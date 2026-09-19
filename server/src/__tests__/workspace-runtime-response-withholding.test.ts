@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { readFileSync } from "node:fs";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -16,6 +17,8 @@ import { executionWorkspaceRoutes } from "../routes/execution-workspaces.js";
 import { projectRoutes } from "../routes/projects.js";
 import {
   publicExecutionWorkspace,
+  publicExecutionWorkspaceCloseReadiness,
+  publicProjectExecutionWorkspacePolicy,
   publicProjectWorkspace,
   publicWorkspaceOperation,
   WITHHELD_WORKSPACE_RUNTIME_VIEWER,
@@ -52,6 +55,25 @@ const SERVICE_CWD_SENTINEL = "/fixture/sentinel-service-cwd";
 const OPERATION_COMMAND_SENTINEL = "TOKEN_FIXTURE=sentinel-operation-command-not-a-real-credential npm run build";
 const OPERATION_CWD_SENTINEL = "/fixture/sentinel-operation-cwd";
 const OPERATION_METADATA_SENTINEL = "/fixture/sentinel-operation-worktree-path";
+
+/**
+ * PEN-3073. The lifecycle command scalars that sit BESIDE `workspaceRuntime` on the same config
+ * object, and their siblings on the three nouns that carry the same strings elsewhere. Each gets its
+ * own sentinel for the reason stated above: a passing assertion has to name the exit it closed.
+ *
+ * Before this ticket every one of these fixture fields was `null`, which is why the suite went green
+ * while the values crossed — a fixture that carries nothing cannot show a mask that does nothing.
+ * All invented; shaped like the inline-assignment idiom `bash -lc` makes ordinary.
+ */
+const CONFIG_PROVISION_SENTINEL = "TOKEN_FIXTURE=sentinel-provision-not-a-real-credential ./provision.sh";
+const CONFIG_TEARDOWN_SENTINEL = "TOKEN_FIXTURE=sentinel-teardown-not-a-real-credential ./teardown.sh";
+const CONFIG_CLEANUP_SENTINEL = "TOKEN_FIXTURE=sentinel-cleanup-not-a-real-credential ./cleanup.sh";
+const PROJECT_SETUP_SENTINEL = "TOKEN_FIXTURE=sentinel-project-setup-not-a-real-credential pnpm install";
+const PROJECT_CLEANUP_SENTINEL = "TOKEN_FIXTURE=sentinel-project-cleanup-not-a-real-credential ./drop.sh";
+const STRATEGY_PROVISION_SENTINEL = "TOKEN_FIXTURE=sentinel-strategy-provision-not-a-real-credential ./boot.sh";
+const STRATEGY_TEARDOWN_SENTINEL = "TOKEN_FIXTURE=sentinel-strategy-teardown-not-a-real-credential ./halt.sh";
+const STRATEGY_PARENT_DIR_SENTINEL = "/fixture/sentinel-worktree-parent-dir";
+const POLICY_RUNTIME_SENTINEL = "sentinel-project-policy-runtime-must-not-egress";
 
 function workspaceOperationFixture(overrides: Record<string, unknown> = {}): WorkspaceOperation {
   return {
@@ -121,7 +143,31 @@ function closeReadinessFixture(runtimeServices = [runtimeServiceFixture()]) {
     blockingReasons: [],
     warnings: [],
     linkedIssues: [],
-    plannedActions: [],
+    // PEN-3073. `plannedActions` was `[]` before this ticket, which is the same blind spot the
+    // `runtimeServices` fixture had: the route spreads `readiness`, so an empty array cannot show
+    // that a populated one crosses. The two operator-authored kinds carry the operator's own string;
+    // the generated preview below must SURVIVE, because blanking it would break the
+    // confirm-before-destroy UI to hide a string the operator never wrote.
+    plannedActions: [
+      {
+        kind: "cleanup_command",
+        label: "Run workspace cleanup command",
+        description: "Workspace-specific cleanup runs before teardown.",
+        command: CONFIG_CLEANUP_SENTINEL,
+      },
+      {
+        kind: "teardown_command",
+        label: "Run teardown command",
+        description: "Teardown runs after cleanup commands during workspace close.",
+        command: STRATEGY_TEARDOWN_SENTINEL,
+      },
+      {
+        kind: "git_worktree_remove",
+        label: "Remove git worktree",
+        description: "Paperclip will run git worktree cleanup.",
+        command: "git worktree remove --force /fixture/cwd",
+      },
+    ],
     isDestructiveCloseAllowed: true,
     isSharedWorkspace: false,
     isProjectPrimaryWorkspace: false,
@@ -187,6 +233,24 @@ vi.mock("../routes/workspace-runtime-service-authz.js", () => ({
   assertCanManageExecutionWorkspaceRuntimeServices: vi.fn(async () => undefined),
 }));
 
+/**
+ * PEN-3205: the workspace-operations route now reads `censorUsernameInLogs` per request, to apply
+ * the username censoring the sibling list route in `routes/agents.ts` already applied. These apps
+ * mount `{}` as `db`, so the real service's `getGeneral()` throws and the route answers 500 —
+ * stubbing it is what keeps the withholding boundary below drivable at all.
+ *
+ * Default OFF so the censor is a no-op: the withholding assertions in this file measure
+ * `publicWorkspaceOperation`, and a censor running underneath them could mask a sentinel and make
+ * a withholding test pass for the wrong reason. The censor has its own coverage below, which
+ * turns it on explicitly and pairs it with the off-case as the discriminator.
+ */
+const mockInstanceGeneralSettings = vi.hoisted(() => ({ censorUsernameInLogs: false }));
+vi.mock("../services/instance-settings.js", () => ({
+  instanceSettingsService: () => ({
+    getGeneral: async () => ({ ...mockInstanceGeneralSettings }),
+  }),
+}));
+
 function runtimeBlob(): Record<string, unknown> {
   return {
     services: [{ name: "web", command: SECRET_SENTINEL, env: { TOKEN_FIXTURE: SECOND_SENTINEL } }],
@@ -220,9 +284,9 @@ function executionWorkspaceFixture(): ExecutionWorkspace {
     cleanupReason: null,
     config: {
       environmentId: null,
-      provisionCommand: null,
-      teardownCommand: null,
-      cleanupCommand: null,
+      provisionCommand: CONFIG_PROVISION_SENTINEL,
+      teardownCommand: CONFIG_TEARDOWN_SENTINEL,
+      cleanupCommand: CONFIG_CLEANUP_SENTINEL,
       workspaceRuntime: runtime,
       desiredState: "running",
       serviceStates: null,
@@ -253,8 +317,8 @@ function projectWorkspaceFixture(): ProjectWorkspace {
     repoRef: null,
     defaultRef: null,
     visibility: "shared",
-    setupCommand: null,
-    cleanupCommand: null,
+    setupCommand: PROJECT_SETUP_SENTINEL,
+    cleanupCommand: PROJECT_CLEANUP_SENTINEL,
     remoteProvider: null,
     remoteWorkspaceRef: null,
     sharedWorkspaceKey: null,
@@ -332,6 +396,7 @@ function createApp(mount: "execution-workspaces" | "projects") {
 describe("workspace runtime withholding boundary (PEN-2852)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockInstanceGeneralSettings.censorUsernameInLogs = false;
     decideAsUnprivilegedReader();
     mockExecutionWorkspaceService.getById.mockResolvedValue(executionWorkspaceFixture());
     mockExecutionWorkspaceService.list.mockResolvedValue([executionWorkspaceFixture()]);
@@ -392,6 +457,133 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
       expect(withheld.config?.desiredState).toBe("running");
       expect(withheld.cwd).toBe("/fixture/cwd");
       expect(withheld.status).toBe("active");
+    });
+
+    /**
+     * PEN-3073. The three scalars that sit beside `workspaceRuntime` on the same object and carried
+     * the same class of value — `provisionCommand` is executed as `bash -lc <string>`.
+     */
+    it("withholds the lifecycle command scalars beside workspaceRuntime", () => {
+      const withheld = publicExecutionWorkspace(
+        executionWorkspaceFixture(),
+        WITHHELD_WORKSPACE_RUNTIME_VIEWER,
+      );
+
+      const serialized = JSON.stringify(withheld);
+      expect(serialized).not.toContain(CONFIG_PROVISION_SENTINEL);
+      expect(serialized).not.toContain(CONFIG_TEARDOWN_SENTINEL);
+      expect(serialized).not.toContain(CONFIG_CLEANUP_SENTINEL);
+      // Masked, not nulled: a withheld reader must still tell "none configured" from "withheld",
+      // the same contract `hasWorkspaceRuntimeConfig` carries for the blob.
+      expect(withheld.config?.provisionCommand).toBe(REDACTED_EVENT_VALUE);
+      expect(withheld.config?.teardownCommand).toBe(REDACTED_EVENT_VALUE);
+      expect(withheld.config?.cleanupCommand).toBe(REDACTED_EVENT_VALUE);
+    });
+
+    it("preserves null rather than masking it, so absent stays distinguishable from withheld", () => {
+      const raw = executionWorkspaceFixture();
+      const withheld = publicExecutionWorkspace(
+        { ...raw, config: { ...raw.config!, provisionCommand: null } },
+        WITHHELD_WORKSPACE_RUNTIME_VIEWER,
+      );
+
+      expect(withheld.config?.provisionCommand).toBeNull();
+      expect(withheld.config?.teardownCommand).toBe(REDACTED_EVENT_VALUE);
+    });
+
+    /**
+     * PEN-3073. `ProjectWorkspaceRuntimeConfig` has no command fields, so reading the
+     * execution/project asymmetry off the two *runtime-config* types says the project side is
+     * already closed. It is not: the ROW carries the same class one level up, as columns.
+     */
+    it("withholds the project workspace's own command columns", () => {
+      const withheld = publicProjectWorkspace(
+        projectWorkspaceFixture(),
+        WITHHELD_WORKSPACE_RUNTIME_VIEWER,
+      );
+
+      const serialized = JSON.stringify(withheld);
+      expect(serialized).not.toContain(PROJECT_SETUP_SENTINEL);
+      expect(serialized).not.toContain(PROJECT_CLEANUP_SENTINEL);
+      expect(withheld.setupCommand).toBe(REDACTED_EVENT_VALUE);
+      expect(withheld.cleanupCommand).toBe(REDACTED_EVENT_VALUE);
+      // The identity fields a caller needs to keep addressing the workspace are untouched.
+      expect(withheld.name).toBe("Primary");
+      expect(withheld.hasWorkspaceRuntimeConfig).toBe(true);
+    });
+
+    /**
+     * PEN-3073. The project-level default for the same two objects the workspace rows carry
+     * per-instance. It is not a workspace row, so nothing in the shipped boundary reached it.
+     */
+    it("withholds the project execution-workspace policy's strategy commands and runtime blob", () => {
+      const withheld = publicProjectExecutionWorkspacePolicy(
+        {
+          enabled: true,
+          defaultMode: "isolated_workspace",
+          environmentId: "environment-1",
+          workspaceStrategy: {
+            type: "git_worktree",
+            baseRef: "main",
+            branchTemplate: "agent/{issue}",
+            worktreeParentDir: STRATEGY_PARENT_DIR_SENTINEL,
+            provisionCommand: STRATEGY_PROVISION_SENTINEL,
+            teardownCommand: STRATEGY_TEARDOWN_SENTINEL,
+            runScope: "per_issue",
+          },
+          workspaceRuntime: { services: [{ name: "web", env: { TOKEN_FIXTURE: POLICY_RUNTIME_SENTINEL } }] },
+        },
+        WITHHELD_WORKSPACE_RUNTIME_VIEWER,
+      );
+
+      const serialized = JSON.stringify(withheld);
+      expect(serialized).not.toContain(STRATEGY_PROVISION_SENTINEL);
+      expect(serialized).not.toContain(STRATEGY_TEARDOWN_SENTINEL);
+      expect(serialized).not.toContain(STRATEGY_PARENT_DIR_SENTINEL);
+      expect(serialized).not.toContain(POLICY_RUNTIME_SENTINEL);
+      // Names and structure survive the runtime walk — PEN-2370 ask 1.
+      expect(serialized).toContain("TOKEN_FIXTURE");
+      // Closed-shape siblings cross intact, per the module's stated non-withholding list.
+      expect(withheld?.enabled).toBe(true);
+      expect(withheld?.environmentId).toBe("environment-1");
+      expect(withheld?.workspaceStrategy?.type).toBe("git_worktree");
+      expect(withheld?.workspaceStrategy?.baseRef).toBe("main");
+      expect(withheld?.workspaceStrategy?.branchTemplate).toBe("agent/{issue}");
+    });
+
+    /**
+     * PEN-3073. Masked by action KIND. Blanket masking would have hidden the generated preview that
+     * is the entire point of a confirm-before-destroy readiness check.
+     */
+    it("withholds only the operator-authored planned-action commands on close-readiness", () => {
+      const withheld = publicExecutionWorkspaceCloseReadiness(
+        closeReadinessFixture() as never,
+        WITHHELD_WORKSPACE_RUNTIME_VIEWER,
+      );
+      const byKind = Object.fromEntries(withheld.plannedActions.map((a) => [a.kind, a.command]));
+
+      expect(JSON.stringify(withheld)).not.toContain(CONFIG_CLEANUP_SENTINEL);
+      expect(JSON.stringify(withheld)).not.toContain(STRATEGY_TEARDOWN_SENTINEL);
+      expect(byKind.cleanup_command).toBe(REDACTED_EVENT_VALUE);
+      expect(byKind.teardown_command).toBe(REDACTED_EVENT_VALUE);
+      expect(byKind.git_worktree_remove).toBe("git worktree remove --force /fixture/cwd");
+      // The service rows the earlier revision already masked stay masked.
+      expect(JSON.stringify(withheld)).not.toContain(SERVICE_COMMAND_SENTINEL);
+    });
+
+    it("discloses every PEN-3073 field to an entitled viewer", () => {
+      const raw = executionWorkspaceFixture();
+      const disclosed = publicExecutionWorkspace(raw, { revealRuntimeConfig: true });
+      const project = publicProjectWorkspace(projectWorkspaceFixture(), { revealRuntimeConfig: true });
+
+      // The runtime EDITORS read these back into a form and PATCH them. Masking them for an
+      // entitled operator would not merely hide the value, it would let the editor write the
+      // sentinel over the real one — the failure the entitlement split exists to prevent.
+      expect(disclosed.config?.provisionCommand).toBe(CONFIG_PROVISION_SENTINEL);
+      expect(disclosed.config?.teardownCommand).toBe(CONFIG_TEARDOWN_SENTINEL);
+      expect(disclosed.config?.cleanupCommand).toBe(CONFIG_CLEANUP_SENTINEL);
+      expect(project.setupCommand).toBe(PROJECT_SETUP_SENTINEL);
+      expect(project.cleanupCommand).toBe(PROJECT_CLEANUP_SENTINEL);
     });
 
     it("does not copy the input when the viewer is entitled", () => {
@@ -654,6 +846,95 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
       expect(res.status).toBe(200);
       expect(res.body[0].command).toBe(OPERATION_COMMAND_SENTINEL);
       expect(res.body[0].cwd).toBe(OPERATION_CWD_SENTINEL);
+    });
+
+    /**
+     * PEN-3205, read side. `publicWorkspaceOperation` masks `command`/`cwd`/`metadata` and spreads
+     * the rest, so `stdoutExcerpt` crosses that projection UNMASKED, and `routes/agents.ts` was
+     * already applying the username censor on the sibling list route while this one answered with
+     * a bare `res.json`.
+     *
+     * PEN-3142/PEN-3204 added a SECOND control over the same field on this route — the
+     * run-transcript gate — so the censor is no longer the only thing standing over the excerpt
+     * here. That matters for the shape of this pair: the gate fails closed on an operation with no
+     * resolvable owning agent, which is what the bare fixture is, so an unowned operation now
+     * arrives with `stdoutExcerpt: null` and could not discriminate the censor setting at all.
+     * These two cases therefore pin an OWNED operation whose owner is the calling agent itself
+     * (own-run, allowed under the transcript decision) — that is the only configuration in which
+     * the censor is the live discriminator, which is what this pair is for. The withholding side
+     * is covered separately, above and in `pen3142-run-transcript-scope`.
+     *
+     * The home directory comes from `os.homedir()` rather than a literal because that is the same
+     * value `defaultHomeDirs` derives its (module-cached) candidate list from, so this is
+     * deterministic on any runner without reaching into that cache. The pair is the point: the
+     * setting is the sole discriminator between the two cases, so neither passes if the censor is
+     * dropped from the route, and neither passes if it is replaced by blanket blanking.
+     */
+    it("censors the current user's home directory in the excerpt when the setting is on", async () => {
+      mockInstanceGeneralSettings.censorUsernameInLogs = true;
+      const homeDir = os.homedir();
+      mockWorkspaceOperationService.listForExecutionWorkspace.mockResolvedValue([
+        workspaceOperationFixture({ heartbeatRunId: "run-1", stdoutExcerpt: `cloned into ${homeDir}/checkout` }),
+      ]);
+      mockWorkspaceOperationService.owningAgentIdsByRunId.mockResolvedValue(new Map([["run-1", "agent-1"]]));
+
+      const res = await request(createApp("execution-workspaces")).get(
+        "/api/execution-workspaces/workspace-1/workspace-operations",
+      );
+
+      expect(res.status).toBe(200);
+      expect(res.body[0].stdoutExcerpt).not.toContain(homeDir);
+      // Censored, not blanked: the surrounding line survives so the excerpt stays readable.
+      expect(res.body[0].stdoutExcerpt).toContain("cloned into ");
+      expect(res.body[0].stdoutExcerpt).toContain("/checkout");
+    });
+
+    it("leaves the excerpt alone when the setting is off", async () => {
+      mockInstanceGeneralSettings.censorUsernameInLogs = false;
+      const homeDir = os.homedir();
+      mockWorkspaceOperationService.listForExecutionWorkspace.mockResolvedValue([
+        workspaceOperationFixture({ heartbeatRunId: "run-1", stdoutExcerpt: `cloned into ${homeDir}/checkout` }),
+      ]);
+      mockWorkspaceOperationService.owningAgentIdsByRunId.mockResolvedValue(new Map([["run-1", "agent-1"]]));
+
+      const res = await request(createApp("execution-workspaces")).get(
+        "/api/execution-workspaces/workspace-1/workspace-operations",
+      );
+
+      expect(res.status).toBe(200);
+      expect(res.body[0].stdoutExcerpt).toBe(`cloned into ${homeDir}/checkout`);
+    });
+
+    /**
+     * The composition guard for the two controls above. An operation owned by a DIFFERENT agent
+     * has its captured output withheld on this route even with the censor off — so the pair above
+     * cannot be read as "the excerpt always crosses", and dropping the transcript gate from this
+     * route while keeping the censor fails here rather than passing quietly.
+     */
+    it("withholds the excerpt of another agent's operation regardless of the censor setting", async () => {
+      mockInstanceGeneralSettings.censorUsernameInLogs = false;
+      mockWorkspaceOperationService.listForExecutionWorkspace.mockResolvedValue([
+        workspaceOperationFixture({ heartbeatRunId: "run-2", stdoutExcerpt: "peer transcript bytes" }),
+      ]);
+      mockWorkspaceOperationService.owningAgentIdsByRunId.mockResolvedValue(new Map([["run-2", "agent-2"]]));
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: input.action !== "workspace_runtime:read" && input.action !== "runs:read_transcript",
+        action: input.action,
+        reason: "test",
+        explanation: "Allowed by test mock.",
+      }));
+
+      const res = await request(createApp("execution-workspaces")).get(
+        "/api/execution-workspaces/workspace-1/workspace-operations",
+      );
+
+      expect(res.status).toBe(200);
+      expect(JSON.stringify(res.body)).not.toContain("peer transcript bytes");
+      expect(res.body[0].stdoutExcerpt).toBeNull();
+      // Withheld, not absent — run STATE stays readable, which is the PEN-3142 boundary.
+      expect(res.body[0].withheldFields).toContain("stdoutExcerpt");
+      expect(res.body[0].phase).toBe("workspace_provision");
+      expect(res.body[0].status).toBe("succeeded");
     });
 
     /**

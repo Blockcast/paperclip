@@ -30,52 +30,55 @@ function renderTemplate(template, extraArgs = []) {
 
 // BLO-32054: pve3 is CPU-oversubscribed and steals 20-40% from every guest on
 // it; a 5 s liveness probe on a stalled vCPU misses its deadline and the
-// kubelet kills a healthy container. Production must not land on a node whose
-// PVE host is pve3. The nodes already carry blockcast.net/pve-storage-domain
-// with the host name, so the rule keys on that label.
-const PVE3_RULE =
-  /nodeAffinity:[\s\S]*?requiredDuringSchedulingIgnoredDuringExecution:\s*\n\s*nodeSelectorTerms:\s*\n\s*- matchExpressions:\s*\n\s*- key: blockcast\.net\/pve-storage-domain\s*\n\s*operator: NotIn\s*\n\s*values:\s*\n\s*- pve3/;
+// kubelet kills a healthy container. Production is biased off pve3, but only
+// by preference. A hard `required NotIn [pve3]` shipped 2026-09-05 and was
+// removed 2026-09-12 (CEO ruling on BLO-32054): it excluded 4 of 11 nodes and
+// stacked with the API's hard two-host spread over 5 uncordoned eligible
+// nodes, so a cordon during an incident could strand a replica Pending. Assert
+// the hard rule stays gone — nothing else in the chart would catch it coming
+// back.
+const NO_REQUIRED_NODE_AFFINITY =
+  /nodeAffinity:[\s\S]*?requiredDuringSchedulingIgnoredDuringExecution/;
 
-test("API deployment requires a node whose PVE host is not pve3", () => {
+test("API deployment pins no required nodeAffinity", () => {
   const rendered = renderTemplate("templates/deployment-api.yaml", [
     "--set",
     "api.enabled=true",
   ]);
 
-  assert.match(rendered, PVE3_RULE);
-  // The chart merges values.affinity beside its own podAntiAffinity; adding
+  assert.doesNotMatch(rendered, NO_REQUIRED_NODE_AFFINITY);
+  // The chart merges values.affinity beside its own podAntiAffinity; editing
   // nodeAffinity must not drop the replica spread hint.
   assert.match(rendered, /podAntiAffinity:/);
 });
 
-test("worker StatefulSet requires a node whose PVE host is not pve3", () => {
+test("worker StatefulSet pins no required nodeAffinity", () => {
   const rendered = renderTemplate("templates/statefulset.yaml");
 
-  assert.match(rendered, PVE3_RULE);
+  assert.doesNotMatch(rendered, NO_REQUIRED_NODE_AFFINITY);
 });
 
-// pve2 saturates whenever CI runner bursts land on paperclip-5/-10/-11, but it
-// cannot be excluded outright: the API's hard two-host spread needs a second
-// eligible node, pve4 hosts only paperclip-3, and the pve1 nodes carry reserved
-// taints production does not tolerate. So pve4 is preferred outright and any
-// non-pve2 host is the fallback, leaving the spread rule to place the second
-// replica on pve2.
-const PREFER_PVE4_THEN_NOT_PVE2 =
-  /preferredDuringSchedulingIgnoredDuringExecution:\s*\n\s*- preference:\s*\n\s*matchExpressions:\s*\n\s*- key: blockcast\.net\/pve-storage-domain\s*\n\s*operator: In\s*\n\s*values:\s*\n\s*- pve4\s*\n\s*weight: 100\s*\n\s*- preference:\s*\n\s*matchExpressions:\s*\n\s*- key: blockcast\.net\/pve-storage-domain\s*\n\s*operator: NotIn\s*\n\s*values:\s*\n\s*- pve2\s*\n\s*weight: 50/;
+// pve2 and pve3 both saturate under CI runner bursts, but neither is excluded
+// outright (see above). The gradient is pve4 = pve1 = 150 > pve3 = 50 >
+// pve2 = 0: pve4 and pve1 are preferred outright on 7d hypervisor CPU, any
+// non-pve2 host is the fallback, and the spread rule places the second replica
+// on the best remaining host.
+const PREFER_PVE4_PVE1_THEN_NOT_PVE2 =
+  /preferredDuringSchedulingIgnoredDuringExecution:\s*\n\s*- preference:\s*\n\s*matchExpressions:\s*\n\s*- key: blockcast\.net\/pve-storage-domain\s*\n\s*operator: In\s*\n\s*values:\s*\n\s*- pve4\s*\n\s*- pve1\s*\n\s*weight: 100\s*\n\s*- preference:\s*\n\s*matchExpressions:\s*\n\s*- key: blockcast\.net\/pve-storage-domain\s*\n\s*operator: NotIn\s*\n\s*values:\s*\n\s*- pve2\s*\n\s*weight: 50/;
 
-test("API deployment prefers pve4, then any host that is not pve2", () => {
+test("API deployment prefers pve4 and pve1, then any host that is not pve2", () => {
   const rendered = renderTemplate("templates/deployment-api.yaml", [
     "--set",
     "api.enabled=true",
   ]);
 
-  assert.match(rendered, PREFER_PVE4_THEN_NOT_PVE2);
+  assert.match(rendered, PREFER_PVE4_PVE1_THEN_NOT_PVE2);
 });
 
-test("worker StatefulSet prefers pve4, then any host that is not pve2", () => {
+test("worker StatefulSet prefers pve4 and pve1, then any host that is not pve2", () => {
   const rendered = renderTemplate("templates/statefulset.yaml");
 
-  assert.match(rendered, PREFER_PVE4_THEN_NOT_PVE2);
+  assert.match(rendered, PREFER_PVE4_PVE1_THEN_NOT_PVE2);
 });
 
 // Slice one probe block out of the rendered container spec so assertions

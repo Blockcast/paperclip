@@ -2988,6 +2988,23 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "post",
+  path: "/api/approvals/{id}/apply",
+  tags: ["approvals"],
+  summary:
+    "Apply the values an approved card recorded to the objects that enforce them (requesting agent). Takes no body — every figure comes from the approved payload, so this route cannot express a figure the board did not decide. Refuses when the card is not `approved` (409), the caller is not the requester or the target is the caller's own budget (403), or no assertion resolves to an exact, still-unapplied target (422). Applying is idempotent. Approval authority is unchanged: `approve`/`reject`/`request-revision` remain board-only.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
   method: "get",
   path: "/api/approvals/{id}/comments",
   tags: ["approvals"],

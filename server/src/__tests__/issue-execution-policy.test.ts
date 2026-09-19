@@ -52,6 +52,48 @@ describe("buildIssueMonitorEligibilityPatch", () => {
     expect((patch.executionState as { monitor?: { status?: string; clearReason?: string } }).monitor)
       .toMatchObject({ status: "cleared", clearReason: "invalid_status" });
   });
+
+  // BLO-29974: `escalateStrandedAssignedIssue` writes a *computed* status, and it is a
+  // service-layer write, so nothing upstream clears a monitor the new status makes
+  // undeliverable. The caller therefore has to evaluate eligibility against the status
+  // it is about to write, not the one the row currently holds. Passing the unmodified
+  // row is the silent-failure mode this pins: the row still reads `in_progress`, the
+  // patch comes back `{}`, and the monitor survives as a false-live wake path.
+  it("clears when evaluated against a post-write escalation status the row does not hold yet", () => {
+    const armed = {
+      status: "in_progress",
+      assigneeAgentId: coderAgentId,
+      assigneeUserId: null,
+      monitorNextCheckAt: new Date("2026-09-19T10:07:00.000Z"),
+      executionPolicy: {
+        monitor: { nextCheckAt: "2026-09-19T10:07:00.000Z", scheduledBy: "assignee" },
+      },
+    };
+
+    // Evaluated against the row as-is, there is nothing to do — this is the trap.
+    expect(buildIssueMonitorEligibilityPatch(armed)).toEqual({});
+
+    const patch = buildIssueMonitorEligibilityPatch({ ...armed, status: "blocked" });
+    expect(patch.monitorNextCheckAt).toBeNull();
+    expect((patch.executionState as { monitor?: { status?: string; clearReason?: string } }).monitor)
+      .toMatchObject({ status: "cleared", clearReason: "invalid_status" });
+  });
+
+  // BLO-27635 leaves a capacity strand dispatchable rather than writing `blocked`. That
+  // branch must keep its monitor, so the unconditional spread has to stay a no-op there.
+  it("leaves the monitor armed when the escalation status still allows one", () => {
+    expect(
+      buildIssueMonitorEligibilityPatch({
+        status: "in_review",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        monitorNextCheckAt: new Date("2026-09-19T10:07:00.000Z"),
+        executionPolicy: {
+          monitor: { nextCheckAt: "2026-09-19T10:07:00.000Z", scheduledBy: "assignee" },
+        },
+      }),
+    ).toEqual({});
+  });
 });
 
 function makePolicy(
@@ -1862,5 +1904,146 @@ describe("isMonitorNextCheckAtLive", () => {
     expect(isMonitorNextCheckAtLive("", nowMs)).toBe(false);
     expect(isMonitorNextCheckAtLive("not a date", nowMs)).toBe(false);
     expect(isMonitorNextCheckAtLive(new Date("not a date"), nowMs)).toBe(false);
+  });
+});
+
+// BLO-33728: an execution stage must not stay live on a terminal issue. The
+// `done` half was already correct (`buildCompletedState` discharges on
+// approval); the gap was `cancelled` from `changes_requested`, which reached
+// no branch at all and returned an empty patch.
+describe("stage discharge on terminal status", () => {
+  const agentApprovalPolicy = () =>
+    makePolicy([{ type: "approval", participants: [{ type: "agent", agentId: ctoAgentId }] }]);
+
+  /** Drive the real transitions to a genuine `changes_requested` state. */
+  function changesRequestedState(policy: IssueExecutionPolicy) {
+    const pending = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: null,
+      },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      commentBody: "Ready for approval",
+    }).patch.executionState;
+
+    const changesRequested = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: ctoAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: pending,
+      },
+      policy,
+      requestedStatus: "in_progress",
+      requestedAssigneePatch: {},
+      actor: { agentId: ctoAgentId },
+      commentBody: "Needs work",
+    }).patch.executionState;
+
+    return { pending, changesRequested };
+  }
+
+  it("records the approval, not the earlier downgrade, on approve-and-close", () => {
+    const policy = agentApprovalPolicy();
+    const { pending } = changesRequestedState(policy);
+
+    const state = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: ctoAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: pending,
+      },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: ctoAgentId },
+      commentBody: "Approved",
+    }).patch.executionState as IssueExecutionState;
+
+    expect(state.lastDecisionOutcome).toBe("approved");
+    // The negative the AC asks for: never a pre-approval `changes_requested`.
+    expect(state.lastDecisionOutcome).not.toBe("changes_requested");
+    expect(state.currentStageId).toBeNull();
+    expect(state.currentParticipant).toBeNull();
+  });
+
+  it("discharges the stage when a changes_requested issue is cancelled", () => {
+    const policy = agentApprovalPolicy();
+    const { changesRequested } = changesRequestedState(policy);
+    // Guard the fixture: the pre-state really does carry a live stage, so a
+    // passing assertion below cannot be an artifact of an already-empty stage.
+    expect((changesRequested as IssueExecutionState).currentStageId).not.toBeNull();
+
+    const patch = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: changesRequested,
+      },
+      policy,
+      requestedStatus: "cancelled",
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      commentBody: "Abandoning",
+    }).patch;
+
+    // The defect was an empty patch: the cancel reached no branch, so the stage
+    // survived untouched. Name that here rather than dereferencing `undefined`.
+    expect(patch.executionState, "cancel left executionState untouched").toBeDefined();
+    const state = patch.executionState as IssueExecutionState;
+
+    expect(state.currentStageId).toBeNull();
+    expect(state.currentStageType).toBeNull();
+    expect(state.currentParticipant).toBeNull();
+    // A genuine decision is real history and must survive the cancel.
+    expect(state.lastDecisionOutcome).toBe("changes_requested");
+  });
+
+  it("clears the discharged state on reopen so a review path can be rebuilt", () => {
+    const policy = agentApprovalPolicy();
+    const { changesRequested } = changesRequestedState(policy);
+
+    const cancelled = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: changesRequested,
+      },
+      policy,
+      requestedStatus: "cancelled",
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      commentBody: "Abandoning",
+    }).patch.executionState;
+
+    const reopened = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "cancelled",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: cancelled,
+      },
+      policy,
+      requestedStatus: "in_progress",
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      commentBody: "Reopening",
+    }).patch;
+
+    expect(reopened.executionState).toBeNull();
   });
 });

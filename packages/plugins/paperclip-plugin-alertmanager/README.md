@@ -297,7 +297,7 @@ cached too (empty string) so a missing user doesn't cause repeated lookups.
 
 ### Issue creation floor and rule-level opt-out
 
-Two gates keep low-value alerts from becoming issues:
+Two gates keep low-value alerts from becoming issues at all:
 
 - **`severity: info` creates no issue.** The gate is *creation-only* and runs
   after the re-fire branch, so an `info` issue that already exists (filed
@@ -309,6 +309,40 @@ Two gates keep low-value alerts from becoming issues:
   refreshed, no state written, no suppression anchor banked) but deliberately
   lets the **resolved** path through. Emits
   `alertmanager.webhook.issue_opt_out`.
+
+A third gate suppresses *actionability* rather than creation:
+
+- **`severity: none` is filed terminal and unowned.** This is the heartbeat
+  band — Prometheus' `Watchdog` (`vector(1)`) is its only member and fires
+  forever by design. The row is kept because it is the only live evidence the
+  in-cluster delivery leg accepts POSTs, but an alert that can never resolve
+  must not carry an owner: an assigned row that can never legitimately close
+  recirculates through agent assignment and `stranded_assigned_issue` recovery
+  forever. So the issue is created — and on every re-fire kept — `done` with no
+  assignee, and owner-map / `issueRouteMap` resolution is skipped entirely. No
+  escalation-ladder exemption is needed: `none` maps to no
+  `escalationDeadlineMinutes`, so `nextEscalationAt` is already `null`.
+
+  `done` rather than unowned-`todo` on purpose. Heartbeat selection is by
+  assignee, so both are inert — but an ownerless `todo` row is
+  indistinguishable from a stranded issue on every triage surface, and this one
+  would be re-minted on every fire, forever. A terminal row is honestly
+  terminal.
+
+  Unlike the two gates above, this one is **not** creation-only: every re-fire
+  re-clears the assignee on the issue, the state record, *and* the emitted
+  firing event. A creation-only guard would leave rows filed before the policy
+  — and any row something later assigns — stuck in the loop, which is the same
+  one-shot patch as unassigning by hand. The re-fire also bypasses
+  `decideRefire`: that helper reads any `done` row as an *operator* close
+  (BLO-24234) and would mute the fingerprint for the suppression window, then
+  re-open it as `todo` when the window expired — re-manufacturing exactly the
+  actionable row this gate exists to prevent. A terminal close is the plugin's
+  own doing, so there is no operator intent to honour.
+
+  The terminal set is a constant (`TERMINAL_SEVERITIES`), deliberately not a
+  config key: a configurable list is what would make a plugin-closed `done` row
+  ambiguous with an operator close, and `none` has exactly one member here.
 
 Letting resolve through is what keeps the opt-out from wedging the issues it was
 added to silence. Gating it too would mean `handleResolved` never runs for an
@@ -393,13 +427,48 @@ branch is decided by `decideRefire()` in `webhook-handler.ts` and each one emits
 a distinct metric, so "the alert delivered but I see no issue" is answerable
 from telemetry rather than by reading the issue body's `Started:` timestamp.
 
-| Issue status at re-fire | `resolvedAt` in state | Outcome | Metric |
+| Issue status at re-fire | Closed by the plugin? | Outcome | Metric |
 |---|---|---|---|
 | open (any non-terminal) | — | refresh description | `alertmanager.firing.deduped` |
-| `done` / `cancelled` | set (plugin closed it on resolve) | re-open → `todo` | `alertmanager.firing.reopened` |
-| `done` / `cancelled` | null (**operator** closed it) — inside window | stay closed, stay quiet | `alertmanager.firing.suppressed` |
-| `done` / `cancelled` | null — window expired | re-open → `todo` + comment | `alertmanager.firing.suppression_expired` |
+| `cancelled` | yes — `pluginClosedAt` set | re-open → `todo` | `alertmanager.firing.reopened` |
+| `cancelled` with `pluginClosedAt` **absent** | unknown — legacy row, or an aggregate member whose close a sibling landed; falls back to `resolvedAt` | re-open → `todo` | `alertmanager.firing.reopened` |
+| `done`, or `cancelled` with `pluginClosedAt: null` | no (**operator** closed it) — inside window | stay closed, stay quiet | `alertmanager.firing.suppressed` |
+| as above — window expired | no | re-open → `todo` + comment | `alertmanager.firing.suppression_expired` |
 | issue unreadable / deleted | — | leave state intact | `alertmanager.firing.issue_missing` |
+
+**Authorship is recorded, not inferred (BLO-31736).** That middle column used to
+read `resolvedAt in state`, and the code matched it. It was wrong: `resolvedAt`
+says only *"the alert last cleared"*, which is also true when the resolve path's
+terminal guard **declined** to close an issue an agent had already closed by
+hand. So a deliberate `done` was read as "the plugin closed this", re-opened to
+`todo` on the next re-fire, and cancelled by the resolve after it — once per
+fire/clear cycle, indefinitely, ending in a plugin-authored `cancelled` that
+looks like a normal auto-close on every triage surface. It also made the
+suppression row above unreachable for any alert that had *ever* resolved, i.e.
+every flapping alert — precisely the ones operators close by hand.
+
+`pluginClosedAt` is now written only on the branch where the plugin's own
+`cancelled` patch actually landed, and cleared by any firing delivery that
+observed the issue's status. Two details worth knowing when reading the table:
+
+- **`done` is never a close of ours.** The plugin's only status writes are
+  `todo` and `cancelled`, so a `done` row was always dispositioned by someone
+  else — true even for state rows written before this field existed.
+- **An absent `pluginClosedAt` means authorship is unknown**, and falls back to
+  `resolvedAt`. Two rows land there: one written before the field existed, and
+  one belonging to an **aggregate** whose close this member deferred to a
+  sibling. The second case is why the record cannot simply be `null` when our
+  own cancel did not land here: `pluginClosedAt` is per-fingerprint, but the
+  close it records happens to the aggregate's *shared* issue, and only the last
+  member to resolve lands it. A non-last member that kept asserting `null` read
+  its own aggregate's close as an operator close and muted the next genuine
+  recurrence.
+  The fallback is asymmetric on purpose: reading our close as an operator's
+  would *mute a live recurring alert* for a whole window, while the reverse
+  costs one unwanted re-open. Legacy rows drain on their first firing — even
+  one whose issue read fails: that write records what the fallback would have
+  concluded and still clears `resolvedAt`, which is also the escalation sweep's
+  bail-out and must not stay set against a firing alert.
 
 `alertmanager.firing.deduped` is still emitted on **every** re-fire, so existing
 dashboards keep working; the metrics above narrate what the re-fire actually did.

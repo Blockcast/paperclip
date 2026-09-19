@@ -267,5 +267,11 @@ export const heartbeatRuns = pgTable(
     crashRecoveryPendingIdx: index("heartbeat_runs_crash_recovery_pending_idx")
       .on(table.finishedAt, table.id)
       .where(sql`${table.errorCode} = 'worker_crashed' and ${table.crashRecoveryCompletedAt} is null`),
+    companyAgentCreatedAtDescIdx: index("heartbeat_runs_company_agent_created_at_idx").on(
+      table.companyId,
+      table.agentId,
+      table.createdAt.desc(),
+      table.id.desc(),
+    ),
   }),
 );

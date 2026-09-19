@@ -90,7 +90,7 @@ describeEmbeddedPostgres("pipelineService", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-pipelines-service-");
     db = createDb(tempDb.connectionString);
     svc = pipelineService(db, { heartbeat: noopHeartbeat });
-  }, 60_000);
+  });
 
   afterEach(async () => {
     cancelledRunIds.length = 0;

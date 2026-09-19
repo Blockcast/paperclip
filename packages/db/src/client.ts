@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import postgres, { type Sql } from "postgres";
 import * as schema from "./schema/index.js";
 import { registerTrackedClient } from "./embedded-test-client-registry.js";
+import { ensureConcurrentIndexesForMigration } from "./concurrent-index-guard.js";
 
 const MIGRATIONS_FOLDER = fileURLToPath(new URL("./migrations", import.meta.url));
 const DRIZZLE_MIGRATIONS_TABLE = "__drizzle_migrations";
@@ -45,6 +46,16 @@ export type MigrationState =
       pendingMigrations: string[];
       reason: "no-migration-journal-empty-db" | "no-migration-journal-non-empty-db" | "pending-migrations";
     };
+
+export type ApplyPendingMigrationsOptions = {
+  /**
+   * Prepare guarded `CREATE INDEX CONCURRENTLY` prerequisites immediately
+   * before each migration file. This is opt-in so migration tests and callers
+   * that intentionally exercise a migration's raw failure remain unchanged.
+   */
+  readonly prepareOnlineIndexes?: boolean;
+  readonly log?: (message: string) => void;
+};
 
 /**
  * Connection-pool ceiling for the application client.
@@ -258,6 +269,7 @@ async function recordMigrationHistoryEntry(
 async function applyPendingMigrationsManually(
   url: string,
   pendingMigrations: string[],
+  options: ApplyPendingMigrationsOptions = {},
 ): Promise<void> {
   if (pendingMigrations.length === 0) return;
 
@@ -283,6 +295,12 @@ async function applyPendingMigrationsManually(
         hash,
       );
       if (existingEntry) continue;
+
+      if (options.prepareOnlineIndexes) {
+        await ensureConcurrentIndexesForMigration(url, migrationFile, {
+          log: options.log,
+        });
+      }
 
       await runInTransaction(sql, async () => {
         for (const statement of splitMigrationStatements(migrationContent)) {
@@ -722,7 +740,10 @@ export async function inspectMigrations(url: string): Promise<MigrationState> {
   }
 }
 
-export async function applyPendingMigrations(url: string): Promise<void> {
+export async function applyPendingMigrations(
+  url: string,
+  options: ApplyPendingMigrationsOptions = {},
+): Promise<void> {
   const initialState = await inspectMigrations(url);
   if (initialState.status === "upToDate") return;
 
@@ -743,7 +764,7 @@ export async function applyPendingMigrations(url: string): Promise<void> {
         bootstrappedState = await inspectMigrations(url);
       }
       if (bootstrappedState.status === "needsMigrations" && bootstrappedState.reason === "pending-migrations") {
-        await applyPendingMigrationsManually(url, bootstrappedState.pendingMigrations);
+        await applyPendingMigrationsManually(url, bootstrappedState.pendingMigrations, options);
         bootstrappedState = await inspectMigrations(url);
       }
     }
@@ -776,7 +797,7 @@ export async function applyPendingMigrations(url: string): Promise<void> {
     throw new Error("Migrations are still pending after migration-history reconciliation; run inspectMigrations for details.");
   }
 
-  await applyPendingMigrationsManually(url, state.pendingMigrations);
+  await applyPendingMigrationsManually(url, state.pendingMigrations, options);
 
   const finalState = await inspectMigrations(url);
   if (finalState.status !== "upToDate") {

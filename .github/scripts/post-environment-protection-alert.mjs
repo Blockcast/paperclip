@@ -24,6 +24,25 @@ const DEFAULT_ALERTMANAGER_URL = 'http://alertmanager.monitoring.svc.cluster.loc
 /** Slightly longer than the 12h schedule interval, so firing is continuous. */
 export const ALERT_TTL_MS = 13 * 60 * 60 * 1000;
 
+/**
+ * Label value used when the check died before writing its summary, so we know
+ * a violation set exists but not which. Stable on purpose: a churning value
+ * here would mint a new alert every run and drown the real signal.
+ */
+export const UNKNOWN_VIOLATION_KINDS = 'unknown';
+
+/**
+ * Collapse the violation-kind slugs into one stable label value.
+ *
+ * Sorted so that the same set of violations always yields the same string
+ * regardless of the order the check emitted them — an unstable value would
+ * re-fire the alert on every run for no reason.
+ */
+export function violationKindsLabel(kinds) {
+  if (!Array.isArray(kinds) || kinds.length === 0) return UNKNOWN_VIOLATION_KINDS;
+  return [...new Set(kinds)].sort().join(',');
+}
+
 export function buildAlert({ exitCode, summary, runUrl, repo, environment, now }) {
   const unreadable = String(exitCode) === '2';
   const startsAt = new Date(now);
@@ -48,6 +67,21 @@ export function buildAlert({ exitCode, summary, runUrl, repo, environment, now }
       service: 'paperclip-production-deploy-gate',
       repo,
       environment,
+      // WHY THIS IS A LABEL AND NOT JUST AN ANNOTATION (PEN-2863):
+      // Alertmanager's fingerprint is computed over labels, and this alert is
+      // re-pushed with endsAt beyond the schedule interval so it fires
+      // continuously while drift persists. With only the static labels above,
+      // a *second* violation appearing on top of an existing one reused the
+      // same fingerprint: Alertmanager saw the same already-firing alert and
+      // silently swapped the description annotation, so no new-firing
+      // notification was ever produced. That is how a tolerated drift masks an
+      // intolerable one — e.g. `can_admins_bypass` flipping to true while a
+      // benign membership drift is already firing, which is exactly the
+      // compound the 2026-08-08 incident turned on. Keying the fingerprint to
+      // the violation set makes the new shape a new alert (and lets the old
+      // one auto-resolve via send_resolved), so the change is what pages.
+      // Grouping is unaffected: the route groups by [alertname, namespace].
+      violation_kinds: unreadable ? 'unreadable' : violationKindsLabel(summary?.violationKinds),
     },
     annotations: {
       summary: unreadable

@@ -626,8 +626,20 @@ type IssueLike = {
   assigneeAdapterOverrides: Record<string, unknown> | null;
 };
 
-type RoutineLike = NonNullable<Awaited<ReturnType<ReturnType<typeof routineService>["getDetail"]>>>;
+/**
+ * PEN-3252. Entitlement carried into the export, so the bundle discloses the same material the
+ * response boundary does and no more.
+ *
+ * Optional and defaulting to withheld on purpose: a caller that forgets to pass it gets the safe
+ * answer. The service takes a plain flag rather than a `WorkspaceRuntimeViewer` so it stays
+ * independent of the route layer — `routes/companies.ts` resolves the viewer and passes its verdict.
+ */
+export type CompanyPortabilityExportOptions = {
+  /** True only for actors entitled to raw `workspaceRuntime` values (`workspace_runtime:read`). */
+  revealWorkspaceRuntime?: boolean;
+};
 
+type RoutineLike = NonNullable<Awaited<ReturnType<ReturnType<typeof routineService>["getDetail"]>>>;
 type ImportPlanInternal = {
   preview: CompanyPortabilityPreviewResult;
   source: ResolvedSource;
@@ -3477,7 +3489,9 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
   async function exportBundle(
     companyId: string,
     input: CompanyPortabilityExport,
+    options: CompanyPortabilityExportOptions = {},
   ): Promise<CompanyPortabilityExportResult> {
+    const revealWorkspaceRuntime = options.revealWorkspaceRuntime === true;
     const include = normalizeInclude({
       ...input.include,
       agents: input.agents && input.agents.length > 0 ? true : input.include?.agents,
@@ -4011,6 +4025,28 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
         }
       }
       const comments = await issuesSvc.listComments(issue.id, { order: "asc" });
+      // PEN-3252. The twelfth exit for `issues.executionWorkspaceSettings`, and the only one that is
+      // not a response projection: this value is written into `.paperclip.yaml` and handed back by
+      // `POST /companies/:companyId/export(s)`, whose gate (`assertSameCompanyCeoAgentOrBoard`)
+      // admits a same-company CEO AGENT. Only the `input.issues` selector path reaches a row that
+      // carries the column at all — those resolve through the bare full-row select — while
+      // `projectIssues` and the include-all fallback go through `issueListSelect`, which already
+      // nulls it. That asymmetry is what makes this easy to mis-test.
+      //
+      // Omitted rather than masked, which is the opposite of the route projections and deliberate: a
+      // bundle is a round-trippable artifact, so a `***REDACTED***` sentinel would not hide a value,
+      // it would be IMPORTED as a literal command string and persisted over the real one. Dropping is
+      // the idiom this file already uses for a value it cannot portably carry (`setupCommand` /
+      // `cleanupCommand` above), and the warning is what keeps withheld distinguishable from unset —
+      // the role the sentinel plays on the response side. Safe import refuses this field outright, so
+      // nothing that round-trips through the safe path regresses.
+      let exportedExecutionWorkspaceSettings = issue.executionWorkspaceSettings ?? undefined;
+      if (exportedExecutionWorkspaceSettings !== undefined && !revealWorkspaceRuntime) {
+        warnings.push(
+          `Task ${taskSlug} executionWorkspaceSettings was omitted from export because it carries operator-authored workspace runtime configuration.`,
+        );
+        exportedExecutionWorkspaceSettings = undefined;
+      }
       files[taskPath] = buildMarkdown(
         {
           name: issue.title,
@@ -4026,7 +4062,7 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
         labelIds: issue.labelIds ?? undefined,
         billingCode: issue.billingCode ?? null,
         projectWorkspaceKey: projectWorkspaceKey ?? undefined,
-        executionWorkspaceSettings: issue.executionWorkspaceSettings ?? undefined,
+        executionWorkspaceSettings: exportedExecutionWorkspaceSettings,
         assigneeAdapterOverrides: issue.assigneeAdapterOverrides ?? undefined,
         comments: comments.length > 0
           ? comments.map((comment) => ({
@@ -4185,6 +4221,7 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
   async function previewExport(
     companyId: string,
     input: CompanyPortabilityExport,
+    options: CompanyPortabilityExportOptions = {},
   ): Promise<CompanyPortabilityExportPreviewResult> {
     const previewInput: CompanyPortabilityExport = {
       ...input,
@@ -4199,7 +4236,7 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
     if (previewInput.include && previewInput.include.issues === undefined) {
       previewInput.include.issues = false;
     }
-    const exported = await exportBundle(companyId, previewInput);
+    const exported = await exportBundle(companyId, previewInput, options);
     return {
       ...exported,
       fileInventory: Object.keys(exported.files)

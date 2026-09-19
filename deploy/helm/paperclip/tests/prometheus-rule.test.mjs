@@ -517,6 +517,59 @@ test("PaperclipPrReviewQueueWaitSaturated uses the bounded p95 histogram and run
   assert.match(rendered, /alert: PaperclipPrReviewQueueWaitSaturated[\s\S]*?runbook_url: "[^\"]*runbooks\/pr-review-queue-wait\.md"/);
 });
 
+test("PaperclipRuntimeResourceReconciliationStuck pins both backlog gauges and the worker-down backstop (BLO-21460)", () => {
+  const rendered = renderChart(["--set", "prometheusRule.enabled=true"]);
+
+  assert.match(rendered, /alert: PaperclipRuntimeResourceReconciliationStuck/);
+  const [, expr] = rendered.match(
+    /alert: PaperclipRuntimeResourceReconciliationStuck[\s\S]*?\n\s+expr: >-?\n([\s\S]*?)\n\s+for:/,
+  ) ?? [];
+  assert.ok(expr, "runtime-resource-reconciliation-stuck alert must render an expr");
+
+  assert.match(
+    expr,
+    /max\(paperclip_external_runtime_reservations_release_pending\) > 0/,
+    "must page on a stuck release-pending external-runtime reservation",
+  );
+  assert.match(
+    expr,
+    /max\(paperclip_environment_leases_orphaned_active\) > 0/,
+    "must page on an orphaned-active environment lease",
+  );
+  // The two count arms above read a healthy 0 when the sweep that publishes
+  // them throws, because prom-client gauges retain their last value and the
+  // process stays up. Without this arm the alert is silent during exactly the
+  // kube-API outage its own description tells the operator to check for.
+  assert.match(
+    expr,
+    /max\(paperclip_orphaned_runtime_resource_metrics_refresh_success\)\s*==\s*0/,
+    "must page when the reconciliation sweep stops refreshing the backlog gauges, so a stale 0 cannot read as healthy",
+  );
+  // max(), not a bare comparison: every control-plane pod exports the gauge
+  // but only the worker runs the sweep, so a bare `== 0` would fire forever on
+  // the api pods' untouched initial 0.
+  assert.doesNotMatch(
+    expr,
+    /(?<!max\()paperclip_orphaned_runtime_resource_metrics_refresh_success\s*==\s*0/,
+    "freshness arm must aggregate with max() so non-sweeping pods cannot hold it firing",
+  );
+  assert.match(
+    expr,
+    /max\(up\{job="paperclip-control-plane", service="paperclip-workers"\}\)\s*==\s*0/,
+    "must page when the worker scrape target is down",
+  );
+  assert.match(
+    expr,
+    /absent\(up\{job="paperclip-control-plane", service="paperclip-workers"\}\)/,
+    "must alert when the worker scrape target disappears entirely",
+  );
+  assert.doesNotMatch(
+    expr,
+    /max by \(job\)/,
+    "must scope availability to the worker service, not aggregate API and worker targets",
+  );
+});
+
 test("PaperclipAgentJobBackoffLimitExceeded is deleted, not just renamed (BLO-23413)", () => {
   // BLO-23413: this alert was verified structurally unable to fire on the
   // live cluster (kube-state-metrics only ever emits ONE post-failure
@@ -1116,5 +1169,69 @@ test("PaperclipExternalRuntimeReservationStrandMetricsRefreshFailed exposes a st
   assert.match(
     rendered,
     /alert: PaperclipExternalRuntimeReservationStrandMetricsRefreshFailed[\s\S]*?runbook_url: "[^\"]*runbooks\/external-runtime-reservation-stranded\.md"/,
+  );
+});
+
+test("PaperclipRecoveryHorizonNoWakeToCurrentOwner{Elevated,Sustained} key on the never_delivered series only and take their thresholds from values (PEN-3000)", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+    "--set",
+    "prometheusRule.recoveryHorizonNoWakeToCurrentOwnerWarnPerDay=2",
+    "--set",
+    "prometheusRule.recoveryHorizonNoWakeToCurrentOwnerPagePerDay=9",
+    "--set",
+    "prometheusRule.recoveryHorizonNoWakeToCurrentOwnerPageFor=45m",
+  ]);
+
+  // The label selector is the whole point: the metric splits a scheduler-side fault
+  // (never_delivered) from the expected background rate of genuine strandings
+  // (delivered). A rule on the unlabelled counter would page on the background rate.
+  assert.match(
+    rendered,
+    /alert: PaperclipRecoveryHorizonNoWakeToCurrentOwnerElevated\n\s+expr: sum\(increase\(paperclip_recovery_horizon_expired_total\{delivery="never_delivered"\}\[1d\]\)\) > 2\n\s+for: 10m\n\s+labels:\n\s+severity: warning\n/,
+  );
+  assert.match(
+    rendered,
+    /alert: PaperclipRecoveryHorizonNoWakeToCurrentOwnerSustained\n\s+expr: sum\(increase\(paperclip_recovery_horizon_expired_total\{delivery="never_delivered"\}\[1d\]\)\) > 9\n\s+for: 45m\n\s+labels:\n\s+severity: critical\n/,
+  );
+  assert.doesNotMatch(
+    rendered,
+    /paperclip_recovery_horizon_expired_total\{delivery="delivered"\}/,
+    "the delivered series is the expected background rate and must not have an alert on it",
+  );
+  // The label is scoped to the current owner (attemptCount restarts on owner churn); the
+  // responder-facing text must say so rather than claim the row never woke anyone.
+  assert.match(
+    rendered,
+    /alert: PaperclipRecoveryHorizonNoWakeToCurrentOwnerElevated[\s\S]*?description: "[^"]*for the current owner[^"]*"/,
+  );
+  // A pager renders the alert NAME and SUMMARY with no metric HELP text attached, so those
+  // two carry the scope on their own or the operator reads a lifetime claim the data cannot
+  // support. Assert the qualification on both summaries, not just the descriptions.
+  assert.match(
+    rendered,
+    /alert: PaperclipRecoveryHorizonNoWakeToCurrentOwnerElevated[\s\S]*?summary: "[^"]*delivered to their current owner[^"]*"/,
+  );
+  assert.match(
+    rendered,
+    /alert: PaperclipRecoveryHorizonNoWakeToCurrentOwnerSustained[\s\S]*?summary: "[^"]*no wake to the current owner[^"]*"/,
+  );
+  // Regression guard on the wording itself: attemptCount 0 means "no wake reached THIS
+  // owner's queue", never "this row woke nobody in its life". An unqualified lifetime
+  // phrasing in a name or summary is the defect, so ban the phrasings outright. The \b is
+  // load-bearing: without it this also matches the "never delivered" inside the rule
+  // comment and the series name, which are the correctly-scoped uses.
+  assert.doesNotMatch(
+    rendered,
+    /\bever delivered/,
+    "an unqualified 'ever delivered' overclaims: owner churn restarts attemptCount",
+  );
+  assert.doesNotMatch(
+    rendered,
+    /alert: \w*NeverDelivered\w*/,
+    "alert names must be current-owner-scoped, not bare NeverDelivered",
   );
 });

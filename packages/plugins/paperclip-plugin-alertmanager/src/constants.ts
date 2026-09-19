@@ -111,6 +111,22 @@ export const DEFAULT_OPERATOR_SUPPRESSION_HOURS = 24;
  */
 export const MAX_OPERATOR_SUPPRESSION_HOURS = 24 * 30;
 
+/**
+ * Severities (BLO-24177) that never produce agent-actionable work. `none` is
+ * Prometheus's convention for the always-firing `Watchdog` alert (`vector(1)`)
+ * used as a dead-man's-switch heartbeat — it is designed to fire forever, so a
+ * normal `todo` issue for it can never be legitimately resolved and just
+ * recirculates through stranded-issue recovery.
+ *
+ * Deliberately a constant and not a config key. Making it configurable would
+ * mean a `done` row this plugin closed could later be re-read by `decideRefire`
+ * as an *operator* close (it has no `resolvedAt`), muting the fingerprint for
+ * the operator-suppression window — a failure mode that only exists if the list
+ * can change. `none` has exactly one member in this estate (`Watchdog`), so the
+ * knob buys nothing and costs that bug.
+ */
+export const TERMINAL_SEVERITIES: readonly string[] = ["none"];
+
 /** Default owner routes shipped with the bundled Blockcast Alertmanager plugin. */
 export const DEFAULT_OWNER_MAP: OwnerMap = {
   class: {

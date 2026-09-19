@@ -13,6 +13,7 @@ import {
 import type { ExecutionWorkspace, ExecutionWorkspaceSummary, WorkspaceRuntimeDesiredState, WorkspaceRuntimeServiceStateMap } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import { accessService, executionWorkspaceService, heartbeatService, logActivity, workspaceOperationService } from "../services/index.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
 import { mergeExecutionWorkspaceConfig, readExecutionWorkspaceConfig } from "../services/execution-workspaces.js";
 import { parseProjectExecutionWorkspacePolicy } from "../services/execution-workspace-policy.js";
 import { readProjectWorkspaceRuntimeConfig } from "../services/project-workspace-runtime-config.js";
@@ -32,8 +33,10 @@ import {
   collectExecutionWorkspaceCommandPaths,
 } from "./workspace-command-authz.js";
 import { assertCanManageExecutionWorkspaceRuntimeServices } from "./workspace-runtime-service-authz.js";
+import { redactCurrentUserValue } from "../log-redaction.js";
 import {
   publicExecutionWorkspace,
+  publicExecutionWorkspaceCloseReadiness,
   publicExecutionWorkspaces,
   publicRuntimeServices,
   publicWorkspaceOperation,
@@ -52,6 +55,13 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
   const svc = executionWorkspaceService(db);
   const access = accessService(db);
   const workspaceOperationsSvc = workspaceOperationService(db);
+  const instanceSettings = instanceSettingsService(db);
+
+  async function getCurrentUserRedactionOptions() {
+    return {
+      enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
+    };
+  }
   const heartbeat = heartbeatService(db, {
     pluginWorkerManager: opts.pluginWorkerManager,
   });
@@ -142,7 +152,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
       return;
     }
     const viewer = await resolveWorkspaceRuntimeViewer(access, req, workspace.companyId);
-    res.json({ ...readiness, runtimeServices: publicRuntimeServices(readiness.runtimeServices, viewer) });
+    res.json(publicExecutionWorkspaceCloseReadiness(readiness, viewer));
   });
 
   router.get("/execution-workspaces/:id/workspace-operations", async (req, res) => {
@@ -157,12 +167,27 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     // runs, so the captured output here is cross-agent transcript by construction. Same
     // per-operation owner resolution and the same shared withholding as the run route;
     // gating that one and leaving this open is the PEN-2777 failure exactly.
+    //
+    // PEN-3205: same username censoring as the sibling list route on `routes/agents.ts`. Both
+    // answer with the same historical `WorkspaceOperation` rows including `stdoutExcerpt` /
+    // `stderrExcerpt`, which `publicWorkspaceOperation` deliberately does NOT withhold, so
+    // censoring on one route and not the other left the same bytes legible one URL over.
+    // New rows are censored at write time as well; this still covers rows stored before that.
+    //
+    // The two are orthogonal and BOTH apply: the withholding decides *whether* captured output
+    // leaves at all, the censoring decides what the surviving text may say. Composed in the
+    // same order as the sibling route on `routes/agents.ts` — withhold first, censor the
+    // projected result — so the censoring never runs over bytes the gate already removed.
     const owners = await workspaceOperationsSvc.owningAgentIdsByRunId(operations.map((op) => op.heartbeatRunId));
-    res.json(await withholdUnentitledWorkspaceOperationOutput(
+    const projected = await withholdUnentitledWorkspaceOperationOutput(
       publicWorkspaceOperations(operations, viewer),
       owners,
       runTranscriptReadGate(req, access, workspace.companyId),
       req.actor.type === "board",
+    );
+    res.json(redactCurrentUserValue(
+      projected,
+      await getCurrentUserRedactionOptions(),
     ));
   });
 
@@ -657,9 +682,15 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
       }
 
       if (readiness.state === "blocked") {
+        // PEN-3073: the same readiness body the GET route masks. `runtime:manage` gates this
+        // handler, and that action sits in the blanket same-company agent allow-list — the exact
+        // trap `workspace-response.ts` documents — so an ordinary agent can reach this 409.
         res.status(409).json({
           error: readiness.blockingReasons[0] ?? "Execution workspace cannot be closed right now",
-          closeReadiness: readiness,
+          closeReadiness: publicExecutionWorkspaceCloseReadiness(
+            readiness,
+            await resolveWorkspaceRuntimeViewer(access, req, existing.companyId),
+          ),
         });
         return;
       }

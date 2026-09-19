@@ -4827,6 +4827,18 @@ export function agentRoutes(
         // two can be compared without opening the run.
         penstockProvider: typeof result.penstockProvider === "string" ? result.penstockProvider : null,
         penstockModel: typeof result.penstockModel === "string" ? result.penstockModel : null,
+        // PEN-3323: which *kind* of denial parked this run —
+        // `penstock.model_capacity_unavailable` (429, pool exhausted) or
+        // `penstock.model_temporarily_unavailable` (503, provider down). Both
+        // book `scheduledRetryReason = "ccrotate_capacity"` deliberately, so
+        // this is the only place the two are distinguishable, and without it
+        // this endpoint could not tell an exhausted pool from a dead provider.
+        //
+        // Two limits on reading it, so nothing is built on it that it cannot
+        // carry (see the writer's docblock in `ccrotate-capacity-retry.ts`):
+        // it is present only while the run is *parked*, and it is not a
+        // historical census.
+        penstockReason: typeof result.penstockReason === "string" ? result.penstockReason : null,
         penstockRetryAfterSeconds:
           typeof result.penstockRetryAfterSeconds === "number" ? result.penstockRetryAfterSeconds : null,
         penstockAdvertisedResumeAt:

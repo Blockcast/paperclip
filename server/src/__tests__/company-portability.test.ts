@@ -933,6 +933,61 @@ describe("company portability", () => {
     expect(preview.fileInventory.some((entry) => entry.path.startsWith("tasks/"))).toBe(false);
   });
 
+  /**
+   * PEN-3252 — the twelfth exit for `issues.executionWorkspaceSettings`, and the only one that is
+   * not a response projection. `POST /companies/:companyId/export` is gated on
+   * `assertSameCompanyCeoAgentOrBoard`, which admits a same-company CEO AGENT.
+   *
+   * Omitted rather than masked here, unlike the route exits: a bundle round-trips, so a
+   * `***REDACTED***` sentinel would be IMPORTED as a literal command string and persisted over the
+   * real one. The warning is what keeps withheld distinguishable from unset.
+   */
+  it("omits executionWorkspaceSettings from the export unless the caller is entitled (PEN-3252)", async () => {
+    const SENTINEL = "sentinel-export-provision-command-must-not-egress";
+    const portability = companyPortabilityService({} as any);
+
+    projectSvc.list.mockResolvedValue([]);
+    issueSvc.list.mockResolvedValue([
+      {
+        id: "issue-1",
+        identifier: "PAP-1",
+        title: "Write launch task",
+        description: "Task body",
+        projectId: null,
+        projectWorkspaceId: null,
+        assigneeAgentId: null,
+        status: "todo",
+        priority: "medium",
+        labelIds: [],
+        billingCode: null,
+        executionWorkspaceSettings: {
+          mode: "isolated_workspace",
+          workspaceStrategy: { type: "git_worktree", provisionCommand: SENTINEL },
+          workspaceRuntime: { services: [{ name: "web", command: SENTINEL }] },
+        },
+        assigneeAdapterOverrides: null,
+      },
+    ]);
+
+    const exportInput = {
+      include: { company: true, agents: false, projects: false, issues: true },
+    };
+
+    // Default is withheld: a caller that passes no entitlement gets the safe answer.
+    const withheld = await portability.exportBundle("company-1", exportInput);
+    expect(asTextFile(withheld.files[".paperclip.yaml"])).not.toContain(SENTINEL);
+    expect(
+      withheld.warnings.some((warning) => warning.includes("executionWorkspaceSettings was omitted")),
+    ).toBe(true);
+
+    // …and an entitled caller still gets a faithful, re-importable bundle. Without this case the
+    // assertion above would also pass on an export that dropped the field unconditionally.
+    const revealed = await portability.exportBundle("company-1", exportInput, {
+      revealWorkspaceRuntime: true,
+    });
+    expect(asTextFile(revealed.files[".paperclip.yaml"])).toContain(SENTINEL);
+  });
+
   it("exports portable project workspace metadata and remaps it on import", async () => {
     const portability = companyPortabilityService({} as any);
 

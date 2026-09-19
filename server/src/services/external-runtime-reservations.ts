@@ -297,7 +297,9 @@ export async function claimRunWithExternalRuntimeSlotPool(
 }
 
 export async function getActiveExternalRuntimeReservation(
-  db: Db,
+  // Accepts a transaction too: the lifecycle finalizer re-reads the
+  // reservation under the run-row lock it already holds (BLO-33019).
+  db: Pick<Db, "select">,
   runId: string,
 ): Promise<ExternalRuntimeReservation | null> {
   return db
@@ -499,6 +501,17 @@ export async function rearmExternalRuntimeReservationForRetry(
         eq(externalRuntimeReservations.state, "launching"),
         eq(externalRuntimeReservations.state, "launched"),
       ),
+      // BLO-33019: the lifecycle reaper finalizes a run with a status CAS on
+      // heartbeat_runs and re-reads this reservation under the run row's lock
+      // right before that write. Taking the same lock here, and requiring the
+      // run to still be running, serializes the two: whichever commits first
+      // wins and the other is a no-op, instead of a re-armed reservation
+      // pointing a replacement launch at a run that is already `failed`.
+      sql`${externalRuntimeReservations.runId} in (
+        select ${heartbeatRuns.id} from ${heartbeatRuns}
+        where ${heartbeatRuns.id} = ${input.runId} and ${heartbeatRuns.status} = 'running'
+        for update
+      )`,
     ))
     .returning()
     .then((rows) => rows[0] ?? null);
