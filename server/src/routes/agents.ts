@@ -1778,10 +1778,18 @@ export function agentRoutes(
    * `PATCH /agents/:id` this guard also runs against the *effective* config,
    * which `resolveRawEffectiveAdapterConfigForPatch` shallow-merges onto the
    * stored config precisely to preserve these keys. Every bundle-managed agent
-   * therefore carried all four keys into the guard, so any agent-authored
-   * `adapterConfig` write — one naming no instructions key at all, or a
-   * verbatim no-op round-trip — was refused with a message listing keys the
-   * caller never sent (BLO-32332). There was no request shape that could pass.
+   * therefore carried its whole `KNOWN_INSTRUCTIONS_BUNDLE_KEYS` set into the
+   * guard, so any agent-authored `adapterConfig` write — one naming no
+   * instructions key at all, or a verbatim no-op round-trip — was refused with
+   * a message listing keys the caller never sent (BLO-32332). There was no
+   * request shape that could pass.
+   *
+   * Check the value that is actually persisted, not just the request: on
+   * `PATCH /agents/:id` the persisted config is the output of
+   * `syncInstructionsBundleConfigFromFilePath`, which re-derives the bundle
+   * keys from `instructionsFilePath` and resolves a relative one against
+   * `adapterConfig.cwd` — a key with no agent-actor guard of its own. So that
+   * call site runs this guard a second time on the post-sync result.
    *
    * `existingAdapterConfig` is omitted on create and hire, where there is no
    * prior state and every key present is therefore a change. Removal is not
@@ -3768,6 +3776,25 @@ export function agentRoutes(
         existingAdapterConfig,
       });
       patchData.adapterConfig = syncInstructionsBundleConfigFromFilePath(existing, normalizedEffectiveAdapterConfig);
+      // The sync above re-derives the bundle keys from `instructionsFilePath`,
+      // resolving a relative one against `adapterConfig.cwd`. `cwd` is not an
+      // instructions key and has no agent-actor guard, so the check before the
+      // sync passes on a body naming only `cwd` — every instructions value is
+      // byte-identical to stored at that point — and the sync then relocates
+      // the bundle. Re-check what is actually written.
+      //
+      // The baseline is the stored config put through the same sync, not the
+      // stored row: for a legacy relative `instructionsFilePath` the sync
+      // rewrites the keys on every write, so diffing against the raw row would
+      // refuse writes that move nothing — the BLO-32332 bug again, one step
+      // later. Comparing sync(stored) with sync(next) asks only whether this
+      // write moved the bundle.
+      assertNoAgentInstructionsConfigMutation(
+        req,
+        asRecord(patchData.adapterConfig),
+        "adapterConfig",
+        syncInstructionsBundleConfigFromFilePath(existing, existingAdapterConfig),
+      );
       // PATCH writes `adapterConfig` straight through to the service, so it was
       // the one skill-writing route with no skill validation at all — hire and
       // create already resolve strictly, and skills/sync at least resolves. That
