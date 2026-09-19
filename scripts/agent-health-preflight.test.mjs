@@ -10,12 +10,14 @@ import {
   classifyAgentHealth,
   classifyHumanReviewGate,
   classifyRoutineRuns,
+  classifyTerminalBlocker,
   compareIdentifier,
   conservedAgainstPlan,
   currentWindowEnd,
   deriveRendererOutput,
   executeDetailWrite,
   maxStepPercent,
+  percentIncrease,
   planDetailShards,
   runComparatorCases,
   runDetailWriteFixture,
@@ -868,6 +870,88 @@ describe("agent-health classification seam", () => {
       }).reason,
       "human_review_gate:appr-2",
     );
+  });
+
+  it("ranks a cancelled blocker edge above every other terminal signal", () => {
+    const base = {
+      assigneeAgentId: "a-1",
+      lastBlockerTerminalAt: "2026-08-02T00:00:00Z",
+      edges: [{ status: "done" }, { status: "done" }],
+    };
+    const byAssignee = [{ createdAt: "2026-08-03T00:00:00Z", authorType: "agent", authorAgentId: "a-1" }];
+
+    assert.equal(classifyTerminalBlocker({ ...base, comments: byAssignee }), "blocked_reaffirmed");
+    // A cancelled edge never resolves, so it outranks a live reaffirmation.
+    assert.equal(
+      classifyTerminalBlocker({ ...base, comments: byAssignee, edges: [{ status: "cancelled" }, { status: "done" }] }),
+      "blocked_cancelled_edge",
+    );
+    // Only the assignee reaffirms. System chatter and another agent do not —
+    // including a platform notice stamped with the assignee's own id, which is
+    // not the assignee speaking.
+    for (const comment of [
+      { createdAt: "2026-08-03T00:00:00Z", authorType: "system", authorAgentId: null },
+      { createdAt: "2026-08-03T00:00:00Z", authorType: "system", authorAgentId: "a-1" },
+      { createdAt: "2026-08-03T00:00:00Z", authorType: "agent", authorAgentId: "a-other" },
+    ]) {
+      assert.equal(classifyTerminalBlocker({ ...base, comments: [comment] }), "blocked_attention");
+    }
+    // Predating the terminal moment is not a reaffirmation of it.
+    assert.equal(
+      classifyTerminalBlocker({
+        ...base,
+        comments: [{ createdAt: "2026-08-01T00:00:00Z", authorType: "agent", authorAgentId: "a-1" }],
+      }),
+      "blocked_attention",
+    );
+    // Unprovable, not false.
+    assert.equal(
+      classifyTerminalBlocker({ ...base, comments: byAssignee, lastBlockerTerminalAt: null }),
+      "blocked_attention",
+    );
+    // …and the null check must be a real guard, not an accident of string
+    // comparison. With epoch-ms timestamps `1735 > null` coerces to `1735 > 0`
+    // and is TRUE, so dropping the guard turns an unprovable block into a
+    // reaffirmed one. String dates hide this: `"2026-…" > null` is NaN-false.
+    assert.equal(
+      classifyTerminalBlocker({
+        ...base,
+        lastBlockerTerminalAt: null,
+        comments: [{ createdAt: Date.parse("2026-08-03T00:00:00Z"), authorType: "agent", authorAgentId: "a-1" }],
+      }),
+      "blocked_attention",
+    );
+    assert.equal(classifyTerminalBlocker(), "blocked_attention");
+  });
+
+  it("does not let an unassigned issue reaffirm its own block via a null author", () => {
+    // null === null is an equality that cannot fail: without the assigneeAgentId
+    // guard this returns blocked_reaffirmed with no assignee in existence.
+    assert.equal(
+      classifyTerminalBlocker({
+        edges: [{ status: "done" }],
+        lastBlockerTerminalAt: "2026-08-02T00:00:00Z",
+        assigneeAgentId: null,
+        comments: [{ createdAt: "2026-08-03T00:00:00Z", authorType: "agent", authorAgentId: null }],
+      }),
+      "blocked_attention",
+    );
+  });
+
+  it("computes a raise percentage that responds to both operands", () => {
+    assert.equal(Math.round(percentIncrease(800000, 2320000)), 190);
+    assert.equal(Math.round(percentIncrease(1000000, 2650000)), 165);
+    // The cumulative half of the cap-raise claim must cross 25% where the
+    // per-step half does not — asserted against the same steps maxStepPercent reads.
+    const steps = [1.08, 1.08, 1.08];
+    const cumulative = percentIncrease(1, steps.reduce((acc, step) => acc * step, 1));
+    assert.ok(cumulative > 25, "three 1.08 steps compound past the threshold");
+    assert.ok(maxStepPercent(steps) < 25, "no individual step crosses it");
+    // A baseline that would make every threshold comparison vacuous is refused
+    // rather than returned as Infinity/NaN.
+    assert.throws(() => percentIncrease(0, 100), /positive/);
+    assert.throws(() => percentIncrease(-1, 100), /positive/);
+    assert.throws(() => percentIncrease(100, Number.NaN), /finite/);
   });
 
   it("treats missing heartbeat config as different from explicit false", () => {

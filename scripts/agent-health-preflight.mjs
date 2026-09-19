@@ -539,14 +539,6 @@ export function runMandatoryFixtures() {
   ));
 
   // 5. Terminal-blocker precedence: cancelled > reaffirmed > stale edge.
-  const classifyTerminal = ({ edges, comments, assigneeAgentId, lastBlockerTerminalAt }) => {
-    if (edges.some((edge) => edge.status === "cancelled")) return "blocked_cancelled_edge";
-    if (lastBlockerTerminalAt == null) return "blocked_attention";
-    const reaffirmed = comments.some((comment) => comment.createdAt > lastBlockerTerminalAt
-      && comment.authorType === "agent"
-      && comment.authorAgentId === assigneeAgentId);
-    return reaffirmed ? "blocked_reaffirmed" : "blocked_attention";
-  };
   const base = {
     assigneeAgentId: "fixture-assignee",
     lastBlockerTerminalAt: "2026-08-02T00:00:00Z",
@@ -554,30 +546,46 @@ export function runMandatoryFixtures() {
   };
   const assigneeComment = [{ createdAt: "2026-08-03T00:00:00Z", authorType: "agent", authorAgentId: "fixture-assignee" }];
   const terminalPass =
-    classifyTerminal({ ...base, comments: assigneeComment }) === "blocked_reaffirmed"
-    && classifyTerminal({ ...base, comments: [] }) === "blocked_attention"
-    && classifyTerminal({ ...base, comments: [{ createdAt: "2026-08-03T00:00:00Z", authorType: "system", authorAgentId: null }] }) === "blocked_attention"
-    && classifyTerminal({ ...base, comments: [{ createdAt: "2026-08-03T00:00:00Z", authorType: "agent", authorAgentId: "fixture-other-agent" }] }) === "blocked_attention"
-    && classifyTerminal({ ...base, comments: assigneeComment, lastBlockerTerminalAt: null }) === "blocked_attention"
-    && classifyTerminal({ ...base, comments: assigneeComment, edges: [{ status: "cancelled" }, { status: "done" }] }) === "blocked_cancelled_edge";
+    classifyTerminalBlocker({ ...base, comments: assigneeComment }) === "blocked_reaffirmed"
+    && classifyTerminalBlocker({ ...base, comments: [] }) === "blocked_attention"
+    && classifyTerminalBlocker({ ...base, comments: [{ createdAt: "2026-08-03T00:00:00Z", authorType: "system", authorAgentId: null }] }) === "blocked_attention"
+    && classifyTerminalBlocker({ ...base, comments: [{ createdAt: "2026-08-03T00:00:00Z", authorType: "agent", authorAgentId: "fixture-other-agent" }] }) === "blocked_attention"
+    && classifyTerminalBlocker({ ...base, comments: assigneeComment, lastBlockerTerminalAt: null }) === "blocked_attention"
+    && classifyTerminalBlocker({ ...base, comments: assigneeComment, edges: [{ status: "cancelled" }, { status: "done" }] }) === "blocked_cancelled_edge"
+    // A platform notice STAMPED with the assignee is not the assignee speaking.
+    // Without the authorType conjunct this reads as a reaffirmation.
+    && classifyTerminalBlocker({
+      ...base,
+      comments: [{ createdAt: "2026-08-03T00:00:00Z", authorType: "system", authorAgentId: "fixture-assignee" }],
+    }) === "blocked_attention"
+    // Predating the terminal moment is not a reaffirmation of it.
+    && classifyTerminalBlocker({
+      ...base,
+      comments: [{ createdAt: "2026-08-01T00:00:00Z", authorType: "agent", authorAgentId: "fixture-assignee" }],
+    }) === "blocked_attention"
+    // An unassigned issue must not read its own system chatter as a reaffirmation.
+    && classifyTerminalBlocker({
+      ...base,
+      assigneeAgentId: null,
+      comments: [{ createdAt: "2026-08-03T00:00:00Z", authorType: "agent", authorAgentId: null }],
+    }) === "blocked_attention";
   fixtures.push(fixture(
     V4_FIXTURE_MANIFEST[4],
     terminalPass,
-    "cases 1-5: reaffirmed, stale, system-author, other-agent, unprovable, cancelled-wins",
+    "cases 1-8: reaffirmed, stale, system-author, other-agent, unprovable, cancelled-wins,"
+      + " system-stamped-as-assignee, predating, unassigned",
   ));
 
   // 6. Cap raise: cumulative over a rolling 30d window, not per-step.
-  const capAt = (events, baseline) => events.reduce((acc, event) => event.to, baseline);
   const july = {
-    cto: capAt([{ to: 1100000 }, { to: 1200000 }, { to: 2320000 }], 800000),
-    multicast: capAt([{ to: 1300000 }, { to: 1380000 }, { to: 2650000 }], 1000000),
+    cto: [{ to: 1100000 }, { to: 1200000 }, { to: 2320000 }].at(-1).to,
+    multicast: [{ to: 1300000 }, { to: 1380000 }, { to: 2650000 }].at(-1).to,
   };
-  const pct = (current, prior) => ((current - prior) / prior) * 100;
-  const ctoPct = pct(july.cto, 800000);
-  const multicastPct = pct(july.multicast, 1000000);
+  const ctoPct = percentIncrease(800000, july.cto);
+  const multicastPct = percentIncrease(1000000, july.multicast);
   const decompositionSteps = [1.08, 1.08, 1.08];
   const decomposition = decompositionSteps.reduce((acc, step) => acc * step, 1);
-  const decompositionPct = (decomposition - 1) * 100;
+  const decompositionPct = percentIncrease(1, decomposition);
   // Derived from the SAME array the cumulative reads — see maxStepPercent.
   const maxStepPct = maxStepPercent(decompositionSteps);
   const capRaisePass =
@@ -614,6 +622,44 @@ export function runMandatoryFixtures() {
 }
 
 const FAILING_RUN_STATUSES = new Set(["failed", "error", "adapter_failed"]);
+
+/**
+ * §8 terminal-blocker precedence: cancelled edge > assignee reaffirmation > stale.
+ *
+ * A `cancelled` blocker never resolves, so an edge pointing at one wedges the
+ * dependent row rather than draining it — that outranks everything else and is
+ * reported first. Below it, a blocker whose terminal moment has passed is only
+ * `blocked_reaffirmed` when the ASSIGNEE said something after that moment;
+ * system chatter and another agent's comment are not the assignee restating the
+ * block, and `lastBlockerTerminalAt == null` means the claim is unprovable
+ * rather than false.
+ *
+ * This exists as an exported predicate because fixture 5 previously asserted an
+ * arrow function defined inside its own body, calling nothing in this module:
+ * its `pass` was a compile-time constant that survived every mutation, while
+ * still counting toward the 7-fixture manifest that gates `runPreflight` — the
+ * same defect `classifyHumanReviewGate` was extracted to fix, one fixture down
+ * (Ally review, PR #1571).
+ *
+ * The `assigneeAgentId != null` guard is new with the extraction: the inline
+ * version compared `comment.authorAgentId === assigneeAgentId` unguarded, so on
+ * an UNASSIGNED issue a `null`-authored agent comment matched `null` and read as
+ * a reaffirmation by an assignee that does not exist — an equality that cannot
+ * fail, which is the shape this file's header bans.
+ */
+export function classifyTerminalBlocker({
+  edges = [],
+  comments = [],
+  assigneeAgentId = null,
+  lastBlockerTerminalAt = null,
+} = {}) {
+  if (edges.some((edge) => edge?.status === "cancelled")) return "blocked_cancelled_edge";
+  if (lastBlockerTerminalAt == null || assigneeAgentId == null) return "blocked_attention";
+  const reaffirmed = comments.some((comment) => comment?.createdAt > lastBlockerTerminalAt
+    && comment?.authorType === "agent"
+    && comment?.authorAgentId === assigneeAgentId);
+  return reaffirmed ? "blocked_reaffirmed" : "blocked_attention";
+}
 
 /**
  * §8 human-review gate: an issue parks only behind a card that is STILL pending.
@@ -713,6 +759,30 @@ export function classifyAgentHealth(agent) {
  */
 export function canonicalRows(rows) {
   return (rows ?? []).filter((row) => row?.category != null && row?.superseded !== true);
+}
+
+/**
+ * Percentage increase from `from` to `to`.
+ *
+ * The `cap_raise_july_backtest` fixture computed this as a local `pct` arrow,
+ * alongside a local `capAt` fold, leaving `maxStepPercent` as its only module
+ * hook — so the cumulative half of its own cumulative-vs-per-step claim was
+ * asserted against arithmetic no production mutation could reach (Ally review,
+ * PR #1571).
+ *
+ * Throws on a non-positive baseline rather than returning `Infinity` or `NaN`,
+ * either of which compares false against every threshold and so would pass a
+ * `> 25` bound vacuously in the same way `Math.max()`'s `-Infinity` passed a
+ * `< 25` bound before `maxStepPercent` guarded it.
+ */
+export function percentIncrease(from, to) {
+  if (!Number.isFinite(from) || from <= 0) {
+    throw new Error("percentIncrease: baseline must be positive — a ratio against zero is not a raise");
+  }
+  if (!Number.isFinite(to)) {
+    throw new Error("percentIncrease: target must be a finite number");
+  }
+  return ((to - from) / from) * 100;
 }
 
 /**
