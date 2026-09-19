@@ -41,6 +41,26 @@ const code = workflow
 
 const crons = [...code.matchAll(/^\s*- cron:\s*["']([^"']+)["']/gm)].map((m) => m[1]);
 
+/**
+ * The entries of the workflow's TOP-LEVEL `permissions:` block, in order.
+ *
+ * Scoped deliberately. Matching `actions:\s*write` against the whole file lets a
+ * grant declared in an unrelated job — or merely discussed in a comment — satisfy
+ * an assertion whose message claims the workflow itself holds it. Parsed from
+ * `code`, so the header's own prose about these permissions cannot stand in for
+ * them either.
+ */
+const topLevelPermissions = (() => {
+  const block = code.split(/^permissions:\n/m)[1] ?? '';
+  const granted = [];
+  for (const line of block.split('\n')) {
+    if (!/^ {2}\S/.test(line)) break; // first non-entry line ends the block
+    const entry = line.replace(/#.*$/, '').trim();
+    if (entry) granted.push(entry);
+  }
+  return granted;
+})();
+
 /** Expand a cron hour field ("7", "*", "0-6,8-23") to the hours it matches. */
 const hours = (cron) => {
   const field = cron.split(/\s+/)[1];
@@ -264,6 +284,7 @@ test('the workflow grants exactly the permissions the new paths need, and no mor
     if (entry) granted.push(entry);
   }
   assert.deepEqual(granted, ['contents: read', 'actions: write', 'issues: write']);
+  assert.deepEqual(topLevelPermissions, granted, 'the shared parser must agree');
 });
 
 // PEN-3315. The supersede resets the pending run's age by construction — it
@@ -484,7 +505,15 @@ test('the escalation step can read run history for the supersede chain', () => {
   // The derivation calls GET /actions/workflows/docker.yml/runs and GET
   // /compare. Both are `actions: read` / `contents: read`, which the workflow
   // already holds — assert it has not been narrowed below what the chain needs.
-  assert.match(workflow, /permissions:/);
-  assert.match(workflow, /actions:\s*write/, 'cancel+dispatch still needs actions: write');
-  assert.match(workflow, /contents:\s*read/, 'compare needs contents: read');
+  // Block-scoped: a grant on some unrelated job would not give the ESCALATION
+  // step these, so a whole-file match would pass while the chain read 403s.
+  assert.ok(topLevelPermissions.length > 0, 'workflow must declare top-level permissions');
+  assert.ok(
+    topLevelPermissions.includes('actions: write'),
+    'cancel+dispatch still needs actions: write',
+  );
+  assert.ok(
+    topLevelPermissions.includes('contents: read'),
+    'compare needs contents: read',
+  );
 });

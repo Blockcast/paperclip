@@ -120,29 +120,56 @@ export async function deriveStallStartFromSupersedeChain({
       })
       .sort((a, b) => Date.parse(b.cancelledAt) - Date.parse(a.cancelledAt));
 
-    if (candidates.length === 0) {
-      stoppedBecause = depth === 0 ? 'no-supersede-found' : 'chain-complete';
-      break;
-    }
-
-    const predecessor = candidates[0];
-    consumed.add(predecessor.databaseId);
-
     // The ancestry test is what separates a forward supersede from every other
     // reason a dispatch might have been cancelled near a new one. `null` (the
     // compare call failed) chains anyway and records that it was unverified:
     // refusing the link on a transient API error would reintroduce the exact
     // under-report this module exists to fix, whereas chaining on a
     // time-proximate but unverified link can only over-state the age.
-    let ancestry = null;
-    try {
-      ancestry = await isAncestor(predecessor.headSha, current.headSha);
-    } catch {
-      ancestry = null;
+    //
+    // A definitive `false` rejects only THAT CANDIDATE, never the walk. The
+    // sort above anticipates several cancels in one window, and this workflow
+    // has produced exactly that (`scheduled-production-deploy.yml`: "two
+    // dispatches 28min apart", 2026-08-30). If a duplicate dispatch at the same
+    // master sha is cancelled a few seconds nearer to us than the real
+    // supersede, `identical` resolves to `false` — and abandoning the walk
+    // there would report a 46h stall as 3h on a green dispatcher, which is the
+    // one direction this module must never fail in (see "Direction of error").
+    // So try the next-closest instead. Termination is unchanged: every
+    // candidate is `consumed` before it is tested, so the window strictly
+    // empties.
+    let predecessor = null;
+    let predecessorAncestry = null;
+    let rejectedForAncestry = false;
+
+    for (const candidate of candidates) {
+      consumed.add(candidate.databaseId);
+
+      let ancestry = null;
+      try {
+        ancestry = await isAncestor(candidate.headSha, current.headSha);
+      } catch {
+        ancestry = null;
+      }
+
+      if (ancestry === false) {
+        rejectedForAncestry = true;
+        continue;
+      }
+
+      predecessor = candidate;
+      predecessorAncestry = ancestry;
+      break;
     }
 
-    if (ancestry === false) {
-      stoppedBecause = 'not-a-forward-replace';
+    if (!predecessor) {
+      // An exhausted window still distinguishes its two causes: nothing was in
+      // range at all, versus everything in range was tested and refused.
+      if (rejectedForAncestry) {
+        stoppedBecause = 'not-a-forward-replace';
+      } else {
+        stoppedBecause = depth === 0 ? 'no-supersede-found' : 'chain-complete';
+      }
       break;
     }
 
@@ -152,7 +179,7 @@ export async function deriveStallStartFromSupersedeChain({
       createdAt: predecessor.createdAt,
       headSha: predecessor.headSha,
       replacedRunId: current.databaseId,
-      ancestryVerified: ancestry === true,
+      ancestryVerified: predecessorAncestry === true,
     });
 
     current = predecessor;
