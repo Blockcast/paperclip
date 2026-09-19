@@ -786,6 +786,452 @@ export function withholdAgentConfigKeys(
 }
 
 /**
+ * The two run-event fields that carry transcript content (PEN-3142).
+ *
+ * `message` and `payload` are the only fields `appendRunEvent` fills from
+ * caller-supplied material; the rest of the row (`id`, `runId`, `agentId`,
+ * `seq`, `eventType`, `stream`, `level`, `color`, `createdAt`) is an envelope
+ * the server writes, and it stays readable so a company peer can still watch
+ * the *shape* of a run.
+ */
+const WITHHELD_RUN_EVENT_CONTENT_KEYS = ["message", "payload"] as const;
+
+/**
+ * Entitlement filter for `GET /heartbeat-runs/:runId/events`, and a sibling in
+ * kind to {@link withholdAgentConfigKeys}: it decides what the caller may
+ * *see*, not what is *secret*. `redactEventPayload` still runs first and does
+ * the secret-scanning job.
+ *
+ * WITHHELDS EVERY EVENT'S CONTENT, NOT A CLASSIFIED SUBSET — this is the whole
+ * design, and an eventType allowlist was considered and rejected:
+ *
+ *  - `heartbeat.ts` accepts an adapter-chosen `eventType` (length-clamped only)
+ *    and writes that event's `message`/`payload` verbatim, so the type space is
+ *    open and an adapter can self-declare any label, including `lifecycle`.
+ *  - `lifecycle` is not state-only even from in-repo emitters. It carries the
+ *    agent-written `issue-continuation-summary` document body through
+ *    `nextAction`, and it promotes the adapter's own failure text into
+ *    `message` on the terminal-decision paths.
+ *
+ * So a type allowlist would make the security property depend on a convention
+ * no test enforces, and would reopen silently the first time someone routes
+ * output through an allowlisted label. Withholding by default inverts that: a
+ * new event type is withheld until someone deliberately widens this.
+ *
+ * Run STATE is unaffected. Everything the PEN-3140 decision holds
+ * company-readable — status, exit/park reason, the retry edge, watchdog
+ * decisions, `lastActivityAt`, error text, workspace operations — is served by
+ * `GET /heartbeat-runs/:runId` and `/workspace-operations`, not from here.
+ *
+ * `null` rather than a `REDACTED_EVENT_VALUE` sentinel, for the reason given on
+ * `withholdAgentConfigKeys`: that sentinel means "a scanner blanked this", and
+ * both columns are already nullable, so an unentitled read is shaped exactly
+ * like an event that genuinely carried no content. `withheldFields` is what
+ * tells the two apart — without it a client cannot distinguish "not entitled"
+ * from "empty", which is the ambiguity that makes a filter look like a bug.
+ *
+ * Read projection only: nothing here rewrites a stored row.
+ */
+export function withholdRunEventTranscriptContent(
+  event: Record<string, unknown>,
+): Record<string, unknown> & { withheldFields: string[] } {
+  const out: Record<string, unknown> = { ...event };
+  const withheldFields: string[] = [];
+  for (const key of WITHHELD_RUN_EVENT_CONTENT_KEYS) {
+    if (out[key] !== null && out[key] !== undefined) withheldFields.push(key);
+    out[key] = null;
+  }
+  return { ...out, withheldFields };
+}
+
+/**
+ * The live-event PUSH channel carries the same transcript content the two REST
+ * routes above withdraw, to the same peers (PEN-3142, Ally review at
+ * `7d859154`). `subscribeCompanyLiveEvents` fans every company event out to
+ * every subscriber, so narrowing only the pull paths would have left the
+ * highest-fidelity copy of the material on an ungated socket — the PEN-2777
+ * split-sibling failure this change exists to close, one sibling further out.
+ *
+ * Three published types carry it: `heartbeat.run.log` (`chunk`, a verbatim
+ * slice of the run log body), `heartbeat.run.event` (`message` / `payload`, the
+ * same two keys {@link withholdRunEventTranscriptContent} nulls), and
+ * `heartbeat.run.progress` (`lastAssistantSnippet`, a
+ * `WITHHELD_RUN_STATE_CONTENT_KEYS` member).
+ *
+ * KEY-SHAPED RATHER THAN TYPE-SHAPED, and deliberately so. `LiveEventType` is a
+ * closed server-owned union (`LIVE_EVENT_TYPES`), so a type allowlist would be
+ * *sound* today — unlike the adapter-chosen `eventType` space that forced the
+ * all-events posture on `withholdRunEventTranscriptContent`. It is still the
+ * wrong shape: a type allowlist silently reopens the moment someone adds a
+ * twelfth live event type carrying prose, and nothing would fail. Matching on
+ * the key names instead means a new type carrying `chunk` / `message` /
+ * `payload` / `lastAssistantSnippet` is withheld the day it is added, and
+ * widening is the deliberate act rather than the accident.
+ *
+ * Verified against every current emitter: no state-only type carries any of
+ * these four keys. `heartbeat.run.status` carries `error`, `heartbeat.run.queued`
+ * carries `triggerDetail`, `agent.status` carries `outcome`, and
+ * `activity.logged` carries `details` — all four stay untouched here, because
+ * the PEN-3140 decision keeps error text and activity state company-readable.
+ *
+ * `currentToolName` is NOT withheld, matching the REST side exactly: the
+ * projection there recomputes `currentStatusMessage` *from* it rather than
+ * nulling it, which makes it state. Withholding it here would contradict the
+ * decision this function exists to enforce.
+ *
+ * Withholds the fields rather than dropping the event, for the reason the
+ * envelope on `/events` is preserved: a peer must still be able to see that a
+ * run is producing output, which is run STATE, while not being able to read it.
+ */
+const WITHHELD_LIVE_EVENT_CONTENT_KEYS = [
+  "chunk",
+  "message",
+  "payload",
+  "lastAssistantSnippet",
+] as const;
+
+export function withholdLiveEventTranscriptContent(
+  payload: Record<string, unknown>,
+): Record<string, unknown> & { withheldFields: string[] } {
+  const out: Record<string, unknown> = { ...payload };
+  const withheldFields: string[] = [];
+  for (const key of WITHHELD_LIVE_EVENT_CONTENT_KEYS) {
+    if (!(key in out)) continue;
+    if (out[key] !== null && out[key] !== undefined) withheldFields.push(key);
+    out[key] = null;
+  }
+  return { ...out, withheldFields };
+}
+
+/**
+ * True when a live-event payload carries any transcript-bearing key, so the
+ * caller can skip the decision entirely for the state-only majority
+ * (`heartbeat.run.queued`, `agent.status`, `external_object.updated`, …).
+ *
+ * This is an optimisation, not the control: {@link withholdLiveEventTranscriptContent}
+ * is what enforces the boundary, and it is safe to call on any payload.
+ */
+export function liveEventCarriesTranscriptContent(payload: Record<string, unknown>): boolean {
+  return WITHHELD_LIVE_EVENT_CONTENT_KEYS.some(
+    (key) => payload[key] !== null && payload[key] !== undefined,
+  );
+}
+
+/**
+ * The run-STATE routes carry transcript content too (PEN-3149 decision, folded
+ * into PEN-3142). `GET /heartbeat-runs/:runId` returns every column of
+ * `heartbeat_runs`, which includes captured output and the adapter's own result
+ * blob; the company list route and `/issues/:issueId/live-runs` carry narrower
+ * slices of the same material.
+ *
+ * Narrowing `/log` and `/events` while leaving these open would have been
+ * decorative: the same prose exits here, in bulk, without even a per-run fetch.
+ */
+const WITHHELD_RUN_STATE_CONTENT_KEYS = [
+  "stdoutExcerpt",
+  "stderrExcerpt",
+  "lastAssistantSnippet",
+  // The four `result_*` columns below are Postgres GENERATED columns
+  // (`packages/db/src/schema/heartbeat_runs.ts`, migration 0079) defined as
+  // `left(result_json ->> '<key>', 500)`. They are the same free text this
+  // function strips out of `resultJson`, mirrored to the top level under
+  // different key names — so projecting the blob alone closes one door and
+  // leaves its twin open.
+  //
+  // They reach the wire because `getRun` selects `heartbeatRunSafeColumns`,
+  // which spreads `getTableColumns(heartbeatRuns)` and therefore includes every
+  // generated column (verified: 71 columns, these four among them). The company
+  // LIST route is unaffected — `heartbeat.list` destructures them out of each
+  // row and folds them into its own `resultJson` summary — which is exactly why
+  // a fixture copied from the list route would not have caught this.
+  //
+  // `resultError` is deliberately NOT here, matching `error` inside the blob and
+  // `error` / `errorCode` at the top level: the PEN-3140 decision keeps error
+  // text on the company-readable side.
+  "resultSummary",
+  "resultResult",
+  "resultMessage",
+  // `nextAction` is a DISTILLATE of every source this function withholds, not an
+  // independent state field, and that makes it the third instance of the same
+  // re-derivation trap as `currentStatusMessage` below. `classifyRunLiveness`
+  // persists it from `extractNextAction` (`services/run-liveness.ts`), whose
+  // candidate list is, in order: issue comment bodies, `resultJson.nextAction`,
+  // `resultFinalText` (= `resultJson.summary` / `.result` / `.message` /
+  // `.error`), the issue continuation-summary body, then `rawSources` (=
+  // `resultJson.stdout` / `.stderr`, `stdoutExcerpt`, `stderrExcerpt`). Every
+  // one of those except `error` is withheld here or in
+  // `WITHHELD_RUN_RESULT_JSON_CONTENT_KEYS`.
+  //
+  // It is not a summary or a classification of that text either — the extractor
+  // returns the matched line VERBATIM, capped at 500 chars. So leaving it
+  // populated hands an unentitled reader a literal excerpt of the transcript
+  // this row exists to withhold, on the same response, one key over.
+  //
+  // Nulling it on the wire does not touch any consumer: the continuation
+  // decider (`heartbeat.ts`), the liveness classifier and the activity sweep
+  // all read the column from the database, never this projection.
+  "nextAction",
+] as const;
+
+/**
+ * `resultJson` is NOT all-or-nothing, and withholding the whole blob would break
+ * live fleet diagnosis: PEN-2501 switched its throttle-family filter to
+ * `resultJson.penstockReason`, and PEN-3129 / PEN-2513 read capacity refusals
+ * out of it. So project *inside* the object.
+ *
+ * **Why a denylist could not work here.** `resultJson` is an open
+ * `Record<string, unknown>` written straight from a third party's own result
+ * event — four adapter families persist it verbatim (`claude-local` and
+ * `claude_k8s` `parse.ts`, `gemini-local/execute.ts:717`, and the
+ * `openclaw-gateway` JSON-RPC payloads) — and PEN-3153 establishes that
+ * **nothing scrubs it on the write path at all**. A denylist of the five
+ * free-text keys we happen to know therefore fails open twice over: an adapter
+ * that renames its output field, or a new adapter that invents one, writes
+ * unscrubbed run output under a key no list mentions and the peer projection
+ * passes it through. Ally's review of PR #1741 called this out; it is the same
+ * open-`Record` boundary failure as door #12 / #15.
+ *
+ * **Why a pure key allowlist could not work either.** A census of every reader
+ * of the blob found ~90 live keys across those four adapter families plus the
+ * vendor passthrough keys nobody enumerates (`uuid`, `num_turns`,
+ * `duration_ms`, `modelUsage`, …), and five more that do not exist in the
+ * database at all — `truncated`, `truncationReason`, `originalSizeBytes`,
+ * `stdoutTruncated`, `stderrTruncated` are synthesized into the wire object by
+ * the oversize-blob SQL in `heartbeat.ts:3938-3972`. A key allowlist silently
+ * drops every key it forgets, and that list is not knowable from this file.
+ *
+ * **So the rule is value-shaped, not key-shaped**, which is the second option
+ * the review offered. The exposure is *prose*, and prose is a string:
+ *
+ * - a string value is kept only if its key is named below,
+ * - numbers, booleans and null are kept regardless of key — they cannot carry
+ *   a transcript, which is what preserves every unenumerated vendor counter,
+ * - objects and arrays recurse under the same rule.
+ *
+ * The recursion is the half a key allowlist cannot reach. `workspaceValidation`
+ * and `externalLifecycleRecovery` read as platform-authored machine blocks and
+ * an earlier cut of this change allowlisted them whole — but
+ * `workspaceValidation.plainLanguageReason` (`workspace-runtime.ts:1683`),
+ * `externalLifecycleRecovery.jobMessage` / `.prReviewErrorMessage`, and
+ * `.containerDiagnostics` (which carries container log tails, i.e. captured
+ * output) are prose sitting inside them. Recursing withholds those subkeys
+ * without needing anyone to have enumerated them.
+ *
+ * `error` and `errorMessage` are prose and are kept anyway: the PEN-3140
+ * decision names "error text" on the company-readable side, and the same
+ * reasoning that keeps `error` / `errorCode` at the top level applies inside the
+ * blob. That is the decision's call, not an oversight.
+ *
+ * Withheld keys are reported in `withheldFields`, so a consumer that needs a
+ * newly-added *string* machine key sees why it vanished instead of silently
+ * reading `undefined`.
+ */
+const RUN_RESULT_JSON_MACHINE_TEXT_KEYS = new Set([
+  // outcome / failure enums — matched against a fixed regex by
+  // `resultJsonIndicatesFailure` (`services/heartbeat.ts:11128-11145`)
+  "status", "outcome", "type", "subtype", "stopReason", "stop_reason",
+  // error text — kept per the PEN-3140 decision, see above
+  "error", "errorMessage", "errorCode", "errorFamily",
+  "api_error_status", "error_status",
+  // provider capacity / throttle family (PEN-2501, PEN-3129, PEN-2513) and the
+  // park-diagnosis fields `paperclipListParkedAgents` renders
+  "penstockReason", "penstockProvider", "penstockModel",
+  "penstockAdvertisedResumeAt", "penstockCapacityParkClampedFrom",
+  "penstockCapacityFirstDeferredAt",
+  "providerCapacityResetAt", "providerQuotaRetryNotBefore",
+  "upstreamCapacityCode", "ccrotateTarget", "recoveryClassification",
+  // retry timing (ISO instants)
+  "retryNotBefore", "transientRetryNotBefore",
+  // stop/timeout provenance — the run-ledger stop labels
+  // (`ui/src/components/IssueRunLedger.tsx:311-327`) read these
+  "timeoutSource",
+  // interruption provenance (`ui/src/lib/interrupt-handoff.ts`)
+  "interruptionSource", "interruptedIssueId",
+  "interruptedByActorType", "interruptedByActorId",
+  // run/session identity
+  "session_id", "model", "uuid", "requestId", "runId",
+  "cursorAgentId", "cursorRunId", "envType", "envName",
+  "requestedModel", "requestedThinkingEffort", "permissionMode", "mode",
+  "phase", "agent", "billingType", "billing_type",
+  // gate + lifecycle codes
+  "wakeReason", "maintenanceCleanupAt", "reason", "reasonCode",
+  "issueId", "serviceName", "pipelineStageExitCancellationRequestedAt",
+  // synthesized by the oversize-blob SQL, never present in the column
+  "truncationReason",
+]);
+
+/**
+ * Project one `resultJson` value under the rule documented above. Returns
+ * `{ kept }` with `undefined` meaning "withheld"; `path` is only used to name
+ * the withheld field for `withheldFields`.
+ */
+function projectRunResultJsonValue(
+  key: string,
+  value: unknown,
+  path: string,
+  withheldFields: string[],
+): { kept: boolean; value?: unknown } {
+  // Non-prose primitives cannot carry a transcript. This is what keeps the
+  // vendor counters (`num_turns`, `duration_api_ms`, cost, `is_error`) working
+  // without anyone having to enumerate them.
+  if (value === null || typeof value === "number" || typeof value === "boolean") {
+    return { kept: true, value };
+  }
+
+  if (typeof value === "string") {
+    if (RUN_RESULT_JSON_MACHINE_TEXT_KEYS.has(key)) return { kept: true, value };
+    if (value.length > 0) withheldFields.push(path);
+    return { kept: false };
+  }
+
+  if (Array.isArray(value)) {
+    // Elements inherit the *array's* key, so `permission_denials: [...]` of
+    // objects recurses, while an array of raw strings under a non-machine key
+    // (a provider's `errors: [...]`) drops its prose and keeps its shape --
+    // presence still reads as presence, content does not leak.
+    const projected: unknown[] = [];
+    let droppedAny = false;
+    for (const [index, element] of value.entries()) {
+      const result = projectRunResultJsonValue(key, element, `${path}[${index}]`, withheldFields);
+      if (result.kept) projected.push(result.value);
+      else droppedAny = true;
+    }
+    if (droppedAny && projected.length === 0 && value.length > 0) return { kept: false };
+    return { kept: true, value: projected };
+  }
+
+  if (isPlainObject(value)) {
+    const projected: Record<string, unknown> = {};
+    for (const [childKey, childValue] of Object.entries(value)) {
+      const result = projectRunResultJsonValue(
+        childKey,
+        childValue,
+        `${path}.${childKey}`,
+        withheldFields,
+      );
+      if (result.kept) projected[childKey] = result.value;
+    }
+    return { kept: true, value: projected };
+  }
+
+  // Anything else (a function, a symbol) has no business on the wire.
+  withheldFields.push(path);
+  return { kept: false };
+}
+
+
+
+/**
+ * Entitlement filter for the run-STATE responses (PEN-3142 + the PEN-3149
+ * ruling). Sibling of {@link withholdRunEventTranscriptContent}: same
+ * "what may this caller see" job, applied to the run row rather than an event.
+ *
+ * Run state itself is untouched and stays company-readable — `status`,
+ * `error`, `errorCode`, exit/park reason, the retry edge, watchdog fields,
+ * `lastActivityAt`, `lastOutput*`, `logBytes`, usage/cost, `currentToolName`,
+ * and every machine key inside `resultJson`. A peer can still see that a run
+ * parked, failed, or was retried, which the decision requires.
+ *
+ * `currentStatusMessage` is RE-DERIVED rather than nulled, and that is the
+ * subtle half. It is not a stored field: `buildRunEventRuntimeProgress`
+ * (`heartbeat.ts`) computes it as
+ *
+ *     currentToolName ? `Using ${currentToolName}` : lastAssistantSnippet ?? fallbackMessage
+ *
+ * and `fallbackMessage` prefers the raw event `message` string before falling
+ * back to the event type. So withholding `lastAssistantSnippet` alone leaves
+ * the identical prose reachable on the same response through a different key.
+ * For an unentitled reader the message must come from `currentToolName` or the
+ * event type only — here, from `currentToolName`, else nothing. Closing one
+ * direction and not the other is the class of miss this row exists to fix.
+ */
+export function withholdRunTranscriptStateContent<T extends Record<string, unknown>>(
+  run: T,
+): T & { withheldFields: string[] } {
+  const out: Record<string, unknown> = { ...run };
+  const withheldFields: string[] = [];
+
+  for (const key of WITHHELD_RUN_STATE_CONTENT_KEYS) {
+    if (key in out) {
+      if (out[key] !== null && out[key] !== undefined) withheldFields.push(key);
+      out[key] = null;
+    }
+  }
+
+  if ("currentStatusMessage" in out) {
+    const toolName = out.currentToolName;
+    const rederived = typeof toolName === "string" && toolName ? `Using ${toolName}` : null;
+    if (out.currentStatusMessage !== rederived && out.currentStatusMessage !== null) {
+      withheldFields.push("currentStatusMessage");
+    }
+    out.currentStatusMessage = rederived;
+  }
+
+  if (isPlainObject(out.resultJson)) {
+    const resultJson: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(out.resultJson)) {
+      const result = projectRunResultJsonValue(key, value, `resultJson.${key}`, withheldFields);
+      if (result.kept) resultJson[key] = result.value;
+    }
+    out.resultJson = resultJson;
+  }
+
+  return { ...(out as T), withheldFields };
+}
+
+/**
+ * PEN-3204, implementing the PEN-3202 ruling: a `workspace_operations` row is a
+ * MIX, and only the captured command OUTPUT narrows.
+ *
+ * Kept company-readable, deliberately: `phase`, `status`, `exitCode`, the log
+ * volume/location/digest (`logStore`, `logRef`, `logBytes`, `logSha256`,
+ * `logCompressed`), the ids and the timestamps — and `command`, `cwd` and
+ * `metadata`, which PEN-3202 rules stay readable here and which are already
+ * masked one projection over by `publicWorkspaceOperation` under the ORTHOGONAL
+ * workspace-runtime gate (CTO Ruling F / BLO-33568). Two gates land on these
+ * rows for different reasons; this one must not quietly absorb the other's
+ * fields, and an unentitled reader must still be able to see that an operation
+ * ran and how it ended.
+ *
+ * Only `stdoutExcerpt` / `stderrExcerpt` are transcript. They are the same
+ * class of material as `heartbeat_runs.stdoutExcerpt` above — the captured
+ * output of a command run inside an agent's own execution — and they reach the
+ * wire through three read routes with no projection at all today. The docblock
+ * on `publicWorkspaceOperation` records that they were deliberately left out of
+ * THAT gate as command output rather than a copied operator string; this gate
+ * is the one that was missing, not a reversal of that call.
+ *
+ * `logRef` deliberately survives: it is a pointer, and the body it points at is
+ * gated separately on `GET /workspace-operations/:operationId/log`. Withholding
+ * the pointer would hide that captured output exists without protecting a byte
+ * of it.
+ *
+ * Same `withheldFields` contract as `withholdRunTranscriptStateContent`, so a
+ * client can tell "not entitled" from "this operation captured no output".
+ */
+const WITHHELD_WORKSPACE_OPERATION_CONTENT_KEYS = [
+  "stdoutExcerpt",
+  "stderrExcerpt",
+] as const;
+
+export function withholdWorkspaceOperationCapturedOutput<T extends object>(
+  operation: T,
+): T & { withheldFields: string[] } {
+  const out: Record<string, unknown> = { ...(operation as Record<string, unknown>) };
+  const withheldFields: string[] = [];
+
+  for (const key of WITHHELD_WORKSPACE_OPERATION_CONTENT_KEYS) {
+    if (key in out) {
+      if (out[key] !== null && out[key] !== undefined) withheldFields.push(key);
+      out[key] = null;
+    }
+  }
+
+  return { ...(out as T), withheldFields };
+}
+
+
+/**
  * `commands` / `services` / `jobs` are the three arrays `listWorkspaceCommandDefinitions`
  * (`packages/shared/src/workspace-commands.ts`) reads command entries out of. The
  * identity set below is the subset of an entry's keys that same parser reads into a

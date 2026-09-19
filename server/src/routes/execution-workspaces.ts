@@ -26,7 +26,7 @@ import {
   startRuntimeServicesForWorkspaceControl,
   stopRuntimeServicesForExecutionWorkspace,
 } from "../services/workspace-runtime.js";
-import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
+import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, runTranscriptReadGate } from "./authz.js";
 import { logger } from "../middleware/logger.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
@@ -42,6 +42,7 @@ import {
   publicWorkspaceOperation,
   publicWorkspaceOperations,
   resolveWorkspaceRuntimeViewer,
+  withholdUnentitledWorkspaceOperationOutput,
 } from "./workspace-response.js";
 import { appendWithCap } from "../adapters/utils.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
@@ -161,13 +162,31 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     if (!(await assertExecutionWorkspaceReadAllowed(req, res, workspace.companyId))) return;
     const operations = await workspaceOperationsSvc.listForExecutionWorkspace(id);
     const viewer = await resolveWorkspaceRuntimeViewer(access, req, workspace.companyId);
+    // PEN-3204: the widest of the three workspace-operation reads — it returns EVERY
+    // operation for the workspace, including those produced by other agents' heartbeat
+    // runs, so the captured output here is cross-agent transcript by construction. Same
+    // per-operation owner resolution and the same shared withholding as the run route;
+    // gating that one and leaving this open is the PEN-2777 failure exactly.
+    //
     // PEN-3205: same username censoring as the sibling list route on `routes/agents.ts`. Both
     // answer with the same historical `WorkspaceOperation` rows including `stdoutExcerpt` /
     // `stderrExcerpt`, which `publicWorkspaceOperation` deliberately does NOT withhold, so
     // censoring on one route and not the other left the same bytes legible one URL over.
     // New rows are censored at write time as well; this still covers rows stored before that.
-    res.json(redactCurrentUserValue(
+    //
+    // The two are orthogonal and BOTH apply: the withholding decides *whether* captured output
+    // leaves at all, the censoring decides what the surviving text may say. Composed in the
+    // same order as the sibling route on `routes/agents.ts` — withhold first, censor the
+    // projected result — so the censoring never runs over bytes the gate already removed.
+    const owners = await workspaceOperationsSvc.owningAgentIdsByRunId(operations.map((op) => op.heartbeatRunId));
+    const projected = await withholdUnentitledWorkspaceOperationOutput(
       publicWorkspaceOperations(operations, viewer),
+      owners,
+      runTranscriptReadGate(req, access, workspace.companyId),
+      req.actor.type === "board",
+    );
+    res.json(redactCurrentUserValue(
+      projected,
       await getCurrentUserRedactionOptions(),
     ));
   });

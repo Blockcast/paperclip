@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
-import { REDACTED_EVENT_VALUE, isPlainObject, redactAgentConfigPayload, redactEventPayload } from "../redaction.js";
+import { REDACTED_EVENT_VALUE, isPlainObject, redactAgentConfigPayload, redactEventPayload, withholdRunEventTranscriptContent, withholdRunTranscriptStateContent } from "../redaction.js";
 import { diffAgentAdapterSecretBindings } from "../services/agent-secret-bindings.js";
 import { agentRuntimeState, agents as agentsTable, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
 import { and, asc, desc, eq, gte, inArray, not, or, sql } from "drizzle-orm";
@@ -62,7 +62,8 @@ import {
   workspaceOperationService,
 } from "../services/index.js";
 import { conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
-import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
+import { assertBoard, assertCompanyAccess, assertInstanceAdmin, decideRunTranscriptRead, getAccessibleResource, getActorInfo, hasCompanyAccess, runTranscriptReadGate } from "./authz.js";
+import type { RunTranscriptReadOutcome } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectAgentAdapterWorkspaceCommandPaths,
@@ -118,7 +119,7 @@ import { assertEnvironmentSelectionForCompany } from "./environment-selection.js
 import { recoveryService } from "../services/recovery/service.js";
 import { resolveCoreTrustPreset } from "../services/trust-preset-resolver.js";
 import { readObject } from "../lib/objects.js";
-import { publicWorkspaceOperations, resolveWorkspaceRuntimeViewer } from "./workspace-response.js";
+import { publicWorkspaceOperations, resolveWorkspaceRuntimeViewer, withholdUnentitledWorkspaceOperationOutput } from "./workspace-response.js";
 import { listInvalidOrgChainDescendantIds } from "../services/agent-invokability.js";
 import {
   AGENT_PROFILE_CHANGE_CONSENT_FIELDS,
@@ -389,6 +390,90 @@ export function agentRoutes(
         offset: opts.offset,
         limitBytes: opts.limitBytes,
         logStore: run.logStore,
+      },
+    });
+  }
+
+  /**
+   * PEN-3204: `GET /workspace-operations/:operationId/log` had NEITHER half of
+   * the control pair — no read-side gate and no access audit. PEN-3140's table
+   * gave `/log` an audit and `/events` a projection, and this sibling path was
+   * simply absent from it; it must not come out of this change with only one.
+   *
+   * A distinct action from `heartbeat.run_log_accessed` for the same reason
+   * `heartbeat.run_events_accessed` is: the paths are separately reachable and a
+   * forensic reader needs to know which one a caller used. Entity is the
+   * operation, and `runId` carries the operation's owning run rather than the
+   * actor's, so an audit row points at the transcript that was read.
+   *
+   * `ownerAgentId` is recorded because it is the subject the decision was made
+   * about, and `null` there is the fail-closed branch — it tells a reader the
+   * access was decided with no resolvable owner rather than against one.
+   */
+  async function logWorkspaceOperationLogAccessAudit(
+    req: Request,
+    operation: { id: string; companyId: string; heartbeatRunId: string | null; logStore: string | null },
+    result: "allowed" | "denied",
+    opts: { offset: number; limitBytes: number; ownerAgentId?: string | null },
+  ) {
+    const actor = getRunLogAuditActor(req);
+    await logActivity(db, {
+      companyId: operation.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: operation.heartbeatRunId,
+      action: "workspace_operation.log_accessed",
+      entityType: "workspace_operation",
+      entityId: operation.id,
+      details: {
+        result,
+        actorSource: actor.actorSource,
+        actorRunId: actor.actorRunId,
+        offset: opts.offset,
+        limitBytes: opts.limitBytes,
+        logStore: operation.logStore,
+        heartbeatRunId: operation.heartbeatRunId,
+        ownerAgentId: opts.ownerAgentId ?? null,
+      },
+    });
+  }
+
+  /**
+   * PEN-3142: `/events` had a read-side projection and no access audit, while
+   * `/log` had the audit and no projection. Each transcript path now has both.
+   *
+   * Deliberately a distinct action from `heartbeat.run_log_accessed` rather than
+   * a reuse: the two paths are separately reachable and a forensic reader needs
+   * to know which one a caller used. Both action names are documented together
+   * in `doc/DEVELOPING.md` so whoever finally gives this audit a consumer
+   * cannot wire up one and stay blind to the other — being blind to `/events`
+   * is exactly why the audit was rejected as a compensating control on
+   * PEN-3140.
+   */
+  async function logRunEventsAccessAudit(
+    req: Request,
+    run: { id: string; companyId: string },
+    result: "allowed" | "denied",
+    opts: { afterSeq: number; limit: number; eventCount: number | null },
+  ) {
+    const actor = getRunLogAuditActor(req);
+    await logActivity(db, {
+      companyId: run.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: run.id,
+      action: "heartbeat.run_events_accessed",
+      entityType: "heartbeat_run",
+      entityId: run.id,
+      details: {
+        result,
+        actorSource: actor.actorSource,
+        actorRunId: actor.actorRunId,
+        afterSeq: opts.afterSeq,
+        limit: opts.limit,
+        eventCount: opts.eventCount,
       },
     });
   }
@@ -4444,7 +4529,22 @@ export function agentRoutes(
     const limit = limitParam ? Math.max(1, Math.min(1000, parseInt(limitParam, 10) || 200)) : undefined;
     const summary = req.query.summary === "true" || req.query.summary === "1";
     const runs = await heartbeat.list(companyId, agentId, limit, { summary });
-    res.json(runs);
+    // PEN-3149 ruling, folded into PEN-3142. This is the bulk feed: without
+    // it, narrowing the per-run `/log` body would be decorative, since the
+    // same prose leaves here for every run in the company at once via the
+    // `result_summary` / `result_result` / `result_message` projection.
+    // Gated per owning agent, memoized, so a mixed page costs one decision
+    // per distinct agent.
+    const canReadTranscript = runTranscriptReadGate(req, access, companyId);
+    res.json(
+      await Promise.all(
+        runs.map(async (run) =>
+          (await canReadTranscript((run as { agentId?: string | null }).agentId ?? null))
+            ? run
+            : withholdRunTranscriptStateContent(run as unknown as Record<string, unknown>),
+        ),
+      ),
+    );
   });
 
   router.get("/companies/:companyId/pr-review-queue", async (req, res) => {
@@ -4816,6 +4916,27 @@ export function agentRoutes(
     const liveRuns = await liveRunsQuery.limit(limit);
     const targetRunCount = Math.min(minCount, limit);
 
+    // PEN-3149 ruling, folded into PEN-3142. None of the columns selected above
+    // carry transcript content — but `decorateActiveRunStatus` ADDS
+    // `lastAssistantSnippet` and `currentStatusMessage` from the runtime-status
+    // store, so the content arrives after the query, not in it. Reading the
+    // column list alone says this route is clean; it is not.
+    //
+    // This is the widest of the run-state feeds: company-scoped rather than
+    // per-issue, so it hands a peer every live agent's current prose in one
+    // call with no per-run fetch. Narrowing the per-run routes while leaving
+    // it open would have been decorative.
+    const canReadTranscript = runTranscriptReadGate(req, access, companyId);
+    const projectLiveRun = async (run: (typeof liveRuns)[number]) => {
+      const decorated = {
+        ...heartbeat.decorateActiveRunStatus(run),
+        outputSilence: await heartbeat.buildRunOutputSilence(run),
+      };
+      return (await canReadTranscript(run.agentId ?? null))
+        ? decorated
+        : withholdRunTranscriptStateContent(decorated as unknown as Record<string, unknown>);
+    };
+
     if (targetRunCount > 0 && liveRuns.length < targetRunCount) {
       const activeIds = liveRuns.map((r) => r.id);
       const recentRuns = await db
@@ -4833,17 +4954,11 @@ export function agentRoutes(
         .limit(targetRunCount - liveRuns.length);
 
       const rows = [...liveRuns, ...recentRuns];
-      res.json(await Promise.all(rows.map(async (run) => ({
-        ...heartbeat.decorateActiveRunStatus(run),
-        outputSilence: await heartbeat.buildRunOutputSilence(run),
-      }))));
+      res.json(await Promise.all(rows.map(projectLiveRun)));
       return;
     }
 
-    res.json(await Promise.all(liveRuns.map(async (run) => ({
-      ...heartbeat.decorateActiveRunStatus(run),
-      outputSilence: await heartbeat.buildRunOutputSilence(run),
-    }))));
+    res.json(await Promise.all(liveRuns.map(projectLiveRun)));
   });
 
   router.get("/heartbeat-runs/:runId", async (req, res) => {
@@ -4857,10 +4972,19 @@ export function agentRoutes(
     // rather than a reverse scan of the company run list.
     const retrySuccessor = await heartbeat.getRetrySuccessor(run);
     const decoratedRun = heartbeat.decorateActiveRunStatus(run);
+    // PEN-3149 ruling, folded into PEN-3142: this route is on the run-STATE
+    // side of the decision and stays 200 for every company peer — but the row
+    // it returns is every column of `heartbeat_runs`, which carries captured
+    // output and the adapter result blob. Same decider, same owning-agent
+    // scope; only the transcript-bearing fields are projected out.
+    const transcriptAccess = await decideRunTranscriptRead(req, access, run);
+    const projectedRun = transcriptAccess.allowed
+      ? decoratedRun
+      : withholdRunTranscriptStateContent(decoratedRun as unknown as Record<string, unknown>);
     res.json(
       redactCurrentUserValue(
         {
-          ...decoratedRun,
+          ...projectedRun,
           retryExhaustedReason,
           retrySuccessor,
           outputSilence: await heartbeat.buildRunOutputSilence(run),
@@ -4997,14 +5121,40 @@ export function agentRoutes(
 
     const afterSeq = Number(req.query.afterSeq ?? 0);
     const limit = Number(req.query.limit ?? 200);
-    const events = await heartbeat.listEvents(runId, Number.isFinite(afterSeq) ? afterSeq : 0, Number.isFinite(limit) ? limit : 200);
+    const normalizedAfterSeq = Number.isFinite(afterSeq) ? afterSeq : 0;
+    const normalizedLimit = Number.isFinite(limit) ? limit : 200;
+
+    // PEN-3142: run STATE stays company-readable, so this route keeps returning
+    // 200 with the full event envelope (`seq` — which is the pagination cursor
+    // every consumer depends on — plus `eventType`, `stream`, `level`, `color`,
+    // `createdAt`). Only the transcript-bearing `message` / `payload` are
+    // withheld from a caller that is neither the run's owner, in its manager
+    // chain, a human operator, nor a `runs:read_transcript` grant holder.
+    //
+    // Withholding rather than 403 is the PEN-2777 shape the decision cites:
+    // withhold the sensitive field, leave the resource readable. `/log` gets a
+    // 403 instead because its entire body is transcript — there is no envelope
+    // left to return.
+    const transcriptAccess = await decideRunTranscriptRead(req, access, run);
+
+    const events = await heartbeat.listEvents(runId, normalizedAfterSeq, normalizedLimit);
+    await logRunEventsAccessAudit(
+      req,
+      run,
+      transcriptAccess.allowed ? "allowed" : "denied",
+      { afterSeq: normalizedAfterSeq, limit: normalizedLimit, eventCount: events.length },
+    );
+
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
-    const redactedEvents = events.map((event) =>
-      redactCurrentUserValue({
+    const redactedEvents = events.map((event) => {
+      const scanned = redactCurrentUserValue({
         ...event,
         payload: redactEventPayload(event.payload),
-      }, currentUserRedactionOptions),
-    );
+      }, currentUserRedactionOptions);
+      return transcriptAccess.allowed
+        ? scanned
+        : withholdRunEventTranscriptContent(scanned as Record<string, unknown>);
+    });
     res.json(redactedEvents);
   });
 
@@ -5035,6 +5185,28 @@ export function agentRoutes(
       throw error;
     }
 
+    // PEN-3142: the whole response body is transcript, so an unentitled
+    // same-company caller gets a 403 rather than a withheld projection.
+    //
+    // 403 and not 404: the run's EXISTENCE is company-readable by design
+    // (`GET /heartbeat-runs/:runId` stays open, per the decision's run-state
+    // carve-out), so there is no existence oracle left to protect here and a
+    // 404 would only mislead. The cross-tenant 404 above is untouched — that is
+    // the case where existence is the secret. The named boundary vocabulary
+    // from the decider travels in the error details so a client can tell
+    // "wrong tenant" (404), "not entitled to the transcript"
+    // (403 `deny_missing_grant`), and "no such run" (404) apart.
+    const transcriptAccess = await decideRunTranscriptRead(req, access, run);
+    if (!transcriptAccess.allowed) {
+      await logRunLogAccessAudit(req, run, "denied", { offset: normalizedOffset, limitBytes });
+      throw forbidden(
+        transcriptAccess.decision?.explanation ?? "Run transcript access is not permitted for this actor.",
+        transcriptAccess.decision
+          ? authorizationDeniedDetails(transcriptAccess.decision)
+          : { reason: "deny_company_boundary" as const },
+      );
+    }
+
     await logRunLogAccessAudit(req, run, "allowed", { offset: normalizedOffset, limitBytes });
     const result = await heartbeat.readLog(run, {
       offset: normalizedOffset,
@@ -5057,8 +5229,22 @@ export function agentRoutes(
     // `WorkspaceOperation` rows carrying the same copied `command`/`cwd`, gated only on company
     // scope, so withholding on one route and not the other leaves the exit open one URL over.
     const viewer = await resolveWorkspaceRuntimeViewer(access, req, run.companyId);
-    res.json(redactCurrentUserValue(
+    // PEN-3204: second, orthogonal gate — the captured OUTPUT narrows to the
+    // run-transcript decision while the operation row stays company-readable.
+    //
+    // Scoped per operation rather than per route: `listForRun` deliberately also
+    // returns run-less workspace-scoped cleanup rows, so the rows in this one
+    // response do not all share this run's owner, and `run.agentId` is the wrong
+    // answer for the cleanup ones.
+    const owners = await workspaceOperations.owningAgentIdsByRunId(operations.map((op) => op.heartbeatRunId));
+    const projected = await withholdUnentitledWorkspaceOperationOutput(
       publicWorkspaceOperations(operations, viewer),
+      owners,
+      runTranscriptReadGate(req, access, run.companyId),
+      req.actor.type === "board",
+    );
+    res.json(redactCurrentUserValue(
+      projected,
       await getCurrentUserRedactionOptions(),
     ));
   });
@@ -5070,8 +5256,39 @@ export function agentRoutes(
 
     const offset = Number(req.query.offset ?? 0);
     const limitBytes = readRunLogLimitBytes(req.query.limitBytes);
+    const normalizedOffset = Number.isFinite(offset) ? offset : 0;
+
+    // PEN-3204: this entire body is captured command output — transcript, not
+    // state — so it is gated on the same decision as the run transcript rather
+    // than projected. Mirrors `GET /heartbeat-runs/:runId/log` above: 403 with
+    // the decider's named boundary vocabulary, and the cross-tenant 404 from
+    // `getAccessibleResource` left untouched, since that is the case where the
+    // operation's existence is itself the secret.
+    //
+    // The path carries a bare operation id with no run in it, so the owning
+    // agent is resolved through `heartbeatRunId`. Unresolvable owner means
+    // withhold — see `withholdUnentitledWorkspaceOperationOutput` for why that
+    // is decided here rather than handed to the decider, which would fall
+    // through to the company-wide grant on a null agent id.
+    const owners = await workspaceOperations.owningAgentIdsByRunId([operation.heartbeatRunId]);
+    const ownerAgentId = operation.heartbeatRunId ? owners.get(operation.heartbeatRunId) : undefined;
+    const transcriptAccess: RunTranscriptReadOutcome = ownerAgentId
+      ? await decideRunTranscriptRead(req, access, { companyId: operation.companyId, agentId: ownerAgentId })
+      : { allowed: req.actor.type === "board", decision: null };
+
+    if (!transcriptAccess.allowed) {
+      await logWorkspaceOperationLogAccessAudit(req, operation, "denied", { offset: normalizedOffset, limitBytes, ownerAgentId: ownerAgentId ?? null });
+      throw forbidden(
+        transcriptAccess.decision?.explanation ?? "Workspace operation output access is not permitted for this actor.",
+        transcriptAccess.decision
+          ? authorizationDeniedDetails(transcriptAccess.decision)
+          : { reason: "deny_unresolved_run_owner" as const },
+      );
+    }
+
+    await logWorkspaceOperationLogAccessAudit(req, operation, "allowed", { offset: normalizedOffset, limitBytes, ownerAgentId: ownerAgentId ?? null });
     const result = await workspaceOperations.readLog(operationId, {
-      offset: Number.isFinite(offset) ? offset : 0,
+      offset: normalizedOffset,
       limitBytes,
     });
 
@@ -5145,10 +5362,19 @@ export function agentRoutes(
         )
         .orderBy(desc(heartbeatRuns.createdAt));
 
-    res.json(await Promise.all(liveRuns.map(async (run) => ({
-      ...heartbeat.decorateActiveRunStatus(run, { companyId: issue.companyId, issueId: issue.id }),
-      outputSilence: await heartbeat.buildRunOutputSilence({ ...run, companyId: issue.companyId }),
-    }))));
+    // PEN-3149 ruling, folded into PEN-3142: `lastAssistantSnippet` reaches
+    // this route too, and `currentStatusMessage` re-derives the same prose
+    // from it — so both have to be closed here, not just the snippet.
+    const canReadTranscript = runTranscriptReadGate(req, access, issue.companyId);
+    res.json(await Promise.all(liveRuns.map(async (run) => {
+      const decorated = {
+        ...heartbeat.decorateActiveRunStatus(run, { companyId: issue.companyId, issueId: issue.id }),
+        outputSilence: await heartbeat.buildRunOutputSilence({ ...run, companyId: issue.companyId }),
+      };
+      return (await canReadTranscript(run.agentId ?? null))
+        ? decorated
+        : withholdRunTranscriptStateContent(decorated as unknown as Record<string, unknown>);
+    })));
   });
 
   router.get("/issues/:issueId/active-run", async (req, res) => {
@@ -5193,8 +5419,24 @@ export function agentRoutes(
     }
 
     const decoratedRun = heartbeat.decorateActiveRunStatus(run, { companyId: issue.companyId, issueId: issue.id });
+    // PEN-3149 ruling, folded into PEN-3142. Sibling of `/issues/:issueId/live-runs`
+    // and reached by the same callers; it carries the same decorated
+    // `lastAssistantSnippet` / `currentStatusMessage`. Gating one and not the
+    // other is precisely the split-sibling failure this row's constraint #1
+    // names, so both move together.
+    //
+    // The run is scoped to `run.agentId`, so the decision keys off the owning
+    // agent exactly as the per-run route does. `agentId` / `agentName` /
+    // `adapterType` are identity, not transcript, and stay readable.
+    const transcriptAccess = await decideRunTranscriptRead(req, access, {
+      companyId: issue.companyId,
+      agentId: run.agentId ?? null,
+    });
+    const projectedRun = transcriptAccess.allowed
+      ? decoratedRun
+      : withholdRunTranscriptStateContent(decoratedRun as unknown as Record<string, unknown>);
     res.json({
-      ...decoratedRun,
+      ...projectedRun,
       agentId: agent.id,
       agentName: agent.name,
       adapterType: agent.adapterType,
