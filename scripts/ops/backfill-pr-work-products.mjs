@@ -109,15 +109,19 @@ const asIssues = (body) => (Array.isArray(body) ? body : (body?.issues ?? []));
 /** GitHub PR state -> issueWorkProductStatusSchema (packages/shared/src/validators/work-product.ts). */
 export function prStatus(pr) {
   if (pr.state === "MERGED") return "merged";
-  if (pr.isDraft) return "draft";
+  // CLOSED before isDraft: a closed draft is abandoned, and `closed` is
+  // terminal while `draft` reads as live in-flight work no one will revisit.
   if (pr.state === "CLOSED") return "closed";
+  if (pr.isDraft) return "draft";
   return "ready_for_review";
 }
 
 let created = 0;
+let wouldCreate = 0;
 let skipped = 0;
 let unrelated = 0;
 let failed = 0;
+let writeFailed = 0;
 
 if (RUN) for (const status of ["in_review", "blocked", "in_progress"]) {
   const issues = asIssues(await j(`/companies/${CID}/issues?status=${status}&limit=${LIMIT}`));
@@ -192,14 +196,32 @@ if (RUN) for (const status of ["in_review", "blocked", "in_progress"]) {
         },
       };
 
-      console.log(`${APPLY ? "CREATE" : "DRY-RUN"} ${issue.identifier} <- ${key} (${body.status})`);
-      if (APPLY) {
-        await j(`/issues/${issue.id}/work-products`, { method: "POST", body: JSON.stringify(body) });
-        created += 1;
+      if (!APPLY) {
+        console.log(`DRY-RUN ${issue.identifier} <- ${key} (${body.status})`);
+        wouldCreate += 1;
+        continue;
       }
+      // Log AFTER the write, and count a failure rather than aborting: the
+      // script is idempotent on (repo, number), so finishing the pass and
+      // printing the summary beats losing the counts for the rows that landed.
+      try {
+        await j(`/issues/${issue.id}/work-products`, { method: "POST", body: JSON.stringify(body) });
+      } catch (err) {
+        console.warn(`FAILED ${issue.identifier} <- ${key}: ${String(err).split("\n")[0]}`);
+        writeFailed += 1;
+        continue;
+      }
+      console.log(`CREATE ${issue.identifier} <- ${key} (${body.status})`);
+      created += 1;
     }
   }
 }
 
-if (RUN) console.log(`done: created=${created} skipped=${skipped} unrelated=${unrelated} unreadable=${failed} apply=${APPLY}`);
+if (RUN)
+  console.log(
+    `done: created=${created} would-create=${wouldCreate} skipped=${skipped} unrelated=${unrelated} unreadable=${failed} write-failed=${writeFailed} apply=${APPLY}`,
+  );
+// Still exit non-zero on a write failure: catching it buys the summary and the
+// remaining rows, it must not turn a partial backfill into a silent success.
+if (RUN && writeFailed > 0) process.exitCode = 1;
 else console.error("not invoked as a script (argv[1] does not match this module); no backfill performed");

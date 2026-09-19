@@ -13,6 +13,18 @@ evidence. Chart value: `evidenceGate.unlabeledTruthBlock` in
 No data migration is involved in either direction; the flip is a values change
 plus a redeploy.
 
+> **Precondition: [#1857](https://github.com/Blockcast/paperclip/pull/1857)
+> (B2/B3/B5/B6/B7) must be on `master` and deployed before any number below
+> means anything.** That PR is what registers `review:ally-clean` and
+> `deploy:landed`, adds `evidence-truth.ts`, and teaches `loadConfig` to read
+> `PAPERCLIP_EVIDENCE_UNLABELED_BLOCK`. Until then every symbol this runbook
+> cites is absent and the shapes cannot enter `missing` — so the jq below still
+> parses and still returns numbers, and **every one of them is structurally
+> zero**. A zero `willBlock` from an uninstalled gate is indistinguishable from
+> a clean one, which would satisfy the flip criterion on day one. The
+> `total` > 0 guard on the measurement window exists to catch exactly that; do
+> not open the window before checking it.
+
 ## What the flag does and does not govern
 
 > **The name is narrower than the behaviour.** The env var says `UNLABELED`,
@@ -99,10 +111,21 @@ curl -sS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
 | jq '[.[] | select(.lastEvidenceVerdict.diagnostics // [] | index("no-linked-pull-request"))] | length'
 ```
 
-Record it in BLO-3202. Run `scripts/ops/backfill-pr-work-products.mjs`
+Record it in BLO-3202. Then run the backfill — **it is dry-run by default**, so
+it takes two invocations and only the second one writes:
+
+```bash
+node scripts/ops/backfill-pr-work-products.mjs            # review the proposed rows
+node scripts/ops/backfill-pr-work-products.mjs --apply    # write them
+```
+
 (needs **Node >= 22.18** — it imports a `.ts` module and relies on built-in
-type stripping; Node 20 throws `ERR_UNKNOWN_FILE_EXTENSION`), re-measure,
-expect near zero.
+type stripping; Node 20 throws `ERR_UNKNOWN_FILE_EXTENSION`). Read the
+`would-create=` count on the dry run and the `created=` count on the apply; if
+they disagree, something changed between the two passes. Then re-measure the
+count above and expect near zero. Re-measuring after the dry run alone returns
+the same number you started with — that is the script working as designed, not
+a broken backfill and not a baseline you can discharge.
 
 > **Two different literals, both real — do not "reconcile" them.** The verdict
 > array is `[...evaluation.diagnostics, ...truthDiagnostics]`
@@ -148,6 +171,20 @@ curl -sS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
 ```
 
 ## Measure daily for seven days
+
+**Before day 1, confirm the gate is actually installed.** The window is only
+meaningful once #1857 is deployed, and the cheap check is that the measurement
+is capable of producing a non-zero number at all:
+
+- `total` > 0 — there is a standing `in_review` population carrying a verdict
+  to measure; and
+- `onlyTruthMissing + noPr + probeFailed` > 0 on at least one of the seven
+  days — the truth shapes are registered and the probe is running.
+
+All four of those reading 0 on day 1 is the signature of an **absent** gate,
+not a quiet one: with the shapes unregistered, `missing` can never contain
+`review:ally-clean`, so every counter below is zero by construction and the
+flip criterion is met trivially. Do not start the window; check the deploy.
 
 ```bash
 curl -sS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
@@ -211,6 +248,9 @@ change its only excess is the two suppressed populations.
 
 Seven consecutive days with **all** of:
 
+- the install check above still passing — `total` > 0 every day, and
+  `onlyTruthMissing + noPr + probeFailed` > 0 on at least one of the seven.
+  Seven all-zero rows are not a clean gate, they are an absent one;
 - `willBlock` below 2% of `total`, **or** `willBlock` of 0 on a `total` under
   50 — below that the percentage is arithmetically "must be 0" (2% of 50 is one
   issue), so state the floor rather than letting a single slow-to-review PR read
