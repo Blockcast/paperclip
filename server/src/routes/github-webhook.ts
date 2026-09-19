@@ -107,6 +107,7 @@ import {
   pullRequestExternalId,
 } from "../services/pull-request-work-products.js";
 import { matchesTaskKey, normalizePrReviewRepoFullName } from "../services/pr-review-duplicate-issue-guard.js";
+import { withPrIssueBackLinkLock } from "../services/pr-issue-backlink-lock.js";
 import {
   activateGithubReviewGateDelivery,
   enqueueGithubReviewGateDelivery,
@@ -3801,6 +3802,34 @@ function prFeedbackAuthorLogin(context: ResolvedEventContext): string | null {
   return context.reviewAuthorLogin ?? context.commentAuthorLogin ?? null;
 }
 
+// BLO-33854: the two review-shaped branches below look asymmetric — one
+// classifies a body, the other returns true outright — and that asymmetry reads
+// like a missing content test. It is not. DO NOT "fix" it by routing the
+// feedback branch through hasActionablePrReviewFeedback.
+//
+// `github_pr_review_feedback` has exactly ONE producer (the issue_comment case
+// of resolveEventContext), and that producer reaches the wakeReason ternary only
+// when `reviewFeedback` is true — i.e. only when isActionablePrReviewComment,
+// and therefore hasActionablePrReviewFeedback, has ALREADY passed on the RAW
+// comment body. A non-actionable comment does not become a non-actionable
+// feedback context; it becomes no context at all (`return null`). So the
+// classification for this branch happened at resolve time, on better input, and
+// repeating it here is at best redundant.
+//
+// At worst it is a fleet-wide outage. The comment path populates `commentBody`
+// and leaves `reviewBody` UNDEFINED (prFeedbackBody exists precisely to coalesce
+// the two), so the literal symmetric rewrite —
+// `hasActionablePrReviewFeedback(context.reviewBody, context.reviewState)` —
+// evaluates `hasActionablePrReviewFeedback(undefined, undefined)`, which is
+// false for every comment-shaped review ever delivered. Reading `commentBody`
+// instead is only slightly better: it is clamped, so a finding past the clamp
+// boundary is silently dropped, against a raw-body verdict that already saw it.
+//
+// The live report that prompted this note (paperclip#1830 comment 5656139623)
+// was a false positive from hasActionablePrReviewFeedback itself — the
+// un-negated `Recommended Action … fix … before merg` clause, BLO-31446 — not
+// from a missing test here. Fix over-classification in the predicate, where both
+// wake paths benefit, not in this branch.
 function isActionableReviewFeedbackContext(context: ResolvedEventContext): boolean {
   if (context.wakeReason === "github_pr_review_feedback") return true;
   if (context.wakeReason !== "github_pr_review_submitted") return false;
@@ -5593,19 +5622,26 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           .filter((m): m is typeof m & { identifier: string } => Boolean(m.identifier))
           .map((m) => ({ identifier: m.identifier, issuePrefix: prefixByCompany.get(m.companyId) ?? "" }));
         if (entries.length > 0) {
-          const existing = await githubListIssueCommentBodies({
-            repoFullName: context.repoFullName,
-            prNumber: context.prNumber,
-          });
-          // null => no creds / couldn't read: skip the write (never blind-post).
-          if (existing !== null && !commentsContainBackLinkMarker(existing)) {
+          const repoFullName = context.repoFullName;
+          const prNumber = context.prNumber;
+          // Hoisted for the same reason as the two above: the guard on this
+          // block narrows these, but narrowing on a property access does not
+          // survive into the closure below.
+          const publicBaseUrl = config.publicBaseUrl;
+          // The marker only makes this idempotent if the read and the post are
+          // atomic against a concurrent delivery of the same event; hold the
+          // per-PR lock across both. See pr-issue-backlink-lock.ts.
+          backLinked = await withPrIssueBackLinkLock(db, { repoFullName, prNumber }, async () => {
+            const existing = await githubListIssueCommentBodies({ repoFullName, prNumber });
+            // null => no creds / couldn't read: skip the write (never blind-post).
+            if (existing === null || commentsContainBackLinkMarker(existing)) return [];
             const posted = await githubPostIssueComment({
-              repoFullName: context.repoFullName,
-              prNumber: context.prNumber,
-              body: buildIssueBackLinkBody(config.publicBaseUrl, entries),
+              repoFullName,
+              prNumber,
+              body: buildIssueBackLinkBody(publicBaseUrl, entries),
             });
-            if (posted) backLinked = entries.map((e) => e.identifier);
-          }
+            return posted ? entries.map((e) => e.identifier) : [];
+          });
         }
       } catch (err) {
         logger.warn(
@@ -6408,6 +6444,7 @@ export const __test_buildDependabotAlertIssueBody = buildDependabotAlertIssueBod
 export const __test_resolveDependabotAlertContext = resolveDependabotAlertContext;
 export const __test_hasActionablePrReviewFeedback = hasActionablePrReviewFeedback;
 export const __test_isClaudeCodeReviewServiceNotice = isClaudeCodeReviewServiceNotice;
+export const __test_isActionableReviewFeedbackContext = isActionableReviewFeedbackContext;
 export const __test_buildPrReviewFeedbackComment = buildPrReviewFeedbackComment;
 export const __test_buildIssueBackLinkBody = buildIssueBackLinkBody;
 export const __test_commentsContainBackLinkMarker = commentsContainBackLinkMarker;

@@ -55,13 +55,31 @@ export const UNMANAGED_BACKGROUND_TASK_STOP_REASON = "unmanaged_background_task_
 export const UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON =
   "unmanaged background task stopped; no durable live path";
 
+/**
+ * Forensic evidence for one terminal-result cleanup escalation.
+ *
+ * `signal` and `forceKilled` describe DIFFERENT things and must not be read as
+ * one fact (PEN-3093):
+ *
+ * - `signal` is what this path DECIDED TO SEND -- the escalation it reached.
+ *   It is recorded unconditionally, because the decision genuinely happened.
+ * - `forceKilled` is whether the SIGKILL was DELIVERED to a live process. It is
+ *   false when the group was already gone (ESRCH) and the direct child had
+ *   closed, i.e. nothing was there to receive it.
+ *
+ * So `signal: "SIGKILL"` with `forceKilled: false` is a normal, truthful
+ * reading: the escalation ran, but killed nothing. Reading `signal` alone as
+ * "a process was killed" is the overclaim this split exists to prevent.
+ */
 export interface TerminalResultCleanupEvidence {
   kind: "terminal_result_cleanup";
   stopped: true;
   stopReason: typeof UNMANAGED_BACKGROUND_TASK_STOP_REASON;
   reason: typeof UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON;
   terminalResultSeen: boolean;
+  /** Escalation this path decided to send. Attempted, NOT necessarily delivered. */
   signal: NodeJS.Signals | null;
+  /** Whether the SIGKILL actually reached a live process. See the note above. */
   forceKilled: boolean;
 }
 
@@ -3201,8 +3219,14 @@ export async function runChildProcess(
             terminalCleanupKillTimer = setTimeout(() => {
               terminalCleanupKillTimer = null;
               terminalCleanupSignal = "SIGKILL";
-              terminalCleanupForceKilled = true;
-              signalRunningProcess({ child, processGroupId }, "SIGKILL");
+              // `forceKilled` is surfaced as run evidence, so it must record a
+              // kill that actually landed rather than one that was merely
+              // attempted. `signalRunningProcess` reports false when the whole
+              // group is already gone (ESRCH) and the direct child has closed.
+              // `terminalCleanupSignal` stays unconditional on purpose: it
+              // describes the escalation this path decided on, which did
+              // happen, whereas `forceKilled` claims an effect on the process.
+              terminalCleanupForceKilled = signalRunningProcess({ child, processGroupId }, "SIGKILL");
             }, Math.max(1, opts.graceSec) * 1000);
           }, graceMs);
         };

@@ -21,6 +21,7 @@ import {
 } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
+import { countRunsOccupyingSlots, resolveEffectiveMaxConcurrentRuns } from "./agent-concurrency.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { budgetService } from "./budgets.js";
 import {
@@ -41,7 +42,11 @@ import {
   PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID,
 } from "./pull-request-work-products.js";
 import { resolveOwningPaperclipIdentifiers } from "./paperclip-identifiers.js";
-import { runUsageTokenCounts } from "./recovery/zero-token-startup-failure.js";
+import {
+  isDependencyBlockedRun,
+  isInfraFailureRun,
+  runUsageTokenCounts,
+} from "./recovery/zero-token-startup-failure.js";
 import { extractNextActionFromText } from "./run-liveness.js";
 
 export const PRODUCTIVITY_REVIEW_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.issueProductivityReview;
@@ -78,6 +83,30 @@ const PRODUCTIVITY_REVIEW_RESERVATION_STALE_MS = 5 * 60 * 1000;
  * block below (BLO-19566 AC4).
  */
 export const PRODUCTIVITY_REVIEW_PR_FRESH_MS = 24 * 60 * 60 * 1000;
+/**
+ * BLO-27698 A3: window in which an assignee `Next action:` comment counts as a
+ * live progress signal, matching the "in the last 6h" wording in the Manager
+ * Decision block below.
+ *
+ * Deliberately its own constant rather than `thresholds.longActiveMs`. Those two
+ * numbers happen to share the 6h default, but they answer different questions —
+ * one is the bar an episode must cross to be *reviewed*, the other is how far
+ * back evidence stays *relevant*. Keying the evidence lookback off the trigger
+ * bar meant raising the bar silently widened the search, so an operator tuning
+ * `longActiveMs` up to 12h would also, invisibly, have started accepting 12h-old
+ * comments as current. Not overridable: it tracks the rubric text a human
+ * reviewer is asked to apply, so drifting it out of step with that wording would
+ * make the printed criterion and the evaluated one disagree.
+ */
+export const PRODUCTIVITY_REVIEW_NEXT_ACTION_COMMENT_FRESH_MS = 6 * 60 * 60 * 1000;
+/**
+ * BLO-27698 A2: window in which an issue the assignee filed against this one
+ * counts as a progress signal. Shared with `PRODUCTIVITY_REVIEW_PR_FRESH_MS` by
+ * intent, not coincidence — A2 suppresses "on the same terms as A1", so the two
+ * deliverable-shaped progress signals must age out together. A reader comparing
+ * the two gates should not have to check whether 24h means the same 24h.
+ */
+const PRODUCTIVITY_REVIEW_LINKED_ISSUE_FRESH_MS = PRODUCTIVITY_REVIEW_PR_FRESH_MS;
 const TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
 // BLO-25410: NOT a lock predicate — this only counts recent runs for the review
 // narrative (`activeRunCount`), and never decides whether an issue is
@@ -427,6 +456,28 @@ type ProductivityReviewEvidence = {
   // the closable case is suppressed outright at generation — i.e. exactly
   // AC2's "still warranted on other grounds".
   dependencyGating: DependencyGating | null;
+  // BLO-27698 C1: the assignee's live slot occupancy at evidence time —
+  // `running` runs against the ceiling the dispatcher actually enforces. The
+  // four fallback verdicts on a `long_active_duration` review all presuppose an
+  // agent that had a turn and used it poorly; a saturated agent had no turn to
+  // use, and until now a reviewer had to reconstruct that from Kubernetes. Null
+  // only when the effective ceiling cannot be resolved from the agent row.
+  //
+  // `runningRunCount` counts the agent's `running` rows that still occupy a
+  // slot, company-wide and NOT just this issue — saturation is an agent-level
+  // property and the whole point is that the other slots are held by *other*
+  // issues. Stale/silent rows are excluded by the same predicate the
+  // dispatcher's slot gate applies (`isRunOccupyingSlot`), so this cannot
+  // report saturation while dispatch would still admit a turn. It is the DB's
+  // view of live runs, deliberately not a Kubernetes read, and the rendered
+  // line says so rather than implying a cluster probe.
+  assigneeConcurrency: {
+    runningRunCount: number;
+    maxConcurrentRuns: number;
+    effectiveMaxConcurrentRuns: number;
+    concurrencyEnabled: boolean;
+    externalLifecycle: boolean;
+  } | null;
   latestRuns: HeartbeatRunRow[];
   latestComments: Array<typeof issueComments.$inferSelect>;
   costCents: number;
@@ -1210,8 +1261,18 @@ function formatDependencyGating(
   const survived = gating.nonClosableTriggers.length > 0
     ? `; reviewed anyway because ${gating.nonClosableTriggers.map((trigger) => `\`${trigger}\``).join(", ")} fired, which an unresolved blocker does not excuse`
     : "";
+  // Names NO individual bucket of the elapsed split, deliberately. This read
+  // "read their unattended portion as covering dependency-blocked time", which
+  // was written when the split had exactly two buckets and dependency-blocked
+  // time could only land in `unattended`. B1 (BLO-27698) adds an `executing`
+  // bucket that absorbs some of it, so on a 30m episode with a blocker
+  // unresolved throughout, the split can render `0m unattended` and a manager
+  // applying the old wording literally concludes there was no
+  // dependency-blocked time — the opposite of the truth, reached by following
+  // the caveat correctly. Point at the figures collectively so a bucket added
+  // later cannot empty the one this names. Do not re-add a bucket name.
   const caveat = elapsedSplitRendered
-    ? "the elapsed figures above are wall-clock and are NOT reduced by this, so read their unattended portion as covering dependency-blocked time of unrecorded length"
+    ? "the elapsed figures above are wall-clock and are NOT reduced by this, so dependency-blocked time of unrecorded length is already inside them"
     : "no elapsed split was computed for this episode, so there is no wall-clock figure this reduces";
   return `${blockers}${finalize}${survived} — blocker state at this pass, not a measured span: ${caveat}`;
 }
@@ -1380,6 +1441,106 @@ function formatNoExecutableTurnGating(gating: NonNullable<ProductivityReviewEvid
     currentClause = `; current run \`${gating.currentRunId}\` failed with zero tokens executed`;
   }
   return `${msToHumanFine(gating.noExecutableTurnMs)} no-executable-turn time (${mix})${currentClause}`;
+}
+
+// BLO-27698 C2: whether the evidence pack itself shows the assignee was denied
+// an executable turn, from the two signals this service already measures — live
+// slot saturation (C1) and no-executable-turn time (BLO-23624). Deliberately
+// NOT a new measurement and NOT a heuristic: the capacity verdict is offered
+// only when one of those two already-computed facts is present, so it cannot
+// become a blanket excuse for every slow episode.
+//
+// The `noExecutableTurn` arm does not require dominance. The dominance test
+// gates *suppression* — withholding the review entirely — and must stay strict.
+// This gates whether a human reviewer is *shown the option*, where a
+// non-dominant but real capacity block is still the thing they need to know.
+// What the cell then SAYS is graded by `hasEpisodeScopedCapacityBlock` — being
+// shown the option and being told not to record under-performance are two
+// different claims, and only the second needs episode-scoped evidence.
+function isCapacityConstrainedEvidence(evidence: ProductivityReviewEvidence) {
+  return (
+    (evidence.assigneeConcurrency !== null
+      && evidence.assigneeConcurrency.runningRunCount
+        >= evidence.assigneeConcurrency.effectiveMaxConcurrentRuns)
+    || (evidence.noExecutableTurnGating !== null
+      && evidence.noExecutableTurnGating.noExecutableTurnMs > 0)
+  );
+}
+
+// BLO-27698 C2 (Ally review on #1856): whether the evidence can carry the
+// CATEGORICAL claim — "had no turn, none of the four verdicts applies" — across
+// the whole episode. Only one of the two signals can:
+//
+//   - `noExecutableTurnGating` is episode-scoped by construction (clamped to
+//     `[attributableStartAt, attributableEndAt)`), so a DOMINANT share of it
+//     does describe the episode. Same predicate and same constant the
+//     suppression gate uses, deliberately — one bar, two consumers.
+//   - `assigneeConcurrency` is a single sample at `now` (see its field note).
+//     Saturation at evidence time says nothing about the preceding hours.
+//   - a NON-dominant no-executable-turn share is real but does not exonerate
+//     the episode: ~30s of queue inside a 7h stall would otherwise emit a
+//     blanket "do not record this as assignee under-performance".
+//
+// Neither weak case is dropped — `isCapacityConstrainedEvidence` still offers
+// the cell — but they render as an unconfirmed partial block the reviewer must
+// check, not as an exoneration.
+function hasEpisodeScopedCapacityBlock(evidence: ProductivityReviewEvidence) {
+  const { noExecutableTurnGating: gating, elapsedMs } = evidence;
+  return Boolean(
+    gating
+      && elapsedMs !== null
+      && elapsedMs > 0
+      && gating.noExecutableTurnMs / elapsedMs > NO_EXECUTABLE_TURN_DOMINANT_SHARE,
+  );
+}
+
+function describeCapacityConstraint(evidence: ProductivityReviewEvidence) {
+  const parts: string[] = [];
+  if (
+    evidence.assigneeConcurrency
+    && evidence.assigneeConcurrency.runningRunCount
+      >= evidence.assigneeConcurrency.effectiveMaxConcurrentRuns
+  ) {
+    // "as of this evidence snapshot" is load-bearing, not hedging: this count
+    // is read once at `now`, so stating it unqualified inside an episode-wide
+    // verdict is an instant-to-episode leap. The C1 line scopes itself the
+    // same way ("live", "while this held").
+    parts.push(
+      `all ${evidence.assigneeConcurrency.effectiveMaxConcurrentRuns} of the assignee's run slots occupied as of this evidence snapshot`,
+    );
+  }
+  if (evidence.noExecutableTurnGating && evidence.noExecutableTurnGating.noExecutableTurnMs > 0) {
+    parts.push(
+      `${msToHuman(evidence.noExecutableTurnGating.noExecutableTurnMs)} of no-executable-turn time`,
+    );
+  }
+  return parts.join("; ");
+}
+
+// BLO-27698 C1: the assignee's live slot occupancy, stated so a reviewer does
+// not have to reconstruct it from Kubernetes. Says "running runs" rather than
+// "pods" because it is a DB count, not a cluster probe — naming it "pods"
+// would claim a measurement this service never takes. The count excludes
+// stale/silent rows on the dispatcher's own predicate, so "saturated" here
+// means dispatch would genuinely have refused a turn.
+function formatAssigneeConcurrency(
+  concurrency: NonNullable<ProductivityReviewEvidence["assigneeConcurrency"]>,
+) {
+  const { runningRunCount, effectiveMaxConcurrentRuns, maxConcurrentRuns } = concurrency;
+  const saturated = runningRunCount >= effectiveMaxConcurrentRuns;
+  // Only worth explaining the ceiling when the enforced value differs from the
+  // configured one — otherwise the parenthetical is noise on every review.
+  const ceilingClause =
+    effectiveMaxConcurrentRuns === maxConcurrentRuns
+      ? ""
+      : concurrency.externalLifecycle && !concurrency.concurrencyEnabled
+        ? ` (configured \`maxConcurrentRuns\` ${maxConcurrentRuns}, held to 1 because external-lifecycle \`concurrencyEnabled\` is off — BLO-15959)`
+        : ` (configured \`maxConcurrentRuns\` ${maxConcurrentRuns}, bounded by the external-lifecycle slot ceiling)`;
+  return `${runningRunCount}/${effectiveMaxConcurrentRuns} running runs against the dispatcher's enforced ceiling${ceilingClause}${
+    saturated
+      ? " — **saturated**: the assignee could not have been dispatched a turn on this issue while this held"
+      : ""
+  }`;
 }
 
 // BLO-23624: the `longActive` trigger-reason qualifier — only rendered when
@@ -1580,23 +1741,6 @@ function formatTrigger(trigger: ProductivityReviewTrigger) {
   return "Long active duration";
 }
 
-// BLO-22097: `usageJson: null` means usage was never *recorded*, not that
-// zero tokens were consumed — a post-model failure whose result event never
-// arrives leaves usage null even though the model produced output. Treating
-// null the same as an explicit `{inputTokens: 0, outputTokens: 0}` (which
-// `runUsageTokenCounts` does, since it exists to parse the blob once it
-// exists) misclassifies that run as never-executed. `logBytes` corroborates
-// the unknown case: every run log opens with ~15-20KB of session boilerplate
-// before any model turn, and explicit-zero-usage runs sampled across
-// BLO-19924/BLO-21091/BLO-21025 topped out at 111,337 bytes (still no model
-// turn — likely a slow upstream timeout inflating the pre-failure log). A
-// run that genuinely executed but lost its usage accounting (BLO-19924's
-// `claude_truncated` case) logged 844,801 bytes, two orders of magnitude
-// above that ceiling. The floor below is set with wide margin above the
-// observed boilerplate ceiling and well below the observed executed-run
-// floor — see BLO-22097 for the full sample tables.
-const NEVER_EXECUTED_UNKNOWN_USAGE_LOG_BYTES_CEILING = 200_000;
-
 const PRODUCTIVITY_REVIEW_TRIGGERS: readonly ProductivityReviewTrigger[] = [
   "no_comment_streak",
   "long_active_duration",
@@ -1614,53 +1758,6 @@ function extractReviewTriggerFromDescription(description: string | null): Produc
   const match = description.match(/^- Primary trigger: `([a-z_]+)`/m);
   const candidate = match?.[1];
   return PRODUCTIVITY_REVIEW_TRIGGERS.find((trigger) => trigger === candidate) ?? null;
-}
-
-// True when the dependency gate cancelled a queued run before dispatch (see
-// `cancelQueuedRunForBlockedDependencies` in heartbeat.ts). The run never
-// reached the adapter, so it is disjoint from `isInfraFailureRun` below even
-// though both are zero-token: this one is a graph-state fact about the issue
-// (an unresolved `blockedBy` edge), not an infrastructure fault, and it must
-// not be reported as one (BLO-22436).
-function isDependencyBlockedRun(run: Pick<HeartbeatRunRow, "errorCode">): boolean {
-  return run.errorCode === "issue_dependencies_blocked";
-}
-
-// True when a run's most recent classification is `failed` liveness AND it
-// burned zero input+output tokens. That combination means the agent never
-// got a model turn — the runtime crashed, the process was killed, or every
-// model call errored before producing output. Observed causes include a K8s
-// crashloop (`BackoffLimitExceeded`), an inference-gateway 503 storm, a
-// provider capacity 429 kill, and retry-budget exhaustion with no error code
-// at all (`error: "unknown"`, `error_status: null`). Keying on token usage
-// rather than error code/status/dispatch-state is deliberate: it is the one
-// signature all four causes share (BLO-21769). Excludes dependency-gate
-// cancellations (BLO-22436) — those never reached the adapter at all, so they
-// are a graph-state fact rather than an infrastructure fault, and are counted
-// separately.
-//
-// `usageJson: null` is unknown, not a measured zero (BLO-22097): it is only
-// read as never-executed when `logBytes` also stays at or under the
-// boilerplate-only ceiling. An *explicit* zero-usage blob is never
-// second-guessed by `logBytes` — a large log with confirmed zero tokens
-// (observed up to 111,337 bytes) is still never-executed, since the
-// corroboration only fills in for missing telemetry, not disputed telemetry.
-//
-// The two narrowings compose without collapsing: BLO-22097 narrows *within*
-// this predicate (which failed runs count as infra), while BLO-22436 widens
-// the *union* below (which populations count as never-executed). Keep them
-// disjoint — folding the dependency gate into the usage test would let a
-// blocker edge masquerade as an infrastructure fault.
-function isInfraFailureRun(
-  run: Pick<HeartbeatRunRow, "livenessState" | "usageJson" | "logBytes" | "errorCode">,
-): boolean {
-  if (isDependencyBlockedRun(run)) return false;
-  if (run.livenessState !== "failed") return false;
-  if (run.usageJson == null) {
-    return (run.logBytes ?? 0) <= NEVER_EXECUTED_UNKNOWN_USAGE_LOG_BYTES_CEILING;
-  }
-  const { inputTokens, outputTokens } = runUsageTokenCounts(run.usageJson);
-  return inputTokens === 0 && outputTokens === 0;
 }
 
 // BLO-22097: manager-facing evidence text must not claim a measured "0
@@ -3333,31 +3430,189 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .then((rows) => rows[0]?.count ?? 0);
   }
 
+  /**
+   * Newest assignee comment carrying a `Next action:` line, within
+   * `PRODUCTIVITY_REVIEW_NEXT_ACTION_COMMENT_FRESH_MS`.
+   *
+   * Returns the row rather than a bare string because BLO-27698 A3 gives this
+   * signal a caller in the generation path, and that caller needs one fact the
+   * string cannot carry: whether the comment is **run-linked**. The Manager
+   * Decision rubric asks for "an assignee run-linked comment in the last 6h",
+   * and suppression must apply the criterion as written — see the gate in
+   * `collectEvidence` for why the unlinked case is reported but not acted on.
+   *
+   * `runLinked` is a property of the **window**, not of the newest comment:
+   * the rubric asks whether *a* run-linked comment exists in the last 6h. Read
+   * off the newest row alone, any later unlinked comment carrying a next-action
+   * line — an out-of-band note, a human-triggered edit — would mask a run-linked
+   * one behind it and flip the gate off. The reported `line` stays the newest,
+   * since that is the one a reviewer wants to read; the two facts are decoupled.
+   *
+   * They are decoupled in their *window* too, and the asymmetry is deliberate:
+   * `line` is drawn from the full freshness window, while `runLinked` is
+   * additionally intersected with the episode. Reporting a next action is useful
+   * to a reviewer at a lower bar than suppressing the review outright — see the
+   * two cutoffs below.
+   */
   async function findCommentNextAction(
     sourceIssue: IssueRow,
     sourceAgent: AgentRow,
-    thresholds: ProductivityReviewThresholds,
+    episodeStartAt: Date | null,
     now: Date,
-  ) {
-    const lookbackStart = new Date(now.getTime() - thresholds.longActiveMs);
+  ): Promise<{ line: string; runLinked: boolean } | null> {
+    // The QUERY keeps the full freshness window, because the reporting fallback
+    // (BLO-19604) is a deliberately lower bar than suppression: recovering a
+    // `Next action:` line for a reviewer to read is useful even when the comment
+    // predates the current episode. Narrowing the query instead would regress it
+    // to "none recorded" — which reads as "the assignee left no next step" and is
+    // exactly what that fallback exists to prevent.
+    const freshCutoff = new Date(now.getTime() - PRODUCTIVITY_REVIEW_NEXT_ACTION_COMMENT_FRESH_MS);
+    // SUPPRESSION, by contrast, is intersected with the episode, exactly as A2's
+    // `findFreshLinkedProgressIssue` is. The freshness bar alone is NOT a subset
+    // of the episode: `longActiveMs` is freely overridable with no lower clamp
+    // (`buildThresholds`), so a lowered bar makes this fixed 6h window wider than
+    // the episode itself, and a `Next action:` from a *previous* episode on the
+    // same issue would suppress indefinitely many reviews of the current one.
+    // Before the lookback was decoupled from `longActiveMs` the subset property
+    // held by construction (`longActive` requires `elapsedMs >= longActiveMs`);
+    // decoupling it is right, but only its upper bound was argued — this restores
+    // the lower one. The failure direction is the unsafe one (review silently
+    // withheld), which is the indefinite-suppression hazard BLO-22331 AC2 forbids.
+    const suppressionStart = episodeStartAt && episodeStartAt.getTime() > freshCutoff.getTime()
+      ? episodeStartAt
+      : freshCutoff;
     const rows = await db
-      .select({ body: issueComments.body })
+      .select({
+        body: issueComments.body,
+        createdByRunId: issueComments.createdByRunId,
+        createdAt: issueComments.createdAt,
+      })
       .from(issueComments)
       .where(
         and(
           eq(issueComments.companyId, sourceIssue.companyId),
           eq(issueComments.issueId, sourceIssue.id),
           eq(issueComments.authorAgentId, sourceAgent.id),
-          sql`${issueComments.createdAt} >= ${lookbackStart.toISOString()}::timestamptz`,
+          sql`${issueComments.createdAt} >= ${freshCutoff.toISOString()}::timestamptz`,
           sql`${issueComments.body} ~* ${NEXT_ACTION_COMMENT_CANDIDATE_PATTERN}`,
         ),
       )
       .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
       .limit(MAX_NEXT_ACTION_COMMENT_CANDIDATES);
 
-    return rows
-      .map((comment) => extractNextActionFromText(comment.body))
-      .find((line): line is string => Boolean(line)) ?? null;
+    let newestLine: string | null = null;
+    let runLinked = false;
+    for (const comment of rows) {
+      const line = extractNextActionFromText(comment.body);
+      // The regex above is a cheap *candidate* filter; `extractNextActionFromText`
+      // is what actually decides a comment states a next action. Only the latter
+      // may be treated as the signal — otherwise a comment merely containing the
+      // words would suppress a review.
+      if (!line) continue;
+      // Rows are newest-first, so the first line seen is the one to report.
+      newestLine ??= line;
+      if (comment.createdByRunId !== null && comment.createdAt.getTime() >= suppressionStart.getTime()) {
+        runLinked = true;
+        break;
+      }
+    }
+    return newestLine === null ? null : { line: newestLine, runLinked };
+  }
+
+  /**
+   * BLO-27698 A2: an issue the assignee filed against this one during the
+   * episode, as a progress signal.
+   *
+   * Decomposing a too-large issue, or filing the human row that a blocker needs,
+   * is deliverable work — but it leaves no trace in any signal this detector
+   * reads. The work-product query is hard-scoped `type = "pull_request"`, so an
+   * assignee who decomposes on contact with a blocker scored exactly zero and
+   * looked identical to one doing nothing.
+   *
+   * "References the source issue" is read **structurally** — a parent link or an
+   * `issue_relations` edge in either direction — never by matching the source
+   * identifier in free text. An identifier is quoted in ordinary prose all the
+   * time (this very comment does it), so a text match would let an assignee
+   * suppress its own review by mentioning the issue it is already working on.
+   * Both structural forms are load-bearing and neither subsumes the other:
+   * decomposition writes `parentId`, while follow-up work the source blocks
+   * writes a relation edge and no parent.
+   *
+   * The relation arm deliberately matches an edge of **any** `type`, in either
+   * direction, whoever created it. `blocks` is the only type the codebase writes
+   * today, so constraining to it would be a no-op that silently excludes any type
+   * added later — and it would not close the residual anyway: a third party can
+   * write a `blocks` edge as easily as any other, so the edge's *creator*, not its
+   * type, is what a tightening would have to key on, and `issue_relations` records
+   * no creator. The residual is therefore accepted and bounded rather than
+   * half-closed: a third party linking an unrelated assignee-filed issue to the
+   * source can manufacture one suppression, but the freshness bar below ages it
+   * out, so it cannot suppress indefinitely.
+   *
+   * Restricted to `originKind = 'manual'`, which is the single most important
+   * line in this function. The productivity review row is ITSELF written as a
+   * child of the source issue with `createdByAgentId` set to the assignee, so
+   * without this filter a generated review would satisfy A2 and suppress the
+   * next one — the detector would switch itself off 24h after firing once, which
+   * is precisely the indefinite-suppression hazard BLO-22331 AC2 forbids. Three
+   * existing `assignment wake` replay tests caught exactly this.
+   *
+   * An allowlist rather than a denylist of known platform origins, so that a
+   * recovery/routine/plugin origin kind added later is excluded by default: the
+   * failure direction is then "a review still generates", not "the detector went
+   * quiet for a reason nobody can see".
+   */
+  async function findFreshLinkedProgressIssue(
+    sourceIssue: IssueRow,
+    sourceAgent: AgentRow,
+    episodeStartAt: Date | null,
+    now: Date,
+  ) {
+    // Bounded by construction, per BLO-22331 AC2. The episode bound alone would
+    // NOT be bounded: an episode grows without limit, so one sub-issue filed in
+    // its first hour would suppress every review for the rest of the episode,
+    // however long. Intersecting it with the same 24h freshness bar A1 uses is
+    // what makes the signal age out.
+    const freshCutoff = new Date(now.getTime() - PRODUCTIVITY_REVIEW_LINKED_ISSUE_FRESH_MS);
+    const createdSince = episodeStartAt && episodeStartAt.getTime() > freshCutoff.getTime()
+      ? episodeStartAt
+      : freshCutoff;
+    const rows = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, sourceIssue.companyId),
+          eq(issues.createdByAgentId, sourceAgent.id),
+          eq(issues.originKind, "manual"),
+          // A soft-deleted row is not a deliverable, and a `harnessKind` row is
+          // test scaffolding. Reuses the shared predicate rather than restating
+          // `hidden_at is null`, so this ages with the visibility rule.
+          visibleIssueCondition(),
+          // Progress-*eligibility*, mirroring `isProgressPullRequest`: A1 keys on
+          // status rather than mere freshness, so that a PR the assignee closed
+          // without merging is not progress however recently it moved. A sub-issue
+          // filed and then cancelled is the same shape. `done` is deliberately
+          // still eligible — completed work is the strongest progress there is.
+          sql`${issues.status} <> 'cancelled'`,
+          sql`${issues.id} <> ${sourceIssue.id}`,
+          sql`${issues.createdAt} >= ${createdSince.toISOString()}::timestamptz`,
+          or(
+            eq(issues.parentId, sourceIssue.id),
+            sql`exists (
+              select 1 from ${issueRelations} r
+              where r.company_id = ${sourceIssue.companyId}
+                and (
+                  (r.issue_id = ${issues.id} and r.related_issue_id = ${sourceIssue.id})
+                  or (r.issue_id = ${sourceIssue.id} and r.related_issue_id = ${issues.id})
+                )
+            )`,
+          ),
+        ),
+      )
+      .orderBy(desc(issues.createdAt), desc(issues.id))
+      .limit(1);
+    return rows[0] ?? null;
   }
 
   async function collectEvidence(
@@ -3539,6 +3794,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       costRow,
       latestPullRequestRow,
       progressPullRequestRow,
+      assigneeRunningRunRows,
     ] = await Promise.all([
       countIssueRunsSince(sourceIssue.companyId, sourceAgent.id, sourceIssue.id, oneHourAgo),
       countIssueRunsSince(sourceIssue.companyId, sourceAgent.id, sourceIssue.id, sixHoursAgo),
@@ -3626,11 +3882,49 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         )
         .orderBy(desc(pullRequestEffectiveEventAtSql))
         .then((rows) => rows.find((row) => pullRequestOwnsIssue(row, sourceIssue.identifier)) ?? null),
+      // BLO-27698 C1: the assignee's live slot occupancy. Company-wide for the
+      // agent, NOT scoped to this issue — the slots that starve this issue are
+      // held by other issues, so an issue-scoped count would always read 1 and
+      // say nothing. `running` only: a `queued` or `scheduled_retry` run holds
+      // no pod and no slot.
+      //
+      // Selects the liveness stamps rather than `count(*)` because the
+      // dispatcher's slot gate counts only NON-STALE running rows
+      // (`isRunOccupyingSlot`). Counting every `running` row here would let a
+      // stale/silent row report `N/N … saturated` — and offer the C2 capacity
+      // verdict — while dispatch would still admit a turn. That is a false
+      // capacity explanation, which is worse than none: it reads as
+      // measurement. The row set is bounded by the agent's live runs, so
+      // filtering in JS against the shared predicate is cheaper than keeping a
+      // second copy of the staleness rule in SQL.
+      db
+        .select({
+          startedAt: heartbeatRuns.startedAt,
+          lastOutputAt: heartbeatRuns.lastOutputAt,
+          lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
+        })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, sourceIssue.companyId),
+            eq(heartbeatRuns.agentId, sourceAgent.id),
+            eq(heartbeatRuns.status, "running"),
+          ),
+        ),
     ]);
 
     const activeRunCount = latestRuns.filter((run) =>
       ACTIVE_RUN_STATUSES.includes(run.status as (typeof ACTIVE_RUN_STATUSES)[number]),
     ).length;
+    // BLO-27698 C1: both halves resolved through the same leaf module the
+    // dispatcher's slot gate uses — the ceiling via
+    // `resolveEffectiveMaxConcurrentRuns`, the occupancy via
+    // `countRunsOccupyingSlots` — so neither a reported ceiling nor a reported
+    // occupancy can disagree with the enforced one.
+    const assigneeConcurrency = {
+      runningRunCount: countRunsOccupyingSlots(assigneeRunningRunRows, now.getTime()),
+      ...resolveEffectiveMaxConcurrentRuns(sourceAgent),
+    };
     // BLO-19604: a run stuck in `queued` never reaches `startedAt`, so it must not anchor
     // the episode. `mostRecentDispatchAt` is a direct `max(startedAt)` over every run
     // touching this issue (queried above, not derived from the createdAt-ordered
@@ -3900,6 +4194,46 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       return null;
     }
 
+    // BLO-19604: `run.nextAction` is only populated when that specific run's own
+    // liveness classification saw the text. Computed here — above the two gates
+    // below rather than at its point of use further down — because it is a pure
+    // scan of already-loaded rows, and hoisting it lets the comment query below
+    // stay lazy for the callers that never needed it.
+    const structuredNextAction = latestRuns.find((run) => run.nextAction)?.nextAction ?? null;
+
+    // BLO-27698 A3: the comment progress signal, evaluated rather than only
+    // printed. The Manager Decision rubric has told reviewers for three releases
+    // that a run-linked `Next action:` comment in the last 6h means "close as
+    // productive", while no code read it — so an assignee that posted exactly the
+    // artifact the rubric asks for still had the review generated against it.
+    //
+    // Queried here (not at the `nextAction` fallback below) because the gate needs
+    // it whether or not the structured field is populated: `run.nextAction` has no
+    // freshness bound of its own, so a stale structured value must not stand in
+    // for a fresh comment. Kept lazy for every other trigger, which is the access
+    // pattern the fallback below was written for.
+    const nextActionComment = trigger === "long_active_duration" || !structuredNextAction
+      ? await findCommentNextAction(sourceIssue, sourceAgent, attributableStartAt, now)
+      : null;
+    // Run-linked only, exactly as the rubric words it. An assignee comment with no
+    // `createdByRunId` is still *reported* (the fallback below prints it), but it
+    // is not evidence that a turn happened — and this gate's whole claim is that
+    // the assignee attended the issue. Bounded per BLO-22331 AC2 by the 6h window:
+    // stop commenting and the trigger fires, so this cannot suppress indefinitely.
+    if (trigger === "long_active_duration" && nextActionComment?.runLinked) {
+      return null;
+    }
+
+    // BLO-27698 A2: an issue filed against this one during the episode is
+    // deliverable progress on the same terms as a fresh PR. Structural edges only
+    // — see `findFreshLinkedProgressIssue`.
+    const linkedProgressIssue = trigger === "long_active_duration"
+      ? await findFreshLinkedProgressIssue(sourceIssue, sourceAgent, attributableStartAt, now)
+      : null;
+    if (linkedProgressIssue) {
+      return null;
+    }
+
     // BLO-25877: computed once here — after both suppression gates above have had
     // their chance to hold this review back — and reused as-is for the report-text
     // field further down, rather than recomputed there.
@@ -3928,23 +4262,18 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       return null;
     }
 
-    // BLO-19604: `run.nextAction` is only populated when that specific run's own
-    // liveness classification saw the text (e.g. a comment posted after that run had
-    // already been classified is invisible to it). Before reporting "none recorded" —
-    // which reads as "the assignee left no next step" — fall back to scanning the
-    // assignee's own recent comments directly, the same way run-liveness classification
-    // would have. This is a genuine fallback, not just a relabelled null: it recovers a
-    // `Next action:`/`Next:` line the structured field missed. Sourced from
-    // `findCommentNextAction` (queried directly against `issueComments`, no join on
-    // `heartbeatRuns`) rather than `latestComments`, since a plain assignee comment with no
-    // `createdByRunId` is exactly the kind of comment this fallback exists to recover, and
-    // `latestComments`'s inner join excludes it. Keep that fallback lazy and projected: the
-    // common structured path should not transfer or parse the assignee's full comment window.
-    const structuredNextAction = latestRuns.find((run) => run.nextAction)?.nextAction ?? null;
-    const commentNextAction = structuredNextAction
-      ? null
-      : await findCommentNextAction(sourceIssue, sourceAgent, thresholds, now);
-    const nextAction = structuredNextAction ?? commentNextAction;
+    // BLO-19604: before reporting "none recorded" — which reads as "the assignee
+    // left no next step" — fall back to the assignee's own recent comments, the
+    // same way run-liveness classification would have. This is a genuine fallback,
+    // not a relabelled null: it recovers a `Next action:`/`Next:` line the
+    // structured field missed. Sourced from `findCommentNextAction` (queried
+    // directly against `issueComments`, no join on `heartbeatRuns`) rather than
+    // `latestComments`, since a plain assignee comment with no `createdByRunId` is
+    // exactly the kind this fallback exists to recover, and `latestComments`'s
+    // inner join excludes it. That unlinked case is why the A3 gate above checks
+    // `runLinked` while this line does not: reporting a next action is useful to a
+    // reviewer at a lower bar than suppressing the review outright.
+    const nextAction = structuredNextAction ?? nextActionComment?.line ?? null;
 
     // Queued-but-never-dispatched runs are excluded from the elapsed-time figure but
     // reported explicitly, so a reviewer has an explanation for why the episode looks
@@ -3987,6 +4316,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       // this in from the map it already holds, and the continuation-hold
       // caller leaves it null because it renders no body.
       dependencyGating: null,
+      assigneeConcurrency,
       latestRuns: latestRuns.slice(0, 5),
       latestComments,
       costCents: costRow.costCents,
@@ -4098,6 +4428,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Total sampled issue-linked runs: ${evidence.totalRunCount}`,
       `- Terminal sampled runs: ${evidence.terminalRunCount}`,
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
+      ...(evidence.assigneeConcurrency
+        ? [`- Assignee live concurrency: ${formatAssigneeConcurrency(evidence.assigneeConcurrency)}`]
+        : []),
       `- No-comment streak (terminal, turn-executing runs): ${evidence.noCommentStreak}`,
       `- Runtime-failure streak (terminal, never-executed runs): ${evidence.runtimeFailureStreak}`,
       `- Never-invoked runs excluded (terminal, no adapter ever created — \`usageJson\`/\`logStore\`/\`logRef\` null, \`logBytes\` null or 0, BLO-26165): ${evidence.neverInvokedRunCount}`,
@@ -4202,6 +4535,25 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           ...pullRequestProgressNote(evidence.latestPullRequest),
           "",
           "If none of these signals is present, the correct verdict is one of:",
+          // BLO-27698 C2: the four verdicts below all presuppose an agent that
+          // was given a turn and used it poorly — decompose, block, stop,
+          // snooze are all instructions to the *assignee*. An assignee that was
+          // saturated or fleet-starved had no turn to use, and with no cell for
+          // that case a reviewer had to force one of the four, which is how a
+          // platform-capacity episode gets recorded as assignee
+          // under-performance. Mirrors the "Route to platform/SRE" block the
+          // `runtime_failure_streak` branch already carries.
+          //
+          // Listed FIRST, and gated on measured evidence rather than always
+          // offered: an always-present capacity excuse would become the default
+          // verdict for every slow episode, which is the opposite failure.
+          ...(isCapacityConstrainedEvidence(evidence)
+            ? [
+              hasEpisodeScopedCapacityBlock(evidence)
+                ? `- Route to platform/SRE as a capacity/dispatch constraint — the evidence above shows the assignee was not given an executable turn (${describeCapacityConstraint(evidence)}). None of the four verdicts below applies to an agent that had no turn; do not record this as assignee under-performance.`
+                : `- Route to platform/SRE as a capacity/dispatch constraint — the evidence above shows a PARTIAL capacity block (${describeCapacityConstraint(evidence)}), not established across the whole episode. Confirm it held for the period in question before routing; if it did not, one of the four verdicts below still applies.`,
+            ]
+            : []),
           "- Request decomposition (the work is too large for a single heartbeat issue and needs to be split)",
           "- Block with an unblock owner (the work needs human direction; name the gate)",
           "- Stop/cancel (the work is not delivering value and should be wound down)",

@@ -25,7 +25,6 @@ import {
   isAllySeatLogin,
   isAllySeatReviewer,
   isMainModule,
-  isRequiredApprovalPair,
   operativeAllyReviews,
   parseBaseline,
   sameLaneBodyRelation,
@@ -224,16 +223,48 @@ describe("operativeAllyReviews", () => {
 });
 
 describe("findPrViolations", () => {
-  it("allows a canonical App review and a plain exact-head User-seat approval", () => {
-    const pr = {
-      number: 1,
-      headSha: HEAD,
-      reviews: [appReview({ id: 1 }), seatReview({ id: 2, body: "Approved after reviewing this change." })],
-    };
+  it("accepts a lone canonical App review as the only permitted shape", () => {
+    const pr = { number: 1, headSha: HEAD, reviews: [appReview({ id: 1 })] };
     assert.deepEqual(findPrViolations(pr), []);
   });
 
-  it("rejects duplicate operative reviews independently in the App and User-seat lanes", () => {
+  // BLO-22916 Defect 2. All five content-free approvals were seat submissions
+  // (uid 296676656) carrying no `Reviewed head:` line; #1114's body is
+  // reproduced verbatim. The App-only I2d check cannot see this shape, so
+  // before I6 the guard returned zero violations for it.
+  it("I6: rejects a User-seat APPROVED that makes no Reviewed head attestation", () => {
+    const pr = {
+      number: 1114,
+      headSha: HEAD,
+      reviews: [
+        appReview({ id: 1 }),
+        seatReview({
+          id: 4879433972,
+          state: "APPROVED",
+          body: "Approved the current CI head. The Alertmanager aggregate lifecycle implementation is unchanged; this head only retriggers checks.",
+        }),
+      ],
+    };
+    assert.deepEqual(findPrViolations(pr), [
+      "I6 PR #1114 @ff1c72db: Ally User seat review 4879433972 is APPROVED — the User seat (uid 296676656) never submits a verdict (R4, BLO-24056); only the App (uid 290875700) may carry one",
+    ]);
+  });
+
+  it("I6: rejects a User-seat review even when it does attest the exact head", () => {
+    const pr = {
+      number: 1115,
+      headSha: HEAD,
+      reviews: [
+        appReview({ id: 1 }),
+        seatReview({ id: 2, body: `Reviewed head: ${HEAD}\n\nSeat approval, independently written.` }),
+      ],
+    };
+    assert.deepEqual(findPrViolations(pr), [
+      "I6 PR #1115 @ff1c72db: Ally User seat review 2 is APPROVED — the User seat (uid 296676656) never submits a verdict (R4, BLO-24056); only the App (uid 290875700) may carry one",
+    ]);
+  });
+
+  it("rejects duplicate operative reviews in the App lane, and both seat reviews outright", () => {
     const pr = {
       number: 876,
       headSha: HEAD,
@@ -245,9 +276,11 @@ describe("findPrViolations", () => {
       ],
     };
     const violations = findPrViolations(pr);
-    assert.equal(violations.length, 2);
+    assert.equal(violations.length, 4);
     assert.match(violations[0], /^I1 PR #876 @ff1c72db: 2 operative Ally App reviews/);
     assert.match(violations[1], /^I1 PR #876 @ff1c72db: 2 operative Ally User seat reviews/);
+    assert.match(violations[2], /^I6 PR #876 @ff1c72db: Ally User seat review 3 is APPROVED/);
+    assert.match(violations[3], /^I6 PR #876 @ff1c72db: Ally User seat review 4 is APPROVED/);
   });
 
   it("I2a: catches an APPROVED whose own body reports an Important finding", () => {
@@ -287,7 +320,7 @@ describe("findPrViolations", () => {
     assert.match(violations[0], /^I2c PR #5 @ff1c72db: Ally App review 12 is APPROVED/);
   });
 
-  it("I3: validates the App attestation while GitHub's exact review commit establishes the User-seat head", () => {
+  it("I3: catches an App review whose body attests a head other than the recorded commit", () => {
     const pr = {
       number: 870,
       headSha: HEAD,
@@ -295,10 +328,6 @@ describe("findPrViolations", () => {
         appReview({
           id: 4830097206,
           body: canonicalBody(OTHER),
-        }),
-        seatReview({
-          id: 4830097207,
-          body: `Approved at exact head ${OTHER}.`,
         }),
       ],
     };
@@ -320,11 +349,6 @@ describe("findPrViolations", () => {
           state: "COMMENTED",
           body: canonicalBody(HEAD, "\nally-verdict: pass"),
         }),
-        seatReview({
-          id: 4888299747,
-          state: "APPROVED",
-          body: "Approved after an independent review.",
-        }),
       ],
     };
     const violations = findPrViolations(pr);
@@ -344,13 +368,27 @@ describe("findPrViolations", () => {
           state: "COMMENTED",
           body: canonicalBody(HEAD),
         }),
-        seatReview({ id: 9842, body: "Approved after an independent review." }),
       ],
     };
     assert.deepEqual(findPrViolations(pr), []);
   });
 
-  it("requires the User-seat lane itself to be a formal approval", () => {
+  it("I6: rejects a User-seat approval on an App-authored PR, which R4 removed as a fallback", () => {
+    const pr = {
+      number: 985,
+      author: { login: "app/allyblockcast", is_bot: true },
+      headSha: HEAD,
+      reviews: [
+        appReview({ id: 9851, state: "COMMENTED", body: canonicalBody(HEAD) }),
+        seatReview({ id: 9852, body: "Approved after an independent review." }),
+      ],
+    };
+    assert.deepEqual(findPrViolations(pr), [
+      "I6 PR #985 @ff1c72db: Ally User seat review 9852 is APPROVED — the User seat (uid 296676656) never submits a verdict (R4, BLO-24056); only the App (uid 290875700) may carry one",
+    ]);
+  });
+
+  it("I6: a User-seat review is prohibited whatever its state", () => {
     const pr = {
       number: 1147,
       headSha: HEAD,
@@ -364,7 +402,7 @@ describe("findPrViolations", () => {
       ],
     };
     assert.deepEqual(findPrViolations(pr), [
-      "I4 PR #1147 @ff1c72db: Ally User seat review 2 is COMMENTED but User-seat evidence must be APPROVED",
+      "I6 PR #1147 @ff1c72db: Ally User seat review 2 is COMMENTED — the User seat (uid 296676656) never submits a verdict (R4, BLO-24056); only the App (uid 290875700) may carry one",
     ]);
   });
 
@@ -383,6 +421,7 @@ describe("findPrViolations", () => {
     };
     const violations = findPrViolations(pr);
     assert.deepEqual(violations, [
+      "I6 PR #876 @ff1c72db: Ally User seat review 4829069732 is APPROVED — the User seat (uid 296676656) never submits a verdict (R4, BLO-24056); only the App (uid 290875700) may carry one",
       "I2b PR #876 @ff1c72db: User-seat APPROVED (4829069732) coexists with a blocking Ally App review (4829074303) — the User seat cannot mask the App blocker",
     ]);
   });
@@ -395,7 +434,6 @@ describe("findPrViolations", () => {
         appReview({ id: 1, state: "DISMISSED", body: canonicalBody(OTHER) }),
         seatReview({ id: 2, state: "DISMISSED", body: canonicalBody(OTHER) }),
         appReview({ id: 3 }),
-        seatReview({ id: 4, body: "Approved after an independent review." }),
       ],
     };
     assert.deepEqual(findPrViolations(pr), []);
@@ -436,8 +474,7 @@ describe("findViolations", () => {
       number: 2,
       headSha: HEAD,
       reviews: [
-        seatReview({ id: 2 }),
-        appReview({ id: 3, state: "COMMENTED", body: canonicalBody(HEAD, "\n### Critical Issues (1)") }),
+        appReview({ id: 3, state: "APPROVED", body: canonicalBody(HEAD, "\n### Critical Issues (1)") }),
       ],
     };
     assert.deepEqual(findViolations([sound]), []);
@@ -477,8 +514,11 @@ describe("assertPrListComplete", () => {
   });
 });
 
-/** The mandated two-principal protected-merge shape. */
-function requiredApprovalPair(app = {}, user = {}) {
+/**
+ * The App+seat two-review shape R4 (BLO-24056) retired. Named for what it
+ * builds, not for a policy: nothing requires this pair any more.
+ */
+function appAndSeatReviews(app = {}, user = {}) {
   return [
     {
       ...review({
@@ -659,56 +699,25 @@ describe("duplicateBodyAcrossIdentities", () => {
   });
 });
 
-describe("I1 accepts only the protected-merge approval pair", () => {
-  it("accepts exactly one independently attested App/User approval pair", () => {
-    const reviews = requiredApprovalPair();
-    const violations = findPrViolations({ number: 1129, headSha: HEAD, reviews });
-
-    assert.equal(isRequiredApprovalPair(reviews, HEAD), true);
-    assert.deepEqual(violations.filter((v) => v.startsWith("I1")), []);
-  });
-
-  it("accepts a clean canonical COMMENTED App self-review only for an App-authored PR", () => {
-    const reviews = requiredApprovalPair({ state: "COMMENTED" });
-    const appAuthoredPr = {
-      number: 1129,
-      author: { login: "app/allyblockcast", is_bot: true },
-      headSha: HEAD,
-      reviews,
-    };
-
-    assert.equal(isRequiredApprovalPair(reviews, HEAD, appAuthoredPr), true);
-    assert.deepEqual(findPrViolations(appAuthoredPr), []);
-    assert.equal(
-      isRequiredApprovalPair(reviews, HEAD, { author: { login: "kkroo", is_bot: false } }),
-      false,
-    );
-
-    const wrongAppIdentity = requiredApprovalPair({
-      state: "COMMENTED",
-      user: { login: ALLY_APP_REVIEWER_LOGIN, id: 42, type: "Bot" },
-    });
-    assert.equal(isRequiredApprovalPair(wrongAppIdentity, HEAD, appAuthoredPr), false);
-  });
-
-  it("does not require the two independent reviews to have byte-identical prose", () => {
-    const reviews = requiredApprovalPair(
-      { body: `## Ally — Consolidated PR Review\nReviewed head: ${HEAD}\n\nApp reviewed the implementation.` },
-      { body: `Reviewed head: ${HEAD}\n\nUser seat independently approved the change.` },
-    );
-
-    assert.equal(isRequiredApprovalPair(reviews, HEAD), true);
-    assert.deepEqual(findPrViolations({ number: 1130, headSha: HEAD, reviews }), []);
-  });
-
+// The App+seat two-review shape R4 (BLO-24056) retired. Every test below
+// builds from it, so every case here is a prohibited submission: the question
+// each asks is only *which* violations the guard reports for it, and whether
+// the App-lane checks still land when a seat review is also present.
+//
+// This block used to assert the pair as the required protected-merge shape,
+// and its passing tests were titled as acceptance of it ("keeps genuinely
+// different App/User write-ups valid"). Those titles were the readable
+// statement of BLO-22916's root cause — they are what a future run would grep
+// and re-derive "submit under both to be safe" from — so they are deleted
+// rather than kept green behind a filter that hid the I6 the guard now emits.
+describe("submissions carrying both an App review and a User seat review", () => {
   it("rejects a byte-identical body submitted under both credentials", () => {
     const body = `## Ally — Consolidated PR Review\nReviewed head: ${HEAD}\n\n### Critical Issues (0)\n### Important Issues (0)\n`;
-    const reviews = requiredApprovalPair({ body }, { body });
+    const reviews = appAndSeatReviews({ body }, { body });
     const violations = findPrViolations({ number: 1176, headSha: HEAD, reviews });
 
     assert.equal(reviews[0].body, reviews[1].body);
     assert.notEqual(reviews[0].user.id, reviews[1].user.id);
-    assert.equal(isRequiredApprovalPair(reviews, HEAD), false);
     assert.match(
       violations.find((v) => v.startsWith("I1")) ?? "",
       /the same body submitted under two credentials/,
@@ -719,11 +728,10 @@ describe("I1 accepts only the protected-merge approval pair", () => {
     const body = `## Ally — Consolidated PR Review\nReviewed head: ${HEAD}\n\n### Critical Issues (0)\n### Important Issues (0)\n`;
 
     for (const variant of [`${body}\n`, `${body}  `, `\n${body}`, `\n  ${body}\n\n`]) {
-      const reviews = requiredApprovalPair({ body }, { body: variant });
+      const reviews = appAndSeatReviews({ body }, { body: variant });
       const context = `variant ${JSON.stringify(variant)}`;
 
       assert.notEqual(reviews[0].body, reviews[1].body, `${context} must not be byte-identical`);
-      assert.equal(isRequiredApprovalPair(reviews, HEAD), false, context);
       assert.match(
         findPrViolations({ number: 1176, headSha: HEAD, reviews }).find((v) =>
           v.startsWith("I1"),
@@ -734,33 +742,27 @@ describe("I1 accepts only the protected-merge approval pair", () => {
     }
   });
 
-  it("keeps genuinely different App/User write-ups valid", () => {
-    const reviews = requiredApprovalPair(
-      {
-        body:
-          `## Ally — Consolidated PR Review\nReviewed head: ${HEAD}\n\n` +
-          `App reviewed the implementation.  `,
-      },
-      { body: `\nReviewed head: ${HEAD}\n\nUser seat approval; see the App review above.\n` },
+  // Was "does not require an App-style attestation in the User-seat body",
+  // asserting this exact shape produced no violation. That is BLO-22916
+  // Defect 2 stated as a requirement, and it is why the five content-free
+  // seat approvals passed the guard. R4 retired the seat verdict, so the
+  // shape is now rejected outright.
+  it("rejects a User-seat body carrying no attestation", () => {
+    const reviews = appAndSeatReviews({}, { body: "Approved after reviewing this change." });
+
+    assert.deepEqual(
+      findPrViolations({ number: 1131, headSha: HEAD, reviews }).filter((v) => v.startsWith("I6")),
+      [
+        "I6 PR #1131 @ff1c72db: Ally User seat review 12 is APPROVED — the User seat (uid 296676656) never submits a verdict (R4, BLO-24056); only the App (uid 290875700) may carry one",
+      ],
     );
-
-    assert.equal(isRequiredApprovalPair(reviews, HEAD), true);
-    assert.deepEqual(findPrViolations({ number: 1177, headSha: HEAD, reviews }), []);
-  });
-
-  it("does not require an App-style attestation in the User-seat body", () => {
-    const reviews = requiredApprovalPair({}, { body: "Approved after reviewing this change." });
-
-    assert.equal(isRequiredApprovalPair(reviews, HEAD), true);
-    assert.deepEqual(findPrViolations({ number: 1131, headSha: HEAD, reviews }), []);
   });
 
   it("rejects an extra operative retry instead of collapsing it", () => {
-    const [app, user] = requiredApprovalPair();
+    const [app, user] = appAndSeatReviews();
     const reviews = [app, user, { ...user, id: 13 }];
     const violations = findPrViolations({ number: 1193, headSha: HEAD, reviews });
 
-    assert.equal(isRequiredApprovalPair(reviews, HEAD), false);
     assert.match(
       violations.find((v) => v.startsWith("I1")) ?? "",
       /^I1 PR #1193 @ff1c72db: 2 operative Ally User seat reviews/,
@@ -768,30 +770,28 @@ describe("I1 accepts only the protected-merge approval pair", () => {
   });
 
   it("rejects a lookalike identity even when it carries the User-seat ID", () => {
-    const [app, user] = requiredApprovalPair();
+    const [app, user] = appAndSeatReviews();
     const reviews = [app, { ...user, user: { login: "blockcast-ally", id: ALLY_USER_REVIEWER_ID } }];
     const violations = findPrViolations({ number: 1194, headSha: HEAD, reviews });
 
-    assert.equal(isRequiredApprovalPair(reviews, HEAD), false);
     assert.deepEqual(operativeAllyReviews(reviews, HEAD, "seat"), []);
     assert.equal(violations.filter((v) => v.startsWith("I1")).length, 0);
   });
 
   it("rejects a canonical login with an unexpected immutable ID", () => {
-    const [app, user] = requiredApprovalPair();
+    const [app, user] = appAndSeatReviews();
     const reviews = [
       app,
       { ...user, user: { login: ALLY_USER_REVIEWER_LOGIN, id: 42, type: "User" } },
     ];
     const violations = findPrViolations({ number: 1195, headSha: HEAD, reviews });
 
-    assert.equal(isRequiredApprovalPair(reviews, HEAD), false);
     assert.equal(violations.filter((v) => v.startsWith("I1")).length, 0);
     assert.equal(violations.filter((v) => v.startsWith("I5")).length, 1);
   });
 
   it("reports an unexpected immutable App ID at the runtime guard", () => {
-    const [app, user] = requiredApprovalPair();
+    const [app, user] = appAndSeatReviews();
     const reviews = [
       { ...app, user: { login: ALLY_APP_REVIEWER_LOGIN, id: 42, type: "Bot" } },
       user,
@@ -803,7 +803,7 @@ describe("I1 accepts only the protected-merge approval pair", () => {
   });
 
   it("reports an unexpected immutable User-seat ID at the runtime guard", () => {
-    const [app, user] = requiredApprovalPair();
+    const [app, user] = appAndSeatReviews();
     const reviews = [
       app,
       { ...user, user: { login: ALLY_USER_REVIEWER_LOGIN, id: 42, type: "User" } },
@@ -814,42 +814,33 @@ describe("I1 accepts only the protected-merge approval pair", () => {
     assert.match(violations.find((v) => v.startsWith("I5")) ?? "", /Ally User seat review 12 uses the canonical login\/type/);
   });
 
-  it("requires both required identities to submit APPROVED reviews", () => {
-    const [app, user] = requiredApprovalPair({}, { state: "COMMENTED" });
+  it("rejects a seat submission regardless of the state it carries", () => {
+    const [app, user] = appAndSeatReviews({}, { state: "COMMENTED" });
     const reviews = [app, user];
     const violations = findPrViolations({ number: 1196, headSha: HEAD, reviews });
 
-    assert.equal(isRequiredApprovalPair(reviews, HEAD), false);
     assert.deepEqual(violations, [
-      "I4 PR #1196 @ff1c72db: Ally User seat review 12 is COMMENTED but User-seat evidence must be APPROVED",
+      "I6 PR #1196 @ff1c72db: Ally User seat review 12 is COMMENTED — the User seat (uid 296676656) never submits a verdict (R4, BLO-24056); only the App (uid 290875700) may carry one",
     ]);
   });
 
-  it("fails closed when either required approval omits its exact-head attestation", () => {
-    const [app, user] = requiredApprovalPair({ body: "Approved without an attestation." });
+  it("still reports the App attestation defects when a seat review is present", () => {
+    const [app, user] = appAndSeatReviews({ body: "Approved without an attestation." });
     const reviews = [app, user];
     const violations = findPrViolations({ number: 1197, headSha: HEAD, reviews });
 
-    assert.equal(isRequiredApprovalPair(reviews, HEAD), false);
     assert.equal(violations.filter((v) => v.startsWith("I1")).length, 0);
     assert.equal(violations.filter((v) => v.startsWith("I2d")).length, 1);
     assert.equal(violations.filter((v) => v.startsWith("I3")).length, 1);
   });
 
-  it("fails closed when either required approval attests a stale head", () => {
-    const [app, user] = requiredApprovalPair({ body: `## Ally — Consolidated PR Review\nReviewed head: ${OTHER}` });
+  it("still reports a stale App attestation when a seat review is present", () => {
+    const [app, user] = appAndSeatReviews({ body: `## Ally — Consolidated PR Review\nReviewed head: ${OTHER}` });
     const reviews = [app, user];
     const violations = findPrViolations({ number: 1198, headSha: HEAD, reviews });
 
-    assert.equal(isRequiredApprovalPair(reviews, HEAD), false);
     assert.equal(violations.filter((v) => v.startsWith("I1")).length, 0);
     assert.equal(violations.filter((v) => v.startsWith("I3")).length, 1);
-  });
-
-  it("does not accept a review recorded against an old commit as current-head evidence", () => {
-    const [app, user] = requiredApprovalPair({}, { commit_id: OTHER });
-
-    assert.equal(isRequiredApprovalPair([app, user], HEAD), false);
   });
 });
 

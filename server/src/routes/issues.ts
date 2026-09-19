@@ -152,6 +152,8 @@ import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
 import {
   executionWorkspaceIdentity,
   publicExecutionWorkspace,
+  publicIssueExecutionWorkspaceSettings,
+  publicProjectExecutionWorkspacePolicy,
   publicProjects,
   publicProjectWorkspace,
   resolveWorkspaceRuntimeViewer,
@@ -176,7 +178,13 @@ import { executionWorkspaceService as executionWorkspaceServiceDirect } from "..
 import { decisionTrainingService } from "../services/decision-training.js";
 import { feedbackService } from "../services/feedback.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
-import { parseUnsupportedPaginationParams } from "../lib/issue-list-query.js";
+import {
+  ISSUE_LIST_APPLIED_LIMIT_HEADER,
+  ISSUE_LIST_TRUNCATED_HEADER,
+  issueListProbeLimit,
+  parseUnsupportedPaginationParams,
+  resolveIssueListTruncation,
+} from "../lib/issue-list-query.js";
 import { readAcceptedPlanConfirmationTarget } from "../services/issues.js";
 import { issueEfficiencyService } from "../services/issue-efficiency.js";
 import {
@@ -2662,10 +2670,17 @@ type IssueListPreparedResponse =
       body: CompactIssue[];
       etag: string;
       cacheControl: string;
+      // BLO-33741: carried on the prepared response, not computed at emit time,
+      // so a TTL-cache hit or a coalesced waiter reports the same truncation
+      // state as the request that actually did the query.
+      appliedLimit: number;
+      truncated: boolean;
     }
   | {
       kind: "full";
       body: unknown[];
+      appliedLimit: number;
+      truncated: boolean;
     };
 
 type IssueListCacheStatus = "miss" | "hit" | "coalesced" | "stale" | "retry";
@@ -3047,6 +3062,43 @@ export function issueRoutes(
   const svc = issueService(db);
   const efficiencySvc = issueEfficiencyService(db);
   const access = accessService(db);
+
+  /**
+   * PEN-3252. Projects the raw `executionWorkspaceSettings` JSONB column off an issue row on its way
+   * out of a response.
+   *
+   * Exists because the issue routes answer with the ROW — `res.json(issue)` or `{...issue}` — rather
+   * than through a projection, so this column never passed the `routes/workspace-response.ts`
+   * withholding boundary at all. It carries the same `workspaceStrategy` command strings and the same
+   * open `workspaceRuntime` record that boundary exists to withhold; not merely the same class, the
+   * same bytes, since `buildReusedExecutionWorkspaceConfigPatchFromIssueSettings` copies them
+   * straight onto the execution workspace's own config.
+   *
+   * One helper rather than the projection inlined at each exit: the column leaves this file from
+   * eleven sites, and a per-site copy is how one of eleven ends up unprojected. Call it on every
+   * response body that carries an issue row.
+   *
+   * The empty-column early return is an optimization that cannot widen what crosses:
+   * `publicIssueExecutionWorkspaceSettings` returns `null`/`undefined` unchanged on BOTH viewer
+   * branches, so resolving the viewer first could only ever produce the same body. It matters because
+   * most issue rows carry no override at all, and `GET /issues/:id` is the most-read agent endpoint in
+   * the product — without it every such response pays an authorization decision to mask nothing.
+   */
+  async function withPublicIssueWorkspaceSettings<
+    T extends { companyId: string; executionWorkspaceSettings?: unknown },
+  >(req: Request, row: T): Promise<T> {
+    if (row.executionWorkspaceSettings === null || row.executionWorkspaceSettings === undefined) {
+      return row;
+    }
+    const runtimeViewer = await resolveWorkspaceRuntimeViewer(access, req, row.companyId);
+    return {
+      ...row,
+      executionWorkspaceSettings: publicIssueExecutionWorkspaceSettings(
+        row.executionWorkspaceSettings,
+        runtimeViewer,
+      ),
+    };
+  }
   const heartbeat = heartbeatService(db, {
     pluginWorkerManager: opts.pluginWorkerManager,
   });
@@ -5279,6 +5331,34 @@ export function issueRoutes(
       if (decision.allowed) readable.push(issue);
     }
     return readable;
+  }
+
+  /**
+   * BLO-33741: does `req.actor` have a readable row at raw position `offset`
+   * or later? The over-fetch probe proves a matching row exists past the page,
+   * but a restricted actor may not be allowed to read THAT row while readable
+   * rows sit further on — so keep scanning raw windows until one turns up or
+   * the population runs out. Only the restricted path pays for this; a
+   * company-scope reader's probe row is its own answer.
+   *
+   * ponytail: O(remaining rows) per request for a restricted actor whose
+   * readable rows are sparse; the durable fix is the actor-readable predicate
+   * in the service query.
+   */
+  async function actorHasReadableIssueFrom(
+    req: Request,
+    companyId: string,
+    filters: IssueFilters,
+    offset: number,
+  ) {
+    for (;;) {
+      const rows = await svc.list(companyId, { ...filters, limit: ISSUE_LIST_MAX_LIMIT, offset });
+      for (const row of rows) {
+        if ((await decideIssueAccess(req, row, "issue:read")).allowed) return true;
+      }
+      if (rows.length < ISSUE_LIST_MAX_LIMIT) return false;
+      offset += rows.length;
+    }
   }
 
   async function actorCanReadCompanyScope(req: Request, companyId: string, scopedDb?: Db) {
@@ -7590,8 +7670,16 @@ export function issueRoutes(
       repoRef: workspace.repoRef,
       defaultRef: workspace.defaultRef,
       visibility: workspace.visibility,
-      setupCommand: workspace.setupCommand,
-      cleanupCommand: workspace.cleanupCommand,
+      // PEN-3073: `ProjectWorkspaceRuntimeConfig` carries no command fields, but the ROW does —
+      // these two are top-level columns, and both are operator-authored shell strings of the same
+      // class as `config.provisionCommand` on the execution-workspace side. Reading the
+      // execution/project asymmetry off the two runtime-config types alone misses them.
+      setupCommand: viewer.revealRuntimeConfig
+        ? workspace.setupCommand
+        : maskWorkspaceRuntimeTextForRead(workspace.setupCommand),
+      cleanupCommand: viewer.revealRuntimeConfig
+        ? workspace.cleanupCommand
+        : maskWorkspaceRuntimeTextForRead(workspace.cleanupCommand),
       remoteProvider: workspace.remoteProvider,
       remoteWorkspaceRef: workspace.remoteWorkspaceRef,
       sharedWorkspaceKey: workspace.sharedWorkspaceKey,
@@ -7664,7 +7752,15 @@ export function issueRoutes(
       env: null,
       pauseReason: project.pauseReason,
       pausedAt: project.pausedAt,
-      executionWorkspacePolicy: project.executionWorkspacePolicy,
+      // PEN-3073: the project-level default for the same two objects the workspace rows carry
+      // per-instance — `workspaceRuntime` (open operator record) and `workspaceStrategy` (the same
+      // provision/teardown command strings). It is not a workspace row, so nothing in the PEN-2852
+      // boundary reached it: this response served `currentExecutionWorkspace.config.workspaceRuntime`
+      // masked and `project.executionWorkspacePolicy.workspaceRuntime` in the clear.
+      executionWorkspacePolicy: publicProjectExecutionWorkspacePolicy(
+        project.executionWorkspacePolicy ?? null,
+        viewer,
+      ),
       codebase: project.codebase,
       workspaces: (project.workspaces ?? []).map((workspace) =>
         compactIssueProjectWorkspace(workspace, viewer),
@@ -7749,9 +7845,21 @@ export function issueRoutes(
       config: workspace.config
         ? {
             environmentId: workspace.config.environmentId,
-            provisionCommand: workspace.config.provisionCommand,
-            teardownCommand: workspace.config.teardownCommand,
-            cleanupCommand: workspace.config.cleanupCommand,
+            // PEN-3073: the three sibling scalars of `workspaceRuntime`, and the same class of
+            // value — `provisionCommand` is executed as `bash -lc <string>`. Masked here on the
+            // same composition rule as `workspaceRuntime` below (BLO-33407): the gate has already
+            // decided, this layer only survives a gate regression. Note these are NOT redundant
+            // with the gate for an entitled reader — values cross by design there, and the
+            // workspace editor depends on it.
+            provisionCommand: viewer.revealRuntimeConfig
+              ? workspace.config.provisionCommand
+              : maskWorkspaceRuntimeTextForRead(workspace.config.provisionCommand),
+            teardownCommand: viewer.revealRuntimeConfig
+              ? workspace.config.teardownCommand
+              : maskWorkspaceRuntimeTextForRead(workspace.config.teardownCommand),
+            cleanupCommand: viewer.revealRuntimeConfig
+              ? workspace.config.cleanupCommand
+              : maskWorkspaceRuntimeTextForRead(workspace.config.cleanupCommand),
             // PEN-2846 (door #12): `workspaceRuntime` is an open
             // `Record<string, unknown>` an operator authors by hand, and this
             // function is a withholding boundary — it enumerates its fields and
@@ -8082,10 +8190,31 @@ export function issueRoutes(
       allowTtlCache: compactView,
       diagnostics: opts.issueListDiagnostics,
       compute: async () => {
-        const rawResult = await svc.list(companyId, listFilters);
-        const result = await actorCanReadCompanyScope(req, companyId)
-          ? rawResult
-          : await filterIssuesForActor(req, rawResult);
+        // BLO-33741: probe one row past the page so truncation is detectable.
+        // `listFilters` keeps the caller's `limit` because it feeds the cache
+        // key — only the service call is widened.
+        //
+        // The page is the RAW `offset`/`limit` window, ACL-filtered — the same
+        // window the caller pages by, so `offset += limit` never skips or
+        // repeats a readable row. The signal is a separate question: does a
+        // matching row THIS ACTOR MAY READ exist past that window? For a
+        // company-scope reader the probe row answers it. For a restricted actor
+        // the probe row may itself be unreadable while readable rows sit further
+        // on, so scan forward until one turns up or the population runs out.
+        // Deriving the signal from the filtered page length is wrong both ways:
+        // counting unreadable rows leaks their existence (first #1844 review),
+        // and a full raw window with sparse readable rows reads as complete
+        // while readable rows sit beyond it (second #1844 review).
+        const probed = await svc.list(companyId, {
+          ...listFilters,
+          limit: issueListProbeLimit(limit),
+        });
+        const { rows: rawPage, truncated: rawHasMore } = resolveIssueListTruncation(probed, limit);
+        const restricted = !(await actorCanReadCompanyScope(req, companyId));
+        const result = restricted ? await filterIssuesForActor(req, rawPage) : rawPage;
+        const truncated = restricted && rawHasMore
+          ? await actorHasReadableIssueFrom(req, companyId, listFilters, offset + limit)
+          : rawHasMore;
         const issueIds = result.map((issue) => issue.id);
         if (compactView) {
           const [handoffStates, recoveryActionByIssue] = await Promise.all([
@@ -8116,6 +8245,8 @@ export function issueRoutes(
             body: compactResult,
             etag: compactIssueListEtag(compactResult),
             cacheControl: "private, must-revalidate",
+            appliedLimit: limit,
+            truncated,
           };
         }
         const [handoffStates, recoveryActionByIssue] = await Promise.all([
@@ -8142,6 +8273,8 @@ export function issueRoutes(
             successfulRunHandoff: handoffStates.get(issue.id) ?? null,
             activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
           })),
+          appliedLimit: limit,
+          truncated,
         };
       },
     });
@@ -8166,6 +8299,18 @@ export function issueRoutes(
       });
       res.status(429).json(body);
       return;
+    }
+
+    // BLO-33741: the body is a bare array with nowhere to carry a flag, so the
+    // truncation signal rides on headers. `X-Applied-Limit` is always present
+    // (a caller learns the effective cap even when it did not bite);
+    // `X-Result-Truncated` appears ONLY when more rows this actor may read exist
+    // past the page, so its absence is the "you have everything" signal. Set
+    // before the 304 branch below — a revalidating client must still learn it
+    // is holding a truncated page.
+    res.setHeader(ISSUE_LIST_APPLIED_LIMIT_HEADER, String(coordinated.response.appliedLimit));
+    if (coordinated.response.truncated) {
+      res.setHeader(ISSUE_LIST_TRUNCATED_HEADER, "true");
     }
 
     if (coordinated.response.kind === "compact") {
@@ -8296,12 +8441,15 @@ export function issueRoutes(
   /**
    * Authoritative open-assignment census.
    *
-   * `GET /companies/:id/issues` silently clamps `limit` to ISSUE_LIST_MAX_LIMIT
-   * and returns a bare array with no total and no cursor, so a caller cannot
-   * tell a complete page from a truncated one, and offset paging over a
-   * mutating collection double-counts and drops rows. Consumers that need
-   * exact per-agent open counts (the agent-health sweep) must read them here
-   * instead of reconstructing them from that population.
+   * `GET /companies/:id/issues` clamps `limit` to ISSUE_LIST_MAX_LIMIT and
+   * returns a bare array, and offset paging over a mutating collection
+   * double-counts and drops rows. Consumers that need exact per-agent open
+   * counts (the agent-health sweep) must read them here instead of
+   * reconstructing them from that population.
+   *
+   * BLO-33741 added `X-Result-Truncated`/`X-Applied-Limit` to that endpoint, so
+   * a truncated page is now detectable rather than silent — but detection is
+   * not a count, and this census remains the authoritative source.
    */
   router.get("/companies/:companyId/issues/open-assignment-census", async (req, res) => {
     const companyId = req.params.companyId as string;
@@ -8809,6 +8957,13 @@ export function issueRoutes(
       currentExecutionWorkspace: compactIssueExecutionWorkspace(currentExecutionWorkspace, runtimeViewer),
       workProducts,
       linkedCases,
+      // PEN-3252. Last in the literal, after every spread above, so no later spread can reintroduce
+      // the raw column — this response already served `currentExecutionWorkspace.config
+      // .workspaceRuntime` masked while `...issue` handed the same bytes back one key over.
+      executionWorkspaceSettings: publicIssueExecutionWorkspaceSettings(
+        issue.executionWorkspaceSettings,
+        runtimeViewer,
+      ),
     });
   });
 
@@ -9148,10 +9303,15 @@ export function issueRoutes(
       }
     }
 
+    const runtimeViewer = await resolveWorkspaceRuntimeViewer(access, req, result.issue.companyId);
     res.json({
       issue: {
         ...result.issue,
         activeRecoveryAction: null,
+        executionWorkspaceSettings: publicIssueExecutionWorkspaceSettings(
+          result.issue.executionWorkspaceSettings,
+          runtimeViewer,
+        ),
       },
       recoveryAction: result.recoveryAction,
     });
@@ -10585,7 +10745,7 @@ export function issueRoutes(
       }
       const referenceSummary = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
       res.status(200).json({
-        ...issue,
+        ...(await withPublicIssueWorkspaceSettings(req, issue)),
         deduplicated: true,
         deduplicationReason,
         duplicateCandidates: [],
@@ -10738,7 +10898,7 @@ export function issueRoutes(
     });
 
     res.status(201).json({
-      ...issue,
+      ...(await withPublicIssueWorkspaceSettings(req, issue)),
       duplicateCandidates,
       relatedWork: referenceSummary,
       referencedIssueIdentifiers: referenceSummary.outbound.map((item) => item.issue.identifier ?? item.issue.id),
@@ -10916,7 +11076,7 @@ export function issueRoutes(
     });
     await queueTaskWatchdogEvaluation(issue, actor.runId);
 
-    res.status(201).json(issue);
+    res.status(201).json(await withPublicIssueWorkspaceSettings(req, issue));
   });
 
   router.get("/issues/:id/accepted-plan-decompositions", async (req, res) => {
@@ -12996,7 +13156,7 @@ export function issueRoutes(
     })();
 
     await queueTaskWatchdogEvaluation(issue, actor.runId);
-    res.json({ ...issueResponse, comment });
+    res.json({ ...(await withPublicIssueWorkspaceSettings(req, issueResponse)), comment });
   });
 
   router.delete("/issues/:id", async (req, res) => {
@@ -13043,7 +13203,7 @@ export function issueRoutes(
     });
 
     await queueTaskWatchdogEvaluation(existing, actor.runId);
-    res.json(issue);
+    res.json(await withPublicIssueWorkspaceSettings(req, issue));
   });
 
   router.post("/issues/:id/checkout", validate(checkoutIssueSchema), async (req, res) => {
@@ -13265,7 +13425,7 @@ export function issueRoutes(
         .catch((err) => logger.warn({ err, issueId: issue.id }, "failed to wake assignee on issue checkout"));
     }
 
-    res.json(updated);
+    res.json(await withPublicIssueWorkspaceSettings(req, updated));
   });
 
   router.post("/issues/:id/release", async (req, res) => {
@@ -13296,7 +13456,7 @@ export function issueRoutes(
         entityType: "issue",
         entityId: released.id,
       });
-      res.json(released);
+      res.json(await withPublicIssueWorkspaceSettings(req, released));
       return;
     }
 
@@ -13328,7 +13488,7 @@ export function issueRoutes(
       entityId: released.id,
     });
 
-    res.json(released);
+    res.json(await withPublicIssueWorkspaceSettings(req, released));
   });
 
   router.post("/issues/:id/admin/force-release", async (req, res) => {
@@ -13371,7 +13531,7 @@ export function issueRoutes(
       },
     });
 
-    res.json(result);
+    res.json({ ...result, issue: await withPublicIssueWorkspaceSettings(req, result.issue) });
   });
 
   router.get("/issues/:id/comments", async (req, res) => {

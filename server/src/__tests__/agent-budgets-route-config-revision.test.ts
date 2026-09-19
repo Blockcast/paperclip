@@ -85,6 +85,7 @@ describeEmbeddedPostgres("PATCH /agents/:agentId/budgets records a config revisi
   });
 
   afterAll(async () => {
+    await db?.$client.end();
     await tempDb?.cleanup();
   });
 
@@ -252,5 +253,82 @@ describeEmbeddedPostgres("PATCH /agents/:agentId/budgets records a config revisi
     // A no-op write must not inflate the chain, or the audit reads repeated
     // idempotent writes as repeated cap raises.
     expect(await revisionsFor(agent.id)).toHaveLength(0);
+  });
+
+  it("takes the budget_policies lock before it touches the agents row", async () => {
+    // BLO-32796 lock-order regression. `applyApprovalEnforcement` locks the
+    // policies it classifies and only then writes the agent mirror; this route
+    // used to do the reverse, so a concurrent apply and board cap change on the
+    // same agent deadlocked (40P01) — not an `HttpError`, so the loser got an
+    // unhandled 500 with no retry. Asserted as the invariant rather than by
+    // racing the two paths: while the policy row is held by someone else, this
+    // route must not yet have locked `agents`.
+    const { company, agent } = await seed(500_000);
+    const app = createApp(db, boardActor(company));
+
+    // Seed the policy row through the route, so there is one to contend over.
+    expect(
+      (await request(app).patch(`/api/agents/${agent.id}/budgets`).send({
+        budgetMonthlyCents: 800_000,
+      })).status,
+    ).toBe(200);
+
+    const holder = createDb(tempDb!.connectionString);
+    const prober = createDb(tempDb!.connectionString);
+    let release!: () => void;
+    let acquired!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    // The holder must actually hold the policy lock before the PATCH fires,
+    // or the route wins the race and the probe measures nothing.
+    const holding = new Promise<void>((resolve) => { acquired = resolve; });
+
+    const held = holder.transaction(async (tx) => {
+      await tx
+        .select({ id: budgetPolicies.id })
+        .from(budgetPolicies)
+        .where(eq(budgetPolicies.scopeId, agent.id))
+        .for("update");
+      acquired();
+      await released;
+    });
+    await holding;
+
+    // `.then()` is what fires a supertest request — without it the PATCH would
+    // not have started during the probe window and the probe would pass for the
+    // wrong reason.
+    const patch = request(app)
+      .patch(`/api/agents/${agent.id}/budgets`)
+      .send({ budgetMonthlyCents: 1_100_000 })
+      .then((response) => response);
+    // The probe window is time-based, so it fails toward green: if express were
+    // slower to enter the transaction than the window is long, the pre-fix route
+    // would never hold `agents` during the probes and all five would succeed for
+    // the wrong reason. Tracking settlement turns that into a failure.
+    let settled = false;
+    void patch.then(() => { settled = true; }, () => { settled = true; });
+
+    try {
+      // Pre-fix the route grabs `agents` immediately and holds it for the whole
+      // window, so every probe fails with 55P03; post-fix it is parked on the
+      // policy lock having touched nothing, so every probe succeeds.
+      for (let i = 0; i < 5; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        await prober.transaction(async (tx) => {
+          await tx
+            .select({ id: agents.id })
+            .from(agents)
+            .where(eq(agents.id, agent.id))
+            .for("update", { noWait: true });
+        });
+      }
+      expect(settled).toBe(false);
+    } finally {
+      release();
+      await held;
+      await holder.$client.end();
+      await prober.$client.end();
+    }
+
+    expect((await patch).status).toBe(200);
   });
 });
