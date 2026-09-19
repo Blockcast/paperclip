@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, exists, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, not, notInArray, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, exists, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, max, ne, not, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 
 /**
@@ -39185,6 +39185,54 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       }
 
+      // BLO-34578: the interval timer used `agents.lastHeartbeatAt` as its
+      // baseline, but that column is stamped by EVERY run's status transition
+      // (`finalizeAgentStatus`), not only by timer ticks. So the gate below was
+      // really asking "has this agent had NO run of ANY KIND for intervalSec?",
+      // and an event-driven agent whose inter-run gap is shorter than its
+      // interval could never satisfy it — its timer never fired at all.
+      //
+      // Measured 2026-09-19 over 9h/1000 runs: Ally took a run every 2-5 min and
+      // logged 0 timer wakes at intervalSec=3600 (expected ~9); same for CTO and
+      // Release Engineer. `max inter-run gap >= intervalSec` predicted the split
+      // 5/5 on the zero side and 6/7 on the other. The timer is the only path
+      // that sweeps an agent's already-assigned `todo` backlog, so the effect ran
+      // backwards: the busier the agent, the less its own queue was ever swept.
+      // Ally's oldest assigned `todo` had aged 12d while it burned ~260 runs/9h.
+      //
+      // Fix is read-side only. Every timer tick — dispatched, skipped by a
+      // circuit breaker, or blocked by the daily cap — already inserts an
+      // `agentWakeupRequests` row with `source: "timer"`, so that table is an
+      // exact, self-healing record of when the timer last ran. Deriving the
+      // baseline from it needs no new column, no new state key, and no write
+      // site that could drift out of sync. Batched here rather than queried
+      // per-agent in the loop, same as `assignedLiveWorkAgentIds` above.
+      //
+      // `lastHeartbeatAt` deliberately keeps its liveness meaning: agent-health
+      // checks, the stale-heartbeat alert and the agent page all read it, and
+      // narrowing its writers to timer ticks would break every one of them.
+      const lastTimerWakeAtByAgentId = new Map<string, Date>();
+      if (allAgents.length > 0) {
+        const lastTimerWakeRows = await db
+          .select({
+            agentId: agentWakeupRequests.agentId,
+            lastRequestedAt: max(agentWakeupRequests.requestedAt),
+          })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              inArray(agentWakeupRequests.agentId, allAgents.map((agent) => agent.id)),
+              eq(agentWakeupRequests.source, "timer"),
+            ),
+          )
+          .groupBy(agentWakeupRequests.agentId);
+        for (const row of lastTimerWakeRows) {
+          if (row.agentId && row.lastRequestedAt) {
+            lastTimerWakeAtByAgentId.set(row.agentId, new Date(row.lastRequestedAt));
+          }
+        }
+      }
+
       for (const agent of allAgents) {
         const invokability = evaluateAgentInvokability(toAgentOrgRow(agent), agentsByCompany.get(agent.companyId) ?? []);
         if (!invokability.invokable) continue;
@@ -39207,7 +39255,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
 
         checked += 1;
-        const baseline = new Date(agent.lastHeartbeatAt ?? agent.createdAt).getTime();
+        // Fall back to `lastHeartbeatAt` only for an agent that has never had a
+        // timer tick recorded — a brand-new agent, or one whose wakeup-request
+        // history has been pruned. Falling back to the old column keeps that
+        // case behaving exactly as before rather than firing immediately.
+        const baseline = (
+          lastTimerWakeAtByAgentId.get(agent.id) ?? new Date(agent.lastHeartbeatAt ?? agent.createdAt)
+        ).getTime();
         const elapsedMs = now.getTime() - baseline;
         if (elapsedMs < policy.intervalSec * 1000) continue;
 
