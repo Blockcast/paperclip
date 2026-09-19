@@ -307,7 +307,11 @@ describeEmbeddedPostgres("GET /api/issues/:id — workspaceRuntime withholding (
   });
 
   /**
-   * BLO-33568. The command SCALARS beside `workspaceRuntime`, on both compacted exits. Distinct
+   * BLO-33568. The command SCALARS beside `workspaceRuntime`, on both compactors of the
+   * issue-detail exit — `compactIssueExecutionWorkspace` and `compactIssueProjectWorkspace`, both
+   * reached by the single `GET /issues/:id` request below. "Compactor" here, never "exit": this
+   * file reserves "exit" for a ROUTE (see the heartbeat-context case), and conflating the two is
+   * what made the heartbeat assertion below look like it was missing one. Distinct
    * from the assertions above in contract as well as in field: `workspaceRuntime` goes to `null`,
    * these are MASKED — so this asserts sentinel-absence AND an explicit `REDACTED_EVENT_VALUE`
    * equality. `toBeNull()` would encode the wrong contract and would pass on a field that had
@@ -323,7 +327,7 @@ describeEmbeddedPostgres("GET /api/issues/:id — workspaceRuntime withholding (
    * fixture: this case fails `expected null to be '***REDACTED***'` and the entitled case below
    * fails alongside it. Both halves guard the seeding; neither depends on the other.
    */
-  it("withholds the command scalars beside workspaceRuntime on both compacted exits", async () => {
+  it("withholds the command scalars beside workspaceRuntime on both compactors of the issue-detail exit", async () => {
     const { companyId, agentId, issueId } = await seedScenario();
 
     const res = await request(createApp(agentActor(companyId, agentId))).get(`/api/issues/${issueId}`);
@@ -439,6 +443,22 @@ describeEmbeddedPostgres("GET /api/issues/:id — workspaceRuntime withholding (
     // production risk today — but it is the same "asserted on both exits that serialize it"
     // convention the flag case above states, and it is this principal's every-wake read.
     expect(JSON.stringify(res.body)).not.toContain(CONFIG_COMMAND_SENTINEL);
+    // There is deliberately NO `PROJECT_WS_COMMAND_SENTINEL` assertion here, and it must not be
+    // added: it would be VACUOUS. This route's `project` is an inline four-field literal
+    // (`id`, `name`, `status`, `targetDate`) built in the handler — it never calls
+    // `compactIssueProject`, so it never serializes `project.workspaces` and the project-workspace
+    // command scalars cannot cross here at all. `compactIssueProject` has exactly one call site in
+    // `routes/issues.ts`, and it is inside `GET /issues/:id`, not this handler.
+    //
+    // Measured 2026-09-19 rather than read, because the reading that suggested adding it cited
+    // that single call site as if it belonged to this route: with the mask reverted at BOTH sites
+    // (see below), the `/issues/:id` case above fails on this sentinel and the proposed assertion
+    // here still passes. A guard that cannot fail is documentation, not a guard.
+    //
+    // ⚠ BOTH sites, because the project-workspace mask is defence-in-depth and a single-site
+    // revert is a false control: `publicProjectWorkspace` (`routes/workspace-response.ts`) masks
+    // these scalars, and `compactIssueProjectWorkspace` (`routes/issues.ts`) then re-masks the
+    // already-masked value. Reverting either one alone leaves all 12 tests in this file green.
   });
 
   it("still discloses heartbeat-context runtime config to an entitled owner member", async () => {
