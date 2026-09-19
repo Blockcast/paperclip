@@ -11,6 +11,14 @@ import manifest from "./manifest.js";
  * `metricLabels`. Neither side can see the other at build time, so each pins
  * its own half.
  *
+ * ⚠ NO CI LANE RUNS THIS FILE. This package is in `UNEXECUTED_WITH_TESTS` in
+ * `scripts/__tests__/vitest-project-coverage.test.mjs` (PEN-2506), so these
+ * assertions are green-by-not-running. The manifest half is pinned for real in
+ * `server/src/__tests__/plugin-metric-exposition.test.ts`, which imports this
+ * manifest directly from a lane CI does execute. This file becomes a live
+ * second guard the day PEN-2506 wires the package in; until then do not treat
+ * it as coverage.
+ *
  * Why this is worth a test rather than left to review: dropping a key here
  * degrades *silently*. The metric keeps publishing and the alert rule keeps
  * evaluating — the series simply loses the label, so a wedged-fence page stops
