@@ -34,7 +34,7 @@ function createEventBusStub() {
   } as any;
 }
 
-describeEmbeddedPostgres("plugin host createComment idempotency", () => {
+describeEmbeddedPostgres("plugin host comment idempotency", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
@@ -255,5 +255,233 @@ describeEmbeddedPostgres("plugin host createComment idempotency", () => {
 
     expect(first.id).not.toBe(second.id);
     expect(await commentRows(issueId)).toHaveLength(2);
+  });
+
+  // -----------------------------------------------------------------------
+  // BLO-31634: updateComment — the key is the authorization, not just the
+  // lookup.
+  //
+  // These live here rather than in the Linear plugin suite on purpose. The
+  // plugin test harness stores the *raw* caller key and does not model the
+  // `plugin:${pluginId}:` namespace at all (it says so in `testing.ts`), so
+  // every property below is invisible to it: against the fake, a cross-plugin
+  // edit would appear to work. Only the real host + real partial unique
+  // indexes can show that it does not.
+  // -----------------------------------------------------------------------
+
+  it("rewrites the body of a comment created under the same raw key", async () => {
+    const { companyId, issueId } = await seedIssue();
+    const idempotencyKey = `linear-comment:${randomUUID()}`;
+
+    const { created, updated } = await withServices(async (services) => ({
+      created: await services.issues.createComment({ issueId, companyId, body: "Original text", idempotencyKey }),
+      updated: await services.issues.updateComment({ issueId, companyId, body: "Edited text", idempotencyKey }),
+    }));
+
+    // Same row rewritten in place — the edit must not insert a second copy.
+    expect(updated?.id).toBe(created.id);
+    expect(updated?.body).toBe("Edited text");
+    const rows = await commentRows(issueId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.body).toBe("Edited text");
+  });
+
+  // The `issue_comments` activity trigger (0076) is AFTER INSERT only, so an
+  // in-place edit bumps nothing on its own and the thread would keep the
+  // pre-edit recency. The service compensates by touching `issues.updated_at`,
+  // which the BEFORE UPDATE trigger mirrors into `last_activity_at`. Drop that
+  // touch and this goes red.
+  it("advances the issue's last_activity_at on an edit", async () => {
+    const { companyId, issueId } = await seedIssue();
+    const idempotencyKey = `linear-comment:${randomUUID()}`;
+
+    const before = await withServices(async (services) => {
+      await services.issues.createComment({ issueId, companyId, body: "Original text", idempotencyKey });
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      return row!.lastActivityAt!;
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await withServices((services) =>
+      services.issues.updateComment({ issueId, companyId, body: "Edited text", idempotencyKey }),
+    );
+
+    const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(after!.lastActivityAt!.getTime()).toBeGreaterThan(before.getTime());
+  });
+
+  // THE security test for this path. There is no update-by-comment-id call, so
+  // the only way to address a comment is to reproduce the key it was written
+  // with — and the host namespaces that per installation. Two plugins sharing
+  // a natural raw key (`comment:42`) must not be able to rewrite each other's
+  // comment. Delete the `plugin:${pluginId}:` prefix in the update path of
+  // `plugin-host-services.ts` and this turns red: the GitHub plugin silently
+  // overwrites the Linear plugin's body.
+  it("scopes an edit per plugin: one plugin cannot rewrite another's comment sharing a raw key", async () => {
+    const { companyId, issueId } = await seedIssue();
+    const idempotencyKey = "comment:42";
+
+    const mine = await withServices((services) =>
+      services.issues.createComment({ issueId, companyId, body: "[Linear] mine", idempotencyKey }),
+    );
+    const theirs = await withOtherPluginServices((services) =>
+      services.issues.createComment({ issueId, companyId, body: "[GitHub] theirs", idempotencyKey }),
+    );
+
+    // The GitHub installation edits *its own* key. It must reach its own
+    // comment and leave the Linear one untouched.
+    const updated = await withOtherPluginServices((services) =>
+      services.issues.updateComment({ issueId, companyId, body: "[GitHub] edited", idempotencyKey }),
+    );
+
+    expect(updated?.id).toBe(theirs.id);
+    const rows = await commentRows(issueId);
+    expect(rows).toHaveLength(2);
+    expect(rows.find((row) => row.id === mine.id)!.body).toBe("[Linear] mine");
+    expect(rows.find((row) => row.id === theirs.id)!.body).toBe("[GitHub] edited");
+  });
+
+  // Sharper than the cross-plugin case above, and the one that fails in the
+  // *dangerous* direction. Non-plugin callers write `idempotency_key` raw —
+  // only the plugin host namespaces — so a server-internal comment sits in the
+  // key space a plugin would occupy if its prefix were dropped. A plugin
+  // asking to edit its own `comment:42` must not be handed that row. Strip the
+  // `plugin:${pluginId}:` prefix from the update path and this does not merely
+  // miss: it rewrites a comment the plugin never authored.
+  it("cannot reach a non-plugin comment stored under the same key un-namespaced", async () => {
+    const { companyId, issueId } = await seedIssue();
+    const idempotencyKey = "comment:42";
+
+    // Written the way a server-internal caller writes it: key stored raw.
+    const internal = await db
+      .insert(issueComments)
+      .values({ companyId, issueId, body: "[internal] not the plugin's", authorType: "system", idempotencyKey })
+      .returning()
+      .then((rows) => rows[0]!);
+
+    const missed = await withServices((services) =>
+      services.issues.updateComment({ issueId, companyId, body: "[Linear] hijacked", idempotencyKey }),
+    );
+
+    expect(missed).toBeNull();
+    const [row] = await db.select().from(issueComments).where(eq(issueComments.id, internal.id));
+    expect(row!.body).toBe("[internal] not the plugin's");
+  });
+
+  // Same uniqueness scope as create — `(issue, author, key)`. A system-authored
+  // comment must not be reachable by passing an agent author, or a plugin could
+  // walk the author axis to reach a row it did not write.
+  it("scopes an edit per author: an agent author does not match a system-authored comment", async () => {
+    const { companyId, issueId } = await seedIssue();
+    const agent = await db
+      .insert(agents)
+      .values({
+        companyId,
+        name: "Linear bridge",
+        role: "engineer",
+        adapterType: "process",
+        adapterConfig: {},
+        permissions: {},
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+    const idempotencyKey = `linear-comment:${randomUUID()}`;
+
+    const missed = await withServices(async (services) => {
+      await services.issues.createComment({ issueId, companyId, body: "system", idempotencyKey });
+      return services.issues.updateComment({
+        issueId,
+        companyId,
+        body: "agent edit",
+        idempotencyKey,
+        authorAgentId: agent.id,
+      });
+    });
+
+    expect(missed).toBeNull();
+    expect((await commentRows(issueId))[0]!.body).toBe("system");
+  });
+
+  // Mirror of the create-side empty-key test, and a sharper hazard here. A
+  // plugin deriving `event.id ?? ""` on the update path must not be handed a
+  // *match*: keyless rows are stored as NULL and an un-normalized "" that fell
+  // through to the WHERE clause would be a body-rewrite aimed at whatever it
+  // collided with. Reject at the boundary instead.
+  it("rejects empty and whitespace-only keys rather than matching a keyless comment", async () => {
+    const { companyId, issueId } = await seedIssue();
+
+    await withServices(async (services) => {
+      await services.issues.createComment({ issueId, companyId, body: "keyless" });
+      await expect(
+        services.issues.updateComment({ issueId, companyId, body: "hijacked", idempotencyKey: "" }),
+      ).rejects.toThrow(/non-empty idempotencyKey/);
+      await expect(
+        services.issues.updateComment({ issueId, companyId, body: "hijacked", idempotencyKey: "   " }),
+      ).rejects.toThrow(/non-empty idempotencyKey/);
+    });
+
+    expect((await commentRows(issueId))[0]!.body).toBe("keyless");
+  });
+
+  // Returning null rather than throwing is load-bearing for the Linear worker:
+  // a miss is the ordinary "no mirror of mine to edit" answer and its fallback
+  // is to create instead, so routing it through a catch would cost a
+  // round-trip on the normal path.
+  it("resolves null when no comment carries the key", async () => {
+    const { companyId, issueId } = await seedIssue();
+
+    const missed = await withServices((services) =>
+      services.issues.updateComment({ issueId, companyId, body: "edit", idempotencyKey: "never-written" }),
+    );
+
+    expect(missed).toBeNull();
+    expect(await commentRows(issueId)).toHaveLength(0);
+  });
+
+  // A soft-deleted mirror must read as "nothing of mine to edit", matching the
+  // partial unique indexes (all `WHERE ... deleted_at IS NULL`). This is what
+  // lets the worker fall through and re-bridge the comment, and what stops an
+  // edit resurrecting a body into a deleted row.
+  it("does not reach a soft-deleted comment", async () => {
+    const { companyId, issueId } = await seedIssue();
+    const idempotencyKey = `linear-comment:${randomUUID()}`;
+
+    const created = await withServices((services) =>
+      services.issues.createComment({ issueId, companyId, body: "Original text", idempotencyKey }),
+    );
+    await db
+      .update(issueComments)
+      .set({ deletedAt: new Date() })
+      .where(eq(issueComments.id, created.id));
+
+    const missed = await withServices((services) =>
+      services.issues.updateComment({ issueId, companyId, body: "Edited text", idempotencyKey }),
+    );
+
+    expect(missed).toBeNull();
+    const [row] = await db.select().from(issueComments).where(eq(issueComments.id, created.id));
+    expect(row!.body).toBe("Original text");
+  });
+
+  // The AC's concurrency guarantee, at the layer that actually provides it.
+  // `updateComment` is a single `UPDATE ... WHERE key = ...` and inserts
+  // nothing, so concurrent deliveries of one edit converge instead of racing
+  // into a second row — the same property BLO-31657 bought for `create`, and
+  // for the same reason: it is the database, not a process-local claim.
+  it("keeps one comment when concurrent edits carry the same key", async () => {
+    const { companyId, issueId } = await seedIssue();
+    const idempotencyKey = `linear-comment:${randomUUID()}`;
+
+    await withServices(async (services) => {
+      await services.issues.createComment({ issueId, companyId, body: "Original text", idempotencyKey });
+      await Promise.all([
+        services.issues.updateComment({ issueId, companyId, body: "Edited text", idempotencyKey }),
+        services.issues.updateComment({ issueId, companyId, body: "Edited text", idempotencyKey }),
+      ]);
+    });
+
+    const rows = await commentRows(issueId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.body).toBe("Edited text");
   });
 });

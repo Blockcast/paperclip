@@ -29,6 +29,9 @@ const manifest: PaperclipPluginManifestV1 = {
     "issues.update",
     "issue.comments.read",
     "issue.comments.create",
+    // BLO-31634: propagate Linear comment edits onto the mirror this plugin
+    // wrote. Reaches only comments carrying this installation's own key.
+    "issue.comments.update",
     "goals.read",
     "milestones.read",
     "milestones.write",

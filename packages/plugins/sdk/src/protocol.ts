@@ -1705,6 +1705,31 @@ export interface WorkerToHostMethods {
     },
     result: IssueComment & { deduplicated?: boolean },
   ];
+  "issues.updateComment": [
+    params: {
+      issueId: string;
+      /**
+       * The key the comment was created with — same value, unnamespaced; the
+       * host re-applies its `plugin:<pluginId>:` prefix. Required, and it is
+       * the authorization as much as the lookup: a comment can only be edited
+       * by the installation that wrote it, so there is no way to reach a
+       * human's comment or another plugin's. Empty and whitespace-only strings
+       * are rejected rather than treated as omitted.
+       */
+      idempotencyKey: string;
+      /** Replacement body. Overwrites; there is no patch/append form. */
+      body: string;
+      companyId: string;
+      /**
+       * Must match the `authorAgentId` the comment was created with — the
+       * uniqueness scope is `(issue, author, key)`, so a mismatch resolves to a
+       * different row or to none.
+       */
+      authorAgentId?: string;
+    },
+    /** `null` when no live comment of this installation's carries that key. */
+    result: IssueComment | null,
+  ];
   "issues.createInteraction": [
     params: {
       issueId: string;
