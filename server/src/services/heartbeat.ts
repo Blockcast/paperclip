@@ -5420,6 +5420,70 @@ export function k8sCcrotateRetryDelayMs(result: { retryNotBefore?: string | null
   );
 }
 
+// BLO-34577: the in-run ccrotate throttle loop re-invokes the k8s adapter for
+// the SAME runId after a zero-progress 429. Each replacement attempt is a fresh
+// Job launch, and that launch can itself fail before any pod runs
+// (`k8s_pod_schedule_failed`). Observed 2026-09-18 on 7 Ally pr_review runs:
+// the adapter read the PREVIOUS attempt's Failed pod -- same deterministic Job
+// name, deleted in the background -- as the replacement's ~100 ms after create
+// and returned `k8s_pod_schedule_failed`. The loop broke on that non-throttle
+// result and the finalizer recorded the code verbatim, which
+// `shouldScheduleAutomaticRunRetry` and `isNonRetryablePrReviewTerminalOutcome`
+// treat as terminal: no retry was minted, the review was dropped, and the gate
+// posted `non_retryable_external_lifecycle`. The identical 429 finalized through
+// the throttle path retries on the flat rate-limit curve.
+//
+// The adapter no longer reads a foreign pod (it scopes lookups to the created
+// Job's UID), but the server verdict must not depend on that: once this run has
+// observed >= 1 zero-progress throttle, a replacement launch that fails before
+// its pod runs adds no information about the WORK -- no attempt made model
+// progress (the loop only retries zero-token results) and this attempt's pod
+// never ran -- so the run's cause is still the throttle. Finalize with the
+// throttle verdict and record the launch failure as an annotation, so the
+// `provider_throttled_no_progress` / `rate_limit_exhausted` path schedules the
+// bounded retry it would have scheduled had the loop simply exhausted.
+//
+// Deliberately narrow: a `k8s_pod_schedule_failed` with NO prior throttle in
+// this run is left exactly as reported. That outcome is ambiguous, and the
+// "does not retry ambiguous k8s_pod_schedule_failed" contract still holds.
+export const K8S_REPLACEMENT_LAUNCH_FAILURE_AFTER_THROTTLE_KEY =
+  "replacementLaunchFailureAfterThrottle" as const;
+
+export function reclassifyK8sReplacementLaunchFailureAfterThrottle(input: {
+  launchResult: AdapterExecutionResult;
+  throttleResult: AdapterExecutionResult | null;
+  throttleAttempts: number;
+}): AdapterExecutionResult | null {
+  const { launchResult, throttleResult, throttleAttempts } = input;
+  if (!throttleResult || throttleAttempts < 1) return null;
+  if (launchResult.errorCode !== "k8s_pod_schedule_failed") return null;
+  // A pod that never ran cannot have made model progress. If usage is reported
+  // anyway this is not the shape described above; leave the verdict alone.
+  if (!zeroTokenUsage(launchResult.usage)) return null;
+  // Only a result the loop itself judged a retryable throttle may stand in as
+  // the verdict; anything else and this was not a throttle chain.
+  if (!isRetryableK8sCcrotateThrottleResult(throttleResult)) return null;
+  const launchErrorMessage = readNonEmptyString(launchResult.errorMessage) ?? launchResult.errorCode;
+  const throttleErrorMessage =
+    readNonEmptyString(throttleResult.errorMessage) ?? "Provider throttled before model progress";
+  const retryNoun = throttleAttempts === 1 ? "retry" : "retries";
+  return {
+    ...throttleResult,
+    errorMessage:
+      `${throttleErrorMessage} (replacement Job launch after ${throttleAttempts} in-run throttle ` +
+      `${retryNoun} failed before its pod ran: ${launchErrorMessage})`,
+    resultJson: {
+      ...(throttleResult.resultJson ?? {}),
+      [K8S_REPLACEMENT_LAUNCH_FAILURE_AFTER_THROTTLE_KEY]: {
+        errorCode: launchResult.errorCode,
+        errorMessage: launchResult.errorMessage ?? null,
+        throttleAttempts,
+        throttleErrorCode: throttleResult.errorCode ?? null,
+      },
+    },
+  };
+}
+
 // The pinned claude_k8s/opencode_k8s adapters report their launch command as
 // this exact "kubectl job/<name>" sentinel (not the real invoked command) so
 // the reservation can learn the expected Job name before the post-create
@@ -31136,6 +31200,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               }
             }
             let ccrotateRetryAttempt = 0;
+            // BLO-34577: the most recent result the loop judged a retryable
+            // throttle. A replacement launch that fails before its pod runs is
+            // finalized with THIS verdict, not the launch failure's.
+            let lastInRunThrottleResult: Awaited<ReturnType<typeof adapter.execute>> | null = null;
             while (true) {
               const executionReservation = externalRuntimeReservation;
               if (executionReservation) {
@@ -31221,6 +31289,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 !isRetryableK8sCcrotateThrottleResult(adapterResult) ||
                 ccrotateRetryAttempt >= K8S_CCROTATE_IN_RUN_RETRY_MAX_ATTEMPTS
               ) {
+                // BLO-34577: a replacement Job whose launch failed before its
+                // pod ran, after this run already observed a zero-progress
+                // throttle, is still the throttle -- see
+                // reclassifyK8sReplacementLaunchFailureAfterThrottle. Without
+                // this the run finalized as `k8s_pod_schedule_failed`, which is
+                // terminal for pr_review, and the review was silently dropped.
+                const reclassified = isK8sAdapter(agent.adapterType)
+                  ? reclassifyK8sReplacementLaunchFailureAfterThrottle({
+                      launchResult: adapterResult,
+                      throttleResult: lastInRunThrottleResult,
+                      throttleAttempts: ccrotateRetryAttempt,
+                    })
+                  : null;
+                if (reclassified) {
+                  await appendRunEvent(currentRun, seq++, {
+                    eventType: "lifecycle",
+                    stream: "system",
+                    level: "warn",
+                    message:
+                      "replacement Job launch failed after an in-run ccrotate throttle; finalizing with the throttle verdict so the bounded retry is scheduled",
+                    payload: {
+                      launchErrorCode: adapterResult.errorCode ?? null,
+                      launchErrorMessage: adapterResult.errorMessage ?? null,
+                      throttleAttempts: ccrotateRetryAttempt,
+                      maxAttempts: K8S_CCROTATE_IN_RUN_RETRY_MAX_ATTEMPTS,
+                    },
+                  });
+                  await onLog(
+                    "stderr",
+                    `[paperclip] Replacement Job launch failed after ${ccrotateRetryAttempt} in-run throttle ${ccrotateRetryAttempt === 1 ? "retry" : "retries"}; recording the run as provider-throttled so it is retried.\n`,
+                  );
+                  adapterResult = reclassified;
+                }
                 break;
               }
               // BLO-18278: if the provider advertised a reset the in-run loop
@@ -31275,6 +31376,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 break;
               }
               ccrotateRetryAttempt += 1;
+              lastInRunThrottleResult = adapterResult;
               const retryDelayMs = k8sCcrotateRetryDelayMs(adapterResult);
               if (externalRuntimeReservation) {
                 // The completed Job belongs to the attempt that just returned.
