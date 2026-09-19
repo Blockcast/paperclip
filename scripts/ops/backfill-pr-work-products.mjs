@@ -217,11 +217,17 @@ if (RUN) for (const status of ["in_review", "blocked", "in_progress"]) {
   }
 }
 
-if (RUN)
+if (RUN) {
   console.log(
     `done: created=${created} would-create=${wouldCreate} skipped=${skipped} unrelated=${unrelated} unreadable=${failed} write-failed=${writeFailed} apply=${APPLY}`,
   );
-// Still exit non-zero on a write failure: catching it buys the summary and the
-// remaining rows, it must not turn a partial backfill into a silent success.
-if (RUN && writeFailed > 0) process.exitCode = 1;
-else console.error("not invoked as a script (argv[1] does not match this module); no backfill performed");
+  // Still exit non-zero on a write failure: catching it buys the summary and the
+  // remaining rows, it must not turn a partial backfill into a silent success.
+  // Braces are load-bearing — this `if` used to be unbraced, which re-parented
+  // the module-guard `else` below onto it and printed "no backfill performed"
+  // under every clean run, directly beneath the counts the runbook sends the
+  // operator to read.
+  if (writeFailed > 0) process.exitCode = 1;
+} else {
+  console.error("not invoked as a script (argv[1] does not match this module); no backfill performed");
+}
