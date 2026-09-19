@@ -38,6 +38,15 @@ function statusExtract(pages) {
   return out.split("\n").filter(Boolean);
 }
 
+/** Turn an actions/runs API body into run rows. */
+function runExtract(workflowRuns) {
+  const out = execFileSync("bash", [READER, "--runs-extract"], {
+    input: JSON.stringify({ workflow_runs: workflowRuns }),
+    encoding: "utf8",
+  });
+  return out.split("\n").filter(Boolean);
+}
+
 /** Validate a candidate head sha. Returns { rc, out }. */
 function shaGuard(sha) {
   try {
@@ -268,9 +277,9 @@ describe("merge-gate reader", () => {
     it("keeps a cancelled run that nothing superseded", () => {
       assert.equal(
         dead([
-          ["276438379", "pull_request", "35249848781", "cancelled"], // sole run of its workflow
-          ["294511598", "pull_request_target", "35249846479", "success"],
-          ["315805904", "pull_request", "35249848741", "skipped"],
+          ["276438379", "pull_request", "35249848781", "cancelled", "2026-09-17T17:00:00Z"], // sole run of its workflow
+          ["294511598", "pull_request_target", "35249846479", "success", "2026-09-17T17:00:00Z"],
+          ["315805904", "pull_request", "35249848741", "skipped", "2026-09-17T17:00:00Z"],
         ]),
         "",
       );
@@ -278,10 +287,12 @@ describe("merge-gate reader", () => {
 
     it("drops a cancelled run whose sibling concluded success", () => {
       // penstock-llm-proxy-core#1948 @ 157589a6 — BLO-34114's own control.
+      // run_started_at are live API values: the success starts 16s LATER, so it
+      // is still stale under the time-ordered rule.
       assert.equal(
         dead([
-          ["286504427", "pull_request", "34542908750", "cancelled"],
-          ["286504427", "pull_request", "34542929394", "success"], // 16s later, same lane
+          ["286504427", "pull_request", "34542908750", "cancelled", "2026-09-10T23:36:32Z"],
+          ["286504427", "pull_request", "34542929394", "success", "2026-09-10T23:36:48Z"], // 16s later, same lane
         ]),
         "34542908750",
       );
@@ -297,14 +308,18 @@ describe("merge-gate reader", () => {
     // The success MUST carry a lower id than at least one cancelled run, or the
     // fixture passes on the old code. All three cancelled ids are asserted: with
     // only the two below max, the old implementation agrees and proves nothing.
+    //
+    // run_started_at are live API values, and the TIE is load-bearing: the
+    // survivor starts 00:04:04 and two of its casualties start 00:04:04 too.
+    // Under `>` instead of `>=` those two are retained and BLO-34619 re-opens.
     it("drops a cancelled run that outranks its successful sibling by id", () => {
       assert.equal(
         dead([
-          ["323092531", "pull_request_target", "35408038943", "cancelled"],
-          ["323092531", "pull_request_target", "35408039732", "cancelled"],
-          ["323092531", "pull_request_target", "35408039808", "success"],
-          ["323092531", "pull_request_target", "35408039945", "cancelled"], // max id
-          ["297263658", "pull_request", "35408038865", "success"],
+          ["323092531", "pull_request_target", "35408038943", "cancelled", "2026-09-19T00:04:03Z"],
+          ["323092531", "pull_request_target", "35408039732", "cancelled", "2026-09-19T00:04:04Z"], // ties the survivor
+          ["323092531", "pull_request_target", "35408039808", "success", "2026-09-19T00:04:04Z"],
+          ["323092531", "pull_request_target", "35408039945", "cancelled", "2026-09-19T00:04:04Z"], // max id, ties too
+          ["297263658", "pull_request", "35408038865", "success", "2026-09-19T00:04:03Z"],
         ]),
         "35408038943|35408039732|35408039945",
       );
@@ -320,8 +335,8 @@ describe("merge-gate reader", () => {
     it("does not let a vacuous pull_request pass delete a cancelled secrets lane", () => {
       assert.equal(
         dead([
-          ["286504429", "pull_request_target", "34868322890", "cancelled"], // secrets lane, timed out
-          ["286504429", "pull_request", "34868326080", "success"], // vacuous lane
+          ["286504429", "pull_request_target", "34868322890", "cancelled", "2026-09-15T16:33:00Z"], // secrets lane, timed out
+          ["286504429", "pull_request", "34868326080", "success", "2026-09-15T16:37:00Z"], // vacuous lane, and LATER
         ]),
         "",
       );
@@ -332,29 +347,29 @@ describe("merge-gate reader", () => {
       // the lane succeeded, so nothing is provably stale and both still STOP.
       assert.equal(
         dead([
-          ["10", "push", "100", "cancelled"],
-          ["10", "push", "200", "cancelled"],
+          ["10", "push", "100", "cancelled", "2026-09-19T01:00:00Z"],
+          ["10", "push", "200", "cancelled", "2026-09-19T01:05:00Z"],
         ]),
         "",
       );
     });
 
     // The sibling check is per workflow, not per head: an unrelated workflow's
-    // success must not retire this cancel. Its run id is deliberately HIGHER, so
-    // a max-id implementation would also spare this row and the fixture would
-    // pass on broken code.
+    // success must not retire this cancel. Its run id is deliberately HIGHER and
+    // its start deliberately LATER, so neither a max-id nor a time-ordered
+    // implementation that lost the workflow scoping would spare this row.
     it("scopes the sibling check to one workflow", () => {
       assert.equal(
         dead([
-          ["20", "push", "200", "success"], // unrelated workflow, higher id
-          ["10", "push", "100", "cancelled"], // sole run of workflow 10
+          ["20", "push", "200", "success", "2026-09-19T01:05:00Z"], // unrelated workflow, higher id, later
+          ["10", "push", "100", "cancelled", "2026-09-19T01:00:00Z"], // sole run of workflow 10
         ]),
         "",
       );
     });
 
     it("is silent when no run was cancelled at all", () => {
-      assert.equal(dead([["10", "push", "100", "success"]]), "");
+      assert.equal(dead([["10", "push", "100", "success", "2026-09-19T01:00:00Z"]]), "");
     });
 
     // DO NOT WIDEN THIS FILTER TO DROP A STALE `failure`. Only `cancelled` rows
@@ -380,10 +395,10 @@ describe("merge-gate reader", () => {
       // penstock-llm-proxy-core#1992 @ fbdb3477 — BLO-34114's control.
       assert.equal(
         dead([
-          ["286504429", "pull_request_target", "34868322890", "failure"],
-          ["286504429", "pull_request", "34868326080", "success"],
-          ["286504427", "pull_request_target", "34868322979", "failure"],
-          ["286504427", "pull_request", "34868326159", "success"],
+          ["286504429", "pull_request_target", "34868322890", "failure", "2026-09-15T16:33:00Z"],
+          ["286504429", "pull_request", "34868326080", "success", "2026-09-15T16:37:00Z"],
+          ["286504427", "pull_request_target", "34868322979", "failure", "2026-09-15T16:33:00Z"],
+          ["286504427", "pull_request", "34868326159", "success", "2026-09-15T16:37:00Z"],
         ]),
         "",
       );
@@ -393,8 +408,67 @@ describe("merge-gate reader", () => {
       // The accepted false RED. Deliberate, not an oversight: see above.
       assert.equal(
         dead([
-          ["315978042", "pull_request_target", "35369288224", "failure"],
-          ["315978042", "pull_request_review", "35370168113", "success"],
+          ["315978042", "pull_request_target", "35369288224", "failure", "2026-09-18T16:34:36Z"],
+          ["315978042", "pull_request_review", "35370168113", "success", "2026-09-18T16:43:36Z"],
+        ]),
+        "",
+      );
+    });
+
+    // BLO-34619, the other direction. Sibling-success is a SET test; supersession
+    // is DIRECTIONAL in time. Without ordering, a success that ran BEFORE the
+    // cancellation deletes it — so a lane that passed and was LATER terminally
+    // cancelled reads green. Measured live on trafficcontrol @ be0a7003, lane
+    // 323092531/issue_comment: success 10:29:56, cancelled 11:19:06, and the run
+    // that actually superseded it had produced no verdict at all.
+    //
+    // The success MUST carry the LOWER id here, or a max-id implementation
+    // agrees and the fixture proves nothing.
+    it("keeps a cancelled run whose only sibling success ran BEFORE it", () => {
+      assert.equal(
+        dead([
+          ["900", "pull_request", "111", "success", "2026-09-19T10:29:56Z"],
+          ["900", "pull_request", "222", "cancelled", "2026-09-19T11:19:06Z"],
+        ]),
+        "",
+      );
+    });
+
+    // `== "success"` must stay exact. Relaxing it to `!= "cancelled"` is silent
+    // against every other fixture in this file: the suite has run rows carrying
+    // `skipped`, but none where a non-`success`, non-`cancelled` sibling is the
+    // ONLY candidate in its own lane, so the condition is never exercised. A
+    // `failure` sibling deleting a terminal cancellation is the exact false
+    // GREEN this rule exists to prevent, and a vacuously-`skipped` lane deleting
+    // the secrets lane is the BLO-34114 hazard — reachable in the run dimension
+    // whenever the two lanes share an event.
+    for (const conclusion of ["failure", "skipped"]) {
+      it(`does not let a same-lane \`${conclusion}\` sibling retire a cancelled run`, () => {
+        assert.equal(
+          dead([
+            ["10", "push", "100", "cancelled", "2026-09-19T01:00:00Z"],
+            ["10", "push", "200", conclusion, "2026-09-19T01:05:00Z"], // later, same lane, no verdict
+          ]),
+          "",
+        );
+      });
+    }
+
+    // A missing run_started_at on either side must fail CLOSED — the run is
+    // kept, i.e. STOP. An absent field is never evidence that a verdict exists;
+    // reading it as one is the direction that ships a merge-authorizing green.
+    it("keeps a cancelled run when a timestamp is missing on either side", () => {
+      assert.equal(
+        dead([
+          ["10", "push", "100", "cancelled", ""],
+          ["10", "push", "200", "success", "2026-09-19T01:05:00Z"],
+        ]),
+        "",
+      );
+      assert.equal(
+        dead([
+          ["10", "push", "100", "cancelled", "2026-09-19T01:00:00Z"],
+          ["10", "push", "200", "success", ""],
         ]),
         "",
       );
@@ -407,8 +481,8 @@ describe("merge-gate reader", () => {
   // this a distinct defect rather than a repeat.
   it("prints the STOPs of a terminally-cancelled run that nothing superseded", () => {
     const runs = [
-      ["276438379", "pull_request", "35249848781", "cancelled"],
-      ["294511598", "pull_request_target", "35249846479", "success"],
+      ["276438379", "pull_request", "35249848781", "cancelled", "2026-09-17T17:00:00Z"],
+      ["294511598", "pull_request_target", "35249846479", "success", "2026-09-17T17:00:00Z"],
     ];
     const rows = [
       ["verify", "failure", "2026-09-17T17:13:29Z", "35249848781"],
@@ -433,11 +507,11 @@ describe("merge-gate reader", () => {
   // the genuine verdict was discarded. Rows and ids are live API values.
   it("keeps the surviving verdict when a workflow bursts several runs at one head", () => {
     const runs = [
-      ["323092531", "pull_request_target", "35408038943", "cancelled"],
-      ["323092531", "pull_request_target", "35408039732", "cancelled"],
-      ["323092531", "pull_request_target", "35408039808", "success"],
-      ["323092531", "pull_request_target", "35408039945", "cancelled"],
-      ["297263658", "pull_request", "35408038865", "success"],
+      ["323092531", "pull_request_target", "35408038943", "cancelled", "2026-09-19T00:04:03Z"],
+      ["323092531", "pull_request_target", "35408039732", "cancelled", "2026-09-19T00:04:04Z"],
+      ["323092531", "pull_request_target", "35408039808", "success", "2026-09-19T00:04:04Z"],
+      ["323092531", "pull_request_target", "35408039945", "cancelled", "2026-09-19T00:04:04Z"],
+      ["297263658", "pull_request", "35408038865", "success", "2026-09-19T00:04:03Z"],
     ];
     const rows = [
       ["Ally review gate", "cancelled", "2026-09-19T00:04:04Z", "35408038943"],
@@ -536,6 +610,44 @@ describe("merge-gate reader", () => {
     }
   });
 
+  // The run-row jq used to be inline in the live path, so its field ORDER — the
+  // contract with dead_runs() — was reached by no fixture at all. A transposition
+  // there is invisible at runtime and silently empties DEAD.
+  describe("run row extraction", () => {
+    it("emits fields in the order dead_runs() reads them", () => {
+      assert.deepEqual(
+        runExtract([
+          {
+            workflow_id: 323092531,
+            event: "pull_request_target",
+            id: 35408039808,
+            conclusion: "success",
+            run_started_at: "2026-09-19T00:04:04Z",
+          },
+        ]),
+        ["323092531\tpull_request_target\t35408039808\tsuccess\t2026-09-19T00:04:04Z"],
+      );
+    });
+
+    // Composed across the seam: @tsv renders a null as the empty string, and
+    // dead_runs() must read that as "no timestamp" and keep the run — not as a
+    // timestamp that compares low enough to retire it.
+    it("renders a null run_started_at as empty, and that fails closed", () => {
+      const rows = runExtract([
+        { workflow_id: 10, event: "push", id: 100, conclusion: "cancelled", run_started_at: null },
+        {
+          workflow_id: 10,
+          event: "push",
+          id: 200,
+          conclusion: "success",
+          run_started_at: "2026-09-19T01:05:00Z",
+        },
+      ]);
+      assert.equal(rows[0], "10\tpush\t100\tcancelled\t");
+      assert.equal(dead(rows.map((r) => r.split("\t"))), "");
+    });
+  });
+
   // Reviewer finding: the legacy-status surface was fetched with neither
   // per_page nor --paginate while the check-run surface one line below had
   // both. GitHub's default page size is 30, so a head with >30 contexts
@@ -547,6 +659,20 @@ describe("merge-gate reader", () => {
     // actions/runs calls carry the same silent-truncation risk, and neither had a
     // guard until this finding. The single-object commit lookup is the only
     // exemption.
+    it("treats an empty DEAD alternation as __none__", () => {
+      // The live path pipes dead_runs() straight in and it prints NOTHING when
+      // no run is stale, so the empty case is on the hot path. Normalising in
+      // verdicts() rather than at the call site is what makes it reachable by a
+      // fixture at all. Empty is not inert: `()` is an empty sub-expression,
+      // read by GNU grep as "matches empty" and rejected outright by ugrep, and
+      // either way `dead` then misses the `__none__` arm so the App-row
+      // exclusion engages. The App-only row is the portable discriminator — it
+      // turns on the awk arm rather than on the local grep's flavour.
+      const appOnly = [["gate/ally-comment-findings", "success", "t1", "app:allyblockcast"]];
+      assert.deepEqual(read(appOnly, ""), []);
+      assert.deepEqual(read(appOnly, ""), read(appOnly, "__none__"));
+    });
+
     it("paginates every list fetch", () => {
       const fetches = SOURCE.split("\n").filter(
         (l) => l.includes('gh api "repos/') && !l.includes("/commits/$2"),
