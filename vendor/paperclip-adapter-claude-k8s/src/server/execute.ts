@@ -2054,6 +2054,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     // Attach ownerReference so K8s GC cleans up the Secret(s) if the process
     // crashes before the finally block runs.
+    //
+    // These three bodies are JSON Patch arrays, and their Content-Type is
+    // stated explicitly rather than inherited.  The generated client picks the
+    // first entry of its accepted-media-type list via
+    // `ObjectSerializer.getPreferredMediaType`, which happens to be
+    // `application/json-patch+json` — so the default is load-bearing here, and
+    // a client-version change that reorders that list would break all three
+    // silently.  The adoption write at `createOrAdoptRunSecret` sets its own
+    // MergePatch header, so leaving these implicit would also make them the
+    // only unstated patch content-type in this file.
     if (promptSecret && createdJobUid) {
       try {
         await coreApi.patchNamespacedSecret({
@@ -2074,7 +2084,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               ],
             },
           ],
-        });
+        }, setHeaderOptions("Content-Type", PatchStrategy.JsonPatch));
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         await onLog("stderr", `[paperclip] Warning: failed to set ownerReference on prompt Secret: ${msg}\n`);
@@ -2100,7 +2110,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               ],
             },
           ],
-        });
+        }, setHeaderOptions("Content-Type", PatchStrategy.JsonPatch));
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         await onLog("stderr", `[paperclip] Warning: failed to set ownerReference on env Secret: ${msg}\n`);
@@ -2126,7 +2136,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               ],
             },
           ],
-        });
+        }, setHeaderOptions("Content-Type", PatchStrategy.JsonPatch));
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         await onLog("stderr", `[paperclip] Warning: failed to set ownerReference on mcp-config Secret: ${msg}\n`);
