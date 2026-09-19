@@ -54,6 +54,16 @@ describe("getConfigSchema", () => {
     ]);
   });
 
+  it("exposes the tool-child memory cap next to the memory limit it derives from (BLO-34477)", () => {
+    const schema = getConfigSchema();
+    const keys = schema.fields.map((f: ConfigFieldSchema) => f.key);
+    const field = schema.fields.find((f: ConfigFieldSchema) => f.key === "resources.limits.toolMemoryKb");
+    expect(field?.type).toBe("number");
+    expect(field?.hint).toMatch(/half of Memory Limit/);
+    expect(field?.hint).toMatch(/0 disables/);
+    expect(keys.indexOf("resources.limits.toolMemoryKb")).toBe(keys.indexOf("resources.limits.memory") + 1);
+  });
+
   it("reattachOrphanedJobs defaults to true", () => {
     const schema = getConfigSchema();
     const field = schema.fields.find((f: ConfigFieldSchema) => f.key === "reattachOrphanedJobs");
