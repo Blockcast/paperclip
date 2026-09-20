@@ -317,9 +317,13 @@ async function runExclusively<T>(agentId: string, fn: () => Promise<T>): Promise
       // work, or `cancel()` was issued and did not take.
       //
       // There is deliberately no retry count here, because there are no
-      // retries: postgres.js `Query#cancel()` is `this.canceller && (this
-      // .canceller(this), this.canceller = null)`, so it disarms itself on the
-      // first call and every later call is a no-op. A counter in this line
+      // retries: postgres.js `Query#cancel()` disarms itself on the first call,
+      // so every later call is a no-op. Upstream did it with
+      // `this.canceller && (this.canceller(this), this.canceller = null)`; this
+      // repo ships `patches/postgres@3.4.9.patch`, which preserves that disarm
+      // via an explicit `if (!this.canceller) return` while returning the
+      // canceller's promise. The patch is the referent — check it, not upstream,
+      // if this claim ever needs re-verifying. A counter in this line
       // would only ever report attempts that did nothing. See "What it does not
       // cover" in `agent-start-lock-db.ts` for why that is reported rather than
       // rescued.

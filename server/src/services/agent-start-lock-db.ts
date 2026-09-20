@@ -81,10 +81,15 @@ import { currentAgentStartLockSignal } from "./agent-start-lock.js";
  * `aborted` when a requested abort does not land.
  *
  * Also uncovered, and live: **a `cancel()` that does not take cannot be
- * retried.** `Query#cancel()` is
- * `this.canceller && (this.canceller(this), this.canceller = null)` — it
- * disarms itself on the first call, so every later `query.cancel?.()` is
- * `null && …` and does nothing. The dial *is* the canceller, and it is spent.
+ * retried.** Upstream's `Query#cancel()` was
+ * `this.canceller && (this.canceller(this), this.canceller = null)`;
+ * `patches/postgres@3.4.9.patch` keeps that self-disarm exactly — including its
+ * order — while returning the canceller's promise, so what this repo ships is
+ * `if (!this.canceller) return; …`. Read the patch, not upstream: it is this
+ * team's file, and a change there making the handle re-armable would invalidate
+ * this paragraph. Either shape disarms on the first call, so every later
+ * `query.cancel?.()` returns without dialling — `undefined` patched, `null`
+ * unpatched — and does nothing. The dial *is* the canceller, and it is spent.
  *
  * An earlier revision of this module retained in-flight queries in a
  * `WeakMap<AbortSignal, Set<Query>>` and re-issued `cancel()` on each lock tick.
@@ -196,8 +201,11 @@ function cancelQuery(query: CancellableQuery, agentId: string | undefined): void
     logger.warn({ err: error, agentId }, "agent start lock: cancelling a wedged statement threw");
     return;
   }
-  // Present only with the patch above applied; `undefined` on an unpatched
-  // driver, where there is nothing to attach to and nothing we can do.
+  // Present only with `patches/postgres@3.4.9.patch` applied. An unpatched
+  // driver returns `null` on every path — armed or not, the comma expression's
+  // value is the `this.canceller = null` assignment — so there is nothing to
+  // attach to and nothing we can do. `isPromiseLike` rejects both shapes
+  // identically, which is why the module still works with the patch dropped.
   if (!isPromiseLike(pending)) return;
   void Promise.resolve(pending).catch((error: unknown) => {
     logger.warn(
@@ -274,8 +282,12 @@ function wrapClient<T extends object>(client: T): T {
   // and the per-access allocation together.
   //
   // Keyed by `prop` only, which is sound because the trap closes over one
-  // `target`: a wrapper is a pure function of (target, prop), and `target` is
-  // fixed for the life of this proxy.
+  // `target`: a wrapper is a pure function of (target, prop, target[prop]), and
+  // `target` is fixed for the life of this proxy. The third term is load-bearing
+  // rather than pedantry — the cached closure captures `value` at build time, so
+  // a method REASSIGNED on the client after its first read would stay masked by
+  // the cache. Unreachable today: postgres.js assigns `unsafe`/`begin`/
+  // `savepoint`/`end` once in `Postgres()` and never rebinds them.
   const methodByProp = new Map<PropertyKey, unknown>();
 
   return new Proxy(client, {
