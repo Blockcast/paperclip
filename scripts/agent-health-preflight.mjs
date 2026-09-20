@@ -295,9 +295,15 @@ export function executeDetailWrite(rowIds, { reserveTripsBeforeShard = null, sta
 }
 
 /**
- * Conservation, checked against three facts the writer cannot re-derive from its
- * own output: the planner's declared `rowCount`, the caller's `rowIds` order, and
- * a duplicate check.
+ * Prefix integrity, checked against the written shards' SELF-REPORTED `rowCount`,
+ * the caller's `rowIds` order, and a duplicate check.
+ *
+ * `declared` sums `rowCount` over the shards that were WRITTEN, so the writer
+ * controls both sides of that conjunct and this function cannot see a shard that
+ * was never written at all. That is deliberate, not a gap: what it checks is
+ * head-first prefix integrity of whatever was materialised. COMPLETENESS is
+ * carried separately by `detailUnmaterialisedRowCount` (Ally review, PR #1571) —
+ * do not read a `true` here as "every planned row landed".
  *
  * The previous form compared `materialised` against `unmaterialised`, which is
  * *defined* as its complement — so the identity held under ANY row loss, and the
@@ -832,10 +838,24 @@ const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
  * past, so real runs land in no expected bucket and are dropped while the
  * missing older windows count as `silent` (Ally review, PR #1571). Callers on
  * the executable path pass `currentWindowEnd()`.
+ *
+ * `end` must be ON the six-hour grid, the same contract `placeWindowKey` already
+ * enforces on every row key. Parseable-but-off-grid was accepted here, which made
+ * all 28 expected keys off-grid and so unmatchable BY CONSTRUCTION: a fully
+ * healthy 28/28 row set reported `silent: 28` — the exact signature of the total
+ * outage this census exists to detect — with `outOfWindowKeys: 28`, documented
+ * as non-failing caller sloppiness, as the only distinguishing signal (Ally
+ * review, PR #1571). It failed closed, so it could not ship a false pass; it
+ * named the wrong defect, which is the standard `placeWindowKey`'s own docblock
+ * applies. Unreachable from `currentWindowEnd()` (it snaps) and from the pinned
+ * default; reachable from the CLI's `process.argv[3]` backfill path.
  */
 export function sevenDayWindowKeys(end = "2026-08-31T06:00:00.000Z") {
   const endMs = Date.parse(end);
   if (!Number.isFinite(endMs)) throw new Error(`invalid census end: ${end}`);
+  if (endMs % SIX_HOURS_MS !== 0) {
+    throw new Error(`invalid census end: not on the six-hour grid: ${end}`);
+  }
   return Array.from({ length: 28 }, (_, index) => windowKey(endMs - (27 - index) * SIX_HOURS_MS));
 }
 
