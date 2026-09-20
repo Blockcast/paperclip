@@ -15,7 +15,7 @@ function blockEventLoop(ms: number): void {
 }
 
 /**
- * Blocks until the sampler reports a stall, or the deadline passes.
+ * Blocks until the sampler reports a stall, or the attempt budget runs out.
  *
  * A single block is a coin flip at these settings, and waiting longer cannot
  * recover a lost one. After the block, our sampler's timer and the histogram's
@@ -27,19 +27,34 @@ function blockEventLoop(ms: number): void {
  * 1000ms, where the histogram is overdue by nearly a full second more than the
  * sampler and always wins — 0 misses in 26 blocks of 1100ms and 3000ms — which
  * is why this is a test-only concern and the module is unchanged.
+ *
+ * The budget is a number of ATTEMPTS, not a wall-clock deadline, and that is
+ * the whole point. Each attempt costs ~610ms of wall time (60 + 400 + 150), so
+ * a 5s deadline bought ~8 attempts on an idle host — miss probability 0.2^8,
+ * i.e. never. But the sleeps and the busy-wait are wall-clock, so on a CPU-
+ * starved runner one attempt can take seconds and the same deadline buys only
+ * one or two: the retry budget collapsed exactly when the per-attempt miss rate
+ * was highest, which is the wrong way round. Measured 2026-09-20: this
+ * assertion failed in 2 of 4 paperclip merge-group runs during a cluster
+ * contention window (`event-loop-stall-log.test.ts:78`, `expected 0 to be
+ * greater than 0`), on runners whose sibling lanes were being preempted
+ * outright. Counting attempts makes the budget independent of host speed:
+ * 12 gives 0.2^12 ~= 4e-9, and a genuine regression still fails in ~7s of
+ * wall time on an idle host rather than hanging.
  */
 async function blockUntilStallObserved(
   observed: ReadonlyArray<unknown>,
-  deadlineMs = 5_000,
+  maxAttempts = 12,
 ): Promise<void> {
-  const end = Date.now() + deadlineMs;
+  let attempts = 0;
   do {
     // The histogram only measures once the loop has iterated after enable(),
     // so yield first — blocking in the same tick records nothing.
     await sleep(60);
     blockEventLoop(400);
     await sleep(150);
-  } while (observed.length === 0 && Date.now() < end);
+    attempts += 1;
+  } while (observed.length === 0 && attempts < maxAttempts);
 }
 
 describe("resolveStallThresholdMs", () => {
