@@ -10,7 +10,7 @@ import {
   extractAllyReviewedHeadSha,
   hasActionablePrReviewFeedback,
   hasAllyConsolidatedReviewHeading,
-  isConformingDispositionVerb,
+  isPublishableToken,
 } from "../services/ally-review-detection.js";
 import {
   commentReviewGateCheckConclusion,
@@ -462,6 +462,49 @@ describe("evaluateCommentReviewGate", () => {
     expect(verdict.reason).toContain(OLD_HEAD.slice(0, 7));
   });
 
+  it("never publishes an unsupported severity key verbatim (PEN-3157)", () => {
+    // Sibling of the ledger-verb case below, one JSON object over: an
+    // unsupported `findings` key is model-authored, and asSeverityCounts quotes
+    // it into the `unreadable` reason, which becomes the commit-status
+    // description and the *uncapped* check-run summary. The verb guard did not
+    // cover it, and the verb test would not have caught it — the leak was the
+    // same token one field away from the one that was fixtured.
+    const token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+    const verdictFor = (severityKey: string) =>
+      evaluateCommentReviewGate({
+        headSha: CURRENT_HEAD,
+        comments: [
+          allyComment(
+            [
+              "## Ally — Consolidated PR Review",
+              "<!-- ally-verdict:1",
+              JSON.stringify({
+                head: CURRENT_HEAD,
+                findings: { critical: 0, important: 0, [severityKey]: 1 },
+              }),
+              "-->",
+              `Reviewed head: ${CURRENT_HEAD}`,
+            ].join("\n"),
+            "2026-08-04T21:09:19Z",
+          ),
+        ],
+      });
+
+    const leaked = verdictFor(token);
+    expect(leaked.reason ?? "").not.toContain(token);
+    expect(leaked.reason ?? "").not.toContain("ghp_");
+    // A URL is alphabet-conforming nowhere near the verb alphabet, so it must
+    // be withheld too — `.toLowerCase()` mangles case but is not a guard.
+    expect(verdictFor("https://hooks.example.io/s3cr3t-9f2a").reason ?? "").not.toContain("s3cr3t");
+    // Withheld, not dropped: the reader must still learn which defect this is.
+    expect(leaked.reason ?? "").toContain("unsupported severity");
+
+    // Positive control. A conforming typo is still named, or the assertions
+    // above would pass on a guard that simply stopped reporting the key — and
+    // naming the rejected key is the whole point of this reason string.
+    expect(verdictFor("critcal").reason ?? "").toContain("critcal");
+  });
+
   it("never publishes a ledger verb outside the prose parser's alphabet (PEN-3157)", () => {
     // An unrecognized verb is quoted verbatim into the commit-status
     // description, and githubPostCommitStatusDetailed POSTs that description
@@ -516,13 +559,12 @@ describe("evaluateCommentReviewGate", () => {
   });
 
   it("the publisher's alphabet is the parser's alphabet", () => {
-    // `[a-z][a-z-]*` is spelled TWICE in ally-review-detection.ts: once as the
-    // verb group of PRIOR_FINDING_DISPOSITION_PATTERN, once as
-    // DISPOSITION_VERB_PATTERN behind isConformingDispositionVerb. That is
-    // deliberate — the PEN-3157 pin in github-write-egress-scrub.test.ts reads
-    // the first out of the pattern's own SOURCE TEXT, so folding them into a
-    // shared constant makes a pure refactor read to that test as a widening of
-    // a security bound. This is what stops the two copies drifting instead.
+    // `[a-z][a-z-]*` is PUBLISHABLE_TOKEN_ALPHABET in ally-review-detection.ts,
+    // interpolated into both the verb group of PRIOR_FINDING_DISPOSITION_PATTERN
+    // and the anchored pattern behind isPublishableToken. Sharing the source
+    // text is what stops them drifting; this test is what proves sharing it
+    // actually yields the same answers, since the two embed it differently —
+    // one anchored `^…$`, one inside a larger bold-list-item match.
     //
     // The bound only holds if the publisher's copy is no WIDER than the
     // parser's: a verb the parser will extract from prose and the publisher
@@ -553,15 +595,15 @@ describe("evaluateCommentReviewGate", () => {
         (entry) => entry.disposition === verb,
       );
       expect(
-        isConformingDispositionVerb(verb),
+        isPublishableToken(verb),
         `publisher vs parser disagree on ${JSON.stringify(verb)}`,
       ).toBe(parserAdmits);
     }
 
     // Positive control: the corpus must actually exercise both answers, or the
     // loop above passes on a corpus that is entirely one-sided.
-    expect(verbs.filter((v) => isConformingDispositionVerb(v)).length).toBeGreaterThan(0);
-    expect(verbs.filter((v) => !isConformingDispositionVerb(v)).length).toBeGreaterThan(0);
+    expect(verbs.filter((v) => isPublishableToken(v)).length).toBeGreaterThan(0);
+    expect(verbs.filter((v) => !isPublishableToken(v)).length).toBeGreaterThan(0);
   });
 
   it("keeps the ordinary reason when no unrecognized verb is involved", () => {

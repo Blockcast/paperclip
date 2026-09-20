@@ -748,6 +748,57 @@ describe("BLO-32695 — fail-closed on an unreadable block", () => {
     });
   }
 
+  it("bounds every model-authored value it quotes into an unreadable reason", () => {
+    // The reason reaches the commit-status description AND the check-run
+    // summary, which has no 140-character cap of its own, so an unbounded
+    // value publishes in full there. Two values on this path are written by
+    // the model: the version digits and an unsupported severity key. Both are
+    // enumerated here together, because the leak that prompted this was the
+    // guarded field's neighbour — the bound was applied per-site, so the next
+    // site was unbounded by default.
+    const reasonFor = (body: string) => {
+      const parsed = parseAllyVerdictBlock(body);
+      expect(parsed.kind).toBe("unreadable");
+      return parsed.kind === "unreadable" ? parsed.reason : "";
+    };
+
+    const longVersion = "9".repeat(400);
+    expect(
+      reasonFor(`${verdictBlock({ head: PR1675_HEAD, findings: {} }, longVersion as never)}
+## Ally — Consolidated PR Review`).length,
+    ).toBeLessThan(120);
+
+    const token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+    const severityReason = reasonFor(
+      `${verdictBlock({ head: PR1675_HEAD, findings: { critical: 0, important: 0, [token]: 1 } })}
+## Ally — Consolidated PR Review`,
+    );
+    expect(severityReason).not.toContain("ghp_");
+    expect(severityReason).toContain("unsupported severity");
+
+    // A lowercase-alphabet key is not mangled by `.toLowerCase()`, so the
+    // guard has to be the alphabet rather than the case fold.
+    expect(
+      reasonFor(`${verdictBlock({
+        head: PR1675_HEAD,
+        findings: { critical: 0, important: 0, "https://hooks.example.io/s3cr3t": 1 },
+      })}
+## Ally — Consolidated PR Review`),
+    ).not.toContain("s3cr3t");
+
+    // Positive control on both surfaces: bounding must not turn into
+    // silencing. A conforming version and a conforming typo are still named,
+    // or the assertions above pass on a guard that reports nothing at all.
+    expect(
+      reasonFor(`${verdictBlock({ head: PR1675_HEAD, findings: {} }, 2)}
+## Ally — Consolidated PR Review`),
+    ).toContain("version 2");
+    expect(
+      reasonFor(`${verdictBlock({ head: PR1675_HEAD, findings: { critcal: 1, important: 0 } })}
+## Ally — Consolidated PR Review`),
+    ).toContain("critcal");
+  });
+
   it("does not report an unreadable block as carrying a finding", () => {
     // AC-3. The distinction is the whole point: "I could not read this" and
     // "this carries an unresolved finding" are different claims, and the gate
