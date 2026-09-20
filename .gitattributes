@@ -1,0 +1,10 @@
+# BLO-34872: the vendored adapter's per-patch log is append-only, so every PR
+# touching that tree used to conflict with every other one on it — 4 rebases on
+# PR #1873 alone, PROVENANCE.md the only conflicting file each time. Union merge
+# keeps both sides' appended rows instead.
+#
+# Scoped to this one file deliberately. PROVENANCE.md itself must NOT be
+# union-merged: it holds the 64-hex integrity hash that the vendor_claude_k8s CI
+# step reads with `grep -oE '^[0-9a-f]{64}$' … | head -1`, and a union would keep
+# both sides' hash lines, making the guard's verdict depend on merge ordering.
+vendor/paperclip-adapter-claude-k8s/PROVENANCE-CHANGES.md merge=union
