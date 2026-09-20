@@ -32,9 +32,18 @@ import { fileURLToPath } from "node:url";
 const DEFAULT_REPO = "Blockcast/penstock-llm-proxy-core";
 const DEFAULT_PR_LIMIT = 60;
 
-/** Descriptions the gate emits when it established no review of the head. */
+/**
+ * Descriptions the gate emits when it established no review of the head.
+ *
+ * Every alternative quotes a sentence `pr-comment-review-gate.ts` owns, long
+ * enough to be unique to it. This predicate runs against EVERY green
+ * `review/`-namespaced status on a merged PR, not only this gate's context, so
+ * a short generic substring couples the census to any wording another repo's
+ * review script happens to use. The shorter the alternative, the more of the
+ * org it silently claims.
+ */
 const NOT_EVALUATED_DESCRIPTION_PATTERN =
-  /no Ally consolidated-review comment attests|no head SHA was supplied|PR author/i;
+  /no Ally consolidated-review comment attests|no head SHA was supplied|attesting this head is the PR author's own|The PR author is unknown/i;
 
 export function isReviewNamespacedContext(context) {
   return typeof context === "string" && context.trim().toLowerCase().startsWith("review/");
