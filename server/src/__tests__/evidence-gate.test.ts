@@ -1059,6 +1059,7 @@ describe("evaluateEvidence — numbered acceptance criteria (BLO-34810)", () => 
       comments: [agentComment(MARKER_TABLE)],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.verdict).toBe("pass");
     expect(result.missing).toEqual([]);
@@ -1074,6 +1075,7 @@ describe("evaluateEvidence — numbered acceptance criteria (BLO-34810)", () => 
       comments: [agentComment(MARKER_TABLE)],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.verdict).toBe("warn");
     expect(result.missing).toEqual(["checklist:done-when"]);
@@ -1091,6 +1093,7 @@ describe("evaluateEvidence — numbered acceptance criteria (BLO-34810)", () => 
       comments: [agentComment(MARKER_TABLE)],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.missing).toEqual(["checklist:done-when"]);
     expect(result.diagnostics).toContain("missing-done-when-bullets");
@@ -1126,6 +1129,7 @@ describe("evaluateEvidence — numbered task-list evidence (BLO-34810 review)", 
       comments: [agentComment(numberedTaskList("1."))],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.verdict).toBe("pass");
     expect(result.missing).toEqual([]);
@@ -1138,6 +1142,7 @@ describe("evaluateEvidence — numbered task-list evidence (BLO-34810 review)", 
       comments: [agentComment("1) [x] a\n2) [x] b\n3) [x] c")],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.missing).toEqual([]);
   });
@@ -1149,6 +1154,7 @@ describe("evaluateEvidence — numbered task-list evidence (BLO-34810 review)", 
         comments: [agentComment(body)],
         workProducts: [],
         registry: DEFAULT_EVIDENCE_REGISTRY,
+        externalDetections: { ...TRUTH_OK },
       });
     expect(evaluate(numberedTaskList("1.")).missing).toEqual(
       evaluate(numberedTaskList("-")).missing,
@@ -1163,6 +1169,7 @@ describe("evaluateEvidence — numbered task-list evidence (BLO-34810 review)", 
       comments: [agentComment("1. [x] a\n2. [x] b")],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.verdict).toBe("warn");
     expect(result.missing).toEqual(["checklist:done-when"]);
@@ -1175,6 +1182,7 @@ describe("evaluateEvidence — numbered task-list evidence (BLO-34810 review)", 
       comments: [agentComment("1. [ ] a\n2. [ ] b\n3. [ ] c")],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
     });
     expect(result.missing).toEqual(["checklist:done-when"]);
   });
