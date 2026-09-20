@@ -1100,7 +1100,19 @@ function buildEnvVars(
   // unlimited; the same spawn with SHLVL=2 -> capped. Do not delete this as a
   // redundant assignment. Today's image uses zsh as the tool shell, so the
   // ZDOTDIR arm already covers it and this closes the bash-tool-shell case.
-  merged.BASH_ENV = TOOL_RLIMIT_FILE;
+  //
+  // Not an off-by-one: bash increments SHLVL during initialisation, before
+  // run_startup_files() evaluates `shell_level < 2`, so a shipped 1 already
+  // clears the branch (measured: child reports shlvl=2). 2 is for margin —
+  // do not "correct" it to 1.
+  //
+  // Clearing that branch also stops bash sourcing ~/.bashrc, so BASH_ENV points
+  // at a bash-specific stub that applies the cap AND chains $HOME/.bashrc
+  // (TOOL_RLIMIT_BASHENV) rather than at rlimit.sh directly. Without that chain
+  // this fix would swap the pod's environment file for the cap instead of
+  // adding the cap to it — on a shared-HOME agent that silently drops
+  // ANTHROPIC_BASE_URL/CCROTATE_SERVE_* and the PATH entries .bashrc sets.
+  merged.BASH_ENV = TOOL_RLIMIT_BASHENV;
   merged.ZDOTDIR = TOOL_RLIMIT_ZDOTDIR;
   merged.SHLVL = "2";
   if (isolation.enabled) {
@@ -1265,7 +1277,9 @@ const DIND_WAIT_PREAMBLE =
 // The emptyDir is per-pod, always mounted in both containers, and dies with
 // the pod, so the cap is rewritten fresh every run with no marker, no shared
 // file to race on, and no stale value to un-append. The ZDOTDIR stubs chain to
-// the user's own `$HOME/.z*` files so nothing an agent relies on is lost.
+// the user's own `$HOME/.z*` files, and the `BASH_ENV` stub chains
+// `$HOME/.bashrc`, so nothing an agent relies on is lost — the cap is added to
+// the environment HOME would have given it, not substituted for it.
 //
 // RLIMIT_DATA rather than RLIMIT_AS: `claude` maps ~73 GiB of virtual address
 // space (V8 pointer-compression cages) against <1 GiB resident, so no `-v`
@@ -1282,8 +1296,21 @@ const DIND_WAIT_PREAMBLE =
 
 export const TOOL_MEMORY_LIMIT_CONFIG_KEY = "resources.limits.toolMemoryKb";
 export const TOOL_RLIMIT_DIR = `${RUNTIME_CACHE_MOUNT_PATH}/tool-rlimit`;
-/** Sourced by bash via `BASH_ENV` and by zsh via the `ZDOTDIR` stub. */
+/** Sourced by zsh via the `ZDOTDIR` stub, and by bash via the `bashenv.sh` stub. */
 export const TOOL_RLIMIT_FILE = `${TOOL_RLIMIT_DIR}/rlimit.sh`;
+/**
+ * `BASH_ENV` target. A bash-specific stub rather than `rlimit.sh` itself:
+ * clearing bash's rshd/sshd branch (see `SHLVL` in the env builder) also stops
+ * bash sourcing `$HOME/.bashrc`, which on a shared-HOME agent is a real file
+ * supplying `ANTHROPIC_BASE_URL`/`CCROTATE_SERVE_*`, `JAVA_HOME` and `PATH`
+ * entries. This stub applies the cap and then chains `$HOME/.bashrc`, so the
+ * agent keeps the environment it would have had from HOME alone, plus the cap —
+ * the same invariant the ZDOTDIR stubs already hold for zsh. It must be a
+ * separate file from `rlimit.sh`: the `.zshenv` stub and the POSIX-`sh` path
+ * source `rlimit.sh` directly, and chaining a bash rc inside it would pull
+ * `.bashrc` into zsh and sh.
+ */
+export const TOOL_RLIMIT_BASHENV = `${TOOL_RLIMIT_DIR}/bashenv.sh`;
 /** `ZDOTDIR` for the claude container; holds chaining stubs for every zsh dotfile. */
 export const TOOL_RLIMIT_ZDOTDIR = `${TOOL_RLIMIT_DIR}/zdotdir`;
 /** Every dotfile zsh looks up under ZDOTDIR; each stub defers to `$HOME/<name>`. */
@@ -1369,12 +1396,15 @@ export function resolveToolMemoryLimitKb(
  * the cap under `dir` (the runtime-cache emptyDir, mounted by both containers):
  *
  *  1. `<dir>/rlimit.sh` — the `ulimit -d` line (or a "disabled" comment when
- *     the cap is 0, so `BASH_ENV` always points at a readable file).
- *  2. `<dir>/zdotdir/.zshenv` — sources rlimit.sh, then the user's
+ *     the cap is 0, so the stubs always point at a readable file).
+ *  2. `<dir>/bashenv.sh` — the `BASH_ENV` target: sources rlimit.sh, then the
+ *     user's `$HOME/.bashrc`. Separate from rlimit.sh because zsh and POSIX sh
+ *     source that file directly and must not pull in a bash rc.
+ *  3. `<dir>/zdotdir/.zshenv` — sources rlimit.sh, then the user's
  *     `$HOME/.zshenv`. The other zsh dotfiles get pure chaining stubs so an
  *     interactive/login zsh under `ZDOTDIR` behaves exactly as it would with
- *     HOME alone. `$HOME` is deliberately left unexpanded: the zsh that sources
- *     the stub resolves it.
+ *     HOME alone. `$HOME` is deliberately left unexpanded: the shell that
+ *     sources the stub resolves it.
  *
  * Everything is rewritten unconditionally: the emptyDir is per-pod, so there is
  * no earlier state to preserve and a changed cap takes effect on the next run.
@@ -1382,6 +1412,7 @@ export function resolveToolMemoryLimitKb(
 export function buildToolRlimitInitShell(dir: string, limitKb: number): string[] {
   const q = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
   const rlimitFile = `${dir}/rlimit.sh`;
+  const bashenvFile = `${dir}/bashenv.sh`;
   const zdotdir = `${dir}/zdotdir`;
   const rlimitLines = [
     "# paperclip claude_k8s (BLO-34477): RLIMIT_DATA cap for tool-spawned children so a runaway fails alone with ENOMEM instead of the cgroup OOM-killing the whole run. Rewritten by the write-prompt init container on every run.",
@@ -1391,6 +1422,10 @@ export function buildToolRlimitInitShell(dir: string, limitKb: number): string[]
   const parts = [
     `mkdir -p ${q(zdotdir)}`,
     `printf '%s\\n' ${rlimitLines.map(q).join(" ")} > ${q(rlimitFile)}`,
+    // Cap first, then the user's own .bashrc — SHLVL=2 means bash no longer
+    // reads it on its own, so without this chain the fix would silently strip
+    // the pod's environment file from a directly-spawned bash.
+    `printf '%s\\n' ${[`. ${q(rlimitFile)}`, chain(".bashrc")].map(q).join(" ")} > ${q(bashenvFile)}`,
   ];
   for (const name of ZSH_DOTFILES) {
     const lines = name === ".zshenv" ? [`. ${q(rlimitFile)}`, chain(name)] : [chain(name)];

@@ -24,6 +24,7 @@ import {
   TOOL_MEMORY_LIMIT_CONFIG_KEY,
   TOOL_RLIMIT_DIR,
   TOOL_RLIMIT_FILE,
+  TOOL_RLIMIT_BASHENV,
   TOOL_RLIMIT_ZDOTDIR,
   ZSH_DOTFILES,
 } from "./job-manifest.js";
@@ -2982,6 +2983,16 @@ describe("tool-child memory cap (BLO-34477)", () => {
       expect(cmd).toContain(
         `printf '%s\\n' '. '\\''${TOOL_RLIMIT_FILE}'\\''' 'if [ -r "$HOME/.zshenv" ]; then . "$HOME/.zshenv"; fi' > '${TOOL_RLIMIT_ZDOTDIR}/.zshenv'`,
       );
+      // bash entry point: same shape as the zsh one. It must chain .bashrc
+      // because SHLVL=2 stops bash reading that file on its own, so without
+      // this the cap would REPLACE the pod's environment file rather than add
+      // to it (shared-HOME agents lose ANTHROPIC_BASE_URL/CCROTATE_SERVE_*).
+      expect(cmd).toContain(
+        `printf '%s\\n' '. '\\''${TOOL_RLIMIT_FILE}'\\''' 'if [ -r "$HOME/.bashrc" ]; then . "$HOME/.bashrc"; fi' > '${TOOL_RLIMIT_BASHENV}'`,
+      );
+      // ...and the bash rc must NOT be chained from rlimit.sh itself, which zsh
+      // and POSIX sh source directly.
+      expect(cmd).not.toContain(`.bashrc"; fi' > '${TOOL_RLIMIT_FILE}'`);
       // Every other zsh dotfile is a pure chaining stub, so ZDOTDIR loses nothing.
       for (const name of ZSH_DOTFILES.filter((n) => n !== ".zshenv")) {
         expect(cmd).toContain(`printf '%s\\n' 'if [ -r "$HOME/${name}" ]; then . "$HOME/${name}"; fi' > '${TOOL_RLIMIT_ZDOTDIR}/${name}'`);
@@ -3013,7 +3024,7 @@ describe("tool-child memory cap (BLO-34477)", () => {
 
     it("points the claude container's BASH_ENV and ZDOTDIR at the emptyDir files, classified SAFE_LITERAL", () => {
       const env = claudeEnv();
-      expect(env.get("BASH_ENV")).toBe(TOOL_RLIMIT_FILE);
+      expect(env.get("BASH_ENV")).toBe(TOOL_RLIMIT_BASHENV);
       expect(env.get("ZDOTDIR")).toBe(TOOL_RLIMIT_ZDOTDIR);
       expect(classifyEnvName("BASH_ENV")).toBe("SAFE_LITERAL");
       expect(classifyEnvName("ZDOTDIR")).toBe("SAFE_LITERAL");
@@ -3042,7 +3053,7 @@ describe("tool-child memory cap (BLO-34477)", () => {
       });
       const env = claudeEnv();
       expect(env.get("HOME")).toBe("/runtime-cache/paperclip-runs/run-abc12345/home");
-      expect(env.get("BASH_ENV")).toBe(TOOL_RLIMIT_FILE);
+      expect(env.get("BASH_ENV")).toBe(TOOL_RLIMIT_BASHENV);
       expect(env.get("ZDOTDIR")).toBe(TOOL_RLIMIT_ZDOTDIR);
     });
 
@@ -3105,7 +3116,7 @@ describe("tool-child memory cap (BLO-34477)", () => {
     // test skips honestly on `which`, and a real delivery regression must fail.
     const bashEnvArm = (dir: string, home: string): Record<string, string> => ({
       HOME: home,
-      BASH_ENV: `${dir}/rlimit.sh`,
+      BASH_ENV: `${dir}/bashenv.sh`,
       // Exactly what job-manifest.ts puts in the claude container env.
       SHLVL: "2",
     });
@@ -3128,15 +3139,35 @@ describe("tool-child memory cap (BLO-34477)", () => {
       expect(ulimitD(["bash", "-c", "sh -c 'ulimit -d'"], env), bashDiag(env)).toBe(String(CAP_KB));
     });
 
+    // SHLVL=2 does not ADD a startup file, it SWAPS one: off the rshd branch
+    // bash stops sourcing ~/.bashrc. On a shared-HOME agent that file supplies
+    // ANTHROPIC_BASE_URL/CCROTATE_SERVE_*, JAVA_HOME and PATH entries, so the
+    // BASH_ENV stub has to chain it back or the cap silently costs the agent
+    // its environment. Both properties asserted together: cap AND chain.
+    itWithBash("the BASH_ENV stub applies the cap AND still sources the user's own $HOME/.bashrc", () => {
+      const { dir, home } = install(CAP_KB);
+      writeFileSync(join(home, ".bashrc"), "export BLO34477_BASHRC=reached\n");
+      const env = bashEnvArm(dir, home);
+      expect(ulimitD(["bash", "-c", "ulimit -d"], env), bashDiag(env)).toBe(String(CAP_KB));
+      expect(ulimitD(["bash", "-c", 'printf %s "$BLO34477_BASHRC"'], env)).toBe("reached");
+    });
+
     // The reason SHLVL=2 is in the manifest, pinned so nobody deletes it as a
     // redundant assignment: drop it and the identical spawn takes bash's rshd
     // branch and never reaches $BASH_ENV, so the cap silently does not apply.
     // If this ever starts failing, bash changed its startup rules — revisit
     // job-manifest.ts's SHLVL arm rather than deleting this test.
+    //
+    // Asserted against the measured uncapped baseline rather than
+    // `.not.toBe(CAP)`, so a bash that fails to start (empty stdout) fails the
+    // test instead of passing it vacuously.
     itWithBash("without SHLVL the BASH_ENV arm is dead on socket stdin — why the manifest sets SHLVL=2", () => {
       const { dir, home } = install(CAP_KB);
-      const env = { HOME: home, BASH_ENV: `${dir}/rlimit.sh` };
-      expect(ulimitD(["bash", "-c", "ulimit -d"], env), bashDiag(env)).not.toBe(String(CAP_KB));
+      const baseline = ulimitD(["bash", "-c", "ulimit -d"], { HOME: home });
+      expect(baseline, bashDiag({ HOME: home })).not.toBe(String(CAP_KB));
+      expect(baseline).not.toBe("");
+      const env = { HOME: home, BASH_ENV: `${dir}/bashenv.sh` };
+      expect(ulimitD(["bash", "-c", "ulimit -d"], env), bashDiag(env)).toBe(baseline);
     });
 
     it("POSIX sh -c — the shape that launches claude — ignores BASH_ENV and stays uncapped", () => {
