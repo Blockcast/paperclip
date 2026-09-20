@@ -55,6 +55,12 @@ export const PLANNING_ONLY_RECOVERY_GUARD_CONTEXT = {
 // action at all, so "record a valid issue disposition to clear the recovery action" named an
 // object that does not exist and left the refused run with no reachable exit but a branchless
 // external ask. Both arms must stay true in both states; do not collapse this back to one.
+// The second arm is scoped to a PERSISTED issue for the same reason the first is scoped to a live
+// action: the monitor gate also refuses when there is no issue yet (the creation routes mint the id
+// after it runs), and "record your conclusion on the issue" would name a second object that does
+// not exist — the very defect this text was widened to fix, one branch over. There the exit is to
+// let the create succeed without a monitor and arm it in a follow-up write, which is reachable for
+// an uncontained run and still refused for a contained one.
 export const STATUS_ONLY_RECOVERY_RESUME_GUIDANCE = {
   normalModelResumeIsAutomatic: false,
   resumeGuidance:
@@ -63,8 +69,9 @@ export const STATUS_ONLY_RECOVERY_RESUME_GUIDANCE = {
     "for a normal-model run never ends. Reachable exits from this run: if a recovery action is " +
     "active on this issue, record a valid issue disposition to clear it; if none is (a monitor-" +
     "recovery wake holds no recovery action), record your conclusion on the issue and re-arm the " +
-    "wake path yourself. Either way you may file a `request_board_approval` linked to the run " +
-    "context's source issue.",
+    "wake path yourself. If this request has no persisted issue yet, drop the monitor from it and " +
+    "arm one in a follow-up write once the issue exists. Either way you may file a " +
+    "`request_board_approval` linked to the run context's source issue.",
 } as const;
 
 // Does a run's `contextSnapshot` carry the full status-only guard tuple?

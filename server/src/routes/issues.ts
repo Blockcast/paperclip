@@ -6959,6 +6959,15 @@ export function issueRoutes(
    * exit. Deliberately NOT keyed on `wakeReason === "issue_monitor_recovery"` —
    * that is a string standing in for the condition, and it would exempt the
    * wake class forever rather than only while nothing is containing it.
+   *
+   * Refusing while the action is `escalated` is NOT itself the BLO-27553 shape,
+   * though it looks like it: `issue-recovery-actions.ts` documents that an
+   * escalated action "does NOT wake anyone", so the issue is left with neither a
+   * monitor nor a waking action. What keeps that safe is that the live run being
+   * refused here is itself the wake — its own disposition write clears the action
+   * and restores arming, and that write is a status-only run's one allowed
+   * deliverable (BLO-25868). The row is only unreachable if this run declines to
+   * dispose of it, which is the case the handoff detector already escalates.
    */
   async function assertMonitorArmingAllowedByRunContext(
     req: Request,
@@ -6968,12 +6977,31 @@ export function issueRoutes(
     const run = await loadActorRunContext(req, companyId);
     if (!run || !isStatusOnlyCheapRecoveryContext(run.contextSnapshot)) return;
 
-    // A null `issue.id` FAILS CLOSED and must keep doing so. The creation
-    // routes mint the id after this gate, so there is no issue to query — and
-    // that is precisely the escape a contained run would use: create a fresh
-    // issue naming itself assignee, arm a monitor on it, collect an unguarded
-    // normal-model wake. An unresolvable scope is not evidence of no containment.
-    if (issue.id && !(await recoveryActionsSvc.getActiveForIssue(companyId, issue.id))) return;
+    // Containment is a property of the RUN, not of the row being patched, so
+    // BOTH scopes are consulted. Probing only the target would relocate the
+    // escape one issue sideways rather than close it: this gate runs BEFORE the
+    // assignee early-return below, and that early-return is a plain
+    // `agentId === issue.assigneeAgentId` with no run scoping — so this check is
+    // the only thing between a status-only run and any issue it is assignee of.
+    // A run contained by an active action on issue A could then arm a monitor on
+    // some other assigned issue B holding none, and collect exactly the
+    // unguarded normal-model wake BLO-32774 denies. `resumeRequiresNormalModel`
+    // is a property of the run; B's empty action list is not evidence about it.
+    // Every sibling guard here (`assertCheapRecoveryIssueAssigneeProfileAllowed`,
+    // `assertDeliverableMutationAllowedByRunContext`) keys on the run alone.
+    //
+    // EITHER scope being unresolvable FAILS CLOSED, and must keep doing so. A
+    // null `issue.id` is the creation routes, which mint the id after this gate
+    // — precisely the escape a contained run would use: create a fresh issue
+    // naming itself assignee, arm a monitor on it, collect an unguarded run. An
+    // unresolvable scope is not evidence of no containment. Note this can only
+    // ever *widen* permission relative to the unconditional refusal it replaces,
+    // and only for a run provably holding no containment on either side.
+    const runScopeIssueId = readNonEmptyString(readObject(run.contextSnapshot).issueId);
+    if (issue.id && runScopeIssueId) {
+      const scopes = [...new Set([issue.id, runScopeIssueId])];
+      if ((await recoveryActionsSvc.listActiveForIssues(companyId, scopes)).size === 0) return;
+    }
 
     // Same shape as `assertCheapRecoveryIssueAssigneeProfileAllowed`: the
     // refusal is unconditional and single-point, the audit row is best-effort
