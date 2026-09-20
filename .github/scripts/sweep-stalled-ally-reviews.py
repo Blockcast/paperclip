@@ -848,9 +848,8 @@ def too_young_to_be_stranded(pr_payload, now):
     return is stage 2, saving the remaining 2 on the PRs only
     `committer_date` proves young. Quoting either stage as the whole cut gets
     the saving wrong in one direction or the other. Deliberately not copied
-    here -- the
-    second copy is the thing that drifts, and that file's own rule is
-    `re-measure the whole table or none of it`.
+    here -- the second copy is the thing that drifts, and that file's own
+    rule is `re-measure the whole table or none of it`.
 
     The cheap proof: `unreviewed_since` returns `max(created_at,
     committer_date)` (each clamped to `now`), so `pending_since >=

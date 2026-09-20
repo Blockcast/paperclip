@@ -37,18 +37,22 @@ on:
   schedule:
     # Hourly, NOT every 30 minutes, and that is a rate-limit decision.
     #
-    # In status-free mode each non-draft PR costs 3 requests (head commit +
-    # comments page + reviews page). Measured 2026-08-21 on this repo: 147
-    # open PRs, 119 non-draft and unlocked -> ~359 requests per run. At
-    # `9,39` that is ~718/hour from this job alone, against `github.token`'s
-    # documented 1,000/hour/repository budget shared with the 26 other
-    # workflows here -- exhaustion would be the steady state, not an edge
-    # case. Hourly halves it to ~359/hour and leaves real headroom.
+    # In status-free mode each non-draft PR costs at least 3 requests (head
+    # commit + comments page + reviews page; `_fetch_paginated` issues one
+    # more per extra page, so a long thread costs more). Every request
+    # figure below counts one page each, which understates the uncut
+    # baseline and the saving alike -- the percentages survive, the absolute
+    # counts are floors. Measured 2026-08-21 on this repo: 147 open PRs, 119
+    # non-draft and unlocked -> ~359 requests per run. At `9,39` that is
+    # ~718/hour from this job alone, against `github.token`'s documented
+    # 1,000/hour/repository budget shared with the 26 other workflows here
+    # -- exhaustion would be the steady state, not an edge case. Hourly
+    # halves it to ~359/hour and leaves real headroom.
     #
     # The cheap predicate-level cut (skipping PRs that cannot be stranded)
-    # scales with that threshold, so BLO-34521's 90m -> 18h move changed it
-    # roughly sevenfold. It runs in TWO stages, and conflating them is how
-    # this paragraph has been wrong before:
+    # scales with STALL_THRESHOLD_SECONDS, so BLO-34521's 90m -> 18h move
+    # changed it roughly sevenfold. It runs in TWO stages, and conflating
+    # them is how this paragraph has been wrong before:
     #
     #   stage 1  too_young_to_be_stranded -- tests `created_at` ALONE, from
     #            the list payload, so it saves all 3 requests. It cannot use
