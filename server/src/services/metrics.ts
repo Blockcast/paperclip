@@ -1480,6 +1480,12 @@ export const PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC =
  * An unlisted code collapses to {@link UNKNOWN_TERMINAL_FAILED_WAKE_ERROR_CODE}
  * rather than growing the series set, so a new terminal code cannot blow up
  * cardinality — it shows up as `other` and gets triaged into this list.
+ *
+ * When you add a code here you must also add a row for it to the Step 2
+ * action table in `runbooks/agent-wakeup-terminal-failed.md`. Listing a code
+ * here removes it from the table's `other` escape hatch, so an operator paged
+ * on it would otherwise see a label with no row and no fallback. Nothing
+ * asserts the two match — the drift is silent.
  */
 export const KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES = [
   "external_lifecycle_stale_killed",
