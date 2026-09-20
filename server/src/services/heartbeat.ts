@@ -3732,6 +3732,65 @@ function isNonRetryablePrReviewTerminalOutcome(
   return recovery.adapterInvocationStarted === true;
 }
 
+/**
+ * BLO-34699: did this terminal run actually produce a REVIEW VERDICT we may
+ * publish to the PR gate?
+ *
+ * Deliberately NOT the same question as `isNonRetryablePrReviewTerminalOutcome`,
+ * whose other two callers ask "is this run terminal for recovery routing" — a
+ * pod that never scheduled IS terminal for its own run, so those must keep the
+ * wider predicate. Publishing a commit status is a different claim: it asserts
+ * something about the HEAD, and a run that never invoked its adapter made no
+ * judgement about the head at all.
+ *
+ * Measured on Blockcast/paperclip, 2026-09-19. Four heads were stamped
+ * `review/ally-complete = failure` with "ended ambiguously and was not
+ * replayed; no review was confirmed"; a genuine, non-stale formal review then
+ * landed at that EXACT head on three of them, 4h59m–5h48m later (#1929
+ * 17:04:56Z→22:53:23Z, #1931 19:42:17Z→00:55:38Z, #1932 19:56:56Z→00:56:06Z).
+ * Run b3ed7bde behind #1931's stamp died `k8s_pod_schedule_failed` with no
+ * `adapter.invoke` event at all. So the gate was not merely early, it was
+ * asserting a verdict about a head that no reviewer had yet read — and
+ * `review/ally-complete` has no writer that ever clears it, so #1929 still
+ * carries that red beside a `gate/ally-comment-findings: success` for the same
+ * head, the two gates contradicting each other ~14h on.
+ *
+ * Not a one-off: `k8s_pod_schedule_failed` is 38 of the reviewer's last 1000
+ * runs (26h window), and BLO-34577 records tenant-wide 429s being mis-tagged
+ * into it. The 5h band matches the reviewer's own dispatch-queue wait, i.e. the
+ * first dispatch was killed by capacity and a later one served the same request.
+ *
+ * `adapterInvocationStarted` is the existing durable proof of an `adapter.invoke`
+ * run event, already required by the `pr_review_output_missing` /
+ * `pr_review_verification_unavailable` arms above. All this adds is requiring it
+ * of the two infra codes as well, by requiring it of everything:
+ *  - `k8s_pod_schedule_failed` never computes it (`hasAdapterInvocationEvent` is
+ *    consulted only for `job_failed`/`job_missing`), so it can never grade — the
+ *    wanted outcome, the pod did not start;
+ *  - `job_missing` is "only produced after adapter.invoke" per the retry-admission
+ *    comment above, so it normally still grades, and the genuine
+ *    reviewer-ran-and-posted-nothing case is preserved;
+ *  - the two `pr_review_*` arms already proved it, so they are unchanged.
+ *
+ * That last point is why this is one condition and not a per-code branch, and it
+ * also sets the default for any code added to the predicate above later: a new
+ * arm publishes a verdict only once it can show the reviewer ran. Failing toward
+ * not-publishing is the safe direction — a missing status blocks under
+ * BLO-26572 exactly as a red one does, without asserting a falsehood about the
+ * head.
+ *
+ * NOTE the deliberate boundary: suppressing the false verdict does not make an
+ * uninvoked reviewer run visible. That is BLO-34577 (mis-tagged 429 → review
+ * silently dropped, no auto-retry) and is not fixed here.
+ */
+export function producedPrReviewGateVerdict(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson" | "contextSnapshot">,
+) {
+  if (!isNonRetryablePrReviewTerminalOutcome(run)) return false;
+  const recovery = parseObject(parseObject(run.resultJson).externalLifecycleRecovery);
+  return recovery.adapterInvocationStarted === true;
+}
+
 export async function assertGitWorktreeBaseWorkspaceReady(input: {
   requestedExecutionWorkspaceMode: ReturnType<typeof resolveExecutionWorkspaceMode>;
   config: Record<string, unknown>;
@@ -33113,7 +33172,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
 
       if (!issue) {
-        if (isNonRetryablePrReviewTerminalOutcome(run)) {
+        // BLO-34699: the gate arm requires proof the reviewer actually ran.
+        if (producedPrReviewGateVerdict(run)) {
           gateDelivery = await queueFailedPrReviewGateStatus(
             run,
             runContext,
@@ -33176,7 +33236,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ),
           );
       }
-      if (isNonRetryablePrReviewTerminalOutcome(run) && !finalizedRunStageSuperseded) {
+      // BLO-34699: `producedPrReviewGateVerdict`, not the wider recovery-routing
+      // predicate — a run that never invoked its adapter read nothing at this
+      // head, so it has no verdict to publish about it.
+      if (producedPrReviewGateVerdict(run) && !finalizedRunStageSuperseded) {
         // The outbox row is part of the ownership decision: a replacement run
         // cannot claim this issue until both the lock release and delivery
         // intent commit. Publishing the informational event can remain best
