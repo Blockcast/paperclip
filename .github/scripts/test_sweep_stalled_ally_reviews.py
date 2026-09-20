@@ -1463,8 +1463,22 @@ class TestPreWriteAllyReviewedGuard(unittest.TestCase):
 
         self.assertEqual(self.review_fetches, 1, "the scan's read only")
 
-    def test_a_cooldown_block_short_circuits_the_paid_reviews_read(self):
-        """A cooldown-blocked path is not going to write either.
+    def test_a_cooldown_block_pays_for_the_reviews_read_first(self):
+        """The deliberate cost inversion: contended no longer skips the paid read.
+
+        This test previously asserted the opposite -- that a cooldown block
+        short-circuits the reviews read -- on the premise that the comment
+        surface was the one Ally most often answers on. Measured across the 45
+        most recent PRs on 2026-09-20, the split was 57 reviews-surface to 0
+        comment-surface, so that premise was backwards and the "saving" was
+        being taken on the only surface that matters. The read is now issued
+        before the cooldown so an answered-AND-contended PR is reported as
+        answered on either surface.
+
+        The cost is bounded and small for a reason worth stating: should_refire
+        already applied the cooldown at scan time, so for it to block again
+        here a marker must have landed in the scan->write gap. That is the rare
+        concurrent-write case, not the common path.
 
         Doubles as the AC3 distinguishability control in the other direction:
         a cooldown skip must keep reporting the cooldown prefix, not be
@@ -1477,7 +1491,10 @@ class TestPreWriteAllyReviewedGuard(unittest.TestCase):
         self.assertFalse(refire)
         self.assertTrue(reason.startswith(sweep.REREAD_SKIP_REASON_PREFIX), reason)
         self.assertFalse(reason.startswith(sweep.REVIEWED_SKIP_REASON_PREFIX), reason)
-        self.assertEqual(self.review_fetches, 1, "the scan's read only")
+        self.assertEqual(
+            self.review_fetches, 2,
+            "the guard must read the reviews surface before letting the cooldown decide",
+        )
 
     def test_a_compound_skip_reports_answered_not_contended(self):
         """THE ordering control: when BOTH free checks fire, answered wins.
@@ -1513,6 +1530,39 @@ class TestPreWriteAllyReviewedGuard(unittest.TestCase):
         )
         self.assertEqual(self._writes(), [])
         self.assertEqual(self.review_fetches, 1, "still short-circuits the paid read")
+
+    def test_a_reviews_surface_compound_skip_reports_answered_not_contended(self):
+        """The same ordering control on the surface Ally actually uses.
+
+        Identical to the test above except Ally answered with a formal review
+        rather than a comment. That distinction is the whole point: measured
+        2026-09-20 across the 45 most recent PRs in this repo, 34 carried an
+        Ally consolidated report and the split was 57 on the reviews surface
+        and 0 on the comment surface. So the test above pins the ordering on
+        the surface responsible for 0 of 57 observed answers, and this one
+        pins it on the surface responsible for 57 of 57.
+
+        This case used to land on the contended branch -- is_alarming=True,
+        filed in the step summary as concurrency evidence -- because the
+        reviews read was short-circuited once the cooldown had declined.
+        """
+        self._install(
+            reread_comments=[{"body": sweep.MARKER + "\nre-ask", "created_at": "2026-09-01T09:59:00Z"}],
+            reread_reviews=[formal_review(commit_id=self.PR_HEAD)],
+        )
+
+        _pr_payload, _head, pending_since, refire, reason = self._consider()
+
+        self.assertFalse(refire, "the write is withheld under either order")
+        self.assertTrue(
+            reason.startswith(sweep.REVIEWED_SKIP_REASON_PREFIX),
+            "answered must win over contended on the reviews surface too, got: %s" % reason,
+        )
+        self.assertIsNone(
+            pending_since,
+            "an answered PR is not stranded, so it must not carry pending_since and alarm",
+        )
+        self.assertEqual(self._writes(), [])
 
     def test_the_two_skip_reasons_are_distinguishable(self):
         """AC3: an operator must be able to tell "Ally answered mid-run" from
