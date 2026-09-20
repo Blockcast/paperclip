@@ -3019,6 +3019,16 @@ describe("tool-child memory cap (BLO-34477)", () => {
       expect(classifyEnvName("ZDOTDIR")).toBe("SAFE_LITERAL");
     });
 
+    // Without this, BASH_ENV is set but never read for a bash tool shell:
+    // libuv gives the child socket stdio, and bash skips $BASH_ENV entirely on
+    // its rshd/sshd branch (isnetconn(fd 0) && SHLVL < 2). Pinned so the arm
+    // cannot be dropped as a redundant-looking assignment; the behavioural half
+    // is asserted by the "without SHLVL ..." case below.
+    it("ships SHLVL=2 so bash does not skip BASH_ENV on its rshd branch", () => {
+      expect(claudeEnv().get("SHLVL")).toBe("2");
+      expect(classifyEnvName("SHLVL")).toBe("SAFE_LITERAL");
+    });
+
     it("keeps BASH_ENV/ZDOTDIR on the emptyDir even when HOME is a per-run isolated root", () => {
       setRuntimeIsolation(ctx, {
         isolationMode: "run",
@@ -3080,35 +3090,53 @@ describe("tool-child memory cap (BLO-34477)", () => {
     const ulimitD = (argv: string[], env: Record<string, string>): string =>
       spawnSync(argv[0], argv.slice(1), { encoding: "utf8", env: { PATH: process.env.PATH ?? "", ...env } }).stdout.trim();
 
-    // bash skips $BASH_ENV in a few host-specific situations (euid != uid,
-    // POSIX mode, a `bash` on PATH that is not GNU bash). The cap's delivery
-    // mechanism assumes the agent image's bash, not the test host's, so probe
-    // the host and skip -- loudly, with the reason -- rather than fail on a
-    // property of the CI runner (arc-light reported `unlimited` here).
-    // Evaluated inside a test body: tempDirs is set up in beforeEach.
-    const bashHonorsBashEnv = (): boolean => {
-      if (!which("bash")) return false;
-      const probe = mkdtempSync(join(tmpdir(), "blo34477-bashenv-"));
-      tempDirs.push(probe);
-      writeFileSync(join(probe, "env.sh"), "BLO34477_BASH_ENV=applied\n");
-      const applied = ulimitD(["bash", "-c", 'printf %s "$BLO34477_BASH_ENV"'], { HOME: probe, BASH_ENV: join(probe, "env.sh") });
-      if (applied === "applied") return true;
-      const diag = spawnSync("bash", ["-c", 'printf "bash=%s uid=%s euid=%s gid=%s egid=%s path=%s" "$BASH_VERSION" "$(id -ru)" "$(id -u)" "$(id -rg)" "$(id -g)" "$(command -v bash)"'], { encoding: "utf8" }).stdout;
-      console.warn(`[BLO-34477 test] this host's bash does not source BASH_ENV (${diag}); skipping the bash-under-BASH_ENV assertions`);
-      return false;
-    };
+    // `ulimitD` already reproduces the PRODUCTION spawn shape exactly: default
+    // stdio, so libuv allocates fd 0 with socketpair(), and a child environment
+    // rebuilt as { PATH, ...overrides }, so SHLVL is never inherited. That is
+    // the shape Claude Code spawns a tool shell in, which is why the assertions
+    // below can run unconditionally on every host instead of behind a probe.
+    //
+    // They previously sat behind `bashHonorsBashEnv()`, which was subject to the
+    // very bug it guarded: it probed through `ulimitD`, so it always hit bash's
+    // rshd/sshd branch (isnetconn(fd 0) && SHLVL < 2 -> source ~/.bashrc and
+    // return before $BASH_ENV), returned false on every POSIX host, and silently
+    // skipped these assertions forever — which is how a dead BASH_ENV arm passed
+    // review twice. Do not reintroduce a host probe here; if bash is missing the
+    // test skips honestly on `which`, and a real delivery regression must fail.
+    const bashEnvArm = (dir: string, home: string): Record<string, string> => ({
+      HOME: home,
+      BASH_ENV: `${dir}/rlimit.sh`,
+      // Exactly what job-manifest.ts puts in the claude container env.
+      SHLVL: "2",
+    });
+    // Reports the two inputs to bash's rshd branch alongside the limit, so a
+    // failure says why: a bare `ulimit -d` here reads `unlimited` on that branch
+    // even when the configuration is correct.
     const bashDiag = (env: Record<string, string>): string =>
-      ulimitD(["bash", "-c", 'ulimit -d; echo "rc=$? hard=$(ulimit -H -d) version=$BASH_VERSION uid=$(id -ru)/$(id -u)"'], env).replace(/\n/g, " ");
+      ulimitD(
+        ["bash", "-c", 'ulimit -d; echo "rc=$? hard=$(ulimit -H -d) version=$BASH_VERSION shlvl=${SHLVL:-unset} fd0=$(readlink /proc/self/fd/0) uid=$(id -ru)/$(id -u)"'],
+        env,
+      ).replace(/\n/g, " ");
+    const itWithBash = which("bash") ? itOnCapableHost : it.skip;
 
-    itOnCapableHost("bash under BASH_ENV, and POSIX sh sourcing the file, report the cap", () => {
+    itWithBash("bash under BASH_ENV, and POSIX sh sourcing the file, report the cap", () => {
       const { dir, home } = install(CAP_KB);
       expect(ulimitD(["/bin/sh", "-c", `. '${dir}/rlimit.sh'; ulimit -d`], { HOME: home })).toBe(String(CAP_KB));
-      if (bashHonorsBashEnv()) {
-        const env = { HOME: home, BASH_ENV: `${dir}/rlimit.sh` };
-        expect(ulimitD(["bash", "-c", "ulimit -d"], env), bashDiag(env)).toBe(String(CAP_KB));
-        // A grandchild inherits it — the property that bounds the whole subtree.
-        expect(ulimitD(["bash", "-c", "sh -c 'ulimit -d'"], env), bashDiag(env)).toBe(String(CAP_KB));
-      }
+      const env = bashEnvArm(dir, home);
+      expect(ulimitD(["bash", "-c", "ulimit -d"], env), bashDiag(env)).toBe(String(CAP_KB));
+      // A grandchild inherits it — the property that bounds the whole subtree.
+      expect(ulimitD(["bash", "-c", "sh -c 'ulimit -d'"], env), bashDiag(env)).toBe(String(CAP_KB));
+    });
+
+    // The reason SHLVL=2 is in the manifest, pinned so nobody deletes it as a
+    // redundant assignment: drop it and the identical spawn takes bash's rshd
+    // branch and never reaches $BASH_ENV, so the cap silently does not apply.
+    // If this ever starts failing, bash changed its startup rules — revisit
+    // job-manifest.ts's SHLVL arm rather than deleting this test.
+    itWithBash("without SHLVL the BASH_ENV arm is dead on socket stdin — why the manifest sets SHLVL=2", () => {
+      const { dir, home } = install(CAP_KB);
+      const env = { HOME: home, BASH_ENV: `${dir}/rlimit.sh` };
+      expect(ulimitD(["bash", "-c", "ulimit -d"], env), bashDiag(env)).not.toBe(String(CAP_KB));
     });
 
     it("POSIX sh -c — the shape that launches claude — ignores BASH_ENV and stays uncapped", () => {

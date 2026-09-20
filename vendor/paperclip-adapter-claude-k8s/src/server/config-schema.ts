@@ -142,7 +142,7 @@ export function getConfigSchema(): AdapterConfigSchema {
       type: "number",
       key: "resources.limits.toolMemoryKb",
       label: "Tool Child Memory Cap (KiB)",
-      hint: "RLIMIT_DATA ceiling (ulimit -d, KiB) applied to every shell the agent spawns — Bash tool commands and their children — but not to the claude process itself. A runaway child then fails alone with ENOMEM instead of the cgroup OOM-killing the whole run (BLO-34477). Default: half of Memory Limit. 0 disables.",
+      hint: "RLIMIT_DATA ceiling (ulimit -d, KiB) applied to every bash or zsh the agent spawns — Bash tool commands and their children — and inherited by their descendants, including plain `sh`. Not applied to the claude process itself, nor to a bare `sh -c` launched outside a tool shell (POSIX sh reads neither BASH_ENV nor ZDOTDIR). A runaway child then fails alone with ENOMEM instead of the cgroup OOM-killing the whole run (BLO-34477). Default: half of Memory Limit. 0 disables.",
     },
     // Scheduling
     {

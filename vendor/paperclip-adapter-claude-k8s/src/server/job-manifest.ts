@@ -686,6 +686,11 @@ export const ENV_NAME_CLASSIFICATION: readonly EnvNameClassification[] = [
     reason: "Runtime-cache directory of the zsh dotfile stubs that apply the tool-child RLIMIT_DATA cap and chain to $HOME (BLO-34477); a path, no credential material.",
   },
   {
+    name: "SHLVL",
+    classification: "SAFE_LITERAL",
+    reason: "Set to 2 so bash does not take its rshd/sshd startup branch and therefore honours $BASH_ENV for tool children (BLO-34477); a shell nesting counter, no credential material.",
+  },
+  {
     name: "CLAUDE_CONFIG_DIR",
     classification: "SAFE_LITERAL",
     reason: "Path to the run's Claude config dir under the isolation root.",
@@ -1077,14 +1082,27 @@ function buildEnvVars(
   // HOME must live on the mounted data PVC to enable session resume. Isolated
   // mode scopes Claude config/cache/session state away from shared /paperclip.
   merged.HOME = isolation.enabled ? isolation.homeRoot : "/paperclip";
-  // BLO-34477: bash sources $BASH_ENV on every non-interactive start and zsh
-  // sources $ZDOTDIR/.zshenv on every start, so every Bash-tool command picks
-  // up the RLIMIT_DATA cap the write-prompt init container wrote onto the
-  // runtime-cache emptyDir. POSIX `sh` (dash on this image) reads neither, so
-  // the `sh -c` that launches `claude` — and therefore `claude` itself — is
-  // not capped.
+  // BLO-34477: zsh sources $ZDOTDIR/.zshenv on every start, and bash sources
+  // $BASH_ENV on a non-interactive start ONLY when it does not take its
+  // rshd/sshd branch, so every Bash-tool command picks up the RLIMIT_DATA cap
+  // the write-prompt init container wrote onto the runtime-cache emptyDir.
+  // POSIX `sh` (dash on this image) reads neither, so the `sh -c` that launches
+  // `claude` — and therefore `claude` itself — is not capped.
+  //
+  // SHLVL=2 is load-bearing, not cosmetic. bash's run_startup_files() treats a
+  // shell as "run by rshd/sshd" when isnetconn(fileno(stdin)) && SHLVL < 2; on
+  // that branch it sources ~/.bashrc and RETURNS BEFORE $BASH_ENV is consulted.
+  // libuv allocates child stdio with socketpair(), so fd 0 of anything Claude
+  // Code spawns is a socket and the test always passes — meaning that without
+  // this variable the BASH_ENV arm is dead for a bash tool shell and the cap is
+  // advertised but never applied. Measured in the agent image and on a second
+  // host (bash 5.2.21/5.2.37): socket stdin + SHLVL unset -> `ulimit -d`
+  // unlimited; the same spawn with SHLVL=2 -> capped. Do not delete this as a
+  // redundant assignment. Today's image uses zsh as the tool shell, so the
+  // ZDOTDIR arm already covers it and this closes the bash-tool-shell case.
   merged.BASH_ENV = TOOL_RLIMIT_FILE;
   merged.ZDOTDIR = TOOL_RLIMIT_ZDOTDIR;
+  merged.SHLVL = "2";
   if (isolation.enabled) {
     merged.CLAUDE_CONFIG_DIR = `${isolation.sessionRoot}/.claude`;
     merged.XDG_CONFIG_HOME = `${isolation.sessionRoot}/.config`;
@@ -1230,13 +1248,16 @@ const DIND_WAIT_PREAMBLE =
 //
 // The fix bounds each child, not the container: every shell the agent spawns
 // applies RLIMIT_DATA (`ulimit -d`) from a file the init container writes onto
-// the per-pod runtime-cache emptyDir, which both containers mount. bash reads
-// `$BASH_ENV` on every non-interactive start and zsh reads `$ZDOTDIR/.zshenv`
-// on every start, so the cap binds every Bash-tool command and is inherited by
-// its descendants — but NOT by the already-running `claude` process, which is
-// exec'd from `sh -c` (dash on this image; POSIX sh reads neither variable).
-// A runaway child now fails alone with ENOMEM, and the model sees a real error
-// instead of a silent orphan.
+// the per-pod runtime-cache emptyDir, which both containers mount. zsh reads
+// `$ZDOTDIR/.zshenv` on every start, and bash reads `$BASH_ENV` on a
+// non-interactive start — but only off its rshd/sshd branch, which is why the
+// claude container also sets `SHLVL=2` (see the env builder: socket stdin from
+// libuv + SHLVL < 2 makes bash source ~/.bashrc and return before BASH_ENV, so
+// without SHLVL the bash arm delivers nothing). Together they bind every
+// Bash-tool command, and the cap is inherited by its descendants — but NOT by
+// the already-running `claude` process, which is exec'd from `sh -c` (dash on
+// this image; POSIX sh reads neither variable). A runaway child now fails alone
+// with ENOMEM, and the model sees a real error instead of a silent orphan.
 //
 // Why the emptyDir and not `$HOME/.zshenv`: HOME may be a persistent, shared
 // PVC path (legacy shared mode), a per-run runtime-cache path, or — with a
