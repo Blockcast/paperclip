@@ -784,6 +784,23 @@ describe("merge-gate reader", () => {
         (l) => l.includes('gh api "repos/') && !l.includes("/commits/$2"),
       );
       assert.equal(fetches.length, 3, `unguarded fetch added? got ${JSON.stringify(fetches)}`);
+      // The collector matches `gh api "repos/` on ONE line, so a fetch written
+      // `gh api "$url"` or split across a continuation is collected by NEITHER
+      // line: the count above stays 3 and this test passes while that fetch goes
+      // unpaginated. That is this file's own recurring defect — a filter keyed
+      // without asking what it looks like when it matches nothing — so cross-check
+      // the total, which any `gh api` in any style reaches. Exempt: the
+      // single-object commit lookup, which has no pages. Comment lines are
+      // excluded by leading `#` only; a trailing `# gh api` comment fails this
+      // LOUD, which is the safe direction.
+      const ghApi = SOURCE.split("\n").filter(
+        (l) => l.includes("gh api") && !l.trimStart().startsWith("#"),
+      );
+      assert.equal(
+        ghApi.length,
+        fetches.length + 1,
+        `gh api call the collector missed — variable URL or line continuation? got ${JSON.stringify(ghApi)}`,
+      );
       for (const call of fetches) {
         assert.match(call, /per_page=100/, call);
         assert.match(call, /--paginate/, call);
