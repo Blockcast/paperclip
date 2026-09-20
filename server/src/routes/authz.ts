@@ -297,7 +297,21 @@ export function runTranscriptReadGate(
     const cached = cache.get(key);
     if (cached) return cached;
     const pending = decideRunTranscriptRead(req, access, { companyId, agentId })
-      .then((outcome) => outcome.allowed);
+      .then((outcome) => outcome.allowed)
+      // Ally review (1ad0e938), adopted with one deliberate addition. Fail closed
+      // here as well as on the push-path twin
+      // (`realtime/live-event-transcript-gate.ts`), so the posture is local to
+      // both gates rather than inferable only from the route that calls this one.
+      //
+      // The addition is the log line. Swallowing the rejection silently would
+      // trade a loud 500 for a normal-looking 200 whose transcript fields are
+      // withheld — safe in content terms, but a broken authorizer would then be
+      // indistinguishable from an ordinary unentitled read, on the one path that
+      // exists to make transcript access decidable. Fail closed AND say so.
+      .catch((error) => {
+        logger.error({ err: error, companyId, agentId }, "run transcript read decision failed; withholding");
+        return false;
+      });
     cache.set(key, pending);
     return pending;
   };
