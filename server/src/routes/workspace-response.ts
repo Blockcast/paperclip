@@ -1,5 +1,6 @@
 import type { Request } from "express";
 import type {
+  AgentEnvConfig,
   ExecutionWorkspace,
   ExecutionWorkspaceCloseReadiness,
   ExecutionWorkspaceConfig,
@@ -12,6 +13,7 @@ import type {
 import { isPlainObject, maskWorkspaceRuntimeForRead, maskWorkspaceRuntimeTextForRead, withholdWorkspaceOperationCapturedOutput } from "../redaction.js";
 import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
 import type { accessService } from "../services/index.js";
+import { maskProjectEnv } from "./project-env-response.js";
 
 /**
  * PEN-2852 — withholding boundary for workspace runtime configuration on response bodies.
@@ -117,8 +119,11 @@ import type { accessService } from "../services/index.js";
  *    caller already holds, while `cleanup_command` is the operator's own string.
  *  - `ExecutionWorkspaceStrategy.type` / `.runScope` — closed enums. `.baseRef` / `.branchTemplate`
  *    are git refs and templates the branch-naming UI renders and the agent needs to name its branch.
- *  - `stdoutExcerpt` / `stderrExcerpt` / `logRef` on operations — command *output*, not a copy of a
- *    declared-withheld value (CTO Ruling F §4, BLO-33407). Unchanged by this ticket.
+ *  - `stdoutExcerpt` / `stderrExcerpt` / `logRef` / `logStore` on operations — command *output* and
+ *    opaque handles. BLO-34631 surveyed the consumers and kept the excerpts disclosed: the agent's
+ *    own MCP control path reads them back for the command it just triggered (see
+ *    `publicWorkspaceOperation`). The route `logRef` points at does withhold its content, because
+ *    that one has no agent consumer.
  *
  * ### PEN-3252 — the bypass this module recorded as open, now closed
  *
@@ -442,16 +447,67 @@ export function publicRuntimeServices(
  * unentitled operator must still be able to see that an operation ran and how it ended — withholding
  * the operator's text is the point, hiding the fact of execution is not.
  *
- * `stdoutExcerpt` / `stderrExcerpt` / `logRef` are deliberately NOT withheld here. They are command
- * *output*, not a copy of a declared-withheld value, so they sit on the far side of BLO-33568's rule
- * and are a product decision rather than a projection bug (CTO Ruling F §4, BLO-33407).
+ * `stdoutExcerpt` / `stderrExcerpt` are NOT withheld, and as of BLO-34631 that is a measured
+ * decision rather than the inherited "command output is not a copy of a declared-withheld value"
+ * reading (CTO Ruling F §4, BLO-33407).
  *
- * That call stands and is unchanged — but it is no longer the whole story, and reading it as "the
- * excerpts are company-readable" is now wrong. PEN-3202 ruled the captured output IS transcript and
- * narrows to the run-transcript gate; PEN-3204 implements that as a SECOND, orthogonal projection,
- * `withholdUnentitledWorkspaceOperationOutput` below. The two compose: this one answers "may you see
- * the operator's command?", that one answers "may you see what it printed?". Neither covers the
- * other, and a route that applies only one is half-gated.
+ * The symmetry argument for withholding them is real and was the CTO's stated lean: the output of a
+ * withheld command can disclose the command — shells echo, `npm` prints the script it runs, `set -x`
+ * prints everything — and the only control standing over the bytes is the write-time
+ * `redactSensitiveText` heuristic, which matches env-dump assignments, JSON secret fields and URI
+ * credentials and nothing else. Host paths, repo layout and an operator's `cleanupCommand` cross it
+ * intact. BLO-34631 AC 3 made that lean explicitly falsifiable by a consumer survey, and the survey
+ * falsifies it:
+ *
+ *  - `POST /execution-workspaces/:id/runtime-services/:action` (`routes/execution-workspaces.ts`) and
+ *    `POST /projects/:id/workspaces/:workspaceId/runtime-services/:action` (`routes/projects.ts`)
+ *    answer with `operation: publicWorkspaceOperation(operation, viewer)`, where the operation is the
+ *    one the caller just triggered and `stdout`/`stderr` are captured synchronously from it.
+ *  - The first of those is the backing call for the MCP tool `paperclipControlIssueWorkspaceServices`
+ *    (`packages/mcp-server/src/tools.ts`), which returns the response JSON verbatim to the calling
+ *    agent, and both it and `GET /heartbeat-runs/:runId/workspace-operations` are on the sandbox
+ *    callback bridge allowlist (`packages/adapter-utils/src/sandbox-callback-bridge.ts`).
+ *  - Same-company agents deliberately lack `workspace_runtime:read` (PEN-2852), so masking here
+ *    hands an agent `***REDACTED***` for the output of the command it just ran. `status`/`exitCode`
+ *    survive, so it would still learn pass/fail — but not why, which is exactly the "debugging a
+ *    failed provision" flow BLO-34631 named as the finding that settles this.
+ *
+ * So the disclosure is deliberate and recorded, not an unexamined pass-through. The residual it
+ * accepts: an operator's service command echoed into its own output still reaches an unentitled
+ * reader, and the write-time scrub is not a boundary. Narrowing it is a product decision that has to
+ * keep the agent's own command-result path readable — masking the read/list routes alone would split
+ * the same field across routes, which is the failure mode this series exists to close.
+ *
+ * `logRef` / `logStore` stay for a different reason: they are opaque handles, and the route they
+ * point at (`/workspace-operations/:id/log`) DOES withhold its content on this entitlement as of
+ * BLO-34631 — that route has no agent consumer (no MCP tool, not bridge-allowlisted; only
+ * `ui/src/pages/AgentDetail.tsx` and `paperclip run workspace-log` read it). Masking a pointer whose
+ * route still served the bytes would have been theatre.
+ *
+ * PEN-3204 (merge of 2026-09-20): the paragraphs above settle THIS gate — the workspace-runtime
+ * entitlement — and they settle it correctly. They are NOT the whole story, because a SECOND and
+ * orthogonal gate now also reads these rows: `withholdUnentitledWorkspaceOperationOutput` below,
+ * which narrows the captured output to `decideRunTranscriptRead` per the PEN-3202 ruling. This one
+ * answers "may you see the operator's command?"; that one answers "may you see what it printed?".
+ *
+ * The two do not collide, and that is a measurement rather than an assertion — BLO-34631's survey
+ * is the sharpest available test of the transcript gate and does not reach it, for two independent
+ * reasons:
+ *
+ *  - **Different key.** BLO-34631 falsified a mask keyed on `workspace_runtime:read`, which
+ *    same-company agents deliberately lack (PEN-2852) — so that mask hit an agent reading its OWN
+ *    output, which is the regression that settles it. The transcript gate is keyed on run
+ *    OWNERSHIP: an agent reading its own run resolves to `allow_self` in `authorization.ts` and is
+ *    admitted. The reader BLO-34631 protects is the one case the transcript gate never denies.
+ *  - **Different routes.** The falsifying consumer is
+ *    `POST /execution-workspaces/:id/runtime-services/:action` (the backing call for
+ *    `paperclipControlIssueWorkspaceServices`), which answers at `:536` through
+ *    `publicWorkspaceOperation` alone and is deliberately left untouched by the transcript gate.
+ *    The transcript gate is applied to the two LIST routes and the per-operation `/log` only.
+ *
+ * What the transcript gate does narrow is the case BLO-34631's survey did not test: one agent
+ * reading ANOTHER agent's run output. Neither gate covers the other, and a route that applies only
+ * one is half-gated.
  */
 export function publicWorkspaceOperation(
   operation: WorkspaceOperation,
@@ -560,22 +616,28 @@ export function publicProjectWorkspaces(
 export function publicProject<T extends {
   workspaces: ProjectWorkspace[];
   primaryWorkspace: ProjectWorkspace | null;
+  env?: AgentEnvConfig | null;
   executionWorkspacePolicy?: ProjectExecutionWorkspacePolicy | null;
 }>(project: T, viewer: WorkspaceRuntimeViewer): T {
-  if (viewer.revealRuntimeConfig) return project;
+  // PEN-3033: the `env` mask is applied FIRST and is not gated on `viewer`. The runtime-config
+  // withholding below is an entitlement decision; a plain env value is disclosed to nobody, so it
+  // must not sit behind the `revealRuntimeConfig` early return — an entitled viewer would
+  // otherwise take the raw row on the very next line.
+  const masked = maskProjectEnv(project);
+  if (viewer.revealRuntimeConfig) return masked;
   return {
-    ...project,
-    ...(project.executionWorkspacePolicy === undefined
+    ...masked,
+    ...(masked.executionWorkspacePolicy === undefined
       ? {}
       : {
           executionWorkspacePolicy: publicProjectExecutionWorkspacePolicy(
-            project.executionWorkspacePolicy,
+            masked.executionWorkspacePolicy,
             viewer,
           ),
         }),
-    workspaces: publicProjectWorkspaces(project.workspaces, viewer),
-    primaryWorkspace: project.primaryWorkspace
-      ? publicProjectWorkspace(project.primaryWorkspace, viewer)
+    workspaces: publicProjectWorkspaces(masked.workspaces, viewer),
+    primaryWorkspace: masked.primaryWorkspace
+      ? publicProjectWorkspace(masked.primaryWorkspace, viewer)
       : null,
   };
 }
@@ -583,6 +645,7 @@ export function publicProject<T extends {
 export function publicProjects<T extends {
   workspaces: ProjectWorkspace[];
   primaryWorkspace: ProjectWorkspace | null;
+  env?: AgentEnvConfig | null;
   executionWorkspacePolicy?: ProjectExecutionWorkspacePolicy | null;
 }>(projects: T[], viewer: WorkspaceRuntimeViewer): T[] {
   return projects.map((project) => publicProject(project, viewer));

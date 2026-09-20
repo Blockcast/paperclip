@@ -170,9 +170,10 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     //
     // PEN-3205: same username censoring as the sibling list route on `routes/agents.ts`. Both
     // answer with the same historical `WorkspaceOperation` rows including `stdoutExcerpt` /
-    // `stderrExcerpt`, which `publicWorkspaceOperation` deliberately does NOT withhold, so
-    // censoring on one route and not the other left the same bytes legible one URL over.
-    // New rows are censored at write time as well; this still covers rows stored before that.
+    // `stderrExcerpt`, which `publicWorkspaceOperation` deliberately does NOT withhold (BLO-34631
+    // surveyed that and found the agent's own MCP control path reads them back), so censoring on
+    // one route and not the other left the same bytes legible one URL over. New rows are censored
+    // at write time as well; this still covers rows stored before that.
     //
     // The two are orthogonal and BOTH apply: the withholding decides *whether* captured output
     // leaves at all, the censoring decides what the surviving text may say. Composed in the

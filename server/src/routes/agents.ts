@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
-import { REDACTED_EVENT_VALUE, isPlainObject, redactAgentConfigPayload, redactEventPayload, withholdRunEventTranscriptContent, withholdRunTranscriptStateContent } from "../redaction.js";
+import { REDACTED_EVENT_VALUE, isPlainObject, maskWorkspaceRuntimeTextForRead, redactAgentConfigPayload, redactEventPayload, withholdRunEventTranscriptContent, withholdRunTranscriptStateContent } from "../redaction.js";
 import { diffAgentAdapterSecretBindings } from "../services/agent-secret-bindings.js";
 import { agentRuntimeState, agents as agentsTable, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
 import { and, asc, desc, eq, gte, inArray, not, or, sql } from "drizzle-orm";
@@ -367,74 +367,48 @@ export function agentRoutes(
   const instanceSettings = instanceSettingsService(db);
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
 
-  async function logRunLogAccessAudit(
-    req: Request,
-    run: { id: string; companyId: string; logStore: string | null },
-    result: "allowed" | "denied",
-    opts: { offset: number; limitBytes: number },
-  ) {
-    const actor = getRunLogAuditActor(req);
-    await logActivity(db, {
-      companyId: run.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: run.id,
-      action: "heartbeat.run_log_accessed",
-      entityType: "heartbeat_run",
-      entityId: run.id,
-      details: {
-        result,
-        actorSource: actor.actorSource,
-        actorRunId: actor.actorRunId,
-        offset: opts.offset,
-        limitBytes: opts.limitBytes,
-        logStore: run.logStore,
-      },
-    });
-  }
-
   /**
-   * PEN-3204: `GET /workspace-operations/:operationId/log` had NEITHER half of
-   * the control pair — no read-side gate and no access audit. PEN-3140's table
-   * gave `/log` an audit and `/events` a projection, and this sibling path was
-   * simply absent from it; it must not come out of this change with only one.
-   *
-   * A distinct action from `heartbeat.run_log_accessed` for the same reason
-   * `heartbeat.run_events_accessed` is: the paths are separately reachable and a
-   * forensic reader needs to know which one a caller used. Entity is the
-   * operation, and `runId` carries the operation's owning run rather than the
-   * actor's, so an audit row points at the transcript that was read.
-   *
-   * `ownerAgentId` is recorded because it is the subject the decision was made
-   * about, and `null` there is the fail-closed branch — it tells a reader the
-   * access was decided with no resolvable owner rather than against one.
+   * BLO-34631. Shared by both raw-log surfaces. `/workspace-operations/:id/log` serves the same
+   * class of bytes as `/heartbeat-runs/:runId/log` — stored log content, not a projected row — and
+   * was the only one of the four run/operation log surfaces writing no audit record at all, so
+   * "who read this log" had no answer for it. Both call sites audit allowed AND denied reads.
    */
-  async function logWorkspaceOperationLogAccessAudit(
+  async function logLogAccessAudit(
     req: Request,
-    operation: { id: string; companyId: string; heartbeatRunId: string | null; logStore: string | null },
+    entity: {
+      companyId: string;
+      entityType: "heartbeat_run" | "workspace_operation";
+      entityId: string;
+      runId: string | null;
+      logStore: string | null;
+    },
     result: "allowed" | "denied",
-    opts: { offset: number; limitBytes: number; ownerAgentId?: string | null },
+    opts: { offset: number; limitBytes: number; withheld?: boolean },
   ) {
     const actor = getRunLogAuditActor(req);
     await logActivity(db, {
-      companyId: operation.companyId,
+      companyId: entity.companyId,
       actorType: actor.actorType,
       actorId: actor.actorId,
       agentId: actor.agentId,
-      runId: operation.heartbeatRunId,
-      action: "workspace_operation.log_accessed",
-      entityType: "workspace_operation",
-      entityId: operation.id,
+      runId: entity.runId,
+      action: entity.entityType === "heartbeat_run"
+        ? "heartbeat.run_log_accessed"
+        : "workspace_operation.log_accessed",
+      entityType: entity.entityType,
+      entityId: entity.entityId,
       details: {
         result,
         actorSource: actor.actorSource,
         actorRunId: actor.actorRunId,
         offset: opts.offset,
         limitBytes: opts.limitBytes,
-        logStore: operation.logStore,
-        heartbeatRunId: operation.heartbeatRunId,
-        ownerAgentId: opts.ownerAgentId ?? null,
+        logStore: entity.logStore,
+        // BLO-34631 review: a withheld read and a real disclosure are both `result: "allowed"` —
+        // the access check decides reachability, the entitlement decides the bytes. Record which
+        // one happened so "who read this log" is answerable without re-deriving the reader's
+        // grants after the fact. Absent on surfaces that apply no read-time projection.
+        ...(opts.withheld === undefined ? {} : { withheld: opts.withheld }),
       },
     });
   }
@@ -450,6 +424,11 @@ export function agentRoutes(
    * cannot wire up one and stay blind to the other — being blind to `/events`
    * is exactly why the audit was rejected as a compensating control on
    * PEN-3140.
+   *
+   * Not folded into BLO-34631's `logLogAccessAudit` above: that helper is shared
+   * by the two RAW-LOG surfaces and is keyed on `offset`/`limitBytes`. `/events`
+   * is a projected row feed paged by `afterSeq`/`limit`, so it has no offset to
+   * record and would have to widen that helper's shape to carry nothing.
    */
   async function logRunEventsAccessAudit(
     req: Request,
@@ -476,6 +455,21 @@ export function agentRoutes(
         eventCount: opts.eventCount,
       },
     });
+  }
+
+  async function logRunLogAccessAudit(
+    req: Request,
+    run: { id: string; companyId: string; logStore: string | null },
+    result: "allowed" | "denied",
+    opts: { offset: number; limitBytes: number },
+  ) {
+    await logLogAccessAudit(req, {
+      companyId: run.companyId,
+      entityType: "heartbeat_run",
+      entityId: run.id,
+      runId: run.id,
+      logStore: run.logStore,
+    }, result, opts);
   }
 
   async function assertAgentEnvironmentSelection(
@@ -4893,6 +4887,7 @@ export function agentRoutes(
       continuationAttempt: heartbeatRuns.continuationAttempt,
       lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
       nextAction: heartbeatRuns.nextAction,
+      firstOutputAt: heartbeatRuns.firstOutputAt,
       lastOutputAt: heartbeatRuns.lastOutputAt,
       lastOutputSeq: heartbeatRuns.lastOutputSeq,
       lastOutputStream: heartbeatRuns.lastOutputStream,
@@ -5251,49 +5246,82 @@ export function agentRoutes(
 
   router.get("/workspace-operations/:operationId/log", async (req, res) => {
     const operationId = req.params.operationId as string;
-    const operation = await getAccessibleResource(req, res, workspaceOperations.getById(operationId), "Workspace operation not found");
-    if (!operation) return;
-
     const offset = Number(req.query.offset ?? 0);
-    const limitBytes = readRunLogLimitBytes(req.query.limitBytes);
     const normalizedOffset = Number.isFinite(offset) ? offset : 0;
-
-    // PEN-3204: this entire body is captured command output — transcript, not
-    // state — so it is gated on the same decision as the run transcript rather
-    // than projected. Mirrors `GET /heartbeat-runs/:runId/log` above: 403 with
-    // the decider's named boundary vocabulary, and the cross-tenant 404 from
-    // `getAccessibleResource` left untouched, since that is the case where the
-    // operation's existence is itself the secret.
-    //
-    // The path carries a bare operation id with no run in it, so the owning
-    // agent is resolved through `heartbeatRunId`. Unresolvable owner means
-    // withhold — see `withholdUnentitledWorkspaceOperationOutput` for why that
-    // is decided here rather than handed to the decider, which would fall
-    // through to the company-wide grant on a null agent id.
-    const owners = await workspaceOperations.owningAgentIdsByRunId([operation.heartbeatRunId]);
-    const ownerAgentId = operation.heartbeatRunId ? owners.get(operation.heartbeatRunId) : undefined;
-    const transcriptAccess: RunTranscriptReadOutcome = ownerAgentId
-      ? await decideRunTranscriptRead(req, access, { companyId: operation.companyId, agentId: ownerAgentId })
-      : { allowed: req.actor.type === "board", decision: null };
-
-    if (!transcriptAccess.allowed) {
-      await logWorkspaceOperationLogAccessAudit(req, operation, "denied", { offset: normalizedOffset, limitBytes, ownerAgentId: ownerAgentId ?? null });
-      throw forbidden(
-        transcriptAccess.decision?.explanation ?? "Workspace operation output access is not permitted for this actor.",
-        transcriptAccess.decision
-          ? authorizationDeniedDetails(transcriptAccess.decision)
-          : { reason: "deny_unresolved_run_owner" as const },
-      );
+    const limitBytes = readRunLogLimitBytes(req.query.limitBytes);
+    const operation = await workspaceOperations.getById(operationId);
+    if (!operation) {
+      res.status(404).json({ error: "Workspace operation not found" });
+      return;
     }
 
-    await logWorkspaceOperationLogAccessAudit(req, operation, "allowed", { offset: normalizedOffset, limitBytes, ownerAgentId: ownerAgentId ?? null });
+    const audit = (result: "allowed" | "denied", withheld?: boolean) => logLogAccessAudit(req, {
+      companyId: operation.companyId,
+      entityType: "workspace_operation",
+      entityId: operation.id,
+      runId: operation.heartbeatRunId,
+      logStore: operation.logStore,
+    }, result, { offset: normalizedOffset, limitBytes, withheld });
+
+    // Same shape as `/heartbeat-runs/:runId/log` rather than `getAccessibleResource`: keep the
+    // cross-tenant 404 so this route is not an existence oracle, without silently dropping the
+    // denied access event. `getAccessibleResource`'s own doc block names audit-logged denials as
+    // the case that should compose `hasCompanyAccess` directly.
+    if (!hasCompanyAccess(req, operation.companyId)) {
+      await audit("denied");
+      res.status(404).json({ error: "Workspace operation not found" });
+      return;
+    }
+
+    try {
+      assertCompanyAccess(req, operation.companyId);
+    } catch (error) {
+      await audit("denied");
+      throw error;
+    }
+
+    // PEN-3204 / merge of 2026-09-20: this route is deliberately left on BLO-34631's
+    // `workspace_runtime:read` entitlement and is NOT additionally gated on
+    // `decideRunTranscriptRead`, even though the sibling list routes are. The reason is that the
+    // entitlement already answers the transcript question here and answers it more tightly:
+    // `workspace_runtime:read` is unmapped in `permissionForAction` and absent from the
+    // same-company agent allow-list (`services/authorization.ts`), so NO agent actor resolves
+    // `revealRuntimeConfig` — the content below is withheld from every agent, owner or not. A
+    // transcript gate stacked on top would convert a withheld 200 into a 403 for non-owners and
+    // change nothing about which bytes leave.
+    //
+    // That is a narrower claim than "this route is done": stacking the two would also close the
+    // `runs:read_transcript` grant's effect here, which is a product decision about the grant's
+    // reach rather than a leak. It belongs to PEN-3204 with BLO-34631's survey in hand, not to a
+    // merge resolution on PEN-3142.
+    //
+    // Viewer first: the audit record has to say whether this read actually disclosed anything, and
+    // only the entitlement knows that. Resolved after the two denial paths, so a caller who never
+    // clears company access costs no entitlement lookup.
+    const viewer = await resolveWorkspaceRuntimeViewer(access, req, operation.companyId);
+    await audit("allowed", !viewer.revealRuntimeConfig);
     const result = await workspaceOperations.readLog(operationId, {
       offset: normalizedOffset,
       limitBytes,
     });
 
     res.set("Cache-Control", "no-cache, no-store");
-    res.json(result);
+    // BLO-34631. `content` is the stored chunk verbatim — the write-time sanitizer is a heuristic
+    // secret matcher, not a withholding boundary, so it lets host paths, repo layout and any
+    // operator command echoed by `set -x` through. That is the same text `publicWorkspaceOperation`
+    // withholds one projection over, so it is withheld on the same entitlement. Masked rather than
+    // emptied, matching `publicRuntimeServices`: a withheld reader can still tell "this operation
+    // logged nothing" from "the log was withheld". `redactCurrentUserValue` still runs for the
+    // entitled reader, because write-time username censoring is not retroactive.
+    res.json(redactCurrentUserValue(
+      {
+        ...result,
+        content: viewer.revealRuntimeConfig
+          ? result.content
+          : maskWorkspaceRuntimeTextForRead(result.content),
+      },
+      await getCurrentUserRedactionOptions(),
+    ));
   });
 
   router.get("/issues/:issueId/live-runs", async (req, res) => {
@@ -5333,6 +5361,7 @@ export function agentRoutes(
         continuationAttempt: heartbeatRuns.continuationAttempt,
         lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
         nextAction: heartbeatRuns.nextAction,
+        firstOutputAt: heartbeatRuns.firstOutputAt,
         lastOutputAt: heartbeatRuns.lastOutputAt,
         lastOutputSeq: heartbeatRuns.lastOutputSeq,
         lastOutputStream: heartbeatRuns.lastOutputStream,

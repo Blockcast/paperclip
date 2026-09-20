@@ -18,6 +18,7 @@ import { assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAcc
 import { forbidden, unauthorized } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
+import { maskProjectEnv } from "./project-env-response.js";
 
 export function routineRoutes(
   db: Db,
@@ -194,7 +195,11 @@ export function routineRoutes(
   router.get("/routines/:id", async (req, res) => {
     const detail = await getAccessibleResource(req, res, svc.getDetail(req.params.id as string), "Routine not found");
     if (!detail) return;
-    res.json(detail);
+    // PEN-3033: `detail.project` is declared `RoutineProjectSummary` (five fields, no `env`), but the
+    // service builds it with a bare `db.select()` full-row read and TypeScript does not strip excess
+    // properties at runtime — so `env` was serialized with plain values in the clear. The narrow type
+    // is what hid this: it reads as though the material was never fetched.
+    res.json(detail.project ? { ...detail, project: maskProjectEnv(detail.project) } : detail);
   });
 
   router.get("/routines/:id/revisions", async (req, res) => {

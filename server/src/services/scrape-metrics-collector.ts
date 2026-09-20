@@ -26,6 +26,7 @@
 
 import type { Db } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
+import { describeHeldAgentStartLocks } from "./agent-start-lock.js";
 import { refreshExternalRuntimeReservationMetrics } from "./external-runtime-reservations.js";
 import { refreshExternalRuntimeReservationStrandMetrics } from "./external-runtime-reservation-strand-metrics.js";
 import {
@@ -34,6 +35,7 @@ import {
   refreshScheduledRetryParkHorizonMetrics,
 } from "./queued-run-age-metrics.js";
 import {
+  setAgentStartLockHeldMetrics,
   setDbPoolStats,
   setExternalRuntimeReservationStrandMetricsRefreshSuccess,
   setOverdueScheduledRetryAgeMetricsRefreshSuccess,
@@ -153,6 +155,19 @@ export function refreshDbPoolMetrics(db: Db): void {
   const client = (db as { $client?: PoolStatsClient }).$client;
   const stats = client?.poolStats?.();
   if (stats) setDbPoolStats(stats);
+}
+
+/**
+ * Publish the held agent start locks (PEN-3305). Synchronous and DB-free for
+ * the same reason as {@link refreshDbPoolMetrics}, and the reason is sharper
+ * here: the condition this exists to expose is a dispatch section wedged on a
+ * database await, so a DB-backed collector tick would be stuck behind the very
+ * thing it is meant to report. Reading it on the scrape path means the gauge
+ * is published *because* the process can still serve HTTP, independently of
+ * whether it can reach Postgres.
+ */
+export function refreshAgentStartLockMetrics(): void {
+  setAgentStartLockHeldMetrics(describeHeldAgentStartLocks());
 }
 
 export interface ScrapeMetricsCollectorOptions {

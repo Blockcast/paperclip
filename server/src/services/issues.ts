@@ -2678,6 +2678,7 @@ const PRODUCTIVITY_REVIEW_TRIGGERS: readonly IssueProductivityReviewTrigger[] = 
   "long_active_duration",
   "high_churn",
   "runtime_failure_streak",
+  "runaway_execution",
 ];
 
 function lowTrustBoundaryIssueCondition(
@@ -5685,7 +5686,12 @@ export function issueService(db: Db) {
   // bootstraps the singleton row, which on a caller's tx is a row lock taken
   // BEFORE the company graph lock and held to commit — a deadlock edge. These
   // are pure reads, so they take the read-only view on either handle.
-  const instanceSettingsOn = (dbOrTx: unknown) => readInstanceSettingsOn(dbOrTx as Db);
+  // Wrapper, not a bare alias: an alias dereferences the module binding when
+  // `issueService(db)` is constructed, so any test that partially mocks
+  // `instance-settings.js` fails just by building the service. Reading it
+  // inside the arrow keeps the dereference at call time.
+  const instanceSettingsOn = (dbOrTx: Parameters<typeof readInstanceSettingsOn>[0]) =>
+    readInstanceSettingsOn(dbOrTx);
   const treeControlSvc = issueTreeControlService(db);
 
   async function lockIssueBlockerRelations(
@@ -12851,6 +12857,63 @@ export function issueService(db: Db) {
       const currentUserRedactionOptions = {
         enabled: (await instanceSettingsOn(dbOrTx)).general.censorUsernameInLogs,
       };
+      return redactIssueComment(comment, currentUserRedactionOptions.enabled);
+    },
+
+    /**
+     * BLO-31634: rewrite the body of a comment located by its idempotency key.
+     *
+     * The key is the authorization, not just the lookup. Only a caller able to
+     * reproduce the exact `(issue, author, key)` tuple it wrote can reach the
+     * row — and the plugin host namespaces plugin keys with the install row's
+     * id — so a plugin can edit the comments it authored and nothing else.
+     * There is deliberately no update-by-comment-id sibling: that would let
+     * anything holding the permission rewrite a human's comment, and no caller
+     * needs it.
+     *
+     * Returns null when no live row matches — a keyless (pre-0206) row, a
+     * soft-deleted one, or another author's. Callers must treat null as "not
+     * mine to edit" rather than retrying without the key.
+     *
+     * Concurrent callers converge: this is a single UPDATE, so two deliveries
+     * carrying the same edit both write the same body and neither inserts.
+     */
+    updateCommentByIdempotencyKey: async (
+      issueId: string,
+      idempotencyKey: string,
+      body: string,
+      actor: { agentId?: string | null; userId?: string | null },
+      dbOrTx: any = db,
+    ) => {
+      const currentUserRedactionOptions = {
+        enabled: (await instanceSettingsOn(dbOrTx)).general.censorUsernameInLogs,
+      };
+      const now = new Date();
+      const [comment] = await dbOrTx
+        .update(issueComments)
+        .set({
+          body: redactCurrentUserText(body, currentUserRedactionOptions),
+          updatedAt: now,
+        })
+        .where(and(
+          eq(issueComments.issueId, issueId),
+          eq(issueComments.idempotencyKey, idempotencyKey),
+          issueCommentIdempotencyAuthorScope(actor),
+          isNull(issueComments.deletedAt),
+        ))
+        .returning();
+
+      if (!comment) return null;
+
+      // The `issue_comments` activity trigger (0076) is AFTER INSERT only, so an
+      // edit would otherwise leave the thread's recency untouched. Bump the
+      // issue the same way `addComment` does and let the BEFORE UPDATE trigger
+      // on `issues` mirror it into `last_activity_at`.
+      await dbOrTx
+        .update(issues)
+        .set({ updatedAt: now })
+        .where(eq(issues.id, issueId));
+
       return redactIssueComment(comment, currentUserRedactionOptions.enabled);
     },
 

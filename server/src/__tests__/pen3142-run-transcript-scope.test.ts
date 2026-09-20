@@ -841,90 +841,35 @@ describe("run transcript scoping (PEN-3142)", () => {
       expect(JSON.stringify(res.body)).not.toContain(WORKSPACE_OP_CANARY);
     });
 
-    it("403s the /log body for an unentitled peer and audits the denial", async () => {
-      const res = await requestApp(
-        await createApp(peerAgentActor),
-        (baseUrl) => request(baseUrl).get("/api/workspace-operations/op-1/log?offset=0&limitBytes=64"),
-      );
-
-      expect(res.status, JSON.stringify(res.body)).toBe(403);
-      expect(JSON.stringify(res.body)).not.toContain(WORKSPACE_OP_CANARY);
-      // Named boundary vocabulary, not a new client-indistinguishable string.
-      expect(res.body.details).toMatchObject({ reason: "deny_missing_grant" });
-      // This path had NEITHER half of the control pair before this row.
-      expect(mockLogActivity).toHaveBeenCalledWith(
-        expect.anything(),
-        expect.objectContaining({
-          action: "workspace_operation.log_accessed",
-          entityType: "workspace_operation",
-          entityId: "op-1",
-          details: expect.objectContaining({ result: "denied" }),
-        }),
-      );
-    });
-
-    it("serves the /log body to the owning agent and audits the allow", async () => {
-      mockDecide.mockImplementation(async (input: { action?: string }) => ({
-        allowed: true,
-        action: input.action,
-        reason: "allow_self",
-        explanation: "Allowed because the actor owns the run whose transcript it is reading.",
-      }));
-
-      const res = await requestApp(
-        await createApp(ownerAgentActor),
-        (baseUrl) => request(baseUrl).get("/api/workspace-operations/op-1/log?offset=0&limitBytes=64"),
-      );
-
-      expect(res.status, JSON.stringify(res.body)).toBe(200);
-      expect(res.body.content).toBe(WORKSPACE_OP_CANARY);
-      expect(mockLogActivity).toHaveBeenCalledWith(
-        expect.anything(),
-        expect.objectContaining({
-          action: "workspace_operation.log_accessed",
-          details: expect.objectContaining({ result: "allowed", ownerAgentId: runOwnerAgentId }),
-        }),
-      );
-    });
-
-    it("403s the /log of a RUN-LESS operation even for a grant holder", async () => {
-      // The decider would ALLOW this: with a null agent id both relational
-      // allows in `authorization.ts` are skipped and it falls through to the
-      // company-wide `runs:read_transcript` grant. There is no owner to decide
-      // about, so the route must be tighter than the decider here — this case
-      // fails if the null-owner branch is ever handed to `decideRunTranscriptRead`.
-      mockWorkspaceOperationService.getById.mockResolvedValue(runlessCleanupOperation);
-      mockDecide.mockImplementation(async (input: { action?: string }) => ({
-        allowed: true,
-        action: input.action,
-        reason: "allow_grant",
-        explanation: "Allowed by an explicit runs:read_transcript grant.",
-      }));
-
-      const res = await requestApp(
-        await createApp(peerAgentActor),
-        (baseUrl) => request(baseUrl).get("/api/workspace-operations/op-2/log"),
-      );
-
-      expect(res.status, JSON.stringify(res.body)).toBe(403);
-      expect(res.body.details).toMatchObject({ reason: "deny_unresolved_run_owner" });
-      expect(JSON.stringify(res.body)).not.toContain(WORKSPACE_OP_CANARY);
-    });
-
-    it("keeps the run-less /log readable for a human operator", async () => {
-      // The fail-closed branch withholds from every AGENT actor, but a human
-      // operator is the class this whole design keeps — and the operator UI
-      // renders these excerpts.
-      mockWorkspaceOperationService.getById.mockResolvedValue(runlessCleanupOperation);
-
-      const res = await requestApp(
-        await createApp(boardActor),
-        (baseUrl) => request(baseUrl).get("/api/workspace-operations/op-2/log"),
-      );
-
-      expect(res.status, JSON.stringify(res.body)).toBe(200);
-      expect(res.body.content).toBe(WORKSPACE_OP_CANARY);
-    });
+    /**
+     * PEN-3204 / merge of 2026-09-20: the four cases that pinned a
+     * `decideRunTranscriptRead` gate on `GET /workspace-operations/:operationId/log`
+     * were REMOVED here rather than repaired, because the route they described is no
+     * longer the route this branch ships.
+     *
+     * Master landed BLO-34631 on that same path while this PR was open, gating the
+     * body on the `workspace_runtime:read` entitlement instead. That control is
+     * strictly tighter for the population this gate protects: `workspace_runtime:read`
+     * is unmapped in `permissionForAction` and absent from the same-company agent
+     * allow-list (`services/authorization.ts`), so NO agent actor resolves
+     * `revealRuntimeConfig` and the content is withheld from every agent, owner or
+     * not. Stacking the transcript gate on top would have converted a withheld 200
+     * into a 403 and changed no bytes.
+     *
+     * The coverage did not move to nothing — it moved to master's cases, which assert
+     * BOTH directions on this route and are green at this head:
+     * `agent-live-run-routes.test.ts` → "withholds workspace-operation log content
+     * from a reader without workspace_runtime:read", "discloses ... to a reader
+     * holding workspace_runtime:read", and "audits denied workspace-operation log
+     * access without reading content".
+     *
+     * What is NOT settled by that, and is deliberately left to PEN-3204 rather than
+     * decided in a merge: whether the `runs:read_transcript` grant should reach this
+     * route at all. Under master's entitlement it does not.
+     *
+     * The cross-tenant 404 case below is kept — that posture is unchanged by either
+     * control, and it is the one assertion here that still describes shipped behaviour.
+     */
 
     it("keeps the cross-tenant 404 rather than exposing the new 403", async () => {
       mockWorkspaceOperationService.getById.mockResolvedValue({

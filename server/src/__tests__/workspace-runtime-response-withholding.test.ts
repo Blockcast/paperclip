@@ -57,6 +57,16 @@ const OPERATION_CWD_SENTINEL = "/fixture/sentinel-operation-cwd";
 const OPERATION_METADATA_SENTINEL = "/fixture/sentinel-operation-worktree-path";
 
 /**
+ * BLO-34631. Command *output*, and distinct from the `command` sentinel on purpose: the whole
+ * question this ticket settled is whether withholding the command while disclosing its output is a
+ * boundary or a gap. It resolved to "disclosed, deliberately" on a consumer survey, so these two
+ * are the values an unentitled reader is expected to RECEIVE — named for the decision they pin
+ * rather than for egress. Both invented.
+ */
+const OPERATION_STDOUT_SENTINEL = "sentinel-operation-stdout-disclosed-by-design";
+const OPERATION_STDERR_SENTINEL = "sentinel-operation-stderr-disclosed-by-design";
+
+/**
  * PEN-3073. The lifecycle command scalars that sit BESIDE `workspaceRuntime` on the same config
  * object, and their siblings on the three nouns that carry the same strings elsewhere. Each gets its
  * own sentinel for the reason stated above: a passing assertion has to name the exit it closed.
@@ -849,10 +859,56 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
     });
 
     /**
+     * BLO-34631 AC 3, resolved as DISCLOSED — pinned by a test because it is a decision, not an
+     * omission, and the next reader of `publicWorkspaceOperation` will otherwise see `command` and
+     * `cwd` masked beside two unmasked siblings and "fix" the asymmetry.
+     *
+     * The CTO lean was to withhold, on the symmetry argument that the output of a withheld command
+     * discloses the command. AC 3 made that falsifiable by a consumer survey and the survey
+     * falsifies it: `POST /execution-workspaces/:id/runtime-services/:action` answers with this
+     * same projection, it is the backing call for the MCP tool
+     * `paperclipControlIssueWorkspaceServices`, and same-company agents deliberately lack
+     * `workspace_runtime:read` — so masking here hands an agent `***REDACTED***` for the output of
+     * the command it just triggered.
+     *
+     * The contrast in the last two assertions is the whole point: this reader is unentitled, and
+     * the SAME row still withholds `command`/`cwd`. So this case cannot pass by the projection
+     * being skipped, only by the excerpts being deliberately exempt from it.
+     *
+     * PEN-3142/PEN-3204 (merge of 2026-09-20): the fixture is given an OWNER so that this case
+     * keeps testing the axis it was written for. A second and orthogonal gate now also reads this
+     * route — the run-transcript gate — and it fails closed on an operation with no resolvable
+     * owning agent. Left bare, this row would arrive withheld by that gate and the assertions
+     * below would pass or fail for a reason that has nothing to do with `workspace_runtime:read`.
+     * The reader stays unentitled on THIS axis (`decideAsUnprivilegedReader` denies only
+     * `workspace_runtime:read`, and allows the transcript read), so the contrast above is intact.
+     */
+    it("discloses the operation excerpts to a reader without workspace_runtime:read", async () => {
+      mockWorkspaceOperationService.listForExecutionWorkspace.mockResolvedValue([
+        workspaceOperationFixture({
+          heartbeatRunId: "run-2",
+          stdoutExcerpt: OPERATION_STDOUT_SENTINEL,
+          stderrExcerpt: OPERATION_STDERR_SENTINEL,
+        }),
+      ]);
+      mockWorkspaceOperationService.owningAgentIdsByRunId.mockResolvedValue(new Map([["run-2", "agent-2"]]));
+
+      const res = await request(createApp("execution-workspaces")).get(
+        "/api/execution-workspaces/workspace-1/workspace-operations",
+      );
+
+      expect(res.status).toBe(200);
+      expect(res.body[0].stdoutExcerpt).toBe(OPERATION_STDOUT_SENTINEL);
+      expect(res.body[0].stderrExcerpt).toBe(OPERATION_STDERR_SENTINEL);
+      expect(res.body[0].command).toBe(REDACTED_EVENT_VALUE);
+      expect(res.body[0].cwd).toBe(REDACTED_EVENT_VALUE);
+    });
+
+    /**
      * PEN-3205, read side. `publicWorkspaceOperation` masks `command`/`cwd`/`metadata` and spreads
-     * the rest, so `stdoutExcerpt` crosses that projection UNMASKED, and `routes/agents.ts` was
-     * already applying the username censor on the sibling list route while this one answered with
-     * a bare `res.json`.
+     * the rest, so `stdoutExcerpt` crosses that projection UNMASKED by design (BLO-34631 surveyed
+     * that and kept it), and `routes/agents.ts` was already applying the username censor on the
+     * sibling list route while this one answered with a bare `res.json`.
      *
      * PEN-3142/PEN-3204 added a SECOND control over the same field on this route — the
      * run-transcript gate — so the censor is no longer the only thing standing over the excerpt

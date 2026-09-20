@@ -1665,7 +1665,14 @@
       "idx": 245,
       "version": "7",
       "when": 1789541100000,
-      "tag": "0245_runs_read_transcript_grant_seed",
+      "tag": "0245_heartbeat_runs_first_output_at",
+      "breakpoints": true
+    },
+    {
+      "idx": 246,
+      "version": "7",
+      "when": 1789541200000,
+      "tag": "0246_runs_read_transcript_grant_seed",
       "breakpoints": true
     }
   ]
