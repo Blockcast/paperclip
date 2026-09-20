@@ -90,7 +90,17 @@ export const MAX_LINKED_PRS = 5;
 /** Whole-probe budget. The gate runs inside a PATCH; a slow GitHub must not hold the request open. */
 export const PROBE_DEADLINE_MS = 8000;
 /** Per-call budget, so one wedged socket cannot consume the whole probe deadline. */
-export const PER_CALL_TIMEOUT_MS = 2500;
+export const PER_CALL_TIMEOUT_MS = 2000;
+/**
+ * Longest serial call chain in `probeOne`: gate → head → surfaces → author.
+ * PRs are probed in PARALLEL, so this chain — not the PR count — is what has to
+ * fit inside `PROBE_DEADLINE_MS`. At 2500ms it did not (4 x 2500 = 10000 > 8000),
+ * and the overflow landed exactly where it was least affordable: the author read
+ * fires only on the would-be-`clean` route, so a full-length chain threw away the
+ * detection it was one call from establishing. `evidence-truth.test.ts` pins the
+ * relation so a fifth call cannot cross it silently.
+ */
+export const MAX_SERIAL_CALLS = 4;
 
 export function prRefsFromWorkProducts(wps: TruthWorkProduct[]): PrRef[] {
   const byKey = new Map<string, PrRef>();
@@ -184,8 +194,9 @@ async function probeOne(
 
     const normalizedHead = head.trim().toLowerCase();
 
-    // Surface 1: the comment-shaped review, judged by the same function the
-    // merge gate publishes from — including its carried-finding rules.
+    // Surface 1: the review GRAMMAR — the consolidated-review body, wherever it
+    // was filed — judged by the same function the merge gate publishes from,
+    // over the same input, including its carried-finding rules.
     //
     // Author-blind FIRST, then read the author only for the outcomes the author
     // could still change — the same order, and the same reason, as the merge
@@ -195,7 +206,24 @@ async function probeOne(
     // one verdict, and would let an unreadable `GET /pulls/{n}` turn a fully
     // justified red into a failed read.
     const commentInput = {
-      comments: surfaces.comments.map((c) => ({ authorLogin: c.login, body: c.body, createdAt: c.createdAt })),
+      // BOTH surfaces, because the grammar is a property of the BODY and not of
+      // the object carrying it. The merge gate builds this argument as
+      // `[...issueComments, ...prReviews]` (`pr-comment-review-gate.ts`), and
+      // Ally files most verdicts as formal review objects — so reading
+      // `surfaces.comments` alone left the carried-finding rules computed over a
+      // list that is EMPTY on exactly the PRs that have a finding to carry, and
+      // a red the merge gate publishes could read `clean` here. Mirror the
+      // gate's own row filter: `githubListPrReviewsWithTimestamps` drops
+      // DISMISSED and any row with no `submitted_at`, and keys `createdAt` off
+      // it. Surface 2 below keeps reading `surfaces.reviews` separately — it
+      // asks a question only it can (the bodyless CHANGES_REQUESTED veto, keyed
+      // on review STATE rather than on grammar).
+      comments: [
+        ...surfaces.comments.map((c) => ({ authorLogin: c.login, body: c.body, createdAt: c.createdAt })),
+        ...surfaces.reviews
+          .filter((r) => (r.state ?? "").trim().toUpperCase() !== "DISMISSED" && typeof r.submittedAt === "string")
+          .map((r) => ({ authorLogin: r.login, body: r.body, createdAt: r.submittedAt as string })),
+      ],
       headSha: normalizedHead,
       reviewerBotLogin: deps.reviewerBotLogin,
     };

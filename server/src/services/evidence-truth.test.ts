@@ -2,11 +2,15 @@ import { describe, expect, it } from "vitest";
 import {
   buildGithubTruthProbe,
   prRefsFromWorkProducts,
+  MAX_SERIAL_CALLS,
+  PER_CALL_TIMEOUT_MS,
+  PROBE_DEADLINE_MS,
   type GithubTruthDeps,
   type TruthWorkProduct,
 } from "./evidence-truth.js";
 
 const HEAD = "c".repeat(40);
+const OLD = "a".repeat(40);
 const ALLY = "allyblockcast[bot]";
 
 const clean = `## Ally — Consolidated PR Review
@@ -21,6 +25,20 @@ None.
 ### Recommended Action
 Land.`;
 const dirty = clean.replace("Important Issues (0)", "Important Issues (1)");
+// A blocking review of a head the branch has since replaced, carrying a real
+// finding bullet so there is something to carry forward. Nothing retires it, so
+// the gate must keep it red across the replacement head (BLO-29711).
+const dirtyAtOld = `## Ally — Consolidated PR Review
+**Reviewed head:** \`${OLD}\`
+
+### Critical Issues (0)
+None.
+
+### Important Issues (1)
+- The probe and the merge gate can disagree about one head.
+
+### Recommended Action
+Fix before merge.`;
 
 const WEBHOOK = { promotedByActorId: "github_pull_request_webhook" };
 
@@ -151,6 +169,93 @@ describe("buildGithubTruthProbe", () => {
   it("not merged per the webhook but merged on GitHub → detected via the confirm call", async () => {
     const r = await buildGithubTruthProbe(deps())({ workProducts: [wp()] });
     expect(r.detections["deploy:landed"]).toBe(true);
+  });
+
+  // The review GRAMMAR is a property of the BODY, not of the object carrying
+  // it. Ally files most verdicts as formal review objects — 8 of them, and zero
+  // issue comments, on this fix's own PR — so judging only `surfaces.comments`
+  // computed the carried-finding rules over an EMPTY list on exactly the PRs
+  // that had a finding to carry.
+  //
+  // This is that shape, and it is the ordinary one for an agent PR: a finding
+  // raised at an older head, and the only attestation of the current head
+  // written by the PR author. A self-attestation does not disposition the
+  // carry, so the merge gate publishes `carried_finding` → RED — while the
+  // probe, seeing an empty comment list, fell through to `formalClean` on the
+  // newest review and reported `review:ally-clean` at the same head. Reverting
+  // the `surfaces.reviews` merge fails this case.
+  it("a finding carried on the REVIEW surface is not cleared by the author's own attestation", async () => {
+    const probe = buildGithubTruthProbe(
+      deps({
+        fetchPrAuthorLogin: async () => ALLY,
+        listReviewerSurfaces: async () => ({
+          reviews: [
+            { login: ALLY, body: dirtyAtOld, state: "COMMENTED", commitId: OLD, submittedAt: "2026-09-06T00:00:00Z" },
+            { login: ALLY, body: clean, state: "COMMENTED", commitId: HEAD, submittedAt: "2026-09-06T01:00:00Z" },
+          ],
+          comments: [],
+        }),
+      }),
+    );
+    expect((await probe({ workProducts: [wp()] })).detections["review:ally-clean"]).toBeUndefined();
+  });
+
+  // The Suggestion's route: `authorUnknown` also rides `carried_finding`, where
+  // the retained verdict is a RED rather than the withheld positive. The red
+  // stands on the comment surfaces alone, so it must survive an unread author —
+  // while `probeFailed` stays honest, because a readable distinct author could
+  // genuinely have cleared the carry. Nothing else stops a future edit from
+  // collapsing this route into the `not_evaluated` one.
+  it("an unreadable author on the CARRIED-finding route keeps the red and still reports", async () => {
+    const r = await buildGithubTruthProbe(
+      deps({
+        fetchPrAuthorLogin: async () => null,
+        listReviewerSurfaces: async () => ({
+          reviews: [],
+          comments: [
+            { login: ALLY, body: dirtyAtOld, createdAt: "2026-09-06T00:00:00Z" },
+            { login: ALLY, body: clean, createdAt: "2026-09-06T01:00:00Z" },
+          ],
+        }),
+      }),
+    )({ workProducts: [wp()] });
+    expect(r.detections["review:ally-clean"]).toBeUndefined();
+    expect(r.probeFailed).toBe(true);
+    expect(r.diagnostics.some((d) => d.startsWith("github-truth-probe-failed:pr_author:"))).toBe(true);
+  });
+
+  // PRs are probed in PARALLEL, so the longest SERIAL chain — not the PR count
+  // — is what has to fit the deadline. Two halves, because each rots
+  // differently: the arithmetic catches a per-call budget raised past the
+  // deadline, the call count catches a fifth call added to the chain. The
+  // per-call signal cannot rescue an overflow: `abort()` runs in the `.finally()`
+  // AFTER `Promise.race` has already resolved `"deadline"`, which discards the
+  // results of every PR that had already finished.
+  it("the longest serial call chain fits inside the whole-probe deadline", () => {
+    expect(MAX_SERIAL_CALLS * PER_CALL_TIMEOUT_MS).toBeLessThanOrEqual(PROBE_DEADLINE_MS);
+  });
+
+  it("the would-be-clean route makes no more serial calls than MAX_SERIAL_CALLS", async () => {
+    let calls = 0;
+    const counted = <T,>(value: T) => async () => {
+      calls += 1;
+      return value;
+    };
+    const r = await buildGithubTruthProbe(
+      deps({
+        // `trust: null` forces the merge confirm call, so this is the full
+        // chain: gate → head → surfaces → author.
+        getPullRequestGate: counted({ state: "closed", merged: true } as const),
+        fetchHeadSha: counted(HEAD),
+        listReviewerSurfaces: counted({
+          reviews: [],
+          comments: [{ login: ALLY, body: clean, createdAt: "2026-09-06T00:00:00Z" }],
+        }),
+        fetchPrAuthorLogin: counted("some-human"),
+      }),
+    )({ workProducts: [wp({ merged: true, trust: null })] });
+    expect(r.detections["review:ally-clean"]).toBe(true);
+    expect(calls).toBe(MAX_SERIAL_CALLS);
   });
 
   it("a formal review at head with no blocking feedback is clean", async () => {
