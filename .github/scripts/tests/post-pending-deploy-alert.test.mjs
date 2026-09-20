@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   ALERT_TTL_MS,
   DEFAULT_ALERT_AFTER_HOURS,
+  DEPLOY_WORKFLOW_FILE,
   UnreadableWaitingRunError,
   buildAlert,
   selectStuckApproval,
@@ -201,6 +202,58 @@ test('buildAlert: names the pending run so the reader can act without opening th
   assert.match(alert.annotations.description, /Approve or reject/);
   assert.match(alert.annotations.description, /33456522759/);
   assert.match(alert.annotations.summary, /10\.0h/);
+});
+
+test('buildAlert: the call to action is the waiting-runs queue, never the perishable run url', () => {
+  // BLO-26972. The escalate step runs BEFORE the supersede step that cancels the
+  // run it names — measured 6s apart on 2026-09-19, and the alert then carried
+  // the dead url for the rest of the ~7h cycle. Sending the one human who can
+  // approve to a cancelled run is the exact harm this ticket tracks, reproduced
+  // inside the sanctioned supersede path.
+  //
+  // The assertion is on the line the reader ACTS on, not on the url appearing
+  // somewhere in the body: `pendingUrl` is still quoted as observed-at-alert
+  // context, so a test that merely greps for the queue url would pass on a
+  // reverted call to action.
+  const verdict = selectStuckApproval({
+    pendingRuns: [
+      waitingRun('2026-09-01T02:00:00.000Z', {
+        url: 'https://github.com/Blockcast/paperclip/actions/runs/33456522759',
+      }),
+    ],
+    alertAfterHours: 6,
+    now: NOW,
+  });
+  const alert = buildAlert({
+    ...verdict,
+    alertAfterHours: 6,
+    runUrl: 'https://github.com/Blockcast/paperclip/actions/runs/99',
+    repo: 'Blockcast/paperclip',
+    environment: 'paperclip-production',
+    now: NOW,
+  });
+
+  const queueUrl =
+    `https://github.com/Blockcast/paperclip/actions/workflows/${DEPLOY_WORKFLOW_FILE}` +
+    '?query=is%3Awaiting';
+  assert.equal(alert.annotations.pending_queue_url, queueUrl);
+
+  const cta = alert.annotations.description
+    .split('\n')
+    .find((line) => line.startsWith('Approve or reject'));
+  assert.ok(cta, 'the description must carry an "Approve or reject" call to action');
+  assert.ok(
+    cta.includes(queueUrl),
+    `the call to action must link the waiting-runs queue, got: ${cta}`,
+  );
+  assert.ok(
+    !cta.includes('/actions/runs/'),
+    `the call to action must not link an individual run — it is cancelled by supersede: ${cta}`,
+  );
+
+  // The specific run stays visible, just demoted out of the actionable line.
+  assert.match(alert.annotations.description, /33456522759/);
+  assert.equal(alert.annotations.pending_run_url, verdict.oldest.url);
 });
 
 test('buildAlert: endsAt brackets the hourly schedule — outlives a missed slot, resolves same-day', () => {
