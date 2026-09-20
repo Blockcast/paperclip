@@ -45,18 +45,28 @@ on:
     # workflows here -- exhaustion would be the steady state, not an edge
     # case. Hourly halves it to ~359/hour and leaves real headroom.
     #
-    # The cheap predicate-level cut (skipping PRs younger than
-    # STALL_THRESHOLD_SECONDS, which cannot be stranded) scales with that
-    # threshold, so BLO-34521's 90m -> 18h move changed it sixfold.
+    # The cheap predicate-level cut (skipping PRs that cannot be stranded)
+    # scales with that threshold, so BLO-34521's 90m -> 18h move changed it
+    # roughly sevenfold. It runs in TWO stages, and conflating them is how
+    # this paragraph has been wrong before:
+    #
+    #   stage 1  too_young_to_be_stranded -- tests `created_at` ALONE, from
+    #            the list payload, so it saves all 3 requests. It cannot use
+    #            `committer_date`: the soundness proof needs only
+    #            `pending_since >= created_at`, and reading the committer
+    #            date would cost the very head-commit request being avoided.
+    #   stage 2  _consider_pr's `(now - pending_since) < STALL` early return
+    #            -- the head commit has now been fetched, so this tests the
+    #            real max(created_at, committer_date) and catches the old PR
+    #            pushed an hour ago. It saves the remaining 2 requests.
     #
     # EVERY FIGURE BELOW IS ONE SNAPSHOT, 2026-09-19T22:26Z: 111 open PRs,
-    # 105 non-draft and unlocked -> ~315 requests per run uncut. Cut by the
-    # script's own `pending_since` = max(created_at, committer_date):
+    # 105 non-draft and unlocked -> ~315 requests per run uncut.
     #
-    #     threshold | younger | cut saves | vs `created_at` alone
-    #         90m   |    5    | ~15 (~5%) |  1
-    #          8h   |    9    | ~27 (~9%) |  4
-    #         18h   |   33    | ~99 (~31%)|  9
+    #     threshold | stage 1 (x3) | stage 2 (x2) | total saved
+    #         90m   |  1 PR -> ~3  |  4 PRs -> ~8 |  ~11  (~3%)
+    #          8h   |  4 PRs -> 12 |  5 PRs -> 10 |  ~22  (~7%)
+    #         18h   |  9 PRs -> 27 | 24 PRs -> 48 |  ~75  (~24%)
     #
     # Deliberately one snapshot rather than the best figure for each line:
     # every prior revision of this paragraph quoted numbers from two
@@ -65,15 +75,19 @@ on:
     # from one population cannot disagree with each other. Re-measure the
     # whole table or none of it.
     #
-    # The last column is why you measure with the committer date and not
-    # `created_at` alone: an old PR pushed an hour ago is young by this
-    # predicate, and ignoring that undercounts the cut nearly fourfold at the
-    # threshold in force (9 against 33). Re-derive rather than inherit --
-    # these track STALL_THRESHOLD_SECONDS and the open-PR backlog, which is
-    # why the 2026-08-21 pair above no longer reproduces.
+    # Read the stage columns as a pair, never the `younger` PR counts alone:
+    # 33 PRs are under 18h by `pending_since`, but only 9 of them are cut for
+    # free. Quoting 33 x 3 = ~99 (~31%) as the saving -- which this paragraph
+    # did until BLO-34521 -- charges stage 2 nothing for the head-commit
+    # request it must issue to decide. Quoting stage 1 alone (~27, ~9%)
+    # makes the opposite error and discards two thirds of what ships.
+    # Re-derive rather than inherit: every figure here tracks
+    # STALL_THRESHOLD_SECONDS and the open-PR backlog, which is why the
+    # 2026-08-21 pair above no longer reproduces.
     #
-    # Cadence is still a comparable lever (hourly vs `9,39` is worth ~315/hour
-    # against a 1,000/hour budget), but the cut is no longer rounding error.
+    # Cadence is still the larger lever (hourly vs `9,39` is worth ~315/hour
+    # against a 1,000/hour budget), but at ~24% the cut is not rounding
+    # error either.
     #
     # ALARM_THRESHOLD_SECONDS derives as STALL + COOLDOWN + 2h in the script,
     # to absorb the coarser polling granularity. Deliberately no figure here:
