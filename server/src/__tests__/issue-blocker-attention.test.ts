@@ -1075,8 +1075,9 @@ describeEmbeddedPostgres("issue blocker attention", () => {
         assigneeAgentId: agentId,
         executionState: null,
       });
+      const interactionId = randomUUID();
       await db.insert(issueThreadInteractions).values({
-        id: randomUUID(),
+        id: interactionId,
         companyId,
         issueId: reviewId,
         kind: "request_confirmation",
@@ -1086,11 +1087,11 @@ describeEmbeddedPostgres("issue blocker attention", () => {
         payload: { version: 1, prompt: "Accept?" },
       });
       const rows = await svc.list(companyId, { attention: "blocked" });
-      return rows.find((row) => row.id === reviewId)?.blockedInboxAttention ?? null;
+      return { attention: rows.find((row) => row.id === reviewId)?.blockedInboxAttention ?? null, interactionId };
     };
 
-    const fresh = await cardAge(new Date(Date.now() - 60_000));
-    const stale = await cardAge(new Date(Date.now() - 25 * 60 * 60 * 1000));
+    const { attention: fresh, interactionId: freshCardId } = await cardAge(new Date(Date.now() - 60_000));
+    const { attention: stale, interactionId: staleCardId } = await cardAge(new Date(Date.now() - 25 * 60 * 60 * 1000));
 
     // A fresh card genuinely does own the next action, and the board is genuinely the owner.
     expect(fresh).toMatchObject({
@@ -1099,6 +1100,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       severity: "medium",
       owner: { type: "board" },
     });
+    expect(fresh?.interactionId).toBe(freshCardId);
     // A card nobody has answered in 25h does not. The row must stop naming the board as the
     // owner of a next action it has not taken.
     expect(stale).toMatchObject({
@@ -1107,6 +1109,58 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       severity: "high",
     });
     expect(stale?.owner.type).not.toBe("board");
+    // The stale row's recommended action is "resolve or withdraw the card", so the card it
+    // means must be named. Dropping the row from the loop left this null while the action
+    // text still told the operator to go withdraw something it declined to identify.
+    expect(stale?.interactionId).toBe(staleCardId);
+  });
+
+  // BLO-22660: the ageing rule is deliberately asymmetric -- interactions age, approvals do
+  // not -- and that asymmetry is only correct while the classifier and this ladder agree
+  // about which paths age. Pin the pairing: a row carrying BOTH a stale card and a pending
+  // approval is still owned by the board via the approval, so it must not fall through to
+  // the stale-card finding. This fails if a later change ages approvals in one half only,
+  // which is the precise shape of the defect this PR fixed twice.
+  it("keeps a row with a stale card but a live approval on the approval path (BLO-22660)", async () => {
+    const { companyId, agentId } = await createCompany("BIA");
+    const reviewId = await insertIssue({
+      companyId,
+      identifier: "BIA-1",
+      title: "Review with a stale card and a live approval",
+      status: "in_review",
+      assigneeAgentId: agentId,
+      executionState: null,
+    });
+    await db.insert(issueThreadInteractions).values({
+      id: randomUUID(),
+      companyId,
+      issueId: reviewId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      createdAt: new Date(Date.now() - 25 * 60 * 60 * 1000),
+      payload: { version: 1, prompt: "Accept?" },
+    });
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "request_board_approval",
+      status: "pending",
+      requestedByAgentId: agentId,
+      payload: { title: "Decide this" },
+    });
+    await db.insert(issueApprovals).values({ companyId, issueId: reviewId, approvalId });
+
+    const rows = await svc.list(companyId, { attention: "blocked" });
+    const attention = rows.find((row) => row.id === reviewId)?.blockedInboxAttention ?? null;
+
+    expect(attention).toMatchObject({
+      state: "awaiting_decision",
+      reason: "pending_board_decision",
+      owner: { type: "board" },
+      approvalId,
+    });
   });
 
   it("classifies recovery issues and missing successful-run dispositions", async () => {
