@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
@@ -481,14 +482,11 @@ test("only helm_chart runs the chart suite from inside the chart directory (BLO-
 //
 // Node's own value-taking flags, so a flag's VALUE is never mistaken for the
 // positional path argument. Only space-separated forms are a hazard --
-// `--flag=value` is one token and already reads as a flag. Short aliases are
-// listed alongside their long spellings (`-r`/`--require`, `-C`/`--conditions`)
-// because they are the same flag; `--import` and `--loader` have none.
+// `--flag=value` is one token and already reads as a flag, and a Set keyed on
+// the bare spelling misses it for free.
 //
-// Listed explicitly rather than inferred from a shape, and the cost of a flag
-// missing from the list runs in BOTH directions -- an earlier draft of this
-// comment claimed it was only ever a missed row, which is wrong. An unconsumed
-// value stays an operand, so:
+// The cost of a flag missing from this set runs in BOTH directions. An
+// unconsumed value stays an operand, so:
 //   - value has no glob -> it satisfies the rooted-path check itself, and the
 //     step escapes. A missed row, the direction this file tolerates.
 //   - value HAS a glob -> it also reaches the wildcard-directory scan below and
@@ -496,47 +494,141 @@ test("only helm_chart runs the chart suite from inside the chart directory (BLO-
 //     A FALSE RED, the direction this file does not tolerate: a missed row is a
 //     hole this gate is allowed to have, a false red fails an unrelated PR and
 //     gets the assertion deleted.
-// `--test-coverage-exclude`/`--test-coverage-include` are exactly that case --
-// glob-valued by design, shipping since node 22, and the natural companions of
-// `--experimental-test-coverage`, so wiring coverage into a `node --test` step
-// is the ordinary edit that hits it rather than an exotic one. Both are listed
-// for that reason; `--test-isolation` takes `process`/`none` and so only ever
-// costs a missed row, and is listed for consistency -- under BOTH spellings,
-// since node 24 prints it as `--experimental-test-isolation, --test-isolation`
-// and listing only the short one leaves the alias unmatched.
-// `--allow-fs-read`/`--allow-fs-write` are the strongest case of all: a glob is
-// the DOCUMENTED syntax of the permission model, not a convention, so their
-// values false-red by specification. `--cpu-prof-dir`/`--heap-prof-dir` take
-// directories, where a glob is unusual rather than idiomatic -- listed anyway
-// because listing a genuinely value-taking flag has no cost (its value is one
-// node consumes, so eating it is always right), while omitting one is the false
-// red above. That asymmetry, not glob-likelihood, is the rule for the next
-// flag: if `node --help` shows it taking a value, list it. Re-check that help
-// output whenever the pinned major moves.
-const VALUE_FLAGS =
-  /^(?:--(?:experimental-test-isolation|test-(?:reporter|reporter-destination|name-pattern|skip-pattern|timeout|concurrency|shard|isolation|coverage-exclude|coverage-include)|allow-fs-(?:read|write)|(?:cpu|heap)-prof-dir|import|require|loader|conditions)|-[rC])$/;
-// This regex has now been widened twice (coverage pair, then the permission and
-// profiler families) and every widening was found by review, not by this file
-// going red -- because the real pr.yml uses none of these flags, so narrowing it
-// back leaves all ten assertions green while restoring the false red. Same
-// silent-revert shape as `jobOwning` above, so pin it the same way: by name, on
-// synthetic tokens. The boolean row is the other direction -- widening
-// `coverage-(?:exclude|include)` to `coverage-.*` would swallow the path after
-// `--experimental-test-coverage` and turn a false red into a false green.
-test("VALUE_FLAGS covers the glob-valued flags, and only value-taking ones (BLO-31516)", () => {
-  for (const flag of [
-    "--allow-fs-read",
-    "--allow-fs-write",
-    "--cpu-prof-dir",
-    "--heap-prof-dir",
-    "--test-coverage-exclude",
-    "--test-reporter-destination",
-  ]) {
-    assert.ok(VALUE_FLAGS.test(flag), `${flag} takes a space-separated value and must be consumed`);
-    assert.ok(!VALUE_FLAGS.test(`${flag}=./x/*/y`), `${flag}=... is one token and must not match`);
+//
+// DERIVED, not hand-listed, and that is the fix for a specific failure. This
+// started as a literal regex and was widened twice -- the coverage pair, then
+// the permission and profiler families -- with review now asking for a third
+// (`--watch-path`/`--env-file`/`--snapshot-blob`). Every gap was found by
+// review rather than by this file going red, because the real pr.yml uses none
+// of these flags, so an incomplete list is green. Three misses by the same
+// mechanism is the mechanism's verdict. Node knows its own flag arity, so ask
+// it instead of transcribing it: any list is a stale copy of this output, and
+// the rule for maintaining the list ("if the help shows it taking a value, list
+// it") was itself unfollowable, since it admitted `--inspect` -- see below.
+//
+// The format contract, from `node --help` on the pinned node 24:
+//   - a flag DEFINITION starts at exactly two spaces; description continuation
+//     lines are indented far further, so `^ {2}-` separates the two.
+//   - aliases share one definition line, comma-separated, and share arity:
+//     `-C, --conditions=...`, `--experimental-test-isolation, --test-isolation=...`.
+//     The `=...` sits on the last spelling only, so mark the whole group.
+//   - `=...` is a REQUIRED value -> consume the next token.
+//   - `[=...]` is OPTIONAL -> the bare spelling is BOOLEAN and must NOT be
+//     consumed: `--inspect[=[host:]port]`, `--inspect-brk`, `--inspect-wait`.
+//     Listing one would eat the path after it -- a false GREEN, the worse
+//     direction. Matching on `=...` excludes them by construction.
+// If a future node re-renders its help, this set shrinks and the membership
+// test below goes red naming the flag it lost -- loudly, where a narrowed
+// literal regex went silent.
+const VALUE_FLAGS = (() => {
+  const help = execFileSync(process.execPath, ["--help"], { encoding: "utf8" });
+  const flags = new Set();
+  for (const line of help.split("\n")) {
+    // `[^\s,]` not `\S`: a greedy `\S*` swallows the separating comma, so the
+    // alias branch never matches and every multi-spelling flag is lost.
+    const definition = /^ {2}(-[^\s,]*(?:, -[^\s,]*)*)/.exec(line);
+    if (!definition) continue;
+    const spellings = definition[1].split(", ");
+    if (!spellings.some((spelling) => spelling.endsWith("=..."))) continue;
+    for (const spelling of spellings) flags.add(spelling.replace(/=\.\.\.$/, ""));
   }
-  for (const flag of ["--experimental-test-coverage", "--experimental-permission", "--test", "--watch"]) {
-    assert.ok(!VALUE_FLAGS.test(flag), `${flag} takes no value; listing it would eat the path argument`);
+  return flags;
+})();
+
+// The tokens of a `node --test ...` invocation that are positional arguments:
+// flags dropped, and the VALUE of any space-separated value-taking flag dropped
+// with the flag that owns it.
+//
+// A flag taking a SPACE-separated value leaves that value behind as a bare
+// token, which satisfies a non-flag check with the VALUE and reopens the argless
+// hazard one flag away -- node consumes the value and then default-discovers, so
+// from the repo root such a step picks the chart suite up silently. Requiring the
+// token look like a rooted path narrowed that class but did not close it, because
+// a flag value can be a rooted path too. Verified on the pinned node 24, from a
+// directory containing `tests/a.test.mjs`, all three of these run it with no path
+// argument given: `--test-reporter ./my-reporter.mjs`,
+// `--test-reporter-destination ./coverage/out.tap`, `--test-name-pattern a/b`.
+// `--test-reporter-destination` is the plausible one -- writing a TAP artifact
+// for CI collection is exactly why a step grows a reporter flag, and
+// `--test-reporter` is required alongside it.
+//
+// Hoisted out of the workflow scan below so it can be exercised on synthetic
+// invocations. It could not be before, and that mattered: the real pr.yml uses
+// none of these flags, so deleting the value-consumption filter entirely left
+// every assertion in this file green.
+function operandsOf(invocation) {
+  const tokens = invocation.split(/[\s\\]+/).filter(Boolean);
+  return (
+    tokens
+      .filter((arg, i) => !(tokens[i - 1] && VALUE_FLAGS.has(tokens[i - 1])))
+      // `-` rather than `--`: a path never starts with a dash, and now that
+      // short aliases are in VALUE_FLAGS a leftover `-r` would otherwise
+      // count as an operand and report "no ROOTED path argument" on a step
+      // that has no path argument at all -- the same misleading-message
+      // defect the operands/args split below exists to fix.
+      .filter((arg) => !arg.startsWith("-"))
+  );
+}
+
+test("a flag's value is never mistaken for the path argument (BLO-31516)", () => {
+  // The integration the membership test cannot reach. Each of these is a step
+  // that runs the chart suite by default discovery while LOOKING like it names
+  // a path, so every row must come back with no operands.
+  for (const invocation of [
+    " --test-reporter ./my-reporter.mjs",
+    " --test-reporter-destination ./coverage/out.tap",
+    " --env-file ./cfg/ci.env",
+    " --watch-path ./src",
+    " -r ./preload.cjs",
+    " --experimental-test-isolation none",
+  ]) {
+    assert.deepEqual(operandsOf(invocation), [], `${invocation.trim()} leaves its value behind as an operand`);
+  }
+  // The other direction, so the filter cannot be "fixed" by dropping everything:
+  // a real path still survives, alongside a consumed flag value and after a
+  // bracketed optional-value flag, which is boolean when spelled bare.
+  assert.deepEqual(operandsOf(" --test-reporter ./r.mjs ./scripts/a.test.mjs"), ["./scripts/a.test.mjs"]);
+  assert.deepEqual(operandsOf(" --inspect ./scripts/a.test.mjs"), ["./scripts/a.test.mjs"]);
+  assert.deepEqual(operandsOf(" --test-coverage-exclude=./x/*/y ./scripts/a.test.mjs"), ["./scripts/a.test.mjs"]);
+});
+
+test("VALUE_FLAGS is derived from node --help, required-value only (BLO-31516)", () => {
+  for (const flag of [
+    // Reachable from a CI `node --test` step, and glob-valued, so each is a
+    // false red while unconsumed. The last three are the ones the hand list
+    // still missed at ad29df6f.
+    "--test-reporter-destination",
+    "--test-coverage-exclude",
+    "--allow-fs-read",
+    "--cpu-prof-dir",
+    "--watch-path",
+    "--env-file",
+    "--snapshot-blob",
+    // Alias-line parsing: these exist only as the non-`=...` spelling on a
+    // shared definition line, so they are lost the moment the comma handling
+    // above regresses.
+    "-r",
+    "-C",
+    "--loader",
+    "--experimental-test-isolation",
+  ]) {
+    assert.ok(VALUE_FLAGS.has(flag), `${flag} takes a space-separated value and must be consumed`);
+    assert.ok(!VALUE_FLAGS.has(`${flag}=./x/*/y`), `${flag}=... is one token and must not match`);
+  }
+  for (const flag of [
+    // Plain booleans.
+    "--test",
+    "--watch",
+    "--experimental-test-coverage",
+    "--experimental-permission",
+    // Bracketed optional-value. Consuming one eats the path after it, which is
+    // the false-GREEN direction -- the reason the filter keys on `=...` rather
+    // than on "the help shows a value".
+    "--inspect",
+    "--inspect-brk",
+    "--inspect-wait",
+  ]) {
+    assert.ok(!VALUE_FLAGS.has(flag), `${flag} takes no required value; consuming it would eat the path argument`);
   }
 });
 
@@ -567,15 +659,7 @@ test("every node --test names explicit paths, so the text match above is sound (
       // alongside it. Consuming the value of a known value-taking flag is what
       // actually discriminates, so that is the check; the rooted-path filter
       // below is kept on top of it, narrower and for a different reason.
-      const tokens = invocation[1].split(/[\s\\]+/).filter(Boolean);
-      const operands = tokens
-        .filter((arg, i) => !(tokens[i - 1] && VALUE_FLAGS.test(tokens[i - 1])))
-        // `-` rather than `--`: a path never starts with a dash, and now that
-        // short aliases are in VALUE_FLAGS a leftover `-r` would otherwise
-        // count as an operand and report "no ROOTED path argument" on a step
-        // that has no path argument at all -- the same misleading-message
-        // defect the operands/args split above exists to fix.
-        .filter((arg) => !arg.startsWith("-"));
+      const operands = operandsOf(invocation[1]);
       // Rooted, not merely non-flag. This is the house-style claim the rest of
       // this gate rests on -- all 40 invocations name a rooted path -- and it
       // is what keeps the exactly-once TEXT match sound. It is reported apart

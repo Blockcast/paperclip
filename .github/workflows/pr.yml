@@ -785,18 +785,20 @@ jobs:
         # refs, not `with:` inputs, so nothing moves this line automatically.
         # BLO-31516.
         #
-        # Drift checked 2026-09-04 — the load-bearing token here, because every
+        # Drift checked 2026-09-20 — the load-bearing token here, because every
         # figure below decays from it. Stated so it stays measurable rather than
         # merely disclosed. Against helm/helm releases on that date: v3.16.3 was
         # published 2024-11-14, so this pin is ~22 months behind. The newest
-        # release is v3.21.4 (2026-08-14) — NOT a 4.x, because helm maintains
+        # release is v3.22.0 (2026-09-10) — NOT a 4.x, because helm maintains
         # both lines in parallel (v4.0.0 shipped 2025-11-12, newest 4.x is
-        # v4.2.4, 2026-08-13, one day older than the 3.x tip). So the low-risk
-        # bump is v3.21.4, staying on the pinned major; moving to 4.x is a
+        # v4.3.0, 2026-09-09, one day older than the 3.x tip). So the low-risk
+        # bump is v3.22.0, staying on the pinned major; moving to 4.x is a
         # separate call. Either way a bump changes render output, so it belongs
         # in its own PR with its own green `Helm chart` rather than riding
-        # along here. Re-run that comparison when you touch this line: if the
-        # gap has grown, that is the signal to bump.
+        # along here. Re-run that comparison when you change the pin, or when
+        # the date above is more than a quarter old: if the gap has grown, that
+        # is the signal to bump. A prose reword does not need it — the previous
+        # pass (2026-09-04, tip v3.21.4) moved only the tip, not the verdict.
         #
         # Prose rather than a soft assertion in the suite, chosen not defaulted:
         # asserting "the pin is within N releases of the tip" means querying the
