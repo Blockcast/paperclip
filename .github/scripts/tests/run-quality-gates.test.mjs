@@ -118,8 +118,11 @@ test('findExistingComment: ignores a bot comment that merely quotes the signatur
 // only exist after it does — so oldest-match is the genuine one and
 // newest-match is the paste. Adopting the paste PATCHes over another agent's
 // comment, which recurs; picking the older of two genuine gate comments only
-// mattered for pre-fix duplicates, which this fix stops and which were deleted
-// from all 20 affected open PRs when it landed.
+// mattered for pre-fix duplicates. Those were deleted from the affected open
+// PRs by a manual sweep, but the producing bug runs on `master` until this
+// merges and keeps minting more (#1933 took two inside eleven minutes) — so
+// sweep once more at merge time rather than treating the earlier sweep as
+// durable. After merge the class cannot recur.
 test('findExistingComment: adopts the oldest gate comment, not the newest', async () => {
   const comment = await findExistingComment(async () => ([
     {
@@ -135,6 +138,27 @@ test('findExistingComment: adopts the oldest gate comment, not the newest', asyn
   ]), 'token', 'Blockcast/paperclip', 1889);
 
   assert.equal(comment.id, 20);
+});
+
+// Every other fixture here is a hand-written literal, so none of them pin the
+// cross-function coupling the whole fix rests on: findExistingComment anchors
+// on `endsWith(COMMENT_SIGNATURE)`, which is only correct while buildComment
+// keeps the signature last in *both* branches. Append a footer after the
+// signature — the edit anyone adding a run link would make — and `existing`
+// goes permanently null again: failing runs POST a duplicate and passing runs
+// fall through the `|| existing` guard, leaving the stale red comment up. That
+// is the BLO-26636 defect restored, with the rest of this suite fully green.
+test('findExistingComment: matches what buildComment actually produces', async () => {
+  for (const body of [
+    buildComment('someone', ['Missing section: **## Risks**'], []),
+    buildComment('someone', [], []),
+  ]) {
+    const comment = await findExistingComment(async () => ([
+      { id: 1, user: { login: 'allyblockcast[bot]', type: 'Bot' }, body },
+    ]), 'token', 'Blockcast/paperclip', 1889);
+
+    assert.equal(comment?.id, 1);
+  }
 });
 
 test('findExistingComment: tolerates a comment with no body', async () => {
