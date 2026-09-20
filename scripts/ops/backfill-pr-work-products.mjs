@@ -53,7 +53,7 @@ const j = async (path, init) => {
 };
 
 const PR_RE = /https?:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)\b/g;
-const LIMIT = 500;
+const LIMIT = 1000; // ISSUE_LIST_MAX_LIMIT — anything lower halves the headroom and doubles the re-runs
 
 /**
  * Does this PR claim this issue? Mirrors the webhook's link rule: the
@@ -127,6 +127,9 @@ if (RUN) {
   for (const status of ["in_review", "blocked", "in_progress"]) {
     const issues = asIssues(await j(`/companies/${CID}/issues?status=${status}&limit=${LIMIT}`));
     // The list caps silently; saying so beats reporting partial coverage as total.
+    // Only sound on a key with `company_scope:read`: the route filters the page
+    // AFTER applying the cap (routes/issues.ts:8085-8088), so a scoped key turns a
+    // truncated page into a short one and this guard never fires.
     if (issues.length >= LIMIT) console.warn(`WARNING: ${status} hit the ${LIMIT} cap — re-run after this pass`);
 
     for (const issue of issues) {
