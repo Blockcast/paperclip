@@ -441,9 +441,29 @@ export function hasDoneWhenHeading(description: string): boolean {
   return doneWhenSections(description).length > 0;
 }
 
+/**
+ * One key per criterion line under a recognized heading. A criterion carries
+ * an unordered marker (`-`/`*`) or an ordered one (`1.`, `1)`).
+ *
+ * Ordered items were unmatched until BLO-34810, which made a fully-specified
+ * numbered acceptance-criteria list count as zero criteria — so
+ * `detectChecklistDoneWhen` short-circuited false and the row carried a
+ * permanent `missing: ["checklist:done-when"]` that no comment could clear.
+ * The only workarounds were renumbering the criteria (breaking every
+ * cross-thread "AC 3" citation) or duplicating them into a parallel bullet
+ * list that then drifts from the original.
+ *
+ * `^` is deliberately not preceded by an indent allowance: a nested item is a
+ * sub-point of the criterion above it, not a criterion of its own, and
+ * counting it would inflate the required evidence-row count.
+ *
+ * Keys are normalized bullet TEXT, so the caller's cross-section dedup is
+ * blind to which marker was used — a criteria list cannot be double-counted
+ * by restating it under a synonym heading with the other marker style.
+ */
 function doneWhenBulletKeys(body: string): string[] {
   return Array.from(
-    body.matchAll(/^[-*]\s+(.*)$/gm),
+    body.matchAll(/^(?:[-*]|\d+[.)])\s+(.*)$/gm),
     (match, index) => {
       const normalized = (match[1] ?? "").trim().replace(/\s+/g, " ").toLowerCase();
       return normalized ? `text:${normalized}` : `empty:${index}`;
