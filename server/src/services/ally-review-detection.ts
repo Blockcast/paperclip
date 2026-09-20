@@ -366,7 +366,10 @@ function asSeverityCounts(raw: unknown): Map<string, number> | string {
     // the gate description is the only place Ally sees which key we rejected.
     // Reporting `exceeds 1000` for it names the wrong defect.
     if (!VERDICT_SEVERITIES.has(key)) {
-      return `ally-verdict findings name unsupported severity \`${key}\``;
+      // Named, not quoted: `key` is model-authored and this reason reaches the
+      // same unscrubbed boundary as the ledger verb (PEN-3157) — see
+      // asPublishableToken.
+      return `ally-verdict findings name unsupported severity \`${asPublishableToken(key)}\``;
     }
     // `Number.isInteger(1e100)` is true, and the ref loops in
     // extractAllyReportedFindingRefs enumerate 1..count. Without a ceiling a
@@ -472,7 +475,12 @@ export function parseAllyVerdictBlock(body: string | null | undefined): AllyVerd
 
   const [, rawVersion, rawPayload] = blocks[0]!;
   if (Number(rawVersion) !== SUPPORTED_ALLY_VERDICT_VERSION) {
-    return { kind: "unreadable", reason: `unsupported ally-verdict version ${rawVersion}` };
+    // Digits only, so it cannot carry a credential — but it is unbounded in
+    // length and lands in the uncapped check-run summary with everything else.
+    return {
+      kind: "unreadable",
+      reason: `unsupported ally-verdict version ${rawVersion!.slice(0, PUBLISHABLE_TOKEN_BUDGET)}`,
+    };
   }
 
   let parsed: unknown;
@@ -667,14 +675,12 @@ function hasNonNegatedMatch(text: string, pattern: RegExp): boolean {
   return false;
 }
 
-// The alphabet a prose ledger entry may spell its verb in. Deliberately a
-// SECOND literal copy of the verb group in PRIOR_FINDING_DISPOSITION_PATTERN
-// below, rather than a shared constant: the PEN-3157 pin in
-// github-write-egress-scrub.test.ts reads `([a-z][a-z-]*)` out of that
-// pattern's own source text, so interpolating a constant there makes a
-// refactor read as a widening of a security bound. The two copies cannot drift
-// — "the publisher's alphabet is the parser's alphabet" in
-// pr-comment-review-gate.test.ts holds them equal.
+// The alphabet a prose ledger entry may spell its verb in, and — because it is
+// the same question — the alphabet any model-authored token may be quoted in
+// when the gate names it publicly. Shared as source text with the verb group of
+// PRIOR_FINDING_DISPOSITION_PATTERN below so the parser's alphabet and the
+// publisher's cannot drift; "the publisher's alphabet is the parser's alphabet"
+// in pr-comment-review-gate.test.ts drives both and pins that they agree.
 //
 // The structured block deliberately does NOT enforce it. An unknown verb
 // already fails closed as `unrecognized`, so rejecting the whole block over a
@@ -684,24 +690,43 @@ function hasNonNegatedMatch(text: string, pattern: RegExp): boolean {
 // `stillPresentIn` in check-ally-review-consistency.mjs) — gate red, peers
 // silent.
 //
-// What the alphabet is needed for is publication: see
-// isConformingDispositionVerb.
-const DISPOSITION_VERB_PATTERN = /^[a-z][a-z-]*$/;
+// What the alphabet is needed for is publication: see asPublishableToken.
+const PUBLISHABLE_TOKEN_ALPHABET = String.raw`[a-z][a-z-]*`;
+const PUBLISHABLE_TOKEN_PATTERN = new RegExp(`^${PUBLISHABLE_TOKEN_ALPHABET}$`);
+
+// Characters of a single model-authored token the gate will quote. The
+// alphabet already rules out a credential; this only keeps one token from
+// crowding out the phrase that makes the red actionable, in the check-run
+// summary that — unlike the commit status — has no cap of its own.
+const PUBLISHABLE_TOKEN_BUDGET = 48;
+
+// Stands in for a token that must not be published verbatim. It is not a value
+// the alphabet admits — `<` is outside it — so it cannot be mistaken for one,
+// and it keeps the drift visible while withholding its text.
+export const NON_CONFORMING_TOKEN = "<non-conforming>";
 
 /**
- * May this verb be quoted into a public commit-status description?
+ * May this model-authored token be quoted into a public commit-status
+ * description?
  *
- * The gate names an unrecognized verb verbatim so a reader can tell vocabulary
- * drift from a genuinely open finding. That description is POSTed by
- * githubPostCommitStatusDetailed, which github-egress-outbound-coverage.test.ts
- * classifies `unscrubbed` under PEN-3157 — so the text it carries is bounded
- * only by whatever produced it. Prose was bounded by the pattern above;
- * `verb` arriving as a JSON field is typed as any non-empty string, so a
- * credential-shaped token in the ledger was published where the identical token
- * in prose was refused. Callers name the drift, not its payload.
+ * The gate names an unrecognized ledger verb, and an unsupported severity key,
+ * verbatim so a reader can tell drift from a genuinely open finding. That
+ * description is POSTed by githubPostCommitStatusDetailed, which
+ * github-egress-outbound-coverage.test.ts classifies `unscrubbed` under
+ * PEN-3157 — so the text it carries is bounded only by whatever produced it.
+ * Prose was bounded by the pattern above; the same token arriving as a JSON
+ * field or object key is bounded by nothing, so it was published where the
+ * identical token in prose was refused. Callers name the drift, not its payload.
  */
-export function isConformingDispositionVerb(verb: string): boolean {
-  return DISPOSITION_VERB_PATTERN.test(verb);
+export function isPublishableToken(token: string): boolean {
+  return PUBLISHABLE_TOKEN_PATTERN.test(token);
+}
+
+/** The token itself when that is safe, otherwise a stand-in naming the drift. */
+export function asPublishableToken(token: string): string {
+  return isPublishableToken(token)
+    ? token.slice(0, PUBLISHABLE_TOKEN_BUDGET)
+    : NON_CONFORMING_TOKEN;
 }
 
 // A "Prior Findings Dispositioned" ledger entry, e.g.
@@ -720,10 +745,10 @@ export function isConformingDispositionVerb(verb: string): boolean {
 // so the bound excludes no observed real entry; and an entry it did exclude
 // would leave a visible red rather than a silent green.
 //
-// The `([a-z][a-z-]*)` verb group is pinned as source text by the PEN-3157
-// test in github-write-egress-scrub.test.ts — keep it literal here.
+// The verb group is PUBLISHABLE_TOKEN_ALPHABET, shared with the publisher
+// guard above so the two cannot drift.
 const PRIOR_FINDING_DISPOSITION_PATTERN = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE} {0,3}-[ \t]*\*\*[ \t]*prior:([0-9a-f]{7,40})[ \t]+([a-z]+)[ \t]+(\d+)[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*([a-z][a-z-]*)[ \t]*(?:—|–|-)`,
+  String.raw`^${NOT_INDENTED_CODE} {0,3}-[ \t]*\*\*[ \t]*prior:([0-9a-f]{7,40})[ \t]+([a-z]+)[ \t]+(\d+)[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*(${PUBLISHABLE_TOKEN_ALPHABET})[ \t]*(?:—|–|-)`,
   "gim",
 );
 
