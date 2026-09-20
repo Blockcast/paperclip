@@ -300,6 +300,11 @@ jobs:
         run: node --test ./scripts/__tests__/merge-group-concurrency.test.mjs
         timeout-minutes: 1
 
+      - name: Test vendored-provenance union-merge invariants (BLO-34872)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/provenance-union-merge.test.mjs
+        timeout-minutes: 1
+
       - name: Test policy node-test timeouts
         if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/policy-node-test-timeouts.test.mjs
@@ -1214,7 +1219,7 @@ jobs:
         run: |
           set -euo pipefail
           actual=$(git ls-files \
-            | grep -vxE 'LICENSE|PROVENANCE\.md' \
+            | grep -vxE 'LICENSE|PROVENANCE\.md|PROVENANCE-CHANGES\.md' \
             | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d' ' -f1)
           recorded=$(grep -oE '^[0-9a-f]{64}$' PROVENANCE.md | head -1)
           echo "actual:   $actual"
