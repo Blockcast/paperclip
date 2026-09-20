@@ -35,8 +35,11 @@ export function shouldReportMergeQueueFailure({ headBranch, conclusion }) {
 export function shouldReportCancelledRun({ merged, isInMergeQueue }) {
   // Only consulted for `cancelled`. `merged` covers the candidate whose group
   // landed; `isInMergeQueue` covers the one still queued for a re-build. Read
-  // at an instant, so a PR mid-re-dispatch can read out-of-queue -- the
-  // per-runId marker bounds that to one spurious comment rather than a loop.
+  // at an instant, so the race cuts both ways: a PR mid-re-dispatch reads
+  // out-of-queue and gets one spurious comment (bounded by the per-runId
+  // marker), and a PR re-enqueued before this handler fires reads
+  // isInMergeQueue:true and is never reported at all. The second is the one
+  // that loses data, and is accepted -- whoever re-added it already knows.
   // Against the measured 22: 14-15 true reports, 0 false alarms.
   return !merged && !isInMergeQueue;
 }
@@ -89,16 +92,25 @@ export async function reportMergeQueueFailure({ repository, headBranch, conclusi
   if (!owner || !repo) throw new Error(`Invalid repository: ${repository}`);
 
   if (conclusion === "cancelled") {
+    // Deliberate: a GraphQL blip here reddens the reporter job rather than
+    // silently skipping. A silent skip loses an ejection report on a PR that is
+    // already stuck, which is the failure nobody notices.
     const state = await pullRequestQueueState(owner, repo, number);
     if (!shouldReportCancelledRun(state)) {
       return { reported: false, reason: state.merged ? "merged" : "still-queued", number };
     }
   }
 
-  // Sorted newest-first: the marker lives in the newest comments, and this is a
-  // single unpaginated page.
+  // One unpaginated page, oldest-first. GET /issues/{n}/comments does NOT honour
+  // sort/direction -- only the repo-level /issues/comments does; measured on this
+  // repo, the per-issue endpoint returns an identical first element with and
+  // without direction=desc (#1306, #1158, #1859), while the repo-level one flips.
+  // So the marker sits on the LAST page and a thread past 100 comments would
+  // re-post on every redelivery. Ceiling accepted: the busiest thread here is 12,
+  // and the blast radius is one duplicate comment. Paginate to the end if a PR
+  // thread ever approaches 100.
   const comments = await githubRequest(
-    `/repos/${owner}/${repo}/issues/${number}/comments?per_page=100&sort=created&direction=desc`,
+    `/repos/${owner}/${repo}/issues/${number}/comments?per_page=100`,
   );
   const marker = `<!-- paperclip:merge-queue-ejection:${runId} -->`;
   if (comments.some((comment) => comment.body?.startsWith(marker))) {
