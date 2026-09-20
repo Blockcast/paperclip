@@ -118,6 +118,9 @@ pass while 2 and 3 fail — that is the whole point of running all three.
 CM=paperclip-grafana-dashboard-runtime-run-queue-health   # ConfigMap name
 KEY=runtime-run-queue-health.json                 # key inside .data
 SRC=deploy/helm/paperclip/dashboards/$KEY         # the file in this repo
+KEY_JP=${KEY//./\\.}   # kubectl JSONPath reads `.` as a field separator, so an
+                       # unescaped `.json` parses as a nested field and silently
+                       # resolves to nothing (exit 0, no output, no stderr).
 
 # 1. EXISTS + LABELLED: the sidecar only adopts ConfigMaps carrying this label.
 kubectl -n paperclip get cm -l grafana_dashboard=1
@@ -126,23 +129,39 @@ kubectl -n paperclip get cm -l grafana_dashboard=1
 #    Diff the live JSON against the tree. `jq -r 'keys'` does NOT answer this --
 #    it returns the filename, which is identical in every revision, so a
 #    ConfigMap hundreds of commits stale looks exactly like a fresh one.
-diff <(kubectl -n paperclip get cm "$CM" -o jsonpath="{.data.$KEY}" | jq -S .) \
-     <(jq -S . "$SRC") && echo "LIVE == TREE" || echo "STALE -- deploy has not run"
+LIVE=$(kubectl -n paperclip get cm "$CM" -o jsonpath="{.data.$KEY_JP}")
+if [ -z "$LIVE" ]; then
+  echo "QUERY RETURNED NOTHING -- wrong CM/KEY or bad jsonpath, NOT evidence of staleness"
+elif diff <(printf '%s' "$LIVE" | jq -S .) <(jq -S . "$SRC") >/dev/null; then
+  echo "LIVE == TREE"
+else
+  echo "STALE -- deploy has not run"
+fi
 
 # 3. RESOLVES: the panel can render only if its series exist. Query the
 #    `cluster` Prometheus directly -- thanos is the Grafana default and will
 #    not see these.
 kubectl -n monitoring port-forward svc/prometheus 9090:9090 >/dev/null 2>&1 &
+PF=$!   # not `kill %1`: that needs job control (a no-op under `bash script.sh`)
 sleep 2
 for m in paperclip_queued_run_oldest_age_seconds \
          paperclip_overdue_scheduled_retry_oldest_age_seconds \
          paperclip_overdue_scheduled_retry_age_metrics_refresh_success; do
+  # `|| echo ERR` so a dead port-forward prints ERR, not a blank that reads as 0.
   printf '%s -> %s series\n' "$m" \
-    "$(curl -sG http://localhost:9090/api/v1/query --data-urlencode "query=$m" \
-        | jq '.data.result | length')"
+    "$(curl -sfG http://localhost:9090/api/v1/query --data-urlencode "query=$m" \
+        | jq -e '.data.result | length' || echo ERR)"
 done
-kill %1
+kill $PF
 ```
+
+Step 2 has exactly three outcomes and they are distinct on purpose: `LIVE ==
+TREE`, `STALE`, and `QUERY RETURNED NOTHING`. An empty read is an operator
+error, not a deploy fault, and collapsing it into `STALE` sends the operator
+after a pipeline that is fine.
+
+Step 3 printing `ERR` means the port-forward did not come up (port 9090 already
+bound is the ordinary case) — that is a broken command, not a missing metric.
 
 Step 3 returning `0 series` for a metric is a **fault, not an empty result** —
 the panel will render "NO DATA" on red by design (see the `-1` sentinel on

@@ -33,7 +33,7 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
-          "expr": "count(max by (agent_id) (paperclip_overdue_scheduled_retry_oldest_age_seconds) > 0) or vector(0)",
+          "expr": "count(max by (agent_id) (paperclip_overdue_scheduled_retry_oldest_age_seconds) > 0) or (absent(paperclip_overdue_scheduled_retry_oldest_age_seconds) * -1) or vector(0)",
           "legendFormat": "agents overdue",
           "instant": true
         }
@@ -41,10 +41,17 @@
       "fieldConfig": {
         "defaults": {
           "unit": "short",
+          "mappings": [
+            {
+              "type": "value",
+              "options": { "-1": { "text": "NO DATA", "color": "red", "index": 0 } }
+            }
+          ],
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
+              { "color": "red", "value": null },
+              { "color": "green", "value": 0 },
               { "color": "red", "value": 1 }
             ]
           }
