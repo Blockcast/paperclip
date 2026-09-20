@@ -7,6 +7,13 @@
 // (see server/src/services/evidence-truth.ts). That is deliberate — a backfilled
 // row must not be able to assert "merged" on its own.
 //
+// Population is PRs referenced in issue COMMENTS. A PR linked only from the
+// issue description is out of scope and stays `noPr` after a clean pass — so
+// the runbook's post-backfill `noPr` count is "issues with no PR in any
+// comment", not "issues with no PR". Deliberate: comments are where this fleet
+// posts its PR links, and the description arm would need the same ownership
+// rule over far noisier text.
+//
 // Idempotent on (repo, number). Dry-run by default; pass --apply to write.
 //
 //   PAPERCLIP_API_URL=... PAPERCLIP_API_KEY=... PAPERCLIP_COMPANY_ID=... \
@@ -52,8 +59,11 @@ const j = async (path, init) => {
   return r.json();
 };
 
-const PR_RE = /https?:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)\b/g;
-const LIMIT = 1000; // ISSUE_LIST_MAX_LIMIT — anything lower halves the headroom and doubles the re-runs
+const PR_URL = String.raw`https?://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)\b`;
+const PR_RE = new RegExp(PR_URL, "g");
+/** Canonical `owner/repo` out of a PR URL, or null. One source with PR_RE so the two cannot drift. */
+export const repoFromUrl = (url) => new RegExp(PR_URL).exec(url ?? "")?.[1] ?? null;
+const LIMIT = 1000; // ISSUE_LIST_MAX_LIMIT — anything lower halves the headroom and doubles the round trips
 
 /**
  * Does this PR claim this issue? Mirrors the webhook's link rule: the
@@ -106,6 +116,31 @@ export function namesIssue(pr, identifier) {
 /** The list route has returned both shapes; neither is worth guessing at 3am. */
 const asIssues = (body) => (Array.isArray(body) ? body : (body?.issues ?? []));
 
+/**
+ * Page the issue list. The route clamps `limit` to ISSUE_LIST_MAX_LIMIT and
+ * returns a bare array — no total, no cursor — so the cap is invisible and a
+ * re-run without `offset` replays the identical page. Paging is the only way
+ * to reach the tail; an earlier revision warned the operator to "re-run",
+ * which could never work.
+ *
+ * Two residues, both bounded and neither fixable here:
+ * - Offset paging over a mutating collection can duplicate or drop rows
+ *   (services/issues.ts:7900). Duplicates are free — the pass is idempotent on
+ *   (repo, number) — and a dropped row is one the next pass picks up.
+ * - Only COMPLETE on a key with `company_scope:read`. The route applies the cap
+ *   before filtering the page for the actor (routes/issues.ts:8085-8088), so a
+ *   scoped key turns a full page into a short one and stops the loop early.
+ *   Check the key first: docs/runbooks/evidence-gate-unlabeled-block.md:119-126.
+ */
+export async function listAllIssues(fetchPage, limit = LIMIT) {
+  const all = [];
+  for (let offset = 0; ; offset += limit) {
+    const page = asIssues(await fetchPage(offset));
+    all.push(...page);
+    if (page.length < limit) return all;
+  }
+}
+
 /** GitHub PR state -> issueWorkProductStatusSchema (packages/shared/src/validators/work-product.ts). */
 export function prStatus(pr) {
   if (pr.state === "MERGED") return "merged";
@@ -114,6 +149,36 @@ export function prStatus(pr) {
   if (pr.state === "CLOSED") return "closed";
   if (pr.isDraft) return "draft";
   return "ready_for_review";
+}
+
+/**
+ * The row the webhook would have written. `repoFullName` comes from GitHub's
+ * own URL rather than the comment's: GitHub URLs are case-insensitive, but the
+ * webhook builds externalId from `repository.full_name`
+ * (services/pull-request-work-products.ts:49-50) and upsertByExternalId matches
+ * it by exact text — so a comment carrying `blockcast/paperclip/pull/1874`
+ * would leave a row the webhook cannot upsert, and it would insert a second one
+ * beside it. `ref.repo` stays the fallback: a row with the comment's casing
+ * beats no row.
+ */
+export function workProductBody(pr, ref) {
+  const repoFullName = repoFromUrl(pr.url) ?? ref.repo;
+  return {
+    type: "pull_request",
+    provider: "github",
+    externalId: `${repoFullName}#${ref.number}`,
+    title: pr.title,
+    url: pr.url,
+    status: prStatus(pr),
+    metadata: {
+      repoFullName,
+      prNumber: ref.number,
+      headSha: pr.headRefOid,
+      merged: pr.state === "MERGED",
+      mergedAt: pr.mergedAt ?? null,
+      backfilledAt: new Date().toISOString(),
+    },
+  };
 }
 
 let created = 0;
@@ -125,12 +190,9 @@ let writeFailed = 0;
 
 if (RUN) {
   for (const status of ["in_review", "blocked", "in_progress"]) {
-    const issues = asIssues(await j(`/companies/${CID}/issues?status=${status}&limit=${LIMIT}`));
-    // The list caps silently; saying so beats reporting partial coverage as total.
-    // Only sound on a key with `company_scope:read`: the route filters the page
-    // AFTER applying the cap (routes/issues.ts:8085-8088), so a scoped key turns a
-    // truncated page into a short one and this guard never fires.
-    if (issues.length >= LIMIT) console.warn(`WARNING: ${status} hit the ${LIMIT} cap — re-run after this pass`);
+    const issues = await listAllIssues((offset) =>
+      j(`/companies/${CID}/issues?status=${status}&limit=${LIMIT}&offset=${offset}`),
+    );
 
     for (const issue of issues) {
       const workProducts = await j(`/issues/${issue.id}/work-products`);
@@ -183,22 +245,7 @@ if (RUN) {
           continue;
         }
 
-        const body = {
-          type: "pull_request",
-          provider: "github",
-          externalId: `${ref.repo}#${ref.number}`,
-          title: pr.title,
-          url: pr.url,
-          status: prStatus(pr),
-          metadata: {
-            repoFullName: ref.repo,
-            prNumber: ref.number,
-            headSha: pr.headRefOid,
-            merged: pr.state === "MERGED",
-            mergedAt: pr.mergedAt ?? null,
-            backfilledAt: new Date().toISOString(),
-          },
-        };
+        const body = workProductBody(pr, ref);
 
         if (!APPLY) {
           console.log(`DRY-RUN ${issue.identifier} <- ${key} (${body.status})`);

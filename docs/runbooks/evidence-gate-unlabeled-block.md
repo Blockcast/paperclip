@@ -143,10 +143,12 @@ curl -sS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
 number.** The list route clamps to `ISSUE_LIST_MAX_LIMIT` (1000) and returns a
 **bare array**: no total, no cursor, and no truncation header
 (`server/src/services/issues.ts:7894-7902`). A full page is the only signal
-there is, which is why this is a row-count check and not a header check — the
-same check `scripts/ops/backfill-pr-work-products.mjs:133` makes for the same
-reason. A header guard here would never fire. It is also only trustworthy on a
-key with `company_scope:read` — see the precondition above.
+there is, which is why this is a row-count check and not a header check — a
+header guard here would never fire. The backfill script does not need this
+check at all: it pages the list itself
+(`scripts/ops/backfill-pr-work-products.mjs`, `listAllIssues`), which a `curl`
+one-liner cannot do without a loop. It is also only trustworthy on a key with
+`company_scope:read` — see the precondition above.
 
 Record it in BLO-3202. Then run the backfill — **it is dry-run by default**, so
 it takes two invocations and only the second one writes:
@@ -160,9 +162,12 @@ node scripts/ops/backfill-pr-work-products.mjs --apply    # write them
 type stripping; Node 20 throws `ERR_UNKNOWN_FILE_EXTENSION`). Read the
 `would-create=` count on the dry run and the `created=` count on the apply; if
 they disagree, something changed between the two passes. Then re-measure the
-count above and expect near zero. Re-measuring after the dry run alone returns
-the same number you started with — that is the script working as designed, not
-a broken backfill and not a baseline you can discharge.
+count above and expect near zero — **near, not zero**: the backfill's population
+is PRs referenced in issue *comments*, so an issue whose only PR link sits in its
+description stays `no-linked-pull-request` after a clean pass. That residue is
+in scope for the script, not a failed backfill. Re-measuring after the dry run
+alone returns the same number you started with — that is the script working as
+designed, not a broken backfill and not a baseline you can discharge.
 
 > **Two different literals, both real — do not "reconcile" them.** The verdict
 > array is `[...evaluation.diagnostics, ...truthDiagnostics]`
