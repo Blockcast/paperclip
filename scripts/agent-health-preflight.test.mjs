@@ -521,6 +521,34 @@ describe("census completeness is derived from observed coverage, not from the ke
     assert.equal(census.complete, true);
     assert.equal(census.counts["classification-producing"], 28);
   });
+
+  it("rejects a parseable but off-grid census end instead of reporting a healthy fleet silent", () => {
+    // The one input class that turns a HEALTHY census red. `placeWindowKey`
+    // rejects any row key off the six-hour grid, so an off-grid `end` generated
+    // 28 expected keys no emitter can produce: the same 28/28 row set that is
+    // `complete` on-grid reported `silent: 28` — the signature of the total
+    // outage this census exists to detect — for a fleet that is fine.
+    const onGrid = currentWindowEnd(Date.parse("2026-09-02T18:00:00.000Z"));
+    const rows = fullyCovered(onGrid);
+
+    // Control: the same rows, on-grid, are healthy.
+    const healthy = classifyRoutineRuns(rows, onGrid);
+    assert.equal(healthy.complete, true);
+    assert.equal(healthy.counts.silent, 0);
+
+    // Off by 13 minutes — parseable, wrong, and previously silent about it.
+    assert.throws(
+      () => classifyRoutineRuns(rows, "2026-08-31T07:13:00Z"),
+      /not on the six-hour grid/,
+    );
+    assert.throws(() => sevenDayWindowKeys("2026-08-31T07:13:00Z"), /not on the six-hour grid/);
+    // Sub-second drift is off-grid too: `windowKey` only ever emits whole seconds
+    // on the boundary, so anything else is a caller bug, not a fleet condition.
+    assert.throws(() => sevenDayWindowKeys("2026-08-31T06:00:00.001Z"), /not on the six-hour grid/);
+    // Unparseable keeps its own distinct message — the two failures are different
+    // caller bugs and must not collapse into one.
+    assert.throws(() => sevenDayWindowKeys("not-a-date"), /invalid census end: not-a-date/);
+  });
   it("treats a blank commentId as absent in BOTH receipt predicates", () => {
     // Ally's reproduction: inputs identical but for one field. A slot whose only
     // classifying row emitted nothing, and whose only emitting row did not
