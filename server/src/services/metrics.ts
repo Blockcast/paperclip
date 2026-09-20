@@ -3123,11 +3123,17 @@ function ensureRegistry(): {
     // form returns the LHS and fires either way. An alert consuming this must key on
     // `== 0` / `absent_over_time`, never on `unless ... > 0`.
     //
-    // The seed is unconditional here, so a process that registers these and never runs a
-    // loop would export a permanently-zero counter. Not live today (both loops are driven
-    // from the same recoveryService, single entrypoint), but gate an `== 0` stall alert on
-    // a job selector or on `paperclip_backstop_deferred_candidates > 0` so it stays true
-    // if that changes. Bounded: 2 sources x (1 gauge + 1 counter + 12 reasons) = 28 series.
+    // The seed is unconditional here, and the API tier registers these metrics without
+    // running either loop -- so after this change every api replica exports a
+    // permanently-zero completion counter. Measured 2026-09-20 on live Prometheus: the
+    // gauge is present on all 3 replicas, but `paperclip_backstop_candidates_skipped_total`
+    // exists on `paperclip-0` (`service="paperclip-workers"`) alone, and the two
+    // `paperclip-api-*` replicas sit at the seeded 0 for both sources. Run dispatch is
+    // already fenced on that tier (PAPERCLIP_NODE_ROLE=api, heartbeat.ts). So an `== 0`
+    // stall alert MUST be scoped -- `service="paperclip-workers"`, or gated on
+    // `paperclip_backstop_deferred_candidates > 0` -- or it pages forever against a tier
+    // that legitimately never sweeps. Bounded: 2 sources x (1 gauge + 1 counter + 12
+    // reasons) = 28 series.
     for (const source of BACKSTOP_SOURCES) {
       backstopDeferredCandidates.set({ source }, 0);
       backstopSweepCompleted.inc({ source }, 0);
