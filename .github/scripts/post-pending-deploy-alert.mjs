@@ -86,6 +86,7 @@
  */
 import { appendFileSync, readFileSync } from 'node:fs';
 import {
+  DEPLOY_WORKFLOW_FILE,
   createGitHubClient,
   renderEscalationComment,
   renderStallIssueBody,
@@ -192,15 +193,6 @@ export function selectStuckApproval({ pendingRuns, alertAfterHours, now, stallSt
   };
 }
 
-/**
- * The deploy workflow whose waiting-runs queue the alert points a human at.
- * Deliberately a local literal rather than an import from
- * supersede-stale-deploy.mjs: that module owns a `main()` that cancels
- * production deploys, and the alert path must stay importable without it. The
- * same string is already a literal in the description buildAlert renders.
- */
-export const DEPLOY_WORKFLOW_FILE = 'docker.yml';
-
 export function buildAlert({
   oldest,
   ageHours,
@@ -247,7 +239,7 @@ export function buildAlert({
         `${repo} production deploy has been awaiting human approval for ${hours}h — ` +
         'the daily dispatcher is a no-op until it clears',
       description:
-        `A docker.yml deploy has been parked on the ${environment} reviewer gate since ` +
+        `A ${DEPLOY_WORKFLOW_FILE} deploy has been parked on the ${environment} reviewer gate since ` +
         `${stallSince} (${hours}h; threshold ${alertAfterHours}h).\n\n` +
         "While it waits, scheduled-production-deploy.yml's anti-stacking guard skips every " +
         'daily slot, so production drift grows and each skipped run still reports ' +

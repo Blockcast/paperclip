@@ -3,11 +3,11 @@ import assert from 'node:assert/strict';
 import {
   ALERT_TTL_MS,
   DEFAULT_ALERT_AFTER_HOURS,
-  DEPLOY_WORKFLOW_FILE,
   UnreadableWaitingRunError,
   buildAlert,
   selectStuckApproval,
 } from '../post-pending-deploy-alert.mjs';
+import { DEPLOY_WORKFLOW_FILE } from '../deploy-stall-record.mjs';
 
 const NOW = new Date('2026-09-01T12:00:00.000Z');
 const waitingRun = (createdAt, extra = {}) => ({
