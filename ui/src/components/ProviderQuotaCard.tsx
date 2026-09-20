@@ -68,7 +68,13 @@ export function ProviderQuotaCard({
       costCents += r.costCents;
       apiRunCount += r.apiRunCount;
       subRunCount += r.subscriptionRunCount;
-      subInputTokens += r.subscriptionInputTokens + r.subscriptionCacheCreationInputTokens;
+      // The subscription counts are a parallel flat block rather than a nested
+      // BilledTokenCounts, so they are reshaped rather than re-added by hand —
+      // a second spelling of this sum is what BLO-29842 was fixing.
+      subInputTokens += promptTokens({
+        inputTokens: r.subscriptionInputTokens,
+        cacheCreationInputTokens: r.subscriptionCacheCreationInputTokens,
+      });
       subOutputTokens += r.subscriptionOutputTokens;
     }
     const totalTokens = inputTokens + outputTokens;
