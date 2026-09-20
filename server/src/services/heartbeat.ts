@@ -364,6 +364,7 @@ import {
 } from "./issue-tree-control.js";
 import { RUN_STALE_SILENCE_MS } from "./issue-run-holding.js";
 import { describeSharedCheckoutOccupancy } from "./shared-checkout-occupancy.js";
+import { resolveWorkspaceWriterTreeKey } from "./workspace-writer-key.js";
 import {
   countRunsOccupyingSlots,
   resolveAgentConcurrencyPolicy,
@@ -29027,47 +29028,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ? randomUUID()
             : null
         );
-    // BLO-31443: the writer reservation must exclude on the TREE this run will
-    // work in, not on the run. The literal `cwd` is unavailable here -- it needs
-    // `repoRoot` from a `git rev-parse` against `resolvedWorkspace.cwd`, which is
-    // not resolved until ~700 lines below, and the reservation has to be bound
-    // before the workspace is realized. Under `per_issue` runScope the resolved
-    // path is a pure function of the issue (identifier + title -> branch name ->
-    // directory, with no run input), so the issue IS the equivalence class of
-    // that path: keying on it collides exactly when two runs would share a tree.
-    //
-    // Scoped by `projectWorkspaceId` because one issue can hold trees in several
-    // repos of a multi-repo project, and those are genuinely independent.
-    //
-    // Two deliberate exclusions:
-    // - `per_run` runScope appends a run token to the branch, hence to the
-    //   directory, so those runs are already tree-unique and must NOT collide.
-    // - a stateless PR review is run-unique by construction and is filtered in
-    //   the resolver ahead of every other branch.
-    //
-    // Conservative in the one case where issue and path disagree: an issue
-    // retitled between runs resolves to a NEW directory while keeping its id, so
-    // this over-serializes rather than under-serializes. Serializing two runs
-    // that could have been parallel costs latency; letting two runs share one
-    // tree corrupts a checkout.
-    const perIssueWorkspaceTreeKey =
-      issueRef?.id &&
-      paperclipPrReview === null &&
-      !executionWorkspaceUsesPerRunScopeForIssue &&
-      (
-        workspaceIsolationRequested ||
-        workspaceReuseRequest.existingExecutionWorkspaceAvailable ||
-        executionWorkspaceUsesGitWorktree({
-          agentConfig: config,
-          projectPolicy: projectExecutionWorkspacePolicy,
-          issueSettings: issueExecutionWorkspaceSettings,
-          mode: requestedExecutionWorkspaceMode,
-          legacyUseProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null,
-          issueAdapterConfig: issueAssigneeOverrides?.adapterConfig ?? null,
-        })
-      )
-        ? `${issueRef.projectWorkspaceId ?? "no-project-workspace"}:${issueRef.id}`
-        : null;
+    // BLO-31443 / BLO-19422: the writer reservation must exclude on the TREE this
+    // run will work in, not on the run. The literal `cwd` is unavailable here --
+    // it needs `repoRoot` from a `git rev-parse` against `resolvedWorkspace.cwd`,
+    // which is not resolved until ~700 lines below, and the reservation has to be
+    // bound before the workspace is realized. So the key is derived from the
+    // equivalence class of that path instead; see `resolveWorkspaceWriterTreeKey`
+    // for which class applies to which shape and why.
+    const runResolvesToOwnTree =
+      workspaceIsolationRequested ||
+      workspaceReuseRequest.existingExecutionWorkspaceAvailable ||
+      executionWorkspaceUsesGitWorktree({
+        agentConfig: config,
+        projectPolicy: projectExecutionWorkspacePolicy,
+        issueSettings: issueExecutionWorkspaceSettings,
+        mode: requestedExecutionWorkspaceMode,
+        legacyUseProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null,
+        issueAdapterConfig: issueAssigneeOverrides?.adapterConfig ?? null,
+      });
+    const perIssueWorkspaceTreeKey = resolveWorkspaceWriterTreeKey({
+      statelessPrReview: paperclipPrReview !== null,
+      runResolvesToOwnTree,
+      usesPerRunScope: executionWorkspaceUsesPerRunScopeForIssue,
+      issue: issueRef
+        ? { id: issueRef.id ?? null, projectWorkspaceId: issueRef.projectWorkspaceId ?? null }
+        : null,
+    });
     const k8sIsolationIdentity = resolveK8sRunIsolationIdentity({
       adapterType: agent.adapterType,
       runId: run.id,
