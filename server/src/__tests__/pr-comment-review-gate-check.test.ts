@@ -40,6 +40,7 @@ vi.mock("../services/github-status-delivery-outbox.js", () => ({
   withGithubStatusDeliveryLock: mockStatusDeliveryLock,
 }));
 
+import { admitsNothingEvaluated } from "../../../scripts/check-comment-review-gate-census.mjs";
 import { runPrCommentReviewGateCheck } from "../services/pr-comment-review-gate.js";
 
 // `db` is required on the input: the gate takes the shared delivery lock
@@ -458,11 +459,10 @@ describe("retired status contexts", () => {
 
     const retired = postFor("review/ally-comment");
     expect(retired).toMatchObject({ sha: TARGET.headSha, state: "success" });
-    // This is what the census greps for. A retirement pointer that still
-    // admitted "nothing attests" would leave AC#1 failing under the old name.
-    expect(retired?.description).not.toMatch(
-      /no Ally consolidated-review comment attests|no head SHA was supplied/i,
-    );
+    // Pinned against the census's own predicate, not a copy of its regex: the
+    // copy went stale the moment the census grew a third alternative, leaving
+    // this guard narrower than the audit it exists to mirror.
+    expect(admitsNothingEvaluated(retired?.description)).toBe(false);
     expect(retired?.description).toContain("gate/ally-comment-findings");
     expect(retired?.description.length).toBeLessThanOrEqual(140);
   });
