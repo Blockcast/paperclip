@@ -10,6 +10,7 @@ import {
   extractAllyReviewedHeadSha,
   hasActionablePrReviewFeedback,
   hasAllyConsolidatedReviewHeading,
+  isConformingDispositionVerb,
 } from "../services/ally-review-detection.js";
 import {
   commentReviewGateCheckConclusion,
@@ -512,6 +513,55 @@ describe("evaluateCommentReviewGate", () => {
     // Positive control. Without it the assertions above would also pass on a
     // fixture the block parser never read at all — a false all-clear.
     expect(carriedFor("deferred").reason).toContain('unrecognized ledger verb "deferred"');
+  });
+
+  it("the publisher's alphabet is the parser's alphabet", () => {
+    // `[a-z][a-z-]*` is spelled TWICE in ally-review-detection.ts: once as the
+    // verb group of PRIOR_FINDING_DISPOSITION_PATTERN, once as
+    // DISPOSITION_VERB_PATTERN behind isConformingDispositionVerb. That is
+    // deliberate — the PEN-3157 pin in github-write-egress-scrub.test.ts reads
+    // the first out of the pattern's own SOURCE TEXT, so folding them into a
+    // shared constant makes a pure refactor read to that test as a widening of
+    // a security bound. This is what stops the two copies drifting instead.
+    //
+    // The bound only holds if the publisher's copy is no WIDER than the
+    // parser's: a verb the parser will extract from prose and the publisher
+    // then refuses is merely withheld, but the reverse is the PEN-3157 leak.
+    const verbs = [
+      "fixed",
+      "wontfix",
+      "not-reproducible",
+      "a",
+      "fixed (partially)",
+      "Fixed",
+      "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+      "AKIAIOSFODNN7EXAMPLE",
+      "eyJhbGciOiJIUzI1NiJ9",
+      "-leading",
+      "fixed1",
+      "fixed_ok",
+      "",
+    ];
+
+    for (const verb of verbs) {
+      // Drive the real prose parser rather than re-spelling its regex here.
+      const body = [
+        "## Ally — Consolidated PR Review",
+        `- **prior:731ced5 important 1** — ${verb} — note.`,
+      ].join("\n");
+      const parserAdmits = extractAllyPriorFindingDispositions(body).some(
+        (entry) => entry.disposition === verb,
+      );
+      expect(
+        isConformingDispositionVerb(verb),
+        `publisher vs parser disagree on ${JSON.stringify(verb)}`,
+      ).toBe(parserAdmits);
+    }
+
+    // Positive control: the corpus must actually exercise both answers, or the
+    // loop above passes on a corpus that is entirely one-sided.
+    expect(verbs.filter((v) => isConformingDispositionVerb(v)).length).toBeGreaterThan(0);
+    expect(verbs.filter((v) => !isConformingDispositionVerb(v)).length).toBeGreaterThan(0);
   });
 
   it("keeps the ordinary reason when no unrecognized verb is involved", () => {

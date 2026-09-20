@@ -667,8 +667,14 @@ function hasNonNegatedMatch(text: string, pattern: RegExp): boolean {
   return false;
 }
 
-// The alphabet a prose ledger entry may spell its verb in — the single source
-// for the pattern below and for isConformingDispositionVerb.
+// The alphabet a prose ledger entry may spell its verb in. Deliberately a
+// SECOND literal copy of the verb group in PRIOR_FINDING_DISPOSITION_PATTERN
+// below, rather than a shared constant: the PEN-3157 pin in
+// github-write-egress-scrub.test.ts reads `([a-z][a-z-]*)` out of that
+// pattern's own source text, so interpolating a constant there makes a
+// refactor read as a widening of a security bound. The two copies cannot drift
+// — "the publisher's alphabet is the parser's alphabet" in
+// pr-comment-review-gate.test.ts holds them equal.
 //
 // The structured block deliberately does NOT enforce it. An unknown verb
 // already fails closed as `unrecognized`, so rejecting the whole block over a
@@ -680,8 +686,7 @@ function hasNonNegatedMatch(text: string, pattern: RegExp): boolean {
 //
 // What the alphabet is needed for is publication: see
 // isConformingDispositionVerb.
-const DISPOSITION_VERB_ALPHABET = String.raw`[a-z][a-z-]*`;
-const DISPOSITION_VERB_PATTERN = new RegExp(`^${DISPOSITION_VERB_ALPHABET}$`);
+const DISPOSITION_VERB_PATTERN = /^[a-z][a-z-]*$/;
 
 /**
  * May this verb be quoted into a public commit-status description?
@@ -714,8 +719,11 @@ export function isConformingDispositionVerb(verb: string): boolean {
 // ledger entries across the 40 most recent PRs' Ally reviews are unindented,
 // so the bound excludes no observed real entry; and an entry it did exclude
 // would leave a visible red rather than a silent green.
+//
+// The `([a-z][a-z-]*)` verb group is pinned as source text by the PEN-3157
+// test in github-write-egress-scrub.test.ts — keep it literal here.
 const PRIOR_FINDING_DISPOSITION_PATTERN = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE} {0,3}-[ \t]*\*\*[ \t]*prior:([0-9a-f]{7,40})[ \t]+([a-z]+)[ \t]+(\d+)[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*(${DISPOSITION_VERB_ALPHABET})[ \t]*(?:—|–|-)`,
+  String.raw`^${NOT_INDENTED_CODE} {0,3}-[ \t]*\*\*[ \t]*prior:([0-9a-f]{7,40})[ \t]+([a-z]+)[ \t]+(\d+)[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*([a-z][a-z-]*)[ \t]*(?:—|–|-)`,
   "gim",
 );
 
