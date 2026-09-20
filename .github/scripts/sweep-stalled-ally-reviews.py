@@ -223,10 +223,13 @@ ALLY_REQUEST_REVIEWER_LOGIN = os.environ.get("ALLY_REQUEST_REVIEWER_LOGIN") or "
 #     > 18h:  11/232 = 4.7%  |   > 22h (ALARM): ~3% ESTIMATED
 #
 # The ALARM cell is the one soft number here -- estimated, not counted, which
-# is why it is the only cell without an exact numerator. Do not reason from it
-# against the counted cells; ~3% of 232 is ~7, which is not reconcilable with
-# any count in this table. Give it its numerator on the next full re-run of
-# the reproduction below, and delete this note when you do.
+# is why it is the only cell without an exact numerator. It is not unbounded,
+# though, and the bound is what to reason from: the table is a survival
+# function, so `> 22h` is a SUBSET of `> 18h` and is therefore at most 11/232
+# = 4.7%. The ~3% only estimates where inside that band it falls. Quote the
+# 4.7% when the number has to carry weight -- it is counted and reproducible
+# from the cells as printed. Give the cell its own numerator on the next full
+# re-run of the reproduction below, and delete this note when you do.
 #
 # So 8h breached on 19.4% of HEALTHY reviews -- against an acceptance
 # criterion of under ~10%. Measured against dispatch wait the same value
@@ -336,11 +339,14 @@ MAX_REFIRES_PER_RUN = int(os.environ.get("MAX_REFIRES_PER_RUN") or 5)
 # landing on it. Either way the property the margin buys holds: "at least one
 # full re-fire AND its cooldown have come and gone", and at 1320m both (1140m,
 # 1260m) are strictly in the past. Kept as a formula so it tracks STALL
-# automatically; the 22h it yields breaches ~3% of the healthy head-landed ->
-# review distribution recorded above STALL_THRESHOLD_SECONDS (p90 12.70h, max
-# 30.81h), so a normally-queued PR no longer alarms. Before BLO-34521 it was
-# 330m, INSIDE the normal distribution -- and the 12h an earlier revision of
-# this same fix yielded was still inside it, at ~11%.
+# automatically; the 22h it yields sits above 18h, which the table above
+# STALL_THRESHOLD_SECONDS bounds at 11/232 = 4.7% of the healthy head-landed
+# -> review distribution (p90 12.70h, max 30.81h). So a normally-queued PR no
+# longer alarms, and that rests on a counted ceiling rather than on the one
+# estimated cell in the table (which puts 22h at ~3% inside that band).
+# Before BLO-34521 it was 330m, INSIDE the normal distribution -- and the 12h
+# an earlier revision of this same fix yielded was still inside it: the same
+# table brackets 12h between `> 18h` 4.7% and `> 8h` 19.4%, estimated ~11%.
 ALARM_THRESHOLD_SECONDS = int(
     os.environ.get("ALARM_THRESHOLD_SECONDS") or (STALL_THRESHOLD_SECONDS + REFIRE_COOLDOWN_SECONDS + 2 * 60 * 60)
 )
@@ -828,15 +834,23 @@ def too_young_to_be_stranded(pr_payload, now):
 
     Call volume is the binding constraint on this job, not correctness: in
     `status-free` mode every non-draft PR costs at least three requests (head
-    commit + comments page + reviews page). Re-measured 2026-09-18T22:55Z on
-    this repo (BLO-34521): 110 non-draft unlocked open PRs of 116 open is
-    ~330 requests per run. The half-hourly `9,39 * * * *` cadence this
-    paragraph was written against would have made that ~660 requests/hour
-    from this job alone, against `github.token`'s documented budget of
-    1,000/hour/repository -- shared with every other workflow here, so
-    exhaustion would have been the steady state rather than an edge case.
-    That is why review-gate-sweep.yml now runs hourly; see the rate-limit
-    arithmetic there, which also records what this cut is currently worth.
+    commit + comments page + reviews page), and this repo's open-PR backlog
+    puts that in the hundreds per run against `github.token`'s documented
+    budget of 1,000/hour/repository -- shared with every other workflow here,
+    so at the half-hourly `9,39 * * * *` cadence this paragraph was written
+    against, exhaustion would have been the steady state rather than an edge
+    case. That is why review-gate-sweep.yml now runs hourly.
+
+    The measured figures live THERE, in one dated snapshot: requests per run,
+    and what this cut is currently worth. Note the table splits it in two --
+    this function is STAGE 1, saving all 3 requests on the PRs it proves
+    young from `created_at` alone; `_consider_pr`'s post-head-fetch early
+    return is stage 2, saving the remaining 2 on the PRs only
+    `committer_date` proves young. Quoting either stage as the whole cut gets
+    the saving wrong in one direction or the other. Deliberately not copied
+    here -- the
+    second copy is the thing that drifts, and that file's own rule is
+    `re-measure the whole table or none of it`.
 
     The cheap proof: `unreviewed_since` returns `max(created_at,
     committer_date)` (each clamped to `now`), so `pending_since >=
