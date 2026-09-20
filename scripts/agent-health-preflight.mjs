@@ -588,10 +588,14 @@ export function runMandatoryFixtures() {
   const decompositionPct = percentIncrease(1, decomposition);
   // Derived from the SAME array the cumulative reads — see maxStepPercent.
   const maxStepPct = maxStepPercent(decompositionSteps);
+  // Both halves are two-sided. A bare `maxStepPct < 25` is satisfied by a
+  // `maxStepPercent` stubbed to 0, so the per-step claim passed under a
+  // production mutation the fixture gate could not see — the tests caught it,
+  // the gate did not (Ally review, PR #1571).
   const capRaisePass =
     Math.round(ctoPct) === 190 && ctoPct > 25
     && Math.round(multicastPct) === 165 && multicastPct > 25
-    && decompositionPct > 25 && maxStepPct < 25;
+    && decompositionPct > 25 && Math.round(maxStepPct) === 8 && maxStepPct < 25;
   fixtures.push(fixture(
     V4_FIXTURE_MANIFEST[5],
     capRaisePass,
