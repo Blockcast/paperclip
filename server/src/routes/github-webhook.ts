@@ -80,6 +80,7 @@ import {
   type ListPrReviewsForAttestation,
 } from "../services/pr-review-head-attestation.js";
 import {
+  extractAllyReviewedHeadSha,
   hasActionablePrReviewFeedback,
   hasAllyConsolidatedReviewHeading,
 } from "../services/ally-review-detection.js";
@@ -317,10 +318,6 @@ function isConfiguredPrReviewerAuthor(
   const configured = normalizeGithubLogin(configuredLogin || DEFAULT_PR_REVIEWER_BOT_LOGIN);
   if (configured && normalizedLogin === configured) return true;
   return normalizedLogin === "ally" || normalizedLogin === "allyblockcast" || normalizedLogin === "blockcast-ci-packages";
-}
-
-function hasAllyConsolidatedReviewHeader(body: string | null | undefined): boolean {
-  return typeof body === "string" && /\bAlly\s*(?:—|-|:)\s*Consolidated\s+PR\s+Review\b/i.test(body);
 }
 
 // Explicit "a Paperclip agent is asking for review" marker (BLO-18865).
@@ -572,22 +569,38 @@ function isClaudeCodeReviewServiceNotice(
   return !hasActionablePrReviewFeedback(rawBody, state);
 }
 
-// PEN-3383: a genuine comment-shaped review carries review STRUCTURE. This is
-// the second admission signal beside the consolidated header, so a template
-// change to one cannot silently suppress every comment-shaped review at once.
+// PEN-3383: a genuine comment-shaped review carries review STRUCTURE. Two
+// independent signals, so a template change to one cannot silently suppress
+// every comment-shaped review at once.
 //
-// Deliberately NOT anchored to the start of the body, and that is measured, not
-// stylistic: of the two genuine Ally reviews in the corpus below, one
-// (paperclip#1877 comment 5686789134) opens "_Supplementary pass — a concurrent
-// Ally run already submitted the operative verdict_" and carries its header
-// mid-body. Anchoring the way PR_REVIEWER_AGENT_REQUEST_MARKER_PATTERN does
-// would drop it. The cost of staying un-anchored is that a reply QUOTING a
-// review header still qualifies; that is accepted here because the conjunct
-// with hasActionablePrReviewFeedback already bounds it, and because the
-// fail-open direction is the safe one for a review-delivery path.
+// Both are reused from ally-review-detection rather than re-derived here, and
+// that is the correction of record for this predicate. The first cut hand-rolled
+// a bare substring test and a `Reviewed head:` regex, which left the residual
+// this issue exists to close: a reply QUOTING a review — the single most common
+// shape of a reply-to-review — still qualified. Measured on the real bodies:
+//
+//   quoted in a ```markdown fence  hand-rolled true  / shared false (actionable)
+//   4-space-indented paste          hand-rolled true  / shared false
+//   `> Reviewed head:` blockquote   hand-rolled true  / shared false
+//   bare label, no SHA at all       hand-rolled true  / shared false
+//
+// The fenced row is the one that matters: it is also hasActionablePrReviewFeedback
+// true, so under the hand-rolled predicate it produced a real self-wake. That
+// conjunct cannot bound the fenced case, because a fence is precisely what
+// defeats it — onprem-k8s#3672 5740414507 was actionable SOLELY because of one.
+//
+// The shared helpers fence-strip, share NOT_INDENTED_CODE, and require exactly
+// one standalone full 40-hex attestation ("an absent or ambiguous attestation
+// must not be guessed at"), so they also keep the BLO-31730 emphasis forms the
+// hand-rolled regex dropped — looser on evasion AND tighter on genuine forms was
+// strictly the wrong trade.
+//
+// Anchoring was never the dichotomy the first cut assumed. hasAllyConsolidatedReviewHeading
+// is LINE-anchored (`im`), not body-anchored like PR_REVIEWER_AGENT_REQUEST_MARKER_PATTERN,
+// so paperclip#1877 comment 5686789134 — a genuine review opening with prose and
+// carrying its header mid-body — still passes. Verified against that exact body.
 function isReviewShapedPrComment(body: string | null | undefined): boolean {
-  if (hasAllyConsolidatedReviewHeader(body)) return true;
-  return typeof body === "string" && /^[ \t>]*(?:\*\*)?Reviewed\s+head(?:\s+SHA)?(?:\*\*)?[ \t]*:/im.test(body);
+  return hasAllyConsolidatedReviewHeading(body) || extractAllyReviewedHeadSha(body) !== null;
 }
 
 type PrReviewCommentVerdict =
@@ -604,9 +617,10 @@ type PrReviewCommentVerdict =
 // an agent's own reply to that review (the shared-seat fact already documented
 // at PR_REVIEWER_AGENT_REQUEST_MARKER_PATTERN, which is why the REQUEST path
 // needs a marker). This predicate used to accept
-// `isConfiguredPrReviewerAuthor(...) || hasAllyConsolidatedReviewHeader(body)`,
-// so for the App seat the identity clause short-circuited and the verdict
-// reduced to hasActionablePrReviewFeedback on the raw body alone.
+// `isConfiguredPrReviewerAuthor(...) || <a bare substring test for the
+// consolidated header>`, so for the App seat the identity clause
+// short-circuited and the verdict reduced to hasActionablePrReviewFeedback on
+// the raw body alone.
 //
 // That predicate deliberately reads the RAW body as well as the fence-stripped
 // one and blocks if either matches, because for a REVIEW a quoted finding is a
@@ -1656,8 +1670,8 @@ function resolveEventContextRaw(
         //
         // Keyed on the GUARDED classification, not on the parsed marker. A
         // marker-led body that is also actionable feedback (reachable from any
-        // author: hasAllyConsolidatedReviewHeader is un-anchored and carries no
-        // author requirement) resolves as `github_pr_review_feedback`, and on
+        // author: isReviewShapedPrComment is line-anchored but carries no author
+        // requirement) resolves as `github_pr_review_feedback`, and on
         // that path the head must come from the live-head lookup in the route
         // (`resolvePrReviewHeadSha`), which only runs when `headSha` is absent.
         // Spreading the marker head here would hand a comment-body-supplied SHA
@@ -4935,7 +4949,8 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       // REAL escalation is now being dropped. The second is precisely the
       // silence this row was opened about, so it cannot be logged at a level
       // anyone filters out.
-      onSuppressedEscalationAuthor: (info) => {        logger.warn(
+      onSuppressedEscalationAuthor: (info) => {
+        logger.warn(
           {
             event: eventName,
             deliveryId,
@@ -6680,7 +6695,6 @@ export const __test_extractPaperclipIdentifiers = extractPaperclipIdentifiers;
 export const __test_hasPrReviewerRequestMention = hasPrReviewerRequestMention;
 export const __test_hasPrReviewerAgentRequestMarker = hasPrReviewerAgentRequestMarker;
 export const __test_hasAllyConsolidatedReviewHeading = hasAllyConsolidatedReviewHeading;
-export const __test_hasAllyConsolidatedReviewHeader = hasAllyConsolidatedReviewHeader;
 export const __test_verifyGithubSignature = verifyGithubSignature;
 export const __test_resolveEventContext = resolveEventContext;
 export const __test_shouldFirePrReviewerWake = shouldFirePrReviewerWake;
