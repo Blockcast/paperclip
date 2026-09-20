@@ -830,32 +830,43 @@ def refire_still_permitted(owner, repo, number, head_sha, token, api_base_url, n
 
     ORDERING. Two axes, and they pull against each other:
 
-    - By COST, so a paid read is only reached when the free checks have passed.
-      The comment surface and the cooldown are both free (the comments are
-      already in hand); only the reviews surface costs a request. That cost is
-      bounded by the number of PRs that pass both free checks -- NOT by
-      MAX_REFIRES_PER_RUN, because a write this guard withholds leaves its
-      budget slot free (see sweep()) -- against a 1,000/hour budget.
-    - By VERDICT QUALITY among the free checks, which is why the comment
-      surface runs BEFORE the cooldown even though either could. When both
-      fire, they disagree about what the PR *is*: the cooldown says "someone
-      re-asked recently" (contended -- keep pending_since, may alarm) and the
-      comment surface says "Ally answered THIS head" (answered -- not stranded
-      at all). Both withhold the write, so the write suppression is unaffected
-      either way; what differs is that cooldown-first returns
-      REREAD_SKIP_REASON_PREFIX, so _consider_pr takes the contended branch,
-      keeps pending_since, and an answered PR alarms and is filed under
-      "contended" in the step summary -- pointing an operator at a concurrency
-      problem on a PR that is simply answered. Answered is both the more
-      specific and the more accurate fact, so it wins. Pinned by
-      test_a_compound_skip_reports_answered_not_contended; nothing else does.
+    - By VERDICT QUALITY, which wins: BOTH answered checks run before the
+      cooldown. When an answered check and the cooldown both fire, they
+      disagree about what the PR *is*: the cooldown says "someone re-asked
+      recently" (contended -- keep pending_since, may alarm) and an answered
+      check says "Ally answered THIS head" (answered -- not stranded at all).
+      Both withhold the write, so write suppression is unaffected either way;
+      what differs is that cooldown-first returns REREAD_SKIP_REASON_PREFIX,
+      so _consider_pr takes the contended branch, keeps pending_since, and an
+      answered PR alarms and is filed under "contended" in the step summary --
+      pointing an operator at a concurrency problem on a PR that is simply
+      answered. Answered is both the more specific and the more accurate fact,
+      so it wins on BOTH surfaces. Pinned by
+      test_a_compound_skip_reports_answered_not_contended and
+      test_a_reviews_surface_compound_skip_reports_answered_not_contended;
+      nothing else does.
+    - By COST, applied only *within* the answered checks: the comment surface
+      is free (the comments are already in hand) and runs first, so it
+      short-circuits the one paid read. Putting the reviews read ahead of the
+      cooldown means the cooldown-blocked path now pays that request too --
+      but that path is, by construction, the rare one. should_refire already
+      applied the cooldown at scan time, so for it to block again here a
+      marker must have landed in the scan->write gap: a concurrent sweep or a
+      hand re-ask, which is the very race this guard exists for. The cost is
+      bounded by that set -- NOT by MAX_REFIRES_PER_RUN, because a write this
+      guard withholds leaves its budget slot free (see sweep()) -- against a
+      1,000/hour budget.
 
-    That ordering covers the COMMENT surface only, and deliberately so. A
-    contended PR answered solely on the REVIEWS surface still alarms, because
-    that read is paid and is correctly short-circuited once the cooldown
-    blocks. Closing that half would spend a request on a rare path -- Ally
-    answering off-cadence, on the surface it uses less often, inside the
-    cooldown window -- and is not worth it. Stated, not fixed.
+    Why the reviews surface is not the cheap half to skip: measured across the
+    45 most recent PRs in this repo on 2026-09-20, 34 carried an Ally
+    consolidated report and the split was 57 on the REVIEWS surface and 0 on
+    the comment surface. An earlier revision of this docstring asserted the
+    opposite -- that the comment surface was the one Ally most often answers
+    on -- and used it to justify leaving the reviews half unfixed. That claim
+    was never measured and is wrong: leaving it out addressed the surface
+    responsible for 0 of 57 observed answers. Both surfaces are still checked,
+    because neither is sufficient alone (verified live 2026-08-04: #952 had 4
+    comment-shaped reviews and an EMPTY pulls/952/reviews, #937 the reverse).
 
     The check is deliberately head-exact, not "has Ally reviewed at all".
     ally_has_reviewed_head demands a consolidated report attesting THIS head,
@@ -886,23 +897,23 @@ def refire_still_permitted(owner, repo, number, head_sha, token, api_base_url, n
     comments = _fetch_paginated(
         api_base_url, "/repos/%s/%s/issues/%d/comments" % (owner, repo, number), token
     )
-    # Comment surface BEFORE the cooldown. Both are free -- the comments are in
-    # hand for either -- so this costs nothing, and the order is load-bearing
-    # when BOTH fire at once (see ORDERING above): answered must win, because
-    # cooldown-first sends an answered PR down the contended branch, which
-    # keeps pending_since and alarms. Passing [] for reviews is a genuine
-    # single-surface test: ally_has_reviewed_head scans the two lists
-    # independently.
+    # BOTH answered checks run before the cooldown (see ORDERING above):
+    # answered must win over contended, because cooldown-first sends an
+    # answered PR down the contended branch, which keeps pending_since and
+    # alarms. Free before paid within that: the comments are already fetched
+    # immediately above, so this check costs nothing by construction. Passing
+    # [] for reviews is a genuine single-surface test: ally_has_reviewed_head
+    # scans the two lists independently.
     if ally_has_reviewed_head([], comments, head_sha, ALLY_REVIEWER_LOGINS):
         return False, "consolidated report on the comment surface", REVIEWED_SKIP_REASON_PREFIX
-    blocked, reason = cooldown_blocks_refire(marker_epochs_from_comments(comments), now)
-    if blocked:
-        return False, reason, REREAD_SKIP_REASON_PREFIX
     reviews = _fetch_paginated(
         api_base_url, "/repos/%s/%s/pulls/%d/reviews" % (owner, repo, number), token
     )
     if ally_has_reviewed_head(reviews, [], head_sha, ALLY_REVIEWER_LOGINS):
         return False, "consolidated report on the reviews surface", REVIEWED_SKIP_REASON_PREFIX
+    blocked, reason = cooldown_blocks_refire(marker_epochs_from_comments(comments), now)
+    if blocked:
+        return False, reason, REREAD_SKIP_REASON_PREFIX
     return True, None, None
 
 
@@ -1183,13 +1194,13 @@ def _consider_pr(owner, repo, pr, token, api_base_url, now, may_refire=True, dry
                 # pending_since on purpose -- that PR genuinely is still
                 # waiting, and must still be able to alarm.
                 #
-                # Narrowed, not absolute: the guard runs the free comment
-                # surface before the cooldown so an answered-AND-contended PR
-                # reaches HERE rather than the contended branch (see
-                # refire_still_permitted's ORDERING). A PR answered only on the
-                # REVIEWS surface while the cooldown blocks still lands on the
-                # contended branch and alarms, because that read is paid and is
-                # correctly skipped once the cooldown has already declined.
+                # Both surfaces reach HERE rather than the contended branch:
+                # the guard runs the comment AND reviews answered-checks ahead
+                # of the cooldown (see refire_still_permitted's ORDERING), so
+                # an answered-AND-contended PR is reported as answered however
+                # Ally replied. That matters because the reviews surface is
+                # the one Ally actually uses -- 57 of 57 observed reports,
+                # measured 2026-09-20.
                 pending_since = None
             return (pr, head_sha, pending_since, False, "%s -- %s" % (prefix, withheld))
         requested = request_review(owner, repo, number, token, api_base_url)
