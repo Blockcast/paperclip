@@ -341,6 +341,17 @@ function structuredVerdict(rawText) {
   const stillPresent = stillPresentIn(parsed?.dispositions);
   if (counts === null || stillPresent === null) return { kind: "unreadable" };
   if (proseCountContradicts(text, counts)) return { kind: "unreadable" };
+  // The same rule on the other field, mirroring proseDispositionContradicting
+  // in ally-review-detection.ts. `structuredBlocking(body, "stillPresent") ??
+  // hasStillPresentDisposition(body)` in reportsStillPresent gives the block
+  // precedence, so a block stating no standing prior finding suppressed the
+  // prose ledger entirely — this reader carried the identical fail-open the
+  // gate did.
+  //
+  // Asymmetric like the count rule: only a *blocking* prose entry against a
+  // block that retires everything is fatal, so `stillPresent` true short-
+  // circuits and a `fixed` prose entry the block omits still reads clean.
+  if (!stillPresent && hasStillPresentDisposition(text)) return { kind: "unreadable" };
   return {
     kind: "ok",
     head: head.trim().toLowerCase(),

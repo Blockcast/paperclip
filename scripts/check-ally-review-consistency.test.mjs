@@ -334,6 +334,39 @@ describe("attestedHead", () => {
       assert.equal(attestedHead(counted('{"critical":0,"important":0}', prose)), HEAD, prose);
     }
   });
+
+  // Peer review of #1721, Important at 1d6f3785 — the same rule on the other
+  // field. `structuredBlocking(body, "stillPresent") ?? hasStillPresentDisposition(body)`
+  // gives the block precedence, so a block retiring everything suppressed a
+  // prose ledger entry saying a prior finding stands. Identical fail-open to
+  // the gate's, in the reader whose job is to notice the gate's.
+  const ledgered = (dispositions, verb) =>
+    [
+      `<!-- ally-verdict:1\n{"head":"${HEAD}","findings":{"critical":0,"important":0}${dispositions}}\n-->`,
+      "",
+      "## Ally — Consolidated PR Review",
+      "### Critical Issues (0)",
+      `- **prior:abc1234 critical 1** — ${verb} — the guard is unchanged.`,
+    ].join("\n");
+
+  it("fails closed when a prose ledger still stands against a block retiring everything", () => {
+    for (const dispositions of ["", ',"dispositions":[]']) {
+      assert.equal(attestedHead(ledgered(dispositions, "still-present")), null, dispositions || "absent");
+    }
+  });
+
+  it("control: a prose ledger that only retires still attests", () => {
+    // Keeps this a fail-closed rule rather than a widening: a `fixed` entry
+    // the block omits clears either way, so reddening it buys nothing.
+    assert.equal(attestedHead(ledgered(',"dispositions":[]', "fixed")), HEAD);
+  });
+
+  it("control: a block that already carries the standing entry still attests", () => {
+    // It blocks — but as a structured verdict, not as an unreadable one, or
+    // every contract-compliant still-present review reads broken.
+    const dispositions = ',"dispositions":[{"head":"abc1234","severity":"critical","index":1,"verb":"still-present"}]';
+    assert.equal(attestedHead(ledgered(dispositions, "still-present")), HEAD);
+  });
 });
 
 describe("operativeAllyReviews", () => {

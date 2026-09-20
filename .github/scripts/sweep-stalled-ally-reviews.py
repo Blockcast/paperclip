@@ -153,6 +153,31 @@ EMITTED_BUCKET_PATTERN = re.compile(
     r"(Critical|Important)[ \t]+Issues[ \t]*[*_]{0,3}[ \t]*\(([0-9]+)\)[*_]{0,3}[ \t]*$",
     re.IGNORECASE | re.MULTILINE | ASCII_RE,
 )
+
+# A prose ledger entry, e.g. `- **prior:abc1234 critical 1** - still-present -`.
+# Composed character-for-character as PRIOR_FINDING_DISPOSITION_PATTERN in
+# ally-review-detection.ts, including the `(?! *\t)(?! {4})` indentation bound
+# and the em/en/hyphen alternation. `[0-9]` rather than `\d` for the reason
+# given at EMITTED_BUCKET_PATTERN, and the harm runs the same way here: a
+# Unicode digit is no ledger entry at all to the JS readers, so widening it
+# would send this sweep to re-request a review Ally already gave.
+#
+# Strict rather than reusing the looser `**prior:[^\n]***` form in
+# check-ally-review-consistency.mjs. That reader is an auditor, where
+# over-matching costs a reported violation; here it costs a duplicate review
+# request, which is the BLO-22892/BLO-28203 loop.
+PRIOR_FINDING_DISPOSITION_PATTERN = re.compile(
+    r"^(?! *\t)(?! {4}) {0,3}-[ \t]*\*\*[ \t]*prior:[0-9a-f]{7,40}[ \t]+[a-z]+[ \t]+[0-9]+"
+    r"[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*([a-z][a-z-]*)[ \t]*(?:—|–|-)",
+    re.IGNORECASE | re.MULTILINE | ASCII_RE,
+)
+
+# The verb that asserts a prior finding still stands. Mirrors
+# BLOCKING_PRIOR_DISPOSITIONS in check-ally-review-consistency.mjs and the
+# `blocks` arm of classifyPriorDisposition in ally-review-detection.ts. An
+# unrecognized verb is deliberately not blocking in any of the three.
+BLOCKING_PRIOR_DISPOSITIONS = frozenset(("still-present",))
+
 FENCE_OPEN_PATTERN = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$", ASCII_RE)
 FENCE_CLOSE_PATTERN = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$", ASCII_RE)
 
@@ -343,6 +368,31 @@ def prose_count_contradicts(text, counts):
             return True
     return False
 
+
+def prose_disposition_contradicts(text, payload):
+    """A prose ledger entry that still stands against a block retiring them all.
+
+    Mirrors proseDispositionContradicting in ally-review-detection.ts. The gate
+    reads `dispositions` for a blocking verb exactly as it reads `findings` for
+    a non-zero count, so a block whose ledger is absent, `[]`, or merely missing
+    the entry suppresses a prose entry saying a prior finding stands. Without
+    this the gate goes red on `unreadable_verdict` while this sweep sees a
+    review that already happened and never re-requests the one that would clear
+    it -- the same asymmetry the `findings` check above exists for.
+
+    Asymmetric like that one: a block already carrying a blocking verb cannot
+    fail open, so the prose is not consulted, and a prose entry that only
+    retires clears either way.
+    """
+    for entry in payload.get("dispositions") or ():
+        verb = entry.get("verb") if isinstance(entry, dict) else None
+        if isinstance(verb, str) and js_trim(verb).lower() in BLOCKING_PRIOR_DISPOSITIONS:
+            return False
+    for verb in PRIOR_FINDING_DISPOSITION_PATTERN.findall(without_fenced_spans(text)):
+        if verb.lower() in BLOCKING_PRIOR_DISPOSITIONS:
+            return True
+    return False
+
 # Same latitude the previous `startswith("## Ally") and "Consolidated PR Review"
 # in body` pair allowed, minus the first-byte anchor.
 CONSOLIDATED_HEADING_PATTERN = re.compile(
@@ -413,6 +463,9 @@ def parse_verdict_block_head(body):
     if not dispositions_ok(parsed):
         return ("unreadable", None)
     if prose_count_contradicts(text, counts):
+        return ("unreadable", None)
+    # The same rule on the other field the payload carries.
+    if prose_disposition_contradicts(text, parsed):
         return ("unreadable", None)
     return ("ok", js_trim(head).lower())
 

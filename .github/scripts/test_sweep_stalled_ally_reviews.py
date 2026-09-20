@@ -1199,6 +1199,80 @@ class TestVerdictCountsMirrorTheGate(unittest.TestCase):
             self.assertIsNone(sweep.parse_reviewed_head(self.body(findings)), findings)
 
 
+class TestVerdictLedgerMirrorsTheGate(unittest.TestCase):
+    """Peer review of #1721 at 1d6f3785 -- the count rule's twin on the other
+    field the gate decides from.
+
+    `carriesBlockingFeedback` reads `dispositions` for a blocking verb exactly
+    as it reads `findings` for a non-zero count, so a block whose ledger is
+    absent, `[]`, or merely missing the entry suppressed a prose ledger entry
+    saying a prior finding still stands. Same asymmetry as the counts class
+    above: the gate goes red on `unreadable_verdict` and this sweep is the only
+    automatic route back, so a divergence here leaves the red with no escape.
+    """
+
+    HEAD = "e" * 40
+
+    def body(self, dispositions, verb):
+        return "\n".join(
+            [
+                '<!-- ally-verdict:1\n{"head":"%s","findings":{"critical":0,"important":0}%s}\n-->'
+                % (self.HEAD, dispositions),
+                "",
+                "## Ally — Consolidated PR Review",
+                "### Critical Issues (0)",
+                "- **prior:abc1234 critical 1** — %s — the guard is unchanged." % verb,
+            ]
+        )
+
+    def test_a_standing_prose_ledger_against_a_block_retiring_everything(self):
+        for dispositions in ("", ',"dispositions":[]'):
+            self.assertIsNone(
+                sweep.parse_reviewed_head(self.body(dispositions, "still-present")),
+                dispositions or "absent",
+            )
+
+    def test_a_partially_drifted_ledger_is_the_same_hole(self):
+        dispositions = ',"dispositions":[{"head":"abc1234","severity":"important","index":1,"verb":"fixed"}]'
+        self.assertIsNone(sweep.parse_reviewed_head(self.body(dispositions, "still-present")))
+
+    def test_control_a_prose_ledger_that_only_retires_still_attests(self):
+        # Keeps this fail-closed rather than a widening: a `fixed` entry the
+        # block omits clears either way, so reddening it buys nothing and costs
+        # the #1675 direction.
+        self.assertEqual(
+            sweep.parse_reviewed_head(self.body(',"dispositions":[]', "fixed")), self.HEAD
+        )
+
+    def test_control_a_block_carrying_the_standing_entry_still_attests(self):
+        dispositions = (
+            ',"dispositions":[{"head":"abc1234","severity":"critical","index":1,'
+            '"verb":"still-present"}]'
+        )
+        self.assertEqual(
+            sweep.parse_reviewed_head(self.body(dispositions, "still-present")), self.HEAD
+        )
+
+    def test_a_quoted_or_fenced_ledger_does_not_fail_it_closed(self):
+        # Over-matching here re-requests a review Ally already gave, which is
+        # the duplicate-COMMENTED loop this file exists downstream of.
+        for quoted in (
+            "> - **prior:abc1234 critical 1** — still-present — stands.",
+            "```\n- **prior:abc1234 critical 1** — still-present — stands.\n```",
+            "    - **prior:abc1234 critical 1** — still-present — stands.",
+        ):
+            body = "\n".join(
+                [
+                    '<!-- ally-verdict:1\n{"head":"%s","findings":{"critical":0,"important":0},'
+                    '"dispositions":[]}\n-->' % self.HEAD,
+                    "",
+                    "## Ally — Consolidated PR Review",
+                    quoted,
+                ]
+            )
+            self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD, quoted)
+
+
 class TestVerdictBlockMirrorsTheGateOnFencesAndLedgers(unittest.TestCase):
     """Peer review of #1721 at 97b4ddd1 -- the remaining two reader divergences.
 

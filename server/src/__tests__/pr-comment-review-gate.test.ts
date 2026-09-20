@@ -11,6 +11,7 @@ import {
   hasActionablePrReviewFeedback,
   hasAllyConsolidatedReviewHeading,
   isPublishableToken,
+  parseAllyVerdictBlock,
 } from "../services/ally-review-detection.js";
 import {
   commentReviewGateCheckConclusion,
@@ -1485,8 +1486,92 @@ describe("clean-review precedence over the Recommended Action prose fallback", (
     expect(hasActionablePrReviewFeedback(blockCarryingStillPresent(CURRENT_HEAD, "fixed"))).toBe(false);
   });
 
-  it("does not count a structured still-present entry when the caller asks the narrower question", () => {
-    // The carry-forward enumeration asks "which findings did *this head*
+  // The last uncovered quadrant of the block/prose drift matrix. The counts
+  // axis fails a block closed when prose contradicts it (proseCountContradicting);
+  // the ledger axis had no twin, so a block whose `dispositions` are absent,
+  // `[]`, or merely missing the entry took the `ok` branch, found zero counts,
+  // found an empty ledger, and returned false -- while the identical body
+  // *without* a block blocks via the prose ledger clause in
+  // carriesBlockingFeedback. The producer
+  // template mandates emitting both the block and the prose ledger, which is
+  // exactly how the two come to disagree on this field. Found by Ally in
+  // review of #1721 at 1d6f3785.
+  const proseLedgerAgainstBlock = (verb: string, dispositions?: unknown[]) =>
+    [
+      "## Ally — Consolidated PR Review",
+      "",
+      "<!-- ally-verdict:1",
+      JSON.stringify({
+        head: CURRENT_HEAD,
+        findings: { critical: 0, important: 0, suggestions: 0 },
+        ...(dispositions === undefined ? {} : { dispositions }),
+      }),
+      "-->",
+      "",
+      `Reviewed head: ${CURRENT_HEAD}`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+      "### Prior Findings Dispositioned (1)",
+      `- **prior:${OLD_HEAD.slice(0, 7)} critical 1** — ${verb} — the guard is unchanged.`,
+      "### Recommended Action",
+      "1. No Critical issues to fix before merge.",
+    ].join("\n");
+
+  for (const [label, dispositions] of [
+    ["omits `dispositions`", undefined],
+    ["states `dispositions: []`", []],
+    ["names only a retired entry", [{ head: OLD_HEAD.slice(0, 7), severity: "important", index: 1, verb: "fixed" }]],
+  ] as const) {
+    it(`fails a block closed when it ${label} and the prose ledger still stands`, () => {
+      // Both shapes matter: absence is legitimately "this review retires
+      // nothing", and a partially-drifted ledger is the same hole one entry in.
+      const body = proseLedgerAgainstBlock("still-present", dispositions);
+      expect(parseAllyVerdictBlock(body)).toMatchObject({ kind: "unreadable" });
+      expect(hasActionablePrReviewFeedback(body)).toBe(true);
+    });
+  }
+
+  it("does not clear the head when a block contradicting its prose ledger is evaluated end to end", () => {
+    // The load-bearing assertion. The unit above passes while the gate still
+    // goes green if evaluateCommentReviewGate reaches `success` by another
+    // route, which is how this family of fail-opens has escaped every time.
+    expect(
+      evaluateCommentReviewGate({
+        headSha: CURRENT_HEAD,
+        comments: [allyComment(proseLedgerAgainstBlock("still-present", []), "2026-08-04T21:09:19Z")],
+      }),
+    ).not.toMatchObject({ state: "success" });
+  });
+
+  it("reports a block contradicting its prose ledger as unreadable, never as carrying a finding", () => {
+    // The acceptance criterion this row exists for: `blocking_finding` must be
+    // reachable only from a structured finding. A body the parser cannot
+    // reconcile is unreadable, which is a distinguishable red.
+    expect(parseAllyVerdictBlock(proseLedgerAgainstBlock("still-present", []))).toMatchObject({
+      reason: expect.stringContaining("prose ledger"),
+    });
+  });
+
+  it("clears a block whose prose ledger only retires prior findings", () => {
+    // Control, and the one that keeps this from being a widening: a prose
+    // `fixed` entry the block omits clears either way, so failing closed on it
+    // would be a false red with no fail-open behind it -- the #1675 direction.
+    expect(parseAllyVerdictBlock(proseLedgerAgainstBlock("fixed", []))).toMatchObject({ kind: "ok" });
+    expect(hasActionablePrReviewFeedback(proseLedgerAgainstBlock("fixed", []))).toBe(false);
+  });
+
+  it("stays readable when the block's ledger agrees with its prose ledger", () => {
+    // The real contract-compliant shape: both state the same standing entry.
+    // It must block, but as a *structured* finding rather than as an
+    // unreadable verdict, or every genuine still-present review reads broken.
+    const agreeing = proseLedgerAgainstBlock("still-present", [
+      { head: OLD_HEAD.slice(0, 7), severity: "critical", index: 1, verb: "still-present" },
+    ]);
+    expect(parseAllyVerdictBlock(agreeing)).toMatchObject({ kind: "ok" });
+    expect(hasActionablePrReviewFeedback(agreeing)).toBe(true);
+  });
+
+  it("does not count a structured still-present entry when the caller asks the narrower question", () => {    // The carry-forward enumeration asks "which findings did *this head*
     // raise?" and passes false, for the reason ActionableFeedbackOptions
     // documents. The structured clause is gated on the same option as its
     // prose twin, so the two cannot drift on which question they answer.
