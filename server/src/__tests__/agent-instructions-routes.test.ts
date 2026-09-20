@@ -711,6 +711,35 @@ describe("agent instructions bundle routes", () => {
         expect(persisted.instructionsRootPath).toBe("/tmp/agent-1");
         expect(persisted.instructionsEntryFile).toBe("AGENTS.md");
       });
+
+      // The post-sync guard's baseline argument syncs the *stored* config, and
+      // argument evaluation precedes the guard's own actor early return. With
+      // no stored `cwd` that sync throws 422, so evaluating it for every actor
+      // refused the board write that repairs the state by supplying `cwd` —
+      // the one operation that fixes it. `svc.create`/hire persist this shape
+      // with no sync and no absolute-path validation, so it is reachable.
+      it("lets a board actor supply a missing cwd when the stored config has none", async () => {
+        mockAgentService.getById.mockResolvedValue({
+          ...makeAgent(),
+          adapterType: "codex_local",
+          adapterConfig: {
+            instructionsBundleMode: "external",
+            instructionsRootPath: "/tmp/agent-1",
+            instructionsEntryFile: "AGENTS.md",
+            instructionsFilePath: "AGENTS.md",
+            model: "gpt-5.4",
+          },
+        });
+
+        const res = await requestApp(await createApp(), (baseUrl) => request(baseUrl)
+          .patch("/api/agents/11111111-1111-4111-8111-111111111111?companyId=company-1")
+          .send({ adapterConfig: { cwd: "/tmp/agent-1" } }));
+
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        const persisted = mockAgentService.update.mock.calls.at(-1)?.[1].adapterConfig as Record<string, unknown>;
+        expect(persisted.instructionsRootPath).toBe("/tmp/agent-1");
+        expect(persisted.instructionsEntryFile).toBe("AGENTS.md");
+      });
     });
   });
 });
