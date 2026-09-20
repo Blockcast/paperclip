@@ -42,12 +42,35 @@ describe("isReviewNamespacedContext", () => {
 });
 
 describe("admitsNothingEvaluated", () => {
-  it("recognizes both not-evaluated descriptions the gate emits", () => {
+  it("recognizes every not-evaluated description the gate emits", () => {
     assert.equal(
       admitsNothingEvaluated("No Ally consolidated-review comment attests to reviewing this head."),
       true,
     );
     assert.equal(admitsNothingEvaluated("No head SHA was supplied to evaluate against."), true);
+    assert.equal(
+      admitsNothingEvaluated(
+        "The only comment attesting this head is the PR author's own; nothing independent reviewed it.",
+      ),
+      true,
+    );
+    assert.equal(
+      admitsNothingEvaluated(
+        "The PR author is unknown, so this head's attestation cannot be shown to be independent.",
+      ),
+      true,
+    );
+  });
+
+  it("does not claim another repo's review script by a generic substring", () => {
+    // This predicate runs against every green `review/`-namespaced status on a
+    // merged PR, not only this gate's context. Shortening an alternative to a
+    // common phrase — `PR author` was the one that motivated this — makes the
+    // census flag wording it does not own. Fails if any alternative is
+    // narrowed back to a fragment short enough to appear in a sentence this
+    // module never wrote.
+    assert.equal(admitsNothingEvaluated("The PR author has not requested a review yet."), false);
+    assert.equal(admitsNothingEvaluated("octocat approved head abc1234 as the PR author."), false);
   });
 
   it("does not flag a genuine reviewed-and-clean description", () => {

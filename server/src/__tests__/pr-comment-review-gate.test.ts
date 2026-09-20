@@ -712,6 +712,10 @@ describe("evaluateCommentReviewGate — self-attestation", () => {
 
     expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
     expect(commentReviewGateCheckConclusion(verdict)).toBe("neutral");
+    // Pinned against the census's own predicate, not a copy of its regex: the
+    // alternatives quote this sentence, so rewording it here without updating
+    // the census would otherwise let the reason escape the audit silently.
+    expect(admitsNothingEvaluated(verdict.reason)).toBe(true);
   });
 
   it("still reports clean for an attestation from someone other than the author", () => {
