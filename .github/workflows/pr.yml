@@ -425,7 +425,8 @@ jobs:
             ./.github/scripts/tests/post-pending-deploy-alert.test.mjs \
             ./.github/scripts/tests/scheduled-production-deploy-schedule.test.mjs \
             ./.github/scripts/tests/supersede-stale-deploy.test.mjs \
-            ./.github/scripts/tests/deploy-stall-record.test.mjs
+            ./.github/scripts/tests/deploy-stall-record.test.mjs \
+            ./.github/scripts/tests/deploy-stall-chain.test.mjs
         timeout-minutes: 1
 
       # BLO-28203. The stalled-Ally-review sweep's decision suite otherwise runs
@@ -1622,11 +1623,38 @@ jobs:
     # Keep PR browser suites off the org-wide default pool. Merge groups use
     # the queue's reserved capacity so unrelated repos cannot delay admission.
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-e2e' }}
-    # The serial browser suite covers 43 flows. 90, not 75, sized against the
-    # measured p100 of SUCCESSFUL runs rather than the median. Every ratio here
+    # The serial browser suite covers 49 flows (43 before BLO-33282 split
+    # smoke-lab into 7). 90, not 75, sized against the measured p100 of
+    # SUCCESSFUL runs rather than the median. Every ratio here
     # is stated one way -- p100 as a percentage OF THE CAP -- so it can be
     # compared across jobs without inverting anything.
     #
+    # CURRENT REGIME (2026-09-18 onwards). The suite level-shifted ~3.5x DOWN
+    # between 09-17 and 09-18 and has held there. 337 e2e jobs over
+    # 2026-09-16..09-19, split at that boundary:
+    #
+    #   09-16..09-17  n=157 success  job p50 31.7 / p90 48.3 / p100 74.4
+    #                                suite p50 27.5 / p90 42.3 / p100 67.6  1 kill
+    #   09-18..09-19  n=125 success  job p50 14.4 / p90 22.0 / p100 36.2
+    #                                suite p50  7.8 / p90 14.7 / p100 32.2  0 kills
+    #
+    # p100 is now 40% of the cap, not 81%. The shift is NOT the BLO-33282
+    # smoke-lab split (which merged 09-19, a day later, and whose file was 1.11m
+    # of a 4.1m suite by then) and NOT the BLO-33478 built-bundle change: on
+    # 09-18, branches whose head did NOT contain 23f5799e7 ran 9.2-20.1m,
+    # i.e. as fast as those that did. The speedup tracks the DATE, not any
+    # commit content. Cause UNKNOWN and unchased -- likely runner-side. Both
+    # hypotheses above are recorded as FALSIFIED so nobody re-derives them.
+    #
+    # 90 is RETAINED, deliberately, and not re-sized down to this regime. It is
+    # robust to the uncertainty in a way a tighter cap would not be: if the
+    # improvement is durable, 90 costs nothing (a cap only bills when it fires,
+    # and it has not fired in 146 jobs); if it reverts, 90 is exactly the value
+    # the pre-shift window below sized. Sizing a cap tight against an
+    # unexplained 2-day improvement is the mistake BLO-32794 was filed to
+    # correct, in the other direction.
+    #
+    # PRIOR REGIME, and still the binding arithmetic if the shift reverts.
     # Measured over 600 pr.yml runs / 598 e2e jobs (2026-09-03..09-11), 434
     # successful: p50 36.0m, p90 52.6m, p100 73.2m. Against the old 75m that is
     # 98% of cap, i.e. 1.8m of margin; against 90 it is 81%, i.e. 16.8m.

@@ -168,6 +168,35 @@ describe("BLO-30608 backfill — API acquisition", () => {
     expect(rendered).toContain("Probed                      : 2 (3 beyond the budget)");
   });
 
+  // The legend label for `approval-abandoned` must not claim "every". The kind
+  // is assigned on *at least one* abandoned card, ahead of the refusal branch,
+  // so a mixed row is counted under it with refused cards still on it. The
+  // service-file heading for this same kind is pinned in
+  // human-gated-gate-revalidation.test.ts; this is the second site carrying the
+  // claim, and it drifted out of step with the first once already (PEN-3089).
+  // Asserted with the padding, because the label sits in a fixed-width column
+  // that nothing else exercises.
+  it("does not claim every board card was withdrawn in the resolution legend", async () => {
+    stub = stubApi({ blocked: humanGatedRows() });
+
+    const acquisition = await acquireFromApi(COMPANY_ID, null, NOW);
+    const report = revalidateGates(acquisition.evidence, {});
+    const rendered = renderReport(report, {
+      population: acquisition.population,
+      calls: acquisition.calls,
+      elapsedMs: 1_000,
+      source: "api",
+      notProbed: 0,
+    });
+
+    expect(rendered).toContain("  a board card withdrawn/cancelled           : ");
+    expect(rendered).not.toContain("every board card");
+    // Deliberately asymmetric with the line above it: `interaction-abandoned`
+    // is its probe's fall-through and so is genuinely terminal, which is what
+    // entitles that one to "every".
+    expect(rendered).toContain("  every question card withdrawn/expired      : ");
+  });
+
   it("excludes agent-owned, hidden, and digest rows from the population", async () => {
     stub = stubApi({ blocked: [...humanGatedRows(), ...excludedRows()] });
 
