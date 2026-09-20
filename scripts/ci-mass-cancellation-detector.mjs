@@ -52,6 +52,11 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 
+// GitHub's `/actions/runs` list stops yielding at ~1000 results per query,
+// regardless of paging. Reaching it means the fetch was truncated from the
+// old end, so any verdict computed over it is a floor.
+const FETCH_RESULT_CAP = 1000;
+
 const DEFAULTS = {
   repo: process.env.CI_MASS_CANCEL_REPO || "Blockcast/paperclip",
   workflowName: process.env.CI_MASS_CANCEL_WORKFLOW || "PR",
@@ -62,7 +67,7 @@ const DEFAULTS = {
 };
 
 export function parseArgs(argv) {
-  const args = { lookbackMinutes: 180, maxPages: 20 };
+  const args = { lookbackMinutes: 180, maxPages: 20, fetchPadMinutes: 360 };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--since") args.since = argv[++i];
@@ -71,17 +76,53 @@ export function parseArgs(argv) {
     else if (arg === "--repo") args.repo = argv[++i];
     else if (arg === "--json-file") args.jsonFile = argv[++i];
     else if (arg === "--max-pages") args.maxPages = Number(argv[++i]);
+    else if (arg === "--fetch-pad-minutes") args.fetchPadMinutes = Number(argv[++i]);
     else if (arg === "--include-merge-group") args.includeMergeGroup = true;
   }
   return args;
 }
 
-function fetchCancelledRunsLive(repo, maxPages) {
+// `/actions/runs` paginates from the NEWEST run and the list endpoint stops
+// returning results at roughly 1000 entries, so a page-bounded fetch reaches
+// back only as far as recent volume allows — measured 2026-09-20, 20 pages of
+// `status=cancelled` bottomed out at 2026-08-10 and could not see the 08-02
+// incident at all. `--since/--until` filtered only AFTER that fetch, so any
+// backtest older than the reachable window returned `firing: false` with
+// `scannedRunCount: 0`: a silent all-clear that is indistinguishable from a
+// genuinely quiet window. Bound the fetch by `created=` instead, which the
+// REST API filters server-side, so reachability depends on the requested
+// window rather than on how busy the repo has been since.
+export function createdRangeFor(args, now = Date.now()) {
+  const padMs = (Number.isFinite(args.fetchPadMinutes) ? args.fetchPadMinutes : 360) * 60 * 1000;
+  let startMs;
+  let endMs;
+  if (args.since || args.until) {
+    startMs = args.since ? Date.parse(args.since) : now - 30 * 24 * 60 * 60 * 1000;
+    endMs = args.until ? Date.parse(args.until) : now;
+  } else {
+    startMs = now - (args.lookbackMinutes || 180) * 60 * 1000;
+    endMs = now;
+  }
+  // The window is expressed in KILL instants (`updated_at`) but `created=`
+  // filters on `created_at`. Pad backwards so a long run created before the
+  // window but killed inside it is still fetched, and forwards so the newer
+  // run that would explain a cancellation as ordinary supersession is present
+  // — without it every supersession reads as an infra kill.
+  return `${new Date(startMs - padMs).toISOString()}..${new Date(endMs + padMs).toISOString()}`;
+}
+
+// Deliberately NOT `status=cancelled`: `detect()` needs same-workflow runs of
+// any conclusion as supersession candidates, and the run that superseded a
+// cancelled one is typically `success`/`in_progress`. Filtering to cancelled
+// at fetch time hid exactly those, so ordinary concurrency supersession could
+// only be recognised when the superseding run had itself been cancelled.
+function fetchRunsLive(repo, maxPages, createdRange) {
   const runs = [];
+  const created = `&created=${encodeURIComponent(createdRange)}`;
   for (let page = 1; page <= maxPages; page += 1) {
     const out = execFileSync(
       "gh",
-      ["api", `repos/${repo}/actions/runs?status=cancelled&per_page=100&page=${page}`, "--jq", ".workflow_runs"],
+      ["api", `repos/${repo}/actions/runs?per_page=100&page=${page}${created}`, "--jq", ".workflow_runs"],
       { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
     ).trim();
     const pageRuns = out ? JSON.parse(out) : [];
@@ -96,7 +137,7 @@ function loadRuns(args) {
   if (args.jsonFile) {
     return JSON.parse(readFileSync(args.jsonFile, "utf8"));
   }
-  return fetchCancelledRunsLive(args.repo || DEFAULTS.repo, args.maxPages);
+  return fetchRunsLive(args.repo || DEFAULTS.repo, args.maxPages, createdRangeFor(args));
 }
 
 // The concurrency-group key this repo's pr.yml actually uses today:
@@ -217,6 +258,18 @@ export function detect(rawRuns, options = {}) {
     minDistinctBranches: opts.minDistinctBranches,
     clusterWindowSeconds: opts.clusterWindowSeconds,
     supersessionGraceSeconds: opts.supersessionGraceSeconds,
+    // `fetchedRunCount` is the raw population the verdict was computed over,
+    // and it is what separates "looked, found nothing" from "never looked".
+    // `scannedRunCount: 0` alone cannot make that distinction, and the quiet
+    // reading is the dangerous one — see `createdRangeFor` above.
+    fetchedRunCount: rawRuns.length,
+    // `/actions/runs` stops yielding at ~1000 results for any one query, and
+    // it pages newest-first — so a truncated fetch silently drops the OLDEST
+    // part of the requested window. For a detector that is the dangerous
+    // direction (a missed cluster reads as quiet), so say so out loud: the
+    // verdict is then a floor, not a census. Narrow the window, or lower
+    // --fetch-pad-minutes, until this clears.
+    fetchTruncated: rawRuns.length >= FETCH_RESULT_CAP,
     scannedRunCount: scoped.length,
     supersessionExcludedCount: scoped.length - nonSuperseded.length,
     clusters,
@@ -243,6 +296,19 @@ async function main() {
   });
 
   console.log(`DETECTOR_VERDICT=${JSON.stringify(verdict)}`);
+  // An empty fetch is an operational error, never a quiet verdict. Without
+  // this, a window the API cannot reach, a `gh` auth failure that still exits
+  // 0, or a mistyped repo all render as `firing: false` — the detector
+  // reporting "no incident" when what happened is "no data". A fixture run
+  // (`--json-file`) is exempt: an empty fixture is a legitimate test input.
+  if (!args.jsonFile && verdict.fetchedRunCount === 0) {
+    console.error(
+      "ci-mass-cancellation-detector: fetched 0 runs — the verdict above is vacuous, not quiet. " +
+        "Check the repo, `gh` auth, and that the requested window is within API reach.",
+    );
+    process.exitCode = 2;
+    return;
+  }
   process.exitCode = verdict.firing ? 1 : 0;
 }
 
