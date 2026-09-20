@@ -64,6 +64,9 @@ import { logActivity } from "../activity-log.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS, issueRecoveryActionService } from "../issue-recovery-actions.js";
+// Type-only, so it is erased before runtime and cannot touch the vitest mock namespace
+// that the comment at `recoveryHandoffCommentGrantTtlHours` below exists to warn about.
+import type { ExpiredWakeHorizonCandidate } from "../issue-recovery-actions.js";
 import {
   isVerifiedIssueTreeControlInteractionWake,
   issueTreeControlService,
@@ -12350,6 +12353,20 @@ export function recoveryService(
    * the source issue's status, and — like the wake backstop beside it — stays enabled when
    * automatic liveness escalation is off, because it re-routes an already-committed action
    * rather than creating recovery work.
+   *
+   * BLO-19124: "independent of the source issue's status" is right; "independent of whether
+   * the issue was WORKED" was not. The notice this pass emits asserts that the stranding was
+   * never worked and that the fault is scheduler-side — and it asserted that on rows whose
+   * source issue had been serviced normally inside the horizon, because the horizon predicate
+   * is pure clock. Every other decision point in this subsystem gates on the source issue
+   * before acting (`hasActiveExecutionPath` at the producer, the liveness backstop, the
+   * blocked-drain hand-back, the wake backstop); escalation was the outlier that did not.
+   *
+   * A candidate with a successful run since the action opened is therefore discharged rather
+   * than escalated: its premise is falsified, so escalating would publish a false statement
+   * into the one queue that cannot absorb it. Discharge, not skip — leaving it `active` past
+   * its horizon would reinstate the BLO-24662 limbo this pass exists to end, and the anchor
+   * being the action's own `createdAt` means the veto would never lapse.
    */
   async function reconcileExpiredRecoveryWakeHorizons(opts?: {
     runId?: string | null;
@@ -12362,17 +12379,62 @@ export function recoveryService(
       escalated: 0,
       neverDelivered: 0,
       announced: 0,
+      workedDischarged: 0,
       actionIds: [] as string[],
       issueIds: [] as string[],
     };
     const now = opts?.now ?? new Date();
 
+    const worked: ExpiredWakeHorizonCandidate[] = [];
     const expired = await recoveryActionsSvc.escalateExpiredWakeHorizons({
       now,
       companyId: opts?.companyId ?? null,
       limit: opts?.limit,
+      selectEscalatable: async (candidates) => {
+        const escalatable: string[] = [];
+        for (const candidate of candidates) {
+          // Anchored at the action's own `createdAt`, so this asks exactly what the notice
+          // claims: was the stranding worked at any point in this action's life? A run still
+          // in flight is NOT enough on its own — `hasActiveExecutionPath` would miss the
+          // common shape, where the run that serviced the issue finished before the sweep ran.
+          if (await hasSuccessfulIssueRunSince(candidate.companyId, candidate.sourceIssueId, candidate.createdAt)) {
+            worked.push(candidate);
+            continue;
+          }
+          escalatable.push(candidate.id);
+        }
+        return escalatable;
+      },
     });
-    result.checked = expired.length;
+
+    for (const candidate of worked) {
+      try {
+        const resolved = await recoveryActionsSvc.resolveActiveForIssue({
+          companyId: candidate.companyId,
+          sourceIssueId: candidate.sourceIssueId,
+          actionId: candidate.id,
+          status: "resolved",
+          outcome: "restored",
+          resolutionNote:
+            "Wake horizon expired, but the source issue had a successful run after this action was opened, "
+            + "so the stranding it was raised for did not survive the window. Discharged instead of escalated: "
+            + "escalating would have told an operator the issue was never worked.",
+        });
+        if (resolved) result.workedDischarged += 1;
+      } catch (error) {
+        // Leave the row `active` on failure. The next sweep re-evaluates it from scratch, and
+        // a missed discharge is strictly better than a false escalation.
+        logger.warn(
+          { err: error, actionId: candidate.id, sourceIssueId: candidate.sourceIssueId },
+          "failed to discharge expired recovery wake horizon whose source issue was worked",
+        );
+      }
+    }
+
+    // Every row whose horizon had expired, discharged or not. Counting only the escalated
+    // ones would make a sweep that discharged ten of them report `checked: 0` — a fresh
+    // observability hole in the pass whose whole subject is observability.
+    result.checked = expired.length + worked.length;
     if (expired.length === 0) return result;
 
     for (const action of expired) {

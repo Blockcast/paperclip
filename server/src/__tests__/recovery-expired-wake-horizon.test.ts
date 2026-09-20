@@ -5,6 +5,7 @@ import {
   agents,
   companies,
   createDb,
+  heartbeatRuns,
   issueComments,
   issueRecoveryActions,
   issues,
@@ -47,6 +48,8 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
     await db.delete(issueRecoveryActions);
     await db.delete(issueComments);
     await db.delete(issues);
+    // Before `agents`/`companies`: heartbeat_runs has FKs onto both.
+    await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -395,5 +398,112 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
     expect(surfaced[0]!.subject.id).toBe(actionId);
     expect(surfaced[0]!.severity).toBe("high");
     expect(surfaced[0]!.whyNow).toContain("no longer wakes anyone");
+  });
+
+  /**
+   * BLO-19124: the horizon predicate is pure clock, so it escalated rows whose source issue
+   * had in fact been serviced inside the window — publishing a notice that says the stranding
+   * "was never worked" and "that is a scheduler-side fault" about an issue that was worked.
+   *
+   * The worked example is BLO-19124 itself: action opened 16:35Z, owner runs commented at
+   * 19:44Z and 22:01Z, horizon 22:35Z, escalated 22:55Z with that sentence attached.
+   *
+   * Note the anchor. `hasActiveExecutionPath` — the guard the four sibling decision points in
+   * this subsystem use — asks whether a run is in flight RIGHT NOW, and would have missed
+   * every one of those: each run had finished well before the sweep read the row. The claim
+   * in the notice is about the action's whole life, so the guard is anchored at the action's
+   * own `createdAt`.
+   */
+  const actionCreatedAt = new Date("2026-08-08T11:00:00.000Z");
+
+  async function insertIssueRun(
+    seeded: Awaited<ReturnType<typeof seed>>,
+    overrides: { status: string; createdAt: Date; issueId?: string },
+  ) {
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      agentId: seeded.ownerAgentId,
+      status: overrides.status,
+      // The run is long finished by the time the sweep reads the row — the shape
+      // `hasActiveExecutionPath` cannot see.
+      startedAt: overrides.createdAt,
+      finishedAt: new Date(overrides.createdAt.getTime() + 60_000),
+      createdAt: overrides.createdAt,
+      contextSnapshot: { issueId: overrides.issueId ?? seeded.sourceIssueId },
+    });
+  }
+
+  it("discharges rather than escalates when the source issue was worked inside the horizon", async () => {
+    const seeded = await seed();
+    const actionId = await insertAction(seeded, { createdAt: actionCreatedAt });
+    // Finished 5h before the sweep, 1h after the action opened.
+    await insertIssueRun(seeded, { status: "succeeded", createdAt: new Date("2026-08-08T12:00:00.000Z") });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn().mockResolvedValue(null) });
+
+    const result = await recovery.reconcileExpiredRecoveryWakeHorizons({ now });
+
+    // `checked` counts every expired row the sweep examined, discharged or not — a sweep that
+    // discharged this row must not report having looked at nothing.
+    expect(result).toMatchObject({ checked: 1, escalated: 0, announced: 0, workedDischarged: 1 });
+
+    const action = await readAction(actionId);
+    expect(action.status).toBe("resolved");
+    expect(action.outcome).toBe("restored");
+    expect(action.retiringBound).toBe("discharged");
+
+    // The false notice is the actual harm — assert it was never published.
+    const comments = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, seeded.sourceIssueId));
+    expect(comments).toHaveLength(0);
+  });
+
+  it("still escalates when the only run on the issue failed", async () => {
+    // Negative control. A crashed run did not service the issue, so the notice is true and
+    // must still go out. Without this, a guard that discharged on ANY run would pass the
+    // test above and silence the mechanism entirely.
+    const seeded = await seed();
+    const actionId = await insertAction(seeded, { createdAt: actionCreatedAt });
+    await insertIssueRun(seeded, { status: "failed", createdAt: new Date("2026-08-08T12:00:00.000Z") });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn().mockResolvedValue(null) });
+
+    const result = await recovery.reconcileExpiredRecoveryWakeHorizons({ now });
+
+    expect(result).toMatchObject({ escalated: 1, announced: 1, workedDischarged: 0 });
+    expect((await readAction(actionId)).status).toBe("escalated");
+  });
+
+  it("still escalates when the successful run predates the action", async () => {
+    // The anchor is load-bearing in the other direction too: a run that succeeded BEFORE the
+    // action was opened is what the stranding happened after, not evidence against it.
+    const seeded = await seed();
+    const actionId = await insertAction(seeded, { createdAt: actionCreatedAt });
+    await insertIssueRun(seeded, { status: "succeeded", createdAt: new Date("2026-08-08T09:00:00.000Z") });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn().mockResolvedValue(null) });
+
+    const result = await recovery.reconcileExpiredRecoveryWakeHorizons({ now });
+
+    expect(result).toMatchObject({ escalated: 1, announced: 1, workedDischarged: 0 });
+    expect((await readAction(actionId)).status).toBe("escalated");
+  });
+
+  it("still escalates when the successful run belongs to a different issue", async () => {
+    // `contextSnapshot ->> 'issueId'` is the only thing tying a run to an issue; a guard that
+    // dropped that predicate would discharge every action in a busy company.
+    const seeded = await seed();
+    const actionId = await insertAction(seeded, { createdAt: actionCreatedAt });
+    await insertIssueRun(seeded, {
+      status: "succeeded",
+      createdAt: new Date("2026-08-08T12:00:00.000Z"),
+      issueId: randomUUID(),
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn().mockResolvedValue(null) });
+
+    const result = await recovery.reconcileExpiredRecoveryWakeHorizons({ now });
+
+    expect(result).toMatchObject({ escalated: 1, announced: 1, workedDischarged: 0 });
+    expect((await readAction(actionId)).status).toBe("escalated");
   });
 });
