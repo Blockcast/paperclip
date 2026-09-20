@@ -98,6 +98,33 @@ remember the instance.
 
 ## Before anything: two baselines, both on the day the truth shapes deploy
 
+**Precondition: `PAPERCLIP_API_KEY` must hold `company_scope:read`.** Without it
+the route filters the page **after** the 1000-row cap is applied
+(`server/src/routes/issues.ts:8085-8088` — `svc.list` fetches at the clamped
+limit, then `filterIssuesForActor` drops rows the actor may not read, and it is
+the *filtered* array that is serialized at `:8140`). Two consequences, and the
+first is the one that bites silently: a page cut at exactly 1000 in the database
+arrives with **fewer** than 1000 rows, so every `truncated` guard below reads
+`false` on a truncated page; and `total`, `willBlock`, `onlyTruthMissing`,
+`noPr` and `probeFailed` are all scoped subsets reading as estate totals. The
+server compensates for exactly this internally — the blocked-count pager at
+`:8277-8286` tests the *unfiltered* `rows.length` for its stop condition — but
+an external `curl` cannot see `rows.length`, so this is a property of the
+credential, not something a better query can fix.
+
+Confirm the key before day 1 — this must return a row for an issue assigned to
+another agent:
+
+```bash
+curl -sS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/issues?status=in_review&limit=1000" \
+| jq '[.[] | select(.assigneeAgentId != null)] | {scopeOk: (length > 0), sampleAssignees: ([.[].assigneeAgentId] | unique | length)}'
+```
+
+`scopeOk: false`, or a `sampleAssignees` of 1 when you know several agents hold
+`in_review` work, means the key is scoped — **stop and re-issue it.** Every
+count below is a subset until it is.
+
 **1. Issues whose linked PR the webhook never saw.** These read
 `no-linked-pull-request`. A **labeled** one cannot reach `pass` until its PR is
 linked — that is what the Task B10 backfill is for. An **unlabeled** one now
@@ -115,10 +142,11 @@ curl -sS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
 **`truncated: true` means page it or narrow the status — do not record the
 number.** The list route clamps to `ISSUE_LIST_MAX_LIMIT` (1000) and returns a
 **bare array**: no total, no cursor, and no truncation header
-(`server/src/routes/issues.ts:7896-7900`). A full page is the only signal there
-is, which is why this is a row-count check and not a header check — the same
-check `scripts/ops/backfill-pr-work-products.mjs:130` makes for the same reason.
-A header guard here would never fire.
+(`server/src/services/issues.ts:7894-7902`). A full page is the only signal
+there is, which is why this is a row-count check and not a header check — the
+same check `scripts/ops/backfill-pr-work-products.mjs:133` makes for the same
+reason. A header guard here would never fire. It is also only trustworthy on a
+key with `company_scope:read` — see the precondition above.
 
 Record it in BLO-3202. Then run the backfill — **it is dry-run by default**, so
 it takes two invocations and only the second one writes:
@@ -220,7 +248,8 @@ side. With no `sortField` the list orders by priority then recency
 head. Truncation therefore under-samples `willBlock` harder than `total` and the
 ratio reads *safer* than reality. It voids the install check above for the same
 reason. Page it with `&offset=` or narrow the status, and do not count the day
-until the page is complete.
+until the page is complete. On a key without `company_scope:read` this flag
+cannot fire at all — see the precondition above.
 
 `willBlock` is the number that matters: it mirrors the escalation predicate in
 `evidence-gate.ts` exactly — `truthOnlyGap && blockableGap`, minus the two
