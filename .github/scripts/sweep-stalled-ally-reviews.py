@@ -714,18 +714,30 @@ def refire_still_permitted(owner, repo, number, head_sha, token, api_base_url, n
       hand re-ask, which is the very race this guard exists for. The cost is
       bounded by that set -- NOT by MAX_REFIRES_PER_RUN, because a write this
       guard withholds leaves its budget slot free (see sweep()) -- against a
-      1,000/hour budget.
+      1,000/hour budget. The cost is not only the request: the reorder also
+      moves the cooldown-blocked path from cannot-fail to can-fail, since it
+      now issues a fetch before returning where it previously returned first.
+      A raise there propagates to sweep(), is isolated per-PR, and counts
+      toward sweep_is_degraded (failed >= max(3, 0.1 * considered)). Accepted:
+      it fails closed (withhold and say so, per "Failure is NOT swallowed"
+      below), needs three failures to trip the alarm, and rides a path that is
+      rare by construction.
 
-    Why the reviews surface is not the cheap half to skip: measured across the
-    45 most recent PRs in this repo on 2026-09-20, 34 carried an Ally
-    consolidated report and the split was 57 on the REVIEWS surface and 0 on
-    the comment surface. An earlier revision of this docstring asserted the
-    opposite -- that the comment surface was the one Ally most often answers
-    on -- and used it to justify leaving the reviews half unfixed. That claim
-    was never measured and is wrong: leaving it out addressed the surface
-    responsible for 0 of 57 observed answers. Both surfaces are still checked,
-    because neither is sufficient alone (verified live 2026-08-04: #952 had 4
-    comment-shaped reviews and an EMPTY pulls/952/reviews, #937 the reverse).
+    Why the reviews surface is not the cheap half to skip: across the 45 most
+    recent PRs in this repo, ZERO Ally consolidated reports landed on the
+    comment surface -- every one was on the reviews surface. The zero is the
+    load-bearing figure and is what the ordering rests on; the matching
+    numerator is a moving target and is quoted only as provenance (34 reports /
+    57 reviews-surface on 2026-09-20, independently re-measured as 37 / 62 over
+    the same window a day later). A future reader finding a different numerator
+    is seeing drift, not a measurement error -- re-check the zero, not the
+    count. An earlier revision of this docstring asserted the opposite -- that
+    the comment surface was the one Ally most often answers on -- and used it
+    to justify leaving the reviews half unfixed. That claim was never measured
+    and is wrong: leaving it out addressed the surface responsible for none of
+    the observed answers. Both surfaces are still checked, because neither is
+    sufficient alone (verified live 2026-08-04: #952 had 4 comment-shaped
+    reviews and an EMPTY pulls/952/reviews, #937 the reverse).
 
     The check is deliberately head-exact, not "has Ally reviewed at all".
     ally_has_reviewed_head demands a consolidated report attesting THIS head,
@@ -1047,8 +1059,10 @@ def _consider_pr(owner, repo, pr, token, api_base_url, now, may_refire=True, dry
                 # of the cooldown (see refire_still_permitted's ORDERING), so
                 # an answered-AND-contended PR is reported as answered however
                 # Ally replied. That matters because the reviews surface is
-                # the one Ally actually uses -- 57 of 57 observed reports,
-                # measured 2026-09-20.
+                # the one Ally actually uses -- across the 45 most recent PRs
+                # in this repo, ZERO reports landed on the comment surface.
+                # The zero is the claim; the numerator drifts (see the
+                # ORDERING docstring in refire_still_permitted).
                 pending_since = None
             return (pr, head_sha, pending_since, False, "%s -- %s" % (prefix, withheld))
         requested = request_review(owner, repo, number, token, api_base_url)
