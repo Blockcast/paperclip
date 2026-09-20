@@ -543,3 +543,31 @@ describeEmbeddedPostgres("agent-liveness gauges (BLO-23413)", () => {
     });
   });
 });
+
+// BLO-33152. Deliberately OUTSIDE describeEmbeddedPostgres: every test above
+// imports these names by SYMBOL, so changing a constant's VALUE in metrics.ts
+// leaves all of them green -- and a host without embedded Postgres would skip
+// the pin along with them. This pin is the entire guard, so it always runs.
+describe("wire names for the BLO-22498 gauges are a cross-repo contract (BLO-33152)", () => {
+  it("pins the exact series names Blockcast/onprem-k8s hardcodes in its Grafana PromQL", () => {
+    // DOWNSTREAM CONSUMER:
+    //   Blockcast/onprem-k8s -> monitoring/dashboards/paperclip-platform.json
+    // Those panels hardcode these strings in their PromQL. Renaming one here
+    // does not break a panel loudly -- it blanks it, and an ABSENT series
+    // renders identically to a RECOVERED one: a quiet, healthy-looking fleet
+    // that is measuring nothing. That is precisely the failure the BLO-22498
+    // panels exist to detect, so the name is load-bearing past this repo.
+    //
+    // If you are here because you renamed a constant: change the dashboard
+    // JSON in onprem-k8s in the same PR, then update these literals. Updating
+    // them alone makes the test green and the panel blind.
+    expect(AGENT_ERROR_REASON_AGENTS_METRIC).toBe("paperclip_agent_status_error_agents");
+    expect(AGENT_ERROR_REASON_OLDEST_AGE_METRIC).toBe(
+      "paperclip_agent_status_error_oldest_age_seconds",
+    );
+    // Pre-existing and equally consumed downstream.
+    expect(AGENT_ERROR_DURATION_SECONDS_METRIC).toBe(
+      "paperclip_agent_status_error_duration_seconds",
+    );
+  });
+});
