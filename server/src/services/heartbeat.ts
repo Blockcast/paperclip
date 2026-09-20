@@ -24833,7 +24833,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       reconciliationSweepSucceeded = false;
       logger.error(
         { error: error instanceof Error ? error.message : String(error) },
-        "reapOrphanedRuns: runtime-resource reconciliation sweep failed; backlog gauges will read stale and the freshness arm will page",
+        "reapOrphanedRuns: runtime-resource reconciliation sweep failed; the refresh in the finally below still runs, so the backlog gauges stay current and the freshness arm will page on incomplete reconciliation",
       );
     } finally {
       try {
