@@ -146,7 +146,6 @@ import {
   ZERO_TOKEN_SESSION_RESET_RETRY_REASON,
 } from "./zero-token-startup-failure.js";
 
-
 /**
  * The recovery transaction has already upserted its source-scoped action when
  * the issue UPDATE reports no match. That result is a lost write precondition,

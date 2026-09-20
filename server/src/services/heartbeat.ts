@@ -32856,7 +32856,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * off the hot path.
    */
   async function hasQueuedReplacementIssueWake(
-    dbOrTx: typeof db | Parameters<Parameters<typeof db.transaction>[0]>[0],
+    dbOrTx: Db | DbTransaction,
     companyId: string,
     issueId: string,
     participantAgentId: string,

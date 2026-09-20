@@ -124,6 +124,18 @@ jobs:
         if: ${{ !cancelled() }}
         run: node ./scripts/check-github-runner-labels.mjs
 
+      - name: Ban inline transaction-handle re-derivations (BLO-34812)
+        # BLO-34656 swept 21 copies of this alias out of 20 files and left a
+        # comment as the only thing holding it at zero. Those 21 copies are
+        # the evidence that a comment does not hold.
+        if: ${{ !cancelled() }}
+        run: node ./scripts/check-db-transaction-alias.mjs
+
+      - name: Test transaction-handle alias ban (BLO-34812)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-db-transaction-alias.test.mjs
+        timeout-minutes: 1
+
       - name: Validate Dockerfile deps stage
         if: ${{ !cancelled() }}
         run: |
