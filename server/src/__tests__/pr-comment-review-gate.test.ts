@@ -1261,6 +1261,10 @@ describe("commentReviewGateCheckConclusion", () => {
     for (const verdict of cases) {
       expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
       expect(commentReviewGateCheckConclusion(verdict)).toBe("neutral");
+      // The two older reasons had no pin, so rewording either dropped it from
+      // the census with nothing failing. These shapes emit both: the first case
+      // the no-head-SHA reason, the rest the nothing-attests one.
+      expect(admitsNothingEvaluated(verdict.reason)).toBe(true);
     }
   });
 
