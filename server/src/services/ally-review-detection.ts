@@ -556,6 +556,9 @@ export function parseAllyVerdictBlock(body: string | null | undefined): AllyVerd
   const countDisagreement = proseCountContradicting(text, counts);
   if (countDisagreement !== null) return { kind: "unreadable", reason: countDisagreement };
 
+  const ledgerDisagreement = proseDispositionContradicting(text, ledger);
+  if (ledgerDisagreement !== null) return { kind: "unreadable", reason: ledgerDisagreement };
+
   return {
     kind: "ok",
     verdict: { head: attestedHead, findings: counts, dispositions: ledger },
@@ -658,6 +661,49 @@ function proseCountContradicting(text: string, counts: Map<string, number>): str
       // call already made for `rawVersion` at :495 and for token length in
       // asPublishableToken, applied here for the symmetry.
       return `ally-verdict states 0 \`${key}\` but the review enumerates ${count!.slice(0, PUBLISHABLE_TOKEN_BUDGET)}`;
+    }
+  }
+  return null;
+}
+
+/**
+ * The count rule above, applied to the other field the gate decides from.
+ *
+ * `carriesBlockingFeedback` reads `dispositions` for a `blocks` verb exactly as
+ * it reads `findings` for a non-zero count, so the same block/prose drift fails
+ * open one axis over. A block whose ledger is absent, `[]`, or merely missing
+ * the entry takes the `ok` branch, finds zero counts, finds no blocking
+ * disposition, and returns `false` — while the identical body *without* a block
+ * blocks via the prose ledger clause in carriesBlockingFeedback. Found in
+ * peer review of #1721 at
+ * 1d6f3785; the producer template mandates emitting both the block and the
+ * prose ledger (`.planning/ally-agent/AGENTS.md`), which is precisely how the
+ * two come to disagree on this field.
+ *
+ * Asymmetric exactly like the count rule, and narrower than the reported shape
+ * on purpose: only a prose entry classifying as `blocks` can fail a block
+ * closed. A prose `fixed` entry the block omits clears either way, so failing
+ * on it would be a false red with no fail-open behind it — the #1675 direction.
+ * Symmetrically, a block already carrying a `blocks` entry cannot fail open, so
+ * the prose is not consulted at all.
+ *
+ * Shares PRIOR_FINDING_DISPOSITION_PATTERN and classifyPriorDisposition with
+ * the prose clause it defends, so by construction it fires exactly when that
+ * clause would have blocked — the two cannot drift into disagreeing about what
+ * "still stands" means.
+ *
+ * Quotes nothing. The severity and index captures are model-authored, and the
+ * reason reaches the uncapped check-run summary; there is no information in
+ * them the operator needs that "the prose ledger retains one" does not carry.
+ */
+function proseDispositionContradicting(
+  text: string,
+  ledger: AllyStructuredDisposition[],
+): string | null {
+  if (ledger.some((entry) => classifyPriorDisposition(entry.verb) === "blocks")) return null;
+  for (const match of text.matchAll(PRIOR_FINDING_DISPOSITION_PATTERN)) {
+    if (classifyPriorDisposition(match[4]!) === "blocks") {
+      return "ally-verdict retires every prior finding but the review's prose ledger retains one";
     }
   }
   return null;
