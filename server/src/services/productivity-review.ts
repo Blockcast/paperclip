@@ -829,32 +829,59 @@ function liveSegmentStartedAt(executionRun: HeartbeatRunRow | null, now: Date): 
  * condition BLO-23248/BLO-22331's capacity-only bucket was defending without
  * naming (see the constants block above for the three mechanisms). Returns
  * null for a run that represents genuine, assignee-attributable turn time.
+ *
+ * BLO-25722 (b): the capacity branch keys on the run's own park record — the
+ * capacity marker plus a `scheduledRetryAt` — and NOT on its status at read
+ * time. `scheduleBoundedRetryForRun` inserts the park as its own row
+ * (heartbeat.ts), so that row carries `createdAt` = park start and, once
+ * promoted, a post-park `startedAt` and a terminal status. Gating on
+ * `status === "scheduled_retry"` therefore scored a park at zero the moment it
+ * *resolved*, which is backwards: an 8092-minute `ccrotate_capacity` park that
+ * eventually succeeded (BLO-27143, run `e048aea2`, 72% of a 7d19h episode) was
+ * read as 6% no-executable-turn time instead of ~79%. That is an under-count in
+ * the suppression numerator, i.e. it makes false-positive reviews *more* likely
+ * — the whole failure mode this bucket exists to prevent. The park interval
+ * itself is recovered by the caller: the segment runs from `createdAt`, and the
+ * run's own post-park live span is subtracted by `msOutsideLiveSpans`.
+ *
+ * `resolved` marks that widening, so the *current-run* clause can keep reading
+ * "still parked right now" — a park that ended is not a live block and must not
+ * hold suppression open or be rendered as one.
  */
 function classifyNoExecutableTurnRun(
   run: HeartbeatRunRow,
-): { mechanism: NoExecutableTurnMechanism; scheduledRetryAt: Date | null; retryReason: string | null; errorCode: string | null } | null {
-  if (run.status === "scheduled_retry") {
-    const isCapacityClass =
-      run.scheduledRetryReason === CAPACITY_RETRY_REASON || run.errorCode === CAPACITY_RETRY_ERROR_CODE;
-    if (!isCapacityClass) return null;
-    const scheduledRetryAt = coerceDate(run.scheduledRetryAt);
-    if (!scheduledRetryAt) return null;
+): {
+  mechanism: NoExecutableTurnMechanism;
+  scheduledRetryAt: Date | null;
+  retryReason: string | null;
+  errorCode: string | null;
+  resolved: boolean;
+} | null {
+  const isCapacityClass =
+    run.scheduledRetryReason === CAPACITY_RETRY_REASON || run.errorCode === CAPACITY_RETRY_ERROR_CODE;
+  const scheduledRetryAt = coerceDate(run.scheduledRetryAt);
+  if (isCapacityClass && scheduledRetryAt) {
     return {
       mechanism: "capacity_park",
       scheduledRetryAt,
       retryReason: run.scheduledRetryReason,
       errorCode: run.errorCode,
+      resolved: run.status !== "scheduled_retry",
     };
   }
+  // A non-capacity park is still not a no-executable-turn mechanism — the
+  // pre-BLO-25722 early return, preserved so a `scheduled_retry` row cannot
+  // fall through into the two branches below.
+  if (run.status === "scheduled_retry") return null;
   // BLO-19604/BLO-22016: a run that never reached `startedAt` never gave the
   // assignee a turn, whatever became of it afterward — still parked in the
   // dispatch queue, or already cancelled out from under it (e.g. the
   // BLO-21621 sweep's `queued_run_detached_from_issue`).
   if (!run.startedAt && (run.status === "queued" || run.status === "cancelled")) {
-    return { mechanism: "dispatch_backlog", scheduledRetryAt: null, retryReason: null, errorCode: run.errorCode };
+    return { mechanism: "dispatch_backlog", scheduledRetryAt: null, retryReason: null, errorCode: run.errorCode, resolved: false };
   }
   if (isNeverExecutedRun(run)) {
-    return { mechanism: "zero_token_throttle", scheduledRetryAt: null, retryReason: null, errorCode: run.errorCode };
+    return { mechanism: "zero_token_throttle", scheduledRetryAt: null, retryReason: null, errorCode: run.errorCode, resolved: false };
   }
   return null;
 }
@@ -1004,15 +1031,16 @@ function noExecutableTurnBreakdown(
       ? segmentEndCandidate
       : attributableEndAt;
     // A terminal no-executable-turn run (a `cancelled` dispatch-backlog run,
-    // or a zero-token `failed` run) stopped mattering the moment it
+    // a zero-token `failed` run, or — BLO-25722 (b) — a capacity park that
+    // resolved and then finished) stopped mattering the moment it
     // finished — attributing the gap up to whenever the *next* run happened
     // to be created would let a run that died in 60s swallow a 10h gap
     // before its retry. Open states (`scheduled_retry` still pending its own
     // due time, or a dispatch-backlog run still genuinely `queued`) have no
     // `finishedAt` yet and legitimately park through to the next run.
-    const isTerminalNoTurnRun =
-      classification.mechanism === "zero_token_throttle" ||
-      (classification.mechanism === "dispatch_backlog" && run.status === "cancelled");
+    const isTerminalNoTurnRun = TERMINAL_RUN_STATUSES.includes(
+      run.status as (typeof TERMINAL_RUN_STATUSES)[number],
+    );
     if (isTerminalNoTurnRun) {
       const finishedAt = coerceDate(run.finishedAt);
       if (finishedAt && finishedAt.getTime() < segmentEnd.getTime()) {
@@ -1028,7 +1056,14 @@ function noExecutableTurnBreakdown(
   if (noExecutableTurnMs === 0) return null;
 
   const currentRun = chronological.at(-1) ?? null;
-  const currentClassification = currentRun ? classifyNoExecutableTurnRun(currentRun) : null;
+  const currentRunClassification = currentRun ? classifyNoExecutableTurnRun(currentRun) : null;
+  // BLO-25722 (b): a park that RESOLVED still contributes its interval to the
+  // numerator above, but it is not a *current* block — the run got its turn.
+  // Keeping it out here is what preserves the pre-widening meaning of every
+  // field below: `currentBlockOpen` must not hold suppression open on a park
+  // that ended, and `formatNoExecutableTurnGating` must not render a finished
+  // run as "parked `scheduled_retry` … overdue and not yet promoted".
+  const currentClassification = currentRunClassification?.resolved ? null : currentRunClassification;
   const currentIsActiveStatus = Boolean(
     currentRun && ACTIVE_RUN_STATUSES.includes(currentRun.status as (typeof ACTIVE_RUN_STATUSES)[number]),
   );
@@ -1516,6 +1551,19 @@ function describeNoExecutableTurnMechanismMix(mechanismMs: Record<NoExecutableTu
     .join(", ");
 }
 
+// BLO-25722 (a): the `Elapsed accounting` split is a partition of the episode
+// (`gatedMs + executingMs + unattendedMs === elapsedMs`, BLO-27698 B1). This
+// figure is not one of its buckets — it is measured per run, over a different
+// basis, and a queued/parked span lands in BOTH it and the split's unattended
+// remainder. Unlabelled, the body therefore stated that the same span was and
+// was not attributable to the assignee, one line apart. Subtracting it is not
+// the fix: that would break B1's identity and lose the disclosure. Say what the
+// two lines are instead — the same discipline, and for the same reason, as
+// `formatDependencyGating`'s caveat. Names NO individual bucket, so a bucket
+// added later cannot empty the one this points at.
+const NO_EXECUTABLE_TURN_OVERLAP_CAVEAT =
+  "measured per run, NOT a bucket of the elapsed split above and NOT subtracted from it: this span is also inside those wall-clock figures, so the two lines are different measures and do not sum";
+
 function formatNoExecutableTurnGating(gating: NonNullable<ProductivityReviewEvidence["noExecutableTurnGating"]>) {
   const mix = describeNoExecutableTurnMechanismMix(gating.mechanismMs);
   let currentClause = "";
@@ -1529,7 +1577,7 @@ function formatNoExecutableTurnGating(gating: NonNullable<ProductivityReviewEvid
   } else if (gating.currentMechanism === "zero_token_throttle") {
     currentClause = `; current run \`${gating.currentRunId}\` failed with zero tokens executed`;
   }
-  return `${msToHumanFine(gating.noExecutableTurnMs)} no-executable-turn time (${mix})${currentClause}`;
+  return `${msToHumanFine(gating.noExecutableTurnMs)} no-executable-turn time (${mix})${currentClause} — ${NO_EXECUTABLE_TURN_OVERLAP_CAVEAT}`;
 }
 
 // BLO-27698 C2: whether the evidence pack itself shows the assignee was denied

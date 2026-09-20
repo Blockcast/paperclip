@@ -4802,6 +4802,15 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("fleet-capacity signal, not assignee inactivity");
     expect(review?.description).toContain(`run \`${runId}\``);
     expect(review?.description).toContain(`No-executable-turn accounting:`);
+    // BLO-25722 (a): that figure is measured per run and overlaps the
+    // `Elapsed accounting` split's unattended remainder, so the body used to
+    // state one line apart that the same span both was and was not
+    // attributable to the assignee. Subtracting it would break BLO-27698 B1's
+    // `gatedMs + executingMs + unattendedMs === elapsedMs` identity and lose
+    // the disclosure, so the two lines are labelled as different measures
+    // instead. Pinned here because nothing else asserts the caveat renders.
+    expect(review?.description).toContain("NOT a bucket of the elapsed split above");
+    expect(review?.description).toContain("do not sum");
     // BLO-27698 C2 positive control for the wording split (Ally finding 1 on
     // #1856). The retry spans essentially the whole 7h episode, so the
     // no-executable-turn share clears NO_EXECUTABLE_TURN_DOMINANT_SHARE and
@@ -4979,6 +4988,131 @@ describeEmbeddedPostgres("productivity review service", () => {
       issueId: seeded.issueId,
       createdAt: new Date(now.getTime() - 10 * 60 * 1000),
       status: "queued",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  // BLO-25722 (b): a capacity park after it RESOLVED — promoted, claimed, and
+  // run through to a terminal status. `scheduleBoundedRetryForRun` inserts the
+  // park as its own row, so `createdAt` is the park start and `startedAt` is
+  // the post-park claim; the park interval is `[createdAt, startedAt)` whatever
+  // the row's status has since become.
+  async function insertResolvedCapacityParkRun(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    createdAt: Date;
+    scheduledRetryAt: Date;
+    startedAt: Date;
+    finishedAt: Date;
+    status?: "succeeded" | "failed" | "running";
+    // Overridden by the negative control below to make the identical park
+    // non-capacity-class.
+    scheduledRetryReason?: string | null;
+    errorCode?: string | null;
+  }) {
+    const runId = randomUUID();
+    const status = input.status ?? "succeeded";
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      status,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      errorCode: input.errorCode === undefined ? "rate_limit_exhausted" : input.errorCode,
+      scheduledRetryAt: input.scheduledRetryAt,
+      scheduledRetryAttempt: 0,
+      scheduledRetryReason:
+        input.scheduledRetryReason === undefined ? "ccrotate_capacity" : input.scheduledRetryReason,
+      startedAt: input.startedAt,
+      finishedAt: status === "running" ? null : input.finishedAt,
+      lastOutputAt: input.finishedAt,
+      usageJson: { inputTokens: 1000, outputTokens: 500 },
+      contextSnapshot: { issueId: input.issueId, taskId: input.issueId },
+      createdAt: input.createdAt,
+      updatedAt: input.createdAt,
+    });
+    return { runId };
+  }
+
+  // Shared fixture for the BLO-25722 (b) pair below: a 10h episode whose first
+  // 8h is a single park, then ~1h of real execution, then a still-queued run.
+  // The trailing queued run is load-bearing — it keeps the episode anchor
+  // (`max(startedAt)`) from jumping past the park, without which the resolved
+  // park sits outside the attributable window and the classification under
+  // test is never reached.
+  async function seedResolvedParkEpisode(overrides: {
+    scheduledRetryReason?: string | null;
+    errorCode?: string | null;
+  }) {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 10 * 60 * 60 * 1000);
+    const parkEnd = new Date(now.getTime() - 2 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    await insertResolvedCapacityParkRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      createdAt: episodeStart,
+      scheduledRetryAt: parkEnd,
+      startedAt: parkEnd,
+      finishedAt: new Date(now.getTime() - 60 * 60 * 1000),
+      ...overrides,
+    });
+    await insertNeverDispatchedRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      createdAt: new Date(now.getTime() - 30 * 60 * 1000),
+      status: "queued",
+    });
+    return { now, seeded };
+  }
+
+  // BLO-25722 (b). On `master` the capacity branch was gated by
+  // `if (run.status === "scheduled_retry")`, so a park scored zero the moment
+  // it *resolved* — an under-count in the suppression numerator, which makes
+  // false-positive reviews MORE likely. The recorded fixture is BLO-27143
+  // (source BLO-22300): run `e048aea2` parked 8092 minutes on
+  // `ccrotate_capacity` — 72% of a 7d19h episode — yet reached terminal
+  // `succeeded`, and `master` scored that episode at 6%.
+  //
+  // Asserted as non-generation rather than on rendered prose: the park is 80%
+  // of this episode, which clears the dominance share, so the correct outcome
+  // is that the review never fires. The negative control immediately below is
+  // what makes that meaningful — it proves the fixture is otherwise fully
+  // trigger-worthy.
+  it("suppresses long_active_duration when a RESOLVED capacity park dominates the episode (BLO-25722 (b), BLO-27143 shape)", async () => {
+    const { now, seeded } = await seedResolvedParkEpisode({});
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // Negative control for the test above, and simultaneously the regression
+  // guard for the `if (run.status === "scheduled_retry") return null;` early
+  // return that BLO-25722 (b) preserved: byte-identical fixture except the park
+  // is not capacity-class, so its 8h is genuine assignee time and the review
+  // MUST still fire. Without this, the assertion above is satisfied by any
+  // unrelated suppression — including the widening never running at all.
+  it("still fires long_active_duration when the same resolved park is not capacity-class (BLO-25722 (b) negative control)", async () => {
+    const { now, seeded } = await seedResolvedParkEpisode({
+      scheduledRetryReason: "transient_failure",
+      errorCode: null,
     });
 
     const result = await productivityReviewService(db).reconcileProductivityReviews({
