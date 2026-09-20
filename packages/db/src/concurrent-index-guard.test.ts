@@ -10,7 +10,7 @@
  * state 0226 leaves behind, it must build the index and fail loudly — never
  * silently — if the build does not leave a valid index in place.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import postgres from "postgres";
 import { applyPendingMigrations } from "./client.js";
 import {
@@ -224,16 +224,38 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
       ...CRASH_RECOVERY_SPEC,
       createStatement: "BEGIN; SELECT 1 / 0;",
     };
-    const logged: string[] = [];
+    // Deliberately passing no `log`: with one supplied, `log` (the no-op-by-
+    // default progress channel) and `warn` (the cleanup channel) are the SAME
+    // function object, so this assertion could not tell them apart and would
+    // still pass if cleanup regressed onto `log`. Spying the `console.warn`
+    // default discriminates that, and is also the only branch the two
+    // production callers ever take -- neither passes options.
+    //
+    // The spy also throws once, on the first cleanup message: a reporter that
+    // itself throws must not replace the build error nor skip the steps after
+    // it, `sql.end()` included. That is the same masking defect one layer up,
+    // so the three assertions below pin both guards at once.
+    const warned: string[] = [];
+    let reporterShouldThrow = true;
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation((message: string) => {
+      if (!message.startsWith("concurrent-index cleanup:")) return;
+      warned.push(message);
+      if (reporterShouldThrow) {
+        reporterShouldThrow = false;
+        throw new Error("cleanup reporter exploded");
+      }
+    });
+    cleanups.push(async () => warnSpy.mockRestore());
 
     await expect(
       ensurePendingConcurrentIndexes(database.connectionString, {
         specs: [abortingSpec],
-        log: (message) => logged.push(message),
       }),
     ).rejects.toThrow(/division by zero/);
 
-    expect(logged.filter((message) => message.startsWith("concurrent-index cleanup:"))).toHaveLength(3);
+    // Three, not two: the reporter threw on the first one, and the two steps
+    // after it still ran and still reported.
+    expect(warned).toHaveLength(3);
 
     // The advisory lock is session-scoped, so Postgres only releases it when
     // the backend exits -- it is therefore gone if and only if `sql.end()`

@@ -372,7 +372,14 @@ export async function ensurePendingConcurrentIndexes(
       try {
         await step();
       } catch (error) {
-        warn(`concurrent-index cleanup: ${what} failed: ${error instanceof Error ? error.message : String(error)}`);
+        // `warn` is caller-supplied, so a throw from it would escape this
+        // `catch` and reinstate both defects one layer up: it would replace
+        // the build error and skip the steps below, `sql.end()` included.
+        try {
+          warn(`concurrent-index cleanup: ${what} failed: ${error instanceof Error ? error.message : String(error)}`);
+        } catch {
+          // nothing left to report it with.
+        }
       }
     };
     if (lockAcquired) {
