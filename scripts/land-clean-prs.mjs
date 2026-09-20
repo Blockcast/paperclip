@@ -399,6 +399,18 @@ export function checkSettlement(
   const optOut = SKIP_LABELS.find((label) => labels.includes(label));
   if (optOut) return row("skip", `label:${optOut}`);
 
+  // Draft is the author's own "not this one", in the same category as the
+  // opt-out labels above, and it is the only machine-readable form a deliberate
+  // sequencing hold reliably takes. trafficcontrol#1726 is the case: draft,
+  // CLEAN, Ally-authored, reviewed clean, and its body reads "Draft, and
+  // blocked by design. Do not merge before magma#1936" — the two repos carry a
+  // byte-identical proto sharing one field-number space, so landing this half
+  // alone is the BLO-29906 breakage. It classified `enqueue` until this rule
+  // existed; GitHub would have refused the auto-merge, but relying on that is
+  // luck, and it evaporates the moment someone marks the PR ready while the
+  // sequencing constraint still holds.
+  if (pr?.isDraft === true) return row("skip", "draft");
+
   if (pr?.autoMergeRequest) {
     const enabledAt = Date.parse(pr.autoMergeRequest.enabledAt ?? "");
     // An unparseable timestamp must not read as infinitely old: treating it as
@@ -520,7 +532,7 @@ export function renderReceipt(rows) {
 }
 
 const PR_LIST_FIELDS =
-  "number,headRefOid,author,labels,autoMergeRequest,mergeStateStatus,reviewRequests";
+  "number,headRefOid,author,labels,isDraft,autoMergeRequest,mergeStateStatus,reviewRequests";
 
 function gh(args) {
   return execFileSync("gh", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });

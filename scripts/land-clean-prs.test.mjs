@@ -83,6 +83,19 @@ describe("classifyPr rule order", () => {
     }
   });
 
+  it("skips a draft, however clean it looks", () => {
+    // Draft is the author's own opt-out and the only machine-readable form a
+    // deliberate sequencing hold reliably takes. trafficcontrol#1726 is the
+    // case: draft, CLEAN, Ally-authored, reviewed clean, body reading "Do not
+    // merge before magma#1936" — a shared proto field-number space that
+    // landing this half alone would break.
+    const row = classify({ isDraft: true, mergeStateStatus: "CLEAN" });
+    assert.equal(row.action, "skip");
+    assert.equal(row.reason, "draft");
+    // And it must be decidable without paying for checks and reviews.
+    assert.equal(classifyFromListing(pr({ isDraft: true }), { now: NOW }).reason, "draft");
+  });
+
   it("reports a fresh auto-merge request as already-enqueued", () => {
     const row = classify({ autoMergeRequest: { enabledAt: "2026-09-13T10:00:00Z" } });
     assert.equal(row.action, "already-enqueued");
@@ -348,8 +361,7 @@ describe("approval rot (BLO-33208)", () => {
   });
 });
 
-describe("check settling floor (BLO-33208 bucket-B age floor)", () => {
-  const at = (iso) => [{ name: "verify", conclusion: "SUCCESS", completedAt: iso }];
+describe("check settling floor (BLO-33208 bucket-B age floor)", () => {  const at = (iso) => [{ name: "verify", conclusion: "SUCCESS", completedAt: iso }];
 
   it("treats a rollup with zero rows as a stop, not a pass", () => {
     // Nothing reporting means nothing attested this head, which renders
