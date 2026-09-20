@@ -18434,9 +18434,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * index absent or invalid — so a latched worker would silently resume the
    * sequential scan and top-N sort this gate exists to prevent, with no further
    * catalog check ever. Revalidating on every periodic pass is Ally's own first
-   * remedy and needs no tunable: this is one indexed catalog lookup per
-   * scheduler tick per replica, which is noise next to the scan it guards
-   * against, and it makes the gate recover in BOTH directions.
+   * remedy and needs no tunable: this is one indexed catalog lookup, which is
+   * noise next to the scan it guards against, and it makes the gate recover in
+   * BOTH directions.
+   *
+   * Exported as `publishCrashRecoveryCandidateIndexGauge` and called a second
+   * time per tick from above both scheduler gates (BLO-21526). Two catalog
+   * lookups per tick per replica instead of one, deliberately: the gate needs
+   * its own read so it acts on the value it published, and the gauge needs a
+   * publisher that a suppressed or still-recovering replica reaches — a
+   * database restore both suppresses the scheduler AND is a leading way to
+   * lose the index, which is exactly where the signal must not go dark.
    *
    * A probe FAILURE means we do not know, so it skips this one periodic tick
    * (startup recovery is ungated) and the next tick asks again.
@@ -38711,6 +38719,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     publishAgentLivenessGauges,
     publishGithubReviewDeadLetterGauge,
     publishAgentWakeupTerminalFailedGauge,
+    // BLO-21526: exported so the gauge has a publisher ABOVE both scheduler
+    // gates, not only the gated reconciliation's own gate read. Same defect
+    // and same remedy as BLO-31335 — see the registration in index.ts.
+    publishCrashRecoveryCandidateIndexGauge: crashRecoveryCandidateIndexPresent,
 
     getRunLogAccess,
 

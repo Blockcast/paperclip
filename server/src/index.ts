@@ -1376,27 +1376,33 @@ export async function startServer(): Promise<StartedServer> {
       void (async () => {
         if (heartbeatSchedulerStopped) return;
 
-        // All three gauge publishers are registered above BOTH gates — the
+        // All four gauge publishers are registered above BOTH gates — the
         // startup-recovery gate immediately below and the scheduling-suppression
-        // gate further down (BLO-31335).
+        // gate further down (BLO-31335, extended by BLO-21526).
         //
         // The startup-recovery gate matters as much as the suppression one, and
-        // for the same reason. Every one of these gauges is zero-initialized at
-        // registration, so a replica that early-returned here would not render
-        // "No data" while recovery ran — it would export a confident `0`. That
-        // chain (crash reconciliation, orphan reaping, reattach, issue-graph
-        // liveness, watchdogs, silent-run scan, productivity, blocker
-        // dependents, wake dispatches) is long and serial, so the exposure is
-        // "recovery duration + one tick", not "one tick", and it lands hardest
-        // on a replica crash-looping through startup. Fabricated health is the
-        // defect this issue exists to remove; time-boxing it to boot does not
-        // make it a different defect.
+        // for the same reason. The three BLO-31335 gauges are zero-initialized
+        // at registration, so a replica that early-returned here would not
+        // render "No data" while recovery ran — it would export a confident
+        // `0`. That chain (crash reconciliation, orphan reaping, reattach,
+        // issue-graph liveness, watchdogs, silent-run scan, productivity,
+        // blocker dependents, wake dispatches) is long and serial, so the
+        // exposure is "recovery duration + one tick", not "one tick", and it
+        // lands hardest on a replica crash-looping through startup. Fabricated
+        // health is the defect this issue exists to remove; time-boxing it to
+        // boot does not make it a different defect.
         //
-        // Publishing during recovery is safe: all three are read-only queries
+        // The candidate-index gauge fails the other way — it is labeled, so it
+        // renders nothing until probed — and it still belongs above this gate:
+        // an unpublished series makes its `== 0` alert structurally silent, and
+        // recovery is exactly when a database that just came back without the
+        // index is being reconciled against.
+        //
+        // Publishing during recovery is safe: all four are read-only queries
         // plus a full-rewrite metric set, so a value observed mid-recovery is
         // self-correcting on the next tick rather than sticky.
         //
-        // All three registrations are synchronous and precede this callback's
+        // All four registrations are synchronous and precede this callback's
         // first `await`, so hoisting them above the recovery gate does not open
         // a BLO-20822 shutdown-drain window: `heartbeatSchedulerStopped` is
         // still checked first, and the work is registered with
@@ -1438,6 +1444,28 @@ export async function startServer(): Promise<StartedServer> {
           .catch((err) => {
             // Defensive only, as above.
             logger.error({ err }, "periodic wake-terminal-failed gauge publication failed");
+          }));
+
+        // BLO-21526: the crash-recovery candidate-index gauge, for the same
+        // reason and in the same place. Its only publisher used to be the
+        // gate read inside the periodic reconciliation below, which sits under
+        // the suppression gate AND the `crashReconcileSweepInFlight` latch, so
+        // the series went dark on a suppressed replica and was never published
+        // at all during startup recovery. `database_restore_in_progress`
+        // suppresses the scheduler and is a leading way to end up WITHOUT the
+        // index, so that was blindness precisely where the risk concentrates —
+        // and a cleared series makes the `== 0` Missing alert structurally
+        // silent, leaving only Unobservable, whose remediation then names
+        // three things that all look healthy under a restore.
+        //
+        // The gate below keeps its own read: it must act on the value it
+        // publishes, not on a value this unit read at some other moment.
+        trackHeartbeatSchedulerWork(heartbeat
+          .publishCrashRecoveryCandidateIndexGauge()
+          .catch((err) => {
+            // Defensive only: the probe wraps its own body in try/catch, clears
+            // the gauge and returns false rather than throwing.
+            logger.error({ err }, "periodic crash-recovery candidate-index gauge publication failed");
           }));
 
         if (heartbeatStartupRecoveryPending) return;

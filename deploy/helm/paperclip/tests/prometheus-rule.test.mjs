@@ -1259,6 +1259,16 @@ test("PaperclipCrashRecoveryCandidateIndex{Missing,Unobservable} distinguish a m
     "the missing-index arm must key on the gauge reading 0, not on its absence",
   );
 
+  // The aggregation must KEEP the `index` label. It is the only place the
+  // index name survives onto the firing alert — everywhere else it is prose in
+  // the description — and a bare `max()` would OR a second deferred index into
+  // one series the moment one is published through this gauge.
+  assert.match(
+    missingExpr,
+    /max by \(index\) \(/,
+    "aggregate with max by (index) so the firing alert names which index is missing",
+  );
+
   const [, absentExpr] = rendered.match(
     /alert: PaperclipCrashRecoveryCandidateIndexUnobservable[\s\S]*?\n\s+expr: (.+)\n/,
   ) ?? [];
