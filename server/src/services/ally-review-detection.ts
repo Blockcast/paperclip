@@ -377,6 +377,19 @@ function asSeverityCounts(raw: unknown): Map<string, number> | string {
     if (value > MAX_VERDICT_FINDING_COUNT) {
       return `ally-verdict findings count \`${key}\` exceeds ${MAX_VERDICT_FINDING_COUNT}`;
     }
+    // Two JSON keys that normalize to the same severity are distinct until the
+    // `toLowerCase` above, so `JSON.parse` keeps both and an unconditional set
+    // would let the last one win: `{"critical":1,"Critical":0}` would parse ok
+    // with `critical: 0` and clear the head. This is the BLO-29711 hole the
+    // unsupported-key guard at :368 was written to close, arriving through a
+    // key that *is* recognized — `{"critcal":1}` already fails closed,
+    // `{"Critical":1}` did not. Unlike an exact duplicate key, which JSON.parse
+    // collapses before we see it, this is reachable. The key is not quoted for
+    // the PEN-3157 reason above, and naming it is not needed: the defect is the
+    // repetition, not which severity repeated.
+    if (counts.has(key)) {
+      return "ally-verdict findings state the same severity twice";
+    }
     counts.set(key, value);
   }
   // Absent counts are not zero counts — the same rule the caller applies to a
@@ -638,7 +651,13 @@ function proseCountContradicting(text: string, counts: Map<string, number>): str
     const key = severity!.toLowerCase();
     if (!BLOCKING_SEVERITIES.has(key)) continue;
     if (Number(count) > 0 && counts.get(key) === 0) {
-      return `ally-verdict states 0 \`${key}\` but the review enumerates ${count}`;
+      // `count` is the `(\d+)` capture over model-authored review text, so it
+      // is digits-only but unbounded in length, and this reason reaches the
+      // check-run summary, which has no cap of its own. A noise bound, not a
+      // security one — digits cannot carry a credential — so it is the same
+      // call already made for `rawVersion` at :495 and for token length in
+      // asPublishableToken, applied here for the symmetry.
+      return `ally-verdict states 0 \`${key}\` but the review enumerates ${count!.slice(0, PUBLISHABLE_TOKEN_BUDGET)}`;
     }
   }
   return null;
@@ -677,10 +696,13 @@ function hasNonNegatedMatch(text: string, pattern: RegExp): boolean {
 
 // The alphabet a prose ledger entry may spell its verb in, and — because it is
 // the same question — the alphabet any model-authored token may be quoted in
-// when the gate names it publicly. Shared as source text with the verb group of
-// PRIOR_FINDING_DISPOSITION_PATTERN below so the parser's alphabet and the
-// publisher's cannot drift; "the publisher's alphabet is the parser's alphabet"
-// in pr-comment-review-gate.test.ts drives both and pins that they agree.
+// when the gate names it publicly. Deliberately NOT interpolated into the verb
+// group of PRIOR_FINDING_DISPOSITION_PATTERN below: that group must stay a
+// literal for the PEN-3157 source-text pin, for the reason set out there. The
+// two copies are held equal by "the publisher's alphabet is the parser's
+// alphabet" in pr-comment-review-gate.test.ts, which drives both and is
+// non-trivial because they embed the alphabet differently — anchored here,
+// inside the list-item match there.
 //
 // The structured block deliberately does NOT enforce it. An unknown verb
 // already fails closed as `unrecognized`, so rejecting the whole block over a
@@ -745,10 +767,23 @@ export function asPublishableToken(token: string): string {
 // so the bound excludes no observed real entry; and an entry it did exclude
 // would leave a visible red rather than a silent green.
 //
-// The verb group is PUBLISHABLE_TOKEN_ALPHABET, shared with the publisher
-// guard above so the two cannot drift.
+// The verb group is a deliberate SECOND literal copy of
+// PUBLISHABLE_TOKEN_ALPHABET, not an interpolation of it. The PEN-3157 pin in
+// server/src/__tests__/github-write-egress-scrub.test.ts (master, added by
+// 1a895b2f8, last touched 43c3875de) reads `([a-z][a-z-]*)` out of this
+// pattern's own SOURCE TEXT, so interpolating the constant here makes a
+// refactor that widens nothing read to that test as a widening of a security
+// bound. The file is absent from this branch — it landed on master after this
+// branch diverged, and CI builds `refs/pull/N/merge` — so `grep` in a worktree
+// reports it missing. Commit 8e6e84bd0 made exactly that measurement and
+// concluded the reference was false, which re-opened this red; the file exists
+// and has never been deleted.
+//
+// The two copies cannot drift: "the publisher's alphabet is the parser's
+// alphabet" in pr-comment-review-gate.test.ts drives the real parser over a
+// verb corpus and asserts isPublishableToken agrees on every one.
 const PRIOR_FINDING_DISPOSITION_PATTERN = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE} {0,3}-[ \t]*\*\*[ \t]*prior:([0-9a-f]{7,40})[ \t]+([a-z]+)[ \t]+(\d+)[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*(${PUBLISHABLE_TOKEN_ALPHABET})[ \t]*(?:—|–|-)`,
+  String.raw`^${NOT_INDENTED_CODE} {0,3}-[ \t]*\*\*[ \t]*prior:([0-9a-f]{7,40})[ \t]+([a-z]+)[ \t]+(\d+)[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*([a-z][a-z-]*)[ \t]*(?:—|–|-)`,
   "gim",
 );
 
@@ -1158,15 +1193,37 @@ export function hasActionablePrReviewFeedback(
   if (normalizedState === "changes_requested" || normalizedState === "changes-requested") return true;
   if (typeof body !== "string") return false;
 
-  // With a structured block, the blocking-severity counts decide and nothing
-  // else is consulted. This is the AC-3 half of BLO-32695: `blocking_finding`
-  // becomes reachable only from a finding Ally actually counted, never from
-  // prose that merely reads as actionable. The clauses below stay for
-  // block-less bodies, where dropping them would fail open.
+  // With a structured block, the counts and the ledger decide and nothing else
+  // is consulted. This is the AC-3 half of BLO-32695: `blocking_finding`
+  // becomes reachable only from a finding Ally actually counted or a ledger
+  // entry Ally actually wrote, never from prose that merely reads as
+  // actionable. The clauses below stay for block-less bodies, where dropping
+  // them would fail open.
   const block = parseAllyVerdictBlock(body);
   if (block.kind === "ok") {
     for (const [severity, count] of block.verdict.findings) {
       if (BLOCKING_SEVERITIES.has(severity) && count > 0) return true;
+    }
+    // The structured twin of the prose ledger clause at :1102, and it is load
+    // bearing for the same reason that one is: the contract says a
+    // still-standing finding is mirrored into the current buckets, and this is
+    // the defence for when that mirroring is omitted. Deciding from `findings`
+    // alone made a block stating `{"critical":0}` beside a ledger entry saying
+    // a prior Critical is `still-present` return false, and
+    // `evaluateCommentReviewGate` short-circuits on a current-head attestation
+    // before consulting the carry-forward, so nothing downstream re-examined
+    // it: `pr-comment-review-gate.ts:596` forHead truthy -> here -> false ->
+    // `success`/`clean`. That was a fail-open regression against master, where
+    // the identical body without a block blocks via :1102, and a live reader
+    // disagreement besides — `check-ally-review-consistency.mjs` reads the
+    // same block as blocking and raises I2c. Found in peer review of #1721 at
+    // 8e6e84bd. Gated on the same option as the prose clause so the
+    // carry-forward enumeration keeps asking its narrower question.
+    if (
+      options?.countInheritedLedgerAssertion !== false &&
+      block.verdict.dispositions.some((entry) => classifyPriorDisposition(entry.verb) === "blocks")
+    ) {
+      return true;
     }
     return false;
   }

@@ -1073,6 +1073,36 @@ class TestParseReviewedHead(unittest.TestCase):
             )
         )
 
+    def test_two_keys_normalizing_to_one_severity_fail_closed(self):
+        """Peer review of #1721 at 8e6e84bd -- shared by all three readers.
+
+        `json.loads` keeps "critical" and "Critical" as distinct keys; they
+        become one severity only at the `.lower()` in severity_counts, where an
+        unconditional assignment let the last one win. So a block stating a
+        Critical could read clean. Reachable precisely because the keys differ
+        in case -- an exact duplicate is collapsed by the parser before this
+        code sees it. Both orders, because last-wins made the verdict depend on
+        key order and a guard catching only one order leaves the dangerous one.
+        """
+        for payload in (
+            '{"critical":0,"Critical":1,"important":0}',
+            '{"Critical":1,"critical":0,"important":0}',
+        ):
+            body = '<!-- ally-verdict:1\n{"head":"%s","findings":%s}\n-->' % (
+                self.HEAD,
+                payload,
+            )
+            self.assertIsNone(sweep.parse_reviewed_head(body), payload)
+
+    def test_distinct_severities_are_still_accepted(self):
+        """Control: without it the guard would reject every honest verdict."""
+        body = (
+            '<!-- ally-verdict:1\n'
+            '{"head":"%s","findings":{"critical":0,"important":0,"suggestions":1}}\n'
+            "-->" % self.HEAD
+        )
+        self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
+
     def test_a_zero_padded_version_reads_the_same_here_as_in_the_two_js_readers(self):
         """Peer review of #1721, Suggestion 1 -- the version compare diverged.
 

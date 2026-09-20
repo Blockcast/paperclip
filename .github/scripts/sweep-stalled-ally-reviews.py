@@ -274,6 +274,12 @@ def severity_counts(raw):
         key = js_trim(severity).lower() if isinstance(severity, str) else None
         if key not in VERDICT_SEVERITIES:
             return None
+        # Two keys normalizing to one severity: last-wins would let
+        # {"critical":1,"Critical":0} read clean. Mirrors the guard in
+        # ally-review-detection.ts and check-ally-review-consistency.mjs -- all
+        # three readers shared the bug identically, so none of them caught it.
+        if key in counts:
+            return None
         counts[key] = value
     if any(severity not in counts for severity in BLOCKING_SEVERITIES):
         return None

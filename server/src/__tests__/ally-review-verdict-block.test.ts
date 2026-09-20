@@ -586,6 +586,57 @@ describe("BLO-32695 — an unknown severity key fails closed, not open", () => {
     ).toMatchObject({ kind: "ok" });
   });
 
+  // The same fail-open arriving through a key that IS recognized.
+  //
+  // `{"critcal":1}` above fails closed; `{"Critical":1,"critical":0}` did not.
+  // The keys are distinct to `JSON.parse` — it keeps both — and only become one
+  // severity at the `trim().toLowerCase()` in the count loop, where an
+  // unconditional `set` let the last one win. So a block could state a Critical
+  // and clear the head, which is the BLO-29711 direction the unknown-key guard
+  // was written to close, entering through the door that guard holds open. An
+  // exact duplicate key is not reachable — `JSON.parse` collapses those before
+  // this code sees them — which is why case is the shape that matters.
+  //
+  // Found by Ally in review of #1721 at 8e6e84bd, who also established that
+  // `proseCountContradicting` cannot rescue it: the producer template heads
+  // buckets `### 🚨 Critical` with no `(N)`, which the emitted-bucket pattern
+  // requires. All three readers shared the bug identically, so no peer reader
+  // caught it either; the mjs and Python guards are pinned in their own suites.
+  describe("two keys normalizing to one severity fail closed", () => {
+    it("reads a case-variant duplicate as unreadable, not as the last value written", () => {
+      expect(parseAllyVerdictBlock(agreeing({ critical: 0, Critical: 1, important: 0 }))).toMatchObject({
+        kind: "unreadable",
+        reason: /same severity twice/,
+      });
+    });
+
+    it("fails closed whichever order the block states them in", () => {
+      // Order-independence is the whole point: last-wins is what made the
+      // verdict depend on key order, so a guard that only catches one order
+      // leaves the dangerous one — non-zero first, zero second — still live.
+      expect(parseAllyVerdictBlock(agreeing({ Critical: 1, critical: 0, important: 0 }))).toMatchObject({
+        kind: "unreadable",
+      });
+    });
+
+    it("names the repetition without quoting the model-authored key", () => {
+      // PEN-3157: this reason reaches the same unscrubbed boundary as the
+      // ledger verb. The defect is the repetition, not which severity
+      // repeated, so there is nothing to quote.
+      const parsed = parseAllyVerdictBlock(agreeing({ critical: 0, Critical: 1, important: 0 }));
+      expect(parsed).toMatchObject({ kind: "unreadable" });
+      expect((parsed as { reason: string }).reason).not.toMatch(/`/);
+    });
+
+    it("control: distinct severities are still accepted", () => {
+      // Without this the guard could be satisfied by any second key at all,
+      // which would reject every honest verdict.
+      expect(
+        parseAllyVerdictBlock(agreeing({ critical: 0, important: 0, suggestions: 1 })),
+      ).toMatchObject({ kind: "ok" });
+    });
+  });
+
   it("does not constrain disposition severities, which are open by design", () => {
     // #1675's ledger retires `prior:583085ded recommended-action 4` — failure #4
     // of this row. The findings vocabulary is closed because a typo there clears
@@ -1329,6 +1380,27 @@ describe("BLO-32695 — the block and the prose must not name different counts",
       kind: "unreadable",
       reason: expect.stringContaining("critical"),
     });
+  });
+
+  // Peer review of #1721, Suggestion 1. The count is a `(\d+)` capture over
+  // model-authored text: digits-only, but unbounded in length, and this reason
+  // reaches the check-run summary, which has no cap of its own. A noise bound
+  // rather than a security one — digits cannot carry a credential — so this
+  // pins the same call already made for `rawVersion` and for token length.
+  //
+  // Without this the bound had no failing mutation: dropping the `.slice` left
+  // all 219 tests in the two gate suites green, which made it a comment rather
+  // than a guard.
+  it("bounds the enumerated count it quotes back", () => {
+    const flood = "9".repeat(400);
+    const result = parseAllyVerdictBlock(
+      body({ head: PR1675_HEAD, findings: { critical: 0, important: 0 } }, `### Critical Issues (${flood})`),
+    );
+    expect(result).toMatchObject({ kind: "unreadable" });
+    const reason = (result as { reason: string }).reason;
+    expect(reason).not.toContain(flood);
+    expect(reason).toContain("9".repeat(48));
+    expect(reason).not.toContain("9".repeat(49));
   });
 
   it("does not resolve that body to success", () => {

@@ -183,6 +183,39 @@ describe("attestedHead", () => {
     assert.equal(attestedHead(`_Reviewed head: \`${HEAD}\`_`), HEAD);
   });
 
+  // This reader was left on the narrow `(?:[_*]+)?` / `` \`? `` form while the
+  // gate and the Python sweep were both widened, so the emphasis forms below
+  // measured gate 1 / python 1 / mjs 0 on the same bodies. The first is named
+  // verbatim in ally-review-detection.ts's own comment as the BLO-31730 shape
+  // — the single permitted run is consumed by `**` and cannot then cross the
+  // space to reach the backtick.
+  //
+  // Block-carrying bodies masked it, because attestedHead falls through to the
+  // block's head. The harm landed on the whole pre-block population, where
+  // operativeAllyReviews dropped a review the gate reads fine — in a script
+  // whose stated purpose is reader parity. Found by Ally reviewing #1721 at
+  // 8e6e84bd. No block in these fixtures, deliberately: with one they pass
+  // whether or not the prose regex works.
+  for (const [label, line] of [
+    ["emphasis closing after the colon", `**Reviewed head:** \`${HEAD}\``],
+    ["underscore emphasis closing after the colon", `_Reviewed head:_ ${HEAD}`],
+    ["a bold wrapper around the whole line", `**Reviewed head: ${HEAD}**`],
+    ["a backticked SHA with no emphasis", `Reviewed head: \`${HEAD}\``],
+  ]) {
+    it(`parses ${label}, as the gate and the Python sweep do`, () => {
+      assert.equal(attestedHead(line), HEAD);
+    });
+  }
+
+  it("does not widen past the gate's own indent bound", () => {
+    // The converse check: the widening has a direction, and accepting a line
+    // the gate rejects is the same divergence one delimiter out. The gate
+    // bounds the run between emphasis and the label at `[ \t]{0,3}`, and
+    // treats four leading spaces as indented code.
+    assert.equal(attestedHead(`**    Reviewed head:** \`${HEAD}\``), null);
+    assert.equal(attestedHead(`    Reviewed head: ${HEAD}`), null);
+  });
+
   it("returns null when no attestation is present", () => {
     assert.equal(attestedHead("## Ally — Consolidated PR Review"), null);
   });
@@ -211,6 +244,36 @@ describe("attestedHead", () => {
   it("fails closed when the block and the prose line name different heads", () => {
     const other = "a".repeat(40);
     assert.equal(attestedHead(`${block(HEAD)}\nReviewed head: ${other}`), null);
+  });
+
+  // Peer review of #1721 at 8e6e84bd -- shared identically by all three
+  // readers, so none of them caught it. `JSON.parse` keeps "critical" and
+  // "Critical" as distinct keys; they become one severity only at the
+  // `toLowerCase` in severityCountsIn, where an unconditional `set` let the
+  // last one win, so a block stating a Critical could read clean. Reachable
+  // because the keys differ in CASE -- an exact duplicate is collapsed by the
+  // parser first. Both orders, because last-wins made the verdict depend on
+  // key order and a guard catching one order leaves the dangerous one live.
+  for (const findings of [
+    `{"critical":0,"Critical":1,"important":0}`,
+    `{"Critical":1,"critical":0,"important":0}`,
+  ]) {
+    it(`fails closed on two keys normalizing to one severity: ${findings}`, () => {
+      assert.equal(
+        attestedHead(`<!-- ally-verdict:1\n{"head":"${HEAD}","findings":${findings}}\n-->`),
+        null,
+      );
+    });
+  }
+
+  it("still accepts distinct severities", () => {
+    // Control: without it the guard would reject every honest verdict.
+    assert.equal(
+      attestedHead(
+        `<!-- ally-verdict:1\n{"head":"${HEAD}","findings":{"critical":0,"important":0,"suggestions":1}}\n-->`,
+      ),
+      HEAD,
+    );
   });
 
   it("fails closed on two blocks rather than falling back to prose", () => {

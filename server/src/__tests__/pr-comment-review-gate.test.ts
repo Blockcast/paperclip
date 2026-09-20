@@ -559,12 +559,16 @@ describe("evaluateCommentReviewGate", () => {
   });
 
   it("the publisher's alphabet is the parser's alphabet", () => {
-    // `[a-z][a-z-]*` is PUBLISHABLE_TOKEN_ALPHABET in ally-review-detection.ts,
-    // interpolated into both the verb group of PRIOR_FINDING_DISPOSITION_PATTERN
-    // and the anchored pattern behind isPublishableToken. Sharing the source
-    // text is what stops them drifting; this test is what proves sharing it
-    // actually yields the same answers, since the two embed it differently —
-    // one anchored `^…$`, one inside a larger bold-list-item match.
+    // `[a-z][a-z-]*` appears TWICE in ally-review-detection.ts: as
+    // PUBLISHABLE_TOKEN_ALPHABET behind isPublishableToken, and as a literal
+    // verb group inside PRIOR_FINDING_DISPOSITION_PATTERN. The duplication is
+    // deliberate — the PEN-3157 pin in master's github-write-egress-scrub.test
+    // reads that group out of the pattern's own source text, so interpolating
+    // the constant there reads as a widening of a security bound. THIS TEST IS
+    // WHAT MAKES THE DUPLICATION SAFE, so it is load-bearing rather than
+    // belt-and-braces: it drives both copies and pins that they agree, which is
+    // non-trivial because they embed the alphabet differently — one anchored
+    // `^…$`, one inside a larger bold-list-item match.
     //
     // The bound only holds if the publisher's copy is no WIDER than the
     // parser's: a verb the parser will extract from prose and the publisher
@@ -1421,6 +1425,76 @@ describe("clean-review precedence over the Recommended Action prose fallback", (
     expect(hasActionablePrReviewFeedback(reviewBody(CURRENT_HEAD, [...ledger, ...unterminatedFence]))).toBe(
       true,
     );
+  });
+
+  // The same assertion, carried by the STRUCTURED block instead of prose.
+  //
+  // Every block-carrying still-present fixture above attests INTERMEDIATE_HEAD
+  // while evaluating CURRENT_HEAD, so all of them exercise the carried path and
+  // none placed the entry at the head under evaluation — the case one head over
+  // from the one written. That gap hid a fail-open: the `ok` branch of
+  // hasActionablePrReviewFeedback decided from `verdict.findings` alone, so a
+  // block stating `{"critical":0,"important":0}` beside a ledger entry saying a
+  // prior Critical is `still-present` returned false. evaluateCommentReviewGate
+  // short-circuits on a current-head attestation before consulting the
+  // carry-forward, so nothing downstream re-examined it and the gate published
+  // `success`/`clean`. A regression against master, where the identical body
+  // without a block blocks via the prose clause. Found by Ally in review of
+  // #1721 at 8e6e84bd.
+  const blockCarryingStillPresent = (headSha: string, verb: string) =>
+    [
+      "## Ally — Consolidated PR Review",
+      "",
+      "<!-- ally-verdict:1",
+      JSON.stringify({
+        head: headSha,
+        findings: { critical: 0, important: 0, suggestions: 0 },
+        dispositions: [{ head: OLD_HEAD.slice(0, 7), severity: "critical", index: 1, verb }],
+      }),
+      "-->",
+      "",
+      `Reviewed head: ${headSha}`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+      "### Recommended Action",
+      "1. No Critical issues to fix before merge.",
+    ].join("\n");
+
+  it("still blocks a structured 0/0 block whose ledger asserts still-present at this head", () => {
+    expect(hasActionablePrReviewFeedback(blockCarryingStillPresent(CURRENT_HEAD, "still-present"))).toBe(
+      true,
+    );
+  });
+
+  it("does not clear the head when a structured still-present block is evaluated end to end", () => {
+    // Driven through the real evaluator, because the unit above passes while
+    // the gate still goes green if the short-circuit ordering is what leaks.
+    // This is the assertion that would have caught the regression.
+    expect(
+      evaluateCommentReviewGate({
+        headSha: CURRENT_HEAD,
+        comments: [allyComment(blockCarryingStillPresent(CURRENT_HEAD, "still-present"), "2026-08-04T21:09:19Z")],
+      }),
+    ).not.toMatchObject({ state: "success" });
+  });
+
+  it("clears a structured block whose ledger only retires prior findings", () => {
+    // Control for both cases above: `fixed` classifies as `retires`. Without
+    // it the new guard could be satisfied by any ledger entry at all, which
+    // would red-wedge every review that correctly reports a fix.
+    expect(hasActionablePrReviewFeedback(blockCarryingStillPresent(CURRENT_HEAD, "fixed"))).toBe(false);
+  });
+
+  it("does not count a structured still-present entry when the caller asks the narrower question", () => {
+    // The carry-forward enumeration asks "which findings did *this head*
+    // raise?" and passes false, for the reason ActionableFeedbackOptions
+    // documents. The structured clause is gated on the same option as its
+    // prose twin, so the two cannot drift on which question they answer.
+    expect(
+      hasActionablePrReviewFeedback(blockCarryingStillPresent(CURRENT_HEAD, "still-present"), undefined, {
+        countInheritedLedgerAssertion: false,
+      }),
+    ).toBe(false);
   });
 
   it("clears a 0/0 review whose ledger only retires prior findings", () => {
