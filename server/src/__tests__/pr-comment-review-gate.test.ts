@@ -67,6 +67,33 @@ function dispositioningReview(headSha: string, priorHeadSha: string, disposition
   ]);
 }
 
+/**
+ * A blocking review raising `findingCount` findings, so a later ledger can
+ * carry a distinct unrecognized verb against each one.
+ */
+function blockingReviewWithFindings(headSha: string, findingCount: number): string {
+  return reviewBody(headSha, [
+    "### Critical Issues (0)",
+    `### Important Issues (${findingCount})`,
+    ...Array.from({ length: findingCount }, (_, i) => `- Finding ${i + 1} on this head.`),
+    "### Recommended Action",
+    "Fix the gate before merge.",
+  ]);
+}
+
+/** A clean review whose ledger dispositions finding `i` with `verbs[i]`. */
+function multiDispositionReview(headSha: string, priorHeadSha: string, verbs: string[]): string {
+  return reviewBody(headSha, [
+    `### Prior Findings Dispositioned (${verbs.length})`,
+    ...verbs.map(
+      (verb, i) =>
+        `- **prior:${priorHeadSha.slice(0, 7)} important ${i + 1}** — ${verb} — re-checked against this head.`,
+    ),
+    "### Critical Issues (0)",
+    "### Important Issues (0)",
+  ]);
+}
+
 describe("evaluateCommentReviewGate", () => {
   it("fails the #1022 shape: an Ally comment finding for the current head", () => {
     const verdict = evaluateCommentReviewGate({
@@ -513,6 +540,61 @@ describe("evaluateCommentReviewGate", () => {
     }
   });
 
+  it("drops a whole verb rather than cutting one in half when the list overflows", () => {
+    // Plural lead (64) + self-attested tail (55) leaves the verb list 21
+    // characters. `"deferred", "pendings"` is 22, so it cannot be rendered
+    // whole — and slicing the JOINED string at 21 yields `"deferred",
+    // "pendings`, which names a verb that is not in the ledger and leaves the
+    // quote open. The author cannot act on either.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [
+        allyComment(blockingReviewWithFindings(OLD_HEAD, 2), "2026-08-04T20:09:19Z"),
+        allyComment(
+          multiDispositionReview(INTERMEDIATE_HEAD, OLD_HEAD, ["deferred", "pendings"]),
+          "2026-08-04T21:09:19Z",
+        ),
+        allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T22:09:19Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    expect(verdict.reason.length).toBeLessThanOrEqual(140);
+    // The verb that fits is rendered whole, and the one that does not is
+    // marked — an author who fixed only what was shown would otherwise
+    // re-push into this same red, which is the loop the tail exists to close.
+    expect(verdict.reason).toContain('"deferred", …');
+    // Every quote closes. This is the invariant, independent of which verbs
+    // the fixture happens to use: a cut inside a token leaves an odd count.
+    expect((verdict.reason.match(/"/g) ?? []).length % 2).toBe(0);
+    // The tail still survives the trim — that is what the budget is for.
+    expect(verdict.reason).toMatch(/the only comment attesting it is the PR author's own/i);
+  });
+
+  it("renders both verbs whole when the list fits the budget exactly", () => {
+    // The control for the case above: `"deferred", "pending"` is exactly the
+    // 21 characters available, so nothing is dropped and no marker appears.
+    // Without this, a fix that always elided would pass the overflow test.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [
+        allyComment(blockingReviewWithFindings(OLD_HEAD, 2), "2026-08-04T20:09:19Z"),
+        allyComment(
+          multiDispositionReview(INTERMEDIATE_HEAD, OLD_HEAD, ["deferred", "pending"]),
+          "2026-08-04T21:09:19Z",
+        ),
+        allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T22:09:19Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    expect(verdict.reason).toContain('"deferred", "pending"');
+    expect(verdict.reason).not.toContain("…");
+    expect(verdict.reason.length).toBeLessThanOrEqual(140);
+  });
+
   it("trims the verb list rather than letting the tail overflow the 140-char cap", () => {
     // The ledger verb is unbounded in length (`[a-z][a-z-]*`), so the fixed
     // prose plus the longest tail is what the verb list has to be budgeted
@@ -534,6 +616,11 @@ describe("evaluateCommentReviewGate", () => {
     expect(verdict.reason.length).toBeLessThanOrEqual(140);
     // Trimmed, not dropped: both clauses still reach the author.
     expect(verdict.reason).toContain('unrecognized ledger verb "dddd');
+    // A single verb longer than the whole budget cannot be cut at an entry
+    // boundary, so it is elided INSIDE its quotes — it still reads as
+    // truncated and still closes, rather than the lead rendering bare.
+    expect(verdict.reason).toContain('…"');
+    expect((verdict.reason.match(/"/g) ?? []).length % 2).toBe(0);
     expect(verdict.reason).toMatch(/the only comment attesting it is the PR author's own/i);
   });
 
