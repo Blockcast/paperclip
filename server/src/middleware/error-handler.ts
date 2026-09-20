@@ -115,13 +115,23 @@ export function errorHandler(
         // `in_review`", and bundling the explanation into that same PATCH is
         // the normal shape, so `PATCH { status: "in_review", comment: "…" }`
         // refused by the evidence gate is exactly the request that loses a
-        // note. `services/issues.ts` is the only producer of this error and it
-        // always writes the two keys together, so they are carried as one
-        // announcement rather than independently. Everything else about the
-        // `{error, missing}` contract agents read is unchanged, and a refusal
-        // that carried no comment still gets neither key.
+        // note. Everything else about the `{error, missing}` contract agents
+        // read is unchanged, and a refusal that carried no comment still gets
+        // neither key.
+        //
+        // `commentHint` is type-guarded like every sibling spread below, since
+        // `details` is a bare `Record<string, unknown>`; `commentPersisted` is
+        // deliberately *not* conditioned on it. The two are independent on
+        // purpose: `commentPersisted: false` is the announcement, and the hint
+        // is a convenience. Gating the pair together would mean a producer that
+        // someday omits or mistypes the hint silently deletes the announcement
+        // as well — reintroducing precisely the silent drop this branch exists
+        // to close, in the one place nobody would look for it.
         ...(details?.commentPersisted === false
-          ? { commentPersisted: false, commentHint: details.commentHint }
+          ? {
+              commentPersisted: false,
+              ...(typeof details.commentHint === "string" ? { commentHint: details.commentHint } : {}),
+            }
           : {}),
       });
       return;
