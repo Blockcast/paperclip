@@ -4688,18 +4688,6 @@ type UsageTotals = {
   outputTokens: number;
 };
 
-/**
- * BLO-29842: prompt tokens that were NOT served from cache — fresh input plus
- * cache creation. This is what `inputTokens` alone meant before cache creation
- * was split out of it, so every consumer that cared about "context size, not
- * cache reads" (session rotation above all) must go through this rather than
- * reading `inputTokens` directly, or its threshold silently loosens.
- *
- * Deliberately the shared `promptTokens` rather than a heartbeat-local twin:
- * two names for one concept is how a third spelling arrives. `UsageTotals`
- * structurally satisfies the shared `Pick<BilledTokenCounts, ...>` parameter.
- */
-
 type SessionCompactionDecision = {
   rotate: boolean;
   reason: string | null;
@@ -15430,6 +15418,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // into inputTokens upstream, so reading inputTokens alone here would quietly
       // shrink the rotation trigger's input by the whole cache-write volume and
       // rotate far later than the policy asks for. The threshold is unchanged.
+      // Deliberately the shared `promptTokens` rather than a heartbeat-local
+      // twin: two names for one concept is how a third spelling arrives.
       latestRawInputTokens: latestRawUsage ? promptTokens(latestRawUsage) : null,
       sessionAgeHours,
       consecutiveFailedOrZeroTokenResumes,
@@ -32309,6 +32299,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ? "timed_out"
               : "failed";
 
+      // BLO-29842: this is the ONLY writer of `usage_json`, so it defines the
+      // spellings any reader of that blob can encounter. For cache creation
+      // there are exactly two, both camelCase: `cacheCreationInputTokens` (via
+      // the `normalizedUsage` spread) and `rawCacheCreationInputTokens` below.
+      // Snake_case — `cache_creation_input_tokens` — is the *Anthropic API*
+      // field name; adapters normalize it away at the boundary (claude-local
+      // parse.ts / execute.ts) and it never reaches this object. Readers that
+      // fall back to it, or to `raw_cache_creation_input_tokens`, are reading a
+      // key this blob cannot carry. Extend this list here if that changes,
+      // rather than guessing a wider one at each read site.
       const usageJson =
         normalizedUsage || adapterResult.costUsd != null
           ? ({
