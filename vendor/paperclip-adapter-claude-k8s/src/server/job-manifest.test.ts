@@ -3080,13 +3080,33 @@ describe("tool-child memory cap (BLO-34477)", () => {
     const ulimitD = (argv: string[], env: Record<string, string>): string =>
       spawnSync(argv[0], argv.slice(1), { encoding: "utf8", env: { PATH: process.env.PATH ?? "", ...env } }).stdout.trim();
 
+    // bash skips $BASH_ENV in a few host-specific situations (euid != uid,
+    // POSIX mode, a `bash` on PATH that is not GNU bash). The cap's delivery
+    // mechanism assumes the agent image's bash, not the test host's, so probe
+    // the host and skip -- loudly, with the reason -- rather than fail on a
+    // property of the CI runner (arc-light reported `unlimited` here).
+    const bashHonorsBashEnv = ((): boolean => {
+      if (!which("bash")) return false;
+      const probe = mkdtempSync(join(tmpdir(), "blo34477-bashenv-"));
+      tempDirs.push(probe);
+      writeFileSync(join(probe, "env.sh"), "BLO34477_BASH_ENV=applied\n");
+      const applied = ulimitD(["bash", "-c", 'printf %s "$BLO34477_BASH_ENV"'], { HOME: probe, BASH_ENV: join(probe, "env.sh") });
+      if (applied === "applied") return true;
+      const diag = spawnSync("bash", ["-c", 'printf "bash=%s uid=%s euid=%s gid=%s egid=%s path=%s" "$BASH_VERSION" "$(id -ru)" "$(id -u)" "$(id -rg)" "$(id -g)" "$(command -v bash)"'], { encoding: "utf8" }).stdout;
+      console.warn(`[BLO-34477 test] this host's bash does not source BASH_ENV (${diag}); skipping the bash-under-BASH_ENV assertions`);
+      return false;
+    })();
+    const bashDiag = (env: Record<string, string>): string =>
+      ulimitD(["bash", "-c", 'ulimit -d; echo "rc=$? hard=$(ulimit -H -d) version=$BASH_VERSION uid=$(id -ru)/$(id -u)"'], env).replace(/\n/g, " ");
+
     itOnCapableHost("bash under BASH_ENV, and POSIX sh sourcing the file, report the cap", () => {
       const { dir, home } = install(CAP_KB);
       expect(ulimitD(["/bin/sh", "-c", `. '${dir}/rlimit.sh'; ulimit -d`], { HOME: home })).toBe(String(CAP_KB));
-      if (which("bash")) {
-        expect(ulimitD(["bash", "-c", "ulimit -d"], { HOME: home, BASH_ENV: `${dir}/rlimit.sh` })).toBe(String(CAP_KB));
+      if (bashHonorsBashEnv) {
+        const env = { HOME: home, BASH_ENV: `${dir}/rlimit.sh` };
+        expect(ulimitD(["bash", "-c", "ulimit -d"], env), bashDiag(env)).toBe(String(CAP_KB));
         // A grandchild inherits it — the property that bounds the whole subtree.
-        expect(ulimitD(["bash", "-c", "sh -c 'ulimit -d'"], { HOME: home, BASH_ENV: `${dir}/rlimit.sh` })).toBe(String(CAP_KB));
+        expect(ulimitD(["bash", "-c", "sh -c 'ulimit -d'"], env), bashDiag(env)).toBe(String(CAP_KB));
       }
     });
 
