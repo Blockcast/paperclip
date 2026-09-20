@@ -26,7 +26,7 @@
     {
       "type": "stat",
       "title": "Agents with an overdue parked retry",
-      "description": "Count of agents whose oldest `scheduled_retry` row is past its due time. Steady state is 0. Non-zero means the promotion path is not draining parked runs for that many agents — see BLO-22094.",
+      "description": "Count of agents whose oldest `scheduled_retry` row is past its due time. Steady state is 0. Non-zero means the promotion path is not draining parked runs for that many agents — see BLO-22094. Absence of the series is rendered as NO DATA on red via the -1 sentinel, NOT as a green zero: a `count()` over a metric that is not being emitted at all returns the same empty result as one where nothing is overdue, and only one of those is healthy.",
       "gridPos": { "h": 4, "w": 8, "x": 0, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
       "targets": [

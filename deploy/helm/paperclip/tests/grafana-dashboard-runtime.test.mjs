@@ -16,6 +16,17 @@ const DASHBOARD_KEY = "runtime-run-queue-health.json";
 const QUEUED = "paperclip_queued_run_oldest_age_seconds";
 const OVERDUE = "paperclip_overdue_scheduled_retry_oldest_age_seconds";
 
+// Split a kubectl jsonpath into its field list. `.` separates fields unless
+// escaped; a bracketed segment (`['a.json']`) is normalised to the escaped-dot
+// form first so both spellings kubectl accepts reach one splitter.
+function jsonpathFields(expr) {
+  return expr
+    .replace(/\['([^']*)'\]|\["([^"]*)"\]/g, (_m, a, b) => `.${(a ?? b).replace(/\./g, "\\.")}`)
+    .replace(/^\./, "")
+    .split(/(?<!\\)\./)
+    .map((s) => s.replace(/\\\./g, "."));
+}
+
 function renderChart(extraArgs = []) {
   return execFileSync(
     "helm",
@@ -389,7 +400,11 @@ test("the runbook's step-2 jsonpath resolves, not just names the right key", () 
   );
   const rendered = renderChart(["--show-only", TEMPLATE]);
 
-  const jp = runbook.match(/-o jsonpath="\{(\.data\.[^}]+)\}"/);
+  // Accept either jsonpath form kubectl supports for a dotted key -- the dotted
+  // `{.data.a\.json}` and the bracketed `{.data['a.json']}` both resolve. The
+  // property under test is that the expression selects one real data key, not
+  // which syntax it uses; pinning the dotted form would fail a correct runbook.
+  const jp = runbook.match(/-o jsonpath="\{(\.data[.[][^}]+)\}"/);
   assert.ok(jp, "runbook step 2 must read the ConfigMap via -o jsonpath");
 
   // Expand the runbook's own shell assignments with bash rather than
@@ -405,10 +420,12 @@ test("the runbook's step-2 jsonpath resolves, not just names the right key", () 
   );
 
   // Apply kubectl's own splitting rule: `.` separates fields unless escaped.
-  const fields = expanded
-    .replace(/^\./, "")
-    .split(/(?<!\\)\./)
-    .map((s) => s.replace(/\\\./g, "."));
+  // Bracketed segments are normalised to the escaped-dot form first, so both
+  // spellings reach one splitter. Widening the capture above WITHOUT this would
+  // just relocate the bad message: `.data['a.json']` dot-splits into
+  // `data['a` -> `json']`, failing the ".data" assertion instead of the
+  // field-count one -- still a wrong message about a correct runbook.
+  const fields = jsonpathFields(expanded);
 
   assert.deepEqual(
     fields.slice(0, 1),
@@ -425,6 +442,24 @@ test("the runbook's step-2 jsonpath resolves, not just names the right key", () 
     rendered.includes(`${fields[1]}: |`),
     `jsonpath '${expanded}' resolves to data key '${fields[1]}', which the rendered ConfigMap does not have`,
   );
+});
+
+// The guard above must judge what the expression RESOLVES TO, not which of the
+// two syntaxes kubectl accepts it is written in. Both forms below were measured
+// against the live cluster at 17565 bytes each, so a future editor switching to
+// the bracket form is writing a correct runbook and must not get a failure that
+// says the runbook lacks something it visibly has.
+test("jsonpath field-split accepts both kubectl spellings of a dotted key", () => {
+  const want = ["data", DASHBOARD_KEY];
+
+  assert.deepEqual(jsonpathFields(`.data.${DASHBOARD_KEY.replace(/\./g, "\\.")}`), want);
+  assert.deepEqual(jsonpathFields(`.data['${DASHBOARD_KEY}']`), want);
+  assert.deepEqual(jsonpathFields(`.data["${DASHBOARD_KEY}"]`), want);
+
+  // Non-vacuity: the unescaped dotted form is the actual defect this whole
+  // guard exists to catch, and it must still split into 3 -- otherwise the
+  // normalisation has been widened into accepting the bug.
+  assert.equal(jsonpathFields(`.data.${DASHBOARD_KEY}`).length, 3);
 });
 
 test("grafanaDashboard.enabled=false renders no runtime ConfigMap", () => {
