@@ -7,7 +7,74 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const execFile = promisify(execFileCb);
 
-import { namesIssue, prStatus } from "../ops/backfill-pr-work-products.mjs";
+import {
+  listAllIssues,
+  namesIssue,
+  prStatus,
+  repoFromUrl,
+  workProductBody,
+} from "../ops/backfill-pr-work-products.mjs";
+
+test("the written row keys off GitHub's repo casing, not the comment's", () => {
+  // The dedup that matters is the webhook's, not this script's: the local `have`
+  // set lowercases both sides, but upsertByExternalId matches by exact text, so
+  // a row written with the comment's casing gets a second row beside it on the
+  // next PR event.
+  const pr = {
+    title: "t",
+    url: "https://github.com/Blockcast/paperclip/pull/1874",
+    state: "OPEN",
+    isDraft: false,
+    headRefOid: "abc",
+  };
+  const body = workProductBody(pr, { repo: "blockcast/paperclip", number: 1874 });
+
+  assert.equal(body.externalId, "Blockcast/paperclip#1874");
+  assert.equal(body.metadata.repoFullName, "Blockcast/paperclip");
+  assert.equal(body.status, "ready_for_review");
+  assert.equal(body.metadata.merged, false);
+
+  // A row with the comment's casing still beats no row.
+  const noUrl = workProductBody({ ...pr, url: undefined }, { repo: "blockcast/paperclip", number: 1874 });
+  assert.equal(noUrl.externalId, "blockcast/paperclip#1874");
+});
+
+// The cap is invisible — the route returns a bare array with no total and no
+// cursor — and a re-run without `offset` replays the identical page, which is
+// the remedy the old warning named. Paging is the only way to reach the tail.
+test("the issue list is paged until a short page, not fetched once", async () => {
+  const pages = [["a", "b"], ["c", "d"], ["e"]];
+  const asked = [];
+  const all = await listAllIssues((offset) => {
+    asked.push(offset);
+    return pages[offset / 2] ?? [];
+  }, 2);
+
+  assert.deepEqual(all, ["a", "b", "c", "d", "e"]);
+  assert.deepEqual(asked, [0, 2, 4]);
+});
+
+test("a full last page still asks once more, and an empty page stops", async () => {
+  // length === limit is indistinguishable from "there is more", so the loop
+  // must not treat an exactly-full final page as the end.
+  const asked = [];
+  const all = await listAllIssues((offset) => {
+    asked.push(offset);
+    return offset === 0 ? ["a", "b"] : [];
+  }, 2);
+
+  assert.deepEqual(all, ["a", "b"]);
+  assert.deepEqual(asked, [0, 2]);
+});
+
+test("the repo comes from GitHub's URL casing, not the comment's", () => {
+  // The webhook keys externalId off `repository.full_name` and matches it by
+  // exact text, so a lowercased URL in a comment must not produce a second row.
+  assert.equal(repoFromUrl("https://github.com/Blockcast/paperclip/pull/1874"), "Blockcast/paperclip");
+  assert.equal(repoFromUrl("http://github.com/Blockcast/onprem-k8s/pull/1"), "Blockcast/onprem-k8s");
+  assert.equal(repoFromUrl("https://github.com/Blockcast/paperclip/issues/1874"), null);
+  assert.equal(repoFromUrl(undefined), null);
+});
 
 test("a PR must name the issue to count as its delivery artifact", () => {
   const id = "BLO-32239";
@@ -94,7 +161,9 @@ test("PR state maps onto the work-product status enum", () => {
 // A stub API with no issues is enough: it reaches the tail on the RUN=true
 // path, which is the only path either finding was ever on.
 test("a real invocation prints the summary and NOT the module-guard message", async () => {
-  const server = createServer((_req, res) => {
+  const paths = [];
+  const server = createServer((req, res) => {
+    paths.push(req.url);
     res.writeHead(200, { "content-type": "application/json" });
     res.end("[]");
   });
@@ -111,6 +180,10 @@ test("a real invocation prints the summary and NOT the module-guard message", as
     });
     assert.match(stdout, /^done: created=0 would-create=0 /m);
     assert.doesNotMatch(stderr, /no backfill performed/);
+    // The pager unit tests above pass even if the loop is never wired in; this
+    // is the one assertion that the shipped path actually pages.
+    assert.equal(paths.length, 3, paths.join(" "));
+    for (const p of paths) assert.match(p, /[?&]offset=0\b/);
   } finally {
     server.close();
   }
