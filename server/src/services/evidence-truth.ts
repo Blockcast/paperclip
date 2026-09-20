@@ -126,6 +126,11 @@ export interface GithubTruthDeps {
     prNumber: number;
     signal?: AbortSignal;
   }): Promise<{ state: "open" | "closed"; merged: boolean } | { error: string }>;
+  fetchPrAuthorLogin(ref: {
+    repoFullName: string;
+    prNumber: number;
+    signal?: AbortSignal;
+  }): Promise<string | null>;
   reviewerBotLogin: string;
 }
 
@@ -181,11 +186,36 @@ async function probeOne(
 
     // Surface 1: the comment-shaped review, judged by the same function the
     // merge gate publishes from — including its carried-finding rules.
-    const commentVerdict = evaluateCommentReviewGate({
+    //
+    // Author-blind FIRST, then read the author only for the outcomes the author
+    // could still change — the same order, and the same reason, as the merge
+    // gate's own publish path (`pr-comment-review-gate.ts`). `clean` is the one
+    // outcome that consults the author, so fetching up front would spend a call
+    // from this probe's deliberately scarce budget on every PR to change at most
+    // one verdict, and would let an unreadable `GET /pulls/{n}` turn a fully
+    // justified red into a failed read.
+    const commentInput = {
       comments: surfaces.comments.map((c) => ({ authorLogin: c.login, body: c.body, createdAt: c.createdAt })),
       headSha: normalizedHead,
       reviewerBotLogin: deps.reviewerBotLogin,
-    });
+    };
+    let commentVerdict = evaluateCommentReviewGate({ ...commentInput, prAuthorLogin: null });
+    // `authorUnknown` marks every outcome the author could still change. Gating
+    // on `outcome` instead would miss the carried-finding route, and `clean` is
+    // unreachable author-blind by construction.
+    if ("authorUnknown" in commentVerdict && commentVerdict.authorUnknown) {
+      const prAuthorLogin = await deps.fetchPrAuthorLogin({ ...call, signal: sig() });
+      if (prAuthorLogin) {
+        commentVerdict = evaluateCommentReviewGate({ ...commentInput, prAuthorLogin });
+      } else {
+        // Fail CLOSED and say so: an unread author leaves the verdict at the
+        // withheld positive, so this surface cannot vouch. That is the safe
+        // direction for a probe whose premise is that it never fabricates a
+        // pass — `formalClean` below can still carry the verdict on its own.
+        out.failed = true;
+        out.diagnostics.push(`github-truth-probe-failed:pr_author:${tag}`);
+      }
+    }
     const commentClean = commentVerdict.state === "success" && commentVerdict.outcome === "clean";
     // `blocking_finding` and `carried_finding` — the two outcomes that make the
     // merge-visible gate red. `not_evaluated` is silence, not a verdict.

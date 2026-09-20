@@ -53,6 +53,10 @@ function deps(o: Partial<GithubTruthDeps> = {}): GithubTruthDeps {
       comments: [{ login: ALLY, body: clean, createdAt: "2026-09-06T00:00:00Z" }],
     }),
     getPullRequestGate: async () => ({ state: "closed", merged: true }),
+    // A PR opened by someone OTHER than the reviewer identity: the default
+    // fixture is an independently-reviewed PR, so the comment surface can
+    // still reach `clean`. Tests that want the self-attested shape override it.
+    fetchPrAuthorLogin: async () => "some-human",
     reviewerBotLogin: ALLY,
     ...o,
   };
@@ -101,6 +105,47 @@ describe("buildGithubTruthProbe", () => {
     const probe = buildGithubTruthProbe(deps({ getPullRequestGate: async () => ({ state: "open", merged: false }) }));
     const r = await probe({ workProducts: [wp({ merged: true, trust: null })] });
     expect(r.detections["deploy:landed"]).toBeUndefined();
+  });
+
+  // BLO-34316. The comment surface may only vouch for a head someone OTHER
+  // than the author examined. On an agent PR both sides are the reviewer
+  // identity, so without this the probe credits a self-attestation as
+  // `review:ally-clean` — the fabrication this module's premise forbids.
+  it("a self-attested comment is not clean: the author IS the reviewer identity", async () => {
+    const r = await buildGithubTruthProbe(deps({ fetchPrAuthorLogin: async () => ALLY }))({
+      workProducts: [wp()],
+    });
+    expect(r.detections["review:ally-clean"]).toBeUndefined();
+  });
+
+  // The author is read ONLY when the outcome turns on it. A head nothing
+  // attests is already not-clean author-blind, so paying for the read would
+  // spend a call from the probe's scarce budget to change nothing.
+  it("does not read the author when no comment attests the head", async () => {
+    let authorCalls = 0;
+    const r = await buildGithubTruthProbe(
+      deps({
+        listReviewerSurfaces: async () => ({ reviews: [], comments: [] }),
+        fetchPrAuthorLogin: async () => {
+          authorCalls += 1;
+          return "some-human";
+        },
+      }),
+    )({ workProducts: [wp()] });
+    expect(authorCalls).toBe(0);
+    expect(r.detections["review:ally-clean"]).toBeUndefined();
+  });
+
+  // An unread author fails CLOSED. Treating an unreadable `GET /pulls/{n}` as
+  // "independent" would let a transient 5xx manufacture the pass, which is the
+  // one direction this probe must never get wrong.
+  it("an unreadable PR author fails closed and is reported, not assumed independent", async () => {
+    const r = await buildGithubTruthProbe(deps({ fetchPrAuthorLogin: async () => null }))({
+      workProducts: [wp()],
+    });
+    expect(r.detections["review:ally-clean"]).toBeUndefined();
+    expect(r.probeFailed).toBe(true);
+    expect(r.diagnostics.some((d) => d.startsWith("github-truth-probe-failed:pr_author:"))).toBe(true);
   });
 
   it("not merged per the webhook but merged on GitHub → detected via the confirm call", async () => {
