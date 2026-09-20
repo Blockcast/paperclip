@@ -116,6 +116,106 @@ describeEmbeddedPostgres("refreshOverdueScheduledRetryAgeMetrics (BLO-22094)", (
     expect(body).toContain(`paperclip_overdue_scheduled_retry_oldest_age_seconds{agent_id="${agentId}"} 0`);
   });
 
+  it("is silent for a capacity-clamped park whose advertised resume instant is still in the future (BLO-34782)", async () => {
+    // The clamp working as designed, not a wedge. `CCROTATE_CAPACITY_MAX_PARK_MS`
+    // caps the booked horizon at an hour, so a pool that will not serve for 3.5
+    // days is booked to re-probe in ~15 minutes. Fifteen minutes later the bare
+    // `scheduled_retry_at < now` predicate is satisfied and stays satisfied for
+    // the whole quota window, while the run is still correctly backing off --
+    // and because the quota bucket is shared, every agent does this at once.
+    // Measured 2026-09-20: 13 of 16 capacity parks "overdue", 10-14 agents over
+    // threshold in each of five episodes.
+    const { companyId, agentId } = await insertCompanyAndAgent();
+    const now = new Date("2026-09-20T00:18:00.000Z");
+    const parkedAt = new Date(now.getTime() - 1_800_000);
+    const scheduledRetryAt = new Date(now.getTime() - 560_000); // clamped, ~9m past due
+    const advertisedResumeAt = new Date(now.getTime() + 302_810_000); // provider: 3.5 days out
+
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "scheduled_retry",
+      contextSnapshot: {},
+      createdAt: parkedAt,
+      updatedAt: parkedAt,
+      scheduledRetryAt,
+      scheduledRetryAttempt: 3,
+      scheduledRetryReason: "ccrotate_capacity",
+      resultJson: {
+        errorFamily: "rate_limit_exhausted",
+        penstockAdvertisedResumeAt: advertisedResumeAt.toISOString(),
+        penstockCapacityParkClampedFrom: advertisedResumeAt.toISOString(),
+      },
+    });
+
+    await refreshOverdueScheduledRetryAgeMetrics(db, now);
+    const { body } = await renderMetrics();
+    expect(body).toContain(`paperclip_overdue_scheduled_retry_oldest_age_seconds{agent_id="${agentId}"} 0`);
+  });
+
+  it("still ages a capacity park that has run past the resume instant the provider itself advertised (BLO-34782)", async () => {
+    // The exclusion is bounded, not a blanket amnesty for `ccrotate_capacity`.
+    // Once the advertised instant passes and the row is *still* parked, the
+    // promotion path is wedged -- exactly what this gauge exists to catch.
+    const { companyId, agentId } = await insertCompanyAndAgent();
+    const now = new Date("2026-09-20T00:18:00.000Z");
+    const parkedAt = new Date(now.getTime() - 10_000_000);
+    const scheduledRetryAt = new Date(now.getTime() - 9_000_000);
+    const advertisedResumeAt = new Date(now.getTime() - 240_000); // provider said: 4m ago
+
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "scheduled_retry",
+      contextSnapshot: {},
+      createdAt: parkedAt,
+      updatedAt: parkedAt,
+      scheduledRetryAt,
+      scheduledRetryAttempt: 7,
+      scheduledRetryReason: "ccrotate_capacity",
+      resultJson: {
+        errorFamily: "rate_limit_exhausted",
+        penstockAdvertisedResumeAt: advertisedResumeAt.toISOString(),
+        penstockCapacityParkClampedFrom: advertisedResumeAt.toISOString(),
+      },
+    });
+
+    await refreshOverdueScheduledRetryAgeMetrics(db, now);
+    const { body } = await renderMetrics();
+    // Aged off the advertised instant (240s), not the clamped booking (9000s).
+    expect(body).toContain(`paperclip_overdue_scheduled_retry_oldest_age_seconds{agent_id="${agentId}"} 240`);
+  });
+
+  it("ignores an unparseable advertised resume instant rather than going silent (BLO-34782)", async () => {
+    // Fail loud, not quiet. A corrupt value degrades to the pre-BLO-34782
+    // reading and may page; treating it as "still backing off" would hide a
+    // real strand behind a malformed string.
+    const { companyId, agentId } = await insertCompanyAndAgent();
+    const now = new Date("2026-09-20T00:18:00.000Z");
+    const parkedAt = new Date(now.getTime() - 600_000);
+    const scheduledRetryAt = new Date(now.getTime() - 90_000);
+
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "scheduled_retry",
+      contextSnapshot: {},
+      createdAt: parkedAt,
+      updatedAt: parkedAt,
+      scheduledRetryAt,
+      scheduledRetryAttempt: 2,
+      scheduledRetryReason: "ccrotate_capacity",
+      resultJson: { penstockAdvertisedResumeAt: "not-a-timestamp" },
+    });
+
+    await refreshOverdueScheduledRetryAgeMetrics(db, now);
+    const { body } = await renderMetrics();
+    expect(body).toContain(`paperclip_overdue_scheduled_retry_oldest_age_seconds{agent_id="${agentId}"} 90`);
+  });
+
   it("reads an explicit 0, not an absent series, for an agent with no scheduled_retry rows at all", async () => {
     const { agentId } = await insertCompanyAndAgent();
 
