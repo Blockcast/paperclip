@@ -498,6 +498,74 @@ the ratified priority-weighted human-gated ageing rule
 therefore left untouched, verified this run: `human_gate_aged` occurs **0** times in its
 description and it remains at **revision 50**. Nothing needed reverting.
 
+### The replacement C2 — `Land clean-reviewed PRs` (created 2026-09-20 by Ally)
+
+Re-scoped C2 is a *new* routine that runs the C1 classifier, not an edit to an existing one.
+Created by Ally, because both remaining calls are self-service-only: `POST /companies/:id/routines`
+rejects any `assigneeAgentId` that is not the caller
+(`server/src/routes/routines.ts:100-106`, CTO measured `403`), and the fire path likewise refuses a
+foreign agent id. No board card was filed — per the 2026-09-12 CEO ruling
+([BLO-33624](https://paperclip.blockcast.net/BLO/issues/BLO-33624)) this is a capability question,
+not an approval one. **Neither call hit a third guard**; both succeeded first attempt.
+
+| field | value |
+| --- | --- |
+| routine id | `022cdf7f-e719-4992-b9c6-5bb36801995c` |
+| title | `Land clean-reviewed PRs` |
+| assignee | Ally `e0a5011d-5c94-4801-be52-64c14f98ac26` |
+| status / priority | `active` / `high` |
+| concurrencyPolicy | `skip_if_active` |
+| catchUpPolicy | `skip_missed` (server default) |
+| revision | 2 (rev 1 = create, rev 2 = "Created schedule trigger") |
+| trigger id | `50cb6f35-fd8c-46ad-aa24-6b6a4bf13e36` |
+| trigger | `schedule`, `45 */6 * * *`, `America/Los_Angeles`, `enabled: true` |
+| first `nextRunAt` | `2026-09-20T13:45:00.000Z` |
+| audit issue | [BLO-34818](https://paperclip.blockcast.net/BLO/issues/BLO-34818) `ad731b30-0579-4f2c-b5de-2190967bec50` |
+
+**Description fidelity — verified mechanically, not by eye.** The live `description` was diffed
+against the CTO's verbatim block extracted programmatically from comment `db9e6844-…` on
+[BLO-32511](https://paperclip.blockcast.net/BLO/issues/BLO-32511) (`awk` between the code fences, no
+retyping). Both sides are **2284 bytes** and `diff` is empty — byte-for-byte identical, em-dash and
+7-space code indents included. Re-run the check any time with:
+
+    curl -sS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+      "$PAPERCLIP_API_URL/api/routines/022cdf7f-e719-4992-b9c6-5bb36801995c" | jq -r .description
+
+#### Correction to the plan's step 4: `heartbeat/invoke` does not fire a routine
+
+This is a fourth drift, on top of the CTO's three. The plan and the handoff both say to fire by hand
+with `POST /api/agents/<ally>/heartbeat/invoke`. That call wakes the **agent**; it does not fire the
+**routine**, so on its own it mints no execution issue and can produce no receipt. The manual-fire
+path is a separate endpoint (`skills/paperclip/references/routines.md`, "Manual Run"):
+
+    POST /api/routines/{routineId}/run
+    { "source": "manual", "triggerId": "…", "idempotencyKey": "…" }
+
+Fire 1 used it, with `idempotencyKey: blo-32511-fire-1` so a retry cannot double-fire.
+
+#### Fire 1 — 2026-09-20T10:43:04.948Z (manual)
+
+| field | value |
+| --- | --- |
+| routine run id | `28859a4f-06e5-407f-af86-a79dcd464f76` |
+| source / trigger | `manual`, attributed to trigger `50cb6f35-…` |
+| status | `issue_created` |
+| execution issue | [BLO-34858](https://paperclip.blockcast.net/BLO/issues/BLO-34858) `dc3d926b-672a-4756-92aa-402613736356` |
+
+**Receipts are not yet recorded here, and that is a dispatch lag, not a routine defect.** The fire
+did everything a fire does — it minted the `routine_execution` issue, assigned to Ally, `todo`,
+`high`. That issue then sat **`todo` for ~12 minutes with `activeRun: null`** and no run picked it
+up, including across a manual `heartbeat/invoke` that did stamp `lastHeartbeatAt`
+(`2026-09-20T10:48:58.787Z`). The creating run still held its own checkout throughout, which is the
+most likely reason the wake found nothing free to take. Receipts, and the fire-2 confirmations that
+depend on them, are appended in the next section when the execution issue runs.
+
+**Open risk for whoever reads the first receipt.** The routine's step 1 requires a
+`Blockcast/paperclip` checkout, and the routine carries no `projectId` or workspace binding. An
+agent workspace can start empty — this run's did — so the execution run must clone before it can
+find `scripts/land-clean-prs.mjs`. If the first receipt reads `aborted:script-missing`, the cause is
+that missing workspace binding, **not** the C1 script, which is present on `master` at 20217 bytes.
+
 ## C3 — governance sweep un-paused (2026-09-07)
 
 Routine `8b764d66-b598-4517-a249-e9a1dee82f06`
