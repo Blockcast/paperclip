@@ -127,9 +127,33 @@ const STILL_PRESENT_DISPOSITION_RE = new RegExp(
   "im",
 );
 
-/** The single standalone attestation line Ally is required to emit. */
+/**
+ * The single standalone attestation line Ally is required to emit.
+ *
+ * The emphasis runs mirror MARKDOWN_EMPHASIS_RUN / ATTESTATION_WRAPPER_RUN in
+ * ally-review-detection.ts:166-167 and sweep-stalled-ally-reviews.py:92-104,
+ * character for character. This reader was left on the narrow
+ * `(?:[_*]+)?` / `` \`? `` form while the other two were widened, and the shape
+ * it dropped is the one this repo's own comment names at
+ * ally-review-detection.ts:138-143 — ``**Reviewed head:** `<sha>` `` — where the
+ * single permitted run is consumed by `**` and cannot then cross the space to
+ * reach the backtick. Measured on the same bodies before this change: gate 1,
+ * python 1, mjs 0, for both that form and `_Reviewed head:_ <sha>`.
+ *
+ * Block-carrying bodies masked it, because attestedHeadFrom falls through to
+ * block.head. The harm landed on the entire pre-block population, where
+ * canonicalReviewHead returned null and operativeAllyReviews dropped a review
+ * the gate reads fine — in a file whose stated purpose is reader parity.
+ *
+ * The inter-run bound is `[ \t]{0,3}` rather than `[ \t]*` deliberately: the
+ * widening has a converse, and `*` here would accept a line the gate rejects,
+ * which is the same divergence one delimiter out.
+ */
+const MARKDOWN_EMPHASIS_RUN = String.raw`[*_\`]{0,3}`;
+const ATTESTATION_WRAPPER_RUN = String.raw`[*_\`\t ]{0,6}`;
 const ATTESTED_HEAD_RE = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE} {0,3}(?:[_*]+)?[ \t]*reviewed head:[ \t]*\`?([0-9a-f]{40})\`?[ \t]*(?:[_*]+)?[ \t]*$`,
+  String.raw`^${NOT_INDENTED_CODE} {0,3}${MARKDOWN_EMPHASIS_RUN}[ \t]{0,3}reviewed head:[ \t]*` +
+    String.raw`${ATTESTATION_WRAPPER_RUN}([0-9a-f]{40})${ATTESTATION_WRAPPER_RUN}[ \t]*$`,
   "im",
 );
 const ATTESTED_HEAD_GLOBAL_RE = new RegExp(ATTESTED_HEAD_RE.source, "gim");
@@ -174,6 +198,11 @@ function severityCountsIn(raw) {
     if (value > MAX_VERDICT_FINDING_COUNT) return null;
     const key = severity.trim().toLowerCase();
     if (!VERDICT_SEVERITIES.has(key)) return null;
+    // Two keys normalizing to one severity: last-wins would let
+    // `{"critical":1,"Critical":0}` read clean. Mirrors the guard in
+    // ally-review-detection.ts and sweep-stalled-ally-reviews.py — all three
+    // readers shared the bug identically, so none of them caught it.
+    if (counts.has(key)) return null;
     counts.set(key, value);
   }
   if (!BLOCKING_SEVERITIES.every((severity) => counts.has(severity))) return null;
