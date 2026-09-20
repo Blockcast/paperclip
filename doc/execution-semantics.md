@@ -292,6 +292,8 @@ Use this to park an issue on a gate the issue graph cannot represent: an approva
 
 A declaration is also read positively, not just as a suppression: a `blocked` issue with a declared wait and no live monitor is surfaced in the blocked inbox as `external_wait` rather than as a stalled row. The two declaration lines are stripped from the description shown there, and the parsed owner and action values are then struck out of whatever prose remains.
 
+**A declared external wait is exempt from auto-resume.** The stranded-blocked-issue reconciler flips any `blocked` issue with zero unresolved blockers to `todo`; a declared wait suppresses that flip (`external_wait`, alongside pending interactions, approvals, executive holds, monitor gates, and the rest). So the declaration is sufficient on its own to hold the park — you do not additionally need a blocker edge or an interaction card. **A `blocked` issue with zero blockers and no declaration is still drained to `todo`, deliberately**, so an undeclared park does not survive either: park on a human gate by declaring it, never by leaving the row `blocked` and silent.
+
 **Keep both values short — the owner at 120 characters or fewer and the action at 240 characters or fewer.** Those caps are not a display nicety: the parsed values are the exact needles used to redact the remaining prose, so any part of an owner or action beyond its cap is not redacted and stays visible in the blocked inbox. A 145-character owner leaves its last 25 characters in the clear.
 
 Two limits worth knowing before you rely on it:
