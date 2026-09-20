@@ -8,7 +8,7 @@ import { randomUUID } from "node:crypto";
 import crypto from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   agents,
   agentWakeupRequests,
@@ -22,6 +22,7 @@ import {
   POSTGRES_POOL_MAX,
 } from "@paperclipai/db";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
+import { logger } from "../middleware/logger.js";
 import {
   __test_backLinkAbsoluteUrl,
   __test_buildDependabotAlertIssueBody,
@@ -3152,6 +3153,80 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .where(eq(heartbeatRuns.agentId, agentId));
     expect(runs).toHaveLength(1);
     expect(runs[0]?.status).toBe("queued");
+  });
+
+  // BLO-22758. The enqueue path was the ONLY outcome of attemptPrReviewerWake
+  // that logged nothing: duplicate, no_reviewer, declined, deferred and
+  // lock-loss all emit a line, so a served PR and a PR whose wake was never
+  // enqueued produced byte-identical webhook logs. That made a dropped review
+  // undiagnosable in retrospect (onprem-k8s#2139 needed a Loki run-lifecycle
+  // reconstruction to establish the wake had in fact been served).
+  //
+  // The assertion is on `runId` and `idempotencyKey` specifically, not on the
+  // message alone: the key is what makes the line greppable from a PR number,
+  // and the run id is the join to the run's own lifecycle logs — together they
+  // are what turn "no Ally response" into a terminal state.
+  it("logs the reviewer-wake enqueue with its idempotency key and run id (BLO-22758)", async () => {
+    const { agentId } = await seedCompanyAndAgent({ agentName: "Ally" });
+    const app = buildApp({
+      prReviewerAgentId: agentId,
+      heartbeatOptions: { paperclipNodeRole: "api", skipQueuedRunDispatch: false },
+    });
+    const payload = {
+      action: "opened",
+      pull_request: {
+        number: 2139,
+        title: "Log the reviewer-wake enqueue",
+        body: null,
+        head: { ref: "fix/reviewer-wake-enqueue-log", sha: "enqueue-log-head" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    };
+    const { body, signature } = signedRequest(payload);
+
+    const infoSpy = vi.spyOn(logger, "info");
+    try {
+      const res = await request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request")
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", "delivery-enqueue-log-1")
+        .set("content-type", "application/json")
+        .send(body);
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ reviewerWakeFired: true });
+
+      const runs = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      expect(runs).toHaveLength(1);
+
+      const enqueueLogs = infoSpy.mock.calls.filter(
+        ([, msg]) => msg === "github webhook reviewer wake enqueued",
+      );
+      expect(enqueueLogs).toHaveLength(1);
+      expect(enqueueLogs[0]?.[0]).toMatchObject({
+        agentId,
+        event: "pull_request",
+        deliveryId: "delivery-enqueue-log-1",
+        // PR-scoped, with no delivery suffix: an `opened` redelivery must
+        // coalesce onto the same wake. Comment- and head-scoped reasons carry a
+        // suffix instead (see the ready_for_review key above), so pinning the
+        // literal here also pins which scope this branch dedups on.
+        idempotencyKey: "pr_review:Blockcast/paperclip:2139:github_pr_opened",
+        wakeReason: "github_pr_opened",
+        prNumber: 2139,
+        repoFullName: "Blockcast/paperclip",
+        runId: runs[0]!.id,
+      });
+      // Not merely present: a null wake id would leave the durable request row
+      // unreachable from the log, which is half of what the line is for.
+      expect((enqueueLogs[0]?.[0] as { wakeupRequestId?: string | null }).wakeupRequestId)
+        .toEqual(expect.any(String));
+    } finally {
+      infoSpy.mockRestore();
+    }
   });
 
   // BLO-32198. The head-attestation gate suppresses a reviewer wake for a head
