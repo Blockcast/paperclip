@@ -667,6 +667,38 @@ function hasNonNegatedMatch(text: string, pattern: RegExp): boolean {
   return false;
 }
 
+// The alphabet a prose ledger entry may spell its verb in — the single source
+// for the pattern below and for isConformingDispositionVerb.
+//
+// The structured block deliberately does NOT enforce it. An unknown verb
+// already fails closed as `unrecognized`, so rejecting the whole block over a
+// cosmetic one (`fixed (partially)`) would only manufacture a red, and it would
+// put the gate out of step with the two peer readers that type `verb` as any
+// non-empty string (`dispositions_ok` in sweep-stalled-ally-reviews.py,
+// `stillPresentIn` in check-ally-review-consistency.mjs) — gate red, peers
+// silent.
+//
+// What the alphabet is needed for is publication: see
+// isConformingDispositionVerb.
+const DISPOSITION_VERB_ALPHABET = String.raw`[a-z][a-z-]*`;
+const DISPOSITION_VERB_PATTERN = new RegExp(`^${DISPOSITION_VERB_ALPHABET}$`);
+
+/**
+ * May this verb be quoted into a public commit-status description?
+ *
+ * The gate names an unrecognized verb verbatim so a reader can tell vocabulary
+ * drift from a genuinely open finding. That description is POSTed by
+ * githubPostCommitStatusDetailed, which github-egress-outbound-coverage.test.ts
+ * classifies `unscrubbed` under PEN-3157 — so the text it carries is bounded
+ * only by whatever produced it. Prose was bounded by the pattern above;
+ * `verb` arriving as a JSON field is typed as any non-empty string, so a
+ * credential-shaped token in the ledger was published where the identical token
+ * in prose was refused. Callers name the drift, not its payload.
+ */
+export function isConformingDispositionVerb(verb: string): boolean {
+  return DISPOSITION_VERB_PATTERN.test(verb);
+}
+
 // A "Prior Findings Dispositioned" ledger entry, e.g.
 //   - **prior:731ced5 critical 1** — fixed — the terminator is gone.
 // Anchored to the bold list-item form Ally emits, matching the shape
@@ -683,7 +715,7 @@ function hasNonNegatedMatch(text: string, pattern: RegExp): boolean {
 // so the bound excludes no observed real entry; and an entry it did exclude
 // would leave a visible red rather than a silent green.
 const PRIOR_FINDING_DISPOSITION_PATTERN = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE} {0,3}-[ \t]*\*\*[ \t]*prior:([0-9a-f]{7,40})[ \t]+([a-z]+)[ \t]+(\d+)[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*([a-z][a-z-]*)[ \t]*(?:—|–|-)`,
+  String.raw`^${NOT_INDENTED_CODE} {0,3}-[ \t]*\*\*[ \t]*prior:([0-9a-f]{7,40})[ \t]+([a-z]+)[ \t]+(\d+)[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*(${DISPOSITION_VERB_ALPHABET})[ \t]*(?:—|–|-)`,
   "gim",
 );
 

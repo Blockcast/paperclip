@@ -461,6 +461,59 @@ describe("evaluateCommentReviewGate", () => {
     expect(verdict.reason).toContain(OLD_HEAD.slice(0, 7));
   });
 
+  it("never publishes a ledger verb outside the prose parser's alphabet (PEN-3157)", () => {
+    // An unrecognized verb is quoted verbatim into the commit-status
+    // description, and githubPostCommitStatusDetailed POSTs that description
+    // unscrubbed — github-egress-outbound-coverage.test.ts classifies it so.
+    // PRIOR_FINDING_DISPOSITION_PATTERN's `[a-z][a-z-]*` bounded what
+    // model-authored text could reach that boundary. Typing the structured
+    // field as a non-empty string dropped the bound, so a credential-shaped
+    // token in the JSON ledger was published where the identical token in
+    // prose was refused. Measured on this fixture before the bound:
+    //   structured -> ...unrecognized ledger verb "ghp_abcdef...0123456789".
+    //   prose      -> ...is still undispositioned; no comment attests...
+    // Guarded at the publisher rather than the parser: an unknown verb already
+    // fails closed as `unrecognized`, so rejecting the block would only
+    // manufacture a red — and would put the gate out of step with the two peer
+    // readers that accept any non-empty string.
+    const token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+    const structuredLedger = (verb: string) =>
+      [
+        "## Ally — Consolidated PR Review",
+        "<!-- ally-verdict:1",
+        JSON.stringify({
+          head: INTERMEDIATE_HEAD,
+          findings: { critical: 0, important: 0, suggestions: 0 },
+          dispositions: [{ head: OLD_HEAD.slice(0, 7), severity: "important", index: 1, verb }],
+        }),
+        "-->",
+        `Reviewed head: ${INTERMEDIATE_HEAD}`,
+        "### Critical Issues (0)",
+        "### Important Issues (0)",
+      ].join("\n");
+
+    const carriedFor = (verb: string) =>
+      evaluateCommentReviewGate({
+        headSha: CURRENT_HEAD,
+        comments: [
+          allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+          allyComment(structuredLedger(verb), "2026-08-04T21:09:19Z"),
+        ],
+      });
+
+    const leaked = carriedFor(token);
+    expect(leaked).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    expect(leaked.reason).not.toContain(token);
+    expect(leaked.reason).not.toContain("ghp_");
+    // Withheld, not dropped: the reader must still learn that the red is
+    // vocabulary drift rather than a genuinely open finding.
+    expect(leaked.reason).toContain("unrecognized ledger verb");
+
+    // Positive control. Without it the assertions above would also pass on a
+    // fixture the block parser never read at all — a false all-clear.
+    expect(carriedFor("deferred").reason).toContain('unrecognized ledger verb "deferred"');
+  });
+
   it("keeps the ordinary reason when no unrecognized verb is involved", () => {
     const verdict = evaluateCommentReviewGate({
       headSha: CURRENT_HEAD,

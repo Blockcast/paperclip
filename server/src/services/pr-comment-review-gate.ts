@@ -21,6 +21,7 @@ import {
   allyClaimedReviewHead,
   hasActionablePrReviewFeedback,
   hasAllyConsolidatedReviewHeading,
+  isConformingDispositionVerb,
   parseAllyVerdictBlock,
   type AllyFindingRef,
   type AllyPriorFindingDisposition,
@@ -43,6 +44,11 @@ const DEFAULT_PR_REVIEWER_BOT_LOGIN = "allyblockcast[bot]";
 // with the head and the explanatory phrase intact, since those are what make
 // the red actionable.
 const UNRECOGNIZED_VERB_BUDGET = 48;
+
+// Stands in for a ledger verb that must not be published verbatim. It is not a
+// verb Ally can emit — the alphabet excludes `<` — so it cannot be confused
+// for one, and it keeps the drift visible while withholding its text.
+const NON_CONFORMING_VERB = "<non-conforming>";
 
 export interface CommentReviewGateComment {
   authorLogin: string | null | undefined;
@@ -393,7 +399,16 @@ function headsWithUndispositionedFinding(
       if (isExplicitlyBlocked(headSha, entry.timeMs, finding)) continue;
       for (const prior of ledger) {
         if (prior.entry.kind !== "unrecognized") continue;
-        if (namesFinding(prior, headSha, entry.timeMs, finding)) verbs.add(prior.entry.disposition);
+        if (namesFinding(prior, headSha, entry.timeMs, finding)) {
+          // Name the drift, not its payload. This set is quoted verbatim into
+          // the commit-status description below, which is POSTed unscrubbed
+          // (PEN-3157) — see isConformingDispositionVerb.
+          verbs.add(
+            isConformingDispositionVerb(prior.entry.disposition)
+              ? prior.entry.disposition
+              : NON_CONFORMING_VERB,
+          );
+        }
       }
     }
     return [...verbs];
