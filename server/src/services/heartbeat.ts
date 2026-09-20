@@ -36063,20 +36063,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       intervalSec: overrunFilterIntervalSec,
       now: overrunFilterNow,
     });
-    // PEN-1990: record the activation. Consumed below, on the mint path only.
+    // PEN-1990: record the activation. Consumed twice below — stamped on the
+    // minted run's snapshot, and logged post-commit with the outcome.
     const intervalOverrunBypass = describeIntervalOverrunCoalesceBypass({
       target: overrunFilterInput,
       filteredTarget: coalescedTargetRun,
       intervalSec: overrunFilterIntervalSec,
       now: overrunFilterNow,
     });
-    if (intervalOverrunBypass) {
-      logger.info(
-        { agentId, taskKey: effectiveTaskKey, ...intervalOverrunBypass },
-        "timer wake declined to coalesce into a run that has overrun its heartbeat interval; "
-          + "minting its own run (PEN-1995)",
-      );
-    }
 
     if (coalescedTargetRun) {
       const mergedContextSnapshot = mergeCoalescedContextSnapshot(
@@ -36368,6 +36362,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       return { kind: "queued" as const, run: newRun };
     });
+
+    // PEN-1990: one line per activation, emitted post-commit so it can never
+    // describe a decision the transaction rolled back. `outcome` is what makes
+    // this reconcile with the snapshot marker: the marker is stamped only on
+    // the run this wake inserts, so its population is exactly the lines with
+    // `outcome: "queued"`. The remainder are activations where a later gate in
+    // this enqueue (the daily cap, the post-lock task-scope re-check, the
+    // github-state coalesce) ended the wake without a mint — real activations
+    // the marker cannot carry, attributable here rather than an unexplained
+    // shortfall between the two counts.
+    if (intervalOverrunBypass) {
+      logger.info(
+        {
+          agentId,
+          taskKey: effectiveTaskKey,
+          outcome: queueOutcome.kind,
+          runId: queueOutcome.kind === "skipped" ? null : queueOutcome.run.id,
+          ...intervalOverrunBypass,
+        },
+        "timer wake declined to coalesce into a run that has overrun its heartbeat "
+          + "interval (PEN-1990; rule added in PEN-1995)",
+      );
+    }
 
     for (const publish of manualCapacityActivityPublishes) {
       try {

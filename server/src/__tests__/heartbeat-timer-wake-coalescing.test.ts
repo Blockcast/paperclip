@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import {
   agents,
@@ -13,11 +13,12 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { heartbeatService } from "../services/heartbeat.ts";
 import {
+  heartbeatService,
   STALLED_COALESCE_BYPASS_SNAPSHOT_KEY,
   STALLED_COALESCE_MIN_BUDGET_MS,
 } from "../services/heartbeat.ts";
+import { logger } from "../middleware/logger.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -251,6 +252,25 @@ describeEmbeddedPostgres("heartbeat timer wake coalescing", () => {
     });
   }
 
+  // PEN-1990: the bypass log is identified by the two fields only it carries —
+  // the spread of the bypass record (`targetAgeMs`) plus the enqueue outcome.
+  // Collected inside the mock rather than read from `mock.calls` afterwards,
+  // because `mockRestore()` also clears the recorded calls.
+  function captureBypassLogs() {
+    const captured: Record<string, unknown>[] = [];
+    const spy = vi.spyOn(logger, "info").mockImplementation(((fields: unknown) => {
+      if (
+        typeof fields === "object" &&
+        fields !== null &&
+        "targetAgeMs" in fields &&
+        "outcome" in fields
+      ) {
+        captured.push(fields as Record<string, unknown>);
+      }
+    }) as never);
+    return { captured, restore: () => spy.mockRestore() };
+  }
+
   it("mints a new run instead of coalescing into a tracked run that has overrun its interval", async () => {
     // 3600s interval => 90 min budget (the floor). Started 4 h ago, so it has
     // already swallowed roughly three wakes it never serviced.
@@ -266,7 +286,13 @@ describeEmbeddedPostgres("heartbeat timer wake coalescing", () => {
     // Not a zombie: this is what makes the assertion attributable to this fix.
     heartbeat.__test_unsafelyTrackActiveRunExecution(runningRunId);
 
-    const run = await fireTimerWake(heartbeat, agentId);
+    const bypassLog = captureBypassLogs();
+    let run: Awaited<ReturnType<typeof fireTimerWake>>;
+    try {
+      run = await fireTimerWake(heartbeat, agentId);
+    } finally {
+      bypassLog.restore();
+    }
 
     expect(run).not.toBeNull();
     expect(run?.id).not.toBe(runningRunId);
@@ -303,6 +329,20 @@ describeEmbeddedPostgres("heartbeat timer wake coalescing", () => {
     expect(Date.parse(bypass.targetStartedAt)).toBeGreaterThan(0);
     // The marker must not leak onto the run that was filtered out.
     expect(stalled?.contextSnapshot).not.toHaveProperty(STALLED_COALESCE_BYPASS_SNAPSHOT_KEY);
+
+    // PEN-1990: the log is emitted post-commit and carries the outcome, so the
+    // two records reconcile exactly — the snapshot marker's population is the
+    // `outcome: "queued"` lines and nothing else. A log taken at the decision
+    // point instead would also fire on the paths that end the wake without a
+    // mint (daily cap, post-lock task-scope re-check, github-state coalesce),
+    // leaving an operator with a count difference and no way to attribute it.
+    expect(bypassLog.captured).toHaveLength(1);
+    expect(bypassLog.captured[0]).toMatchObject({
+      agentId,
+      outcome: "queued",
+      runId: run?.id,
+      targetRunId: runningRunId,
+    });
   });
 
   it("still coalesces into a tracked running run that is within its interval budget", async () => {
@@ -320,7 +360,13 @@ describeEmbeddedPostgres("heartbeat timer wake coalescing", () => {
     });
     heartbeat.__test_unsafelyTrackActiveRunExecution(runningRunId);
 
-    const run = await fireTimerWake(heartbeat, agentId);
+    const bypassLog = captureBypassLogs();
+    let run: Awaited<ReturnType<typeof fireTimerWake>>;
+    try {
+      run = await fireTimerWake(heartbeat, agentId);
+    } finally {
+      bypassLog.restore();
+    }
 
     expect(run?.id).toBe(runningRunId);
 
@@ -332,10 +378,11 @@ describeEmbeddedPostgres("heartbeat timer wake coalescing", () => {
     // PEN-1990: no activation, so no marker. A marker that also appeared on
     // the coalesce path would make every run look like a filter activation.
     expect(runs[0]?.contextSnapshot).not.toHaveProperty(STALLED_COALESCE_BYPASS_SNAPSHOT_KEY);
+    // Same control for the log, whose failure mode is also over-reporting.
+    expect(bypassLog.captured).toHaveLength(0);
   });
 
   it("holds a fast-cadence agent to the 90 min floor rather than 1.5x its interval", async () => {
-
     // 30s interval * 1.5 = 45s, which is below the measured p50 run duration.
     // Without the floor this run (20 min old) would be filtered and the agent
     // would mint a fresh run on nearly every wake.
