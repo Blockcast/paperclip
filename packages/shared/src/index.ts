@@ -1,11 +1,13 @@
 export { agentAdapterTypeSchema, optionalAgentAdapterTypeSchema } from "./adapter-type.js";
 export {
   CREDENTIAL_VALUE_RES,
+  REDACTED_VALUE_SENTINEL,
   SENSITIVE_ENV_KEY_RE,
   isPlausiblySensitiveEnvValue,
   isSensitiveEnv,
   isSensitiveEnvKey,
 } from "./sensitive-env.js";
+export { REDACTED_SENTINEL } from "./secret-sentinel.js";
 export {
   getAgentOrgChainHealth,
   getAgentWorkEligibility,

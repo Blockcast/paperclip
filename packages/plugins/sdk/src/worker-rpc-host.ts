@@ -991,6 +991,10 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           return callHost("issues.createComment", { issueId, body, companyId, authorAgentId: options?.authorAgentId, fencing: options?.fencing, idempotencyKey: options?.idempotencyKey });
         },
 
+        async updateComment(issueId: string, idempotencyKey: string, body: string, companyId: string, options?: { authorAgentId?: string }) {
+          return callHost("issues.updateComment", { issueId, idempotencyKey, body, companyId, authorAgentId: options?.authorAgentId });
+        },
+
         async createInteraction(issueId: string, interaction, companyId: string, options?: { authorAgentId?: string }) {
           return callHost("issues.createInteraction", {
             issueId,

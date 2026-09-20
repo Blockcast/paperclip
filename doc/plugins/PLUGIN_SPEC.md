@@ -816,6 +816,7 @@ The host enforces capabilities in the SDK layer and refuses calls outside the gr
 - `issues.create`
 - `issues.update`
 - `issue.comments.create`
+- `issue.comments.update`
 - `issue.interactions.create`
 - `issue.documents.write`
 - `issue.relations.write`

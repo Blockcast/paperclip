@@ -425,7 +425,8 @@ jobs:
             ./.github/scripts/tests/post-pending-deploy-alert.test.mjs \
             ./.github/scripts/tests/scheduled-production-deploy-schedule.test.mjs \
             ./.github/scripts/tests/supersede-stale-deploy.test.mjs \
-            ./.github/scripts/tests/deploy-stall-record.test.mjs
+            ./.github/scripts/tests/deploy-stall-record.test.mjs \
+            ./.github/scripts/tests/deploy-stall-chain.test.mjs
         timeout-minutes: 1
 
       # BLO-28203. The stalled-Ally-review sweep's decision suite otherwise runs
@@ -1278,11 +1279,11 @@ jobs:
           set -euo pipefail
           base="${BASE_REF:-}"
           if [ -z "$base" ]; then
-            echo "No base ref (not a pull request) — nothing to compare against."
+            echo "::notice::No base ref or base SHA — nothing to compare against; collision check did NOT run."
             exit 0
           fi
           if ! git fetch --no-tags --depth=1 origin "$base" 2>/dev/null; then
-            echo "::warning::Could not fetch base ref '$base'; skipping collision check."
+            echo "::warning::Could not fetch base '$base'; collision check did NOT run."
             exit 0
           fi
 
@@ -1292,7 +1293,7 @@ jobs:
           # A base without the vendored package at all (or without a recorded
           # hash) leaves nothing to collide with.
           if ! git show "FETCH_HEAD:$pkg_path" >/dev/null 2>&1; then
-            echo "Base '$base' has no vendored package — nothing to compare."
+            echo "::notice::Base '$base' has no vendored package — collision check did NOT run."
             exit 0
           fi
 
@@ -1305,7 +1306,7 @@ jobs:
           echo "head:          version=$head_version hash=$head_hash"
 
           if [ -z "$base_hash" ]; then
-            echo "Base records no integrity hash — cannot compare bytes; skipping."
+            echo "::notice::Base records no integrity hash — cannot compare bytes; collision check did NOT run."
             exit 0
           fi
           if [ "$head_version" != "$base_version" ]; then
@@ -1326,7 +1327,33 @@ jobs:
           echo "Re-read the base and any in-flight PR touching vendor/ before picking N — the next integer is not necessarily free."
           exit 1
         env:
-          BASE_REF: ${{ github.base_ref }}
+          # Two lanes, resolved differently ON PURPOSE — this job carries no
+          # `if:`/`needs:` guard, so it runs in the merge queue too, and
+          # `github.base_ref` is populated ONLY for pull_request events. Wiring
+          # this to `github.base_ref` alone left the step taking its empty-base
+          # arm in every `merge_group` build, where a skipped run is
+          # indistinguishable from a passed one (caught in review of e7eff177).
+          #
+          # Do NOT collapse this to the workflow-level `PR_BASE_SHA` at the top
+          # of this file, however tempting the symmetry. That resolves the PR
+          # lane to `github.event.pull_request.base.sha`, which is the base as
+          # of the PR's creation and does NOT advance as master does: measured
+          # on this very PR, `base.sha` b722f584 was **49 commits behind**
+          # master. The collision this guard exists for is exactly a version
+          # master takes AFTER the branch did (`.10`, 1h54m later), so a stale
+          # base SHA would look green through the defect. The PR lane must
+          # resolve to the LIVE tip, which is what the branch name gives.
+          #
+          # The merge queue is the opposite case: `merge_group.base_ref` is the
+          # constant `refs/heads/master` (see the concurrency comment at the top
+          # of this file), while `base_sha` is the exact commit the queue entry
+          # was built on — which, unlike master's tip, already contains the PRs
+          # merging ahead of this one. That is the in-flight-PR axis a
+          # branch-name compare structurally cannot see.
+          #
+          # `git fetch --no-tags --depth=1 origin <sha>` works unchanged against
+          # GitHub (verified against this repo), so the consumer needs no branch.
+          BASE_REF: ${{ github.base_ref || github.event.merge_group.base_sha }}
 
   verify:
     # Preserve the legacy required-check name while the underlying work runs in parallel.
@@ -1722,11 +1749,38 @@ jobs:
     # Keep PR browser suites off the org-wide default pool. Merge groups use
     # the queue's reserved capacity so unrelated repos cannot delay admission.
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-e2e' }}
-    # The serial browser suite covers 43 flows. 90, not 75, sized against the
-    # measured p100 of SUCCESSFUL runs rather than the median. Every ratio here
+    # The serial browser suite covers 49 flows (43 before BLO-33282 split
+    # smoke-lab into 7). 90, not 75, sized against the measured p100 of
+    # SUCCESSFUL runs rather than the median. Every ratio here
     # is stated one way -- p100 as a percentage OF THE CAP -- so it can be
     # compared across jobs without inverting anything.
     #
+    # CURRENT REGIME (2026-09-18 onwards). The suite level-shifted ~3.5x DOWN
+    # between 09-17 and 09-18 and has held there. 337 e2e jobs over
+    # 2026-09-16..09-19, split at that boundary:
+    #
+    #   09-16..09-17  n=157 success  job p50 31.7 / p90 48.3 / p100 74.4
+    #                                suite p50 27.5 / p90 42.3 / p100 67.6  1 kill
+    #   09-18..09-19  n=125 success  job p50 14.4 / p90 22.0 / p100 36.2
+    #                                suite p50  7.8 / p90 14.7 / p100 32.2  0 kills
+    #
+    # p100 is now 40% of the cap, not 81%. The shift is NOT the BLO-33282
+    # smoke-lab split (which merged 09-19, a day later, and whose file was 1.11m
+    # of a 4.1m suite by then) and NOT the BLO-33478 built-bundle change: on
+    # 09-18, branches whose head did NOT contain 23f5799e7 ran 9.2-20.1m,
+    # i.e. as fast as those that did. The speedup tracks the DATE, not any
+    # commit content. Cause UNKNOWN and unchased -- likely runner-side. Both
+    # hypotheses above are recorded as FALSIFIED so nobody re-derives them.
+    #
+    # 90 is RETAINED, deliberately, and not re-sized down to this regime. It is
+    # robust to the uncertainty in a way a tighter cap would not be: if the
+    # improvement is durable, 90 costs nothing (a cap only bills when it fires,
+    # and it has not fired in 146 jobs); if it reverts, 90 is exactly the value
+    # the pre-shift window below sized. Sizing a cap tight against an
+    # unexplained 2-day improvement is the mistake BLO-32794 was filed to
+    # correct, in the other direction.
+    #
+    # PRIOR REGIME, and still the binding arithmetic if the shift reverts.
     # Measured over 600 pr.yml runs / 598 e2e jobs (2026-09-03..09-11), 434
     # successful: p50 36.0m, p90 52.6m, p100 73.2m. Against the old 75m that is
     # 98% of cap, i.e. 1.8m of margin; against 90 it is 81%, i.e. 16.8m.
