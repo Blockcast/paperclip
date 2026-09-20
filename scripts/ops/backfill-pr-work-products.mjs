@@ -123,96 +123,98 @@ let unrelated = 0;
 let failed = 0;
 let writeFailed = 0;
 
-if (RUN) for (const status of ["in_review", "blocked", "in_progress"]) {
-  const issues = asIssues(await j(`/companies/${CID}/issues?status=${status}&limit=${LIMIT}`));
-  // The list caps silently; saying so beats reporting partial coverage as total.
-  if (issues.length >= LIMIT) console.warn(`WARNING: ${status} hit the ${LIMIT} cap — re-run after this pass`);
+if (RUN) {
+  for (const status of ["in_review", "blocked", "in_progress"]) {
+    const issues = asIssues(await j(`/companies/${CID}/issues?status=${status}&limit=${LIMIT}`));
+    // The list caps silently; saying so beats reporting partial coverage as total.
+    if (issues.length >= LIMIT) console.warn(`WARNING: ${status} hit the ${LIMIT} cap — re-run after this pass`);
 
-  for (const issue of issues) {
-    const workProducts = await j(`/issues/${issue.id}/work-products`);
-    const have = new Set(
-      workProducts
-        .filter((w) => w.type === "pull_request")
-        .map((w) => `${w.metadata?.repoFullName}#${w.metadata?.prNumber}`.toLowerCase()),
-    );
+    for (const issue of issues) {
+      const workProducts = await j(`/issues/${issue.id}/work-products`);
+      const have = new Set(
+        workProducts
+          .filter((w) => w.type === "pull_request")
+          .map((w) => `${w.metadata?.repoFullName}#${w.metadata?.prNumber}`.toLowerCase()),
+      );
 
-    const comments = await j(`/issues/${issue.id}/comments`);
-    const refs = new Map();
-    for (const c of comments) {
-      for (const m of (c.body ?? "").matchAll(PR_RE)) {
-        refs.set(`${m[1]}#${m[2]}`.toLowerCase(), { repo: m[1], number: Number(m[2]) });
-      }
-    }
-
-    for (const [key, ref] of refs) {
-      if (have.has(key)) {
-        skipped += 1;
-        continue;
-      }
-      let pr;
-      try {
-        pr = JSON.parse(
-          execFileSync(
-            "gh",
-            ["pr", "view", String(ref.number), "-R", ref.repo, "--json", "title,body,headRefName,url,state,mergedAt,headRefOid,isDraft"],
-            { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
-          ),
-        );
-      } catch (err) {
-        // A deleted PR, a repo this token cannot read, or a URL in prose that
-        // was never a PR. Skip the row rather than abort the whole backfill.
-        console.warn(`SKIP ${issue.identifier} <- ${key}: ${String(err).split("\n")[0]}`);
-        failed += 1;
-        continue;
+      const comments = await j(`/issues/${issue.id}/comments`);
+      const refs = new Map();
+      for (const c of comments) {
+        for (const m of (c.body ?? "").matchAll(PR_RE)) {
+          refs.set(`${m[1]}#${m[2]}`.toLowerCase(), { repo: m[1], number: Number(m[2]) });
+        }
       }
 
-      // Same rule the webhook uses to link a PR: the PR must NAME this issue in
-      // its title, its branch, or on a labeled owning-reference line in the body
-      // — a bare prose mention is not ownership. Without this the backfill
-      // invents evidence — a dry run over live data proposed
-      // `actions/actions-runner-controller#4516` and `safishamsi/graphify#1570`,
-      // upstream PRs merely cited in prose, and the truth probe would then read
-      // review:ally-clean off the wrong artifact.
-      if (!namesIssue(pr, issue.identifier)) {
-        console.warn(`UNRELATED ${issue.identifier} <- ${key}: PR does not name the issue`);
-        unrelated += 1;
-        continue;
-      }
+      for (const [key, ref] of refs) {
+        if (have.has(key)) {
+          skipped += 1;
+          continue;
+        }
+        let pr;
+        try {
+          pr = JSON.parse(
+            execFileSync(
+              "gh",
+              ["pr", "view", String(ref.number), "-R", ref.repo, "--json", "title,body,headRefName,url,state,mergedAt,headRefOid,isDraft"],
+              { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+            ),
+          );
+        } catch (err) {
+          // A deleted PR, a repo this token cannot read, or a URL in prose that
+          // was never a PR. Skip the row rather than abort the whole backfill.
+          console.warn(`SKIP ${issue.identifier} <- ${key}: ${String(err).split("\n")[0]}`);
+          failed += 1;
+          continue;
+        }
 
-      const body = {
-        type: "pull_request",
-        provider: "github",
-        externalId: `${ref.repo}#${ref.number}`,
-        title: pr.title,
-        url: pr.url,
-        status: prStatus(pr),
-        metadata: {
-          repoFullName: ref.repo,
-          prNumber: ref.number,
-          headSha: pr.headRefOid,
-          merged: pr.state === "MERGED",
-          mergedAt: pr.mergedAt ?? null,
-          backfilledAt: new Date().toISOString(),
-        },
-      };
+        // Same rule the webhook uses to link a PR: the PR must NAME this issue in
+        // its title, its branch, or on a labeled owning-reference line in the body
+        // — a bare prose mention is not ownership. Without this the backfill
+        // invents evidence — a dry run over live data proposed
+        // `actions/actions-runner-controller#4516` and `safishamsi/graphify#1570`,
+        // upstream PRs merely cited in prose, and the truth probe would then read
+        // review:ally-clean off the wrong artifact.
+        if (!namesIssue(pr, issue.identifier)) {
+          console.warn(`UNRELATED ${issue.identifier} <- ${key}: PR does not name the issue`);
+          unrelated += 1;
+          continue;
+        }
 
-      if (!APPLY) {
-        console.log(`DRY-RUN ${issue.identifier} <- ${key} (${body.status})`);
-        wouldCreate += 1;
-        continue;
+        const body = {
+          type: "pull_request",
+          provider: "github",
+          externalId: `${ref.repo}#${ref.number}`,
+          title: pr.title,
+          url: pr.url,
+          status: prStatus(pr),
+          metadata: {
+            repoFullName: ref.repo,
+            prNumber: ref.number,
+            headSha: pr.headRefOid,
+            merged: pr.state === "MERGED",
+            mergedAt: pr.mergedAt ?? null,
+            backfilledAt: new Date().toISOString(),
+          },
+        };
+
+        if (!APPLY) {
+          console.log(`DRY-RUN ${issue.identifier} <- ${key} (${body.status})`);
+          wouldCreate += 1;
+          continue;
+        }
+        // Log AFTER the write, and count a failure rather than aborting: the
+        // script is idempotent on (repo, number), so finishing the pass and
+        // printing the summary beats losing the counts for the rows that landed.
+        try {
+          await j(`/issues/${issue.id}/work-products`, { method: "POST", body: JSON.stringify(body) });
+        } catch (err) {
+          console.warn(`FAILED ${issue.identifier} <- ${key}: ${String(err).split("\n")[0]}`);
+          writeFailed += 1;
+          continue;
+        }
+        console.log(`CREATE ${issue.identifier} <- ${key} (${body.status})`);
+        created += 1;
       }
-      // Log AFTER the write, and count a failure rather than aborting: the
-      // script is idempotent on (repo, number), so finishing the pass and
-      // printing the summary beats losing the counts for the rows that landed.
-      try {
-        await j(`/issues/${issue.id}/work-products`, { method: "POST", body: JSON.stringify(body) });
-      } catch (err) {
-        console.warn(`FAILED ${issue.identifier} <- ${key}: ${String(err).split("\n")[0]}`);
-        writeFailed += 1;
-        continue;
-      }
-      console.log(`CREATE ${issue.identifier} <- ${key} (${body.status})`);
-      created += 1;
     }
   }
 }

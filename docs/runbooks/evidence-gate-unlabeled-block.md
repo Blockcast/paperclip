@@ -107,9 +107,18 @@ this count is a backfill work-list, not a stuck-issue count; split it by
 
 ```bash
 curl -sS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-  "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/issues?status=in_review&limit=500" \
-| jq '[.[] | select(.lastEvidenceVerdict.diagnostics // [] | index("no-linked-pull-request"))] | length'
+  "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/issues?status=in_review&limit=1000" \
+| jq '{ truncated: (length >= 1000),
+        noPr: [.[] | select(.lastEvidenceVerdict.diagnostics // [] | index("no-linked-pull-request"))] | length }'
 ```
+
+**`truncated: true` means page it or narrow the status — do not record the
+number.** The list route clamps to `ISSUE_LIST_MAX_LIMIT` (1000) and returns a
+**bare array**: no total, no cursor, and no truncation header
+(`server/src/routes/issues.ts:7896-7900`). A full page is the only signal there
+is, which is why this is a row-count check and not a header check — the same
+check `scripts/ops/backfill-pr-work-products.mjs:130` makes for the same reason.
+A header guard here would never fire.
 
 Record it in BLO-3202. Then run the backfill — **it is dry-run by default**, so
 it takes two invocations and only the second one writes:
@@ -188,8 +197,8 @@ flip criterion is met trivially. Do not start the window; check the deploy.
 
 ```bash
 curl -sS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-  "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/issues?status=in_review&limit=500" \
-| jq '[.[] | select(.lastEvidenceVerdict != null)] | {
+  "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/issues?status=in_review&limit=1000" \
+| jq '{truncated: (length >= 1000)} + ([.[] | select(.lastEvidenceVerdict != null)] | {
     total: length,
     pass: map(select(.lastEvidenceVerdict.verdict=="pass")) | length,
     onlyTruthMissing: map(select((.lastEvidenceVerdict.missing|length)>0 and ((.lastEvidenceVerdict.missing - ["review:ally-clean","deploy:landed"])|length)==0)) | length,
@@ -200,8 +209,18 @@ curl -sS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
         and ((.lastEvidenceVerdict.diagnostics // []) | map(startswith("github-truth-probe-failed")) | any | not)
         and ((.lastEvidenceVerdict.diagnostics // []) | index("no-linked-pull-request") | not))) | length,
     noPr: map(select((.lastEvidenceVerdict.diagnostics // []) | index("no-linked-pull-request"))) | length,
-    probeFailed: map(select(.lastEvidenceVerdict.diagnostics // [] | map(startswith("github-truth-probe-failed")) | any)) | length }'
+    probeFailed: map(select(.lastEvidenceVerdict.diagnostics // [] | map(startswith("github-truth-probe-failed")) | any)) | length })'
 ```
+
+**A day that comes back `truncated: true` is an unmeasured day, not a clean
+one** — `total` and `willBlock` are both floors, and the cut falls on the wrong
+side. With no `sortField` the list orders by priority then recency
+(`issues.ts:2216-2221`), so the rows past the cap are the low-priority, stalest
+`in_review` issues — exactly where an issue sits without a clean Ally review at
+head. Truncation therefore under-samples `willBlock` harder than `total` and the
+ratio reads *safer* than reality. It voids the install check above for the same
+reason. Page it with `&offset=` or narrow the status, and do not count the day
+until the page is complete.
 
 `willBlock` is the number that matters: it mirrors the escalation predicate in
 `evidence-gate.ts` exactly — `truthOnlyGap && blockableGap`, minus the two
@@ -248,6 +267,10 @@ change its only excess is the two suppressed populations.
 
 Seven consecutive days with **all** of:
 
+- every day's page complete — `truncated: false`. A truncated day does not
+  count toward the seven and is not a failure either; it is unmeasured, and the
+  window pauses until you re-measure it completely. Same standard as the seven
+  all-zero rows below: a number you cannot see all of is not a clean number;
 - the install check above still passing — `total` > 0 every day, and
   `onlyTruthMissing + noPr + probeFailed` > 0 on at least one of the seven.
   Seven all-zero rows are not a clean gate, they are an absent one;
