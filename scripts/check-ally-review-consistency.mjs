@@ -525,6 +525,34 @@ export function findViolations(prs) {
  * moving PR breaks its own baseline entry. Staleness is a proxy for that; the head
  * SHA measures it directly.
  *
+ * That rejection stands, and `prDormancy` below does **not** reverse it — there is
+ * still no calendar window here. What the ratchet alone does not cover is a PR that
+ * carries a real violation and *cannot merge at all*, which the ratchet can only
+ * dispose of by having a human write a baseline entry for every one of them. As of
+ * 2026-09-20 exactly one unbaselined violation was outstanding repo-wide (#1220
+ * @a9ee094a) and it is `DIRTY`; all six original baseline entries had self-expired.
+ * So the run was red, un-actionably, over a PR GitHub itself refuses to merge.
+ *
+ * The two legs of "liveness" are not equally safe and only one is adopted:
+ *
+ *   - **Cannot-merge (adopted).** `DIRTY` and `draft` are states GitHub enforces at
+ *     the merge button. Leaving one is a state transition this guard re-observes on
+ *     its next hourly run, so deferring is bounded: the PR cannot reach `master`
+ *     without first re-entering scope. For `DIRTY` the exposure is usually nil —
+ *     resolving conflicts means pushing, which moves the head, which sheds the
+ *     violation outright.
+ *   - **Not-updated-in-N-days (still rejected).** Staleness is not a state GitHub
+ *     enforces anything against. A `CLEAN` PR untouched for 30 days merges on a
+ *     click, with no push, no transition, and no run in between — the guard never
+ *     gets its chance to red. That is unbounded fail-open on exactly the BLO-19778
+ *     incident, and it is why #1525's two-day-old `BEHIND` measurement killed the
+ *     window approach and still does.
+ *
+ * Measured on the 121 open PRs of 2026-09-20: 71 live, 50 dormant. #1316
+ * (`UNSTABLE`) and #1360 (`BEHIND`) — two of the four PRs that originally pinned
+ * this guard — classify **live**, so this scoping grants them no amnesty; their
+ * findings expired by head movement, as designed.
+ *
  * A baseline entry is a suppression of a real finding, so each one must name the
  * PR and the issue that owns its disposition, and a malformed entry throws rather
  * than being skipped — a baseline that silently ignores its own bad rows is the
@@ -644,6 +672,89 @@ export function applyBaseline(violations, entries) {
   };
 }
 
+/**
+ * The merge states GitHub will not merge from, so a violation under one of them
+ * cannot reach `master` without the PR first changing state.
+ *
+ * Deliberately a deny-list of two, not an allow-list of the mergeable states.
+ * `mergeStateStatus` is lazily computed server-side and reports `UNKNOWN` until
+ * GitHub finishes — 5 of 121 open PRs were `UNKNOWN` when this was written — and
+ * GitHub adds values to this enum without notice. An allow-list would silently
+ * drop every unrecognised and every not-yet-computed state out of the audit, which
+ * is the fail-open shape this whole file exists to prevent. Anything not named
+ * here is treated as live and can fail the run.
+ */
+export const DORMANT_MERGE_STATES = new Set(["DIRTY"]);
+
+/**
+ * Why a PR cannot merge right now, or `null` if it can.
+ *
+ * Unknown, missing and malformed inputs all resolve to `null` (live) on purpose:
+ * the only thing that defers a finding is positive evidence that GitHub is
+ * blocking the merge. Absence of evidence keeps the finding fatal.
+ */
+export function prDormancy(pr) {
+  if (pr?.isDraft === true) {
+    return "draft";
+  }
+  const state = String(pr?.mergeStateStatus ?? "").toUpperCase();
+  if (DORMANT_MERGE_STATES.has(state)) {
+    return `merge state ${state}`;
+  }
+  return null;
+}
+
+/**
+ * Refuses to run an audit that has scoped itself down to nothing.
+ *
+ * Deferring findings on unmergeable PRs is only sound while the live set is a
+ * real population. If a `mergeStateStatus` schema change, a token losing a field,
+ * or a bad edit here ever classified every PR dormant, every violation would
+ * downgrade to a warning and the run would print a green pass having failed
+ * nothing — "green because it stopped checking", which PEN-2847 names as worse
+ * than the permanent red it replaced. Same reflex as `assertPrListComplete` and
+ * `assertHeadSha`: throw rather than assert nothing.
+ */
+export function assertLiveScopeNonVacuous(prs, repo) {
+  const rows = prs ?? [];
+  if (rows.length > 0 && rows.every((pr) => prDormancy(pr) !== null)) {
+    throw new Error(
+      `every one of the ${rows.length} open PR(s) in ${repo} classified as unmergeable, ` +
+        `so no finding could fail this run. That is a scoping bug, not a clean repo: ` +
+        `check that gh pr list still returns isDraft/mergeStateStatus.`,
+    );
+  }
+  return rows;
+}
+
+/**
+ * Splits unbaselined findings into the ones that can still reach `master` and the
+ * ones GitHub is currently refusing to merge.
+ *
+ * A finding is matched to its PR by the number already parsed into its
+ * fingerprint. A finding whose PR cannot be resolved — unparseable number, or a PR
+ * absent from the fetched set — stays in `failing`, because "I could not tell
+ * whether this one matters" must not read as "this one does not matter".
+ */
+export function partitionByMergeEligibility(failing, prs) {
+  const byNumber = new Map((prs ?? []).map((pr) => [String(pr?.number), pr]));
+  const live = [];
+  const deferred = [];
+
+  for (const item of failing ?? []) {
+    const number = String(item?.fingerprint ?? "").split(":")[1];
+    const pr = byNumber.get(number);
+    const reason = pr ? prDormancy(pr) : null;
+    if (reason) {
+      deferred.push({ ...item, reason });
+    } else {
+      live.push(item);
+    }
+  }
+
+  return { failing: live, deferred };
+}
+
 function gh(args) {
   return execFileSync("gh", args, {
     encoding: "utf8",
@@ -708,7 +819,7 @@ function fetchOpenPrs(repo) {
       "--limit",
       String(PR_LIST_LIMIT),
       "--json",
-      "number,headRefOid,author",
+      "number,headRefOid,author,isDraft,mergeStateStatus",
     ]),
   );
 
@@ -718,6 +829,8 @@ function fetchOpenPrs(repo) {
     number: assertHeadSha(row, repo).number,
     headSha: row.headRefOid,
     author: row.author,
+    isDraft: row.isDraft,
+    mergeStateStatus: row.mergeStateStatus,
     reviews: JSON.parse(
       gh(["api", `repos/${repo}/pulls/${row.number}/reviews`, "--paginate"]),
     ),
@@ -732,8 +845,12 @@ function loadBaseline() {
 function main() {
   const repo = process.env.ALLY_REVIEW_REPO || "Blockcast/paperclip";
   const prs = fetchOpenPrs(repo);
+  assertLiveScopeNonVacuous(prs, repo);
   const violations = findViolations(prs);
-  const { failing, suppressed, staleEntries } = applyBaseline(violations, loadBaseline());
+  const baselined = applyBaseline(violations, loadBaseline());
+  const { suppressed, staleEntries } = baselined;
+  const { failing, deferred } = partitionByMergeEligibility(baselined.failing, prs);
+  const liveCount = prs.filter((pr) => prDormancy(pr) === null).length;
 
   for (const entry of staleEntries) {
     console.log(
@@ -751,9 +868,24 @@ function main() {
     console.log("");
   }
 
+  if (deferred.length > 0) {
+    console.log(
+      `Deferred (${deferred.length}) — real, unbaselined findings on PR(s) GitHub will not ` +
+        `merge from. Each returns to failing the moment its PR becomes mergeable:\n`,
+    );
+    for (const { violation, fingerprint, reason } of deferred) {
+      console.log(
+        `::warning title=Ally review-consistency finding on an unmergeable PR::` +
+          `${violation} [${reason}]`,
+      );
+      console.log(`    fingerprint: ${fingerprint}`);
+    }
+    console.log("");
+  }
+
   if (failing.length > 0) {
     console.error(
-      `Ally review-consistency guard FAILED for ${repo} (${failing.length} unbaselined violation(s)):\n`,
+      `Ally review-consistency guard FAILED for ${repo} (${failing.length} unbaselined violation(s) on mergeable PR(s)):\n`,
     );
     for (const { violation, fingerprint } of failing) {
       console.error(`  ${violation}`);
@@ -770,7 +902,9 @@ function main() {
   }
 
   console.log(
-    `Ally review-consistency guard passed: no unbaselined attestation conflicts found across ${prs.length} open PR(s) in ${repo}.`,
+    `Ally review-consistency guard passed: no unbaselined attestation conflicts found across ` +
+      `${liveCount} mergeable PR(s) of ${prs.length} open in ${repo}` +
+      `${deferred.length > 0 ? `, ${deferred.length} finding(s) deferred on unmergeable PRs` : ""}.`,
   );
 }
 
