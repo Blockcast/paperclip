@@ -562,11 +562,25 @@ export const NUMERIC_SETTING_BOUNDS = {
   //
   // Reading `updated_at` is safe here ONLY because the predicate is scoped to `pending`.
   // The column has no `$onUpdate` and no trigger, so it moves solely where a write sets
-  // it; of the eleven writers to `approvals`, exactly one leaves the row `pending`
-  // afterwards (`resubmit`), and comments are inserted into `approval_comments` without
-  // touching the parent. So on a `pending` row `updated_at` cannot carry comment noise —
-  // it carries a resubmission instant or nothing. Do not lift this bound to a predicate
-  // that also admits decided or withdrawn rows without redoing that survey.
+  // it. The survey behind that claim, stated so the next reader can re-run it rather than
+  // trust it: `grep -rn 'update(approvals)' server/src --include='*.ts' | grep -v
+  // __tests__` returns eleven sites, and exactly one leaves the row `pending` afterwards
+  // (`resubmit`, `services/approvals.ts`). Comments are inserted into `approval_comments`
+  // without touching the parent. So on a `pending` row `updated_at` cannot carry comment
+  // noise — it carries a resubmission instant or nothing.
+  //
+  // The nearest miss is worth naming, because it is the shape that would break this and
+  // it already exists: `services/agents.ts` edits `payload` on rows explicitly scoped to
+  // `pending`/`revision_requested`. It is safe here for one reason only — it does not set
+  // `updatedAt`. A future "bump"/nudge write, or an idempotency replay that touches a
+  // pending row's `updated_at`, would silently extend this exemption by up to the full
+  // grace, which is the over-exemption direction. No test covers that drift, and the
+  // obvious candidate does not: `issue-recovery-actions.test.ts` drives the real
+  // revision→resubmit chain, but freshness there is produced by the two writers jointly
+  // (`requestRevision` moves `updated_at` first), so removing it from `resubmit` alone
+  // leaves that test green. The survey above is therefore the control, and re-running it
+  // is the only thing that catches a new writer. Do not lift this bound to a predicate
+  // that also admits decided or withdrawn rows without redoing it.
   //
   // Ceiling is 30d, matching the PR entry and the observed maximum: past a month
   // "waiting on the board" is not a description of the card but of a problem nobody is

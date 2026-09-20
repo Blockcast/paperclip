@@ -3023,13 +3023,17 @@ export function recoveryService(
    * Bounding on `createdAt` alone would date that live wait from the original filing, so
    * a card filed on day 0 and resubmitted on day 20 reports no path and is seizable while
    * a genuine decision is still coming. `updatedAt` is safe to read here precisely because
-   * this predicate is scoped to `pending`: of the eleven writers to `approvals`, the only
-   * one that leaves a row `pending` while touching `updatedAt` is `resubmit`
+   * this predicate is scoped to `pending`: of the eleven `update(approvals)` sites under
+   * `server/src` (excluding tests — `grep -rn 'update(approvals)' server/src
+   * --include='*.ts' | grep -v __tests__`, re-runnable rather than asserted), the only one
+   * that leaves a row `pending` while touching `updatedAt` is `resubmit`
    * (`services/approvals.ts`) — `addComment` writes `approval_comments` only, the column
-   * has no `$onUpdate` and no trigger, and every other write moves the row out of
-   * `pending`. So on a `pending` row `updatedAt` carries exactly one signal, and it is the
-   * one this predicate wants. See `pendingBoardApprovalAttendanceGraceMs` for the measured
-   * decision-latency distribution behind the 14d default.
+   * has no `$onUpdate` and no trigger, and every other write either moves the row out of
+   * `pending` or leaves `updatedAt` alone. The nearest miss is `services/agents.ts`, which
+   * edits `payload` on rows scoped to `pending` and is harmless only because it does not
+   * set `updatedAt`. So on a `pending` row `updatedAt` carries exactly one signal, and it
+   * is the one this predicate wants. See `pendingBoardApprovalAttendanceGraceMs` for the
+   * measured decision-latency distribution behind the 14d default.
    */
   async function hasPendingBoardApprovalWakePath(
     issue: typeof issues.$inferSelect,

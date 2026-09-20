@@ -29,6 +29,7 @@ import { truncateCompanyScopedTestState } from "./helpers/truncate-company-scope
 import { errorHandler } from "../middleware/index.js";
 import { logger } from "../middleware/logger.js";
 import { issueRoutes } from "../routes/issues.js";
+import { approvalService } from "../services/approvals.js";
 import { buildPaperclipWakePayload } from "../services/heartbeat.js";
 import { computeIssueMonitorGateFingerprint } from "../services/issue-execution-policy.js";
 import { RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS, issueRecoveryActionService, recoveryHandoffGrantIsWithinTtl } from "../services/issue-recovery-actions.js";
@@ -2840,6 +2841,15 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       updatedAt?: Date;
     }) {
       const approvalId = randomUUID();
+      // `updated_at` follows `created_at` unless a caller moves it deliberately. Both
+      // columns are `defaultNow()`, so the real insert path leaves them EQUAL at filing
+      // and only `resubmit` separates them — back-dating `created_at` alone would seed a
+      // row production cannot produce (filed two weeks ago, touched a moment ago) and
+      // would make every aged-out test silently assert nothing once the predicate reads
+      // `GREATEST(created_at, updated_at)`. Caught exactly that way: the pre-existing
+      // grace test went green-to-red on the predicate change, because the fixture, not
+      // the code, was wrong.
+      const stamp = input.updatedAt ?? input.createdAt;
       await db.insert(approvals).values({
         id: approvalId,
         companyId: input.companyId,
@@ -2848,17 +2858,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         status: input.status ?? "pending",
         payload: { title: "Authorize the seat purchase" },
         ...(input.createdAt ? { createdAt: input.createdAt } : {}),
-        // `updated_at` follows `created_at` unless a caller moves it deliberately. Both
-        // columns are `defaultNow()`, so the real insert path leaves them EQUAL at filing
-        // and only `resubmit` separates them — back-dating `created_at` alone would seed a
-        // row production cannot produce (filed two weeks ago, touched a moment ago) and
-        // would make every aged-out test silently assert nothing once the predicate reads
-        // `GREATEST(created_at, updated_at)`. Caught exactly that way: the pre-existing
-        // grace test went green-to-red on the predicate change, because the fixture, not
-        // the code, was wrong.
-        ...(input.updatedAt ?? input.createdAt
-          ? { updatedAt: input.updatedAt ?? input.createdAt }
-          : {}),
+        ...(stamp ? { updatedAt: stamp } : {}),
       });
       // `issueId: null` seeds a card that exists but is linked to nothing, so the
       // issue-scoping clause can be measured without the link row confounding it.
@@ -3022,6 +3022,67 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         createdAt: new Date(Date.now() - (graceMs + 7 * 24 * 60 * 60_000)),
         updatedAt: new Date(Date.now() - 60 * 60_000),
       });
+
+      const result = await sweep();
+
+      expect(result.escalated).toBe(0);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("in_progress");
+    });
+
+    it("keeps believing a card the real resubmit path returned to pending", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedSeizableProductiveRow();
+      const graceMs = loadConfig().pendingBoardApprovalAttendanceGraceMs;
+      const filedAt = new Date(Date.now() - (graceMs + 7 * 24 * 60 * 60_000));
+      const approvalId = await insertBoardApproval({
+        companyId,
+        issueId: sourceIssueId,
+        requestedByAgentId: coderId,
+        createdAt: filedAt,
+      });
+
+      // The test above hand-writes the post-resubmit shape; this one DRIVES it through the
+      // real producers, because the shape is only meaningful if production can still make
+      // it. That is a cross-module invariant — the predicate lives in `recovery/service.ts`
+      // and the writers in `services/approvals.ts` — and a hand-written fixture cannot fail
+      // when the writers change underneath it.
+      //
+      // What this pins, verified by breaking each one and watching it go red: `created_at`
+      // survives the round trip (so the aged-out tests above keep measuring something), and
+      // the real two-step chain yields a row this predicate exempts.
+      //
+      // What it does NOT pin, stated because the obvious reading is wrong: it does not
+      // catch `resubmit` ceasing to move `updated_at`. Measured — patch that write out and
+      // this test still passes, because `requestRevision` moved `updated_at` one step
+      // earlier and `GREATEST()` is already fresh. Freshness on a resubmitted row is
+      // produced by the revision→resubmit chain JOINTLY, not by `resubmit` alone, so no
+      // single-writer test can pin it.
+      //
+      // Residual hazard, deliberately left visible rather than papered over: a NEW writer
+      // that bumps `updated_at` on a row it leaves `pending` would silently widen this
+      // exemption by up to the full grace, and nothing here would catch it. The live
+      // near-miss is `services/agents.ts`, which edits `payload` on rows explicitly scoped
+      // to `pending` and is harmless for one reason only — it omits `updatedAt`.
+      await approvalService(db).requestRevision(approvalId, "board-user", "Needs a cost line.");
+      const resubmitted = await approvalService(db).resubmit(approvalId);
+
+      // Guard the premise before measuring the behaviour, so a change to the producers
+      // fails HERE with a legible cause rather than as an unexplained escalation count.
+      expect(resubmitted.status).toBe("pending");
+      expect(resubmitted.createdAt.getTime()).toBe(filedAt.getTime());
+      expect(resubmitted.updatedAt.getTime()).toBeGreaterThan(filedAt.getTime());
+
+      // The approval path must be the ONLY thing exempting this row, or the assertion
+      // below would pass for a reason this test does not name. `services/approvals.ts`
+      // never writes `agent_wakeup_requests` — wakes are queued from
+      // `approval-resolution.ts`, which these two methods do not call — so this should be
+      // empty, and it is asserted rather than assumed so a future wake-on-resubmit cannot
+      // quietly take over as the thing keeping the row alive.
+      const queuedWakes = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.companyId, companyId));
+      expect(queuedWakes).toHaveLength(0);
 
       const result = await sweep();
 
