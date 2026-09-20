@@ -177,6 +177,25 @@ REFIRE_COOLDOWN_SECONDS = int(os.environ.get("REFIRE_COOLDOWN_SECONDS") or 2 * 6
 # reported as deferred, still counted in `considered`, and still alarm.
 MAX_REFIRES_PER_RUN = int(os.environ.get("MAX_REFIRES_PER_RUN") or 5)
 
+# Ceiling on re-fire ATTEMPTS per run. MAX_REFIRES_PER_RUN counts re-fires
+# that were actually DELIVERED, so a PR whose write fails does not consume a
+# slot -- otherwise a permanently-failing PR would hold rank 0 forever (no
+# marker is posted on failure, so its cooldown never engages and its wait
+# keeps growing), and MAX_REFIRES_PER_RUN such PRs would starve the budget
+# every run. That fall-through has to stop somewhere or a run where every
+# write fails would attempt the entire eligible set, so this bounds the
+# extra calls.
+#
+# 2x the delivery cap. Each re-fire is 2 writes, so the worst case is 20
+# requests against github.token's 1,000/hour/repository budget -- negligible
+# beside the ~359 reads a run already makes (see review-gate-sweep.yml's
+# rate-limit arithmetic, which is unchanged by this). It tolerates up to
+# MAX_REFIRES_PER_RUN persistently-failing PRs while still delivering a full
+# budget to healthy ones.
+MAX_REFIRE_ATTEMPTS_PER_RUN = int(
+    os.environ.get("MAX_REFIRE_ATTEMPTS_PER_RUN") or 2 * MAX_REFIRES_PER_RUN
+)
+
 # BLO-22892 AC4: the stranded condition must be visible without a human
 # noticing by hand. A re-fired request can itself go unserviced (that's the
 # whole failure mode this script backstops), so "we re-fired it" is not
@@ -226,6 +245,13 @@ DEFERRED_REASON_PREFIX = "skip: deferred"
 # but carries this distinguishing token so main() can name the actual cause
 # instead of reporting N indistinguishable per-PR errors.
 RATE_LIMIT_TOKEN = "RateLimitExhausted"
+
+# Distinguishing token for a failure in the WRITE pass rather than the read
+# pass. Both are recorded under SWEEP_ERROR_REASON_PREFIX (both are genuine
+# failures and must count toward sweep_is_degraded), but only a write failure
+# means "this PR won a slot and the re-fire did not land" -- which is what
+# lets main()'s deferred summary stay honest about where the budget went.
+REFIRE_WRITE_FAILURE_TOKEN = "re-fire write failed"
 
 # Every API call is bounded. urlopen's default timeout is None -- block
 # forever -- and this script never calls socket.setdefaulttimeout(), so a
@@ -840,6 +866,7 @@ def sweep(owner, repo, token, api_base_url, now=None, dry_run=False):
 
       1. DECIDE every PR. No writes.
       2. Spend MAX_REFIRES_PER_RUN on the LONGEST-WAITING eligible PRs.
+         The cap counts DELIVERED re-fires; see MAX_REFIRE_ATTEMPTS_PER_RUN.
 
     This used to be one pass that wrote as it walked, which handed the budget
     to whatever order the API returned -- and `GET /pulls?state=open` returns
@@ -915,13 +942,26 @@ def sweep(owner, repo, token, api_base_url, now=None, dry_run=False):
                     False,
                     "%s -- %s" % (SWEEP_ERROR_REASON_PREFIX, RATE_LIMIT_TOKEN),
                 ))
-            # Fall through to the re-fire pass rather than returning. Under
-            # the old single pass, PRs walked before exhaustion had ALREADY
-            # been written; returning here would make an exhausted run issue
-            # zero re-fires, which is a regression -- the re-asks are the
-            # point of the job and the reads only serve them. The writes are
-            # attempted and may themselves hit the limit, which lands in the
-            # per-write isolation below.
+            # Fall through to the re-fire pass rather than returning. Two
+            # reasons, and the second is the one that makes `break` load-
+            # bearing rather than merely preferable:
+            #
+            #   1. Under the old single pass, PRs walked before exhaustion
+            #      had ALREADY been written; returning here would make an
+            #      exhausted run issue zero re-fires, which is a regression --
+            #      the re-asks are the point of the job and the reads only
+            #      serve them.
+            #   2. Since the writes no longer happen inside _consider_pr, a
+            #      `return` would leave the already-decided PRs at
+            #      refire=True with no write ever attempted -- and main()
+            #      derives `refired = [r for r in results if r[3]]`, so the
+            #      run would REPORT re-fires that never happened. That is a
+            #      correctness defect in the accounting, not just lost work.
+            #
+            # Do not "simplify" this back to a return. Pinned by
+            # test_rate_limit_in_the_read_pass_still_spends_the_refire_budget.
+            # The writes are attempted and may themselves hit the limit,
+            # which lands in the per-write isolation below.
             break
         except Exception as error:  # noqa: BLE001 -- deliberate per-PR isolation
             print(
@@ -942,33 +982,58 @@ def sweep(owner, repo, token, api_base_url, now=None, dry_run=False):
         (i for i, outcome in enumerate(results) if outcome[3]),
         key=lambda i: results[i][2],
     )
-    for rank, i in enumerate(eligible):
+    #
+    # The cap counts DELIVERED re-fires, not attempts, and that distinction is
+    # load-bearing (PEN-3394 review). A failed write posts no marker, so
+    # should_refire's cooldown never engages -- the PR keeps the longest wait
+    # and sorts back to rank 0 on the next run, forever. If a failure spent a
+    # slot, then >= MAX_REFIRES_PER_RUN permanently-failing PRs (a comment POST
+    # 403ing as "resource not accessible by integration" is the realistic case)
+    # would consume the whole budget every run and nobody would be served --
+    # the same starvation this change exists to fix, reintroduced through a
+    # different door. Counting successes lets a failed write fall through to
+    # the next-ranked PR instead.
+    #
+    # MAX_REFIRE_ATTEMPTS_PER_RUN is what keeps that from being unbounded: it
+    # caps the API calls a run of failures can make, so the fall-through cannot
+    # walk the entire eligible set.
+    succeeded = 0
+    attempted = 0
+    for i in eligible:
         pr, head_sha, pending_since, _refire, reason = results[i]
-        if rank >= MAX_REFIRES_PER_RUN:
+        if succeeded >= MAX_REFIRES_PER_RUN or attempted >= MAX_REFIRE_ATTEMPTS_PER_RUN:
             # Withheld for rate-limiting, not because nothing is wrong. The
             # PR keeps its `pending_since`, so it still counts toward
             # `considered` and can still ALARM -- rate-limiting a write must
             # never suppress the alarm.
+            exhausted = (
+                "over MAX_REFIRES_PER_RUN=%d this run" % MAX_REFIRES_PER_RUN
+                if succeeded >= MAX_REFIRES_PER_RUN
+                else "over MAX_REFIRE_ATTEMPTS_PER_RUN=%d this run (%d re-fire write(s) failed)"
+                     % (MAX_REFIRE_ATTEMPTS_PER_RUN, attempted - succeeded)
+            )
             results[i] = (
                 pr, head_sha, pending_since, False,
-                "%s -- %s, over MAX_REFIRES_PER_RUN=%d this run"
-                % (DEFERRED_REASON_PREFIX, reason, MAX_REFIRES_PER_RUN),
+                "%s -- %s, %s" % (DEFERRED_REASON_PREFIX, reason, exhausted),
             )
             continue
         if dry_run:
             # The flag stays True so the dry run's accounting and budget match
             # a live run exactly; only the side effects are withheld.
+            attempted += 1
+            succeeded += 1
             results[i] = (pr, head_sha, pending_since, True, "DRY-RUN would re-fire -- %s" % reason)
             continue
+        attempted += 1
         try:
             _refire_pr(owner, repo, pr, head_sha, pending_since, token, api_base_url, now)
         except Exception as error:  # noqa: BLE001 -- isolation, as in the decision pass
             # A failed write must not strand the remaining re-fires, and must
             # not read as a clean skip. RateLimitExhausted is not special-cased
             # here: unlike the read pass there is no per-PR read left to grind
-            # through, the remaining writes are few (<= MAX_REFIRES_PER_RUN),
-            # and each is the job's actual product -- so attempt them and let
-            # each record its own failure.
+            # through, the remaining writes are bounded by
+            # MAX_REFIRE_ATTEMPTS_PER_RUN, and each is the job's actual
+            # product -- so attempt them and let each record its own failure.
             print(
                 "PR #%d: re-fire failed (%s: %s) -- continuing with the remaining re-fires"
                 % (pr.get("number", -1), type(error).__name__, error),
@@ -976,8 +1041,11 @@ def sweep(owner, repo, token, api_base_url, now=None, dry_run=False):
             )
             results[i] = (
                 pr, head_sha, pending_since, False,
-                "%s -- %s" % (SWEEP_ERROR_REASON_PREFIX, type(error).__name__),
+                "%s -- %s (%s)"
+                % (SWEEP_ERROR_REASON_PREFIX, REFIRE_WRITE_FAILURE_TOKEN, type(error).__name__),
             )
+            continue
+        succeeded += 1
     return results
 
 
@@ -1025,6 +1093,7 @@ def main(argv=None):
     ]
     failed = [r for r in results if str(r[4]).startswith(SWEEP_ERROR_REASON_PREFIX)]
     rate_limited = [r for r in failed if RATE_LIMIT_TOKEN in str(r[4])]
+    refire_write_failures = [r for r in failed if REFIRE_WRITE_FAILURE_TOKEN in str(r[4])]
     deferred = [r for r in results if str(r[4]).startswith(DEFERRED_REASON_PREFIX)]
     degraded = sweep_is_degraded(len(failed), len(results))
     for pr, head_sha, pending_since, refire, reason in results:
@@ -1077,12 +1146,30 @@ def main(argv=None):
                 # Before PEN-3394 this line was simply false -- spending was
                 # positional over a newest-first list, so a deferred PR could
                 # be deferred indefinitely, and one was for 50h.
+                #
+                # `len(refired)` is the count that went on COOLDOWN, which is
+                # exactly what makes "those rank first next run" true -- and
+                # it is only the same as "the count that won a slot" because
+                # a failed write no longer consumes one. Where the two do
+                # diverge (the attempt ceiling bit), the extra line below
+                # names the difference rather than letting this one imply the
+                # budget was delivered.
                 handle.write(
-                    "\n### %d PR(s) eligible but deferred past MAX_REFIRES_PER_RUN=%d "
-                    "(they waited less than the %d re-fired above, and rank first as "
-                    "those go on cooldown)\n\n"
-                    % (len(deferred), MAX_REFIRES_PER_RUN, len(refired))
+                    "\n### %d PR(s) eligible but deferred past this run's re-fire budget "
+                    "(MAX_REFIRES_PER_RUN=%d delivered, MAX_REFIRE_ATTEMPTS_PER_RUN=%d attempted) "
+                    "-- they waited less than the %d re-fired above, which go on cooldown, "
+                    "so these rank first next run\n\n"
+                    % (len(deferred), MAX_REFIRES_PER_RUN, MAX_REFIRE_ATTEMPTS_PER_RUN, len(refired))
                 )
+                if refire_write_failures:
+                    handle.write(
+                        "%d re-fire write(s) failed this run. A failed write posts no marker "
+                        "and so starts no cooldown, so it does NOT consume the "
+                        "MAX_REFIRES_PER_RUN budget -- but it does count against "
+                        "MAX_REFIRE_ATTEMPTS_PER_RUN=%d, which is what can defer a PR here "
+                        "with fewer than %d re-fired above.\n\n"
+                        % (len(refire_write_failures), MAX_REFIRE_ATTEMPTS_PER_RUN, MAX_REFIRES_PER_RUN)
+                    )
                 handle.write("| PR | head | reason |\n|---|---|---|\n")
                 for pr, head_sha, _pending_since, _refire, reason in deferred:
                     handle.write("| #%d | `%s` | %s |\n" % (pr["number"], head_sha[:7], reason))

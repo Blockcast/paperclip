@@ -905,6 +905,7 @@ class TestRefireBudget(unittest.TestCase):
         self._real_consider = sweep._consider_pr
         self._real_refire = sweep._refire_pr
         self._real_max = sweep.MAX_REFIRES_PER_RUN
+        self._real_max_attempts = sweep.MAX_REFIRE_ATTEMPTS_PER_RUN
         self.refired = []
         sweep._refire_pr = lambda o, r, pr, h, p, t, u, n: self.refired.append(pr["number"])
 
@@ -913,6 +914,7 @@ class TestRefireBudget(unittest.TestCase):
         sweep._consider_pr = self._real_consider
         sweep._refire_pr = self._real_refire
         sweep.MAX_REFIRES_PER_RUN = self._real_max
+        sweep.MAX_REFIRE_ATTEMPTS_PER_RUN = self._real_max_attempts
 
     def _install_prs(self, prs):
         def fake_fetch(api_base_url, path, token):
@@ -998,6 +1000,112 @@ class TestRefireBudget(unittest.TestCase):
             str(by_number[2][4]).startswith(sweep.SWEEP_ERROR_REASON_PREFIX),
             "and must not read as a clean skip either",
         )
+
+    def test_a_failed_refire_does_not_consume_a_budget_slot(self):
+        """PEN-3394 review regression.
+
+        A failed write posts no marker, so should_refire's cooldown never
+        engages: the PR keeps the longest wait and sorts back to rank 0 on
+        the next run, forever. If that failure spent a slot, then
+        MAX_REFIRES_PER_RUN permanently-failing PRs would consume the whole
+        budget every run and nobody would be served -- the same starvation
+        this change exists to fix, through a different door.
+
+        #1 waits longest and always fails. Against attempt-counting this
+        re-fires only {2}; the budget must instead fall through to {2, 3}.
+        """
+        sweep.MAX_REFIRES_PER_RUN = 2
+        self._install_prs([_pr(1), _pr(2), _pr(3), _pr(4)])
+        self._eligible_at({1: 100.0, 2: 200.0, 3: 300.0, 4: 400.0})
+        attempted = []
+
+        def always_fails_on_1(o, r, pr, h, p, t, u, n):
+            attempted.append(pr["number"])
+            if pr["number"] == 1:
+                raise urllib.error.HTTPError(
+                    "u", 403, "resource not accessible by integration", {}, None
+                )
+            self.refired.append(pr["number"])
+
+        sweep._refire_pr = always_fails_on_1
+        results = sweep.sweep("o", "r", "tok", "https://api.github.com", now=0.0)
+
+        self.assertEqual(attempted, [1, 2, 3], "the failure falls through to the next-ranked PR")
+        self.assertEqual(self.refired, [2, 3], "a full budget is still DELIVERED")
+        by_number = {r[0]["number"]: r for r in results}
+        self.assertFalse(by_number[1][3], "the failed write must not read as re-fired")
+        self.assertIn(sweep.REFIRE_WRITE_FAILURE_TOKEN, str(by_number[1][4]))
+        self.assertTrue(
+            str(by_number[4][4]).startswith(sweep.DEFERRED_REASON_PREFIX),
+            "#4 is deferred because the budget was delivered, not because it was burnt",
+        )
+
+    def test_the_attempt_ceiling_bounds_the_fall_through(self):
+        """Counting successes must not let a run of failures walk the whole set.
+
+        Every write fails here, so nothing ever consumes the delivery cap.
+        MAX_REFIRE_ATTEMPTS_PER_RUN is the only thing that stops the loop.
+        """
+        sweep.MAX_REFIRES_PER_RUN = 5
+        sweep.MAX_REFIRE_ATTEMPTS_PER_RUN = 2
+        self._install_prs([_pr(1), _pr(2), _pr(3), _pr(4)])
+        self._eligible_at({1: 100.0, 2: 200.0, 3: 300.0, 4: 400.0})
+        attempted = []
+
+        def always_fails(o, r, pr, h, p, t, u, n):
+            attempted.append(pr["number"])
+            raise urllib.error.URLError("connection reset")
+
+        sweep._refire_pr = always_fails
+        results = sweep.sweep("o", "r", "tok", "https://api.github.com", now=0.0)
+
+        self.assertEqual(attempted, [1, 2], "the attempt ceiling caps the API calls")
+        deferred = [r for r in results if str(r[4]).startswith(sweep.DEFERRED_REASON_PREFIX)]
+        self.assertEqual(sorted(r[0]["number"] for r in deferred), [3, 4])
+        self.assertIn(
+            "MAX_REFIRE_ATTEMPTS_PER_RUN", str(deferred[0][4]),
+            "the deferral must name the ceiling that actually bit, not the delivery cap",
+        )
+        for res in deferred:
+            self.assertIsNotNone(res[2], "a deferred PR keeps pending_since so it can still ALARM")
+
+    def test_rate_limit_in_the_read_pass_still_spends_the_refire_budget(self):
+        """PEN-3394: the read pass `break`s into pass 2 rather than returning.
+
+        Under the old single pass, PRs walked before exhaustion had ALREADY
+        been written. Now the writes all happen in pass 2, so a `return` here
+        would make an exhausted run issue ZERO re-fires -- and worse, leave
+        the already-decided PRs at refire=True with no write attempted, so
+        main()'s `refired = [r for r in results if r[3]]` would report
+        re-fires that never occurred.
+
+        The pre-existing rate-limit test cannot catch that: it returns
+        refire=False for every PR, so pass 2 finds an empty eligible set and
+        passes identically against `return` and against `break`. This one
+        makes #1 eligible before #2 exhausts the budget.
+        """
+        self._install_prs([_pr(1), _pr(2), _pr(3)])
+        considered = []
+
+        def limited(o, r, pr, t, u, n):
+            considered.append(pr["number"])
+            if pr["number"] == 2:
+                raise sweep.RateLimitExhausted("budget spent")
+            return (pr, pr["head"]["sha"], 100.0, True, "re-fired")
+
+        sweep._consider_pr = limited
+        results = sweep.sweep("o", "r", "tok", "https://api.github.com", now=0.0)
+
+        self.assertEqual(considered, [1, 2], "the READ pass still aborts")
+        self.assertEqual(
+            self.refired, [1],
+            "but the decided PR is still written -- the re-asks are the product",
+        )
+        by_number = {r[0]["number"]: r for r in results}
+        self.assertTrue(by_number[1][3], "and it reports as re-fired because it was")
+        for n in (2, 3):
+            self.assertIn(sweep.RATE_LIMIT_TOKEN, str(by_number[n][4]))
+            self.assertFalse(by_number[n][3], "unevaluated PRs must not report phantom re-fires")
 
     def test_deferred_pr_still_carries_pending_since_so_it_can_alarm(self):
         """Rate-limiting a write must never suppress the alarm.
