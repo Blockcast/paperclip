@@ -1325,10 +1325,8 @@ describe("backstop metrics (BLO-29763)", () => {
     // Measured live 2026-09-20 on paperclip-0: the gauge was present for both streams
     // (one at 20, one at 0) while `paperclip_backstop_sweep_completed_total` carried
     // EXACTLY ONE series -- issue_graph_liveness.backstop was absent entirely, because
-    // that process had not yet completed a sweep. AC2 asks that "did this loop finish a
-    // sweep in the last N minutes" be answerable from metrics alone; an absent series
-    // cannot answer it, and `depth > 0 unless increase(counter[2h]) > 0` cannot exclude
-    // on a missing arm, so the alert fires on process age rather than on a stalled loop.
+    // that process had not yet completed a sweep. Mechanism and the alert shape this
+    // does and does not fix: see the pre-seed loop in `ensureRegistry` (metrics.ts).
     // This asserts the healthy-but-untouched state BEFORE anything is recorded.
     const body = (await renderMetrics()).body;
 

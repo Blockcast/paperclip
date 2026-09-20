@@ -3113,10 +3113,21 @@ function ensureRegistry(): {
     // absent series. The gauge already did this; the counters did not, which reproduced
     // the exact silence defect BLO-29763 was opened to remove, one metric over: on a
     // freshly-started process `paperclip_backstop_sweep_completed_total` is missing for
-    // any stream that has not yet completed a sweep, so "did this loop finish a sweep in
-    // the last N minutes" is unanswerable, and a `depth > 0 unless increase(...) > 0`
-    // alert cannot exclude on the missing arm and fires on process age instead of on a
-    // stalled backstop. Bounded: 2 sources, 2 + (2 x 12) = 26 series.
+    // any stream that has not yet completed a sweep, so AC2 ("did this loop finish a
+    // sweep in the last N minutes", answerable from metrics alone) has no series to read.
+    //
+    // What this buys, precisely: `increase(...[2h]) == 0` now RETURNS A SAMPLE for a
+    // stream that has never swept. Absent, it returned nothing and the stall was
+    // undetectable. It does NOT change `depth > 0 unless increase(...) > 0` -- `> 0`
+    // discards a zero-valued sample exactly as it discards an absent series, so that
+    // form returns the LHS and fires either way. An alert consuming this must key on
+    // `== 0` / `absent_over_time`, never on `unless ... > 0`.
+    //
+    // The seed is unconditional here, so a process that registers these and never runs a
+    // loop would export a permanently-zero counter. Not live today (both loops are driven
+    // from the same recoveryService, single entrypoint), but gate an `== 0` stall alert on
+    // a job selector or on `paperclip_backstop_deferred_candidates > 0` so it stays true
+    // if that changes. Bounded: 2 sources x (1 gauge + 1 counter + 12 reasons) = 28 series.
     for (const source of BACKSTOP_SOURCES) {
       backstopDeferredCandidates.set({ source }, 0);
       backstopSweepCompleted.inc({ source }, 0);
