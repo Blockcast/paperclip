@@ -5921,6 +5921,149 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     });
   });
 
+  // BLO-30445. `listBlockedIssueAutoResumeSuppressions` gates the blocker-resolved wake as
+  // well as the reconciler flip, so adding `external_wait` to it decides a second question
+  // the ticket never asked: what happens to a row carrying BOTH a real blocker edge and a
+  // declaration, when that blocker closes. The intended answer is that the declared park
+  // OUTLIVES its structural blocker — the human gate is still live, and resuming on the
+  // blocker alone would drain a park that is still genuinely waiting. That is the same
+  // semantic BLO-3496 already established for executive holds one describe block up (see
+  // the comment at the `resolved_blocker_sweep` call site); `external_wait` only joins it.
+  //
+  // The consequence is deliberate and worth stating plainly: such a row keeps `status`
+  // `blocked` with zero unresolved blockers and NO wake path. `isDeadEndBlocked` also
+  // declines to flag it, so the blocked inbox — which surfaces it as `external_wait` with
+  // the declared owner and action — is its only surface. That is the documented contract
+  // for a human-only gate (it does not move on a timer), not an oversight; the cost is that
+  // a STALE declaration nobody removed parks the row just as effectively as a live one.
+  // Removing the two lines when the gate clears is the declaring agent's job.
+  describe("listWakeableBlockedDependents external wait suppression (BLO-30445)", () => {
+    it("suppresses the blocker-resolved wake for a declared external wait, but not for its undeclared twin", async () => {
+      const companyId = randomUUID();
+      const assigneeAgentId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(agents).values({
+        id: assigneeAgentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+
+      // One blocker, two dependents differing ONLY in the declaration. Both are evaluated
+      // in the same `listWakeableBlockedDependents` call, so "the declared row is absent"
+      // cannot be confused with "the wake did not fire at all" — the same matched-pair
+      // shape as the reconciler test.
+      const blockerId = randomUUID();
+      const declaredId = randomUUID();
+      const controlId = randomUUID();
+      await db.insert(issues).values([
+        { id: blockerId, companyId, title: "Blocker", status: "done", priority: "medium" },
+        {
+          id: declaredId,
+          companyId,
+          title: "Declared external wait",
+          status: "blocked",
+          priority: "medium",
+          assigneeAgentId,
+          description: [
+            "Waiting on the ruleset change.",
+            "external owner: kkroo",
+            "external action: approve the onprem-k8s ruleset change",
+          ].join("\n"),
+        },
+        {
+          id: controlId,
+          companyId,
+          title: "Undeclared twin",
+          status: "blocked",
+          priority: "medium",
+          assigneeAgentId,
+          // Same gate, named in prose only — the documented non-match.
+          description: "Waiting on kkroo to approve the onprem-k8s ruleset change.",
+        },
+      ]);
+      await svc.update(declaredId, { blockedByIssueIds: [blockerId] });
+      await svc.update(controlId, { blockedByIssueIds: [blockerId] });
+
+      await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([
+        expect.objectContaining({ id: controlId, assigneeAgentId }),
+      ]);
+
+      // The eager recompute reads the same predicate, so the declared row must also still
+      // be `blocked` — a flip to `todo` there would drain the park by the other caller.
+      const declaredAfter = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, declaredId))
+        .then((rows) => rows[0]);
+      expect(declaredAfter?.status).toBe("blocked");
+    });
+
+    it("resumes the wake once the declaration is removed", async () => {
+      const companyId = randomUUID();
+      const assigneeAgentId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(agents).values({
+        id: assigneeAgentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+
+      const blockerId = randomUUID();
+      const declaredId = randomUUID();
+      await db.insert(issues).values([
+        { id: blockerId, companyId, title: "Blocker", status: "done", priority: "medium" },
+        {
+          id: declaredId,
+          companyId,
+          title: "Declared external wait",
+          status: "blocked",
+          priority: "medium",
+          assigneeAgentId,
+          description: [
+            "external owner: kkroo",
+            "external action: approve the onprem-k8s ruleset change",
+          ].join("\n"),
+        },
+      ]);
+      await svc.update(declaredId, { blockedByIssueIds: [blockerId] });
+
+      await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([]);
+
+      // Clearing the declaration is the declaring agent's exit from the park, so it must
+      // put the row straight back on the wake path — otherwise the park is a one-way door.
+      await db
+        .update(issues)
+        .set({ description: "Gate cleared; resuming." })
+        .where(eq(issues.id, declaredId));
+
+      await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([
+        expect.objectContaining({ id: declaredId, assigneeAgentId }),
+      ]);
+    });
+  });
+
   describe("listResolvedBlockerDependentsToSweep executive hold suppression (BLO-3496)", () => {
     async function setupBlockedDependentWithExecutive(opts: {
       ctoRole?: string;
