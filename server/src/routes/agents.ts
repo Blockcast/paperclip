@@ -3823,12 +3823,26 @@ export function agentRoutes(
       // refuse writes that move nothing — the BLO-32332 bug again, one step
       // later. Comparing sync(stored) with sync(next) asks only whether this
       // write moved the bundle.
-      assertNoAgentInstructionsConfigMutation(
-        req,
-        asRecord(patchData.adapterConfig),
-        "adapterConfig",
-        syncInstructionsBundleConfigFromFilePath(existing, existingAdapterConfig),
-      );
+      //
+      // Gated on the actor here rather than relying on the guard's own
+      // `actor.type !== "agent"` early return: that return is inside the
+      // function body, so argument evaluation precedes it, and this baseline
+      // syncs the *stored* config. A stored legacy relative
+      // `instructionsFilePath` with no absolute `cwd` throws 422 in
+      // `resolveLegacyInstructionsPath` — a shape `svc.create`/hire persist
+      // unvalidated — so evaluating it for every actor would refuse the
+      // human/board write that repairs it by supplying the missing `cwd`.
+      // An agent sending that same write still fails, on the 422 rather than
+      // a 403: the refusal is right (it relocates the bundle), the status
+      // is not.
+      if (req.actor.type === "agent") {
+        assertNoAgentInstructionsConfigMutation(
+          req,
+          asRecord(patchData.adapterConfig),
+          "adapterConfig",
+          syncInstructionsBundleConfigFromFilePath(existing, existingAdapterConfig),
+        );
+      }
       // PATCH writes `adapterConfig` straight through to the service, so it was
       // the one skill-writing route with no skill validation at all — hire and
       // create already resolve strictly, and skills/sync at least resolves. That
