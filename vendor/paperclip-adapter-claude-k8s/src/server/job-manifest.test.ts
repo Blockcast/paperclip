@@ -1373,7 +1373,28 @@ describe("buildJobManifest", () => {
     it("sets default resource requests and limits", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
       const resources = job.spec?.template?.spec?.containers[0]?.resources;
-      expect(resources?.requests).toEqual({ cpu: "1000m", memory: "2Gi" });
+      expect(resources?.requests).toEqual({ cpu: "1000m", memory: "1536Mi" });
+      expect(resources?.limits).toEqual({ cpu: "4000m", memory: "8Gi" });
+    });
+
+    // Characterises the lookup this default depends on, so the reclamation
+    // above cannot be silently undone. mergeEnvironmentConfig is a top-level
+    // merge, so an environment row nesting {resources:{requests:{memory}}}
+    // never satisfies the dotted lookup and the default stays in force —
+    // confirmed live: an agent whose environment row carries that nested block
+    // still runs at the default. Only the flat dotted key overrides.
+    //
+    // This pins current behaviour, not desired behaviour: the nested shape is
+    // dead config that its author meant to take effect. If that is ever fixed
+    // by deep-merging, this test SHOULD fail — update it deliberately rather
+    // than assuming it is stale.
+    it("ignores a nested resources block and keeps the default", () => {
+      ctx.config = {
+        resources: { requests: { cpu: "500m", memory: "1Gi" }, limits: { cpu: "4", memory: "16Gi" } },
+      };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const resources = job.spec?.template?.spec?.containers[0]?.resources;
+      expect(resources?.requests).toEqual({ cpu: "1000m", memory: "1536Mi" });
       expect(resources?.limits).toEqual({ cpu: "4000m", memory: "8Gi" });
     });
 
@@ -1996,6 +2017,31 @@ describe("buildJobManifest", () => {
       const cmd = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
       expect(cmd).toContain("| tee");
       expect(cmd).toContain("/paperclip/instances/default/data/run-logs/");
+    });
+
+    // BLO-31955 / BLO-33894. `claudeLineIsHarnessAuthored` in parse.ts trusts
+    // any pod-log line that matches no operator/MCP event shape
+    // (`if (!match) return true`). That trust is STRUCTURAL, not empirical: this
+    // `tee` is the pod log's only writer, and its pipeline carries no `2>&1`, so
+    // only Claude's stdout can reach the parse surface. Adding `2>&1` before the
+    // `tee` — a reasonable-looking edit, e.g. to capture CLI diagnostics in the
+    // pod log — would route operator- and MCP-authored stderr onto that surface
+    // as bare, trusted lines, with no diff on the guard itself. That invisible
+    // widening from a change elsewhere is what BLO-7991 -> #1525 -> BLO-31794
+    // produced four times over. If this assertion goes red, fix the pipeline;
+    // deleting it to get green re-opens the hole it exists to hold shut.
+    it("routes no stderr into the tee that writes the pod log (BLO-31955)", () => {
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const command = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
+      const launcher = command.indexOf("cat /tmp/prompt/prompt.txt");
+      const tee = command.indexOf("| tee ");
+      expect(launcher).toBeGreaterThanOrEqual(0);
+      expect(tee).toBeGreaterThan(launcher);
+      expect(command.slice(launcher, tee)).not.toContain("2>&1");
+      // Negative control: the scope above is load-bearing, not vacuous. The
+      // ccrotate/git plumbing upstream of the launcher legitimately redirects
+      // with `>/dev/null 2>&1`, so a whole-command assertion would be red today.
+      expect(command.slice(0, launcher)).toContain("2>&1");
     });
 
     it("podLogPath is returned from buildJobManifest", () => {

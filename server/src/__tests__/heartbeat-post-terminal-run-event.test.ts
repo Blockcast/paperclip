@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { asc, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, companies, createDb, heartbeatRunEvents } from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRunEvents, heartbeatRuns } from "@paperclipai/db";
 import type { AdapterRuntimeEvent } from "@paperclipai/adapter-utils";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.ts";
 import {
@@ -21,8 +21,17 @@ import { waitForRunToFinish } from "./helpers/wait-for-run-to-finish.js";
 /**
  * 20s was observed to be too tight on a loaded host — a run took ~68s to finish
  * and the poll gave up first, failing on `status === "running"` and reading as a
- * guard bug rather than as a slow machine. The enclosing `it` timeout is 120s and
- * this only polls, so waiting longer costs nothing when the host is healthy.
+ * guard bug rather than as a slow machine. This only polls, so waiting longer
+ * costs nothing when the host is healthy.
+ *
+ * The enclosing `it`s are 180s, not 120s, because this ceiling plus
+ * `snapshotSettledEvents`' 20s already exceeded 120s before `seedAgent()` and
+ * `invoke()` were counted. Under the old budget a slow host blew the `it`
+ * timeout first and surfaced as a bare vitest timeout instead of
+ * `waitForRunToFinish`'s "did not reach a terminal status" throw (BLO-33449) or
+ * `snapshotSettledEvents`' "still appending events" message — losing exactly the
+ * diagnostics those helpers exist to produce. Keep `it` > 90 + 20 + setup if
+ * either ceiling moves.
  */
 const RUN_FINISH_TIMEOUT_MS = 90_000;
 
@@ -324,7 +333,7 @@ describeEmbeddedPostgres("post-terminal adapter run events (BLO-32553)", () => {
       // And the runtime status terminalization cleared was not resurrected.
       expect(getHeartbeatRunRuntimeStatus(run!.id)).toBeNull();
     },
-    120_000,
+    180_000,
   );
 
   it(
@@ -380,7 +389,7 @@ describeEmbeddedPostgres("post-terminal adapter run events (BLO-32553)", () => {
         warnSpy.mockRestore();
       }
     },
-    120_000,
+    180_000,
   );
 
   it(
@@ -403,33 +412,47 @@ describeEmbeddedPostgres("post-terminal adapter run events (BLO-32553)", () => {
       // failure path — it is the one place a silent regression would not show
       // up in any other assertion here.
       //
-      // Safe because the window is empty, NOT because the shape is selective:
-      // the flag is set immediately before the late event and the first match
-      // disarms it, and no other work runs in between. The shape check is only
-      // a cheap narrowing — `select({ status })` is not unique to the guard
-      // (heartbeat.ts has 7 single-key `{ status }` selects: :15625 the guard's
-      // own, plus :16656, :20469, :26262, :30205, :32039, :33257). If you ever
-      // add concurrent work to this window, this spy WILL hit the wrong query;
-      // key it on the run id, don't just tighten the field list.
+      // Keyed on the guard's OWN query, not on its shape: the arm fires only
+      // for a `select({ status })` `.from(heartbeatRuns)` whose bound params
+      // carry this run's id. `select({ status })` alone is not unique to the
+      // guard (heartbeat.ts has several single-key `{ status }` selects), so a
+      // shape-only predicate would be selective by accident of today's call
+      // graph rather than structurally. `toSQL()` is drizzle's public builder
+      // API, so the param check does not depend on clause internals.
       let armed = true;
+      let armedFrom: unknown = null;
       const originalSelect = db.select.bind(db);
       const selectSpy = vi
         .spyOn(db, "select")
         .mockImplementation(((fields?: Record<string, unknown>) => {
-          const isTerminalStatusRead =
+          const builder =
+            fields === undefined ? originalSelect() : originalSelect(fields as never);
+          const isStatusOnly =
             !!fields
             && typeof fields === "object"
             && Object.keys(fields).length === 1
             && "status" in fields;
-          if (armed && isTerminalStatusRead) {
-            armed = false;
-            throw new Error("simulated status read failure");
-          }
-          return fields === undefined
-            ? originalSelect()
-            : originalSelect(fields as never);
+          if (!armed || !isStatusOnly) return builder;
+          const originalFrom = builder.from.bind(builder);
+          (builder as { from: unknown }).from = (table: unknown) => {
+            const fromResult = originalFrom(table as never);
+            if (table !== heartbeatRuns) return fromResult;
+            armedFrom = table;
+            const originalWhere = fromResult.where.bind(fromResult);
+            (fromResult as { where: unknown }).where = (condition: unknown) => {
+              const query = originalWhere(condition as never);
+              if (armed && query.toSQL().params.includes(run!.id)) {
+                armed = false;
+                throw new Error("simulated status read failure");
+              }
+              return query;
+            };
+            return fromResult;
+          };
+          return builder;
         }) as never);
 
+      const warnSpy = vi.spyOn(logger, "warn");
       try {
         // Still must not throw: the caller is a detached continuation, so an
         // escaping rejection would be an unhandled one.
@@ -447,6 +470,23 @@ describeEmbeddedPostgres("post-terminal adapter run events (BLO-32553)", () => {
       }
 
       expect(armed, "the simulated failure must actually have fired").toBe(false);
+      expect(armedFrom, "the arm must have keyed on the heartbeatRuns table").toBe(heartbeatRuns);
+
+      try {
+        // This branch's two distinguishing signals — the only things separating
+        // a read failure from a confirmed post-terminal drop in the log. The
+        // metric label above is the other half; asserted together so collapsing
+        // the message ternary or dropping `err` turns this test red rather than
+        // silently degrading the drop log to the indistinguishable variant.
+        const dropCall = warnSpy.mock.calls.find(
+          (call) => typeof call[1] === "string" && call[1].includes("BLO-32553"),
+        );
+        expect(dropCall, "the drop path must emit its logger.warn").toBeDefined();
+        expect(dropCall![1]).toContain("after failing to read the run's status");
+        expect(dropCall![0] as Record<string, unknown>).toHaveProperty("err");
+      } finally {
+        warnSpy.mockRestore();
+      }
 
       // Unverifiable status is treated as a drop, not as "not terminal".
       expectNoAdapterEventAppended(before, await readEvents(run!.id));
@@ -456,7 +496,7 @@ describeEmbeddedPostgres("post-terminal adapter run events (BLO-32553)", () => {
       expect(await droppedCount("succeeded")).toBe(succeededBefore);
       expect(getHeartbeatRunRuntimeStatus(run!.id)).toBeNull();
     },
-    120_000,
+    180_000,
   );
 
   it(
@@ -482,6 +522,6 @@ describeEmbeddedPostgres("post-terminal adapter run events (BLO-32553)", () => {
       expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
       expect(new Set(seqs).size).toBe(seqs.length);
     },
-    120_000,
+    180_000,
   );
 });

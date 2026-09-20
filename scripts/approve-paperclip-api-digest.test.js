@@ -452,6 +452,30 @@ const unguardedCoercionReaderSource = replicaSetReaderSource.replace(
   "| ($r | tonumber);",
 );
 
+// BLO-32396. The same neutering, one layer up, for each of the two reads that
+// derive the label selector and the owner uid. Those ran above the state
+// directory behind `2>/dev/null` and a bare `return 0`, so an abort there warned
+// nothing AT ALL — not even once — and was indistinguishable from "no rollback
+// target". One anchor per read, so a case can break exactly one of them and the
+// other stays honest.
+//
+// The selector mutation drops the `// {}` guard, which is a regression a future
+// edit could genuinely make: against a Deployment with no matchLabels the read
+// then aborts on `null | to_entries` instead of yielding the empty selector the
+// branch below is written to warn about. The uid mutation is an unguarded
+// coercion, the same shape as the one above, because `// ""` has no absent-field
+// abort to expose — a uid that is missing already succeeds and emits "".
+const SELECTOR_GUARD_ANCHOR = "[ (.spec.selector.matchLabels // {}) | to_entries[]";
+const brokenSelectorReadReaderSource = replicaSetReaderSource.replace(
+  SELECTOR_GUARD_ANCHOR,
+  "[ (.spec.selector.matchLabels) | to_entries[]",
+);
+const UID_READ_ANCHOR = `uid="$(jq -r '.metadata.uid // ""'`;
+const brokenUidReadReaderSource = replicaSetReaderSource.replace(
+  UID_READ_ANCHOR,
+  `uid="$(jq -r '.metadata.uid // "" | tonumber'`,
+);
+
 // `deployment` of null makes the stub exit non-zero, standing in for "no such
 // Deployment" or an unreachable apiserver.
 //
@@ -476,6 +500,8 @@ function readerRunFor(
     repeat = 1,
     callerOwnedStateDir = false,
     unguardedCoercion = false,
+    brokenSelectorRead = false,
+    brokenUidRead = false,
   } = {},
 ) {
   const dir = mkdtempSync(path.join(tmpdir(), "paperclip-live-digest-"));
@@ -522,7 +548,13 @@ function readerRunFor(
     `  esac`,
     `}`,
     "deploy_kubectl=(fake_kubectl)",
-    unguardedCoercion ? unguardedCoercionReaderSource : replicaSetReaderSource,
+    unguardedCoercion
+      ? unguardedCoercionReaderSource
+      : brokenSelectorRead
+        ? brokenSelectorReadReaderSource
+        : brokenUidRead
+          ? brokenUidReadReaderSource
+          : replicaSetReaderSource,
     readerSource,
     // Mints and clears the state directory exactly as the script's own top level
     // and EXIT trap do, so leftover-file accounting measures the reader rather
@@ -1430,6 +1462,96 @@ test("a selector the reader cannot use warns instead of degrading silently", () 
     0,
     "a selector that cannot be built must not reach the apiserver",
   );
+  // The selector DECLINE and a selector jq ABORT are different outcomes, and the
+  // cases below prove the second is visible. Pin here that this one is not
+  // reporting itself as the other.
+  assert.doesNotMatch(run.stderr, /selector\/uid jq program failed/);
+});
+
+// BLO-32396. Same conflation as BLO-32267, one layer up, and strictly quieter
+// there: these two reads ran ABOVE the state directory behind `2>/dev/null` and a
+// bare `return 0`, so an abort returned empty with no warning at all — not even a
+// once-per-run one — and the reader reported "no rollback target" with nothing
+// anywhere saying why. Each read gets its own case so a mutation that breaks one
+// cannot pass on the other's behalf; both assert the anchor still matched the
+// SHIPPING source, so a rewrite fails loudly instead of quietly testing nothing.
+test("a broken selector jq read is reported as an error, not returned as a silent empty", () => {
+  assert.notEqual(
+    brokenSelectorReadReaderSource,
+    replicaSetReaderSource,
+    "the selector-guard anchor no longer matches the shipping source — this case would prove nothing",
+  );
+  const run = readerRunFor(
+    deploymentWith({
+      images: [`${IMAGE_REPOSITORY}@${digest(0xbb)}`],
+      status: NEVER_READY,
+      selector: {
+        matchExpressions: [
+          { key: "app.kubernetes.io/name", operator: "In", values: ["paperclip"] },
+        ],
+      },
+    }),
+    { brokenSelectorRead: true, callerOwnedStateDir: true },
+  );
+  // Still degrades rather than failing the release — this stays a safeguard.
+  assert.equal(run.digest, "");
+  assert.match(run.stderr, /selector\/uid jq program failed/);
+  assert.match(run.stderr, /broken\s+program rather than a decline/);
+  assert.match(run.stderr, /BLO-31842/);
+  // jq's own message is carried through, which is the whole point — and it is
+  // what separates this from the decline the SAME fixture produces unmutated.
+  assert.match(run.stderr, /has no keys/);
+  assert.doesNotMatch(run.stderr, /no matchLabels selector/);
+  // Own marker, and the capture reclaimed: neither may mask the three markers the
+  // branches below it write.
+  assert.deepEqual(run.stateDirResidue, ["warned-read"]);
+});
+
+test("a broken uid jq read is reported as an error, not returned as a silent empty", () => {
+  assert.notEqual(
+    brokenUidReadReaderSource,
+    replicaSetReaderSource,
+    "the uid-read anchor no longer matches the shipping source — this case would prove nothing",
+  );
+  const run = readerRunFor(neverReadyDeployment(digest(0xbb)), {
+    brokenUidRead: true,
+    callerOwnedStateDir: true,
+    replicaSets: [
+      replicaSetWith({ name: "paperclip-api-old", images: [`${IMAGE_REPOSITORY}@${digest(0xaa)}`], ready: 2 }),
+    ],
+  });
+  assert.equal(run.digest, "");
+  assert.match(run.stderr, /selector\/uid jq program failed/);
+  assert.match(run.stderr, /Invalid numeric literal/);
+  // The selector resolved, so this is NOT the empty-selector decline — and the
+  // list is never reached, so it is not the list failure either.
+  assert.doesNotMatch(run.stderr, /no matchLabels selector/);
+  assert.equal(
+    run.argv.filter((line) => line.includes("replicasets")).length,
+    0,
+    "a uid that cannot be read must not reach the apiserver",
+  );
+  assert.deepEqual(run.stateDirResidue, ["warned-read"]);
+});
+
+// Same guard as the other three branches, for the same reason: the rotate loop
+// re-enters this reader on every 409, so an unguarded warning prints its five
+// lines up to MAX_ROTATE_ATTEMPTS times and buries itself. This is the property
+// the pre-fix code could not have at all — it returned before the state directory
+// that holds the markers was minted.
+test("a repeated selector/uid read abort warns once, not once per rotation", () => {
+  const run = readerRunFor(neverReadyDeployment(digest(0xbb)), {
+    brokenUidRead: true,
+    repeat: 5,
+    callerOwnedStateDir: true,
+  });
+  const warnings = run.stderr.match(/selector\/uid jq program failed/g)?.length ?? 0;
+  assert.equal(
+    warnings,
+    1,
+    `expected exactly one selector/uid read-abort warning across 5 rotations, got ${warnings}:\n${run.stderr}`,
+  );
+  assert.deepEqual(run.leftoverTempFiles, []);
 });
 
 // The rotate loop re-reads the running digest on EVERY 409 retry, so an unguarded
@@ -2565,8 +2687,13 @@ test("retire-only mode's succeeding write exits 0 at the first attempt, telling 
   );
   // The consequence, not just the act: this is what tells the operator they can
   // re-run a corrected plan without editing the ring by hand. Matched across the
-  // line wrap so a rewrap stays green and a deletion does not -- the two lines
-  // are one sentence and neither is separately meaningful.
+  // line wrap so THIS assertion survives a rewrap and a deletion does not -- the
+  // two lines are one sentence and neither is separately meaningful.
+  //
+  // The SUITE is a different question, and it does NOT tolerate a rewrap: pulling
+  // these two lines into one deletes a line, so every citation below shifts by -1
+  // and the citation test below goes red naming each one. That is the pin doing
+  // its job, not a false alarm -- the failure message says where each moved to.
   assert.match(
     r.stdout,
     /The ring still lists that digest, so a corrected plan or a rollback is\s+admitted without an out-of-band edit\./,
@@ -2598,10 +2725,12 @@ test("retire-only mode's write with no stderr still explains itself", () => {
 // shipping script, and until now nothing checked them. That is not hypothetical
 // drift: when the BLO-31842 ReplicaSet work inserted four lines into the
 // script's header comment, all seven citations in this file went stale by
-// exactly +4 in one commit, silently. The worst of them then pointed a reader
-// at the "nothing to retire" branch's `exit 0` instead of the three success
-// lines the assertion beside it is actually about -- so the comment read as if
-// it were pinning a completely different code path.
+// exactly +4 in one commit, silently. (Seven occurrences, six distinct ranges --
+// the messaging-asymmetry one is cited twice, which is why the table below has
+// six rows and not seven.) The worst of them then pointed a reader at the
+// "nothing to retire" branch's `exit 0` instead of the three success lines the
+// assertion beside it is actually about -- so the comment read as if it were
+// pinning a completely different code path.
 //
 // Every OTHER cross-file reference here is already mechanical -- the function
 // body by name via extractShellFunction(), the numeric defaults and limits by
@@ -2617,7 +2746,11 @@ test("retire-only mode's write with no stderr still explains itself", () => {
 // an earlier occurrence elsewhere in the script and then reports a confidently
 // wrong line number -- the very defect being fixed. An exact first-line match
 // admits neither. `contains` additionally holds the rest of the range to the
-// content the citing comment claims is there.
+// content the citing comment claims is there, and EVERY multi-line entry below
+// carries one: first-line anchoring alone catches wholesale drift but leaves a
+// range's interior free to be gutted in place, which is the widest ranges'
+// problem precisely because they have the most interior to lose. A single-line
+// citation needs no `contains` -- its first line is the whole range.
 const LINE_CITATIONS = [
   {
     cite: "86",
@@ -2633,6 +2766,7 @@ const LINE_CITATIONS = [
   {
     cite: "751-760",
     startsWith: /^\s*# Flat, where retire-only mode backs off linearly/,
+    contains: /only remaining asymmetry[\s\S]*unfinished parity fix[\s\S]*no such deadline/,
     claim: "the ten lines defending the release loop's flat backoff",
   },
   {
@@ -2644,6 +2778,7 @@ const LINE_CITATIONS = [
   {
     cite: "759-763",
     startsWith: /^\s*# Their MESSAGING differences are deliberate too/,
+    contains: /not a parity gap[\s\S]*`return` vs `exit` is structurally required/,
     claim: "the messaging-asymmetry defence against a parity fix",
   },
   {
@@ -2716,6 +2851,20 @@ test("no line citation can be added to this file without being pinned", () => {
     [...pinned].filter((c) => !found.has(c)).sort(),
     [],
     "a LINE_CITATIONS entry no longer matches any citation in the file -- remove it rather than leaving it pinning nothing",
+  );
+  // Pinned AT ALL is not the same as pinned THROUGHOUT. A multi-line entry with
+  // no `contains` holds only its first line, so its interior can be rewritten
+  // wholesale while this suite stays green -- measured, not supposed: gutting
+  // the interior of the ten-line range and the last line of the five-line one
+  // each left 81/81 passing until those two got a guard. Asserted here rather
+  // than left to care, because the next wide citation is unguarded by default
+  // and this gap would reopen exactly as quietly as it opened.
+  assert.deepEqual(
+    LINE_CITATIONS.filter((c) => c.cite.includes("-") && !c.contains).map(
+      (c) => c.cite,
+    ),
+    [],
+    "a multi-line citation has no `contains` guard -- only its first line is pinned, so the rest of the range can be gutted without failing anything",
   );
 });
 

@@ -6,36 +6,50 @@
  * Ally composes a consolidated review body and posts it with `gh pr review`.
  * Nothing server-side enforces one verdict per head, and several independent
  * wake sources (marker comment, ready_for_review toggle, and review-request
- * issue assignment) can each launch a run for the same PR. The resulting
- * evidence has two distinct lanes: the Ally App's formal review determines the
- * review outcome, while the `allyblockcast` User approval is separate team
- * evidence. They are both required on protected PRs that opt into team
- * evidence, but neither lane may contain competing attestations.
+ * issue assignment) can each launch a run for the same PR. Review evidence
+ * comes from one lane only: the Ally App's formal review. The `allyblockcast`
+ * User seat is a second hat on the same agent, so R4 (BLO-24056) retired it as
+ * evidence entirely — see I6. Reviews still arrive on both lanes, so both are
+ * parsed; only the App lane can carry a verdict.
  *
  * Observed on Blockcast/paperclip#876 (BLO-19778): two runs dispatched 43 ms
  * apart both submitted at head ff1c72db, 34 s apart, with opposite verdicts.
  *
- *   I1  At most one operative App review and one operative User-seat approval
- *       per (PR, head SHA). One review in each separate lane is valid; an
- *       exact App/User pair is therefore not a duplicate, but retries within
- *       either lane remain fatal.
+ *   I1  At most one operative review per lane per (PR, head SHA). A same-lane
+ *       duplicate also reports whether the bodies are identical or differ
+ *       (`sameLaneBodyRelation`), because that — not the gap between
+ *       submissions — is what says whether the missing control is submit
+ *       idempotency or reviewer exclusion.
+ *
+ *       Three arms here can only fire when an operative seat review exists —
+ *       I1 over the seat lane, I1 for one body submitted under two
+ *       credentials, and I2b — so I6 already fires wherever they do. They are
+ *       retained as subsumed diagnostics that add detail to a seat violation,
+ *       not as independent policy: do not read them as evidence that the seat
+ *       lane still carries a permitted shape.
  *   I2  No operative APPROVED review whose own body reports a Critical or
  *       Important finding, no User-seat APPROVED review coexisting with a
- *       blocking App review, and no clean App approval without a `Reviewed
- *       head:` attestation. The User-seat lane is human evidence and may use
- *       plain exact-head prose; it must not be forced to imitate the App's
- *       machine-readable review template.
+ *       blocking App review, and no App approval without a `Reviewed head:`
+ *       attestation.
  *   I3  An operative App review has exactly one canonical body and its
  *       body-attested `Reviewed head:` matches the commit GitHub recorded it
- *       against. The User-seat lane relies on GitHub's exact `commit_id`.
- *   I4  A clean App verdict and a User-seat approval are formal `APPROVED`
- *       reviews. The sole exception is an App-authored PR: GitHub prevents
- *       the App from approving its own PR, so its clean canonical self-review
- *       is necessarily `COMMENTED`. A clean App `COMMENTED` review cannot
- *       satisfy the App lane for any independently authored PR.
+ *       against.
+ *   I4  A clean App verdict is a formal `APPROVED` review. The sole exception
+ *       is an App-authored PR: GitHub prevents the App from approving its own
+ *       PR, so its clean canonical self-review is necessarily `COMMENTED`. A
+ *       clean App `COMMENTED` review cannot satisfy the App lane for any
+ *       independently authored PR.
  *   I5  A review using an Ally canonical login and account type must also
  *       carry the immutable REST ID for that principal. A lookalike identity
  *       must never become valid evidence merely by copying the login string.
+ *   I6  No operative User-seat review at all. R4 (BLO-24056, ratified on
+ *       BLO-29559) made the seat a flat prohibition: it shares a login with
+ *       the authoring App, so a seat verdict is self-approval wearing a second
+ *       hat. An earlier revision of this file treated the seat as a second
+ *       lane of "human evidence" that "may use plain exact-head prose" and so
+ *       need not attest a head — which is exactly why BLO-22916 Defect 2, five
+ *       content-free seat APPROVEDs carrying no `Reviewed head:` line, was
+ *       invisible to every check here.
  *
  * On I3's mechanism. An earlier revision of this file said `gh pr review`
  * binds a review to the head at submit time, so a mid-review push "certifies a
@@ -158,7 +172,7 @@ function reviewDetails(reviews) {
   return reviews.map((review) => `${reviewState(review)}/${review.id}`).join(", ");
 }
 
-function canonicalReviewHead(body) {
+export function canonicalReviewHead(body) {
   const text = String(body ?? "");
   const headings = Array.from(text.matchAll(CANONICAL_REVIEW_HEADING_RE));
   const attestations = Array.from(text.matchAll(ATTESTED_HEAD_GLOBAL_RE));
@@ -166,9 +180,15 @@ function canonicalReviewHead(body) {
   return attestations[0][1].toLowerCase();
 }
 
-// The two distinct GitHub principals required by the protected-merge policy.
-// Pin both the immutable REST ID and the canonical login: either mismatch is
-// not an eligible substitute for the required artifact.
+// The two GitHub principals the guard must recognise. Recognising both is not
+// endorsing both: only the App may carry a verdict, and every operative seat
+// review is a violation (I6, R4/BLO-24056). Do not read this pair as a shape
+// something requires.
+//
+// Only the IDs have production consumers — `allyReviewIdentityShape` pins the
+// immutable REST ID per lane, so an impostor matching a login regex is caught
+// by I5 rather than silently accepted. The login constants are retained as the
+// canonical spelling and for the test fixtures that exercise that mismatch.
 export const ALLY_APP_REVIEWER_ID = 290875700;
 export const ALLY_APP_REVIEWER_LOGIN = "allyblockcast[bot]";
 export const ALLY_USER_REVIEWER_ID = 296676656;
@@ -255,15 +275,6 @@ function isCleanAppSelfReview(pr, review) {
   );
 }
 
-function isExpectedApproval(review, { id, login }, headSha, { requireAttestation = true } = {}) {
-  return (
-    review?.state === "APPROVED" &&
-    review?.user?.id === id &&
-    review?.user?.login === login &&
-    (!requireAttestation || attestedHead(review?.body) === String(headSha ?? "").toLowerCase())
-  );
-}
-
 /**
  * A review body reduced to the form the equality rules below compare.
  *
@@ -272,9 +283,9 @@ function isExpectedApproval(review, { id, login }, headSha, { requireAttestation
  * newline is still one verdict posted twice. Two bodies that differ in
  * substance remain two independent write-ups.
  *
- * This helper is used by both the pair predicate and the duplicate diagnostic.
- * Keeping the normalization at both decision points prevents a laxer pair
- * check from exempting the reviews before the diagnostic is consulted.
+ * This helper is used by both the same-lane relation and the cross-credential
+ * duplicate diagnostic. Keeping the normalization at both decision points stops
+ * one of them exempting a body shape the other would have flagged.
  */
 export function normalizedBody(review) {
   return String(review?.body ?? "").trim();
@@ -297,44 +308,57 @@ export function duplicateBodyAcrossIdentities(operative) {
 }
 
 /**
- * The only permitted two-review shape: one current-head clean review from the
- * required App identity and one from the required User seat. Independently
- * authored PRs require formal approval in both lanes. For an App-authored PR,
- * GitHub forbids the App from approving itself, so the clean canonical App
- * self-review is necessarily COMMENTED; the caller must pass the PR author so
- * this exception cannot be inferred from review text alone. Two reviews with
- * the same normalized body are not independent evidence and do not qualify.
- * This deliberately inspects the full operative set instead of deduplicating
- * it; a retry, an unexpected identity, or a missing/stale attestation makes the
- * shape fail.
+ * Classifies a same-lane duplicate by comparing the bodies against each other.
+ *
+ * I1 says two reviews in one lane is a violation; it does not say which defect
+ * produced them, and the two need different fixes. The bodies discriminate:
+ *
+ *   "resubmit"  Every body is identical. One computed verdict reached GitHub
+ *               more than once, so the submit step is at-least-once. Ally holds
+ *               the composed body in context, so a retried submit re-sends the
+ *               same bytes; two independent runs cannot emit identical prose.
+ *   "recompute" The bodies differ. Two full reviews were computed for one head
+ *               and both were submitted, so the missing control is exclusion
+ *               (one reviewer per head), not submit idempotency.
+ *   "mixed"     Both shapes at once: >2 reviews, some identical, some distinct.
+ *   null        Not a duplicate, or a body is empty — an empty body is an
+ *               attestation defect (I3), and guessing a mode from it would
+ *               assert a mechanism the evidence does not carry.
+ *
+ * Timing is NOT a substitute for this. PEN-2865 first split these modes by the
+ * gap between submissions on the theory that seconds meant a retry and hours
+ * meant a re-review. Measured on paperclip#1220, two reviews 10 s apart carried
+ * different bodies (8513 vs 6564 bytes) — a genuine double-compute inside the
+ * window the timing rule reserved for retries. Reporting the gap alone had
+ * already produced one wrong recommendation, which is why the classification
+ * lives here rather than in the reader's head.
+ *
+ * Keep the label free of any 6-digit-or-longer number. `violationFingerprint`
+ * harvests every such token out of the message text, so a count or an account
+ * id embedded here would change the fingerprint of an I1 finding and silently
+ * void the matching baseline suppression.
  */
-export function isRequiredApprovalPair(reviews, headSha, pr = undefined) {
-  const appReviews = operativeAllyReviews(reviews, headSha, "app");
-  const seatReviews = operativeAllyReviews(reviews, headSha, "seat");
-  if (appReviews.length !== 1 || seatReviews.length !== 1) return false;
-
-  const app = appReviews[0];
-  const seat = seatReviews[0];
-  if (normalizedBody(app) === normalizedBody(seat)) return false;
-  const expectedAppIdentity =
-    app?.user?.id === ALLY_APP_REVIEWER_ID && app?.user?.login === ALLY_APP_REVIEWER_LOGIN;
-  const appSelfReview = expectedAppIdentity && isCleanAppSelfReview(pr, app);
-  const appApproval = isExpectedApproval(
-    app,
-    { id: ALLY_APP_REVIEWER_ID, login: ALLY_APP_REVIEWER_LOGIN },
-    headSha,
+export function sameLaneBodyRelation(operative) {
+  const reviews = operative ?? [];
+  if (reviews.length < 2) return null;
+  const bodies = reviews.map(normalizedBody);
+  if (bodies.some((body) => body === "")) return null;
+  const identical = bodies.every((body) => body === bodies[0]);
+  if (identical) return "resubmit";
+  const anyPairIdentical = bodies.some((body, i) =>
+    bodies.some((other, j) => j > i && body === other),
   );
-  return (
-    (appSelfReview || appApproval) &&
-    canonicalReviewHead(app.body) === String(headSha ?? "").toLowerCase() &&
-    isExpectedApproval(
-      seat,
-      { id: ALLY_USER_REVIEWER_ID, login: ALLY_USER_REVIEWER_LOGIN },
-      headSha,
-      { requireAttestation: false },
-    )
-  );
+  return anyPairIdentical ? "mixed" : "recompute";
 }
+
+const SAME_LANE_RELATION_NOTES = {
+  resubmit:
+    "the bodies are identical — one verdict submitted more than once, so the submit step is at-least-once",
+  recompute:
+    "the bodies differ — two reviews were computed for this one head and both submitted, so the missing control is exclusion, not submit idempotency",
+  mixed:
+    "some bodies are identical and some differ — both a repeated submit and an independent recomputation are present",
+};
 
 /**
  * @param {{number: number, headSha: string, author?: {login?: string, is_bot?: boolean}, reviews: object[]}} pr
@@ -366,13 +390,38 @@ export function findPrViolations(pr) {
     const label = laneLabel(lane);
 
     if (reviews.length > 1) {
+      const relation = SAME_LANE_RELATION_NOTES[sameLaneBodyRelation(reviews)];
       violations.push(
-        `I1 PR #${pr.number} @${short}: ${reviews.length} operative ${label} reviews (${reviewDetails(reviews)}) — expected at most 1 in the ${lane} lane`,
+        `I1 PR #${pr.number} @${short}: ${reviews.length} operative ${label} reviews (${reviewDetails(reviews)}) — expected at most 1 in the ${lane} lane` +
+          (relation ? `; ${relation}` : ""),
       );
     }
 
     for (const review of reviews) {
       const blocking = hasBlockingVerdict(review.body);
+
+      // R4 (BLO-24056, ratified by the CEO ruling on BLO-29559): the User seat
+      // shares a login with the authoring App, so a seat verdict is the same
+      // head both writing a change and clearing it. It never submits a review,
+      // an approval, or a REQUEST_CHANGES under any condition. Its only
+      // sanctioned operation is dismissing a stale approval, and a DISMISSED
+      // review is already excluded from the operative set above.
+      //
+      // This subsumes BLO-22916 Defect 2: the five content-free approvals that
+      // carried no `Reviewed head:` line were all seat submissions, and the
+      // App-only I2d check below could never see them.
+      //
+      // The `continue` skips I2a/I2c for this review. Detection is unchanged
+      // and remains a strict superset — I6 is unconditional over the lane, so
+      // a seat APPROVED carrying a Critical finding is still a violation; only
+      // the diagnostic narrows, from "approved over a blocker" to "the seat
+      // may not submit at all". I2b still reports the blocker-masking case.
+      if (lane === "seat") {
+        violations.push(
+          `I6 PR #${pr.number} @${short}: ${label} review ${review.id} is ${reviewState(review)} — the User seat (uid ${ALLY_USER_REVIEWER_ID}) never submits a verdict (R4, BLO-24056); only the App (uid ${ALLY_APP_REVIEWER_ID}) may carry one`,
+        );
+        continue;
+      }
 
       if (lane === "app") {
         const canonicalHead = canonicalReviewHead(review.body);
@@ -396,13 +445,9 @@ export function findPrViolations(pr) {
         }
       }
 
-      if (
-        !isApproved(review) &&
-        (lane === "seat" || (!blocking && !(lane === "app" && isCleanAppSelfReview(pr, review))))
-      ) {
-        const requirement = lane === "app" ? "clean App evidence" : "User-seat evidence";
+      if (!isApproved(review) && !blocking && !isCleanAppSelfReview(pr, review)) {
         violations.push(
-          `I4 PR #${pr.number} @${short}: ${label} review ${review.id} is ${reviewState(review)} but ${requirement} must be APPROVED`,
+          `I4 PR #${pr.number} @${short}: ${label} review ${review.id} is ${reviewState(review)} but clean App evidence must be APPROVED`,
         );
       }
 
@@ -499,7 +544,11 @@ export const BASELINE_PATH = "scripts/ally-review-consistency-baseline.json";
  * silently move a violation out from under its baseline entry.
  *
  * Review IDs are 9-10 digits and PR numbers are 4, so the digit-run floor
- * separates them without needing to parse each message shape individually. If a
+ * separates them without needing to parse each message shape individually. The
+ * floor is not exclusive to review IDs: I6 embeds both reviewer uids, which are
+ * 9 digits and so join the scraped set. That is harmless — both uids are
+ * constant across every I6, so they cannot merge two distinct findings, and the
+ * real review ID is still in the set, so the expiry properties hold. If a
  * future message shape defeats this scraping the fingerprint changes and the run
  * goes red — the safe direction.
  */

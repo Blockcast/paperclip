@@ -300,31 +300,40 @@ async function gatewayFetch(request: APIRequestContext, path: string, token: str
   return await request.get(path, { headers });
 }
 
-test.describe.serial("Smoke Lab scenario catalog mirror", () => {
-  // This CI-safe mirror records eight screenshot-backed lifecycle steps for
-  // each of P1-P7, all inside ONE test. Measured over 6 full CI runs
-  // (BLO-33282): 18.6m median / 22.9m p100, i.e. 44% of the whole 42.1m e2e
-  // suite and by far its largest single unit. The 30m budget below is ~2x the
-  // observed median, deliberately -- NOT "half the ceiling"; the enclosing
-  // `e2e` job cap is 90m, so this is a third of it.
+test.describe("Smoke Lab scenario catalog mirror", () => {
+  // One test per CI-safe scenario (P1-P7). Each records eight
+  // screenshot-backed lifecycle steps against its OWN throwaway company,
+  // scout and smoke run, so the tests share nothing but the instance-level
+  // `enableSmokeLab` flag, which every one of them sets to the same value.
   //
-  // Because this is one test in a `describe.serial` block, it is indivisible
-  // for sharding: Playwright assigns a whole non-parallel group to one shard,
-  // so no `--shard=i/N` can split it and 18.6m is the floor for any N. If the
-  // e2e wall-time question is reopened, splitting these 7 scenarios into 7
-  // tests is the prerequisite -- see the `e2e` job comment in
-  // .github/workflows/pr.yml.
-  test.setTimeout(1_800_000);
+  // This was ONE test until BLO-33282. Measured then: 18.6m median / 28.1m
+  // p100 for the whole block, 44% of a 42.1m suite -- and with
+  // `retries: process.env.CI ? 1 : 0` its 30m budget meant a worst case of
+  // 60m, which blew the enclosing 90m `e2e` job cap on its own against a
+  // measured rest-of-job of 51.5m. That is what killed job 35157831438 at
+  // 90.4m. Splitting bounds the retry: a hung scenario now costs 2 x 8m
+  // instead of 2 x 30m, and a plain flake costs one scenario (~4m), not seven.
+  //
+  // NOT `describe.serial` -- deliberately. A serial block retries from the top
+  // of the block, which would reinstate exactly the 7-scenarios-per-retry cost
+  // this split exists to remove. The tests are independent, and `workers: 1`
+  // (playwright.config.ts) already runs them in order.
+  //
+  // 8m per scenario is ~2x the 4.0m the 28.1m p100 implies per scenario, so it
+  // absorbs a 2x imbalance between scenarios. It is NOT sized to the job cap:
+  // seven hung scenarios still exceed 90m and the job is still killed, which
+  // is the intended behaviour for a wedged suite.
+  test.setTimeout(480_000);
 
-  test("records the P1-P7 CI-safe Smoke Lab lifecycle into the results API @smoke-lab", async ({ page, request }) => {
-    const seed = await newCompany(request, "catalog");
-    const scout = await createScout(request, seed.companyId);
-    await enableSmokeLab(request);
-    const smokeRun = await createSmokeRun(request, seed.companyId);
-    const failed: string[] = [];
+  for (const scenario of ciSmokeLabScenarios) {
+    test(`records the ${scenario.path} CI-safe Smoke Lab lifecycle into the results API @smoke-lab`, async ({ page, request }) => {
+      const seed = await newCompany(request, scenario.path.toLowerCase());
+      const scout = await createScout(request, seed.companyId);
+      await enableSmokeLab(request);
+      const smokeRun = await createSmokeRun(request, seed.companyId);
+      const failed: string[] = [];
 
-    try {
-      for (const scenario of ciSmokeLabScenarios) {
+      try {
         const fixtures = await startAndInstallFixtures(request, seed.companyId);
         const connection = connectionForScenario(fixtures, scenario);
 
@@ -440,27 +449,26 @@ test.describe.serial("Smoke Lab scenario catalog mirror", () => {
           await page.goto(`/${seed.prefix}/apps/${connection.id}/activity`);
           return scenario.lifecycle.auditEvidence;
         });
+      } catch (error) {
+        failed.push(error instanceof Error ? error.message : String(error));
+        throw error;
+      } finally {
+        await updateSmokeRun(request, seed.companyId, smokeRun.id, failed.length > 0 ? "failed" : "passed", {
+          catalog: "tests/e2e/smoke-lab.catalog.ts",
+          scenarioPath: scenario.path,
+          scenarioCount: 1,
+          failed,
+        }).catch(() => undefined);
       }
-    } catch (error) {
-      failed.push(error instanceof Error ? error.message : String(error));
-      throw error;
-    } finally {
-      await updateSmokeRun(request, seed.companyId, smokeRun.id, failed.length > 0 ? "failed" : "passed", {
-        catalog: "tests/e2e/smoke-lab.catalog.ts",
-        scenarioCount: ciSmokeLabScenarios.length,
-        failed,
-      }).catch(() => undefined);
-    }
 
-    const completed = await json<{ run: SmokeRun; steps: Array<{ path: string; status: string; screenshotArtifactRef: Json | null }> }>(
-      await request.get(`/api/companies/${seed.companyId}/smoke-lab/runs/${smokeRun.id}`),
-    );
-    expect(completed.run.status).toBe("passed");
-    for (const scenario of ciSmokeLabScenarios) {
-      const steps = completed.steps.filter((step) => step.path === scenario.path);
-      expect(steps.length, `${scenario.path} should record lifecycle steps`).toBeGreaterThanOrEqual(8);
-      expect(steps.every((step) => step.status === "pass")).toBe(true);
-      expect(steps.every((step) => step.screenshotArtifactRef?.kind === "playwright_screenshot")).toBe(true);
-    }
-  });
+      const completed = await json<{ run: SmokeRun; steps: Array<{ path: string; status: string; screenshotArtifactRef: Json | null }> }>(
+        await request.get(`/api/companies/${seed.companyId}/smoke-lab/runs/${smokeRun.id}`),
+      );
+      expect(completed.run.status).toBe("passed");
+      const recorded = completed.steps.filter((step) => step.path === scenario.path);
+      expect(recorded.length, `${scenario.path} should record lifecycle steps`).toBeGreaterThanOrEqual(8);
+      expect(recorded.every((step) => step.status === "pass")).toBe(true);
+      expect(recorded.every((step) => step.screenshotArtifactRef?.kind === "playwright_screenshot")).toBe(true);
+    });
+  }
 });

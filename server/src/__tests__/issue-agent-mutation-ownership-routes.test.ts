@@ -3587,6 +3587,156 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueApprovalService.unlink).not.toHaveBeenCalled();
   });
 
+  // ─── BLO-32774: a guarded run may not buy itself an unguarded one ──────────
+  //
+  // The residual left open by BLO-32634 / #1718. A monitor fire declares
+  // `normal_model`, so `mergeCoalescedContextSnapshot` correctly drops the
+  // recovery guard for it — otherwise the fire could not perform the write it
+  // was armed for. The hole was *who may schedule that fire*: on a
+  // `stranded_assigned_issue` recovery the guarded agent IS the assignee, so it
+  // sailed through the assignee early-return and could arm a monitor on its own
+  // issue, collecting an unguarded normal-model run while its recovery action
+  // stayed `active` and un-dispositioned.
+  const statusOnlyRecoveryContext = {
+    modelProfile: "cheap",
+    recoveryIntent: "status_only",
+    allowDeliverableWork: false,
+    allowDocumentUpdates: false,
+    resumeRequiresNormalModel: true,
+  };
+
+  // The gate sits *below* the `runtime:manage` decision, and the suite default
+  // denies that action. Without this the route would 403 before ever reaching
+  // the run-class check, and every assertion below would pass for the wrong
+  // reason — fatal for the pairing, whose entire job is to show the refusal is
+  // keyed on run class and on nothing else.
+  // `company_scope:read` is here for the *creation* case only: a parentless
+  // agent-authored create is refused by the low-trust boundary check at
+  // `issues.ts:10324` long before the monitor gate runs. Without it that test
+  // passes on a 403 raised for an entirely different reason.
+  const decideWithRuntimeManage = async (input: { action: string }) => ({
+    allowed: input.action === "runtime:manage"
+      || input.action === "issue:read"
+      || input.action === "issue:mutate"
+      || input.action === "company_scope:read"
+      || input.action === "tasks:assign",
+    action: input.action,
+    reason: input.action === "runtime:manage" ? "allow_explicit_grant" : "allow_company_agent",
+    explanation: "Allowed by test runtime grant.",
+  });
+
+  const armMonitorPatch = (app: express.Express, notes: string) =>
+    request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        executionPolicy: {
+          monitor: { nextCheckAt: "2026-09-20T00:00:00.000Z", notes, scheduledBy: "assignee" },
+        },
+      });
+
+  it("refuses a status-only recovery run arming a monitor on its own issue", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress", executionPolicy: null }));
+    mockAccessService.decide.mockImplementation(decideWithRuntimeManage);
+    const app = await createApp(ownerActor(), createRunContextDb(statusOnlyRecoveryContext));
+
+    const res = await armMonitorPatch(app, "self-armed by a guarded run");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    // Discriminating on the message, not the status: the assignee-relation
+    // refusal and the `runtime:manage` refusal are also 403 on this route, so
+    // the status alone cannot tell us the run-class gate is what fired.
+    expect(res.body.error).toContain("Cheap status-only recovery runs cannot arm issue monitors");
+    expect(res.body.details).toMatchObject({
+      runId: ownerRunId,
+      recoveryIntent: "status_only",
+      resumeRequiresNormalModel: true,
+      // The refused caller must not be told to wait for a normal-model run that
+      // this issue's own wake class can never dispatch (BLO-25878).
+      normalModelResumeIsAutomatic: false,
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue_write_denied",
+        entityId: issueId,
+        details: expect.objectContaining({ reason: "deny_status_only_recovery_monitor_arm" }),
+      }),
+      expect.anything(),
+    );
+  });
+
+  // The paired half, and the half that makes this a fix rather than a blanket
+  // refusal that would re-strand BLO-32634. Same issue, same actor, same
+  // request body — only the run class differs, so a regression that over-blocks
+  // shows up here rather than silently removing a wake path people depend on.
+  it("still lets a normal-model run arm a monitor on the same issue", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress", executionPolicy: null }));
+    mockAccessService.decide.mockImplementation(decideWithRuntimeManage);
+    const app = await createApp(ownerActor(), createRunContextDb({}));
+
+    const res = await armMonitorPatch(app, "armed by a normal-model run");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({
+        executionPolicy: expect.objectContaining({
+          monitor: expect.objectContaining({ notes: "armed by a normal-model run" }),
+        }),
+      }),
+    );
+  });
+
+  // `monitorChanged` on PATCH is a policy *diff*, so it is true for clears as
+  // well as arms. Refusing a clear would over-block: it removes a wake path
+  // rather than buying an unguarded run, and tidying a stale monitor is exactly
+  // the disposition work a status-only run exists to do.
+  it("still lets a status-only recovery run clear a monitor", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "in_progress",
+      executionPolicy: { monitor: { nextCheckAt: "2026-09-20T00:00:00.000Z", scheduledBy: "assignee" } },
+    }));
+    mockAccessService.decide.mockImplementation(decideWithRuntimeManage);
+    const app = await createApp(ownerActor(), createRunContextDb(statusOnlyRecoveryContext));
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({ executionPolicy: {} });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+  });
+
+  // The surface is wider than the PATCH path: three of the five gate callers
+  // pass a *synthetic* issue built from the request body, so the assignee
+  // comparison runs against a name the caller supplies rather than persisted
+  // state. A status-only run can therefore reach the gate on a brand-new issue
+  // simply by naming itself assignee. No audit row is possible here — the issue
+  // id is minted after the gate runs — but the refusal is not optional.
+  it("refuses a status-only recovery run arming a monitor on an issue it creates", async () => {
+    mockAccessService.decide.mockImplementation(decideWithRuntimeManage);
+    // The create route resolves the assignee reference (`issues.ts:10340`)
+    // before it reaches the monitor gate; without this the request 404s on
+    // "Agent not found" and never exercises the refusal.
+    mockAgentService.resolveByReference.mockResolvedValue({ ambiguous: false, agent: makeAgent(ownerAgentId) });
+    const app = await createApp(ownerActor(), createRunContextDb(statusOnlyRecoveryContext));
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "self-armed at creation",
+        assigneeAgentId: ownerAgentId,
+        executionPolicy: {
+          monitor: { nextCheckAt: "2026-09-20T00:00:00.000Z", scheduledBy: "assignee" },
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("Cheap status-only recovery runs cannot arm issue monitors");
+    expect(res.body.details).toMatchObject({ issueId: null });
+    expect(mockIssueService.create).not.toHaveBeenCalled();
+  });
+
   // BLO-23197: the refusal has to leave a durable mark, or the
   // successful-run-handoff detector has nothing to escalate on and queues
   // another status-only wake into the identical 403.

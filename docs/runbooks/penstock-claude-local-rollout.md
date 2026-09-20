@@ -149,18 +149,27 @@ other secret references.
 The Job receives the Secret reference through `valueFrom`; the resolved value
 must never be visible in the adapter configuration or Job manifest.
 
-Note what the adapter actually does with worker env, because it is broader than
-a `PENSTOCK_API_KEY` carve-out: `getSelfPod` copies **every** non-empty literal
-env entry off the worker's main container into `inheritedEnv`, and every
-`valueFrom` entry into `inheritedEnvValueFrom`. There is no name allowlist or
-denylist. So any non-secret `PENSTOCK_*` tunable added to `worker.extraEnv`
-reaches every agent Job — this is the supported way to set a fleet-wide
-launcher default without editing each agent's `adapterConfig` (see
-`PENSTOCK_READY_TIMEOUT_MS`, BLO-33279). Per-agent `adapterConfig.env` is
-layered after inheritance and still wins for a single agent.
+Note what the adapter actually does with worker env. `getSelfPod` copies each
+non-empty literal env entry off the worker's main container into `inheritedEnv`
+and each `valueFrom` entry into `inheritedEnvValueFrom` — but **both are
+filtered through an allowlist** (`isAgentInheritableEnvName`,
+`vendor/paperclip-adapter-claude-k8s/src/server/inherit-allowlist.ts`, added by
+BLO-22514). Inheritance is default-deny: a name reaches agent Jobs only if it is
+listed exactly in `AGENT_ENV_ALLOWLIST` or matches an entry in
+`AGENT_ENV_ALLOWED_PREFIXES`.
 
-Because inheritance is unfiltered, treat the worker container env as the
-blast radius: never put a credential there as a literal value.
+So adding a `PENSTOCK_*` tunable to `worker.extraEnv` is **two** edits, not one:
+the value, and the name in the allowlist. Skipping the second renders a green
+manifest that changes nothing in any agent pod — that is exactly how
+`PENSTOCK_READY_TIMEOUT_MS` (BLO-33279) shipped on 2026-09-12 and left every
+agent on the 15000 ms default. `deploy/helm/paperclip/tests/penstock-worker-secret.test.mjs`
+now fails the build when a worker literal is not inheritable. Per-agent
+`adapterConfig.env` is layered after inheritance and still wins for a single
+agent — and it is not allowlist-filtered, so it remains the escape hatch for a
+one-off.
+
+The allowlist is a credential boundary, not a convenience filter: never put a
+credential in the worker container env as a literal value.
 
 ## 3. Configure one test agent
 

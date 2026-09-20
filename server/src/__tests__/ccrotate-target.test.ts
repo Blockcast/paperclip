@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { mapAdapterToCcrotateTarget } from "../services/ccrotate-target.js";
+import {
+  mapAdapterToCcrotateTarget,
+  mapPenstockProviderToCcrotateTarget,
+} from "../services/ccrotate-target.js";
 
 describe("mapAdapterToCcrotateTarget", () => {
   it("maps claude_local to claude", () => {
@@ -27,5 +30,15 @@ describe("mapAdapterToCcrotateTarget", () => {
     expect(mapAdapterToCcrotateTarget("gemini_local")).toBeNull();
     expect(mapAdapterToCcrotateTarget("process")).toBeNull();
     expect(mapAdapterToCcrotateTarget("http")).toBeNull();
+  });
+});
+
+describe("mapPenstockProviderToCcrotateTarget", () => {
+  it("keys the escalation on the pool that denied, not the adapter default", () => {
+    // An opencode_k8s agent routed to the anthropic pool defers on claude
+    // capacity; the adapter default would say codex and the escalation would
+    // never close.
+    expect(mapPenstockProviderToCcrotateTarget("anthropic")).toBe("claude");
+    expect(mapPenstockProviderToCcrotateTarget("codex")).toBe("codex");
   });
 });

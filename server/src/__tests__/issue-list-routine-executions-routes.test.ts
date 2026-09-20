@@ -158,6 +158,13 @@ describe("issue list route routine-execution visibility", () => {
         status: "backlog",
         projectId: "project-large",
         includeRoutineExecutions: "false",
+        // BLO-33741: ask for the 1000 rows this fixture supplies. Previously
+        // omitted, which meant the route defaulted to limit=500 and only the
+        // mock ignoring that limit made 1000 rows come back — against a real
+        // service the assertion below could never have held. Now that the
+        // route detects an over-cap page and truncates it, the omission would
+        // surface as 500 rows, so state the limit the fixture actually needs.
+        limit: "1000",
       });
 
     expect(res.status).toBe(200);

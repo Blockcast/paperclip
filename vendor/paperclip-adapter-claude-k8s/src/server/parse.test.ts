@@ -930,10 +930,12 @@ describe("isClaudeSkillNotFoundStartupFailure", () => {
 
   // v2.1.210 emits `subtype:"status"` before the first turn under
   // `--include-partial-messages` (across 3 runs it appeared in no plain
-  // `--print --output-format stream-json --verbose` invocation). That is also
-  // the mode in which `init -> status -> death` is a real startup shape —
-  // before any `stream_event` exists to reject the transcript — so the
-  // allowlist entry is load-bearing rather than incidental.
+  // `--print --output-format stream-json --verbose` invocation), so
+  // `init -> status -> death` is a real startup shape. Detection does not
+  // depend on admitting `status`: the death is the bare error line, trusted on
+  // its own, and a `status` line that does not carry the phrase is never
+  // consulted. This case pins that removing `status` from the allowlist
+  // (BLO-31955) lost no detection.
   it("still classifies when a system:status event follows init", () => {
     const transcript = [
       '{"type":"system","subtype":"init"}',
@@ -943,6 +945,25 @@ describe("isClaudeSkillNotFoundStartupFailure", () => {
     expect(
       isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: false }),
     ).toBe(true);
+  });
+
+  // The reason `status` is not admitted (BLO-31955): its `compact_result` /
+  // `compact_error` are compaction summaries derived from model output. Under
+  // per-line attribution nothing elsewhere in the transcript vetoes such a
+  // line, so admitting the subtype would attribute model prose to the harness
+  // on a retry-killing code. Fails closed like any other non-`init` subtype.
+  it("does not classify when only a system:status compact_result quotes the phrase", () => {
+    const transcript = [
+      '{"type":"system","subtype":"init"}',
+      '{"type":"system","subtype":"status","status":"compacting","compact_result":"Earlier the run hit Skill \'verification-before-completion\' not found and moved on.","uuid":"3d1a9017","session_id":"e45846ad"}',
+    ].join("\n");
+    // Presence control, same discipline as the model-prose cases above: the
+    // phrase IS in the transcript, so a `false` here is attribution, not the
+    // pre-filter.
+    expect(transcript).toContain("Skill 'verification-before-completion' not found");
+    expect(
+      isClaudeSkillNotFoundStartupFailure({ stdout: transcript, assistantContentSeen: false }),
+    ).toBe(false);
   });
 
   // Second detection-preserving case: a harness-authored event type other than

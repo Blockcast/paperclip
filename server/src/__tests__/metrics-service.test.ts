@@ -389,12 +389,16 @@ describe("recordHeartbeatRunFailed + renderMetrics", () => {
     );
   });
 
+  // BLO-17953: every k8s isolation mode is an execution pod, so a pod-schedule
+  // failure must stay attributable in all of them. This previously asserted the
+  // opposite (collapse), which is what made PaperclipExecutionPodFailureLoop
+  // structurally blind to workspace/shared-isolated pods.
   it.each([
     ["workspace", "workspace"],
     ["shared", "shared"],
     ["not-a-mode", UNKNOWN_ISOLATION_MODE],
   ])(
-    "collapses source identifiers for %s pod-schedule failures",
+    "retains source identifiers for %s pod-schedule failures",
     async (isolationMode, expectedIsolationMode) => {
       const labels = recordHeartbeatRunFailed({
         agentId: "agent-a",
@@ -406,8 +410,8 @@ describe("recordHeartbeatRunFailed + renderMetrics", () => {
       });
 
       expect(labels).toEqual({
-        agent_id: UNKNOWN_AGENT_ID,
-        issue_id: "none",
+        agent_id: "agent-a",
+        issue_id: "issue-a",
         adapter: "claude_k8s",
         error_code: "k8s_pod_schedule_failed",
         invocation_source: "github_pr_review_submitted",
@@ -416,7 +420,7 @@ describe("recordHeartbeatRunFailed + renderMetrics", () => {
 
       const { body } = await renderMetrics();
       expect(body).toContain(
-        `${HEARTBEAT_RUN_FAILED_METRIC}{agent_id="${UNKNOWN_AGENT_ID}",issue_id="none",adapter="claude_k8s",error_code="k8s_pod_schedule_failed",invocation_source="github_pr_review_submitted",isolation_mode="${expectedIsolationMode}"} 1`,
+        `${HEARTBEAT_RUN_FAILED_METRIC}{agent_id="agent-a",issue_id="issue-a",adapter="claude_k8s",error_code="k8s_pod_schedule_failed",invocation_source="github_pr_review_submitted",isolation_mode="${expectedIsolationMode}"} 1`,
       );
     },
   );
@@ -436,16 +440,34 @@ describe("recordHeartbeatRunFailed + renderMetrics", () => {
         invocationSource: "capacity_blocked_retry",
         isolationMode: "shared",
       });
-      // Only run-isolated k8s_pod_schedule_failed keeps the real ids. Every other
-      // code — including every workspace refusal — collapses them, so a Prometheus
-      // selector of the form `error_code="<workspace code>", issue_id!="none"` can
-      // never match. BLO-28648 shipped exactly that alert; it loaded healthy and
-      // could not fire. Assert the collapse so the impossibility stays documented.
+      // Only k8s_pod_schedule_failed keeps the real ids (in every isolation mode,
+      // BLO-17953). Every other code — including every workspace refusal —
+      // collapses them, so a Prometheus selector of the form
+      // `error_code="<workspace code>", issue_id!="none"` can never match.
+      // BLO-28648 shipped exactly that alert; it loaded healthy and could not
+      // fire. Assert the collapse so the impossibility stays documented.
       expect(labels.issue_id).toBe("none");
       expect(labels.agent_id).toBe(UNKNOWN_AGENT_ID);
       expect(labels.error_code).toBe(errorCode);
     },
   );
+
+  // The cardinality bound is the error code, not the isolation mode: a
+  // non-pod-schedule failure must still collapse both source identifiers even
+  // in `run` isolation, or every historical issue retains a series.
+  it("still collapses source identifiers for non-pod-schedule failures in run isolation", async () => {
+    const labels = recordHeartbeatRunFailed({
+      agentId: "agent-a",
+      issueId: "issue-a",
+      adapter: "claude_k8s",
+      errorCode: "job_failed",
+      invocationSource: "github_pr_review_submitted",
+      isolationMode: "run",
+    });
+
+    expect(labels.agent_id).toBe(UNKNOWN_AGENT_ID);
+    expect(labels.issue_id).toBe("none");
+  });
 
   it("collapses unknown invocation source to the bounded fallback (cardinality guardrail)", async () => {
     const labels = recordHeartbeatRunFailed({
@@ -1324,6 +1346,36 @@ describe("backstop metrics (BLO-29763)", () => {
     setBackstopDeferredCandidates("issue_graph_liveness.backstop", 0);
     body = (await renderMetrics()).body;
     expect(body).toContain(`${BACKSTOP_DEFERRED_CANDIDATES_METRIC}{source="issue_graph_liveness.backstop"} 0`);
+  });
+
+  it("keeps every backstop series bounded to source/reason with no per-issue or per-agent label", async () => {
+    // AC5. These three series are recorded once per candidate, so an `issue_id` or
+    // `agent_id` label would make their cardinality track the backlog rather than a fixed
+    // enum. Assert the label set off the rendered exposition rather than the registration
+    // call, so a label added anywhere downstream is caught too.
+    setBackstopDeferredCandidates("issue_graph_liveness.backstop", 3);
+    recordBackstopSweepCompleted("issue_graph_liveness.backstop");
+    recordBackstopCandidateSkipped("issue_graph_liveness.backstop", "live_path");
+    const body = (await renderMetrics()).body;
+
+    const labelSets = body
+      .split("\n")
+      .filter((line) =>
+        [
+          BACKSTOP_DEFERRED_CANDIDATES_METRIC,
+          BACKSTOP_SWEEP_COMPLETED_METRIC,
+          BACKSTOP_CANDIDATES_SKIPPED_METRIC,
+        ].some((metric) => line.startsWith(`${metric}{`)),
+      )
+      .map((line) =>
+        [...(line.match(/\{(.*)\}/)?.[1].matchAll(/([a-zA-Z_][a-zA-Z0-9_]*)=/g) ?? [])]
+          .map((match) => match[1])
+          .sort()
+          .join(","),
+      );
+
+    expect(labelSets.length).toBeGreaterThan(0);
+    expect([...new Set(labelSets)].sort()).toEqual(["reason,source", "source"]);
   });
 });
 

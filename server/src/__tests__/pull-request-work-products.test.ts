@@ -154,4 +154,42 @@ describe("buildPullRequestWorkProductFields", () => {
     );
     expect(new Set(ids).size).toBe(1);
   });
+
+  // PEN-3219: the row is written for every issue the PR references, so the row
+  // alone cannot say which issue the PR is FOR. Carrying the resolved owning
+  // set is what lets a consumer tell work on this issue from a name-drop.
+  describe("owning identifiers (PEN-3219)", () => {
+    it("records the resolved owning set on the row", () => {
+      const fields = buildPullRequestWorkProductFields({
+        ...base,
+        prTitle: "t",
+        owningIdentifiers: ["BLO-19566", "BLO-19567"],
+      });
+      expect(fields.metadata.owningIdentifiers).toEqual(["BLO-19566", "BLO-19567"]);
+    });
+
+    it("copies the array rather than aliasing the caller's", () => {
+      // The webhook reuses one resolved context across every matched issue, so
+      // an aliased array would let a later mutation rewrite rows already built.
+      const owning = ["BLO-19566"];
+      const fields = buildPullRequestWorkProductFields({ ...base, prTitle: "t", owningIdentifiers: owning });
+      owning.push("BLO-99999");
+      expect(fields.metadata.owningIdentifiers).toEqual(["BLO-19566"]);
+    });
+
+    it("distinguishes an unresolved owning set from an empty one", () => {
+      // null means "not recorded" and licenses the consumer's fallback
+      // derivation; [] is authoritative — the PR named no owner anywhere.
+      expect(buildPullRequestWorkProductFields({ ...base, prTitle: "t" }).metadata.owningIdentifiers)
+        .toBeNull();
+      expect(
+        buildPullRequestWorkProductFields({ ...base, prTitle: "t", owningIdentifiers: null })
+          .metadata.owningIdentifiers,
+      ).toBeNull();
+      expect(
+        buildPullRequestWorkProductFields({ ...base, prTitle: "t", owningIdentifiers: [] })
+          .metadata.owningIdentifiers,
+      ).toEqual([]);
+    });
+  });
 });

@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import postgres, { type Sql } from "postgres";
 import * as schema from "./schema/index.js";
 import { registerTrackedClient } from "./embedded-test-client-registry.js";
+import { ensureConcurrentIndexesForMigration } from "./concurrent-index-guard.js";
 
 const MIGRATIONS_FOLDER = fileURLToPath(new URL("./migrations", import.meta.url));
 const DRIZZLE_MIGRATIONS_TABLE = "__drizzle_migrations";
@@ -46,6 +47,16 @@ export type MigrationState =
       reason: "no-migration-journal-empty-db" | "no-migration-journal-non-empty-db" | "pending-migrations";
     };
 
+export type ApplyPendingMigrationsOptions = {
+  /**
+   * Prepare guarded `CREATE INDEX CONCURRENTLY` prerequisites immediately
+   * before each migration file. This is opt-in so migration tests and callers
+   * that intentionally exercise a migration's raw failure remain unchanged.
+   */
+  readonly prepareOnlineIndexes?: boolean;
+  readonly log?: (message: string) => void;
+};
+
 /**
  * Connection-pool ceiling for the application client.
  *
@@ -63,12 +74,134 @@ export type MigrationState =
  */
 export const POSTGRES_POOL_MAX = 10;
 
+/**
+ * How long a pooled application connection may sit inside an open transaction
+ * with no statement running before Postgres terminates it.
+ *
+ * This is not a new number: it matches `DELIVERY_LOCK_HOLD_TIMEOUT_MS` in
+ * `server/src/services/github-status-delivery-outbox.ts`, which already applies
+ * exactly this bound — for exactly this reason — to one critical section that
+ * performs external I/O while holding a transaction open. This applies the same
+ * bound pool-wide so a section nobody thought to guard cannot pin a connection
+ * forever.
+ *
+ * Why it is safe to set unconditionally, unlike `statement_timeout`: Postgres
+ * resolves GUCs as `postgresql.conf` < `ALTER DATABASE SET` < `ALTER ROLE SET`
+ * < startup-packet parameters < session `SET`, and both settings have context
+ * `user` — so a startup-packet value *overrides* a role-level one rather than
+ * stacking with it, and can therefore loosen an existing bound as easily as
+ * tighten it. That risk is real for `statement_timeout`, where a role-level
+ * bound is plausible and would be silently raised. It does not apply here: no
+ * healthy workload wants an idle-open transaction, so there is no bound worth
+ * preserving. `statement_timeout` is deliberately left unset until
+ * {@link readInheritedTimeoutSettings} has reported what is actually in force.
+ *
+ * A `?idle_in_transaction_session_timeout=` in the connection URL still wins
+ * over this, because postgres.js lets URL query parameters override
+ * `options.connection`. That is the intended escape hatch for an operator.
+ */
+export const POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS = 120_000;
+
 export function createDb(url: string) {
-  const sql = postgres(url, { max: POSTGRES_POOL_MAX });
+  const sql = postgres(url, {
+    max: POSTGRES_POOL_MAX,
+    // Sent in the startup packet, so it applies to every connection this pool
+    // opens — including ones created later to refill the pool. postgres.js
+    // filters falsy startup parameters out entirely, so a `0` here would ship
+    // no bound at all rather than the "disabled" it reads as; the value must
+    // stay positive for this to mean anything.
+    connection: {
+      idle_in_transaction_session_timeout: POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+    },
+  });
   // Inert in production; only embedded test databases register their URL so
   // their pools can be closed before the server stops (see registry module).
   registerTrackedClient(url, sql);
   return createDbFromPostgresClient(sql);
+}
+
+/**
+ * The three timeouts that decide whether a query can hang forever, as they are
+ * inherited from the server environment (`postgresql.conf`, `ALTER DATABASE
+ * SET`, `ALTER ROLE SET`) — *before* any client-side override.
+ *
+ * `valueMs` is `null` when the setting is disabled (Postgres reports `0`),
+ * which is the unbounded case and the one worth alerting on.
+ */
+export type InheritedTimeoutSetting = {
+  readonly name: string;
+  readonly valueMs: number | null;
+  readonly source: string;
+};
+
+export type InheritedTimeoutSettings = {
+  readonly statementTimeout: InheritedTimeoutSetting;
+  readonly idleInTransactionSessionTimeout: InheritedTimeoutSetting;
+  readonly lockTimeout: InheritedTimeoutSetting;
+};
+
+const TIMEOUT_SETTING_NAMES = [
+  "statement_timeout",
+  "idle_in_transaction_session_timeout",
+  "lock_timeout",
+] as const;
+
+/**
+ * Read the effective timeout environment on a connection that carries none of
+ * this module's own client-side overrides.
+ *
+ * It deliberately uses {@link createUtilitySql}, not the application pool. The
+ * pool sets `idle_in_transaction_session_timeout` in its startup packet, so
+ * reading these values there would report our own override back to us and
+ * destroy the one piece of evidence this probe exists to collect: whether the
+ * *server* already bounds these. `statement_timeout` and `lock_timeout` are not
+ * set by the pool, so the values reported here are what the pool inherits too.
+ *
+ * The repo asserts a role-level 30s `statement_timeout` in two places
+ * (`routes/plugins.ts`, migration `0098`) and `lib/db-retry.ts` retries `57014`
+ * on that basis, but no `ALTER ROLE` exists in either `Blockcast/paperclip` or
+ * `Blockcast/onprem-k8s` — so the assertion is unverified. This answers it from
+ * whatever database the process is actually pointed at, with no cluster access.
+ */
+export async function readInheritedTimeoutSettings(
+  url: string,
+): Promise<InheritedTimeoutSettings> {
+  const sql = createUtilitySql(url);
+  try {
+    const rows = await sql<{ name: string; setting: string; source: string }[]>`
+      SELECT name, setting, source
+      FROM pg_settings
+      WHERE name IN ${sql(TIMEOUT_SETTING_NAMES)}
+    `;
+    const byName = new Map(rows.map((row) => [row.name, row]));
+    const read = (name: string): InheritedTimeoutSetting => {
+      const row = byName.get(name);
+      // pg_settings reports these three in milliseconds, and 0 means disabled.
+      const parsed = Number(row?.setting ?? Number.NaN);
+      const valueMs = Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+      return { name, valueMs, source: row?.source ?? "unknown" };
+    };
+    return {
+      statementTimeout: read("statement_timeout"),
+      idleInTransactionSessionTimeout: read("idle_in_transaction_session_timeout"),
+      lockTimeout: read("lock_timeout"),
+    };
+  } finally {
+    await sql.end();
+  }
+}
+
+/** One-line, log-friendly rendering of {@link readInheritedTimeoutSettings}. */
+export function formatInheritedTimeoutSettings(settings: InheritedTimeoutSettings): string {
+  return [
+    settings.statementTimeout,
+    settings.idleInTransactionSessionTimeout,
+    settings.lockTimeout,
+  ]
+    .map(({ name, valueMs, source }) =>
+      `${name}=${valueMs === null ? "disabled" : `${valueMs}ms`} (source=${source})`,
+    )
+    .join(", ");
 }
 
 export function createDbFromPostgresClient(sql: Sql) {
@@ -258,6 +391,7 @@ async function recordMigrationHistoryEntry(
 async function applyPendingMigrationsManually(
   url: string,
   pendingMigrations: string[],
+  options: ApplyPendingMigrationsOptions = {},
 ): Promise<void> {
   if (pendingMigrations.length === 0) return;
 
@@ -283,6 +417,12 @@ async function applyPendingMigrationsManually(
         hash,
       );
       if (existingEntry) continue;
+
+      if (options.prepareOnlineIndexes) {
+        await ensureConcurrentIndexesForMigration(url, migrationFile, {
+          log: options.log,
+        });
+      }
 
       await runInTransaction(sql, async () => {
         for (const statement of splitMigrationStatements(migrationContent)) {
@@ -722,7 +862,10 @@ export async function inspectMigrations(url: string): Promise<MigrationState> {
   }
 }
 
-export async function applyPendingMigrations(url: string): Promise<void> {
+export async function applyPendingMigrations(
+  url: string,
+  options: ApplyPendingMigrationsOptions = {},
+): Promise<void> {
   const initialState = await inspectMigrations(url);
   if (initialState.status === "upToDate") return;
 
@@ -743,7 +886,7 @@ export async function applyPendingMigrations(url: string): Promise<void> {
         bootstrappedState = await inspectMigrations(url);
       }
       if (bootstrappedState.status === "needsMigrations" && bootstrappedState.reason === "pending-migrations") {
-        await applyPendingMigrationsManually(url, bootstrappedState.pendingMigrations);
+        await applyPendingMigrationsManually(url, bootstrappedState.pendingMigrations, options);
         bootstrappedState = await inspectMigrations(url);
       }
     }
@@ -776,7 +919,7 @@ export async function applyPendingMigrations(url: string): Promise<void> {
     throw new Error("Migrations are still pending after migration-history reconciliation; run inspectMigrations for details.");
   }
 
-  await applyPendingMigrationsManually(url, state.pendingMigrations);
+  await applyPendingMigrationsManually(url, state.pendingMigrations, options);
 
   const finalState = await inspectMigrations(url);
   if (finalState.status !== "upToDate") {

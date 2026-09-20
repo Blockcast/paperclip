@@ -154,7 +154,7 @@ describeEmbeddedPostgres("recovery observability report", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-recovery-observability-");
     db = createDb(tempDb.connectionString);
-  }, 60_000);
+  });
 
   afterEach(async () => {
     await db.delete(issueRecoveryActions);
@@ -585,6 +585,117 @@ describeEmbeddedPostgres("recovery observability report", () => {
     const resolved = await service.listActions(companyId, { status: "resolved" });
     expect(resolved).toHaveLength(1);
     expect(resolved[0]?.outcome).toBe("restored");
+  });
+
+  // BLO-19124: the list shipped projecting `status` and no routing class, so its
+  // consumers had to read `status` AS the outcome — the exact misread that
+  // produced "resolves 1 action in 200" company-wide, reproduced per-owner.
+  //
+  // Both rows below are `cancelled`. If `handoffClass` were an alias of `status`
+  // (or of `outcome`, also identical here) the two would be indistinguishable and
+  // this fails. The halves of the predicate have to disagree for the assertion to
+  // mean anything, so the fixture forces them to.
+  it("projects a routing class that two same-status rows can disagree on", async () => {
+    const { companyId, managerId, coderId } = await seedBaseline();
+
+    // Owner recovered its own issue: owner === returnOwner -> self_recovery.
+    await seedRecoveryAction({
+      companyId,
+      n: 1,
+      createdAt: regressionWeek,
+      cause: "stranded_assigned_issue",
+      errorCode: "adapter_failed",
+      status: "cancelled",
+      outcome: "cancelled",
+      ownerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+      finalAssigneeAgentId: coderId,
+      finalIssueStatus: "in_progress",
+    });
+    // Genuine takeover that landed back with the original agent -> handed_back.
+    await seedRecoveryAction({
+      companyId,
+      n: 2,
+      createdAt: latestWeek,
+      cause: "stranded_assigned_issue",
+      errorCode: "adapter_failed",
+      status: "cancelled",
+      outcome: "cancelled",
+      ownerAgentId: managerId,
+      returnOwnerAgentId: coderId,
+      finalAssigneeAgentId: coderId,
+      finalIssueStatus: "in_progress",
+    });
+
+    const actions = await recoveryObservabilityService(db).listActions(companyId, {
+      kind: "stranded_assigned_issue",
+      order: "asc",
+    });
+
+    expect(actions.map((a) => a.status)).toEqual(["cancelled", "cancelled"]);
+    expect(actions.map((a) => a.handoffClass)).toEqual(["self_recovery", "handed_back"]);
+    // The classifier's input comes back with its verdict, so a caller can audit
+    // the class without a second query.
+    expect(actions[1]?.resolutionSnapshot).toEqual({
+      assigneeAgentId: coderId,
+      issueStatus: "in_progress",
+    });
+  });
+
+  // BLO-33600: the class must come from the action's own evidence snapshot, never
+  // from a live read of the source issue. This row has no snapshot, so the only
+  // way to classify it non-`unknown` is to read the issue live — which is what
+  // this pins shut. The issue row it seeds is a genuine `handed_back` shape.
+  it("classifies a pre-snapshot row unknown rather than reading the issue live", async () => {
+    const { companyId, managerId, coderId } = await seedBaseline();
+
+    await seedRecoveryAction({
+      companyId,
+      n: 1,
+      createdAt: latestWeek,
+      cause: "stranded_assigned_issue",
+      errorCode: "adapter_failed",
+      status: "cancelled",
+      outcome: "cancelled",
+      ownerAgentId: managerId,
+      returnOwnerAgentId: coderId,
+      finalAssigneeAgentId: coderId,
+      finalIssueStatus: "in_progress",
+      captureResolutionSnapshot: false,
+    });
+
+    const [action] = await recoveryObservabilityService(db).listActions(companyId, {
+      kind: "stranded_assigned_issue",
+    });
+
+    expect(action?.resolutionSnapshot).toBeNull();
+    expect(action?.handoffClass).toBe("unknown");
+  });
+
+  it("agrees with the company-wide report on how a row is routed", async () => {
+    const { companyId, managerId, coderId } = await seedBaseline();
+
+    await seedRecoveryAction({
+      companyId,
+      n: 1,
+      createdAt: latestWeek,
+      cause: "stranded_assigned_issue",
+      errorCode: "adapter_failed",
+      status: "resolved",
+      outcome: "restored",
+      ownerAgentId: managerId,
+      returnOwnerAgentId: coderId,
+      finalAssigneeAgentId: managerId,
+      finalIssueStatus: "done",
+    });
+
+    const service = recoveryObservabilityService(db);
+    const [action] = await service.listActions(companyId, { kind: "stranded_assigned_issue" });
+    const report = await service.report(companyId, { now });
+    const routing = report.perCauseRouting.find((r) => r.cause === "stranded_assigned_issue");
+
+    expect(action?.handoffClass).toBe("owner_completed");
+    expect(routing?.ownerCompleted).toBe(1);
   });
 
   // BLO-19124: `listActions` was newest-first with `limit` hard-capped at 500 and

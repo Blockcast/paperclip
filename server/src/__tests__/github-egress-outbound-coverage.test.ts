@@ -41,7 +41,8 @@ import { describe, expect, it } from "vitest";
  *
  * It also enumerates the server-side write set, which is a second family
  * entirely: `paperclip-api` writes to GitHub over HTTP from `server/`, reaching
- * no wrapper and no scrubber.
+ * no wrapper. Its scrub is `scrubOutboundGitHubText` in `github-app-auth.ts`,
+ * applied inside the write helpers rather than at their call sites (PEN-3157).
  *
  * ## ⚠️ Scope boundary — read before citing this file as coverage
  *
@@ -65,14 +66,22 @@ import { describe, expect, it } from "vitest";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 const statefulSetPath = path.join(repoRoot, "deploy/helm/paperclip/templates/statefulset.yaml");
 const servicesDirectory = path.join(repoRoot, "server/src/services");
+const serverSourceDirectory = path.join(repoRoot, "server/src");
 
 /** The compiled entrypoints that carry a control, as the wrappers name them. */
 const CLI_EGRESS_RUNTIME = "github-cli-egress-runtime.js";
 const MCP_EGRESS_RUNTIME = "github-mcp-egress-runtime.js";
 const GIT_EGRESS_RUNTIME = "github-git-egress-runtime.js";
 
+/** The server-side wrapper over `scrubGitHubEgressText`, as the service files name it. */
+const SERVER_EGRESS_SCRUB = "scrubOutboundGitHubText";
+
 type Coverage =
-  /** Agent-authored text on this path passes through `scrubGitHubEgressText`. */
+  /**
+   * Agent-authored text on this path passes through `scrubGitHubEgressText`.
+   * `runtime` names what carries it: a compiled egress runtime for a launcher,
+   * the server-side scrub helper for a service file.
+   */
   | { kind: "egress-scrubbed"; runtime: string }
   /**
    * Agent-authored text on this path is REFUSED, not rewritten, when it carries
@@ -140,25 +149,40 @@ const WRAPPER_COVERAGE: Readonly<Record<string, Coverage>> = {
 };
 
 /**
- * `server/src/services` files that issue a WRITE to GitHub over HTTP.
+ * `server/src` files that issue a WRITE to GitHub over HTTP, keyed by path
+ * relative to `server/src` — not by bare filename. The path is deliberate:
+ * the walk is recursive, so two files of the same name in different
+ * directories must be distinguishable here.
  *
  * Derived from source at file granularity rather than line, so it stays stable
  * across refactors while still failing when a NEW file starts writing to
- * GitHub. Both entries are unscrubbed: the scrubber lives in
- * `packages/adapter-utils`, is imported only by the two sandbox wrappers, and
- * is not re-exported from that package's `index.ts` — so it is structurally
- * unreachable from `server/`.
+ * GitHub. Until PEN-3157 both entries were `unscrubbed` by construction: the
+ * scrubber was not exported from `packages/adapter-utils`'s `index.ts`, so no
+ * server-side write could reach it even by a caller who wanted to. PEN-3157
+ * exported it and applied it inside the write helpers; a `kind` here is still
+ * only a statement about whether the scrub is on the path (scope boundary 3).
+ * Which FIELDS each helper scrubs is pinned per helper in
+ * `github-write-egress-scrub.test.ts`, not here.
  */
 const SERVER_WRITE_COVERAGE: Readonly<Record<string, Coverage>> = {
-  "github-app-auth.ts": {
-    kind: "unscrubbed",
-    ticket: "PEN-3157",
-    why: "githubPostIssueComment POSTs an arbitrary `body` to /issues/{n}/comments, and githubPostCommitStatusDetailed POSTs a `description`. The comment helper's only caller passes a template today, so the exposure there is latent rather than live — but the helper accepts any string and is one caller away from carrying model output",
+  // githubPostCommitStatusDetailed (context, description, target_url),
+  // githubPostIssueComment (body) and githubPostCheckRun (name, title, summary,
+  // details_url) each scrub inside the helper, so every present and future
+  // caller inherits it. The installation-token POST in this file carries a JWT
+  // and no authored text, and is not scrubbed.
+  "services/github-app-auth.ts": {
+    kind: "egress-scrubbed",
+    runtime: SERVER_EGRESS_SCRUB,
   },
-  "github-review-gate-authority.ts": {
-    kind: "unscrubbed",
-    ticket: "PEN-3157",
-    why: "POSTs a fixed pending-status description plus a repository_dispatch client_payload of ids; no model-authored free text on either, but it reaches GitHub through the same unscrubbed ghFetch boundary and must be reclassified together with it",
+  // Builds its own requests — a caller-supplied token and an abort signal the
+  // shared helper does not model — so it calls the scrub directly on the
+  // pending status's context, description and target_url. Its
+  // repository_dispatch client_payload is ids only (app, installation,
+  // delivery, PR number, head SHA) and is not scrubbed: it carries no authored
+  // text, and the detectors are tuned for prose, not protocol.
+  "services/github-review-gate-authority.ts": {
+    kind: "egress-scrubbed",
+    runtime: SERVER_EGRESS_SCRUB,
   },
 };
 
@@ -199,17 +223,40 @@ function readSeededGitHubMcpCommand(): string {
   return (match as RegExpExecArray)[1] as string;
 }
 
-function serviceFilesWritingToGitHub(): string[] {
+/**
+ * Every non-test TypeScript file under `server/src`, as a path relative to it
+ * with forward slashes ("services/github-app-auth.ts").
+ *
+ * Recursive, and that is the load-bearing part. This walked
+ * `server/src/services` one level deep until Ally caught the scope on #1754:
+ * `server/src/routes/` (which holds `github-webhook.ts`) and
+ * `server/src/services/recovery/` were both invisible to it, so a new
+ * `ghFetch`-based write added in either would have shipped unscrubbed with this
+ * table green. No live leak existed — widening the walk finds exactly the same
+ * two writers today — but the table is the mechanism meant to catch the NEXT
+ * one, and it could not see two directories that already hold GitHub code.
+ *
+ * That is the third repeat of one shape: PEN-2527 enumerated `gh` and missed
+ * the MCP server, PEN-3152 enumerated both wrappers and missed `server/`, and
+ * this enumerated `services/` and missed its own siblings. Each time the
+ * derivation was correct over a set that was quietly too small.
+ */
+function serverSourceFiles(): string[] {
   const { readdirSync } = require("node:fs") as typeof import("node:fs");
-  const out: string[] = [];
-  for (const entry of readdirSync(servicesDirectory)) {
-    if (!entry.endsWith(".ts") || entry.endsWith(".test.ts")) continue;
-    const source = readFileSync(path.join(servicesDirectory, entry), "utf8");
-    if (!source.includes("ghFetch(")) continue;
-    if (!/method:\s*"(?:POST|PATCH|PUT|DELETE)"/.test(source)) continue;
-    out.push(entry);
-  }
-  return out.sort();
+  return readdirSync(serverSourceDirectory, { recursive: true, encoding: "utf8" })
+    .map((entry) => entry.split(path.sep).join("/"))
+    .filter((entry) => entry.endsWith(".ts") && !entry.endsWith(".test.ts"))
+    .sort();
+}
+
+function serverFilesWritingToGitHub(): string[] {
+  return serverSourceFiles()
+    .filter((entry) => {
+      const source = readFileSync(path.join(serverSourceDirectory, entry), "utf8");
+      if (!source.includes("ghFetch(")) return false;
+      return /method:\s*"(?:POST|PATCH|PUT|DELETE)"/.test(source);
+    })
+    .sort();
 }
 
 describe("outbound GitHub egress coverage", () => {
@@ -325,27 +372,66 @@ describe("outbound GitHub egress coverage", () => {
   });
 
   describe("server-side GitHub writes", () => {
-    it("classifies every service file that writes to GitHub", () => {
+    it("classifies every server file that writes to GitHub", () => {
       // paperclip-api reaches GitHub over HTTP from server/, touching no
-      // wrapper. A new service file that starts writing fails here until it is
+      // wrapper. A new file that starts writing fails here until it is
       // classified — which is the whole mechanism PEN-3152 asked for.
-      expect(serviceFilesWritingToGitHub()).toEqual(Object.keys(SERVER_WRITE_COVERAGE).sort());
+      expect(serverFilesWritingToGitHub()).toEqual(Object.keys(SERVER_WRITE_COVERAGE).sort());
     });
 
-    it("records that the scrubber is structurally unreachable from server/", () => {
-      // Not a style point: as long as this holds, no server-side write can be
-      // scrubbed even by a caller who wants to, and every entry in
-      // SERVER_WRITE_COVERAGE must remain `unscrubbed`. PEN-3157 closes it by
-      // exporting the core (or relocating it); when that lands this assertion
-      // is what tells you the table is now stale.
+    it("derives that set from a walk that actually descends below server/src", () => {
+      // Scope control for the assertion above, not a style point. The walk it
+      // replaced listed `server/src/services` one level deep, so a writer added
+      // under `routes/` or `services/recovery/` was not merely unclassified —
+      // it was invisible, and the table stayed green while missing it. A
+      // non-recursive regression would still pass the check above (the two
+      // known writers both sit directly in `services/`), so the blind spot has
+      // to be pinned by naming files only a descending walk can reach.
+      //
+      // `routes/github-webhook.ts` is the specific file Ally named on #1754:
+      // it imports `githubPostIssueComment` and so is one edit away from being
+      // a direct writer itself.
+      const scanned = serverSourceFiles();
+      expect(scanned).toContain("routes/github-webhook.ts");
+      expect(
+        scanned.filter((entry) => entry.startsWith("services/recovery/")),
+        "services/recovery/ is no longer reachable from the walk",
+      ).not.toHaveLength(0);
+    });
+
+    it("the scrubber is reachable from server/, and the server wrapper still delegates to it", () => {
+      // The inverse of the assertion this replaced. Before PEN-3157 the barrel
+      // did NOT export the core, so no server-side write could be scrubbed and
+      // every entry above had to be `unscrubbed`; that test was written to
+      // fail the day the export landed, and it did. This is the regression
+      // guard for the mechanism it turned on: drop the barrel export, or hollow
+      // out `scrubOutboundGitHubText` so it no longer calls the shared core,
+      // and every "egress-scrubbed" row above becomes a false claim — here.
       const index = readFileSync(
         path.join(repoRoot, "packages/adapter-utils/src/index.ts"),
         "utf8",
       );
-      expect(index).not.toContain("github-egress-scrub");
+      expect(index).toContain("github-egress-scrub");
+      expect(index).toContain("scrubGitHubEgressText");
 
-      for (const coverage of Object.values(SERVER_WRITE_COVERAGE)) {
-        expect(coverage.kind).toBe("unscrubbed");
+      const appAuth = readFileSync(path.join(servicesDirectory, "github-app-auth.ts"), "utf8");
+      expect(appAuth).toMatch(
+        /import\s*\{[^}]*\bscrubGitHubEgressText\b[^}]*\}\s*from\s*"@paperclipai\/adapter-utils"/,
+      );
+      const wrapper = appAuth.slice(appAuth.indexOf(`export function ${SERVER_EGRESS_SCRUB}(`));
+      expect(wrapper, `${SERVER_EGRESS_SCRUB} is no longer defined in github-app-auth.ts`).not.toBe("");
+      expect(wrapper).toContain("scrubGitHubEgressText(");
+    });
+
+    it("every classified writer claimed as scrubbed still calls the scrub", () => {
+      // Mirror of the launcher check above. A writer that only imports or
+      // mentions the helper is not covered; it has to CALL it.
+      for (const [name, coverage] of Object.entries(SERVER_WRITE_COVERAGE)) {
+        if (coverage.kind !== "egress-scrubbed") continue;
+        const source = readFileSync(path.join(serverSourceDirectory, name), "utf8");
+        expect(source, `${name} no longer calls ${coverage.runtime}`).toContain(
+          `${coverage.runtime}(`,
+        );
       }
     });
   });
@@ -371,6 +457,12 @@ describe("outbound GitHub egress coverage", () => {
         (coverage) => coverage.kind === "egress-scrubbed",
       );
       expect(scrubbed.length).toBeGreaterThanOrEqual(2);
+      // Same guard for the server family: after PEN-3157, a table with no
+      // scrubbed server write is a regression, not a neutral starting state.
+      const serverScrubbed = Object.values(SERVER_WRITE_COVERAGE).filter(
+        (coverage) => coverage.kind === "egress-scrubbed",
+      );
+      expect(serverScrubbed.length).toBeGreaterThanOrEqual(1);
     });
   });
 });
