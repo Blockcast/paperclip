@@ -1,9 +1,7 @@
 import { createDbFromPostgresClient, type Db } from "@paperclipai/db";
 
-import {
-  currentAgentStartLockSignal,
-  registerAgentStartLockCancelRetry,
-} from "./agent-start-lock.js";
+import { logger } from "../middleware/logger.js";
+import { currentAgentStartLockSignal } from "./agent-start-lock.js";
 
 /**
  * Make the queued-run dispatch critical section's database work cancellable
@@ -82,11 +80,48 @@ import {
  * and `describeAgentStartLockDispatchHealth` reports `stalled` rather than
  * `aborted` when a requested abort does not land.
  *
+ * Also uncovered, and live: **a `cancel()` that does not take cannot be
+ * retried.** `Query#cancel()` is
+ * `this.canceller && (this.canceller(this), this.canceller = null)` — it
+ * disarms itself on the first call, so every later `query.cancel?.()` is
+ * `null && …` and does nothing. The dial *is* the canceller, and it is spent.
+ *
+ * An earlier revision of this module retained in-flight queries in a
+ * `WeakMap<AbortSignal, Set<Query>>` and re-issued `cancel()` on each lock tick.
+ * That was removed rather than fixed, because it could not work: the branch it
+ * was built for (`query.active` — the CancelRequest dial) is exactly the branch
+ * that is inert on a second call, while the two branches that do not need it
+ * already succeed synchronously (`!query.state` rejects `57014` client-side;
+ * `state && !active` defers through `query.cancelled = { resolve, reject }`).
+ * Worse than inert, it was misleading: the retained query only leaves the set
+ * when it settles, so a wedged section accrued one phantom attempt per tick and
+ * logged them as `cancelRetried: N` — reading as "we re-dialled N times", when
+ * the truth was "we dialled once and have not tried since".
+ *
+ * A genuine retry needs a re-armable handle and postgres.js exposes none:
+ * `query.state` and `Connection#cancel` are internal, and re-implementing the
+ * CancelRequest dial against them would couple this module to driver internals
+ * for a failure mode that reports `stalled` either way. So this is reported
+ * rather than rescued, like the non-database awaits above — and
+ * {@link cancelQuery} logs the failed dial so the operator can tell a cancel
+ * that failed from a section that never observed one.
+ * `agent-start-lock-db.test.ts` pins the self-disarm against a REAL `Query`
+ * (built I/O-free, the way `db-pool-stats.test.ts` guards the other half of
+ * this patch), so a future re-addition of a retry has a test that says why it
+ * cannot work. A fake `cancel()` is re-armable and would hide exactly that.
+ *
+ * Also uncovered: **`reserve()` is a pass-through**, so a reserved client
+ * obtained inside a section is unwrapped and its statements are uncancellable.
+ * Nothing in dispatch reserves today — `routes/issues.ts` is the only caller and
+ * it is not on this path — so this is latent rather than live, the same shape as
+ * the tagged-template gap below. Wrap the resolved client the way
+ * `wrapCallbackArgs` wraps `begin`'s scoped one if that changes.
+ *
  * Also uncovered, and unlike the tagged template below this one is **live**:
  * a `begin`/`savepoint` call that hangs *before* it invokes its callback.
  * The wrapper pre-checks `signal.aborted` and then hands off to the real
- * client, but it registers nothing — the promise `begin` returns gets no abort
- * listener and no `inFlightBySignal` entry, and `wrapCallbackArgs` only reaches
+ * client, but it registers nothing — the promise `begin` returns carries no
+ * `cancel()` and so gets no abort listener, and `wrapCallbackArgs` only reaches
  * statements issued through the scoped client *after* the callback runs.
  * Connection acquisition is the instance that matters: `begin` takes a pool
  * slot before it can issue `BEGIN`, and with `max: 10` and no acquire timeout
@@ -130,52 +165,52 @@ type PostgresClient = {
 const WRAPPED = Symbol.for("paperclip.agentStartLockAbortableClient");
 
 /**
- * Statements still in flight for a given section signal.
+ * Issue `cancel()` on one in-flight statement, containing both ways it can fail.
  *
- * Keyed weakly by signal so an abandoned section's entry dies with it, and the
- * set is emptied as statements settle — in the healthy case it is created,
- * emptied and collected without anyone reading it.
+ * `cancel()` on an *executing* statement dials a fresh connection to send a
+ * PostgreSQL CancelRequest, and that dial can fail. It fails **asynchronously**:
+ * `Connection#cancel` (`src/connection.js:145-154`) is `async` and rejects on
+ * two paths — `catch (error) { reject(error) }` around `connect()`, and
+ * `socket.once('error', reject)` — rejecting the promise `index.js` `cancel(query)`
+ * builds. A synchronous `try`/`catch` cannot see any of that.
  *
- * It exists for one narrow case: `Query#cancel()` on an *executing* statement
- * dials a fresh connection, and that dial can fail. The abort listener is
- * `once: true`, so a cancel that did not take is never retried and the section
- * stays wedged with its abort already spent. Retaining the query lets
- * {@link retryAgentStartLockCancels} have another go on a later tick.
+ * That promise must not be dropped. `server/src/process-crash-guard.ts` handles
+ * `unhandledRejection` by logging and then **exiting the worker**, so a failed
+ * cancel dial would trade one wedged agent for every agent's in-flight dispatch
+ * — strictly worse than the `stalled` report this module otherwise falls back
+ * to. Upstream drops it (`Query#cancel()` discards its canceller's return value
+ * via a comma expression), so `patches/postgres@3.4.9.patch` returns it instead;
+ * this is the handler that makes returning it worth anything.
+ *
+ * Both failures are swallowed rather than propagated, for the same reason: the
+ * caller is already being torn down and has nothing useful to do with a failed
+ * cancel. They are logged because a failed dial is the difference between
+ * "aborted and recovered" and "aborted and still wedged", and the escalating
+ * `error` line in `agent-start-lock.ts` reports only the latter's symptom.
  */
-const inFlightBySignal = new WeakMap<AbortSignal, Set<CancellableQuery>>();
-
-/**
- * Re-issue `cancel()` for every statement still in flight on an already-aborted
- * section. Returns how many it attempted.
- *
- * Best-effort and idempotent: cancelling an already-cancelled or
- * already-finished postgres.js query is harmless, and every throw is swallowed
- * for the same reason the first attempt's is — the caller is being torn down
- * and has nothing useful to do with the failure.
- *
- * Deliberately a no-op unless the signal has aborted, so this can never cancel
- * a healthy section's work.
- */
-export function retryAgentStartLockCancels(signal: AbortSignal): number {
-  if (!signal.aborted) return 0;
-  const inFlight = inFlightBySignal.get(signal);
-  if (!inFlight?.size) return 0;
-  let attempted = 0;
-  for (const query of inFlight) {
-    attempted += 1;
-    try {
-      query.cancel?.();
-    } catch {
-      /* best-effort, same as the first attempt */
-    }
+function cancelQuery(query: CancellableQuery, agentId: string | undefined): void {
+  let pending: unknown;
+  try {
+    pending = query.cancel?.();
+  } catch (error) {
+    logger.warn({ err: error, agentId }, "agent start lock: cancelling a wedged statement threw");
+    return;
   }
-  return attempted;
+  // Present only with the patch above applied; `undefined` on an unpatched
+  // driver, where there is nothing to attach to and nothing we can do.
+  if (!isPromiseLike(pending)) return;
+  void Promise.resolve(pending).catch((error: unknown) => {
+    logger.warn(
+      { err: error, agentId },
+      "agent start lock: the cancel request for a wedged statement failed to dial; "
+      + "the section stays held and will report `stalled`",
+    );
+  });
 }
 
-// The lock module raises the abort; this module is what can act on it a second
-// time. Registering here (rather than having the lock import this file) keeps
-// the dependency one-directional — see `registerAgentStartLockCancelRetry`.
-registerAgentStartLockCancelRetry(retryAgentStartLockCancels);
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return typeof (value as { then?: unknown } | null | undefined)?.then === "function";
+}
 
 function isPostgresClient(value: unknown): value is PostgresClient {
   return typeof value === "function"
@@ -192,6 +227,18 @@ function abortReason(signal: AbortSignal): Error {
   const reason: unknown = signal.reason;
   if (reason instanceof Error) return reason;
   return new Error(typeof reason === "string" ? reason : "Agent start lock section aborted");
+}
+
+/**
+ * Which agent's section raised the abort, for log correlation only.
+ *
+ * `AgentStartLockAbortedError` carries `agentId`; read it structurally rather
+ * than importing the class, so an abort raised with any other reason degrades
+ * to `undefined` instead of throwing on the log path.
+ */
+function abortedAgentId(signal: AbortSignal): string | undefined {
+  const agentId: unknown = (signal.reason as { agentId?: unknown } | null | undefined)?.agentId;
+  return typeof agentId === "string" ? agentId : undefined;
 }
 
 /**
@@ -217,104 +264,102 @@ function wrapClient<T extends object>(client: T): T {
           (arg as (...a: unknown[]) => unknown)(wrapClient(scoped), ...rest)
         : arg);
 
+  // Method wrappers, memoized per property. Every branch below builds a fresh
+  // function — a closure for the three intercepted methods, a `bind` for the
+  // pass-throughs — so without this cache `client.end !== client.end` and
+  // likewise for `unsafe`/`begin`/`savepoint`. Nothing in drizzle compares
+  // these by identity today, which is precisely why a regression would be
+  // silent: anything that stored one to remove or compare later would quietly
+  // hold a different function than the one it kept. Caching removes the hazard
+  // and the per-access allocation together.
+  //
+  // Keyed by `prop` only, which is sound because the trap closes over one
+  // `target`: a wrapper is a pure function of (target, prop), and `target` is
+  // fixed for the life of this proxy.
+  const methodByProp = new Map<PropertyKey, unknown>();
+
   return new Proxy(client, {
     get(target, prop, receiver) {
       if (prop === WRAPPED) return true;
       const value = Reflect.get(target, prop, receiver);
       if (typeof value !== "function") return value;
 
-      if (prop === "unsafe") {
-        return function unsafe(this: unknown, ...args: unknown[]) {
-          const signal = currentAgentStartLockSignal();
-          // Outside a dispatch section there is no signal and this wrapper is a
-          // pass-through — which is the case for essentially all traffic.
-          if (!signal) return (value as (...a: unknown[]) => unknown).apply(target, args);
-          // Already aborted: refuse to start. Issuing the statement first and
-          // cancelling it immediately would burn a pool slot the wedged agent's
-          // recovery needs, and the rejection is identical either way.
-          //
-          // Throwing synchronously rather than returning a rejected thenable is
-          // deliberate. Not every drizzle entry point is async —
-          // `PostgresJsSession.query`/`queryObjects` return
-          // `client.unsafe(...).values()` straight out of a sync method, and
-          // `transaction` returns `client.begin(...)` the same way — so a
-          // rejected thenable would have to also carry `.values()`/`.raw()` to
-          // keep those chains intact, and would risk an unhandled rejection if
-          // any caller discarded it. A synchronous throw needs neither: every
-          // one of those paths is reached from inside the section's `async`
-          // closure, so the throw becomes a rejection of `fn`, which is exactly
-          // the outcome the lock is waiting for.
-          if (signal.aborted) throw abortReason(signal);
-
-          const query = (value as (...a: unknown[]) => CancellableQuery).apply(target, args);
-          if (typeof query.cancel !== "function") return query;
-
-          const onAbort = () => {
-            // `cancel()` is best-effort by nature — for an executing statement
-            // it dials a fresh connection, which can itself fail. Swallowing is
-            // correct: the caller is already being torn down, and throwing from
-            // an abort listener would surface as an unhandled rejection with
-            // less information than the abort reason the section will see.
-            try {
-              query.cancel?.();
-            } catch {
-              /* best-effort */
-            }
-          };
-          signal.addEventListener("abort", onAbort, { once: true });
-          // Also retain the query so the cancel can be RE-issued on a later
-          // tick. The listener above is `once: true` and detaches after firing,
-          // so without this a failed `cancel()` — the fresh connection it dials
-          // can itself fail — would never be retried, and the section would
-          // stay wedged for the rest of the process's life with the abort
-          // already spent. Subsequent statements are refused synchronously by
-          // the `signal.aborted` check above, so the one case this covers is a
-          // single statement in flight whose cancel did not take.
-          inFlightBySignal.get(signal)?.add(query)
-            ?? inFlightBySignal.set(signal, new Set([query]));
-          // Drop the listener when the statement settles, so a long section
-          // issuing many statements does not accumulate them on one signal.
-          //
-          // Touching `.then()` here is safe despite postgres.js's Query
-          // executing lazily on first `then`: `Query#handle()` defers the actual
-          // dispatch by a microtask (`await 1`), and drizzle's
-          // `client.unsafe(...).values()` runs synchronously on the value we
-          // return. So `values()`/`raw()` still land before the statement is
-          // built. (`Query[Symbol.species]` is `Promise`, so this branch is a
-          // plain promise and cannot be mistaken for the query itself.)
-          const detach = () => {
-            signal.removeEventListener("abort", onAbort);
-            inFlightBySignal.get(signal)?.delete(query);
-          };
-          void Promise.resolve(query).then(detach, detach);
-          return query;
-        };
-      }
-
-      if (prop === "begin" || prop === "savepoint") {
-        return function scoped(this: unknown, ...args: unknown[]) {
-          const signal = currentAgentStartLockSignal();
-          if (signal?.aborted) throw abortReason(signal);
-          // NOTE: this is a pre-check, not cancellation. Once the real call is
-          // under way nothing here can interrupt it — `begin` returns a plain
-          // promise with no `cancel()`, and `wrapCallbackArgs` only takes effect
-          // when the callback is invoked, i.e. after a pool slot is already held.
-          // A hang in that acquisition is therefore uncancellable, and that is a
-          // live gap rather than a theoretical one. See "What it does not cover"
-          // in the module header for why racing it would be worse than leaving
-          // it, and `agent-start-lock-db.test.ts` for the test that pins it.
-          return (value as (...a: unknown[]) => unknown).apply(target, wrapCallbackArgs(args));
-        };
-      }
-
-      // Everything else — `options`, `poolStats`, `end`, `reserve`, the tagged
-      // template call — passes straight through to the real client.
-      return value.bind(target);
+      const memoized = methodByProp.get(prop);
+      if (memoized !== undefined) return memoized;
+      const built = buildMethod(target, prop, value as (...a: unknown[]) => unknown);
+      methodByProp.set(prop, built);
+      return built;
     },
     apply(target, thisArg, args) {
       return Reflect.apply(target as unknown as (...a: unknown[]) => unknown, thisArg, args);
     },
   });
+
+  function buildMethod(target: T, prop: PropertyKey, value: (...a: unknown[]) => unknown): unknown {
+    if (prop === "unsafe") {
+      return function unsafe(this: unknown, ...args: unknown[]) {
+        const signal = currentAgentStartLockSignal();
+        // Outside a dispatch section there is no signal and this wrapper is a
+        // pass-through — which is the case for essentially all traffic.
+        if (!signal) return (value as (...a: unknown[]) => unknown).apply(target, args);
+        // Already aborted: refuse to start. Issuing the statement first and
+        // cancelling it immediately would burn a pool slot the wedged agent's
+        // recovery needs, and the rejection is identical either way.
+        //
+        // Throwing synchronously rather than returning a rejected thenable is
+        // deliberate. Not every drizzle entry point is async —
+        // `PostgresJsSession.query`/`queryObjects` return
+        // `client.unsafe(...).values()` straight out of a sync method, and
+        // `transaction` returns `client.begin(...)` the same way — so a
+        // rejected thenable would have to also carry `.values()`/`.raw()` to
+        // keep those chains intact, and would risk an unhandled rejection if
+        // any caller discarded it. A synchronous throw needs neither: every
+        // one of those paths is reached from inside the section's `async`
+        // closure, so the throw becomes a rejection of `fn`, which is exactly
+        // the outcome the lock is waiting for.
+        if (signal.aborted) throw abortReason(signal);
+
+        const query = (value as (...a: unknown[]) => CancellableQuery).apply(target, args);
+        if (typeof query.cancel !== "function") return query;
+
+        const onAbort = () => cancelQuery(query, abortedAgentId(signal));
+        signal.addEventListener("abort", onAbort, { once: true });
+        // Drop the listener when the statement settles, so a long section
+        // issuing many statements does not accumulate them on one signal.
+        //
+        // Touching `.then()` here is safe despite postgres.js's Query
+        // executing lazily on first `then`: `Query#handle()` defers the actual
+        // dispatch by a microtask (`await 1`), and drizzle's
+        // `client.unsafe(...).values()` runs synchronously on the value we
+        // return. So `values()`/`raw()` still land before the statement is
+        // built. (`Query[Symbol.species]` is `Promise`, so this branch is a
+        // plain promise and cannot be mistaken for the query itself.)
+        const detach = () => signal.removeEventListener("abort", onAbort);
+        void Promise.resolve(query).then(detach, detach);
+        return query;
+      };
+    }
+
+    if (prop === "begin" || prop === "savepoint") {
+      return function scoped(this: unknown, ...args: unknown[]) {
+        const signal = currentAgentStartLockSignal();
+        if (signal?.aborted) throw abortReason(signal);
+        // NOTE: this is a pre-check, not cancellation. Once the real call is
+        // under way nothing here can interrupt it — `begin` returns a plain
+        // promise with no `cancel()`, and `wrapCallbackArgs` only takes effect
+        // when the callback is invoked, i.e. after a pool slot is already held.
+        // A hang in that acquisition is therefore uncancellable, and that is a
+        // live gap rather than a theoretical one. See "What it does not cover"
+        // in the module header for why racing it would be worse than leaving
+        // it, and `agent-start-lock-db.test.ts` for the test that pins it.
+        return (value as (...a: unknown[]) => unknown).apply(target, wrapCallbackArgs(args));
+      };
+    }
+
+    // Everything else — `options`, `poolStats`, `end`, `reserve`, the tagged
+    // template call — passes straight through to the real client.
+    return value.bind(target);
+  }
 }
 
 /**

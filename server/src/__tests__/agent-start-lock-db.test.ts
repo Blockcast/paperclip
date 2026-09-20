@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
 
 import type { Db } from "@paperclipai/db";
+import { createDb } from "@paperclipai/db";
 import {
   _resetAgentStartLocksForTesting,
   AgentStartLockAbortedError,
@@ -132,57 +133,96 @@ describe("agent start lock database cancellation seam (PEN-3328)", () => {
     await expect(held).rejects.toMatchObject({ code: "57014" });
   });
 
-  it("re-issues the cancel on later ticks when the first attempt fails to take", async () => {
+  // The negative control for the retry mechanism that is deliberately ABSENT.
+  //
+  // An earlier revision retained in-flight queries and re-issued `cancel()` on
+  // each lock tick. It could not work, and this is why: postgres.js's
+  // `Query#cancel()` nulls its own canceller, so the second call reaches
+  // nothing. A fake `cancel()` is re-armable and hid that — this test uses a
+  // REAL `Query`, built I/O-free (`unsafe` only constructs; dispatch is lazy
+  // until the first `then`), so it fails if the assumption ever changes.
+  it("cannot be re-cancelled: postgres.js `Query#cancel()` disarms itself (PEN-3328 review)", async () => {
+    // postgres.js connects lazily and `unsafe` only constructs — dispatch waits
+    // for the first `then` — so this opens no socket. Same pattern as
+    // `db-pool-stats.test.ts`, which guards the other half of this patch.
+    const db = createDb("postgres://unused:unused@127.0.0.1:1/unused");
+    const client = (db as unknown as { $client: { unsafe: (q: string) => unknown } }).$client;
+    const query = client.unsafe("select 1") as {
+      cancel: () => unknown;
+      canceller?: unknown;
+    };
+    // Attach through the BASE `then`: `Query` overrides `then`/`catch` to call
+    // `handle()`, which would dispatch the statement and dial 127.0.0.1:1.
+    // `Promise.prototype.then` bypasses the override, so this only marks the
+    // 57014 rejection below as handled.
+    void Promise.prototype.then.call(query as PromiseLike<unknown>, () => {}, () => {});
+
+    expect(typeof query.canceller).toBe("function");
+
+    // First cancel: real work. It takes the `!query.state` branch — the
+    // statement never executed — which rejects it 57014 client-side.
+    const first = query.cancel();
+    // And it returns the canceller's promise rather than discarding it, which
+    // is what `patches/postgres@3.4.9.patch` adds so `cancelQuery` can attach a
+    // rejection handler. If that patch stops applying, this goes red.
+    expect(typeof (first as PromiseLike<unknown> | undefined)?.then).toBe("function");
+
+    // Second cancel: inert. The canceller is spent, so there is no re-dial to
+    // be had and a retry loop would only ever count phantom attempts.
+    expect(query.canceller).toBeNull();
+    expect(query.cancel()).toBeUndefined();
+  });
+
+  // The other half of the same finding: the dial fails ASYNCHRONOUSLY, so a
+  // synchronous try/catch cannot contain it. `process-crash-guard.ts` handles
+  // `unhandledRejection` by exiting the worker, so an uncontained one here
+  // would trade a single wedged agent for every agent's in-flight dispatch.
+  it("contains an asynchronously failing cancel dial rather than letting it reach the crash guard", async () => {
     vi.useFakeTimers();
     vi.spyOn(logger, "warn").mockImplementation(() => logger);
     vi.spyOn(logger, "error").mockImplementation(() => logger);
-    const client = makeFakeClient("never");
-    const db = withAgentStartLockAbortableDb(makeFakeDb(client));
-    const wrapped = (db as Db & { $client: typeof client }).$client;
 
-    const held = withAgentStartLock(
-      randomUUID(),
-      async () => wrapped.unsafe("select 1"),
-      coalesced,
-    );
-    void held.catch(() => {});
-    await vi.advanceTimersByTimeAsync(0);
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
 
-    // Stand in for the real failure mode this retry exists for: `cancel()` on
-    // an EXECUTING statement dials a fresh connection, and that dial can fail.
-    // The query then stays pending with the abort already spent — before the
-    // retry, that was a permanent wedge, because the signal fires its listeners
-    // once and they detach.
-    const query = client.issued[0]!;
-    let attempts = 0;
-    const realCancel = query.cancel;
-    query.cancel = () => {
-      attempts += 1;
-      // Fail the first two attempts, then let one through.
-      if (attempts < 3) throw new Error("could not connect to cancel the query");
-      realCancel();
-    };
+    try {
+      const client = makeFakeClient("never");
+      const db = withAgentStartLockAbortableDb(makeFakeDb(client));
+      const wrapped = (db as Db & { $client: typeof client }).$client;
 
-    await vi.advanceTimersByTimeAsync(LOCK_HELD_ERROR_MS + 1_000);
-    // First attempt happened and threw; the section is still wedged, and
-    // crucially the lock is still HELD — a failed cancel must never be mistaken
-    // for a release.
-    expect(attempts).toBe(1);
-    expect(query.cancelled).toBe(false);
+      const held = withAgentStartLock(
+        randomUUID(),
+        async () => wrapped.unsafe("select 1"),
+        coalesced,
+      );
+      void held.catch(() => {});
+      await vi.advanceTimersByTimeAsync(0);
 
-    // Each subsequent WARN tick tries again rather than giving up. The retry is
-    // hoisted above the log backoff (PEN-3328 review), so recovery runs at the
-    // 30s tick cadence while the error LOG stays backed off to
-    // LOCK_HELD_ERROR_MS. Pinning 30s here is what discriminates the hoist: on
-    // the old coupling these two attempts took 10 minutes rather than one.
-    await vi.advanceTimersByTimeAsync(LOCK_HELD_WARN_MS);
-    expect(attempts).toBe(2);
-    expect(query.cancelled).toBe(false);
+      // The patched `Query#cancel()` returns the canceller's promise, and that
+      // promise rejects when the CancelRequest connection cannot be opened.
+      const query = client.issued[0]!;
+      const dialFailure = new Error("connect ECONNREFUSED (cancel request)");
+      query.cancel = () => Promise.reject(dialFailure) as unknown as void;
 
-    await vi.advanceTimersByTimeAsync(LOCK_HELD_WARN_MS);
-    expect(attempts).toBe(3);
-    expect(query.cancelled).toBe(true);
-    await expect(held).rejects.toMatchObject({ code: "57014" });
+      await vi.advanceTimersByTimeAsync(LOCK_HELD_ERROR_MS + 1_000);
+
+      // Give the rejection every chance to be reported as unhandled.
+      vi.useRealTimers();
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(unhandled).toEqual([]);
+      // And the failure is not merely swallowed — it is reported, because a
+      // dial that failed is the difference between "aborted and recovered" and
+      // "aborted and still wedged".
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ err: dialFailure }),
+        expect.stringContaining("failed to dial"),
+      );
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
   });
 
   it("refuses to issue a new statement once the section is aborted", async () => {
@@ -333,5 +373,20 @@ describe("agent start lock database cancellation seam (PEN-3328)", () => {
     // is deliberate: dispatching without the wrapper beats refusing to start.
     const plain = { select: () => undefined } as unknown as Db;
     expect(withAgentStartLockAbortableDb(plain)).toBe(plain);
+  });
+
+  it("keeps pass-through methods reference-stable across property reads", () => {
+    // `fn.bind()` mints a new function every call, so binding inside the proxy's
+    // `get` trap would make `client.end !== client.end`. Nothing in drizzle
+    // compares these by identity today, which is exactly why a regression here
+    // would be silent — anything that stored one to remove or compare later
+    // would quietly operate on a different function than the one it kept.
+    const client = makeFakeClient("immediate");
+    const db = withAgentStartLockAbortableDb(makeFakeDb(client));
+    const wrapped = (db as Db & { $client: typeof client }).$client;
+
+    expect(wrapped.begin).toBe(wrapped.begin);
+    expect(wrapped.savepoint).toBe(wrapped.savepoint);
+    expect(wrapped.unsafe).toBe(wrapped.unsafe);
   });
 });

@@ -233,25 +233,6 @@ type DispatchAbortRecord = {
 /** The most recent abort per agent, retained for `DISPATCH_ABORT_RETENTION_MS`. */
 const lastAbortByAgent = new Map<string, DispatchAbortRecord>();
 
-/**
- * Re-issue cancellation for statements still in flight on an aborted section.
- *
- * Registered by `agent-start-lock-db.ts` rather than imported from it, because
- * that module already imports {@link currentAgentStartLockSignal} from here and
- * importing back would make the cycle mutual. A hook keeps the dependency
- * one-directional and keeps this module's concern intact: it decides *when* a
- * section has stopped, and knows nothing about how database work is cancelled.
- *
- * Unset is a safe state — retries simply do not happen, and the first abort
- * (which is delivered by the signal itself, not through here) is unaffected.
- */
-let cancelRetryHook: ((signal: AbortSignal) => number) | null = null;
-
-/** @see cancelRetryHook */
-export function registerAgentStartLockCancelRetry(fn: (signal: AbortSignal) => number): void {
-  cancelRetryHook = fn;
-}
-
 export type AgentStartLockOptions<T> = {
   /**
    * Result to return when this call is folded into another pass instead of
@@ -307,20 +288,10 @@ async function runExclusively<T>(agentId: string, fn: () => Promise<T>): Promise
   // past LOCK_HELD_ERROR_MS separates "slow" from "stopped".
   let lastLoggedAtMs = startedAtMs;
   let loggedStopped = false;
-  let cancelRetriesSinceLog = 0;
   const warnTimer = setInterval(() => {
     const nowMs = Date.now();
     const heldMs = nowMs - startedAtMs;
     const stopped = heldMs >= LOCK_HELD_ERROR_MS;
-    // Retry the cancel on EVERY tick once the abort has been raised, deliberately
-    // ABOVE the log backoff below (PEN-3328 review). The two were coupled only by
-    // position: the backoff exists to stop a multi-hour wedge emitting thousands of
-    // identical log lines, and a retry is not a log line. It is a weak-map lookup
-    // over at most one in-flight query and a no-op unless the signal has aborted,
-    // so it is far cheaper than the line the backoff suppresses. Leaving it below
-    // the early return bought nothing and cost a 10x slower recovery cadence --
-    // one attempt per LOCK_HELD_ERROR_MS instead of one per tick.
-    if (stopped && loggedStopped) cancelRetriesSinceLog += cancelRetryHook?.(abort.signal) ?? 0;
     // Past the error threshold the section is not coming back on its own, so
     // back the cadence off from 30s to LOCK_HELD_ERROR_MS: a multi-hour wedge
     // should be loud enough to alert on, not thousands of identical lines.
@@ -342,14 +313,18 @@ async function runExclusively<T>(agentId: string, fn: () => Promise<T>): Promise
       }
       loggedStopped = true;
       // Reaching a LATER tick at all means the section is STILL held, i.e. the
-      // cancel did not take — most likely because `Query#cancel()` on an
-      // executing statement dials a fresh connection and that dial failed. The
-      // count is every retry since the previous line, not just this tick's, so
-      // the backoff above cannot hide the attempts made while it suppressed.
-      const retried = cancelRetriesSinceLog;
-      cancelRetriesSinceLog = 0;
+      // abort did not land — either the section's current await is not database
+      // work, or `cancel()` was issued and did not take.
+      //
+      // There is deliberately no retry count here, because there are no
+      // retries: postgres.js `Query#cancel()` is `this.canceller && (this
+      // .canceller(this), this.canceller = null)`, so it disarms itself on the
+      // first call and every later call is a no-op. A counter in this line
+      // would only ever report attempts that did nothing. See "What it does not
+      // cover" in `agent-start-lock-db.ts` for why that is reported rather than
+      // rescued.
       logger.error(
-        { ...fields, errorAfterMs: LOCK_HELD_ERROR_MS, aborted: true, cancelRetried: retried },
+        { ...fields, errorAfterMs: LOCK_HELD_ERROR_MS, aborted: true },
         "agent start lock held far past its budget; queued-run dispatch for this agent has stopped",
       );
     } else {
