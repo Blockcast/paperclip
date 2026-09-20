@@ -256,6 +256,32 @@ function detectScreenshotViewport(
   return looseFilename.test(text);
 }
 
+/**
+ * A markdown list item's leading marker: unordered (`-`/`*`) or ordered
+ * (`1.`, `1)`). ONE source, consumed by both the criteria counter
+ * (`doneWhenBulletKeys`) and the evidence task-list counter
+ * (`detectChecklistDoneWhen`), because those two are the halves of a single
+ * comparison — criteria count vs evidence count — and a marker the one side
+ * reads but the other does not makes the shape unsatisfiable rather than
+ * merely under-counted.
+ *
+ * That is not hypothetical: BLO-34810 widened the criteria side alone, which
+ * left `1. [x]` evidence (valid GFM, renders as a checkbox) matching zero
+ * task-list lines against a now-correct criteria count. Keep them sharing
+ * this constant rather than restating the character class.
+ *
+ * `^` carries no indent allowance: a nested item is a sub-point of the item
+ * above it, not an item of its own. `\s+` after the marker is what keeps
+ * `1.2.3 is the pinned version` from reading as a list item.
+ */
+const LIST_MARKER_SOURCE = "^(?:[-*]|\\d+[.)])\\s+";
+
+/** A completed task-list line — any list marker followed by `[x]`. */
+const TASK_LIST_DONE_RE = new RegExp(`${LIST_MARKER_SOURCE}\\[[xX]\\]`, "gm");
+
+/** A list item under a criteria heading; group 1 is the criterion text. */
+const LIST_ITEM_RE = new RegExp(`${LIST_MARKER_SOURCE}(.*)$`, "gm");
+
 function detectChecklistDoneWhen(
   text: string,
   issueDescription: string | null | undefined,
@@ -280,12 +306,13 @@ function detectChecklistDoneWhen(
   // A "checklist" is either:
   //  (a) A markdown table with N >= doneWhenBullets rows that include an
   //      explicit completion marker in any cell.
-  //  (b) A completed task-list with N >= doneWhenBullets `- [x]` lines.
+  //  (b) A completed task-list with N >= doneWhenBullets `[x]` lines, under
+  //      any list marker the criteria side also counts.
 
   const statusMarker = /✅|✓|✔|❌|✗|\[[xX]\]/;
 
   // (b) Task list count.
-  const taskListMatches = text.match(/^[-*]\s+\[[xX]\]/gm);
+  const taskListMatches = text.match(TASK_LIST_DONE_RE);
   if (taskListMatches && taskListMatches.length >= doneWhenBullets) return true;
 
   // (a) Markdown table — count rows that contain a status marker.
@@ -457,13 +484,16 @@ export function hasDoneWhenHeading(description: string): boolean {
  * sub-point of the criterion above it, not a criterion of its own, and
  * counting it would inflate the required evidence-row count.
  *
+ * The marker class is shared with the evidence task-list counter via
+ * `LIST_MARKER_SOURCE` — see that constant for why the two must not drift.
+ *
  * Keys are normalized bullet TEXT, so the caller's cross-section dedup is
  * blind to which marker was used — a criteria list cannot be double-counted
  * by restating it under a synonym heading with the other marker style.
  */
 function doneWhenBulletKeys(body: string): string[] {
   return Array.from(
-    body.matchAll(/^(?:[-*]|\d+[.)])\s+(.*)$/gm),
+    body.matchAll(LIST_ITEM_RE),
     (match, index) => {
       const normalized = (match[1] ?? "").trim().replace(/\s+/g, " ").toLowerCase();
       return normalized ? `text:${normalized}` : `empty:${index}`;

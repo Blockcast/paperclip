@@ -1098,6 +1098,88 @@ describe("evaluateEvidence — numbered acceptance criteria (BLO-34810)", () => 
   });
 });
 
+describe("evaluateEvidence — numbered task-list evidence (BLO-34810 review)", () => {
+  // The criteria-side widening alone left the OTHER half of the same
+  // comparison narrow: evidence written as `1. [x]` (valid GFM, renders as a
+  // checkbox) matched zero task-list lines against a now-correct criteria
+  // count, so the shape stayed unsatisfiable — and harder to diagnose,
+  // because the criteria count now looked right. Every other
+  // `evaluateEvidence` case here supplies a marker TABLE, which is exactly
+  // why the task-list path needs its own case.
+  const NUMBERED_CRITERIA = [
+    "## Acceptance criteria",
+    "1. cards drop the h-100 dead space",
+    "2. grid reflows at 390px",
+    "3. no visual regression at 1440px",
+  ].join("\n");
+
+  const numberedTaskList = (marker: string) =>
+    [
+      `${marker === "-" ? "-" : "1."} [x] h-100 dead space gone`,
+      `${marker === "-" ? "-" : "2."} [x] reflows at 390px`,
+      `${marker === "-" ? "-" : "3."} [x] no 1440px regression`,
+    ].join("\n");
+
+  it("clears checklist:done-when from a numbered `[x]` task list", () => {
+    const result = evaluateEvidence({
+      issue: { description: NUMBERED_CRITERIA, labels: [] },
+      comments: [agentComment(numberedTaskList("1."))],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    expect(result.verdict).toBe("pass");
+    expect(result.missing).toEqual([]);
+    expect(result.evidenceFound).toContain("checklist:done-when");
+  });
+
+  it("reads `1)` markers too", () => {
+    const result = evaluateEvidence({
+      issue: { description: NUMBERED_CRITERIA, labels: [] },
+      comments: [agentComment("1) [x] a\n2) [x] b\n3) [x] c")],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    expect(result.missing).toEqual([]);
+  });
+
+  it("is marker-blind: `-` and `1.` evidence produce the same verdict", () => {
+    const evaluate = (body: string) =>
+      evaluateEvidence({
+        issue: { description: NUMBERED_CRITERIA, labels: [] },
+        comments: [agentComment(body)],
+        workProducts: [],
+        registry: DEFAULT_EVIDENCE_REGISTRY,
+      });
+    expect(evaluate(numberedTaskList("1.")).missing).toEqual(
+      evaluate(numberedTaskList("-")).missing,
+    );
+  });
+
+  it("still warns when the task list is SHORTER than the criteria list", () => {
+    // Widening the marker must not widen the count comparison: two ticked
+    // items cannot discharge three criteria.
+    const result = evaluateEvidence({
+      issue: { description: NUMBERED_CRITERIA, labels: [] },
+      comments: [agentComment("1. [x] a\n2. [x] b")],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    expect(result.verdict).toBe("warn");
+    expect(result.missing).toEqual(["checklist:done-when"]);
+  });
+
+  it("does not accept an UNTICKED numbered list as evidence", () => {
+    // `[ ]` is a criterion restated, not a criterion met.
+    const result = evaluateEvidence({
+      issue: { description: NUMBERED_CRITERIA, labels: [] },
+      comments: [agentComment("1. [ ] a\n2. [ ] b\n3. [ ] c")],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+    });
+    expect(result.missing).toEqual(["checklist:done-when"]);
+  });
+});
+
 describe("evaluateEvidence — criteria heading synonyms (BLO-19047)", () => {
   // Regression for the exact BLO-18833 shape: a description written to the
   // company issue-creation policy (which mandates `## Acceptance criteria`)
