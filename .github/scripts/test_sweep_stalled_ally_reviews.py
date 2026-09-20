@@ -442,10 +442,16 @@ class TestSweepIsolation(unittest.TestCase):
     def setUp(self):
         self._real_fetch = sweep._fetch_paginated
         self._real_consider = sweep._consider_pr
+        self._real_refire = sweep._refire_pr
+        # The re-fire pass is a separate function now, so a test that stubs
+        # only _consider_pr would let a "would re-fire" verdict reach the
+        # real network. Stub it by default; tests about the write override it.
+        sweep._refire_pr = lambda *a, **k: None
 
     def tearDown(self):
         sweep._fetch_paginated = self._real_fetch
         sweep._consider_pr = self._real_consider
+        sweep._refire_pr = self._real_refire
 
     def _install_prs(self, prs):
         def fake_fetch(api_base_url, path, token):
@@ -897,11 +903,15 @@ class TestRefireBudget(unittest.TestCase):
     def setUp(self):
         self._real_fetch = sweep._fetch_paginated
         self._real_consider = sweep._consider_pr
+        self._real_refire = sweep._refire_pr
         self._real_max = sweep.MAX_REFIRES_PER_RUN
+        self.refired = []
+        sweep._refire_pr = lambda o, r, pr, h, p, t, u, n: self.refired.append(pr["number"])
 
     def tearDown(self):
         sweep._fetch_paginated = self._real_fetch
         sweep._consider_pr = self._real_consider
+        sweep._refire_pr = self._real_refire
         sweep.MAX_REFIRES_PER_RUN = self._real_max
 
     def _install_prs(self, prs):
@@ -910,25 +920,84 @@ class TestRefireBudget(unittest.TestCase):
 
         sweep._fetch_paginated = fake_fetch
 
+    def _eligible_at(self, ages):
+        """Stub _consider_pr so PR n is eligible with pending_since ages[n]."""
+        def fake_consider(o, r, pr, t, u, n):
+            return (pr, pr["head"]["sha"], ages[pr["number"]], True, "re-fired")
+
+        sweep._consider_pr = fake_consider
+
     def test_over_budget_prs_are_deferred_not_dropped(self):
         sweep.MAX_REFIRES_PER_RUN = 2
         self._install_prs([_pr(1), _pr(2), _pr(3), _pr(4)])
         seen = []
 
-        def fake_consider(o, r, pr, t, u, n, may_refire=True, dry_run=False):
-            seen.append((pr["number"], may_refire))
-            if not may_refire:
-                return (pr, pr["head"]["sha"], 100.0, False,
-                        "%s -- over budget" % sweep.DEFERRED_REASON_PREFIX)
+        def fake_consider(o, r, pr, t, u, n):
+            seen.append(pr["number"])
             return (pr, pr["head"]["sha"], 100.0, True, "re-fired")
 
         sweep._consider_pr = fake_consider
         results = sweep.sweep("o", "r", "tok", "https://api.github.com", now=0.0)
 
-        self.assertEqual([n for n, _ in seen], [1, 2, 3, 4], "every PR is still evaluated")
-        self.assertEqual([m for _, m in seen], [True, True, False, False])
+        self.assertEqual(seen, [1, 2, 3, 4], "every PR is still evaluated")
         self.assertEqual(len(results), 4, "deferred PRs stay in the accounting")
-        self.assertTrue(results[2][4].startswith(sweep.DEFERRED_REASON_PREFIX))
+        self.assertEqual(len(self.refired), 2, "the cap still bounds the writes")
+        deferred = [r for r in results if str(r[4]).startswith(sweep.DEFERRED_REASON_PREFIX)]
+        self.assertEqual(len(deferred), 2)
+
+    def test_budget_goes_to_the_longest_waiting_not_to_list_order(self):
+        """PEN-3394 regression.
+
+        `GET /pulls?state=open` returns NEWEST FIRST, and the budget used to
+        be spent while walking that list -- so the newest eligible PRs took
+        every slot and the oldest never got one. Measured on paperclip over
+        five consecutive runs: in every one, every re-fired PR number was
+        strictly greater than every deferred number. #1862 went 50h with no
+        re-fire while newer PRs were re-fired hourly.
+
+        List order here is newest-first (4, 3, 2, 1) while the waits run the
+        other way, so a regression to positional spending re-fires {4, 3}.
+        """
+        sweep.MAX_REFIRES_PER_RUN = 2
+        self._install_prs([_pr(4), _pr(3), _pr(2), _pr(1)])
+        self._eligible_at({1: 100.0, 2: 200.0, 3: 300.0, 4: 400.0})
+
+        results = sweep.sweep("o", "r", "tok", "https://api.github.com", now=0.0)
+
+        self.assertEqual(sorted(self.refired), [1, 2], "longest-waiting two win the budget")
+        self.assertEqual(
+            sorted(r[0]["number"] for r in results
+                   if str(r[4]).startswith(sweep.DEFERRED_REASON_PREFIX)),
+            [3, 4],
+        )
+        self.assertEqual(
+            [r[0]["number"] for r in results], [4, 3, 2, 1],
+            "the accounting still reports in list order, unsorted",
+        )
+
+    def test_a_failed_refire_does_not_strand_the_remaining_refires(self):
+        sweep.MAX_REFIRES_PER_RUN = 3
+        self._install_prs([_pr(1), _pr(2), _pr(3)])
+        self._eligible_at({1: 100.0, 2: 200.0, 3: 300.0})
+        attempted = []
+
+        def flaky_refire(o, r, pr, h, p, t, u, n):
+            attempted.append(pr["number"])
+            if pr["number"] == 2:
+                raise urllib.error.URLError("connection reset")
+
+        sweep._refire_pr = flaky_refire
+        results = sweep.sweep("o", "r", "tok", "https://api.github.com", now=0.0)
+
+        self.assertEqual(attempted, [1, 2, 3], "#3 is still attempted after #2 failed")
+        by_number = {r[0]["number"]: r for r in results}
+        self.assertTrue(by_number[1][3])
+        self.assertTrue(by_number[3][3])
+        self.assertFalse(by_number[2][3], "a failed write must not read as re-fired")
+        self.assertTrue(
+            str(by_number[2][4]).startswith(sweep.SWEEP_ERROR_REASON_PREFIX),
+            "and must not read as a clean skip either",
+        )
 
     def test_deferred_pr_still_carries_pending_since_so_it_can_alarm(self):
         """Rate-limiting a write must never suppress the alarm.
@@ -938,14 +1007,11 @@ class TestRefireBudget(unittest.TestCase):
         """
         sweep.MAX_REFIRES_PER_RUN = 0
         self._install_prs([_pr(1)])
+        self._eligible_at({1: 100.0})
 
-        def fake_consider(o, r, pr, t, u, n, may_refire=True, dry_run=False):
-            return (pr, pr["head"]["sha"], 100.0, False,
-                    "%s -- over budget" % sweep.DEFERRED_REASON_PREFIX)
-
-        sweep._consider_pr = fake_consider
         results = sweep.sweep("o", "r", "tok", "https://api.github.com", now=0.0)
 
+        self.assertTrue(str(results[0][4]).startswith(sweep.DEFERRED_REASON_PREFIX))
         self.assertIsNotNone(results[0][2])
         self.assertTrue(
             sweep.is_alarming({"is_draft": False, "pending_since": results[0][2]},

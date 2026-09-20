@@ -723,20 +723,21 @@ def too_young_to_be_stranded(pr_payload, now):
     return (now - created) < STALL_THRESHOLD_SECONDS
 
 
-def _consider_pr(owner, repo, pr, token, api_base_url, now, may_refire=True, dry_run=False):
-    """Evaluate one open PR and, if it is stranded, re-fire the request and
-    post the marker comment. Returns the result tuple for the accounting.
-    Network failures propagate to sweep(), which isolates them per-PR.
+def _consider_pr(owner, repo, pr, token, api_base_url, now):
+    """Evaluate one open PR and report whether it is stranded and eligible
+    for a re-ask. Returns the result tuple for the accounting. Network
+    failures propagate to sweep(), which isolates them per-PR.
 
-    `may_refire` False means the run's MAX_REFIRES_PER_RUN budget is spent.
-    The PR is still fully evaluated -- so it still counts toward `considered`
-    and can still ALARM -- but the two write calls are withheld and the
-    reason is marked deferred. Skipping evaluation instead would hide a
-    stranded PR behind a rate limit, which is the silent cap this must not be.
+    Issues NO writes, deliberately. Which of the eligible PRs actually get
+    the run's MAX_REFIRES_PER_RUN budget cannot be decided while walking the
+    list, because it depends on how every OTHER PR came out -- see the
+    ranking note in sweep(). Writing here is what made the budget
+    first-come-first-served over an order nobody chose.
 
-    `dry_run` reports the decision without issuing either write. The returned
-    re-fire flag stays True so the caller's accounting and budget match a live
-    run exactly; only the side effects are withheld.
+    Every PR is still fully evaluated whether or not it will win a slot, so
+    a PR that loses one still counts toward `considered` and can still ALARM.
+    Skipping evaluation instead would hide a stranded PR behind the cap,
+    which is the silent cap this must not be.
     """
     number = pr["number"]
     is_draft = bool(pr.get("draft"))
@@ -806,30 +807,28 @@ def _consider_pr(owner, repo, pr, token, api_base_url, now, may_refire=True, dry
         "existing_marker_epochs": marker_epochs,
     }
     refire, reason = should_refire(decision_input, now)
-    if refire and not may_refire:
-        return (
-            pr,
-            head_sha,
-            pending_since,
-            False,
-            "%s -- %s, over MAX_REFIRES_PER_RUN=%d this run" % (DEFERRED_REASON_PREFIX, reason, MAX_REFIRES_PER_RUN),
-        )
-    if refire and dry_run:
-        return (pr, head_sha, pending_since, True, "DRY-RUN would re-fire -- %s" % reason)
-    if refire:
-        requested = request_review(owner, repo, number, token, api_base_url)
-        body = build_comment_body(
-            number, head_sha, now - pending_since,
-            requested_login=ALLY_REQUEST_REVIEWER_LOGIN if requested else None,
-            mode=PREDICATE_MODE,
-        )
-        _request(
-            "%s/repos/%s/%s/issues/%d/comments" % (api_base_url.rstrip("/"), owner, repo, number),
-            token,
-            method="POST",
-            payload={"body": body},
-        )
     return (pr, head_sha, pending_since, refire, reason)
+
+
+def _refire_pr(owner, repo, pr, head_sha, pending_since, token, api_base_url, now):
+    """Issue the two writes for one stranded PR: the native reviewer
+    re-request and the marker comment. Split out of _consider_pr so the
+    decision pass can rank every eligible PR before any of them is written
+    (see sweep()). Exceptions propagate to the caller, which isolates them
+    per-PR exactly as the decision pass does.
+    """
+    requested = request_review(owner, repo, pr["number"], token, api_base_url)
+    body = build_comment_body(
+        pr["number"], head_sha, now - pending_since,
+        requested_login=ALLY_REQUEST_REVIEWER_LOGIN if requested else None,
+        mode=PREDICATE_MODE,
+    )
+    _request(
+        "%s/repos/%s/%s/issues/%d/comments" % (api_base_url.rstrip("/"), owner, repo, pr["number"]),
+        token,
+        method="POST",
+        payload={"body": body},
+    )
 
 
 def sweep(owner, repo, token, api_base_url, now=None, dry_run=False):
@@ -837,11 +836,45 @@ def sweep(owner, repo, token, api_base_url, now=None, dry_run=False):
     for every non-draft open PR considered, in list order, so the caller can
     print a full accounting -- not just the ones actioned (no silent caps).
 
-    Each PR is evaluated in isolation. A failure against one PR must never
-    strand the others: this sweep *is* the reconciler for stranded PRs, so
-    letting a single transient error abort the loop would reinstate exactly
-    the defect it exists to clear (BLO-22892) -- and silently, since the
-    remaining PRs would simply never be considered.
+    Two passes, and the split is load-bearing rather than tidiness (PEN-3394):
+
+      1. DECIDE every PR. No writes.
+      2. Spend MAX_REFIRES_PER_RUN on the LONGEST-WAITING eligible PRs.
+
+    This used to be one pass that wrote as it walked, which handed the budget
+    to whatever order the API returned -- and `GET /pulls?state=open` returns
+    NEWEST FIRST. (That ordering is already noted in main()'s degraded-run
+    summary below; it was reasoned about for the dropped-reads path and not
+    for this one.) With more eligible PRs per run than slots, the budget was
+    therefore always spent on the newest and the oldest never got a slot at
+    all. Measured on this repo 2026-09-20 over five consecutive runs: in every
+    one, every re-fired PR number was strictly greater than every deferred
+    number -- a deterministic rank cut, not a distribution. #1862 went 50h
+    with no re-fire while newer PRs were re-fired hourly, and the deferred
+    summary below was telling operators they "will be picked up on the next
+    scheduled run" when structurally they would not be.
+
+    Ranking by `pending_since` ascending -- longest wait first -- is what
+    makes the cap fair rather than positional. Note the cap alone does NOT
+    starve anyone: REFIRE_COOLDOWN_SECONDS takes a PR out of eligibility for
+    2h as soon as it is served, so a stable candidate set rotates through the
+    budget on its own. Newest-first defeated that only because new PRs keep
+    arriving and keep refilling the front of the list. Ordering by wait also
+    avoids the mirror-image bug that plain oldest-PR-first would introduce: a
+    brand-new PR whose `pull_request.opened` wake was LOST -- precisely what
+    this reconciler exists to backstop -- would sit behind the entire old
+    cohort. Wait-time ordering serves it on the same terms as everyone else.
+
+    Pass 1 costs no extra API calls: every PR was already fully evaluated
+    before this change (that is why over-budget PRs could still ALARM), so
+    only the *timing* of the two writes moves.
+
+    Each PR is evaluated in isolation, and so is each write. A failure
+    against one PR must never strand the others: this sweep *is* the
+    reconciler for stranded PRs, so letting a single transient error abort
+    the loop would reinstate exactly the defect it exists to clear
+    (BLO-22892) -- and silently, since the remaining PRs would simply never
+    be considered.
 
     `dry_run` evaluates every PR and reports what it WOULD do without issuing
     either write (the reviewer re-request or the marker comment). It exists so
@@ -851,7 +884,6 @@ def sweep(owner, repo, token, api_base_url, now=None, dry_run=False):
     now = now if now is not None else time.time()
     prs = _fetch_paginated(api_base_url, "/repos/%s/%s/pulls?state=open" % (owner, repo), token)
     results = []
-    refires_left = MAX_REFIRES_PER_RUN
     for index, pr in enumerate(prs):
         head_sha = pr.get("head", {}).get("sha", "")
         if pr.get("locked"):
@@ -864,25 +896,15 @@ def sweep(owner, repo, token, api_base_url, now=None, dry_run=False):
             results.append((pr, head_sha, None, False, "skip: conversation locked"))
             continue
         try:
-            outcome = _consider_pr(
-                owner, repo, pr, token, api_base_url, now,
-                may_refire=(refires_left > 0),
-                dry_run=dry_run,
-            )
-            if outcome[3]:
-                # True in a dry run means "would have re-fired". Decrementing
-                # on that too is what makes the dry run's plan match what a
-                # live run would really do, cap included.
-                refires_left -= 1
-            results.append(outcome)
+            results.append(_consider_pr(owner, repo, pr, token, api_base_url, now))
         except RateLimitExhausted as error:
             # Not isolated per-PR like the errors below: the budget is spent,
             # so every remaining PR would raise the identical error. Grinding
             # through them would deepen the exhaustion, hide the real cause
             # behind N indistinguishable per-PR failures, and delay the run's
-            # end for no information. Abort, but keep the partial results and
-            # record the unevaluated remainder as failures -- they feed
-            # sweep_is_degraded, so this run exits non-zero rather than
+            # end for no information. Abort the READS, but keep the partial
+            # results and record the unevaluated remainder as failures -- they
+            # feed sweep_is_degraded, so this run exits non-zero rather than
             # reporting `alarming=0` off a list it never finished reading.
             print("rate limit exhausted at PR #%d: %s" % (pr.get("number", -1), error), file=sys.stderr)
             for unevaluated in prs[index:]:
@@ -893,7 +915,14 @@ def sweep(owner, repo, token, api_base_url, now=None, dry_run=False):
                     False,
                     "%s -- %s" % (SWEEP_ERROR_REASON_PREFIX, RATE_LIMIT_TOKEN),
                 ))
-            return results
+            # Fall through to the re-fire pass rather than returning. Under
+            # the old single pass, PRs walked before exhaustion had ALREADY
+            # been written; returning here would make an exhausted run issue
+            # zero re-fires, which is a regression -- the re-asks are the
+            # point of the job and the reads only serve them. The writes are
+            # attempted and may themselves hit the limit, which lands in the
+            # per-write isolation below.
+            break
         except Exception as error:  # noqa: BLE001 -- deliberate per-PR isolation
             print(
                 "PR #%d: sweep failed (%s: %s) -- continuing with the remaining PRs"
@@ -901,6 +930,54 @@ def sweep(owner, repo, token, api_base_url, now=None, dry_run=False):
                 file=sys.stderr,
             )
             results.append((pr, head_sha, None, False, "%s -- %s" % (SWEEP_ERROR_REASON_PREFIX, type(error).__name__)))
+
+    # --- Pass 2: spend the budget, longest wait first. ---------------------
+    #
+    # `refire` True implies `pending_since` is not None (should_refire returns
+    # False for None before it can reach the eligible branch), so the sort key
+    # is always a real epoch. Ties keep list order, which is stable and
+    # arbitrary -- two PRs stalled in the same second have no fairness claim
+    # against each other.
+    eligible = sorted(
+        (i for i, outcome in enumerate(results) if outcome[3]),
+        key=lambda i: results[i][2],
+    )
+    for rank, i in enumerate(eligible):
+        pr, head_sha, pending_since, _refire, reason = results[i]
+        if rank >= MAX_REFIRES_PER_RUN:
+            # Withheld for rate-limiting, not because nothing is wrong. The
+            # PR keeps its `pending_since`, so it still counts toward
+            # `considered` and can still ALARM -- rate-limiting a write must
+            # never suppress the alarm.
+            results[i] = (
+                pr, head_sha, pending_since, False,
+                "%s -- %s, over MAX_REFIRES_PER_RUN=%d this run"
+                % (DEFERRED_REASON_PREFIX, reason, MAX_REFIRES_PER_RUN),
+            )
+            continue
+        if dry_run:
+            # The flag stays True so the dry run's accounting and budget match
+            # a live run exactly; only the side effects are withheld.
+            results[i] = (pr, head_sha, pending_since, True, "DRY-RUN would re-fire -- %s" % reason)
+            continue
+        try:
+            _refire_pr(owner, repo, pr, head_sha, pending_since, token, api_base_url, now)
+        except Exception as error:  # noqa: BLE001 -- isolation, as in the decision pass
+            # A failed write must not strand the remaining re-fires, and must
+            # not read as a clean skip. RateLimitExhausted is not special-cased
+            # here: unlike the read pass there is no per-PR read left to grind
+            # through, the remaining writes are few (<= MAX_REFIRES_PER_RUN),
+            # and each is the job's actual product -- so attempt them and let
+            # each record its own failure.
+            print(
+                "PR #%d: re-fire failed (%s: %s) -- continuing with the remaining re-fires"
+                % (pr.get("number", -1), type(error).__name__, error),
+                file=sys.stderr,
+            )
+            results[i] = (
+                pr, head_sha, pending_since, False,
+                "%s -- %s" % (SWEEP_ERROR_REASON_PREFIX, type(error).__name__),
+            )
     return results
 
 
@@ -992,10 +1069,19 @@ def main(argv=None):
                 # Over-budget PRs are real stranded work withheld only for
                 # rate-limiting. Naming them keeps MAX_REFIRES_PER_RUN from
                 # reading as "nothing else was wrong".
+                #
+                # "next scheduled run" is a claim, so it has to be earned:
+                # it holds because the budget now goes to the longest wait
+                # (see sweep()) and REFIRE_COOLDOWN_SECONDS drops each PR
+                # just served out of eligibility for 2h, so the set rotates.
+                # Before PEN-3394 this line was simply false -- spending was
+                # positional over a newest-first list, so a deferred PR could
+                # be deferred indefinitely, and one was for 50h.
                 handle.write(
                     "\n### %d PR(s) eligible but deferred past MAX_REFIRES_PER_RUN=%d "
-                    "(they will be picked up on the next scheduled run)\n\n"
-                    % (len(deferred), MAX_REFIRES_PER_RUN)
+                    "(they waited less than the %d re-fired above, and rank first as "
+                    "those go on cooldown)\n\n"
+                    % (len(deferred), MAX_REFIRES_PER_RUN, len(refired))
                 )
                 handle.write("| PR | head | reason |\n|---|---|---|\n")
                 for pr, head_sha, _pending_since, _refire, reason in deferred:
