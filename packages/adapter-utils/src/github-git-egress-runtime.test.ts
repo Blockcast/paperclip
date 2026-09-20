@@ -1,7 +1,7 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -13,6 +13,8 @@ import {
   gitBinary,
   hooksDirectory,
   makeGitReader,
+  readStdin,
+  type HookStdin,
   runGitEgressRuntime,
   runPrePushHook,
 } from "./github-git-egress-runtime.js";
@@ -32,6 +34,17 @@ const PRESENT = { hooksDir: HOOKS, hookPresent: () => true };
 
 /** Real git, or null when this environment has none to drive. */
 const GIT = spawnSync("git", ["--version"], { encoding: "utf8" }).status === 0 ? "git" : null;
+
+/**
+ * The spawned-entrypoint tests need git at DEFAULT_GIT_BINARY specifically, not
+ * merely on PATH: the hook's own reader hardcodes that path, because the
+ * `PAPERCLIP_GIT_EGRESS_GIT` override was removed as an escape hatch (see
+ * `hooksDirectory`). Checking PATH instead would let those tests run with a git
+ * the hook cannot reach, and a scan that cannot read git refuses — which would
+ * look like the regression passing.
+ */
+const SPAWNED_GIT =
+  spawnSync(DEFAULT_GIT_BINARY, ["--version"], { encoding: "utf8" }).status === 0;
 
 describe("buildGitArgv", () => {
   it("points a push at the hooks directory that holds the guard", () => {
@@ -715,5 +728,203 @@ describe.skipIf(!GIT)("content leg against a real repository", () => {
     });
     expect(errors.join("\n")).toBe("");
     expect(code).toBe(0);
+  });
+});
+
+describe("readStdin", () => {
+  /**
+   * A stand-in for the pipe git supplies, typed as `HookStdin` so the test
+   * exercises the same overloads production does rather than an `any` cast.
+   */
+  function fakePipe(): {
+    stream: HookStdin;
+    emitData: (chunk: string) => void;
+    emitEnd: () => void;
+  } {
+    const data: ((chunk: string) => void)[] = [];
+    const end: (() => void)[] = [];
+    const stream: HookStdin = {
+      isTTY: false,
+      setEncoding() {},
+      on(event: "data" | "end" | "error", listener: unknown) {
+        if (event === "data") data.push(listener as (chunk: string) => void);
+        if (event === "end") end.push(listener as () => void);
+        return stream;
+      },
+    };
+    return {
+      stream,
+      emitData: (chunk) => data.forEach((listener) => listener(chunk)),
+      emitEnd: () => end.forEach((listener) => listener()),
+    };
+  }
+
+  // The hook's stdin is the only description it gets of what the push
+  // publishes. "Could not read it" and "git said there is nothing to push" must
+  // not be the same value, because the second is a legitimate pass.
+  it("refuses a TTY rather than reporting an empty ref list", async () => {
+    // Resolving "" here was a fail-open one layer above `runPrePushHook`:
+    // `parsePrePushInput("")` yields zero updates, which is a pass.
+    const tty: HookStdin = { isTTY: true, setEncoding() {}, on: () => tty };
+    await expect(readStdin(tty)).rejects.toThrow(/TTY/);
+  });
+
+  it("still reads a piped ref-update list", async () => {
+    // The control for the test above: the refusal must be scoped to a TTY and
+    // must not break the pipe git actually supplies.
+    const pipe = fakePipe();
+    const read = readStdin(pipe.stream);
+    pipe.emitData("refs/heads/m a refs/heads/m b\n");
+    pipe.emitEnd();
+    await expect(read).resolves.toBe("refs/heads/m a refs/heads/m b\n");
+  });
+
+  it("reads an EMPTY pipe as an empty ref list, which is a pass", async () => {
+    // Git runs the pre-push hook with zero bytes on the pipe for an
+    // "Everything up-to-date" push — measured against git 2.47.3. Refusing that
+    // would fail every no-op push, so the TTY refusal above must not widen into
+    // "empty stdin refuses".
+    const pipe = fakePipe();
+    const read = readStdin(pipe.stream);
+    pipe.emitEnd();
+    await expect(read).resolves.toBe("");
+    expect(await runPrePushHook({ input: "", runGit: () => null })).toBe(0);
+  });
+});
+
+describe.skipIf(!SPAWNED_GIT)("pre-push hook bootstrap, spawned as git spawns it", () => {
+  // `runPrePushHook` is covered directly above, but nothing drove the module as
+  // an ENTRYPOINT, and that is where the fail-open was: the bootstrap decided
+  // whether to run at all by comparing `process.argv[1]` against
+  // `import.meta.url`. Those differ whenever the package is reached through a
+  // symlink, and a bootstrap that does not run exits 0 — which git reads as a
+  // hook that passed. Everything below the bootstrap was already fail-closed;
+  // the bootstrap was not.
+  //
+  // These tests spawn the compiled entrypoint the way the seeded hook does, so
+  // a regression shows up as a push that is allowed rather than as a unit that
+  // returns the wrong number.
+
+  let built: string;
+  let linked: string;
+
+  beforeAll(async () => {
+    // Compile rather than run the TypeScript directly: Node's strip-only mode
+    // rejects this module's parameter property. `transpileModule` skips type
+    // checking, which keeps the test independent of whether `@types/node` is
+    // installed in the sandbox.
+    const ts = (await import("typescript")).default;
+    const out = mkdtempSync(path.join(tmpdir(), "git-egress-boot-"));
+    for (const name of [
+      "github-egress-scrub",
+      "github-git-egress-shim",
+      "github-git-egress-runtime",
+    ]) {
+      const source = readFileSync(path.join(import.meta.dirname, `${name}.ts`), "utf8");
+      const js = ts.transpileModule(source, {
+        compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+      }).outputText;
+      writeFileSync(path.join(out, `${name}.js`), js);
+    }
+    built = path.join(out, "github-git-egress-runtime.js");
+
+    // The shape the finding names: the package directory is a symlink, as it is
+    // under a pnpm store layout or workspace hoisting. `argv[1]` is then the
+    // link path while `import.meta.url` is the realpath.
+    const linkRoot = mkdtempSync(path.join(tmpdir(), "git-egress-link-"));
+    symlinkSync(out, path.join(linkRoot, "adapter-utils"));
+    linked = path.join(linkRoot, "adapter-utils", "github-git-egress-runtime.js");
+  });
+
+  /**
+   * Spawn the entrypoint exactly as the seeded `pre-push` hook does.
+   *
+   * `cwd` is load-bearing, not incidental: git runs the hook inside the
+   * repository being pushed, and the hook's reader inherits that directory.
+   * Spawning from the test runner's cwd instead made every scan fail to read
+   * the commit — and a failed scan ALSO refuses, with a message that also
+   * begins "refusing to publish". The refusal assertions below therefore pin
+   * the detection wording specifically, or they would pass without the
+   * scanner ever having looked at the commit.
+   */
+  function hook(
+    entrypoint: string,
+    input: string,
+    cwd: string,
+  ): { status: number | null; stderr: string } {
+    const result = spawnSync(process.execPath, [entrypoint, "--pre-push-hook", "origin", "url"], {
+      input,
+      cwd,
+      encoding: "utf8",
+    });
+    return { status: result.status, stderr: result.stderr };
+  }
+
+  /** A commit carrying credential-shaped material, and the hook stdin for it. */
+  function dirtyPush(): { repo: string; input: string } {
+    const repo = mkdtempSync(path.join(tmpdir(), "git-egress-boot-repo-"));
+    execFileSync("git", ["init", "-q", repo]);
+    execFileSync("git", ["-C", repo, "config", "user.email", "t@example.invalid"]);
+    execFileSync("git", ["-C", repo, "config", "user.name", "T"]);
+    // Derived, not a literal: an embedded token would trip the repository's own
+    // secret scan, which reads the commit range rather than the worktree.
+    writeFileSync(path.join(repo, "config.txt"), `key = ghp_${"A".repeat(24)}\n`);
+    execFileSync("git", ["-C", repo, "add", "-A"]);
+    execFileSync("git", ["-C", repo, "commit", "-qm", "add config"]);
+    const head = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+    return {
+      repo,
+      input: `refs/heads/topic ${head} refs/heads/topic ${"0".repeat(40)}\n`,
+    };
+  }
+
+  /**
+   * The detection wording, distinct from the scan-failure wording. Asserting
+   * this is what makes these tests non-vacuous.
+   */
+  const DETECTED = "credential-shaped material found";
+
+  it("refuses credential-bearing input when run from the real path", () => {
+    // The positive control. Without it, the symlink assertion below could pass
+    // because the scanner refuses everything, or because the fixture is wrong.
+    const { repo, input } = dirtyPush();
+    const { status, stderr } = hook(built, input, repo);
+    expect(status).not.toBe(0);
+    expect(stderr).toContain(DETECTED);
+    expect(stderr).not.toContain("could not be completed");
+  });
+
+  it("refuses the same input when the package is reached through a symlink", () => {
+    // The regression. Before the fix this exited 0 with EMPTY stderr, and a
+    // real `git push` through it landed the commit on the remote.
+    const { repo, input } = dirtyPush();
+    const { status, stderr } = hook(linked, input, repo);
+    expect(status).not.toBe(0);
+    expect(stderr).toContain(DETECTED);
+    expect(stderr).not.toContain("could not be completed");
+  });
+
+  it("does not refuse a clean push through the symlinked path", () => {
+    // Entering the hook on argv alone must not turn the bootstrap into a
+    // blanket refusal: the common case still has to push.
+    const repo = mkdtempSync(path.join(tmpdir(), "git-egress-boot-clean-"));
+    execFileSync("git", ["init", "-q", repo]);
+    execFileSync("git", ["-C", repo, "config", "user.email", "t@example.invalid"]);
+    execFileSync("git", ["-C", repo, "config", "user.name", "T"]);
+    writeFileSync(path.join(repo, "readme.md"), "Hello, world.\n");
+    execFileSync("git", ["-C", repo, "add", "-A"]);
+    execFileSync("git", ["-C", repo, "commit", "-qm", "clean"]);
+    const head = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+    const { status, stderr } = hook(
+      linked,
+      `refs/heads/topic ${head} refs/heads/topic ${"0".repeat(40)}\n`,
+      repo,
+    );
+    expect(stderr).toBe("");
+    expect(status).toBe(0);
   });
 });

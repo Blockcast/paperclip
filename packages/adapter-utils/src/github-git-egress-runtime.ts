@@ -72,7 +72,7 @@
 // limits are written down and tracked.
 
 import { spawn, spawnSync } from "node:child_process";
-import { accessSync, constants } from "node:fs";
+import { accessSync, constants, realpathSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -329,18 +329,48 @@ export function makeGitReader(gitPath: string, cwd?: string): GitReader {
   };
 }
 
-function readStdin(): Promise<string> {
+/**
+ * The part of `process.stdin` the hook reads, narrowed so a test can supply a
+ * stand-in. `isTTY` is the field the refusal in {@link readStdin} turns on.
+ */
+export interface HookStdin {
+  isTTY?: boolean;
+  setEncoding(encoding: "utf8"): unknown;
+  on(event: "data", listener: (chunk: string) => void): unknown;
+  on(event: "end", listener: () => void): unknown;
+  on(event: "error", listener: (error: unknown) => void): unknown;
+}
+
+/**
+ * Read the ref-update list git pipes to the pre-push hook.
+ *
+ * Takes the stream so the refusal below is reachable from a test without
+ * allocating a pty; production passes `process.stdin`.
+ */
+export function readStdin(stream: HookStdin = process.stdin): Promise<string> {
   return new Promise((resolve, reject) => {
     let buffer = "";
-    if (process.stdin.isTTY) {
-      resolve("");
+    // A TTY on stdin means git did not invoke this. Git always hands the
+    // pre-push hook a pipe — measured against git 2.47.3, `isTTY` is false and
+    // fd 0 is a FIFO on both a real push and an "Everything up-to-date" one.
+    //
+    // Resolving "" here was the fail-open: it is indistinguishable from the
+    // empty ref list git legitimately sends for a no-op push, so
+    // `runPrePushHook` returned 0 and the caller read "scanned and clean" from
+    // a run that never had input to scan. Refuse instead — the guard cannot see
+    // its input, and an unread ref update is an unscanned ref update.
+    //
+    // Note this rejects rather than waiting for `end`: a TTY never ends, so
+    // waiting would hang the push instead of refusing it.
+    if (stream.isTTY) {
+      reject(new Error("pre-push hook stdin is a TTY; expected the ref-update pipe git supplies"));
       return;
     }
-    process.stdin.setEncoding("utf8");
-    process.stdin.on("data", (chunk) => {
+    stream.setEncoding("utf8");
+    stream.on("data", (chunk) => {
       buffer += chunk;
     });
-    process.stdin.on("end", () => resolve(buffer));
+    stream.on("end", () => resolve(buffer));
     // Reject rather than resolving the partial buffer. A truncation that lands
     // mid-line throws in `parsePrePushInput` and refuses, but one landing
     // exactly on a newline yields a SHORTER, well-formed update list — and
@@ -349,7 +379,7 @@ function readStdin(): Promise<string> {
     // reaches `reportRuntimeError`, which sets a non-zero exit code, so the
     // push aborts: an unread ref update is an unscanned ref update, exactly as
     // an unreadable commit is an unscanned commit.
-    process.stdin.on("error", reject);
+    stream.on("error", reject);
   });
 }
 
@@ -378,6 +408,15 @@ export async function runPrePushHook(options: {
     // push publishes, so a throw from it must refuse like any other unknown
     // verdict rather than escaping the guard's own error path.
     const updates = parsePrePushInput(options.input);
+    // An empty update list is a PASS, and must stay one. Git runs the pre-push
+    // hook with genuinely empty stdin on an "Everything up-to-date" push —
+    // measured against git 2.47.3, hook invoked, zero bytes on the pipe — so
+    // refusing here would fail every no-op push.
+    //
+    // What makes that safe is that the one way to arrive here WITHOUT git
+    // having said "nothing to push" is now closed upstream: `readStdin` refuses
+    // a TTY rather than resolving "", so "git sent an empty list" and "this was
+    // never invoked by git" are no longer the same value.
     if (updates.length === 0) return 0;
     findings = scanPrePushUpdates(updates, options.runGit);
   } catch (error) {
@@ -477,28 +516,78 @@ function reportRuntimeError(error: unknown): void {
   process.exitCode = exitCode;
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  if (process.argv[2] === "--pre-push-hook") {
-    void readStdin()
-      .then((input) =>
-        runPrePushHook({ input, runGit: makeGitReader(gitBinary()) }),
-      )
+/**
+ * Is this module the process entrypoint?
+ *
+ * Tolerates a symlinked install. `process.argv[1]` is the literal path the
+ * caller named; `import.meta.url` is what Node resolved, which is the REALPATH
+ * unless `--preserve-symlinks` is set. A plain string compare of the two is
+ * false whenever any parent directory is a link — measured on Node 24.16: with
+ * the package reached through a symlinked directory, `path.resolve(argv[1])`
+ * and `fileURLToPath(import.meta.url)` differ, and `realpathSync` agrees again.
+ *
+ * This is used ONLY for the wrapper leg. The hook leg must not depend on it —
+ * see the entry block below for why.
+ */
+function invokedAsEntrypoint(): boolean {
+  const argv1 = process.argv[1];
+  if (!argv1) return false;
+  const here = fileURLToPath(import.meta.url);
+  if (path.resolve(argv1) === here) return true;
+  try {
+    return realpathSync(argv1) === realpathSync(here);
+  } catch {
+    // An unresolvable argv[1] is not this module. The hook leg does not reach
+    // here, so returning false cannot open the publish boundary.
+    return false;
+  }
+}
+
+// Hook mode is selected by argv ALONE, deliberately, and not by
+// `invokedAsEntrypoint()`.
+//
+// The entrypoint guard is the standard idiom, and it is copied from
+// `github-cli-egress-runtime.ts` and `github-mcp-egress-runtime.ts` where it is
+// safe. It is NOT safe here, and the failure direction is inverted: for `gh` and
+// `github-mcp-server` a bootstrap that does not run is a command that produces
+// no output, which is loud. For a pre-push hook it is a silent exit 0, and git
+// reads exit 0 as "hook passed" — the one thing `prePushHookPresent` documents
+// that this door cannot tolerate, reinstated one layer up.
+//
+// Measured end to end: with the package reached through a symlinked directory,
+// a push carrying a credential-shaped literal exited 0 with no output and
+// landed the commit on the remote, while the identical push through the
+// unlinked path was refused and landed nothing. Causes that make the two paths
+// diverge are ordinary, not exotic — pnpm's store layout, workspace hoisting,
+// or a bundler emitting a re-export shim.
+//
+// `realpathSync` alone would not be enough: it repairs a symlink, but a
+// re-export shim is a DIFFERENT FILE, so no amount of path canonicalisation
+// makes the comparison true. The only form that fails closed is to take argv as
+// the contract — `--pre-push-hook` is a private spelling nothing but the seeded
+// hook passes — and keep path resolution out of the decision entirely.
+const invokedAsPrePushHook = process.argv[2] === "--pre-push-hook";
+
+if (invokedAsPrePushHook) {
+  void readStdin()
+    .then((input) =>
+      runPrePushHook({ input, runGit: makeGitReader(gitBinary()) }),
+    )
+    .then((exitCode) => {
+      process.exitCode = exitCode;
+    })
+    .catch(reportRuntimeError);
+} else if (invokedAsEntrypoint()) {
+  const target = process.argv[2];
+  const argv = process.argv.slice(3);
+  try {
+    if (!target) throw new GitEgressRuntimeError("missing git target");
+    void runGitEgressRuntime({ target, argv, hooksDir: hooksDirectory() })
       .then((exitCode) => {
         process.exitCode = exitCode;
       })
       .catch(reportRuntimeError);
-  } else {
-    const target = process.argv[2];
-    const argv = process.argv.slice(3);
-    try {
-      if (!target) throw new GitEgressRuntimeError("missing git target");
-      void runGitEgressRuntime({ target, argv, hooksDir: hooksDirectory() })
-        .then((exitCode) => {
-          process.exitCode = exitCode;
-        })
-        .catch(reportRuntimeError);
-    } catch (error) {
-      reportRuntimeError(error);
-    }
+  } catch (error) {
+    reportRuntimeError(error);
   }
 }

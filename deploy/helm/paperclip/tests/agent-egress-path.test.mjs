@@ -326,6 +326,42 @@ test("the seed installs a pre-push hook for the guard to run", () => {
   assert.match(rendered, /--pre-push-hook/, "the seeded hook does not invoke the guard");
 });
 
+test("the seeded hooks directory is the one the runtime actually looks in", () => {
+  // The assertions above match `--pre-push-hook` and `paperclip-git-hooks` as
+  // strings, which catches deletion but not DIVERGENCE — and divergence is the
+  // failure this seam actually has. The runtime hardcodes DEFAULT_HOOKS_DIR
+  // (`/paperclip/...`) while the seed writes to `${BASE}/...` from
+  // persistence.mountPath. They are equal in every values file today, so a
+  // deployment that relocated the PVC would point core.hooksPath at a directory
+  // holding no hook. `prePushHookPresent` exists to turn that into a refusal
+  // rather than a silent unscanned push; this turns it into a failing test
+  // instead, which is cheaper than discovering it in production.
+  const rendered = render("templates/statefulset.yaml", {});
+
+  const base = rendered.match(/^\s*BASE=(?:"([^"]*)"|'([^']*)'|(\S+))\s*$/m);
+  assert.ok(base, "could not find BASE in the rendered seed script");
+  const baseValue = base[1] ?? base[2] ?? base[3];
+
+  const hooks = rendered.match(/GIT_HOOKS_DIR="\$\{BASE\}([^"]*)"/);
+  assert.ok(hooks, "could not find GIT_HOOKS_DIR in the rendered seed script");
+  const seeded = `${baseValue}${hooks[1]}`;
+
+  // Read the constant from source rather than restating it: a test that
+  // hardcodes both sides of an equality cannot observe either one moving.
+  const runtimeSource = fs.readFileSync(
+    path.join(repoRoot, "packages/adapter-utils/src/github-git-egress-runtime.ts"),
+    "utf8",
+  );
+  const declared = runtimeSource.match(/DEFAULT_HOOKS_DIR\s*=\s*"([^"]+)"/);
+  assert.ok(declared, "could not read DEFAULT_HOOKS_DIR from the runtime source");
+
+  assert.equal(
+    seeded,
+    declared[1],
+    "the seed writes the pre-push hook somewhere the runtime will not look",
+  );
+});
+
 // --- Fail closed on overrides that would take the scrubber off the path ----
 
 test("a PATH entry in env.extra is rejected rather than silently overriding the chart", () => {

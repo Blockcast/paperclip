@@ -30,6 +30,22 @@ import {
  * and the push would sail past the guard, so this list is the guard's integrity
  * rather than a parsing nicety. The `--opt=value` spelling is self-contained and
  * is handled separately.
+ *
+ * ONE KNOWN MISMATCH WITH GIT, and it is safe in the one direction that
+ * matters. `--exec-path` takes a value only in its `=` form: bare
+ * `--exec-path` PRINTS the exec path and exits without consuming the next
+ * token. So for `git --exec-path push origin main` this scan skips `push` as a
+ * value and classifies `origin` as the subcommand — not a push, no hook
+ * injected. That costs nothing, because git does not push on that invocation
+ * either: measured against git 2.47.3, it printed `/usr/lib/git-core`, exited
+ * 0, and left the remote with no refs. An invocation that publishes nothing
+ * cannot be a hole.
+ *
+ * Do not read the rest of this set as an exact model of git's parser on the
+ * strength of that one. The property the set needs is narrower: over-skipping
+ * is safe only while the over-skipped invocation publishes nothing, and
+ * UNDER-skipping is what opens a hole. Anything added here should be checked
+ * against git for which of the two it can do.
  */
 const VALUE_TAKING_GLOBAL_OPTIONS: ReadonlySet<string> = new Set([
   "-C",
