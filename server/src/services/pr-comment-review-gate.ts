@@ -38,11 +38,39 @@ import {
 
 const DEFAULT_PR_REVIEWER_BOT_LOGIN = "allyblockcast[bot]";
 
-// Characters of the unrecognized-verb list a carried-finding reason may spend.
-// Sized so the message stays inside GitHub's 140-character commit-status cap
-// with the head and the explanatory phrase intact, since those are what make
-// the red actionable.
-const UNRECOGNIZED_VERB_BUDGET = 48;
+/**
+ * Join quoted verbs into at most `budget` characters, cutting BETWEEN entries.
+ *
+ * Slicing the joined string cuts inside a verb and drops its closing quote, so
+ * the author reads a name that is not the one in their ledger — the same
+ * hazard `commentReviewGateRetirementDescription` refuses for the context
+ * name. Whatever did not fit is marked, because an author who fixes only the
+ * verbs shown would re-push into this same red, which is the loop the carried
+ * tail exists to close.
+ *
+ * There is no separate standalone budget: the caller's cap is always the
+ * tighter one (the lead is 63-64 characters and the shortest tail is 38, so
+ * the most this can ever be handed is 39), and a second constant that never
+ * binds reads as load-bearing while doing nothing.
+ */
+function fitQuotedVerbs(quoted: string[], budget: number): string {
+  const whole = quoted.join(", ");
+  if (whole.length <= budget) return whole;
+  const kept: string[] = [];
+  let used = 0;
+  for (const entry of quoted) {
+    // +3 keeps room for the ", …" that marks the entries left out.
+    const cost = (kept.length ? 2 : 0) + entry.length;
+    if (used + cost + 3 > budget) break;
+    kept.push(entry);
+    used += cost;
+  }
+  if (kept.length) return `${kept.join(", ")}, …`;
+  // Not even the first verb fits whole. Elide inside its quotes so it still
+  // reads as truncated and keeps its closing quote, rather than rendering the
+  // lead with no verb at all.
+  return budget >= 3 ? `${quoted[0].slice(0, budget - 2)}…"` : "";
+}
 
 export interface CommentReviewGateComment {
   authorLogin: string | null | undefined;
@@ -460,12 +488,12 @@ export function evaluateCommentReviewGate(input: {
     // unrecognized ledger verbs " lead is 86 characters and leaves 0 and -1 for
     // the two longest tails, i.e. the verb list it exists to introduce cannot be
     // rendered at all. And the verb list is budgeted against what the tail
-    // actually leaves rather than against the standalone cap, because the regex
+    // actually leaves rather than against a standalone cap, because the regex
     // behind `disposition` accepts an arbitrarily long verb. Worst case (plural
     // lead, longest tail) still leaves 21 characters for it; the `Math.max(0,
-    // …)` floor is there because `.slice(0, -n)` would trim from the END rather
-    // than emptying, so a future longer tail would overflow the cap silently
-    // instead of dropping the verb list.
+    // …)` floor is there because a negative budget would otherwise reach
+    // `fitQuotedVerbs` and elide against it, so a future longer tail would
+    // overflow the cap silently instead of dropping the verb list.
     //
     // PEN-3157 asked whether this republishes model-authored text to a public
     // commit status without a scrub, since the verb is lifted verbatim out of
@@ -485,19 +513,10 @@ export function evaluateCommentReviewGate(input: {
     const verbLead =
       `Undispositioned finding from ${shortHead}: unrecognized ledger ` +
       `${carried.unrecognizedVerbs.length === 1 ? "verb" : "verbs"} `;
-    const verbList = carried.unrecognizedVerbs
-      .map((verb) => `"${verb}"`)
-      .join(", ")
-      .slice(
-        0,
-        Math.max(
-          0,
-          Math.min(
-            UNRECOGNIZED_VERB_BUDGET,
-            MAX_COMMIT_STATUS_DESCRIPTION - verbLead.length - carriedTail.length,
-          ),
-        ),
-      );
+    const verbList = fitQuotedVerbs(
+      carried.unrecognizedVerbs.map((verb) => `"${verb}"`),
+      Math.max(0, MAX_COMMIT_STATUS_DESCRIPTION - verbLead.length - carriedTail.length),
+    );
     const reason = carried.unrecognizedVerbs.length
       ? verbLead + verbList + carriedTail
       : `An unresolved finding from Ally's review of ${shortHead} is still undispositioned` +
