@@ -271,6 +271,60 @@ test("an absent queued-age series renders NO DATA on red, never a green zero", (
   );
 });
 
+test("an absent overdue-retry series renders NO DATA on red, never a green zero", () => {
+  // Same defect as the tile above, on a count() rather than a max(). It needs a
+  // DIFFERENT idiom: `count(x > 0) or vector(0)` returns 0 both when the metric
+  // is absent and when it is present-and-idle, so a rename or a dead emit path
+  // is pixel-identical to a healthy cluster. count() cannot use `or vector(-1)`
+  // the way the max() tile does, because count() of an empty inner result is
+  // also empty -- there is nothing to distinguish. absent() is what separates
+  // them, and the two arms must be ordered absent-before-zero or the zero arm
+  // swallows absence.
+  //
+  // The refresher tile does NOT cover this: that is a different metric and
+  // would still read 1/OK while this one is dead.
+  //
+  // Validated live across all three states before adopting (2026-09-20):
+  // absent -> -1, present-and-idle -> 0, present-and-overdue -> 1.
+  const { dashboard } = renderDashboard();
+
+  const panel = dashboard.panels.find(
+    (p) => p.title === "Agents with an overdue parked retry",
+  );
+  assert.ok(panel, "dashboard must chart the overdue-agent count");
+
+  assert.match(
+    panel.targets[0].expr,
+    new RegExp(`absent\\(${OVERDUE}\\)\\s*\\*\\s*-1`),
+    "an absent overdue-retry series must resolve to the -1 sentinel; `or vector(0)` alone renders a dead emit path as a green '0 agents overdue'",
+  );
+  assert.ok(
+    panel.targets[0].expr.indexOf("absent(") <
+      panel.targets[0].expr.indexOf("or vector(0)"),
+    "the absent() arm must precede `or vector(0)`, otherwise the zero arm matches first and absence never reaches the sentinel",
+  );
+
+  const steps = panel.fieldConfig.defaults.thresholds.steps;
+  assert.equal(
+    steps[0].color,
+    "red",
+    "base threshold must be red so the -1 sentinel colours the tile red",
+  );
+  assert.equal(
+    steps[1].value,
+    0,
+    "green must start at 0 so a genuinely idle fleet is not reported as absent",
+  );
+
+  const mapped = panel.fieldConfig.defaults.mappings?.flatMap((m) =>
+    Object.keys(m.options ?? {}),
+  );
+  assert.ok(
+    mapped?.includes("-1"),
+    "the -1 sentinel must be mapped to readable text; a bare '-1' count reads as a bug in the panel, not as absence",
+  );
+});
+
 test("the runbook's verification commands name objects that actually render", () => {
   // The runbook's whole job is telling an operator whether a merged dashboard
   // is live. A wrong ConfigMap name or data key there fails in the worst
@@ -308,6 +362,68 @@ test("the runbook's verification commands name objects that actually render", ()
     src[1],
     `deploy/helm/paperclip/dashboards/$KEY`,
     "SRC must be derived from $KEY so the diff cannot compare two different dashboards",
+  );
+});
+
+test("the runbook's step-2 jsonpath resolves, not just names the right key", () => {
+  // The test above checks the NAMES appear. Names and the jsonpath EXPRESSION
+  // are separate failure surfaces, and the second one failed in review:
+  // kubectl's JSONPath reads `.` as a field separator, so `{.data.$KEY}` with
+  // KEY=runtime-run-queue-health.json parses as data -> runtime-run-queue-health
+  // -> json, resolves to nothing, and exits 0 with no output and nothing on
+  // stderr. `jq -S .` on empty stdin also exits 0 silently, so step 2 printed
+  // `STALE -- deploy has not run` unconditionally -- including when the
+  // ConfigMap was current. Measured on the live cluster: as-written returned 0
+  // bytes, escaped returned 17565.
+  //
+  // That is worse than the `jq -r 'keys'` version it replaced -- that answered
+  // nothing, this answers WRONGLY, and the runbook exists because the deploy
+  // pipeline genuinely does run hundreds of commits behind, so a false STALE is
+  // indistinguishable from the real condition step 2 detects.
+  //
+  // MUTATION TEST: delete the `\\.` from the runbook's KEY_JP line. If this
+  // still passes, it has gone back to checking names.
+  const runbook = readFileSync(
+    path.join(repoRoot, "runbooks/grafana-dashboard-as-code.md"),
+    "utf8",
+  );
+  const rendered = renderChart(["--show-only", TEMPLATE]);
+
+  const jp = runbook.match(/-o jsonpath="\{(\.data\.[^}]+)\}"/);
+  assert.ok(jp, "runbook step 2 must read the ConfigMap via -o jsonpath");
+
+  // Expand the runbook's own shell assignments with bash rather than
+  // re-implementing `${KEY//./\\.}` -- a hand-rolled expansion could agree with
+  // a wrong runbook.
+  const assigns = [...runbook.matchAll(/^(?:CM|KEY|KEY_JP)=.*$/gm)]
+    .map((m) => m[0].split("#")[0].trimEnd())
+    .join("\n");
+  const expanded = execFileSync(
+    "bash",
+    ["-c", `set -u\n${assigns}\nprintf '%s' "${jp[1]}"`],
+    { encoding: "utf8" },
+  );
+
+  // Apply kubectl's own splitting rule: `.` separates fields unless escaped.
+  const fields = expanded
+    .replace(/^\./, "")
+    .split(/(?<!\\)\./)
+    .map((s) => s.replace(/\\\./g, "."));
+
+  assert.deepEqual(
+    fields.slice(0, 1),
+    ["data"],
+    `jsonpath '${expanded}' does not start at .data`,
+  );
+  assert.equal(
+    fields.length,
+    2,
+    `jsonpath '${expanded}' splits into ${fields.length} fields (${fields.join(" -> ")}); ` +
+      "a dot inside the key must be escaped or kubectl reads it as a nested field and silently returns nothing",
+  );
+  assert.ok(
+    rendered.includes(`${fields[1]}: |`),
+    `jsonpath '${expanded}' resolves to data key '${fields[1]}', which the rendered ConfigMap does not have`,
   );
 });
 
