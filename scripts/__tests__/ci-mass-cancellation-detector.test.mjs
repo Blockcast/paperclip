@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { detect } from "../ci-mass-cancellation-detector.mjs";
+import { createdRangeFor, detect } from "../ci-mass-cancellation-detector.mjs";
 
 // Fixture data transcribed from the real recurrences documented on
 // https://paperclip.blockcast.net/BLO/issues/BLO-21078 — the 2026-08-02
@@ -141,4 +141,50 @@ test("ignores runs from other workflows", () => {
   const otherWorkflow = AUG_02_CLUSTER.map((r) => ({ ...r, name: "release" }));
   const verdict = detect(otherWorkflow, { since: "2026-08-02T00:00:00Z", until: "2026-08-03T00:00:00Z" });
   assert.equal(verdict.firing, false);
+});
+
+// BLO-21078: the backtest that AC3's verifying signal calls for was
+// unrunnable before 2026-09-20. `--since/--until` filtered only AFTER a
+// page-bounded fetch that pages newest-first, so any window older than
+// recent volume allowed came back `firing: false, scannedRunCount: 0` — a
+// vacuous verdict presented as a quiet one. Measured that day: 20 pages of
+// `status=cancelled` reached back only to 2026-08-10, so the 08-02 incident
+// this detector was BUILT for could not be seen at all.
+
+test("createdRangeFor derives the fetch window from --since/--until, not from lookback", () => {
+  const range = createdRangeFor(
+    { since: "2026-08-02T19:00:00Z", until: "2026-08-02T23:00:00Z", fetchPadMinutes: 60 },
+    Date.parse("2026-09-20T00:00:00Z"),
+  );
+  assert.equal(range, "2026-08-02T18:00:00.000Z..2026-08-03T00:00:00.000Z");
+});
+
+test("createdRangeFor pads both ends: back for long runs, forward for supersession candidates", () => {
+  const [start, end] = createdRangeFor(
+    { since: "2026-08-02T19:00:00Z", until: "2026-08-02T20:00:00Z", fetchPadMinutes: 360 },
+    Date.parse("2026-09-20T00:00:00Z"),
+  ).split("..");
+  // A run created 6h before the kill window must still be fetched, or a long
+  // run killed inside the window is invisible; and the newer run that would
+  // explain a cancellation as ordinary supersession is created AFTER it.
+  assert.ok(Date.parse(start) <= Date.parse("2026-08-02T13:00:00Z"), `start too late: ${start}`);
+  assert.ok(Date.parse(end) >= Date.parse("2026-08-03T02:00:00Z"), `end too early: ${end}`);
+});
+
+test("verdict reports the raw fetched population, so an empty fetch is distinguishable from a quiet window", () => {
+  const quiet = detect(ISOLATED_MANUAL_CANCEL, { since: "2026-08-06T00:00:00Z", until: "2026-08-07T00:00:00Z" });
+  assert.equal(quiet.firing, false);
+  // Both are non-firing; only fetchedRunCount separates "looked, found
+  // nothing" from "never looked". main() exits 2 on the latter.
+  assert.equal(quiet.fetchedRunCount, ISOLATED_MANUAL_CANCEL.length);
+  assert.ok(quiet.fetchedRunCount > 0);
+  assert.equal(detect([], { since: "2026-08-06T00:00:00Z", until: "2026-08-07T00:00:00Z" }).fetchedRunCount, 0);
+});
+
+test("verdict flags a fetch truncated at the API result cap, because a missed cluster reads as quiet", () => {
+  const padded = Array.from({ length: 1000 }, (_, i) =>
+    run({ id: 90000 + i, branch: `bulk-${i}`, created: "2026-08-06T00:00:00Z", killed: "2026-08-06T00:00:00Z" }),
+  );
+  assert.equal(detect(padded, { since: "2026-08-05T00:00:00Z", until: "2026-08-07T00:00:00Z" }).fetchTruncated, true);
+  assert.equal(detect(ISOLATED_MANUAL_CANCEL, { since: "2026-08-06T00:00:00Z", until: "2026-08-07T00:00:00Z" }).fetchTruncated, false);
 });
