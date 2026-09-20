@@ -1641,12 +1641,13 @@ class TestPreWriteAllyReviewedGuard(unittest.TestCase):
         """The same ordering control on the surface Ally actually uses.
 
         Identical to the test above except Ally answered with a formal review
-        rather than a comment. That distinction is the whole point: measured
-        2026-09-20 across the 45 most recent PRs in this repo, 34 carried an
-        Ally consolidated report and the split was 57 on the reviews surface
-        and 0 on the comment surface. So the test above pins the ordering on
-        the surface responsible for 0 of 57 observed answers, and this one
-        pins it on the surface responsible for 57 of 57.
+        rather than a comment. That distinction is the whole point: across the
+        45 most recent PRs in this repo, ZERO Ally consolidated reports landed
+        on the comment surface -- every one was on the reviews surface. So the
+        test above pins the ordering on the surface responsible for none of
+        the observed answers, and this one pins it on the surface responsible
+        for all of them. (The matching numerator drifts and is deliberately
+        not quoted here; see the ORDERING docstring in refire_still_permitted.)
 
         This case used to land on the contended branch -- is_alarming=True,
         filed in the step summary as concurrency evidence -- because the
