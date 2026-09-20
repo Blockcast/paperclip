@@ -244,6 +244,7 @@ import { externalObjectService } from "../services/external-objects.js";
 import {
   isStatusOnlyRecoveryContextSnapshot,
   STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
+  statusOnlyMonitorArmResumeGuidance,
 } from "../services/recovery/model-profile-hint.js";
 import {
   enqueueCommentEffects,
@@ -6997,10 +6998,34 @@ export function issueRoutes(
     // unresolvable scope is not evidence of no containment. Note this can only
     // ever *widen* permission relative to the unconditional refusal it replaces,
     // and only for a run provably holding no containment on either side.
-    const runScopeIssueId = readNonEmptyString(readObject(run.contextSnapshot).issueId);
-    if (issue.id && runScopeIssueId) {
-      const scopes = [...new Set([issue.id, runScopeIssueId])];
-      if ((await recoveryActionsSvc.listActiveForIssues(companyId, scopes)).size === 0) return;
+    //
+    // BOTH stamped scope fields are read, because `contextSnapshot.issueId` alone
+    // is the WRONG scope for every class that actually holds an action. The
+    // action is keyed on the source issue — `upsertSourceScoped({ sourceIssueId:
+    // input.issue.id })`, and `listActiveForIssues` filters on that column — while
+    // the wake stamps `issueId: recovery.id` and `sourceIssueId: input.issue.id`
+    // side by side (`recovery/service.ts`, `stranded_assigned_issue` and both
+    // stale-run evaluation sites). `recovery.id` is a freshly minted recovery
+    // issue that never holds an action, so an `issueId`-only probe returns empty
+    // for exactly the class this gate's doc comment is written about, and the
+    // sideways escape stays open.
+    //
+    // At least ONE field, not both: `issue_monitor_recovery` (`heartbeat.ts`)
+    // stamps `issueId` and no `sourceIssueId` at all, so requiring both would
+    // fail closed on the very wake BLO-34683 exists to unblock.
+    const runContext = readObject(run.contextSnapshot);
+    const runScopeIssueIds = [runContext.issueId, runContext.sourceIssueId]
+      .map(readNonEmptyString)
+      .filter((id): id is string => id !== null);
+    // Empty ⟺ the gate refused on an unresolvable scope rather than on real
+    // containment. Carried into the 403 so the refused run is told which row to
+    // dispose of instead of being asked to guess which branch it hit.
+    let containingIssueIds: string[] = [];
+    if (issue.id && runScopeIssueIds.length > 0) {
+      const scopes = [...new Set([issue.id, ...runScopeIssueIds])];
+      const active = await recoveryActionsSvc.listActiveForIssues(companyId, scopes);
+      if (active.size === 0) return;
+      containingIssueIds = [...active.keys()];
     }
 
     // Same shape as `assertCheapRecoveryIssueAssigneeProfileAllowed`: the
@@ -7028,7 +7053,7 @@ export function issueRoutes(
         modelProfile: "cheap",
         recoveryIntent: "status_only",
         resumeRequiresNormalModel: true,
-        ...STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
+        ...statusOnlyMonitorArmResumeGuidance(containingIssueIds),
       },
     );
   }
