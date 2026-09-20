@@ -610,6 +610,11 @@ describe("agent live run routes", () => {
    * log, and the `allowed` audit sat above that call — so a 404 that disclosed nothing was booked
    * as a read. Control: move `logRunLogAccessAudit(..., "allowed", ...)` back above `readLog` and
    * this fails (verified, not assumed).
+   *
+   * BLO-34901: no `result` matcher. The invariant is that this 404 records NOTHING — the reader is
+   * entitled, so booking it `denied` is equally false, and a matcher pinned to `"allowed"` passes
+   * that mutation unchanged. Second control (also verified): make the route write
+   * `logRunLogAccessAudit(..., "denied", ...)` on this path and this fails.
    */
   it("does not audit an allowed run log read when the run stored no log", async () => {
     const app = await createApp();
@@ -624,7 +629,6 @@ describe("agent live run routes", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(404);
     expect(mockLogActivity).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       action: "heartbeat.run_log_accessed",
-      details: expect.objectContaining({ result: "allowed" }),
     }));
   });
 
@@ -743,6 +747,9 @@ describe("agent live run routes", () => {
    * `logStore: null` on the fixture rather than only rejecting `readLog`: that is the shape the
    * closure records, and it keeps the audit's own `logStore` field honest if the ordering ever
    * regresses.
+   *
+   * BLO-34901: no `result` matcher, same reasoning as the heartbeat guard above — and second
+   * control verified here too.
    */
   it("does not audit an allowed workspace-operation log read when the operation stored no log", async () => {
     mockWorkspaceOperationService.getById.mockResolvedValue(
@@ -762,7 +769,6 @@ describe("agent live run routes", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(404);
     expect(mockLogActivity).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       action: "workspace_operation.log_accessed",
-      details: expect.objectContaining({ result: "allowed" }),
     }));
   });
 
