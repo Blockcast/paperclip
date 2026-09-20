@@ -3109,8 +3109,20 @@ function ensureRegistry(): {
       labelNames: ["source", "reason"],
       registers: [registry],
     });
+    // Pre-seed every backstop series so "healthy" reads as a literal 0 rather than an
+    // absent series. The gauge already did this; the counters did not, which reproduced
+    // the exact silence defect BLO-29763 was opened to remove, one metric over: on a
+    // freshly-started process `paperclip_backstop_sweep_completed_total` is missing for
+    // any stream that has not yet completed a sweep, so "did this loop finish a sweep in
+    // the last N minutes" is unanswerable, and a `depth > 0 unless increase(...) > 0`
+    // alert cannot exclude on the missing arm and fires on process age instead of on a
+    // stalled backstop. Bounded: 2 sources, 2 + (2 x 12) = 26 series.
     for (const source of BACKSTOP_SOURCES) {
       backstopDeferredCandidates.set({ source }, 0);
+      backstopSweepCompleted.inc({ source }, 0);
+      for (const reason of BACKSTOP_SKIP_REASONS) {
+        backstopCandidatesSkipped.inc({ source, reason }, 0);
+      }
     }
     pluginWebhookDeliveryRejected = new Counter({
       name: PLUGIN_WEBHOOK_DELIVERY_REJECTED_METRIC,

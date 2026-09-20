@@ -4,6 +4,8 @@ import {
   AUTH_REQUEST_METRIC,
   BACKSTOP_CANDIDATES_SKIPPED_METRIC,
   BACKSTOP_DEFERRED_CANDIDATES_METRIC,
+  BACKSTOP_SKIP_REASONS,
+  BACKSTOP_SOURCES,
   BACKSTOP_SWEEP_COMPLETED_METRIC,
   CONCURRENT_RUN_BLOCKED_METRIC,
   DEP_BLOCKED_WAKEUP_METRIC,
@@ -1319,6 +1321,27 @@ describe("setQueuedRunOldestAgeMetrics (BLO-21116)", () => {
 });
 
 describe("backstop metrics (BLO-29763)", () => {
+  it("pre-seeds the COUNTERS at zero too, not just the gauge, so absence never reads as 'no sweep'", async () => {
+    // Measured live 2026-09-20 on paperclip-0: the gauge was present for both streams
+    // (one at 20, one at 0) while `paperclip_backstop_sweep_completed_total` carried
+    // EXACTLY ONE series -- issue_graph_liveness.backstop was absent entirely, because
+    // that process had not yet completed a sweep. AC2 asks that "did this loop finish a
+    // sweep in the last N minutes" be answerable from metrics alone; an absent series
+    // cannot answer it, and `depth > 0 unless increase(counter[2h]) > 0` cannot exclude
+    // on a missing arm, so the alert fires on process age rather than on a stalled loop.
+    // This asserts the healthy-but-untouched state BEFORE anything is recorded.
+    const body = (await renderMetrics()).body;
+
+    for (const source of BACKSTOP_SOURCES) {
+      expect(body).toContain(`${BACKSTOP_SWEEP_COMPLETED_METRIC}{source="${source}"} 0`);
+      for (const reason of BACKSTOP_SKIP_REASONS) {
+        expect(body).toContain(
+          `${BACKSTOP_CANDIDATES_SKIPPED_METRIC}{source="${source}",reason="${reason}"} 0`,
+        );
+      }
+    }
+  });
+
   it("publishes both bounded streams at zero, then records depth, completion, and skips", async () => {
     let body = (await renderMetrics()).body;
     expect(body).toContain(`${BACKSTOP_DEFERRED_CANDIDATES_METRIC}{source="issue_graph_liveness.backstop"} 0`);
