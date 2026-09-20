@@ -2,9 +2,12 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
+  CHECK_SETTLE_MINUTES,
   MAX_ENQUEUES_PER_FIRE,
   STALE_ENQUEUE_HOURS,
   allyVerdictAtHead,
+  approvalLanes,
+  checkSettlement,
   classifyAll,
   classifyFromListing,
   classifyPr,
@@ -12,6 +15,7 @@ import {
   isFatalGhError,
   isMainModule,
   latestCheckStates,
+  targetRepos,
   unsatisfiedOwners,
 } from "./land-clean-prs.mjs";
 
@@ -278,6 +282,114 @@ describe("Ally verdict-mirror statuses are not CI checks", () => {
     assert.deepEqual(failingChecks([{ context: "review/ally-complete", state: "FAILURE" }]), [
       "review/ally-complete=FAILURE",
     ]);
+  });
+});
+
+describe("approval rot (BLO-33208)", () => {
+  const HUMAN = { login: "kkroo", id: 169, type: "User" };
+  const BOT = { login: "allyblockcast[bot]", id: 290875700, type: "Bot" };
+  const approval = (user) => ({ state: "APPROVED", user, commit_id: HEAD, submitted_at: "2026-09-09T14:38:50Z" });
+
+  it("splits approvers by identity, not by a `[bot]` login suffix", () => {
+    // A suffix is a naming convention any account may adopt; `type` is the
+    // identity. Conflating them overstated this ticket's own cohort by ~2.7x.
+    const lanes = approvalLanes({
+      reviews: [
+        approval(HUMAN),
+        approval(BOT),
+        approval({ login: "looks-like-a[bot]", type: "User" }),
+        { state: "COMMENTED", user: HUMAN },
+      ],
+    });
+    assert.deepEqual(lanes, { human: ["kkroo", "looks-like-a[bot]"], bot: ["allyblockcast[bot]"] });
+  });
+
+  it("reports a conflicted PR that spent a human approval as its own action", () => {
+    // The priority cohort: finished, reviewed, and unmergeable because master
+    // moved. Its own action so the receipt tally carries the count instead of
+    // burying it among every other skip.
+    const row = classify({ mergeStateStatus: "DIRTY", reviews: [review(), approval(HUMAN)] });
+    assert.equal(row.action, "approval-rotted");
+    assert.equal(row.reason, "mergestate:DIRTY");
+    assert.match(row.detail, /spent human approval: kkroo/);
+  });
+
+  it("names a bot-only approval separately, since no scarce resource was spent", () => {
+    const row = classify({ mergeStateStatus: "DIRTY", reviews: [review(), approval(BOT)] });
+    assert.equal(row.action, "approval-rotted");
+    assert.match(row.detail, /bot-only approval: allyblockcast\[bot\]/);
+  });
+
+  it("leaves an unapproved conflicted PR as a plain skip", () => {
+    const row = classify({ mergeStateStatus: "DIRTY" });
+    assert.equal(row.action, "skip");
+    assert.equal(row.reason, "mergestate:DIRTY");
+  });
+
+  it("reports the conflict, never a check, on a DIRTY PR (BLO-32606)", () => {
+    // GitHub cannot evaluate a `paths:` filter on a PR whose merge commit will
+    // not compute, so path-filtered workflows are silently never dispatched and
+    // the surviving checks mean nothing. Measured on onprem-k8s#3269: 4 runs
+    // dirty, 22 for the identical tree once mergeable.
+    const row = classify({
+      mergeStateStatus: "DIRTY",
+      statusCheckRollup: [{ name: "verify", conclusion: "FAILURE", completedAt: "2026-09-13T05:00:00Z" }],
+      reviews: [review(), approval(HUMAN)],
+    });
+    assert.equal(row.reason, "mergestate:DIRTY", "the conflict is the true and only actionable cause");
+  });
+
+  it("does not spend enqueue cap on a rotted PR, and never enqueues it", () => {
+    const rows = classifyAll(
+      [pr({ mergeStateStatus: "DIRTY", reviews: [review(), approval(HUMAN)] }), pr({ mergeStateStatus: "CLEAN" })],
+      { now: NOW, maxEnqueues: 1 },
+    );
+    assert.deepEqual(rows.map((r) => r.action), ["approval-rotted", "enqueue"]);
+  });
+});
+
+describe("check settling floor (BLO-33208 bucket-B age floor)", () => {
+  const at = (iso) => [{ name: "verify", conclusion: "SUCCESS", completedAt: iso }];
+
+  it("treats a rollup with zero rows as a stop, not a pass", () => {
+    // Nothing reporting means nothing attested this head, which renders
+    // identically to every check passing.
+    assert.deepEqual(checkSettlement([], { now: NOW }), { settled: false, reason: "none" });
+    assert.equal(classify({ statusCheckRollup: [] }).reason, "checks:none");
+  });
+
+  it(`holds an all-green rollup whose newest check is under ${CHECK_SETTLE_MINUTES}m old`, () => {
+    // Green only because the reds have not registered yet.
+    const row = classify({ statusCheckRollup: at("2026-09-13T11:56:00Z") });
+    assert.equal(row.reason, "checks:settling");
+    assert.match(row.detail, /4\.0m ago, floor 15m/);
+  });
+
+  it("enqueues once the newest check has been green past the floor", () => {
+    assert.equal(classify({ statusCheckRollup: at("2026-09-13T11:40:00Z") }).action, "enqueue");
+  });
+
+  it("does not hold forever on rows carrying no parseable timestamp", () => {
+    // A commit status never moves on its own, so holding undatable rows would
+    // be permanent — the immortal-stale-verdict shape. `--auto` re-gates, so
+    // enqueuing early is the bounded direction.
+    assert.deepEqual(checkSettlement([{ name: "verify", conclusion: "SUCCESS" }], { now: NOW }), {
+      settled: true,
+    });
+  });
+});
+
+describe("multi-repo sweep", () => {
+  it("parses a comma-separated repo list and defaults to this repo", () => {
+    // The rot is not repo-local: it has been hand-cleaned four times and
+    // regrown in the same repos, because each sweep only looked at one.
+    assert.deepEqual(targetRepos("Blockcast/trafficcontrol, Blockcast/multicast"), [
+      "Blockcast/trafficcontrol",
+      "Blockcast/multicast",
+    ]);
+    assert.deepEqual(targetRepos(""), ["Blockcast/paperclip"]);
+    assert.deepEqual(targetRepos(undefined), ["Blockcast/paperclip"]);
+    assert.deepEqual(targetRepos("Blockcast/paperclip,,  "), ["Blockcast/paperclip"]);
   });
 });
 

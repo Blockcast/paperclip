@@ -18,6 +18,29 @@
  *
  * Default is a dry run. `--apply` performs the actions.
  *
+ * ## The reporting half: approvals that rotted (BLO-33208)
+ *
+ * The same sweep answers a second question nothing else was asking. An approval
+ * is the scarcest signal on a PR — a human read the diff and said yes, at a
+ * measured fleet throughput of ~2.4 such actions/day — and it is silently spent
+ * when master moves underneath the branch. A conflict is created by a commit on
+ * the BASE, so there is no `synchronize`, no `pull_request` event and no check
+ * re-run on the PR itself; `mergeStateStatus` is not a check, so it cannot be
+ * expressed as a `gateSignals` monitor either. Nothing wakes the assignee, ever.
+ *
+ * That cohort has been cleaned up by hand four times (BLO-29984, BLO-31321,
+ * BLO-32205, BLO-33208) and regrown in the same repos every time, which is why
+ * it is folded in here as a standing `approval-rotted` row rather than cleaned
+ * up a fifth time. It is REPORTED and never acted on: a deliberate sequencing
+ * hold is indistinguishable from a strand on every API surface, and
+ * trafficcontrol#1726 was exactly that — "do not merge before magma#1936", a
+ * shared proto field-number space that a rebase would have broken.
+ *
+ * Folded in from the standalone detector in trafficcontrol#1815, which was
+ * closed in favour of this: that one needed a repo secret no agent can
+ * provision, so its schedule would have been permanently red and its alarm
+ * state indistinguishable from its broken state (BLO-33268).
+ *
  * ## Why the review verdict is read from the body, not from `commit_id`
  *
  * GitHub rewrites `commit_id` on APPROVED reviews when the head moves, so a
@@ -132,6 +155,25 @@ const ALLY_VERDICT_STATUS_RE = /^(?:review|gate)\/ally-/i;
  * queue exists to resolve. `--auto` waits for both correctly.
  */
 const UNLANDABLE_MERGE_STATES = new Set(["DIRTY", "UNSTABLE", "UNKNOWN"]);
+
+/**
+ * How long after the newest check reports before an all-green rollup is
+ * believed (BLO-33208 bucket-B age floor).
+ *
+ * Checks register over the seconds-to-minutes following a push, so a rollup
+ * read mid-registration is green only because the reds have not arrived yet.
+ * `failingChecks` structurally cannot see this: an absent check and a passing
+ * one are the same empty set. Measured next door on onprem-k8s#3269, where one
+ * head dispatched 4 workflows and the identical tree dispatched 22 once a merge
+ * commit could be computed (BLO-32606).
+ *
+ * 15 minutes, not the 24h the reporting-only detector used: that floor existed
+ * to avoid paging a human about a PR mid-CI, and this script acts rather than
+ * pages. The enqueue is `--auto`, so GitHub re-gates on required checks anyway
+ * and the cost of being wrong is one deferred fire. Calibrate with
+ * LAND_CLEAN_PRS_SETTLE_MINUTES if a repo's checks register more slowly.
+ */
+export const CHECK_SETTLE_MINUTES = 15;
 
 function isDismissedOrPending(review) {
   const state = String(review?.state ?? "").toUpperCase();
@@ -263,6 +305,75 @@ export function unsatisfiedOwners(pr) {
 }
 
 /**
+ * APPROVED reviewers on this PR, split into human and bot lanes.
+ *
+ * Only a human approval consumed a scarce resource — human review throughput on
+ * this fleet measures ~2.4 actions/day — so a PR that rotted after a person
+ * said yes is categorically more expensive than one carrying a bot approval.
+ * Reporting them as one "approved" count overstated BLO-33208's own cohort by
+ * ~2.7x, which is why the two lanes stay separate all the way to the receipt.
+ *
+ * Keyed on the REST `user.type` field and never on a `[bot]` login suffix: the
+ * suffix is a naming convention any account may adopt, and identity is what
+ * decides whether a person was spent. Head is deliberately not considered — the
+ * approval was paid for whether or not the branch has moved since.
+ */
+export function approvalLanes(pr) {
+  const human = new Set();
+  const bot = new Set();
+  for (const review of pr?.reviews ?? []) {
+    if (String(review?.state ?? "").toUpperCase() !== "APPROVED") continue;
+    const login = String(review?.user?.login ?? "<unknown>");
+    (String(review?.user?.type ?? "") === "Bot" ? bot : human).add(login);
+  }
+  return { human: [...human].sort(), bot: [...bot].sort() };
+}
+
+/** Human lane first: the receipt should lead with the expensive case. */
+function approvalNote(pr) {
+  const { human, bot } = approvalLanes(pr);
+  if (human.length > 0) return `spent human approval: ${human.join(", ")}`;
+  if (bot.length > 0) return `bot-only approval: ${bot.join(", ")}`;
+  return null;
+}
+
+/**
+ * Whether an all-green rollup has been green long enough to believe.
+ *
+ * Two ways it has not. A rollup with zero rows is a stop, not a pass: the two
+ * surfaces `statusCheckRollup` unions are each capable of carrying the real
+ * verdict, so nothing reporting means nothing has attested this head, which
+ * renders identically to every check passing. And a rollup whose newest row is
+ * younger than the floor is still registering — see CHECK_SETTLE_MINUTES.
+ *
+ * A non-empty rollup carrying no parseable timestamp counts as settled, which
+ * is the opposite of the empty case on purpose. Undatable rows cannot be shown
+ * to be *fresh* either, and a commit status never moves on its own, so holding
+ * would be permanent — the same immortal-stale-verdict shape the newest-review
+ * rule exists to prevent. Enqueuing early is bounded instead: it only arms
+ * `--auto`, which re-gates on required checks server-side.
+ */
+export function checkSettlement(
+  rollup,
+  { now = Date.now(), settleMinutes = CHECK_SETTLE_MINUTES } = {},
+) {
+  if ((rollup ?? []).length === 0) return { settled: false, reason: "none" };
+  const stamps = (rollup ?? [])
+    .map((c) => Date.parse(c?.completedAt || c?.startedAt || c?.createdAt || ""))
+    .filter((at) => Number.isFinite(at));
+  if (stamps.length === 0) return { settled: true };
+  const ageMinutes = (now - Math.max(...stamps)) / 60_000;
+  if (ageMinutes < settleMinutes) {
+    return {
+      settled: false,
+      reason: "settling",
+      detail: `newest check reported ${ageMinutes.toFixed(1)}m ago, floor ${settleMinutes}m`,
+    };
+  }
+  return { settled: true };
+}
+
+/**
  * The rules decidable from `gh pr list` alone, or null when this PR needs its
  * checks and reviews fetched.
  *
@@ -271,8 +382,7 @@ export function unsatisfiedOwners(pr) {
  * limits 150, 200 and 500). Deciding the cheap rules first means only the PRs
  * that survive them cost two API calls each, and on a repo where most open PRs
  * are already enqueued or human-authored that is most of them avoided.
- */
-export function classifyFromListing(pr, { now = Date.now() } = {}) {
+ */export function classifyFromListing(pr, { now = Date.now() } = {}) {
   const row = (action, reason, detail = null) => ({
     number: pr?.number,
     headSha: pr?.headRefOid,
@@ -307,8 +417,17 @@ export function classifyFromListing(pr, { now = Date.now() } = {}) {
  * One row per PR. Rules are ordered so that the reason reported is the one a
  * human would act on first: an explicit opt-out beats a red check, and a red
  * check beats a missing review, because fixing the review would not help.
+ *
+ * DIRTY is decided ahead of the check rules, and that ordering is load-bearing
+ * rather than cosmetic. GitHub cannot evaluate a `paths:` filter on a PR whose
+ * merge commit will not compute, so on a conflicted PR every path-filtered
+ * workflow is silently never dispatched — no run, no check-run, no "expected"
+ * row. The surviving checks then read green and mean nothing (BLO-32606,
+ * measured on onprem-k8s#3269). Reading them first would report `checks:` as
+ * the reason, or worse read the remnant as a pass; the conflict is both the
+ * true cause and the only actionable one.
  */
-export function classifyPr(pr, { now = Date.now() } = {}) {
+export function classifyPr(pr, { now = Date.now(), settleMinutes = CHECK_SETTLE_MINUTES } = {}) {
   const fromListing = classifyFromListing(pr, { now });
   if (fromListing) return fromListing;
 
@@ -320,10 +439,25 @@ export function classifyPr(pr, { now = Date.now() } = {}) {
     detail,
   });
 
+  const mergeState = String(pr?.mergeStateStatus ?? "UNKNOWN").toUpperCase();
+  if (mergeState === "DIRTY") {
+    // An approval already paid for here is the BLO-33208 priority cohort: the
+    // work is finished and reviewed, master moved underneath it, and no GitHub
+    // event fires because the conflicting commit landed on the BASE. Given its
+    // own action so the receipt tally carries the count rather than burying it
+    // among every other `skip`.
+    const spent = approvalNote(pr);
+    if (spent) return row("approval-rotted", "mergestate:DIRTY", spent);
+    return row("skip", "mergestate:DIRTY");
+  }
+
   const failing = failingChecks(pr?.statusCheckRollup);
   if (failing.length > 0) {
     return row("skip", `checks:${failing[0].split("=")[1]}`, failing.join(", "));
   }
+
+  const settlement = checkSettlement(pr?.statusCheckRollup, { now, settleMinutes });
+  if (!settlement.settled) return row("skip", `checks:${settlement.reason}`, settlement.detail);
 
   const { verdict } = allyVerdictAtHead(pr);
   if (verdict !== "clean") return row("skip", `review:${verdict}`);
@@ -333,17 +467,19 @@ export function classifyPr(pr, { now = Date.now() } = {}) {
     return row("codeowner-review-requested", "owner-approval-pending", owners.join(", "));
   }
 
-  const mergeState = String(pr?.mergeStateStatus ?? "UNKNOWN").toUpperCase();
   if (UNLANDABLE_MERGE_STATES.has(mergeState)) return row("skip", `mergestate:${mergeState}`);
 
   return row("enqueue", `mergestate:${mergeState}`);
 }
 
 /** Classifies every PR and applies the per-fire enqueue cap. */
-export function classifyAll(prs, { now = Date.now(), maxEnqueues = MAX_ENQUEUES_PER_FIRE } = {}) {
+export function classifyAll(
+  prs,
+  { now = Date.now(), maxEnqueues = MAX_ENQUEUES_PER_FIRE, settleMinutes = CHECK_SETTLE_MINUTES } = {},
+) {
   let enqueued = 0;
   return (prs ?? []).map((pr) => {
-    const classified = classifyPr(pr, { now });
+    const classified = classifyPr(pr, { now, settleMinutes });
     if (classified.action !== "enqueue") return classified;
     if (enqueued >= maxEnqueues) {
       return { ...classified, action: "skip", reason: `cap:${maxEnqueues}-per-fire` };
@@ -456,10 +592,23 @@ function applyRow(repo, row) {
   return null;
 }
 
-function main() {
-  const repo = process.env.LAND_CLEAN_PRS_REPO || "Blockcast/paperclip";
-  const apply = process.argv.includes("--apply");
-  const rows = classifyAll(fetchOpenPrs(repo));
+/**
+ * Repos this fire covers. Comma-separated, because the rot this detects is not
+ * repo-local: the DIRTY-after-approval cohort has been cleaned up by hand four
+ * times (BLO-29984 multicast, BLO-31321 trafficcontrol, BLO-32205 onprem-k8s,
+ * BLO-33208) and regrown in the same repos every time. A single-repo sweep is
+ * how the other two stay unobserved between cleanups.
+ */
+export function targetRepos(value = process.env.LAND_CLEAN_PRS_REPO) {
+  const repos = String(value ?? "")
+    .split(",")
+    .map((repo) => repo.trim())
+    .filter(Boolean);
+  return repos.length > 0 ? repos : ["Blockcast/paperclip"];
+}
+
+function runRepo(repo, apply, settleMinutes) {
+  const rows = classifyAll(fetchOpenPrs(repo), { settleMinutes });
 
   for (const row of rows) {
     if (!apply) continue;
@@ -471,7 +620,7 @@ function main() {
       if (isFatalGhError(message)) {
         row.action = "aborted";
         row.detail = message.trim().split("\n")[0];
-        console.log(renderReceipt(rows));
+        console.log(`## ${repo}\n\n${renderReceipt(rows)}`);
         console.error(`\nAborted the fire: ${row.detail}`);
         process.exit(1);
       }
@@ -481,7 +630,37 @@ function main() {
     }
   }
 
-  console.log(renderReceipt(rows));
+  console.log(`## ${repo}\n\n${renderReceipt(rows)}`);
+  return rows;
+}
+
+function main() {
+  const apply = process.argv.includes("--apply");
+  const settleMinutes = Number(
+    process.env.LAND_CLEAN_PRS_SETTLE_MINUTES || CHECK_SETTLE_MINUTES,
+  );
+  const rotted = [];
+
+  for (const repo of targetRepos()) {
+    for (const row of runRepo(repo, apply, settleMinutes)) {
+      if (row.action === "approval-rotted") rotted.push(`${repo}#${row.number} (${row.detail})`);
+    }
+    console.log("");
+  }
+
+  if (rotted.length > 0) {
+    // Reported, never acted on. A deliberate hold is invisible on every API
+    // surface — trafficcontrol#1726 read exactly like a strand while its body
+    // said "do not merge before magma#1936", a shared proto field-number space.
+    // So: read the PR body before rebasing anything here.
+    console.log(
+      `approval-rotted (BLO-33208 priority cohort) — ${rotted.length}:\n` +
+        rotted.map((row) => `  ${row}`).join("\n") +
+        "\nRead each PR body before rebasing: a deliberate sequencing hold is " +
+        "indistinguishable from a strand on every API surface.",
+    );
+  }
+
   if (!apply) console.log("\n(dry run — pass --apply to act)");
 }
 
