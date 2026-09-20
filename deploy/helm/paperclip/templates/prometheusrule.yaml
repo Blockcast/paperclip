@@ -259,8 +259,13 @@ spec:
         # it is labeled precisely so the API tier, which calls ensureRegistry()
         # but never observes the catalog, renders no series instead of a frozen
         # 0. That is why `== 0` is a real absence rather than a tier artifact.
+        #
+        # `max by (index)`, not a bare `max()`: the label is the only place the
+        # index NAME survives onto the firing alert (otherwise it is prose in
+        # the description), and a bare max() would silently OR a second
+        # deferred index into one series once one is published through here.
         - alert: PaperclipCrashRecoveryCandidateIndexMissing
-          expr: max(paperclip_crash_recovery_candidate_index_present) == 0
+          expr: max by (index) (paperclip_crash_recovery_candidate_index_present) == 0
           for: {{ .Values.prometheusRule.crashRecoveryCandidateIndexMissingFor }}
           labels:
             severity: warning
