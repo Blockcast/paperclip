@@ -51,11 +51,15 @@ export const PLANNING_ONLY_RECOVERY_GUARD_CONTEXT = {
 // is deliberate in both directions — it must not go stale again, and it must not read to a refused
 // agent as an instruction to go arm itself an unguarded run (that residual is BLO-32774).
 // BLO-34683: the exit list is now per-refusal, because the state it used to assert is not
-// universal and no single string is true at all four call sites. This constant is spread into the
-// assignee-profile (`issues.ts`), document/deliverable and approval-link refusals; the monitor-arm
-// gate uses `statusOnlyMonitorArmResumeGuidance` below instead.
+// universal and no single string is true at every call site. This constant is spread into FOUR
+// refusals — the assignee-profile, document/deliverable and approval-link gates in `issues.ts`,
+// and the approval create/modify gate in `routes/approvals.ts`; the monitor-arm gate uses
+// `statusOnlyMonitorArmResumeGuidance` below instead, for five sharers in total. Enumerate with
+// a grep across `server/src`, not across `issues.ts`: deriving this count from `issues.ts` alone
+// is what left a stale assertion in `approval-routes-idempotency.test.ts` when the text last
+// changed, and this comment is the record that licenses the next edit to the shared string.
 //
-// What the three sites above have in common is that they refuse on RUN CLASS ALONE — none of them
+// What the four sites above have in common is that they refuse on RUN CLASS ALONE — none of them
 // queries `issue_recovery_actions`, so none can say whether an action is containing the run, and a
 // text that splits on that asks the reader to resolve something the refusal never resolved. They
 // also carry no monitor, so monitor-specific advice named an object not in the payload. Both were
@@ -68,7 +72,7 @@ const STATUS_ONLY_RESUME_PREAMBLE =
   "No normal-model run arrives on its own: this run's class is fixed for its lifetime, and every " +
   "wake a recovery action raises is status-only — so waiting for a normal-model run never ends.";
 
-// True at all four sites, and the only exit that is. Kept separate so neither arm has to restate it.
+// True at all five sharers, and the only exit that is. Kept separate so neither arm has to restate it.
 const STATUS_ONLY_BOARD_APPROVAL_EXIT =
   "You may also file a `request_board_approval` linked to the run context's source issue.";
 
