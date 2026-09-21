@@ -6912,6 +6912,13 @@ export function issueRoutes(
         runId: run.id,
         modelProfile: "cheap",
         recoveryIntent: "status_only",
+        // BLO-34683: the shared guidance ends "take the allowed write named in this response",
+        // and of its four sharers this is the only one whose `error` names no exit — the other
+        // three carry `allowedDocumentKey`/`allowedApprovalType`. Without this key the one
+        // refusal the caller could clear IN the refused run is the one sent looking for a key
+        // that is not in the payload. `requestsCheapIssueAssigneeModelProfile` tests exactly
+        // one thing, so the allowed form is exactly the same write minus that override.
+        allowedWrite: 'the same request without `assigneeAdapterOverrides.modelProfile: "cheap"`',
         resumeRequiresNormalModel: true,
         ...STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
       },
@@ -7013,6 +7020,16 @@ export function issueRoutes(
     // At least ONE field, not both: `issue_monitor_recovery` (`heartbeat.ts`)
     // stamps `issueId` and no `sourceIssueId` at all, so requiring both would
     // fail closed on the very wake BLO-34683 exists to unblock.
+    //
+    // Reading BOTH also survives a coalesce, which the stamping argument alone
+    // does not cover: `mergeCoalescedContextSnapshot` is `{...existing,
+    // ...incoming}`, and it drops the guard block only when the incoming wake
+    // DECLARES a run class — so a wake silent about run class inherits the guard
+    // tuple while its own `issueId` overwrites the stamped one. Neither scope
+    // field is in `RECOVERY_GUARD_CONTEXT_KEYS`, so on that path `sourceIssueId`
+    // is the field that survives and keeps containment visible. Do not
+    // "simplify" this to one field on the grounds that one stamp site supplies
+    // only one.
     const runContext = readObject(run.contextSnapshot);
     const runScopeIssueIds = [runContext.issueId, runContext.sourceIssueId]
       .map(readNonEmptyString)

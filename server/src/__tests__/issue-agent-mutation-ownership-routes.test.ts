@@ -4255,6 +4255,45 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
+  // BLO-34683. `STATUS_ONLY_RECOVERY_RESUME_GUIDANCE` ends "take the allowed write named in this
+  // response". That is a promise about the PAYLOAD, and of its four sharers this is the only one
+  // whose `error` string names no exit — the document gate names the PUT path and both approval
+  // gates name `request_board_approval`, so at those three the pointer resolves in prose as well
+  // as in `allowedDocumentKey`/`allowedApprovalType`. Here it resolves nowhere unless `details`
+  // carries the key, which made the single refusal a run CAN clear within its own lifetime the
+  // one sent looking for something absent.
+  //
+  // Both halves are asserted because either alone is satisfiable while the pair is broken: the
+  // clause can point at a key that is missing (the defect), and the key can sit in a payload
+  // whose guidance never tells the reader to look for it. Mutation: drop `allowedWrite` from
+  // `issues.ts` and the second expect goes red on its own.
+  //
+  // One route, not all three: the refusal is single-point in
+  // `assertCheapRecoveryIssueAssigneeProfileAllowed`, so the payload shape is the same at each.
+  it("names the immediately-takeable write in the cheap-profile refusal it promises to name", async () => {
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb({
+        modelProfile: "cheap",
+        recoveryIntent: "status_only",
+        allowDeliverableWork: false,
+        allowDocumentUpdates: false,
+        resumeRequiresNormalModel: true,
+      }),
+    );
+
+    const res = await request(app).patch(`/api/issues/${issueId}`).send({
+      assigneeAdapterOverrides: { modelProfile: "cheap" },
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.details.resumeGuidance).toContain("the allowed write named in this response");
+    // The allowed form is the same write minus the one field
+    // `requestsCheapIssueAssigneeModelProfile` tests — not a different endpoint, and not a wait.
+    expect(res.body.details.allowedWrite).toContain("assigneeAdapterOverrides.modelProfile");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
   it("records cheap status-only recovery profile PATCH denials with redacted payload", async () => {
     const app = await createApp(
       ownerActor(),
