@@ -1115,6 +1115,55 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     expect(stale?.interactionId).toBe(staleCardId);
   });
 
+  // BLO-22660: the pin above is the SELF form -- the stale card sits on the row being
+  // listed, so keying the lookup on the source id happens to work. Every dependency-path
+  // form evaluates staleness on the recovery issue instead, which is a different row, and
+  // `blocked_by_assigned_backlog_issue` is never self-form at all: a blocker cannot be its
+  // own blocked issue, so that state missed 100% of the time while the self-form test stayed
+  // green. Pin the cross-row shape: card on the blocker, finding on the source.
+  it("names a stale card that sits on the blocker, not the listed row (BLO-22660)", async () => {
+    const { companyId, agentId } = await createCompany("BIX");
+    const sourceId = await insertIssue({
+      companyId,
+      identifier: "BIX-1",
+      title: "Blocked by a blocker holding a stale card",
+      status: "blocked",
+    });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "BIX-2",
+      title: "Parked blocker behind a stale card",
+      status: "backlog",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: sourceId });
+
+    const staleCardId = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id: staleCardId,
+      companyId,
+      issueId: blockerId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      createdAt: new Date(Date.now() - 25 * 60 * 60 * 1000),
+      payload: { version: 1, prompt: "Accept?" },
+    });
+
+    const rows = await svc.list(companyId, { attention: "blocked" });
+    const attention = rows.find((row) => row.id === sourceId)?.blockedInboxAttention ?? null;
+
+    expect(attention).toMatchObject({
+      state: "needs_attention",
+      reason: "blocked_by_assigned_backlog_issue",
+      recoveryIssue: { id: blockerId },
+    });
+    // The card the action text tells the operator to withdraw lives on the blocker. Keying
+    // the lookup on the listed row's id returned null here while the prose still said
+    // "resolve or withdraw its stale interaction".
+    expect(attention?.interactionId).toBe(staleCardId);
+  });
+
   // BLO-22660: the ageing rule is deliberately asymmetric -- interactions age, approvals do
   // not -- and that asymmetry is only correct while the classifier and this ladder agree
   // about which paths age. Pin the pairing: a row carrying BOTH a stale card and a pending

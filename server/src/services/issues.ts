@@ -5177,8 +5177,13 @@ async function listIssueBlockedInboxAttentionMap(
         sampleIssueIdentifier: leaf?.identifier ?? finding.identifier,
         // BLO-22660: when this row fell through because its only waiting path was a stale
         // card, `recommendedAction` tells the operator to resolve or withdraw that card.
-        // Name it. Null on every other finding state, which have no card to point at.
-        interactionId: staleInteractionByIssueId.get(row.id)?.id ?? null,
+        // Name it. Key on `recoveryIssueId`, never on `row.id`: all three stale-aware states
+        // evaluate `hasStaleInteraction` on the recovery issue (`recoveryIssue: deadEnd` /
+        // `reviewIssue` / `blocker` in issue-graph-liveness.ts), which is a different row from
+        // the source in every dependency-path form -- and always different for
+        // `blocked_by_assigned_backlog_issue`, since a blocker is never its own blocked issue.
+        // Null on the finding states that have no stale card, which have no id to point at.
+        interactionId: staleInteractionByIssueId.get(finding.recoveryIssueId)?.id ?? null,
       }));
       continue;
     }
