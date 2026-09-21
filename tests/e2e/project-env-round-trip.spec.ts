@@ -43,6 +43,55 @@ const SENTINEL = REDACTED_SENTINEL;
 const KEEP_KEY = "PEN3033_KEEP";
 const EDIT_KEY = "PEN3033_EDIT";
 
+/**
+ * The fixture VALUES have to dodge the same gate, and for a separate reason the key choice above
+ * does not cover: `isSensitiveEnv` is `isSensitiveEnvKey(name) || isPlausiblySensitiveEnvValue(value)`
+ * (`packages/shared/src/sensitive-env.ts:54-57`), so a harmless key with a credential-SHAPED value
+ * still trips it.
+ *
+ * `isPlausiblySensitiveEnvValue` returns true at >= 24 chars with no whitespace, a
+ * `[A-Za-z0-9+/=_\-.]` charset and >= 2 character classes. Every value this spec writes goes
+ * through `fixtureValue` below, which stays under that 24-char floor — killing the branch
+ * structurally rather than relying on what a given nonce happens to contain.
+ *
+ * Getting it wrong would be a once-a-year failure of the worst kind. It only bites when
+ * `PAPERCLIP_SECRETS_STRICT_MODE=true` (`server/src/routes/projects.ts:64`), which this suite does
+ * not set — but `playwright.config.ts:114` spreads `...process.env`, so an inherited var flips it,
+ * and a length-based trip would additionally be nondeterministic (an all-letters nonce is one
+ * character class and passes). Under the floor, neither input can reach the branch.
+ */
+const MAX_NONSENSITIVE_VALUE_LENGTH = 24;
+
+/**
+ * The single constructor for every env value this spec writes, so the floor above is enforced
+ * rather than merely documented: a later edit that lengthens a prefix fails here, loudly and
+ * deterministically, instead of arming a strict-mode 422 that only reproduces under an inherited
+ * env var.
+ */
+function fixtureValue(prefix: string): string {
+  const value = `${prefix}-${Date.now().toString(36)}`;
+  expect(
+    value.length,
+    `fixture value ${JSON.stringify(value)} must stay under the isPlausiblySensitiveEnvValue floor`,
+  ).toBeLessThan(MAX_NONSENSITIVE_VALUE_LENGTH);
+  return value;
+}
+
+/**
+ * Tracked at module scope so `test.afterAll` can reach it even when the test fails partway: the
+ * suite runs `workers: 1` against one shared throwaway instance, so a leaked company persists into
+ * every later spec's company list. Set as soon as the company exists, before any assertion that
+ * could throw and skip the cleanup.
+ */
+let seededCompanyId: string | undefined;
+
+test.afterAll(async ({ request }) => {
+  if (!seededCompanyId) return;
+  // Best-effort, matching the established idiom (`applications-crud.spec.ts:113`,
+  // `sidebar-takeover.spec.ts:69`): a cleanup failure must not turn a passing run red.
+  await request.delete(`/api/companies/${seededCompanyId}`).catch(() => undefined);
+});
+
 type Seed = {
   projectId: string;
   prefix: string;
@@ -52,8 +101,8 @@ type Seed = {
 
 async function seedProject(request: APIRequestContext): Promise<Seed> {
   const nonce = `${Date.now().toString(36)}`;
-  const keepValue = `keep-me-untouched-${nonce}`;
-  const editValue = `original-${nonce}`;
+  const keepValue = fixtureValue("keep");
+  const editValue = fixtureValue("edit");
 
   const companyRes = await request.post("/api/companies", {
     data: { name: `pen3033 env round trip ${nonce}` },
@@ -63,6 +112,7 @@ async function seedProject(request: APIRequestContext): Promise<Seed> {
     `create company failed ${companyRes.status()}: ${await companyRes.text()}`,
   ).toBe(true);
   const company = await companyRes.json();
+  seededCompanyId = company.id;
 
   const projectRes = await request.post(`/api/companies/${company.id}/projects`, {
     data: {
@@ -128,6 +178,14 @@ test("project env: editing one binding in the UI saves without 422 and leaves th
   page,
   request,
 }) => {
+  // Two full navigations (`page.goto` + `page.reload`), four API round trips and two form saves.
+  // The config default is 60s (`playwright.config.ts:66`), but the same file records 12-41s PER
+  // navigation under Vite dev middleware — still the supported local path when `ui/dist` is absent,
+  // since the throw at `:40` is CI-only. Two navigations at the upper end exhaust the default before
+  // a single assertion runs. Matches `signoff-policy.spec.ts:285`, the closest comparable spec (also
+  // two navigations).
+  test.setTimeout(120_000);
+
   const seed = await seedProject(request);
 
   // Exit 2 of 3 — `GET /projects/:id`.
@@ -182,7 +240,7 @@ test("project env: editing one binding in the UI saves without 422 and leaves th
   // The criterion. Before the write-merge half landed, this PATCH carried `***REDACTED***` for the
   // untouched KEEP row and `normalizeEnvConfig` refused the whole body — 422, every other edit in
   // the save lost with it.
-  const first = await editAndSave(`edited-once-${Date.now().toString(36)}`);
+  const first = await editAndSave(fixtureValue("edited-once"));
   expect(first.status, `first save must not 422: ${first.body}`).toBe(200);
 
   // Exit 3 of 3 — `PATCH /projects/:id`, asserted on the body of the save the UI actually
@@ -222,7 +280,7 @@ test("project env: editing one binding in the UI saves without 422 and leaves th
    * It therefore discriminates the two outcomes a masked response cannot tell apart on its own:
    * KEEP holding its original value, versus KEEP holding `***REDACTED***`.
    */
-  const second = await editAndSave(`edited-twice-${Date.now().toString(36)}`);
+  const second = await editAndSave(fixtureValue("edited-twice"));
   expect(
     second.status,
     `second save must not 422 — a 422 here means the first save persisted the placeholder into the untouched binding: ${second.body}`,
