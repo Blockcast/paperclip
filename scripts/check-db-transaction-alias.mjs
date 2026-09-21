@@ -23,15 +23,28 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /**
- * Nested `Parameters<Parameters<...>>` over an expression mentioning
- * `transaction`. The inner `[^>]*` confines the match to the first type
- * argument, so unrelated nested `Parameters<...>` that merely mentions a
- * transaction further right does not match.
+ * Any `Parameters<...>[0]` whose first type argument mentions `transaction`.
+ * The `[^>]*` confines the match to the first type argument, so an unrelated
+ * `Parameters<...>` that merely mentions a transaction further right does not
+ * match. The trailing `[0]` is what makes it a handle derivation: a bare
+ * `Parameters<typeof db.transaction>` is the method's argument tuple (test
+ * doubles spread it as `(...args: Parameters<typeof db.transaction>)`) and is
+ * not the alias.
+ *
+ * The pattern is deliberately single-level: the canonical two-line split in
+ * `packages/db/src/client.ts` (`Parameters<Db["transaction"]>[0]` feeding a
+ * second `Parameters<...>[0]`) and a hand-wrapped multi-line nested form both
+ * contain this single level on some line, and `git grep` is line-anchored.
+ * Requiring nesting on one line let both spellings through. The definition
+ * site is exempted by PATH (`DEFINITION_SITE`), not by shape.
  *
  * Only `.ts`/`.tsx` is scanned, so this file's own quoting of the shape is
  * out of scope by construction.
  */
-export const TX_ALIAS_REDERIVATION = /Parameters< *Parameters<[^>]*transaction/;
+export const TX_ALIAS_REDERIVATION = /Parameters<[^>]*transaction[^>]*>\[0\]/;
+
+/** The one file allowed to derive the alias: it is where `DbTransaction` is defined. */
+export const DEFINITION_SITE = "packages/db/src/client.ts";
 
 export function violatesTxAliasBan(line) {
   return TX_ALIAS_REDERIVATION.test(line);
@@ -44,7 +57,15 @@ export function scanRepo({ repoRoot, exec = execFileSync } = {}) {
   try {
     const output = exec(
       "git",
-      ["grep", "-nE", TX_ALIAS_REDERIVATION.source, "--", "*.ts", "*.tsx"],
+      [
+        "grep",
+        "-nE",
+        TX_ALIAS_REDERIVATION.source,
+        "--",
+        "*.ts",
+        "*.tsx",
+        `:(exclude)${DEFINITION_SITE}`,
+      ],
       { encoding: "utf8", cwd: repoRoot },
     );
     return output.split("\n").filter((line) => line.trim());

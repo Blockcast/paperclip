@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  DEFINITION_SITE,
   MESSAGE,
   scanRepo,
   TX_ALIAS_REDERIVATION,
@@ -15,15 +16,20 @@ const BANNED = [
   "  type CompanyTx = Parameters<Parameters<typeof db.transaction>[0]>[0];",
   "    dbOrTx: typeof db | Parameters<Parameters<typeof db.transaction>[0]>[0],",
   'type Tx = Parameters< Parameters<Db["transaction"]>[0]>[0];',
+  // The two-line split copied out of client.ts under a new local name: the
+  // first line carries the single level the rule keys on.
+  'type LocalTxCallback = Parameters<Db["transaction"]>[0];',
+  // The inner line of a hand-wrapped nested declaration. git grep is
+  // line-anchored, so this line is the only one the scan can see.
+  '  Parameters<Db["transaction"]>[0]',
 ];
 
-// Must stay green. The first two are the deliberate two-alias split in
-// packages/db/src/client.ts that DEFINES the replacement — a rule that flags
-// its own definition is unshippable. The third is a legitimate unrelated
-// nested-Parameters expression (company-skill-test-runs-service.test.ts).
+// Must stay green: legitimate unrelated nested-Parameters expressions
+// (company-skill-test-runs-service.test.ts) and plain uses of the alias.
 const ALLOWED = [
-  'type DbTransactionCallback = Parameters<Db["transaction"]>[0];',
-  "export type DbTransaction = Parameters<DbTransactionCallback>[0];",
+  // A test double spreading the method's own argument tuple is not a handle
+  // derivation: there is no `[0]` picking the callback's first parameter.
+  "        (async (...args: Parameters<typeof db.transaction>) => {",
   "    createHarnessIssue: async (issue: Parameters<Parameters<typeof svc.createTestRun>[4][\"createHarnessIssue\"]>[0]) => {",
   "type HeartbeatDbExecutor = Db | DbTransaction;",
   "  async function applyArchiveCascadeInTx(tx: DbTransaction, id: string) {",
@@ -45,8 +51,28 @@ test("does not flag the client.ts split that defines the replacement", () => {
   }
 });
 
-test("nesting is required — a single Parameters<...> over a transaction is the definition, not a copy", () => {
-  assert.equal(violatesTxAliasBan('Parameters<Db["transaction"]>[0]'), false);
+// The deliberate two-alias split in packages/db/src/client.ts DEFINES the
+// replacement. It is exempt because of WHERE it lives, not because of its
+// shape: the same two lines anywhere else are a re-derivation.
+const DEFINITION_SPLIT = [
+  'type DbTransactionCallback = Parameters<Db["transaction"]>[0];',
+  "export type DbTransaction = Parameters<DbTransactionCallback>[0];",
+];
+
+test("the client.ts split is exempted by path, not by shape", () => {
+  assert.equal(violatesTxAliasBan(DEFINITION_SPLIT[0]), true, "line 1 carries the banned single level");
+  assert.equal(violatesTxAliasBan(DEFINITION_SPLIT[1]), false, "line 2 names the alias, not a transaction");
+  assert.equal(DEFINITION_SITE, "packages/db/src/client.ts");
+  let grepArgs;
+  scanRepo({
+    repoRoot: "/repo",
+    exec: (_cmd, args) => {
+      grepArgs = args;
+      return "";
+    },
+  });
+  assert.ok(grepArgs.includes(`:(exclude)${DEFINITION_SITE}`), "the definition site is carved out by pathspec");
+  assert.equal(grepArgs.indexOf("--") < grepArgs.indexOf(`:(exclude)${DEFINITION_SITE}`), true, "the exclude is a pathspec, not a flag");
 });
 
 test("the message names the replacement import", () => {
