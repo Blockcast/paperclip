@@ -14,7 +14,9 @@ import {
   type EvidenceCommentLite,
   type EvidenceVerdict,
 } from "./evidence-gate.js";
+import type { EvidenceShape } from "./evidence-shapes.js";
 import { DEFAULT_EVIDENCE_REGISTRY } from "./evidence-shapes.js";
+import type { TruthProbe } from "./evidence-truth.js";
 
 export interface EvidenceFetchResult {
   description: string | null;
@@ -26,6 +28,14 @@ export interface EvidenceFetchResult {
     type: string;
     metadata: Record<string, unknown> | null;
     status: string | null;
+    /**
+     * Provenance. The truth probe trusts a `merged` claim only from a
+     * webhook-stamped row, so this must be selected alongside the row — a
+     * dropped `sourceTrust` silently downgrades every PR to "confirm with
+     * GitHub", which is slower but still correct, and an INVENTED one would
+     * not be.
+     */
+    sourceTrust: { promotedByActorId?: string | null } | null;
   }>;
 }
 
@@ -91,6 +101,8 @@ export async function runEvidenceGate(
   fetch: FetchEvidenceForGate,
   issueId: string,
   now: Date = new Date(),
+  truth?: TruthProbe,
+  options?: { unlabeledTruthBlock?: boolean },
 ): Promise<EvidenceVerdictRecord> {
   const data = await fetch(issueId, now);
   const override = (data.operatorOverrideComments ?? data.comments)
@@ -122,6 +134,26 @@ export async function runEvidenceGate(
       commitEvidence: [],
     };
   }
+  // Deliberately AFTER the operator override: an override is a human saying
+  // "ship it anyway", and spending GitHub calls to contradict them is both
+  // slower and pointless.
+  let externalDetections: Partial<Record<EvidenceShape, boolean>> | undefined;
+  let probeFailed = false;
+  let noLinkedPullRequest = false;
+  const truthDiagnostics: string[] = [];
+  if (truth) {
+    const probed = await truth({
+      workProducts: data.workProducts.map((wp) => ({
+        type: wp.type,
+        metadata: wp.metadata,
+        sourceTrust: wp.sourceTrust,
+      })),
+    });
+    externalDetections = probed.detections;
+    probeFailed = probed.probeFailed;
+    noLinkedPullRequest = probed.noLinkedPullRequest;
+    truthDiagnostics.push(...probed.diagnostics);
+  }
   const evaluation = evaluateEvidence({
     issue: {
       description: data.description,
@@ -135,6 +167,10 @@ export async function runEvidenceGate(
     })),
     registry: DEFAULT_EVIDENCE_REGISTRY,
     doneWhenBulletsRemoved: data.doneWhenBulletsRemoved,
+    externalDetections,
+    probeFailed,
+    noLinkedPullRequest,
+    unlabeledTruthBlock: options?.unlabeledTruthBlock,
   });
   return {
     verdict: evaluation.verdict,
@@ -143,7 +179,7 @@ export async function runEvidenceGate(
     requiredFound: evaluation.requiredFound,
     allDetected: evaluation.allDetected,
     unlabeledFallback: evaluation.unlabeledFallback,
-    diagnostics: evaluation.diagnostics,
+    diagnostics: [...evaluation.diagnostics, ...truthDiagnostics],
     evaluatedAt: now.toISOString(),
     commitEvidence: extractGithubCommitEvidence(data.comments),
   };

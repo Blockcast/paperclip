@@ -57,6 +57,16 @@ const OPERATION_CWD_SENTINEL = "/fixture/sentinel-operation-cwd";
 const OPERATION_METADATA_SENTINEL = "/fixture/sentinel-operation-worktree-path";
 
 /**
+ * BLO-34631. Command *output*, and distinct from the `command` sentinel on purpose: the whole
+ * question this ticket settled is whether withholding the command while disclosing its output is a
+ * boundary or a gap. It resolved to "disclosed, deliberately" on a consumer survey, so these two
+ * are the values an unentitled reader is expected to RECEIVE — named for the decision they pin
+ * rather than for egress. Both invented.
+ */
+const OPERATION_STDOUT_SENTINEL = "sentinel-operation-stdout-disclosed-by-design";
+const OPERATION_STDERR_SENTINEL = "sentinel-operation-stderr-disclosed-by-design";
+
+/**
  * PEN-3073. The lifecycle command scalars that sit BESIDE `workspaceRuntime` on the same config
  * object, and their siblings on the three nouns that carry the same strings elsewhere. Each gets its
  * own sentinel for the reason stated above: a passing assertion has to name the exit it closed.
@@ -840,10 +850,47 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
     });
 
     /**
+     * BLO-34631 AC 3, resolved as DISCLOSED — pinned by a test because it is a decision, not an
+     * omission, and the next reader of `publicWorkspaceOperation` will otherwise see `command` and
+     * `cwd` masked beside two unmasked siblings and "fix" the asymmetry.
+     *
+     * The CTO lean was to withhold, on the symmetry argument that the output of a withheld command
+     * discloses the command. AC 3 made that falsifiable by a consumer survey and the survey
+     * falsifies it: `POST /execution-workspaces/:id/runtime-services/:action` answers with this
+     * same projection, it is the backing call for the MCP tool
+     * `paperclipControlIssueWorkspaceServices`, and same-company agents deliberately lack
+     * `workspace_runtime:read` — so masking here hands an agent `***REDACTED***` for the output of
+     * the command it just triggered.
+     *
+     * The contrast in the last two assertions is the whole point: this reader is unentitled, and
+     * the SAME row still withholds `command`/`cwd`. So this case cannot pass by the projection
+     * being skipped, only by the excerpts being deliberately exempt from it.
+     */
+    it("discloses the operation excerpts to a reader without workspace_runtime:read", async () => {
+      mockWorkspaceOperationService.listForExecutionWorkspace.mockResolvedValue([
+        workspaceOperationFixture({
+          stdoutExcerpt: OPERATION_STDOUT_SENTINEL,
+          stderrExcerpt: OPERATION_STDERR_SENTINEL,
+        }),
+      ]);
+
+      const res = await request(createApp("execution-workspaces")).get(
+        "/api/execution-workspaces/workspace-1/workspace-operations",
+      );
+
+      expect(res.status).toBe(200);
+      expect(res.body[0].stdoutExcerpt).toBe(OPERATION_STDOUT_SENTINEL);
+      expect(res.body[0].stderrExcerpt).toBe(OPERATION_STDERR_SENTINEL);
+      expect(res.body[0].command).toBe(REDACTED_EVENT_VALUE);
+      expect(res.body[0].cwd).toBe(REDACTED_EVENT_VALUE);
+    });
+
+    /**
      * PEN-3205, read side. `publicWorkspaceOperation` masks `command`/`cwd`/`metadata` and spreads
-     * the rest, so `stdoutExcerpt` crosses this route UNMASKED by design — the username censor is
-     * the only control standing over it here, and `routes/agents.ts` was already applying it on
-     * the sibling list route while this one answered with a bare `res.json`.
+     * the rest, so `stdoutExcerpt` crosses this route UNMASKED by design (BLO-34631 surveyed that
+     * and kept it) — the username censor is the only control standing over it here, and
+     * `routes/agents.ts` was already applying it on the sibling list route while this one answered
+     * with a bare `res.json`.
      *
      * The home directory comes from `os.homedir()` rather than a literal because that is the same
      * value `defaultHomeDirs` derives its (module-cached) candidate list from, so this is

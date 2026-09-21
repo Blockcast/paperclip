@@ -1982,6 +1982,32 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         issueComments.set(issueId, existingForIssue);
         return comment;
       },
+      async updateComment(issueId, idempotencyKey, body, companyId, options) {
+        requireCapability(manifest, capabilitySet, "issue.comments.update");
+        if (!isInCompany(issues.get(issueId), companyId)) {
+          throw new Error(`Issue not found: ${issueId}`);
+        }
+        // Same `(issue, author, key)` scope and same live-row filter as the
+        // host's `updateCommentByIdempotencyKey`, so a plugin that gets the
+        // author or the key wrong sees the null here that it would see in
+        // production rather than a convenient match. As in `createComment`, the
+        // raw caller key is stored — the host's `plugin:<pluginId>:` namespace
+        // is not modelled, so do not read a match here as evidence that another
+        // plugin's comment would be unreachable; that is the namespace's job.
+        const key = idempotencyKey?.trim();
+        if (!key) throw new Error("updateComment requires a non-empty idempotencyKey");
+        const authorAgentId = options?.authorAgentId ?? null;
+        const existing = (issueComments.get(issueId) ?? []).find(
+          (candidate) =>
+            candidate.idempotencyKey === key &&
+            candidate.authorAgentId === authorAgentId &&
+            !candidate.deletedAt,
+        );
+        if (!existing) return null;
+        existing.body = body;
+        existing.updatedAt = new Date();
+        return existing;
+      },
       async createInteraction(issueId, interaction, companyId, options) {
         requireCapability(manifest, capabilitySet, "issue.interactions.create");
         const parentIssue = issues.get(issueId);

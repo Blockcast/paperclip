@@ -57,6 +57,7 @@ function createRun(overrides: Partial<HeartbeatRun> = {}): HeartbeatRun {
     logBytes: null,
     logSha256: null,
     logCompressed: false,
+    firstOutputAt: null,
     lastOutputAt: null,
     lastOutputSeq: 0,
     lastOutputStream: null,

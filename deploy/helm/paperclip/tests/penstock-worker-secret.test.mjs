@@ -1,4 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
@@ -134,4 +135,124 @@ test("API Deployment does not receive the worker-only readiness budget", () => {
     "persistence.existingClaim=paperclip-shared",
   ]);
   assert.doesNotMatch(rendered, /PENSTOCK_READY_TIMEOUT_MS/);
+});
+
+// BLO-33279, second half. Rendering the value onto the worker is necessary and
+// NOT sufficient: the claude_k8s adapter filters every inherited literal
+// through AGENT_ENV_ALLOWLIST (BLO-22514, k8s-client.ts), so a worker.extraEnv
+// literal whose name is not listed there reaches no agent pod at all. That is
+// how PENSTOCK_READY_TIMEOUT_MS shipped green on 2026-09-12 and changed
+// nothing — the test above passed, the sts carried the value, and every agent
+// Job still ran the 15000 ms default. The runbook asserted "there is no name
+// allowlist", which had been false since BLO-22514.
+//
+// ponytail: text-scrape of the allowlist rather than importing it — the module
+// is TypeScript in a vendored package and this is a dependency-free node:test
+// file. Upgrade to a real import if these tests ever gain a TS pipeline.
+
+// Entries only. Matched at line start so a name quoted inside a COMMENT in the
+// set body is not counted as a member (BLO-34412) — `// "X" stays denied` would
+// otherwise read as an entry under a substring test and make the guard report a
+// denied name inheritable. Requires the trailing comma prettier already writes;
+// a comma-less final entry is dropped, which fails toward a false RED.
+const setEntries = (block) => [...block.matchAll(/^\s*"([A-Za-z0-9_]+)",/gm)].map((m) => m[1]);
+
+// Mirrors isAgentInheritableEnvName (inherit-allowlist.ts). The order is the
+// point: the runtime checks SERVER_ONLY_ENV_DENY FIRST and deny beats both the
+// exact allowlist and the prefix families, so a predicate written as
+// "allowlist OR prefix" reports inheritable for a name the adapter drops.
+function buildInheritPredicate(allowlistSrc) {
+  const block = (re, label) => {
+    const found = allowlistSrc.match(re)?.[0];
+    assert.ok(found, `could not locate the adapter ${label} declaration`);
+    return setEntries(found);
+  };
+  const deny = block(/SERVER_ONLY_ENV_DENY[\s\S]*?\n\]\);/, "SERVER_ONLY_ENV_DENY");
+  const exact = block(/AGENT_ENV_ALLOWLIST[\s\S]*?\n\]\);/, "AGENT_ENV_ALLOWLIST");
+  const prefixes = block(/AGENT_ENV_ALLOWED_PREFIXES[\s\S]*?\n\];/, "AGENT_ENV_ALLOWED_PREFIXES");
+
+  return (name) =>
+    !deny.includes(name) &&
+    (exact.includes(name) || prefixes.some((prefix) => name.startsWith(prefix)));
+}
+
+test("every literal worker.extraEnv name is inheritable by agent Jobs", () => {
+  const values = readFileSync(`${repoRoot}/${blockcastValues}`, "utf8");
+  // ponytail: two known ceilings in this scan, both of which degrade QUIETLY
+  // rather than erroring (BLO-34412) — `literals.length > 0` catches only TOTAL
+  // truncation, so a partially-skipped block still reports green.
+  //   1. the worker: capture ends at the first column-0 line, so a top-level
+  //      comment between extraEnv entries truncates it;
+  //   2. the literal regex requires `name:` before `value:` inside a mapping,
+  //      which YAML does not guarantee.
+  // Both are cheap to spot once written down. Upgrade path: parse the values
+  // file with a real YAML loader once this test file has a dependency.
+  const workerBlock = values.match(/^worker:\n((?:[ \t].*\n|\n)*)/m)?.[1];
+  assert.ok(workerBlock, "worker: block not found in values.blockcast.yaml");
+
+  // Literals only. valueFrom entries travel a separate path.
+  const literals = [...workerBlock.matchAll(/- name: (\S+)\n\s+value:/g)].map((m) => m[1]);
+  assert.ok(literals.length > 0, "expected at least one literal in worker.extraEnv");
+
+  const inheritable = buildInheritPredicate(
+    readFileSync(
+      `${repoRoot}/vendor/paperclip-adapter-claude-k8s/src/server/inherit-allowlist.ts`,
+      "utf8",
+    ),
+  );
+
+  for (const name of literals) {
+    assert.ok(
+      inheritable(name),
+      `worker.extraEnv sets ${name}, but the adapter will not inherit it — ` +
+        `no agent pod will ever see the value`,
+    );
+  }
+});
+
+// Negative controls for the predicate above. The guard scrapes the real
+// allowlist, so these are the only place the deny-shadowing and commented-name
+// cases can be exercised: today's source happens to contain neither, which is
+// exactly why the un-fixed guard read green on both.
+test("SERVER_ONLY_ENV_DENY beats the allowlist and the prefix families", () => {
+  const inheritable = buildInheritPredicate(`
+export const SERVER_ONLY_ENV_DENY: ReadonlySet<string> = new Set([
+  "DATABASE_URL",
+  "ANTHROPIC_ADMIN_KEY",
+]);
+export const AGENT_ENV_ALLOWLIST: ReadonlySet<string> = new Set([
+  "DATABASE_URL",
+  "PAPERCLIP_API_URL",
+]);
+export const AGENT_ENV_ALLOWED_PREFIXES: readonly string[] = [
+  "ANTHROPIC_",
+];
+`);
+
+  // Both of these pass a predicate that omits the deny check.
+  assert.equal(inheritable("DATABASE_URL"), false, "deny must beat the exact allowlist");
+  assert.equal(inheritable("ANTHROPIC_ADMIN_KEY"), false, "deny must beat a prefix family");
+
+  assert.equal(inheritable("PAPERCLIP_API_URL"), true);
+  assert.equal(inheritable("ANTHROPIC_AUTH_TOKEN"), true);
+});
+
+test("a name quoted only in a comment is not a set entry", () => {
+  const inheritable = buildInheritPredicate(`
+export const SERVER_ONLY_ENV_DENY: ReadonlySet<string> = new Set([
+  // "PENSTOCK_READY_TIMEOUT_MS" was considered here and rejected.
+  "DATABASE_URL",
+]);
+export const AGENT_ENV_ALLOWLIST: ReadonlySet<string> = new Set([
+  // "PENSTOCK_RUNTIME_TOKEN" stays denied.
+  "PENSTOCK_READY_TIMEOUT_MS",
+]);
+export const AGENT_ENV_ALLOWED_PREFIXES: readonly string[] = [
+  "ANTHROPIC_",
+];
+`);
+
+  // Substring membership reads both comments as entries, and gets both wrong.
+  assert.equal(inheritable("PENSTOCK_RUNTIME_TOKEN"), false, "a comment must not admit a name");
+  assert.equal(inheritable("PENSTOCK_READY_TIMEOUT_MS"), true, "a comment must not deny a name");
 });

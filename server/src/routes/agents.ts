@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
-import { REDACTED_EVENT_VALUE, isPlainObject, redactAgentConfigPayload, redactEventPayload } from "../redaction.js";
+import { REDACTED_EVENT_VALUE, isPlainObject, maskWorkspaceRuntimeTextForRead, redactAgentConfigPayload, redactEventPayload } from "../redaction.js";
 import { diffAgentAdapterSecretBindings } from "../services/agent-secret-bindings.js";
 import { agentRuntimeState, agents as agentsTable, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
 import { and, asc, desc, eq, gte, inArray, not, or, sql } from "drizzle-orm";
@@ -366,31 +366,65 @@ export function agentRoutes(
   const instanceSettings = instanceSettingsService(db);
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
 
-  async function logRunLogAccessAudit(
+  /**
+   * BLO-34631. Shared by both raw-log surfaces. `/workspace-operations/:id/log` serves the same
+   * class of bytes as `/heartbeat-runs/:runId/log` — stored log content, not a projected row — and
+   * was the only one of the four run/operation log surfaces writing no audit record at all, so
+   * "who read this log" had no answer for it. Both call sites audit allowed AND denied reads.
+   */
+  async function logLogAccessAudit(
     req: Request,
-    run: { id: string; companyId: string; logStore: string | null },
+    entity: {
+      companyId: string;
+      entityType: "heartbeat_run" | "workspace_operation";
+      entityId: string;
+      runId: string | null;
+      logStore: string | null;
+    },
     result: "allowed" | "denied",
-    opts: { offset: number; limitBytes: number },
+    opts: { offset: number; limitBytes: number; withheld?: boolean },
   ) {
     const actor = getRunLogAuditActor(req);
     await logActivity(db, {
-      companyId: run.companyId,
+      companyId: entity.companyId,
       actorType: actor.actorType,
       actorId: actor.actorId,
       agentId: actor.agentId,
-      runId: run.id,
-      action: "heartbeat.run_log_accessed",
-      entityType: "heartbeat_run",
-      entityId: run.id,
+      runId: entity.runId,
+      action: entity.entityType === "heartbeat_run"
+        ? "heartbeat.run_log_accessed"
+        : "workspace_operation.log_accessed",
+      entityType: entity.entityType,
+      entityId: entity.entityId,
       details: {
         result,
         actorSource: actor.actorSource,
         actorRunId: actor.actorRunId,
         offset: opts.offset,
         limitBytes: opts.limitBytes,
-        logStore: run.logStore,
+        logStore: entity.logStore,
+        // BLO-34631 review: a withheld read and a real disclosure are both `result: "allowed"` —
+        // the access check decides reachability, the entitlement decides the bytes. Record which
+        // one happened so "who read this log" is answerable without re-deriving the reader's
+        // grants after the fact. Absent on surfaces that apply no read-time projection.
+        ...(opts.withheld === undefined ? {} : { withheld: opts.withheld }),
       },
     });
+  }
+
+  async function logRunLogAccessAudit(
+    req: Request,
+    run: { id: string; companyId: string; logStore: string | null },
+    result: "allowed" | "denied",
+    opts: { offset: number; limitBytes: number },
+  ) {
+    await logLogAccessAudit(req, {
+      companyId: run.companyId,
+      entityType: "heartbeat_run",
+      entityId: run.id,
+      runId: run.id,
+      logStore: run.logStore,
+    }, result, opts);
   }
 
   async function assertAgentEnvironmentSelection(
@@ -1768,14 +1802,45 @@ export function agentRoutes(
     );
   }
 
+  /**
+   * An agent must not be able to change its own instructions path or bundle
+   * configuration — that is a rewrite of its own operating instructions.
+   *
+   * This compares each instructions key the write would persist against the
+   * value already stored and refuses only a difference. A presence test is
+   * wrong here for the same reason it was wrong for secret bindings: on
+   * `PATCH /agents/:id` this guard also runs against the *effective* config,
+   * which `resolveRawEffectiveAdapterConfigForPatch` shallow-merges onto the
+   * stored config precisely to preserve these keys. Every bundle-managed agent
+   * therefore carried its whole `KNOWN_INSTRUCTIONS_BUNDLE_KEYS` set into the
+   * guard, so any agent-authored `adapterConfig` write — one naming no
+   * instructions key at all, or a verbatim no-op round-trip — was refused with
+   * a message listing keys the caller never sent (BLO-32332). There was no
+   * request shape that could pass.
+   *
+   * Check the value that is actually persisted, not just the request: on
+   * `PATCH /agents/:id` the persisted config is the output of
+   * `syncInstructionsBundleConfigFromFilePath`, which re-derives the bundle
+   * keys from `instructionsFilePath` and resolves a relative one against
+   * `adapterConfig.cwd` — a key with no agent-actor guard of its own. So that
+   * call site runs this guard a second time on the post-sync result.
+   *
+   * `existingAdapterConfig` is omitted on create and hire, where there is no
+   * prior state and every key present is therefore a change. Removal is not
+   * checked here: a merge cannot drop a key, and the `replaceAdapterConfig`
+   * path that can routes through `assertCanManageInstructionsPath` instead.
+   */
   function assertNoAgentInstructionsConfigMutation(
     req: Request,
     adapterConfig: Record<string, unknown> | null | undefined,
     path = "adapterConfig",
+    existingAdapterConfig?: Record<string, unknown> | null,
   ) {
     if (req.actor.type !== "agent" || !adapterConfig) return;
+    const existing = existingAdapterConfig ?? {};
     const changedSensitiveKeys = KNOWN_INSTRUCTIONS_BUNDLE_KEYS
-      .filter((key) => adapterConfig[key] !== undefined)
+      .filter((key) => adapterConfig[key] !== undefined
+        && JSON.stringify(adapterConfig[key]) !== JSON.stringify(existing[key]))
       .map((key) => `${path}.${key}`);
     if (changedSensitiveKeys.length === 0) return;
     throw forbidden(
@@ -1890,7 +1955,12 @@ export function agentRoutes(
       effectiveAdapterConfig?: Record<string, unknown> | null;
     },
   ) {
-    assertNoAgentInstructionsConfigMutation(req, adapterConfig, path);
+    assertNoAgentInstructionsConfigMutation(
+      req,
+      adapterConfig,
+      path,
+      options?.existingAdapterConfig ?? null,
+    );
     assertNoAgentSecretBindingMutation(
       req,
       options?.effectiveAdapterConfig ?? adapterConfig,
@@ -3740,6 +3810,39 @@ export function agentRoutes(
         existingAdapterConfig,
       });
       patchData.adapterConfig = syncInstructionsBundleConfigFromFilePath(existing, normalizedEffectiveAdapterConfig);
+      // The sync above re-derives the bundle keys from `instructionsFilePath`,
+      // resolving a relative one against `adapterConfig.cwd`. `cwd` is not an
+      // instructions key and has no agent-actor guard, so the check before the
+      // sync passes on a body naming only `cwd` — every instructions value is
+      // byte-identical to stored at that point — and the sync then relocates
+      // the bundle. Re-check what is actually written.
+      //
+      // The baseline is the stored config put through the same sync, not the
+      // stored row: for a legacy relative `instructionsFilePath` the sync
+      // rewrites the keys on every write, so diffing against the raw row would
+      // refuse writes that move nothing — the BLO-32332 bug again, one step
+      // later. Comparing sync(stored) with sync(next) asks only whether this
+      // write moved the bundle.
+      //
+      // Gated on the actor here rather than relying on the guard's own
+      // `actor.type !== "agent"` early return: that return is inside the
+      // function body, so argument evaluation precedes it, and this baseline
+      // syncs the *stored* config. A stored legacy relative
+      // `instructionsFilePath` with no absolute `cwd` throws 422 in
+      // `resolveLegacyInstructionsPath` — a shape `svc.create`/hire persist
+      // unvalidated — so evaluating it for every actor would refuse the
+      // human/board write that repairs it by supplying the missing `cwd`.
+      // An agent sending that same write still fails, on the 422 rather than
+      // a 403: the refusal is right (it relocates the bundle), the status
+      // is not.
+      if (req.actor.type === "agent") {
+        assertNoAgentInstructionsConfigMutation(
+          req,
+          asRecord(patchData.adapterConfig),
+          "adapterConfig",
+          syncInstructionsBundleConfigFromFilePath(existing, existingAdapterConfig),
+        );
+      }
       // PATCH writes `adapterConfig` straight through to the service, so it was
       // the one skill-writing route with no skill validation at all — hire and
       // create already resolve strictly, and skills/sync at least resolves. That
@@ -4793,6 +4896,7 @@ export function agentRoutes(
       continuationAttempt: heartbeatRuns.continuationAttempt,
       lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
       nextAction: heartbeatRuns.nextAction,
+      firstOutputAt: heartbeatRuns.firstOutputAt,
       lastOutputAt: heartbeatRuns.lastOutputAt,
       lastOutputSeq: heartbeatRuns.lastOutputSeq,
       lastOutputStream: heartbeatRuns.lastOutputStream,
@@ -5035,11 +5139,15 @@ export function agentRoutes(
       throw error;
     }
 
-    await logRunLogAccessAudit(req, run, "allowed", { offset: normalizedOffset, limitBytes });
+    // BLO-34738: audit AFTER `readLog` returns. It throws `notFound("Run log not found")` when the
+    // run stored no log (`services/heartbeat.ts`), and a 404 that disclosed nothing is not a read —
+    // auditing first booked `result: "allowed"` against it, so "who read this log" over-reported.
+    // Denied-path audits stay before the response: those record an attempt, which did happen.
     const result = await heartbeat.readLog(run, {
       offset: normalizedOffset,
       limitBytes,
     });
+    await logRunLogAccessAudit(req, run, "allowed", { offset: normalizedOffset, limitBytes });
 
     res.set("Cache-Control", "no-cache, no-store");
     res.json(result);
@@ -5065,18 +5173,74 @@ export function agentRoutes(
 
   router.get("/workspace-operations/:operationId/log", async (req, res) => {
     const operationId = req.params.operationId as string;
-    const operation = await getAccessibleResource(req, res, workspaceOperations.getById(operationId), "Workspace operation not found");
-    if (!operation) return;
-
     const offset = Number(req.query.offset ?? 0);
+    const normalizedOffset = Number.isFinite(offset) ? offset : 0;
     const limitBytes = readRunLogLimitBytes(req.query.limitBytes);
+    const operation = await workspaceOperations.getById(operationId);
+    if (!operation) {
+      res.status(404).json({ error: "Workspace operation not found" });
+      return;
+    }
+
+    const audit = (result: "allowed" | "denied", withheld?: boolean) => logLogAccessAudit(req, {
+      companyId: operation.companyId,
+      entityType: "workspace_operation",
+      entityId: operation.id,
+      runId: operation.heartbeatRunId,
+      logStore: operation.logStore,
+    }, result, { offset: normalizedOffset, limitBytes, withheld });
+
+    // Same shape as `/heartbeat-runs/:runId/log` rather than `getAccessibleResource`: keep the
+    // cross-tenant 404 so this route is not an existence oracle, without silently dropping the
+    // denied access event. `getAccessibleResource`'s own doc block names audit-logged denials as
+    // the case that should compose `hasCompanyAccess` directly.
+    if (!hasCompanyAccess(req, operation.companyId)) {
+      await audit("denied");
+      res.status(404).json({ error: "Workspace operation not found" });
+      return;
+    }
+
+    try {
+      assertCompanyAccess(req, operation.companyId);
+    } catch (error) {
+      await audit("denied");
+      throw error;
+    }
+
+    // Viewer first: the audit record has to say whether this read actually disclosed anything, and
+    // only the entitlement knows that. Resolved after the two denial paths, so a caller who never
+    // clears company access costs no entitlement lookup.
+    const viewer = await resolveWorkspaceRuntimeViewer(access, req, operation.companyId);
+    // BLO-34738: then `readLog`, and only then the audit. It throws
+    // `notFound("Workspace operation log not found")` when the operation stored no log
+    // (`services/workspace-operations.ts`), so auditing first booked `result: "allowed",
+    // withheld: true` against a 404 that disclosed nothing — inaccurate on exactly the flag
+    // BLO-34631 added for audit accuracy. Same ordering as `/heartbeat-runs/:runId/log`
+    // deliberately: the two are one URL apart, and a split audit semantic across them is the
+    // failure mode this series exists to close.
     const result = await workspaceOperations.readLog(operationId, {
-      offset: Number.isFinite(offset) ? offset : 0,
+      offset: normalizedOffset,
       limitBytes,
     });
+    await audit("allowed", !viewer.revealRuntimeConfig);
 
     res.set("Cache-Control", "no-cache, no-store");
-    res.json(result);
+    // BLO-34631. `content` is the stored chunk verbatim — the write-time sanitizer is a heuristic
+    // secret matcher, not a withholding boundary, so it lets host paths, repo layout and any
+    // operator command echoed by `set -x` through. That is the same text `publicWorkspaceOperation`
+    // withholds one projection over, so it is withheld on the same entitlement. Masked rather than
+    // emptied, matching `publicRuntimeServices`: a withheld reader can still tell "this operation
+    // logged nothing" from "the log was withheld". `redactCurrentUserValue` still runs for the
+    // entitled reader, because write-time username censoring is not retroactive.
+    res.json(redactCurrentUserValue(
+      {
+        ...result,
+        content: viewer.revealRuntimeConfig
+          ? result.content
+          : maskWorkspaceRuntimeTextForRead(result.content),
+      },
+      await getCurrentUserRedactionOptions(),
+    ));
   });
 
   router.get("/issues/:issueId/live-runs", async (req, res) => {
@@ -5116,6 +5280,7 @@ export function agentRoutes(
         continuationAttempt: heartbeatRuns.continuationAttempt,
         lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
         nextAction: heartbeatRuns.nextAction,
+        firstOutputAt: heartbeatRuns.firstOutputAt,
         lastOutputAt: heartbeatRuns.lastOutputAt,
         lastOutputSeq: heartbeatRuns.lastOutputSeq,
         lastOutputStream: heartbeatRuns.lastOutputStream,

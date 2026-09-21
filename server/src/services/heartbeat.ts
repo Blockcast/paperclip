@@ -4090,6 +4090,7 @@ const heartbeatRunListColumns = {
   processPid: heartbeatRuns.processPid,
   processGroupId: heartbeatRunProcessGroupIdColumn,
   processStartedAt: heartbeatRuns.processStartedAt,
+  firstOutputAt: heartbeatRuns.firstOutputAt,
   lastOutputAt: heartbeatRuns.lastOutputAt,
   lastOutputSeq: heartbeatRuns.lastOutputSeq,
   lastOutputStream: heartbeatRuns.lastOutputStream,
@@ -4244,6 +4245,7 @@ const heartbeatRunIssueSummaryColumns = {
   continuationAttempt: heartbeatRuns.continuationAttempt,
   lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
   nextAction: heartbeatRuns.nextAction,
+  firstOutputAt: heartbeatRuns.firstOutputAt,
   lastOutputAt: heartbeatRuns.lastOutputAt,
   lastOutputSeq: heartbeatRuns.lastOutputSeq,
   lastOutputStream: heartbeatRuns.lastOutputStream,
@@ -21291,6 +21293,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         id: heartbeatRuns.id,
         contextSnapshot: heartbeatRuns.contextSnapshot,
         startedAt: heartbeatRuns.startedAt,
+        firstOutputAt: heartbeatRuns.firstOutputAt,
         lastOutputAt: heartbeatRuns.lastOutputAt,
         lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
       })
@@ -30309,6 +30312,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await db
         .update(heartbeatRuns)
         .set({
+          // Write-once: the first flush stamps it, every later flush is a
+          // no-op. COALESCE rather than a read-then-write so two concurrent
+          // flushes cannot race the value forward, and so no extra SELECT is
+          // added to the hot output path. `pendingOutputProgress.at` is the
+          // timestamp of the output event itself, not of the flush, and the
+          // first output always flushes immediately (the interval check below
+          // short-circuits on `!lastOutputFlushAt`) -- so this records when the
+          // run actually spoke, not when the writer got around to persisting.
+          //
+          // `.toISOString()` + explicit cast, not the bare Date: inside a
+          // `sql` template drizzle does not apply the column's type mapper, so
+          // a Date reaches postgres.js unconverted and the bind fails with
+          // ERR_INVALID_ARG_TYPE at runtime. Covered by
+          // heartbeat-run-first-output-at.test.ts, which exercises this exact
+          // statement against a real database.
+          firstOutputAt: sql`COALESCE(${heartbeatRuns.firstOutputAt}, ${pendingOutputProgress.at.toISOString()}::timestamptz)`,
           lastOutputAt: pendingOutputProgress.at,
           lastUsefulActionAt: pendingOutputProgress.at,
           lastOutputSeq: pendingOutputProgress.seq,

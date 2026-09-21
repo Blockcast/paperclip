@@ -168,6 +168,18 @@ const CAPACITY_RETRY_ERROR_CODE = "rate_limit_exhausted";
 // a fresh episode) always suppresses, while an episode that was already long
 // *before* it started still fires on its own unattended time.
 const NO_EXECUTABLE_TURN_DOMINANT_SHARE = 0.5;
+
+/**
+ * BLO-27698 B2: the one dominance shape, shared by both mechanisms that can
+ * account for an episode instead of assignee inactivity — no-executable-turn
+ * time (BLO-23248/BLO-23624) and executing time (B1). Extracted rather than
+ * re-written so a change to what "dominant" means cannot apply to one and not
+ * the other, which would leave the two gates disagreeing about the same
+ * episode.
+ */
+function isDominantEpisodeShare(partMs: number, elapsedMs: number | null) {
+  return elapsedMs !== null && elapsedMs > 0 && partMs / elapsedMs > NO_EXECUTABLE_TURN_DOMINANT_SHARE;
+}
 // BLO-26165: `heartbeatRuns.issueCommentStatus` defaults to (and is explicitly
 // re-stamped) `not_applicable` by `finalizeIssueCommentPolicy` (heartbeat.ts).
 // It is NOT an invocation signal and must never be used as one — see
@@ -212,7 +224,12 @@ type ProductivityReviewTrigger =
   | "no_comment_streak"
   | "long_active_duration"
   | "high_churn"
-  | "runtime_failure_streak";
+  | "runtime_failure_streak"
+  // BLO-27698 B3b: one run that has been executing, uninterrupted and still
+  // live, for at least `longActiveMs`. Distinct from `long_active_duration`,
+  // which after B3 measures only time nobody was accounting for — a runaway run
+  // is the opposite shape (the turn was taken and never given back).
+  | "runaway_execution";
 
 type ProductivityReviewThresholds = {
   noCommentStreakRuns: number;
@@ -614,6 +631,26 @@ function issueRunScopeSql(issueId: string) {
   );
 }
 
+/**
+ * Batched `issueRunScopeSql` — same three columns, one query for many issues.
+ * Used by the retirement sweep, which resolves run liveness for every open
+ * `runaway_execution` review at once rather than per review.
+ */
+function issueRunScopeInSql(issueIds: string[]) {
+  return or(
+    inArray(heartbeatRuns.contextIssueId, issueIds),
+    inArray(heartbeatRuns.contextTaskId, issueIds),
+    inArray(heartbeatRuns.contextTaskKey, issueIds),
+  );
+}
+
+/** The source issue a run row is scoped to, for grouping a batched scope read. */
+function runScopeIssueIds(run: HeartbeatRunRow) {
+  return [run.contextIssueId, run.contextTaskId, run.contextTaskKey].filter(
+    (id): id is string => Boolean(id),
+  );
+}
+
 function msToHuman(ms: number | null) {
   if (ms === null) return "unknown";
   const minutes = Math.floor(ms / 60_000);
@@ -856,6 +893,22 @@ function runLiveInterval(run: HeartbeatRunRow, now: Date): { start: number; end:
   }
   if (!end) return null;
   return end.getTime() > start.getTime() ? { start: start.getTime(), end: end.getTime() } : null;
+}
+
+/**
+ * The shared "still signalling" test: a live span that still reaches `now`.
+ *
+ * Written against the span rather than the run so its two consumers cannot
+ * drift — `siblingStillExecuting` (episode attribution) and `liveExecutingMs`
+ * (B3b). The tail clamp in `liveExecutingMs` is provably a no-op only while
+ * those two tests are identical; a comment was carrying that coupling (Ally
+ * review on 06b87852), so it is structural here instead.
+ */
+function stillSignalling(
+  span: { start: number; end: number } | null,
+  now: Date,
+): span is { start: number; end: number } {
+  return span !== null && span.end >= now.getTime();
 }
 
 /** Milliseconds of `[start, end)` not covered by any span in `liveSpans`. */
@@ -1102,13 +1155,13 @@ function deliberatePendingMonitor(
  */
 function monitorGatingBreakdown(
   issue: IssueRow,
-  activeStartedAt: Date | null,
+  attributableStartAt: Date | null,
   elapsedMs: number | null,
   now: Date,
   latestRuns: HeartbeatRunRow[],
   thresholds: ProductivityReviewThresholds,
 ) {
-  if (elapsedMs === null || !activeStartedAt) return null;
+  if (elapsedMs === null || !attributableStartAt) return null;
   const armedUntil = coerceDate(issue.monitorNextCheckAt);
   const lastTriggeredAt = coerceDate(issue.monitorLastTriggeredAt);
 
@@ -1122,8 +1175,6 @@ function monitorGatingBreakdown(
   // unattended. That is the question the split exists to answer — "nobody was
   // watching; was anything still happening?" — and executing time inside the
   // gated prefix is unremarkable, because the monitor was accounting for it.
-  // Since `activeStartedAt` is the most recent dispatch, the current run's live
-  // span starts at the episode boundary, so this is the tail of that span.
   //
   // Leaving the gated prefix whole also keeps `unattendedMs + executingMs`
   // exactly equal to the pre-B1 `unattendedMs`, which is what lets the BLO-22331
@@ -1131,7 +1182,7 @@ function monitorGatingBreakdown(
   // only: B3 is the separate change that makes the trigger fire on the narrowed
   // bucket, and folding it in here is the compute-without-consult failure
   // BLO-27225 documents.
-  const episodeStartMs = activeStartedAt.getTime();
+  const episodeStartMs = attributableStartAt.getTime();
   const episodeEndMs = episodeStartMs + elapsedMs;
   const liveSpans = latestRuns
     .map((run) => runLiveInterval(run, now))
@@ -1147,7 +1198,7 @@ function monitorGatingBreakdown(
   };
 
   // Still armed for a future check. There is no arm-time column, so a monitor
-  // armed seconds ago is indistinguishable from one armed at `activeStartedAt`
+  // armed seconds ago is indistinguishable from one armed at `attributableStartAt`
   // and the whole episode is attributed to gating — flagged as an upper bound,
   // because reporting it flat would tell a manager that a 15h stall was fully
   // accounted for when only the last 90s provably was.
@@ -1183,8 +1234,8 @@ function monitorGatingBreakdown(
 
   // Coverage that ended before this episode began belongs to a prior episode:
   // none of this episode was gated, and calling it an in-episode lapse would
-  // print a timestamp from before `activeStartedAt`.
-  if (lapsedAt.getTime() <= activeStartedAt.getTime()) {
+  // print a timestamp from before `attributableStartAt`.
+  if (lapsedAt.getTime() <= attributableStartAt.getTime()) {
     return {
       ...splitExecuting(0),
       lapsedAt: null,
@@ -1211,7 +1262,7 @@ function monitorGatingBreakdown(
         .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())[0]?.id ?? null)
     : null;
 
-  const gatedMs = Math.min(elapsedMs, lapsedAt.getTime() - activeStartedAt.getTime());
+  const gatedMs = Math.min(elapsedMs, lapsedAt.getTime() - attributableStartAt.getTime());
   // BLO-27698 A4: a monitor whose scheduled check has only just passed has not
   // "lapsed" — it is waiting on the dispatcher, inside the same
   // `monitorLapseServiceGraceMs` window `deliberatePendingMonitor` already
@@ -1702,6 +1753,7 @@ function choosePrimaryTrigger(input: {
   noComment: boolean;
   longActive: boolean;
   highChurn: boolean;
+  runawayExecution: boolean;
 }): ProductivityReviewTrigger | null {
   // Runtime failure takes priority: if the sampled window is dominated by
   // runs that never got a model turn, that is the root cause worth surfacing
@@ -1716,10 +1768,47 @@ function choosePrimaryTrigger(input: {
   if (input.runtimeFailure) return "runtime_failure_streak";
   if (input.noComment) return "no_comment_streak";
   if (input.highChurn) return "high_churn";
+  // BLO-27698 B3b: directly above `long_active_duration`, and that position is
+  // the whole point. B3 narrows `long_active_duration` to the *unattended*
+  // bucket, which by construction stops it firing on an episode a run spent
+  // executing — so without a trigger that outranks it, a genuinely runaway run
+  // would become undetectable instead of merely reclassified. Below the two
+  // streak triggers and `high_churn` because those describe the whole sampled
+  // window; this one describes a single run inside it.
+  //
+  // ⚠ Outranking `long_active_duration` also opts this trigger OUT of every
+  // suppression gate keyed on `trigger === "long_active_duration"` — the
+  // approval gate, `currentPendingMonitorForReviewSuppression`, the A1
+  // progress-PR gate, and the final TOCTOU revalidation. That is deliberate,
+  // not an oversight: those gates all answer "is this elapsed time explained by
+  // something other than assignee inactivity?", and a run that has been
+  // *live-executing* past the bar is burning real compute regardless of the
+  // answer. It is the same argument this file already makes one line above for
+  // `high_churn` — a human gate does not excuse cost being burned against it.
+  // An armed monitor means "wake me later", not "this run may execute
+  // indefinitely". Pinned by the monitor-armed + live-runaway test; if you ever
+  // want a monitor to suppress this, change the test first — a silent flip here
+  // would re-open exactly the indefinite-suppression hazard BLO-22331 AC2
+  // forbids, from the other direction.
+  if (input.runawayExecution) return "runaway_execution";
   if (input.longActive) return "long_active_duration";
   return null;
 }
 
+// Which open reviews hold an agent back from *continuing* onto more work.
+// Scoped to the accumulation triggers — `no_comment_streak` and `high_churn`
+// both say "you have already spent turns badly, stop taking more".
+// Deliberately excluded:
+//   - `long_active_duration` / `runaway_execution` — both describe a single
+//     episode that is still in flight, not a pattern across turns. A
+//     continuation hold cannot act on either: the hold is evaluated between
+//     turns, while the run these describe is executing right now, so holding
+//     would neither stop that run nor answer the review. `runaway_execution`
+//     (BLO-27698 B3b) is excluded for exactly the reason it bypasses the
+//     monitor gate — it is a runtime/cost alarm for a human to adjudicate, not
+//     an automatic brake.
+//   - `runtime_failure_streak` — infra faults; withholding the agent's next
+//     turn punishes it for the platform's failure.
 function isSoftStopTrigger(trigger: ProductivityReviewTrigger) {
   return trigger === "no_comment_streak" || trigger === "high_churn";
 }
@@ -1736,6 +1825,11 @@ function isSoftStopTrigger(trigger: ProductivityReviewTrigger) {
 //   - `runtime_failure_streak` — genuine infra faults, disjoint from the gate by
 //     construction (`isInfraFailureRun` short-circuits on
 //     `isDependencyBlockedRun`), so a blocker does not explain it.
+//   - `runaway_execution` (BLO-27698 B3b) — an unresolved blocker cannot explain
+//     a run that is executing *right now*. The dependency gate cancels queued
+//     runs before dispatch, so it produces absence of execution, never an
+//     excess of it; a blocker added mid-run leaves the burn real and the alarm
+//     valid. Fail-closed here is the deliberate answer, not an oversight.
 //   - missing/unknown provenance — fails closed.
 function isDependencyBlockedClosableTrigger(trigger: unknown) {
   return trigger === "no_comment_streak" || trigger === "long_active_duration";
@@ -1772,11 +1866,21 @@ function isDependencyBlockedClosableRecord(trigger: unknown, firedTriggers: unkn
   return isDependencyBlockedClosableTriggerSet(firedTriggers);
 }
 
+// Exhaustive by type, not by if-ladder (Ally review on BLO-27698 2e95b50b): the
+// previous form fell through to "Long active duration" as its default, so a new
+// trigger would render under an existing trigger's name — a silently wrong
+// evidence pack rather than a compile error. `runaway_execution` in particular
+// would have been labelled as the very trigger it was split out from.
+const TRIGGER_LABELS: Record<ProductivityReviewTrigger, string> = {
+  no_comment_streak: "No-comment streak",
+  long_active_duration: "Long active duration",
+  high_churn: "High churn",
+  runtime_failure_streak: "Runtime failure streak",
+  runaway_execution: "Runaway execution",
+};
+
 function formatTrigger(trigger: ProductivityReviewTrigger) {
-  if (trigger === "no_comment_streak") return "No-comment streak";
-  if (trigger === "high_churn") return "High churn";
-  if (trigger === "runtime_failure_streak") return "Runtime failure streak";
-  return "Long active duration";
+  return TRIGGER_LABELS[trigger];
 }
 
 const PRODUCTIVITY_REVIEW_TRIGGERS: readonly ProductivityReviewTrigger[] = [
@@ -1784,6 +1888,7 @@ const PRODUCTIVITY_REVIEW_TRIGGERS: readonly ProductivityReviewTrigger[] = [
   "long_active_duration",
   "high_churn",
   "runtime_failure_streak",
+  "runaway_execution",
 ];
 
 // BLO-22105: `buildReviewMarkdown` bakes the trigger that produced it into the
@@ -3152,6 +3257,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     let closedMonitorScheduled = 0;
     let closedTerminalSource = 0;
     let closedDependencyBlocked = 0;
+    let closedExecutionEnded = 0;
 
     // BLO-22436: resolve blocker state for the sources whose open review a
     // blocker could retire, batched per company. Without this, a review minted
@@ -3182,6 +3288,73 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       }
     }
 
+    // BLO-27698 B3b (Ally review on 7f4fbc43b): resolve, for every open
+    // `runaway_execution` review, whether the run it describes is still running.
+    //
+    // That trigger is the only one in the set whose subject is a single
+    // in-flight run, and its rubric is entirely forward-looking — "let it
+    // finish", "bound it", "route to platform/SRE" are all actions on a live
+    // process. Its retirement predicate is therefore *the run ended*, and
+    // source-`done` (the arm below) is a strictly narrower proxy for it: a run
+    // that exits while its issue stays `in_progress`/`todo`/`blocked` would
+    // strand an unanswerable review open indefinitely, because generation
+    // cannot retire it either (`createOrUpdateReview` returns null the moment
+    // no trigger fires, so an open review whose trigger stopped firing is never
+    // revisited). Close on the predicate itself.
+    //
+    // Liveness is `runLiveInterval` + `stillSignalling`, the identical pair
+    // `liveExecutingMs` applies in the generation path, so suppression and
+    // retirement cannot drift on what "still executing" means — the same
+    // discipline A4 applies to the monitor grace. When no run is still
+    // signalling, `liveExecutingMs` is 0 by construction and so cannot clear
+    // any positive bar; that is why this needs no threshold of its own.
+    const runawayExecutionEndedSourceIds = new Set<string>();
+    const runawaySourceIdsByCompany = new Map<string, Set<string>>();
+    for (const review of reviewRows) {
+      if (!review.originId) continue;
+      if (reviewTriggerById.get(review.id) !== "runaway_execution") continue;
+      const sourceIssue = sourceIssueById.get(review.originId);
+      if (!sourceIssue || sourceIssue.companyId !== review.companyId) continue;
+      const forCompany = runawaySourceIdsByCompany.get(review.companyId) ?? new Set<string>();
+      forCompany.add(sourceIssue.id);
+      runawaySourceIdsByCompany.set(review.companyId, forCompany);
+    }
+    for (const [runawayCompanyId, sourceIds] of runawaySourceIdsByCompany) {
+      const scopedIds = [...sourceIds];
+      // Only `running` rows can be live: `runLiveInterval` ends a terminal row
+      // at `finishedAt` and a re-parked one at its last signal, so neither can
+      // satisfy `stillSignalling`. Filtering in SQL keeps this read bounded by
+      // the number of *live* runs rather than by run history.
+      const liveRuns = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, runawayCompanyId),
+            eq(heartbeatRuns.status, "running"),
+            issueRunScopeInSql(scopedIds),
+          ),
+        );
+      const stillExecutingSourceIds = new Set<string>();
+      // Issue-scoped, not run-scoped, and chosen that way: the review does not
+      // persist the run id it fired on, so keying per-run would mean adding that
+      // to `details` first. The cost is a residue — a review that fired on run A
+      // stays open while an unrelated later run B is live on the same source.
+      // That is the fail-closed direction and it is self-clearing (the first
+      // sweep with nothing live retires it), so it is bounded by an unrelated
+      // run's lifetime rather than by the issue's, which is the bound the
+      // predicate was tightened to buy.
+      for (const run of liveRuns) {
+        if (!stillSignalling(runLiveInterval(run, now), now)) continue;
+        for (const scopeId of runScopeIssueIds(run)) {
+          if (sourceIds.has(scopeId)) stillExecutingSourceIds.add(scopeId);
+        }
+      }
+      for (const sourceId of sourceIds) {
+        if (!stillExecutingSourceIds.has(sourceId)) runawayExecutionEndedSourceIds.add(sourceId);
+      }
+    }
+
     for (const review of reviewRows) {
       if (!review.originId) continue;
       const sourceIssue = sourceIssueById.get(review.originId) ?? null;
@@ -3189,22 +3362,65 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       if (sourceIssue.companyId !== review.companyId) continue;
       const trigger = reviewTriggerById.get(review.id);
 
-      let suppressedBy: "terminal_source" | "monitor_scheduled" | "dependency_blocked" | null = null;
+      let suppressedBy:
+        | "terminal_source"
+        | "monitor_scheduled"
+        | "dependency_blocked"
+        | "execution_ended"
+        | null = null;
       let suppressionDetails: Record<string, unknown> = {};
       // A `done` source can retire an already-open long-active review: the work
       // episode finished under the terminal-status evidence gate, so the
-      // elapsed-time alarm no longer needs manager adjudication. This does not
-      // extend to `cancelled`; an assignee can abandon and later restore their
-      // own source issue, so cancellation must not retire its oversight
-      // artifact. It also does not extend to historical/accountability triggers
-      // (`no_comment_streak`, `high_churn`) or missing provenance: completion
-      // does not invalidate those signals, and unknown trigger semantics fail
-      // closed.
-      if (trigger === "long_active_duration" && sourceIssue.status === "done") {
+      // elapsed-time alarm no longer needs manager adjudication. `runaway_execution`
+      // rides the same arm for the same reason (BLO-27698 B3b, Ally review on
+      // 2e95b50b): it is a runtime/cost alarm on a run that is executing *right
+      // now*, so once the source reaches `done` that run has finished and every
+      // option in its rubric — "let it finish", "bound it", "route to platform"
+      // — is a question about a run that no longer exists. Leaving it open would
+      // park an unanswerable review in a reviewer's queue.
+      // For `runaway_execution` this arm is a *convenience*, not its predicate:
+      // source-`done` implies the run ended, but the run can also end with the
+      // source still open, and that case is retired by the `execution_ended`
+      // arm below on the real predicate (Ally review on 7f4fbc43b). The two
+      // overlap deliberately — this one costs no extra read when it applies.
+      // This does not extend to `cancelled`; an assignee can abandon and later
+      // restore their own source issue, so cancellation must not retire its
+      // oversight artifact. It also does not extend to historical/accountability
+      // triggers (`no_comment_streak`, `high_churn`) or missing provenance:
+      // completion does not invalidate those signals, and unknown trigger
+      // semantics fail closed.
+      if (
+        (trigger === "long_active_duration" || trigger === "runaway_execution")
+        && sourceIssue.status === "done"
+      ) {
         suppressedBy = "terminal_source";
         suppressionDetails = { sourceStatus: sourceIssue.status };
+      } else if (
+        trigger === "runaway_execution"
+        && runawayExecutionEndedSourceIds.has(sourceIssue.id)
+      ) {
+        // The run this alarm describes has stopped executing. Unlike
+        // `long_active_duration` — whose rubric ("what progress did the
+        // assignee show") stays answerable after the episode ends, and which
+        // keeps the `monitor_scheduled` arm — every option offered for a
+        // runaway run is an instruction to a live process. Retire it rather
+        // than asking a manager to bound a run that already exited.
+        //
+        // Deliberately NOT gated on `isTerminalIssueStatus`: the whole point is
+        // that the source is usually still open here. A run that restarts and
+        // clears the bar again simply re-fires a fresh review through
+        // generation, so this cannot suppress a genuinely runaway run — it can
+        // only retire the record of one that ended.
+        suppressedBy = "execution_ended";
+        suppressionDetails = { sourceStatus: sourceIssue.status };
       } else if (trigger === "long_active_duration" && !isTerminalIssueStatus(sourceIssue.status)) {
-        // Deliberately monitor-only. An approval gate suppresses *new* reviews but never closes one
+        // Deliberately monitor-only, and deliberately `long_active_duration`-only:
+        // `runaway_execution` is excluded here because `choosePrimaryTrigger`
+        // opts it out of the monitor gate by design (an armed monitor means
+        // "wake me later", not "this run may execute indefinitely"). Honouring a
+        // monitor here would re-suppress through the close path what the
+        // generation path deliberately let fire.
+        // An approval gate suppresses *new* reviews but never closes one
         // that already fired: the approval that would justify the close is creatable by the very
         // agent under review (`POST /companies/:companyId/approvals` resolves `requestedByAgentId`
         // from an agent actor and hard-codes `status: "pending"`), so honouring it here would let a
@@ -3299,15 +3515,22 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           ...suppressionDetails,
         },
       });
+      // Explicit on every arm rather than falling through to
+      // `closedMonitorScheduled`: that default silently mis-attributed any new
+      // suppression reason to the monitor counter, which is the funnel
+      // BLO-33477 AC4 added these counters to make legible.
       if (suppressedBy === "terminal_source") closedTerminalSource += 1;
       else if (suppressedBy === "dependency_blocked") closedDependencyBlocked += 1;
+      else if (suppressedBy === "execution_ended") closedExecutionEnded += 1;
       else closedMonitorScheduled += 1;
     }
-    const retiredCount = closedMonitorScheduled + closedTerminalSource + closedDependencyBlocked;
+    const retiredCount =
+      closedMonitorScheduled + closedTerminalSource + closedDependencyBlocked + closedExecutionEnded;
     return {
       monitorScheduled: closedMonitorScheduled,
       terminalSource: closedTerminalSource,
       dependencyBlocked: closedDependencyBlocked,
+      executionEnded: closedExecutionEnded,
       // BLO-33477 AC4: funnel counters for the retirement pass. A sweep that
       // scans a full window and retires nothing is exactly what starvation
       // looks like, and without `scanned` it is indistinguishable from a
@@ -4009,9 +4232,48 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           ? null
           : issueEpisodeStartedAt;
     const nonLiveHoldSince = nonLiveExecutionHoldSince(sourceIssue, executionRun, now);
+    // BLO-27698 (Ally review on 160720b4): `nonLiveExecutionHoldSince` keys only
+    // on `issue.executionRunId`, so it answers "is the *holder* live", not "is
+    // anything live on this issue". Those diverge whenever the holder pointer is
+    // parked while another run keeps executing, and the holder-only reading is
+    // then applied on a false premise: the episode has not ended, work is
+    // happening on the sibling row. `runLiveInterval`'s docblock already states
+    // that principle for its own consumer — "a run sitting `queued` while a
+    // *different* run works the same issue is not a missing turn" — so reading
+    // liveness holder-only here contradicted it, and did so invisibly: because
+    // `elapsedMs` and `liveExecutingMs` are both cut at this boundary, a sibling
+    // burning 13h continuously was truncated to the holder's 2h for *every*
+    // B-group gate at once, leaving B2, B3 and B3b unable to see it between them.
+    //
+    // `latestRuns` is scoped to this issue and this assignee, so a live sibling
+    // here is that assignee demonstrably working this issue right now — not
+    // unrelated traffic.
+    //
+    // BLO-18307 is not weakened, and the precise statement matters: the tail
+    // extension never resurrects a gap, because `attributableStartAt` moves to
+    // the sibling's own span start whenever the sibling began after the hold
+    // (see `siblingSegmentStart`). So the wedged-holder wall-clock this exists
+    // to exclude stays excluded either way — as a trailing hold when nothing is
+    // live anywhere, or as a leading park when a sibling picked the issue up
+    // later. An earlier draft of this comment claimed only the first half; that
+    // understated the change, because a *binary* extension removed the
+    // truncation entirely and retroactively the moment anything went live.
+    // The earliest point from which a still-signalling sibling has been live —
+    // i.e. when the sibling-carried live segment began, or null when no sibling
+    // is executing.
+    const siblingLiveFrom = latestRuns.reduce<number | null>((earliest, run) => {
+      if (run.id === sourceIssue.executionRunId || run.status !== "running") return earliest;
+      const span = runLiveInterval(run, now);
+      // `runLiveInterval` caps a `running` row at `min(now, silentFrom)`, so
+      // `end >= now` is exactly "still signalling" — the same liveness test
+      // `liveExecutingMs` applies below, shared via `stillSignalling`.
+      if (!stillSignalling(span, now)) return earliest;
+      return earliest === null || span.start < earliest ? span.start : earliest;
+    }, null);
+    const siblingStillExecuting = siblingLiveFrom !== null;
     // Clamping below activeStartedAt collapses to 0 via Math.max — i.e. a holder
     // that went non-live before the episode began contributes no active time.
-    const attributableEndAt = nonLiveHoldSince ?? now;
+    const attributableEndAt = siblingStillExecuting ? now : (nonLiveHoldSince ?? now);
     // BLO-19848 (review follow-up): the tail clamp above is not enough on its
     // own, because it only truncates a hold that is *still* open. A holder that
     // parked and then resumed is live again, so nonLiveExecutionHoldSince
@@ -4021,10 +4283,39 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // Exclude the park from the front of the episode too. See
     // liveSegmentStartedAt.
     const liveSegmentStart = liveSegmentStartedAt(executionRun, now);
+    // BLO-27698 (Ally review on 06b87852): extending the tail on a *duration-
+    // blind boolean* re-attributes the whole holder park whenever anything is
+    // live — a sibling up for one second resurrects an 11h gap retroactively and
+    // entirely, not proportionally, handing B2 an episode rendered as 13h of
+    // "active elapsed time" that was 11h of park. Worse, the disclosure vanishes
+    // with it: `trailingHoldMs` goes to 0, so the excluded-hold line is not
+    // rendered either, and the gap is neither counted out nor visible as in.
+    //
+    // Bound the extension to the sibling's own span. When the holder is non-live
+    // and the segment is carried by a sibling that started *after* the hold
+    // began, the current live segment starts there — so the sibling contributes
+    // its own burn without resurrecting the gap before it. A sibling live since
+    // before the hold leaves the start untouched, which is the 13h
+    // continuous-burn case the tail extension exists for.
+    //
+    // This is `liveSegmentStartedAt`'s own BLO-19848 discipline — a park breaks
+    // the segment, measure the current one — applied issue-wide rather than
+    // holder-only, so the excluded interval keeps surfacing through the existing
+    // `leadingParkMs` disclosure instead of disappearing from both sides of the
+    // ledger. It also keeps `elapsedMs` exactly `attributableEndAt -
+    // attributableStartAt`, which `monitorGatingBreakdown` relies on to place
+    // the episode window (`episodeEndMs = start + elapsedMs`); subtracting an
+    // interior hole from the duration instead would have shifted that window off
+    // the spans it measures and broken B1's bucket identity.
+    const siblingSegmentStart =
+      siblingLiveFrom !== null && nonLiveHoldSince && siblingLiveFrom > nonLiveHoldSince.getTime()
+        ? new Date(siblingLiveFrom)
+        : null;
+    const segmentStart = latestDate(liveSegmentStart, siblingSegmentStart);
     const attributableStartAt = activeStartedAt
-      && liveSegmentStart
-      && liveSegmentStart.getTime() > activeStartedAt.getTime()
-      ? liveSegmentStart
+      && segmentStart
+      && segmentStart.getTime() > activeStartedAt.getTime()
+      ? segmentStart
       : activeStartedAt;
     const elapsedMs = sourceIssue.status === "in_progress" && attributableStartAt
       ? Math.max(0, attributableEndAt.getTime() - attributableStartAt.getTime())
@@ -4060,9 +4351,75 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       : null;
     const noExecutableTurnDominant = Boolean(
       noExecutableTurnGating
-        && elapsedMs !== null
-        && elapsedMs > 0
-        && noExecutableTurnGating.noExecutableTurnMs / elapsedMs > NO_EXECUTABLE_TURN_DOMINANT_SHARE,
+        && isDominantEpisodeShare(noExecutableTurnGating.noExecutableTurnMs, elapsedMs),
+    );
+    // BLO-27698 B3b: the longest execution span in this episode that is
+    // *still live as of `now`*. `runLiveInterval` caps a `running` row at its
+    // last signal + NON_LIVE_EXECUTION_SILENCE_MS, so a row that went silent
+    // stops counting here — "still executing" means signalling, not merely
+    // still holding the `running` status.
+    //
+    // Read by `runawayExecution` only. Scoped deliberately: B2's dominance gate
+    // reads `monitorGating.executingMs`, which carries no liveness requirement
+    // at all, and locates its bound in the share test instead — see the comment
+    // on that clause. An earlier version of this docblock claimed to be "the
+    // liveness half of both B-group gates" and credited BLO-22331 AC2
+    // boundedness to it; that was wrong for B2 and is corrected here, because a
+    // reader trusting it could remove B2's share-test bound believing liveness
+    // still covered it.
+    //
+    // For B3b the liveness requirement is what keeps `runaway_execution`
+    // bounded: a run that executed hard and then went quiet stops counting, so
+    // the trigger cannot latch on a dead span. Clamped to the episode at *both*
+    // ends so a span that predates it cannot inflate the gate and a span that
+    // outruns it cannot exceed the elapsed figure rendered beside it.
+    //
+    // The tail clamp is not symmetry for its own sake (Ally review on
+    // 2e95b50b). It originally existed because `nonLiveExecutionHoldSince` keys
+    // only on the run pointed at by `issue.executionRunId`, so a parked holder
+    // truncated `attributableEndAt` into the past while this reducer walked
+    // *all* of `latestRuns` and counted a live sibling right up to `now` —
+    // making `liveExecutingMs > elapsedMs` representable, and the evidence pack
+    // self-contradictory: the trigger reason prints this figure and the report
+    // prints `elapsedMs`, so one review could claim 13h of continuous execution
+    // above "Current active elapsed time: 2h".
+    //
+    // That divergence is now fixed at its source — `attributableEndAt` extends
+    // to `now` while a sibling is still executing (see `siblingLiveFrom`), with
+    // `attributableStartAt` moved to the sibling's own span start so the
+    // extension covers the sibling's burn and not the holder's park before it.
+    // Both figures move together and the contradiction is unrepresentable
+    // rather than clamped away. Clamping the tail was the wrong half of that
+    // trade: it bought consistency by discarding the sibling's burn from
+    // `liveExecutingMs` too, which hid a genuinely runaway run from the one
+    // trigger B3b added to catch it.
+    //
+    // The clamp is therefore retained as a belt-and-braces invariant guard, not
+    // as a suppressor: with `attributableEndAt` sibling-aware it is provably a
+    // no-op, because every span this reducer counts is `running` and live, and
+    // any such run drives `attributableEndAt` to `now` (as the holder, via a
+    // null hold; or as a sibling, via `siblingStillExecuting`). Keeping it means
+    // `liveExecutingMs <= elapsedMs` stays true by construction if a future edit
+    // narrows either of those paths, instead of by the argument above. The head
+    // clamp is no longer a no-op in the sibling case and is doing real work: it
+    // is what stops a sibling's pre-episode span leaking back in once
+    // `attributableStartAt` has been moved forward to exclude the park.
+    //
+    // Order matters: the clamp is applied to the measured duration *after* the
+    // `stillSignalling` liveness test, never before. Testing a clamped end
+    // against `now` would read a truncated `attributableEndAt` as "went silent"
+    // and zero out genuinely live runs — liveness asks about `now`, the counted
+    // duration stays inside the episode.
+    const liveExecutingMs = Math.max(
+      0,
+      ...latestRuns.map((run) => {
+        if (run.status !== "running") return 0;
+        const span = runLiveInterval(run, now);
+        if (!stillSignalling(span, now)) return 0;
+        const start = attributableStartAt ? Math.max(span.start, attributableStartAt.getTime()) : span.start;
+        const end = Math.min(span.end, attributableEndAt.getTime());
+        return Math.max(0, end - start);
+      }),
     );
     // Only suppress while the run currently heading the episode is still
     // actually blocked (`currentBlockOpen`) — e.g. a capacity retry genuinely
@@ -4110,7 +4467,37 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||
       runCountLastSixHours >= thresholds.highChurnSixHours ||
       assigneeRunCommentCountLastSixHours >= thresholds.highChurnSixHours;
-    const trigger = choosePrimaryTrigger({ runtimeFailure, noComment, longActive, highChurn });
+    // BLO-27698 B3b: the escape hatch B3 owes. Keyed on a single run's own
+    // still-live execution span, not on the episode, so it survives B3's
+    // narrowing of `long_active_duration` to the unattended bucket — an episode
+    // spent executing has almost no unattended time by construction, which is
+    // exactly the case that would otherwise vanish.
+    //
+    // Reuses `longActiveMs` rather than adding a knob: both are "this has gone
+    // on too long" bars over the same episode, and two independently-tunable
+    // constants for one question is how a raised bar silently stops covering a
+    // case (the A3 defect on this same issue). Split them if a fleet ever needs
+    // a runaway bar below the long-active one.
+    //
+    // Guarded on `elapsedMs !== null && attributableStartAt !== null`, matching
+    // `longActive` above. Both are required and neither is redundant:
+    //   - `elapsedMs` is null for any issue not `in_progress` (see the episode
+    //     attribution above), yet `reconcileProductivityReviews` selects over
+    //     `["todo", "in_progress"]`. Without this, a `todo` issue still carrying
+    //     a signalling `running` row — released back to `todo` mid-run, or a
+    //     checkout that never landed — would produce a review that
+    //     `long_active_duration` is structurally incapable of producing.
+    //   - `attributableStartAt` null is the BLO-22016 `currentHolderNeverDispatched`
+    //     shape. The clamp in `liveExecutingMs` degrades to the raw `span.start`
+    //     there, so the run's entire lifetime counts rather than its episode
+    //     share — the opposite of what that docblock promises. Guarding here
+    //     makes the clamp unconditional in every case that can reach this bar.
+    // Such reports also render "Current active elapsed time: unknown" with no
+    // `Elapsed accounting` line (`monitorGatingBreakdown` returns null on a null
+    // `elapsedMs`), so firing on them would be evidence-free as well as wrong.
+    const runawayExecution =
+      elapsedMs !== null && attributableStartAt !== null && liveExecutingMs >= thresholds.longActiveMs;
+    const trigger = choosePrimaryTrigger({ runtimeFailure, noComment, longActive, highChurn, runawayExecution });
     if (!trigger) return null;
 
     // BLO-22436 (Ally follow-up): recorded in `choosePrimaryTrigger`'s ladder
@@ -4121,6 +4508,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     if (runtimeFailure) firedTriggers.push("runtime_failure_streak");
     if (noComment) firedTriggers.push("no_comment_streak");
     if (highChurn) firedTriggers.push("high_churn");
+    if (runawayExecution) firedTriggers.push("runaway_execution");
     if (longActive) firedTriggers.push("long_active_duration");
 
     const triggerReasons: string[] = [];
@@ -4139,6 +4527,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
         ? ` (${neverInvokedRunCount} run(s) in the sampled window never had an adapter created and are excluded, not counted toward this streak; these mostly overlap the non-executing runs reported separately, so the two counts do not sum)`
         : "";
       triggerReasons.push(`${noCommentStreak} consecutive terminal, turn-executing issue-linked runs had no run-created issue comment${neverInvokedNote}`);
+    }
+    if (runawayExecution) {
+      triggerReasons.push(
+        `a single run has been executing continuously for ${msToHuman(liveExecutingMs)} and is still signalling; the assignee has had its turn and has not given it back`,
+      );
     }
     if (longActive) {
       // BLO-23624: this only fires while no-executable-turn-dominant when the
@@ -4159,9 +4552,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
 
     const routineOnlySamplingWindow = latestRuns.length > 0 && latestRuns.every(isRoutineOriginRun);
 
-    // Only `long_active_duration` is suppressible by a human gate. `no_comment_streak` and
-    // `high_churn` stay live: an agent burning runs against a gate it cannot clear is exactly
-    // the waste worth reviewing, and a gate does not excuse silent runs.
+    // Only `long_active_duration` is suppressible by a human gate. `no_comment_streak`,
+    // `high_churn` and `runaway_execution` stay live: an agent burning runs against a gate
+    // it cannot clear is exactly the waste worth reviewing, and a gate does not excuse
+    // silent runs — nor a single run executing past the long-active bar (BLO-27698 B3b;
+    // see the opt-out note in `choosePrimaryTrigger`).
     //
     // The suppression is deliberately bounded and forward-only: it lapses once the approval ages
     // past `approvalGateMaxAgeMs`, and it never closes a review that already fired (see
@@ -4295,11 +4690,57 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       trigger === "long_active_duration" &&
       monitorGating &&
       !monitorGating.gatedIsUpperBound &&
-      // BLO-27698 B1: `unattendedMs` no longer includes executing time, so it is
-      // re-added here to keep this gate bit-identical to its pre-B1 behaviour.
-      // B3 is the deliberate, separately-reviewed change that drops the addend
-      // and lets the trigger fire on the narrowed bucket; do not drop it here.
-      monitorGating.unattendedMs + monitorGating.executingMs < thresholds.longActiveMs
+      // BLO-27698 B3/B3a: fires on the *unattended* bucket. B1's addend is gone,
+      // so executing time no longer counts toward the trigger it was never
+      // evidence for. Still guarded by `!gatedIsUpperBound` above — the
+      // still-armed branch reports `unattendedMs: 0` as a deliberate upper
+      // bound, and treating that as measured would exempt any issue with a
+      // monitor armed however briefly (BLO-22331 AC2). B3b's
+      // `runaway_execution` recovers the case this narrowing drops for ONE
+      // shape only — a single continuous run, still live, past the bar — and it
+      // outranks this trigger, so an episode of that shape never reaches this
+      // gate at all. It is deliberately NOT the general inverse of B3: an
+      // episode whose executing time is split across several finished runs,
+      // none individually past the bar, stays suppressed here and is not
+      // recovered. That is intended, on the same ground the B2 clause below
+      // takes — an executing-dominant episode is explained — but do not read
+      // B3b as full coverage and widen this narrowing on that basis.
+      (monitorGating.unattendedMs < thresholds.longActiveMs ||
+        // BLO-27698 B2: the episode is more than half executing time. Same
+        // dominance shape as `noExecutableTurnDominant`, through the shared
+        // `isDominantEpisodeShare`, because both answer one question: is this
+        // episode better explained by something other than assignee inactivity?
+        //
+        // Deliberately NOT gated on a *run* being live right now, which is where
+        // `noExecutableTurnDominantAndOpen` gets its bound. That guard would make
+        // this clause unreachable rather than conservative: a run that is live now
+        // started at or before the episode anchor (`mostRecentDispatchAt`), so its
+        // span covers the whole episode, `unattendedMs` is then ~0, and the first
+        // arm above has already suppressed. Both fixtures below prove the point
+        // from the other side — their executing span is a *terminal* run, so no
+        // run is live and the clause still has to work.
+        //
+        // It IS gated on the *episode clock* being live, which is a different
+        // thing and the actual bound (Ally review on fe4e9dcb). The share test
+        // alone is not self-clearing: it only falls as `elapsedMs` grows, and
+        // `elapsedMs` stops growing whenever `attributableEndAt` stops tracking
+        // `now` — i.e. exactly when `trailingHoldMs > 0`. For a silent `running`
+        // holder, `nonLiveExecutionHoldSince` (:698) pins the episode end at the
+        // fixed `lastSignal + NON_LIVE_EXECUTION_SILENCE_MS`, so `elapsedMs`,
+        // `executingMs` and `unattendedMs` all freeze and the ratio can never
+        // cross back under the bar. Reachable shape: anchor 15h ago, holder live
+        // for 8h, then silent — executing 8h / unattended 7h / elapsed 15h, the
+        // unattended residue is above the bar so the first arm does not apply,
+        // and `runaway_execution` declines because the span no longer reaches
+        // `now`. B2 alone would then suppress permanently, which is the BLO-22331
+        // AC2 hazard this clause claimed to avoid.
+        //
+        // `trailingHoldMs === 0` is the whole guard: while the clock runs, the
+        // ratio genuinely falls and suppression lapses once the episode reaches
+        // twice the executing time (the paired boundedness test pins that); once
+        // it freezes, the episode falls through to the trigger rather than being
+        // suppressed on a number that can no longer move.
+        (trailingHoldMs === 0 && isDominantEpisodeShare(monitorGating.executingMs, elapsedMs)))
     ) {
       return null;
     }
@@ -4516,7 +4957,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
       ...(evidence.nonLiveHoldMs > 0
         ? [
-            `- Excluded as non-live execution hold: ${msToHuman(evidence.nonLiveHoldMs)} (issue's executionRunId parked or pinned by a run that was not live; not counted toward the trigger — BLO-19848)`,
+            `- Excluded as non-live execution hold: ${msToHuman(evidence.nonLiveHoldMs)} (issue's executionRunId parked, pinned by a run that was not live, or outside the current live segment; not counted toward the trigger — BLO-19848)`,
           ]
         : []),
       ...(evidence.monitorGating
@@ -4568,6 +5009,20 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           "- Diagnose and fix the underlying dispatch/runtime fault (crashloop, provider outage, retry exhaustion)",
           "- Confirm the fault has cleared and let the issue continue unattended (no assignee action needed)",
           "- If the fault persists, escalate for infrastructure remediation instead of reassigning or cancelling the source work",
+        ]
+        : evidence.trigger === "runaway_execution"
+        // BLO-27698 B3b: the four verdicts below all ask whether the assignee
+        // showed progress signals during time it was *not* working. That
+        // question is wrong here by construction — this trigger fires because a
+        // run is still executing right now — so asking it would invite a
+        // "close as productive" on a run nobody has bounded.
+        ? [
+          "A single run has held its turn longer than the whole-episode bar and is still signalling, so this is a runtime/cost question, not an assignee-inactivity one.",
+          "",
+          "Decide one of:",
+          "- Let it finish (the work genuinely needs a long turn; say so and snooze, naming the expected finish)",
+          "- Bound it (the run has no stopping condition — interrupt it and require the assignee to decompose the work before re-dispatching)",
+          "- Route to platform/SRE (the run is wedged rather than working: a live signal stream with no run comments and no cost growth is the shape to look for)",
         ]
         : [
           "A \"Close as productive\" verdict requires at least ONE of the following concrete progress signals:",
@@ -5421,6 +5876,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       closedSuppressedMonitorReviews: 0,
       closedTerminalSourceReviews: 0,
       closedDependencyBlockedReviews: 0,
+      closedExecutionEndedReviews: 0,
       // BLO-33477 AC4: the retirement pass's own funnel. Kept separate from the
       // `closed*` counters above because those are outcome tallies and one of
       // them (`closedTerminalSourceReviews`) is also credited by the stale
@@ -5442,6 +5898,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     result.closedSuppressedMonitorReviews = closedSuppressed.monitorScheduled;
     result.closedTerminalSourceReviews = closedSuppressed.terminalSource;
     result.closedDependencyBlockedReviews = closedSuppressed.dependencyBlocked;
+    result.closedExecutionEndedReviews = closedSuppressed.executionEnded;
     result.retirementScanned = closedSuppressed.scanned;
     result.retirementRetired = closedSuppressed.retired;
     result.retirementDeclined = closedSuppressed.declined;
