@@ -105,6 +105,11 @@ export const SKIP_LABELS = ["do-not-merge", "review-gate-override"];
  * A blast-radius cap, not a throughput target. A classifier bug that says
  * "enqueue" for the wrong reason costs at most this many PRs per fire, and the
  * receipt names every PR the cap deferred so the truncation is never silent.
+ *
+ * Per FIRE, not per repo: `classifyAll` is called once per swept repo, so the
+ * counter has to carry across those calls via `spent` or the real ceiling is
+ * `10 x repos` — the cap quietly scaling with the very knob that makes a
+ * classifier bug reach further.
  */
 export const MAX_ENQUEUES_PER_FIRE = 10;
 
@@ -382,7 +387,8 @@ export function checkSettlement(
  * limits 150, 200 and 500). Deciding the cheap rules first means only the PRs
  * that survive them cost two API calls each, and on a repo where most open PRs
  * are already enqueued or human-authored that is most of them avoided.
- */export function classifyFromListing(pr, { now = Date.now() } = {}) {
+ */
+export function classifyFromListing(pr, { now = Date.now() } = {}) {
   const row = (action, reason, detail = null) => ({
     number: pr?.number,
     headSha: pr?.headRefOid,
@@ -487,9 +493,14 @@ export function classifyPr(pr, { now = Date.now(), settleMinutes = CHECK_SETTLE_
 /** Classifies every PR and applies the per-fire enqueue cap. */
 export function classifyAll(
   prs,
-  { now = Date.now(), maxEnqueues = MAX_ENQUEUES_PER_FIRE, settleMinutes = CHECK_SETTLE_MINUTES } = {},
+  {
+    now = Date.now(),
+    maxEnqueues = MAX_ENQUEUES_PER_FIRE,
+    settleMinutes = CHECK_SETTLE_MINUTES,
+    spent = 0,
+  } = {},
 ) {
-  let enqueued = 0;
+  let enqueued = spent;
   return (prs ?? []).map((pr) => {
     const classified = classifyPr(pr, { now, settleMinutes });
     if (classified.action !== "enqueue") return classified;
@@ -619,8 +630,34 @@ export function targetRepos(value = process.env.LAND_CLEAN_PRS_REPO) {
   return repos.length > 0 ? repos : ["Blockcast/paperclip"];
 }
 
-function runRepo(repo, apply, settleMinutes) {
-  const rows = classifyAll(fetchOpenPrs(repo), { settleMinutes });
+/**
+ * The settling floor, from the environment, refusing anything that is not a
+ * real number of minutes.
+ *
+ * `Number("15m")` is `NaN`, and `ageMinutes < NaN` is `false`, so an
+ * unparseable value used to report every rollup as settled — the guard
+ * disarming itself in the fail-OPEN direction, silently. `15m` is the likely
+ * bad input, invited by the "15 minutes" phrasing and by the `floor 15m` the
+ * detail string prints back. Blank is unset, not zero, for the same reason:
+ * `Number("")` is `0`, which is finite and would disable the floor.
+ *
+ * Same rule `classifyFromListing` already applies to an unparseable
+ * `autoMergeRequest.enabledAt`, which refuses to let a bad timestamp read as
+ * infinitely old.
+ */
+export function settleMinutesFrom(value = process.env.LAND_CLEAN_PRS_SETTLE_MINUTES) {
+  const raw = String(value ?? "").trim();
+  const parsed = Number(raw);
+  if (raw === "" || !Number.isFinite(parsed) || parsed < 0) return CHECK_SETTLE_MINUTES;
+  return parsed;
+}
+
+function runRepo(repo, apply, settleMinutes, spent, rotted) {
+  const rows = classifyAll(fetchOpenPrs(repo), { settleMinutes, spent });
+
+  for (const row of rows) {
+    if (row.action === "approval-rotted") rotted.push(`${repo}#${row.number} (${row.detail})`);
+  }
 
   for (const row of rows) {
     if (!apply) continue;
@@ -633,6 +670,9 @@ function runRepo(repo, apply, settleMinutes) {
         row.action = "aborted";
         row.detail = message.trim().split("\n")[0];
         console.log(`## ${repo}\n\n${renderReceipt(rows)}`);
+        // Print the priority cohort before dying: it is the expensive half of
+        // the output, and the repos that already completed earned it.
+        reportRotted(rotted);
         console.error(`\nAborted the fire: ${row.detail}`);
         process.exit(1);
       }
@@ -646,32 +686,33 @@ function runRepo(repo, apply, settleMinutes) {
   return rows;
 }
 
+function reportRotted(rotted) {
+  if (rotted.length === 0) return;
+  // Reported, never acted on. A deliberate hold is invisible on every API
+  // surface — trafficcontrol#1726 read exactly like a strand while its body
+  // said "do not merge before magma#1936", a shared proto field-number space.
+  // So: read the PR body before rebasing anything here.
+  console.log(
+    `approval-rotted (BLO-33208 priority cohort) — ${rotted.length}:\n` +
+      rotted.map((row) => `  ${row}`).join("\n") +
+      "\nRead each PR body before rebasing: a deliberate sequencing hold is " +
+      "indistinguishable from a strand on every API surface.",
+  );
+}
+
 function main() {
   const apply = process.argv.includes("--apply");
-  const settleMinutes = Number(
-    process.env.LAND_CLEAN_PRS_SETTLE_MINUTES || CHECK_SETTLE_MINUTES,
-  );
+  const settleMinutes = settleMinutesFrom();
   const rotted = [];
+  let spent = 0;
 
   for (const repo of targetRepos()) {
-    for (const row of runRepo(repo, apply, settleMinutes)) {
-      if (row.action === "approval-rotted") rotted.push(`${repo}#${row.number} (${row.detail})`);
-    }
+    const rows = runRepo(repo, apply, settleMinutes, spent, rotted);
+    spent += rows.filter((row) => row.action === "enqueue").length;
     console.log("");
   }
 
-  if (rotted.length > 0) {
-    // Reported, never acted on. A deliberate hold is invisible on every API
-    // surface — trafficcontrol#1726 read exactly like a strand while its body
-    // said "do not merge before magma#1936", a shared proto field-number space.
-    // So: read the PR body before rebasing anything here.
-    console.log(
-      `approval-rotted (BLO-33208 priority cohort) — ${rotted.length}:\n` +
-        rotted.map((row) => `  ${row}`).join("\n") +
-        "\nRead each PR body before rebasing: a deliberate sequencing hold is " +
-        "indistinguishable from a strand on every API surface.",
-    );
-  }
+  reportRotted(rotted);
 
   if (!apply) console.log("\n(dry run — pass --apply to act)");
 }

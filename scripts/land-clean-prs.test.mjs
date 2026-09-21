@@ -15,6 +15,7 @@ import {
   isFatalGhError,
   isMainModule,
   latestCheckStates,
+  settleMinutesFrom,
   targetRepos,
   unsatisfiedOwners,
 } from "./land-clean-prs.mjs";
@@ -238,6 +239,50 @@ describe("per-fire cap", () => {
     });
     assert.equal(rows[1].action, "enqueue");
   });
+
+  it("carries spend across repos, so the cap is per FIRE and not per repo", () => {
+    // `runRepo` calls `classifyAll` once per swept repo. Without `spent` the
+    // counter restarts each call and the real ceiling is `cap x repos` — the
+    // blast radius scaling with the multi-repo knob that makes a classifier
+    // bug reach further in the first place.
+    const clean = () => Array.from({ length: 3 }, (_, i) => pr({ number: 200 + i }));
+    let spent = 0;
+    const perRepo = [];
+    for (const _repo of ["a/one", "a/two", "a/three"]) {
+      const rows = classifyAll(clean(), { now: NOW, maxEnqueues: 4, spent });
+      const armed = rows.filter((r) => r.action === "enqueue").length;
+      spent += armed;
+      perRepo.push(armed);
+    }
+    assert.deepEqual(perRepo, [3, 1, 0], "repo 2 gets the remainder, repo 3 gets nothing");
+    assert.equal(spent, 4, "total armed never exceeds the cap");
+  });
+});
+
+describe("settle floor from the environment", () => {
+  // `Number("15m")` is NaN and `ageMinutes < NaN` is false, so an unparseable
+  // value reported every rollup as settled — the guard disarming itself in the
+  // fail-OPEN direction, silently.
+  it("falls back to the default for values that are not a number of minutes", () => {
+    for (const bad of ["15m", "banana", "", "   ", undefined, null, "-5", "NaN"]) {
+      assert.equal(settleMinutesFrom(bad), CHECK_SETTLE_MINUTES, `bad input: ${String(bad)}`);
+    }
+  });
+
+  it("honours a real number, including an explicit 0", () => {
+    assert.equal(settleMinutesFrom("30"), 30);
+    assert.equal(settleMinutesFrom(" 7 "), 7);
+    assert.equal(settleMinutesFrom("0"), 0, "0 is a deliberate opt-out, not a bad value");
+  });
+
+  it("a bad value cannot let an unsettled rollup read as settled", () => {
+    const fresh = [
+      { name: "verify", conclusion: "SUCCESS", completedAt: new Date(NOW - 60_000).toISOString() },
+    ];
+    const settlement = checkSettlement(fresh, { now: NOW, settleMinutes: settleMinutesFrom("15m") });
+    assert.equal(settlement.settled, false);
+    assert.equal(settlement.reason, "settling");
+  });
 });
 
 describe("Ally verdict-mirror statuses are not CI checks", () => {
@@ -361,7 +406,8 @@ describe("approval rot (BLO-33208)", () => {
   });
 });
 
-describe("check settling floor (BLO-33208 bucket-B age floor)", () => {  const at = (iso) => [{ name: "verify", conclusion: "SUCCESS", completedAt: iso }];
+describe("check settling floor (BLO-33208 bucket-B age floor)", () => {
+  const at = (iso) => [{ name: "verify", conclusion: "SUCCESS", completedAt: iso }];
 
   it("treats a rollup with zero rows as a stop, not a pass", () => {
     // Nothing reporting means nothing attested this head, which renders
