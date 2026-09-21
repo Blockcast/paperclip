@@ -746,6 +746,14 @@ describe("startServer feedback export wiring", () => {
       // but its position relative to the *recovery* gate is a behaviour change
       // of this diff (it used to sit below) and is only covered here.
       expect(heartbeatServiceMock.publishAgentLivenessGauges).toHaveBeenCalledTimes(1);
+      // BLO-21526 (Ally round 2 on #1933): FOUR publishers now. The suppressed
+      // sibling test above pins this gauge against the suppression gate only —
+      // it never starts recovery, so it cannot see the recovery gate at all.
+      // This is the case the comment at index.ts claims and nothing asserted:
+      // a tick fired while `heartbeatStartupRecoveryPending` is true must
+      // still publish. It is the longer window of the two, because a boot
+      // lasts minutes where a suppressed tick lasts one interval.
+      expect(heartbeatServiceMock.publishCrashRecoveryCandidateIndexGauge).toHaveBeenCalledTimes(1);
       // Control that the recovery guard really is still closed. Without this the
       // test could pass for the trivial reason that recovery had already
       // drained, proving nothing about where the registrations sit.

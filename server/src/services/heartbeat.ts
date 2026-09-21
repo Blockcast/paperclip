@@ -18447,9 +18447,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * lose the index, which is exactly where the signal must not go dark.
    *
    * A probe FAILURE means we do not know, so it skips this one periodic tick
-   * (startup recovery is ungated) and the next tick asks again.
+   * (startup recovery is ungated ON THE INDEX — it is still gated on
+   * scheduling suppression) and the next tick asks again.
    */
-  async function crashRecoveryCandidateIndexPresent(): Promise<boolean> {
+  async function crashRecoveryCandidateIndexPresent(
+    source: "gate" | "gauge",
+  ): Promise<boolean> {
     try {
       const rows = await db.execute(sql`
         select 1
@@ -18482,23 +18485,46 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logger.warn(
           {
             index: "heartbeat_runs_crash_recovery_pending_idx",
+            // Which caller probed. The two run concurrently within a tick —
+            // the gauge publisher is tracked without `await` and the gate
+            // probes later in the same tick — and the latch above can be read
+            // as `false` by both before either sets it, so the absent
+            // TRANSITION can legitimately emit two lines. Tagging them is
+            // what stops an operator reading that as two distinct failures.
+            source,
             remediation:
               "CREATE INDEX CONCURRENTLY heartbeat_runs_crash_recovery_pending_idx ON heartbeat_runs USING btree (finished_at, id) WHERE error_code = 'worker_crashed' AND crash_recovery_completed_at IS NULL",
           },
-          "worker-crash candidate index missing or invalid; periodic crash reconciliation is disabled until it is built online (startup recovery still runs)",
+          // "startup recovery covers this only while scheduling is not
+          // suppressed", not the flat "startup recovery still runs" this used
+          // to claim: this publisher is called from above both scheduler gates
+          // (BLO-21526), so it now also emits on a suppressed replica — where
+          // `startServer` skips startup recovery entirely and NEITHER recovery
+          // path is running.
+          "worker-crash candidate index missing or invalid; periodic crash reconciliation is disabled until it is built online (startup recovery covers this only while scheduling is not suppressed)",
         );
       }
       return present;
     } catch (err) {
       // Never let a catalog probe failure take out the caller, and never cache
       // it: "we could not tell" is not evidence either way. Skips this periodic
-      // tick only; startup recovery is ungated.
+      // tick only; startup recovery is ungated on the index (though it is
+      // still gated on scheduling suppression).
       //
       // The gauge is cleared rather than set to 0 for the same reason: an
       // unreadable catalog must not publish "the index is gone", and a stale 1
       // left behind would publish "healthy" on no information (BLO-21526).
       setCrashRecoveryCandidateIndexPresent(null);
-      logger.warn({ err }, "failed to probe worker-crash candidate index; skipping periodic reconciliation this tick");
+      // The consequence is the CALLER's, not the probe's: only the gate turns
+      // this into a skipped tick. The ungated gauge publisher makes no
+      // reconciliation decision at all — and on a suppressed replica there is
+      // no periodic reconciliation for it to be skipping.
+      logger.warn(
+        { err, source },
+        source === "gate"
+          ? "failed to probe worker-crash candidate index; skipping periodic reconciliation this tick"
+          : "failed to probe worker-crash candidate index; candidate-index gauge cleared for this tick",
+      );
       return false;
     }
   }
@@ -18565,7 +18591,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // caller passes `requireCandidateIndex` and is skipped until the index
     // exists; startup recovery is never gated, because that is the primary
     // recovery path and its cost is bounded and one-off.
-    if (options.requireCandidateIndex && !(await crashRecoveryCandidateIndexPresent())) {
+    if (options.requireCandidateIndex && !(await crashRecoveryCandidateIndexPresent("gate"))) {
       return {
         reconciledRunIds: [],
         retryRunIds: [],
@@ -38722,7 +38748,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // BLO-21526: exported so the gauge has a publisher ABOVE both scheduler
     // gates, not only the gated reconciliation's own gate read. Same defect
     // and same remedy as BLO-31335 — see the registration in index.ts.
-    publishCrashRecoveryCandidateIndexGauge: crashRecoveryCandidateIndexPresent,
+    publishCrashRecoveryCandidateIndexGauge: () => crashRecoveryCandidateIndexPresent("gauge"),
 
     getRunLogAccess,
 
