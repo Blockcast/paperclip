@@ -595,11 +595,26 @@ spec:
           # invisible to any gauge, forever -- a dead/wedged promotion sweep
           # had nothing to page on. This alert covers exactly that gap: the
           # server-computed age, past DUE TIME, of the oldest agent row still
-          # sitting at status='scheduled_retry' with scheduled_retry_at < now
+          # sitting at status='scheduled_retry' past its EFFECTIVE due time
           # (paperclip_overdue_scheduled_retry_oldest_age_seconds, reset to 0
           # per agent on every /metrics scrape). A run still backing off
           # toward a future due time contributes nothing -- this only fires on
           # overshoot past when the promotion sweep should have already acted.
+          #
+          # "Effective due time" is greatest(scheduled_retry_at, advertised
+          # resume) per BLO-34782, not the bare column: a ccrotate_capacity
+          # park books scheduled_retry_at far NEARER than the instant the
+          # provider advertised, so the bare column reads "overdue" for the
+          # whole quota window while the run is correctly backing off -- and
+          # fleet-wide at once, since it is one shared quota bucket (measured
+          # 2026-09-20: 13 of 16 capacity parks "overdue", five episodes of
+          # 10-14 agents). Such a park is excluded until its advertised resume
+          # passes; it is NOT invisible meanwhile -- paperclipListParkedAgents
+          # (reason: ccrotate_capacity) still lists it with its
+          # penstockAdvertisedResumeAt and capacityParkClampedFrom. The triage
+          # query below reproduces this predicate, so it lists the rows the
+          # alert actually counted; it writes the timestamp regex as [0-9]
+          # rather than the source's equivalent \d to avoid YAML escaping.
           #
           # Threshold derived from the observed park-to-promotion lag
           # distribution over the 7 days preceding this alert's authorship
@@ -635,7 +650,7 @@ spec:
             severity: warning
           annotations:
             summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} has a scheduled_retry row overdue past its due time for longer than {{ .Values.prometheusRule.overdueScheduledRetryAgeSeconds }}s"
-            description: "Agent {{`{{ $labels.agent_id }}`}}'s oldest overdue `scheduled_retry` heartbeat run has been sitting past its due time for {{`{{ $value }}`}}s (BLO-22094). The age is only trusted while paperclip_overdue_scheduled_retry_age_metrics_refresh_success is 1. This row is still parked, not dispatched -- it has never even reached the `queued` state PaperclipQueuedRunStranded covers, so the promotion sweep (promoteScheduledRetryRun) either never ran for it or is systematically wedged. Query `select id, agent_id, scheduled_retry_reason, scheduled_retry_attempt, scheduled_retry_at, now() - scheduled_retry_at as overdue_by, context_snapshot ->> 'issueId' as issue_id from heartbeat_runs where status = 'scheduled_retry' and scheduled_retry_at < now() and agent_id = '{{`{{ $labels.agent_id }}`}}' order by scheduled_retry_at asc limit 10` to find the specific rows. See the runbook to distinguish a wedged promotion sweep from a gate legitimately re-deferring the row (e.g. issue_dependencies_blocked re-defer, which re-arms scheduled_retry_at further out rather than promoting -- that is designed backoff, not a strand)."
+            description: "Agent {{`{{ $labels.agent_id }}`}}'s oldest overdue `scheduled_retry` heartbeat run has been sitting past its due time for {{`{{ $value }}`}}s (BLO-22094). The age is only trusted while paperclip_overdue_scheduled_retry_age_metrics_refresh_success is 1. This row is still parked, not dispatched -- it has never even reached the `queued` state PaperclipQueuedRunStranded covers, so the promotion sweep (promoteScheduledRetryRun) either never ran for it or is systematically wedged. Due time here is the EFFECTIVE one, greatest(scheduled_retry_at, penstockAdvertisedResumeAt) per BLO-34782: a ccrotate_capacity park books scheduled_retry_at far nearer than the resume instant the provider advertised, so such a park is excluded from this alert until that advertised instant passes -- it is not hidden meanwhile, paperclipListParkedAgents (reason: ccrotate_capacity) still lists it with its penstockAdvertisedResumeAt and capacityParkClampedFrom. Query `select r.id, r.agent_id, r.scheduled_retry_reason, r.scheduled_retry_attempt, r.scheduled_retry_at, e.effective_due_at, now() - e.effective_due_at as overdue_by, r.result_json ->> 'penstockAdvertisedResumeAt' as advertised_resume_at, r.context_snapshot ->> 'issueId' as issue_id from heartbeat_runs r cross join lateral (select greatest(r.scheduled_retry_at, case when r.result_json ->> 'penstockAdvertisedResumeAt' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?Z$' then (r.result_json ->> 'penstockAdvertisedResumeAt')::timestamptz end) as effective_due_at) e where r.status = 'scheduled_retry' and r.scheduled_retry_at is not null and e.effective_due_at < now() and r.agent_id = '{{`{{ $labels.agent_id }}`}}' order by e.effective_due_at asc limit 10` to find the specific rows -- it reproduces the gauge's predicate and its overdue_by magnitude, so it lists exactly the rows this alert counted. See the runbook to distinguish a wedged promotion sweep from a gate legitimately re-deferring the row (e.g. issue_dependencies_blocked re-defer, which re-arms scheduled_retry_at further out rather than promoting -- that is designed backoff, not a strand)."
             runbook_url: {{ .Values.prometheusRule.overdueScheduledRetryRunbookUrl | quote }}
         - alert: PaperclipOverdueScheduledRetryAgeMetricsRefreshFailed
           # Separate from the overdue alert above for the same reason

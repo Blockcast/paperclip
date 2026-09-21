@@ -216,6 +216,42 @@ describeEmbeddedPostgres("refreshOverdueScheduledRetryAgeMetrics (BLO-22094)", (
     expect(body).toContain(`paperclip_overdue_scheduled_retry_oldest_age_seconds{agent_id="${agentId}"} 90`);
   });
 
+  it("is silent for a parked row with no due time at all, even when its advertised resume has passed (BLO-34782)", async () => {
+    // Pins the explicit `isNotNull(scheduledRetryAt)` guard, which sits beside
+    // a `greatest` whose documented property is that it ignores NULLs -- so
+    // "redundant, the greatest handles it" is the natural and wrong reading.
+    // Without the guard `greatest` collapses to the advertised instant alone
+    // and this row starts contributing, where the pre-BLO-34782
+    // `scheduled_retry_at < now` excluded it.
+    //
+    // Reachability, stated honestly: all three `scheduled_retry` insert sites
+    // set the column today (heartbeat.ts:20557, :34415, :35352). This pins a
+    // schema-representable state against a future writer, not one produced now.
+    const { companyId, agentId } = await insertCompanyAndAgent();
+    const now = new Date("2026-09-20T00:18:00.000Z");
+    const parkedAt = new Date(now.getTime() - 600_000);
+
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "scheduled_retry",
+      contextSnapshot: {},
+      createdAt: parkedAt,
+      updatedAt: parkedAt,
+      scheduledRetryAt: null,
+      scheduledRetryAttempt: 1,
+      scheduledRetryReason: "ccrotate_capacity",
+      resultJson: {
+        penstockAdvertisedResumeAt: new Date(now.getTime() - 240_000).toISOString(),
+      },
+    });
+
+    await refreshOverdueScheduledRetryAgeMetrics(db, now);
+    const { body } = await renderMetrics();
+    expect(body).toContain(`paperclip_overdue_scheduled_retry_oldest_age_seconds{agent_id="${agentId}"} 0`);
+  });
+
   it("reads an explicit 0, not an absent series, for an agent with no scheduled_retry rows at all", async () => {
     const { agentId } = await insertCompanyAndAgent();
 
