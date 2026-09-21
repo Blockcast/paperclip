@@ -304,6 +304,93 @@ describe("missing hook", () => {
   });
 });
 
+describe("publishing verbs other than `push` (PEN-3156)", () => {
+  // The bypass these close: `isPush` was `subcommand === "push"`, so every
+  // other verb that publishes classified as not-a-push and went through
+  // untouched. Measured against git 2.47.3 by Ally on head 5bc6f36e, and
+  // re-measured end to end here: `git -c core.hooksPath=<hooks> send-pack
+  // <remote> HEAD:refs/heads/x` printed `* [new branch]`, landed the ref, and
+  // ran no hook — the guard's injected config present and irrelevant, because
+  // `send-pack` never consults the pre-push hook.
+  //
+  // These therefore assert the REFUSAL, not that the hook fired. Asserting the
+  // hook would be asserting something unreachable on this path, and would pass
+  // for the wrong reason the moment the refusal regressed to a guard.
+  const SEND_PACK = "send-pack";
+
+  it("refuses send-pack on the bare-argv leg", () => {
+    expect(() =>
+      buildGitArgv([SEND_PACK, "origin", "HEAD:refs/heads/x"], { ...PRESENT }),
+    ).toThrow(/refusing to run `git send-pack`/);
+  });
+
+  it("says injecting the hook would not help, so nobody re-fixes it as a guard", () => {
+    // The obvious remedy — add these verbs to the push classification so
+    // `core.hooksPath` is injected — is inert. The message has to carry that,
+    // or the next author re-applies it.
+    expect(() => buildGitArgv([SEND_PACK], { ...PRESENT })).toThrow(/does not help/);
+  });
+
+  it("refuses send-pack reached through an alias, naming the chain", () => {
+    // The alias-expansion leg. Ally measured this one publishing too:
+    // `alias.publishit = send-pack <remote> HEAD:refs/heads/viaalias` landed
+    // the ref with the hook silent.
+    expect(() =>
+      buildGitArgv(["publishit"], {
+        ...PRESENT,
+        resolveAlias: (name) =>
+          name === "publishit" ? `${SEND_PACK} origin HEAD:refs/heads/x` : null,
+      }),
+    ).toThrow(/refusing to run `git send-pack`[\s\S]*alias `publishit`/);
+  });
+
+  it("refuses an unrecognised verb, because unknown cannot be shown to be safe", () => {
+    // The inversion. A denylist would pass this; the allowlist refuses it, and
+    // that is the whole behavioural change. `lfs` is the realistic case — a
+    // third-party verb that does publish.
+    expect(() => buildGitArgv(["lfs", "push"], { ...PRESENT })).toThrow(
+      /refusing to run `git lfs`[\s\S]*not one of them/,
+    );
+  });
+
+  it("tells the operator which constant to widen, so the fix is not to bypass the wrapper", () => {
+    expect(() => buildGitArgv(["some-new-plumbing"], { ...PRESENT })).toThrow(
+      /NON_PUBLISHING_GIT_VERBS/,
+    );
+  });
+
+  it("still passes ordinary non-publishing verbs through untouched", () => {
+    // The control that would catch the allowlist being over-applied as a
+    // blanket refusal — the failure mode that would break every agent's git.
+    // Deliberately wide, and includes plumbing, because the risk of an
+    // allowlist is what it omits.
+    for (const argv of [
+      ["status"],
+      ["commit", "-m", "x"],
+      ["fetch", "origin"],
+      ["log"],
+      ["rev-parse", "HEAD"],
+      ["worktree", "list"],
+      ["cat-file", "-p", "HEAD"],
+      ["ls-remote", "origin"],
+      ["for-each-ref"],
+      ["update-ref", "refs/heads/x", "HEAD"],
+      ["stash", "pop"],
+      ["bundle", "create", "/tmp/b", "HEAD"],
+    ]) {
+      expect(buildGitArgv(argv, { ...PRESENT }), argv.join(" ")).toEqual(argv);
+    }
+  });
+
+  it("still guards a real push rather than refusing it", () => {
+    // The other half of that control: the inversion must not have swept `push`
+    // itself into the refusal path.
+    const argv = buildGitArgv(["push", "origin", "main"], { ...PRESENT });
+    expect(argv).toContain("push");
+    expect(argv.join(" ")).toContain("core.hooksPath");
+  });
+});
+
 describe("shell aliases", () => {
   // Measured against git 2.47.3: git PREPENDS its exec-path to PATH for the
   // shell it spawns, and /usr/lib/git-core ships a complete `git`. So a bare

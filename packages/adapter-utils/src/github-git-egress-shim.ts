@@ -106,6 +106,100 @@ const HOOKS_PATH_KEY = "core.hookspath";
 const ALIAS_KEY_PREFIX = "alias.";
 
 /**
+ * Git verbs that do NOT publish to a remote, and so may pass through unguarded.
+ *
+ * This is an allowlist, and the direction is the point. The obvious shape is a
+ * denylist — refuse `send-pack`, guard `push`, pass everything else — and it
+ * was the shape this guard shipped with, as `subcommand === "push"`. It fails
+ * OPEN on every verb nobody thought of, which is not a hypothetical: `git
+ * send-pack <url> <ref>` classified as not-a-push, went through untouched, and
+ * published. Measured against git 2.47.3, `git -c core.hooksPath=<hooks>
+ * send-pack <remote> HEAD:refs/heads/x` printed `* [new branch]`, landed the
+ * ref, and produced no hook output at all — the guard's own injected config was
+ * present and made no difference, because `send-pack` is plumbing and never
+ * consults the pre-push hook. Only `push` runs it.
+ *
+ * So an unrecognised verb refuses. The cost is a loud, self-describing refusal
+ * on a verb that turns out to be harmless, which an operator fixes by adding it
+ * here. The cost of the other direction is a silent publish, which nobody sees.
+ *
+ * Derived from `git --list-cmds=builtins,main,others,nohelpers` at git 2.47.3
+ * (157 verbs), less three groups held back deliberately:
+ *
+ *   publishing    `push` (guarded, not listed here), `send-pack`, `http-push`,
+ *                 and `subtree`, whose `push` mode shells out to a bare `git`
+ *                 that resolves to git's own exec-path rather than back through
+ *                 this wrapper.
+ *   transport     `remote-http{,s}`, `remote-ext`, `remote-fd`, `remote-ftp{,s}`.
+ *                 Invoked directly these speak the transport protocol on stdin,
+ *                 which includes push.
+ *   server/egress `daemon`, `http-backend`, `instaweb`, `shell`, `receive-pack`,
+ *                 `upload-pack`, `upload-archive`, `imap-send`. None has an
+ *                 agent use, and each either serves the repository to the
+ *                 network or sends its contents somewhere.
+ *
+ * A third-party verb (`git lfs`, `git flow`) is unrecognised and therefore
+ * refused. That is correct for those two specifically — both publish.
+ */
+const NON_PUBLISHING_GIT_VERBS: ReadonlySet<string> = new Set([
+  "add", "am", "annotate", "apply", "archive", "bisect", "blame", "branch",
+  "bugreport", "bundle", "cat-file", "check-attr", "check-ignore",
+  "check-mailmap", "check-ref-format", "checkout", "checkout-index", "cherry",
+  "cherry-pick", "clean", "clone", "column", "commit", "commit-graph",
+  "commit-tree", "config", "count-objects", "credential", "credential-cache",
+  "credential-store", "describe", "diagnose", "diff", "diff-files",
+  "diff-index", "diff-tree", "difftool", "fast-export", "fast-import", "fetch",
+  "fetch-pack", "filter-branch", "fmt-merge-msg", "for-each-ref",
+  "for-each-repo", "format-patch", "fsck", "fsck-objects", "gc",
+  "get-tar-commit-id", "grep", "hash-object", "help", "hook", "http-fetch",
+  "index-pack", "init", "init-db", "interpret-trailers", "log", "ls-files",
+  "ls-remote", "ls-tree", "mailinfo", "mailsplit", "maintenance", "merge",
+  "merge-base", "merge-file", "merge-index", "merge-octopus", "merge-one-file",
+  "merge-ours", "merge-recursive", "merge-recursive-ours",
+  "merge-recursive-theirs", "merge-resolve", "merge-subtree", "merge-tree",
+  "mergetool", "mktag", "mktree", "multi-pack-index", "mv", "name-rev", "notes",
+  "pack-objects", "pack-redundant", "pack-refs", "patch-id", "pickaxe", "prune",
+  "prune-packed", "pull", "quiltimport", "range-diff", "read-tree", "rebase",
+  "reflog", "refs", "remote", "repack", "replace", "replay", "request-pull",
+  "rerere", "reset", "restore", "rev-list", "rev-parse", "revert", "rm",
+  "shortlog", "show", "show-branch", "show-index", "show-ref",
+  "sparse-checkout", "stage", "stash", "status", "stripspace", "switch",
+  "symbolic-ref", "tag", "unpack-file", "unpack-objects", "update-index",
+  "update-ref", "update-server-info", "var", "verify-commit", "verify-pack",
+  "verify-tag", "version", "whatchanged", "worktree", "write-tree",
+]);
+
+/**
+ * Verbs known to publish, as opposed to merely unrecognised.
+ *
+ * Enforcement does NOT read this set — {@link NON_PUBLISHING_GIT_VERBS} decides
+ * that, so a publishing verb missing from here is still refused. It exists only
+ * so the refusal can say "this publishes without running the hook" where that
+ * is known, instead of the weaker "I do not recognise this", which reads like a
+ * tooling gap rather than a security decision and invites the wrong fix.
+ */
+const KNOWN_PUBLISHING_GIT_VERBS: ReadonlySet<string> = new Set([
+  "push", "send-pack", "http-push", "subtree", "remote-http", "remote-https",
+  "remote-ext", "remote-fd", "remote-ftp", "remote-ftps",
+]);
+
+/**
+ * True when `verb` is one git will run without any chance of publishing.
+ *
+ * Case-sensitive, matching git: `git STATUS` is not `git status` (measured
+ * against git 2.47.3 — `git: 'STATUS' is not a git command`). Folding here
+ * would admit spellings git itself rejects, which is a widening with no caller.
+ */
+export function isNonPublishingGitVerb(verb: string): boolean {
+  return NON_PUBLISHING_GIT_VERBS.has(verb);
+}
+
+/** True when `verb` is a verb this guard knows publishes to a remote. */
+export function isKnownPublishingGitVerb(verb: string): boolean {
+  return KNOWN_PUBLISHING_GIT_VERBS.has(verb);
+}
+
+/**
  * How many alias hops resolution will walk before refusing.
  *
  * Bounded rather than recursive because the config defining the chain is
@@ -374,6 +468,30 @@ export function splitAliasExpansion(expansion: string): string[] | null {
   return tokens;
 }
 
+/**
+ * A verb that reached the wrapper without being cleared as non-publishing.
+ *
+ * Covers two cases the refusal wording distinguishes but enforcement does not:
+ * a verb known to publish (`send-pack`), and one simply not on the allowlist.
+ * Both refuse, because the second cannot be shown to be safe.
+ */
+export interface GitPublishVerb {
+  /** The verb git would actually have run. */
+  verb: string;
+  /** True when {@link isKnownPublishingGitVerb} recognises it. */
+  known: boolean;
+  /** The alias the caller typed, when the verb was reached through one. */
+  alias: string | null;
+  /**
+   * The alias names walked, ending at {@link verb}, when `alias` is set.
+   *
+   * Carried for the same reason `alias-depth` carries one: the author has to
+   * find the definition to fix it, and the head of the chain is rarely where
+   * the publishing verb is written.
+   */
+  chain?: readonly string[];
+}
+
 export interface GitInvocationClassification {
   /** The resolved subcommand, or null when argv carries only global options. */
   subcommand: string | null;
@@ -407,6 +525,15 @@ export interface GitInvocationClassification {
    * is not an option.
    */
   shellAlias: GitShellAlias | null;
+  /**
+   * A verb that is neither `push` nor on the non-publishing allowlist.
+   *
+   * Set whether or not the chain reached a push — it is set precisely when it
+   * did NOT — so, like `shellAlias`, it must be refused ahead of the
+   * not-a-push early return. Gating it on `isPush` would discard every one of
+   * them, which is the bug it exists to close.
+   */
+  publishVerb: GitPublishVerb | null;
 }
 
 export interface GitShellAlias {
@@ -466,6 +593,7 @@ export function classifyGitInvocation(
       hooksPathOverride: globals.hooksPathOverride,
       aliasBypass: null,
       shellAlias: null,
+      publishVerb: null,
     };
   }
 
@@ -484,6 +612,9 @@ export function classifyGitInvocation(
   // `unquotable`, it means "is this a push?" went unanswered, so the refusal
   // must not be gated on `isPush` — that is the very thing not known.
   let aliasDepthExhausted = false;
+  // The verb git will actually run, when it is neither `push` nor cleared as
+  // non-publishing. Set at the one place the walk learns what that verb is.
+  let publishVerb: GitPublishVerb | null = null;
 
   if (!isPush) {
     const definitions = new Map(globals.aliasDefinitions);
@@ -497,7 +628,26 @@ export function classifyGitInvocation(
     let hop = 0;
     for (; hop < ALIAS_HOP_LIMIT && name && !isPush; hop += 1) {
       const expansion = lookup(name);
-      if (!expansion) break;
+      // No expansion means `name` is not an alias, so it is the verb git will
+      // actually run — and this is the ONLY place in the walk where that is
+      // known. Testing here covers the bare-argv leg (`hop === 0`, `name` is
+      // the typed subcommand) and the alias-expansion leg (`hop > 0`, `name`
+      // came out of an expansion) with one test. Ally's finding named the two
+      // legs as separate call sites; they are deliberately not implemented as
+      // two, because two tests of the same property are two things that can
+      // drift, and the four bypasses already closed on this path were all
+      // drift of exactly that kind.
+      if (!expansion) {
+        if (!isNonPublishingGitVerb(name)) {
+          publishVerb = {
+            verb: name,
+            known: isKnownPublishingGitVerb(name),
+            alias: hop === 0 ? null : subcommand,
+            ...(hop === 0 ? {} : { chain: [...chain, name] }),
+          };
+        }
+        break;
+      }
       chain.push(name);
       // A `!`-prefixed alias is an arbitrary shell command, and it is the one
       // expansion that escapes this guard completely — so it is recorded for
@@ -625,6 +775,7 @@ export function classifyGitInvocation(
         ? pendingBypass
         : null,
     shellAlias,
+    publishVerb,
   };
 }
 

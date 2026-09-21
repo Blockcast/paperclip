@@ -85,6 +85,7 @@ import {
   parsePrePushInput,
   scanPrePushUpdates,
   type GitAliasBypass,
+  type GitPublishVerb,
   type GitReader,
 } from "./github-git-egress-shim.js";
 
@@ -218,6 +219,34 @@ function aliasBypassRefusal(bypass: GitAliasBypass): GitEgressRuntimeError {
   );
 }
 
+/**
+ * The refusal for a verb that is not `push` and not cleared as non-publishing.
+ *
+ * The two wordings differ because the remedies differ. For a verb known to
+ * publish there is nothing to add to an allowlist and the author needs to hear
+ * that the `push` subcommand is the guarded way. For an unrecognised one the
+ * refusal is a conservative default that an operator may legitimately want to
+ * relax, so it names the constant to edit — otherwise the natural fix is to
+ * reach around the wrapper, which is strictly worse than widening the list on
+ * purpose.
+ */
+function publishVerbRefusal(publishVerb: GitPublishVerb): GitEgressRuntimeError {
+  const { verb, known, alias, chain } = publishVerb;
+  const via = alias
+    ? ` It was reached through the alias \`${alias}\` (\`${(chain ?? [alias]).join("` → `")}\`), so the definition is where the fix goes.`
+    : "";
+
+  if (known) {
+    return new GitEgressRuntimeError(
+      `paperclip-github-egress: refusing to run \`git ${verb}\` — it publishes to a remote but does NOT run the pre-push hook, so the check for credential-shaped material would never see the objects it sends. Measured against git 2.47.3: \`send-pack\` landed a new ref on the remote with the hook silent, and with this guard's own \`core.hooksPath\` present — injecting the hook does not help, because the command never reads it. Publish with the \`push\` subcommand, which is guarded.${via}`,
+    );
+  }
+
+  return new GitEgressRuntimeError(
+    `paperclip-github-egress: refusing to run \`git ${verb}\` — this guard passes through only verbs it knows cannot publish to a remote, and \`${verb}\` is not one of them. Unrecognised is refused rather than allowed because the plumbing verbs that publish (\`send-pack\`, \`http-push\`) do so WITHOUT running the pre-push hook, so letting an unknown verb through is a silent hole rather than a noisy one. If \`${verb}\` cannot publish, add it to NON_PUBLISHING_GIT_VERBS in github-git-egress-shim.ts; if it can, use the \`push\` subcommand instead.${via}`,
+  );
+}
+
 export function buildGitArgv(
   argv: readonly string[],
   options: {
@@ -267,6 +296,19 @@ export function buildGitArgv(
       classification.aliasBypass.reason === "alias-depth")
   ) {
     throw aliasBypassRefusal(classification.aliasBypass);
+  }
+
+  // Ahead of the not-a-push early return, for the same reason as the two
+  // blocks above: this is set precisely WHEN the invocation is not a `push`,
+  // so letting the early return run first would discard every one of them.
+  //
+  // Refusal, not guarding. Adding these verbs to the push classification so
+  // `core.hooksPath` is injected does nothing — `send-pack` does not consult
+  // the pre-push hook at all, measured against git 2.47.3 with this guard's
+  // own `-c` present: the ref landed and the hook never ran. There is no hook
+  // to make fire, so the only enforcement available is to not run the command.
+  if (classification.publishVerb) {
+    throw publishVerbRefusal(classification.publishVerb);
   }
 
   if (!classification.isPush) return [...argv];
