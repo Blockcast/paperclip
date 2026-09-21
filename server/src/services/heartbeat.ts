@@ -1707,6 +1707,39 @@ export function selectAgedPrReviewRunForFairDispatch(
     )[0]?.id ?? null;
 }
 
+type QueuedRunDispatchOrderRun = Pick<
+  typeof heartbeatRuns.$inferSelect,
+  "id" | "createdAt"
+>;
+
+/**
+ * Total order for the queued-run dispatch sort (BLO-12990 priority sort).
+ *
+ * Rank, then age, then id. The final `id` leg is load-bearing (BLO-28886):
+ * `queuedRuns` is a CONCATENATION of the critical / recovery /
+ * absolute-starvation / general lanes, so two runs that tie on rank AND on
+ * `createdAt` — routine for rows enqueued in one batch, which share a
+ * millisecond — were left to stable-sort input order, i.e. to lane admission
+ * order. That order moves with `dispatchNow`, the absolute-starvation floor and
+ * the per-agent lane cursors, so the same queue could dispatch a different run
+ * on two otherwise identical passes. Mirrors the `(created_at, id)` ORDER BY
+ * every lane query already uses, and `selectAgedPrReviewRunForFairDispatch`.
+ */
+export function compareQueuedRunDispatchOrder(
+  left: QueuedRunDispatchOrderRun,
+  right: QueuedRunDispatchOrderRun,
+  rankByRunId: ReadonlyMap<string, number>,
+  fairnessPromotedRunId: string | null,
+) {
+  if (left.id === fairnessPromotedRunId && right.id !== fairnessPromotedRunId) return -1;
+  if (right.id === fairnessPromotedRunId && left.id !== fairnessPromotedRunId) return 1;
+  const leftRank = rankByRunId.get(left.id) ?? Number.MAX_SAFE_INTEGER;
+  const rightRank = rankByRunId.get(right.id) ?? Number.MAX_SAFE_INTEGER;
+  return (leftRank - rightRank)
+    || (left.createdAt.getTime() - right.createdAt.getTime())
+    || left.id.localeCompare(right.id);
+}
+
 /**
  * Returns the opts to pass to `scheduleBoundedRetryForRun` for an automatic
  * retry, or undefined to use the default transient-failure opts. Called only
@@ -28071,19 +28104,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ),
         );
       }
-      const prioritizedRuns = [...queuedRuns].sort((left, right) => {
-        if (left.id === fairnessPromotedPrReviewRunId && right.id !== fairnessPromotedPrReviewRunId) {
-          return -1;
-        }
-        if (right.id === fairnessPromotedPrReviewRunId && left.id !== fairnessPromotedPrReviewRunId) {
-          return 1;
-        }
-        const leftRank = dispatchRankByRunId.get(left.id) ?? Number.MAX_SAFE_INTEGER;
-        const rightRank = dispatchRankByRunId.get(right.id) ?? Number.MAX_SAFE_INTEGER;
-        return leftRank !== rightRank
-          ? leftRank - rightRank
-          : left.createdAt.getTime() - right.createdAt.getTime();
-      });
+      const prioritizedRuns = [...queuedRuns].sort((left, right) =>
+        compareQueuedRunDispatchOrder(
+          left,
+          right,
+          dispatchRankByRunId,
+          fairnessPromotedPrReviewRunId,
+        ));
 
       // Per-issue dedupe: if a queued run targets an issue that already has a
       // running sibling (this iteration's claim OR a prior tick's still-running
