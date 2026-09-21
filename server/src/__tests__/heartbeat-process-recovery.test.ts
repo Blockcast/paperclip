@@ -13017,24 +13017,82 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // increment per concurrent caller — so this still fails if a retry path double-increments.
     expect(actions[0]?.attemptCount).toBeGreaterThanOrEqual(1);
     expect(actions[0]?.attemptCount).toBeLessThanOrEqual(8);
-    // Pin WHICH bound retired it. The creation-anchored horizon is hours out here, so the
-    // budget is the only bound that can have fired — which makes this the one assertion that
-    // fails if the wake path ever goes back to hardcoding the bound on a disjunctive gate.
+    // Pin the retirement to `retiringBound`, the durable record of WHY the row retired —
+    // never to `attemptCount`.
     //
-    // Keyed on the OBSERVED attempt count, not on config. How many of the 8 concurrent
-    // reserves actually land is scheduling-dependent (measured 4, 6 and 7 on three runs of
-    // this suite against a budget of 5), so "was the budget exhausted?" is only answerable
-    // from the row itself. Both regimes are asserted rather than one being skipped, so the
-    // branch cannot rot into a silent no-op, and the pairing — retired iff the budget was
-    // reached — holds whichever way the race falls.
-    if ((actions[0]?.attemptCount ?? 0) >= defaultRecoveryActionMaxAttempts) {
-      expect(actions[0]?.status).toBe("escalated");
-      expect(actions[0]?.retiringBound).toBe("attempt_budget");
-    } else {
-      expect(actions[0]?.status).toBe("active");
-      expect(actions[0]?.retiringBound).toBeNull();
-    }
+    // BLO-35010: the BLO-33410 branch keyed this on `attemptCount >= budget` and so asserted
+    // that a retired row must read at or above the budget. It does not. Retirement runs
+    // through `retireAndReleaseWakeAttempt`, which REFUNDS the reserved attempt in the same
+    // statement that escalates, and a sweep whose `enqueueWakeup` returns null refunds too —
+    // so a correctly-escalated row routinely reads BELOW the budget and the `else` arm then
+    // demanded `active` of it (`expected 'escalated' to be 'active'`, run 35544923341).
+    // `retiringBound` is written with `coalesce`, first writer wins permanently, and no
+    // refund touches it.
+    //
+    // Both bounds are legitimately reachable here and neither is collapsed into the other:
+    // `strandedRecoveryWakeAttemptsExhausted` is disjunctive (budget OR `timeoutAt <= now`),
+    // so the set membership is the assertion that fails if the wake path ever hardcodes one
+    // bound on that gate, and the pairing below is what fails if a retirement stops
+    // escalating — or an un-retired row escalates without recording a bound.
+    const retiringBound = actions[0]?.retiringBound ?? null;
+    expect([null, "attempt_budget", "timeout_horizon"]).toContain(retiringBound);
+    expect(actions[0]?.status).toBe(retiringBound === null ? "active" : "escalated");
     await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
+  });
+
+  it("retires a stranded recovery action on the wall-clock horizon with its attempt budget unspent", async () => {
+    // BLO-35010: the regime the race test above cannot reach deterministically — whether it
+    // enters this one is scheduling-dependent — and the regime BLO-33410's `attemptCount`
+    // branch asserted was unreachable. Per BLO-19124 it is the DOMINANT production shape: 0
+    // of 245 rows ever reached the attempt budget, every observed retirement came from the
+    // horizon, and the retirement's own refund puts the count back below the budget.
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "adapter_exit_code",
+    });
+
+    // The state a long-lived action reaches: horizon burned, budget barely touched. Seeded
+    // rather than swept into, because the sweep escalates the issue out of the stranded set
+    // on its first pass — one sweep is the only entry this path gets. Owner-keyed
+    // fingerprint, matching what the sweep computes, so it reuses this row rather than
+    // inserting a second one (asserted by the id check below).
+    const [seeded] = await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: issueId,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerAgentId: agentId,
+      previousOwnerAgentId: agentId,
+      returnOwnerAgentId: agentId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `source_scoped_recovery:${companyId}:${issueId}:stranded_assigned_issue:${agentId}`,
+      nextAction: "Restore a live execution path.",
+      attemptCount: 1,
+      maxAttempts: defaultRecoveryActionMaxAttempts,
+      timeoutAt: new Date(Date.now() - 60_000),
+    }).returning();
+    expect(seeded?.retiringBound).toBeNull();
+
+    await heartbeat.reconcileStrandedAssignedIssues();
+
+    const retired = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(
+        eq(issueRecoveryActions.companyId, companyId),
+        eq(issueRecoveryActions.sourceIssueId, issueId),
+      ))
+      .then((rows) => rows[0] ?? null);
+    expect(retired?.id).toBe(seeded!.id);
+    expect(retired?.status).toBe("escalated");
+    expect(retired?.retiringBound).toBe("timeout_horizon");
+    // The point of the row: retired, with the budget demonstrably NOT reached — the sweep
+    // reserved an attempt and `retireAndReleaseWakeAttempt` refunded it in the same
+    // statement that escalated. This is what BLO-33410's `attemptCount` branch called
+    // unreachable.
+    expect(retired?.attemptCount).toBeLessThan(defaultRecoveryActionMaxAttempts);
   });
 
   it("blocks stranded recovery issues in place instead of creating nested recovery issues", async () => {
