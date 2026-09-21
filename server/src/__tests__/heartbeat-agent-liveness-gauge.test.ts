@@ -588,13 +588,29 @@ describe("wire names for the BLO-22498 gauges are a cross-repo contract (BLO-331
     // has no mutation that fails it alone, because the zero-fill below
     // derives from that same constant. The zero-fill is also what makes this
     // readable with no database.
-    const oldestAge = getMetricsRegistry().getSingleMetric(AGENT_ERROR_REASON_OLDEST_AGE_METRIC);
-    expect(oldestAge, `${AGENT_ERROR_REASON_OLDEST_AGE_METRIC} must be registered`).toBeTruthy();
-    const series = (await oldestAge!.get()) as {
-      values: Array<{ labels: Record<string, string> }>;
-    };
-    expect(series.values.map((entry) => entry.labels)).toContainEqual({
-      error_reason: "session_unavailable",
-    });
+    //
+    // BOTH reason-gauges are checked, not just one. The dashboard reads
+    // `max by (error_reason)` off each, and the two gauges declare INDEPENDENT
+    // bare `error_reason` literals (metrics.ts `labelNames`, one per gauge).
+    // So a rename of a single gauge's label blanks exactly that panel and
+    // leaves the other reporting normally -- a half-dark dashboard, which is
+    // harder to notice than a wholly dark one. Verified by mutation: renaming
+    // the agents gauge's label alone passed a single-gauge version of this
+    // assertion.
+    const registry = getMetricsRegistry();
+    for (const metricName of [
+      AGENT_ERROR_REASON_AGENTS_METRIC,
+      AGENT_ERROR_REASON_OLDEST_AGE_METRIC,
+    ]) {
+      const gauge = registry.getSingleMetric(metricName);
+      expect(gauge, `${metricName} must be registered`).toBeTruthy();
+      const series = (await gauge!.get()) as {
+        values: Array<{ labels: Record<string, string> }>;
+      };
+      expect(
+        series.values.map((entry) => entry.labels),
+        `${metricName} must publish the session_unavailable bucket under the error_reason label`,
+      ).toContainEqual({ error_reason: "session_unavailable" });
+    }
   });
 });
