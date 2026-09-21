@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { createdRangeFor, detect } from "../ci-mass-cancellation-detector.mjs";
+import { createdRangeFor, detect, fetchRunsLive } from "../ci-mass-cancellation-detector.mjs";
 
 // Fixture data transcribed from the real recurrences documented on
 // https://paperclip.blockcast.net/BLO/issues/BLO-21078 — the 2026-08-02
@@ -141,6 +141,18 @@ test("ignores runs from other workflows", () => {
   const otherWorkflow = AUG_02_CLUSTER.map((r) => ({ ...r, name: "release" }));
   const verdict = detect(otherWorkflow, { since: "2026-08-02T00:00:00Z", until: "2026-08-03T00:00:00Z" });
   assert.equal(verdict.firing, false);
+  // ...but say so. `fetchedRunCount` counts every workflow, so a mistyped
+  // --workflow clears the vacuous-fetch guard and emits a confident all-clear
+  // over the 08-02 incident itself. `sameWorkflowRunCount` is what separates
+  // "the named workflow was quiet" from "nothing is named that"; main() exits
+  // 2 on the latter.
+  assert.equal(verdict.sameWorkflowRunCount, 0);
+  assert.ok(verdict.fetchedRunCount > 0);
+});
+
+test("sameWorkflowRunCount counts the matching workflow, so a quiet window stays distinguishable from a typo", () => {
+  const verdict = detect(AUG_02_CLUSTER, { since: "2026-08-02T00:00:00Z", until: "2026-08-03T00:00:00Z" });
+  assert.equal(verdict.sameWorkflowRunCount, AUG_02_CLUSTER.length);
 });
 
 // BLO-21078: the backtest that AC3's verifying signal calls for was
@@ -187,4 +199,47 @@ test("verdict flags a fetch truncated at the API result cap, because a missed cl
   );
   assert.equal(detect(padded, { since: "2026-08-05T00:00:00Z", until: "2026-08-07T00:00:00Z" }).fetchTruncated, true);
   assert.equal(detect(ISOLATED_MANUAL_CANCEL, { since: "2026-08-06T00:00:00Z", until: "2026-08-07T00:00:00Z" }).fetchTruncated, false);
+});
+
+test("verdict flags a fetch truncated by --max-pages, which the result-cap check cannot see", () => {
+  // The dangerous case is truncation BELOW the ~1000 cap: `--max-pages 1`
+  // over 2026-08-02T19:00Z..20:00Z fetched 100 runs spanning 20:45Z..01:59Z
+  // and reported `firing:false, fetchTruncated:false`, exit 0 — the 19:34Z
+  // incident sat under the page cut with no caveat. Only the fetcher knows it
+  // stopped early, so it has to say so.
+  const window = { since: "2026-08-06T00:00:00Z", until: "2026-08-07T00:00:00Z" };
+  assert.equal(detect(ISOLATED_MANUAL_CANCEL, { ...window, pageBounded: true }).fetchTruncated, true);
+  assert.equal(detect(ISOLATED_MANUAL_CANCEL, { ...window, pageBounded: false }).fetchTruncated, false);
+  // Well under the cap, so the cap check alone would have called this a census.
+  assert.ok(ISOLATED_MANUAL_CANCEL.length < 1000);
+});
+
+// The page-bounding guard lives in the fetch loop, which `--json-file`
+// bypasses entirely — so every fixture test above passes with it deleted
+// (confirmed by mutation). Inject the page fetcher to reach it.
+test("fetchRunsLive reports pageBounded only when it quit on --max-pages with more to give", () => {
+  const page = (n) => Array.from({ length: n }, (_, i) => ({ id: i }));
+  const pager = (pages) => (_repo, p) => pages[p - 1] ?? [];
+
+  // Full final page at the cap: the API still had more and we stopped first.
+  // This is the silent all-clear the reviewer reproduced at --max-pages 1.
+  const bounded = fetchRunsLive("o/r", 2, "r", pager([page(100), page(100), page(100)]));
+  assert.equal(bounded.pageBounded, true);
+  assert.equal(bounded.runs.length, 200);
+
+  // Short final page: the API is exhausted, so the census is complete.
+  const short = fetchRunsLive("o/r", 2, "r", pager([page(100), page(7)]));
+  assert.equal(short.pageBounded, false);
+  assert.equal(short.runs.length, 107);
+
+  // Exhausted by an empty page before the cap — also complete, and the
+  // boundary case that a naive `page === maxPages` check gets wrong.
+  const drained = fetchRunsLive("o/r", 3, "r", pager([page(100), []]));
+  assert.equal(drained.pageBounded, false);
+  assert.equal(drained.runs.length, 100);
+
+  // Exactly-full last page at the cap is the ONLY bounded shape: one page,
+  // one call, cap 1.
+  assert.equal(fetchRunsLive("o/r", 1, "r", pager([page(100)])).pageBounded, true);
+  assert.equal(fetchRunsLive("o/r", 1, "r", pager([page(99)])).pageBounded, false);
 });
