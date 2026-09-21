@@ -212,7 +212,6 @@ const UNEXECUTED_WITH_TESTS = new Map(
     "@paperclipai/plugin-workspace-diff",
     "@paperclipai/teams-catalog",
     "paperclip-cloudflare-sandbox-bridge-template",
-    "paperclip-plugin-alertmanager",
     "paperclip-plugin-slack",
   ].map((name) => [name, "PEN-2506"]),
 );
