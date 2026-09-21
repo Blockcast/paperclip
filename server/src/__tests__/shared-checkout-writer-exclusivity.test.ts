@@ -148,8 +148,14 @@ describe("resolveWorkspaceWriterTreeKey", () => {
   });
 
   it("returns null when there is nothing identifying the shared tree", () => {
-    // An unscoped run has no project workspace, so there is no shared project
-    // checkout to exclude on. Keying it would serialize unrelated runs.
+    // NOT "there is no shared checkout to exclude on" -- there usually is one,
+    // and this is a known gap rather than a safe case. `projectWorkspaceId` is
+    // only backfilled onto the issue AFTER the first run realizes a workspace
+    // (`issueRef?.projectWorkspaceId ?? resolvedWorkspace.workspaceId`), so the
+    // first run of a fresh issue into a shared checkout keys null and is not
+    // excluded. Accepted deliberately: the reservation must bind before the
+    // workspace is realized, so no sound key exists at this point. See the
+    // KNOWN GAP note on `resolveWorkspaceWriterTreeKey`.
     expect(resolveWorkspaceWriterTreeKey({
       statelessPrReview: false,
       runResolvesToOwnTree: false,
@@ -170,42 +176,109 @@ describe("the key reaches the reservation (end-to-end through the resolver)", ()
   // actually puts it on `reservationKey` -- that is the field bound to the
   // single-writer index. Asserting the key alone would pass even if the
   // resolver dropped it, which is how the shared-checkout case stayed broken.
-  const identityFor = (runId: string, treeKey: string | null) =>
+  //
+  // Parameterized over `effectiveMaxConcurrentRuns` deliberately. An earlier
+  // revision hardcoded 3, which exercised only the `> 1` exit and hid a live
+  // defect: the resolver DID drop the key at 1, which is the DEFAULT for every
+  // external-lifecycle agent (`concurrencyEnabled` is false unless an operator
+  // sets it, and `resolveExternalLifecycleConcurrency` then returns a hard 1).
+  // The untested branch was the only branch that ships. Any new exit added to
+  // that resolver must be reachable from this helper.
+  const identityFor = (
+    runId: string,
+    treeKey: string | null,
+    opts: { agentId?: string; effectiveMaxConcurrentRuns: number },
+  ) =>
     resolveK8sRunIsolationIdentity({
       adapterType: "claude_k8s",
       runId,
-      agentId: "agent-1",
+      agentId: opts.agentId ?? "agent-1",
       statelessPrReview: false,
       isWorkspaceIsolated: false,
       persistedExecutionWorkspaceId: null,
-      effectiveMaxConcurrentRuns: 3,
+      effectiveMaxConcurrentRuns: opts.effectiveMaxConcurrentRuns,
       perIssueWorkspaceTreeKey: treeKey,
     });
 
-  it("two shared-checkout runs land on ONE reservationKey", () => {
-    const treeKey = resolveWorkspaceWriterTreeKey({
-      statelessPrReview: false,
-      runResolvesToOwnTree: false,
-      usesPerRunScope: false,
-      issue: { id: "issue-a", projectWorkspaceId: PW },
+  const sharedCheckoutKey = (issueId: string) => resolveWorkspaceWriterTreeKey({
+    statelessPrReview: false,
+    runResolvesToOwnTree: false,
+    usesPerRunScope: false,
+    issue: { id: issueId, projectWorkspaceId: PW },
+  });
+
+  // 1 is the default posture; 3 is an operator who opted into concurrency.
+  for (const effectiveMaxConcurrentRuns of [1, 3]) {
+    describe(`effectiveMaxConcurrentRuns: ${effectiveMaxConcurrentRuns}`, () => {
+      it("two shared-checkout runs land on ONE reservationKey", () => {
+        const treeKey = sharedCheckoutKey("issue-a");
+        const first = identityFor("run-1", treeKey, { effectiveMaxConcurrentRuns });
+        const second = identityFor("run-2", treeKey, { effectiveMaxConcurrentRuns });
+
+        expect(first?.reservationKey).toBe(`workspace-tree:project-primary:${PW}`);
+        expect(first?.reservationKey).toBe(second?.reservationKey);
+        // isolationKey stays private: it gates saved-session resume and names
+        // the run's own roots, so widening it would let a run resume a session
+        // that is not under its own sessionRoot. At concurrency 1 it stays
+        // agent-scoped, which is what keeps the warm shared home/session roots.
+        expect(first?.isolationKey).toBe(
+          effectiveMaxConcurrentRuns > 1 ? "run:run-1" : "agent-shared:agent-1",
+        );
+      });
+
+      it("excludes TWO DIFFERENT AGENTS sharing one project checkout", () => {
+        // BLO-19422's headline case, and the one no earlier test covered. The
+        // pre-fix keys were `agent-shared:A` / `agent-shared:B` -- distinct,
+        // both admitted by the writer index, both writing one directory.
+        // Different issues too, because that is the measured shape: the
+        // project checkout is shared across issues AND across agents.
+        const first = identityFor("run-1", sharedCheckoutKey("issue-a"), {
+          agentId: "agent-1",
+          effectiveMaxConcurrentRuns,
+        });
+        const second = identityFor("run-2", sharedCheckoutKey("issue-b"), {
+          agentId: "agent-2",
+          effectiveMaxConcurrentRuns,
+        });
+
+        expect(first?.reservationKey).toBe(second?.reservationKey);
+      });
+
+      it("keeps different project workspaces independent across agents", () => {
+        // The other half of the contract: serializing runs that do NOT share a
+        // directory would be a throughput regression, not a fix.
+        const first = identityFor("run-1", `project-primary:${PW}`, {
+          agentId: "agent-1",
+          effectiveMaxConcurrentRuns,
+        });
+        const second = identityFor("run-2", `project-primary:${OTHER_PW}`, {
+          agentId: "agent-2",
+          effectiveMaxConcurrentRuns,
+        });
+
+        expect(first?.reservationKey).not.toBe(second?.reservationKey);
+      });
+
+      it("regression: a null key leaves both runs writing one tree unexcluded", () => {
+        // Pins the pre-fix behaviour as the thing being prevented. If a future
+        // change makes resolveWorkspaceWriterTreeKey return null for the shared
+        // checkout again, the tests above fail and this one explains why.
+        //
+        // At concurrency 1 both runs fall back to `agent-shared:<agentId>`, so
+        // two runs of ONE agent still collide -- assert across agents, which is
+        // the pairing that genuinely goes unexcluded on a null key. That is the
+        // known un-backfilled-issue gap documented on `resolveWorkspaceWriter
+        // TreeKey`, not an oversight.
+        const first = identityFor("run-1", null, {
+          agentId: "agent-1",
+          effectiveMaxConcurrentRuns,
+        });
+        const second = identityFor("run-2", null, {
+          agentId: "agent-2",
+          effectiveMaxConcurrentRuns,
+        });
+        expect(first?.reservationKey).not.toBe(second?.reservationKey);
+      });
     });
-    const first = identityFor("run-1", treeKey);
-    const second = identityFor("run-2", treeKey);
-
-    expect(first?.reservationKey).toBe(`workspace-tree:project-primary:${PW}`);
-    expect(first?.reservationKey).toBe(second?.reservationKey);
-    // isolationKey stays run-private: it gates saved-session resume and names
-    // the run's own ephemeral roots, so widening it would let a run resume a
-    // session that is not under its own sessionRoot.
-    expect(first?.isolationKey).not.toBe(second?.isolationKey);
-  });
-
-  it("regression: a null key leaves both runs writing one tree unexcluded", () => {
-    // Pins the pre-fix behaviour as the thing being prevented. If a future
-    // change makes resolveWorkspaceWriterTreeKey return null for the shared
-    // checkout again, the test above fails and this one explains why.
-    const first = identityFor("run-1", null);
-    const second = identityFor("run-2", null);
-    expect(first?.reservationKey).not.toBe(second?.reservationKey);
-  });
+  }
 });
