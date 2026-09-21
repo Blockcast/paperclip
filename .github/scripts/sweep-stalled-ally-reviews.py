@@ -192,8 +192,14 @@ MAX_REFIRES_PER_RUN = int(os.environ.get("MAX_REFIRES_PER_RUN") or 5)
 # rate-limit arithmetic, which is unchanged by this). It tolerates up to
 # MAX_REFIRES_PER_RUN persistently-failing PRs while still delivering a full
 # budget to healthy ones.
-MAX_REFIRE_ATTEMPTS_PER_RUN = int(
-    os.environ.get("MAX_REFIRE_ATTEMPTS_PER_RUN") or 2 * MAX_REFIRES_PER_RUN
+#
+# Clamped to at least the delivery cap. An operator-set value below it would
+# make MAX_REFIRES_PER_RUN unreachable, and the deferral message would then
+# name the attempt ceiling while implying the delivery budget had been spent.
+# The clamp makes that state unrepresentable rather than merely unlikely.
+MAX_REFIRE_ATTEMPTS_PER_RUN = max(
+    MAX_REFIRES_PER_RUN,
+    int(os.environ.get("MAX_REFIRE_ATTEMPTS_PER_RUN") or 2 * MAX_REFIRES_PER_RUN),
 )
 
 # BLO-22892 AC4: the stranded condition must be visible without a human
@@ -1092,8 +1098,20 @@ def main(argv=None):
         if is_alarming({"is_draft": bool(r[0].get("draft")), "pending_since": r[2]}, now)
     ]
     failed = [r for r in results if str(r[4]).startswith(SWEEP_ERROR_REASON_PREFIX)]
-    rate_limited = [r for r in failed if RATE_LIMIT_TOKEN in str(r[4])]
     refire_write_failures = [r for r in failed if REFIRE_WRITE_FAILURE_TOKEN in str(r[4])]
+    # A write-pass failure records the EXCEPTION TYPE in its reason, so a
+    # rate-limited write reads "re-fire write failed (RateLimitExhausted)" --
+    # which contains RATE_LIMIT_TOKEN as a substring. Matching on that alone
+    # put it in this bucket and printed "never attempted ... the run aborted"
+    # over a PR that was fully evaluated and whose write was attempted and
+    # rejected. Excluding write failures keeps the two apart because their
+    # remedies differ: read-pass exhaustion argues for fewer reads, a
+    # write-side rejection (secondary limit, or a token that cannot post)
+    # does not.
+    rate_limited = [
+        r for r in failed
+        if RATE_LIMIT_TOKEN in str(r[4]) and REFIRE_WRITE_FAILURE_TOKEN not in str(r[4])
+    ]
     deferred = [r for r in results if str(r[4]).startswith(DEFERRED_REASON_PREFIX)]
     degraded = sweep_is_degraded(len(failed), len(results))
     for pr, head_sha, pending_since, refire, reason in results:
@@ -1123,6 +1141,27 @@ def main(argv=None):
                         "mid-sweep and the run aborted rather than grinding out one identical "
                         "failure per remaining PR.\n\n" % len(rate_limited)
                     )
+                if refire_write_failures:
+                    # Sits here, beside its read-pass counterpart, rather than
+                    # under `if deferred:` -- write failures and deferrals are
+                    # independent, and a run with failed writes but nothing
+                    # deferred used to print no explanation of them at all.
+                    # Phrased to hold in both cases, so hoisting it needs no
+                    # extra condition.
+                    handle.write(
+                        "%d of them DID win a slot and were attempted -- the re-fire write "
+                        "was rejected. A failed write posts no marker and so starts no "
+                        "cooldown, so it does NOT consume the MAX_REFIRES_PER_RUN=%d budget "
+                        "-- but it does count against MAX_REFIRE_ATTEMPTS_PER_RUN=%d, which "
+                        "is what can defer an otherwise-eligible PR with fewer than %d "
+                        "re-fired.\n\n"
+                        % (
+                            len(refire_write_failures),
+                            MAX_REFIRES_PER_RUN,
+                            MAX_REFIRE_ATTEMPTS_PER_RUN,
+                            MAX_REFIRES_PER_RUN,
+                        )
+                    )
                 if degraded:
                     handle.write(
                         "**This run is DEGRADED** (%d of %d failed). Its `alarming=%d` "
@@ -1151,9 +1190,9 @@ def main(argv=None):
                 # exactly what makes "those rank first next run" true -- and
                 # it is only the same as "the count that won a slot" because
                 # a failed write no longer consumes one. Where the two do
-                # diverge (the attempt ceiling bit), the extra line below
-                # names the difference rather than letting this one imply the
-                # budget was delivered.
+                # diverge (the attempt ceiling bit), the write-failure line in
+                # the failed-PR section above names the difference rather than
+                # letting this one imply the budget was delivered.
                 handle.write(
                     "\n### %d PR(s) eligible but deferred past this run's re-fire budget "
                     "(MAX_REFIRES_PER_RUN=%d delivered, MAX_REFIRE_ATTEMPTS_PER_RUN=%d attempted) "
@@ -1161,15 +1200,6 @@ def main(argv=None):
                     "so these rank first next run\n\n"
                     % (len(deferred), MAX_REFIRES_PER_RUN, MAX_REFIRE_ATTEMPTS_PER_RUN, len(refired))
                 )
-                if refire_write_failures:
-                    handle.write(
-                        "%d re-fire write(s) failed this run. A failed write posts no marker "
-                        "and so starts no cooldown, so it does NOT consume the "
-                        "MAX_REFIRES_PER_RUN budget -- but it does count against "
-                        "MAX_REFIRE_ATTEMPTS_PER_RUN=%d, which is what can defer a PR here "
-                        "with fewer than %d re-fired above.\n\n"
-                        % (len(refire_write_failures), MAX_REFIRE_ATTEMPTS_PER_RUN, MAX_REFIRES_PER_RUN)
-                    )
                 handle.write("| PR | head | reason |\n|---|---|---|\n")
                 for pr, head_sha, _pending_since, _refire, reason in deferred:
                     handle.write("| #%d | `%s` | %s |\n" % (pr["number"], head_sha[:7], reason))

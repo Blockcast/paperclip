@@ -10,6 +10,7 @@ import contextlib
 import importlib.util
 import io
 import os
+import tempfile
 import unittest
 import urllib.error
 
@@ -1181,6 +1182,152 @@ class TestCommentBodyIsModeAware(unittest.TestCase):
         body = sweep.build_comment_body(7, "b" * 40, 3 * HOUR, requested_login="allyblockcast", mode="status-free")
         self.assertNotIn(sweep.STATUS_CONTEXT, body)
         self.assertIn("awaiting review", body)
+
+
+class TestFailureSummaryAttribution(unittest.TestCase):
+    """A write-pass failure must not be reported as a read-pass abort.
+
+    Both record the exception type in their reason, so a rate-limited WRITE
+    reads "re-fire write failed (RateLimitExhausted)" and contains
+    RATE_LIMIT_TOKEN as a substring. Bucketing on that alone printed "never
+    attempted ... the run aborted" directly above a table row saying the
+    write failed -- the summary contradicting itself. The two have different
+    remedies (fewer reads vs. a write-side rejection), and an operator reads
+    this during exactly the incident the script backstops.
+    """
+
+    NEVER_ATTEMPTED = "never attempted"
+
+    def setUp(self):
+        self._real_sweep = sweep.sweep
+        self._env = {
+            k: os.environ.get(k)
+            for k in ("GITHUB_REPOSITORY", "GITHUB_TOKEN", "GITHUB_STEP_SUMMARY")
+        }
+        os.environ["GITHUB_REPOSITORY"] = "Blockcast/paperclip"
+        os.environ["GITHUB_TOKEN"] = "t"
+
+    def tearDown(self):
+        sweep.sweep = self._real_sweep
+        for key, value in self._env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def _summary_for(self, results):
+        """Run main() over `results` and return what it wrote to the summary."""
+        handle, path = tempfile.mkstemp()
+        os.close(handle)
+        os.environ["GITHUB_STEP_SUMMARY"] = path
+        sweep.sweep = lambda *a, **k: results
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                sweep.main([])
+        except SystemExit:
+            pass
+        try:
+            with open(path, encoding="utf-8") as summary:
+                return summary.read()
+        finally:
+            os.unlink(path)
+
+    def _write_failure(self, number, exc_name="RateLimitExhausted"):
+        return (
+            _pr(number), "%040x" % number, None, False,
+            "%s -- %s (%s)"
+            % (sweep.SWEEP_ERROR_REASON_PREFIX, sweep.REFIRE_WRITE_FAILURE_TOKEN, exc_name),
+        )
+
+    def _read_failure(self, number):
+        return (
+            _pr(number), "%040x" % number, None, False,
+            "%s -- %s" % (sweep.SWEEP_ERROR_REASON_PREFIX, sweep.RATE_LIMIT_TOKEN),
+        )
+
+    def test_a_rate_limited_write_is_not_reported_as_never_attempted(self):
+        """The regression. Reverting the REFIRE_WRITE_FAILURE_TOKEN exclusion
+        in main()'s `rate_limited` filter makes this fail."""
+        summary = self._summary_for([self._write_failure(1), self._write_failure(2)])
+
+        self.assertNotIn(self.NEVER_ATTEMPTED, summary)
+        self.assertIn("DID win a slot and were attempted", summary)
+
+    def test_a_read_pass_rate_limit_is_still_reported_as_never_attempted(self):
+        """Positive control for the test above.
+
+        Without this, deleting the `rate_limited` bucket outright would pass
+        the regression test while destroying the reporting it exists for.
+        """
+        summary = self._summary_for([self._read_failure(1), self._read_failure(2)])
+
+        self.assertIn(self.NEVER_ATTEMPTED, summary)
+        self.assertNotIn("DID win a slot", summary)
+
+    def test_both_kinds_in_one_run_are_counted_separately(self):
+        """The buckets partition; neither absorbs the other's members."""
+        summary = self._summary_for(
+            [self._read_failure(1), self._write_failure(2), self._write_failure(3)]
+        )
+
+        self.assertIn("1 of them were never attempted", summary)
+        self.assertIn("2 of them DID win a slot", summary)
+
+    def test_write_failures_are_explained_when_nothing_is_deferred(self):
+        """The explanation used to be nested under `if deferred:`.
+
+        Write failures and deferrals are independent: a run with rejected
+        writes and an empty deferral list printed no account of them at all,
+        which is precisely the shape of the reproduction above.
+        """
+        summary = self._summary_for([self._write_failure(1)])
+
+        self.assertNotIn("deferred past this run's re-fire budget", summary)
+        self.assertIn("does NOT consume the MAX_REFIRES_PER_RUN", summary)
+
+    def test_a_non_rate_limit_write_failure_is_still_attributed_to_the_write(self):
+        """The bucket keys off the write token, not the exception type."""
+        summary = self._summary_for([self._write_failure(1, exc_name="HTTPError")])
+
+        self.assertIn("DID win a slot and were attempted", summary)
+        self.assertNotIn(self.NEVER_ATTEMPTED, summary)
+
+
+class TestAttemptCeilingIsClamped(unittest.TestCase):
+    """MAX_REFIRE_ATTEMPTS_PER_RUN below MAX_REFIRES_PER_RUN makes the
+    delivery cap unreachable, and the deferral message would then name the
+    attempt ceiling while implying the budget had been spent. Operator-set,
+    so the clamp is about making the state unrepresentable, not likely."""
+
+    def _reload_with(self, **env):
+        previous = {k: os.environ.get(k) for k in env}
+        os.environ.update({k: str(v) for k, v in env.items()})
+        try:
+            module = importlib.util.module_from_spec(_SPEC)
+            _SPEC.loader.exec_module(module)
+            return module
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_an_attempt_ceiling_below_the_delivery_cap_is_raised_to_it(self):
+        module = self._reload_with(MAX_REFIRES_PER_RUN=5, MAX_REFIRE_ATTEMPTS_PER_RUN=2)
+
+        self.assertEqual(module.MAX_REFIRE_ATTEMPTS_PER_RUN, 5)
+
+    def test_an_attempt_ceiling_above_the_delivery_cap_is_left_alone(self):
+        """The clamp must not flatten a deliberately generous ceiling."""
+        module = self._reload_with(MAX_REFIRES_PER_RUN=5, MAX_REFIRE_ATTEMPTS_PER_RUN=40)
+
+        self.assertEqual(module.MAX_REFIRE_ATTEMPTS_PER_RUN, 40)
+
+    def test_the_default_is_still_twice_the_delivery_cap(self):
+        module = self._reload_with(MAX_REFIRES_PER_RUN=7, MAX_REFIRE_ATTEMPTS_PER_RUN="")
+
+        self.assertEqual(module.MAX_REFIRE_ATTEMPTS_PER_RUN, 14)
 
 
 if __name__ == "__main__":
