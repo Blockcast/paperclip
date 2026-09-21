@@ -231,8 +231,14 @@ describe("buildGithubTruthProbe", () => {
   // per-call signal cannot rescue an overflow: `abort()` runs in the `.finally()`
   // AFTER `Promise.race` has already resolved `"deadline"`, which discards the
   // results of every PR that had already finished.
-  it("the longest serial call chain fits inside the whole-probe deadline", () => {
-    expect(MAX_SERIAL_CALLS * PER_CALL_TIMEOUT_MS).toBeLessThan(PROBE_DEADLINE_MS);
+  //
+  // Pin the MARGIN, not the relation: `< PROBE_DEADLINE_MS` is satisfied by
+  // `PER_CALL_TIMEOUT_MS = 1999` with 4ms of headroom, which defeats the very
+  // thing the headroom is for — a cold `getInstallationToken()` sits OUTSIDE
+  // the per-call signal, so a chain that only just fits has nowhere to put it.
+  // 10% of the deadline is the 800ms the current values already leave.
+  it("the longest serial call chain fits inside the whole-probe deadline, with headroom", () => {
+    expect(MAX_SERIAL_CALLS * PER_CALL_TIMEOUT_MS).toBeLessThanOrEqual(PROBE_DEADLINE_MS * 0.9);
   });
 
   it("the would-be-clean route makes no more serial calls than MAX_SERIAL_CALLS", async () => {
@@ -540,6 +546,32 @@ describe("buildGithubTruthProbe", () => {
       }),
     )({ workProducts: [wp()] });
     expect(b.detections["review:ally-clean"]).toBeUndefined();
+
+    // And the BODY arm of the same veto, isolated. Case `b` above reddens
+    // through `hasActionablePrReviewFeedback`'s STATE arm, and case `a` of the
+    // Important(1) test reddens on BOTH surfaces at once now that the fixtures
+    // carry `submittedAt` — so neither one fails if the body arm is reverted.
+    // A body with no `## Ally` heading is invisible to the comment gate
+    // (`isAllyConsolidatedReviewComment`), so the clean comment decides Surface
+    // 1 and only `carriesBlockingFeedback` can hold the detection back.
+    const c = await buildGithubTruthProbe(
+      deps({
+        listReviewerSurfaces: async () => ({
+          reviews: [
+            {
+              login: ALLY,
+              body: "### Important Issues (1)\n- The formal surface must redden on the body, not only on the state.",
+              state: "COMMENTED",
+              commitId: HEAD,
+              submittedAt: "2026-09-06T01:00:00Z",
+            },
+          ],
+          comments: [{ login: ALLY, body: clean, createdAt: "2026-09-06T00:00:00Z" }],
+        }),
+      }),
+    )({ workProducts: [wp()] });
+    expect(c.detections["review:ally-clean"]).toBeUndefined();
+    expect(c.probeFailed).toBe(false);
   });
 
   it("exceeding the deadline fails the probe rather than returning a partial answer", async () => {
