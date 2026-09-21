@@ -4718,6 +4718,71 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   };
 }
 
+export type WorktreeReclaimSafety = {
+  /** True only when reclaiming the disk provably discards no work. */
+  safe: boolean;
+  reason: "missing" | "clean" | "dirty" | "unpushed" | "unverifiable";
+  detail: string | null;
+};
+
+const WORKTREE_RECLAIM_GIT_TIMEOUT_MS = 30_000;
+
+/**
+ * Fail-closed pre-check for reclaiming a worktree's disk (BLO-22984).
+ *
+ * `cleanupExecutionWorkspaceArtifacts` removes with `--force --force`, which is
+ * correct for its existing callers — a persist-rollback tearing down a tree it
+ * created seconds earlier, and an explicit operator PATCH. A background
+ * collector has neither of those warrants, so it asks this first and leaves
+ * anything it cannot *prove* clean alone. Every failure mode returns
+ * `unverifiable`, never `clean`: an unreadable tree is a reason to skip, not a
+ * reason to proceed.
+ */
+export async function inspectWorktreeReclaimSafety(worktreePath: string): Promise<WorktreeReclaimSafety> {
+  if (!await directoryExists(worktreePath)) {
+    // Nothing materialized: only a registry entry can remain, and removing that
+    // discards no work.
+    return { safe: true, reason: "missing", detail: null };
+  }
+
+  const git = async (args: string[]): Promise<{ ok: true; out: string } | { ok: false; error: string }> => {
+    try {
+      return { ok: true, out: await runGit(args, worktreePath, { timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS }) };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  };
+
+  const status = await git(["status", "--porcelain"]);
+  if (!status.ok) return { safe: false, reason: "unverifiable", detail: `git status failed: ${status.error}` };
+  if (status.out.trim()) {
+    const changed = status.out.trim().split("\n");
+    return {
+      safe: false,
+      reason: "dirty",
+      detail: `${changed.length} uncommitted path(s), first: ${changed[0]?.trim() ?? ""}`,
+    };
+  }
+
+  const head = await git(["rev-parse", "HEAD"]);
+  if (!head.ok) return { safe: false, reason: "unverifiable", detail: `git rev-parse HEAD failed: ${head.error}` };
+  const headSha = head.out.trim();
+  if (!headSha) return { safe: false, reason: "unverifiable", detail: "empty HEAD" };
+
+  // Containment in any remote-tracking branch is the cheap proof that HEAD is
+  // published. It deliberately does not care *which* remote branch: a topic
+  // branch pushed for review counts, and that is the common shape here.
+  const remotes = await git(["branch", "-r", "--contains", headSha]);
+  if (!remotes.ok) {
+    return { safe: false, reason: "unverifiable", detail: `git branch -r --contains failed: ${remotes.error}` };
+  }
+  if (!remotes.out.trim()) {
+    return { safe: false, reason: "unpushed", detail: `HEAD ${headSha.slice(0, 9)} is on no remote branch` };
+  }
+
+  return { safe: true, reason: "clean", detail: null };
+}
+
 export async function cleanupExecutionWorkspaceArtifacts(input: {
   workspace: {
     id: string;

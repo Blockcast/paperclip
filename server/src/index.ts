@@ -50,6 +50,7 @@ import {
   bootstrapExecutionPolicyFromEnv,
   EXTERNAL_LIFECYCLE_COLD_BOOT_REATTACH_GRACE_MS,
   environmentCustomImageService,
+  executionWorkspaceCleanupService,
   heartbeatService,
   instanceSettingsService,
   reconcileBuiltInAgentsOnStartup,
@@ -1166,6 +1167,7 @@ export async function startServer(): Promise<StartedServer> {
     drainHeartbeatRunsForShutdown = heartbeat.drainRunningRunsForShutdown;
     prepareHotRestartShutdown = heartbeat.prepareHotRestartShutdown;
     const environmentCustomImages = environmentCustomImageService(db as any, { pluginWorkerManager });
+    const executionWorkspaceCleanup = executionWorkspaceCleanupService(db as any);
     const routines = routineService(db as any, { pluginWorkerManager });
     const tools = toolAccessService(db as any, {
       deploymentMode: config.deploymentMode,
@@ -1368,6 +1370,13 @@ export async function startServer(): Promise<StartedServer> {
             "startup failed-wake-dispatch reconciliation retried durable wake failures (BLO-14395)",
           );
         }
+
+        // BLO-22984: the only consumer of `execution_workspaces.cleanup_eligible_at`.
+        // Logged unconditionally — a collector that never runs is indistinguishable
+        // from one that runs and finds nothing, and the previous code was believed
+        // to collect for weeks while reclaiming zero bytes.
+        const workspacesCollected = await executionWorkspaceCleanup.reconcileExecutionWorkspaceCleanup();
+        logger.info({ ...workspacesCollected }, "startup execution-workspace collector");
       })().catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
       }).finally(() => {
@@ -1821,6 +1830,12 @@ export async function startServer(): Promise<StartedServer> {
                     "periodic failed-wake-dispatch reconciliation retried durable wake failures (BLO-14395)",
                   );
                 }
+              })
+              .then(async () => {
+                // BLO-22984: see the startup pass. Unconditional log.
+                const workspacesCollected = await executionWorkspaceCleanup
+                  .reconcileExecutionWorkspaceCleanup();
+                logger.info({ ...workspacesCollected }, "periodic execution-workspace collector");
               })
               .then(async () => {
                 // BLO-21995: replay PR-reviewer wakes that lost their PR-scope
