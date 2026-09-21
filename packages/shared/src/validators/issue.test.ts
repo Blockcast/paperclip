@@ -485,6 +485,23 @@ describe("issue validators", () => {
       // The hazard that actually bites a hand-rolled fetch is the default page size, not the cap.
       expect(text).toMatch(/DEFAULT page size is 30/);
     });
+
+    // PEN-3413: `commit_id` is not immutable — GitHub rewrites it onto the new head when a
+    // force-push orphans the reviewed commit, hours after submission, so a `commit_id`-only
+    // check credits an approval of a tree the reviewer never read. This description IS the
+    // implementation for the hand-performed gate re-check, so the body-attestation
+    // requirement has to survive a size-motivated trim. Assert the invariants, not the prose.
+    it("refuses a formal review whose body attests a head other than its commit_id", () => {
+      const text = issueExecutionMonitorPolicySchema.shape.gateSignals.description ?? "";
+      // The stamp alone must not read as sufficient.
+      expect(text).toMatch(/NOT SUFFICIENT|not immutable/);
+      // Name the mechanism, so nobody re-derives it as a submit-time race.
+      expect(text).toMatch(/force-push/i);
+      // The refusal, and the direction the disagreement resolves in.
+      expect(text).toMatch(/attesting a DIFFERENT head refuses the entry/i);
+      // …and its narrowness: an unattested body is still credited on the stamp.
+      expect(text).toMatch(/no attestation still rides on `commit_id`/i);
+    });
   });
 
   describe("misplaced parked input keys (BLO-27912)", () => {
