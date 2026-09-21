@@ -402,6 +402,20 @@ jobs:
         run: node --test ./.github/scripts/tests/check-ffmpeg-muxer.test.mjs
         timeout-minutes: 1
 
+      # BLO-28886 ask 2. The ejection notifier only ever runs from a
+      # `workflow_run` listener, after a merge-queue entry has already failed —
+      # so every property below is unobservable until an ejection has already
+      # been missed, which is the exact failure it exists to remove. Two of them
+      # cannot be re-checked after the fact at all: that a non-queue branch
+      # shaped like a queue ref is rejected (otherwise the notice lands on an
+      # unrelated PR), and that the workflow never checks out the queue
+      # candidate (it holds `pull-requests: write`, so a `ref:` pointing at the
+      # triggering run would hand that token to any queued diff).
+      - name: Test merge-queue ejection notice (BLO-28886)
+        if: ${{ !cancelled() }}
+        run: node --test ./.github/scripts/tests/post-merge-queue-ejection-notice.test.mjs
+        timeout-minutes: 1
+
       - name: Test production environment protection guard (BLO-22329)
         if: ${{ !cancelled() }}
         run: |

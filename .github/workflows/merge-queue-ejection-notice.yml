@@ -1,0 +1,124 @@
+name: Merge-queue ejection notice
+
+# BLO-28886 ask 2: surface a queue-branch failure on the pull request it ejected.
+#
+# A merge-queue entry re-runs the full suite on a temporary
+# `gh-readonly-queue/master/pr-<N>-<baseSha>` branch. Those runs are reported
+# against the QUEUE BRANCH, so they never appear in the pull request's
+# `statusCheckRollup` — the PR keeps reading CLEAN while its entry is dead, and
+# GitHub emits no wake on ejection. #1853 sat out of the queue 17h43m, green,
+# with nobody re-enqueuing it. See BLO-28886 for the measurement.
+#
+# WHY A SEPARATE `workflow_run` WORKFLOW RATHER THAN A STEP IN pr.yml — two
+# independent reasons, either one sufficient:
+#
+#   1. TRUST BOUNDARY. `pr.yml`'s `verify` job checks out the QUEUE CANDIDATE,
+#      i.e. the diff under review. Giving that job `pull-requests: write` would
+#      hand every queued PR a write token it could drive by editing the script
+#      or the workflow in its own diff. `comment-review-gate-merge-group.yml`
+#      already refuses that same trade for `statuses: write`. A `workflow_run`
+#      listener runs the DEFAULT BRANCH's copy of this file regardless of what
+#      the candidate contains, so the write scope is never exposed to it.
+#   2. EJECTION SURFACE. Every job added to a merge_group run is another way for
+#      an entry to die under ALLGREEN. This workflow is not a merge_group check
+#      and cannot gate, delay, or eject anything.
+#
+# ⚠️ UNVERIFIED DELIVERY ASSUMPTION — do not assume a silent notifier is a quiet
+# one. GitHub does not document whether `workflow_run` is delivered when the
+# triggering run was itself started by `merge_group`, and the failure mode is
+# silent: no run, no comment, no error, indistinguishable from "no ejections
+# happened". That is the exact invisibility this workflow exists to remove, so
+# it must be checked rather than assumed.
+#
+# It is checked two ways. `workflow_dispatch` below replays this logic against
+# any past run id without waiting for a real ejection, which proves the parsing,
+# the job query and the comment POST end to end. It does NOT prove automatic
+# delivery — for that, after this merges, take the next `PR` run with
+# `event=merge_group` and `conclusion=failure` and confirm a run of this
+# workflow exists for it:
+#
+#   gh run list -R Blockcast/paperclip --workflow="Merge-queue ejection notice"
+#
+# If automatic delivery turns out not to happen, the fallback is a scheduled
+# sweep over `removed_from_merge_queue` timeline events (the detector recorded
+# on BLO-28886), not a merge_group job.
+
+on:
+  workflow_run:
+    workflows: ["PR"]
+    types: [completed]
+  # Replays the notice for one past run, so delivery and formatting can be
+  # verified without waiting for a real ejection.
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "PR-workflow run id to replay the ejection notice for"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  notice:
+    # Only a FAILED run on a queue branch ejected anything. `cancelled` is queue
+    # supersession or a re-stage and carries no verdict (BLO-23194), so it is
+    # deliberately not reported — announcing it would train readers to ignore
+    # this comment. The dispatch path skips the filter so a replay can target
+    # any run.
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+          (github.event.workflow_run.conclusion == 'failure' &&
+           startsWith(github.event.workflow_run.head_branch, 'gh-readonly-queue/')) }}
+    # NOT arc-merge-queue: that pool's admission hook refuses any workflow other
+    # than pr.yml before checkout (see comment-review-gate-merge-group.yml).
+    # arc-light is the precedented pool for this repo's non-pr.yml CI jobs.
+    runs-on: arc-light
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # The run's per-job conclusions, to name the failing shard.
+      actions: read
+      # The comment itself. Safe here and only here: this job never runs
+      # candidate code (see the header).
+      pull-requests: write
+    steps:
+      # No `ref:` — a `workflow_run` job checks out the default branch by
+      # default, which is the property the trust-boundary argument rests on.
+      # Do not add `ref: ${{ github.event.workflow_run.head_sha }}`: that would
+      # run the queue candidate's code with the write token above.
+      - name: Checkout default branch (never queue-candidate code)
+        uses: actions/checkout@v6
+
+      - name: Resolve the run being reported
+        id: run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            run_json="$(gh api "repos/${{ github.repository }}/actions/runs/${{ inputs.run_id }}")"
+            {
+              echo "id=$(jq -r .id <<<"$run_json")"
+              echo "head_branch=$(jq -r .head_branch <<<"$run_json")"
+              echo "head_sha=$(jq -r .head_sha <<<"$run_json")"
+              echo "url=$(jq -r .html_url <<<"$run_json")"
+            } >>"$GITHUB_OUTPUT"
+          else
+            {
+              echo "id=${{ github.event.workflow_run.id }}"
+              echo "head_branch=${{ github.event.workflow_run.head_branch }}"
+              echo "head_sha=${{ github.event.workflow_run.head_sha }}"
+              echo "url=${{ github.event.workflow_run.html_url }}"
+            } >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Post the ejection notice on the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ steps.run.outputs.id }}
+          RUN_HEAD_BRANCH: ${{ steps.run.outputs.head_branch }}
+          RUN_HEAD_SHA: ${{ steps.run.outputs.head_sha }}
+          RUN_URL: ${{ steps.run.outputs.url }}
+        run: node ./.github/scripts/post-merge-queue-ejection-notice.mjs
