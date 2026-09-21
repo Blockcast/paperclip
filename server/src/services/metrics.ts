@@ -3147,18 +3147,28 @@ function ensureRegistry(): {
     //      detects a stall on a permanently-saturated stream -- that needs the
     //      zero-deferred-tick fix, not an alert change.
     //   3. The seed makes a never-swept process read identical to a drained one: both
-    //      counters sit at 0 until that process completes its first sweep. So an `== 0`
-    //      alert needs a `for:` longer than one sweep interval -- and process lifetime
-    //      here is short. Measured 2026-09-21, `paperclip-0` ran under 19 distinct pod
-    //      UIDs in 24h with 0 container restarts on each: the pod is REPLACED roughly
-    //      hourly, so every series is born fresh well inside a 2h window.
-    //      Worked example, same day: `deferred == 0 and increase(...[2h]) == 0`, scoped
-    //      to the worker tier, DID fire against the healthy, drained
-    //      `stranded_recovery_wake_backstop` stream. Two distinct causes, and only one of
-    //      them is fixed here -- pre-change the counter series is born at 1 so
-    //      `increase()` never sees the 0->1 edge (the seed below cures that); post-change
-    //      the start-to-first-sweep window still reads exactly like a stall (only a
-    //      `for:` longer than the sweep interval covers that one).
+    //      counters sit at 0 until that process completes its first sweep. Sizing a
+    //      `for:` around that needs the sweep CADENCE -- and the cadence is NOT the 30s
+    //      scheduler tick. Neither loop is driven by that tick: both run only inside
+    //      `reconcileIssueGraphLiveness`, which sits partway down the heartbeat recovery
+    //      chain behind `reconcileStrandedAssignedIssues` and is gated by the
+    //      `heartbeatRecoveryChainInFlight` latch (index.ts, BLO-34207/#1897). A tick
+    //      that finds the chain in flight skips it silently, and the latch declaration
+    //      says outright that a sweep "routinely outlives one interval". So a completion
+    //      is one CHAIN COMPLETION, not one tick, and that period is a property of the
+    //      chain's slowest pass and of estate size -- not of these metrics, and not of
+    //      anything this file can track. Do NOT paste a `for:` constant from here.
+    //   4. PRECONDITION, not reassurance: `increase(<counter>[Nh]) == 0` is only
+    //      meaningful while process lifetime stays under N. Because a completion is
+    //      per-chain rather than per-tick, that expression currently reads as a function
+    //      of PROCESS AGE more than of sweep liveness; it is quiet today only because the
+    //      pod is replaced on a shorter period than the range window. Anything that
+    //      lengthens pod lifetime past N makes it fire permanently on a healthy stream.
+    //      Any alert built on it must state that bound, and a `for:` shorter than the
+    //      start-to-first-completion window pages on every fresh pod.
+    //      Measurements behind 3-4, and the standing caveat that this cadence moves:
+    //      BLO-29763. Three review rounds have each produced a predicate that then
+    //      measured wrong -- a number recorded here is the thing that keeps decaying.
     //
     // Bounded: 2 sources x (1 gauge + 1 counter + 12 reasons) = 28 series.
     for (const source of BACKSTOP_SOURCES) {
