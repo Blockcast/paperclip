@@ -853,13 +853,24 @@ describe("merge-gate reader", () => {
       // line: the count above stays 3 and this test passes while that fetch goes
       // unpaginated. That is this file's own recurring defect — a filter keyed
       // without asking what it looks like when it matches nothing — so cross-check
-      // the total, which any `gh api` in any style reaches. Exempt: the
-      // single-object commit lookup, which has no pages. Comment lines are
-      // excluded by leading `#` only; a trailing `# gh api` comment fails this
-      // LOUD, which is the safe direction.
-      const ghApi = SOURCE.split("\n").filter(
-        (l) => l.includes("gh api") && !l.trimStart().startsWith("#"),
-      );
+      // the total. Exempt: the single-object commit lookup, which has no pages.
+      //
+      // Count OCCURRENCES after unfolding continuations, not LINES. A line-granular
+      // cross-check inherits the exact blind spot it was added to close, in two
+      // measured shapes: a second call APPENDED to an already-collected line
+      // (`{ a | status_extract ; b | extract }` is the style this file already
+      // uses at `:235-236`, so appending a third fetch there is the natural edit),
+      // and a continuation break BETWEEN `gh` and `api`. Both leave every
+      // line-granular assertion green — `fetches` counts the line once so `=== 3`
+      // holds, the cross-check counts it once, and `assert.match(call, /--paginate/)`
+      // passes on the FIRST call on that line while the appended one goes
+      // unpaginated. Unfolding first also catches the split-token shape.
+      // Comment lines are excluded by leading `#` only; a trailing `# gh api`
+      // comment fails this LOUD, which is the safe direction.
+      const ghApi = SOURCE.replace(/\\\n\s*/g, " ")
+        .split("\n")
+        .filter((l) => !l.trimStart().startsWith("#"))
+        .flatMap((l) => l.match(/gh\s+api/g) ?? []);
       assert.equal(
         ghApi.length,
         fetches.length + 1,
