@@ -341,6 +341,11 @@ describeEmbeddedPostgres("heartbeat timer wake coalescing", () => {
       agentId,
       outcome: "queued",
       runId: run?.id,
+      // `runId` carries the MINTED run and nothing else, so it is non-null
+      // exactly when a marker was stamped. On the fold outcomes it is null and
+      // the merged-into run is reported separately — without that split a
+      // consumer grouping on `runId` would read a fold as a mint.
+      coalescedIntoRunId: null,
       targetRunId: runningRunId,
     });
   });
