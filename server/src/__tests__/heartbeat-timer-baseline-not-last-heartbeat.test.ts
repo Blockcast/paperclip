@@ -17,6 +17,33 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import type {
+  PenstockAvailabilityGate,
+  PenstockAvailabilityGateCheckInput,
+  PenstockAvailabilityGateResult,
+} from "../services/penstock-availability-gate.js";
+
+/**
+ * Capacity unavailable — the shape that POSTPONES a wake behind a committed
+ * `scheduled_retry` run rather than declining it, which is why that path
+ * deliberately writes no `durableSkipReason` and used to write no timer row
+ * either.
+ */
+function capacityDenyingGate(): PenstockAvailabilityGate {
+  return {
+    async checkAdapter(_input: PenstockAvailabilityGateCheckInput): Promise<PenstockAvailabilityGateResult> {
+      return {
+        allow: false,
+        provider: "anthropic",
+        reason: "penstock.model_capacity_unavailable",
+        model: "claude-test",
+        resumeAt: new Date("2026-09-19T11:15:00.000Z"),
+        retryAfterSeconds: 900,
+      };
+    },
+    _resetForTesting() {},
+  };
+}
 
 /**
  * BLO-34578 — the interval timer must be reachable for an agent that is busy
@@ -33,9 +60,11 @@ import { heartbeatService } from "../services/heartbeat.js";
  * sweeps an agent's already-assigned backlog, so the effect ran backwards --
  * the busier an agent was, the less its own queue was ever swept.
  *
- * The three cases below are the whole contract: the timer fires off its own
- * history, it does not re-fire off that same history, and an agent with no
- * timer history still behaves exactly as it did before.
+ * The four cases below are the whole contract: the timer fires off its own
+ * history, it does not re-fire off that same history, an agent with no timer
+ * history fires once and thereby acquires one, and the provider-capacity gate —
+ * the one timer exit that used to write no history at all — records its tick so
+ * a capacity outage cannot make the scheduler re-enter it every 30 seconds.
  */
 
 const INTERVAL_SEC = 600;
@@ -116,9 +145,10 @@ describeEmbeddedPostgres("timer baseline is the last timer tick, not the last ru
 
   /**
    * Seeds the record a timer tick leaves behind. Every timer tick writes one of
-   * these -- dispatched, skipped by a circuit breaker, or blocked by the daily
-   * cap -- which is what makes this table an exact record of when the timer
-   * last ran, with no extra write site to keep in sync.
+   * these -- dispatched, skipped by a circuit breaker, blocked by the daily cap,
+   * or deferred by the provider-capacity gate -- which is what makes this table
+   * an exact record of when the timer last ran, with no extra write site to keep
+   * in sync.
    */
   async function seedTimerWakeupRequest(input: { companyId: string; agentId: string; requestedAt: Date }) {
     await db.insert(agentWakeupRequests).values({
@@ -140,6 +170,11 @@ describeEmbeddedPostgres("timer baseline is the last timer tick, not the last ru
   async function countTimerWakeups(agentId: string) {
     const rows = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
     return rows.filter((row) => row.source === "timer").length;
+  }
+
+  async function countScheduledRetryRuns(agentId: string) {
+    const rows = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    return rows.filter((row) => row.status === "scheduled_retry").length;
   }
 
   it("fires when the last TIMER tick is older than the interval, even though lastHeartbeatAt is seconds old", async () => {
@@ -199,7 +234,7 @@ describeEmbeddedPostgres("timer baseline is the last timer tick, not the last ru
     expect(await countTimerWakeups(agentId)).toBe(1);
   });
 
-  it("falls back to lastHeartbeatAt for an agent that has never had a timer tick", async () => {
+  it("fires for an agent that has never had a timer tick, however fresh lastHeartbeatAt is", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const now = new Date("2026-09-19T11:00:00.000Z");
@@ -210,13 +245,56 @@ describeEmbeddedPostgres("timer baseline is the last timer tick, not the last ru
       lastHeartbeatAt: new Date("2026-09-19T10:59:30.000Z"),
       createdAt: new Date("2026-09-01T00:00:00.000Z"),
     });
-    // No timer wakeup rows at all -- a brand-new agent, or one whose history
-    // has been pruned. Old behaviour must be preserved rather than firing
-    // immediately on an empty history.
-
+    // No timer wakeup rows at all. Falling back to `lastHeartbeatAt` here would
+    // reproduce the original bug permanently: an agent busy from creation keeps
+    // that column fresh forever, so it never fires, so it never writes the first
+    // timer row, so the fallback never stops applying. `createdAt` fires once and
+    // that tick's own row moves the agent into the timer-row regime for good.
     const result = await heartbeatService(db, { skipQueuedRunDispatch: true }).tickTimers(now);
 
-    expect(result).toMatchObject({ enqueued: 0 });
-    expect(await countTimerWakeups(agentId)).toBe(0);
+    expect(result).toMatchObject({ checked: 1, enqueued: 1 });
+    expect(await countTimerWakeups(agentId)).toBe(1);
+  });
+
+  it("records a timer tick that the provider-capacity gate defers, so it does not re-enter every pass", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const firstPass = new Date("2026-09-19T11:00:00.000Z");
+    // Well inside INTERVAL_SEC of the first pass: the only thing that can stop a
+    // second tick is the first one having moved the baseline.
+    const secondPass = new Date("2026-09-19T11:01:00.000Z");
+
+    await seedTimerAgent({
+      companyId,
+      agentId,
+      lastHeartbeatAt: new Date("2026-09-19T10:59:30.000Z"),
+      createdAt: new Date("2026-09-01T00:00:00.000Z"),
+    });
+    await seedTimerWakeupRequest({
+      companyId,
+      agentId,
+      requestedAt: new Date("2026-09-19T09:00:00.000Z"),
+    });
+
+    const service = heartbeatService(db, {
+      skipQueuedRunDispatch: true,
+      penstockAvailabilityGate: capacityDenyingGate(),
+    });
+
+    // The capacity gate postpones rather than declines: it commits a
+    // `scheduled_retry` run and returns null, so the tick is not an enqueue.
+    const first = await service.tickTimers(firstPass);
+    expect(first).toMatchObject({ checked: 1, enqueued: 0 });
+    // Deleting `writeTimerProviderCapacityDeferred` turns this red: the capacity
+    // path is the one timer exit that writes no wakeup row of its own.
+    expect(await countTimerWakeups(agentId)).toBe(2);
+
+    const second = await service.tickTimers(secondPass);
+    expect(second).toMatchObject({ checked: 1, enqueued: 0 });
+    expect(await countTimerWakeups(agentId)).toBe(2);
+    // The real cost of an un-advanced baseline: the scheduler re-enters the
+    // capacity path every pass (30s in production) and each pass commits another
+    // parked run, because a bare timer wake has no task key and cannot coalesce.
+    expect(await countScheduledRetryRuns(agentId)).toBe(1);
   });
 });
