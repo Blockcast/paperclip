@@ -45,9 +45,17 @@ function unionMergedPaths() {
  * rather than a surprise in CI.
  */
 function ciExclusionAlternatives(source, label) {
-  const m = source.match(/grep -vxE '([^']+)'/);
-  assert.ok(m, `${label}: no \`grep -vxE '...'\` exclusion found`);
-  return m[1].split("|");
+  const all = source.match(/grep -vxE '([^']+)'/g);
+  assert.ok(all, `${label}: no \`grep -vxE '...'\` exclusion found`);
+  // A second vendored tree with its own provenance job would bind every
+  // assertion below to whichever regex appears first, leaving the suite green
+  // while guarding the wrong job.
+  assert.equal(
+    all.length,
+    1,
+    `${label}: expected exactly one \`grep -vxE '...'\` exclusion regex, found ${all.length}`,
+  );
+  return source.match(/grep -vxE '([^']+)'/)[1].split("|");
 }
 
 const workflow = read(".github/workflows/pr.yml");
