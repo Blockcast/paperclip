@@ -610,8 +610,9 @@ routine description specifies for a first fire.
 | rows total | 127 |
 
 Confirmations section reads `none` — the correct output when the previous receipt had no `enqueue`
-rows. The two `stale-enqueue` rows from receipt 1 are absent from receipt 2 because fire 1 had
-already posted on #1444 and #1271; the classifier does not re-report a stale enqueue it has
+rows. Receipt 1's two `stale-enqueue` rows do not appear in that category in receipt 2: **#1444 and
+#1271 both reclassified to `skip` · `checks:FAILURE`**. Stated as observed; no mechanism is claimed
+here, and in particular this is *not* evidence that the classifier suppresses a stale enqueue it has
 already flagged.
 
 #### ACs 3 and 4 are satisfied vacuously, and that is worth stating plainly
@@ -638,33 +639,76 @@ and an owner approval at head**, and that has not happened yet in three fires.
 | triggered | run | status | outcome |
 | --- | --- | --- | --- |
 | 2026-09-20T10:43:04Z | `28859a4f` | `completed` | manual; minted BLO-34858 → receipt 1 |
-| 2026-09-20T13:45:00Z | `af449f27` | `skipped` | coalesced into `28859a4f` (BLO-34858 still live) |
+| 2026-09-20T13:45:00Z | `af449f27` | `skipped` | coalesced into `28859a4f` (BLO-34858 still live); no separate receipt |
 | 2026-09-20T19:45:00Z | `e7e5ce9e` | `issue_created` | minted BLO-34946 → receipt 2 |
-| 2026-09-21T01:45:00Z | `73032a7a` | `skipped` | coalesced into `e7e5ce9e` (BLO-34946 still live) |
+| 2026-09-21T01:45:00Z | `73032a7a` | `skipped` | coalesced into `e7e5ce9e` (BLO-34946 still live) → receipt 3, late, via BLO-34946's recovery run |
 
-So **four fires produced two receipts, and that is correct behaviour, not two missing receipts.** A
-coalesced fire is explicitly not a separate fire; the acceptance criterion "one receipt per fire"
+So **four cron slots produced three receipts, and that is correct behaviour, not a missing
+receipt.** A coalesced fire is explicitly not a separate fire; the "one receipt per fire" criterion
 must be read against runs that reached `issue_created`/`completed`, not against cron slots. Anyone
 auditing this routine by counting cron slots against receipts will report a false defect.
 
-#### Fire 3 — the 01:45Z slot's re-run failed on infrastructure, and is self-healing
+Note the two coalesced slots resolved *differently*, which is the subtle part: 13:45Z produced no
+receipt of its own, while 01:45Z did — because its target issue BLO-34946 was still open and got
+re-woken, whereas BLO-34858 had already closed. **Coalescing therefore does not reliably drop a
+slot; whether a receipt appears depends on the target issue's lifecycle at wake time.** Do not infer
+a fixed receipts-per-slot ratio from either case.
+
+#### Fire 3 — the 01:45Z slot failed on infrastructure, then recovered unaided
 
 BLO-34946 was re-woken for the coalesced 01:45Z slot, and that run
 (`934e605e-5562-45a5-8f16-4f9ad2679b70`) failed at `03:10Z` with `adapter_failed` —
 `Claude exited with code 1 [pod: reason=Error, container_log=penstock agent runtime: Caveman proxy
 did not become ready]`. Infrastructure, not the script and not the routine.
 
-**BLO-34946 therefore reads `blocked` with `blockedBy: []`, which looks exactly like the
-zero-wake-path strand of [BLO-27553](https://paperclip.blockcast.net/BLO/issues/BLO-27553) and is
-not one.** It carries `activeRecoveryAction.status: "active"`, attempt 1 of 5, `timeoutAt`
-`2026-09-21T09:10:46Z`, `wakePolicy: wake_owner` → Ally. That is a live wake path. Per the
-2026-09-13 amendment to that rule, **a `PATCH {status}` here would discharge the recovery action and
-delete the working wake path** — the repair is strictly worse than the apparent defect. It was left
-untouched deliberately. Re-check it with:
+**For seven hours BLO-34946 read `blocked` with `blockedBy: []`, which looks exactly like the
+zero-wake-path strand of [BLO-27553](https://paperclip.blockcast.net/BLO/issues/BLO-27553) and was
+not one.** It carried `activeRecoveryAction.status: "active"`, attempt 1 of 5, `timeoutAt`
+`2026-09-21T09:10:46Z`, `wakePolicy: wake_owner` → Ally. That is a live wake path, and per the
+2026-09-13 amendment to that rule a `PATCH {status}` would have **discharged the recovery action and
+deleted the working wake path** — the repair is strictly worse than the apparent defect. It was left
+untouched deliberately.
 
-    curl -sS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-      "$PAPERCLIP_API_URL/api/issues/34cf59eb-3a43-44bd-b17b-13230fbe84eb" \
-      | jq '{status, blockedBy, ra: .activeRecoveryAction | {status, attemptCount, maxAttempts, timeoutAt}}'
+**That decision is now confirmed by outcome, not just by rule.** The recovery action fired on its
+own and the issue completed without any intervention:
+
+| event | timestamp |
+| --- | --- |
+| run failed `adapter_failed`, recovery action opened (attempt 1/5) | `2026-09-21T03:10:46Z` |
+| recovery run `a60a4b12-d3fd-4fca-964a-c03255eb9663` posted receipt 3 | `2026-09-21T07:16:33.433Z` |
+| BLO-34946 `completed`, `status: done`, `activeRecoveryAction: null` | `2026-09-21T07:20:47.348Z` |
+
+Had the `blocked` + `blockedBy: []` shape been "repaired" by a status write at any point in that
+window, the recovery action would have been discharged and this fire would have produced no receipt
+at all. **This is a worked example of the amendment's central claim: on that shape the cheap
+reading manufactures work against a lane that is behaving correctly.** The discriminator is
+`activeRecoveryAction.status == "active"` with a future `timeoutAt`, and it was readable throughout.
+
+#### Receipt 3 — 2026-09-21T07:16:33.433Z, from the recovered 01:45Z slot
+
+Comment [`19519080`](https://paperclip.blockcast.net/BLO/issues/BLO-34818#comment-19519080-60a3-4584-9c07-c79c9b3f5665), run `a60a4b12`.
+
+| tally | count |
+| --- | --- |
+| `codeowner-review-requested` | 29 |
+| `skip` | 99 |
+| `stale-enqueue` | 1 |
+| `already-enqueued` | 0 |
+| **`enqueue`** | **0** |
+| rows total | 129 |
+
+Confirmations section reads `none`. Three fires, three receipts, **still zero `enqueue` rows** — so
+ACs 3 and 4 remain unexercised, and the reading above about fleet CI health holds across all three.
+
+`already-enqueued` drops to 0 here because #1954 — the only PR that had ever held that status — lost
+its armed auto-merge when this branch was force-pushed to record these receipts. That is expected:
+a new head drops auto-merge and staleness-dismisses the review attesting the old head. It is noted
+so the 1 → 1 → 0 progression is not mistaken for a classifier regression.
+
+**This log is a point-in-time record through fire 3.** The routine remains `active` on its 6-hour
+trigger and will keep posting receipts to BLO-34818; that issue, not this file, is the running
+ledger. Nothing further needs appending here unless a fire produces an `enqueue` row, which is the
+event ACs 3 and 4 were actually written for.
 
 ## C3 — governance sweep un-paused (2026-09-07)
 
