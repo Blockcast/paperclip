@@ -25,6 +25,7 @@ import {
   RECOVER_AGGREGATE_FIRING_ACTION,
   registerRecoveryAction,
 } from "../recovery-action.js";
+import manifest from "../manifest.js";
 import {
   CompanyScopeUnavailableError,
   authenticateWebhook,
@@ -2369,6 +2370,8 @@ describe("aggregate firing fence recovery", () => {
           phase: "firing",
           firingToken: token,
           updatedAt: "2026-08-11T19:10:00.000Z",
+          ownerInstanceId: null,
+          ownerSlot: null,
         }],
       },
     });
@@ -2376,6 +2379,126 @@ describe("aggregate firing fence recovery", () => {
       expect.stringContaining("phase = 'firing'"),
       ["company-1"],
     );
+  });
+
+  // BLO-35053 — an agent can diagnose a wedged fence but cannot act on it.
+  // `aggregate_key`/`phase` never reach Prometheus (the host promotes only
+  // manifest-declared promotable tags), so without this the only agent-readable
+  // signal is a mean hold age dimensioned by alertname.
+  describe("BLO-35053 — agent-readable diagnostic listing", () => {
+    const agentActor = {
+      actorType: "agent",
+      actorId: "agent-1",
+      userId: null,
+      agentId: "agent-1",
+      runId: "run-1",
+    } as const;
+
+    const listInput = {
+      routeKey: LIST_AGGREGATE_FIRING_FENCES_ROUTE,
+      method: "GET",
+      path: "/aggregate-firing-fences",
+      params: {},
+      query: { companyId: "company-1" },
+      body: null,
+      actor: agentActor,
+      companyId: "company-1",
+      headers: {},
+    } satisfies PluginApiRequestInput;
+
+    it("returns phase, age and owner fields to an agent with the bearer token OMITTED", async () => {
+      const { ctx, mocks } = mkCtx();
+      const token = "firing-token-must-not-leak-to-agent";
+      mocks.db.query.mockResolvedValueOnce([
+        {
+          aggregate_key: aggregateKey,
+          phase: "firing",
+          firing_token: token,
+          updated_at: "2026-09-21T06:00:00.000Z",
+          owner_instance_id: "paperclip-0",
+          owner_slot: "slot-3",
+        },
+      ]);
+
+      const result = await handleRecoveryApiRequest(ctx, listInput);
+
+      expect(result).toEqual({
+        headers: { "cache-control": "no-store" },
+        body: {
+          fences: [{
+            aggregateKey,
+            phase: "firing",
+            updatedAt: "2026-09-21T06:00:00.000Z",
+            ownerInstanceId: "paperclip-0",
+            ownerSlot: "slot-3",
+          }],
+        },
+      });
+      // Absent, not nulled: the token is the whole capability `recover` accepts.
+      const [fence] = (result.body as { fences: Record<string, unknown>[] }).fences;
+      expect(Object.hasOwn(fence, "firingToken")).toBe(false);
+      expect(JSON.stringify(result)).not.toContain(token);
+      // Assert the SQL, not just the mapping: the mock ignores the query text,
+      // so mapper-only assertions pass even if the columns are never selected.
+      const [sql] = mocks.db.query.mock.calls[0];
+      expect(sql).toContain("owner_instance_id");
+      expect(sql).toContain("owner_slot");
+    });
+
+    it("still refuses `recover` to that same agent identity", async () => {
+      const { ctx, mocks } = mkCtx();
+
+      await expect(handleRecoveryApiRequest(ctx, {
+        ...listInput,
+        routeKey: RECOVER_AGGREGATE_FIRING_ROUTE,
+        method: "POST",
+        path: "/aggregate-firing-fences/recover",
+        query: {},
+        // Same company, well-formed body: the ONLY thing refusing this is the
+        // actor check, so the 403 cannot be a company-mismatch false pass.
+        body: {
+          companyId: "company-1",
+          aggregateKey,
+          firingToken: "firing-token-for-operator",
+        },
+      } satisfies PluginApiRequestInput)).resolves.toEqual({
+        status: 403,
+        body: { error: "Alertmanager aggregate firing recovery failed" },
+      });
+      expect(mocks.db.execute).not.toHaveBeenCalled();
+    });
+
+    it("never returns another company's fences to an agent", async () => {
+      const { ctx, mocks } = mkCtx();
+
+      // A mismatched query param is refused outright...
+      await expect(handleRecoveryApiRequest(ctx, {
+        ...listInput,
+        query: { companyId: "company-2" },
+      } satisfies PluginApiRequestInput)).resolves.toEqual({
+        status: 400,
+        body: { error: "Alertmanager aggregate firing recovery failed" },
+      });
+      expect(mocks.db.query).not.toHaveBeenCalled();
+
+      // ...and the read is parameterized by the HOST-resolved company, so a
+      // matching param can still only ever read the caller's own company.
+      mocks.db.query.mockResolvedValueOnce([]);
+      await handleRecoveryApiRequest(ctx, listInput);
+      expect(mocks.db.query).toHaveBeenCalledWith(
+        expect.stringContaining("company_id = $1"),
+        ["company-1"],
+      );
+    });
+
+    it("pins the declared route auth: listing board-or-agent, recover board-only", () => {
+      const routes = manifest.apiRoutes ?? [];
+      expect(routes.find((r) => r.routeKey === LIST_AGGREGATE_FIRING_FENCES_ROUTE)?.auth)
+        .toBe("board-or-agent");
+      // AC3: widening the listing must not widen the mutation.
+      expect(routes.find((r) => r.routeKey === RECOVER_AGGREGATE_FIRING_ROUTE)?.auth)
+        .toBe("board");
+    });
   });
 
   it("recovers an exact token through the board operator API without returning or auditing it", async () => {
@@ -2598,6 +2721,8 @@ describe("PEN-2581 — an interrupted cancellation is listable and recoverable",
         phase: "cancelling",
         firingToken: resolutionToken,
         updatedAt: "2026-08-25T21:20:24.000Z",
+        ownerInstanceId: null,
+        ownerSlot: null,
       },
     ]);
 
