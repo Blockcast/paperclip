@@ -232,7 +232,7 @@ describe("buildGithubTruthProbe", () => {
   // AFTER `Promise.race` has already resolved `"deadline"`, which discards the
   // results of every PR that had already finished.
   it("the longest serial call chain fits inside the whole-probe deadline", () => {
-    expect(MAX_SERIAL_CALLS * PER_CALL_TIMEOUT_MS).toBeLessThanOrEqual(PROBE_DEADLINE_MS);
+    expect(MAX_SERIAL_CALLS * PER_CALL_TIMEOUT_MS).toBeLessThan(PROBE_DEADLINE_MS);
   });
 
   it("the would-be-clean route makes no more serial calls than MAX_SERIAL_CALLS", async () => {
@@ -271,11 +271,50 @@ describe("buildGithubTruthProbe", () => {
     expect(r.detections["review:ally-clean"]).toBe(true);
   });
 
+  // KNOWN OPEN, tracked at BLO-34969. Pinned rather than fixed, and pinned in
+  // the ASSERTING direction so it can neither close by accident nor widen
+  // unnoticed: when BLO-34969 lands this test fails, which is the point.
+  //
+  // This is the mirror of the carried-finding case above, with nothing to
+  // carry. Surface 1 reads the review (the merge above put it there), refuses
+  // it because the attesting author IS the PR author, and returns
+  // `not_evaluated` — the correct answer, paid for with a real GitHub call.
+  // Surface 2 then reads the same body author-blind and publishes it through
+  // the OR, so the module discards the detection it just established.
+  //
+  // Not fixed here because both available fixes — dropping `formalClean` from
+  // the disjunction, or gating it on the same author evidence — make
+  // `review:ally-clean` UNREACHABLE on every agent-authored PR, the author
+  // being the reviewer identity on all of them. It is a required shape
+  // (`DEFAULT_UNLABELED_REQUIRED`) whose absence `PAPERCLIP_EVIDENCE_UNLABELED_BLOCK=1`
+  // promotes from a warn to a block, so that is an estate-wide `in_review`
+  // decision with its own acceptance criteria, not a review fixup.
+  it("KNOWN GAP (BLO-34969): the formal surface publishes a self-attestation the comment surface refused", async () => {
+    let authorReads = 0;
+    const r = await buildGithubTruthProbe(
+      deps({
+        fetchPrAuthorLogin: async () => {
+          authorReads += 1;
+          return ALLY;
+        },
+        listReviewerSurfaces: async () => ({
+          reviews: [{ login: ALLY, body: clean, state: "COMMENTED", commitId: HEAD, submittedAt: "2026-09-06T00:00:00Z" }],
+          comments: [],
+        }),
+      }),
+    )({ workProducts: [wp()] });
+    // The author WAS read, so this is an override of a computed refusal rather
+    // than a surface that never asked the question.
+    expect(authorReads).toBe(1);
+    expect(r.detections["review:ally-clean"]).toBe(true);
+    expect(r.probeFailed).toBe(false);
+  });
+
   it("a formal review at head with Important(1), or CHANGES_REQUESTED, is not clean", async () => {
     const a = await buildGithubTruthProbe(
       deps({
         listReviewerSurfaces: async () => ({
-          reviews: [{ login: ALLY, body: dirty, state: "COMMENTED", commitId: HEAD, submittedAt: null }],
+          reviews: [{ login: ALLY, body: dirty, state: "COMMENTED", commitId: HEAD, submittedAt: "2026-09-06T00:00:00Z" }],
           comments: [],
         }),
       }),
@@ -285,7 +324,7 @@ describe("buildGithubTruthProbe", () => {
     const b = await buildGithubTruthProbe(
       deps({
         listReviewerSurfaces: async () => ({
-          reviews: [{ login: ALLY, body: "fine", state: "CHANGES_REQUESTED", commitId: HEAD, submittedAt: null }],
+          reviews: [{ login: ALLY, body: "fine", state: "CHANGES_REQUESTED", commitId: HEAD, submittedAt: "2026-09-06T00:00:00Z" }],
           comments: [],
         }),
       }),
@@ -308,11 +347,23 @@ describe("buildGithubTruthProbe", () => {
     expect((await probe({ workProducts: [wp()] })).detections["review:ally-clean"]).toBe(true);
   });
 
+  // A COHERENT review of another head: `commit_id` and the body attestation
+  // agree. The incoherent variant — `commit_id` at D while the body attests
+  // HEAD — is the NEXT case, and it is the one GitHub actually produces, by
+  // rewriting `commit_id` on push.
   it("a review at a DIFFERENT head is not evidence about this head", async () => {
     const probe = buildGithubTruthProbe(
       deps({
         listReviewerSurfaces: async () => ({
-          reviews: [{ login: ALLY, body: clean, state: "COMMENTED", commitId: "d".repeat(40), submittedAt: null }],
+          reviews: [
+            {
+              login: ALLY,
+              body: clean.replace(HEAD, "d".repeat(40)),
+              state: "COMMENTED",
+              commitId: "d".repeat(40),
+              submittedAt: "2026-09-06T00:00:00Z",
+            },
+          ],
           comments: [],
         }),
       }),
@@ -329,7 +380,7 @@ describe("buildGithubTruthProbe", () => {
       deps({
         listReviewerSurfaces: async () => ({
           reviews: [
-            { login: ALLY, body: clean.replace(HEAD, "d".repeat(40)), state: "COMMENTED", commitId: HEAD, submittedAt: null },
+            { login: ALLY, body: clean.replace(HEAD, "d".repeat(40)), state: "COMMENTED", commitId: HEAD, submittedAt: "2026-09-06T00:00:00Z" },
           ],
           comments: [],
         }),
@@ -465,11 +516,13 @@ describe("buildGithubTruthProbe", () => {
   it("a blocking verdict on either surface beats a clean one on the other", async () => {
     // Comment surface red, formal surface clean at the same head. The merge
     // gate publishes from the comment surface, so reading this clean would put
-    // the two gates in opposite states on one head.
+    // the two gates in opposite states on one head. The red is the NEWER of
+    // the two: with the clean later, it would legitimately supersede the
+    // finding on the merged surface and this would stop testing the veto.
     const a = await buildGithubTruthProbe(
       deps({
         listReviewerSurfaces: async () => ({
-          reviews: [{ login: ALLY, body: clean, state: "COMMENTED", commitId: HEAD, submittedAt: null }],
+          reviews: [{ login: ALLY, body: clean, state: "COMMENTED", commitId: HEAD, submittedAt: "2026-09-05T23:00:00Z" }],
           comments: [{ login: ALLY, body: dirty, createdAt: "2026-09-06T00:00:00Z" }],
         }),
       }),
@@ -481,7 +534,7 @@ describe("buildGithubTruthProbe", () => {
     const b = await buildGithubTruthProbe(
       deps({
         listReviewerSurfaces: async () => ({
-          reviews: [{ login: ALLY, body: "nope", state: "CHANGES_REQUESTED", commitId: HEAD, submittedAt: null }],
+          reviews: [{ login: ALLY, body: "nope", state: "CHANGES_REQUESTED", commitId: HEAD, submittedAt: "2026-09-06T01:00:00Z" }],
           comments: [{ login: ALLY, body: clean, createdAt: "2026-09-06T00:00:00Z" }],
         }),
       }),

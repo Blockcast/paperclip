@@ -89,8 +89,17 @@ export interface PrRef {
 export const MAX_LINKED_PRS = 5;
 /** Whole-probe budget. The gate runs inside a PATCH; a slow GitHub must not hold the request open. */
 export const PROBE_DEADLINE_MS = 8000;
-/** Per-call budget, so one wedged socket cannot consume the whole probe deadline. */
-export const PER_CALL_TIMEOUT_MS = 2000;
+/**
+ * Per-call budget, so one wedged socket cannot consume the whole probe deadline.
+ * Sized to leave HEADROOM under `PROBE_DEADLINE_MS`, not to tie it: the pinned
+ * chain models less than the real one, because `AbortSignal.timeout(perCallMs)`
+ * covers the `fetch` but not the `await getInstallationToken()` that precedes it
+ * in each dep (`github-app-auth.ts`). That is a cached no-op on a warm token, so
+ * the tie only lost on a cold one — but a deadline loss discards every PR's
+ * result, not just the slow one, so the margin is worth more than the extra
+ * 200ms of per-call patience.
+ */
+export const PER_CALL_TIMEOUT_MS = 1800;
 /**
  * Longest serial call chain in `probeOne`: gate → head → surfaces → author.
  * PRs are probed in PARALLEL, so this chain — not the PR count — is what has to
@@ -98,7 +107,8 @@ export const PER_CALL_TIMEOUT_MS = 2000;
  * and the overflow landed exactly where it was least affordable: the author read
  * fires only on the would-be-`clean` route, so a full-length chain threw away the
  * detection it was one call from establishing. `evidence-truth.test.ts` pins the
- * relation so a fifth call cannot cross it silently.
+ * relation STRICTLY, so a fifth call cannot cross it silently and the chain has
+ * somewhere to give when a cold token lands outside the per-call signal.
  */
 export const MAX_SERIAL_CALLS = 4;
 
@@ -289,9 +299,28 @@ async function probeOne(
     const formalClean =
       newest !== undefined && !formalBlocking && extractAllyReviewedHeadSha(newest.body) === normalizedHead;
 
-    // Each surface is individually blind to the other — Ally files a formal
-    // review on some PRs and only a comment on others — so SILENCE on one is
-    // not evidence, and the clean verdicts are OR'd.
+    // The OR is REDUNDANCY for the veto and an OVERRIDE for the clean, and the
+    // asymmetry is this commit's doing rather than the original design's. Until
+    // the surface merge above, each side read a disjoint row set — Ally files a
+    // formal review on some PRs and only a comment on others — so SILENCE on
+    // one genuinely was not evidence and OR'ing both clean verdicts was sound.
+    // Surface 1 now reads every row Surface 2 does (the only exception is a
+    // review with `submittedAt: null`, which GitHub does not produce for a
+    // submitted review), so for the CLEAN half the OR no longer adds a surface:
+    // it lets the author-blind `formalClean` publish a body that Surface 1 has
+    // already refused under the merge gate's author rule.
+    //
+    // KNOWN OPEN, tracked at BLO-34969 and pinned by a test, NOT an oversight.
+    // Closing it — by dropping `formalClean` from the disjunction or by gating
+    // it on the same author evidence, which are the same thing here — makes
+    // `review:ally-clean` unreachable on EVERY agent-authored PR, because the
+    // author is the reviewer identity on all of them. That shape is required
+    // (`DEFAULT_UNLABELED_REQUIRED`) and `PAPERCLIP_EVIDENCE_UNLABELED_BLOCK=1`
+    // promotes its absence from a warn to a block, so the fix is an estate-wide
+    // `in_review` decision with acceptance criteria of its own, not a line in a
+    // review fixup. The VETO keeps its independent justification either way:
+    // `formalBlocking` reads `newest.state`, so a bodyless CHANGES_REQUESTED is
+    // reachable only through Surface 2.
     //
     // A BLOCKING verdict is not silence, and it wins outright over the other
     // surface's clean. Without that veto a duplicate or concurrent review lets
