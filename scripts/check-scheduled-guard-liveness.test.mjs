@@ -145,7 +145,7 @@ describe("classifyGuard — reconstruction of the 2026-09-15 outage (PEN-3281)",
     assert.equal(first.reason, "stopped");
     assert.equal(first.ageMinutes, 364);
     assert.match(first.detail, /last completed 6h ago/);
-    assert.match(first.detail, /past the 4h liveness threshold/);
+    assert.match(first.detail, new RegExp(`past the ${DEFAULT_STALE_HOURS}h liveness threshold`));
   });
 
   // Mutation check: the same guards, same code path, healthy timings. If this
@@ -164,7 +164,7 @@ describe("classifyGuard — reconstruction of the 2026-09-15 outage (PEN-3281)",
   });
 });
 
-describe("classifyGuard — the 4h threshold against measured gap distribution", () => {
+describe("classifyGuard — the 165-minute threshold against measured gap distribution", () => {
   const now = Date.parse("2026-09-15T12:00:00Z");
 
   // Ordinary cron jitter on this repo topped out at 118 min across all six
@@ -184,23 +184,179 @@ describe("classifyGuard — the 4h threshold against measured gap distribution",
     assert.equal(over.status, "stale");
   });
 
-  // Honest limitation, asserted rather than left in prose: in the 2026-09-14
-  // event the lockfile guard's gap reached only 213 min, under the 4h bar. The
-  // event is still caught — detection is per-event, and the other five breach.
-  it("catches the 2026-09-14 event on five of six legs", () => {
-    const gaps = { a: 305, b: 291, c: 268, d: 254, e: 241, "lockfile-drift-monitor.yml": 213 };
-    const results = Object.entries(gaps).map(([workflow, minutes]) =>
-      classifyGuard(workflow, completedAgo(workflow, minutes * MINUTE, { now }), { now }),
+  // The band is (118, 213): above the jitter ceiling, below the shortest leg of
+  // the outage cluster. 165 sits mid-band at 1.40x the ceiling. Asserted so a
+  // later "let's relax it a bit" edit has to argue with the data.
+  it("sits strictly inside the admissible band", () => {
+    const bar = DEFAULT_STALE_HOURS * 60;
+    assert.ok(bar > 118, `bar ${bar} must clear the 118-min jitter ceiling`);
+    assert.ok(bar < 213, `bar ${bar} must sit under the 213-min shortest outage leg`);
+  });
+
+  const EVENT_2026_09_14_LEGS = [305, 291, 268, 254, 241, 213];
+
+  it("is retrospectively over the bar on all six legs of the 2026-09-14 event", () => {
+    const results = EVENT_2026_09_14_LEGS.map((minutes, index) =>
+      classifyGuard(`leg-${index}.yml`, completedAgo(`leg-${index}`, minutes * MINUTE, { now }), { now }),
     );
     const summary = summarize(results);
 
-    assert.equal(summary.staleCount, 5);
-    assert.equal(summary.exitCode, 1, "the event is reported even though one leg is under the bar");
-    assert.equal(
-      results.find((r) => r.workflow === "lockfile-drift-monitor.yml").status,
-      "ok",
-      "documents the known miss rather than pretending full coverage",
+    assert.equal(summary.staleCount, 6);
+    assert.equal(summary.exitCode, 1);
+  });
+
+  // The number that actually decides coverage, and the reason 240 was wrong.
+  // An HOURLY detector only samples once every 60 min, so a leg of length G is
+  // catchable for G-bar minutes and only GUARANTEED to be sampled when
+  // G - bar > 60. Retrospective "is it over the bar" flatters both bars; this
+  // is the honest instrument.
+  it("guarantees a catch on 5 of 6 legs at 165 min where 240 min guarantees 1", () => {
+    const guaranteed = (bar) => EVENT_2026_09_14_LEGS.filter((leg) => leg - bar > 60).length;
+
+    assert.equal(guaranteed(DEFAULT_STALE_HOURS * 60), 5);
+    assert.equal(guaranteed(240), 1, "the shipped 240-min bar guaranteed a catch on one leg only");
+  });
+});
+
+describe("classifyGuard — the four PEN-3379 production false positives", () => {
+  // NOT a synthetic reconstruction. These are the four reds this detector
+  // actually produced in production between 2026-09-18T06:59Z and 14:50Z, the
+  // only four it had ever produced on the detection step — and all four were
+  // wrong. `claimed` is the completion the filtered `status=completed&per_page=1`
+  // read returned as [0]; `actual` is the completion that guard genuinely had,
+  // 14-23 minutes before the red. Both guards ran every hour throughout and
+  // read state=active.
+  const FALSE_POSITIVES = [
+    {
+      redAt: "2026-09-18T06:59:00Z",
+      workflow: "relay-ssl-multicert-guard.yml",
+      name: "Relay SSL Multicert",
+      claimed: "2026-09-12T04:32:39Z",
+      actual: "2026-09-18T06:42:30Z",
+    },
+    {
+      redAt: "2026-09-18T08:52:00Z",
+      workflow: "ally-review-consistency.yml",
+      name: "Ally Review Consistency",
+      claimed: "2026-09-12T04:35:43Z",
+      actual: "2026-09-18T08:38:43Z",
+    },
+    {
+      redAt: "2026-09-18T10:51:00Z",
+      workflow: "relay-ssl-multicert-guard.yml",
+      name: "Relay SSL Multicert",
+      claimed: "2026-09-12T04:32:39Z",
+      actual: "2026-09-18T10:27:48Z",
+    },
+    {
+      redAt: "2026-09-18T14:50:00Z",
+      workflow: "relay-ssl-multicert-guard.yml",
+      name: "Relay SSL Multicert",
+      claimed: "2026-09-12T04:32:39Z",
+      actual: "2026-09-18T14:32:34Z",
+    },
+  ];
+
+  /** The stale-index observation as the detector saw it, with the cross-check attached. */
+  function staleIndexObservation({ name, claimed, actual }) {
+    return {
+      state: "active",
+      name,
+      newest: {
+        updatedAt: claimed,
+        conclusion: "success",
+        htmlUrl: "https://github.com/Blockcast/paperclip/actions/runs/1",
+      },
+      crossCheck: { newestCompletedAt: actual },
+    };
+  }
+
+  // The positive control. Without the cross-check this fixture MUST still red,
+  // or the test proves nothing about the fix — it would pass just as happily
+  // against a classifier that never reds at all.
+  it("reproduces all four reds when the cross-check is absent (shipped behaviour)", () => {
+    for (const fixture of FALSE_POSITIVES) {
+      const { crossCheck, ...withoutCrossCheck } = staleIndexObservation(fixture);
+      const result = classifyGuard(fixture.workflow, withoutCrossCheck, {
+        now: Date.parse(fixture.redAt),
+        staleHours: thresholdFor(fixture.workflow),
+      });
+
+      assert.equal(result.status, "stale", `${fixture.workflow} @ ${fixture.redAt}`);
+      assert.equal(result.reason, "stopped");
+      assert.ok(result.ageMinutes > 140 * 60, "the fixture really does carry the ~6-day bogus age");
+    }
+  });
+
+  it("suppresses all four once the unfiltered cross-check contradicts the index", () => {
+    for (const fixture of FALSE_POSITIVES) {
+      const result = classifyGuard(fixture.workflow, staleIndexObservation(fixture), {
+        now: Date.parse(fixture.redAt),
+        staleHours: thresholdFor(fixture.workflow),
+      });
+
+      assert.equal(result.status, "unknown", `${fixture.workflow} @ ${fixture.redAt} must not red`);
+      assert.equal(result.reason, "cross-check-disagreement");
+      // Re-aged against the completion that really happened: 14-23 min, not ~150h.
+      assert.ok(result.ageMinutes < 30, `re-aged to ${result.ageMinutes}m against the real completion`);
+    }
+  });
+
+  it("reports the whole set as zero stale and exits 0", () => {
+    // All four reds fell inside one ~8h window; classify them together at the
+    // last one, which is how a single run would have seen a repeat occurrence.
+    const now = Date.parse("2026-09-18T14:50:00Z");
+    const summary = summarize(
+      FALSE_POSITIVES.map((fixture) =>
+        classifyGuard(fixture.workflow, staleIndexObservation(fixture), {
+          now,
+          staleHours: thresholdFor(fixture.workflow),
+        }),
+      ),
     );
+
+    assert.equal(summary.staleCount, 0);
+    assert.equal(summary.exitCode, 0, "not one of these four may exit non-zero");
+  });
+
+  // The other half of the contract. Suppression must be driven by DISAGREEMENT,
+  // not by the cross-check existing — otherwise the fix mutes the detector and
+  // reproduces PEN-3281 by a different route.
+  it("still reds a genuinely stopped guard when both reads agree", () => {
+    const now = Date.parse("2026-09-18T14:50:00Z");
+    const result = classifyGuard(
+      "relay-ssl-multicert-guard.yml",
+      {
+        state: "active",
+        name: "Relay SSL Multicert",
+        newest: { updatedAt: "2026-09-12T04:32:39Z", conclusion: "success", htmlUrl: "https://x" },
+        // The unfiltered read corroborates: nothing newer has completed.
+        crossCheck: { newestCompletedAt: "2026-09-12T04:32:39Z" },
+      },
+      { now, staleHours: thresholdFor("relay-ssl-multicert-guard.yml") },
+    );
+
+    assert.equal(result.status, "stale");
+    assert.equal(result.reason, "stopped");
+  });
+
+  // Absence of corroboration is not agreement. A permanently failing second
+  // read must not become a mute switch.
+  it("leaves the red standing, annotated, when the cross-check cannot be read", () => {
+    const now = Date.parse("2026-09-18T14:50:00Z");
+    const result = classifyGuard(
+      "relay-ssl-multicert-guard.yml",
+      {
+        state: "active",
+        name: "Relay SSL Multicert",
+        newest: { updatedAt: "2026-09-12T04:32:39Z", conclusion: "success", htmlUrl: "https://x" },
+        crossCheck: { error: true },
+      },
+      { now, staleHours: thresholdFor("relay-ssl-multicert-guard.yml") },
+    );
+
+    assert.equal(result.status, "stale");
+    assert.match(result.detail, /cross-check read could not be made/);
   });
 });
 
@@ -402,10 +558,17 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     assert.ok(twiceDaily > 14.6, "would red on ordinary twice-daily jitter");
     assert.ok(twiceDaily < 17.71, "would sail over the 2026-09-15 outage it must catch");
 
-    // The hourly six keep 4h; a shared global threshold is the bug this replaced.
+    // The hourly six share one bar; a shared GLOBAL threshold across cadences is
+    // the bug this replaced. Asserted against DEFAULT_STALE_HOURS rather than a
+    // literal so moving the bar stays a one-line change with a reason attached
+    // (PEN-3379 moved it 4h -> 2.75h).
     for (const workflow of WATCHED_WORKFLOWS) {
       if (workflow === "production-environment-protection-guard.yml") continue;
-      assert.equal(byWorkflow.get(workflow), 4, `${workflow} should be on the hourly 4h bar`);
+      assert.equal(
+        byWorkflow.get(workflow),
+        DEFAULT_STALE_HOURS,
+        `${workflow} should be on the hourly ${DEFAULT_STALE_HOURS}h bar`,
+      );
     }
   });
 });
