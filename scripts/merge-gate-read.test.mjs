@@ -445,12 +445,76 @@ describe("merge-gate reader", () => {
       );
     });
 
-    it("keeps a stale failure its own workflow later re-ran and passed", () => {
-      // The accepted false RED. Deliberate, not an oversight: see above.
+    it("keeps a stale failure whose later pass is in a DIFFERENT event lane", () => {
+      // The accepted false RED. Deliberate, not an oversight: see above. Contrast
+      // the same-lane case below, which IS dropped (BLO-34835) — the victim's
+      // conclusion is identical in both and only the lane differs.
       assert.equal(
         dead([
           ["315978042", "pull_request_target", "35369288224", "failure", "2026-09-18T16:34:36Z"],
           ["315978042", "pull_request_review", "35370168113", "success", "2026-09-18T16:43:36Z"],
+        ]),
+        "",
+      );
+    });
+
+    // BLO-34835. The VICTIM half of the test, which `cancelled`-only left as a
+    // permanent false RED: one lane, one head, two runs, because `pull_request`
+    // re-fires on the cheap metadata actions (edited/labeled/ready_for_review).
+    // The head never moves, so the dead `failure` prints STOP forever.
+    // Measured on Open-Capacity-Marketplace#261 @ c1a6cd76.
+    //
+    // NOTE the field: `workflow_run.event` is the WEBHOOK event, not the action.
+    // Both runs below are `pull_request` — ONE lane — which is what separates
+    // this from the two cross-event cases above that must stay kept.
+    it("drops a failure its own lane re-ran and passed at the same head", () => {
+      assert.equal(
+        dead([
+          ["328360353", "pull_request", "35545233196", "failure", "2026-09-20T23:38:21Z"],
+          ["328360353", "pull_request", "35545277556", "success", "2026-09-20T23:39:15Z"],
+        ]),
+        "35545233196",
+      );
+    });
+
+    // The fence on the above. Without this, widening the victim is
+    // indistinguishable from "stop reading failures at all" — which is the
+    // merge-authorizing direction and this file's whole failure mode.
+    it("keeps a failure with no later pass in its lane", () => {
+      assert.equal(
+        dead([
+          ["328360353", "pull_request", "35545233196", "failure", "2026-09-20T23:38:21Z"],
+          ["328360353", "pull_request", "35545277556", "failure", "2026-09-20T23:39:15Z"],
+        ]),
+        "",
+      );
+    });
+
+    // The other fence on the victim widening, and the one that is easy to miss:
+    // the victim test must stay an EXPLICIT allow-list of terminal conclusions.
+    // Relaxing it to `!= "success"` reads as the tidy generalisation and sweeps
+    // in a run that is STILL RUNNING — `conclusion` is null on an in-flight run
+    // and @tsv renders that as "". Its rows are live STOPs (an in-flight check is
+    // a stop, pinned above), so deleting them is merge-authorizing: the reader
+    // goes green on a head whose lane has not finished. Direction: GREEN.
+    it("never treats an in-flight run as a victim, even with a later lane pass", () => {
+      assert.equal(
+        dead([
+          ["328360353", "pull_request", "35545233196", "", "2026-09-20T23:38:21Z"],
+          ["328360353", "pull_request", "35545277556", "success", "2026-09-20T23:39:15Z"],
+        ]),
+        "",
+      );
+    });
+
+    // cancelled one: supersession is directional, sibling-success is not. The
+    // pass MUST carry the LOWER id, or a max-id implementation agrees and the
+    // fixture proves nothing.
+    it("keeps a failure whose only lane pass ran BEFORE it", () => {
+      assert.equal(
+        dead([
+          ["328360353", "pull_request", "35545233100", "success", "2026-09-20T22:10:00Z"],
+          ["328360353", "pull_request", "35545233196", "failure", "2026-09-20T23:38:21Z"],
         ]),
         "",
       );
