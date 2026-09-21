@@ -552,19 +552,110 @@ Fire 1 used it, with `idempotencyKey: blo-32511-fire-1` so a retry cannot double
 | status | `issue_created` |
 | execution issue | [BLO-34858](https://paperclip.blockcast.net/BLO/issues/BLO-34858) `dc3d926b-672a-4756-92aa-402613736356` |
 
-**Receipts are not yet recorded here, and that is a dispatch lag, not a routine defect.** The fire
-did everything a fire does — it minted the `routine_execution` issue, assigned to Ally, `todo`,
-`high`. That issue then sat **`todo` for ~12 minutes with `activeRun: null`** and no run picked it
-up, including across a manual `heartbeat/invoke` that did stamp `lastHeartbeatAt`
-(`2026-09-20T10:48:58.787Z`). The creating run still held its own checkout throughout, which is the
-most likely reason the wake found nothing free to take. Receipts, and the fire-2 confirmations that
-depend on them, are appended in the next section when the execution issue runs.
+**The fire-1 dispatch lag cleared on its own.** The fire minted the `routine_execution` issue
+assigned to Ally, `todo`, `high`; that issue then sat **`todo` for ~18 minutes with
+`activeRun: null`** while the creating run still held its own checkout, which is the most likely
+reason the wake found nothing free to take. Run `230a8b6d-3736-4cfb-a661-2ab392371513` picked it up
+at `13:01:18.951Z` and posted receipt 1 nine minutes later. No intervention was needed.
 
-**Open risk for whoever reads the first receipt.** The routine's step 1 requires a
-`Blockcast/paperclip` checkout, and the routine carries no `projectId` or workspace binding. An
-agent workspace can start empty — this run's did — so the execution run must clone before it can
-find `scripts/land-clean-prs.mjs`. If the first receipt reads `aborted:script-missing`, the cause is
-that missing workspace binding, **not** the C1 script, which is present on `master` at 20217 bytes.
+**The workspace-binding risk flagged above did not materialise.** Neither receipt contains an
+`aborted:script-missing` row; both are full classifications, so the execution runs did find
+`scripts/land-clean-prs.mjs`. The routine still carries no `projectId` or workspace binding, so the
+risk remains live for future fires — it was simply not the thing that broke. What did break is
+recorded under fire 3 below, and it is unrelated.
+
+#### Receipt 1 — 2026-09-20T13:10:13.997Z, from fire 1
+
+Comment [`e5b20c74`](https://paperclip.blockcast.net/BLO/issues/BLO-34818#comment-e5b20c74-7476-434b-b470-745fb2808ebe)
+on BLO-34818, posted by run `230a8b6d`. First line is exactly `<!-- landing-routine-receipt -->`.
+
+| tally | count |
+| --- | --- |
+| `already-enqueued` | 1 (#1954) |
+| `codeowner-review-requested` | 13 |
+| `skip` | 107 |
+| `stale-enqueue` | 2 (#1444 at 753.8h, #1271 at 849.0h) |
+| **`enqueue`** | **0** |
+| rows total | 123 |
+
+Confirmations section reads `first fire — no previous receipt`, which is the value step 3 of the
+routine description specifies for a first fire.
+
+#### Fire 2 — 2026-09-20T19:45:00Z (schedule) → receipt 2 at 20:50:12.506Z
+
+| field | value |
+| --- | --- |
+| routine run id | `e7e5ce9e-9640-4d0c-b661-ab771e747df9` |
+| source | `schedule`, trigger `50cb6f35-…` |
+| status | `issue_created` |
+| execution issue | [BLO-34946](https://paperclip.blockcast.net/BLO/issues/BLO-34946) `34cf59eb-3a43-44bd-b17b-13230fbe84eb` |
+| receipt | [`31344cc1`](https://paperclip.blockcast.net/BLO/issues/BLO-34818#comment-31344cc1-387f-4059-8462-d44c32400443), run `fc878f8c` |
+
+| tally | count |
+| --- | --- |
+| `already-enqueued` | 1 (#1954) |
+| `codeowner-review-requested` | 20 |
+| `skip` | 106 |
+| `stale-enqueue` | 0 |
+| **`enqueue`** | **0** |
+| rows total | 127 |
+
+Confirmations section reads `none` — the correct output when the previous receipt had no `enqueue`
+rows. The two `stale-enqueue` rows from receipt 1 are absent from receipt 2 because fire 1 had
+already posted on #1444 and #1271; the classifier does not re-report a stale enqueue it has
+already flagged.
+
+#### ACs 3 and 4 are satisfied vacuously, and that is worth stating plainly
+
+The acceptance criteria expect receipt 1 to carry `enqueue` rows whose `autoMergeRequest` is set on
+GitHub, and receipt 2 to resolve each of them to `confirmed-merged` or `still-queued`. **Neither
+fire produced a single `enqueue` row**, so there was nothing to arm and nothing to confirm. Both
+criteria hold, but neither was exercised. No `gh pr view <n> --json state,mergedAt` verification was
+run, because there are zero `confirmed-merged` rows to verify.
+
+The reason is not a routine defect — it is the state of the fleet's open PRs. Across 127 rows the
+classifier found that essentially every candidate fails a real gate before landing is even
+considered: `checks:FAILURE`/`QUEUED`/`IN_PROGRESS` dominates, `owner-approval-pending` accounts for
+20, and the rest are `human-author`, `review:missing`, `review:blocking`, `review:stale-head` or
+`mergestate:DIRTY`. The routine is correctly declining to merge PRs that are not clean. **The first
+genuine end-to-end exercise of ACs 3 and 4 will be the first fire that meets a PR with green checks
+and an owner approval at head**, and that has not happened yet in three fires.
+
+#### Fires coalesce: two of the four slots minted no issue, by design
+
+`concurrencyPolicy: skip_if_active` does not merely drop a fire — it records it as `skipped` with a
+`coalescedIntoRunId` pointing at the run that was still live. Two of four fires took that path:
+
+| triggered | run | status | outcome |
+| --- | --- | --- | --- |
+| 2026-09-20T10:43:04Z | `28859a4f` | `completed` | manual; minted BLO-34858 → receipt 1 |
+| 2026-09-20T13:45:00Z | `af449f27` | `skipped` | coalesced into `28859a4f` (BLO-34858 still live) |
+| 2026-09-20T19:45:00Z | `e7e5ce9e` | `issue_created` | minted BLO-34946 → receipt 2 |
+| 2026-09-21T01:45:00Z | `73032a7a` | `skipped` | coalesced into `e7e5ce9e` (BLO-34946 still live) |
+
+So **four fires produced two receipts, and that is correct behaviour, not two missing receipts.** A
+coalesced fire is explicitly not a separate fire; the acceptance criterion "one receipt per fire"
+must be read against runs that reached `issue_created`/`completed`, not against cron slots. Anyone
+auditing this routine by counting cron slots against receipts will report a false defect.
+
+#### Fire 3 — the 01:45Z slot's re-run failed on infrastructure, and is self-healing
+
+BLO-34946 was re-woken for the coalesced 01:45Z slot, and that run
+(`934e605e-5562-45a5-8f16-4f9ad2679b70`) failed at `03:10Z` with `adapter_failed` —
+`Claude exited with code 1 [pod: reason=Error, container_log=penstock agent runtime: Caveman proxy
+did not become ready]`. Infrastructure, not the script and not the routine.
+
+**BLO-34946 therefore reads `blocked` with `blockedBy: []`, which looks exactly like the
+zero-wake-path strand of [BLO-27553](https://paperclip.blockcast.net/BLO/issues/BLO-27553) and is
+not one.** It carries `activeRecoveryAction.status: "active"`, attempt 1 of 5, `timeoutAt`
+`2026-09-21T09:10:46Z`, `wakePolicy: wake_owner` → Ally. That is a live wake path. Per the
+2026-09-13 amendment to that rule, **a `PATCH {status}` here would discharge the recovery action and
+delete the working wake path** — the repair is strictly worse than the apparent defect. It was left
+untouched deliberately. Re-check it with:
+
+    curl -sS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+      "$PAPERCLIP_API_URL/api/issues/34cf59eb-3a43-44bd-b17b-13230fbe84eb" \
+      | jq '{status, blockedBy, ra: .activeRecoveryAction | {status, attemptCount, maxAttempts, timeoutAt}}'
 
 ## C3 — governance sweep un-paused (2026-09-07)
 
