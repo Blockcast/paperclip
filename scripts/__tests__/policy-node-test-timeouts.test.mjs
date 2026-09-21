@@ -396,12 +396,21 @@ test("only helm_chart runs the chart suite from inside the chart directory (BLO-
 //     lines are indented far further, so `^ {2}-` separates the two.
 //   - aliases share one definition line, comma-separated, and share arity:
 //     `-C, --conditions=...`, `--experimental-test-isolation, --test-isolation=...`.
-//     The `=...` sits on the last spelling only, so mark the whole group.
-//   - `=...` is a REQUIRED value -> consume the next token.
-//   - `[=...]` is OPTIONAL -> the bare spelling is BOOLEAN and must NOT be
-//     consumed: `--inspect[=[host:]port]`, `--inspect-brk`, `--inspect-wait`.
-//     Listing one would eat the path after it -- a false GREEN, the worse
-//     direction. Matching on `=...` excludes them by construction.
+//     The value marker sits on the last spelling only, so mark the whole group.
+//   - an `=` OUTSIDE brackets is a REQUIRED value -> consume the next token.
+//     The placeholder is usually `...` but is sometimes spelled out, so key on
+//     the `=`, not on the `...`: `--debug-port, --inspect-port=[host:]port` is
+//     required-value (the brackets are inside the value, around the optional
+//     `host:`) and is the only line rendered that way on node 24.16.0. Keying
+//     on the literal `=...` read both spellings as boolean, so a step passing
+//     a port argless-discovered the chart suite and reported under the wrong
+//     branch -- measured, `node --test --inspect-port 9229` runs default
+//     discovery while `9229` survives as an operand.
+//   - an `=` INSIDE brackets is OPTIONAL -> the bare spelling is BOOLEAN and
+//     must NOT be consumed: `--inspect[=[host:]port]`, `--inspect-brk`,
+//     `--inspect-wait`. Listing one would eat the path after it -- a false
+//     GREEN, the worse direction. Requiring a `=` not preceded by `[` excludes
+//     them by construction.
 // If a future node re-renders its help, this set shrinks and the membership
 // test below goes red naming the flag it lost -- loudly, where a narrowed
 // literal regex went silent.
@@ -414,8 +423,8 @@ const VALUE_FLAGS = (() => {
     const definition = /^ {2}(-[^\s,]*(?:, -[^\s,]*)*)/.exec(line);
     if (!definition) continue;
     const spellings = definition[1].split(", ");
-    if (!spellings.some((spelling) => spelling.endsWith("=..."))) continue;
-    for (const spelling of spellings) flags.add(spelling.replace(/=\.\.\.$/, ""));
+    if (!spellings.some((spelling) => /[^[]=/.test(spelling))) continue;
+    for (const spelling of spellings) flags.add(spelling.replace(/=.*$/, ""));
   }
   return flags;
 })();
@@ -466,6 +475,11 @@ test("a flag's value is never mistaken for the path argument (BLO-31516)", () =>
     " --watch-path ./src",
     " -r ./preload.cjs",
     " --experimental-test-isolation none",
+    // Measured on node 24.16.0: `node --test --inspect-port 9229` runs default
+    // discovery. Unconsumed, `9229` survives as an operand -- and because it
+    // holds no `/` it fails the rooted-path branch instead of this one, telling
+    // the reader to root a path that is a port number.
+    " --inspect-port 9229",
   ]) {
     assert.deepEqual(operandsOf(invocation), [], `${invocation.trim()} leaves its value behind as an operand`);
   }
@@ -489,6 +503,13 @@ test("VALUE_FLAGS is derived from node --help, required-value only (BLO-31516)",
     "--watch-path",
     "--env-file",
     "--snapshot-blob",
+    // Required value rendered with a spelled-out placeholder rather than
+    // `...` -- `--debug-port, --inspect-port=[host:]port`. The only line in
+    // that class on node 24.16.0, and the one an `endsWith("=...")` filter
+    // read as boolean. Both spellings, because the whole alias group is lost
+    // together if the `=`-not-preceded-by-`[` test regresses to the literal.
+    "--inspect-port",
+    "--debug-port",
     // Alias-line parsing: these exist only as the non-`=...` spelling on a
     // shared definition line, so they are lost the moment the comma handling
     // above regresses.
@@ -514,6 +535,16 @@ test("VALUE_FLAGS is derived from node --help, required-value only (BLO-31516)",
     "--inspect-wait",
   ]) {
     assert.ok(!VALUE_FLAGS.has(flag), `${flag} takes no required value; consuming it would eat the path argument`);
+  }
+  // Every member must be a spelling a real token can equal. Without this, the
+  // `=`-not-preceded-by-`[` filter has no failing mutation: loosening it to a
+  // bare `=` admits the bracketed optional-value flags, but the strip above
+  // turns `--inspect[=[host:]port]` into `--inspect[`, so the must-be-absent
+  // rows above still pass on a set that has silently stopped excluding them.
+  // A member holding a `[` can never match a token, so it is a derivation bug
+  // whether or not it is inert today.
+  for (const flag of VALUE_FLAGS) {
+    assert.ok(!flag.includes("["), `${flag} is a mangled spelling; the optional-value filter has regressed`);
   }
 });
 

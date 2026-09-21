@@ -516,7 +516,17 @@ jobs:
         # job with no bound below the job cap. A stale date misleads a reader
         # who is already editing this line; a flaky assertion fails PRs that
         # never touched it. So the decay is accepted deliberately, and bounded
-        # by pinning it to a date a reader can re-run in one API call.
+        # by pinning it to a date a reader can re-run in one API call:
+        #
+        #   gh api repos/helm/helm/releases \
+        #     --jq '.[]|select(.prerelease|not)
+        #           |"\(.tag_name)\t\(.published_at[:10])"' | head -6
+        #
+        # One page is enough and `--paginate` is wrong here: the 3.x and 4.x
+        # tips interleave by date on page 1 (verified 2026-09-21 — v4.3.0
+        # 2026-09-09, v3.22.0 2026-09-10, v4.2.4, v3.21.4 ...), and paginating
+        # re-applies the filter per page, so later pages emit 2018-era tags.
+        # Read the newest tag of EACH major, not just the newest tag.
         uses: azure/setup-helm@v4
         with:
           version: v3.16.3
