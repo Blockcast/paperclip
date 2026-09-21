@@ -64,9 +64,6 @@ import { logActivity } from "../activity-log.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS, issueRecoveryActionService } from "../issue-recovery-actions.js";
-// Type-only, so it is erased before runtime and cannot touch the vitest mock namespace
-// that the comment at `recoveryHandoffCommentGrantTtlHours` below exists to warn about.
-import type { ExpiredWakeHorizonCandidate } from "../issue-recovery-actions.js";
 import {
   isVerifiedIssueTreeControlInteractionWake,
   issueTreeControlService,
@@ -12354,19 +12351,23 @@ export function recoveryService(
    * automatic liveness escalation is off, because it re-routes an already-committed action
    * rather than creating recovery work.
    *
-   * BLO-19124: "independent of the source issue's status" is right; "independent of whether
-   * the issue was WORKED" was not. The notice this pass emits asserts that the stranding was
-   * never worked and that the fault is scheduler-side — and it asserted that on rows whose
-   * source issue had been serviced normally inside the horizon, because the horizon predicate
-   * is pure clock. Every other decision point in this subsystem gates on the source issue
-   * before acting (`hasActiveExecutionPath` at the producer, the liveness backstop, the
-   * blocked-drain hand-back, the wake backstop); escalation was the outlier that did not.
+   * BLO-19124: the retirement is unconditional and stays that way. What was wrong is what the
+   * `attemptCount === 0` notice ASSERTS while doing it — "the stranding was never worked, and
+   * that is a scheduler-side fault". `attemptCount` counts wakes this action delivered, so 0
+   * proves only that THIS action never woke anyone; it says nothing about whether the issue
+   * was serviced by some other path (a comment wake, a manual dispatch, an operator). The
+   * worked example is BLO-19124 itself: action opened 16:35Z at `attemptCount: 0`, owner runs
+   * commented at 19:44Z and 22:01Z, horizon 22:35Z, escalated 22:55Z with that sentence
+   * attached to an issue that had demonstrably been worked twice inside the window.
    *
-   * A candidate with a successful run since the action opened is therefore discharged rather
-   * than escalated: its premise is falsified, so escalating would publish a false statement
-   * into the one queue that cannot absorb it. Discharge, not skip — leaving it `active` past
-   * its horizon would reinstate the BLO-24662 limbo this pass exists to end, and the anchor
-   * being the action's own `createdAt` means the veto would never lapse.
+   * So the fix is to stop publishing the false half, not to stop retiring the row. An earlier
+   * revision of this change discharged the action instead (`status: "resolved"`); that is
+   * withdrawn, because `resolved` is outside `ACTIVE_RECOVERY_ACTION_STATUSES` and so frees
+   * `issue_recovery_actions_active_source_uq` — `upsertSourceScoped` then INSERTs a fresh row
+   * at `attemptCount: 0` with a fresh horizon instead of reusing this one, which is the
+   * unbounded re-fire loop BLO-18996 closed. Escalating holds the slot, so the budget cannot
+   * reset. Leaving the row `active` is not an option either: that is the BLO-24662 limbo this
+   * pass exists to end.
    */
   async function reconcileExpiredRecoveryWakeHorizons(opts?: {
     runId?: string | null;
@@ -12378,63 +12379,20 @@ export function recoveryService(
       checked: 0,
       escalated: 0,
       neverDelivered: 0,
+      /** Of `neverDelivered`, those whose source issue was serviced anyway (BLO-19124). */
+      neverDeliveredButWorked: 0,
       announced: 0,
-      workedDischarged: 0,
       actionIds: [] as string[],
       issueIds: [] as string[],
     };
     const now = opts?.now ?? new Date();
 
-    const worked: ExpiredWakeHorizonCandidate[] = [];
     const expired = await recoveryActionsSvc.escalateExpiredWakeHorizons({
       now,
       companyId: opts?.companyId ?? null,
       limit: opts?.limit,
-      selectEscalatable: async (candidates) => {
-        const escalatable: string[] = [];
-        for (const candidate of candidates) {
-          // Anchored at the action's own `createdAt`, so this asks exactly what the notice
-          // claims: was the stranding worked at any point in this action's life? A run still
-          // in flight is NOT enough on its own — `hasActiveExecutionPath` would miss the
-          // common shape, where the run that serviced the issue finished before the sweep ran.
-          if (await hasSuccessfulIssueRunSince(candidate.companyId, candidate.sourceIssueId, candidate.createdAt)) {
-            worked.push(candidate);
-            continue;
-          }
-          escalatable.push(candidate.id);
-        }
-        return escalatable;
-      },
     });
-
-    for (const candidate of worked) {
-      try {
-        const resolved = await recoveryActionsSvc.resolveActiveForIssue({
-          companyId: candidate.companyId,
-          sourceIssueId: candidate.sourceIssueId,
-          actionId: candidate.id,
-          status: "resolved",
-          outcome: "restored",
-          resolutionNote:
-            "Wake horizon expired, but the source issue had a successful run after this action was opened, "
-            + "so the stranding it was raised for did not survive the window. Discharged instead of escalated: "
-            + "escalating would have told an operator the issue was never worked.",
-        });
-        if (resolved) result.workedDischarged += 1;
-      } catch (error) {
-        // Leave the row `active` on failure. The next sweep re-evaluates it from scratch, and
-        // a missed discharge is strictly better than a false escalation.
-        logger.warn(
-          { err: error, actionId: candidate.id, sourceIssueId: candidate.sourceIssueId },
-          "failed to discharge expired recovery wake horizon whose source issue was worked",
-        );
-      }
-    }
-
-    // Every row whose horizon had expired, discharged or not. Counting only the escalated
-    // ones would make a sweep that discharged ten of them report `checked: 0` — a fresh
-    // observability hole in the pass whose whole subject is observability.
-    result.checked = expired.length + worked.length;
+    result.checked = expired.length;
     if (expired.length === 0) return result;
 
     for (const action of expired) {
@@ -12456,6 +12414,29 @@ export function recoveryService(
       if (neverDelivered) result.neverDelivered += 1;
       recordRecoveryHorizonExpired(neverDelivered ? "never_delivered" : "delivered");
 
+      // BLO-19124: only asked on the `neverDelivered` branch, because that is the only notice
+      // arm that claims the stranding went unworked — the delivered arm makes no such claim,
+      // so buying this row would be a query per sweep for nothing.
+      //
+      // "Since the action opened" is deliberately an OVERLAP test, not a containment one:
+      // `hasSuccessfulIssueRunSince` matches `createdAt >= since OR finishedAt >= since`, so a
+      // run that started before this action and finished inside its window counts. That is the
+      // meaning the notice needs — such a run WAS working the issue during the horizon.
+      //
+      // `hasActiveExecutionPath`, the guard the sibling decision points in this subsystem use,
+      // is the wrong instrument here: it asks whether a run is in flight RIGHT NOW and would
+      // have missed all three BLO-19124 runs, every one of which had finished before the sweep
+      // read the row.
+      // `createdAt` is `string | Date` on the read model — the driver hands back a Date, but
+      // the type is widened, so normalise rather than relying on the runtime shape.
+      const neverDeliveredButWorked = neverDelivered
+        && await hasSuccessfulIssueRunSince(
+          action.companyId,
+          action.sourceIssueId,
+          new Date(action.createdAt),
+        );
+      if (neverDeliveredButWorked) result.neverDeliveredButWorked += 1;
+
       logger.warn(
         {
           actionId: action.id,
@@ -12466,6 +12447,7 @@ export function recoveryService(
           attemptCount: action.attemptCount,
           maxAttempts: action.maxAttempts,
           neverDelivered,
+          neverDeliveredButWorked,
           timeoutAt: action.timeoutAt,
           runId: opts?.runId ?? null,
         },
@@ -12511,9 +12493,20 @@ export function recoveryService(
                 "every sweep since the current owner took over was refused by the wake channel " +
                 "(provider-capacity deferral, an active tree pause hold, wake disabled, or cooldown). An " +
                 "earlier owner may have been woken; check the action's owner history before concluding the " +
-                "whole window was refused. Within the current owner's tenure the stranding this action was " +
-                "opened to repair was never worked, and that is a scheduler-side fault rather than an owner " +
-                "who was woken and could not resolve it."
+                "whole window was refused. " +
+                (neverDeliveredButWorked
+                  // BLO-19124: the claim below is about THIS ACTION's wakes, never about the issue.
+                  // Saying "never worked" here was false on every row where the issue was serviced by
+                  // another path, and it is the whole reason an operator would open this notice.
+                  ? "The issue itself WAS worked inside this window even so — at least one run on it " +
+                    "succeeded after this action was opened — so this is a bookkeeping failure (the " +
+                    "action was never discharged) rather than an unworked stranding. Check whether the " +
+                    "work that happened actually resolved the stranding before treating this as an " +
+                    "incident."
+                  : "No run on the issue succeeded inside this window either, so within the current " +
+                    "owner's tenure the stranding this action was opened to repair was never worked, and " +
+                    "that is a scheduler-side fault rather than an owner who was woken and could not " +
+                    "resolve it.")
               : "- Note: reassigning will NOT restore the wake budget — the horizon above is fixed for the life of " +
                 "the action, so a new owner does not get fresh attempts.",
             "- Next action: discharge or cancel this recovery action, or record an intentional manual resolution.",
@@ -13647,6 +13640,7 @@ export function recoveryService(
       strandedRecoveryWakeIssueIds: [] as string[],
       expiredRecoveryHorizonsEscalated: 0,
       expiredRecoveryHorizonsNeverDelivered: 0,
+      expiredRecoveryHorizonsNeverDeliveredButWorked: 0,
       expiredRecoveryHorizonsAnnounced: 0,
       expiredRecoveryHorizonIssueIds: [] as string[],
       issueIds: [] as string[],
@@ -13695,6 +13689,11 @@ export function recoveryService(
     });
     result.expiredRecoveryHorizonsEscalated = expiredHorizons.escalated;
     result.expiredRecoveryHorizonsNeverDelivered = expiredHorizons.neverDelivered;
+    // BLO-19124: propagated, not just counted internally. Without it the sweep result cannot
+    // distinguish "the wake channel refused and nothing got done" from "the wake channel
+    // refused but the issue was worked anyway", which is the split that decides whether a
+    // never-delivered spike is a scheduler incident or a discharge-bookkeeping gap.
+    result.expiredRecoveryHorizonsNeverDeliveredButWorked = expiredHorizons.neverDeliveredButWorked;
     result.expiredRecoveryHorizonsAnnounced = expiredHorizons.announced;
     result.expiredRecoveryHorizonIssueIds = expiredHorizons.issueIds;
 

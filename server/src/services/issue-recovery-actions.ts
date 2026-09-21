@@ -118,14 +118,6 @@ export type ResolveIssueRecoveryActionInput = {
   resolutionNote?: string | null;
 };
 
-/** A row `escalateExpiredWakeHorizons` is about to escalate, as offered to `selectEscalatable`. */
-export type ExpiredWakeHorizonCandidate = {
-  id: string;
-  companyId: string;
-  sourceIssueId: string;
-  createdAt: Date;
-};
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -831,26 +823,11 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
    *
    * The `status` re-check inside the UPDATE is what makes concurrent sweeps safe: only
    * rows this call actually transitioned come back, so the caller announces once.
-   *
-   * BLO-19124: the predicate is pure clock and deliberately stays that way. Whether the
-   * source issue was in fact worked inside the horizon is the caller's question, asked
-   * through `selectEscalatable`.
    */
   async function escalateExpiredWakeHorizons(input: {
     now?: Date;
     companyId?: string | null;
     limit?: number;
-    /**
-     * BLO-19124: optional caller-supplied veto, applied between candidate selection and the
-     * escalating UPDATE. Returns the subset of ids that should actually escalate.
-     *
-     * The horizon predicate above is pure clock — it says nothing about whether the source
-     * issue was worked. Everything the caller needs to answer that lives in recovery/service
-     * (heartbeat runs, wake queues), not here, so the check is injected rather than inlined.
-     * Read-only by contract: a candidate the caller drops is left `active` and untouched,
-     * so the caller owns whatever it does with it instead.
-     */
-    selectEscalatable?: (candidates: ExpiredWakeHorizonCandidate[]) => Promise<string[]> | string[];
   } = {}): Promise<IssueRecoveryAction[]> {
     const now = input.now ?? new Date();
     const limit = Math.max(1, Math.floor(input.limit ?? 200));
@@ -864,22 +841,13 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       candidatePredicates.push(eq(issueRecoveryActions.companyId, input.companyId));
     }
 
-    const candidates = await db
-      .select({
-        id: issueRecoveryActions.id,
-        companyId: issueRecoveryActions.companyId,
-        sourceIssueId: issueRecoveryActions.sourceIssueId,
-        createdAt: issueRecoveryActions.createdAt,
-      })
+    const candidateIds = await db
+      .select({ id: issueRecoveryActions.id })
       .from(issueRecoveryActions)
       .where(and(...candidatePredicates))
       .orderBy(asc(issueRecoveryActions.timeoutAt))
-      .limit(limit);
-    if (candidates.length === 0) return [];
-
-    const candidateIds = input.selectEscalatable
-      ? await input.selectEscalatable(candidates)
-      : candidates.map((row) => row.id);
+      .limit(limit)
+      .then((rows) => rows.map((row) => row.id));
     if (candidateIds.length === 0) return [];
 
     const updated = await db
