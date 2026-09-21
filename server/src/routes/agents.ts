@@ -1847,14 +1847,45 @@ export function agentRoutes(
     );
   }
 
+  /**
+   * An agent must not be able to change its own instructions path or bundle
+   * configuration — that is a rewrite of its own operating instructions.
+   *
+   * This compares each instructions key the write would persist against the
+   * value already stored and refuses only a difference. A presence test is
+   * wrong here for the same reason it was wrong for secret bindings: on
+   * `PATCH /agents/:id` this guard also runs against the *effective* config,
+   * which `resolveRawEffectiveAdapterConfigForPatch` shallow-merges onto the
+   * stored config precisely to preserve these keys. Every bundle-managed agent
+   * therefore carried its whole `KNOWN_INSTRUCTIONS_BUNDLE_KEYS` set into the
+   * guard, so any agent-authored `adapterConfig` write — one naming no
+   * instructions key at all, or a verbatim no-op round-trip — was refused with
+   * a message listing keys the caller never sent (BLO-32332). There was no
+   * request shape that could pass.
+   *
+   * Check the value that is actually persisted, not just the request: on
+   * `PATCH /agents/:id` the persisted config is the output of
+   * `syncInstructionsBundleConfigFromFilePath`, which re-derives the bundle
+   * keys from `instructionsFilePath` and resolves a relative one against
+   * `adapterConfig.cwd` — a key with no agent-actor guard of its own. So that
+   * call site runs this guard a second time on the post-sync result.
+   *
+   * `existingAdapterConfig` is omitted on create and hire, where there is no
+   * prior state and every key present is therefore a change. Removal is not
+   * checked here: a merge cannot drop a key, and the `replaceAdapterConfig`
+   * path that can routes through `assertCanManageInstructionsPath` instead.
+   */
   function assertNoAgentInstructionsConfigMutation(
     req: Request,
     adapterConfig: Record<string, unknown> | null | undefined,
     path = "adapterConfig",
+    existingAdapterConfig?: Record<string, unknown> | null,
   ) {
     if (req.actor.type !== "agent" || !adapterConfig) return;
+    const existing = existingAdapterConfig ?? {};
     const changedSensitiveKeys = KNOWN_INSTRUCTIONS_BUNDLE_KEYS
-      .filter((key) => adapterConfig[key] !== undefined)
+      .filter((key) => adapterConfig[key] !== undefined
+        && JSON.stringify(adapterConfig[key]) !== JSON.stringify(existing[key]))
       .map((key) => `${path}.${key}`);
     if (changedSensitiveKeys.length === 0) return;
     throw forbidden(
@@ -1969,7 +2000,12 @@ export function agentRoutes(
       effectiveAdapterConfig?: Record<string, unknown> | null;
     },
   ) {
-    assertNoAgentInstructionsConfigMutation(req, adapterConfig, path);
+    assertNoAgentInstructionsConfigMutation(
+      req,
+      adapterConfig,
+      path,
+      options?.existingAdapterConfig ?? null,
+    );
     assertNoAgentSecretBindingMutation(
       req,
       options?.effectiveAdapterConfig ?? adapterConfig,
@@ -3819,6 +3855,39 @@ export function agentRoutes(
         existingAdapterConfig,
       });
       patchData.adapterConfig = syncInstructionsBundleConfigFromFilePath(existing, normalizedEffectiveAdapterConfig);
+      // The sync above re-derives the bundle keys from `instructionsFilePath`,
+      // resolving a relative one against `adapterConfig.cwd`. `cwd` is not an
+      // instructions key and has no agent-actor guard, so the check before the
+      // sync passes on a body naming only `cwd` — every instructions value is
+      // byte-identical to stored at that point — and the sync then relocates
+      // the bundle. Re-check what is actually written.
+      //
+      // The baseline is the stored config put through the same sync, not the
+      // stored row: for a legacy relative `instructionsFilePath` the sync
+      // rewrites the keys on every write, so diffing against the raw row would
+      // refuse writes that move nothing — the BLO-32332 bug again, one step
+      // later. Comparing sync(stored) with sync(next) asks only whether this
+      // write moved the bundle.
+      //
+      // Gated on the actor here rather than relying on the guard's own
+      // `actor.type !== "agent"` early return: that return is inside the
+      // function body, so argument evaluation precedes it, and this baseline
+      // syncs the *stored* config. A stored legacy relative
+      // `instructionsFilePath` with no absolute `cwd` throws 422 in
+      // `resolveLegacyInstructionsPath` — a shape `svc.create`/hire persist
+      // unvalidated — so evaluating it for every actor would refuse the
+      // human/board write that repairs it by supplying the missing `cwd`.
+      // An agent sending that same write still fails, on the 422 rather than
+      // a 403: the refusal is right (it relocates the bundle), the status
+      // is not.
+      if (req.actor.type === "agent") {
+        assertNoAgentInstructionsConfigMutation(
+          req,
+          asRecord(patchData.adapterConfig),
+          "adapterConfig",
+          syncInstructionsBundleConfigFromFilePath(existing, existingAdapterConfig),
+        );
+      }
       // PATCH writes `adapterConfig` straight through to the service, so it was
       // the one skill-writing route with no skill validation at all — hire and
       // create already resolve strictly, and skills/sync at least resolves. That
@@ -5202,11 +5271,15 @@ export function agentRoutes(
       );
     }
 
-    await logRunLogAccessAudit(req, run, "allowed", { offset: normalizedOffset, limitBytes });
+    // BLO-34738: audit AFTER `readLog` returns. It throws `notFound("Run log not found")` when the
+    // run stored no log (`services/heartbeat.ts`), and a 404 that disclosed nothing is not a read —
+    // auditing first booked `result: "allowed"` against it, so "who read this log" over-reported.
+    // Denied-path audits stay before the response: those record an attempt, which did happen.
     const result = await heartbeat.readLog(run, {
       offset: normalizedOffset,
       limitBytes,
     });
+    await logRunLogAccessAudit(req, run, "allowed", { offset: normalizedOffset, limitBytes });
 
     res.set("Cache-Control", "no-cache, no-store");
     res.json(result);
@@ -5299,11 +5372,18 @@ export function agentRoutes(
     // only the entitlement knows that. Resolved after the two denial paths, so a caller who never
     // clears company access costs no entitlement lookup.
     const viewer = await resolveWorkspaceRuntimeViewer(access, req, operation.companyId);
-    await audit("allowed", !viewer.revealRuntimeConfig);
+    // BLO-34738: then `readLog`, and only then the audit. It throws
+    // `notFound("Workspace operation log not found")` when the operation stored no log
+    // (`services/workspace-operations.ts`), so auditing first booked `result: "allowed",
+    // withheld: true` against a 404 that disclosed nothing — inaccurate on exactly the flag
+    // BLO-34631 added for audit accuracy. Same ordering as `/heartbeat-runs/:runId/log`
+    // deliberately: the two are one URL apart, and a split audit semantic across them is the
+    // failure mode this series exists to close.
     const result = await workspaceOperations.readLog(operationId, {
       offset: normalizedOffset,
       limitBytes,
     });
+    await audit("allowed", !viewer.revealRuntimeConfig);
 
     res.set("Cache-Control", "no-cache, no-store");
     // BLO-34631. `content` is the stored chunk verbatim — the write-time sanitizer is a heuristic

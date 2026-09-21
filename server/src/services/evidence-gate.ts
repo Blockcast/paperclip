@@ -51,6 +51,40 @@ export interface EvaluateEvidenceInput {
   allowedPrRepos?: readonly string[];
   /** Caller-derived history signal: a prior description had Done-when bullets, current does not. */
   doneWhenBulletsRemoved?: boolean;
+  /**
+   * Detections computed outside this pure evaluator — in practice the GitHub
+   * truth probe (`evidence-truth.ts`). `true` ADDS a detection; `false` and
+   * `undefined` are ignored on purpose. A probe that cannot reach GitHub must
+   * never be able to subtract evidence the text detectors genuinely found,
+   * because that turns an outage into a block on correct work.
+   */
+  externalDetections?: Partial<Record<EvidenceShape, boolean>>;
+  /** True when the probe could not establish truth (GitHub error, deadline, cap). Suppresses escalation to block. */
+  probeFailed?: boolean;
+  /**
+   * True when the probe found NO linked pull request. A third state, not a
+   * flavour of `probeFailed` — the probe worked and the answer is "there is
+   * nothing to review".
+   *
+   * Passed as a boolean rather than derived here from `workProducts`, and
+   * rather than string-matched out of the probe's diagnostics. Deriving it
+   * would duplicate `prRefsFromWorkProducts`' free-text (D5) and sourceTrust
+   * rules in a second place; string-matching would rot the moment someone
+   * rewords a diagnostic.
+   */
+  noLinkedPullRequest?: boolean;
+  /**
+   * Wired from loadConfig().evidenceGateUnlabeledTruthBlock. Default off.
+   *
+   * NAME IS NARROWER THAN THE BEHAVIOUR: the env var is
+   * `PAPERCLIP_EVIDENCE_UNLABELED_BLOCK`, but the escalation applies to any
+   * truth-only gap, labeled or unlabeled. Kept as-is rather than renamed — the
+   * name is load-bearing in the Helm chart, the rollout runbook and the
+   * measurement baseline, and a rename buys nothing behavioural.
+   *
+   * It governs `review:ally-clean` ONLY. See BLOCKABLE_TRUTH_SHAPES.
+   */
+  unlabeledTruthBlock?: boolean;
 }
 
 export interface EvaluateEvidenceResult {
@@ -90,7 +124,38 @@ const ALL_SHAPES: readonly EvidenceShape[] = [
   "e2e-script",
   "e2e-run",
   "migration-output",
+  "review:ally-clean",
+  "deploy:landed",
 ] as const;
+
+/**
+ * The shapes no comment text can produce. They are set only through
+ * `externalDetections`, from a probe that reads GitHub — so an agent cannot
+ * satisfy them by writing about its own work. `unlabeledTruthBlock` only ever
+ * escalates a gap that is *entirely* within this set.
+ */
+export const TRUTH_SHAPES: readonly EvidenceShape[] = ["review:ally-clean", "deploy:landed"];
+
+/**
+ * The subset of `TRUTH_SHAPES` the operator flag may make binding.
+ *
+ * `deploy:landed` is deliberately NOT here, and no flag value may add it. The
+ * gate runs on exactly one transition — INTO `in_review` (doc/EVIDENCE_GATE.md
+ * L3/L15) — and `deploy:landed` means merged. `in_review` is the state a PR
+ * occupies BEFORE it merges, so the shape is unsatisfiable at the only moment
+ * it would ever be evaluated. Making it binding does not raise the bar, it
+ * makes the transition unreachable.
+ *
+ * `review:ally-clean` is a different kind of shape despite sitting next to it
+ * in the registry: an OPEN PR can be at head with 0 Critical / 0 Important, so
+ * it is satisfiable exactly when the gate fires. That asymmetry is the whole
+ * reason this list exists rather than the flag simply reading `TRUTH_SHAPES`.
+ *
+ * A flag can defer an inconvenience; it cannot defer an impossibility. Gating
+ * `deploy:landed` behind `unlabeledTruthBlock` would not make it safe — it
+ * would schedule the deadlock for whoever flips the flag.
+ */
+export const BLOCKABLE_TRUTH_SHAPES: readonly EvidenceShape[] = ["review:ally-clean"];
 
 /**
  * Compute the required-shape set for an issue by unioning the registry
@@ -589,6 +654,10 @@ function detectAll(input: {
     "e2e-script": detectE2eScript(text, workProducts),
     "e2e-run": detectE2eRun(workProducts, text),
     "migration-output": detectMigrationOutput(text),
+    // Not derivable from text by design — see TRUTH_SHAPES. Set only by the
+    // caller merging `externalDetections` after this returns.
+    "review:ally-clean": false,
+    "deploy:landed": false,
   };
   const found = ALL_SHAPES.filter((s) => detections[s]);
   return { detections, found };
@@ -617,7 +686,47 @@ export function evaluateEvidence(
   const text = buildAgentEvidenceText(input.comments, limit);
   const resolved = resolveRequiredShapes(input.issue, input.registry);
   const { unlabeledFallback } = resolved;
-  const required = resolved.required;
+
+  // A truth shape is computed against a PR head. On the UNLABELED fallback with
+  // no linked PR, there is no head and never will be, so no truth shape is
+  // REQUIRED — the same demotion `deploy:landed` got for being unsatisfiable at
+  // the moment it is evaluated (evidence-shapes.ts).
+  //
+  // Suppressing only the escalation (below) fixed the BLOCK hazard and left the
+  // METRIC one: `missing` still carried the shape, so the verdict stayed a
+  // permanent `warn`, and `reviewPassRate` (`agent-scorecards.ts`, where warn
+  // and block are both not-pass) was depressed for work no agent behaviour
+  // could change. Inverted, not degraded — same diagnosis as `deploy:landed`.
+  //
+  // Scoped to the unlabeled fallback ON PURPOSE, and the line is satisfiability,
+  // not blast radius:
+  //   - Unlabeled is the doc-only / refactor population (see
+  //     DEFAULT_UNLABELED_REQUIRED). There is no code to open a PR for, so the
+  //     shape is unsatisfiable FOREVER and must not be binding.
+  //   - A LABELED code issue with no linked PR keeps the shape required. Its
+  //     assignee CAN satisfy it — open a PR and let the webhook link it — so it
+  //     is a real gap, and it stays a `warn` via `truth-gap-warn-only` with the
+  //     escalation suppressed by `noLinkedPullRequest` below. Dropping it there
+  //     would let `landing-artifact`-via-commit-link reach `pass` with no review
+  //     at all, which is the hole the truth shapes exist to close.
+  //
+  // `probeFailed` deliberately gets NO drop: a probe that could not reach GitHub
+  // has not established that there is no PR. The shape stays required and only
+  // the escalation is suppressed, so an outage can never launder a gap into a
+  // `pass`.
+  //
+  // Can only move a verdict warn -> pass; it shrinks `required` and never grows
+  // it. A mixed gap is untouched.
+  const prLessUnlabeledTruthDrop =
+    unlabeledFallback &&
+    input.noLinkedPullRequest === true &&
+    resolved.required.some((s) => TRUTH_SHAPES.includes(s));
+  const required = prLessUnlabeledTruthDrop
+    ? resolved.required.filter((s) => !TRUTH_SHAPES.includes(s))
+    : resolved.required;
+  if (prLessUnlabeledTruthDrop) {
+    diagnostics.push("truth-shapes-not-required:no-linked-pull-request");
+  }
 
   const doneWhenApplicable =
     !!input.issue.description && countDoneWhenBullets(input.issue.description) > 0;
@@ -642,12 +751,19 @@ export function evaluateEvidence(
     diagnostics.push("unmatched-labels-used-fallback");
   }
 
-  const { detections, found } = detectAll({
+  const { detections } = detectAll({
     issueDescription: input.issue.description,
     text,
     workProducts: input.workProducts,
     allowedPrRepos: input.allowedPrRepos,
   });
+
+  // Additive only. See `externalDetections` on the input type for why a `false`
+  // is ignored rather than clearing the text detector's finding.
+  for (const [shape, hit] of Object.entries(input.externalDetections ?? {})) {
+    if (hit === true && shape in detections) detections[shape as EvidenceShape] = true;
+  }
+  const foundAll = ALL_SHAPES.filter((s) => detections[s]);
 
   const missing = required.filter((s) => !detections[s]);
   const requiredFound = required.filter((s) => detections[s]);
@@ -662,12 +778,87 @@ export function evaluateEvidence(
     verdict = "block";
   }
 
+  // The unlabeled fallback warns rather than blocks so the gate is not a chore
+  // for refactor/doc issues.
+  //
+  // A gap made ENTIRELY of truth shapes is treated the same way, and
+  // deliberately so on LABELED issues too. `deploy:landed` means merged, and
+  // `in_review` is the state where work waits FOR review — so requiring it to
+  // ENTER in_review would deadlock the normal flow for every code-completion
+  // label (the gate throws 422 on a block at that transition). It is the same
+  // reasoning that excludes the `pr` label in evidence-shapes.ts: an open PR
+  // awaiting a decision cannot also be a merged one.
+  //
+  // So the shapes are recorded and measurable from day one, and only the
+  // operator flag makes them binding — which is the measurement-first posture
+  // the rollout runbook depends on. Without this, the risky half of the change
+  // would ship ungated while the safe half shipped behind a flag.
+  //
+  // A MIXED gap is untouched: a labeled issue missing its screenshots still
+  // blocks on the screenshots, exactly as before.
+  const truthOnlyGap = missing.length > 0 && missing.every((s) => TRUTH_SHAPES.includes(s));
+  if (verdict === "block" && truthOnlyGap) {
+    verdict = "warn";
+    diagnostics.push("truth-gap-warn-only");
+  }
+
+  // A failed probe suppresses the escalation outright. "The probe could not
+  // reach GitHub" and "GitHub says this was never reviewed" are the same
+  // `missing` list, and blocking on the first would make every GitHub outage
+  // an estate-wide in_review freeze.
+  //
+  // So does a PR-less issue, for a stronger reason (CTO ruling 2026-09-16).
+  // `review:ally-clean` needs a head to review; with no linked PR there is no
+  // head, so the shape is unsatisfiable by the assignee FOREVER — not merely
+  // at this transition, as with `deploy:landed`. An AC an assignee cannot
+  // satisfy is a stall amplifier, not a gate. If we ever want "code work must
+  // have a PR", that is an explicit requirement on a labeled path — not a side
+  // effect of an absent probe result.
+  //
+  // The population reaching this arm is now LABELED-only: on the unlabeled
+  // fallback the shape is dropped from `required` outright (see
+  // `prLessUnlabeledTruthDrop` above), so its gap is empty and `truthOnlyGap` is
+  // false before we get here. Both defenses are live and neither is dead code —
+  // they cover disjoint populations, and the split is satisfiability: the
+  // labeled assignee can open a PR, the doc-only one cannot.
+  //
+  // The gap must also contain a shape the flag is ALLOWED to bind — see
+  // BLOCKABLE_TRUTH_SHAPES. A gap of only `deploy:landed` stays a warn at every
+  // flag setting: it is informational by construction, feeding the scorecards
+  // and the rollout measurement without ever gating the transition.
+  //
+  // Since `deploy:landed` is required NOWHERE in DEFAULT_EVIDENCE_REGISTRY or
+  // DEFAULT_UNLABELED_REQUIRED, it can never enter `missing` on a shipped path,
+  // so `blockableGap` is vacuously true there — belt-and-braces, not dead. It is
+  // still reachable through a custom `registry` that requires the shape, and one
+  // test drives exactly that: it is what pins the flag's scope to
+  // BLOCKABLE_TRUTH_SHAPES independently of the registry decision, so the two
+  // can never silently collapse into one.
+  const blockableGap = missing.some((s) => BLOCKABLE_TRUTH_SHAPES.includes(s));
+  if (verdict === "warn" && input.unlabeledTruthBlock === true && truthOnlyGap && blockableGap) {
+    // Distinct reasons stay distinct in the verdict: the runbook's seven-day
+    // measurement reads these apart to separate a GitHub outage from work that
+    // can never satisfy the shape.
+    const suppress =
+      input.probeFailed === true
+        ? "probe-failed"
+        : input.noLinkedPullRequest === true
+          ? "no-linked-pull-request"
+          : null;
+    if (suppress !== null) {
+      diagnostics.push(`unlabeled-truth-block-suppressed:${suppress}`);
+    } else {
+      verdict = "block";
+      diagnostics.push("unlabeled-truth-block");
+    }
+  }
+
   return {
     verdict,
     missing,
     evidenceFound: requiredFound,
     requiredFound,
-    allDetected: found,
+    allDetected: foundAll,
     shapeDetections: detections,
     unlabeledFallback,
     diagnostics,

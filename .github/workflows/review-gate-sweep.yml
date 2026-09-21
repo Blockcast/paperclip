@@ -37,25 +37,71 @@ on:
   schedule:
     # Hourly, NOT every 30 minutes, and that is a rate-limit decision.
     #
-    # In status-free mode each non-draft PR costs 3 requests (head commit +
-    # comments page + reviews page). Measured 2026-08-21 on this repo: 147
-    # open PRs, 119 non-draft and unlocked -> ~359 requests per run. At
-    # `9,39` that is ~718/hour from this job alone, against `github.token`'s
-    # documented 1,000/hour/repository budget shared with the 26 other
-    # workflows here -- exhaustion would be the steady state, not an edge
-    # case. Hourly halves it to ~359/hour and leaves real headroom.
+    # In status-free mode each non-draft PR costs at least 3 requests (head
+    # commit + comments page + reviews page; `_fetch_paginated` issues one
+    # more per extra page, so a long thread costs more). Every request
+    # figure below counts one page each, which understates the uncut
+    # baseline and the saving alike -- the percentages survive, the absolute
+    # counts are floors. Measured 2026-08-21 on this repo: 147 open PRs, 119
+    # non-draft and unlocked -> ~359 requests per run. At `9,39` that is
+    # ~718/hour from this job alone, against `github.token`'s documented
+    # 1,000/hour/repository budget shared with the 26 other workflows here
+    # -- exhaustion would be the steady state, not an edge case. Hourly
+    # halves it to ~359/hour and leaves real headroom.
     #
-    # The cheap predicate-level cut (skipping PRs younger than the stall
-    # threshold, which cannot be stranded) was measured too and saves only
-    # 3 of those 359 calls on this repo -- almost every open PR here is
-    # older than 90 minutes. It is kept because it is free and correct, but
-    # cadence is the lever that actually moves the number.
+    # The cheap predicate-level cut (skipping PRs that cannot be stranded)
+    # scales with STALL_THRESHOLD_SECONDS, so BLO-34521's 90m -> 18h move
+    # changed it roughly sevenfold. It runs in TWO stages, and conflating
+    # them is how this paragraph has been wrong before:
     #
-    # ALARM_THRESHOLD_SECONDS is raised to 5.5h in the script to absorb the
-    # coarser polling granularity -- see the comment on that constant. Off
-    # the hour to avoid clustering with every other cron in the org, and
-    # offset from trafficcontrol (7,37) and pim-multicast-gateway (8,38) so
-    # the repos' sweeps do not fire their re-requests at Ally at once.
+    #   stage 1  too_young_to_be_stranded -- tests `created_at` ALONE, from
+    #            the list payload, so it saves all 3 requests. It cannot use
+    #            `committer_date`: the soundness proof needs only
+    #            `pending_since >= created_at`, and reading the committer
+    #            date would cost the very head-commit request being avoided.
+    #   stage 2  _consider_pr's `(now - pending_since) < STALL` early return
+    #            -- the head commit has now been fetched, so this tests the
+    #            real max(created_at, committer_date) and catches the old PR
+    #            pushed an hour ago. It saves the remaining 2 requests.
+    #
+    # EVERY FIGURE BELOW IS ONE SNAPSHOT, 2026-09-19T22:26Z: 111 open PRs,
+    # 105 non-draft and unlocked -> ~315 requests per run uncut.
+    #
+    #     threshold | stage 1 (x3) | stage 2 (x2) | total saved
+    #         90m   |  1 PR -> ~3  |  4 PRs -> ~8 |  ~11  (~3%)
+    #          8h   |  4 PRs -> 12 |  5 PRs -> 10 |  ~22  (~7%)
+    #         18h   |  9 PRs -> 27 | 24 PRs -> 48 |  ~75  (~24%)
+    #
+    # Deliberately one snapshot rather than the best figure for each line:
+    # every prior revision of this paragraph quoted numbers from two
+    # different measurement moments, and every one of them ended up with a
+    # figure a sibling figure contradicted -- three revisions running. Numbers
+    # from one population cannot disagree with each other. Re-measure the
+    # whole table or none of it.
+    #
+    # Read the stage columns as a pair, never the `younger` PR counts alone:
+    # 33 PRs are under 18h by `pending_since`, but only 9 of them are cut for
+    # free. Quoting 33 x 3 = ~99 (~31%) as the saving -- which this paragraph
+    # did until BLO-34521 -- charges stage 2 nothing for the head-commit
+    # request it must issue to decide. Quoting stage 1 alone (~27, ~9%)
+    # makes the opposite error and discards two thirds of what ships.
+    # Re-derive rather than inherit: every figure here tracks
+    # STALL_THRESHOLD_SECONDS and the open-PR backlog, which is why the
+    # 2026-08-21 pair above no longer reproduces.
+    #
+    # Cadence is still the larger lever (hourly vs `9,39` is worth ~315/hour
+    # against a 1,000/hour budget), but at ~24% the cut is not rounding
+    # error either.
+    #
+    # ALARM_THRESHOLD_SECONDS derives as STALL + COOLDOWN + 2h in the script,
+    # to absorb the coarser polling granularity. Deliberately no figure here:
+    # this line has gone stale against STALL twice, once per revision of
+    # BLO-34521, so read the constant rather than a copy of it.
+    #
+    # Off the hour to avoid clustering with every other cron in
+    # the org, and offset from trafficcontrol (7,37) and
+    # pim-multicast-gateway (8,38) so the repos' sweeps do not fire their
+    # re-requests at Ally at once.
     - cron: '9 * * * *'
   workflow_dispatch: {}
 
