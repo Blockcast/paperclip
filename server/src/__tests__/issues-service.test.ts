@@ -11175,6 +11175,72 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
     });
   });
 
+  // BLO-28441: a run the server has already marked terminal keeps executing for
+  // ~10 minutes and its comments still succeed, so it publishes analysis derived
+  // from a state the server considers dead. The guard's refusal is correct; what
+  // was missing was any way for the caller to learn the refusal is about ITSELF.
+  //
+  // Note this lands in the no-holder branch on purpose: the ladder releases the
+  // dead holder's lock in the same call, so both lock columns read null and the
+  // pre-BLO-28441 remediation told a run that can never succeed to "retry once".
+  it("names the actor's own terminal run status in the ownership 409", async () => {
+    const seeded = await seedOwnershipIssue({ checkoutStatus: "failed", actorRunStatus: "succeeded" });
+
+    await expect(
+      svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId),
+    ).rejects.toMatchObject({
+      status: 409,
+      details: {
+        actorRunId: seeded.actorRunId,
+        actorRunStatus: "succeeded",
+      },
+    });
+
+    const err = await svc
+      .assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId)
+      .then(() => null, (caught) => caught as { details?: Record<string, unknown> });
+    // The caller must be able to act on this without further investigation, so
+    // the hoisted remediation has to blame the caller's run, not the holder.
+    expect(String(err?.details?.remediation)).toContain(seeded.actorRunId);
+    expect(String(err?.details?.remediation)).toContain("succeeded");
+  });
+
+  it("reports the actor's run status without weakening the live-holder fence", async () => {
+    // The adversarial twin: both runs genuinely live. The guard's DECISION must
+    // be byte-identical to before — this is an observability change only, and a
+    // widened guard would let a run the server declared dead seize a lock.
+    const seeded = await seedOwnershipIssue({ checkoutStatus: "running", actorRunStatus: "running" });
+
+    await expect(
+      svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId),
+    ).rejects.toMatchObject({
+      status: 409,
+      details: {
+        // Existing payload preserved: the BLOCKING run id must remain present.
+        checkoutRunId: seeded.staleRunId,
+        executionRunId: seeded.staleRunId,
+        actorRunId: seeded.actorRunId,
+        // A live actor is reported as live, and must NOT be told to stop working.
+        actorRunStatus: "running",
+        holderLiveness: "live",
+      },
+    });
+
+    // The live holder still owns the row: nothing was adopted or released.
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, seeded.issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      checkoutRunId: seeded.staleRunId,
+      executionRunId: seeded.staleRunId,
+    });
+  });
+
   it("adopts unowned checkout after a concurrent stale-checkout clear wins the lock race", async () => {
     const seeded = await seedOwnershipIssue({ checkoutStatus: "failed" });
     await db
