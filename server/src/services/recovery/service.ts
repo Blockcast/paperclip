@@ -12400,80 +12400,88 @@ export function recoveryService(
       result.actionIds.push(action.id);
       result.issueIds.push(action.sourceIssueId);
 
-      // PEN-3000: `attemptCount` counts wakes that REACHED THE QUEUE, not sweeps — every
-      // sweep reserves +1 and refunds it when `enqueueWakeup` returned null, so the counter
-      // freezes at the delivered count. It also restarts on owner change (`isNewOwnerSequence`
-      // in `upsertSourceScopedUnlocked`), so 0 means no wake was delivered to the CURRENT
-      // owner since it took over — not necessarily across the row's whole life. Within that
-      // scope it is a wake-channel fault rather than an owner who was woken and did not
-      // converge; those are different incidents with different responders and they render
-      // identically without this split. Not gated on `previousOwnerAgentId`: the stranded
-      // sweep writes it from the issue's assignee on the first insert (see `upsertSourceScoped`
-      // call above), so it is non-null on the un-churned rows this label exists to catch.
-      const neverDelivered = action.attemptCount === 0;
-      if (neverDelivered) result.neverDelivered += 1;
-      recordRecoveryHorizonExpired(neverDelivered ? "never_delivered" : "delivered");
-
-      // BLO-19124: only asked on the `neverDelivered` branch, because that is the only notice
-      // arm that claims the stranding went unworked — the delivered arm makes no such claim,
-      // so buying this row would be a query per sweep for nothing.
-      //
-      // "Since the action opened" is deliberately an OVERLAP test, not a containment one:
-      // `hasSuccessfulIssueRunSince` matches `createdAt >= since OR finishedAt >= since`, so a
-      // run that started before this action and finished inside its window counts. That is the
-      // meaning the notice needs — such a run WAS working the issue during the horizon.
-      //
-      // `hasActiveExecutionPath`, the guard the sibling decision points in this subsystem use,
-      // is the wrong instrument here: it asks whether a run is in flight RIGHT NOW and would
-      // have missed all three BLO-19124 runs, every one of which had finished before the sweep
-      // read the row.
-      // `createdAt` is `string | Date` on the read model — the driver hands back a Date, but
-      // the type is widened, so normalise rather than relying on the runtime shape.
-      const neverDeliveredButWorked = neverDelivered
-        && await hasSuccessfulIssueRunSince(
-          action.companyId,
-          action.sourceIssueId,
-          new Date(action.createdAt),
-        );
-      if (neverDeliveredButWorked) result.neverDeliveredButWorked += 1;
-
-      logger.warn(
-        {
-          actionId: action.id,
-          companyId: action.companyId,
-          sourceIssueId: action.sourceIssueId,
-          cause: action.cause,
-          ownerAgentId: action.ownerAgentId,
-          attemptCount: action.attemptCount,
-          maxAttempts: action.maxAttempts,
-          neverDelivered,
-          neverDeliveredButWorked,
-          timeoutAt: action.timeoutAt,
-          runId: opts?.runId ?? null,
-        },
-        "recovery action passed its wake horizon and was escalated out of active",
-      );
-
-      // Same marker text and the same exact-match dedup as the notice in
-      // `escalateStrandedAssignedIssue`, so whichever path gets there first wins and the
-      // other stays quiet — the operator sees one horizon notice per action, not two.
-      const horizonAt = action.timeoutAt instanceof Date
-        ? action.timeoutAt.toISOString()
-        : String(action.timeoutAt);
-      const marker = `Recovery wake horizon reached for action \`${action.id}\` (horizon \`${horizonAt}\`)`;
-      const alreadyAnnounced = await db
-        .select({ id: issueComments.id })
-        .from(issueComments)
-        .where(and(
-          eq(issueComments.issueId, action.sourceIssueId),
-          eq(issueComments.authorType, "system"),
-          sql`${issueComments.body} LIKE ${`%${escapeLikePattern(marker)}%`} ESCAPE '\\'`,
-        ))
-        .limit(1)
-        .then((rows) => rows.length > 0);
-      if (alreadyAnnounced) continue;
-
+      // BLO-19124: the WHOLE per-row body is inside this try, not just the comment write.
+      // `escalateExpiredWakeHorizons` flipped the entire batch to `escalated` in one UPDATE
+      // above and only ever selects `status = "active"` rows, so a row this loop drops is
+      // never re-selected and its notice is lost for good. Both reads below hit the database
+      // — a connection blip or a statement timeout on either used to abort the sweep and
+      // silently strand every remaining row in the batch (default limit 200), which is the
+      // BLO-24662 shape this pass exists to end. The status transition is the load-bearing
+      // half and is already committed; nothing here may roll it back or abort the rest.
       try {
+        // PEN-3000: `attemptCount` counts wakes that REACHED THE QUEUE, not sweeps — every
+        // sweep reserves +1 and refunds it when `enqueueWakeup` returned null, so the counter
+        // freezes at the delivered count. It also restarts on owner change (`isNewOwnerSequence`
+        // in `upsertSourceScopedUnlocked`), so 0 means no wake was delivered to the CURRENT
+        // owner since it took over — not necessarily across the row's whole life. Within that
+        // scope it is a wake-channel fault rather than an owner who was woken and did not
+        // converge; those are different incidents with different responders and they render
+        // identically without this split. Not gated on `previousOwnerAgentId`: the stranded
+        // sweep writes it from the issue's assignee on the first insert (see `upsertSourceScoped`
+        // call above), so it is non-null on the un-churned rows this label exists to catch.
+        const neverDelivered = action.attemptCount === 0;
+        if (neverDelivered) result.neverDelivered += 1;
+        recordRecoveryHorizonExpired(neverDelivered ? "never_delivered" : "delivered");
+
+        // BLO-19124: only asked on the `neverDelivered` branch, because that is the only notice
+        // arm that claims the stranding went unworked — the delivered arm makes no such claim,
+        // so buying this row would be a query per sweep for nothing.
+        //
+        // "Since the action opened" is deliberately an OVERLAP test, not a containment one:
+        // `hasSuccessfulIssueRunSince` matches `createdAt >= since OR finishedAt >= since`, so a
+        // run that started before this action and finished inside its window counts. That is the
+        // meaning the notice needs — such a run WAS working the issue during the horizon.
+        //
+        // `hasActiveExecutionPath`, the guard the sibling decision points in this subsystem use,
+        // is the wrong instrument here: it asks whether a run is in flight RIGHT NOW and would
+        // have missed all three BLO-19124 runs, every one of which had finished before the sweep
+        // read the row.
+        // `createdAt` is `string | Date` on the read model — the driver hands back a Date, but
+        // the type is widened, so normalise rather than relying on the runtime shape.
+        const neverDeliveredButWorked = neverDelivered
+          && await hasSuccessfulIssueRunSince(
+            action.companyId,
+            action.sourceIssueId,
+            new Date(action.createdAt),
+          );
+        if (neverDeliveredButWorked) result.neverDeliveredButWorked += 1;
+
+        logger.warn(
+          {
+            actionId: action.id,
+            companyId: action.companyId,
+            sourceIssueId: action.sourceIssueId,
+            cause: action.cause,
+            ownerAgentId: action.ownerAgentId,
+            attemptCount: action.attemptCount,
+            maxAttempts: action.maxAttempts,
+            neverDelivered,
+            neverDeliveredButWorked,
+            timeoutAt: action.timeoutAt,
+            runId: opts?.runId ?? null,
+          },
+          "recovery action passed its wake horizon and was escalated out of active",
+        );
+
+        // Same marker text and the same exact-match dedup as the notice in
+        // `escalateStrandedAssignedIssue`, so whichever path gets there first wins and the
+        // other stays quiet — the operator sees one horizon notice per action, not two.
+        const horizonAt = action.timeoutAt instanceof Date
+          ? action.timeoutAt.toISOString()
+          : String(action.timeoutAt);
+        const marker = `Recovery wake horizon reached for action \`${action.id}\` (horizon \`${horizonAt}\`)`;
+        const alreadyAnnounced = await db
+          .select({ id: issueComments.id })
+          .from(issueComments)
+          .where(and(
+            eq(issueComments.issueId, action.sourceIssueId),
+            eq(issueComments.authorType, "system"),
+            sql`${issueComments.body} LIKE ${`%${escapeLikePattern(marker)}%`} ESCAPE '\\'`,
+          ))
+          .limit(1)
+          .then((rows) => rows.length > 0);
+        if (alreadyAnnounced) continue;
+
         await issuesSvc.addComment(
           action.sourceIssueId,
           [
@@ -12516,8 +12524,6 @@ export function recoveryService(
         );
         result.announced += 1;
       } catch (error) {
-        // The status transition is the load-bearing half and is already committed; a failed
-        // comment must not roll it back or abort the rest of the batch.
         logger.warn(
           { err: error, actionId: action.id, sourceIssueId: action.sourceIssueId },
           "failed to announce recovery wake horizon expiry on source issue",

@@ -97,7 +97,7 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
       identifier: `${prefix}-20995`,
     });
 
-    return { companyId, ownerAgentId, sourceIssueId };
+    return { companyId, ownerAgentId, sourceIssueId, prefix };
   }
 
   async function insertAction(
@@ -568,5 +568,91 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
     expect(reused!.status).toBe("escalated");
     expect(new Date(reused!.timeoutAt!).toISOString()).toBe(pastHorizon.toISOString());
     expect(await db.select().from(issueRecoveryActions)).toHaveLength(1);
+    // Ally suggestion 3 on 36bd9d6b: assert the budget directly rather than inferring it from
+    // the preserved horizon. The reuse path sets `attemptCount: existing.attemptCount + 1`
+    // (`issue-recovery-actions.ts:575`), so 1 here is positive proof of reuse — a fresh INSERT
+    // would read 0. This complements the slot test at `:351` (which checks the status set) and
+    // is not a duplicate of it: that one pins WHICH statuses hold the slot, this one pins the
+    // consequence for the budget.
+    expect(reused!.attemptCount).toBe(1);
+  });
+
+  /**
+   * Ally's review of #1950 at `36bd9d6b`: both database reads in the per-row body sat OUTSIDE
+   * the try, on a path where the announcement is a once-only opportunity.
+   * `escalateExpiredWakeHorizons` flips the whole batch to `escalated` in a single UPDATE and
+   * only ever selects `status = "active"` rows, so a row whose notice is skipped is never
+   * re-selected by a later sweep. One connection blip or statement timeout therefore aborted
+   * the sweep and permanently dropped the notice for every remaining row in the batch (default
+   * limit 200) — each already silently moved out of `active`. That is the BLO-24662 silent
+   * strand this pass exists to end, arriving through the pass itself.
+   */
+  function dbWithFailingIssueRunLookup(real: typeof db, failures: { remaining: number }) {
+    const bind = (target: object, prop: string | symbol) => {
+      const value = Reflect.get(target, prop);
+      return typeof value === "function" ? value.bind(target) : value;
+    };
+    return new Proxy(real, {
+      get(target, prop) {
+        if (prop !== "select") return bind(target, prop);
+        return (...args: unknown[]) => {
+          const builder = (target.select as (...a: unknown[]) => object)(...args);
+          return new Proxy(builder, {
+            get(b, p) {
+              if (p !== "from") return bind(b, p);
+              return (table: unknown) => {
+                // Only the run lookup — the batch UPDATE and the dedup select read other tables.
+                if (table === heartbeatRuns && failures.remaining > 0) {
+                  failures.remaining -= 1;
+                  throw new Error("simulated connection blip on the issue-run lookup");
+                }
+                return (bind(b, "from") as (t: unknown) => unknown)(table);
+              };
+            },
+          });
+        };
+      },
+    }) as typeof db;
+  }
+
+  it("announces the rest of the batch when one row's issue-run lookup throws", async () => {
+    const seeded = await seed();
+    const secondIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: secondIssueId,
+      companyId: seeded.companyId,
+      title: "second stranded issue in the same sweep batch",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId: seeded.ownerAgentId,
+      issueNumber: 20996,
+      identifier: `${seeded.prefix}-20996`,
+    });
+    await insertAction(seeded);
+    await insertAction(seeded, {
+      sourceIssueId: secondIssueId,
+      fingerprint: `stranded:${secondIssueId}`,
+    });
+
+    const failures = { remaining: 1 };
+    const recovery = recoveryService(dbWithFailingIssueRunLookup(db, failures), {
+      enqueueWakeup: vi.fn().mockResolvedValue(null),
+    });
+
+    // Before the guard this call REJECTED — the throw escaped the sweep entirely.
+    const result = await recovery.reconcileExpiredRecoveryWakeHorizons({ now });
+
+    // The blip really fired; without this the test would pass on a no-op injection.
+    expect(failures.remaining).toBe(0);
+    // Both rows were retired by the batch UPDATE — that half is committed either way — and
+    // the surviving row still got its notice.
+    expect(result).toMatchObject({ escalated: 2, announced: 1 });
+    const statuses = await db
+      .select({ status: issueRecoveryActions.status })
+      .from(issueRecoveryActions)
+      .then((rows) => rows.map((row) => row.status));
+    expect(statuses).toEqual(["escalated", "escalated"]);
+    const comments = await db.select({ id: issueComments.id }).from(issueComments);
+    expect(comments).toHaveLength(1);
   });
 });
