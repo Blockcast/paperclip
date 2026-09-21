@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { asc, eq } from "drizzle-orm";
+import { asc, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import {
@@ -45,6 +45,7 @@ import {
   ISSUE_LIST_MAX_LIMIT,
   issueService,
   parseExecutiveHoldMarkerTimestamp,
+  recomputeBlockedIssuesStatusIfReady,
 } from "../services/issues.ts";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import {
@@ -5937,8 +5938,8 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
   // for a human-only gate (it does not move on a timer), not an oversight; the cost is that
   // a STALE declaration nobody removed parks the row just as effectively as a live one.
   // Removing the two lines when the gate clears is the declaring agent's job.
-  describe("listWakeableBlockedDependents external wait suppression (BLO-30445)", () => {
-    it("suppresses the blocker-resolved wake for a declared external wait, but not for its undeclared twin", async () => {
+  describe("blocked auto-resume external wait suppression (BLO-30445)", () => {
+    it("suppresses all three non-reconciler auto-resume callers for a declared external wait, but not for its undeclared twin", async () => {
       const companyId = randomUUID();
       const assigneeAgentId = randomUUID();
       await db.insert(companies).values({
@@ -5999,14 +6000,34 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         expect.objectContaining({ id: controlId, assigneeAgentId }),
       ]);
 
-      // The eager recompute reads the same predicate, so the declared row must also still
-      // be `blocked` — a flip to `todo` there would drain the park by the other caller.
-      const declaredAfter = await db
-        .select({ status: issues.status })
+      // Second caller: the periodic resolved-blocker sweep. Read-only like the wake, and a
+      // pure pass-through to the same suppression map, so the fixture above covers it as-is.
+      await expect(
+        svc.listResolvedBlockerDependentsToSweep(companyId, {
+          minBlockerResolvedAge: { milliseconds: 0 },
+        }),
+      ).resolves.toEqual([expect.objectContaining({ id: controlId, assigneeAgentId })]);
+
+      // Third caller, and the only one of the three that MUTATES `status`. It is unreachable
+      // from `svc` — `recomputeBlockedIssuesStatusIfReady` is called only from the route
+      // layer — so it has to be invoked directly or the flip is never exercised at all. Run
+      // it last: it drains the control, which would then drop out of the two reads above.
+      await expect(
+        recomputeBlockedIssuesStatusIfReady(db, companyId, [declaredId, controlId], {
+          triggerPath: "eager_status_recompute",
+        }),
+      ).resolves.toEqual([controlId]);
+
+      const statusesAfter = await db
+        .select({ id: issues.id, status: issues.status })
         .from(issues)
-        .where(eq(issues.id, declaredId))
-        .then((rows) => rows[0]);
-      expect(declaredAfter?.status).toBe("blocked");
+        .where(inArray(issues.id, [declaredId, controlId]));
+      expect(new Map(statusesAfter.map((row) => [row.id, row.status]))).toEqual(
+        new Map([
+          [declaredId, "blocked"],
+          [controlId, "todo"],
+        ]),
+      );
     });
 
     it("resumes the wake once the declaration is removed", async () => {
