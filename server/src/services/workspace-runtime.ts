@@ -4739,10 +4739,23 @@ const WORKTREE_RECLAIM_GIT_TIMEOUT_MS = 30_000;
  * reason to proceed.
  */
 export async function inspectWorktreeReclaimSafety(worktreePath: string): Promise<WorktreeReclaimSafety> {
-  if (!await directoryExists(worktreePath)) {
-    // Nothing materialized: only a registry entry can remain, and removing that
-    // discards no work.
-    return { safe: true, reason: "missing", detail: null };
+  // Deliberately not `directoryExists`, which is `stat().catch(() => false)`:
+  // that collapses EACCES/EIO/ESTALE into "missing" and so returns `safe` for a
+  // tree it never read. Only an errno that *proves* nothing is there counts as
+  // missing; every other failure is unverifiable.
+  try {
+    const stats = await fs.stat(worktreePath);
+    if (!stats.isDirectory()) {
+      return { safe: false, reason: "unverifiable", detail: `${worktreePath} exists but is not a directory` };
+    }
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      // Nothing materialized: only a registry entry can remain, and removing
+      // that discards no work.
+      return { safe: true, reason: "missing", detail: null };
+    }
+    return { safe: false, reason: "unverifiable", detail: `stat failed: ${code ?? String(error)}` };
   }
 
   const git = async (args: string[]): Promise<{ ok: true; out: string } | { ok: false; error: string }> => {

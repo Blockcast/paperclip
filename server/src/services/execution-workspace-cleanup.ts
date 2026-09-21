@@ -118,6 +118,9 @@ export function executionWorkspaceCleanupService(db: Db) {
         projectWorkspaceCwd: projectWorkspaces.cwd,
       })
       .from(executionWorkspaces)
+      // Non-active companies are out of scope on purpose: a suspended or
+      // deleted company's artifacts are evidence until someone decides
+      // otherwise, and that decision is not this sweep's to make.
       .innerJoin(companies, and(
         eq(companies.id, executionWorkspaces.companyId),
         eq(companies.status, "active"),
@@ -162,10 +165,39 @@ export function executionWorkspaceCleanupService(db: Db) {
       logger.warn({ err }, "reconcileExecutionWorkspaceCleanup: idle backfill failed");
     }
 
-    const candidates = await selectEligible(now, limit, opts?.companyId);
+    const candidates = await selectEligible(now, limit, opts?.companyId).catch((err) => {
+      // Non-throwing contract: this sweep is one link in the periodic recovery
+      // chain, and a rejection here skips every downstream pass for the tick —
+      // including the BLO-21995 replay that is the only path back for a review
+      // request that lost its webhook lock. Disk reclamation must not be able
+      // to starve wake recovery.
+      logger.warn({ err }, "reconcileExecutionWorkspaceCleanup: eligible-candidate query failed");
+      return [] as Awaited<ReturnType<typeof selectEligible>>;
+    });
     let collected = 0;
     let skipped = 0;
     let failed = 0;
+
+    /**
+     * Push the stamp out by one grace window rather than clearing it: a tree
+     * that is unreclaimable today is usually collectable once its work is
+     * pushed or its lock is released, and clearing would drop it back to the
+     * backfill's much longer idle window.
+     *
+     * Retained rows stay visible — each logs every window, and
+     * `cleanup_reason like 'retained_%'` is a one-query census of the subset
+     * the collector is choosing not to reclaim.
+     */
+    const deferCandidate = async (id: string, reason: string) => {
+      await db
+        .update(executionWorkspaces)
+        .set({
+          cleanupEligibleAt: new Date(now.getTime() + EXECUTION_WORKSPACE_IDLE_GRACE_MS),
+          cleanupReason: `retained_${reason}`,
+          updatedAt: now,
+        })
+        .where(eq(executionWorkspaces.id, id));
+    };
 
     for (const candidate of candidates) {
       const worktreePath = candidate.providerRef ?? candidate.cwd;
@@ -173,18 +205,7 @@ export function executionWorkspaceCleanupService(db: Db) {
         if (candidate.providerType === "git_worktree" && worktreePath) {
           const safety = await inspectWorktreeReclaimSafety(worktreePath);
           if (!safety.safe) {
-            // Re-check after another grace window rather than clearing the
-            // stamp: a tree that is dirty today is usually collectable once
-            // its work is pushed, and clearing would drop it back to the
-            // backfill's much longer idle window.
-            await db
-              .update(executionWorkspaces)
-              .set({
-                cleanupEligibleAt: new Date(now.getTime() + EXECUTION_WORKSPACE_IDLE_GRACE_MS),
-                cleanupReason: `retained_${safety.reason}`,
-                updatedAt: now,
-              })
-              .where(eq(executionWorkspaces.id, candidate.id));
+            await deferCandidate(candidate.id, safety.reason);
             skipped += 1;
             logger.info(
               {
@@ -218,6 +239,27 @@ export function executionWorkspaceCleanupService(db: Db) {
             : null,
         });
 
+        // Removal is not all-or-nothing and does not throw: an unowned or
+        // foreign-owned registration is *declined* (BLO-19607) and an
+        // unreadable registry is a warning, both leaving the tree on disk with
+        // `cleaned: false`. Archiving on that path would null the stamp, which
+        // `selectEligible` requires, so the row could never be reconsidered —
+        // turning a recoverable leak into a permanent one and logging it as a
+        // success. Archive only on a proven removal.
+        if (!cleanup.cleaned) {
+          await deferCandidate(candidate.id, "uncleaned");
+          skipped += 1;
+          logger.warn(
+            {
+              executionWorkspaceId: candidate.id,
+              worktreePath,
+              warnings: cleanup.warnings,
+            },
+            "reconcileExecutionWorkspaceCleanup: retained worktree still present after cleanup",
+          );
+          continue;
+        }
+
         await db
           .update(executionWorkspaces)
           .set({
@@ -233,7 +275,7 @@ export function executionWorkspaceCleanupService(db: Db) {
           {
             executionWorkspaceId: candidate.id,
             worktreePath,
-            warnings: cleanup?.warnings ?? [],
+            warnings: cleanup.warnings,
           },
           "reconcileExecutionWorkspaceCleanup: collected execution workspace",
         );
