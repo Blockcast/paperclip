@@ -1,4 +1,4 @@
-import { test, expect, request as pwRequest, type APIRequestContext } from "@playwright/test";
+import { test, expect, request as pwRequest, type APIRequestContext, type Page } from "@playwright/test";
 
 /**
  * E2E: Sidebar takeover model (PAP-10695).
@@ -31,6 +31,34 @@ const COLLAPSED_STORAGE_KEY = "paperclip.sidebar.collapsed";
 // the 64px width. Its presence/absence is therefore a stable proxy for the
 // app sidebar's collapsed state (see Sidebar.tsx).
 const APP_SIDEBAR_EXPANDED_MARKER = "Open search";
+
+// `page.goto` resolves on the document `load` event, but the board is a
+// client-rendered SPA: React mounts and paints *after* that. Every assertion in
+// this file reads `Layout`'s output, and `Layout` emits `#main-content` and
+// `[data-secondary-sidebar]` in the same render commit — `hasSecondarySidebar`
+// is derived synchronously from `location.pathname`, with no data dependency —
+// so the secondary pane can never lag the app shell. A missing pane therefore
+// always means "the app has not rendered yet", never "the takeover model broke".
+//
+// Charging that cold-boot latency to the default 5s `expect` budget is what made
+// this file flaky (BLO-33478): on a loaded CI runner, first render after `load`
+// routinely exceeds 5s. Measured on run 35566266808, this spec's tests took
+// 9-17s each where the same tests take 2-3s on an unloaded runner. Waiting for
+// the shell here absorbs boot latency in a precondition with a generous budget
+// and leaves the behavioral assertions on the default 5s, so a genuine takeover
+// regression still fails fast instead of hiding behind a lengthened wait.
+//
+// It also closes a false *positive*: `expect(secondary).toHaveCount(0)` after
+// navigating off a takeover route is satisfied by a blank page, so without this
+// gate those assertions could pass while the app had rendered nothing at all.
+const APP_SHELL_READY_TIMEOUT = 30_000;
+
+async function gotoAppRoute(page: Page, url: string) {
+  await page.goto(url);
+  await expect(page.locator("#main-content")).toBeAttached({
+    timeout: APP_SHELL_READY_TIMEOUT,
+  });
+}
 
 async function createCompany(board: APIRequestContext): Promise<{ id: string; prefix: string }> {
   const healthRes = await board.get("/api/health");
@@ -88,7 +116,7 @@ test.describe("Sidebar takeover (collapse + secondary pane)", () => {
   });
 
   test("collapses the app sidebar to its rail and shows the settings sidebar beside it", async ({ page }) => {
-    await page.goto(`${baseUrl}/${prefix}/company/settings`);
+    await gotoAppRoute(page, `${baseUrl}/${prefix}/company/settings`);
 
     // The contextual (secondary) pane is present...
     const secondary = page.locator("[data-secondary-sidebar]");
@@ -113,7 +141,7 @@ test.describe("Sidebar takeover (collapse + secondary pane)", () => {
     // SidebarNavItem children read the *global* collapsed state and used to
     // render icon-only (label `w-0 text-transparent`), making the settings nav
     // unreadable in the default takeover state. The pane must force full labels.
-    await page.goto(`${baseUrl}/${prefix}/company/settings`);
+    await gotoAppRoute(page, `${baseUrl}/${prefix}/company/settings`);
 
     const secondary = page.locator("[data-secondary-sidebar]");
     await expect(secondary).toBeVisible();
@@ -141,7 +169,7 @@ test.describe("Sidebar takeover (collapse + secondary pane)", () => {
       { key: COLLAPSED_STORAGE_KEY },
     );
 
-    await page.goto(`${baseUrl}/${prefix}/company/settings`);
+    await gotoAppRoute(page, `${baseUrl}/${prefix}/company/settings`);
 
     // Secondary pane still shows on the takeover route.
     await expect(page.locator("[data-secondary-sidebar]")).toBeVisible();
@@ -149,7 +177,7 @@ test.describe("Sidebar takeover (collapse + secondary pane)", () => {
     // The app sidebar is hard-collapsed despite the stored expanded pin.
     await expect(page.getByLabel(APP_SIDEBAR_EXPANDED_MARKER)).toHaveCount(0);
 
-    await page.goto(`${baseUrl}/${prefix}/dashboard`);
+    await gotoAppRoute(page, `${baseUrl}/${prefix}/dashboard`);
 
     // Leaving the takeover route clears the force and restores the user's
     // persisted expanded pin.
@@ -158,12 +186,12 @@ test.describe("Sidebar takeover (collapse + secondary pane)", () => {
   });
 
   test("leaving the takeover route removes the secondary pane and restores the sidebar", async ({ page }) => {
-    await page.goto(`${baseUrl}/${prefix}/company/settings`);
+    await gotoAppRoute(page, `${baseUrl}/${prefix}/company/settings`);
     await expect(page.locator("[data-secondary-sidebar]")).toBeVisible();
     await expect(page.getByLabel(APP_SIDEBAR_EXPANDED_MARKER)).toHaveCount(0);
 
     // Navigate to a plain (non-takeover) route.
-    await page.goto(`${baseUrl}/${prefix}/dashboard`);
+    await gotoAppRoute(page, `${baseUrl}/${prefix}/dashboard`);
 
     // No secondary pane, and the app sidebar is no longer force-collapsed.
     await expect(page.locator("[data-secondary-sidebar]")).toHaveCount(0);
