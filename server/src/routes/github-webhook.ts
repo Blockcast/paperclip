@@ -6028,6 +6028,52 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     let recoveryInstance: ReturnType<typeof recoveryService> | null = null;
     const getRecovery = () =>
       (recoveryInstance ??= recoveryService(db, { enqueueWakeup: heartbeat.wakeup }));
+
+    // PEN-3397: a closed PR discharges any `pr_review_non_convergence` action
+    // raised against it. Gated on the `closed` action rather than on
+    // `prMerged === true` like the merged-PR forward-capture above, because a PR
+    // closed WITHOUT merging ends the self-review loop just as conclusively as a
+    // merge — abandoned or superseded, there is still no author left to unstick.
+    //
+    // Sits here rather than beside its sibling PR-close handlers purely because
+    // `getRecovery` (and the `heartbeat` it closes over) are declared above this
+    // line and not above those.
+    //
+    // Candidate set is deliberately wide (`pullRequestWorkProductTargets`, i.e.
+    // matched ∪ previously-linked): the service matches on a fingerprint built
+    // from `(issue.id, repoFullName, prNumber)`, so an issue that merely mentions
+    // this PR cannot match, while an issue whose body no longer names the PR is
+    // still reached through the previously-linked half.
+    //
+    // Best-effort, mirroring the forward-capture and work-product blocks: this
+    // must never break the wake path.
+    let prNonConvergenceDischarged = 0;
+    if (
+      eventName === "pull_request" &&
+      context.prAction === "closed" &&
+      context.prNumber !== null &&
+      pullRequestWorkProductTargets.length > 0
+    ) {
+      try {
+        const discharged = await getRecovery().closePrReviewNonConvergenceForClosedPr({
+          repoFullName: context.repoFullName,
+          prNumber: context.prNumber,
+          merged: context.prMerged === true,
+          candidateIssues: pullRequestWorkProductTargets.map((issue) => ({
+            id: issue.id,
+            companyId: issue.companyId,
+            identifier: issue.identifier,
+          })),
+        });
+        prNonConvergenceDischarged = discharged.closed;
+      } catch (err) {
+        logger.error(
+          { err, prNumber: context.prNumber, repoFullName: context.repoFullName },
+          "pr_review_non_convergence auto-discharge on PR close failed",
+        );
+      }
+    }
+
     const actionableReviewFeedback = isActionableReviewFeedbackContext(context);
     // BLO-32381: reconstructed from wakeReason rather than threaded through as
     // its own context field. resolveEventContext already made the decision (and
@@ -6480,6 +6526,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       reviewerWakeFired,
       reviewerRunsCancelled,
       ...(workProductsUpserted > 0 ? { workProductsUpserted } : {}),
+      ...(prNonConvergenceDischarged > 0 ? { prNonConvergenceDischarged } : {}),
       ...(backLinked.length ? { backLinked } : {}),
       ...(foreignCommitNotices > 0 ? { foreignCommitNotices } : {}),
       ...(foreignCommitListingTruncated ? { foreignCommitListingTruncated } : {}),

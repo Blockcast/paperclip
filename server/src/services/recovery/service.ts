@@ -14881,7 +14881,18 @@ export function recoveryService(
         priorAssigneeAgentId: issue.assigneeAgentId,
       },
       nextAction: ownerAgentId
-        ? `Self-reviewed PR #${input.prNumber} has cycled through review feedback ${input.cycleCount} times without converging. Take over the PR, unblock or reassign the author, or record a disposition — do not leave the author looping on its own self-review.`
+        // PEN-3397: name the discharge route explicitly. This used to end at
+        // "or record a disposition", which names an outcome and no mechanism.
+        // Two agents independently read that as an instruction to find a write
+        // route, probed four shapes that all put the action id in the PATH
+        // (`POST .../recovery-actions/{actionId}/resolve`, `PATCH
+        // .../recovery-actions/{actionId}`, ...), got a uniform
+        // `404 API route not found`, and filed the conclusion that NO
+        // agent-facing discharge route exists and a grant could not fix it.
+        // The route exists and always did — the action id belongs in the BODY,
+        // and is optional there, because the endpoint resolves the issue's one
+        // active action. Spelling the call out is what stops that misreading.
+        ? `Self-reviewed PR #${input.prNumber} has cycled through review feedback ${input.cycleCount} times without converging. Take over the PR, unblock or reassign the author, or discharge this action yourself: POST /issues/${issue.id}/recovery-actions/resolve with body {"outcome":"restored","resolutionNote":"<why>"} (the action id goes in the BODY as an optional "actionId", never in the path; omit "sourceIssueStatus" to leave the source issue's status untouched). Do not leave the author looping on its own self-review.`
         : `Self-reviewed PR #${input.prNumber} is not converging after ${input.cycleCount} review cycles and no invokable agent can own it. Board intervention needed.`,
       wakePolicy: ownerAgentId
         ? { type: "wake_owner", reason: "self_review_pr_non_convergence", ownerAgentId }
@@ -14939,8 +14950,105 @@ export function recoveryService(
     return { escalated: true, ownerAgentId, ownerType: ownerAgentId ? "agent" : "board" };
   }
 
+  /**
+   * PEN-3397: discharge `pr_review_non_convergence` actions whose PR has closed.
+   *
+   * The escalation's entire premise is "an author is looping on its own
+   * self-review and nothing forces a resolution". A closed PR ends that loop by
+   * construction — merged, the loop converged; closed unmerged, it was abandoned
+   * or superseded. Either way there is no author left to unstick.
+   *
+   * Nothing was watching for that. PEN-2756 bounded the shape so it can no longer
+   * re-fire forever, and BLO-24662's `escalateExpiredWakeHorizons` moves a spent
+   * one to `escalated` — but `escalated` is deliberately NOT terminal (it stays
+   * inside `ACTIVE_RECOVERY_ACTION_STATUSES` so the row keeps holding
+   * `issue_recovery_actions_active_source_uq`; see the note on
+   * `escalateExpiredWakeHorizons`). So a moot action still read as active and
+   * still sat on its owner's plate. Measured on two live rows: `6542ffc8` asked
+   * the CTO to "take over" onprem-k8s#3076 for **3 days** after that PR merged —
+   * it merged 3h22m after the action was created, and 3h22m after its own
+   * `timeoutAt`.
+   *
+   * Matched on the FINGERPRINT, which the creation site above builds from
+   * `(issue.id, repoFullName, prNumber)` and is therefore exactly reconstructible
+   * here. That is what makes passing a broad candidate issue list safe: an issue
+   * that merely mentions this PR, or carries a non-convergence action for a
+   * DIFFERENT PR, cannot match. Do not relax this to a `kind`-only predicate — an
+   * issue can legitimately carry an action for another PR.
+   *
+   * Resolving (rather than cancelling) on merge is the honest outcome: the
+   * condition the action flagged genuinely cleared. A PR closed unmerged is
+   * recorded `cancelled`, matching how the wake backstop records an action whose
+   * premise went stale rather than succeeded.
+   */
+  async function closePrReviewNonConvergenceForClosedPr(input: {
+    repoFullName: string | null;
+    prNumber: number;
+    merged: boolean;
+    candidateIssues: ReadonlyArray<{ id: string; companyId: string; identifier?: string | null }>;
+    runId?: string | null;
+  }): Promise<{ closed: number; issueIds: string[] }> {
+    const closedIssueIds: string[] = [];
+    for (const issue of input.candidateIssues) {
+      // Contained per candidate: one issue's failure must not abort the rest,
+      // and this whole path is best-effort decoration on the webhook.
+      try {
+        const fingerprint =
+          `pr_review_non_convergence:${issue.id}:${input.repoFullName ?? "unknown"}:${input.prNumber}`;
+        const resolutionNote = input.merged
+          ? `Recovery action discharged automatically: PR #${input.prNumber} merged, so the self-review loop it flagged has converged and there is no author left to unstick.`
+          : `Recovery action cancelled automatically: PR #${input.prNumber} closed without merging, so the self-review loop it flagged has ended.`;
+        const resolved = await recoveryActionsSvc.resolveActiveForIssue({
+          companyId: issue.companyId,
+          sourceIssueId: issue.id,
+          kind: "pr_review_non_convergence",
+          fingerprint,
+          // Deliberately no `sourceIssueStatus` equivalent: this closes the
+          // recovery action ONLY. A merged PR does not by itself mean the source
+          // issue is done, and moving it here would silently complete work whose
+          // Done-when nobody evaluated.
+          status: input.merged ? "resolved" : "cancelled",
+          outcome: input.merged ? "restored" : "cancelled",
+          resolutionNote,
+        });
+        if (!resolved) continue;
+        closedIssueIds.push(issue.id);
+
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: "system",
+          actorId: "pr_review_non_convergence_pr_closed",
+          agentId: resolved.ownerAgentId,
+          runId: input.runId ?? null,
+          action: "issue.recovery_action_resolved",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            source: "recovery.close_pr_review_non_convergence_for_closed_pr",
+            identifier: issue.identifier ?? null,
+            repoFullName: input.repoFullName,
+            prNumber: input.prNumber,
+            prMerged: input.merged,
+            recoveryActionId: resolved.id,
+            recoveryActionStatus: resolved.status,
+            outcome: resolved.outcome,
+            recoveryOwnerAgentId: resolved.ownerAgentId,
+          },
+        });
+      } catch (err) {
+        logger.warn(
+          { err, issueId: issue.id, prNumber: input.prNumber, repoFullName: input.repoFullName },
+          "pr_review_non_convergence auto-discharge failed for issue (non-fatal)",
+        );
+      }
+    }
+
+    return { closed: closedIssueIds.length, issueIds: closedIssueIds };
+  }
+
   return {
     escalateStalledSelfReviewPr,
+    closePrReviewNonConvergenceForClosedPr,
     buildRunOutputSilence,
     closeRecoveredCcrotateCapacityEscalations,
     escalateCcrotateCapacityExhausted,
