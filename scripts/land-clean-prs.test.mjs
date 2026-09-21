@@ -320,8 +320,36 @@ describe("Ally verdict-mirror statuses are not CI checks", () => {
     assert.deepEqual(failingChecks(ALLY_RED), []);
   });
 
-  it("still blocks on the review itself, so the verdict is not lost", () => {
+  // The exclusion has to reach BOTH check rules, or they disagree about what a
+  // check is and the settle guard loses. Green mirrors, so nothing here is
+  // about `failingChecks`.
+  const ALLY_GREEN = (iso) => [
+    { __typename: "StatusContext", context: "review/ally-complete", state: "SUCCESS", createdAt: iso },
+    { __typename: "StatusContext", context: "gate/ally-comment-findings", state: "SUCCESS", createdAt: iso },
+  ];
+
+  it("counts a mirror-only rollup as nothing attesting the head, not as settled", () => {
+    // Fail-open: the rows are non-empty, so the `checks:none` stop never fired
+    // and a head with zero CI classified `enqueue`. Asserted through `classify`
+    // rather than `checkSettlement` directly: the filter lives at the call site
+    // that feeds both check rules, so the helper still reports on whatever set
+    // it is handed.
+    assert.equal(classify({ statusCheckRollup: ALLY_GREEN("2026-09-13T09:00:00Z") }).reason, "checks:none");
+  });
+
+  it("does not let a fresh mirror row reset the settle clock on settled CI", () => {
+    // Fail-closed, and this one fired routinely: the normal ordering is
+    // CI -> review -> mirror, so the newest row is almost always a mirror.
     const row = classify({
+      statusCheckRollup: [
+        { name: "verify", conclusion: "SUCCESS", completedAt: "2026-09-13T09:00:00Z" },
+        ...ALLY_GREEN("2026-09-13T11:58:00Z"),
+      ],
+    });
+    assert.equal(row.action, "enqueue", "CI settled 3h ago; a 2m-old mirror is not a check");
+  });
+
+  it("still blocks on the review itself, so the verdict is not lost", () => {    const row = classify({
       statusCheckRollup: [{ name: "verify", conclusion: "SUCCESS" }, ...ALLY_RED],
       reviews: [review({ body: body(HEAD, { important: 1 }) })],
     });
@@ -464,9 +492,26 @@ describe("multi-repo sweep", () => {
       "Blockcast/trafficcontrol",
       "Blockcast/multicast",
     ]);
+    // Same rule as `settleMinutesFrom` above, and for the same reason: no
+    // `undefined` here, because the parameter has an env default and passing it
+    // re-reads the ambient environment instead of the fallback. `""` and `null`
+    // cover the empty path; the env path is pinned below.
     assert.deepEqual(targetRepos(""), ["Blockcast/paperclip"]);
-    assert.deepEqual(targetRepos(undefined), ["Blockcast/paperclip"]);
+    assert.deepEqual(targetRepos(null), ["Blockcast/paperclip"]);
     assert.deepEqual(targetRepos("Blockcast/paperclip,,  "), ["Blockcast/paperclip"]);
+  });
+
+  it("reads the environment when called with no argument", () => {
+    const prior = process.env.LAND_CLEAN_PRS_REPO;
+    try {
+      delete process.env.LAND_CLEAN_PRS_REPO;
+      assert.deepEqual(targetRepos(), ["Blockcast/paperclip"], "unset falls back to this repo");
+      process.env.LAND_CLEAN_PRS_REPO = "Blockcast/multicast,Blockcast/trafficcontrol";
+      assert.deepEqual(targetRepos(), ["Blockcast/multicast", "Blockcast/trafficcontrol"]);
+    } finally {
+      if (prior === undefined) delete process.env.LAND_CLEAN_PRS_REPO;
+      else process.env.LAND_CLEAN_PRS_REPO = prior;
+    }
   });
 });
 

@@ -469,12 +469,23 @@ export function classifyPr(pr, { now = Date.now(), settleMinutes = CHECK_SETTLE_
     return row("skip", "mergestate:DIRTY");
   }
 
-  const failing = failingChecks(pr?.statusCheckRollup);
+  // One filtered set for BOTH check rules. `failingChecks` strips the Ally
+  // verdict mirrors on the stated grounds that they are not CI checks; handing
+  // `checkSettlement` the raw rollup made the two rules disagree about what a
+  // check is, in both directions. Fail-open: a rollup carrying only mirror rows
+  // is non-empty, so the `checks:none` stop never fired on a head no CI had
+  // attested. Fail-closed: `Math.max` over the unfiltered stamps let a mirror
+  // row posted minutes ago reset the settle clock on CI that finished hours
+  // ago — and since the normal ordering is CI -> review -> mirror, that fired
+  // routinely.
+  const checks = (pr?.statusCheckRollup ?? []).filter((c) => !isAllyVerdictStatus(c));
+
+  const failing = failingChecks(checks);
   if (failing.length > 0) {
     return row("skip", `checks:${failing[0].split("=")[1]}`, failing.join(", "));
   }
 
-  const settlement = checkSettlement(pr?.statusCheckRollup, { now, settleMinutes });
+  const settlement = checkSettlement(checks, { now, settleMinutes });
   if (!settlement.settled) return row("skip", `checks:${settlement.reason}`, settlement.detail);
 
   const { verdict } = allyVerdictAtHead(pr);
