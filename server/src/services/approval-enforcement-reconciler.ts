@@ -312,6 +312,75 @@ export function extractEnforcementAssertions(payload: unknown): EnforcementAsser
   return [...byPolicyId.values()];
 }
 
+/** Marks a prior the server read from `budget_policies`, not one the caller stated. */
+export const SERVER_POLICY_READ_PRIOR = "server_policy_read";
+
+/**
+ * Fill in the starting figure on canonical assertions that omit one, reading it
+ * from the enforcing policy row (BLO-34008).
+ *
+ * Without a prior, `classifyEnforcementAssertion` cannot run its three-way split
+ * and answers `unverifiable_mismatch` for every disagreement — so a never-applied
+ * decision and a legitimately superseded one look identical. Both get reported,
+ * which is the safe direction, but the second is the false-positive class that
+ * filed BLO-33160, BLO-33397, BLO-33416 and BLO-33772, and the first is not
+ * auto-appliable. Recording the prior is what separates them.
+ *
+ * The obvious alternative — require the caller to state `from_usd` — is the one
+ * thing the refusal's own remediation forbids ("never invent one"), and the
+ * example payload deliberately ships without it. So callers will keep omitting
+ * it, correctly. The server does not have to guess: it holds the authoritative
+ * number already, because the assertion names the `policyId`.
+ *
+ * Deliberately narrow:
+ *   - **Only fills what is absent.** A caller who stated a prior has stated
+ *     something we should not silently overwrite; `readPriorAmountCents` already
+ *     treats a wrong one as suspect and splits on `amountUpdatedAt` instead.
+ *   - **Canonical shape only.** `exact_changes` is the legacy shape on card
+ *     `6f45844e`, which already carries `from_usd`. Rewriting a shape we are not
+ *     encouraging buys nothing.
+ *   - **Unresolvable policy is left alone.** A missing or cross-company id stays
+ *     unstamped so the reconciler still reports it as `missing_policy`, rather
+ *     than the stamp quietly making a bad id look serviceable.
+ *
+ * `from_source` records that the figure is a database read, so a later reader can
+ * tell an authoritative prior from an agent-authored one on a path that writes money.
+ */
+export function stampAssertionPriors(
+  payload: unknown,
+  policies: ReadonlyMap<string, EnforcedBudgetPolicy | null>,
+): unknown {
+  const root = asRecord(payload);
+  if (!root) return payload;
+  // Read and write the same key. Deriving the write key with `in` diverges from
+  // this read: `??` falls through a present-but-`null` `enforcement_assertions`
+  // to the camelCase array, but `in` would then pick the snake_case key — so the
+  // stamped array lands under snake_case while the camelCase one this actually
+  // read stays in place unstamped. Two arrays, one payload, on a money path.
+  const snake = root.enforcement_assertions;
+  const usesSnake = snake !== undefined && snake !== null;
+  const entries = usesSnake ? snake : root.enforcementAssertions;
+  if (!Array.isArray(entries)) return payload;
+
+  let changed = false;
+  const stamped = entries.map((raw) => {
+    const entry = asRecord(raw);
+    if (!entry) return raw;
+    if (asNonEmptyString(entry.kind) !== BUDGET_POLICY_AMOUNT_ASSERTION) return raw;
+    if (readPriorAmountCents(entry) !== null) return raw;
+    const policyId = asNonEmptyString(entry.policyId ?? entry.policy_id);
+    if (!policyId) return raw;
+    const amount = policies.get(policyId)?.amount;
+    if (typeof amount !== "number") return raw;
+    changed = true;
+    return { ...entry, from_amount_cents: amount, from_source: SERVER_POLICY_READ_PRIOR };
+  });
+
+  if (!changed) return payload;
+  const key = usesSnake ? "enforcement_assertions" : "enforcementAssertions";
+  return { ...root, [key]: stamped };
+}
+
 /**
  * What the enforcing row says happened to one decided assertion.
  *
