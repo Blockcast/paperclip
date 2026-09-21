@@ -247,14 +247,19 @@ export const CCROTATE_CAPACITY_DEFERRED_METRIC = "paperclip_ccrotate_capacity_de
  * - Cache hits do **not** increment. Only real network probes are counted, so
  *   the ratio above is over re-probes rather than over gate calls.
  * - **The fail-open set is path-qualified:** `path="messages_fallback"` with
- *   `outcome=~"error|auth_fault"`. Only the fallback path returns `allow: true`
- *   without a verdict (`penstock-availability-gate.ts:762` for the auth fault,
- *   `:804`/`:813` for transport errors), so a *broken* probe is
- *   indistinguishable from a healthy one on every other signal and that pair is
- *   what an alert wants. The same two outcomes on `path="capacity"` are **not**
- *   fail-open: they yield no verdict and fall through to the fallback, which
- *   then decides. Alerting on `outcome="error"` alone both misses every
- *   entitlement fail-open and fires on capacity reads that allowed nothing.
+ *   `outcome=~"error|auth_fault"`, **plus `path="capacity"` with
+ *   `outcome="error"`** since BLO-29900 item 3 stopped that branch falling
+ *   through (a transport failure says nothing about the model, and the
+ *   fallback would reuse the transport that just failed). Those return
+ *   `allow: true` with no verdict — `penstock-availability-gate.ts:762` for the
+ *   auth fault, `:804`/`:813` for fallback transport errors, and
+ *   `capacityOutcomeJustifiesFallback` for the capacity one — so a *broken*
+ *   probe is indistinguishable from a healthy one on every other signal, and
+ *   that set is what an alert wants. `path="capacity"` with
+ *   `outcome="auth_fault"` (or `"inconclusive"`) is still **not** fail-open: it
+ *   falls through and the fallback decides. Alerting on `outcome="error"` alone
+ *   misses every entitlement fail-open; alerting on the fallback path alone now
+ *   misses the capacity-transport one.
  *
  * Cardinality: `path` and `outcome` are fixed allow-lists (2 x 6), coerced
  * here. `provider` is deliberately **not** coerced: it is bounded by its
@@ -296,9 +301,12 @@ export type PenstockProbePathLabel = (typeof KNOWN_PENSTOCK_PROBE_PATHS)[number]
  *   forever on a horizon that cannot expire it. Fails **open** on
  *   `path="messages_fallback"`; on `path="capacity"` it yields no verdict and
  *   falls through to the fallback.
- * - `error` — transport failure or timeout. Fails **open** on
- *   `path="messages_fallback"`; on `path="capacity"` it falls through to the
- *   fallback instead, so it is not a fail-open there.
+ * - `error` — transport failure or timeout. Fails **open** on **both** paths.
+ *   On `path="capacity"` it used to fall through to the fallback; BLO-29900
+ *   item 3 stopped that, because a transport failure says nothing about the
+ *   model and the fallback would reuse the transport that just failed. So
+ *   `path="capacity", outcome="error"` is now a terminal fail-open, and it is
+ *   the series to watch: it is the gate going blind, not the gate deciding.
  */
 export const KNOWN_PENSTOCK_PROBE_OUTCOMES = [
   "ok",
@@ -2494,9 +2502,10 @@ function ensureRegistry(): {
         + "advancing before reading that silence as health. Cache hits are not counted, so "
         + "the ratio is over real re-probes. The fail-open set is path-qualified: "
         + "path=messages_fallback with outcome=error|auth_fault allows dispatch with no "
-        + "verdict, and no other signal distinguishes that from a healthy probe. Those same "
-        + "outcomes on path=capacity are NOT fail-open - they fall through to the fallback, "
-        + "which decides.",
+        + "verdict, and so does path=capacity with outcome=error, which no longer falls "
+        + "through to the fallback (BLO-29900 item 3) - a transport failure says nothing "
+        + "about the model. path=capacity with outcome=auth_fault|inconclusive still does "
+        + "fall through, and there the fallback decides.",
       labelNames: ["path", "outcome", "provider", "model"],
       registers: [registry],
     });

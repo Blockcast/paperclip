@@ -155,7 +155,37 @@ describe("penstock availability gate probe instrumentation (BLO-29900)", () => {
     expect(await probeCount({ path: "capacity", outcome: "deny_capacity" })).toBe(0);
   });
 
-  // PEN-2513 landed after this PR was opened and made 401/403 fail open instead
+  // The matched pair for the test above, and the assertion BLO-29900 item 3
+  // exists for. Same provider, same config, same `result: null` from the
+  // capacity readback — differing *only* in why it was null. A 404 means the
+  // service declined to answer and the fallback is the only thing that can
+  // decide, so it runs. A transport abort means nothing answered at all, and
+  // the fallback would go out over that same transport, so it must not.
+  //
+  // Deliberately anthropic, not codex: the codex test below proves only that a
+  // provider with no `messagesUrl` sends nothing. Here the fallback URL exists
+  // and is resolvable, so a green result can only mean the suppression fired.
+  it("does not spend a fallback POST when the capacity probe failed in transport", async () => {
+    const fetchMock = vi.fn().mockRejectedValueOnce(
+      Object.assign(new Error("This operation was aborted"), { name: "AbortError" }),
+    );
+    const gate = gateWith(fetchMock as unknown as typeof fetch);
+
+    // Fails open, exactly as it did before item 3 — in production 36/36 of
+    // these POSTs timed out and returned `{allow: true}` anyway, so the
+    // dispatch decision on the measured path is unchanged. What is saved is
+    // the call and the second 3s timeout.
+    expect(await gate.checkAdapter(anthropicInput())).toEqual({ allow: true });
+
+    // One GET and nothing else. This is the load-bearing assertion: the
+    // provider's inference API was not touched.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(await observedPaths()).toEqual(["capacity"]);
+    expect(await probeCount({ path: "capacity", outcome: "error", provider: "anthropic" })).toBe(1);
+    // AC3's query, in miniature: the fallback series must not exist at all.
+    expect(await probeCount({ path: "messages_fallback" })).toBe(0);
+  });
+
   // of denying. That branch reaches the fallback by the same route a 404 does,
   // so folding it into `inconclusive` would hide an entitlement fault inside the
   // counter built to stop entitlement faults being read as capacity ones.
