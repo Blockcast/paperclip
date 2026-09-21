@@ -25,9 +25,20 @@
  *
  * - otherwise (`project_primary`, the SHARED project checkout) -> key on the
  *   PROJECT WORKSPACE. `realizeExecutionWorkspace` returns `input.base.baseCwd`
- *   verbatim for every non-`git_worktree` strategy, so every issue of that
- *   project workspace lands in ONE directory. Keying on the issue here would
- *   reproduce the defect: two issues, two keys, one tree.
+ *   for every non-`git_worktree` strategy, so every issue of that project
+ *   workspace lands in ONE directory. Keying on the issue here would reproduce
+ *   the defect: two issues, two keys, one tree.
+ *
+ *   One caveat on that "returns baseCwd" claim, because it is load-bearing for
+ *   anyone deciding what this key means: `rebindProjectPrimaryToManagedCheckout`
+ *   can substitute a managed checkout resolved from `(companyId, projectId,
+ *   repoName)` -- keyed by PROJECT + REPO, not by project workspace. Two project
+ *   workspaces of one project pointing at one repo URL would therefore rebind to
+ *   a single directory while holding two distinct keys here. Not reachable in
+ *   any config today, and deliberately not defended against: keying on the
+ *   project instead would over-serialize unrelated workspaces in every config
+ *   that IS reachable. If that config ever becomes reachable, this key is the
+ *   thing that has to change.
  *
  * BLO-19422 is that second branch. Every arm of the original predicate required
  * isolation or a worktree, so a shared-checkout run produced a null key and fell
@@ -57,6 +68,31 @@
  * resolves to a NEW directory while keeping its id, so this over-serializes
  * rather than under-serializes. Serializing two runs that could have been
  * parallel costs latency; letting two runs share one tree corrupts a checkout.
+ *
+ * KNOWN GAP -- the first run of an un-backfilled issue is UNPROTECTED, and this
+ * is accepted rather than fixed. The only source for `projectWorkspaceId` at
+ * reservation-bind time is `issueRef`, but the run's actual workspace is not
+ * resolved until ~600 lines later (`issueRef?.projectWorkspaceId ??
+ * resolvedWorkspace.workspaceId`) and is written back onto the issue after
+ * that. The id is a RESULT of the first run, not a precondition of it, so run 1
+ * of a fresh issue keys null and only run 2 onward is excluded.
+ *
+ * Two consequences worth stating, because the second is a real (narrow) loss:
+ *
+ * - There is no sound fix available at bind time. Every candidate is a proxy
+ *   with its own gap, and the reservation MUST bind before the workspace is
+ *   realized -- binding after it would mean the loser has already mutated the
+ *   tree it was supposed to be excluded from. Closing this properly means
+ *   hoisting the workspace-base resolution above the bind, which is a dispatch-
+ *   path change and not this row's scope.
+ * - Now that the `agent-shared` exit is tree-scoped too (BLO-19422), a null key
+ *   falls back to `agent-shared:<agentId>` and therefore no longer collides
+ *   with the SAME agent's tree-keyed runs on that tree. Pre-BLO-19422 it did.
+ *   That window needs two concurrent runs of one agent at effective
+ *   concurrency 1, which requires the BLO-12990 silent-run exclusion from
+ *   `countRunsOccupyingSlots`, and one of the two to be an un-backfilled first
+ *   run. It is strictly narrower than the cross-agent case it buys: that one
+ *   needs no loophole at all and is the measured defect.
  */
 export function resolveWorkspaceWriterTreeKey(input: {
   statelessPrReview: boolean;

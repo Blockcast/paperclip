@@ -6880,7 +6880,18 @@ export function resolveK8sRunIsolationIdentity(input: {
       input.perIssueWorkspaceTreeKey,
     );
   }
-  return runUniqueIdentity({ isolationMode: "shared", isolationKey: `agent-shared:${input.agentId}` });
+  // BLO-19422: this is the DEFAULT exit -- `concurrencyEnabled` is false unless
+  // an operator sets it, so `effectiveMaxConcurrentRuns` is a hard 1 for every
+  // external-lifecycle agent and every such run lands here. `agent-shared:
+  // <agentId>` carries no tree scope, so two AGENTS on one shared project
+  // checkout held distinct keys and both wrote it. Tree-scope the reservation
+  // here too; `isolationKey` stays agent-scoped so warm session/home roots are
+  // untouched. See `withTreeScopedReservationKey` for why the old "shared is
+  // already stricter" reasoning was wrong.
+  return withTreeScopedReservationKey(
+    { isolationMode: "shared", isolationKey: `agent-shared:${input.agentId}` },
+    input.perIssueWorkspaceTreeKey,
+  );
 }
 
 /**
@@ -6930,14 +6941,11 @@ export function resolveK8sRunIsolationIdentity(input: {
  * this key gates.
  *
  * THE INVARIANT for the reservation key: only ever replace a key that is
- * RUN-UNIQUE. A key that already names a shared tree is at least as strict as
- * the per-issue key, so substituting it would loosen exclusivity instead of
- * tightening it. Three keys are therefore left alone, each for its own reason:
+ * RUN-UNIQUE, or one whose scope is NARROWER THAN THE TREE. A key that already
+ * names a shared tree is at least as strict as the per-issue key, so
+ * substituting it would loosen exclusivity instead of tightening it. Two keys
+ * are therefore left alone:
  *
- * - `shared` (`agent-shared:<agentId>`) is already STRICTER than per-tree — one
- *   writer per agent. Substituting a per-tree key there would *loosen* it and
- *   let an effective-concurrency-1 agent hold two reservations for different
- *   issues, inverting BLO-16842's containment.
  * - `workspace:<id>` for an EXPLICITLY reused persisted workspace already names
  *   the tree, and several issues may share one such workspace, so a per-issue
  *   key would let those issues write it concurrently. Gated at the call site in
@@ -6948,6 +6956,32 @@ export function resolveK8sRunIsolationIdentity(input: {
  * - stateless PR review never reaches this helper; it returns run-scoped
  *   isolation ahead of every other branch and must stay fully ephemeral.
  *
+ * BLO-19422: `shared` (`agent-shared:<agentId>`) USED TO BE left alone here, on
+ * the reasoning that one-writer-per-agent is already stricter than per-tree.
+ * That was wrong, and it is the whole defect. `agent-shared` is stricter along
+ * the AGENT axis and carries no tree scope at all, so it cannot exclude ACROSS
+ * agents: agent A and agent B both running `project_primary` against project
+ * workspace pw-1 hold `agent-shared:A` and `agent-shared:B`, both satisfy the
+ * writer index, and both write one directory. That is BLO-19422 verbatim, and
+ * because `concurrencyEnabled` defaults false (`resolveExternalLifecycle
+ * Concurrency` returns a hard 1), this exit is the DEFAULT posture rather than
+ * an edge case.
+ *
+ * The "inverting BLO-16842's containment" half of that rationale does not hold
+ * either: the per-agent concurrency ceiling is enforced at dispatch by
+ * `availableSlots = effectiveMaxConcurrentRuns - runningCount` in
+ * `startNextQueuedRunForAgent`, not by this index. Widening the key cannot let
+ * an agent exceed its ceiling, because the slot counter never admits the second
+ * run. `agent-shared` was a belt over braces that already hold.
+ *
+ * The cost is real and deliberate: this serializes ALL issues of one project
+ * workspace across ALL agents, because they are one mutable directory. That is
+ * the correct outcome for a shared checkout, and it is the same trade the
+ * module doc makes -- serializing runs that could have been parallel costs
+ * latency, letting two runs share one tree corrupts a checkout. It does not
+ * touch runs that get their own worktree: those key on the ISSUE and stay
+ * independent across issues.
+ *
  * `isolationMode` is untouched, so every filesystem root keeps deriving from
  * `runId`/`persistedExecutionWorkspaceId` exactly as before.
  */
@@ -6956,7 +6990,7 @@ function withTreeScopedReservationKey(
   perIssueWorkspaceTreeKey: string | null | undefined,
 ): K8sRunIsolationIdentity {
   const treeKey = readNonEmptyString(perIssueWorkspaceTreeKey ?? null);
-  if (!treeKey || identity.isolationMode === "shared") return runUniqueIdentity(identity);
+  if (!treeKey) return runUniqueIdentity(identity);
   return { ...identity, reservationKey: `workspace-tree:${treeKey}` };
 }
 
