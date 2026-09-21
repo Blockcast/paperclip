@@ -128,6 +128,17 @@ describe("inspectWorktreeReclaimSafety", () => {
     const verdict = await inspectWorktreeReclaimSafety(path.join(os.tmpdir(), `paperclip-absent-${randomUUID()}`));
     expect(verdict).toMatchObject({ safe: true, reason: "missing" });
   });
+
+  it("refuses a path that is not a directory rather than calling it missing", async () => {
+    // `stat().catch(() => false)` would collapse this into "missing" -> safe,
+    // and so would every EACCES/EIO/ESTALE. Only a proving errno is missing.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-ws-collector-file-"));
+    tempRoots.add(root);
+    const filePath = path.join(root, "not-a-directory");
+    fs.writeFileSync(filePath, "\n", "utf8");
+
+    expect(await inspectWorktreeReclaimSafety(filePath)).toMatchObject({ safe: false, reason: "unverifiable" });
+  });
 });
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -257,6 +268,46 @@ describeEmbeddedPostgres("reconcileExecutionWorkspaceCleanup", () => {
     const [row] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, id));
     expect(row?.cleanupReason).toBe("retained_dirty");
     // Deferred, not abandoned: re-checked next window so it collects once pushed.
+    expect(row?.cleanupEligibleAt?.getTime() ?? 0).toBeGreaterThan(Date.now());
+  });
+
+  it("never archives a workspace whose worktree removal was declined", async () => {
+    // The targeted population: a registration whose lock this workspace does
+    // not own, so `authorizeOwnedGitWorktreeCleanup` declines and nothing is
+    // removed. Archiving here would null `cleanupEligibleAt`, which
+    // `selectEligible` requires, so the tree could never be reconsidered.
+    const { repo } = createRepoWithRemote();
+    const worktreePath = path.join(path.dirname(repo), "wt-foreign");
+    const id = randomUUID();
+    git(["worktree", "add", "-q", "-b", "wt-foreign", worktreePath, "main"], repo);
+    git(["worktree", "lock", "--reason", "held by another tool", worktreePath], repo);
+    await db.insert(executionWorkspaces).values({
+      id,
+      companyId,
+      projectId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "wt-foreign",
+      status: "active",
+      cwd: worktreePath,
+      providerType: "git_worktree",
+      providerRef: worktreePath,
+      branchName: "wt-foreign",
+      cleanupEligibleAt: hourAgo(),
+      lastUsedAt: hourAgo(),
+    });
+
+    const result = await cleanup.reconcileExecutionWorkspaceCleanup();
+
+    expect(result.collected).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(fs.existsSync(worktreePath)).toBe(true);
+    expect(worktreeIsRegistered(repo, worktreePath)).toBe(true);
+
+    const [row] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, id));
+    expect(row?.status).toBe("active");
+    expect(row?.cleanupReason).toBe("retained_uncleaned");
+    // Still selectable next window, so the leak stays recoverable.
     expect(row?.cleanupEligibleAt?.getTime() ?? 0).toBeGreaterThan(Date.now());
   });
 
