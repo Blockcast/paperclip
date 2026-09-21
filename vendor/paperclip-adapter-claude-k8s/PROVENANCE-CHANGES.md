@@ -12,15 +12,22 @@ concurrent appends merge without a conflict. Three rules keep that safe:
 
 1. **Append at the end. Never edit or reorder existing rows.** Union merge
    resolves by keeping both sides' added lines; it cannot reconcile an edit.
-2. **Never put a 64-hex string in this file.** The integrity hash lives in
-   `PROVENANCE.md`, which is *not* union-merged, precisely so that a union can
-   never introduce a second candidate line for
-   `grep -oE '^[0-9a-f]{64}$' … | head -1`.
+   `scripts/check-vendored-provenance-log.mjs` fails any change that deletes a
+   line from this file — which is what an edit or a reorder looks like in a
+   diff. To correct an earlier row, append a row that supersedes it.
+2. **Never put a 64-hex string in this file.** A union keeps both sides' lines,
+   so any single-valued field placed here acquires a second candidate on the
+   next concurrent append and is then resolved by sort order rather than by the
+   tree. This is why the integrity hash was *removed* from `PROVENANCE.md`
+   under [BLO-35109](https://paperclip.blockcast.net/BLO/issues/BLO-35109)
+   rather than moved here — see [Integrity](./PROVENANCE.md#integrity).
 3. **Nothing goes below the table.** Trailing prose turns every append into an
    interior edit.
 
-This file is excluded from the integrity hash (it is a Blockcast addition, not
-upstream source), same as `LICENSE` and `PROVENANCE.md`. That exclusion is
+Appending a row here is **required**, not conventional: CI fails any change that
+touches vendored source without one. That guard replaced the stored integrity
+hash, which is what used to force a PROVENANCE edit. See
+`scripts/check-vendored-provenance-log.mjs`, wired into the `policy` job and
 asserted by `scripts/__tests__/provenance-union-merge.test.mjs`.
 
 | commit | files | what |

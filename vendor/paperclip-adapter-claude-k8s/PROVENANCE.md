@@ -92,36 +92,41 @@ applied since.
 
 ### Integrity
 
-A manifest of `sha256(path)` over all 41 in-tree files, sorted by path under
-`LC_ALL=C`, itself hashes to:
+**There is no recorded integrity hash, deliberately — removed under
+[BLO-35109](https://paperclip.blockcast.net/BLO/issues/BLO-35109).** What
+replaced it is the append-only log in
+[PROVENANCE-CHANGES.md](./PROVENANCE-CHANGES.md): CI fails any change that
+touches vendored source without appending a row there
+(`scripts/check-vendored-provenance-log.mjs`, run from the `policy` job).
 
-```
-8c3a5f3d741ff0567bbe9f4a33ff7e9b520396dbc3cebe635d12d23b5f81fdf4
-```
+A single 64-hex manifest of the tree used to be recorded here and recomputed by
+CI. It was removed for three reasons, in ascending order of importance:
 
-Regenerate with:
+1. **It did not attest what it appeared to.** The hash was recomputed from *our*
+   tree, which has diverged from upstream — so "hash matches" never meant
+   "upstream is unmodified", only "the tree is what the last editor recorded".
+   The section that stood here said as much in its final paragraph.
+2. **It was a false-positive generator, not a conflict detector.** Two PRs
+   editing different lines of the same vendored file merge correctly, and the
+   combined tree's hash matched *neither* recorded value. It failed on every
+   combination of two changes, correct or not, so it could not tell a bad merge
+   from two good ones.
+3. **It was single-valued, so it made concurrent work serial.** Every pair of
+   PRs touching this tree conflicted on that one line. `merge=union`
+   (BLO-34872) cannot reach it: a union keeps both sides' lines, and CI's
+   `grep -oE '^[0-9a-f]{64}$' … | head -1` would then have resolved the
+   provenance verdict by sort order rather than by the tree — failing
+   permissively on one of the two orderings.
 
-```sh
-cd vendor/paperclip-adapter-claude-k8s
-git ls-files | grep -vxE 'LICENSE|PROVENANCE\.md|PROVENANCE-CHANGES\.md' \
-  | LC_ALL=C sort | xargs sha256sum | sha256sum
-```
+The property the hash existed for — vendored source does not change without the
+change being recorded — survives, as a *transition* invariant checked against
+the merge base instead of a *state* invariant stored in the file. Nothing is
+stored, so nothing can conflict, and the in-diff review surface is now the log
+row itself rather than an opaque hash nobody could verify by reading.
 
-`LICENSE`, `PROVENANCE.md` and `PROVENANCE-CHANGES.md` are excluded because they
-are Blockcast additions, not upstream files — the hash covers only what came from
-upstream. The exclusion list here, in the `vendor_claude_k8s` CI step and on disk
-is held in agreement by `scripts/__tests__/provenance-union-merge.test.mjs`,
-which fails if the regex names a file that is **not** present in the tree — a
-stale exclusion left behind by a rename would silently drop a real file from the
-hash.
-
-**The reverse direction is not checked.** Adding a Blockcast-local file without
-excluding it changes the hash rather than failing that test, and the remedy the
-hash failure prescribes — regenerate — then widens the hash to cover a
-non-upstream file. After that, "hash matches" no longer means "upstream is
-unmodified". Checking that direction needs an explicit manifest of
-Blockcast-added paths, which does not exist; until it does, extending this
-exclusion list is a manual step to get right when adding a file here.
+`scripts/__tests__/provenance-union-merge.test.mjs` asserts that no 64-hex line
+is reintroduced into either provenance file, so a future revival is caught
+rather than quietly re-creating the conflict.
 
 The listing comes from `git ls-files` rather than `find` so that `node_modules/`,
 `dist/` and packed tarballs cannot perturb it.
@@ -192,7 +197,22 @@ prerelease identifiers would have decided it — and `blockcast` sorts *below*
 `kkroo` alphabetically, making the release read as a downgrade to anything
 comparing versions.
 
-Bump `-blockcast.N` for subsequent changes to this directory.
+Bump `-blockcast.N` **only when something outside this directory needs to tell
+two builds of it apart** — which, as of
+[BLO-35109](https://paperclip.blockcast.net/BLO/issues/BLO-35109), nothing does.
+Do **not** bump it per-PR.
+
+Measured 2026-09-21: the `-blockcast.N` version string appears in exactly five
+places, all of them inside this directory (`package.json`, `package-lock.json`
+×2, and twice in this file). Nothing outside the vendored tree reads it. The
+image builds this package from source and packs it with a glob —
+`mv paperclip-adapter-claude-k8s-*.tgz` — so the number never reaches the
+Dockerfile, which says so itself: *"claude_k8s — edit
+vendor/paperclip-adapter-claude-k8s/ and open a PR. Nothing to pin or bump."*
+
+Bumping it per-PR was not free. It put a version line in five places into every
+vendored PR's diff, which is three of the four hunks that used to make any two
+concurrent PRs on this tree conflict — for a number no consumer reads.
 
 ### The inert upstream workflow
 
