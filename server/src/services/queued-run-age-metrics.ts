@@ -97,12 +97,21 @@ export async function refreshQueuedRunAgeMetrics(db: Db, now = new Date()): Prom
  * reason writes no `penstockAdvertisedResumeAt`, so `greatest` (which ignores
  * NULLs) collapses to the bare due time and their arithmetic is unchanged.
  *
- * The regex guard is deliberate, and so is its failure direction. Both writers
- * of this field go through `applyCcrotateCapacityDecision` and emit
- * `Date.toISOString()`, so anything else is corrupt; an unparseable value
- * degrades to the pre-BLO-34782 reading (the row stays eligible and may page)
- * rather than to silence. A detector that fails loud is recoverable; one that
- * fails quiet is the invisible-strand mode this metric was built to remove.
+ * The regex guard is deliberate, and so is its failure direction. Both
+ * `result_json` writers of this field go through
+ * `applyCcrotateCapacityDecision` and emit `Date.toISOString()`, so anything
+ * else is corrupt; an unparseable value degrades to the pre-BLO-34782 reading
+ * (the row stays eligible and may page) rather than to silence. A detector
+ * that fails loud is recoverable; one that fails quiet is the
+ * invisible-strand mode this metric was built to remove.
+ *
+ * Scope bound, so nobody reads the exclusion as total: a third write site puts
+ * the key in `context_snapshot`, not `result_json` (`heartbeat.ts:34311`), and
+ * `coalescePendingTaskScopeWake` merges only `context_snapshot`. So a capacity
+ * denial coalesced onto an existing park leaves the advertised instant
+ * invisible to this query and the row keeps counting -- failing loud, the
+ * right direction, and the likely reason 11 of 46 parks in the BLO-34782 live
+ * sample carried no `result_json` key at all.
  */
 const effectiveRetryDueAt = sql`greatest(
   ${heartbeatRuns.scheduledRetryAt},
