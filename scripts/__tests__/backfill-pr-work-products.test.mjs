@@ -162,10 +162,18 @@ test("PR state maps onto the work-product status enum", () => {
 // path, which is the only path either finding was ever on.
 test("a real invocation prints the summary and NOT the module-guard message", async () => {
   const paths = [];
+  // A FULL first page for one status is what forces a second iteration. With
+  // every page empty the loop exits at offset=0 and an unpaged call site is
+  // indistinguishable from a paging one — which is what the previous revision
+  // of this test asserted, and it proved nothing.
+  const PAGE = 1000; // LIMIT in the script; a full page is `=== limit`
+  const fullPage = JSON.stringify(
+    Array.from({ length: PAGE }, (_, i) => ({ id: `i${i}`, identifier: `BLO-${i}` })),
+  );
   const server = createServer((req, res) => {
     paths.push(req.url);
     res.writeHead(200, { "content-type": "application/json" });
-    res.end("[]");
+    res.end(/status=in_review&.*offset=0\b/.test(req.url) ? fullPage : "[]");
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   try {
@@ -180,10 +188,16 @@ test("a real invocation prints the summary and NOT the module-guard message", as
     });
     assert.match(stdout, /^done: created=0 would-create=0 /m);
     assert.doesNotMatch(stderr, /no backfill performed/);
-    // The pager unit tests above pass even if the loop is never wired in; this
-    // is the one assertion that the shipped path actually pages.
-    assert.equal(paths.length, 3, paths.join(" "));
-    for (const p of paths) assert.match(p, /[?&]offset=0\b/);
+    // The pager unit tests above pass even if the loop is never wired in. This
+    // is the one assertion that the SHIPPED path pages: the `offset=1000` entry
+    // exists only because the full first page sent the loop round again, so
+    // replacing the call site with a single unpaged fetch fails here — and
+    // fails nowhere else. Mutation-tested; re-run that mutation before trusting
+    // any future edit to this case.
+    const offsets = paths
+      .filter((p) => p.includes("/issues?status="))
+      .map((p) => new URL(p, "http://x").searchParams.get("offset"));
+    assert.deepEqual(offsets, ["0", "1000", "0", "0"], paths.slice(0, 8).join(" "));
   } finally {
     server.close();
   }
