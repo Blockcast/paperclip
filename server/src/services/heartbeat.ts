@@ -501,6 +501,7 @@ import {
   RECOVERY_WORK_CLASS_KEY,
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
+import type { RecoveryRunWriteClassNoticeText } from "./recovery/model-profile-hint.js";
 import { recoveryService, STALE_PRE_CLAIM_ISSUE_LOCK_MS } from "./recovery/service.js";
 import { PROVIDER_CAPACITY_MAX_HORIZON_MS } from "./provider-capacity-horizon-bound.js";
 import { productivityReviewService } from "./productivity-review.js";
@@ -11345,7 +11346,13 @@ export function buildPaperclipTaskMarkdown(input: {
   // The caller passes the rendered notice rather than a class because the status-only text is
   // conditional on the snapshot's `sourceIssueId`; deriving both from one input there is what
   // stops the announcement promising an escalation the guard would refuse.
-  recoveryRunWriteClassNotice?: string | null;
+  //
+  // Branded, so the "System-generated, not user-authored task data." frame this lands inside is a
+  // claim the TYPE makes rather than one asserted by argument position — only
+  // `recoveryRunWriteClassNotice` can mint the value. Controlled in
+  // `recovery/model-profile-hint.test.ts`, not beside the markdown tests: `server/tsconfig.json`
+  // excludes `src/__tests__`, so a `@ts-expect-error` there would compile silently.
+  recoveryRunWriteClassNotice?: RecoveryRunWriteClassNoticeText | null;
 }) {
   const quoteTaskScalar = (value: string) => JSON.stringify(value);
   const fenceTaskText = (value: string) => {

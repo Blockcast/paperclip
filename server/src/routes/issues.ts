@@ -7109,6 +7109,14 @@ export function issueRoutes(
     // `standard` in exactly the deadlocking case and queues another status-only
     // wake into the identical 403.
     //
+    // PEN-3275: the wake prompt now ANNOUNCES this refusal before the agent
+    // plans, which means a compliant agent would never reach this stamp — the
+    // announcement would silently disable the escalation. So
+    // `recoveryRunWriteClassNotice` tells the reader to attempt the write
+    // anyway, naming it as the escalation channel. That sentence and this stamp
+    // are one mechanism: removing either leaves the other inert, and nothing
+    // fails when it happens.
+    //
     // Documents only: the escalation target is `planning_only`, which permits
     // document updates but still bars deliverables and annotations, so a refused
     // deliverable write would be escalated onto a lane that still cannot perform

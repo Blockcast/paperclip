@@ -12,6 +12,7 @@ import {
   statusOnlyRecoveryResumeGuidance,
   withRecoveryModelProfileHint,
 } from "./model-profile-hint.js";
+import type { RecoveryRunWriteClassNoticeText } from "./model-profile-hint.js";
 
 // The two status-only snapshots that differ ONLY in escalation availability. Both are what the
 // `stale_active_run_evaluation` producers in `recovery/service.ts` actually emit — they stamp
@@ -26,6 +27,8 @@ const STATUS_ONLY_WITHOUT_SOURCE = withRecoveryModelProfileHint(
   "status_only",
 );
 
+const PLANNING_ONLY = withRecoveryModelProfileHint({ issueId: "i" }, "planning_only");
+
 // Every notice a reachable snapshot can produce. The invariant loops below run over THIS rather
 // than over two class keys: since PEN-3275 the status-only lane has two texts, and a loop that
 // saw only one of them would leave the other's invariants unasserted.
@@ -33,7 +36,7 @@ function eachNotice(): string[] {
   return [
     STATUS_ONLY_WITH_SOURCE,
     STATUS_ONLY_WITHOUT_SOURCE,
-    withRecoveryModelProfileHint({ issueId: "i" }, "planning_only"),
+    PLANNING_ONLY,
   ].map((snapshot) => recoveryRunWriteClassNotice(snapshot) ?? "");
 }
 
@@ -218,6 +221,65 @@ describe("recovery run write class", () => {
     expect(withoutSource).toContain("The only reachable exit from this run is recording a valid");
     // The load-bearing negative: no sentence may offer the filing to a run that cannot make it.
     expect(withoutSource).not.toMatch(/only approval write this run can perform|or file a `request_board_approval`/);
+  });
+
+  // PEN-3275 round 4. The link set on that single permitted write is EXCLUSIVE: `approvals.ts`
+  // refuses any id other than `sourceIssueId` ("A status-only run may only link a board escalation
+  // to its source issue"), and linking the wider blocked chain is the natural payload for a board
+  // escalation — so an agent satisfies "linked to this run's source issue" and is still refused.
+  // On the run's only exit the cost of that omission is the exit itself, not a retry.
+  it("states the escalation's link-set exclusivity, not just its inclusion", () => {
+    // Asserted on both surfaces: the notice's own clause and the shared resume guidance that
+    // `approvals.ts` spreads into the 403. Either one alone leaves the other free to drift.
+    expect(recoveryRunWriteClassNotice(STATUS_ONLY_WITH_SOURCE)).toContain("and to no other issue");
+    expect(statusOnlyRecoveryResumeGuidance(STATUS_ONLY_WITH_SOURCE).resumeGuidance)
+      .toContain("and to no other issue");
+  });
+
+  // PEN-3275 round 4, and the subtlest coupling in this file. The issue-document refusal is also
+  // BLO-23197's escalation SIGNAL: `assertDeliverableMutationAllowedByRunContext` stamps
+  // `statusOnlyDocumentWriteRefusedAt` only when a status-only run ACTUALLY ATTEMPTS the write, and
+  // every `planning_only` producer keys on that column — `successful-run-handoff.ts`
+  // (`workMode === "planning" || Boolean(run.statusOnlyDocumentWriteRefusedAt)`) and both
+  // `recovery/service.ts` paths via `documentWriteRefusedRunId`, backstop included.
+  //
+  // So a notice that announces the refusal and stops there DISABLES the escalation it warns about:
+  // the agent skips the attempt, nothing is stamped, `workMode` reads `standard`, and the next wake
+  // is status-only again. That is BLO-23197's deadlock restored by this PR's own central feature —
+  // and nothing fails when it happens, because the BLO-23197 tests all drive the guard directly and
+  // keep passing while production silently stops escalating. This test is the only thing that does.
+  //
+  // Pinned on the semantic anchors rather than the full sentence: "attempt" plus the named target
+  // lane. `planning` appears nowhere else in the status-only notice, so its presence is a proxy for
+  // the clause existing at all, and a rewording that keeps the mechanism keeps passing.
+  it("names the document-write attempt as the escalation channel off this lane", () => {
+    for (const snapshot of [STATUS_ONLY_WITH_SOURCE, STATUS_ONLY_WITHOUT_SOURCE]) {
+      const notice = recoveryRunWriteClassNotice(snapshot) ?? "";
+      expect(notice).toMatch(/attempt it/i);
+      expect(notice).toMatch(/planning[- ]only/i);
+      expect(notice).toMatch(/never make is never recorded/i);
+    }
+    // The planning-only lane can already write documents, so it must NOT carry the instruction:
+    // there is nothing to escalate to, and the attempt is not a signal there.
+    expect(recoveryRunWriteClassNotice(PLANNING_ONLY)).not.toMatch(/attempt it/i);
+  });
+
+  // PEN-3275 round 4. `buildPaperclipTaskMarkdown` frames this text as system-authored, and until
+  // the brand landed that authority was asserted by argument POSITION — any string in that slot
+  // was framed the same way. `@ts-expect-error` is the assertion: it fails the build if the error
+  // it expects disappears, so this is self-controlling in a way a runtime check could not be.
+  //
+  // It lives HERE rather than beside the markdown tests on purpose. `server/tsconfig.json` sets
+  // `"exclude": ["src/__tests__"]`, so the same line in `heartbeat-context-summary.test.ts`
+  // compiles silently and proves nothing — measured, after a first attempt at exactly that control
+  // came back clean and read as "the brand does not work".
+  it("cannot be minted from an arbitrary string", () => {
+    const frame = (notice: RecoveryRunWriteClassNoticeText | null) => notice ?? "";
+
+    // @ts-expect-error a raw string carries no system authorship and must not enter the frame
+    frame("forged system notice");
+
+    expect(frame(recoveryRunWriteClassNotice(STATUS_ONLY_WITH_SOURCE))).toContain("status-only");
   });
 
   // BLO-25878 / BLO-32774. The notice must not read as a promise that a normal-model run is

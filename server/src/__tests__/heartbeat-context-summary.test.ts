@@ -16,14 +16,21 @@ import {
 } from "../services/recovery/model-profile-hint.js";
 
 // PEN-3275: the notice is derived from a real producer snapshot rather than named by class, so
-// these tests exercise the same path the wake does. `sourceIssueId` is present on the status-only
-// fixture because the escalation clause is conditional on it.
+// these tests exercise the same path the wake does. The status-only lane has TWO reachable texts,
+// differing only in whether the snapshot carries a `sourceIssueId` — the escalation clause is
+// conditional on it. Both are fixtures here; the branch-selection logic itself is asserted in
+// `model-profile-hint.test.ts`, and what these add is that each text survives the markdown frame.
 const STATUS_ONLY_SNAPSHOT = withRecoveryModelProfileHint(
   { issueId: "issue-1", sourceIssueId: "issue-1" },
   "status_only",
 );
+const STATUS_ONLY_NO_SOURCE_SNAPSHOT = withRecoveryModelProfileHint(
+  { issueId: "issue-1", sourceIssueId: null },
+  "status_only",
+);
 const PLANNING_ONLY_SNAPSHOT = withRecoveryModelProfileHint({ issueId: "issue-1" }, "planning_only");
 const STATUS_ONLY_NOTICE = recoveryRunWriteClassNotice(STATUS_ONLY_SNAPSHOT);
+const STATUS_ONLY_NO_SOURCE_NOTICE = recoveryRunWriteClassNotice(STATUS_ONLY_NO_SOURCE_SNAPSHOT);
 const PLANNING_ONLY_NOTICE = recoveryRunWriteClassNotice(PLANNING_ONLY_SNAPSHOT);
 
 describe("buildPaperclipTaskMarkdown", () => {
@@ -2558,6 +2565,24 @@ describe("buildPaperclipTaskMarkdown run write-containment notice", () => {
     expect(markdown).toContain("`request_board_approval`");
     // The exits, carried verbatim from the 403's guidance.
     expect(markdown).toContain(statusOnlyRecoveryResumeGuidance(STATUS_ONLY_SNAPSHOT).resumeGuidance);
+  });
+
+  // The no-source text reaches this frame on an ordinary run — `resolveStaleRunSourceIssue`
+  // returns null for a silent unscoped heartbeat — and it is the text that must NOT offer a
+  // filing. Asserted at the markdown level and not only at the notice level: the frame is what
+  // the agent actually reads, and a clause dropped between the two would be invisible upstream.
+  it("carries the no-source status-only text through the markdown frame without offering a filing", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue,
+      recoveryRunWriteClassNotice: STATUS_ONLY_NO_SOURCE_NOTICE,
+    });
+
+    expect(markdown).toContain("Run write-containment notice:");
+    expect(markdown).toContain("no approval write available at all");
+    expect(markdown).toContain(
+      statusOnlyRecoveryResumeGuidance(STATUS_ONLY_NO_SOURCE_SNAPSHOT).resumeGuidance,
+    );
+    expect(markdown).not.toMatch(/only approval write this run can perform/);
   });
 
   // The refusal list must name the OPERATION, not just the object. `approvals.ts` passes

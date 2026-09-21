@@ -28,7 +28,7 @@ export const PLANNING_ONLY_RECOVERY_GUARD_CONTEXT = {
   resumeRequiresNormalModel: false,
 } as const;
 
-// Attached to every 403 whose `details` carry `resumeRequiresNormalModel: true`.
+// Builds the guidance attached to every 403 whose `details` carry `resumeRequiresNormalModel: true`.
 //
 // That flag states a real *requirement* — the refused work does need a normal-model run — but on its
 // own it reads as a *promise* that such a run will come around, and callers wait for it. They wait
@@ -70,6 +70,12 @@ export const PLANNING_ONLY_RECOVERY_GUARD_CONTEXT = {
 // Derived from `statusOnlyEscalationSourceIssueId`, which is the same function `approvals.ts` gates
 // on. Sharing the predicate rather than restating the condition is what keeps the two honest: the
 // guidance names the escalation exactly when the guard would admit it.
+//
+// PEN-3275 round 4: the escalation's link set is EXCLUSIVE, and saying only "linked to the source
+// issue" is satisfied by a payload that also links the wider chain — which is the natural shape for
+// a board escalation about a blocked issue, and which `approvals.ts` refuses ("A status-only run may
+// only link a board escalation to its source issue"). On the run's single permitted write, the cost
+// of that omission is the whole exit rather than a retry, so the exclusivity is stated here.
 export function statusOnlyRecoveryResumeGuidance(contextSnapshot: unknown): {
   normalModelResumeIsAutomatic: false;
   resumeGuidance: string;
@@ -82,7 +88,8 @@ export function statusOnlyRecoveryResumeGuidance(contextSnapshot: unknown): {
     normalModelResumeIsAutomatic: false,
     resumeGuidance: preamble + (statusOnlyEscalationSourceIssueId(contextSnapshot)
       ? "Reachable exits from this run: record a valid issue disposition to clear the recovery " +
-        "action, or file a `request_board_approval` linked to the run context's source issue."
+        "action, or file a `request_board_approval` linked to the run context's source issue and " +
+        "to no other issue."
       : "This run context carries no source issue, so it cannot file a `request_board_approval` " +
         "either. The only reachable exit from this run is recording a valid issue disposition to " +
         "clear the recovery action."),
@@ -135,6 +142,22 @@ export function isPlanningOnlyRecoveryContextSnapshot(contextSnapshot: unknown):
 }
 
 export type RecoveryRunWriteClass = Extract<RecoveryModelProfileWorkClass, "status_only" | "planning_only">;
+
+declare const recoveryRunWriteClassNoticeBrand: unique symbol;
+
+/**
+ * The rendered write-containment notice, branded.
+ *
+ * PEN-3275 round 4: `buildPaperclipTaskMarkdown` frames this text as "System-generated, not
+ * user-authored task data.", and it takes it pre-rendered because the status-only wording is
+ * conditional on the snapshot — so the caller, not the frame, chooses the text. That is the right
+ * split, but it left the authority claim asserted by POSITION: any string in that argument would
+ * have been framed as system-authored. The brand moves the claim into the type, at no runtime
+ * cost — `recoveryRunWriteClassNotice` is the only thing that can mint one.
+ */
+export type RecoveryRunWriteClassNoticeText = string & {
+  readonly [recoveryRunWriteClassNoticeBrand]: true;
+};
 
 /**
  * Which write-containment class is this run executing under, if any?
@@ -222,18 +245,52 @@ export function readRecoveryRunWriteClass(contextSnapshot: unknown): RecoveryRun
  * an agent into the 403 this notice exists to pre-empt. One input, one output: the class, the
  * escalation clause and the appended resume guidance are all derived here from the same object the
  * route guards will test, so they cannot disagree with each other or with enforcement.
+ *
+ * PEN-3275 round 4, and the one place this notice must NOT simply deter the write it names. One
+ * entry in the status-only refusal list — the issue-document write — is also BLO-23197's escalation
+ * SIGNAL. `assertDeliverableMutationAllowedByRunContext` (`issues.ts`) stamps
+ * `statusOnlyDocumentWriteRefusedAt` only when a status-only run ACTUALLY ATTEMPTS that write and is
+ * refused, and every producer of `planning_only` keys on that column — `successful-run-handoff.ts`
+ * (`workMode === "planning" || Boolean(run.statusOnlyDocumentWriteRefusedAt)`) and both
+ * `recovery/service.ts` paths via `documentWriteRefusedRunId`, the backstop included, so there is no
+ * independent route. `workMode` reads `standard` in precisely the deadlocking case, which is why the
+ * refusal itself had to become the signal.
+ *
+ * So announcing the refusal in advance can DISABLE the escalation it warns about: a compliant agent
+ * reads the list, does not attempt the write, nothing is stamped, and the next corrective wake is
+ * status-only again — BLO-23197's deadlock ("measured live on BLO-23032 and five times since")
+ * restored by this notice working exactly as designed. Nothing fails when that happens: the run
+ * terminates cleanly, and the BLO-23197 tests drive the guard directly so they keep passing.
+ *
+ * The notice therefore names the attempt as the channel rather than leaving the refusal standing as
+ * a bare prohibition. Two rejected alternatives, recorded because both look cheaper:
+ *
+ *  - Stamp the column when the notice is RENDERED. It decouples the signal from the attempt, but it
+ *    stamps on every status-only wake regardless of whether a document was ever needed, so every
+ *    such run that ends without a disposition is escalated to a document-write-capable lane. That is
+ *    a write-containment control failing OPEN, which is the direction this file refuses everywhere
+ *    else (see `isStatusOnlyRecoveryContextSnapshot` on why `sourceIssueId` stays out of the tuple).
+ *  - Add a separate "request the escalation" route. The attempt already IS that request — same
+ *    stamp, same consequence, one fewer verb — so the route would be a second spelling of an
+ *    existing channel, and a second spelling is the drift hazard the rest of this PR removed.
+ *
+ * Keep this clause. It is prose, but it is prose that carries a mechanism, and deleting it silently
+ * reverts BLO-23197 with every test still green.
  */
-export function recoveryRunWriteClassNotice(contextSnapshot: unknown): string | null {
+export function recoveryRunWriteClassNotice(contextSnapshot: unknown): RecoveryRunWriteClassNoticeText | null {
   const writeClass = readRecoveryRunWriteClass(contextSnapshot);
   if (!writeClass) return null;
+  const mint = (text: string) => text as RecoveryRunWriteClassNoticeText;
   if (writeClass === "planning_only") {
-    return "This wake is a planning-only recovery run. Issue document updates are permitted. Refused " +
+    return mint(
+      "This wake is a planning-only recovery run. Issue document updates are permitted. Refused " +
       "with 403: creating, modifying, commenting on, resubmitting, withdrawing, linking or " +
       "unlinking approvals — every approval write, with no `request_board_approval` exception on " +
       "this lane — and all deliverable and annotation writes. Confirm any of those returned before " +
-      "you describe it as done.";
+      "you describe it as done.");
   }
-  return "This wake is a cheap status-only recovery run. Reads and issue comments behave normally, so " +
+  return mint(
+    "This wake is a cheap status-only recovery run. Reads and issue comments behave normally, so " +
     "there is no other signal that writes are contained. Refused with 403: creating, modifying, " +
     "commenting on, resubmitting, withdrawing, linking or unlinking approvals — including the " +
     "`request_board_approval` this run may itself file; assigning downstream issue work to the " +
@@ -241,14 +298,19 @@ export function recoveryRunWriteClassNotice(contextSnapshot: unknown): string | 
     "the status-adjudication document; and all deliverable and annotation writes. " +
     (statusOnlyEscalationSourceIssueId(contextSnapshot)
       ? "The only approval write this run can perform is creating a `request_board_approval` " +
-        "linked to this run's source issue, and that is a single call you cannot follow up from " +
-        "here — not even to comment on what you just filed. "
+        "linked to this run's source issue and to no other issue, and that is a single call you " +
+        "cannot follow up from here — not even to comment on what you just filed. "
       : "This run's context carries no source issue, so the `request_board_approval` escalation is " +
         "refused here too: this run has no approval write available at all. ") +
     "Permitted: reads, issue comments, and recording a status disposition. " +
+    "One of those refusals is also the only escalation channel off this lane: if the work this run " +
+    "must finish genuinely needs an issue-document write, attempt it rather than skipping it on " +
+    "the strength of this notice. The refusal is recorded against this run, and the next " +
+    "corrective wake for it is dispatched planning-only, which can perform the write. An attempt " +
+    "you never make is never recorded, and the wake after it is status-only again. " +
     statusOnlyRecoveryResumeGuidance(contextSnapshot).resumeGuidance +
     " Confirm any of the refused writes returned before you describe it as done: composing the " +
-    "claim before the call lands is how a refused write becomes a false record.";
+    "claim before the call lands is how a refused write becomes a false record.");
 }
 
 const RECOVERY_MODEL_PROFILE_HINT_KEYS = [
