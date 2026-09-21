@@ -273,10 +273,17 @@ REQUEST_TIMEOUT_SECONDS = int(os.environ.get("REQUEST_TIMEOUT_SECONDS") or 30)
 # Exit codes. Both are non-zero (both turn the scheduled job red), but they
 # are distinct so a red run can be read without opening the log: a stranded
 # PR needs a human to go review it, whereas a degraded sweep means the
-# reconciler itself did not run and the PR list is unknown. Conflating them
-# would mean "red because it worked and found something" and "red because it
-# could not look" are the same signal -- which is the failure class this
+# reconciler could not complete its own work. Conflating them would mean
+# "red because it worked and found something" and "red because it could not
+# do its job" are the same signal -- which is the failure class this
 # reconciler exists to remove.
+#
+# "Could not complete its work" covers two shapes, and main()'s summary names
+# which one occurred rather than leaving the reader to assume the first:
+# a READ failure, where the PR list is unknown and the alarm count is
+# therefore unreliable; and a re-fire WRITE failure, where every PR was read
+# (so the alarm count is exact) but re-fires the sweep decided on did not
+# land. Both are genuine failures of the run; only the first blinds it.
 EXIT_ALARM = 1
 EXIT_SWEEP_DEGRADED = 2
 
@@ -1163,13 +1170,37 @@ def main(argv=None):
                         )
                     )
                 if degraded:
+                    # The run is degraded on EITHER kind of failure -- that is
+                    # deliberate (see REFIRE_WRITE_FAILURE_TOKEN) and the
+                    # non-zero exit stays. What differs is what each kind
+                    # costs. Only a READ failure makes `alarming` unreliable:
+                    # a PR whose read succeeded and whose WRITE was rejected
+                    # was fully evaluated, so its pending_since is known and
+                    # its alarm verdict is exact. Attributing the whole
+                    # `failed` count to "could not be read" told the operator
+                    # to discount the one number that was still trustworthy,
+                    # on precisely the run where it is the only signal left.
+                    read_failures = len(failed) - len(refire_write_failures)
                     handle.write(
-                        "**This run is DEGRADED** (%d of %d failed). Its `alarming=%d` "
-                        "count is not trustworthy -- a PR that could not be read cannot be "
-                        "shown to be un-stranded, and GitHub lists open PRs newest-first, so "
-                        "the ones dropped are the oldest.\n\n"
-                        % (len(failed), len(results), len(alarming))
+                        "**This run is DEGRADED** (%d of %d failed)."
+                        % (len(failed), len(results))
                     )
+                    if read_failures:
+                        handle.write(
+                            " %d could not be read, so its `alarming=%d` count is not "
+                            "trustworthy -- a PR that could not be read cannot be shown "
+                            "to be un-stranded, and GitHub lists open PRs newest-first, "
+                            "so the ones dropped are the oldest."
+                            % (read_failures, len(alarming))
+                        )
+                    if refire_write_failures:
+                        handle.write(
+                            " %d were read in full and failed on the re-fire WRITE, so "
+                            "they are counted in `alarming=%d` correctly; the remedy is "
+                            "on the write side, not in the read budget."
+                            % (len(refire_write_failures), len(alarming))
+                        )
+                    handle.write("\n\n")
                 handle.write("| PR | head | reason |\n|---|---|---|\n")
                 for pr, head_sha, _pending_since, _refire, reason in failed:
                     handle.write("| #%d | `%s` | %s |\n" % (pr["number"], head_sha[:7], reason))
@@ -1189,17 +1220,44 @@ def main(argv=None):
                 # `len(refired)` is the count that went on COOLDOWN, which is
                 # exactly what makes "those rank first next run" true -- and
                 # it is only the same as "the count that won a slot" because
-                # a failed write no longer consumes one. Where the two do
-                # diverge (the attempt ceiling bit), the write-failure line in
-                # the failed-PR section above names the difference rather than
-                # letting this one imply the budget was delivered.
+                # a failed write no longer consumes one.
+                #
+                # So it is the DELIVERED figure here too. Interpolating the
+                # constant instead reported "MAX_REFIRES_PER_RUN=5 delivered"
+                # on a run that delivered nothing, two lines under
+                # "re-fired 0" -- a fully-spent budget over a genuine
+                # starvation, which is the one reading that stops an operator
+                # looking. The rotation clause has the same dependency and is
+                # split out below rather than asserted unconditionally.
                 handle.write(
                     "\n### %d PR(s) eligible but deferred past this run's re-fire budget "
-                    "(MAX_REFIRES_PER_RUN=%d delivered, MAX_REFIRE_ATTEMPTS_PER_RUN=%d attempted) "
-                    "-- they waited less than the %d re-fired above, which go on cooldown, "
-                    "so these rank first next run\n\n"
-                    % (len(deferred), MAX_REFIRES_PER_RUN, MAX_REFIRE_ATTEMPTS_PER_RUN, len(refired))
+                    "(%d of MAX_REFIRES_PER_RUN=%d delivered, "
+                    "MAX_REFIRE_ATTEMPTS_PER_RUN=%d attempted)\n\n"
+                    % (
+                        len(deferred),
+                        len(refired),
+                        MAX_REFIRES_PER_RUN,
+                        MAX_REFIRE_ATTEMPTS_PER_RUN,
+                    )
                 )
+                if refire_write_failures:
+                    # The guarantee is earned by the cooldown, and a failed
+                    # write posts no marker, so it starts none. Those PRs keep
+                    # the longer waits that won them a slot and re-take the
+                    # front of the queue ahead of everything deferred here --
+                    # the set is stationary, not rotating. Claiming otherwise
+                    # reads a starvation as fairness working.
+                    handle.write(
+                        "These do **not** rank first next run: %d re-fire write(s) failed, "
+                        "and a failed write posts no marker so starts no cooldown. Those "
+                        "PRs keep their longer waits and rank ahead of these again until "
+                        "the write-side failure is fixed.\n\n" % len(refire_write_failures)
+                    )
+                else:
+                    handle.write(
+                        "They waited less than the %d re-fired this run, which go on "
+                        "cooldown, so these rank first next run.\n\n" % len(refired)
+                    )
                 handle.write("| PR | head | reason |\n|---|---|---|\n")
                 for pr, head_sha, _pending_since, _refire, reason in deferred:
                     handle.write("| #%d | `%s` | %s |\n" % (pr["number"], head_sha[:7], reason))

@@ -1184,19 +1184,13 @@ class TestCommentBodyIsModeAware(unittest.TestCase):
         self.assertIn("awaiting review", body)
 
 
-class TestFailureSummaryAttribution(unittest.TestCase):
-    """A write-pass failure must not be reported as a read-pass abort.
+class _RendersMainSummary:
+    """Harness for asserting on what main() writes to GITHUB_STEP_SUMMARY.
 
-    Both record the exception type in their reason, so a rate-limited WRITE
-    reads "re-fire write failed (RateLimitExhausted)" and contains
-    RATE_LIMIT_TOKEN as a substring. Bucketing on that alone printed "never
-    attempted ... the run aborted" directly above a table row saying the
-    write failed -- the summary contradicting itself. The two have different
-    remedies (fewer reads vs. a write-side rejection), and an operator reads
-    this during exactly the incident the script backstops.
+    A plain mixin, not a TestCase, so unittest does not collect it as a
+    suite of its own -- the fixtures below are shared by two classes that
+    assert on different paragraphs of the same rendered summary.
     """
-
-    NEVER_ATTEMPTED = "never attempted"
 
     def setUp(self):
         self._real_sweep = sweep.sweep
@@ -1245,6 +1239,30 @@ class TestFailureSummaryAttribution(unittest.TestCase):
             "%s -- %s" % (sweep.SWEEP_ERROR_REASON_PREFIX, sweep.RATE_LIMIT_TOKEN),
         )
 
+    def _deferred(self, number):
+        return (
+            _pr(number), "%040x" % number, 1.0, False,
+            "%s -- over budget" % sweep.DEFERRED_REASON_PREFIX,
+        )
+
+    def _refired(self, number):
+        return (_pr(number), "%040x" % number, 1.0, True, "re-fired")
+
+
+class TestFailureSummaryAttribution(_RendersMainSummary, unittest.TestCase):
+    """A write-pass failure must not be reported as a read-pass abort.
+
+    Both record the exception type in their reason, so a rate-limited WRITE
+    reads "re-fire write failed (RateLimitExhausted)" and contains
+    RATE_LIMIT_TOKEN as a substring. Bucketing on that alone printed "never
+    attempted ... the run aborted" directly above a table row saying the
+    write failed -- the summary contradicting itself. The two have different
+    remedies (fewer reads vs. a write-side rejection), and an operator reads
+    this during exactly the incident the script backstops.
+    """
+
+    NEVER_ATTEMPTED = "never attempted"
+
     def test_a_rate_limited_write_is_not_reported_as_never_attempted(self):
         """The regression. Reverting the REFIRE_WRITE_FAILURE_TOKEN exclusion
         in main()'s `rate_limited` filter makes this fail."""
@@ -1291,6 +1309,101 @@ class TestFailureSummaryAttribution(unittest.TestCase):
 
         self.assertIn("DID win a slot and were attempted", summary)
         self.assertNotIn(self.NEVER_ATTEMPTED, summary)
+
+
+class TestDeferralHeaderReportsMeasuredDelivery(_RendersMainSummary, unittest.TestCase):
+    """Write-failures WITH deferrals -- the combination that renders the
+    deferral header and the DEGRADED paragraph at the same time.
+
+    Neither was covered: the write-failure cases all had an empty deferral
+    list and the deferral cases had no failures, so the two paragraphs that
+    interpolate `failed` were only ever exercised in the states where the
+    conflation is invisible. In this state the header interpolated the
+    CONSTANT MAX_REFIRES_PER_RUN as the count delivered -- reporting a
+    fully-spent budget two lines under "re-fired 0" -- and promised a
+    rotation that cannot happen, because a failed write posts no marker, so
+    starts no cooldown, so those PRs keep their longer waits and rank ahead
+    again. The population is stationary, not rotating.
+    """
+
+    def _spent_budget_claim(self):
+        """What the header must NOT say: the cap, reported as delivered."""
+        return "%d of MAX_REFIRES_PER_RUN=%d delivered" % (
+            sweep.MAX_REFIRES_PER_RUN,
+            sweep.MAX_REFIRES_PER_RUN,
+        )
+
+    def test_a_run_that_delivered_nothing_does_not_report_a_spent_budget(self):
+        """The regression. Reverting to the constant makes this fail."""
+        summary = self._summary_for(
+            [self._write_failure(n) for n in (1, 2)] + [self._deferred(3)]
+        )
+
+        self.assertIn(
+            "0 of MAX_REFIRES_PER_RUN=%d delivered" % sweep.MAX_REFIRES_PER_RUN, summary
+        )
+        self.assertNotIn(self._spent_budget_claim(), summary)
+
+    def test_the_delivered_figure_is_the_measured_count_not_the_cap(self):
+        """Two delivered under a cap of five must read as two, so the header
+        cannot pass by coincidence on a run that happens to spend it all."""
+        summary = self._summary_for(
+            [self._refired(1), self._refired(2), self._deferred(3)]
+        )
+
+        self.assertIn(
+            "2 of MAX_REFIRES_PER_RUN=%d delivered" % sweep.MAX_REFIRES_PER_RUN, summary
+        )
+        self.assertNotIn(self._spent_budget_claim(), summary)
+
+    def test_the_rotation_guarantee_is_withdrawn_when_a_write_failed(self):
+        """A failed write starts no cooldown, so the deferred set does not
+        advance. Claiming it does reads a starvation as fairness working."""
+        summary = self._summary_for([self._write_failure(1), self._deferred(2)])
+
+        self.assertIn("do **not** rank first next run", summary)
+        self.assertNotIn("so these rank first next run", summary)
+
+    def test_the_rotation_guarantee_still_holds_when_every_write_landed(self):
+        """Positive control. Without it, deleting the rotation clause
+        outright would pass the test above while destroying the claim this
+        PR exists to make true."""
+        summary = self._summary_for([self._refired(1), self._deferred(2)])
+
+        self.assertIn("so these rank first next run", summary)
+        self.assertNotIn("do **not** rank first next run", summary)
+
+    def test_a_write_only_failure_does_not_discredit_the_alarm_count(self):
+        """Every PR was READ; only the write was rejected. `alarming` is
+        therefore exact, and telling the operator to discount it removes the
+        one trustworthy number on the run where it is the only signal.
+
+        Three failures, because sweep_is_degraded has a floor of 3 -- below
+        it nothing renders and the assertion would pass vacuously.
+        """
+        summary = self._summary_for([self._write_failure(n) for n in (1, 2, 3)])
+
+        self.assertIn("This run is DEGRADED", summary)
+        self.assertIn("read in full and failed on the re-fire WRITE", summary)
+        self.assertNotIn("could not be read", summary)
+
+    def test_a_read_failure_still_discredits_the_alarm_count(self):
+        """Positive control for the test above: gating the sentence must not
+        delete it. A PR that could not be read cannot be shown un-stranded."""
+        summary = self._summary_for([self._read_failure(n) for n in (1, 2, 3)])
+
+        self.assertIn("This run is DEGRADED", summary)
+        self.assertIn("could not be read", summary)
+        self.assertNotIn("read in full and failed on the re-fire WRITE", summary)
+
+    def test_a_mixed_run_attributes_each_failure_kind_to_its_own_side(self):
+        """Neither clause absorbs the other's members."""
+        summary = self._summary_for(
+            [self._read_failure(n) for n in (1, 2, 3)] + [self._write_failure(4)]
+        )
+
+        self.assertIn("3 could not be read", summary)
+        self.assertIn("1 were read in full and failed on the re-fire WRITE", summary)
 
 
 class TestAttemptCeilingIsClamped(unittest.TestCase):
