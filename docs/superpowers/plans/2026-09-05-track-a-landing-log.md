@@ -552,11 +552,20 @@ Fire 1 used it, with `idempotencyKey: blo-32511-fire-1` so a retry cannot double
 | status | `issue_created` |
 | execution issue | [BLO-34858](https://paperclip.blockcast.net/BLO/issues/BLO-34858) `dc3d926b-672a-4756-92aa-402613736356` |
 
-**The fire-1 dispatch lag cleared on its own.** The fire minted the `routine_execution` issue
-assigned to Ally, `todo`, `high`; that issue then sat **`todo` for ~18 minutes with
-`activeRun: null`** while the creating run still held its own checkout, which is the most likely
-reason the wake found nothing free to take. Run `230a8b6d-3736-4cfb-a661-2ab392371513` picked it up
-at `13:01:18.951Z` and posted receipt 1 nine minutes later. No intervention was needed.
+**The fire-1 dispatch lag cleared on its own, and it was 2h18m — not the ~12 or ~18 minutes
+recorded earlier.** Both smaller figures are wrong and are corrected here; the second dropped the
+hours component. Measured from the API timestamps:
+
+| event | timestamp | elapsed |
+| --- | --- | --- |
+| fire minted BLO-34858 (`todo`, `high`, Ally, `activeRun: null`) | `2026-09-20T10:43:04.948Z` | — |
+| run `230a8b6d-3736-4cfb-a661-2ab392371513` picked it up | `2026-09-20T13:01:18.951Z` | **+2h18m14s** |
+| receipt 1 posted | `2026-09-20T13:10:13.997Z` | +8m55s |
+
+The creating run still held its own checkout across that window, which is the most likely reason
+the wake found nothing free to take. No intervention was needed. The figure matters because a
+2h18m dispatch lag against a 6h cron period is a third of the window — worth watching, where an
+18-minute lag would not be.
 
 **The workspace-binding risk flagged above did not materialise.** Neither receipt contains an
 `aborted:script-missing` row; both are full classifications, so the execution runs did find
