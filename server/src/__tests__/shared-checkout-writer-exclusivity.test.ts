@@ -182,8 +182,12 @@ describe("the key reaches the reservation (end-to-end through the resolver)", ()
   // defect: the resolver DID drop the key at 1, which is the DEFAULT for every
   // external-lifecycle agent (`concurrencyEnabled` is false unless an operator
   // sets it, and `resolveExternalLifecycleConcurrency` then returns a hard 1).
-  // The untested branch was the only branch that ships. Any new exit added to
-  // that resolver must be reachable from this helper.
+  // The untested branch was the only branch that ships. Any new exit reachable
+  // with `isWorkspaceIsolated: false` and no persisted workspace must be
+  // exercised here. The other two exits are NOT reachable from this helper --
+  // stateless PR review and the persisted-`workspace` exit both need inputs
+  // this helper hardcodes; the latter is covered in
+  // `heartbeat-external-lifecycle-concurrency-flag.test.ts`.
   const identityFor = (
     runId: string,
     treeKey: string | null,

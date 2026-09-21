@@ -347,10 +347,14 @@ describe("resolveK8sRunIsolationIdentity: writer key follows the tree, not the r
   //   `agent-shared:B`, both satisfied the writer index, and both wrote one
   //   directory -- BLO-19422's measured defect. Because `concurrencyEnabled`
   //   defaults false, this was the DEFAULT path, not an edge case.
-  // - Containment is not this index's job. The per-agent ceiling is enforced at
-  //   dispatch by `availableSlots = effectiveMaxConcurrentRuns - runningCount`
-  //   in `startNextQueuedRunForAgent`, so widening the key cannot let an agent
-  //   exceed its ceiling -- the slot counter never admits the second run.
+  // - Containment is mostly not this index's job. The per-agent ceiling is
+  //   enforced at dispatch by `availableSlots = effectiveMaxConcurrentRuns -
+  //   runningCount` in `startNextQueuedRunForAgent` -- except where BLO-12990
+  //   excludes a silent run from `countRunsOccupyingSlots`, which lets a second
+  //   run in at effective concurrency 1. There, and only there, this key was
+  //   doing real containment work and widening it gives that up. See the KNOWN
+  //   GAP on `resolveWorkspaceWriterTreeKey`: that case needs a silent run AND
+  //   an un-backfilled issue, where the cross-agent defect above needs neither.
   //
   // Nor does widening loosen the case the old rationale named: two runs of one
   // agent on DIFFERENT issues of one project checkout both key
