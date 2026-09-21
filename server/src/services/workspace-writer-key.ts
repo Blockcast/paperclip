@@ -13,6 +13,14 @@
  * means "nothing shared to exclude on" and leaves the run's own run-unique key
  * in place.
  *
+ * That contract depends on the index being keyed on `isolation_key` ALONE
+ * (migration 0130: `ON (isolation_key) WHERE released_at IS NULL AND
+ * isolation_key IS NOT NULL`). Adding `isolation_mode` to it would silently
+ * un-exclude every mixed-mode pair this relies on -- agent A at concurrency 1
+ * (mode `shared`) and agent B at concurrency 3 (mode `run`) on one project
+ * workspace produce the same key and MUST collide. Every test here would still
+ * pass while that case stayed broken.
+ *
  * The class depends on which shape the run resolves to, and the two shapes key
  * on different things:
  *

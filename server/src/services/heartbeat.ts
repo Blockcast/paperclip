@@ -6967,12 +6967,19 @@ export function resolveK8sRunIsolationIdentity(input: {
  * Concurrency` returns a hard 1), this exit is the DEFAULT posture rather than
  * an edge case.
  *
- * The "inverting BLO-16842's containment" half of that rationale does not hold
- * either: the per-agent concurrency ceiling is enforced at dispatch by
+ * The "inverting BLO-16842's containment" half of that rationale is weaker than
+ * it looks, but it is NOT free: the per-agent ceiling is enforced at dispatch by
  * `availableSlots = effectiveMaxConcurrentRuns - runningCount` in
- * `startNextQueuedRunForAgent`, not by this index. Widening the key cannot let
- * an agent exceed its ceiling, because the slot counter never admits the second
- * run. `agent-shared` was a belt over braces that already hold.
+ * `startNextQueuedRunForAgent`, not by this index -- EXCEPT where BLO-12990
+ * excludes a silent run from `countRunsOccupyingSlots`. One silent running row
+ * leaves `runningRunRows.length === 1` (so the zero-rows guard does not fire)
+ * while `runningCount` collapses to 0, so `availableSlots = 1 - 0 = 1` and a
+ * second run IS admitted at effective concurrency 1. In exactly that case
+ * `agent-shared` was not a belt over braces -- it was the sole restraint, and
+ * widening the key gives it up. That narrow loss is stated as a KNOWN GAP on
+ * `resolveWorkspaceWriterTreeKey`; it needs a silent run AND an un-backfilled
+ * issue, where the cross-agent case this buys needs no loophole at all and is
+ * the measured default defect. The trade is deliberate, not an oversight.
  *
  * The cost is real and deliberate: this serializes ALL issues of one project
  * workspace across ALL agents, because they are one mutable directory. That is
