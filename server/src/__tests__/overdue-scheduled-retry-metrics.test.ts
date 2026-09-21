@@ -118,7 +118,7 @@ describeEmbeddedPostgres("refreshOverdueScheduledRetryAgeMetrics (BLO-22094)", (
 
   it("is silent for a capacity-clamped park whose advertised resume instant is still in the future (BLO-34782)", async () => {
     // The clamp working as designed, not a wedge. `CCROTATE_CAPACITY_MAX_PARK_MS`
-    // caps the booked horizon at an hour, so a pool that will not serve for 3.5
+    // caps the booked horizon at 15 minutes, so a pool that will not serve for 3.5
     // days is booked to re-probe in ~15 minutes. Fifteen minutes later the bare
     // `scheduled_retry_at < now` predicate is satisfied and stays satisfied for
     // the whole quota window, while the run is still correctly backing off --

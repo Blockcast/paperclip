@@ -80,7 +80,7 @@ export async function refreshQueuedRunAgeMetrics(db: Db, now = new Date()): Prom
  *
  * A `ccrotate_capacity` park does not book what the provider asked for. The
  * scheduler *clamps* it — `CCROTATE_CAPACITY_MAX_PARK_MS` caps the horizon at
- * an hour — so a pool that will not serve until 3.5 days out is booked to
+ * 15 minutes — so a pool that will not serve until 3.5 days out is booked to
  * re-probe in ~15 minutes. Fifteen minutes later the row satisfies
  * `scheduled_retry_at < now()` and keeps satisfying it for the entire
  * remaining quota window, while the run is still, correctly, backing off.
@@ -96,6 +96,16 @@ export async function refreshQueuedRunAgeMetrics(db: Db, now = new Date()): Prom
  * gauge exists to catch, not the clamp working as designed. Every other park
  * reason writes no `penstockAdvertisedResumeAt`, so `greatest` (which ignores
  * NULLs) collapses to the bare due time and their arithmetic is unchanged.
+ *
+ * Note the asymmetry this creates, because it is not obvious: the advertised
+ * instant is persisted *unclamped*, so the suppression window is
+ * provider-controlled even though the *booked* park deliberately distrusts it
+ * (`CCROTATE_CAPACITY_MAX_PARK_MS` exists because a long advertised horizon is
+ * not credible enough to schedule against). A provider returning an
+ * implausible resume instant therefore silences this gauge for that row until
+ * it passes. The backstop is `CAPACITY_ESCALATION_AFTER_MS`, which ends
+ * the chain on wall-clock regardless of what was advertised; the park itself
+ * also stays visible on `paperclipListParkedAgents`, which is non-paging.
  *
  * The regex guard is deliberate, and so is its failure direction. Both
  * `result_json` writers of this field go through
