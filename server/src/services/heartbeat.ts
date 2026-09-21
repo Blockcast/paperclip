@@ -20092,6 +20092,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // GitHub-evidence read and transient GitHub/token failures can retry.
       // Opt-in and swallowed so status delivery can never alter exhaustion
       // handling.
+      //
+      // BLO-34699: this arm deliberately does NOT require the
+      // `adapterInvocationStarted` proof the two non-retryable arms do, and the
+      // asymmetry is the point rather than an oversight. Exhaustion is a
+      // stronger claim to terminality: the bounded chain has run to its end, so
+      // nothing further is coming from this request whether or not any single
+      // attempt reached a model call. The non-retryable arms have no such
+      // chain behind them — one crashed pod is their whole evidence — which is
+      // why they need the extra proof. Do not "fix" this by symmetry.
       await queueFailedPrReviewGateStatus(run, contextSnapshot, "retry_exhausted").catch((error) => {
         logger.warn(
           { err: error, runId: run.id },

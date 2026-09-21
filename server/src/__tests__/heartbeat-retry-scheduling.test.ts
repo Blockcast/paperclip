@@ -3293,8 +3293,17 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       return { events, runId };
     }
 
+    // BLO-34699: `reviewKind`/`prRole` are load-bearing, not decoration. The
+    // seeded `pr_review_output_missing` errorCode is only reachable through
+    // evaluatePrReviewCompletionEvidence, which returns `not_applicable` unless
+    // reviewKind === "pr_review" and prRole is absent or "reviewer" — so a
+    // snapshot without them is a shape production cannot mint. Omitting them
+    // also made the three negative cases below pass vacuously, for the tag
+    // check rather than for the condition each one names.
     const prReviewSnapshot = {
       wakeReason: "github_pr_synchronized",
+      reviewKind: "pr_review",
+      prRole: "reviewer",
       githubPrNumber: 7,
       githubRepoFullName: "Blockcast/hang",
       githubHeadSha: HEAD_SHA,
@@ -3350,6 +3359,30 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
       expect(events.at(-1)?.message).toContain("Bounded retry exhausted");
       expect(events.some((e) => e.message.includes("gate status"))).toBe(false);
+    });
+
+    // BLO-34699: the PR author's own agent is woken by its own review-request
+    // marker (BLO-19522) and carries the same repo/head/PR identity as the
+    // reviewer, so before the resolver read these tags a crashed author run was
+    // published as the reviewer's verdict on the head. Asserted at the call
+    // site, not only over the pure predicate: this is the case that must
+    // enqueue no `github_commit_status` delivery at all. One row per guard
+    // clause so neither can hide behind the other under mutation (BLO-34263) —
+    // `measured` is the shape seen on pim-multicast-gateway#3237.
+    it.each([
+      { label: "measured author shape (no reviewKind)", overrides: { reviewKind: undefined, prRole: "author" } },
+      { label: "author run that is tagged pr_review", overrides: { prRole: "author" } },
+    ])("writes no gate-status event for the PR author's own run — $label", async ({ overrides }) => {
+      process.env[GATE_CONTEXT_ENV] = "review/ally-complete";
+      const { events } = await exhaustPrReviewRun({ ...prReviewSnapshot, ...overrides });
+
+      expect(events.at(-1)?.message).toContain("Bounded retry exhausted");
+      expect(events.some((e) => e.message.includes("gate status"))).toBe(false);
+      const deliveries = await db
+        .select()
+        .from(githubCommitStatusDeliveries)
+        .where(eq(githubCommitStatusDeliveries.sha, HEAD_SHA));
+      expect(deliveries).toHaveLength(0);
     });
   });
 
