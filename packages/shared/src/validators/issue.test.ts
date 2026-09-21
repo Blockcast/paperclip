@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MAX_ISSUE_REQUEST_DEPTH } from "../index.js";
+import { ISSUE_EXECUTION_MONITOR_KINDS, MAX_ISSUE_REQUEST_DEPTH } from "../index.js";
 import {
   addIssueCommentSchema,
   createIssueSchema,
@@ -484,6 +484,48 @@ describe("issue validators", () => {
       }
       // The hazard that actually bites a hand-rolled fetch is the default page size, not the cap.
       expect(text).toMatch(/DEFAULT page size is 30/);
+    });
+
+    // PEN-3415: `monitor.kind` is the trigger for the #1195 external-wait slot yield. Measured
+    // 2026-09-21 across every `in_review` row in one company (64 rows, untruncated): 7 armed
+    // monitors, 7/7 with `kind: null` — an opt-in mechanism nobody opted into, because this was
+    // the one conjunct of the yield predicate no agent-facing string described. The failure is
+    // silent by construction (200 + armed monitor either way), so the description IS the only
+    // thing standing between a caller and a no-op. Assert the claims, not the prose.
+    it("tells the caller that monitor.kind is what releases the execution slot", () => {
+      const text = issueExecutionMonitorPolicySchema.shape.kind.description ?? "";
+
+      // Coupled to the constant the route predicate compares against, so renaming or adding a
+      // kind fails here rather than leaving the description naming a value that no longer fires.
+      for (const kind of ISSUE_EXECUTION_MONITOR_KINDS) {
+        expect(text).toContain(kind);
+      }
+      // The terminal code and activity action are the caller's only positive evidence the slot
+      // was actually freed; both are literals in the route, so name them exactly.
+      expect(text).toContain("external_wait_yield");
+      expect(text).toContain("heartbeat.external_wait_yielded");
+      // Null is the default and is a silent no-op — the trap this whole block exists for.
+      expect(text).toMatch(/defaults to `null`/);
+      expect(text).toMatch(/null `kind` yields NOTHING/i);
+      // A 200 with an armed monitor is not evidence of a yield; say so, or the caller checks the
+      // one field that looks right and stops.
+      expect(text).toMatch(/NOT evidence/i);
+      // The gate is a conjunction: the same-run requirement makes a later fix-up PATCH inert.
+      expect(text).toMatch(/CURRENT execution run/i);
+      // The run dies at this PATCH, so anything unfinished — including a follow-up comment — is
+      // lost. Guidance that sells the yield without this ordering rule teaches data loss.
+      expect(text).toMatch(/terminated at this PATCH/i);
+      expect(text).toMatch(/Commit, push/i);
+    });
+
+    // The pointer matters as much as the target: an agent arming a monitor reads the `monitor`
+    // description and has no reason to open a sub-field it has never heard of.
+    it("points from the monitor description at the field that frees the slot", () => {
+      const text = issueExecutionPolicySchema.shape.monitor.description ?? "";
+
+      expect(text).toContain("monitor.kind");
+      expect(text).toContain("external_service");
+      expect(text).toMatch(/does NOT release your agent execution slot/i);
     });
   });
 
