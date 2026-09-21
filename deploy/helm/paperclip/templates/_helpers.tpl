@@ -286,7 +286,7 @@ operator would read seven days of zero blocks as "the gate is quiet" rather than
        both say so. */ -}}
 {{- $v := (kindIs "invalid" $raw | ternary "0" ($raw | toString)) -}}
 {{- if not (has $v (list "0" "1")) -}}
-{{- fail (printf "evidenceGate.unlabeledTruthBlock must be the string \"0\" or \"1\", got %q — an unquoted YAML bool renders \"true\" and the server reads it as off (docs/runbooks/evidence-gate-unlabeled-block.md)" $v) -}}
+{{- fail (printf "evidenceGate.unlabeledTruthBlock must be the string \"0\" or \"1\", got %q (note: an unquoted YAML bool renders \"true\"/\"false\" and the server reads either as off) — docs/runbooks/evidence-gate-unlabeled-block.md" $v) -}}
 {{- end -}}
 {{- $v | quote -}}
 {{- end }}

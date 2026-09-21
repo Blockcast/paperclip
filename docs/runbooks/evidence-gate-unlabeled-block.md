@@ -248,7 +248,8 @@ curl -sS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
 **A day that comes back `truncated: true` is an unmeasured day, not a clean
 one** — `total` and `willBlock` are both floors, and the cut falls on the wrong
 side. With no `sortField` the list orders by priority then recency
-(`issues.ts:2216-2221`), so the rows past the cap are the low-priority, stalest
+(`server/src/services/issues.ts:2125-2129`, priority rank at `:7719`), so the
+rows past the cap are the low-priority, stalest
 `in_review` issues — exactly where an issue sits without a clean Ally review at
 head. Truncation therefore under-samples `willBlock` harder than `total` and the
 ratio reads *safer* than reality. It voids the install check above for the same
