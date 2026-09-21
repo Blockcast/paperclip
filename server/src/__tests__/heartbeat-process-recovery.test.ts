@@ -13029,11 +13029,22 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // `retiringBound` is written with `coalesce`, first writer wins permanently, and no
     // refund touches it.
     //
-    // Both bounds are legitimately reachable here and neither is collapsed into the other:
-    // `strandedRecoveryWakeAttemptsExhausted` is disjunctive (budget OR `timeoutAt <= now`),
-    // so the set membership is the assertion that fails if the wake path ever hardcodes one
-    // bound on that gate, and the pairing below is what fails if a retirement stops
-    // escalating — or an un-retired row escalates without recording a bound.
+    // What the two lines below DO and DO NOT catch, stated honestly because a guard whose
+    // claimed mutation passes is documentation (BLO-34263), and the weaker version of that
+    // mistake is what this PR is fixing.
+    //
+    // The pairing catches a MISMATCH only: escalated with no bound, or a bound with no
+    // escalation. It is silent on retirement never firing at all — that reads as
+    // `null` + `active` and passes. Which bound fired is deliberately not pinned here: both
+    // are reachable under this race and neither may satisfy the other's expectation, so
+    // `attempt_budget` discrimination lives in the deterministic
+    // `issue-recovery-actions.test.ts` cases and `timeout_horizon` in the test below.
+    //
+    // The set membership is documentation, not a guard: `[null, attempt_budget,
+    // timeout_horizon]` is every value this call site can write, and the other two enum
+    // members are only written alongside a terminal status that this query's
+    // `inArray(status, ["active","escalated"])` filter already excludes. Kept only so the
+    // reachable set is written down next to the pairing that consumes it.
     const retiringBound = actions[0]?.retiringBound ?? null;
     expect([null, "attempt_budget", "timeout_horizon"]).toContain(retiringBound);
     expect(actions[0]?.status).toBe(retiringBound === null ? "active" : "escalated");
@@ -13055,9 +13066,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     // The state a long-lived action reaches: horizon burned, budget barely touched. Seeded
     // rather than swept into, because the sweep escalates the issue out of the stranded set
-    // on its first pass — one sweep is the only entry this path gets. Owner-keyed
-    // fingerprint, matching what the sweep computes, so it reuses this row rather than
-    // inserting a second one (asserted by the id check below).
+    // on its first pass — one sweep is the only entry this path gets. The sweep reuses this
+    // row rather than inserting a second one because `getActiveForIssue` keys reuse on
+    // `(companyId, sourceIssueId, status IN active)` alone; `fingerprint` is NOT load-bearing
+    // here — the upsert overwrites it with `input.fingerprint` unconditionally, and with an
+    // `active` status and an owner set `shouldReuseStrandedRecoveryAction` returns false
+    // whether or not it matches. It is written in the shape the sweep computes only so the
+    // fixture reads like a real row.
     const [seeded] = await db.insert(issueRecoveryActions).values({
       companyId,
       sourceIssueId: issueId,
@@ -13077,20 +13092,26 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     await heartbeat.reconcileStrandedAssignedIssues();
 
-    const retired = await db
+    const rows = await db
       .select()
       .from(issueRecoveryActions)
       .where(and(
         eq(issueRecoveryActions.companyId, companyId),
         eq(issueRecoveryActions.sourceIssueId, issueId),
-      ))
-      .then((rows) => rows[0] ?? null);
+      ));
+    // Length before index: the query has no ORDER BY, so with a second row present `rows[0]`
+    // is arbitrary and the id check below would fail ~half of runs instead of every run —
+    // a flake introduced by the test that exists to remove one.
+    expect(rows).toHaveLength(1);
+    const retired = rows[0] ?? null;
     expect(retired?.id).toBe(seeded!.id);
     expect(retired?.status).toBe("escalated");
     expect(retired?.retiringBound).toBe("timeout_horizon");
-    // The point of the row: retired, with the budget demonstrably NOT reached — the sweep
-    // reserved an attempt and `retireAndReleaseWakeAttempt` refunded it in the same
-    // statement that escalated. This is what BLO-33410's `attemptCount` branch called
+    // The point of the row: retired, with the budget demonstrably NOT reached. Either of the
+    // upsert's two arms gets there — the sweep increments to 2 and `retireAndReleaseWakeAttempt`
+    // refunds to 1 in the same statement that escalates, or, if the routed owner differs from
+    // the seeded one, `isNewOwnerSequence` RESETS the count to 1 and the refund lands it at 0.
+    // Both are below the budget, which is what BLO-33410's `attemptCount` branch called
     // unreachable.
     expect(retired?.attemptCount).toBeLessThan(defaultRecoveryActionMaxAttempts);
   });
