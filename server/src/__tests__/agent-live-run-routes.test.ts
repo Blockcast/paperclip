@@ -615,8 +615,13 @@ describe("agent live run routes", () => {
    * entitled, so booking it `denied` is equally false, and a matcher pinned to `"allowed"` passes
    * that mutation unchanged. Second control (also verified): make the route write
    * `logRunLogAccessAudit(..., "denied", ...)` on this path and this fails.
+   *
+   * The `readLog` positive pins the path the absence assertion is about. Without it, any mutation
+   * that 404s BEFORE `readLog` writes no audit either, so the absence assertion passes while
+   * nothing is exercised — verified: a `return` above `readLog` fails this test, and fails nothing
+   * if the positive is removed.
    */
-  it("does not audit an allowed run log read when the run stored no log", async () => {
+  it("does not audit a run log read at all when the run stored no log", async () => {
     const app = await createApp();
     const { notFound } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
     mockHeartbeatService.readLog.mockRejectedValue(notFound("Run log not found"));
@@ -627,6 +632,7 @@ describe("agent live run routes", () => {
     );
 
     expect(res.status, JSON.stringify(res.body)).toBe(404);
+    expect(mockHeartbeatService.readLog).toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       action: "heartbeat.run_log_accessed",
     }));
@@ -749,9 +755,11 @@ describe("agent live run routes", () => {
    * regresses.
    *
    * BLO-34901: no `result` matcher, same reasoning as the heartbeat guard above — and second
-   * control verified here too.
+   * control verified here too. The `readLog` positive pins the exercised path for the same reason,
+   * with its own verified mutation: a `return` above `readLog` fails this test only while that
+   * assertion is present.
    */
-  it("does not audit an allowed workspace-operation log read when the operation stored no log", async () => {
+  it("does not audit a workspace-operation log read at all when the operation stored no log", async () => {
     mockWorkspaceOperationService.getById.mockResolvedValue(
       workspaceOperationLogFixture({ logStore: null, logRef: null }),
     );
@@ -767,6 +775,7 @@ describe("agent live run routes", () => {
     );
 
     expect(res.status, JSON.stringify(res.body)).toBe(404);
+    expect(mockWorkspaceOperationService.readLog).toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       action: "workspace_operation.log_accessed",
     }));
