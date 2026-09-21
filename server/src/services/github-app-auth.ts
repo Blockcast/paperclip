@@ -108,6 +108,27 @@ export function githubSharesReviewerIdentity(login: string, configuredLogin: str
 }
 
 /**
+ * Are these two logins the same actor, whichever hat each is wearing?
+ *
+ * `githubSharesReviewerIdentity` cannot answer this: it derives an App slug
+ * from its SECOND argument, so it is directional and returns false whenever
+ * that side is a plain user login. Asking it "is this reviewer the PR author"
+ * therefore answers "no" for two spellings of one human, which on a
+ * self-attestation check is the fabricating direction.
+ *
+ * Both orders, because either side may be the App spelling, plus plain login
+ * equality so a human reviewing their own PR is caught too — GitHub bars a PR
+ * author from APPROVING their own PR, but not from filing a `COMMENTED` review
+ * carrying a `Reviewed head:` attestation.
+ */
+export function githubSameActorLogin(a: string, b: string): boolean {
+  const left = exactGithubLogin(a);
+  const right = exactGithubLogin(b);
+  if (!left || !right) return false;
+  return left === right || githubSharesReviewerIdentity(a, b) || githubSharesReviewerIdentity(b, a);
+}
+
+/**
  * Mint an RS256 GitHub App JWT (valid ~9 min). Returns null when the App id or
  * private key is unconfigured.
  */

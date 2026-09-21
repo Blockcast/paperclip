@@ -271,27 +271,110 @@ describe("buildGithubTruthProbe", () => {
     expect(r.detections["review:ally-clean"]).toBe(true);
   });
 
-  // KNOWN OPEN, tracked at BLO-34969. Pinned rather than fixed, and pinned in
-  // the ASSERTING direction so it can neither close by accident nor widen
-  // unnoticed: when BLO-34969 lands this test fails, which is the point.
+  // BLO-34969, the falsifier this row was filed for. Before it, WHICH GitHub
+  // object carried a body decided whether the self-attestation rule applied to
+  // it: Surface 1 refused an author-written `clean` and Surface 2 published the
+  // identical body off the identical row through the OR.
   //
-  // This is the mirror of the carried-finding case above, with nothing to
-  // carry. Surface 1 reads the review (the merge above put it there), refuses
-  // it because the attesting author IS the PR author, and returns
-  // `not_evaluated` — the correct answer, paid for with a real GitHub call.
-  // Surface 2 then reads the same body author-blind and publishes it through
-  // the OR, so the module discards the detection it just established.
-  //
-  // Not fixed here because both available fixes — dropping `formalClean` from
-  // the disjunction, or gating it on the same author evidence — make
-  // `review:ally-clean` UNREACHABLE on every agent-authored PR, the author
-  // being the reviewer identity on all of them. It is a required shape
-  // (`DEFAULT_UNLABELED_REQUIRED`) whose absence `PAPERCLIP_EVIDENCE_UNLABELED_BLOCK=1`
-  // promotes from a warn to a block, so that is an estate-wide `in_review`
-  // decision with its own acceptance criteria, not a review fixup.
-  it("KNOWN GAP (BLO-34969): the formal surface publishes a self-attestation the comment surface refused", async () => {
-    let authorReads = 0;
+  // Asserted as an EQUIVALENCE rather than as two literals on purpose. The
+  // property is "the surface does not change the answer", so a future edit that
+  // moves BOTH surfaces together stays green, and one that moves only one goes
+  // red whichever direction it moves in.
+  it("a self-attested clean body gives the SAME verdict on either surface", async () => {
+    const row = { login: ALLY, body: clean, createdAt: "2026-09-06T00:00:00Z" };
+    const onSurface = async (which: "reviews" | "comments") =>
+      buildGithubTruthProbe(
+        deps({
+          // The PR author IS the attesting identity — an agent-authored PR.
+          fetchPrAuthorLogin: async () => ALLY,
+          listReviewerSurfaces: async () =>
+            which === "reviews"
+              ? {
+                  reviews: [{ ...row, state: "COMMENTED", commitId: HEAD, submittedAt: row.createdAt }],
+                  comments: [],
+                }
+              : { reviews: [], comments: [row] },
+        }),
+      )({ workProducts: [wp()] });
+
+    const asReview = await onSurface("reviews");
+    const asComment = await onSurface("comments");
+    expect(asReview.detections["review:ally-clean"]).toBe(asComment.detections["review:ally-clean"]);
+    // And the shared answer is the WITHHELD one. Equivalence alone would also
+    // be satisfied by both surfaces crediting it, which is the defect.
+    expect(asReview.detections["review:ally-clean"]).toBeUndefined();
+    // Nothing failed: refusing to vouch is a verdict the probe reached, not an
+    // inability to ask. A `probeFailed` here would suppress the escalation
+    // branch and quietly restore the pass it just declined to give.
+    expect(asReview.probeFailed).toBe(false);
+    expect(asComment.probeFailed).toBe(false);
+  });
+
+  // The positive control that keeps the guard above a NARROWING rather than an
+  // off switch, and the case the fix is built to preserve: a review object is
+  // the ONLY surface that can carry a reviewer whose body lacks Ally's
+  // consolidated-review heading, so deleting `formalClean` instead of gating it
+  // would have taken this with it.
+  it("a formal review by a login that is NOT the PR author is still clean", async () => {
     const r = await buildGithubTruthProbe(
+      deps({
+        fetchPrAuthorLogin: async () => ALLY,
+        listReviewerSurfaces: async () => ({
+          reviews: [
+            { login: "some-human", body: clean, state: "COMMENTED", commitId: HEAD, submittedAt: "2026-09-06T00:00:00Z" },
+          ],
+          comments: [],
+        }),
+      }),
+    )({ workProducts: [wp()] });
+    expect(r.detections["review:ally-clean"]).toBe(true);
+    expect(r.probeFailed).toBe(false);
+  });
+
+  // The bare `<slug>` user seat and the `<slug>[bot]` App are one agent in two
+  // hats, so a PR opened by one and attested by the other is still nothing
+  // independent reading that head. `githubSharesReviewerIdentity` is
+  // directional and cannot answer this; `githubSameActorLogin` exists for it.
+  it("the reviewer bot attesting a PR opened by its own user seat is not clean", async () => {
+    const r = await buildGithubTruthProbe(
+      deps({
+        fetchPrAuthorLogin: async () => "allyblockcast",
+        listReviewerSurfaces: async () => ({
+          reviews: [{ login: ALLY, body: clean, state: "COMMENTED", commitId: HEAD, submittedAt: "2026-09-06T00:00:00Z" }],
+          comments: [],
+        }),
+      }),
+    )({ workProducts: [wp()] });
+    expect(r.detections["review:ally-clean"]).toBeUndefined();
+    expect(r.probeFailed).toBe(false);
+  });
+
+  // Fail CLOSED, and say so. An unread author cannot establish independence, so
+  // the attestation is not credited — and `probeFailed` marks it as an
+  // inability to ask rather than a fact about the work, which is what keeps a
+  // GitHub blip from reading as "nobody reviewed this".
+  it("an unreadable PR author withholds the formal clean and marks the probe failed", async () => {
+    const r = await buildGithubTruthProbe(
+      deps({
+        fetchPrAuthorLogin: async () => null,
+        listReviewerSurfaces: async () => ({
+          reviews: [{ login: ALLY, body: clean, state: "COMMENTED", commitId: HEAD, submittedAt: "2026-09-06T00:00:00Z" }],
+          comments: [],
+        }),
+      }),
+    )({ workProducts: [wp()] });
+    expect(r.detections["review:ally-clean"]).toBeUndefined();
+    expect(r.probeFailed).toBe(true);
+    expect(r.diagnostics.some((d) => d.startsWith("github-truth-probe-failed:pr_author:"))).toBe(true);
+  });
+
+  // Both surfaces now want the author, and the read is memoized so the pinned
+  // MAX_SERIAL_CALLS relation to PROBE_DEADLINE_MS still holds. This drives the
+  // path where BOTH ask: Surface 1 refuses the self-attestation, Surface 2 then
+  // asks the same question of the same row.
+  it("the PR author is read at most once even when both surfaces ask", async () => {
+    let authorReads = 0;
+    await buildGithubTruthProbe(
       deps({
         fetchPrAuthorLogin: async () => {
           authorReads += 1;
@@ -299,15 +382,11 @@ describe("buildGithubTruthProbe", () => {
         },
         listReviewerSurfaces: async () => ({
           reviews: [{ login: ALLY, body: clean, state: "COMMENTED", commitId: HEAD, submittedAt: "2026-09-06T00:00:00Z" }],
-          comments: [],
+          comments: [{ login: ALLY, body: clean, createdAt: "2026-09-06T00:00:00Z" }],
         }),
       }),
     )({ workProducts: [wp()] });
-    // The author WAS read, so this is an override of a computed refusal rather
-    // than a surface that never asked the question.
     expect(authorReads).toBe(1);
-    expect(r.detections["review:ally-clean"]).toBe(true);
-    expect(r.probeFailed).toBe(false);
   });
 
   it("a formal review at head with Important(1), or CHANGES_REQUESTED, is not clean", async () => {
