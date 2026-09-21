@@ -706,13 +706,20 @@ function main() {
   const rotted = [];
   let spent = 0;
 
-  for (const repo of targetRepos()) {
-    const rows = runRepo(repo, apply, settleMinutes, spent, rotted);
-    spent += rows.filter((row) => row.action === "enqueue").length;
-    console.log("");
+  // `finally`, because the cohort is the expensive half of the output and the
+  // likeliest thrower is `fetchOpenPrs` — outside `runRepo`'s try, one list
+  // call plus two per undecided PR, multiplied by the repo count, and in a dry
+  // run the only `gh` traffic there is. The explicit call before `process.exit`
+  // in `runRepo` stays: `exit` does not unwind, so this block never runs there.
+  try {
+    for (const repo of targetRepos()) {
+      const rows = runRepo(repo, apply, settleMinutes, spent, rotted);
+      spent += rows.filter((row) => row.action === "enqueue").length;
+      console.log("");
+    }
+  } finally {
+    reportRotted(rotted);
   }
-
-  reportRotted(rotted);
 
   if (!apply) console.log("\n(dry run — pass --apply to act)");
 }

@@ -264,8 +264,27 @@ describe("settle floor from the environment", () => {
   // value reported every rollup as settled — the guard disarming itself in the
   // fail-OPEN direction, silently.
   it("falls back to the default for values that are not a number of minutes", () => {
-    for (const bad of ["15m", "banana", "", "   ", undefined, null, "-5", "NaN"]) {
+    // No `undefined` here: the parameter has an env default, so passing it
+    // re-reads the ambient environment instead of the fallback this case is
+    // named for — a red under `LAND_CLEAN_PRS_SETTLE_MINUTES=30`, which the
+    // script itself invites operators to set. The env path is pinned below.
+    for (const bad of ["15m", "banana", "", "   ", null, "-5", "NaN"]) {
       assert.equal(settleMinutesFrom(bad), CHECK_SETTLE_MINUTES, `bad input: ${String(bad)}`);
+    }
+  });
+
+  it("reads the environment when called with no argument", () => {
+    const prior = process.env.LAND_CLEAN_PRS_SETTLE_MINUTES;
+    try {
+      delete process.env.LAND_CLEAN_PRS_SETTLE_MINUTES;
+      assert.equal(settleMinutesFrom(), CHECK_SETTLE_MINUTES, "unset falls back to the default");
+      process.env.LAND_CLEAN_PRS_SETTLE_MINUTES = "25";
+      assert.equal(settleMinutesFrom(), 25, "a good value is honoured");
+      process.env.LAND_CLEAN_PRS_SETTLE_MINUTES = "15m";
+      assert.equal(settleMinutesFrom(), CHECK_SETTLE_MINUTES, "a bad value cannot disarm the floor");
+    } finally {
+      if (prior === undefined) delete process.env.LAND_CLEAN_PRS_SETTLE_MINUTES;
+      else process.env.LAND_CLEAN_PRS_SETTLE_MINUTES = prior;
     }
   });
 
