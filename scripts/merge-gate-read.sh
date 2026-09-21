@@ -158,10 +158,47 @@ dead_runs() { # stdin: run rows -> stdout: alternation of stale run ids
   # land at id[""] while the END loop reads id[0] — silently dropping one run
   # from DEAD. Direction: RED, but it is the same class of defect as the rest of
   # this file and a fixture caught it.
+  # BLO-34835: the VICTIM predicate covers `failure` as well as `cancelled`.
+  # These are the two halves of this test and only one of them is fenced above:
+  # `== "success"` governs which run may SUPERSEDE and must stay exact; the
+  # victim test governs which run may BE superseded, and restricting it to
+  # `cancelled` was a permanent false RED. One head, one lane, two runs: a
+  # `pull_request` re-trigger at the SAME head (`edited`, `labeled`,
+  # `ready_for_review`, `reopened` — all the cheap metadata actions) leaves the
+  # older run's `failure` rows behind forever, and the head never moves to clear
+  # them. Measured on Open-Capacity-Marketplace#261 @ c1a6cd76: workflow
+  # 328360353 ran twice, 35545233196 failure 23:38:21Z then 35545277556 success
+  # 23:39:15Z after a title edit, and the reader printed a STOP nobody could
+  # clear. ~3% of sampled open-PR heads across five repos carry the shape.
+  #
+  # BEWARE the field this keys on: `workflow_run.event` is the WEBHOOK event
+  # (`pull_request`), NOT the action (`opened`/`edited`). The originating report
+  # read the actions and concluded the two runs were different events; they are
+  # ONE lane, which is precisely why this is in scope and the cross-event cases
+  # below are not. Read `.event`, never the action, before reasoning about lanes.
+  #
+  # Widening the victim does NOT widen the lane. Both cross-event controls stay
+  # empty under it, measured: penstock fbdb3477 (BLO-34114's own control) and the
+  # pull_request_target -> pull_request_review pair pinned in the test file. The
+  # further widening to "any non-newest run of this workflow" is the one that was
+  # implemented and REVERTED — it deletes across events, which is BLO-34114's
+  # masking in the run dimension. Victim widening and lane widening are different
+  # changes; only the first is safe.
+  #
+  # Residual, accepted and NOT fixable by a name-matched variant: if a later
+  # same-lane run SKIPS the job that failed — a job gated on
+  # `github.event.action` or on a label, e.g. paperclip's storybook-visual.yml,
+  # which fires `pull_request` on [opened, reopened, synchronize, labeled] with
+  # the job behind a label test — that run concludes `success` and republishes
+  # the name as `skipped`, which passes. So a label change can turn a red lane
+  # green. A per-name supersession test does not help, because the name IS
+  # republished. This is "latest state wins", which is also what GitHub's own
+  # required-check evaluation does; it is documented here so the next reader does
+  # not mistake it for an oversight in this filter.
   awk -F'\t' 'BEGIN { n = 0 }   # n MUST be seeded: implicit is "" , not 0
               { key = $1 FS $2
                 if ($4 == "success" && $5 > newest_pass[key]) newest_pass[key] = $5
-                if ($4 == "cancelled") {
+                if ($4 == "cancelled" || $4 == "failure") {
                   id[n] = $3; grp[n] = key; started[n] = $5; n++ } }
               END { for (i = 0; i < n; i++)
                       if (started[i] != "" \
