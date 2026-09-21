@@ -110,16 +110,27 @@ export function githubSharesReviewerIdentity(login: string, configuredLogin: str
 /**
  * Are these two logins the same actor, whichever hat each is wearing?
  *
- * `githubSharesReviewerIdentity` cannot answer this: it derives an App slug
- * from its SECOND argument, so it is directional and returns false whenever
- * that side is a plain user login. Asking it "is this reviewer the PR author"
- * therefore answers "no" for two spellings of one human, which on a
- * self-attestation check is the fabricating direction.
+ * `githubSharesReviewerIdentity` is directional — it derives an App slug from
+ * its SECOND argument — so it returns false whenever that side is a plain user
+ * login. This helper is symmetric: both orders, plus plain login equality.
  *
- * Both orders, because either side may be the App spelling, plus plain login
- * equality so a human reviewing their own PR is caught too — GitHub bars a PR
- * author from APPROVING their own PR, but not from filing a `COMMENTED` review
- * carrying a `Reviewed head:` attestation.
+ * WHAT IT ACTUALLY BUYS AT ITS CALLER, stated honestly because the obvious
+ * justification does not hold (Ally review of #1966). Its only caller is
+ * `evidence-truth.ts`, comparing a review login against the PR author. Every
+ * row on that surface has already passed `githubReviewerIdentityMatches`, so
+ * the review side is ALWAYS the configured App — which collapses this call to
+ * `githubSharesReviewerIdentity(prAuthor, botLogin)`, the one-liner the merge
+ * gate already uses. Two spellings of one human, and a human reviewing their
+ * own PR, are both UNREACHABLE through that caller today.
+ *
+ * So this is kept for the FORWARD-COMPAT direction, not for a live gap: it
+ * reads the login the row actually carries instead of a config constant, so it
+ * stays correct if that surface is ever widened to admit unfiltered reviewers.
+ * The constant-based form would then fail OPEN — crediting a human's review of
+ * their own PR — and this one fails closed. On a self-attestation check that
+ * asymmetry is the whole reason to prefer the symmetric helper; if the surface
+ * filter is ever made unconditional and provably permanent, delete this and
+ * call `githubSharesReviewerIdentity` directly.
  */
 export function githubSameActorLogin(a: string, b: string): boolean {
   const left = exactGithubLogin(a);

@@ -191,9 +191,24 @@ async function probeOne(
   // relation to PROBE_DEADLINE_MS. The null result is cached too; a failed read
   // is an answer, and retrying it inside one probe just spends the deadline
   // twice for the same nothing.
+  //
+  // The FAILURE is reported here too, not at the call sites. Both surfaces ask
+  // and the memo means they share one read, so a per-caller push emitted the
+  // identical string twice for one cause — and the runbook reads these
+  // aggregated, one line per cause (Ally review of #1966).
   let authorRead: { login: string | null } | undefined;
   const readPrAuthor = async (): Promise<string | null> => {
-    authorRead ??= { login: await deps.fetchPrAuthorLogin({ ...call, signal: sig() }) };
+    if (authorRead === undefined) {
+      authorRead = { login: await deps.fetchPrAuthorLogin({ ...call, signal: sig() }) };
+      if (!authorRead.login) {
+        // Fail CLOSED and say so: an unread author cannot establish
+        // independence, so neither surface may vouch. That is the safe
+        // direction for a probe whose premise is that it never fabricates a
+        // pass.
+        out.failed = true;
+        out.diagnostics.push(`github-truth-probe-failed:pr_author:${tag}`);
+      }
+    }
     return authorRead.login;
   };
 
@@ -268,14 +283,9 @@ async function probeOne(
       const prAuthorLogin = await readPrAuthor();
       if (prAuthorLogin) {
         commentVerdict = evaluateCommentReviewGate({ ...commentInput, prAuthorLogin });
-      } else {
-        // Fail CLOSED and say so: an unread author leaves the verdict at the
-        // withheld positive, so this surface cannot vouch. That is the safe
-        // direction for a probe whose premise is that it never fabricates a
-        // pass — and Surface 2 below now fails closed on the same read.
-        out.failed = true;
-        out.diagnostics.push(`github-truth-probe-failed:pr_author:${tag}`);
       }
+      // else: the verdict stays at the withheld positive, so this surface
+      // cannot vouch. `readPrAuthor` has already set `failed` and reported it.
     }
     const commentClean = commentVerdict.state === "success" && commentVerdict.outcome === "clean";
     // `blocking_finding` and `carried_finding` — the two outcomes that make the
@@ -349,24 +359,31 @@ async function probeOne(
     // KNOWN CONSEQUENCE, accepted and NOT hidden: the author IS the reviewer
     // identity on every agent-authored PR here, so `review:ally-clean` is now
     // unreachable on them by either surface. That shape is required
-    // (`DEFAULT_UNLABELED_REQUIRED`), but its absence is a `warn` at the
-    // shipped default — `truthOnlyGap` demotes a truth-only gap out of `block`
-    // (`evidence-gate.ts`), and only `PAPERCLIP_EVIDENCE_UNLABELED_BLOCK=1`
-    // promotes it back. `evidence-gate.test.ts` pins that demotion, so this
-    // change moves no verdict today. Whoever flips that flag owns de-requiring
-    // the shape for the self-authored population; the flag exists for a
-    // measured rollout, and a detector that fabricates the pass is what would
-    // make that measurement say "safe to flip".
+    // (`DEFAULT_UNLABELED_REQUIRED`), so state the move precisely: this change
+    // moves no verdict to `block`, and it DOES move `pass` -> `warn` on
+    // essentially that whole population. `evidence-gate.ts` sets `pass` only on
+    // an empty `missing`, so the shape's absence lands at `block` and is then
+    // demoted by `truthOnlyGap` to a `warn` carrying `truth-gap-warn-only`
+    // (`evidence-gate.test.ts` pins that demotion). The ungated transition is
+    // the safety property; the gate OUTPUT changes for the population, and
+    // pretending otherwise is the kind of understatement this module's premise
+    // is supposed to rule out.
+    //
+    // EXPECTED MEASUREMENT OUTCOME, so it is not left as someone else's
+    // surprise: only `PAPERCLIP_EVIDENCE_UNLABELED_BLOCK=1` promotes that warn
+    // back to a block, and the flag exists for a measured rollout — which will
+    // now read `review:ally-clean` absent on ~100% of agent-authored PRs. So
+    // the flag is UNFLIPPABLE for that population until the shape is
+    // de-required for it, and that de-requiring is the flip's own work (this
+    // module's precedent for an unsatisfiable shape is to drop it from
+    // `required`, not to fabricate it). A detector that invents the pass is
+    // exactly what would make that measurement lie about being safe to flip.
     let formalClean = false;
     if (formalAttestingReview !== undefined) {
       const prAuthorLogin = await readPrAuthor();
-      if (!prAuthorLogin) {
-        // Same fail-closed direction as Surface 1: an unread author cannot
-        // establish independence, and a probe whose premise is that it never
-        // fabricates a pass must not guess in the crediting direction.
-        out.failed = true;
-        out.diagnostics.push(`github-truth-probe-failed:pr_author:${tag}`);
-      } else {
+      // An unread author leaves this false: it cannot establish independence,
+      // and `readPrAuthor` has already set `failed` and reported it.
+      if (prAuthorLogin) {
         formalClean = !githubSameActorLogin(formalAttestingReview.login, prAuthorLogin);
       }
     }
@@ -377,9 +394,23 @@ async function probeOne(
     // review), but the two ask different questions of them: Surface 1 applies
     // the full review GRAMMAR — the consolidated-review heading, the
     // carried-finding ledger — while Surface 2 asks only whether an
-    // independent review object attests this head. A human reviewer whose body
-    // carries the attestation without Ally's heading is reachable only through
-    // Surface 2, which is why it is gated rather than deleted.
+    // independent review object attests this head.
+    //
+    // WHAT `formalClean` STILL BUYS, stated as the reachable population rather
+    // than the intuitive one: an **Ally App** review at this head whose body
+    // carries a `Reviewed head:` attestation but FAILS Surface 1's grammar —
+    // no `## Ally` consolidated-review heading — on a PR someone else opened.
+    // Surface 1 returns `not_evaluated` there (`isAllyConsolidatedReviewComment`
+    // requires the heading), so Surface 2 is the only surface that can vouch,
+    // and deleting `formalClean` rather than gating it would take that with it.
+    //
+    // NOT "a human reviewer", which is what this comment used to say and is
+    // UNREACHABLE in production (Ally review of #1966): the wiring is
+    // `githubListReviewerSurfacesAtPr` (`issues.ts`), and every row it returns
+    // has already passed `githubReviewerIdentityMatches(login, botLogin)`
+    // (`github-app-auth.ts`) — so `surfaces.reviews[*].login` is ALWAYS the
+    // configured reviewer App, never a human and never even the bare user
+    // seat. A distinct-human reviewer is a property of the injected dep only.
     //
     // A BLOCKING verdict is not silence, and it wins outright over the other
     // surface's clean. Without that veto a duplicate or concurrent review lets

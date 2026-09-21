@@ -25,6 +25,12 @@ None.
 ### Recommended Action
 Land.`;
 const dirty = clean.replace("Important Issues (0)", "Important Issues (1)");
+// A body that attests this head but FAILS Surface 1's grammar: no `## Ally`
+// consolidated-review heading, so `isAllyConsolidatedReviewComment` skips it
+// and only the formal-review surface can vouch. This is the reachable
+// population `formalClean` still buys — see the positive control below.
+const attestedNoHeading = `Looks fine to me.
+**Reviewed head:** \`${HEAD}\``;
 // A blocking review of a head the branch has since replaced, carrying a real
 // finding bullet so there is something to carry forward. Nothing retires it, so
 // the gate must keep it red across the replacement head (BLO-29711).
@@ -311,24 +317,56 @@ describe("buildGithubTruthProbe", () => {
   });
 
   // The positive control that keeps the guard above a NARROWING rather than an
-  // off switch, and the case the fix is built to preserve: a review object is
-  // the ONLY surface that can carry a reviewer whose body lacks Ally's
-  // consolidated-review heading, so deleting `formalClean` instead of gating it
+  // off switch, built on the population that is actually REACHABLE in
+  // production (Ally review of #1966): the reviewer is the Ally App — every row
+  // on that surface has passed `githubReviewerIdentityMatches`, so it can be
+  // nothing else — and its body attests this head while failing Surface 1's
+  // consolidated-review heading grammar. Surface 1 returns `not_evaluated`, so
+  // `formalClean` is load-bearing here and deleting it instead of gating it
   // would have taken this with it.
-  it("a formal review by a login that is NOT the PR author is still clean", async () => {
-    const r = await buildGithubTruthProbe(
-      deps({
-        fetchPrAuthorLogin: async () => ALLY,
-        listReviewerSurfaces: async () => ({
-          reviews: [
-            { login: "some-human", body: clean, state: "COMMENTED", commitId: HEAD, submittedAt: "2026-09-06T00:00:00Z" },
-          ],
-          comments: [],
+  //
+  // The earlier version of this control used `login: "some-human"`, which the
+  // surface filter makes unreachable — a control over nothing. It also could
+  // not show `formalClean` was load-bearing, because that body passes Surface
+  // 1's grammar too.
+  it("a formal Ally review whose body lacks the consolidated heading is still clean", async () => {
+    const onSurface = (which: "reviews" | "comments") =>
+      buildGithubTruthProbe(
+        deps({
+          // A PR opened by someone other than the reviewer identity.
+          fetchPrAuthorLogin: async () => "some-human",
+          listReviewerSurfaces: async () =>
+            which === "reviews"
+              ? {
+                  reviews: [
+                    {
+                      login: ALLY,
+                      body: attestedNoHeading,
+                      state: "COMMENTED",
+                      commitId: HEAD,
+                      submittedAt: "2026-09-06T00:00:00Z",
+                    },
+                  ],
+                  comments: [],
+                }
+              : { reviews: [], comments: [{ login: ALLY, body: attestedNoHeading, createdAt: "2026-09-06T00:00:00Z" }] },
         }),
-      }),
-    )({ workProducts: [wp()] });
-    expect(r.detections["review:ally-clean"]).toBe(true);
-    expect(r.probeFailed).toBe(false);
+      )({ workProducts: [wp()] });
+
+    const asReview = await onSurface("reviews");
+    expect(asReview.detections["review:ally-clean"]).toBe(true);
+    expect(asReview.probeFailed).toBe(false);
+    // And Surface 2 is genuinely the ONLY surface that reaches it, which is the
+    // property the control rests on: give this body the `## Ally` heading and
+    // the assertion above still passes while the control stops controlling
+    // anything. That is the defect this test replaced, so it is pinned.
+    //
+    // NOT a counter-example to the surface-equivalence falsifier above. That
+    // property is about the AUTHOR rule, which must never depend on the
+    // surface. The GRAMMAR differs between surfaces by design — Surface 1
+    // applies the full consolidated-review grammar, Surface 2 asks only for an
+    // attestation — and the falsifier holds a body that passes both.
+    expect((await onSurface("comments")).detections["review:ally-clean"]).toBeUndefined();
   });
 
   // The bare `<slug>` user seat and the `<slug>[bot]` App are one agent in two
@@ -365,7 +403,12 @@ describe("buildGithubTruthProbe", () => {
     )({ workProducts: [wp()] });
     expect(r.detections["review:ally-clean"]).toBeUndefined();
     expect(r.probeFailed).toBe(true);
-    expect(r.diagnostics.some((d) => d.startsWith("github-truth-probe-failed:pr_author:"))).toBe(true);
+    // ONE line per cause. This row reaches BOTH surfaces — Surface 1 through
+    // the merged comment list, Surface 2 as a formal review — and both ask for
+    // the author, so a per-caller push reported the identical string twice for
+    // a single failed read. `.some()` cannot see that, and the runbook reads
+    // these aggregated (Ally review of #1966).
+    expect(r.diagnostics.filter((d) => d.startsWith("github-truth-probe-failed:pr_author:"))).toHaveLength(1);
   });
 
   // Both surfaces now want the author, and the read is memoized so the pinned
