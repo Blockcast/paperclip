@@ -39,6 +39,10 @@ function registerModuleMocks() {
     approvalService: () => mockApprovalService,
     heartbeatService: () => mockHeartbeatService,
     issueApprovalService: () => mockIssueApprovalService,
+    // BLO-23763: approval create resolves each `issueIds` entry to run the
+    // issue-scoped boundary, so the router constructs an issue service. The
+    // withdraw route never reaches it; this just keeps the module mock complete.
+    issueService: () => ({ getById: vi.fn(async () => null) }),
     logActivity: mockLogActivity,
     secretService: () => mockSecretService,
   }));
