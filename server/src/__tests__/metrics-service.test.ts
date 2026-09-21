@@ -1331,6 +1331,7 @@ describe("backstop metrics (BLO-29763)", () => {
     const body = (await renderMetrics()).body;
 
     for (const source of BACKSTOP_SOURCES) {
+      expect(body).toContain(`${BACKSTOP_DEFERRED_CANDIDATES_METRIC}{source="${source}"} 0`);
       expect(body).toContain(`${BACKSTOP_SWEEP_COMPLETED_METRIC}{source="${source}"} 0`);
       for (const reason of BACKSTOP_SKIP_REASONS) {
         expect(body).toContain(

@@ -3125,15 +3125,42 @@ function ensureRegistry(): {
     //
     // The seed is unconditional here, and the API tier registers these metrics without
     // running either loop -- so after this change every api replica exports a
-    // permanently-zero completion counter. Measured 2026-09-20 on live Prometheus: the
-    // gauge is present on all 3 replicas, but `paperclip_backstop_candidates_skipped_total`
-    // exists on `paperclip-0` (`service="paperclip-workers"`) alone, and the two
-    // `paperclip-api-*` replicas sit at the seeded 0 for both sources. Run dispatch is
-    // already fenced on that tier (PAPERCLIP_NODE_ROLE=api, heartbeat.ts). So an `== 0`
-    // stall alert MUST be scoped -- `service="paperclip-workers"`, or gated on
-    // `paperclip_backstop_deferred_candidates > 0` -- or it pages forever against a tier
-    // that legitimately never sweeps. Bounded: 2 sources x (1 gauge + 1 counter + 12
-    // reasons) = 28 series.
+    // permanently-zero completion counter. Measured 2026-09-21 on live Prometheus: the
+    // gauge is present on all 3 replicas, while `paperclip_backstop_sweep_completed_total`
+    // and `paperclip_backstop_candidates_skipped_total` exist on `paperclip-0`
+    // (`service="paperclip-workers"`) alone -- on both `paperclip-api-*` replicas those
+    // two counters are absent pre-change and read a permanent seeded 0 after it. Run
+    // dispatch is already fenced on that tier (PAPERCLIP_NODE_ROLE=api, heartbeat.ts).
+    //
+    // Constraints on a stall alert over these series, given as mechanism rather than a
+    // paste-ready predicate: two review rounds have each produced a predicate that then
+    // measured wrong against live data, because correctness here turns on topology and
+    // process lifetime that a code comment cannot track.
+    //   1. Scope to `service="paperclip-workers"`, or it pages against a tier that
+    //      legitimately never sweeps.
+    //   2. The gauge and the completion counter are ONE variable with opposite sign --
+    //      `setBackstopDeferredCandidates(src, result.candidateLimitSkipped)` against
+    //      `if (result.candidateLimitSkipped === 0) recordBackstopSweepCompleted(src)`
+    //      (recovery/service.ts). So `deferred > 0` and "no completion on that tick" are
+    //      the SAME fact, not two independent signals, and ANDing them pages forever on a
+    //      saturated-but-healthy stream. Corollary: NO predicate over these two series
+    //      detects a stall on a permanently-saturated stream -- that needs the
+    //      zero-deferred-tick fix, not an alert change.
+    //   3. The seed makes a never-swept process read identical to a drained one: both
+    //      counters sit at 0 until that process completes its first sweep. So an `== 0`
+    //      alert needs a `for:` longer than one sweep interval -- and process lifetime
+    //      here is short. Measured 2026-09-21, `paperclip-0` ran under 19 distinct pod
+    //      UIDs in 24h with 0 container restarts on each: the pod is REPLACED roughly
+    //      hourly, so every series is born fresh well inside a 2h window.
+    //      Worked example, same day: `deferred == 0 and increase(...[2h]) == 0`, scoped
+    //      to the worker tier, DID fire against the healthy, drained
+    //      `stranded_recovery_wake_backstop` stream. Two distinct causes, and only one of
+    //      them is fixed here -- pre-change the counter series is born at 1 so
+    //      `increase()` never sees the 0->1 edge (the seed below cures that); post-change
+    //      the start-to-first-sweep window still reads exactly like a stall (only a
+    //      `for:` longer than the sweep interval covers that one).
+    //
+    // Bounded: 2 sources x (1 gauge + 1 counter + 12 reasons) = 28 series.
     for (const source of BACKSTOP_SOURCES) {
       backstopDeferredCandidates.set({ source }, 0);
       backstopSweepCompleted.inc({ source }, 0);
