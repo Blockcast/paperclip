@@ -16,15 +16,26 @@
  *
  * This watches LIVENESS, NOT VERDICT. See the header of
  * .github/workflows/scheduled-guard-liveness.yml for the full rationale:
- * why age-since-last-COMPLETION rather than age-since-last-SUCCESS, why the
- * threshold is 4h, and why the job must not run on the `default` label.
+ * why age-since-last-COMPLETION rather than age-since-last-SUCCESS, how each
+ * threshold is derived from that guard's own measured cadence, why a stale
+ * verdict must survive a second independent read (PEN-3379), and why the job
+ * must not run on the `default` label.
  */
 
 import { execFileSync } from "node:child_process";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const DEFAULT_STALE_HOURS = 4;
+export const DEFAULT_STALE_HOURS = 2.75;
+
+/**
+ * How many runs the cross-check read scans (see `crossCheckCompletions`).
+ *
+ * Unfiltered, so it sees queued and in-progress runs too. An hourly guard
+ * produces ~1 run an hour, so 30 covers well over a day — comfortably past any
+ * threshold in this file for which the cross-check is spent.
+ */
+const CROSS_CHECK_PAGE_SIZE = 30;
 
 /**
  * Every watched guard, with the threshold that guard's OWN cadence justifies.
@@ -42,15 +53,43 @@ export const DEFAULT_STALE_HOURS = 4;
  */
 export const WATCHED_GUARDS = [
   // Hourly guards. Gap distribution to 2026-09-11: ordinary jitter <= 118 min,
-  // outage clusters 213-305 min. 4h = 2.03x the jitter ceiling.
-  { workflow: "review-gate-sweep.yml", staleHours: 4 },
-  { workflow: "ally-review-consistency.yml", staleHours: 4 },
-  { workflow: "codeowners-guard.yml", staleHours: 4 },
-  { workflow: "relay-ssl-multicert-guard.yml", staleHours: 4 },
-  { workflow: "lockfile-drift-monitor.yml", staleHours: 4 },
-  { workflow: "adapter-pin-drift-monitor.yml", staleHours: 4 },
+  // outage clusters 213-305 min. The bar is 165 min (2.75h), 1.40x the jitter
+  // ceiling, mid-band in the only admissible window: (118, 213).
+  //
+  // This shipped at 240 min and 240 IS OUTSIDE THAT WINDOW — above the 213-min
+  // floor of the outage cluster it exists to catch, not merely close to it. The
+  // number it was justified against was the jitter ceiling alone (240 = 2.03x
+  // 118), which is only half the constraint; nothing checked it against the
+  // events on the other side. PEN-3379.
+  //
+  // The instrument is not the retrospective gap but the window in which an
+  // HOURLY detector can sample it: a leg of length G is over bar B for G-B
+  // minutes, so the catch is guaranteed only when G-B > 60. Against the six
+  // measured legs of the 2026-09-14 event (305, 291, 268, 254, 241, 213):
+  //
+  //   bar 240 -> guaranteed on 1 of 6   (and the 241 leg clears it by one minute)
+  //   bar 165 -> guaranteed on 5 of 6
+  //
+  // Derived jointly with @Devops on PEN-3281 (2026-09-16) from two independent
+  // datasets — per-workflow completion gaps and a pool-wide dispatch census —
+  // which disagree about the low legs and agree that 240 is wrong.
+  //
+  // Not 150-180 by luck: a quantized one-tick drop (~120 min) sits below this
+  // band and a two-tick drop (~180) would sit inside it, but two consecutive
+  // drops are NOT OBSERVED in either dataset. And a quorum rule ("red only when
+  // >=2 guards are stale at once") is not available as an alternative: five of
+  // the six share a cron minute and dropped the SAME tick, so simultaneity is
+  // not independent here. Magnitude is the only axis that separates jitter from
+  // outage.
+  { workflow: "review-gate-sweep.yml", staleHours: 2.75 },
+  { workflow: "ally-review-consistency.yml", staleHours: 2.75 },
+  { workflow: "codeowners-guard.yml", staleHours: 2.75 },
+  { workflow: "relay-ssl-multicert-guard.yml", staleHours: 2.75 },
+  { workflow: "lockfile-drift-monitor.yml", staleHours: 2.75 },
+  { workflow: "adapter-pin-drift-monitor.yml", staleHours: 2.75 },
 
-  // Twice daily (cron "43 6,18"), so the 4h bar above would red it permanently.
+  // Twice daily (cron "43 6,18"), so the hourly bar above would red it
+  // permanently.
   // 39 measured gaps: ordinary band tops out at 14.60h (n=37); the two outliers
   // are 17.71h (the 2026-09-15 PEN-3272 event this row was filed on) and 22.21h
   // (2026-09-06, a wholly missed 06:43 cycle nobody noticed at the time).
@@ -106,6 +145,12 @@ export const EXEMPT_SCHEDULED_DEFAULT_WORKFLOWS = [
  *   {error: "runs-unreadable", state}          run history unreadable
  *   {state, name, newest: null}                active, never completed
  *   {state, name, newest: {updatedAt, conclusion, htmlUrl}}
+ *
+ * `observation.crossCheck` is optional and only consulted on the path that
+ * would otherwise red. It is `{newestCompletedAt}` from the independent
+ * unfiltered read, or `{error: true}`. A cross-check that is NEWER than
+ * `newest` suppresses the alarm to "unknown" (PEN-3379); an absent or
+ * unreadable one leaves the verdict alone.
  *
  * @returns {{workflow: string, status: "ok"|"stale"|"unknown", reason: string,
  *            name: string, ageMinutes: number|null, detail: string}}
@@ -186,6 +231,50 @@ export function classifyGuard(workflow, observation, { now, staleHours = DEFAULT
     };
   }
 
+  // Past the bar on the filtered read alone. Before that becomes a red, it has
+  // to survive the independent unfiltered read (PEN-3379): on 2026-09-18 the
+  // filtered index served a ~140-run-old entry as [0] four times, and every red
+  // this detector had ever produced was that fault rather than a stopped guard.
+  //
+  // DISAGREEMENT SUPPRESSES. A cross-check that found a completion NEWER than
+  // the one we just aged proves the filtered read was stale, so the age is
+  // measured off a fiction and the only honest verdict is "unknown". It still
+  // prints as a warning, so a genuinely wedged index stays visible instead of
+  // going quiet — but it does not assert that a guard stopped, and it does not
+  // exit non-zero.
+  //
+  // Absence of corroboration is NOT agreement: an unreadable cross-check leaves
+  // the stale verdict standing, annotated. Suppressing there would mean a
+  // persistently failing second read mutes the alarm entirely, which is the
+  // exact failure mode this detector exists to prevent — the same reasoning
+  // that makes `runs-unreadable` red rather than pass.
+  const crossCheck = observation.crossCheck;
+  if (crossCheck && !crossCheck.error && crossCheck.newestCompletedAt) {
+    const crossEpoch = Date.parse(crossCheck.newestCompletedAt);
+    if (!Number.isNaN(crossEpoch) && crossEpoch > completedEpoch) {
+      const crossAgeMinutes = Math.floor((now - crossEpoch) / 60000);
+      return {
+        ...base,
+        status: "unknown",
+        reason: "cross-check-disagreement",
+        ageMinutes: crossAgeMinutes,
+        detail:
+          `${name} (${workflow}) read as ${Math.floor(ageMinutes / 60)}h stale from the filtered ` +
+          `run index (newest completed ${observation.newest.updatedAt}), but an unfiltered re-read ` +
+          `of the same history found a completion at ${crossCheck.newestCompletedAt} — ` +
+          `${crossAgeMinutes}m ago. The two reads disagree, so the filtered index is stale and the ` +
+          `age above is measured off a fiction. Suppressing the alarm rather than firing it ` +
+          `(PEN-3379); this guard is NOT being asserted to have stopped.`,
+        lastRunUrl: observation.newest.htmlUrl ?? null,
+      };
+    }
+  }
+
+  const crossCheckNote = crossCheck?.error
+    ? ` The unfiltered cross-check read could not be made, so this verdict rests on the filtered ` +
+      `read alone (PEN-3379); treat the age with corresponding caution.`
+    : "";
+
   return {
     ...base,
     status: "stale",
@@ -194,7 +283,7 @@ export function classifyGuard(workflow, observation, { now, staleHours = DEFAULT
     detail:
       `${name} (${workflow}) last completed ${Math.floor(ageMinutes / 60)}h ago (at ` +
       `${observation.newest.updatedAt}, conclusion=${conclusion}), past the ${staleHours}h liveness ` +
-      `threshold.`,
+      `threshold.${crossCheckNote}`,
     lastRunUrl: observation.newest.htmlUrl ?? null,
   };
 }
@@ -348,16 +437,31 @@ function observeWorkflow(repo, workflow) {
     // filtered query: no pagination, so the 1000-item cap that bites
     // --paginate scans cannot truncate this.
     //
-    // ON THE SORT KEY, which is deliberate and not an oversight: this endpoint
-    // orders by created_at, while the age below is computed from updated_at.
-    // Re-running an OLD run bumps its updated_at without moving it up that
-    // ordering, so a completion can land outside this single-item window and be
-    // missed. That is a KNOWN, ACCEPTED skew, kept because it errs in the safe
-    // direction — reporting a guard stale slightly early. The alternative,
-    // taking max(updated_at) over the newest N, trades it for an unsafe error:
-    // re-running one ancient run would then read as a fresh completion and mask
-    // a dead schedule indefinitely. For a control whose only value is being
-    // believed, false-early beats false-quiet.
+    // ON THE SORT KEY: this endpoint orders by created_at, while the age below
+    // is computed from updated_at. Re-running an OLD run bumps its updated_at
+    // without moving it up that ordering, so a completion can land outside this
+    // single-item window and be missed. The alternative, taking max(updated_at)
+    // over the newest N, trades it for an unsafe error: re-running one ancient
+    // run would then read as a fresh completion and mask a dead schedule
+    // indefinitely.
+    //
+    // THIS NOTE USED TO CALL THAT SKEW BOUNDED — "errs in the safe direction,
+    // reporting a guard stale slightly early". PEN-3379 FALSIFIED THAT BOUND.
+    // On 2026-09-18 this read returned a ~140-run-old entry as [0] four times
+    // in ~8h, citing 2026-09-12T04:32:39Z for a guard that had completed 17 min
+    // earlier. The error was 146-154h, not "slightly". Two distinct guards were
+    // hit with bogus citations 3 minutes apart, which points at one stale
+    // server-side index rather than two independent per-workflow faults — it was
+    // not reproducible on demand afterwards, and the root cause is NOT
+    // established. All four reds this detector had produced in production were
+    // false positives.
+    //
+    // So the skew is no longer accepted on trust. `crossCheckCompletions` below
+    // re-reads the same history UNFILTERED before any stale verdict is allowed
+    // to stand, and disagreement between the two reads SUPPRESSES the alarm
+    // instead of firing it. The false-early/false-quiet trade above still
+    // decides the sort key; what changed is that "false-early" is no longer
+    // assumed to be small.
     const raw = gh([
       "api",
       `repos/${repo}/actions/workflows/${workflow}/runs?status=completed&per_page=1`,
@@ -387,6 +491,39 @@ function countQueued(repo, workflow) {
   }
 }
 
+/**
+ * Second, INDEPENDENT read of the same run history — the corroboration a stale
+ * verdict must survive before it is allowed to red (PEN-3379).
+ *
+ * Deliberately differs from `observeWorkflow`'s read on the one axis suspected
+ * of failing: it drops `status=completed`, so it does not go through the
+ * server-side filtered index that returned a 6-day-old entry as [0]. It pages
+ * CROSS_CHECK_PAGE_SIZE runs and takes the newest one that has actually
+ * completed, which is the same quantity the filtered read claims to return.
+ *
+ * Returns `{newestCompletedAt}` (ISO string, or null when the page genuinely
+ * holds no completed run), or `{error: true}` when the read could not be made.
+ * An unreadable cross-check is NOT treated as agreement — see `classifyGuard`.
+ */
+function crossCheckCompletions(repo, workflow) {
+  try {
+    const raw = gh([
+      "api",
+      `repos/${repo}/actions/workflows/${workflow}/runs?per_page=${CROSS_CHECK_PAGE_SIZE}`,
+    ]);
+    const runs = JSON.parse(raw).workflow_runs ?? [];
+    const completed = runs
+      .filter((run) => run.status === "completed" && run.updated_at)
+      .map((run) => Date.parse(run.updated_at))
+      .filter((epoch) => !Number.isNaN(epoch));
+
+    if (completed.length === 0) return { newestCompletedAt: null };
+    return { newestCompletedAt: new Date(Math.max(...completed)).toISOString() };
+  } catch {
+    return { error: true };
+  }
+}
+
 function main() {
   const repo = process.env.GUARD_LIVENESS_REPO || process.env.GITHUB_REPOSITORY || "Blockcast/paperclip";
 
@@ -403,12 +540,24 @@ function main() {
     : WATCHED_GUARDS;
 
   const now = Date.now();
-  const results = watched.map(({ workflow, staleHours }) =>
-    classifyGuard(workflow, observeWorkflow(repo, workflow), {
-      now,
-      staleHours: overrideHours ?? staleHours,
-    }),
-  );
+  const results = watched.map(({ workflow, staleHours }) => {
+    const effectiveStaleHours = overrideHours ?? staleHours;
+    const observation = observeWorkflow(repo, workflow);
+    const first = classifyGuard(workflow, observation, { now, staleHours: effectiveStaleHours });
+
+    // The cross-check is only worth a call once the cheap read has already
+    // decided this guard looks stopped — the same "spend it only when it
+    // matters" shape as countQueued below. Re-classifying is a pure call on the
+    // observation we already hold, so corroborating costs exactly one request
+    // and only on the path that was about to red (PEN-3379).
+    if (first.status !== "stale" || first.reason !== "stopped") return first;
+
+    return classifyGuard(
+      workflow,
+      { ...observation, crossCheck: crossCheckCompletions(repo, workflow) },
+      { now, staleHours: effectiveStaleHours },
+    );
+  });
 
   for (const result of results) {
     if (result.status === "ok") {
@@ -417,7 +566,11 @@ function main() {
     }
 
     if (result.status === "unknown") {
-      console.log(`::warning title=Unparsable run timestamp::${result.detail}`);
+      const title =
+        result.reason === "cross-check-disagreement"
+          ? "Run index disagreed with itself — liveness alarm suppressed"
+          : "Unparsable run timestamp";
+      console.log(`::warning title=${title}::${result.detail}`);
       continue;
     }
 

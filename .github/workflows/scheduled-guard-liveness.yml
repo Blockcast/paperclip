@@ -53,11 +53,11 @@
 # THRESHOLDS ARE MEASURED PER GUARD, NOT GUESSED AND NOT SHARED
 #
 # Each watched guard gets the threshold its OWN cadence justifies. The six
-# hourly guards share 4h; production-environment-protection-guard runs twice
-# daily and gets 16h. A single global number was the first shape of this job and
-# it silently assumed everything watched was hourly — true only by accident of
-# which workflows PEN-3281 happened to name. The full per-guard derivations,
-# including the uncomfortably narrow window on the 16h one, are in
+# hourly guards share 165 min (2.75h); production-environment-protection-guard
+# runs twice daily and gets 16h. A single global number was the first shape of
+# this job and it silently assumed everything watched was hourly — true only by
+# accident of which workflows PEN-3281 happened to name. The full per-guard
+# derivations, including the uncomfortably narrow window on the 16h one, are in
 # WATCHED_GUARDS in scripts/check-scheduled-guard-liveness.mjs.
 #
 # For the hourly six: every completion gap across all six back to 2026-09-11 was
@@ -69,21 +69,55 @@
 #   outage clusters   213-305 min  the two events named above, all six
 #                                  workflows moving together
 #
-# 4h sits at 2.03x the observed jitter ceiling and below every observed outage
-# gap but one. The first draft of this job used 4h derived from the *raw* max
-# healthy gap of 305 min — which was wrong, because that 305 min sample WAS the
-# 2026-09-14 outage. Baselining on the incident would have set the bar above the
-# thing it must catch. The clusters were separated before the number was chosen.
+# That makes the admissible window (118, 213) — above the jitter ceiling, below
+# the shortest leg of the cluster it must catch. 165 min sits mid-band at 1.40x
+# the ceiling.
 #
-# They are deliberately not tighter. This job's whole value is being believed; an
-# alarm that fires on ordinary cron jitter gets muted, and a muted liveness
-# alarm reproduces the exact failure mode it exists to prevent.
+# THIS JOB SHIPPED AT 240 MIN, WHICH IS OUTSIDE THAT WINDOW (PEN-3379). 240 was
+# justified against the jitter ceiling alone (2.03x 118) — only half the
+# constraint. Nothing checked it against the outage legs on the other side, and
+# it sits ABOVE the 213-min floor of the cluster it exists to catch.
+#
+# The instrument that settles it is not the retrospective gap but the window in
+# which an HOURLY detector can sample it: a leg of length G is over bar B for
+# G-B minutes, so a catch is guaranteed only when G-B > 60. Against the six
+# measured legs of the 2026-09-14 event (305, 291, 268, 254, 241, 213):
+#
+#   bar 240 -> guaranteed on 1 of 6   (the 241 leg clears it by one minute)
+#   bar 165 -> guaranteed on 5 of 6
+#
+# The bar is still not tighter than the data allows. This job's whole value is
+# being believed; an alarm that fires on ordinary cron jitter gets muted, and a
+# muted liveness alarm reproduces the exact failure mode it exists to prevent.
+# 165 clears the measured jitter ceiling by 47 min.
+#
+# An earlier draft derived 4h from the *raw* max healthy gap of 305 min — which
+# was wrong, because that 305 min sample WAS the 2026-09-14 outage. Baselining
+# on the incident sets the bar above the thing it must catch. The clusters were
+# separated before the number was chosen, both then and now.
 #
 # Detection is per-EVENT, not per-workflow: any one guard breaching is enough to
-# red the job. Against the 2026-09-14 event, five of six breached 4h
-# (lockfile-drift-monitor reached only 213 min), so the event would have been
-# reported even though one leg of it would not have been. That known miss is
-# asserted, not just described, in the colocated test.
+# red the job. At 165 all six legs of the 2026-09-14 event are retrospectively
+# over the bar, and five of the six are guaranteed to be sampled while over it.
+# Both numbers are asserted, not just described, in the colocated test.
+#
+# A STALE VERDICT MUST SURVIVE A SECOND, INDEPENDENT READ
+#
+# PEN-3379: in its first 27 scheduled runs this job produced four reds on the
+# detection step and ALL FOUR WERE FALSE POSITIVES. The filtered
+# `runs?status=completed&per_page=1` read returned a ~140-run-old entry as [0],
+# citing 2026-09-12 for guards that had completed 14-23 minutes earlier. Two
+# different guards were hit with bogus citations 3 minutes apart, pointing at one
+# stale server-side index rather than two independent faults; it was not
+# reproducible afterwards and the root cause is NOT established.
+#
+# So no stale verdict is trusted on one read. Before a red is emitted the same
+# history is re-read UNFILTERED, and DISAGREEMENT SUPPRESSES THE ALARM rather
+# than firing it — a cross-check finding a newer completion demotes the verdict
+# to a warning, because the age was measured off a fiction. Absence of
+# corroboration is not agreement: an unreadable cross-check leaves the red
+# standing, annotated, so a persistently failing second read cannot become a
+# mute switch. The extra call is spent only on the path that was about to red.
 #
 # WHY arc-light AND NOT default
 #
