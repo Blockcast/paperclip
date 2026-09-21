@@ -111,9 +111,20 @@ git ls-files | grep -vxE 'LICENSE|PROVENANCE\.md|PROVENANCE-CHANGES\.md' \
 are Blockcast additions, not upstream files — the hash covers only what came from
 upstream. The exclusion list here, in the `vendor_claude_k8s` CI step and on disk
 is held in agreement by `scripts/__tests__/provenance-union-merge.test.mjs`,
-which fails if a non-upstream file exists that the regex does not name. The listing
-comes from `git ls-files` rather than `find` so that `node_modules/`, `dist/`
-and packed tarballs cannot perturb it.
+which fails if the regex names a file that is **not** present in the tree — a
+stale exclusion left behind by a rename would silently drop a real file from the
+hash.
+
+**The reverse direction is not checked.** Adding a Blockcast-local file without
+excluding it changes the hash rather than failing that test, and the remedy the
+hash failure prescribes — regenerate — then widens the hash to cover a
+non-upstream file. After that, "hash matches" no longer means "upstream is
+unmodified". Checking that direction needs an explicit manifest of
+Blockcast-added paths, which does not exist; until it does, extending this
+exclusion list is a manual step to get right when adding a file here.
+
+The listing comes from `git ls-files` rather than `find` so that `node_modules/`,
+`dist/` and packed tarballs cannot perturb it.
 
 CI enforces this: the `vendor_claude_k8s` job recomputes the hash and fails if
 it does not match the value recorded above. Change any vendored file and you
