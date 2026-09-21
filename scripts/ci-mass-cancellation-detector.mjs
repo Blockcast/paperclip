@@ -28,6 +28,13 @@
 //     Read runs from a local JSON fixture (array of GitHub workflow-run
 //     objects) instead of calling `gh api` — used by the test suite.
 //
+// --fetch-pad-minutes (default 360) pads BOTH ends of the requested window,
+// so it — not --lookback-minutes — is what drives fetch volume: the default
+// 180-minute live lookback fetches a ~15h span of runs of every conclusion
+// and every workflow. That interacts with the ~1000-result API cap and with
+// --max-pages; when either bound bites, `fetchTruncated` is set and a
+// non-firing verdict exits 2 rather than reporting a floor as an all-clear.
+//
 // Cluster membership defaults to `pull_request`-event runs only.
 // `merge_group` cancellations are excluded by default: this repo's merge
 // queue is configured with `maximumEntriesToBuild=1`, so when the queue's
@@ -116,26 +123,45 @@ export function createdRangeFor(args, now = Date.now()) {
 // cancelled one is typically `success`/`in_progress`. Filtering to cancelled
 // at fetch time hid exactly those, so ordinary concurrency supersession could
 // only be recognised when the superseding run had itself been cancelled.
-function fetchRunsLive(repo, maxPages, createdRange) {
+function ghFetchPage(repo, page, created) {
+  const out = execFileSync(
+    "gh",
+    ["api", `repos/${repo}/actions/runs?per_page=100&page=${page}${created}`, "--jq", ".workflow_runs"],
+    { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
+  ).trim();
+  return out ? JSON.parse(out) : [];
+}
+
+// `fetchPage` is injectable so the page-bounding branch below is reachable
+// from a test. It is the only guard here the fixture-driven suite cannot
+// exercise — `--json-file` bypasses this function entirely — and an unguarded
+// guard is a comment: removing it left the suite green (mutation-tested).
+export function fetchRunsLive(repo, maxPages, createdRange, fetchPage = ghFetchPage) {
   const runs = [];
   const created = `&created=${encodeURIComponent(createdRange)}`;
+  let pageBounded = false;
   for (let page = 1; page <= maxPages; page += 1) {
-    const out = execFileSync(
-      "gh",
-      ["api", `repos/${repo}/actions/runs?per_page=100&page=${page}${created}`, "--jq", ".workflow_runs"],
-      { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
-    ).trim();
-    const pageRuns = out ? JSON.parse(out) : [];
+    const pageRuns = fetchPage(repo, page, created);
     if (pageRuns.length === 0) break;
     runs.push(...pageRuns);
     if (pageRuns.length < 100) break;
+    // Stopping on --max-pages with a FULL final page means the API still had
+    // more to give and we quit first. Paging is newest-first, so what was
+    // dropped is the OLDEST part of the window — exactly where a backtested
+    // incident lives. The `FETCH_RESULT_CAP` check below cannot see this:
+    // truncation under the cap leaves a population that looks complete.
+    // Measured at `--max-pages 1` over 2026-08-02T19:00Z..20:00Z: 100 runs
+    // spanning 20:45Z..01:59Z, `firing:false`, exit 0 — a confident all-clear
+    // over a window that provably contains the incident this detector exists
+    // to catch.
+    if (page === maxPages) pageBounded = true;
   }
-  return runs;
+  return { runs, pageBounded };
 }
 
 function loadRuns(args) {
   if (args.jsonFile) {
-    return JSON.parse(readFileSync(args.jsonFile, "utf8"));
+    return { runs: JSON.parse(readFileSync(args.jsonFile, "utf8")), pageBounded: false };
   }
   return fetchRunsLive(args.repo || DEFAULTS.repo, args.maxPages, createdRangeFor(args));
 }
@@ -263,13 +289,21 @@ export function detect(rawRuns, options = {}) {
     // `scannedRunCount: 0` alone cannot make that distinction, and the quiet
     // reading is the dangerous one — see `createdRangeFor` above.
     fetchedRunCount: rawRuns.length,
+    // `fetchedRunCount` is the population across ALL workflows, so it cannot
+    // catch a mistyped --workflow: the guard passes and the verdict reads
+    // quiet over a window that contains an incident. This is the same count
+    // one level down, and `> 0 fetched` with `0 same-workflow` is a lookup
+    // failure, never an all-clear.
+    sameWorkflowRunCount: sameWorkflow.length,
     // `/actions/runs` stops yielding at ~1000 results for any one query, and
     // it pages newest-first — so a truncated fetch silently drops the OLDEST
-    // part of the requested window. For a detector that is the dangerous
-    // direction (a missed cluster reads as quiet), so say so out loud: the
-    // verdict is then a floor, not a census. Narrow the window, or lower
-    // --fetch-pad-minutes, until this clears.
-    fetchTruncated: rawRuns.length >= FETCH_RESULT_CAP,
+    // part of the requested window. `pageBounded` is the same hazard from the
+    // other bound: we stopped on --max-pages while the API still had pages.
+    // For a detector either is the dangerous direction (a missed cluster
+    // reads as quiet), so say so out loud: the verdict is then a floor, not a
+    // census, and main() refuses to report it as a clean exit. Narrow the
+    // window, raise --max-pages, or lower --fetch-pad-minutes until it clears.
+    fetchTruncated: rawRuns.length >= FETCH_RESULT_CAP || Boolean(opts.pageBounded),
     scannedRunCount: scoped.length,
     supersessionExcludedCount: scoped.length - nonSuperseded.length,
     clusters,
@@ -278,9 +312,22 @@ export function detect(rawRuns, options = {}) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  // Validate here rather than letting `Date.parse` -> NaN reach
+  // `createdRangeFor`, where `new Date(NaN).toISOString()` throws and is
+  // caught below as "failed to fetch runs: Invalid time value" — the right
+  // exit code attributing a parse error to the network.
+  for (const key of ["since", "until"]) {
+    if (args[key] !== undefined && Number.isNaN(Date.parse(args[key]))) {
+      console.error(`ci-mass-cancellation-detector: --${key} is not a parseable timestamp: ${JSON.stringify(args[key])}`);
+      process.exitCode = 2;
+      return;
+    }
+  }
+
   let rawRuns;
+  let pageBounded;
   try {
-    rawRuns = loadRuns(args);
+    ({ runs: rawRuns, pageBounded } = loadRuns(args));
   } catch (err) {
     console.error(`ci-mass-cancellation-detector: failed to fetch runs: ${err.message}`);
     process.exitCode = 2;
@@ -293,18 +340,42 @@ async function main() {
     until: args.until,
     lookbackMinutes: args.since || args.until ? undefined : args.lookbackMinutes,
     includeMergeGroup: args.includeMergeGroup,
+    pageBounded,
   });
 
   console.log(`DETECTOR_VERDICT=${JSON.stringify(verdict)}`);
-  // An empty fetch is an operational error, never a quiet verdict. Without
-  // this, a window the API cannot reach, a `gh` auth failure that still exits
-  // 0, or a mistyped repo all render as `firing: false` — the detector
-  // reporting "no incident" when what happened is "no data". A fixture run
-  // (`--json-file`) is exempt: an empty fixture is a legitimate test input.
+  // Three ways to reach `firing: false` without having looked — each renders
+  // identically to a genuinely quiet window, and quiet is the dangerous
+  // reading. A fixture run (`--json-file`) is exempt from the two population
+  // guards: an empty fixture, or one deliberately containing only other
+  // workflows, is a legitimate test input.
   if (!args.jsonFile && verdict.fetchedRunCount === 0) {
     console.error(
       "ci-mass-cancellation-detector: fetched 0 runs — the verdict above is vacuous, not quiet. " +
         "Check the repo, `gh` auth, and that the requested window is within API reach.",
+    );
+    process.exitCode = 2;
+    return;
+  }
+  if (!args.jsonFile && verdict.sameWorkflowRunCount === 0) {
+    console.error(
+      `ci-mass-cancellation-detector: fetched ${verdict.fetchedRunCount} runs but none named ` +
+        `"${verdict.workflowName}" — the verdict above is vacuous, not quiet. Check ` +
+        "CI_MASS_CANCEL_WORKFLOW against the repo's actual workflow names.",
+    );
+    process.exitCode = 2;
+    return;
+  }
+  // A truncated fetch makes a non-firing verdict a floor, not a census: the
+  // dropped part of the window is the oldest, and a cluster there is exactly
+  // what this looks for. Exit 2 so a CI gate consuming the exit code cannot
+  // read a floor as an all-clear. A FIRING truncated verdict still exits 1 —
+  // the incident was found, and more of the window would only add to it.
+  if (verdict.fetchTruncated && !verdict.firing) {
+    console.error(
+      `ci-mass-cancellation-detector: fetch truncated at ${verdict.fetchedRunCount} runs — the ` +
+        "non-firing verdict above is a floor, not a census. Narrow --since/--until, raise " +
+        "--max-pages, or lower --fetch-pad-minutes.",
     );
     process.exitCode = 2;
     return;
