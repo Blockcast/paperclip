@@ -281,6 +281,7 @@ vi.mock("../adapters/index.ts", async () => {
 import {
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
+  STALLED_COALESCE_BYPASS_SNAPSHOT_KEY,
   heartbeatService,
   type HeartbeatEnvironmentRuntime,
   redactDetectedSuccessfulRunProgressSummaryForBoard,
@@ -3675,6 +3676,71 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       retryReason: "issue_continuation_needed",
       cause: "process_lost",
     });
+  });
+
+  // PEN-1990: the bypass marker records why ITS OWN run was minted, so it must
+  // not ride a carried-forward snapshot onto the run that replaces a dead one.
+  // This is the `process_lost` carry specifically because it is the reachable
+  // one: process loss is routine on this fleet, and a run minted *because* its
+  // predecessor overran its heartbeat budget is an agent already burning
+  // wall-clock, so the two correlate rather than being independent.
+  //
+  // A propagated marker breaks both properties the marker exists to provide —
+  // its count stops being a count of filter activations, and its `targetRunId`
+  // points at a run unrelated to the retry. It also breaks the reconciliation
+  // with the enqueue log: a propagated marker has no `outcome: "queued"` line
+  // at all, so the two counts can now differ in BOTH directions and an
+  // operator differencing them is back to the unattributable discrepancy this
+  // instrument was added to remove.
+  it("drops the interval-overrun bypass marker when carrying a snapshot onto a process-loss retry", async () => {
+    const { companyId, runId } = await seedRunFixture({
+      adapterType: "openclaw_gateway",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+      contextSnapshot: {
+        wakeReason: "issue_monitor_due",
+        nextCheckAt: "2026-03-19T00:00:00.000Z",
+        [STALLED_COALESCE_BYPASS_SNAPSHOT_KEY]: {
+          targetRunId: "00000000-0000-4000-8000-00000000dead",
+          targetStartedAt: "2026-03-18T22:00:00.000Z",
+          targetAgeMs: 7_200_000,
+          budgetMs: 5_400_000,
+          intervalSec: 3600,
+        },
+      },
+    });
+    const heartbeat = createHeartbeat();
+
+    expect(await heartbeat.reapOrphanedRuns()).toEqual({ reaped: 1, runIds: [runId] });
+
+    const retry = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.retryOfRunId, runId)))
+      .then((rows) => rows[0] ?? null);
+    expect(retry).not.toBeNull();
+    expect(retry?.contextSnapshot).not.toHaveProperty(STALLED_COALESCE_BYPASS_SNAPSHOT_KEY);
+    // Carrying the snapshot forward is the whole point of the retry builder, so
+    // a strip that took the work-describing keys with it would be a regression
+    // rather than a fix. `nextCheckAt` is the carried key that has no other
+    // source on the retry — asserting only the two keys the builder overwrites
+    // would pass against a strip that emptied the snapshot.
+    expect(retry?.contextSnapshot).toMatchObject({
+      wakeReason: "process_lost_retry",
+      retryReason: "issue_continuation_needed",
+      retryOfRunId: runId,
+      nextCheckAt: "2026-03-19T00:00:00.000Z",
+    });
+    // The marker still belongs to the run it was actually stamped on: the strip
+    // copies rather than deleting in place, so it must not have reached back
+    // through `parseObject` (which casts, not copies) onto the source row.
+    const source = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(source?.contextSnapshot).toHaveProperty(STALLED_COALESCE_BYPASS_SNAPSHOT_KEY);
   });
 
   it("does not retry a lost monitor dispatch while another monitor wake remains scheduled", async () => {

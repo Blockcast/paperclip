@@ -6,6 +6,8 @@ import {
   filterIntervalOverrunCoalesceTarget,
   describeIntervalOverrunCoalesceBypass,
   resolveStalledCoalesceBudgetMs,
+  stripRunScopedSnapshotMarkers,
+  STALLED_COALESCE_BYPASS_SNAPSHOT_KEY,
   STALLED_COALESCE_INTERVAL_MULTIPLE,
   STALLED_COALESCE_MIN_BUDGET_MS,
 } from "../services/heartbeat.ts";
@@ -428,5 +430,58 @@ describe("describeIntervalOverrunCoalesceBypass", () => {
         now,
       }),
     ).toMatchObject({ targetAgeMs: 4 * HOUR_MS });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PEN-1990: the marker must not outlive the run it describes.
+//
+// The retry builders replace a dead run by spreading its whole snapshot onto
+// the replacement, which would carry a mint-scoped marker onto a run that
+// never went through the enqueue that stamped it. The wiring is pinned end to
+// end against the `process_lost` retry in heartbeat-process-recovery.test.ts;
+// these cover the helper's own contract, including the copy-not-delete
+// property that integration test can only observe half of.
+// ---------------------------------------------------------------------------
+describe("stripRunScopedSnapshotMarkers", () => {
+  it("drops the interval-overrun bypass marker", () => {
+    expect(
+      stripRunScopedSnapshotMarkers({
+        [STALLED_COALESCE_BYPASS_SNAPSHOT_KEY]: { targetRunId: "stalled-1" },
+      }),
+    ).toEqual({});
+  });
+
+  it("keeps every key that describes the work rather than the mint", () => {
+    const carried = {
+      issueId: "issue-1",
+      wakeReason: "issue_monitor_due",
+      depBlockedFirstParkedAt: "2026-03-18T00:00:00.000Z",
+      modelProfile: "normal_model",
+    };
+
+    expect(stripRunScopedSnapshotMarkers({ ...carried })).toEqual(carried);
+  });
+
+  it("does not mutate the caller's snapshot", () => {
+    // `parseObject` casts rather than copies, so a delete-in-place strip would
+    // edit the caller's in-memory run row and change what every later read of
+    // `run.contextSnapshot` in the same function sees.
+    const original = {
+      issueId: "issue-1",
+      [STALLED_COALESCE_BYPASS_SNAPSHOT_KEY]: { targetRunId: "stalled-1" },
+    };
+
+    const stripped = stripRunScopedSnapshotMarkers(original);
+
+    expect(stripped).not.toBe(original);
+    expect(original).toHaveProperty(STALLED_COALESCE_BYPASS_SNAPSHOT_KEY);
+    expect(stripped).toEqual({ issueId: "issue-1" });
+  });
+
+  it("returns an equal copy when there is nothing to strip", () => {
+    const original = { issueId: "issue-1" };
+
+    expect(stripRunScopedSnapshotMarkers(original)).toEqual(original);
   });
 });

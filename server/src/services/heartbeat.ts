@@ -7627,6 +7627,45 @@ export function describeIntervalOverrunCoalesceBypass(input: {
   };
 }
 
+/**
+ * Snapshot keys that describe ONE run's own minting decision, and are therefore
+ * false on any later run.
+ *
+ * The retry builders replace a dead run by spreading `parseObject(
+ * run.contextSnapshot)` wholesale onto the replacement, so a key stamped by the
+ * enqueue that minted the original would ride along onto a run that never went
+ * through that path. For {@link STALLED_COALESCE_BYPASS_SNAPSHOT_KEY} that
+ * breaks both properties it exists to provide: the marker's count stops being a
+ * count of filter activations, and its `targetRunId` points at a run unrelated
+ * to the retry. It also breaks the reconciliation with the enqueue log — a
+ * propagated marker has no log line at all, so the two counts can differ in
+ * both directions and an operator is back to an unattributable discrepancy.
+ *
+ * Register a key here when it records why *this* run was created. Keys that
+ * describe the work rather than the mint (`issueId`, `wakeReason`,
+ * `depBlockedFirstParkedAt`) are meant to survive a retry and must not go here.
+ */
+const RUN_SCOPED_SNAPSHOT_MARKER_KEYS = [STALLED_COALESCE_BYPASS_SNAPSHOT_KEY] as const;
+
+/**
+ * Copy a prior run's snapshot for carry-forward onto its replacement, dropping
+ * the run-scoped markers in {@link RUN_SCOPED_SNAPSHOT_MARKER_KEYS}.
+ *
+ * Returns a new object rather than deleting in place: `parseObject` casts, it
+ * does not copy, so mutating its result would edit the caller's in-memory run
+ * row and change what every later read of `run.contextSnapshot` in the same
+ * function sees.
+ */
+export function stripRunScopedSnapshotMarkers(
+  snapshot: Record<string, unknown>,
+): Record<string, unknown> {
+  const carried = { ...snapshot };
+  for (const key of RUN_SCOPED_SNAPSHOT_MARKER_KEYS) {
+    delete carried[key];
+  }
+  return carried;
+}
+
 export function describeSessionResetReason(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ) {
@@ -16917,7 +16956,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
     const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
     const retryContextSnapshot = withRecoveryModelProfileHint({
-      ...contextSnapshot,
+      ...stripRunScopedSnapshotMarkers(contextSnapshot),
       retryOfRunId: run.id,
       wakeReason: "missing_issue_comment",
       retryReason: "missing_issue_comment",
@@ -17247,7 +17286,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
     const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
     const retryContextSnapshot = withRecoveryModelProfileHint({
-      ...contextSnapshot,
+      ...stripRunScopedSnapshotMarkers(contextSnapshot),
       retryOfRunId: run.id,
       wakeReason: "process_lost_retry",
       retryReason,
@@ -20128,7 +20167,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       workspaceValidationRetryPayload !== null &&
       Object.keys(workspaceValidationRetryPayload).length > 0;
     const retryContextSnapshot: Record<string, unknown> = withRecoveryModelProfileHint({
-      ...contextSnapshot,
+      ...stripRunScopedSnapshotMarkers(contextSnapshot),
       retryOfRunId: run.id,
       wakeReason,
       retryReason,
@@ -36369,16 +36408,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // the run this wake inserts, so its population is exactly the lines with
     // `outcome: "queued"`. The remainder are activations where a later gate in
     // this enqueue (the daily cap, the post-lock task-scope re-check, the
-    // github-state coalesce) ended the wake without a mint — real activations
-    // the marker cannot carry, attributable here rather than an unexplained
-    // shortfall between the two counts.
+    // github-state coalesce, or the idempotency-key already-delivered claim)
+    // ended the wake without a mint — real activations the marker cannot
+    // carry, attributable here rather than an unexplained shortfall between
+    // the two counts.
+    //
+    // `runId` therefore means "the run this wake minted" and nothing else: it
+    // is non-null exactly when a marker was stamped, so the two records
+    // reconcile on the field as well as on `outcome`. The fold outcomes report
+    // the run they merged into under a separate key, because a consumer that
+    // grouped those on `runId` would count them as mints.
     if (intervalOverrunBypass) {
       logger.info(
         {
           agentId,
           taskKey: effectiveTaskKey,
           outcome: queueOutcome.kind,
-          runId: queueOutcome.kind === "skipped" ? null : queueOutcome.run.id,
+          runId: queueOutcome.kind === "queued" ? queueOutcome.run.id : null,
+          coalescedIntoRunId:
+            queueOutcome.kind === "skipped" || queueOutcome.kind === "queued"
+              ? null
+              : queueOutcome.run.id,
           ...intervalOverrunBypass,
         },
         "timer wake declined to coalesce into a run that has overrun its heartbeat "
