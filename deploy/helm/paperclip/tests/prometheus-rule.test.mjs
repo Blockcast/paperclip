@@ -1405,4 +1405,38 @@ test("PaperclipCrashRecoveryCandidateIndex{Missing,Unobservable} distinguish a m
     /alert: PaperclipCrashRecoveryCandidateIndexUnobservable[\s\S]*?description: "[^"]*NOT evidence the index is healthy[^"]*"/,
     "the unobservable alert must state that absence is not health",
   );
+
+  // Same defect class, on the other rule: remediation that does not match the
+  // code. The gauge publisher is registered ABOVE both scheduler gates, so
+  // this alert is reachable from a suppressed replica — and `startServer`
+  // takes the suppressed branch and never calls reconcileWorkerCrashedRuns,
+  // so an unqualified "startup recovery still runs" tells a responder crashed
+  // runs are partly covered when nothing is recovering them at all. The
+  // qualifier is the assertion; scope it to this alert's own block so a
+  // greedy match cannot borrow text from a sibling rule.
+  const [, missingBlock] = rendered.match(
+    /(alert: PaperclipCrashRecoveryCandidateIndexMissing[\s\S]*?)(?=\n\s+- alert:|\n\s+- name:|$)/,
+  ) ?? [];
+  assert.ok(missingBlock, "index-missing alert must render a block");
+  assert.match(
+    missingBlock,
+    /PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS[\s\S]*?skips startup recovery/,
+    "the missing-index remediation must name suppression as the state to check first and say it skips startup recovery too",
+  );
+  assert.doesNotMatch(
+    missingBlock,
+    /startup recovery still runs/,
+    "an unqualified 'startup recovery still runs' is false on a suppressed replica, which is exactly where this alert is newly reachable",
+  );
+  // resolveHeartbeatSchedulingSuppression accepts EITHER restore variable
+  // (heartbeat.ts: PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS || PAPERCLIP_RESTORE_IN_PROGRESS).
+  // Naming only the long one sends a responder to check one variable, read it
+  // unset, and conclude the replica is unsuppressed while the alias is what is
+  // suppressing it — the same remediation-does-not-match-the-code defect this
+  // block exists to fix, reintroduced inside the fix.
+  assert.match(
+    missingBlock,
+    /PAPERCLIP_RESTORE_IN_PROGRESS/,
+    "the remediation must name the restore alias too, since either variable alone suppresses",
+  );
 });
