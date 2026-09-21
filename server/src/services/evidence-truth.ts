@@ -9,6 +9,7 @@
  *        │          review:ally-clean = head := fetchHeadSha()          <- CURRENT head
  *        │                              surfaces := listReviewerSurfaces()
  *        │                              clean if either surface attests THAT head
+ *        │                              by someone who is NOT the PR author,
  *        │                              clean and NEITHER surface blocks it
  *        ▼
  *   {detections, diagnostics, probeFailed}
@@ -37,7 +38,7 @@ import type { EvidenceShape } from "./evidence-shapes.js";
 import { evaluateCommentReviewGate } from "./pr-comment-review-gate.js";
 import { extractAllyReviewedHeadSha, hasActionablePrReviewFeedback } from "./ally-review-detection.js";
 import { PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID } from "./pull-request-work-products.js";
-import type { ReviewerSurfaces } from "./github-app-auth.js";
+import { githubSameActorLogin, type ReviewerSurfaces } from "./github-app-auth.js";
 
 export interface TruthWorkProduct {
   type: string;
@@ -174,6 +175,28 @@ async function probeOne(
   // deadline. Either one ends the read.
   const sig = (): AbortSignal => AbortSignal.any([probeSignal, AbortSignal.timeout(perCallMs)]);
 
+  // The PR author, read AT MOST ONCE and shared by both surfaces.
+  //
+  // Both now need it — Surface 1 to let the merge gate's author rule decide
+  // `clean`, Surface 2 to refuse a self-attested review object — and both want
+  // it LAZILY, because `clean` is the only verdict either surface lets the
+  // author change. Fetching up front would spend a call from this probe's
+  // deliberately scarce budget on every PR to change at most one verdict, and
+  // would let an unreadable `GET /pulls/{n}` turn a fully justified red into a
+  // failed read.
+  //
+  // Memoized rather than fetched per surface, and that is what keeps
+  // MAX_SERIAL_CALLS at 4: the would-be-clean route reads gate, head, surfaces,
+  // author — and a second author fetch would silently break the pinned
+  // relation to PROBE_DEADLINE_MS. The null result is cached too; a failed read
+  // is an answer, and retrying it inside one probe just spends the deadline
+  // twice for the same nothing.
+  let authorRead: { login: string | null } | undefined;
+  const readPrAuthor = async (): Promise<string | null> => {
+    authorRead ??= { login: await deps.fetchPrAuthorLogin({ ...call, signal: sig() }) };
+    return authorRead.login;
+  };
+
   try {
     if (ref.webhookMerged) {
       // The webhook is GitHub telling us directly; re-asking buys nothing and
@@ -242,14 +265,14 @@ async function probeOne(
     // on `outcome` instead would miss the carried-finding route, and `clean` is
     // unreachable author-blind by construction.
     if ("authorUnknown" in commentVerdict && commentVerdict.authorUnknown) {
-      const prAuthorLogin = await deps.fetchPrAuthorLogin({ ...call, signal: sig() });
+      const prAuthorLogin = await readPrAuthor();
       if (prAuthorLogin) {
         commentVerdict = evaluateCommentReviewGate({ ...commentInput, prAuthorLogin });
       } else {
         // Fail CLOSED and say so: an unread author leaves the verdict at the
         // withheld positive, so this surface cannot vouch. That is the safe
         // direction for a probe whose premise is that it never fabricates a
-        // pass — `formalClean` below can still carry the verdict on its own.
+        // pass — and Surface 2 below now fails closed on the same read.
         out.failed = true;
         out.diagnostics.push(`github-truth-probe-failed:pr_author:${tag}`);
       }
@@ -296,37 +319,76 @@ async function probeOne(
     // surface's clean win — a false pass arriving through the veto instead of
     // through the detection. `evidence-truth.test.ts` pins that direction with
     // a bodyless CHANGES_REQUESTED against a clean comment.
-    const formalClean =
-      newest !== undefined && !formalBlocking && extractAllyReviewedHeadSha(newest.body) === normalizedHead;
+    const formalAttestingReview =
+      newest !== undefined && !formalBlocking && extractAllyReviewedHeadSha(newest.body) === normalizedHead
+        ? newest
+        : undefined;
 
-    // The OR is REDUNDANCY for the veto and an OVERRIDE for the clean, and the
-    // asymmetry is this commit's doing rather than the original design's. Until
-    // the surface merge above, each side read a disjoint row set — Ally files a
-    // formal review on some PRs and only a comment on others — so SILENCE on
-    // one genuinely was not evidence and OR'ing both clean verdicts was sound.
-    // Surface 1 now reads every row Surface 2 does (the only exception is a
-    // review with `submittedAt: null`, which GitHub does not produce for a
-    // submitted review), so for the CLEAN half the OR no longer adds a surface:
-    // it lets the author-blind `formalClean` publish a body that Surface 1 has
-    // already refused under the merge gate's author rule.
+    // ...and the attestation must be INDEPENDENT, by the same rule Surface 1
+    // applies (BLO-34969). This is option 1 of the three that row put up, and
+    // the choice is recorded here so a later reader does not restore the
+    // author-blind line as a simplification.
     //
-    // KNOWN OPEN, tracked at BLO-34969 and pinned by a test, NOT an oversight.
-    // Closing it — by dropping `formalClean` from the disjunction or by gating
-    // it on the same author evidence, which are the same thing here — makes
-    // `review:ally-clean` unreachable on EVERY agent-authored PR, because the
-    // author is the reviewer identity on all of them. That shape is required
-    // (`DEFAULT_UNLABELED_REQUIRED`) and `PAPERCLIP_EVIDENCE_UNLABELED_BLOCK=1`
-    // promotes its absence from a warn to a block, so the fix is an estate-wide
-    // `in_review` decision with acceptance criteria of its own, not a line in a
-    // review fixup. The VETO keeps its independent justification either way:
-    // `formalBlocking` reads `newest.state`, so a bodyless CHANGES_REQUESTED is
-    // reachable only through Surface 2.
+    // WHY, in one sentence: before this, which GitHub object carried a body
+    // decided whether the self-attestation rule applied to it — Surface 1
+    // refused an author-written `clean`, and Surface 2 read the identical body
+    // off the identical row and published it anyway through the OR below.
+    // Surface coverage was never the justification for that OR's clean half:
+    // since the surface merge above, Surface 1 reads every row Surface 2 does,
+    // so the OR had stopped being redundancy and become an override.
+    //
+    // WHY NOT option 2 (credit a distinct LANE via the head commit's git
+    // author, which is per-lane where the GitHub login is not): it does not
+    // close this. The git author says who wrote the CODE; a review is not a
+    // commit, so nothing on GitHub says which lane wrote the REVIEW. Against
+    // the shape this guard exists for — an implementing agent writing its own
+    // consolidated-review body — a per-lane code-author test returns
+    // "independent" and credits the fabrication. It is a discriminator for a
+    // different question.
+    //
+    // KNOWN CONSEQUENCE, accepted and NOT hidden: the author IS the reviewer
+    // identity on every agent-authored PR here, so `review:ally-clean` is now
+    // unreachable on them by either surface. That shape is required
+    // (`DEFAULT_UNLABELED_REQUIRED`), but its absence is a `warn` at the
+    // shipped default — `truthOnlyGap` demotes a truth-only gap out of `block`
+    // (`evidence-gate.ts`), and only `PAPERCLIP_EVIDENCE_UNLABELED_BLOCK=1`
+    // promotes it back. `evidence-gate.test.ts` pins that demotion, so this
+    // change moves no verdict today. Whoever flips that flag owns de-requiring
+    // the shape for the self-authored population; the flag exists for a
+    // measured rollout, and a detector that fabricates the pass is what would
+    // make that measurement say "safe to flip".
+    let formalClean = false;
+    if (formalAttestingReview !== undefined) {
+      const prAuthorLogin = await readPrAuthor();
+      if (!prAuthorLogin) {
+        // Same fail-closed direction as Surface 1: an unread author cannot
+        // establish independence, and a probe whose premise is that it never
+        // fabricates a pass must not guess in the crediting direction.
+        out.failed = true;
+        out.diagnostics.push(`github-truth-probe-failed:pr_author:${tag}`);
+      } else {
+        formalClean = !githubSameActorLogin(formalAttestingReview.login, prAuthorLogin);
+      }
+    }
+
+    // The OR is REDUNDANCY, in both halves, and no longer an override.
+    // Surface 1 reads every row Surface 2 does (the only exception is a review
+    // with `submittedAt: null`, which GitHub does not produce for a submitted
+    // review), but the two ask different questions of them: Surface 1 applies
+    // the full review GRAMMAR — the consolidated-review heading, the
+    // carried-finding ledger — while Surface 2 asks only whether an
+    // independent review object attests this head. A human reviewer whose body
+    // carries the attestation without Ally's heading is reachable only through
+    // Surface 2, which is why it is gated rather than deleted.
     //
     // A BLOCKING verdict is not silence, and it wins outright over the other
     // surface's clean. Without that veto a duplicate or concurrent review lets
     // this shape read `review:ally-clean` at the same head the merge gate is
     // publishing red from — the two-verdicts-for-one-grammar divergence this
     // module exists to avoid, arriving through the OR instead of a parser.
+    // The VETO keeps its independent justification either way: `formalBlocking`
+    // reads `newest.state`, so a bodyless CHANGES_REQUESTED is reachable only
+    // through Surface 2.
     out.clean = !commentBlocking && !formalBlocking && (commentClean || formalClean);
   } catch {
     // A throw is an inability to ask, which is exactly `probeFailed` — never
