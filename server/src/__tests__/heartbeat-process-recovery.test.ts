@@ -13073,6 +13073,17 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // `active` status and an owner set `shouldReuseStrandedRecoveryAction` returns false
     // whether or not it matches. It is written in the shape the sweep computes only so the
     // fixture reads like a real row.
+    //
+    // `evidence.sourceScopedWakeHorizonAt` is load-bearing, not decoration. Horizon
+    // preservation reads it first (`issue-recovery-actions.ts:452`); without it the upsert
+    // falls through to `existing.maxAttempts !== null ? existingTimeoutAt : null` (`:459`),
+    // whose own comment scopes it to "rows written before the evidence key existed". That
+    // arm happens to yield the same past date today, so the test would pass — but deleting
+    // a transitional backfill would then flip `isNewlyBoundedSequence`, re-arm `timeoutAt`
+    // from now, and fail this test as though production had regressed. A row the sweep
+    // creates carries the key (`:642-647`); seeding it routes preservation through the
+    // steady-state path the assertions below actually claim to exercise.
+    const seededHorizonAt = new Date(Date.now() - 60_000);
     const [seeded] = await db.insert(issueRecoveryActions).values({
       companyId,
       sourceIssueId: issueId,
@@ -13086,7 +13097,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       nextAction: "Restore a live execution path.",
       attemptCount: 1,
       maxAttempts: defaultRecoveryActionMaxAttempts,
-      timeoutAt: new Date(Date.now() - 60_000),
+      evidence: { sourceScopedWakeHorizonAt: seededHorizonAt.toISOString() },
+      timeoutAt: seededHorizonAt,
     }).returning();
     expect(seeded?.retiringBound).toBeNull();
 
@@ -13113,6 +13125,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // the seeded one, `isNewOwnerSequence` RESETS the count to 1 and the refund lands it at 0.
     // Both are below the budget, which is what BLO-33410's `attemptCount` branch called
     // unreachable.
+    //
+    // Bounded at 1, not at the budget: the two arms above are the complete reachable set, so
+    // `toBeLessThan(defaultRecoveryActionMaxAttempts)` would admit 2-4 and let the comment
+    // drift from the code. One sweep is one upsert and one refund, so this is deterministic —
+    // the same standard this PR applies to the race test's set membership.
+    expect(retired?.attemptCount).toBeLessThanOrEqual(1);
     expect(retired?.attemptCount).toBeLessThan(defaultRecoveryActionMaxAttempts);
   });
 
