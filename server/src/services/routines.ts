@@ -1642,25 +1642,38 @@ export function routineService(
     error: unknown;
   }) {
     const failureReason = input.error instanceof Error ? input.error.message : String(input.error);
-    try {
-      await db
-        .insert(routineRuns)
-        .values({
+    // A coalesced or skipped fire had already reached its terminal status
+    // inside the transaction (finalizeRun ran before the abort), so re-persist
+    // that status rather than relabelling the fire failed: those paths create
+    // no issue, so a "failed" row with no linked issue would never self-correct.
+    const reachedTerminal = input.run.status === "coalesced" || input.run.status === "skipped";
+    const reinsert: typeof routineRuns.$inferInsert = reachedTerminal
+      ? { ...input.run, updatedAt: new Date() }
+      : {
           ...input.run,
           status: "failed",
           linkedIssueId: input.issueId,
           failureReason,
           completedAt: new Date(),
           updatedAt: new Date(),
-        })
+        };
+    try {
+      const [reinserted] = await db
+        .insert(routineRuns)
+        .values(reinsert)
         // A failure raised by COMMIT itself leaves the outcome ambiguous, so
         // never clobber a row that did survive.
-        .onConflictDoNothing({ target: routineRuns.id });
+        .onConflictDoNothing({ target: routineRuns.id })
+        .returning({ id: routineRuns.id });
+      // The row survived, so that fire's outcome is already recorded on the
+      // trigger; rewriting it here would clobber the successful fire's result.
+      if (!reinserted) return;
       await updateRoutineTouchedState({
         routineId: input.run.routineId,
         triggerId: input.run.triggerId,
         triggeredAt: input.run.triggeredAt,
-        status: "failed",
+        status: reinsert.status ?? "failed",
+        issueId: reachedTerminal ? input.run.linkedIssueId : undefined,
         nextRunAt: input.nextRunAt,
       });
     } catch (err) {
@@ -2009,7 +2022,8 @@ export function routineService(
             issueId: activeIssue.id,
             nextRunAt,
           }, txDb);
-          return updated ?? createdRun;
+          dispatchedRun = updated ?? createdRun;
+          return dispatchedRun;
         }
 
         try {
@@ -2076,7 +2090,8 @@ export function routineService(
             issueId: existingIssue.id,
             nextRunAt,
           }, txDb);
-          return updated ?? createdRun;
+          dispatchedRun = updated ?? createdRun;
+          return dispatchedRun;
         }
 
         dispatchedIssueId = createdIssue.id;
