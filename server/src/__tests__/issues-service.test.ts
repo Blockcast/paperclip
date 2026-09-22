@@ -11009,7 +11009,7 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
 
   async function seedOwnershipIssue(params: {
     checkoutStatus: "running" | "failed" | "timed_out";
-    actorRunStatus?: "queued" | "running" | "failed" | "timed_out" | "succeeded";
+    actorRunStatus?: "queued" | "running" | "failed" | "timed_out" | "succeeded" | "scheduled_retry";
     assigneeMatchesActor?: boolean;
   }) {
     const companyId = randomUUID();
@@ -11068,8 +11068,10 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
         agentId: actorAgentId,
         status: actorRunStatus,
         invocationSource: "manual",
-        startedAt: actorRunStatus === "running" ? new Date() : null,
-        finishedAt: actorRunStatus === "queued" || actorRunStatus === "running" ? null : new Date(),
+        // `scheduled_retry` with startedAt set is the retry ladder parking a run
+        // that DID start: not reapable, yet refused by the grant gate.
+        startedAt: actorRunStatus === "running" || actorRunStatus === "scheduled_retry" ? new Date() : null,
+        finishedAt: actorRunStatus === "queued" || actorRunStatus === "running" || actorRunStatus === "scheduled_retry" ? null : new Date(),
       },
     ]);
     await db.insert(issues).values({
@@ -11203,6 +11205,23 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
     // the hoisted remediation has to blame the caller's run, not the holder.
     expect(String(err?.details?.remediation)).toContain(seeded.actorRunId);
     expect(String(err?.details?.remediation)).toContain("succeeded");
+  });
+
+  it("names a started run parked in scheduled_retry as dead, not retryable", async () => {
+    // The grant gate refuses anything but `running`; a run the retry ladder
+    // parked in `scheduled_retry` after it started is refused just the same, yet
+    // it is not reapable (startedAt is set), so gating the remediation on
+    // reapability sent it back to "retry once" -- a retry that can never succeed.
+    const seeded = await seedOwnershipIssue({ checkoutStatus: "failed", actorRunStatus: "scheduled_retry" });
+
+    const err = await svc
+      .assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId)
+      .then(() => null, (caught) => caught as { status?: number; details?: Record<string, unknown> });
+    expect(err?.status).toBe(409);
+    expect(err?.details?.actorRunStatus).toBe("scheduled_retry");
+    expect(String(err?.details?.remediation)).toContain(seeded.actorRunId);
+    expect(String(err?.details?.remediation)).toContain("scheduled_retry");
+    expect(String(err?.details?.remediation)).not.toContain("retry once");
   });
 
   it("reports the actor's run status without weakening the live-holder fence", async () => {
