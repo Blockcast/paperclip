@@ -172,6 +172,54 @@ describe("hasStillPresentDisposition", () => {
       false,
     );
   });
+
+  // The gate (ally-review-detection.ts) and the sweep (sweep-stalled-ally-reviews.py)
+  // read the prose ledger with PRIOR_FINDING_DISPOSITION_PATTERN; this auditor
+  // must accept exactly the entries they accept, or the gate goes red on
+  // `unreadable_verdict` while the auditor reads a cleanly-attesting review.
+  // Drive the same ledger strings through all three sources, taken from the
+  // committed files rather than retyped.
+  it("accepts exactly the ledger entries the gate and the sweep accept", () => {
+    const notIndentedCode = String.raw`(?! *\t)(?! {4})`;
+    const tsSource = readFileSync(
+      new URL("../server/src/services/ally-review-detection.ts", import.meta.url),
+      "utf8",
+    );
+    const tsRaw = tsSource.match(
+      /PRIOR_FINDING_DISPOSITION_PATTERN = new RegExp\(\n\s*String\.raw`([^`]+)`,\n\s*"gim",/,
+    );
+    assert.ok(tsRaw, "ally-review-detection.ts still defines PRIOR_FINDING_DISPOSITION_PATTERN");
+    const gatePattern = new RegExp(tsRaw[1].replace("${NOT_INDENTED_CODE}", notIndentedCode), "gim");
+
+    const pySource = readFileSync(
+      new URL("../.github/scripts/sweep-stalled-ally-reviews.py", import.meta.url),
+      "utf8",
+    );
+    const pyRaw = pySource.match(
+      /PRIOR_FINDING_DISPOSITION_PATTERN = re\.compile\(\n\s*r"([^"]+)"\n\s*r"([^"]+)",/,
+    );
+    assert.ok(pyRaw, "sweep-stalled-ally-reviews.py still defines PRIOR_FINDING_DISPOSITION_PATTERN");
+    const sweepPattern = new RegExp(pyRaw[1] + pyRaw[2], "gim");
+
+    const blocksUnder = (pattern, verbGroup, text) =>
+      [...text.matchAll(pattern)].some((m) => m[verbGroup].toLowerCase() === "still-present");
+
+    const corpus = [
+      ["canonical", "- **prior:354d5b9 important 1** — still-present — not mirrored", true],
+      ["en dash separator", "- **prior:354d5b9 important 1** – still-present – not mirrored", true],
+      ["space after the emphasis", "- ** prior:354d5b9 important 1** — still-present — not mirrored", true],
+      ["trailing parenthetical after the index", "- **prior:354d5b9 important 1 (see below)** — still-present — not mirrored", false],
+      ["fixed verb", "- **prior:354d5b9 important 1** — fixed — closed", false],
+      ["verb in prose only", "still-present in quoted prose\n- prior:354d5b9 important 1 still-present", false],
+    ];
+    for (const [name, text, expected] of corpus) {
+      const gate = blocksUnder(gatePattern, 4, text);
+      const sweep = blocksUnder(sweepPattern, 1, text);
+      assert.equal(gate, expected, `gate reader: ${name}`);
+      assert.equal(sweep, expected, `sweep reader: ${name}`);
+      assert.equal(hasStillPresentDisposition(text), expected, `auditor: ${name}`);
+    }
+  });
 });
 
 describe("attestedHead", () => {
