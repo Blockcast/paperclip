@@ -485,6 +485,26 @@ describe("issue validators", () => {
       // The hazard that actually bites a hand-rolled fetch is the default page size, not the cap.
       expect(text).toMatch(/DEFAULT page size is 30/);
     });
+
+    // BLO-35277: `commit_id` re-anchors FORWARD on APPROVED reviews when the head moves, so
+    // `commit_id == head` fails OPEN — it accepts a review that never saw the head being acted on.
+    // This was the fourth copy of that recipe found and the only one no agent bundle write can
+    // reach. Assert the invariants rather than the prose, so wording stays free to change.
+    it("warns that `commit_id` is mutable and does not prescribe it as the record of the reviewed head", () => {
+      const text = issueExecutionMonitorPolicySchema.shape.gateSignals.description ?? "";
+      // The mechanism and its direction of failure, in those terms.
+      expect(text).toMatch(/commit_id` IS MUTABLE/i);
+      expect(text).toMatch(/RE-ANCHORS it FORWARD/i);
+      expect(text).toMatch(/fails OPEN/i);
+      // The immutable body marker is what records which head was read; commit_id corroborates.
+      expect(text).toMatch(/Reviewed head: <40-hex>` marker in the review BODY/);
+      expect(text).toMatch(/treat `commit_id` as corroboration at most/i);
+      // SURFACE 1 must stay labelled a liveness signal, so the empirically safe use survives.
+      expect(text).toMatch(/LIVENESS check/i);
+      // And the old recipe must not come back in either of the two places it lived.
+      expect(text).not.toMatch(/`commit_id` equals the PR's current head/i);
+      expect(text).not.toMatch(/staleness by comparing that `commit_id`/i);
+    });
   });
 
   describe("misplaced parked input keys (BLO-27912)", () => {
