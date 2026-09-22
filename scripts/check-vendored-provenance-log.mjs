@@ -51,6 +51,23 @@ export function checkVendoredProvenanceLog({ base, head = "HEAD", cwd }) {
     ? numstat.split("\t").slice(0, 2).map(Number)
     : [0, 0];
 
+  // `git diff --numstat` emits `-\t-` for a blob it treats as binary, so both
+  // counts parse to NaN and every comparison below is false: the guard would
+  // pass on exactly the input it exists to reject -- including a destructively
+  // rewritten log, which is the case the append-only rule is here for. Reject
+  // non-finite rather than comparing against it.
+  if (!Number.isFinite(added) || !Number.isFinite(deleted)) {
+    return {
+      ok: false,
+      reason: `${LOG} is not a text file; provenance cannot be verified.`,
+      detail: [
+        "git reports it as binary, so added/removed rows cannot be counted and",
+        "the append-only rule cannot be enforced. Check for a stray NUL byte or",
+        "a non-UTF-8 encoding, and restore the file as UTF-8 text.",
+      ],
+    };
+  }
+
   // Unconditional, because append-only is what makes `merge=union` on this file
   // safe at all: a union resolves by keeping both sides' added lines and cannot
   // reconcile an edit, so a rewritten row would be silently duplicated on the
@@ -73,7 +90,16 @@ export function checkVendoredProvenanceLog({ base, head = "HEAD", cwd }) {
 
   if (changed.length === 0) return { ok: true };
 
-  if (added < 1) {
+  // Count added *rows*, not added lines: a bare `added > 0` is satisfied by a
+  // blank line, so the cheapest way to silence the guard would be to add
+  // nothing. Row quality is still left to human review -- this only rules out
+  // the whitespace-only satisfier. The `+++ b/path` diff header cannot match,
+  // since the character after its leading `+` is neither space nor `|`.
+  const addedRows = git("diff", "--unified=0", range, "--", LOG)
+    .split("\n")
+    .filter((line) => /^\+\s*\|/.test(line));
+
+  if (addedRows.length < 1) {
     return {
       ok: false,
       reason: `Vendored source changed but ${LOG} gained no row.`,

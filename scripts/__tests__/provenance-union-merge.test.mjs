@@ -225,6 +225,48 @@ test("changing only the Blockcast-added provenance files needs no row", () => {
   assert.deepEqual(NOT_SOURCE, [`${VENDOR_DIR}/LICENSE`, `${VENDOR_DIR}/PROVENANCE.md`]);
 });
 
+test("a log git treats as binary is rejected, not silently passed", () => {
+  // `git diff --numstat` emits `-\t-` for a binary blob, so both counts parse
+  // to NaN and every comparison against them is false. Without an explicit
+  // non-finite check the guard passes on exactly the input it exists to
+  // reject. A stray NUL from a bad editor or a pasted binary snippet is enough.
+  //
+  // Asserting the *reason* is what makes this a real mutation test: drop the
+  // non-finite check and the destructive rewrite below stops being reported as
+  // an unverifiable file, which is the defect. The no-source-change case is
+  // the pure fail-open -- with the check gone it returns ok:true outright.
+  const withSource = scratchRepo();
+  withSource.write(SOURCE, "export const manifest = 2;\n");
+  withSource.write(LOG, `${LOG_HEADER}| \`abc\` | job\0manifest.ts | binary now |\n`);
+  withSource.commit("rewrite the log as a binary blob, and touch source");
+
+  const a = withSource.check();
+  assert.equal(a.ok, false);
+  assert.match(a.reason, /not a text file/);
+
+  const logOnly = scratchRepo();
+  logOnly.write(LOG, "| commit | files | what |\n|---|---|---|\n| `seed` | x | \0 |\n");
+  logOnly.commit("destructively rewrite the log as a binary blob");
+
+  const b = logOnly.check();
+  assert.equal(b.ok, false, "a binary log must never verify as ok");
+  assert.match(b.reason, /not a text file/);
+});
+
+test("a blank added line does not satisfy the require-a-row guard", () => {
+  // `added > 0` counts lines, and a blank line is a line. Requiring an added
+  // line shaped like a table row keeps the cheapest way to silence the guard
+  // being to actually write the row.
+  const { write, commit, check } = scratchRepo();
+  write(SOURCE, "export const manifest = 2;\n");
+  write(LOG, `${LOG_HEADER}\n   \n`);
+  commit("touch vendored source, append only whitespace");
+
+  const result = check();
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /gained no row/);
+});
+
 test("a change that does not touch the vendored tree at all passes", () => {
   const { write, commit, check } = scratchRepo();
   write("README.md", "unrelated\n");
