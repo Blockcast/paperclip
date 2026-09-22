@@ -66,6 +66,14 @@ function fitQuotedVerbs(quoted: string[], budget: number): string {
     used += cost;
   }
   if (kept.length) return `${kept.join(", ")}, …`;
+  // The first verb fits whole and was rejected only by the 3-character reserve
+  // for the ", …" marker. Return it as is: eliding it would slice through its
+  // closing quote when its length is exactly budget - 2 (three quotes in the
+  // render, the odd-quote defect the invariant test guards) and would mark a
+  // complete name as truncated while the other verbs vanish unmarked either
+  // way. Below this line quoted[0].length > budget > budget - 2, so the slice
+  // can no longer reach the closing quote.
+  if (quoted[0].length <= budget) return quoted[0];
   // Not even the first verb fits whole. Elide inside its quotes so it still
   // reads as truncated and keeps its closing quote, rather than rendering the
   // lead with no verb at all.

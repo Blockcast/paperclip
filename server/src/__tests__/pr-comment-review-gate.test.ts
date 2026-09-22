@@ -572,6 +572,34 @@ describe("evaluateCommentReviewGate", () => {
     expect(verdict.reason).toMatch(/the only comment attesting it is the PR author's own/i);
   });
 
+  it("returns a first verb that fits whole instead of slicing through its closing quote", () => {
+    // Budget 21 (plural lead + self-attested tail). `"not-yet-evaluated"` is
+    // exactly 19 characters = budget - 2: the elide fallback's guard fires
+    // (19 + 3 > 21) and its slice(0, budget - 2) takes the whole entry INCLUDING
+    // its closing quote, then appends `…"` -- three quotes, and a complete
+    // name marked as truncated while the second verb vanishes unmarked. The
+    // entry fits the budget on its own, so it is rendered whole.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [
+        allyComment(blockingReviewWithFindings(OLD_HEAD, 2), "2026-08-04T20:09:19Z"),
+        allyComment(
+          multiDispositionReview(INTERMEDIATE_HEAD, OLD_HEAD, ["not-yet-evaluated", "pending"]),
+          "2026-08-04T21:09:19Z",
+        ),
+        allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T22:09:19Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    expect(verdict.reason.length).toBeLessThanOrEqual(140);
+    expect(verdict.reason).toContain('"not-yet-evaluated"');
+    expect(verdict.reason).not.toContain('not-yet-evaluated"…"');
+    expect((verdict.reason.match(/"/g) ?? []).length % 2).toBe(0);
+    expect(verdict.reason).toMatch(/the only comment attesting it is the PR author's own/i);
+  });
+
   it("renders both verbs whole when the list fits the budget exactly", () => {
     // The control for the case above: `"deferred", "pending"` is exactly the
     // 21 characters available, so nothing is dropped and no marker appears.
