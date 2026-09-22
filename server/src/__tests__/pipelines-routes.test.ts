@@ -62,7 +62,7 @@ describeEmbeddedPostgres("pipeline routes", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-pipelines-routes-");
     db = createDb(tempDb.connectionString);
-  }, 60_000);
+  });
 
   afterEach(async () => {
     await db.delete(pipelineAutomationExecutions);

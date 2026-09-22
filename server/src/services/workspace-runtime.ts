@@ -19,7 +19,7 @@ import {
   type WorkspaceRuntimeDesiredState,
   type WorkspaceRuntimeServiceStateMap,
 } from "@paperclipai/shared";
-import { and, desc, eq, inArray, isNull, ne } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, ne, notInArray } from "drizzle-orm";
 import { asNumber, asString, parseObject, renderTemplate } from "../adapters/utils.js";
 import { resolveHomeAwarePath, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import {
@@ -658,6 +658,45 @@ const RUN_SCOPE_TOKEN_LENGTH = 8;
 const BRANCH_NAME_MAX_LENGTH = 120;
 
 /**
+ * BLO-23144 (2): clamp `branchName` into `budget` characters without losing the
+ * issue identifier.
+ *
+ * The clamp truncates from the END, so it only preserves the identifier when the
+ * identifier happens to sit at the FRONT of the rendered name. That is true for
+ * the default branchTemplate and for anything `applyIssueIdentifierToBranchName`
+ * had to prepend, which is why the original code could assert "applied after the
+ * identifier step so the identifier survives" and be right in practice. It is
+ * not true in general: a custom `branchTemplate` that renders the identifier
+ * last (`{{agent.slug}}-{{issue.identifier}}`) puts it exactly where the cut
+ * lands, and losing it breaks the BLO-9117 guarantee that a merged PR ref-links
+ * at merge time — silently, because the branch still looks well-formed.
+ *
+ * When the cut would eat the identifier, re-anchor it at the front, where
+ * end-truncation can never reach it, and spend whatever budget is left on the
+ * original name.
+ */
+function clampBranchBasePreservingIdentifier(
+  branchName: string,
+  issueIdentifier: string | null | undefined,
+  budget: number,
+): string {
+  if (branchName.length <= budget) return branchName;
+  const clamped = branchName.slice(0, budget);
+  const identifier = issueIdentifier ? sanitizeBranchName(issueIdentifier) : "";
+  // Nothing to protect, it already survived the cut, or it was never in the name
+  // to begin with (applyIssueIdentifierToBranchName's job, not this one's).
+  if (!identifier || clamped.includes(identifier) || !branchName.includes(identifier)) {
+    return clamped;
+  }
+  const prefix = `${identifier}-`;
+  // Degenerate budget: an identifier that cannot fit alongside the run token has
+  // nothing to re-anchor into. Prefer the plain clamp over emitting a branch that
+  // is nothing but an identifier.
+  if (prefix.length >= budget) return clamped;
+  return `${prefix}${branchName.slice(0, budget - prefix.length)}`;
+}
+
+/**
  * BLO-19063: derive a run-scoped branch name so that two concurrent runs never
  * share a working tree.
  *
@@ -667,34 +706,41 @@ const BRANCH_NAME_MAX_LENGTH = 120;
  * twice, so a per-run tree genuinely requires a per-run branch, not just a
  * per-run directory.
  *
- * The issue identifier is preserved verbatim in the result, so the BLO-9117
- * ref-linking guarantee (see applyIssueIdentifierToBranchName) still holds — the
- * token is appended, never substituted. Returns `branchName` unchanged for
- * `per_issue` scope or when no run id is available, which is what keeps this
- * opt-in rather than a fleet-wide migration.
+ * The issue identifier is preserved in the result, so the BLO-9117 ref-linking
+ * guarantee (see applyIssueIdentifierToBranchName) still holds — the token is
+ * appended, never substituted, and the clamp re-anchors the identifier rather
+ * than cutting it (see clampBranchBasePreservingIdentifier). Returns
+ * `branchName` unchanged for `per_issue` scope or when no run id is available,
+ * which is what keeps this opt-in rather than a fleet-wide migration.
  */
 export function applyRunScopeToBranchName(
   branchName: string,
   runScope: ExecutionWorkspaceRunScope | null | undefined,
   heartbeatRunId: string | null | undefined,
+  issueIdentifier?: string | null,
 ): string {
   if (runScope !== "per_run") return branchName;
-  // Derive the token from the raw run id rather than via sanitizeBranchName:
-  // that helper substitutes a literal "paperclip-work" for empty input, which
-  // would turn every run *without* a run id into the same token ("papercli")
-  // and silently collapse them back onto one shared tree while still looking
-  // per-run. A missing id must degrade to the issue-scoped name loudly, not to
-  // a colliding one quietly.
-  const token = (heartbeatRunId ?? "")
-    .replace(/[^A-Za-z0-9]+/g, "")
-    .slice(0, RUN_SCOPE_TOKEN_LENGTH)
-    .toLowerCase();
-  // No usable run id (e.g. a non-heartbeat realize path): fall back to the
-  // issue-scoped name rather than inventing a token, which would strand a tree
-  // nothing can find again.
-  if (!token) return branchName;
+  // Decide "is there a usable run id?" on the RAW id, before hashing. A hash maps
+  // every input to a plausible-looking token, including "" and "-----", so
+  // deciding on the digest would resurrect the exact failure the original code
+  // avoided: runs without an id silently colliding on one token while still
+  // looking per-run. A missing id must degrade to the issue-scoped name loudly.
+  if (!/[A-Za-z0-9]/.test(heartbeatRunId ?? "")) return branchName;
+  // BLO-23144 (3): hash the WHOLE run id rather than slicing its first 8
+  // alphanumerics. For a UUID those 8 are just `time_low` — one field, ~32 bits —
+  // so uniqueness rested on a fraction of the id and on the id happening to be a
+  // UUID at all. A digest depends on every character and is stable across calls,
+  // which is what the worktree lookup needs.
+  const token = createHash("sha256")
+    .update(heartbeatRunId ?? "")
+    .digest("hex")
+    .slice(0, RUN_SCOPE_TOKEN_LENGTH);
   const suffix = `-r${token}`;
-  const base = branchName.slice(0, BRANCH_NAME_MAX_LENGTH - suffix.length);
+  const base = clampBranchBasePreservingIdentifier(
+    branchName,
+    issueIdentifier,
+    BRANCH_NAME_MAX_LENGTH - suffix.length,
+  );
   return sanitizeBranchName(`${base}${suffix}`);
 }
 
@@ -1350,7 +1396,79 @@ async function findGitWorktreeBranchContention(input: {
     worktreePath: input.worktreePath,
     liveBranchName: input.actualBranchName,
     excludingExecutionWorkspaceId: input.executionWorkspaceId,
+    excludingSourceIssueId: input.sourceIssue?.id ?? null,
   });
+}
+
+const EXECUTION_WORKSPACE_CLAIMANT_SAMPLE_LIMIT = 10;
+
+// Outcome of the claimant lookup. `null` used to mean both "nothing to query"
+// and "the query failed", and collapsing those made the failure case read as
+// "not contended" — a refusal that disables itself under exactly the database
+// stress that co-occurs with workspace thrash. Keeping the three states
+// distinct lets eligibility fail closed on `failed` while the fresh-worktree
+// reuse path, which has no execution workspace id yet, keeps passing.
+type ExecutionWorkspaceClaimantLookup =
+  | {
+      status: "ok";
+      claimants: NonNullable<GitWorktreeBranchIncoherenceEvidence["workspaceClaimants"]>;
+      truncated: boolean;
+    }
+  | { status: "not-computable" }
+  | { status: "failed" };
+
+// Non-terminal issues pointing at one execution workspace. A worktree holds a
+// single branch, so two or more claimants make it a shared resource and the
+// recorded branch is shared with them. Restoring it would move the worktree off
+// whichever claimant's branch is currently checked out, so safe repair refuses
+// and leaves the existing workspace-binding recovery path to route it (BLO-32628).
+async function findExecutionWorkspaceIssueClaimants(input: {
+  db: Db | null | undefined;
+  executionWorkspaceId: string | null;
+}): Promise<ExecutionWorkspaceClaimantLookup> {
+  if (!input.db || !input.executionWorkspaceId) return { status: "not-computable" };
+  let rows: { id: string; identifier: string | null; status: string }[];
+  try {
+    // One row past the sample limit, so a saturated result can be reported as
+    // "at least N" rather than rendering the cap as an exact count.
+    rows = await input.db
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        status: issues.status,
+      })
+      .from(issues)
+      .where(and(
+        eq(issues.executionWorkspaceId, input.executionWorkspaceId),
+        notInArray(issues.status, ["done", "cancelled"]),
+        isNull(issues.hiddenAt),
+      ))
+      .orderBy(issues.issueNumber)
+      .limit(EXECUTION_WORKSPACE_CLAIMANT_SAMPLE_LIMIT + 1);
+  } catch {
+    return { status: "failed" };
+  }
+  return {
+    status: "ok",
+    truncated: rows.length > EXECUTION_WORKSPACE_CLAIMANT_SAMPLE_LIMIT,
+    claimants: rows.slice(0, EXECUTION_WORKSPACE_CLAIMANT_SAMPLE_LIMIT).map((row) => ({
+      issueId: row.id,
+      issueIdentifier: row.identifier ?? null,
+      status: row.status,
+    })),
+  };
+}
+
+function formatWorkspaceClaimantRefusal(
+  claimants: NonNullable<GitWorktreeBranchIncoherenceEvidence["workspaceClaimants"]>,
+  truncated: boolean,
+) {
+  const names = claimants
+    .map((claimant) => claimant.issueIdentifier ?? claimant.issueId)
+    .join(", ");
+  const count = truncated ? `at least ${claimants.length}` : `${claimants.length}`;
+  const sample = truncated ? `${names}, …` : names;
+  return `execution workspace is claimed by ${count} non-terminal issues (${sample}); restoring the recorded branch would move the worktree off another issue's branch`;
 }
 
 function executionWorkspaceUsesInheritedProjectRuntimeServices(
@@ -1530,7 +1648,15 @@ async function inspectGitWorktreeBranchIncoherence(input: {
   const actualBranchExists = input.actualBranchName
     ? await localBranchExists(input.repoRoot, input.actualBranchName)
     : null;
-  const registered = await findRegisteredGitWorktreeByPath(input.repoRoot, input.worktreePath);
+  // One `git worktree list` and one realpath walk of the worktree path, shared
+  // by the path lookup here and the recorded-branch lookup below. This runs on
+  // every dispatch, so resolving both out of a single listing keeps the common
+  // `sameHead` repair from paying for a lookup it never reads.
+  const registeredWorktrees = await listRegisteredGitWorktrees(input.repoRoot);
+  const resolvedWorktreePath = await resolvePathForWorktreeComparison(input.worktreePath);
+  const registered = registeredWorktrees
+    ? await findGitWorktreeEntryByResolvedPath(registeredWorktrees, resolvedWorktreePath)
+    : null;
   const actualBranchRef = input.actualBranchName ? `refs/heads/${input.actualBranchName}` : null;
   const registeredBranchRef = registered?.branch ?? null;
   const registeredBranchMatchesHead = Boolean(registered && registeredBranchRef === actualBranchRef);
@@ -1568,14 +1694,72 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     ancestryVerdict === "ancestor" &&
     !sameHead &&
     registeredBranchMatchesHead;
+  const workspaceClaimantLookup = await findExecutionWorkspaceIssueClaimants({
+    db: input.db ?? null,
+    executionWorkspaceId: input.executionWorkspaceId ?? null,
+  });
+  const workspaceClaimants =
+    workspaceClaimantLookup.status === "ok" ? workspaceClaimantLookup.claimants : null;
+  // A failed lookup fails closed. `cleanliness` above resolves to "unknown" when
+  // `git status` fails and then refuses; this has to take the same posture,
+  // because database stress and workspace thrash share causes — a refusal that
+  // evaporates under exactly the load that produces contention is not a refusal.
+  // Only "not-computable" reads as uncontended: there was nothing to query, which
+  // is the fresh-worktree reuse path with no execution workspace id yet.
+  const workspaceIsContended =
+    workspaceClaimantLookup.status === "failed" || (workspaceClaimants?.length ?? 0) > 1;
+  // `git checkout` refuses a branch that is already checked out in another
+  // linked worktree, so eligibility has to know about that before it promises a
+  // repair. Without this the run would report `eligible: true`, attempt the
+  // checkout, and fail with a bare "safe checkout failed" — strictly less
+  // diagnosable than the refusal it replaced.
+  const expectedBranchWorktreePath = expectedBranchExists && registeredWorktrees
+    ? findGitWorktreeEntryByBranch(registeredWorktrees, input.expectedBranchName)
+    : null;
+  const expectedBranchHeldByOtherWorktree = expectedBranchWorktreePath
+    ? await resolvePathForWorktreeComparison(expectedBranchWorktreePath) !== resolvedWorktreePath
+    : false;
+  // Ordinary stacked work — a sibling feature branch cut from the same base —
+  // leaves both branches as named local refs with neither an ancestor of the
+  // other. Ancestry is not load-bearing here: `refs/heads/<actualBranch>` keeps
+  // the checked-out commits reachable by construction, so restoring the recorded
+  // branch cannot orphan work whatever the verdict says. Ancestry stays
+  // load-bearing for the two branches above — the detached-HEAD case, where no
+  // ref preserves those commits, and the forward-adopt case, which rewrites the
+  // recorded branch rather than restoring it. A contended workspace is excluded:
+  // there the checked-out branch belongs to another claimant, so the mismatch is
+  // a workspace-binding defect for the recovery path, not a branch to restore.
+  const canCheckoutRecordedBranchOverDivergedBranch =
+    cleanliness === "clean" &&
+    expectedBranchExists &&
+    actualBranchExists === true &&
+    ancestryVerdict !== "ancestor" &&
+    !sameHead &&
+    registeredBranchMatchesHead &&
+    // `git bisect start` is the one shape that reads clean and still sits on a
+    // branch, so cleanliness does not screen it out; the other operations either
+    // detach (rebase) or stage content (merge, cherry-pick, revert). The checkout
+    // would succeed and lose nothing, but it would leave live bisect state
+    // pointing at a branch the worktree is no longer on, for the next run to
+    // inherit silently. A worktree mid-bisect is an interrupted operation rather
+    // than the ordinary stacked work this branch is for, so excluding it costs no
+    // reach over either observed shape.
+    !inProgressOperation &&
+    !workspaceIsContended &&
+    !expectedBranchHeldByOtherWorktree;
   const eligible =
-    canCheckoutRecordedBranch || canAdoptForwardActualBranch || canAttachRecordedBranchToDetachedHead;
+    canCheckoutRecordedBranch ||
+    canAdoptForwardActualBranch ||
+    canAttachRecordedBranchToDetachedHead ||
+    canCheckoutRecordedBranchOverDivergedBranch;
   const safeRepairReason = eligible
     ? canCheckoutRecordedBranch
       ? "clean worktree and expected branch points at the current HEAD"
       : canAdoptForwardActualBranch
         ? "clean worktree and checked-out branch is forward of the recorded branch"
-        : "clean detached worktree HEAD is forward of the recorded branch"
+        : canAttachRecordedBranchToDetachedHead
+          ? "clean detached worktree HEAD is forward of the recorded branch"
+          : "clean worktree can restore the recorded branch because the checked-out branch keeps its commits reachable"
     : cleanliness !== "clean"
       ? inProgressOperation
         ? `worktree is not clean and a git ${GIT_IN_PROGRESS_OPERATION_LABELS[inProgressOperation]} is in progress`
@@ -1586,9 +1770,22 @@ async function inspectGitWorktreeBranchIncoherence(input: {
         ? "registered worktree branch does not match HEAD"
       : !expectedBranchExists
         ? "expected branch does not exist"
-        : !sameHead
-          ? "expected branch and current HEAD differ"
-          : "safe repair could not be proven";
+        : input.actualBranchName === null
+          ? "detached worktree HEAD is not provably forward of the recorded branch"
+          : inProgressOperation
+            ? `a git ${GIT_IN_PROGRESS_OPERATION_LABELS[inProgressOperation]} is in progress in this worktree`
+          : workspaceClaimantLookup.status === "failed"
+            ? "execution workspace claimant lookup failed, so contention could not be ruled out"
+          : workspaceIsContended && workspaceClaimants
+            ? formatWorkspaceClaimantRefusal(
+              workspaceClaimants,
+              workspaceClaimantLookup.status === "ok" && workspaceClaimantLookup.truncated,
+            )
+            : expectedBranchHeldByOtherWorktree
+              ? `recorded branch is already checked out in another worktree at ${expectedBranchWorktreePath}`
+              : !sameHead
+                ? "expected branch and current HEAD differ"
+                : "safe repair could not be proven";
   const fingerprint = fingerprintWorkspaceBranchIncoherence({
     sourceIssueId: input.sourceIssue?.id ?? null,
     executionWorkspaceId: input.executionWorkspaceId ?? null,
@@ -1622,6 +1819,9 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     statusEntryCount: statusLines?.length ?? null,
     dirtyPathSample,
     contention,
+    workspaceClaimants,
+    workspaceClaimantLookup: workspaceClaimantLookup.status,
+    expectedBranchWorktreePath,
     provenance: {
       expectedBranchRef: `refs/heads/${input.expectedBranchName}`,
       actualBranchRef,
@@ -2492,11 +2692,20 @@ export async function ensureGitWorktreeBranchCoherent(input: {
 
   evidence.safeRepair.succeeded = true;
   evidence.safeRepair.reason = "clean worktree checked out the recorded branch";
+  // A diverged sibling branch is the ordinary stacked-work shape. The checkout
+  // above moved HEAD off it, so name the ref and the commit it still points at:
+  // that is what makes the no-loss guarantee checkable by whoever reads this.
+  const divergedBranchPreserved =
+    currentBranch !== null &&
+    evidence.provenance.actualBranchExists === true &&
+    !evidence.provenance.sameHead;
   return {
     branchName: expectedBranchName,
     reconciledForward: false,
     warnings: [
-      `Execution workspace branch metadata was self-healed by checking out recorded branch "${expectedBranchName}" at ${input.worktreePath}.`,
+      divergedBranchPreserved
+        ? `${warningPrefix} The checked-out branch had diverged from the recorded branch, so Paperclip restored "${expectedBranchName}"; the diverged work is unchanged on "${currentBranch}"${evidence.provenance.actualHeadSha ? ` at ${formatShortSha(evidence.provenance.actualHeadSha)}` : ""} and can be checked out again.`
+        : `Execution workspace branch metadata was self-healed by checking out recorded branch "${expectedBranchName}" at ${input.worktreePath}.`,
     ],
   };
 }
@@ -2667,30 +2876,44 @@ async function resolveGitOwnerRepoRoot(cwd: string): Promise<string> {
   return path.dirname(path.resolve(checkoutRoot, commonDir));
 }
 
-async function findRegisteredGitWorktreeByBranch(repoRoot: string, branchName: string): Promise<string | null> {
+// One `git worktree list` for callers that need to resolve more than one thing
+// out of it. The branch-incoherence inspection runs on every dispatch, so paying
+// the subprocess twice — once by path, once by branch — is pure overhead on the
+// common `sameHead` path that repairs without ever reading the branch lookup.
+async function listRegisteredGitWorktrees(repoRoot: string): Promise<GitWorktreeListEntry[] | null> {
   const raw = await runGit(["worktree", "list", "--porcelain"], repoRoot).catch(() => null);
   if (!raw) return null;
+  return parseGitWorktreeListPorcelain(raw);
+}
 
+function findGitWorktreeEntryByBranch(
+  entries: GitWorktreeListEntry[],
+  branchName: string,
+): string | null {
   const expectedBranchRef = `refs/heads/${branchName}`;
-  for (const entry of parseGitWorktreeListPorcelain(raw)) {
+  for (const entry of entries) {
     if (entry.branch !== expectedBranchRef) continue;
     return path.resolve(entry.worktree);
   }
-
   return null;
 }
 
-async function findRegisteredGitWorktreeByPath(repoRoot: string, worktreePath: string): Promise<GitWorktreeListEntry | null> {
-  const raw = await runGit(["worktree", "list", "--porcelain"], repoRoot).catch(() => null);
-  if (!raw) return null;
-
-  const expectedPath = await resolvePathForWorktreeComparison(worktreePath);
-  for (const entry of parseGitWorktreeListPorcelain(raw)) {
-    if (await resolvePathForWorktreeComparison(entry.worktree) === expectedPath) {
+async function findGitWorktreeEntryByResolvedPath(
+  entries: GitWorktreeListEntry[],
+  resolvedWorktreePath: string,
+): Promise<GitWorktreeListEntry | null> {
+  for (const entry of entries) {
+    if (await resolvePathForWorktreeComparison(entry.worktree) === resolvedWorktreePath) {
       return entry;
     }
   }
   return null;
+}
+
+async function findRegisteredGitWorktreeByBranch(repoRoot: string, branchName: string): Promise<string | null> {
+  const entries = await listRegisteredGitWorktrees(repoRoot);
+  if (!entries) return null;
+  return findGitWorktreeEntryByBranch(entries, branchName);
 }
 
 async function isGitCheckout(cwd: string): Promise<boolean> {
@@ -3918,11 +4141,14 @@ export async function realizeExecutionWorkspace(input: {
   //
   // BLO-19063: then, under `runScope: "per_run"`, append a run token so two
   // concurrent runs of this issue land in different trees instead of sharing
-  // one. Applied after the identifier step so the identifier survives.
+  // one. Applied after the identifier step, and handed the identifier so its
+  // length clamp can re-anchor rather than truncate it (BLO-23144) — ordering
+  // alone only protects an identifier that sits at the front.
   let branchName = applyRunScopeToBranchName(
     applyIssueIdentifierToBranchName(renderedBranch, input.issue?.identifier ?? null),
     resolveExecutionWorkspaceRunScope(rawStrategy.runScope),
     input.heartbeatRunId ?? null,
+    input.issue?.identifier ?? null,
   );
   const configuredParentDir = asString(rawStrategy.worktreeParentDir, "");
   const worktreeParentDir = configuredParentDir

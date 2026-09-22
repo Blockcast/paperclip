@@ -3,11 +3,14 @@ import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AcpRuntimeOptions } from "acpx/runtime";
 import type { AdapterRuntimeMcpAccess } from "@paperclipai/adapter-utils";
 import { DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC } from "@paperclipai/adapter-utils/execution-target";
+import { ACP_ENGINE_SESSION_PROGRESS_MAX_DELAY_MS } from "./constants.js";
 import {
+  awaitPreTurnWithProgress,
+  awaitRuntimePrepareWithProgress,
   awaitSessionWithProgress,
   createAcpxEngineExecutor,
   findAncestorBin,
@@ -1859,9 +1862,31 @@ describe("ACPX session establishment progress (PEN-1995)", () => {
       fastDelays,
     );
 
-    await new Promise((resolve) => setTimeout(resolve, 60));
-    const waitingWhileStalled = stages().filter((stage) => stage === "waiting").length;
-    expect(waitingWhileStalled).toBeGreaterThanOrEqual(2);
+    // Wait on the ticks themselves, not on wall-clock. A fixed sleep asserts a
+    // rate the runner is under no obligation to deliver: at firstDelay 5ms /
+    // maxDelay 10ms a 60ms sleep should see ~6 ticks, but on a loaded CI shard
+    // it saw 1 and failed, reporting a healthy ticker as broken. Polling to a
+    // bounded deadline keeps the assertion honest in the failing direction: a
+    // ticker that stops rescheduling never reaches 2 and still fails here.
+    //
+    // The deadline must stay well under the test timeout. Two of those apply and
+    // the tighter one binds: vitest's 5s default locally, and 30s in CI, which
+    // runs adapter-utils in the `general-workspaces-b` lane with
+    // --testTimeout=30000 (scripts/run-vitest-stable.mjs). Design against the 5s.
+    // At 5s exactly the two race and the timeout wins, so a genuine ticker
+    // regression aborts the test before the expect() runs and reports an opaque
+    // "Test timed out" with no observed stages -- verified by breaking the
+    // reschedule. Budget is 2s against a 10ms tick ceiling, i.e. ~200x; nothing
+    // but a real regression reaches it.
+    const waitingTicks = () => stages().filter((stage) => stage === "waiting").length;
+    const deadlineMs = Date.now() + 2_000;
+    while (waitingTicks() < 2 && Date.now() < deadlineMs) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(
+      waitingTicks(),
+      `ticker did not keep reporting; observed stages: [${stages().join(", ")}]`,
+    ).toBeGreaterThanOrEqual(2);
     expect(stages()).not.toContain("established");
 
     release();
@@ -1951,6 +1976,435 @@ describe("ACPX session establishment progress (PEN-1995)", () => {
     ]);
     for (const entry of lines) {
       expect(Object.keys(entry).filter((key) => !allowed.has(key))).toEqual([]);
+    }
+  });
+});
+
+describe("ACPX runtime prepare progress (PEN-1995)", () => {
+  function collector() {
+    const lines: Array<Record<string, unknown>> = [];
+    const ctx = {
+      onLog: async (_stream: "stdout" | "stderr", text: string) => {
+        for (const line of text.split("\n")) {
+          if (!line.trim()) continue;
+          try {
+            lines.push(JSON.parse(line) as Record<string, unknown>);
+          } catch {
+            // non-JSON prose lines are not part of this contract
+          }
+        }
+      },
+    } as never;
+    const stages = () =>
+      lines
+        .filter((entry) => entry.type === "acpx.runtime_prepare")
+        .map((entry) => entry.stage as string);
+    return { lines, ctx, stages };
+  }
+
+  const fastDelays = { firstDelayMs: 5, maxDelayMs: 10 };
+
+  it("brackets a normal prepare with started/prepared and reports elapsed", async () => {
+    const { ctx, lines, stages } = collector();
+
+    const prepared = await awaitRuntimePrepareWithProgress(ctx, async () => "runtime", fastDelays);
+
+    expect(prepared).toBe("runtime");
+    expect(stages()).toEqual(["started", "prepared"]);
+    expect(typeof lines[0]?.elapsedMs).toBe("number");
+  });
+
+  it("keeps reporting while prepare is slow, and stops once it settles", async () => {
+    const { ctx, stages } = collector();
+    // Definite-assignment, not `| null`: the executor assigns synchronously, but
+    // control-flow analysis cannot see that and narrows a nullable binding to
+    // `never` at the call site below.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    const pending = awaitRuntimePrepareWithProgress(
+      ctx,
+      async () => {
+        await gate;
+        return "runtime";
+      },
+      fastDelays,
+    );
+
+    // A stall must keep the run's last-output timestamp advancing; that is the
+    // entire point of the ticker, so assert more than one tick actually lands.
+    // Bounded well under the tighter of the two test timeouts that apply (5s
+    // vitest default locally, 30s in CI's workspaces-b lane) so a ticker
+    // regression fails against the stages actually observed; at 5s exactly the
+    // timeout wins the race and reports "Test timed out" with no stages. See the
+    // session-side sibling above for the same budget and the same reason.
+    const waitingTicks = () => stages().filter((stage) => stage === "waiting").length;
+    const deadlineMs = Date.now() + 2_000;
+    while (waitingTicks() < 2 && Date.now() < deadlineMs) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(
+      waitingTicks(),
+      `ticker did not keep reporting; observed stages: [${stages().join(", ")}]`,
+    ).toBeGreaterThanOrEqual(2);
+
+    release();
+    await pending;
+
+    expect(stages().at(0)).toBe("started");
+    expect(stages().at(-1)).toBe("prepared");
+
+    const settled = stages().length;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(stages().length).toBe(settled);
+  });
+
+  it("reports a failed prepare and rethrows", async () => {
+    const { ctx, stages } = collector();
+
+    await expect(
+      awaitRuntimePrepareWithProgress(
+        ctx,
+        async () => {
+          throw new Error("ACP_RUNTIME_PREPARE_FAILED");
+        },
+        fastDelays,
+      ),
+    ).rejects.toThrow("ACP_RUNTIME_PREPARE_FAILED");
+
+    expect(stages()).toEqual(["started", "failed"]);
+
+    const settled = stages().length;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(stages().length).toBe(settled);
+  });
+
+  // Regression guard for the `started` emit's `.catch()`. This is the first
+  // statement of the run and it is awaited ABOVE the block whose catch routes to
+  // `emitAcpxFailure`, so an unguarded rejection here would leave
+  // `executeAcpxEngine` as an unclassified throw -- the instrumentation becoming
+  // the reason the run died, with less evidence than the silent runs it exists
+  // to explain. Progress reporting must never be fatal.
+  it("survives a rejecting run-log write instead of failing the run", async () => {
+    const ctx = {
+      onLog: async () => {
+        throw new Error("RUN_LOG_WRITE_FAILED");
+      },
+    } as never;
+
+    await expect(
+      awaitRuntimePrepareWithProgress(ctx, async () => "runtime", fastDelays),
+    ).resolves.toBe("runtime");
+  });
+
+  // Wiring check, and the ordering claim that makes "silent at seq 1" mean one
+  // thing: preparation is the first window of the run, so its `started` tick
+  // must be the very first event the engine emits -- ahead of the handshake's.
+  it("routes the real executor's preparation through the ticker, ahead of the handshake", async () => {
+    const { logs } = await runExecutor({ agent: "claude" });
+
+    const events = logs
+      .filter((entry) => entry.stream === "stdout")
+      .flatMap((entry) => entry.text.split("\n"))
+      .filter((line) => line.trim().startsWith("{"))
+      .map((line) => {
+        try {
+          return JSON.parse(line) as Record<string, unknown>;
+        } catch {
+          return null;
+        }
+      })
+      .filter((entry): entry is Record<string, unknown> => entry !== null);
+
+    const prepare = events.filter((entry) => entry.type === "acpx.runtime_prepare");
+    expect(prepare.map((entry) => entry.stage)).toEqual(["started", "prepared"]);
+    expect(typeof prepare[1]?.elapsedMs).toBe("number");
+
+    expect(events[0]?.type).toBe("acpx.runtime_prepare");
+    expect(events[0]?.stage).toBe("started");
+
+    const firstHandshake = events.findIndex((entry) => entry.type === "acpx.session_establish");
+    expect(firstHandshake).toBeGreaterThan(events.indexOf(prepare[1]!));
+  });
+
+  // PEN-3099. The residual pre-import window is only *attributable* because the
+  // `Adapter execution timeout:` line is emitted from inside this module, using
+  // the result of `buildRuntime`. That makes its presence in a run log positive
+  // proof that the lazy `await import(...)`, the billing lookup and the prepare
+  // all returned -- which is what lets a liveness predicate tell a run parked in
+  // the import (line absent) from one parked in the handshake (line present),
+  // rather than reading both as an indistinguishable silence. Measured on 1,808
+  // production runs, 27 of 28 silent runs carried this line. Moving the emit
+  // above `buildRuntime` would destroy that discriminator without failing any
+  // other assertion here, so pin its position on both sides.
+  it("emits the timeout line between the prepare terminal and the handshake, so it proves prepare completed", async () => {
+    const { logs } = await runExecutor({ agent: "claude" });
+
+    const at = (needle: string) => logs.findIndex((entry) => entry.text.includes(needle));
+
+    // Match the *terminal* prepare tick explicitly. `at('"type":"acpx.runtime_-
+    // prepare"')` matches on type alone and would return the leading `started`
+    // tick, which is emitted before `buildRuntime` -- so an ordering assertion
+    // written against it would still pass with the emit moved above
+    // `buildRuntime`, i.e. it would pass in exactly the case this test exists to
+    // fail. There is deliberately no index for the `started` tick here.
+    const preparedTerminalAt = logs.findIndex(
+      (entry) => entry.text.includes('"type":"acpx.runtime_prepare"') && entry.text.includes('"stage":"prepared"'),
+    );
+    const timeoutAt = at("Adapter execution timeout:");
+    const handshakeAt = at('"type":"acpx.session_establish"');
+
+    // Assert presence positively: a missing marker yields -1, which would other-
+    // wise satisfy the < comparisons below and pass vacuously.
+    expect(preparedTerminalAt).toBeGreaterThanOrEqual(0);
+    expect(timeoutAt).toBeGreaterThanOrEqual(0);
+    expect(handshakeAt).toBeGreaterThanOrEqual(0);
+
+    expect(timeoutAt).toBeGreaterThan(preparedTerminalAt);
+    expect(timeoutAt).toBeLessThan(handshakeAt);
+  });
+
+  it("never emits prompt, credential, environment, or path material", async () => {
+    const { lines, ctx } = collector();
+
+    await awaitRuntimePrepareWithProgress(ctx, async () => "runtime", fastDelays);
+
+    expect(lines.length).toBeGreaterThan(0);
+    for (const entry of lines) {
+      // Exact key set, not an exclusion list: a payload field added later has
+      // to be re-justified here rather than inherited silently.
+      expect(Object.keys(entry).sort()).toEqual(["elapsedMs", "observedAt", "stage", "type"]);
+    }
+  });
+});
+
+describe("ACPX pre-turn progress (PEN-2555)", () => {
+  function collector() {
+    const lines: Array<Record<string, unknown>> = [];
+    const ctx = {
+      onLog: async (_stream: "stdout" | "stderr", text: string) => {
+        for (const line of text.split("\n")) {
+          if (!line.trim()) continue;
+          try {
+            lines.push(JSON.parse(line) as Record<string, unknown>);
+          } catch {
+            // non-JSON prose lines are not part of this contract
+          }
+        }
+      },
+    } as never;
+    const ticks = () => lines.filter((entry) => entry.type === "acpx.pre_turn");
+    const stages = () => ticks().map((entry) => entry.stage as string);
+    return { lines, ctx, ticks, stages };
+  }
+
+  const fastDelays = { firstDelayMs: 5, maxDelayMs: 10 };
+
+  it("brackets a normal pre-turn phase with started/completed and tags the phase", async () => {
+    const { ctx, ticks, stages } = collector();
+
+    const built = await awaitPreTurnWithProgress(
+      ctx,
+      { phase: "build_prompt" },
+      async () => "prompt",
+      fastDelays,
+    );
+
+    expect(built).toBe("prompt");
+    expect(stages()).toEqual(["started", "completed"]);
+    expect(ticks().every((entry) => entry.phase === "build_prompt")).toBe(true);
+    expect(typeof ticks()[1]?.elapsedMs).toBe("number");
+  });
+
+  it("keeps reporting while a pre-turn phase stalls, and stops once it settles", async () => {
+    const { ctx, stages } = collector();
+    // Definite-assignment for the same reason as the sibling blocks above:
+    // the executor assigns synchronously but control-flow analysis cannot see it.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    const pending = awaitPreTurnWithProgress(
+      ctx,
+      { phase: "configure_session" },
+      async () => {
+        await gate;
+        return "configured";
+      },
+      fastDelays,
+    );
+
+    const waitingTicks = () => stages().filter((stage) => stage === "waiting").length;
+    const deadlineMs = Date.now() + 2_000;
+    while (waitingTicks() < 2 && Date.now() < deadlineMs) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(
+      waitingTicks(),
+      `ticker did not keep reporting; observed stages: [${stages().join(", ")}]`,
+    ).toBeGreaterThanOrEqual(2);
+
+    release();
+    await pending;
+    expect(stages().at(-1)).toBe("completed");
+
+    // Once settled the ticker must be silent, or it would keep a finished run
+    // looking alive.
+    const settledCount = stages().length;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(stages().length).toBe(settledCount);
+  });
+
+  it("stops ticking and records failure when a pre-turn phase rejects, preserving the error", async () => {
+    const { ctx, stages } = collector();
+
+    await expect(
+      awaitPreTurnWithProgress(
+        ctx,
+        { phase: "configure_session" },
+        async () => {
+          throw new Error("ACP_SET_MODE_FAILED");
+        },
+        fastDelays,
+      ),
+    ).rejects.toThrow("ACP_SET_MODE_FAILED");
+
+    expect(stages()).toEqual(["started", "failed"]);
+
+    const before = stages().length;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(stages().length).toBe(before);
+  });
+
+  // The property this ticket exists for. A run parked in the pre-turn window
+  // must never accrue enough silence to be accused, at any duration -- the
+  // detector declares `suspicious` at 1h and `critical` at 4h, and the measured
+  // healthy pre-session waits ran to 289.6 min (PEN-2533), above both. Driven at
+  // the PRODUCTION delay constants, not `fastDelays`, because the claim is about
+  // the shipped cadence and would be vacuous at 5 ms ticks.
+  it("keeps a multi-hour pre-turn stall reporting inside the suspicion threshold at 1h, 4h and 5h", async () => {
+    vi.useFakeTimers();
+    try {
+      const { ctx, ticks } = collector();
+      const emittedAtMs: number[] = [];
+      const startMs = Date.now();
+
+      const pending = awaitPreTurnWithProgress(
+        ctx,
+        { phase: "build_prompt" },
+        // Never settles: the wedged `fs.readFile` on the network mount this
+        // bracket exists to cover.
+        () => new Promise<string>(() => {}),
+      );
+      void pending;
+
+      const HOUR_MS = 60 * 60 * 1000;
+      // The server flushes output progress at most every 60s and declares
+      // suspicion at 1h; asserting against the tick ceiling keeps this test
+      // inside this package rather than importing a server constant, which
+      // would invert the layering (see awaitPhaseWithProgress).
+      const TICK_CEILING_MS = ACP_ENGINE_SESSION_PROGRESS_MAX_DELAY_MS;
+
+      let seen = 0;
+      const recordNew = () => {
+        for (; seen < ticks().length; seen += 1) emittedAtMs.push(Date.now());
+      };
+      recordNew();
+
+      for (const hours of [1, 4, 5]) {
+        while (Date.now() - startMs < hours * HOUR_MS) {
+          await vi.advanceTimersByTimeAsync(30_000);
+          recordNew();
+        }
+        // Positive control: a broken ticker would leave this at the single
+        // `started` tick, and a gap assertion alone would pass vacuously.
+        expect(
+          emittedAtMs.length,
+          `no progress ticks accumulated by ${hours}h`,
+        ).toBeGreaterThan(hours * 6);
+
+        const gaps = emittedAtMs.slice(1).map((at, index) => at - emittedAtMs[index]!);
+        const largestGapMs = Math.max(...gaps, Date.now() - emittedAtMs.at(-1)!);
+        expect(
+          largestGapMs,
+          `largest silence by ${hours}h was ${largestGapMs}ms`,
+        ).toBeLessThanOrEqual(TICK_CEILING_MS);
+        expect(largestGapMs).toBeLessThan(HOUR_MS);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Wiring check: the helper only matters if the real executor routes BOTH
+  // pre-turn awaits through it, and does so in the window between the handshake
+  // settling and `acpx.session`. That window is the one the detector reads as
+  // silence, so assert the position, not just the presence.
+  it("routes the real executor's configure and prompt build through the ticker, between handshake and session", async () => {
+    const { logs } = await runExecutor({ agent: "claude" });
+
+    const events = logs
+      .filter((entry) => entry.stream === "stdout")
+      .flatMap((entry) => entry.text.split("\n"))
+      .filter((line) => line.trim().startsWith("{"))
+      .map((line) => {
+        try {
+          return JSON.parse(line) as Record<string, unknown>;
+        } catch {
+          return null;
+        }
+      })
+      .filter((entry): entry is Record<string, unknown> => entry !== null);
+
+    const preTurn = events.filter((entry) => entry.type === "acpx.pre_turn");
+    expect(preTurn.map((entry) => `${entry.phase}:${entry.stage}`)).toEqual([
+      "configure_session:started",
+      "configure_session:completed",
+      "build_prompt:started",
+      "build_prompt:completed",
+    ]);
+
+    // Assert presence positively: a missing marker yields -1, which would
+    // otherwise satisfy the comparisons below and pass vacuously.
+    const handshakeTerminalAt = events.findIndex(
+      (entry) => entry.type === "acpx.session_establish" && entry.stage === "established",
+    );
+    const sessionAt = events.findIndex((entry) => entry.type === "acpx.session");
+    expect(handshakeTerminalAt).toBeGreaterThanOrEqual(0);
+    expect(sessionAt).toBeGreaterThanOrEqual(0);
+
+    for (const tick of preTurn) {
+      const at = events.indexOf(tick);
+      expect(at).toBeGreaterThan(handshakeTerminalAt);
+      expect(at).toBeLessThan(sessionAt);
+    }
+  });
+
+  it("never emits prompt, credential, environment, or path material", async () => {
+    const { ctx, ticks } = collector();
+
+    await awaitPreTurnWithProgress(
+      ctx,
+      { phase: "build_prompt" },
+      async () => "prompt",
+      fastDelays,
+    );
+
+    expect(ticks().length).toBeGreaterThan(0);
+    for (const entry of ticks()) {
+      // Exact key set, not an exclusion list: a payload field added later has
+      // to be re-justified here rather than inherited silently. `phase` is a
+      // fixed enum of two literals, never a path or a prompt.
+      expect(Object.keys(entry).sort()).toEqual([
+        "elapsedMs",
+        "observedAt",
+        "phase",
+        "stage",
+        "type",
+      ]);
     }
   });
 });

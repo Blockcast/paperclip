@@ -3,8 +3,19 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   computeIssueMonitorGateFingerprint,
+  isMonitorNextCheckAtLive,
   normalizeIssueExecutionPolicy,
 } from "../services/issue-execution-policy.js";
+
+/**
+ * PEN-2853: the `in_review` validator now requires a genuinely future `nextCheckAt`,
+ * which turns every fixed future date in these fixtures into an *expiring* one. This
+ * fixture was literally `2026-12-01T12:00:00.000Z` — future when it was written, and
+ * a suite that would have started failing on a calendar date. Derive it from the
+ * clock instead. (The `2099-…` fixtures elsewhere in this file are far enough out to
+ * be harmless and are left as they are, to keep this diff about the defect.)
+ */
+const SCHEDULED_MONITOR_NEXT_CHECK_AT = new Date(Date.now() + 60 * 60 * 1000).toISOString();
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -530,6 +541,8 @@ describe("issue execution policy routes", () => {
       status: "todo",
       assigneeAgentId: "33333333-3333-4333-8333-333333333333",
       assigneeUserId: null,
+      checkoutRunId: "run-1",
+      executionRunId: "run-1",
       createdByUserId: "local-board",
       identifier: "PAP-1006",
       title: "External review monitor",
@@ -559,9 +572,11 @@ describe("issue execution policy routes", () => {
         status: "in_review",
         executionPolicy: {
           monitor: {
-            nextCheckAt: "2026-12-01T12:00:00.000Z",
+            nextCheckAt: SCHEDULED_MONITOR_NEXT_CHECK_AT,
             scheduledBy: "assignee",
             notes: "Wait for external QA report.",
+            kind: "external_service",
+            serviceName: "github-actions",
           },
         },
       });
@@ -571,9 +586,315 @@ describe("issue execution policy routes", () => {
       "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       expect.objectContaining({
         status: "in_review",
-        monitorNextCheckAt: new Date("2026-12-01T12:00:00.000Z"),
+        monitorNextCheckAt: new Date(SCHEDULED_MONITOR_NEXT_CHECK_AT),
       }),
     );
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+      "run-1",
+      "Yielded after persisting an external-service wait",
+      expect.objectContaining({
+        errorCode: "external_wait_yield",
+        persistBeforeTerminate: true,
+        repairTerminalRelease: true,
+        resultJson: expect.objectContaining({
+          yieldedExternalWait: true,
+          issueId: issue.id,
+          serviceName: "github-actions",
+        }),
+      }),
+    );
+  });
+
+  /**
+   * The yield is a *post-commit* side effect: the issue row — including the armed
+   * `monitorNextCheckAt` — is already durable by the time `cancelRun` is awaited. So a
+   * rejection there must not reach Express's error middleware, or the caller reads a 500
+   * for a monitor that IS armed, concludes it is not, and re-arms into a live monitor.
+   *
+   * This case exists because nothing else in this file can fail if the `.catch()` is
+   * removed: the suite's `cancelRun` double always resolves, so the two tests above pass
+   * either way — the one at :592 only asserts the yield was *attempted*. The throw is not
+   * hypothetical; `heartbeat-process-recovery.test.ts` pins
+   * `rejects.toThrow("db update unavailable")` on the same call at the service level.
+   */
+  it("still returns 200 when the post-commit external-wait yield rejects", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      checkoutRunId: "run-1",
+      executionRunId: "run-1",
+      createdByUserId: "local-board",
+      identifier: "PAP-1006",
+      title: "External review monitor",
+      executionPolicy: null,
+      executionState: null,
+      monitorAttemptCount: 0,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+      monitorNotes: null,
+      monitorScheduledBy: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+    mockHeartbeatService.cancelRun.mockRejectedValueOnce(new Error("db update unavailable"));
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "run-1",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({
+        status: "in_review",
+        executionPolicy: {
+          monitor: {
+            nextCheckAt: SCHEDULED_MONITOR_NEXT_CHECK_AT,
+            scheduledBy: "assignee",
+            notes: "Wait for external QA report.",
+            kind: "external_service",
+            serviceName: "github-actions",
+          },
+        },
+      });
+
+    // The rejection is absorbed at the yield rather than surfacing as a 500 …
+    expect(res.status).toBe(200);
+    // … the yield really was the call that rejected (guards against a vacuous pass if
+    // the gating predicate ever stops firing for this fixture) …
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledTimes(1);
+    // … the durable write still landed with the monitor armed …
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      expect.objectContaining({
+        status: "in_review",
+        monitorNextCheckAt: new Date(SCHEDULED_MONITOR_NEXT_CHECK_AT),
+      }),
+    );
+    // … and no activity row claims a slot release that did not happen.
+    expect(
+      mockLogActivity.mock.calls.some(
+        (call) => (call[1] as { action?: string })?.action === "heartbeat.external_wait_yielded",
+      ),
+    ).toBe(false);
+  });
+
+  it("does not yield the current run for a non-external monitor", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      checkoutRunId: "run-1",
+      executionRunId: "run-1",
+      createdByUserId: "local-board",
+      identifier: "PAP-1007",
+      title: "Internal follow-up monitor",
+      executionPolicy: null,
+      executionState: null,
+      monitorAttemptCount: 0,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+      monitorNotes: null,
+      monitorScheduledBy: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "run-1",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({
+        executionPolicy: {
+          monitor: {
+            nextCheckAt: "2026-12-01T12:00:00.000Z",
+            scheduledBy: "assignee",
+            notes: "Resume an internal follow-up.",
+          },
+        },
+      });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+  });
+
+  /**
+   * PEN-2853 Finding 2: the validator used to accept ANY non-null `monitorNextCheckAt`.
+   *
+   * A monitor that lapsed a week ago cleared the 422 while the stranded-assigned sweep
+   * had already stopped counting it, so the row was admitted to `in_review` and was
+   * seizable as unattended at the same instant, off the same column. The compounding is
+   * what made it worth fixing: of the five review paths, the monitor is the only one an
+   * agent can satisfy alone, so the least-verified path was also the one always in reach.
+   */
+  it("refuses an in_review transition on a monitor that lapsed, which the sweep no longer counts", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-2853",
+      title: "Lapsed monitor",
+      executionPolicy: null,
+      executionState: null,
+      monitorAttemptCount: 3,
+      // A week in the past: fired long ago, never re-armed.
+      monitorNextCheckAt: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000),
+      monitorLastTriggeredAt: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000),
+      monitorNotes: null,
+      monitorScheduledBy: "assignee",
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "run-1",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "in_review" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details).toMatchObject({
+      code: "invalid_issue_disposition",
+      missing: "review_path",
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("refuses an in_review transition that arms a monitor already in the past", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-2853",
+      title: "Past-dated arm",
+      executionPolicy: null,
+      executionState: null,
+      monitorAttemptCount: 0,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+      monitorNotes: null,
+      monitorScheduledBy: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "run-1",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({
+        status: "in_review",
+        executionPolicy: {
+          monitor: {
+            // `nextCheckAt` carries no future constraint of its own -- unlike
+            // `timeoutAt`, which `exhaustedMonitorClearReason` rejects when past. So
+            // this patch really does reach the validator.
+            nextCheckAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+            scheduledBy: "assignee",
+            notes: "watches nothing",
+          },
+        },
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details).toMatchObject({
+      code: "invalid_issue_disposition",
+      missing: "review_path",
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The divergence test the fix exists to make possible.
+   *
+   * Expectations are not hand-written per row: each is `isMonitorNextCheckAtLive`, the
+   * single definition the stranded-assigned sweep's `hasActiveMonitorPath` now calls
+   * too. So this asserts the route and the sweep read the same column the same way,
+   * and it fails the moment either side stops delegating -- restoring the old
+   * `Boolean(monitorNextCheckAt)` here turns the two past rows red.
+   *
+   * The sweep additionally ORs a bounded lapsed-trigger window on top of this, so it
+   * accepts a superset. That asymmetry is safe in one direction only, and this pins
+   * that direction: everything the validator admits, the sweep counts.
+   */
+  it("admits exactly the monitors the sweep's own definition calls live", async () => {
+    const nowMs = Date.now();
+    const cases: Array<{ label: string; nextCheckAt: Date }> = [
+      { label: "a week lapsed", nextCheckAt: new Date(nowMs - 7 * 24 * 60 * 60 * 1000) },
+      { label: "just lapsed", nextCheckAt: new Date(nowMs - 1000) },
+      { label: "an hour out", nextCheckAt: new Date(nowMs + 60 * 60 * 1000) },
+      { label: "a week out", nextCheckAt: new Date(nowMs + 7 * 24 * 60 * 60 * 1000) },
+    ];
+
+    for (const { label, nextCheckAt } of cases) {
+      vi.clearAllMocks();
+      mockAccessService.hasPermission.mockResolvedValue(false);
+      mockIssueThreadInteractionService.listForIssue.mockResolvedValue([]);
+      mockIssueApprovalService.listApprovalsForIssue.mockResolvedValue([]);
+
+      const issue = {
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        companyId: "company-1",
+        status: "in_progress",
+        assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-2853",
+        title: `Monitor ${label}`,
+        executionPolicy: null,
+        executionState: null,
+        monitorAttemptCount: 0,
+        monitorNextCheckAt: nextCheckAt,
+        monitorLastTriggeredAt: null,
+        monitorNotes: null,
+        monitorScheduledBy: "assignee",
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ status: "in_review" });
+
+      const sweepCountsIt = isMonitorNextCheckAtLive(nextCheckAt, Date.now());
+      expect(sweepCountsIt, `${label} should be a review path iff the sweep counts it`)
+        .toBe(res.status === 200);
+    }
   });
 
   it("lets a checked-out execution agent re-arm a board-scheduled monitor", async () => {

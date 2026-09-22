@@ -120,6 +120,14 @@ export const issues = pgTable(
     // writes a verdict. Keeps dashboard scorecard review-window queries on a
     // normal timestamp column instead of scanning JSONB across the company.
     lastEvidenceVerdictEvaluatedAt: timestamp("last_evidence_verdict_evaluated_at", { withTimezone: true }),
+    // BLO-30303: rotation watermark for the productivity-review candidate scan.
+    // Stamped with `now` for every row the scan reads, so the next pass orders
+    // by least-recently-*scanned* and cannot re-select the same window forever.
+    // Deliberately a bare column write: it never touches `updated_at`, so the
+    // `issues_sync_last_activity_at` BEFORE UPDATE trigger does not fire and the
+    // watermark stays invisible to the activity signals the detector reads.
+    // Unindexed on purpose — see migration 0242.
+    productivityScannedAt: timestamp("productivity_scanned_at", { withTimezone: true }),
   },
   (table) => ({
     companyStatusIdx: index("issues_company_status_idx").on(table.companyId, table.status),
@@ -206,6 +214,14 @@ export const issues = pgTable(
       .on(table.companyId, table.originKind, table.originId)
       .where(
         sql`${table.originKind} = 'ccrotate_capacity_exhausted'
+          and ${table.originId} is not null
+          and ${table.hiddenAt} is null
+          and ${table.status} not in ('done', 'cancelled')`,
+      ),
+    activeApprovalEnforcementDriftIdx: uniqueIndex("issues_active_approval_enforcement_drift_uq")
+      .on(table.companyId, table.originKind, table.originId)
+      .where(
+        sql`${table.originKind} = 'approval_enforcement_drift'
           and ${table.originId} is not null
           and ${table.hiddenAt} is null
           and ${table.status} not in ('done', 'cancelled')`,

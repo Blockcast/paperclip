@@ -61,11 +61,12 @@ function runGuard({ digest, owner }) {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     });
-    return { code: 0, reached: stdout.includes("REACHED_CREDENTIAL_WRITE") };
+    return { code: 0, reached: stdout.includes("REACHED_CREDENTIAL_WRITE"), stderr: "" };
   } catch (error) {
     return {
       code: error.status ?? 1,
       reached: String(error.stdout ?? "").includes("REACHED_CREDENTIAL_WRITE"),
+      stderr: String(error.stderr ?? ""),
     };
   }
 }
@@ -79,12 +80,47 @@ test("the guard admits the two legitimate shapes and rejects every malformed one
   // incident it exists for -- so the two accepting rows are as load-bearing as
   // the four rejecting ones. This is also what catches an inverted polarity: a
   // flipped `=~` rejects the well-formed pair and fails the last row.
+  //
+  // Each rejecting row also names WHICH guard must reject it. Exit code alone
+  // cannot tell "rejected for the stated reason" from "rejected by accident":
+  // gut the pairing check to `if false; then` and the two half-supplied rows
+  // still exit 1, because the empty counterpart then trips a shape check
+  // instead. Without `stderr` this matrix would lean on the sibling
+  // condition-shape tests below to catch that; with it, it stands alone.
   const cases = [
     { name: "neither set (ordinary deploy)", digest: "", owner: "", code: 0, reached: true },
-    { name: "digest only", digest: VALID_DIGEST, owner: "", code: 1, reached: false },
-    { name: "owner only", digest: "", owner: VALID_OWNER, code: 1, reached: false },
-    { name: "malformed digest", digest: "nope", owner: VALID_OWNER, code: 1, reached: false },
-    { name: "malformed owner", digest: VALID_DIGEST, owner: "nothex", code: 1, reached: false },
+    {
+      name: "digest only",
+      digest: VALID_DIGEST,
+      owner: "",
+      code: 1,
+      reached: false,
+      stderr: "must be supplied together",
+    },
+    {
+      name: "owner only",
+      digest: "",
+      owner: VALID_OWNER,
+      code: 1,
+      reached: false,
+      stderr: "must be supplied together",
+    },
+    {
+      name: "malformed digest",
+      digest: "nope",
+      owner: VALID_OWNER,
+      code: 1,
+      reached: false,
+      stderr: "must be a full digest of the form",
+    },
+    {
+      name: "malformed owner",
+      digest: VALID_DIGEST,
+      owner: "nothex",
+      code: 1,
+      reached: false,
+      stderr: "must be 64 hexadecimal characters",
+    },
     { name: "both valid", digest: VALID_DIGEST, owner: VALID_OWNER, code: 0, reached: true },
   ];
 
@@ -98,6 +134,13 @@ test("the guard admits the two legitimate shapes and rejects every malformed one
         ? `${expected.name}: must reach the credential write`
         : `${expected.name}: must be rejected BEFORE the credential write`,
     );
+    if (expected.stderr) {
+      assert.ok(
+        actual.stderr.includes(expected.stderr),
+        `${expected.name}: must be rejected by the guard that owns this case ` +
+          `(expected stderr to mention "${expected.stderr}", got: ${JSON.stringify(actual.stderr.trim())})`,
+      );
+    }
   }
 });
 
@@ -191,6 +234,41 @@ test("both abandon values are shape-checked, with the negation required", () => 
     workflow,
     /\[\[ ! "\$\{ABANDON_IN_FLIGHT_OWNER\}" =~ \^\[0-9a-f\]\{64\}\$ \]\]/,
     "the abandon owner must be shape-checked by name, with the negation present",
+  );
+});
+
+test("the ::warning:: is emitted only after both shape checks have passed", () => {
+  // Ordering, not presence -- and nothing else pins it. Hoisting the echo above
+  // the two regexes leaves all six matrix rows green, because the guard still
+  // rejects the same inputs with the same exit codes; the only thing that
+  // changes is that an operator-supplied value reaches the run log without
+  // having been shape-checked, at which point `::stop-commands::` or
+  // `::add-mask::` embedded in the input become live workflow commands.
+  //
+  // Low severity by construction -- the step is behind `paperclip-production`
+  // environment approval, so the actor is an authorized deployer, and the
+  // consequence is log manipulation rather than privilege escalation. Pinned
+  // anyway because the property is invisible: it survives only as long as
+  // nobody reorders three adjacent lines.
+  //
+  // Anchored on the ABANDON variable names. docker.yml shape-checks a digest in
+  // several places, so the bare `^sha256:[0-9a-f]{64}$` pattern would not
+  // identify this one.
+  const digestCheck = workflow.indexOf('! "${ABANDON_IN_FLIGHT}" =~ ^sha256:');
+  const ownerCheck = workflow.indexOf('! "${ABANDON_IN_FLIGHT_OWNER}" =~ ^[0-9a-f]');
+  const warning = workflow.indexOf("::warning::retiring stranded in-flight approval");
+
+  assert.notEqual(digestCheck, -1, "could not locate the abandon digest shape check");
+  assert.notEqual(ownerCheck, -1, "could not locate the abandon owner shape check");
+  assert.notEqual(warning, -1, "could not locate the abandon ::warning:: echo");
+
+  assert.ok(
+    warning > digestCheck,
+    "the ::warning:: must come after the digest shape check, or it echoes an unvalidated operator input",
+  );
+  assert.ok(
+    warning > ownerCheck,
+    "the ::warning:: must come after the owner shape check, or it echoes an unvalidated operator input",
   );
 });
 

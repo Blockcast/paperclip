@@ -193,6 +193,108 @@ class TestIsAlarming(unittest.TestCase):
         )
 
 
+class TestStallThresholdCalibration(unittest.TestCase):
+    """The threshold must clear the measured distribution OF THE QUANTITY IT
+    CLOCKS, with the margin its derivation claims.
+
+    This is the defect BLO-34521 fixed, and the second half is the defect the
+    first version of that fix walked into. At 90m the predicate was
+    effectively constant-true -- 96-99% of *healthy* dispatches breached it --
+    so "stranded" meant "dispatched normally". The replacement, 8h, was
+    derived from `startedAt - createdAt` and breached 0% of THAT. But the
+    threshold is compared against `unreviewed_since()`, so what it really
+    clocks is head-landed -> review, of which dispatch wait is one term of
+    four; measured directly, 8h breached 19.4%. At the 1.35 multiplier in
+    force when 8h shipped, a table carrying only `dispatch-wait` rows passed
+    it -- which is how 8h cleared its own guard.
+
+    So the `quantity` column is load-bearing, not documentation: at least one
+    row must measure end-to-end, or this guard cannot see the failure it
+    exists to catch. If you change STALL_THRESHOLD_SECONDS, re-run the
+    reproduction recorded in the comment block above it and update this table
+    in the same commit -- a constant whose derivation is not re-measured is
+    how this rotted twice.
+
+    Read the column as the structural protection and nothing else. At today's
+    1.41 the `n=725` dispatch-wait row happens to refuse 8h on its own
+    (30033s floor against 28800s), so the end-to-end row is not currently the
+    only thing standing between this guard and the regression -- but that is
+    an accident of how starved the queue is, not a property of the design.
+    The BLO-19881 paragraph in `sweep-stalled-ally-reviews.py` (grep it, do
+    not cite its line -- these shift) expects dispatch wait to come back DOWN
+    if that lands, which lowers both dispatch-wait floors and hands the
+    refusal back to the end-to-end row alone. The column is what holds
+    independently of the multiplier and of the queue.
+    """
+
+    END_TO_END = "unreviewed_since->review"
+
+    # Picked off p90, never off the max -- the end-to-end tail is heavy
+    # (p90 12.70h against max 30.81h), and chasing the max would mean a 32h
+    # threshold: a day and a half to notice a lost review, bought against the
+    # 11/232 (4.7%) above 18h. This is the multiplier the derivation actually
+    # claims, floored to 2dp: 1080/762 = 1.417. It was 1.35, which is not a
+    # claim anything makes
+    # -- a floor ~5% under the asserted margin, i.e. the guard relaxed until
+    # it admitted the chosen value. At 1.41 the slack is 0.5%, so the guard
+    # now refuses any constant that does not clear the margin in the prose.
+    P90_MULTIPLIER = 1.41
+
+    # (window label, quantity, p90 minutes)
+    OBSERVED_WINDOWS = [
+        ("2026-09-16T22:37Z->2026-09-18T05:50Z n=706", "dispatch-wait", 338),
+        ("2026-09-17T19:19Z->2026-09-18T21:54Z n=725", "dispatch-wait", 355),
+        ("2026-09-13T17:37Z->2026-09-19T05:25Z n=232", END_TO_END, 762),
+    ]
+
+    def test_threshold_clears_every_observed_p90_with_its_claimed_margin(self):
+        # subTest, not a bare loop: a regression must report EVERY row it
+        # breaks. Without it the first failure stops the loop, and since the
+        # dispatch-wait rows come first, a revert to 8h reports only those --
+        # hiding the end-to-end row, which is the one this class exists to
+        # make load-bearing.
+        for label, quantity, p90_minutes in self.OBSERVED_WINDOWS:
+            with self.subTest("%s (%s)" % (label, quantity)):
+                self.assertGreaterEqual(
+                    sweep.STALL_THRESHOLD_SECONDS,
+                    self.P90_MULTIPLIER * p90_minutes * 60,
+                    "%s (%s)" % (label, quantity),
+                )
+
+    def test_table_measures_the_quantity_the_predicate_clocks(self):
+        # Without this, the table degrades to dispatch-wait rows only. That is
+        # exactly what let 8h pass its own guard at the 1.35 multiplier then
+        # in force, while breaching 19.4% of real reviews. At today's 1.41 a
+        # dispatch-wait-only table would refuse 8h anyway, on the `n=725` row
+        # -- so this assertion is not what is stopping that regression right
+        # now. It is what stops it once the queue recovers and those floors
+        # drop back. `unreviewed_since()` is what STALL_THRESHOLD_SECONDS is
+        # compared against, so a row measuring it is the minimum evidence.
+        self.assertTrue(
+            any(q == self.END_TO_END for _, q, _ in self.OBSERVED_WINDOWS),
+            "no end-to-end window recorded; dispatch wait alone cannot calibrate this",
+        )
+
+    def test_old_ninety_minute_value_would_fail_this_calibration(self):
+        # Guard the guard: if this assertion ever passes at 90m, the table
+        # above has been emptied or the comparison inverted, and the test is
+        # no longer capable of catching a regression to the rotted value.
+        worst_p90 = max(p90 for _, _, p90 in self.OBSERVED_WINDOWS)
+        self.assertLess(90 * 60, self.P90_MULTIPLIER * worst_p90 * 60)
+
+    def test_superseded_eight_hour_value_would_fail_this_calibration(self):
+        # The same guard for the value this replaced. Asserted against the
+        # end-to-end row specifically: at 1.41 the dispatch-wait rows are
+        # split on 8h (it clears the 338m row at 28595s and fails the 355m one
+        # at 30033s), and that split moves with the queue. The end-to-end row
+        # refuses 8h by 35665s (~9.9h) and refuses it for the reason the
+        # threshold exists -- so it is the row worth pinning this to.
+        self.assertLess(
+            8 * 60 * 60,
+            self.P90_MULTIPLIER * max(p90 for _, q, p90 in self.OBSERVED_WINDOWS if q == self.END_TO_END) * 60,
+        )
+
+
 HEAD_SHA = "a" * 40
 OTHER_SHA = "b" * 40
 ALLY_LOGIN = "allyblockcast[bot]"
@@ -982,7 +1084,11 @@ class TestDryRun(unittest.TestCase):
 
         sweep._request = fake_request
         sweep._fetch_paginated = fake_fetch
-        now = sweep._parse_iso("2026-08-01T00:00:00Z") + 10 * HOUR
+        # Key off the constant, not a literal: a hardcoded age silently turns
+        # into a "not yet stalled" case the next time the threshold is
+        # recalibrated upward, and the test then fails for a reason that has
+        # nothing to do with dry-run behaviour.
+        now = sweep._parse_iso("2026-08-01T00:00:00Z") + sweep.STALL_THRESHOLD_SECONDS + HOUR
 
         results = sweep.sweep("o", "r", "tok", "https://api.github.com", now=now, dry_run=True)
 

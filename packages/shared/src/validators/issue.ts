@@ -20,6 +20,7 @@ import {
   ISSUE_RECOVERY_ACTION_OUTCOMES,
   ISSUE_RECOVERY_ACTION_OWNER_TYPES,
   ISSUE_RECOVERY_ACTION_STATUSES,
+  ISSUE_RECOVERY_ACTION_RETIRING_BOUNDS,
   ISSUE_WORK_MODES,
   clampIssueRequestDepth,
   ISSUE_STATUSES,
@@ -187,8 +188,26 @@ export const issueExecutionMonitorPolicySchema = z.object({
     .optional()
     .nullable()
     .default(null)
+    // Schema-size note (BLO-32419): this description is ~3.6 KB (~915 tokens) and ships in BOTH
+    // the create-issue and update-issue MCP tool schemas, so every agent pays it roughly twice on
+    // every tool-schema load. Kept inline rather than reduced to a pointer at `github-app-auth.ts`:
+    // this is the only copy an agent is guaranteed to have in context at the moment it arms a
+    // monitor, and the failures it prevents — converging a review gate that was in fact satisfied,
+    // or recording a verdict off a truncated read — each cost whole runs. A pointer would be
+    // cheaper and would not be read. `issue.test.ts` guards the load-bearing phrases so a
+    // size-motivated trim fails loudly instead of silently reinstating the false negative.
+    //
+    // Evidence for the pagination clause, kept here rather than in the description because these
+    // counts decay and the mechanism does not (measured 2026-09-07): `paperclip#937` holds 60
+    // comments and returns only 30 unpaginated; `#952` holds 41. Both are far below the helper's
+    // 10-page/1000-comment cap, which is why the description leads with the 30-item default —
+    // that is the limit a hand-rolled fetch actually trips over.
     .describe(
-      "BLO-18294: the gates this monitor is actually waiting on, as short stable tokens (e.g. \"pr:Blockcast/paperclip#814:checks\", \"deploy:paperclip-api\"). Declaring them makes the convergence guard compare re-checks against THESE and ignore free-form `notes` churn, so an unrelated signal you happened to mention cannot read as progress and keep the loop alive. Unresolved `blockedBy` edges are folded in automatically — declare gateSignals for anything the issue graph does not already model.",
+      "BLO-18294: the gates this monitor is actually waiting on, as short stable tokens (e.g. \"pr:Blockcast/paperclip#814:checks\", \"deploy:paperclip-api\"). Declaring them makes the convergence guard compare re-checks against THESE and ignore free-form `notes` churn, so an unrelated signal you happened to mention cannot read as progress and keep the loop alive. Unresolved `blockedBy` edges are folded in automatically — declare gateSignals for anything the issue graph does not already model. " +
+        "BLO-22574: a `pr:<repo>#<n>:review` gate token is opaque to the server — nothing evaluates it against GitHub, so YOU perform the re-check and record the verdict. It has TWO satisfying surfaces, `pulls/{n}/reviews` shows only one of them, and BOTH require an explicit identity check before anything counts. " +
+        "SURFACE 1 — formal reviews (`pulls/{n}/reviews`): a non-empty response is NOT by itself satisfaction. Credit an entry only when its author is the reviewer App identity (`<slug>[bot]` or `app/<slug>`) AND its `commit_id` equals the PR's current head exactly. Any SUBMITTED state qualifies (COMMENTED / CHANGES_REQUESTED / APPROVED / DISMISSED — a dismissed review still happened), because this gate asks whether a review happened, not whether it approved; requiring APPROVED is structurally unsatisfiable, since GitHub bars a PR's author from approving its own PR and agent PRs are App-authored. `PENDING` does NOT qualify: it is an unsubmitted draft visible only to the App that created it, so crediting it would let a run that died mid-flow self-attest. The bare `<slug>` user seat is a DIFFERENT principal and is NEVER credited, on either surface, in any review state — including an `APPROVED` seat review at the exact head. Every other author, and every review at any other head, fails closed. `reviews` is not returned sorted, so scan every entry rather than taking the first or last printed. " +
+        "SURFACE 2 — issue comments (`issues/{n}/comments`): Ally frequently answers as a plain PR comment and files no formal review object at all, so `pulls/{n}/reviews` reads `reviews=0` forever on those PRs even though Ally has demonstrably reviewed (verified on Blockcast/magma#1655 and Blockcast/paperclip#929/#942/#948/#951/#952). `reviews=0` is therefore NOT evidence of no review: before re-arming on it, also read `issues/{n}/comments`. Credit a comment only when it is authored by the reviewer App identity (the same-slug user seat is not that identity and never counts here either), carries the canonical `## Ally — Consolidated PR Review` heading, and contains EXACTLY ONE standalone full-40-hex `Reviewed head:` attestation; zero or several means unproven, so fail closed rather than crediting it. " +
+        "On both surfaces judge staleness by comparing that `commit_id`/attested SHA against the PR's current head — never by timestamp, which cannot tell \"read this head\" apart from \"raced the push\". PAGINATE BOTH surfaces, and note the trap is not the far end: GitHub's DEFAULT page size is 30, so a hand-rolled single-page fetch silently drops the rest of a longer thread and reproduces the very `reviews=0` false negative this block exists to kill. Pass `per_page=100` AND keep following pages until a short one. Whatever your cap, a TRUNCATED read is UNPROVEN, never absence: the helper stops at 10 pages and returns `reviews_pagination_exhausted`/`comments_pagination_exhausted`, a retryable outcome distinct from `{found:false}` — re-check, do not record a verdict off it. `githubHasReviewerEvidenceForPr` in `server/src/services/github-app-auth.ts` is the authoritative server-side implementation of exactly this check; mirror it rather than re-deriving weaker logic.",
     ),
   kind: z.enum(ISSUE_EXECUTION_MONITOR_KINDS).optional().nullable().default(null),
   serviceName: z.string().trim().min(1).max(120).optional().nullable().default(null),
@@ -274,8 +293,10 @@ export const issueRecoveryActionReadModelSchema = z.object({
   wakePolicy: z.record(z.string(), z.unknown()).nullable(),
   monitorPolicy: z.record(z.string(), z.unknown()).nullable(),
   attemptCount: z.number().int().nonnegative(),
+  nonDeliverySweepCount: z.number().int().nonnegative(),
   maxAttempts: z.number().int().positive().nullable(),
   timeoutAt: z.union([z.date(), z.string().datetime()]).nullable(),
+  retiringBound: z.enum(ISSUE_RECOVERY_ACTION_RETIRING_BOUNDS).nullable(),
   lastAttemptAt: z.union([z.date(), z.string().datetime()]).nullable(),
   outcome: z.enum(ISSUE_RECOVERY_ACTION_OUTCOMES).nullable(),
   resolutionNote: z.string().nullable(),

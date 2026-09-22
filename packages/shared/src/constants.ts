@@ -341,6 +341,14 @@ export const ISSUE_RECOVERY_ACTION_OUTCOMES = [
 ] as const;
 export type IssueRecoveryActionOutcome = (typeof ISSUE_RECOVERY_ACTION_OUTCOMES)[number];
 
+export const ISSUE_RECOVERY_ACTION_RETIRING_BOUNDS = [
+  "timeout_horizon",
+  "attempt_budget",
+  "discharged",
+  "cancelled",
+] as const;
+export type IssueRecoveryActionRetiringBound = (typeof ISSUE_RECOVERY_ACTION_RETIRING_BOUNDS)[number];
+
 export function pluginOperationIssueOriginKind(pluginKey: string): PluginIssueOriginKind {
   return `plugin:${pluginKey}:operation`;
 }
@@ -1323,6 +1331,7 @@ export const PLUGIN_CAPABILITIES = [
   "issues.checkout",
   "issues.wakeup",
   "issue.comments.create",
+  "issue.comments.update",
   "issue.interactions.create",
   "issue.documents.write",
   "projects.managed",

@@ -282,16 +282,37 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     managerId: string;
     blockerIssueId: string;
     incidentKey: string;
-    /** The timestamp the suppressor compares: `coalesce(completedAt, updatedAt)`. */
+    /**
+     * The timestamp the suppressor compares:
+     * `coalesce(completedAt, cancelledAt, updatedAt)`.
+     */
     resolvedAt: Date;
-    /** Default "done". "cancelled" re-arms immediately, by design. */
+    /**
+     * Default "done". Since BLO-29838 a "cancelled" row suppresses on the same
+     * two gates as a `done` one (BLO-29764), so the only difference these
+     * fixtures carry is which timestamp column the resolution lands in -- see
+     * the defaults below.
+     */
     status?: "done" | "cancelled";
     /**
-     * Defaults to `resolvedAt`. Pass `null` to pin the `coalesce` fallback (a
-     * row closed without a `completedAt`); pass `updatedAt` separately to model
-     * a post-close edit that bumps it above the resolution.
+     * Defaults to `resolvedAt` for `done` and to `null` for `cancelled` (see
+     * `cancelledAt`). Pass `null` to pin the `coalesce` fallback (a row closed
+     * without a `completedAt`); pass `updatedAt` separately to model a
+     * post-close edit that bumps it above the resolution.
      */
     completedAt?: Date | null;
+    /**
+     * Defaults to `resolvedAt` for `cancelled` and to `null` for `done`.
+     *
+     * Production cancels write `completed_at = NULL` with `cancelled_at` set --
+     * measured 2026-08-23 over all 67 August rows of this origin kind,
+     * `completed_at` non-null on 0/67 and `cancelled_at` non-null on 67/67 --
+     * so defaulting a `cancelled` fixture to the `done` shape would exercise a
+     * row production never produces AND never reach the `cancelled_at` arm of
+     * the coalesce. Pass it explicitly to model a post-cancel edit that drifts
+     * `updatedAt` away from the actual cancellation.
+     */
+    cancelledAt?: Date | null;
     updatedAt?: Date;
     /**
      * When set, backdate the leaf blocker's activity to this instant.
@@ -308,6 +329,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     issueNumber?: number;
   }) {
     const id = randomUUID();
+    const isCancelled = (input.status ?? "done") === "cancelled";
     await db.insert(issues).values({
       id,
       companyId: input.companyId,
@@ -322,7 +344,18 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       originId: input.incidentKey,
       createdAt: new Date(input.resolvedAt.getTime() - 30 * 60 * 1000),
       updatedAt: input.updatedAt ?? input.resolvedAt,
-      completedAt: input.completedAt === undefined ? input.resolvedAt : input.completedAt,
+      completedAt:
+        input.completedAt === undefined
+          ? isCancelled
+            ? null
+            : input.resolvedAt
+          : input.completedAt,
+      cancelledAt:
+        input.cancelledAt === undefined
+          ? isCancelled
+            ? input.resolvedAt
+            : null
+          : input.cancelledAt,
     });
     if (input.leafQuietSince) {
       // Backdate `createdAt` with the activity, so the leaf does not end up with
@@ -2384,19 +2417,26 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(escalation?.parentId).toBe(blockerIssueId);
   });
 
-  // BLO-28957 reverses this case deliberately, so the rename is the point.
+  // This case has now been reversed twice, deliberately, and the successive
+  // renames are the audit trail.
   //
-  // It used to assert "re-escalates immediately after a matching escalation is
-  // cancelled", on the reading that a cancelled row was dismissed without being
-  // worked, so the incident still needed attention right now. That reading does
-  // not survive the abandonment bound: `cancelled` is also how the sweep RETIRES
-  // a row, so a `done`-only cooldown left the re-file loop this cooldown exists
-  // to stop wide open -- retire, re-file, repeat (240 of 500 sampled rows on
-  // 2026-08-18). The cooldown now holds `cancelled` too.
+  // BLO-27676 shipped it as "re-escalates immediately after a matching
+  // escalation is cancelled", on the reading that a cancelled row was dismissed
+  // without being worked, so the incident still needed attention right now.
+  // BLO-28957 narrowed that to a 60m hold, because `cancelled` is also how the
+  // sweep RETIRES a row, so the immediate hatch left the re-file loop wide open
+  // -- retire, re-file, repeat (240 of 500 sampled rows on 2026-08-18).
   //
-  // The second half is what keeps this from being a regression: the incident is
-  // held for one cooldown, not dropped.
-  it("holds re-escalation for one cooldown after a matching escalation is cancelled", async () => {
+  // BLO-29764 (2026-08-23) finished the reversal: a `cancelled` prior
+  // escalation now suppresses on BOTH gates, the same two a `done` row gets.
+  // The 60m hold was still short enough to lose the two cases a cancel actually
+  // means -- a report that was WRONG, and one that was CONSOLIDATED AWAY -- in
+  // both of which re-filing is the harmful act rather than the safe one.
+  //
+  // The second half is what keeps this from being a mute: the hold hands over
+  // from `cooldown` to `unchanged_target`, which is itself bounded by the 7d
+  // ceiling (pinned separately below) and released by any leaf touch.
+  it("holds re-escalation on both gates after a matching escalation is cancelled", async () => {
     await enableAutoRecovery();
     const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
     const heartbeat = heartbeatSvc;
@@ -2412,24 +2452,162 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       title: "Cancelled escalation",
       identifier: "CANCELLED-3",
       resolvedAt: now,
-      completedAt: null,
     });
 
     const held = await heartbeat.reconcileIssueGraphLiveness({ now });
 
     expect(held.escalationsCreated).toBe(0);
     expect(held.skippedReescalationCooldown).toBe(1);
+    expect(held.skippedUnchangedTarget).toBe(0);
 
-    // Held, not dropped: once the cooldown expires the finding speaks again.
-    // This is the assertion that separates "cancelled joins the cooldown" from
-    // "cancelled joins the 7-day target-state suppressor" -- the latter would
-    // leave this at 0 and is what makes the narrow, cooldown-only scoping in
-    // `findSuppressingResolvedLivenessRecoveryIssue` load-bearing.
-    const after = await heartbeat.reconcileIssueGraphLiveness({
+    // Past the cooldown the hold does not lapse: it hands over to the target
+    // gate, exactly as it does for a `done` row ("holds a recently closed
+    // matching escalation, and keeps holding past the cooldown while the target
+    // is unchanged"). This assertion is the whole reversal -- pre-BLO-29838 the
+    // cancelled row fell out of the narrow cooldown-only lookup here and the
+    // finding re-filed.
+    const stillHeld = await heartbeat.reconcileIssueGraphLiveness({
       now: new Date(now.getTime() + DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS + 60 * 1000),
     });
 
-    expect(after.escalationsCreated).toBe(1);
+    expect(stillHeld.escalationsCreated).toBe(0);
+    expect(stillHeld.skippedUnchangedTarget).toBe(1);
+  });
+
+  // The named replacement for the immediate-re-arm hatch BLO-29764 removed:
+  // activity on the leaf after the cancellation. Strictly stronger than the old
+  // hatch, because it means something actually changed about the thing being
+  // complained about rather than merely that someone closed a row. Pinned here
+  // so a future narrowing of the suppressor cannot take it away silently.
+  it("re-escalates a cancelled escalation once the leaf has been touched since it was cancelled", async () => {
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const now = new Date();
+    const incidentKey = livenessIncidentKey(companyId, blockedIssueId, blockerIssueId);
+
+    // Cancelled 50h ago, leaf touched 30h ago: after the cancellation (so this
+    // suppressor re-arms) but still >24h quiet (so the finding fires at all).
+    await seedResolvedEscalation({
+      companyId,
+      managerId,
+      blockerIssueId,
+      incidentKey,
+      status: "cancelled",
+      identifier: "CANCELLED-TOUCHED",
+      resolvedAt: new Date(now.getTime() - 50 * 60 * 60 * 1000),
+      leafQuietSince: new Date(now.getTime() - 30 * 60 * 60 * 1000),
+    });
+
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness({ now });
+
+    expect(result.escalationsCreated).toBe(1);
+    expect(result.skippedUnchangedTarget).toBe(0);
+    expect(result.skippedReescalationCooldown).toBe(0);
+  });
+
+  // Bounded-suppression guard, the `cancelled` counterpart of "re-escalates an
+  // untouched leaf once the suppression ceiling has elapsed". Widening the
+  // status filter to a branch that can hold for 7 days is only defensible
+  // because that branch has a ceiling; without this the reversal would be a
+  // permanent mute on any incident someone once cancelled.
+  it("re-escalates an untouched leaf once the ceiling elapses on a cancelled escalation", async () => {
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const now = new Date();
+    const incidentKey = livenessIncidentKey(companyId, blockedIssueId, blockerIssueId);
+
+    await seedResolvedEscalation({
+      companyId,
+      managerId,
+      blockerIssueId,
+      incidentKey,
+      status: "cancelled",
+      identifier: "CANCELLED-CEILING",
+      // Cancelled 8d ago, past the 7d ceiling, leaf untouched since (9d quiet).
+      resolvedAt: new Date(now.getTime() - 8 * 24 * 60 * 60 * 1000),
+      leafQuietSince: new Date(now.getTime() - 9 * 24 * 60 * 60 * 1000),
+    });
+
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness({ now });
+
+    expect(result.escalationsCreated).toBe(1);
+    expect(result.skippedUnchangedTarget).toBe(0);
+    expect(result.skippedReescalationCooldown).toBe(0);
+  });
+
+  // Regression guard for the `cancelled_at` arm of the coalesce, on BOTH sides
+  // of it -- the ORDER BY and the value `resolvedAtMs` reads. They must be the
+  // same expression, and this fails if either one omits `cancelled_at`:
+  //
+  //   - ORDER BY only: the older row's drifted `updatedAt` wins the sort, the
+  //     comparison then runs against its 100h-old `cancelledAt`, the leaf touch
+  //     reads as "after the resolution" and the finding re-escalates.
+  //   - value only: the newer row is still selected but judged by its own
+  //     drifted `updatedAt` (10 min old), so the hold is attributed to
+  //     `cooldown` instead of `unchanged_target`.
+  //
+  // Both drifts are ordinary post-resolution edits (retitle, relabel, assignee
+  // change). They matter far more for `cancelled` than for `done`: production
+  // cancels leave `completed_at` NULL (0/67 in August 2026), so every one of
+  // these rows would otherwise fall straight through to `updatedAt`.
+  it("judges a cancelled escalation by cancelledAt even when a later edit drifted its updatedAt", async () => {
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const now = new Date();
+    const incidentKey = livenessIncidentKey(companyId, blockedIssueId, blockerIssueId);
+
+    // Two cancellations straddling one leaf touch. The leaf is quiet for 50h so
+    // the finding still fires; the newer cancellation is 30h old, outside the
+    // 60m cooldown and inside the 7d ceiling.
+    await seedResolvedEscalation({
+      companyId,
+      managerId,
+      blockerIssueId,
+      incidentKey,
+      status: "cancelled",
+      title: "Cancelled escalation (older, edited after the cancel)",
+      identifier: "CANCELLED-OLDER",
+      issueNumber: 5,
+      resolvedAt: new Date(now.getTime() - 100 * 60 * 60 * 1000),
+      // The drift that used to win the ORDER BY.
+      updatedAt: new Date(now.getTime() - 60 * 1000),
+    });
+    const newerCancelledId = await seedResolvedEscalation({
+      companyId,
+      managerId,
+      blockerIssueId,
+      incidentKey,
+      title: "Cancelled escalation (most recently cancelled)",
+      status: "cancelled",
+      identifier: "CANCELLED-NEWER",
+      issueNumber: 6,
+      resolvedAt: new Date(now.getTime() - 30 * 60 * 60 * 1000),
+      // Also edited after its cancel, but less recently than the older row --
+      // so a correct ORDER BY still picks this row, while a value side reading
+      // `updatedAt` would mistake the hold for a cooldown.
+      updatedAt: new Date(now.getTime() - 10 * 60 * 1000),
+      leafQuietSince: new Date(now.getTime() - 50 * 60 * 60 * 1000),
+    });
+
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness({ now });
+
+    expect(result.escalationsCreated).toBe(0);
+    // `skippedUnchangedTarget` is the discriminating counter, and it has to be
+    // this one: `skippedReescalationCooldown` is the AGGREGATE over both
+    // suppressors (service.ts, "kept stable for existing dashboards"), so it
+    // reads 1 either way and cannot tell the two gates apart.
+    expect(result.skippedUnchangedTarget).toBe(1);
+
+    // Assert the SELECTED row, not just the outcome: with two candidate rows
+    // the counter alone cannot say which one supplied the timestamp.
+    const events = await readSuppressionEvents(companyId);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.details).toMatchObject({
+      reason: "unchanged_target",
+      suppressedByIssueId: newerCancelledId,
+      suppressedByIdentifier: "CANCELLED-NEWER",
+      suppressedByStatus: "cancelled",
+    });
   });
 
   /**
@@ -2568,13 +2746,21 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       );
     expect(stillOpen).toHaveLength(0);
 
-    // Bounded, not dropped: once the cooldown expires the source gets a fresh
-    // row with a fresh owner. This is the "regains a wake path within a bounded,
-    // stated interval" half of the acceptance criteria, and it is also what
-    // proves `cancelled` joined the 60m cooldown rather than the 7d
-    // target-state suppressor.
+    // Bounded, not dropped: the source gets a fresh row with a fresh owner.
+    // This is the "regains a wake path within a bounded, stated interval" half
+    // of BLO-28957's acceptance criteria.
+    //
+    // BLO-29838 moved WHICH bound releases it, and that is the only change here
+    // -- the property is unchanged. A retired row is `cancelled`, and since
+    // BLO-29764 a `cancelled` row suppresses on both gates, so the hold hands
+    // over from the 60m cooldown to the target gate and the release is the 7d
+    // ceiling instead. The leaf of an abandoned row is quiet by construction,
+    // which is precisely why the ceiling rather than a leaf touch is what frees
+    // it. Longer, still finite, and still a fresh owner at the end.
     const reescalated = await heartbeatSvc.reconcileIssueGraphLiveness({
-      now: new Date(retiredAt.getTime() + DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS + 60 * 1000),
+      now: new Date(
+        retiredAt.getTime() + DEFAULT_LIVENESS_UNCHANGED_TARGET_SUPPRESSION_MS + 60 * 1000,
+      ),
     });
 
     expect(reescalated.escalationsCreated).toBe(1);

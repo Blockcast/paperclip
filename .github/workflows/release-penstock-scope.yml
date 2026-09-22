@@ -66,7 +66,24 @@ env:
 jobs:
   publish:
     runs-on: arc-deploy
-    environment: npm-penstock-scope # optional manual-approval gate; configure in repo settings
+    # ⚠ THIS IS NOT AN APPROVAL GATE. The environment exists but has NO protection
+    # rules, so naming it here changes nothing about who may publish.
+    #
+    # Measured 2026-09-07 (and identical on 2026-09-05):
+    #   protection_rules: []          deployment_branch_policy: null
+    #   can_admins_bypass: true       updated_at: 2026-06-14T07:54:39Z (= created_at)
+    #
+    # Consequence: a `workflow_dispatch` with `dry_run: false` publishes to the public
+    # Blockcast-owned @penstock/* npm scope unattended. npm versions cannot be reused
+    # and unpublish is restricted, so it is not cleanly reversible.
+    #
+    # Configuring protection requires repo-admin rights. The GitHub App installation
+    # cannot do it: `PUT /repos/Blockcast/paperclip/environments/{name}` returns
+    # 403 "Resource not accessible by integration" (re-probed 2026-09-07 against a
+    # scratch environment, so this environment's audit trail was left untouched).
+    #
+    # Tracked in BLO-32090. Do not read this line as evidence a gate exists.
+    environment: npm-penstock-scope
     steps:
       - name: Checkout
         uses: actions/checkout@v4

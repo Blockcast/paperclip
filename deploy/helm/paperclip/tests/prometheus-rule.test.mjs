@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import path from "node:path";
@@ -142,11 +143,22 @@ test("PaperclipGithubReviewRequestDeadLettered fires on any dead-lettered delive
   // recorded before the first scrape (no baseline for increase()) or one whose
   // pod is replaced before `for` elapses (series retires out of the range) is
   // silently un-alertable — a terminal loss that pages nobody. The gauge is
-  // re-derived from committed rows every reconcile pass, so it survives both.
+  // re-derived from committed rows on every heartbeat scheduler tick, so it
+  // survives both. (BLO-31335 moved that emission off the wake-dispatch
+  // reconcile pass, which only ran on an unsuppressed replica.)
+  //
+  // BLO-31335: the aggregation is pinned, not just the metric name. This gauge
+  // is a full rewrite of global, DB-derived state, so it is replica-invariant —
+  // every publishing pod exports the same value. A bare `sum()` therefore
+  // multiplies by the replica count (3× today) and silently rescales on any
+  // replica-count change. `max by (reason)` collapses the pod dimension first;
+  // the outer `sum` then adds the 8 reason buckets, which a bare `max()` would
+  // have undercounted to the single largest bucket. Both halves are load-bearing
+  // and neither is recoverable from `promtool check rules` or a render test.
   assert.match(
     rendered,
-    /or \(sum\(paperclip_github_review_request_dead_letter_unresolved\) > 0\)/,
-    "dead-letter alert must also key on the restart-safe durable gauge",
+    /or \(sum\(max by \(reason\) \(paperclip_github_review_request_dead_letter_unresolved\)\) > 0\)/,
+    "dead-letter alert must key on the restart-safe durable gauge, aggregated replica-safely",
   );
 });
 
@@ -304,6 +316,106 @@ test("PaperclipPrReviewWakeTerminalFailed is pr_review-scoped, gauge-keyed, and 
     /alert: PaperclipPrReviewWakeTerminalFailed[\s\S]*?runbook_url: "[^"]*runbooks\/agent-wakeup-terminal-failed\.md"/,
     "terminal-failed alert must link the runbook from its annotation",
   );
+
+  // BLO-31335: the description hands the responder a query, and since this
+  // gauge moved onto the scheduler tick EVERY replica publishes it with the
+  // same value (full rewrite of global DB-derived state). So the aggregation
+  // has to be spelled out and it has to be replica-invariant -- a bare
+  // `sum by (error_code)` reads 3x on a 3-replica deploy. The rule's own
+  // `expr` is unaffected (it is the replica-invariant max() over the age
+  // gauge, asserted above), which is exactly why this can rot unnoticed: no
+  // rendered expression breaks, only the human following the instructions.
+  const [, terminalFailedDescription] = rendered.match(
+    /alert: PaperclipPrReviewWakeTerminalFailed[\s\S]*?\n\s+description: "([\s\S]*?)"\n/,
+  ) ?? [];
+  assert.ok(
+    terminalFailedDescription,
+    "terminal-failed alert must render a description annotation",
+  );
+  assert.match(
+    terminalFailedDescription,
+    /max by \(error_code, scope\)/,
+    "terminal-failed description must name the replica-invariant aggregation "
+      + "(max by (error_code, scope)), matching the metric's own help string",
+  );
+  assert.doesNotMatch(
+    terminalFailedDescription,
+    /Break down by the `error_code` label on the count series/,
+    "terminal-failed description must not tell the responder to break the "
+      + "count series down without naming an aggregation -- the natural "
+      + "reading is `sum by (error_code)`, which multiplies by replica count",
+  );
+});
+
+test("the terminal-failed runbook describes the post-BLO-31335 emission path", () => {
+  // The sibling of the description guard above, on the other side of
+  // `runbook_url`. BLO-31335 moved both wake-dispatch gauges off
+  // `reconcileFailedWakeDispatches` and onto the heartbeat scheduler tick,
+  // which silently falsified the runbook's "No data" triage step -- it sent an
+  // on-call responder mid-incident to check a pass that can no longer suppress
+  // these series. Nothing rendered breaks when this rots (the chart does not
+  // read the runbook at all), so only an assertion catches it, and this is the
+  // page an operator lands on from the alert.
+  const runbook = readFileSync(
+    path.join(repoRoot, "runbooks/agent-wakeup-terminal-failed.md"),
+    "utf8",
+  );
+
+  // Split at the status table so the two halves can be asserted apart. The
+  // table's `reconcileFailedWakeDispatches` mentions describe which ROWS that
+  // pass selects, which BLO-31335 did not change -- they must survive, so this
+  // guard must never be satisfiable by a blanket find-and-replace.
+  //
+  // The -1 check is load-bearing, not defensive boilerplate. `indexOf` returns
+  // -1 when the heading is renamed, and `slice(-1)` yields the file's LAST
+  // CHARACTER rather than "", which is truthy and matches no phrase -- so
+  // without this, `assert.ok` below would pass on a one-character string and
+  // the `doesNotMatch` regression guard would pass vacuously, while
+  // `slice(0, -1)` widened the row-selection assertion to the whole file. A
+  // guard that cannot fire is the same defect class this PR exists to remove.
+  const verifyIndex = runbook.indexOf("## Verifying the signal is live");
+  assert.notStrictEqual(
+    verifyIndex,
+    -1,
+    "runbook must keep a 'Verifying the signal is live' section -- the "
+      + "assertions below scope themselves to it by name and silently stop "
+      + "guarding if it is renamed",
+  );
+  const verifySection = runbook.slice(verifyIndex);
+
+  assert.doesNotMatch(
+    verifySection,
+    /reconcile pass/,
+    "runbook liveness section must not attribute gauge emission to the "
+      + "reconcile pass -- since BLO-31335 both gauges publish from the "
+      + "heartbeat scheduler tick, so a stalled reconcile no longer explains "
+      + "'No data' and sends the responder to the wrong subsystem",
+  );
+  assert.match(
+    verifySection,
+    /heartbeat scheduler tick/,
+    "runbook liveness section must name the heartbeat scheduler tick as the "
+      + "emission path to check",
+  );
+
+  // The row-selection statements outside the liveness section are correct and
+  // load-bearing; assert they survive so a future sweep of the phrase above
+  // cannot take them with it.
+  assert.match(
+    runbook.slice(0, verifyIndex),
+    /`reconcileFailedWakeDispatches` only ever\nselects `dispatch_failed`/,
+    "runbook must keep the row-selection statement -- BLO-31335 changed which "
+      + "path EMITS the gauges, not which rows that pass selects",
+  );
+
+  // Same replica-invariance rule as the alert description: every replica
+  // publishes the same value, so a bare `sum` reads 3x on a 3-replica deploy.
+  assert.match(
+    verifySection,
+    /sum\(max by \(error_code, scope\) \(paperclip_agent_wakeup_terminal_failed_unresolved/,
+    "runbook copy-paste query must use the replica-invariant aggregation, "
+      + "matching the alert description it sits one hop from",
+  );
 });
 
 test("PaperclipQueuedRunStranded is agent-keyed, freshness-gated, and fires before 30m (BLO-21116)", () => {
@@ -403,6 +515,59 @@ test("PaperclipPrReviewQueueWaitSaturated uses the bounded p95 histogram and run
   assert.match(rendered, /histogram_quantile\(0\.95, sum by \(le\) \(rate\(paperclip_pr_review_queue_wait_seconds_bucket\[6h\]\)\)\) > 3600/);
   assert.match(rendered, /alert: PaperclipPrReviewQueueWaitSaturated[\s\S]*?for: 10m/);
   assert.match(rendered, /alert: PaperclipPrReviewQueueWaitSaturated[\s\S]*?runbook_url: "[^\"]*runbooks\/pr-review-queue-wait\.md"/);
+});
+
+test("PaperclipRuntimeResourceReconciliationStuck pins both backlog gauges and the worker-down backstop (BLO-21460)", () => {
+  const rendered = renderChart(["--set", "prometheusRule.enabled=true"]);
+
+  assert.match(rendered, /alert: PaperclipRuntimeResourceReconciliationStuck/);
+  const [, expr] = rendered.match(
+    /alert: PaperclipRuntimeResourceReconciliationStuck[\s\S]*?\n\s+expr: >-?\n([\s\S]*?)\n\s+for:/,
+  ) ?? [];
+  assert.ok(expr, "runtime-resource-reconciliation-stuck alert must render an expr");
+
+  assert.match(
+    expr,
+    /max\(paperclip_external_runtime_reservations_release_pending\) > 0/,
+    "must page on a stuck release-pending external-runtime reservation",
+  );
+  assert.match(
+    expr,
+    /max\(paperclip_environment_leases_orphaned_active\) > 0/,
+    "must page on an orphaned-active environment lease",
+  );
+  // The two count arms above read a healthy 0 when the sweep that publishes
+  // them throws, because prom-client gauges retain their last value and the
+  // process stays up. Without this arm the alert is silent during exactly the
+  // kube-API outage its own description tells the operator to check for.
+  assert.match(
+    expr,
+    /max\(paperclip_orphaned_runtime_resource_metrics_refresh_success\)\s*==\s*0/,
+    "must page when the reconciliation sweep stops refreshing the backlog gauges, so a stale 0 cannot read as healthy",
+  );
+  // max(), not a bare comparison: every control-plane pod exports the gauge
+  // but only the worker runs the sweep, so a bare `== 0` would fire forever on
+  // the api pods' untouched initial 0.
+  assert.doesNotMatch(
+    expr,
+    /(?<!max\()paperclip_orphaned_runtime_resource_metrics_refresh_success\s*==\s*0/,
+    "freshness arm must aggregate with max() so non-sweeping pods cannot hold it firing",
+  );
+  assert.match(
+    expr,
+    /max\(up\{job="paperclip-control-plane", service="paperclip-workers"\}\)\s*==\s*0/,
+    "must page when the worker scrape target is down",
+  );
+  assert.match(
+    expr,
+    /absent\(up\{job="paperclip-control-plane", service="paperclip-workers"\}\)/,
+    "must alert when the worker scrape target disappears entirely",
+  );
+  assert.doesNotMatch(
+    expr,
+    /max by \(job\)/,
+    "must scope availability to the worker service, not aggregate API and worker targets",
+  );
 });
 
 test("PaperclipAgentJobBackoffLimitExceeded is deleted, not just renamed (BLO-23413)", () => {
@@ -1004,5 +1169,159 @@ test("PaperclipExternalRuntimeReservationStrandMetricsRefreshFailed exposes a st
   assert.match(
     rendered,
     /alert: PaperclipExternalRuntimeReservationStrandMetricsRefreshFailed[\s\S]*?runbook_url: "[^\"]*runbooks\/external-runtime-reservation-stranded\.md"/,
+  );
+});
+
+test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own error boundary (PEN-3305)", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  assert.match(rendered, /alert: PaperclipAgentStartLockWedged/);
+
+  // Slice the one alert block out before asserting anything about its fields.
+  // An unbounded `alert: Name[\s\S]*?severity:` matches the FIRST severity
+  // anywhere later in the document, so with the alert's own fields absent it
+  // would silently borrow a neighbour's -- today it passes only because the
+  // next rendered alert happens to be `severity: warning` with a different
+  // runbook. Adding any `severity: critical` alert after this group would let
+  // a silent downgrade of THIS one to `warning` keep passing.
+  const [, block] = rendered.match(
+    /\n\s+- alert: PaperclipAgentStartLockWedged\n([\s\S]*?)(?=\n\s+- alert: |\n\s+- name: |$)/,
+  ) ?? [];
+  assert.ok(block, "wedged-start-lock alert must render its own block");
+
+  const [, expr] = block.match(/\n\s+expr: (.+)\n/) ?? [];
+  assert.ok(expr, "wedged-start-lock alert must render an expr");
+
+  // Per-agent max, not a sum: the gauge is published by every replica that
+  // serves /metrics, and a sum would add one pod's hold age to another's for
+  // the same agent. It must also NOT carry a freshness join -- unlike the
+  // queued-run and stranded-reservation gauges there is no separate
+  // `..._refresh_success` series, because this one is a synchronous map walk
+  // performed on the scrape itself. Asserting the exact shape is what stops a
+  // later reader "restoring" a join against a series that does not exist,
+  // which would make the alert permanently unevaluable rather than noisy.
+  assert.match(
+    expr,
+    /^max by \(agent_id\) \(paperclip_agent_start_lock_held_seconds\) > (\d+)$/,
+    "wedged-start-lock alert must threshold the per-agent max of the hold gauge, with no refresh-freshness join",
+  );
+
+  const [, heldThreshold] = expr.match(/> (\d+)$/) ?? [];
+  // The gauge is emitted only for locks held at scrape time (reset-then-set,
+  // no zero-fill), so any positive threshold is silent in steady state. It is
+  // pinned to 300 on purpose: that is LOCK_HELD_ERROR_MS in
+  // server/src/services/agent-start-lock.ts, the point at which the code
+  // itself escalates to logger.error and says dispatch "has stopped". If the
+  // constant moves and this does not, the page and the log line disagree
+  // about when an agent is considered wedged.
+  assert.equal(
+    heldThreshold,
+    "300",
+    "hold threshold must track LOCK_HELD_ERROR_MS (300s) in agent-start-lock.ts",
+  );
+
+  const [, forWindow] = block.match(/\n\s+for: (.+)\n/) ?? [];
+  assert.ok(forWindow, "wedged-start-lock alert must render a for window");
+  const forMinutes = /^(\d+)m$/.test(forWindow.trim())
+    ? Number(forWindow.trim().slice(0, -1))
+    : /^(\d+)h$/.test(forWindow.trim())
+      ? Number(forWindow.trim().slice(0, -1)) * 60
+      : null;
+  // Scrape-flap tolerance only; the ageing lives in the threshold. Same
+  // stacking trap as PaperclipQueuedRunStranded -- threshold and `for:` are
+  // not independent, so check the sum, not each half.
+  assert.ok(
+    forMinutes !== null && forMinutes > 0 && forMinutes <= 10,
+    `for window ${forWindow} must be a short scrape-flap tolerance (<= 10m)`,
+  );
+  assert.ok(
+    Number(heldThreshold) + forMinutes * 60 <= 900,
+    `hold threshold ${heldThreshold}s plus for-window ${forWindow} stacks to `
+      + `${Number(heldThreshold) + forMinutes * 60}s; a wedge must page inside 15m, `
+      + "not on the 6-19h timescale the incident actually ran",
+  );
+
+  // Severity, not decoration: the hold never self-heals (the lock has no
+  // timeout, by design), so this is a per-agent dispatch outage that lasts
+  // until the process is replaced. A warning would reproduce the original
+  // failure, which was nobody being paged.
+  assert.match(
+    block,
+    /\n\s+severity: critical\n/,
+    "a non-self-healing per-agent dispatch outage must page, not warn",
+  );
+  assert.match(
+    block,
+    /runbook_url: "[^"]*runbooks\/queued-run-stranded\.md#agent-start-lock-wedged-pen-3305"/,
+    "wedged-start-lock alert must link the runbook section from its annotation",
+  );
+});
+
+test("PaperclipRecoveryHorizonNoWakeToCurrentOwner{Elevated,Sustained} key on the never_delivered series only and take their thresholds from values (PEN-3000)", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+    "--set",
+    "prometheusRule.recoveryHorizonNoWakeToCurrentOwnerWarnPerDay=2",
+    "--set",
+    "prometheusRule.recoveryHorizonNoWakeToCurrentOwnerPagePerDay=9",
+    "--set",
+    "prometheusRule.recoveryHorizonNoWakeToCurrentOwnerPageFor=45m",
+  ]);
+
+  // The label selector is the whole point: the metric splits a scheduler-side fault
+  // (never_delivered) from the expected background rate of genuine strandings
+  // (delivered). A rule on the unlabelled counter would page on the background rate.
+  assert.match(
+    rendered,
+    /alert: PaperclipRecoveryHorizonNoWakeToCurrentOwnerElevated\n\s+expr: sum\(increase\(paperclip_recovery_horizon_expired_total\{delivery="never_delivered"\}\[1d\]\)\) > 2\n\s+for: 10m\n\s+labels:\n\s+severity: warning\n/,
+  );
+  assert.match(
+    rendered,
+    /alert: PaperclipRecoveryHorizonNoWakeToCurrentOwnerSustained\n\s+expr: sum\(increase\(paperclip_recovery_horizon_expired_total\{delivery="never_delivered"\}\[1d\]\)\) > 9\n\s+for: 45m\n\s+labels:\n\s+severity: critical\n/,
+  );
+  assert.doesNotMatch(
+    rendered,
+    /paperclip_recovery_horizon_expired_total\{delivery="delivered"\}/,
+    "the delivered series is the expected background rate and must not have an alert on it",
+  );
+  // The label is scoped to the current owner (attemptCount restarts on owner churn); the
+  // responder-facing text must say so rather than claim the row never woke anyone.
+  assert.match(
+    rendered,
+    /alert: PaperclipRecoveryHorizonNoWakeToCurrentOwnerElevated[\s\S]*?description: "[^"]*for the current owner[^"]*"/,
+  );
+  // A pager renders the alert NAME and SUMMARY with no metric HELP text attached, so those
+  // two carry the scope on their own or the operator reads a lifetime claim the data cannot
+  // support. Assert the qualification on both summaries, not just the descriptions.
+  assert.match(
+    rendered,
+    /alert: PaperclipRecoveryHorizonNoWakeToCurrentOwnerElevated[\s\S]*?summary: "[^"]*delivered to their current owner[^"]*"/,
+  );
+  assert.match(
+    rendered,
+    /alert: PaperclipRecoveryHorizonNoWakeToCurrentOwnerSustained[\s\S]*?summary: "[^"]*no wake to the current owner[^"]*"/,
+  );
+  // Regression guard on the wording itself: attemptCount 0 means "no wake reached THIS
+  // owner's queue", never "this row woke nobody in its life". An unqualified lifetime
+  // phrasing in a name or summary is the defect, so ban the phrasings outright. The \b is
+  // load-bearing: without it this also matches the "never delivered" inside the rule
+  // comment and the series name, which are the correctly-scoped uses.
+  assert.doesNotMatch(
+    rendered,
+    /\bever delivered/,
+    "an unqualified 'ever delivered' overclaims: owner churn restarts attemptCount",
+  );
+  assert.doesNotMatch(
+    rendered,
+    /alert: \w*NeverDelivered\w*/,
+    "alert names must be current-owner-scoped, not bare NeverDelivered",
   );
 });

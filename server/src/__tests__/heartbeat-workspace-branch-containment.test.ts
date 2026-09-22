@@ -47,6 +47,7 @@ import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
 } from "../services/execution-workspace-policy.ts";
+import { waitForRunToFinish } from "./helpers/wait-for-run-to-finish.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -164,16 +165,6 @@ async function createForwardBranchMismatch(input: {
   await writeFile(path.join(input.worktreePath, "actual-branch.txt"), "actual branch work\n", "utf8");
   await runGit(input.worktreePath, ["add", "actual-branch.txt"]);
   await runGit(input.worktreePath, ["commit", "-m", "Add actual branch work"]);
-}
-
-async function waitForRunToFinish(heartbeat: Heartbeat, runId: string, timeoutMs = 10_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const run = await heartbeat.getRun(runId);
-    if (run && run.status !== "queued" && run.status !== "running") return run;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  return heartbeat.getRun(runId);
 }
 
 async function waitForHeartbeatIdle(db: Db, timeoutMs = 5_000) {
@@ -596,6 +587,14 @@ function asRecord(value: unknown): Record<string, unknown> {
     : {};
 }
 
+// CI-load margin (BLO-22985) for the `timeoutMs` handed to the shared
+// `waitForRunToFinish` here and in `expectForwardBranchReconciled`. Measured overruns
+// on run 34673003753 (General tests server 3/4, 2026-09-12): fresh worktree reuse
+// 10_052ms and persisted restore 10_689ms against a 10_000ms budget (+0.5% / +6.9%);
+// forward reconcile 30_322ms against 30_000ms (+1.1%). These are a loaded runner losing
+// a scheduling slice, not a hung run, so the budgets move to 20_000/45_000 — ~2x the
+// observed elapsed. The invariant is unchanged: a run that never terminates still
+// fails (the helper throws on expiry, BLO-33449), just later.
 async function expectContainedWorkspaceBranchFailure(input: {
   db: Db;
   heartbeat: Heartbeat;
@@ -608,7 +607,7 @@ async function expectContainedWorkspaceBranchFailure(input: {
   expectedBranch: string;
   actualBranch: string;
 }) {
-  const finishedRun = await waitForRunToFinish(input.heartbeat, input.runId, 10_000);
+  const finishedRun = await waitForRunToFinish(input.heartbeat, input.runId, 20_000);
   expect(finishedRun).toMatchObject({
     status: "failed",
     errorCode: "workspace_validation_failed",
@@ -626,7 +625,17 @@ async function expectContainedWorkspaceBranchFailure(input: {
       eligible: false,
       attempted: false,
       succeeded: false,
-      reason: "expected branch and current HEAD differ",
+      // BLO-32628: a single-claimant worktree in this same git state now
+      // self-heals, so containment here rests on two other refusals — both
+      // real, and which one fires depends on what the call site knows.
+      // Persisted restore passes the execution workspace id, so claimant
+      // contention is visible (source + same-workspace sibling). Fresh-worktree
+      // reuse passes `executionWorkspaceId: null`, so contention cannot be
+      // computed and the refusal falls to the git-level fact that the fixture's
+      // main checkout still holds the recorded branch.
+      reason: input.sourceExecutionWorkspaceId
+        ? expect.stringContaining("execution workspace is claimed by 2 non-terminal issues")
+        : expect.stringContaining("recorded branch is already checked out in another worktree"),
     }),
   });
   if (input.sourceExecutionWorkspaceId !== undefined) {
@@ -726,7 +735,7 @@ async function expectForwardBranchReconciled(input: {
   expectsExistingRecordUpdate: boolean;
   expectedResolvedRecoveryActionFingerprint?: string | null;
 }) {
-  const finishedRun = await waitForRunToFinish(input.heartbeat, input.runId, 30_000);
+  const finishedRun = await waitForRunToFinish(input.heartbeat, input.runId, 45_000);
   expect(finishedRun).toMatchObject({
     status: "succeeded",
     errorCode: null,
@@ -1298,7 +1307,7 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
       actualBranch: seeded.actualBranch,
     });
     expect(adapterExecute).toHaveBeenCalledTimes(callSite === "finalize" ? 1 : 0);
-  }, 30_000);
+  }, 60_000);
 
   it.each([
     ["workspace-runtime fresh worktree reuse", "fresh_realize" as const, false],
@@ -1408,5 +1417,5 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
       expectedResolvedRecoveryActionFingerprint,
     });
     expect(adapterExecute).toHaveBeenCalledTimes(1);
-  }, 60_000);
+  }, 90_000);
 });

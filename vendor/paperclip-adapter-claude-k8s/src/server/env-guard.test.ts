@@ -340,6 +340,32 @@ describe("buildEnvGuardSetupShell", () => {
     );
   }
 
+  // PEN — the agent HOME is a ReadWriteMany CephFS volume shared by every agent
+  // pod. `> shared-file` is O_TRUNC, so every pod truncated the SAME inode; one
+  // truncate wedging in the MDS hung open() fleet-wide and the poisoned dentry
+  // could not even be renamed over. Nothing may truncate a shared path again.
+  it("never truncates a shared file in place", () => {
+    const shell = buildEnvGuardSetupShell();
+    const redirects = [...shell.matchAll(/> "([^"]+)"/g)].map((m) => m[1]!);
+    expect(redirects.length).toBeGreaterThan(0);
+    for (const target of redirects) {
+      expect(target).toMatch(/\.\$\$\.tmp$/);
+    }
+    // Every install is create-if-absent and lands via rename(2), never a rewrite.
+    const installs = [...shell.matchAll(/\[ -f "([^"]+)" \] \|\|/g)].map((m) => m[1]!);
+    expect(installs).toHaveLength(2);
+    for (const target of installs) {
+      const tmp = `${target.replace(/\/([^/]+)$/, "/.$1")}.$$.tmp`;
+      expect(shell).toContain(`mv -f "${tmp}" "${target}"`);
+    }
+  });
+
+  it("content-addresses the guard filename so a change lands as a new inode", () => {
+    const shell = buildEnvGuardSetupShell();
+    expect(shell).toMatch(/paperclip-env-guard\.[0-9a-f]{12}\.mjs/);
+    expect(shell).toMatch(/export PAPERCLIP_GUARD_FILE/);
+  });
+
   it("round-trips the guard + helper scripts through base64", () => {
     const blobs = decodedBlobs(buildEnvGuardSetupShell());
     expect(blobs).toContain(ENV_GUARD_SCRIPT);
@@ -352,12 +378,34 @@ describe("buildEnvGuardSetupShell", () => {
     const mergeScript = decodedBlobs(shell)[2]!;
     const dir = mkdtempSync(path.join(tmpdir(), "pc-settings-"));
     try {
-      // Seed an existing Stop hook to prove it is preserved.
+      const guardFile = path.join(dir, "paperclip-env-guard.deadbeef1234.mjs");
+      // Seed an existing Stop hook (must be preserved) alongside a STALE guard
+      // entry pointing at the old fixed-name guard. On the shared volume that
+      // stale path is the wedged inode every pod hung on, so it must be pruned.
       writeFileSync(
         path.join(dir, "settings.json"),
-        JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: "echo stop" }] }] } }),
+        JSON.stringify({
+          hooks: {
+            Stop: [{ hooks: [{ type: "command", command: "echo stop" }] }],
+            PreToolUse: [
+              {
+                matcher: "Bash",
+                hooks: [
+                  {
+                    type: "command",
+                    command: `node ${path.join(dir, "paperclip-env-guard.mjs")}`,
+                  },
+                ],
+              },
+            ],
+          },
+        }),
       );
-      const env = { ...process.env, CLAUDE_CONFIG_DIR: dir };
+      const env = {
+        ...process.env,
+        CLAUDE_CONFIG_DIR: dir,
+        PAPERCLIP_GUARD_FILE: guardFile,
+      };
       const run = () => spawnSync(process.execPath, ["-"], { input: mergeScript, encoding: "utf8", env });
       expect(run().status).toBe(0);
       expect(run().status).toBe(0); // run twice → must stay idempotent
@@ -369,7 +417,10 @@ describe("buildEnvGuardSetupShell", () => {
         (g: { matcher?: string }) => g.matcher === "Bash",
       );
       expect(guardEntries).toHaveLength(1);
-      expect(guardEntries[0].hooks[0].command).toContain("paperclip-env-guard.mjs");
+      expect(guardEntries[0].hooks[0].command).toBe(`node ${guardFile}`);
+      // The stale fixed-name guard hook is gone, not merely deduplicated.
+      const raw = readFileSync(path.join(dir, "settings.json"), "utf8");
+      expect(raw).not.toContain(`${path.join(dir, "paperclip-env-guard.mjs")}`);
       // Existing Stop hook survived.
       expect(settings.hooks.Stop[0].hooks[0].command).toBe("echo stop");
     } finally {

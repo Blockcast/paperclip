@@ -1,10 +1,13 @@
 export { agentAdapterTypeSchema, optionalAgentAdapterTypeSchema } from "./adapter-type.js";
 export {
+  CREDENTIAL_VALUE_RES,
+  REDACTED_VALUE_SENTINEL,
   SENSITIVE_ENV_KEY_RE,
   isPlausiblySensitiveEnvValue,
   isSensitiveEnv,
   isSensitiveEnvKey,
 } from "./sensitive-env.js";
+export { REDACTED_SENTINEL } from "./secret-sentinel.js";
 export {
   getAgentOrgChainHealth,
   getAgentWorkEligibility,
@@ -207,6 +210,7 @@ export {
   ISSUE_RECOVERY_ACTION_STATUSES,
   ISSUE_RECOVERY_ACTION_OWNER_TYPES,
   ISSUE_RECOVERY_ACTION_OUTCOMES,
+  ISSUE_RECOVERY_ACTION_RETIRING_BOUNDS,
   pluginOperationIssueOriginKind,
   isPluginOperationIssueOriginKind,
   ISSUE_RELATION_TYPES,
@@ -398,6 +402,7 @@ export {
   type IssueRecoveryActionStatus,
   type IssueRecoveryActionOwnerType,
   type IssueRecoveryActionOutcome,
+  type IssueRecoveryActionRetiringBound,
   type IssueRelationType,
   type IssueTreeControlMode,
   type IssueTreeHoldReleasePolicyStrategy,
@@ -1416,6 +1421,7 @@ export type { ServerGitInfo, ServerGitLocalChanges, ServerInfoSnapshot } from ".
 
 export {
   getClosedIsolatedExecutionWorkspaceMessage,
+  isClosedExecutionWorkspace,
   isClosedIsolatedExecutionWorkspace,
 } from "./execution-workspace-guards.js";
 

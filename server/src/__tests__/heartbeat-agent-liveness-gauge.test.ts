@@ -18,6 +18,8 @@ import { agents, companies, createDb } from "@paperclipai/db";
 import { heartbeatService } from "../services/heartbeat.js";
 import {
   AGENT_ERROR_DURATION_SECONDS_METRIC,
+  AGENT_ERROR_REASON_AGENTS_METRIC,
+  AGENT_ERROR_REASON_OLDEST_AGE_METRIC,
   AGENT_HEARTBEAT_AGE_SECONDS_METRIC,
   AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC,
   __resetMetricsForTest,
@@ -71,6 +73,7 @@ describeEmbeddedPostgres("agent-liveness gauges (BLO-23413)", () => {
 
   async function seedAgent(overrides: {
     status?: string;
+    errorReason?: string | null;
     runtimeConfig?: Record<string, unknown>;
     lastHeartbeatAt?: Date | null;
     createdAt?: Date;
@@ -86,6 +89,7 @@ describeEmbeddedPostgres("agent-liveness gauges (BLO-23413)", () => {
       name: overrides.name ?? "Test agent",
       role: "engineer",
       status: overrides.status ?? "idle",
+      errorReason: overrides.errorReason ?? null,
       adapterType: "claude_k8s",
       adapterConfig: {},
       runtimeConfig: overrides.runtimeConfig ?? {},
@@ -105,6 +109,21 @@ describeEmbeddedPostgres("agent-liveness gauges (BLO-23413)", () => {
       values: Array<{ labels: Record<string, string>; value: number }>;
     };
     return data.values.find((entry) => entry.labels.agent_id === agentId)?.value;
+  }
+
+  /**
+   * Read a reason-bucketed gauge (BLO-22498). Returns `undefined` only when
+   * the series is genuinely ABSENT, which the assertions below distinguish
+   * from `0` on purpose: absent and healthy render identically on a panel,
+   * and telling them apart is the whole point of the zero-fill contract.
+   */
+  async function bucketValue(metricName: string, errorReason: string): Promise<number | undefined> {
+    const metric = getMetricsRegistry().getSingleMetric(metricName);
+    expect(metric, `${metricName} must be registered`).toBeTruthy();
+    const data = (await metric!.get()) as {
+      values: Array<{ labels: Record<string, string>; value: number }>;
+    };
+    return data.values.find((entry) => entry.labels.error_reason === errorReason)?.value;
   }
 
   it("publishes age+interval only for heartbeat-enabled agents, error duration for every agent", async () => {
@@ -386,6 +405,141 @@ describeEmbeddedPostgres("agent-liveness gauges (BLO-23413)", () => {
       expect(firing.map((v) => v.labels.agent_id)).toEqual([genuinelyDark]);
       // Six seeded, only the two live agents are even eligible to be judged.
       expect(ages.values).toHaveLength(2);
+    });
+  });
+
+  // BLO-22498: BLO-18012's operational verifying signal. Its fourth AC is a
+  // BOUND ("time-to-recovery <= 2 min"), and the pre-existing
+  // AGENT_ERROR_DURATION_SECONDS_METRIC cannot serve it: it carries only
+  // agent_id, so it answers "some agent is errored" and never "we are in the
+  // Session unavailable condition". These tests pin the reason dimension that
+  // makes the bound measurable, and specifically pin the two ways this
+  // exporter could break while still LOOKING healthy on a panel:
+  //   - a flat-zero line because the reason match silently never fires, and
+  //   - a vanished series, which is indistinguishable from recovery.
+  describe("reason-bucketed error gauges (BLO-22498)", () => {
+    const SESSION_UNAVAILABLE = "session_unavailable";
+    const OTHER = "other";
+    const NONE = "none";
+
+    it("publishes a nonzero count and max-age for the Session unavailable bucket, keeping other reasons separate", async () => {
+      const now = new Date("2026-09-09T12:00:00Z");
+      const enabled = { heartbeat: { enabled: true, intervalSec: 1800 } };
+
+      // Two agents wedged on Session unavailable -- the originating BLO-18010
+      // incident shape (BackendEngineerGo + Players Engineer). The reason text
+      // is deliberately WRAPPED rather than the bare phrase: it is verbatim
+      // adapter-CLI output, so an equality-based classifier would bucket both
+      // of these as `other` and leave the panel at a plausible flat zero.
+      await seedAgent({
+        status: "error",
+        errorReason: "opencode session error: Session unavailable (session expired)",
+        runtimeConfig: enabled,
+        lastHeartbeatAt: new Date(now.getTime() - 30_000),
+        updatedAt: new Date(now.getTime() - 90_000), // 90s in error
+      });
+      await seedAgent({
+        status: "error",
+        errorReason: "Session unavailable",
+        runtimeConfig: enabled,
+        lastHeartbeatAt: new Date(now.getTime() - 30_000),
+        updatedAt: new Date(now.getTime() - 300_000), // 300s -- the oldest
+      });
+      // An unrelated error must NOT land in the session bucket, or the panel
+      // degenerates into the generic error count the AC forbids.
+      await seedAgent({
+        status: "error",
+        errorReason: "adapter_failed: image pull backoff",
+        runtimeConfig: enabled,
+        lastHeartbeatAt: new Date(now.getTime() - 30_000),
+        updatedAt: new Date(now.getTime() - 1_000_000),
+      });
+      // In error with nothing recorded -> `none`, counted but bucketed apart.
+      await seedAgent({
+        status: "error",
+        errorReason: null,
+        runtimeConfig: enabled,
+        lastHeartbeatAt: new Date(now.getTime() - 30_000),
+        updatedAt: new Date(now.getTime() - 45_000),
+      });
+      // Healthy agent must contribute to no bucket at all.
+      await seedAgent({
+        status: "idle",
+        errorReason: null,
+        runtimeConfig: enabled,
+        lastHeartbeatAt: new Date(now.getTime() - 10_000),
+        updatedAt: now,
+      });
+
+      await heartbeat.publishAgentLivenessGauges(now);
+
+      expect(await bucketValue(AGENT_ERROR_REASON_AGENTS_METRIC, SESSION_UNAVAILABLE)).toBe(2);
+      // Max-within-bucket, not the sum and not the newest.
+      expect(await bucketValue(AGENT_ERROR_REASON_OLDEST_AGE_METRIC, SESSION_UNAVAILABLE)).toBe(300);
+
+      // The 2-min bound is breached here, and the series must say so rather
+      // than being clamped -- a panel tuned to hide a breach is explicitly
+      // disallowed by the AC.
+      expect(
+        (await bucketValue(AGENT_ERROR_REASON_OLDEST_AGE_METRIC, SESSION_UNAVAILABLE))!,
+      ).toBeGreaterThan(120);
+
+      // Separation: the unrelated failure is visible, and in its own bucket.
+      expect(await bucketValue(AGENT_ERROR_REASON_AGENTS_METRIC, OTHER)).toBe(1);
+      expect(await bucketValue(AGENT_ERROR_REASON_OLDEST_AGE_METRIC, OTHER)).toBe(1000);
+      expect(await bucketValue(AGENT_ERROR_REASON_AGENTS_METRIC, NONE)).toBe(1);
+      expect(await bucketValue(AGENT_ERROR_REASON_OLDEST_AGE_METRIC, NONE)).toBe(45);
+    });
+
+    it("reads an explicit 0 -- not an absent series -- when no agent is in the Session unavailable state", async () => {
+      const now = new Date("2026-09-09T12:00:00Z");
+      await seedAgent({
+        status: "idle",
+        runtimeConfig: { heartbeat: { enabled: true, intervalSec: 1800 } },
+        lastHeartbeatAt: new Date(now.getTime() - 10_000),
+        updatedAt: now,
+      });
+
+      await heartbeat.publishAgentLivenessGauges(now);
+
+      // toBe(0), never toBeUndefined(): if the series dropped out when the
+      // bucket emptied, "recovered to 0" and "exporter stopped reporting"
+      // would render as the same blank panel, and the BLO-22498 recovery
+      // demonstration would be unfalsifiable.
+      expect(await bucketValue(AGENT_ERROR_REASON_AGENTS_METRIC, SESSION_UNAVAILABLE)).toBe(0);
+      expect(await bucketValue(AGENT_ERROR_REASON_OLDEST_AGE_METRIC, SESSION_UNAVAILABLE)).toBe(0);
+      expect(await bucketValue(AGENT_ERROR_REASON_AGENTS_METRIC, OTHER)).toBe(0);
+      expect(await bucketValue(AGENT_ERROR_REASON_AGENTS_METRIC, NONE)).toBe(0);
+    });
+
+    it("returns the bucket to 0 on the pass after the agent recovers, which is the recovery signal itself", async () => {
+      const now = new Date("2026-09-09T12:00:00Z");
+      const wedged = await seedAgent({
+        status: "error",
+        errorReason: "Session unavailable",
+        runtimeConfig: { heartbeat: { enabled: true, intervalSec: 1800 } },
+        lastHeartbeatAt: new Date(now.getTime() - 30_000),
+        updatedAt: new Date(now.getTime() - 90_000),
+      });
+
+      await heartbeat.publishAgentLivenessGauges(now);
+      expect(await bucketValue(AGENT_ERROR_REASON_AGENTS_METRIC, SESSION_UNAVAILABLE)).toBe(1);
+      expect(await bucketValue(AGENT_ERROR_REASON_OLDEST_AGE_METRIC, SESSION_UNAVAILABLE)).toBe(90);
+
+      // Recovery: BLO-18012's fix clears status and reason together.
+      const recoveredAt = new Date(now.getTime() + 30_000);
+      await db.execute(
+        sql.raw(
+          `UPDATE "agents" SET status = 'idle', error_reason = NULL, updated_at = '${recoveredAt.toISOString()}' WHERE id = '${wedged}'`,
+        ),
+      );
+
+      await heartbeat.publishAgentLivenessGauges(recoveredAt);
+
+      // Both arms drop to 0 without the series disappearing. This is exactly
+      // what the panel renders across a control-plane restart.
+      expect(await bucketValue(AGENT_ERROR_REASON_AGENTS_METRIC, SESSION_UNAVAILABLE)).toBe(0);
+      expect(await bucketValue(AGENT_ERROR_REASON_OLDEST_AGE_METRIC, SESSION_UNAVAILABLE)).toBe(0);
     });
   });
 });

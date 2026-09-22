@@ -55,8 +55,37 @@ Pinned by commit SHA in the Dockerfile's `ARG *_REF` lines.
    or via PR + merge).
 2. Bump the corresponding `*_REF` ARG in the Dockerfile to the new commit
    SHA. Pinning by SHA (not branch name) keeps image builds reproducible.
+   **Pin a SHA that is reachable from a ref — see the hazard below.**
 3. Build the image. The `vendor` stage clones the fork at the pinned SHA,
    runs the package's build, and packs the result.
+
+#### Hazard: never pin a PR branch head that is about to be squash-merged
+
+The `vendor` stage does a plain `git clone`, which fetches only
+**ref-reachable** objects. Squash-merging the PR you pinned replaces its branch
+commits, so the SHA you pinned becomes reachable from no ref and the checkout
+fails with `fatal: unable to read tree (<sha>)`, exit 128. The commit still
+resolves through the GitHub API, so this is *reachability*, not deletion, and
+`gh api repos/<fork>/commits/<sha>` returning 200 proves nothing.
+
+Two things make this expensive to diagnose (BLO-33204, 2026-09-10):
+
+- **It is cache-timed, not commit-timed.** Builds reusing a `vendor` layer
+  created before the squash keep passing, so master looks healthy while every
+  cache-missing build fails — including a `workflow_dispatch` at an older SHA
+  that had already built green. Do not conclude only master head is broken.
+- **The fix is usually content-neutral.** The squash commit of the same PR has
+  the identical tree, so re-pinning to it changes no behaviour. Verify before
+  assuming: `git diff <orphaned-sha> <squash-sha>` should be empty. Do **not**
+  reach for `compare/master...<sha>` to judge this — a legitimately pinned
+  un-merged branch head also reads `diverged`, so that status cannot tell an
+  orphan from a valid pin.
+
+`scripts/check-opencode-k8s-pin-reachable.mjs` enforces reachability in CI
+(`pr.yml`) so an orphaned pin fails a PR instead of surfacing later as a broken
+deploy path. Pin changes must also be added to the known-bad list in
+`scripts/opencode-k8s-runtime-cache-pin.test.js` when the old SHA must never
+return.
 
 ## Historical note
 

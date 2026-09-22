@@ -271,6 +271,7 @@ export interface HostServices {
     getOrchestrationSummary(params: WorkerToHostMethods["issues.summaries.getOrchestration"][0]): Promise<WorkerToHostMethods["issues.summaries.getOrchestration"][1]>;
     listComments(params: WorkerToHostMethods["issues.listComments"][0]): Promise<WorkerToHostMethods["issues.listComments"][1]>;
     createComment(params: WorkerToHostMethods["issues.createComment"][0]): Promise<WorkerToHostMethods["issues.createComment"][1]>;
+    updateComment(params: WorkerToHostMethods["issues.updateComment"][0]): Promise<WorkerToHostMethods["issues.updateComment"][1]>;
     createInteraction(params: WorkerToHostMethods["issues.createInteraction"][0]): Promise<WorkerToHostMethods["issues.createInteraction"][1]>;
   };
 
@@ -521,6 +522,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   "issues.summaries.getOrchestration": "issues.orchestration.read",
   "issues.listComments": "issue.comments.read",
   "issues.createComment": "issue.comments.create",
+  "issues.updateComment": "issue.comments.update",
   "issues.createInteraction": "issue.interactions.create",
 
   // Projects write (Lucitra extension)
@@ -1026,6 +1028,9 @@ export function createHostClientHandlers(
     }),
     "issues.createComment": gated("issues.createComment", async (params) => {
       return services.issues.createComment(params);
+    }),
+    "issues.updateComment": gated("issues.updateComment", async (params) => {
+      return services.issues.updateComment(params);
     }),
     "issues.createInteraction": gated("issues.createInteraction", async (params) => {
       return services.issues.createInteraction(params);

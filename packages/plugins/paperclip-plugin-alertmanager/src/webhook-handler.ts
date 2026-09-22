@@ -22,10 +22,12 @@ import {
   buildIssueDescription,
   buildIssueTitle,
   effectiveAlertStatus,
+  isTerminalSeverity,
   severityToPriority,
 } from "./issue-mapping.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
 import { resolveAssigneeUserId, resolveFallbackAgentId } from "./owner-resolver.js";
+import type { FallbackOwnerResolution } from "./owner-resolver.js";
 import { aggregateKeyForAlert } from "./aggregate-key.js";
 import { escalationDeadlineMs, recordSourceResolvedAndCloseCovers } from "./escalation.js";
 import {
@@ -62,6 +64,36 @@ export class AlertDeliveryIncompleteError extends Error {
     );
     this.name = "AlertDeliveryIncompleteError";
     this.fingerprints = fingerprints;
+  }
+}
+
+/**
+ * Raised by a per-alert path whose failure no retry can fix — a configuration
+ * or roster fact rather than process state.
+ *
+ * The per-alert catch treats these as *handled*: the alert is dropped, the
+ * failure is recorded (log + metric), and the fingerprint is deliberately NOT
+ * added to `failedFingerprints`, so the delivery still answers 200.
+ *
+ * This is the same "log + 200" treatment the malformed-payload and
+ * permanent-policy drops already get. It exists because the taxonomy the
+ * per-alert catch was written against — "these failures are issue-RPC,
+ * state-store, event, and metric errors, which are transient" — stopped being
+ * true once `handleFiring` began throwing on unresolvable fallback ownership
+ * (PEN-2581). Reporting a permanent fault through the transient channel makes
+ * Alertmanager retry it 15-17× and drop the delivery anyway, and the resulting
+ * `alertmanager_notifications_failed_total` storm masks concurrent *transient*
+ * failures that retrying would genuinely have fixed.
+ *
+ * Only reachable from the firing path (owner resolution is never run on
+ * resolve), so a dropped alert that is still firing returns on Alertmanager's
+ * next `repeat_interval` — this trades a doomed retry burst for a later
+ * re-delivery, not for silent permanent loss.
+ */
+export class PermanentAlertError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PermanentAlertError";
   }
 }
 
@@ -141,7 +173,7 @@ type AggregateMemberResolution = {
  */
 type AggregateFiringClaim =
   | { ok: true; token: string }
-  | { ok: false; blockingPhase: string | null };
+  | { ok: false; blockingPhase: string | null; heldMs?: number | null };
 
 function q(ns: string, table: string): string {
   return `${ns}.${table}`;
@@ -373,6 +405,28 @@ async function upsertAggregateMember(
 }
 
 /**
+ * How long a `firing`/`cancelling` fence may be held before the next claim for
+ * that aggregate reclaims it regardless of who owns it (BLO-32113).
+ *
+ * This is a backstop against an unreclaimable fence, not a lease: nothing
+ * renews it, and the identity rules in `beginAggregateFiring` are tried first
+ * and handle every ordinary case. It exists because identity-based reclaim has
+ * one blind spot it cannot close by construction — a fence leaked by a process
+ * that is still running — and in that state no automatic path can ever recover
+ * the aggregate.
+ *
+ * 15 minutes is not a new number: it is the horizon this file already calls
+ * wedged (see `assertFiringGeneration`, which is a SELECT specifically so it
+ * cannot bump `updated_at` and hide a fence from the
+ * `updated_at < now() - interval '15 minutes'` detector). A legitimate hold
+ * covers one delivery's issue RPCs and clears in the sub-second range; the
+ * contention wait budget above is 3s. So this is ~300x the wait budget and
+ * orders of magnitude beyond any healthy hold — a delivery still holding at 15
+ * minutes is pathological whether or not its process is alive.
+ */
+const AGGREGATE_FENCE_ABANDONED_BACKSTOP_MS = 15 * 60_000;
+
+/**
  * Firing claims the aggregate fence before it mutates member state or touches
  * the issue. A resolver may only begin finalization while the fence is active;
  * once it is cancelling, a new firing fails its delivery and retries after the
@@ -411,6 +465,46 @@ async function beginAggregateFiring(
   //
   // A live sibling delivery in *this* process shares WORKER_INSTANCE_ID and is
   // therefore excluded, as is any owner in another slot.
+  //
+  // Those two exclusions are also the identity steal's blind spot, and BLO-32113
+  // measured it in production: a fence leaked by a process that is still alive
+  // — same instance id, or an owner in a slot that never restarts — matched
+  // NEITHER this steal NOR `reconcileAbandonedAggregateFences`, because both
+  // required `owner_instance_id IS DISTINCT FROM` the running process. It was
+  // then unreclaimable by any automatic path, and the only drain was the
+  // board-user recovery route. Four aggregates sat that way while every delivery
+  // for them 502'd (`ArgoAppOutOfSyncTooLong`,
+  // `HeartbeatRunQueueAgentOldestQueuedHigh`, `BlockcastdImageDriftDetected`,
+  // `LLMProxyProviderAuthenticationFailed`: 25 distinct fingerprints retried
+  // ~50x each, none ever succeeding).
+  //
+  // The third disjunct is the backstop for that, and it closes the half that
+  // matters most: an aggregate that keeps firing recovers on its very next
+  // delivery, with no restart and no human. It cannot close the other half on
+  // its own, because it only ever runs *on a delivery* — an aggregate whose
+  // alert has stopped firing delivers nothing. `reconcileAbandonedAggregateFences`
+  // carries the same age clause for exactly that case; between them no fence
+  // stays held, but the two cover different triggers and neither is redundant.
+  //
+  // It is NOT a lease, and it does
+  // not weaken the rule above it: identity remains the ordinary reclaim path and
+  // is tried first. This only admits a fence whose hold has already exceeded
+  // AGGREGATE_FENCE_ABANDONED_BACKSTOP_MS — a duration this file already treats
+  // as pathological, since `assertFiringGeneration` is deliberately a SELECT so
+  // that it cannot bump `updated_at` and hide a fence from the wedged-fence
+  // detector's `updated_at < now() - interval '15 minutes'`. That detector
+  // defines the condition; nothing acted on it. This is the actor.
+  //
+  // Stealing from a possibly-live owner is already this design's accepted
+  // posture, not a new one: the comment above admits same-slot/different-instance
+  // on "strong evidence of death, NOT proof of it", and rests correctness on the
+  // generation instead. A backstop steal is safe by exactly that argument. A
+  // holder that resumes after losing the race cannot attach a member
+  // (`upsertAggregateMember`), cannot complete (`finishAggregateFiring`), and
+  // cannot mutate the issue (the `firingFence(...)` share lock, BLO-31049); it
+  // fails loudly and Alertmanager retries. So an over-eager backstop costs one
+  // retry, while the current behaviour costs every alert in the aggregate
+  // indefinitely.
   const result = await ctx.db.execute(
     `INSERT INTO ${fences}
        (company_id, aggregate_key, phase, firing_token, owner_instance_id, owner_slot)
@@ -427,8 +521,20 @@ async function beginAggregateFiring(
           ${fences}.phase IN ('firing', 'cancelling')
           AND ${fences}.owner_slot = $5
           AND ${fences}.owner_instance_id IS DISTINCT FROM $4
+        )
+        OR (
+          ${fences}.phase IN ('firing', 'cancelling')
+          AND ${fences}.updated_at
+              < now() - ($6::bigint * interval '1 millisecond')
         )`,
-    [companyId, aggregateKey, token, WORKER_INSTANCE_ID, WORKER_SLOT],
+    [
+      companyId,
+      aggregateKey,
+      token,
+      WORKER_INSTANCE_ID,
+      WORKER_SLOT,
+      AGGREGATE_FENCE_ABANDONED_BACKSTOP_MS,
+    ],
   );
   if (result.rowCount > 0) return { ok: true, token };
   // Read back the phase that actually refused the claim. The upsert admits
@@ -437,14 +543,168 @@ async function beginAggregateFiring(
   // what makes the wedge diagnosable from the delivery error alone; reporting a
   // fixed phase here sent a six-day production investigation (PEN-2581) after
   // `finalizing`, which is the one phase that cannot produce this failure.
-  const rows = await ctx.db.query<{ phase: string }>(
-    `SELECT phase
+  const rows = await ctx.db.query<{ phase: string; held_ms: number | string | null }>(
+    `SELECT phase,
+            EXTRACT(EPOCH FROM (now() - updated_at)) * 1000 AS held_ms
        FROM ${fences}
       WHERE company_id = $1
         AND aggregate_key = $2`,
     [companyId, aggregateKey],
   );
-  return { ok: false, blockingPhase: rows[0]?.phase ?? null };
+  const heldMsRaw = rows[0]?.held_ms;
+  const heldMs = heldMsRaw === null || heldMsRaw === undefined
+    ? null
+    : Math.round(Number(heldMsRaw));
+  return {
+    ok: false,
+    blockingPhase: rows[0]?.phase ?? null,
+    heldMs: heldMs !== null && Number.isFinite(heldMs) ? heldMs : null,
+  };
+}
+
+/**
+ * How long a firing delivery waits for a live sibling to release the aggregate
+ * fence before giving up and failing the delivery (PEN-3013).
+ *
+ * The fence is keyed on the *creation identity*
+ * (`alert-aggregate:v1:[alertname, dedupe-domain]`), so by design every alert
+ * sharing an alertname contends for one fence — that convergence is the whole
+ * point of the aggregate, and widening the key here would change which alerts
+ * share an issue, not merely who waits. So contention is expected, routine, and
+ * scales with the number of distinct firing instances per alertname; it is not
+ * a fault. Treating it as one is what produced the measured failure mode:
+ * unrelated objects under a shared alertname each returned 502, and
+ * Alertmanager's retry then collided with the delivery still holding the fence,
+ * sustaining the episode until the fan-out settled.
+ *
+ * The fence is only ever held for one delivery's issue RPCs, so the holder
+ * clears in the sub-second range and waiting nearly always beats failing. The
+ * budget is wall-clock and deliberately modest, because it is also paid on the
+ * path it cannot help: against a genuinely wedged fence a delivery now occupies
+ * a request slot for the full budget before failing, and Alertmanager keeps
+ * retrying throughout. That cost is per aggregate key per delivery, not per
+ * alert — see {@link AggregateFenceWedgedMemo}, without which it would scale
+ * with batch size. It does not need to cover the worst-case fan-out — only to
+ * collapse the common case. A delivery that loses the race anyway still
+ * throws exactly as it did before, so it is retried, not lost; the
+ * transient/permanent taxonomy is untouched.
+ *
+ * Delays are jittered because the alerts that contend here re-fire *together*
+ * after a worker restart. Retrying on a fixed schedule would re-collide the same
+ * set in lockstep on every attempt, converting one queue into repeated
+ * thundering herds.
+ */
+const AGGREGATE_FENCE_WAIT_BUDGET_MS = 3_000;
+const AGGREGATE_FENCE_WAIT_INITIAL_DELAY_MS = 25;
+const AGGREGATE_FENCE_WAIT_MAX_DELAY_MS = 500;
+
+export type AggregateFenceWaitPolicy = {
+  budgetMs: number;
+  initialDelayMs: number;
+  maxDelayMs: number;
+  sleep: (ms: number) => Promise<void>;
+  now: () => number;
+  random: () => number;
+};
+
+const DEFAULT_AGGREGATE_FENCE_WAIT: AggregateFenceWaitPolicy = {
+  budgetMs: AGGREGATE_FENCE_WAIT_BUDGET_MS,
+  initialDelayMs: AGGREGATE_FENCE_WAIT_INITIAL_DELAY_MS,
+  maxDelayMs: AGGREGATE_FENCE_WAIT_MAX_DELAY_MS,
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  now: () => Date.now(),
+  random: () => Math.random(),
+};
+
+/**
+ * Aggregate keys this delivery has already spent a full wait budget on without
+ * winning the claim. Scoped to one webhook delivery, like {@link FallbackOwnerMemo}
+ * and for the same reason: a storm is the case that matters.
+ *
+ * The budget is per *call*, so without this a batch of N alerts costs N budgets
+ * against a fence nothing in this delivery can clear — and that lands on
+ * precisely the wrong population, because Alertmanager groups by alertname and
+ * the aggregate key is `[alertname, dedupe-domain]`, so one batch is exactly the
+ * set that maps to one fence. A 10-alert `CronJobSuccessStale` batch would hold a
+ * request slot for ~30s where it previously failed in milliseconds, worst under
+ * the restart fan-out this change exists to fix.
+ *
+ * Alerts 2..N gain nothing by waiting: the first already established that this
+ * key is not becoming claimable on this delivery's timescale, and none of them
+ * can release it. So they get one attempt and no wait — cheaper, and more
+ * honest about the information available.
+ */
+type AggregateFenceWedgedMemo = Set<string>;
+
+/**
+ * `beginAggregateFiring`, but waits out a fence held by a live holder instead of
+ * failing the delivery on first refusal (PEN-3013).
+ *
+ * This waits for a *claim*; it holds nothing while it sleeps, so it cannot
+ * itself wedge an aggregate or delay a holder's release. Ownership safety is
+ * unchanged — it still rests entirely on the `firing_token` generation checked
+ * at each mutation site, and a claim won on the second attempt is
+ * indistinguishable from one won on the first.
+ *
+ * Deliberately retries on BOTH blocking phases. 'cancelling' is the resolver
+ * finishing a terminal transition, which is exactly the case the original
+ * comment says should "retry after the terminal transition" — previously that
+ * retry had to arrive as a whole new HTTP delivery.
+ *
+ * The budget is spent at most once per aggregate key per delivery — see
+ * {@link AggregateFenceWedgedMemo}. Distinct keys still each get their own
+ * budget, because a claim refused on one fence says nothing about another.
+ */
+async function claimAggregateFiringWaiting(
+  ctx: PluginContext,
+  companyId: string,
+  aggregateKey: string,
+  policyOverrides?: Partial<AggregateFenceWaitPolicy>,
+  wedgedKeys?: AggregateFenceWedgedMemo,
+): Promise<AggregateFiringClaim> {
+  const policy: AggregateFenceWaitPolicy = policyOverrides
+    ? { ...DEFAULT_AGGREGATE_FENCE_WAIT, ...policyOverrides }
+    : DEFAULT_AGGREGATE_FENCE_WAIT;
+
+  // Still attempt once: the holder may have released since the alert that gave
+  // up, and skipping the attempt entirely would fail an alert that could have
+  // been served. Only the *waiting* is skipped.
+  if (wedgedKeys?.has(aggregateKey)) {
+    return beginAggregateFiring(ctx, companyId, aggregateKey);
+  }
+
+  const startedAt = policy.now();
+  let attempt = 0;
+  let claim = await beginAggregateFiring(ctx, companyId, aggregateKey);
+
+  while (!claim.ok) {
+    const elapsedMs = policy.now() - startedAt;
+    const remainingMs = policy.budgetMs - elapsedMs;
+    if (remainingMs <= 0) {
+      wedgedKeys?.add(aggregateKey);
+      return claim;
+    }
+
+    // Exponential with full jitter, clamped to whatever budget is left so the
+    // total wait cannot overrun even on the final attempt.
+    const ceiling = Math.min(
+      policy.maxDelayMs,
+      policy.initialDelayMs * 2 ** attempt,
+    );
+    const delayMs = Math.min(remainingMs, Math.ceil(policy.random() * ceiling));
+    await policy.sleep(delayMs);
+    attempt += 1;
+    claim = await beginAggregateFiring(ctx, companyId, aggregateKey);
+  }
+
+  if (attempt > 0) {
+    ctx.logger.info(
+      `Alertmanager aggregate ${aggregateKey} was held by a concurrent ` +
+        `delivery; claimed it after ${attempt} attempt(s) over ` +
+        `${policy.now() - startedAt}ms instead of failing the delivery.`,
+    );
+  }
+  return claim;
 }
 
 /**
@@ -458,13 +718,30 @@ async function beginAggregateFiring(
  * held after the owner dies" an invariant rather than a property of alerts that
  * happen to repeat.
  *
- * Release is justified by identity, never by age:
+ * Release is justified by identity:
  *   - `owner_instance_id IS DISTINCT FROM` this process — never touches a fence
  *     held by a live sibling delivery in this same process. A delivery can
  *     arrive while setup is still running, so this exclusion is load-bearing.
  *   - same `owner_slot`, or NULL. NULL means the row was written before this
  *     column existed, i.e. by a strictly older image, which the running process
  *     has by definition replaced.
+ *
+ * ...or by age, past `AGGREGATE_FENCE_ABANDONED_BACKSTOP_MS` (BLO-32113). The
+ * identity arm alone leaves one state with no automatic drain: a fence leaked
+ * by a live process in a *foreign* slot, whose alert then stops firing. It
+ * matches neither this sweep (wrong slot) nor the per-claim backstop in
+ * `beginAggregateFiring` (that only ever runs on a delivery, and a stopped
+ * alert delivers nothing), so it waits on that foreign slot restarting — which
+ * may never happen. The age disjunct is what makes the invariant hold for
+ * aggregates that do not fire again.
+ *
+ * The age arm does not weaken the exclusion above it. That exclusion protects a
+ * live sibling delivery in *this* process, and this sweep runs only from
+ * `setup()` (see `worker.ts`) — a fence this process owns cannot already be 15
+ * minutes old when the process is seconds old, so the two arms do not overlap
+ * in practice. Safety does not rest on that timing argument either way: as with
+ * the per-claim backstop, a stolen holder is refused at every mutation site by
+ * the `firing_token` generation, so an over-eager release costs one retry.
  *
  * Deliberately non-fatal: a failed sweep leaves fences wedged, which the
  * per-claim steal can still recover. Throwing here would prevent the worker
@@ -484,15 +761,25 @@ export async function reconcileAbandonedAggregateFences(
            owner_slot = NULL,
            updated_at = now()
        WHERE phase IN ('firing', 'cancelling')
-         AND owner_instance_id IS DISTINCT FROM $1
-         AND (owner_slot IS NULL OR owner_slot = $2)`,
-      [WORKER_INSTANCE_ID, WORKER_SLOT],
+         AND (
+           (
+             owner_instance_id IS DISTINCT FROM $1
+             AND (owner_slot IS NULL OR owner_slot = $2)
+           )
+           OR updated_at < now() - ($3::bigint * interval '1 millisecond')
+         )`,
+      [
+        WORKER_INSTANCE_ID,
+        WORKER_SLOT,
+        AGGREGATE_FENCE_ABANDONED_BACKSTOP_MS,
+      ],
     );
     if (result.rowCount > 0) {
       ctx.logger.warn(
         `paperclip-plugin-alertmanager: released ${result.rowCount} aggregate lifecycle fence(s) ` +
-          `abandoned by a previous occupant of slot ${WORKER_SLOT}. Each of these was refusing ` +
-          `every firing delivery for its aggregate until now.`,
+          `abandoned by a previous occupant of slot ${WORKER_SLOT}, or held past the ` +
+          `${AGGREGATE_FENCE_ABANDONED_BACKSTOP_MS}ms abandonment backstop by any owner. Each of ` +
+          `these was refusing every firing delivery for its aggregate until now.`,
       );
     }
     return result.rowCount;
@@ -975,15 +1262,66 @@ function operatorSuppressionMs(config: AlertmanagerPluginConfig): number | null 
 }
 
 /**
+ * Did the *plugin* author this issue's current terminal status, or did a human
+ * or an agent? (BLO-31736)
+ *
+ * This used to be inferred from `existing.resolvedAt`, which does not record
+ * authorship — it records only that the alert last cleared. The two diverge on
+ * exactly the case the terminal guard in `handleResolved` exists to protect: an
+ * agent closes the row `done`, the alert then resolves, the guard correctly
+ * declines to overwrite the close, and `resolvedAt` is written anyway. The next
+ * re-fire read that as "the plugin closed this" and resurrected the row to
+ * `todo`; the resolve after it then found a non-terminal row and cancelled it.
+ * A deliberate `done` became a plugin-authored `cancelled`, once per fire/clear
+ * cycle, indefinitely — and BLO-24234's operator suppression was unreachable
+ * for any alert that had ever resolved, which is every flapping alert, i.e.
+ * precisely the ones operators close by hand.
+ *
+ * Two signals, in precedence order:
+ *
+ * 1. **`done` is never a close of ours.** The plugin's only status writes are
+ *    `todo` (fire, re-open) and `cancelled` (resolve) — it has no path that
+ *    closes an issue `done`, so a `done` row was dispositioned by someone
+ *    else whatever the state says. (An `issueRouteMap` entry could in
+ *    principle *create* a row `done`; that is still not a close on resolve,
+ *    and re-opening such a row on re-fire would be wrong for the same
+ *    reason.) This signal holds for rows written before `pluginClosedAt`
+ *    existed too, which is what makes the reported defect fixed on contact
+ *    rather than one migration cycle later.
+ * 2. **`pluginClosedAt` is the recorded fact** for anything else: set when a
+ *    resolve delivery's cancel actually landed, `null` when we positively know
+ *    it did not.
+ *
+ * `undefined` means authorship is unknown for this row. Two sources: the row
+ * predates the field, or it is a member of an aggregate whose close decision
+ * this member deferred to a sibling (see `handleResolved`). We fall back to the
+ * old `resolvedAt` reading rather than assuming an operator close, because the
+ * two errors are not symmetric: reading a plugin close as operator-authored
+ * *mutes a live recurring alert* for the suppression window, while reading an
+ * operator close as plugin-authored costs one unwanted re-open that the very
+ * next firing state-write corrects. Silence is the worse failure. Legacy rows
+ * drain on their first post-deploy firing, which writes the field explicitly.
+ */
+export function closedByPlugin(
+  issue: { status: string },
+  existing: Pick<AlertStateRecord, "resolvedAt" | "pluginClosedAt">,
+): boolean {
+  if (issue.status === "done") return false;
+  if (existing.pluginClosedAt !== undefined) return existing.pluginClosedAt !== null;
+  return Boolean(existing.resolvedAt);
+}
+
+/**
  * Decide what a re-fire should do to an issue that already exists for this
  * fingerprint. Split out from `handleFiring` so the four decision points the
  * incident review asked for are enumerable in one place, and testable without
  * driving a whole webhook delivery.
  *
- * `terminal + resolvedAt` means the plugin closed it when the alert cleared, so
- * a re-fire is a genuine recurrence → re-open. `terminal` with no `resolvedAt`
- * means a human closed it while the alert was still firing → honour that, but
- * only until the suppression window expires (BLO-24234).
+ * A terminal issue the plugin closed when the alert cleared means a re-fire is
+ * a genuine recurrence → re-open. A terminal issue closed by anyone else means
+ * a human or an agent dispositioned it while the alert was still firing →
+ * honour that, but only until the suppression window expires (BLO-24234). See
+ * `closedByPlugin` for why that distinction cannot be read off `resolvedAt`.
  */
 type RefireDecision =
   | { kind: "refresh" }
@@ -993,7 +1331,10 @@ type RefireDecision =
 
 export function decideRefire(
   issue: { status: string } | null | undefined,
-  existing: Pick<AlertStateRecord, "resolvedAt" | "operatorSuppressedAt">,
+  existing: Pick<
+    AlertStateRecord,
+    "resolvedAt" | "operatorSuppressedAt" | "pluginClosedAt"
+  >,
   config: AlertmanagerPluginConfig,
   nowMs: number,
 ): RefireDecision {
@@ -1001,7 +1342,9 @@ export function decideRefire(
 
   const terminal = issue.status === "done" || issue.status === "cancelled";
   if (!terminal) return { kind: "refresh" };
-  if (existing.resolvedAt) return { kind: "reopen", reason: "plugin_resolved" };
+  if (closedByPlugin(issue, existing)) {
+    return { kind: "reopen", reason: "plugin_resolved" };
+  }
 
   // Operator-closed. Anchor the window on the first re-fire we see against the
   // closed issue — not on the close itself, which the plugin never observes.
@@ -1065,14 +1408,14 @@ function suppressionExpiryLabel(
  * delivery (rather than the module) is what keeps it correct: a config edit or
  * an agent being paused takes effect on the very next delivery.
  */
-export type FallbackOwnerMemo = Map<string, Promise<string | undefined>>;
+export type FallbackOwnerMemo = Map<string, Promise<FallbackOwnerResolution>>;
 
 function resolveFallbackAgentIdMemoized(
   ctx: Pick<PluginContext, "agents" | "logger">,
   companyId: string,
   fallbackAgentName: string | undefined,
   memo: FallbackOwnerMemo | undefined,
-): Promise<string | undefined> {
+): Promise<FallbackOwnerResolution> {
   if (!memo) return resolveFallbackAgentId(ctx, companyId, fallbackAgentName);
   // JSON-encoded pair rather than a naive `a + sep + b`: agent names are
   // operator-supplied config, so any single-character separator could be
@@ -1085,11 +1428,12 @@ function resolveFallbackAgentIdMemoized(
     companyId,
     fallbackAgentName,
   ).catch((err: unknown) => {
-    // Evict on failure. A refusal (bad name / paused / ambiguous) resolves to
-    // `undefined` and IS cached — it is a config fact, stable for the delivery.
-    // A *throw* is a transient host fault, and caching it would let one failed
-    // `agents.list` poison every remaining alert in the batch, converting a
-    // blip that previously cost one alert into a whole-delivery failure.
+    // Evict on failure. A refusal (bad name / paused / ambiguous) resolves to a
+    // `refusal` value and IS cached — the underlying condition is stable for the
+    // delivery, whether or not it is permanent beyond it. A *throw* is a
+    // transient host fault, and caching it would let one failed `agents.list`
+    // poison every remaining alert in the batch, converting a blip that
+    // previously cost one alert into a whole-delivery failure.
     memo.delete(key);
     throw err;
   });
@@ -1107,6 +1451,8 @@ export async function handleFiring(
   config: AlertmanagerPluginConfig,
   alert: AlertmanagerAlert,
   fallbackOwnerMemo?: FallbackOwnerMemo,
+  fenceWaitPolicy?: Partial<AggregateFenceWaitPolicy>,
+  fenceWedgedMemo?: AggregateFenceWedgedMemo,
 ): Promise<void> {
   // Resolved up front because it now scopes the state read, not just issue
   // creation. Without it there is no namespace to look in, so a delivery that
@@ -1134,10 +1480,16 @@ export async function handleFiring(
   //
   // This is the same `state ?? recover-from-issue` fallback the resolved path
   // has always used; only the firing path was missing it.
-  const existing = stateRecord ?? (await recoverStateFromIssue(ctx, config, alert));
   const nowIso = new Date().toISOString();
   const alertname = alert.labels.alertname ?? "UnnamedAlert";
   const severity = alert.labels.severity ?? "unknown";
+  // BLO-24177: a terminal severity (e.g. `none`, Prometheus's always-firing
+  // `Watchdog` dead-man's-switch) must never become agent-actionable work.
+  // Computed before the state read so the recovery lookup can adopt an
+  // already-terminal row rather than minting a second permanent evidence row.
+  const terminal = isTerminalSeverity(severity);
+  const existing =
+    stateRecord ?? (await recoverStateFromIssue(ctx, config, alert, terminal));
   const storedAggregateKey = existing
     ? (existing.aggregateKey ??
       (await findAggregateMemberKey(
@@ -1166,15 +1518,119 @@ export async function handleFiring(
     return;
   }
 
-  const firingClaim = await beginAggregateFiring(ctx, companyId, aggregateKey);
+  const firingClaim = await claimAggregateFiringWaiting(
+    ctx,
+    companyId,
+    aggregateKey,
+    fenceWaitPolicy,
+    fenceWedgedMemo,
+  );
   if (!firingClaim.ok) {
+    // Surface the wedge as a metric so it is detectable as a *cause* rather
+    // than inferred hours later from the webhook delivery ratio (BLO-32113).
+    //
+    // Two series: an occurrence count of `1` (matching every other
+    // `ctx.metrics.write` call site in this file) plus the hold age as its own
+    // series. The value is deliberately NOT the duration:
+    //
+    //   - As of PEN-2799 the host publishes every `metrics.write` to the
+    //     prom-client counter `paperclip_plugin_metric_total{metric="..."}`
+    //     *before* appending the `plugin_logs` row at `level: "metric"`
+    //     (`server/src/services/plugin-host-services.ts` -> `recordPluginMetric`
+    //     in `server/src/services/metrics.ts`). Both still happen; the counter
+    //     is the scraped path, ordered first because that is what an alert rule
+    //     depends on. So both series below are real, monotonic, scraped
+    //     counters today — which makes the PromQL at the end of this comment
+    //     executable rather than aspirational.
+    //   - Because a counter accumulates every write, a single duration-valued
+    //     series would become a monotonically climbing sum of hold ages:
+    //     non-zero forever after the first wedge, unable to distinguish "the
+    //     reclaim is broken" from "one wedge happened last month" — the only
+    //     question it exists to answer. Splitting the count from the summed age
+    //     keeps both recoverable under `rate()`.
+    //
+    // Both names clear the host's drop gates: each satisfies
+    // PLUGIN_METRIC_NAME_REGEX and sits under the name-length bound, and this
+    // plugin mints 21 static names (no interpolation) against a
+    // PLUGIN_METRIC_NAME_BUDGET of 50, so neither can collapse into the shared
+    // `_overflow` series. Both values are non-negative, so neither trips
+    // `bad_value`.
+    //
+    // NB: AC3 of BLO-32113 asks for a Prometheus *rule* on fence age. The
+    // series it needs are scrapeable from here; authoring and deploying the
+    // rule itself remains BLO-32163. Two things that rule's author needs which
+    // are not visible from the `metrics.write` calls below:
+    //
+    //   - `aggregate_key` and `phase` do NOT reach Prometheus. The host
+    //     promotes a tag to a label only if it is BOTH manifest-declared and
+    //     in PLUGIN_METRIC_PROMOTABLE_TAG_KEYS (`metrics.ts`); this plugin
+    //     declares `["alertname", "severity", "version"]` (`manifest.ts`) and
+    //     neither key is promotable in any case. So the scraped series is
+    //     dimensioned by `tag_alertname` only — promoted tags publish under the
+    //     host's `tag_` prefix (`pluginMetricTagLabel` =
+    //     PLUGIN_METRIC_TAG_LABEL_PREFIX + key, `metrics.ts`), and the counter's
+    //     label set is built through exactly that mapper, so a rule matching a
+    //     bare `alertname` hits the same empty-vector trap as the bare
+    //     `rate(age) / rate(count)` described below. AC3's "naming the
+    //     aggregate_key" has to come from the `plugin_logs` metric row or the
+    //     error thrown below — both carry the full tag set — not from the
+    //     rule's labels.
+    //   - Both series land on the SAME prom-client counter
+    //     (`paperclip_plugin_metric_total`), distinguished only by the `metric`
+    //     label. Prometheus matches binary operands on all labels by default,
+    //     so a bare `rate(age) / rate(count)` matches nothing and returns an
+    //     empty vector — no error, just a rule that can never fire, which is
+    //     the same invisible-failure class as the wedge itself. The division
+    //     needs an explicit `ignoring(metric)`:
+    //
+    //       rate(paperclip_plugin_metric_total{
+    //         metric="alertmanager.aggregate.fence_blocked"}[5m])
+    //       -> blocked deliveries/sec
+    //
+    //       rate(paperclip_plugin_metric_total{
+    //         metric="alertmanager.aggregate.fence_blocked_age_seconds"}[5m])
+    //         / ignoring(metric)
+    //       rate(paperclip_plugin_metric_total{
+    //         metric="alertmanager.aggregate.fence_blocked"}[5m])
+    //       -> mean hold age, seconds
+    //
+    // Past the backstop this should be self-clearing, so a sustained non-zero
+    // *rate* on the first series means the reclaim itself is not working.
+    const heldMs = firingClaim.heldMs ?? null;
+    const metricTags = {
+      alertname,
+      aggregate_key: aggregateKey,
+      phase: firingClaim.blockingPhase ?? "unknown",
+    };
+    try {
+      await ctx.metrics.write("alertmanager.aggregate.fence_blocked", 1, metricTags);
+      // Skipped rather than zero-filled when the age is unknown (the fence row
+      // vanished between the refused upsert and the read-back, which implies it
+      // was released). A zero would drag the mean down and misreport a wedge as
+      // brief; omitting it leaves the ratio honest, at the cost of one
+      // occurrence counted without an age.
+      if (heldMs !== null) {
+        await ctx.metrics.write(
+          "alertmanager.aggregate.fence_blocked_age_seconds",
+          Math.round(heldMs / 1000),
+          metricTags,
+        );
+      }
+    } catch (metricErr) {
+      ctx.logger.error(
+        `paperclip-plugin-alertmanager: failed to record blocked-fence metric for ${alert.fingerprint}: ${String(metricErr)}`,
+      );
+    }
     throw new Error(
       `Alertmanager aggregate ${aggregateKey} is held in phase ` +
         `'${firingClaim.blockingPhase ?? "unknown"}' by a delivery in progress; ` +
+        (heldMs === null ? "" : `held for ${Math.round(heldMs / 1000)}s; `) +
         `retrying firing delivery. A fence abandoned by a dead process is released ` +
-        `automatically by its slot's next worker; if this persists, the holder is ` +
-        `either live or in another slot, and an operator can release it via the ` +
-        `plugin's recover-aggregate-firing route.`,
+        `automatically by its slot's next worker, and any fence held past the ` +
+        `abandonment backstop is reclaimed by the next claim regardless of owner. ` +
+        `So this should clear on its own; if it persists past that backstop the ` +
+        `reclaim itself is failing, and an operator can force it via the plugin's ` +
+        `recover-aggregate-firing route.`,
     );
   }
   const firingToken = firingClaim.token;
@@ -1198,7 +1654,19 @@ export async function handleFiring(
           existing.paperclipIssueId,
           existing.paperclipCompanyId,
         );
-        decision = decideRefire(issue, existing, config, Date.now());
+        // BLO-24177: a terminal severity never consults `decideRefire`. That
+        // helper reads any `done`/`cancelled` row as an *operator* close
+        // (BLO-24234), which would mute this fingerprint for the suppression
+        // window and then re-open it as `todo` once the window expired —
+        // re-manufacturing exactly the agent-actionable row this exists to
+        // prevent. A terminal close is the plugin's own doing, not an
+        // operator's, so there is no operator intent to honour and no
+        // suppression anchor to bank.
+        decision = terminal
+          ? issue
+            ? { kind: "refresh" }
+            : { kind: "issue_missing" }
+          : decideRefire(issue, existing, config, Date.now());
 
         // Barrier before the first issue mutation. Placed *after* the reads
         // above so the window between proving ownership and acting on it holds
@@ -1207,7 +1675,27 @@ export async function handleFiring(
         // of them. The reads are unguarded on purpose — they mutate nothing.
         await assertFiringGeneration(ctx, companyId, aggregateKey, firingToken);
 
-        if (decision.kind === "reopen") {
+        if (terminal && issue) {
+          // Never agent-actionable, regardless of the row's prior status —
+          // route straight to `done` instead of reopening as `todo`, so
+          // stranded-issue recovery and orphan sweeps never see it as unowned
+          // work. Still touch the row on every re-fire (whether it is already
+          // terminal or not) so `updatedAt` keeps proving the in-cluster
+          // delivery leg accepts POSTs — the row stays live evidence, it just
+          // never becomes work.
+          await ctx.issues.update(
+            existing.paperclipIssueId,
+            {
+              ...(issue.status !== "done" ? { status: "done" as const } : {}),
+              description: newDescription,
+              assigneeAgentId: null,
+              assigneeUserId: null,
+            },
+            existing.paperclipCompanyId,
+            undefined,
+            { fencing: firingFence(companyId, aggregateKey, firingToken) },
+          );
+        } else if (decision.kind === "reopen") {
           if (decision.reason === "plugin_resolved") {
             // A different firing in this aggregate may already have created a
             // live winner while this fingerprint was resolved. Rebind to that
@@ -1355,6 +1843,11 @@ export async function handleFiring(
         ctx.logger.warn(
           `Failed to re-sync existing issue ${existing.paperclipIssueId} on re-fire: ${String(err)}`,
         );
+        // BLO-24177: for a terminal severity the re-sync IS the whole delivery
+        // — it is what keeps the row `done` and unassigned. Swallowing the
+        // failure here would acknowledge a delivery that left an
+        // agent-actionable row behind, so fail it and let Alertmanager retry.
+        if (terminal) throw err;
       }
 
       // Ladder restart keeps its original trigger — the alert going
@@ -1382,6 +1875,43 @@ export async function handleFiring(
           : decision.kind === "suppressed"
             ? decision.suppressedAt
             : null;
+      // BLO-31736: same rule, same reason, for the closure-authorship record.
+      // A firing delivery that applied a decision has observed the issue's
+      // status first-hand, so whatever close we had recorded is spent — we
+      // either re-opened the row or judged the close to be someone else's.
+      // Writing `null` there is what makes BLO-24234's suppression reachable
+      // on the *next* re-fire for an alert that has resolved before: a later
+      // hand-cancel of this row is then read as the operator close it is,
+      // rather than inheriting our stale authorship.
+      //
+      // `issue_missing` and a failed RPC learn nothing, so they must leave an
+      // explicit record alone. Clearing on those would let one transient
+      // `issues.get` failure convert our own close into an apparent operator
+      // close and mute a live recurring alert for a whole suppression window —
+      // the failure direction this ticket exists to remove, arriving from the
+      // other side.
+      //
+      // A row with no record (`undefined`: legacy, or an aggregate member that
+      // deferred its close to a sibling) has that same exposure one field
+      // over, because `closedByPlugin` falls back to `resolvedAt` for it — and
+      // `resolvedAt` is cleared unconditionally below. So carry the inference
+      // across as a recorded value instead of freezing the field it is read
+      // from: this writes exactly what `closedByPlugin` would have concluded
+      // from the row as it stood, and the next applied delivery replaces it.
+      const pluginClosureUpdate: Partial<Pick<AlertStateRecord, "pluginClosedAt">> =
+        !decisionApplied || decision.kind === "issue_missing"
+          ? existing.pluginClosedAt === undefined
+            ? { pluginClosedAt: existing.resolvedAt }
+            : {}
+          : { pluginClosedAt: null };
+      // `resolvedAt` is NOT under that rule. It means "the alert is currently
+      // cleared", which a firing delivery disproves whether or not its issue
+      // read succeeded — and the escalation sweep (`advanceIssueLadder` in
+      // escalation.ts) bails on a truthy `resolvedAt` before any rung.
+      // Preserving it on a not-applied delivery left an open, firing issue
+      // un-escalatable until the next delivery that did apply, i.e. one
+      // `repeat_interval` of paging nobody, with nothing logged. Hence the
+      // unconditional clear in the literal below.
 
       await upsertAggregateMember(
         ctx,
@@ -1394,11 +1924,17 @@ export async function handleFiring(
 
       const updated: AlertStateRecord = {
         ...tracked,
+        // BLO-24177: the row above was just forced unassigned, so the state
+        // record must agree — otherwise the next resolve/escalation read would
+        // wake an owner this severity is never allowed to have.
+        assigneeUserId: terminal ? null : tracked.assigneeUserId,
+        assigneeAgentId: terminal ? null : tracked.assigneeAgentId,
         aggregateKey,
         alertname,
         severity,
         lastFiredAt: nowIso,
         resolvedAt: null,
+        ...pluginClosureUpdate,
         operatorSuppressedAt: suppressionAnchor,
         nextEscalationAt: ladderRestart
           ? (() => {
@@ -1441,8 +1977,8 @@ export async function handleFiring(
           labels: alert.labels,
           annotations: alert.annotations,
           paperclipIssueId: tracked.paperclipIssueId,
-          assigneeUserId: tracked.assigneeUserId,
-          assigneeAgentId: tracked.assigneeAgentId ?? null,
+          assigneeUserId: updated.assigneeUserId,
+          assigneeAgentId: updated.assigneeAgentId ?? null,
           reFired: true,
         },
         { ownershipCheck: firingFence(companyId, aggregateKey, firingToken) },
@@ -1486,7 +2022,12 @@ export async function handleFiring(
   // First time we've seen this fingerprint — create a new issue. `companyId` is
   // already resolved and non-empty; it scoped the state read above.
   let retainedIssue = await findActiveAggregateIssue(ctx, companyId, aggregateKey);
-  const issueRouteResolution = resolveIssueRoute(alert, config.issueRouteMap);
+  // BLO-24177: a terminal-severity alert is never agent-actionable, so
+  // owner-map and issue-route resolution are skipped entirely rather than
+  // resolved and then discarded — no assignee or route should ever apply to it.
+  const issueRouteResolution = terminal
+    ? { route: null, source: null }
+    : resolveIssueRoute(alert, config.issueRouteMap);
   const issueRoute = issueRouteResolution.route;
   const routeAssigneeAgentId = nonEmptyString(issueRoute?.assigneeAgentId);
   const routeHasAssigneeUserId = Object.prototype.hasOwnProperty.call(
@@ -1500,7 +2041,7 @@ export async function handleFiring(
   let createAssigneeUserId: string | undefined;
   let assigneeResolutionSource = "aggregate-winner";
   let resolvedTarget = "(aggregate-winner)";
-  if (!retainedIssue) {
+  if (!retainedIssue && !terminal) {
     const { assigneeUserId, assigneeAgentId, resolution } =
       await resolveAssigneeUserId(ctx, alert, config.ownerMap);
     const ownerOverride =
@@ -1522,8 +2063,8 @@ export async function handleFiring(
         ? `agent:${resolution.agentId}`
         : resolution.email ?? "(none)";
   }
-  const fallbackAssigneeAgentId =
-    retainedIssue || createAssigneeAgentId || createAssigneeUserId
+  const fallbackResolution =
+    terminal || retainedIssue || createAssigneeAgentId || createAssigneeUserId
       ? undefined
       : await resolveFallbackAgentIdMemoized(
           ctx,
@@ -1531,26 +2072,67 @@ export async function handleFiring(
           config.fallbackAgentName,
           fallbackOwnerMemo,
         );
+  const fallbackAssigneeAgentId = fallbackResolution?.agentId;
   const finalAssigneeAgentId = createAssigneeAgentId ?? fallbackAssigneeAgentId;
-  if (!retainedIssue && !finalAssigneeAgentId && !createAssigneeUserId) {
+  // BLO-24177: the ownerless-creation refusal below exists to stop a real alert
+  // landing with nobody paged. A terminal severity is the one case where an
+  // ownerless row is the *intended* outcome, so it is exempt — without this the
+  // fallback-owner guard would throw on every Watchdog delivery and the
+  // heartbeat evidence row would never be created at all.
+  if (!terminal && !retainedIssue && !finalAssigneeAgentId && !createAssigneeUserId) {
+    // Only `terminated` / wrong-name / genuinely-ambiguous is unfixable by
+    // retrying. A `paused` or `pending_approval` fallback owner becomes
+    // invokable without anyone editing config, and Alertmanager's retry window
+    // is the only thing that lets the alert land within minutes of that rather
+    // than waiting out a whole `repeat_interval`. Absent a classification we
+    // take the transient branch: a needless retry burst is survivable, a
+    // wrongly-dropped alert is not.
+    const isPermanent = fallbackResolution?.refusal === "permanent";
     ctx.logger.warn(
-      `Cannot create issue for ${alertname}: fallbackAgentName is missing, invalid, or ambiguous`,
+      `Cannot create issue for ${alertname}: fallbackAgentName is missing, invalid, or ambiguous (${
+        isPermanent ? "permanent" : "transient"
+      })`,
     );
-    await ctx.metrics.write("alertmanager.owner.fallback_failed", 1, {
-      alertname,
-      severity,
-    });
-    throw new Error(
-      `Fallback owner resolution failed for ${alertname}; refusing ownerless issue creation`,
-    );
+    try {
+      // `refusal` splits the two outcomes this metric otherwise conflates: a
+      // permanent refusal is dropped at 200 and will not be retried, a
+      // transient one keeps Alertmanager's retry window. Without the label an
+      // operator has to join this series against
+      // `alertmanager.alert.permanent_error` to tell "gone until someone edits
+      // config" from "retrying, may still land". Two values, so no meaningful
+      // cardinality cost.
+      await ctx.metrics.write("alertmanager.owner.fallback_failed", 1, {
+        alertname,
+        severity,
+        refusal: isPermanent ? "permanent" : "transient",
+      });
+    } catch (metricErr) {
+      // Best-effort, matching the severity-floor and opt-out drops above. On the
+      // permanent branch this is load-bearing: letting a metrics outage throw
+      // would surface a *metrics* error instead of `PermanentAlertError`, the
+      // per-alert catch would push the fingerprint, and the delivery would 502
+      // — reinstating exactly the doomed retry burst this path removes, and
+      // taking the rest of the batch down with it.
+      ctx.logger.error(
+        `paperclip-plugin-alertmanager: failed to record fallback owner metric for ${alert.fingerprint}: ${String(metricErr)}`,
+      );
+    }
+    const message = `Fallback owner resolution failed for ${alertname}; refusing ownerless issue creation`;
+    throw isPermanent ? new PermanentAlertError(message) : new Error(message);
   }
   const routeProjectId = nonEmptyString(issueRoute?.projectId);
   const routeGoalId = nonEmptyString(issueRoute?.goalId);
   const routeStatus = issueRoute?.status;
+  // BLO-24177: terminal severities always create `done` — never left `todo`
+  // where stranded-issue recovery and orphan sweeps would eventually assign
+  // it, resuming exactly the loop this exists to break.
+  const createStatus = terminal ? "done" : routeStatus;
   const resolvedAssignee =
     finalAssigneeAgentId ?? createAssigneeUserId ?? "(no assignee)";
   ctx.logger.debug(
-    `Owner resolution for ${alertname}: ${assigneeResolutionSource} → ${resolvedTarget} → ${resolvedAssignee}`,
+    terminal
+      ? `Owner resolution for ${alertname}: skipped (terminal severity "${severity}", BLO-24177)`
+      : `Owner resolution for ${alertname}: ${assigneeResolutionSource} → ${resolvedTarget} → ${resolvedAssignee}`,
   );
   if (issueRouteResolution.source) {
     ctx.logger.debug(
@@ -1604,7 +2186,7 @@ export async function handleFiring(
           originFingerprint: aggregateKey,
           ...(routeProjectId ? { projectId: routeProjectId } : {}),
           ...(routeGoalId ? { goalId: routeGoalId } : {}),
-          ...(routeStatus ? { status: routeStatus } : {}),
+          ...(createStatus ? { status: createStatus } : {}),
           ...(createAssigneeUserId ? { assigneeUserId: createAssigneeUserId } : {}),
           ...(finalAssigneeAgentId ? { assigneeAgentId: finalAssigneeAgentId } : {}),
           ...(billingCode ? { billingCode } : {}),
@@ -1655,6 +2237,10 @@ export async function handleFiring(
     firstSeenAt: alert.startsAt || nowIso,
     lastFiredAt: nowIso,
     resolvedAt: null,
+    // BLO-31736: a freshly tracked fingerprint has no close of ours behind it.
+    // Explicit rather than `undefined` so a new row never enters the legacy
+    // `resolvedAt` authorship fallback.
+    pluginClosedAt: null,
     nextEscalationAt: (() => {
       const delay = escalationDeadlineMs(alert, config);
       return delay === null ? null : new Date(Date.now() + delay).toISOString();
@@ -1848,6 +2434,10 @@ export async function handleResolved(
   );
   let cancellationToken: string | null = null;
   let cancelWithheldForRunId: string | null = null;
+  // BLO-31736: authorship, recorded rather than inferred. Flipped only on the
+  // branch where our own `status: "cancelled"` patch actually landed, so the
+  // next re-fire can tell our close from an operator's.
+  let pluginCancelLanded = false;
 
   try {
     if (config.autoCloseOnResolve !== false) {
@@ -1897,6 +2487,7 @@ export async function handleResolved(
               },
               existing.paperclipCompanyId,
             );
+            pluginCancelLanded = true;
           } catch (err) {
             if (!isExecutionLockPreconditionFailure(err)) throw err;
             // The diagnostic read before update is racy. Re-read after the
@@ -1951,11 +2542,45 @@ export async function handleResolved(
       aggregateResolution.issueId,
     );
 
+    // BLO-31736: authorship is a property of the *issue*, but this record is
+    // keyed by fingerprint — and in a multi-member aggregate those are not the
+    // same thing, because every member points at one shared issue. Three cases:
+    //
+    //  - **Our cancel landed** → stamp it. This delivery closed the issue.
+    //  - **We deferred the close to a sibling** (`has-unresolved-siblings`):
+    //    this delivery decided nothing, so the `null` our own *firing* write
+    //    planted is now a false assertion. The last member to resolve will
+    //    close the shared issue on this member's behalf and cannot reach back
+    //    to correct this row, so leaving `null` made every non-last member read
+    //    its own aggregate's close as an operator close and suppress the next
+    //    genuine recurrence — the muting direction this ticket exists to
+    //    remove. Drop to `undefined` ("authorship unknown"), which falls back
+    //    to `resolvedAt` exactly as a legacy row does: a spurious re-open is
+    //    the cheap error, silence is the expensive one.
+    //  - **Anything else** — the terminal guard declining to overwrite someone
+    //    else's close, a withheld cancel, a missing membership,
+    //    `autoCloseOnResolve` off — leaves the previous value untouched via the
+    //    spread, because this delivery learned nothing new about who closed the
+    //    row. Overwriting would break the recurrence contract on a repeated
+    //    `resolved` notification: Alertmanager may re-deliver one, the guard
+    //    would hold (we already cancelled it), and clearing the flag would then
+    //    mute the next real re-fire.
+    const closeDeferredToSibling =
+      config.autoCloseOnResolve !== false &&
+      aggregateResolution.disposition === "has-unresolved-siblings";
+    const pluginClosureUpdate: Partial<Pick<AlertStateRecord, "pluginClosedAt">> =
+      pluginCancelLanded
+        ? { pluginClosedAt: resolvedAt }
+        : closeDeferredToSibling
+          ? { pluginClosedAt: undefined }
+          : {};
+
     const updated: AlertStateRecord = {
       ...existing,
       aggregateKey,
       paperclipIssueId: aggregateResolution.issueId,
       resolvedAt,
+      ...pluginClosureUpdate,
       nextEscalationAt: null,
       escalationComplete: true,
       cancelWithheldForRunId,
@@ -1995,6 +2620,7 @@ async function recoverStateFromIssue(
   ctx: PluginContext,
   config: AlertmanagerPluginConfig,
   alert: AlertmanagerAlert,
+  includeTerminalIssue = false,
 ): Promise<AlertStateRecord | null> {
   const companyId = config.defaultCompanyId;
   if (!companyId) return null;
@@ -2011,7 +2637,17 @@ async function recoverStateFromIssue(
   // let that historical row mask the aggregate membership fallback: state
   // loss must recover the live aggregate binding, not conclude that the alert
   // is unknown merely because its first origin match is terminal.
-  if (!issue || issue.status === "done" || issue.status === "cancelled") {
+  //
+  // `includeTerminalIssue` is the one deliberate exception (BLO-24177). For a
+  // terminal severity that ambiguity does not exist: the plugin closes those
+  // rows itself on every delivery and never leaves them open, so a closed row
+  // cannot encode an operator's intent to mute. Falling through would mint a
+  // second permanent evidence row per state loss, so it adopts instead.
+  if (
+    !issue ||
+    (!includeTerminalIssue &&
+      (issue.status === "done" || issue.status === "cancelled"))
+  ) {
     return recoverStateFromAggregateMember(ctx, config, alert);
   }
 
@@ -2036,6 +2672,11 @@ function buildRecoveredStateRecord(
     firstSeenAt: alert.startsAt || new Date().toISOString(),
     lastFiredAt: alert.startsAt || new Date().toISOString(),
     resolvedAt: null,
+    // BLO-31736: reconstructed rows are built only from a *non-terminal* issue
+    // (both callers reject `done`/`cancelled` before getting here), so no close
+    // of ours can be outstanding. Explicit rather than `undefined` so a
+    // reconstructed row does not enter the legacy authorship fallback.
+    pluginClosedAt: null,
     // BLO-20467: arm the ladder on the recovered record. The firing path now
     // adopts this when state was lost, and the re-fire branch carries these
     // fields through unchanged for a still-firing alert — so leaving them unset
@@ -2080,6 +2721,7 @@ export async function handleWebhook(
   config: AlertmanagerPluginConfig,
   authenticated: boolean,
   input: PluginWebhookInput,
+  fenceWaitPolicy?: Partial<AggregateFenceWaitPolicy>,
 ): Promise<void> {
   if (input.endpointKey !== WEBHOOK_KEYS.alertmanager) {
     ctx.logger.warn(
@@ -2120,6 +2762,10 @@ export async function handleWebhook(
   // matters: without it, every ownerless alert in the batch repeats the same
   // company-wide agent lookup.
   const fallbackOwnerMemo: FallbackOwnerMemo = new Map();
+  // Same scope, same reason — see AggregateFenceWedgedMemo. Bounds the fence
+  // wait at one budget per aggregate key per delivery instead of one per alert,
+  // so a wedged fence stays O(1) in batch size on the failure path.
+  const fenceWedgedMemo: AggregateFenceWedgedMemo = new Set();
 
   for (const alert of body.alerts) {
     if (!alertMatchesLabelFilter(alert, config.acceptOnlyLabels)) {
@@ -2182,7 +2828,14 @@ export async function handleWebhook(
           }
           continue;
         }
-        await handleFiring(ctx, config, alert, fallbackOwnerMemo);
+        await handleFiring(
+          ctx,
+          config,
+          alert,
+          fallbackOwnerMemo,
+          fenceWaitPolicy,
+          fenceWedgedMemo,
+        );
       } else if (status === "resolved") {
         // Reached with BOTH policy gates above deliberately bypassed — this
         // path is creation-only, exactly like the severity floor in
@@ -2227,17 +2880,44 @@ export async function handleWebhook(
       // so Alertmanager stopped retrying and the alert was destroyed with no
       // durable issue or state row — the same silent-loss class as the outage
       // this plugin already suffered (BLO-20467).
+      //
+      // `PermanentAlertError` is the one documented exception to that taxonomy:
+      // a config/roster fault no retry can fix, so it takes the same "log + 200"
+      // route as the malformed payload above instead of the transient-retry
+      // route. Retrying it burns Alertmanager's 15-17 attempts, drops the
+      // delivery anyway, and storms the failure metric that transient faults
+      // need to stay legible. See the class doc (PEN-2581).
+      const permanent = err instanceof PermanentAlertError;
       ctx.logger.error(
-        `paperclip-plugin-alertmanager: error processing alert ${alert.fingerprint}: ${String(err)}`,
+        permanent
+          ? `paperclip-plugin-alertmanager: permanently dropping alert ${alert.fingerprint}: ${String(err)} — no retry can resolve this, so the delivery is not failed`
+          : `paperclip-plugin-alertmanager: error processing alert ${alert.fingerprint}: ${String(err)}`,
       );
-      failedFingerprints.push(alert.fingerprint);
+      if (!permanent) {
+        failedFingerprints.push(alert.fingerprint);
+      }
       try {
-        await ctx.metrics.write("alertmanager.alert.error", 1, {
-          alertname: alert.labels.alertname ?? "unknown",
-        });
+        // `severity` is carried on both branches for the same reason the
+        // `refusal` label exists on `alertmanager.owner.fallback_failed`:
+        // without it, "did we drop a critical?" needs a join against another
+        // series. It matters most on the permanent branch — that drop returns
+        // 200, so it is by design invisible in Alertmanager's own failure
+        // metrics and this series is the entire detection surface for it.
+        await ctx.metrics.write(
+          permanent
+            ? "alertmanager.alert.permanent_error"
+            : "alertmanager.alert.error",
+          1,
+          {
+            alertname: alert.labels.alertname ?? "unknown",
+            severity: alert.labels.severity ?? "unknown",
+          },
+        );
       } catch (metricErr) {
         // Telemetry is best-effort; a metrics outage must not be the thing that
-        // aborts the remaining alerts. The delivery already counts as failed.
+        // aborts the remaining alerts. The delivery's outcome is already
+        // decided either way — failed for a transient fault, 200 for a
+        // permanent one.
         ctx.logger.error(
           `paperclip-plugin-alertmanager: failed to record alert error metric for ${alert.fingerprint}: ${String(metricErr)}`,
         );

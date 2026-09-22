@@ -9,7 +9,11 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { prepareClaudePromptBundle } from "./prompt-cache.js";
+import {
+  ClaudeSkillSourceUnavailableError,
+  prepareClaudePromptBundle,
+  readCatalogBackedSkillKeys,
+} from "./prompt-cache.js";
 import {
   parseClaudeStreamJson,
   describeClaudeFailure,
@@ -34,6 +38,10 @@ const POLL_INTERVAL_MS = 2000;
 const KEEPALIVE_INTERVAL_MS = 15_000;
 const K8S_CONCURRENCY_GUARD_TIMEOUT_MS = 15_000;
 const RUN_ID_LABEL = "paperclip.io/run-id";
+const MANAGED_BY_LABEL = "app.kubernetes.io/managed-by";
+const MANAGED_BY_VALUE = "paperclip";
+const ADAPTER_TYPE_LABEL = "paperclip.io/adapter-type";
+const ADAPTER_TYPE_VALUE = "claude_k8s";
 const ISOLATION_MODE_LABEL = "paperclip.io/isolation-mode";
 const ISOLATION_KEY_LABEL = "paperclip.io/isolation-key";
 const TASK_KEY_LABEL = "paperclip.io/task-key";
@@ -539,6 +547,246 @@ export function isK8s404(err: unknown): boolean {
 }
 
 /**
+ * Returns true for a Kubernetes 409 (`AlreadyExists` on a create).
+ *
+ * Mirrors isK8s404's shape, with one addition and one caveat, both measured
+ * against the installed @kubernetes/client-node (1.4.0) rather than assumed.
+ *
+ * `ApiException` is constructed as `super("HTTP-Code: " + code + ...)` and
+ * then sets **only** `this.code` — `statusCode` and `response` are both
+ * `undefined`.  So:
+ *
+ *   - `err.code` is the reliable structured signal, and isK8s404 does not
+ *     check it; that predicate works today purely on its message regex.
+ *     Checking `code` here is the more robust half, not the fallback.
+ *   - The `HTTP-Code:` probe is kept for symmetry with isK8s404 and to cover
+ *     an error re-thrown as a plain Error carrying only the message text.
+ *     It is redundant for a genuine ApiException, deliberately.
+ */
+export function isK8s409(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const e = err as unknown as Record<string, unknown>;
+  const resp = e.response as Record<string, unknown> | undefined;
+  if (resp?.statusCode === 409 || resp?.status === 409) return true;
+  if (e.statusCode === 409 || e.code === 409) return true;
+  return /HTTP-Code:\s*409\b/.test(err.message);
+}
+
+type SecretDisposition = "created" | "adopted" | "recreated";
+
+/**
+ * Log verb per disposition.  Deliberately three distinct words: "Replaced" and
+ * "Recreated" are operationally different events — a leftover that was still
+ * there and got overwritten, versus one that vanished under us so the name had
+ * to be retaken — and which of the two occurred is exactly what you want to
+ * know when triaging the next occurrence.
+ */
+const SECRET_DISPOSITION_VERB = {
+  created: "Created",
+  adopted: "Replaced",
+  recreated: "Recreated",
+} as const satisfies Record<SecretDisposition, string>;
+
+/**
+ * Create one of the run-scoped Secrets (prompt / env / mcp-config), adopting
+ * an existing object instead of failing when the name is already taken.
+ *
+ * Why adopting is safe here.  Every one of these names is
+ * `${jobName}-{prompt,env,mcp}` where
+ * `jobName = ac-<agentSlug>-<runSlug>-<shortHash(agentId:runId)>`
+ * (job-manifest.ts).  The name therefore *encodes* the run identity, so a
+ * collision on the full name is a collision with this same (agentId, runId) —
+ * i.e. a leftover from an earlier attempt of this very run — and the contents
+ * are re-derived from the same config, so replacing is idempotent.  Before
+ * BLO-31665 every throw here was fatal, so a benign leftover killed the run.
+ *
+ * The obvious worry about replace-on-collision is yanking a Secret out from
+ * under a pod that is still mounting it.  The concurrency guard above
+ * (`k8s_concurrent_run_blocked`) removes most of that: it lists this agent's
+ * Jobs and returns *before* buildJobManifest.  It does not remove all of it —
+ * that filter counts a Job as running only when it carries no
+ * `deletionTimestamp` and no Complete/Failed condition, so a Job mid-deletion
+ * whose pod is still terminating passes the guard.  What closes the residual
+ * window is the consumption model, not the guard: the env Secret is read via
+ * `secretKeyRef` at container start, so a later replace cannot reach an
+ * already-running container, and the prompt/mcp Secrets are volume-mounted but
+ * re-derived byte-identically for the same (agentId, runId).
+ *
+ * The identity check fails closed only on *positive contradiction*: a Secret
+ * whose labels actively disagree with this run is never overwritten.  Missing
+ * labels are tolerated, because a Secret written by an older adapter build is
+ * still one this run must be able to reclaim — a gate that requires labels to
+ * be present would refuse to adopt precisely the objects that need adopting.
+ *
+ * Note the label vocabulary differs from the sandbox-provider sibling
+ * (`app.kubernetes.io/managed-by: paperclip` here vs
+ * `paperclip.io/managed-by: paperclip-k8s-plugin` there); a verbatim copy of
+ * that gate would reject every Secret this adapter writes.
+ *
+ * @returns how the Secret came to exist, for logging.
+ */
+export async function createOrAdoptRunSecret(
+  coreApi: k8s.CoreV1Api,
+  input: { name: string; namespace: string; runId: string; data: Record<string, string> },
+): Promise<SecretDisposition> {
+  const body: k8s.V1Secret = {
+    apiVersion: "v1",
+    kind: "Secret",
+    metadata: {
+      name: input.name,
+      namespace: input.namespace,
+      labels: {
+        [MANAGED_BY_LABEL]: MANAGED_BY_VALUE,
+        [ADAPTER_TYPE_LABEL]: ADAPTER_TYPE_VALUE,
+        [RUN_ID_LABEL]: input.runId,
+      },
+    },
+    stringData: input.data,
+  };
+
+  // At most two passes.  The second exists only for the read-404 case below,
+  // where the name was freed under us and the create is worth exactly one
+  // retry; bounding it here rather than recursing keeps the "give up" path
+  // explicit and makes an infinite create/delete duel impossible.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await coreApi.createNamespacedSecret({ namespace: input.namespace, body });
+      return attempt === 0 ? "created" : "recreated";
+    } catch (err) {
+      if (!isK8s409(err)) throw err;
+
+      let existing: k8s.V1Secret;
+      try {
+        existing = await coreApi.readNamespacedSecret({ namespace: input.namespace, name: input.name });
+      } catch (readErr) {
+        if (!isK8s404(readErr)) {
+          throw new Error(
+            `Secret ${input.namespace}/${input.name} already exists and could not be read`,
+            { cause: readErr },
+          );
+        }
+        // Create said "exists", read said "gone": a cleanup delete landed in
+        // between (the adapter's own finally-block reaper races a retry).  The
+        // name is free again, so the correct move is to take it — not to
+        // resurface the stale 409, which is what the sandbox-provider sibling
+        // does and is a live way to fail a run that had nothing wrong with it.
+        if (attempt === 0) continue;
+        // Twice in a row means something is actively churning this name.
+        // Surface the original 409 rather than spinning.
+        throw err;
+      }
+
+      const labels = existing.metadata?.labels ?? {};
+      const existingRunId = labels[RUN_ID_LABEL];
+      if (existingRunId !== undefined && existingRunId !== input.runId) {
+        throw new Error(
+          `Secret ${input.namespace}/${input.name} already exists and belongs to run ${existingRunId}, not ${input.runId}`,
+        );
+      }
+      const existingManagedBy = labels[MANAGED_BY_LABEL];
+      if (existingManagedBy !== undefined && existingManagedBy !== MANAGED_BY_VALUE) {
+        throw new Error(
+          `Secret ${input.namespace}/${input.name} already exists and is managed by ${existingManagedBy}, not ${MANAGED_BY_VALUE}`,
+        );
+      }
+
+      await coreApi.replaceNamespacedSecret({
+        namespace: input.namespace,
+        name: input.name,
+        body: { ...body, metadata: { ...body.metadata, resourceVersion: existing.metadata?.resourceVersion } },
+      });
+      return "adopted";
+    }
+  }
+}
+
+export type JobAdoptionVerdict =
+  | { adopt: true; jobUid: string }
+  | { adopt: false; reason: string };
+
+/**
+ * Decide whether a `createNamespacedJob` 409 is this run reattaching to its own
+ * still-live Job, or a genuine collision that must stay fatal.
+ *
+ * Why this exists (BLO-27155).  When the worker process restarts, in-flight
+ * runs are re-executed from their persisted reservation, which carries the Job
+ * identity (`ctx.externalRuntime`).  The Job name is deterministic per
+ * (agentId, runId), so that re-execution's create *always* collides with the
+ * run's own live Job.  The 409 was fatal — and, worse, the failure path deleted
+ * the three run Secrets, which are mounted into the live pod.  So a worker
+ * restart did not merely fail the run: it dismantled a still-running Job's
+ * inputs, converting a recoverable stall into lost work.  Adopting is what
+ * turns that into the reattach the reservation already expects.
+ *
+ * Why this gate is stricter than `createOrAdoptRunSecret`'s.  That one tolerates
+ * missing labels, because a Secret written by an older adapter build must still
+ * be reclaimable and its name already encodes the run identity.  Here something
+ * far stronger is available — a server-assigned UID persisted at launch — so
+ * there is no need to infer identity from a name.  Every condition below is
+ * therefore *required*, not merely "not contradicted":
+ *
+ *   - no persisted identity => refuse.  Without it, "our own live Job" and "a
+ *     same-named Job from an earlier attempt" are indistinguishable, and they
+ *     want opposite handling.
+ *   - UID mismatch          => refuse.  This is the BLO-17291 AC-3 guarantee:
+ *     a same-name object that is not this exact object is never touched.
+ *   - name mismatch         => refuse.  Cross-checked against the reservation
+ *     because the two genuinely can disagree — an adapter-type change
+ *     re-prefixes the Job name while the reservation holds the old one
+ *     (BLO-28865).
+ *   - run-id label mismatch => refuse.  Compared against the *sanitized* runId,
+ *     because that is what job-manifest.ts writes.  An unlabelled Job is
+ *     already fatal to the concurrency guard above and stays fatal here.
+ *
+ * Pure, so the fail-closed matrix is testable without a cluster; the caller
+ * does the I/O.
+ */
+export function jobAdoptionVerdict(
+  existing: k8s.V1Job | null | undefined,
+  expected: {
+    jobName: string;
+    runId: string;
+    identity: { jobName?: string | null; jobUid?: string | null } | null | undefined;
+  },
+): JobAdoptionVerdict {
+  const persistedName = expected.identity?.jobName;
+  const persistedUid = expected.identity?.jobUid;
+  if (!persistedName || !persistedUid) {
+    return { adopt: false, reason: "run has no persisted external-runtime Job identity" };
+  }
+  if (persistedName !== expected.jobName) {
+    return {
+      adopt: false,
+      reason: `reservation holds Job name ${persistedName}, but this execution builds ${expected.jobName}`,
+    };
+  }
+  const meta = existing?.metadata;
+  if (!meta?.uid) {
+    return { adopt: false, reason: "existing Job could not be read, or carries no UID" };
+  }
+  if (meta.name !== expected.jobName) {
+    return { adopt: false, reason: `existing Job is named ${meta.name}, not ${expected.jobName}` };
+  }
+  if (meta.uid !== persistedUid) {
+    return {
+      adopt: false,
+      reason: `existing Job UID ${meta.uid} is not this run's launched UID ${persistedUid}`,
+    };
+  }
+  const expectedRunIdLabel = sanitizeLabelValue(expected.runId);
+  const actualRunIdLabel = meta.labels?.[RUN_ID_LABEL];
+  if (!expectedRunIdLabel || actualRunIdLabel !== expectedRunIdLabel) {
+    return {
+      adopt: false,
+      reason:
+        `existing Job ${RUN_ID_LABEL}=${actualRunIdLabel ?? "<none>"} `
+        + `does not match run ${expectedRunIdLabel ?? "<unlabelable>"}`,
+    };
+  }
+  return { adopt: true, jobUid: meta.uid };
+}
+
+/**
  * Returns true when the heartbeat-run status indicates the run was explicitly
  * cancelled and the K8s Job must be torn down.
  *
@@ -805,13 +1053,82 @@ export function describePodTerminatedError(
   return `Pod ${podName} reached phase=${phase}`;
 }
 
+// Labels the Job controller stamps on every pod it creates. `controller-uid`
+// is the legacy key (every supported release); the `batch.kubernetes.io/`
+// prefixed key was added in 1.27. Both carry the owning Job's metadata.uid.
+const JOB_CONTROLLER_UID_LABELS = ["batch.kubernetes.io/controller-uid", "controller-uid"] as const;
+
+/**
+ * Pick, from a `job-name=<jobName>` pod listing, the pod owned by THIS
+ * execution's Job — identified by the server-assigned UID returned from
+ * `createNamespacedJob` (or the adopted Job's UID).
+ *
+ * Why this exists (BLO-34577). The Job name is deterministic per
+ * (agentId, runId) — see job-manifest.ts — and the server's in-run ccrotate
+ * throttle loop re-invokes `execute()` for the SAME runId after a 429, so the
+ * replacement Job gets the same name as the attempt that just returned. That
+ * previous Job was deleted with `propagationPolicy: Background`, which removes
+ * the Job object immediately but garbage-collects its pod asynchronously. For
+ * a window after the replacement Job is created, `job-name=<name>` therefore
+ * matches BOTH the stale pod (phase=Failed, `claude exited 1` from the 429)
+ * and — once the controller creates it — the new one. Taking `items[0]` read
+ * the stale pod ~100 ms after create and reported the prior attempt's terminal
+ * state as this attempt's `k8s_pod_schedule_failed`, a code the server treats
+ * as non-retryable; the review was dropped.
+ *
+ * Ownership is read from `metadata.ownerReferences` (controller: Job, matching
+ * uid) with the controller-uid labels as the fallback. A pod carrying neither
+ * is not provably ours and is not selected — fail closed, since selecting the
+ * wrong pod is exactly the bug. Pure so the matrix is testable without a
+ * cluster.
+ */
+export function selectJobOwnedPod(
+  pods: readonly k8s.V1Pod[],
+  jobUid: string,
+): { owned: k8s.V1Pod | null; stale: k8s.V1Pod[] } {
+  let owned: k8s.V1Pod | null = null;
+  const stale: k8s.V1Pod[] = [];
+  for (const pod of pods) {
+    const meta = pod.metadata;
+    const ownerMatch = (meta?.ownerReferences ?? []).some(
+      (ref) => ref.kind === "Job" && ref.uid === jobUid,
+    );
+    const labelMatch = JOB_CONTROLLER_UID_LABELS.some((key) => meta?.labels?.[key] === jobUid);
+    if (ownerMatch || labelMatch) {
+      // The Job controller runs exactly one pod per attempt for this manifest
+      // (parallelism 1, no restart of a Failed pod is ours to wait on here);
+      // keep the first owned pod and let the caller's phase logic judge it.
+      if (!owned) owned = pod;
+      continue;
+    }
+    stale.push(pod);
+  }
+  return { owned, stale };
+}
+
+function describeStalePods(stale: readonly k8s.V1Pod[]): string {
+  return stale
+    .map((pod) => {
+      const name = pod.metadata?.name ?? "unknown";
+      const owner = pod.metadata?.ownerReferences?.find((ref) => ref.kind === "Job")?.uid
+        ?? JOB_CONTROLLER_UID_LABELS.map((key) => pod.metadata?.labels?.[key]).find(Boolean)
+        ?? "<no owner>";
+      return `${name} (owner uid ${owner}, phase=${pod.status?.phase ?? "Unknown"})`;
+    })
+    .join(", ");
+}
+
 /**
  * Wait for the Job's pod to reach a terminal or running state.
  * Returns the pod name once logs can be streamed, or throws on failure.
+ *
+ * `jobUid` scopes the lookup to the Job this execution created or adopted;
+ * same-name pods from an earlier attempt are ignored (see selectJobOwnedPod).
  */
 async function waitForPod(
   namespace: string,
   jobName: string,
+  jobUid: string,
   scheduleTimeoutMs: number,
   startTimeoutMs: number,
   onLog: AdapterExecutionContext["onLog"],
@@ -826,12 +1143,21 @@ async function waitForPod(
   let lastStatus = "";
   let lastStatusDetails = "no pod observed yet";
   let startDeadline = 0;
+  let staleLogged = false;
   while (true) {
     const podList = await coreApi.listNamespacedPod({
       namespace,
       labelSelector,
     });
-    const pod = podList.items[0];
+    const { owned: pod, stale } = selectJobOwnedPod(podList.items, jobUid);
+    if (stale.length > 0 && !staleLogged) {
+      staleLogged = true;
+      await onLog(
+        "stdout",
+        `[paperclip] Ignoring ${stale.length} pod(s) named for Job ${jobName} but not owned by this Job (uid ${jobUid}); `
+          + `they belong to an earlier attempt still being garbage-collected: ${describeStalePods(stale)}\n`,
+      );
+    }
 
     if (!pod) {
       if (Date.now() >= scheduleDeadline) {
@@ -999,8 +1325,13 @@ async function waitForJobCompletion(
 /**
  * Get the exit code from the Job's pod.
  */
-async function getPodExitCode(namespace: string, jobName: string, kubeconfigPath?: string): Promise<number | null> {
-  const state = await getPodTerminatedState(namespace, jobName, kubeconfigPath);
+async function getPodExitCode(
+  namespace: string,
+  jobName: string,
+  jobUid: string,
+  kubeconfigPath?: string,
+): Promise<number | null> {
+  const state = await getPodTerminatedState(namespace, jobName, jobUid, kubeconfigPath);
   return state?.exitCode ?? null;
 }
 
@@ -1030,6 +1361,7 @@ export interface PodLookupResult {
 async function lookupPodState(
   namespace: string,
   jobName: string,
+  jobUid: string,
   kubeconfigPath?: string,
 ): Promise<PodLookupResult> {
   const coreApi = getCoreApi(kubeconfigPath);
@@ -1037,7 +1369,9 @@ async function lookupPodState(
     namespace,
     labelSelector: `job-name=${jobName}`,
   });
-  const pod = podList.items[0];
+  // Same ownership scoping as waitForPod: a same-name pod from an earlier
+  // attempt must not be read as this attempt's terminal state (BLO-34577).
+  const { owned: pod } = selectJobOwnedPod(podList.items, jobUid);
   if (!pod) return { state: null, phase: null, podMissing: true };
 
   const phase = pod.status?.phase ?? null;
@@ -1066,13 +1400,14 @@ async function lookupPodState(
 async function getPodLookupWithRetry(
   namespace: string,
   jobName: string,
+  jobUid: string,
   kubeconfigPath?: string,
   attempts = 4,
   delayMs = 500,
 ): Promise<PodLookupResult> {
   let last: PodLookupResult = { state: null, phase: null, podMissing: true };
   for (let i = 0; i < attempts; i++) {
-    last = await lookupPodState(namespace, jobName, kubeconfigPath);
+    last = await lookupPodState(namespace, jobName, jobUid, kubeconfigPath);
     if (last.state) return last;
     if (last.podMissing) return last;
     // Pod exists but no terminated state.  If it is in a terminal phase the
@@ -1087,9 +1422,10 @@ async function getPodLookupWithRetry(
 async function getPodTerminatedState(
   namespace: string,
   jobName: string,
+  jobUid: string,
   kubeconfigPath?: string,
 ): Promise<PodTerminatedState | null> {
-  return (await lookupPodState(namespace, jobName, kubeconfigPath)).state;
+  return (await lookupPodState(namespace, jobName, jobUid, kubeconfigPath)).state;
 }
 
 /**
@@ -1265,6 +1601,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const coreApi = getCoreApi(kubeconfigPath);
   const batchApi = getBatchApi(kubeconfigPath);
 
+  // UID of the Job this execution created or adopted, bound once the launch
+  // identity is acknowledged. Every pod lookup below is scoped to it (BLO-34577).
+  let jobUid: string;
   try {
   const selfPod = await getSelfPodInfo(kubeconfigPath);
   const guardNamespace = asString(config.namespace, "") || selfPod.namespace;
@@ -1408,6 +1747,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const skillEntries = await readPaperclipRuntimeSkillEntries(config, import.meta.dirname ?? __dirname);
   const desiredSkillNames = new Set(resolvePaperclipDesiredSkillNames(config, skillEntries));
   const desiredSkills = skillEntries.filter((e) => desiredSkillNames.has(e.key));
+  // BLO-32055: which of these came from a company-skill catalog row, which is
+  // the discriminator between a transient materialization race and a permanent
+  // config fault. `readPaperclipRuntimeSkillEntries` returns EITHER the
+  // server-injected `paperclipRuntimeSkills` (resolved by `listRuntimeSkillEntries`
+  // from catalog rows, and the only ones the rolling sweep rewrites) OR, when that
+  // is empty, the adapter's own bundled on-disk skills. A missing file under the
+  // latter is a packaging fault in a read-only image path — permanent, and it must
+  // not be retried as though a sweep were about to finish writing it.
+  const catalogBackedSkillKeys = readCatalogBackedSkillKeys(config);
   const skillSummary = desiredSkills.length > 0 ? desiredSkills.map((s) => s.runtimeName ?? s.key).join(", ") : "none";
   await onLog("stdout", `[paperclip] Skills bundled (${desiredSkills.length}): ${skillSummary}\n`);
   const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
@@ -1429,13 +1777,54 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       );
     }
   }
-  const promptBundle = await prepareClaudePromptBundle({
-    companyId: ctx.agent.companyId,
-    skills: desiredSkills,
-    instructionsContents,
-    rootDir: resolvePromptCacheRoot(config, effectiveCtx, jobIsolation),
-    onLog,
-  });
+  let promptBundle: Awaited<ReturnType<typeof prepareClaudePromptBundle>>;
+  try {
+    promptBundle = await prepareClaudePromptBundle({
+      companyId: ctx.agent.companyId,
+      skills: desiredSkills,
+      instructionsContents,
+      rootDir: resolvePromptCacheRoot(config, effectiveCtx, jobIsolation),
+      catalogBackedSkillKeys,
+      onLog,
+    });
+  } catch (err) {
+    // BLO-32055. This throw happens before the Claude CLI is spawned, so there is
+    // no stdout, no result event and no `parsed` — every BLO-7991 AC3 classifier
+    // in parse.ts reads a Claude-CLI-authored surface and is structurally unable
+    // to see it. Untyped, it fell through to the anonymous `adapter_failed`,
+    // which reports an agent-pool/adapter fault for what is actually a skill
+    // configuration fault and hides it from skill-health sweeps.
+    //
+    // Classified on the source of truth (which skill owns the path), never on
+    // the message text: nothing here scans transcript or model output, so the
+    // BLO-31794 false-positive hazard — a run that merely *discusses* a missing
+    // skill — cannot reach this branch.
+    if (!(err instanceof ClaudeSkillSourceUnavailableError)) throw err;
+    await onLog(
+      "stderr",
+      `[paperclip] ${err.message} (source: ${err.skillSource})\n`,
+    );
+    return {
+      exitCode: null,
+      signal: null,
+      timedOut: false,
+      errorMessage: err.message,
+      // A catalog row exists => the sweep is mid-refresh and the tree completes
+      // on its own, so this must stay retryable: `skill_materialization_pending`
+      // is a member of TRANSIENT_INFRA_CONTINUATION_ERROR_CODES (the set that
+      // already held `adapter_failed`, so retryability is preserved exactly, not
+      // widened). Like `adapter_failed` it is also absent from
+      // ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES, so it is NOT escalated as a
+      // structural startup wedge — a self-healing race is the opposite of one.
+      // It is separately not the DETERMINISTIC_SKILL_FAILURE_ERROR_CODE; that
+      // non-membership does not imply zero-token eligibility, which is an
+      // independent test.
+      //
+      // No catalog row => a genuine, permanent configuration fault, which keeps
+      // the existing non-retryable `skill_not_found`.
+      errorCode: err.catalogBacked ? "skill_materialization_pending" : "skill_not_found",
+    };
+  }
 
   // Build Job manifest
     const built = buildJobManifest({ ctx: effectiveCtx, selfPod, promptBundle });
@@ -1478,24 +1867,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // PodSpec limit).  The Secret is cleaned up in the finally block.
     if (promptSecret) {
       try {
-        await coreApi.createNamespacedSecret({
+        const disposition = await createOrAdoptRunSecret(coreApi, {
+          name: promptSecret.name,
           namespace: promptSecret.namespace,
-          body: {
-            apiVersion: "v1",
-            kind: "Secret",
-            metadata: {
-              name: promptSecret.name,
-              namespace: promptSecret.namespace,
-              labels: {
-                "app.kubernetes.io/managed-by": "paperclip",
-                "paperclip.io/adapter-type": "claude_k8s",
-                "paperclip.io/run-id": runId,
-              },
-            },
-            stringData: promptSecret.data,
-          },
+          runId,
+          data: promptSecret.data,
         });
-        await onLog("stdout", `[paperclip] Created prompt Secret: ${promptSecret.name} (${Math.round(Buffer.byteLength(prompt, "utf-8") / 1024)} KiB)\n`);
+        await onLog("stdout", `[paperclip] ${SECRET_DISPOSITION_VERB[disposition]} prompt Secret: ${promptSecret.name} (${Math.round(Buffer.byteLength(prompt, "utf-8") / 1024)} KiB)\n`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         await onLog("stderr", `[paperclip] Failed to create prompt Secret: ${msg}\n`);
@@ -1515,24 +1893,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // clean it up in the finally block. Never log envSecret.data (values).
     if (envSecret) {
       try {
-        await coreApi.createNamespacedSecret({
+        const disposition = await createOrAdoptRunSecret(coreApi, {
+          name: envSecret.name,
           namespace: envSecret.namespace,
-          body: {
-            apiVersion: "v1",
-            kind: "Secret",
-            metadata: {
-              name: envSecret.name,
-              namespace: envSecret.namespace,
-              labels: {
-                "app.kubernetes.io/managed-by": "paperclip",
-                "paperclip.io/adapter-type": "claude_k8s",
-                "paperclip.io/run-id": runId,
-              },
-            },
-            stringData: envSecret.data,
-          },
+          runId,
+          data: envSecret.data,
         });
-        await onLog("stdout", `[paperclip] Created env Secret: ${envSecret.name} (keys: ${Object.keys(envSecret.data).join(", ")})\n`);
+        await onLog("stdout", `[paperclip] ${SECRET_DISPOSITION_VERB[disposition]} env Secret: ${envSecret.name} (keys: ${Object.keys(envSecret.data).join(", ")})\n`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         await onLog("stderr", `[paperclip] Failed to create env Secret: ${msg}\n`);
@@ -1555,24 +1922,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // — never a literal env var. Never log mcpConfigSecret.data (values).
     if (mcpConfigSecret) {
       try {
-        await coreApi.createNamespacedSecret({
+        const disposition = await createOrAdoptRunSecret(coreApi, {
+          name: mcpConfigSecret.name,
           namespace: mcpConfigSecret.namespace,
-          body: {
-            apiVersion: "v1",
-            kind: "Secret",
-            metadata: {
-              name: mcpConfigSecret.name,
-              namespace: mcpConfigSecret.namespace,
-              labels: {
-                "app.kubernetes.io/managed-by": "paperclip",
-                "paperclip.io/adapter-type": "claude_k8s",
-                "paperclip.io/run-id": runId,
-              },
-            },
-            stringData: mcpConfigSecret.data,
-          },
+          runId,
+          data: mcpConfigSecret.data,
         });
-        await onLog("stdout", `[paperclip] Created mcp-config Secret: ${mcpConfigSecret.name}\n`);
+        await onLog("stdout", `[paperclip] ${SECRET_DISPOSITION_VERB[disposition]} mcp-config Secret: ${mcpConfigSecret.name}\n`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         await onLog("stderr", `[paperclip] Failed to create mcp-config Secret: ${msg}\n`);
@@ -1594,54 +1950,90 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     // Create the Job
     let createdJobUid: string | undefined;
+    // Set when the Job below already existed and is provably this run's own
+    // live Job (worker-restart reattach, BLO-27155).  It gates the two abort
+    // paths that follow: an object we adopted rather than created must never be
+    // torn down by them, because it is carrying live work.
+    let adoptedExistingJob = false;
     try {
       const created = await batchApi.createNamespacedJob({ namespace, body: job });
       createdJobUid = created.metadata?.uid;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      await onLog("stderr", `[paperclip] Failed to create K8s Job: ${msg}\n`);
-      if (promptSecret) {
+      let verdict: JobAdoptionVerdict = { adopt: false, reason: "create failed with a non-409 error" };
+      if (isK8s409(err)) {
+        let existing: k8s.V1Job | null = null;
         try {
-          await coreApi.deleteNamespacedSecret({ name: promptSecret.name, namespace: promptSecret.namespace });
-        } catch { /* best-effort */ }
+          existing = await batchApi.readNamespacedJob({ name: jobName, namespace });
+        } catch (readErr) {
+          // Leave `existing` null and let the verdict refuse: a 409 we cannot
+          // corroborate by reading is exactly the case that must fail closed.
+          const readMsg = readErr instanceof Error ? readErr.message : String(readErr);
+          await onLog("stderr", `[paperclip] Job ${jobName} already exists but could not be read: ${readMsg}\n`);
+        }
+        verdict = jobAdoptionVerdict(existing, { jobName, runId, identity: currentJobIdentity });
       }
-      if (envSecret) {
-        try {
-          await coreApi.deleteNamespacedSecret({ name: envSecret.name, namespace: envSecret.namespace });
-        } catch { /* best-effort */ }
+
+      if (verdict.adopt) {
+        createdJobUid = verdict.jobUid;
+        adoptedExistingJob = true;
+        await onLog(
+          "stdout",
+          `[paperclip] Reattached to existing Job ${jobName} (uid ${verdict.jobUid}): this run's launched Job is still live, so it is adopted rather than recreated.\n`,
+        );
+      } else {
+        const msg = err instanceof Error ? err.message : String(err);
+        const why = isK8s409(err) ? ` (not adoptable: ${verdict.reason})` : "";
+        await onLog("stderr", `[paperclip] Failed to create K8s Job: ${msg}${why}\n`);
+        if (promptSecret) {
+          try {
+            await coreApi.deleteNamespacedSecret({ name: promptSecret.name, namespace: promptSecret.namespace });
+          } catch { /* best-effort */ }
+        }
+        if (envSecret) {
+          try {
+            await coreApi.deleteNamespacedSecret({ name: envSecret.name, namespace: envSecret.namespace });
+          } catch { /* best-effort */ }
+        }
+        if (mcpConfigSecret) {
+          try {
+            await coreApi.deleteNamespacedSecret({ name: mcpConfigSecret.name, namespace: mcpConfigSecret.namespace });
+          } catch { /* best-effort */ }
+        }
+        return {
+          exitCode: null,
+          signal: null,
+          timedOut: false,
+          errorMessage: `Failed to create Kubernetes Job: ${msg}`,
+          errorCode: "k8s_job_create_failed",
+        };
       }
-      if (mcpConfigSecret) {
-        try {
-          await coreApi.deleteNamespacedSecret({ name: mcpConfigSecret.name, namespace: mcpConfigSecret.namespace });
-        } catch { /* best-effort */ }
-      }
-      return {
-        exitCode: null,
-        signal: null,
-        timedOut: false,
-        errorMessage: `Failed to create Kubernetes Job: ${msg}`,
-        errorCode: "k8s_job_create_failed",
-      };
     }
     if (!createdJobUid || !onExternalRuntimeLaunched) {
-      await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath);
-      if (promptSecret) {
-        await coreApi.deleteNamespacedSecret({
-          name: promptSecret.name,
-          namespace: promptSecret.namespace,
-        }).catch(() => undefined);
-      }
-      if (envSecret) {
-        await coreApi.deleteNamespacedSecret({
-          name: envSecret.name,
-          namespace: envSecret.namespace,
-        }).catch(() => undefined);
-      }
-      if (mcpConfigSecret) {
-        await coreApi.deleteNamespacedSecret({
-          name: mcpConfigSecret.name,
-          namespace: mcpConfigSecret.namespace,
-        }).catch(() => undefined);
+      // Only tear down what this execution actually created.  An adopted Job is
+      // live and its Secrets are mounted into a running pod; deleting either
+      // here would destroy work that is still progressing, which is the failure
+      // this whole change exists to stop.  Leaking a Job is recoverable by the
+      // existing reapers — deleting a live one is not.
+      if (!adoptedExistingJob) {
+        await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath);
+        if (promptSecret) {
+          await coreApi.deleteNamespacedSecret({
+            name: promptSecret.name,
+            namespace: promptSecret.namespace,
+          }).catch(() => undefined);
+        }
+        if (envSecret) {
+          await coreApi.deleteNamespacedSecret({
+            name: envSecret.name,
+            namespace: envSecret.namespace,
+          }).catch(() => undefined);
+        }
+        if (mcpConfigSecret) {
+          await coreApi.deleteNamespacedSecret({
+            name: mcpConfigSecret.name,
+            namespace: mcpConfigSecret.namespace,
+          }).catch(() => undefined);
+        }
       }
       return {
         exitCode: null,
@@ -1653,27 +2045,36 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         errorCode: "k8s_job_identity_unacknowledged",
       };
     }
+    // From here on every pod read is scoped to this exact Job object. The
+    // deterministic name alone cannot identify it (BLO-34577).
+    jobUid = createdJobUid;
     try {
-      await onExternalRuntimeLaunched({ jobName, jobUid: createdJobUid });
+      await onExternalRuntimeLaunched({ jobName, jobUid });
     } catch (err) {
-      await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath);
-      if (promptSecret) {
-        await coreApi.deleteNamespacedSecret({
-          name: promptSecret.name,
-          namespace: promptSecret.namespace,
-        }).catch(() => undefined);
-      }
-      if (envSecret) {
-        await coreApi.deleteNamespacedSecret({
-          name: envSecret.name,
-          namespace: envSecret.namespace,
-        }).catch(() => undefined);
-      }
-      if (mcpConfigSecret) {
-        await coreApi.deleteNamespacedSecret({
-          name: mcpConfigSecret.name,
-          namespace: mcpConfigSecret.namespace,
-        }).catch(() => undefined);
+      // Same reasoning as above.  Re-acking an adopted Job re-asserts an
+      // identity the server already persisted, so a throw here means we could
+      // not confirm ownership — which is the least safe moment to delete a
+      // live in-cluster object, not the most.
+      if (!adoptedExistingJob) {
+        await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath);
+        if (promptSecret) {
+          await coreApi.deleteNamespacedSecret({
+            name: promptSecret.name,
+            namespace: promptSecret.namespace,
+          }).catch(() => undefined);
+        }
+        if (envSecret) {
+          await coreApi.deleteNamespacedSecret({
+            name: envSecret.name,
+            namespace: envSecret.namespace,
+          }).catch(() => undefined);
+        }
+        if (mcpConfigSecret) {
+          await coreApi.deleteNamespacedSecret({
+            name: mcpConfigSecret.name,
+            namespace: mcpConfigSecret.namespace,
+          }).catch(() => undefined);
+        }
       }
       return {
         exitCode: null,
@@ -1818,7 +2219,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const scheduleTimeoutMs = Math.max(0, asNumber(config.podScheduleTimeoutSec, 120)) * 1000;
     const startTimeoutMs = Math.max(0, asNumber(config.podStartTimeoutSec, 600)) * 1000;
     try {
-      podName = await waitForPod(namespace, jobName, scheduleTimeoutMs, startTimeoutMs, onLog, kubeconfigPath);
+      podName = await waitForPod(namespace, jobName, jobUid, scheduleTimeoutMs, startTimeoutMs, onLog, kubeconfigPath);
       await onLog("stdout", `[paperclip] Pod running: ${podName}\n`);
       podRunningAt = Date.now();
 
@@ -2008,7 +2409,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     }
 
-    podTerminatedState = await getPodTerminatedState(namespace, jobName, kubeconfigPath);
+    podTerminatedState = await getPodTerminatedState(namespace, jobName, jobUid, kubeconfigPath);
     exitCode = podTerminatedState?.exitCode ?? null;
     if ((exitCode ?? 0) !== 0 && podName) {
       containerLogTail = await readPodContainerLogTail({ namespace, podName, kubeconfigPath });
@@ -2164,7 +2565,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       let lookup: PodLookupResult | undefined;
       let refreshedState = podTerminatedState;
       try {
-        lookup = await getPodLookupWithRetry(namespace, jobName, kubeconfigPath);
+        lookup = await getPodLookupWithRetry(namespace, jobName, jobUid, kubeconfigPath);
         refreshedState = lookup.state;
         if (refreshedState && refreshedState.exitCode !== null) {
           exitCode = refreshedState.exitCode;

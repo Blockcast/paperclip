@@ -33,11 +33,13 @@ import {
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
   JOB_FAILED_HEARTBEAT_RETRY_MAX_ATTEMPTS,
+  K8S_REPLACEMENT_LAUNCH_FAILURE_AFTER_THROTTLE_KEY,
   MAX_TURN_CONTINUATION_RETRY_REASON,
   MAX_TURN_CONTINUATION_WAKE_REASON,
   heartbeatService,
   isRetryableInteractionContinuationInfrastructureFailure,
   probeStaleKillReviewEvidence,
+  resolveAutomaticRunRetryOpts,
   SESSION_UNAVAILABLE_HEARTBEAT_RETRY_DELAY_MS,
   SESSION_UNAVAILABLE_HEARTBEAT_RETRY_MAX_ATTEMPTS,
   shouldScheduleAutomaticRunRetry,
@@ -47,6 +49,7 @@ import {
   TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS,
   TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS,
 } from "../services/ccrotate-capacity-retry.js";
+import { waitForRunToFinish } from "./helpers/wait-for-run-to-finish.js";
 
 /**
  * PEN-2509: a retry floor is no longer adopted verbatim as `dueAt`.
@@ -129,20 +132,6 @@ if (!embeddedPostgresSupport.supported) {
   console.warn(
     `Skipping embedded Postgres heartbeat retry scheduling tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
   );
-}
-
-async function waitForRunToFinish(
-  heartbeat: ReturnType<typeof heartbeatService>,
-  runId: string,
-  timeoutMs = 5_000,
-) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const run = await heartbeat.getRun(runId);
-    if (run && !["queued", "running"].includes(run.status)) return run;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  return await heartbeat.getRun(runId);
 }
 
 describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
@@ -1356,6 +1345,69 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         },
       }),
     ).toBe(true);
+  });
+
+  it("treats explicitly transient adapter timeouts as retry-eligible", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "timeout",
+        resultJson: { errorFamily: "transient_upstream" },
+        contextSnapshot: { wakeReason: "timer" },
+      }),
+    ).toBe(true);
+
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "timeout",
+        resultJson: {},
+        contextSnapshot: { wakeReason: "timer" },
+      }),
+    ).toBe(false);
+  });
+
+  it("limits automatic timeout recovery to one scheduled retry", async () => {
+    const runId = randomUUID();
+    const now = new Date("2026-08-10T19:00:00.000Z");
+    await seedRetryFixture({
+      runId,
+      companyId: randomUUID(),
+      agentId: randomUUID(),
+      now,
+      errorCode: "timeout",
+      errorFamily: "transient_upstream",
+      adapterType: "claude_local",
+      contextSnapshot: { wakeReason: "timer" },
+    });
+
+    const retryOpts = resolveAutomaticRunRetryOpts({
+      errorCode: "timeout",
+      contextSnapshot: { wakeReason: "timer" },
+    });
+    expect(retryOpts).toEqual({ maxAttempts: 1 });
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      random: () => 0.5,
+      ...retryOpts,
+    });
+    expect(scheduled).toMatchObject({ outcome: "scheduled", attempt: 1, maxAttempts: 1 });
+    if (scheduled.outcome !== "scheduled") return;
+
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "timed_out",
+        errorCode: "timeout",
+        resultJson: { errorFamily: "transient_upstream" },
+      })
+      .where(eq(heartbeatRuns.id, scheduled.run.id));
+
+    await expect(
+      heartbeat.scheduleBoundedRetry(scheduled.run.id, {
+        now,
+        random: () => 0.5,
+        ...retryOpts,
+      }),
+    ).resolves.toMatchObject({ outcome: "retry_exhausted", maxAttempts: 1 });
   });
 
   it("schedules accepted interaction continuation infra retries while the issue is in_review", async () => {
@@ -3056,6 +3108,58 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     ).toBe(false);
   });
 
+  // BLO-17938: the concurrency guard's `catch` sibling. Raised before the prompt
+  // bundle is assembled and before any Job exists, so it is retryable on exactly
+  // the same terms as `k8s_concurrent_run_blocked` — and was previously retried
+  // on none, falling through to the adapter_failed/process_lost tail.
+  it("retries k8s_concurrency_guard_unreachable for issue-backed and pr_review runs", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "k8s_concurrency_guard_unreachable",
+        resultJson: {},
+        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      }),
+    ).toBe(true);
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "k8s_concurrency_guard_unreachable",
+        resultJson: {},
+        contextSnapshot: { reviewKind: "pr_review" },
+      }),
+    ).toBe(true);
+  });
+
+  it("does not retry k8s_concurrency_guard_unreachable without an issue or PR-review context", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "k8s_concurrency_guard_unreachable",
+        resultJson: {},
+        contextSnapshot: {},
+      }),
+    ).toBe(false);
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "k8s_concurrency_guard_unreachable",
+        resultJson: {},
+        contextSnapshot: { wakeReason: "heartbeat_timer" },
+      }),
+    ).toBe(false);
+  });
+
+  // BLO-17938 guardrail pin: widening the guard-unreachable arm must not reach
+  // the job_failed family, whose retry still requires proof nothing began.
+  it("leaves the job_failed adapterInvocationStarted guardrail intact", () => {
+    for (const errorCode of ["job_failed", "oom_killed", "exit_137"]) {
+      expect(
+        shouldScheduleAutomaticRunRetry({
+          errorCode,
+          resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: true } },
+          contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+        }),
+      ).toBe(false);
+    }
+  });
+
   it.each(["job_failed", "oom_killed", "exit_137"])(
     "retries %s only when durable evidence proves adapter invocation never began",
     (errorCode) => {
@@ -3140,6 +3244,51 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         }),
       ).toBe(false);
     }
+  });
+
+  // BLO-34577: a replacement Job launch that failed before its pod ran, after
+  // this run already observed a zero-progress 429, is finalized with the throttle
+  // verdict (provider_throttled_no_progress / rate_limit_exhausted) carrying the
+  // launch failure as an annotation. That verdict is what re-queues the pr_review
+  // -- previously the run kept `k8s_pod_schedule_failed` and the review dropped.
+  describe("BLO-34577 replacement-launch failure after an in-run throttle", () => {
+    const annotation = {
+      [K8S_REPLACEMENT_LAUNCH_FAILURE_AFTER_THROTTLE_KEY]: {
+        errorCode: "k8s_pod_schedule_failed",
+        errorMessage: "Pod scheduling failed: Pod ac-ally-x reached phase=Failed: claude exited 1",
+        throttleAttempts: 2,
+        throttleErrorCode: null,
+      },
+    };
+
+    it("schedules the bounded retry for pr_review and issue contexts once finalized as the throttle", () => {
+      for (const contextSnapshot of [
+        { wakeReason: "github_pr_opened", reviewKind: "pr_review", githubPrNumber: 3212 },
+        { taskKey: "pr_review:Blockcast/pim-multicast-gateway:3212" },
+        { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      ]) {
+        expect(
+          shouldScheduleAutomaticRunRetry({
+            errorCode: "provider_throttled_no_progress",
+            resultJson: { errorFamily: "rate_limit_exhausted", api_error_status: 429, ...annotation },
+            contextSnapshot,
+          }),
+        ).toBe(true);
+      }
+    });
+
+    it("does not retry when the launch failure was recorded verbatim, annotation or not", () => {
+      // Negative control: the fix is the VERDICT, not the annotation. A run that
+      // kept `k8s_pod_schedule_failed` -- and a stale transient family in its
+      // merged resultJson -- still hits the ambiguous-outcome reject first.
+      expect(
+        shouldScheduleAutomaticRunRetry({
+          errorCode: "k8s_pod_schedule_failed",
+          resultJson: { errorFamily: "rate_limit_exhausted", ...annotation },
+          contextSnapshot: { wakeReason: "github_pr_opened", reviewKind: "pr_review", githubPrNumber: 3212 },
+        }),
+      ).toBe(false);
+    });
   });
 
   // BLO-17456: when a PR-review chain exhausts, the reviewer never posts its

@@ -9,11 +9,19 @@ on:
       - checks_requested
 
 concurrency:
-  # Pull requests are stable by number. A merge-group head SHA changes every
-  # time GitHub re-stages the queue, so key the sole active build for each
-  # merge-queue base branch instead. The repository merge queue is configured
-  # with maximumEntriesToBuild=1; a newer generation must replace the old one.
-  group: pr-${{ github.event.pull_request.number || github.event.merge_group.base_ref || github.run_id }}
+  # Pull requests are stable by number. Merge groups key on `head_ref`, which is
+  # unique per queue entry AND per generation (`pr-1778-2ace7b68` vs
+  # `pr-1778-e34a14b0` after a re-stage). `base_ref` is a constant
+  # (`refs/heads/master`), so it collapses every merge-group build into one slot
+  # and, with cancel-in-progress, the newer entry kills the older one. That is
+  # invisible at maximumEntriesToBuild=1 but silently defeats any raise above 1:
+  # the head's build would be cancelled by the entry queued behind it (BLO-22902).
+  #
+  # Superseding a destroyed generation does not depend on this key. GitHub
+  # cancels a destroyed merge group's runs itself: run 08:48:57Z
+  # (pr-1770-2ace7b68) was cancelled at 09:05:23Z, 73s before any successor run
+  # existed, so no concurrency rule could have done it (measured 2026-09-13).
+  group: pr-${{ github.event.pull_request.number || github.event.merge_group.head_ref || github.run_id }}
   cancel-in-progress: true
 
 env:
@@ -33,6 +41,27 @@ jobs:
     # 2 x (bootstrap + 120s fetch) + backoff ~= 5m, so the real work needs the
     # headroom above it.
     timeout-minutes: 10
+    # BLO-32682: the step-kill classifier at the end of this job reads the run's
+    # own step conclusions and annotations back off the Actions API, and
+    # `pr.yml` declares no workflow-level `permissions:`. Under a restricted
+    # default-permissions preset every scope is `none`, both calls 403, and the
+    # classifier degrades to a warning on every red run.
+    permissions:
+      # A job-level block REPLACES the workflow-level one rather than merging
+      # into it (see the same note on `verify` below), so `contents: read` is
+      # listed deliberately and FIRST — without it the `actions/checkout` step
+      # immediately below loses repo access and every step in this job fails,
+      # which would turn a legibility fix into an outage on the gate every
+      # other job `needs:`. scripts/__tests__/policy-step-kill-classifier.test.mjs
+      # pins all three entries against exactly that mistake.
+      contents: read
+      # `/actions/runs/{id}/jobs` — this job's own step conclusions and their
+      # start/finish timestamps.
+      actions: read
+      # `/check-runs/{id}/annotations` — a DIFFERENT scope from `actions: read`,
+      # and the only source of the "has timed out after N minutes" line that
+      # says a step was killed by the clock rather than by an assertion.
+      checks: read
     outputs:
       lockfile_regenerated: ${{ steps.regen_lockfile.outputs.regenerated }}
 
@@ -107,6 +136,18 @@ jobs:
         run: node --test ./scripts/check-docker-deploy-timeout.test.js
         timeout-minutes: 1
 
+      # BLO-33382: the agent-image delivery lane's alert job routed through
+      # GitHub Issues on a repo where Issues are DISABLED, so it could never
+      # emit — 8 master failures in 27h produced zero notifications while every
+      # triage surface showed a workflow that had alerting. This is the
+      # workflow-lint-time assertion that would have caught it the day it was
+      # written, and it also pins the bump step's 5xx retry and legible error
+      # body.
+      - name: Validate agent-image alert channel and bump retry
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-docker-agent-alert-channel.test.js
+        timeout-minutes: 1
+
       # BLO-31598: pins the abandon-in-flight escape hatch's wiring. The
       # approval holds a lock until its rollout lands, so a deploy dying between
       # the approval step and `helm upgrade` strands a lock nothing can clear
@@ -120,6 +161,50 @@ jobs:
         if: ${{ !cancelled() }}
         run: node --test ./scripts/check-docker-abandon-in-flight-inputs.test.js
         timeout-minutes: 1
+
+      # BLO-31666: the automatic half of the above. The escape hatch pinned by
+      # its neighbour is recovery and needs a human who knows it exists; this is
+      # prevention — the deploy job retires the lock it took when `helm upgrade`
+      # never ran. The safety condition is the whole design, since retiring a
+      # lock whose rollout IS in flight lets a competing release rotate the ring
+      # underneath a landing one.
+      #
+      # Deliberately NOT render-level, unlike its neighbours. #1636's review
+      # showed two presence-only assertions passing against mutated code — an
+      # inverted-polarity guard and a condition gutted to `if false; then` — so
+      # this extracts the step's real shell and runs the full conclusion matrix,
+      # and runs the retirement itself against a stubbed cluster to prove it
+      # clears every constituent annotation, leaves the approval ring alone, and
+      # never touches a lock whose digest+owner pair it did not write.
+      - name: Validate in-flight lock retirement on a skipped helm upgrade (BLO-31666)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-docker-retire-in-flight-lock.test.js
+        timeout-minutes: 1
+
+      # BLO-33027: pins the negative admission probe that ends the deploy job.
+      # It is the only production-side evidence that
+      # ValidatingAdmissionPolicy/paperclip-api-image-approval is EVALUATED
+      # rather than merely installed — as of 2026-09-09 the policy had zero
+      # samples in apiserver_validating_admission_policy_check_total while five
+      # other policies reported into the same family, so every other link in
+      # the enforcement story (a kind-cluster CEL assertion, a drift gauge on
+      # the Binding) is off-cluster or indirect.
+      #
+      # Executable rather than render-level, for its neighbour's reason: a probe
+      # whose verdict logic is inverted, or which credits any non-zero kubectl
+      # exit as "denied", would sail through a grep-based test while reporting a
+      # green receipt forever — exactly the false confidence the step removes.
+      # So this extracts the step's real shell and runs it against a stubbed
+      # apiserver over the whole verdict matrix: admitted, denied-by-policy,
+      # denied-by-another-policy, the same policy's other validation, a
+      # storage-layer conflict, and an unreachable server. It also asserts the
+      # probe mutates only the container image, that a generation change
+      # outranks any verdict, and that the live Deployment's container env never
+      # reaches the step log or the job summary.
+      - name: Validate production admission denial receipt probe (BLO-33027)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-docker-admission-denial-receipt.test.js
+        timeout-minutes: 2
 
       # Asserts the pre-flight runs BEFORE helm upgrade and fails closed. Both
       # are load-bearing: running it after the rollout starts reports the
@@ -147,10 +232,13 @@ jobs:
       # 21.8s local to 32-73s on CI. Keep this bound honest by re-measuring
       # rather than by analogy -- but if you add a test here that waits on a new
       # budget, it lands on the bound directly, so check the total.
+      # BLO-32670: 3, not 1. Measured p100 53s across 58 sampled runs (p50 24s)
+      # — 88% of the old one-minute bound, the tightest margin of all 41
+      # bounded steps in this job. It had not tripped yet; it was next.
       - name: Test pending-migration pre-flight phase budgets (BLO-31254)
         if: ${{ !cancelled() }}
         run: node --test ./scripts/check-pending-migration-preflight-phases.test.js
-        timeout-minutes: 1
+        timeout-minutes: 3
 
       # BLO-29008: executes the two-tier convergence gate's shell against
       # recorded cluster states. The gate fails OPEN if its string accumulation
@@ -161,10 +249,20 @@ jobs:
         run: node --test ./scripts/check-docker-two-tier-convergence.test.js
         timeout-minutes: 1
 
+      # BLO-32670: 3, not 1. This suite forks 150 short-lived `bash` processes
+      # across its 96 tests, because it exercises the shipping backoff function
+      # by sourcing it rather than by asserting against a copy. That makes its
+      # wall time track runner CPU contention rather than its own work: ~9s on
+      # an idle host, 44s p100 across 58 sampled runs, and 73s observed on
+      # 2026-09-07 — which tripped the old one-minute bound and failed `policy`
+      # on a PR whose diff touched only `server/src/services/recovery/*`.
+      # Sizing an ~9s task at 60s reads as 7x headroom; against a p100 that is
+      # already 5x the median it was not. The bound still catches a hang, far
+      # inside the 10m job cap — it is no longer a duration tripwire.
       - name: Test approval admissibility-probe backoff (BLO-28471)
         if: ${{ !cancelled() }}
         run: node --test ./scripts/approve-paperclip-api-digest.test.js
-        timeout-minutes: 1
+        timeout-minutes: 3
 
       - name: Test pnpm setup retry wrapper (BLO-28813)
         if: ${{ !cancelled() }}
@@ -181,6 +279,22 @@ jobs:
         run: node --test ./scripts/opencode-k8s-runtime-cache-pin.test.js
         timeout-minutes: 1
 
+      # BLO-33204: its neighbour above pins WHICH commit; this checks the commit
+      # is still REACHABLE. A squash-merge in the adapter repo orphans the branch
+      # head we pinned without changing a byte of our Dockerfile, and the vendor
+      # stage's `git clone` only fetches ref-reachable objects — so the build
+      # dies with `fatal: unable to read tree` on the next cache miss while
+      # cache-hitting builds keep passing. That made a hard, estate-wide deploy
+      # break look intermittent and commit-specific. Needs network (the adapter
+      # repo is public, no token required); it fails the PR only on a definite
+      # orphan and warns rather than blocking when the probe itself cannot run.
+      - name: Validate opencode_k8s adapter pin is reachable (BLO-33204)
+        if: ${{ !cancelled() }}
+        run: |
+          node --test ./scripts/__tests__/opencode-k8s-pin-reachable.test.mjs
+          node ./scripts/check-opencode-k8s-pin-reachable.mjs
+        timeout-minutes: 3
+
       - name: Test merge-group concurrency key
         if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/merge-group-concurrency.test.mjs
@@ -191,6 +305,11 @@ jobs:
         run: node --test ./scripts/__tests__/policy-node-test-timeouts.test.mjs
         timeout-minutes: 1
 
+      - name: Test policy step-kill classifier (BLO-32682)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/policy-step-kill-classifier.test.mjs
+        timeout-minutes: 1
+
       - name: Test @penstock publish-drift comparison
         if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/penstock-publish-drift.test.mjs
@@ -199,6 +318,11 @@ jobs:
       - name: Test Ally agent instruction contract
         if: ${{ !cancelled() }}
         run: node --test ./scripts/ally-agent-idempotency-contract.test.mjs
+        timeout-minutes: 1
+
+      - name: Test scheduled-guard liveness detector (PEN-3281)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-scheduled-guard-liveness.test.mjs
         timeout-minutes: 1
 
       - name: Reject git push in adapter/runtime code
@@ -252,6 +376,18 @@ jobs:
         run: node --test ./.github/scripts/tests/check-pr-test-coverage.test.mjs
         timeout-minutes: 1
 
+      # BLO-26636. This suite existed but was wired into no workflow, so it had
+      # never run — which is exactly why the two defects it now pins survived:
+      # a login allowlist that matched neither deployment's App (so the gate
+      # could never update its own comment), and a `pull_request_target` trigger
+      # list missing `edited` (so the fix the gate asks for re-ran nothing).
+      # Both are properties of the commitperclip gate that only fail on a live
+      # PR, days later, as a stalled review.
+      - name: Test commitperclip quality-gate orchestrator (BLO-26636)
+        if: ${{ !cancelled() }}
+        run: node --test ./.github/scripts/tests/run-quality-gates.test.mjs
+        timeout-minutes: 1
+
       # Guards the one property of the BLO-28888 soak workflow that cannot be
       # re-checked after the fact: that it stays dispatch-only. Adding its
       # ~50-90 minutes to a per-PR trigger would be invisible until it was
@@ -281,9 +417,28 @@ jobs:
       # that cannot be re-checked after the fact: that severity stays `critical`
       # (anything else routes to the paperclip webhook only, which is not a
       # human), and that queued/building runs never page the reviewers.
-      - name: Test stuck production-approval escalation (PEN-2848)
+      #
+      # BLO-33400 adds the schedule suite alongside it, for the same reason at a
+      # different layer: the escalation was correct and simply sampled too
+      # rarely to observe a 6h condition, which no assertion about the script
+      # itself can catch. Those tests pin the sampling cadence and the step
+      # ORDER the cadence depends on.
+      #
+      # PEN-3315 adds two more. The supersede suite pins that guard (1)'s new
+      # bounded exit approves nothing and refuses a run whose target is still
+      # current; the record suite pins that superseding a run cannot reset the
+      # escalation's stall clock. Both properties are unobservable in production
+      # until a deploy is already stuck for hours, which is the wrong moment to
+      # discover either of them regressed.
+      - name: Test stuck production-approval escalation (PEN-2848, BLO-33400, PEN-3315)
         if: ${{ !cancelled() }}
-        run: node --test ./.github/scripts/tests/post-pending-deploy-alert.test.mjs
+        run: |
+          node --test \
+            ./.github/scripts/tests/post-pending-deploy-alert.test.mjs \
+            ./.github/scripts/tests/scheduled-production-deploy-schedule.test.mjs \
+            ./.github/scripts/tests/supersede-stale-deploy.test.mjs \
+            ./.github/scripts/tests/deploy-stall-record.test.mjs \
+            ./.github/scripts/tests/deploy-stall-chain.test.mjs
         timeout-minutes: 1
 
       # BLO-28203. The stalled-Ally-review sweep's decision suite otherwise runs
@@ -313,6 +468,15 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 -m unittest discover -s .github/scripts -p 'test_sweep_*.py' -v
 
+      # BLO-31492. The floor guards above only ever see whatever the lockfiles
+      # resolved -- one known-good version -- so a dropped advisory or a
+      # flipped range bound stays green. This pins both edges of every derived
+      # range and the fail-closed behaviour of the version parser.
+      - name: Test fast-uri advisory range table
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/fast-uri-advisory.test.js
+        timeout-minutes: 1
+
       - name: Validate Designer fast-uri security floor
         if: ${{ !cancelled() }}
         run: node ./scripts/designer-fast-uri-security.test.js
@@ -325,7 +489,10 @@ jobs:
         # blocks against a stubbed `gh` and asserts the exit codes.
         if: ${{ !cancelled() }}
         run: node --test ./scripts/skill-bounded-pr-check-polling.test.mjs
-        timeout-minutes: 1
+        # BLO-32670: 3, not 1. Measured p100 53s across 58 sampled runs against
+        # a p50 of 7s — a 7.6x spread, the widest in this job, because the
+        # fenced blocks fork a stubbed `gh` per case.
+        timeout-minutes: 3
 
       # BLO-31405: the chart render suite deliberately does NOT run here. It has
       # its own `helm_chart` job below; see the comment there before adding it
@@ -336,6 +503,14 @@ jobs:
         run: node --test ./scripts/check-ally-review-consistency.test.mjs
         timeout-minutes: 1
 
+      - name: Test landing classifier
+        if: ${{ !cancelled() }}
+        # The classifier itself is not run here. It only ever reports in CI
+        # (`--apply` is opt-in) but it makes one `gh` call per open PR, and the
+        # routine that owns the live fire is BLO-32511.
+        run: node --test ./scripts/land-clean-prs.test.mjs
+        timeout-minutes: 1
+
       - name: Test comment-review-gate census
         if: ${{ !cancelled() }}
         # The census itself is not run here: it fails on 100% of sampled merges
@@ -343,6 +518,14 @@ jobs:
         # would block every merge. It becomes a runnable regression gate once
         # the gate context moves out of the review/ namespace (BLO-29711).
         run: node --test ./scripts/check-comment-review-gate-census.test.mjs
+        timeout-minutes: 1
+
+      - name: Test comment-review-gate merge-queue mirror
+        if: ${{ !cancelled() }}
+        # Guards the no-`pending` invariant in particular: a pending required
+        # status on a queue ref waits the full 6h checkResponseTimeout and
+        # ejects the entry, which is the outage BLO-26602 exists to avoid.
+        run: node --test ./scripts/mirror-comment-review-gate-to-merge-group.test.mjs
         timeout-minutes: 1
 
       - name: Test CODEOWNERS guard
@@ -434,6 +617,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: pnpm run test:browserslist-security-override
 
+      - name: Test multer security override
+        if: ${{ !cancelled() }}
+        run: pnpm run test:multer-security-override
+
+      - name: Test js-yaml security override
+        if: ${{ !cancelled() }}
+        run: pnpm run test:js-yaml-security-override
+
       - name: Verify release package bootstrap for changed manifests
         if: ${{ !cancelled() }}
         run: |
@@ -456,6 +647,16 @@ jobs:
       - name: Test lockfile overrides consistency guard
         if: ${{ !cancelled() }}
         run: node --test ./scripts/check-lockfile-overrides-consistency.test.mjs
+        timeout-minutes: 1
+
+      # BLO-27611. The escalation half of the guard above: the hourly drift
+      # monitor's only recipient. Its delivery path runs exclusively inside the
+      # scheduled job, and only on the branch where master is ALREADY drifted,
+      # so a regression there is invisible until the one run that needed it —
+      # and the failure mode is silence, which is what the issue is about.
+      - name: Test lockfile drift alert delivery (BLO-27611)
+        if: ${{ !cancelled() }}
+        run: node --test ./.github/scripts/tests/post-lockfile-drift-alert.test.mjs
         timeout-minutes: 1
 
       - name: Validate dependency resolution when manifests change
@@ -483,6 +684,47 @@ jobs:
           path: pnpm-lock.yaml
           retention-days: 1
           if-no-files-found: error
+
+      # BLO-32682: when a step above is killed by its `timeout-minutes`, GitHub
+      # emits only `##[error]The action '<step>' has timed out after 1 minutes.`
+      # — no test output, no elapsed time, nothing saying the kill was a
+      # DURATION kill. In the checks UI that is indistinguishable from "your
+      # diff broke this test", which is what sent the author of #1707 hunting in
+      # the wrong file. BLO-32670 re-budgeted the three steps most likely to
+      # trip it; it did not make the remaining case legible, and any step can
+      # still be killed under sufficient load.
+      #
+      # Last step in the job on purpose: it reads the step conclusions back off
+      # the API, so it can only classify steps that have already finished.
+      #
+      # Gated on `failure()` so the overwhelmingly common green run pays
+      # nothing — no API calls at all. Written `!cancelled() && failure()`
+      # rather than a bare `failure()` because every policy step after the first
+      # bounded test step must continue past a test failure, which
+      # scripts/__tests__/policy-node-test-timeouts.test.mjs asserts by matching
+      # the leading `!cancelled()`.
+      #
+      # Keep the phrase "node<space>--test" out of this comment block: that
+      # suite splits the job on `- name:`, so a trailing comment lands in the
+      # PREVIOUS step's slice, and it selects test steps by substring — a
+      # comment mentioning the runner would make the upload step above look
+      # like an unbounded test step.
+      - name: Classify step-timeout kills as duration kills, not test failures
+        if: ${{ !cancelled() && failure() }}
+        # Annotations only. This step decides which WORDING explains a red that
+        # has already happened, and must never be able to change the outcome —
+        # `policy` fails on the step conclusions themselves either way.
+        continue-on-error: true
+        # Bounded well inside the 10-minute job ceiling: it makes a handful of
+        # API calls on a pool that is, by construction, busy enough to have just
+        # killed a step.
+        timeout-minutes: 3
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # `github.job` is the YAML key, which is the job's DISPLAY name only
+          # while this job declares no `name:`. The test pins that pairing.
+          POLICY_JOB_NAME: ${{ github.job }}
+        run: node ./scripts/classify-policy-step-kills.mjs
 
   # The chart tests under deploy/helm/paperclip/tests/ were never wired into any
   # workflow -- 21 assertions about the manifests we actually ship (Penstock
@@ -546,7 +788,49 @@ jobs:
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-paperclip-general' }}
     # ARC setup plus the sequential build-gap typechecks exceeded the previous
     # 20-minute ceiling while the final UI typecheck was still making progress.
-    timeout-minutes: 40
+    #
+    # 50, not 40. BLO-33313 swept 598 pr.yml runs (2026-09-04..09-12): p100 of
+    # 459 successful runs here was 38.2m, i.e. 96% of the old 40m cap,
+    # with a cap-band kill to match (run 34286001265, cancelled at 40.3m while
+    # sibling jobs ran on and succeeded for another 37m -- so the run was alive
+    # and the cancel was job-scoped, not a push supersede). 45 would pass that
+    # row's own "p100 <= 85% of cap" test by a tenth of a point, which is not a
+    # margin; 50 puts p100 at 76%.
+    #
+    # POOL-OCCUPANCY MODEL, shared by every cap BLO-33313 raised (its AC4).
+    # These jobs run on arc-paperclip-general (maxRunners 16, observed at 16/16
+    # with runners pending -- BLO-22835) or, for merge_group, arc-merge-queue
+    # (maxRunners 12). Raising a cap by D minutes costs nothing on a job that
+    # finishes; only a job that HANGS to the ceiling burns the delta. So the
+    # worst case is D runner-minutes per hang -- one slot, i.e. 1/16 of the
+    # pull-request pool, held D minutes longer. Against that, every ceiling kill
+    # the raise converts into a success returns the whole old cap AND the re-run
+    # the kill forces, which nothing here counts. Cap-band kills are an upper
+    # bound on hangs, so each raise below is at worst old_cap : D per kill --
+    # 40:10 here. Re-derive if arc-paperclip-general shrinks (BLO-23434,
+    # BLO-25404, BLO-30085).
+    #
+    # The whole-file trade, as a number. The window held 16 cap-band kills
+    # across the four caps raised here (Build 7, General tests 6, Typecheck 2,
+    # Canary 1) costing 800 dead runner-minutes. If EVERY one of them were a
+    # true hang the raises would add 7*5 + 6*20 + 2*10 + 1*5 = 180 runner-
+    # minutes per window and recover nothing; if every one were a ceiling kill
+    # they recover all 800 plus the forced re-runs. Break-even is therefore a
+    # 180/800 = 23% ceiling-kill share. The evidence says the real share is far
+    # above that: the kill durations are CONTIGUOUS with the upper tail of the
+    # successful distribution (successful Builds reach 20.0m and the kills land
+    # at 20.0-20.8m; successful server shards reach 89.7m and the kills land at
+    # 90.3-90.5m), which is the ceiling signature -- a genuinely hung job has no
+    # reason to stop within half a minute of p100.
+    #
+    # Honest caveat: the kills are not uniform in time. 11 of the 16 fall on
+    # 2026-09-06 alone, so a large share of this cost is one contention
+    # episode rather than steady-state work growth (BLO-33313 lists that
+    # separation as not verified, and this sweep does not settle it either).
+    # That argues FOR the headroom rather than against it -- absorbing a bad
+    # runner day instead of converting it into discarded work is what the
+    # margin is for -- but do not read 800/window as a steady-state rate.
+    timeout-minutes: 50
 
     steps:
       - name: Checkout repository
@@ -721,6 +1005,17 @@ jobs:
     # precisely the slow-cold-migration case this lane exists to catch, discarding the
     # diagnostics the watchdog is meant to preserve. Keep this above 3 * (270s + 150s)
     # plus setup margin if either budget in the suite changes.
+    #
+    # BLO-33313 AC3 audited this cap and deliberately LEFT it at 30. p100 of
+    # 486 successful runs is 27.3m = 91% of the cap, which fails that
+    # row's "p100 <= 85% of cap" test -- but that test is the wrong instrument
+    # here, because this cap is derived from the suite's own declared budget
+    # (the 3 * (270s + 150s) above) rather than fitted to an observed
+    # distribution. p50 is 5.3m and p90 8.9m, so the outlier is one run
+    # that spent most of the budget the suite declares for itself: the cap
+    # working as designed, not a cap running out of room. Zero cap-band
+    # kills in 598 runs. Re-derive this number when MIGRATION_TIMEOUT_MS,
+    # TEST_TIMEOUT_MS, or the iteration count changes -- NOT when p100/cap moves.
     timeout-minutes: 30
 
     steps:
@@ -773,7 +1068,34 @@ jobs:
     # ARC node storage. A server shard reached the previous 60-minute ceiling
     # while still advancing through passing suites, so retain a bounded margin
     # without treating runner I/O contention as a test failure.
-    timeout-minutes: 90
+    #
+    # PER-VARIANT, not matrix-wide -- BLO-33313 AC2. One cap across six jobs of
+    # very different size was simultaneously too tight for one half of the
+    # matrix and roughly 3x too loose for the other. p100 of successful runs
+    # against the old single 90m cap: server 4/4 89.7m (100%), server 2/4
+    # 89.3m (99%), server 1/4 88.3m (98%), server 3/4 81.4m (90%),
+    # workspaces-a 55.9m (62%), workspaces-b 25.7m (29%). All SIX cap-band
+    # kills in the window were server shards -- 4/4 x3, 2/4 x2, 1/4 x1, and
+    # ZERO on either workspaces shard. Run 34023045937 is the clean instance:
+    # three cancels spread over 2h06m (Build 09:51Z, server 1/4 11:29Z, server
+    # 4/4 11:57Z) with Canary, Typecheck and k8s-ro all SUCCEEDING in between.
+    # A push supersede cancels every in-flight job at once, so a multi-hour
+    # spread rules it out; across the whole window the two populations separate
+    # cleanly, every supersede landing within 29s and every kill either alone in
+    # its run or 116s-7561s from the next cancel.
+    #
+    # 110 puts the server shards at 82%. 75 and 45 put workspaces-a/-b at
+    # 75% and 57% while LOWERING the ceiling a hung workspaces job
+    # can burn -- by 15 and 45 minutes respectively -- which a single
+    # matrix-wide 110 would instead have raised for them. See
+    # typecheck_release_registry above for the pool-occupancy model.
+    #
+    # 110 is a ceiling raise and not the durable fix for the server shards.
+    # BLO-28956 (the 2.0x serialized route/authz imbalance across those four
+    # shards) would LOWER their p100 instead of raising their ceiling. This row
+    # is deliberately NOT blocked on it: that row is unowned backlog, and these
+    # caps bite today. Bring 110 back down when it lands.
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
       # Every matrix entry gets an isolated ARC pod/database. Serializing this
@@ -786,26 +1108,32 @@ jobs:
             group_label: server 1/4
             shard_index: 0
             shard_count: 4
+            timeout_minutes: 110
           - group: general-server
             group_label: server 2/4
             shard_index: 1
             shard_count: 4
+            timeout_minutes: 110
           - group: general-server
             group_label: server 3/4
             shard_index: 2
             shard_count: 4
+            timeout_minutes: 110
           - group: general-server
             group_label: server 4/4
             shard_index: 3
             shard_count: 4
+            timeout_minutes: 110
           - group: general-workspaces-a
             group_label: workspaces-a
             shard_index: ''
             shard_count: ''
+            timeout_minutes: 75
           - group: general-workspaces-b
             group_label: workspaces-b
             shard_index: ''
             shard_count: ''
+            timeout_minutes: 45
 
     steps:
       - name: Checkout repository
@@ -1200,7 +1528,14 @@ jobs:
     # pool so pull_request and merge_group traffic cannot starve each other.
     # See typecheck_release_registry above.
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-paperclip-general' }}
-    timeout-minutes: 20
+    # 25, not 20. BLO-33313 measured p100 of 471 successful Build jobs at
+    # 20.0m against the old 20m cap -- 100%, the tightest ratio in this
+    # file -- with cap-band kills to match (run 34175815206, cancelled at 20.1m
+    # while 16 sibling jobs ran on for another 2.5h and most succeeded, so the
+    # run was alive and the cancel was job-scoped, not a push supersede). 25
+    # puts p100 at 80%. See typecheck_release_registry above for the
+    # pool-occupancy model.
+    timeout-minutes: 25
 
     steps:
       - name: Checkout repository
@@ -1238,7 +1573,14 @@ jobs:
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-paperclip-general' }}
     # ARC setup/cache restore plus release.sh's mandatory workspace build hit
     # the previous 20-minute ceiling while the build was still progressing.
-    timeout-minutes: 40
+    #
+    # 45, not 40: BLO-33313 measured p100 of 463 successful runs at 37.0m =
+    # 92% of the old cap, with a cap-band kill to match (run 34286001265,
+    # cancelled at 40.3m while sibling jobs ran on and succeeded for another
+    # 37m, so the run was alive and the cancel was job-scoped). 45 puts p100 at
+    # 82%. See typecheck_release_registry above for the pool-occupancy
+    # model.
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
@@ -1293,9 +1635,133 @@ jobs:
     # Keep PR browser suites off the org-wide default pool. Merge groups use
     # the queue's reserved capacity so unrelated repos cannot delay admission.
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-e2e' }}
-    # The serial browser suite now covers 43 flows and remained active through
-    # test 42 when ARC enforced the previous 30-minute job ceiling.
-    timeout-minutes: 75
+    # The serial browser suite covers 49 flows (43 before BLO-33282 split
+    # smoke-lab into 7). 90, not 75, sized against the measured p100 of
+    # SUCCESSFUL runs rather than the median. Every ratio here
+    # is stated one way -- p100 as a percentage OF THE CAP -- so it can be
+    # compared across jobs without inverting anything.
+    #
+    # CURRENT REGIME (2026-09-18 onwards). The suite level-shifted ~3.5x DOWN
+    # between 09-17 and 09-18 and has held there. 337 e2e jobs over
+    # 2026-09-16..09-19, split at that boundary:
+    #
+    #   09-16..09-17  n=157 success  job p50 31.7 / p90 48.3 / p100 74.4
+    #                                suite p50 27.5 / p90 42.3 / p100 67.6  1 kill
+    #   09-18..09-19  n=125 success  job p50 14.4 / p90 22.0 / p100 36.2
+    #                                suite p50  7.8 / p90 14.7 / p100 32.2  0 kills
+    #
+    # p100 is now 40% of the cap, not 81%. The shift is NOT the BLO-33282
+    # smoke-lab split (which merged 09-19, a day later, and whose file was 1.11m
+    # of a 4.1m suite by then) and NOT the BLO-33478 built-bundle change: on
+    # 09-18, branches whose head did NOT contain 23f5799e7 ran 9.2-20.1m,
+    # i.e. as fast as those that did. The speedup tracks the DATE, not any
+    # commit content. Cause UNKNOWN and unchased -- likely runner-side. Both
+    # hypotheses above are recorded as FALSIFIED so nobody re-derives them.
+    #
+    # 90 is RETAINED, deliberately, and not re-sized down to this regime. It is
+    # robust to the uncertainty in a way a tighter cap would not be: if the
+    # improvement is durable, 90 costs nothing (a cap only bills when it fires,
+    # and it has not fired in 146 jobs); if it reverts, 90 is exactly the value
+    # the pre-shift window below sized. Sizing a cap tight against an
+    # unexplained 2-day improvement is the mistake BLO-32794 was filed to
+    # correct, in the other direction.
+    #
+    # PRIOR REGIME, and still the binding arithmetic if the shift reverts.
+    # Measured over 600 pr.yml runs / 598 e2e jobs (2026-09-03..09-11), 434
+    # successful: p50 36.0m, p90 52.6m, p100 73.2m. Against the old 75m that is
+    # 98% of cap, i.e. 1.8m of margin; against 90 it is 81%, i.e. 16.8m.
+    #
+    # The two independently-observed tails have not yet co-occurred, and the
+    # bound they imply is TIGHTER than an earlier revision of this comment
+    # claimed. Worst suite 62.9m (job 103123856477, setup only 9.0m); worst
+    # setup 21.0m (job 101223622109, suite only 51.4m). Their sum is 83.8m --
+    # 93% of 90, not the 77.2m/86% stated before. That 77.2m came from a
+    # 28-job step-level sample whose setup p100 was 14.3m; over all 434
+    # successful jobs setup p100 is 21.0m. So 90 is defensible but holds only
+    # ~6m against a combination whose parts have both already happened -- do
+    # not read the 16.8m p100 margin as the real headroom.
+    #
+    # Setup is 13% of a MEDIAN job and 25% of that tail bound, so "setup cannot
+    # move this" is true of the median only. The tail is driven by
+    # `Install Playwright system dependencies` (up to 13.1m) and
+    # `Install Playwright browser` (up to 6.2m) -- apt/download variance, not
+    # the suite. Baking those into the runner image is the cheapest way to buy
+    # tail margin back; nothing here depends on it.
+    #
+    # 9 jobs died on the clock in that window. The classification rule, stated
+    # so it reproduces: a 75m cap cannot end a job BEFORE 75.0m, so a kill is
+    # exactly `conclusion == cancelled && 75.0 <= duration <= 80`. All 9 land in
+    # 75.6-76.1m -- that tight cluster IS the cap-kill signature. Deliberately
+    # excluded: 117 cancels under 70m (push-supersedes), 3 cancels at 70.7/73.6/
+    # 73.9m (long supersedes -- below the cap, so they cannot be kills), and 2
+    # at 155m/653m (lost-runner orphans -- a 75m cap cannot produce those).
+    # Rate = 9 / (434 success + 17 failure + 9 kills) = 9/460 = 2.0%.
+    #
+    # A cap kill is pure waste: it burns the full budget, produces no verdict,
+    # and forces a re-run. Cost of 75 on a demand-bound pool: 9 x 75m nominal
+    # = 675 dead runner-min / 9 days x 7 = 525/week (8.8h). That charges each
+    # kill the NOMINAL cap, so 525 is a FLOOR -- measured time-to-kill ran
+    # 75.6-76.1m, and re-run occupancy is NOT counted at all. Either refinement
+    # only makes it worse, so raising the ceiling REDUCES expected arc-e2e
+    # occupancy. Only worst-case single-job occupancy rises (+15m). How much 90
+    # costs is NOT yet known -- nothing observes how long a killed job would
+    # have taken, which is exactly what this change makes measurable.
+    # Deliberately left below the ceiling Playwright's own limits can produce
+    # (42 tests x 60s + 7 smoke-lab tests x 8m, all x `retries: 1`, plus the
+    # 300s webServer boot and measured setup ~= 215m), so a genuinely wedged
+    # suite is still killed rather than sitting on a runner. That figure read
+    # ~107m before BLO-33282 split smoke-lab, and it was understated even then
+    # -- it charged the old 30m `setTimeout` override as 60s.
+    #
+    # 90 is the DURABLE value, not a stop-gap. BLO-33282 evaluated cross-job
+    # sharding as the alternative and ruled against it on measurement; do not
+    # re-open it as "the fix nobody got round to".
+    #
+    # Why sharding does not help here. Per-file wall-times over 6 full runs:
+    # `smoke-lab.spec.ts` took 18.6m median / 28.1m p100 -- 44% of a 42.1m
+    # suite. Playwright balances shards by TEST COUNT, not duration
+    # (testGroups.ts `filterForShard`: "Shards are still balanced by the number
+    # of tests, not files"), and shards non-parallel files as whole groups. So
+    # when that file was ONE test, `--shard=i/N` put it in a shard with ~half
+    # the other 42 tests: simulated against the real algorithm the wall-time
+    # miss vs `suite/N` was +34% (N=2), +91% (N=3), +100% (N=4) -- all failing
+    # BLO-33282's own <=20% balance criterion. A `--grep @smoke-lab` /
+    # `--grep-invert` split DID balance (+12%, wall 23.6m).
+    #
+    # BLO-33282 then took the OTHER branch of its own AC2 and split that one
+    # test into 7 (one per P1-P7 scenario, plain `describe`, 8m each). That was
+    # for retry blast radius, not for sharding -- a single hung scenario used to
+    # cost 2 x 30m and kill the job by itself. But it also removes the 18.6m
+    # irreducible floor the pre-split arithmetic above rests on, so the shard
+    # simulation is STALE and must be re-run against the new 49-test shape
+    # before anyone quotes those percentages again. It is not evidence that
+    # sharding now works; nobody has measured it.
+    #
+    # The blocker is pool capacity, not suite structure: `arc-e2e` is
+    # maxRunners 8 and was observed at 8/8 with 2 pending. Over this window 42%
+    # of e2e jobs waited >1m for admission, 27% >5m, 15% >15m (queue p90 22.8m,
+    # p99 406m). A 2-way split doubles e2e jobs per PR for +10% total
+    # runner-minutes, and the ~18.5m of wall-time it saves is SMALLER than the
+    # queue p90 it would worsen. Revisit only once arc-e2e maxRunners rises
+    # (BLO-23434) -- then the tag split, not `--shard`, is the mechanism.
+    #
+    # This job is not special: the same 9-day sweep found 6 more job caps in
+    # pr.yml at >=96% of their own p100 (Build 100%, General tests server 4/4
+    # 100% and 2/4 99%, policy 99%, server 1/4 98%, Typecheck 96%) and 46 cap
+    # kills file-wide costing ~25.7 runner-hours/week. See BLO-32794 for the
+    # full per-job table before sizing any other cap here by eye.
+    #
+    # Setup gained a UI build step (1m44s) below, so the setup side of that
+    # table is now understated by about that much. Headroom still grew, not
+    # shrank -- like for like, one basis, both attempts green: job end to end
+    # 22.3m -> 11.9m and the `Run e2e tests` step 19.6m -> 6.6m (34802954363
+    # attempt 2 at pre-fix head fabf0e90b, against 35015220512). The build is
+    # what buys that: it lets the suite skip dev middleware (BLO-33478). The
+    # ~59m figure sometimes quoted for the same baseline is the suite step of
+    # attempt 1 of that run, which FAILED -- that is the clearest evidence the
+    # flake is real, but it is not a baseline. Re-measure before trimming this
+    # cap.
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
@@ -1376,6 +1842,13 @@ jobs:
             "secrets": { "provider": "local_encrypted", "strictMode": false }
           }
           CONF
+
+      # Without a built bundle the e2e server falls back to Vite dev middleware
+      # and serves the UI as an unbundled module graph, costing 12-41s per
+      # navigation (BLO-33478). Build once so the suite exercises the same
+      # static bundle production serves.
+      - name: Build UI bundle for e2e
+        run: pnpm --filter @paperclipai/ui build
 
       - name: Run e2e tests
         env:

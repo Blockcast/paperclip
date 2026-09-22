@@ -246,3 +246,76 @@ describe("plugin UI slot validators", () => {
     expect(parsed.error.issues.some((issue) => issue.message.includes("reserved by the host"))).toBe(true);
   });
 });
+
+// PEN-2799 — `metricLabels` chooses which of a plugin's metric tag keys may be
+// promoted to Prometheus labels. Validated for shape and bounded in count here;
+// which keys the host actually promotes is the host's allow-list decision, so a
+// manifest naming an unlisted key stays VALID and simply promotes nothing.
+describe("plugin manifest metricLabels (PEN-2799)", () => {
+  const base = {
+    id: "paperclip.metric-labels-fixture",
+    apiVersion: 1 as const,
+    version: "0.1.0",
+    displayName: "Metric Labels Fixture",
+    description: "Fixture exercising the metricLabels manifest field.",
+    author: "Paperclip",
+    categories: ["automation"],
+    capabilities: ["metrics.write"],
+    entrypoints: { worker: "./dist/worker.js" },
+  };
+
+  it("is optional — omitting it leaves metricLabels undefined, not an error", () => {
+    const parsed = pluginManifestV1Schema.parse({ ...base });
+    expect(parsed.metricLabels).toBeUndefined();
+  });
+
+  it("accepts an empty array (declare nothing explicitly)", () => {
+    expect(pluginManifestV1Schema.parse({ ...base, metricLabels: [] }).metricLabels).toEqual([]);
+  });
+
+  it("accepts snake_case keys and preserves order", () => {
+    const parsed = pluginManifestV1Schema.parse({
+      ...base,
+      metricLabels: ["alertname", "severity", "version"],
+    });
+    expect(parsed.metricLabels).toEqual(["alertname", "severity", "version"]);
+  });
+
+  it("accepts a key the host does not promote — validity is not promotability", () => {
+    expect(
+      pluginManifestV1Schema.parse({ ...base, metricLabels: ["command_name"] }).metricLabels,
+    ).toEqual(["command_name"]);
+  });
+
+  it("accepts exactly 5 keys and rejects a 6th", () => {
+    const five = ["alertname", "severity", "source", "action", "decision"];
+    expect(pluginManifestV1Schema.parse({ ...base, metricLabels: five }).metricLabels).toEqual(five);
+    expect(() =>
+      pluginManifestV1Schema.parse({ ...base, metricLabels: [...five, "scope"] }),
+    ).toThrow();
+  });
+
+  it("rejects duplicates — a duplicate would silently consume one of the 5 slots", () => {
+    expect(() =>
+      pluginManifestV1Schema.parse({ ...base, metricLabels: ["alertname", "alertname"] }),
+    ).toThrow(/duplicate/i);
+  });
+
+  for (const bad of ["Alertname", "alert-name", "alert.name", "1alert", "_alert", "alert name", ""]) {
+    it(`rejects the non-snake_case key ${JSON.stringify(bad)}`, () => {
+      expect(() => pluginManifestV1Schema.parse({ ...base, metricLabels: [bad] })).toThrow();
+    });
+  }
+
+  it("rejects a key longer than 40 chars", () => {
+    expect(() =>
+      pluginManifestV1Schema.parse({ ...base, metricLabels: [`a${"b".repeat(40)}`] }),
+    ).toThrow();
+  });
+
+  it("rejects a non-array value", () => {
+    expect(() =>
+      pluginManifestV1Schema.parse({ ...base, metricLabels: "alertname" }),
+    ).toThrow();
+  });
+});

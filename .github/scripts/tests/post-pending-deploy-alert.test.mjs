@@ -7,6 +7,7 @@ import {
   buildAlert,
   selectStuckApproval,
 } from '../post-pending-deploy-alert.mjs';
+import { DEPLOY_WORKFLOW_FILE } from '../deploy-stall-record.mjs';
 
 const NOW = new Date('2026-09-01T12:00:00.000Z');
 const waitingRun = (createdAt, extra = {}) => ({
@@ -203,7 +204,59 @@ test('buildAlert: names the pending run so the reader can act without opening th
   assert.match(alert.annotations.summary, /10\.0h/);
 });
 
-test('buildAlert: endsAt outlives the daily schedule so firing stays continuous', () => {
+test('buildAlert: the call to action is the waiting-runs queue, never the perishable run url', () => {
+  // BLO-26972. The escalate step runs BEFORE the supersede step that cancels the
+  // run it names — measured 6s apart on 2026-09-19, and the alert then carried
+  // the dead url for the rest of the ~7h cycle. Sending the one human who can
+  // approve to a cancelled run is the exact harm this ticket tracks, reproduced
+  // inside the sanctioned supersede path.
+  //
+  // The assertion is on the line the reader ACTS on, not on the url appearing
+  // somewhere in the body: `pendingUrl` is still quoted as observed-at-alert
+  // context, so a test that merely greps for the queue url would pass on a
+  // reverted call to action.
+  const verdict = selectStuckApproval({
+    pendingRuns: [
+      waitingRun('2026-09-01T02:00:00.000Z', {
+        url: 'https://github.com/Blockcast/paperclip/actions/runs/33456522759',
+      }),
+    ],
+    alertAfterHours: 6,
+    now: NOW,
+  });
+  const alert = buildAlert({
+    ...verdict,
+    alertAfterHours: 6,
+    runUrl: 'https://github.com/Blockcast/paperclip/actions/runs/99',
+    repo: 'Blockcast/paperclip',
+    environment: 'paperclip-production',
+    now: NOW,
+  });
+
+  const queueUrl =
+    `https://github.com/Blockcast/paperclip/actions/workflows/${DEPLOY_WORKFLOW_FILE}` +
+    '?query=is%3Awaiting';
+  assert.equal(alert.annotations.pending_queue_url, queueUrl);
+
+  const cta = alert.annotations.description
+    .split('\n')
+    .find((line) => line.startsWith('Approve or reject'));
+  assert.ok(cta, 'the description must carry an "Approve or reject" call to action');
+  assert.ok(
+    cta.includes(queueUrl),
+    `the call to action must link the waiting-runs queue, got: ${cta}`,
+  );
+  assert.ok(
+    !cta.includes('/actions/runs/'),
+    `the call to action must not link an individual run — it is cancelled by supersede: ${cta}`,
+  );
+
+  // The specific run stays visible, just demoted out of the actionable line.
+  assert.match(alert.annotations.description, /33456522759/);
+  assert.equal(alert.annotations.pending_run_url, verdict.oldest.url);
+});
+
+test('buildAlert: endsAt brackets the hourly schedule — outlives a missed slot, resolves same-day', () => {
   const verdict = selectStuckApproval({
     pendingRuns: [waitingRun('2026-09-01T02:00:00.000Z')],
     alertAfterHours: 6,
@@ -218,9 +271,75 @@ test('buildAlert: endsAt outlives the daily schedule so firing stays continuous'
     now: NOW,
   });
 
+  const HOUR = 60 * 60 * 1000;
   assert.equal(alert.startsAt, NOW.toISOString());
   assert.equal(new Date(alert.endsAt).getTime() - NOW.getTime(), ALERT_TTL_MS);
-  // 24h schedule; a TTL at or under that would let the alert resolve between
-  // runs and re-notify as if it were new.
-  assert.ok(ALERT_TTL_MS > 24 * 60 * 60 * 1000);
+  // Lower bound: the escalation re-pushes on the hourly cron, so a TTL at or
+  // under one hour would let the alert resolve between runs and re-notify as if
+  // it were new. Two hours of slack absorbs a delayed or failed slot.
+  assert.ok(ALERT_TTL_MS > 2 * HOUR, 'TTL must survive one missed hourly slot');
+  // Upper bound, and this is the half BLO-33400 added: the TTL is also how long
+  // a CLEARED gate keeps a critical alert firing, because nothing detects the
+  // fix — it resolves by expiry. At the old 25h value an approval granted at
+  // 10:00 paged until 11:00 the next day.
+  assert.ok(ALERT_TTL_MS <= 6 * HOUR, 'TTL must not outlive the gate it reports');
+});
+
+// ---------------------------------------------------------------------------
+// When the stall record is UNREADABLE, the run only goes red if the record
+// could have changed the verdict.
+//
+// PEN-2848 made this dispatcher's `conclusion` mean one specific thing: "a
+// production approval is stuck". Exiting 1 on any failed record read would make
+// a transient GitHub API blip, during a slot where nothing is on the reviewer
+// gate at all, emit that same signal — and it would contradict the rule the
+// sibling close step states, that the conclusion must not start meaning
+// "housekeeping failed".
+//
+// The discriminator is `verdict.oldest`. These two tests pin the property the
+// gate is derived from, so the gate cannot be "simplified" back.
+test('with no waiting run the verdict is settled BEFORE the record is consulted', () => {
+  // Every recorded stall start, including an absurd one, must produce the
+  // identical verdict — which is what makes a failed read provably irrelevant.
+  const base = { pendingRuns: [], alertAfterHours: 6, now: new Date('2026-09-16T12:00:00Z') };
+  const noRecord = selectStuckApproval({ ...base, stallStartedAt: null });
+  const ancientRecord = selectStuckApproval({ ...base, stallStartedAt: '2020-01-01T00:00:00Z' });
+
+  assert.deepEqual(noRecord, ancientRecord);
+  assert.equal(noRecord.stuck, false);
+  assert.equal(noRecord.oldest, null);
+});
+
+test('queued and in_progress dispatches are not waiting runs, so they too settle without the record', () => {
+  // This is the slot the finding is about: guard (1) reported something pending,
+  // so the escalation step runs, but nothing is actually on the reviewer gate.
+  const base = {
+    pendingRuns: [
+      { databaseId: 1, status: 'queued', createdAt: '2026-09-16T11:00:00Z' },
+      { databaseId: 2, status: 'in_progress', createdAt: '2026-09-16T11:30:00Z' },
+    ],
+    alertAfterHours: 6,
+    now: new Date('2026-09-16T12:00:00Z'),
+  };
+  assert.deepEqual(
+    selectStuckApproval({ ...base, stallStartedAt: null }),
+    selectStuckApproval({ ...base, stallStartedAt: '2020-01-01T00:00:00Z' }),
+  );
+  assert.equal(selectStuckApproval({ ...base, stallStartedAt: null }).oldest, null);
+});
+
+test('WITH a waiting run under threshold the record IS decisive, so a failed read stays fatal', () => {
+  // The other arm: here an earlier recorded start pushes the age over the
+  // threshold, so an unreadable record genuinely means an unjudgeable age.
+  const base = {
+    pendingRuns: [{ databaseId: 1, status: 'waiting', createdAt: '2026-09-16T11:00:00Z' }],
+    alertAfterHours: 6,
+    now: new Date('2026-09-16T12:00:00Z'),
+  };
+  assert.equal(selectStuckApproval({ ...base, stallStartedAt: null }).stuck, false);
+  assert.equal(
+    selectStuckApproval({ ...base, stallStartedAt: '2026-09-16T00:00:00Z' }).stuck,
+    true,
+    'the record can flip the verdict here, which is why a failed read must still fail',
+  );
 });

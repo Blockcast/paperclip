@@ -1,0 +1,14 @@
+# These packages are excluded from pnpm-workspace.yaml so they stay installable
+# standalone without churning the root pnpm-lock.yaml. A standalone
+# `pnpm install --ignore-workspace` therefore generates a package-local
+# lockfile and dist/ -- neither of which may be committed, or the exclusion's
+# whole purpose is defeated.
+#
+# kubernetes/.gitignore said exactly this, for one package out of eight. The
+# CI lane added in BLO-34222 runs that standalone install across the whole
+# tree, which turns "a contributor might leave an untracked lockfile here"
+# from theoretical into routine. Covering the tree once also means a provider
+# added later inherits it, rather than repeating the omission this file fixes.
+node_modules/
+dist/
+pnpm-lock.yaml

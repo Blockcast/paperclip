@@ -688,7 +688,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
         async set(
           input: ScopeKey,
           value: unknown,
-          options?: { fencing?: PluginFencingPrecondition },
+          options?: { fencing?: PluginFencingPrecondition; ifMatch?: unknown },
         ): Promise<void> {
           await callHost("state.set", {
             scopeKind: input.scopeKind,
@@ -697,6 +697,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             stateKey: input.stateKey,
             value,
             fencing: options?.fencing,
+            ifMatch: options?.ifMatch,
           });
         },
 
@@ -988,6 +989,10 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
 
         async createComment(issueId: string, body: string, companyId: string, options?: { authorAgentId?: string; fencing?: PluginFencingPrecondition; idempotencyKey?: string | null }) {
           return callHost("issues.createComment", { issueId, body, companyId, authorAgentId: options?.authorAgentId, fencing: options?.fencing, idempotencyKey: options?.idempotencyKey });
+        },
+
+        async updateComment(issueId: string, idempotencyKey: string, body: string, companyId: string, options?: { authorAgentId?: string }) {
+          return callHost("issues.updateComment", { issueId, idempotencyKey, body, companyId, authorAgentId: options?.authorAgentId });
         },
 
         async createInteraction(issueId: string, interaction, companyId: string, options?: { authorAgentId?: string }) {
