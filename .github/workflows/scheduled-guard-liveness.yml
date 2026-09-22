@@ -73,6 +73,15 @@
 # the shortest leg of the cluster it must catch. 165 min sits mid-band at 1.40x
 # the ceiling.
 #
+# RE-DERIVED 2026-09-22 over 2026-09-11 -> 09-22 (1634 pooled completion gaps,
+# ~272 per guard), because the figures above stopped at 09-11 and 165 has less
+# headroom to spend than the 240 it replaces. The jitter ceiling is still
+# 118 min, and no leg lands in (118, 213) anywhere in the window — the legs
+# above 118 and the legs above 165 are the same set. Moving the bar to 165
+# therefore adds zero false positives across all 1634 observations. The 213-min
+# band floor is still a single leg, which is the weakest part of this derivation
+# and is recorded rather than rounded away.
+#
 # THIS JOB SHIPPED AT 240 MIN, WHICH IS OUTSIDE THAT WINDOW (PEN-3379). 240 was
 # justified against the jitter ceiling alone (2.03x 118) — only half the
 # constraint. Nothing checked it against the outage legs on the other side, and
