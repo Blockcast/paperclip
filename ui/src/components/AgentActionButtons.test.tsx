@@ -124,17 +124,28 @@ describe("AgentActionButtons", () => {
     vi.clearAllMocks();
   });
 
-  function render(agent: Agent) {
-    root = createRoot(container);
-    root.render(
-      <QueryClientProvider client={queryClient}>
-        <AgentActionButtons agent={agent} companyId="company-1" runLabel="Run Heartbeat" />
-      </QueryClientProvider>,
-    );
+  // `root.render` must run INSIDE `act`, which is what every other UI suite
+  // here does (Inbox, Routines, CompanyInvites, ProjectDetail). Rendering
+  // outside it and relying on a later `flushReact()` to catch up makes the
+  // first paint depend on the scheduler getting a turn within that helper's
+  // single microtask + one `setTimeout(0)`. On a CPU-starved runner it does
+  // not, and the assertion reads `container.textContent === ""` — the
+  // `expected '' to contain 'Pause'` failure that ejected the merge group for
+  // #1787 on 2026-09-21. Inside `act`, the render is flushed before this
+  // returns, so the assertion no longer races the scheduler.
+  async function render(agent: Agent) {
+    await act(async () => {
+      root = createRoot(container);
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <AgentActionButtons agent={agent} companyId="company-1" runLabel="Run Heartbeat" />
+        </QueryClientProvider>,
+      );
+    });
   }
 
   it("replaces the pause slot with Clear error for error agents", async () => {
-    render(makeAgent({ status: "error" }));
+    await render(makeAgent({ status: "error" }));
     await flushReact();
 
     expect(container.textContent).toContain("Clear error");
@@ -150,7 +161,7 @@ describe("AgentActionButtons", () => {
   });
 
   it("calls clearError and refreshes agent-related queries", async () => {
-    render(makeAgent({ status: "error" }));
+    await render(makeAgent({ status: "error" }));
     await flushReact();
 
     await act(async () => {
@@ -169,7 +180,7 @@ describe("AgentActionButtons", () => {
   });
 
   it("keeps the normal pause action for non-error agents", async () => {
-    render(makeAgent({ status: "active" }));
+    await render(makeAgent({ status: "active" }));
     await flushReact();
 
     expect(container.textContent).toContain("Pause");
