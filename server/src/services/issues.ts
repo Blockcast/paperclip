@@ -7479,16 +7479,21 @@ export function issueService(db: Db) {
     const actorRun = input.actorRunId ? runById.get(input.actorRunId) ?? null : null;
     const actorRunStatus = actorRun?.status ?? null;
     // Only claim the caller's own run is dead when a row was actually read and
-    // the grant gate would refuse it: the lock is granted only to a run that is
-    // exactly `running` (see the status check in the grant path), so anything
-    // else -- terminal, never-started, or parked in `scheduled_retry` with
-    // startedAt set by the retry ladder -- is refused however the holder
-    // resolves. Mirroring that condition rather than `isReapableHeartbeatRunRow`
-    // matters for the parked case, which reapability treats as alive and which
-    // otherwise gets the "retry once" misdirection this remediation replaces. A
-    // missing row, or a failed lookup, is NOT evidence of death — telling a
-    // healthy run to stop working is the expensive direction to be wrong in, so
-    // this fails closed to the existing holder-shaped remediation.
+    // the gate this mirrors would refuse it: `runningCheckoutExecutionPatch`
+    // grants the lock only to a run whose status is exactly `running`, so
+    // anything else -- terminal, never-started, or parked in `scheduled_retry`
+    // with startedAt set by the retry ladder -- is refused on that path. This
+    // is NOT a universal rule for `assertCheckoutOwner`: `resolveSameRunOwnership`
+    // is consulted first and grants a run that is its own holder without
+    // reading its status, so a parked run whose lock columns point at itself
+    // never reaches this 409 at all (BLO-35402 tracks closing that; it is a
+    // behaviour change and out of scope here). Mirroring the `running` condition
+    // rather than `isReapableHeartbeatRunRow` matters for the parked case,
+    // which reapability treats as alive and which otherwise gets the "retry
+    // once" misdirection this remediation replaces. A missing row, or a failed
+    // lookup, is NOT evidence of death — telling a healthy run to stop working
+    // is the expensive direction to be wrong in, so this fails closed to the
+    // existing holder-shaped remediation.
     const actorRunRemediation = actorRun != null && actorRunStatus !== "running"
       ? `Your own run (${input.actorRunId}) is \`${actorRunStatus}\`, so the server will not grant it this lock however the holder resolves. Do NOT retry and do NOT re-file a platform bug — stop working this issue and let your successor run pick it up. Note your comments still succeed, so anything you publish from here is derived from a run the server considers dead.`
       : null;

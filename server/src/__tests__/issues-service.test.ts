@@ -11208,10 +11208,14 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
   });
 
   it("names a started run parked in scheduled_retry as dead, not retryable", async () => {
-    // The grant gate refuses anything but `running`; a run the retry ladder
-    // parked in `scheduled_retry` after it started is refused just the same, yet
-    // it is not reapable (startedAt is set), so gating the remediation on
-    // reapability sent it back to "retry once" -- a retry that can never succeed.
+    // `runningCheckoutExecutionPatch` refuses anything but `running`; a run the
+    // retry ladder parked in `scheduled_retry` after it started is refused just
+    // the same, yet it is not reapable (startedAt is set), so gating the
+    // remediation on reapability sent it back to "retry once" -- a retry that
+    // can never succeed. This fixture keeps the actor run distinct from the
+    // holder on purpose: a parked run that is its OWN holder is granted by
+    // `resolveSameRunOwnership` before any status check and never gets here
+    // (BLO-35402).
     const seeded = await seedOwnershipIssue({ checkoutStatus: "failed", actorRunStatus: "scheduled_retry" });
 
     const err = await svc
