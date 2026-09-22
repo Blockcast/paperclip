@@ -12,6 +12,7 @@ import io
 import os
 import tempfile
 import time
+from datetime import datetime, timezone
 import unittest
 import urllib.error
 
@@ -24,6 +25,21 @@ _SPEC.loader.exec_module(sweep)
 
 CONTEXT = sweep.STATUS_CONTEXT
 HOUR = 3600.0
+
+# The instant the two pre-write guard suites anchor their fixtures on. Every
+# other instant they use is DERIVED from it and from the calibrated thresholds
+# (STALL_THRESHOLD_SECONDS, REFIRE_COOLDOWN_SECONDS), never typed as a
+# literal: the thresholds are recalibrated as the fleet changes (BLO-34521
+# moved the stall threshold from 8h to 18h), and a literal "now" that used to
+# sit past the threshold silently stops satisfying should_refire, at which
+# point the guard under test is never reached and every assertion about it
+# fails for a reason none of them name.
+PENDING_SINCE = "2026-09-01T00:00:00Z"
+
+
+def _iso(epoch):
+    """Inverse of sweep._parse_iso, for fixture instants derived from `now`."""
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def status(state, created_at):
@@ -1193,7 +1209,7 @@ class TestPreWriteRereadGuard(unittest.TestCase):
 
         def fake_fetch(api_base_url, path, token):
             if "/statuses" in path:
-                return [status("pending", "2026-09-01T00:00:00Z")]
+                return [status("pending", PENDING_SINCE)]
             if "/comments" in path:
                 index = min(self.comment_fetches, len(self.comment_pages) - 1)
                 self.comment_fetches += 1
@@ -1212,9 +1228,10 @@ class TestPreWriteRereadGuard(unittest.TestCase):
         sweep._request = fake_request
 
     def _now(self):
-        # Well past STALL_THRESHOLD_SECONDS, so should_refire says yes on the
-        # scan and only the guard can stop the write.
-        return sweep._parse_iso("2026-09-01T00:00:00Z") + 10 * HOUR
+        # Past STALL_THRESHOLD_SECONDS by a margin whatever it is calibrated to
+        # today, so should_refire says yes on the scan and only the guard can
+        # stop the write.
+        return sweep._parse_iso(PENDING_SINCE) + sweep.STALL_THRESHOLD_SECONDS + HOUR
 
     def _marker(self, at):
         return [{"body": sweep.MARKER + "\nre-ask", "created_at": at}]
@@ -1225,7 +1242,7 @@ class TestPreWriteRereadGuard(unittest.TestCase):
     def test_marker_landing_between_scan_and_write_withholds_the_refire(self):
         """The headline case: a concurrent sweep posted a marker mid-run."""
         now = self._now()
-        self._install(scan_comments=[], reread_comments=self._marker("2026-09-01T09:59:00Z"))
+        self._install(scan_comments=[], reread_comments=self._marker(_iso(self._now() - 60)))
 
         pr, _head, _pending, refire, reason = sweep._consider_pr(
             "o", "r", _pr(1), "tok", "https://api.github.com", now
@@ -1243,7 +1260,7 @@ class TestPreWriteRereadGuard(unittest.TestCase):
         the next run.
         """
         now = self._now()
-        self._install(scan_comments=[], reread_comments=self._marker("2026-09-01T09:59:00Z"))
+        self._install(scan_comments=[], reread_comments=self._marker(_iso(self._now() - 60)))
 
         sweep._consider_pr("o", "r", _pr(1), "tok", "https://api.github.com", now)
 
@@ -1279,7 +1296,7 @@ class TestPreWriteRereadGuard(unittest.TestCase):
         so treating any marker as blocking would wedge the sweep permanently.
         """
         now = self._now()
-        stale = self._marker("2026-09-01T04:00:00Z")  # 6h before now, cooldown is 2h
+        stale = self._marker(_iso(self._now() - 3 * sweep.REFIRE_COOLDOWN_SECONDS))  # 3 cooldowns before now
         self._install(scan_comments=stale, reread_comments=stale)
 
         _pr_payload, _head, _pending, refire, _reason = sweep._consider_pr(
@@ -1338,7 +1355,7 @@ class TestPreWriteRereadGuard(unittest.TestCase):
         keeps its existing meaning rather than quietly tightening.
         """
         now = self._now()
-        self._install(scan_comments=[], reread_comments=self._marker("2026-09-01T09:59:00Z"))
+        self._install(scan_comments=[], reread_comments=self._marker(_iso(self._now() - 60)))
 
         outcome = sweep._consider_pr("o", "r", _pr(1), "tok", "https://api.github.com", now)
 
@@ -1427,7 +1444,7 @@ class TestPreWriteAllyReviewedGuard(unittest.TestCase):
 
         def fake_fetch(api_base_url, path, token):
             if "/statuses" in path:
-                return [status("pending", "2026-09-01T00:00:00Z")]
+                return [status("pending", PENDING_SINCE)]
             if "/comments" in path:
                 index = min(self.comment_fetches, len(self.comment_pages) - 1)
                 self.comment_fetches += 1
@@ -1448,9 +1465,10 @@ class TestPreWriteAllyReviewedGuard(unittest.TestCase):
         sweep._request = fake_request
 
     def _now(self):
-        # Well past STALL_THRESHOLD_SECONDS, so should_refire says yes on the
-        # scan and only the guard can stop the write.
-        return sweep._parse_iso("2026-09-01T00:00:00Z") + 10 * HOUR
+        # Past STALL_THRESHOLD_SECONDS by a margin whatever it is calibrated to
+        # today, so should_refire says yes on the scan and only the guard can
+        # stop the write.
+        return sweep._parse_iso(PENDING_SINCE) + sweep.STALL_THRESHOLD_SECONDS + HOUR
 
     def _consider(self, **kwargs):
         return sweep._consider_pr("o", "r", _pr(1), "tok", "https://api.github.com", self._now(), **kwargs)
@@ -1590,7 +1608,7 @@ class TestPreWriteAllyReviewedGuard(unittest.TestCase):
         a cooldown skip must keep reporting the cooldown prefix, not be
         relabelled as an already-reviewed skip.
         """
-        self._install(reread_comments=[{"body": sweep.MARKER + "\nre-ask", "created_at": "2026-09-01T09:59:00Z"}])
+        self._install(reread_comments=[{"body": sweep.MARKER + "\nre-ask", "created_at": _iso(self._now() - 60)}])
 
         _pr_payload, _head, _pending, refire, reason = self._consider()
 
@@ -1619,7 +1637,7 @@ class TestPreWriteAllyReviewedGuard(unittest.TestCase):
         THIS head" says it is not. Serve the re-read a page carrying both.
         """
         self._install(reread_comments=[
-            {"body": sweep.MARKER + "\nre-ask", "created_at": "2026-09-01T09:59:00Z"},
+            {"body": sweep.MARKER + "\nre-ask", "created_at": _iso(self._now() - 60)},
             issue_comment(body=consolidated_body(self.PR_HEAD)),
         ])
 
@@ -1654,7 +1672,7 @@ class TestPreWriteAllyReviewedGuard(unittest.TestCase):
         reviews read was short-circuited once the cooldown had declined.
         """
         self._install(
-            reread_comments=[{"body": sweep.MARKER + "\nre-ask", "created_at": "2026-09-01T09:59:00Z"}],
+            reread_comments=[{"body": sweep.MARKER + "\nre-ask", "created_at": _iso(self._now() - 60)}],
             reread_reviews=[formal_review(commit_id=self.PR_HEAD)],
         )
 
@@ -1723,14 +1741,19 @@ class TestPreWriteAllyReviewedGuard(unittest.TestCase):
         writer re-asked, nobody answered -- so silencing its alarm would hide a
         stranded PR behind the guard.
         """
-        self._install(reread_comments=[{"body": sweep.MARKER + "\nre-ask", "created_at": "2026-09-01T09:59:00Z"}])
+        self._install(reread_comments=[{"body": sweep.MARKER + "\nre-ask", "created_at": _iso(self._now() - 60)}])
 
         _pr_payload, _head, pending, refire, reason = self._consider()
 
         self.assertFalse(refire)
         self.assertTrue(reason.startswith(sweep.REREAD_SKIP_REASON_PREFIX), reason)
         self.assertIsNotNone(pending)
-        self.assertTrue(sweep.is_alarming({"is_draft": False, "pending_since": pending}, self._now()))
+        # The carried pending_since is what lets this PR alarm once the alarm
+        # threshold has elapsed; evaluate at that instant, not at the scan's
+        # "just past the stall threshold" now, which by construction is
+        # earlier than ALARM_THRESHOLD_SECONDS.
+        alarm_now = sweep._parse_iso(PENDING_SINCE) + sweep.ALARM_THRESHOLD_SECONDS + HOUR
+        self.assertTrue(sweep.is_alarming({"is_draft": False, "pending_since": pending}, alarm_now))
 
     def test_a_failed_reviews_reread_withholds_the_write_rather_than_writing_blind(self):
         """Fail-closed, matching the cooldown re-read's contract.
