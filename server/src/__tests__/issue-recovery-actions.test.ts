@@ -7,9 +7,11 @@ import {
   agents,
   agentWakeupRequests,
   activityLog,
+  approvals,
   companies,
   createDb,
   heartbeatRuns,
+  issueApprovals,
   issueComments,
   issueRecoveryActions,
   issueRelations,
@@ -27,6 +29,7 @@ import { truncateCompanyScopedTestState } from "./helpers/truncate-company-scope
 import { errorHandler } from "../middleware/index.js";
 import { logger } from "../middleware/logger.js";
 import { issueRoutes } from "../routes/issues.js";
+import { approvalService } from "../services/approvals.js";
 import { buildPaperclipWakePayload } from "../services/heartbeat.js";
 import { computeIssueMonitorGateFingerprint } from "../services/issue-execution-policy.js";
 import { RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS, issueRecoveryActionService, recoveryHandoffGrantIsWithinTtl } from "../services/issue-recovery-actions.js";
@@ -2515,82 +2518,93 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   // re-measured on the row itself: its monitor was cleared with `monitorAttemptCount: 8`
   // and it carried two `ready_for_review` PR work products written by the same webhook
   // that had already woken that owner from those PRs earlier the same day.
-  describe("PEN-2791 open pull request as an attendance path", () => {
-    // The PEN-2370 shape: productive succeeded run, no monitor, no blockers. Without an
-    // open PR this escalates -- which the first test below asserts, so the rest are
-    // known to be measuring the exemption rather than a row that was never at risk.
-    async function seedSeizableProductiveRow() {
-      const seeded = await seedCompany();
-      await db.insert(heartbeatRuns).values({
-        id: randomUUID(),
-        companyId: seeded.companyId,
-        agentId: seeded.coderId,
-        invocationSource: "assignment",
-        triggerDetail: "system",
-        status: "succeeded",
-        livenessState: "advanced",
-        startedAt: new Date(Date.now() - 45 * 60_000),
-        finishedAt: new Date(Date.now() - 40 * 60_000),
-        contextSnapshot: {
-          issueId: seeded.sourceIssueId,
-          retryReason: "issue_continuation_needed",
-          source: "issue.productive_terminal_continuation_recovery",
-        },
-      });
-      return seeded;
-    }
+  // Shared by the PEN-2791 and PEN-3352 blocks below. Both measure exemptions from the
+  // SAME seizable shape, so they must not seed subtly different rows -- PEN-3198's rule
+  // that two gates asking one question must not answer it differently applies to the
+  // fixtures that pin them just as much as to the predicates themselves.
+  // The PEN-2370 shape: productive succeeded run, no monitor, no blockers. Without an
+  // open PR this escalates -- which the first test below asserts, so the rest are
+  // known to be measuring the exemption rather than a row that was never at risk.
+  async function seedSeizableProductiveRow() {
+    const seeded = await seedCompany();
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "succeeded",
+      livenessState: "advanced",
+      startedAt: new Date(Date.now() - 45 * 60_000),
+      finishedAt: new Date(Date.now() - 40 * 60_000),
+      contextSnapshot: {
+        issueId: seeded.sourceIssueId,
+        retryReason: "issue_continuation_needed",
+        source: "issue.productive_terminal_continuation_recovery",
+      },
+    });
+    return seeded;
+  }
 
-    // The same row, except its continuation retry died on infrastructure instead of
-    // exiting 0. Under the BLO-32679 ruling this population IS reached: the exemption is
-    // consulted whenever the latest run never executed a model turn
-    // (`isInfraFailureRun`), not only on the succeeded arm. The run below is seeded to
-    // that never-executed shape, so the tests using this helper measure the exemption
-    // itself rather than a row the predicate declines to look at. The one test that
-    // varies it -- by giving the run real token usage -- is asserting the boundary, where
-    // an interrupted turn stays seizable.
-    //
-    // `job_failed` specifically, because that is the sweep's own retry giving up:
-    // `reconcileStrandedAssignedIssues` issues the `issue_continuation_needed`
-    // continuation, the lifecycle Job exhausts its backoff, and the resulting
-    // `latestRun.status = "failed"` is what disqualifies the row. Note the error code is
-    // NOT in `isInfraClassStrandedFailure`, so `infraClassCause` reads false on it.
-    async function seedSeizableFailedContinuationRow() {
-      const seeded = await seedCompany();
-      // Returned so callers that mutate this run address it by id. Scoping the update
-      // by `agentId` instead would be correct only while this helper inserts exactly
-      // one run for that agent -- an invariant of a shared helper two call sites away.
-      const failedRunId = randomUUID();
-      await db.insert(heartbeatRuns).values({
-        id: failedRunId,
-        companyId: seeded.companyId,
-        agentId: seeded.coderId,
-        invocationSource: "assignment",
-        triggerDetail: "system",
-        status: "failed",
-        // BLO-32679: `livenessState` and the usage/log pair are what
-        // `isInfraFailureRun` reads, so they are the difference between a run that never
-        // reached a model call and one interrupted mid-turn. Seeded to the measured
-        // production shape: of 71 live `stranded_assigned_issue` actions on company
-        // `aaced805` (2026-09-16), 71/71 carried `livenessState: "failed"`, and 49
-        // carried null usage with logs at most 4,738 bytes against a 200,000 ceiling.
-        // Leaving `livenessState` unset would make this row never-executed=false and
-        // quietly turn the exemption test below into a test of a row the predicate never
-        // looks at.
-        livenessState: "failed",
-        usageJson: null,
-        logBytes: null,
-        error: "BackoffLimitExceeded: Job has reached the specified backoff limit",
-        errorCode: "job_failed",
-        startedAt: new Date(Date.now() - 45 * 60_000),
-        finishedAt: new Date(Date.now() - 40 * 60_000),
-        contextSnapshot: {
-          issueId: seeded.sourceIssueId,
-          retryReason: "issue_continuation_needed",
-          source: "issue.productive_terminal_continuation_recovery",
-        },
-      });
-      return { ...seeded, failedRunId };
-    }
+  // The same row, except its continuation retry died on infrastructure instead of
+  // exiting 0. Under the BLO-32679 ruling this population IS reached: the exemption is
+  // consulted whenever the latest run never executed a model turn
+  // (`isInfraFailureRun`), not only on the succeeded arm. The run below is seeded to
+  // that never-executed shape, so the tests using this helper measure the exemption
+  // itself rather than a row the predicate declines to look at. The one test that
+  // varies it -- by giving the run real token usage -- is asserting the boundary, where
+  // an interrupted turn stays seizable.
+  //
+  // `job_failed` specifically, because that is the sweep's own retry giving up:
+  // `reconcileStrandedAssignedIssues` issues the `issue_continuation_needed`
+  // continuation, the lifecycle Job exhausts its backoff, and the resulting
+  // `latestRun.status = "failed"` is what disqualifies the row. Note the error code is
+  // NOT in `isInfraClassStrandedFailure`, so `infraClassCause` reads false on it.
+  async function seedSeizableFailedContinuationRow() {
+    const seeded = await seedCompany();
+    // Returned so callers that mutate this run address it by id. Scoping the update
+    // by `agentId` instead would be correct only while this helper inserts exactly
+    // one run for that agent -- an invariant of a shared helper two call sites away.
+    const failedRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: failedRunId,
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      // BLO-32679: `livenessState` and the usage/log pair are what
+      // `isInfraFailureRun` reads, so they are the difference between a run that never
+      // reached a model call and one interrupted mid-turn. Seeded to the measured
+      // production shape: of 71 live `stranded_assigned_issue` actions on company
+      // `aaced805` (2026-09-16), 71/71 carried `livenessState: "failed"`, and 49
+      // carried null usage with logs at most 4,738 bytes against a 200,000 ceiling.
+      // Leaving `livenessState` unset would make this row never-executed=false and
+      // quietly turn the exemption test below into a test of a row the predicate never
+      // looks at.
+      livenessState: "failed",
+      usageJson: null,
+      logBytes: null,
+      error: "BackoffLimitExceeded: Job has reached the specified backoff limit",
+      errorCode: "job_failed",
+      startedAt: new Date(Date.now() - 45 * 60_000),
+      finishedAt: new Date(Date.now() - 40 * 60_000),
+      contextSnapshot: {
+        issueId: seeded.sourceIssueId,
+        retryReason: "issue_continuation_needed",
+        source: "issue.productive_terminal_continuation_recovery",
+      },
+    });
+    return { ...seeded, failedRunId };
+  }
+
+  async function sweep() {
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    return recovery.reconcileStrandedAssignedIssues();
+  }
+
+  describe("PEN-2791 open pull request as an attendance path", () => {
 
     // Built through the real producer, not hand-written literals: the predicate filters
     // on the webhook's metadata source and system source-trust, so if either constant
@@ -2631,12 +2645,6 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         ...(input.updatedAt ? { updatedAt: input.updatedAt } : {}),
       });
       return fields;
-    }
-
-    async function sweep() {
-      const enqueueWakeup = vi.fn(async () => null);
-      const recovery = recoveryService(db, { enqueueWakeup });
-      return recovery.reconcileStrandedAssignedIssues();
     }
 
     it("escalates the PEN-2370 shape when no pull request is recorded (control)", async () => {
@@ -2802,6 +2810,343 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       });
       expect(fields.status).toBe("ready_for_review");
 
+      const result = await sweep();
+
+      expect(result.escalated).toBe(1);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("blocked");
+    });
+  });
+
+  // PEN-3352. PEN-2791 gave an open PR a durable attendance path; a pending board
+  // approval — the same class of object, a human gate on a queue measured in days — got
+  // none. So a row whose only gate was a board card had the monitor as its sole path,
+  // and the convergence guard retiring that monitor (correctly, against a gate the
+  // assignee cannot move) is what made the row seizable.
+  //
+  // Live instance PEN-2727, seized 2026-09-17T12:56:20Z with `latestRunStatus:
+  // succeeded` and `latestRunErrorCode: null` while linked to pending approval
+  // `71e27d35`.
+  //
+  // The tests below are deliberately weighted toward the NEGATIVE cases, because the
+  // hazard in this change is over-exemption: a row protected from seizure whose decision
+  // wake goes to some other agent is darker than one that gets seized, not safer.
+  describe("PEN-3352 pending board approval as an attendance path", () => {
+    async function insertBoardApproval(input: {
+      companyId: string;
+      issueId: string | null;
+      requestedByAgentId: string | null;
+      status?: string;
+      createdAt?: Date;
+      updatedAt?: Date;
+    }) {
+      const approvalId = randomUUID();
+      // `updated_at` follows `created_at` unless a caller moves it deliberately. Both
+      // columns are `defaultNow()`, so the real insert path leaves them EQUAL at filing
+      // and only `resubmit` separates them — back-dating `created_at` alone would seed a
+      // row production cannot produce (filed two weeks ago, touched a moment ago) and
+      // would make every aged-out test silently assert nothing once the predicate reads
+      // `GREATEST(created_at, updated_at)`. Caught exactly that way: the pre-existing
+      // grace test went green-to-red on the predicate change, because the fixture, not
+      // the code, was wrong.
+      const stamp = input.updatedAt ?? input.createdAt;
+      await db.insert(approvals).values({
+        id: approvalId,
+        companyId: input.companyId,
+        type: "request_board_approval",
+        requestedByAgentId: input.requestedByAgentId,
+        status: input.status ?? "pending",
+        payload: { title: "Authorize the seat purchase" },
+        ...(input.createdAt ? { createdAt: input.createdAt } : {}),
+        ...(stamp ? { updatedAt: stamp } : {}),
+      });
+      // `issueId: null` seeds a card that exists but is linked to nothing, so the
+      // issue-scoping clause can be measured without the link row confounding it.
+      if (input.issueId) {
+        await db.insert(issueApprovals).values({
+          companyId: input.companyId,
+          issueId: input.issueId,
+          approvalId,
+        });
+      }
+      return approvalId;
+    }
+
+    it("escalates the board-gated shape when no approval is linked (control)", async () => {
+      const { sourceIssueId } = await seedSeizableProductiveRow();
+
+      const result = await sweep();
+
+      // Establishes the row is genuinely seizable, so every test below measures the
+      // exemption rather than a row that was never at risk.
+      expect(result.escalated).toBe(1);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("blocked");
+    });
+
+    it("does not escalate when the assignee's own pending board approval is linked", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedSeizableProductiveRow();
+      await insertBoardApproval({
+        companyId,
+        issueId: sourceIssueId,
+        requestedByAgentId: coderId,
+      });
+
+      const result = await sweep();
+
+      // `approval-resolution.ts` wakes `requestedByAgentId` on approve, reject AND
+      // revision-requested, and all three reasons are in
+      // `RUNNING_ISSUE_WAKE_REASONS_REQUIRING_FOLLOWUP`, so the decision reaches this
+      // agent even if a run is in flight when it lands.
+      expect(result.escalated).toBe(0);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("in_progress");
+      expect(updated?.assigneeAgentId).toBe(coderId);
+      expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+    });
+
+    it("still escalates when the pending approval was filed by a different agent", async () => {
+      const { companyId, managerId, coderId, sourceIssueId } = await seedSeizableProductiveRow();
+      await insertBoardApproval({
+        companyId,
+        issueId: sourceIssueId,
+        requestedByAgentId: managerId,
+      });
+
+      const result = await sweep();
+
+      // THE case this predicate exists to get right, and the one a copy of the PR path
+      // would get wrong. The PR webhook wakes the issue's assignee, so that predicate can
+      // ignore identity; an approval decision wakes the REQUESTER. Measured 2026-09-17,
+      // 8 of 20 linked (approval, issue) pairs in the reference company had requester !=
+      // assignee — including PEN-2727 itself. Exempting this row would protect it from
+      // recovery while leaving it genuinely dark.
+      expect(result.escalated).toBe(1);
+      expect(coderId).not.toBe(managerId);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("blocked");
+    });
+
+    it("still escalates for a pending approval with no requesting agent", async () => {
+      const { companyId, sourceIssueId } = await seedSeizableProductiveRow();
+      await insertBoardApproval({
+        companyId,
+        issueId: sourceIssueId,
+        requestedByAgentId: null,
+      });
+
+      // `queueRequesterWake` returns immediately without a requester agent, so a
+      // board- or system-filed card (every `budget_override_required` row) predicts no
+      // agent wake at all. Same shape as the hand-created PR row above: a claim that
+      // someone is waiting is not evidence that anyone will be woken.
+      const result = await sweep();
+
+      expect(result.escalated).toBe(1);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("blocked");
+    });
+
+    it("still escalates once the approval has been decided", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedSeizableProductiveRow();
+      await insertBoardApproval({
+        companyId,
+        issueId: sourceIssueId,
+        requestedByAgentId: coderId,
+        status: "approved",
+      });
+
+      // A decided card has already spent its wake. Mirrors the merged-PR case: the
+      // external event source has nothing further to emit.
+      const result = await sweep();
+
+      expect(result.escalated).toBe(1);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("blocked");
+    });
+
+    it("still escalates for a revision-requested approval", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedSeizableProductiveRow();
+      await insertBoardApproval({
+        companyId,
+        issueId: sourceIssueId,
+        requestedByAgentId: coderId,
+        status: "revision_requested",
+      });
+
+      // Deliberately narrower than the issue-graph liveness classifier, which counts
+      // `pending` and `revision_requested` alike. That gate asks "does anything own the
+      // next action" — and a revision request is owned, by the requester. This gate asks
+      // "will an external event wake this agent", and the board has already answered:
+      // the next move is the assignee resubmitting, not an event arriving.
+      const result = await sweep();
+
+      expect(result.escalated).toBe(1);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("blocked");
+    });
+
+    it("stops believing a pending approval that has aged past the grace", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedSeizableProductiveRow();
+      const graceMs = loadConfig().pendingBoardApprovalAttendanceGraceMs;
+      await insertBoardApproval({
+        companyId,
+        issueId: sourceIssueId,
+        requestedByAgentId: coderId,
+        createdAt: new Date(Date.now() - (graceMs + 60 * 60_000)),
+      });
+
+      // The bound is the load-bearing half, exactly as on the PR path. Unbounded, this
+      // disjunct would hold the issue of a card nobody will ever decide `in_progress`
+      // and unattended forever — PEN-2791's own failure entered from the other side, and
+      // the reason `kind: "external_service"` (which is exempt from the convergence
+      // guard outright) is not the right escape hatch for a human gate.
+      const result = await sweep();
+
+      expect(result.escalated).toBe(1);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("blocked");
+    });
+
+    it("keeps believing a stale-filed approval that was resubmitted inside the grace", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedSeizableProductiveRow();
+      const graceMs = loadConfig().pendingBoardApprovalAttendanceGraceMs;
+      await insertBoardApproval({
+        companyId,
+        issueId: sourceIssueId,
+        requestedByAgentId: coderId,
+        // Filed well outside the grace, revision-requested, then resubmitted an hour ago.
+        // `resubmit` is the one writer that returns a row to `pending` while moving
+        // `updated_at` and leaving `created_at` at the original filing instant, so this is
+        // the exact shape that `created_at`-only bounding got wrong: a fresh board
+        // decision is owed, and the row would have read as a two-week-old dead card.
+        createdAt: new Date(Date.now() - (graceMs + 7 * 24 * 60 * 60_000)),
+        updatedAt: new Date(Date.now() - 60 * 60_000),
+      });
+
+      const result = await sweep();
+
+      expect(result.escalated).toBe(0);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("in_progress");
+    });
+
+    it("keeps believing a card the real resubmit path returned to pending", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedSeizableProductiveRow();
+      const graceMs = loadConfig().pendingBoardApprovalAttendanceGraceMs;
+      const filedAt = new Date(Date.now() - (graceMs + 7 * 24 * 60 * 60_000));
+      const approvalId = await insertBoardApproval({
+        companyId,
+        issueId: sourceIssueId,
+        requestedByAgentId: coderId,
+        createdAt: filedAt,
+      });
+
+      // The test above hand-writes the post-resubmit shape; this one DRIVES it through the
+      // real producers, because the shape is only meaningful if production can still make
+      // it. That is a cross-module invariant — the predicate lives in `recovery/service.ts`
+      // and the writers in `services/approvals.ts` — and a hand-written fixture cannot fail
+      // when the writers change underneath it.
+      //
+      // What this pins, verified by breaking each one and watching it go red: `created_at`
+      // survives the round trip (so the aged-out tests above keep measuring something), and
+      // the real two-step chain yields a row this predicate exempts.
+      //
+      // What it does NOT pin, stated because the obvious reading is wrong: it does not
+      // catch `resubmit` ceasing to move `updated_at`. Measured — patch that write out and
+      // this test still passes, because `requestRevision` moved `updated_at` one step
+      // earlier and `GREATEST()` is already fresh. Freshness on a resubmitted row is
+      // produced by the revision→resubmit chain JOINTLY, not by `resubmit` alone, so no
+      // single-writer test can pin it.
+      //
+      // Residual hazard, deliberately left visible rather than papered over: a NEW writer
+      // that bumps `updated_at` on a row it leaves `pending` would silently widen this
+      // exemption by up to the full grace, and nothing here would catch it. The live
+      // near-miss is `services/agents.ts`, which edits `payload` on rows explicitly scoped
+      // to `pending` and is harmless for one reason only — it omits `updatedAt`.
+      await approvalService(db).requestRevision(approvalId, "board-user", "Needs a cost line.");
+      const resubmitted = await approvalService(db).resubmit(approvalId);
+
+      // Guard the premise before measuring the behaviour, so a change to the producers
+      // fails HERE with a legible cause rather than as an unexplained escalation count.
+      expect(resubmitted.status).toBe("pending");
+      expect(resubmitted.createdAt.getTime()).toBe(filedAt.getTime());
+      expect(resubmitted.updatedAt.getTime()).toBeGreaterThan(filedAt.getTime());
+
+      // The approval path must be the ONLY thing exempting this row, or the assertion
+      // below would pass for a reason this test does not name. `services/approvals.ts`
+      // never writes `agent_wakeup_requests` — wakes are queued from
+      // `approval-resolution.ts`, which these two methods do not call — so this should be
+      // empty, and it is asserted rather than assumed so a future wake-on-resubmit cannot
+      // quietly take over as the thing keeping the row alive.
+      const queuedWakes = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.companyId, companyId));
+      expect(queuedWakes).toHaveLength(0);
+
+      const result = await sweep();
+
+      expect(result.escalated).toBe(0);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("in_progress");
+    });
+
+    it("does not exempt a row whose fresh approval is linked to a different issue", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedSeizableProductiveRow();
+      // Same company, same requester, same `pending` status, inside the grace — differing
+      // only in that no `issue_approvals` row ties it to this issue. Without the
+      // `issueApprovals.issueId` clause this would be an AGENT-level exemption: one open
+      // card would shield every issue that agent holds. This test is what keeps the
+      // exemption issue-level.
+      await insertBoardApproval({
+        companyId,
+        issueId: null,
+        requestedByAgentId: coderId,
+      });
+
+      const result = await sweep();
+
+      expect(result.escalated).toBe(1);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("blocked");
+    });
+
+    it("does not escalate a fresh pending approval when the latest run never executed", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedSeizableFailedContinuationRow();
+      await insertBoardApproval({
+        companyId,
+        issueId: sourceIssueId,
+        requestedByAgentId: coderId,
+      });
+
+      const result = await sweep();
+
+      // Follows the PR path onto the BLO-32679 gate rather than staying on the
+      // succeeded-only one. That ruling landed while this branch was open and the earlier
+      // revision of this test pre-committed to flipping with it, precisely so the two
+      // gates stay one policy (PEN-3198). The argument transfers unchanged: a run that
+      // never reached a model call cannot have decided a board card, so a card that was
+      // pending before it started is still pending after — the run is evidence about the
+      // runtime, not about attendance.
+      expect(result.escalated).toBe(0);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("in_progress");
+    });
+
+    it("still escalates an aged-out approval when the latest run never executed", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedSeizableFailedContinuationRow();
+      const graceMs = loadConfig().pendingBoardApprovalAttendanceGraceMs;
+      await insertBoardApproval({
+        companyId,
+        issueId: sourceIssueId,
+        requestedByAgentId: coderId,
+        createdAt: new Date(Date.now() - (graceMs + 60 * 60_000)),
+      });
+
+      // The grace is what makes admitting this disjunct onto the infra-failure gate
+      // bounded rather than an unbounded belief. Pinned separately from the succeeded-arm
+      // grace test because the two gates are different call sites and only a test proves
+      // the bound travelled with the disjunct.
       const result = await sweep();
 
       expect(result.escalated).toBe(1);
