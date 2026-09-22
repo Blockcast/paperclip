@@ -9750,6 +9750,8 @@ const GITHUB_PR_CONTEXT_KEYS = [
   "githubPrReviewRequestAuthorLogin",
   "githubReviewFeedbackActionable",
   "githubMergeQueueEvictionBody",
+  "githubReviewFeedbackSuppressionReason",
+  "githubReviewFeedbackSuppressionPredicate",
   "prRole",
   "reviewKind",
 ] as const;
@@ -9772,6 +9774,14 @@ const GITHUB_PR_REVIEW_CONTENT_KEYS = [
   "githubPrReviewAuthorLogin",
   "githubReviewFeedbackActionable",
   "githubReviewFeedbackCommentId",
+  // BLO-30420: the declined-classification reason describes ONE review
+  // instance. Both keys are written under a conditional spread, so an
+  // actionable review re-supplies neither; without listing them here a later
+  // actionable wake coalescing onto the same run would carry
+  // `githubReviewFeedbackActionable: true` next to the earlier decline's
+  // reason, the pair the webhook test forbids for a single delivery.
+  "githubReviewFeedbackSuppressionReason",
+  "githubReviewFeedbackSuppressionPredicate",
 ] as const;
 
 // BLO-23395: the same instance-ownership rule as BLO-22229 above, for
