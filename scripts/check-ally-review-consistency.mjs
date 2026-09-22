@@ -121,10 +121,18 @@ const BLOCKING_SECTION_RE =
  */
 const NOT_INDENTED_CODE = String.raw`(?! *\t)(?! {4})`;
 
-/** A prior-finding disposition that says the blocker is still present. */
-const STILL_PRESENT_DISPOSITION_RE = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE} {0,3}-[ \t]*\*\*prior:[^\n]*\*\*[ \t]*(?:—|-)[ \t]*still-present[ \t]*(?:—|-)`,
-  "im",
+/**
+ * A prior-finding ledger entry. Composed character-for-character with
+ * PRIOR_FINDING_DISPOSITION_PATTERN in server/src/services/ally-review-detection.ts
+ * (mirrored verbatim in .github/scripts/sweep-stalled-ally-reviews.py), so the
+ * three readers accept exactly the same entries. Group 4 is the disposition
+ * verb; whether it blocks is decided against BLOCKING_PRIOR_DISPOSITIONS rather
+ * than embedded in the pattern. The cross-reader corpus in the test file drives
+ * the same ledger strings through all three sources.
+ */
+const PRIOR_FINDING_DISPOSITION_RE = new RegExp(
+  String.raw`^${NOT_INDENTED_CODE} {0,3}-[ \t]*\*\*[ \t]*prior:([0-9a-f]{7,40})[ \t]+([a-z]+)[ \t]+(\d+)[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*([a-z][a-z-]*)[ \t]*(?:—|–|-)`,
+  "gim",
 );
 
 /**
@@ -521,7 +529,10 @@ export function hasBlockingFindings(body) {
 }
 
 export function hasStillPresentDisposition(body) {
-  return STILL_PRESENT_DISPOSITION_RE.test(String(body ?? ""));
+  for (const match of String(body ?? "").matchAll(PRIOR_FINDING_DISPOSITION_RE)) {
+    if (BLOCKING_PRIOR_DISPOSITIONS.has(match[4].toLowerCase())) return true;
+  }
+  return false;
 }
 
 export function attestedHead(body) {
