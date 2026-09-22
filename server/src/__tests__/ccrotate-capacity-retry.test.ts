@@ -11,6 +11,7 @@ import {
   TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS,
   applyCcrotateCapacityDecision,
   clampTransientRetryHorizon,
+  clearCcrotateCapacityDecision,
   resolveCapacityEscalation,
   resolveCcrotateCapacityRetry,
 } from "../services/ccrotate-capacity-retry.js";
@@ -453,6 +454,45 @@ describe("capacity floor ceiling is writer-independent (BLO-28919)", () => {
       expect(
         CCROTATE_CAPACITY_RESULT_KEYS.clearedOnRedefer as readonly string[],
       ).not.toContain(CCROTATE_CAPACITY_RESULT_KEYS.carriedAcrossRedefer);
+    });
+
+    it("clears every decision key and nothing else when a park is overridden", () => {
+      // The retry-now writer (heartbeat.ts retryScheduledRetryNow) books
+      // scheduled_retry_at to now without replacing the decision. It must drop
+      // exactly the keys a re-defer would rewrite -- the stale advertised
+      // resume would otherwise out-vote the forced due time in the overdue
+      // gauge -- while the chain origin and unrelated result fields survive.
+      const origin = new Date(NOW.getTime() - 9 * 60 * 60 * 1000).toISOString();
+      const parked = applyCcrotateCapacityDecision(
+        { penstockCapacityFirstDeferredAt: origin, unrelated: "kept" },
+        {
+          retryAtIso: new Date(NOW.getTime() + 60_000).toISOString(),
+          provider: "anthropic",
+          model: "claude-opus-4-1",
+          reason: "ccrotate_capacity",
+          retryAfterSeconds: 3834,
+          advertisedResumeAtIso: new Date(NOW.getTime() + 3 * 24 * 60 * 60 * 1000).toISOString(),
+          clampedFromIso: new Date(NOW.getTime() + 3 * 24 * 60 * 60 * 1000).toISOString(),
+          firstDeferredAtIso: NOW.toISOString(),
+        },
+      );
+      // The fixture must exercise the whole list, or a key added later could
+      // escape the clear without this test noticing.
+      for (const key of CCROTATE_CAPACITY_RESULT_KEYS.clearedOnRedefer) {
+        expect(parked, `fixture must carry ${key}`).toHaveProperty(key);
+      }
+
+      const cleared = clearCcrotateCapacityDecision(parked);
+      // `errorFamily` survives on purpose: it classifies the failure that
+      // already happened, not the park being overridden, and the flat
+      // rate-limit backoff in heartbeat.ts keys off it on the next attempt.
+      expect(cleared).toEqual({
+        penstockCapacityFirstDeferredAt: origin,
+        unrelated: "kept",
+        errorFamily: "rate_limit_exhausted",
+      });
+      // Pure: the parked row is not mutated.
+      expect(parked.penstockAdvertisedResumeAt).toBeDefined();
     });
 
     it("sets the origin once and carries it across re-defers", () => {

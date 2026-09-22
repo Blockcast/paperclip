@@ -97,6 +97,7 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
     agentStatus?: "active" | "paused";
     retryStatus?: "scheduled_retry" | "queued" | "running";
     issueStatus?: "in_progress" | "todo" | "done" | "cancelled";
+    retryResultJson?: Record<string, unknown>;
   } = {}) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -173,6 +174,7 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       scheduledRetryAt,
       scheduledRetryAttempt: 2,
       scheduledRetryReason: "transient_failure",
+      ...(input.retryResultJson ? { resultJson: input.retryResultJson } : {}),
       contextSnapshot: {
         issueId,
         wakeReason: "bounded_transient_heartbeat_retry",
@@ -255,6 +257,69 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       .where(and(eq(heartbeatRuns.retryOfRunId, first.body.scheduledRetry.retryOfRunId), eq(heartbeatRuns.companyId, companyId)));
     expect(retryRuns).toHaveLength(1);
     expect(retryRuns[0]).toMatchObject({ id: retryRunId, status: "queued" });
+  });
+
+  it("clears the capacity decision keys when retry-now overrides a capacity park", async () => {
+    // A retry-now books scheduled_retry_at to now. Every penstock* decision key in
+    // result_json then describes a park the row no longer holds, and the overdue
+    // gauge (queued-run-age-metrics.ts) takes greatest(scheduled_retry_at,
+    // penstockAdvertisedResumeAt), so a stale advertised resume 3.5 days out would
+    // keep the forced row invisible to the detector. The chain origin stays.
+    // Relative to the real clock: the fixture's fixed May-2026 dates are in the
+    // past by the time this runs, and the whole point is a horizon still ahead.
+    const advertisedResumeAt = new Date(Date.now() + 3.5 * 24 * 60 * 60 * 1000).toISOString();
+    const firstDeferredAt = new Date("2026-05-06T12:00:00.000Z").toISOString();
+    const { companyId, issueId, retryRunId } = await seedIssueWithRetry({
+      retryResultJson: {
+        retryNotBefore: advertisedResumeAt,
+        transientRetryNotBefore: advertisedResumeAt,
+        penstockProvider: "anthropic",
+        penstockModel: "claude-opus-4-1",
+        penstockReason: "ccrotate_capacity",
+        penstockRetryAfterSeconds: 302400,
+        penstockAdvertisedResumeAt: advertisedResumeAt,
+        penstockCapacityParkClampedFrom: advertisedResumeAt,
+        penstockCapacityFirstDeferredAt: firstDeferredAt,
+        unrelatedKey: "kept",
+      },
+    });
+    const before = Date.now();
+
+    const res = await request(createApp(boardActor(companyId)))
+      .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toMatchObject({ outcome: "promoted", scheduledRetry: { runId: retryRunId, status: "queued" } });
+
+    const [run] = await db
+      .select({ resultJson: heartbeatRuns.resultJson, scheduledRetryAt: heartbeatRuns.scheduledRetryAt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, retryRunId));
+    expect(run.resultJson).toEqual({
+      penstockCapacityFirstDeferredAt: firstDeferredAt,
+      unrelatedKey: "kept",
+    });
+    expect(run.scheduledRetryAt).not.toBeNull();
+    expect(run.scheduledRetryAt!.getTime()).toBeGreaterThanOrEqual(before - 1000);
+    expect(run.scheduledRetryAt!.getTime()).toBeLessThan(new Date(advertisedResumeAt).getTime());
+  });
+
+  it("leaves result_json untouched when retry-now promotes a row that never had one", async () => {
+    const { companyId, issueId, retryRunId } = await seedIssueWithRetry();
+
+    const res = await request(createApp(boardActor(companyId)))
+      .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toMatchObject({ outcome: "promoted" });
+
+    const [run] = await db
+      .select({ resultJson: heartbeatRuns.resultJson })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, retryRunId));
+    expect(run.resultJson).toBeNull();
   });
 
   it("returns a clear no-op response when there is no scheduled retry", async () => {

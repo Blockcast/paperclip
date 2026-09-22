@@ -110,7 +110,11 @@ export async function refreshQueuedRunAgeMetrics(db: Db, now = new Date()): Prom
  * The regex guard is deliberate, and so is its failure direction. Both
  * `result_json` writers of this field go through
  * `applyCcrotateCapacityDecision` and emit `Date.toISOString()`, so anything
- * else is corrupt; an unparseable value degrades to the pre-BLO-34782 reading
+ * else is corrupt. The one write that invalidates the field without replacing
+ * it, `retryScheduledRetryNow` booking `scheduled_retry_at` to `now`, clears it
+ * through `clearCcrotateCapacityDecision` in the same statement, so a due time
+ * an actor forced cannot be out-voted here by a provider horizon that no longer
+ * describes the row. An unparseable value degrades to the pre-BLO-34782 reading
  * (the row stays eligible and may page) rather than to silence. A detector
  * that fails loud is recoverable; one that fails quiet is the
  * invisible-strand mode this metric was built to remove.
