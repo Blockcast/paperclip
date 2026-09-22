@@ -10,7 +10,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { executionWorkspaceCleanupService } from "../services/execution-workspace-cleanup.ts";
+import { classifyRemovalProof, executionWorkspaceCleanupService } from "../services/execution-workspace-cleanup.ts";
 import { inspectWorktreeReclaimSafety } from "../services/workspace-runtime.ts";
 import { lockGitWorktreeForOwner } from "../services/git-worktree-ownership.ts";
 
@@ -138,6 +138,50 @@ describe("inspectWorktreeReclaimSafety", () => {
     fs.writeFileSync(filePath, "\n", "utf8");
 
     expect(await inspectWorktreeReclaimSafety(filePath)).toMatchObject({ safe: false, reason: "unverifiable" });
+  });
+});
+
+/**
+ * The archive decision, isolated.
+ *
+ * This one branch cannot be reached through the real-filesystem suite below,
+ * and the reason is worth stating rather than papering over with a mock. The
+ * divergence between `cleanup.cleaned` and a proving stat is a TOCTOU on a
+ * transient errno: the pre-check reads the tree, removal runs, and only then
+ * does EACCES/EIO/ESTALE land. The pre-check already rejects every *stable*
+ * cause (a non-directory, an unreadable path) before removal is attempted, so
+ * staging it needs the errno to appear mid-sweep — not reproducible with a real
+ * fs, and not reproducible by chmod either, since these tests can run as root.
+ *
+ * So the wiring is covered by the sweep tests below (a proven removal archives;
+ * a declined one does not) and the errno mapping by the inspector tests above;
+ * this table covers the predicate that joins them.
+ */
+describe("classifyRemovalProof", () => {
+  it("archives only on a removal proven by a missing path", () => {
+    expect(classifyRemovalProof(true, "missing")).toBeNull();
+  });
+
+  it("defers when the stat that reported removal could not prove it", () => {
+    // The BLO-22984 residual: `cleaned` is `stat().catch(() => false)`, so an
+    // ESTALE on the network mount reads as "gone" and would archive the row
+    // with a null stamp, which `selectEligible` can never re-select.
+    expect(classifyRemovalProof(true, "unverifiable")).toBe("unverifiable");
+  });
+
+  it("defers when the tree is still demonstrably there after cleanup", () => {
+    expect(classifyRemovalProof(true, "clean")).toBe("clean");
+    expect(classifyRemovalProof(true, "dirty")).toBe("dirty");
+    expect(classifyRemovalProof(true, "unpushed")).toBe("unpushed");
+  });
+
+  it("defers when removal itself was declined, whatever the path now stats as", () => {
+    expect(classifyRemovalProof(false, "missing")).toBe("uncleaned");
+    expect(classifyRemovalProof(false, null)).toBe("uncleaned");
+  });
+
+  it("archives a row with no path to prove, which is the registry-only case", () => {
+    expect(classifyRemovalProof(true, null)).toBeNull();
   });
 });
 
