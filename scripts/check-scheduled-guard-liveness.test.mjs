@@ -10,8 +10,10 @@ import {
   WATCHED_GUARDS,
   WATCHED_WORKFLOWS,
   classifyGuard,
+  crossCheckCompletions,
   describeStopMode,
   resolveStaleHours,
+  selectNewestCompleted,
   summarize,
 } from "./check-scheduled-guard-liveness.mjs";
 
@@ -357,6 +359,225 @@ describe("classifyGuard — the four PEN-3379 production false positives", () =>
 
     assert.equal(result.status, "stale");
     assert.match(result.detail, /cross-check read could not be made/);
+  });
+});
+
+describe("selectNewestCompleted — the cross-check must not become a mute switch", () => {
+  /**
+   * An unfiltered run page as the API returns it: ordered by `created_at` DESC,
+   * mixing queued/in-progress entries in with completed ones.
+   */
+  function page(...runs) {
+    return runs.map(([createdAt, updatedAt, status]) => ({
+      created_at: createdAt,
+      updated_at: updatedAt,
+      status,
+    }));
+  }
+
+  // THE failure this selection exists to avoid, and the one a `max(updated_at)`
+  // implementation gets wrong. The guard genuinely stopped on 09-12. Someone
+  // then re-ran an ancient run — the ordinary triage reflex on a stalled guard —
+  // which bumped that entry's `updated_at` to 09-18 WITHOUT moving its
+  // `created_at`, so it stays near the bottom of the page.
+  //
+  // `max(updated_at)` reads 09-18, contradicts the filtered read, and suppresses
+  // the alarm: a mute, co-located with the outage it would hide. Taking the
+  // first completed entry in `created_at` order cannot be fooled this way.
+  it("takes the newest-CREATED completion, not the largest updated_at", () => {
+    const observed = selectNewestCompleted(
+      page(
+        ["2026-09-12T04:32:39Z", "2026-09-12T04:32:39Z", "completed"],
+        ["2026-09-12T03:31:12Z", "2026-09-12T03:33:40Z", "completed"],
+        // The re-run: ancient created_at, fresh updated_at.
+        ["2026-09-06T11:20:00Z", "2026-09-18T14:00:00Z", "completed"],
+      ),
+    );
+
+    assert.equal(observed, "2026-09-12T04:32:39.000Z");
+    assert.notEqual(observed, "2026-09-18T14:00:00.000Z", "a re-run of an old run is not a fresh completion");
+  });
+
+  it("drives that page through the classifier without suppressing a real outage", () => {
+    const result = classifyGuard(
+      "relay-ssl-multicert-guard.yml",
+      {
+        state: "active",
+        name: "Relay SSL Multicert",
+        newest: { updatedAt: "2026-09-12T04:32:39Z", conclusion: "success", htmlUrl: "https://x" },
+        crossCheck: {
+          newestCompletedAt: selectNewestCompleted(
+            page(
+              ["2026-09-12T04:32:39Z", "2026-09-12T04:32:39Z", "completed"],
+              ["2026-09-06T11:20:00Z", "2026-09-18T14:00:00Z", "completed"],
+            ),
+          ),
+        },
+      },
+      {
+        now: Date.parse("2026-09-18T14:50:00Z"),
+        staleHours: thresholdFor("relay-ssl-multicert-guard.yml"),
+      },
+    );
+
+    assert.equal(result.status, "stale", "a re-run must not demote a genuine outage to unknown");
+    assert.equal(result.reason, "stopped");
+  });
+
+  // The other direction: the four real false positives must still be suppressed
+  // when the cross-check is derived from a PAGE rather than handed in ready-made.
+  it("still recovers the real completion behind each PEN-3379 false positive", () => {
+    const observed = selectNewestCompleted(
+      page(
+        ["2026-09-18T06:31:02Z", "2026-09-18T06:42:30Z", "completed"],
+        ["2026-09-18T05:30:55Z", "2026-09-18T05:33:10Z", "completed"],
+      ),
+    );
+
+    assert.equal(observed, "2026-09-18T06:42:30.000Z", "the completion the filtered index failed to return");
+  });
+
+  it("skips queued and in-progress entries sitting above the newest completion", () => {
+    const observed = selectNewestCompleted(
+      page(
+        ["2026-09-22T07:31:00Z", "2026-09-22T07:31:00Z", "queued"],
+        ["2026-09-22T06:43:09Z", "2026-09-22T06:44:10Z", "in_progress"],
+        ["2026-09-22T05:28:10Z", "2026-09-22T05:30:01Z", "completed"],
+      ),
+    );
+
+    assert.equal(observed, "2026-09-22T05:30:01.000Z");
+  });
+
+  it("returns null when the page holds no completed run at all", () => {
+    assert.equal(selectNewestCompleted(page(["2026-09-22T07:31:00Z", "2026-09-22T07:31:00Z", "queued"])), null);
+    assert.equal(selectNewestCompleted([]), null);
+    assert.equal(selectNewestCompleted(undefined), null);
+  });
+
+  // Null withholds corroboration, which leaves the red STANDING. Falling through
+  // to an older run instead would answer a different question than the one asked.
+  it("returns null rather than an older run when the newest completion will not parse", () => {
+    const observed = selectNewestCompleted(
+      page(
+        ["2026-09-12T04:32:39Z", "not-a-timestamp", "completed"],
+        ["2026-09-12T03:31:12Z", "2026-09-12T03:33:40Z", "completed"],
+      ),
+    );
+
+    assert.equal(observed, null);
+  });
+});
+
+describe("crossCheckCompletions — the corroborating read's own failure modes", () => {
+  const reader = (payload) => () => JSON.stringify(payload);
+
+  it("reports the newest completion from an unfiltered page", () => {
+    const observed = crossCheckCompletions(
+      "Blockcast/paperclip",
+      "relay-ssl-multicert-guard.yml",
+      reader({
+        workflow_runs: [
+          { created_at: "2026-09-18T06:31:02Z", updated_at: "2026-09-18T06:42:30Z", status: "completed" },
+          { created_at: "2026-09-18T05:30:55Z", updated_at: "2026-09-18T05:33:10Z", status: "completed" },
+        ],
+      }),
+    );
+
+    assert.deepEqual(observed, { newestCompletedAt: "2026-09-18T06:42:30.000Z" });
+  });
+
+  it("reports null — not an error — when the page genuinely holds no completed run", () => {
+    const observed = crossCheckCompletions(
+      "Blockcast/paperclip",
+      "relay-ssl-multicert-guard.yml",
+      reader({ workflow_runs: [{ created_at: "2026-09-22T07:31:00Z", updated_at: "2026-09-22T07:31:00Z", status: "queued" }] }),
+    );
+
+    // Distinct from {error: true}: this is a successful read that found
+    // nothing, which is evidence. An error is the absence of evidence.
+    assert.deepEqual(observed, { newestCompletedAt: null });
+  });
+
+  it("reports {error: true} when the read throws, so the red is left standing", () => {
+    const observed = crossCheckCompletions("Blockcast/paperclip", "relay-ssl-multicert-guard.yml", () => {
+      throw new Error("gh: API rate limit exceeded");
+    });
+
+    // THE branch that decides whether a broken second read degrades to "no
+    // corroboration, red stands" or becomes a mute switch. classifyGuard only
+    // suppresses on `!error && newestCompletedAt`, so `{error: true}` must not
+    // be confused with either a null or a timestamp.
+    assert.deepEqual(observed, { error: true });
+    assert.equal(observed.newestCompletedAt, undefined);
+  });
+
+  it("reports {error: true} on a malformed body rather than throwing out of the run", () => {
+    const observed = crossCheckCompletions(
+      "Blockcast/paperclip",
+      "relay-ssl-multicert-guard.yml",
+      () => "<html>502 Bad Gateway</html>",
+    );
+
+    assert.deepEqual(observed, { error: true });
+  });
+
+  it("tolerates a well-formed body with no workflow_runs key", () => {
+    const observed = crossCheckCompletions("Blockcast/paperclip", "relay-ssl-multicert-guard.yml", reader({}));
+
+    assert.deepEqual(observed, { newestCompletedAt: null });
+  });
+});
+
+describe("classifyGuard — 'never completed' rests on the same distrusted index", () => {
+  const now = Date.parse("2026-09-18T14:50:00Z");
+  const staleHours = 2.75;
+
+  function neverCompleted(crossCheck) {
+    return classifyGuard(
+      "relay-ssl-multicert-guard.yml",
+      { state: "active", name: "Relay SSL Multicert", newest: null, crossCheck },
+      { now, staleHours },
+    );
+  }
+
+  it("still reds when the cross-check agrees there is no completed run", () => {
+    const result = neverCompleted({ newestCompletedAt: null });
+
+    assert.equal(result.status, "stale");
+    assert.equal(result.reason, "never-completed");
+  });
+
+  it("still reds when no cross-check was supplied at all", () => {
+    const result = neverCompleted(undefined);
+
+    assert.equal(result.status, "stale");
+    assert.equal(result.reason, "never-completed");
+  });
+
+  it("still reds when the cross-check could not be read — absence is not agreement", () => {
+    const result = neverCompleted({ error: true });
+
+    assert.equal(result.status, "stale", "an unreadable second read must not mute the alarm");
+    assert.equal(result.reason, "never-completed");
+  });
+
+  it("suppresses when the unfiltered read finds any completion — 'never' is then a fiction", () => {
+    const result = neverCompleted({ newestCompletedAt: "2026-09-18T14:32:34Z" });
+
+    assert.equal(result.status, "unknown");
+    assert.equal(result.reason, "cross-check-disagreement");
+    assert.match(result.detail, /NOT being\s+asserted to have stopped/);
+  });
+
+  // "Never completed" is refuted by ANY completion, however old — unlike the
+  // `stopped` branch, which only suppresses on a completion NEWER than the one
+  // it aged. A six-day-old run still falsifies "has never enforced anything".
+  it("suppresses even on an ancient completion, because the claim is 'never', not 'recently'", () => {
+    const result = neverCompleted({ newestCompletedAt: "2026-09-12T04:32:39Z" });
+
+    assert.equal(result.status, "unknown");
+    assert.equal(result.reason, "cross-check-disagreement");
   });
 });
 

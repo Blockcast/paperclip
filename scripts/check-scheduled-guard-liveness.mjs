@@ -74,6 +74,27 @@ export const WATCHED_GUARDS = [
   // datasets — per-workflow completion gaps and a pool-wide dispatch census —
   // which disagree about the low legs and agree that 240 is wrong.
   //
+  // RE-DERIVED 2026-09-22 on 11 days of fresh data (2026-09-11 -> 09-22), because
+  // the numbers above were measured to 09-11 and a tightened bar has less
+  // headroom to spend than the one it replaces. 1634 pooled completion gaps
+  // across the six guards (successive updated_at deltas, ~272 legs each):
+  //
+  //   ordinary jitter ceiling   118 min   unchanged; p95 is 83-99 per guard
+  //   legs above the ceiling    213, 246, 254, 290, 301, 305, then 562-712
+  //
+  // The band survives unchanged, and on better evidence than it had: NO LEG
+  // LANDS IN (118, 213) AT ALL over 1634 observations. The set of legs above
+  // 118 and the set above 165 are identical, so moving the bar from the jitter
+  // ceiling to 165 adds exactly zero false positives across the whole window.
+  // 165 is not merely mid-band — it sits in an observed-empty region, which is
+  // the property that matters for an alarm whose value is being believed.
+  //
+  // Two caveats kept rather than smoothed over. The 213-min floor is still a
+  // single leg, so the band's lower edge rests on one observation even now.
+  // And the 562-712 legs are much longer than the 213-305 cluster cited above;
+  // they are not attributed here, because this measurement enumerates gaps and
+  // does not establish what caused any of them.
+  //
   // Not 150-180 by luck: a quantized one-tick drop (~120 min) sits below this
   // band and a two-tick drop (~180) would sit inside it, but two consecutive
   // drops are NOT OBSERVED in either dataset. And a quorum rule ("red only when
@@ -96,7 +117,12 @@ export const WATCHED_GUARDS = [
   //
   // 16h is the honest number and it is the least comfortable one in this file:
   // the admissible window is only (14.60h, 17.71h), so the margin is 1.10x the
-  // jitter ceiling where the hourly guards get 2.03x. Setting it any looser —
+  // jitter ceiling where the hourly guards get 1.40x. That contrast is narrower
+  // than it used to read: this note said 2.03x until PEN-3379, quoting the old
+  // 240-min hourly bar, and the tightening to 165 min cut the hourly margin to
+  // 1.40x. So 16h is tight, but it is no longer the outlier the 1.10x-vs-2.03x
+  // framing implied — both bars now sit close to their jitter ceilings, which is
+  // what placing a bar mid-band actually costs. Setting it any looser —
   // 18h, say — would clear the jitter ceiling more safely but sail straight
   // over the 17.71h event, which is the baseline-on-the-incident error this
   // file already made once and corrected.
@@ -198,6 +224,28 @@ export function classifyGuard(workflow, observation, { now, staleHours = DEFAULT
   }
 
   if (!observation?.newest) {
+    // This reds on the SAME filtered index the rest of this function now
+    // distrusts, and on its strongest possible claim — "never enforced
+    // anything". An index that served a 140-run-old entry as [0] is not
+    // obviously trustworthy when it serves an empty page instead, so the
+    // empty result gets the same corroboration a stale one does: any completed
+    // run in the unfiltered re-read refutes "never", outright and without
+    // needing to be recent (PEN-3379).
+    const crossCheckNewest = observation?.crossCheck?.newestCompletedAt;
+    if (crossCheckNewest) {
+      return {
+        ...base,
+        status: "unknown",
+        reason: "cross-check-disagreement",
+        detail:
+          `${name} (${workflow}) returned no completed run at all from the filtered run index, ` +
+          `but an unfiltered re-read of the same history found a completion at ${crossCheckNewest}. ` +
+          `The two reads disagree, so the filtered index is stale and "has never completed" is a ` +
+          `fiction. Suppressing the alarm rather than firing it (PEN-3379); this guard is NOT being ` +
+          `asserted to have stopped.`,
+      };
+    }
+
     return {
       ...base,
       status: "stale",
@@ -492,6 +540,39 @@ function countQueued(repo, workflow) {
 }
 
 /**
+ * Picks the newest COMPLETED run out of an unfiltered run page.
+ *
+ * Split out from the read below so the selection can be tested without the
+ * network — the selection, not the request, is where this was got wrong once.
+ *
+ * The page is ordered by `created_at` DESC, so the FIRST completed entry is the
+ * newest-created completion. That ordering is the whole reason this is a
+ * `find`. Taking `max(updated_at)` across the page is NOT a harmless
+ * equivalent: it is the unsafe error the sort-key note in `observeWorkflow`
+ * rejects, arriving by the back door. Re-running any older run still inside the
+ * page bumps its `updated_at` without moving its `created_at`, so `max` reads
+ * that as a fresh completion, disagrees with the filtered read, and SUPPRESSES
+ * the alarm. On a genuinely stopped guard that is a mute — and re-running a
+ * stalled guard is the first thing a human does, which puts the trigger exactly
+ * where the outage is. `find` cannot be fooled this way: a re-run entry stays
+ * where its `created_at` put it.
+ *
+ * Returns the ISO `updated_at` of that run — the same quantity `observeWorkflow`
+ * returns, so the two reads are compared like for like — or null when the page
+ * holds no completed run. A newest completion whose timestamp will not parse
+ * also returns null rather than falling through to an older run: null merely
+ * withholds corroboration (the red stands), whereas selecting some other run
+ * would answer a different question than the one asked.
+ */
+export function selectNewestCompleted(runs) {
+  const newest = (runs ?? []).find((run) => run?.status === "completed" && run.updated_at);
+  if (!newest) return null;
+
+  const epoch = Date.parse(newest.updated_at);
+  return Number.isNaN(epoch) ? null : new Date(epoch).toISOString();
+}
+
+/**
  * Second, INDEPENDENT read of the same run history — the corroboration a stale
  * verdict must survive before it is allowed to red (PEN-3379).
  *
@@ -504,21 +585,19 @@ function countQueued(repo, workflow) {
  * Returns `{newestCompletedAt}` (ISO string, or null when the page genuinely
  * holds no completed run), or `{error: true}` when the read could not be made.
  * An unreadable cross-check is NOT treated as agreement — see `classifyGuard`.
+ *
+ * `read` is injectable so the failure branch is reachable from a test. It is
+ * the branch that matters most: it decides whether a broken second read
+ * degrades to "no corroboration, red stands" or to a silent mute, and a
+ * veto whose failure mode is untested is a veto nobody can trust.
  */
-function crossCheckCompletions(repo, workflow) {
+export function crossCheckCompletions(repo, workflow, read = gh) {
   try {
-    const raw = gh([
+    const raw = read([
       "api",
       `repos/${repo}/actions/workflows/${workflow}/runs?per_page=${CROSS_CHECK_PAGE_SIZE}`,
     ]);
-    const runs = JSON.parse(raw).workflow_runs ?? [];
-    const completed = runs
-      .filter((run) => run.status === "completed" && run.updated_at)
-      .map((run) => Date.parse(run.updated_at))
-      .filter((epoch) => !Number.isNaN(epoch));
-
-    if (completed.length === 0) return { newestCompletedAt: null };
-    return { newestCompletedAt: new Date(Math.max(...completed)).toISOString() };
+    return { newestCompletedAt: selectNewestCompleted(JSON.parse(raw).workflow_runs ?? []) };
   } catch {
     return { error: true };
   }
@@ -550,7 +629,15 @@ function main() {
     // matters" shape as countQueued below. Re-classifying is a pure call on the
     // observation we already hold, so corroborating costs exactly one request
     // and only on the path that was about to red (PEN-3379).
-    if (first.status !== "stale" || first.reason !== "stopped") return first;
+    //
+    // Both reasons that red off the filtered index are gated, not just
+    // `stopped`: `never-completed` rests on the same suspect read and makes a
+    // stronger claim from it. `disabled` and `runs-unreadable` are deliberately
+    // NOT here — neither is derived from that index, so a second read of it
+    // could not corroborate them.
+    if (first.status !== "stale" || (first.reason !== "stopped" && first.reason !== "never-completed")) {
+      return first;
+    }
 
     return classifyGuard(
       workflow,
