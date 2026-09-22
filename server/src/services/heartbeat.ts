@@ -12302,6 +12302,25 @@ export interface HeartbeatServiceOptions {
   beforeWakeRedeliveryEnqueueForTest?: (
     row: typeof agentWakeupRequests.$inferSelect,
   ) => Promise<void> | void;
+  /**
+   * Test-only interleaving point between enqueueWakeup's UNLOCKED coalesce
+   * read and the transaction that takes the agent lock (PEN-1990).
+   *
+   * This window is the only way to reach a `coalesced` outcome on the
+   * interval-overrun bypass path, and it cannot be reproduced by seeding the
+   * fixture up front. `rawCoalescedTarget` prefers `sameScopeQueuedRun` over
+   * the running run, and `filterIntervalOverrunCoalesceTarget` returns a
+   * non-running target unchanged -- so a queued row that is already present at
+   * the unlocked read wins that read, coalesces there, and returns before the
+   * bypass is ever computed. The queued sibling has to APPEAR in between, which
+   * is exactly the live race the `includeRunning: false` re-check exists for:
+   * "a same-task run found after taking the agent lock was created while this
+   * enqueue was waiting".
+   */
+  beforeWakeEnqueueTransactionForTest?: (input: {
+    agentId: string;
+    taskKey: string | null;
+  }) => Promise<void> | void;
 }
 
 function isTruthyRuntimeEnvValue(value: string | undefined) {
@@ -36146,6 +36165,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return mergedRun;
       }
     }
+
+    await options.beforeWakeEnqueueTransactionForTest?.({
+      agentId,
+      taskKey: effectiveTaskKey,
+    });
 
     const queueOutcome = await db.transaction(async (tx) => {
       await tx.execute(

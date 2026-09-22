@@ -387,6 +387,101 @@ describeEmbeddedPostgres("heartbeat timer wake coalescing", () => {
     expect(bypassLog.captured).toHaveLength(0);
   });
 
+  it("reports a mid-flight queued sibling as a fold, not a mint", async () => {
+    // PEN-1990: the ONLY bypass activation that does not mint, and the case
+    // that discriminates `runId` from `coalescedIntoRunId`. The two cases above
+    // both leave `runId` non-null on a `queued` outcome and `coalescedIntoRunId`
+    // null, so collapsing the split back to
+    //   `runId: queueOutcome.kind === "skipped" ? null : queueOutcome.run.id`
+    // keeps them green. Here the fold reports a run this wake did NOT mint, so
+    // that form would publish the queued sibling's id under `runId` and a
+    // consumer grouping on it would count this activation as a mint.
+    const { companyId, agentId, runningRunId } = await seedAgentWithRunningRun({
+      intervalSec: 3600,
+      runStartedAt: new Date(Date.now() - 4 * 60 * 60 * 1000),
+    });
+
+    const queuedRunId = randomUUID();
+    let seeded = false;
+    const heartbeat = heartbeatService(db, {
+      penstockAvailabilityGate: allowPenstockGate,
+      skipQueuedRunDispatch: true,
+      // The sibling has to appear in THIS window -- after the unlocked coalesce
+      // read, before the post-lock re-check. Seeding it in the fixture instead
+      // would prove nothing: `rawCoalescedTarget` prefers a queued run over the
+      // running one and the overrun filter passes a non-running target through
+      // unchanged, so the wake would coalesce at the unlocked read and return
+      // before the bypass was ever computed -- zero bypass lines captured.
+      beforeWakeEnqueueTransactionForTest: async () => {
+        if (seeded) return;
+        seeded = true;
+        await db.insert(heartbeatRuns).values({
+          id: queuedRunId,
+          companyId,
+          agentId,
+          invocationSource: "timer",
+          triggerDetail: "system",
+          status: "queued",
+          // The post-lock re-check matches on the `context_task_key` COLUMN
+          // rather than on the snapshot JSON the unlocked read walks. It is
+          // GENERATED ALWAYS from `context_snapshot ->> 'taskKey'`, so setting
+          // the snapshot key below is what makes this row visible to
+          // `coalescePendingTaskScopeWake` -- it cannot be written directly.
+          contextSnapshot: {
+            wakeReason: "heartbeat_timer",
+            wakeSource: "timer",
+            taskKey: "__heartbeat__",
+          },
+        });
+      },
+    });
+    // Same as the cases above: tracked, so the bypass is attributable to the
+    // overrun rule rather than to the zombie filter nulling the target first.
+    heartbeat.__test_unsafelyTrackActiveRunExecution(runningRunId);
+
+    const bypassLog = captureBypassLogs();
+    let run: Awaited<ReturnType<typeof fireTimerWake>>;
+    try {
+      run = await fireTimerWake(heartbeat, agentId);
+    } finally {
+      bypassLog.restore();
+    }
+
+    // The bypass fired (the running target was filtered) and then the wake was
+    // absorbed by the queued sibling instead of minting.
+    expect(run?.id).toBe(queuedRunId);
+    expect(seeded).toBe(true);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    // The running one and the queued one, and no third: a mint here would mean
+    // the re-check had not absorbed the wake and the outcome under test would
+    // be `queued` rather than `coalesced`.
+    expect(runs).toHaveLength(2);
+    expect(runs.find((candidate) => candidate.id === runningRunId)?.status).toBe("running");
+
+    // No marker anywhere: it is stamped only on a run this wake mints, and this
+    // wake minted nothing. A marker on the folded-into run would double-count
+    // this activation against the log line below.
+    for (const candidate of runs) {
+      expect(candidate.contextSnapshot).not.toHaveProperty(STALLED_COALESCE_BYPASS_SNAPSHOT_KEY);
+    }
+
+    expect(bypassLog.captured).toHaveLength(1);
+    expect(bypassLog.captured[0]).toMatchObject({
+      agentId,
+      outcome: "coalesced",
+      coalescedIntoRunId: queuedRunId,
+      targetRunId: runningRunId,
+    });
+    // Asserted separately and identity-strictly: this is the assertion the
+    // reverted form reds on, and `toMatchObject` would also accept `undefined`
+    // for a key that had been dropped entirely.
+    expect(bypassLog.captured[0]).toHaveProperty("runId", null);
+  });
+
   it("holds a fast-cadence agent to the 90 min floor rather than 1.5x its interval", async () => {
     // 30s interval * 1.5 = 45s, which is below the measured p50 run duration.
     // Without the floor this run (20 min old) would be filtered and the agent
