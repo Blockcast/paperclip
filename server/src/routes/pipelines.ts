@@ -72,6 +72,7 @@ import {
 import {
   publicPipelineStageConfig,
   resolveWorkspaceRuntimeViewer,
+  WITHHELD_WORKSPACE_RUNTIME_VIEWER,
   type WorkspaceRuntimeViewer,
 } from "./workspace-response.js";
 import { documentAnnotationService } from "../services/document-annotations.js";
@@ -945,6 +946,13 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
         })),
         actor,
       });
+      // PEN-3266 negative control, so the next sweep does not have to re-derive it: `created.stages[]`
+      // ARE whole `pipeline_stages` rows with `config` intact, and this handler resolves no viewer.
+      // It is deliberately not projected — every value in that `config` is the caller's own request
+      // body (`stageInputs`, `services/pipelines.ts`), and the only other source, `DEFAULT_STAGES`,
+      // carries no `onEnter` and no `executionWorkspaceSettings`. So there is nothing here the caller
+      // did not just supply. If `DEFAULT_STAGES` ever grows one, or this route starts echoing a
+      // stored row, it becomes a real carrier and must be projected like the others.
       res.status(201).json(created);
     } catch (error) {
       codedConflictForUnique(error);
@@ -956,7 +964,24 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     assertPipelineCompanyAccess(req, companyId);
     const pipelineId = typeof req.query.pipelineId === "string" ? req.query.pipelineId : undefined;
     const parentCaseId = typeof req.query.parentCaseId === "string" ? req.query.parentCaseId : undefined;
-    res.json(await svc.listReviewCases({ companyId, pipelineId, parentCaseId }));
+    const [rows, stageViewer] = await Promise.all([
+      svc.listReviewCases({ companyId, pipelineId, parentCaseId }),
+      resolveWorkspaceRuntimeViewer(access, req, companyId),
+    ]);
+    // PEN-3266: TWO carriers on this one response, and masking only the obvious one would leave the
+    // commands egressing on its sibling.
+    //   `stage`        — the whole `pipeline_stages` row, spread by `...row` in `listReviewCases`.
+    //   `reviewConfig` — `reviewConfigForStage` (`services/pipelines.ts`) spreads
+    //                    `normalizeStageConfig(...)`, which strips only `automation`,
+    //                    `assigneeAgentId` and `reviewerKind`. `onEnter` survives it intact, so the
+    //                    same `executionWorkspaceSettings` rides out a second time under a key whose
+    //                    name suggests it only carries review-routing fields.
+    // Projected here rather than in the service because `services/` does not import the route layer.
+    res.json(rows.map((row) => ({
+      ...row,
+      stage: publicPipelineStage(row.stage, stageViewer),
+      reviewConfig: publicPipelineStageConfig(row.reviewConfig, stageViewer),
+    })));
   });
 
   router.post("/companies/:companyId/review-cases/bulk", validate(bulkReviewSchema), async (req, res) => {
@@ -1234,7 +1259,8 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
         config: req.body.config,
         actor,
       });
-      res.status(201).json(publicPipelineStage(stage, await resolveWorkspaceRuntimeViewer(access, req, companyId)));
+      const stageViewer = await resolveWorkspaceRuntimeViewer(access, req, companyId);
+      res.status(201).json(publicPipelineStage(stage, stageViewer));
     } catch (error) {
       codedConflictForUnique(error);
     }
@@ -1248,7 +1274,8 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     const actor = actorForMutation(req);
     try {
       const updatedStage = await svc.updateStage({ companyId, pipelineId, stageId, patch: req.body, actor });
-      res.json(publicPipelineStage(updatedStage, await resolveWorkspaceRuntimeViewer(access, req, companyId)));
+      const stageViewer = await resolveWorkspaceRuntimeViewer(access, req, companyId);
+      res.json(publicPipelineStage(updatedStage, stageViewer));
     } catch (error) {
       codedConflictForUnique(error);
     }
@@ -1573,13 +1600,14 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
       ))
       .orderBy(asc(pipelineCases.createdAt));
     const caseIds = rows.map((row) => row.case.id);
-    const [activeWork, descendantActiveWorkCounts] = await Promise.all([
+    const [activeWork, descendantActiveWorkCounts, stageViewer] = await Promise.all([
       loadActiveWorkForCases(db, companyId, caseIds),
       loadDescendantActiveWorkCountsForCases(db, companyId, caseIds),
+      resolveWorkspaceRuntimeViewer(access, req, companyId),
     ]);
     res.json(rows.map((row) => ({
       case: row.case,
-      stage: row.stage,
+      stage: publicPipelineStage(row.stage, stageViewer),
       parentCase: row.parentCase?.id && row.parentPipeline?.id
         ? {
             case: row.parentCase,
@@ -1594,7 +1622,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
   router.get("/cases/:caseId", async (req, res) => {
     const caseId = req.params.caseId as string;
     const companyId = await assertCaseAccess(db, req, caseId);
-    const detail = await getCaseDetail(db, companyId, caseId);
+    const detail = await getCaseDetail(db, companyId, caseId, await resolveWorkspaceRuntimeViewer(access, req, companyId));
     res.json(detail);
   });
 
@@ -1938,12 +1966,14 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
       ))
       .orderBy(asc(pipelineCases.createdAt));
     const caseIds = rows.map((row) => row.case.id);
-    const [activeWork, descendantActiveWorkCounts] = await Promise.all([
+    const [activeWork, descendantActiveWorkCounts, stageViewer] = await Promise.all([
       loadActiveWorkForCases(db, companyId, caseIds),
       loadDescendantActiveWorkCountsForCases(db, companyId, caseIds),
+      resolveWorkspaceRuntimeViewer(access, req, companyId),
     ]);
     res.json(rows.map((row) => ({
       ...row,
+      stage: publicPipelineStage(row.stage, stageViewer),
       activeWork: activeWork.get(row.case.id) ?? null,
       descendantActiveWorkCount: descendantActiveWorkCounts.get(row.case.id) ?? 0,
     })));
@@ -2049,7 +2079,11 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
       res.json({ issue: conversationSource.issue, created: false });
       return;
     }
-    const detail = await getCaseDetail(db, companyId, caseId);
+    // PEN-3266: the withheld viewer, not the caller's. This detail never reaches the response —
+    // it feeds `buildCaseContextMarkdown`, which projects the stage to {id,key,name,kind} — and the
+    // markdown it builds becomes an agent-visible issue description, so the most restrictive viewer
+    // is the correct one and it saves an access decision on a mutation path.
+    const detail = await getCaseDetail(db, companyId, caseId, WITHHELD_WORKSPACE_RUNTIME_VIEWER);
     const [bodyDocumentContext, outputSummaries] = await Promise.all([
       loadPipelineConversationBodyDocumentContext(db, { companyId, caseId }),
       outputsSvc.listCaseOutputs(companyId, caseId).then((outputs) => summarizePipelineCaseOutputsForContext(outputs)),
@@ -2216,7 +2250,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
   router.get("/cases/:caseId/context-pack", async (req, res) => {
     const caseId = req.params.caseId as string;
     const companyId = await assertCaseAccess(db, req, caseId);
-    const detail = await getCaseDetail(db, companyId, caseId);
+    const detail = await getCaseDetail(db, companyId, caseId, await resolveWorkspaceRuntimeViewer(access, req, companyId));
     const [events, outputs, childOutcomes] = await Promise.all([
       svc.listCaseEventsPage(companyId, caseId, {
         limit: PIPELINE_CONTEXT_PACK_EVENT_LIMIT,
@@ -2307,7 +2341,15 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
   return router;
 }
 
-async function getCaseDetail(db: Db, companyId: string, caseId: string) {
+/**
+ * PEN-3266. `viewer` is threaded in rather than resolved here because this is a bare function
+ * with no `req`, and because the projection has to happen INSIDE it: `stage`, `parentCase.stage`
+ * and every `allowedNextStages` entry are whole `pipelineStages` rows, so each one carries
+ * `config` — and `allowedNextStages` is the widest of the three, being every stage of the
+ * pipeline rather than just the case's own. Projecting at the chokepoint instead of at each
+ * `res.json` means a future caller that returns this detail wholesale is masked by construction.
+ */
+async function getCaseDetail(db: Db, companyId: string, caseId: string, viewer: WorkspaceRuntimeViewer) {
   const row = await db
     .select({ case: pipelineCases, stage: pipelineStages, pipeline: pipelines })
     .from(pipelineCases)
@@ -2358,10 +2400,11 @@ async function getCaseDetail(db: Db, companyId: string, caseId: string) {
   ]);
   return {
     ...row,
+    stage: publicPipelineStage(row.stage, viewer),
     // Derived, invisible: a case's "type" is simply which pipeline it lives in.
     // Used internally for display and ingest sanity-checks; not a user field.
     caseType: deriveCaseType(row.pipeline),
-    allowedNextStages,
+    allowedNextStages: allowedNextStages.map((stage) => publicPipelineStage(stage, viewer)),
     links,
     blockers,
     blocks,
@@ -2376,7 +2419,9 @@ async function getCaseDetail(db: Db, companyId: string, caseId: string) {
     liveness,
     conversationSource,
     builtFromAutomation,
-    parentCase,
+    parentCase: parentCase === null
+      ? null
+      : { ...parentCase, stage: publicPipelineStage(parentCase.stage, viewer) },
     pendingSuggestion: row.case.pendingSuggestion,
   };
 }
