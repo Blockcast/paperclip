@@ -1801,6 +1801,64 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
+  // BLO-33223 (extension): the guard test for deriving
+  // `ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES` from `TRANSIENT_INFRA_CONTINUATION_ERROR_CODES`
+  // rather than re-listing it. `skill_materialization_pending` is the measured proof that
+  // the two-list arrangement drifts: BLO-32055 added it to the transient-infra set with a
+  // comment correctly reasoning the runtime tree vanished underneath the adapter before
+  // the CLI was ever spawned -- i.e. explicitly infrastructure -- and it still laundered
+  // BLO-33648 and BLO-32939 onto the manager, because the author had no reason to know a
+  // second list decided routing.
+  //
+  // Mutation check: delete the `...TRANSIENT_INFRA_CONTINUATION_ERROR_CODES` spread and
+  // this test fails on both assertions. The error text is marker-free on purpose, so the
+  // message arm cannot carry it -- `infraClassCauseByMessage: false` pins that, exactly as
+  // in the `k8s_pod_schedule_failed` test above.
+  it("re-dispatches a skill_materialization_pending failure to the existing assignee (BLO-33223)", async () => {
+    const { managerId, coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+    >(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "Skill `garrytan/gstack/investigate` source is incomplete: " +
+        "`investigate--9debdeaf08` disappeared while building the Claude prompt bundle",
+      errorCode: "skill_materialization_pending",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(action).toMatchObject({
+      kind: "stranded_assigned_issue",
+      cause: "stranded_assigned_issue",
+      ownerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+    });
+    expect(action?.ownerAgentId).not.toBe(managerId);
+    expect(action?.evidence).toMatchObject({
+      infraClassCause: true,
+      infraClassCauseByMessage: false,
+      latestRunErrorCode: "skill_materialization_pending",
+    });
+  });
+
   it("keeps the original return owner after a temporary invocability fallback", async () => {
     const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
     const enqueueWakeup = vi.fn<
