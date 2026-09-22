@@ -501,9 +501,19 @@ describe("issue validators", () => {
       expect(text).toMatch(/treat `commit_id` as corroboration at most/i);
       // SURFACE 1 must stay labelled a liveness signal, so the empirically safe use survives.
       expect(text).toMatch(/LIVENESS check/i);
-      // And the old recipe must not come back in either of the two places it lived.
-      expect(text).not.toMatch(/`commit_id` equals the PR's current head/i);
-      expect(text).not.toMatch(/staleness by comparing that `commit_id`/i);
+      // The old recipe must not come back as a PARAPHRASE either, not just as a verbatim revert.
+      // The previous exact-string guards passed on "its `commit_id` matches the PR's current
+      // head", which sits perfectly happily beside the mutability warning and reinstates the
+      // prescription anyway.
+      expect(text).not.toMatch(/`commit_id`[^.]{0,60}\b(equals?|matches?|identical to|the same as)\b[^.]{0,40}current head/i);
+      // The staleness comparison must NAME the immutable marker as the thing compared, so
+      // swapping `commit_id` back into that sentence fails here however it is phrased.
+      expect(text).toMatch(/staleness by comparing the attested `Reviewed head:`/i);
+      // The `githubHasReviewerEvidenceForPr` pointer must stay SCOPED. That predicate credits a
+      // formal review on `review.commitId === headSha` alone, in any SUBMITTED state including
+      // APPROVED, with no body-marker check — so an unqualified "mirror it" tells an agent to
+      // re-derive the exact recipe removed above (BLO-35277 review, paperclip#1988).
+      expect(text).toMatch(/do NOT carry that over to `?APPROVED/i);
     });
   });
 
