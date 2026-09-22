@@ -1349,4 +1349,17 @@ test("PaperclipCrashRecoveryCandidateIndex{Missing,Unobservable} distinguish a m
     /PAPERCLIP_RESTORE_IN_PROGRESS/,
     "the remediation must name the restore alias too, since either variable alone suppresses",
   );
+  // The alias clause above under-reports suppression; this one over-reports
+  // it. PAPERCLIP_IN_WORKTREE alone does NOT imply suppressed —
+  // resolveHeartbeatSchedulingSuppression suppresses on worktree only when
+  // `!overrides.allowWorktreeRunExecution` (heartbeat.ts), and that override
+  // is a real runtime value resolved from the `enableWorktreeRunExecution`
+  // experimental setting, not a test-only narrowing. Unqualified, the first
+  // thing this remediation tells a responder to check sends them hunting an
+  // outage that is not there on a worktree instance with the setting armed.
+  assert.match(
+    missingBlock,
+    /PAPERCLIP_IN_WORKTREE[^)]*enableWorktreeRunExecution/,
+    "PAPERCLIP_IN_WORKTREE must be qualified by enableWorktreeRunExecution, since it does not suppress on its own when that setting is armed",
+  );
 });
