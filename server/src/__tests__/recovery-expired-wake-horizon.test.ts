@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -13,7 +13,10 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
+import {
+  BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES,
+  issueRecoveryActionService,
+} from "../services/issue-recovery-actions.js";
 import { attentionService } from "../services/attention.js";
 import { recoveryService } from "../services/recovery/service.js";
 import {
@@ -395,5 +398,158 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
     expect(surfaced[0]!.subject.id).toBe(actionId);
     expect(surfaced[0]!.severity).toBe("high");
     expect(surfaced[0]!.whyNow).toContain("no longer wakes anyone");
+  });
+  it("retires a 25-action burst on one 3-concurrency owner bounded by the sweep limit, not by the owner", async () => {
+    // BLO-19124 AC4 (burst safety): "creating N recovery actions for one owner in a short
+    // window does not depend on that owner absorbing N wakes. Demonstrate with N >= 20
+    // against an owner whose `maxConcurrentRuns` is 3."
+    //
+    // The 07-30 snapshot is the failure this pins: 59 one-shot `wake_owner` beacons landed
+    // on a single owner in one day, that owner runs 3 concurrent slots, and there was no
+    // second chance — so a burst deterministically stranded most of its own recoveries.
+    //
+    // WHICH ASSERTION CARRIES THE AC, and which does not — stated because the obvious
+    // reading is wrong. `expect(enqueueWakeup).not.toHaveBeenCalled()` below looks like the
+    // demonstration and is NOT: `reconcileExpiredRecoveryWakeHorizons` contains no call to
+    // `enqueueWakeup` on any path (the only mention in it is a comment), so that assertion
+    // holds for N=1 as readily as N=25 and cannot fail against today's code. It is kept
+    // deliberately, as a REGRESSION GUARD — it fails the moment someone puts a wake back
+    // into the retirement path — but a guard that cannot fail today demonstrates nothing,
+    // and citing it as the AC4 evidence would be exactly that.
+    //
+    // The AC rests on the two-pass drain instead, which is the only part here that depends
+    // on N. The retiring path is a batch sweep over the table whose batch is bounded by its
+    // OWN `limit` and by nothing else: pass one with `limit: 3` retires exactly 3, and pass
+    // two retires the remaining 22 in one go. Were the batch owner-bounded — the pre-fix
+    // shape, where progress was gated on how many beacons a 3-slot owner could absorb —
+    // pass two would stop at 3 and leave 19 rows `active`. Both counts fail if that
+    // changes, so the burst size is load-bearing rather than decorative.
+    const N = 25;
+    const FIRST_PASS = 3;
+    const companyId = randomUUID();
+    const ownerAgentId = randomUUID();
+    const prefix = `BU${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Burst Co",
+      issuePrefix: prefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: ownerAgentId,
+      companyId,
+      name: "Burst Owner",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      // The AC names this number, so assert the fixture carries it rather than letting a
+      // later edit quietly turn this into a burst against an unbounded owner.
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 3 } },
+      permissions: {},
+    });
+    const [owner] = await db.select().from(agents).where(eq(agents.id, ownerAgentId));
+    expect(
+      (owner!.runtimeConfig as { heartbeat?: { maxConcurrentRuns?: number } }).heartbeat
+        ?.maxConcurrentRuns,
+    ).toBe(3);
+
+    const issueIds: string[] = [];
+    const actionIds: string[] = [];
+    for (let i = 0; i < N; i += 1) {
+      const issueId = randomUUID();
+      issueIds.push(issueId);
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: `burst row ${i}`,
+        // The shape the stranded sweep leaves behind: blocked, assigned, zero blocker edges.
+        status: "blocked",
+        priority: "high",
+        assigneeAgentId: ownerAgentId,
+        issueNumber: 30000 + i,
+        identifier: `${prefix}-${30000 + i}`,
+      });
+      const actionId = randomUUID();
+      actionIds.push(actionId);
+      await db.insert(issueRecoveryActions).values({
+        id: actionId,
+        companyId,
+        sourceIssueId: issueId,
+        kind: "stranded_assigned_issue",
+        status: "active",
+        ownerType: "agent",
+        ownerAgentId,
+        cause: "stranded_assigned_issue",
+        fingerprint: `stranded:${issueId}`,
+        evidence: {},
+        nextAction: "Restore a live execution path.",
+        // 0 DELIVERED wakes is the burst's own signature: every sweep reserved an attempt
+        // and the wake channel refused it, because the owner's 3 slots were saturated by
+        // the other 24. This is the population the 07-30 snapshot measured at 67/131.
+        attemptCount: 0,
+        maxAttempts: 5,
+        timeoutAt: pastHorizon,
+        lastAttemptAt: pastHorizon,
+      });
+    }
+
+    const enqueueWakeup = vi.fn().mockResolvedValue(null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    // Pass one, capped well below the burst: the batch is bounded by the sweep's own limit.
+    const first = await recovery.reconcileExpiredRecoveryWakeHorizons({ now, limit: FIRST_PASS });
+    expect(first).toMatchObject({ checked: FIRST_PASS, escalated: FIRST_PASS });
+
+    // Pass two, uncapped: the whole remainder drains at once. An owner-bounded sweep would
+    // stop at the owner's 3 slots here and strand 19 rows — this is the AC4 assertion.
+    const result = await recovery.reconcileExpiredRecoveryWakeHorizons({ now });
+    expect(result).toMatchObject({
+      checked: N - FIRST_PASS,
+      escalated: N - FIRST_PASS,
+      neverDelivered: N - FIRST_PASS,
+      announced: N - FIRST_PASS,
+    });
+
+    // Regression guard, not the demonstration — see the header comment. Retirement must
+    // stay a table sweep; the day it wakes the owner, a burst is owner-bounded again.
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+
+    const rows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(inArray(issueRecoveryActions.id, actionIds));
+    expect(rows).toHaveLength(N);
+    for (const row of rows) {
+      expect(row.status).toBe("escalated");
+      // AC2's dedicated field: which bound retired it, not prose and not `outcome`.
+      expect(row.retiringBound).toBe("timeout_horizon");
+      // `outcome` must stay null — it is load-bearing for
+      // `issue_recovery_actions_active_source_uq` and writing it reopens BLO-18996's loop.
+      expect(row.outcome).toBeNull();
+    }
+
+    // Every source issue gets its own notice. One announcement per issue, not one for the
+    // batch: an operator triaging BLO-30001 must find it on BLO-30001.
+    const comments = await db
+      .select({ issueId: issueComments.issueId, body: issueComments.body })
+      .from(issueComments)
+      .where(inArray(issueComments.issueId, issueIds));
+    expect(comments).toHaveLength(N);
+    expect(new Set(comments.map((c) => c.issueId)).size).toBe(N);
+
+    // AC3's surviving half, one step removed and said plainly: this asserts the
+    // SUPPRESSION is released on all N, not that a resumer ran. `blocked` with zero
+    // blockers is auto-resumable only while no recovery action holds a status in
+    // `BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES` (issues.ts), and
+    // `escalated` is deliberately not in that set. Leave 1 of 25 `active` and the
+    // resumer skips that row forever — which is the pre-bounds strand.
+    const stillSuppressing = rows.filter((row) =>
+      (BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES as readonly string[]).includes(
+        row.status,
+      ),
+    );
+    expect(stillSuppressing).toHaveLength(0);
   });
 });
