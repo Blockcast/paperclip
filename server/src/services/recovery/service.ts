@@ -866,36 +866,8 @@ type StrandedRecoveryCause =
 
 type StrandedPreviousStatus = "todo" | "in_progress" | "in_review";
 
-const ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES = new Set([
-  "job_failed",
-  "k8s_pod_schedule_failed",
-  "adapter_failed",
-  "external_lifecycle_stale_killed",
-  "k8s_concurrency_guard_unreachable",
-  // BLO-27463: provider capacity throttling. Both codes carry errorFamily
-  // `rate_limit_exhausted` (see heartbeat.ts `readHeartbeatRunErrorFamily`) — the
-  // provider refused to serve, which is infra-class by exactly the BLO-20933
-  // argument used for a vanished pod: the run never got to succeed or fail on its
-  // own merits, and the assignee had no part in it. Moving `ownerAgentId` up the
-  // manager ladder for a provider's capacity decision concentrates load on the
-  // manager for an event nobody on this side caused.
-  //
-  // Their sibling `provider_quota` never reaches here — `resolveStrandedRecoveryCause`
-  // re-causes it via `isProviderQuotaRecovery` — because it carries an authoritative
-  // reset instant and so gets the quota monitor/retry path. These two do not carry
-  // one, so they stay `stranded_assigned_issue` and are corrected here, at the
-  // routing decision, rather than by widening that quota predicate onto runs whose
-  // retry horizon it cannot resolve.
-  //
-  // Scope note: this fixes ROUTING only, not the attempt budget. Deliberately not
-  // added to TRANSIENT_INFRA_CONTINUATION_ERROR_CODES — BLO-5681's counterfactual
-  // asserts a `rate_limit_exhausted` continuation retry still produces a recovery
-  // action at zero tokens, and granting bounded retries here makes that (and two
-  // adjacent retry-count guards) fail. Changing the budget is a separate decision
-  // against those guards, not a side effect of fixing ownership.
-  "rate_limit_exhausted",
-  "provider_throttled_no_progress",
-]);
+// `ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES` is defined next to
+// `TRANSIENT_INFRA_CONTINUATION_ERROR_CODES` below, because it is derived from it.
 
 type SuccessfulRunHandoffRecoveryEvidence = {
   sourceRunId: string | null;
@@ -1618,6 +1590,82 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   // Routing it to `skill_not_found` would suppress retries permanently on a
   // transient condition — the over-suppression hazard BLO-31794 tracks.
   "skill_materialization_pending",
+]);
+
+/**
+ * Codes that are infra-class by CODE ALONE, so a `stranded_assigned_issue` carrying
+ * one is re-dispatched to the existing assignee instead of escalating ownership up
+ * the manager ladder (BLO-20933). Also recorded verbatim as the evidence field
+ * `infraClassCause`'s error-code arm.
+ *
+ * BLO-33223: derived from `TRANSIENT_INFRA_CONTINUATION_ERROR_CODES` rather than
+ * re-listed, because the two answer the SAME question — "was this the agent's
+ * fault?" — and maintaining them separately is the actual defect. This row is the
+ * fourth report in one family (BLO-20933 pod eviction, BLO-31351 git transport,
+ * this row's original `OOMKilled`, now `skill_materialization_pending`), and each
+ * of the first three was closed by enumerating one more cause into one of the two
+ * lists. `skill_materialization_pending` is the proof that that does not converge:
+ * BLO-32055 added it directly above, with a comment correctly reasoning that the
+ * runtime tree vanished underneath the adapter and the run never reached the CLI —
+ * i.e. explicitly infrastructure — and it still laundered two live rows onto the
+ * manager (BLO-33648, BLO-32939, measured 2026-09-22) because the author had no
+ * reason to know a second list existed. Deriving makes that drift unrepresentable:
+ * anything a future change declares transient-infra for the retry budget is
+ * automatically not-the-agent's-fault for routing.
+ *
+ * Chose this over the "invert the default for pod deaths" option the filing floated.
+ * An agent-side crash is also a pod death (`exit code 1, reason=Error`), so "the pod
+ * died" does not discriminate — see `isInfraClassStrandedFailure` below, where the
+ * same reasoning anchored the message arm on the KILL rather than on `reason=`.
+ *
+ * The six members below are infra-class but NOT retryable, so they are not in the
+ * set above and must stay listed here. Conversely `provider_quota` and
+ * `process_lost` are inherited but inert: `resolveStrandedRecoveryCause` gives each
+ * its own cause, so neither ever reaches the `stranded_assigned_issue` test that
+ * reads this set.
+ *
+ * Inheriting `timeout` is the one member included by consistency rather than by a
+ * measured instance: no laundered `timeout` row exists in the live census. It is
+ * kept because escalating a wall-clock exhaustion to a manager who cannot make the
+ * agent faster is the load-concentration BLO-20933 exists to stop. If it proves
+ * wrong, subtract that one code here rather than un-deriving the set.
+ *
+ * Deliberately NOT inherited, and still escalating: `workspace_validation_failed`
+ * and `configuration_incomplete` (both are `manual_repair_required` causes that
+ * never reach this test at all), `skill_not_found`, `issue_cancelled`, and a
+ * `claude_truncated` agent-side crash.
+ */
+const ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES = new Set<string>([
+  ...TRANSIENT_INFRA_CONTINUATION_ERROR_CODES,
+  "job_failed",
+  "k8s_pod_schedule_failed",
+  "external_lifecycle_stale_killed",
+  "k8s_concurrency_guard_unreachable",
+  // BLO-27463: provider capacity throttling. Both codes carry errorFamily
+  // `rate_limit_exhausted` (see heartbeat.ts `readHeartbeatRunErrorFamily`) — the
+  // provider refused to serve, which is infra-class by exactly the BLO-20933
+  // argument used for a vanished pod: the run never got to succeed or fail on its
+  // own merits, and the assignee had no part in it. Moving `ownerAgentId` up the
+  // manager ladder for a provider's capacity decision concentrates load on the
+  // manager for an event nobody on this side caused.
+  //
+  // Their sibling `provider_quota` never reaches here — `resolveStrandedRecoveryCause`
+  // re-causes it via `isProviderQuotaRecovery` — because it carries an authoritative
+  // reset instant and so gets the quota monitor/retry path. These two do not carry
+  // one, so they stay `stranded_assigned_issue` and are corrected here, at the
+  // routing decision, rather than by widening that quota predicate onto runs whose
+  // retry horizon it cannot resolve.
+  //
+  // Scope note: this fixes ROUTING only, not the attempt budget. Deliberately NOT
+  // added to TRANSIENT_INFRA_CONTINUATION_ERROR_CODES — BLO-5681's counterfactual
+  // asserts a `rate_limit_exhausted` continuation retry still produces a recovery
+  // action at zero tokens, and granting bounded retries here makes that (and two
+  // adjacent retry-count guards) fail. Changing the budget is a separate decision
+  // against those guards, not a side effect of fixing ownership. That asymmetry is
+  // precisely why the derivation above is one-way: a code may be infra-class for
+  // ROUTING without earning a retry budget, so it is added here and not there.
+  "rate_limit_exhausted",
+  "provider_throttled_no_progress",
 ]);
 
 // BLO-19124: emitted by the dispatcher's dependency gate (see heartbeat.ts
