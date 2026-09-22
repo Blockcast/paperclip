@@ -202,6 +202,123 @@ export const ISOLATED_RUN_STARTED_METRIC = "paperclip_k8s_isolated_run_started_t
  * Unknown/empty values collapse to "unknown" to guard against future changes.
  */
 export const CCROTATE_CAPACITY_DEFERRED_METRIC = "paperclip_ccrotate_capacity_deferred_total";
+
+/**
+ * Penstock availability-gate probe counter (BLO-29900).
+ *
+ * ## Why this counter has to exist before anything else gets "fixed"
+ *
+ * `CCROTATE_CAPACITY_MAX_PARK_MS` (15m) is a deliberate trade: re-probe often
+ * rather than honour a provider horizon measured going stale within hours
+ * (BLO-23438 — ~76 runs frozen 5.2 days). That trade is sound *only if
+ * re-probing is cheap*, and the clamp's own docblock asserts exactly that —
+ * "Re-probing is a single cached GET".
+ *
+ * The assertion is **conditional, and the condition was unstated**. When
+ * `readPenstockCapacity` yields no verdict (404, non-ok status, unparseable
+ * body, or `state: "unknown"` without an authoritative reason) the gate falls
+ * through to `probePenstockAnthropicModel` — a real `POST /v1/messages`
+ * against the provider that is currently exhausted. The 30s verdict cache
+ * cannot absorb it at a ~15m cadence, and the fallback is anthropic-only,
+ * which matches the firing alert set (`LLMProxyProviderCapacityRetryStorm
+ * {provider="anthropic"}`, no codex equivalent).
+ *
+ * Before this counter, that path was **unobservable**: `penstock_proxy_requests_total`
+ * carries no `route` label, so probe traffic could not be separated from real
+ * dispatch, and both probe paths persisted the same `reason` on a 429. The
+ * fallback's existence is provable from the code; its *rate* is not provable
+ * from anything that existed. This series is what turns that into a
+ * measurement — deliberately shipped on its own, ahead of any suppression, so
+ * the decision to suppress rests on a number rather than on arithmetic over an
+ * unlabelled series (the BLO-29779 error).
+ *
+ * ## Reading it
+ *
+ * - `path="capacity"` counts every capacity **attempt**, whatever it returned.
+ *   It is the denominator: fallback share is
+ *   `{path="messages_fallback"} / {path="capacity"}`.
+ * - `path="messages_fallback"` counts the provider-inference probes actually
+ *   paid for. **An absent series means the fallback has not been taken since
+ *   process start** — the counter is not pre-seeded, deliberately, so a zero
+ *   cannot be confused with a series that was minted by seeding rather than by
+ *   a real probe. Confirm the gate is probing at all by checking the
+ *   `path="capacity"` series is advancing; do not read fallback silence alone
+ *   as health.
+ * - Cache hits do **not** increment. Only real network probes are counted, so
+ *   the ratio above is over re-probes rather than over gate calls.
+ * - **The fail-open set is path-qualified:** `path="messages_fallback"` with
+ *   `outcome=~"error|auth_fault"`. Only the fallback path returns `allow: true`
+ *   without a verdict (`penstock-availability-gate.ts:762` for the auth fault,
+ *   `:804`/`:813` for transport errors), so a *broken* probe is
+ *   indistinguishable from a healthy one on every other signal and that pair is
+ *   what an alert wants. The same two outcomes on `path="capacity"` are **not**
+ *   fail-open: they yield no verdict and fall through to the fallback, which
+ *   then decides. Alerting on `outcome="error"` alone both misses every
+ *   entitlement fail-open and fires on capacity reads that allowed nothing.
+ *
+ * Cardinality: `path` and `outcome` are fixed allow-lists (2 x 6), coerced
+ * here. `provider` is deliberately **not** coerced: it is bounded by its
+ * caller's own `PenstockProvider` union instead, because collapsing a
+ * genuinely new third provider to "unknown" would hide exactly the per-provider
+ * probe cost this series exists to attribute. `model` comes from
+ * operator-managed `adapterConfig.model`, so it is bounded by the models
+ * configured across the fleet — small, and never attacker- or request-supplied.
+ */
+export const PENSTOCK_AVAILABILITY_GATE_PROBE_METRIC = "penstock_availability_gate_probe_total";
+/**
+ * Latency of one availability-gate probe, in seconds
+ * ({@link PENSTOCK_AVAILABILITY_GATE_PROBE_METRIC} is the count).
+ *
+ * Labeled `path` and `provider` only: `model` and `outcome` are omitted on
+ * purpose because a histogram multiplies every label combination by the bucket
+ * count, and the question this series answers — "is the fallback probe
+ * materially more expensive than the capacity GET?" — does not need them. The
+ * counter keeps the finer breakdown.
+ */
+export const PENSTOCK_AVAILABILITY_GATE_PROBE_DURATION_METRIC =
+  "penstock_availability_gate_probe_duration_seconds";
+
+/** Which probe produced a verdict. Mirrors `PenstockProbePath` in the gate. */
+export const KNOWN_PENSTOCK_PROBE_PATHS = ["capacity", "messages_fallback"] as const;
+export type PenstockProbePathLabel = (typeof KNOWN_PENSTOCK_PROBE_PATHS)[number];
+
+/**
+ * Probe outcomes, as an allow-list so a future branch cannot mint a series.
+ *
+ * - `ok` — probe answered and capacity is available (the gate allows).
+ * - `deny_capacity` — answered `penstock.model_capacity_unavailable`.
+ * - `deny_temporary` — answered `penstock.model_temporarily_unavailable`.
+ * - `inconclusive` — the capacity probe returned no verdict. This is the branch
+ *   that triggers the messages fallback, so its rate is the fallback's cause.
+ *   Minted on `path="capacity"` only; the messages probe never returns it.
+ * - `auth_fault` — 401/403. Kept separate from `error` because PEN-2513's whole
+ *   finding is that an entitlement fault read as a capacity signal parks
+ *   forever on a horizon that cannot expire it. Fails **open** on
+ *   `path="messages_fallback"`; on `path="capacity"` it yields no verdict and
+ *   falls through to the fallback.
+ * - `error` — transport failure or timeout. Fails **open** on
+ *   `path="messages_fallback"`; on `path="capacity"` it falls through to the
+ *   fallback instead, so it is not a fail-open there.
+ */
+export const KNOWN_PENSTOCK_PROBE_OUTCOMES = [
+  "ok",
+  "deny_capacity",
+  "deny_temporary",
+  "inconclusive",
+  "auth_fault",
+  "error",
+] as const;
+export type PenstockProbeOutcomeLabel = (typeof KNOWN_PENSTOCK_PROBE_OUTCOMES)[number];
+
+/**
+ * Buckets sized to the gate's own 3s `timeoutMs`: sub-100ms is a healthy
+ * same-region hop, and the 3s/5s tail exists so an aborted probe is visible
+ * rather than collapsed into `+Inf`.
+ */
+const PENSTOCK_PROBE_DURATION_BUCKETS_SECONDS = [
+  0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 3, 5,
+] as const;
+
 export const HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC =
   "paperclip_heartbeat_timer_scheduler_exclusion_total";
 /**
@@ -1036,9 +1153,35 @@ export const PLUGIN_METRIC_DROPPED_METRIC = "paperclip_plugin_metric_dropped_tot
  *   - `mimetype` — plugin-supplied and effectively open.
  * Their metrics still publish; they just publish without those labels. Adding
  * a key here is an explicit cardinality decision, not a convenience.
+ *
+ * `aggregate_key` was added for BLO-32163, and the bound is argued rather than
+ * assumed: it is `alert-aggregate:v1:["<alertname>",<dedupe-domain>]` (see the
+ * alertmanager plugin's `aggregateKeyForAlert`), so its cardinality is
+ * `alertname × dedupe-domain`. `alertname` is already accepted above as bounded
+ * by the alert-rule registry, and `dedupe-domain` is a rule-author opt-in label
+ * that is null on every rule that does not set it. So this sits in the same
+ * order as a key the list already admits, and is bounded by the rule registry —
+ * not by alert *instances*, which is the axis that would actually be unbounded.
+ *
+ * It is load-bearing that `aggregate_key` be a label and not merely present in
+ * the metric name: a wedged-fence page has to name the wedged aggregate to be
+ * actionable, and `alertname` alone cannot do it — two aggregates of the same
+ * rule differing only by dedupe-domain are distinct fences that wedge
+ * independently.
+ *
+ * `phase` (the fence lifecycle column: `active`/`firing`/`cancelling`/
+ * `finalizing`) was in the first cut of this change and is deliberately NOT
+ * here. It is trivially bounded on its own, but it multiplies the fence
+ * metrics' combination count 4× inside their own
+ * {@link PLUGIN_METRIC_CARDINALITY_BUDGET} allowance — ~23 live aggregate keys
+ * × 4 phases exceeds the 50-slot per-name budget, so admitting it would
+ * reintroduce, within one metric, exactly the starvation the per-name ledger
+ * fixes. The responder-facing value it carried is supplied in prose by the
+ * alert annotation instead.
  */
 export const PLUGIN_METRIC_PROMOTABLE_TAG_KEYS = [
   "action",
+  "aggregate_key",
   "alertname",
   "decision",
   "error_code",
@@ -1131,18 +1274,22 @@ export const PLUGIN_METRIC_CONTROL_CHAR_REGEX = /[\u0000-\u001F\u007F]/g;
  * from the inbound Alertmanager webhook, so its length is chosen by whoever
  * authored the firing rule, not by us.
  *
- * The *count* of retained values is already bounded by
- * {@link PLUGIN_METRIC_CARDINALITY_BUDGET}, so an unbounded length is bloat
- * rather than a breach: prom-client never retires a label combination, so each
- * one is re-serialised on every scrape for the process lifetime. Truncating is
- * strictly better than dropping — a truncated `alertname` still identifies the
- * alert to a human reading the series, where a dropped label loses the
- * breakdown entirely.
+ * The *count* of retained values is bounded by
+ * {@link PLUGIN_METRIC_NAME_BUDGET} × {@link PLUGIN_METRIC_CARDINALITY_BUDGET}
+ * — each name carries its own combination pool (BLO-32163), so the two budgets
+ * multiply rather than the second bounding the whole plugin. That product is
+ * still finite, so an unbounded length is bloat rather than a breach:
+ * prom-client never retires a label combination, so each one is re-serialised
+ * on every scrape for the process lifetime. Truncating is strictly better than
+ * dropping — a truncated `alertname` still identifies the alert to a human
+ * reading the series, where a dropped label loses the breakdown entirely.
  *
  * 128 is comfortably above the longest alertname firing fleet-wide when this
  * was written (59 chars, `PhysicalInfra...NearConfiguredMax`) while keeping the
  * worst case bounded at roughly
- * `CARDINALITY_BUDGET x promotable-keys x 128` bytes per plugin.
+ * `NAME_BUDGET x CARDINALITY_BUDGET x promotable-keys x 128` bytes per plugin,
+ * i.e. ~3.8 MB at 50 x 50 x 12 x 128. That is 50x the pre-BLO-32163 figure,
+ * which assumed one combination pool shared across all of a plugin's names.
  */
 export const PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH = 128;
 
@@ -1162,9 +1309,10 @@ export const PLUGIN_METRIC_NAME_BUDGET = 50;
 
 /**
  * Ceiling on distinct `(metric, promoted-label-values)` combinations a single
- * plugin may occupy, per process lifetime. Past it, a write **keeps its
- * `metric` label and drops its promoted labels**, so it still lands on the
- * plugin's real per-name series.
+ * **(plugin, metric name)** pair may occupy, per process lifetime — not a
+ * per-plugin pool; see the BLO-32163 paragraph below for why that distinction
+ * is load-bearing. Past it, a write **keeps its `metric` label and drops its
+ * promoted labels**, so it still lands on the plugin's real per-name series.
  *
  * The two tiers degrade on different axes, and that asymmetry is the whole
  * point (PEN-2799 review of its own first cut):
@@ -1194,10 +1342,29 @@ export const PLUGIN_METRIC_NAME_BUDGET = 50;
  * restart; the alternative is persisting the ledger, which is not worth a DB
  * write per metric.
  *
- * Worst case per plugin is {@link PLUGIN_METRIC_NAME_BUDGET} name-level series
- * + this many full combinations + one `_overflow`, i.e. 151.
+ * This budget is per **(plugin, metric name)**, not per plugin, and that is
+ * load-bearing rather than a refinement (BLO-32163). A single shared pool is
+ * first-come-first-served over a *restart* lottery, so a chatty metric
+ * permanently starves a rare one — and the rare one is exactly the metric a
+ * page depends on. Measured in production 2026-09-17 on
+ * `paperclip-plugin-alertmanager`: 110 distinct series against a shared budget
+ * of 100, with `alertmanager.aggregate.fence_blocked` — the wedged-fence
+ * signal — dropping 91 writes/hr to `label_budget` while
+ * `alertmanager.alert.error` (185/hr) and `alertmanager.firing.deduped`
+ * (101/hr) held the slots. Adding a key to
+ * {@link PLUGIN_METRIC_PROMOTABLE_TAG_KEYS} cannot fix that: a full ledger
+ * rejects every new combination regardless of which keys compose it. Giving
+ * each name its own allowance is what makes a promotion actually reach the
+ * series, so the two changes ship together.
+ *
+ * Halved from 100 to keep the inflation proportionate: worst case per plugin
+ * is {@link PLUGIN_METRIC_NAME_BUDGET} name-level series + that many × this
+ * many combinations + one `_overflow`, i.e. 2551 rather than the previous 151.
+ * 50 is ~2× the largest per-name combination count any live metric has reached
+ * (24, on `alertmanager.alert.error`), and the chatty metrics already lose
+ * combinations under the shared pool, so no live breakdown regresses.
  */
-export const PLUGIN_METRIC_CARDINALITY_BUDGET = 100;
+export const PLUGIN_METRIC_CARDINALITY_BUDGET = 50;
 
 /** Label value that over-name-budget writes collapse into. */
 export const PLUGIN_METRIC_OVERFLOW_NAME = "_overflow";
@@ -2069,6 +2236,8 @@ type HeartbeatRunFailedLabel =
 
 let heartbeatRunFailed: Counter<HeartbeatRunFailedLabel> | null = null;
 let ccrotateCapacityDeferred: Counter<"adapter" | "provider"> | null = null;
+let penstockGateProbe: Counter<"path" | "outcome" | "provider" | "model"> | null = null;
+let penstockGateProbeDuration: Histogram<"path" | "provider"> | null = null;
 let heartbeatTimerSchedulerExclusion: Counter<"reason"> | null = null;
 let heartbeatPostTerminalRunEventDropped: Counter<"status"> | null = null;
 let heartbeatTimerChecked: Counter | null = null;
@@ -2140,18 +2309,21 @@ let pluginMetricDropped: Counter<"plugin_id" | "plugin_key" | "reason" | "metric
  * `never emits a raw control character into the exposition` is what fails if
  * it is ever removed.
  *
- * Entries are keyed by `pluginId` and are never pruned in production — only
+ * Entries are keyed by `pluginId\0name` (BLO-32163 — see
+ * {@link PLUGIN_METRIC_CARDINALITY_BUDGET} for why the ledger is per-name
+ * rather than per-plugin) and are never pruned in production — only
  * {@link __resetMetricsForTest} clears them — so a plugin uninstalled or
  * disabled mid-process keeps its ledger for the worker's lifetime. That is
  * deliberate, not an oversight. The residue is bounded by the same two budgets
- * this ledger exists to enforce (at most 50 names and 100 combinations per
- * plugin, so ~150 short strings), and on the *default* uninstall path pruning
+ * this ledger exists to enforce (at most 50 names × 50 combinations per
+ * plugin), and on the *default* uninstall path pruning
  * would hand a reinstall a fresh budget — turning install/uninstall into a way
  * to mint unbounded series, which is exactly what the bound refuses.
  *
  * That default is a soft delete: the row survives as `uninstalled` and a
- * reinstall reuses it, so `pluginId` — and with it the ledger key — is stable
- * across the cycle. `uninstall(id, removeData = true)` instead hard-deletes the
+ * reinstall reuses it, so `pluginId` — and with it the ledger key prefix — is
+ * stable across the cycle. `uninstall(id, removeData = true)` instead
+ * hard-deletes the
  * row, so the reinstall inserts under a fresh `defaultRandom()` id and gets a
  * clean budget whether or not we prune; there the retained entry is an orphan
  * rather than a hole this closes. The rule is kept unconditional because the
@@ -2191,6 +2363,8 @@ function ensureRegistry(): {
   isolatedStartedCounter: Counter<"agent_id" | "isolation_mode">;
   failedCounter: Counter<HeartbeatRunFailedLabel>;
   capacityDeferredCounter: Counter<"adapter" | "provider">;
+  penstockGateProbeCounter: Counter<"path" | "outcome" | "provider" | "model">;
+  penstockGateProbeDurationHistogram: Histogram<"path" | "provider">;
   heartbeatTimerSchedulerExclusionCounter: Counter<"reason">;
   heartbeatPostTerminalRunEventDroppedCounter: Counter<"status">;
   heartbeatTimerCheckedCounter: Counter;
@@ -2257,6 +2431,8 @@ function ensureRegistry(): {
     || !isolatedRunStarted
     || !heartbeatRunFailed
     || !ccrotateCapacityDeferred
+    || !penstockGateProbe
+    || !penstockGateProbeDuration
     || !heartbeatTimerSchedulerExclusion
     || !heartbeatPostTerminalRunEventDropped
     || !heartbeatTimerChecked
@@ -2357,6 +2533,35 @@ function ensureRegistry(): {
         + "that returned scheduled_retry with scheduledRetryReason='ccrotate_capacity'. "
         + "A sustained non-zero rate means the fleet is quota-stalled.",
       labelNames: ["adapter", "provider"],
+      registers: [registry],
+    });
+    penstockGateProbe = new Counter({
+      name: PENSTOCK_AVAILABILITY_GATE_PROBE_METRIC,
+      help:
+        "Count of penstock availability-gate probes (BLO-29900), labeled by path "
+        + "(capacity = the cached GET /v1/pools/default/capacity; messages_fallback = the "
+        + "real POST /v1/messages taken when that GET yields no verdict), bounded outcome, "
+        + "provider, and model. path=capacity counts every attempt and is the denominator "
+        + "for fallback share. Not pre-seeded: an absent messages_fallback series means the "
+        + "fallback has not been taken since process start, so confirm path=capacity is "
+        + "advancing before reading that silence as health. Cache hits are not counted, so "
+        + "the ratio is over real re-probes. The fail-open set is path-qualified: "
+        + "path=messages_fallback with outcome=error|auth_fault allows dispatch with no "
+        + "verdict, and no other signal distinguishes that from a healthy probe. Those same "
+        + "outcomes on path=capacity are NOT fail-open - they fall through to the fallback, "
+        + "which decides.",
+      labelNames: ["path", "outcome", "provider", "model"],
+      registers: [registry],
+    });
+    penstockGateProbeDuration = new Histogram({
+      name: PENSTOCK_AVAILABILITY_GATE_PROBE_DURATION_METRIC,
+      help:
+        "Seconds spent in one penstock availability-gate probe, labeled by path and provider "
+        + "(BLO-29900). Answers whether the messages_fallback probe is materially more "
+        + "expensive than the capacity GET the clamp's cheapness assumption rests on. "
+        + "Buckets run to 5s so a probe aborted at the gate's 3s timeout stays visible.",
+      labelNames: ["path", "provider"],
+      buckets: [...PENSTOCK_PROBE_DURATION_BUCKETS_SECONDS],
       registers: [registry],
     });
     heartbeatTimerSchedulerExclusion = new Counter({
@@ -2905,7 +3110,7 @@ function ensureRegistry(): {
         + "silently); unpromoted tags stay on the "
         + "plugin_logs row. company_id is deliberately not a label (unbounded "
         + "per tenant). Two cardinality tiers degrade on DIFFERENT axes: past "
-        + "the per-plugin tag-value budget a write keeps its 'metric' label and "
+        + "the per-(plugin, metric) tag-value budget a write keeps its 'metric' label and "
         + "drops its promoted labels, so a rule matching metric=\"<name>\" keeps "
         + "working and sum by (metric) stays exact; only a plugin exceeding the "
         + "much tighter metric-NAME budget collapses to metric=\""
@@ -2924,7 +3129,7 @@ function ensureRegistry(): {
         "Plugin metric writes not published as-submitted, by reason "
         + "(PEN-2799): 'bad_name' (name failed shape/length validation), "
         + "'bad_value' (non-finite or negative -- ctx.metrics.write is a "
-        + "counter increment), 'label_budget' (per-plugin tag-value budget "
+        + "counter increment), 'label_budget' (per-(plugin, metric) tag-value budget "
         + "exhausted, so the promoted labels were dropped but the increment "
         + "still landed on the metric's own series -- totals stay correct, only "
         + "the per-tag breakdown is lost), 'name_budget' (the plugin exceeded "
@@ -3177,6 +3382,8 @@ function ensureRegistry(): {
     isolatedStartedCounter: isolatedRunStarted,
     failedCounter: heartbeatRunFailed,
     capacityDeferredCounter: ccrotateCapacityDeferred,
+    penstockGateProbeCounter: penstockGateProbe,
+    penstockGateProbeDurationHistogram: penstockGateProbeDuration,
     heartbeatTimerSchedulerExclusionCounter: heartbeatTimerSchedulerExclusion,
     heartbeatPostTerminalRunEventDroppedCounter: heartbeatPostTerminalRunEventDropped,
     heartbeatTimerCheckedCounter: heartbeatTimerChecked,
@@ -3375,6 +3582,82 @@ export function recordCcrotateCapacityDeferred(
       : "unknown",
   };
   ensureRegistry().capacityDeferredCounter.inc(labels);
+  return labels;
+}
+
+export interface RecordPenstockAvailabilityGateProbeInput {
+  /** Which probe ran. Coerced to the allow-list; anything else is rejected. */
+  path: string | null | undefined;
+  /** Bounded probe outcome. Coerced to the allow-list. */
+  outcome: string | null | undefined;
+  /** Penstock provider probed (e.g. "anthropic"). */
+  provider: string | null | undefined;
+  /** Model probed, from operator-managed adapter config. */
+  model: string | null | undefined;
+  /**
+   * Wall time the probe took, in seconds. Omit when the caller has no
+   * measurement; the counter still increments so attempt counts never depend on
+   * timing being available.
+   */
+  durationSeconds?: number | null;
+}
+
+/**
+ * Longest `model` label accepted verbatim.
+ *
+ * `model` is operator-managed rather than request-supplied, so this is a
+ * backstop against a malformed config value becoming a permanent series, not a
+ * defence against a hostile caller. Truncating rather than dropping keeps a
+ * genuinely long model id readable and attributable.
+ */
+const PENSTOCK_PROBE_MODEL_LABEL_MAX_LENGTH = 120;
+
+function normalizePenstockProbeLabel<T extends string>(
+  value: string | null | undefined,
+  allowed: readonly T[],
+  fallback: T,
+): T {
+  return typeof value === "string" && (allowed as readonly string[]).includes(value)
+    ? (value as T)
+    : fallback;
+}
+
+/**
+ * Increment {@link PENSTOCK_AVAILABILITY_GATE_PROBE_METRIC} and observe
+ * {@link PENSTOCK_AVAILABILITY_GATE_PROBE_DURATION_METRIC} for one probe.
+ *
+ * Call once per **network probe**, never on a verdict-cache hit: the fallback
+ * share this series exists to measure is a ratio over real re-probes, and
+ * counting cache hits in the denominator would understate it by exactly the
+ * cache hit rate.
+ *
+ * An unrecognised `path` collapses to "capacity" and an unrecognised `outcome`
+ * to "error". Both fallbacks are deliberately the *pessimistic* reading — an
+ * uninstrumented branch shows up as a probe that failed on the cheap path
+ * rather than silently inflating the expensive one, so a labelling mistake
+ * cannot manufacture evidence that the fallback is hot.
+ */
+export function recordPenstockAvailabilityGateProbe(
+  input: RecordPenstockAvailabilityGateProbeInput,
+): { path: PenstockProbePathLabel; outcome: PenstockProbeOutcomeLabel; provider: string; model: string } {
+  const path = normalizePenstockProbeLabel(input.path, KNOWN_PENSTOCK_PROBE_PATHS, "capacity");
+  const outcome = normalizePenstockProbeLabel(input.outcome, KNOWN_PENSTOCK_PROBE_OUTCOMES, "error");
+  const provider = typeof input.provider === "string" && input.provider.length > 0
+    ? input.provider
+    : "unknown";
+  const rawModel = typeof input.model === "string" ? input.model.trim() : "";
+  const model = rawModel.length > 0
+    ? rawModel.slice(0, PENSTOCK_PROBE_MODEL_LABEL_MAX_LENGTH)
+    : "unknown";
+  const labels = { path, outcome, provider, model };
+  const registryHandles = ensureRegistry();
+  registryHandles.penstockGateProbeCounter.inc(labels);
+  if (typeof input.durationSeconds === "number" && Number.isFinite(input.durationSeconds)) {
+    registryHandles.penstockGateProbeDurationHistogram.observe(
+      { path, provider },
+      Math.max(0, input.durationSeconds),
+    );
+  }
   return labels;
 }
 
@@ -4210,7 +4493,11 @@ export function recordPluginMetric(input: RecordPluginMetricInput): void {
       (input.declaredLabels ?? []).map((key) => String(key)),
     );
     const labels: Record<string, string> = { ...identity, metric: name };
-    const comboParts: string[] = [name];
+    // Seeded empty: the ledger key below carries `name`, so repeating it in
+    // every combination string adds no discriminating power — only an extra
+    // copy of it per combination, up to NAME_BUDGET x CARDINALITY_BUDGET of
+    // them per plugin.
+    const comboParts: string[] = [];
     let truncatedValue = false;
     let sanitizedValue = false;
     for (const key of PLUGIN_METRIC_PROMOTABLE_TAG_KEYS) {
@@ -4260,15 +4547,25 @@ export function recordPluginMetric(input: RecordPluginMetricInput): void {
 
     // Tier 2 — the tag-value axis, over combinations ever observed. NUL-joined,
     // which is injective ONLY because no part can contain a NUL — and that is
-    // now enforced here rather than assumed: every promoted value is stripped
-    // of control characters a few lines above, and `name` cleared
-    // PLUGIN_METRIC_NAME_REGEX. See pluginMetricCombinations for why a
-    // collision would be a real leak rather than a miscount.
+    // now enforced here rather than assumed: every part is a promoted value,
+    // and each was stripped of control characters a few lines above. See
+    // pluginMetricCombinations for why a collision would be a real leak rather
+    // than a miscount.
     const combo = comboParts.join("\0");
-    let seen = pluginMetricCombinations.get(pluginId);
+    // Keyed per (plugin, NAME), not per plugin — see
+    // PLUGIN_METRIC_CARDINALITY_BUDGET for why a shared pool starves the rare
+    // metric that a page depends on. The join is injective on both components,
+    // which now needs stating for both rather than one: `name` cleared tier 1
+    // above, so it is one of at most PLUGIN_METRIC_NAME_BUDGET values and
+    // cleared PLUGIN_METRIC_NAME_REGEX, which admits no NUL; `pluginId` is a
+    // `defaultRandom()` UUID (see pluginMetricCombinations), so it cannot
+    // contain one either. It moved from opaque map key to joined key component
+    // in BLO-32163, which is what put it inside this argument.
+    const ledgerKey = `${pluginId}\0${name}`;
+    let seen = pluginMetricCombinations.get(ledgerKey);
     if (!seen) {
       seen = new Set<string>();
-      pluginMetricCombinations.set(pluginId, seen);
+      pluginMetricCombinations.set(ledgerKey, seen);
     }
     if (!seen.has(combo)) {
       if (seen.size >= PLUGIN_METRIC_CARDINALITY_BUDGET) {
@@ -4612,6 +4909,8 @@ export function __resetMetricsForTest(): void {
   isolatedRunStarted = null;
   heartbeatRunFailed = null;
   ccrotateCapacityDeferred = null;
+  penstockGateProbe = null;
+  penstockGateProbeDuration = null;
   heartbeatTimerSchedulerExclusion = null;
   heartbeatPostTerminalRunEventDropped = null;
   heartbeatTimerChecked = null;

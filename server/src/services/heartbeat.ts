@@ -19278,6 +19278,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         resumeAt: Date | null;
         penstockProvider?: string;
         penstockModel?: string;
+        penstockProbePath?: string;
         penstockRetryAfterSeconds?: number | null;
       } | null = null;
       const penstockCapacity = await checkPenstockAvailabilityForAgent({
@@ -19293,6 +19294,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           resumeAt: penstockCapacity.resumeAt,
           penstockProvider: penstockCapacity.provider,
           penstockModel: penstockCapacity.model,
+          penstockProbePath: penstockCapacity.probePath,
           penstockRetryAfterSeconds: penstockCapacity.retryAfterSeconds,
         };
         recordCcrotateCapacityDeferred({
@@ -19432,6 +19434,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             model: capacity.penstockModel,
             reason: capacity.reason,
             retryAfterSeconds: capacity.penstockRetryAfterSeconds,
+            probePath: capacity.penstockProbePath,
             advertisedResumeAtIso: capacity.resumeAt ? capacity.resumeAt.toISOString() : null,
             clampedFromIso: capacityRetryPlan.clampedFromIso,
             // Set once for the chain. `resolveCapacityEscalation` already echoed
@@ -25017,7 +25020,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       reconciliationSweepSucceeded = false;
       logger.error(
         { error: error instanceof Error ? error.message : String(error) },
-        "reapOrphanedRuns: runtime-resource reconciliation sweep failed; backlog gauges will read stale and the freshness arm will page",
+        "reapOrphanedRuns: runtime-resource reconciliation sweep failed; the refresh in the finally below still runs, so the backlog gauges stay current and the freshness arm will page on incomplete reconciliation",
       );
     } finally {
       try {
@@ -34537,6 +34540,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   model: gateResult.model,
                   reason: gateResult.reason,
                   retryAfterSeconds: gateResult.retryAfterSeconds,
+                  probePath: gateResult.probePath,
                   advertisedResumeAtIso: advertisedResumeAtIso,
                   clampedFromIso: capacityRetryPlan.clampedFromIso,
                   // First hop of a fresh chain by construction — this is the
