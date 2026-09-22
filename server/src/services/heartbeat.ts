@@ -18765,12 +18765,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logger.warn(
           {
             index: "heartbeat_runs_crash_recovery_pending_idx",
-            // Which caller probed. The two run concurrently within a tick —
-            // the gauge publisher is tracked without `await` and the gate
-            // probes later in the same tick — and the latch above can be read
-            // as `false` by both before either sets it, so the absent
-            // TRANSITION can legitimately emit two lines. Tagging them is
-            // what stops an operator reading that as two distinct failures.
+            // Which caller probed. NOT a double-warn tag on THIS branch: the
+            // latch read and write above sit in one synchronous block with no
+            // `await` between them, and setCrashRecoveryCandidateIndexPresent
+            // is synchronous (metrics.ts), so on a single-threaded event loop
+            // the latch is atomic and the absent TRANSITION emits exactly one
+            // line per episode no matter which caller wins. Where the tag
+            // earns its place is the `catch` path below: that has no latch at
+            // all, so an unreadable catalog genuinely warns once per caller
+            // per tick, and `source` is what stops an operator reading those
+            // two lines as two distinct failures.
             source,
             remediation:
               "CREATE INDEX CONCURRENTLY heartbeat_runs_crash_recovery_pending_idx ON heartbeat_runs USING btree (finished_at, id) WHERE error_code = 'worker_crashed' AND crash_recovery_completed_at IS NULL",
