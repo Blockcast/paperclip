@@ -14,6 +14,8 @@ const {
   deriveAuthTrustedOriginsMock,
   environmentCustomImagesServiceMock,
   environmentCustomImagesServiceFactoryMock,
+  executionWorkspaceCleanupServiceMock,
+  executionWorkspaceCleanupServiceFactoryMock,
   feedbackExportServiceMock,
   feedbackServiceFactoryMock,
   fakeServer,
@@ -87,6 +89,19 @@ const {
     cleanupExpiredSetupSessions: vi.fn(async () => ({ scanned: 0, timedOut: 0, failed: 0 })),
   };
   const environmentCustomImagesServiceFactoryMock = vi.fn(() => environmentCustomImagesServiceMock);
+  const executionWorkspaceCleanupServiceMock = {
+    reconcileExecutionWorkspaceCleanup: vi.fn(async () => ({
+      stamped: 0,
+      scanned: 0,
+      collected: 0,
+      skipped: 0,
+      failed: 0,
+    })),
+    stampIdleLegacyWorkspaces: vi.fn(async () => 0),
+  };
+  const executionWorkspaceCleanupServiceFactoryMock = vi.fn(
+    () => executionWorkspaceCleanupServiceMock,
+  );
   const routineServiceMock = {
     tickScheduledTriggers: vi.fn(async () => ({ triggered: 0 })),
   };
@@ -114,6 +129,8 @@ const {
     deriveAuthTrustedOriginsMock,
     environmentCustomImagesServiceMock,
     environmentCustomImagesServiceFactoryMock,
+    executionWorkspaceCleanupServiceMock,
+    executionWorkspaceCleanupServiceFactoryMock,
     feedbackExportServiceMock,
     feedbackServiceFactoryMock,
     fakeServer,
@@ -247,6 +264,7 @@ vi.mock("../services/index.js", () => ({
   feedbackService: feedbackServiceFactoryMock,
   bootstrapExecutionPolicyFromEnv: vi.fn(async () => null),
   environmentCustomImageService: environmentCustomImagesServiceFactoryMock,
+  executionWorkspaceCleanupService: executionWorkspaceCleanupServiceFactoryMock,
   heartbeatService: heartbeatServiceFactoryMock,
   instanceSettingsService: vi.fn(() => ({
     getGeneral: vi.fn(async () => ({
@@ -838,6 +856,51 @@ describe("startServer feedback export wiring", () => {
       await vi.waitFor(() => {
         expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1);
         expect(heartbeatServiceMock.reconcileDetachedQueuedRuns).toHaveBeenCalledTimes(1);
+      });
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  // BLO-22984: the collector is the only consumer of `cleanup_eligible_at`, and
+  // an uncalled collector is indistinguishable from one that finds nothing to
+  // collect — which is exactly how the previous worktree reclamation was
+  // believed to work for weeks while freeing zero bytes. Pin both call sites:
+  // the startup recovery pass and the recurring tick. Folding it behind an
+  // earlier reconciler's success must fail here.
+  it("runs the execution-workspace collector at startup and on the periodic tick", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    try {
+      await startServer();
+      await vi.waitFor(() => {
+        expect(
+          executionWorkspaceCleanupServiceMock.reconcileExecutionWorkspaceCleanup,
+        ).toHaveBeenCalledTimes(1);
+      });
+
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockRejectedValueOnce(
+        new Error("unrelated recovery failure"),
+      );
+      intervalCallback?.();
+
+      // `vi.waitFor` rather than counted microtask hops, for the reason given on
+      // the stale-lock sweep above: the collector sits deep in the tick chain and
+      // any reconciler added ahead of it would break a fixed count.
+      await vi.waitFor(() => {
+        expect(
+          executionWorkspaceCleanupServiceMock.reconcileExecutionWorkspaceCleanup,
+        ).toHaveBeenCalledTimes(2);
       });
     } finally {
       setIntervalSpy.mockRestore();

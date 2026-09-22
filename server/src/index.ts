@@ -1675,6 +1675,27 @@ export async function startServer(): Promise<StartedServer> {
 
           if (heartbeatSchedulerStopped) return;
 
+          // BLO-22984: the only consumer of `execution_workspaces.cleanup_eligible_at`.
+          // Deliberately its own tracked pass rather than a link in the recovery
+          // chain below: that chain has a single trailing `.catch`, so one
+          // unrelated reconciler rejecting would silently skip every pass after
+          // it. A collector that never runs is indistinguishable from one that
+          // runs and finds nothing — which is how the previous worktree
+          // reclamation was believed to work for weeks while freeing zero bytes.
+          // It depends on no upstream pass; the stamps it selects on are written
+          // at run end and by its own backfill.
+          trackHeartbeatSchedulerWork(executionWorkspaceCleanup
+            .reconcileExecutionWorkspaceCleanup()
+            .then((workspacesCollected) => {
+              // Unconditional: the zero row is the evidence that it ran at all.
+              logger.info({ ...workspacesCollected }, "periodic execution-workspace collector");
+            })
+            .catch((err) => {
+              logger.error({ err }, "periodic execution-workspace collector failed");
+            }));
+
+          if (heartbeatSchedulerStopped) return;
+
           // BLO-33539: producer-agnostic backstop for a monitor armed on an
           // issue the scheduler can never select. Transition-time guards each
           // cover one demotion path; this pass covers the rest, including
@@ -1830,12 +1851,6 @@ export async function startServer(): Promise<StartedServer> {
                     "periodic failed-wake-dispatch reconciliation retried durable wake failures (BLO-14395)",
                   );
                 }
-              })
-              .then(async () => {
-                // BLO-22984: see the startup pass. Unconditional log.
-                const workspacesCollected = await executionWorkspaceCleanup
-                  .reconcileExecutionWorkspaceCleanup();
-                logger.info({ ...workspacesCollected }, "periodic execution-workspace collector");
               })
               .then(async () => {
                 // BLO-21995: replay PR-reviewer wakes that lost their PR-scope
