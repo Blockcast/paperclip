@@ -460,6 +460,7 @@ import {
   jitterTransientRetryFloor,
   isCapacityGovernedRetryFloor,
   applyCcrotateCapacityDecision,
+  clearCcrotateCapacityDecision,
   resolveCapacityEscalation,
   resolveRoutineScopedRetry,
   CAPACITY_ESCALATION_AFTER_MS,
@@ -20941,6 +20942,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       retryNowRequestedByActorType: input.actor?.actorType ?? null,
       retryNowRequestedByActorId: input.actor?.actorId ?? null,
     };
+    // Booking the due time to `now` invalidates whatever capacity decision
+    // parked this row: the advertised resume instant, retry-after figure and
+    // clamp provenance in `result_json` now describe a park the row no longer
+    // holds. Clear them in the same write so no reader keeps honouring a
+    // provider horizon an actor has just overridden -- the overdue gauge takes
+    // `greatest(scheduled_retry_at, penstockAdvertisedResumeAt)` and would
+    // otherwise go silent on exactly the row a human is watching (BLO-34782).
+    // The chain origin is deliberately kept: it bounds the whole deferral chain
+    // on wall clock and a retry-now is not the start of a new chain.
+    const resultJson =
+      scheduled.run.resultJson == null
+        ? undefined
+        : clearCcrotateCapacityDecision(parseObject(scheduled.run.resultJson));
 
     const updated = await db.transaction(async (tx) => {
       const row = await tx
@@ -20948,6 +20962,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .set({
           scheduledRetryAt: now,
           contextSnapshot,
+          ...(resultJson === undefined ? {} : { resultJson }),
           updatedAt: now,
         })
         .where(and(eq(heartbeatRuns.id, scheduled.run.id), eq(heartbeatRuns.status, "scheduled_retry")))

@@ -366,14 +366,36 @@ export interface CcrotateCapacityDecision {
  * can trust that every `penstock*` field describes the park the row currently
  * holds.
  */
-export function applyCcrotateCapacityDecision(
+/**
+ * Drop every capacity *decision* key from a `result_json`, keeping the chain
+ * origin (`CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY`) and everything unrelated.
+ *
+ * This is the first half of `applyCcrotateCapacityDecision`, split out for the
+ * one writer that invalidates a park without replacing it: `retryScheduledRetryNow`
+ * books `scheduled_retry_at` to `now` on a live parked row. After that write the
+ * advertised resume instant, the retry-after figure and the clamp provenance all
+ * describe a park the row no longer holds, and any reader that trusts them --
+ * the overdue gauge in `queued-run-age-metrics.ts` computes
+ * `greatest(scheduled_retry_at, penstockAdvertisedResumeAt)` -- would keep
+ * honouring a provider horizon a human has just overridden (BLO-34782 review).
+ * Clearing at the write restores the invariant the docblock above promises:
+ * every `penstock*` field describes the park the row currently holds.
+ */
+export function clearCcrotateCapacityDecision(
   previous: Record<string, unknown>,
-  decision: CcrotateCapacityDecision,
 ): Record<string, unknown> {
   const next: Record<string, unknown> = { ...previous };
   for (const key of CCROTATE_CAPACITY_DECISION_KEYS) {
     delete next[key];
   }
+  return next;
+}
+
+export function applyCcrotateCapacityDecision(
+  previous: Record<string, unknown>,
+  decision: CcrotateCapacityDecision,
+): Record<string, unknown> {
+  const next = clearCcrotateCapacityDecision(previous);
   // Set once, then carried forward untouched. See the key's docblock: re-seeding
   // this on each hop would stop the wall-clock horizon from ever elapsing.
   //
