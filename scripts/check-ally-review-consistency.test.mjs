@@ -180,16 +180,20 @@ describe("hasStillPresentDisposition", () => {
   // Drive the same ledger strings through all three sources, taken from the
   // committed files rather than retyped.
   it("accepts exactly the ledger entries the gate and the sweep accept", () => {
-    const notIndentedCode = String.raw`(?! *\t)(?! {4})`;
     const tsSource = readFileSync(
       new URL("../server/src/services/ally-review-detection.ts", import.meta.url),
       "utf8",
     );
+    // The interpolated sub-pattern comes out of the same source, not a retyped
+    // copy: a retyped copy would keep this test green after an edit to the
+    // constant every line-anchored gate pattern shares.
+    const tsNotIndented = tsSource.match(/NOT_INDENTED_CODE = String\.raw`([^`]+)`/);
+    assert.ok(tsNotIndented, "ally-review-detection.ts still defines NOT_INDENTED_CODE");
     const tsRaw = tsSource.match(
       /PRIOR_FINDING_DISPOSITION_PATTERN = new RegExp\(\n\s*String\.raw`([^`]+)`,\n\s*"gim",/,
     );
     assert.ok(tsRaw, "ally-review-detection.ts still defines PRIOR_FINDING_DISPOSITION_PATTERN");
-    const gatePattern = new RegExp(tsRaw[1].replace("${NOT_INDENTED_CODE}", notIndentedCode), "gim");
+    const gatePattern = new RegExp(tsRaw[1].replace("${NOT_INDENTED_CODE}", tsNotIndented[1]), "gim");
 
     const pySource = readFileSync(
       new URL("../.github/scripts/sweep-stalled-ally-reviews.py", import.meta.url),
