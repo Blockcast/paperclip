@@ -5,6 +5,7 @@ import { logger } from "../middleware/logger.js";
 import {
   cleanupExecutionWorkspaceArtifacts,
   inspectWorktreeReclaimSafety,
+  type WorktreeReclaimSafety,
 } from "./workspace-runtime.js";
 
 /**
@@ -53,6 +54,34 @@ export const EXECUTION_WORKSPACE_LEGACY_IDLE_MS = readDurationEnv(
  * realization straddle a sweep.
  */
 const EXECUTION_WORKSPACE_MIN_IDLE_MS = 10 * 60 * 1000;
+
+/**
+ * Why a proven-removal check needs two inputs, not one.
+ *
+ * `cleanupExecutionWorkspaceArtifacts` reports `cleaned`, but computes it as
+ * `!(await directoryExists(path))`, and `directoryExists` is
+ * `stat().catch(() => false)` (workspace-runtime.ts:3416). So EACCES / EIO /
+ * ESTALE — and a path that exists but is not a directory — all read as
+ * "removed". That is the same stat-collapse `inspectWorktreeReclaimSafety`
+ * refuses to make before removal, arriving after it, and it ends in the same
+ * place: archiving nulls `cleanupEligibleAt`, `selectEligible` requires that
+ * stamp to be non-null, so the row is never reconsidered and the tree leaks
+ * permanently while the sweep logs a success. ESTALE is a routine transient on
+ * the network mount these trees live on, and the stat runs immediately after a
+ * `git worktree remove` has rewritten the parent directory.
+ *
+ * Returns the `retained_*` reason to defer under, or null to archive. Deferring
+ * a tree that *was* removed is free — the next window stats it, gets ENOENT and
+ * archives it — so this is fail-closed in the cheap direction.
+ */
+export function classifyRemovalProof(
+  cleaned: boolean,
+  proofReason: WorktreeReclaimSafety["reason"] | null,
+): string | null {
+  if (!cleaned) return "uncleaned";
+  if (proofReason && proofReason !== "missing") return proofReason;
+  return null;
+}
 
 function readDurationEnv(name: string, fallback: number): number {
   const raw = Number.parseInt(process.env[name] ?? "", 10);
@@ -245,14 +274,25 @@ export function executionWorkspaceCleanupService(db: Db) {
         // `cleaned: false`. Archiving on that path would null the stamp, which
         // `selectEligible` requires, so the row could never be reconsidered —
         // turning a recoverable leak into a permanent one and logging it as a
-        // success. Archive only on a proven removal.
-        if (!cleanup.cleaned) {
-          await deferCandidate(candidate.id, "uncleaned");
+        // success. Archive only on a proven removal, and see
+        // `classifyRemovalProof` for why `cleaned` alone is not that proof.
+        //
+        // Kept collector-local rather than changing `cleaned` itself, so the
+        // persist-rollback and operator-PATCH callers of
+        // `cleanupExecutionWorkspaceArtifacts` keep their existing contract.
+        const removalProof = cleanup.cleaned && worktreePath
+          ? await inspectWorktreeReclaimSafety(worktreePath)
+          : null;
+        const retainReason = classifyRemovalProof(cleanup.cleaned, removalProof?.reason ?? null);
+        if (retainReason) {
+          await deferCandidate(candidate.id, retainReason);
           skipped += 1;
           logger.warn(
             {
               executionWorkspaceId: candidate.id,
               worktreePath,
+              reason: retainReason,
+              detail: removalProof?.detail ?? null,
               warnings: cleanup.warnings,
             },
             "reconcileExecutionWorkspaceCleanup: retained worktree still present after cleanup",
