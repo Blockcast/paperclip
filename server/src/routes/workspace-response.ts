@@ -368,6 +368,11 @@ export function publicIssueExecutionWorkspaceSettings(
  * Enumerated over a walk on purpose: `config` holds unrelated operator prose (`variables`,
  * `disabledReason`, breakdown templates) that is not workspace-runtime material and must survive
  * intact, so a blanket mask over the blob would be wrong in the other direction.
+ *
+ * This read projection is only half of the fix; the write-side counterpart that keeps it from
+ * destroying the values it masks is `restoreWithheldPipelineStageConfig` in `../redaction.ts`.
+ * That lives there rather than here because `services/pipelines.ts` is what has to call it, and
+ * services do not import from the route layer.
  */
 export function publicPipelineStageConfig(config: unknown, viewer: WorkspaceRuntimeViewer): unknown {
   if (viewer.revealRuntimeConfig) return config;
@@ -386,12 +391,6 @@ export function publicPipelineStageConfig(config: unknown, viewer: WorkspaceRunt
   return projected;
 }
 
-/**
- * PEN-3266. The read projection above is only half of the fix; the write-side counterpart that keeps
- * it from destroying the values it masks is `restoreWithheldPipelineStageConfig` in `../redaction.ts`.
- * It lives there rather than here because `services/pipelines.ts` is what has to call it, and services
- * do not import from the route layer.
- */
 export function publicExecutionWorkspace(
   workspace: ExecutionWorkspace,
   viewer: WorkspaceRuntimeViewer,

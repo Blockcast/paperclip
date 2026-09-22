@@ -961,32 +961,88 @@ export function restoreWithheldPipelineStageConfig(incoming: unknown, existing: 
   if (!isPlainObject(incoming)) return incoming;
   const existingRecord = isPlainObject(existing) ? existing : {};
 
+  // BOTH incoming keys restore from the SAME stored block, and that asymmetry is the whole
+  // point: `persistedStageConfig` (`services/pipelines.ts`) destructures `automation` out
+  // before every write, so no stored row can carry one. Keying the `automation` branch on
+  // `existing.automation` therefore always found `undefined` and stripped the command instead
+  // of restoring it — and `upsertStageAutomationRoutine` then rebuilds `onEnter` from that
+  // stripped context (`onEnter: { type, routineId, ...input.executionContext }`), overwriting
+  // the copy the `onEnter` branch had just restored correctly. `onEnter` is the only persisted
+  // copy of this carrier; `automation` is derived from it on read.
+  const storedBlock = isPlainObject(existingRecord.onEnter) ? existingRecord.onEnter : {};
+  const storedSettings = storedBlock.executionWorkspaceSettings;
+
   const restored: Record<string, unknown> = { ...incoming };
   for (const key of ["onEnter", "automation"]) {
     const block = restored[key];
     if (!isPlainObject(block)) continue;
     if (!("executionWorkspaceSettings" in block)) continue;
-    const existingBlock = isPlainObject(existingRecord[key])
-      ? (existingRecord[key] as Record<string, unknown>)
-      : {};
     restored[key] = {
       ...block,
-      executionWorkspaceSettings: restoreWithheldValue(
-        block.executionWorkspaceSettings,
-        existingBlock.executionWorkspaceSettings,
-      ),
+      executionWorkspaceSettings: restoreWithheldValue(block.executionWorkspaceSettings, storedSettings),
     };
   }
   return restored;
 }
 
+function readArrayElementIdentity(value: unknown): { key: string; value: string } | null {
+  if (!isPlainObject(value)) return null;
+  // The mask's OWN set, not a copy: an identity key added there must start being honoured here in
+  // the same commit, or the restore silently loses the ability to align on it.
+  for (const key of WORKSPACE_RUNTIME_IDENTITY_KEYS) {
+    const candidate = value[key];
+    if (typeof candidate === "string" && candidate.length > 0) return { key, value: candidate };
+  }
+  return null;
+}
+
+/**
+ * PEN-3266. Which stored element an incoming array element should restore from.
+ *
+ * Aligning by index alone is wrong for a read-modify-write that removes or reorders an
+ * element: the sentinel at index *i* would be restored from the stored element at index *i*,
+ * silently writing one service's real command onto another. `workspaceRuntime` holds exactly
+ * such arrays (`services`, and the `commands`/`jobs` siblings `maskWorkspaceRuntimeForRead`
+ * walks), and that mask deliberately lets identity keys through on those entries — so an
+ * unentitled round-tripper still holds a real `id`/`name` to key on.
+ *
+ * Ambiguity fails closed: no identity, or an identity matching zero or several stored
+ * elements, yields `undefined`, and the caller then leaves the incoming value untouched
+ * rather than guessing a neighbour. Index alignment survives only as the fallback for
+ * identity-less elements in an array that demonstrably did not change length.
+ */
+function matchExistingArrayElement(
+  incoming: unknown,
+  index: number,
+  incomingLength: number,
+  existingArray: readonly unknown[],
+): unknown {
+  const identity = readArrayElementIdentity(incoming);
+  if (identity) {
+    const matches = existingArray.filter((candidate) => {
+      const candidateIdentity = readArrayElementIdentity(candidate);
+      return candidateIdentity?.key === identity.key && candidateIdentity?.value === identity.value;
+    });
+    return matches.length === 1 ? matches[0] : undefined;
+  }
+  return existingArray.length === incomingLength ? existingArray[index] : undefined;
+}
+
 function restoreWithheldValue(incoming: unknown, existing: unknown): unknown {
   if (typeof incoming === "string") {
-    return incoming.includes(REDACTED_EVENT_VALUE) ? existing : incoming;
+    if (!incoming.includes(REDACTED_EVENT_VALUE)) return incoming;
+    // Nothing stored to put back. Leave the sentinel rather than returning `undefined`, which
+    // would strip the key entirely — that is the destructive write this guard exists to stop,
+    // and a literal sentinel in the config is at least visibly wrong instead of silently gone.
+    // `null` is a real stored value ("no command configured") and is restored normally.
+    return existing === undefined ? incoming : existing;
   }
   if (Array.isArray(incoming)) {
     const existingArray = Array.isArray(existing) ? existing : [];
-    return incoming.map((value, index) => restoreWithheldValue(value, existingArray[index]));
+    return incoming.map((value, index) => restoreWithheldValue(
+      value,
+      matchExistingArrayElement(value, index, incoming.length, existingArray),
+    ));
   }
   if (!isPlainObject(incoming)) return incoming;
 

@@ -63,6 +63,21 @@ function stageConfig() {
   };
 }
 
+/**
+ * What a stage row can ACTUALLY hold, and the distinction the first version of this suite missed.
+ *
+ * `persistedStageConfig` (`services/pipelines.ts`) destructures `automation` out before every write,
+ * so no stored config can carry one — `onEnter` is the only persisted copy of this carrier and
+ * `automation` is derived from it on read. Passing the full `stageConfig()` as the stored side was an
+ * impossible fixture, and it is precisely what made the `automation` restore assertions green while
+ * the production path stripped the command to `undefined` and then overwrote the real value with it.
+ * A stored fixture that cannot exist cannot fail, which is why the stated mutation check missed it.
+ */
+function storedStageConfig() {
+  const { automation: _automation, ...rest } = stageConfig();
+  return rest;
+}
+
 function withheld(config: unknown) {
   return publicPipelineStageConfig(config, WITHHELD_WORKSPACE_RUNTIME_VIEWER) as Record<string, any>;
 }
@@ -122,7 +137,14 @@ describe("PEN-3266 pipeline stage config withholding", () => {
  * otherwise persist the sentinel over the real command — a silent destructive write, not a disclosure.
  */
 describe("PEN-3266 pipeline stage config write-back guard", () => {
-  const stored = stageConfig();
+  const stored = storedStageConfig();
+
+  it("pins the stored fixture to a shape a stage row can actually hold", () => {
+    // Guards the fixture itself: if `automation` creeps back in here, every assertion below that
+    // exercises the derived-copy branch silently stops testing the production path.
+    expect("automation" in stored).toBe(false);
+    expect(stored.onEnter.executionWorkspaceSettings.workspaceStrategy.provisionCommand).toBe(COMMAND_SENTINEL);
+  });
 
   it("restores a masked command instead of persisting the sentinel", () => {
     const roundTripped = withheld(stageConfig());
@@ -166,6 +188,100 @@ describe("PEN-3266 pipeline stage config write-back guard", () => {
   it("is inert when there is no stored config to restore from", () => {
     const incoming = { onEnter: { type: "run_routine", routineId: "r-2" } };
     expect(restoreWithheldPipelineStageConfig(incoming, null)).toEqual(incoming);
+  });
+
+  /**
+   * The derived `automation` block must restore from the STORED `onEnter`, because that is the only
+   * place the value is kept. Keying it on `existing.automation` found `undefined` on every real row
+   * and stripped the command instead of restoring it — and `upsertStageAutomationRoutine` then
+   * rebuilds `onEnter` from that stripped context, overwriting the copy the `onEnter` branch had just
+   * restored correctly. Net effect: renaming a stage destroyed its provision command.
+   */
+  it("restores the derived automation copy from the stored onEnter, not from a stored automation key", () => {
+    const roundTripped = withheld(stageConfig());
+    roundTripped.name = "Renamed stage";
+
+    const restored = restoreWithheldPipelineStageConfig(roundTripped, stored) as Record<string, any>;
+    const automationSettings = restored.automation.executionWorkspaceSettings;
+
+    // The precise production failure: stripped to `undefined` rather than left as a sentinel.
+    expect(automationSettings).toBeDefined();
+    expect(automationSettings.workspaceStrategy.provisionCommand).toBe(COMMAND_SENTINEL);
+    expect(automationSettings.workspaceStrategy.teardownCommand).toBe(`${COMMAND_SENTINEL}-teardown`);
+    expect(automationSettings.workspaceRuntime).toEqual(stored.onEnter.executionWorkspaceSettings.workspaceRuntime);
+  });
+
+  it("leaves a sentinel in place rather than deleting the field when nothing is stored to restore", () => {
+    // `undefined` here would strip the key entirely, which is the destructive write the guard exists
+    // to stop. A literal sentinel is visibly wrong; a vanished command is silently gone.
+    const incoming = {
+      onEnter: {
+        type: "run_routine",
+        executionWorkspaceSettings: { workspaceStrategy: { provisionCommand: REDACTED_EVENT_VALUE } },
+      },
+    };
+    const restored = restoreWithheldPipelineStageConfig(incoming, { onEnter: { type: "run_routine" } }) as Record<string, any>;
+    expect("provisionCommand" in restored.onEnter.executionWorkspaceSettings.workspaceStrategy).toBe(true);
+    expect(restored.onEnter.executionWorkspaceSettings.workspaceStrategy.provisionCommand).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  /**
+   * `workspaceRuntime` holds arrays (`services`, and the `commands`/`jobs` siblings the mask walks),
+   * every command value masked for an unentitled reader. Restoring them by index means a
+   * read-modify-write that removes or reorders an element writes one service's real command onto
+   * another — a silent integrity fault, not a disclosure. `maskWorkspaceRuntimeForRead` deliberately
+   * lets identity keys (`id`/`name`/`label`/`title`) through on those entries, so there is a stable
+   * key to align on.
+   */
+  it("aligns array elements by identity, not position, when an element is removed", () => {
+    const storedRuntime = {
+      onEnter: {
+        type: "run_routine",
+        executionWorkspaceSettings: {
+          workspaceRuntime: {
+            services: [
+              { name: "api", command: `${COMMAND_SENTINEL}-api` },
+              { name: "web", command: `${COMMAND_SENTINEL}-web` },
+            ],
+          },
+        },
+      },
+    };
+    // The caller dropped "api" and kept the masked "web" entry — now at index 0.
+    const incoming = {
+      onEnter: {
+        type: "run_routine",
+        executionWorkspaceSettings: {
+          workspaceRuntime: { services: [{ name: "web", command: REDACTED_EVENT_VALUE }] },
+        },
+      },
+    };
+
+    const restored = restoreWithheldPipelineStageConfig(incoming, storedRuntime) as Record<string, any>;
+    const services = restored.onEnter.executionWorkspaceSettings.workspaceRuntime.services;
+    expect(services).toHaveLength(1);
+    // Index alignment would have handed "web" the command belonging to "api".
+    expect(services[0].command).toBe(`${COMMAND_SENTINEL}-web`);
+  });
+
+  it("does not guess a neighbour when an identity-less array element cannot be aligned", () => {
+    const storedRuntime = {
+      onEnter: {
+        type: "run_routine",
+        executionWorkspaceSettings: { workspaceRuntime: { commands: ["stored-first", "stored-second"] } },
+      },
+    };
+    const incoming = {
+      onEnter: {
+        type: "run_routine",
+        executionWorkspaceSettings: { workspaceRuntime: { commands: [REDACTED_EVENT_VALUE] } },
+      },
+    };
+
+    const restored = restoreWithheldPipelineStageConfig(incoming, storedRuntime) as Record<string, any>;
+    // Length changed and there is no identity key, so the sentinel stays rather than picking up
+    // whichever string happens to sit at index 0.
+    expect(restored.onEnter.executionWorkspaceSettings.workspaceRuntime.commands).toEqual([REDACTED_EVENT_VALUE]);
   });
 
   it("passes through an incoming config that is not an object", () => {
