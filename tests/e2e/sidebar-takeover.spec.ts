@@ -34,11 +34,22 @@ const APP_SIDEBAR_EXPANDED_MARKER = "Open search";
 
 // `page.goto` resolves on the document `load` event, but the board is a
 // client-rendered SPA: React mounts and paints *after* that. Every assertion in
-// this file reads `Layout`'s output, and `Layout` emits `#main-content` and
-// `[data-secondary-sidebar]` in the same render commit — `hasSecondarySidebar`
-// is derived synchronously from `location.pathname`, with no data dependency —
-// so the secondary pane can never lag the app shell. A missing pane therefore
-// always means "the app has not rendered yet", never "the takeover model broke".
+// this file reads `Layout`'s output: `Layout` emits `#main-content`
+// (`Layout.tsx`) and renders `<SecondarySidebar/>`, which carries
+// `[data-secondary-sidebar]` (`SecondarySidebar.tsx`), in the same render
+// commit.
+//
+// On the *company-settings* routes this file exercises, `isCompanySettingsRoute`
+// is derived synchronously from `location.pathname` with no data dependency, so
+// the secondary pane cannot lag the app shell: a missing pane always means "the
+// app has not rendered yet", never "the takeover model broke".
+//
+// That scoping is deliberate — it does NOT extend to the plugin `routeSidebar`
+// branch of the same resolver, where `routeSidebarSlot` derives from
+// `usePluginSlots` (a `useQuery`, see `ui/src/plugins/slots.tsx`). On a plugin
+// route the pane genuinely can arrive after the shell, so a plugin-route test
+// added later (see the file header) must wait on the pane itself and cannot
+// inherit this precondition as a guarantee.
 //
 // Charging that cold-boot latency to the default 5s `expect` budget is what made
 // this file flaky (BLO-33478): on a loaded CI runner, first render after `load`
@@ -51,7 +62,17 @@ const APP_SIDEBAR_EXPANDED_MARKER = "Open search";
 // It also closes a false *positive*: `expect(secondary).toHaveCount(0)` after
 // navigating off a takeover route is satisfied by a blank page, so without this
 // gate those assertions could pass while the app had rendered nothing at all.
-const APP_SHELL_READY_TIMEOUT = 30_000;
+//
+// Bounded by the per-test cap, not picked for headroom alone: the tests below
+// navigate at most twice, and the suite default is 60s
+// (`tests/e2e/playwright.config.ts`). At 30s a two-navigation test could spend
+// 2 x 30s and die on the generic Playwright timeout instead of this
+// precondition's self-describing `#main-content` message — losing the
+// diagnostic exactly in the slowest case it exists for. 20s keeps the
+// worst case (2 x 20s = 40s) inside the cap, so the precondition can always
+// expire on its own terms, while still giving 4x the 5s budget that made this
+// file flaky.
+const APP_SHELL_READY_TIMEOUT = 20_000;
 
 async function gotoAppRoute(page: Page, url: string) {
   await page.goto(url);
