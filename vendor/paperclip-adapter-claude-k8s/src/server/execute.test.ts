@@ -1630,7 +1630,7 @@ describe("execute: waitForPod edge cases", () => {
   it("labels an init-container failure that took the pod to phase=Failed", async () => {
     mockCoreListPods.mockResolvedValue({
       items: [{
-        metadata: { name: "pod-x" },
+        metadata: { name: "pod-x", ownerReferences: [jobOwnerRef("uid-1")] },
         spec: { nodeName: "k8s-paperclip-1" },
         status: {
           phase: "Failed",
@@ -1660,7 +1660,7 @@ describe("execute: waitForPod edge cases", () => {
   it("still reports the terminated label when the main container died", async () => {
     mockCoreListPods.mockResolvedValue({
       items: [{
-        metadata: { name: "pod-x" },
+        metadata: { name: "pod-x", ownerReferences: [jobOwnerRef("uid-1")] },
         status: {
           phase: "Failed",
           initContainerStatuses: [{
@@ -1691,7 +1691,7 @@ describe("execute: waitForPod edge cases", () => {
   it("still reports Pod scheduling failed when the pod is unschedulable", async () => {
     mockCoreListPods.mockResolvedValue({
       items: [{
-        metadata: { name: "pod-x" },
+        metadata: { name: "pod-x", ownerReferences: [jobOwnerRef("uid-1")] },
         status: {
           phase: "Pending",
           conditions: [{
