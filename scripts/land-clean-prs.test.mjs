@@ -349,7 +349,8 @@ describe("Ally verdict-mirror statuses are not CI checks", () => {
     assert.equal(row.action, "enqueue", "CI settled 3h ago; a 2m-old mirror is not a check");
   });
 
-  it("still blocks on the review itself, so the verdict is not lost", () => {    const row = classify({
+  it("still blocks on the review itself, so the verdict is not lost", () => {
+    const row = classify({
       statusCheckRollup: [{ name: "verify", conclusion: "SUCCESS" }, ...ALLY_RED],
       reviews: [review({ body: body(HEAD, { important: 1 }) })],
     });
