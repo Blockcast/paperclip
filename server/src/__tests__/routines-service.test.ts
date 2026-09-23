@@ -18,6 +18,7 @@ import {
   issueComments,
   issueInboxArchives,
   issueReadStates,
+  issueRecoveryActions,
   issueRelations,
   issues,
   projectWorkspaces,
@@ -2196,6 +2197,57 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(predecessor.status).toBe("blocked");
     expect(predecessor.cancelledAt).toBeNull();
     expect(getRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue")).toBe(0);
+  });
+
+  // Ally review, BLO-31996: a live recovery action is a wake path stored in
+  // `issue_recovery_actions`, not `issue_relations`, so the blocker-edge check
+  // alone would still let the supersede cancel its source row.
+  it("does not supersede a stale predecessor that has an active recovery action", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "coalesce_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const dependencyParked = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "queued",
+      runStartedAt: new Date(Date.now() - YOUNG_RETRY_AGE_MS),
+      issueCreatedAt: new Date(Date.now() - STALE_FIRE_AGE_MS),
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+      bindExecutionRun: true,
+    });
+
+    await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: dependencyParked.issue.id,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      cause: "test",
+      fingerprint: randomUUID(),
+      nextAction: "wait",
+    });
+    await db
+      .update(issues)
+      .set({ status: "blocked" })
+      .where(eq(issues.id, dependencyParked.issue.id));
+
+    resetRoutineDispatchMetrics();
+    await svc.runRoutine(routine.id, { source: "schedule" });
+
+    const [predecessor] = await db.select().from(issues).where(eq(issues.id, dependencyParked.issue.id));
+    expect(predecessor.status).toBe("blocked");
+    expect(predecessor.cancelledAt).toBeNull();
+    expect(getRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue")).toBe(0);
+    const [recoveryAction] = await db
+      .select({ status: issueRecoveryActions.status })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, dependencyParked.issue.id));
+    expect(recoveryAction.status).toBe("active");
   });
 
   // Ally review, BLO-31996: the activity row is the second supersede receipt,
