@@ -8,6 +8,7 @@
  */
 
 import { randomUUID, timingSafeEqual } from "node:crypto";
+import { hostname as osHostname } from "node:os";
 import type { PluginContext, PluginFencingPrecondition, PluginWebhookInput } from "@paperclipai/plugin-sdk";
 import {
   ACCEPTED_SCHEMA_VERSIONS,
@@ -132,11 +133,47 @@ const WORKER_INSTANCE_ID = randomUUID();
  * (Kubernetes recreates a StatefulSet ordinal only after the previous pod has
  * fully terminated); across slots, nothing is ever assumed dead.
  *
- * Falls back to a per-process value when `HOSTNAME` is unset, which is
+ * `HOSTNAME` alone is not enough to find it, and in production it never was.
+ * The plugin host forks this worker as a child whose env does NOT carry
+ * `HOSTNAME` — measured 2026-09-23 on `paperclip-0`, where the parent server
+ * process has `HOSTNAME=paperclip-0` and the alertmanager plugin child has no
+ * `HOSTNAME` entry in `/proc/<pid>/environ` at all. So the fallback below was
+ * the *only* path ever taken, and it mints a fresh value per process: every
+ * held fence in the live table read `unknown-slot:<uuid>`, which by
+ * construction equals no other process's slot. Both identity predicates
+ * (`beginAggregateFiring`'s steal and `reconcileAbandonedAggregateFences`)
+ * require `owner_slot = <mine>`, so neither could ever match and the
+ * restart-safety fix was inert from the day it shipped. The only drain that
+ * ever fired was the elapsed-time abandonment backstop.
+ *
+ * `os.hostname()` reads the UTS namespace instead of the env, so it returns
+ * the pod name in the child regardless of what the host forwards. That is the
+ * stable, per-host value this design always wanted.
+ *
+ * Still falls back to a per-process value when no hostname resolves, which is
  * fail-safe: an unidentifiable slot matches no stored slot, so it steals
- * nothing.
+ * nothing. `localhost` is treated as unidentifiable for the opposite reason —
+ * it is a generic name two unrelated hosts can share, and a wrongly *shared*
+ * slot would let them steal each other's live fences.
  */
-const WORKER_SLOT = process.env.HOSTNAME?.trim() || `unknown-slot:${WORKER_INSTANCE_ID}`;
+export function resolveWorkerSlot(
+  fallbackId: string,
+  env: NodeJS.ProcessEnv = process.env,
+  readOsHostname: () => string = osHostname,
+): string {
+  const fromEnv = env.HOSTNAME?.trim();
+  if (fromEnv) return fromEnv;
+  let fromOs = "";
+  try {
+    fromOs = readOsHostname().trim();
+  } catch {
+    fromOs = "";
+  }
+  if (fromOs && fromOs !== "localhost") return fromOs;
+  return `unknown-slot:${fallbackId}`;
+}
+
+const WORKER_SLOT = resolveWorkerSlot(WORKER_INSTANCE_ID);
 
 /** Test seam: the identity this process claims fences under. */
 export function workerFenceIdentity(): { instanceId: string; slot: string } {

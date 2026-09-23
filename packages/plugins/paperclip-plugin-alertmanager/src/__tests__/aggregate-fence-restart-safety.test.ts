@@ -29,6 +29,7 @@ import {
   type AggregateFenceWaitPolicy,
   handleWebhook,
   reconcileAbandonedAggregateFences,
+  resolveWorkerSlot,
   workerFenceIdentity,
 } from "../webhook-handler.js";
 import { DEFAULT_ISSUE_ROUTE_MAP } from "../constants.js";
@@ -1114,5 +1115,49 @@ describe("BLO-31036 — state and event publication carry the generation too", (
     expect(fence?.firing_token).toBe("token-replacement");
     expect(sent!.match.firing_token).not.toBe("token-replacement");
     expect(sent!.match.firing_token).toEqual(expect.any(String));
+  });
+});
+
+/**
+ * The slot itself — the input every identity predicate above is keyed on.
+ *
+ * The cases above all use `workerFenceIdentity().slot` on both sides, so they
+ * pass whatever that value happens to be. In production it was
+ * `unknown-slot:<uuid>`, freshly minted per process, because the plugin host
+ * forks this worker without `HOSTNAME` in its process environment (measured on
+ * `paperclip-0`, 2026-09-23: the parent server process carries it, the
+ * alertmanager plugin child does not). A per-process slot equals no stored
+ * slot, so both identity arms were dead and only the elapsed-time backstop ever
+ * drained a fence. This block is the guard the suite was missing: it asserts
+ * the slot is a real host identity, rather than asserting that the predicates
+ * agree with themselves.
+ */
+describe("resolveWorkerSlot", () => {
+  it("prefers HOSTNAME when the process environment carries it", () => {
+    expect(resolveWorkerSlot("id-1", { HOSTNAME: " paperclip-0 " }, () => "ignored")).toBe(
+      "paperclip-0",
+    );
+  });
+
+  it("falls back to the UTS hostname when HOSTNAME is absent — the production case", () => {
+    // Reverting the os.hostname() arm fails here and only here.
+    expect(resolveWorkerSlot("id-2", {}, () => "paperclip-0")).toBe("paperclip-0");
+  });
+
+  it("is stable across processes in the same pod, which is what makes the steal possible", () => {
+    const readOsHostname = () => "paperclip-0";
+    expect(resolveWorkerSlot("dead-instance", {}, readOsHostname)).toBe(
+      resolveWorkerSlot("live-instance", {}, readOsHostname),
+    );
+  });
+
+  it("stays per-process when nothing identifies the host, so it steals nothing", () => {
+    expect(resolveWorkerSlot("id-3", {}, () => "")).toBe("unknown-slot:id-3");
+    expect(resolveWorkerSlot("id-4", {}, () => "localhost")).toBe("unknown-slot:id-4");
+    expect(
+      resolveWorkerSlot("id-5", {}, () => {
+        throw new Error("no UTS namespace");
+      }),
+    ).toBe("unknown-slot:id-5");
   });
 });
