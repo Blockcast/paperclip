@@ -1742,22 +1742,36 @@ jobs:
       # check asserts that vendored source carries a log row, not that the
       # recorded version is true. The failure is quiet and lands later: the next
       # vendored change reads the stale table field and bumps from there.
+      # BLO-21857 widens it to the lockfile's two copies, which drifted the same
+      # way on #1459 (doc said -blockcast.2, package said .3).
       - name: Verify vendored version is recorded consistently
         run: |
           set -euo pipefail
-          pkg=$(node -p 'require("./package.json").version')
-          recorded=$(sed -n 's/^| Current version | `\([^`]*\)`.*/\1/p' PROVENANCE.md | head -1)
-          echo "package.json:   $pkg"
-          echo "PROVENANCE.md:  $recorded"
-          if [ -z "$recorded" ]; then
+          # `{p;q}` rather than `| head -1`: under `set -o pipefail` a sed that
+          # keeps writing after head exits fails the step on SIGPIPE. Safe today
+          # only because there is exactly one matching row — a property of the
+          # document, not of the pipeline.
+          doc=$(sed -n '/^| Current version |/{s/^| Current version | `\([^`]*\)`.*/\1/p;q}' PROVENANCE.md)
+          if [ -z "$doc" ]; then
             echo "::error::No 'Current version' row found in PROVENANCE.md's Origin table."
             exit 1
           fi
-          if [ "$pkg" != "$recorded" ]; then
-            echo "::error::PROVENANCE.md records version '$recorded' but package.json is '$pkg'."
-            echo "Update the 'Current version' row in vendor/paperclip-adapter-claude-k8s/PROVENANCE.md to: $pkg"
-            exit 1
-          fi
+          # The lockfile carries the version twice and npm ci does not compare
+          # either copy against package.json, so both are checked explicitly.
+          pkg=$(node -p 'require("./package.json").version')
+          lock=$(node -p 'require("./package-lock.json").version')
+          lock_self=$(node -p 'require("./package-lock.json").packages[""].version')
+          echo "PROVENANCE.md:              $doc"
+          echo "package.json:               $pkg"
+          echo "package-lock.json:          $lock"
+          echo "package-lock.json packages: $lock_self"
+          for found in "$pkg" "$lock" "$lock_self"; do
+            if [ "$found" != "$doc" ]; then
+              echo "::error::Version drift in the vendored tree: PROVENANCE.md records $doc but a manifest says $found."
+              echo "Set the same version in package.json, package-lock.json (both copies), and the 'Current version' row of PROVENANCE.md."
+              exit 1
+            fi
+          done
 
   verify:
     # Preserve the legacy required-check name while the underlying work runs in parallel.
