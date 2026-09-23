@@ -50,6 +50,7 @@ import os
 import re
 import sys
 import time
+import traceback
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -1260,7 +1261,7 @@ def run_cli():
         # so the schedule already supplies the retry; the 13:22Z truncation
         # self-healed at 14:24Z on the same commit. Retrying in-process would
         # add a failure mode to buy back an hour that costs nothing.
-        print("GitHub API request failed (truncated response): %r" % error, file=sys.stderr)
+        print("GitHub API request failed (malformed or truncated HTTP response): %r" % error, file=sys.stderr)
         sys.exit(EXIT_SWEEP_DEGRADED)
     except OSError as error:
         # A REQUEST_TIMEOUT_SECONDS expiry during the response *read* raises a
@@ -1272,6 +1273,17 @@ def run_cli():
         # human to look for work that does not exist. Caught last: URLError is
         # itself an OSError, so the arms above still take precedence.
         print("GitHub API request failed (socket): %r" % error, file=sys.stderr)
+        sys.exit(EXIT_SWEEP_DEGRADED)
+    except Exception:
+        # Terminal arm: any exception class not enumerated above (e.g. a
+        # json.JSONDecodeError == ValueError from _request()'s json.loads on a
+        # 200 carrying a non-JSON proxy/WAF page during the unisolated open-PR
+        # pagination) would otherwise escape and exit 1 == EXIT_ALARM. Anything
+        # reaching here by definition never finished reading the PR list, so it
+        # is degraded, not an alarm. `Exception`, NOT `BaseException`: main()'s
+        # deliberate sys.exit(EXIT_ALARM) raises SystemExit, which must pass
+        # through untouched (BLO-35151).
+        print("GitHub API sweep crashed before completing: %s" % traceback.format_exc(), file=sys.stderr)
         sys.exit(EXIT_SWEEP_DEGRADED)
 
 

@@ -1151,7 +1151,7 @@ class TestRunCliExitCodePolicy(unittest.TestCase):
     def test_incomplete_read_is_degraded_not_alarm(self):
         code, err = self._exit_code_for(http.client.IncompleteRead(b"partial", 68373))
         self.assertEqual(code, sweep.EXIT_SWEEP_DEGRADED)
-        self.assertIn("truncated response", err)
+        self.assertIn("truncated HTTP response", err)
 
     def test_bad_status_line_is_degraded_not_alarm(self):
         """The arm catches the HTTPException BASE, not just IncompleteRead.
@@ -1161,7 +1161,7 @@ class TestRunCliExitCodePolicy(unittest.TestCase):
         """
         code, err = self._exit_code_for(http.client.BadStatusLine("garbage"))
         self.assertEqual(code, sweep.EXIT_SWEEP_DEGRADED)
-        self.assertIn("truncated response", err)
+        self.assertIn("truncated HTTP response", err)
 
     def test_incomplete_read_is_not_an_oserror(self):
         """Pins WHY the pre-existing arms could not catch it.
@@ -1188,6 +1188,27 @@ class TestRunCliExitCodePolicy(unittest.TestCase):
         code, err = self._exit_code_for(sweep.RateLimitExhausted("budget spent"))
         self.assertEqual(code, sweep.EXIT_SWEEP_DEGRADED)
         self.assertIn("rate limit exhausted", err)
+
+    def test_unenumerated_exception_classes_are_degraded_not_alarm(self):
+        """Pins the class-level invariant the docstring states, not just the
+        enumerated arms: ANY escaping exception is degraded, never alarm."""
+        import json
+        for error in (
+            json.JSONDecodeError("Expecting value", "<html>", 0),
+            ValueError("unrelated"),
+            KeyError("missing"),
+            RuntimeError("unrelated"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                code, err = self._exit_code_for(error)
+                self.assertEqual(code, sweep.EXIT_SWEEP_DEGRADED)
+                self.assertIn("crashed", err)
+
+    def test_deliberate_alarm_exit_passes_through_terminal_arm(self):
+        """SystemExit is a BaseException; the terminal `except Exception`
+        must not reclassify main()'s own sys.exit(EXIT_ALARM) to degraded."""
+        code, _ = self._exit_code_for(SystemExit(sweep.EXIT_ALARM))
+        self.assertEqual(code, sweep.EXIT_ALARM)
 
 
 if __name__ == "__main__":
