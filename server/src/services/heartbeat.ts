@@ -25702,7 +25702,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // `releaseLeasesForRun` calls, which is the held-resource harm Ally
         // described. It also skipped this run's own `appendRunEvent` below,
         // after its terminal status had already been persisted.
-        await startNextQueuedRunForAgent(run.agentId).catch((error) => {
+        //
+        // This one swallows rather than collecting and rethrowing the way
+        // `resumeQueuedRuns` does, and the asymmetry is deliberate:
+        // `reapOrphanedRuns` sits MID-chain in the periodic tick in index.ts,
+        // ahead of `promoteDueScheduledRetries` and `resumeQueuedRuns`. A
+        // rejection here lands in that chain's `.catch()` and skips both, so
+        // rethrowing would re-create the abandon-the-rest harm one level up —
+        // and it would discard this pass's reap summary as well. Dispatch is
+        // recoverable: the next `resumeQueuedRuns` re-drives any agent still
+        // holding queued runs.
+        await startNextQueuedRunForAgent(run.agentId).catch((error: unknown) => {
           logger.warn(
             { error, runId: run.id, agentId: run.agentId },
             "reapOrphanedRuns: post-reap dispatch failed for one agent; continuing the pass",
@@ -25768,27 +25778,43 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ));
 
     const agentIds = [...new Set(queuedRuns.map((r) => r.agentId))];
+    // PEN-2400: found while verifying Ally non-blocking 1 against its sibling
+    // call sites. The reservation reconciler Ally named already has per-row
+    // isolation (BLO-21460, added after that review), so the "one throw
+    // abandons the rest of the batch" harm Ally described no longer lands
+    // there — it lands on the two loops that still have no per-iteration
+    // catch: this one, and the `activeRuns` loop in `reapOrphanedRuns`. Both
+    // are fleet-wide: one agent's dispatch rejecting abandoned dispatch for
+    // every agent after it in the pass.
+    //
+    // Isolate per agent, but do NOT swallow: collect and rethrow once the pass
+    // is complete. Continuing the loop is what fixes the batch-abort harm;
+    // discarding the error would be a separate, unasked-for change that blinds
+    // the caller's failure log and drops the BLO-12990 contract that this
+    // function rejects when a dispatch fails.
+    //
+    // Rethrowing is free HERE specifically because `resumeQueuedRuns` is the
+    // last pass in the periodic chain in index.ts — nothing downstream is
+    // skipped by it. That is exactly why `reapOrphanedRuns` below swallows
+    // instead: it sits MID-chain, so rethrowing there would abandon
+    // `promoteDueScheduledRetries` and this function for the whole tick,
+    // reproducing the same abandon-the-rest harm one level up.
+    const dispatchFailures: unknown[] = [];
     for (const agentId of agentIds) {
-      // PEN-2400: found while verifying Ally non-blocking 1 against its sibling
-      // call sites. The reservation reconciler Ally named already has per-row
-      // isolation (BLO-21460, added after that review), so the "one throw
-      // abandons the rest of the batch" harm Ally described no longer lands
-      // there — it lands on the two loops that still have no per-iteration
-      // catch: this one, and the `activeRuns` loop in `reapOrphanedRuns`. Both
-      // are fleet-wide. One agent's dispatch rejecting used to abandon dispatch
-      // for every agent after it in the pass — on the periodic tick that is
-      // swallowed by the chain `.catch()` in index.ts as "periodic heartbeat
-      // dispatch resumption failed" and lost until the next tick; on the
-      // startup path (index.ts, uncaught) it is worse. Isolating per agent
-      // matches the doctrine already stated for the post-commit wake dispatch
-      // below: swallowing is safe because dispatch is recoverable — the next
-      // pass re-drives any agent still holding queued runs.
-      await startNextQueuedRunForAgent(agentId).catch((error) => {
+      await startNextQueuedRunForAgent(agentId).catch((error: unknown) => {
+        dispatchFailures.push(error);
         logger.warn(
           { error, agentId },
           "resumeQueuedRuns: dispatch failed for one agent; continuing the pass",
         );
       });
+    }
+    if (dispatchFailures.length === 1) throw dispatchFailures[0];
+    if (dispatchFailures.length > 1) {
+      throw new AggregateError(
+        dispatchFailures,
+        `resumeQueuedRuns: dispatch failed for ${dispatchFailures.length} of ${agentIds.length} agents`,
+      );
     }
   }
 
