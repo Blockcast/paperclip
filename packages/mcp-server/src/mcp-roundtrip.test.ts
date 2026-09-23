@@ -85,3 +85,61 @@ describe("MCP tools/call round trip", () => {
     expect(result.isError).toBeFalsy();
   });
 });
+
+// BLO-27561: `q` is a literal contiguous ILIKE, so a multi-word phrase silently returns
+// `[]` — indistinguishable from "no such issue exists" — while fleet-wide agent
+// instructions mandate this exact call as the pre-filing duplicate gate. The fix is a
+// call-time warning, which is only worth anything if it survives into the schema an MCP
+// client actually receives. Asserting on the source constant would pass even if zod
+// dropped `.describe()` on the way through `tools/list`, so this reads the served
+// schema back over a real client, the same way an agent does.
+describe("MCP tools/list served schema — BLO-27561 q substring warning", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  async function servedParamDescription(toolName: string, param: string) {
+    const client = await connectedClient();
+    const { tools } = await client.listTools();
+    const tool = tools.find((candidate) => candidate.name === toolName);
+    expect(tool, `${toolName} missing from tools/list`).toBeDefined();
+
+    const properties = (tool!.inputSchema as { properties?: Record<string, { description?: string }> })
+      .properties;
+    return { description: properties?.[param]?.description, toolDescription: tool!.description };
+  }
+
+  for (const [toolName, param] of [
+    ["paperclipListIssues", "q"],
+    ["paperclip_search_issues", "query"],
+  ] as const) {
+    it(`warns that ${toolName}.${param} is a non-tokenized substring match`, async () => {
+      const { description } = await servedParamDescription(toolName, param);
+
+      expect(description, `${toolName}.${param} has no served description`).toBeDefined();
+      // The three things an agent must learn at call time: what the match IS, that
+      // multi-word input is unreliable, and what to do instead.
+      expect(description).toMatch(/NOT tokenized/);
+      expect(description).toMatch(/MULTI-WORD INPUT IS UNRELIABLE/);
+      expect(description).toMatch(/\b(one|single) distinctive token\b/i);
+    });
+  }
+
+  it("keeps the alias and the primary parameter descriptions identical", async () => {
+    const primary = await servedParamDescription("paperclipListIssues", "q");
+    const alias = await servedParamDescription("paperclip_search_issues", "query");
+
+    // The alias is the tool whose name most invites a phrase query, so it must not be
+    // possible to fix the warning on one tool and leave the other stale.
+    expect(alias.description).toBe(primary.description);
+  });
+
+  it("does not describe the alias as free-text 'search' in its tool description", async () => {
+    const { toolDescription } = await servedParamDescription("paperclip_search_issues", "query");
+
+    // "Search Paperclip issues by text" was the original wording, and it actively
+    // invited the multi-word phrase queries that silently false-clear.
+    expect(toolDescription).not.toMatch(/^Search Paperclip issues by text\./);
+    expect(toolDescription).toMatch(/substring/i);
+  });
+});

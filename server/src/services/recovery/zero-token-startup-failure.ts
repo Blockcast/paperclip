@@ -15,8 +15,16 @@
 export const ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES = new Set<string>([
   "context_overflow",
   "context_length_exceeded",
+  "session_unavailable",
   "startup_error_pre_model",
 ]);
+
+// A missing configured skill is deterministic and must not consume the
+// one-shot session reset retry reserved for structural startup wedges.
+export const DETERMINISTIC_SKILL_FAILURE_ERROR_CODE = "skill_not_found";
+
+const LEGACY_SESSION_UNAVAILABLE_ERROR_RE = /\bsession\s+unavailable\b/i;
+const OPENCODE_ADAPTER_TYPES = new Set(["opencode_local", "opencode_k8s"]);
 
 // Heartbeat-run terminal statuses that represent an unsuccessful outcome.
 // Mirrors UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES in heartbeat.ts /
@@ -30,7 +38,9 @@ const UNSUCCESSFUL_TERMINAL_STATUSES = new Set<string>([
 
 export type ZeroTokenStartupFailureRunInput =
   | {
+    adapterType?: string | null;
     status?: string | null;
+    error?: string | null;
     errorCode?: string | null;
     usageJson?: Record<string, unknown> | null;
   }
@@ -65,6 +75,123 @@ export function runUsageTokenCounts(
   };
 }
 
+// BLO-22097: `usageJson: null` means usage was never *recorded*, not that
+// zero tokens were consumed — a post-model failure whose result event never
+// arrives leaves usage null even though the model produced output. Treating
+// null the same as an explicit `{inputTokens: 0, outputTokens: 0}` (which
+// `runUsageTokenCounts` does, since it exists to parse the blob once it
+// exists) misclassifies that run as never-executed. `logBytes` corroborates
+// the unknown case: every run log opens with ~15-20KB of session boilerplate
+// before any model turn, and explicit-zero-usage runs sampled across
+// BLO-19924/BLO-21091/BLO-21025 topped out at 111,337 bytes (still no model
+// turn — likely a slow upstream timeout inflating the pre-failure log). A
+// run that genuinely executed but lost its usage accounting (BLO-19924's
+// `claude_truncated` case) logged 844,801 bytes, two orders of magnitude
+// above that ceiling. The floor below is set with wide margin above the
+// observed boilerplate ceiling and well below the observed executed-run
+// floor — see BLO-22097 for the full sample tables.
+const NEVER_EXECUTED_UNKNOWN_USAGE_LOG_BYTES_CEILING = 200_000;
+
+// The fields `isInfraFailureRun` reads. Structural rather than a `Pick` off the
+// schema row so this module stays dependency-free and unit-testable in isolation,
+// matching `ZeroTokenStartupFailureRunInput` above. Unlike that sibling, the fields
+// are REQUIRED: structural and required are orthogonal, and here optionality is
+// load-bearing rather than cosmetic. `isInfraFailureRun` reads `(logBytes ?? 0)`,
+// so an omitted column falls into the *permissive* arm and every failed run with
+// missing telemetry reads as never-executed -- widening the exemption silently
+// while every unit test still passes (the BLO-32566 projection-omission shape).
+// `ZeroTokenStartupFailureRunInput` can afford `?` because an absent field there
+// makes its predicate return false. Requiring these four makes a caller that
+// forgets a projection column a compile error instead of a behaviour change.
+export type NeverExecutedRunInput = {
+  livenessState: string | null;
+  usageJson: Record<string, unknown> | null;
+  logBytes: number | null;
+  errorCode: string | null;
+};
+
+// True when the dependency gate cancelled a queued run before dispatch (see
+// `cancelQueuedRunForBlockedDependencies` in heartbeat.ts). The run never
+// reached the adapter, so it is disjoint from `isInfraFailureRun` below even
+// though both are zero-token: this one is a graph-state fact about the issue
+// (an unresolved `blockedBy` edge), not an infrastructure fault, and it must
+// not be reported as one (BLO-22436).
+export function isDependencyBlockedRun(run: Pick<NeverExecutedRunInput, "errorCode">): boolean {
+  return run.errorCode === "issue_dependencies_blocked";
+}
+
+// True when a run's most recent classification is `failed` liveness AND it
+// burned zero input+output tokens. That combination means the agent never
+// got a model turn — the runtime crashed, the process was killed, or every
+// model call errored before producing output. Observed causes include a K8s
+// crashloop (`BackoffLimitExceeded`), an inference-gateway 503 storm, a
+// provider capacity 429 kill, and retry-budget exhaustion with no error code
+// at all (`error: "unknown"`, `error_status: null`). Keying on token usage
+// rather than error code/status/dispatch-state is deliberate: it is the one
+// signature all four causes share (BLO-21769). Excludes dependency-gate
+// cancellations (BLO-22436) — those never reached the adapter at all, so they
+// are a graph-state fact rather than an infrastructure fault, and are counted
+// separately.
+//
+// `usageJson: null` is unknown, not a measured zero (BLO-22097): it is only
+// read as never-executed when `logBytes` also stays at or under the
+// boilerplate-only ceiling. An *explicit* zero-usage blob is never
+// second-guessed by `logBytes` — a large log with confirmed zero tokens
+// (observed up to 111,337 bytes) is still never-executed, since the
+// corroboration only fills in for missing telemetry, not disputed telemetry.
+//
+// The two narrowings compose without collapsing: BLO-22097 narrows *within*
+// this predicate (which failed runs count as infra), while BLO-22436 widens
+// the *union* in productivity-review's `isNeverExecutedRun` (which populations
+// count as never-executed). Keep them disjoint — folding the dependency gate
+// into the usage test would let a blocker edge masquerade as an infrastructure
+// fault.
+//
+// BLO-32679 moved this here from productivity-review.ts, where it was private,
+// so the stranded-assigned-issue sweep can ask the same question without a
+// second definition. Two definitions of "never executed" would drift silently
+// in the dangerous direction: the sweep suppressing a seizure the review
+// treats as agent silence, or the reverse. Same reasoning as
+// `openPullRequestWakePathConditions`, which was extracted for the same hazard.
+export function isInfraFailureRun(run: NeverExecutedRunInput): boolean {
+  if (isDependencyBlockedRun(run)) return false;
+  if (run.livenessState !== "failed") return false;
+  if (run.usageJson == null) {
+    return (run.logBytes ?? 0) <= NEVER_EXECUTED_UNKNOWN_USAGE_LOG_BYTES_CEILING;
+  }
+  const { inputTokens, outputTokens } = runUsageTokenCounts(run.usageJson);
+  return inputTokens === 0 && outputTokens === 0;
+}
+
+function readAdapterType(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+export function isLegacySessionUnavailableAdapterFailure(
+  run: Pick<NonNullable<ZeroTokenStartupFailureRunInput>, "error" | "errorCode"> | null | undefined,
+): boolean {
+  const errorCode = typeof run?.errorCode === "string" ? run.errorCode.trim() : "";
+  return (
+    errorCode === "adapter_failed" &&
+    typeof run?.error === "string" &&
+    LEGACY_SESSION_UNAVAILABLE_ERROR_RE.test(run.error)
+  );
+}
+
+export function isLegacySessionUnavailableAdapterMismatch(input: {
+  run: ZeroTokenStartupFailureRunInput;
+  currentAdapterType?: string | null;
+}): boolean {
+  const historicalAdapterType = readAdapterType(input.run?.adapterType);
+  const currentAdapterType = readAdapterType(input.currentAdapterType);
+  return Boolean(
+    historicalAdapterType &&
+      currentAdapterType &&
+      historicalAdapterType !== currentAdapterType &&
+      isLegacySessionUnavailableAdapterFailure(input.run),
+  );
+}
+
 // True when a run's most recent terminal failure is a structural, pre-model
 // startup wedge that produced zero token usage. The recovery sweep uses this
 // to gate `stranded_issue_recovery` wrapper creation: for this family the
@@ -76,7 +203,13 @@ export function isZeroTokenStartupFailureRun(
   if (!run) return false;
   if (!run.status || !UNSUCCESSFUL_TERMINAL_STATUSES.has(run.status)) return false;
   const errorCode = typeof run.errorCode === "string" ? run.errorCode.trim() : "";
-  if (!errorCode || !ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES.has(errorCode)) return false;
+  if (errorCode === DETERMINISTIC_SKILL_FAILURE_ERROR_CODE) return false;
+  const isLegacySessionUnavailable =
+    OPENCODE_ADAPTER_TYPES.has(readAdapterType(run.adapterType) ?? "") &&
+    isLegacySessionUnavailableAdapterFailure(run);
+  if (!isLegacySessionUnavailable && (!errorCode || !ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES.has(errorCode))) {
+    return false;
+  }
   const { inputTokens, outputTokens } = runUsageTokenCounts(run.usageJson);
   return inputTokens === 0 && outputTokens === 0;
 }
@@ -86,6 +219,8 @@ export function isZeroTokenStartupFailureRun(
 // reset-and-retry attempt for a zero-token startup failure (see
 // resetSessionAndRetryZeroTokenFailure in recovery/service.ts).
 export const ZERO_TOKEN_SESSION_RESET_RETRY_REASON = "zero_token_session_reset";
+export const SESSION_UNAVAILABLE_RECOVERY_RETRY_REASON = "session_unavailable";
+export const SESSION_UNAVAILABLE_RECOVERY_MAX_ATTEMPTS = 2;
 
 // True when the latest run was itself dispatched as that one-shot
 // reset-and-retry attempt and failed again with the same zero-token
@@ -95,11 +230,17 @@ export const ZERO_TOKEN_SESSION_RESET_RETRY_REASON = "zero_token_session_reset";
 // when the wedge isn't actually session-poisoning (e.g. a genuinely
 // oversized workspace tripping context_overflow every time).
 export function isZeroTokenSessionResetRetryRun(
-  run: { contextSnapshot?: Record<string, unknown> | null } | null | undefined,
+  run: {
+    contextSnapshot?: Record<string, unknown> | null;
+    scheduledRetryAttempt?: number | null;
+  } | null | undefined,
 ): boolean {
   const context = run?.contextSnapshot;
   if (!context || typeof context !== "object") return false;
   const retryReason = context.retryReason;
-  return typeof retryReason === "string" && retryReason === ZERO_TOKEN_SESSION_RESET_RETRY_REASON;
+  if (retryReason === ZERO_TOKEN_SESSION_RESET_RETRY_REASON) return true;
+  return (
+    retryReason === SESSION_UNAVAILABLE_RECOVERY_RETRY_REASON &&
+    (run?.scheduledRetryAttempt ?? 0) >= SESSION_UNAVAILABLE_RECOVERY_MAX_ATTEMPTS
+  );
 }
-

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -11,6 +11,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
 import { heartbeatService } from "../services/heartbeat.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
@@ -83,10 +84,10 @@ describeEmbeddedPostgres("executeRun finalize: cancelled status skips next-queue
       provider: "test",
       model: "test-model",
     }));
-    // TRUNCATE CASCADE handles the activity_log FK to heartbeat_runs that the
-    // claim + finalize paths populate. Plain row-delete hits a 23503 ordering
-    // problem because activity_log has no ON DELETE CASCADE on run_id.
-    await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
+    await cleanupHeartbeatTestState(db, heartbeat, {
+      errorLabel: "finalize-cancelled cleanup",
+      drainTimeoutMs: 30_000,
+    });
   }, 120_000);
 
   afterAll(async () => {

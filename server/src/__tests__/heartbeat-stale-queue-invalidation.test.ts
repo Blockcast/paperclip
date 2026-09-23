@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  activityLog,
   agents,
   agentWakeupRequests,
   companies,
@@ -14,13 +15,18 @@ import {
   issueDocuments,
   issues,
 } from "@paperclipai/db";
-import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
+import {
+  ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
+  LOW_TRUST_REVIEW_PRESET,
+  type SourceTrustMetadata,
+} from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { issueService } from "../services/issues.js";
 import { runningProcesses } from "../adapters/index.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
@@ -217,6 +223,9 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     issueId: string;
     agentId: string;
     body: string;
+    updatedAt?: Date;
+    sourceTrust?: SourceTrustMetadata;
+    createdByRunId?: string;
   }) {
     const documentId = randomUUID();
     const revisionId = randomUUID();
@@ -230,6 +239,8 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       latestRevisionNumber: 1,
       createdByAgentId: input.agentId,
       updatedByAgentId: input.agentId,
+      ...(input.updatedAt ? { updatedAt: input.updatedAt } : {}),
+      ...(input.sourceTrust ? { sourceTrust: input.sourceTrust } : {}),
     });
     await db.insert(documentRevisions).values({
       id: revisionId,
@@ -240,6 +251,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       format: "markdown",
       body: input.body,
       createdByAgentId: input.agentId,
+      ...(input.createdByRunId ? { createdByRunId: input.createdByRunId } : {}),
     });
     await db.insert(issueDocuments).values({
       companyId: input.companyId,
@@ -347,6 +359,308 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(run).not.toBeNull();
     await waitForCondition(async () => countExecuteCallsForRun(run!.id) > 0);
 
+    expect(countExecuteCallsForRun(run!.id)).toBe(1);
+  });
+
+  /**
+   * BLO-19749. `skipTimerWhenNoActionableWork` counted assigned issues by STATUS
+   * alone, so it could not suppress the wakes that actually waste runs: an issue
+   * sitting in `todo`/`in_progress` whose execution lock is already held by a
+   * live run is not available to a fresh timer wake — `checkout()` 409s on it —
+   * and the wake burns a full run to discover that.
+   *
+   * Reported from a UXDesigner timer wake where both candidate issues 409'd
+   * (`todo` held by one run, `in_progress` held by another) and available work
+   * was genuinely zero, yet the predicate reported work and the wake ran.
+   */
+  async function seedLockHolderRun(input: {
+    companyId: string;
+    agentId: string;
+    status: string;
+    startedAt?: Date | null;
+    contextSnapshot?: Record<string, unknown>;
+    createdAt?: Date;
+  }) {
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: input.status,
+      startedAt: input.startedAt ?? null,
+      contextSnapshot: input.contextSnapshot ?? {},
+      createdAt: input.createdAt ?? new Date(),
+    });
+    return runId;
+  }
+
+  it("skips generic timer wakes when every actionable assigned issue is held by a live run", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: {
+        enabled: true,
+        skipTimerWhenNoActionableWork: true,
+      },
+    });
+    const runningHolder = await seedLockHolderRun({ companyId, agentId, status: "running" });
+    const retryHolder = await seedLockHolderRun({
+      companyId,
+      agentId,
+      status: "scheduled_retry",
+      startedAt: new Date(),
+    });
+    await db.insert(issues).values([
+      {
+        id: randomUUID(),
+        companyId,
+        title: "todo but already checked out by another run",
+        status: "todo",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: runningHolder,
+        executionRunId: runningHolder,
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        title: "in_progress but locked by an executing scheduled retry",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        executionRunId: retryHolder,
+      },
+    ]);
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "schedule",
+    });
+
+    expect(run).toBeNull();
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+
+    const [wakeup] = await db
+      .select({ status: agentWakeupRequests.status, reason: agentWakeupRequests.reason })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeup).toMatchObject({
+      status: "skipped",
+      reason: "heartbeat.timer.no_actionable_work",
+    });
+  });
+
+  it("skips generic timer wakes when the only actionable issue is held by a scheduled_retry run", async () => {
+    // The status the retry ladder parks runs in. It is non-terminal, so it holds
+    // the lock and `checkout()` 409s on it — but it was absent from every
+    // open-coded ["queued","running"] availability literal.
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: {
+        enabled: true,
+        skipTimerWhenNoActionableWork: true,
+      },
+    });
+    const retryHolder = await seedLockHolderRun({
+      companyId,
+      agentId,
+      status: "scheduled_retry",
+      startedAt: new Date(),
+    });
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId,
+      title: "awaiting a scheduled retry",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: retryHolder,
+      executionRunId: retryHolder,
+    });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "schedule",
+    });
+
+    expect(run).toBeNull();
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+  });
+
+  it("skips generic timer wakes when a checkout-only holder has an unknown non-terminal status", async () => {
+    // The checkout path retains every status outside the terminal set. Keep the
+    // availability query identical: treating a future persisted status as free
+    // would start a wake which can only 409 at checkout.
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: {
+        enabled: true,
+        skipTimerWhenNoActionableWork: true,
+      },
+    });
+    const futureHolder = await seedLockHolderRun({
+      companyId,
+      agentId,
+      status: "some_future_live_status",
+    });
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId,
+      title: "checkout lock held by a newer run status",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: futureHolder,
+    });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "schedule",
+    });
+
+    expect(run).toBeNull();
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+  });
+
+  it.each(["queued", "scheduled_retry"] as const)(
+    "allows a timer wake to adopt a never-started %s lock",
+    async (status) => {
+      const { companyId, agentId } = await seedCompanyAndAgent({
+        heartbeatConfig: {
+          enabled: true,
+          skipTimerWhenNoActionableWork: true,
+        },
+      });
+      const issueId = randomUUID();
+      const staleHolder = await seedLockHolderRun({
+        companyId,
+        agentId,
+        status,
+        // Give the stale holder its actual issue scope. That prevents the
+        // generic timer wake from coalescing into it and matches the lock shape
+        // checkout is expected to reclaim.
+        contextSnapshot: { issueId },
+        // The actor must be newer than the owner for adoption; avoid a
+        // millisecond-resolution tie between the two inserts.
+        createdAt: new Date(Date.now() - 1_000),
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: `never-started ${status} lock is reclaimable`,
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: staleHolder,
+        executionRunId: staleHolder,
+      });
+
+      // A queued holder is itself eligible for dispatch and otherwise wins the
+      // agent queue before the new generic timer run. Fence dispatch, then
+      // advance the newly-enqueued timer run to its real checkout state. This
+      // keeps the gate/adoption regression deterministic while still exercising
+      // checkout's atomic owner cancellation and transfer.
+      const timerOnlyHeartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+      const run = await timerOnlyHeartbeat.wakeup(agentId, {
+        source: "timer",
+        triggerDetail: "schedule",
+      });
+
+      expect(run).not.toBeNull();
+      if (!run) throw new Error("timer wake was unexpectedly skipped");
+      expect(run.id).not.toBe(staleHolder);
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "running", startedAt: new Date(), updatedAt: new Date() })
+        .where(eq(heartbeatRuns.id, run.id));
+
+      const adopted = await issueService(db).checkout(issueId, agentId, ["in_progress"], run.id);
+      expect(adopted).toMatchObject({
+        checkoutRunId: run.id,
+        executionRunId: run.id,
+      });
+      const previousOwner = await db
+        .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, staleHolder))
+        .then((rows) => rows[0]);
+      expect(previousOwner).toEqual({
+        status: "cancelled",
+        errorCode: "issue_checkout_adopted",
+      });
+    },
+  );
+
+  it("allows generic timer wakes when a stale lock names a run that already terminalized", async () => {
+    // A terminal holder releases the lock: `checkout()` clears it and succeeds,
+    // so this issue IS available and the wake is not waste. Suppressing here
+    // would strand the issue with no wake path.
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: {
+        enabled: true,
+        skipTimerWhenNoActionableWork: true,
+      },
+    });
+    const deadHolder = await seedLockHolderRun({ companyId, agentId, status: "failed" });
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId,
+      title: "stale lock from a dead run",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: deadHolder,
+      executionRunId: deadHolder,
+    });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "schedule",
+    });
+
+    expect(run).not.toBeNull();
+    await waitForCondition(async () => countExecuteCallsForRun(run!.id) > 0);
+    expect(countExecuteCallsForRun(run!.id)).toBe(1);
+  });
+
+  it("allows generic timer wakes when a held issue coexists with an available one", async () => {
+    // The predicate is availability-any, not all-or-nothing: one busy issue must
+    // not suppress a wake that has other work to do.
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: {
+        enabled: true,
+        skipTimerWhenNoActionableWork: true,
+      },
+    });
+    const holder = await seedLockHolderRun({ companyId, agentId, status: "running" });
+    await db.insert(issues).values([
+      {
+        id: randomUUID(),
+        companyId,
+        title: "held",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: holder,
+        executionRunId: holder,
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        title: "free",
+        status: "todo",
+        priority: "high",
+        assigneeAgentId: agentId,
+      },
+    ]);
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "schedule",
+    });
+
+    expect(run).not.toBeNull();
+    await waitForCondition(async () => countExecuteCallsForRun(run!.id) > 0);
     expect(countExecuteCallsForRun(run!.id)).toBe(1);
   });
 
@@ -848,7 +1162,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(issue?.executionRunId).toBeNull();
   });
 
-  it("promotes deferred issue wakes when a queued holder is cancelled by the daily run cap", async () => {
+  it("promotes deferred issue wakes with retry lineage when a queued holder is cancelled by the daily run cap", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({
       heartbeatConfig: {
         maxDailyRuns: 1,
@@ -928,6 +1242,9 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         _paperclipWakeContext: {
           issueId,
           wakeReason: "issue_mention",
+          retryReason: "session_unavailable",
+          retryOfRunId: queuedRunId,
+          scheduledRetryAttempt: 2,
         },
       },
       status: "deferred_issue_execution",
@@ -952,13 +1269,21 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       .where(eq(agentWakeupRequests.id, deferredWakeupId));
     const [promotedRun] = deferred?.runId
       ? await db
-        .select({ agentId: heartbeatRuns.agentId })
+        .select({
+          agentId: heartbeatRuns.agentId,
+          retryOfRunId: heartbeatRuns.retryOfRunId,
+          scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+        })
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, deferred.runId))
       : [];
 
     expect(deferred?.status).not.toBe("deferred_issue_execution");
-    expect(promotedRun?.agentId).toBe(peerAgentId);
+    expect(promotedRun).toMatchObject({
+      agentId: peerAgentId,
+      retryOfRunId: queuedRunId,
+      scheduledRetryAttempt: 2,
+    });
   });
 
   it("cancels queued runs when the issue assignee changes before the run starts", async () => {
@@ -997,6 +1322,16 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       issueId,
       wakeReason: "issue_assigned",
     });
+    await db
+      .update(issues)
+      .set({
+        checkoutRunId: runId,
+        executionRunId: runId,
+        executionAgentNameKey: "original-coder",
+        executionLockedAt: new Date(),
+        checkoutRestoreStatus: "todo",
+      })
+      .where(eq(issues.id, issueId));
 
     await heartbeat.resumeQueuedRuns();
 
@@ -1009,7 +1344,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       return run?.status === "cancelled";
     });
 
-    const [run, wakeup] = await Promise.all([
+    const [run, wakeup, issue] = await Promise.all([
       db
         .select({
           status: heartbeatRuns.status,
@@ -1024,6 +1359,18 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         .from(agentWakeupRequests)
         .where(eq(agentWakeupRequests.id, wakeupRequestId))
         .then((rows) => rows[0] ?? null),
+      db
+        .select({
+          status: issues.status,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+          executionAgentNameKey: issues.executionAgentNameKey,
+          executionLockedAt: issues.executionLockedAt,
+          checkoutRestoreStatus: issues.checkoutRestoreStatus,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null),
     ]);
 
     expect(run?.status).toBe("cancelled");
@@ -1031,6 +1378,14 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(run?.resultJson).toMatchObject({ stopReason: "issue_assignee_changed" });
     expect(wakeup?.status).toBe("skipped");
     expect(wakeup?.error).toContain("assignee changed");
+    expect(issue).toMatchObject({
+      status: "todo",
+      checkoutRunId: null,
+      executionRunId: null,
+      executionAgentNameKey: null,
+      executionLockedAt: null,
+      checkoutRestoreStatus: null,
+    });
     expect(mockAdapterExecute).not.toHaveBeenCalled();
   });
 
@@ -1081,6 +1436,61 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(run?.errorCode).toBe("issue_terminal_status");
     expect(wakeup?.status).toBe("skipped");
     expect(mockAdapterExecute).not.toHaveBeenCalled();
+  });
+
+  // BLO-23206 pins the floor of the terminal-status exemption in
+  // `evaluateQueuedRunStaleness`: a deliberate resume/reopen must still start,
+  // even though the issue it names is already terminal. The leak this ticket
+  // fixed was tempting to fix by narrowing that exemption; doing so also broke
+  // cross-agent handoffs, so the exemption stayed wide and the screen moved to
+  // the promotion source instead. This test is what makes an over-eager
+  // re-narrowing fail loudly here rather than silently stranding reopens.
+  it("still runs a queued run on a terminal issue when the wake carries explicit resume intent", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Closed task with an explicit resume request",
+      status: "done",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+
+    const { runId } = await seedQueuedRun({
+      companyId,
+      agentId,
+      issueId,
+      wakeReason: "issue_comment_mentioned",
+      contextExtras: {
+        wakeCommentId: randomUUID(),
+        resumeIntent: true,
+        followUpRequested: true,
+      },
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    // Wait for the fully-settled state, not merely "no longer queued": leaving
+    // an adapter execution in flight past the end of the test leaks a
+    // mockAdapterExecute call into the next one.
+    await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "succeeded";
+    });
+
+    const run = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+
+    expect(run?.status).toBe("succeeded");
+    expect(run?.errorCode).toBeNull();
   });
 
   it("cancels non-interaction queued runs when the issue execution lock cannot be acquired", async () => {
@@ -1540,5 +1950,350 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(run?.status).toBe("succeeded");
     expect(run?.errorCode).toBeNull();
     expect(countExecuteCallsForRun(runId)).toBe(1);
+  });
+
+  // BLO-27639. Only an executing run can rewrite the continuation summary, so a
+  // park-shaped summary that events have overtaken used to wedge the
+  // continuation lineage shut permanently. The park is now honoured only while
+  // the summary is still the most recent word on the issue.
+  describe("continuation park freshness (BLO-27639)", () => {
+    const PARKING_SUMMARY = [
+      "# Continuation Summary",
+      "",
+      "## Next Action",
+      "",
+      "- Wait for reviewer feedback or approval before continuing executor work.",
+    ].join("\n");
+
+    async function seedParkedContinuationRetry(input: {
+      title: string;
+      summaryUpdatedAt: Date;
+      sourceTrust?: SourceTrustMetadata;
+      // When set, the summary revision is attributed to a finalized run whose
+      // id is returned as `summaryRunId`, so a test can reproduce the
+      // summary-then-own-comment ordering that run finalization emits.
+      attributeSummaryToFinalizedRun?: boolean;
+    }) {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: input.title,
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+      });
+      let summaryRunId: string | null = null;
+      if (input.attributeSummaryToFinalizedRun) {
+        summaryRunId = randomUUID();
+        await db.insert(heartbeatRuns).values({
+          id: summaryRunId,
+          companyId,
+          agentId,
+          invocationSource: "automation",
+          triggerDetail: "system",
+          status: "succeeded",
+          startedAt: new Date(input.summaryUpdatedAt.getTime() - 60_000),
+          finishedAt: input.summaryUpdatedAt,
+          contextSnapshot: { issueId, wakeReason: "issue_continuation_needed" },
+        });
+      }
+      await seedContinuationSummary({
+        companyId,
+        issueId,
+        agentId,
+        body: PARKING_SUMMARY,
+        updatedAt: input.summaryUpdatedAt,
+        sourceTrust: input.sourceTrust,
+        ...(summaryRunId ? { createdByRunId: summaryRunId } : {}),
+      });
+      return { companyId, agentId, issueId, summaryRunId };
+    }
+
+    async function resumeContinuationRetry(input: {
+      companyId: string;
+      agentId: string;
+      issueId: string;
+      expectedStatus: "succeeded" | "cancelled";
+    }) {
+      const { runId } = await seedQueuedRun({
+        companyId: input.companyId,
+        agentId: input.agentId,
+        issueId: input.issueId,
+        wakeReason: "issue_continuation_needed",
+        invocationSource: "automation",
+        contextExtras: { retryReason: "issue_continuation_needed" },
+      });
+
+      await heartbeat.resumeQueuedRuns();
+
+      await waitForCondition(async () => {
+        const run = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId))
+          .then((rows) => rows[0] ?? null);
+        return run?.status === input.expectedStatus;
+      });
+
+      const run = await db
+        .select({
+          status: heartbeatRuns.status,
+          errorCode: heartbeatRuns.errorCode,
+          startedAt: heartbeatRuns.startedAt,
+          resultJson: heartbeatRuns.resultJson,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      return { runId, run };
+    }
+
+    // Replays the recorded BLO-22293 shape: summary written 2026-08-14T04:33Z,
+    // CTO ruling comment 26h later clearing the blocker. That retry was
+    // cancelled with `startedAt: null`; it must now execute.
+    it("executes a continuation retry whose parking summary predates the latest issue comment", async () => {
+      const summaryUpdatedAt = new Date("2026-08-14T04:33:51.682Z");
+      const { companyId, agentId, issueId } = await seedParkedContinuationRetry({
+        title: "Blocker cleared after the parking summary was written",
+        summaryUpdatedAt,
+      });
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        authorType: "agent",
+        body: "Ruling: the blocker is removed. Nothing is waiting on review any more — proceed.",
+        createdAt: new Date("2026-08-15T06:31:00.000Z"),
+      });
+
+      const { run } = await resumeContinuationRetry({
+        companyId,
+        agentId,
+        issueId,
+        expectedStatus: "succeeded",
+      });
+
+      expect(run?.status).toBe("succeeded");
+      expect(run?.errorCode).toBeNull();
+      expect(run?.startedAt).not.toBeNull();
+    });
+
+    it("executes a continuation retry whose parking summary predates a status change", async () => {
+      const summaryUpdatedAt = new Date("2026-08-14T04:33:51.682Z");
+      const { companyId, agentId, issueId } = await seedParkedContinuationRetry({
+        title: "Status moved after the parking summary was written",
+        summaryUpdatedAt,
+      });
+      await db.insert(activityLog).values({
+        companyId,
+        actorType: "agent",
+        actorId: agentId,
+        agentId,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: issueId,
+        details: { status: "in_progress", _previous: { status: "blocked" } },
+        createdAt: new Date("2026-08-15T06:31:00.000Z"),
+      });
+
+      const { run } = await resumeContinuationRetry({
+        companyId,
+        agentId,
+        issueId,
+        expectedStatus: "succeeded",
+      });
+
+      expect(run?.status).toBe("succeeded");
+      expect(run?.errorCode).toBeNull();
+    });
+
+    // BLO-16146 / BLO-18643 no-regression: a genuinely review-waiting issue
+    // must still park rather than burn runs.
+    it("still cancels a continuation retry whose parking summary is the most recent word on the issue", async () => {
+      const { companyId, agentId, issueId } = await seedParkedContinuationRetry({
+        title: "Genuinely waiting on review",
+        summaryUpdatedAt: new Date("2026-08-15T09:00:00.000Z"),
+      });
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        authorType: "agent",
+        body: "Handing off to the reviewer.",
+        createdAt: new Date("2026-08-15T08:00:00.000Z"),
+      });
+
+      const { runId, run } = await resumeContinuationRetry({
+        companyId,
+        agentId,
+        issueId,
+        expectedStatus: "cancelled",
+      });
+
+      expect(run?.status).toBe("cancelled");
+      expect(run?.errorCode).toBe("issue_continuation_waiting_on_review");
+      expect(run?.startedAt).toBeNull();
+      expect(run?.resultJson).toMatchObject({ timeoutSource: "stale_queued_run_gate" });
+      // Scoped to this run, not the global mock: the sibling tests above resume
+      // runs that do execute, and an execution still settling past their end
+      // leaks a call into this one (see the note on resumeQueuedRuns above).
+      expect(countExecuteCallsForRun(runId)).toBe(0);
+    });
+
+    // The ordering above is hand-written and is the OPPOSITE of what run
+    // finalization emits. Finalization refreshes the summary first and then
+    // posts its own run-summary comment, so in production the agent comment is
+    // always strictly NEWER than the summary it accompanies. Without excluding
+    // the summary-writing run's own comment, that inversion supersedes the park
+    // on the ordinary success path and disables the gate for every genuinely
+    // review-waiting issue — the exact population BLO-16146 / BLO-18643 exist
+    // to protect.
+    it("still cancels when the summary-writing run's own finalization comment lands after the summary", async () => {
+      const summaryUpdatedAt = new Date("2026-08-15T09:00:00.000Z");
+      const { companyId, agentId, issueId, summaryRunId } = await seedParkedContinuationRetry({
+        title: "Finalization comment must not supersede its own summary",
+        summaryUpdatedAt,
+        attributeSummaryToFinalizedRun: true,
+      });
+      // Mirrors the finalizer: summary at T, then the run's own comment at T+ε,
+      // authored `agent` (not `system`) and stamped with the same run id.
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        authorType: "agent",
+        createdByRunId: summaryRunId,
+        body: "Run finished. Waiting for reviewer feedback or approval before continuing.",
+        createdAt: new Date(summaryUpdatedAt.getTime() + 250),
+      });
+
+      const { runId, run } = await resumeContinuationRetry({
+        companyId,
+        agentId,
+        issueId,
+        expectedStatus: "cancelled",
+      });
+
+      expect(run?.status).toBe("cancelled");
+      expect(run?.errorCode).toBe("issue_continuation_waiting_on_review");
+      expect(run?.startedAt).toBeNull();
+      expect(countExecuteCallsForRun(runId)).toBe(0);
+    });
+
+    // Guards the fix above against over-tightening: only the summary-writing
+    // run's own writes are discounted. A DIFFERENT run's comment at the same
+    // instant is genuine new instruction and must still release the park,
+    // otherwise the deadlock this issue exists to fix comes back.
+    it("executes when a different run comments after the summary-writing run's own comment", async () => {
+      const summaryUpdatedAt = new Date("2026-08-15T09:00:00.000Z");
+      const { companyId, agentId, issueId, summaryRunId } = await seedParkedContinuationRetry({
+        title: "Another run's comment still supersedes",
+        summaryUpdatedAt,
+        attributeSummaryToFinalizedRun: true,
+      });
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        authorType: "agent",
+        createdByRunId: summaryRunId,
+        body: "Run finished. Waiting for reviewer feedback or approval before continuing.",
+        createdAt: new Date(summaryUpdatedAt.getTime() + 250),
+      });
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        authorType: "agent",
+        body: "Ruling: the blocker is removed. Nothing is waiting on review any more — proceed.",
+        createdAt: new Date(summaryUpdatedAt.getTime() + 3_600_000),
+      });
+
+      const { run } = await resumeContinuationRetry({
+        companyId,
+        agentId,
+        issueId,
+        expectedStatus: "succeeded",
+      });
+
+      expect(run?.status).toBe("succeeded");
+      expect(run?.errorCode).toBeNull();
+      expect(run?.startedAt).not.toBeNull();
+    });
+
+    // The park cancellation posts a system comment (AC3). If system comments
+    // counted as superseding activity, that comment would unpark the next retry
+    // and the gate would disable itself after one firing.
+    it("records the park on the issue without letting its own notice unpark the next retry", async () => {
+      const { companyId, agentId, issueId } = await seedParkedContinuationRetry({
+        title: "Park notice must not self-supersede",
+        summaryUpdatedAt: new Date("2026-08-15T09:00:00.000Z"),
+      });
+
+      const first = await resumeContinuationRetry({
+        companyId,
+        agentId,
+        issueId,
+        expectedStatus: "cancelled",
+      });
+      expect(first.run?.errorCode).toBe("issue_continuation_waiting_on_review");
+
+      const notices = await db
+        .select({ body: issueComments.body, authorType: issueComments.authorType })
+        .from(issueComments)
+        .where(and(
+          eq(issueComments.issueId, issueId),
+          sql`${issueComments.body} like '%Continuation retry%'`,
+        ));
+      expect(notices).toHaveLength(1);
+      expect(notices[0]?.authorType).toBe("system");
+      expect(notices[0]?.body).toContain("waiting for reviewer feedback or approval");
+      expect(notices[0]?.body).toContain(first.runId);
+
+      // Second retry against the same summary: still cancelled, and the notice
+      // is not duplicated.
+      const second = await resumeContinuationRetry({
+        companyId,
+        agentId,
+        issueId,
+        expectedStatus: "cancelled",
+      });
+      expect(second.run?.errorCode).toBe("issue_continuation_waiting_on_review");
+
+      const noticesAfter = await db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(and(
+          eq(issueComments.issueId, issueId),
+          sql`${issueComments.body} like '%Continuation retry%'`,
+        ));
+      expect(noticesAfter).toHaveLength(1);
+      expect(countExecuteCallsForRun(first.runId)).toBe(0);
+      expect(countExecuteCallsForRun(second.runId)).toBe(0);
+    });
+
+    // Preferring the live document over the wake snapshot must not bypass the
+    // snapshot's quarantine redaction: a low-trust summary reads as
+    // `LOW_TRUST_QUARANTINED_BODY`, which has no `Next Action`, so it cannot
+    // park a run (and its raw text cannot reach the run-event payload).
+    it("does not let a quarantined low-trust summary park a continuation retry", async () => {
+      const { companyId, agentId, issueId } = await seedParkedContinuationRetry({
+        title: "Quarantined summary must not park",
+        summaryUpdatedAt: new Date("2026-08-15T09:00:00.000Z"),
+        sourceTrust: { preset: LOW_TRUST_REVIEW_PRESET, disposition: "quarantined" },
+      });
+
+      const { run } = await resumeContinuationRetry({
+        companyId,
+        agentId,
+        issueId,
+        expectedStatus: "succeeded",
+      });
+
+      expect(run?.status).toBe("succeeded");
+      expect(run?.errorCode).toBeNull();
+    });
   });
 });

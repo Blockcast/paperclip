@@ -8,7 +8,20 @@ export type DepBlockedMetricKey =
   | "dep_blocked_reset"
   | "dep_blocked_promoted"
   | "dep_blocked_redeferred"
-  | "dep_blocked_exhausted";
+  | "dep_blocked_exhausted"
+  // Park terminated for exceeding DEP_BLOCKED_MAX_PARK_AGE_MS. Distinct from
+  // dep_blocked_exhausted (attempt budget) because the age ceiling exists to catch
+  // parks whose attempt counter was reset by blocker-set churn (BLO-29055) — the two
+  // must stay separable to tell "waited too long" from "retried too often".
+  | "dep_blocked_age_expired"
+  // A re-park inherited its age origin from a park that the blockedInteractionWake
+  // branch had cancelled on an earlier call (BLO-29729). Counted because that carry
+  // cannot be inferred from any other counter: without it the re-park stamps a fresh
+  // origin and looks identical to a genuine first park. Read it as "how often the
+  // interaction-wake evasion was actually taken" — a persistently zero value on a
+  // fleet with dep-blocked parks and comment traffic means the recovery is not
+  // matching, not that the hole is unused.
+  | "dep_blocked_origin_recovered";
 
 const MAX_COUNTER_VALUE = Number.MAX_SAFE_INTEGER;
 
@@ -19,6 +32,8 @@ const counters: Record<DepBlockedMetricKey, number> = {
   dep_blocked_promoted: 0,
   dep_blocked_redeferred: 0,
   dep_blocked_exhausted: 0,
+  dep_blocked_age_expired: 0,
+  dep_blocked_origin_recovered: 0,
 };
 
 export function incrementDepBlockedMetric(key: DepBlockedMetricKey): void {

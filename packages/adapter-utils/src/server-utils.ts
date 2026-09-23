@@ -26,6 +26,26 @@ export interface RunProcessResult {
   terminalResultCleanup?: TerminalResultCleanupEvidence | null;
 }
 
+export interface ProcessLifecycleEvent {
+  stage:
+    | "spawn_attempted"
+    | "spawned"
+    | "error"
+    | "first_output"
+    | "timeout_signal"
+    | "kill_signal"
+    | "exit"
+    | "close";
+  observedAt: string;
+  pid?: number;
+  processGroupId?: number | null;
+  stream?: "stdout" | "stderr";
+  signal?: NodeJS.Signals | null;
+  exitCode?: number | null;
+  errorCode?: string | null;
+  timedOut?: boolean;
+}
+
 export interface TerminalResultCleanupOptions {
   hasTerminalResult: (output: { stdout: string; stderr: string }) => boolean;
   graceMs?: number;
@@ -35,13 +55,31 @@ export const UNMANAGED_BACKGROUND_TASK_STOP_REASON = "unmanaged_background_task_
 export const UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON =
   "unmanaged background task stopped; no durable live path";
 
+/**
+ * Forensic evidence for one terminal-result cleanup escalation.
+ *
+ * `signal` and `forceKilled` describe DIFFERENT things and must not be read as
+ * one fact (PEN-3093):
+ *
+ * - `signal` is what this path DECIDED TO SEND -- the escalation it reached.
+ *   It is recorded unconditionally, because the decision genuinely happened.
+ * - `forceKilled` is whether the SIGKILL was DELIVERED to a live process. It is
+ *   false when the group was already gone (ESRCH) and the direct child had
+ *   closed, i.e. nothing was there to receive it.
+ *
+ * So `signal: "SIGKILL"` with `forceKilled: false` is a normal, truthful
+ * reading: the escalation ran, but killed nothing. Reading `signal` alone as
+ * "a process was killed" is the overclaim this split exists to prevent.
+ */
 export interface TerminalResultCleanupEvidence {
   kind: "terminal_result_cleanup";
   stopped: true;
   stopReason: typeof UNMANAGED_BACKGROUND_TASK_STOP_REASON;
   reason: typeof UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON;
   terminalResultSeen: boolean;
+  /** Escalation this path decided to send. Attempted, NOT necessarily delivered. */
   signal: NodeJS.Signals | null;
+  /** Whether the SIGKILL actually reached a live process. See the note above. */
   forceKilled: boolean;
 }
 
@@ -62,6 +100,7 @@ interface SpawnTarget {
 type RemoteExecutionSpec = SshRemoteExecutionSpec;
 
 type ChildProcessWithEvents = ChildProcess & {
+  on(event: "spawn", listener: () => void): ChildProcess;
   on(event: "error", listener: (err: Error) => void): ChildProcess;
   on(
     event: "exit",
@@ -79,24 +118,28 @@ function resolveProcessGroupId(child: ChildProcess) {
 }
 
 // Exported so the direct-child fallback branch can be unit-tested directly.
+// Returns whether the signal was actually delivered to a live target, so callers
+// can report a kill as evidence only when one really happened.
 export function signalRunningProcess(
   running: Pick<RunningProcess, "child" | "processGroupId">,
   signal: NodeJS.Signals,
-) {
+): boolean {
   if (process.platform !== "win32" && running.processGroupId && running.processGroupId > 0) {
     try {
       process.kill(-running.processGroupId, signal);
-      return;
+      return true;
     } catch {
-      // Fall back to the direct child signal if group signaling fails.
+      // Fall back to the direct child signal if group signaling fails. A throw
+      // here is usually ESRCH: the whole group is already gone.
     }
   }
   // Gate on real liveness: `child.killed` only means a signal was sent, not that
   // the process exited, so escalating on it would suppress a follow-up SIGKILL.
   // `exitCode`/`signalCode` are null until the child actually closes.
   if (running.child.exitCode === null && running.child.signalCode === null) {
-    running.child.kill(signal);
+    return running.child.kill(signal);
   }
+  return false;
 }
 
 export const runningProcesses = new Map<string, RunningProcess>();
@@ -3051,6 +3094,7 @@ export async function runChildProcess(
     onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
     onLogError?: (err: unknown, runId: string, message: string) => void;
     onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
+    onLifecycle?: (event: ProcessLifecycleEvent) => Promise<void>;
     terminalResultCleanup?: TerminalResultCleanupOptions;
     stdin?: string;
     remoteExecution?: RemoteExecutionSpec | null;
@@ -3089,6 +3133,14 @@ export async function runChildProcess(
       localProcessSandbox: opts.localProcessSandbox ?? null,
     })
       .then((target) => {
+        let lifecycleChain: Promise<void> = Promise.resolve();
+        const emitLifecycle = (event: ProcessLifecycleEvent) => {
+          if (!opts.onLifecycle) return;
+          lifecycleChain = lifecycleChain
+            .then(() => opts.onLifecycle?.(event))
+            .catch((err) => onLogError(err, runId, "failed to record child process lifecycle"));
+        };
+        emitLifecycle({ stage: "spawn_attempted", observedAt: new Date().toISOString() });
         const childEnv = { ...mergedEnv, ...target.env };
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
@@ -3102,7 +3154,6 @@ export async function runChildProcess(
         }) as ChildProcessWithEvents;
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
-
         const spawnPersistPromise =
           typeof child.pid === "number" && child.pid > 0 && opts.onSpawn
             ? opts.onSpawn({ pid: child.pid, processGroupId, startedAt }).catch((err) => {
@@ -3122,8 +3173,12 @@ export async function runChildProcess(
         let terminalCleanupForceKilled = false;
         let terminalCleanupTimer: NodeJS.Timeout | null = null;
         let terminalCleanupKillTimer: NodeJS.Timeout | null = null;
+        let timeoutKillTimer: NodeJS.Timeout | null = null;
         let terminalResultStdoutScanOffset = 0;
         let terminalResultStderrScanOffset = 0;
+        let firstStdoutSeen = false;
+        let firstStderrSeen = false;
+        let childError: Error | null = null;
 
         const clearTerminalCleanupTimers = () => {
           if (terminalCleanupTimer) clearTimeout(terminalCleanupTimer);
@@ -3164,8 +3219,14 @@ export async function runChildProcess(
             terminalCleanupKillTimer = setTimeout(() => {
               terminalCleanupKillTimer = null;
               terminalCleanupSignal = "SIGKILL";
-              terminalCleanupForceKilled = true;
-              signalRunningProcess({ child, processGroupId }, "SIGKILL");
+              // `forceKilled` is surfaced as run evidence, so it must record a
+              // kill that actually landed rather than one that was merely
+              // attempted. `signalRunningProcess` reports false when the whole
+              // group is already gone (ESRCH) and the direct child has closed.
+              // `terminalCleanupSignal` stays unconditional on purpose: it
+              // describes the escalation this path decided on, which did
+              // happen, whereas `forceKilled` claims an effect on the process.
+              terminalCleanupForceKilled = signalRunningProcess({ child, processGroupId }, "SIGKILL");
             }, Math.max(1, opts.graceSec) * 1000);
           }, graceMs);
         };
@@ -3175,9 +3236,28 @@ export async function runChildProcess(
             ? setTimeout(() => {
                 timedOut = true;
                 clearTerminalCleanupTimers();
+                emitLifecycle({
+                  stage: "timeout_signal",
+                  observedAt: new Date().toISOString(),
+                  signal: "SIGTERM",
+                });
                 signalRunningProcess({ child, processGroupId }, "SIGTERM");
-                setTimeout(() => {
-                  signalRunningProcess({ child, processGroupId }, "SIGKILL");
+                timeoutKillTimer = setTimeout(() => {
+                  timeoutKillTimer = null;
+                  // Deliver first, then report. The grace timer deliberately
+                  // survives `close` (see the `close` handler) so a descendant
+                  // that outlived the direct child still gets SIGKILLed. On the
+                  // common graceful path the whole group is already gone, the
+                  // kill lands on nothing, and emitting `kill_signal` there
+                  // would forge evidence of a force-kill that never happened —
+                  // and append a run event after the run had terminalized.
+                  const delivered = signalRunningProcess({ child, processGroupId }, "SIGKILL");
+                  if (!delivered) return;
+                  emitLifecycle({
+                    stage: "kill_signal",
+                    observedAt: new Date().toISOString(),
+                    signal: "SIGKILL",
+                  });
                 }, Math.max(1, opts.graceSec) * 1000);
               }, opts.timeoutSec * 1000)
             : null;
@@ -3187,6 +3267,14 @@ export async function runChildProcess(
           if (!readable) return;
           readable.pause();
           const text = String(chunk);
+          if (!firstStdoutSeen && text.length > 0) {
+            firstStdoutSeen = true;
+            emitLifecycle({
+              stage: "first_output",
+              observedAt: new Date().toISOString(),
+              stream: "stdout",
+            });
+          }
           stdout = appendWithCap(stdout, text);
           maybeArmTerminalResultCleanup();
           logChain = logChain
@@ -3203,6 +3291,14 @@ export async function runChildProcess(
           if (!readable) return;
           readable.pause();
           const text = String(chunk);
+          if (!firstStderrSeen && text.length > 0) {
+            firstStderrSeen = true;
+            emitLifecycle({
+              stage: "first_output",
+              observedAt: new Date().toISOString(),
+              stream: "stderr",
+            });
+          }
           stderr = appendWithCap(stderr, text);
           maybeArmTerminalResultCleanup();
           logChain = logChain
@@ -3232,29 +3328,68 @@ export async function runChildProcess(
           });
         }
 
+        child.on("spawn", () => {
+          if (typeof child.pid !== "number" || child.pid <= 0) return;
+          emitLifecycle({
+            stage: "spawned",
+            observedAt: new Date().toISOString(),
+            pid: child.pid,
+            processGroupId,
+          });
+        });
+
         child.on("error", (err: Error) => {
+          childError = err;
           if (timeout) clearTimeout(timeout);
+          if (timeoutKillTimer) clearTimeout(timeoutKillTimer);
           clearTerminalCleanupTimers();
           runningProcesses.delete(runId);
           void target.cleanup?.();
           const errno = (err as NodeJS.ErrnoException).code;
+          emitLifecycle({
+            stage: "error",
+            observedAt: new Date().toISOString(),
+            errorCode: errno ?? null,
+          });
           const pathValue = mergedEnv.PATH ?? mergedEnv.Path ?? "";
           const msg =
             errno === "ENOENT"
               ? `Failed to start command "${command}" in "${opts.cwd}". Verify adapter command, working directory, and PATH (${pathValue}).`
               : `Failed to start command "${command}" in "${opts.cwd}": ${err.message}`;
-          reject(new Error(msg));
+          void lifecycleChain.finally(() => reject(new Error(msg)));
         });
 
-        child.on("exit", () => {
+        child.on("exit", (code, signal) => {
+          emitLifecycle({
+            stage: "exit",
+            observedAt: new Date().toISOString(),
+            exitCode: code,
+            signal,
+            timedOut,
+          });
           maybeArmTerminalResultCleanup();
         });
 
         child.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
           if (timeout) clearTimeout(timeout);
+          // `timeoutKillTimer` is deliberately NOT cleared here, unlike in the
+          // `error` handler. `close` only means the direct child's stdio closed;
+          // descendants spawned with their own stdio (`stdio: 'ignore'`) stay
+          // alive in the process group, and this pending timer is the only thing
+          // that SIGKILLs them — see the "keeps timeout escalation armed after
+          // the direct child exits" test. The `error` handler may clear it
+          // because a failed spawn leaves no process group to signal.
           clearTerminalCleanupTimers();
           runningProcesses.delete(runId);
-          void logChain.finally(() => {
+          if (childError) return;
+          emitLifecycle({
+            stage: "close",
+            observedAt: new Date().toISOString(),
+            exitCode: code,
+            signal,
+            timedOut,
+          });
+          void Promise.allSettled([logChain, lifecycleChain]).finally(() => {
             void Promise.resolve()
               .then(() => target.cleanup?.())
               .finally(() => {

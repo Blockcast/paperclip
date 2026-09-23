@@ -49,14 +49,45 @@ rules:
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
+  # Pod metrics (BLO-20251) — the hard-stale reaper in
+  # server/src/services/heartbeat.ts reads pod CPU to tell a run blocked on a
+  # long silent subprocess (pnpm install, test suite, docker build) apart from a
+  # genuinely wedged pod. Without this, both look identical (the agent CLI emits
+  # nothing between tool_use and tool_result) and live work gets force-killed.
+  #
+  # Served by metrics-server, which is an OPTIONAL cluster add-on. Every read
+  # degrades to "unknown" and the reaper falls back to its pre-BLO-20251
+  # output-silence behaviour, so this grant failing (or metrics-server being
+  # absent) is safe — it costs sensitivity, not correctness.
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get", "list"]
   # Secrets — both adapters create a transient Secret per Job for prompts
   # above LARGE_PROMPT_THRESHOLD_BYTES (256 KiB; below that, the prompt
   # rides as an env var on the init container). Both also patch the Secret
   # mid-run (claude-k8s execute.js:884, opencode-k8s execute.js:1052) —
   # `patch` is NOT in either adapter's SSAR self-test.
+  #
+  # `update` (BLO-31665 / PEN-3041) — required by createOrAdoptRunSecret in
+  # vendor/paperclip-adapter-claude-k8s/src/server/execute.ts. On a create 409
+  # it reads the colliding Secret, checks its run-id/managed-by labels, then
+  # calls replaceNamespacedSecret — a PUT, which the RBAC authorizer maps to
+  # `update`, not to the `patch` granted above. Without this verb the adopt
+  # path 403s and the run dies anyway, so the #1678 fix for the intermittent
+  # (~1 in 40 runs) Secret collision is present but inert: it converts an
+  # AlreadyExists failure into a Forbidden one. Measured in prod 2026-09-13 —
+  # 7 runs across 4 agents in one 7h window, all on
+  # `cannot update resource "secrets"`.
+  #
+  # `replace` is deliberate upstream, not an oversight to paper over with
+  # `patch`: it re-derives the full Secret body and carries the existing
+  # resourceVersion as an optimistic-concurrency precondition. A strategic-merge
+  # patch would leave stale keys from the prior attempt and drop that guard.
+  # Granting `update` beside the `create`+`delete` already held is not a
+  # privilege increase — the same end state is reachable by delete-then-create.
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["create", "delete", "get", "patch"]
+    verbs: ["create", "delete", "get", "patch", "update"]
   # PVCs — adapter looks up the shared PVC claim name (paperclip-data) to mount
   # at /paperclip in agent Job pods. opencode-k8s additionally creates/deletes
   # per-agent PVCs by default — `agentDbMode` defaults to `dedicated_pvc`

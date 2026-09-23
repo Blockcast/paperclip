@@ -23,6 +23,7 @@ import type { IncomingHttpHeaders } from "node:http";
 import type { Request, RequestHandler, Router } from "express";
 import { logger } from "../middleware/logger.js";
 import { assertBoardOrgAccess } from "./authz.js";
+import { recordWorkerTierProxyFailure } from "../services/metrics.js";
 
 /**
  * Plugin routes whose handlers reach pluginWorkerManager.{startWorker,
@@ -233,9 +234,27 @@ function createWorkerProxyHandler(
     // Non-streaming requests get a hard timeout. Streaming (SSE) requests get
     // only a bounded startup retry budget; after the worker responds, the
     // stream itself stays open until the client disconnects.
+    //
+    // ponytail: a streaming request that has started has NO deadline, so a
+    // worker that accepts the SSE connection and then goes silent produces no
+    // abort, no catch, and no counter increment — the request just hangs and
+    // the failure series stays quiet. Silence on this metric is therefore not
+    // proof of health for the streaming routes. Upgrade path if that gap
+    // matters: an idle-timeout on the piped stream (reset on each chunk),
+    // which is the only shape that does not also kill a healthy long-lived
+    // SSE connection.
+    //
+    // `timedOut` records WHY the abort fired. Without it every abort surfaces
+    // as "Worker tier unreachable", which is false whenever the connection
+    // succeeded and the worker was merely slow — and it sends the responder
+    // hunting for a missing Service endpoint that was there the whole time.
+    let timedOut = false;
     const timeout = streaming
       ? undefined
-      : setTimeout(() => controller.abort(), requestTimeoutMs);
+      : setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, requestTimeoutMs);
 
     try {
       const headers = forwardRequestHeaders(req.headers);
@@ -317,14 +336,36 @@ function createWorkerProxyHandler(
     } catch (err) {
       // Client left before we finished — expected, nothing to report.
       if (clientDisconnected) return;
+      // `headersSent` is definitive proof the worker responded: those headers
+      // were read off the upstream response above and forwarded. Counting
+      // that as `unreachable` would send the responder hunting for a missing
+      // Service endpoint that demonstrably answered — the same wrong-cause
+      // chase this split exists to remove. It is reachable on the streaming
+      // routes in particular, where `timeout` is undefined and `timedOut` can
+      // never become true, so a worker that streams and then dies mid-body
+      // lands here with no other way to be labelled.
+      const failureReason = timedOut
+        ? "timeout"
+        : res.headersSent
+        ? "mid_stream"
+        : "unreachable";
+      recordWorkerTierProxyFailure(failureReason);
       logger.error(
-        { err, targetUrl, method: req.method },
-        "worker-tier proxy: failed to relay request to worker tier",
+        { err, targetUrl, method: req.method, reason: failureReason, requestTimeoutMs },
+        failureReason === "timeout"
+          ? "worker-tier proxy: worker tier did not respond before the proxy timeout"
+          : failureReason === "mid_stream"
+          ? "worker-tier proxy: worker tier response failed after headers were flushed"
+          : "worker-tier proxy: failed to relay request to worker tier",
       );
       if (!res.headersSent) {
         res
-          .status(502)
-          .json({ error: "Worker tier unreachable — plugin operation could not be completed." });
+          .status(timedOut ? 504 : 502)
+          .json({
+            error: timedOut
+              ? `Worker tier did not respond within ${requestTimeoutMs}ms — plugin operation could not be completed.`
+              : "Worker tier unreachable — plugin operation could not be completed.",
+          });
       } else {
         // Headers already flushed: the response is now a truncated stream.
         // Destroy the socket so the client sees a broken connection rather

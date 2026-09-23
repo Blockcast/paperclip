@@ -2,16 +2,63 @@ name: commitperclip PR Review
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened]
+    # `edited` is load-bearing, not optional (BLO-26636). Three of the gates
+    # below read only the PR body and title (checkTemplate, checkLinkedIssue,
+    # checkDedupSearch), and the failure comment asks the author to fix exactly
+    # those. Without `edited` that fix fires no event, so the check stays red
+    # until somebody hand-re-runs the job; measured instances sat red 7h, 10h,
+    # ~21h and ~7h across #1328, #1359, #1696 and #1873.
+    #
+    # Deliberately NOT filtered down to `github.event.changes.body != null`.
+    # `edited` also fires on a base-branch retarget, and a job-level `if` that
+    # skips those publishes a check-run with conclusion `skipped` for the same
+    # head — which every downstream reader scores as non-failing, so a retarget
+    # would silently clear a genuinely red gate. The run is cheap enough that
+    # the filter is not worth that: 20 recent pull_request_target runs measured
+    # 25-133s (median ~60s) on arc-light.
+    #
+    # Known residual: `edited` makes same-head re-runs routine, and GitHub adds
+    # a check-run rather than replacing the old one, so a fixed body leaves a
+    # stale `review: failure` row beside the new success at that SHA. Branch
+    # protection collapses to latest-per-name and is unaffected, but a reader
+    # that enumerates check-runs keyed on (name, run id) still scores the dead
+    # row as a stop. The fix belongs reader-side — collapse same-name re-runs
+    # to the latest run id — not here. Tracked on BLO-26636.
+    types: [opened, synchronize, reopened, edited]
+  merge_group:
+    types: [checks_requested]
 
-# Always runs from base branch context — never executes PR code.
-# pull_request_target gives access to secrets for untrusted fork PRs.
+# Always runs from base branch context — never executes PR or merge-queue
+# code. pull_request_target gives access to secrets for untrusted fork PRs,
+# so the "Checkout base branch" step below deliberately checks out `master`
+# rather than the PR head, regardless of trigger. That same checkout also
+# covers the merge_group case: this workflow never runs the diff itself (the
+# steps below only call the GitHub API to *read* PR/file data, they don't
+# execute anything the diff added), so the only thing "checking out the
+# right commit" would buy is running this workflow's own scripts from the
+# queue candidate instead of from master — which is exactly the thing this
+# guards against, since the diff under review could itself be the one
+# trying to weaken these scripts. All secret-bearing steps below always run
+# the master copy.
+#
+# What DOES vary with `merge_group` is which commit these checks are *about*:
+# the PR/dependency-review diff and the security-review check-run report
+# against the queue's rebased candidate commit (github.event.merge_group.*),
+# not the PR's original head, mirroring the PR_BASE_SHA/PR_HEAD_SHA pattern
+# in pr.yml. See BLO-22300.
 
 permissions:
   pull-requests: write
   security-events: write
   checks: write
   contents: read
+
+env:
+  # pull_request_target and merge_group carry the base/head commits under
+  # different event fields; fall back the same way pr.yml does so every
+  # step below can read one pair of names regardless of trigger.
+  PR_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+  PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
 
 jobs:
   review:
@@ -22,30 +69,57 @@ jobs:
     # without letting a genuinely hung job drain a runner.
     timeout-minutes: 10
     env:
-      # Blockcast does not provision the upstream commitperclip bot key. Skip
-      # the bot steps (token + quality/security gates) when it is absent so
-      # Dependency Review still gates every PR instead of the whole job
-      # failing at token generation.
+      # Skip the bot steps (token + quality/security gates) when no App key is
+      # provisioned, so Dependency Review still gates every PR instead of the
+      # whole job failing at token generation. Blockcast DOES provision one —
+      # it points COMMITPERCLIP_APP_ID at the `allyblockcast` App rather than
+      # upstream's `commitperclip` (see get-bot-token.mjs), so these steps run
+      # here and the gate comment is authored by `allyblockcast[bot]`.
       COMMITPERCLIP_ENABLED: ${{ secrets.COMMITPERCLIP_KEY != '' }}
     steps:
-      - name: Checkout base branch (never PR code)
+      - name: Checkout base branch (never PR or queue-candidate code)
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: master
 
+      # merge_group events have no github.event.pull_request context, so the
+      # PR number (needed by the scripts below to call the GitHub API) has to
+      # be recovered from the queue entry's branch name, which GitHub always
+      # formats as refs/heads/gh-readonly-queue/<base>/pr-<number>-<sha>.
+      # Skipped entirely on pull_request_target runs, where the PR number is
+      # already available directly from the event.
+      - name: Resolve PR context for merge-queue runs
+        id: pr_context
+        if: github.event_name == 'merge_group'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          head_ref="${{ github.event.merge_group.head_ref }}"
+          pr_number="${head_ref##*/pr-}"
+          pr_number="${pr_number%-*}"
+          if ! [[ "$pr_number" =~ ^[0-9]+$ ]]; then
+            echo "::error::Could not parse a PR number out of merge_group.head_ref: $head_ref"
+            exit 1
+          fi
+          echo "number=$pr_number" >> "$GITHUB_OUTPUT"
+
+          pr_json="$(gh api "repos/${{ github.repository }}/pulls/$pr_number")"
+          echo "author=$(jq -r .user.login <<<"$pr_json")" >> "$GITHUB_OUTPUT"
+          echo "branch=$(jq -r .head.ref <<<"$pr_json")" >> "$GITHUB_OUTPUT"
+
       - name: Dependency Review
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
-          base-ref: ${{ github.event.pull_request.base.sha }}
-          head-ref: ${{ github.event.pull_request.head.sha }}
+          base-ref: ${{ env.PR_BASE_SHA }}
+          head-ref: ${{ env.PR_HEAD_SHA }}
 
-      # Only the commitperclip bot steps below use Node. On Blockcast the bot
-      # key is absent (COMMITPERCLIP_ENABLED=false), so setting up Node here
-      # would download the toolcache purely to leave it unused — the main cost
-      # that pushes this job past its cap. Gate it behind the same flag as its
-      # consumers: upstream (key present) still installs Node, Blockcast skips.
-      # Dependency Review runs as a JS action on the runner's own node20, so it
-      # does not depend on this step.
+      # Only the commitperclip bot steps below use Node. Where no App key is
+      # provisioned (COMMITPERCLIP_ENABLED=false) those steps are skipped, so
+      # setting up Node would download the toolcache purely to leave it unused
+      # — the main cost that pushes this job past its cap. Gate it behind the
+      # same flag as its consumers. Dependency Review runs as a JS action on
+      # the runner's own node20, so it does not depend on this step.
       - name: Set up Node
         if: env.COMMITPERCLIP_ENABLED == 'true'
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
@@ -67,15 +141,15 @@ jobs:
         id: quality
         if: >-
           env.COMMITPERCLIP_ENABLED == 'true' &&
-          github.event.pull_request.user.login != 'dependabot[bot]'
+          (github.event.pull_request.user.login || steps.pr_context.outputs.author) != 'dependabot[bot]'
         run: node .github/scripts/run-quality-gates.mjs
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.token.outputs.value }}
           GH_REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number || steps.pr_context.outputs.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login || steps.pr_context.outputs.author }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref || steps.pr_context.outputs.branch }}
 
       - name: Run security gates
         if: env.COMMITPERCLIP_ENABLED == 'true'
@@ -85,12 +159,19 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.token.outputs.value }}
           GH_REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_NUMBER: ${{ github.event.pull_request.number || steps.pr_context.outputs.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login || steps.pr_context.outputs.author }}
+          # The commit this check-run reports against. For pull_request_target
+          # this is the PR head (same as pr.head.sha, which the script would
+          # otherwise fetch itself). For merge_group it is the queue's rebased
+          # candidate commit — the one that actually lands on master — so the
+          # security-review check-run stops being scoped to a SHA that never
+          # merges. See resolveTargetSha() in check-pr-security.mjs.
+          PR_HEAD_SHA: ${{ env.PR_HEAD_SHA }}
 
       - name: Fail if quality gates failed
         if: >-
-          github.event.pull_request.user.login != 'dependabot[bot]' &&
+          (github.event.pull_request.user.login || steps.pr_context.outputs.author) != 'dependabot[bot]' &&
           steps.quality.outcome == 'failure'
         run: |
           echo "One or more quality gates failed. See commitperclip comment on the PR for details."

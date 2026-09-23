@@ -82,6 +82,51 @@ export const DEFAULT_ESCALATION_DEADLINE_MINUTES: Record<string, number> = {
  */
 export const DEFAULT_COVER_DEDUP_WINDOW_MINUTES = 120;
 
+/**
+ * How long an operator-closed issue mutes re-fires of its fingerprint before
+ * the plugin re-opens it anyway (BLO-24234).
+ *
+ * 24h is chosen to outlast a single on-call shift — long enough that closing a
+ * noisy issue actually buys quiet for the rest of the day, short enough that a
+ * still-firing alert cannot stay invisible across a handover. Operators who
+ * want the old unbounded mute can set `operatorSuppressionHours: 0`.
+ */
+export const DEFAULT_OPERATOR_SUPPRESSION_HOURS = 24;
+
+/**
+ * Ceiling on `operatorSuppressionHours`, applied before it is converted to
+ * milliseconds.
+ *
+ * Validating the configured value for finiteness is not enough on its own: the
+ * conversion multiplies by 3.6e6, so any input above ~5e301 overflows to
+ * `Infinity`, and `now - anchor >= Infinity` is never true. A merely large
+ * finite value is no better — 1e15 hours is ~1e11 years. Either way the window
+ * never expires, which is exactly the unbounded mute BLO-24234 exists to
+ * remove, reachable through a config typo rather than a code path.
+ *
+ * 30 days is well past any plausible deliberate mute while still guaranteeing
+ * the multiplication stays finite and the window always ends. `0` remains the
+ * explicit, documented opt-in to indefinite suppression, so clamping here
+ * takes nothing away that an operator can't still ask for on purpose.
+ */
+export const MAX_OPERATOR_SUPPRESSION_HOURS = 24 * 30;
+
+/**
+ * Severities (BLO-24177) that never produce agent-actionable work. `none` is
+ * Prometheus's convention for the always-firing `Watchdog` alert (`vector(1)`)
+ * used as a dead-man's-switch heartbeat — it is designed to fire forever, so a
+ * normal `todo` issue for it can never be legitimately resolved and just
+ * recirculates through stranded-issue recovery.
+ *
+ * Deliberately a constant and not a config key. Making it configurable would
+ * mean a `done` row this plugin closed could later be re-read by `decideRefire`
+ * as an *operator* close (it has no `resolvedAt`), muting the fingerprint for
+ * the operator-suppression window — a failure mode that only exists if the list
+ * can change. `none` has exactly one member in this estate (`Watchdog`), so the
+ * knob buys nothing and costs that bug.
+ */
+export const TERMINAL_SEVERITIES: readonly string[] = ["none"];
+
 /** Default owner routes shipped with the bundled Blockcast Alertmanager plugin. */
 export const DEFAULT_OWNER_MAP: OwnerMap = {
   class: {
@@ -232,6 +277,7 @@ export const DEFAULT_CONFIG: AlertmanagerPluginConfig = {
   severityToPriority: DEFAULT_SEVERITY_TO_PRIORITY,
   autoCloseOnResolve: true,
   ownerMap: DEFAULT_OWNER_MAP,
+  fallbackAgentName: "",
   issueRouteMap: DEFAULT_ISSUE_ROUTE_MAP,
   escalationDeadlineMinutes: DEFAULT_ESCALATION_DEADLINE_MINUTES,
   coverDedupWindowMinutes: DEFAULT_COVER_DEDUP_WINDOW_MINUTES,

@@ -1,10 +1,18 @@
 import assert from "node:assert/strict";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
 
-import { linkSdkInto, readPluginsUnder } from "./link-plugin-dev-sdk.mjs";
+import {
+  excludedPluginDirs,
+  linkSdkInto,
+  readPluginsUnder,
+  symlinkAcceptingIdenticalRaceWinner,
+} from "./link-plugin-dev-sdk.mjs";
+
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 let workDir;
 
@@ -86,4 +94,46 @@ test("linkSdkInto replaces a symlink that points somewhere else", () => {
   assert.equal(linkSdkInto(pkg), true);
   assert.notEqual(readlinkSync(join(scopeDir, "plugin-sdk")), "../somewhere-else");
   assert.ok(existsSync(scopeDir));
+});
+
+test("symlinkAcceptingIdenticalRaceWinner tolerates a concurrent linker that wrote the same link", () => {
+  // The lstat probe in linkSdkInto and the symlink call are not atomic, so a
+  // concurrent linker can create the link in between. An identical link means
+  // our work is already done.
+  const scopeDir = join(workDir, "race-identical");
+  mkdirSync(scopeDir, { recursive: true });
+  const link = join(scopeDir, "plugin-sdk");
+  symlinkSync("../../sdk", link, "dir");
+
+  assert.doesNotThrow(() => symlinkAcceptingIdenticalRaceWinner("../../sdk", link));
+  assert.equal(readlinkSync(link), "../../sdk");
+});
+
+test("symlinkAcceptingIdenticalRaceWinner rethrows when the racing link points elsewhere", () => {
+  const scopeDir = join(workDir, "race-divergent");
+  mkdirSync(scopeDir, { recursive: true });
+  const link = join(scopeDir, "plugin-sdk");
+  symlinkSync("../../somewhere-else", link, "dir");
+
+  assert.throws(() => symlinkAcceptingIdenticalRaceWinner("../../sdk", link), { code: "EEXIST" });
+});
+
+test("no workspace-member plugin runs the shared linker from its own postinstall", () => {
+  // pnpm runs a workspace member's postinstall concurrently with the root one.
+  // Both call this script, both walk the same excluded-plugin list, and the
+  // loser of the symlink race fails the entire install with EEXIST. The root
+  // postinstall already covers every excluded plugin, so a member's own hook is
+  // pure duplication. Packages excluded from the workspace are the exception:
+  // they never see the root hook when installed standalone.
+  const excluded = new Set(excludedPluginDirs());
+  const offenders = [];
+
+  for (const packageDir of readPluginsUnder(join(repoRoot, "packages", "plugins"))) {
+    if (excluded.has(packageDir)) continue;
+    const manifest = JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8"));
+    const postinstall = manifest.scripts?.postinstall ?? "";
+    if (postinstall.includes("link-plugin-dev-sdk")) offenders.push(manifest.name);
+  }
+
+  assert.deepEqual(offenders, []);
 });

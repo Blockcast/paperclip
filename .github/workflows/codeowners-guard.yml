@@ -1,0 +1,40 @@
+name: CODEOWNERS Guard
+
+# Asserts master's .github/CODEOWNERS has zero GitHub-side errors. GitHub
+# silently ignores an entry naming an account without write access — the
+# rule parses fine and enforces nothing, with no signal anywhere in the UI.
+# BLO-22899 found all 13 rules on master inert this way for an unknown
+# period after an upstream merge (c204d117) inherited two read-only
+# accounts. See scripts/check-codeowners.mjs.
+
+on:
+  schedule:
+    - cron: "41 * * * *"
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "owner/name to audit"
+        required: false
+        default: "Blockcast/paperclip"
+      ref:
+        description: "ref to check"
+        required: false
+        default: "master"
+
+permissions:
+  contents: read
+
+jobs:
+  zero-errors-on-master:
+    runs-on: default
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Assert zero CODEOWNERS errors
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CODEOWNERS_GUARD_REPO: ${{ inputs.repo || 'Blockcast/paperclip' }}
+          CODEOWNERS_GUARD_REF: ${{ inputs.ref || 'master' }}
+        run: node scripts/check-codeowners.mjs

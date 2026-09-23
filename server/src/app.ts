@@ -69,7 +69,12 @@ import { mcpGatewayProtocolRoutes, toolGatewayRoutes } from "./routes/tool-gatew
 import { adapterRoutes } from "./routes/adapters.js";
 import { metricsIngestRoutes } from "./routes/metrics-ingest.js";
 import { renderMetrics } from "./services/metrics.js";
-import { refreshExternalRuntimeReservationMetrics } from "./services/external-runtime-reservations.js";
+import {
+  expireStaleRefreshFreshness,
+  refreshAgentStartLockMetrics,
+  refreshDbPoolMetrics,
+  startScrapeMetricsCollector,
+} from "./services/scrape-metrics-collector.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { readBrandedStaticIndexHtml } from "./static-index-html.js";
 import { applyUiBranding } from "./ui-branding.js";
@@ -86,7 +91,10 @@ import { buildHostServices, flushPluginLogBuffer } from "./services/plugin-host-
 import { createPluginEventBus } from "./services/plugin-event-bus.js";
 import { setPluginEventBus, setPluginEventOutboxDb } from "./services/activity-log.js";
 import { startPluginEventOutbox } from "./services/plugin-event-outbox.js";
+import { startPluginStatusCollector } from "./services/plugin-status-metrics.js";
 import { startGitHubCommitStatusDeliveryOutbox } from "./services/github-status-delivery-outbox.js";
+import { startGithubReviewGateDeliveryWorker } from "./services/github-review-gate-authority.js";
+import { startIssueCommentEffectReconciler } from "./services/issue-comment-effects.js";
 import { createPluginDevWatcher } from "./services/plugin-dev-watcher.js";
 import { createPluginHostServiceCleanup } from "./services/plugin-host-service-cleanup.js";
 import { pluginRegistryService } from "./services/plugin-registry.js";
@@ -304,16 +312,69 @@ export async function createApp(
   // actorMiddleware: scrapes are unauthenticated (access is gated at the
   // network layer by the ServiceMonitor scrape-allow NetworkPolicy) and would
   // otherwise spam request logs every scrape interval.
+  //
+  // BLO-33243: this handler MUST NOT touch the database. It used to await five
+  // DB-querying refreshes in series, so a pool stall pushed the scrape past its
+  // 10 s timeout and the scrape ingested *no sample at all* -- destroying every
+  // in-process metric for that interval, including the event-loop-lag gauge
+  // that would have explained the stall. Two of three control-plane pods were
+  // losing ~1 scrape in 8 that way. The refreshes now run on a background
+  // interval (services/scrape-metrics-collector.ts); this handler renders the
+  // registry and nothing else. `expireStaleRefreshFreshness`,
+  // `refreshDbPoolMetrics` and `refreshAgentStartLockMetrics` are synchronous
+  // in-memory reads, not queries — which is load-bearing for the last one
+  // (PEN-3305): it reports dispatch sections wedged on the database, so it must
+  // not itself need the database to be reachable.
   app.get("/metrics", async (_req, res, next) => {
     try {
-      await refreshExternalRuntimeReservationMetrics(db).catch((err) => {
-        logger.warn({ err }, "failed to refresh external-runtime reservation metrics before scrape");
-      });
+      expireStaleRefreshFreshness();
+      refreshDbPoolMetrics(db);
+      refreshAgentStartLockMetrics();
       const { contentType, body } = await renderMetrics();
       res.status(200).set("Content-Type", contentType).send(body);
     } catch (err) {
       next(err);
     }
+  });
+
+  // Kubernetes probe endpoint (BLO-32164). Every probe in the chart —
+  // liveness, readiness and startup, on both the API Deployment and the worker
+  // StatefulSet — targets `/healthz`, but until this route existed **nothing
+  // declared it**. The request fell through to the SPA catch-all near the
+  // bottom of this file, which answered 200 with the UI shell. That accident
+  // held for a long time and hid three sharp edges:
+  //
+  //   1. Every probe did a synchronous `fs.readFileSync(index.html)` plus the
+  //      `applyUiBranding` string pass, on the event loop, on the exact path
+  //      that is expected to answer within 5-10s. Blocking disk work is the
+  //      worst possible thing to put on a liveness path: under image-fs
+  //      pressure that read is unbounded, so the probe could fail for a
+  //      reason that has nothing to do with whether the process is healthy.
+  //   2. A build serving no `ui-dist` skips the catch-all entirely, so every
+  //      probe would 404 and CrashLoop the pod for an unrelated reason. This
+  //      was recorded as a "latent landmine" in values.yaml under BLO-19722
+  //      and is now closed: this route does not depend on the UI existing.
+  //   3. The probe's semantics were undocumented and accidental. They are now
+  //      explicit, and deliberately UNCHANGED: this answers exactly one
+  //      question — "can the event loop service a request right now" — and
+  //      says nothing about database or heartbeat health.
+  //
+  // Deliberately NOT adding a DB check here. BLO-32164 originally attributed
+  // the probe failures to `/health`'s pool queries queueing behind the
+  // recovery sweep, but `/health` is mounted under `/api` and the kubelet
+  // never calls it; measured 2026-09-10, `/api/health` took 13.19s while
+  // `/healthz` answered in 6ms in the same second. Putting a query here would
+  // import that 13s stall onto the liveness path and start killing the
+  // singleton worker for pool saturation — turning a latency problem into an
+  // availability one. Readiness gating on the database belongs in `/api/health`.
+  //
+  // Mounted here, beside /metrics and ahead of httpLogger, the hostname guard
+  // and actorMiddleware, so a probe cannot be failed by auth, by log volume,
+  // or by the `Host: 127.0.0.1:3100` header the chart currently has to send to
+  // satisfy the private-hostname allowlist. The response carries no
+  // information, so exposing it unauthenticated costs nothing.
+  app.get("/healthz", (_req, res) => {
+    res.status(200).set("Cache-Control", "no-store").json({ status: "ok" });
   });
 
   // Respect the operator's `TRUST_PROXY` env var (see middleware/trust-proxy.ts).
@@ -513,6 +574,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     db,
     jobStore,
     workerManager,
+    listConfigCompanyIds: (pluginId) => pluginRegistry.listConfigCompanyIds(pluginId),
   });
   const toolDispatcher = createPluginToolDispatcher({
     workerManager,
@@ -528,10 +590,14 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   // Issue routes are intentionally mounted after the gateway is constructed because
   // issue approval endpoints delegate to it. The intervening routers use distinct
   // route prefixes, so this dependency does not change issue-route precedence.
+  let processIssueCommentEffects: ((commentId: string) => Promise<unknown>) | null = null;
   api.use(issueRoutes(db, opts.storageService, {
     feedbackExportService: opts.feedbackExportService,
     pluginWorkerManager: workerManager,
     approveToolActionRequest: (input) => toolGateway.approveActionRequest(input),
+    registerCommentEffectProcessor: (processor) => {
+      processIssueCommentEffects = processor;
+    },
   }));
   app.use(mcpGatewayProtocolRoutes(toolGateway));
   api.use(toolAccessRoutes(db, {
@@ -635,6 +701,16 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
       heartbeatOptions: { paperclipNodeRole: appConfig.paperclipNodeRole },
       prReviewerAgentIds: appConfig.githubPrReviewerAgentIds,
       prReviewerBotLogin: appConfig.prReviewerBotLogin || null,
+      reviewGateAuthority: appConfig.githubReviewGateCaptureEnabled
+        ? {
+            authorityEnabled: appConfig.githubReviewGateEnabled,
+            repositories: appConfig.githubReviewGateRepositories,
+            statusContext: appConfig.prReviewGateStatusContext,
+            expectedAppId: appConfig.githubReviewGateExpectedAppId,
+            expectedInstallationId: appConfig.githubReviewGateExpectedInstallationId,
+            reviewerBotLogin: appConfig.prReviewerBotLogin || null,
+          }
+        : null,
       // PR→issue back-link (BLO-13353). Absolute public origin used to build the
       // issue URL posted onto PRs; null (unset PAPERCLIP_PUBLIC_URL) disables it.
       // Opt-out gate is env-driven and defaults on; the poster also self-gates
@@ -999,6 +1075,12 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   // can host workers.
   let stopPluginEventOutbox: (() => void) | null = null;
   let stopGitHubStatusDeliveryOutbox: (() => void) | null = null;
+  let stopPluginStatusCollector: (() => void) | null = null;
+  let stopGithubReviewGateDeliveryWorker: (() => Promise<void>) | null = null;
+  let stopIssueCommentEffectReconciler: (() => Promise<void>) | null = null;
+  // BLO-33243: every tier serves /metrics and is a scrape target, so unlike the
+  // plugin-status collector this one is NOT gated on the node role.
+  const stopScrapeMetricsCollector = startScrapeMetricsCollector(db);
   if (appConfig.paperclipNodeRole === "api") {
     logger.info(
       { role: appConfig.paperclipNodeRole },
@@ -1006,6 +1088,19 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     );
   } else {
     stopGitHubStatusDeliveryOutbox = startGitHubCommitStatusDeliveryOutbox(db);
+    // Status collection doesn't depend on loadAll() completing -- an
+    // already-error'd plugin from a previous boot must be visible on /metrics
+    // immediately, not only after this boot's own load attempt resolves.
+    stopPluginStatusCollector = startPluginStatusCollector(db);
+    // Capture is staged across every API replica before processing is enabled.
+    // This prevents an old replica from acknowledging a delivery without
+    // persisting it during the authority activation rollout.
+    if (appConfig.githubReviewGateEnabled) {
+      stopGithubReviewGateDeliveryWorker = startGithubReviewGateDeliveryWorker(db);
+    }
+    if (processIssueCommentEffects) {
+      stopIssueCommentEffectReconciler = startIssueCommentEffectReconciler(db, processIssueCommentEffects);
+    }
     void ensureBundledKubernetesPlugin()
       .then(() => retireLegacyCcrotatePlugin())
       .then(() => retireIncompatiblePluginUpdater())
@@ -1027,20 +1122,26 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
       });
   }
   let appServicesShutdown = false;
-  const shutdownAppServices = () => {
+  const shutdownAppServices = async () => {
     if (appServicesShutdown) return;
     appServicesShutdown = true;
     stopPluginEventOutbox?.();
     stopGitHubStatusDeliveryOutbox?.();
+    stopPluginStatusCollector?.();
+    stopScrapeMetricsCollector();
+    await stopIssueCommentEffectReconciler?.();
     disableFeedbackExportFlushes();
     devWatcher?.close();
     viteHtmlRenderer?.dispose();
     hostServiceCleanup?.disposeAll();
     hostServiceCleanup?.teardown();
+    await stopGithubReviewGateDeliveryWorker?.();
   };
   app.locals.paperclipShutdown = shutdownAppServices;
 
-  process.once("exit", shutdownAppServices);
+  process.once("exit", () => {
+    void shutdownAppServices();
+  });
   process.once("beforeExit", () => {
     void flushPluginLogBuffer();
   });

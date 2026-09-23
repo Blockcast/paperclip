@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -87,6 +87,79 @@ describe("createPluginSecretsHandler fail-closed guards", () => {
       handler.resolve({ companyId: randomUUID(), secretRef: "not-a-secret-id" }),
     ).rejects.toThrow(/use \{ type: "secret_ref"/i);
     expect(db.select).not.toHaveBeenCalled();
+  });
+
+  it("rejects oversized verification candidates before touching the database", async () => {
+    const db = { select: vi.fn(() => { throw new Error("db should not be touched"); }) };
+    const handler = createPluginSecretsHandler({ db: db as never, pluginId });
+
+    await expect(handler.verify({
+      companyId: randomUUID(),
+      secretRef: { type: "secret_ref", secretId: randomUUID() },
+      presented: "x".repeat(4_097),
+    })).rejects.toMatchObject({
+      details: { code: "presented_secret_invalid" },
+    });
+    expect(db.select).not.toHaveBeenCalled();
+  });
+
+  it("meters verification before authorization, at 600 per window", async () => {
+    const db = { select: vi.fn(() => { throw new Error("db should not be touched"); }) };
+    const handler = createPluginSecretsHandler({ db: db as never, pluginId });
+    const params = {
+      companyId: randomUUID(),
+      secretRef: { type: "secret_ref" as const, secretId: randomUUID() },
+      presented: "a-junk-bearer",
+    };
+
+    // Each of these clears the rate gate and then dies at the first read inside
+    // `authorizeBoundSecret`. That failure is the instrument, not an accident:
+    // these calls can only have spent budget if the gate ran BEFORE the lookup.
+    for (let i = 0; i < 600; i += 1) {
+      await expect(handler.verify(params)).rejects.toThrow(/db should not be touched/);
+    }
+    expect(db.select).toHaveBeenCalledTimes(600);
+
+    // Hoisting the gate back below `authorizeBoundSecret` — the round-3
+    // regression this ordering exists to prevent — makes call 601 throw the db
+    // error like every call before it, because the limiter would never have
+    // been reached to count them. Asserting the limiter answers here is
+    // therefore what pins the ordering; the count alone would not.
+    await expect(handler.verify(params)).rejects.toMatchObject({
+      name: "RateLimitExceededError",
+    });
+    expect(db.select).toHaveBeenCalledTimes(600);
+  });
+
+  it("scopes the verification budget per company and keeps it out of resolve's", async () => {
+    const db = { select: vi.fn(() => { throw new Error("db should not be touched"); }) };
+    const handler = createPluginSecretsHandler({ db: db as never, pluginId });
+    const secretRef = { type: "secret_ref" as const, secretId: randomUUID() };
+    const floodedCompany = randomUUID();
+
+    for (let i = 0; i < 600; i += 1) {
+      await expect(
+        handler.verify({ companyId: floodedCompany, secretRef, presented: "a-junk-bearer" }),
+      ).rejects.toThrow(/db should not be touched/);
+    }
+    await expect(
+      handler.verify({ companyId: floodedCompany, secretRef, presented: "a-junk-bearer" }),
+    ).rejects.toMatchObject({ name: "RateLimitExceededError" });
+
+    // A neighbouring tenant is untouched: the bucket is keyed per
+    // (companyId, pluginId), so one company's public endpoint cannot be used to
+    // lock another's out.
+    await expect(
+      handler.verify({ companyId: randomUUID(), secretRef, presented: "a-junk-bearer" }),
+    ).rejects.toThrow(/db should not be touched/);
+
+    // And the flooded company's own plaintext-resolution budget survives, which
+    // is BLO-20738 AC 2 at the unit level: `verify` and `resolve` meter into
+    // separate buckets, so a junk-bearer flood cannot starve the resolutions a
+    // legitimate delivery depends on.
+    await expect(
+      handler.resolve({ companyId: floodedCompany, secretRef }),
+    ).rejects.toThrow(/db should not be touched/);
   });
 });
 
@@ -197,6 +270,213 @@ describeEmbeddedPostgres("createPluginSecretsHandler shared vault integration", 
       outcome: "success",
       errorCode: null,
     });
+  });
+
+  it("keeps failed verification traffic off the secret-resolution budget", async () => {
+    await seedPlugin();
+    const companyId = await seedCompany("Verification Budget Co");
+    const svc = secretService(db);
+    const secret = await svc.create(companyId, {
+      name: `webhook-token-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "valid-webhook-token",
+    });
+    await svc.syncSecretRefsForTarget(companyId, { targetType: "plugin", targetId: pluginId }, [
+      { secretId: secret.id, configPath: "webhookTokenRef" },
+    ], { replaceAll: true });
+
+    const handler = createPluginSecretsHandler({ db, pluginId });
+    const secretRef = { type: "secret_ref" as const, secretId: secret.id };
+    for (let attempt = 0; attempt < 31; attempt += 1) {
+      await expect(handler.verify({
+        companyId,
+        secretRef,
+        configPath: "webhookTokenRef",
+        presented: `invalid-${attempt}`,
+      })).resolves.toBe(false);
+    }
+
+    const eventsAfterFailures = await db
+      .select()
+      .from(secretAccessEvents)
+      .where(eq(secretAccessEvents.secretId, secret.id));
+    expect(eventsAfterFailures).toHaveLength(0);
+
+    const [secretAfterFailures] = await db
+      .select({ lastResolvedAt: companySecrets.lastResolvedAt })
+      .from(companySecrets)
+      .where(eq(companySecrets.id, secret.id));
+    expect(secretAfterFailures?.lastResolvedAt).toBeNull();
+
+    await expect(handler.verify({
+      companyId,
+      secretRef,
+      configPath: "webhookTokenRef",
+      presented: "valid-webhook-token",
+    })).resolves.toBe(true);
+
+    const eventsAfterValidVerification = await db
+      .select()
+      .from(secretAccessEvents)
+      .where(eq(secretAccessEvents.secretId, secret.id));
+    expect(eventsAfterValidVerification).toHaveLength(0);
+
+    await expect(handler.resolve({
+      companyId,
+      secretRef,
+      configPath: "webhookTokenRef",
+    })).resolves.toBe("valid-webhook-token");
+
+    const eventsAfterResolution = await db
+      .select()
+      .from(secretAccessEvents)
+      .where(eq(secretAccessEvents.secretId, secret.id));
+    expect(eventsAfterResolution).toHaveLength(1);
+  });
+
+  /**
+   * Rewrite the stored version material in place so a case can exercise a
+   * provider shape without standing up that provider. `material` is what the
+   * handler discriminates on, and `value_sha256` is the column whose meaning
+   * changes with it — the pair is exactly the production state under test.
+   */
+  async function rewriteVersionMaterial(
+    secretId: string,
+    material: Record<string, unknown>,
+    valueSha256?: string,
+  ) {
+    await db
+      .update(companySecretVersions)
+      .set({ material, ...(valueSha256 ? { valueSha256 } : {}) })
+      .where(eq(companySecretVersions.secretId, secretId));
+  }
+
+  async function seedVerifiableSecret(companyName: string, value: string) {
+    await seedPlugin();
+    const companyId = await seedCompany(companyName);
+    const svc = secretService(db);
+    const secret = await svc.create(companyId, {
+      name: `webhook-token-${randomUUID()}`,
+      provider: "local_encrypted",
+      value,
+    });
+    await svc.syncSecretRefsForTarget(companyId, { targetType: "plugin", targetId: pluginId }, [
+      { secretId: secret.id, configPath: "webhookTokenRef" },
+    ], { replaceAll: true });
+    return {
+      companyId,
+      secret,
+      handler: createPluginSecretsHandler({ db, pluginId }),
+      secretRef: { type: "secret_ref" as const, secretId: secret.id },
+    };
+  }
+
+  it("refuses to verify an external provider reference instead of rejecting the real credential", async () => {
+    // The regression this pins (BLO-20738, Ally round-5): `value_sha256` holds
+    // a digest of the VALUE only for versions Paperclip wrote itself. For an
+    // imported AWS reference it holds
+    // `sha256("aws_secrets_manager_v1:<ref>:<version>")` instead — a
+    // fingerprint of the POINTER. Comparing a presented bearer against that can
+    // never match, so before this fix a correctly-configured production webhook
+    // was rejected on every delivery, and `verify` reported it as `false` —
+    // indistinguishable from an attacker guessing wrong.
+    //
+    // Asserting `rejects` rather than `resolves.toBe(false)` is the whole point:
+    // a confident `false` here is a lie.
+    const { companyId, secret, handler, secretRef } = await seedVerifiableSecret(
+      "External Reference Co",
+      "valid-webhook-token",
+    );
+
+    const externalRef = "arn:aws:secretsmanager:us-east-1:123456789012:secret:paperclip/webhook-AbCdEf";
+    await rewriteVersionMaterial(
+      secret.id,
+      {
+        scheme: "aws_secrets_manager_v1",
+        secretId: externalRef,
+        versionId: null,
+        source: "external_reference",
+      },
+      // Exactly what `createExternalReferenceMaterial` stores.
+      createHash("sha256").update(`aws_secrets_manager_v1:${externalRef}:`).digest("hex"),
+    );
+
+    await expect(handler.verify({
+      companyId,
+      secretRef,
+      configPath: "webhookTokenRef",
+      presented: "valid-webhook-token",
+    })).rejects.toMatchObject({ details: { code: "secret_verifier_unsupported" } });
+
+    // A wrong guess must fail the same way. If the two differed, the error
+    // channel would leak whether a guess was correct for a secret the host
+    // cannot actually verify.
+    await expect(handler.verify({
+      companyId,
+      secretRef,
+      configPath: "webhookTokenRef",
+      presented: "wrong-token",
+    })).rejects.toMatchObject({ details: { code: "secret_verifier_unsupported" } });
+
+    // Refusing must stay free of audit noise, exactly like a failed compare.
+    const events = await db
+      .select()
+      .from(secretAccessEvents)
+      .where(eq(secretAccessEvents.secretId, secret.id));
+    expect(events).toHaveLength(0);
+  });
+
+  it("verifies a provider-managed version, where value_sha256 really is the value digest", async () => {
+    // The other half of the discriminator: an AWS version Paperclip wrote
+    // itself (`createSecret`/`createVersion`, both `source: "managed"`) does
+    // store `sha256(value)`, so it must verify normally. Without this case the
+    // fix above could be "reject everything non-local" and still look green.
+    const { companyId, secret, handler, secretRef } = await seedVerifiableSecret(
+      "Managed Provider Co",
+      "valid-webhook-token",
+    );
+
+    await rewriteVersionMaterial(secret.id, {
+      scheme: "aws_secrets_manager_v1",
+      secretId: "arn:aws:secretsmanager:us-east-1:123456789012:secret:paperclip/webhook-AbCdEf",
+      versionId: "11111111-2222-3333-4444-555555555555",
+      source: "managed",
+    });
+
+    await expect(handler.verify({
+      companyId,
+      secretRef,
+      configPath: "webhookTokenRef",
+      presented: "valid-webhook-token",
+    })).resolves.toBe(true);
+    await expect(handler.verify({
+      companyId,
+      secretRef,
+      configPath: "webhookTokenRef",
+      presented: "wrong-token",
+    })).resolves.toBe(false);
+  });
+
+  it("refuses an unrecognized provider scheme rather than trusting its digest", async () => {
+    // Fail closed. A scheme this build has never seen may or may not store a
+    // value digest; guessing "it does" silently rejects every real credential
+    // for that provider, which is the failure this whole module exists to stop.
+    const { companyId, secret, handler, secretRef } = await seedVerifiableSecret(
+      "Future Provider Co",
+      "valid-webhook-token",
+    );
+
+    await rewriteVersionMaterial(secret.id, {
+      scheme: "some_future_provider_v1",
+      source: "managed",
+    });
+
+    await expect(handler.verify({
+      companyId,
+      secretRef,
+      configPath: "webhookTokenRef",
+      presented: "valid-webhook-token",
+    })).rejects.toMatchObject({ details: { code: "secret_verifier_unsupported" } });
   });
 
   it("resolves a stored config written under the previous bare-string ref format", async () => {

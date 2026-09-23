@@ -9,6 +9,7 @@ import {
   companyMemberships,
 } from "@paperclipai/db";
 import { and, eq } from "drizzle-orm";
+import { insertApproval } from "../services/approval-insert.js";
 
 const DEFAULT_BLOCKCAST_COMPANY_ID = "aaced805-3491-4ee5-9b14-cdf70cb81d47";
 
@@ -143,12 +144,13 @@ export async function reconcileGroupClaimUser(
       .limit(1);
 
     if (existing.length === 0) {
-      await db.insert(approvals).values({
+      await insertApproval(db, {
         companyId: config.blockcastCompanyId,
         type: config.adminApprovalType,
         requestedByUserId: userId,
         status: "pending",
         payload: {
+          title: `Admin elevation requested for ${userId}`,
           userId,
           detectedAt: new Date().toISOString(),
           source: config.payloadSource,

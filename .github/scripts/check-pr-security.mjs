@@ -314,6 +314,17 @@ export async function findExistingDraftAdvisory(fetchImpl, token, repo, prNumber
   return null;
 }
 
+// Under `pull_request_target`, `pr.head.sha` (from the live API read) is the
+// commit that actually lands. Under `merge_group`, it is not — the queue
+// rebases the PR onto master's tip into a distinct candidate commit, and
+// that candidate (not the original PR head) is what merges. The workflow
+// passes that candidate via PR_HEAD_SHA (falling back to the PR head for
+// pull_request_target runs, where the two are the same) so the check-run
+// lands on the commit that is actually being evaluated for merge.
+export function resolveTargetSha(pr, envHeadSha) {
+  return envHeadSha || pr.head.sha;
+}
+
 // `advisoryResult` describes what actually happened to the draft-advisory sync
 // so the check-run never asserts an advisory exists when it doesn't:
 //   { ok: true, url }     — advisory created/updated; link it
@@ -401,6 +412,10 @@ export async function postFlaggedSecurityResult(
   pr,
   flags,
   advisoryBudgetMs,
+  // The commit the check-run must land on. Under `merge_group` this is the
+  // queue's candidate commit, not `pr.head.sha`. Defaults to the PR head so
+  // existing `pull_request_target` callers keep their behaviour exactly.
+  targetSha = pr.head.sha,
 ) {
   const controller = new AbortController();
   const budgetError = new Error(`draft advisory sync exceeded ${advisoryBudgetMs}ms wall-clock budget`);
@@ -428,7 +443,7 @@ export async function postFlaggedSecurityResult(
 
   await warnOnFailure(
     'security check-run update',
-    postSecurityCheckRun(fetchImpl, token, repo, pr.head.sha, true, { flags, advisoryResult }),
+    postSecurityCheckRun(fetchImpl, token, repo, targetSha, true, { flags, advisoryResult }),
   );
 }
 
@@ -436,7 +451,7 @@ async function main() {
   const startedAt = Date.now();
   const watchdog = startScriptWatchdog();
 
-  const { GH_TOKEN, GH_REPO, PR_NUMBER } = process.env;
+  const { GH_TOKEN, GH_REPO, PR_NUMBER, PR_HEAD_SHA } = process.env;
 
   if (!GH_TOKEN || !GH_REPO || !PR_NUMBER) {
     console.error('ERROR: GH_TOKEN, GH_REPO, PR_NUMBER required');
@@ -479,6 +494,8 @@ async function main() {
     ...scanSensitivePaths(files),
   ];
 
+  const targetSha = resolveTargetSha(pr, PR_HEAD_SHA);
+
   if (allFlags.length > 0) {
     console.error(`[security] ${allFlags.length} flag(s) detected — creating draft advisory and pending check run`);
 
@@ -492,10 +509,11 @@ async function main() {
       { ...pr, number: prNumber },
       allFlags,
       advisoryBudgetMs,
+      targetSha,
     );
   } else {
     console.log('[security] all clear');
-    await warnOnFailure('security check-run update', postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, pr.head.sha, false));
+    await warnOnFailure('security check-run update', postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, targetSha, false));
   }
 
   // Always exit 0 — security flags are silent, never block the PR publicly

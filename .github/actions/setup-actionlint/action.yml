@@ -1,0 +1,103 @@
+# BLO-23511: install the pinned actionlint used by the workflow-parse gate.
+#
+# WHY A DOWNLOAD AND NOT A DEPENDENCY
+#
+# The `policy` job never installs `node_modules` (it calls setup-pnpm with
+# the default `run_install: false`), and adding a YAML parser as a
+# devDependency would change `pnpm-lock.yaml` — which the `Block manual
+# lockfile edits` step in that same job rejects for non-bot PRs. A static
+# binary sidesteps both constraints. See scripts/check-workflows-parse.mjs
+# for the full reasoning.
+#
+# WHY PINNED BY CHECKSUM AND NOT JUST VERSION
+#
+# A release tag can be moved and a release asset can be replaced. This action
+# runs a downloaded executable inside CI, so the version alone is not a
+# sufficient pin — the SHA256 below is the actual trust anchor, verified
+# fail-closed before the binary is ever made executable.
+#
+# TO UPGRADE
+#
+# Bump VERSION, then take the new digest from the release's own checksums
+# file rather than from a local download, so the pin records what upstream
+# published rather than whatever this machine happened to receive:
+#
+#   curl -sSL https://github.com/rhysd/actionlint/releases/download/v<X.Y.Z>/actionlint_<X.Y.Z>_checksums.txt \
+#     | grep linux_amd64
+#
+# LIMIT
+#
+# linux/amd64 only. Every ARC runner in this repo is linux/amd64, and a
+# silent fallback to "no linter" is exactly the failure this gate exists to
+# prevent, so an unsupported platform is an error rather than a skip.
+
+name: Setup actionlint
+description: Install the pinned actionlint binary, verified by SHA256.
+
+outputs:
+  bin:
+    # Provided as a stable interface for callers that want an explicit path.
+    # pr.yml does not use it — the gate finds actionlint on PATH via the
+    # $GITHUB_PATH write in the install step below.
+    description: Absolute path to the verified actionlint binary.
+    value: ${{ steps.install.outputs.bin }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install actionlint
+      id: install
+      shell: bash
+      env:
+        VERSION: "1.7.7"
+        SHA256: "023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757"
+      run: |
+        set -euo pipefail
+
+        arch="$(uname -m)"
+        if [ "$(uname -s)" != "Linux" ] || [ "$arch" != "x86_64" ]; then
+          echo "::error::setup-actionlint pins linux/amd64 only; this runner is $(uname -s)/${arch}."
+          exit 1
+        fi
+
+        dest="${RUNNER_TEMP}/actionlint"
+        mkdir -p "$dest"
+        tarball="${dest}/actionlint.tar.gz"
+        url="https://github.com/rhysd/actionlint/releases/download/v${VERSION}/actionlint_${VERSION}_linux_amd64.tar.gz"
+
+        # One retry, jittered. pr.yml fans out several jobs; a constant
+        # backoff would re-synchronise them into a second burst against a
+        # host that is already struggling. This survives a blip, not an
+        # outage — a sustained failure is still red, deliberately, because
+        # continuing without the linter is the bug being fixed.
+        for attempt in 1 2; do
+          if curl -sSL --fail --max-time 120 -o "$tarball" "$url"; then
+            break
+          fi
+          if [ "$attempt" = "2" ]; then
+            echo "::error::Could not download actionlint ${VERSION} after 2 attempts."
+            exit 1
+          fi
+          delay=$(( 5 + RANDOM % 11 ))
+          echo "actionlint download failed; retrying once in ${delay}s"
+          sleep "$delay"
+        done
+
+        # Fail closed before the file is ever executable.
+        echo "${SHA256}  ${tarball}" | sha256sum --check --status || {
+          echo "::error::actionlint checksum mismatch. Expected ${SHA256}, got $(sha256sum "$tarball" | cut -d' ' -f1)."
+          exit 1
+        }
+
+        tar -xzf "$tarball" -C "$dest" actionlint
+        chmod +x "${dest}/actionlint"
+
+        echo "bin=${dest}/actionlint" >> "$GITHUB_OUTPUT"
+        # The $GITHUB_PATH write is the load-bearing wiring, not the output
+        # above: the gate resolves the binary by name off PATH
+        # (ACTIONLINT_BIN || "actionlint" in scripts/check-workflows-parse.mjs)
+        # and pr.yml uses this action without an `id:`, so it never reads
+        # `outputs.bin`. Removing this line breaks the gate even though the
+        # output still looks correct.
+        echo "${dest}" >> "$GITHUB_PATH"
+        "${dest}/actionlint" --version

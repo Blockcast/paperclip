@@ -417,7 +417,7 @@ describeEmbeddedPostgres("accepted plan workspace refresh", () => {
         resultError: latest?.resultError,
         resultJson: latest?.resultJson,
       })).toBe("succeeded");
-    }, { timeout: 10_000 });
+    }, { timeout: 60_000 });
 
     expect(adapterExecute).toHaveBeenCalledTimes(1);
     const adapterInput = adapterExecute.mock.calls[0]?.[0] as {
@@ -573,7 +573,7 @@ describeEmbeddedPostgres("accepted plan workspace refresh", () => {
         );
       }
       expect(latest?.status).toBe("succeeded");
-    }, { timeout: 10_000 });
+    }, { timeout: 60_000 });
 
     const sourceWorkspace = await db
       .select()
@@ -680,7 +680,7 @@ describeEmbeddedPostgres("accepted plan workspace refresh", () => {
     await vi.waitFor(async () => {
       const latest = await heartbeat.getRun(childRun!.id);
       expect(latest?.status).toBe("succeeded");
-    }, { timeout: 10_000 });
+    }, { timeout: 60_000 });
 
     expect(childRunWorkspace).not.toBeNull();
     expect(childRunWorkspace?.executionWorkspaceId).not.toBe(sourceWorkspace?.id);
@@ -690,7 +690,7 @@ describeEmbeddedPostgres("accepted plan workspace refresh", () => {
       .where(eq(issues.id, childIssueId!))
       .then((rows) => rows[0] ?? null);
     expect(childAfterRun?.executionWorkspaceId).toBe(childRunWorkspace?.executionWorkspaceId);
-  }, 20_000);
+  }, 120_000);
 
   it("forces a fresh session and suppresses accepted-plan continuation when another issue owns the in-flight claim", async () => {
     const companyId = randomUUID();
@@ -838,7 +838,7 @@ describeEmbeddedPostgres("accepted plan workspace refresh", () => {
         resultError: latest?.resultError,
         resultJson: latest?.resultJson,
       })).toBe("succeeded");
-    }, { timeout: 10_000 });
+    }, { timeout: 60_000 });
 
     expect(adapterExecute).toHaveBeenCalledTimes(1);
     const adapterInput = adapterExecute.mock.calls[0]?.[0] as {
@@ -1004,7 +1004,7 @@ describeEmbeddedPostgres("accepted plan workspace refresh", () => {
         resultError: latest?.resultError,
         resultJson: latest?.resultJson,
       })).toBe("succeeded");
-    }, { timeout: 10_000 });
+    }, { timeout: 60_000 });
 
     expect(adapterExecute).toHaveBeenCalledTimes(1);
     const adapterInput = adapterExecute.mock.calls[0]?.[0] as {

@@ -156,8 +156,9 @@ describe("createJob", () => {
       metadata: { name: "r-2", namespace: "ns", labels: { ...identityLabels, "paperclip.io/run-id": "run-xyz" } },
       spec: { template: {} },
     };
-    await expect(createJob(clients as never, "ns", jobManifest)).rejects.toThrow(JobAlreadyExistsError);
-    await expect(createJob(clients as never, "ns", jobManifest)).rejects.toThrow(/run-xyz/);
+    const error = await createJob(clients as never, "ns", jobManifest).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(JobAlreadyExistsError);
+    expect(error).toMatchObject({ message: expect.stringMatching(/run-xyz/) });
   });
 
   it("re-throws non-409 errors from createNamespacedJob unchanged", async () => {

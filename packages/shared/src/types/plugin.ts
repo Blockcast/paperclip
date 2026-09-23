@@ -54,6 +54,34 @@ export type JsonSchema = {
    * `x-paperclip-advanced` is not true.
    */
   "x-paperclip-group"?: string;
+  /**
+   * Marks a property as secret-bearing, so the host masks its value in every
+   * config API response and restores the stored value when an unchanged masked
+   * payload is posted back (BLO-20794).
+   *
+   * Use this to cover an ordinary `type: "string"` credential without moving it
+   * to `format: "secret-ref"`. The standard `writeOnly: true` keyword is
+   * honoured identically; prefer this marker when `writeOnly`'s other form
+   * semantics are unwanted.
+   *
+   * Setting it to `false` opts the property out of the host's key-name
+   * heuristic — use it for a field whose name looks credential-ish (`token`,
+   * `secret`, …) but whose value is not sensitive.
+   */
+  "x-paperclip-secret"?: boolean;
+  /**
+   * Names the property that immutably identifies an entry of this array, e.g.
+   * `items: { "x-paperclip-identity": "id" }`.
+   *
+   * Declaring it is a promise that the named property never changes for a given
+   * entry. That promise is what lets the host restore a masked secret onto an
+   * entry that moved or was edited (BLO-20871). Without it, a masked array entry
+   * is restored only when the array is otherwise byte-identical, and any
+   * reorder, insertion, deletion or edit forces the operator to re-enter the
+   * secret — deliberately, because an inferred identity can re-home a live
+   * credential onto the wrong entry.
+   */
+  "x-paperclip-identity"?: string;
   [key: string]: unknown;
 };
 
@@ -593,6 +621,28 @@ export interface PaperclipPluginManifestV1 {
   minimumPaperclipVersion?: PluginMinimumHostVersion;
   /** Capabilities this plugin requires from the host. Enforced at runtime. */
   capabilities: PluginCapability[];
+  /**
+   * Tag keys from this plugin's `ctx.metrics.write` calls that may be promoted
+   * to Prometheus labels on `paperclip_plugin_metric_total` (PEN-2799).
+   *
+   * This is only one half of a two-sided gate: a key becomes a label when it
+   * appears here **and** in the host's `PLUGIN_METRIC_PROMOTABLE_TAG_KEYS`
+   * allow-list. This field chooses what *this* plugin promotes; the host list
+   * bounds what *any* plugin may ever promote, so installing a third-party
+   * plugin cannot introduce an unbounded label. Both are needed because
+   * prom-client fixes a counter's label names at construction while a manifest
+   * is read per write.
+   *
+   * Omitting it is safe and is the default: the plugin's metrics still publish,
+   * just without per-tag breakdown. Max 5 keys, `snake_case`.
+   *
+   * Declare the key UNPREFIXED (`alertname`). It publishes as `tag_alertname`:
+   * promoted tags are namespaced so they cannot collide with a label Prometheus
+   * assigns itself — a bare `alertname` is overwritten by the firing rule's own
+   * name and hard-fails evaluation on duplicate label sets, and a bare
+   * `severity` is overwritten by the rule's `labels:` block silently.
+   */
+  metricLabels?: string[];
   /** Entrypoint paths relative to the package root. */
   entrypoints: {
     /** Path to the worker entrypoint (required). */
@@ -664,6 +714,13 @@ export interface PluginRecord {
   installOrder: number | null;
   /** Resolved package path for local-path installs; used to find worker entrypoint. */
   packagePath: string | null;
+  /**
+   * npm install prefix this plugin was installed into, when it differs from
+   * the shared plugins directory. Null means the shared store. See
+   * BLO-20961 — set for plugins isolated from the shared store's
+   * workspace-SDK-fork vendoring.
+   */
+  installDir: string | null;
   /** Most recent error message, or operator-provided disable reason. */
   lastError: string | null;
   /** Timestamp when the plugin was first installed. */

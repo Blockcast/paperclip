@@ -88,6 +88,34 @@ export const BUILTIN_WATCH_TEMPLATES: Array<{
   },
 ];
 // --- Check watches job (runs on schedule) ---
+/**
+ * Thrown when `checkWatches` fails *after* it has already invoked agents and
+ * posted to Slack.
+ *
+ * The distinction matters to the caller and cannot be recovered from the error
+ * alone. `checkWatches` swallows every per-watch failure internally, so the
+ * only rejections that escape it come from the watch-registry state calls —
+ * and those sit on both sides of the side effects. A registry *read* failing
+ * means nothing was delivered and the batch is safe to retry; the registry
+ * *write* failing means agents were already invoked and messages were already
+ * posted, so retrying the batch pays for them a second time.
+ *
+ * Callers must not re-queue a batch that raised this (BLO-29663).
+ */
+export class WatchesAlreadyDeliveredError extends Error {
+  /** Watches that completed both `agents.invoke` and `postMessage`. */
+  readonly delivered: number;
+
+  constructor(delivered: number, options?: { cause?: unknown }) {
+    super(
+      `check-watches failed after delivering ${delivered} watch trigger(s); the batch must not be retried`,
+      options,
+    );
+    this.name = "WatchesAlreadyDeliveredError";
+    this.delivered = delivered;
+  }
+}
+
 export async function checkWatches(
   ctx: PluginContext,
   token: string,
@@ -147,8 +175,32 @@ export async function checkWatches(
     }
   }
   if (triggered > 0) {
-    await setAllWatches(ctx, watches);
-    await ctx.metrics.write("slack.watches.triggered", triggered);
+    // Everything below this line runs with the side effects already committed:
+    // `triggered` only increments once both `agents.invoke` and `postMessage`
+    // have returned. So neither of these two calls may surface to the caller as
+    // an ordinary failure — that would read as "nothing happened, retry me"
+    // when agents have already been paid for (BLO-29663).
+    try {
+      await setAllWatches(ctx, watches);
+    }
+    catch (err) {
+      // Losing the updated trigger counts is a real cost, but a far smaller one
+      // than re-invoking every watch in the batch. Tell the caller which it is.
+      throw new WatchesAlreadyDeliveredError(triggered, { cause: err });
+    }
+    try {
+      await ctx.metrics.write("slack.watches.triggered", triggered);
+    }
+    catch (err) {
+      // Telemetry is never worth reprocessing a batch over. A dropped counter
+      // sample costs a gap in a graph; propagating this used to cost a second
+      // round of paid agent invocations and duplicate Slack posts.
+      ctx.logger.warn("Failed to record watch-trigger metric", {
+        companyId,
+        triggered,
+        err,
+      });
+    }
   }
   return triggered;
 }

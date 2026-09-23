@@ -222,6 +222,7 @@ describe("cursor execute", () => {
     const remoteWorkspace = path.join(rootDir, "remote-workspace");
     const systemHomeDir = path.join(rootDir, "system-home");
     const managedCaptureDir = path.join(rootDir, "managed-capture");
+    const agentPath = path.join(systemHomeDir, ".local", "bin", "agent");
     await fs.mkdir(managedCaptureDir, { recursive: true });
     await fs.mkdir(workspaceDir, { recursive: true });
     await fs.mkdir(remoteWorkspace, { recursive: true });
@@ -265,23 +266,11 @@ printf '%s\\n' '{"type":"result","subtype":"success","session_id":"cursor-sessio
       };
     });
 
-    const runnerState = {
-      commands: [] as string[],
-    };
-    const runner = {
-      execute: async (input: { command: string; args?: string[]; env?: Record<string, string>; stdin?: string }) => {
-        runnerState.commands.push(input.command);
-        return runChildProcess(`cursor-fresh-lease-${runnerState.commands.length}`, input.command, input.args ?? [], {
-          cwd: remoteWorkspace,
-          env: input.env ?? {},
-          stdin: input.stdin,
-          timeoutSec: 30,
-          graceSec: 5,
-          onLog: async () => {},
-          onSpawn: async () => {},
-        });
-      },
-    };
+    const runner = createFreshLeaseSandboxRunner({
+      homeDir: systemHomeDir,
+      installCommandPath: agentPath,
+      captureDir: managedCaptureDir,
+    });
 
     const runMeta: Array<{ command?: string; [key: string]: unknown }> = [];
     const previousHome = process.env.HOME;
@@ -326,6 +315,7 @@ printf '%s\\n' '{"type":"result","subtype":"success","session_id":"cursor-sessio
       });
 
       expect(result.exitCode).toBe(0);
+      expect(runner.installCommands).toEqual([SANDBOX_INSTALL_COMMAND]);
       expect(prepareInputs).toHaveLength(2);
       expect(finalPreparedCommand).not.toBeNull();
       expect(finalPreparedCommand).toMatch(/\.local\/(bin|sbin)\/agent$/);

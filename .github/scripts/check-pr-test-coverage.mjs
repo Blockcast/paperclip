@@ -12,11 +12,24 @@ import { fileURLToPath } from 'node:url';
 // `*.test.mjs` (38 of them, including this checker's tests and everything run by
 // the `node --test` steps in pr.yml). Omitting them made the gate report "no test
 // files detected" on PRs whose only tests were written in that convention.
+//
+// The `unittest` patterns are here for the same reason, one language over. The
+// repo runs Python suites too — `.github/workflows/review-gate-sweep.yml` invokes
+// `unittest discover -p 'test_sweep_*.py'` — and `unittest`'s own discovery
+// convention is `test_*.py`, which none of the JS patterns match. Because the
+// no-tests arm fires whenever a non-skip-prefixed PR contains no matching file at
+// all (regardless of whether any *source* file changed), the omission failed every
+// Python-only PR unconditionally, and pushed authors toward a false `refactor:`
+// retitle rather than toward writing tests — inverting the gate's own purpose
+// (BLO-19152 recorded that inversion for the `.mjs` case). `*_test.py` is accepted
+// alongside it for symmetry with the `.test.*` convention above.
 const TEST_PATTERNS = [
   /\.test\.(ts|js|tsx|jsx|mjs|cjs)$/,
   /\.spec\.(ts|js|tsx|jsx|mjs|cjs)$/,
   /(?:^|\/)tests?\//,
   /\/__tests__\//,
+  /(?:^|\/)test_[^/]*\.py$/,
+  /_test\.py$/,
 ];
 
 const SOURCE_CODE_PATTERN = /\.(ts|tsx|js|jsx|mjs|cjs)$/;

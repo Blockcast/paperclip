@@ -365,4 +365,31 @@ describe("hasActiveJobForAgent run-id awareness (BLO-20801)", () => {
     expect(result).toBe(true);
     expect(mockDeleteNamespacedJob).toHaveBeenCalledTimes(1);
   });
+
+  it("still blocks when the optional metrics client cannot be constructed (BLO-20251 fail-open guard)", async () => {
+    // BLO-20251 added a metrics.k8s.io client for pod-CPU liveness. Its first
+    // pass built that client inline with batchApi/coreApi inside initClient's
+    // single try, so `makeApiClient` throwing on the metrics symbol — exactly
+    // what the mock at the top of this file does, since it exports no
+    // CustomObjectsApi — marked the WHOLE client `unavailable`. Every function
+    // here fails open (`return false`) on a non-ready client, so an optional
+    // add-on's construction silently switched off this entire BLO-20801 guard:
+    // all 13 cases above went red at once, and in production dispatch would
+    // have admitted a second run against a live Job (RWO PVC multi-attach).
+    //
+    // This asserts the invariant directly rather than leaving it implicit in
+    // the shared mock: the metrics client is optional, so losing it may cost
+    // pod-CPU liveness but must never weaken dispatch blocking. Do NOT "fix" a
+    // failure here by teaching the mock about CustomObjectsApi — that would
+    // delete the coverage and restore the fail-open hole in production.
+    mockListNamespacedJob.mockResolvedValue({ items: [terminalJob("run-live", { active: 1, succeeded: 0, failed: 0 })] });
+
+    const result = await hasActiveJobForAgent(AGENT_ID, {
+      isRunTerminal: async () => new Set<string>(),
+    });
+
+    expect(result).toBe(true);
+    expect(mockListNamespacedJob).toHaveBeenCalled();
+    expect(mockDeleteNamespacedJob).not.toHaveBeenCalled();
+  });
 });

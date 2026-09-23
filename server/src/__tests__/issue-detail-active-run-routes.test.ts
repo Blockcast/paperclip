@@ -10,6 +10,7 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { isIssueHeldByForeignRun } from "../services/issue-run-holding.js";
+import { TERMINAL_HEARTBEAT_RUN_STATUS_VALUES } from "../services/issue-execution-lock.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -238,7 +239,16 @@ describeEmbeddedPostgres("GET /api/issues/:id — active run holder", () => {
 
   it("returns activeRun null when the recorded run has terminalized", async () => {
     // `executionRunId` outlives the run, so a stale pointer must not read as held.
-    for (const [index, status] of ["completed", "failed", "cancelled"].entries()) {
+    //
+    // BLO-25410: this loop used to lead with "completed", which is NOT a status
+    // any code path writes to `heartbeat_runs.status` — `finalizeRun` in
+    // routines.ts writes it to `routine_runs`. It passed only because the old
+    // `activeRun` filter enumerated the known holding statuses, so any unknown
+    // string fell through to null; it was never classified as terminal. Once the
+    // hydration switched to the terminal complement that accident disappeared and
+    // the fiction surfaced. Assert against the real terminal set instead, and see
+    // the unknown-status case below for the behaviour that replaced it.
+    for (const [index, status] of TERMINAL_HEARTBEAT_RUN_STATUS_VALUES.entries()) {
       const { companyId, agentId, prefix } = await seedCompanyAndAgent();
       const runId = await seedRun({
         companyId,
@@ -268,6 +278,29 @@ describeEmbeddedPostgres("GET /api/issues/:id — active run holder", () => {
         `status=${status}`,
       ).toBe(false);
     }
+  });
+
+  it("reports a non-terminal status outside the canonical union as held, matching checkout", async () => {
+    // BLO-25410. `runStatusHoldsIssueExecutionLock` deliberately fails toward
+    // "held" for an unrecognised status, and `clearExecutionRunIfTerminal` will
+    // not clear such a pointer — so checkout() 409s on this issue. `activeRun`
+    // must say the same thing. Reporting null here is what made a permanently
+    // un-checkoutable issue look unowned (the BLO-19749 defect).
+    const { companyId, agentId, prefix } = await seedCompanyAndAgent();
+    const runId = await seedRun({ companyId, agentId, status: "provisioning" });
+    const issueId = await seedIssue({
+      companyId,
+      prefix,
+      issueNumber: 40,
+      agentId,
+      executionRunId: runId,
+    });
+
+    const res = await request(createApp(companyId)).get(`/api/issues/${issueId}`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.activeRun?.id).toBe(runId);
+    expect(res.body.activeRun?.status).toBe("provisioning");
   });
 
   it("returns activeRun null when executionRunId points at another company", async () => {

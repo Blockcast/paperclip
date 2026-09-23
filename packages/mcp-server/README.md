@@ -35,6 +35,7 @@ Read tools:
 - `paperclipMe`
 - `paperclipInboxLite`
 - `paperclipListAgents`
+- `paperclipListParkedAgents`
 - `paperclipGetAgent`
 - `paperclipListIssues`
 - `paperclip_search_issues`

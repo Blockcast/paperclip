@@ -1,0 +1,73 @@
+# Fail when the fork's SDK packages have changed on master but the matching
+# `@penstock/*` publish has not happened.
+#
+# WHY: plugins load @paperclipai/{plugin-sdk,shared} from the shared plugin
+# store, which resolves them to the fork's own publish through an npm alias
+# ("@paperclipai/plugin-sdk": "npm:@penstock/plugin-sdk@<ver>"). A boot-time
+# vendor copy in server/src/index.ts used to paste the workspace dist over the
+# installed copy, so a missed publish was invisible. PR #1589 removed that copy
+# — correctly, since for `shared` it was silently DOWNGRADING the store — but
+# that also removed the net. A missed publish now surfaces at runtime as a
+# plugin worker crashing on "does not provide an export named ...".
+#
+# WHY PUSH AND NOT pull_request: the publish necessarily happens *after* merge,
+# so a PR-time check would fail on every SDK PR by construction. Running on
+# master means a red result is an accurate, actionable statement — "master has
+# SDK changes npm has not been told about" — that clears as soon as someone
+# publishes. Re-run via workflow_dispatch after publishing rather than pushing
+# an empty commit.
+name: SDK publish drift
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "packages/plugins/sdk/**"
+      - "packages/shared/**"
+      - "scripts/check-penstock-publish-drift.mjs"
+      - ".github/workflows/sdk-publish-drift.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sdk-publish-drift
+  cancel-in-progress: true
+
+jobs:
+  drift:
+    runs-on: arc-paperclip-general
+    # Budget required by BLO-28813: any job that sets up pnpm must declare one,
+    # or it inherits GitHub's 360m default and a wedged runner burns six hours.
+    # Install + build both packages + two `npm pack` round-trips; the release
+    # workflow doing the same work lands around 4-5m, so 20m is generous.
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: ./.github/actions/setup-pnpm
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Restore tracked install-time changes
+        run: git checkout -- pnpm-lock.yaml || true
+
+      # The check compares emitted dist, not source, so both packages must be
+      # built first — same build the release workflow runs before publishing.
+      - name: Build SDK packages
+        run: |
+          pnpm --filter @paperclipai/shared build
+          pnpm --filter @paperclipai/plugin-sdk build
+
+      - name: Compare workspace build against published @penstock packages
+        run: node scripts/check-penstock-publish-drift.mjs

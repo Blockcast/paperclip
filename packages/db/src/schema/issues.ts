@@ -45,6 +45,12 @@ export const issues = pgTable(
     executionRunId: uuid("execution_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
     executionAgentNameKey: text("execution_agent_name_key"),
     executionLockedAt: timestamp("execution_locked_at", { withTimezone: true }),
+    // Status held immediately before `checkout` promoted this row to
+    // `in_progress`. A release that did not advance the issue restores it from
+    // here, so `in_progress` stops accumulating as a high-water mark. Null means
+    // there is no checkout promotion to undo — either the row was never checked
+    // out, or a run has since written a status of its own. See BLO-20649.
+    checkoutRestoreStatus: text("checkout_restore_status"),
     createdByAgentId: uuid("created_by_agent_id").references(() => agents.id),
     createdByUserId: text("created_by_user_id"),
     responsibleUserId: text("responsible_user_id"),
@@ -70,6 +76,15 @@ export const issues = pgTable(
     monitorAttemptCount: integer("monitor_attempt_count").notNull().default(0),
     monitorNotes: text("monitor_notes"),
     monitorScheduledBy: text("monitor_scheduled_by"),
+    // BLO-27912: the deliberate-park disposition. Set together or all NULL. Derived from
+    // the nested `parkedDisposition` PATCH input — never written from flat request keys —
+    // and readable by the liveness sweep as a seventh explicit waiting path. `parkedUntil`
+    // is the whole anti-silence mechanism: suppression is keyed on it being in the future,
+    // so the park expires rather than persisting by default.
+    parkedUntil: timestamp("parked_until", { withTimezone: true }),
+    parkedReason: text("parked_reason"),
+    parkedByAgentId: uuid("parked_by_agent_id").references((): AnyPgColumn => agents.id),
+    parkedAt: timestamp("parked_at", { withTimezone: true }),
     executionWorkspaceId: uuid("execution_workspace_id")
       .references((): AnyPgColumn => executionWorkspaces.id, { onDelete: "set null" }),
     executionWorkspacePreference: text("execution_workspace_preference"),
@@ -105,6 +120,14 @@ export const issues = pgTable(
     // writes a verdict. Keeps dashboard scorecard review-window queries on a
     // normal timestamp column instead of scanning JSONB across the company.
     lastEvidenceVerdictEvaluatedAt: timestamp("last_evidence_verdict_evaluated_at", { withTimezone: true }),
+    // BLO-30303: rotation watermark for the productivity-review candidate scan.
+    // Stamped with `now` for every row the scan reads, so the next pass orders
+    // by least-recently-*scanned* and cannot re-select the same window forever.
+    // Deliberately a bare column write: it never touches `updated_at`, so the
+    // `issues_sync_last_activity_at` BEFORE UPDATE trigger does not fire and the
+    // watermark stays invisible to the activity signals the detector reads.
+    // Unindexed on purpose — see migration 0242.
+    productivityScannedAt: timestamp("productivity_scanned_at", { withTimezone: true }),
   },
   (table) => ({
     companyStatusIdx: index("issues_company_status_idx").on(table.companyId, table.status),
@@ -195,6 +218,14 @@ export const issues = pgTable(
           and ${table.hiddenAt} is null
           and ${table.status} not in ('done', 'cancelled')`,
       ),
+    activeApprovalEnforcementDriftIdx: uniqueIndex("issues_active_approval_enforcement_drift_uq")
+      .on(table.companyId, table.originKind, table.originId)
+      .where(
+        sql`${table.originKind} = 'approval_enforcement_drift'
+          and ${table.originId} is not null
+          and ${table.hiddenAt} is null
+          and ${table.status} not in ('done', 'cancelled')`,
+      ),
     activeTaskWatchdogIdx: uniqueIndex("issues_active_task_watchdog_uq")
       .on(table.companyId, table.originKind, table.originId)
       .where(
@@ -230,6 +261,28 @@ export const issues = pgTable(
       .on(table.companyId, table.originKind, table.originFingerprint)
       .where(
         sql`${table.originKind} = 'plugin:paperclip-plugin-alertmanager:escalation'
+          and ${table.originFingerprint} <> 'default'
+          and ${table.hiddenAt} is null
+          and ${table.status} not in ('done', 'cancelled')`,
+      ),
+    // BLO-20074: one unresolved review-request issue per (repo, PR).
+    // originFingerprint carries the `pr_review:<repoFullName>:<prNumber>` key,
+    // so N concurrent requests as a branch advances collapse onto one row —
+    // the losers catch 23505 and reuse the winner instead of each launching an
+    // independent reviewer run. Scoped to unresolved rows so a genuinely new
+    // review is still creatable once the prior one reaches a terminal status.
+    activePrReviewIdx: uniqueIndex("issues_active_pr_review_uq")
+      .on(table.companyId, table.originKind, table.originFingerprint)
+      .where(
+        sql`${table.originKind} = 'pr_review'
+          and ${table.originFingerprint} <> 'default'
+          and ${table.hiddenAt} is null
+          and ${table.status} not in ('done', 'cancelled')`,
+      ),
+    activeAlertmanagerAggregateCreationIdx: uniqueIndex("issues_active_alertmanager_aggregate_creation_uq")
+      .on(table.companyId, table.originKind, table.originFingerprint)
+      .where(
+        sql`${table.originKind} = 'plugin:paperclip-plugin-alertmanager'
           and ${table.originFingerprint} <> 'default'
           and ${table.hiddenAt} is null
           and ${table.status} not in ('done', 'cancelled')`,
