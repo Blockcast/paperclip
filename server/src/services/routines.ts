@@ -17,6 +17,7 @@ import {
   heartbeatRuns,
   issueInboxArchives,
   issueReadStates,
+  issueRecoveryActions,
   issueRelations,
   issues,
   pluginManagedResources,
@@ -61,6 +62,7 @@ import { conflict, forbidden, notFound, unauthorized, unprocessable } from "../e
 import { logger } from "../middleware/logger.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
+import { ACTIVE_RECOVERY_ACTION_STATUSES } from "./issue-recovery-actions.js";
 import { issueService } from "./issues.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
@@ -1806,9 +1808,9 @@ export function routineService(
   // Both have a wake path that is not a heartbeat run, so `!activeIssue` says
   // nothing about whether they are dead, and cancelling them would be a
   // behaviour change in the unsafe direction -- previously they produced a loud
-  // 23505 with the row preserved. Two exclusions below; `in_progress` is
-  // deliberately NOT excluded, because a row held by a dead run is the exact
-  // wedge this exists to clear.
+  // 23505 with the row preserved. Three exclusions below (status, blocker
+  // edge, live recovery action); `in_progress` is deliberately NOT excluded,
+  // because a row held by a dead run is the exact wedge this exists to clear.
   //
   // The caller must only invoke this when `findLiveExecutionIssue` returned
   // null -- the fire-age filter alone is NOT sufficient protection for
@@ -1869,6 +1871,21 @@ export function routineService(
             where ${issueRelations.relatedIssueId} = ${issues.id}
               and ${issueRelations.type} = 'blocks'
               and supersede_blocker.status <> 'done'
+          )`,
+      // Ally review, BLO-31996: a live recovery action is an explicit wake path
+      // too, but it lives in `issue_recovery_actions`, not `issue_relations`, so
+      // the edge check above cannot see it. Cancelling the source row would
+      // terminalise the work the recovery owner was handed while leaving the
+      // action's own lifecycle untouched, so it could never resume. The live set
+      // is the recovery service's own (`active` + `escalated`, recovery/service.ts
+      // waiting-path and hand-back drain queries): an escalated action is still
+      // owned by an operator who resolves it, so its source is protected here.
+      sql`not exists (
+            select 1
+            from ${issueRecoveryActions}
+            where ${issueRecoveryActions.sourceIssueId} = ${issues.id}
+              and ${issueRecoveryActions.companyId} = ${issues.companyId}
+              and ${inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES])}
           )`,
       ...(fingerprintCondition ? [fingerprintCondition] : []),
     );
