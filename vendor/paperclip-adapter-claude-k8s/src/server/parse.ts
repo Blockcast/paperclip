@@ -103,6 +103,9 @@ export function parseClaudeStreamJson(stdout: string) {
   const usage: UsageSummary = {
     inputTokens: asNumber(usageObj.input_tokens, 0),
     cachedInputTokens: asNumber(usageObj.cache_read_input_tokens, 0),
+    // BLO-29842: raw Anthropic payloads spell this snake_case. Absent for any
+    // provider that does not cache-write, which reads as 0.
+    cacheCreationInputTokens: asNumber(usageObj.cache_creation_input_tokens, 0),
     outputTokens: asNumber(usageObj.output_tokens, 0),
   };
   const costRaw = finalResult.total_cost_usd;
