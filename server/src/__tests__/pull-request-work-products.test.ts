@@ -9,6 +9,7 @@ import {
   OPEN_PULL_REQUEST_WORK_PRODUCT_STATUSES,
   PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID,
   pullRequestExternalId,
+  pullRequestMergeQueueState,
   pullRequestWorkProductSourceEventActionOrder,
   pullRequestWorkProductStatus,
   TERMINAL_PULL_REQUEST_WORK_PRODUCT_STATUSES,
@@ -190,6 +191,40 @@ describe("buildPullRequestWorkProductFields", () => {
         buildPullRequestWorkProductFields({ ...base, prTitle: "t", owningIdentifiers: [] })
           .metadata.owningIdentifiers,
       ).toEqual([]);
+    });
+  });
+
+  // BLO-35779: in a rebase merge queue the PR's head deliberately cannot move,
+  // so `synchronize` never fires while it advances and the freshness clock the
+  // productivity detector reads stops at the enqueue. These two actions are the
+  // only per-PR merge-queue signals GitHub emits.
+  describe("merge-queue state", () => {
+    it("records enqueued and dequeued, and nothing for other actions", () => {
+      for (const action of ["enqueued", "dequeued"]) {
+        expect(pullRequestMergeQueueState({ action })).toBe(action);
+        expect(
+          buildPullRequestWorkProductFields({ ...base, prTitle: "t", action }).metadata.mergeQueueState,
+        ).toBe(action);
+      }
+      // null means "this event carried no queue signal", NOT "not queued" — for
+      // a repo with no merge queue that is every row, so the consumer must read
+      // it as not-queued and never as queued.
+      for (const action of ["opened", "reopened", "synchronize", "closed", "ready_for_review"]) {
+        expect(pullRequestMergeQueueState({ action })).toBeNull();
+        expect(
+          buildPullRequestWorkProductFields({ ...base, prTitle: "t", action }).metadata.mergeQueueState,
+        ).toBeNull();
+      }
+    });
+
+    // A queued PR is `ready_for_review`, not a new state: the open/terminal
+    // partition above must keep covering it, or the stranded-assigned sweep
+    // drops the row.
+    it("leaves a queued PR in an open status", () => {
+      const open = new Set<string>(OPEN_PULL_REQUEST_WORK_PRODUCT_STATUSES);
+      for (const action of ["enqueued", "dequeued"]) {
+        expect(open.has(pullRequestWorkProductStatus({ action, prDraft: false, prMerged: false }))).toBe(true);
+      }
     });
   });
 });
