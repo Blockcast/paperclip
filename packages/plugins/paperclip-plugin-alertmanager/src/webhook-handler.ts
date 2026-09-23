@@ -2537,6 +2537,14 @@ export async function handleResolved(
     // exhausted because the alert kept firing, not because the underlying
     // issue's status policy says so, so a resolved alert means its membership
     // in the shared cover is done either way.
+    //
+    // Position is load-bearing: this sits AHEAD of the `ctx.state.set` below,
+    // which is this delivery's commit point. Cover cleanup is therefore a
+    // precondition of recording the resolution — a throwing cascade aborts the
+    // delivery with `resolvedAt` still unwritten, so the retry re-runs every
+    // side effect rather than stranding an uncleaned cover behind a record that
+    // already claims the alert is over. Do not move it past the commit point;
+    // the second call below exists precisely so this one does not have to.
     await recordSourceResolvedAndCloseCovers(
       ctx,
       existing.paperclipCompanyId,
@@ -2588,6 +2596,42 @@ export async function handleResolved(
       cancelWithheldAt: cancelWithheldForRunId ? resolvedAt : null,
     };
     await ctx.state.set(stateRef, updated);
+
+    // BLO-33497: cascade a SECOND time, behind the commit point. This is not a
+    // duplicate of the call above — the two cover different failures, and
+    // neither subsumes the other:
+    //
+    //  - the call AHEAD of the commit point makes cover cleanup a precondition
+    //    of recording the resolution, so a cascade failure leaves nothing
+    //    recorded and the retry redoes everything;
+    //  - this one catches a cover that did not exist yet when that call ran.
+    //
+    // The escalation sweep's chain-exhausted rung creates its cover BEFORE its
+    // compare-and-swap (see `escalation.ts`; claiming first would leave a
+    // failed `createCover` permanently uncovered), so the two paths interleave.
+    // The sweep compensates when its swap is REFUSED, which is the half where
+    // this delivery had already stored `resolvedAt`. The other half had nothing
+    // watching it: the cascade above ran while the cover did not yet exist —
+    // no membership to mark — and `resolvedAt` landed only after the sweep's
+    // swap, so the swap SUCCEEDED and the sweep's compensation never ran. That
+    // stranded an open [user-cover] with an unresolved member for a cleared
+    // alert, which no later resolve can ever cascade into again.
+    //
+    // A swap that succeeds means the sweep read, created its cover and claimed
+    // all before the write above — so by the time we get here the cover exists
+    // and this call sees it. Together the two halves leave no window.
+    //
+    // Cheap and idempotent: `recordSourceResolvedAndCloseCovers` early-returns
+    // on `rowCount === 0` (the common case — most alerts never join a cover),
+    // re-marking is `COALESCE(resolved_at, now())`, and the close is a
+    // single-UPDATE claim only one caller can win. Failing here still fails the
+    // delivery, and the retry's pre-commit cascade closes the cover, which by
+    // then exists.
+    await recordSourceResolvedAndCloseCovers(
+      ctx,
+      existing.paperclipCompanyId,
+      aggregateResolution.issueId,
+    );
 
     await ctx.events.emit(
       "alertmanager.alert.resolved",
