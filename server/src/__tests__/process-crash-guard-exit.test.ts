@@ -31,13 +31,13 @@ const tsx = path.resolve(here, "..", "..", "node_modules", ".bin", "tsx");
 
 /**
  * Padding for the *crash message*, to make the guard's breadcrumb writes large.
- * These four cases drain stderr, so they assert on content rather than on the channel
- * filling up, and this constant carries no backpressure assumption. It used to be
- * described as overrunning "the 64 KB pipe buffer": `stdio: "pipe"` is really a unix
- * socketpair sized by net.core.wmem_default (212992 by default), and betting a
- * constant against that unknown is exactly what made the stalled-stderr case flake
- * (BLO-25854). The stalled case now fills until the stream reports backpressure
- * instead of guessing.
+ * The three `runFixture` cases that pass it drain stderr, so they assert on content
+ * rather than on the channel filling up, and this constant carries no backpressure
+ * assumption. It used to be described as overrunning "the 64 KB pipe buffer":
+ * `stdio: "pipe"` is really a unix socketpair sized by net.core.wmem_default (212992
+ * by default), and betting a constant against that unknown is exactly what made the
+ * stalled-stderr case flake (BLO-25854). The stalled case now fills until the stream
+ * reports backpressure instead of guessing.
  */
 const PIPE_PRESSURE_BYTES = 200_000;
 /** Child startup is outside the measured crash deadline and can lag on loaded CI runners. */
@@ -134,15 +134,22 @@ function runFixture(kind: "throw" | "reject", padBytes: number, strictRejections
  * (what `child.stderr.destroy()` used to do on this path) is why five occurrences of
  * `fixture exited before reporting stderr backpressure` were unattributable.
  *
- * Keep both ends, not one: the fixture's padding goes through the stream while the
- * guard's breadcrumbs go through `writeSync`, so the two interleave at the fd in an
- * order that depends on how much of the padding had flushed. Truncating to either end
- * alone was observed burying the one line that names the cause under the padding.
+ * Stderr here is a socket, so `writeShutdownBreadcrumb` and
+ * `writeShutdownBreadcrumbsBounded` fall through their `isRegularFile` guard to
+ * `process.stderr.write`. Padding and breadcrumbs therefore share one stream and are
+ * strictly FIFO behind it; they do not interleave. Behind a full socket, a breadcrumb
+ * queued at crash time can be dropped at exit instead of landing after the padding.
+ *
+ * Keep both ends, not one: head and tail are both cheap context. Truncating to either
+ * end alone was observed burying the one line that names the cause under the padding.
  */
 function readRemainingStderr(stream: Readable): Promise<string> {
   return new Promise((done) => {
     let out = "";
+    let settled = false;
     const finish = (): void => {
+      if (settled) return;
+      settled = true;
       clearTimeout(bail);
       stream.destroy();
       done(
@@ -198,14 +205,16 @@ function runFixtureWithStalledStderr(): Promise<StalledCrashResult> {
       clearTimeout(startupWatchdog);
       if (watchdog) clearTimeout(watchdog);
       if (startedAt === undefined) {
-        void readRemainingStderr(child.stderr).then((stderr) => {
-          reject(
-            new Error(
-              `fixture exited before reporting stderr backpressure ` +
-                `(code=${code}, signal=${signal}); its stderr said: ${stderr.trim() || "<nothing>"}`,
-            ),
-          );
-        });
+        void readRemainingStderr(child.stderr)
+          .then((stderr) => {
+            reject(
+              new Error(
+                `fixture exited before reporting stderr backpressure ` +
+                  `(code=${code}, signal=${signal}); its stderr said: ${stderr.trim() || "<nothing>"}`,
+              ),
+            );
+          })
+          .catch(reject);
         return;
       }
       child.stderr.destroy();

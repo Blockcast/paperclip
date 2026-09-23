@@ -50,27 +50,40 @@ if (prefillStderr) {
   // constant beats the buffer.
   //
   // `stdio: "pipe"` is a unix socketpair, not the 64 KB pipe this fixture used to
-  // assume. `write()` returns false only when libuv's non-blocking writev cannot
-  // take the WHOLE buffer at once, so what governs is the largest SINGLE write the
-  // socket accepts — not its total capacity. Those are not the same number and not
-  // close: measured on one host, single-write threshold ~146 KB against ~288 KB
-  // cumulative. Re-deriving this by measuring capacity alone yields a figure over
-  // 200 KB and the wrong conclusion that the old constant was safe.
+  // assume. `write()` returns `state.length < writableHighWaterMark`, evaluated after
+  // libuv's synchronous non-blocking writev attempt. `state.length` only grows when
+  // the kernel refuses bytes, so false means "the kernel refused AND the userland
+  // queue has reached the high-water mark"; a false backpressure reading cannot
+  // happen. It also means this loop overshoots the first refused write by
+  // ceil(hwm / CHUNK_BYTES) iterations (measured on Node 24: write 4 was the first
+  // refused and still returned true at length 64000 < 65536; write 5 returned false).
   //
-  // Both scale with the runner's net.core.wmem_default (212992 by default, higher on
-  // tuned hosts). On a runner whose single-write threshold clears 200 KB, the old
-  // `write("P".repeat(200_000))` was accepted, so this threw before stdout ever saw
-  // BACKPRESSURE and the parent reported only "fixture exited before reporting
-  // stderr backpressure" — reproduced exactly by lowering the constant under one
-  // host's threshold. That is the whole of BLO-25854: a host-dependent buffer
-  // assumption, not the CI-load race the issue was filed as. Looping removes the bet
-  // rather than re-tuning it, so it holds whatever the host is tuned to.
+  // What sank the OLD single 200 KB write: for one write, the refusal comes from the
+  // socket not taking that whole buffer at once, and that single-write threshold is
+  // not the socket's cumulative capacity. Measured on one host, ~146 KB single-write
+  // against ~288 KB cumulative. Re-deriving the old constant by measuring capacity
+  // alone yields a figure over 200 KB and the wrong conclusion that it was safe.
+  // Neither number governs the loop below; the high-water mark does.
+  //
+  // Both socket numbers scale with the runner's net.core.wmem_default (212992 by
+  // default, higher on tuned hosts). On a runner whose single-write threshold clears
+  // 200 KB, the old `write("P".repeat(200_000))` was accepted, so this threw before
+  // stdout ever saw BACKPRESSURE and the parent reported only "fixture exited before
+  // reporting stderr backpressure", reproduced exactly by lowering the constant
+  // under one host's threshold. That is the whole of BLO-25854: a host-dependent
+  // buffer assumption, not the CI-load race the issue was filed as. Looping removes
+  // the bet rather than re-tuning it, so it holds whatever the host is tuned to.
+  //
+  // CHUNK_BYTES is chosen against `process.stderr.writableHighWaterMark`, not against
+  // the socket. That default was 16 KiB before Node 22 and is 64 KiB from Node 22, so
+  // the overshoot above is a silent Node-version dependency.
   const CHUNK_BYTES = 64_000;
   const CEILING_BYTES = 8_000_000;
+  const chunk = "P".repeat(CHUNK_BYTES);
   let accepted = true;
   let written = 0;
   while (accepted && written < CEILING_BYTES) {
-    accepted = process.stderr.write("P".repeat(CHUNK_BYTES));
+    accepted = process.stderr.write(chunk);
     written += CHUNK_BYTES;
   }
   if (accepted) throw new Error(`stderr did not report backpressure after ${written} bytes`);
