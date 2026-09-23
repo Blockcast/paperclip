@@ -2443,6 +2443,17 @@ describe("aggregate firing fence recovery", () => {
       const [sql] = mocks.db.query.mock.calls[0];
       expect(sql).toContain("owner_instance_id");
       expect(sql).toContain("owner_slot");
+
+      // The read is deliberately not activity-logged (an activity row per
+      // diagnostic poll is noise), so this debug line is the only thing that
+      // attributes it. Assert the token does not ride along: the fence rows
+      // that carry it are in scope at the call site.
+      const [logLine] = mocks.logger.debug.mock.calls.at(-1) as [string];
+      expect(logLine).toContain("agent");
+      expect(logLine).toContain("agent-1");
+      expect(logLine).toContain("company-1");
+      expect(logLine).toContain("1 fence(s)");
+      expect(logLine).not.toContain(token);
     });
 
     it("still refuses `recover` to that same agent identity", async () => {
