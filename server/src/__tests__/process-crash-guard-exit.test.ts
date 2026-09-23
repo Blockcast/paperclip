@@ -20,6 +20,7 @@
  */
 
 import { spawn } from "node:child_process";
+import type { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -28,7 +29,16 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const fixture = path.join(here, "fixtures", "crash-guard-exit-fixture.ts");
 const tsx = path.resolve(here, "..", "..", "node_modules", ".bin", "tsx");
 
-/** Enough to overrun the 64 KB pipe buffer several times over. */
+/**
+ * Padding for the *crash message*, to make the guard's breadcrumb writes large.
+ * These four cases drain stderr, so they assert on content rather than on the channel
+ * filling up, and this constant carries no backpressure assumption. It used to be
+ * described as overrunning "the 64 KB pipe buffer": `stdio: "pipe"` is really a unix
+ * socketpair sized by net.core.wmem_default (212992 by default), and betting a
+ * constant against that unknown is exactly what made the stalled-stderr case flake
+ * (BLO-25854). The stalled case now fills until the stream reports backpressure
+ * instead of guessing.
+ */
 const PIPE_PRESSURE_BYTES = 200_000;
 /** Child startup is outside the measured crash deadline and can lag on loaded CI runners. */
 const FIXTURE_STARTUP_TIMEOUT_MS = 10_000;
@@ -39,14 +49,24 @@ const FIXTURE_STARTUP_TIMEOUT_MS = 10_000;
  * literal because at a bare 5_000 it contradicted the constant directly above — this
  * budget spans spawn through child exit, a superset of the startup that
  * FIXTURE_STARTUP_TIMEOUT_MS already says can take 10s on a loaded runner, and it
- * additionally has to cover the crash and draining PIPE_PRESSURE_BYTES through a
- * 64 KB pipe. Deriving it keeps the two watchdogs in this file from disagreeing
+ * additionally has to cover the crash and draining PIPE_PRESSURE_BYTES through the
+ * stderr socket. Deriving it keeps the two watchdogs in this file from disagreeing
  * again about how slow a loaded runner is allowed to be.
  */
 const FIXTURE_RUN_WATCHDOG_MS = FIXTURE_STARTUP_TIMEOUT_MS + 5_000;
 /**
  * The behaviour under test: with stderr stalled, the guard must still exit this fast.
  * This is the contract — tighten or loosen it only when the guard's own deadline moves.
+ *
+ * Deliberately left at 1_500 by BLO-25854, which fixed the *other* failure signature on
+ * this test and stopped short of this one. This bound spends only 30% of the guard's
+ * DEFAULT_CRASH_GUARD_TIMEOUT_MS, and has been seen failing at 1547ms on a loaded
+ * runner — a 3% overshoot against 70% unused budget. Deriving it from that constant is
+ * the obvious repair, but a mutation test (deleting the `timer.unref()` early exit the
+ * assertion exists to protect) failed through the startup watchdog rather than through
+ * this assertion, so the re-derivation could not be shown to preserve what it catches.
+ * Tracked as BLO-22985 (hardcoded wall-clock budgets under CI load) rather than changed
+ * here on an unvalidated rationale.
  */
 const STALLED_EXIT_DEADLINE_MS = 1_500;
 /**
@@ -108,6 +128,40 @@ function runFixture(kind: "throw" | "reject", padBytes: number, strictRejections
   });
 }
 
+/**
+ * Whatever the deliberately-undrained stderr pipe still holds now the child is gone.
+ * Reading it earlier would drain the stall this test exists to create; discarding it
+ * (what `child.stderr.destroy()` used to do on this path) is why five occurrences of
+ * `fixture exited before reporting stderr backpressure` were unattributable.
+ *
+ * Keep both ends, not one: the fixture's padding goes through the stream while the
+ * guard's breadcrumbs go through `writeSync`, so the two interleave at the fd in an
+ * order that depends on how much of the padding had flushed. Truncating to either end
+ * alone was observed burying the one line that names the cause under the padding.
+ */
+function readRemainingStderr(stream: Readable): Promise<string> {
+  return new Promise((done) => {
+    let out = "";
+    const finish = (): void => {
+      clearTimeout(bail);
+      stream.destroy();
+      done(
+        out.length > 2_000
+          ? `${out.slice(0, 1_000)} …(${out.length} bytes, middle elided)… ${out.slice(-1_000)}`
+          : out,
+      );
+    };
+    const bail = setTimeout(finish, 1_000);
+    stream.setEncoding("utf8");
+    stream.on("data", (chunk: string) => {
+      out += chunk;
+    });
+    stream.once("end", finish);
+    stream.once("error", finish);
+    stream.resume();
+  });
+}
+
 function runFixtureWithStalledStderr(): Promise<StalledCrashResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(tsx, [fixture, "throw", "0", "prefill-stderr"], {
@@ -140,14 +194,21 @@ function runFixtureWithStalledStderr(): Promise<StalledCrashResult> {
     });
 
     child.on("error", reject);
-    child.on("exit", (code) => {
+    child.on("exit", (code, signal) => {
       clearTimeout(startupWatchdog);
       if (watchdog) clearTimeout(watchdog);
-      child.stderr.destroy();
       if (startedAt === undefined) {
-        reject(new Error("fixture exited before reporting stderr backpressure"));
+        void readRemainingStderr(child.stderr).then((stderr) => {
+          reject(
+            new Error(
+              `fixture exited before reporting stderr backpressure ` +
+                `(code=${code}, signal=${signal}); its stderr said: ${stderr.trim() || "<nothing>"}`,
+            ),
+          );
+        });
         return;
       }
+      child.stderr.destroy();
       resolve({ code, elapsedMs: Date.now() - startedAt });
     });
   });
