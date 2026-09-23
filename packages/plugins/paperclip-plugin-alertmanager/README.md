@@ -103,14 +103,20 @@ the HTTP layer (502s at the webhook route) and from the handler logs above. Note
 that `paperclip_plugin_error` also stays `0` throughout: the plugin is running and
 healthy at the lifecycle level, and is failing per alert.
 
-The recovery API is board-authenticated and company-scoped. The examples below
-use a Paperclip board token in `PAPERCLIP_BOARD_TOKEN` (a browser session cookie
-can be used instead). Keep that token in the environment, never in the command
-itself.
+The fence listing
+(`GET /api/plugins/$PLUGIN_ID/api/aggregate-firing-fences?companyId=...`) is
+`board-or-agent` and company-scoped. Recovery
+(`POST /api/plugins/$PLUGIN_ID/api/aggregate-firing-fences/recover`) stays
+board-only. The board examples below use a Paperclip board token in
+`PAPERCLIP_BOARD_TOKEN` (a browser session cookie can be used instead). Keep that
+token in the environment, never in the command itself.
 
 1. List the currently held fences. The response is sensitive and is
-   marked `Cache-Control: no-store`; only an authorized board user for the
-   requested company can read it.
+   marked `Cache-Control: no-store`; only an authenticated board user or agent
+   of the requested company can read it. A board caller gets each fence with
+   `aggregateKey`, `phase`, `updatedAt`, `ownerInstanceId`, `ownerSlot` and
+   `firingToken`. An agent caller gets the same fields, but the handler omits
+   `firingToken`, so an agent can diagnose a fence but cannot recover it.
 
    ```sh
    curl --fail --silent --show-error \
@@ -118,11 +124,22 @@ itself.
      "$PAPERCLIP_URL/api/plugins/$PLUGIN_ID/api/aggregate-firing-fences?companyId=$COMPANY_ID"
    ```
 
-   Copy the `aggregateKey` and its matching `firingToken` from the response.
-   The token is bearer-equivalent; do not put it in tickets, chat, shell
-   history, or logs.
+   An agent reads the same route with its own run credentials:
 
-2. Release that exact token through the board-authenticated recovery route.
+   ```sh
+   curl --fail --silent --show-error \
+     -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+     "$PAPERCLIP_API_URL/api/plugins/$PLUGIN_ID/api/aggregate-firing-fences?companyId=$PAPERCLIP_COMPANY_ID"
+   ```
+
+   An agent that finds a wedged fence escalates to a board operator for step 2,
+   because it never receives `firingToken`.
+
+   Board only: copy the `aggregateKey` and its matching `firingToken` from the
+   response. The token is bearer-equivalent; do not put it in tickets, chat,
+   shell history, or logs.
+
+2. Release that exact token through the board-only recovery route.
    The response contains only whether the compare-and-set matched; it never
    returns the token.
 
