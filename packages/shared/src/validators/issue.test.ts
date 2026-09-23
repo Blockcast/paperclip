@@ -501,9 +501,15 @@ describe("issue validators", () => {
       expect(text).toMatch(/treat `commit_id` as corroboration at most/i);
       // The CREDITING sentence itself must name the marker as the thing read, and must not reach
       // `commit_id` before it does — the crediting CONDITION is where the recipe gets reinstated.
-      // The negative guard below is a verb-list regex with known paraphrase gaps ("its `commit_id`
-      // IS the head the PR is currently at" slips past it); this lookahead does not care how the
-      // comparison is phrased, only that the condition does not key on the mutable field.
+      // SCOPE, stated precisely because the next editor reads this to decide if they are covered:
+      // the lookahead is phrasing-blind only for the region BEFORE the marker phrase. It stops
+      // matching there, so a requirement APPENDED after it ("…corroboration at most. Also require
+      // that its `commit_id` IS the head the PR is currently at.") falls through to the verb-list
+      // guard below — which has known paraphrase gaps ("IS", "currently at") and does not catch
+      // that shape. Measured, not reasoned. Closing it needs the lookahead anchored to the end of
+      // the SURFACE 1 sentence group; `commit_id` appears legitimately four times inside SURFACE 1
+      // (mutability warning, `commit_id == head` fails OPEN, corroboration, COMMENTED anchor), so
+      // a blanket ban on the region is not available and the narrower guard is deliberate.
       expect(text).toMatch(/Credit an entry only when(?:(?!commit_id)[^])*?Reviewed head: <40-hex>` marker in the review BODY/);
       // SURFACE 1 must stay labelled a liveness signal, so the empirically safe use survives.
       expect(text).toMatch(/LIVENESS check/i);
