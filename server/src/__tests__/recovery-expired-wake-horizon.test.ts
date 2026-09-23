@@ -419,13 +419,26 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
     //
     // The AC rests on the two-pass drain instead, which is the only part here that depends
     // on N. The retiring path is a batch sweep over the table whose batch is bounded by its
-    // OWN `limit` and by nothing else: pass one with `limit: 3` retires exactly 3, and pass
-    // two retires the remaining 22 in one go. Were the batch owner-bounded — the pre-fix
+    // OWN `limit` and by nothing else: pass one with `limit: 4` retires exactly 4, and pass
+    // two retires the remaining 21 in one go. Were the batch owner-bounded — the pre-fix
     // shape, where progress was gated on how many beacons a 3-slot owner could absorb —
-    // pass two would stop at 3 and leave 19 rows `active`. Both counts fail if that
-    // changes, so the burst size is load-bearing rather than decorative.
+    // pass one would stop at 3 and pass two would stop at 3, stranding 19 rows `active`.
+    // Both counts fail if that changes, so the burst size is load-bearing rather than
+    // decorative.
+    //
+    // FIRST_PASS is deliberately NOT 3. At 3 it collides with the fixture's
+    // `maxConcurrentRuns: 3`, and pass one then predicts `checked: 3` under BOTH
+    // hypotheses — limit-bounded and owner-bounded — so it discriminates neither and all
+    // the weight falls on pass two. At 4 the two hypotheses disagree on pass one as well
+    // (4 vs 3), at no cost.
     const N = 25;
-    const FIRST_PASS = 3;
+    const FIRST_PASS = 4;
+    // Pass two's batch cap, stated rather than defaulted. `escalateExpiredWakeHorizons`
+    // falls back to `input.limit ?? 200` (issue-recovery-actions.ts:832); relying on that
+    // would make `checked: 21` depend on an unrelated batch-size constant staying above 21,
+    // and a future tune of it would fail this test with a count the comment here attributes
+    // to owner-bounding. Any value > N - FIRST_PASS keeps the discrimination identical.
+    const SECOND_PASS = N;
     const companyId = randomUUID();
     const ownerAgentId = randomUUID();
     const prefix = `BU${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`;
@@ -444,45 +457,49 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
       status: "idle",
       adapterType: "codex_local",
       adapterConfig: {},
-      // The AC names this number, so assert the fixture carries it rather than letting a
-      // later edit quietly turn this into a burst against an unbounded owner.
       runtimeConfig: { heartbeat: { maxConcurrentRuns: 3 } },
       permissions: {},
     });
     const [owner] = await db.select().from(agents).where(eq(agents.id, ownerAgentId));
+    // FIXTURE GUARD, and a weaker one than the `enqueueWakeup` guard below — same family,
+    // named here by the same standard. No path in the retirement sweep reads the owner's
+    // `runtimeConfig` at all (neither `reconcileExpiredRecoveryWakeHorizons` nor
+    // `escalateExpiredWakeHorizons` touches it), so unlike the `enqueueWakeup` guard — which
+    // fails if a wake ever returns to the path — this one cannot fail against ANY production
+    // change. It fails only if someone edits the four literal lines above it. That is still
+    // worth keeping: the AC names this number, and the test's claim to be "a burst against a
+    // 3-slot owner" is false if the fixture quietly stops being one. It is not evidence.
     expect(
       (owner!.runtimeConfig as { heartbeat?: { maxConcurrentRuns?: number } }).heartbeat
         ?.maxConcurrentRuns,
     ).toBe(3);
 
-    const issueIds: string[] = [];
-    const actionIds: string[] = [];
-    for (let i = 0; i < N; i += 1) {
-      const issueId = randomUUID();
-      issueIds.push(issueId);
-      await db.insert(issues).values({
+    const issueIds = Array.from({ length: N }, () => randomUUID());
+    const actionIds = Array.from({ length: N }, () => randomUUID());
+    await db.insert(issues).values(
+      issueIds.map((issueId, i) => ({
         id: issueId,
         companyId,
         title: `burst row ${i}`,
         // The shape the stranded sweep leaves behind: blocked, assigned, zero blocker edges.
-        status: "blocked",
-        priority: "high",
+        status: "blocked" as const,
+        priority: "high" as const,
         assigneeAgentId: ownerAgentId,
         issueNumber: 30000 + i,
         identifier: `${prefix}-${30000 + i}`,
-      });
-      const actionId = randomUUID();
-      actionIds.push(actionId);
-      await db.insert(issueRecoveryActions).values({
+      })),
+    );
+    await db.insert(issueRecoveryActions).values(
+      actionIds.map((actionId, i) => ({
         id: actionId,
         companyId,
-        sourceIssueId: issueId,
-        kind: "stranded_assigned_issue",
-        status: "active",
-        ownerType: "agent",
+        sourceIssueId: issueIds[i]!,
+        kind: "stranded_assigned_issue" as const,
+        status: "active" as const,
+        ownerType: "agent" as const,
         ownerAgentId,
         cause: "stranded_assigned_issue",
-        fingerprint: `stranded:${issueId}`,
+        fingerprint: `stranded:${issueIds[i]!}`,
         evidence: {},
         nextAction: "Restore a live execution path.",
         // 0 DELIVERED wakes is the burst's own signature: every sweep reserved an attempt
@@ -492,19 +509,24 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
         maxAttempts: 5,
         timeoutAt: pastHorizon,
         lastAttemptAt: pastHorizon,
-      });
-    }
+      })),
+    );
 
     const enqueueWakeup = vi.fn().mockResolvedValue(null);
     const recovery = recoveryService(db, { enqueueWakeup });
 
-    // Pass one, capped well below the burst: the batch is bounded by the sweep's own limit.
+    // Pass one, capped below both the burst AND the owner's 3 slots: the batch is bounded by
+    // the sweep's own limit. An owner-bounded sweep would stop at 3 here, not 4.
     const first = await recovery.reconcileExpiredRecoveryWakeHorizons({ now, limit: FIRST_PASS });
     expect(first).toMatchObject({ checked: FIRST_PASS, escalated: FIRST_PASS });
 
-    // Pass two, uncapped: the whole remainder drains at once. An owner-bounded sweep would
-    // stop at the owner's 3 slots here and strand 19 rows — this is the AC4 assertion.
-    const result = await recovery.reconcileExpiredRecoveryWakeHorizons({ now });
+    // Pass two, capped above the remainder: the whole remainder drains at once. An
+    // owner-bounded sweep would stop at the owner's 3 slots here and strand 18 rows — this
+    // is the AC4 assertion.
+    const result = await recovery.reconcileExpiredRecoveryWakeHorizons({
+      now,
+      limit: SECOND_PASS,
+    });
     expect(result).toMatchObject({
       checked: N - FIRST_PASS,
       escalated: N - FIRST_PASS,
