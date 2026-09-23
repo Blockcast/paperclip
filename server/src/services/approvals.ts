@@ -1,6 +1,6 @@
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents, approvalComments, approvals, budgetPolicies, issueApprovals } from "@paperclipai/db";
+import { agents, approvalComments, approvals, budgetIncidents, budgetPolicies, issueApprovals } from "@paperclipai/db";
 import { APPROVAL_UNDECIDED_STATUSES } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
@@ -178,6 +178,64 @@ export function approvalService(db: Db) {
     return boundAgent;
   }
 
+  /**
+   * BLO-29085: refuse a generic decision on a budget card that still owns an open
+   * incident, and point the caller at the route that owns the lifecycle.
+   *
+   * `budget_override_required` cards are filed by the budget watcher
+   * (`services/budgets.ts`) alongside a `budget_incidents` row, and only
+   * `budgetService.resolveIncident` closes the pair: it raises the cap, resumes the
+   * paused scope, closes the incident, *then* writes the approval status directly.
+   * This service has no branch for the type — `resolveApproval` and `withdraw` just
+   * write the approval — so a decision taken here marks the card terminal and leaves
+   * the incident `open` forever. The scope stays paused with no live card, and
+   * because incident creation is suppressed while an open row exists for the same
+   * `(policy, window, threshold)`, nothing re-arms it either.
+   *
+   * Refusing rather than routing, deliberately. An approval decision here carries no
+   * amount, and `raise_budget_and_resume` needs one — so "apply the same side
+   * effects" would reduce to guessing a cap, and rejecting-but-not-approving would
+   * leave the two verbs on different owners. The UI already declines this exact
+   * decision and sends the board to /costs (`ui/src/pages/ApprovalDetail.tsx`); this
+   * makes the server agree with the page it ships instead of trusting the UI to be
+   * the only guard on a money path.
+   *
+   * Gated on an *open incident*, not on the type. A `budget_override_required` card
+   * with no open incident — a caller-filed one, or a watcher card whose incident was
+   * already closed out of band — owns no lifecycle to strand, and refusing it would
+   * take away the board's only decision affordance for it. The predicate is the
+   * invariant itself: refuse exactly when deciding here would strand an open row.
+   *
+   * Not applied to `requestRevision`: `revision_requested` is undecided, the card can
+   * still return to `pending`, and the invariant only speaks about terminal states.
+   * The approval-gate reconciler's `cancelled` write is a third terminal path but is
+   * unreachable for these cards — it selects on
+   * `payload->'gate'->>'kind' = 'github_actions_run'` and a watcher card is filed
+   * through `insertApproval()` with no gate.
+   */
+  async function assertNoOpenBudgetIncident(id: string, type: string, dbClient: Db) {
+    if (type !== "budget_override_required") return;
+    const open = await dbClient
+      .select({ id: budgetIncidents.id, companyId: budgetIncidents.companyId })
+      .from(budgetIncidents)
+      .where(and(eq(budgetIncidents.approvalId, id), eq(budgetIncidents.status, "open")))
+      .then((rows) => rows[0] ?? null);
+    if (!open) return;
+
+    throw unprocessable(
+      "This budget card still owns an open budget incident; deciding it here would leave the " +
+        "scope paused with no live card. Resolve it through the budget route " +
+        "(POST /api/companies/:companyId/budget-incidents/:incidentId/resolve, or the budget " +
+        "controls on /costs), which raises the cap, resumes the scope, and decides this card.",
+      {
+        code: "budget_incident_open",
+        approvalId: id,
+        incidentId: open.id,
+        route: `/api/companies/${open.companyId}/budget-incidents/${open.id}/resolve`,
+      },
+    );
+  }
+
   async function resolveApproval(
     id: string,
     targetStatus: "approved" | "rejected",
@@ -194,6 +252,10 @@ export function approvalService(db: Db) {
         `Only pending or revision requested approvals can be ${targetStatus === "approved" ? "approved" : "rejected"}`,
       );
     }
+
+    // After the status check so an already-decided card still replays idempotently
+    // above rather than turning a no-op retry into a 422.
+    await assertNoOpenBudgetIncident(id, existing.type, dbClient);
 
     const now = new Date();
     const updated = await dbClient
@@ -682,6 +744,11 @@ export function approvalService(db: Db) {
             allowedStatuses: resolvableStatuses,
           });
         }
+
+        // Withdrawal is terminal too, and the board retains full reach over
+        // server-filed cards (`routes/approvals.ts`), so this is a live way to
+        // strand an incident, not a theoretical one. See assertNoOpenBudgetIncident.
+        await assertNoOpenBudgetIncident(id, existing.type, txDb);
 
         // The note is the board's, not the withdrawer's. Overwriting it with the
         // withdrawal reason is unrecoverable -- there is no revision history on
