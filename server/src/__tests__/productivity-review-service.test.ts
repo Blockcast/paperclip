@@ -9210,6 +9210,8 @@ describeEmbeddedPostgres("productivity review service", () => {
       sourceIssueId: seeded.issueId,
     });
   });
+
+  // BLO-33477: retirement-scan starvation, the same defect BLO-30303 fixed on
   // the source scan. `closeOpenSuppressedReviews` is the only path that can
   // retire an open review, and it only writes to a review it *retires* — a
   // review that is scanned and correctly declined (its alarm still stands) has
