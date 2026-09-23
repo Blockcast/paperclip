@@ -13868,6 +13868,49 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       source: input.activitySource,
     });
 
+    // Queue a recovery wake, or when the gate declines it with a 4xx, leave the
+    // recovery comment on the source issue and log the suppression instead. The
+    // wake target is the same seat whose suppression this recovery follows, so a
+    // declined wake is the expected case, not an error to escape the tick with.
+    async function enqueueRecoveryWakeOrComment(
+      agentId: string,
+      wakeInput: Parameters<typeof enqueueWakeup>[1],
+      suppressedCommentLead: string,
+    ): Promise<"queued" | "suppressed"> {
+      try {
+        await enqueueWakeup(agentId, wakeInput);
+        return "queued";
+      } catch (err) {
+        if (!(err instanceof HttpError) || err.status < 400 || err.status >= 500) throw err;
+        await db.insert(issueComments).values({
+          companyId: input.claimed.companyId,
+          issueId: input.claimed.id,
+          body: [
+            monitorRecoveryComment({
+              issue: input.claimed,
+              clearReason: input.clearReason,
+              recoveryPolicy: input.recoveryPolicy,
+              nextAttemptCount: input.nextAttemptCount,
+            }),
+            "",
+            `${suppressedCommentLead}: ${err.message}`,
+          ].join("\n"),
+        });
+        await logActivity(db, {
+          companyId: input.claimed.companyId,
+          actorType: input.actorType,
+          actorId: input.actorId,
+          agentId: input.agentId,
+          runId: input.runId,
+          action: "issue.monitor_recovery_wake_suppressed",
+          entityType: "issue",
+          entityId: input.claimed.id,
+          details: { ...details, suppressionMessage: err.message },
+        });
+        return "suppressed";
+      }
+    }
+
     if (input.recoveryPolicy === "create_recovery_issue") {
       let recoveryIssue = await findOpenIssueMonitorRecoveryIssue(input.claimed);
       if (!recoveryIssue) {
@@ -13893,8 +13936,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
 
+      // PEN-3326: the recovery issue defaults to the source issue's own assignee,
+      // which on the paused-seat exhaustion that now reaches here is the agent
+      // that could not be woken. The row is the unsuppressible artifact; a
+      // declined wake must not throw past the `issue.monitor_recovery_issue_created`
+      // log below, so route it through the same comment fallback as `wake_owner`.
+      let recoveryWakeSuppressed = false;
       if (recoveryIssue.assigneeAgentId) {
-        await enqueueWakeup(recoveryIssue.assigneeAgentId, {
+        const wake = await enqueueRecoveryWakeOrComment(recoveryIssue.assigneeAgentId, {
           source: "automation",
           triggerDetail: "system",
           reason: "issue_monitor_recovery_issue",
@@ -13908,7 +13957,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             source: "issue.monitor.recovery_issue",
             wakeReason: "issue_monitor_recovery_issue",
           }, "status_only"),
-        });
+        }, "The recovery-issue wake could not be delivered");
+        recoveryWakeSuppressed = wake === "suppressed";
       }
 
       await logActivity(db, {
@@ -13924,6 +13974,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ...details,
           recoveryIssueId: recoveryIssue.id,
           recoveryIdentifier: recoveryIssue.identifier,
+          ...(recoveryWakeSuppressed ? { recoveryWakeSuppressed: true } : {}),
         },
       });
       return;
@@ -13962,64 +14013,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // the tick, after the monitor has already been cleared, and the escalation
     // that was meant to make the loss loud is itself silently suppressed. Fall
     // back to the artifact that cannot be suppressed: a comment on the row.
-    try {
-      await enqueueWakeup(input.claimed.assigneeAgentId!, {
-        source: "automation",
-        triggerDetail: "system",
-        reason: "issue_monitor_recovery",
-        idempotencyKey: `issue-monitor-recovery:${input.claimed.id}:${input.clearReason}:${input.scheduledAtIso}`,
-        payload: withRecoveryModelProfileHint({
-          issueId: input.claimed.id,
-          monitorAttemptCount: input.nextAttemptCount,
-          monitorNotes: input.claimed.monitorNotes ?? null,
-          clearReason: input.clearReason,
-          serviceName: input.monitor?.serviceName ?? null,
-          timeoutAt: input.monitor?.timeoutAt ?? null,
-          maxAttempts: input.monitor?.maxAttempts ?? null,
-        }, "status_only"),
-        requestedByActorType: input.actorType,
-        requestedByActorId: input.actorId,
-        contextSnapshot: withRecoveryModelProfileHint({
-          issueId: input.claimed.id,
-          source: "issue.monitor.recovery",
-          wakeReason: "issue_monitor_recovery",
-          monitorAttemptCount: input.nextAttemptCount,
-          monitorNotes: input.claimed.monitorNotes ?? null,
-          clearReason: input.clearReason,
-          serviceName: input.monitor?.serviceName ?? null,
-          timeoutAt: input.monitor?.timeoutAt ?? null,
-          maxAttempts: input.monitor?.maxAttempts ?? null,
-        }, "status_only"),
-      });
-    } catch (err) {
-      if (!(err instanceof HttpError) || err.status < 400 || err.status >= 500) throw err;
-      await db.insert(issueComments).values({
-        companyId: input.claimed.companyId,
+    const wake = await enqueueRecoveryWakeOrComment(input.claimed.assigneeAgentId!, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_monitor_recovery",
+      idempotencyKey: `issue-monitor-recovery:${input.claimed.id}:${input.clearReason}:${input.scheduledAtIso}`,
+      payload: withRecoveryModelProfileHint({
         issueId: input.claimed.id,
-        body: [
-          monitorRecoveryComment({
-            issue: input.claimed,
-            clearReason: input.clearReason,
-            recoveryPolicy: input.recoveryPolicy,
-            nextAttemptCount: input.nextAttemptCount,
-          }),
-          "",
-          `The owner-recovery wake could not be delivered: ${err.message}`,
-        ].join("\n"),
-      });
-      await logActivity(db, {
-        companyId: input.claimed.companyId,
-        actorType: input.actorType,
-        actorId: input.actorId,
-        agentId: input.agentId,
-        runId: input.runId,
-        action: "issue.monitor_recovery_wake_suppressed",
-        entityType: "issue",
-        entityId: input.claimed.id,
-        details: { ...details, suppressionMessage: err.message },
-      });
-      return;
-    }
+        monitorAttemptCount: input.nextAttemptCount,
+        monitorNotes: input.claimed.monitorNotes ?? null,
+        clearReason: input.clearReason,
+        serviceName: input.monitor?.serviceName ?? null,
+        timeoutAt: input.monitor?.timeoutAt ?? null,
+        maxAttempts: input.monitor?.maxAttempts ?? null,
+      }, "status_only"),
+      requestedByActorType: input.actorType,
+      requestedByActorId: input.actorId,
+      contextSnapshot: withRecoveryModelProfileHint({
+        issueId: input.claimed.id,
+        source: "issue.monitor.recovery",
+        wakeReason: "issue_monitor_recovery",
+        monitorAttemptCount: input.nextAttemptCount,
+        monitorNotes: input.claimed.monitorNotes ?? null,
+        clearReason: input.clearReason,
+        serviceName: input.monitor?.serviceName ?? null,
+        timeoutAt: input.monitor?.timeoutAt ?? null,
+        maxAttempts: input.monitor?.maxAttempts ?? null,
+      }, "status_only"),
+    }, "The owner-recovery wake could not be delivered");
+    if (wake === "suppressed") return;
 
     await logActivity(db, {
       companyId: input.claimed.companyId,
@@ -14614,9 +14636,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // condition a human clears. Deleting the timer made that recoverable
         // pause permanently destructive — resuming the seat does not bring the
         // schedule back, and the row then reads healthy on every field an
-        // observer checks. Scoped to the automation path: the manual/on-demand
-        // caller passes `clearOnClientError: false`, already leaves the monitor
-        // intact, and must keep seeing the 409 rather than a silent deferral.
+        // observer checks. THIS throw-branch deferral is automation-only: the
+        // manual/on-demand caller passes `clearOnClientError: false`, already
+        // leaves the monitor intact, and must keep seeing the 409. The
+        // return-null deferral above is deliberately NOT gated the same way: a
+        // null return carries no error to surface, so falling through on the
+        // manual path would replay the "triggered for a wake never queued"
+        // defect. It re-arms instead, and the route reports the deferred
+        // outcome rather than a bare ok.
         if (input.clearOnClientError && monitorSuppression.durableSkipReason) {
           const deferral = await deferSuppressedDispatch(monitorSuppression.durableSkipReason, err.message);
           if (deferral.kind === "rearmed") return deferral.result;
