@@ -207,9 +207,11 @@ export const issueExecutionMonitorPolicySchema = z.object({
     // the description because an agent reading this schema is about to act on it; the counts live
     // here. BLO-27234, n=128 reviews: 8 confirmed forward re-anchorings, all 8 APPROVED, 6 of them
     // not even the latest review; 0 of 94 COMMENTED re-anchored. That breakdown names only
-    // COMMENTED and APPROVED — the remaining ~26 are unattributed — which is why the description
-    // calls CHANGES_REQUESTED / DISMISSED UNMEASURED rather than reading COMMENTED's result across
-    // them. Re-measured 2026-09-22 on `pim-multicast-gateway#1968`: four APPROVED reviews of two
+    // COMMENTED and APPROVED — 8 + 94 = 102, so ~26 of the 128 are unattributed — which is why the
+    // description calls CHANGES_REQUESTED / DISMISSED UNMEASURED rather than reading COMMENTED's
+    // result across them. That arithmetic is the sole support for the UNMEASURED label, so it is
+    // stated here rather than left as the reader's inference.
+    // Re-measured 2026-09-22 on `pim-multicast-gateway#1968`: four APPROVED reviews of two
     // different older heads (`9b5e3a29…`, `11c80be5…`) all report one `commit_id=3168e6a2`, which
     // is neither of them, while their `Reviewed head:` body markers keep the two heads correctly
     // distinct. This is the fourth copy of the unsound recipe found (BLO-27234 `pim` CLAUDE.md,
