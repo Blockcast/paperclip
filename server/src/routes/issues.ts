@@ -6713,6 +6713,12 @@ export function issueRoutes(
         res.status(400).json({ error: "afterId requires sortField=id" });
         return;
       }
+      // offset applies on top of the keyset predicate, so combining them would
+      // silently skip `offset` rows per page.
+      if (parsedOffset !== null && parsedOffset > 0) {
+        res.status(400).json({ error: "afterId cannot be combined with offset" });
+        return;
+      }
     }
     if (hasPlanDocument === null) {
       res.status(400).json({ error: "hasPlanDocument must be true or false when provided" });
