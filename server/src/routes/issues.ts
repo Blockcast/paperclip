@@ -4360,10 +4360,19 @@ export function issueRoutes(
     // that it was). This route keeps running the full gate anyway, because that
     // is what preserves this door's `deny_task_watchdog_scope` audit row and its
     // pre-refactor 409 staleness contract exactly as they were.
+    //
+    // Only its denial is terminal, though. Pre-refactor an in-subtree watchdog
+    // allow was still refused by `assertCanManageIssueApprovalLinks` unless the
+    // agent was privileged; returning it here would skip the evaluator and let a
+    // watchdog attach approvals to a peer's checked-out issue that the create
+    // door refuses for the same pair (Ally, PR #1271). So a watchdog allow falls
+    // through: the evaluator re-runs subtree and freshness (side-effect-free)
+    // and then applies the execution-run and assignee branches exactly as the
+    // create door does, so both doors reach the same 409/403 for that pair.
     const watchdogDecision = await assertTaskWatchdogScopedIssueMutationAllowed(req, res, issue, {
       deniedWriteAction: "issue:mutate",
     });
-    if (watchdogDecision !== null) return watchdogDecision;
+    if (watchdogDecision === false) return false;
     const verdict = await evaluateAgentIssueApprovalLinkAuthorization({ access, db }, req, issue);
     if (verdict.allowed) return true;
     res.status(verdict.status).json({

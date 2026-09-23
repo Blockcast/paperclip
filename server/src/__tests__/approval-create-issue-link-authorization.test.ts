@@ -470,6 +470,34 @@ describe("POST /companies/:companyId/approvals — task-watchdog freshness (BLO-
     expect(mockTaskWatchdogService.revalidateMutationScope).toHaveBeenCalled();
   });
 
+  it("refuses a live watchdog run linking an in-subtree issue whose checkout it does not own", async () => {
+    // The create-door twin of the link-route case in
+    // issue-agent-mutation-ownership-routes.test.ts (Ally, PR #1271): a fresh,
+    // in-subtree watchdog run is not a grant. The evaluator's watchdog branch
+    // falls through to the execution-run and assignee branches, so a peer's
+    // checked-out issue is a 409 here, and the link door must answer the same.
+    decideAllowingBoundary();
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({
+        id: PEER_ISSUE_ID,
+        assigneeAgentId: PEER_AGENT_ID,
+        createdByAgentId: PEER_AGENT_ID,
+        status: "in_progress",
+        checkoutRunId: "other-run",
+        executionRunId: "other-run",
+      }),
+    );
+
+    const res = await request(await createApp(agentActor(), watchdogContext(PEER_ISSUE_ID)))
+      .post(`/api/companies/${COMPANY_ID}/approvals`)
+      .send(createBody([PEER_ISSUE_ID]));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details.refusedIssueIds).toEqual([PEER_ISSUE_ID]);
+    expect(mockApprovalService.createWithIdempotency).not.toHaveBeenCalled();
+    expect(mockIssueApprovalService.linkManyForApproval).not.toHaveBeenCalled();
+  });
+
   it("exempts the watchdog's own report issue from revalidation", async () => {
     // Mirrors the `scope.watchdogIssueId` exemption in
     // `assertFreshTaskWatchdogSourceMutation`: a watchdog may always annotate the

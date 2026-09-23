@@ -6463,6 +6463,37 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueApprovalService.link).toHaveBeenCalled();
     });
 
+    // BLO-24699 review (Ally, PR #1271): the case the two above do not cover. An
+    // in-subtree, fresh watchdog run used to short-circuit this route to "allow"
+    // before the evaluator ever ran, so a watchdog could link approvals to a
+    // peer's checked-out issue that the create door refuses for the same pair.
+    // The boundary is allowed here (and the checkout-management override is
+    // not) so the refusal provably comes from the evaluator's assignee branch,
+    // the same 409 the create door answers.
+    it("refuses a watchdog run linking an approval to an in-subtree issue whose checkout it does not own", async () => {
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: input.action !== "tasks:manage_active_checkouts",
+        action: input.action,
+        reason: input.action !== "tasks:manage_active_checkouts" ? "allow_explicit_grant" : "deny_missing_grant",
+        explanation: "Watchdog test boundary default.",
+      }));
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "in_progress",
+        assigneeAgentId: ownerAgentId,
+        checkoutRunId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbc",
+        executionRunId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbc",
+      }));
+
+      const app = await createApp(watchdogActor(), createWatchdogDb());
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/approvals`)
+        .send({ approvalId: "88888888-8888-4888-8888-888888888888" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.details.reason).toBe("deny_active_checkout");
+      expect(mockIssueApprovalService.link).not.toHaveBeenCalled();
+    });
+
     it("still enforces normal assignment guards for watchdog reassignment", async () => {
       // Base boundary denied AND tasks:assign denied: the watchdog grant lets the
       // mutation past the ownership boundary, but the assignment guard must still bite.
