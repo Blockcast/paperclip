@@ -499,8 +499,18 @@ describe("issue validators", () => {
       // The immutable body marker is what records which head was read; commit_id corroborates.
       expect(text).toMatch(/Reviewed head: <40-hex>` marker in the review BODY/);
       expect(text).toMatch(/treat `commit_id` as corroboration at most/i);
+      // The CREDITING sentence itself must name the marker as the thing read, and must not reach
+      // `commit_id` before it does — the crediting CONDITION is where the recipe gets reinstated.
+      // The negative guard below is a verb-list regex with known paraphrase gaps ("its `commit_id`
+      // IS the head the PR is currently at" slips past it); this lookahead does not care how the
+      // comparison is phrased, only that the condition does not key on the mutable field.
+      expect(text).toMatch(/Credit an entry only when(?:(?!commit_id)[^])*?Reviewed head: <40-hex>` marker in the review BODY/);
       // SURFACE 1 must stay labelled a liveness signal, so the empirically safe use survives.
       expect(text).toMatch(/LIVENESS check/i);
+      // The re-anchoring sample covers COMMENTED and APPROVED only (BLO-27234, n=128). The other
+      // two submitted states must stay labelled unmeasured rather than inheriting COMMENTED's
+      // clean result, which is a stronger instruction, not a weaker one.
+      expect(text).toMatch(/CHANGES_REQUESTED \/ DISMISSED are UNMEASURED, not cleared/i);
       // The old recipe must not come back as a PARAPHRASE either, not just as a verbatim revert.
       // The previous exact-string guards passed on "its `commit_id` matches the PR's current
       // head", which sits perfectly happily beside the mutability warning and reinstates the
@@ -513,7 +523,13 @@ describe("issue validators", () => {
       // formal review on `review.commitId === headSha` alone, in any SUBMITTED state including
       // APPROVED, with no body-marker check — so an unqualified "mirror it" tells an agent to
       // re-derive the exact recipe removed above (BLO-35277 review, paperclip#1988).
-      expect(text).toMatch(/do NOT carry that over to `?APPROVED/i);
+      expect(text).toMatch(/do NOT carry (that|its `commit_id` keying) over to `?APPROVED/i);
+      // ...and the pointer must not imply the server is FINE. `APPROVED` is reachable there on any
+      // human-authored PR, so the text has to say the server carries the same latent fail-open —
+      // otherwise a later audit of `github-app-auth.ts` reads this as "already assessed, sound"
+      // and stops. That is the one follow-up that matters (BLO-35545).
+      expect(text).toMatch(/`?APPROVED`? IS a state it runs on/i);
+      expect(text).toMatch(/same latent fail-open and is NOT cleared by this block/i);
     });
   });
 
