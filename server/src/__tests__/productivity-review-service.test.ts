@@ -9185,6 +9185,7 @@ describeEmbeddedPostgres("productivity review service", () => {
       entityId: reviewId,
       details: {
         trigger: "runtime_failure_streak",
+        firedTriggers: ["runtime_failure_streak"],
         sourceIssueId: seeded.issueId,
       },
     });
@@ -9209,6 +9210,115 @@ describeEmbeddedPostgres("productivity review service", () => {
       sourceStatus: "done",
       sourceIssueId: seeded.issueId,
     });
+  });
+
+  // BLO-35725 (Ally review on eb48670e): the overlap case. `runtime_failure_streak`
+  // is the first member of the `done` arm that *outranks* the accountability
+  // triggers in `choosePrimaryTrigger`, so it is the first one that can present a
+  // closable primary while carrying a non-closable `high_churn` record underneath.
+  // The defaults make that the norm, not a corner: both thresholds are 10 and
+  // infra-failure runs count toward churn in full, so ten fast infra-failing runs
+  // inside an hour trip both predicates at once.
+  //
+  // Retiring this row would destroy the cost record permanently — generation only
+  // scans `["todo", "in_progress"]` sources, so a `done` source never re-fires it.
+  // Keying the arm on the primary trigger alone turns this red.
+  it("does not close a done-source runtime-failure-streak review that also fired high_churn", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "done",
+      startedAt: new Date(now.getTime() - 13 * 60 * 60 * 1000),
+    });
+    const reviewId = randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Review productivity for source",
+      status: "todo",
+      priority: "medium",
+      parentId: seeded.issueId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await logActivity(db, {
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: reviewId,
+      details: {
+        // `firedTriggers[0] === trigger` always holds (see `collectEvidence`).
+        trigger: "runtime_failure_streak",
+        firedTriggers: ["runtime_failure_streak", "high_churn"],
+        sourceIssueId: seeded.issueId,
+      },
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.closedTerminalSourceReviews).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.status).toBe("todo");
+  });
+
+  // BLO-35725: legacy rows minted before `firedTriggers` was persisted fail
+  // closed for this trigger specifically — we cannot tell whether `high_churn`
+  // co-fired, and there is no stranding risk to trade against because the
+  // trigger is new enough that no legacy row carries it. The two older members
+  // keep the old primary-trigger fallback (their ladder position makes it safe),
+  // which the BLO-20549 tests above pin.
+  it("does not close a done-source runtime-failure-streak review with no recorded firedTriggers", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "done",
+      startedAt: new Date(now.getTime() - 13 * 60 * 60 * 1000),
+    });
+    const reviewId = randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Review productivity for source",
+      status: "todo",
+      priority: "medium",
+      parentId: seeded.issueId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await logActivity(db, {
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: reviewId,
+      details: {
+        trigger: "runtime_failure_streak",
+        sourceIssueId: seeded.issueId,
+      },
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.closedTerminalSourceReviews).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.status).toBe("todo");
   });
 
   // BLO-33477: retirement-scan starvation, the same defect BLO-30303 fixed on
