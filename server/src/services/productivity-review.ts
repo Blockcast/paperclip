@@ -3454,6 +3454,23 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       // source still open, and that case is retired by the `execution_ended`
       // arm below on the real predicate (Ally review on 7f4fbc43b). The two
       // overlap deliberately — this one costs no extra read when it applies.
+      // `runtime_failure_streak` rides it too (BLO-35725): like the two above
+      // and unlike the accountability triggers, its rubric is entirely
+      // forward-looking about a *live* condition — "diagnose the
+      // dispatch/runtime fault", "confirm the fault has cleared and let the
+      // issue continue unattended". It is explicitly not an agent-conduct
+      // record: `isSoftStopTrigger` omits it because withholding the agent's
+      // next turn would punish it for the platform's failure. Once the source
+      // reaches `done` the faults did not prevent delivery and there is no
+      // turn left to release, so every option in its rubric is moot.
+      // Source-`done` is a convenience proxy here exactly as it is for
+      // `runaway_execution`, and for the same reason it is safe: a completed
+      // source does not prove the fault cleared fleet-wide, but a per-source
+      // review is the wrong instrument for a fleet-wide fault (that is
+      // BLO-34556's job) and a still-faulting assignee simply re-fires a fresh
+      // review through generation. Unlike `long_active_duration` this trigger
+      // carries no soft-stop, so retiring it on a self-settable status grants
+      // the reviewed agent nothing it did not already have.
       // This does not extend to `cancelled`; an assignee can abandon and later
       // restore their own source issue, so cancellation must not retire its
       // oversight artifact. It also does not extend to historical/accountability
@@ -3461,7 +3478,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       // completion does not invalidate those signals, and unknown trigger
       // semantics fail closed.
       if (
-        (trigger === "long_active_duration" || trigger === "runaway_execution")
+        (trigger === "long_active_duration"
+          || trigger === "runaway_execution"
+          || trigger === "runtime_failure_streak")
         && sourceIssue.status === "done"
       ) {
         suppressedBy = "terminal_source";

@@ -9141,7 +9141,75 @@ describeEmbeddedPostgres("productivity review service", () => {
     });
   });
 
-  // BLO-33477: retirement-scan starvation, the same defect BLO-30303 fixed on
+  // BLO-35725: `runtime_failure_streak` was absent from the `done` arm, so it
+  // fell to the "unknown trigger semantics fail closed" default and no such
+  // review could ever auto-retire on source completion. Measured 2026-09-23:
+  // 32 of 32 open productivity reviews fleet-wide carried this trigger (the
+  // self-retiring triggers clear themselves, so it was the entire open
+  // population) and 6 were orphans whose source had reached `done` — each one
+  // otherwise costing a manager run to close by hand, which is exactly the cost
+  // BLO-20549 removed for `long_active_duration`.
+  //
+  // Paired with the `no_comment_streak` sibling below rather than
+  // parameterised, for the same reason as the two arms above: this is a
+  // per-trigger decision, and the accountability triggers must still retire
+  // neither.
+  it("closes an open runtime-failure-streak productivity review once its source issue is done", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "done",
+      startedAt: new Date(now.getTime() - 13 * 60 * 60 * 1000),
+    });
+    const reviewId = randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Review productivity for source",
+      status: "todo",
+      priority: "medium",
+      parentId: seeded.issueId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await logActivity(db, {
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: reviewId,
+      details: {
+        trigger: "runtime_failure_streak",
+        sourceIssueId: seeded.issueId,
+      },
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    // Dropping `runtime_failure_streak` from the `done` arm turns this red.
+    expect(result.closedTerminalSourceReviews).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.status).toBe("done");
+
+    const closeEntries = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_suppressed_open_review_closed"));
+    expect(closeEntries).toHaveLength(1);
+    expect(closeEntries[0]?.details).toMatchObject({
+      suppressedBy: "terminal_source",
+      sourceStatus: "done",
+      sourceIssueId: seeded.issueId,
+    });
+  });
   // the source scan. `closeOpenSuppressedReviews` is the only path that can
   // retire an open review, and it only writes to a review it *retires* — a
   // review that is scanned and correctly declined (its alarm still stands) has
@@ -9320,7 +9388,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.status).toBe("todo");
   });
 
-  it("does not close a done-source review whose trigger was not long_active_duration", async () => {
+  it("does not close a done-source review whose trigger is an accountability record", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue({ status: "done" });
     const reviewId = randomUUID();
