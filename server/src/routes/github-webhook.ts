@@ -5899,11 +5899,94 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       }
     }
 
+    // Both lazy: this pair is declared here so the PEN-3397 discharge below can
+    // sit ABOVE the `matched.length === 0` gate (see its comment). The
+    // heartbeat used to be constructed eagerly below that gate, which is what
+    // pinned the discharge underneath it. Laziness keeps that move free --
+    // a delivery that exits at the gate without discharging anything still
+    // constructs neither service, exactly as before.
+    let heartbeatInstance: ReturnType<typeof heartbeatService> | null = null;
+    const getHeartbeat = () =>
+      (heartbeatInstance ??= heartbeatService(db, {
+        pluginWorkerManager: config.pluginWorkerManager,
+        ...config.heartbeatOptions,
+      }));
+    let recoveryInstance: ReturnType<typeof recoveryService> | null = null;
+    const getRecovery = () =>
+      // Thunked rather than `getHeartbeat().wakeup`: the discharge path never
+      // enqueues a wake, so binding the method here would construct a heartbeat
+      // for every discharge that does not need one.
+      (recoveryInstance ??= recoveryService(db, {
+        enqueueWakeup: (...args) => getHeartbeat().wakeup(...args),
+      }));
+
+    // PEN-3397: a closed PR discharges any `pr_review_non_convergence` action
+    // raised against it. Gated on the `closed` action rather than on
+    // `prMerged === true` like the merged-PR forward-capture above, because a PR
+    // closed WITHOUT merging ends the self-review loop just as conclusively as a
+    // merge — abandoned or superseded, there is still no author left to unstick.
+    //
+    // MUST stay ABOVE the `matched.length === 0` gate below. `matched` is
+    // identifier-matched issues only, so a `closed` delivery whose issue link
+    // exists solely through `pullRequestWorkProductExternalId` exits there --
+    // and that previously-linked half is precisely the half this block's wide
+    // candidate set exists to serve. Placing it after the gate made the call
+    // unreachable for it (caught in review on PR#1967, PEN-3397). The sibling
+    // work-product block consuming the identical set sits above the gate for
+    // the same reason.
+    //
+    // Candidate set is deliberately wide (`pullRequestWorkProductTargets`, i.e.
+    // matched ∪ previously-linked): the service matches on a fingerprint built
+    // from `(issue.id, repoFullName, prNumber)`, so an issue that merely mentions
+    // this PR cannot match, while an issue whose body no longer names the PR is
+    // still reached through the previously-linked half.
+    //
+    // Best-effort, mirroring the forward-capture and work-product blocks: this
+    // must never break the wake path.
+    let prNonConvergenceDischarged = 0;
+    if (
+      eventName === "pull_request" &&
+      context.prAction === "closed" &&
+      context.prNumber !== null &&
+      // Symmetry with the sibling merged-PR block above. Not a live defect
+      // today -- creation and discharge both normalize a null through
+      // `?? "unknown"`, so the fingerprints still match -- but the two
+      // normalizations are independent, and a null repo here can only ever
+      // produce a silent no-op. Refusing it makes that explicit.
+      context.repoFullName &&
+      pullRequestWorkProductTargets.length > 0
+    ) {
+      try {
+        const discharged = await getRecovery().closePrReviewNonConvergenceForClosedPr({
+          repoFullName: context.repoFullName,
+          prNumber: context.prNumber,
+          merged: context.prMerged === true,
+          candidateIssues: pullRequestWorkProductTargets.map((issue) => ({
+            id: issue.id,
+            companyId: issue.companyId,
+            identifier: issue.identifier,
+          })),
+        });
+        prNonConvergenceDischarged = discharged.closed;
+      } catch (err) {
+        logger.error(
+          { err, prNumber: context.prNumber, repoFullName: context.repoFullName },
+          "pr_review_non_convergence auto-discharge on PR close failed",
+        );
+      }
+    }
+
     if (matched.length === 0) {
       respond(200, {
         ok: true,
         ignored: "no_matching_issue",
         identifiers: context.identifiers,
+        // PEN-3397: same reasoning as `reviewerWakeFired` below -- the
+        // discharge now runs above this gate, so this exit is a path on which
+        // it can have fired. Reporting it only on the main response would make
+        // exactly the previously-linked-only delivery this block was hoisted to
+        // serve the one delivery whose outcome is invisible.
+        ...(prNonConvergenceDischarged > 0 ? { prNonConvergenceDischarged } : {}),
         // BLO-23893: `reviewerWakeFired` is computed for EVERY delivery but
         // used to be reported only on the two `no_paperclip_identifier`
         // exits. That was invisible until the BLO-20886 owning-union fix
@@ -5917,10 +6000,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       });
       return;
     }
-    const heartbeat = heartbeatService(db, {
-      pluginWorkerManager: config.pluginWorkerManager,
-      ...config.heartbeatOptions,
-    });
+    const heartbeat = getHeartbeat();
     const wakes: Array<{ issueIdentifier: string | null; agentId: string }> = [];
     const skipped: Array<{ issueIdentifier: string | null; reason: string }> = [];
     const reopened: Array<{ issueIdentifier: string | null; commentId: string | null }> = [];
@@ -6022,55 +6102,6 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           "foreign-commit notice wake failed (non-fatal)",
         );
         skipped.push({ issueIdentifier: notice.issueIdentifier, reason: "foreign_commit_wake_threw" });
-      }
-    }
-
-    let recoveryInstance: ReturnType<typeof recoveryService> | null = null;
-    const getRecovery = () =>
-      (recoveryInstance ??= recoveryService(db, { enqueueWakeup: heartbeat.wakeup }));
-
-    // PEN-3397: a closed PR discharges any `pr_review_non_convergence` action
-    // raised against it. Gated on the `closed` action rather than on
-    // `prMerged === true` like the merged-PR forward-capture above, because a PR
-    // closed WITHOUT merging ends the self-review loop just as conclusively as a
-    // merge — abandoned or superseded, there is still no author left to unstick.
-    //
-    // Sits here rather than beside its sibling PR-close handlers purely because
-    // `getRecovery` (and the `heartbeat` it closes over) are declared above this
-    // line and not above those.
-    //
-    // Candidate set is deliberately wide (`pullRequestWorkProductTargets`, i.e.
-    // matched ∪ previously-linked): the service matches on a fingerprint built
-    // from `(issue.id, repoFullName, prNumber)`, so an issue that merely mentions
-    // this PR cannot match, while an issue whose body no longer names the PR is
-    // still reached through the previously-linked half.
-    //
-    // Best-effort, mirroring the forward-capture and work-product blocks: this
-    // must never break the wake path.
-    let prNonConvergenceDischarged = 0;
-    if (
-      eventName === "pull_request" &&
-      context.prAction === "closed" &&
-      context.prNumber !== null &&
-      pullRequestWorkProductTargets.length > 0
-    ) {
-      try {
-        const discharged = await getRecovery().closePrReviewNonConvergenceForClosedPr({
-          repoFullName: context.repoFullName,
-          prNumber: context.prNumber,
-          merged: context.prMerged === true,
-          candidateIssues: pullRequestWorkProductTargets.map((issue) => ({
-            id: issue.id,
-            companyId: issue.companyId,
-            identifier: issue.identifier,
-          })),
-        });
-        prNonConvergenceDischarged = discharged.closed;
-      } catch (err) {
-        logger.error(
-          { err, prNumber: context.prNumber, repoFullName: context.repoFullName },
-          "pr_review_non_convergence auto-discharge on PR close failed",
-        );
       }
     }
 

@@ -4198,6 +4198,84 @@ describeEmbeddedPostgres("github-webhook route", () => {
       expect(rows[0]?.updatedAt.getTime()).toBe(afterNewerSync?.updatedAt.getTime());
     });
 
+    it("discharges a pr_review_non_convergence action on a close whose issue link is previously-linked only (PEN-3397)", async () => {
+      // Regression pin for the reachability defect caught in review on PR#1967.
+      // The discharge used to sit BELOW the `matched.length === 0` gate, so this
+      // delivery -- identifier removed from the payload, issue reachable only
+      // through the persisted work-product link -- returned at that gate and
+      // never ran it. Every other test for this feature calls the service
+      // directly, which is exactly why a dead call site passed a green suite.
+      // This one goes through the route.
+      const { companyId, agentId, issueId } = await seedIssueWithIdentifier("BLO-40011");
+      const app = buildApp();
+      const prNumber = 4252;
+
+      // Link the PR while the identifier is still present.
+      await postPr(
+        app,
+        prPayload({ action: "opened", identifier: "BLO-40011", number: prNumber }),
+        "wp-nonconv-1",
+      );
+
+      // `escalated`, not `active`: that is the state the stuck production
+      // population was actually in, and it is non-terminal by design.
+      await db.insert(issueRecoveryActions).values({
+        companyId,
+        sourceIssueId: issueId,
+        kind: "pr_review_non_convergence",
+        status: "escalated",
+        ownerType: "agent",
+        ownerAgentId: agentId,
+        cause: "self_review_pr_non_convergence",
+        fingerprint: `pr_review_non_convergence:${issueId}:Blockcast/paperclip:${prNumber}`,
+        evidence: { repoFullName: "Blockcast/paperclip", prNumber, cycleCount: 3 },
+        nextAction: "Take over the PR, unblock or reassign the author.",
+      });
+
+      const closeWithoutIdentifier = await postPr(
+        app,
+        prPayload({
+          action: "closed",
+          identifier: "no-ticket",
+          number: prNumber,
+          title: "Retitled without paperclip id",
+          merged: true,
+          headSha: "merge-nonconv",
+        }),
+        "wp-nonconv-2",
+      );
+
+      // Still the `no_matching_issue` exit -- the hoist did not change which
+      // exit this delivery takes, only what runs before it.
+      expect(closeWithoutIdentifier.status).toBe(200);
+      expect(closeWithoutIdentifier.body).toMatchObject({
+        ignored: "no_matching_issue",
+        prNonConvergenceDischarged: 1,
+      });
+
+      const actions = await db
+        .select({
+          status: issueRecoveryActions.status,
+          outcome: issueRecoveryActions.outcome,
+          resolutionNote: issueRecoveryActions.resolutionNote,
+        })
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+      expect(actions).toHaveLength(1);
+      // Merged -> `resolved`/`restored`: the flagged condition genuinely cleared.
+      expect(actions[0]?.status).toBe("resolved");
+      expect(actions[0]?.outcome).toBe("restored");
+      expect(actions[0]?.resolutionNote).toContain(`PR #${prNumber} merged`);
+
+      // The source issue's status is never written by the discharge.
+      const issueRow = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(issueRow?.status).toBe("in_progress");
+    });
+
     it("does not refresh updatedAt for an exact webhook redelivery", async () => {
       const { issueId } = await seedIssueWithIdentifier("BLO-40010");
       const app = buildApp();

@@ -15008,6 +15008,11 @@ export function recoveryService(
           // issue is done, and moving it here would silently complete work whose
           // Done-when nobody evaluated.
           status: input.merged ? "resolved" : "cancelled",
+          // `cancelled` is restricted to board actors on the REST surface
+          // (`routes/issues.ts` -> `assertBoard`). That gate scopes who may
+          // *assert* an action failed, and this is a system-initiated discharge
+          // acting on an observed GitHub event rather than an agent's judgement,
+          // so it deliberately does not go through it.
           outcome: input.merged ? "restored" : "cancelled",
           resolutionNote,
         });
