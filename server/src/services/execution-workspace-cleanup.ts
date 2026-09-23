@@ -180,8 +180,10 @@ export function executionWorkspaceCleanupService(db: Db) {
    * One sweep: backfill, then collect everything already eligible.
    *
    * Safe to run concurrently with itself only in the sense that a double
-   * `git worktree remove` of the same path is idempotent; the sweep is driven
-   * from the single scheduler tick, so it is not designed for fan-out.
+   * `git worktree remove` of the same path is idempotent; it is not designed
+   * for fan-out. The scheduler in index.ts single-flights it across ticks via
+   * `executionWorkspaceCollectorInFlight` (a pass can outlive the interval),
+   * so overlapping passes do not occur from that caller.
    */
   async function reconcileExecutionWorkspaceCleanup(opts?: {
     companyId?: string;

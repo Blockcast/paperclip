@@ -907,6 +907,141 @@ describe("startServer feedback export wiring", () => {
     }
   });
 
+  // BLO-22984: `executionWorkspaceCollectorInFlight` single-flights the
+  // collector across ticks. A pass walks up to 50 candidates serially, each
+  // costing an `fs.stat` plus up to three `runGit` calls at a 30 s timeout,
+  // against a 30 s tick, so a pass routinely outlives the interval. Two
+  // overlapping passes are mostly benign (double `git worktree remove` is
+  // idempotent) except that the trailing pass's `deferCandidate` can land on a
+  // row the leading pass already archived, corrupting the `retained_%` census.
+  // The test above proves the collector runs periodically but cannot tell a
+  // latched implementation from an unlatched one; this parks the first pass
+  // and fires a second tick underneath it.
+  it("does not start a second execution-workspace collector pass while the first is still in flight", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    const idleCollect = { stamped: 0, scanned: 0, collected: 0, skipped: 0, failed: 0 };
+    let releaseCollector: (() => void) | null = null;
+    try {
+      await startServer();
+      // Drain the startup pass first: it holds the same latch, and a tick that
+      // fires while it is pending early-returns anyway (see the tail test below).
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalledTimes(1));
+      await vi.waitFor(() =>
+        expect(executionWorkspaceCleanupServiceMock.reconcileExecutionWorkspaceCleanup).toHaveBeenCalledTimes(1));
+      executionWorkspaceCleanupServiceMock.reconcileExecutionWorkspaceCleanup.mockClear();
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockClear();
+
+      // Park the first periodic pass so it is still in flight when the next
+      // tick fires.
+      executionWorkspaceCleanupServiceMock.reconcileExecutionWorkspaceCleanup.mockImplementationOnce(
+        () => new Promise((resolve) => {
+          releaseCollector = () => resolve(idleCollect);
+        }),
+      );
+
+      intervalCallback?.();
+      await vi.waitFor(() =>
+        expect(executionWorkspaceCleanupServiceMock.reconcileExecutionWorkspaceCleanup).toHaveBeenCalledTimes(1));
+
+      // Second tick, first still parked. Pre-latch this started a concurrent
+      // pass. `reconcileStrandedAssignedIssues` sits below the collector in the
+      // tick, so its second call proves the tick got past the collector site.
+      intervalCallback?.();
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalledTimes(2));
+      expect(executionWorkspaceCleanupServiceMock.reconcileExecutionWorkspaceCleanup).toHaveBeenCalledTimes(1);
+
+      // Once it drains, a later tick can run it again. Macrotask hops: the
+      // first lets the two ticks above finish against the still-held latch, the
+      // second lets the release's `.finally` clear it before the next fire.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(executionWorkspaceCleanupServiceMock.reconcileExecutionWorkspaceCleanup).toHaveBeenCalledTimes(1);
+      releaseCollector?.();
+      releaseCollector = null;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      intervalCallback?.();
+      await vi.waitFor(() =>
+        expect(executionWorkspaceCleanupServiceMock.reconcileExecutionWorkspaceCleanup).toHaveBeenCalledTimes(2));
+    } finally {
+      releaseCollector?.();
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  // BLO-22984: the startup collector must not be awaited inside the startup
+  // recovery chain. `heartbeatStartupRecoveryPending` clears only in that
+  // chain's `.finally`, and the tick early-returns on it above the runtime
+  // status sweep, crash reconciliation, the stale-lock sweeper and everything
+  // below - so an inline `await` on a collector stuck in git or a hung mount
+  // suspended all periodic recovery for as long as it took. Park the STARTUP
+  // call and prove a tick still runs its passes underneath it.
+  it("does not hold periodic recovery on a slow startup execution-workspace collector", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    const idleCollect = { stamped: 0, scanned: 0, collected: 0, skipped: 0, failed: 0 };
+    let releaseStartupCollector: (() => void) | null = null;
+    // The first call is the startup pass; park it before the server starts.
+    executionWorkspaceCleanupServiceMock.reconcileExecutionWorkspaceCleanup.mockImplementationOnce(
+      () => new Promise((resolve) => {
+        releaseStartupCollector = () => resolve(idleCollect);
+      }),
+    );
+    try {
+      await startServer();
+      await vi.waitFor(() =>
+        expect(executionWorkspaceCleanupServiceMock.reconcileExecutionWorkspaceCleanup).toHaveBeenCalledTimes(1));
+      expect(releaseStartupCollector).not.toBeNull();
+
+      // Fire ticks until one gets past the pending gate. The gate clears in the
+      // chain's `.finally`, which is a few microtasks behind the collector call
+      // above; firing inside `waitFor` absorbs that. With the collector awaited
+      // inline the gate never clears while it is parked and this times out.
+      await vi.waitFor(() => {
+        intervalCallback?.();
+        expect(heartbeatServiceMock.sweepExpiredRuntimeStatuses).toHaveBeenCalled();
+      });
+      // The parked startup pass holds the collector latch, so no tick fired
+      // above started a second pass under it. The macrotask hop lets every
+      // fired tick finish first, so this is a count over completed ticks.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(executionWorkspaceCleanupServiceMock.reconcileExecutionWorkspaceCleanup).toHaveBeenCalledTimes(1);
+
+      // Released, the latch clears (second hop) and the next tick collects
+      // again: 1 after startup, 2 after one tick, as the test above pins.
+      releaseStartupCollector?.();
+      releaseStartupCollector = null;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      intervalCallback?.();
+      await vi.waitFor(() =>
+        expect(executionWorkspaceCleanupServiceMock.reconcileExecutionWorkspaceCleanup).toHaveBeenCalledTimes(2));
+    } finally {
+      releaseStartupCollector?.();
+      setIntervalSpy.mockRestore();
+    }
+  });
+
   // BLO-20822: a startup-only pass misses a lease left by a recoverer that
   // died mid-cleanup on this replica's own previous life — a replica that
   // restarts immediately runs its startup pass before that lease expires and
