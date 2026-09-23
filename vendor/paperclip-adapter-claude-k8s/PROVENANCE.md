@@ -167,16 +167,18 @@ upstream**, so they are enumerated here rather than left implicit.
 
 The per-patch log lives in [PROVENANCE-CHANGES.md](./PROVENANCE-CHANGES.md),
 a separate file so that concurrent PRs appending to it do not conflict
-(BLO-34872). It is excluded from the integrity hash below.
+(BLO-34872).
 
 The two cherry-picked commits in the composition above remain upstream commits
 authored against the fork, not Blockcast-local patches.
 
 Future changes to this directory are ordinary in-tree changes to this
 repository: edit, open a PR, let CI run. There is no longer an external fork to
-push to first, and `CLAUDE_K8S_REF` no longer exists. **Any change here must
-update the integrity hash in the same PR** — CI fails the `vendor_claude_k8s`
-job otherwise, and prints the expected value.
+push to first, and `CLAUDE_K8S_REF` no longer exists. There is no integrity
+hash to update (see [Integrity](#integrity)). What gates a vendored change now
+is a row appended to [PROVENANCE-CHANGES.md](./PROVENANCE-CHANGES.md):
+`scripts/check-vendored-provenance-log.mjs`, run from the `policy` job, fails
+any PR that touches vendored source without one.
 
 ### Versioning
 
