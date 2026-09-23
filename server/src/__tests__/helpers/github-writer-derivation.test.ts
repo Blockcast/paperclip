@@ -176,6 +176,17 @@ describe("server GitHub writer derivation (PEN-3391)", () => {
       expect(isSuspectedGitHubWriter(source)).toBe(true);
     });
 
+    it("a capitalised safe literal in prose does not cancel an unpinned write", () => {
+      // SAFE_READ_METHOD is case-insensitive, so `Method: "GET"` in a comment is
+      // a safe hit. Unless the mention count is case-insensitive too, that hit
+      // has no matching mention and offsets the real write below.
+      const source = `import { ghFetch } from "./github-fetch.js";
+        /** Method: "GET" is the default. */
+        await ghFetch(url, { method: verb, headers, body });`;
+      expect(declaresOnlySafeReadMethods(source)).toBe(false);
+      expect(isSuspectedGitHubWriter(source)).toBe(true);
+    });
+
     it("classifies an ambiguous mention as a writer rather than a read", () => {
       // Documenting the accepted false-positive direction. This file is a read,
       // and the predicate calls it a writer because it says "method" in prose.

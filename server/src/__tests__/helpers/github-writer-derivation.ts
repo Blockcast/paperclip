@@ -53,9 +53,10 @@ import path from "node:path";
  *   of the word `method` is a quoted safe-verb literal.
  *
  * The cost of that inversion is false POSITIVES: a candidate that merely says
- * "method" in a comment, or names a variable `methodName`, is classified as a
- * writer and must carry the scrub. That is deliberate. A false positive is one
- * legible test failure naming the file; a false negative is an unscrubbed
+ * "method" in a comment, or uses `method` as a bare identifier
+ * (`const method = pick()`), is classified as a writer and must carry the
+ * scrub. That is deliberate. A false positive is one legible test failure
+ * naming the file; a false negative is an unscrubbed
  * credential on a public commit status. It costs nothing today — of the nine
  * files under `server/src` that reference `ghFetch`, the word `method` appears
  * in exactly the two that do write, and both already scrub.
@@ -85,8 +86,12 @@ import path from "node:path";
  */
 const GH_FETCH_REFERENCE = /\bghFetch\b/;
 
-/** Every mention of the word, whatever its shape. */
-const METHOD_WORD = /\bmethod\b/g;
+/**
+ * Every mention of the word, whatever its shape or case. Must match
+ * SAFE_READ_METHOD's case-insensitivity, or a capitalised safe literal credits a
+ * safe hit with no matching mention and cancels a real write.
+ */
+const METHOD_WORD = /\bmethod\b/gi;
 
 /**
  * The only shape that proves a `method` is a read: a quoted literal naming a
