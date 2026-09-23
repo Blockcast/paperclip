@@ -134,7 +134,13 @@ describeEmbeddedPostgres("issue recovery action legacy wake bounds migration", (
       maxAttempts: null,
       wakePolicyType: "wake_owner",
     });
-    // Already bounded: the backfill must not overwrite a live budget.
+    // Already bounded: the backfill must not overwrite a live budget. The null
+    // `timeout_at` asserted for this row below is NOT an accepted residual — it
+    // guards against an over-broad match. No producer can mint `max_attempts`
+    // non-null alongside a null `timeout_at`: both creation sites take the pair
+    // from one `recoveryActionBoundsAtCreation` object
+    // (`recovery/service.ts:5954-5955` and `:14906`), so the two columns are
+    // always written together or not at all.
     const alreadyBounded = await seed("D", {
       status: "active",
       maxAttempts: 3,
