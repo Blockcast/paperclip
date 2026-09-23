@@ -67,6 +67,33 @@ function dispositioningReview(headSha: string, priorHeadSha: string, disposition
   ]);
 }
 
+/**
+ * A blocking review raising `findingCount` findings, so a later ledger can
+ * carry a distinct unrecognized verb against each one.
+ */
+function blockingReviewWithFindings(headSha: string, findingCount: number): string {
+  return reviewBody(headSha, [
+    "### Critical Issues (0)",
+    `### Important Issues (${findingCount})`,
+    ...Array.from({ length: findingCount }, (_, i) => `- Finding ${i + 1} on this head.`),
+    "### Recommended Action",
+    "Fix the gate before merge.",
+  ]);
+}
+
+/** A clean review whose ledger dispositions finding `i` with `verbs[i]`. */
+function multiDispositionReview(headSha: string, priorHeadSha: string, verbs: string[]): string {
+  return reviewBody(headSha, [
+    `### Prior Findings Dispositioned (${verbs.length})`,
+    ...verbs.map(
+      (verb, i) =>
+        `- **prior:${priorHeadSha.slice(0, 7)} important ${i + 1}** — ${verb} — re-checked against this head.`,
+    ),
+    "### Critical Issues (0)",
+    "### Important Issues (0)",
+  ]);
+}
+
 describe("evaluateCommentReviewGate", () => {
   it("fails the #1022 shape: an Ally comment finding for the current head", () => {
     const verdict = evaluateCommentReviewGate({
@@ -468,6 +495,161 @@ describe("evaluateCommentReviewGate", () => {
     expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
     expect(verdict.reason).toContain('unrecognized ledger verb "deferred"');
     expect(verdict.reason).toContain(OLD_HEAD.slice(0, 7));
+  });
+
+  // BLO-34742. Each clause was covered alone, and only the combination reaches
+  // the branch that dropped one. An author who is both ledger-malformed and
+  // self-attested was told about the verb and nothing about why the comment
+  // they just posted did not count — the half they are least placed to guess.
+  it("renders both the unrecognized verb and why the attestation did not count", () => {
+    const comments = [
+      allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+      allyComment(
+        dispositioningReview(INTERMEDIATE_HEAD, OLD_HEAD, "deferred"),
+        "2026-08-04T21:09:19Z",
+      ),
+      allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T22:09:19Z"),
+    ];
+
+    const cases = [
+      [
+        evaluateCommentReviewGate({
+          headSha: CURRENT_HEAD,
+          prAuthorLogin: ALLY_BOT_LOGIN,
+          comments,
+        }),
+        /the only comment attesting it is the PR author's own/i,
+      ],
+      [
+        evaluateCommentReviewGate({ headSha: CURRENT_HEAD, prAuthorLogin: null, comments }),
+        /its only attestation is not known to be independent/i,
+      ],
+    ] as const;
+
+    for (const [verdict, tail] of cases) {
+      expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+      expect(verdict.reason).toContain('unrecognized ledger verb "deferred"');
+      expect(verdict.reason).toMatch(tail);
+      // The sentence this branch used to end on, and the one that invites the
+      // author to repeat the action that cannot clear a carried finding.
+      expect(verdict.reason).not.toMatch(/no comment attests the current head/i);
+      // `verdict.reason` is written to the commit-status description verbatim,
+      // and GitHub truncates at 140 — an overflow silently cuts the tail, which
+      // is the defect rather than a cosmetic issue.
+      expect(verdict.reason.length).toBeLessThanOrEqual(140);
+    }
+  });
+
+  it("drops a whole verb rather than cutting one in half when the list overflows", () => {
+    // Plural lead (64) + self-attested tail (55) leaves the verb list 21
+    // characters. `"deferred", "pendings"` is 22, so it cannot be rendered
+    // whole — and slicing the JOINED string at 21 yields `"deferred",
+    // "pendings`, which names a verb that is not in the ledger and leaves the
+    // quote open. The author cannot act on either.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [
+        allyComment(blockingReviewWithFindings(OLD_HEAD, 2), "2026-08-04T20:09:19Z"),
+        allyComment(
+          multiDispositionReview(INTERMEDIATE_HEAD, OLD_HEAD, ["deferred", "pendings"]),
+          "2026-08-04T21:09:19Z",
+        ),
+        allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T22:09:19Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    expect(verdict.reason.length).toBeLessThanOrEqual(140);
+    // The verb that fits is rendered whole, and the one that does not is
+    // marked — an author who fixed only what was shown would otherwise
+    // re-push into this same red, which is the loop the tail exists to close.
+    expect(verdict.reason).toContain('"deferred", …');
+    // Every quote closes. This is the invariant, independent of which verbs
+    // the fixture happens to use: a cut inside a token leaves an odd count.
+    expect((verdict.reason.match(/"/g) ?? []).length % 2).toBe(0);
+    // The tail still survives the trim — that is what the budget is for.
+    expect(verdict.reason).toMatch(/the only comment attesting it is the PR author's own/i);
+  });
+
+  it("returns a first verb that fits whole instead of slicing through its closing quote", () => {
+    // Budget 21 (plural lead + self-attested tail). `"not-yet-evaluated"` is
+    // exactly 19 characters = budget - 2: the elide fallback's guard fires
+    // (19 + 3 > 21) and its slice(0, budget - 2) takes the whole entry INCLUDING
+    // its closing quote, then appends `…"` -- three quotes, and a complete
+    // name marked as truncated while the second verb vanishes unmarked. The
+    // entry fits the budget on its own, so it is rendered whole.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [
+        allyComment(blockingReviewWithFindings(OLD_HEAD, 2), "2026-08-04T20:09:19Z"),
+        allyComment(
+          multiDispositionReview(INTERMEDIATE_HEAD, OLD_HEAD, ["not-yet-evaluated", "pending"]),
+          "2026-08-04T21:09:19Z",
+        ),
+        allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T22:09:19Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    expect(verdict.reason.length).toBeLessThanOrEqual(140);
+    expect(verdict.reason).toContain('"not-yet-evaluated"');
+    expect(verdict.reason).not.toContain('not-yet-evaluated"…"');
+    expect((verdict.reason.match(/"/g) ?? []).length % 2).toBe(0);
+    expect(verdict.reason).toMatch(/the only comment attesting it is the PR author's own/i);
+  });
+
+  it("renders both verbs whole when the list fits the budget exactly", () => {
+    // The control for the case above: `"deferred", "pending"` is exactly the
+    // 21 characters available, so nothing is dropped and no marker appears.
+    // Without this, a fix that always elided would pass the overflow test.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [
+        allyComment(blockingReviewWithFindings(OLD_HEAD, 2), "2026-08-04T20:09:19Z"),
+        allyComment(
+          multiDispositionReview(INTERMEDIATE_HEAD, OLD_HEAD, ["deferred", "pending"]),
+          "2026-08-04T21:09:19Z",
+        ),
+        allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T22:09:19Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    expect(verdict.reason).toContain('"deferred", "pending"');
+    expect(verdict.reason).not.toContain("…");
+    expect(verdict.reason.length).toBeLessThanOrEqual(140);
+  });
+
+  it("trims the verb list rather than letting the tail overflow the 140-char cap", () => {
+    // The ledger verb is unbounded in length (`[a-z][a-z-]*`), so the fixed
+    // prose plus the longest tail is what the verb list has to be budgeted
+    // against — not the standalone verb cap, which on its own overflows here.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+        allyComment(
+          dispositioningReview(INTERMEDIATE_HEAD, OLD_HEAD, "d".repeat(80)),
+          "2026-08-04T21:09:19Z",
+        ),
+        allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T22:09:19Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    expect(verdict.reason.length).toBeLessThanOrEqual(140);
+    // Trimmed, not dropped: both clauses still reach the author.
+    expect(verdict.reason).toContain('unrecognized ledger verb "dddd');
+    // A single verb longer than the whole budget cannot be cut at an entry
+    // boundary, so it is elided INSIDE its quotes — it still reads as
+    // truncated and still closes, rather than the lead rendering bare.
+    expect(verdict.reason).toContain('…"');
+    expect((verdict.reason.match(/"/g) ?? []).length % 2).toBe(0);
+    expect(verdict.reason).toMatch(/the only comment attesting it is the PR author's own/i);
   });
 
   it("keeps the ordinary reason when no unrecognized verb is involved", () => {
@@ -1112,6 +1294,12 @@ describe("extractAllyReviewedHeadSha — attestation delimiters", () => {
 // cannot be deleted, the pre-rename rows have to be superseded in place.
 describe("retired context supersede", () => {
   const LIVE = "gate/ally-comment-findings";
+  // The retirement row is rendered from the whole verdict, not just its state:
+  // `clean` and `not_evaluated` share `success` and must not share wording
+  // (BLO-34742).
+  const CLEAN_VERDICT = { state: "success", outcome: "clean" } as const;
+  const NOT_EVALUATED_VERDICT = { state: "success", outcome: "not_evaluated" } as const;
+  const BLOCKING_VERDICT = { state: "failure", outcome: "blocking_finding" } as const;
 
   it("excludes the live context so a retirement pointer cannot overwrite a real verdict", () => {
     expect(retiredCommentReviewGateContexts(["review/ally-comment", LIVE], LIVE)).toEqual([
@@ -1132,7 +1320,7 @@ describe("retired context supersede", () => {
   });
 
   it("points at the live context without claiming anything about review", () => {
-    const description = commentReviewGateRetirementDescription(LIVE);
+    const description = commentReviewGateRetirementDescription(LIVE, CLEAN_VERDICT);
 
     expect(description).toContain(LIVE);
     // Asserted against the census's own predicate rather than a copy of its
@@ -1165,37 +1353,69 @@ describe("retired context supersede", () => {
   });
 
   it("mirrors a clean live verdict rather than inventing a state", () => {
-    for (const outcome of ["clean", "not_evaluated"] as const) {
-      const retirement = commentReviewGateRetirementStatus(LIVE, { state: "success", outcome });
+    const retirement = commentReviewGateRetirementStatus(LIVE, CLEAN_VERDICT);
 
-      expect(retirement.state).toBe("success");
-      expect(admitsNothingEvaluated(retirement.description)).toBe(false);
-    }
+    expect(retirement.state).toBe("success");
+    expect(admitsNothingEvaluated(retirement.description)).toBe(false);
+  });
+
+  // BLO-34742. `clean` and `not_evaluated` both publish `success`, so a
+  // retirement row rendered from the state alone said "findings now publish
+  // elsewhere" on a head nothing reviewed — green, `review/`-namespaced, and
+  // worded past the one predicate that would have counted it. The row always
+  // was a fail-open green; the census simply could not see it. Note the mirror
+  // stays `success`: this makes the row visible to the audit, it does not block
+  // anything (BLO-29711).
+  it("admits nothing was evaluated when the live verdict is not-evaluated", () => {
+    const retirement = commentReviewGateRetirementStatus(LIVE, NOT_EVALUATED_VERDICT);
+
+    expect(retirement.state).toBe("success");
+    // Against the census's own predicate, not a copy of its regex — and
+    // deliberately without a new alternative for the retirement pointer being
+    // added there (BLO-32695: the gate owns the wording, so the gate is where
+    // it is made honest). The census's existing "no … comment attests"
+    // alternative does gain an optional `independent`, but that tracks the
+    // wording of a LIVE reason string the census already matched; it is not a
+    // pattern taught to recognise retirement prose.
+    expect(admitsNothingEvaluated(retirement.description)).toBe(true);
+    expect(retirement.description).toContain(LIVE);
+    // The qualifier is load-bearing, not decoration: `not_evaluated` covers the
+    // self-attested and author-unknown routes, where a comment DOES attest this
+    // head. An unqualified "no comment attests" is false there and invites the
+    // author to post another one.
+    expect(retirement.description).toContain("No independent");
   });
 
   it("keeps the pointer intact within GitHub's 140-character description limit", () => {
     // GitHub truncates at 140. The context name is the whole point of the
     // pointer, so it must survive rather than being cut mid-name.
     const longContext = `gate/${"x".repeat(120)}`;
+    const verdicts = [CLEAN_VERDICT, BLOCKING_VERDICT, NOT_EVALUATED_VERDICT] as const;
 
-    expect(commentReviewGateRetirementDescription(LIVE).length).toBeLessThanOrEqual(140);
-    expect(commentReviewGateRetirementDescription(longContext).length).toBeLessThanOrEqual(140);
-    expect(commentReviewGateRetirementDescription(LIVE, "failure").length).toBeLessThanOrEqual(140);
-    expect(
-      commentReviewGateRetirementDescription(longContext, "failure").length,
-    ).toBeLessThanOrEqual(140);
+    for (const verdict of verdicts) {
+      expect(commentReviewGateRetirementDescription(LIVE, verdict).length).toBeLessThanOrEqual(140);
+    }
 
     // Length alone was the weaker half of this promise: slicing the rendered
     // sentence also satisfies it, while severing the name and dropping the
     // closing quote — the exact "cut in half" outcome the fallback exists to
     // prevent. Assert the sentence stays well-formed: the name is elided with
     // an ellipsis and the quoted pointer still closes.
-    for (const state of ["success", "failure"] as const) {
-      const description = commentReviewGateRetirementDescription(longContext, state);
+    for (const verdict of verdicts) {
+      const description = commentReviewGateRetirementDescription(longContext, verdict);
       expect(description.length).toBeLessThanOrEqual(140);
       expect(description).toMatch(/"[^"]*…"\.$/);
       expect(description.split('"').length - 1).toBe(2);
     }
+
+    // Elision must not cost the not-evaluated admission: the census predicate
+    // is the entire point of that phrasing, and it lives in the part of the
+    // sentence the fallback shortens.
+    expect(
+      admitsNothingEvaluated(
+        commentReviewGateRetirementDescription(longContext, NOT_EVALUATED_VERDICT),
+      ),
+    ).toBe(true);
   });
 });
 

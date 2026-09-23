@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { admitsNothingEvaluated } from "../../../scripts/check-comment-review-gate-census.mjs";
+
 const h = vi.hoisted(() => ({
   cfg: {
     prCommentReviewGateStatusContext: "",
@@ -443,10 +445,9 @@ describe("retired status contexts", () => {
     return mockPostStatus.mock.calls.map(([arg]) => arg).find((arg) => arg.context === context);
   }
 
-  it("supersedes the retired context with a pointer carrying no not-evaluated claim", async () => {
+  it("supersedes the retired context with a pointer the census can count", async () => {
     // The exact pre-rename state: nothing attests the head, so the live gate
-    // legitimately goes green under `gate/`. The stale `review/` row must stop
-    // asserting that nothing reviewed the head.
+    // legitimately goes green under `gate/`.
     await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
       posted: true,
       verdict: { state: "success", outcome: "not_evaluated" },
@@ -458,11 +459,19 @@ describe("retired status contexts", () => {
     });
 
     const retired = postFor("review/ally-comment");
+    // Still green, because the retired row mirrors the live state and a red
+    // here would block a PR the live gate is deliberately not blocking
+    // (BLO-29711's anti-deadlock constraint).
     expect(retired).toMatchObject({ sha: TARGET.headSha, state: "success" });
-    // Pinned against the census's own predicate, not a copy of its regex: the
-    // copy went stale the moment the census grew a third alternative, leaving
-    // this guard narrower than the audit it exists to mirror.
-    expect(admitsNothingEvaluated(retired?.description)).toBe(false);
+    // BLO-34742. This assertion used to demand the opposite, on the reasoning
+    // that a retirement pointer matching the census pattern would "leave AC#1
+    // failing under the old name". That had it backwards: the row IS a green
+    // `review/`-namespaced status on a head nothing reviewed, so wording it
+    // past the census did not make it safe, it made it uncountable. Asserted
+    // via the census's own predicate rather than a local copy of its regex,
+    // which is how the previous version of this test drifted from the one in
+    // `pr-comment-review-gate.test.ts`.
+    expect(admitsNothingEvaluated(retired?.description)).toBe(true);
     expect(retired?.description).toContain("gate/ally-comment-findings");
     expect(retired?.description.length).toBeLessThanOrEqual(140);
   });
