@@ -6958,13 +6958,22 @@ export function issueRoutes(
         return;
       }
     }
+    const assigneeUserFilterRaw = req.query.assigneeUserId as string | undefined;
+    const assigneeUserId =
+      assigneeUserFilterRaw === "me" && req.actor.type === "board"
+        ? req.actor.userId
+        : assigneeUserFilterRaw;
+    if (assigneeUserFilterRaw === "me" && (!assigneeUserId || req.actor.type !== "board")) {
+      res.status(403).json({ error: "assigneeUserId=me requires board authentication" });
+      return;
+    }
 
     const countFilters = {
       attention: attention === "blocked" ? "blocked" as const : undefined,
       status: req.query.status as string | string[] | undefined,
       assigneeAgentId: req.query.assigneeAgentId as string | undefined,
       participantAgentId: req.query.participantAgentId as string | undefined,
-      assigneeUserId: req.query.assigneeUserId as string | undefined,
+      assigneeUserId,
       projectId: req.query.projectId as string | undefined,
       workspaceId: req.query.workspaceId as string | undefined,
       executionWorkspaceId: req.query.executionWorkspaceId as string | undefined,

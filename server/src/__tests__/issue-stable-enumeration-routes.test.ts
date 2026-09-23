@@ -214,6 +214,23 @@ describeEmbeddedPostgres("issue list stable enumeration and exact counts", () =>
     expect(res.body.count).toBe(2);
   });
 
+  it("resolves assigneeUserId=me to the board user for the exact open count", async () => {
+    const companyId = await seedCompany();
+    await db.insert(issues).values([
+      { companyId, title: "Mine todo", status: "todo", priority: "medium", assigneeUserId: "cloud-user-1" },
+      { companyId, title: "Mine todo 2", status: "todo", priority: "low", assigneeUserId: "cloud-user-1" },
+      { companyId, title: "Someone else", status: "todo", priority: "low", assigneeUserId: randomUUID() },
+      { companyId, title: "Mine done", status: "done", priority: "low", assigneeUserId: "cloud-user-1" },
+    ]);
+
+    const res = await request(createApp(companyId))
+      .get(`/api/companies/${companyId}/issues/count`)
+      .query({ status: "backlog,todo,in_progress,in_review,blocked", assigneeUserId: "me" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.count).toBe(2);
+  });
+
   it("rejects filters the general count cannot honor rather than counting a wider set", async () => {
     const companyId = await seedCompany();
     const res = await request(createApp(companyId))
