@@ -86,7 +86,17 @@ if (prefillStderr) {
     accepted = process.stderr.write(chunk);
     written += CHUNK_BYTES;
   }
-  if (accepted) throw new Error(`stderr did not report backpressure after ${written} bytes`);
+  if (accepted) {
+    // The ceiling is the one failure mode this loop adds, and it is the worst place
+    // to be heard from: stderr is by definition still accepting here, so the throw's
+    // breadcrumb joins ~8 MB of padding and the parent's stderr diagnostic recovers
+    // nothing but "P"s. Say it on stdout, which the parent drains, so this stays
+    // attributable by the same mechanism the rest of BLO-25854 is adding.
+    // Lower-case "backpressure" is deliberate: the parent's readiness match is on the
+    // exact token BACKPRESSURE, and this line must not satisfy it.
+    process.stdout.write(`FIXTURE-ERROR stderr did not report backpressure after ${written} bytes\n`);
+    throw new Error(`stderr did not report backpressure after ${written} bytes`);
+  }
 
   // Do not let child exit race the parent's stdout listener. The ack arrives
   // only after the parent has observed backpressure and started its deadline.
