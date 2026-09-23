@@ -195,6 +195,22 @@ dead_runs() { # stdin: run rows -> stdout: alternation of stale run ids
   # republished. This is "latest state wins", which is also what GitHub's own
   # required-check evaluation does; it is documented here so the next reader does
   # not mistake it for an oversight in this filter.
+  # That equivalence holds ONLY when the superseding same-lane run republishes
+  # every check-run name. Deletion here is per RUN, not per NAME, so it is a
+  # proxy for "latest state wins" that the code assumes unconditionally.
+  # Second residual, accepted: a `failure` victim whose rows include a name the
+  # later same-lane `success` run never republished (narrowed matrix,
+  # event-conditional job set) loses that verdict with no replacement. Unlike
+  # the `skipped` case above, GitHub's latest state for that context is still
+  # failure, so the direction is GREEN, not "latest state wins". Measured shape:
+  # runs 111 failure / 222 success in one pull_request lane -> DEAD=111; rows
+  # test-b failure only in run 111 -> verdicts() prints nothing, rc=0. A
+  # per-name test WOULD help here (keep a `failure` victim's rows whose name no
+  # later same-lane run republished) and is deliberately not implemented:
+  # dead_runs() never sees names, so it would move the `failure` half of the
+  # victim decision into verdicts(). How often a later same-lane run drops a
+  # name at one head is unmeasured; the mechanism is proven, the frequency is
+  # not.
   awk -F'\t' 'BEGIN { n = 0 }   # n MUST be seeded: implicit is "" , not 0
               { key = $1 FS $2
                 if ($4 == "success" && $5 > newest_pass[key]) newest_pass[key] = $5
