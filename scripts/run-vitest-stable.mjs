@@ -1,15 +1,13 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadShardDurations, selectGeneralServerShard } from "./general-server-shard.mjs";
 import {
   collectGeneralServerSuiteFiles,
-  isRouteOrAuthzTest,
-  toRepoPath as toRepoPathFromRoot,
-  walk,
+  collectSerializedServerSuiteFiles,
 } from "./run-vitest-stable-suites.mjs";
 
 const repoRoot = process.cwd();
@@ -18,7 +16,6 @@ const generalServerShardDurations = loadShardDurations(
   path.join(scriptsDir, "general-server-shard-durations.json"),
 );
 const serverRoot = path.join(repoRoot, "server");
-const serverTestsDir = path.join(repoRoot, "server", "src", "__tests__");
 // Every non-server project that CI must execute. This list is NOT derived from
 // the root vitest.config.ts `projects` array -- it is a second, independent
 // enumeration, and `--mode general` only ever runs `--project <name>` for the
@@ -69,10 +66,6 @@ const arcWorkspaceVitestArgs = [
   "--testTimeout=30000",
   "--hookTimeout=60000",
 ];
-
-function toRepoPath(file) {
-  return toRepoPathFromRoot(repoRoot, file);
-}
 
 function toServerPath(file) {
   return path.relative(serverRoot, file).split(path.sep).join("/");
@@ -225,8 +218,61 @@ function parseCliOptions(argv) {
   };
 }
 
+// Duration-aware partition of the serialized route/authz lane, mirroring the
+// general-server lane. This used to be `index % shardCount` on the sorted
+// path list, which packs by FILE COUNT: every shard got exactly 31-33 files
+// and wildly different work. Measured on run 35789886432 (4 shards, real ARC
+// job logs), per-shard test time was 892.7 / 311.4 / 1089.1 / 292.9 s --
+// 3.72x on test time, 2.62x on job wall-clock. Sorted-path adjacency is what
+// does it: the two heaviest suites in the lane (heartbeat-process-recovery
+// 444s, issues-service 251s) are 4 apart in sort order, so modulo-4 lands
+// both on the same shard. LPT over the same durations predicts 646.5 s on
+// every shard. See BLO-28956.
 function selectSerializedSuites(routeTests, shardIndex, shardCount) {
-  return routeTests.filter((_, index) => index % shardCount === shardIndex);
+  const selected = new Set(
+    selectGeneralServerShard(
+      routeTests.map((routeTest) => routeTest.repoPath),
+      shardIndex,
+      shardCount,
+      generalServerShardDurations,
+    ),
+  );
+  return routeTests.filter((routeTest) => selected.has(routeTest.repoPath));
+}
+
+const PHASE_SUMMARY_HEADER = "### Vitest phase durations";
+
+// BLO-28956: a `General tests (server N/4)` job runs TWO Vitest invocations --
+// the duration-partitioned general-server shard, then the serialized
+// route/authz shard -- and the only number anyone reads is the job's
+// wall-clock, which blends them. That is how the serialized phase sat at a
+// 2.6x imbalance for months behind a job total that looked fine. One row per
+// invocation in the job summary makes each phase legible without opening a
+// 370k-line log, so a regression in one cannot hide inside the other.
+//
+// Emitted on failure too: the phase that just blew the timeout budget is
+// exactly the one whose duration you want recorded.
+function recordPhaseDuration(label, startedAt, status) {
+  const seconds = (Date.now() - startedAt) / 1000;
+  console.log(`[test:run] phase ${status}: ${label} in ${seconds.toFixed(1)}s`);
+  const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+  if (!summaryPath) {
+    return;
+  }
+  try {
+    // The two phases of a server shard job are two separate STEPS, so this
+    // runs in two separate processes appending to the same summary file --
+    // `invocationIndex` cannot tell you whether the header is already there.
+    // Ask the file.
+    const existing = existsSync(summaryPath) ? readFileSync(summaryPath, "utf8") : "";
+    const header = existing.includes(PHASE_SUMMARY_HEADER)
+      ? ""
+      : `${PHASE_SUMMARY_HEADER}\n\n| phase | seconds | result |\n| --- | --: | --- |\n`;
+    appendFileSync(summaryPath, `${header}| \`${label}\` | ${seconds.toFixed(1)} | ${status} |\n`);
+  } catch (error) {
+    // The job summary is diagnostics. Never fail a test lane over it.
+    console.warn(`[test:run] could not write the job summary: ${error.message}`);
+  }
 }
 
 function runVitest(args, label) {
@@ -244,15 +290,18 @@ function runVitest(args, label) {
   };
   mkdirSync(env.PAPERCLIP_HOME, { recursive: true });
   mkdirSync(env.TMPDIR, { recursive: true });
+  const startedAt = Date.now();
   const result = spawnSync("pnpm", ["exec", "vitest", "run", ...args], {
     cwd: repoRoot,
     env,
     stdio: "inherit",
   });
   if (result.error) {
+    recordPhaseDuration(label, startedAt, "start-failed");
     console.error(`[test:run] Failed to start Vitest: ${result.error.message}`);
     process.exit(1);
   }
+  recordPhaseDuration(label, startedAt, result.status === 0 ? "passed" : "failed");
   if (result.status !== 0) {
     process.exit(result.status ?? 1);
   }
@@ -370,13 +419,15 @@ function runSerializedSuites(routeTests, shardIndex, shardCount) {
   );
 }
 
-const routeTests = walk(serverTestsDir)
-  .filter((file) => isRouteOrAuthzTest(toRepoPath(file)))
-  .map((file) => ({
-    repoPath: toRepoPath(file),
-    serverPath: toServerPath(file),
-  }))
-  .sort((a, b) => a.repoPath.localeCompare(b.repoPath));
+// Note this enumerates the whole server/src tree, not just server/src/__tests__
+// as it used to. The two sets are identical today; they differ the moment
+// someone colocates a `*-routes.test.ts` next to its route module, which the
+// old walk dropped from the serialized lane while isRouteOrAuthzTest kept it
+// out of the general-server one -- i.e. a suite that ran nowhere (BLO-28956).
+const routeTests = collectSerializedServerSuiteFiles(repoRoot).map((repoPath) => ({
+  repoPath,
+  serverPath: toServerPath(path.join(repoRoot, repoPath)),
+}));
 
 // Every server test file that the general-server group is responsible for,
 // i.e. the whole server project minus the route/authz suites that run in the

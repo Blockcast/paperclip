@@ -171,3 +171,75 @@ test("the real shard partition is duration-balanced", () => {
     `shard weight spread ${maxTotal - minTotal}ms exceeds heaviest suite ${heaviest}ms: ${totals.join(", ")}`,
   );
 });
+
+// ---------------------------------------------------------------------------
+// The serialized route/authz lane -- phase 2 of every `General tests (server
+// N/4)` job. BLO-28956.
+// ---------------------------------------------------------------------------
+
+function serializedShards() {
+  return Array.from({ length: SHARD_COUNT }, (_, index) =>
+    dryRunJson(["--mode", "serialized", "--shard-index", String(index), "--shard-count", String(SHARD_COUNT)]),
+  );
+}
+
+test("the serialized shards form a complete, non-overlapping partition", () => {
+  const shards = serializedShards();
+  const total = shards[0].serializedSuiteCount;
+  assert.ok(total > 0, "expected a non-empty serialized suite set");
+
+  const seen = new Set();
+  for (const shard of shards) {
+    assert.equal(shard.serializedSuiteCount, total, "suite count must be stable across shards");
+    for (const file of shard.selectedSerializedSuites) {
+      assert.ok(!seen.has(file), `suite assigned to more than one shard: ${file}`);
+      seen.add(file);
+    }
+  }
+  assert.equal(seen.size, total, "union of shards must cover the whole serialized suite set");
+});
+
+// This assertion is the reason BLO-28956 exists, and it is deliberately in two
+// halves -- the balance bound is worthless without the coverage guard under it.
+//
+// Phase 2 used to be split by `index % shardCount`, i.e. by FILE COUNT. That
+// looked fair (31-33 files everywhere) and was not: measured on run
+// 35789886432, per-shard test time was 892.7 / 311.4 / 1089.1 / 292.9 s, a
+// 3.72x spread, because the two heaviest suites in the lane sort four apart
+// and modulo-4 therefore lands both on the same shard. Against that tree this
+// assertion fails by 796s vs a 444s bound.
+//
+// The coverage half is what stops it from passing VACUOUSLY. With no
+// serialized entries in the manifest every suite takes the median fallback,
+// under which ANY equal-count split -- including the broken modulo one --
+// scores a perfect zero spread. A balance assertion over synthetic uniform
+// weights proves nothing at all, which is the trap BLO-24241 hit from the
+// other side. So: require that most of the lane is really measured first.
+test("the serialized shard partition is duration-balanced against real measurements", () => {
+  const durations = loadShardDurations(durationsManifest);
+  const shards = serializedShards();
+  const allFiles = shards.flatMap((shard) => shard.selectedSerializedSuites);
+
+  const { missing, coverage } = evaluateManifestFreshness({ files: allFiles, durations });
+  if (missing.length > 0) {
+    console.warn(formatMissingSuitesDiagnostic({ missing, coverage, totalSuites: allFiles.length }));
+  }
+  assert.ok(
+    coverage >= HARD_FAIL_COVERAGE_FLOOR,
+    `serialized-lane manifest coverage ${(coverage * 100).toFixed(1)}% is below ${HARD_FAIL_COVERAGE_FLOOR * 100}% — ` +
+      "the balance bound below would pass vacuously on median fallbacks (see the manifest's $comment)",
+  );
+
+  const fallback = defaultSuiteWeight(durations);
+  const totals = shards.map((shard) =>
+    shard.selectedSerializedSuites.reduce((sum, file) => sum + (durations[file] ?? fallback), 0),
+  );
+  // Same bound as the general-server lane: LPT cannot do better than the
+  // heaviest indivisible suite, and must not do worse.
+  const heaviest = Math.max(...allFiles.map((file) => durations[file] ?? fallback));
+  assert.ok(
+    Math.max(...totals) - Math.min(...totals) <= heaviest,
+    `serialized shard weight spread ${Math.max(...totals) - Math.min(...totals)}ms exceeds heaviest suite ` +
+      `${heaviest}ms: ${totals.join(", ")}`,
+  );
+});
