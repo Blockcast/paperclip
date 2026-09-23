@@ -155,6 +155,13 @@ export async function handleRecoveryApiRequest(
         return recoveryFailureResponse();
       }
       const fences = await listAggregateFiringFences(ctx, input.companyId);
+      // `recover` audits through the activity log; this read does not, because
+      // an activity row per diagnostic poll is noise. A debug line still makes
+      // the read attributable the next time fence behaviour is investigated.
+      // Never log the fence rows themselves — they carry the firing token.
+      ctx.logger.debug(
+        `Alertmanager aggregate fence listing read by ${input.actor.actorType} ${input.actor.actorId} for company ${input.companyId}: ${fences.length} fence(s)`,
+      );
       return {
         headers: { "cache-control": "no-store" },
         body: {
