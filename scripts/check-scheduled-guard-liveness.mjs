@@ -599,6 +599,22 @@ function countQueued(repo, workflow) {
  * also returns null rather than falling through to an older run: null merely
  * withholds corroboration (the red stands), whereas selecting some other run
  * would answer a different question than the one asked.
+ *
+ * STATED, because this file's own thesis is that unstated assumptions are what
+ * cost four false positives: relying on `created_at` DESC is itself trust in
+ * server-side ordering — the same CLASS of assumption PEN-3379 falsified for
+ * the filtered index. These two reads differ only on the filter axis, and the
+ * root cause is recorded there as unestablished, so nothing here proves the
+ * unfiltered page is ordered any more reliably than the filtered one was.
+ *
+ * What makes it tolerable is the direction it fails in, not confidence that it
+ * holds. A mis-ordered page hands back an OLDER completion than the true
+ * newest, which reads as "no corroboration" — and this function's corroboration
+ * is only ever used to weaken a red. So the failure mode is a red that stands
+ * when it might have been suppressed, never a mute. The assumption is load-
+ * bearing for precision and NOT for safety; if it breaks, the detector gets
+ * noisier, not quieter. That asymmetry is why this is a `find` over an ordering
+ * assumption rather than a `max` over none.
  */
 export function selectNewestCompleted(runs) {
   const newest = (runs ?? []).find((run) => run?.status === "completed" && run.updated_at);
