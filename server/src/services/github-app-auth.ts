@@ -1171,6 +1171,68 @@ export function scrubOutboundGitHubText(value: string, field: string): string {
 }
 
 /**
+ * Guard an **identity** field bound for GitHub: refuse the write rather than
+ * redact it (PEN-3391).
+ *
+ * ## Why identity fields are not scrubbed like prose
+ *
+ * `scrubOutboundGitHubText` redacts and proceeds. That is right for prose — a
+ * commit-status `description`, a check-run `summary` — where a redacted string
+ * is a degraded but still-serviceable version of the same message.
+ *
+ * It is wrong for a field that is a NAME. A commit status is addressed by
+ * `(repo, sha, context)` and a check-run by `(repo, sha, name)`; those values
+ * are what branch protection matches a required check against, what
+ * `githubGetLatestCommitStatusForContext` filters on, and what the delivery
+ * outbox keys its upsert on. Redacting one does not degrade the identity, it
+ * substitutes a DIFFERENT one. The status would be published under a name
+ * nothing looks up: branch protection would go on waiting for a context that
+ * will never arrive, the outbox would key its row on the unredacted value it
+ * was handed, and the gate would be unable to observe its own status. That is a
+ * silent gate-liveness failure — the control stays green while the thing it
+ * gates is stuck.
+ *
+ * PEN-3157 already reached this conclusion at the enqueue boundary, where it
+ * declined to scrub `context` because doing so "would risk the delivery
+ * identity". The same argument holds at the send boundary; it just bites later.
+ * The code did both things and justified only one, which is what PEN-3391 was
+ * filed to settle.
+ *
+ * ## Why refuse rather than simply exempt the field
+ *
+ * Exempting it (leaving `context` unscrubbed) would restore the leak the scrub
+ * exists to prevent: commit-status contexts are public on a public repo.
+ * Refusing keeps both properties at once —
+ *
+ * - **nothing leaks**, because a credential-bearing identity is never published; and
+ * - **publish and lookup cannot disagree**, because the write proceeds only
+ *   when the scrub is a byte-for-byte no-op. Callers may therefore keep using
+ *   the raw value as a key, and are provably keying on what was published.
+ *
+ * The failure is non-retryable by construction: the same input scrubs the same
+ * way every time, so a retry cannot succeed. It is logged at `error` rather
+ * than `warn` because, unlike a redaction, no write happened.
+ *
+ * A caller reaching this has a configuration bug — every context in this repo
+ * is a fixed operator-set literal — so the refusal is a loud stop, not a
+ * degradation path.
+ *
+ * @returns the detected classes when the write must be refused, or `null` when
+ *          the field is publishable unchanged.
+ */
+export function gitHubIdentityFieldRedaction(value: string, field: string): string[] | null {
+  const result = scrubGitHubEgressText(value);
+  if (!result.redacted) return null;
+  console.error(
+    `[github-egress] REFUSED an outbound GitHub write: the ${field} is an identity field and ` +
+      `credential-shaped material was detected in it (${result.classes.join(", ")}). Nothing was ` +
+      `published — redacting it would address the status to a name no lookup can find.`,
+  );
+  return result.classes;
+}
+
+
+/**
  * Post a commit status as the GitHub App with a classified result so callers
  * can retry transient failures and surface permanent configuration/permission
  * failures separately.
@@ -1199,7 +1261,14 @@ export async function githubPostCommitStatusDetailed(input: {
   const description = input.description
     ? scrubOutboundGitHubText(input.description, "commit-status description").slice(0, 140)
     : undefined;
-  const context = scrubOutboundGitHubText(input.context, "commit-status context");
+  // `context` is the status's IDENTITY, not prose: branch protection matches a
+  // required check on it and `githubGetLatestCommitStatusForContext` filters on
+  // it. Refuse rather than redact, so publish and lookup cannot disagree — see
+  // `gitHubIdentityFieldRedaction` (PEN-3391).
+  if (gitHubIdentityFieldRedaction(input.context, "commit-status context")) {
+    return { ok: false, retryable: false, reason: "commit_status_context_not_publishable" };
+  }
+  const context = input.context;
   const targetUrl = input.targetUrl
     ? scrubOutboundGitHubText(input.targetUrl, "commit-status target_url")
     : input.targetUrl;
@@ -1268,7 +1337,13 @@ export async function githubPostCheckRun(input: {
   // and a check-run has no 140-char cap — so it publishes MORE of it. Scrubbed
   // here like every other free-text field this file writes, so the helper's
   // callers inherit the control rather than each remembering it (PEN-3157).
-  const name = scrubOutboundGitHubText(input.name, "check-run name");
+  // `name` is the check-run's IDENTITY — it is what a required check is matched
+  // on and what a `check-runs` read selects by — so it is refused, not redacted,
+  // for the same reason as a commit-status `context` (PEN-3391).
+  if (gitHubIdentityFieldRedaction(input.name, "check-run name")) {
+    return { ok: false, retryable: false, reason: "check_run_name_not_publishable" };
+  }
+  const name = input.name;
   const title = scrubOutboundGitHubText(input.title, "check-run title");
   const summary = scrubOutboundGitHubText(input.summary, "check-run summary");
   const detailsUrl = input.detailsUrl
