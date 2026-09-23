@@ -3187,6 +3187,30 @@ async function attemptPrReviewerWake(params: {
       // terminal for this delivery.
       if (wakeResult) {
         recordGithubReviewRequestDelivery({ state: "queued", reason: context.wakeReason });
+        // BLO-22758: the success side must be as loud as the failures. Every
+        // other outcome of this function logs (duplicate/no_reviewer/declined
+        // above, deferred and lock-loss in the caller), so before this line a
+        // *served* PR and a PR whose wake was never enqueued emitted a
+        // byte-identical webhook trail — "the wake was created and the run was
+        // lost" and "the wake was never created" were observationally
+        // identical. The counter alone cannot close that: it is aggregate, so
+        // it cannot answer the question for ONE PR. `runId` is the join key to
+        // the run's own lifecycle logs, which is what makes the terminal state
+        // (served / deadline-killed / still queued) recoverable from logs.
+        logger.info(
+          {
+            agentId: reviewerAgentId,
+            event: eventName,
+            deliveryId,
+            idempotencyKey,
+            wakeReason: context.wakeReason,
+            prNumber: context.prNumber,
+            repoFullName: context.repoFullName,
+            runId: wakeResult.id,
+            wakeupRequestId: wakeResult.wakeupRequestId,
+          },
+          "github webhook reviewer wake enqueued",
+        );
         return "queued";
       }
       // The terminal `suppressed` increment is NOT emitted here: the wake
