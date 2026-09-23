@@ -460,10 +460,19 @@ async function advanceIssueLadder(
     const claimed = await casAlertState(ctx, ref, state, { ...state, escalationAttempt: MAX_ATTEMPTS, escalationComplete: true, nextEscalationAt: null });
     if (!claimed) {
       // A webhook won the record while the cover was being created. If it was a
-      // resolve, its own cascade ran before the cover existed and so could not
-      // see it — leaving an open board-assigned cover for an alert that has
-      // already cleared. Re-running the cascade here against the cover we just
-      // created is the compensating close.
+      // resolve, its own cascade may have run before the cover existed and so
+      // could not see it — which would leave an open board-assigned cover for
+      // an alert that has already cleared. Re-running the cascade here against
+      // the cover we just created is the compensating close.
+      //
+      // BLO-33497: this branch is reached only when the swap is REFUSED, which
+      // is exactly the half `handleResolved` cannot see for itself. It pairs
+      // with the second `recordSourceResolvedAndCloseCovers` there, behind its
+      // commit point: a swap that SUCCEEDS means the webhook had not yet stored
+      // `resolvedAt` when we claimed, so its post-commit cascade still lies
+      // ahead of it and will find the cover we just created. Keep the two in
+      // step — drop that call and this compensation stops being sufficient on
+      // its own.
       //
       // Safe to run unconditionally on a resolved winner: the cascade is
       // idempotent (`COALESCE(resolved_at, now())` plus the single-UPDATE
