@@ -184,7 +184,12 @@ function runFixtureWithStalledStderr(): Promise<StalledCrashResult> {
     }, FIXTURE_STARTUP_TIMEOUT_MS);
 
     child.stdout.setEncoding("utf8");
+    // Captured for the failure path below. Once the fixture has deliberately filled
+    // stderr, stdout is the only channel it can still be heard on — see the ceiling
+    // branch in the fixture.
+    let stdout = "";
     child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
       if (startedAt !== undefined || !chunk.includes("BACKPRESSURE")) return;
       clearTimeout(startupWatchdog);
       startedAt = Date.now();
@@ -210,7 +215,8 @@ function runFixtureWithStalledStderr(): Promise<StalledCrashResult> {
             reject(
               new Error(
                 `fixture exited before reporting stderr backpressure ` +
-                  `(code=${code}, signal=${signal}); its stderr said: ${stderr.trim() || "<nothing>"}`,
+                  `(code=${code}, signal=${signal}); its stdout said: ${stdout.trim() || "<nothing>"}; ` +
+                  `its stderr said: ${stderr.trim() || "<nothing>"}`,
               ),
             );
           })
