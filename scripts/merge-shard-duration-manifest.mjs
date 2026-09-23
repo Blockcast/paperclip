@@ -28,7 +28,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { collectGeneralServerSuiteFiles } from "./run-vitest-stable-suites.mjs";
+import { collectAllServerSuiteFiles } from "./run-vitest-stable-suites.mjs";
 
 // Manifest keys this merge is allowed to rewrite. Anything else -- `$notes`,
 // `unit`, and whatever a future reader adds -- survives a refresh verbatim.
@@ -51,8 +51,9 @@ export function readShardMeasurements(shardDir, { readDir = readdirSync, readFil
 
 export function formatProvenanceComment({ runId, date, measuredCount, totalCount }) {
   return (
-    `Per-suite Vitest durations (ms) for the general-server lane, used by ` +
-    `scripts/general-server-shard.mjs to balance suites across the PR shard matrix. ` +
+    `Per-suite Vitest durations (ms) for every server suite -- both the ` +
+    `general-server lane and the serialized route/authz lane -- used by ` +
+    `scripts/general-server-shard.mjs to balance both shard partitions. ` +
     `Re-sampled from the four .github/workflows/refresh-shard-manifest.yml shard jobs ` +
     `in run ${runId} on ${date}: ${measuredCount} suite(s) measured, ${totalCount} total ` +
     `entries. This sentence is regenerated on every refresh; see "$notes" for guidance ` +
@@ -143,10 +144,13 @@ if (isMainModule()) {
   // The suite set on disk, used to prune entries for deleted suites. An empty
   // result means the checkout is broken or the cwd is wrong, not that every
   // suite was deleted -- prune nothing rather than empty the manifest.
-  const knownSuites = collectGeneralServerSuiteFiles(process.cwd());
+  // The union of BOTH server lanes (BLO-28956). Keyed on the general half
+  // alone, this prune would delete every serialized route/authz entry on the
+  // first refresh -- silently returning that lane to file-count packing.
+  const knownSuites = collectAllServerSuiteFiles(process.cwd());
   if (knownSuites.length === 0) {
     console.warn(
-      "[merge-shard-manifest] collected 0 general-server suites from " +
+      "[merge-shard-manifest] collected 0 server suites from " +
         `${process.cwd()}; skipping the prune of deleted suites`,
     );
   }
