@@ -36,6 +36,20 @@ function isPidAlive(pid: number) {
   }
 }
 
+// Loaded CI hosts may need more than one second to start a nested Node process.
+// These tests cover timeout signaling, not process-start latency.
+//
+// BLO-26627: every test below that reads a descendant PID races the child's
+// `spawn()` + stdout flush against a wall clock. That clock is NOT the thing
+// under test -- the assertions are about signal ordering (timeout -> grace ->
+// kill), which is unaffected by when the announcement lands. So every such
+// budget is sized off this one constant rather than hardcoded per test, and
+// `timeoutSec: 1` in particular must not reappear: one second is less than a
+// nested Node boot on a host under the CPU steal BLO-35090 measured, which
+// truncates stdout and fails the PID assertion for no in-scope reason.
+const PROCESS_TREE_TEST_TIMEOUT_SEC = 5;
+const PROCESS_TREE_TEST_BUDGET_MS = 15_000;
+
 async function waitForPidExit(pid: number, timeoutMs = 2_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -45,7 +59,11 @@ async function waitForPidExit(pid: number, timeoutMs = 2_000) {
   return !isPidAlive(pid);
 }
 
-async function waitForTextMatch(read: () => string, pattern: RegExp, timeoutMs = 1_000) {
+async function waitForTextMatch(
+  read: () => string,
+  pattern: RegExp,
+  timeoutMs = PROCESS_TREE_TEST_TIMEOUT_SEC * 1_000,
+) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const value = read();
@@ -56,10 +74,16 @@ async function waitForTextMatch(read: () => string, pattern: RegExp, timeoutMs =
   return read().match(pattern);
 }
 
-// Loaded CI hosts may need more than one second to start a nested Node process.
-// These tests cover timeout signaling, not process-start latency.
-const PROCESS_TREE_TEST_TIMEOUT_SEC = 5;
-const PROCESS_TREE_TEST_BUDGET_MS = 15_000;
+// Accepts either `descendant:<pid>` or a bare PID, and reports what was
+// actually observed. Parsing a missing PID yields NaN, whose bare assertion
+// reads "expected false to be true" -- which is what made the three CI
+// sightings of this flake cost a full triage each before they could be
+// recognized as the same loaded-host truncation.
+function expectDescendantPid(stdout: string) {
+  const pid = Number.parseInt(stdout.match(/descendant:(\d+)/)?.[1] ?? stdout.trim(), 10);
+  expect(pid, `expected a descendant PID, observed: ${JSON.stringify(stdout.slice(-200))}`).toBeGreaterThan(0);
+  return pid;
+}
 
 describe("buildInvocationEnvForLogs", () => {
   it("redacts inline secrets from resolved command metadata", () => {
@@ -528,8 +552,6 @@ describe("runChildProcess", () => {
   });
 
   it.skipIf(process.platform === "win32")("kills descendant processes on timeout via the process group", async () => {
-    let descendantPid: number | null = null;
-
     const result = await runChildProcess(
       randomUUID(),
       process.execPath,
@@ -552,11 +574,10 @@ describe("runChildProcess", () => {
       },
     );
 
-    descendantPid = Number.parseInt(result.stdout.trim(), 10);
     expect(result.timedOut).toBe(true);
-    expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true);
+    const descendantPid = expectDescendantPid(result.stdout);
 
-    expect(await waitForPidExit(descendantPid!, 2_000)).toBe(true);
+    expect(await waitForPidExit(descendantPid, 2_000)).toBe(true);
   }, PROCESS_TREE_TEST_BUDGET_MS);
 
   it.skipIf(process.platform === "win32")(
@@ -577,19 +598,19 @@ describe("runChildProcess", () => {
         {
           cwd: process.cwd(),
           env: {},
-          timeoutSec: 1,
+          timeoutSec: PROCESS_TREE_TEST_TIMEOUT_SEC,
           graceSec: 1,
           onLog: async () => {},
           onSpawn: async () => {},
         },
       );
 
-      const descendantPid = Number.parseInt(result.stdout.trim(), 10);
       expect(result.timedOut).toBe(true);
       expect(result.signal).toBe("SIGTERM");
-      expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true);
+      const descendantPid = expectDescendantPid(result.stdout);
       expect(await waitForPidExit(descendantPid, 2_000)).toBe(true);
     },
+    PROCESS_TREE_TEST_BUDGET_MS,
   );
 
   it.skipIf(process.platform === "win32")(
@@ -665,7 +686,7 @@ describe("runChildProcess", () => {
         {
           cwd: process.cwd(),
           env: {},
-          timeoutSec: 1,
+          timeoutSec: PROCESS_TREE_TEST_TIMEOUT_SEC,
           graceSec,
           onLog: async () => {},
           onSpawn: async () => {},
@@ -675,9 +696,8 @@ describe("runChildProcess", () => {
         },
       );
 
-      const descendantPid = Number.parseInt(result.stdout.trim(), 10);
       expect(result.timedOut).toBe(true);
-      expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true);
+      const descendantPid = expectDescendantPid(result.stdout);
 
       // The descendant is killed by the grace timer, which fires after `close`.
       expect(await waitForPidExit(descendantPid, graceSec * 1000 + 2_000)).toBe(true);
@@ -807,7 +827,7 @@ describe("runChildProcess", () => {
       },
     );
 
-    const descendantPid = Number.parseInt(result.stdout.match(/descendant:(\d+)/)?.[1] ?? "", 10);
+    const descendantPid = expectDescendantPid(result.stdout);
     expect(result.timedOut).toBe(false);
     expect(result.exitCode).toBe(0);
     expect(result.terminalResultCleanup).toMatchObject({
@@ -817,7 +837,6 @@ describe("runChildProcess", () => {
       reason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
       terminalResultSeen: true,
     });
-    expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true);
     expect(await waitForPidExit(descendantPid, 2_000)).toBe(true);
   });
 
@@ -929,8 +948,7 @@ describe("runChildProcess", () => {
         forceKilled: false,
       });
 
-      const descendantPid = Number.parseInt(result.stdout.match(/descendant:(\d+)/)?.[1] ?? "", 10);
-      expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true);
+      const descendantPid = expectDescendantPid(result.stdout);
       if (isPidAlive(descendantPid)) {
         try {
           process.kill(descendantPid, "SIGKILL");
@@ -1014,9 +1032,8 @@ describe("runChildProcess", () => {
       },
     );
 
-    const pidMatch = await waitForTextMatch(() => observed, /descendant:(\d+)/);
-    const descendantPid = Number.parseInt(pidMatch?.[1] ?? "", 10);
-    expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true);
+    await waitForTextMatch(() => observed, /descendant:(\d+)/);
+    const descendantPid = expectDescendantPid(observed);
 
     const race = await Promise.race([
       resultPromise.then(() => "settled" as const),
