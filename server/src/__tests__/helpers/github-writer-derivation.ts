@@ -144,13 +144,43 @@ export function serverSourceFiles(serverSourceDirectory: string): string[] {
 }
 
 /**
+ * Any specifier that pulls `__tests__/` into a module — `from` for static
+ * imports and re-exports, bare `import`/`require` for side-effect and dynamic
+ * ones — in any quote style.
+ *
+ * The quote class is deliberate. This predicate is what keeps the `__tests__/`
+ * exclusion in `serverSourceFiles` sound, and an earlier form matched
+ * `from\s*"…"` only. That is the same double-quote assumption the writer
+ * predicate above rejects, applied to the check guarding the writer predicate's
+ * own scope — and the assumption is weaker here than the phrase "Prettier pins
+ * double quotes" suggests, because this repo has no Prettier: there is no
+ * formatter or linter config, dependency, or CI step anywhere in it. Every
+ * import being double-quoted today is convention, enforced by nothing.
+ *
+ * It stops short of matching `__tests__/` anywhere in the file, which would be
+ * more fail-closed but would trip on prose: `services/plugin-host-services.ts`
+ * names a test file in a comment, and this predicate must stay empty over the
+ * real tree for its callers' assertion to mean anything.
+ */
+const TEST_HELPER_SPECIFIER = /\b(?:from|import|require)\s*\(?\s*(["'`])[^"'`]*__tests__\//;
+
+/** True when the file pulls a module out of `__tests__/`, however it spells it. */
+export function importsFromTestHelpers(source: string): boolean {
+  return TEST_HELPER_SPECIFIER.test(source);
+}
+
+/**
  * Production files that reach into `__tests__/`. Must be empty for the
  * exclusion in `serverSourceFiles` to hold; asserted by both callers rather
  * than trusted.
+ *
+ * Note that an empty result is also what a predicate matching nothing returns,
+ * so the callers' assertion cannot distinguish the two. `importsFromTestHelpers`
+ * is exported and unit-tested against synthetic sources for that reason.
  */
 export function productionFilesImportingTestHelpers(serverSourceDirectory: string): string[] {
   return serverSourceFiles(serverSourceDirectory).filter((entry) =>
-    /from\s*"[^"]*__tests__\//.test(readFileSync(path.join(serverSourceDirectory, entry), "utf8")),
+    importsFromTestHelpers(readFileSync(path.join(serverSourceDirectory, entry), "utf8")),
   );
 }
 
