@@ -15,6 +15,7 @@ import {
   assertPrListComplete,
   attestedHead,
   duplicateBodyAcrossIdentities,
+  findPrNotices,
   findPrViolations,
   findViolations,
   hasBlockingFindings,
@@ -611,14 +612,61 @@ describe("I1 names the mechanism a same-lane duplicate implies", () => {
     assert.match(violation, /submit step is at-least-once/);
   });
 
-  it("calls differing bodies a double-compute needing exclusion, not idempotency", () => {
-    // paperclip#1220: two reviews 10 s apart carried different bodies, so a
-    // timing threshold misfiles this case as a retry.
-    const violation = findPrViolations(
+  it("exempts differing bodies: a re-review of one head supersedes, it does not duplicate", () => {
+    // BLO-25764. paperclip#1220 (10 s apart) and #1972 (33.6 h apart) are the
+    // same observable shape, and #1972 is a legitimate re-review after a
+    // description-only fix that could not move the head. Measured over every
+    // same-head App duplicate pair on the open PRs (n=15) the gap runs
+    // 3 s → 33.6 h with no separation, so nothing here distinguishes the race
+    // from the re-review. Asserting at-most-1 over it can never pass.
+    const violations = findPrViolations(
       duplicatePr([canonicalBody(HEAD, "first pass"), canonicalBody(HEAD, "second pass")]),
+    );
+    assert.deepEqual(violations.filter((v) => v.startsWith("I1")), []);
+  });
+
+  it("still reports the superseded pair as a notice rather than dropping the signal", () => {
+    const notices = findPrNotices(
+      duplicatePr([canonicalBody(HEAD, "first pass"), canonicalBody(HEAD, "second pass")]),
+    );
+    assert.equal(notices.length, 1);
+    assert.match(notices[0], /2 operative Ally App reviews/);
+    assert.match(notices[0], /standing verdict/);
+  });
+
+  it("keeps failing when only SOME bodies repeat — a mixed set still contains a repeated submit", () => {
+    const violation = findPrViolations(
+      duplicatePr([canonicalBody(), canonicalBody(), canonicalBody(HEAD, "third")]),
     ).find((v) => v.startsWith("I1"));
-    assert.match(violation, /bodies differ/);
-    assert.match(violation, /exclusion, not submit idempotency/);
+    assert.match(violation, /some bodies are identical and some differ/);
+  });
+
+  it("does not exempt the User seat, which may not submit a verdict at all", () => {
+    const pr = {
+      number: 1193,
+      headSha: HEAD,
+      reviews: [
+        seatReview({ id: 3, body: canonicalBody(HEAD, "a") }),
+        seatReview({ id: 4, body: canonicalBody(HEAD, "b") }),
+      ],
+    };
+    assert.match(
+      findPrViolations(pr).find((v) => v.startsWith("I1")) ?? "",
+      /^I1 PR #1193 @ff1c72db: 2 operative Ally User seat reviews/,
+    );
+  });
+
+  it("exempts I1 only — a superseded review that approves over a blocker is still fatal", () => {
+    // The exemption must not become a hiding place: every review in the set is
+    // still carried through I2/I3/I4.
+    const violations = findPrViolations(
+      duplicatePr([
+        canonicalBody(HEAD, "### Important Issues (1)\n- boom"),
+        canonicalBody(HEAD, "clean second pass"),
+      ]),
+    );
+    assert.deepEqual(violations.filter((v) => v.startsWith("I1")), []);
+    assert.match(violations.find((v) => v.startsWith("I2a")) ?? "", /APPROVED but its body reports a Critical\/Important finding/);
   });
 
   it("omits the clause rather than guessing when a body is empty", () => {
@@ -633,13 +681,9 @@ describe("I1 names the mechanism a same-lane duplicate implies", () => {
     const identical = findPrViolations(duplicatePr([canonicalBody(), canonicalBody()])).find((v) =>
       v.startsWith("I1"),
     );
-    const differing = findPrViolations(
-      duplicatePr([canonicalBody(HEAD, "a"), canonicalBody(HEAD, "b")]),
-    ).find((v) => v.startsWith("I1"));
     const bodiless = findPrViolations(duplicatePr(["", ""])).find((v) => v.startsWith("I1"));
 
     assert.equal(violationFingerprint(identical), "I1:1220:ff1c72db:5124949902,5124950225");
-    assert.equal(violationFingerprint(identical), violationFingerprint(differing));
     assert.equal(violationFingerprint(identical), violationFingerprint(bodiless));
   });
 });
@@ -1088,31 +1132,27 @@ describe("the committed baseline", () => {
   );
 
   it("parses under the same validation the guard applies at runtime", () => {
-    assert.ok(parseBaseline(raw).length > 0);
+    assert.deepEqual(parseBaseline(raw), []);
   });
 
-  it("suppresses exactly the violation set measured on 2026-09-01 and nothing else", () => {
-    const measured = [
-      REAL_I1_1525,
-      REAL_I3_1525,
-      "I1 PR #1360 @6a7e86b8: 2 operative Ally App reviews (COMMENTED/5002830694, COMMENTED/5003133252) — expected at most 1 in the app lane",
-      "I1 PR #1316 @0110ccd1: 2 operative Ally App reviews (COMMENTED/4911401804, COMMENTED/4913256943) — expected at most 1 in the app lane",
-      "I3 PR #1316 @0110ccd1: Ally App review 4913256943 is not canonical — expected one consolidated-review heading and one Reviewed head attestation",
-      "I1 PR #1304 @61360b5a: 2 operative Ally App reviews (COMMENTED/5062643059, COMMENTED/5062648138) — expected at most 1 in the app lane",
-    ];
-    const { failing, suppressed, staleEntries } = applyBaseline(measured, parseBaseline(raw));
-    assert.deepEqual(failing, [], "the run goes green on the state that pinned it red");
-    assert.equal(suppressed.length, measured.length);
-    assert.deepEqual(staleEntries, [], "no entry suppresses something that is not happening");
+  it("is empty, so nothing is suppressed and nothing can go stale", () => {
+    // BLO-25764. All six entries suppressed an I1 same-head App duplicate and
+    // all six had gone stale. An empty baseline is the honest state: the guard
+    // now passes on its own verdict rather than on six dead suppressions, and
+    // it emits no stale-entry warnings to train readers to ignore it.
+    const { failing, suppressed, staleEntries } = applyBaseline([], parseBaseline(raw));
+    assert.deepEqual(failing, []);
+    assert.deepEqual(suppressed, []);
+    assert.deepEqual(staleEntries, []);
   });
 
-  it("still fails on a new violation alongside the baselined set", () => {
+  it("still fails on a new violation, with nothing left to suppress it", () => {
     const withNewFinding = [
       REAL_I1_1525,
       "I1 PR #1601 @abcdef12: 2 operative Ally App reviews (COMMENTED/5111111111, COMMENTED/5222222222) — expected at most 1 in the app lane",
     ];
     const { failing } = applyBaseline(withNewFinding, parseBaseline(raw));
-    assert.equal(failing.length, 1);
-    assert.match(failing[0].violation, /PR #1601/);
+    assert.equal(failing.length, 2);
+    assert.match(failing[1].violation, /PR #1601/);
   });
 });

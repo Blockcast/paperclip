@@ -15,11 +15,33 @@
  * Observed on Blockcast/paperclip#876 (BLO-19778): two runs dispatched 43 ms
  * apart both submitted at head ff1c72db, 34 s apart, with opposite verdicts.
  *
- *   I1  At most one operative review per lane per (PR, head SHA). A same-lane
- *       duplicate also reports whether the bodies are identical or differ
+ *   I1  At most one operative review per lane per (PR, head SHA), EXCEPT where
+ *       the App lane's duplicates all carry distinct bodies — see below. A
+ *       same-lane duplicate reports whether the bodies are identical or differ
  *       (`sameLaneBodyRelation`), because that — not the gap between
  *       submissions — is what says whether the missing control is submit
  *       idempotency or reviewer exclusion.
+ *
+ *       On the App-lane `recompute` exemption (BLO-25764). Ally may re-review
+ *       an unchanged head: a finding whose remedy is not a code change (a
+ *       wrong PR description, a rebase that moved nothing) is addressed
+ *       without moving the head, so the re-review lands at the same SHA and
+ *       supersedes its predecessor. That is correct behaviour, and it is
+ *       observationally identical to the concurrent-run race in the paragraph
+ *       above: both yield N canonical App verdicts at one head with differing
+ *       bodies and possibly differing dispositions. Measured over every
+ *       same-head App duplicate pair on the open PRs (2026-09-23, n=15), the
+ *       gap between submissions runs 3 s → 33.6 h with no separation, so no
+ *       time threshold distinguishes them either. Asserting `at most 1` over
+ *       that shape is therefore unsatisfiable while re-review is permitted —
+ *       which is why this guard failed 99/99 scheduled runs from 2026-08-07.
+ *       Differing App bodies at one head are reported as a notice
+ *       (`findPrNotices`) and the latest submission is the standing verdict;
+ *       I2/I3/I4 still evaluate EVERY operative review, so a superseded review
+ *       that approves over a blocker is still fatal. Identical bodies keep
+ *       failing: one verdict submitted twice has no legitimate explanation.
+ *       The exclusion control this gave up belongs at dispatch, where the
+ *       concurrency is visible — see BLO-20074.
  *
  *       Three arms here can only fire when an operative seat review exists —
  *       I1 over the seat lane, I1 for one body submitted under two
@@ -351,6 +373,48 @@ export function sameLaneBodyRelation(operative) {
   return anyPairIdentical ? "mixed" : "recompute";
 }
 
+/**
+ * True when a same-head App-lane duplicate is a re-review superseding its
+ * predecessor rather than a defect.
+ *
+ * Scoped to the App lane deliberately: the User seat may not submit a verdict
+ * at all (I6/R4), so a seat duplicate has no legitimate reading and keeps
+ * failing. `recompute` — every body distinct — is the only exempt relation.
+ * `resubmit` and `mixed` both contain a byte-identical pair, which is one
+ * verdict delivered more than once and is always a submit-side defect, and a
+ * `null` relation means an empty body, which is an attestation defect.
+ *
+ * This exempts the shape from I1 only. Every review in the set is still
+ * carried through I2/I3/I4/I5, so a superseded review that approves over a
+ * blocking finding remains fatal.
+ */
+export function isSupersedingAppRereview(lane, operative) {
+  return lane === "app" && sameLaneBodyRelation(operative) === "recompute";
+}
+
+/**
+ * Non-fatal observations. Supersession is legitimate but it is still two runs
+ * doing one PR's work, so it is reported rather than dropped: silence here
+ * would make a re-review storm indistinguishable from a quiet week.
+ *
+ * @returns {string[]}
+ */
+export function findPrNotices(pr) {
+  const head = pr.headSha;
+  const short = String(head ?? "").slice(0, 8);
+  const reviews = operativeAllyReviews(pr.reviews, head, "app");
+  if (!isSupersedingAppRereview("app", reviews)) return [];
+  const latest = [...reviews].sort((a, b) =>
+    String(a?.submitted_at ?? "").localeCompare(String(b?.submitted_at ?? "")),
+  )[reviews.length - 1];
+  return [
+    `PR #${pr.number} @${short}: ${reviews.length} operative Ally App reviews (${reviewDetails(reviews)}) with distinct bodies — ` +
+      `treating the latest (${latest?.id}, ${latest?.submitted_at}) as the standing verdict. Legitimate for a re-review of an ` +
+      `unchanged head; also the signature of two concurrent runs, which review data cannot distinguish (BLO-25764). ` +
+      `Exclusion belongs at dispatch — see BLO-20074.`,
+  ];
+}
+
 const SAME_LANE_RELATION_NOTES = {
   resubmit:
     "the bodies are identical — one verdict submitted more than once, so the submit step is at-least-once",
@@ -389,7 +453,7 @@ export function findPrViolations(pr) {
     const reviews = reviewsByLane.get(lane);
     const label = laneLabel(lane);
 
-    if (reviews.length > 1) {
+    if (reviews.length > 1 && !isSupersedingAppRereview(lane, reviews)) {
       const relation = SAME_LANE_RELATION_NOTES[sameLaneBodyRelation(reviews)];
       violations.push(
         `I1 PR #${pr.number} @${short}: ${reviews.length} operative ${label} reviews (${reviewDetails(reviews)}) — expected at most 1 in the ${lane} lane` +
@@ -734,6 +798,12 @@ function main() {
   const prs = fetchOpenPrs(repo);
   const violations = findViolations(prs);
   const { failing, suppressed, staleEntries } = applyBaseline(violations, loadBaseline());
+
+  for (const pr of prs) {
+    for (const notice of findPrNotices(pr)) {
+      console.log(`::notice title=Superseded Ally review at one head::${notice}`);
+    }
+  }
 
   for (const entry of staleEntries) {
     console.log(
