@@ -2960,6 +2960,31 @@ function logIssueListRequest(input: {
   });
 }
 
+/**
+ * Pages through `fetchPage` until it returns a short page, handing each page to `visit`.
+ *
+ * attention=blocked is served by listBlockedInboxIssues, which pages by offset only and
+ * ignores sortField/afterId, so that path advances `offset`; a keyset cursor there would
+ * re-read page one forever. Every other path walks the immutable id order with a keyset
+ * cursor, because offset paging over the mutable activity order re-ranks rows touched
+ * mid-walk, which both double-counts and skips them.
+ */
+export async function walkIssueListPages<Row extends { id: string }>(
+  fetchPage: (page: { offset?: number; afterId?: string }) => Promise<Row[]>,
+  opts: { blocked: boolean; pageSize: number },
+  visit: (rows: Row[]) => Promise<void>,
+): Promise<void> {
+  let offset = 0;
+  let afterId: string | undefined;
+  while (true) {
+    const rows = await fetchPage(opts.blocked ? { offset } : { afterId });
+    await visit(rows);
+    if (rows.length < opts.pageSize) return;
+    if (opts.blocked) offset += rows.length;
+    else afterId = rows[rows.length - 1]!.id;
+  }
+}
+
 export function issueRoutes(
   db: Db,
   storage: StorageService,
@@ -6719,6 +6744,13 @@ export function issueRoutes(
         res.status(400).json({ error: "afterId cannot be combined with offset" });
         return;
       }
+      // attention=blocked is served by the blocked-inbox listing, which pages by
+      // offset only and ignores afterId, so a cursor there would return page one on
+      // every request and never advance.
+      if (attention === "blocked") {
+        res.status(400).json({ error: "afterId cannot be combined with attention=blocked" });
+        return;
+      }
     }
     if (hasPlanDocument === null) {
       res.status(400).json({ error: "hasPlanDocument must be true or false when provided" });
@@ -7020,22 +7052,21 @@ export function issueRoutes(
         return;
       }
 
-      // Walk in immutable id order with a keyset cursor. Offset paging over the default
-      // activity order re-ranks rows as issues are touched mid-walk, which both
-      // double-counts and skips them — the exact defect this endpoint exists to avoid.
-      let afterId: string | undefined;
+      const blocked = countFilters.attention === "blocked";
       let visibleCount = 0;
-      while (true) {
-        const rows = await svc.list(companyId, {
-          ...countFilters,
-          limit: ISSUE_LIST_MAX_LIMIT,
-          sortField: "id",
-          afterId,
-        });
-        visibleCount += (await filterIssuesForActor(req, rows)).length;
-        if (rows.length < ISSUE_LIST_MAX_LIMIT) break;
-        afterId = rows[rows.length - 1]!.id;
-      }
+      await walkIssueListPages(
+        (page) =>
+          svc.list(
+            companyId,
+            blocked
+              ? { ...countFilters, limit: ISSUE_LIST_MAX_LIMIT, offset: page.offset }
+              : { ...countFilters, limit: ISSUE_LIST_MAX_LIMIT, sortField: "id", afterId: page.afterId },
+          ),
+        { blocked, pageSize: ISSUE_LIST_MAX_LIMIT },
+        async (rows) => {
+          visibleCount += (await filterIssuesForActor(req, rows)).length;
+        },
+      );
       res.json({ count: visibleCount });
       return;
     }

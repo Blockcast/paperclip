@@ -186,6 +186,18 @@ describeEmbeddedPostgres("issue list stable enumeration and exact counts", () =>
     expect(res.body).toMatchObject({ error: "afterId cannot be combined with offset" });
   });
 
+  it("rejects afterId combined with attention=blocked", async () => {
+    // The blocked-inbox listing pages by offset only, so an accepted cursor would be
+    // silently ignored and a cursor loop over it would never advance.
+    const companyId = await seedCompany();
+    const res = await request(createApp(companyId))
+      .get(`/api/companies/${companyId}/issues`)
+      .query({ attention: "blocked", sortField: "id", afterId: randomUUID() });
+
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ error: "afterId cannot be combined with attention=blocked" });
+  });
+
   it("rejects a malformed afterId", async () => {
     const companyId = await seedCompany();
     const res = await request(createApp(companyId))
