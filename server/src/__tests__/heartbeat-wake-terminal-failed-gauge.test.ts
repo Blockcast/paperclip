@@ -15,6 +15,14 @@
 //     has no such column) and by `pr_review` scope,
 //   - the full label grid is zero-initialized so a healthy fleet renders 0
 //     rather than "No data" (the BLO-18859 lesson).
+//
+// These drive `publishAgentWakeupTerminalFailedGauge` directly. They used to
+// go through `reconcileFailedWakeDispatches`, which was only ever an emission
+// vehicle here -- every row seeded below lands on `failed`, and that pass only
+// selects `dispatch_failed`, so it never touched them. BLO-31335 moved the
+// emission to the scheduler tick, so the publisher is now the honest entry
+// point; the tick wiring itself is pinned in
+// `server-startup-feedback-export.test.ts`.
 import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -240,7 +248,7 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
       errorCode: "external_lifecycle_stale_killed",
     });
 
-    await heartbeat.reconcileFailedWakeDispatches(now);
+    await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
 
     expect(await gaugeTotal()).toBe(1);
     // The errorCode lives on heartbeat_runs, not on the wake row; getting this
@@ -262,7 +270,7 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
       errorCode: "external_lifecycle_stale_killed",
     });
 
-    await heartbeat.reconcileFailedWakeDispatches(now);
+    await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
     expect(await gaugeTotal()).toBe(1);
 
     // A fresh webhook push (or a re-request) creates a new wake row carrying
@@ -281,7 +289,7 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
     });
 
     __resetMetricsForTest();
-    await heartbeat.reconcileFailedWakeDispatches(now);
+    await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
     expect(await gaugeTotal()).toBe(0);
   });
 
@@ -312,7 +320,7 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
       contextSnapshot: { taskKey: PR_TASK_KEY },
     });
 
-    await heartbeat.reconcileFailedWakeDispatches(now);
+    await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
     expect(await gaugeTotal()).toBe(0);
   });
 
@@ -330,7 +338,7 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
       errorCode: null,
     });
 
-    await heartbeat.reconcileFailedWakeDispatches(now);
+    await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
 
     expect(await gaugeTotal({ errorCode: "none", scope: "pr_review" })).toBe(1);
   });
@@ -346,7 +354,7 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
       errorCode: "job_failed",
     });
 
-    await heartbeat.reconcileFailedWakeDispatches(now);
+    await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
 
     expect(await gaugeTotal({ scope: "pr_review" })).toBe(0);
     expect(await gaugeTotal({ errorCode: "job_failed", scope: "other" })).toBe(1);
@@ -364,7 +372,7 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
       errorCode: "some_code_nobody_has_triaged_yet",
     });
 
-    await heartbeat.reconcileFailedWakeDispatches(now);
+    await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
 
     expect(await gaugeTotal({ errorCode: "other", scope: "pr_review" })).toBe(1);
     // Cardinality stays bounded: an unknown code must not grow the series set.
@@ -384,7 +392,7 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
       errorCode: "external_lifecycle_stale_killed",
     });
 
-    await heartbeat.reconcileFailedWakeDispatches(now);
+    await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
 
     expect(await gaugeTotal()).toBe(0);
   });
@@ -420,7 +428,7 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
       errorCode: "external_lifecycle_stale_killed",
     });
 
-    await heartbeat.reconcileFailedWakeDispatches(now);
+    await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
 
     expect(
       await gaugeTotal({ errorCode: "external_lifecycle_stale_killed", scope: "pr_review" }),
@@ -473,7 +481,7 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
         requestedAt: new Date(failedAt.getTime() + 30_000),
       });
 
-      await heartbeat.reconcileFailedWakeDispatches(now);
+      await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
 
       expect(await gaugeTotal({ scope: "pr_review" })).toBe(1);
       // And the age must still be published, or the alert would read 0 and
@@ -503,7 +511,7 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
         createdAt: new Date(failedAt.getTime() + 120_000),
       });
 
-      await heartbeat.reconcileFailedWakeDispatches(now);
+      await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
 
       expect(await gaugeTotal({ scope: "pr_review" })).toBe(1);
     });
@@ -540,7 +548,7 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
         requestedAt: new Date(failedAt.getTime() + 30_000),
       });
 
-      await heartbeat.reconcileFailedWakeDispatches(now);
+      await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
 
       expect(await gaugeTotal({ scope: "pr_review" })).toBe(0);
       expect(await oldestAgeSeconds("pr_review")).toBe(0);
@@ -568,7 +576,7 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
         createdAt: new Date(failedAt.getTime() + 120_000),
       });
 
-      await heartbeat.reconcileFailedWakeDispatches(now);
+      await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
 
       expect(await gaugeTotal({ scope: "pr_review" })).toBe(0);
     });
@@ -596,7 +604,7 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
       errorCode: "external_lifecycle_stale_killed",
     });
 
-    await heartbeat.reconcileFailedWakeDispatches(now);
+    await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
 
     const age = await oldestAgeSeconds("pr_review");
     expect(age).toBeGreaterThanOrEqual(7_100);
@@ -618,7 +626,7 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
       errorCode: "external_lifecycle_stale_killed",
     });
 
-    await heartbeat.reconcileFailedWakeDispatches(now);
+    await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
     expect(await oldestAgeSeconds("pr_review")).toBeGreaterThan(0);
 
     await seedSuccessorWake({
@@ -628,7 +636,7 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
       requestedAt: new Date(failedAt.getTime() + 30_000),
     });
 
-    await heartbeat.reconcileFailedWakeDispatches(now);
+    await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
     expect(await oldestAgeSeconds("pr_review")).toBe(0);
   });
 
@@ -650,7 +658,7 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
       errorCode: "external_lifecycle_stale_killed",
     });
 
-    await heartbeat.reconcileFailedWakeDispatches(now);
+    await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
     expect(await oldestAgeSeconds("pr_review")).toBeGreaterThan(7_000);
 
     // A covers; B is a different PR that just failed.
@@ -669,7 +677,7 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
       errorCode: "job_failed",
     });
 
-    await heartbeat.reconcileFailedWakeDispatches(now);
+    await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
 
     // The count is still 1, which is exactly why a count-plus-`for:` rule
     // cannot tell these two situations apart.
@@ -702,7 +710,7 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
       errorCode: "job_failed",
     });
 
-    await heartbeat.reconcileFailedWakeDispatches(now);
+    await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
 
     expect(await gaugeTotal({ errorCode: "job_failed", scope: "other" })).toBe(1);
     expect(await gaugeTotal({ scope: "pr_review" })).toBe(0);
@@ -746,7 +754,7 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
       await db.insert(agentWakeupRequests).values(flood.slice(offset, offset + 100));
     }
 
-    await heartbeat.reconcileFailedWakeDispatches(now);
+    await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
 
     expect(await gaugeTotal({ scope: "pr_review" })).toBe(1);
     expect(await oldestAgeSeconds("pr_review")).toBeGreaterThan(7_000);
@@ -793,7 +801,7 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
       await db.insert(agentWakeupRequests).values(flood.slice(offset, offset + 100));
     }
 
-    await heartbeat.reconcileFailedWakeDispatches(now);
+    await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
 
     // The count saturates at the scan budget -- acceptable, because a
     // saturated count is still non-zero and still pages.

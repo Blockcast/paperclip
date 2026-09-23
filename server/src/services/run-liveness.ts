@@ -253,7 +253,7 @@ function nextNonNoiseLine(lines: string[], startIndex: number) {
   return null;
 }
 
-function extractNextActionFromText(text: string) {
+export function extractNextActionFromText(text: string) {
   const lines = text.split(/\r?\n/).map((entry) => entry.trim());
   for (let i = 0; i < lines.length; i += 1) {
     const rawLine = lines[i] ?? "";

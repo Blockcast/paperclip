@@ -4,8 +4,13 @@ import {
   buildCacheEntry,
   RECALL_STATE_KEY,
   DEFAULT_RECALL_DEPTH,
+  MAX_ENRICHMENT_NODES,
+  MAX_ENRICHMENT_EDGES,
+  MAX_ENRICHMENT_SERIALIZED_BYTES,
 } from "../recall.js";
 import type { GbrainCallable } from "../pages.js";
+import { GbrainCallError } from "../gbrain-client.js";
+import { NoOAuthClientError } from "../oauth-client-manager.js";
 
 describe("RECALL_STATE_KEY + defaults", () => {
   it("exposes a stable key + depth so worker + tool agree", () => {
@@ -108,6 +113,148 @@ describe("prefetchRunContext", () => {
     });
   });
 
+  it("caps an oversized agent-hub fallback (array shape) instead of attaching it whole", async () => {
+    // BLO-21635: hub nodes like "agent-cto" can be linked to thousands of
+    // unrelated fact-* nodes. Simulate that with a fallback far larger than
+    // MAX_ENRICHMENT_NODES and assert the merged graph stays bounded.
+    const hubNodes = Array.from({ length: MAX_ENRICHMENT_NODES + 200 }, (_, i) => ({
+      slug: `fact-${i}`,
+      depth: i < 10 ? 1 : 2,
+    }));
+    const client = {
+      call: vi.fn(async (_tool: string, args: Record<string, unknown>) => {
+        if (args.slug === "issue-blo-1") return [];
+        if (args.slug === "agent-cto") return hubNodes;
+        return null;
+      }),
+    };
+
+    const out = await prefetchRunContext({
+      client: client as unknown as GbrainCallable,
+      issueIdentifier: "BLO-1",
+      agentName: "CTO",
+      depth: 2,
+    });
+
+    expect(out.ok).toBe(true);
+    const graph = out.graph as unknown[];
+    expect(graph.length).toBe(MAX_ENRICHMENT_NODES);
+    // The lower-depth (more hub-proximate) nodes are kept preferentially.
+    const slugs = graph.map((n) => (n as { slug: string }).slug);
+    for (let i = 0; i < 10; i++) expect(slugs).toContain(`fact-${i}`);
+  });
+
+  it("caps an oversized agent-hub fallback (nodes/edges shape) and drops edges to dropped nodes", async () => {
+    const hubNodes = Array.from({ length: MAX_ENRICHMENT_NODES + 50 }, (_, i) => ({
+      slug: `fact-${i}`,
+      depth: 2,
+    }));
+    const hubEdges = hubNodes.map((n) => ({ from: "agent-cto", to: n.slug }));
+    const client = {
+      call: vi.fn(async (_tool: string, args: Record<string, unknown>) => {
+        if (args.slug === "issue-blo-1") {
+          return { nodes: [{ slug: "issue-blo-1" }], edges: [] };
+        }
+        if (args.slug === "agent-cto") {
+          return {
+            nodes: [{ slug: "agent-cto", depth: 0 }, ...hubNodes],
+            edges: hubEdges,
+          };
+        }
+        return null;
+      }),
+    };
+
+    const out = await prefetchRunContext({
+      client: client as unknown as GbrainCallable,
+      issueIdentifier: "BLO-1",
+      agentName: "CTO",
+      depth: 2,
+    });
+
+    expect(out.ok).toBe(true);
+    const graph = out.graph as { nodes: unknown[]; edges: { from: string; to: string }[] };
+    // +1 for the always-included issue-page node from the primary (island) graph.
+    expect(graph.nodes.length).toBeLessThanOrEqual(MAX_ENRICHMENT_NODES + 1);
+    const keptSlugs = new Set(graph.nodes.map((n) => (n as { slug: string }).slug));
+    for (const edge of graph.edges) {
+      expect(keptSlugs.has(edge.from)).toBe(true);
+      expect(keptSlugs.has(edge.to)).toBe(true);
+    }
+  });
+
+  it("normalizes and caps an oversized edges-only fallback graph", async () => {
+    const hubEdges = Array.from({ length: MAX_ENRICHMENT_EDGES + 500 }, (_, i) => ({
+      from: `fact-${i}`,
+      to: `fact-${i + 1}`,
+      label: "related",
+    }));
+    const client = {
+      call: vi.fn(async (_tool: string, args: Record<string, unknown>) => {
+        if (args.slug === "issue-blo-1") return [];
+        if (args.slug === "agent-cto") return { edges: hubEdges };
+        return null;
+      }),
+    };
+
+    const out = await prefetchRunContext({
+      client: client as unknown as GbrainCallable,
+      issueIdentifier: "BLO-1",
+      agentName: "CTO",
+      depth: 2,
+    });
+
+    expect(out.ok).toBe(true);
+    const graph = out.graph as { edges: unknown[] };
+    expect(graph).toEqual({ edges: expect.any(Array) });
+    expect(graph.edges.length).toBeLessThanOrEqual(MAX_ENRICHMENT_EDGES);
+    expect(Buffer.byteLength(JSON.stringify(graph))).toBeLessThanOrEqual(MAX_ENRICHMENT_SERIALIZED_BYTES);
+  });
+
+  it("drops auxiliary fallback collections and caps dense kept-node edges", async () => {
+    const hubNodes = Array.from({ length: 12 }, (_, i) => ({
+      slug: `fact-${i}`,
+      depth: 1,
+    }));
+    const hubEdges = hubNodes.flatMap((from) =>
+      hubNodes.map((to) => ({
+        from: from.slug,
+        to: to.slug,
+        label: "dense",
+      }))
+    );
+    const oversizedPaths = Array.from({ length: 500 }, (_, i) => ({
+      id: `path-${i}`,
+      body: "x".repeat(1000),
+    }));
+    const client = {
+      call: vi.fn(async (_tool: string, args: Record<string, unknown>) => {
+        if (args.slug === "issue-blo-1") return { nodes: [{ slug: "issue-blo-1" }], edges: [] };
+        if (args.slug === "agent-cto") {
+          return {
+            nodes: hubNodes,
+            edges: hubEdges,
+            paths: oversizedPaths,
+          };
+        }
+        return null;
+      }),
+    };
+
+    const out = await prefetchRunContext({
+      client: client as unknown as GbrainCallable,
+      issueIdentifier: "BLO-1",
+      agentName: "CTO",
+      depth: 2,
+    });
+
+    expect(out.ok).toBe(true);
+    const graph = out.graph as { nodes: unknown[]; edges: unknown[]; paths?: unknown[] };
+    expect(graph.paths).toBeUndefined();
+    expect(graph.edges.length).toBeLessThanOrEqual(MAX_ENRICHMENT_EDGES);
+    expect(Buffer.byteLength(JSON.stringify(graph))).toBeLessThanOrEqual(MAX_ENRICHMENT_SERIALIZED_BYTES);
+  });
+
   it("tries ID-based agent and project fallbacks after a missing named agent hub", async () => {
     const client = {
       call: vi.fn(async (_tool: string, args: Record<string, unknown>) => {
@@ -179,6 +326,41 @@ describe("prefetchRunContext", () => {
     });
     expect(out.ok).toBe(false);
     expect(out.reason).toMatch(/traverse_graph failed.*gbrain down/);
+    expect(out.reasonKind).toBeUndefined();
+  });
+
+  it("tags a no-oauth-client failure with reasonKind — not a generic error (BLO-23403)", async () => {
+    const client = {
+      call: vi.fn(async () => {
+        throw new NoOAuthClientError("agent-unprovisioned");
+      }),
+    };
+    const out = await prefetchRunContext({
+      client: client as unknown as GbrainCallable,
+      issueIdentifier: "BLO-1",
+      depth: 2,
+    });
+    expect(out.ok).toBe(false);
+    expect(out.reasonKind).toBe("no-oauth-client");
+    expect(out.reason).toMatch(/no client configured/);
+  });
+
+  it("tags a no-oauth-client failure wrapped in GbrainCallError (real client shape)", async () => {
+    const client = {
+      call: vi.fn(async () => {
+        // GbrainClient wraps every thrown error into GbrainCallError,
+        // preserving the original as `cause` — mirror that here.
+        const cause = new NoOAuthClientError("agent-unprovisioned");
+        throw new GbrainCallError(cause.message, cause);
+      }),
+    };
+    const out = await prefetchRunContext({
+      client: client as unknown as GbrainCallable,
+      issueIdentifier: "BLO-1",
+      depth: 2,
+    });
+    expect(out.ok).toBe(false);
+    expect(out.reasonKind).toBe("no-oauth-client");
   });
 });
 
@@ -271,6 +453,34 @@ describe("buildCacheEntry", () => {
     });
     expect(entry.status).toBe("error");
     expect(entry.note).toMatch(/HTTP 401/);
+  });
+
+  it("maps a no-oauth-client failure → status=skipped, not error (BLO-23403)", () => {
+    const entry = buildCacheEntry({
+      result: {
+        ok: false,
+        issuePageSlug: "issue-blo-1",
+        graph: null,
+        reason: "traverse_graph failed: gbrain OAuth: no client configured for agentId agent-x",
+        reasonKind: "no-oauth-client",
+      },
+      depth: 2,
+    });
+    expect(entry.status).toBe("skipped");
+    expect(entry.note).toMatch(/no client configured/);
+  });
+
+  it("still maps a configured-client auth/transport failure → status=error", () => {
+    const entry = buildCacheEntry({
+      result: {
+        ok: false,
+        issuePageSlug: "issue-blo-1",
+        graph: null,
+        reason: "traverse_graph failed: HTTP 403",
+      },
+      depth: 2,
+    });
+    expect(entry.status).toBe("error");
   });
 
   it("uses current time when nowIso omitted", () => {

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { flushSync } from "react-dom";
+import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SidebarProvider, useSidebar } from "../context/SidebarContext";
@@ -30,18 +30,11 @@ function Harness({ onRoute }: { onRoute: boolean }) {
   );
 }
 
-async function flushReact() {
-  await Promise.resolve();
-  await new Promise((resolve) => window.setTimeout(resolve, 0));
-  flushSync(() => {});
-}
-
-async function render(onRoute: boolean): Promise<{ root: Root; host: HTMLDivElement }> {
+function render(onRoute: boolean): { root: Root; host: HTMLDivElement } {
   const host = document.createElement("div");
   document.body.appendChild(host);
   const root = createRoot(host);
-  flushSync(() => root.render(<Harness onRoute={onRoute} />));
-  await flushReact();
+  act(() => root.render(<Harness onRoute={onRoute} />));
   return { root, host };
 }
 
@@ -75,47 +68,45 @@ describe("RequestCollapsedSidebar", () => {
 
   afterEach(() => {
     if (active) {
-      flushSync(() => active!.root.unmount());
+      act(() => active!.root.unmount());
       active.host.remove();
       active = null;
     }
     localStorage.clear();
   });
 
-  it("requests collapsed while mounted when there is no user pin", async () => {
-    active = await render(true);
+  it("requests collapsed while mounted when there is no user pin", () => {
+    active = render(true);
     expect(capturedValue?.routeRequestsCollapsed).toBe(true);
     expect(capturedValue?.collapsed).toBe(true);
   });
 
-  it("lets an explicit user pin override the route request", async () => {
-    active = await render(true);
+  it("lets an explicit user pin override the route request", () => {
+    active = render(true);
     expect(capturedValue?.collapsed).toBe(true);
 
     // User explicitly pins expanded — must win over the route's request.
-    flushSync(() => capturedValue?.setCollapsed(false));
+    act(() => capturedValue?.setCollapsed(false));
     expect(capturedValue?.routeRequestsCollapsed).toBe(true);
     expect(capturedValue?.collapsed).toBe(false);
   });
 
-  it("clears the request on unmount, restoring the global default", async () => {
-    active = await render(true);
+  it("clears the request on unmount, restoring the global default", () => {
+    active = render(true);
     expect(capturedValue?.collapsed).toBe(true);
 
     // Navigate away: the route (and its <RequestCollapsedSidebar/>) unmounts.
-    flushSync(() => active!.root.render(<Harness onRoute={false} />));
-    await flushReact();
+    act(() => active!.root.render(<Harness onRoute={false} />));
     expect(capturedValue?.routeRequestsCollapsed).toBe(false);
     expect(capturedValue?.collapsed).toBe(false);
   });
 
-  it("keeps a user pin after navigating away (pin persists, request cleared)", async () => {
-    active = await render(true);
-    flushSync(() => capturedValue?.setCollapsed(true));
+  it("keeps a user pin after navigating away (pin persists, request cleared)", () => {
+    active = render(true);
+    act(() => capturedValue?.setCollapsed(true));
     expect(localStorage.getItem(COLLAPSED_STORAGE_KEY)).toBe("1");
 
-    flushSync(() => active!.root.render(<Harness onRoute={false} />));
-    await flushReact();
+    act(() => active!.root.render(<Harness onRoute={false} />));
     // Route request gone, but the explicit collapsed pin still applies.
     expect(capturedValue?.routeRequestsCollapsed).toBe(false);
     expect(capturedValue?.collapsed).toBe(true);

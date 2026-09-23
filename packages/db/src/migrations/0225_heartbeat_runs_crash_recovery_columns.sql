@@ -1,0 +1,54 @@
+-- BLO-19722 / BLO-20822 — Phase A of three: durable state for worker-crash recovery.
+--
+-- `reconcileWorkerCrashedRuns` cannot infer "recovery finished" from the
+-- existence of a retry child. That inference is wrong in both directions:
+-- recovery deliberately completes *without* a retry when the agent is not
+-- invokable (`enqueueProcessLossRetry` suppresses it and releases the issue lock
+-- instead), so such a row would be replayed at every startup forever; and the
+-- retry is committed *before* the lifecycle-event and agent-finalization steps,
+-- so a crash in between made a genuinely unfinished row disappear from the
+-- candidate set. Recording completion explicitly is the only thing that gets
+-- both cases right.
+--
+-- WHY THIS FILE CONTAINS NOTHING BUT `ADD COLUMN`.
+--
+-- The production runner in `packages/db/src/client.ts` applies each pending
+-- migration file in its own transaction and commits that file's history row
+-- before starting the next. The previous single-file version of this migration
+-- added the column and then raised in the same file, demanding the operator
+-- precreate an index whose predicate referenced the column that transaction had
+-- just rolled back. The hinted `CREATE INDEX CONCURRENTLY` then failed with
+-- "column does not exist", and migrations could never advance — an unbreakable
+-- loop on any populated pre-0225 database.
+--
+-- Phase A therefore does the one thing that is unconditionally safe and can
+-- never fail: add nullable, defaultless columns. That is a catalog-only change
+-- with no table rewrite and no lock held for any meaningful time, on a table of
+-- any size. Phase B (0226) adds the supporting index and is written so it can
+-- never raise on a populated table. Phase C (0227) validates.
+--
+-- No backfill is needed: `error_code = 'worker_crashed'` is introduced by the
+-- same change that adds these columns, so there are no pre-existing rows to
+-- classify.
+ALTER TABLE "heartbeat_runs" ADD COLUMN IF NOT EXISTS "crash_recovery_completed_at" timestamp with time zone;
+--> statement-breakpoint
+-- Poison-row backoff state. A run whose *required* cleanup permanently fails
+-- must not starve the oldest-first candidate batch: candidates are ordered
+-- `asc(finished_at), asc(id)` and capped, so without this a handful of
+-- permanently-failing rows at the head of that order would freeze recovery of
+-- every newer run forever. Attempts and a next-attempt time let a failing row
+-- fall out of the candidate window and back off, while staying visibly
+-- *unresolved* — `crash_recovery_completed_at` stays NULL — rather than being
+-- falsely stamped complete just to drain the batch.
+--
+-- Nullable with no default rather than `NOT NULL DEFAULT 0`: this table is
+-- large, and a defaultless nullable column is unambiguously rewrite-free on
+-- every PostgreSQL major. Readers coalesce NULL to 0, matching how
+-- `process_loss_retry_count` is already read on this table.
+ALTER TABLE "heartbeat_runs" ADD COLUMN IF NOT EXISTS "crash_recovery_attempts" integer;
+--> statement-breakpoint
+ALTER TABLE "heartbeat_runs" ADD COLUMN IF NOT EXISTS "crash_recovery_next_attempt_at" timestamp with time zone;
+--> statement-breakpoint
+-- Kept for operators: which required step was still failing at the last
+-- attempt. Truncated by the writer; this is a diagnostic, not a control field.
+ALTER TABLE "heartbeat_runs" ADD COLUMN IF NOT EXISTS "crash_recovery_last_error" text;

@@ -94,7 +94,20 @@ export interface Agent {
   adapterConfig: Record<string, unknown>;
   runtimeConfig: AgentRuntimeConfig;
   defaultEnvironmentId?: string | null;
+  /**
+   * Display mirror of the monthly cap. Kept equal to the enforcing policy by
+   * every writer that goes through `budgets.upsertPolicy`, but the paths that
+   * write it alone can leave it stale — prefer `enforcedBudgetMonthlyCents`
+   * for anything that decides or reports. See BLO-27626.
+   */
   budgetMonthlyCents: number;
+  /**
+   * Amount of the active enforcing budget policy (agent scope, `billed_cents`,
+   * `calendar_month_utc`) — the value that actually stops the agent. `null`
+   * when no active policy exists, i.e. uncapped, which is distinct from `0`.
+   * Derived on read; absent on write responses.
+   */
+  enforcedBudgetMonthlyCents?: number | null;
   spentMonthlyCents: number;
   pauseReason: PauseReason | null;
   pausedAt: Date | null;

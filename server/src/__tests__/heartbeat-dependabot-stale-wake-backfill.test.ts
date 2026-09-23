@@ -57,6 +57,16 @@ vi.mock("../services/k8s-job-liveness.ts", () => ({
   readAgentJobRunStatusByName: vi.fn(async () => null),
   deleteAgentJobsForRun: vi.fn(async () => 1),
   hasActiveJobForAgent: vi.fn(async () => false),
+  // BLO-20251: exhaustive stub (no `...actual` spread) — a new export the
+  // reaper calls must be listed here or it arrives as `undefined` and throws.
+  // "unknown" is the fail-closed branch, i.e. pre-BLO-20251 reaper behaviour.
+  probeAgentPodActivity: vi.fn(async () => "unknown" as const),
+  // BLO-30087: the two silence bounds now live in this module so the stale-lock
+  // sweeper resolves the same values as the reaper. `undefined` here fails
+  // silently, not loudly — every `silentMs >= undefined` is false, so the
+  // hard-stale path would quietly stop firing instead of throwing.
+  AGENT_POD_HARD_STALE_MS: 45 * 60 * 1000,
+  AGENT_POD_BUSY_MAX_STALE_MS: 4 * 45 * 60 * 1000,
 }));
 
 vi.mock("../telemetry.ts", () => ({

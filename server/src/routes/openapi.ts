@@ -10,6 +10,7 @@ import {
   updateAgentInstructionsBundleSchema,
   upsertAgentInstructionsFileSchema,
   createAgentKeySchema,
+  agentMeRecoveryActionsQuerySchema,
   builtInAgentEmptyMutationSchema,
   builtInAgentProvisionSchema,
   generateSummarySlotSchema,
@@ -73,6 +74,7 @@ import {
   updateUserSecretValueSchema,
   // Approval
   createApprovalSchema,
+  listApprovalsQuerySchema,
   resolveApprovalSchema,
   requestApprovalRevisionSchema,
   resubmitApprovalSchema,
@@ -840,15 +842,37 @@ const AUTHENTICATED_OPERATIONS = new Set([
   "GET /api/plugins/rag-health",
 ]);
 
+// Every operation whose handler enforces instance admin. `BOARD_ONLY_PREFIXES`
+// would otherwise classify most of these as plain `board`, understating the
+// privilege boundary for spec-driven consumers. The openapi-routes suite walks
+// the route sources and fails if a handler calls `assertInstanceAdmin` without a
+// matching entry here, so keep this in sync with the routes rather than by hand.
 const INSTANCE_ADMIN_OPERATIONS = new Set([
   "POST /api/companies",
-  "POST /api/plugins/install",
   "POST /api/instance/reset",
   "POST /api/instance/database-backups",
+  "GET /api/instance/scheduler-heartbeats",
   "POST /api/service-account-tokens",
+  "GET /api/admin/users",
   "POST /api/admin/users/{userId}/promote-instance-admin",
   "POST /api/admin/users/{userId}/demote-instance-admin",
+  "GET /api/admin/users/{userId}/company-access",
   "PUT /api/admin/users/{userId}/company-access",
+  "POST /api/adapters/install",
+  "PATCH /api/adapters/{type}",
+  "PATCH /api/adapters/{type}/override",
+  "DELETE /api/adapters/{type}",
+  "POST /api/adapters/{type}/reload",
+  "POST /api/adapters/{type}/reinstall",
+  "POST /api/plugins/install",
+  "DELETE /api/plugins/{pluginId}",
+  "POST /api/plugins/{pluginId}/enable",
+  "POST /api/plugins/{pluginId}/disable",
+  "POST /api/plugins/{pluginId}/upgrade",
+  "GET /api/plugins/{pluginId}/config",
+  "POST /api/plugins/{pluginId}/config",
+  "POST /api/plugins/{pluginId}/config/test",
+  "POST /api/plugins/{pluginId}/jobs/{jobId}/trigger",
 ]);
 
 const CREATED_OPERATIONS = new Set([
@@ -1509,7 +1533,21 @@ registry.registerPath({
   method: "get",
   path: "/api/agents/me/inbox-lite",
   tags: ["agents"],
-  summary: "Get current agent inbox (lite)",
+  summary: "Get current agent inbox (lite) — todo, in_progress, blocked (in_review excluded)",
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/agents/me/recovery-actions",
+  tags: ["agents"],
+  summary: "List recovery actions the current agent OWNS (defaults to active + escalated)",
+  description:
+    "Owner-scoped view of recovery beacons. Distinct from inbox-lite, which carries " +
+    "`activeRecoveryAction` only for issues the agent is the ASSIGNEE of — a beacon " +
+    "routinely names this agent as owner on a row assigned to someone else, and those " +
+    "obligations appear only here.",
+  request: { query: agentMeRecoveryActionsQuerySchema },
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
 
@@ -2841,8 +2879,14 @@ registry.registerPath({
   path: "/api/companies/{companyId}/approvals",
   tags: ["approvals"],
   summary: "List approvals in a company",
-  request: { params: z.object({ companyId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  description:
+    "view=full (default) returns whole payload bodies. Use view=count or view=summary for a cheap " +
+    "existence check before filing a new approval — summary omits payload and adds a derived label.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: listApprovalsQuerySchema,
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({
@@ -2927,7 +2971,8 @@ registry.registerPath({
   method: "post",
   path: "/api/approvals/{id}/withdraw",
   tags: ["approvals"],
-  summary: "Withdraw an approval request (requesting agent or board)",
+  summary:
+    "Withdraw an undecided approval request (requesting agent or board). Accepts `pending` and `revision_requested`; a decision note already written by the board is preserved and the withdrawal reason is recorded as an approval comment.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(withdrawApprovalSchema),
@@ -2939,6 +2984,23 @@ registry.registerPath({
     403: r.forbidden,
     404: r.notFound,
     409: r.conflict,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/approvals/{id}/apply",
+  tags: ["approvals"],
+  summary:
+    "Apply the values an approved card recorded to the objects that enforce them (requesting agent). Takes no body — every figure comes from the approved payload, so this route cannot express a figure the board did not decide. Refuses when the card is not `approved` (409), the caller is not the requester or the target is the caller's own budget (403), or no assertion resolves to an exact, still-unapplied target (422). Applying is idempotent. Approval authority is unchanged: `approve`/`reject`/`request-revision` remain board-only.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
   },
 });
 
@@ -3070,8 +3132,17 @@ registry.registerPath({
   path: "/api/companies/{companyId}/activity",
   tags: ["activity"],
   summary: "List company activity",
-  request: { params: z.object({ companyId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      agentId: z.string().uuid().optional(),
+      entityType: z.string().optional(),
+      entityId: z.string().optional(),
+      action: z.string().optional(),
+      limit: z.string().optional(),
+    }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({
@@ -3100,7 +3171,7 @@ registry.registerPath({
   tags: ["activity"],
   summary: "List activity for an issue",
   request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({
@@ -3109,7 +3180,7 @@ registry.registerPath({
   tags: ["activity"],
   summary: "List runs for an issue",
   request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({
@@ -3118,7 +3189,7 @@ registry.registerPath({
   tags: ["activity"],
   summary: "List issues for a heartbeat run",
   request: { params: z.object({ runId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 // ─── Dashboard ───────────────────────────────────────────────────────────────
@@ -3154,6 +3225,28 @@ registry.registerPath({
     query: z.object({
       weeks: z.string().optional(),
       threshold: z.string().optional(),
+    }),
+  },
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/recovery-actions",
+  tags: ["dashboard"],
+  summary: "List issue recovery actions",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      ownerAgentId: z.string().uuid().optional(),
+      kind: z.string().optional(),
+      status: z.string().optional(),
+      limit: z.string().optional(),
+      offset: z.string().optional(),
+      // Documented because `asc` is what makes a census of the legacy tail
+      // reachable at all past the 500-row limit; the route has accepted both
+      // since BLO-19124 but neither appeared here.
+      order: z.enum(["asc", "desc"]).optional(),
     }),
   },
   responses: { 200: r.ok(), 401: r.unauthorized },
@@ -3716,6 +3809,21 @@ registry.registerPath({
     params: z.object({ companyId: z.string() }),
     query: z.object({
       lookbackHours: z.coerce.number().int().min(1).max(168).optional(),
+      limit: z.coerce.number().int().min(1).max(1000).optional(),
+    }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/parked-agents",
+  tags: ["runs"],
+  summary: "List agents parked on a scheduled retry, and when each is due to run again",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      reason: z.string().min(1).max(64).optional(),
       limit: z.coerce.number().int().min(1).max(1000).optional(),
     }),
   },
@@ -4976,6 +5084,9 @@ registry.registerPath({
   path: "/api/plugins/{pluginId}/config",
   tags: ["plugins"],
   summary: "Get company-scoped plugin config",
+  description:
+    "Requires instance admin. Secret-bearing values are returned as `__redacted__`; " +
+    "posting the response back unchanged preserves the stored secret.",
   request: {
     params: z.object({ pluginId: z.string() }),
     query: z.object({ companyId: z.string() }),
@@ -4988,6 +5099,9 @@ registry.registerPath({
   path: "/api/plugins/{pluginId}/config",
   tags: ["plugins"],
   summary: "Set company-scoped plugin config",
+  description:
+    "Requires instance admin. A field sent as `__redacted__` keeps its stored value; " +
+    "the sentinel is never persisted.",
   request: {
     params: z.object({ pluginId: z.string() }),
     body: jsonBody(z.object({ companyId: z.string(), configJson: z.record(z.unknown()) })),
@@ -5000,6 +5114,9 @@ registry.registerPath({
   path: "/api/plugins/{pluginId}/config/test",
   tags: ["plugins"],
   summary: "Test company-scoped plugin config",
+  description:
+    "Requires instance admin. Restores masked (`__redacted__`) fields from stored config " +
+    "before handing them to the plugin worker.",
   request: {
     params: z.object({ pluginId: z.string() }),
     body: jsonBody(z.object({ companyId: z.string(), configJson: z.record(z.unknown()) })),
@@ -5503,6 +5620,11 @@ for (const route of [
   ["get", "/api/companies/{companyId}/search", "Search company data"],
   ["get", "/api/companies/{companyId}/search/extract", "Extract company search matches"],
   ["get", "/api/companies/{companyId}/issues/count", "Count issues in a company"],
+  [
+    "get",
+    "/api/companies/{companyId}/issues/open-assignment-census",
+    "Authoritative per-agent open-assignment census (single snapshot, not paginated)",
+  ],
 ] as const) {
   registerCurrentRoute({
     method: route[0],

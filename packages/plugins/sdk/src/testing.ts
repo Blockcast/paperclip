@@ -69,6 +69,7 @@ import type {
   PluginEnvironmentDeleteTemplateResult,
   PluginPerformActionActorContext,
   PluginPerformActionContext,
+  WorkerToHostMethods,
 } from "./protocol.js";
 
 export interface TestHarnessOptions {
@@ -150,6 +151,10 @@ export interface TestHarness {
   logs: TestHarnessLogEntry[];
   activity: Array<{ message: string; entityType?: string; entityId?: string; metadata?: Record<string, unknown> }>;
   metrics: Array<{ name: string; value: number; tags?: Record<string, string> }>;
+  /** Finance events recorded via `ctx.costs.recordFinanceEvent`, in call order. */
+  financeEvents: Array<
+    WorkerToHostMethods["costs.finance.create"][0] & { id: string }
+  >;
   telemetry: Array<{ eventName: string; dimensions?: Record<string, string | number | boolean> }>;
   dbQueries: Array<{ sql: string; params?: unknown[] }>;
   dbExecutes: Array<{ sql: string; params?: unknown[] }>;
@@ -490,6 +495,9 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
   const logs: TestHarnessLogEntry[] = [];
   const activity: TestHarness["activity"] = [];
   const metrics: TestHarness["metrics"] = [];
+  const financeEvents: TestHarness["financeEvents"] = [];
+  /** `${companyId}::${externalInvoiceId}` -> id, mirroring the host's idempotency guard. */
+  const financeEventKeys = new Map<string, string>();
   const telemetry: TestHarness["telemetry"] = [];
   const dbQueries: TestHarness["dbQueries"] = [];
   const dbExecutes: TestHarness["dbExecutes"] = [];
@@ -903,6 +911,10 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         requireCapability(manifest, capabilitySet, "secrets.read-ref");
         return `resolved:${secretRef}`;
       },
+      async verify(secretRef, presented) {
+        requireCapability(manifest, capabilitySet, "secrets.verify-ref");
+        return presented === `resolved:${secretRef}`;
+      },
       async list(_companyId) {
         requireCapability(manifest, capabilitySet, "secrets.list");
         return [];
@@ -1066,8 +1078,102 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         const projectId = (issue as unknown as Record<string, unknown>)?.projectId as string | undefined;
         if (!projectId) return null;
         if (!isInCompany(projects.get(projectId), companyId)) return null;
+
+        // BLO-31349: mirror the host — prefer the issue's own bound execution
+        // workspace, so BOTH limbs of the contract are reachable from the
+        // double. Seed one via `seed({ executionWorkspaces: [...] })` and point
+        // the issue's `executionWorkspaceId` at it. Previously this hard-coded
+        // `isIssueScoped: false`, which meant a plugin author who correctly
+        // branched on the flag had the `true` limb permanently untested, while
+        // one who ignored it and wrote to `path` still saw green tests.
+        const executionWorkspaceId = (issue as unknown as Record<string, unknown>)
+          ?.executionWorkspaceId as string | undefined;
+        if (executionWorkspaceId) {
+          const executionWorkspace = executionWorkspaces.get(executionWorkspaceId);
+          // Mirror ALL THREE of the host's rejection conditions
+          // (`plugin-host-services.ts` `getWorkspaceForIssue`): wrong company,
+          // closed/archived, and no realized `cwd`. Dropping any one of them
+          // makes the double model a workspace the host would refuse, so a
+          // plugin author who tested the fallback here would see `true` in the
+          // harness and `false` in production. Seed `closed: true` to exercise
+          // the torn-down-workspace fallback.
+          //
+          // The three CONDITIONS are mirrored; the host's path/name
+          // TRANSFORMATIONS are not. The host's third condition is really
+          // "`sanitizeWorkspacePath(cwd)` is non-empty", which additionally
+          // rejects a `cwd` with no slash or one matching `UUID_PATTERN`, and
+          // the host labels via `sanitizeWorkspaceName(name, path)`, which
+          // rejects UUID- or path-shaped names. Any realistic seeded path and
+          // name pass both, so nothing diverges today — but do not read this
+          // block as a full reimplementation of the host's sanitizers.
+          //
+          // The host's PROJECT-LEVEL fallbacks are not mirrored either. It
+          // resolves `repoUrl: workspace.repoUrl ?? project.codebase.repoUrl`,
+          // `repoRef: … ?? project.codebase.repoRef` and `defaultRef: … ??
+          // project.codebase.defaultRef`; the double takes all three straight
+          // off the execution workspace, because the harness seeds projects
+          // with no `codebase` to fall back to. A worktree row commonly
+          // inherits the project's repo rather than restating it, so a
+          // workspace seeded with `repoUrl: null` yields `null` here where the
+          // host would yield the project URL — a plugin gated on
+          // `if (!ws.repoUrl)` takes opposite limbs in test and production.
+          // Seed those three fields explicitly if your plugin branches on them.
+          if (
+            isInCompany(executionWorkspace, companyId) &&
+            !executionWorkspace?.closed &&
+            executionWorkspace?.cwd
+          ) {
+            const now = new Date().toISOString();
+            return {
+              id: executionWorkspace.id,
+              projectId: executionWorkspace.projectId,
+              // `name` first, to match the host, which labels the result with
+              // the execution workspace's own name column; `branchName`/`id`
+              // remain as fallbacks for a double seeded without a name.
+              name: executionWorkspace.name ?? executionWorkspace.branchName ?? executionWorkspace.id,
+              path: executionWorkspace.cwd,
+              repoUrl: executionWorkspace.repoUrl,
+              repoRef: executionWorkspace.branchName,
+              defaultRef: executionWorkspace.baseRef,
+              branchName: executionWorkspace.branchName,
+              isPrimary: false,
+              isIssueScoped: true,
+              // Never `null`/`undefined` on this limb: the host's `mode` is a
+              // non-null column, so an issue-scoped result always carries a
+              // real mode. Emitting `{ isIssueScoped: true, mode: null }` would
+              // contradict the `mode` contract in `types.ts`, which tells
+              // callers to read a falsy `mode` as project-scoped — so a plugin
+              // following that advice, against a workspace seeded without the
+              // optional `mode`, would see a result claiming both at once.
+              //
+              // The substitute FAILS CLOSED. `isolated_workspace` and
+              // `cloud_sandbox` are the two modes that promise the path is
+              // private to one issue, so inventing either for a field the
+              // author never set would hand an unseeded fixture the strongest
+              // privacy claim available: a plugin doing
+              // `if (ws.mode === "isolated_workspace") destructiveWrite()`
+              // would take the confined limb in the harness while production
+              // took whichever real mode the row carries. `shared_workspace` is
+              // equally non-null and equally host-reachable, and drives that
+              // check false. Note `??` also substitutes for an explicitly
+              // seeded `null`, which the type permits — same reasoning: "the
+              // author said nothing about isolation" must not read as "the
+              // author claimed isolation".
+              mode: executionWorkspace.mode ?? "shared_workspace",
+              createdAt: now,
+              updatedAt: now,
+            };
+          }
+        }
+
         const workspaces = projectWorkspaces.get(projectId) ?? [];
-        return workspaces.find((workspace) => workspace.isPrimary) ?? null;
+        const primary = workspaces.find((workspace) => workspace.isPrimary);
+        if (!primary) return null;
+        // No live execution workspace bound: this is the project-scoped
+        // fallback. Say so explicitly — leaving the field undefined would let a
+        // plugin test pass while the plugin treats a base checkout as an
+        // issue-scoped working copy.
+        return { ...primary, isIssueScoped: false, mode: null };
       },
       // Lucitra extension
       async create(input) {
@@ -1144,6 +1250,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
             },
             workspaces: [],
             primaryWorkspace: null,
+            primaryWorkspaceSource: "none" as const,
             managedByPlugin: {
               id: `managed-${projects.size + 1}`,
               pluginId: manifest.id,
@@ -1819,24 +1926,87 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         if (!isInCompany(parentIssue, companyId)) {
           throw new Error(`Issue not found: ${issueId}`);
         }
+        // Mirror the host's idempotent-create contract (`issues.addComment` +
+        // the three partial unique indexes in `0206_issue_comment_idempotency`):
+        // a second create carrying a key already written to this issue returns
+        // the existing comment with `deduplicated: true` rather than inserting.
+        //
+        // Two details are load-bearing for plugins that rely on the key instead
+        // of their own dedup layer, so they are reproduced rather than
+        // approximated:
+        //  - The scope is (issue, author, key), not (issue, key). The real
+        //    indexes are partial and author-scoped, so an agent-authored and a
+        //    system-authored comment can hold the same key on one issue.
+        //  - Empty and whitespace-only keys count as omitted, matching the
+        //    host's `readNonEmptyParam`. Otherwise `""` would dedup every
+        //    keyless-looking create against the first one.
+        // One detail is deliberately *not* reproduced: this stores the raw
+        // caller key, where the host stores `plugin:${pluginId}:${key}`. Tests
+        // asserting the key should assert the call argument, which is the level
+        // a plugin controls. Do not read this fake as evidence that the host's
+        // namespacing is unnecessary — it cannot model the cross-plugin
+        // collision that namespacing exists to prevent, where two plugins
+        // sharing a natural key on one issue would hand the second caller the
+        // first's body with `deduplicated: true` and no error.
+        // Everything up to the push below is synchronous, so concurrent callers
+        // cannot interleave here — the same atomicity the unique index gives us
+        // in Postgres, which is what makes the concurrency tests meaningful.
+        const idempotencyKey = options?.idempotencyKey?.trim() || null;
+        const authorAgentId = options?.authorAgentId ?? null;
+        const existingForIssue = issueComments.get(issueId) ?? [];
+        if (idempotencyKey) {
+          const duplicate = existingForIssue.find(
+            (candidate) =>
+              candidate.idempotencyKey === idempotencyKey &&
+              candidate.authorAgentId === authorAgentId &&
+              !candidate.deletedAt,
+          );
+          if (duplicate) return { ...duplicate, deduplicated: true };
+        }
         const now = new Date();
         const comment: IssueComment = {
           id: randomUUID(),
           companyId: parentIssue.companyId,
           issueId,
-          authorType: options?.authorAgentId ? "agent" : "system",
-          authorAgentId: options?.authorAgentId ?? null,
+          authorType: authorAgentId ? "agent" : "system",
+          authorAgentId,
           authorUserId: null,
           body,
           presentation: null,
           metadata: null,
           createdAt: now,
           updatedAt: now,
+          ...(idempotencyKey ? { idempotencyKey } : {}),
         };
-        const current = issueComments.get(issueId) ?? [];
-        current.push(comment);
-        issueComments.set(issueId, current);
+        existingForIssue.push(comment);
+        issueComments.set(issueId, existingForIssue);
         return comment;
+      },
+      async updateComment(issueId, idempotencyKey, body, companyId, options) {
+        requireCapability(manifest, capabilitySet, "issue.comments.update");
+        if (!isInCompany(issues.get(issueId), companyId)) {
+          throw new Error(`Issue not found: ${issueId}`);
+        }
+        // Same `(issue, author, key)` scope and same live-row filter as the
+        // host's `updateCommentByIdempotencyKey`, so a plugin that gets the
+        // author or the key wrong sees the null here that it would see in
+        // production rather than a convenient match. As in `createComment`, the
+        // raw caller key is stored — the host's `plugin:<pluginId>:` namespace
+        // is not modelled, so do not read a match here as evidence that another
+        // plugin's comment would be unreachable; that is the namespace's job.
+        const key = idempotencyKey?.trim();
+        if (!key) throw new Error("updateComment requires a non-empty idempotencyKey");
+        const authorAgentId = options?.authorAgentId ?? null;
+        const existing = (issueComments.get(issueId) ?? []).find(
+          (candidate) =>
+            candidate.idempotencyKey === key &&
+            candidate.authorAgentId === authorAgentId &&
+            !candidate.deletedAt,
+        );
+        if (!existing) return null;
+        existing.body = body;
+        existing.updatedAt = new Date();
+        return existing;
       },
       async createInteraction(issueId, interaction, companyId, options) {
         requireCapability(manifest, capabilitySet, "issue.interactions.create");
@@ -2539,6 +2709,22 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         toolHandlers.set(name, fn);
       },
     },
+    costs: {
+      async recordFinanceEvent(params) {
+        requireCapability(manifest, capabilitySet, "costs.write");
+        const key = params.externalInvoiceId
+          ? `${params.companyId}::${params.externalInvoiceId}`
+          : null;
+        const existing = key ? financeEventKeys.get(key) : undefined;
+        if (existing) {
+          return { id: existing, created: false };
+        }
+        const id = `finance-${financeEvents.length + 1}`;
+        if (key) financeEventKeys.set(key, id);
+        financeEvents.push({ ...params, id });
+        return { id, created: true };
+      },
+    },
     metrics: {
       async write(name, value, tags) {
         requireCapability(manifest, capabilitySet, "metrics.write");
@@ -2690,6 +2876,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
     logs,
     activity,
     metrics,
+    financeEvents,
     telemetry,
     dbQueries,
     dbExecutes,

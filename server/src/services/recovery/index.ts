@@ -34,8 +34,10 @@ export {
   strandedRecoveryWakeAttemptsExhausted,
 } from "./service.js";
 export {
+  DETERMINISTIC_SKILL_FAILURE_ERROR_CODE,
   ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES,
   ZERO_TOKEN_SESSION_RESET_RETRY_REASON,
+  isLegacySessionUnavailableAdapterMismatch,
   isZeroTokenStartupFailureRun,
   isZeroTokenSessionResetRetryRun,
   runUsageTokenCounts,
@@ -75,3 +77,18 @@ export type {
   SuccessfulRunHandoffNotice,
   SuccessfulRunHandoffDecision,
 } from "./successful-run-handoff.js";
+// BLO-27635: the stranded-escalation status rule. Exported here alongside the other
+// pure recovery predicates so the reconciler work on BLO-27553 can reuse the exact
+// same three-way test rather than re-deriving it from the owner/blocker columns —
+// a drain and a producer that disagree on what "no recovery path" means is how the
+// `blocked`-with-no-blocker backlog accumulated in the first place.
+export {
+  resolveStrandedEscalationStatus,
+  shouldReuseStrandedRecoveryAction,
+} from "./stranded-escalation-status.js";
+export type {
+  StrandedEscalationStatus,
+  StrandedEscalationStatusInput,
+  StrandedEscalationStatusDecision,
+  StrandedRecoveryActionReuseInput,
+} from "./stranded-escalation-status.js";

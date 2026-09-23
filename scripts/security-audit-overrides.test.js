@@ -5,6 +5,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
+import {
+  fastUriAdvisoriesFor,
+  fastUriLockfileVersions,
+  isVulnerableFastUri,
+} from "./fast-uri-advisory.js";
+
 const execFileAsync = promisify(execFile);
 const repoRoot = new URL("..", import.meta.url);
 
@@ -40,50 +46,80 @@ async function main() {
     });
 
     await runPnpm(
-      ["install", "--lockfile-only", "--frozen-lockfile=false", "--ignore-scripts"],
+      [
+        "install",
+        "--lockfile-only",
+        "--frozen-lockfile=false",
+        "--ignore-scripts",
+      ],
       fixtureRoot,
     );
 
     const packageJson = JSON.parse(
       await readFile(join(fixtureRoot, "package.json"), "utf8"),
     );
-    assert.equal(packageJson.pnpm.overrides["fast-uri"], "^3.1.5");
+    assert.equal(packageJson.pnpm.overrides["fast-uri"], "^3.1.6");
 
-    const lockfile = await readFile(join(fixtureRoot, "pnpm-lock.yaml"), "utf8");
-    const fastUriResolution = lockfile.match(
-      /^  fast-uri@(\d+)\.(\d+)\.(\d+):$/m,
+    const lockfile = await readFile(
+      join(fixtureRoot, "pnpm-lock.yaml"),
+      "utf8",
     );
-    assert.ok(fastUriResolution, "lockfile missing fast-uri resolution");
-    const [, major, minor, patch] = fastUriResolution.map(Number);
+    // Scan + count cross-check live in fast-uri-advisory.js, where the CI-run
+    // test pins every key shape. This file is referenced by no workflow.
+    const fastUriEntries = fastUriLockfileVersions(lockfile);
     assert.ok(
-      major > 3 || (major === 3 && (minor > 1 || (minor === 1 && patch >= 5))),
-      `lockfile resolved vulnerable fast-uri ${major}.${minor}.${patch}`,
+      fastUriEntries.length > 0,
+      "lockfile missing fast-uri resolution",
     );
+    for (const version of fastUriEntries) {
+      assert.ok(
+        !isVulnerableFastUri(version),
+        `lockfile resolved fast-uri ${version}, vulnerable per ${fastUriAdvisoriesFor(version).join(", ")}`,
+      );
+    }
+
     const designerLockfile = JSON.parse(
       await readFile(
         join(fixtureRoot, "packages/services/designer/package-lock.json"),
         "utf8",
       ),
     );
-    const [designerMajor, designerMinor, designerPatch] = designerLockfile.packages[
-      "node_modules/fast-uri"
-    ].version
-      .split(".")
-      .map(Number);
-    assert.ok(
-      designerMajor > 3 ||
-        (designerMajor === 3 &&
-          (designerMinor > 1 || (designerMinor === 1 && designerPatch >= 5))),
-      "designer lockfile resolved vulnerable fast-uri",
+    // Enumerate every nested resolution, not just the top-level node — a
+    // second copy under a transitive dependency is exactly what a floor guard
+    // exists to catch. Asserting the set is non-empty keeps a dropped
+    // dependency from reading as "nothing vulnerable found".
+    const designerResolutions = Object.entries(
+      designerLockfile.packages,
+    ).filter(
+      ([path]) =>
+        path === "node_modules/fast-uri" ||
+        path.endsWith("/node_modules/fast-uri"),
     );
+    assert.ok(
+      designerResolutions.length > 0,
+      "designer lockfile missing fast-uri resolution",
+    );
+    for (const [path, fastUri] of designerResolutions) {
+      assert.ok(
+        !isVulnerableFastUri(fastUri.version),
+        `designer lockfile ${path} resolved fast-uri ${fastUri.version}, vulnerable per ${fastUriAdvisoriesFor(fastUri.version).join(", ")}`,
+      );
+    }
     assertIncludes(lockfile, "undici@6.27.0:", "lockfile");
     assertIncludes(lockfile, "undici@7.29.0:", "lockfile");
-    assertIncludes(lockfile, "multer@2.2.0:", "lockfile");
+    assertIncludes(lockfile, "multer@2.3.0:", "lockfile");
     assertIncludes(lockfile, "'@babel/core@7.29.7':", "lockfile");
     assertIncludes(lockfile, "esbuild@0.28.1:", "lockfile");
-    assertIncludes(lockfile, "js-yaml@4.3.0:", "lockfile");
-    const uiViteConfig = await readFile(join(fixtureRoot, "ui/vite.config.ts"), "utf8");
-    assertIncludes(uiViteConfig, 'const UI_ESBUILD_TARGET = "es2022";', "ui vite config");
+    assertIncludes(lockfile, "js-yaml@4.3.2:", "lockfile");
+    const uiViteConfig = await readFile(
+      join(fixtureRoot, "ui/vite.config.ts"),
+      "utf8",
+    );
+    assertIncludes(
+      uiViteConfig,
+      'const UI_ESBUILD_TARGET = "es2022";',
+      "ui vite config",
+    );
     assertIncludes(uiViteConfig, "optimizeDeps", "ui vite config");
     assert.match(
       lockfile,
@@ -96,7 +132,11 @@ async function main() {
       "jsdom must resolve undici 7.29.0",
     );
 
-    const audit = await runPnpm(["audit", "--prod", "--json"], fixtureRoot, true);
+    const audit = await runPnpm(
+      ["audit", "--prod", "--json"],
+      fixtureRoot,
+      true,
+    );
     const auditJson = JSON.parse(audit.stdout);
     assert.equal(auditJson.metadata.vulnerabilities.moderate, 0);
     assert.equal(auditJson.metadata.vulnerabilities.high, 0);

@@ -19,6 +19,27 @@ const K8S_JOB_LIVENESS_TIMEOUT_SECONDS = Math.max(
   Math.ceil(K8S_JOB_LIVENESS_TIMEOUT_MS / 1000),
 );
 
+// BLO-20801 (Ally review round 3/4): an accepted DELETE response is not proof
+// the Job is gone, nor proof that its dependent Pods have released any PVCs.
+// `deleteStaleTerminalJob` requests foreground deletion, then re-reads the
+// exact Job by name and only trusts the waiver once that read confirms a 404,
+// bounded by this small retry budget so a still-terminating Job fails closed
+// (stays blocking) rather than being trusted on the DELETE response alone.
+const STALE_JOB_DELETE_CONFIRM_ATTEMPTS = Math.max(
+  1,
+  Number(process.env.PAPERCLIP_K8S_STALE_JOB_DELETE_CONFIRM_ATTEMPTS ?? "3"),
+);
+const STALE_JOB_DELETE_CONFIRM_DELAY_MS = Math.max(
+  0,
+  Number(
+    process.env.PAPERCLIP_K8S_STALE_JOB_DELETE_CONFIRM_DELAY_MS ?? (IS_TEST_ENVIRONMENT ? "0" : "150"),
+  ),
+);
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // Agent Job manifests carry app.kubernetes.io/managed-by=paperclip and a
 // paperclip.io/run-id label that maps directly to heartbeat_runs.id. The
 // adapters set both unconditionally; see paperclip-adapter-claude-k8s
@@ -43,6 +64,127 @@ const FAILURE_LOG_TAIL_LINES = Math.max(
 const FAILURE_LOG_TAIL_MAX_BYTES = Math.max(
   1024,
   Number(process.env.PAPERCLIP_K8S_FAILURE_LOG_TAIL_MAX_BYTES ?? "16384"),
+);
+
+// BLO-20251 (Ally review) — a malformed override must not silently disarm the
+// liveness probe. `Number("abc")` is NaN, and NaN survives Math.max, so the
+// older `Math.max(1, Number(env))` shape yielded a NaN threshold; every
+// `millicores >= NaN` comparison is then false, every sampled pod classifies as
+// "idle", and the hard-stale reaper kills exactly the live subprocesses this
+// module exists to protect. Fail closed onto the documented default instead,
+// mirroring how parseCpuQuantityToMillicores rejects a non-finite magnitude
+// rather than guessing.
+//
+// Falls back rather than throwing: these are background-reaper tunables read at
+// import time, and a typo in a deployment value should not take the whole API
+// server down. Exported for unit testing, like parseCpuQuantityToMillicores.
+export function numberFromEnv(name: string, fallback: number, minimum: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const parsed = Number(raw.trim());
+  if (!Number.isFinite(parsed) || parsed < minimum) {
+    logger.warn(
+      { env: name, value: redactSensitiveText(raw), fallback },
+      "invalid k8s liveness tunable; falling back to default",
+    );
+    return fallback;
+  }
+  return parsed;
+}
+
+// BLO-20251 — subprocess liveness for the hard-stale reaper.
+//
+// WHY POD CPU, and not the alternatives:
+//
+//   * adapter stdout (`heartbeat_runs.last_output_at`) is what the reaper
+//     already keys on, and it is exactly the signal that fails here. The
+//     claude_k8s Job pipes only the agent CLI's own stdout to the pod log
+//     (`claude ... | tee <podLog>`, see paperclip-adapter-claude-k8s
+//     job-manifest.ts). While the agent sits in a Bash tool call, the CLI emits
+//     the tool_use event, then nothing until the tool_result — so a 20-minute
+//     `pnpm install` is byte-for-byte indistinguishable from a wedged process.
+//
+//   * workspace mtime would catch a dependency install (it writes into
+//     node_modules on the shared PVC) but NOT a docker build, whose writes go
+//     to the DinD sidecar's emptyDir graph rather than the workspace. It also
+//     needs a recursive walk to be reliable, which is far more expensive than
+//     one metrics read.
+//
+//   * a longer grace window only trades a wrong answer for a slower wrong
+//     answer — a genuinely wedged pod would hold its agent's dispatch slot for
+//     the whole extension.
+//
+// Pod CPU covers all three AC cases (install, test suite, image build), is
+// summed across containers so the DinD sidecar's work counts, and costs one
+// namespace-wide metrics read per reaper tick (cached below). It is read ONLY
+// for runs that already crossed the hard-stale threshold, so the steady-state
+// cost is zero.
+//
+// Verified against the live cluster 2026-08-22: PodMetrics objects mirror the
+// pod's labels (so `paperclip.io/run-id` is present and the managed-by
+// labelSelector filters server-side), and agent pods report CPU in BOTH `n` and
+// `u` units in the same listing — hence the unit handling in the parser below.
+//
+// Threshold: from that same listing — agents idling on an LLM round-trip sit at
+// 8-26m, agents running real subprocesses at 148-2979m. 100m sits in that gap.
+// Being wrong in the "busy" direction only DELAYS the kill to the absolute
+// ceiling enforced by the caller, so the conservative choice is the safe one.
+const AGENT_POD_BUSY_CPU_MILLICORES = numberFromEnv(
+  "PAPERCLIP_K8S_AGENT_POD_BUSY_CPU_MILLICORES",
+  100,
+  // A 0m threshold would classify every pod busy forever, so the floor is 1m.
+  1,
+);
+
+// BLO-20251 / BLO-30087: the two silence bounds that gate the busy-pod
+// deferral. They live HERE, in the leaf module that owns probeAgentPodActivity,
+// rather than in heartbeat.ts, because there are now multiple consumers of the
+// "silence == dead" heuristic and they must not be able to drift apart:
+//
+//   * the hard-stale reaper (heartbeat.ts) — KILLS the run
+//   * the stale-lock sweeper (recovery/service.ts) — FREES the issue lock
+//
+// heartbeat.ts imports recovery/service.js, so recovery cannot import heartbeat
+// and the constant could not simply be shared across. This module imports only
+// the k8s client, the logger and the redactor, so both consumers can depend on
+// it without a cycle.
+//
+// BLO-30087 is what happens when they DO drift: the reaper spared a busy pod up
+// to 3h while the sweeper still freed its lock at 2h, producing a run that was
+// alive and actively writing a shared workspace while its issue lock read free —
+// a state that was previously unreachable, because the 45min reaper always won
+// against the 2h sweeper. Two live runs then interleaved writes into one file.
+export const AGENT_POD_HARD_STALE_MS = 45 * 60 * 1000;
+// Absolute ceiling on how long a demonstrably-busy pod may defer. Without it a
+// run wedged in a CPU-burning spin loop would look "busy" forever and hold its
+// agent's dispatch slot indefinitely (the BLO-12996 starvation the force-reap
+// exists to prevent). 4x the floor (3h) is comfortably longer than any real
+// dependency install, test suite or image build we have observed.
+//
+// Parsed defensively via numberFromEnv, which falls back rather than passing a
+// malformed value through: every `silentMs >= NaN` comparison is false, so a NaN
+// here would make the ceiling silently vanish and let a busy-looking zombie hold
+// its slot — and now also its issue lock — forever. That is the one direction
+// this must never fail in.
+export const AGENT_POD_BUSY_MAX_STALE_MS = Math.max(
+  AGENT_POD_HARD_STALE_MS,
+  numberFromEnv(
+    "PAPERCLIP_EXTERNAL_LIFECYCLE_BUSY_POD_MAX_STALE_MS",
+    4 * AGENT_POD_HARD_STALE_MS,
+    1,
+  ),
+);
+
+// One namespace-wide PodMetrics read serves every hard-stale candidate in a
+// reaper tick. The TTL is deliberately shorter than a tick so consecutive ticks
+// re-read, but a tick with 20 stale candidates still makes a single call.
+// metrics-server itself only refreshes every ~15s, so a finer TTL would buy
+// nothing but load.
+const AGENT_POD_METRICS_CACHE_TTL_MS = numberFromEnv(
+  "PAPERCLIP_K8S_AGENT_POD_METRICS_CACHE_TTL_MS",
+  10_000,
+  // 0 is meaningful here: it disables the cache (every probe re-reads).
+  0,
 );
 
 export type AgentJobRunStatus = {
@@ -133,10 +275,48 @@ export type AgentJobFailureDiagnostics = {
   logTailTruncated: boolean;
 };
 
+export function classifyAgentJobFailureErrorCode(
+  diagnostics: AgentJobFailureDiagnostics | null,
+): "oom_killed" | "exit_137" | null {
+  const failedApps = diagnostics?.containers.filter(
+    (entry) => entry.kind === "app" && (entry.exitCode ?? 0) !== 0,
+  ) ?? [];
+  if (failedApps.some((entry) => entry.reason?.toLowerCase() === "oomkilled")) {
+    return "oom_killed";
+  }
+  return failedApps.some((entry) => entry.exitCode === 137) ? "exit_137" : null;
+}
+
 type ClientState =
   | { kind: "uninitialized" }
   | { kind: "unavailable"; reason: string }
-  | { kind: "ready"; batchApi: k8s.BatchV1Api; coreApi: k8s.CoreV1Api };
+  | {
+      kind: "ready";
+      batchApi: k8s.BatchV1Api;
+      coreApi: k8s.CoreV1Api;
+      // metrics.k8s.io is served by metrics-server, which is an optional
+      // cluster add-on, so every metrics *call* degrades to "unknown" rather
+      // than throwing.
+      //
+      // `null` when even CONSTRUCTING the client failed. An earlier draft of
+      // this change asserted construction "always succeeds" and built it inline
+      // with batchApi/coreApi. But `makeApiClient` throws
+      // `TypeError: apiClientType is not a constructor` whenever the symbol it
+      // is handed is absent (verified against @kubernetes/client-node 1.4.0),
+      // and that throw landed in initClient's shared catch. The whole client
+      // then went `unavailable`, and because hasActiveJobForAgent fails OPEN on
+      // a non-ready client (`return false`), an optional add-on's client
+      // construction could silently switch off the BLO-20801 double-dispatch /
+      // RWO-PVC multi-attach guard.
+      //
+      // `CustomObjectsApi` IS exported at 1.4.0, so this is drift/packaging
+      // risk rather than a live production fault — but it is not theoretical
+      // either: it is precisely how this broke all 13 cases of
+      // k8s-job-liveness-run-scoped.test.ts, whose mock exports no
+      // CustomObjectsApi. The optional dependency is therefore isolated: it may
+      // be null, and a null here costs only pod-CPU liveness.
+      metricsApi: k8s.CustomObjectsApi | null;
+    };
 
 let clientState: ClientState = { kind: "uninitialized" };
 
@@ -177,7 +357,22 @@ function initClient(): ClientState {
     }
     const batchApi = kc.makeApiClient(k8s.BatchV1Api);
     const coreApi = kc.makeApiClient(k8s.CoreV1Api);
-    clientState = { kind: "ready", batchApi, coreApi };
+    // Constructed in its OWN try: this client is optional, and a throw here
+    // must not reach the shared catch below. See the ClientState comment —
+    // letting it escape marks the entire client `unavailable`, and
+    // hasActiveJobForAgent fails OPEN on that, so a missing metrics symbol
+    // would disable the BLO-20801 double-dispatch guard rather than merely
+    // disabling pod-CPU liveness.
+    let metricsApi: k8s.CustomObjectsApi | null = null;
+    try {
+      metricsApi = kc.makeApiClient(k8s.CustomObjectsApi);
+    } catch (error) {
+      logger.warn(
+        { error: error instanceof Error ? error.message : String(error) },
+        "k8s metrics client unavailable; pod-CPU liveness disabled, job-liveness guard unaffected",
+      );
+    }
+    clientState = { kind: "ready", batchApi, coreApi, metricsApi };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     logger.warn({ error: reason }, "k8s job-liveness client init failed; falling back to staleness heuristic");
@@ -346,6 +541,131 @@ export async function listManagedAgentPods(): Promise<ManagedAgentPod[] | null> 
     );
     return null;
   }
+}
+
+/**
+ * Whether an agent pod is demonstrably doing work right now.
+ *
+ * "unknown" is NOT a synonym for "idle" and callers must not treat it as one:
+ * it means we have no evidence either way (no metrics-server, RBAC denied, the
+ * pod not yet scraped). Callers preserve their pre-BLO-20251 behaviour on
+ * "unknown" so a cluster without metrics-server reaps exactly as it did before.
+ */
+export type AgentPodActivity = "busy" | "idle" | "unknown";
+
+type PodMetricsItem = {
+  metadata?: { name?: string; labels?: Record<string, string> };
+  containers?: Array<{ name?: string; usage?: { cpu?: string } }>;
+};
+
+/**
+ * Parse a Kubernetes CPU quantity into millicores.
+ *
+ * metrics-server reports CPU in whichever unit keeps precision, so the same
+ * cluster yields "0", "46m", "2", and "1234567n" across pods. Returns null for
+ * anything unparseable rather than guessing — an unparseable sample must not
+ * read as 0 (that would look idle and license a kill).
+ */
+export function parseCpuQuantityToMillicores(raw: unknown): number | null {
+  if (typeof raw !== "string") return null;
+  const match = /^([0-9]*\.?[0-9]+)([a-zA-Z]*)$/.exec(raw.trim());
+  if (!match) return null;
+  const magnitude = Number(match[1]);
+  if (!Number.isFinite(magnitude)) return null;
+  switch (match[2]) {
+    case "n":
+      return magnitude / 1_000_000;
+    case "u":
+      return magnitude / 1_000;
+    case "m":
+      return magnitude;
+    case "":
+      return magnitude * 1_000;
+    default:
+      return null;
+  }
+}
+
+// `byRunId: null` is a cached FAILURE (metrics unavailable), distinct from a
+// cached empty map (metrics available, no agent pods). Collapsing the two would
+// turn "we cannot tell" into "idle" and reintroduce the very kill this fixes.
+let podMetricsCache: { at: number; byRunId: Map<string, number> | null } | null = null;
+
+async function readAgentPodCpuMillicoresByRunId(): Promise<Map<string, number> | null> {
+  const state = initClient();
+  if (state.kind !== "ready") return null;
+  // No metrics client at all (construction failed) is the same *answer* as a
+  // failed metrics call — "we cannot tell" — so it returns null and the reaper
+  // keeps its pre-existing behavior. Checked before the cache so a null client
+  // can never be mistaken for a cached empty map.
+  if (state.metricsApi === null) return null;
+  const now = Date.now();
+  if (podMetricsCache && now - podMetricsCache.at < AGENT_POD_METRICS_CACHE_TTL_MS) {
+    return podMetricsCache.byRunId;
+  }
+  try {
+    const response = await state.metricsApi.listNamespacedCustomObject(
+      {
+        group: "metrics.k8s.io",
+        version: "v1beta1",
+        namespace: PAPERCLIP_K8S_NAMESPACE,
+        plural: "pods",
+        labelSelector: AGENT_JOB_LABEL_SELECTOR,
+        timeoutSeconds: K8S_JOB_LIVENESS_TIMEOUT_SECONDS,
+      },
+      requestOptionsWithTimeout(),
+    );
+    const items = (response as { items?: PodMetricsItem[] } | null)?.items ?? [];
+    const byRunId = new Map<string, number>();
+    for (const item of items) {
+      const runId = item.metadata?.labels?.[RUN_ID_LABEL];
+      if (!runId) continue;
+      // Sum across containers so a docker build burning CPU in the DinD
+      // sidecar counts as liveness for the run that launched it. If NOT ONE
+      // container sample parses we leave the run out of the map entirely, so it
+      // reports "unknown" rather than a fabricated 0 — a 0 here would read as
+      // idle and license exactly the kill this exists to prevent.
+      let millicores = 0;
+      let parsedAnySample = false;
+      for (const container of item.containers ?? []) {
+        const parsed = parseCpuQuantityToMillicores(container.usage?.cpu);
+        if (parsed === null) continue;
+        millicores += parsed;
+        parsedAnySample = true;
+      }
+      if (!parsedAnySample) continue;
+      byRunId.set(runId, Math.max(byRunId.get(runId) ?? 0, millicores));
+    }
+    podMetricsCache = { at: now, byRunId };
+    return byRunId;
+  } catch (error) {
+    logger.debug(
+      { error: error instanceof Error ? error.message : String(error) },
+      "k8s pod-metrics read failed; hard-stale reaper falls back to output-silence only",
+    );
+    // Negative-cache so a cluster with no metrics-server does not pay one
+    // failed call per stale run per tick.
+    podMetricsCache = { at: now, byRunId: null };
+    return null;
+  }
+}
+
+/**
+ * BLO-20251: is this run's pod burning CPU right now?
+ *
+ * Used only for runs that already crossed EXTERNAL_LIFECYCLE_HARD_STALE_MS, to
+ * distinguish "blocked on a long silent subprocess" from "wedged". A run absent
+ * from the metrics list reports "unknown", not "idle" — metrics-server lags pod
+ * creation by ~15-30s and a missing sample is not evidence of idleness.
+ */
+export async function probeAgentPodActivity(runId: string): Promise<AgentPodActivity> {
+  const trimmed = runId.trim();
+  if (!trimmed) return "unknown";
+  const byRunId = await readAgentPodCpuMillicoresByRunId();
+  if (!byRunId) return "unknown";
+  const millicores = byRunId.get(trimmed);
+  if (millicores === undefined) return "unknown";
+  return millicores >= AGENT_POD_BUSY_CPU_MILLICORES ? "busy" : "idle";
 }
 
 function toIsoOrNull(value: unknown): string | null {
@@ -681,6 +1001,112 @@ export async function deleteAgentJobExact(
   }
 }
 
+/**
+ * BLO-20801: `jobBlocksDispatch` waives a Job whose run-id is DB-terminal
+ * and whose snapshot showed no active pods (missing status, or
+ * active/succeeded/failed all zero) -- but that snapshot is a separate,
+ * earlier read than whatever the dispatch gate does next, and the Job's
+ * controller can create/retry a pod at any point in between (it has not
+ * been told to stop). Closing that window means removing the Job itself
+ * rather than trusting the stale read: this re-reads the Job immediately
+ * before deleting and refuses to delete (returns "still-active") if it has
+ * since gained an active pod, so a Job that raced to real work is never
+ * killed. Callers must treat every outcome other than "deleted"/"missing"
+ * as still-blocking (fail closed) -- this is a stricter, purpose-built
+ * sibling of `deleteAgentJobExact` and does not change that function's
+ * existing reaper call sites.
+ *
+ * BLO-20801 (Ally review round 3/4): a DELETE response of 200/202 only means
+ * the API server accepted the request. Treating that response itself as proof
+ * of absence would reopen the exact double-execution race this function exists
+ * to close, so deletion uses foreground propagation and then re-reads the exact
+ * Job by name with a small bounded retry until that read confirms a 404
+ * (`"deleted"`), sees the Job gained an active pod in the meantime
+ * (`"still-active"`), or exhausts the retry budget without either -- which
+ * fails closed (`null`) exactly like any other unconfirmed outcome.
+ */
+export async function deleteStaleTerminalJob(
+  identity: ExactAgentJobIdentity,
+): Promise<"deleted" | "missing" | "still-active" | "mismatch" | null> {
+  const state = initClient();
+  if (state.kind !== "ready") return null;
+  try {
+    const job = await state.batchApi.readNamespacedJob(
+      { name: identity.name, namespace: PAPERCLIP_K8S_NAMESPACE },
+      requestOptionsWithTimeout(),
+    );
+    const labels = job.metadata?.labels;
+    if (
+      job.metadata?.uid !== identity.uid
+      || labels?.[RUN_ID_LABEL] !== identity.runId
+      || labels?.[AGENT_ID_LABEL] !== identity.agentId
+    ) {
+      logger.error(
+        {
+          identity,
+          observed: {
+            uid: job.metadata?.uid ?? null,
+            runId: labels?.[RUN_ID_LABEL] ?? null,
+            agentId: labels?.[AGENT_ID_LABEL] ?? null,
+          },
+        },
+        "refusing to delete k8s Job whose persisted identity does not match (BLO-20801 stale-terminal cleanup)",
+      );
+      return "mismatch";
+    }
+    if ((job.status?.active ?? 0) > 0) {
+      return "still-active";
+    }
+    await state.batchApi.deleteNamespacedJob(
+      {
+        name: identity.name,
+        namespace: PAPERCLIP_K8S_NAMESPACE,
+        propagationPolicy: "Foreground",
+        body: { preconditions: { uid: identity.uid } },
+      },
+      requestOptionsWithTimeout(),
+    );
+  } catch (error) {
+    if (isKubernetesNotFoundError(error)) return "missing";
+    logger.warn(
+      { identity, error: error instanceof Error ? error.message : String(error) },
+      "stale-terminal k8s Job deletion failed (BLO-20801)",
+    );
+    return null;
+  }
+
+  for (let attempt = 0; attempt < STALE_JOB_DELETE_CONFIRM_ATTEMPTS; attempt++) {
+    if (attempt > 0) await sleepMs(STALE_JOB_DELETE_CONFIRM_DELAY_MS);
+    try {
+      const reread = await state.batchApi.readNamespacedJob(
+        { name: identity.name, namespace: PAPERCLIP_K8S_NAMESPACE },
+        requestOptionsWithTimeout(),
+      );
+      if ((reread.status?.active ?? 0) > 0) {
+        logger.debug(
+          { identity, attempt },
+          "BLO-20801: Job gained an active pod before deletion was confirmed; failing closed",
+        );
+        return "still-active";
+      }
+      // Still present (e.g. finalizers pending) but not yet active -- keep
+      // polling until the retry budget confirms absence or is exhausted.
+    } catch (error) {
+      if (isKubernetesNotFoundError(error)) return "deleted";
+      logger.warn(
+        { identity, attempt, error: error instanceof Error ? error.message : String(error) },
+        "stale-terminal k8s Job re-read after delete failed (BLO-20801)",
+      );
+      return null;
+    }
+  }
+  logger.debug(
+    { identity, attempts: STALE_JOB_DELETE_CONFIRM_ATTEMPTS },
+    "BLO-20801: stale-terminal Job deletion not confirmed within retry budget; failing closed",
+  );
+  return null;
+}
+
 export async function deleteAgentPodExact(identity: {
   name: string;
   uid: string;
@@ -766,12 +1192,68 @@ export function classifyManagedAgentPod(pod: k8s.V1Pod): ManagedAgentPod | null 
 }
 
 /**
+ * BLO-20801: `hasActiveJobForAgent`'s Job-status check is agent-scoped only
+ * (no run-id awareness), so a Job that survives a worker crash after its run
+ * was already stamped terminal in the DB blocks dispatch for the full
+ * `EXTERNAL_LIFECYCLE_HARD_STALE_MS` reaper ceiling. A Job whose `runId`
+ * label is in `terminalRunIds` is known-terminal at the DB layer, but that
+ * DB status is NOT proof the Job's controller has stopped doing work: the
+ * `process_lost` mint (heartbeat.ts reap loop) fires on ambiguous/lost-
+ * visibility conditions, not a confirmed pod death (a confirmed exact-name
+ * 404 finalizes as `job_missing`, a different, non-terminal-by-this-fn
+ * path). So a Job Kubernetes currently reports as `active > 0` is real,
+ * live evidence that must never be waived by the DB row -- doing so would
+ * let dispatch admit a second run while the old Job can still execute,
+ * which is exactly the double-execution/RWO-PVC-multi-attach hazard this
+ * gate exists to prevent. The terminal-run waiver therefore only applies to
+ * the two false-positive shapes the ticket targets -- a Job whose status
+ * subresource has not been populated yet, and a Job with
+ * active/succeeded/failed all zero -- both of which report zero *current*
+ * active pods. Jobs with no run-id label, or whose run-id is not in
+ * `terminalRunIds` (live, unknown, or the caller opted out of the lookup),
+ * fall through to the original status-counter heuristic unchanged.
+ */
+export function jobBlocksDispatch(job: k8s.V1Job, terminalRunIds: ReadonlySet<string>): boolean {
+  const status = job.status;
+  const active = status?.active ?? 0;
+  if (active > 0) return true;
+  const runId = job.metadata?.labels?.[RUN_ID_LABEL]?.trim() || null;
+  if (runId && terminalRunIds.has(runId)) return false;
+  if (!status) return true;
+  const succeeded = status.succeeded ?? 0;
+  const failed = status.failed ?? 0;
+  return succeeded === 0 && failed === 0;
+}
+
+export type HasActiveJobForAgentOptions = {
+  /**
+   * Given the distinct, non-null run-id labels found on this agent's Jobs,
+   * returns the subset whose heartbeat_runs row is already terminal in the
+   * DB. Omit to preserve the pre-BLO-20801 behavior of never excluding a Job
+   * by run-id (every candidate Job counts purely on its k8s status).
+   */
+  isRunTerminal?: (runIds: readonly string[]) => Promise<ReadonlySet<string>>;
+};
+
+/**
  * Returns true when there is at least one active (not yet completed) Job for
  * the given agent in the paperclip namespace. Returns false when the kube API
  * is unavailable (not in cluster, RBAC missing, transient error) so the
  * caller can degrade to DB-only in-flight detection.
+ *
+ * Side effect (BLO-20801, only when `options.isRunTerminal` is supplied): a
+ * Job waived purely because its run-id maps to a DB-terminal run is deleted
+ * (identity-checked, with a live re-check immediately before deleting) so
+ * its controller cannot create/retry a pod during the window the DB row's
+ * terminal status does not, by itself, prove closed. This mirrors the
+ * cleanup the 45-minute reaper already performs for the same reason, just
+ * triggered as soon as dispatch observes the waiver instead of waiting out
+ * the reaper's ceiling.
  */
-export async function hasActiveJobForAgent(agentId: string): Promise<boolean> {
+export async function hasActiveJobForAgent(
+  agentId: string,
+  options?: HasActiveJobForAgentOptions,
+): Promise<boolean> {
   const state = initClient();
   if (state.kind !== "ready") return false;
   try {
@@ -784,29 +1266,112 @@ export async function hasActiveJobForAgent(agentId: string): Promise<boolean> {
       requestOptionsWithTimeout(),
     );
     const items = res.items ?? [];
-    const hasActiveJob = items.some((job) => {
-      const status = job.status;
-      if (!status) return true;
-      const active = status.active ?? 0;
-      const succeeded = status.succeeded ?? 0;
-      const failed = status.failed ?? 0;
-      return active > 0 || (succeeded === 0 && failed === 0);
-    });
+    const candidateRunIds = [
+      ...new Set(
+        items
+          .map((job) => job.metadata?.labels?.[RUN_ID_LABEL]?.trim() || null)
+          .filter((runId): runId is string => Boolean(runId)),
+      ),
+    ];
+    // The DB lookup is deliberately isolated from the outer try/catch below:
+    // that catch means "the kube API is unreachable" and fails OPEN (dispatch
+    // proceeds). A rejected isRunTerminal after Kubernetes already returned an
+    // active Job is the opposite situation -- kube is fine, we just can't
+    // confirm the run is terminal -- so it must fail CLOSED (treat every
+    // candidate Job as non-terminal, i.e. still blocking) instead of being
+    // swallowed into the fail-open path.
+    let terminalRunIds: ReadonlySet<string> = new Set<string>();
+    if (candidateRunIds.length > 0 && options?.isRunTerminal) {
+      try {
+        terminalRunIds = await options.isRunTerminal(candidateRunIds);
+      } catch (error) {
+        logger.warn(
+          {
+            agentId,
+            runIds: candidateRunIds,
+            error: error instanceof Error ? error.message : String(error),
+          },
+          "k8s job-liveness isRunTerminal callback failed; treating all candidate Jobs as non-terminal",
+        );
+        terminalRunIds = new Set<string>();
+      }
+    }
+    const hasActiveJob = items.some((job) => jobBlocksDispatch(job, terminalRunIds));
     if (hasActiveJob) {
       return true;
     }
 
+    // BLO-20801: a Job that reaches here only by way of the terminal-run
+    // waiver (its own status showed no active pods, but its run-id maps to
+    // a DB-terminal run) is not proven dead -- its controller could
+    // create/retry a pod any time after the read above. Delete the exact
+    // stale Job before trusting the waiver, and fail CLOSED (still block)
+    // unless the delete confirms the Job is gone. deleteStaleTerminalJob
+    // re-checks liveness immediately before deleting, so a Job that raced
+    // to genuinely active in the interim is left alone rather than killed.
+    // Genuinely completed Jobs (succeeded/failed > 0) don't reach this
+    // loop -- jobBlocksDispatch already resolves those to non-blocking on
+    // their own status, independent of terminalRunIds.
+    const staleWaivedJobs = items.filter((job) => {
+      const runId = job.metadata?.labels?.[RUN_ID_LABEL]?.trim() || null;
+      if (!runId || !terminalRunIds.has(runId)) return false;
+      const status = job.status;
+      if (!status) return true;
+      const succeeded = status.succeeded ?? 0;
+      const failed = status.failed ?? 0;
+      return succeeded === 0 && failed === 0;
+    });
+    for (const job of staleWaivedJobs) {
+      const runId = job.metadata?.labels?.[RUN_ID_LABEL]?.trim() || "";
+      const name = job.metadata?.name;
+      const uid = job.metadata?.uid;
+      if (!name || !uid) {
+        logger.warn(
+          { agentId, runId },
+          "BLO-20801: stale-terminal Job missing name/uid, cannot identity-check a deletion; failing closed",
+        );
+        return true;
+      }
+      const outcome = await deleteStaleTerminalJob({ name, uid, runId, agentId });
+      if (outcome !== "deleted" && outcome !== "missing") {
+        logger.debug(
+          { agentId, runId, name, outcome },
+          "BLO-20801: stale-terminal Job cleanup did not confirm removal; failing closed",
+        );
+        return true;
+      }
+    }
+
     // A just-deleted Job can already look terminal while its Pod is still
-    // terminating and holding a ReadWriteOnce agent PVC on the old node.
-    const podRes = await state.coreApi.listNamespacedPod(
-      {
-        namespace: PAPERCLIP_K8S_NAMESPACE,
-        labelSelector: `${AGENT_JOB_LABEL_SELECTOR},${AGENT_ID_LABEL}=${agentId}`,
-        timeoutSeconds: K8S_JOB_LIVENESS_TIMEOUT_SECONDS,
-      },
-      requestOptionsWithTimeout(),
-    );
-    return (podRes.items ?? []).some(isActiveOrTerminatingAgentPod);
+    // terminating and holding a ReadWriteOnce agent PVC on the old node. This
+    // probe is deliberately NOT filtered by terminalRunIds/run-id: a run
+    // being terminal in the DB says nothing about whether its pod has
+    // released the PVC yet, and folding the two gates together would let a
+    // new pod dispatch into a multi-attach wedge. If this probe is unavailable
+    // after a terminal-run waiver/deletion path, fail closed; the old broad
+    // catch remains fail-open only for the pure kube-API-unavailable fallback
+    // path where no stale-terminal cleanup was trusted.
+    try {
+      const podRes = await state.coreApi.listNamespacedPod(
+        {
+          namespace: PAPERCLIP_K8S_NAMESPACE,
+          labelSelector: `${AGENT_JOB_LABEL_SELECTOR},${AGENT_ID_LABEL}=${agentId}`,
+          timeoutSeconds: K8S_JOB_LIVENESS_TIMEOUT_SECONDS,
+        },
+        requestOptionsWithTimeout(),
+      );
+      return (podRes.items ?? []).some(isActiveOrTerminatingAgentPod);
+    } catch (error) {
+      if (staleWaivedJobs.length > 0) {
+        const reason = error instanceof Error ? error.message : String(error);
+        logger.warn(
+          { agentId, error: reason },
+          "k8s pod quiescence probe failed after stale-terminal cleanup; failing closed",
+        );
+        return true;
+      }
+      throw error;
+    }
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     logger.warn({ agentId, error: reason }, "k8s in-flight check failed; falling back to DB-only");
@@ -817,4 +1382,5 @@ export async function hasActiveJobForAgent(agentId: string): Promise<boolean> {
 /** Test-only hook to force re-init (e.g. after env changes). */
 export function __resetK8sJobLivenessClient() {
   clientState = { kind: "uninitialized" };
+  podMetricsCache = null;
 }

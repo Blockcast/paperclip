@@ -543,38 +543,51 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     run: { id: runId, source: "on_demand" },
     context,
   };
-  const renderedBootstrapPrompt =
-    !sessionId && bootstrapPromptTemplate.trim().length > 0
-      ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
-      : "";
-  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: Boolean(sessionId) });
-  const shouldUseResumeDeltaPrompt = Boolean(sessionId) && wakePrompt.length > 0;
-  const renderedPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
-    ? ""
-    : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
   const paperclipEnvNote = renderPaperclipEnvNote(env);
   const apiAccessNote = renderApiAccessNote(env);
-  const prompt = joinPromptSections([
-    instructionsPrefix,
-    renderedBootstrapPrompt,
-    wakePrompt,
-    sessionHandoffNote,
-    paperclipEnvNote,
-    apiAccessNote,
-    renderedPrompt,
-  ]);
-  const promptMetrics = {
-    promptChars: prompt.length,
-    instructionsChars: instructionsPrefix.length,
-    bootstrapPromptChars: renderedBootstrapPrompt.length,
-    wakePromptChars: wakePrompt.length,
-    sessionHandoffChars: sessionHandoffNote.length,
-    runtimeNoteChars: paperclipEnvNote.length + apiAccessNote.length,
-    heartbeatPromptChars: renderedPrompt.length,
+  // Renders the stdin prompt for a single attempt, keyed on the session id that
+  // attempt will actually resume (or null when it starts a fresh session). This
+  // must be re-derived per attempt rather than computed once: the
+  // session-unavailable fallback (BLO-22497) calls runAttempt(null) after a
+  // resume attempt fails, and that retry is a genuinely new session — it needs
+  // fresh-session semantics (bootstrap prompt, resumedSession: false, full
+  // task-context prompt), not the resume-delta prompt built for the original
+  // sessionId.
+  const buildAttemptPrompt = (effectiveSessionId: string | null) => {
+    const renderedBootstrapPrompt =
+      !effectiveSessionId && bootstrapPromptTemplate.trim().length > 0
+        ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
+        : "";
+    const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
+      resumedSession: Boolean(effectiveSessionId),
+    });
+    const shouldUseResumeDeltaPrompt = Boolean(effectiveSessionId) && wakePrompt.length > 0;
+    const renderedPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
+      ? ""
+      : renderTemplate(promptTemplate, templateData);
+    const prompt = joinPromptSections([
+      instructionsPrefix,
+      renderedBootstrapPrompt,
+      wakePrompt,
+      sessionHandoffNote,
+      paperclipEnvNote,
+      apiAccessNote,
+      renderedPrompt,
+    ]);
+    const promptMetrics = {
+      promptChars: prompt.length,
+      instructionsChars: instructionsPrefix.length,
+      bootstrapPromptChars: renderedBootstrapPrompt.length,
+      wakePromptChars: wakePrompt.length,
+      sessionHandoffChars: sessionHandoffNote.length,
+      runtimeNoteChars: paperclipEnvNote.length + apiAccessNote.length,
+      heartbeatPromptChars: renderedPrompt.length,
+    };
+    return { prompt, promptMetrics };
   };
 
-  const buildArgs = (resumeSessionId: string | null) => {
+  const buildArgs = (resumeSessionId: string | null, attemptPrompt: string) => {
     const args = ["--output-format", "stream-json"];
     if (resumeSessionId) args.push("--resume", resumeSessionId);
     if (model && model !== DEFAULT_GEMINI_LOCAL_MODEL) args.push("--model", model);
@@ -585,12 +598,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       args.push("--sandbox=none");
     }
     if (extraArgs.length > 0) args.push(...extraArgs);
-    args.push("--prompt", prompt);
+    args.push("--prompt", attemptPrompt);
     return args;
   };
 
   const runAttempt = async (resumeSessionId: string | null) => {
-    const args = buildArgs(resumeSessionId);
+    const { prompt, promptMetrics } = buildAttemptPrompt(resumeSessionId);
+    const args = buildArgs(resumeSessionId, prompt);
     const invocationEnv = buildGeminiHeadlessEnv(env);
     const invocationRuntimeEnv = buildGeminiRuntimeEnv(env);
     const loggedEnv = buildInvocationEnvForLogs(invocationEnv, {

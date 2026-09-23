@@ -180,6 +180,7 @@ describe("Slack notifications", () => {
     await plugin.definition.setup?.(ctx as any);
 
     await plugin.definition.onWebhook?.({
+      companyId: COMPANY,
       endpointKey: WEBHOOK_KEYS.slackEvents,
       headers: {},
       rawBody: "{}",
@@ -229,6 +230,7 @@ describe("Slack notifications", () => {
     await plugin.definition.setup?.(ctx as any);
 
     await plugin.definition.onWebhook?.({
+      companyId: COMPANY,
       endpointKey: WEBHOOK_KEYS.interactivity,
       headers: {},
       rawBody: "",

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { asc, eq } from "drizzle-orm";
+import { asc, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import {
@@ -45,8 +45,21 @@ import {
   ISSUE_LIST_MAX_LIMIT,
   issueService,
   parseExecutiveHoldMarkerTimestamp,
+  recomputeBlockedIssuesStatusIfReady,
 } from "../services/issues.ts";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
+import {
+  releaseIssueRunOwnership,
+  restoreCheckoutPromotedStatus,
+} from "../services/issue-checkout-status.ts";
+import {
+  ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES,
+  TERMINAL_HEARTBEAT_RUN_STATUS_VALUES,
+} from "../services/issue-execution-lock.ts";
+import {
+  buildInitialIssueMonitorFields,
+  normalizeIssueExecutionPolicy,
+} from "../services/issue-execution-policy.ts";
 import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
@@ -379,7 +392,7 @@ describeEmbeddedPostgres("issueService.addComment idempotency", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-comment-idempotency-");
     db = createDb(tempDb.connectionString);
     svc = issueService(db);
-  }, 20_000);
+  }, 120_000);
 
   afterEach(async () => {
     await db.delete(issueComments);
@@ -598,6 +611,32 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     });
   });
 
+  it("returns the active aggregate winner for sequential alertmanager creates", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    const originFingerprint =
+      'alert-aggregate:v1:["HindsightConsolidationStalled",null]';
+    const first = await svc.create(companyId, {
+      title: "First alert series",
+      status: "todo",
+      priority: "high",
+      originKind: "plugin:paperclip-plugin-alertmanager",
+      originId: "series-1",
+      originFingerprint,
+    });
+
+    const second = await svc.create(companyId, {
+      title: "Concurrent alert series",
+      status: "todo",
+      priority: "high",
+      originKind: "plugin:paperclip-plugin-alertmanager",
+      originId: "series-2",
+      originFingerprint,
+    });
+
+    expect(second.id).toBe(first.id);
+    expect(second.identifier).toBe(first.identifier);
+  });
+
   function agentRow(companyId: string, input: {
     id: string;
     name: string;
@@ -617,6 +656,468 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       permissions: {},
     };
   }
+
+  // BLO-20649: `checkout` promotes to `in_progress`; releasing the lock has to
+  // undo that promotion, or `in_progress` becomes a high-water mark of every
+  // issue any wake ever touched.
+  describe("checkout status restore", () => {
+    async function seedCheckoutFixture(status: "todo" | "backlog" | "blocked") {
+      const companyId = await seedAssignableAgentCompany();
+      const agentId = randomUUID();
+      await db.insert(agents).values(agentRow(companyId, { id: agentId, name: "RestoreCoder" }));
+      const issue = await svc.create(companyId, {
+        title: `Restore round trip from ${status}`,
+        description: null,
+        status,
+        priority: "medium",
+      });
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "manual",
+      });
+      return { companyId, agentId, issue, runId };
+    }
+
+    async function finishRun(runId: string, status = "succeeded") {
+      await db.update(heartbeatRuns).set({ status }).where(eq(heartbeatRuns.id, runId));
+    }
+
+    function readIssue(id: string) {
+      return db
+        .select({ status: issues.status, restore: issues.checkoutRestoreStatus })
+        .from(issues)
+        .where(eq(issues.id, id))
+        .then((rows) => rows[0]!);
+    }
+
+    // BLO-28900: `tickDueIssueMonitors` only selects `in_progress`/`in_review`,
+    // agent-assigned rows. A demotion that leaves `monitor_next_check_at`
+    // populated produces a monitor that reads `scheduled` forever and can never
+    // fire — silent, and indistinguishable from an idle assignee.
+    function readMonitor(id: string) {
+      return db
+        .select({
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          checkoutRestoreStatus: issues.checkoutRestoreStatus,
+          monitorNextCheckAt: issues.monitorNextCheckAt,
+          executionPolicy: issues.executionPolicy,
+          executionState: issues.executionState,
+        })
+        .from(issues)
+        .where(eq(issues.id, id))
+        .then((rows) => rows[0]!);
+    }
+
+    const MONITOR_CHECK_AT = "2026-09-01T12:00:00.000Z";
+
+    /**
+     * Arming goes through the route layer (`routes/issues.ts` computes the
+     * policy transition), so a service-level test writes the armed shape
+     * directly — built with the production builders rather than hand-rolled
+     * JSON, so the fixture cannot drift from what a real arm persists.
+     */
+    async function armMonitor(issueId: string, agentId: string) {
+      const policy = normalizeIssueExecutionPolicy({
+        monitor: { nextCheckAt: MONITOR_CHECK_AT, notes: "watch deploy", scheduledBy: "assignee" },
+      });
+      const fields = buildInitialIssueMonitorFields({
+        policy,
+        status: "in_progress",
+        assigneeAgentId: agentId,
+        assigneeUserId: null,
+      });
+      await db
+        .update(issues)
+        .set({ ...fields, executionPolicy: policy as unknown as Record<string, unknown> })
+        .where(eq(issues.id, issueId));
+
+      const armed = await readMonitor(issueId);
+      // Guard the guard: if the arm silently no-ops the assertions below pass
+      // vacuously and the test proves nothing.
+      expect(armed.monitorNextCheckAt).not.toBeNull();
+      expect((armed.executionState as { monitor?: { status?: string } } | null)?.monitor?.status)
+        .toBe("scheduled");
+    }
+
+    // BLO-29554: BLO-28900 cleared the monitor a restore stranded, which stopped
+    // the row lying about being scheduled but still threw the scheduled work
+    // away. The restore now declines instead, so the wake survives.
+    it("keeps the checkout promotion while a dispatchable monitor is armed", async () => {
+      const { agentId, issue, runId } = await seedCheckoutFixture("todo");
+
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+      await armMonitor(issue.id, agentId);
+
+      await finishRun(runId);
+      await svc.clearCheckoutRunIfTerminal(issue.id);
+
+      const held = await readMonitor(issue.id);
+      // `in_progress` plus an agent assignee is exactly what
+      // `tickDueIssueMonitors` selects on, so this row can still be dispatched.
+      expect(held.status).toBe("in_progress");
+      expect(held.assigneeAgentId).toBe(agentId);
+      expect(held.monitorNextCheckAt).toEqual(new Date(MONITOR_CHECK_AT));
+      expect(held.executionState).toMatchObject({ monitor: { status: "scheduled" } });
+      // Deferred, not cancelled: the marker is what lets the demotion still
+      // happen at the end of the run this monitor wakes.
+      expect(held.checkoutRestoreStatus).toBe("todo");
+    });
+
+    // BLO-29554 review follow-up: `holdsDispatchableMonitor` deliberately omits
+    // the `companies.status = 'active'` condition that `tickDueIssueMonitors`
+    // also joins on. Both non-active statuses are reversible, so folding it in
+    // would let a pause restore the row and clear the monitor as
+    // `invalid_status` — destroying an armed wake that reactivation would
+    // otherwise have fired. This pins the divergence as intended, not an
+    // oversight to be tidied away.
+    it("holds the promotion for a paused company so reactivation can still fire", async () => {
+      const { companyId, agentId, issue, runId } = await seedCheckoutFixture("todo");
+
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+      await armMonitor(issue.id, agentId);
+      await db
+        .update(companies)
+        .set({ status: "paused" })
+        .where(eq(companies.id, companyId));
+
+      await finishRun(runId);
+      expect(
+        await restoreCheckoutPromotedStatus(db, { issueId: issue.id, companyId }),
+      ).toBe(false);
+
+      const held = await readMonitor(issue.id);
+      expect(held.status).toBe("in_progress");
+      expect(held.monitorNextCheckAt).toEqual(new Date(MONITOR_CHECK_AT));
+      // The wake survives the pause intact — this is the assertion that fails if
+      // company status is ever added to the guard.
+      expect(held.executionState).toMatchObject({ monitor: { status: "scheduled" } });
+      expect(held.checkoutRestoreStatus).toBe("todo");
+    });
+
+    it("restores the deferred demotion once the monitor is no longer armed", async () => {
+      const { companyId, agentId, issue, runId } = await seedCheckoutFixture("todo");
+
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+      await armMonitor(issue.id, agentId);
+      await finishRun(runId);
+      await svc.clearCheckoutRunIfTerminal(issue.id);
+      expect(await readMonitor(issue.id)).toMatchObject({ status: "in_progress" });
+
+      // Stand in for the woken run finishing without re-arming. Without this the
+      // test above only proves the demotion was skipped, not that it was merely
+      // postponed — a skip that never resolves is the BLO-20649 high-water mark.
+      await db
+        .update(issues)
+        .set({ monitorNextCheckAt: null })
+        .where(eq(issues.id, issue.id));
+
+      expect(
+        await restoreCheckoutPromotedStatus(db, { issueId: issue.id, companyId }),
+      ).toBe(true);
+      expect(await readMonitor(issue.id)).toMatchObject({
+        status: "todo",
+        checkoutRestoreStatus: null,
+      });
+    });
+
+    it("clears a monitor the restore strands when the agent assignee is gone", async () => {
+      const { companyId, agentId, issue, runId } = await seedCheckoutFixture("todo");
+
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+      await armMonitor(issue.id, agentId);
+      // An unassigned monitor is undeliverable at every status, so there is no
+      // promotion worth holding and the reconciler still has to run here.
+      await db
+        .update(issues)
+        .set({ assigneeAgentId: null })
+        .where(eq(issues.id, issue.id));
+      await finishRun(runId);
+
+      expect(
+        await restoreCheckoutPromotedStatus(db, { issueId: issue.id, companyId }),
+      ).toBe(true);
+
+      const restored = await readMonitor(issue.id);
+      expect(restored.status).toBe("todo");
+      expect(restored.monitorNextCheckAt).toBeNull();
+      expect(restored.executionState).toMatchObject({
+        monitor: { status: "cleared", clearReason: "invalid_assignee" },
+      });
+      expect((restored.executionPolicy as { monitor?: unknown } | null)?.monitor).toBeUndefined();
+    });
+
+    it("clears a monitor when release strips both eligibility conditions", async () => {
+      const { agentId, issue, runId } = await seedCheckoutFixture("todo");
+
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+      await armMonitor(issue.id, agentId);
+
+      await svc.release(issue.id, agentId, runId);
+
+      const released = await readMonitor(issue.id);
+      expect(released.status).toBe("todo");
+      expect(released.assigneeAgentId).toBeNull();
+      expect(released.monitorNextCheckAt).toBeNull();
+      // Release drops the agent assignee too, so the assignee condition is the
+      // one reported — release is the worst instance of this class, not a
+      // milder one.
+      expect(released.executionState).toMatchObject({
+        monitor: { status: "cleared", clearReason: "invalid_assignee" },
+      });
+    });
+
+    it("leaves a monitor armed when the run advances the issue to in_review", async () => {
+      const { agentId, issue, runId } = await seedCheckoutFixture("todo");
+
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+      await armMonitor(issue.id, agentId);
+      await svc.update(issue.id, { status: "in_review" });
+
+      await finishRun(runId);
+      await svc.clearCheckoutRunIfTerminal(issue.id);
+
+      // The safety property runs the other way too: reconciliation must not
+      // disarm a monitor that is still deliverable, or the fix trades a silent
+      // stall for a silent cancellation.
+      const kept = await readMonitor(issue.id);
+      expect(kept.status).toBe("in_review");
+      expect(kept.monitorNextCheckAt?.toISOString()).toBe(MONITOR_CHECK_AT);
+      expect(kept.executionState).toMatchObject({ monitor: { status: "scheduled" } });
+    });
+
+    it("returns a todo issue to todo when the run releases without advancing it", async () => {
+      const { agentId, issue, runId } = await seedCheckoutFixture("todo");
+
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+      expect(await readIssue(issue.id)).toMatchObject({ status: "in_progress", restore: "todo" });
+
+      await finishRun(runId);
+      await svc.clearCheckoutRunIfTerminal(issue.id);
+
+      expect(await readIssue(issue.id)).toMatchObject({ status: "todo", restore: null });
+    });
+
+    it("returns a backlog issue to backlog, not todo", async () => {
+      const { agentId, issue, runId } = await seedCheckoutFixture("backlog");
+
+      await svc.checkout(issue.id, agentId, ["backlog"], runId);
+      expect(await readIssue(issue.id)).toMatchObject({ status: "in_progress", restore: "backlog" });
+
+      await finishRun(runId);
+      await svc.clearCheckoutRunIfTerminal(issue.id);
+
+      expect(await readIssue(issue.id)).toMatchObject({ status: "backlog", restore: null });
+    });
+
+    it("keeps a status the run actually wrote", async () => {
+      const { agentId, issue, runId } = await seedCheckoutFixture("todo");
+
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+      await svc.update(issue.id, { status: "in_review" });
+      expect(await readIssue(issue.id)).toMatchObject({ status: "in_review", restore: null });
+
+      await finishRun(runId);
+      await svc.clearCheckoutRunIfTerminal(issue.id);
+
+      expect(await readIssue(issue.id)).toMatchObject({ status: "in_review", restore: null });
+    });
+
+    it("keeps an explicit in_progress write instead of resetting it", async () => {
+      const { agentId, issue, runId } = await seedCheckoutFixture("todo");
+
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+      // Re-asserting in_progress is a deliberate claim by the run, so it clears
+      // the marker and must survive the release.
+      await svc.update(issue.id, { status: "in_progress" });
+      expect(await readIssue(issue.id)).toMatchObject({ restore: null });
+
+      await finishRun(runId);
+      await svc.clearCheckoutRunIfTerminal(issue.id);
+
+      expect(await readIssue(issue.id)).toMatchObject({ status: "in_progress", restore: null });
+    });
+
+    it("does not reset while the checkout run is still live", async () => {
+      const { agentId, issue, runId } = await seedCheckoutFixture("todo");
+
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+      // Run is still `running`; both clear paths must decline.
+      await svc.clearExecutionRunIfTerminal(issue.id);
+      await svc.clearCheckoutRunIfTerminal(issue.id);
+
+      expect(await readIssue(issue.id)).toMatchObject({ status: "in_progress", restore: "todo" });
+    });
+
+    it("does not reset on execution-lock release while a live checkout still holds the row", async () => {
+      const { companyId, agentId, issue, runId } = await seedCheckoutFixture("todo");
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+
+      // Execution lock moves to a second, terminal run while the original
+      // checkout run keeps executing — a retry hand-off, not a release.
+      const retryRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: retryRunId,
+        companyId,
+        agentId,
+        status: "failed",
+        invocationSource: "manual",
+      });
+      await db
+        .update(issues)
+        .set({ executionRunId: retryRunId })
+        .where(eq(issues.id, issue.id));
+
+      await svc.clearExecutionRunIfTerminal(issue.id);
+
+      expect(await readIssue(issue.id)).toMatchObject({ status: "in_progress", restore: "todo" });
+    });
+
+    it("releases an old checkout without erasing a newer execution owner", async () => {
+      const { companyId, agentId, issue, runId } = await seedCheckoutFixture("todo");
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+
+      const retryRunId = randomUUID();
+      const retryLockedAt = new Date("2026-08-11T12:00:00.000Z");
+      await db.insert(heartbeatRuns).values({
+        id: retryRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "manual",
+      });
+      await db
+        .update(issues)
+        .set({
+          executionRunId: retryRunId,
+          executionAgentNameKey: "restorecoder",
+          executionLockedAt: retryLockedAt,
+        })
+        .where(eq(issues.id, issue.id));
+      await finishRun(runId);
+
+      expect(
+        await releaseIssueRunOwnership(db, {
+          issueId: issue.id,
+          companyId,
+          runId,
+        }),
+      ).toBe(true);
+
+      const released = await db
+        .select({
+          status: issues.status,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+          executionAgentNameKey: issues.executionAgentNameKey,
+          executionLockedAt: issues.executionLockedAt,
+          checkoutRestoreStatus: issues.checkoutRestoreStatus,
+        })
+        .from(issues)
+        .where(eq(issues.id, issue.id))
+        .then((rows) => rows[0] ?? null);
+      expect(released).toMatchObject({
+        status: "in_progress",
+        checkoutRunId: null,
+        executionRunId: retryRunId,
+        executionAgentNameKey: "restorecoder",
+        executionLockedAt: retryLockedAt,
+        checkoutRestoreStatus: "todo",
+      });
+      await expect(
+        restoreCheckoutPromotedStatus(db, { issueId: issue.id, companyId }),
+      ).resolves.toBe(false);
+    });
+
+    it("restores a pre-existing strand to todo when dispatch re-adopts and releases it", async () => {
+      // Rows stranded before this fix carry no marker. The normal dispatcher
+      // does not include `in_progress` in its expected status list, so this
+      // must take checkout's markerless in-progress adoption fallback rather
+      // than the primary update. Re-adoption records `todo` and lets the
+      // historical backlog drain without hand-demotion.
+      const { agentId, issue, runId } = await seedCheckoutFixture("todo");
+      await db
+        .update(issues)
+        .set({ status: "in_progress", assigneeAgentId: agentId, checkoutRestoreStatus: null })
+        .where(eq(issues.id, issue.id));
+
+      await svc.checkout(issue.id, agentId, ["todo", "backlog", "blocked"], runId);
+      expect(await readIssue(issue.id)).toMatchObject({ status: "in_progress", restore: "todo" });
+
+      await finishRun(runId);
+      await svc.clearCheckoutRunIfTerminal(issue.id);
+
+      expect(await readIssue(issue.id)).toMatchObject({ status: "todo", restore: null });
+    });
+
+    // The fallback checkout paths (stale-execution-lock adoption, and the
+    // clear-then-retry below it) also promote to `in_progress`. A promotion that
+    // does not record what it displaced is unrestorable, so these paths used to
+    // strand a row permanently even with the release side wired up.
+    for (const startStatus of ["todo", "backlog"] as const) {
+      it(`records a restore marker when adopting a stale execution lock from ${startStatus}`, async () => {
+        const { companyId, agentId, issue, runId } = await seedCheckoutFixture(startStatus);
+
+        // A previous run holds the execution lock and is already terminal, so
+        // checkout adopts the row rather than taking the primary path.
+        const deadRunId = randomUUID();
+        await db.insert(heartbeatRuns).values({
+          id: deadRunId,
+          companyId,
+          agentId,
+          status: "failed",
+          invocationSource: "manual",
+        });
+        await db
+          .update(issues)
+          .set({ executionRunId: deadRunId, executionLockedAt: new Date() })
+          .where(eq(issues.id, issue.id));
+
+        await svc.checkout(issue.id, agentId, [startStatus], runId);
+        expect(await readIssue(issue.id)).toMatchObject({
+          status: "in_progress",
+          restore: startStatus,
+        });
+
+        await finishRun(runId);
+        await svc.clearCheckoutRunIfTerminal(issue.id);
+
+        expect(await readIssue(issue.id)).toMatchObject({ status: startStatus, restore: null });
+      });
+    }
+
+    it("does not restore an issue belonging to another company", async () => {
+      // `restoreCheckoutPromotedStatus` takes issue ids from run context, which
+      // is not guaranteed to name an issue in the caller's company. The company
+      // predicate makes a cross-company reset structurally impossible.
+      const { agentId, issue, runId } = await seedCheckoutFixture("todo");
+      await svc.checkout(issue.id, agentId, ["todo"], runId);
+      await finishRun(runId);
+
+      const foreignCompanyId = await seedAssignableAgentCompany();
+      expect(
+        await restoreCheckoutPromotedStatus(db, {
+          issueId: issue.id,
+          companyId: foreignCompanyId,
+        }),
+      ).toBe(false);
+      expect(await readIssue(issue.id)).toMatchObject({ status: "in_progress", restore: "todo" });
+
+      // Same call, correct company: the row is otherwise fully qualified, so
+      // this proves the company predicate is what declined above.
+      expect(
+        await restoreCheckoutPromotedStatus(db, {
+          issueId: issue.id,
+          companyId: issue.companyId,
+        }),
+      ).toBe(true);
+      expect(await readIssue(issue.id)).toMatchObject({ status: "todo", restore: null });
+    });
+  });
 
   it("rejects direct terminated assignees with structured conflict details", async () => {
     const companyId = await seedAssignableAgentCompany();
@@ -724,6 +1225,40 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       assigneeAgentId: null,
       status: "todo",
     });
+  });
+
+  it("checks out a todo issue and stamps startedAt through the checkout CASE expression", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    const agentId = randomUUID();
+    const checkoutRunId = randomUUID();
+    await db.insert(agents).values(agentRow(companyId, {
+      id: agentId,
+      name: "CheckoutCaseCoder",
+    }));
+    await db.insert(heartbeatRuns).values({
+      id: checkoutRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+    });
+    const issue = await svc.create(companyId, {
+      title: "Checkout raw SQL startedAt regression",
+      description: null,
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: null,
+    });
+
+    const checkedOut = await svc.checkout(issue.id, agentId, ["todo"], checkoutRunId);
+
+    expect(checkedOut).toMatchObject({
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      checkoutRunId,
+      executionRunId: checkoutRunId,
+    });
+    expect(checkedOut.startedAt).toBeInstanceOf(Date);
   });
 
   it("lets an active source-scoped recovery owner checkout the source issue", async () => {
@@ -4625,6 +5160,126 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     expect(child.requestDepth).toBe(MAX_ISSUE_REQUEST_DEPTH);
   });
+
+  // BLO-27706: a reused execution workspace is shared, so patching issue B's
+  // settings must not clear config issue A depends on. The builder used to emit
+  // `null` for every absent key, which defeated mergeExecutionWorkspaceConfig's
+  // leave-unchanged semantics and silently wiped runtime services.
+  it("BLO-27706: a sibling issue update that omits workspaceRuntime leaves shared workspace config intact", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const issueAId = randomUUID();
+    const issueBId = randomUUID();
+
+    const workspaceRuntime = {
+      services: [{ name: "portal", command: "pnpm dev", port: 5173 }],
+    };
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Workspace project",
+      status: "in_progress",
+    });
+
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary workspace",
+    });
+
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: "shared_workspace",
+      strategyType: "project_primary",
+      name: "Shared workspace",
+      status: "active",
+      providerType: "local_fs",
+      metadata: {
+        source: "project_primary",
+        config: {
+          provisionCommand: "bash ./scripts/provision.sh",
+          teardownCommand: "bash ./scripts/teardown.sh",
+          workspaceRuntime,
+        },
+      },
+    });
+
+    // Two issues share the one execution workspace.
+    await db.insert(issues).values([
+      {
+        id: issueAId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        title: "Issue A depends on the runtime services",
+        status: "in_progress",
+        priority: "medium",
+        executionWorkspaceId,
+        executionWorkspacePreference: "reuse_existing",
+        executionWorkspaceSettings: { mode: "shared_workspace", workspaceRuntime },
+      },
+      {
+        id: issueBId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        title: "Issue B knows nothing about runtime services",
+        status: "todo",
+        priority: "medium",
+        executionWorkspaceId,
+        executionWorkspacePreference: "reuse_existing",
+        executionWorkspaceSettings: { mode: "shared_workspace" },
+      },
+    ]);
+
+    const readConfig = async () => {
+      const row = await db
+        .select({ metadata: executionWorkspaces.metadata })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, executionWorkspaceId))
+        .then((rows) => rows[0] ?? null);
+      return (row?.metadata as { config?: Record<string, unknown> } | null)?.config ?? null;
+    };
+
+    expect((await readConfig())?.workspaceRuntime).toEqual(workspaceRuntime);
+
+    // Issue B supplies settings without workspaceRuntime. Absent must mean
+    // "leave unchanged", not "clear".
+    await svc.update(issueBId, {
+      executionWorkspaceSettings: { mode: "shared_workspace" },
+    });
+
+    const afterSiblingUpdate = await readConfig();
+    expect(afterSiblingUpdate?.workspaceRuntime).toEqual(workspaceRuntime);
+    expect(afterSiblingUpdate?.provisionCommand).toBe("bash ./scripts/provision.sh");
+    expect(afterSiblingUpdate?.teardownCommand).toBe("bash ./scripts/teardown.sh");
+
+    // Control: an issue that DOES supply workspaceRuntime still writes it through,
+    // so the fix suppresses only the absent-key clear, not the feature.
+    const replacementRuntime = {
+      services: [{ name: "portal", command: "pnpm dev --host", port: 5173 }],
+    };
+    await svc.update(issueAId, {
+      executionWorkspaceSettings: { mode: "shared_workspace", workspaceRuntime: replacementRuntime },
+    });
+
+    expect((await readConfig())?.workspaceRuntime).toEqual(replacementRuntime);
+  });
 });
 
 describeEmbeddedPostgres("issueService blockers and dependency wake readiness", () => {
@@ -5263,6 +5918,169 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
           id: ctx.blockedIssueId,
           assigneeAgentId: ctx.assigneeAgentId,
         }),
+      ]);
+    });
+  });
+
+  // BLO-30445. `listBlockedIssueAutoResumeSuppressions` gates the blocker-resolved wake as
+  // well as the reconciler flip, so adding `external_wait` to it decides a second question
+  // the ticket never asked: what happens to a row carrying BOTH a real blocker edge and a
+  // declaration, when that blocker closes. The intended answer is that the declared park
+  // OUTLIVES its structural blocker — the human gate is still live, and resuming on the
+  // blocker alone would drain a park that is still genuinely waiting. That is the same
+  // semantic BLO-3496 already established for executive holds one describe block up (see
+  // the comment at the `resolved_blocker_sweep` call site); `external_wait` only joins it.
+  //
+  // The consequence is deliberate and worth stating plainly: such a row keeps `status`
+  // `blocked` with zero unresolved blockers and NO wake path. `isDeadEndBlocked` also
+  // declines to flag it, so the blocked inbox — which surfaces it as `external_wait` with
+  // the declared owner and action — is its only surface. That is the documented contract
+  // for a human-only gate (it does not move on a timer), not an oversight; the cost is that
+  // a STALE declaration nobody removed parks the row just as effectively as a live one.
+  // Removing the two lines when the gate clears is the declaring agent's job.
+  describe("blocked auto-resume external wait suppression (BLO-30445)", () => {
+    it("suppresses all three non-reconciler auto-resume callers for a declared external wait, but not for its undeclared twin", async () => {
+      const companyId = randomUUID();
+      const assigneeAgentId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(agents).values({
+        id: assigneeAgentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+
+      // One blocker, two dependents differing ONLY in the declaration. Both are evaluated
+      // in the same `listWakeableBlockedDependents` call, so "the declared row is absent"
+      // cannot be confused with "the wake did not fire at all" — the same matched-pair
+      // shape as the reconciler test.
+      const blockerId = randomUUID();
+      const declaredId = randomUUID();
+      const controlId = randomUUID();
+      await db.insert(issues).values([
+        { id: blockerId, companyId, title: "Blocker", status: "done", priority: "medium" },
+        {
+          id: declaredId,
+          companyId,
+          title: "Declared external wait",
+          status: "blocked",
+          priority: "medium",
+          assigneeAgentId,
+          description: [
+            "Waiting on the ruleset change.",
+            "external owner: kkroo",
+            "external action: approve the onprem-k8s ruleset change",
+          ].join("\n"),
+        },
+        {
+          id: controlId,
+          companyId,
+          title: "Undeclared twin",
+          status: "blocked",
+          priority: "medium",
+          assigneeAgentId,
+          // Same gate, named in prose only — the documented non-match.
+          description: "Waiting on kkroo to approve the onprem-k8s ruleset change.",
+        },
+      ]);
+      await svc.update(declaredId, { blockedByIssueIds: [blockerId] });
+      await svc.update(controlId, { blockedByIssueIds: [blockerId] });
+
+      await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([
+        expect.objectContaining({ id: controlId, assigneeAgentId }),
+      ]);
+
+      // Second caller: the periodic resolved-blocker sweep. Read-only like the wake, and a
+      // pure pass-through to the same suppression map, so the fixture above covers it as-is.
+      await expect(
+        svc.listResolvedBlockerDependentsToSweep(companyId, {
+          minBlockerResolvedAge: { milliseconds: 0 },
+        }),
+      ).resolves.toEqual([expect.objectContaining({ id: controlId, assigneeAgentId })]);
+
+      // Third caller, and the only one of the three that MUTATES `status`. It is unreachable
+      // from `svc` — `recomputeBlockedIssuesStatusIfReady` is called only from the route
+      // layer — so it has to be invoked directly or the flip is never exercised at all. Run
+      // it last: it drains the control, which would then drop out of the two reads above.
+      await expect(
+        recomputeBlockedIssuesStatusIfReady(db, companyId, [declaredId, controlId], {
+          triggerPath: "eager_status_recompute",
+        }),
+      ).resolves.toEqual([controlId]);
+
+      const statusesAfter = await db
+        .select({ id: issues.id, status: issues.status })
+        .from(issues)
+        .where(inArray(issues.id, [declaredId, controlId]));
+      expect(new Map(statusesAfter.map((row) => [row.id, row.status]))).toEqual(
+        new Map([
+          [declaredId, "blocked"],
+          [controlId, "todo"],
+        ]),
+      );
+    });
+
+    it("resumes the wake once the declaration is removed", async () => {
+      const companyId = randomUUID();
+      const assigneeAgentId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(agents).values({
+        id: assigneeAgentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+
+      const blockerId = randomUUID();
+      const declaredId = randomUUID();
+      await db.insert(issues).values([
+        { id: blockerId, companyId, title: "Blocker", status: "done", priority: "medium" },
+        {
+          id: declaredId,
+          companyId,
+          title: "Declared external wait",
+          status: "blocked",
+          priority: "medium",
+          assigneeAgentId,
+          description: [
+            "external owner: kkroo",
+            "external action: approve the onprem-k8s ruleset change",
+          ].join("\n"),
+        },
+      ]);
+      await svc.update(declaredId, { blockedByIssueIds: [blockerId] });
+
+      await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([]);
+
+      // Clearing the declaration is the declaring agent's exit from the park, so it must
+      // put the row straight back on the wake path — otherwise the park is a one-way door.
+      await db
+        .update(issues)
+        .set({ description: "Gate cleared; resuming." })
+        .where(eq(issues.id, declaredId));
+
+      await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([
+        expect.objectContaining({ id: declaredId, assigneeAgentId }),
       ]);
     });
   });
@@ -6104,6 +6922,280 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     });
   });
 
+  // PEN-3304: "the owing run is over" has exactly one definition in this
+  // codebase -- `TERMINAL_HEARTBEAT_RUN_STATUSES`, the set that decides a run
+  // has released the issue execution lock -- and the release above must agree
+  // with it. The first cut of this fix reached for `agent-scorecards.ts`'s
+  // 4-element `TERMINAL_RUN_STATUSES` instead. That list answers a different
+  // question ("did the agent fail?", for a failure-rate denominator) and omits
+  // `interrupted`, `error` and `adapter_failed`, so the barrier stayed
+  // permanently shut on three of the seven ways a run can die -- precisely the
+  // run-death paths that record no finalize row. It shipped green because this
+  // suite only ever drove `running -> failed`.
+  //
+  // So the table is DERIVED from the constant, not transcribed from it: an
+  // eighth terminal status extends this test automatically rather than
+  // silently reopening the gap. `issue-execution-lock.ts` exists because this
+  // same notion had already been open-coded as three literal arrays that drifted
+  // apart; a fourth definition site is the defect, not the fix.
+  const seedFinalizeBarrierFixture = async () => {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const owingRunId = randomUUID();
+    const blockerId = randomUUID();
+    const dependentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "QA",
+      role: "qa",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Shared workspace project",
+      status: "in_progress",
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Shared workspace",
+      sourceType: "local_path",
+      visibility: "default",
+      isPrimary: true,
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: "shared_workspace",
+      strategyType: "project_primary",
+      name: "Shared exec workspace",
+      status: "active",
+      providerType: "local_fs",
+    });
+    await db.insert(issues).values([
+      {
+        id: blockerId,
+        companyId,
+        projectId,
+        title: "Predecessor",
+        status: "done",
+        priority: "medium",
+        executionWorkspaceId,
+      },
+      {
+        id: dependentId,
+        companyId,
+        projectId,
+        title: "Dependent",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId,
+      },
+    ]);
+    await svc.update(dependentId, { blockedByIssueIds: [blockerId] });
+
+    // The shape measured on PEN-2969: the finalize was attempted and FAILED
+    // ("External runtime reservation no longer owns execution for run ..."),
+    // so the barrier's own retry story -- "a subsequent finalize wake will
+    // re-evaluate readiness" -- had nothing left to fire it.
+    await db.insert(heartbeatRuns).values({
+      id: owingRunId,
+      companyId,
+      agentId: assigneeAgentId,
+      status: "running",
+      invocationSource: "automation",
+    });
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      heartbeatRunId: owingRunId,
+      issueId: blockerId,
+      phase: "workspace_finalize",
+      status: "failed",
+      startedAt: new Date("2026-09-06T02:27:34.412Z"),
+    });
+
+    return { assigneeAgentId, blockerId, dependentId, owingRunId };
+  };
+
+  it.each(TERMINAL_HEARTBEAT_RUN_STATUS_VALUES)(
+    "releases the workspace-finalize barrier once the run that owed the finalize is `%s` (PEN-3255, PEN-3304)",
+    async (terminalStatus) => {
+      const { assigneeAgentId, blockerId, dependentId, owingRunId } = await seedFinalizeBarrierFixture();
+
+      // While that run is still alive the gate must stay closed -- it may yet
+      // record a succeeded finalize. This is the positive control for the
+      // release below: without it, a test that only asserts the release could
+      // pass against a gate that had been removed outright.
+      await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+        isDependencyReady: false,
+        pendingFinalizeBlockerIssueIds: [blockerId],
+        unresolvedBlockerIssueIds: [blockerId],
+      });
+      expect(await svc.listWakeableBlockedDependents(blockerId)).toEqual([]);
+
+      // Once the owing run reaches a terminal status no finalize can ever
+      // arrive. Before PEN-3255 the dependent stayed gated forever here, which
+      // refused both checkout and every `status=in_progress` write on three
+      // issues for nine days after their blocker closed.
+      //
+      // Note `error` and `adapter_failed` are absent from the `HeartbeatRunStatus`
+      // union but are observed in the column, which is text -- that gap is the
+      // whole reason the canonical set is a superset of it.
+      await db
+        .update(heartbeatRuns)
+        .set({ status: terminalStatus, finishedAt: new Date("2026-09-06T02:25:58.824Z") })
+        .where(eq(heartbeatRuns.id, owingRunId));
+
+      await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+        isDependencyReady: true,
+        pendingFinalizeBlockerIssueIds: [],
+        unresolvedBlockerIssueIds: [],
+      });
+      await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([
+        expect.objectContaining({ id: dependentId, assigneeAgentId, blockerIssueIds: [blockerId] }),
+      ]);
+    },
+  );
+
+  // The complement, so the release cannot widen into "always release": a run
+  // that still holds the issue execution lock may yet deliver the finalize, and
+  // `scheduled_retry` is the one that reads most like a dead run while being
+  // resumable -- the retry ladder parks a run there with the issue's lock
+  // columns still pointed at it.
+  it.each(ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES)(
+    "keeps the workspace-finalize barrier closed while the owing run is `%s` (PEN-3304)",
+    async (holdingStatus) => {
+      const { blockerId, dependentId, owingRunId } = await seedFinalizeBarrierFixture();
+
+      await db
+        .update(heartbeatRuns)
+        .set({ status: holdingStatus })
+        .where(eq(heartbeatRuns.id, owingRunId));
+
+      await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+        isDependencyReady: false,
+        pendingFinalizeBlockerIssueIds: [blockerId],
+        unresolvedBlockerIssueIds: [blockerId],
+      });
+      expect(await svc.listWakeableBlockedDependents(blockerId)).toEqual([]);
+    },
+  );
+
+  it("keeps the workspace-finalize barrier closed when the unfinalized operation names no run (PEN-3255)", async () => {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "QA",
+      role: "qa",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Shared workspace project",
+      status: "in_progress",
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Shared workspace",
+      sourceType: "local_path",
+      visibility: "default",
+      isPrimary: true,
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Shared exec workspace",
+      status: "active",
+      providerType: "git_worktree",
+    });
+
+    const blockerId = randomUUID();
+    const dependentId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: blockerId,
+        companyId,
+        projectId,
+        title: "Predecessor",
+        status: "done",
+        priority: "medium",
+        executionWorkspaceId,
+      },
+      {
+        id: dependentId,
+        companyId,
+        projectId,
+        title: "Dependent",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId,
+      },
+    ]);
+    await svc.update(dependentId, { blockedByIssueIds: [blockerId] });
+
+    // An operation with no `heartbeat_run_id` carries no evidence either way,
+    // so the release must NOT fire: absence of a run row is not proof the work
+    // finished. Pinning this keeps the PEN-3255 release narrow -- it is the one
+    // case where "nothing can deliver the finalize" and "we cannot tell" look
+    // alike, and defaulting it open would drop the barrier for every legacy row.
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      phase: "worktree_prepare",
+      status: "succeeded",
+      startedAt: new Date("2026-05-23T22:00:00.000Z"),
+    });
+
+    await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+      isDependencyReady: false,
+      pendingFinalizeBlockerIssueIds: [blockerId],
+      unresolvedBlockerIssueIds: [blockerId],
+    });
+  });
+
   it("does NOT count/log fast_path_finalize_gated when a dependent also has a wholly-unresolved blocker (Ally review, BLO-13250)", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
@@ -6506,6 +7598,248 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     ).rejects.toMatchObject({ status: 422 });
   });
 
+  it("waits for an in-flight blocker insertion before promoting to in_progress", async () => {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const blockerId = "00000000-0000-4000-8000-000000000001";
+    const blockedId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Concurrent blocker readiness",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "ConcurrentBlockerAgent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      { id: blockerId, companyId, title: "Late blocker", status: "todo", priority: "medium" },
+      {
+        id: blockedId,
+        companyId,
+        title: "Stale promotion candidate",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId,
+      },
+    ]);
+
+    const blockerLockKey = `paperclip:issue-blockers:${companyId}:${blockedId}`;
+    const relationWriterReady = deferred<void>();
+    const releaseRelationWriter = deferred<void>();
+    const relationUpdate = db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${blockerLockKey}, 0))`);
+      relationWriterReady.resolve();
+      await releaseRelationWriter.promise;
+      await svc.update(blockedId, { blockedByIssueIds: [blockerId] }, tx);
+    });
+    await relationWriterReady.promise;
+
+    const waitForBlockedTransactions = async (expected: number) => {
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        const waitingRows = await db.execute(sql<{ count: number }>`
+          select count(*)::int as count
+          from pg_stat_activity
+          where datname = current_database()
+            and pid <> pg_backend_pid()
+            and wait_event_type = 'Lock'
+        `);
+        if ((Array.from(waitingRows)[0]?.count ?? 0) >= expected) return;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      throw new Error(`Timed out waiting for ${expected} blocked transactions`);
+    };
+
+    const promotion = svc.update(blockedId, { status: "in_progress" });
+    try {
+      await waitForBlockedTransactions(1);
+    } finally {
+      releaseRelationWriter.resolve();
+    }
+    await relationUpdate;
+    await expect(promotion).rejects.toMatchObject({ status: 422 });
+
+    const row = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, blockedId))
+      .then((rows) => rows[0] ?? null);
+    expect(row?.status).toBe("todo");
+  });
+
+  it("waits for an in-flight blocker insertion before checkout", async () => {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const blockerId = randomUUID();
+    const blockedId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Concurrent checkout blocker readiness",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "ConcurrentCheckoutAgent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      { id: blockerId, companyId, title: "Late checkout blocker", status: "todo", priority: "medium" },
+      {
+        id: blockedId,
+        companyId,
+        title: "Checkout candidate",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId,
+      },
+    ]);
+
+    const blockerLockKey = `paperclip:issue-blockers:${companyId}:${blockedId}`;
+    const relationWriterReady = deferred<void>();
+    const releaseRelationWriter = deferred<void>();
+    const relationUpdate = db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${blockerLockKey}, 0))`);
+      relationWriterReady.resolve();
+      await releaseRelationWriter.promise;
+      await svc.update(blockedId, { blockedByIssueIds: [blockerId] }, tx);
+    });
+    await relationWriterReady.promise;
+
+    const checkout = svc.checkout(blockedId, assigneeAgentId, ["todo"], null);
+    try {
+      const deadline = Date.now() + 10_000;
+      let checkoutWaitedForRelationWriter = false;
+      while (Date.now() < deadline) {
+        const waitingRows = await db.execute(sql<{ waiting: boolean }>`
+          select exists (
+            select 1
+            from pg_stat_activity
+            where datname = current_database()
+              and pid <> pg_backend_pid()
+              and wait_event_type = 'Lock'
+          ) as waiting
+        `);
+        if (Array.from(waitingRows)[0]?.waiting) {
+          checkoutWaitedForRelationWriter = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(checkoutWaitedForRelationWriter).toBe(true);
+    } finally {
+      releaseRelationWriter.resolve();
+    }
+
+    await relationUpdate;
+    await expect(checkout).rejects.toMatchObject({ status: 422 });
+    const row = await db
+      .select({ status: issues.status, checkoutRunId: issues.checkoutRunId })
+      .from(issues)
+      .where(eq(issues.id, blockedId))
+      .then((rows) => rows[0] ?? null);
+    expect(row).toEqual({ status: "todo", checkoutRunId: null });
+  });
+
+  it("waits for an existing blocker status transition before checkout", async () => {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const blockerId = "00000000-0000-4000-8000-000000000001";
+    const blockedId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Concurrent checkout blocker status",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "ConcurrentCheckoutStatusAgent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      { id: blockerId, companyId, title: "Resolved checkout blocker", status: "done", priority: "medium" },
+      {
+        id: blockedId,
+        companyId,
+        title: "Checkout status race candidate",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: blockedId,
+      type: "blocks",
+    });
+
+    const blockerUpdateReady = deferred<void>();
+    const releaseBlockerUpdate = deferred<void>();
+    const blockerUpdate = db.transaction(async (tx) => {
+      await tx.update(issues).set({ status: "todo" }).where(eq(issues.id, blockerId));
+      blockerUpdateReady.resolve();
+      await releaseBlockerUpdate.promise;
+    });
+    await blockerUpdateReady.promise;
+
+    const checkout = svc.checkout(blockedId, assigneeAgentId, ["todo"], null);
+    try {
+      const deadline = Date.now() + 10_000;
+      let checkoutWaitedForBlockerUpdate = false;
+      while (Date.now() < deadline) {
+        const waitingRows = await db.execute(sql<{ waiting: boolean }>`
+          select exists (
+            select 1
+            from pg_stat_activity
+            where datname = current_database()
+              and pid <> pg_backend_pid()
+              and wait_event_type = 'Lock'
+          ) as waiting
+        `);
+        if (Array.from(waitingRows)[0]?.waiting) {
+          checkoutWaitedForBlockerUpdate = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(checkoutWaitedForBlockerUpdate).toBe(true);
+    } finally {
+      releaseBlockerUpdate.resolve();
+    }
+
+    await blockerUpdate;
+    await expect(checkout).rejects.toMatchObject({ status: 422 });
+    const row = await db
+      .select({ status: issues.status, checkoutRunId: issues.checkoutRunId })
+      .from(issues)
+      .where(eq(issues.id, blockedId))
+      .then((rows) => rows[0] ?? null);
+    expect(row).toEqual({ status: "todo", checkoutRunId: null });
+  });
+
   it("allows a deliberate blocked to todo promotion when the latest agent comment awaits user input", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
@@ -6859,6 +8193,204 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     // be filtered out of the wake-readiness check. The parent has no real
     // work-children, so we should not wake it. See PCL-2418.
     expect(await svc.getWakeableParentAfterChildCompletion(parentId)).toBeNull();
+  });
+
+  // BLO-22909 (Ally, follow-on to BLO-20385 / #970). The delegate-recovery
+  // unpark patch shape mandates `blockedByIssueIds: []` and then applies it, so
+  // the readiness check that authorizes it and the clear that follows must
+  // observe the same snapshot. The route-level pre-check reads readiness on its
+  // own connection, and adding a blocker edge changes neither status nor
+  // assignee — so it slips past `expectedCurrentStatus` and
+  // `expectedCurrentAssigneeAgentId` alike. These pin the write-time guard.
+  describe("unpark unresolved-blocker precondition", () => {
+    async function seedUnparkScenario() {
+      const companyId = randomUUID();
+      const projectId = randomUUID();
+      const assigneeAgentId = randomUUID();
+      const dependentId = randomUUID();
+      const doneBlockerId = randomUUID();
+      const liveBlockerId = randomUUID();
+
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(agents).values({
+        id: assigneeAgentId,
+        companyId,
+        name: "Delegate",
+        role: "engineer",
+        status: "active",
+        adapterType: "claude_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(projects).values({
+        id: projectId,
+        companyId,
+        name: "Unpark project",
+        status: "in_progress",
+      });
+      await db.insert(issues).values([
+        {
+          id: doneBlockerId,
+          companyId,
+          projectId,
+          title: "Stale blocker (terminal)",
+          status: "done",
+          priority: "medium",
+        },
+        {
+          id: liveBlockerId,
+          companyId,
+          projectId,
+          title: "Live blocker",
+          status: "in_progress",
+          priority: "medium",
+        },
+        {
+          id: dependentId,
+          companyId,
+          projectId,
+          title: "Parked dependent",
+          status: "blocked",
+          priority: "medium",
+          assigneeAgentId,
+        },
+      ]);
+
+      return { companyId, projectId, assigneeAgentId, dependentId, doneBlockerId, liveBlockerId };
+    }
+
+    const unparkPatch = {
+      status: "todo" as const,
+      blockedByIssueIds: [] as string[],
+      expectedCurrentStatus: "blocked",
+      expectedNoUnresolvedBlockers: true,
+    };
+
+    async function readBlockedBy(issueId: string) {
+      const summaries = await svc.getRelationSummaries(issueId);
+      return summaries.blockedBy.map((relation) => relation.id).sort();
+    }
+
+    it("clears genuinely stale terminal edges — the case the recovery patch exists for", async () => {
+      const { dependentId, doneBlockerId } = await seedUnparkScenario();
+      await svc.update(dependentId, { blockedByIssueIds: [doneBlockerId] });
+
+      const updated = await svc.update(dependentId, { ...unparkPatch });
+
+      expect(updated?.status).toBe("todo");
+      expect(await readBlockedBy(dependentId)).toEqual([]);
+    });
+
+    it("refuses and leaves edges intact when a blocker is unresolved (no race)", async () => {
+      const { dependentId, liveBlockerId } = await seedUnparkScenario();
+      await svc.update(dependentId, { blockedByIssueIds: [liveBlockerId] });
+
+      await expect(svc.update(dependentId, { ...unparkPatch })).rejects.toMatchObject({
+        status: 409,
+        details: {
+          reason: "delegate_recovery_unresolved_blockers",
+          unresolvedBlockerCount: 1,
+          unresolvedBlockerIssueIds: [liveBlockerId],
+        },
+      });
+
+      // The edge must survive, and the row must stay parked.
+      expect(await readBlockedBy(dependentId)).toEqual([liveBlockerId]);
+      const row = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, dependentId))
+        .then((rows) => rows[0] ?? null);
+      expect(row?.status).toBe("blocked");
+    });
+
+    it("refuses when a blocker is committed after the readiness read but before the write", async () => {
+      const { dependentId, doneBlockerId, liveBlockerId } = await seedUnparkScenario();
+      await svc.update(dependentId, { blockedByIssueIds: [doneBlockerId] });
+
+      // The route's pre-check: readiness read on its own connection, well before
+      // the write. It legitimately sees nothing unresolved and admits the patch.
+      await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+        unresolvedBlockerCount: 0,
+      });
+
+      // ...and *then* someone adds a live blocker and commits. This is the
+      // window #970 left open: neither optimistic guard notices, because the
+      // status is still `blocked` and the assignee is unchanged.
+      await svc.update(dependentId, { blockedByIssueIds: [doneBlockerId, liveBlockerId] });
+
+      await expect(svc.update(dependentId, { ...unparkPatch })).rejects.toMatchObject({
+        status: 409,
+        details: { reason: "delegate_recovery_unresolved_blockers" },
+      });
+      expect(await readBlockedBy(dependentId)).toEqual([doneBlockerId, liveBlockerId].sort());
+    });
+
+    it("re-reads readiness inside the write transaction, not from the pre-transaction snapshot", async () => {
+      const { dependentId, doneBlockerId, liveBlockerId } = await seedUnparkScenario();
+      await svc.update(dependentId, { blockedByIssueIds: [doneBlockerId] });
+
+      // The pre-check passes: at this instant nothing is unresolved.
+      await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+        unresolvedBlockerCount: 0,
+      });
+
+      // A concurrent writer adds the live blocker but has NOT committed yet, so
+      // it holds the company issue-parent advisory lock that every
+      // blockedByIssueIds write takes.
+      const blockerAdded = deferred<void>();
+      const releaseBlockerAdd = deferred<void>();
+      const concurrentBlockerAdd = db.transaction(async (tx) => {
+        await svc.update(dependentId, { blockedByIssueIds: [doneBlockerId, liveBlockerId] }, tx);
+        blockerAdded.resolve();
+        await releaseBlockerAdd.promise;
+      });
+      await blockerAdded.promise;
+
+      // The unpark now runs concurrently and must block on that advisory lock —
+      // which is the whole point of evaluating the precondition *after* it.
+      const unpark = svc.update(dependentId, { ...unparkPatch });
+      const unparkExpectation = expect(unpark).rejects.toMatchObject({
+        status: 409,
+        details: { reason: "delegate_recovery_unresolved_blockers" },
+      });
+
+      const lockWaitDeadline = Date.now() + 10_000;
+      let unparkWaitingForLock = false;
+      while (Date.now() < lockWaitDeadline) {
+        const waitingRows = await db.execute(sql<{ waiting: boolean }>`
+          select exists (
+            select 1
+            from pg_stat_activity
+            where datname = current_database()
+              and pid <> pg_backend_pid()
+              and wait_event_type = 'Lock'
+              and query ~* 'pg_advisory_xact_lock'
+          ) as waiting
+        `);
+        if (Array.from(waitingRows)[0]?.waiting) {
+          unparkWaitingForLock = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      // Assert the interleaving actually happened. Without this the test could
+      // pass vacuously by running the two transactions in sequence.
+      expect(unparkWaitingForLock).toBe(true);
+
+      releaseBlockerAdd.resolve();
+      await concurrentBlockerAdd;
+      await unparkExpectation;
+
+      // Both edges survive: the unpark saw the newly-committed blocker.
+      expect(await readBlockedBy(dependentId)).toEqual([doneBlockerId, liveBlockerId].sort());
+    });
   });
 });
 
@@ -7423,6 +8955,63 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
   });
 
+  /**
+   * Runs `start` against a held company graph lock so every operation it launches
+   * parks at that same boundary, then releases them together.
+   *
+   * Bare `Promise.allSettled` proves nothing about concurrency: a connection-pool
+   * schedule that runs one call to completion before the other begins still
+   * produces the expected results, so these regressions could stay green even if
+   * the lock invariant regressed. Holding the lock from a control transaction and
+   * polling `pg_stat_activity` for the waiters asserts the overlap actually
+   * happened, mirroring the stale-workspace test's lock-wait probe above.
+   */
+  async function withIssueGraphOverlapBarrier<T>(
+    companyId: string,
+    expectedWaiters: number,
+    start: () => Promise<T>,
+  ): Promise<T> {
+    const barrierHeld = deferred<void>();
+    const releaseBarrier = deferred<void>();
+    const control = db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`paperclip:issue-parent:${companyId}`}, 0))`,
+      );
+      barrierHeld.resolve();
+      await releaseBarrier.promise;
+    });
+    await barrierHeld.promise;
+
+    const pending = start();
+    // Keep the rejection handled while we poll; `pending` is still returned so the
+    // caller observes the real settlement.
+    pending.catch(() => {});
+
+    let observedWaiters = 0;
+    try {
+      const lockWaitDeadline = Date.now() + 10_000;
+      while (Date.now() < lockWaitDeadline) {
+        const waitingRows = await db.execute(sql<{ waiters: number }>`
+          select count(*)::int as waiters
+          from pg_stat_activity
+          where datname = current_database()
+            and pid <> pg_backend_pid()
+            and wait_event_type = 'Lock'
+            and wait_event = 'advisory'
+            and query ~* 'pg_advisory_xact_lock'
+        `);
+        observedWaiters = Number(Array.from(waitingRows)[0]?.waiters ?? 0);
+        if (observedWaiters >= expectedWaiters) break;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    } finally {
+      releaseBarrier.resolve();
+      await control;
+    }
+    expect(observedWaiters).toBeGreaterThanOrEqual(expectedWaiters);
+    return pending;
+  }
+
   it("returns cycle validation instead of deadlocking concurrent reciprocal reparent updates", async () => {
     const companyId = randomUUID();
     const issueAId = randomUUID();
@@ -7452,10 +9041,12 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
       },
     ]);
 
-    const results = await Promise.allSettled([
-      svc.update(issueAId, { parentId: issueBId }),
-      svc.update(issueBId, { parentId: issueAId }),
-    ]);
+    const results = await withIssueGraphOverlapBarrier(companyId, 2, () =>
+      Promise.allSettled([
+        svc.update(issueAId, { parentId: issueBId }),
+        svc.update(issueBId, { parentId: issueAId }),
+      ]),
+    );
     const fulfilled = results.filter((result) => result.status === "fulfilled");
     const rejected = results.filter((result) => result.status === "rejected");
 
@@ -7467,6 +9058,38 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
       status: 422,
       message: "Parent issue would create a cycle",
     });
+  });
+
+  // BLO-34207: issue mutations read instance settings on the caller's handle so
+  // they do not take a second pool connection while holding the company graph
+  // lock. That read must stay a pure read: bootstrapping the singleton row from
+  // inside the caller's tx takes an instance-wide row lock BEFORE
+  // `lockIssueParentMutationCompany` and holds it to commit, so two callers can
+  // take the two locks in opposite orders. Assert the write never happens.
+  it("does not write the instance settings singleton from an update running on a caller transaction", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Settings read must not write",
+      status: "todo",
+      priority: "medium",
+    });
+    await db.delete(instanceSettings);
+
+    await db.transaction(async (tx) => {
+      await svc.update(issueId, { title: "Renamed under a caller tx" }, tx);
+    });
+
+    expect(await db.select().from(instanceSettings)).toHaveLength(0);
   });
 
   it("returns cycle validation instead of deadlocking intersecting multi-level reparent updates", async () => {
@@ -7518,10 +9141,12 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
       },
     ]);
 
-    const results = await Promise.allSettled([
-      svc.update(issueXId, { parentId: issueAId }),
-      svc.update(issueYId, { parentId: issueBId }),
-    ]);
+    const results = await withIssueGraphOverlapBarrier(companyId, 2, () =>
+      Promise.allSettled([
+        svc.update(issueXId, { parentId: issueAId }),
+        svc.update(issueYId, { parentId: issueBId }),
+      ]),
+    );
     const fulfilled = results.filter((result) => result.status === "fulfilled");
     const rejected = results.filter((result) => result.status === "rejected");
 
@@ -7580,10 +9205,12 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
       },
     ]);
 
-    const results = await Promise.allSettled([
-      svc.update(issueXId, { parentId: issuePId, blockedByIssueIds: [issueYId] }),
-      svc.update(issueYId, { parentId: issueQId }),
-    ]);
+    const results = await withIssueGraphOverlapBarrier(companyId, 2, () =>
+      Promise.allSettled([
+        svc.update(issueXId, { parentId: issuePId, blockedByIssueIds: [issueYId] }),
+        svc.update(issueYId, { parentId: issueQId }),
+      ]),
+    );
 
     for (const result of results) {
       if (result.status === "rejected") {
@@ -7640,10 +9267,12 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
       },
     ]);
 
-    const results = await Promise.allSettled([
-      svc.update(issueXId, { parentId: issuePId, blockedByIssueIds: [issueZId] }),
-      svc.update(issuePId, { blockedByIssueIds: [issueZId] }),
-    ]);
+    const results = await withIssueGraphOverlapBarrier(companyId, 2, () =>
+      Promise.allSettled([
+        svc.update(issueXId, { parentId: issuePId, blockedByIssueIds: [issueZId] }),
+        svc.update(issuePId, { blockedByIssueIds: [issueZId] }),
+      ]),
+    );
 
     for (const result of results) {
       if (result.status === "rejected") {
@@ -7699,15 +9328,17 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
       },
     ]);
 
-    const results = await Promise.allSettled([
-      svc.update(issueXId, { parentId: issuePId, blockedByIssueIds: [issueZId] }),
-      svc.create(companyId, {
-        title: "New dependent",
-        status: "todo",
-        priority: "medium",
-        blockedByIssueIds: [issuePId, issueZId],
-      }),
-    ]);
+    const results = await withIssueGraphOverlapBarrier(companyId, 2, () =>
+      Promise.allSettled([
+        svc.update(issueXId, { parentId: issuePId, blockedByIssueIds: [issueZId] }),
+        svc.create(companyId, {
+          title: "New dependent",
+          status: "todo",
+          priority: "medium",
+          blockedByIssueIds: [issuePId, issueZId],
+        }),
+      ]),
+    );
 
     for (const result of results) {
       if (result.status === "rejected") {
@@ -7730,6 +9361,64 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
         expect.objectContaining({ id: issueZId }),
       ],
     });
+  });
+
+  it("serializes concurrent deletion and reparent onto the deleted parent without deadlocking", async () => {
+    const companyId = randomUUID();
+    // remove() sweeps children before locking the parent row, while update()
+    // locks the parent first. Ordering the ids P < C is what let the two paths
+    // take the same rows in opposite order and abort with 40P01 (a 500) before
+    // remove() joined the company graph lock.
+    const parentId = "00000000-0000-4000-8000-00000000000a";
+    const childId = "ffffffff-ffff-4fff-bfff-fffffffffffe";
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values([
+      {
+        id: parentId,
+        companyId,
+        title: "Parent under deletion",
+        status: "todo",
+        priority: "medium",
+      },
+      {
+        id: childId,
+        companyId,
+        title: "Child being reparented",
+        status: "todo",
+        priority: "medium",
+      },
+    ]);
+
+    // Both paths must park on the company graph lock. Before the fix remove()
+    // never requested it, so only one waiter appears and the barrier fails here.
+    const results = await withIssueGraphOverlapBarrier(companyId, 2, () =>
+      Promise.allSettled([
+        svc.remove(parentId),
+        svc.update(childId, { parentId }),
+      ]),
+    );
+
+    for (const result of results) {
+      if (result.status !== "rejected") continue;
+      const reason = result.reason as { status?: number; message?: string };
+      expect(String(reason?.message ?? result.reason)).not.toMatch(/deadlock/i);
+      expect(reason?.status ?? 0).toBeLessThan(500);
+    }
+
+    // The delete owns the parent either way, so both orderings converge: whether
+    // the reparent lands first and is swept, or is rejected against an already
+    // deleted parent, the parent is gone and the child is detached.
+    expect(results[0].status).toBe("fulfilled");
+    await expect(svc.getById(parentId)).resolves.toBeNull();
+    const child = await svc.getById(childId);
+    expect(child?.parentId ?? null).toBeNull();
   });
 
   it("rejects updates that pin a projectless issue to an isolated git worktree", async () => {
@@ -7869,7 +9558,14 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     expect(workspace?.metadata).toEqual({
       config: {
-        environmentId: null,
+        // BLO-27706: issue settings deliberately do not carry environmentId --
+        // parseIssueExecutionWorkspaceSettings is called here without
+        // includeEnvironmentId, so "env-new" above never reaches this patch (see
+        // the "operator overrides env then reassigns" case). This previously
+        // asserted `null`, i.e. every such update silently discarded the
+        // workspace's own environment selection. Absent now means leave
+        // unchanged, so the persisted "env-old" survives.
+        environmentId: "env-old",
         provisionCommand: "bash ./scripts/provision-new.sh",
         teardownCommand: "bash ./scripts/teardown-new.sh",
         cleanupCommand: null,
@@ -8177,7 +9873,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     expect(duplicateIssue?.executionRunId).toBeNull();
   });
 
-  it("returns a typed 422 (not generic 409) for assignee-owned in_review checkout with no active owner", async () => {
+  it("preserves the expectedStatuses guard for assignee-owned in_review checkout", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
     await db.insert(companies).values({
@@ -8198,9 +9894,11 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       permissions: {},
     });
 
-    // Reproduction matrix (BLO-8454): status=in_review, assignee matches caller,
-    // checkoutRunId=null, executionRunId=null.
+    // Callers that do not include in_review in expectedStatuses still do not
+    // claim review work accidentally. Agent-facing checkout includes in_review
+    // explicitly; the route test pins that positive path.
     const issueId = randomUUID();
+    const checkoutRunId = randomUUID();
     await db.insert(issues).values({
       id: issueId,
       companyId,
@@ -8213,13 +9911,14 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     });
 
     await expect(
-      svc.checkout(issueId, assigneeAgentId, ["todo", "backlog", "blocked"], randomUUID()),
+      svc.checkout(issueId, assigneeAgentId, ["todo", "backlog", "blocked"], checkoutRunId),
     ).rejects.toMatchObject({
-      status: 422,
-      details: { code: "issue_in_review_not_checkoutable", issueId },
+      status: 409,
+      message: "Issue checkout conflict",
+      details: { issueId },
     });
 
-    // The rejected checkout must not mutate the issue out of review (no state-machine side effect).
+    // The rejected checkout must not mutate the issue out of review.
     const after = await db
       .select({
         status: issues.status,
@@ -8476,6 +10175,175 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       assigneeAgentId: agentId,
       checkoutRunId: null,
     });
+  });
+
+  it("checkout adoption of a stale executionRunId preserves startedAt on in_progress issues", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const failedRunId = randomUUID();
+    const successorRunId = randomUUID();
+    const originalStartedAt = new Date("2026-06-10T09:30:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: failedRunId,
+        companyId,
+        agentId,
+        status: "failed",
+        invocationSource: "manual",
+        finishedAt: new Date("2026-06-10T10:05:00.000Z"),
+      },
+      {
+        id: successorRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "manual",
+        startedAt: new Date("2026-06-10T10:07:00.000Z"),
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Stale execution lock on in-progress issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      startedAt: originalStartedAt,
+      executionRunId: failedRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date("2026-06-10T10:00:00.000Z"),
+    });
+
+    await expect(svc.checkout(issueId, agentId, ["in_progress"], successorRunId))
+      .resolves.toMatchObject({
+        status: "in_progress",
+        checkoutRunId: successorRunId,
+        executionRunId: successorRunId,
+      });
+
+    const row = await db
+      .select({ startedAt: issues.startedAt })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(row?.startedAt?.toISOString()).toBe(originalStartedAt.toISOString());
+  });
+
+  it("does not let runless stale-lock retry steal a concurrent reassignment", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const reassignedAgentId = randomUUID();
+    const issueId = randomUUID();
+    const failedRunId = randomUUID();
+    const triggerName = `test_reassign_on_clear_${randomUUID().replace(/-/g, "_")}`;
+    const functionName = `${triggerName}_fn`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: agentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: reassignedAgentId,
+        companyId,
+        name: "Reviewer",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(heartbeatRuns).values({
+      id: failedRunId,
+      companyId,
+      agentId,
+      status: "failed",
+      invocationSource: "manual",
+      finishedAt: new Date("2026-06-10T10:05:00.000Z"),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Stale execution lock reassigned during clear",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      executionRunId: failedRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date("2026-06-10T10:00:00.000Z"),
+    });
+
+    await db.execute(sql.raw(`
+      CREATE FUNCTION ${functionName}() RETURNS trigger AS $$
+      BEGIN
+        IF OLD.id = '${issueId}'::uuid
+          AND OLD.execution_run_id = '${failedRunId}'::uuid
+          AND NEW.execution_run_id IS NULL
+        THEN
+          NEW.assignee_agent_id := '${reassignedAgentId}'::uuid;
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+      CREATE TRIGGER ${triggerName}
+      BEFORE UPDATE ON issues
+      FOR EACH ROW EXECUTE FUNCTION ${functionName}();
+    `));
+
+    try {
+      await expect(svc.checkout(issueId, agentId, ["in_progress"], null))
+        .rejects.toMatchObject({ status: 409 });
+
+      const row = await db
+        .select({
+          assigneeAgentId: issues.assigneeAgentId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(row).toMatchObject({
+        assigneeAgentId: reassignedAgentId,
+        executionRunId: null,
+      });
+    } finally {
+      await db.execute(sql.raw(`DROP TRIGGER IF EXISTS ${triggerName} ON issues;`));
+      await db.execute(sql.raw(`DROP FUNCTION IF EXISTS ${functionName}();`));
+    }
   });
 
   it("checkout adoption of a stale checkoutRunId preserves the issue's assigneeUserId", async () => {
@@ -9305,7 +11173,7 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
 
   async function seedOwnershipIssue(params: {
     checkoutStatus: "running" | "failed" | "timed_out";
-    actorRunStatus?: "running" | "failed" | "timed_out" | "succeeded";
+    actorRunStatus?: "queued" | "running" | "failed" | "timed_out" | "succeeded";
     assigneeMatchesActor?: boolean;
   }) {
     const companyId = randomUUID();
@@ -9365,7 +11233,7 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
         status: actorRunStatus,
         invocationSource: "manual",
         startedAt: actorRunStatus === "running" ? new Date() : null,
-        finishedAt: actorRunStatus === "running" ? null : new Date(),
+        finishedAt: actorRunStatus === "queued" || actorRunStatus === "running" ? null : new Date(),
       },
     ]);
     await db.insert(issues).values({
@@ -9392,6 +11260,16 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
     expect(ownership.checkoutRunId).toBe(seeded.actorRunId);
     expect(ownership.executionRunId).toBe(seeded.actorRunId);
     expect(ownership.adoptedFromRunId).toBeNull();
+
+    // This is the same legacy markerless in_progress shape as the normal
+    // checkout fallback. Ownership adoption is a new checkout claim too, so it
+    // must record the fallback tier for the eventual release.
+    const row = await db
+      .select({ checkoutRestoreStatus: issues.checkoutRestoreStatus })
+      .from(issues)
+      .where(eq(issues.id, seeded.issueId))
+      .then((rows) => rows[0]);
+    expect(row?.checkoutRestoreStatus).toBe("todo");
   });
 
   it("treats timed_out checkout owners as stale and recoverable", async () => {
@@ -9421,6 +11299,27 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
 
   it("does not let terminal actor runs adopt stale checkout ownership", async () => {
     const seeded = await seedOwnershipIssue({ checkoutStatus: "failed", actorRunStatus: "succeeded" });
+
+    await expect(
+      svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId),
+    ).rejects.toMatchObject({ status: 409 });
+
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, seeded.issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+  });
+
+  it("does not let queued actor runs adopt stale checkout ownership", async () => {
+    const seeded = await seedOwnershipIssue({ checkoutStatus: "failed", actorRunStatus: "queued" });
 
     await expect(
       svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId),
@@ -9693,4 +11592,80 @@ describeEmbeddedPostgres("issueService.update expectedCurrentStatus (BLO-18797)"
     expect(updated?.title).toBe("Renamed without a precondition");
     expect(updated?.status).toBe("in_progress");
   });
+
+  // BLO-22876 review: the manager-chain reroute grant is conditioned on the
+  // assignee being non-invokable, and that status lives in `agents` — a WHERE
+  // clause on `issues` cannot pin it. These cover the paused-to-active race
+  // between the route's eligibility read and this write.
+  it("applies the reroute when the assignee is still non-invokable at write time", async () => {
+    const { companyId, issueId, agentId } = await seedBlockedIssue();
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+
+    const successorAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: successorAgentId,
+      companyId,
+      name: "SuccessorEngineer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const updated = await svc.update(issueId, {
+      assigneeAgentId: successorAgentId,
+      expectedCurrentAssigneeAgentId: agentId,
+      expectedCurrentAssigneeAgentNonInvokable: true,
+    });
+
+    expect(updated?.assigneeAgentId).toBe(successorAgentId);
+  });
+
+  it.each([
+    ["reassign", (successorAgentId: string) => ({ assigneeAgentId: successorAgentId })],
+    ["cancel", () => ({ status: "cancelled" as const })],
+  ])(
+    "rejects a manager-chain %s with 409 when the assignee is resumed before the write",
+    async (_kind, buildPatch) => {
+      const { companyId, issueId, agentId } = await seedBlockedIssue();
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+
+      const successorAgentId = randomUUID();
+      await db.insert(agents).values({
+        id: successorAgentId,
+        companyId,
+        name: "SuccessorEngineer",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+
+      // Stand in for the concurrent resume that lands between the route's
+      // `agentsSvc.getById()` eligibility read and this write. Without the
+      // locked re-read the manager would reassign or cancel an issue held by a
+      // live report, which the ordinary issue:mutate boundary denies.
+      await db.update(agents).set({ status: "running" }).where(eq(agents.id, agentId));
+
+      await expect(
+        svc.update(issueId, {
+          ...buildPatch(successorAgentId),
+          expectedCurrentAssigneeAgentId: agentId,
+          expectedCurrentAssigneeAgentNonInvokable: true,
+        }),
+      ).rejects.toMatchObject({ status: 409 });
+
+      const row = await db
+        .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row?.status).toBe("blocked");
+      expect(row?.assigneeAgentId).toBe(agentId);
+    },
+  );
 });

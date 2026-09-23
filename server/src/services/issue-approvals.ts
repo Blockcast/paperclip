@@ -2,7 +2,7 @@ import { and, desc, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { approvals, issueApprovals, issues } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
-import { redactApprovalPayloadForDisplay } from "../redaction.js";
+import { redactApprovalPayloadForDisplay, withholdAgentConfigFromApprovalPayload } from "../redaction.js";
 
 interface LinkActor {
   agentId?: string | null;
@@ -41,7 +41,16 @@ export function issueApprovalService(db: Db) {
   }
 
   return {
-    listApprovalsForIssue: async (issueId: string) => {
+    /**
+     * `includeAgentConfig` carries the caller's `agent_config:read` verdict —
+     * the same second gate `routes/approvals.ts` applies, because this is the
+     * third path to the same `hire_agent` payload. Defaults to withholding so a
+     * caller that does not resolve the verdict discloses nothing (PEN-2777).
+     */
+    listApprovalsForIssue: async (
+      issueId: string,
+      options: { includeAgentConfig?: boolean } = {},
+    ) => {
       const issue = await getIssue(issueId);
       if (!issue) throw notFound("Issue not found");
 
@@ -66,7 +75,16 @@ export function issueApprovalService(db: Db) {
         .orderBy(desc(issueApprovals.createdAt));
       return result.map((approval) => {
         const { payload, redactedFields } = redactApprovalPayloadForDisplay(approval.type, approval.payload);
-        return { ...approval, payload, redactedFields };
+        if (options.includeAgentConfig) {
+          return { ...approval, payload, redactedFields, withheldFields: [] as string[] };
+        }
+        const withheld = withholdAgentConfigFromApprovalPayload(approval.type, payload);
+        return {
+          ...approval,
+          payload: withheld.payload,
+          redactedFields,
+          withheldFields: withheld.withheldFields,
+        };
       });
     },
 

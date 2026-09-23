@@ -1,18 +1,8 @@
 import { z } from "zod";
 import { PROJECT_STATUSES, PROJECT_ICON_NAMES } from "../constants.js";
+import { executionWorkspaceStrategySchema } from "./execution-workspace.js";
 import { envConfigSchema } from "./secret.js";
 import { trustAuthorizationPolicySchema } from "./trust-policy.js";
-
-const executionWorkspaceStrategySchema = z
-  .object({
-    type: z.enum(["project_primary", "git_worktree", "adapter_managed", "cloud_sandbox"]).optional(),
-    baseRef: z.string().optional().nullable(),
-    branchTemplate: z.string().optional().nullable(),
-    worktreeParentDir: z.string().optional().nullable(),
-    provisionCommand: z.string().optional().nullable(),
-    teardownCommand: z.string().optional().nullable(),
-  })
-  .strict();
 
 export const projectExecutionWorkspacePolicySchema = z
   .object({

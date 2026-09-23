@@ -1,18 +1,53 @@
 export {
   createDb,
   createDbFromPostgresClient,
+  POSTGRES_POOL_MAX,
+  POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+  readInheritedTimeoutSettings,
+  formatInheritedTimeoutSettings,
+  type InheritedTimeoutSetting,
+  type InheritedTimeoutSettings,
   getPostgresDataDirectory,
   ensurePostgresDatabase,
   resetPostgresDatabase,
   inspectMigrations,
   applyPendingMigrations,
+  type ApplyPendingMigrationsOptions,
   reconcilePendingMigrationHistory,
   type MigrationState,
   type MigrationHistoryReconcileResult,
   migratePostgresIfEmpty,
   type MigrationBootstrapResult,
   type Db,
+  type DbTransaction,
 } from "./client.js";
+export {
+  checkPendingMigrationPreflight,
+  formatPreflightFailure,
+  selectGuardedPendingIndexes,
+  PRECREATE_REQUIRED_INDEXES,
+  type PrecreateRequiredIndex,
+  type PreflightBlocker,
+  type PendingMigrationPreflightResult,
+} from "./pending-migration-preflight.js";
+export {
+  ensurePendingConcurrentIndexes,
+  ensureConcurrentIndexesForMigration,
+  PENDING_CONCURRENT_INDEXES,
+  type ConcurrentIndexSpec,
+  type ConcurrentIndexEnsureAction,
+  type ConcurrentIndexEnsureResult,
+  type EnsurePendingConcurrentIndexesOptions,
+  type EnsureConcurrentIndexesForMigrationOptions,
+} from "./concurrent-index-guard.js";
+export {
+  ensureOnlineIndexPrerequisites,
+  ONLINE_INDEX_PREREQUISITES,
+  type OnlineIndexPrerequisite,
+  type OnlineIndexPrecreationAction,
+  type OnlineIndexPrecreationResult,
+  type EnsureOnlineIndexPrerequisitesOptions,
+} from "./precreate-online-indexes.js";
 export {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,

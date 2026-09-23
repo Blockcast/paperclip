@@ -281,7 +281,7 @@ export type {
   DocumentTextRange,
   UpdateDocumentAnnotationThreadRequest,
 } from "./document-annotation.js";
-export type { Project, ProjectBudgetSummary, ProjectCodebase, ProjectCodebaseOrigin, ProjectGoalRef, LinearProjectLink, ProjectManagedByPlugin, ProjectWorkspace } from "./project.js";
+export type { Project, PrimaryWorkspaceSource, ProjectBudgetSummary, ProjectCodebase, ProjectCodebaseOrigin, ProjectGoalRef, LinearProjectLink, ProjectManagedByPlugin, ProjectWorkspace } from "./project.js";
 export type {
   CompanySearchCountType,
   CompanySearchExtractIssueResult,
@@ -340,6 +340,7 @@ export type {
   ExecutionWorkspaceStrategyType,
   ExecutionWorkspaceMode,
   ExecutionWorkspaceProviderType,
+  ExecutionWorkspaceRunScope,
   ExecutionWorkspaceStatus,
   ExecutionWorkspaceStrategy,
   ProjectExecutionWorkspacePolicy,
@@ -730,6 +731,8 @@ export type {
   GitWorktreeBranchIncoherenceEvidence,
   GitWorktreeInProgressOperation,
   HeartbeatRun,
+  HeartbeatRunRetrySuccessor,
+  HeartbeatRunRetrySuccessorState,
   HeartbeatRunEvent,
   HeartbeatRunStatusPhase,
   AgentRuntimeState,

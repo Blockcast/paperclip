@@ -154,12 +154,16 @@ export interface HostServices {
     resolve(params: WorkerToHostMethods["approvals.resolve"][0]): Promise<WorkerToHostMethods["approvals.resolve"][1]>;
   };
 
-  /** Provides `secrets.resolve`, `secrets.list`, `secrets.manage`. */
+  /** Provides `secrets.resolve`, `secrets.verify`, `secrets.list`, `secrets.manage`. */
   secrets: {
     resolve(
       params: WorkerToHostMethods["secrets.resolve"][0],
       context?: WorkerHostCallContext,
     ): Promise<string>;
+    verify(
+      params: WorkerToHostMethods["secrets.verify"][0],
+      context?: WorkerHostCallContext,
+    ): Promise<boolean>;
     list(params: WorkerToHostMethods["secrets.list"][0]): Promise<WorkerToHostMethods["secrets.list"][1]>;
     providers(params: WorkerToHostMethods["secrets.providers"][0]): Promise<WorkerToHostMethods["secrets.providers"][1]>;
     create(params: WorkerToHostMethods["secrets.create"][0]): Promise<WorkerToHostMethods["secrets.create"][1]>;
@@ -177,6 +181,13 @@ export interface HostServices {
       entityId?: string;
       metadata?: Record<string, unknown>;
     }): Promise<void>;
+  };
+
+  /** Provides `costs.write`. */
+  costs: {
+    createFinanceEvent(
+      params: WorkerToHostMethods["costs.finance.create"][0],
+    ): Promise<WorkerToHostMethods["costs.finance.create"][1]>;
   };
 
   /** Provides `metrics.write`. */
@@ -260,6 +271,7 @@ export interface HostServices {
     getOrchestrationSummary(params: WorkerToHostMethods["issues.summaries.getOrchestration"][0]): Promise<WorkerToHostMethods["issues.summaries.getOrchestration"][1]>;
     listComments(params: WorkerToHostMethods["issues.listComments"][0]): Promise<WorkerToHostMethods["issues.listComments"][1]>;
     createComment(params: WorkerToHostMethods["issues.createComment"][0]): Promise<WorkerToHostMethods["issues.createComment"][1]>;
+    updateComment(params: WorkerToHostMethods["issues.updateComment"][0]): Promise<WorkerToHostMethods["issues.updateComment"][1]>;
     createInteraction(params: WorkerToHostMethods["issues.createInteraction"][0]): Promise<WorkerToHostMethods["issues.createInteraction"][1]>;
   };
 
@@ -442,6 +454,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
 
   // Secrets
   "secrets.resolve": "secrets.read-ref",
+  "secrets.verify": "secrets.verify-ref",
   "secrets.list": "secrets.list",
   "secrets.providers": "secrets.list",
   "secrets.create": "secrets.manage",
@@ -451,6 +464,9 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
 
   // Activity
   "activity.log": "activity.log.write",
+
+  // Costs / finance
+  "costs.finance.create": "costs.write",
 
   // Metrics
   "metrics.write": "metrics.write",
@@ -506,6 +522,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   "issues.summaries.getOrchestration": "issues.orchestration.read",
   "issues.listComments": "issue.comments.read",
   "issues.createComment": "issue.comments.create",
+  "issues.updateComment": "issue.comments.update",
   "issues.createInteraction": "issue.interactions.create",
 
   // Projects write (Lucitra extension)
@@ -834,6 +851,10 @@ export function createHostClientHandlers(
       const companyId = resolveRequiredCompanyId("secrets.resolve", params, context);
       return services.secrets.resolve({ ...params, companyId }, context);
     }),
+    "secrets.verify": gated("secrets.verify", async (params, context) => {
+      const companyId = resolveRequiredCompanyId("secrets.verify", params, context);
+      return services.secrets.verify({ ...params, companyId }, context);
+    }),
     "secrets.list": gated("secrets.list", async (params) => {
       return services.secrets.list(params);
     }),
@@ -856,6 +877,11 @@ export function createHostClientHandlers(
     // Activity
     "activity.log": gated("activity.log", async (params) => {
       return services.activity.log(params);
+    }),
+
+    // Costs / finance
+    "costs.finance.create": gated("costs.finance.create", async (params) => {
+      return services.costs.createFinanceEvent(params);
     }),
 
     // Metrics
@@ -1002,6 +1028,9 @@ export function createHostClientHandlers(
     }),
     "issues.createComment": gated("issues.createComment", async (params) => {
       return services.issues.createComment(params);
+    }),
+    "issues.updateComment": gated("issues.updateComment", async (params) => {
+      return services.issues.updateComment(params);
     }),
     "issues.createInteraction": gated("issues.createInteraction", async (params) => {
       return services.issues.createInteraction(params);

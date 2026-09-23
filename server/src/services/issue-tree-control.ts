@@ -70,6 +70,11 @@ type RestoreTreeStatusResult = TreeStatusUpdateResult & {
 };
 
 const TERMINAL_ISSUE_STATUSES = new Set<IssueStatus>(["done", "cancelled"]);
+// BLO-25410: NOT a lock predicate — this drives pause/cancel control over a
+// tree, where "active" means actually executing, and the rows are re-narrowed to
+// queued/running in memory below. Enumeration is correct: an unknown status must
+// not be treated as an executing run to pause. Checkoutability uses the terminal
+// complement instead — see `issue-execution-lock.ts`.
 const ACTIVE_RUN_STATUSES = ["queued", "running"] as const;
 const DEFAULT_RELEASE_POLICY: IssueTreeHoldReleasePolicy = { strategy: "manual" };
 const MAX_PAUSE_HOLD_ANCESTOR_DEPTH = 100;

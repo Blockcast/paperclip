@@ -14,7 +14,9 @@ import {
   type EvidenceCommentLite,
   type EvidenceVerdict,
 } from "./evidence-gate.js";
+import type { EvidenceShape } from "./evidence-shapes.js";
 import { DEFAULT_EVIDENCE_REGISTRY } from "./evidence-shapes.js";
+import type { TruthProbe } from "./evidence-truth.js";
 
 export interface EvidenceFetchResult {
   description: string | null;
@@ -26,6 +28,14 @@ export interface EvidenceFetchResult {
     type: string;
     metadata: Record<string, unknown> | null;
     status: string | null;
+    /**
+     * Provenance. The truth probe trusts a `merged` claim only from a
+     * webhook-stamped row, so this must be selected alongside the row — a
+     * dropped `sourceTrust` silently downgrades every PR to "confirm with
+     * GitHub", which is slower but still correct, and an INVENTED one would
+     * not be.
+     */
+    sourceTrust: { promotedByActorId?: string | null } | null;
   }>;
 }
 
@@ -45,10 +55,32 @@ export interface EvidenceVerdictRecord {
   overridden?: boolean;
   overrideReason?: string;
   evaluatedAt: string;
+  commitEvidence?: Array<{ repoFullName: string; sha: string }>;
 }
 
 const OPERATOR_OVERRIDE_PATTERN = /^evidence-gate: override (.+)$/;
 const OPERATOR_OVERRIDE_MAX_AGE_MS = 60 * 60 * 1000;
+
+export function extractGithubCommitEvidence(
+  comments: EvidenceCommentLite[],
+): Array<{ repoFullName: string; sha: string }> {
+  const seen = new Set<string>();
+  const refs: Array<{ repoFullName: string; sha: string }> = [];
+  for (const comment of comments) {
+    if (comment.authorAgentId === null) continue;
+    for (const match of comment.body.matchAll(
+      /https?:\/\/github\.com\/([\w-]+\/[\w.-]+)\/commit\/([0-9a-f]{7,40})\b/gi,
+    )) {
+      const repoFullName = match[1]!;
+      const sha = match[2]!.toLowerCase();
+      const key = `${repoFullName.toLowerCase()}@${sha}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      refs.push({ repoFullName, sha });
+    }
+  }
+  return refs;
+}
 
 /**
  * Run the gate for one issue. Returns the verdict record the caller should
@@ -69,6 +101,8 @@ export async function runEvidenceGate(
   fetch: FetchEvidenceForGate,
   issueId: string,
   now: Date = new Date(),
+  truth?: TruthProbe,
+  options?: { unlabeledTruthBlock?: boolean },
 ): Promise<EvidenceVerdictRecord> {
   const data = await fetch(issueId, now);
   const override = (data.operatorOverrideComments ?? data.comments)
@@ -97,7 +131,28 @@ export async function runEvidenceGate(
       overridden: true,
       overrideReason: override.match[1]!.trim(),
       evaluatedAt: now.toISOString(),
+      commitEvidence: [],
     };
+  }
+  // Deliberately AFTER the operator override: an override is a human saying
+  // "ship it anyway", and spending GitHub calls to contradict them is both
+  // slower and pointless.
+  let externalDetections: Partial<Record<EvidenceShape, boolean>> | undefined;
+  let probeFailed = false;
+  let noLinkedPullRequest = false;
+  const truthDiagnostics: string[] = [];
+  if (truth) {
+    const probed = await truth({
+      workProducts: data.workProducts.map((wp) => ({
+        type: wp.type,
+        metadata: wp.metadata,
+        sourceTrust: wp.sourceTrust,
+      })),
+    });
+    externalDetections = probed.detections;
+    probeFailed = probed.probeFailed;
+    noLinkedPullRequest = probed.noLinkedPullRequest;
+    truthDiagnostics.push(...probed.diagnostics);
   }
   const evaluation = evaluateEvidence({
     issue: {
@@ -112,6 +167,10 @@ export async function runEvidenceGate(
     })),
     registry: DEFAULT_EVIDENCE_REGISTRY,
     doneWhenBulletsRemoved: data.doneWhenBulletsRemoved,
+    externalDetections,
+    probeFailed,
+    noLinkedPullRequest,
+    unlabeledTruthBlock: options?.unlabeledTruthBlock,
   });
   return {
     verdict: evaluation.verdict,
@@ -120,7 +179,8 @@ export async function runEvidenceGate(
     requiredFound: evaluation.requiredFound,
     allDetected: evaluation.allDetected,
     unlabeledFallback: evaluation.unlabeledFallback,
-    diagnostics: evaluation.diagnostics,
+    diagnostics: [...evaluation.diagnostics, ...truthDiagnostics],
     evaluatedAt: now.toISOString(),
+    commitEvidence: extractGithubCommitEvidence(data.comments),
   };
 }

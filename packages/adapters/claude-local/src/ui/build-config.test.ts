@@ -47,4 +47,8 @@ describe("buildClaudeLocalConfig", () => {
     expect(buildClaudeLocalConfig(makeValues({ claudeEngine: "cli" }))).toMatchObject({ engine: "cli" });
     expect(buildClaudeLocalConfig(makeValues({ claudeEngine: "acp" }))).toMatchObject({ engine: "acp" });
   });
+
+  it("leaves timeout unset so the selected execution target applies its default", () => {
+    expect(buildClaudeLocalConfig(makeValues())).not.toHaveProperty("timeoutSec");
+  });
 });

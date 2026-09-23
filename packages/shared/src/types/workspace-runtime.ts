@@ -70,6 +70,19 @@ export interface WorkspaceCommandDefinition {
   source: WorkspaceCommandSource;
 }
 
+/**
+ * Granularity at which a `git_worktree` strategy allocates a working tree.
+ *
+ * - `per_issue` (default, and the historical behaviour): the tree is keyed by
+ *   the rendered branch name, which is derived from the issue. Two concurrent
+ *   runs of the *same* issue therefore resolve to the same `cwd` and share
+ *   uncommitted state.
+ * - `per_run`: the branch (and therefore the tree) additionally carries a short
+ *   run token, so every heartbeat run gets its own tree. Costs one dependency
+ *   install per run; see BLO-19063.
+ */
+export type ExecutionWorkspaceRunScope = "per_issue" | "per_run";
+
 export interface ExecutionWorkspaceStrategy {
   type: ExecutionWorkspaceStrategyType;
   baseRef?: string | null;
@@ -77,6 +90,7 @@ export interface ExecutionWorkspaceStrategy {
   worktreeParentDir?: string | null;
   provisionCommand?: string | null;
   teardownCommand?: string | null;
+  runScope?: ExecutionWorkspaceRunScope | null;
 }
 
 export interface ExecutionWorkspaceConfig {
@@ -257,6 +271,14 @@ export interface ExecutionWorkspace {
   cleanupEligibleAt: Date | null;
   cleanupReason: string | null;
   config: ExecutionWorkspaceConfig | null;
+  /**
+   * Whether this workspace carries its own `workspaceRuntime` block, independent of whether the
+   * reader is entitled to see its contents. `config.workspaceRuntime` and `metadata` are withheld
+   * from readers without `workspace_runtime:read` (PEN-2852), so callers must NOT infer presence from
+   * `Boolean(config?.workspaceRuntime)` — that predicate is false for a withheld value and for an
+   * absent one alike. This flag is always computed from the stored row.
+   */
+  hasWorkspaceRuntimeConfig: boolean;
   metadata: Record<string, unknown> | null;
   runtimeServices?: WorkspaceRuntimeService[];
   createdAt: Date;

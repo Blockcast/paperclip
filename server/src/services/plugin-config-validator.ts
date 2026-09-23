@@ -38,6 +38,13 @@ export function validateInstanceConfig(
   // hold a Paperclip secret UUID rather than a raw value. The format is a UI
   // hint only — UUID validation happens in the secrets handler at resolve time.
   ajv.addFormat("secret-ref", { validate: () => true });
+  // Paperclip annotation keywords consumed by `plugin-config-masking`. They
+  // carry no validation semantics, but Ajv runs in strict mode and throws on an
+  // unknown keyword — so a manifest that marks a field secret-bearing, or names
+  // an array's immutable identity, would otherwise fail to compile and turn
+  // every config save and test for that plugin into a 500 (BLO-20871).
+  ajv.addKeyword({ keyword: "x-paperclip-secret", schemaType: "boolean" });
+  ajv.addKeyword({ keyword: "x-paperclip-identity", schemaType: "string" });
   const validate = ajv.compile(schema);
   const valid = validate(configJson);
 

@@ -15,6 +15,10 @@ import {
 } from "@paperclipai/shared";
 import { eq } from "drizzle-orm";
 
+// Same shape as `agent-invokability.ts` / `recovery/service.ts`: a caller's
+// open transaction handle, which the db package does not export as a name.
+type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+
 const DEFAULT_SINGLETON_KEY = "default";
 const instanceGeneralSettingsStorageSchema = instanceGeneralSettingsSchema.strip();
 const instanceExperimentalSettingsStorageSchema = instanceExperimentalSettingsSchema.strip();
@@ -289,6 +293,35 @@ function toInstanceSettings(row: typeof instanceSettings.$inferSelect): Instance
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   } as InstanceSettings;
+}
+
+/**
+ * Read-only settings view for callers that already hold a transaction.
+ *
+ * BLO-34207: `getOrCreateRow` bootstraps the singleton row with
+ * `insert ... on conflict do update`. On the pool that is harmless — its own
+ * autocommitted statement — but run on a caller's tx it takes a row lock on a
+ * single instance-wide row and holds it to commit. Issue mutations take that
+ * read BEFORE `lockIssueParentMutationCompany`, so two transactions can acquire
+ * the singleton row and the company graph lock in opposite orders: a global
+ * serialization point with a deadlock edge, which is strictly worse than the
+ * convoy this change set exists to remove.
+ *
+ * A missing row and a freshly bootstrapped row normalize to exactly the same
+ * values (`general: {}` / `experimental: {}`), so reading defaults is
+ * equivalent to bootstrapping — minus the write. Writers still go through
+ * `instanceSettingsService`, which keeps creating the row.
+ */
+export async function readInstanceSettingsOn(dbOrTx: Db | DbTransaction) {
+  const row = await dbOrTx
+    .select()
+    .from(instanceSettings)
+    .where(eq(instanceSettings.singletonKey, DEFAULT_SINGLETON_KEY))
+    .then((rows) => rows[0] ?? null);
+  return {
+    general: normalizeGeneralSettings(row?.general),
+    experimental: normalizeExperimentalSettings(row?.experimental),
+  };
 }
 
 export function instanceSettingsService(db: Db, options: InstanceSettingsServiceOptions = {}) {

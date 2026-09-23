@@ -4,11 +4,16 @@
 // are excluded from the pnpm workspace (see pnpm-workspace.yaml). Workspace
 // members get their SDK link from pnpm automatically; excluded packages do not.
 //
-// Invoked from the root postinstall. Intentionally NOT referenced from any
-// plugin's own package.json so the published tarballs cannot carry a lifecycle
-// script that escapes their package directory at install time.
+// Invoked from the root postinstall, which covers every excluded plugin. A
+// workspace member must NOT also call it from its own postinstall: pnpm runs
+// those concurrently with the root hook, and two linkers racing on the same
+// symlink fail the whole install with EEXIST. Excluded packages that are also
+// installed standalone (they never see the root hook) are the one exception.
+// Published tarballs never carry this script because prepack regenerates
+// package.json from a field whitelist that omits `scripts` entirely --
+// see scripts/generate-plugin-package-json.mjs.
 
-import { existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, rmSync, symlinkSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, symlinkSync, unlinkSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -18,7 +23,7 @@ const sdkDir = join(repoRoot, "packages", "plugins", "sdk");
 
 // Plugin packages excluded from the workspace that still need @paperclipai/plugin-sdk
 // linked in for local dev. Keep in sync with pnpm-workspace.yaml exclusions.
-function excludedPluginDirs() {
+export function excludedPluginDirs() {
   return [
     ...readPluginsUnder(join(repoRoot, "packages", "plugins", "sandbox-providers")),
     join(repoRoot, "packages", "plugins", "examples", "plugin-orchestration-smoke-example"),
@@ -82,7 +87,7 @@ export function linkSdkInto(packageDir) {
         // Already linked to the in-repo SDK; nothing to do.
         return false;
       }
-      rmSync(linkTarget, { force: true });
+      unlinkSync(linkTarget);
     } else {
       // A real install has already populated @paperclipai/plugin-sdk (e.g. the
       // plugin host did `npm install` of the published tarball). Leave it.
@@ -93,6 +98,20 @@ export function linkSdkInto(packageDir) {
     if (error?.code !== "ENOENT") throw error;
   }
 
-  symlinkSync(relativeSdkDir, linkTarget, "dir");
+  symlinkAcceptingIdenticalRaceWinner(relativeSdkDir, linkTarget);
   return true;
+}
+
+// symlinkSync, but tolerant of losing a race to another linker. The lstat above
+// and this call are not atomic, so a concurrent process (a standalone plugin's
+// postinstall, or a parallel build) can create the same link in between. An
+// identical link means our work is already done; anything else still throws.
+export function symlinkAcceptingIdenticalRaceWinner(relativeSdkDir, linkTarget) {
+  try {
+    symlinkSync(relativeSdkDir, linkTarget, "dir");
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+    const stat = lstatSync(linkTarget);
+    if (!stat.isSymbolicLink() || readlinkSync(linkTarget) !== relativeSdkDir) throw error;
+  }
 }

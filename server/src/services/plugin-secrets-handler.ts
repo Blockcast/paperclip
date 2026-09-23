@@ -3,9 +3,10 @@
  * `secret_ref` config bindings only with an explicit company context.
  */
 
+import { createHash, timingSafeEqual } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { companySecretBindings } from "@paperclipai/db";
+import { companySecretBindings, companySecretVersions } from "@paperclipai/db";
 import type { EnvSecretRefBinding, SecretProjectionClass, SecretVersionSelector } from "@paperclipai/shared";
 import { envBindingSecretRefSchema } from "@paperclipai/shared";
 import {
@@ -14,6 +15,7 @@ import {
   readConfigValueAtPath,
 } from "./json-schema-secret-refs.js";
 import { secretService } from "./secrets.js";
+import { versionMaterialHasValueDigest } from "../secrets/value-digest.js";
 import { unprocessable } from "../errors.js";
 
 // ---------------------------------------------------------------------------
@@ -186,6 +188,10 @@ export interface PluginSecretsResolveParams {
   heartbeatRunId?: string | null;
 }
 
+export interface PluginSecretsVerifyParams extends PluginSecretsResolveParams {
+  presented: string;
+}
+
 export interface PluginSecretsHandlerOptions {
   db: Db;
   pluginId: string;
@@ -193,7 +199,10 @@ export interface PluginSecretsHandlerOptions {
 
 export interface PluginSecretsService {
   resolve(params: PluginSecretsResolveParams): Promise<string>;
+  verify(params: PluginSecretsVerifyParams): Promise<boolean>;
 }
+
+const MAX_PRESENTED_SECRET_BYTES = 4_096;
 
 function createRateLimiter(maxAttempts: number, windowMs: number) {
   const attempts = new Map<string, number[]>();
@@ -216,6 +225,11 @@ export function createPluginSecretsHandler(
 ): PluginSecretsService {
   const { db, pluginId } = options;
   const rateLimiter = createRateLimiter(30, 60_000);
+  // Separate bucket from `resolve`, on purpose. A public webhook endpoint
+  // authenticates with `verify`, so an unauthenticated flood lands here; if the
+  // two shared a bucket, that flood would starve the plaintext resolutions a
+  // legitimate delivery needs (BLO-20738).
+  const verifyRateLimiter = createRateLimiter(600, 60_000);
 
   async function lookupBinding(input: {
     companyId: string;
@@ -242,53 +256,118 @@ export function createPluginSecretsHandler(
     return matchingVersion;
   }
 
+  async function authorizeBoundSecret(params: PluginSecretsResolveParams) {
+    // A legacy bare-UUID ref resolves as `{ secretId, version: "latest" }`.
+    // This does not widen what a worker can reach: `lookupBinding` below is
+    // the authorization gate, and it still requires an explicit
+    // companySecretBindings row scoped to this company *and* this plugin.
+    const rawRef =
+      typeof params.secretRef === "string"
+        ? coerceLegacySecretRef(params.secretRef)
+        : params.secretRef;
+    if (!rawRef) throw invalidSecretRef(params.secretRef);
+
+    const bindingRef = parseSecretRefBinding(rawRef);
+    if (!bindingRef) throw invalidSecretRef(params.secretRef);
+
+    const companyId = requireCompanyId(params.companyId);
+    const versionSelector = bindingRef.version ?? "latest";
+    const bindings = await lookupBinding({
+      companyId,
+      secretId: bindingRef.secretId,
+      versionSelector,
+      configPath: params.configPath,
+    });
+
+    if (bindings.length === 0) {
+      throw unprocessable(
+        `Secret is not bound to plugin:${pluginId}${params.configPath ? ` at ${params.configPath}` : ""}`,
+        { code: "binding_missing" },
+      );
+    }
+    if (bindings.length > 1) {
+      throw unprocessable(
+        "Plugin secret reference is ambiguous; pass configPath when resolving this secret",
+        { code: "binding_ambiguous" },
+      );
+    }
+
+    return { bindingRef, companyId, versionSelector, binding: bindings[0]! };
+  }
+
+  async function resolveBoundSecret(params: PluginSecretsResolveParams): Promise<string> {
+    const { bindingRef, companyId, versionSelector, binding } = await authorizeBoundSecret(params);
+    return secretService(db).resolveSecretValue(companyId, bindingRef.secretId, versionSelector, {
+      bindingContext: {
+        consumerType: "plugin",
+        consumerId: pluginId,
+        configPath: binding.configPath,
+        actorType: params.actorType ?? "plugin",
+        actorId: params.actorId ?? pluginId,
+        issueId: params.issueId ?? null,
+        heartbeatRunId: params.heartbeatRunId ?? null,
+        pluginId,
+      },
+      accessContext: {
+        consumerType: "plugin_worker",
+        consumerId: pluginId,
+        configPath: binding.configPath,
+        actorType: params.actorType ?? "plugin",
+        actorId: params.actorId ?? pluginId,
+        issueId: params.issueId ?? null,
+        heartbeatRunId: params.heartbeatRunId ?? null,
+        pluginId,
+      },
+    });
+  }
+
   return {
     async resolve(params: PluginSecretsResolveParams): Promise<string> {
-      // A legacy bare-UUID ref resolves as `{ secretId, version: "latest" }`.
-      // This does not widen what a worker can reach: `lookupBinding` below is
-      // the authorization gate, and it still requires an explicit
-      // companySecretBindings row scoped to this company *and* this plugin.
-      const rawRef =
-        typeof params.secretRef === "string"
-          ? coerceLegacySecretRef(params.secretRef)
-          : params.secretRef;
-      if (!rawRef) throw invalidSecretRef(params.secretRef);
-
-      const bindingRef = parseSecretRefBinding(rawRef);
-      if (!bindingRef) throw invalidSecretRef(params.secretRef);
-
       const companyId = requireCompanyId(params.companyId);
-
       if (!rateLimiter.check(`${companyId}:${pluginId}`)) {
         const err = new Error("Rate limit exceeded for secret resolution");
         err.name = "RateLimitExceededError";
         throw err;
       }
+      return resolveBoundSecret(params);
+    },
 
-      const versionSelector = bindingRef.version ?? "latest";
-      const bindings = await lookupBinding({
+    async verify(params: PluginSecretsVerifyParams): Promise<boolean> {
+      if (
+        typeof params.presented !== "string" ||
+        Buffer.byteLength(params.presented, "utf8") > MAX_PRESENTED_SECRET_BYTES
+      ) {
+        throw unprocessable(
+          `Presented secret must be a string no larger than ${MAX_PRESENTED_SECRET_BYTES} bytes`,
+          { code: "presented_secret_invalid" },
+        );
+      }
+
+      // Metered separately from `resolve`, and BEFORE any database work — same
+      // ordering as `resolve` above, and the entire point of this primitive: a
+      // public webhook flooded with junk bearers must not be able to spend the
+      // plaintext-resolution budget legitimate deliveries depend on
+      // (BLO-20738 AC 2). Gating after `authorizeBoundSecret` would still bound
+      // the *verification*, but would let an unauthenticated caller force an
+      // unbounded number of binding lookups first.
+      //
+      // The ceiling is far higher than `resolve`'s because a verification hands
+      // back one bit rather than a secret, so a wrong guess is cheap to reject
+      // — which is what lets correct deliveries keep working under a flood.
+      if (!verifyRateLimiter.check(`${requireCompanyId(params.companyId)}:${pluginId}`)) {
+        const err = new Error("Rate limit exceeded for secret verification");
+        err.name = "RateLimitExceededError";
+        throw err;
+      }
+
+      const { bindingRef, companyId, versionSelector, binding } = await authorizeBoundSecret(params);
+
+      const secrets = secretService(db);
+      const resolvedVersion = await secrets.resolveSecretVersion(
         companyId,
-        secretId: bindingRef.secretId,
+        bindingRef.secretId,
         versionSelector,
-        configPath: params.configPath,
-      });
-
-      if (bindings.length === 0) {
-        throw unprocessable(
-          `Secret is not bound to plugin:${pluginId}${params.configPath ? ` at ${params.configPath}` : ""}`,
-          { code: "binding_missing" },
-        );
-      }
-      if (bindings.length > 1) {
-        throw unprocessable(
-          "Plugin secret reference is ambiguous; pass configPath when resolving this secret",
-          { code: "binding_ambiguous" },
-        );
-      }
-
-      const binding = bindings[0]!;
-      return secretService(db).resolveSecretValue(companyId, bindingRef.secretId, versionSelector, {
-        bindingContext: {
+        {
           consumerType: "plugin",
           consumerId: pluginId,
           configPath: binding.configPath,
@@ -298,17 +377,45 @@ export function createPluginSecretsHandler(
           heartbeatRunId: params.heartbeatRunId ?? null,
           pluginId,
         },
-        accessContext: {
-          consumerType: "plugin_worker",
-          consumerId: pluginId,
-          configPath: binding.configPath,
-          actorType: params.actorType ?? "plugin",
-          actorId: params.actorId ?? pluginId,
-          issueId: params.issueId ?? null,
-          heartbeatRunId: params.heartbeatRunId ?? null,
-          pluginId,
-        },
-      });
+      );
+      const [version] = await db
+        .select({
+          valueSha256: companySecretVersions.valueSha256,
+          material: companySecretVersions.material,
+        })
+        .from(companySecretVersions)
+        .where(and(
+          eq(companySecretVersions.secretId, bindingRef.secretId),
+          eq(companySecretVersions.version, resolvedVersion),
+        ))
+        .limit(1);
+
+      // A selector that resolved to a version with no row is a different fault
+      // from an unverifiable one, and saying "external provider reference" here
+      // would send an operator hunting the wrong problem.
+      if (!version) {
+        throw unprocessable("Secret verifier is unavailable", { code: "secret_verifier_unavailable" });
+      }
+
+      // `value_sha256` holds a metadata fingerprint rather than a value digest
+      // for externally-referenced versions, so digest comparison would reject
+      // every genuine credential — indistinguishable, to the caller, from a
+      // wrong bearer. Refuse loudly instead of returning a confident `false`
+      // (BLO-20738 / Ally round-5). Verifying those requires a provider-side
+      // verifier; until then a plugin must keep using `resolve` for them.
+      if (!versionMaterialHasValueDigest(version.material)) {
+        throw unprocessable(
+          "Secret verifier is unavailable: this secret version is an external provider reference, which stores a metadata fingerprint rather than a digest of the value. Verification is only supported for versions Paperclip wrote itself.",
+          { code: "secret_verifier_unsupported" },
+        );
+      }
+
+      const expectedDigest = Buffer.from(version.valueSha256 ?? "", "hex");
+      if (expectedDigest.length !== 32) {
+        throw unprocessable("Secret verifier is unavailable", { code: "secret_verifier_unavailable" });
+      }
+      const presentedDigest = createHash("sha256").update(params.presented).digest();
+      return timingSafeEqual(expectedDigest, presentedDigest);
     },
   };
 }

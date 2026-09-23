@@ -81,6 +81,7 @@ export function signToolArguments(args: {
   canonicalArguments: string;
   approvalSnapshot?: unknown;
   executionOnApprove?: boolean;
+  requiresFormalApproval?: boolean;
   signingSecret?: string;
 }) {
   const payloadValue: Record<string, unknown> = {
@@ -90,6 +91,9 @@ export function signToolArguments(args: {
   };
   if (args.executionOnApprove === true) {
     payloadValue.executionOnApprove = true;
+  }
+  if (args.requiresFormalApproval === true) {
+    payloadValue.requiresFormalApproval = true;
   }
   if (args.approvalSnapshot !== undefined) {
     payloadValue.approvalSnapshot = args.approvalSnapshot;
@@ -106,6 +110,7 @@ export function verifyToolArgumentsSignature(input: {
   canonicalArguments: string;
   approvalSnapshot?: unknown;
   executionOnApprove?: boolean;
+  requiresFormalApproval?: boolean;
   signingSecret?: string;
 }) {
   if (!input.signedArguments) return false;
@@ -125,6 +130,9 @@ export function verifyToolArgumentsSignature(input: {
   if (input.executionOnApprove !== undefined) {
     expectedPayloadValue.executionOnApprove = input.executionOnApprove;
   }
+  if (input.requiresFormalApproval !== undefined) {
+    expectedPayloadValue.requiresFormalApproval = input.requiresFormalApproval;
+  }
   if (input.approvalSnapshot !== undefined) {
     expectedPayloadValue.approvalSnapshot = input.approvalSnapshot;
   }
@@ -141,7 +149,7 @@ export function readSignedToolArgumentsPayload(input: {
   invocationId: string;
   toolName: string;
   signingSecret?: string;
-}): { arguments: unknown; approvalSnapshot?: unknown; executionOnApprove?: boolean } | null {
+}): { arguments: unknown; approvalSnapshot?: unknown; executionOnApprove?: boolean; requiresFormalApproval?: boolean } | null {
   if (!input.signedArguments) return null;
   let parsed: { payload?: unknown };
   try {
@@ -156,6 +164,7 @@ export function readSignedToolArgumentsPayload(input: {
     canonicalArguments?: unknown;
     approvalSnapshot?: unknown;
     executionOnApprove?: unknown;
+    requiresFormalApproval?: unknown;
   };
   try {
     payload = JSON.parse(parsed.payload);
@@ -171,6 +180,7 @@ export function readSignedToolArgumentsPayload(input: {
     canonicalArguments: payload.canonicalArguments,
     approvalSnapshot: payload.approvalSnapshot,
     executionOnApprove: payload.executionOnApprove === true ? true : undefined,
+    requiresFormalApproval: payload.requiresFormalApproval === true ? true : undefined,
     signingSecret: input.signingSecret,
   })) {
     return null;
@@ -180,6 +190,7 @@ export function readSignedToolArgumentsPayload(input: {
       arguments: JSON.parse(payload.canonicalArguments) as unknown,
       ...(payload.approvalSnapshot !== undefined ? { approvalSnapshot: payload.approvalSnapshot } : {}),
       ...(payload.executionOnApprove === true ? { executionOnApprove: true } : {}),
+      ...(payload.requiresFormalApproval === true ? { requiresFormalApproval: true } : {}),
     };
   } catch {
     return null;

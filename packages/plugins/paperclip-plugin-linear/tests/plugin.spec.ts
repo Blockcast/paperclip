@@ -3414,6 +3414,697 @@ describe("paperclip-plugin-linear", () => {
       // (Per-test mock-reset cleanup removed — beforeEach now restores
       // syncModule defaults systematically via restoreSyncModuleDefaults.)
     });
+
+    // BLO-3267: the test above awaits delivery 1 before firing delivery 2, so it
+    // only covers sequential retries. The duplicate pair actually observed on
+    // BLO-3267 landed 3ms apart — i.e. concurrent delivery, where the
+    // read-then-write `listComments` check cannot see a sibling that has not
+    // written yet. This is the case that regressed.
+    //
+    // BLO-31657 removed both the `listComments` scan and the process-local
+    // `inFlightComments` claim, so this assertion now rests entirely on the
+    // `idempotencyKey` handed to the host. That makes it a live plumbing check
+    // rather than an inherited one: drop the key in `worker.ts` and both
+    // deliveries insert, so this fails. It previously passed because of the
+    // in-flight Set, which would have masked exactly that regression.
+    it("does not double-post when the same Linear comment is delivered concurrently", async () => {
+      const paperclipIssue = await harness.ctx.issues.create({
+        companyId: "comp-1",
+        title: "Issue with Linear comments",
+      });
+      syncModule.getLinkByLinear.mockResolvedValue({
+        paperclipIssueId: paperclipIssue.id,
+        paperclipCompanyId: "comp-1",
+        linearIssueId: "lin-iss-1",
+        linearIdentifier: "LUC-100",
+        linearUrl: "https://linear.app/lucitra/issue/LUC-100",
+        syncDirection: "bidirectional",
+      });
+
+      const commentPayload = {
+        type: "Comment",
+        action: "create" as const,
+        data: {
+          id: "lin-comment-uuid-99",
+          body: "Hello from Linear",
+          issue: { id: "lin-iss-1" },
+          user: { name: "Linear Author" },
+        },
+      };
+
+      // Both deliveries in flight at once — neither awaited before the other
+      // starts, so the sentinel check alone cannot separate them.
+      await Promise.all([
+        plugin.definition.onWebhook!({
+          endpointKey: "linear-events",
+          parsedBody: commentPayload,
+          headers: {},
+          rawBody: "",
+          requestId: "concurrent-a",
+        }),
+        plugin.definition.onWebhook!({
+          endpointKey: "linear-events",
+          parsedBody: commentPayload,
+          headers: {},
+          rawBody: "",
+          requestId: "concurrent-b",
+        }),
+      ]);
+
+      const comments = await harness.ctx.issues.listComments(paperclipIssue.id, "comp-1");
+      const bridged = comments.filter((c) => c.body.includes("(from Linear)"));
+      expect(bridged).toHaveLength(1);
+      expect(bridged[0]!.body).toContain("<!-- linear-comment-id: lin-comment-uuid-99 -->");
+    });
+
+    // Direct plumbing assertion. The dedup tests above observe an *outcome*
+    // (one row), which the harness could in principle deliver for the wrong
+    // reason. This pins the key itself: derived from the Linear comment UUID,
+    // exactly as BLO-31657 specifies, so a rename or a dropped forward is a
+    // named failure rather than a silently weaker guarantee.
+    it("passes an idempotency key derived from the Linear comment UUID", async () => {
+      const paperclipIssue = await harness.ctx.issues.create({
+        companyId: "comp-1",
+        title: "Issue with Linear comments",
+      });
+      syncModule.getLinkByLinear.mockResolvedValue({
+        paperclipIssueId: paperclipIssue.id,
+        paperclipCompanyId: "comp-1",
+        linearIssueId: "lin-iss-1",
+        linearIdentifier: "LUC-100",
+        linearUrl: "https://linear.app/lucitra/issue/LUC-100",
+        syncDirection: "bidirectional",
+      });
+
+      const createSpy = vi.spyOn(harness.ctx.issues, "createComment");
+      // "`create` never pays the round-trip" is load-bearing — it is why the
+      // legacy guard is gated on `action` rather than run unconditionally, and
+      // it is half of what BLO-31657 buys (one fewer RPC per bridged comment).
+      // Nothing else in this spec pins it: hoisting the guard above the `action`
+      // check in a later refactor would silently restore the round-trip and
+      // every outcome assertion would still pass.
+      const listSpy = vi.spyOn(harness.ctx.issues, "listComments");
+
+      await plugin.definition.onWebhook!({
+        endpointKey: "linear-events",
+        parsedBody: {
+          type: "Comment",
+          action: "create" as const,
+          data: {
+            id: "lin-comment-uuid-key",
+            body: "Hello from Linear",
+            issue: { id: "lin-iss-1" },
+            user: { name: "Linear Author" },
+          },
+        },
+        headers: {},
+        rawBody: "",
+        requestId: "key-check",
+      });
+
+      expect(createSpy).toHaveBeenCalledTimes(1);
+      expect(createSpy.mock.calls[0]![3]).toMatchObject({
+        idempotencyKey: "linear-comment:lin-comment-uuid-key",
+      });
+      expect(listSpy).not.toHaveBeenCalled();
+      createSpy.mockRestore();
+      listSpy.mockRestore();
+    });
+
+    // BLO-31657 regression. A comment bridged before the key shipped carries
+    // the sentinel but `idempotency_key IS NULL`, and all three partial indexes
+    // in 0206 are `WHERE idempotency_key IS NOT NULL` — so the legacy row is
+    // not in the index and `ON CONFLICT` cannot fire against it.
+    //
+    // `update` is an unbounded trigger: editing a comment bridged last month
+    // delivers here today. Without the sentinel guard that edit inserts a
+    // *second* mirror carrying the edited body while the original keeps the
+    // stale one — two versions in the thread with nothing marking which is
+    // current. That is the one dedup failure that is not additive noise, and it
+    // covers the whole pre-deploy backlog until each comment is edited once.
+    //
+    // Live check, not inherited: drop the `action === "update"` guard in
+    // `worker.ts` and this goes to two bridged comments.
+    it("does not duplicate a pre-BLO-31657 mirror when its Linear comment is edited", async () => {
+      const paperclipIssue = await harness.ctx.issues.create({
+        companyId: "comp-1",
+        title: "Issue with Linear comments",
+      });
+      syncModule.getLinkByLinear.mockResolvedValue({
+        paperclipIssueId: paperclipIssue.id,
+        paperclipCompanyId: "comp-1",
+        linearIssueId: "lin-iss-1",
+        linearIdentifier: "LUC-100",
+        linearUrl: "https://linear.app/lucitra/issue/LUC-100",
+        syncDirection: "bidirectional",
+      });
+
+      // A legacy mirror: sentinel present, created with NO idempotency key —
+      // exactly what the pre-BLO-31657 handler wrote.
+      await harness.ctx.issues.createComment(
+        paperclipIssue.id,
+        "<!-- linear-comment-id: lin-comment-uuid-legacy -->\n**Linear Author** (from Linear):\n\nOriginal body",
+        "comp-1",
+      );
+
+      await plugin.definition.onWebhook!({
+        endpointKey: "linear-events",
+        parsedBody: {
+          type: "Comment",
+          action: "update" as const,
+          data: {
+            id: "lin-comment-uuid-legacy",
+            body: "Edited body",
+            issue: { id: "lin-iss-1" },
+            user: { name: "Linear Author" },
+          },
+        },
+        headers: {},
+        rawBody: "",
+        requestId: "legacy-edit",
+      });
+
+      const comments = await harness.ctx.issues.listComments(paperclipIssue.id, "comp-1");
+      const bridged = comments.filter((c) => c.body.includes("(from Linear)"));
+      expect(bridged).toHaveLength(1);
+      // And it is the original row, not a second copy carrying the edit.
+      expect(bridged[0]!.body).toContain("Original body");
+      expect(bridged[0]!.body).not.toContain("Edited body");
+    });
+
+    // Companion control for the test above. A guard that returned on *every*
+    // `update` would satisfy that assertion while silently dropping real work,
+    // so pin the other side: an edit to a comment that was never mirrored must
+    // still bridge it, which is what the pre-BLO-31657 scan did on a miss.
+    it("still bridges an update for a Linear comment that was never mirrored", async () => {
+      const paperclipIssue = await harness.ctx.issues.create({
+        companyId: "comp-1",
+        title: "Issue with Linear comments",
+      });
+      syncModule.getLinkByLinear.mockResolvedValue({
+        paperclipIssueId: paperclipIssue.id,
+        paperclipCompanyId: "comp-1",
+        linearIssueId: "lin-iss-1",
+        linearIdentifier: "LUC-100",
+        linearUrl: "https://linear.app/lucitra/issue/LUC-100",
+        syncDirection: "bidirectional",
+      });
+
+      await plugin.definition.onWebhook!({
+        endpointKey: "linear-events",
+        parsedBody: {
+          type: "Comment",
+          action: "update" as const,
+          data: {
+            id: "lin-comment-uuid-unmirrored",
+            body: "Edited before we ever saw it",
+            issue: { id: "lin-iss-1" },
+            user: { name: "Linear Author" },
+          },
+        },
+        headers: {},
+        rawBody: "",
+        requestId: "unmirrored-edit",
+      });
+
+      const comments = await harness.ctx.issues.listComments(paperclipIssue.id, "comp-1");
+      const bridged = comments.filter((c) => c.body.includes("(from Linear)"));
+      expect(bridged).toHaveLength(1);
+      expect(bridged[0]!.body).toContain("Edited before we ever saw it");
+    });
+
+    // ---------------------------------------------------------------------
+    // BLO-31634: Linear comment edits propagate onto the existing mirror
+    // ---------------------------------------------------------------------
+
+    // Before this landed, an `update` for an already-bridged comment matched
+    // the mirror written by its own `create` and returned — so an edit in
+    // Linear left the Paperclip thread showing the original text forever, with
+    // no way to tell it was stale. Fails on the pre-BLO-31634 handler: the
+    // bridged body still reads "Original text".
+    it("propagates a Linear comment edit onto the existing bridged comment", async () => {
+      const paperclipIssue = await harness.ctx.issues.create({
+        companyId: "comp-1",
+        title: "Issue with Linear comments",
+      });
+      syncModule.getLinkByLinear.mockResolvedValue({
+        paperclipIssueId: paperclipIssue.id,
+        paperclipCompanyId: "comp-1",
+        linearIssueId: "lin-iss-1",
+        linearIdentifier: "LUC-100",
+        linearUrl: "https://linear.app/lucitra/issue/LUC-100",
+        syncDirection: "bidirectional",
+      });
+
+      const delivery = (action: "create" | "update", body: string, requestId: string) => ({
+        endpointKey: "linear-events",
+        parsedBody: {
+          type: "Comment",
+          action,
+          data: {
+            id: "lin-comment-uuid-edit",
+            body,
+            issue: { id: "lin-iss-1" },
+            user: { name: "Linear Author" },
+          },
+        },
+        headers: {},
+        rawBody: "",
+        requestId,
+      });
+
+      await plugin.definition.onWebhook!(delivery("create", "Original text", "edit-create"));
+      await plugin.definition.onWebhook!(delivery("update", "Edited text", "edit-update"));
+
+      const comments = await harness.ctx.issues.listComments(paperclipIssue.id, "comp-1");
+      const bridged = comments.filter((c) => c.body.includes("(from Linear)"));
+      // The edit rewrites in place — one comment, not two versions in the
+      // thread with nothing marking which is current.
+      expect(bridged).toHaveLength(1);
+      expect(bridged[0]!.body).toContain("Edited text");
+      expect(bridged[0]!.body).not.toContain("Original text");
+      // The sentinel survives the rewrite: it is the only mapping a reader
+      // outside the handler has, since the stored idempotency key is namespaced
+      // with the install row's PK.
+      expect(bridged[0]!.body).toContain("<!-- linear-comment-id: lin-comment-uuid-edit -->");
+
+      // AC control — `create` is unchanged by this work. A `create` redelivery
+      // carrying the *stale* body must still skip rather than write, so it can
+      // neither duplicate the comment nor roll the edit back.
+      await plugin.definition.onWebhook!(delivery("create", "Original text", "edit-create-redelivery"));
+      const afterRedelivery = (await harness.ctx.issues.listComments(paperclipIssue.id, "comp-1"))
+        .filter((c) => c.body.includes("(from Linear)"));
+      expect(afterRedelivery).toHaveLength(1);
+      expect(afterRedelivery[0]!.body).toContain("Edited text");
+    });
+
+    // Mirrors the concurrent-`create` test above. Two edits of one comment in
+    // flight at once must converge on a single row: `updateComment` is one
+    // `UPDATE ... WHERE key = ...` and inserts nothing, so this holds for the
+    // same reason the create case does — it is the database, not a
+    // process-local claim that a second replica would not share.
+    it("keeps exactly one comment when concurrent update deliveries carry the same edit", async () => {
+      const paperclipIssue = await harness.ctx.issues.create({
+        companyId: "comp-1",
+        title: "Issue with Linear comments",
+      });
+      syncModule.getLinkByLinear.mockResolvedValue({
+        paperclipIssueId: paperclipIssue.id,
+        paperclipCompanyId: "comp-1",
+        linearIssueId: "lin-iss-1",
+        linearIdentifier: "LUC-100",
+        linearUrl: "https://linear.app/lucitra/issue/LUC-100",
+        syncDirection: "bidirectional",
+      });
+
+      const updatePayload = {
+        type: "Comment",
+        action: "update" as const,
+        data: {
+          id: "lin-comment-uuid-concurrent-edit",
+          body: "Edited text",
+          issue: { id: "lin-iss-1" },
+          user: { name: "Linear Author" },
+        },
+      };
+
+      await plugin.definition.onWebhook!({
+        endpointKey: "linear-events",
+        parsedBody: {
+          ...updatePayload,
+          action: "create" as const,
+          data: { ...updatePayload.data, body: "Original text" },
+        },
+        headers: {},
+        rawBody: "",
+        requestId: "concurrent-edit-create",
+      });
+
+      await Promise.all([
+        plugin.definition.onWebhook!({
+          endpointKey: "linear-events",
+          parsedBody: updatePayload,
+          headers: {},
+          rawBody: "",
+          requestId: "concurrent-edit-a",
+        }),
+        plugin.definition.onWebhook!({
+          endpointKey: "linear-events",
+          parsedBody: updatePayload,
+          headers: {},
+          rawBody: "",
+          requestId: "concurrent-edit-b",
+        }),
+      ]);
+
+      const comments = await harness.ctx.issues.listComments(paperclipIssue.id, "comp-1");
+      const bridged = comments.filter((c) => c.body.includes("(from Linear)"));
+      expect(bridged).toHaveLength(1);
+      expect(bridged[0]!.body).toContain("Edited text");
+    });
+
+    // Direct plumbing assertion, the companion to the create-side key check
+    // above. The outcome tests observe one comment carrying the edit, which the
+    // harness could in principle deliver for the wrong reason; this pins *how*.
+    //
+    // `listComments` not being called is half the point: correlating on the key
+    // rather than the sentinel is what makes the edit reach only a comment this
+    // installation wrote, and it drops the scan round-trip for every keyed
+    // mirror. Route the update back through the sentinel scan and this fails.
+    it("correlates an edit on the Linear comment UUID, without re-scanning the thread", async () => {
+      const paperclipIssue = await harness.ctx.issues.create({
+        companyId: "comp-1",
+        title: "Issue with Linear comments",
+      });
+      syncModule.getLinkByLinear.mockResolvedValue({
+        paperclipIssueId: paperclipIssue.id,
+        paperclipCompanyId: "comp-1",
+        linearIssueId: "lin-iss-1",
+        linearIdentifier: "LUC-100",
+        linearUrl: "https://linear.app/lucitra/issue/LUC-100",
+        syncDirection: "bidirectional",
+      });
+
+      await plugin.definition.onWebhook!({
+        endpointKey: "linear-events",
+        parsedBody: {
+          type: "Comment",
+          action: "create" as const,
+          data: {
+            id: "lin-comment-uuid-edit-key",
+            body: "Original text",
+            issue: { id: "lin-iss-1" },
+            user: { name: "Linear Author" },
+          },
+        },
+        headers: {},
+        rawBody: "",
+        requestId: "edit-key-create",
+      });
+
+      const updateSpy = vi.spyOn(harness.ctx.issues, "updateComment");
+      const listSpy = vi.spyOn(harness.ctx.issues, "listComments");
+      const createSpy = vi.spyOn(harness.ctx.issues, "createComment");
+
+      await plugin.definition.onWebhook!({
+        endpointKey: "linear-events",
+        parsedBody: {
+          type: "Comment",
+          action: "update" as const,
+          data: {
+            id: "lin-comment-uuid-edit-key",
+            body: "Edited text",
+            issue: { id: "lin-iss-1" },
+            user: { name: "Linear Author" },
+          },
+        },
+        headers: {},
+        rawBody: "",
+        requestId: "edit-key-update",
+      });
+
+      expect(updateSpy).toHaveBeenCalledTimes(1);
+      // Same key the create wrote — a Linear edit keeps the comment UUID, which
+      // is the whole reason the correlation works.
+      expect(updateSpy.mock.calls[0]![1]).toBe("linear-comment:lin-comment-uuid-edit-key");
+      expect(updateSpy.mock.calls[0]![2]).toContain("Edited text");
+      expect(listSpy).not.toHaveBeenCalled();
+      // A propagated edit returns before the create path; reaching it would
+      // mean relying on the key's dedup to avoid a duplicate instead.
+      expect(createSpy).not.toHaveBeenCalled();
+
+      updateSpy.mockRestore();
+      listSpy.mockRestore();
+      createSpy.mockRestore();
+    });
+
+    // The throw path, which is *not* the `null` path even though one `catch`
+    // used to serve both. `null` means "no keyed mirror, go look for a legacy
+    // one"; a throw means "could not tell", and the legacy scan cannot answer
+    // that question because a keyed mirror carries the sentinel as well. Route
+    // the throw back into the scan and it matches this comment's own sentinel,
+    // then reports it as a pre-BLO-31657 keyless row — so the handler returns
+    // normally, the delivery is ACKed, the edit is lost, and the single log line
+    // an operator reads while debugging this names the wrong cause.
+    //
+    // Pinning the two negative assertions is the point: both flip on the
+    // pre-fix code.
+    it("leaves the mirror stale without consulting the legacy scan when the rewrite throws", async () => {
+      const paperclipIssue = await harness.ctx.issues.create({
+        companyId: "comp-1",
+        title: "Issue with Linear comments",
+      });
+      syncModule.getLinkByLinear.mockResolvedValue({
+        paperclipIssueId: paperclipIssue.id,
+        paperclipCompanyId: "comp-1",
+        linearIssueId: "lin-iss-1",
+        linearIdentifier: "LUC-100",
+        linearUrl: "https://linear.app/lucitra/issue/LUC-100",
+        syncDirection: "bidirectional",
+      });
+
+      await plugin.definition.onWebhook!({
+        endpointKey: "linear-events",
+        parsedBody: {
+          type: "Comment",
+          action: "create" as const,
+          data: {
+            id: "lin-comment-uuid-edit-throws",
+            body: "Original text",
+            issue: { id: "lin-iss-1" },
+            user: { name: "Linear Author" },
+          },
+        },
+        headers: {},
+        rawBody: "",
+        requestId: "edit-throws-create",
+      });
+
+      // A transient DB/RPC blip on the rewrite of a mirror that does have a key.
+      const updateSpy = vi.spyOn(harness.ctx.issues, "updateComment")
+        .mockRejectedValue(new Error("connection terminated"));
+      const listSpy = vi.spyOn(harness.ctx.issues, "listComments");
+      const createSpy = vi.spyOn(harness.ctx.issues, "createComment");
+
+      await plugin.definition.onWebhook!({
+        endpointKey: "linear-events",
+        parsedBody: {
+          type: "Comment",
+          action: "update" as const,
+          data: {
+            id: "lin-comment-uuid-edit-throws",
+            body: "Edited text",
+            issue: { id: "lin-iss-1" },
+            user: { name: "Linear Author" },
+          },
+        },
+        headers: {},
+        rawBody: "",
+        requestId: "edit-throws-update",
+      });
+
+      expect(updateSpy).toHaveBeenCalledTimes(1);
+      // The two that regress. The scan would match the keyed mirror's own
+      // sentinel and misreport it as keyless; reaching the create path would
+      // spend a round-trip to dedup against the row we just failed to rewrite.
+      expect(listSpy).not.toHaveBeenCalled();
+      expect(createSpy).not.toHaveBeenCalled();
+
+      updateSpy.mockRestore();
+      listSpy.mockRestore();
+      createSpy.mockRestore();
+
+      // A failed edit must not damage the thread: still exactly one mirror, and
+      // it keeps the pre-edit body rather than being half-written or dropped.
+      const bridged = (await harness.ctx.issues.listComments(paperclipIssue.id, "comp-1"))
+        .filter((c) => c.body.includes("(from Linear)"));
+      expect(bridged).toHaveLength(1);
+      expect(bridged[0]!.body).toContain("Original text");
+      expect(bridged[0]!.body).not.toContain("Edited text");
+    });
+
+    // A deduplicated create returns the first delivery's comment instead of
+    // throwing, so the handler must not go on to log activity — that would
+    // report a sync that did not happen, once per duplicate delivery, which is
+    // the noise the key is bought to remove.
+    it("does not log sync activity for a deduplicated redelivery", async () => {
+      const paperclipIssue = await harness.ctx.issues.create({
+        companyId: "comp-1",
+        title: "Issue with Linear comments",
+      });
+      syncModule.getLinkByLinear.mockResolvedValue({
+        paperclipIssueId: paperclipIssue.id,
+        paperclipCompanyId: "comp-1",
+        linearIssueId: "lin-iss-1",
+        linearIdentifier: "LUC-100",
+        linearUrl: "https://linear.app/lucitra/issue/LUC-100",
+        syncDirection: "bidirectional",
+      });
+
+      const commentPayload = {
+        type: "Comment",
+        action: "create" as const,
+        data: {
+          id: "lin-comment-uuid-activity",
+          body: "Hello from Linear",
+          issue: { id: "lin-iss-1" },
+          user: { name: "Linear Author" },
+        },
+      };
+
+      const activitySpy = vi.spyOn(harness.ctx.activity, "log");
+
+      for (const requestId of ["activity-first", "activity-retry"]) {
+        await plugin.definition.onWebhook!({
+          endpointKey: "linear-events",
+          parsedBody: commentPayload,
+          headers: {},
+          rawBody: "",
+          requestId,
+        });
+      }
+
+      const syncedLogs = activitySpy.mock.calls.filter(
+        ([entry]: [any]) => entry?.message === "issue.comment.synced_from_linear",
+      );
+      expect(syncedLogs).toHaveLength(1);
+      activitySpy.mockRestore();
+    });
+
+    // A failed delivery must leave nothing behind that suppresses its own
+    // retry. Under the old process-local claim that meant releasing the claim
+    // in a `finally`; under the idempotency key it means the failed create
+    // wrote no row, so no key exists to dedup the retry against. The mechanism
+    // changed with BLO-31657 — the guarantee did not, so this stays pinned.
+    it("still bridges the comment on retry when the first create fails", async () => {
+      const paperclipIssue = await harness.ctx.issues.create({
+        companyId: "comp-1",
+        title: "Issue with Linear comments",
+      });
+      syncModule.getLinkByLinear.mockResolvedValue({
+        paperclipIssueId: paperclipIssue.id,
+        paperclipCompanyId: "comp-1",
+        linearIssueId: "lin-iss-1",
+        linearIdentifier: "LUC-100",
+        linearUrl: "https://linear.app/lucitra/issue/LUC-100",
+        syncDirection: "bidirectional",
+      });
+
+      const commentPayload = {
+        type: "Comment",
+        action: "create" as const,
+        data: {
+          id: "lin-comment-uuid-77",
+          body: "Hello from Linear",
+          issue: { id: "lin-iss-1" },
+          user: { name: "Linear Author" },
+        },
+      };
+
+      const createComment = harness.ctx.issues.createComment;
+      const failOnce = vi
+        .spyOn(harness.ctx.issues, "createComment")
+        .mockRejectedValueOnce(new Error("transient host failure"));
+
+      await plugin.definition.onWebhook!({
+        endpointKey: "linear-events",
+        parsedBody: commentPayload,
+        headers: {},
+        rawBody: "",
+        requestId: "fails",
+      });
+
+      failOnce.mockRestore();
+      expect(harness.ctx.issues.createComment).toBe(createComment);
+
+      // The retry must still be able to bridge the comment.
+      await plugin.definition.onWebhook!({
+        endpointKey: "linear-events",
+        parsedBody: commentPayload,
+        headers: {},
+        rawBody: "",
+        requestId: "retry-after-failure",
+      });
+
+      const comments = await harness.ctx.issues.listComments(paperclipIssue.id, "comp-1");
+      const bridged = comments.filter((c) => c.body.includes("(from Linear)"));
+      expect(bridged).toHaveLength(1);
+    });
+
+    // The other failure shape: `resolveLinearWorkspaceSlug` rejects *before*
+    // the create is ever attempted, so the handler exits without writing a row
+    // or a key. Structurally distinct from a failing `createComment` (which
+    // fails after the attempt), and the path most likely to move in a later
+    // refactor — which is exactly why it is worth pinning.
+    it("still bridges the comment on retry when workspace-slug resolution throws", async () => {
+      const paperclipIssue = await harness.ctx.issues.create({
+        companyId: "comp-1",
+        title: "Issue with Linear comments",
+      });
+      syncModule.getLinkByLinear.mockResolvedValue({
+        paperclipIssueId: paperclipIssue.id,
+        paperclipCompanyId: "comp-1",
+        linearIssueId: "lin-iss-1",
+        linearIdentifier: "LUC-100",
+        linearUrl: "https://linear.app/lucitra/issue/LUC-100",
+        syncDirection: "bidirectional",
+      });
+
+      const commentPayload = {
+        type: "Comment",
+        action: "create" as const,
+        data: {
+          id: "lin-comment-uuid-55",
+          body: "Hello from Linear",
+          issue: { id: "lin-iss-1" },
+          user: { name: "Linear Author" },
+        },
+      };
+
+      // Fail only the workspace-slug lookup, and only once, so the retry below
+      // exercises the real code path rather than a second failure.
+      const realStateGet = harness.ctx.state.get.bind(harness.ctx.state);
+      let alreadyFailed = false;
+      const slugFailure = vi
+        .spyOn(harness.ctx.state, "get")
+        .mockImplementation(async (scope: any) => {
+          if (!alreadyFailed && scope?.stateKey === STATE_KEYS.workspaceUrlKey) {
+            alreadyFailed = true;
+            throw new Error("state backend unavailable");
+          }
+          return realStateGet(scope);
+        });
+
+      await plugin.definition.onWebhook!({
+        endpointKey: "linear-events",
+        parsedBody: commentPayload,
+        headers: {},
+        rawBody: "",
+        requestId: "slug-throws",
+      });
+
+      slugFailure.mockRestore();
+      expect(alreadyFailed).toBe(true);
+
+      // Nothing bridged, and no idempotency key written — so nothing exists
+      // that could suppress the retry.
+      const afterFailure = await harness.ctx.issues.listComments(paperclipIssue.id, "comp-1");
+      expect(afterFailure.filter((c) => c.body.includes("(from Linear)"))).toHaveLength(0);
+
+      await plugin.definition.onWebhook!({
+        endpointKey: "linear-events",
+        parsedBody: commentPayload,
+        headers: {},
+        rawBody: "",
+        requestId: "retry-after-slug-failure",
+      });
+
+      const bridgedAfterRetry = (
+        await harness.ctx.issues.listComments(paperclipIssue.id, "comp-1")
+      ).filter((c) => c.body.includes("(from Linear)"));
+      expect(bridgedAfterRetry).toHaveLength(1);
+      expect(bridgedAfterRetry[0]!.body).toContain("<!-- linear-comment-id: lin-comment-uuid-55 -->");
+    });
   });
 
   // -----------------------------------------------------------------------

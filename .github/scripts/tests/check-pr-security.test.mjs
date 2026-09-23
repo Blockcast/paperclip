@@ -7,6 +7,7 @@ import {
   findExistingDraftAdvisory,
   postFlaggedSecurityResult,
   postSecurityCheckRun,
+  resolveTargetSha,
   scanSecrets,
   scanCITampering,
   scanBuildScripts,
@@ -230,6 +231,19 @@ test('postSecurityCheckRun: links the advisory when the sync succeeded', async (
   });
 });
 
+// ── resolveTargetSha ─────────────────────────────────────────────────────────
+
+test('resolveTargetSha: uses PR head sha when no merge-queue candidate sha is provided', () => {
+  const pr = { head: { sha: 'prheadsha' } };
+  assert.equal(resolveTargetSha(pr, undefined), 'prheadsha');
+  assert.equal(resolveTargetSha(pr, ''), 'prheadsha');
+});
+
+test('resolveTargetSha: prefers the merge-queue candidate sha over the PR head sha', () => {
+  const pr = { head: { sha: 'prheadsha' } };
+  assert.equal(resolveTargetSha(pr, 'queuecandidatesha'), 'queuecandidatesha');
+});
+
 test('postSecurityCheckRun: reports unknown advisory state and inlines redacted flags when sync failed', async () => {
   const calls = [];
   const detectedToken = 'sk-abcdefghijklmnopqrstuvwxyz123456';
@@ -322,8 +336,60 @@ test('postFlaggedSecurityResult: advisory budget expiry still posts the check-ru
   assert.ok(calls.some(path => path.endsWith('/check-runs')), 'check-run must be attempted after advisory timeout');
 });
 
-test('postFlaggedSecurityResult: advisory POST that commits before abort reports unknown state', async () => {
-  let advisoryCommitted = false;
+test('postFlaggedSecurityResult: defaults the check-run to the PR head sha', async () => {
+  let checkRunBody;
+  const fakeFetch = async (path, _token, options = {}) => {
+    if (path.endsWith('/check-runs')) {
+      checkRunBody = JSON.parse(options.body);
+      return { ok: true };
+    }
+    return [];
+  };
+
+  await postFlaggedSecurityResult(
+    fakeFetch,
+    'token',
+    'paperclipai/paperclip',
+    { number: 6469, title: 'My PR', head: { sha: 'prheadsha' } },
+    [{ check: 'ci-tampering', file: '.github/workflows/pr.yml' }],
+    5_000,
+  );
+
+  assert.equal(
+    checkRunBody.head_sha,
+    'prheadsha',
+    'omitting targetSha must preserve pull_request_target behaviour exactly',
+  );
+});
+
+test('postFlaggedSecurityResult: posts the check-run against the merge-queue candidate sha when given one', async () => {
+  let checkRunBody;
+  const fakeFetch = async (path, _token, options = {}) => {
+    if (path.endsWith('/check-runs')) {
+      checkRunBody = JSON.parse(options.body);
+      return { ok: true };
+    }
+    return [];
+  };
+
+  await postFlaggedSecurityResult(
+    fakeFetch,
+    'token',
+    'paperclipai/paperclip',
+    { number: 6469, title: 'My PR', head: { sha: 'prheadsha' } },
+    [{ check: 'ci-tampering', file: '.github/workflows/pr.yml' }],
+    5_000,
+    'queuecandidatesha',
+  );
+
+  assert.equal(
+    checkRunBody.head_sha,
+    'queuecandidatesha',
+    'flagged check-run must land on the commit actually being merged, not the stale PR head',
+  );
+});
+
+test('postFlaggedSecurityResult: advisory POST that commits before abort reports unknown state', async () => {  let advisoryCommitted = false;
   let checkRunBody;
   const fakeFetch = async (path, _token, options = {}) => {
     if (path.includes('/security-advisories?state=draft')) return [];

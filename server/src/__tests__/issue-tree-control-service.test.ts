@@ -493,7 +493,7 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
         agentId,
         invocationSource: "automation",
         triggerDetail: "system",
-        status: "queued",
+        status: "running",
         wakeupRequestId: rootWakeupRequestId,
         contextSnapshot: {
           issueId: rootIssueId,
@@ -524,7 +524,7 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
         agentId,
         invocationSource: "automation",
         triggerDetail: "system",
-        status: "queued",
+        status: "running",
         wakeupRequestId: deepDescendantWakeupRequestId,
         contextSnapshot: {
           issueId: deepDescendantIssueId,
