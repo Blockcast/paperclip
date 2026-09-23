@@ -11264,6 +11264,42 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
     });
   });
 
+  // BLO-28441 names both routes in its acceptance criterion. The PATCH-side
+  // guard is pinned above; this pins the `POST /checkout` conflict, which is the
+  // route the original wedge was discovered on. Without it, dropping the
+  // `describeIssueLockConflict` spread from the checkout 409 passes the suite.
+  it("names the actor's own terminal run status in the checkout 409", async () => {
+    const seeded = await seedOwnershipIssue({ checkoutStatus: "running", actorRunStatus: "succeeded" });
+
+    await expect(
+      svc.checkout(seeded.issueId, seeded.actorAgentId, ["todo"], seeded.actorRunId),
+    ).rejects.toMatchObject({
+      status: 409,
+      message: "Issue checkout conflict",
+      details: {
+        checkoutRunId: seeded.staleRunId,
+        executionRunId: seeded.staleRunId,
+        actorRunId: seeded.actorRunId,
+        actorRunStatus: "succeeded",
+        holderLiveness: "live",
+      },
+    });
+
+    // The live holder still owns the row: the rejected checkout adopted nothing.
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, seeded.issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      checkoutRunId: seeded.staleRunId,
+      executionRunId: seeded.staleRunId,
+    });
+  });
+
   it("adopts unowned checkout after a concurrent stale-checkout clear wins the lock race", async () => {
     const seeded = await seedOwnershipIssue({ checkoutStatus: "failed" });
     await db
