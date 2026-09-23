@@ -10,6 +10,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { ISSUE_LIST_MAX_LIMIT } from "../services/index.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -42,11 +43,11 @@ describeEmbeddedPostgres("issue list stable enumeration and exact counts", () =>
     await tempDb?.cleanup();
   });
 
-  function createApp(companyId: string) {
+  function createApp(companyId: string, actor?: Record<string, unknown>) {
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {
-      (req as any).actor = {
+      (req as any).actor = actor ?? {
         type: "board",
         userId: "cloud-user-1",
         companyIds: [companyId],
@@ -175,6 +176,16 @@ describeEmbeddedPostgres("issue list stable enumeration and exact counts", () =>
     expect(res.body).toMatchObject({ error: "afterId requires sortField=id" });
   });
 
+  it("rejects afterId combined with offset", async () => {
+    const companyId = await seedCompany();
+    const res = await request(createApp(companyId))
+      .get(`/api/companies/${companyId}/issues`)
+      .query({ status: "todo", sortField: "id", afterId: randomUUID(), offset: "2" });
+
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ error: "afterId cannot be combined with offset" });
+  });
+
   it("rejects a malformed afterId", async () => {
     const companyId = await seedCompany();
     const res = await request(createApp(companyId))
@@ -230,6 +241,47 @@ describeEmbeddedPostgres("issue list stable enumeration and exact counts", () =>
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.count).toBe(2);
   });
+
+  it("walks every keyset page of the restricted-actor count", async () => {
+    const companyId = await seedCompany();
+    const agentId = randomUUID();
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Skill tester",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    // One row past a full page forces a second keyset page. The only issue the
+    // restricted actor can read is the highest id, which sortField=id places on page 2.
+    const ids = await seedIssues(companyId, ISSUE_LIST_MAX_LIMIT + 1);
+    const scopedIssueId = [...ids].sort().at(-1)!;
+    // A skill-test key is denied company_scope:read, so the route takes the walk
+    // instead of the single COUNT(*), and may read only its own issue.
+    const skillTestActor = {
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_key",
+      keyScope: { kind: "skill_test", issueId: scopedIssueId },
+    };
+
+    const res = await request(createApp(companyId, skillTestActor))
+      .get(`/api/companies/${companyId}/issues/count`)
+      .query({ status: "todo" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.count).toBe(1);
+
+    const boardRes = await request(createApp(companyId))
+      .get(`/api/companies/${companyId}/issues/count`)
+      .query({ status: "todo" });
+    expect(boardRes.status, JSON.stringify(boardRes.body)).toBe(200);
+    expect(boardRes.body.count).toBe(ISSUE_LIST_MAX_LIMIT + 1);
+  }, 120_000);
 
   it("rejects filters the general count cannot honor rather than counting a wider set", async () => {
     const companyId = await seedCompany();
