@@ -107,6 +107,7 @@ describe("buildIssuePropertiesPanelKey", () => {
           closedAt: null,
           cleanupEligibleAt: null,
           cleanupReason: null,
+          hasWorkspaceRuntimeConfig: false,
           config: null,
           metadata: null,
           runtimeServices: [],

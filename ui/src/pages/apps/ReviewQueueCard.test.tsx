@@ -158,12 +158,13 @@ describe("ReviewQueueCard", () => {
   async function render(
     client = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
     connectionId?: string,
+    emptyState: "hidden" | "reassure" = "reassure",
   ) {
     root = createRoot(container);
     await act(async () => {
       root.render(
         <QueryClientProvider client={client}>
-          <ReviewQueueCard emptyState="reassure" connectionId={connectionId} />
+          <ReviewQueueCard emptyState={emptyState} connectionId={connectionId} />
         </QueryClientProvider>,
       );
     });
@@ -367,5 +368,32 @@ describe("ReviewQueueCard", () => {
       timeout: 500,
       interval: 10,
     });
+  });
+
+  it("leaves a hidden empty queue on the slow interval instead of fast-polling it", async () => {
+    // The `emptyState === "hidden"` backoff is what pins the card to ONE polling
+    // mechanism. The visible cadence cannot: a stray second timer re-armed off
+    // the same fetch completion converges with refetchInterval at an identical
+    // ~2s and react-query dedupes the pair. The hidden case can -- refetchInterval
+    // deliberately drops to 20s when the card renders nothing, and an
+    // unconditional 2s timer silently overrides exactly that.
+    vi.useFakeTimers();
+    listActionRequestsMock.mockResolvedValue({ actionRequests: [] });
+
+    await render(undefined, undefined, "hidden");
+
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    await flushReact();
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(18_000);
+    });
+    await flushReact();
+    expect(listActionRequestsMock).toHaveBeenCalledTimes(3);
   });
 });

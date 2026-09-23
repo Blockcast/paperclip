@@ -67,6 +67,8 @@ import {
   type AcpRuntimeUsageCost,
 } from "acpx/runtime";
 import {
+  ACP_ENGINE_SESSION_PROGRESS_FIRST_DELAY_MS,
+  ACP_ENGINE_SESSION_PROGRESS_MAX_DELAY_MS,
   DEFAULT_ACP_ENGINE_AGENT,
   DEFAULT_ACP_ENGINE_MODE,
   DEFAULT_ACP_ENGINE_NON_INTERACTIVE_PERMISSIONS,
@@ -1524,6 +1526,250 @@ async function emitAcpxLog(ctx: AdapterExecutionContext, payload: Record<string,
   await ctx.onLog("stdout", `${JSON.stringify(payload)}\n`);
 }
 
+/**
+ * Await session establishment while emitting periodic elapsed-time progress.
+ *
+ * `runtime.ensureSession` spawns the agent process and performs the
+ * `session/new`|`session/load` handshake. Neither is covered by
+ * `adapterConfig.timeoutSec`, which only arms a timer around the turn once the
+ * handle exists, so a stalled handshake used to leave the run log frozen at
+ * its pre-exec lines with no way to tell a stall from a dead process.
+ *
+ * Emitting progress here keeps the run's last-output timestamp advancing, which
+ * is what makes such a stall observable to operators and to staleness
+ * detection. Deliberately does NOT terminate the attempt: handshakes have been
+ * observed recovering as late as 43.20h, so choosing a kill threshold needs the
+ * distribution this instrumentation is meant to collect. Payload carries only
+ * stage/elapsed/attempt metadata -- never prompts, credentials, env values, or
+ * model output.
+ */
+export async function awaitSessionWithProgress<T>(
+  ctx: AdapterExecutionContext,
+  meta: { attempt: "initial" | "fresh_retry"; resume: boolean },
+  start: () => Promise<T>,
+  delays: { firstDelayMs?: number; maxDelayMs?: number } = {},
+): Promise<T> {
+  const startedAtMs = Date.now();
+  return awaitPhaseWithProgress(
+    start,
+    async (stage) => {
+      await emitAcpxLog(ctx, {
+        type: "acpx.session_establish",
+        stage: stage === "settled" ? "established" : stage,
+        attempt: meta.attempt,
+        resume: meta.resume,
+        elapsedMs: Math.max(0, Date.now() - startedAtMs),
+        observedAt: new Date().toISOString(),
+      });
+    },
+    delays,
+  );
+}
+
+/**
+ * Await runtime preparation while emitting periodic elapsed-time progress.
+ *
+ * Everything the engine does before the handshake -- billing-identity
+ * resolution, workspace and state directory creation, skill installation, and
+ * the ancestor-bin walk that resolves the agent command -- runs before the run
+ * has emitted a byte of its own. `awaitSessionWithProgress` covers only the
+ * handshake that follows it, so a stall in this window still left the run log
+ * frozen at its pre-exec prefix: indistinguishable, at `lastOutputSeq: 1`,
+ * from a process that never started at all. Several of those steps are
+ * filesystem syscalls against a network mount, where a blocked call does not
+ * return on its own.
+ *
+ * Closing this window narrows "silent at seq 1" towards meaning one thing,
+ * which is the discriminator any decision taken against a silent run needs.
+ *
+ * ⚠️ It does NOT close it completely, and a consumer of this signal must know
+ * where the coverage actually starts. `acpx.runtime_prepare` begins inside
+ * `executeAcpxEngine`; the adapter entry points reach that function through a
+ * lazy `await import(...)` of this module (e.g.
+ * `packages/adapters/claude-local/src/server/acp.ts`), so that module load
+ * happens before the first tick. That residual is now measured (PEN-3099):
+ * across 1,808 `claude_local` runs over 46 days the window containing it ran
+ * p50 637 ms, p99 16.7 s, max 2.1 min, and never once reached the 5 min tick
+ * ceiling, let alone `RUN_STALE_SILENCE_MS`.
+ *
+ * Three corrections to the reasoning that first flagged it, since each is easy
+ * to re-derive wrongly. The load is paid once per *process*, not per run: every
+ * importer of this module is a server-side `acp.ts`, the `await import(...)`
+ * resolves from the ESM module registry after the first load, and the worker
+ * awaits `adapter.execute` in-process -- the per-run pod adapters
+ * (`claude_k8s`, `opencode_k8s`) never import it. Credit the registry, not the
+ * executor memo: `createClaudeAcpExecutor`'s `let executor` is *function*-scoped
+ * (`packages/adapters/claude-local/src/server/acp.ts:180`) and is per-process
+ * only because that factory happens to be called at module scope
+ * (`.../server/execute.ts:98`). Construct a second executor and the memo is
+ * gone; the disk read is still paid once, because the registry caches it.
+ * It is not I/O on the network mount either: the module is read from the
+ * container image layer, whereas the mount that has been observed to wedge
+ * backs the workspace and state directories this helper *does* bracket. And a
+ * run parked in the import is not byte-identical to one parked after it -- the
+ * `Adapter execution timeout:` line is emitted from this module using the
+ * result of `buildRuntime`, so its presence proves the import, the billing
+ * lookup and the prepare all returned.
+ *
+ * A liveness predicate keyed on that line's presence therefore does not inherit
+ * this residual; one keyed on a raw `seq <= 1` still does, which is the shape of
+ * the precision failure that withdrew #1462. Key it on the line and not on the
+ * byte count: the leading workspace-fallback line is conditional, so a healthy
+ * prefix is legitimately two or three lines.
+ *
+ * Same non-terminating contract as the handshake ticker -- this reports, it does
+ * not bound. Payload carries only stage/elapsed metadata: never prompts,
+ * credentials, environment values, paths, or model output.
+ */
+export async function awaitRuntimePrepareWithProgress<T>(
+  ctx: AdapterExecutionContext,
+  start: () => Promise<T>,
+  delays: { firstDelayMs?: number; maxDelayMs?: number } = {},
+): Promise<T> {
+  const startedAtMs = Date.now();
+  return awaitPhaseWithProgress(
+    start,
+    async (stage) => {
+      await emitAcpxLog(ctx, {
+        type: "acpx.runtime_prepare",
+        stage: stage === "settled" ? "prepared" : stage,
+        elapsedMs: Math.max(0, Date.now() - startedAtMs),
+        observedAt: new Date().toISOString(),
+      });
+    },
+    delays,
+  );
+}
+
+/**
+ * Await the post-handshake, pre-turn window while emitting periodic progress.
+ *
+ * The two siblings above bracket everything up to and including the handshake,
+ * but `acpx.session` is not emitted when the handshake returns -- two more
+ * unbounded awaits sit between them, and neither reported anything:
+ *
+ * - `applySessionConfigOptions` issues mode/model RPCs to the agent process.
+ *   The handshake only proves that process answered `session/new`; a process
+ *   that has since stopped answering leaves this call pending with no timer on
+ *   it, because `adapterConfig.timeoutSec` arms around the turn and the turn
+ *   has not started.
+ * - `buildPrompt` reads `instructionsFilePath` with `fs.readFile`. That path is
+ *   on the same network mount whose blocked syscalls motivated the prepare
+ *   bracket; a blocked call there does not return on its own either.
+ *
+ * A run parked in this window is silent at `lastOutputSeq` unchanged since the
+ * handshake, having emitted no `acpx.session` -- which is precisely the state
+ * the staleness detector cannot tell apart from a dead process, and which it
+ * has been measured to misread: healthy pre-turn waits have outlasted both the
+ * 1h suspicion and 4h critical thresholds (PEN-2555, PEN-2533).
+ *
+ * Bracketing it is what makes the silence mean something. Ticks arrive at most
+ * `ACP_ENGINE_SESSION_PROGRESS_MAX_DELAY_MS` (5 min) apart and the server
+ * flushes output progress at most every 60 s, so a bracketed stall keeps
+ * `lastOutputAt` advancing an order of magnitude inside the 1h threshold; an
+ * unbracketed one sits still and accrues silence it is not responsible for.
+ *
+ * Same non-terminating contract as its siblings -- this reports, it does not
+ * bound. Deciding a kill threshold needs the distribution this collects, and
+ * handshakes in this family have been observed recovering as late as 43.20h.
+ * Payload carries only stage/phase/elapsed metadata: never prompts, the
+ * instructions file's contents or path, credentials, environment values, or
+ * model output.
+ */
+export async function awaitPreTurnWithProgress<T>(
+  ctx: AdapterExecutionContext,
+  meta: { phase: "configure_session" | "build_prompt" },
+  start: () => Promise<T>,
+  delays: { firstDelayMs?: number; maxDelayMs?: number } = {},
+): Promise<T> {
+  const startedAtMs = Date.now();
+  return awaitPhaseWithProgress(
+    start,
+    async (stage) => {
+      await emitAcpxLog(ctx, {
+        type: "acpx.pre_turn",
+        stage: stage === "settled" ? "completed" : stage,
+        phase: meta.phase,
+        elapsedMs: Math.max(0, Date.now() - startedAtMs),
+        observedAt: new Date().toISOString(),
+      });
+    },
+    delays,
+  );
+}
+
+/**
+ * Run `start()` while emitting `started`, backing-off `waiting`, and one
+ * terminal `settled`/`failed` progress tick.
+ *
+ * Shared by every phase that awaits an unbounded operation before the run
+ * produces output of its own; each caller names its own wire stages and owns
+ * its own payload. The cadence is the point: ticks arrive faster than the
+ * shortest staleness window that reads a run's last-output timestamp, so a
+ * phase that is merely slow cannot be read as one whose process is gone. That
+ * window is `RUN_STALE_SILENCE_MS` (15m) in
+ * `server/src/services/issue-run-holding.ts`, three times the 5m tick ceiling
+ * here. The relationship is deliberately prose and not an assertion: this
+ * package is a dependency of the server, so importing that constant to test
+ * against would invert the layering. If the server ever tightens it below 15m,
+ * `ACP_ENGINE_SESSION_PROGRESS_MAX_DELAY_MS` has to come down with it.
+ */
+async function awaitPhaseWithProgress<T>(
+  start: () => Promise<T>,
+  emit: (stage: "started" | "waiting" | "settled" | "failed") => Promise<void>,
+  delays: { firstDelayMs?: number; maxDelayMs?: number },
+): Promise<T> {
+  const firstDelayMs = Math.max(1, delays.firstDelayMs ?? ACP_ENGINE_SESSION_PROGRESS_FIRST_DELAY_MS);
+  const maxDelayMs = Math.max(firstDelayMs, delays.maxDelayMs ?? ACP_ENGINE_SESSION_PROGRESS_MAX_DELAY_MS);
+
+  // Guarded like every sibling emit below, and for a sharper reason: this is the
+  // first statement of the run, and the prepare wrapper is awaited *above* the
+  // block whose catch routes to `emitAcpxFailure`. An unguarded rejection here
+  // would leave `executeAcpxEngine` via an unclassified throw before any
+  // `acpx.*` diagnostic exists -- making the instrumentation the reason the run
+  // died, with less evidence than the silent runs it exists to explain.
+  await emit("started").catch(() => {});
+
+  let timer: NodeJS.Timeout | null = null;
+  let delayMs = firstDelayMs;
+  let stopped = false;
+  const scheduleNext = () => {
+    if (stopped) return;
+    timer = setTimeout(() => {
+      timer = null;
+      void emit("waiting")
+        .catch(() => {})
+        .finally(() => {
+          delayMs = Math.min(delayMs * 2, maxDelayMs);
+          scheduleNext();
+        });
+    }, delayMs);
+    // Progress reporting must never be the reason the process stays alive.
+    timer.unref?.();
+  };
+  const stop = () => {
+    stopped = true;
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+
+  // Start the work before scheduling, so a synchronous throw cannot leak a timer.
+  const pending = start();
+  scheduleNext();
+  try {
+    const value = await pending;
+    stop();
+    await emit("settled").catch(() => {});
+    return value;
+  } catch (err) {
+    stop();
+    await emit("failed").catch(() => {});
+    throw err;
+  }
+}
+
 async function emitRuntimeEvent(ctx: AdapterExecutionContext, event: AcpRuntimeEvent) {
   if (event.type === "text_delta") {
     await emitAcpxLog(ctx, {
@@ -1934,18 +2180,23 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
   const engine = resolveEngineSettings(deps);
 
   return async function executeAcpxEngine(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
-    let billingIdentity: AcpxEngineBillingIdentity | null = null;
-    try {
-      billingIdentity = (await deps.resolveBillingIdentity?.(ctx)) ?? null;
-    } catch {
-      billingIdentity = null;
-    }
+    // Both awaits are inside the ticker: this is the whole window between the
+    // pre-exec prefix and the first byte the engine emits on its own, and it is
+    // where an unreturning filesystem call parks a run with nothing in the log.
+    const { prepared, billingIdentity } = await awaitRuntimePrepareWithProgress(ctx, async () => {
+      let identity: AcpxEngineBillingIdentity | null = null;
+      try {
+        identity = (await deps.resolveBillingIdentity?.(ctx)) ?? null;
+      } catch {
+        identity = null;
+      }
+      return { prepared: await buildRuntime({ ctx, engine }), billingIdentity: identity };
+    });
     const billingFields = {
       provider: billingIdentity?.provider ?? "acpx",
       ...(billingIdentity?.biller ? { biller: billingIdentity.biller } : {}),
       billingType: billingIdentity?.billingType ?? ("unknown" as const),
     };
-    const prepared = await buildRuntime({ ctx, engine });
     // State the effective wall-clock timeout and its source up front so a
     // later timeout is diagnosable from the run log alone. Goes to stderr:
     // the acpx stdout log stream carries JSON acpx.* event payloads and must
@@ -1990,13 +2241,18 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
     try {
       if (!handle) {
         try {
-          handle = await runtime.ensureSession({
-            sessionKey: prepared.sessionKey,
-            agent: prepared.acpxAgent,
-            mode: prepared.mode,
-            cwd: prepared.cwd,
-            resumeSessionId,
-          });
+          handle = await awaitSessionWithProgress(
+            ctx,
+            { attempt: "initial", resume: Boolean(resumeSessionId) },
+            () =>
+              runtime.ensureSession({
+                sessionKey: prepared.sessionKey,
+                agent: prepared.acpxAgent,
+                mode: prepared.mode,
+                cwd: prepared.cwd,
+                resumeSessionId,
+              }),
+          );
         } catch (err) {
           if (!resumeSessionId || !isResumeFailure(err)) throw err;
           clearSession = true;
@@ -2005,12 +2261,17 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             "stdout",
             `[paperclip] ACPX resume session "${resumeSessionId}" is unavailable; retrying with a fresh session.\n`,
           );
-          handle = await runtime.ensureSession({
-            sessionKey: prepared.sessionKey,
-            agent: prepared.acpxAgent,
-            mode: prepared.mode,
-            cwd: prepared.cwd,
-          });
+          handle = await awaitSessionWithProgress(
+            ctx,
+            { attempt: "fresh_retry", resume: false },
+            () =>
+              runtime.ensureSession({
+                sessionKey: prepared.sessionKey,
+                agent: prepared.acpxAgent,
+                mode: prepared.mode,
+                cwd: prepared.cwd,
+              }),
+          );
         }
       }
     } catch (err) {
@@ -2051,12 +2312,14 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
     }
     const sessionHandle = handle;
     try {
-      await applySessionConfigOptions({
-        runtime,
-        handle: sessionHandle,
-        prepared,
-        onLog: ctx.onLog,
-      });
+      await awaitPreTurnWithProgress(ctx, { phase: "configure_session" }, () =>
+        applySessionConfigOptions({
+          runtime,
+          handle: sessionHandle,
+          prepared,
+          onLog: ctx.onLog,
+        }),
+      );
     } catch (err) {
       const { classified, message } = await emitAcpxFailure({
         ctx,
@@ -2094,7 +2357,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         summary: message,
       };
     }
-    const { prompt, promptMetrics, commandNotes } = await buildPrompt(ctx, resumedSession, prepared.env);
+    const { prompt, promptMetrics, commandNotes } = await awaitPreTurnWithProgress(
+      ctx,
+      { phase: "build_prompt" },
+      () => buildPrompt(ctx, resumedSession, prepared.env),
+    );
     const runPrompt = joinPromptSections([prepared.skillPromptInstructions, prompt]);
     await emitAcpxLog(ctx, {
       type: "acpx.session",

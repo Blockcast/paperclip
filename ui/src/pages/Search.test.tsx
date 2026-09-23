@@ -6,7 +6,7 @@ import { createRoot } from "react-dom/client";
 import { MemoryRouter, Route, Routes } from "react-router";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Search, buildSearchUrl } from "./Search";
+import { SEARCH_DEBOUNCE_MS, Search, buildSearchUrl } from "./Search";
 
 const companyState = vi.hoisted(() => ({
   selectedCompanyId: "company-1",
@@ -103,21 +103,45 @@ vi.mock("../components/Identity", () => ({
 
 async function flush() {
   await Promise.resolve();
+  // Sound as a fixed sleep: this is a macrotask yield, not a wait for a specific
+  // timer. It hands control back to the event loop and never needs a budget.
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-async function waitForAssertion(assertion: () => void, attempts = 50) {
+// Search.tsx debounces the draft query with a real window.setTimeout, so any
+// assertion about the resulting request has to outlast that timer on a contended
+// runner. A retry count is not a wall-clock budget: `flush()` costs one microtask
+// drain plus a setTimeout(0), so 50 attempts bought only ~50-100ms and the fixed
+// pre-assertion sleep was doing all the real waiting. Both numbers below derive
+// from SEARCH_DEBOUNCE_MS so raising the debounce cannot silently re-open the
+// flake this replaced (BLO-30247).
+const ASSERTION_TIMEOUT_MS = SEARCH_DEBOUNCE_MS * 8;
+const ASSERTION_POLL_MS = 10;
+
+async function waitForAssertion(assertion: () => void, timeoutMs = ASSERTION_TIMEOUT_MS) {
+  const deadline = Date.now() + timeoutMs;
   let lastError: unknown;
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
+  for (;;) {
     try {
       assertion();
       return;
     } catch (error) {
       lastError = error;
-      await flush();
     }
+    if (Date.now() >= deadline) break;
+    await flush();
+    await new Promise((resolve) => setTimeout(resolve, ASSERTION_POLL_MS));
   }
   throw lastError;
+}
+
+// Skips the common-case polling before an assertion that depends on the debounce.
+// This is deliberately NOT load-bearing: waitForAssertion's budget above is what
+// absorbs a slow runner, so this sleep being short is a performance detail, not a
+// correctness one.
+async function settleDebounce() {
+  await new Promise((resolve) => setTimeout(resolve, SEARCH_DEBOUNCE_MS));
+  await flush();
 }
 
 function renderSearch(initialPath: string, container: HTMLDivElement, node?: ReactNode) {
@@ -511,7 +535,7 @@ describe("Search page", () => {
     // The debounce hasn't fired yet, so no API call should be made synchronously.
     expect(searchApiMock.search).not.toHaveBeenCalled();
 
-    await new Promise((resolve) => setTimeout(resolve, 350));
+    await settleDebounce();
 
     await waitForAssertion(() => {
       expect(searchApiMock.search).toHaveBeenCalledWith("company-1", {
@@ -704,7 +728,7 @@ describe("Search page", () => {
       input.dispatchEvent(new Event("input", { bubbles: true }));
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 350));
+    await settleDebounce();
 
     await waitForAssertion(() => {
       expect(searchApiMock.search).toHaveBeenCalledWith("company-1", {
@@ -736,7 +760,7 @@ describe("Search page", () => {
       input.dispatchEvent(new Event("input", { bubbles: true }));
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 350));
+    await settleDebounce();
     await waitForAssertion(() => {
       expect(searchApiMock.search).toHaveBeenCalledWith("company-1", {
         q: "auth",
@@ -752,7 +776,7 @@ describe("Search page", () => {
       input.dispatchEvent(new Event("input", { bubbles: true }));
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 350));
+    await settleDebounce();
     await waitForAssertion(() => {
       const lastCall = searchApiMock.search.mock.calls.at(-1);
       expect(lastCall?.[1]).toEqual({ q: "auth", scope: "all", limit: 20 });
@@ -775,7 +799,7 @@ describe("Search page", () => {
       input.dispatchEvent(new Event("input", { bubbles: true }));
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 350));
+    await settleDebounce();
     await waitForAssertion(() => {
       expect(searchApiMock.search).toHaveBeenCalledWith("company-1", {
         q: "auth",

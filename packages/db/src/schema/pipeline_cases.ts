@@ -50,6 +50,10 @@ export const pipelineCases = pgTable(
     requestKey: text("request_key"),
     automationAttemptId: uuid("automation_attempt_id"),
     version: integer("version").notNull().default(1),
+    // This advances only when the case enters a stage. It deliberately does
+    // not track ordinary case edits: automation ownership must be tied to a
+    // stable stage entry rather than inferred from event timestamps.
+    stageGeneration: integer("stage_generation").notNull().default(1),
     pendingSuggestion: jsonb("pending_suggestion").$type<PipelineCasePendingSuggestion>(),
     leaseOwnerType: text("lease_owner_type"),
     leaseAgentId: uuid("lease_agent_id").references(() => agents.id, { onDelete: "set null" }),
@@ -96,6 +100,11 @@ export const pipelineCaseIssueLinks = pgTable(
     role: text("role").notNull(),
     createdByRunId: uuid("created_by_run_id"),
     automationAttemptId: uuid("automation_attempt_id"),
+    // A routine can return a coalesced issue before the attachment transaction
+    // can acquire that issue's lock. `reserved` is a durable ownership claim
+    // visible to stage-exit retirement; `attached` has passed attachment
+    // validation. Historical and non-automation links are always attached.
+    attachmentState: text("attachment_state").notNull().default("attached"),
     retiredAt: timestamp("retired_at", { withTimezone: true }),
     retiredByAttemptId: uuid("retired_by_attempt_id"),
     retiredReason: text("retired_reason"),
@@ -103,11 +112,28 @@ export const pipelineCaseIssueLinks = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
-    caseIssueUq: uniqueIndex("pipeline_case_issue_links_case_issue_uq").on(table.caseId, table.issueId),
+    // Automation ownership is attempt-scoped so a fresh stage generation may
+    // retain an audit trail without reactivating a retired link. All other
+    // links keep their original one-link-per-case-and-issue invariant.
+    caseIssueNonAutomationUq: uniqueIndex("pipeline_case_issue_links_case_issue_non_automation_uq")
+      .on(table.caseId, table.issueId)
+      .where(sql`${table.role} <> 'automation'`),
+    caseAutomationAttemptUq: uniqueIndex("pipeline_case_issue_links_case_automation_attempt_uq")
+      .on(table.caseId, table.automationAttemptId)
+      .where(sql`${table.role} = 'automation' and ${table.automationAttemptId} is not null`),
+    // Historical/manual automation links can predate an execution attempt. Keep
+    // those singular too; new stage-owned links always carry an attempt id.
+    caseIssueAutomationWithoutAttemptUq: uniqueIndex("pipeline_case_issue_links_case_issue_automation_without_attempt_uq")
+      .on(table.caseId, table.issueId)
+      .where(sql`${table.role} = 'automation' and ${table.automationAttemptId} is null`),
     issueIdx: index("pipeline_case_issue_links_issue_idx").on(table.issueId),
     companyCaseIdx: index("pipeline_case_issue_links_company_case_idx").on(table.companyId, table.caseId),
     automationAttemptIdx: index("pipeline_case_issue_links_automation_attempt_idx").on(table.automationAttemptId),
     roleCheck: check("pipeline_case_issue_links_role_check", sql`${table.role} in ('origin', 'conversation', 'work', 'automation')`),
+    attachmentStateCheck: check(
+      "pipeline_case_issue_links_attachment_state_check",
+      sql`${table.attachmentState} in ('reserved', 'attached')`,
+    ),
   }),
 );
 
@@ -194,6 +220,11 @@ export const pipelineAutomationExecutions = pgTable(
     executionIssueId: uuid("execution_issue_id").references(() => issues.id, { onDelete: "set null" }),
     retryOfExecutionId: uuid("retry_of_execution_id"),
     generation: integer("generation").notNull().default(1),
+    // Explicit stage-entry identity. These remain nullable only so an upgrade
+    // can fail closed for pre-hardening executions whose generation cannot be
+    // reconstructed safely.
+    stageId: uuid("stage_id"),
+    stageGeneration: integer("stage_generation"),
     error: text("error"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
@@ -208,6 +239,11 @@ export const pipelineAutomationExecutions = pgTable(
     routineIdx: index("pipeline_automation_executions_routine_idx").on(table.routineId),
     executionIssueIdx: index("pipeline_automation_executions_execution_issue_idx").on(table.executionIssueId),
     retryOfExecutionIdx: index("pipeline_automation_executions_retry_of_execution_idx").on(table.retryOfExecutionId),
+    caseStageGenerationIdx: index("pipeline_automation_executions_case_stage_generation_idx").on(
+      table.caseId,
+      table.stageId,
+      table.stageGeneration,
+    ),
     statusCheck: check("pipeline_automation_executions_status_check", sql`${table.status} in ('succeeded', 'failed')`),
   }),
 );

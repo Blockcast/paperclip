@@ -4,6 +4,35 @@ Date: 2026-04-29
 Status: Draft / scope spec — not yet implemented
 Owner: TBD
 
+## 2026-08-03 creation-intake amendment
+
+The current intake contract narrows the original per-fingerprint design:
+
+- `paperclip_issue: "false"` opts out before issue or state side effects at
+  every severity. Firing `severity=info` is below the creation floor by default;
+  resolved legacy info alerts still follow the existing resolution path.
+- Label, owner-map, annotation, and issue-route assignment retain their existing
+  precedence. When none resolves, `fallbackAgentName` must identify exactly one
+  company agent. Missing or ambiguous configuration fails closed; ownerless
+  creation is forbidden.
+- The creation aggregate key is
+  `alert-aggregate:v1:[<alertname>,<paperclip_dedupe_domain-or-null>]`, stored in
+  `originFingerprint`. A partial unique index permits one open issue per company
+  and key. Concurrent losers attach their per-fingerprint state to the winner.
+- Accepted severities map explicitly as `critical → critical`,
+  `warning → high`, and unknown/custom → `medium`; `info → medium` remains
+  explicit but is unreachable for new firing creation under the default floor.
+- This amendment is creation-only. Existing resolution, close, escalation, and
+  same-fingerprint re-fire behavior is unchanged. Shared-member resolution and
+  aggregate reopen policy belong to the lifecycle follow-up.
+
+The intended channel precision is at least 70% actionable, measured as a
+14-day cancellation rate at or below 30%, versus
+[BLO-20576](/BLO/issues/BLO-20576)'s 73.6% cancellation baseline. If the first
+14-day cohort remains above 36.8% cancelled, disable the noisiest rules with
+`paperclip_issue: "false"`, recalibrate thresholds and dedupe domains, and
+require a replay before restoring issue creation.
+
 ## 1. Background & motivation
 
 On 2026-04-29 we hit a registry image-pull outage on the on-prem k8s cluster.
@@ -303,7 +332,9 @@ In `onWebhook` (signature mirrors `paperclip-plugin-slack/src/worker.ts:1533`):
    payload to back up the queue.
 4. For each `alert` in `alerts[]`:
    - Apply `acceptOnlyLabels` filter (if set, skip alerts that don't match).
+   - Honor `paperclip_issue: "false"` before any issue or state side effect.
    - Compute `effectiveStatus = alert.status ?? envelope.status`.
+   - Drop firing `severity=info` before issue creation.
    - Branch: firing → `handleFiring(alert)`, resolved → `handleResolved(alert)`.
 
 ### 5.3 Idempotency
@@ -381,6 +412,7 @@ Defaults: `critical → critical`, `warning → high`, `info → medium`.
 ```
 originKind: "plugin:paperclip-plugin-alertmanager"
 originId:   alert.fingerprint
+originFingerprint: alert-aggregate:v1:[<alertname>,<dedupe-domain-or-null>]
 ```
 
 This lets `ctx.issues.list({ originKind, originId })` (see Linear pattern,
@@ -477,9 +509,11 @@ In order, first hit wins:
    `{ team: { platform: "alice@blockcast.net" } }`), match against
    `alert.labels[key]`, resolve email → user.
 3. **Annotation `paperclip_assignee_email`** (same lookup as 1, just named).
-4. **Default per-company on-call** (future extension; out of scope V1).
-5. **No assignee.** Issue is created unassigned — the issue still shows up in
-   the company's queue, just nobody is paged.
+4. **Issue-route assignee**, unless a direct label/annotation override won.
+5. **Named fallback agent.** `fallbackAgentName` must match exactly one company
+   agent after trim/case normalization.
+6. **Fail closed.** Missing, invalid, or ambiguous fallback configuration
+   creates no issue and emits `alertmanager.owner.fallback_failed`.
 
 The lookup goes through a cached helper (mirror of
 `paperclip-plugin-linear/src/worker.ts:117–140`):

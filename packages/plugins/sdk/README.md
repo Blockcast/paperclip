@@ -334,6 +334,7 @@ Declare in `manifest.capabilities`. Grouped by scope:
 | | `issues.checkout` |
 | | `issues.wakeup` |
 | | `issue.comments.create` |
+| | `issue.comments.update` |
 | | `issue.documents.write` |
 | | `issue.relations.write` |
 | | `activity.log.write` |
@@ -355,6 +356,7 @@ Declare in `manifest.capabilities`. Grouped by scope:
 | | `api.routes.register` |
 | | `http.outbound` |
 | | `secrets.read-ref` |
+| | `secrets.verify-ref` |
 | | `environment.drivers.register` |
 | | `local.folders` |
 | **Agent** | `agent.tools.register` |

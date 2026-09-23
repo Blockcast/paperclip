@@ -106,7 +106,7 @@ describeEmbeddedPostgres("plugin-managed routines", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-plugin-managed-routines-");
     db = createDb(tempDb.connectionString);
-  }, 60_000);
+  });
 
   afterEach(async () => {
     await db.delete(routineRuns);

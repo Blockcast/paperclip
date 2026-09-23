@@ -1,0 +1,71 @@
+-- Time-to-first-output on a run. `last_output_at` cannot answer this: it
+-- advances on every progress flush, so by the time a run ends the "first" and
+-- "last" output timestamps are the same column read at different moments.
+--
+-- Why the question matters. `reapOrphanedRuns` applies `RUN_STALE_SILENCE_MS`
+-- (15m) uniformly to started external-lifecycle runs before minting
+-- `process_lost`. That floor is load-bearing and must stay 15m for runs that
+-- have streamed: the 2026-05-23 RCA measured ~6.5/hr fleet-wide FALSE
+-- `process_lost` on live agents that were still producing output, because a
+-- kube Job snapshot can be a false negative (list timeout, eventual
+-- consistency, in-flight Job not yet visible).
+--
+-- A run that has never emitted PROGRESS-COUNTING output is a different case --
+-- there is no streaming agent to protect -- but separating the two safely
+-- requires knowing how long a HEALTHY run can legitimately take to say
+-- anything, and nothing records that today. Without it, any shorter floor is a
+-- guess that risks re-creating exactly the regression the floor exists to
+-- prevent.
+--
+-- "Progress-counting", NOT "any byte", and the distinction is load-bearing.
+-- Synthetic keepalive and reattach chunks are excluded by
+-- `isSyntheticNonProgressRunLogChunk`, but they are appended to the log store
+-- unconditionally, so they DO count toward `log_bytes`. `log_bytes > 0 AND
+-- first_output_at IS NULL` is therefore a reachable and meaningful state: it
+-- means KEEPALIVE-ONLY, not silent. Those runs look like
+-- `[paperclip] keepalive ... job ... running (Ns since last output)` -- a Job
+-- actively reporting itself alive. Anyone shortening the floor for "runs that
+-- never spoke" must exclude them, or they will shorten it on precisely the
+-- live-but-quiet runs the 15m floor exists to protect, re-creating the
+-- 2026-05-23 regression cited above. The filter matches `last_output_at`'s own
+-- rule deliberately, so the two columns are directly comparable and the reaper
+-- reads a consistent pair.
+--
+-- What the gap costs, measured on 300 runs 2026-09-18 (Ally,
+-- e0a5011d-5c94-4801-be52-64c14f98ac26):
+--
+--   succeeded         n=60  median 10.1m   644 slot-minutes
+--   process_lost      n=41  median 15.3m   638 slot-minutes
+--
+-- `process_lost` consumed within 1% of the slot time all successful work
+-- consumed. Every one of the 41 had `log_bytes` 0, `exit_code` null, and was
+-- killed at a 15.1m median -- i.e. exactly the floor. They died in batches (5
+-- at 17:10Z, 3 each at 20:19/20:38/20:45Z), one reaper pass clearing pods that
+-- had died earlier. Because the adapter never produced anything, those 638
+-- minutes cost zero provider capacity: reclaiming them is throughput that adds
+-- no load to an already-saturated pool (BLO-34556).
+--
+-- This column is only the measurement. It changes no reaper behaviour. Once
+-- the distribution of first-output latency on healthy runs is known, the floor
+-- can be split by evidence rather than by guess.
+--
+-- Nullable with no backfill, deliberately: NULL means "this run never emitted
+-- progress-counting output" (see the keepalive note above), which is the
+-- signal itself, and history cannot be reconstructed from rows that never
+-- recorded it. Written write-once via COALESCE at the single output-progress
+-- flush site, so concurrent flushes cannot move it.
+--
+-- ANALYST CAVEAT, bounded to the deploy window. `lastOutputFlushAt` is seeded
+-- from the run's existing `last_output_at`, so a run ALREADY STREAMING when
+-- this ships (`last_output_at` set, `first_output_at` still NULL) gets
+-- `first_output_at` stamped at its next flush -- a mid-run timestamp that
+-- looks exactly like a real first-output time. There is no way to detect one
+-- after the fact. Filter to `started_at > <the time this migration was
+-- applied>` before computing any distribution from this column.
+--
+-- No index. Nothing filters or orders on this column -- it is read per-run
+-- alongside the row it belongs to, and analysed in bulk offline. On a table
+-- this write-heavy an unused index is write amplification nobody asked for;
+-- add one if a query ever needs it.
+ALTER TABLE "heartbeat_runs"
+  ADD COLUMN IF NOT EXISTS "first_output_at" timestamp with time zone;

@@ -5,24 +5,19 @@ import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
-  agentRuntimeState,
-  agentWakeupRequests,
   agents,
   companies,
   companyMemberships,
   createDb,
-  heartbeatRunEvents,
   heartbeatRuns,
-  issueComments,
-  issueRelations,
   issueWatchdogs,
   issues,
-  principalPermissionGrants,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { truncateCompanyScopedTestState } from "./helpers/truncate-company-scoped-test-state.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
@@ -47,19 +42,7 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
   }, 120_000);
 
   afterEach(async () => {
-    await db.delete(activityLog);
-    await db.delete(issueComments);
-    await db.delete(heartbeatRunEvents);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agentRuntimeState);
-    await db.delete(issueRelations);
-    await db.delete(issueWatchdogs);
-    await db.delete(issues);
-    await db.delete(agents);
-    await db.delete(principalPermissionGrants);
-    await db.delete(companyMemberships);
-    await db.delete(companies);
+    await truncateCompanyScopedTestState(db);
   });
 
   afterAll(async () => {

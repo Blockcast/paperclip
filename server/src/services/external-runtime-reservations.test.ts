@@ -19,6 +19,7 @@ import {
   ExternalRuntimeIsolationConflictError,
   externalRuntimeReservationCanRelease,
   markExternalRuntimeReservationLaunching,
+  getActiveExternalRuntimeReservation,
   rearmExternalRuntimeReservationForRetry,
   recordExpectedExternalRuntimeJobName,
   recordExternalRuntimeJobIdentity,
@@ -91,6 +92,14 @@ describeEmbeddedPostgres("external runtime reservations", () => {
     return runIds;
   }
 
+  function eventCount(body: string, event: string): number {
+    const match = new RegExp(
+      `^${EXTERNAL_RUNTIME_RESERVATION_EVENTS_METRIC}\\{event="${event}"\\} (\\d+)`,
+      "m",
+    ).exec(body);
+    return match ? Number(match[1]) : 0;
+  }
+
   it("atomically gives one slot to only one concurrent dispatcher", async () => {
     const [firstRunId, secondRunId] = await seedQueuedRuns(2);
     const now = new Date("2026-07-13T12:00:00.000Z");
@@ -113,6 +122,38 @@ describeEmbeddedPostgres("external runtime reservations", () => {
     expect(metrics.body).toContain(`${EXTERNAL_RUNTIME_RESERVATIONS_ACTIVE_METRIC} 1`);
     expect(metrics.body).toContain(`${EXTERNAL_RUNTIME_RESERVATION_EVENTS_METRIC}{event="reserved"} 1`);
     expect(metrics.body).toContain(`${EXTERNAL_RUNTIME_RESERVATION_EVENTS_METRIC}{event="contended"} 1`);
+  });
+
+  it("books one contended event when every slot in a pool is occupied", async () => {
+    const runIds = await seedQueuedRuns(4);
+    const now = new Date("2026-08-09T12:00:00.000Z");
+
+    for (const runId of runIds.slice(0, 3)) {
+      expect(await claimRunWithExternalRuntimeSlotPool(db, runId, now, 3)).not.toBeNull();
+    }
+
+    __resetMetricsForTest();
+    expect(await claimRunWithExternalRuntimeSlotPool(db, runIds[3], now, 3)).toBeNull();
+
+    const metrics = await renderMetrics();
+    expect(eventCount(metrics.body, "contended")).toBe(1);
+    expect(eventCount(metrics.body, "reserved")).toBe(0);
+  });
+
+  it("books one reserved event when a pool claim wins a later slot", async () => {
+    const runIds = await seedQueuedRuns(3);
+    const now = new Date("2026-08-09T12:05:00.000Z");
+
+    for (const runId of runIds.slice(0, 2)) {
+      expect(await claimRunWithExternalRuntimeSlotPool(db, runId, now, 3)).not.toBeNull();
+    }
+
+    __resetMetricsForTest();
+    expect(await claimRunWithExternalRuntimeSlotPool(db, runIds[2], now, 3)).not.toBeNull();
+
+    const metrics = await renderMetrics();
+    expect(eventCount(metrics.body, "reserved")).toBe(1);
+    expect(eventCount(metrics.body, "contended")).toBe(0);
   });
 
   it("atomically fills a bounded slot pool without over-claiming", async () => {
@@ -167,11 +208,13 @@ describeEmbeddedPostgres("external runtime reservations", () => {
       startedAt: now,
     });
 
+    __resetMetricsForTest();
     const claim = await claimRunWithExternalRuntimeSlotPool(db, followUpRunId, now, 3, {
       exclusivePrReviewTaskKey: taskKey,
     });
 
     expect(claim).toBeNull();
+    expect(eventCount((await renderMetrics()).body, "contended")).toBe(1);
     expect(await db.select().from(externalRuntimeReservations)).toHaveLength(0);
     const followUp = await db
       .select({ status: heartbeatRuns.status })
@@ -802,6 +845,8 @@ describeEmbeddedPostgres("external runtime reservations", () => {
       jobName: "agent-opencode-run-1",
       jobUid: "uid-1",
     });
+    expect(eventCount((await renderMetrics()).body, "launched")).toBe(1);
+    __resetMetricsForTest();
     const retry = await recordExternalRuntimeJobIdentity(db, {
       runId,
       jobName: "agent-opencode-run-1",
@@ -816,6 +861,7 @@ describeEmbeddedPostgres("external runtime reservations", () => {
     expect(first?.expectedJobName).toBe("agent-opencode-run-1");
     expect(retry?.id).toBe(first?.id);
     expect(missingUidObservation?.jobUid).toBe("uid-1");
+    expect(eventCount((await renderMetrics()).body, "launched")).toBe(0);
     const run = await db
       .select()
       .from(heartbeatRuns)
@@ -839,6 +885,47 @@ describeEmbeddedPostgres("external runtime reservations", () => {
       jobName: "agent-opencode-run-2",
       jobUid: "uid-2",
     })).rejects.toThrow(/identity mismatch/);
+  });
+
+  it("does not re-book a launched event when a later observation fills the Job UID", async () => {
+    const [runId] = await seedQueuedRuns(1);
+    await claimRunWithExternalRuntimeSlot(db, runId, new Date());
+    await markExternalRuntimeReservationLaunching(db, runId);
+    await recordExpectedExternalRuntimeJobName(db, {
+      runId,
+      jobName: "agent-opencode-run-late-uid",
+    });
+
+    const initiallyObservedAt = new Date("2026-08-09T12:10:00.000Z");
+    const initiallyObserved = await recordExternalRuntimeJobIdentity(db, {
+      runId,
+      jobName: "agent-opencode-run-late-uid",
+      now: initiallyObservedAt,
+    });
+    expect(initiallyObserved).toMatchObject({ state: "launched", jobUid: null });
+    expect(eventCount((await renderMetrics()).body, "launched")).toBe(1);
+    const runBeforeEnrichment = await db
+      .select({ updatedAt: heartbeatRuns.updatedAt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]);
+
+    __resetMetricsForTest();
+    const enriched = await recordExternalRuntimeJobIdentity(db, {
+      runId,
+      jobName: "agent-opencode-run-late-uid",
+      jobUid: "uid-arrived-late",
+      now: new Date("2026-08-09T12:15:00.000Z"),
+    });
+
+    expect(enriched).toMatchObject({ state: "launched", jobUid: "uid-arrived-late" });
+    expect(eventCount((await renderMetrics()).body, "launched")).toBe(0);
+    const runAfterEnrichment = await db
+      .select({ updatedAt: heartbeatRuns.updatedAt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]);
+    expect(runAfterEnrichment?.updatedAt).toEqual(runBeforeEnrichment?.updatedAt);
   });
 
   it("re-arms a launched reservation for a replacement Job", async () => {
@@ -882,6 +969,41 @@ describeEmbeddedPostgres("external runtime reservations", () => {
       jobName: "agent-opencode-run-2",
       jobUid: "uid-2",
     });
+  });
+
+  it("serializes the re-arm behind a reaper holding the run row, and yields once the run is terminal (BLO-33019)", async () => {
+    // The lifecycle reaper finalizes a run inside a transaction that locks the
+    // heartbeat_runs row FOR UPDATE, re-reads this reservation, then CASes the
+    // status. The re-arm has to take the same row lock and require the run to
+    // still be running, so the two writes serialize: a re-arm racing a
+    // finalization blocks, then observes `failed` and becomes a no-op instead
+    // of pointing a replacement launch at a run that is already terminal.
+    const [runId] = await seedQueuedRuns(1);
+    const claim = await claimRunWithExternalRuntimeSlot(db, runId, new Date());
+    await markExternalRuntimeReservationLaunching(db, runId);
+    await recordExpectedExternalRuntimeJobName(db, { runId, jobName: "agent-opencode-terminal" });
+    await recordExternalRuntimeJobIdentity(db, { runId, jobName: "agent-opencode-terminal", jobUid: "uid-t" });
+
+    // The re-arm runs on its own pool connection and must stay parked until
+    // the transaction below COMMITS -- so it is awaited after the transaction,
+    // never inside it (awaiting inside would wait on a lock the transaction
+    // itself holds).
+    let pending!: ReturnType<typeof rearmExternalRuntimeReservationForRetry>;
+    await db.transaction(async (tx) => {
+      await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).for("update");
+      pending = rearmExternalRuntimeReservationForRetry(db, { runId, reservationId: claim!.reservation.id });
+      const raced = await Promise.race([
+        pending.then(() => "resolved" as const),
+        new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 400)),
+      ]);
+      expect(raced, "re-arm must wait for the run-row lock held by the finalizer").toBe("blocked");
+      await tx.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+    });
+    const rearmed = await pending;
+
+    expect(rearmed).toBeNull();
+    const reservation = await getActiveExternalRuntimeReservation(db, runId);
+    expect(reservation).toMatchObject({ jobName: "agent-opencode-terminal", jobUid: "uid-t" });
   });
 
   it("re-arms a retry when throttling happens before Job acknowledgment", async () => {

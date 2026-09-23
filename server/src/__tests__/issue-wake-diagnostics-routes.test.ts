@@ -192,7 +192,7 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-wake-diagnostics-");
     db = createDb(tempDb.connectionString);
-  }, 60_000);
+  });
 
   afterEach(async () => {
     await db.delete(activityLog);

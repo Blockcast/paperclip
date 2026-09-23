@@ -21,6 +21,7 @@ import type {
   IssueRecoveryActionOutcome,
   IssueRecoveryActionOwnerType,
   IssueRecoveryActionStatus,
+  IssueRecoveryActionRetiringBound,
   IssueWorkMode,
   ModelProfileKey,
   IssueThreadInteractionContinuationPolicy,
@@ -420,6 +421,7 @@ export type IssueBlockedInboxReason =
   | "blocked_by_assigned_backlog_issue"
   | "blocked_by_uninvokable_assignee"
   | "blocked_by_cancelled_issue"
+  | "blocked_without_blockers"
   | "blocked_chain_stalled"
   | "invalid_review_participant"
   | "in_review_without_action_path"
@@ -477,7 +479,11 @@ export type IssueProductivityReviewTrigger =
   | "no_comment_streak"
   | "long_active_duration"
   | "high_churn"
-  | "runtime_failure_streak";
+  | "runtime_failure_streak"
+  // BLO-27698 B3b: one still-live run has held its turn longer than the
+  // long-active bar. Kept distinct from `long_active_duration`, which measures
+  // time nobody was accounting for.
+  | "runaway_execution";
 
 export interface IssueProductivityReview {
   reviewIssueId: string;
@@ -509,8 +515,10 @@ export interface IssueRecoveryAction {
   wakePolicy: Record<string, unknown> | null;
   monitorPolicy: Record<string, unknown> | null;
   attemptCount: number;
+  nonDeliverySweepCount: number;
   maxAttempts: number | null;
   timeoutAt: Date | string | null;
+  retiringBound: IssueRecoveryActionRetiringBound | null;
   lastAttemptAt: Date | string | null;
   outcome: IssueRecoveryActionOutcome | null;
   resolutionNote: string | null;
@@ -531,6 +539,11 @@ export interface SuccessfulRunHandoffState {
   assigneeAgentId: string | null;
   detectedProgressSummary: string | null;
   createdAt: Date | string | null;
+  // Set when the handoff reads `resolved` because its source issue reached a
+  // terminal status rather than because a corrective run discharged it. Absent
+  // on every handoff resolved the ordinary way, so a reader can tell the two
+  // apart instead of inferring a continuation that never ran (BLO-16074).
+  resolvedBySourceIssueStatus?: "done" | "cancelled" | null;
 }
 
 export type IssueScheduledRetryStatus = "scheduled_retry" | "queued" | "running" | "cancelled";
@@ -762,6 +775,28 @@ export interface Issue {
   monitorAttemptCount?: number;
   monitorNotes?: string | null;
   monitorScheduledBy?: IssueMonitorScheduledBy | null;
+  // BLO-27912: the deliberate-park disposition. Server-owned (hence optional/read-only
+  // here) and written only via the nested `parkedDisposition` PATCH input. `parkedUntil`
+  // in the future is the seventh explicit waiting path the liveness sweep accepts; once it
+  // lapses the row is detectable again without anyone having to un-park it.
+  parkedUntil?: Date | null;
+  parkedReason?: string | null;
+  parkedByAgentId?: string | null;
+  parkedAt?: Date | null;
+  /**
+   * Flat scheduled-retry projection carried by every issue **list** row
+   * (BLO-28843). Present-and-null when the issue has no run parked in
+   * `scheduled_retry`; never absent on a list row.
+   *
+   * These mirror the `scheduledRetry` object returned by the single-issue read
+   * for the same issue — an issue is attended by exactly one of three paths (a
+   * live `activeRun`, an armed `monitor*`, or a scheduled retry), and a list
+   * consumer that reads only the first two systematically over-reports
+   * "unattended".
+   */
+  scheduledRetryAt?: Date | null;
+  scheduledRetryReason?: string | null;
+  scheduledRetryAttempt?: number | null;
   executionWorkspaceId: string | null;
   executionWorkspacePreference: string | null;
   executionWorkspaceSettings: IssueExecutionWorkspaceSettings | null;

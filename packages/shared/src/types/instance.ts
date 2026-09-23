@@ -158,5 +158,26 @@ export interface IssueGraphLivenessAutoRecoveryPreview {
   findings: number;
   recoverableFindings: number;
   skippedOutsideLookback: number;
+  // Re-escalation suppression, reported with the same field names the run
+  // returns so preview and run compare directly (BLO-27676 review). Without
+  // these the preview counted stale findings while the run created only the
+  // unsuppressed ones, and `recoverableFindings` -- which the confirm dialog
+  // renders as "Enable and create N" -- overstated the run by up to the 7d
+  // target-state window per leaf.
+  //
+  // Aggregate across BOTH suppressors; the cooldown-only count is the
+  // difference between the two.
+  skippedReescalationCooldown: number;
+  // Subset of the above attributable to the target-state gate.
+  skippedUnchangedTarget: number;
+  // The suppression windows this preview actually resolved. Reported so the
+  // operator surface can state the bounds instead of restating them as
+  // constants: both suppressors are time-bounded, and a UI string that says
+  // "will not be re-raised" unqualified describes the unbounded behaviour the
+  // 7d ceiling exists to prevent (BLO-27676 review). Deriving the numbers from
+  // the response keeps the sentence true if either constant is ever tuned, or
+  // if a caller overrides the windows via the documented rollback lever.
+  reescalationCooldownMs: number;
+  unchangedTargetSuppressionMs: number;
   items: IssueGraphLivenessAutoRecoveryPreviewItem[];
 }

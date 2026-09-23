@@ -1,10 +1,16 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, statSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadShardDurations, selectGeneralServerShard } from "./general-server-shard.mjs";
+import {
+  collectGeneralServerSuiteFiles,
+  isRouteOrAuthzTest,
+  toRepoPath as toRepoPathFromRoot,
+  walk,
+} from "./run-vitest-stable-suites.mjs";
 
 const repoRoot = process.cwd();
 const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
@@ -12,7 +18,6 @@ const generalServerShardDurations = loadShardDurations(
   path.join(scriptsDir, "general-server-shard-durations.json"),
 );
 const serverRoot = path.join(repoRoot, "server");
-const serverSrcDir = path.join(repoRoot, "server", "src");
 const serverTestsDir = path.join(repoRoot, "server", "src", "__tests__");
 // Every non-server project that CI must execute. This list is NOT derived from
 // the root vitest.config.ts `projects` array -- it is a second, independent
@@ -39,36 +44,10 @@ const nonServerProjects = [
   "@paperclipai/create-paperclip-plugin",
   "@paperclipai/mcp-external",
   "@paperclipai/mcp-server",
+  "@paperclipai/mcp-gateway",
   "@paperclipai/ui",
   "paperclipai",
 ];
-const routeTestPattern = /[^/]*(?:route|routes|authz)[^/]*\.test\.ts$/;
-const additionalSerializedServerTests = new Set([
-  "server/src/__tests__/approval-routes-idempotency.test.ts",
-  "server/src/__tests__/assets.test.ts",
-  "server/src/__tests__/authz-company-access.test.ts",
-  "server/src/__tests__/companies-route-path-guard.test.ts",
-  "server/src/__tests__/company-portability.test.ts",
-  "server/src/__tests__/costs-service.test.ts",
-  "server/src/__tests__/express5-auth-wildcard.test.ts",
-  "server/src/__tests__/health-dev-server-token.test.ts",
-  "server/src/__tests__/health.test.ts",
-  "server/src/__tests__/heartbeat-dependency-scheduling.test.ts",
-  "server/src/__tests__/heartbeat-issue-liveness-escalation.test.ts",
-  "server/src/__tests__/heartbeat-process-recovery.test.ts",
-  "server/src/__tests__/invite-accept-existing-member.test.ts",
-  "server/src/__tests__/invite-accept-gateway-defaults.test.ts",
-  "server/src/__tests__/invite-accept-replay.test.ts",
-  "server/src/__tests__/invite-expiry.test.ts",
-  "server/src/__tests__/invite-join-manager.test.ts",
-  "server/src/__tests__/invite-onboarding-text.test.ts",
-  "server/src/__tests__/issues-checkout-wakeup.test.ts",
-  "server/src/__tests__/issues-service.test.ts",
-  "server/src/__tests__/opencode-local-adapter-environment.test.ts",
-  "server/src/__tests__/project-routes-env.test.ts",
-  "server/src/__tests__/redaction.test.ts",
-  "server/src/__tests__/routines-e2e.test.ts",
-]);
 let invocationIndex = 0;
 const serializedModeName = "serialized";
 const generalModeName = "general";
@@ -91,35 +70,12 @@ const arcWorkspaceVitestArgs = [
   "--hookTimeout=60000",
 ];
 
-function walk(dir) {
-  const entries = readdirSync(dir);
-  const files = [];
-  for (const entry of entries) {
-    const absolute = path.join(dir, entry);
-    const stats = statSync(absolute);
-    if (stats.isDirectory()) {
-      files.push(...walk(absolute));
-    } else if (stats.isFile()) {
-      files.push(absolute);
-    }
-  }
-  return files;
-}
-
 function toRepoPath(file) {
-  return path.relative(repoRoot, file).split(path.sep).join("/");
+  return toRepoPathFromRoot(repoRoot, file);
 }
 
 function toServerPath(file) {
   return path.relative(serverRoot, file).split(path.sep).join("/");
-}
-
-function isRouteOrAuthzTest(file) {
-  if (routeTestPattern.test(file)) {
-    return true;
-  }
-
-  return additionalSerializedServerTests.has(file);
 }
 
 function fail(message) {
@@ -429,11 +385,7 @@ const routeTests = walk(serverTestsDir)
 // config pins maxWorkers to 1, so the only way to parallelize is across jobs.
 // Suites are partitioned by recorded duration (scripts/general-server-shard.mjs)
 // rather than round-robin, so one slow suite cluster can't stretch a single shard.
-const generalServerTestFiles = walk(serverSrcDir)
-  .map((file) => toRepoPath(file))
-  .filter((repoPath) => repoPath.endsWith(".test.ts"))
-  .filter((repoPath) => !isRouteOrAuthzTest(repoPath))
-  .sort((a, b) => a.localeCompare(b));
+const generalServerTestFiles = collectGeneralServerSuiteFiles(repoRoot);
 
 const options = parseCliOptions(process.argv.slice(2));
 if (options.dryRun) {
@@ -441,37 +393,40 @@ if (options.dryRun) {
     options.mode === serializedModeName
       ? selectSerializedSuites(routeTests, options.shardIndex, options.shardCount)
       : routeTests;
-  console.log(
-    JSON.stringify(
-      {
-        mode: options.mode,
-        shardIndex: options.shardIndex,
-        shardCount: options.shardCount,
-        group: options.group,
-        availableGeneralGroups: generalGroupNames,
-        nonServerProjects,
-        generalWorkspacesAProjects,
-        generalWorkspacesBProjects,
-        generalWorkspacesBVitestArgs: arcWorkspaceVitestArgs,
-        serializedSuiteCount: routeTests.length,
-        selectedSerializedSuites: serializedSuites.map((routeTest) => routeTest.repoPath),
-        generalServerSuiteCount: generalServerTestFiles.length,
-        selectedGeneralServerSuites:
-          options.mode === generalModeName &&
-          options.group === generalServerGroupName &&
-          options.shardCount !== null
-            ? selectGeneralServerShard(
-                generalServerTestFiles,
-                options.shardIndex,
-                options.shardCount,
-                generalServerShardDurations,
-              )
-            : null,
-      },
-      null,
-      2,
-    ),
+  const dryRunPayload = JSON.stringify(
+    {
+      mode: options.mode,
+      shardIndex: options.shardIndex,
+      shardCount: options.shardCount,
+      group: options.group,
+      availableGeneralGroups: generalGroupNames,
+      nonServerProjects,
+      generalWorkspacesAProjects,
+      generalWorkspacesBProjects,
+      generalWorkspacesBVitestArgs: arcWorkspaceVitestArgs,
+      serializedSuiteCount: routeTests.length,
+      selectedSerializedSuites: serializedSuites.map((routeTest) => routeTest.repoPath),
+      generalServerSuiteCount: generalServerTestFiles.length,
+      selectedGeneralServerSuites:
+        options.mode === generalModeName &&
+        options.group === generalServerGroupName &&
+        options.shardCount !== null
+          ? selectGeneralServerShard(
+              generalServerTestFiles,
+              options.shardIndex,
+              options.shardCount,
+              generalServerShardDurations,
+            )
+          : null,
+    },
+    null,
+    2,
   );
+  // This payload is consumed through a pipe by policy tests and by other
+  // tooling. `console.log` followed by `process.exit` can leave the pipe's
+  // final chunk unwritten once the suite list grows beyond the stream buffer.
+  // A synchronous write makes the machine-readable dry-run contract complete.
+  writeSync(1, `${dryRunPayload}\n`);
   process.exit(0);
 }
 

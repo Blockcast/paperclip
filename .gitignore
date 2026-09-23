@@ -79,3 +79,7 @@ vendor/*.tgz
 **/graphify-out/cache/
 **/graphify-out/memory/
 **/graphify-out/20*/
+
+# Python bytecode (the .github/scripts/ sweep suite is run with unittest locally)
+__pycache__/
+*.pyc

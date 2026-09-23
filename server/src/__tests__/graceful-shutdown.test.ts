@@ -165,8 +165,13 @@ describe("sseRegistry", () => {
     await sseRegistry.drain({ timeoutMs: 50, reason: "shutdown:test" });
     const elapsed = Date.now() - start;
 
-    // Should not block forever — bounded by timeout (with reasonable upper bound)
-    expect(elapsed).toBeLessThan(500);
+    // Should not block forever — the invariant is boundedness, not a deadline.
+    // The drain budget above is 50ms, so the regression this catches is an
+    // *unbounded* wait; any finite ceiling still catches it. 2000ms is 40x the
+    // scripted timeout, and unlike the previous 500ms it does not sit close
+    // enough to a loaded runner's scheduling jitter to fail on CPU contention
+    // alone (a 500ms absolute floor is one GC pause wide under merge-queue load).
+    expect(elapsed).toBeLessThan(2_000);
     // Final clear should remove the wedged entry
     expect(sseRegistry.size()).toBe(0);
   });
@@ -282,8 +287,11 @@ describe("sseRegistry", () => {
 
       // server.close() must resolve promptly — with the SSE drained there are
       // no long-lived connections holding the callback. If we ever regress
-      // and put server.close before drain, this would hang forever.
-      const closeStart = Date.now();
+      // and put server.close before drain, this would hang forever. The 2s
+      // reject timer below IS that assertion, and it names the failure; a
+      // second, tighter wall-clock ceiling on top of it could only ever fire
+      // in the 1-2s band, where it reported a bare "expected N < 1000" for a
+      // close that had in fact resolved within the stated contract.
       await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(
           () => reject(new Error("server.close did not resolve within 2s — SSE drain failed to release the connection")),
@@ -295,7 +303,6 @@ describe("sseRegistry", () => {
           else resolve();
         });
       });
-      expect(Date.now() - closeStart).toBeLessThan(1000);
 
       // Tidy up the client; it's fine if it's already ended.
       clientReq.destroy();

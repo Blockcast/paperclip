@@ -5,8 +5,10 @@ import {
   pgTable,
   text,
   timestamp,
+  uniqueIndex,
   uuid,
 } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import type { SourceTrustMetadata } from "@paperclipai/shared";
 import { companies } from "./companies.js";
 import { executionWorkspaces } from "./execution_workspaces.js";
@@ -62,5 +64,12 @@ export const issueWorkProducts = pgTable(
       table.companyId,
       table.updatedAt,
     ),
+    // Conflict target for the webhook upsert (BLO-19566). Partial on
+    // external_id so hand-created rows, which leave it null, stay unconstrained.
+    issueProviderTypeExternalIdUniq: uniqueIndex(
+      "issue_work_products_issue_provider_type_external_id_uniq",
+    )
+      .on(table.companyId, table.issueId, table.provider, table.type, table.externalId)
+      .where(sql`${table.externalId} IS NOT NULL`),
   }),
 );

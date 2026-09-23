@@ -31,6 +31,11 @@ describe("shouldBlockNarratedDone", () => {
     ).toBe(false);
   });
 
+  it("allows done only when a cited commit was resolved remotely", () => {
+    expect(shouldBlockNarratedDone({ ...base, hasVerifiedCommitEvidence: true })).toBe(false);
+    expect(shouldBlockNarratedDone({ ...base, hasVerifiedCommitEvidence: false })).toBe(true);
+  });
+
   it("allows QA-only closure when a refreshed evidence verdict found a PR link", () => {
     expect(
       shouldBlockNarratedDone({

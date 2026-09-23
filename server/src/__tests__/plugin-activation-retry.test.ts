@@ -9,36 +9,53 @@
  *      is still classified terminal (fails closed on the first attempt);
  *   2. boot activation is bounded, so the plugin set no longer contends for one
  *      60s initialize window.
+ *
+ * Guarantee 1 is asserted against `isTransientActivationRetryError`, the
+ * classifier the retry loop actually consults. The message-substring classifier
+ * this file used to exercise was removed in BLO-22095: it matched the
+ * `Worker initialize failed for "<id>"` prefix that `startWorker()` applies to
+ * *every* initialize failure, so it retried real plugin faults, and the case
+ * below asserting `Worker exited during startup` blessed a string no production
+ * site throws. Provenance-level coverage lives in
+ * `plugin-activation-retry-provenance.test.ts`.
  */
 import { describe, expect, it } from "vitest";
 import {
   TRANSIENT_ACTIVATION_RETRY_DELAYS_MS,
-  isTransientActivationError,
+  isTransientActivationRetryError,
   mapWithConcurrency,
   resolveActivationConcurrency,
 } from "../services/plugin-loader.js";
 
-describe("isTransientActivationError", () => {
+describe("isTransientActivationRetryError", () => {
   it("classifies the observed production initialize timeout as transient", () => {
-    // Verbatim from the four errored plugins' lastError (BLO-20410).
+    // Verbatim from the four errored plugins' lastError (BLO-20410). Untyped
+    // here because the classifier must still recognise a bare rejection that
+    // never picked up `WorkerStartupError` provenance.
     const observed = new Error(
       'Worker initialize failed for "lucitra.plugin-secrets": ' +
         'RPC call "initialize" timed out after 60000ms',
     );
-    expect(isTransientActivationError(observed)).toBe(true);
-  });
-
-  it("classifies a worker that dies during startup as transient", () => {
-    expect(
-      isTransientActivationError(new Error("Worker exited during startup (code 1)")),
-    ).toBe(true);
+    expect(isTransientActivationRetryError(observed)).toBe(true);
   });
 
   it("does NOT retry a plugin that reports a real fault inside the budget", () => {
     // ok=false is the plugin answering "I am broken" — retrying just delays a
     // legitimate error latch.
     expect(
-      isTransientActivationError(new Error("Worker initialize returned ok=false")),
+      isTransientActivationRetryError(new Error("Worker initialize returned ok=false")),
+    ).toBe(false);
+  });
+
+  it("does NOT retry an explicit initialize rejection wearing the wrapper prefix", () => {
+    // BLO-22095 finding 1. `startWorker()` stamps this prefix onto every
+    // initialize failure, so a prefix match cannot tell a blown host budget
+    // apart from a plugin that threw. This is the case the removed classifier
+    // got wrong.
+    expect(
+      isTransientActivationRetryError(
+        new Error('Worker initialize failed for "acme.plugin": invalid credentials'),
+      ),
     ).toBe(false);
   });
 
@@ -48,15 +65,15 @@ describe("isTransientActivationError", () => {
       "Invalid plugin manifest: missing 'id'",
       "ERR_MODULE_NOT_FOUND: cannot find package 'left-pad'",
     ]) {
-      expect(isTransientActivationError(new Error(message))).toBe(false);
+      expect(isTransientActivationRetryError(new Error(message))).toBe(false);
     }
   });
 
   it("handles non-Error rejections without throwing", () => {
-    expect(isTransientActivationError('RPC call "initialize" timed out after 60000ms')).toBe(
-      true,
-    );
-    expect(isTransientActivationError(undefined)).toBe(false);
+    expect(
+      isTransientActivationRetryError('RPC call "initialize" timed out after 60000ms'),
+    ).toBe(true);
+    expect(isTransientActivationRetryError(undefined)).toBe(false);
   });
 
   it("budgets more than one retry but keeps the added boot delay small", () => {
