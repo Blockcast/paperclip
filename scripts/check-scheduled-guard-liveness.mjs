@@ -231,26 +231,62 @@ export function classifyGuard(workflow, observation, { now, staleHours = DEFAULT
     // empty result gets the same corroboration a stale one does: any completed
     // run in the unfiltered re-read refutes "never", outright and without
     // needing to be recent (PEN-3379).
+    //
+    // Refuting "never" does not establish "alive", though. The cross-check
+    // hands back a real timestamp, and that timestamp is aged against the same
+    // staleHours bar the `stopped` branch uses: inside the bar the two reads
+    // merely disagree and the alarm is suppressed; past the bar the guard has
+    // stopped, and the unfiltered completion is strictly better evidence than
+    // the empty page it replaces. Otherwise a dead guard whose filtered index
+    // happens to serve an empty page would go quiet with exit 0, and an empty
+    // page is exactly the index fault this gate was widened for.
     const crossCheckNewest = observation?.crossCheck?.newestCompletedAt;
-    if (crossCheckNewest) {
+    const crossEpoch = crossCheckNewest ? Date.parse(crossCheckNewest) : NaN;
+    if (!Number.isNaN(crossEpoch)) {
+      const crossAgeMinutes = Math.floor((now - crossEpoch) / 60000);
+      if (crossAgeMinutes < staleHours * 60) {
+        return {
+          ...base,
+          status: "unknown",
+          reason: "cross-check-disagreement",
+          detail:
+            `${name} (${workflow}) returned no completed run at all from the filtered run index, ` +
+            `but an unfiltered re-read of the same history found a completion at ${crossCheckNewest}. ` +
+            `The two reads disagree, so the filtered index is stale and "has never completed" is a ` +
+            `fiction. Suppressing the alarm rather than firing it (PEN-3379); this guard is NOT being ` +
+            `asserted to have stopped.`,
+        };
+      }
+
       return {
         ...base,
-        status: "unknown",
-        reason: "cross-check-disagreement",
+        status: "stale",
+        reason: "stopped",
+        ageMinutes: crossAgeMinutes,
         detail:
-          `${name} (${workflow}) returned no completed run at all from the filtered run index, ` +
-          `but an unfiltered re-read of the same history found a completion at ${crossCheckNewest}. ` +
-          `The two reads disagree, so the filtered index is stale and "has never completed" is a ` +
-          `fiction. Suppressing the alarm rather than firing it (PEN-3379); this guard is NOT being ` +
-          `asserted to have stopped.`,
+          `${name} (${workflow}) returned no completed run from the filtered run index, but an ` +
+          `unfiltered re-read found its newest completion at ${crossCheckNewest}, ` +
+          `${Math.floor(crossAgeMinutes / 60)}h ago, past the ${staleHours}h liveness threshold. ` +
+          `"Never completed" is refuted, but the guard has stopped (PEN-3379).`,
+        lastRunUrl: null,
       };
     }
+
+    // A present-but-unparsable cross-check timestamp falls through to the red:
+    // selectNewestCompleted withholds corroboration (null) rather than serving
+    // an older run, and an unreadable value is no corroboration either.
+    const neverCompletedNote = observation?.crossCheck?.error
+      ? ` The unfiltered cross-check read could not be made, so this verdict rests on the filtered ` +
+        `read alone (PEN-3379); treat the age with corresponding caution.`
+      : "";
 
     return {
       ...base,
       status: "stale",
       reason: "never-completed",
-      detail: `${name} (${workflow}) is active but has no completed run at all. It has never enforced anything.`,
+      detail:
+        `${name} (${workflow}) is active but has no completed run at all. It has never enforced ` +
+        `anything.${neverCompletedNote}`,
     };
   }
 

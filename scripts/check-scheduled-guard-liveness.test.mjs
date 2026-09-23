@@ -570,14 +570,44 @@ describe("classifyGuard — 'never completed' rests on the same distrusted index
     assert.match(result.detail, /NOT being\s+asserted to have stopped/);
   });
 
-  // "Never completed" is refuted by ANY completion, however old — unlike the
-  // `stopped` branch, which only suppresses on a completion NEWER than the one
-  // it aged. A six-day-old run still falsifies "has never enforced anything".
-  it("suppresses even on an ancient completion, because the claim is 'never', not 'recently'", () => {
+  // "Never completed" is refuted by ANY completion, however old. But refuting
+  // "never" does not establish "alive": the cross-check timestamp is aged
+  // against staleHours, and a six-day-old completion is a stopped guard, not a
+  // disagreement to suppress. The empty filtered page must not mute a dead guard.
+  it("reds as stopped, citing the cross-check timestamp, when the only completion is past the bar; refuting 'never' does not establish 'alive'", () => {
     const result = neverCompleted({ newestCompletedAt: "2026-09-12T04:32:39Z" });
+
+    assert.equal(result.status, "stale");
+    assert.equal(result.reason, "stopped");
+    // 2026-09-12T04:32:39Z -> 2026-09-18T14:50:00Z is 6d 10h 17m 21s = 9257m (floored).
+    assert.equal(result.ageMinutes, 9257);
+    assert.match(result.detail, /2026-09-12T04:32:39Z/);
+    assert.match(result.detail, /past the 2\.75h liveness threshold/);
+    assert.equal(result.lastRunUrl, null);
+  });
+
+  // Inside the bar by one minute: 2h44m against a 2h45m threshold still reads
+  // as a disagreement, not a stop.
+  it("still suppresses when the cross-check completion sits just inside the bar", () => {
+    const result = neverCompleted({ newestCompletedAt: "2026-09-18T12:06:00Z" });
 
     assert.equal(result.status, "unknown");
     assert.equal(result.reason, "cross-check-disagreement");
+  });
+
+  // A present-but-unparsable timestamp is not corroboration. It falls through to
+  // the red rather than being read as either fresh or stale.
+  it("falls through to never-completed when the cross-check timestamp is present but unparsable", () => {
+    const result = neverCompleted({ newestCompletedAt: "not-a-timestamp" });
+
+    assert.equal(result.status, "stale");
+    assert.equal(result.reason, "never-completed");
+  });
+
+  it("annotates the never-completed red when the cross-check could not be read", () => {
+    const result = neverCompleted({ error: true });
+
+    assert.match(result.detail, /cross-check read could not be made/);
   });
 });
 
