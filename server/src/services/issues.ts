@@ -6694,7 +6694,15 @@ export function issueService(db: Db) {
     return activeReservation !== null;
   }
 
-  async function isTerminalOrMissingHeartbeatRun(runId: string, dbOrTx: DbReader = db) {
+  /**
+   * PEN-2400 (Ally non-blocking 4): named for what it actually returns. Since
+   * PEN-2074 this is not a status predicate — a terminal run that still holds an
+   * unreleased `externalRuntimeReservations` row returns `false`, because the run
+   * is parked on an external wait and still owns its slot. The old name
+   * (`isTerminalOrMissingHeartbeatRun`) promised a pure status read, so a caller
+   * going by the signature would adopt a lock out from under a live reservation.
+   */
+  async function isReleasedTerminalOrMissingHeartbeatRun(runId: string, dbOrTx: DbReader = db) {
     const run = await dbOrTx
       .select({ status: heartbeatRuns.status })
       .from(heartbeatRuns)
@@ -11858,7 +11866,7 @@ export function issueService(db: Db) {
         (current.assigneeAgentId === agentId || current.assigneeAgentId == null)
       ) {
         const expectedExecutionRunId = current.executionRunId;
-        const stale = await isTerminalOrMissingHeartbeatRun(expectedExecutionRunId);
+        const stale = await isReleasedTerminalOrMissingHeartbeatRun(expectedExecutionRunId);
         if (stale) {
           const now = new Date();
           const adopted = await withLockedIssueCheckoutExecution(

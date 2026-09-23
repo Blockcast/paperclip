@@ -753,23 +753,20 @@ type HeartbeatRunTerminalStatus = (typeof HEARTBEAT_RUN_TERMINAL_STATUSES)[numbe
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
 const OPEN_ROUTINE_EXECUTION_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"] as const;
 const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
-const GITHUB_STATE_CHANGE_WAKE_REASONS = new Set([
-  "github_check_completed",
-  "github_check_suite_completed",
-  "github_workflow_completed",
-]);
-const EXTERNAL_WAIT_RESUME_WAKE_REASONS = new Set([
-  ...GITHUB_STATE_CHANGE_WAKE_REASONS,
-  "github_pr_closed",
-  "github_pr_converted_to_draft",
-  "github_pr_review_submitted",
-  "github_pr_synchronized",
-  "issue_monitor_due",
-]);
+// PEN-2400 (Ally non-blocking 2): these two sets used to be declared here AND as a
+// hardcoded literal in recovery/service.ts. Identical, with nothing holding them so.
+// recovery/service.js is the leaf (heartbeat imports it; it cannot import back) and now
+// owns both — see the rationale beside the declarations there.
+import {
+  EXTERNAL_WAIT_RESUME_WAKE_REASONS,
+  GITHUB_STATE_CHANGE_WAKE_REASONS,
+} from "./recovery/service.js";
 export {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
   ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
+  EXTERNAL_WAIT_RESUME_WAKE_REASONS,
+  GITHUB_STATE_CHANGE_WAKE_REASONS,
 } from "./recovery/service.js";
 export const ACTIVE_RUN_OUTPUT_PROGRESS_FLUSH_INTERVAL_MS = 60 * 1000;
 export const ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS = 5 * 1000;
@@ -24334,7 +24331,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               "reservation reconciler released runtime slot but agent finalization failed",
             );
           });
-          if (!options.suppressDispatch) await startNextQueuedRunForAgent(run.agentId);
+          // PEN-2400 (Ally non-blocking 1): guard this the same way as the two
+          // siblings above. By this line the release has already COMMITTED, so
+          // the row is drained. An unguarded throw here lands in the per-row
+          // `catch` below, whose meaning is "this reservation may still be
+          // held" — it increments `failedRowCount`, clears
+          // `paperclip_orphaned_runtime_resource_metrics_refresh_success` and
+          // pages PaperclipRuntimeResourceReconciliationStuck about a backlog
+          // that does not exist. Dispatch is follow-on work with its own retry
+          // (the next `resumeQueuedRuns` pass), so log it and let the sweep
+          // report the truth about the reservation.
+          if (!options.suppressDispatch) {
+            await startNextQueuedRunForAgent(run.agentId).catch((error) => {
+              logger.warn(
+                { error, runId: run.id, agentId: run.agentId },
+                "reservation reconciler released runtime slot but follow-on queued dispatch failed",
+              );
+            });
+          }
         }
         if (released && terminalPrelaunchOrphan) {
           logger.warn(
@@ -25681,7 +25695,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         suppressPromotion: retryContinuesContextIssue,
       });
       if (!opts?.suppressDispatchAfterReap && !promotedRunDispatched) {
-        await startNextQueuedRunForAgent(run.agentId);
+        // PEN-2400: second of the two unguarded batch-loop sites (see
+        // `resumeQueuedRuns`). This runs inside `for (const { run } of
+        // activeRuns)` with no per-iteration catch, so a rejecting dispatch used
+        // to abandon the reap of every run after this one — including their
+        // `releaseLeasesForRun` calls, which is the held-resource harm Ally
+        // described. It also skipped this run's own `appendRunEvent` below,
+        // after its terminal status had already been persisted.
+        await startNextQueuedRunForAgent(run.agentId).catch((error) => {
+          logger.warn(
+            { error, runId: run.id, agentId: run.agentId },
+            "reapOrphanedRuns: post-reap dispatch failed for one agent; continuing the pass",
+          );
+        });
       }
 
       await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
@@ -25743,7 +25769,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const agentIds = [...new Set(queuedRuns.map((r) => r.agentId))];
     for (const agentId of agentIds) {
-      await startNextQueuedRunForAgent(agentId);
+      // PEN-2400: found while verifying Ally non-blocking 1 against its sibling
+      // call sites. The reservation reconciler Ally named already has per-row
+      // isolation (BLO-21460, added after that review), so the "one throw
+      // abandons the rest of the batch" harm Ally described no longer lands
+      // there — it lands on the two loops that still have no per-iteration
+      // catch: this one, and the `activeRuns` loop in `reapOrphanedRuns`. Both
+      // are fleet-wide. One agent's dispatch rejecting used to abandon dispatch
+      // for every agent after it in the pass — on the periodic tick that is
+      // swallowed by the chain `.catch()` in index.ts as "periodic heartbeat
+      // dispatch resumption failed" and lost until the next tick; on the
+      // startup path (index.ts, uncaught) it is worse. Isolating per agent
+      // matches the doctrine already stated for the post-commit wake dispatch
+      // below: swallowing is safe because dispatch is recoverable — the next
+      // pass re-drives any agent still holding queued runs.
+      await startNextQueuedRunForAgent(agentId).catch((error) => {
+        logger.warn(
+          { error, agentId },
+          "resumeQueuedRuns: dispatch failed for one agent; continuing the pass",
+        );
+      });
     }
   }
 
