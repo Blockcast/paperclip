@@ -1637,8 +1637,12 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
  *
  * Inheriting `timeout` is the one member included by consistency rather than by a
  * measured instance: no laundered `timeout` row exists in the live census. It is
- * kept because escalating a wall-clock exhaustion to a manager who cannot make the
- * agent faster is the load-concentration BLO-20933 exists to stop. If it proves
+ * also the weakest member on the merits — six of the seven inherited codes are
+ * provider-side or pre-CLI faults, whereas a run that loops until wall-clock
+ * exhaustion is also a `timeout`, so it is the one code where agent behaviour is
+ * plausibly causal. Kept because escalating a wall-clock exhaustion to a manager
+ * who cannot make the agent faster is the load-concentration BLO-20933 exists to
+ * stop. If it proves
  * wrong, subtract that one code here rather than un-deriving the set, and note that
  * subtracting it changes both readers: routing and the evidence arm.
  *
