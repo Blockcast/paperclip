@@ -43,6 +43,39 @@ export interface PullRequestWorkProductInput {
   owningIdentifiers?: readonly string[] | null;
 }
 
+/**
+ * Merge-queue occupancy, as last reported by a `pull_request` webhook (BLO-35779).
+ *
+ * `null` means "this event said nothing about the queue" — NOT "not queued" —
+ * exactly like `owningIdentifiers`. Only `enqueued`/`dequeued` carry the signal.
+ *
+ * Deliberately a STATE, not a timestamp. GitHub emits exactly two per-PR
+ * merge-queue signals — `added_to_merge_queue` and `removed_from_merge_queue`
+ * — and NOTHING while a PR advances through the queue. Measured on
+ * `Blockcast/paperclip`: #1948 sat 27.4h between the two with no intervening
+ * event, #1654 sat 38.9h. So there is no "last queue activity" clock to read;
+ * the only honest question is "is it in the queue right now".
+ */
+export type PullRequestMergeQueueState = "enqueued" | "dequeued";
+
+/**
+ * Derive queue occupancy from the triggering action.
+ *
+ * Stateless by design: no read-modify-write of the prior row. That is safe
+ * because every other action this webhook handler accepts either cannot occur
+ * while a PR is queued (`opened`, `reopened`, `ready_for_review`) or ejects it
+ * first — GitHub emits `dequeued` before `closed` on a merge (observed 1s
+ * apart on #1948), and a push to a queued PR ejects it. A lost `dequeued`
+ * delivery is bounded by the reader's own cap, not carried here.
+ */
+export function pullRequestMergeQueueState(
+  input: Pick<PullRequestWorkProductInput, "action">,
+): PullRequestMergeQueueState | null {
+  if (input.action === "enqueued") return "enqueued";
+  if (input.action === "dequeued") return "dequeued";
+  return null;
+}
+
 export interface PullRequestWorkProductFields {
   externalId: string;
   title: string;
@@ -175,6 +208,8 @@ export function buildPullRequestWorkProductFields(
       merged: input.prMerged === true,
       mergedAt: input.prMergedAt ?? null,
       lastEventAction: input.action,
+      // BLO-35779. Null = "this event carried no queue signal", not "not queued".
+      mergeQueueState: pullRequestMergeQueueState(input),
       // Null (not `[]`) when the caller did not resolve ownership, so a
       // consumer can tell "not recorded" from "owns nothing" — see the field
       // docblock on PullRequestWorkProductInput.

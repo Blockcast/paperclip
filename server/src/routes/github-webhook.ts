@@ -1637,12 +1637,21 @@ function resolveEventContextRaw(
       // that arrives while it runs gets its own queued follow-up.
       // See shouldFirePrReviewerWake / buildPrReviewerTaskKey /
       // buildPrReviewerWakeIdempotencyKey.
+      // enqueued/dequeued (BLO-35779) are admitted for their WORK PRODUCT only,
+      // not for a wake: they are the sole per-PR evidence that a merge queue is
+      // carrying the PR, and the productivity detector's PR-freshness clock is
+      // otherwise blind to a queued PR (its head deliberately cannot move —
+      // pushing ejects it). Neither reason appears in shouldFirePrReviewerWake's
+      // set, and both are added to suppressAuthorWake below, so admitting them
+      // adds rows and no runs.
       if (
         action !== "opened" &&
         action !== "reopened" &&
         action !== "ready_for_review" &&
         action !== "converted_to_draft" &&
         action !== "synchronize" &&
+        action !== "enqueued" &&
+        action !== "dequeued" &&
         action !== "closed"
       ) return null;
       const pr = payload.pull_request as Record<string, unknown> | undefined;
@@ -1653,6 +1662,8 @@ function resolveEventContextRaw(
         ready_for_review: "github_pr_ready_for_review",
         converted_to_draft: "github_pr_converted_to_draft",
         synchronize: "github_pr_synchronized",
+        enqueued: "github_pr_enqueued",
+        dequeued: "github_pr_dequeued",
         closed: "github_pr_closed",
       };
       const head = pr?.head as Record<string, unknown> | undefined;
@@ -6093,7 +6104,15 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     // no agent treats as an instruction to request review again. That is the
     // same shape a human @ally request has always had.
     const suppressAuthorWake =
-      synchronizeReviewerOnly || context.wakeReason === "github_pr_converted_to_draft";
+      synchronizeReviewerOnly ||
+      context.wakeReason === "github_pr_converted_to_draft" ||
+      // BLO-35779: queue transitions are evidence, never a wake. The author has
+      // nothing to do when their PR enters or leaves the queue — an ejection
+      // that needs action arrives separately as a failed check or a `closed`.
+      // Waking on them would add one run per PR per queue cycle (91 cycles
+      // across 52 PRs in the week measured) to buy nothing.
+      context.wakeReason === "github_pr_enqueued" ||
+      context.wakeReason === "github_pr_dequeued";
     if (
       eventName === "pull_request" &&
       synchronizeReviewerOnly &&

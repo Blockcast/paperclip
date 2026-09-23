@@ -963,8 +963,44 @@ describe("github-webhook pure helpers", () => {
     );
   });
 
-  it("resolves a wake reason for pull_request opened", () => {
-    const ctx = __test_resolveEventContext("pull_request", {
+  // BLO-35779. A rebase merge queue freezes the PR head — pushing ejects it —
+  // so these two actions are the ONLY per-PR evidence that the queue is
+  // carrying the PR. They are admitted for their work product and must produce
+  // NO run: neither reason is in shouldFirePrReviewerWake's set, and both are
+  // in suppressAuthorWake. Measured 91 queue cycles across 52 PRs in one week,
+  // so waking on them would be a real cost for no signal.
+  it("admits merge-queue transitions as evidence without firing a reviewer wake", () => {
+    for (const [action, wakeReason] of [
+      ["enqueued", "github_pr_enqueued"],
+      ["dequeued", "github_pr_dequeued"],
+    ]) {
+      const ctx = __test_resolveEventContext("pull_request", {
+        action,
+        pull_request: {
+          number: 1948,
+          title: `Queue the fix BLO-35779`,
+          body: null,
+          html_url: "https://github.com/Blockcast/paperclip/pull/1948",
+          head: { ref: "staff/blo-35779", sha: "queue1sha" },
+          updated_at: "2026-09-21T13:18:47Z",
+        },
+        repository: { full_name: "Blockcast/paperclip" },
+      });
+      // Admitted at all — on master this returned null, which is the defect:
+      // no context means no work product, so the row's clock froze at the last
+      // push and a queued PR read `stale` for its whole time in the queue.
+      expect(ctx).toMatchObject({
+        identifiers: ["BLO-35779"],
+        wakeReason,
+        prNumber: 1948,
+        prAction: action,
+        prUpdatedAt: "2026-09-21T13:18:47Z",
+      });
+      expect(__test_shouldFirePrReviewerWake(ctx)).toBe(false);
+    }
+  });
+
+  it("resolves a wake reason for pull_request opened", () => {    const ctx = __test_resolveEventContext("pull_request", {
       action: "opened",
       pull_request: {
         number: 200,
