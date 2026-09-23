@@ -161,6 +161,14 @@ export function executionWorkspaceCleanupService(db: Db) {
         // Scoped to linked git worktrees. A shared `local_fs` row points at the
         // project's own checkout, which is not this collector's to archive.
         eq(executionWorkspaces.providerType, "git_worktree"),
+        // The same evidence rule the backfill applies, applied to the other
+        // producer. `stampIdleLegacyWorkspaces` refuses to stamp an archived
+        // row so quarantine artifacts survive; without this, any row archived
+        // elsewhere while still carrying a stamp would be collected anyway —
+        // the same evidence destroyed through a different door. No such writer
+        // exists today, so this keeps the two producers honest rather than
+        // closing a live path.
+        ne(executionWorkspaces.status, "archived"),
         lte(executionWorkspaces.lastUsedAt, new Date(now.getTime() - EXECUTION_WORKSPACE_MIN_IDLE_MS)),
         companyId ? eq(executionWorkspaces.companyId, companyId) : undefined,
       ))

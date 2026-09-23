@@ -456,4 +456,43 @@ describeEmbeddedPostgres("reconcileExecutionWorkspaceCleanup", () => {
     expect(row?.cleanupEligibleAt).toBeNull();
     expect(row?.cleanupReason).toBe("workspace_validation_failed");
   });
+
+  it("never collects an archived row that still carries a stamp", async () => {
+    // The backfill's evidence rule, asserted on the selection side. A row
+    // archived elsewhere *while stamped* is reachable by `selectEligible`
+    // even though `stampIdleLegacyWorkspaces` would never have stamped it,
+    // so without a status filter the collector would remove the artifact
+    // somebody archived to keep. The worktree is real and clean here, so the
+    // only thing that can spare it is the selection predicate.
+    const { repo } = createRepoWithRemote();
+    const worktreePath = path.join(path.dirname(repo), "wt-quarantined");
+    const id = randomUUID();
+    await addOwnedWorktree({ repo, worktreePath, branchName: "wt-quarantined", executionWorkspaceId: id });
+    await db.insert(executionWorkspaces).values({
+      id,
+      companyId,
+      projectId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "wt-quarantined",
+      status: "archived",
+      cwd: worktreePath,
+      providerType: "git_worktree",
+      providerRef: worktreePath,
+      branchName: "wt-quarantined",
+      cleanupReason: "workspace_validation_failed",
+      cleanupEligibleAt: hourAgo(),
+      lastUsedAt: hourAgo(),
+    });
+
+    const result = await cleanup.reconcileExecutionWorkspaceCleanup();
+
+    expect(result.scanned).toBe(0);
+    expect(result.collected).toBe(0);
+    expect(fs.existsSync(worktreePath)).toBe(true);
+    expect(worktreeIsRegistered(repo, worktreePath)).toBe(true);
+
+    const [row] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, id));
+    expect(row?.cleanupReason).toBe("workspace_validation_failed");
+  });
 });
