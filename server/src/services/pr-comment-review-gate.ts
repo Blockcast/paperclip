@@ -44,9 +44,14 @@ const DEFAULT_PR_REVIEWER_BOT_LOGIN = "allyblockcast[bot]";
  * Slicing the joined string cuts inside a verb and drops its closing quote, so
  * the author reads a name that is not the one in their ledger — the same
  * hazard `commentReviewGateRetirementDescription` refuses for the context
- * name. Whatever did not fit is marked, because an author who fixes only the
- * verbs shown would re-push into this same red, which is the loop the carried
- * tail exists to close.
+ * name. On the between-entries path whatever did not fit is marked with ", …",
+ * because an author who fixes only the verbs shown would re-push into this
+ * same red, which is the loop the carried tail exists to close. That marker is
+ * scoped to that path and is NOT an invariant of this function: neither
+ * fallback below can afford it, because at the worst-case budget of 21 there
+ * is no room for both an entry and the 3-character reserve. There entries
+ * 2..n are dropped unmarked, deliberately — spending the reserve would buy the
+ * marker by losing the one verb name the author can actually act on.
  *
  * There is no separate standalone budget: the caller's cap is always the
  * tighter one (the lead is 63-64 characters and the shortest tail is 38, so
@@ -480,7 +485,12 @@ export function evaluateCommentReviewGate(input: {
     // they just did, and which cannot clear a carried finding. Naming why the
     // attestation did not count is the difference between a red that routes
     // the author to the reviewer and a red that routes them into a loop.
-    // Longest rendering is 131 characters, inside the 140 cap.
+    // Tails measure 38 / 54 / 55. That 55 bounds the NO-VERB branch below to
+    // 131 (its 76-character lead plus the tail), inside the 140 cap. It does
+    // not bound the verb branch directly beneath this comment: that one
+    // budgets the verb list against whatever the tail leaves, so it lands on
+    // exactly 140 whenever the list fills its allowance — which is what the
+    // exact-fit test pins. 131 is this branch's ceiling, not the file's.
     const carriedTail = !withheldPositive
       ? "; no comment attests the current head."
       : withheldPositive.authorUnknown
