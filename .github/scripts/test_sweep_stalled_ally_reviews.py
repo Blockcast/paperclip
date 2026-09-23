@@ -1211,5 +1211,22 @@ class TestRunCliExitCodePolicy(unittest.TestCase):
         self.assertEqual(code, sweep.EXIT_ALARM)
 
 
+    def test_exception_raised_while_reporting_a_failure_is_degraded_not_alarm(self):
+        """Arm bodies are siblings of the terminal arm, not inside its try.
+        Live case: HTTPError.read() re-raising IncompleteRead off the socket
+        while the HTTPError arm formats its message (BLO-35151)."""
+        class _TruncatedBody:
+            def read(self):
+                raise http.client.IncompleteRead(b"partial", 100)
+
+            def close(self):
+                pass
+
+        error = urllib.error.HTTPError("https://api.github.com/x", 500, "boom", {}, _TruncatedBody())
+        code, err = self._exit_code_for(error)
+        self.assertEqual(code, sweep.EXIT_SWEEP_DEGRADED)
+        self.assertIn("while reporting a failure", err)
+
+
 if __name__ == "__main__":
     unittest.main()

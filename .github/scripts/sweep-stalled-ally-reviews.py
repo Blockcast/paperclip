@@ -1202,7 +1202,7 @@ def main(argv=None):
         sys.exit(EXIT_SWEEP_DEGRADED)
 
 
-def run_cli():
+def _dispatch():
     """Run `main()` under the abort-vs-alarm exit-code policy.
 
     A function rather than a bare `if __name__ == "__main__"` body so the arms
@@ -1284,6 +1284,21 @@ def run_cli():
         # deliberate sys.exit(EXIT_ALARM) raises SystemExit, which must pass
         # through untouched (BLO-35151).
         print("GitHub API sweep crashed before completing: %s" % traceback.format_exc(), file=sys.stderr)
+        sys.exit(EXIT_SWEEP_DEGRADED)
+
+
+def run_cli():
+    """Run `_dispatch()` under the abort-vs-alarm exit-code policy; see its docstring."""
+    try:
+        _dispatch()
+    except Exception:
+        # The arm BODIES in _dispatch() are siblings of its terminal arm, not
+        # inside its try: an exception raised while REPORTING a failure (live
+        # case: `error.read()` on an HTTPError re-raising IncompleteRead off
+        # the socket) would escape and exit 1 == EXIT_ALARM. `Exception`, not
+        # `BaseException`, so each arm's own sys.exit(SystemExit) passes
+        # through untouched (BLO-35151).
+        print("GitHub API sweep crashed while reporting a failure: %s" % traceback.format_exc(), file=sys.stderr)
         sys.exit(EXIT_SWEEP_DEGRADED)
 
 
