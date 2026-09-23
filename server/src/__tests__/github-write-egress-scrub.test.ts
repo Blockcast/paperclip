@@ -555,9 +555,20 @@ describe("the scrub is reachable from server/ at all", () => {
 
     for (const writer of writers) {
       const source = readFileSync(path.join(serverSrc, writer), "utf8");
-      expect(source, `${writer} writes to GitHub without reaching the egress scrub`).toContain(
-        "scrubOutboundGitHubText",
-      );
+      // The message has to describe what was actually measured, not what is
+      // most likely. The predicate is fail-closed, so a hit means "this scan
+      // could not PROVE this is read-only" — which includes the false-positive
+      // case of a file that merely says "method" somewhere. Reporting that as
+      // "writes to GitHub" would send someone hunting for a write that is not
+      // there, and the obvious way to make such a failure go away is to weaken
+      // the guard. So name the remedy for both cases.
+      expect(
+        source,
+        `${writer} references ghFetch and this scan cannot prove it is read-only, so it must ` +
+          `call scrubOutboundGitHubText. If it genuinely does not write, pin every \`method\` to ` +
+          `a quoted GET/HEAD/OPTIONS literal — see __tests__/helpers/github-writer-derivation.ts ` +
+          `for why the predicate errs in this direction.`,
+      ).toContain("scrubOutboundGitHubText");
     }
   });
 });
