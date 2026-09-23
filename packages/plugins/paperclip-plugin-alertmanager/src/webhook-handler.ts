@@ -129,9 +129,19 @@ const WORKER_INSTANCE_ID = randomUUID();
  * so a typo on an api replica would silently add a second plugin host.
  *
  * Keying the steal on the slot means correctness does not depend on that
- * config being right. Within one slot, a new process proves the old one is gone
- * (Kubernetes recreates a StatefulSet ordinal only after the previous pod has
- * fully terminated); across slots, nothing is ever assumed dead.
+ * config being right. Across slots, nothing is ever assumed dead. Within one
+ * slot, a new process is taken as proof the old one is gone — which holds
+ * strictly for pod replacement (Kubernetes recreates a StatefulSet ordinal only
+ * after the previous pod has fully terminated), but is weaker for an in-process
+ * worker restart, which a working slot newly brings under this rule. The worker
+ * manager's `stopInternal` escalates shutdown RPC → SIGTERM → SIGKILL and, if
+ * the child is still unreaped after the SIGKILL wait, logs and returns
+ * `stopped` anyway; `restart()` then forks immediately, so the new child's
+ * sweep can match a fence the old child still holds. That is within this
+ * design's accepted posture — stealing from a possibly-live owner is bounded by
+ * the `firing_token` generation check to one failed delivery plus an
+ * Alertmanager retry — but the pod-lifecycle sentence alone does not justify
+ * it, so it is stated rather than implied.
  *
  * `HOSTNAME` alone is not enough to find it, and in production it never was.
  * The plugin host forks this worker as a child whose env does NOT carry
@@ -146,30 +156,44 @@ const WORKER_INSTANCE_ID = randomUUID();
  * restart-safety fix was inert from the day it shipped. The only drain that
  * ever fired was the elapsed-time abandonment backstop.
  *
- * `os.hostname()` reads the UTS namespace instead of the env, so it returns
- * the pod name in the child regardless of what the host forwards. That is the
- * stable, per-host value this design always wanted.
+ * `os.hostname()` reads the UTS namespace instead of the env, so — absent
+ * `hostNetwork: true` — it returns the pod name in the child regardless of what
+ * the host forwards. That is the stable, per-host value this design always
+ * wanted. Under `hostNetwork` the pod shares the node's UTS namespace, so this
+ * returns the *node* name and every plugin host on that node would share one
+ * slot; the chart does not set it today, and this comment is the thing to
+ * re-read if that changes.
  *
  * Still falls back to a per-process value when no hostname resolves, which is
  * fail-safe: an unidentifiable slot matches no stored slot, so it steals
- * nothing. `localhost` is treated as unidentifiable for the opposite reason —
- * it is a generic name two unrelated hosts can share, and a wrongly *shared*
- * slot would let them steal each other's live fences.
+ * nothing. Any `localhost*` name is treated as unidentifiable for the opposite
+ * reason — it is a generic name two unrelated hosts can share (`localhost`,
+ * `localhost.localdomain`, `localhost6`), and a wrongly *shared* slot would let
+ * them steal each other's live fences. The guard runs on both sources and on a
+ * lower-cased value, because the hazard is the *value* being shareable, not
+ * where it came from: `HOSTNAME` is overridable per plugin via the worker
+ * manager's `options.env`. Lower-casing is safe because `owner_slot` is only
+ * ever written from, and compared against, this same function's output.
+ *
+ * Over-rejecting is the cheap direction: a real host named `localhost-1` merely
+ * loses restart-safety and falls back to the status quo, while under-rejecting
+ * costs mutual fence theft between unrelated hosts.
  */
 export function resolveWorkerSlot(
   fallbackId: string,
   env: NodeJS.ProcessEnv = process.env,
   readOsHostname: () => string = osHostname,
 ): string {
-  const fromEnv = env.HOSTNAME?.trim();
-  if (fromEnv) return fromEnv;
-  let fromOs = "";
-  try {
-    fromOs = readOsHostname().trim();
-  } catch {
-    fromOs = "";
+  let candidate = env.HOSTNAME?.trim() ?? "";
+  if (!candidate) {
+    try {
+      candidate = readOsHostname().trim();
+    } catch {
+      candidate = "";
+    }
   }
-  if (fromOs && fromOs !== "localhost") return fromOs;
+  candidate = candidate.toLowerCase();
+  if (candidate && !candidate.startsWith("localhost")) return candidate;
   return `unknown-slot:${fallbackId}`;
 }
 

@@ -1160,4 +1160,36 @@ describe("resolveWorkerSlot", () => {
       }),
     ).toBe("unknown-slot:id-5");
   });
+
+  /**
+   * The generic-name guard is about the *value* being shareable, not its
+   * source, so it has to run on the env arm too — `HOSTNAME` is overridable
+   * per plugin through the worker manager's `options.env`. Before the fix the
+   * env arm returned ahead of the guard and this yielded the slot `localhost`,
+   * the exact value the OS arm rejects.
+   */
+  it("rejects a generic name from HOSTNAME, not just from the UTS namespace", () => {
+    expect(resolveWorkerSlot("id-6", { HOSTNAME: "localhost" }, () => "paperclip-0")).toBe(
+      "unknown-slot:id-6",
+    );
+  });
+
+  /**
+   * Two hosts left on a distro default (`localhost.localdomain`) against one
+   * Paperclip database would share a slot and mutually steal each other's live
+   * fences. An exact, case-sensitive `!== "localhost"` let every one of these
+   * through; each case below fails on that version.
+   */
+  it.each(["localhost.localdomain", "LOCALHOST", "localhost6", "Localhost.localdomain"])(
+    "treats the generic name %s as unidentifiable",
+    (hostname) => {
+      expect(resolveWorkerSlot("id-7", {}, () => hostname)).toBe("unknown-slot:id-7");
+    },
+  );
+
+  it("lower-cases the slot so one host cannot hold two slots across a restart", () => {
+    expect(resolveWorkerSlot("id-8", {}, () => "Paperclip-0")).toBe(
+      resolveWorkerSlot("id-9", { HOSTNAME: "paperclip-0" }, () => "ignored"),
+    );
+  });
 });
