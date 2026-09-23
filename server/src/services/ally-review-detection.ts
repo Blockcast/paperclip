@@ -546,6 +546,13 @@ function carriesBlockingFeedback(text: string, options?: ActionableFeedbackOptio
  *     4248/4273, past the old 4096-byte clamp. Seeing this reason on a review
  *     that also dispositions prior findings means the classifier read a
  *     fragment, not that the review was clean.
+ *
+ *     frr#61 itself no longer lands here: its first disposition is
+ *     `still-present` and survives the clamp, and BLO-31446 made a
+ *     still-present ledger entry a hard blocking signal, so the specimen now
+ *     routes as actionable before reaching this branch. The reason stays for
+ *     the same truncation carrying no such assertion — the shape above with
+ *     every prior finding retired.
  */
 export type PrReviewNonActionableReason =
   | "review_body_absent"

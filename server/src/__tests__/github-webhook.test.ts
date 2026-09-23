@@ -8795,7 +8795,17 @@ describeEmbeddedPostgres("github-webhook route", () => {
     // buckets pushed past the clamp boundary by the intervening prose. The
     // padding width is chosen so the first bucket starts at byte ~5006, past
     // the 4096 clamp, mirroring the live specimen's 4248.
-    function frr61ShapedBody(): string {
+    //
+    // `priorStillPresent` selects which half of the specimen a case needs.
+    // The live body's first disposition is `still-present`, and it survives
+    // the clamp — so since BLO-31446 (`9d4e6b9ab`, 2026-09-06, which landed
+    // after this issue was filed) that entry is a hard blocking signal and
+    // the verbatim specimen no longer reaches the declined path at all. The
+    // `false` variant keeps the same truncated-before-its-buckets shape while
+    // dropping the blocking assertion, which is what still selects
+    // `ally_review_findings_unenumerable`. Both are exercised below: the
+    // reason must stay reachable, and the specimen must stay non-silent.
+    function frr61ShapedBody({ priorStillPresent = true } = {}): string {
       const detail = "detail ".repeat(160);
       return [
         "## Ally — Consolidated PR Review",
@@ -8806,7 +8816,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
         "",
         "### Prior Findings Dispositioned (4)",
         "",
-        `- **prior:f58559a important 4** — still-present — \`pimd/pim_mroute.c:1828\` — ${detail}`,
+        `- **prior:f58559a important 4** — ${priorStillPresent ? "still-present" : "fixed"} — \`pimd/pim_mroute.c:1828\` — ${detail}`,
         `- **prior:b889084 important 2** — fixed — \`pimd/pim_dimt.c:1115\` — ${detail}`,
         `- **prior:b889084 important 3** — fixed — \`pimd/pim_iface.c:2218\` — ${detail}`,
         `- **prior:b889084 important 4** — fixed — \`tests/topotests/lib/test_kernel_state.py:73\` — ${detail}`,
@@ -8820,7 +8830,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     }
 
     it("names ally_review_findings_unenumerable when the classifier sees the frr#61 body truncated before its findings buckets", async () => {
-      const fullBody = frr61ShapedBody();
+      const fullBody = frr61ShapedBody({ priorStillPresent: false });
       // Pin the property that made frr#61 undiagnosable: the buckets sit
       // beyond the clamp, exactly as in the live specimen (4248/4273 > 4096).
       // Read against the real clamp, not a copy of it — if the clamp is
@@ -8966,7 +8976,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
         predicate: "hasAllyConsolidatedReviewHeading && every counted findings bucket === 0",
       });
 
-      const truncated = Buffer.from(frr61ShapedBody(), "utf8")
+      const truncated = Buffer.from(frr61ShapedBody({ priorStillPresent: false }), "utf8")
         .subarray(0, __test_REVIEW_BODY_MAX_BYTES)
         .toString("utf8");
       expect(__test_classifyPrReviewActionability(truncated, "commented")).toMatchObject({
@@ -8978,6 +8988,26 @@ describeEmbeddedPostgres("github-webhook route", () => {
       expect(__test_classifyPrReviewActionability("lgtm, nice work", "commented")).toMatchObject({
         actionable: false,
         reason: "review_no_blocking_feedback",
+      });
+    });
+
+    it("routes the verbatim frr#61 clamped body as actionable on its still-present ledger entry (BLO-31446)", () => {
+      // The specimen's own fate, which moved under this issue after it was
+      // filed. Its first disposition is `still-present` and sits inside the
+      // 4096-byte clamp, so the truncated body carries a positive assertion
+      // that a prior finding stands even though every counted bucket was cut
+      // off. BLO-31446 made that a hard blocking signal, which cures frr#61 at
+      // the root: it now routes as actionable feedback rather than declining
+      // with a name. Pinned because a regression there restores the original
+      // silence, and the only evidence would again be an absent comment.
+      const clamped = Buffer.from(frr61ShapedBody(), "utf8")
+        .subarray(0, __test_REVIEW_BODY_MAX_BYTES)
+        .toString("utf8");
+      expect(clamped).toContain("still-present");
+      expect(clamped).not.toMatch(/Issues\s*\(\d+\)/);
+      expect(__test_classifyPrReviewActionability(clamped, "commented")).toEqual({
+        actionable: true,
+        predicate: "carriesBlockingFeedback(rawBody)",
       });
     });
 
