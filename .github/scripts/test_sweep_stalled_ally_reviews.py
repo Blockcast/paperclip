@@ -11,6 +11,7 @@ import importlib.util
 import io
 import os
 import tempfile
+import time
 import unittest
 import urllib.error
 
@@ -1127,6 +1128,33 @@ class TestRefireBudget(unittest.TestCase):
                               100.0 + sweep.ALARM_THRESHOLD_SECONDS)
         )
 
+    def test_write_failed_pr_still_carries_pending_since_so_it_can_alarm(self):
+        """The write-side twin of the deferred test above; BLO-22892 class.
+
+        A rejected write must not drop pending_since: the PR was read in
+        full, so its alarm verdict is exact, and sweep_is_degraded's floor
+        of max(3, 10%) does not backstop a few write failures on a large
+        open-PR list.
+        """
+        sweep.MAX_REFIRES_PER_RUN = 1
+        self._install_prs([_pr(1)])
+        self._eligible_at({1: 100.0})
+
+        def failing_refire(*args):
+            raise RuntimeError("boom")
+
+        sweep._refire_pr = failing_refire
+
+        results = sweep.sweep("o", "r", "tok", "https://api.github.com", now=0.0)
+
+        self.assertTrue(str(results[0][4]).startswith(sweep.SWEEP_ERROR_REASON_PREFIX))
+        self.assertIn(sweep.REFIRE_WRITE_FAILURE_TOKEN, str(results[0][4]))
+        self.assertIsNotNone(results[0][2])
+        self.assertTrue(
+            sweep.is_alarming({"is_draft": False, "pending_since": results[0][2]},
+                              100.0 + sweep.ALARM_THRESHOLD_SECONDS)
+        )
+
 
 class TestDryRun(unittest.TestCase):
     """--dry-run must report the real plan and issue no writes."""
@@ -1226,9 +1254,16 @@ class _RendersMainSummary:
         finally:
             os.unlink(path)
 
-    def _write_failure(self, number, exc_name="RateLimitExhausted"):
+    def _write_failure(self, number, exc_name="RateLimitExhausted", pending_since=None):
+        # A failed write keeps the pending_since it was read with (the read
+        # succeeded; only the write was rejected). Defaulting it to None
+        # would encode the alarm-suppressed state -- the BLO-22892 class --
+        # as the normal shape. Fresh by default so `alarming` stays 0 in
+        # the tests that do not care.
+        if pending_since is None:
+            pending_since = time.time()
         return (
-            _pr(number), "%040x" % number, None, False,
+            _pr(number), "%040x" % number, pending_since, False,
             "%s -- %s (%s)"
             % (sweep.SWEEP_ERROR_REASON_PREFIX, sweep.REFIRE_WRITE_FAILURE_TOKEN, exc_name),
         )
@@ -1403,7 +1438,26 @@ class TestDeferralHeaderReportsMeasuredDelivery(_RendersMainSummary, unittest.Te
         )
 
         self.assertIn("3 could not be read", summary)
-        self.assertIn("1 were read in full and failed on the re-fire WRITE", summary)
+        self.assertIn("1 PR(s) were read in full and failed on the re-fire WRITE", summary)
+
+    def test_the_write_clause_states_the_verdict_is_exact_not_that_they_are_counted(self):
+        """Re-fire eligibility (STALL_THRESHOLD) is below the alarm threshold,
+        so a write-failed PR is normally NOT alarming. Claiming they "are
+        counted in `alarming=N`" pointed the operator at an alarm table that
+        does not list them. The true property is that their verdict is
+        exact; rendered against a non-zero count so the sentence cannot pass
+        by reading `alarming=0` as vacuously true."""
+        summary = self._summary_for([
+            self._write_failure(
+                1, pending_since=time.time() - sweep.ALARM_THRESHOLD_SECONDS - 60
+            ),
+            self._write_failure(2),
+            self._write_failure(3),
+        ])
+
+        self.assertIn("This run is DEGRADED", summary)
+        self.assertIn("`alarming=1` is trustworthy", summary)
+        self.assertNotIn("counted in `alarming=", summary)
 
 
 class TestAttemptCeilingIsClamped(unittest.TestCase):

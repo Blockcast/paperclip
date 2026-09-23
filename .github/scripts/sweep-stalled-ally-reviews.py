@@ -1195,9 +1195,10 @@ def main(argv=None):
                         )
                     if refire_write_failures:
                         handle.write(
-                            " %d were read in full and failed on the re-fire WRITE, so "
-                            "they are counted in `alarming=%d` correctly; the remedy is "
-                            "on the write side, not in the read budget."
+                            " %d PR(s) were read in full and failed on the re-fire WRITE, "
+                            "so their alarm verdict is exact and `alarming=%d` is "
+                            "trustworthy; the remedy is on the write side, not in the "
+                            "read budget."
                             % (len(refire_write_failures), len(alarming))
                         )
                     handle.write("\n\n")
