@@ -45,17 +45,6 @@ async function waitForPidExit(pid: number, timeoutMs = 2_000) {
   return !isPidAlive(pid);
 }
 
-async function waitForTextMatch(read: () => string, pattern: RegExp, timeoutMs = 1_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const value = read();
-    const match = value.match(pattern);
-    if (match) return match;
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-  return read().match(pattern);
-}
-
 // Loaded CI hosts may need more than one second to start a nested Node process.
 // These tests cover timeout signaling, not process-start latency.
 const PROCESS_TREE_TEST_TIMEOUT_SEC = 5;
@@ -577,7 +566,12 @@ describe("runChildProcess", () => {
         {
           cwd: process.cwd(),
           env: {},
-          timeoutSec: 1,
+          // The timeout timer is armed synchronously at spawn, so timeoutSec is
+          // also the budget for starting the nested Node process and writing its
+          // pid. At 1s a loaded host SIGTERMs the child before it announces,
+          // leaving stdout empty and the pid assertion failing on NaN
+          // (BLO-26627). This test covers escalation, not process-start latency.
+          timeoutSec: PROCESS_TREE_TEST_TIMEOUT_SEC,
           graceSec: 1,
           onLog: async () => {},
           onSpawn: async () => {},
@@ -590,6 +584,7 @@ describe("runChildProcess", () => {
       expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true);
       expect(await waitForPidExit(descendantPid, 2_000)).toBe(true);
     },
+    PROCESS_TREE_TEST_BUDGET_MS,
   );
 
   it.skipIf(process.platform === "win32")(
@@ -665,7 +660,10 @@ describe("runChildProcess", () => {
         {
           cwd: process.cwd(),
           env: {},
-          timeoutSec: 1,
+          // See the sibling escalation test: at timeoutSec 1 the SIGTERM can
+          // beat the nested spawn, so no descendant survives the grace SIGKILL
+          // and `kill_signal` is never emitted (BLO-26627).
+          timeoutSec: PROCESS_TREE_TEST_TIMEOUT_SEC,
           graceSec,
           onLog: async () => {},
           onSpawn: async () => {},
@@ -984,68 +982,84 @@ describe("runChildProcess", () => {
     PROCESS_TREE_TEST_BUDGET_MS,
   );
 
-  it.skipIf(process.platform === "win32")("does not clean up noisy runs that have no terminal output", async () => {
-    const runId = randomUUID();
-    let observed = "";
-    const resultPromise = runChildProcess(
-      runId,
-      process.execPath,
-      [
-        "-e",
+  it.skipIf(process.platform === "win32")(
+    "does not clean up noisy runs that have no terminal output",
+    async () => {
+      const runId = randomUUID();
+      let observed = "";
+      // Wait for the descendant announcement as an *event*, not against a fixed
+      // wall-clock budget. Polling with a 1s deadline meant a loaded host that
+      // was slow to start the nested Node process returned no match, and the
+      // NaN that produced surfaced as a bare `expected false to be true`
+      // (BLO-26627). Resolving from onLog has no threshold to cross, and a
+      // genuine no-show now fails as an explicit test-budget timeout instead.
+      let announceDescendantPid: (pid: number) => void = () => {};
+      const descendantPidAnnounced = new Promise<number>((resolve) => {
+        announceDescendantPid = resolve;
+      });
+      const resultPromise = runChildProcess(
+        runId,
+        process.execPath,
         [
-          "const { spawn } = require('node:child_process');",
-          "const child = spawn(process.execPath, ['-e', \"setInterval(() => process.stdout.write('noise\\\\n'), 50)\"], { stdio: ['ignore', 'inherit', 'ignore'] });",
-          "process.stdout.write(`descendant:${child.pid}\\n`);",
-          "setTimeout(() => process.exit(0), 25);",
-        ].join(" "),
-      ],
-      {
-        cwd: process.cwd(),
-        env: {},
-        timeoutSec: 0,
-        graceSec: 1,
-        onLog: async (_stream, chunk) => {
-          observed += chunk;
+          "-e",
+          [
+            "const { spawn } = require('node:child_process');",
+            "const child = spawn(process.execPath, ['-e', \"setInterval(() => process.stdout.write('noise\\\\n'), 50)\"], { stdio: ['ignore', 'inherit', 'ignore'] });",
+            "process.stdout.write(`descendant:${child.pid}\\n`);",
+            "setTimeout(() => process.exit(0), 25);",
+          ].join(" "),
+        ],
+        {
+          cwd: process.cwd(),
+          env: {},
+          timeoutSec: 0,
+          graceSec: 1,
+          onLog: async (_stream, chunk) => {
+            // Accumulate: the announcement can straddle two chunks.
+            observed += chunk;
+            const match = observed.match(/descendant:(\d+)/);
+            if (match) announceDescendantPid(Number.parseInt(match[1], 10));
+          },
+          terminalResultCleanup: {
+            graceMs: 50,
+            hasTerminalResult: ({ stdout }) => stdout.includes('"type":"result"'),
+          },
         },
-        terminalResultCleanup: {
-          graceMs: 50,
-          hasTerminalResult: ({ stdout }) => stdout.includes('"type":"result"'),
-        },
-      },
-    );
+      );
 
-    const pidMatch = await waitForTextMatch(() => observed, /descendant:(\d+)/);
-    const descendantPid = Number.parseInt(pidMatch?.[1] ?? "", 10);
-    expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true);
+      const descendantPid = await descendantPidAnnounced;
+      expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true);
 
-    const race = await Promise.race([
-      resultPromise.then(() => "settled" as const),
-      new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), 300)),
-    ]);
-    expect(race).toBe("pending");
-    expect(isPidAlive(descendantPid)).toBe(true);
+      const race = await Promise.race([
+        resultPromise.then(() => "settled" as const),
+        new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), 300)),
+      ]);
+      expect(race).toBe("pending");
+      expect(isPidAlive(descendantPid)).toBe(true);
 
-    const running = runningProcesses.get(runId) as
-      | { child: { kill(signal: NodeJS.Signals): boolean }; processGroupId: number | null }
-      | undefined;
-    try {
-      if (running?.processGroupId) {
-        process.kill(-running.processGroupId, "SIGKILL");
-      } else {
-        running?.child.kill("SIGKILL");
-      }
-      await resultPromise;
-    } finally {
-      runningProcesses.delete(runId);
-      if (isPidAlive(descendantPid)) {
-        try {
-          process.kill(descendantPid, "SIGKILL");
-        } catch {
-          // Ignore cleanup races.
+      const running = runningProcesses.get(runId) as
+        | { child: { kill(signal: NodeJS.Signals): boolean }; processGroupId: number | null }
+        | undefined;
+      try {
+        if (running?.processGroupId) {
+          process.kill(-running.processGroupId, "SIGKILL");
+        } else {
+          running?.child.kill("SIGKILL");
+        }
+        await resultPromise;
+      } finally {
+        runningProcesses.delete(runId);
+        if (isPidAlive(descendantPid)) {
+          try {
+            process.kill(descendantPid, "SIGKILL");
+          } catch {
+            // Ignore cleanup races.
+          }
         }
       }
-    }
-  });
+    },
+    PROCESS_TREE_TEST_BUDGET_MS,
+  );
 });
 
 describe("renderPaperclipWakePrompt", () => {
