@@ -5443,6 +5443,62 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
 
+  // BLO-35893: the comment counters used to AND in `issueRunScopeSql`, a
+  // predicate over the authoring *run's* context columns rather than over the
+  // comment's issue. Every routine-backed row hit this structurally — routine
+  // dispatch wakes the agent on a fresh per-fire execution issue, so a receipt
+  // posted back to the long-lived log row is authored by a run scoped
+  // elsewhere, forever. BLO-35321 reported 11 such comments as `2 total, 0/6h`.
+  it("counts an assignee comment whose authoring run was scoped to a different issue", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    // Streak runs on the SOURCE issue, all older than 6h, so both run-scoped
+    // windows stay at 0 and only the comment counter can move. That is what
+    // makes the control below meaningful.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    // The routine shape: a run woken on some other issue, posting its receipt
+    // here. `contextIssueId` is generated from `contextSnapshot->>'issueId'`.
+    const otherIssueId = randomUUID();
+    const commentAt = new Date(now.getTime() - 3 * 60 * 60 * 1000);
+    const [crossScopeRun] = await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: otherIssueId,
+      count: 1,
+      now: commentAt,
+    });
+    await db.insert(issueComments).values({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      authorAgentId: seeded.coderId,
+      createdByRunId: crossScopeRun!.id,
+      body: "Landing receipt: merged PR #1234.",
+      createdAt: commentAt,
+      updatedAt: commentAt,
+    });
+
+    await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    const [review] = await listProductivityReviews(seeded.companyId);
+    const description = review?.description ?? "";
+    expect(description).toContain("Assignee run-linked comments total/window: 1 total, 0/1h, 1/6h");
+    // The exact pre-fix rendering, which scoped the count to runs woken here.
+    expect(description).not.toContain("Assignee run-linked comments total/window: 0 total");
+    // ...and the comment is listed, not just counted.
+    expect(description).toContain(`run \`${crossScopeRun!.id}\`: Landing receipt: merged PR #1234.`);
+    // CONTROL: the run-scoped counters were NOT loosened along with the comment
+    // counter. Without this, the test passes on a change that strips
+    // `issueRunScopeSql` from `countIssueRunsSince` too — the cross-scope run
+    // sits 3h back, so a loosened runs query would read `1/6h` here.
+    expect(description).toContain("Runs in rolling windows: 0/1h, 0/6h");
+  });
+
   it("recovers a Next line from an assignee comment instead of reporting 'none recorded'", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();

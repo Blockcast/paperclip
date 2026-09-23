@@ -3743,6 +3743,22 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .then((rows) => rows[0]?.count ?? 0);
   }
 
+  /**
+   * BLO-35893: counts every assignee comment **on this issue** that is
+   * run-linked, deliberately WITHOUT `issueRunScopeSql`. The join to
+   * `heartbeatRuns` is retained only to enforce "run-linked, by this agent" —
+   * the scope predicate is over the *run's* context columns, not the comment's
+   * issue, so ANDing it in narrowed the counter to "…by a run woken on this
+   * issue". That is a strictly narrower fact than the `Assignee run-linked
+   * comments total/window` line claims, and routine-backed rows hit it every
+   * time: routine dispatch wakes the agent on a fresh per-fire execution issue
+   * (`routines.ts`, `queueIssueAssignmentWakeup`), so a receipt posted to a
+   * long-lived log row is authored by a run scoped elsewhere, forever. Measured
+   * on BLO-35321: 11 such comments reported as `2 total, 0/6h`.
+   *
+   * `countIssueRunsSince` keeps the predicate — it counts *runs on this issue*,
+   * where scoping the run is the right question.
+   */
   async function countIssueCommentsSince(companyId: string, issueId: string, agentId: string, since?: Date) {
     return db
       .select({ count: sql<number>`count(*)::int` })
@@ -3755,7 +3771,6 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           eq(issueComments.authorAgentId, agentId),
           eq(heartbeatRuns.companyId, companyId),
           eq(heartbeatRuns.agentId, agentId),
-          issueRunScopeSql(issueId),
           since ? sql`${issueComments.createdAt} >= ${since.toISOString()}::timestamptz` : undefined,
         ),
       )
@@ -4133,6 +4148,10 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id),
       countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, oneHourAgo),
       countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, sixHoursAgo),
+      // BLO-35893: same widening as `countIssueCommentsSince` — no
+      // `issueRunScopeSql` here. `Latest Assignee Run Comments` is a list of
+      // comments *on this issue*, so filtering by the authoring run's context
+      // dropped every cross-issue-run receipt (9 of 11 on BLO-35321).
       db
         .select({ comment: issueComments })
         .from(issueComments)
@@ -4144,7 +4163,6 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
             eq(issueComments.authorAgentId, sourceAgent.id),
             eq(heartbeatRuns.companyId, sourceIssue.companyId),
             eq(heartbeatRuns.agentId, sourceAgent.id),
-            issueRunScopeSql(sourceIssue.id),
           ),
         )
         .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
