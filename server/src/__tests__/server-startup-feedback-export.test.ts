@@ -980,6 +980,80 @@ describe("startServer feedback export wiring", () => {
     }
   });
 
+  // BLO-22984: the latch clears only in the pass's `.finally`, so a pass that
+  // HANGS rather than rejects (its `fs.stat` on a wedged mount has no timeout)
+  // turns "retry next tick" into "never again", silently. Skipping while a
+  // pass is merely slow must stay quiet; once it has been in flight past the
+  // stall threshold the skip must warn, and must still not start a second pass.
+  it("warns when an execution-workspace collector pass stays in flight across many ticks", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    const idleCollect = { stamped: 0, scanned: 0, collected: 0, skipped: 0, failed: 0 };
+    const stallWarnAfterMs = 10 * 30000;
+    const stallMessage = /execution-workspace collector still in flight/;
+    let releaseCollector: (() => void) | null = null;
+    let dateNowSpy: { mockRestore(): void } | null = null;
+    try {
+      await startServer();
+      // Drain the startup pass first, as in the test above: it holds the same latch.
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalledTimes(1));
+      await vi.waitFor(() =>
+        expect(executionWorkspaceCleanupServiceMock.reconcileExecutionWorkspaceCleanup).toHaveBeenCalledTimes(1));
+      executionWorkspaceCleanupServiceMock.reconcileExecutionWorkspaceCleanup.mockClear();
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockClear();
+
+      // Pin the clock so the periodic pass is stamped at a known start.
+      const startedAt = Date.now();
+      let clock = startedAt;
+      dateNowSpy = vi.spyOn(Date, "now").mockImplementation(() => clock);
+
+      executionWorkspaceCleanupServiceMock.reconcileExecutionWorkspaceCleanup.mockImplementationOnce(
+        () => new Promise((resolve) => {
+          releaseCollector = () => resolve(idleCollect);
+        }),
+      );
+      intervalCallback?.();
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalledTimes(1));
+      expect(executionWorkspaceCleanupServiceMock.reconcileExecutionWorkspaceCleanup).toHaveBeenCalledTimes(1);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      // Still under the threshold: an ordinary skip, no warning.
+      clock = startedAt + stallWarnAfterMs - 1;
+      intervalCallback?.();
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalledTimes(2));
+      expect(logger.warn).not.toHaveBeenCalledWith(expect.anything(), expect.stringMatching(stallMessage));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      // Past it: the skip reports the stall and still does not act on it.
+      clock = startedAt + stallWarnAfterMs + 1;
+      intervalCallback?.();
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalledTimes(3));
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ inFlightMs: stallWarnAfterMs + 1, warnAfterMs: stallWarnAfterMs }),
+        expect.stringMatching(stallMessage),
+      );
+      expect(executionWorkspaceCleanupServiceMock.reconcileExecutionWorkspaceCleanup).toHaveBeenCalledTimes(1);
+    } finally {
+      releaseCollector?.();
+      dateNowSpy?.mockRestore();
+      setIntervalSpy.mockRestore();
+    }
+  });
+
   // BLO-22984: the startup collector must not be awaited inside the startup
   // recovery chain. `heartbeatStartupRecoveryPending` clears only in that
   // chain's `.finally`, and the tick early-returns on it above the runtime

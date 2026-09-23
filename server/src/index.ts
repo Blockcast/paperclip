@@ -1138,7 +1138,15 @@ export async function startServer(): Promise<StartedServer> {
   // next tick's and the trailing pass's `deferCandidate` can land on a row the
   // leading pass already archived. Every collector pass is idempotent, so a
   // tick that finds one running skips it. The startup pass sets it too.
+  //
+  // It inherits the hang-not-reject failure mode described on
+  // `heartbeatRecoveryChainInFlight` above, and the collector is where a hang
+  // is reachable: its `fs.stat` on a candidate path has no timeout, and one
+  // wedged mount stops collection for the life of the process with no output.
+  // `executionWorkspaceCollectorStartedAt` makes that absence visible. Like
+  // the chain's stamp it reports and does not act.
   let executionWorkspaceCollectorInFlight = false;
+  let executionWorkspaceCollectorStartedAt = 0;
   // 10 ticks. Above the normal case (a sweep routinely outlives one interval —
   // that is what the latch is for) and far below the hours a wedged chain would
   // otherwise sit silent.
@@ -1387,7 +1395,11 @@ export async function startServer(): Promise<StartedServer> {
         // starve every periodic pass on a slow git/fs (prior:19b276c important 2
         // principle). It gates nothing below it; it is tracked for the shutdown
         // drain and holds the collector latch so the first tick does not double it.
+        // It may take the latch without testing it only because
+        // `heartbeatStartupRecoveryPending` is still true here and the tick
+        // early-returns on it, so no periodic pass can be holding it yet.
         executionWorkspaceCollectorInFlight = true;
+        executionWorkspaceCollectorStartedAt = Date.now();
         trackHeartbeatSchedulerWork(executionWorkspaceCleanup
           .reconcileExecutionWorkspaceCleanup()
           .then((workspacesCollected) => {
@@ -1398,6 +1410,7 @@ export async function startServer(): Promise<StartedServer> {
           })
           .finally(() => {
             executionWorkspaceCollectorInFlight = false;
+            executionWorkspaceCollectorStartedAt = 0;
           }));
       })().catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
@@ -1712,6 +1725,7 @@ export async function startServer(): Promise<StartedServer> {
           // outlive the interval and the next tick must skip it, not double it.
           if (!executionWorkspaceCollectorInFlight) {
             executionWorkspaceCollectorInFlight = true;
+            executionWorkspaceCollectorStartedAt = Date.now();
             trackHeartbeatSchedulerWork(executionWorkspaceCleanup
               .reconcileExecutionWorkspaceCleanup()
               .then((workspacesCollected) => {
@@ -1723,7 +1737,21 @@ export async function startServer(): Promise<StartedServer> {
               })
               .finally(() => {
                 executionWorkspaceCollectorInFlight = false;
+                executionWorkspaceCollectorStartedAt = 0;
               }));
+          } else if (
+            Date.now() - executionWorkspaceCollectorStartedAt >
+            HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS
+          ) {
+            // Skipping is normal and silent; a pass in flight for many ticks is
+            // not. Reported, not acted on: see the latch declaration.
+            logger.warn(
+              {
+                inFlightMs: Date.now() - executionWorkspaceCollectorStartedAt,
+                warnAfterMs: HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS,
+              },
+              "periodic execution-workspace collector still in flight across many ticks; workspaces are not being collected",
+            );
           }
 
           if (heartbeatSchedulerStopped) return;
