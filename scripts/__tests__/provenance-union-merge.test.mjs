@@ -60,6 +60,17 @@ test("no provenance file carries a 64-hex line (BLO-35109 AC3)", () => {
   }
 });
 
+test("PROVENANCE.md does not instruct contributors to update the deleted hash", () => {
+  // The content check above cannot see prose. A surviving "update the integrity
+  // hash" mandate sends a contributor looking for a hash that no longer exists,
+  // and the good-faith repair is to restore one, tripping the AC3 assertion.
+  assert.doesNotMatch(
+    read(`${VENDOR_DIR}/PROVENANCE.md`),
+    /must\s+update the integrity hash/i,
+    "PROVENANCE.md still mandates updating a hash BLO-35109 deleted",
+  );
+});
+
 test("the append-only log is union-merged and PROVENANCE.md is not", () => {
   const union = unionMergedPaths();
   assert.ok(
