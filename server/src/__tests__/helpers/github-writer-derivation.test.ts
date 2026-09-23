@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   declaresOnlySafeReadMethods,
+  importsFromTestHelpers,
   isSuspectedGitHubWriter,
   referencesGhFetch,
 } from "./github-writer-derivation.js";
@@ -212,6 +213,53 @@ describe("server GitHub writer derivation (PEN-3391)", () => {
         import { writeInit } from "./elsewhere.js";
         await ghFetch(url, writeInit(body));`;
       expect(isSuspectedGitHubWriter(caller)).toBe(false);
+    });
+  });
+
+  describe("the __tests__/ exclusion guard reads every import spelling", () => {
+    /**
+     * Verbatim from `productionFilesImportingTestHelpers` before this change.
+     * Same fail-first shape as `OLD_PREDICATE`: each widened spelling is
+     * asserted to slip past this one first, so the widening is measured rather
+     * than asserted.
+     */
+    const OLD_TEST_IMPORT_PREDICATE = (source: string): boolean =>
+      /from\s*"[^"]*__tests__\//.test(source);
+
+    const MISSED_SPELLINGS: ReadonlyArray<readonly [string, string]> = [
+      ["single-quoted static import", `import { seed } from '../__tests__/helpers/db.js';`],
+      ["backtick specifier", "export { seed } from `../__tests__/helpers/db.js`;"],
+      ["dynamic import", `const { seed } = await import("../__tests__/helpers/db.js");`],
+      ["single-quoted dynamic import", `await import('../__tests__/helpers/db.js');`],
+      ["side-effect import", `import "../__tests__/helpers/register.js";`],
+      ["require", `const { seed } = require("../__tests__/helpers/db.js");`],
+    ];
+
+    it.each(MISSED_SPELLINGS)("catches a %s", (_label, source) => {
+      expect(OLD_TEST_IMPORT_PREDICATE(source)).toBe(false);
+      expect(importsFromTestHelpers(source)).toBe(true);
+    });
+
+    it("still catches the double-quoted static import the old form caught", () => {
+      const source = `import { seed } from "../__tests__/helpers/db.js";`;
+      expect(OLD_TEST_IMPORT_PREDICATE(source)).toBe(true);
+      expect(importsFromTestHelpers(source)).toBe(true);
+    });
+
+    it("does not fire on a test path named in prose", () => {
+      // services/plugin-host-services.ts does exactly this. The predicate must
+      // stay empty over the real tree or its callers' assertion is vacuous, so
+      // matching `__tests__/` anywhere would be more fail-closed and less
+      // useful. This is the case that pins the boundary.
+      const source = `// See \`server/src/__tests__/plugin-events-ownership-check.test.ts\`.
+        import { helper } from "./helper.js";`;
+      expect(importsFromTestHelpers(source)).toBe(false);
+    });
+
+    it("does not fire on an unrelated import elsewhere in the file", () => {
+      const source = `import { a } from "./a.js";
+        const label = "__tests__/ is excluded from the walk";`;
+      expect(importsFromTestHelpers(source)).toBe(false);
     });
   });
 });

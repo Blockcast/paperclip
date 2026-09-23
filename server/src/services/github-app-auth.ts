@@ -1231,7 +1231,6 @@ export function gitHubIdentityFieldRedaction(value: string, field: string): stri
   return result.classes;
 }
 
-
 /**
  * Post a commit status as the GitHub App with a classified result so callers
  * can retry transient failures and surface permanent configuration/permission
