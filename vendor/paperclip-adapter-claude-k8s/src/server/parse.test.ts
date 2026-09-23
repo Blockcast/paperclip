@@ -114,6 +114,52 @@ describe("parseClaudeStreamJson", () => {
     expect(result.usage?.cachedInputTokens).toBe(50);
   });
 
+  it("reports cache writes separately from input instead of summing them in (BLO-29842)", () => {
+    // A real Anthropic result block: three input classes billed at three
+    // prices. This adapter is the claude_k8s execution path, so a run whose
+    // cache writes land in `inputTokens` prices them at 1x instead of
+    // 1.25x-2x and leaves the rate card unidentifiable for the whole fleet.
+    const lines = JSON.stringify({
+      type: "result",
+      session_id: "sess_cachewrite",
+      result: "Done",
+      subtype: "stop",
+      total_cost_usd: 0.42,
+      usage: {
+        input_tokens: 1,
+        output_tokens: 35,
+        cache_creation_input_tokens: 523,
+        cache_read_input_tokens: 46_295,
+      },
+    });
+    const result = parseClaudeStreamJson(lines);
+    expect(result.usage).toEqual({
+      inputTokens: 1,
+      outputTokens: 35,
+      cachedInputTokens: 46_295,
+      cacheCreationInputTokens: 523,
+    });
+    // The whole point of the split: cache writes must not ride inside the 1x
+    // input figure the rate card fits against.
+    expect(result.usage?.inputTokens).not.toBe(524);
+  });
+
+  it("reads an absent cache-creation field as 0, not undefined (BLO-29842)", () => {
+    // Providers that never cache-write must keep working unchanged, and the
+    // column must record 0 rather than a silently-missing key.
+    const lines = JSON.stringify({
+      type: "result",
+      session_id: "sess_nocache",
+      result: "Done",
+      subtype: "stop",
+      total_cost_usd: 0.001,
+      usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0 },
+    });
+    const result = parseClaudeStreamJson(lines);
+    expect(result.usage?.cacheCreationInputTokens).toBe(0);
+    expect(result.usage?.inputTokens).toBe(10);
+  });
+
   it("returns null cost for non-finite total_cost_usd", () => {
     const lines = [
       JSON.stringify({
