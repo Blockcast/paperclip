@@ -16,7 +16,15 @@ either field scatters one fault across four buckets and points at the adapter, w
 involved.
 
 ```
-kubectl -n paperclip get events --field-selector type=Warning
+# Record the observation window first: k8s Events are retained ~1h by default
+# (kube-apiserver --event-ttl), so a "60-minute window" is the whole retention
+# horizon and cannot be extended after the fact.
+date -u +%FT%TZ   # observation start
+kubectl -n paperclip get events \
+  --field-selector type=Warning,reason=FailedMount,involvedObject.kind=Pod \
+  --sort-by=.lastTimestamp \
+  -o custom-columns=FIRST:.firstTimestamp,LAST:.lastTimestamp,COUNT:.count,POD:.involvedObject.name,MSG:.message \
+  | grep -E 'paperclip-data|globalmount'
 ```
 
 You have this fault if you see **permission denied on a path that exists** at either site:
@@ -105,20 +113,26 @@ If that control does not return a nonzero `OOMKilled` bucket from *somewhere* in
 
 Done is **not** "nodeplugin restarted". Done is all three:
 
-- zero `FailedMount` Warning events on the claim across a 60-minute window;
+- zero `FailedMount` Warning events for pods mounting `paperclip-data` over the full
+  event-retention window (default 1h; record start/end with `date -u`), using the scoped command
+  in "Confirm you are looking at this"; a shorter window only proves a shorter window and must be
+  reported as such;
 - `Deployment/paperclip-api` reporting `Available: True` with `readyReplicas: 2`;
 - a recorded answer on what the restarts' actual cause was — a refuted hypothesis recorded here is
   a deliverable, because it stops the next responder re-deriving it.
 
 ## Outcome of the 2026-08-20 → 08-22 incident
 
-Recorded 2026-08-22T~06:5xZ, closing the third `Verify` bullet above.
+Recorded 2026-08-22T~06:5xZ, closing the second and third `Verify` bullets; the first is satisfied
+only to the ~55-min retention bound recorded below.
 
 **The fault cleared on its own, with no node-level remediation performed.** Measured at 06:5xZ:
 
-- Zero `lstat …/globalmount: permission denied` events in the `paperclip` namespace across the
-  ~55-minute Warning window then visible (05:55Z–06:50Z). The last EACCES anyone recorded was
-  03:37:50Z.
+- Observation window 2026-08-22T05:55Z to 06:50Z (~55 min, bounded by event retention at the time
+  of reading, NOT a full 60 min): zero `FailedMount` / `lstat …/globalmount: permission denied`
+  Warning events in the `paperclip` namespace. Command used at the time was the unscoped
+  `get events --field-selector type=Warning` (the scoped form above was added afterwards). Last
+  EACCES recorded anywhere: 03:37:50Z, i.e. >3h before window start, which is the stronger datum.
 - `Deployment/paperclip-api`: `Available: True`, `readyReplicas: 2`, condition
   `lastTransitionTime: 2026-08-22T04:37:04Z` — it recovered ~14 min after the last status comment
   claiming 16.8h of degradation, and before anyone acted on the asks.
