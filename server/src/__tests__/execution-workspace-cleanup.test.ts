@@ -495,4 +495,96 @@ describeEmbeddedPostgres("reconcileExecutionWorkspaceCleanup", () => {
     const [row] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, id));
     expect(row?.cleanupReason).toBe("workspace_validation_failed");
   });
+
+
+  it("never defers a row archived after it was selected, so the retained census stays true", async () => {
+    // The evidence rule on the THIRD writer. `selectEligible` excludes archived
+    // rows, so the only way `deferCandidate` can see one is the window between
+    // selection and the defer write — which is exactly what two overlapping
+    // passes produce: the leading pass archives a row it proved removed while
+    // the trailing pass is still inspecting the tree underneath it.
+    //
+    // `deferCandidate` deliberately does not set `status`, so without the guard
+    // the row ends `archived` while carrying `retained_dirty`: a tree that was
+    // provably removed, recorded in the `cleanup_reason like 'retained_%'`
+    // census as one the collector chose to keep. That census is this
+    // collector's own observability deliverable, so the corruption is silent in
+    // exactly the place we would look to detect it.
+    //
+    // The window is forced rather than raced: the db handed to the service
+    // archives the row the moment the candidate query resolves, which is
+    // deterministic where a real overlap would be timing-dependent.
+    const { repo } = createRepoWithRemote();
+    const worktreePath = path.join(path.dirname(repo), "wt-archived-midpass");
+    const id = randomUUID();
+    await addOwnedWorktree({ repo, worktreePath, branchName: "wt-archived-midpass", executionWorkspaceId: id });
+    // Dirty, so the pass takes the defer path rather than removing the tree.
+    fs.writeFileSync(path.join(worktreePath, "README.md"), "unsaved work\n", "utf8");
+    await db.insert(executionWorkspaces).values({
+      id,
+      companyId,
+      projectId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "wt-archived-midpass",
+      status: "active",
+      cwd: worktreePath,
+      providerType: "git_worktree",
+      providerRef: worktreePath,
+      branchName: "wt-archived-midpass",
+      cleanupEligibleAt: hourAgo(),
+      lastUsedAt: hourAgo(),
+    });
+
+    let archived = false;
+    const archiveOnce = async () => {
+      if (archived) return;
+      archived = true;
+      await db.update(executionWorkspaces)
+        .set({ status: "archived", cleanupReason: "workspace_validation_failed" })
+        .where(eq(executionWorkspaces.id, id));
+    };
+    // Drizzle builders are chainable thenables, so the hook has to survive
+    // `.from().where().orderBy().limit()`. `then` is read off the TARGET, not
+    // the proxy, or awaiting it would re-enter this trap forever.
+    const archiveWhenSelectResolves = (builder: any): any => new Proxy(builder, {
+      get(target, prop, receiver) {
+        if (prop === "then") {
+          return (onOk: any, onErr: any) =>
+            Reflect.get(target, "then").call(target, async (rows: unknown) => {
+              await archiveOnce();
+              return rows;
+            }).then(onOk, onErr);
+        }
+        const value = Reflect.get(target, prop, receiver);
+        if (typeof value !== "function") return value;
+        return (...args: unknown[]) => {
+          const out = value.apply(target, args);
+          return out && typeof out === "object" ? archiveWhenSelectResolves(out) : out;
+        };
+      },
+    });
+    const racingDb = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop === "select") {
+          return (...args: unknown[]) =>
+            archiveWhenSelectResolves((target as any).select(...args));
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    }) as typeof db;
+
+    const result = await executionWorkspaceCleanupService(racingDb)
+      .reconcileExecutionWorkspaceCleanup();
+
+    // The pass really did reach the defer path — otherwise this asserts nothing.
+    expect(archived).toBe(true);
+    expect(result.skipped).toBe(1);
+    expect(result.collected).toBe(0);
+
+    const [row] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, id));
+    expect(row?.status).toBe("archived");
+    // The archive's own reason survives; no `retained_*` stamp is layered onto it.
+    expect(row?.cleanupReason).toBe("workspace_validation_failed");
+  });
 });

@@ -226,6 +226,20 @@ export function executionWorkspaceCleanupService(db: Db) {
      * Retained rows stay visible — each logs every window, and
      * `cleanup_reason like 'retained_%'` is a one-query census of the subset
      * the collector is choosing not to reclaim.
+     *
+     * `ne(status, 'archived')` is the same evidence rule the other two writers
+     * carry (`:124`, `:171`), applied to the third. This writer deliberately
+     * does not set `status`, so without it a defer landing after an archive
+     * leaves the row `archived` while carrying `retained_*` — a tree that was
+     * provably removed, recorded in the census above as one the collector chose
+     * to keep. `selectEligible` excludes archived rows, so nothing leaks; what
+     * degrades is the census itself, which is this collector's own
+     * observability deliverable.
+     *
+     * The caller-side latch should keep two passes from overlapping in the
+     * first place. This is the same rule stated at the write, so the census
+     * cannot be corrupted by any future writer that reaches this path from
+     * somewhere the latch does not cover.
      */
     const deferCandidate = async (id: string, reason: string) => {
       await db
@@ -235,7 +249,10 @@ export function executionWorkspaceCleanupService(db: Db) {
           cleanupReason: `retained_${reason}`,
           updatedAt: now,
         })
-        .where(eq(executionWorkspaces.id, id));
+        .where(and(
+          eq(executionWorkspaces.id, id),
+          ne(executionWorkspaces.status, "archived"),
+        ));
     };
 
     for (const candidate of candidates) {
