@@ -32300,15 +32300,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               : "failed";
 
       // BLO-29842: this is the ONLY writer of `usage_json`, so it defines the
-      // spellings any reader of that blob can encounter. For cache creation
+      // spellings a reader can encounter on rows it wrote. For cache creation
       // there are exactly two, both camelCase: `cacheCreationInputTokens` (via
       // the `normalizedUsage` spread) and `rawCacheCreationInputTokens` below.
       // Snake_case — `cache_creation_input_tokens` — is the *Anthropic API*
-      // field name; adapters normalize it away at the boundary (claude-local
-      // parse.ts / execute.ts) and it never reaches this object. Readers that
-      // fall back to it, or to `raw_cache_creation_input_tokens`, are reading a
-      // key this blob cannot carry. Extend this list here if that changes,
-      // rather than guessing a wider one at each read site.
+      // field name; adapters normalize it away at the boundary, so this writer
+      // never emits it. The snake_case arms at the read sites are therefore
+      // DEFENSIVE, not reachable-from-here: the input/cached/output legs have
+      // carried them since before this change, and cache creation matches that
+      // shape rather than being the one leg of four that drops them. Extend
+      // this list when the emitted shape changes, rather than widening a read
+      // site to a guess.
       const usageJson =
         normalizedUsage || adapterResult.costUsd != null
           ? ({

@@ -1898,13 +1898,18 @@ export function summarizeAcpxTurnUsage(input: {
   const cachedReadTokens = Math.max(0, Math.floor(asNumber(breakdown?.cachedReadTokens, 0)));
   const cachedWriteTokens = Math.max(0, Math.floor(asNumber(breakdown?.cachedWriteTokens, 0)));
   const hasTokens = inputTokens > 0 || outputTokens > 0 || cachedReadTokens > 0 || cachedWriteTokens > 0;
-  // Cache-write tokens are prompt tokens the provider billed to create cache
-  // entries; UsageSummary has no dedicated field, so count them as input.
+  // BLO-29842: cache writes are prompt tokens the provider billed to create
+  // cache entries, at 1.25x-2x — not the 1x `inputTokens` is fitted at. They
+  // used to be folded into `inputTokens` because `UsageSummary` had nowhere
+  // else to put them; it now has `cacheCreationInputTokens`, so they go there.
+  // Folding them back in reprices them at 1x and makes the rate card
+  // unidentifiable for every acpx-routed run (acpx_local defaults to Claude).
   const usage: UsageSummary | null = hasTokens
     ? {
-        inputTokens: inputTokens + cachedWriteTokens,
+        inputTokens,
         outputTokens,
         cachedInputTokens: cachedReadTokens,
+        cacheCreationInputTokens: cachedWriteTokens,
       }
     : null;
   const usageDetail = breakdown
