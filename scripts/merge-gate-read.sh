@@ -16,9 +16,10 @@
 #                          blocking (BLO-34035), and not evidence of a review.
 #   MALFORMED            — an un-expanded `${{` workflow template, i.e. a
 #                          registration that can never report. NOT blocking.
-# LOOKUP-FAILED is blocking but is NOT a label: `:71` emits it in the CONCLUSION
-# column ($3) under a $1 of STOP. A consumer filtering $1 for blocking labels
-# must match STOP and will never see it; listing it here as a label was wrong.
+# LOOKUP-FAILED is blocking but is NOT a label: require_sha's printf emits it
+# in the CONCLUSION column ($3) under a $1 of STOP. A consumer filtering $1
+# for blocking labels must match STOP and will never see it; listing it here
+# as a label was wrong.
 #
 # The VERDICT IS THE LINES, never $?. rc 1 IMPLIES the ABSENT line, but NOT the
 # converse: `grep -v` returns 0 whenever any row survives, while the survivor
@@ -46,7 +47,8 @@ extract() { # stdin: check-runs API body (one object per page) -> stdout: rows
   # nullable in the REST schema and is set by whichever App published the run,
   # not by this repo. Failure direction is toward GREEN.
   # The fallback carries `.app.slug`, not a constant: a constant collapses the
-  # `:50` dedup key to name-only for every App-published row, which is exactly
+  # name+run dedup key (the `seen` filter below) to name-only for every
+  # App-published row, which is exactly
   # the masking BLO-34114 fixed for the workflow lanes.
   jq -r '.check_runs[]|[.name,(.conclusion // .status),(.completed_at // .started_at // "-"),
                         ((.details_url // "" | capture("runs/(?<r>[0-9]+)").r)
@@ -290,8 +292,8 @@ DEAD=$(gh api "repos/$R/actions/runs?head_sha=$H&per_page=100" --paginate \
 
 # BOTH surfaces paginate. GitHub's default page size is 30, so an unpaginated
 # status fetch silently drops the 31st context onward — and a dropped `failure`
-# prints no STOP. The ABSENT guard cannot catch it: `:52` excludes status rows
-# from the survivor count, so one surviving check-run keeps the guard quiet.
+# prints no STOP. The ABSENT guard cannot catch it: `$4!="status"` excludes
+# status rows from the survivor count, so one surviving check-run keeps the guard quiet.
 { gh api "repos/$R/commits/$H/status?per_page=100" --paginate | status_extract
   gh api "repos/$R/commits/$H/check-runs?per_page=100" --paginate | extract
 } | verdicts "$DEAD"
