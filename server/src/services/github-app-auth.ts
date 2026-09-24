@@ -24,6 +24,7 @@ import { scrubGitHubEgressText } from "@paperclipai/adapter-utils";
 import { loadConfig } from "../config.js";
 import {
   extractAllyReviewedHeadSha,
+  extractAllyReviewedHeadShas,
   hasAllyConsolidatedReviewHeading,
 } from "./ally-review-detection.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
@@ -492,6 +493,54 @@ const commentAttestsHead = (body: string, head: string): boolean =>
   hasAllyConsolidatedReviewHeading(body) && extractAllyReviewedHeadSha(body) === head;
 
 /**
+ * Whether a formal review's own body attests a head OTHER than the one GitHub
+ * stamped on it — in which case `commit_id` is not evidence that this reviewer
+ * read this tree.
+ *
+ * `commit_id` IS NOT AN IMMUTABLE RECORD OF WHAT WAS REVIEWED. Measured on
+ * `Blockcast/paperclip` 2026-09-21 (PEN-3413):
+ *
+ *  - #1936 review 5258246839, submitted 2026-09-19T23:12:46Z, body attests
+ *    `3a019931`. Its `commit_id` reads `f6bbb959` — a commit not authored
+ *    until 2026-09-20T22:23:44Z and force-pushed at 22:33:50Z, i.e. 23h11m
+ *    AFTER the review was submitted.
+ *  - #1937 review 5261008302, submitted 2026-09-20T16:03:47Z, body attests
+ *    `3d9cfb2b`. Its `commit_id` reads `c890164a`, authored 2026-09-21T
+ *    02:19:58Z and force-pushed at 02:21:25Z — 10h16m after submission.
+ *
+ * Both are `APPROVED`, both by the App identity, and #1936 was sitting in the
+ * `master` merge queue carrying one. A commit that did not yet exist at submit
+ * time cannot have been stamped at submit time, so this is GitHub moving the
+ * pointer afterwards — not the reviewer racing a push, which was the competing
+ * hypothesis. In both cases the attested commit is `diverged` from the new head
+ * (orphaned by the force-push) and only the review sitting on the OLD TIP moved;
+ * the older intermediate reviews on the same two PRs kept their stamps. Note the
+ * `reviewed` entry in the issue timeline renders the same rewritten field, so it
+ * corroborates nothing.
+ *
+ * The consequence that decides where the fix belongs: no producer-side change —
+ * re-reading the head immediately before submit, pinning the SHA — can prevent a
+ * rewrite that happens hours later. Only a consumer can refuse it.
+ * `pr-review-head-attestation.ts` and `evidence-truth.ts` already refuse to read
+ * `commit_id` as an attestation for this reason; this was the remaining consumer
+ * that did.
+ *
+ * NARROW ON PURPOSE — read the BLO-28920 header below before widening it. A body
+ * carrying NO attestation still passes on `commit_id` alone, exactly as before:
+ * requiring an attestation to be PRESENT would fail every bodyless or
+ * off-template App review, which is precisely the false `pr_review_output_missing`
+ * regression that header exists to prevent. Only a body that names a *different*
+ * head is refused. A body naming several distinct heads is refused too, on the
+ * same rule the grammar's exactly-one check encodes: a self-contradictory record
+ * vouches for nothing.
+ */
+const reviewBodyContradictsHead = (body: string, head: string): boolean => {
+  const attested = extractAllyReviewedHeadShas(body);
+  if (attested.length === 0) return false;
+  return !(attested.length === 1 && attested[0] === head);
+};
+
+/**
  * Page cap for BOTH evidence surfaces below. Deliberately far smaller than
  * `GITHUB_COMMENT_PAGINATION_HARD_LIMIT_PAGES` (500), because this predicate runs
  * on every reviewer-run completion and so its request budget is a hot path,
@@ -695,9 +744,10 @@ export async function githubListReviewerSurfacesAtPr(input: {
  * Found when the configured App identity left EITHER surface at the exact head,
  * because Ally posts on either and each surface is individually blind to the
  * other:
- *  - a formal SUBMITTED review with `commit_id === headSha`, in any submitted
- *    state (`COMMENTED` / `CHANGES_REQUESTED` / `APPROVED` / `DISMISSED` — a
- *    dismissed review still happened, it was only disposed of afterwards); or
+ *  - a formal SUBMITTED review with `commit_id === headSha` whose body does not
+ *    attest a *different* head, in any submitted state (`COMMENTED` /
+ *    `CHANGES_REQUESTED` / `APPROVED` / `DISMISSED` — a dismissed review still
+ *    happened, it was only disposed of afterwards); or
  *  - an issue comment carrying the canonical consolidated-review heading and a
  *    single `Reviewed head:` attestation equal to that head (comment-mode
  *    reviews file no review object and so carry no `commit_id`).
@@ -706,6 +756,12 @@ export async function githubListReviewerSurfacesAtPr(input: {
  *  - the same-slug bare user seat (a distinct principal — see
  *    `githubReviewerIdentityMatches`);
  *  - any review at a head other than the required one;
+ *  - a review whose `commit_id` matches but whose own body attests a different
+ *    head. GitHub rewrites `commit_id` onto the new head when a force-push
+ *    orphans the reviewed commit, hours after submission, so the stamp alone
+ *    can credit an approval of a tree the reviewer never read — see
+ *    `reviewBodyContradictsHead` for the measurement (PEN-3413). An *unattested*
+ *    body is still accepted on the stamp alone; see the narrowness note there;
  *  - a `PENDING` review. That is an *unsubmitted draft*, returned by GitHub only
  *    to the identity that created it — which is this App — and it already
  *    carries a `commit_id`. The MCP review flow is `create pending` → `add
@@ -874,7 +930,13 @@ export async function githubHasReviewerEvidenceForPr(input: {
   // above.
   const reviews = await listReviewerReviews(args);
   if ("error" in reviews) return { error: reviews.error };
-  if (reviews.some((review) => review.commitId === headSha)) return { found: true, via: "review" };
+  if (
+    reviews.some(
+      (review) => review.commitId === headSha && !reviewBodyContradictsHead(review.body, headSha),
+    )
+  ) {
+    return { found: true, via: "review" };
+  }
 
   // 2) Comment-shaped reviews — the second surface. Ally frequently reviews by
   // posting a consolidated comment and files no review object at all, so a PR it

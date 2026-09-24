@@ -3,6 +3,7 @@ import {
   classifyPriorDisposition,
   extractAllyPriorFindingDispositions,
   extractAllyReviewedHeadSha,
+  extractAllyReviewedHeadShas,
   hasActionablePrReviewFeedback,
   hasAllyConsolidatedReviewHeading,
 } from "./ally-review-detection.js";
@@ -18,6 +19,39 @@ ${attest}
 ${extra}
 ### Recommended Action
 Land.`;
+
+// PEN-3413. The singular form deliberately collapses "no attestation" and
+// "several attestations" into null, which is right for a consumer that must
+// fail closed on ambiguity. A consumer asking whether a body CONTRADICTS the
+// head GitHub stamped on the review has to separate those two, so it reads the
+// plural form instead.
+describe("extractAllyReviewedHeadShas", () => {
+  it("returns nothing for a body that attests no head", () => {
+    expect(extractAllyReviewedHeadShas("Looks fine to me.")).toEqual([]);
+    expect(extractAllyReviewedHeadShas(null)).toEqual([]);
+  });
+
+  it("returns the single attested head", () => {
+    expect(extractAllyReviewedHeadShas(body(`Reviewed head: ${SHA}`))).toEqual([SHA]);
+  });
+
+  it("returns every distinct head where the singular form collapses to null", () => {
+    const two = body(`Reviewed head: ${SHA}\nReviewed head: ${OTHER}`);
+    expect(extractAllyReviewedHeadSha(two)).toBeNull();
+    expect(extractAllyReviewedHeadShas(two)).toEqual([SHA, OTHER]);
+  });
+
+  it("de-duplicates a head attested twice — repetition is not contradiction", () => {
+    expect(extractAllyReviewedHeadShas(body(`Reviewed head: ${SHA}\nReviewed head: ${SHA}`))).toEqual([
+      SHA,
+    ]);
+  });
+
+  it("ignores an attestation inside a fenced quote, as the singular form does", () => {
+    const quoted = body(`Reviewed head: ${SHA}`, `\`\`\`\nReviewed head: ${OTHER}\n\`\`\``);
+    expect(extractAllyReviewedHeadShas(quoted)).toEqual([SHA]);
+  });
+});
 
 describe("extractAllyReviewedHeadSha", () => {
   it("accepts the plain form", () => {

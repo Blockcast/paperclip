@@ -178,6 +178,34 @@ export function extractAllyReviewedHeadSha(body: string | null | undefined): str
   return attestations.length === 1 ? attestations[0]! : null;
 }
 
+/**
+ * Every DISTINCT head this body attests, in first-seen order (PEN-3413).
+ *
+ * Deliberately a second function rather than a refactor of the singular form
+ * above, because the two answer different questions and the difference is one
+ * bit that the singular form throws away. `extractAllyReviewedHeadSha` asks
+ * "does this body vouch for exactly one head?" and returns null for BOTH zero
+ * and several — right for a consumer that must fail closed on ambiguity, and
+ * relied on by three of them. A consumer asking instead "does this body
+ * CONTRADICT the head GitHub stamped on the review?" must separate those: an
+ * unattested body contradicts nothing and must keep its existing treatment,
+ * whereas a body naming some other head contradicts loudly.
+ *
+ * Distinctness, not raw count, is what that consumer needs — a body repeating
+ * one head twice is redundant, not self-contradictory. The singular form is
+ * left keyed on the raw count so its callers' fail-closed behaviour is
+ * untouched.
+ */
+export function extractAllyReviewedHeadShas(body: string | null | undefined): string[] {
+  const text = emittedReviewText(body);
+  if (text === null) return [];
+  const seen = new Set<string>();
+  for (const match of text.matchAll(REVIEWED_HEAD_ATTESTATION_PATTERN)) {
+    seen.add(match[1]!.toLowerCase());
+  }
+  return [...seen];
+}
+
 // Negation cues flip an otherwise-actionable bare phrase into a confirmation
 // that no follow-up is required. Limit the lookback to the local sentence so
 // an unrelated earlier negation does not mask a real later finding.

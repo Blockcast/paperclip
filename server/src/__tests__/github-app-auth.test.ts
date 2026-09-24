@@ -443,6 +443,130 @@ describe("githubHasReviewerEvidenceForPr", () => {
     });
   });
 
+  // PEN-3413. `commit_id` is not an immutable record of what was reviewed:
+  // GitHub rewrites it onto the new head when a force-push orphans the
+  // reviewed commit, HOURS after submission. Measured on Blockcast/paperclip
+  // #1936 review 5258246839 — submitted 2026-09-19T23:12:46Z attesting
+  // 3a019931, stamped f6bbb959, a commit not authored until the following day
+  // (+23h11m) — and #1937 review 5261008302 (+10h16m). Both APPROVED, both by
+  // the App identity, #1936 queued to merge on one. So the stamp alone can
+  // credit an approval of a tree the reviewer never read, and no producer-side
+  // pin can prevent a rewrite that lands after the review does.
+  it("PEN-3413: rejects a stamped-at-head review whose body attests a different head", async () => {
+    setCreds();
+    const reviewedHead = "3a0199316c9335b1664804e97f1339d8e6c85a84";
+    stubGithub({
+      reviews: [
+        {
+          user: { login: "allyblockcast[bot]" },
+          commit_id: headSha,
+          state: "APPROVED",
+          body: `## Ally — Consolidated PR Review\n\nReviewed head: ${reviewedHead}\n\nNo findings.`,
+        },
+      ],
+    });
+
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      found: false,
+    });
+  });
+
+  // Positive control for the case above: the ONLY difference is which head the
+  // body names. Without this, the rejection above would also pass if the guard
+  // had simply broken every bodied review.
+  it("PEN-3413: still accepts a stamped-at-head review whose body attests that same head", async () => {
+    setCreds();
+    stubGithub({
+      reviews: [
+        {
+          user: { login: "allyblockcast[bot]" },
+          commit_id: headSha,
+          state: "APPROVED",
+          body: `## Ally — Consolidated PR Review\n\nReviewed head: ${headSha}\n\nNo findings.`,
+        },
+      ],
+    });
+
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      found: true,
+      via: "review",
+    });
+  });
+
+  // The narrowness is the point, and it is the BLO-28920 direction. Requiring
+  // the attestation to be PRESENT would fail every bodyless or off-template App
+  // review — reviewer runs that genuinely posted, failed `pr_review_output_missing`
+  // and retried in a paid loop. Only a body naming a DIFFERENT head is refused.
+  it("PEN-3413: still accepts a stamped-at-head review whose body attests no head at all", async () => {
+    setCreds();
+    stubGithub({
+      reviews: [
+        {
+          user: { login: "allyblockcast[bot]" },
+          commit_id: headSha,
+          state: "COMMENTED",
+          body: "Looks fine to me.",
+        },
+      ],
+    });
+
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      found: true,
+      via: "review",
+    });
+  });
+
+  // A self-contradictory record vouches for nothing — the same fail-closed rule
+  // the grammar's exactly-one attestation check already encodes.
+  it("PEN-3413: rejects a stamped-at-head review whose body attests several distinct heads", async () => {
+    setCreds();
+    const other = "3a0199316c9335b1664804e97f1339d8e6c85a84";
+    stubGithub({
+      reviews: [
+        {
+          user: { login: "allyblockcast[bot]" },
+          commit_id: headSha,
+          state: "APPROVED",
+          body:
+            `## Ally — Consolidated PR Review\n\nReviewed head: ${headSha}\n`
+            + `Reviewed head: ${other}\n\nNo findings.`,
+        },
+      ],
+    });
+
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      found: false,
+    });
+  });
+
+  // A re-anchored review is refused, not poisonous: a genuine review of this
+  // head sitting beside it still attests. Both #1936 and #1937 are in exactly
+  // this state now, each having been re-reviewed at its current head.
+  it("PEN-3413: a re-anchored review does not mask a sibling review that attests this head", async () => {
+    setCreds();
+    stubGithub({
+      reviews: [
+        {
+          user: { login: "allyblockcast[bot]" },
+          commit_id: headSha,
+          state: "APPROVED",
+          body: `## Ally — Consolidated PR Review\n\nReviewed head: 3a0199316c9335b1664804e97f1339d8e6c85a84\n`,
+        },
+        {
+          user: { login: "allyblockcast[bot]" },
+          commit_id: headSha,
+          state: "APPROVED",
+          body: `## Ally — Consolidated PR Review\n\nReviewed head: ${headSha}\n\nNo findings.`,
+        },
+      ],
+    });
+
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      found: true,
+      via: "review",
+    });
+  });
+
   it("does not let an approved same-slug user-seat review satisfy the App gate", async () => {
     setCreds();
     stubGithub({
