@@ -926,6 +926,7 @@ describe("merge-gate reader", () => {
       ["an abbreviation", "4e62193"],
       ["an empty string", ""],
       ["41 hex chars", "4e62193a169ece35ff5c7076362ecb1aaa53c1eef"],
+      ["40 non-hex chars", "z".repeat(40)],
     ]) {
       it(`stops with LOOKUP-FAILED on ${label}`, () => {
         const { rc, out } = shaGuard(bad);
