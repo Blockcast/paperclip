@@ -1439,6 +1439,8 @@ class TestDeferralHeaderReportsMeasuredDelivery(_RendersMainSummary, unittest.Te
 
         self.assertIn("3 could not be read", summary)
         self.assertIn("1 PR(s) were read in full and failed on the re-fire WRITE", summary)
+        self.assertNotIn("is trustworthy", summary)
+        self.assertIn("they are not what makes `alarming=", summary)
 
     def test_the_write_clause_states_the_verdict_is_exact_not_that_they_are_counted(self):
         """Re-fire eligibility (STALL_THRESHOLD) is below the alarm threshold,

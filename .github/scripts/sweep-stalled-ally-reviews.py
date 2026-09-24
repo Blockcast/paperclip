@@ -1180,6 +1180,8 @@ def main(argv=None):
                     # `failed` count to "could not be read" told the operator
                     # to discount the one number that was still trustworthy,
                     # on precisely the run where it is the only signal left.
+                    # The COUNT is only trustworthy when no read failed, so the
+                    # write clause claims it only when read_failures == 0.
                     read_failures = len(failed) - len(refire_write_failures)
                     handle.write(
                         "**This run is DEGRADED** (%d of %d failed)."
@@ -1196,10 +1198,18 @@ def main(argv=None):
                     if refire_write_failures:
                         handle.write(
                             " %d PR(s) were read in full and failed on the re-fire WRITE, "
-                            "so their alarm verdict is exact and `alarming=%d` is "
-                            "trustworthy; the remedy is on the write side, not in the "
-                            "read budget."
-                            % (len(refire_write_failures), len(alarming))
+                            "so their alarm verdict is exact %s is on the write side, "
+                            "not in the read budget."
+                            % (
+                                len(refire_write_failures),
+                                (
+                                    "and `alarming=%d` is trustworthy; the remedy"
+                                    if read_failures == 0
+                                    else "-- they are not what makes `alarming=%d` "
+                                    "unreliable; the remedy for them"
+                                )
+                                % len(alarming),
+                            )
                         )
                     handle.write("\n\n")
                 handle.write("| PR | head | reason |\n|---|---|---|\n")
