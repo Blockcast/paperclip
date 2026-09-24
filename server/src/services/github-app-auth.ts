@@ -1209,9 +1209,14 @@ export function scrubOutboundGitHubText(value: string, field: string): string {
  *   when the scrub is a byte-for-byte no-op. Callers may therefore keep using
  *   the raw value as a key, and are provably keying on what was published.
  *
- * The failure is non-retryable by construction: the same input scrubs the same
- * way every time, so a retry cannot succeed. It is logged at `error` rather
- * than `warn` because, unlike a redaction, no write happened.
+ * The refusal is deterministic: the same input scrubs the same way every time,
+ * so a retry cannot succeed. That is a property of this function, not a
+ * guarantee that callers stop retrying. The review-gate delivery loop
+ * (`github-review-gate-authority.ts`) re-queues every non-ok result with
+ * backoff and has no terminal failure state, so a refused context there is
+ * retried indefinitely, as `review_gate_persisted_payload_invalid` and
+ * `review_gate_pull_payload_invalid` already are (PEN-3504). It is logged at
+ * `error` rather than `warn` because, unlike a redaction, no write happened.
  *
  * A caller reaching this has a configuration bug — every context in this repo
  * is a fixed operator-set literal — so the refusal is a loud stop, not a

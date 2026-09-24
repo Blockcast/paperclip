@@ -332,6 +332,8 @@ async function postPendingStatus(input: {
   // `context` is the exception, and for the same reason as in the shared helper:
   // it is the status's identity, so a redaction would publish under a name the
   // outbox and branch protection cannot find. Refuse instead (PEN-3391).
+  // processDelivery re-queues this like any other failure; nothing here makes
+  // it terminal yet (PEN-3504).
   if (gitHubIdentityFieldRedaction(input.row.statusContext, "commit-status context")) {
     return { ok: false, reason: "review_gate_status_context_not_publishable" };
   }
