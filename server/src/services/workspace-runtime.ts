@@ -1284,6 +1284,7 @@ type DirtyQuarantineRepairResult = {
   rescueCommitSha: string;
   fileCount: number;
   clearedInProgressOperation: GitWorktreeInProgressOperation | null;
+  quarantinedIndexLockPath: string | null;
   sourceAuditCommentId: string | null;
   claimantAuditCommentId: string | null;
 };
@@ -1543,44 +1544,132 @@ async function assertDirtyQuarantineRuntimeServicesStopped(input: {
   throw branchIncoherenceValidationFailure(input.evidence);
 }
 
-// A run killed mid-`git` leaves a 0-byte `index.lock` behind. Git will not reap
-// it because it cannot tell a dead owner from a live one on another host; a
-// Paperclip worktree is single-writer, so that ambiguity does not exist here and
-// the abandoned mutex is safe to break. Anchored on
-// `WORKSPACE_SUBMODULE_REPAIR_TIMEOUT_MS` (5m), the longest git budget in this
-// file: past 3x that ceiling no git command this process started is still alive.
-const GIT_INDEX_LOCK_STALE_MS = 15 * 60 * 1000;
+// A run killed mid-`git` leaves a 0-byte `index.lock` behind and git will not
+// reap it, because it cannot tell a dead owner from a live one. Neither can the
+// lock file: git creates it `O_CREAT|O_EXCL` at 0 bytes, does every expensive
+// step holding it (blob hashing, tree walk, object writes), and serialises the
+// index into it only in the last moment before the rename. Measured against a
+// live `git add` stalled in a clean filter, size stayed 0 and mtime stayed
+// frozen at creation for the whole run -- so "empty and old" is what a *slow
+// live writer* looks like, not what a dead one leaves behind. Neither size nor
+// mtime is evidence of abandonment, and this guard does not treat them as such.
+//
+// An open descriptor is evidence: git holds the lock open from creation to
+// rename, so `lockHolderPids` below is a positive liveness signal rather than
+// an absence of one. Measured on both commands that plausibly run long here --
+// `git add` (clean filter) and `git checkout` (smudge filter, a separate
+// unpack_trees path) -- each showed a live holding fd while size stayed 0 and
+// mtime stayed frozen. It sees the writers that actually threaten this worktree
+// -- the agent's own shell `git`, `git gc`/`maintenance`, a sibling repair. It
+// cannot see a holder under another uid or on another pod sharing the volume,
+// and nothing here can; the age floor is a mitigation for that residue,
+// deliberately not the safety argument. The break is a rename, not a delete, so
+// that residue stays recoverable.
+export const GIT_INDEX_LOCK_STALE_MS = 15 * 60 * 1000;
 
-// Every refusal below keeps "index lock" in the message so
+// Git holds `index.lock` open from creation to rename, so a descriptor naming
+// it is a live owner. Returns null when `/proc` cannot be walked at all: that
+// is "holder unknown", which must not read as "no holder".
+// ponytail: O(processes x fds) scan, fine on a repair path that runs once per
+// incoherent workspace; switch to a targeted inode match if it ever gets hot.
+async function lockHolderPids(lockPath: string): Promise<string[] | null> {
+  // `/proc/*/fd` readlinks are fully canonical, but `indexLockPath` is built
+  // with `path.resolve`, which does not resolve symlinks. Comparing the two
+  // directly would silently match nothing whenever any component of the
+  // worktree path is a symlink -- a miss that reads as "no holder", which is
+  // the one direction this scan must never fail in.
+  const canonicalLockPath = await fs.realpath(lockPath).catch(() => lockPath);
+  const entries = await fs.readdir("/proc").catch(() => null);
+  if (!entries) return null;
+  const holders: string[] = [];
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    // Unreadable (another uid, or exited mid-scan) -- skip rather than fail the
+    // whole scan; the age floor is what covers the holders we cannot read.
+    const fds = await fs.readdir(`/proc/${entry}/fd`).catch(() => null);
+    if (!fds) continue;
+    for (const fd of fds) {
+      const target = await fs.readlink(`/proc/${entry}/fd/${fd}`).catch(() => null);
+      if (target === canonicalLockPath) {
+        holders.push(entry);
+        break;
+      }
+    }
+  }
+  return holders;
+}
+
+// Returns the path of the lock it broke, or null when there was nothing to
+// break. Every refusal below keeps "index lock" in the message so
 // `formatDirtyQuarantineFailure` still reports it as index contention.
-async function assertGitIndexIsUnlocked(worktreePath: string) {
+async function ensureGitIndexIsUnlocked(worktreePath: string): Promise<string | null> {
   const rawLockPath = await runGit(["rev-parse", "--git-path", "index.lock"], worktreePath)
     .catch(() => null);
-  if (!rawLockPath) return;
+  if (!rawLockPath) return null;
   // `--git-path` answers relative to the worktree for a normal repo and absolute
   // for a linked one. Resolving against `worktreePath` rather than the process
   // cwd is what makes the `unlink` below point at the lock we just stat'd.
   const indexLockPath = path.isAbsolute(rawLockPath) ? rawLockPath : path.resolve(worktreePath, rawLockPath);
-  const lockStat = await fs.stat(indexLockPath).catch(() => null);
-  if (!lockStat) return;
+  const lockStat = await fs.stat(indexLockPath).catch((error: unknown) => {
+    // Only "not there" is an unlocked index. EACCES/EIO is a lock we cannot
+    // vet, and an unvettable lock has to refuse rather than read as absent.
+    if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") return null;
+    throw new Error(
+      `git index lock at ${indexLockPath} could not be read: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  });
+  if (!lockStat) return null;
 
-  // A non-empty lock is a real in-flight index, not a mutex. Never remove it.
+  // Serialised index state, written just before the rename. Never remove it.
   if (lockStat.size > 0) {
     throw new Error(
-      `git index lock exists at ${indexLockPath} and holds ${lockStat.size} bytes of in-flight index state`,
+      `git index lock exists at ${indexLockPath} and holds ${lockStat.size} bytes of serialised index state`,
     );
   }
+
+  const holders = await lockHolderPids(indexLockPath);
+  if (!holders) {
+    throw new Error(
+      `git index lock exists at ${indexLockPath} and its holder could not be determined because /proc is unreadable`,
+    );
+  }
+  if (holders.length > 0) {
+    throw new Error(
+      `git index lock exists at ${indexLockPath} and is held open by live pid ${holders.join(", ")}`,
+    );
+  }
+
+  // A future mtime yields a negative age and refuses here. That is deliberate,
+  // not incidental: a lock stamped by a clock we do not share is not one to
+  // break on an age argument.
   const ageMs = Date.now() - lockStat.mtimeMs;
   if (ageMs < GIT_INDEX_LOCK_STALE_MS) {
     throw new Error(
-      `git index lock exists at ${indexLockPath} and was written ${Math.round(ageMs / 1000)}s ago, under the ${Math.round(GIT_INDEX_LOCK_STALE_MS / 60000)}m staleness threshold`,
+      `git index lock exists at ${indexLockPath} and was created ${Math.round(ageMs / 1000)}s ago, under the ${Math.round(GIT_INDEX_LOCK_STALE_MS / 60000)}m staleness floor`,
     );
   }
-  await fs.unlink(indexLockPath).catch((error: unknown) => {
+
+  // Move it aside rather than delete it. The verdict above is evidential, not
+  // certain -- a holder under another uid or on another pod sharing the volume
+  // is invisible to the scan -- and this is the only irreversible act on the
+  // repair path. A rename releases the mutex exactly as an unlink does, and
+  // costs one inode to keep the evidence if the verdict was wrong.
+  const quarantinedPath = `${indexLockPath}.paperclip-broken-${formatUtcBranchTimestamp()}`;
+  let broken = true;
+  await fs.rename(indexLockPath, quarantinedPath).catch((error: unknown) => {
+    // Gone between the stat and here: its owner finished normally, or a sibling
+    // repair won the race. Either way the index is unlocked, which is the whole
+    // post-condition -- turning that into a failure would reinstate the
+    // permanent park this guard exists to remove.
+    if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") {
+      broken = false;
+      return;
+    }
     throw new Error(
-      `git index lock exists at ${indexLockPath} and could not be removed: ${error instanceof Error ? error.message : String(error)}`,
+      `git index lock exists at ${indexLockPath} and could not be moved aside: ${error instanceof Error ? error.message : String(error)}`,
     );
   });
+  return broken ? quarantinedPath : null;
 }
 
 function fingerprintWorkspaceBranchIncoherence(input: {
@@ -2139,7 +2228,7 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
   let rescueBranchCreated = false;
   let expectedBranchRestored = false;
   try {
-    await assertGitIndexIsUnlocked(input.worktreePath);
+    const quarantinedIndexLockPath = await ensureGitIndexIsUnlocked(input.worktreePath);
     await recordGitOperation(input.recorder, {
       phase: input.phase ?? "worktree_prepare",
       args: ["checkout", "-b", rescueBranch],
@@ -2274,6 +2363,7 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
       rescueCommitSha,
       fileCount,
       clearedInProgressOperation,
+      quarantinedIndexLockPath,
       ...comments,
     };
   } catch (error) {
@@ -2524,7 +2614,7 @@ export async function ensureGitWorktreeBranchCoherent(input: {
       reconciledForward: false,
       dirtyQuarantineRepair: result,
       warnings: [
-        `Execution workspace dirty worktree state was quarantined on rescue branch "${result.rescueBranch}" (${formatShortSha(result.rescueCommitSha)}; ${result.fileCount} ${result.fileCount === 1 ? "file" : "files"}) before restoring recorded branch "${expectedBranchName}".${result.clearedInProgressOperation ? ` An interrupted git ${GIT_IN_PROGRESS_OPERATION_LABELS[result.clearedInProgressOperation]} was also cleared; its in-flight state is preserved on the rescue branch.` : ""}`,
+        `Execution workspace dirty worktree state was quarantined on rescue branch "${result.rescueBranch}" (${formatShortSha(result.rescueCommitSha)}; ${result.fileCount} ${result.fileCount === 1 ? "file" : "files"}) before restoring recorded branch "${expectedBranchName}".${result.clearedInProgressOperation ? ` An interrupted git ${GIT_IN_PROGRESS_OPERATION_LABELS[result.clearedInProgressOperation]} was also cleared; its in-flight state is preserved on the rescue branch.` : ""}${result.quarantinedIndexLockPath ? ` An abandoned 0-byte git index lock was broken first; no process held it open, and it was preserved at "${result.quarantinedIndexLockPath}".` : ""}`,
       ],
     };
   }
