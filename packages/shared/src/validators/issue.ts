@@ -919,7 +919,17 @@ export const askUserQuestionsPayloadSchema = z.object({
   version: z.literal(1),
   title: z.string().trim().max(240).nullable().optional(),
   submitLabel: z.string().trim().max(120).nullable().optional(),
-  supersedeOnUserComment: z.boolean().optional(),
+  supersedeOnUserComment: z.boolean()
+    .describe(
+      "DEFAULTS TO TRUE when omitted. While true, ANY user comment on the issue expires this "
+      + "interaction unanswered (status `expired`, outcome `superseded_by_comment`) — including a "
+      + "comment that has nothing to do with the ask. Set it to FALSE explicitly for any gate that "
+      + "must survive unrelated thread traffic: sign-offs, review verdicts, dry-run receipts, "
+      + "approvals. Leave it true only for a short-lived ask where a prose reply genuinely answers "
+      + "the question. Omitting the field does not turn it off, and a 200 does not tell you which "
+      + "you got — read it back from the create response. (BLO-35308)",
+    )
+    .optional(),
   questions: z.array(askUserQuestionsQuestionSchema).min(1).max(10),
 }).superRefine((value, ctx) => {
   const seenQuestionIds = new Set<string>();
@@ -1021,7 +1031,17 @@ export const requestConfirmationPayloadSchema = z.object({
   allowDeclineReason: z.boolean().optional().default(true),
   declineReasonPlaceholder: z.string().trim().min(1).max(240).nullable().optional(),
   detailsMarkdown: z.string().max(20000).nullable().optional(),
-  supersedeOnUserComment: z.boolean().optional(),
+  supersedeOnUserComment: z.boolean()
+    .describe(
+      "DEFAULTS TO TRUE when omitted. While true, ANY user comment on the issue expires this "
+      + "interaction unanswered (status `expired`, outcome `superseded_by_comment`) — including a "
+      + "comment that has nothing to do with the ask. Set it to FALSE explicitly for any gate that "
+      + "must survive unrelated thread traffic: sign-offs, review verdicts, dry-run receipts, "
+      + "approvals. Leave it true only for a short-lived ask where a prose reply genuinely answers "
+      + "the question. Omitting the field does not turn it off, and a 200 does not tell you which "
+      + "you got — read it back from the create response. (BLO-35308)",
+    )
+    .optional(),
   target: requestConfirmationTargetSchema.nullable().optional(),
   toolAction: requestConfirmationToolActionPayloadSchema.optional(),
 });
@@ -1051,7 +1071,17 @@ export const requestCheckboxConfirmationPayloadSchema = z.object({
   rejectReasonLabel: z.string().trim().min(1).max(160).nullable().optional(),
   allowDeclineReason: z.boolean().optional().default(true),
   declineReasonPlaceholder: z.string().trim().min(1).max(240).nullable().optional(),
-  supersedeOnUserComment: z.boolean().optional(),
+  supersedeOnUserComment: z.boolean()
+    .describe(
+      "DEFAULTS TO TRUE when omitted. While true, ANY user comment on the issue expires this "
+      + "interaction unanswered (status `expired`, outcome `superseded_by_comment`) — including a "
+      + "comment that has nothing to do with the ask. Set it to FALSE explicitly for any gate that "
+      + "must survive unrelated thread traffic: sign-offs, review verdicts, dry-run receipts, "
+      + "approvals. Leave it true only for a short-lived ask where a prose reply genuinely answers "
+      + "the question. Omitting the field does not turn it off, and a 200 does not tell you which "
+      + "you got — read it back from the create response. (BLO-35308)",
+    )
+    .optional(),
   target: requestConfirmationTargetSchema.nullable().optional(),
 }).superRefine((value, ctx) => {
   const optionIds = new Set<string>();
@@ -1211,7 +1241,17 @@ export const requestItemVerdictsPayloadSchema = z.object({
     .default(["reject"]),
   reasonLabel: z.string().trim().min(1).max(160).nullable().optional(),
   allowBulkApprove: z.boolean().optional().default(true),
-  supersedeOnUserComment: z.boolean().optional(),
+  supersedeOnUserComment: z.boolean()
+    .describe(
+      "DEFAULTS TO TRUE when omitted. While true, ANY user comment on the issue expires this "
+      + "interaction unanswered (status `expired`, outcome `superseded_by_comment`) — including a "
+      + "comment that has nothing to do with the ask. Set it to FALSE explicitly for any gate that "
+      + "must survive unrelated thread traffic: sign-offs, review verdicts, dry-run receipts, "
+      + "approvals. Leave it true only for a short-lived ask where a prose reply genuinely answers "
+      + "the question. Omitting the field does not turn it off, and a 200 does not tell you which "
+      + "you got — read it back from the create response. (BLO-35308)",
+    )
+    .optional(),
   target: requestConfirmationTargetSchema.nullable().optional(),
 }).superRefine((value, ctx) => {
   const itemIds = new Set<string>();

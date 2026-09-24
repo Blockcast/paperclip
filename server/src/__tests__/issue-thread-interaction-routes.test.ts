@@ -7,6 +7,7 @@ const CREATED_AGENT_ID = "22222222-2222-4222-8222-222222222222";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
+  addComment: vi.fn(async () => ({ id: "comment-notice" })),
 }));
 
 const mockInteractionService = vi.hoisted(() => ({
@@ -186,6 +187,7 @@ describe.sequential("issue thread interaction routes", () => {
     registerModuleMocks();
     vi.clearAllMocks();
     mockIssueService.getById.mockResolvedValue(createIssue());
+    mockIssueService.addComment.mockResolvedValue({ id: "comment-notice" });
     mockInteractionService.listForIssue.mockResolvedValue([]);
     mockInteractionService.expireRequestConfirmationsSupersededByHistoricalComments.mockResolvedValue([]);
     mockInteractionService.create.mockResolvedValue({
@@ -437,6 +439,62 @@ describe.sequential("issue thread interaction routes", () => {
       }),
     );
   });
+
+  // BLO-35308: expiry used to leave nothing but an activity_log row, which no
+  // triage surface reads. The thread must carry the artifact naming the dead
+  // ask and the comment that killed it.
+  it("posts a thread notice naming the interaction and the comment that superseded it", async () => {
+    mockInteractionService.expireRequestConfirmationsSupersededByHistoricalComments.mockResolvedValueOnce([
+      {
+        id: "interaction-expired",
+        kind: "request_confirmation",
+        status: "expired",
+        title: "Dry-run sign-off",
+        result: {
+          version: 1,
+          outcome: "superseded_by_comment",
+          commentId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        },
+      },
+    ]);
+    const app = await createApp();
+
+    const res = await request(app).get("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions");
+    expect(res.status).toBe(200);
+
+    expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
+    const [issueId, body, , options] = mockIssueService.addComment.mock.calls[0];
+    expect(issueId).toBe("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    expect(body).toContain("interaction-expired");
+    expect(body).toContain("Dry-run sign-off");
+    expect(body).toContain("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+    expect(body).toContain("supersedeOnUserComment: false");
+    // A system comment carries no authorUserId, so the notice cannot itself
+    // supersede the next ask.
+    expect(options).toMatchObject({
+      authorType: "system",
+      idempotencyKey: "interaction-superseded:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    });
+  });
+
+  // The document-driven `stale_target` expiries share this code path and are a
+  // different reason with their own ledger; they must not be swept in.
+  it("posts no supersession notice when an interaction expired for a different reason", async () => {
+    mockInteractionService.expireRequestConfirmationsSupersededByHistoricalComments.mockResolvedValueOnce([
+      {
+        id: "interaction-stale",
+        kind: "request_confirmation",
+        status: "expired",
+        result: { version: 1, outcome: "stale_target", staleTarget: null },
+      },
+    ]);
+    const app = await createApp();
+
+    const res = await request(app).get("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions");
+    expect(res.status).toBe(200);
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  });
+
 
   it("accepts suggested tasks and wakes created assignees plus the current assignee", async () => {
     const app = await createApp();
