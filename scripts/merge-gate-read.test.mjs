@@ -822,8 +822,9 @@ describe("merge-gate reader", () => {
   // per_page nor --paginate while the check-run surface one line below had
   // both. GitHub's default page size is 30, so a head with >30 contexts
   // silently loses the remainder, and a dropped `failure` prints no STOP.
-  // The ABSENT guard cannot catch it — `:52` excludes status rows from the
-  // survivor count, so one surviving check-run keeps it quiet. Direction: GREEN.
+  // The ABSENT guard cannot catch it: the reader's `$4!="status"` excludes
+  // status rows from the survivor count, so one surviving check-run keeps it
+  // quiet. Direction: GREEN.
   describe("legacy status surface", () => {
     // Asserted over EVERY list fetch, not just the status one: the check-run and
     // actions/runs calls carry the same silent-truncation risk, and neither had a
@@ -858,8 +859,9 @@ describe("merge-gate reader", () => {
       // Count OCCURRENCES after unfolding continuations, not LINES. A line-granular
       // cross-check inherits the exact blind spot it was added to close, in two
       // measured shapes: a second call APPENDED to an already-collected line
-      // (`{ a | status_extract ; b | extract }` is the style this file already
-      // uses at `:235-236`, so appending a third fetch there is the natural edit),
+      // (`{ a | status_extract ; b | extract }` is the style merge-gate-read.sh
+      // already uses for its two fetches, so appending a third fetch there is
+      // the natural edit),
       // and a continuation break BETWEEN `gh` and `api`. Both leave every
       // line-granular assertion green — `fetches` counts the line once so `=== 3`
       // holds, the cross-check counts it once, and `assert.match(call, /--paginate/)`
