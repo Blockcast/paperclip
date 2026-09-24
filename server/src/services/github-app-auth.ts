@@ -277,6 +277,126 @@ export async function githubGetPullRequestGate(input: {
 }
 
 /**
+ * Is a named status context actually **required to merge** on the branch this
+ * PR targets? (PEN-3487)
+ *
+ * The same context name carries opposite consequences across our repos —
+ * measured 2026-09-24, `review/ally-complete` is one of ten required contexts on
+ * `Blockcast/penstock-llm-proxy-core`, is not required at all on
+ * `Blockcast/paperclip` (whose `master` requires exactly `verify`), and
+ * `Blockcast/onprem-k8s` requires none. A reader who sees that context red has
+ * no way to tell which of those they are looking at, and the cost is not
+ * hypothetical: PEN-3487 was filed as a merge-pipeline blocker, escalated, and
+ * absorbed hours of investigation across three agents before anyone read
+ * `branches/master` and found the gate blocks nothing there.
+ *
+ * Three outcomes, kept distinct on purpose. `unknown` must never collapse into
+ * `not_required`: "we could not read branch protection" and "we read it and the
+ * context is absent" are opposite facts, and flattening them would put a
+ * confident all-clear on an unread gate.
+ *
+ * Readability note: this uses `GET /repos/{repo}/branches/{branch}`, whose
+ * `.protection` summary an ordinary installation token CAN read. The narrower
+ * `branches/{branch}/protection` endpoint 403s for a non-admin App, which is the
+ * read that has repeatedly been mistaken for "the required set is unknowable
+ * from an agent seat".
+ */
+export type PrRequiredStatusContextLookup =
+  | { outcome: "required"; baseRef: string; requiredContexts: string[] }
+  | { outcome: "not_required"; baseRef: string; branchProtected: boolean; requiredContexts: string[] }
+  | { outcome: "unknown"; reason: string };
+
+function encodeGitRefPath(ref: string): string {
+  // Branch names legitimately contain `/`, which must stay a path separator;
+  // everything else gets encoded so a ref cannot escape the path.
+  return ref.split("/").map((segment) => encodeURIComponent(segment)).join("/");
+}
+
+export async function githubGetPrRequiredStatusContext(input: {
+  repoFullName: string;
+  prNumber: number;
+  context: string;
+  signal?: AbortSignal;
+}): Promise<PrRequiredStatusContextLookup> {
+  const context = input.context.trim();
+  if (!context) return { outcome: "unknown", reason: "status_context_empty" };
+
+  const tokenResult = await getInstallationTokenResult();
+  if (!tokenResult.ok) return { outcome: "unknown", reason: tokenResult.reason };
+  const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` };
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+
+  let baseRef: string;
+  try {
+    const res = await ghFetch(`${apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}`, {
+      headers,
+      signal: input.signal,
+    });
+    if (!res.ok) {
+      const classified = await classifyGithubHttpFailure("required_context_pull_request", res);
+      return { outcome: "unknown", reason: classified.reason };
+    }
+    const body = (await res.json().catch(() => null)) as { base?: { ref?: string } } | null;
+    const ref = typeof body?.base?.ref === "string" ? body.base.ref.trim() : "";
+    if (!ref) return { outcome: "unknown", reason: "required_context_base_ref_missing" };
+    baseRef = ref;
+  } catch {
+    return { outcome: "unknown", reason: "required_context_pull_request_fetch_failed" };
+  }
+
+  try {
+    const res = await ghFetch(
+      `${apiBase}/repos/${input.repoFullName}/branches/${encodeGitRefPath(baseRef)}`,
+      { headers, signal: input.signal },
+    );
+    if (!res.ok) {
+      const classified = await classifyGithubHttpFailure("required_context_branch", res);
+      return { outcome: "unknown", reason: classified.reason };
+    }
+    const body = (await res.json().catch(() => null)) as {
+      protected?: boolean;
+      protection?: {
+        enabled?: boolean;
+        required_status_checks?: {
+          contexts?: unknown;
+          checks?: unknown;
+        };
+      };
+    } | null;
+    if (!body) return { outcome: "unknown", reason: "required_context_branch_body_missing" };
+
+    const required = body.protection?.required_status_checks;
+    // `contexts` is the legacy shape and `checks[].context` the current one;
+    // GitHub still returns both, but a repo configured only through the newer
+    // API can come back with an empty `contexts`. Union them rather than
+    // trusting either alone — reading only `contexts` would report a genuinely
+    // required check as unrequired, which is the one error direction that
+    // matters here.
+    const fromContexts = Array.isArray(required?.contexts)
+      ? required.contexts.filter((value): value is string => typeof value === "string")
+      : [];
+    const fromChecks = Array.isArray(required?.checks)
+      ? required.checks
+        .map((check) =>
+          check && typeof check === "object" && typeof (check as { context?: unknown }).context === "string"
+            ? (check as { context: string }).context
+            : null
+        )
+        .filter((value): value is string => value !== null)
+      : [];
+    const requiredContexts = [...new Set([...fromContexts, ...fromChecks])].sort();
+    const branchProtected = body.protected === true || body.protection?.enabled === true;
+
+    if (requiredContexts.includes(context)) {
+      return { outcome: "required", baseRef, requiredContexts };
+    }
+    return { outcome: "not_required", baseRef, branchProtected, requiredContexts };
+  } catch {
+    return { outcome: "unknown", reason: "required_context_branch_fetch_failed" };
+  }
+}
+
+/**
  * Terminal-state lookup for a single Actions run, used to decide whether a board
  * approval card that points at that run is still worth a human's attention.
  *
