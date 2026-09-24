@@ -1377,7 +1377,11 @@ jobs:
     # previous 5 minutes a slow classify step could time `verify` out and lose
     # the annotation entirely — the one thing this job exists to emit. The
     # classify step carries its own tighter bound, so this ceiling only has to
-    # cover the setup around it. Same headroom reasoning as `policy` above.
+    # cover the setup around it. This 10 is NOT derived by the BLO-35615 rule
+    # that sizes `policy` above: no W95 has been measured for `verify`. At that
+    # rule's F = 0.32 floor it supplies 600 x 0.32 = 192 CPU-seconds. Before
+    # changing it, measure W95 and apply the rule rather than tuning from
+    # observed durations.
     timeout-minutes: 10
     # BLO-28999: the classify step below is this workflow's first GITHUB_TOKEN
     # consumer, and `pr.yml` declares no workflow-level `permissions:`. Under a
