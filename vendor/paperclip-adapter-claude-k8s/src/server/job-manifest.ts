@@ -86,9 +86,23 @@ export function buildPodLogPath(companyId: string, agentId: string, runId: strin
   return `${dir}/${runId}.pod.ndjson`;
 }
 
-/** Prompts above this size (bytes) are staged via a Secret instead of an
- *  init container env var, protecting against the ~1 MiB PodSpec limit. */
-const LARGE_PROMPT_THRESHOLD_BYTES = 256 * 1024;
+/** Env var carrying the prompt on the small-prompt path. Shared with
+ *  LARGE_PROMPT_THRESHOLD_BYTES below, which depends on its length. */
+const PROMPT_ENV_NAME = "PROMPT_CONTENT";
+
+/** Linux caps a SINGLE execve argument/environment string at MAX_ARG_STRLEN =
+ *  32 * PAGE_SIZE = 131072 bytes (4 KiB pages; larger page sizes only raise
+ *  it), counting the `NAME=` prefix and the trailing NUL. Exceed it and the
+ *  init container's `sh -c` cannot exec at all — E2BIG — which the kubelet
+ *  surfaces as a bare non-zero init-container exit that names neither the
+ *  prompt nor its size.
+ *
+ *  This threshold used to be 256 KiB, chosen against the ~1 MiB PodSpec limit.
+ *  That is the wrong constraint: the kernel's exec limit binds first, at half
+ *  that. Every prompt in the resulting 128 KiB..256 KiB dead zone took the env
+ *  var path and failed 100% of the time (BLO-35720). */
+const MAX_ARG_STRLEN_BYTES = 32 * 4096;
+const LARGE_PROMPT_THRESHOLD_BYTES = MAX_ARG_STRLEN_BYTES - PROMPT_ENV_NAME.length - "=".length - 1;
 const RUNTIME_CACHE_VOLUME_NAME = "runtime-cache";
 const RUNTIME_CACHE_MOUNT_PATH = "/runtime-cache";
 const RUNTIME_CACHE_SIZE_LIMIT = "20Gi";
@@ -1918,10 +1932,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // init-container env var, regardless of size (BLO-17980/BLO-17973).
   const initCommandParts = useLargePromptPath
     ? ["cp /tmp/prompt-secret/prompt.txt /tmp/prompt/prompt.txt"]
-    : [`printf '%s' "$PROMPT_CONTENT" > /tmp/prompt/prompt.txt`];
+    : [`printf '%s' "$${PROMPT_ENV_NAME}" > /tmp/prompt/prompt.txt`];
   const initEnv: k8s.V1EnvVar[] = useLargePromptPath
     ? []
-    : [{ name: "PROMPT_CONTENT", value: prompt }];
+    : [{ name: PROMPT_ENV_NAME, value: prompt }];
   let mcpConfigSecret: McpConfigSecret | null = null;
   if (mergedMcpJson) {
     const mcpConfigSecretName = `${jobName}-mcp`;
