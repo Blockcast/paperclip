@@ -1543,12 +1543,44 @@ async function assertDirtyQuarantineRuntimeServicesStopped(input: {
   throw branchIncoherenceValidationFailure(input.evidence);
 }
 
+// A run killed mid-`git` leaves a 0-byte `index.lock` behind. Git will not reap
+// it because it cannot tell a dead owner from a live one on another host; a
+// Paperclip worktree is single-writer, so that ambiguity does not exist here and
+// the abandoned mutex is safe to break. Anchored on
+// `WORKSPACE_SUBMODULE_REPAIR_TIMEOUT_MS` (5m), the longest git budget in this
+// file: past 3x that ceiling no git command this process started is still alive.
+const GIT_INDEX_LOCK_STALE_MS = 15 * 60 * 1000;
+
+// Every refusal below keeps "index lock" in the message so
+// `formatDirtyQuarantineFailure` still reports it as index contention.
 async function assertGitIndexIsUnlocked(worktreePath: string) {
-  const indexLockPath = await runGit(["rev-parse", "--git-path", "index.lock"], worktreePath)
+  const rawLockPath = await runGit(["rev-parse", "--git-path", "index.lock"], worktreePath)
     .catch(() => null);
-  if (indexLockPath && existsSync(indexLockPath)) {
-    throw new Error(`git index lock exists at ${indexLockPath}`);
+  if (!rawLockPath) return;
+  // `--git-path` answers relative to the worktree for a normal repo and absolute
+  // for a linked one. Resolving against `worktreePath` rather than the process
+  // cwd is what makes the `unlink` below point at the lock we just stat'd.
+  const indexLockPath = path.isAbsolute(rawLockPath) ? rawLockPath : path.resolve(worktreePath, rawLockPath);
+  const lockStat = await fs.stat(indexLockPath).catch(() => null);
+  if (!lockStat) return;
+
+  // A non-empty lock is a real in-flight index, not a mutex. Never remove it.
+  if (lockStat.size > 0) {
+    throw new Error(
+      `git index lock exists at ${indexLockPath} and holds ${lockStat.size} bytes of in-flight index state`,
+    );
   }
+  const ageMs = Date.now() - lockStat.mtimeMs;
+  if (ageMs < GIT_INDEX_LOCK_STALE_MS) {
+    throw new Error(
+      `git index lock exists at ${indexLockPath} and was written ${Math.round(ageMs / 1000)}s ago, under the ${Math.round(GIT_INDEX_LOCK_STALE_MS / 60000)}m staleness threshold`,
+    );
+  }
+  await fs.unlink(indexLockPath).catch((error: unknown) => {
+    throw new Error(
+      `git index lock exists at ${indexLockPath} and could not be removed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  });
 }
 
 function fingerprintWorkspaceBranchIncoherence(input: {
