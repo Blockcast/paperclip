@@ -1804,6 +1804,128 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
+  // BLO-33223 (extension): the guard test for deriving
+  // `ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES` from `TRANSIENT_INFRA_CONTINUATION_ERROR_CODES`
+  // rather than re-listing it. `skill_materialization_pending` is the measured proof that
+  // the two-list arrangement drifts: BLO-32055 added it to the transient-infra set with a
+  // comment correctly reasoning the runtime tree vanished underneath the adapter before
+  // the CLI was ever spawned -- i.e. explicitly infrastructure -- and it still laundered
+  // BLO-33648 and BLO-32939 onto the manager, because the author had no reason to know a
+  // second list decided routing.
+  //
+  // Mutation check: delete the `...TRANSIENT_INFRA_CONTINUATION_ERROR_CODES` spread and
+  // this test fails on both assertions. The error text is marker-free on purpose, so the
+  // message arm cannot carry it -- `infraClassCauseByMessage: false` pins that, exactly as
+  // in the `k8s_pod_schedule_failed` test above.
+  it("re-dispatches a skill_materialization_pending failure to the existing assignee (BLO-33223)", async () => {
+    const { managerId, coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+    >(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "Skill `garrytan/gstack/investigate` source is incomplete: " +
+        "`investigate--9debdeaf08` disappeared while building the Claude prompt bundle",
+      errorCode: "skill_materialization_pending",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(action).toMatchObject({
+      kind: "stranded_assigned_issue",
+      cause: "stranded_assigned_issue",
+      ownerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+    });
+    expect(action?.ownerAgentId).not.toBe(managerId);
+    expect(action?.evidence).toMatchObject({
+      infraClassCause: true,
+      infraClassCauseByMessage: false,
+      latestRunErrorCode: "skill_materialization_pending",
+    });
+  });
+
+  // BLO-33223 (review follow-up): the set has TWO readers and only the routing one is
+  // gated on `recoveryCause`, so deriving it changes the evidence record for causes
+  // that never reach the routing test at all. The test above pins only a
+  // `stranded_assigned_issue`, which is exactly the gap that let the doc comment claim
+  // `provider_quota`/`process_lost` were "inert" when they are inert for routing only.
+  //
+  // `process_lost` is the sharpest case: `resolveStrandedRecoveryCause` diverts it to
+  // its own cause and `routeToOriginal` is already true for that cause unconditionally,
+  // so routing here is identical before and after the derivation -- while the evidence
+  // arm flips `false` -> `true`. Pinning it locks the intended semantic: the field
+  // answers "was this cause infra-class?" independent of the cause bucket, and a
+  // process death is not the agent's fault.
+  //
+  // Mutation check: delete the `...TRANSIENT_INFRA_CONTINUATION_ERROR_CODES` spread and
+  // this test fails on `infraClassCause` alone, with every routing assertion still
+  // passing -- which is the asymmetry the routing-only test above cannot observe.
+  it("records infraClassCause for a process_lost cause that never reaches the routing test (BLO-33223)", async () => {
+    const { managerId, coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+    >(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      // Marker-free on purpose: `infraClassCauseByMessage: false` pins that the union
+      // is carried by the error-code arm, not by the pod-removal wording.
+      error: "Agent process exited before reporting a result.",
+      errorCode: "process_lost",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    // Routing is unchanged by the derivation -- `process_lost` gets its own cause and
+    // returns to the lane through its own branch.
+    expect(action).toMatchObject({
+      cause: "process_lost",
+      ownerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+    });
+    expect(action?.ownerAgentId).not.toBe(managerId);
+    // The evidence arm is the part the derivation moved.
+    expect(action?.evidence).toMatchObject({
+      infraClassCause: true,
+      infraClassCauseByMessage: false,
+      latestRunErrorCode: "process_lost",
+    });
+  });
+
   it("keeps the original return owner after a temporary invocability fallback", async () => {
     const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
     const enqueueWakeup = vi.fn<

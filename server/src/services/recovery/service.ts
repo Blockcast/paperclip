@@ -866,13 +866,8 @@ type StrandedRecoveryCause =
 
 type StrandedPreviousStatus = "todo" | "in_progress" | "in_review";
 
-const ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES = new Set([
-  "job_failed",
-  "k8s_pod_schedule_failed",
-  "adapter_failed",
-  "external_lifecycle_stale_killed",
-  "k8s_concurrency_guard_unreachable",
-]);
+// `ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES` is defined next to
+// `TRANSIENT_INFRA_CONTINUATION_ERROR_CODES` below, because it is derived from it.
 
 type SuccessfulRunHandoffRecoveryEvidence = {
   sourceRunId: string | null;
@@ -1595,6 +1590,72 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   // Routing it to `skill_not_found` would suppress retries permanently on a
   // transient condition — the over-suppression hazard BLO-31794 tracks.
   "skill_materialization_pending",
+]);
+
+/**
+ * Codes that are infra-class by CODE ALONE, so a `stranded_assigned_issue` carrying
+ * one is re-dispatched to the existing assignee instead of escalating ownership up
+ * the manager ladder (BLO-20933). Also recorded verbatim as the evidence field
+ * `infraClassCause`'s error-code arm.
+ *
+ * BLO-33223: derived from `TRANSIENT_INFRA_CONTINUATION_ERROR_CODES` rather than
+ * re-listed, because the two answer the SAME question — "was this the agent's
+ * fault?" — and maintaining them separately is the actual defect. This row is the
+ * fourth report in one family (BLO-20933 pod eviction, BLO-31351 git transport,
+ * this row's original `OOMKilled`, now `skill_materialization_pending`), and each
+ * of the first three was closed by enumerating one more cause into one of the two
+ * lists. `skill_materialization_pending` is the proof that that does not converge:
+ * BLO-32055 added it directly above, with a comment correctly reasoning that the
+ * runtime tree vanished underneath the adapter and the run never reached the CLI —
+ * i.e. explicitly infrastructure — and it still laundered two live rows onto the
+ * manager (BLO-33648, BLO-32939, measured 2026-09-22) because the author had no
+ * reason to know a second list existed. Deriving makes that drift unrepresentable:
+ * anything a future change declares transient-infra for the retry budget is
+ * automatically not-the-agent's-fault for routing.
+ *
+ * Chose this over the "invert the default for pod deaths" option the filing floated.
+ * An agent-side crash is also a pod death (`exit code 1, reason=Error`), so "the pod
+ * died" does not discriminate — see `isInfraClassStrandedFailure` below, where the
+ * same reasoning anchored the message arm on the KILL rather than on `reason=`.
+ *
+ * The four members below are infra-class but NOT retryable, so they are not in the
+ * set above and must stay listed here. Conversely `provider_quota` and
+ * `process_lost` are inherited but inert for ROUTING: `resolveStrandedRecoveryCause`
+ * gives each its own cause, so neither ever reaches the `stranded_assigned_issue`
+ * routing test that reads this set.
+ *
+ * The set has a second reader that is NOT gated on cause: the evidence arm
+ * `infraClassCauseByErrorCode` in the recovery-action evidence builder (BLO-33655),
+ * unioned into the recorded `infraClassCause`. That arm keys only on the latest
+ * run's `errorCode`, so ANY recovery action whose latest run carries a code this
+ * derivation newly adds (`provider_quota` and `process_lost` included) now records
+ * `infraClassCause: true`, whatever its cause bucket, where it used to record
+ * `false`. That change is intended: the field answers "was this failure
+ * infra-class?", and these codes are. Anyone reading `infraClassCause` in an
+ * incident write-up should expect it.
+ *
+ * Inheriting `timeout` is the one member included by consistency rather than by a
+ * measured instance: no laundered `timeout` row exists in the live census. It is
+ * also the weakest member on the merits — six of the seven inherited codes are
+ * provider-side or pre-CLI faults, whereas a run that loops until wall-clock
+ * exhaustion is also a `timeout`, so it is the one code where agent behaviour is
+ * plausibly causal. Kept because escalating a wall-clock exhaustion to a manager
+ * who cannot make the agent faster is the load-concentration BLO-20933 exists to
+ * stop. If it proves wrong, subtract that one code here rather than un-deriving
+ * the set, and note that subtracting it changes both readers: routing and the
+ * evidence arm.
+ *
+ * Deliberately NOT inherited, and still escalating: `workspace_validation_failed`
+ * and `configuration_incomplete` (both are `manual_repair_required` causes that
+ * never reach this test at all), `skill_not_found`, `issue_cancelled`, and a
+ * `claude_truncated` agent-side crash.
+ */
+const ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES = new Set<string>([
+  ...TRANSIENT_INFRA_CONTINUATION_ERROR_CODES,
+  "job_failed",
+  "k8s_pod_schedule_failed",
+  "external_lifecycle_stale_killed",
+  "k8s_concurrency_guard_unreachable",
 ]);
 
 // BLO-19124: emitted by the dispatcher's dependency gate (see heartbeat.ts
