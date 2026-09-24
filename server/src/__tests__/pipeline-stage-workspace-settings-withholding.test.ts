@@ -193,8 +193,9 @@ describe("PEN-3266 pipeline stage config write-back guard", () => {
   /**
    * The derived `automation` block must restore from the STORED `onEnter`, because that is the only
    * place the value is kept. Keying it on `existing.automation` found `undefined` on every real row
-   * and stripped the command instead of restoring it — and `upsertStageAutomationRoutine` then
-   * rebuilds `onEnter` from that stripped context, overwriting the copy the `onEnter` branch had just
+   * and stripped the command instead of restoring it — and `syncPipelineStageAutomation`
+   * (`services/pipelines.ts:2818`) then rebuilds `onEnter` from that stripped context (`:2886`,
+   * `:2924`), overwriting the copy the `onEnter` branch had just
    * restored correctly. Net effect: renaming a stage destroyed its provision command.
    */
   it("restores the derived automation copy from the stored onEnter, not from a stored automation key", () => {
@@ -287,5 +288,122 @@ describe("PEN-3266 pipeline stage config write-back guard", () => {
   it("passes through an incoming config that is not an object", () => {
     expect(restoreWithheldPipelineStageConfig(null, stored)).toBeNull();
     expect(restoreWithheldPipelineStageConfig("x", stored)).toBe("x");
+  });
+});
+
+/**
+ * PEN-3266 — the round-trip property, driven through the REAL mask rather than a hand-written
+ * "masked" fixture.
+ *
+ * Every assertion above builds its masked input by hand, which silently pins the ONE array shape
+ * the identity alignment happened to handle: a top-level `services` array whose entries carry a
+ * unique STRING `name`. Four neighbouring shapes destroyed the operator's stored value on an
+ * *unmodified* round-trip, and no hand-written fixture could have caught it, because the bug lives
+ * in the disagreement between what `maskWorkspaceRuntimeForRead` emits and what
+ * `readArrayElementIdentity` accepts — and a hand-written fixture is the author asserting that
+ * they agree.
+ *
+ * So these drive `publicPipelineStageConfig` → `restoreWithheldPipelineStageConfig` and assert the
+ * only property that matters: **an unentitled reader who saves back exactly what it was handed
+ * must not change a single stored byte.**
+ */
+describe("PEN-3266 write guard — mask/restore round-trip is lossless for an unedited save", () => {
+  function roundTrip(storedRuntime: unknown) {
+    const storedConfig = {
+      onEnter: {
+        type: "run_routine",
+        executionWorkspaceSettings: { workspaceRuntime: storedRuntime },
+      },
+    };
+    // Exactly what an unentitled editor receives, then saves back untouched.
+    const masked = publicPipelineStageConfig(storedConfig, WITHHELD_WORKSPACE_RUNTIME_VIEWER) as Record<string, any>;
+    const restored = restoreWithheldPipelineStageConfig(masked, storedConfig) as Record<string, any>;
+    return {
+      masked: masked.onEnter.executionWorkspaceSettings.workspaceRuntime,
+      restored: restored.onEnter.executionWorkspaceSettings.workspaceRuntime,
+    };
+  }
+
+  /** The shape the hand-written fixtures already cover — a positive control for this harness. */
+  it("control: blessed services[] with unique string names round-trips losslessly", () => {
+    const storedRuntime = {
+      services: [
+        { name: "web", command: `${COMMAND_SENTINEL}-web` },
+        { name: "api", command: `${COMMAND_SENTINEL}-api` },
+      ],
+    };
+    const { masked, restored } = roundTrip(storedRuntime);
+    expect(masked.services[0].command).toBe(REDACTED_EVENT_VALUE);
+    expect(restored).toEqual(storedRuntime);
+  });
+
+  /**
+   * `identityScope` is true only for entries sitting DIRECTLY inside a top-level
+   * `commands`/`services`/`jobs` array, so a nested `env` array has its `name` masked. The restore
+   * then read that sentinel as a legitimate identity, matched zero stored elements, and persisted
+   * the sentinel over the real value.
+   */
+  it("restores a nested array whose identity key the mask replaced with a sentinel", () => {
+    const storedRuntime = {
+      services: [{
+        name: "web",
+        command: `${COMMAND_SENTINEL}-web`,
+        env: [{ name: "REGION", value: `${RUNTIME_SENTINEL}-region` }],
+      }],
+    };
+    const { masked, restored } = roundTrip(storedRuntime);
+    // The mask does redact the nested identity — that half is intended and stays asserted.
+    expect(masked.services[0].env[0].name).toBe(REDACTED_EVENT_VALUE);
+    expect(restored).toEqual(storedRuntime);
+  });
+
+  /** A top-level array the parser does not bless gets NO identity honoured at all. */
+  it("restores a top-level array that is not commands/services/jobs", () => {
+    const storedRuntime = {
+      containers: [
+        { name: "web", command: `${COMMAND_SENTINEL}-a` },
+        { name: "api", command: `${COMMAND_SENTINEL}-b` },
+      ],
+    };
+    const { masked, restored } = roundTrip(storedRuntime);
+    expect(masked.containers[0].name).toBe(REDACTED_EVENT_VALUE);
+    expect(restored).toEqual(storedRuntime);
+  });
+
+  /**
+   * `maskEntry` emits the sentinel for a non-string identity, so mask and restore disagreed about
+   * which key was the identity and every command in the array was destroyed.
+   */
+  it("restores a blessed array whose identity value is not a string", () => {
+    const storedRuntime = {
+      services: [
+        { id: 1, command: `${COMMAND_SENTINEL}-1` },
+        { id: 2, command: `${COMMAND_SENTINEL}-2` },
+      ],
+    };
+    const { restored } = roundTrip(storedRuntime);
+    expect(restored).toEqual(storedRuntime);
+  });
+
+  /**
+   * ⚠️ Pins a KNOWN, DELIBERATE loss rather than a fix. A duplicate stored identity is genuinely
+   * ambiguous — there is no way to tell a reorder from a no-op — and writing one service's real
+   * command onto another is the silent fault the identity alignment exists to prevent. So this
+   * branch keeps the sentinel, which loses the stored value VISIBLY.
+   *
+   * It is pinned so the cost is a recorded choice. If this test ever starts failing because
+   * someone made the index fallback unconditional, that is a decision to take deliberately, not a
+   * green diff.
+   */
+  it("known loss: a duplicate stored identity keeps the sentinel rather than guessing", () => {
+    const storedRuntime = {
+      services: [
+        { name: "web", command: `${COMMAND_SENTINEL}-1` },
+        { name: "web", command: `${COMMAND_SENTINEL}-2` },
+      ],
+    };
+    const { restored } = roundTrip(storedRuntime);
+    expect(restored.services[0].command).toBe(REDACTED_EVENT_VALUE);
+    expect(restored.services[1].command).toBe(REDACTED_EVENT_VALUE);
   });
 });
