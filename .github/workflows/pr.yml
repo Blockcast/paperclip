@@ -33,14 +33,14 @@ jobs:
     # A merge-group is the sole landing candidate and must not wait behind the
     # pull-request review backlog that saturates arc-light.
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
-    # 10, not 5, because this is the tightest-budgeted job that sets up pnpm and
-    # `./.github/actions/setup-pnpm` may spend a second attempt on a stalled
-    # npm registry (BLO-28813). At 5 a degraded registry converted a fast red
-    # into a job timeout, which ejects a merge-queue candidate just the same but
-    # burns a runner for the full budget first. Worst case here is roughly
-    # 2 x (bootstrap + 120s fetch) + backoff ~= 5m, so the real work needs the
-    # headroom above it.
-    timeout-minutes: 10
+    # 20, not 10, because this job also pays for a cold, full-depth checkout
+    # before pnpm and the policy suite can start. Run 35968078306 attempt 4
+    # spent 7m52s in checkout alone and was killed by the old 10m cap during a
+    # bounded test step; there was no assertion failure. `./.github/actions/
+    # setup-pnpm` may also spend a second attempt on a stalled npm registry
+    # (BLO-28813). Keep every step bound unchanged and give setup plus the
+    # existing validation budget a finite, attributable ceiling.
+    timeout-minutes: 20
     # BLO-32682: the step-kill classifier at the end of this job reads the run's
     # own step conclusions and annotations back off the Actions API, and
     # `pr.yml` declares no workflow-level `permissions:`. Under a restricted
@@ -270,7 +270,7 @@ jobs:
       # on a PR whose diff touched only `server/src/services/recovery/*`.
       # Sizing an ~9s task at 60s reads as 7x headroom; against a p100 that is
       # already 5x the median it was not. The bound still catches a hang, far
-      # inside the 10m job cap — it is no longer a duration tripwire.
+      # inside the 20m job cap — it is no longer a duration tripwire.
       - name: Test approval admissibility-probe backoff (BLO-28471)
         if: ${{ !cancelled() }}
         run: node --test ./scripts/approve-paperclip-api-digest.test.js
@@ -765,7 +765,7 @@ jobs:
         # has already happened, and must never be able to change the outcome —
         # `policy` fails on the step conclusions themselves either way.
         continue-on-error: true
-        # Bounded well inside the 10-minute job ceiling: it makes a handful of
+        # Bounded well inside the 20-minute job ceiling: it makes a handful of
         # API calls on a pool that is, by construction, busy enough to have just
         # killed a step.
         timeout-minutes: 3
