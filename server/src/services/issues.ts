@@ -7455,28 +7455,76 @@ export function issueService(db: Db) {
       input.checkoutRunId,
       input.executionRunId,
     ].filter((runId): runId is string => Boolean(runId)))].sort();
+
+    // BLO-28441: read the ACTOR's own run in the same round trip as the holders'.
+    // A run the server has already marked terminal keeps executing for ~10 more
+    // minutes, and every health signal available to it — `/agents/me`, its own
+    // pod, `lastHeartbeatAt` — reads clean, so it cannot discover why its writes
+    // are refused. Its comments still succeed, so it goes on publishing confident
+    // analysis derived from a state the server considers dead. Reporting the
+    // holder alone cannot explain that 409: the cause is the caller, not the row.
+    const lookupRunIds = [...new Set([...ownerRunIds, input.actorRunId]
+      .filter((runId): runId is string => Boolean(runId)))];
+
+    let runRows: {
+      id: string;
+      agentId: string | null;
+      status: string;
+      startedAt: Date | null;
+    }[] = [];
+    let lookupFailed = false;
+    if (lookupRunIds.length > 0) {
+      try {
+        runRows = await db
+          .select({
+            id: heartbeatRuns.id,
+            agentId: heartbeatRuns.agentId,
+            status: heartbeatRuns.status,
+            startedAt: heartbeatRuns.startedAt,
+          })
+          .from(heartbeatRuns)
+          .where(inArray(heartbeatRuns.id, lookupRunIds))
+          .orderBy(asc(heartbeatRuns.id));
+      } catch {
+        lookupFailed = true;
+      }
+    }
+    const runById = new Map(runRows.map((run) => [run.id, run]));
+
+    const actorRun = input.actorRunId ? runById.get(input.actorRunId) ?? null : null;
+    const actorRunStatus = actorRun?.status ?? null;
+    // Only claim the caller's own run is dead when a row was actually read and
+    // the gate this mirrors would refuse it: `runningCheckoutExecutionPatch`
+    // grants the lock only to a run whose status is exactly `running`, so
+    // anything else -- terminal, never-started, or parked in `scheduled_retry`
+    // with startedAt set by the retry ladder -- is refused on that path. This
+    // is NOT a universal rule for `assertCheckoutOwner`: `resolveSameRunOwnership`
+    // is consulted first and grants a run that is its own holder without
+    // reading its status, so a parked run whose lock columns point at itself
+    // never reaches this 409 at all (BLO-35402 tracks closing that; it is a
+    // behaviour change and out of scope here). Mirroring the `running` condition
+    // rather than `isReapableHeartbeatRunRow` matters for the parked case,
+    // which reapability treats as alive and which otherwise gets the "retry
+    // once" misdirection this remediation replaces. A missing row, or a failed
+    // lookup, is NOT evidence of death — telling a healthy run to stop working
+    // is the expensive direction to be wrong in, so this fails closed to the
+    // existing holder-shaped remediation.
+    const actorRunRemediation = actorRun != null && actorRunStatus !== "running"
+      ? `Your own run (${input.actorRunId}) is \`${actorRunStatus}\`, so the server will not grant it this lock however the holder resolves. Do NOT retry and do NOT re-file a platform bug — stop working this issue and let your successor run pick it up. Note your comments still succeed, so anything you publish from here is derived from a run the server considers dead.`
+      : null;
+
     if (ownerRunIds.length === 0) {
       return {
         lockHolders: [],
         holderLiveness: "no_holder" as const,
         concurrentSiblingRun: false,
-        remediation: "No lock holder was present in the conflict snapshot; retry once, then re-read the issue before escalating.",
+        actorRunStatus,
+        remediation: actorRunRemediation
+          ?? "No lock holder was present in the conflict snapshot; retry once, then re-read the issue before escalating.",
       };
     }
 
-    let ownerRuns;
-    try {
-      ownerRuns = await db
-        .select({
-          id: heartbeatRuns.id,
-          agentId: heartbeatRuns.agentId,
-          status: heartbeatRuns.status,
-          startedAt: heartbeatRuns.startedAt,
-        })
-        .from(heartbeatRuns)
-        .where(inArray(heartbeatRuns.id, ownerRunIds))
-        .orderBy(asc(heartbeatRuns.id));
-    } catch {
+    if (lookupFailed) {
       return {
         lockHolders: ownerRunIds.map((runId) => ({
           runId,
@@ -7487,10 +7535,11 @@ export function issueService(db: Db) {
         })),
         holderLiveness: "unknown" as const,
         concurrentSiblingRun: false,
+        actorRunStatus,
         remediation: "The lock-holder status could not be read; retry once, then re-read the issue before escalating.",
       };
     }
-    const ownerRunById = new Map(ownerRuns.map((run) => [run.id, run]));
+    const ownerRunById = runById;
 
     const holders = ownerRunIds.map((runId) => {
       const run = ownerRunById.get(runId) ?? null;
@@ -7514,14 +7563,18 @@ export function issueService(db: Db) {
       // 409 is a bug at all.
       holderLiveness: liveHolders.length > 0 ? ("live" as const) : ("not_live" as const),
       concurrentSiblingRun: liveSiblings.length > 0,
+      actorRunStatus,
       // `remediation` specifically: the error handler hoists a string under this
       // key to the top level of the response body, so the fix path is visible
       // without the caller having to dig into `details`.
-      remediation: liveHolders.length === 0
+      //
+      // A dead caller outranks every holder-shaped explanation: if the actor's
+      // own run cannot hold a lock, what the holder is doing is irrelevant.
+      remediation: actorRunRemediation ?? (liveHolders.length === 0
         ? "The lock holder was not live in this snapshot. Retry once so a terminal or queued holder can be reaped; escalate only if the conflict persists."
         : liveSiblings.length > 0
           ? `Expected: a concurrent run of your own agent (${liveSiblings.map((holder) => holder.runId).join(", ")}) is live and holds this issue. Do NOT retry or re-file a platform bug — yield this issue to the sibling run, or wait for it to finish and the lock releases automatically.`
-          : `Another agent's live run (${liveHolders.map((holder) => holder.runId).join(", ")}) holds this issue. Comment instead of mutating, or wait for that run to finish.`,
+          : `Another agent's live run (${liveHolders.map((holder) => holder.runId).join(", ")}) holds this issue. Comment instead of mutating, or wait for that run to finish.`),
     };
   }
 
@@ -12001,6 +12054,18 @@ export function issueService(db: Db) {
         assigneeAgentId: current.assigneeAgentId,
         checkoutRunId: current.checkoutRunId,
         executionRunId: current.executionRunId,
+        // BLO-28441: `POST /checkout` refused the lock without ever naming the
+        // caller, so a run the server had already marked terminal could not tell
+        // "the holder is busy" from "I am dead". Same helper as the PATCH-side
+        // ownership guard, so both routes report the conflict the same way.
+        actorAgentId: agentId,
+        actorRunId: checkoutRunId,
+        ...(await describeIssueLockConflict({
+          checkoutRunId: current.checkoutRunId,
+          executionRunId: current.executionRunId,
+          actorAgentId: agentId,
+          actorRunId: checkoutRunId,
+        })),
       });
     },
 
