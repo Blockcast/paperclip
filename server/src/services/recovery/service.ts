@@ -1627,13 +1627,13 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
  *
  * The set has a second reader that is NOT gated on cause: the evidence arm
  * `infraClassCauseByErrorCode` in the recovery-action evidence builder (BLO-33655),
- * unioned into the recorded `infraClassCause`. So every code this derivation newly
- * adds, `provider_quota` and `process_lost` included, now records
- * `infraClassCause: true` on recovery actions of EVERY cause (for example
- * `provider_quota`, `process_lost`, `codex_output_inactivity_monitor` and
- * `workspace_validation_failed`), where it used to record `false`. That change is
- * intended: the field answers "was this failure infra-class?", and these codes are.
- * Anyone reading `infraClassCause` in an incident write-up should expect it.
+ * unioned into the recorded `infraClassCause`. That arm keys only on the latest
+ * run's `errorCode`, so ANY recovery action whose latest run carries a code this
+ * derivation newly adds (`provider_quota` and `process_lost` included) now records
+ * `infraClassCause: true`, whatever its cause bucket, where it used to record
+ * `false`. That change is intended: the field answers "was this failure
+ * infra-class?", and these codes are. Anyone reading `infraClassCause` in an
+ * incident write-up should expect it.
  *
  * Inheriting `timeout` is the one member included by consistency rather than by a
  * measured instance: no laundered `timeout` row exists in the live census. It is
@@ -1642,9 +1642,9 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
  * exhaustion is also a `timeout`, so it is the one code where agent behaviour is
  * plausibly causal. Kept because escalating a wall-clock exhaustion to a manager
  * who cannot make the agent faster is the load-concentration BLO-20933 exists to
- * stop. If it proves
- * wrong, subtract that one code here rather than un-deriving the set, and note that
- * subtracting it changes both readers: routing and the evidence arm.
+ * stop. If it proves wrong, subtract that one code here rather than un-deriving
+ * the set, and note that subtracting it changes both readers: routing and the
+ * evidence arm.
  *
  * Deliberately NOT inherited, and still escalating: `workspace_validation_failed`
  * and `configuration_incomplete` (both are `manual_repair_required` causes that
