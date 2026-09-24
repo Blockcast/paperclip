@@ -80,6 +80,7 @@ const {
     publishAgentLivenessGauges: vi.fn(async () => {}),
     publishGithubReviewDeadLetterGauge: vi.fn(async () => {}),
     publishAgentWakeupTerminalFailedGauge: vi.fn(async () => {}),
+    publishCrashRecoveryCandidateIndexGauge: vi.fn(async () => true),
     tickTimers: vi.fn(async () => ({ checked: 0, enqueued: 0, skipped: 0 })),
   };
   const heartbeatServiceFactoryMock = vi.fn(() => heartbeatServiceMock);
@@ -570,6 +571,58 @@ describe("startServer feedback export wiring", () => {
     }
   });
 
+  // BLO-21526 (Ally round 1 on #1933): the crash-recovery candidate-index
+  // gauge's only publisher was the gate read inside `reconcileWorkerCrashedRuns`,
+  // whose periodic call site sits below the suppression gate AND behind the
+  // `crashReconcileSweepInFlight` latch — so a suppressed replica published
+  // nothing, and the series was never published during startup recovery at
+  // all. That matters more than for the BLO-31335 gauges: suppression includes
+  // `database_restore_in_progress`, and a restored database is a leading way
+  // to end up WITHOUT the index. A cleared series also makes the `== 0`
+  // Missing alert structurally silent, leaving only Unobservable, whose
+  // remediation names three things that all look healthy under a restore.
+  it("publishes the crash-recovery candidate-index gauge on a suppressed tick, without reaching the reconcile pass", async () => {
+    const schedulerIntervalMs = 30000;
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: schedulerIntervalMs,
+    }));
+    resolveHeartbeatSchedulingSuppressionMock.mockReturnValue({
+      suppressed: true,
+      reason: "database_restore_in_progress",
+    });
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void, delay?: number) => {
+        if (delay === schedulerIntervalMs) intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    try {
+      await startServer();
+
+      // Pre-tick control, with the same caveat as the sibling tests: under
+      // suppression `startServer` skips startup recovery entirely, so this
+      // establishes only that any call seen below came FROM the tick.
+      expect(heartbeatServiceMock.publishCrashRecoveryCandidateIndexGauge).not.toHaveBeenCalled();
+
+      expect(intervalCallback).not.toBeNull();
+      intervalCallback?.();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // The point of the fix. Removing the ungated registration in index.ts
+      // must fail exactly here.
+      expect(heartbeatServiceMock.publishCrashRecoveryCandidateIndexGauge).toHaveBeenCalledTimes(1);
+      // ...and it got there without the gated pass that used to be its only
+      // publisher being reached at all.
+      expect(heartbeatServiceMock.reconcileWorkerCrashedRuns).not.toHaveBeenCalled();
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
   // BLO-33539 (Ally round 1): the undeliverable-monitor reconciler is a
   // producer-agnostic backstop, so it must not be a link in the long serial
   // recovery chain — that chain has a single terminal catch, and the
@@ -693,6 +746,14 @@ describe("startServer feedback export wiring", () => {
       // but its position relative to the *recovery* gate is a behaviour change
       // of this diff (it used to sit below) and is only covered here.
       expect(heartbeatServiceMock.publishAgentLivenessGauges).toHaveBeenCalledTimes(1);
+      // BLO-21526 (Ally round 2 on #1933): FOUR publishers now. The suppressed
+      // sibling test above pins this gauge against the suppression gate only —
+      // it never starts recovery, so it cannot see the recovery gate at all.
+      // This is the case the comment at index.ts claims and nothing asserted:
+      // a tick fired while `heartbeatStartupRecoveryPending` is true must
+      // still publish. It is the longer window of the two, because a boot
+      // lasts minutes where a suppressed tick lasts one interval.
+      expect(heartbeatServiceMock.publishCrashRecoveryCandidateIndexGauge).toHaveBeenCalledTimes(1);
       // Control that the recovery guard really is still closed. Without this the
       // test could pass for the trivial reason that recovery had already
       // drained, proving nothing about where the registrations sit.

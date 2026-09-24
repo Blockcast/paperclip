@@ -133,9 +133,13 @@ jobs:
           # human or still building, a second one just splits the reviewer's attention
           # and risks a double roll. Observed live on 2026-08-30: two dispatches 28min
           # apart, and docker.yml's own guard had to skip the second one's deploy.
+          # `headSha` is read by the stall-clock derivation (PEN-3315 follow-up),
+          # which needs the waiting run's head to test whether a cancelled
+          # predecessor is a strict ancestor of it — i.e. whether it was
+          # superseded rather than cancelled for some other reason.
           gh run list --repo "$REPO" --workflow=docker.yml \
               --event=workflow_dispatch --limit 20 \
-              --json databaseId,status,createdAt,url \
+              --json databaseId,status,createdAt,url,headSha \
               --jq '[.[] | select(.status == "waiting" or .status == "in_progress" or .status == "queued")]' \
               > "$PENDING_JSON_PATH"
           PENDING="$(jq 'length' "$PENDING_JSON_PATH")"

@@ -63,6 +63,7 @@ import {
   formatGateRevalidationSections,
   resolvedButOpenIssueIds,
   revalidateGates,
+  withheldFromAgeRankingIssueIds,
   type GateEvidenceInput,
 } from "./human-gated-gate-revalidation.js";
 // The second producer on this seam (BLO-30259). Reads
@@ -492,10 +493,15 @@ export async function loadGateEvidence(
  * the BLO-30608 gate re-validation pass in front of it.
  *
  * Order matters and is the point of BLO-30608: re-validation runs **first**, and
- * the rows it finds `resolved-but-open` are withheld from the age-ranked list
- * rather than aged another day as if they were still waiting. They are not
- * dropped — they are rendered in their own section, carrying their age, so
- * reclassification never loses information a reader had before.
+ * a row whose gate re-tests as resolved is reported in its own section, carrying
+ * its age, rather than aged another day as if the gate were still live.
+ *
+ * PEN-3089 narrowed what that section *exempts*. Being resolved no longer
+ * removes a row from the age-ranked list on its own: only a resolution that
+ * left nothing owed does ({@link withheldFromAgeRankingIssueIds}). A gate that
+ * resolved by the requester withdrawing the ask, or by the board granting work
+ * nobody then performed, keeps the row escalated — those are the states where
+ * the row most needs a reader, and they were the ones being dropped.
  */
 export const humanGatedAgeingProducer: DigestProducer = {
   key: "human-gated-ageing",
@@ -522,11 +528,17 @@ export const humanGatedAgeingProducer: DigestProducer = {
     const byAgeDescending = orderByHumanSilenceDescending(candidates, now);
     const evidence = await loadGateEvidence(db, companyId, byAgeDescending);
     const revalidation = revalidateGates(evidence, { maxProbes: DEFAULT_MAX_PROBES });
-    const withheld = resolvedButOpenIssueIds(revalidation);
+    // Two sets, deliberately not one (PEN-3089). Every resolved-but-open row is
+    // rendered with its age, so `resolvedRows` drives the age map; only the
+    // rows whose resolution left nothing owed are exempted from escalation, so
+    // the narrower `withheld` drives the filter. Using one set for both is what
+    // let an ask the requester withdrew delete its row from the age-ranked list.
+    const resolvedRows = resolvedButOpenIssueIds(revalidation);
+    const withheld = withheldFromAgeRankingIssueIds(revalidation);
 
     const ageDaysByIssueId = new Map<string, number>(
       candidates
-        .filter((candidate) => withheld.has(candidate.id))
+        .filter((candidate) => resolvedRows.has(candidate.id))
         .map((candidate) => [candidate.id, rankableSilenceDays(candidate, now)])
         // An unrankable row has no age to render; omitting it leaves the entry
         // absent so the renderer prints no age rather than a fabricated one.
@@ -565,6 +577,18 @@ export const humanGatedAgeingProducer: DigestProducer = {
     return {
       key: "human-gated-ageing",
       markdown,
+      // Item *mentions* across the two rendered sections, not distinct rows.
+      // Before PEN-3089 the two addends were disjoint — every resolved-but-open
+      // row was withheld from the age-ranked list — so the sum was an exact row
+      // count. Now an action-owed resolved row is rendered in both sections and
+      // counted twice, and since escalation also requires passing the silence
+      // threshold, that overlap covers most of the newly-escalated population.
+      // Left as a sum deliberately: this value is telemetry (a digest-size
+      // signal and a log field), never control flow, and an exact distinct
+      // count would mean plumbing the over-threshold issue ids out of
+      // `selectAgedHumanGatedIssues` to serve a number nothing branches on. The
+      // meaning is recorded here so the next reader does not mistake it for a
+      // row count.
       itemCount: report.totalOverThreshold + revalidation.counts["resolved-but-open"],
     };
   },

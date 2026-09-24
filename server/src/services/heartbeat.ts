@@ -4,7 +4,7 @@ import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
 import { and, asc, desc, eq, exists, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, not, notInArray, or, sql, type SQL } from "drizzle-orm";
-import type { Db } from "@paperclipai/db";
+import type { Db, DbTransaction } from "@paperclipai/db";
 
 /**
  * Either the pool or an open transaction. BLO-19722 needs a handful of writes
@@ -12,8 +12,7 @@ import type { Db } from "@paperclipai/db";
  * helpers they go through accept an executor rather than always closing over
  * the pool.
  */
-type HeartbeatTx = Parameters<Parameters<Db["transaction"]>[0]>[0];
-type HeartbeatDbExecutor = Db | HeartbeatTx;
+type HeartbeatDbExecutor = Db | DbTransaction;
 
 /**
  * Outcome of `enqueueProcessLossRetry` (BLO-19722).
@@ -264,7 +263,6 @@ import {
   resolveAgentEmptyWorkspaceSourceDir,
   resolveDefaultAgentWorkspaceDir,
   resolveManagedProjectWorkspaceDir,
-  resolvePaperclipInstanceRoot,
 } from "../home-paths.js";
 import {
   buildHeartbeatRunIssueComment,
@@ -303,6 +301,7 @@ import {
 } from "./github-app-auth.js";
 import { loadConfig } from "../config.js";
 import { enqueueGithubCommitStatusDelivery } from "./github-status-delivery-outbox.js";
+import { resolveSharedDocSearchBoundaryPath } from "./shared-doc-search-boundary.js";
 import { pullRequestExternalId } from "./pull-request-work-products.js";
 import {
   ensureReferencedSharedDocsMaterialized,
@@ -444,6 +443,7 @@ import {
   setReleasePendingExternalRuntimeReservationMetrics,
   setOrphanedEnvironmentLeaseMetrics,
   setOrphanedRuntimeResourceMetricsRefreshSuccess,
+  setCrashRecoveryCandidateIndexPresent,
 } from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
 import { runLifecycleHook } from "./lifecycle-hook.js";
@@ -586,7 +586,6 @@ import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { createServerGbrainClient } from "./gbrain-client-factory.js";
 import { runSweepWakePreflight } from "./sweep-wake-preflight.js";
 
-type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type WakeCoalescingDb = Pick<Db | DbTransaction, "select" | "update" | "insert">;
 
 // Run statuses considered terminal. Used to gate the agent-image-bump
@@ -3734,6 +3733,65 @@ function isNonRetryablePrReviewTerminalOutcome(
   return recovery.adapterInvocationStarted === true;
 }
 
+/**
+ * BLO-34699: did this terminal run actually produce a REVIEW VERDICT we may
+ * publish to the PR gate?
+ *
+ * Deliberately NOT the same question as `isNonRetryablePrReviewTerminalOutcome`,
+ * whose other two callers ask "is this run terminal for recovery routing" — a
+ * pod that never scheduled IS terminal for its own run, so those must keep the
+ * wider predicate. Publishing a commit status is a different claim: it asserts
+ * something about the HEAD, and a run that never invoked its adapter made no
+ * judgement about the head at all.
+ *
+ * Measured on Blockcast/paperclip, 2026-09-19. Four heads were stamped
+ * `review/ally-complete = failure` with "ended ambiguously and was not
+ * replayed; no review was confirmed"; a genuine, non-stale formal review then
+ * landed at that EXACT head on three of them, 4h59m–5h48m later (#1929
+ * 17:04:56Z→22:53:23Z, #1931 19:42:17Z→00:55:38Z, #1932 19:56:56Z→00:56:06Z).
+ * Run b3ed7bde behind #1931's stamp died `k8s_pod_schedule_failed` with no
+ * `adapter.invoke` event at all. So the gate was not merely early, it was
+ * asserting a verdict about a head that no reviewer had yet read — and
+ * `review/ally-complete` has no writer that ever clears it, so #1929 still
+ * carries that red beside a `gate/ally-comment-findings: success` for the same
+ * head, the two gates contradicting each other ~14h on.
+ *
+ * Not a one-off: `k8s_pod_schedule_failed` is 38 of the reviewer's last 1000
+ * runs (26h window), and BLO-34577 records tenant-wide 429s being mis-tagged
+ * into it. The 5h band matches the reviewer's own dispatch-queue wait, i.e. the
+ * first dispatch was killed by capacity and a later one served the same request.
+ *
+ * `adapterInvocationStarted` is the existing durable proof of an `adapter.invoke`
+ * run event, already required by the `pr_review_output_missing` /
+ * `pr_review_verification_unavailable` arms above. All this adds is requiring it
+ * of the two infra codes as well, by requiring it of everything:
+ *  - `k8s_pod_schedule_failed` never computes it (`hasAdapterInvocationEvent` is
+ *    consulted only for `job_failed`/`job_missing`), so it can never grade — the
+ *    wanted outcome, the pod did not start;
+ *  - `job_missing` is "only produced after adapter.invoke" per the retry-admission
+ *    comment above, so it normally still grades, and the genuine
+ *    reviewer-ran-and-posted-nothing case is preserved;
+ *  - the two `pr_review_*` arms already proved it, so they are unchanged.
+ *
+ * That last point is why this is one condition and not a per-code branch, and it
+ * also sets the default for any code added to the predicate above later: a new
+ * arm publishes a verdict only once it can show the reviewer ran. Failing toward
+ * not-publishing is the safe direction — a missing status blocks under
+ * BLO-26572 exactly as a red one does, without asserting a falsehood about the
+ * head.
+ *
+ * NOTE the deliberate boundary: suppressing the false verdict does not make an
+ * uninvoked reviewer run visible. That is BLO-34577 (mis-tagged 429 → review
+ * silently dropped, no auto-retry) and is not fixed here.
+ */
+export function producedPrReviewGateVerdict(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson" | "contextSnapshot">,
+) {
+  if (!isNonRetryablePrReviewTerminalOutcome(run)) return false;
+  const recovery = parseObject(parseObject(run.resultJson).externalLifecycleRecovery);
+  return recovery.adapterInvocationStarted === true;
+}
+
 export async function assertGitWorktreeBaseWorkspaceReady(input: {
   requestedExecutionWorkspaceMode: ReturnType<typeof resolveExecutionWorkspaceMode>;
   config: Record<string, unknown>;
@@ -5424,6 +5482,70 @@ export function k8sCcrotateRetryDelayMs(result: { retryNotBefore?: string | null
   );
 }
 
+// BLO-34577: the in-run ccrotate throttle loop re-invokes the k8s adapter for
+// the SAME runId after a zero-progress 429. Each replacement attempt is a fresh
+// Job launch, and that launch can itself fail before any pod runs
+// (`k8s_pod_schedule_failed`). Observed 2026-09-18 on 7 Ally pr_review runs:
+// the adapter read the PREVIOUS attempt's Failed pod -- same deterministic Job
+// name, deleted in the background -- as the replacement's ~100 ms after create
+// and returned `k8s_pod_schedule_failed`. The loop broke on that non-throttle
+// result and the finalizer recorded the code verbatim, which
+// `shouldScheduleAutomaticRunRetry` and `isNonRetryablePrReviewTerminalOutcome`
+// treat as terminal: no retry was minted, the review was dropped, and the gate
+// posted `non_retryable_external_lifecycle`. The identical 429 finalized through
+// the throttle path retries on the flat rate-limit curve.
+//
+// The adapter no longer reads a foreign pod (it scopes lookups to the created
+// Job's UID), but the server verdict must not depend on that: once this run has
+// observed >= 1 zero-progress throttle, a replacement launch that fails before
+// its pod runs adds no information about the WORK -- no attempt made model
+// progress (the loop only retries zero-token results) and this attempt's pod
+// never ran -- so the run's cause is still the throttle. Finalize with the
+// throttle verdict and record the launch failure as an annotation, so the
+// `provider_throttled_no_progress` / `rate_limit_exhausted` path schedules the
+// bounded retry it would have scheduled had the loop simply exhausted.
+//
+// Deliberately narrow: a `k8s_pod_schedule_failed` with NO prior throttle in
+// this run is left exactly as reported. That outcome is ambiguous, and the
+// "does not retry ambiguous k8s_pod_schedule_failed" contract still holds.
+export const K8S_REPLACEMENT_LAUNCH_FAILURE_AFTER_THROTTLE_KEY =
+  "replacementLaunchFailureAfterThrottle" as const;
+
+export function reclassifyK8sReplacementLaunchFailureAfterThrottle(input: {
+  launchResult: AdapterExecutionResult;
+  throttleResult: AdapterExecutionResult | null;
+  throttleAttempts: number;
+}): AdapterExecutionResult | null {
+  const { launchResult, throttleResult, throttleAttempts } = input;
+  if (!throttleResult || throttleAttempts < 1) return null;
+  if (launchResult.errorCode !== "k8s_pod_schedule_failed") return null;
+  // A pod that never ran cannot have made model progress. If usage is reported
+  // anyway this is not the shape described above; leave the verdict alone.
+  if (!zeroTokenUsage(launchResult.usage)) return null;
+  // Only a result the loop itself judged a retryable throttle may stand in as
+  // the verdict; anything else and this was not a throttle chain.
+  if (!isRetryableK8sCcrotateThrottleResult(throttleResult)) return null;
+  const launchErrorMessage = readNonEmptyString(launchResult.errorMessage) ?? launchResult.errorCode;
+  const throttleErrorMessage =
+    readNonEmptyString(throttleResult.errorMessage) ?? "Provider throttled before model progress";
+  const retryNoun = throttleAttempts === 1 ? "retry" : "retries";
+  return {
+    ...throttleResult,
+    errorMessage:
+      `${throttleErrorMessage} (replacement Job launch after ${throttleAttempts} in-run throttle ` +
+      `${retryNoun} failed before its pod ran: ${launchErrorMessage})`,
+    resultJson: {
+      ...(throttleResult.resultJson ?? {}),
+      [K8S_REPLACEMENT_LAUNCH_FAILURE_AFTER_THROTTLE_KEY]: {
+        errorCode: launchResult.errorCode,
+        errorMessage: launchResult.errorMessage ?? null,
+        throttleAttempts,
+        throttleErrorCode: throttleResult.errorCode ?? null,
+      },
+    },
+  };
+}
+
 // The pinned claude_k8s/opencode_k8s adapters report their launch command as
 // this exact "kubectl job/<name>" sentinel (not the real invoked command) so
 // the reservation can learn the expected Job name before the post-create
@@ -5502,7 +5624,7 @@ async function materializeExternalK8sSharedDocs(input: {
   }
   if (!instructionsContents) return;
 
-  const sharedDocSearchBoundaryPath = resolvePaperclipInstanceRoot();
+  const sharedDocSearchBoundaryPath = resolveSharedDocSearchBoundaryPath();
   if (!sharedDocSourceRoots(sourceRootPath, sharedDocSearchBoundaryPath).some((root) => root !== sourceRootPath)) {
     // Not fatal: shared docs may genuinely live in the bundle. Logged because an external
     // bundle configured outside the instance root silently loses the company-root lookup,
@@ -10047,8 +10169,37 @@ function unavailablePrReviewVerification(reason: string) {
  *  - an operator opted in by configuring a context name (this server does not
  *    own the branch-protection rule, so it must not invent one);
  *  - the run is a PR-review run (`derivePaperclipPrReview`);
+ *  - the run is the REVIEWER's, not the author's (`reviewKind` / `prRole`);
  *  - the wake carried a repo AND an exact head SHA — statuses are per-commit,
  *    so a guessed SHA would fail an unrelated commit.
+ *
+ * BLO-34699: `derivePaperclipPrReview` answers "is this wake ABOUT a PR", which
+ * is true of both sides of one review. The author's own agent is woken by its
+ * own `<!-- paperclip:review-request -->` marker (BLO-19522, deliberate and not
+ * being removed), so an author run carries the same repo/head/PR identity as
+ * the reviewer run and used to resolve a target here. Measured on
+ * Blockcast/pim-multicast-gateway#3237: run 974efdbd on the PR AUTHOR's agent
+ * (`prRole: "author"`, `reviewKind: null`) died `k8s_pod_schedule_failed` at pod
+ * start with zero turns, and its crash was written as `review/ally-complete =
+ * failure` — while Ally's real review for that head was still QUEUED (oldest
+ * queued reviewer run 4.67h, matching the request age). `review-gate` is a
+ * scheduled peer of `ci-gate`, so that manufactured red made the PR unmergeable
+ * and could not self-heal: the gate re-runs on `pull_request_review: submitted`
+ * and Ally's common shape is a comment-shaped review, which never re-triggers it.
+ *
+ * Gating on the context's own `reviewKind`/`prRole` rather than on the agent
+ * id: both are stamped by the code that CHOSE whom to wake — the two reviewer
+ * wake constructors (`buildPrReviewerWakeupOptions` and
+ * `queueIssueAssignmentWakeup`'s PR-review branch) each set
+ * `reviewKind: "pr_review"` AND `prRole: "reviewer"`, while the author-directed
+ * path sets `prRole: "author"` and no `reviewKind`. That is the server's own
+ * recorded answer, rather than an identity re-derived at finalize time from a
+ * reviewer-agent-id config this module does not carry.
+ *
+ * The predicate is the one already used by `evaluatePrReviewCompletionEvidence`
+ * for the same question, deliberately: require a positive `pr_review` tag, and
+ * reject a `prRole` that is present and not the reviewer's. The measured case
+ * fails both clauses.
  */
 export function resolvePrReviewGateStatusTarget(
   contextSnapshot: Record<string, unknown> | null | undefined,
@@ -10058,6 +10209,8 @@ export function resolvePrReviewGateStatusTarget(
   if (!context) return null;
   const prReview = derivePaperclipPrReview(contextSnapshot);
   if (!prReview) return null;
+  if (prReview.reviewKind !== "pr_review") return null;
+  if (prReview.prRole && prReview.prRole !== "reviewer") return null;
   const { repoFullName, headSha, prNumber, prUrl } = prReview;
   if (!repoFullName || !headSha) return null;
   return { repoFullName, sha: headSha, context, prNumber, prUrl: prUrl ?? null };
@@ -12710,14 +12863,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const body = [
       `## Ally review did not land on \`${target.repoFullName}#${target.prNumber}\``,
       "",
-      `The Paperclip reviewer run for head \`${shortSha}\` ${cause}. **No review was posted, and none is coming for this head** — this is a terminal outcome, not reviewer latency.`,
+      // BLO-34699: this used to assert "none is coming for this head — a
+      // terminal outcome, not reviewer latency". That claim is about the QUEUE,
+      // and this function has not read the queue. It was measured false on
+      // Blockcast/pim-multicast-gateway#3237 at the moment it was written: a
+      // reviewer run for that exact head was queued and 4.67h old behind a
+      // firing PaperclipPrReviewConsumerStarved. Report only what this run did;
+      // a second request for the same head can still be in flight, and the old
+      // prescribed remedy (re-request / push a new head) is actively harmful
+      // against a starved queue — a re-request lengthens it and a push voids
+      // the head.
+      `The Paperclip reviewer run for head \`${shortSha}\` ${cause}. **No review was posted by that run**, and the gate below is red on its behalf.`,
       "",
       `- Head: \`${target.sha}\``,
       `- Gate status: \`${target.context}\` set to \`failure\` on that commit`,
       ...(target.prUrl ? [`- PR: ${target.prUrl}`] : []),
       `- Reviewer run: \`${run.id}\``,
       "",
-      "Re-request the review on the PR (a start-of-body `<!-- paperclip:review-request -->` marker **and** a bare `@ally` mention — the marker alone is silently dropped), or push a new head.",
+      "Check whether another review for this exact head is still queued before acting — this notice does not know. If one is, wait for it. If none is, re-request the review on the PR (a start-of-body `<!-- paperclip:review-request -->` marker **and** a bare `@ally` mention — the marker alone is silently dropped); pushing a new head voids any at-head attestation and is the last resort.",
     ].join("\n");
 
     for (const issue of linked) {
@@ -18437,14 +18600,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * index absent or invalid — so a latched worker would silently resume the
    * sequential scan and top-N sort this gate exists to prevent, with no further
    * catalog check ever. Revalidating on every periodic pass is Ally's own first
-   * remedy and needs no tunable: this is one indexed catalog lookup per
-   * scheduler tick per replica, which is noise next to the scan it guards
-   * against, and it makes the gate recover in BOTH directions.
+   * remedy and needs no tunable: this is one indexed catalog lookup, which is
+   * noise next to the scan it guards against, and it makes the gate recover in
+   * BOTH directions.
+   *
+   * Exported as `publishCrashRecoveryCandidateIndexGauge` and called a second
+   * time per tick from above both scheduler gates (BLO-21526). Two catalog
+   * lookups per tick per replica instead of one, deliberately: the gate needs
+   * its own read so it acts on the value it published, and the gauge needs a
+   * publisher that a suppressed or still-recovering replica reaches — a
+   * database restore both suppresses the scheduler AND is a leading way to
+   * lose the index, which is exactly where the signal must not go dark.
    *
    * A probe FAILURE means we do not know, so it skips this one periodic tick
-   * (startup recovery is ungated) and the next tick asks again.
+   * (startup recovery is ungated ON THE INDEX — it is still gated on
+   * scheduling suppression) and the next tick asks again.
    */
-  async function crashRecoveryCandidateIndexPresent(): Promise<boolean> {
+  async function crashRecoveryCandidateIndexPresent(
+    source: "gate" | "gauge",
+  ): Promise<boolean> {
     try {
       const rows = await db.execute(sql`
         select 1
@@ -18459,6 +18633,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         limit 1
       `);
       const present = Array.from(rows as unknown as Iterable<unknown>).length > 0;
+      // Published on every tick, in BOTH directions (BLO-21526). The warn
+      // below is latched to the absent transition and says nothing at all
+      // while the index is healthy, which is the same silent-on-healthy shape
+      // as the migration's swallowed RAISE NOTICE; the gauge is what lets an
+      // operator or a later deploy check confirm presence rather than merely
+      // observe quiet.
+      setCrashRecoveryCandidateIndexPresent(present);
       if (present) {
         // Re-arm the warning so a later disappearance is reported again rather
         // than being silenced by a warning issued before the index existed.
@@ -18470,18 +18651,46 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logger.warn(
           {
             index: "heartbeat_runs_crash_recovery_pending_idx",
+            // Which caller probed. The two run concurrently within a tick —
+            // the gauge publisher is tracked without `await` and the gate
+            // probes later in the same tick — and the latch above can be read
+            // as `false` by both before either sets it, so the absent
+            // TRANSITION can legitimately emit two lines. Tagging them is
+            // what stops an operator reading that as two distinct failures.
+            source,
             remediation:
               "CREATE INDEX CONCURRENTLY heartbeat_runs_crash_recovery_pending_idx ON heartbeat_runs USING btree (finished_at, id) WHERE error_code = 'worker_crashed' AND crash_recovery_completed_at IS NULL",
           },
-          "worker-crash candidate index missing or invalid; periodic crash reconciliation is disabled until it is built online (startup recovery still runs)",
+          // "startup recovery covers this only while scheduling is not
+          // suppressed", not the flat "startup recovery still runs" this used
+          // to claim: this publisher is called from above both scheduler gates
+          // (BLO-21526), so it now also emits on a suppressed replica — where
+          // `startServer` skips startup recovery entirely and NEITHER recovery
+          // path is running.
+          "worker-crash candidate index missing or invalid; periodic crash reconciliation is disabled until it is built online (startup recovery covers this only while scheduling is not suppressed)",
         );
       }
       return present;
     } catch (err) {
       // Never let a catalog probe failure take out the caller, and never cache
       // it: "we could not tell" is not evidence either way. Skips this periodic
-      // tick only; startup recovery is ungated.
-      logger.warn({ err }, "failed to probe worker-crash candidate index; skipping periodic reconciliation this tick");
+      // tick only; startup recovery is ungated on the index (though it is
+      // still gated on scheduling suppression).
+      //
+      // The gauge is cleared rather than set to 0 for the same reason: an
+      // unreadable catalog must not publish "the index is gone", and a stale 1
+      // left behind would publish "healthy" on no information (BLO-21526).
+      setCrashRecoveryCandidateIndexPresent(null);
+      // The consequence is the CALLER's, not the probe's: only the gate turns
+      // this into a skipped tick. The ungated gauge publisher makes no
+      // reconciliation decision at all — and on a suppressed replica there is
+      // no periodic reconciliation for it to be skipping.
+      logger.warn(
+        { err, source },
+        source === "gate"
+          ? "failed to probe worker-crash candidate index; skipping periodic reconciliation this tick"
+          : "failed to probe worker-crash candidate index; candidate-index gauge cleared for this tick",
+      );
       return false;
     }
   }
@@ -18548,7 +18757,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // caller passes `requireCandidateIndex` and is skipped until the index
     // exists; startup recovery is never gated, because that is the primary
     // recovery path and its cost is bounded and one-off.
-    if (options.requireCandidateIndex && !(await crashRecoveryCandidateIndexPresent())) {
+    if (options.requireCandidateIndex && !(await crashRecoveryCandidateIndexPresent("gate"))) {
       return {
         reconciledRunIds: [],
         retryRunIds: [],
@@ -19218,6 +19427,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         resumeAt: Date | null;
         penstockProvider?: string;
         penstockModel?: string;
+        penstockProbePath?: string;
         penstockRetryAfterSeconds?: number | null;
       } | null = null;
       const penstockCapacity = await checkPenstockAvailabilityForAgent({
@@ -19233,6 +19443,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           resumeAt: penstockCapacity.resumeAt,
           penstockProvider: penstockCapacity.provider,
           penstockModel: penstockCapacity.model,
+          penstockProbePath: penstockCapacity.probePath,
           penstockRetryAfterSeconds: penstockCapacity.retryAfterSeconds,
         };
         recordCcrotateCapacityDeferred({
@@ -19372,6 +19583,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             model: capacity.penstockModel,
             reason: capacity.reason,
             retryAfterSeconds: capacity.penstockRetryAfterSeconds,
+            probePath: capacity.penstockProbePath,
             advertisedResumeAtIso: capacity.resumeAt ? capacity.resumeAt.toISOString() : null,
             clampedFromIso: capacityRetryPlan.clampedFromIso,
             // Set once for the chain. `resolveCapacityEscalation` already echoed
@@ -19996,6 +20208,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // GitHub-evidence read and transient GitHub/token failures can retry.
       // Opt-in and swallowed so status delivery can never alter exhaustion
       // handling.
+      //
+      // BLO-34699: this arm deliberately does NOT require the
+      // `adapterInvocationStarted` proof the two non-retryable arms do, and the
+      // asymmetry is the point rather than an oversight. Exhaustion is a
+      // stronger claim to terminality: the bounded chain has run to its end, so
+      // nothing further is coming from this request whether or not any single
+      // attempt reached a model call. The non-retryable arms have no such
+      // chain behind them — one crashed pod is their whole evidence — which is
+      // why they need the extra proof. Do not "fix" this by symmetry.
       await queueFailedPrReviewGateStatus(run, contextSnapshot, "retry_exhausted").catch((error) => {
         logger.warn(
           { err: error, runId: run.id },
@@ -24981,7 +25202,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       reconciliationSweepSucceeded = false;
       logger.error(
         { error: error instanceof Error ? error.message : String(error) },
-        "reapOrphanedRuns: runtime-resource reconciliation sweep failed; backlog gauges will read stale and the freshness arm will page",
+        "reapOrphanedRuns: runtime-resource reconciliation sweep failed; the refresh in the finally below still runs, so the backlog gauges stay current and the freshness arm will page on incomplete reconciliation",
       );
     } finally {
       try {
@@ -31181,6 +31402,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               }
             }
             let ccrotateRetryAttempt = 0;
+            // BLO-34577: the most recent result the loop judged a retryable
+            // throttle. A replacement launch that fails before its pod runs is
+            // finalized with THIS verdict, not the launch failure's.
+            let lastInRunThrottleResult: Awaited<ReturnType<typeof adapter.execute>> | null = null;
             while (true) {
               const executionReservation = externalRuntimeReservation;
               if (executionReservation) {
@@ -31266,6 +31491,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 !isRetryableK8sCcrotateThrottleResult(adapterResult) ||
                 ccrotateRetryAttempt >= K8S_CCROTATE_IN_RUN_RETRY_MAX_ATTEMPTS
               ) {
+                // BLO-34577: a replacement Job whose launch failed before its
+                // pod ran, after this run already observed a zero-progress
+                // throttle, is still the throttle -- see
+                // reclassifyK8sReplacementLaunchFailureAfterThrottle. Without
+                // this the run finalized as `k8s_pod_schedule_failed`, which is
+                // terminal for pr_review, and the review was silently dropped.
+                const reclassified = isK8sAdapter(agent.adapterType)
+                  ? reclassifyK8sReplacementLaunchFailureAfterThrottle({
+                      launchResult: adapterResult,
+                      throttleResult: lastInRunThrottleResult,
+                      throttleAttempts: ccrotateRetryAttempt,
+                    })
+                  : null;
+                if (reclassified) {
+                  await appendRunEvent(currentRun, seq++, {
+                    eventType: "lifecycle",
+                    stream: "system",
+                    level: "warn",
+                    message:
+                      "replacement Job launch failed after an in-run ccrotate throttle; finalizing with the throttle verdict so the bounded retry is scheduled",
+                    payload: {
+                      launchErrorCode: adapterResult.errorCode ?? null,
+                      launchErrorMessage: adapterResult.errorMessage ?? null,
+                      throttleAttempts: ccrotateRetryAttempt,
+                      maxAttempts: K8S_CCROTATE_IN_RUN_RETRY_MAX_ATTEMPTS,
+                    },
+                  });
+                  await onLog(
+                    "stderr",
+                    `[paperclip] Replacement Job launch failed after ${ccrotateRetryAttempt} in-run throttle ${ccrotateRetryAttempt === 1 ? "retry" : "retries"}; recording the run as provider-throttled so it is retried.\n`,
+                  );
+                  adapterResult = reclassified;
+                }
                 break;
               }
               // BLO-18278: if the provider advertised a reset the in-run loop
@@ -31320,6 +31578,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 break;
               }
               ccrotateRetryAttempt += 1;
+              lastInRunThrottleResult = adapterResult;
               const retryDelayMs = k8sCcrotateRetryDelayMs(adapterResult);
               if (externalRuntimeReservation) {
                 // The completed Job belongs to the attempt that just returned.
@@ -32903,7 +33162,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * off the hot path.
    */
   async function hasQueuedReplacementIssueWake(
-    dbOrTx: typeof db | Parameters<Parameters<typeof db.transaction>[0]>[0],
+    dbOrTx: Db | DbTransaction,
     companyId: string,
     issueId: string,
     participantAgentId: string,
@@ -33117,7 +33376,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
 
       if (!issue) {
-        if (isNonRetryablePrReviewTerminalOutcome(run)) {
+        // BLO-34699: the gate arm requires proof the reviewer actually ran.
+        if (producedPrReviewGateVerdict(run)) {
           gateDelivery = await queueFailedPrReviewGateStatus(
             run,
             runContext,
@@ -33180,7 +33440,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ),
           );
       }
-      if (isNonRetryablePrReviewTerminalOutcome(run) && !finalizedRunStageSuperseded) {
+      // BLO-34699: `producedPrReviewGateVerdict`, not the wider recovery-routing
+      // predicate — a run that never invoked its adapter read nothing at this
+      // head, so it has no verdict to publish about it.
+      if (producedPrReviewGateVerdict(run) && !finalizedRunStageSuperseded) {
         // The outbox row is part of the ownership decision: a replacement run
         // cannot claim this issue until both the lock release and delivery
         // intent commit. Publishing the informational event can remain best
@@ -34463,6 +34726,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   model: gateResult.model,
                   reason: gateResult.reason,
                   retryAfterSeconds: gateResult.retryAfterSeconds,
+                  probePath: gateResult.probePath,
                   advertisedResumeAtIso: advertisedResumeAtIso,
                   clampedFromIso: capacityRetryPlan.clampedFromIso,
                   // First hop of a fresh chain by construction — this is the
@@ -38743,6 +39007,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     publishAgentLivenessGauges,
     publishGithubReviewDeadLetterGauge,
     publishAgentWakeupTerminalFailedGauge,
+    // BLO-21526: exported so the gauge has a publisher ABOVE both scheduler
+    // gates, not only the gated reconciliation's own gate read. Same defect
+    // and same remedy as BLO-31335 — see the registration in index.ts.
+    publishCrashRecoveryCandidateIndexGauge: () => crashRecoveryCandidateIndexPresent("gauge"),
 
     getRunLogAccess,
 

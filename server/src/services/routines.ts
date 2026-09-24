@@ -1810,8 +1810,14 @@ export function routineService(
       ...input,
       automaticVariables,
     });
-    const allVariables = { ...getBuiltinRoutineVariableValues(), ...automaticVariables, ...resolvedVariables };
+    // Resolve the slot BEFORE interpolating: the built-ins render `triggeredAt`, not the
+    // dispatch instant, so a late or multi-slot catch-up stamps each issue with its own window.
     const triggeredAt = input.triggeredAtOverride ?? new Date();
+    const allVariables = {
+      ...getBuiltinRoutineVariableValues(triggeredAt),
+      ...automaticVariables,
+      ...resolvedVariables,
+    };
     const nextRunAt = input.nextRunAtOverride !== undefined
       ? input.nextRunAtOverride
       : input.trigger?.kind === "schedule" && input.trigger.cronExpression && input.trigger.timezone

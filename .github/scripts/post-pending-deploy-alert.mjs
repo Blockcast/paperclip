@@ -65,9 +65,28 @@
  *    threshold instead of firing continuously with a climbing age. The stall
  *    start comes from the durable record, and the age basis is the EARLIER of
  *    that and the oldest waiting run.
+ *
+ * WHAT ITS FOLLOW-UP CHANGED, AND WHY
+ * -----------------------------------
+ * (1) above is INERT on this repository. `Blockcast/paperclip` has
+ * `has_issues: false`, so `POST /issues` returns `410 Issues has been disabled
+ * in this repository` on every escalation; the permission reasoning was right
+ * but the feature is switched off, and no token scope reaches it. The clock in
+ * (2) therefore had no durable source, and the supersede shipped by PEN-3315
+ * duly reset it. Measured live 2026-09-18: a genuine stall running since
+ * 09-17T02:01:24Z reported `3.0h old, under the 6h threshold — not escalating`
+ * on a GREEN dispatcher run while `paperclip_api_deploy_commits_behind` read
+ * 107. That is the pre-PEN-2848 silent green, reintroduced by the fix.
+ *
+ * So the clock is now DERIVED rather than stored — from Actions run history,
+ * which is already retained 90 days and readable with the `actions: read` this
+ * workflow holds. See deploy-stall-chain.mjs. The issue record is kept for the
+ * repositories where it does work, and its 410 is reported as a configuration
+ * fact rather than an hourly warning.
  */
 import { appendFileSync, readFileSync } from 'node:fs';
 import {
+  DEPLOY_WORKFLOW_FILE,
   createGitHubClient,
   renderEscalationComment,
   renderStallIssueBody,
@@ -75,6 +94,11 @@ import {
   parseStallMarker,
   tryComment,
 } from './deploy-stall-record.mjs';
+import {
+  createAncestryProbe,
+  deriveStallStartFromSupersedeChain,
+  fetchCancelledDispatchRuns,
+} from './deploy-stall-chain.mjs';
 
 const DEFAULT_ALERTMANAGER_URL = 'http://alertmanager.monitoring.svc.cluster.local:9093';
 /**
@@ -183,6 +207,18 @@ export function buildAlert({
 }) {
   const hours = ageHours.toFixed(1);
   const pendingUrl = oldest.url ?? '(url unavailable)';
+  // The call to action must NOT be a run url. This step runs BEFORE the
+  // supersede step that cancels the very run it names, so `pendingUrl` is dead
+  // within seconds of every push and stays dead for the whole ~7h cycle —
+  // measured 2026-09-19: alert posted 23:31:17Z naming run 35455142403,
+  // cancelled 23:31:23Z, still named at 00:05Z. A human opening the link finds a
+  // cancelled run, which is this alert's own subject matter (BLO-26972).
+  //
+  // The queue filter is correct unconditionally: it lists whatever is on the
+  // gate at READ time, so no step ordering, no write-back of the replacement run
+  // id, and no supersede can stale it. `pendingUrl` is kept as observed-at-alert
+  // context and in the machine annotation, where a perishable value is honest.
+  const pendingQueueUrl = `https://github.com/${repo}/actions/workflows/${DEPLOY_WORKFLOW_FILE}?query=is%3Awaiting`;
   // A supersede replaces the run but not the stall, so these two differ whenever
   // the lane has been refreshed. Saying only one of them would either understate
   // the outage or point at a run that no longer exists.
@@ -203,7 +239,7 @@ export function buildAlert({
         `${repo} production deploy has been awaiting human approval for ${hours}h — ` +
         'the daily dispatcher is a no-op until it clears',
       description:
-        `A docker.yml deploy has been parked on the ${environment} reviewer gate since ` +
+        `A ${DEPLOY_WORKFLOW_FILE} deploy has been parked on the ${environment} reviewer gate since ` +
         `${stallSince} (${hours}h; threshold ${alertAfterHours}h).\n\n` +
         "While it waits, scheduled-production-deploy.yml's anti-stacking guard skips every " +
         'daily slot, so production drift grows and each skipped run still reports ' +
@@ -213,9 +249,13 @@ export function buildAlert({
             `current, so it is younger than the stall: it has been waiting since ${oldest.createdAt}. ` +
             'Nothing has been approved — the age above is how long a human has been needed.\n\n'
           : '') +
-        `Approve or reject the pending run to clear it: ${pendingUrl}\n\n` +
+        `Approve or reject the pending deploy to clear it: ${pendingQueueUrl}\n` +
+        'That link lists whatever is on the gate right now. Do not bookmark an individual run: ' +
+        'a stale one is cancelled and replaced whenever master moves past it, so approve ' +
+        `whichever run is waiting there. At the time of this alert that was ${pendingUrl}.\n\n` +
         `${waitingCount} deploy(s) currently waiting on this gate.` +
         (stallRecordUrl ? `\n\nDurable record (survives this alert's TTL): ${stallRecordUrl}` : ''),
+      pending_queue_url: pendingQueueUrl,
       pending_run_url: pendingUrl,
       pending_since: oldest.createdAt,
       stall_since: stallSince,
@@ -282,6 +322,12 @@ async function main() {
   const client = createGitHubClient();
   let record = null;
   let recordReadFailed = false;
+  // Tracked separately from the record read so the two degradations stay
+  // distinguishable in the log, but folded into the same fatal condition: both
+  // mean the stall age could not be established from a source that survives a
+  // supersede, and reporting an unjudgeable age as "not stuck" is the silent
+  // green PEN-2848 exists to prevent.
+  let chainReadFailed = false;
   try {
     record = await client.findOpenStallIssue();
   } catch (err) {
@@ -303,17 +349,58 @@ async function main() {
 
   let verdict;
   try {
-    const oldestWaitingCreatedAt = (pendingRuns ?? [])
+    const waitingRuns = (pendingRuns ?? [])
       .filter((run) => run?.status === 'waiting' && Number.isFinite(Date.parse(run?.createdAt)))
-      .map((run) => run.createdAt)
-      .sort((a, b) => Date.parse(a) - Date.parse(b))[0];
+      .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
+    const oldestWaitingCreatedAt = waitingRuns[0]?.createdAt;
+
+    // Derive the stall clock from run history. This is what keeps the age honest
+    // across a supersede in a repository where the durable record cannot be
+    // written (`has_issues: false` -> 410). It runs BEFORE the stuck verdict
+    // because it is an input to it.
+    let chainStallStartedAt = null;
+    if (waitingRuns[0]) {
+      try {
+        const cancelledRuns = await fetchCancelledDispatchRuns({ client });
+        const chain = await deriveStallStartFromSupersedeChain({
+          oldestWaitingRun: waitingRuns[0],
+          cancelledRuns,
+          isAncestor: createAncestryProbe({ client }),
+        });
+        chainStallStartedAt = chain.stallStartedAt;
+        if (chain.links.length > 0) {
+          const unverified = chain.links.filter((link) => !link.ancestryVerified).length;
+          console.log(
+            `Supersede chain: ${chain.links.length} link(s) back to ${chain.stallStartedAt} ` +
+              `(stopped: ${chain.stoppedBecause}` +
+              `${unverified > 0 ? `, ${unverified} ancestry-unverified` : ''}). ` +
+              `Cancelled predecessors: ${chain.links.map((l) => l.cancelledRunId).join(', ')}.`,
+          );
+        }
+      } catch (err) {
+        // Non-fatal on its own: the chain is an enhancement over run-only
+        // ageing, so losing it degrades to the previous behaviour rather than
+        // breaking the escalation. It IS counted as a failed clock read below,
+        // which is what makes the degradation visible instead of silent.
+        chainReadFailed = true;
+        console.error(
+          `::error::Could not derive the stall clock from run history: ${err.message}. ` +
+            'Ageing from the pending run alone, which UNDERSTATES the stall if it has been ' +
+            'superseded.',
+        );
+      }
+    }
+
     const { stallStartedAt, source } = resolveStallStartedAt({
       marker,
       issueCreatedAt: record?.created_at,
       oldestWaitingCreatedAt,
+      chainStallStartedAt,
       alertAfterHours,
     });
-    if (record) console.log(`Stall start ${stallStartedAt} (source: ${source}).`);
+    if (record || chainStallStartedAt) {
+      console.log(`Stall start ${stallStartedAt} (source: ${source}).`);
+    }
 
     verdict = selectStuckApproval({ pendingRuns, alertAfterHours, now, stallStartedAt });
   } catch (err) {
@@ -351,7 +438,7 @@ async function main() {
     // With a waiting run under threshold the record IS record-sensitive — an
     // earlier recorded start would push the age over — so a failed read there is
     // still an unjudgeable age and still fatal.
-    if (recordReadFailed && verdict.oldest) process.exit(1);
+    if ((recordReadFailed || chainReadFailed) && verdict.oldest) process.exit(1);
     return;
   }
 
@@ -412,7 +499,7 @@ async function main() {
       `firing until ${alert.endsAt}. Stall since ${alert.annotations.stall_since}; ` +
       `pending run waiting since ${alert.annotations.pending_since}.`,
   );
-  if (recordReadFailed) process.exit(1);
+  if (recordReadFailed || chainReadFailed) process.exit(1);
 }
 
 /**
@@ -459,6 +546,23 @@ async function upsertStallRecord({
     );
     return { number: created.number, url: created.html_url ?? null };
   } catch (err) {
+    // A 410 here is not a fault and not actionable: it means the repository has
+    // Issues switched off (`has_issues: false`), so this channel can never
+    // succeed and no token scope changes that. Measured on Blockcast/paperclip
+    // 2026-09-18. Warning hourly about a configuration that is not going to
+    // change is noise that trains people to ignore the annotation, so say it
+    // once, plainly, and point at what actually carries the property: the
+    // dispatcher's own run history, which is retained 90 days and is where the
+    // stall clock is now derived from.
+    if (err.status === 410) {
+      console.log(
+        'Durable issue record unavailable: Issues are disabled on this repository (410), so ' +
+          'the escalation is audited from dispatcher run history instead — this red run and ' +
+          'its ::error:: annotation are themselves the durable trace, and the stall clock is ' +
+          'derived from the supersede chain (deploy-stall-chain.mjs).',
+      );
+      return { number: null, url: null };
+    }
     console.log(
       `::warning::Could not open the durable deploy-stall record: ${err.message}. ` +
         'The Alertmanager push below is unaffected, but this escalation will not be ' +
