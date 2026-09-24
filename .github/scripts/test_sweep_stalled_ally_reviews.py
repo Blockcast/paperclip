@@ -1378,6 +1378,12 @@ class TestDeferralHeaderReportsMeasuredDelivery(_RendersMainSummary, unittest.Te
             "0 of MAX_REFIRES_PER_RUN=%d delivered" % sweep.MAX_REFIRES_PER_RUN, summary
         )
         self.assertNotIn(self._spent_budget_claim(), summary)
+        # Attempts = delivered + rejected writes, so both failures count.
+        self.assertIn(
+            "2 of MAX_REFIRE_ATTEMPTS_PER_RUN=%d attempted"
+            % sweep.MAX_REFIRE_ATTEMPTS_PER_RUN,
+            summary,
+        )
 
     def test_the_delivered_figure_is_the_measured_count_not_the_cap(self):
         """Two delivered under a cap of five must read as two, so the header
@@ -1390,6 +1396,13 @@ class TestDeferralHeaderReportsMeasuredDelivery(_RendersMainSummary, unittest.Te
             "2 of MAX_REFIRES_PER_RUN=%d delivered" % sweep.MAX_REFIRES_PER_RUN, summary
         )
         self.assertNotIn(self._spent_budget_claim(), summary)
+        # No write failed, so attempted must equal delivered: the cap here
+        # would read as write failures that never happened.
+        self.assertIn(
+            "2 of MAX_REFIRE_ATTEMPTS_PER_RUN=%d attempted"
+            % sweep.MAX_REFIRE_ATTEMPTS_PER_RUN,
+            summary,
+        )
 
     def test_the_rotation_guarantee_is_withdrawn_when_a_write_failed(self):
         """A failed write starts no cooldown, so the deferred set does not

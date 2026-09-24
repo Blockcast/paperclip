@@ -1243,11 +1243,17 @@ def main(argv=None):
                 handle.write(
                     "\n### %d PR(s) eligible but deferred past this run's re-fire budget "
                     "(%d of MAX_REFIRES_PER_RUN=%d delivered, "
-                    "MAX_REFIRE_ATTEMPTS_PER_RUN=%d attempted)\n\n"
+                    "%d of MAX_REFIRE_ATTEMPTS_PER_RUN=%d attempted)\n\n"
                     % (
                         len(deferred),
                         len(refired),
                         MAX_REFIRES_PER_RUN,
+                        # Measured, like the delivered figure: every attempt
+                        # either lands in `refired` or is recorded as a write
+                        # failure. The bare cap here read as a delivered/
+                        # attempted shortfall, i.e. write failures, on a run
+                        # that had none.
+                        len(refired) + len(refire_write_failures),
                         MAX_REFIRE_ATTEMPTS_PER_RUN,
                     )
                 )
