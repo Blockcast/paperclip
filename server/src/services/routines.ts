@@ -1835,6 +1835,46 @@ export function routineService(
     const fingerprintCondition = routineExecutionFingerprintCondition(input.dispatchFingerprint);
     const fireAgeCutoff = new Date(input.now.getTime() - input.fireAgeHorizonMs);
     const liveRunCondition = liveHeartbeatRunConditionForRoutineDispatch(input.now, input.fireAgeHorizonMs);
+    // A row with a genuine unresolved blocker edge is dependency-parked,
+    // not wedged: it self-drains via `issue_blockers_resolved_sweep` when
+    // the blocker closes. Only the edge-less `blocked` row -- the
+    // BLO-27553 zero-wake-path strand this change targets -- is retired.
+    // `cancelled` blockers do not count as resolved, matching the
+    // dependency semantics used everywhere else.
+    //
+    // The self-join is written as raw SQL rather than with drizzle's
+    // `alias()` on purpose: interpolating an aliased table into a `sql`
+    // fragment emits only the alias NAME, so the join reads
+    // `join "supersede_blocker"` -- a table that does not exist. That is
+    // a runtime 42P01 inside the dispatch transaction, not a type error,
+    // so it compiles clean and only shows up when the supersede actually
+    // matches. Aliasing here is mandatory, not cosmetic: an unaliased
+    // second `issues` in the subquery would shadow the outer statement's
+    // target and make `issues.id` below self-correlate.
+    const noUnresolvedBlocker = sql`not exists (
+          select 1
+          from ${issueRelations}
+          join ${issues} as supersede_blocker
+            on supersede_blocker.id = ${issueRelations.issueId}
+          where ${issueRelations.relatedIssueId} = ${issues.id}
+            and ${issueRelations.type} = 'blocks'
+            and supersede_blocker.status <> 'done'
+        )`;
+    // Ally review, BLO-31996: a live recovery action is an explicit wake path
+    // too, but it lives in `issue_recovery_actions`, not `issue_relations`, so
+    // the edge check above cannot see it. Cancelling the source row would
+    // terminalise the work the recovery owner was handed while leaving the
+    // action's own lifecycle untouched, so it could never resume. The live set
+    // is the recovery service's own (`active` + `escalated`, recovery/service.ts
+    // waiting-path and hand-back drain queries): an escalated action is still
+    // owned by an operator who resolves it, so its source is protected here.
+    const noLiveRecoveryAction = sql`not exists (
+          select 1
+          from ${issueRecoveryActions}
+          where ${issueRecoveryActions.sourceIssueId} = ${issues.id}
+            and ${issueRecoveryActions.companyId} = ${issues.companyId}
+            and ${inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES])}
+        )`;
     const staleCondition = and(
       eq(issues.companyId, input.routine.companyId),
       eq(issues.originKind, input.originKind),
@@ -1847,46 +1887,8 @@ export function routineService(
       // has not been dispatched yet, so it must not be cancelled.
       isNotNull(issues.executionRunId),
       lte(issues.createdAt, fireAgeCutoff),
-      // A row with a genuine unresolved blocker edge is dependency-parked,
-      // not wedged: it self-drains via `issue_blockers_resolved_sweep` when
-      // the blocker closes. Only the edge-less `blocked` row -- the
-      // BLO-27553 zero-wake-path strand this change targets -- is retired.
-      // `cancelled` blockers do not count as resolved, matching the
-      // dependency semantics used everywhere else.
-      //
-      // The self-join is written as raw SQL rather than with drizzle's
-      // `alias()` on purpose: interpolating an aliased table into a `sql`
-      // fragment emits only the alias NAME, so the join reads
-      // `join "supersede_blocker"` -- a table that does not exist. That is
-      // a runtime 42P01 inside the dispatch transaction, not a type error,
-      // so it compiles clean and only shows up when the supersede actually
-      // matches. Aliasing here is mandatory, not cosmetic: an unaliased
-      // second `issues` in the subquery would shadow the outer statement's
-      // target and make `issues.id` below self-correlate.
-      sql`not exists (
-            select 1
-            from ${issueRelations}
-            join ${issues} as supersede_blocker
-              on supersede_blocker.id = ${issueRelations.issueId}
-            where ${issueRelations.relatedIssueId} = ${issues.id}
-              and ${issueRelations.type} = 'blocks'
-              and supersede_blocker.status <> 'done'
-          )`,
-      // Ally review, BLO-31996: a live recovery action is an explicit wake path
-      // too, but it lives in `issue_recovery_actions`, not `issue_relations`, so
-      // the edge check above cannot see it. Cancelling the source row would
-      // terminalise the work the recovery owner was handed while leaving the
-      // action's own lifecycle untouched, so it could never resume. The live set
-      // is the recovery service's own (`active` + `escalated`, recovery/service.ts
-      // waiting-path and hand-back drain queries): an escalated action is still
-      // owned by an operator who resolves it, so its source is protected here.
-      sql`not exists (
-            select 1
-            from ${issueRecoveryActions}
-            where ${issueRecoveryActions.sourceIssueId} = ${issues.id}
-              and ${issueRecoveryActions.companyId} = ${issues.companyId}
-              and ${inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES])}
-          )`,
+      noUnresolvedBlocker,
+      noLiveRecoveryAction,
       ...(fingerprintCondition ? [fingerprintCondition] : []),
     );
 
@@ -1908,6 +1910,14 @@ export function routineService(
     // issue row, which is what makes the issue lock the right one to serialise
     // on. Two statements instead of one is the cost of the cancellation
     // decision and the liveness decision being the same decision.
+    //
+    // The blocker-edge and recovery-action guards are re-evaluated by the
+    // UPDATE too, for a different reason: neither write touches the `issues`
+    // row (a recovery upsert inserts straight into `issue_recovery_actions`,
+    // issue-recovery-actions.ts `upsertSourceScopedUnlocked`), so the issue
+    // lock does not serialise them, and a `for update` that blocked on the
+    // lock evaluated them under a snapshot taken before they committed. All
+    // three protections are therefore decided by the post-lock statement.
     const locked = await input.executor
       .select({ id: issues.id })
       .from(issues)
@@ -1946,23 +1956,11 @@ export function routineService(
               )
               and ${liveRunCondition}
           )`,
+          noUnresolvedBlocker,
+          noLiveRecoveryAction,
         ),
       )
       .returning({ id: issues.id, identifier: issues.identifier, createdAt: issues.createdAt });
-
-    for (const row of stale) {
-      logger.warn(
-        {
-          routineId: input.routine.id,
-          issueId: row.id,
-          issueIdentifier: row.identifier,
-          fireCreatedAt: row.createdAt.toISOString(),
-          fireAgeMs: input.now.getTime() - row.createdAt.getTime(),
-          fireAgeHorizonMs: input.fireAgeHorizonMs,
-        },
-        "cancelled routine execution issue whose fire outlived its cadence so the successor fire can dispatch",
-      );
-    }
 
     return stale;
   }
@@ -2279,6 +2277,7 @@ export function routineService(
     });
     let supersededStaleIssues: { id: string; identifier: string | null; createdAt: Date }[] = [];
     let supersededFireAgeHorizonMs = 0;
+    let supersededAtMs = 0;
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await tx.execute(
@@ -2416,6 +2415,7 @@ export function routineService(
           });
           supersededStaleIssues = superseded;
           supersededFireAgeHorizonMs = fireAgeHorizonMs;
+          supersededAtMs = dispatchNow.getTime();
         }
 
         try {
@@ -2529,13 +2529,24 @@ export function routineService(
       }
     });
 
-    // Ally review, BLO-31996: the counter is process-local and does not roll
-    // back, so it is bumped only once the transaction carrying the cancellation
-    // UPDATE has committed. Bumped inside the supersede loop it attested a
-    // disposal that a later abort undid -- least useful exactly when a wedge
-    // is recurring.
-    for (let i = 0; i < supersededStaleIssues.length; i += 1) {
+    // Ally review, BLO-31996: the counter and the log line are process-local
+    // and do not roll back, so both are emitted only once the transaction
+    // carrying the cancellation UPDATE has committed. Emitted inside the
+    // supersede they attested a disposal that a later abort undid -- least
+    // useful exactly when a wedge is recurring.
+    for (const row of supersededStaleIssues) {
       incrementRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue");
+      logger.warn(
+        {
+          routineId: input.routine.id,
+          issueId: row.id,
+          issueIdentifier: row.identifier,
+          fireCreatedAt: row.createdAt.toISOString(),
+          fireAgeMs: supersededAtMs - row.createdAt.getTime(),
+          fireAgeHorizonMs: supersededFireAgeHorizonMs,
+        },
+        "cancelled routine execution issue whose fire outlived its cadence so the successor fire can dispatch",
+      );
     }
     // Same reason the counter is out here: these are best-effort receipts for a
     // cancellation that has already committed, and inside the transaction a
