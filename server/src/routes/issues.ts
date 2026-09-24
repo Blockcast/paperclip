@@ -88,7 +88,6 @@ import {
   type IssueWakeDiagnosticsResponse,
   type IssueRelationIssueSummary,
   type IssueWatchdogDiscoveryKind,
-  type ProjectManagedByPlugin,
   type ProjectWorkspace,
   type SourceTrustMetadata,
   type SuccessfulRunHandoffState,
@@ -155,6 +154,7 @@ import {
   publicExecutionWorkspace,
   publicIssueExecutionWorkspaceSettings,
   publicProjectExecutionWorkspacePolicy,
+  publicProjectManagedByPlugin,
   publicProjects,
   publicProjectWorkspace,
   resolveWorkspaceRuntimeViewer,
@@ -7825,85 +7825,16 @@ export function issueRoutes(
   }
 
   /**
-   * Mask the one open field on a project's plugin binding (PEN-3114, door #15 of the
-   * PEN-2370 series; ask 1 — names survive, values elided).
+   * `managedByPlugin.defaultsJson` is masked by `publicProjectManagedByPlugin`
+   * (`routes/workspace-response.ts`), which carries the full rationale for the walk it delegates to
+   * and for why the mask is unconditional where the runtime-config exits around it are gated.
    *
-   * `compactIssueProject` below is a projection, and the `env: null` line in it proves
-   * the author treated this response as a withholding boundary. `managedByPlugin`
-   * crossed it verbatim. `ProjectManagedByPlugin.defaultsJson` is an open
-   * `Record<string, unknown>` (`packages/shared/src/types/project.ts`) over a `jsonb`
-   * column, and its `settings` leaf is copied straight out of a plugin manifest's
-   * `PluginManagedProjectDeclaration.settings` — "Optional plugin-specific defaults"
-   * (`packages/shared/src/types/plugin.ts`) — via `buildManagedProjectDefaults`
-   * (`services/projects.ts`). That block is authored by a plugin author rather than by
-   * a Paperclip operator, and integration config is a natural home for a credential.
-   *
-   * Enumerated rather than spread, so a field added to `ProjectManagedByPlugin` later
-   * has to be considered here instead of crossing silently — the same reason the
-   * enclosing function is a projection rather than a spread.
-   *
-   * ## Why delegate, and why to this walk
-   *
-   * `defaultsJson` goes through `maskWorkspaceRuntimeForRead` rather than a second walk
-   * written here: copying one is exactly how the array-shaped (#1574) and JSON-string
-   * (#1583) bypasses each shipped, so a finding against that walk should land here too.
-   * Its contract is the one ask 1 asks for — every value masked, every key name kept,
-   * anything that is not an object or array masked outright, depth-capped fail-closed.
-   * The last two matter more than they look: the column is `jsonb`, so the runtime value
-   * is arbitrary regardless of what the TypeScript type claims.
-   *
-   * Its `commands`/`services`/`jobs` identity carve-out is *inert* here — the platform
-   * writes `projectKey`/`displayName`/`description`/`status`/`color`/`settings` and none
-   * of those is one of those three array names. If a manifest ever did write a top-level
-   * `services` array, the carve-out would preserve only `id`/`name`/`label`/`title`
-   * strings on its entries, which that walk already discloses in the strictly more
-   * sensitive workspace-runtime position; the residual is bounded and no worse there.
-   *
-   * `withholdAgentConfigKeys` (#1581) was checked first and does not fit: it is keyed on
-   * the literal names `adapterConfig`/`runtimeConfig`, and it blanks its target to `{}`,
-   * which erases the key names ask 1 requires be kept.
-   *
-   * ## Why this is masked unconditionally, when the runtime exits above are gated
-   *
-   * The two workspace-runtime exits in this file now read
-   * `viewer.revealRuntimeConfig ? raw : …` (PEN-2852 / BLO-33407). This one deliberately
-   * does not, and the difference is the entitlement's scope rather than an oversight:
-   * `workspace_runtime:read` is defined over workspace runtime config. `defaultsJson` is
-   * plugin-manifest material with a different audience, so gating it on that flag would
-   * disclose plugin defaults to every holder of an unrelated entitlement — widening the
-   * grant while appearing to narrow it.
-   *
-   * Nor is there an entitled consumer to serve, which is what makes the gate valuable
-   * above: there, the runtime editors genuinely need raw values. Here no reader wants
-   * them (see below), so a gate would have an empty true-branch and the only effect of
-   * adding one would be the mis-scoping. If a consumer ever does need raw `defaultsJson`,
-   * it should arrive with its own entitlement rather than borrow this one.
-   *
-   * ## Why masking is safe here
-   *
-   * `defaultsJson` is retained to drive plugin reset/reconcile, and that path is
-   * write-only with respect to this response: it recomputes `defaults` from the manifest
-   * declaration and writes it to `pluginManagedResources.defaultsJson`
-   * (`services/projects.ts`), and `reset` updates the project row from the declaration
-   * too — neither ever reads this projection back. No UI reads `defaultsJson` at all:
-   * `ProjectDetail.tsx` reads `pluginDisplayName`, `pluginKey` and `resourceKey`, all of
-   * which survive untouched, and it reads them from `GET /projects/:id` rather than from
-   * this issue projection.
+   * PEN-3114 wrote that walk here, as a local `compactIssueManagedByPlugin`, because this projection
+   * was the only exit known to reach the field. PEN-3210 (door #19) found five more — `publicProject`
+   * serves the four project routes AND `mentionedProjects[]` on THIS response body, two keys below
+   * this one — so it moved to the module they already share. This site now calls the same function
+   * they do rather than holding a second copy of the walk.
    */
-  function compactIssueManagedByPlugin(managed: ProjectManagedByPlugin | null | undefined) {
-    if (!managed) return null;
-    return {
-      id: managed.id,
-      pluginId: managed.pluginId,
-      pluginKey: managed.pluginKey,
-      pluginDisplayName: managed.pluginDisplayName,
-      resourceKind: managed.resourceKind,
-      resourceKey: managed.resourceKey,
-      defaultsJson: maskWorkspaceRuntimeForRead(managed.defaultsJson),
-      createdAt: managed.createdAt,
-      updatedAt: managed.updatedAt,
-    };
-  }
 
   function compactIssueProject(
     project: Awaited<ReturnType<typeof resolveIssueProjectAndGoal>>["project"],
@@ -7941,7 +7872,7 @@ export function issueRoutes(
         compactIssueProjectWorkspace(workspace, viewer),
       ),
       primaryWorkspace: compactIssueProjectWorkspace(project.primaryWorkspace, viewer),
-      managedByPlugin: compactIssueManagedByPlugin(project.managedByPlugin),
+      managedByPlugin: publicProjectManagedByPlugin(project.managedByPlugin),
       taskCount: project.taskCount,
       budget: project.budget,
       archivedAt: project.archivedAt,
