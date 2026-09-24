@@ -98,7 +98,9 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
     agentStatus?: "active" | "paused";
     retryStatus?: "scheduled_retry" | "queued" | "running";
     issueStatus?: "in_progress" | "todo" | "done" | "cancelled";
-    retryResultJson?: Record<string, unknown>;
+    // jsonb accepts any JSON value; the Drizzle column narrows to an object.
+    // Widened so a test can seed the non-object shape the writers never emit.
+    retryResultJson?: Record<string, unknown> | unknown[];
   } = {}) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -175,7 +177,9 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       scheduledRetryAt,
       scheduledRetryAttempt: 2,
       scheduledRetryReason: "transient_failure",
-      ...(input.retryResultJson ? { resultJson: input.retryResultJson } : {}),
+      ...(input.retryResultJson
+        ? { resultJson: input.retryResultJson as Record<string, unknown> }
+        : {}),
       contextSnapshot: {
         issueId,
         wakeReason: "bounded_transient_heartbeat_retry",
@@ -370,6 +374,29 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, retryRunId));
     expect(run.resultJson).toBeNull();
+  });
+
+  it("leaves a non-object result_json untouched rather than flattening it to {}", async () => {
+    // parseObject() maps a jsonb array/scalar to {}, so clearing through it
+    // would *replace* the column instead of removing keys from it. Retry-now is
+    // the only writer of result_json on this path, so that loss would be
+    // unrecoverable. Treat a non-object exactly as null: skip the write.
+    const { companyId, issueId, retryRunId } = await seedIssueWithRetry({
+      retryResultJson: ["not", "an", "object"],
+    });
+
+    const res = await request(createApp(boardActor(companyId)))
+      .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toMatchObject({ outcome: "promoted" });
+
+    const [run] = await db
+      .select({ resultJson: heartbeatRuns.resultJson })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, retryRunId));
+    expect(run.resultJson).toEqual(["not", "an", "object"]);
   });
 
   it("returns a clear no-op response when there is no scheduled retry", async () => {
