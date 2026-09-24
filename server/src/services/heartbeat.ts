@@ -295,9 +295,11 @@ import {
 } from "./activity-log.js";
 import {
   githubFetchPrAuthorLogin,
+  githubGetPrRequiredStatusContext,
   githubGetPullRequestGate,
   githubHasReviewerEvidenceForPr,
   githubReviewerIdentityMatches,
+  type PrRequiredStatusContextLookup,
 } from "./github-app-auth.js";
 import { loadConfig } from "../config.js";
 import { enqueueGithubCommitStatusDelivery } from "./github-status-delivery-outbox.js";
@@ -10313,6 +10315,43 @@ export function resolvePrReviewGateStatusTarget(
 
 const PR_REVIEW_OUTPUT_EVIDENCE_MAX_CHARS = 240_000;
 
+/**
+ * One sentence saying whether the red gate this notice is about actually blocks
+ * the merge (PEN-3487).
+ *
+ * The notice already says a review did not land. What it never said is the fact
+ * that decides whether anyone should care, and that fact is **per repository**:
+ * measured 2026-09-24, `review/ally-complete` is required on
+ * `Blockcast/penstock-llm-proxy-core` (one of ten), required on nothing in
+ * `Blockcast/paperclip` (whose `master` requires exactly `verify`), and
+ * `Blockcast/onprem-k8s` requires no contexts at all. Same context name, opposite
+ * consequence, and nothing at the point of reading disambiguated them — which is
+ * how PEN-3487 came to be filed and escalated as a stuck merge pipeline on a PR
+ * that read `mergeable: true` the whole time.
+ *
+ * `unknown` is phrased as a refusal, not a reassurance. An unread gate is not a
+ * cleared gate, and the reader has to be able to tell those apart.
+ */
+export function describePrReviewGateMergeImpact(input: {
+  lookup: PrRequiredStatusContextLookup;
+  context: string;
+  repoFullName: string;
+}): string {
+  const { lookup, context, repoFullName } = input;
+  if (lookup.outcome === "required") {
+    return `- Merge impact: \`${context}\` **is a required status check** on \`${repoFullName}\`'s \`${lookup.baseRef}\`, so this red gate does block merge there.`;
+  }
+  if (lookup.outcome === "not_required") {
+    const others = lookup.requiredContexts.length > 0
+      ? ` Required there: ${lookup.requiredContexts.map((name) => `\`${name}\``).join(", ")}.`
+      : lookup.branchProtected
+      ? " That branch is protected but requires no status checks."
+      : " That branch has no branch protection.";
+    return `- Merge impact: \`${context}\` is **not a required status check** on \`${repoFullName}\`'s \`${lookup.baseRef}\`, so this red gate does not block merge there.${others}`;
+  }
+  return `- Merge impact: **unread** — Paperclip could not read branch protection for this PR's base (\`${lookup.reason}\`), so whether \`${context}\` blocks merge on \`${repoFullName}\` is unknown here. Read it before assuming either way; the required set differs per repository.`;
+}
+
 function appendReviewOutputEvidenceText(parts: string[], value: unknown, budget: { remaining: number }) {
   if (budget.remaining <= 0 || value == null) return;
   if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
@@ -12930,6 +12969,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * reports a fact this server itself just derived, and agent-registered PR work
    * products are the common case (the Paperclip skill tells agents to create
    * one). Narrowing it here would drop most real links.
+   *
+   * The company filter IS intentional and stays (PEN-3487 asked). Both things
+   * this function does — posting an issue comment and waking an assignee — are
+   * tenancy-bound writes, and `run.companyId` is the only company this reviewer
+   * run is authorized to act in. Matching a work product across companies would
+   * mean writing into another tenant's issue on the strength of a PR number, and
+   * would leak the existence and head SHA of that tenant's PR to whoever reads
+   * this run. Neither is worth the reach.
+   *
+   * The consequence is real and worth naming rather than hiding: a PR whose
+   * reviewer run lives in company A but whose tracking issue lives in company B
+   * gets NO in-Paperclip notice — the GitHub commit status is the only signal
+   * there. That silence is now attributable: the no-linked-issue log below says
+   * the lookup was company-scoped and names the company it searched, so the case
+   * is greppable instead of indistinguishable from "this PR has no issue".
    */
   async function notifyLinkedIssuesOfFailedPrReviewGate(
     run: typeof heartbeatRuns.$inferSelect,
@@ -12964,8 +13018,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
     if (linked.length === 0) {
       logger.info(
-        { runId: run.id, repoFullName: target.repoFullName, prNumber: target.prNumber },
-        "failed PR-review gate has no linked Paperclip issue to notify",
+        {
+          runId: run.id,
+          companyId: run.companyId,
+          companyScoped: true,
+          repoFullName: target.repoFullName,
+          prNumber: target.prNumber,
+        },
+        "failed PR-review gate has no linked Paperclip issue in the reviewer run's company to notify",
       );
       return;
     }
@@ -12974,6 +13034,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const cause = reason === "retry_exhausted"
       ? "exhausted its automatic retries"
       : "ended ambiguously and was not replayed";
+    // PEN-3487: read whether this context actually gates merge on THIS repo's
+    // base branch. Deliberately after the linked-issue lookup, so a notice with
+    // nobody to tell costs no GitHub calls. Fail-soft by construction — the
+    // lookup returns `unknown` rather than throwing, and an unknown prints as a
+    // refusal to say, never as an all-clear.
+    const mergeImpact = describePrReviewGateMergeImpact({
+      lookup: await githubGetPrRequiredStatusContext({
+        repoFullName: target.repoFullName,
+        prNumber: target.prNumber,
+        context: target.context,
+      }).catch((error): PrRequiredStatusContextLookup => {
+        logger.warn(
+          { err: error, repoFullName: target.repoFullName, prNumber: target.prNumber },
+          "failed to read required-status-check configuration for a failed PR-review gate",
+        );
+        return { outcome: "unknown", reason: "required_context_lookup_threw" };
+      }),
+      context: target.context,
+      repoFullName: target.repoFullName,
+    });
     const body = [
       `## Ally review did not land on \`${target.repoFullName}#${target.prNumber}\``,
       "",
@@ -12991,6 +13071,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       "",
       `- Head: \`${target.sha}\``,
       `- Gate status: \`${target.context}\` set to \`failure\` on that commit`,
+      mergeImpact,
       ...(target.prUrl ? [`- PR: ${target.prUrl}`] : []),
       `- Reviewer run: \`${run.id}\``,
       "",
