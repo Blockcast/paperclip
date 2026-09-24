@@ -52,8 +52,9 @@
  *   I2  No operative APPROVED review whose own body reports a Critical or
  *       Important finding, no User-seat APPROVED review coexisting with a
  *       blocking App review, no App APPROVED coexisting with a different
- *       blocking App review at one head (I2e), and no App approval without a
- *       `Reviewed head:` attestation.
+ *       blocking App review at one head unless it follows every such blocker
+ *       and retires, by name, a finding raised against that head (I2e), and no
+ *       App approval without a `Reviewed head:` attestation.
  *   I3  An operative App review has exactly one canonical body and its
  *       body-attested `Reviewed head:` matches the commit GitHub recorded it
  *       against.
@@ -153,6 +154,17 @@ const STILL_PRESENT_DISPOSITION_RE = new RegExp(
   "im",
 );
 
+/**
+ * A prior-finding disposition that retires the finding, capturing the head it
+ * was raised against. The verbs are the retiring set the merge gate uses
+ * (RESOLVED_PRIOR_DISPOSITIONS in server/src/services/ally-review-detection.ts);
+ * an unrecognized verb does not match, so I2e fails closed on it.
+ */
+const RETIRING_DISPOSITION_GLOBAL_RE = new RegExp(
+  String.raw`^${NOT_INDENTED_CODE}-[ \t]*\*\*prior:([0-9a-f]{7,40})[^\n]*\*\*[ \t]*(?:—|-)[ \t]*(?:fixed|no-longer-applicable)[ \t]*(?:—|-)`,
+  "gim",
+);
+
 /** The single standalone attestation line Ally is required to emit. */
 const ATTESTED_HEAD_RE = new RegExp(
   String.raw`^${NOT_INDENTED_CODE}(?:[_*]+)?[ \t]*reviewed head:[ \t]*\`?([0-9a-f]{40})\`?[ \t]*(?:[_*]+)?[ \t]*$`,
@@ -189,6 +201,14 @@ function isApproved(review) {
 
 function hasBlockingVerdict(body) {
   return hasBlockingFindings(body) || hasStillPresentDisposition(body);
+}
+
+// submitted_at has 1 s resolution, so ties fall back to the monotonic id.
+function bySubmission(a, b) {
+  return (
+    String(a?.submitted_at ?? "").localeCompare(String(b?.submitted_at ?? "")) ||
+    Number(a?.id ?? 0) - Number(b?.id ?? 0)
+  );
 }
 
 function reviewDetails(reviews) {
@@ -267,6 +287,14 @@ export function hasBlockingFindings(body) {
 
 export function hasStillPresentDisposition(body) {
   return STILL_PRESENT_DISPOSITION_RE.test(String(body ?? ""));
+}
+
+/** True when the body retires, by name, a finding raised against `head`. */
+function retiresFindingRaisedAt(body, head) {
+  const normalizedHead = String(head ?? "").toLowerCase();
+  return Array.from(String(body ?? "").matchAll(RETIRING_DISPOSITION_GLOBAL_RE)).some((match) =>
+    normalizedHead.startsWith(match[1].toLowerCase()),
+  );
 }
 
 export function attestedHead(body) {
@@ -405,9 +433,7 @@ export function findPrNotices(pr) {
   const short = String(head ?? "").slice(0, 8);
   const reviews = operativeAllyReviews(pr.reviews, head, "app");
   if (!isSupersedingAppRereview("app", reviews)) return [];
-  const latest = [...reviews].sort((a, b) =>
-    String(a?.submitted_at ?? "").localeCompare(String(b?.submitted_at ?? "")),
-  )[reviews.length - 1];
+  const latest = [...reviews].sort(bySubmission)[reviews.length - 1];
   return [
     `PR #${pr.number} @${short}: ${reviews.length} operative Ally App reviews (${reviewDetails(reviews)}) with distinct bodies — ` +
       `treating the latest (${latest?.id}, ${latest?.submitted_at}) as the standing verdict. Legitimate for a re-review of an ` +
@@ -557,11 +583,29 @@ export function findPrViolations(pr) {
   // toward reviewDecision and a COMMENTED blocker does not, so the approval
   // would outrank it. A re-review that supersedes a blocker dismisses the stale
   // approval, which leaves it non-operative, so this does not fire there.
+  //
+  // The other order has no such exit: a COMMENTED blocker cannot be dismissed,
+  // so a clean approval that supersedes it at an unchanged head would fail here
+  // forever. That approval is exempt when it retires, by name, a finding raised
+  // against this head and lands after every other blocker. Naming is the test:
+  // only a run that read the blocker can name its finding, and a racing run
+  // never saw it. Merely carrying a ledger is not enough, because both racing
+  // reviews on #876 (ff1c72db) and on #1220 (a9ee094a) carried one, for
+  // findings raised at an earlier head. Order alone is not the test either (a
+  // race can land its approval last); it only keeps a blocker that follows the
+  // approval fatal, since dismissing the approval is the exit there. Residual:
+  // two runs racing after a same-head predecessor can both name it, so this
+  // cannot separate them; that exclusion belongs at dispatch (BLO-20074).
   const appApprovals = appReviews.filter(isApproved);
   const otherAppBlockers = appBlockers.filter((review) => !appApprovals.includes(review));
-  if (appApprovals.length > 0 && otherAppBlockers.length > 0) {
+  const unsupersedingApprovals = appApprovals.filter(
+    (review) =>
+      !retiresFindingRaisedAt(review.body, head) ||
+      otherAppBlockers.some((blocker) => bySubmission(blocker, review) > 0),
+  );
+  if (unsupersedingApprovals.length > 0 && otherAppBlockers.length > 0) {
     violations.push(
-      `I2e PR #${pr.number} @${short}: Ally App APPROVED (${appApprovals.map((review) => review.id).join(", ")}) coexists with a different blocking Ally App review (${otherAppBlockers.map((review) => review.id).join(", ")}) at one head; the standing approval outranks the blocker`,
+      `I2e PR #${pr.number} @${short}: Ally App APPROVED (${unsupersedingApprovals.map((review) => review.id).join(", ")}) coexists with a different blocking Ally App review (${otherAppBlockers.map((review) => review.id).join(", ")}) at one head; the standing approval outranks the blocker`,
     );
   }
   return violations;
