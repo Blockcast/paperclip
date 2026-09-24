@@ -71,8 +71,83 @@ export type ApplyPendingMigrationsOptions = {
  * `max` as `explicit option > URL query param > PGMAX env > default`, so a
  * `?max=` in the connection string can no longer shrink the pool out from
  * under a caller that derived a bound from it.
+ *
+ * ## Why this stays at 10 (BLO-35946 AC3)
+ *
+ * Three incidents now cite this number, and none of them is a sizing problem:
+ *
+ * - `server/src/index.ts` (BLO-34207) and `services/issues.ts` — 8-9 waiters on
+ *   one *company-wide advisory lock*. The holder could not get the second
+ *   connection it needed to finish, so the waiters it was blocking were the
+ *   reason it stayed blocked. Raising `max` moves that wall without removing
+ *   it: N+1 overlapping passes re-create it at any N. Both were fixed with a
+ *   latch, not with connections.
+ * - This issue — 9 of 10 slots were in postgres.js's `ended` queue and
+ *   unreclaimable. A pool of 50 would have leaked to zero the same way, just
+ *   more slowly.
+ *
+ * So the value is deliberate, and the standing rule is the one
+ * `derivePrReviewerWakeMaxConcurrency` in `routes/github-webhook.ts` already
+ * follows: a path that can run concurrently and needs *two* connections per
+ * unit of work bounds itself against this constant. Raising `max` is the wrong
+ * lever for every failure recorded against it so far — each connection is a
+ * server-side backend, so it trades a client-side queue for server-side memory
+ * and buys time rather than correctness.
  */
 export const POSTGRES_POOL_MAX = 10;
+
+/**
+ * How long a pooled connection that has been asked to end, but still has a
+ * query in flight, may wait for that query before it is terminated outright.
+ *
+ * Without this the wait is unbounded and the connection is lost for the life of
+ * the process (BLO-35946). postgres.js's `end()` moves a connection to the
+ * pool's `ended` queue *before* it checks whether the connection is quiescent,
+ * and `handler()` never draws from `ended`. When a query is in flight it then
+ * takes the non-quiescent branch, which deliberately skips `terminate()` and
+ * waits for the `ReadyForQuery` that ends the query. If that message never
+ * arrives the slot is gone: on 2026-09-24 nine of ten slots left this pool that
+ * way and company-wide dispatch ran on the remaining one for 2h15m, recoverable
+ * only by `pg_terminate_backend` from an operator session.
+ *
+ * Terminating is what makes the slot come back. `terminate()` rejects the
+ * in-flight query and closes the socket, and the resulting `closed()` lands the
+ * connection in the pool's `closed` queue — the one non-`open` queue
+ * `handler()` does draw from — so it reconnects on the next query. That is the
+ * same recovery the operator achieved from the server side, driven from the
+ * client.
+ *
+ * 120s, matching {@link POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS}, and for a
+ * similar reason: it only ever fires when something is already wrong. In the
+ * healthy case the in-flight query finishes in milliseconds and `terminate()`
+ * happens at `ReadyForQuery`, nowhere near this bound. It is also comfortably
+ * above the 30s role-level `statement_timeout` this repo asserts in
+ * `routes/plugins.ts` and migration `0098`, so a query that the server would
+ * itself have killed is never cut short by this instead.
+ *
+ * Unlike the other options here this one does not exist upstream — it is added
+ * by `patches/postgres@3.4.9.patch` and defaults to `null` (the current,
+ * unbounded behaviour) so the patch changes nothing for a caller that does not
+ * set it.
+ */
+export const POSTGRES_CLOSE_TIMEOUT_SECONDS = 120;
+
+/**
+ * Bounds on how long a pooled connection lives before it is recycled.
+ *
+ * These are not a behaviour change: they restate postgres.js's own default
+ * (`max_lifetime()` in its `src/index.js`, a fresh `60 * (30 + random * 30)`
+ * seconds per connection) so the value is readable here instead of only in the
+ * dependency. BLO-35946 AC4 — during that incident `max_lifetime` was the one
+ * routine caller of the `end()` path that leaks, and establishing what it was
+ * set to meant reading library source mid-incident.
+ *
+ * The spread is the point, so it is passed as a function rather than a number:
+ * postgres.js evaluates `max_lifetime` once per connection, so a plain number
+ * would retire all ten together and empty the pool in one tick.
+ */
+export const POSTGRES_MAX_LIFETIME_MIN_SECONDS = 30 * 60;
+export const POSTGRES_MAX_LIFETIME_MAX_SECONDS = 60 * 60;
 
 /**
  * How long a pooled application connection may sit inside an open transaction
@@ -113,6 +188,18 @@ export function createDb(url: string) {
     connection: {
       idle_in_transaction_session_timeout: POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS,
     },
+    // Neither of these is usable through the shipped typings in the shape it is
+    // needed: `close_timeout` is added by `patches/postgres@3.4.9.patch` and so
+    // appears in no upstream `.d.ts`, and `max_lifetime` is typed `number |
+    // null` even though the driver accepts — and this pool requires — a
+    // function, evaluated once per connection. Same cast the existing patched
+    // `poolStats()` needs at its call sites.
+    ...({
+      close_timeout: POSTGRES_CLOSE_TIMEOUT_SECONDS,
+      max_lifetime: () =>
+        POSTGRES_MAX_LIFETIME_MIN_SECONDS +
+        Math.random() * (POSTGRES_MAX_LIFETIME_MAX_SECONDS - POSTGRES_MAX_LIFETIME_MIN_SECONDS),
+    } as Record<string, unknown>),
   });
   // Inert in production; only embedded test databases register their URL so
   // their pools can be closed before the server stops (see registry module).
