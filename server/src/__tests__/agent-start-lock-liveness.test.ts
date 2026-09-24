@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   _resetAgentStartLocksForTesting,
   describeHeldAgentStartLocks,
+  LOCK_HELD_WARN_MS,
   withAgentStartLock,
 } from "../services/agent-start-lock.js";
 import {
@@ -299,5 +300,76 @@ describe("agent start lock metrics publication (PEN-3305)", () => {
     const afterRelease = await publishedHoldSeconds();
     expect(afterRelease.has(agentId)).toBe(false);
     expect(afterRelease.size).toBe(0);
+  });
+});
+
+/**
+ * BLO-35878. `LOCK_HELD_WARN_MS` was module-private until this change and is
+ * now exported, so that a *phase* inside the critical section can be judged
+ * against the same budget the lock itself enforces rather than against a
+ * second threshold invented beside it. `heartbeat.ts` imports it to decide
+ * when one `reapOrphanedRuns` sweep has, on its own, consumed the whole
+ * budget — which is the discriminator the hold gauge cannot provide, because
+ * it reports a section's total duration with no breakdown. That is how a
+ * 245–1586 s regression came to be attributed to hindsight recall, a
+ * subsystem that never runs on this path.
+ *
+ * An exported constant is only worth importing if it is still the number the
+ * lock actually acts on. Nothing else pins that: the suite above stubs `warn`
+ * globally and every one of its tests advances well past the threshold, so a
+ * divergence between the exported value and the interval that consumes it
+ * would leave all of them green while every caller's comparison silently
+ * shifted. This asserts the coupling at the edge, where it is observable.
+ */
+describe("exported lock budget is the threshold the lock acts on (BLO-35878)", () => {
+  let warn!: ReturnType<typeof vi.spyOn<typeof logger, "warn">>;
+
+  beforeEach(() => {
+    warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+    vi.spyOn(logger, "error").mockImplementation(() => logger);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    _resetAgentStartLocksForTesting();
+  });
+
+  it("first warns at exactly LOCK_HELD_WARN_MS, reporting that same value as its budget", async () => {
+    vi.useFakeTimers();
+    const agentId = randomUUID();
+    const gate = deferred<string>();
+    const held = withAgentStartLock(agentId, () => gate.promise, coalesced);
+
+    const warnsForAgent = () =>
+      warn.mock.calls.filter(
+        ([fields]) => (fields as { agentId?: string } | undefined)?.agentId === agentId,
+      );
+
+    // One millisecond short of the exported budget: nothing has overrun yet.
+    // If the export were larger than the interval that consumes it, the lock
+    // would already have warned here and this would fail.
+    await vi.advanceTimersByTimeAsync(LOCK_HELD_WARN_MS - 1);
+    expect(warnsForAgent()).toHaveLength(0);
+
+    // Crossing it produces exactly one line. If the export were smaller than
+    // the interval, no line would have landed yet and this would fail. So the
+    // two assertions bracket the value from both sides rather than asserting
+    // "some warn eventually happens".
+    await vi.advanceTimersByTimeAsync(1);
+    expect(warnsForAgent()).toHaveLength(1);
+
+    // `heldMs` is the lock's own measurement and `warnAfterMs` is the budget
+    // it judged against. Both must equal the exported constant, or a caller
+    // comparing its phase duration to that constant is comparing against a
+    // number the lock does not use.
+    expect(warnsForAgent()[0]?.[0]).toMatchObject({
+      agentId,
+      heldMs: LOCK_HELD_WARN_MS,
+      warnAfterMs: LOCK_HELD_WARN_MS,
+    });
+
+    gate.resolve("done");
+    await held;
   });
 });
