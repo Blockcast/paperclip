@@ -1202,7 +1202,7 @@ class TestRunCliExitCodePolicy(unittest.TestCase):
             with self.subTest(error=type(error).__name__):
                 code, err = self._exit_code_for(error)
                 self.assertEqual(code, sweep.EXIT_SWEEP_DEGRADED)
-                self.assertIn("crashed", err)
+                self.assertIn("crashed before completing", err)
 
     def test_deliberate_alarm_exit_passes_through_terminal_arm(self):
         """SystemExit is a BaseException; the terminal `except Exception`
