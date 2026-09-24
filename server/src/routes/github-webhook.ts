@@ -934,6 +934,25 @@ const DEFAULT_SELF_REVIEW_ESCALATION_THRESHOLD = 3;
 // Every unknown fails CLOSED (returns false, i.e. not a self-review). The harm
 // being guarded is suppression of the author's wake, so "cannot tell" must
 // leave the author woken.
+//
+// The lane test is SINGLETON EQUALITY, not pool membership. The reviewer pool
+// is plural by design (configuredPrReviewerAgentIds unions the plural and
+// singular config keys; selectPrReviewerAgentId load-balances across it), so
+// with a pool {Ally, X} a PR owned by lane X and reviewed by Ally is an
+// ordinary peer review that membership would call a self-review — the same
+// suppression bug, narrowed. Requiring a one-member pool makes a multi-member
+// pool never escalate, which is the recoverable direction. Today's deployment
+// is a singleton, so this is exact rather than conservative.
+//
+// Residual, named so the next reader does not re-derive it: `assigneeAgentId`
+// is who gets suppressed, not who wrote the code, so an issue REASSIGNED to
+// the reviewer lane after a peer wrote the PR still reads as a self-review.
+// It is narrow — the caller prefers readReturnAssigneeAgentId (the pre-review
+// owner the work is being handed back to) over issue.assigneeAgentId, so this
+// only leaks when execution state carries no return owner, AND it must also
+// clear cycles >= threshold AND a `still-present` ledger. The git-author
+// instrument (BLO-32943) would close it at the cost of a GitHub round-trip on
+// the webhook path; not worth it for this case.
 function isSelfReviewedPr(
   context: ResolvedEventContext,
   reviewerBotLogin: string | null,
@@ -944,7 +963,7 @@ function isSelfReviewedPr(
   if (!author) return false;
   if (normalizeGithubLogin(author) !== normalizeGithubLogin(reviewerBotLogin)) return false;
   if (!lanes.assigneeAgentId) return false;
-  return lanes.reviewerAgentIds.includes(lanes.assigneeAgentId);
+  return lanes.reviewerAgentIds.length === 1 && lanes.reviewerAgentIds[0] === lanes.assigneeAgentId;
 }
 
 // Whether this review's prior-finding ledger asserts that a finding an earlier
@@ -960,7 +979,14 @@ function isSelfReviewedPr(
 // No ledger entry means no positive evidence of re-raising, so no escalation.
 // That is the same fail-closed direction as isSelfReviewedPr: an unprovable
 // loop keeps waking the author, which is recoverable; a wrongly-suppressed wake
-// is not.
+// is not. Two known shapes land there, both benign for that reason:
+//   - a first-round review, which has no prior findings to disposition;
+//   - a PR force-pushed hard enough to rebase earlier heads away along with
+//     their reviews. The reviewer rebuilds its active prior-finding set from
+//     reviews STILL PRESENT on the PR, so it then emits no ledger and this
+//     escalation becomes unreachable — on exactly the force-push-heavy PRs
+//     most likely to be looping. Stated here rather than discovered later as
+//     "the escalation never fires".
 function bodyReRaisesPriorFinding(body: string | null | undefined): boolean {
   return extractAllyPriorFindingDispositions(body).some((entry) => entry.kind === "blocks");
 }
@@ -970,8 +996,27 @@ function bodyReRaisesPriorFinding(body: string | null | undefined): boolean {
 // on the context are clamped, and a ledger past the clamp boundary would read
 // as "no finding re-raised" — failing in the suppressing direction. The
 // fallback only serves synthetic contexts that never went through a producer.
+//
+// This guard has no failing mutation today, and that is structural rather than
+// a gap in the tests: the ledger sits in the OPENING section of the reviewer's
+// template, above the counted findings buckets, so any body whose ledger is
+// clamped has already had its findings clamped — and that case is caught first
+// by the older raw read for reviewHasActionableFeedback. Keep the raw read
+// anyway: the ordering it relies on is enforced only by the reviewer's
+// template, not by this module. Do not delete it as provably dead code.
 function reRaisesPriorFinding(context: ResolvedEventContext): boolean {
   return context.reviewReRaisesPriorFinding ?? bodyReRaisesPriorFinding(prFeedbackBody(context));
+}
+
+// The re-raised findings, named the way the ledger names them ("important #1
+// from de0d81ab"). Prose only — the escalation is gated on
+// reRaisesPriorFinding above, which reads the unclamped classification, so an
+// empty list here never suppresses an escalation, it only costs the message
+// its specifics.
+function reRaisedPriorFindingLabels(context: ResolvedEventContext): string[] {
+  return extractAllyPriorFindingDispositions(prFeedbackBody(context))
+    .filter((entry) => entry.kind === "blocks")
+    .map((entry) => `${entry.severity} #${entry.index} from ${entry.shortSha}`);
 }
 
 // Count prior actionable-feedback reopen cycles on this (issue, PR). Each call to
@@ -6277,6 +6322,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
                 prNumber: context.prNumber,
                 repoFullName: context.repoFullName,
                 cycleCount: cycles,
+                reRaisedFindings: reRaisedPriorFindingLabels(context),
               });
               escalated.push({
                 issueIdentifier: issue.identifier,

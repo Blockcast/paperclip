@@ -14963,6 +14963,13 @@ export function recoveryService(
     prNumber: number;
     repoFullName: string | null;
     cycleCount: number;
+    // BLO-35909: the findings the latest review's ledger asserts are still
+    // present, as the ledger names them. The evidence for "not converging" is
+    // this list, NOT cycleCount — cycleCount counts every actionable round,
+    // converging ones included, so a PR with five converging rounds and one
+    // re-raise arrives here as 6 and the old "cycled 6 times without
+    // converging" overstated by five. The count is reported as context only.
+    reRaisedFindings?: readonly string[];
   }): Promise<{ escalated: boolean; ownerAgentId: string | null; ownerType: "agent" | "board" }> {
     const issue = await db
       .select()
@@ -14981,6 +14988,9 @@ export function recoveryService(
       resolvedOwnerAgentId && resolvedOwnerAgentId === issue.assigneeAgentId
         ? null
         : resolvedOwnerAgentId;
+    const reRaised = input.reRaisedFindings?.length
+      ? `re-raised ${input.reRaisedFindings.join(", ")}`
+      : "re-raised a finding an earlier review round already raised";
     const action = await recoveryActionsSvc.upsertSourceScoped({
       companyId: issue.companyId,
       sourceIssueId: issue.id,
@@ -14995,11 +15005,12 @@ export function recoveryService(
         repoFullName: input.repoFullName,
         prNumber: input.prNumber,
         cycleCount: input.cycleCount,
+        reRaisedFindings: input.reRaisedFindings ?? [],
         priorAssigneeAgentId: issue.assigneeAgentId,
       },
       nextAction: ownerAgentId
-        ? `Self-reviewed PR #${input.prNumber} has cycled through review feedback ${input.cycleCount} times without converging. Take over the PR, unblock or reassign the author, or record a disposition — do not leave the author looping on its own self-review.`
-        : `Self-reviewed PR #${input.prNumber} is not converging after ${input.cycleCount} review cycles and no invokable agent can own it. Board intervention needed.`,
+        ? `Self-reviewed PR #${input.prNumber} ${reRaised}, after ${input.cycleCount} actionable review rounds. Take over the PR, unblock or reassign the author, or record a disposition — do not leave the author looping on its own self-review.`
+        : `Self-reviewed PR #${input.prNumber} ${reRaised}, after ${input.cycleCount} actionable review rounds, and no invokable agent can own it. Board intervention needed.`,
       wakePolicy: ownerAgentId
         ? { type: "wake_owner", reason: "self_review_pr_non_convergence", ownerAgentId }
         : { type: "board_escalation", reason: "no_invokable_recovery_owner" },

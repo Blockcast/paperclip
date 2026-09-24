@@ -8699,10 +8699,22 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(res.body.wakes).toEqual([]);
 
     const actions = await db
-      .select({ ownerType: issueRecoveryActions.ownerType, ownerAgentId: issueRecoveryActions.ownerAgentId })
+      .select({
+        ownerType: issueRecoveryActions.ownerType,
+        ownerAgentId: issueRecoveryActions.ownerAgentId,
+        nextAction: issueRecoveryActions.nextAction,
+      })
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, issueId));
-    expect(actions).toEqual([{ ownerType: "board", ownerAgentId: null }]);
+    expect(actions).toHaveLength(1);
+    expect(actions[0]!.ownerType).toBe("board");
+    expect(actions[0]!.ownerAgentId).toBeNull();
+    // BLO-35909: the escalation's evidence is the re-raised finding the ledger
+    // names, NOT the round count. cycleCount counts converging rounds too, so
+    // resting the "without converging" claim on it overstated by however many
+    // rounds did converge. Named here so the prose cannot drift back.
+    expect(actions[0]!.nextAction).toContain("important #1 from de0d81ab");
+    expect(actions[0]!.nextAction).not.toContain("without converging");
 
     const authorWakes = await db
       .select({ id: agentWakeupRequests.id })
@@ -8818,6 +8830,8 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .where(eq(issueRecoveryActions.sourceIssueId, issueId));
     expect(actions).toEqual([]);
   });
+
+  // BLO-19497: second and later Ally reviews on the same PR must still
   // produce a Changes-Requested comment. Before this fix,
   // reopenInReviewIssueForActionablePrFeedback short-circuited the ENTIRE
   // write -- comment included -- unless `issue.status === "in_review"`.
@@ -11142,6 +11156,22 @@ describe("self-review non-convergence detection (BLO-13353, BLO-35909)", () => {
     ).toBe(false);
     expect(
       __test_isSelfReviewedPr(ctx("allyblockcast[bot]"), "allyblockcast[bot]", lanes(REVIEWER_LANE, [])),
+    ).toBe(false);
+  });
+
+  // BLO-35909 Gap-2 guard. The reviewer pool is plural by design
+  // (configuredPrReviewerAgentIds unions the plural and singular config keys,
+  // and selectPrReviewerAgentId load-balances across it), so a membership test
+  // calls an ordinary peer review BETWEEN two pool lanes a self-review — the
+  // same suppression bug, narrowed from "every agent PR" to "PRs owned by a
+  // reviewer-pool lane". Fails against `reviewerAgentIds.includes(...)`, which
+  // is what makes it a guard rather than a restatement of the new code.
+  it("fails closed when the reviewer pool has more than one lane", () => {
+    expect(
+      __test_isSelfReviewedPr(ctx("allyblockcast[bot]"), "allyblockcast[bot]", {
+        assigneeAgentId: AUTHOR_LANE,
+        reviewerAgentIds: [REVIEWER_LANE, AUTHOR_LANE],
+      }),
     ).toBe(false);
   });
 });
