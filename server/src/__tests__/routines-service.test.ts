@@ -2204,8 +2204,12 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       .where(eq(issues.id, dependencyParked.issue.id));
 
     resetRoutineDispatchMetrics();
-    await svc.runRoutine(routine.id, { source: "schedule" });
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
 
+    // The row the supersede refused to cancel must read as live to the gate,
+    // so the fire coalesces onto it rather than hitting 23505 and failing.
+    expect(run.status).toBe("coalesced");
+    expect(run.linkedIssueId).toBe(dependencyParked.issue.id);
     const [predecessor] = await db.select().from(issues).where(eq(issues.id, dependencyParked.issue.id));
     expect(predecessor.status).toBe("blocked");
     expect(predecessor.cancelledAt).toBeNull();
@@ -2250,8 +2254,12 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       .where(eq(issues.id, dependencyParked.issue.id));
 
     resetRoutineDispatchMetrics();
-    await svc.runRoutine(routine.id, { source: "schedule" });
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
 
+    // The row the supersede refused to cancel must read as live to the gate,
+    // so the fire coalesces onto it rather than hitting 23505 and failing.
+    expect(run.status).toBe("coalesced");
+    expect(run.linkedIssueId).toBe(dependencyParked.issue.id);
     const [predecessor] = await db.select().from(issues).where(eq(issues.id, dependencyParked.issue.id));
     expect(predecessor.status).toBe("blocked");
     expect(predecessor.cancelledAt).toBeNull();
@@ -2327,6 +2335,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     resetRoutineDispatchMetrics();
     const dispatch = svc.runRoutine(routine.id, { source: "schedule" });
     let raced = false;
+    let run!: Awaited<typeof dispatch>;
     try {
       // Safety valve: if the supersede never blocks, `raced` stays false and
       // the assertion below fails the test rather than passing it quietly.
@@ -2348,10 +2357,14 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     } finally {
       releaseLock();
       await racingTx;
-      await dispatch;
+      run = await dispatch;
     }
 
     expect(raced).toBe(true);
+    // The gate's snapshot predates the recovery action, so this is the 23505
+    // catch's re-run of the gate that has to find the protected row.
+    expect(run.status).toBe("coalesced");
+    expect(run.linkedIssueId).toBe(stranded.issue.id);
     const [predecessor] = await db.select().from(issues).where(eq(issues.id, stranded.issue.id));
     expect(predecessor.status).toBe("blocked");
     expect(predecessor.cancelledAt).toBeNull();
