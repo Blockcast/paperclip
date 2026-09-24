@@ -2061,6 +2061,35 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     })).resolves.toEqual([]);
   });
 
+  // BLO-35308: the route posts the supersession notice as a system comment with
+  // `{ runId }` alone. The route suite mocks addComment, so pin here that the
+  // real service persists that shape idempotently and rejects the agent-actor
+  // shape the notice used to pass (which the route's catch then swallowed).
+  it("persists a runId-only system notice idempotently and rejects one carrying an agentId", async () => {
+    const { issueId } = await seedConfirmationIssue("Supersession notice actor");
+    const idempotencyKey = `interaction-superseded:${randomUUID()}`;
+
+    const posted = await issuesSvc.addComment(issueId, "Pending ask expired.", { runId: null }, {
+      authorType: "system",
+      idempotencyKey,
+    });
+    expect(posted).toMatchObject({ authorType: "system", authorAgentId: null, authorUserId: null });
+
+    const retried = await issuesSvc.addComment(issueId, "Pending ask expired.", { runId: null }, {
+      authorType: "system",
+      idempotencyKey,
+    });
+    expect(retried).toMatchObject({ id: posted.id, deduplicated: true });
+
+    await expect(issuesSvc.addComment(issueId, "Pending ask expired.", { agentId: randomUUID(), runId: null }, {
+      authorType: "system",
+      idempotencyKey: `interaction-superseded:${randomUUID()}`,
+    })).rejects.toThrow("Comment authorType must match authenticated actor");
+
+    const rows = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(rows).toHaveLength(1);
+  });
+
   it("does not repair historical confirmations from run-originated comments", async () => {
     // The repair sweep must ignore machine-originated comments (createdByRunId set) even
     // when authorUserId is present under user auth.
