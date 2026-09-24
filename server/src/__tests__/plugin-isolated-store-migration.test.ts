@@ -25,8 +25,16 @@ import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { PluginRuntimeServices } from "../services/plugin-loader.js";
 
-// npm install becomes a no-op; each test pre-seeds the package tree that a
-// real install would have produced in the target prefix.
+// npm install becomes a no-op by default; each test pre-seeds the package tree
+// that a real install would have produced in the target prefix. `npmMock`
+// records every argv so the BLO-34795 assertions read the *real* command rather
+// than a copy of it, and `onInstall` lets a test make the fake install actually
+// materialise a tree (the success path of the isolated SDK repair).
+const npmMock = vi.hoisted(() => ({
+  calls: [] as string[][],
+  onInstall: null as null | ((args: string[]) => void | Promise<void>),
+}));
+
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
   return {
@@ -35,16 +43,23 @@ vi.mock("node:child_process", async (importOriginal) => {
       ..._args: unknown[]
     ): unknown => {
       const cb = _args[_args.length - 1];
-      if (typeof cb === "function") (cb as (e: null, o: string, s: string) => void)(null, "", "");
+      const argv = Array.isArray(_args[1]) ? (_args[1] as string[]) : [];
+      npmMock.calls.push(argv);
+      const done = (err: Error | null): void => {
+        if (typeof cb === "function") (cb as (e: Error | null, o: string, s: string) => void)(err, "", "");
+      };
+      void Promise.resolve(npmMock.onInstall?.(argv)).then(
+        () => done(null),
+        (err: unknown) => done(err instanceof Error ? err : new Error(String(err))),
+      );
       return undefined;
     },
   };
 });
 
 const { createDb, plugins } = await import("@paperclipai/db");
-const { pluginLoader, TORN_STORE_ERROR_MARKER, SDK_NOT_INSTALLED_ERROR_MARKER } = await import(
-  "../services/plugin-loader.js"
-);
+const { pluginLoader, TORN_STORE_ERROR_MARKER, SDK_NOT_INSTALLED_ERROR_MARKER, buildPluginInstallArgs } =
+  await import("../services/plugin-loader.js");
 const { ISOLATED_SDK_PLUGIN_PACKAGES, resolveDefaultInstallDir } = await import(
   "../bootstrap/isolated-sdk-plugins.js"
 );
@@ -107,6 +122,9 @@ describeEmbeddedPostgres("BLO-20961 — pre-isolation rows migrate into an isola
 
   afterEach(async () => {
     await db.delete(plugins);
+    npmMock.calls.length = 0;
+    npmMock.onInstall = null;
+    delete process.env["PAPERCLIP_PLUGIN_BOOT_ACTIVATION_RETRY_LIMIT"];
     for (const cleanupPath of cleanupPaths) {
       await rm(cleanupPath, { recursive: true, force: true });
     }
@@ -379,5 +397,156 @@ describeEmbeddedPostgres("BLO-20961 — pre-isolation rows migrate into an isola
     const [after] = await db.select().from(plugins);
     expect(after?.status).toBe("error");
     expect(after?.lastError).toContain(SDK_NOT_INSTALLED_ERROR_MARKER);
+  }, 60_000);
+
+  // BLO-34795 — an isolated tree that has lost its SDK must repair itself.
+  //
+  // `@lucitra/paperclip-plugin-secrets` declares `@paperclipai/plugin-sdk` as a
+  // *peer* and has no regular dependencies, so while every plugin install ran
+  // with `--legacy-peer-deps` no code path in the server could ever place the
+  // SDK in its isolated tree. The boot install loop fired on every restart and
+  // could not help; the tree was only ever repaired by a human `npm install`
+  // over `kubectl exec`. These four pin the fix and, more importantly, the two
+  // things it must not do.
+
+  /** argv the loader passed to npm for installs targeting `prefix`. */
+  function installArgsFor(prefix: string): string[][] {
+    return npmMock.calls.filter((argv) => argv[0] === "install" && argv.includes(prefix));
+  }
+
+  it("reinstalls an isolated tree whose SDK is gone and re-enables the row in the same boot", async () => {
+    const sharedDir = await tornSharedStore();
+    const isolatedDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-sdkgone-"));
+    cleanupPaths.add(isolatedDir);
+
+    const pluginKey = `paperclip.sdkgone_${randomUUID().slice(0, 8)}`;
+    const manifest = await seedIsolatedPackage(isolatedDir, pluginKey);
+    // Production shape: the lockfile exists and records the *plugin*, but has
+    // no SDK entry (it was installed as an uninstallable peer), and the SDK is
+    // physically absent. That is (absent)/(absent) for the SDK — `not_installed`.
+    await writeLockfileVersion(isolatedDir, ISOLATED_PACKAGE, "0.1.0");
+
+    // A real peer-resolving `npm install` would land the SDK. The mock does it
+    // so the re-probe has something true to find.
+    npmMock.onInstall = async (argv) => {
+      if (!argv.includes(isolatedDir)) return;
+      await writeLockfileVersion(isolatedDir, SDK_PACKAGE, "2026.916.1");
+      await writeInstalledPackageVersion(isolatedDir, SDK_PACKAGE, "2026.916.1");
+    };
+
+    await insertLegacyRow(pluginKey, manifest, {
+      installDir: isolatedDir,
+      status: "error",
+      lastError: `${SDK_NOT_INSTALLED_ERROR_MARKER}: ${isolatedDir}/package-lock.json records no ${SDK_PACKAGE} entry ...`,
+    });
+
+    const { runtimeServices } = createRuntimeServices();
+    const loader = pluginLoader(db, { localPluginDir: sharedDir }, runtimeServices);
+    await loader.loadAll();
+
+    const [after] = await db.select().from(plugins);
+    // No human exec, no second boot.
+    expect(after?.status).toBe("ready");
+    expect(after?.lastError).toBeNull();
+    expect(after?.installDir).toBe(isolatedDir);
+
+    // The mechanism, not just the outcome: the isolated install resolves peers,
+    // which is the only way the SDK can enter that tree.
+    const isolatedInstalls = installArgsFor(isolatedDir);
+    expect(isolatedInstalls.length).toBeGreaterThan(0);
+    for (const argv of isolatedInstalls) {
+      expect(argv).not.toContain("--legacy-peer-deps");
+    }
+  }, 60_000);
+
+  it("does not reinstall the BLO-31857 healthy shape — lock absent, SDK installed", async () => {
+    const sharedDir = await tornSharedStore();
+    const isolatedDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-healthy-"));
+    cleanupPaths.add(isolatedDir);
+
+    const pluginKey = `paperclip.healthy_${randomUUID().slice(0, 8)}`;
+    const manifest = await seedIsolatedPackage(isolatedDir, pluginKey);
+    // No SDK lockfile entry, but the SDK is physically there. BLO-31857: this
+    // tree works, and a reinstall over it is the tear BLO-20961 is about.
+    await writeInstalledPackageVersion(isolatedDir, SDK_PACKAGE, "2026.916.1");
+
+    await insertLegacyRow(pluginKey, manifest, {
+      installDir: isolatedDir,
+      status: "error",
+      lastError: `${SDK_NOT_INSTALLED_ERROR_MARKER}: ${isolatedDir}/package-lock.json records no ${SDK_PACKAGE} entry ...`,
+    });
+
+    const { runtimeServices } = createRuntimeServices();
+    const loader = pluginLoader(db, { localPluginDir: sharedDir }, runtimeServices);
+    await loader.loadAll();
+
+    const [after] = await db.select().from(plugins);
+    expect(after?.status).toBe("ready");
+    expect(after?.lastError).toBeNull();
+    // Revived by the re-probe alone. Nothing was reinstalled over a good tree.
+    expect(installArgsFor(isolatedDir)).toEqual([]);
+  }, 60_000);
+
+  it("never names the SDK in an install argv, and keeps --legacy-peer-deps for the shared store", async () => {
+    // The shared store must not gain a second SDK writer (BLO-20961): the fix
+    // changes which *peers* npm resolves in an isolated tree, and adds no
+    // explicit SDK install anywhere. Asserted against the real argv builder so
+    // it cannot drift from the command the loader actually runs.
+    const sharedDir = await tornSharedStore();
+    const isolatedDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-argv-"));
+    cleanupPaths.add(isolatedDir);
+
+    const sharedArgs = buildPluginInstallArgs(ISOLATED_PACKAGE, sharedDir, "/tmp/cache", {
+      installPeers: false,
+    });
+    expect(sharedArgs).toContain("--legacy-peer-deps");
+    expect(sharedArgs.join(" ")).not.toContain(SDK_PACKAGE);
+
+    const isolatedArgs = buildPluginInstallArgs(ISOLATED_PACKAGE, isolatedDir, "/tmp/cache", {
+      installPeers: true,
+    });
+    expect(isolatedArgs).not.toContain("--legacy-peer-deps");
+    expect(isolatedArgs.join(" ")).not.toContain(SDK_PACKAGE);
+  });
+
+  it("stops reinstalling after the boot budget, leaving the exhausting failure in lastError", async () => {
+    process.env["PAPERCLIP_PLUGIN_BOOT_ACTIVATION_RETRY_LIMIT"] = "1";
+
+    const sharedDir = await tornSharedStore();
+    const isolatedDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-budget-"));
+    cleanupPaths.add(isolatedDir);
+
+    const pluginKey = `paperclip.budget_${randomUUID().slice(0, 8)}`;
+    const manifest = await seedIsolatedPackage(isolatedDir, pluginKey);
+    await writeLockfileVersion(isolatedDir, ISOLATED_PACKAGE, "0.1.0");
+    // A package that cannot be repaired: every install fails.
+    npmMock.onInstall = (argv) => {
+      if (argv.includes(isolatedDir)) throw new Error("E404 Not Found - GET .../- not found");
+    };
+
+    await insertLegacyRow(pluginKey, manifest, {
+      installDir: isolatedDir,
+      status: "error",
+      lastError: `${SDK_NOT_INSTALLED_ERROR_MARKER}: ${isolatedDir}/package-lock.json records no ${SDK_PACKAGE} entry ...`,
+    });
+
+    const { runtimeServices } = createRuntimeServices();
+    const loader = pluginLoader(db, { localPluginDir: sharedDir }, runtimeServices);
+
+    await loader.loadAll();
+    const [firstBoot] = await db.select().from(plugins);
+    expect(firstBoot?.status).toBe("error");
+    // The exhausting failure, not the stale original.
+    expect(firstBoot?.lastError).toContain("E404 Not Found");
+    expect(firstBoot?.lastError).toContain(SDK_NOT_INSTALLED_ERROR_MARKER);
+
+    // Budget is spent across boots, not reset by each one.
+    const afterFirstBoot = installArgsFor(isolatedDir).length;
+    expect(afterFirstBoot).toBeGreaterThan(0);
+
+    await loader.loadAll();
+    const [secondBoot] = await db.select().from(plugins);
+    expect(secondBoot?.status).toBe("error");
+    expect(installArgsFor(isolatedDir).length).toBe(afterFirstBoot);
   }, 60_000);
 });
