@@ -71,6 +71,47 @@ export type ApplyPendingMigrationsOptions = {
  * `max` as `explicit option > URL query param > PGMAX env > default`, so a
  * `?max=` in the connection string can no longer shrink the pool out from
  * under a caller that derived a bound from it.
+ *
+ * ---
+ *
+ * BLO-35946 AC3 asked for this value to be reconciled against its consumers.
+ * It has been measured, and the honest answer is that **10 is inherited, not
+ * deliberate, and it is below steady-state demand.** Recorded here rather than
+ * changed, because sizing it needs the server-side `max_connections` budget
+ * across all replicas and no such budget is documented in either
+ * `Blockcast/paperclip` or `Blockcast/onprem-k8s`. Changing the number without
+ * it would trade a client-side queue for a server-side connection refusal.
+ *
+ * Measured against this constant (2026-09-24, single API/worker process, one
+ * shared pool — note `server/src/index.ts:543` may create a *second* 10-slot
+ * pool for `databaseMigrationUrl`):
+ *
+ * | source                                              | connections |
+ * |-----------------------------------------------------|-------------|
+ * | PR-reviewer wakes: 4 slots x depth 2 (see below)     | 8           |
+ * | scheduler tick: ~11 unlatched concurrent chains      | ~11         |
+ * | `plugin-job-scheduler.ts` `DEFAULT_MAX_CONCURRENT_JOBS` | 10       |
+ * | one `getDeleteConstraints` precheck (`environments.ts:499`) | 8    |
+ * | agent run executions                                 | unbounded  |
+ *
+ * These are not mutually exclusive — they share one pool in one process — so a
+ * conservative floor is ~19 concurrent demands with zero API traffic.
+ *
+ * {@link POSTGRES_POOL_MAX} has exactly one derived consumer,
+ * `derivePrReviewerWakeMaxConcurrency` (`routes/github-webhook.ts:3013`), which
+ * yields 4 and reserves 8 of the 10 on the reasoning that `2 * bound < poolMax`.
+ * That derivation implicitly assumes the PR path is the only thing on the pool,
+ * which the table above contradicts.
+ *
+ * Exactly one live nested acquire remains (`github-webhook.ts:3092` takes a
+ * transaction-scoped advisory lock, then `heartbeat.wakeup()` inside it opens
+ * its own claim transaction at `heartbeat.ts:23786`). Every other nesting path
+ * — recovery, issues, environment leases, both outboxes — was converted to
+ * thread `tx` through rather than take a second pooled connection, which is why
+ * the two prior incidents at this number (`server/src/index.ts:1114`,
+ * `services/issues.ts:5723`) were each fixed by removing a nest rather than by
+ * sizing the pool. That is the pattern this note exists to flag: the number has
+ * now been paid for twice and never re-derived.
  */
 export const POSTGRES_POOL_MAX = 10;
 
@@ -102,9 +143,53 @@ export const POSTGRES_POOL_MAX = 10;
  */
 export const POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS = 120_000;
 
+/**
+ * How long a retiring connection waits for an in-flight query before the
+ * driver terminates it instead (BLO-35946, patched into postgres.js as the
+ * `close_timeout` option; see `closeTimedOut()` in `patches/postgres@3.4.9.patch`).
+ *
+ * This bound only ever applies *after* `Connection.end()` has been called —
+ * by {@link POSTGRES_MAX_LIFETIME_MIN_SECONDS} below, or by `sql.end()`. At
+ * that point the connection has already been moved to the pool's terminal
+ * `ended` queue and can never be handed out again, so the choice is not "kill
+ * the query or let it finish": it is "kill the query or leak the slot
+ * permanently". Waiting was the unbounded half of the 2026-09-24 outage.
+ *
+ * 30s matches the driver's sibling `connect_timeout` and the `statement_timeout`
+ * this repo asserts at role level — so any query a healthy environment would
+ * already have cancelled is dead well before this fires. A query that outlives
+ * it is rejected with `CONNECTION_DESTROYED`, which is loud and retriable;
+ * that is the deliberate trade against a silent permanent leak.
+ */
+export const POSTGRES_CLOSE_TIMEOUT_SECONDS = 30;
+
+/**
+ * Bounds on how long a pooled connection lives before the driver retires and
+ * reopens it. Previously left at the postgres.js default, which is the same
+ * 30–60 minute randomised range — this states it so the value is readable
+ * rather than having to be recovered from the library (BLO-35946 AC4).
+ *
+ * The randomisation is load-bearing and is why this is a function rather than
+ * a constant: `timer()` resolves it **once per `Connection`**, so passing a
+ * plain number would give all {@link POSTGRES_POOL_MAX} connections — which
+ * are all opened at process start — the same expiry instant, retiring the
+ * whole pool simultaneously. Spreading them is the point.
+ */
+export const POSTGRES_MAX_LIFETIME_MIN_SECONDS = 30 * 60;
+export const POSTGRES_MAX_LIFETIME_MAX_SECONDS = 60 * 60;
+
+export function postgresMaxLifetimeSeconds(): number {
+  return (
+    POSTGRES_MAX_LIFETIME_MIN_SECONDS +
+    Math.random() * (POSTGRES_MAX_LIFETIME_MAX_SECONDS - POSTGRES_MAX_LIFETIME_MIN_SECONDS)
+  );
+}
+
 export function createDb(url: string) {
   const sql = postgres(url, {
     max: POSTGRES_POOL_MAX,
+    max_lifetime: postgresMaxLifetimeSeconds,
+    close_timeout: POSTGRES_CLOSE_TIMEOUT_SECONDS,
     // Sent in the startup packet, so it applies to every connection this pool
     // opens — including ones created later to refill the pool. postgres.js
     // filters falsy startup parameters out entirely, so a `0` here would ship
@@ -113,7 +198,12 @@ export function createDb(url: string) {
     connection: {
       idle_in_transaction_session_timeout: POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS,
     },
-  });
+    // Two of these are invisible to the shipped typings, so the whole object
+    // is cast rather than each field suppressed: `close_timeout` is this
+    // repo's patch, and `max_lifetime` is typed as a plain number even though
+    // the library's own default for it is a function (`src/index.js:515`) and
+    // `timer()` calls it (`src/connection.js:1043`). Both are real at runtime.
+  } as unknown as Parameters<typeof postgres>[1]);
   // Inert in production; only embedded test databases register their URL so
   // their pools can be closed before the server stops (see registry module).
   registerTrackedClient(url, sql);
