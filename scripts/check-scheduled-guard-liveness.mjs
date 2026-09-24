@@ -332,11 +332,30 @@ export function classifyGuard(workflow, observation, { now, staleHours = DEFAULT
   // persistently failing second read mutes the alarm entirely, which is the
   // exact failure mode this detector exists to prevent — the same reasoning
   // that makes `runs-unreadable` red rather than pass.
+  //
+  // A newer cross-check refutes the AGE, not staleness: it is aged against the
+  // same staleHours bar the never-completed branch uses. Past the bar the guard
+  // is dead by either read (a one-second index lag is enough to reach this
+  // branch), so the red stands, citing the better timestamp.
   const crossCheck = observation.crossCheck;
   if (crossCheck && !crossCheck.error && crossCheck.newestCompletedAt) {
     const crossEpoch = Date.parse(crossCheck.newestCompletedAt);
+    const crossAgeMinutes = Math.floor((now - crossEpoch) / 60000);
+    if (!Number.isNaN(crossEpoch) && crossEpoch > completedEpoch && crossAgeMinutes >= staleHours * 60) {
+      return {
+        ...base,
+        status: "stale",
+        reason: "stopped",
+        ageMinutes: crossAgeMinutes,
+        detail:
+          `${name} (${workflow}) read as ${Math.floor(ageMinutes / 60)}h stale from the filtered ` +
+          `run index, and an unfiltered re-read found its newest completion at ` +
+          `${crossCheck.newestCompletedAt}, ${Math.floor(crossAgeMinutes / 60)}h ago, also past the ` +
+          `${staleHours}h liveness threshold. The guard has stopped by either read (PEN-3379).`,
+        lastRunUrl: observation.newest.htmlUrl ?? null,
+      };
+    }
     if (!Number.isNaN(crossEpoch) && crossEpoch > completedEpoch) {
-      const crossAgeMinutes = Math.floor((now - crossEpoch) / 60000);
       return {
         ...base,
         status: "unknown",
