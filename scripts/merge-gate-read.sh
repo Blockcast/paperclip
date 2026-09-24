@@ -171,6 +171,13 @@ dead_runs() { # stdin: run rows -> stdout: alternation of stale run ids
   # 23:39:15Z after a title edit, and the reader printed a STOP nobody could
   # clear. ~3% of sampled open-PR heads across five repos carry the shape.
   #
+  # Knowingly out of scope, not an oversight: GitHub's other terminal run
+  # conclusions — `timed_out`, `startup_failure`, `stale`, `action_required`.
+  # A superseded run in one of those still prints STOP, i.e. the same false RED
+  # this widening fixed. Left alone because the direction is RED (costs a wait,
+  # never a bad merge) and because none has been measured at a real head here,
+  # unlike `failure`. Widen the predicate when one is; do not widen on theory.
+  #
   # BEWARE the field this keys on: `workflow_run.event` is the WEBHOOK event
   # (`pull_request`), NOT the action (`opened`/`edited`). The originating report
   # read the actions and concluded the two runs were different events; they are

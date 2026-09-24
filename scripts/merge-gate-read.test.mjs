@@ -867,6 +867,14 @@ describe("merge-gate reader", () => {
       // unpaginated. Unfolding first also catches the split-token shape.
       // Comment lines are excluded by leading `#` only; a trailing `# gh api`
       // comment fails this LOUD, which is the safe direction.
+      //
+      // The unfolding itself is a COVERAGE WIDENING, not a guard, and is
+      // deliberately kept as one: reverting `.replace(...)` to bare `SOURCE`
+      // leaves the suite green (re-measured 61/61 at this head) because no
+      // line here yet splits a `gh api` token or appends a second call. The
+      // `+ 1` and the `#` exclusion are the terms that fail when broken. Do
+      // not record this as an unkilled guard on the next sweep — it is the
+      // two shapes above being absent today, not a fixture gap.
       const ghApi = SOURCE.replace(/\\\n\s*/g, " ")
         .split("\n")
         .filter((l) => !l.trimStart().startsWith("#"))

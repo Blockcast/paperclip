@@ -492,9 +492,13 @@ jobs:
         # row: BLO-34035 (neutral dropped), BLO-34114 (dedup key not unique),
         # BLO-34263 (dead-run filter eats the whole surface, empty output reads as
         # a pass), BLO-34619 (supersession proxied through id ordering, then
-        # through an un-ordered sibling test). All four are pinned here, and every
-        # guard in the reader is mutation-checked: reverting any ONE of them alone
-        # fails this suite. A guard with no failing mutation is a comment — add
+        # through an un-ordered sibling test). All four are pinned here. Every
+        # guard swept so far is mutation-checked — reverting any ONE alone fails
+        # this suite — but read that as a record of what the sweeps covered, not
+        # as a property of the file: the 09-19 `28/28` asserted exactly this
+        # universally while a coarse mutation hid an unkilled arm (:501). The
+        # claim is only ever as wide as the last sweep.
+        # A guard with no failing mutation is a comment — add
         # the mutation before you trust the fixture. Last swept 2026-09-23 after
         # BLO-34835 (victim widened to `failure`, in-flight `""` fence): 17/17
         # dead_runs()+verdicts()+extract() mutations killed at this head.
