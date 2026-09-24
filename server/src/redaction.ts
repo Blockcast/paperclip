@@ -965,8 +965,9 @@ export function restoreWithheldPipelineStageConfig(incoming: unknown, existing: 
   // point: `persistedStageConfig` (`services/pipelines.ts`) destructures `automation` out
   // before every write, so no stored row can carry one. Keying the `automation` branch on
   // `existing.automation` therefore always found `undefined` and stripped the command instead
-  // of restoring it — and `upsertStageAutomationRoutine` then rebuilds `onEnter` from that
-  // stripped context (`onEnter: { type, routineId, ...input.executionContext }`), overwriting
+  // of restoring it — and `syncPipelineStageAutomation` (`services/pipelines.ts:2818`) then
+  // rebuilds `onEnter` from that stripped context (`:2886`, `:2924`:
+  // `onEnter: { type, routineId, ...input.executionContext }`), overwriting
   // the copy the `onEnter` branch had just restored correctly. `onEnter` is the only persisted
   // copy of this carrier; `automation` is derived from it on read.
   const storedBlock = isPlainObject(existingRecord.onEnter) ? existingRecord.onEnter : {};
@@ -991,7 +992,20 @@ function readArrayElementIdentity(value: unknown): { key: string; value: string 
   // the same commit, or the restore silently loses the ability to align on it.
   for (const key of WORKSPACE_RUNTIME_IDENTITY_KEYS) {
     const candidate = value[key];
-    if (typeof candidate === "string" && candidate.length > 0) return { key, value: candidate };
+    if (typeof candidate !== "string" || candidate.length === 0) continue;
+    // A MASKED identity is not an identity. `maskWorkspaceRuntimeForRead` honours these keys only
+    // on an entry sitting directly inside a top-level `commands`/`services`/`jobs` array
+    // (`identityScope`), and only when the value is already a string. Everywhere else — a nested
+    // `env` array inside a service, a top-level array the parser does not bless (`containers`,
+    // `volumes`, …), or a blessed entry whose `id` is a NUMBER — the identity key comes back as the
+    // sentinel. Accepting that sentinel as an identity made this function match zero stored
+    // elements, which `matchExistingArrayElement` reads as "ambiguous" and fails closed on, so the
+    // caller persisted the sentinel OVER the operator's real value on an UNMODIFIED round-trip —
+    // the exact destructive write this guard exists to prevent, one nesting level down.
+    // Treating it as absent instead falls through to the length-guarded index alignment below,
+    // which is correct whenever the editor did not add or remove elements.
+    if (candidate.includes(REDACTED_EVENT_VALUE)) continue;
+    return { key, value: candidate };
   }
   return null;
 }
@@ -1006,10 +1020,23 @@ function readArrayElementIdentity(value: unknown): { key: string; value: string 
  * walks), and that mask deliberately lets identity keys through on those entries — so an
  * unentitled round-tripper still holds a real `id`/`name` to key on.
  *
- * Ambiguity fails closed: no identity, or an identity matching zero or several stored
- * elements, yields `undefined`, and the caller then leaves the incoming value untouched
- * rather than guessing a neighbour. Index alignment survives only as the fallback for
- * identity-less elements in an array that demonstrably did not change length.
+ * Ambiguity fails closed: an identity matching zero or several stored elements yields
+ * `undefined`, and the caller then leaves the incoming value untouched rather than guessing a
+ * neighbour. ⚠️ Be precise about what that costs — "fails closed" here is NOT a no-op. The
+ * incoming value under a sentinel IS the sentinel, so leaving it untouched persists
+ * `***REDACTED***` and the operator's stored value is lost. It is a *visible* loss rather than a
+ * silent one (a literal sentinel in the config is obviously wrong, whereas a neighbour's real
+ * command is not), and that is the only sense in which it is the safer branch.
+ *
+ * The one case that genuinely reaches it is a DUPLICATE identity in the stored array — two
+ * services both named `web`. That is left fail-closed deliberately: with the identity ambiguous
+ * there is no way to tell a reorder from a no-op, and silently writing one service's command onto
+ * another is the failure this alignment was introduced to stop. It is pinned by a test so the
+ * cost is a recorded choice rather than an accident.
+ *
+ * Index alignment survives as the fallback for elements with no USABLE identity — including one
+ * whose identity the mask replaced with a sentinel — in an array that demonstrably did not change
+ * length.
  */
 function matchExistingArrayElement(
   incoming: unknown,
