@@ -560,6 +560,88 @@ function requiresSelfContainedSdkTree(
   return !!installDir && installDir !== sharedStoreDir;
 }
 
+/**
+ * The one place a plugin install argv is composed (BLO-34795).
+ *
+ * `--legacy-peer-deps` tells npm not to install peerDependencies at all. That
+ * is load-bearing for the **shared** store, where several plugins'
+ * irreconcilable `@paperclipai/plugin-sdk` peer ranges coexist in one tree
+ * (`@lucitra/paperclip-plugin-secrets@>=1.0.0` vs
+ * `@lucitra/paperclip-plugin-chat`'s pinned canary) and npm would otherwise
+ * refuse to build a tree at all.
+ *
+ * In an **isolated** tree the same flag is the whole bug. Those packages
+ * declare the SDK as a *peer* and several have no regular dependencies at all,
+ * so with the flag on this command can never place
+ * `node_modules/@paperclipai/plugin-sdk` in the tree however many times it
+ * runs — which is why a torn isolated tree has only ever been repaired by a
+ * human `npm install` over `kubectl exec`, and why the boot install loop
+ * firing on every restart changed nothing. An isolated tree holds exactly one
+ * plugin, so the cross-plugin ERESOLVE the flag absorbs cannot arise there,
+ * and npm's default peer install is also the version-accurate answer: each
+ * plugin gets the SDK range *it* declares, rather than one this file would
+ * have to hardcode and keep in sync with four separate packages.
+ *
+ * Exported so the tests assert against the real argv rather than a copy of it.
+ */
+export function buildPluginInstallArgs(
+  spec: string,
+  targetInstallDir: string,
+  npmCacheDir: string,
+  options: { installPeers: boolean },
+): string[] {
+  return [
+    "install",
+    spec,
+    "--prefix",
+    targetInstallDir,
+    "--save",
+    "--ignore-scripts",
+    // --ignore-scripts prevents preinstall/install/postinstall hooks from
+    // executing arbitrary code on the host before manifest validation.
+    ...(options.installPeers ? [] : ["--legacy-peer-deps"]),
+    "--cache",
+    npmCacheDir,
+  ];
+}
+
+/**
+ * Run a plugin install, falling back to the pre-BLO-34795 invocation if the
+ * peer-resolving one fails.
+ *
+ * The fallback is what makes dropping `--legacy-peer-deps` strictly
+ * non-regressive: three of the four `ISOLATED_SDK_PLUGIN_PACKAGES` are healthy
+ * today, and if resolving one of their peer trees turns out to ERESOLVE we
+ * retry exactly the argv that shipped before, so the worst case is today's
+ * behaviour rather than taking a working plugin offline. A tree that installs
+ * but still has no SDK is caught downstream by the consistency guard, as it is
+ * now.
+ */
+async function npmInstallPlugin(
+  spec: string,
+  targetInstallDir: string,
+  options: { installPeers: boolean },
+): Promise<void> {
+  // --cache uses a writable temp dir to avoid EPERM on root-owned ~/.npm cache.
+  const npmCacheDir = path.join(os.tmpdir(), "paperclip-npm-cache");
+  const run = (installPeers: boolean): Promise<unknown> =>
+    // execFile (not exec) to avoid shell injection from package name/version.
+    execFileAsync("npm", buildPluginInstallArgs(spec, targetInstallDir, npmCacheDir, { installPeers }), {
+      timeout: 120_000, // 2 minute timeout for npm install
+    });
+
+  try {
+    await run(options.installPeers);
+  } catch (err) {
+    if (!options.installPeers) throw err;
+    logger.child({ service: "plugin-loader" }).warn(
+      { spec, installDir: targetInstallDir, err: err instanceof Error ? err.message : String(err) },
+      "plugin-loader: peer-resolving install failed; retrying with --legacy-peer-deps",
+    );
+    await run(false);
+  }
+}
+
 interface SharedDependencyVersionRead {
   state: "missing" | "ok" | "invalid";
   version: string | null;
@@ -2011,24 +2093,16 @@ export function pluginLoader(
       );
 
       try {
-        // Use execFile (not exec) to avoid shell injection from package name/version.
-        // --ignore-scripts prevents preinstall/install/postinstall hooks from
-        // executing arbitrary code on the host before manifest validation.
-        // --cache uses a writable temp dir to avoid EPERM on root-owned ~/.npm cache.
-        // --legacy-peer-deps absorbs ERESOLVE failures from third-party plugin
-        // packages whose `@paperclipai/plugin-sdk` peer ranges don't reconcile
-        // (e.g. `@lucitra/paperclip-plugin-secrets@>=1.0.0` vs
-        // `@lucitra/paperclip-plugin-chat`'s pinned canary). Plugin manifests
-        // are validated separately downstream, so a "potentially broken"
-        // peer-dep tree at install time is bounded — we'd reject a bad
-        // manifest before loading it, rather than letting npm refuse to
-        // install at all.
-        const npmCacheDir = path.join(os.tmpdir(), "paperclip-npm-cache");
-        await execFileAsync(
-          "npm",
-          ["install", spec, "--prefix", targetInstallDir, "--save", "--ignore-scripts", "--legacy-peer-deps", "--cache", npmCacheDir],
-          { timeout: 120_000 }, // 2 minute timeout for npm install
-        );
+        // Peers are installed for a tree the server owns and nothing else
+        // provides an SDK for; skipped for the shared store, where several
+        // plugins' peer ranges cannot reconcile. See buildPluginInstallArgs.
+        // Plugin manifests are validated separately downstream, so a
+        // "potentially broken" peer-dep tree at install time is bounded — we'd
+        // reject a bad manifest before loading it, rather than letting npm
+        // refuse to install at all.
+        await npmInstallPlugin(spec, targetInstallDir, {
+          installPeers: requiresSelfContainedSdkTree(targetInstallDir, localPluginDir),
+        });
       } catch (err) {
         throw new Error(`npm install failed for ${spec}: ${String(err)}`);
       }
@@ -2178,6 +2252,98 @@ export function pluginLoader(
   }
 
   /**
+   * Bounded in-boot repair for an isolated tree whose SDK is genuinely absent
+   * (BLO-34795).
+   *
+   * Before this, the branch below only ever *observed*: it re-probed, found the
+   * tree still empty, and left the row errored until something else installed
+   * the SDK. Nothing else ever could — the boot install loop runs about a
+   * second later and, until `buildPluginInstallArgs` grew the isolated case,
+   * ran with `--legacy-peer-deps`, which cannot place a peer. So the row stayed
+   * dead until a human `npm install` over `kubectl exec`. Reinstalling here
+   * closes that, and closes it in the **same** boot rather than the next, which
+   * is what removes the second-restart requirement.
+   *
+   * Scope and budget:
+   *
+   * - Only `not_installed`. A version *mismatch* is the torn-store case, and
+   *   reinstalling over it is the BLO-20961 tear this family exists to stop.
+   * - Only a tree the server owns (`requiresSelfContainedSdkTree`) — the same
+   *   predicate the activation guard and the re-probe use, so the three cannot
+   *   drift into disagreeing about which rows are in scope. The shared store is
+   *   never reinstalled from here.
+   * - Budgeted with the existing boot re-attempt counter, so a package that
+   *   simply cannot be installed (yanked, unpublished, npm offline) lands back
+   *   in `error` with the exhausting failure in `lastError` instead of
+   *   reinstalling on every boot forever. The two passes that read that counter
+   *   are mutually exclusive by latch marker — a `SDK_NOT_INSTALLED` row never
+   *   carries a contention suffix — so it is one budget per row and one env
+   *   knob rather than a shared one.
+   *
+   * Returns whether it took responsibility for the row's status.
+   */
+  async function repairIsolatedSdkTree(
+    plugin: PluginRecord,
+    probeDir: string,
+    reprobe: SharedDependencyConsistencyCheck,
+  ): Promise<boolean> {
+    if (reprobe.problem !== "not_installed") return false;
+    if (!requiresSelfContainedSdkTree(plugin.installDir, localPluginDir)) return false;
+    if (!plugin.packageName) return false;
+
+    const limit = resolveBootActivationRetryLimit();
+    const spent = readBootActivationRetryCount(plugin.lastError);
+    if (limit <= 0 || spent >= limit) {
+      log.warn(
+        { pluginId: plugin.id, pluginKey: plugin.pluginKey, installDir: probeDir, attempts: spent, limit },
+        "plugin-loader: isolated SDK tree repair budget exhausted across boots; leaving plugin errored",
+      );
+      return false;
+    }
+
+    const attempt = spent + 1;
+    // Reinstall at the recorded version: a repair must not silently upgrade the
+    // plugin. Peers are on, which is what pulls the SDK the package declares.
+    const spec = plugin.version ? `${plugin.packageName}@${plugin.version}` : plugin.packageName;
+
+    let failure: string | null = null;
+    try {
+      await npmInstallPlugin(spec, probeDir, { installPeers: true });
+    } catch (err) {
+      failure = err instanceof Error ? err.message : String(err);
+    }
+
+    if (!failure) {
+      const after = await checkSharedDependencyConsistency(probeDir, SDK_INSTALL_RACE_PACKAGE_MARKER, {
+        requireInstalledInTree: true,
+      });
+      if (after.consistent) {
+        await registry.updateStatus(plugin.id, { status: "ready", lastError: null });
+        log.info(
+          { pluginId: plugin.id, pluginKey: plugin.pluginKey, installDir: probeDir, spec, attempt },
+          "plugin-loader: reinstalled a plugin whose isolated tree had lost its SDK; re-enabled in this boot",
+        );
+        return true;
+      }
+      failure = formatSharedDependencyConsistencyError(after, probeDir);
+    }
+
+    // Keep the marker so the next boot's pass still recognises the row, and
+    // carry the exhausting failure rather than the stale original.
+    await registry.updateStatus(plugin.id, {
+      status: "error",
+      lastError:
+        `${SDK_NOT_INSTALLED_ERROR_MARKER}: isolated tree repair failed for ${spec}: ${failure}` +
+        formatBootActivationRetryTag(attempt, limit),
+    });
+    log.warn(
+      { pluginId: plugin.id, pluginKey: plugin.pluginKey, installDir: probeDir, spec, attempt, limit },
+      "plugin-loader: isolated SDK tree repair did not produce a usable tree",
+    );
+    return true;
+  }
+
+  /**
    * Run `reconcileLegacyIsolatedInstall` across installed rows before
    * `loadAll()` selects by status.
    *
@@ -2231,7 +2397,7 @@ export function pluginLoader(
               { pluginId: migrated.id, pluginKey: migrated.pluginKey, installDir: probeDir },
               "plugin-loader: re-enabled plugin latched by a missing plugin SDK; the install has since landed",
             );
-          } else {
+          } else if (!(await repairIsolatedSdkTree(migrated, probeDir, reprobe))) {
             log.warn(
               {
                 pluginId: migrated.id,
