@@ -212,6 +212,7 @@ describe("hasStillPresentDisposition", () => {
       ["canonical", "- **prior:354d5b9 important 1** — still-present — not mirrored", true],
       ["en dash separator", "- **prior:354d5b9 important 1** – still-present – not mirrored", true],
       ["space after the emphasis", "- ** prior:354d5b9 important 1** — still-present — not mirrored", true],
+      ["3-space indent", "   - **prior:354d5b9 important 1** — still-present — not mirrored", true],
       ["trailing parenthetical after the index", "- **prior:354d5b9 important 1 (see below)** — still-present — not mirrored", false],
       ["fixed verb", "- **prior:354d5b9 important 1** — fixed — closed", false],
       ["verb in prose only", "still-present in quoted prose\n- prior:354d5b9 important 1 still-present", false],
