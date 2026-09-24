@@ -941,5 +941,108 @@ describe.sequential("issue goal context routes", () => {
       // `null` carries nothing and stays `null` rather than becoming the sentinel.
       expect(emitted.defaultsJson.color).toBeNull();
     });
+
+    // PEN-3210 door #19. The block above pins `project.managedByPlugin`; this pins
+    // `mentionedProjects[].managedByPlugin` — TWO KEYS DOWN THE SAME `res.json({…})`
+    // LITERAL, reached through `publicProjects` instead of `compactIssueProject`. The
+    // finding was exactly that: the mask landed on one key and the same material went
+    // out on its neighbour. Cases are parameterised over the entitlement because the
+    // two keys reach the field by different routes and a plausible fix closes only one
+    // of them.
+    //
+    // ⚠️ The `revealRuntimeConfig: true` case is the load-bearing one and it is NOT
+    // redundant with the block above. `publicProject` early-returns the whole row for an
+    // entitled viewer:
+    //
+    //     const masked = maskProjectManagedByPluginDefaults(maskProjectEnv(project));
+    //     if (viewer.revealRuntimeConfig) return masked;   // ← everything below is skipped
+    //
+    // so a mask written into the object literal BELOW that line — the obvious place, next
+    // to `workspaces` and `primaryWorkspace` — masks nothing for the caller most likely to
+    // be an entitled human operator, while passing an unentitled-only test. `defaultsJson`
+    // is plugin-manifest material and `workspace_runtime:read` is scoped to workspace
+    // runtime config, so no viewer is entitled to it and the mask must sit ABOVE the
+    // return. That is what the `true` case measures and nothing else in the suite does.
+    //
+    // Fixture values are invented; no real endpoint was called to produce them. The
+    // secret is distinct from every sibling door's constant — reusing one would let an
+    // already-merged mask elsewhere in the response satisfy `not.toContain` and the test
+    // would pass against unfixed code (the PEN-3130 lesson).
+    describe("plugin defaultsJson masking on mentionedProjects (PEN-3210)", () => {
+      const MENTIONED_PLUGIN_SECRET = "invented-mentioned-project-defaults-fixture";
+
+      for (const revealRuntimeConfig of [true, false]) {
+        it(`masks plugin-authored defaultsJson on mentionedProjects[] from GET /issues/:id (workspace_runtime:read ${
+          revealRuntimeConfig ? "granted" : "denied"
+        })`, async () => {
+          mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+            allowed: revealRuntimeConfig || input.action !== "workspace_runtime:read",
+            action: input.action,
+            reason: "allow_test",
+            explanation: "Allowed by test mock.",
+          }));
+
+          const mentionedProject = {
+            ...(await mockProjectService.getById()),
+            id: "22222222-2222-4222-8222-222222222222",
+            urlKey: "billing",
+            name: "Billing",
+            managedByPlugin: {
+              id: "plugin-binding-2",
+              pluginId: "plugin-2",
+              pluginKey: "acme-billing",
+              pluginDisplayName: "Acme Billing",
+              resourceKind: "project",
+              resourceKey: "billing",
+              defaultsJson: {
+                projectKey: "billing",
+                displayName: "Billing",
+                color: null,
+                settings: { BILLING_WEBHOOK_SECRET: MENTIONED_PLUGIN_SECRET, region: "eu-west-1" },
+              },
+              createdAt: new Date("2026-03-20T00:00:00Z"),
+              updatedAt: new Date("2026-03-20T00:00:00Z"),
+            },
+          };
+
+          mockIssueService.getById.mockResolvedValue({ ...legacyProjectLinkedIssue });
+          mockIssueService.findMentionedProjectIds.mockResolvedValue([mentionedProject.id]);
+          mockProjectService.listByIds.mockResolvedValue([structuredClone(mentionedProject)]);
+
+          const res = await request(createApp()).get(
+            "/api/issues/11111111-1111-4111-8111-111111111111",
+          );
+
+          expect(res.status).toBe(200);
+          expect(JSON.stringify(res.body)).not.toContain(MENTIONED_PLUGIN_SECRET);
+
+          const emitted = res.body.mentionedProjects[0].managedByPlugin;
+          // The binding stays addressable: these three are what the UI reads.
+          expect(emitted.pluginKey).toBe("acme-billing");
+          expect(emitted.pluginDisplayName).toBe("Acme Billing");
+          expect(emitted.resourceKey).toBe("billing");
+
+          // Structure and key names survive (ask 1).
+          expect(Object.keys(emitted.defaultsJson)).toEqual([
+            "projectKey",
+            "displayName",
+            "color",
+            "settings",
+          ]);
+          expect(Object.keys(emitted.defaultsJson.settings)).toEqual([
+            "BILLING_WEBHOOK_SECRET",
+            "region",
+          ]);
+
+          // Values do not — asserted BY VALUE. A verbatim passthrough keeps the key set
+          // byte-identical, so the two `Object.keys` assertions above stay green against
+          // the unfixed code and cannot carry this on their own.
+          expect(emitted.defaultsJson.settings.BILLING_WEBHOOK_SECRET).toBe("***REDACTED***");
+          expect(emitted.defaultsJson.settings.region).toBe("***REDACTED***");
+          expect(emitted.defaultsJson.displayName).toBe("***REDACTED***");
+          expect(emitted.defaultsJson.color).toBeNull();
+        });
+      }
+    });
   });
 });

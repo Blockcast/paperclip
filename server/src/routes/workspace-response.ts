@@ -6,6 +6,7 @@ import type {
   ExecutionWorkspaceConfig,
   ExecutionWorkspaceStrategy,
   ProjectExecutionWorkspacePolicy,
+  ProjectManagedByPlugin,
   ProjectWorkspace,
   WorkspaceOperation,
   WorkspaceRuntimeService,
@@ -541,6 +542,114 @@ export function publicProjectWorkspaces(
 }
 
 /**
+ * Mask the one open field on a project's plugin binding (PEN-3114, door #15 of the PEN-2370 series;
+ * ask 1 — names survive, values elided).
+ *
+ * `ProjectManagedByPlugin.defaultsJson` is an open `Record<string, unknown>`
+ * (`packages/shared/src/types/project.ts`) over a `jsonb` column, and its `settings` leaf is copied
+ * straight out of a plugin manifest's `PluginManagedProjectDeclaration.settings` — "Optional
+ * plugin-specific defaults" (`packages/shared/src/types/plugin.ts`) — via
+ * `buildManagedProjectDefaults` (`services/projects.ts`). That block is authored by a plugin author
+ * rather than by a Paperclip operator, and integration config is a natural home for a credential.
+ *
+ * Enumerated rather than spread, so a field added to `ProjectManagedByPlugin` later has to be
+ * considered here instead of crossing silently.
+ *
+ * ## Why this lives here, and not beside its first caller
+ *
+ * PEN-3114 landed this walk as a local `compactIssueManagedByPlugin` in `routes/issues.ts`, which
+ * masked the `project` key of `GET /issues/:id`. PEN-3210 (door #19) found the same field crossing
+ * the SAME response body two keys over, under `mentionedProjects[]`, and four more times through the
+ * project routes — every one of them via `publicProject` below. Copying the walk to those exits is
+ * exactly how the array-shaped (#1574) and JSON-string (#1583) bypasses each shipped, so it moved
+ * here instead: one walk, reached by both `compactIssueProject` and `publicProject`, and a finding
+ * against it lands in one place.
+ *
+ * ## Why delegate to `maskWorkspaceRuntimeForRead`
+ *
+ * Its contract is the one ask 1 asks for — every value masked, every key name kept, anything that is
+ * not an object or array masked outright, depth-capped fail-closed. The last two matter more than
+ * they look: the column is `jsonb`, so the runtime value is arbitrary regardless of what the
+ * TypeScript type claims. That is also why the returned `defaultsJson` is cast rather than inferred
+ * — a non-object value masks to a scalar, so the declared `Record` is a claim about the input shape,
+ * never about what this function discloses. The cast is static only; the runtime value is masked on
+ * every branch.
+ *
+ * Its `commands`/`services`/`jobs` identity carve-out is *inert* here — the platform writes
+ * `projectKey`/`displayName`/`description`/`status`/`color`/`settings` and none of those is one of
+ * those three array names. If a manifest ever did write a top-level `services` array, the carve-out
+ * would preserve only `id`/`name`/`label`/`title` strings on its entries, which that walk already
+ * discloses in the strictly more sensitive workspace-runtime position; the residual is bounded and
+ * no worse there.
+ *
+ * `withholdAgentConfigKeys` (#1581) was checked first and does not fit: it is keyed on the literal
+ * names `adapterConfig`/`runtimeConfig`, and it blanks its target to `{}`, which erases the key
+ * names ask 1 requires be kept.
+ *
+ * ## Why this is masked unconditionally, when the runtime exits in this module are gated
+ *
+ * Everything else here reads `viewer.revealRuntimeConfig ? raw : …` (PEN-2852 / BLO-33407). This one
+ * deliberately does not, and the difference is the entitlement's scope rather than an oversight:
+ * `workspace_runtime:read` is defined over workspace runtime config. `defaultsJson` is
+ * plugin-manifest material with a different audience, so gating it on that flag would disclose
+ * plugin defaults to every holder of an unrelated entitlement — widening the grant while appearing
+ * to narrow it.
+ *
+ * Nor is there an entitled consumer to serve, which is what makes the gate valuable above: there,
+ * the runtime editors genuinely need raw values. Here no reader wants them (see below), so a gate
+ * would have an empty true-branch and the only effect of adding one would be the mis-scoping. If a
+ * consumer ever does need raw `defaultsJson`, it should arrive with its own entitlement rather than
+ * borrow this one.
+ *
+ * ## Why masking is safe here
+ *
+ * `defaultsJson` is retained to drive plugin reset/reconcile, and that path is write-only with
+ * respect to these responses: it recomputes `defaults` from the manifest declaration and writes it
+ * to `pluginManagedResources.defaultsJson` (`services/projects.ts`), and `reset` updates the project
+ * row from the declaration too — neither ever reads a response body back.
+ *
+ * No UI reads `defaultsJson`: `ui/src/pages/ProjectDetail.tsx` reads `pluginDisplayName` (`:814`),
+ * `pluginKey` (`:912`) and the binding's mere existence (`:701`, `:811`, `:878`, `:908`), and
+ * `RoutineDetail.tsx` reads `pluginDisplayName`/`resourceKey` off the ROUTINE binding, a different
+ * noun. All of those survive untouched. Re-grepped across the whole of `ui/` for PEN-3210, now that
+ * the four project routes are in scope and not just the issue projection — the only hit outside the
+ * server is a `defaultsJson: {}` fixture in `ProjectDetail.test.tsx`, which asserts nothing about it.
+ */
+export function publicProjectManagedByPlugin(
+  managed: ProjectManagedByPlugin | null | undefined,
+): ProjectManagedByPlugin | null {
+  if (!managed) return null;
+  return {
+    id: managed.id,
+    pluginId: managed.pluginId,
+    pluginKey: managed.pluginKey,
+    pluginDisplayName: managed.pluginDisplayName,
+    resourceKind: managed.resourceKind,
+    resourceKey: managed.resourceKey,
+    defaultsJson: maskWorkspaceRuntimeForRead(managed.defaultsJson) as Record<string, unknown>,
+    createdAt: managed.createdAt,
+    updatedAt: managed.updatedAt,
+  };
+}
+
+/**
+ * Apply {@link publicProjectManagedByPlugin} to any row that carries a plugin binding, leaving rows
+ * that do not exactly as they arrived.
+ *
+ * The `in` check is deliberately about the KEY's presence and not about `managedByPlugin` being
+ * truthy: `managedByPlugin` is hydrated (`services/projects.ts:379`) rather than selected, so a row
+ * that never went through the hydrator has no such key at all, and writing `managedByPlugin: null`
+ * onto it would add a field to a response that has never carried one. A row that WAS hydrated and
+ * came back `null` already has the key, and normalising it through the projection is a no-op.
+ */
+function maskProjectManagedByPluginDefaults<T extends object>(project: T): T {
+  if (!project || typeof project !== "object") return project;
+  if (!("managedByPlugin" in project)) return project;
+  const managed = (project as { managedByPlugin?: ProjectManagedByPlugin | null }).managedByPlugin;
+  return { ...project, managedByPlugin: publicProjectManagedByPlugin(managed) };
+}
+
+/**
  * Project responses EMBED their workspaces (`workspaces[]` and `primaryWorkspace`), each built by
  * the same `toWorkspace` mapper — so a project read is a second exit for exactly the same material,
  * and `GET /companies/:companyId/projects` is the widest one in the codebase. Found by running this
@@ -557,12 +666,19 @@ export function publicProject<T extends {
   primaryWorkspace: ProjectWorkspace | null;
   env?: AgentEnvConfig | null;
   executionWorkspacePolicy?: ProjectExecutionWorkspacePolicy | null;
+  managedByPlugin?: ProjectManagedByPlugin | null;
 }>(project: T, viewer: WorkspaceRuntimeViewer): T {
   // PEN-3033: the `env` mask is applied FIRST and is not gated on `viewer`. The runtime-config
   // withholding below is an entitlement decision; a plain env value is disclosed to nobody, so it
   // must not sit behind the `revealRuntimeConfig` early return — an entitled viewer would
   // otherwise take the raw row on the very next line.
-  const masked = maskProjectEnv(project);
+  //
+  // PEN-3210: `managedByPlugin` is masked on the same terms and for the same reason, one axis over.
+  // It is a HYDRATED field rather than a column, so it is absent from the bare deleted row that
+  // `DELETE /projects/:id` answers with and present on every exit that goes through this function.
+  // The guard below is therefore a runtime key check, not a type check — `maskProjectEnv`'s docblock
+  // records why the declared shape is not the authority here.
+  const masked = maskProjectManagedByPluginDefaults(maskProjectEnv(project));
   if (viewer.revealRuntimeConfig) return masked;
   return {
     ...masked,
@@ -586,6 +702,7 @@ export function publicProjects<T extends {
   primaryWorkspace: ProjectWorkspace | null;
   env?: AgentEnvConfig | null;
   executionWorkspacePolicy?: ProjectExecutionWorkspacePolicy | null;
+  managedByPlugin?: ProjectManagedByPlugin | null;
 }>(projects: T[], viewer: WorkspaceRuntimeViewer): T[] {
   return projects.map((project) => publicProject(project, viewer));
 }
