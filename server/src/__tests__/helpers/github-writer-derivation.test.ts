@@ -49,9 +49,16 @@ const INLINE_DOUBLE_QUOTED = `
 
 /**
  * Shapes the old predicate missed. Every one is a working GitHub write.
- * Prettier pins double quotes repo-wide, which is why several of these were
- * argued unreachable — but Prettier is a formatter, not a security control, and
- * it does not normalise a variable or a shorthand into a literal at all.
+ *
+ * Several were argued unreachable on the grounds that "Prettier pins double
+ * quotes repo-wide". That premise is simply false: this repo has no Prettier,
+ * and no other formatter or linter either — the measurement is recorded on
+ * `TEST_HELPER_SPECIFIER` in `./github-writer-derivation.ts`. Every import
+ * being double-quoted today is convention, enforced by nothing.
+ *
+ * The premise would not license the conclusion even where it held. A formatter
+ * is not a security control, and it does not normalise a variable or a
+ * shorthand into a literal at all.
  */
 const MISSED_BY_OLD: ReadonlyArray<readonly [string, string]> = [
   [
@@ -228,7 +235,13 @@ describe("server GitHub writer derivation (PEN-3391)", () => {
 
     const MISSED_SPELLINGS: ReadonlyArray<readonly [string, string]> = [
       ["single-quoted static import", `import { seed } from '../__tests__/helpers/db.js';`],
-      ["backtick specifier", "export { seed } from `../__tests__/helpers/db.js`;"],
+      ["single-quoted static re-export", `export { seed } from '../__tests__/helpers/db.js';`],
+      // Backticks reach a specifier only through `import(...)`. A static
+      // `from \`...\`` is a SyntaxError ("Unexpected template string"), so
+      // pinning that shape would assert the predicate against a module that
+      // cannot exist — a fixture describing an unreachable spelling, which is
+      // the exact failure this suite exists to catch one level up.
+      ["backtick dynamic import", "const { seed } = await import(`../__tests__/helpers/db.js`);"],
       ["dynamic import", `const { seed } = await import("../__tests__/helpers/db.js");`],
       ["single-quoted dynamic import", `await import('../__tests__/helpers/db.js');`],
       ["side-effect import", `import "../__tests__/helpers/register.js";`],
