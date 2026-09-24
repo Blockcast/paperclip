@@ -942,6 +942,12 @@ describe("BLO-20650 concurrent webhook + sweep on one alert-state record", () =>
     // branch, which is what makes it a distinct case from the test above.
     expect(store.read().escalationComplete).toBe(true);
     expect(store.read().resolvedAt).toBe("2026-07-11T02:00:00Z");
+    // The two lines above hold on the refused-swap branch too, since the
+    // webhook's own write sets both. Only the claimed path posts the
+    // chain-exhausted comment, so this pins the test to the branch it names.
+    expect(mocks.issues.createComment).toHaveBeenCalledWith(
+      "issue-1", expect.stringContaining("Agent chain exhausted"), "company-1",
+    );
     // No cover may be left open with an unresolved member for a cleared alert.
     // Both assertions fail with the cascade moved back ahead of the state
     // write: membership stays open, which blocks the closing claim, so
