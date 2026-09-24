@@ -67,6 +67,7 @@ function probeSettings(rendered, probeName) {
     return Number(found[1]);
   };
   return {
+    path: block.match(/\bpath:\s*(\S+)/)?.[1],
     periodSeconds: read("periodSeconds"),
     timeoutSeconds: read("timeoutSeconds"),
     failureThreshold: read("failureThreshold"),
@@ -132,5 +133,56 @@ test("worker readiness probe cannot be re-tightened into the BLO-31945 outage", 
     readiness.timeoutSeconds <= readiness.periodSeconds,
     `readiness timeoutSeconds (${readiness.timeoutSeconds}s) must not exceed periodSeconds ` +
       `(${readiness.periodSeconds}s), or one probe can outlast its own period. See BLO-31945.`,
+  );
+});
+
+// BLO-35948. The 2026-09-24 wedge: the worker's connection pool was dead for
+// 2h15m, every API-to-worker call returned "Connect Timeout Error
+// (paperclip-workers:3100)" / 502 / 504, and the pod read 1/1 Ready the whole
+// time because all three probes target `/healthz`, which is DB-free on
+// purpose. Readiness now targets `/api/health` (a `SELECT 1` through the pool,
+// 503 on failure) so a dead pool produces a Kubernetes signal and fires the
+// existing PaperclipWorkerTierNoReadyEndpoints alert.
+//
+// Both halves of the split are asserted, because each fails a different way:
+// readiness on `/healthz` restores the silent wedge, and liveness or startup
+// on `/api/health` starts KILLING the singleton worker for pool saturation —
+// measured 2026-09-10 `/api/health` took 13.19s while `/healthz` answered in
+// 6ms in the same second.
+test("worker probes keep the BLO-35948 split: readiness checks the DB, liveness and startup do not", () => {
+  const rendered = renderTemplate("templates/statefulset.yaml");
+
+  const readiness = probeSettings(rendered, "readinessProbe");
+
+  assert.equal(
+    readiness.path,
+    "/api/health",
+    "worker readiness must exercise the database path, or a dead connection pool " +
+      "leaves the pod Ready with no Kubernetes signal at all. See BLO-35948.",
+  );
+
+  for (const name of ["livenessProbe", "startupProbe"]) {
+    assert.equal(
+      probeSettings(rendered, name).path,
+      "/healthz",
+      `worker ${name} must stay on the DB-free /healthz: a query here imports pool ` +
+        `latency into a kill decision and restarts the singleton worker (and every ` +
+        `in-flight agent run on it) for a saturation problem. See BLO-35948.`,
+    );
+  }
+
+  // `/api/health` has its own, much longer tail than `/healthz` — 13.19s
+  // measured under pool saturation on 2026-09-10 — so BLO-31945's "never set
+  // the timeout below the endpoint's own tail" rule yields a different floor
+  // for this endpoint than the 10s that was right for `/healthz`. Below this,
+  // a merely saturated pool drops the only Service endpoint instead of a
+  // genuinely dead one.
+  const API_HEALTH_SATURATION_TAIL_SECONDS = 15;
+  assert.ok(
+    readiness.timeoutSeconds >= API_HEALTH_SATURATION_TAIL_SECONDS,
+    `readiness timeoutSeconds (${readiness.timeoutSeconds}s) must be at least ` +
+      `${API_HEALTH_SATURATION_TAIL_SECONDS}s while it targets /api/health, measured at 13.19s ` +
+      `under pool saturation on 2026-09-10. A shorter timeout fails on a slow pool rather than ` +
+      `a dead one and 502s all plugin traffic. See BLO-35948.`,
   );
 });

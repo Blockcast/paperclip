@@ -168,7 +168,19 @@ describe("/healthz probe route", () => {
     // Guards the code<->chart disagreement that caused BLO-32164: if a probe
     // path is ever changed in the chart, this fails instead of silently
     // routing probes back into the SPA catch-all.
+    //
+    // BLO-35948 widened this from "every probe is /healthz" to "every probe is
+    // one of the two routes the server actually declares". Worker readiness
+    // now targets `/api/health` so a dead connection pool takes the pod
+    // NotReady; liveness and startup stay on `/healthz`. Which probe gets
+    // which path is asserted against the *rendered* chart in
+    // `deploy/helm/paperclip/tests/probes.test.mjs`, where the probe blocks
+    // are parsed individually — this test only pins that no probe points at a
+    // path nothing serves.
     expect(probePaths.length).toBeGreaterThanOrEqual(6);
-    expect([...new Set(probePaths)]).toEqual(["/healthz"]);
+    expect([...new Set(probePaths)].sort()).toEqual([
+      "/api/health",
+      "/healthz",
+    ]);
   });
 });
