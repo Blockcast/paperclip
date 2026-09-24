@@ -659,11 +659,11 @@ the alert, runs the cover cascade itself
 only cancels a cover whose every member has resolved, so a storm-batched
 sibling that is still firing keeps the cover open. The "chain exhausted"
 comment sits behind the swap, so a **refused** swap posts no announcement for
-an alert that has already cleared. A swap that **succeeds** still can: the
-resolve is mid-delivery and has not stored `resolvedAt` yet, so the rung reads
-the alert as firing and posts "while alert remains firing" on the source issue.
-The cover is still closed by the resolve's post-commit cascade below, so the
-announcement is the only residue.
+an alert that has already cleared. A swap that **succeeds** in that same window
+still can: the resolve is mid-delivery and has not stored `resolvedAt` yet, so
+the rung reads the alert as firing and posts "while alert remains firing" on
+the source issue. The cover is still closed by the resolve's post-commit
+cascade below, so the announcement is the only residue.
 
 That compensation only fires when the swap is **refused**, which left one more
 interleaving open (BLO-33497). The webhook's cover cascade ran *before* it
