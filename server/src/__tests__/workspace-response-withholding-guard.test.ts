@@ -1380,3 +1380,78 @@ describe("project env withholding guard (PEN-3033 door #17, PEN-2370 (b2))", () 
     }
   });
 });
+
+/**
+ * PEN-3210 door #19 — the plugin-defaults axis.
+ *
+ * `managedByPlugin.defaultsJson` is the third axis crossing `publicProject`, alongside workspace
+ * runtime config (PEN-2852) and `env` (PEN-3033). It differs from both in the property that is
+ * easiest to get wrong and hardest to see: **it is masked unconditionally**, so it has to be applied
+ * BEFORE `publicProject`'s `if (viewer.revealRuntimeConfig) return masked;` early return, not in the
+ * object literal below it.
+ *
+ * `workspace_runtime:read` is scoped to workspace runtime config; `defaultsJson` is plugin-manifest
+ * material with a different audience. Gating it on that flag would hand plugin defaults to every
+ * holder of an unrelated entitlement — widening the grant while appearing to narrow it.
+ *
+ * A `contains` pin cannot see that, which is why the ordering is asserted by index rather than by
+ * presence: moving the call three lines down is a silent re-opening for exactly the class of caller
+ * most likely to be a human operator, and it leaves every `contains`-style assertion green.
+ */
+describe("plugin defaults withholding guard (PEN-3210 door #19, PEN-2370 ask 1)", () => {
+  const WRAPPER = "publicProject";
+  const MASK_CALL = "maskProjectManagedByPluginDefaults(";
+  const ENTITLED_EARLY_RETURN = "viewer.revealRuntimeConfig";
+
+  function publicProjectBody(): string {
+    const source = readFileSync(path.join(ROUTES_DIR, "workspace-response.ts"), "utf8");
+    const body = extractFunctionBody(source, WRAPPER);
+    expect(body, `workspace-response.ts has no function ${WRAPPER}`).not.toBeNull();
+    return body as string;
+  }
+
+  it("publicProject masks managedByPlugin defaults", () => {
+    expect(
+      publicProjectBody(),
+      `${WRAPPER} no longer masks managedByPlugin.defaultsJson — five exits disclose it raw ` +
+        "(the four project routes plus mentionedProjects[] on GET /issues/:id)",
+    ).toContain(MASK_CALL);
+  });
+
+  it("publicProject masks managedByPlugin defaults ABOVE the entitled early return", () => {
+    const body = publicProjectBody();
+    const maskAt = body.indexOf(MASK_CALL);
+    const earlyReturnAt = body.indexOf(ENTITLED_EARLY_RETURN);
+
+    expect(
+      earlyReturnAt,
+      `${WRAPPER} no longer has the ${ENTITLED_EARLY_RETURN} early return`,
+    ).toBeGreaterThan(-1);
+    expect(
+      maskAt,
+      `${WRAPPER} masks managedByPlugin.defaultsJson BELOW its ${ENTITLED_EARLY_RETURN} early ` +
+        "return, so an entitled viewer takes the raw binding. This mask is unconditional by " +
+        "design: the entitlement is scoped to workspace runtime config, and defaultsJson is " +
+        "plugin-manifest material with a different audience",
+    ).toBeLessThan(earlyReturnAt);
+  });
+
+  it("the shared walk is reached, not copied, by the issue projection", () => {
+    // PEN-3114 wrote this walk as a local `compactIssueManagedByPlugin` in `issues.ts`; PEN-3210
+    // moved it here once five more exits were found. A re-copy at either site is the documented
+    // transmission mechanism for the array-shaped (#1574) and JSON-string (#1583) bypasses — one
+    // walk gets the fix, the copy keeps the hole.
+    const issues = readFileSync(path.join(ROUTES_DIR, "issues.ts"), "utf8");
+    const body = extractFunctionBody(issues, "compactIssueProject");
+    expect(body, "issues.ts has no function compactIssueProject").not.toBeNull();
+    expect(
+      body,
+      "compactIssueProject no longer delegates managedByPlugin to publicProjectManagedByPlugin",
+    ).toContain("publicProjectManagedByPlugin(");
+    expect(
+      extractFunctionBody(issues, "compactIssueManagedByPlugin"),
+      "issues.ts has re-grown a local copy of the plugin-defaults walk; call " +
+        "publicProjectManagedByPlugin from workspace-response.ts instead",
+    ).toBeNull();
+  });
+});
