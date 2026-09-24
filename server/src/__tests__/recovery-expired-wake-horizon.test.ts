@@ -5,6 +5,7 @@ import {
   agents,
   companies,
   createDb,
+  heartbeatRuns,
   issueComments,
   issueRecoveryActions,
   issues,
@@ -47,6 +48,8 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
     await db.delete(issueRecoveryActions);
     await db.delete(issueComments);
     await db.delete(issues);
+    // Before `agents`/`companies`: heartbeat_runs has FKs onto both.
+    await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -94,7 +97,7 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
       identifier: `${prefix}-20995`,
     });
 
-    return { companyId, ownerAgentId, sourceIssueId };
+    return { companyId, ownerAgentId, sourceIssueId, prefix };
   }
 
   async function insertAction(
@@ -395,5 +398,261 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
     expect(surfaced[0]!.subject.id).toBe(actionId);
     expect(surfaced[0]!.severity).toBe("high");
     expect(surfaced[0]!.whyNow).toContain("no longer wakes anyone");
+  });
+
+  /**
+   * BLO-19124: the `attemptCount === 0` notice asserted that the stranding "was never worked"
+   * and that the fault was scheduler-side. `attemptCount` counts wakes THIS ACTION delivered,
+   * so 0 proves only that this action never woke anyone — it says nothing about whether the
+   * issue was serviced by some other path.
+   *
+   * The worked example is BLO-19124 itself: action opened 16:35Z at `attemptCount: 0`, owner
+   * runs commented at 19:44Z and 22:01Z, horizon 22:35Z, escalated 22:55Z with that sentence
+   * attached to an issue that had demonstrably been worked twice inside the window.
+   *
+   * The retirement itself is NOT conditional — see the note on
+   * `reconcileExpiredRecoveryWakeHorizons` for why discharging instead would free
+   * `issue_recovery_actions_active_source_uq` and reinstate the BLO-18996 re-fire loop. Only
+   * the claim changes. Every case below therefore asserts `escalated`; what varies is the text.
+   */
+  const actionCreatedAt = new Date("2026-08-08T11:00:00.000Z");
+  /** The sentence that was false on a worked issue. */
+  const SCHEDULER_FAULT_CLAIM = "was never worked, and that is a scheduler-side fault";
+  /** The sentence that replaces it when the issue was in fact serviced. */
+  const WORKED_ANYWAY_CLAIM = "The issue itself WAS worked inside this window even so";
+
+  async function insertIssueRun(
+    seeded: Awaited<ReturnType<typeof seed>>,
+    overrides: { status: string; createdAt: Date; finishedAt?: Date; issueId?: string },
+  ) {
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      agentId: seeded.ownerAgentId,
+      status: overrides.status,
+      // Long finished by the time the sweep reads the row — the shape
+      // `hasActiveExecutionPath` cannot see, which is why it is the wrong instrument here.
+      startedAt: overrides.createdAt,
+      finishedAt: overrides.finishedAt ?? new Date(overrides.createdAt.getTime() + 60_000),
+      createdAt: overrides.createdAt,
+      contextSnapshot: { issueId: overrides.issueId ?? seeded.sourceIssueId },
+    });
+  }
+
+  async function escalateAndReadNotice(seeded: Awaited<ReturnType<typeof seed>>) {
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn().mockResolvedValue(null) });
+    const result = await recovery.reconcileExpiredRecoveryWakeHorizons({ now });
+    const [comment] = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, seeded.sourceIssueId));
+    return { result, body: comment?.body ?? "" };
+  }
+
+  it("does not claim a scheduler-side fault when a successful run landed inside the horizon", async () => {
+    const seeded = await seed();
+    const actionId = await insertAction(seeded, { createdAt: actionCreatedAt });
+    // Finished 18h before the sweep, 1h after the action opened.
+    await insertIssueRun(seeded, { status: "succeeded", createdAt: new Date("2026-08-08T12:00:00.000Z") });
+
+    const { result, body } = await escalateAndReadNotice(seeded);
+
+    expect(result).toMatchObject({
+      escalated: 1,
+      neverDelivered: 1,
+      neverDeliveredButWorked: 1,
+      announced: 1,
+    });
+    expect(body).toContain(WORKED_ANYWAY_CLAIM);
+    expect(body).not.toContain(SCHEDULER_FAULT_CLAIM);
+    // The row is still retired, and still HOLDS the uniqueness slot. See the reuse test below.
+    expect((await readAction(actionId)).status).toBe("escalated");
+  });
+
+  it("counts a run that straddles the action's opening as worked", async () => {
+    // The predicate is `createdAt >= since OR finishedAt >= since` — an OVERLAP test, not a
+    // containment one. This is the arm that distinguishes the two, and the `predates` control
+    // below is only a true negative because its run finished before the anchor as well.
+    const seeded = await seed();
+    await insertAction(seeded, { createdAt: actionCreatedAt });
+    await insertIssueRun(seeded, {
+      status: "succeeded",
+      createdAt: new Date("2026-08-08T09:00:00.000Z"),
+      finishedAt: new Date("2026-08-08T13:00:00.000Z"),
+    });
+
+    const { result, body } = await escalateAndReadNotice(seeded);
+
+    expect(result).toMatchObject({ escalated: 1, neverDeliveredButWorked: 1 });
+    expect(body).toContain(WORKED_ANYWAY_CLAIM);
+  });
+
+  it("still claims a scheduler-side fault when the only run on the issue failed", async () => {
+    // Negative control. A crashed run did not service the issue, so the original claim is true
+    // and must survive. Without this, a guard that softened on ANY run would pass the tests
+    // above and silence the mechanism entirely.
+    const seeded = await seed();
+    await insertAction(seeded, { createdAt: actionCreatedAt });
+    await insertIssueRun(seeded, { status: "failed", createdAt: new Date("2026-08-08T12:00:00.000Z") });
+
+    const { result, body } = await escalateAndReadNotice(seeded);
+
+    expect(result).toMatchObject({ escalated: 1, neverDelivered: 1, neverDeliveredButWorked: 0 });
+    expect(body).toContain(SCHEDULER_FAULT_CLAIM);
+    expect(body).not.toContain(WORKED_ANYWAY_CLAIM);
+  });
+
+  it("still claims a scheduler-side fault when the successful run ended before the action opened", async () => {
+    // The anchor is load-bearing in the other direction: a run that both started AND finished
+    // before this action existed is what the stranding happened after, not evidence against it.
+    const seeded = await seed();
+    await insertAction(seeded, { createdAt: actionCreatedAt });
+    await insertIssueRun(seeded, {
+      status: "succeeded",
+      createdAt: new Date("2026-08-08T09:00:00.000Z"),
+      finishedAt: new Date("2026-08-08T09:30:00.000Z"),
+    });
+
+    const { result, body } = await escalateAndReadNotice(seeded);
+
+    expect(result).toMatchObject({ escalated: 1, neverDeliveredButWorked: 0 });
+    expect(body).toContain(SCHEDULER_FAULT_CLAIM);
+  });
+
+  it("still claims a scheduler-side fault when the successful run belongs to a different issue", async () => {
+    // `contextSnapshot ->> 'issueId'` is the only thing tying a run to an issue; a guard that
+    // dropped that predicate would soften every notice in a busy company.
+    const seeded = await seed();
+    await insertAction(seeded, { createdAt: actionCreatedAt });
+    await insertIssueRun(seeded, {
+      status: "succeeded",
+      createdAt: new Date("2026-08-08T12:00:00.000Z"),
+      issueId: randomUUID(),
+    });
+
+    const { result, body } = await escalateAndReadNotice(seeded);
+
+    expect(result).toMatchObject({ escalated: 1, neverDeliveredButWorked: 0 });
+    expect(body).toContain(SCHEDULER_FAULT_CLAIM);
+  });
+
+  it("leaves the escalated row holding the uniqueness slot, so a re-strand cannot mint a fresh budget", async () => {
+    // Ally's review of #1950 caught the real hazard in the withdrawn discharge approach: a
+    // TERMINAL status (`resolved`) is outside `ACTIVE_RECOVERY_ACTION_STATUSES`, which frees
+    // `issue_recovery_actions_active_source_uq`, and `upsertSourceScoped` then INSERTs a fresh
+    // row at `attemptCount: 0` with a fresh horizon instead of reusing this one — the unbounded
+    // re-fire loop BLO-18996 closed. `escalated` is inside that set, so it cannot happen. This
+    // test is what pins that, and it fails if anyone retires this row terminally again.
+    const seeded = await seed();
+    const actionId = await insertAction(seeded, { createdAt: actionCreatedAt });
+    await insertIssueRun(seeded, { status: "succeeded", createdAt: new Date("2026-08-08T12:00:00.000Z") });
+    await escalateAndReadNotice(seeded);
+
+    const reused = await issueRecoveryActionService(db).upsertSourceScoped({
+      companyId: seeded.companyId,
+      sourceIssueId: seeded.sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: seeded.ownerAgentId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `stranded:${seeded.sourceIssueId}`,
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner" },
+      maxAttempts: 5,
+      timeoutAt: new Date("2026-08-10T00:00:00.000Z"),
+    });
+
+    // Same row, not a new one — and the creation-anchored horizon is untouched, so the
+    // re-strand inherits the spent window rather than a fresh one.
+    expect(reused!.id).toBe(actionId);
+    expect(reused!.status).toBe("escalated");
+    expect(new Date(reused!.timeoutAt!).toISOString()).toBe(pastHorizon.toISOString());
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(1);
+    // Ally suggestion 3 on 36bd9d6b: assert the budget directly rather than inferring it from
+    // the preserved horizon. The reuse path sets `attemptCount: existing.attemptCount + 1`
+    // (`issue-recovery-actions.ts:575`), so 1 here is positive proof of reuse — a fresh INSERT
+    // would read 0. This complements the slot test at `:351` (which checks the status set) and
+    // is not a duplicate of it: that one pins WHICH statuses hold the slot, this one pins the
+    // consequence for the budget.
+    expect(reused!.attemptCount).toBe(1);
+  });
+
+  /**
+   * Ally's review of #1950 at `36bd9d6b`: both database reads in the per-row body sat OUTSIDE
+   * the try, on a path where the announcement is a once-only opportunity.
+   * `escalateExpiredWakeHorizons` flips the whole batch to `escalated` in a single UPDATE and
+   * only ever selects `status = "active"` rows, so a row whose notice is skipped is never
+   * re-selected by a later sweep. One connection blip or statement timeout therefore aborted
+   * the sweep and permanently dropped the notice for every remaining row in the batch (default
+   * limit 200) — each already silently moved out of `active`. That is the BLO-24662 silent
+   * strand this pass exists to end, arriving through the pass itself.
+   */
+  function dbWithFailingIssueRunLookup(real: typeof db, failures: { remaining: number }) {
+    const bind = (target: object, prop: string | symbol) => {
+      const value = Reflect.get(target, prop);
+      return typeof value === "function" ? value.bind(target) : value;
+    };
+    return new Proxy(real, {
+      get(target, prop) {
+        if (prop !== "select") return bind(target, prop);
+        return (...args: unknown[]) => {
+          const builder = (target.select as (...a: unknown[]) => object)(...args);
+          return new Proxy(builder, {
+            get(b, p) {
+              if (p !== "from") return bind(b, p);
+              return (table: unknown) => {
+                // Only the run lookup — the batch UPDATE and the dedup select read other tables.
+                if (table === heartbeatRuns && failures.remaining > 0) {
+                  failures.remaining -= 1;
+                  throw new Error("simulated connection blip on the issue-run lookup");
+                }
+                return (bind(b, "from") as (t: unknown) => unknown)(table);
+              };
+            },
+          });
+        };
+      },
+    }) as typeof db;
+  }
+
+  it("announces the rest of the batch when one row's issue-run lookup throws", async () => {
+    const seeded = await seed();
+    const secondIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: secondIssueId,
+      companyId: seeded.companyId,
+      title: "second stranded issue in the same sweep batch",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId: seeded.ownerAgentId,
+      issueNumber: 20996,
+      identifier: `${seeded.prefix}-20996`,
+    });
+    await insertAction(seeded);
+    await insertAction(seeded, {
+      sourceIssueId: secondIssueId,
+      fingerprint: `stranded:${secondIssueId}`,
+    });
+
+    const failures = { remaining: 1 };
+    const recovery = recoveryService(dbWithFailingIssueRunLookup(db, failures), {
+      enqueueWakeup: vi.fn().mockResolvedValue(null),
+    });
+
+    // Before the guard this call REJECTED — the throw escaped the sweep entirely.
+    const result = await recovery.reconcileExpiredRecoveryWakeHorizons({ now });
+
+    // The blip really fired; without this the test would pass on a no-op injection.
+    expect(failures.remaining).toBe(0);
+    // Both rows were retired by the batch UPDATE — that half is committed either way — and
+    // the surviving row still got its notice.
+    expect(result).toMatchObject({ escalated: 2, announced: 1 });
+    const statuses = await db
+      .select({ status: issueRecoveryActions.status })
+      .from(issueRecoveryActions)
+      .then((rows) => rows.map((row) => row.status));
+    expect(statuses).toEqual(["escalated", "escalated"]);
+    const comments = await db.select({ id: issueComments.id }).from(issueComments);
+    expect(comments).toHaveLength(1);
   });
 });
