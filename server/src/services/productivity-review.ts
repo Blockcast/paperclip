@@ -1900,7 +1900,8 @@ function isTerminalGateClosableTriggerSet(triggers: unknown) {
 //
 // The overlap is the norm rather than a corner, on the file's own arithmetic:
 // `runtimeFailure` fires at `runtimeFailureStreak >= noCommentStreakRuns` and
-// `highChurn` at `runCountLastHour >= highChurnHourly`, both defaulting to 10,
+// `highChurn` at `runCountLastHour >= highChurnHourly` (one of its two
+// disjuncts; the six-hour arm only widens the overlap), both defaulting to 10,
 // and `countIssueRunsSince` is an unfiltered count — infra-failure runs count
 // toward churn in full. Ten fast infra-failing runs inside an hour trip both.
 // Retiring that row would destroy the `high_churn` cost record permanently:
@@ -3526,9 +3527,12 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       // re-fires for this source ever again (Ally review on eb48670e — the
       // unscoped version of this sentence is true only in the `execution_ended`
       // arm below, which is deliberately not gated on terminal status).
-      // Unlike `long_active_duration` this trigger
-      // carries no soft-stop, so retiring it on a self-settable status grants
-      // the reviewed agent nothing it did not already have.
+      // No member of this arm carries a soft-stop — `isSoftStopTrigger` is
+      // exactly the accountability pair this arm excludes — so retiring it on a
+      // self-settable status grants the reviewed agent nothing it did not
+      // already have. That membership, not any contrast between the three
+      // members, is the discriminator to check before widening this arm
+      // (Ally review on 52dcdb96).
       // This does not extend to `cancelled`; an assignee can abandon and later
       // restore their own source issue, so cancellation must not retire its
       // oversight artifact. It also does not extend to historical/accountability
