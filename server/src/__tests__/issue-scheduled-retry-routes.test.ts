@@ -22,6 +22,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { heartbeatService } from "../services/heartbeat.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -264,7 +265,10 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
     // result_json then describes a park the row no longer holds, and the overdue
     // gauge (queued-run-age-metrics.ts) takes greatest(scheduled_retry_at,
     // penstockAdvertisedResumeAt), so a stale advertised resume 3.5 days out would
-    // keep the forced row invisible to the detector. The chain origin stays.
+    // keep the forced row invisible to the detector. The chain origin stays, and
+    // so do the retryNotBefore/transientRetryNotBefore floors, on purpose: the
+    // promotion-time capacity re-probe reads them (see the gate test below).
+    // errorFamily is what applyCcrotateCapacityDecision always writes.
     // Relative to the real clock: the fixture's fixed May-2026 dates are in the
     // past by the time this runs, and the whole point is a horizon still ahead.
     const advertisedResumeAt = new Date(Date.now() + 3.5 * 24 * 60 * 60 * 1000).toISOString();
@@ -273,6 +277,7 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       retryResultJson: {
         retryNotBefore: advertisedResumeAt,
         transientRetryNotBefore: advertisedResumeAt,
+        errorFamily: "rate_limit_exhausted",
         penstockProvider: "anthropic",
         penstockModel: "claude-opus-4-1",
         penstockReason: "ccrotate_capacity",
@@ -297,12 +302,57 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, retryRunId));
     expect(run.resultJson).toEqual({
+      retryNotBefore: advertisedResumeAt,
+      transientRetryNotBefore: advertisedResumeAt,
+      errorFamily: "rate_limit_exhausted",
       penstockCapacityFirstDeferredAt: firstDeferredAt,
       unrelatedKey: "kept",
     });
     expect(run.scheduledRetryAt).not.toBeNull();
     expect(run.scheduledRetryAt!.getTime()).toBeGreaterThanOrEqual(before - 1000);
     expect(run.scheduledRetryAt!.getTime()).toBeLessThan(new Date(advertisedResumeAt).getTime());
+  });
+
+  it("still runs the promotion-time capacity gate on a transient_failure capacity park", async () => {
+    // BLO-28919: a capacity denial whose reset arrived as prose parks under
+    // transient_failure, and promoteScheduledRetryRun re-probes it only through
+    // capacityDrivenTransientPark (errorFamily + a retryNotBefore floor). The
+    // retry-now clear must keep that floor, or the row dispatches blind into a
+    // still-empty pool. The route app cannot inject a gate, so call the service.
+    const floor = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    const { issueId, retryRunId } = await seedIssueWithRetry({
+      retryResultJson: {
+        errorFamily: "rate_limit_exhausted",
+        retryNotBefore: floor,
+        transientRetryNotBefore: floor,
+      },
+    });
+    const heartbeat = heartbeatService(db, {
+      penstockAvailabilityGate: {
+        async checkAdapter() {
+          return {
+            allow: false,
+            provider: "anthropic",
+            reason: "penstock.model_capacity_unavailable",
+            model: "claude-test",
+            resumeAt: new Date(Date.now() + 60_000),
+            retryAfterSeconds: null,
+          };
+        },
+        _resetForTesting() {},
+      },
+      skipQueuedRunDispatch: true,
+    });
+
+    const result = await heartbeat.retryScheduledRetryNow({ issueId });
+
+    expect(result.outcome).not.toBe("promoted");
+    const [run] = await db
+      .select({ status: heartbeatRuns.status, scheduledRetryReason: heartbeatRuns.scheduledRetryReason })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, retryRunId));
+    // The relabel happens only when the capacity gate ran and denied.
+    expect(run).toEqual({ status: "scheduled_retry", scheduledRetryReason: "ccrotate_capacity" });
   });
 
   it("leaves result_json untouched when retry-now promotes a row that never had one", async () => {

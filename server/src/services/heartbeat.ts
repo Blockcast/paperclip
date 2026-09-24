@@ -465,6 +465,7 @@ import {
   resolveRoutineScopedRetry,
   CAPACITY_ESCALATION_AFTER_MS,
   CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY,
+  CCROTATE_CAPACITY_RESULT_KEYS,
   TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS,
 } from "./ccrotate-capacity-retry.js";
 import {
@@ -20950,11 +20951,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // `greatest(scheduled_retry_at, penstockAdvertisedResumeAt)` and would
     // otherwise go silent on exactly the row a human is watching (BLO-34782).
     // The chain origin is deliberately kept: it bounds the whole deferral chain
-    // on wall clock and a retry-now is not the start of a new chain.
+    // on wall clock and a retry-now is not the start of a new chain. The
+    // retryNotBefore/transientRetryNotBefore floors are kept too, on purpose:
+    // promoteScheduledRetryRun's capacityDrivenTransientPark conjunct reads them,
+    // so clearing them would promote a transient_failure capacity park with no
+    // promotion-time capacity re-probe (BLO-28919).
     const resultJson =
       scheduled.run.resultJson == null
         ? undefined
-        : clearCcrotateCapacityDecision(parseObject(scheduled.run.resultJson));
+        : clearCcrotateCapacityDecision(
+            parseObject(scheduled.run.resultJson),
+            CCROTATE_CAPACITY_RESULT_KEYS.clearedOnOverride,
+          );
 
     const updated = await db.transaction(async (tx) => {
       const row = await tx
