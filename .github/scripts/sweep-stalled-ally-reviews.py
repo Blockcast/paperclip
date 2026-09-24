@@ -44,11 +44,13 @@ Run tests:
 """
 
 import argparse
+import http.client
 import json
 import os
 import re
 import sys
 import time
+import traceback
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -1200,13 +1202,27 @@ def main(argv=None):
         sys.exit(EXIT_SWEEP_DEGRADED)
 
 
-if __name__ == "__main__":
+def _dispatch():
+    """Run `main()` under the abort-vs-alarm exit-code policy.
+
+    A function rather than a bare `if __name__ == "__main__"` body so the arms
+    below are reachable from the test suite. They were not, and that is why
+    the `http.client` hole sat open: every arm here is a guard whose whole
+    purpose is to fire on a path nothing else exercises, and an unreachable
+    guard is a comment. Tests assert each arm's exit code by calling this.
+    """
     # Every arm here exits EXIT_SWEEP_DEGRADED, never EXIT_ALARM: reaching
     # this handler means the sweep aborted outright (typically on the initial
     # open-PR list, before any PR was evaluated), so nothing is known about
     # whether a PR is stranded. Reporting that as the stranded-PR alarm would
     # send a human looking for a PR to review when the actual fault is that
     # the reconciler could not talk to GitHub.
+    #
+    # review-gate-sweep.yml fails the job on ANY non-zero exit, so choosing
+    # EXIT_SWEEP_DEGRADED over EXIT_ALARM does not turn a red run green. What
+    # it buys is that the red is correctly DIAGNOSED -- "could not talk to
+    # GitHub" rather than "go review a stranded PR". Judge these arms on the
+    # log line, not on the workflow conclusion.
     try:
         main()
     except RateLimitExhausted as error:
@@ -1221,6 +1237,32 @@ if __name__ == "__main__":
         # shadow the status-code message above.
         print("GitHub API request failed (transport): %s" % error.reason, file=sys.stderr)
         sys.exit(EXIT_SWEEP_DEGRADED)
+    except http.client.HTTPException as error:
+        # A truncated or malformed response body raises from `http.client`,
+        # whose exception tree hangs off Exception and NOT off OSError:
+        #
+        #     IncompleteRead -> HTTPException -> Exception
+        #     URLError       -> OSError
+        #
+        # So none of the arms above and none below catch it, and uncaught it
+        # exits 1 == EXIT_ALARM -- a truncated GitHub page reporting itself as
+        # "a PR is stranded, go review it". Measured live on run 35605218498
+        # (2026-09-21T13:22Z): `IncompleteRead(703602 bytes read, 68373 more
+        # expected)` while paginating the open-PR list, which a human then had
+        # to read a traceback to tell apart from a real alarm. Exactly the
+        # hazard the OSError arm below already documents, arriving through the
+        # one door that arm cannot cover (BLO-35151).
+        #
+        # Catch the HTTPException BASE, not IncompleteRead: BadStatusLine and
+        # LineTooLong are siblings with identical consequences, and naming
+        # only the subclass we happened to observe would leave the same hole.
+        #
+        # No retry here on purpose. The sweep runs hourly and is idempotent,
+        # so the schedule already supplies the retry; the 13:22Z truncation
+        # self-healed at 14:24Z on the same commit. Retrying in-process would
+        # add a failure mode to buy back an hour that costs nothing.
+        print("GitHub API request failed (malformed or truncated HTTP response): %r" % error, file=sys.stderr)
+        sys.exit(EXIT_SWEEP_DEGRADED)
     except OSError as error:
         # A REQUEST_TIMEOUT_SECONDS expiry during the response *read* raises a
         # bare TimeoutError (== socket.timeout), which is an OSError but NOT a
@@ -1232,3 +1274,33 @@ if __name__ == "__main__":
         # itself an OSError, so the arms above still take precedence.
         print("GitHub API request failed (socket): %r" % error, file=sys.stderr)
         sys.exit(EXIT_SWEEP_DEGRADED)
+    except Exception:
+        # Terminal arm: any exception class not enumerated above (e.g. a
+        # json.JSONDecodeError == ValueError from _request()'s json.loads on a
+        # 200 carrying a non-JSON proxy/WAF page during the unisolated open-PR
+        # pagination) would otherwise escape and exit 1 == EXIT_ALARM. Anything
+        # reaching here by definition never finished reading the PR list, so it
+        # is degraded, not an alarm. `Exception`, NOT `BaseException`: main()'s
+        # deliberate sys.exit(EXIT_ALARM) raises SystemExit, which must pass
+        # through untouched (BLO-35151).
+        print("GitHub API sweep crashed before completing: %s" % traceback.format_exc(), file=sys.stderr)
+        sys.exit(EXIT_SWEEP_DEGRADED)
+
+
+def run_cli():
+    """Run `_dispatch()` under the abort-vs-alarm exit-code policy; see its docstring."""
+    try:
+        _dispatch()
+    except Exception:
+        # The arm BODIES in _dispatch() are siblings of its terminal arm, not
+        # inside its try: an exception raised while REPORTING a failure (live
+        # case: `error.read()` on an HTTPError re-raising IncompleteRead off
+        # the socket) would escape and exit 1 == EXIT_ALARM. `Exception`, not
+        # `BaseException`, so each arm's own sys.exit(SystemExit) passes
+        # through untouched (BLO-35151).
+        print("GitHub API sweep crashed while reporting a failure: %s" % traceback.format_exc(), file=sys.stderr)
+        sys.exit(EXIT_SWEEP_DEGRADED)
+
+
+if __name__ == "__main__":
+    run_cli()

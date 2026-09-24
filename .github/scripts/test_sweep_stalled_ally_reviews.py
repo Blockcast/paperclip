@@ -7,6 +7,7 @@ Run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
 """
 
 import contextlib
+import http.client
 import importlib.util
 import io
 import os
@@ -1113,6 +1114,118 @@ class TestCommentBodyIsModeAware(unittest.TestCase):
         body = sweep.build_comment_body(7, "b" * 40, 3 * HOUR, requested_login="allyblockcast", mode="status-free")
         self.assertNotIn(sweep.STATUS_CONTEXT, body)
         self.assertIn("awaiting review", body)
+
+
+class TestRunCliExitCodePolicy(unittest.TestCase):
+    """Every abort arm in run_cli() must exit DEGRADED, never ALARM.
+
+    EXIT_ALARM is the "a PR is stranded, go review it" signal. CPython exits
+    1 on an uncaught exception and EXIT_ALARM is 1, so ANY exception class
+    that escapes run_cli() silently becomes a false alarm -- it sends a human
+    to look for review work that does not exist. That is not hypothetical:
+    `http.client.IncompleteRead` escaped every arm and did exactly this on
+    run 35605218498 (BLO-35151).
+
+    These tests exist because the arms used to live in a bare
+    `if __name__ == "__main__"` block, where no test could reach them.
+    """
+
+    def _exit_code_for(self, error):
+        """Raise `error` out of main() and return run_cli()'s exit code."""
+        original_main = sweep.main
+        sweep.main = lambda: (_ for _ in ()).throw(error)
+        stderr = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as caught:
+                    sweep.run_cli()
+        finally:
+            sweep.main = original_main
+        return caught.exception.code, stderr.getvalue()
+
+    def test_alarm_and_degraded_are_distinct_nonzero_codes(self):
+        """The guard below is meaningless if these two ever collide."""
+        self.assertEqual(sweep.EXIT_ALARM, 1)
+        self.assertNotEqual(sweep.EXIT_SWEEP_DEGRADED, sweep.EXIT_ALARM)
+
+    def test_incomplete_read_is_degraded_not_alarm(self):
+        code, err = self._exit_code_for(http.client.IncompleteRead(b"partial", 68373))
+        self.assertEqual(code, sweep.EXIT_SWEEP_DEGRADED)
+        self.assertIn("truncated HTTP response", err)
+
+    def test_bad_status_line_is_degraded_not_alarm(self):
+        """The arm catches the HTTPException BASE, not just IncompleteRead.
+
+        Naming only the subclass we happened to observe would leave the same
+        hole open for its siblings.
+        """
+        code, err = self._exit_code_for(http.client.BadStatusLine("garbage"))
+        self.assertEqual(code, sweep.EXIT_SWEEP_DEGRADED)
+        self.assertIn("truncated HTTP response", err)
+
+    def test_incomplete_read_is_not_an_oserror(self):
+        """Pins WHY the pre-existing arms could not catch it.
+
+        If a future Python made HTTPException an OSError subclass this test
+        fails, flagging that the dedicated arm is now redundant rather than
+        letting it rot as unexplained duplication.
+        """
+        self.assertFalse(issubclass(http.client.HTTPException, OSError))
+        self.assertTrue(issubclass(urllib.error.URLError, OSError))
+
+    def test_timeout_error_is_degraded_not_alarm(self):
+        code, err = self._exit_code_for(TimeoutError("read timed out"))
+        self.assertEqual(code, sweep.EXIT_SWEEP_DEGRADED)
+        self.assertIn("socket", err)
+
+    def test_url_error_keeps_its_transport_message(self):
+        """Arm precedence is unchanged by the insertion above it."""
+        code, err = self._exit_code_for(urllib.error.URLError("dns failure"))
+        self.assertEqual(code, sweep.EXIT_SWEEP_DEGRADED)
+        self.assertIn("transport", err)
+
+    def test_rate_limit_keeps_its_own_message(self):
+        code, err = self._exit_code_for(sweep.RateLimitExhausted("budget spent"))
+        self.assertEqual(code, sweep.EXIT_SWEEP_DEGRADED)
+        self.assertIn("rate limit exhausted", err)
+
+    def test_unenumerated_exception_classes_are_degraded_not_alarm(self):
+        """Pins the class-level invariant the docstring states, not just the
+        enumerated arms: ANY escaping exception is degraded, never alarm."""
+        import json
+        for error in (
+            json.JSONDecodeError("Expecting value", "<html>", 0),
+            ValueError("unrelated"),
+            KeyError("missing"),
+            RuntimeError("unrelated"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                code, err = self._exit_code_for(error)
+                self.assertEqual(code, sweep.EXIT_SWEEP_DEGRADED)
+                self.assertIn("crashed before completing", err)
+
+    def test_deliberate_alarm_exit_passes_through_terminal_arm(self):
+        """SystemExit is a BaseException; the terminal `except Exception`
+        must not reclassify main()'s own sys.exit(EXIT_ALARM) to degraded."""
+        code, _ = self._exit_code_for(SystemExit(sweep.EXIT_ALARM))
+        self.assertEqual(code, sweep.EXIT_ALARM)
+
+
+    def test_exception_raised_while_reporting_a_failure_is_degraded_not_alarm(self):
+        """Arm bodies are siblings of the terminal arm, not inside its try.
+        Live case: HTTPError.read() re-raising IncompleteRead off the socket
+        while the HTTPError arm formats its message (BLO-35151)."""
+        class _TruncatedBody:
+            def read(self):
+                raise http.client.IncompleteRead(b"partial", 100)
+
+            def close(self):
+                pass
+
+        error = urllib.error.HTTPError("https://api.github.com/x", 500, "boom", {}, _TruncatedBody())
+        code, err = self._exit_code_for(error)
+        self.assertEqual(code, sweep.EXIT_SWEEP_DEGRADED)
+        self.assertIn("while reporting a failure", err)
 
 
 if __name__ == "__main__":
