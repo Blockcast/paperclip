@@ -1749,6 +1749,8 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
   // The fixture is that exact shape: an old fire whose current run is young.
   const STALE_FIRE_AGE_MS = 11 * 60 * 60 * 1000;
   const YOUNG_RETRY_AGE_MS = 2.3 * 60 * 60 * 1000;
+  const SUPERSEDE_WARN =
+    "cancelled routine execution issue whose fire outlived its cadence so the successor fire can dispatch";
 
   it("fires when the execution issue's FIRE outlived its cadence even though its retry run is young", async () => {
     const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
@@ -1876,11 +1878,22 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     });
 
     resetRoutineDispatchMetrics();
-    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+    const warnSpy = vi.spyOn(logger, "warn");
+    let run: Awaited<ReturnType<typeof svc.runRoutine>>;
+    let supersedeWarns: unknown[][];
+    try {
+      run = await svc.runRoutine(routine.id, { source: "schedule" });
+    } finally {
+      // Read before restoring: `mockRestore` also clears `mock.calls`.
+      supersedeWarns = warnSpy.mock.calls.filter((call) => (call as unknown[]).includes(SUPERSEDE_WARN));
+      warnSpy.mockRestore();
+    }
 
     expect(run.status).toBe("issue_created");
     expect(run.linkedIssueId).not.toBe(wedged.issue.id);
     expect(getRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue")).toBe(1);
+    expect(supersedeWarns).toHaveLength(1);
+    expect(supersedeWarns[0][0]).toMatchObject({ issueId: wedged.issue.id });
 
     const [predecessor] = await db.select().from(issues).where(eq(issues.id, wedged.issue.id));
     // Terminal, and specifically NOT `blocked` -- a routine-execution row parked
@@ -2250,6 +2263,106 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(recoveryAction.status).toBe("active");
   });
 
+  // Ally review, BLO-31996: the recovery-action guard must also be decided after
+  // the row lock. A recovery upsert never writes the `issues` row, so the issue
+  // lock does not serialise it, and a `for update` that blocked on that lock
+  // evaluated the guard under a snapshot taken before the upsert committed.
+  // The lock is released only once Postgres reports a backend waiting on it,
+  // which can only be the supersede's `for update`. Releasing from the gate's
+  // bypass warning instead is too early: the racing COMMIT lands before the
+  // `for update` starts, its snapshot already sees the action, and the test
+  // passes without the fix.
+  it("does not supersede a stale predecessor whose recovery action is created while the supersede is blocked on the row lock", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "coalesce_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const stranded = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "queued",
+      runStartedAt: new Date(Date.now() - YOUNG_RETRY_AGE_MS),
+      issueCreatedAt: new Date(Date.now() - STALE_FIRE_AGE_MS),
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+      bindExecutionRun: true,
+    });
+    await db
+      .update(issues)
+      .set({ status: "blocked" })
+      .where(eq(issues.id, stranded.issue.id));
+
+    let lockHeld!: () => void;
+    let releaseLock!: () => void;
+    const lockTaken = new Promise<void>((resolve) => {
+      lockHeld = resolve;
+    });
+    const lockReleased = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+
+    const racingTx = db.transaction(async (tx) => {
+      await tx
+        .update(issues)
+        .set({ executionLockedAt: new Date() })
+        .where(eq(issues.id, stranded.issue.id));
+      await tx.insert(issueRecoveryActions).values({
+        companyId,
+        sourceIssueId: stranded.issue.id,
+        kind: "stranded_assigned_issue",
+        status: "active",
+        cause: "test",
+        fingerprint: randomUUID(),
+        nextAction: "wait",
+      });
+      lockHeld();
+      await lockReleased;
+    });
+    await lockTaken;
+
+    resetRoutineDispatchMetrics();
+    const dispatch = svc.runRoutine(routine.id, { source: "schedule" });
+    let raced = false;
+    try {
+      // Safety valve: if the supersede never blocks, `raced` stays false and
+      // the assertion below fails the test rather than passing it quietly.
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        const waitingRows = await db.execute(sql<{ count: number }>`
+          select count(*)::int as count
+          from pg_stat_activity
+          where datname = current_database()
+            and pid <> pg_backend_pid()
+            and wait_event_type = 'Lock'
+        `);
+        if ((Array.from(waitingRows)[0]?.count ?? 0) >= 1) {
+          raced = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    } finally {
+      releaseLock();
+      await racingTx;
+      await dispatch;
+    }
+
+    expect(raced).toBe(true);
+    const [predecessor] = await db.select().from(issues).where(eq(issues.id, stranded.issue.id));
+    expect(predecessor.status).toBe("blocked");
+    expect(predecessor.cancelledAt).toBeNull();
+    expect(getRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue")).toBe(0);
+    const [recoveryAction] = await db
+      .select({ status: issueRecoveryActions.status })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, stranded.issue.id));
+    expect(recoveryAction.status).toBe("active");
+  });
+
   // Ally review, BLO-31996: the activity row is the second supersede receipt,
   // and the first version left it in a bare try/catch inside the dispatch
   // transaction. That is not best-effort: a failed INSERT aborts the whole
@@ -2333,6 +2446,66 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       expect(getRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue")).toBe(1);
     } finally {
       logActivitySpy.mockRestore();
+    }
+  });
+
+  // Ally review, BLO-31996: the cancellation log line, like the counter, is
+  // process-local and does not roll back, so it must be emitted only after the
+  // dispatch transaction commits. The injected failure is a real SQL error on
+  // the dispatch transaction after the supersede: the successor's run cannot be
+  // finalized, the catch's next statement raises 25P02, and the whole
+  // transaction, cancellation included, rolls back. The trigger sits on
+  // `routine_runs` because the successor issue INSERT runs on the service's own
+  // pool, outside this transaction, so failing it would not roll anything back.
+  it("does not log a supersede cancellation when the dispatch transaction rolls back", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "coalesce_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const wedged = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "queued",
+      runStartedAt: new Date(Date.now() - YOUNG_RETRY_AGE_MS),
+      issueCreatedAt: new Date(Date.now() - STALE_FIRE_AGE_MS),
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+      bindExecutionRun: true,
+    });
+
+    await db.execute(sql.raw(`
+      create function fail_routine_run_issue_created() returns trigger language plpgsql as $$
+      begin
+        raise exception 'injected dispatch failure';
+      end
+      $$
+    `));
+    await db.execute(sql.raw(`
+      create trigger fail_routine_run_issue_created
+      before update on routine_runs
+      for each row
+      when (new.status = 'issue_created' and new.routine_id = '${routine.id}')
+      execute function fail_routine_run_issue_created()
+    `));
+
+    resetRoutineDispatchMetrics();
+    const warnSpy = vi.spyOn(logger, "warn");
+    try {
+      await expect(svc.runRoutine(routine.id, { source: "schedule" })).rejects.toThrow();
+
+      const [predecessor] = await db.select().from(issues).where(eq(issues.id, wedged.issue.id));
+      expect(predecessor.status).not.toBe("cancelled");
+      expect(predecessor.cancelledAt).toBeNull();
+      expect(getRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue")).toBe(0);
+      expect(warnSpy.mock.calls.filter((call) => (call as unknown[]).includes(SUPERSEDE_WARN))).toHaveLength(0);
+    } finally {
+      warnSpy.mockRestore();
+      await db.execute(sql.raw("drop trigger if exists fail_routine_run_issue_created on routine_runs"));
+      await db.execute(sql.raw("drop function if exists fail_routine_run_issue_created()"));
     }
   });
 
