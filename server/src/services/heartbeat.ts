@@ -27291,12 +27291,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       const policy = parseHeartbeatPolicy(agent);
       if (hasExternalLifecycle(agent.adapterType)) {
-        // BLO-35878: time this. `reapOrphanedRuns` has exactly one call site —
-        // here, inside the agent start lock — and it is NOT agent-scoped: it
+        // BLO-35878: time this. This is the only `reapOrphanedRuns` call site
+        // inside the agent start lock, and the sweep is NOT agent-scoped: it
         // sweeps every `running` run in the instance, issuing per-run k8s reads
         // and writes. So every external-lifecycle agent's dispatch pass pays a
         // full cluster-wide sweep, and N concurrently-dispatching agents run N
         // redundant copies of it against one API server and one DB pool.
+        //
+        // Not covered here: the startup reap and the periodic scheduler tick's
+        // reap (both in `index.ts`) run outside the lock and are not timed.
+        // `reapOrphanedRuns` has no in-flight latch, so the tick's sweep can run
+        // concurrently with this one, and a large `reapMs` below can mean this
+        // sweep was contending with it for the same k8s API and DB pool rather
+        // than being slow on its own. This line cannot separate those two.
         //
         // The hold gauge (`paperclip_agent_start_lock_held_seconds`) reports the
         // section's total duration with no breakdown, which is why a 245–1586 s
@@ -27305,14 +27312,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // nothing on this path awaits it. This line is the discriminator: a reap
         // that alone exceeds the lock's warn budget names itself in the log next
         // to the hold it caused.
+        //
+        // Timed in `finally` so a sweep that stalls and then throws (its first
+        // `running` select sits outside its per-stage catches, so a slow pool
+        // acquire that rejects propagates) still logs its duration.
         const reapStartedAtMs = Date.now();
-        await reapOrphanedRuns({ suppressDispatchAfterReap: true });
-        const reapMs = Date.now() - reapStartedAtMs;
-        if (reapMs >= LOCK_HELD_WARN_MS) {
-          logger.warn(
-            { agentId, reapMs, warnAfterMs: LOCK_HELD_WARN_MS },
-            "orphan reap alone exceeded the agent start lock budget; it is holding dispatch for this agent",
-          );
+        try {
+          await reapOrphanedRuns({ suppressDispatchAfterReap: true });
+        } finally {
+          const reapMs = Date.now() - reapStartedAtMs;
+          if (reapMs >= LOCK_HELD_WARN_MS) {
+            logger.warn(
+              { agentId, reapMs, warnAfterMs: LOCK_HELD_WARN_MS },
+              "orphan reap alone exceeded the agent start lock budget; it is holding dispatch for this agent",
+            );
+          }
         }
       }
       // BLO-12990 Fix #1 / BLO-20775: stale/silent running runs must not block new
