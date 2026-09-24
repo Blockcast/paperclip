@@ -20956,13 +20956,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // promoteScheduledRetryRun's capacityDrivenTransientPark conjunct reads them,
     // so clearing them would promote a transient_failure capacity park with no
     // promotion-time capacity re-probe (BLO-28919).
-    const resultJson =
-      scheduled.run.resultJson == null
-        ? undefined
-        : clearCcrotateCapacityDecision(
-            parseObject(scheduled.run.resultJson),
-            CCROTATE_CAPACITY_RESULT_KEYS.clearedOnOverride,
-          );
+    // A non-object `result_json` (jsonb array or scalar) is skipped exactly as
+    // null is: `parseObject` would flatten it to `{}`, and since this is the
+    // only path that writes the column here, that would *replace* the row's
+    // value rather than clear keys from it. No writer produces that shape today.
+    const resultJson = isPlainObject(scheduled.run.resultJson)
+      ? clearCcrotateCapacityDecision(
+          scheduled.run.resultJson,
+          CCROTATE_CAPACITY_RESULT_KEYS.clearedOnOverride,
+        )
+      : undefined;
 
     const updated = await db.transaction(async (tx) => {
       const row = await tx
