@@ -504,7 +504,7 @@ import { PROVIDER_CAPACITY_MAX_HORIZON_MS } from "./provider-capacity-horizon-bo
 import { productivityReviewService } from "./productivity-review.js";
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run-handoff-state.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
-import { runDetachedFromAgentStartLock, withAgentStartLock } from "./agent-start-lock.js";
+import { LOCK_HELD_WARN_MS, runDetachedFromAgentStartLock, withAgentStartLock } from "./agent-start-lock.js";
 import {
   evaluateAgentInvokability,
   evaluateAgentInvokabilityFromDb,
@@ -27291,7 +27291,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       const policy = parseHeartbeatPolicy(agent);
       if (hasExternalLifecycle(agent.adapterType)) {
+        // BLO-35878: time this. `reapOrphanedRuns` has exactly one call site —
+        // here, inside the agent start lock — and it is NOT agent-scoped: it
+        // sweeps every `running` run in the instance, issuing per-run k8s reads
+        // and writes. So every external-lifecycle agent's dispatch pass pays a
+        // full cluster-wide sweep, and N concurrently-dispatching agents run N
+        // redundant copies of it against one API server and one DB pool.
+        //
+        // The hold gauge (`paperclip_agent_start_lock_held_seconds`) reports the
+        // section's total duration with no breakdown, which is why a 245–1586 s
+        // regression was attributed to hindsight recall — recall runs in the
+        // out-of-process plugin worker off the `plugin_event_outbox`, and
+        // nothing on this path awaits it. This line is the discriminator: a reap
+        // that alone exceeds the lock's warn budget names itself in the log next
+        // to the hold it caused.
+        const reapStartedAtMs = Date.now();
         await reapOrphanedRuns({ suppressDispatchAfterReap: true });
+        const reapMs = Date.now() - reapStartedAtMs;
+        if (reapMs >= LOCK_HELD_WARN_MS) {
+          logger.warn(
+            { agentId, reapMs, warnAfterMs: LOCK_HELD_WARN_MS },
+            "orphan reap alone exceeded the agent start lock budget; it is holding dispatch for this agent",
+          );
+        }
       }
       // BLO-12990 Fix #1 / BLO-20775: stale/silent running runs must not block new
       // high-priority work. Fetch full run rows so `isRunOccupyingSlot` can partition
