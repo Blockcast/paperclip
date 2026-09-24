@@ -658,8 +658,47 @@ the alert, runs the cover cascade itself
 (`recordSourceResolvedAndCloseCovers`). That is idempotent by construction and
 only cancels a cover whose every member has resolved, so a storm-batched
 sibling that is still firing keeps the cover open. The "chain exhausted"
-comment sits behind the swap, so no announcement is posted for an alert that
-has already cleared.
+comment sits behind the swap, so a **refused** swap posts no announcement for
+an alert that has already cleared. A swap that **succeeds** in that same window
+still can: the resolve is mid-delivery and has not stored `resolvedAt` yet, so
+the rung reads the alert as firing and posts "while alert remains firing" on
+the source issue. The cover is still closed by the resolve's post-commit
+cascade below, so the announcement is the only residue.
+
+That compensation only fires when the swap is **refused**, which left one more
+interleaving open (BLO-33497). The webhook's cover cascade ran *before* it
+stored `resolvedAt`, so a resolve could cascade while the cover did not yet
+exist — nothing to mark — and then store `resolvedAt` only *after* the sweep's
+swap had already succeeded. The swap succeeding means no compensation runs, and
+no later resolve will ever cascade into that cover again: an open
+`[user-cover]` with an unresolved member, for an alert that has cleared,
+permanently.
+
+The obvious repair — move the cascade behind the state write — is wrong, and
+the existing tests say so. `ctx.state.set` is the delivery's **commit point**,
+and every side effect is deliberately sequenced ahead of it so that a failure
+leaves `resolvedAt` unwritten and the retry redoes the lot. Moving the cascade
+past it swaps a concurrency orphan for a failure orphan: a cascade that throws
+would leave a record asserting the alert is over with its cover uncleaned.
+
+So `handleResolved` cascades **twice**, and the two calls answer different
+failures:
+
+- **ahead of the commit point** — makes cover cleanup a precondition of
+  recording the resolution. A throwing cascade aborts the delivery with nothing
+  recorded.
+- **behind the commit point** — catches a cover that did not exist yet when the
+  first call ran. A swap that *succeeds* means the sweep read, created its cover
+  and claimed all before the commit, so by the time the second call runs the
+  cover is there to be closed.
+
+Between them there is no window: the sweep compensates the refused-swap half,
+and the post-commit cascade covers the succeeded-swap half. The second call is
+close to free — `recordSourceResolvedAndCloseCovers` early-returns when the
+alert never joined a cover (the common case), re-marking is
+`COALESCE(resolved_at, now())`, and the close is a single-UPDATE claim only one
+caller can win. If it throws, the delivery still fails and the retry's
+pre-commit cascade closes the cover, which by then exists.
 
 ### Bearer rotation in a Kubernetes deployment
 
