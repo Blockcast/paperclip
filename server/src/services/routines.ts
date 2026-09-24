@@ -1666,6 +1666,46 @@ export function routineService(
     );
   }
 
+  // Ally review, BLO-31996: the two wake paths an open routine execution can
+  // have that are not heartbeat runs. The supersede refuses to cancel a row
+  // with either, so the gate must read that same row as live, or the fire
+  // proceeds beside a predecessor nothing will cancel. Both functions read
+  // these from here so the refused set and the gated set cannot drift apart.
+  //
+  // The self-join is written as raw SQL rather than with drizzle's `alias()`
+  // on purpose: interpolating an aliased table into a `sql` fragment emits
+  // only the alias NAME, so the join reads `join "supersede_blocker"` -- a
+  // table that does not exist. That is a runtime 42P01, not a type error, so
+  // it compiles clean and only shows up when the predicate actually matches.
+  // Aliasing is mandatory, not cosmetic: an unaliased second `issues` in the
+  // subquery would shadow the outer statement's target and make `issues.id`
+  // self-correlate. `cancelled` blockers do not count as resolved, matching
+  // the dependency semantics used everywhere else.
+  function hasUnresolvedBlockerEdge() {
+    return sql`exists (
+          select 1
+          from ${issueRelations}
+          join ${issues} as supersede_blocker
+            on supersede_blocker.id = ${issueRelations.issueId}
+          where ${issueRelations.relatedIssueId} = ${issues.id}
+            and ${issueRelations.type} = 'blocks'
+            and supersede_blocker.status <> 'done'
+        )`;
+  }
+
+  // The live set is the recovery service's own (`active` + `escalated`,
+  // recovery/service.ts waiting-path and hand-back drain queries): an
+  // escalated action is still owned by an operator who resolves it.
+  function hasLiveRecoveryAction() {
+    return sql`exists (
+          select 1
+          from ${issueRecoveryActions}
+          where ${issueRecoveryActions.sourceIssueId} = ${issues.id}
+            and ${issueRecoveryActions.companyId} = ${issues.companyId}
+            and ${inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES])}
+        )`;
+  }
+
   async function findLiveExecutionIssue(
     routine: typeof routines.$inferSelect,
     executor: Db = db,
@@ -1742,6 +1782,29 @@ export function routineService(
         .limit(1);
       if (liveRow) return liveRow.issue;
     }
+
+    // Ally review, BLO-31996: a row `supersedeStaleExecutionIssues` refuses to
+    // cancel must gate the fire too. It stays open with its execution run, so
+    // proceeding would put a successor beside it (the INSERT carries no run yet,
+    // so the unique index does not stop it) -- where before the fire-age arm
+    // this same row read as live and the fire coalesced. Scoped like the supersede's own
+    // candidate set (`executionRunId` bound); age is deliberately not a
+    // condition, since a protected row is never cancelled at any age. A
+    // protection that commits after this snapshot is caught by the second gate
+    // `dispatchRoutineRun` runs after the supersede's row lock.
+    const [protectedRow] = await executor
+      .select({ issue: issues })
+      .from(issues)
+      .where(
+        and(
+          issueCondition,
+          isNotNull(issues.executionRunId),
+          or(hasUnresolvedBlockerEdge(), hasLiveRecoveryAction()),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
+      .limit(1);
+    if (protectedRow) return protectedRow.issue;
 
     // Nothing genuinely live. Any bypassed rows -- parked past the retry
     // horizon, or older than the run-age horizon -- are the reason this fire is
@@ -1851,15 +1914,7 @@ export function routineService(
     // matches. Aliasing here is mandatory, not cosmetic: an unaliased
     // second `issues` in the subquery would shadow the outer statement's
     // target and make `issues.id` below self-correlate.
-    const noUnresolvedBlocker = sql`not exists (
-          select 1
-          from ${issueRelations}
-          join ${issues} as supersede_blocker
-            on supersede_blocker.id = ${issueRelations.issueId}
-          where ${issueRelations.relatedIssueId} = ${issues.id}
-            and ${issueRelations.type} = 'blocks'
-            and supersede_blocker.status <> 'done'
-        )`;
+    const noUnresolvedBlocker = sql`not ${hasUnresolvedBlockerEdge()}`;
     // Ally review, BLO-31996: a live recovery action is an explicit wake path
     // too, but it lives in `issue_recovery_actions`, not `issue_relations`, so
     // the edge check above cannot see it. Cancelling the source row would
@@ -1868,13 +1923,7 @@ export function routineService(
     // is the recovery service's own (`active` + `escalated`, recovery/service.ts
     // waiting-path and hand-back drain queries): an escalated action is still
     // owned by an operator who resolves it, so its source is protected here.
-    const noLiveRecoveryAction = sql`not exists (
-          select 1
-          from ${issueRecoveryActions}
-          where ${issueRecoveryActions.sourceIssueId} = ${issues.id}
-            and ${issueRecoveryActions.companyId} = ${issues.companyId}
-            and ${inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES])}
-        )`;
+    const noLiveRecoveryAction = sql`not ${hasLiveRecoveryAction()}`;
     const staleCondition = and(
       eq(issues.companyId, input.routine.companyId),
       eq(issues.originKind, input.originKind),
@@ -2360,20 +2409,20 @@ export function routineService(
           kind: issueOriginKind,
           id: issueOriginId,
         }, { observeBypass: gatesOnActiveIssue, trigger: input.trigger ?? null, now: dispatchNow });
-        if (activeIssue && gatesOnActiveIssue) {
+        const coalesceOnto = async (heldIssue: NonNullable<typeof activeIssue>) => {
           const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
           if (manualRunnerUserId) {
             await touchIssueForUserInbox(txDb, {
               companyId: input.routine.companyId,
-              issueId: activeIssue.id,
+              issueId: heldIssue.id,
               userId: manualRunnerUserId,
               touchedAt: triggeredAt,
             });
           }
           const updated = await finalizeRun(createdRun.id, {
             status,
-            linkedIssueId: activeIssue.id,
-            coalescedIntoRunId: activeIssue.originRunId,
+            linkedIssueId: heldIssue.id,
+            coalescedIntoRunId: heldIssue.originRunId,
             completedAt: triggeredAt,
           }, txDb);
           await updateRoutineTouchedState({
@@ -2381,11 +2430,12 @@ export function routineService(
             triggerId: input.trigger?.id ?? null,
             triggeredAt,
             status,
-            issueId: activeIssue.id,
+            issueId: heldIssue.id,
             nextRunAt,
           }, txDb);
           return updated ?? createdRun;
-        }
+        };
+        if (activeIssue && gatesOnActiveIssue) return coalesceOnto(activeIssue);
 
         // Nothing live is holding the lock. Retire any open predecessor that has
         // outlived its cadence before inserting, so the partial unique index
@@ -2416,6 +2466,21 @@ export function routineService(
           supersededStaleIssues = superseded;
           supersededFireAgeHorizonMs = fireAgeHorizonMs;
           supersededAtMs = dispatchNow.getTime();
+
+          // Ally review, BLO-31996: gate again, after the supersede's row lock.
+          // The supersede decides its protections post-lock, so a blocker edge
+          // or recovery action that committed after the snapshot above can make
+          // it refuse a row the first gate read as bypassable. The successor
+          // INSERT does not trip the unique index (it carries no execution run
+          // yet), so nothing else would stop the fire proceeding beside that
+          // row. This read takes a fresh statement snapshot and sees it.
+          if (gatesOnActiveIssue) {
+            const heldIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
+              kind: issueOriginKind,
+              id: issueOriginId,
+            }, { trigger: input.trigger ?? null, now: dispatchNow });
+            if (heldIssue) return coalesceOnto(heldIssue);
+          }
         }
 
         try {
