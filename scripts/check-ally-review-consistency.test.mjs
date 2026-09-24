@@ -193,7 +193,14 @@ describe("hasStillPresentDisposition", () => {
       /PRIOR_FINDING_DISPOSITION_PATTERN = new RegExp\(\n\s*String\.raw`([^`]+)`,\n\s*"gim",/,
     );
     assert.ok(tsRaw, "ally-review-detection.ts still defines PRIOR_FINDING_DISPOSITION_PATTERN");
-    const gatePattern = new RegExp(tsRaw[1].replace("${NOT_INDENTED_CODE}", tsNotIndented[1]), "gim");
+    // Function replacement, not a string one: a string replacement interprets
+    // `$&`/`` $` ``/`$'`/`$$` in the spliced-in source text, so a future
+    // NOT_INDENTED_CODE containing `$` would be silently mangled rather than
+    // failing loudly. `$&` alone would rebuild the literal `${NOT_INDENTED_CODE}`.
+    const gatePattern = new RegExp(
+      tsRaw[1].replace("${NOT_INDENTED_CODE}", () => tsNotIndented[1]),
+      "gim",
+    );
 
     const pySource = readFileSync(
       new URL("../.github/scripts/sweep-stalled-ally-reviews.py", import.meta.url),
