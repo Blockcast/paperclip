@@ -5,6 +5,7 @@ import {
   shouldReportMergeQueueFailure,
   shouldReportCancelledRun,
   failingJobSummary,
+  runOutcomeText,
 } from "../report-merge-queue-ejection.mjs";
 
 test("extracts PR numbers from merge-group synthetic refs", () => {
@@ -62,4 +63,31 @@ test("the ejection comment names the failing shards", () => {
   assert.equal(failingJobSummary([{ name: "verify", conclusion: "success" }]), "");
   assert.equal(failingJobSummary([]), "");
   assert.equal(failingJobSummary(undefined), "");
+});
+
+test("a `cancelled` run carrying a failed job is described as failed, not as a timeout", () => {
+  // Shape taken from run 35993984182, which ejected #1976: run-level conclusion
+  // `cancelled` (fail-fast cancelled `Build`), but the cause was a genuine
+  // `failure` in a shard. Reporting that as "a job timeout surfaces this way"
+  // points the reader at infra instead of at the shard.
+  assert.equal(
+    runOutcomeText("cancelled", [
+      { name: "Build", conclusion: "cancelled" },
+      { name: "General tests (workspaces-a)", conclusion: "failure" },
+      { name: "verify", conclusion: "failure" },
+    ]),
+    "failed",
+  );
+  // A genuine timeout: every non-success job is cancelled, nothing failed.
+  assert.equal(
+    runOutcomeText("cancelled", [
+      { name: "General tests (server 4/4)", conclusion: "cancelled" },
+      { name: "verify", conclusion: "success" },
+    ]),
+    "was cancelled (a job timeout surfaces this way)",
+  );
+  // Degrades to the run-level conclusion when the best-effort jobs read gave
+  // nothing -- i.e. exactly the pre-BLO-28886 behaviour, never worse.
+  assert.equal(runOutcomeText("cancelled", undefined), "was cancelled (a job timeout surfaces this way)");
+  assert.equal(runOutcomeText("failure", undefined), "failed");
 });

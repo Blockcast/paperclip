@@ -60,8 +60,23 @@ export function failingJobSummary(jobs) {
   return ` Failing ${failed.length === 1 ? "job" : "jobs"}: ${failed.map((name) => `\`${name}\``).join(", ")}.`;
 }
 
-async function githubRequest(path, options = {}) {
-  const response = await fetch(`https://api.github.com${path}`, {
+// A run whose conclusion is `cancelled` is NOT necessarily a timeout. GitHub
+// marks the whole run `cancelled` when ANY job is cancelled, and fail-fast
+// cancels the siblings of a job that genuinely failed -- so the commonest
+// `cancelled` run is a real test failure wearing a timeout's clothes. Measured
+// on run 35993984182 (ejected #1976): run `cancelled`, but `General tests
+// (workspaces-a)` and `verify` both `failure`, and the actual cause was an
+// after-teardown `ReferenceError: window is not defined` with 3075/3075 tests
+// passing. Reading the run-level conclusion alone sends the reader to look for
+// an infra timeout that is not there.
+export function runOutcomeText(conclusion, jobs) {
+  const failed =
+    conclusion === "failure" ||
+    (Array.isArray(jobs) ? jobs : []).some((job) => job?.conclusion === "failure");
+  return failed ? "failed" : "was cancelled (a job timeout surfaces this way)";
+}
+
+async function githubRequest(path, options = {}) {  const response = await fetch(`https://api.github.com${path}`, {
     ...options,
     headers: {
       accept: "application/vnd.github+json",
@@ -133,22 +148,21 @@ export async function reportMergeQueueFailure({ repository, headBranch, conclusi
     return { reported: false, reason: "already-reported", number };
   }
 
-  const outcome = conclusion === "failure" ? "failed" : "was cancelled (a job timeout surfaces this way)";
   // Best-effort: a failure here must NOT lose the ejection report. Losing the
   // shard name degrades the comment; losing the comment leaves a stuck PR
   // silent, which is the failure this whole script exists to prevent.
   // One unpaginated page (default `filter=latest`, so a re-run's older attempts
   // are excluded). Ceiling: a workflow past 100 jobs truncates -- 17 today.
-  let summary = "";
+  let jobs;
   try {
-    const { jobs } = await githubRequest(
+    ({ jobs } = await githubRequest(
       `/repos/${owner}/${repo}/actions/runs/${runId}/jobs?per_page=100`,
-    );
-    summary = failingJobSummary(jobs);
+    ));
   } catch (error) {
     console.warn(`Could not read jobs for run ${runId}: ${error.message}`);
   }
-  const body = `${marker}\nMerge-queue ejection detected for PR #${number}. The merge-group run ${outcome} and GitHub may have removed the PR from the queue and dropped auto-merge.${summary} Inspect the merge-group jobs, fix or rerun the failing checks, then re-enqueue the PR.\n\nRun: ${runUrl}`;
+  const summary = failingJobSummary(jobs);
+  const body = `${marker}\nMerge-queue ejection detected for PR #${number}. The merge-group run ${runOutcomeText(conclusion, jobs)} and GitHub may have removed the PR from the queue and dropped auto-merge.${summary} Inspect the merge-group jobs, fix or rerun the failing checks, then re-enqueue the PR.\n\nRun: ${runUrl}`;
   await githubRequest(`/repos/${owner}/${repo}/issues/${number}/comments`, {
     method: "POST",
     headers: { "content-type": "application/json" },
