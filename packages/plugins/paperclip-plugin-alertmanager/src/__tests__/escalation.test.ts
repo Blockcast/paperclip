@@ -934,7 +934,17 @@ describe("BLO-20650 concurrent webhook + sweep on one alert-state record", () =>
       return [{ principalType: "user", principalId: "board-1", status: "active", membershipRole: "owner" }];
     });
 
-    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+    try {
+      await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+    } catch (err) {
+      // The webhook is still parked on the gate. Release it and swallow its
+      // rejection here only, so an unhandled rejection cannot outlive this test
+      // and mask the sweep's real failure. On the success path below it is
+      // awaited normally, so a genuine webhook rejection still surfaces.
+      releaseStateWrite();
+      await webhook?.catch(() => {});
+      throw err;
+    }
     releaseStateWrite();
     await webhook;
 
