@@ -199,6 +199,124 @@ export async function actorCanReadAgentConfig(
   return decision.allowed;
 }
 
+type RunTranscriptReadDecider = {
+  decide: (input: {
+    actor: Request["actor"];
+    action: "runs:read_transcript";
+    resource: { type: "agent"; companyId: string; agentId: string | null };
+  }) => Promise<AuthorizationDecision>;
+};
+
+/**
+ * `decision` is present whenever the authorization service actually ran, so a
+ * route can render the named boundary vocabulary. It is absent for the two
+ * cases decided without it: a human operator (allowed), and the fail-closed
+ * company-boundary case, which callers are expected to have already turned into
+ * a 404 (see `hasCompanyAccess`) — the check is repeated here so a future
+ * caller that forgets cannot fall open.
+ */
+export type RunTranscriptReadOutcome = {
+  allowed: boolean;
+  decision: AuthorizationDecision | null;
+};
+
+/**
+ * Shared "may this actor see a run's TRANSCRIPT?" test (PEN-3142).
+ *
+ * Run *state* — status, exit/park reason, the retry edge, watchdog decisions,
+ * `lastActivityAt`, error text — stays company-readable and must not be routed
+ * through here. This gate covers transcript *content* only: the
+ * `GET /heartbeat-runs/:runId/log` body, the `message` / `payload` of
+ * `GET /heartbeat-runs/:runId/events`, and — per the PEN-3202 ruling
+ * implemented by PEN-3204 — the captured OUTPUT of a workspace operation
+ * (`stdoutExcerpt` / `stderrExcerpt` and the
+ * `GET /workspace-operations/:operationId/log` body).
+ *
+ * A workspace operation is a MIX rather than a counterexample: the operation
+ * ROW stays company-readable — `phase`, `status`, `exitCode`, `command`, `cwd`,
+ * `metadata`, the log digest and the timestamps — and only the captured output
+ * narrows. Operations carry no owning-agent column, so callers resolve the
+ * owner through `heartbeatRunId → heartbeat_runs.agentId` and withhold when
+ * that cannot be resolved; see `withholdUnentitledWorkspaceOperationOutput`
+ * (`routes/workspace-response.ts`), which is deliberately tighter than this
+ * function on a null agent id, because the grant fallback below would otherwise
+ * admit a grant holder for an operation with no owner to decide about.
+ *
+ * Same shape as `actorCanReadAgentConfig` above, and for the same reason:
+ * human board members of the company keep the read, agent actors get own-run
+ * plus manager chain from the decider and otherwise need an explicit
+ * `runs:read_transcript` grant, so peers cannot read each other's transcripts.
+ * The run log has carried vendor credential material across several incidents
+ * (PEN-2328 → PEN-2370 → PEN-3139) and the scrub protecting it is write-time
+ * only, which is why standing company-wide peer read was withdrawn.
+ *
+ * It lives here, taking the run's owning agent rather than a whole run row, so
+ * BOTH transcript routes call one definition. `/log` and `/events` carry the
+ * same material with opposite halves of the control pair — `/log` had the
+ * audit and no projection, `/events` the projection and no audit — and PEN-2777
+ * (see `actorCanReadAgentConfig`) was exactly this gate existing on one sibling
+ * path and not the other.
+ */
+export async function decideRunTranscriptRead(
+  req: Request,
+  access: RunTranscriptReadDecider,
+  run: { companyId: string; agentId: string | null },
+): Promise<RunTranscriptReadOutcome> {
+  if (!hasCompanyAccess(req, run.companyId)) return { allowed: false, decision: null };
+  if (req.actor.type === "board") return { allowed: true, decision: null };
+  const decision = await access.decide({
+    actor: req.actor,
+    action: "runs:read_transcript",
+    resource: { type: "agent", companyId: run.companyId, agentId: run.agentId },
+  });
+  return { allowed: decision.allowed, decision };
+}
+
+/**
+ * List-route form of {@link decideRunTranscriptRead} (PEN-3149 ruling, folded
+ * into PEN-3142).
+ *
+ * A run list spans many owning agents, and the decision is scoped to the
+ * OWNING AGENT rather than the run — so the answer is per distinct agent, not
+ * per row. This memoizes on that key: a 200-run page owned by 6 agents costs 6
+ * decisions, not 200. The cache is per call, so it cannot outlive the request
+ * and go stale against a grant or reporting-line change.
+ *
+ * Returns a predicate rather than a filtered list because the caller must keep
+ * every row — run STATE stays company-readable, and only the transcript-bearing
+ * fields are projected out of the rows that fail the check.
+ */
+export function runTranscriptReadGate(
+  req: Request,
+  access: RunTranscriptReadDecider,
+  companyId: string,
+): (agentId: string | null) => Promise<boolean> {
+  const cache = new Map<string, Promise<boolean>>();
+  return (agentId: string | null) => {
+    const key = agentId ?? "";
+    const cached = cache.get(key);
+    if (cached) return cached;
+    const pending = decideRunTranscriptRead(req, access, { companyId, agentId })
+      .then((outcome) => outcome.allowed)
+      // Ally review (1ad0e938), adopted with one deliberate addition. Fail closed
+      // here as well as on the push-path twin
+      // (`realtime/live-event-transcript-gate.ts`), so the posture is local to
+      // both gates rather than inferable only from the route that calls this one.
+      //
+      // The addition is the log line. Swallowing the rejection silently would
+      // trade a loud 500 for a normal-looking 200 whose transcript fields are
+      // withheld — safe in content terms, but a broken authorizer would then be
+      // indistinguishable from an ordinary unentitled read, on the one path that
+      // exists to make transcript access decidable. Fail closed AND say so.
+      .catch((error) => {
+        logger.error({ err: error, companyId, agentId }, "run transcript read decision failed; withholding");
+        return false;
+      });
+    cache.set(key, pending);
+    return pending;
+  };
+}
+
 /**
  * Preferred way to fetch a company-scoped resource by id inside a route
  * handler. Wraps the two-step pattern described on `hasCompanyAccess` so

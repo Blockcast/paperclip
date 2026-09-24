@@ -10,7 +10,7 @@ import type {
   WorkspaceOperation,
   WorkspaceRuntimeService,
 } from "@paperclipai/shared";
-import { isPlainObject, maskWorkspaceRuntimeForRead, maskWorkspaceRuntimeTextForRead } from "../redaction.js";
+import { isPlainObject, maskWorkspaceRuntimeForRead, maskWorkspaceRuntimeTextForRead, withholdWorkspaceOperationCapturedOutput } from "../redaction.js";
 import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
 import type { accessService } from "../services/index.js";
 import { maskProjectEnv } from "./project-env-response.js";
@@ -484,6 +484,31 @@ export function publicRuntimeServices(
  * `ui/src/pages/AgentDetail.tsx` and `paperclip run workspace-log` read it). Masking a pointer whose
  * route still served the bytes would have been theatre.
  *
+ * PEN-3204 (merge of 2026-09-20): the paragraphs above settle THIS gate — the workspace-runtime
+ * entitlement — and they settle it correctly. They are NOT the whole story, because a SECOND and
+ * orthogonal gate now also reads these rows: `withholdUnentitledWorkspaceOperationOutput` below,
+ * which narrows the captured output to `decideRunTranscriptRead` per the PEN-3202 ruling. This one
+ * answers "may you see the operator's command?"; that one answers "may you see what it printed?".
+ *
+ * The two do not collide, and that is a measurement rather than an assertion — BLO-34631's survey
+ * is the sharpest available test of the transcript gate and does not reach it, for two independent
+ * reasons:
+ *
+ *  - **Different key.** BLO-34631 falsified a mask keyed on `workspace_runtime:read`, which
+ *    same-company agents deliberately lack (PEN-2852) — so that mask hit an agent reading its OWN
+ *    output, which is the regression that settles it. The transcript gate is keyed on run
+ *    OWNERSHIP: an agent reading its own run resolves to `allow_self` in `authorization.ts` and is
+ *    admitted. The reader BLO-34631 protects is the one case the transcript gate never denies.
+ *  - **Different routes.** The falsifying consumer is
+ *    `POST /execution-workspaces/:id/runtime-services/:action` (the backing call for
+ *    `paperclipControlIssueWorkspaceServices`), which answers at `:536` through
+ *    `publicWorkspaceOperation` alone and is deliberately left untouched by the transcript gate.
+ *    The transcript gate is applied to the two LIST routes and the per-operation `/log` only.
+ *
+ * What the transcript gate does narrow is the case BLO-34631's survey did not test: one agent
+ * reading ANOTHER agent's run output. Neither gate covers the other, and a route that applies only
+ * one is half-gated.
+ *
  * BLO-34738: "no agent consumer" is NOT what bounds the loss, and reading it that way is a trap.
  * `paperclip run workspace-log` (`cli/src/commands/client/run.ts:243`) sends whatever key `ctx.api`
  * holds, so a non-sandboxed agent with a direct key does reach that route — and gets
@@ -511,6 +536,51 @@ export function publicWorkspaceOperations(
   viewer: WorkspaceRuntimeViewer,
 ): WorkspaceOperation[] {
   return operations.map((operation) => publicWorkspaceOperation(operation, viewer));
+}
+
+/**
+ * PEN-3204 (implements the PEN-3202 ruling). The SECOND, orthogonal gate on these
+ * rows: `publicWorkspaceOperation` above withholds the operator's copied
+ * `command`/`cwd`/`metadata` under the workspace-runtime gate; this one withholds
+ * the captured OUTPUT under the run-transcript gate. Different questions, different
+ * deciders, same rows — so they compose rather than nest, and neither may be taken
+ * as covering the other.
+ *
+ * It lives here, next to the projection it composes with, so all three read routes
+ * (`/heartbeat-runs/:runId/workspace-operations`,
+ * `/execution-workspaces/:id/workspace-operations`, and the per-operation `/log`
+ * gate that mirrors this decision) share ONE definition of who owns an operation's
+ * output. Gating two of the three and leaving the third is the PEN-2777 failure the
+ * `authz.ts` comment exists to prevent, and a second copy of this rule is how the
+ * third one drifts.
+ *
+ * **Fail-closed, and deliberately tighter than the decider.** An operation with no
+ * resolvable owning agent is withheld from every agent actor — including a holder of
+ * the company-wide `runs:read_transcript` grant. `decideRunTranscriptRead` would fall
+ * through to that grant when handed a null `agentId` (the two relational allows in
+ * `authorization.ts` are both guarded on `resource.agentId` being set), so calling it
+ * with an unresolved owner would NOT fail closed. Human operators keep the read,
+ * matching the board carve-out the decider makes itself and the operator UI that
+ * renders these excerpts.
+ *
+ * The return type carries `withheldFields` optionally rather than dropping it:
+ * an entitled row keeps the key absent, a withheld row carries the list, and
+ * that is the documented difference between "not entitled" and "captured no
+ * output" (`doc/DEVELOPING.md`). Declaring the plain row type erased it.
+ */
+export async function withholdUnentitledWorkspaceOperationOutput(
+  operations: WorkspaceOperation[],
+  owners: Map<string, string>,
+  gate: (agentId: string) => Promise<boolean>,
+  actorIsHumanOperator: boolean,
+): Promise<Array<WorkspaceOperation & { withheldFields?: string[] }>> {
+  return Promise.all(operations.map(async (operation) => {
+    const ownerAgentId = operation.heartbeatRunId ? owners.get(operation.heartbeatRunId) : undefined;
+    if (!ownerAgentId) {
+      return actorIsHumanOperator ? operation : withholdWorkspaceOperationCapturedOutput(operation);
+    }
+    return (await gate(ownerAgentId)) ? operation : withholdWorkspaceOperationCapturedOutput(operation);
+  }));
 }
 
 export function publicProjectWorkspace(

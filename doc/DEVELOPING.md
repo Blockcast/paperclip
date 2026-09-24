@@ -717,23 +717,160 @@ those providers are enabled.
 
 Agent env vars now support secret references. By default, secret values are stored with local encryption and only secret refs are persisted in agent config.
 
-## Heartbeat Run Log Access Auditing
+## Heartbeat Run Transcript Access and Auditing
 
-`GET /api/heartbeat-runs/:runId/log` emits a company-scoped `activity_log` entry
-with action `heartbeat.run_log_accessed` for both allowed and denied company
-access checks. The audit row records the actor type/id, company id, heartbeat run
-id, timestamp (`activity_log.created_at`), access result, requested byte window,
-and log store type. It deliberately does not record transcript content, log
-chunks, log references/paths, environment values, or credential material.
+### Who may read a run transcript
+
+Run *transcript content* — the `GET /api/heartbeat-runs/:runId/log` body, the
+`message` / `payload` of `GET /api/heartbeat-runs/:runId/events`, and the
+captured output of a workspace operation — is scoped to
+the run's owning agent, that agent's manager chain, human board members of the
+company, and any principal holding the `runs:read_transcript` grant (PEN-3142,
+implementing the decision on PEN-3140). Company-wide peer read was withdrawn
+because the run log has carried vendor credential material across several
+incidents and the scrub protecting it runs only at write time.
+
+Run *state* is unchanged and stays company-readable: `GET
+/api/heartbeat-runs/:runId` (status, exit/park reason, retry edge, error text,
+`lastActivityAt`) and watchdog decisions.
+
+### Workspace operations are a mix
+
+A `workspace_operations` row is **partly state and partly transcript**
+(PEN-3204, implementing the ruling on PEN-3202). Do not treat the whole row as
+either.
+
+| field | treatment |
+|---|---|
+| `phase`, `status`, `exitCode`, `command`, `cwd`, `metadata`, the ids, the timestamps, and the log volume/location/digest (`logStore`, `logRef`, `logBytes`, `logSha256`, `logCompressed`) | **state** — company-readable |
+| `stdoutExcerpt`, `stderrExcerpt` | **transcript** — scoped as above |
+| `GET /api/workspace-operations/:operationId/log` body | **transcript** — scoped as above |
+
+The excerpts are withheld on **all three** read routes, or the boundary is not
+closed: `GET /api/heartbeat-runs/:runId/workspace-operations`,
+`GET /api/execution-workspaces/:id/workspace-operations` (the widest — it
+returns every operation for a workspace, including other agents' runs), and the
+per-operation `/log` above. Withheld rows carry
+`withheldFields: ["stdoutExcerpt", "stderrExcerpt"]`, so a client can tell "not
+entitled" from "this operation captured no output"; every state field survives
+beside them, because hiding the operator's text is the point and hiding that an
+operation ran is not.
+
+`command` / `cwd` / `metadata` are separately masked by an **orthogonal** gate,
+`workspace_runtime:read` (`routes/workspace-response.ts`). The two compose and
+neither covers the other: one answers "may you see the operator's command?", the
+other "may you see what it printed?". A route applying only one is half-gated.
+
+**Owner resolution fails closed.** `workspace_operations` has no owning-agent
+column, so the owner is resolved through `heartbeatRunId → heartbeat_runs.agentId`.
+That edge is `onDelete: "set null"` and is never set by the POST runtime-command
+recorders, so an unresolvable owner is normal — and the captured output is then
+withheld from **every agent actor, including a `runs:read_transcript` grant
+holder**, because there is no owner for the grant to be about. Human operators
+keep the read. `issues.assigneeAgentId` is not an acceptable substitute for the
+run edge: assignees move.
+
+The two transcript routes deny differently, on purpose:
+
+- `/log` returns **403** with the decider's named boundary reason in the error
+  details. Its entire body is transcript, so there is nothing left to return.
+  A cross-tenant caller still gets the pre-existing **404** — that is the case
+  where the run's existence is itself the secret.
+- `/events` returns **200** with the event envelope (`seq`, `eventType`,
+  `stream`, `level`, `color`, `createdAt`) and `message` / `payload` set to
+  `null`, plus `withheldFields: ["message", "payload"]` so a client can tell
+  "not entitled" from "the event carried no content". `seq` — the pagination
+  cursor every consumer depends on — is always readable.
+
+Withholding on `/events` covers **every** event type rather than a classified
+subset. Adapters supply their own `eventType` string, and the in-repo
+`lifecycle` emitters already carry agent-written prose and adapter failure text,
+so a type allowlist would rest on a convention nothing enforces.
+
+### The live-event push channel
+
+The two routes above are **pull** paths. The same transcript content is also
+**pushed**, over the company live-event WebSocket
+(`GET /api/companies/:companyId/events/ws`), and it is scoped by the same
+decision — closing one and not the other would leave the highest-fidelity copy
+of the material on an ungated socket.
+
+Three of the eleven `LIVE_EVENT_TYPES` carry transcript content:
+
+| live event type | transcript-bearing keys |
+|---|---|
+| `heartbeat.run.log` | `chunk` |
+| `heartbeat.run.event` | `message`, `payload`, `lastAssistantSnippet` |
+| `heartbeat.run.progress` | `message`, `lastAssistantSnippet` |
+
+A subscriber receives **every** event; only those keys are nulled, and the
+payload then carries `withheldFields` — same contract as `/events`. A peer can
+still see that a run is producing output (`runId`, `seq`, `stream`, `phase`,
+`currentToolName`), which is state. `currentToolName` in particular stays
+readable, matching the REST projection that recomputes `currentStatusMessage`
+*from* it rather than nulling it.
+
+The filter matches on **key name, not event type**
+(`withholdLiveEventTranscriptContent`, `redaction.ts`). `LiveEventType` is a
+closed server-owned union, so a type allowlist would be sound today — but it
+would reopen silently the first time a twelfth type carried prose. Matching keys
+means a new type carrying `chunk` / `message` / `payload` /
+`lastAssistantSnippet` is withheld the day it is added, and widening is a
+deliberate act. State-only types (`heartbeat.run.status` and its `error`,
+`heartbeat.run.queued`, `agent.status`, `activity.logged`,
+`external_object.updated`) carry none of those keys and pass through untouched.
+
+The decision is memoized per socket, keyed on the run's owning agent. The
+staleness that buys is bounded and one-directional: a grant revoked mid-stream
+is not picked up until the socket reconnects, which is why the memo is scoped to
+a live connection rather than cached globally.
+
+**Not audited, deliberately.** The two pull routes emit an `activity_log` row per
+read. The push channel does not: it would emit one row per log chunk per
+subscriber, which is a different order of volume, and the audit already records
+the pull reads that a `denied` finding would be investigated through. Auditing
+the subscription rather than the event is the shape to reach for if this is ever
+needed.
+
+### Access auditing
+
+Both transcript routes emit a company-scoped `activity_log` entry for allowed
+and denied reads:
+
+| route | action |
+|---|---|
+| `GET /api/heartbeat-runs/:runId/log` | `heartbeat.run_log_accessed` |
+| `GET /api/heartbeat-runs/:runId/events` | `heartbeat.run_events_accessed` |
+| `GET /api/workspace-operations/:operationId/log` | `workspace_operation.log_accessed` |
+
+**All three actions exist and a consumer needs all three.** They are separately
+reachable paths over the same material; wiring an alert or digest to some and
+not the others reproduces the blindness that got this audit rejected as a
+standalone compensating control on PEN-3140. The workspace-operation path is the
+one that had *neither* half of the control pair — no gate and no audit — until
+PEN-3204; its row is keyed `entity_type = workspace_operation` and carries the
+operation's owning run in `runId`, plus `details.ownerAgentId`, where `null`
+records the fail-closed branch (decided with no resolvable owner).
+
+The audit row records the actor type/id, company id, heartbeat run id, timestamp
+(`activity_log.created_at`), access result, and the requested window (byte
+offset/limit for `/log`; `afterSeq`/`limit`/`eventCount` for `/events`), plus the
+log store type for `/log`. It deliberately does not record transcript content,
+log chunks, log references/paths, environment values, or credential material.
 
 Incident response can inspect these events through the company activity API or
-activity UI filtered by action/entity/run. Use `action = heartbeat.run_log_accessed`,
-`entity_type = heartbeat_run`, and `entity_id = <runId>` to isolate a run's access
-history. The event `details.result` value is `allowed` when content was eligible
-to be read and `denied` when the company access check rejected the request.
-Retention follows the deployment's normal `activity_log` database retention and
-backup policy; Paperclip does not currently apply a separate shorter retention
-window for these access-audit rows.
+activity UI filtered by action/entity/run. To isolate a run's access history,
+query all three actions above — the two run-transcript routes are keyed
+`entity_type = heartbeat_run` with `entity_id = <runId>`, while the
+workspace-operation route is keyed `entity_type = workspace_operation` with the
+owning run in `runId`. Querying only the `heartbeat_run` rows silently omits the
+workspace-operation path, which is the same partial-coverage blindness this
+section warns about immediately above. The event `details.result` value is `allowed` when content was
+eligible to be read and `denied` when an access check rejected the request —
+which now includes a same-company caller that lacks transcript entitlement, not
+only a cross-company one. Retention follows the deployment's normal
+`activity_log` database retention and backup policy; Paperclip does not
+currently apply a separate shorter retention window for these access-audit rows.
 
 - Default local key path: `~/.paperclip/instances/default/secrets/master.key`
 - Override key material directly: `PAPERCLIP_SECRETS_MASTER_KEY`
