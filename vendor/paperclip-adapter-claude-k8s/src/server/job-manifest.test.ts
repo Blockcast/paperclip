@@ -1822,6 +1822,57 @@ describe("buildJobManifest", () => {
       const init = job.spec?.template?.spec?.initContainers?.[0];
       expect(init?.env?.[0]?.name).toBe("PROMPT_CONTENT");
     });
+
+    // BLO-35720. Linux caps one execve env string at MAX_ARG_STRLEN = 32 *
+    // PAGE_SIZE = 131072 bytes including `NAME=` and the trailing NUL. Past
+    // that the init container's `sh -c` cannot exec (E2BIG) and the pod dies
+    // with a bare non-zero init exit naming neither the prompt nor its size.
+    // The threshold used to be 256 KiB — guarding the ~1 MiB PodSpec limit,
+    // which is not the binding one — so every prompt in the 128..256 KiB dead
+    // zone took the env path and failed 100% of the time.
+    const MAX_ARG_STRLEN = 32 * 4096;
+
+    it.each([
+      ["just under the exec limit", 120 * 1024],
+      ["the real BLO-35720 prompt size", 130_660],
+      ["just over the exec limit", 140 * 1024],
+      ["mid dead zone", 200 * 1024],
+      ["the old 256 KiB threshold", 256 * 1024],
+    ])("never emits an unexecable PROMPT_CONTENT env: %s (%i B)", (_label, size) => {
+      ctx.config = { promptTemplate: "x".repeat(size) };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const init = job.spec?.template?.spec?.initContainers?.[0];
+      const promptEnv = init?.env?.find((e: { name: string }) => e.name === "PROMPT_CONTENT");
+      if (!promptEnv) return; // took the Secret path — safe by construction
+      const envStringBytes = Buffer.byteLength(`PROMPT_CONTENT=${promptEnv.value ?? ""}`, "utf-8") + 1;
+      expect(envStringBytes).toBeLessThanOrEqual(MAX_ARG_STRLEN);
+    });
+
+    it("routes a dead-zone prompt to the Secret path, not the env var", () => {
+      // The failing agent-health fires carry a 130,660 B issue description,
+      // which is itself under the limit — it is the ~420-450 B of mandatory
+      // task-context preamble concatenated on top that crosses it. Model that
+      // sum: the first byte past MAX_ARG_STRLEN minus the `PROMPT_CONTENT=`
+      // prefix and NUL must already be on the Secret path.
+      const firstUnexecableSize = MAX_ARG_STRLEN - "PROMPT_CONTENT=".length - 1 + 1;
+      ctx.config = { promptTemplate: "x".repeat(firstUnexecableSize) };
+      const { promptSecret, job } = buildJobManifest({ ctx, selfPod });
+      expect(promptSecret).not.toBeNull();
+      const init = job.spec?.template?.spec?.initContainers?.[0];
+      expect(init?.env?.find((e: { name: string }) => e.name === "PROMPT_CONTENT")).toBeUndefined();
+    });
+
+    it("keeps the largest still-execable prompt on the cheaper env var path", () => {
+      // Guards the other direction: the fix must not push everything to
+      // Secrets. Exactly at the limit the env path is still correct.
+      const largestExecable = MAX_ARG_STRLEN - "PROMPT_CONTENT=".length - 1;
+      ctx.config = { promptTemplate: "x".repeat(largestExecable) };
+      const { promptSecret, job } = buildJobManifest({ ctx, selfPod });
+      expect(promptSecret).toBeNull();
+      const init = job.spec?.template?.spec?.initContainers?.[0];
+      const promptEnv = init?.env?.find((e: { name: string }) => e.name === "PROMPT_CONTENT");
+      expect(Buffer.byteLength(`PROMPT_CONTENT=${promptEnv?.value ?? ""}`, "utf-8") + 1).toBe(MAX_ARG_STRLEN);
+    });
   });
 
   describe("pod log file tailing", () => {
