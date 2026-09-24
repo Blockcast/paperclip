@@ -7639,6 +7639,136 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
   }, 20_000);
 
+  // A run killed mid-`git` leaves a 0-byte index.lock that git never reaps, which
+  // aborted the quarantine repair forever and parked the row on
+  // manual_repair_required (BLO-35981).
+  async function writeIndexLock(worktreePath: string, input: { body: string; ageMs: number }) {
+    const lockPath = await readGit(worktreePath, ["rev-parse", "--git-path", "index.lock"]);
+    await fs.writeFile(lockPath, input.body, "utf8");
+    const stamp = new Date(Date.now() - input.ageMs);
+    await fs.utimes(lockPath, stamp, stamp);
+    return lockPath;
+  }
+
+  it("breaks a stale 0-byte index lock and completes the dirty quarantine repair", async () => {
+    const expectedBranch = "PAP-468-recorded";
+    const actualBranch = "PAP-468-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-468",
+      claimant: "none",
+    });
+    const lockPath = await writeIndexLock(worktreePath, { body: "", ageMs: 21.5 * 60 * 60 * 1000 });
+
+    const restored = await restoreDirtyQuarantine({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      ids,
+    });
+
+    expect(restored?.branchName).toBe(expectedBranch);
+    expect(existsSync(lockPath)).toBe(false);
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(expectedBranch);
+    await expect(readGit(worktreePath, ["status", "--porcelain", "--untracked-files=all"])).resolves.toBe("");
+
+    // AC3: assert on recovered file *content*, not on the rescue branch existing.
+    const warning = restored?.warnings.find((entry) => entry.includes("dirty worktree state was quarantined"));
+    const rescueBranch = warning?.match(/"([^"]+)"/)?.[1] ?? "";
+    expect(rescueBranch).toMatch(/^paperclip\/rescue\/PAP-468\/\d{8}T\d{6}Z$/);
+    await expect(readGit(repoRoot, ["show", `${rescueBranch}:untracked.txt`])).resolves.toBe("dirty untracked work");
+    await expect(readGit(repoRoot, ["show", `${rescueBranch}:README.md`])).resolves.toContain("dirty tracked work");
+  }, 20_000);
+
+  it("refuses to break a non-empty index lock however stale it is", async () => {
+    const expectedBranch = "PAP-469-recorded";
+    const actualBranch = "PAP-469-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-469",
+      claimant: "none",
+    });
+    // Aged past the threshold so only the non-empty check can be what refuses.
+    const lockPath = await writeIndexLock(worktreePath, {
+      body: "in-flight index\n",
+      ageMs: 21.5 * 60 * 60 * 1000,
+    });
+    try {
+      await expect(restoreDirtyQuarantine({
+        repoRoot,
+        worktreePath,
+        expectedBranch,
+        actualBranch,
+        ids,
+      })).rejects.toMatchObject({
+        code: "workspace_validation_failed",
+        resultJson: {
+          workspaceValidation: expect.objectContaining({
+            safeRepair: expect.objectContaining({
+              attempted: true,
+              succeeded: false,
+              reason: expect.stringContaining("index contention"),
+            }),
+          }),
+        },
+      });
+      expect(existsSync(lockPath)).toBe(true);
+      await expect(fs.readFile(lockPath, "utf8")).resolves.toBe("in-flight index\n");
+    } finally {
+      await fs.rm(lockPath, { force: true });
+    }
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
+  }, 20_000);
+
+  it("refuses to break a 0-byte index lock that is newer than the staleness threshold", async () => {
+    const expectedBranch = "PAP-470-recorded";
+    const actualBranch = "PAP-470-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-470",
+      claimant: "none",
+    });
+    // Empty, so only the age check can be what refuses.
+    const lockPath = await writeIndexLock(worktreePath, { body: "", ageMs: 60_000 });
+    try {
+      await expect(restoreDirtyQuarantine({
+        repoRoot,
+        worktreePath,
+        expectedBranch,
+        actualBranch,
+        ids,
+      })).rejects.toMatchObject({
+        code: "workspace_validation_failed",
+        resultJson: {
+          workspaceValidation: expect.objectContaining({
+            safeRepair: expect.objectContaining({
+              attempted: true,
+              succeeded: false,
+              reason: expect.stringContaining("index contention"),
+            }),
+          }),
+        },
+      });
+      expect(existsSync(lockPath)).toBe(true);
+    } finally {
+      await fs.rm(lockPath, { force: true });
+    }
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
+  }, 20_000);
+
   it("best-effort restores the recorded branch when the rescue commit fails", async () => {
     const expectedBranch = "PAP-460-recorded";
     const actualBranch = "PAP-460-live";
