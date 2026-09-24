@@ -71,6 +71,18 @@ export type ApplyPendingMigrationsOptions = {
  * `max` as `explicit option > URL query param > PGMAX env > default`, so a
  * `?max=` in the connection string can no longer shrink the pool out from
  * under a caller that derived a bound from it.
+ *
+ * BLO-35946 asked whether 10 is still right after a second pool incident. It
+ * is, and deliberately so: that incident was not sizing. Both prior incidents
+ * were *starvation* — too many legitimate concurrent holders — and both are
+ * already bounded off this constant rather than in prose (see
+ * `derivePrReviewerWakeMaxConcurrency` above, and the sequential-pass latch at
+ * `server/src/index.ts`). BLO-35946 was *leakage*: nine of ten slots left the
+ * pool entirely via the `ended` queue, with `poolStats()` reporting `active=1`
+ * against 1505 waiters. A leak consumes whatever the pool is sized to, so no
+ * value of `max` would have prevented it — raising it would only have lengthened
+ * the runway before the same total stall. The fix is
+ * {@link POSTGRES_END_TIMEOUT_SECONDS}, which stops slots leaving at all.
  */
 export const POSTGRES_POOL_MAX = 10;
 
@@ -102,9 +114,79 @@ export const POSTGRES_POOL_MAX = 10;
  */
 export const POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS = 120_000;
 
+/**
+ * How long `Connection.end()` may wait for an in-flight query before it
+ * terminates the connection instead. Seconds, matching postgres.js's unit for
+ * every other timer option.
+ *
+ * This bound is the fix for BLO-35946, and it exists because `end()` is not
+ * reversible. Its first act is `onend()`, which moves the connection to the
+ * pool's `ended` queue — and `handler()` draws from `open`, `closed` and `busy`
+ * only, never `ended`. It then checks whether the connection is quiescent, and
+ * if a query is in flight it takes a branch that deliberately skips
+ * `terminate()` and waits. So the ordering is: leave the pool first, decide how
+ * to close second. A query that never completes makes that wait permanent, and
+ * the slot is gone until the process restarts — with the socket still open and
+ * the server-side backend orphaned.
+ *
+ * That is not hypothetical. On 2026-09-24, nine of ten slots left this pool
+ * that way between 01:00 and 03:15Z; `poolStats()` read `active=1` against 1505
+ * waiters, and company-wide agent dispatch ran on a single connection for two
+ * hours until an operator ran `pg_terminate_backend` by hand. No configured
+ * timeout could have reclaimed them: the backends sat in `active`/`ClientRead`
+ * mid extended-protocol, which `statement_timeout` does not arm against,
+ * {@link POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS} does not match, and TCP
+ * keepalive does not probe.
+ *
+ * 120s, rather than something tighter, because the cost of being wrong is
+ * asymmetric. Too tight kills a legitimately slow query that `end()` would
+ * otherwise have let finish; too loose only delays a reclaim that is already
+ * gated on {@link postgresMaxLifetimeSeconds}, so shaving it buys almost
+ * nothing. It matches the idle-in-transaction bound above for the same reason.
+ *
+ * Note what this does *not* do: it bounds the damage, not the trigger. What
+ * stalls a query mid-protocol is still unexplained (BLO-35940) — these
+ * connections had sent `Parse` and never sent `Bind`. This guarantees such a
+ * connection is reclaimed rather than lost, which is what makes the trigger
+ * survivable while it is still being hunted.
+ */
+export const POSTGRES_END_TIMEOUT_SECONDS = 120;
+
+/**
+ * Age at which a pooled connection is recycled, in seconds, randomised per
+ * connection.
+ *
+ * The band reproduces postgres.js's own default exactly. It is restated here
+ * only because BLO-35946 asked for it to be readable rather than inherited: the
+ * default is a *function* the driver calls once per connection, so nothing in
+ * this repo previously said what the recycle age was, and the incident review
+ * had to read it out of the vendored library.
+ *
+ * Deliberately not shortened. Recycling is what eventually calls `end()` on a
+ * connection whose query has stalled, so with {@link POSTGRES_END_TIMEOUT_SECONDS}
+ * in place it is now the *self-heal* path rather than the leak path. Tightening
+ * it would reclaim a stalled slot sooner, but every recycle is a reconnect with
+ * an empty prepared-statement cache, and the leading theory for the BLO-35946
+ * trigger is a race in the describe-first path a cold cache forces. Until that
+ * is settled, more reconnect churn is as likely to cause stalls as to clear
+ * them, so this keeps the rate where it has been.
+ */
+export function postgresMaxLifetimeSeconds(): number {
+  return 30 * 60 + Math.random() * 30 * 60;
+}
+
 export function createDb(url: string) {
   const sql = postgres(url, {
     max: POSTGRES_POOL_MAX,
+    // Both are read by the vendored `patches/postgres@3.4.9.patch`.
+    // `end_timeout` is added by that patch and so is absent from the shipped
+    // typings; `max_lifetime` is typed as a number but the driver accepts (and
+    // defaults to) a function it calls once per connection, which is what makes
+    // the age per-connection rather than shared.
+    ...({
+      max_lifetime: postgresMaxLifetimeSeconds,
+      end_timeout: POSTGRES_END_TIMEOUT_SECONDS,
+    } as object),
     // Sent in the startup packet, so it applies to every connection this pool
     // opens — including ones created later to refill the pool. postgres.js
     // filters falsy startup parameters out entirely, so a `0` here would ship

@@ -1,8 +1,18 @@
 diff --git a/cf/src/connection.js b/cf/src/connection.js
-index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..8270fd86c878884802c5472231f93396a02fb327 100644
+index 8e79170..e3a7314 100644
 --- a/cf/src/connection.js
 +++ b/cf/src/connection.js
-@@ -254,6 +254,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -77,6 +77,9 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+       , idleTimer = timer(end, options.idle_timeout)
+       , lifeTimer = timer(end, options.max_lifetime)
+       , connectTimer = timer(connectTimedOut, options.connect_timeout)
++      // BLO-35946: bounds the wait in `end()` below. Declared here so it
++      // shares the cancel points of the other per-connection timers.
++      , endTimer = timer(endTimedOut, options.end_timeout)
+ 
+   let socket = null
+     , cancelMessage
+@@ -254,6 +257,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
    }
  
    function nextWrite(fn) {
@@ -20,8 +30,56 @@ index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..8270fd86c878884802c5472231f93396
      const x = socket.write(chunk, fn)
      nextWriteTimer !== null && clearImmediate(nextWriteTimer)
      chunk = nextWriteTimer = null
+@@ -265,6 +279,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     socket.destroy()
+   }
+ 
++  // BLO-35946: `end()` has already handed this connection to the pool's
++  // `ended` queue, which `handler()` never draws from -- so the slot is gone
++  // until the connection closes. Waiting unbounded for an in-flight query
++  // that never completes therefore loses the slot permanently. `terminate()`
++  // rejects the stuck query and resolves the `ended` promise; `destroy()`
++  // then forces the 'close' event, because `terminate()` only sends a FIN
++  // and a wedged peer may never answer it. `closed()` -> `onclose` puts the
++  // connection back in the pool's `closed` queue, where it reconnects on
++  // demand. That is the same recovery path a server-side
++  // `pg_terminate_backend` produced when this was mitigated by hand.
++  function endTimedOut() {
++    terminate()
++    socket && socket.destroy()
++  }
++
+   async function secure() {
+     if (sslnegotiation !== 'direct') {
+       write(SSLRequest)
+@@ -417,12 +446,16 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+       !connection.reserved && onend(connection),
+       !connection.reserved && !initial && !query && sent.length === 0
+         ? (terminate(), new Promise(r => socket && socket.readyState !== 'closed' ? socket.once('close', r) : r()))
+-        : ending = new Promise(r => ended = r)
++        // BLO-35946: this branch deliberately skips `terminate()` while a
++        // query is in flight, but `onend()` above has *already* moved the
++        // connection out of the pool. Bound the wait so it cannot be forever.
++        : (endTimer.start(), ending = new Promise(r => ended = r))
+     )
+   }
+ 
+   function terminate() {
+     terminated = true
++    endTimer.cancel()
+     if (stream || query || initial || sent.length)
+       error(Errors.connection('CONNECTION_DESTROYED', options))
+ 
+@@ -445,6 +478,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     idleTimer.cancel()
+     lifeTimer.cancel()
+     connectTimer.cancel()
++    endTimer.cancel()
+ 
+     socket.removeAllListeners()
+     socket = null
 diff --git a/cf/src/index.js b/cf/src/index.js
-index ffbe7aef075d6037c540cbd5e8f7e298d4345cc3..af2f3aa8e75697602375b0d6ba26f6ad60c5e5ba 100644
+index ffbe7ae..76f35ed 100644
 --- a/cf/src/index.js
 +++ b/cf/src/index.js
 @@ -75,6 +75,18 @@ function Postgres(a, b) {
@@ -43,11 +101,42 @@ index ffbe7aef075d6037c540cbd5e8f7e298d4345cc3..af2f3aa8e75697602375b0d6ba26f6ad
      reserve,
      listen,
      begin,
+@@ -445,7 +457,7 @@ function parseOptions(a, b) {
+   'timeout' in o && (console.log('The timeout option is deprecated, use idle_timeout instead'), o.idle_timeout = o.timeout) // eslint-disable-line
+   query.sslrootcert === 'system' && (query.ssl = 'verify-full')
+ 
+-  const ints = ['idle_timeout', 'connect_timeout', 'max_lifetime', 'max_pipeline', 'backoff', 'keep_alive']
++  const ints = ['idle_timeout', 'connect_timeout', 'max_lifetime', 'max_pipeline', 'backoff', 'keep_alive', 'end_timeout']
+   const defaults = {
+     max             : globalThis.Cloudflare ? 3 : 10,
+     ssl             : false,
+@@ -453,6 +465,11 @@ function parseOptions(a, b) {
+     idle_timeout    : null,
+     connect_timeout : 30,
+     max_lifetime    : max_lifetime,
++    // BLO-35946: seconds `Connection.end()` may wait for an in-flight query
++    // before terminating the connection instead. Defaulted rather than left
++    // opt-in so a pool built somewhere that forgets to pass it still cannot
++    // leak a slot; `createDb` sets it explicitly so the value is readable.
++    end_timeout     : 120,
+     max_pipeline    : 100,
+     backoff         : backoff,
+     keep_alive      : 60,
 diff --git a/cjs/src/connection.js b/cjs/src/connection.js
-index 07f6716702ac888215c86ad6e0071aaf55ae519c..0ac92ecf452d68276c169ee2c4d29005c04cbf64 100644
+index 07f6716..22a708b 100644
 --- a/cjs/src/connection.js
 +++ b/cjs/src/connection.js
-@@ -252,6 +252,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -75,6 +75,9 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+       , idleTimer = timer(end, options.idle_timeout)
+       , lifeTimer = timer(end, options.max_lifetime)
+       , connectTimer = timer(connectTimedOut, options.connect_timeout)
++      // BLO-35946: bounds the wait in `end()` below. Declared here so it
++      // shares the cancel points of the other per-connection timers.
++      , endTimer = timer(endTimedOut, options.end_timeout)
+ 
+   let socket = null
+     , cancelMessage
+@@ -252,6 +255,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
    }
  
    function nextWrite(fn) {
@@ -65,8 +154,56 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..0ac92ecf452d68276c169ee2c4d29005
      const x = socket.write(chunk, fn)
      nextWriteTimer !== null && clearImmediate(nextWriteTimer)
      chunk = nextWriteTimer = null
+@@ -263,6 +277,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     socket.destroy()
+   }
+ 
++  // BLO-35946: `end()` has already handed this connection to the pool's
++  // `ended` queue, which `handler()` never draws from -- so the slot is gone
++  // until the connection closes. Waiting unbounded for an in-flight query
++  // that never completes therefore loses the slot permanently. `terminate()`
++  // rejects the stuck query and resolves the `ended` promise; `destroy()`
++  // then forces the 'close' event, because `terminate()` only sends a FIN
++  // and a wedged peer may never answer it. `closed()` -> `onclose` puts the
++  // connection back in the pool's `closed` queue, where it reconnects on
++  // demand. That is the same recovery path a server-side
++  // `pg_terminate_backend` produced when this was mitigated by hand.
++  function endTimedOut() {
++    terminate()
++    socket && socket.destroy()
++  }
++
+   async function secure() {
+     if (sslnegotiation !== 'direct') {
+       write(SSLRequest)
+@@ -415,12 +444,16 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+       !connection.reserved && onend(connection),
+       !connection.reserved && !initial && !query && sent.length === 0
+         ? (terminate(), new Promise(r => socket && socket.readyState !== 'closed' ? socket.once('close', r) : r()))
+-        : ending = new Promise(r => ended = r)
++        // BLO-35946: this branch deliberately skips `terminate()` while a
++        // query is in flight, but `onend()` above has *already* moved the
++        // connection out of the pool. Bound the wait so it cannot be forever.
++        : (endTimer.start(), ending = new Promise(r => ended = r))
+     )
+   }
+ 
+   function terminate() {
+     terminated = true
++    endTimer.cancel()
+     if (stream || query || initial || sent.length)
+       error(Errors.connection('CONNECTION_DESTROYED', options))
+ 
+@@ -443,6 +476,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     idleTimer.cancel()
+     lifeTimer.cancel()
+     connectTimer.cancel()
++    endTimer.cancel()
+ 
+     socket.removeAllListeners()
+     socket = null
 diff --git a/cjs/src/index.js b/cjs/src/index.js
-index f09c61c7e998f411560b95c9a8e1ed6a97972c11..2dd06f4e865a094ea2b9cc1ff085bedd877c4fd5 100644
+index f09c61c..109e870 100644
 --- a/cjs/src/index.js
 +++ b/cjs/src/index.js
 @@ -74,6 +74,18 @@ function Postgres(a, b) {
@@ -88,11 +225,42 @@ index f09c61c7e998f411560b95c9a8e1ed6a97972c11..2dd06f4e865a094ea2b9cc1ff085bedd
      reserve,
      listen,
      begin,
+@@ -444,7 +456,7 @@ function parseOptions(a, b) {
+   'timeout' in o && (console.log('The timeout option is deprecated, use idle_timeout instead'), o.idle_timeout = o.timeout) // eslint-disable-line
+   query.sslrootcert === 'system' && (query.ssl = 'verify-full')
+ 
+-  const ints = ['idle_timeout', 'connect_timeout', 'max_lifetime', 'max_pipeline', 'backoff', 'keep_alive']
++  const ints = ['idle_timeout', 'connect_timeout', 'max_lifetime', 'max_pipeline', 'backoff', 'keep_alive', 'end_timeout']
+   const defaults = {
+     max             : globalThis.Cloudflare ? 3 : 10,
+     ssl             : false,
+@@ -452,6 +464,11 @@ function parseOptions(a, b) {
+     idle_timeout    : null,
+     connect_timeout : 30,
+     max_lifetime    : max_lifetime,
++    // BLO-35946: seconds `Connection.end()` may wait for an in-flight query
++    // before terminating the connection instead. Defaulted rather than left
++    // opt-in so a pool built somewhere that forgets to pass it still cannot
++    // leak a slot; `createDb` sets it explicitly so the value is readable.
++    end_timeout     : 120,
+     max_pipeline    : 100,
+     backoff         : backoff,
+     keep_alive      : 60,
 diff --git a/src/connection.js b/src/connection.js
-index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..657f98fc9d37f585a359f593ca09ec35336f3bbc 100644
+index 1b1cccd..4ed530e 100644
 --- a/src/connection.js
 +++ b/src/connection.js
-@@ -252,6 +252,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -75,6 +75,9 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+       , idleTimer = timer(end, options.idle_timeout)
+       , lifeTimer = timer(end, options.max_lifetime)
+       , connectTimer = timer(connectTimedOut, options.connect_timeout)
++      // BLO-35946: bounds the wait in `end()` below. Declared here so it
++      // shares the cancel points of the other per-connection timers.
++      , endTimer = timer(endTimedOut, options.end_timeout)
+ 
+   let socket = null
+     , cancelMessage
+@@ -252,6 +255,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
    }
  
    function nextWrite(fn) {
@@ -110,8 +278,56 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..657f98fc9d37f585a359f593ca09ec35
      const x = socket.write(chunk, fn)
      nextWriteTimer !== null && clearImmediate(nextWriteTimer)
      chunk = nextWriteTimer = null
+@@ -263,6 +277,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     socket.destroy()
+   }
+ 
++  // BLO-35946: `end()` has already handed this connection to the pool's
++  // `ended` queue, which `handler()` never draws from -- so the slot is gone
++  // until the connection closes. Waiting unbounded for an in-flight query
++  // that never completes therefore loses the slot permanently. `terminate()`
++  // rejects the stuck query and resolves the `ended` promise; `destroy()`
++  // then forces the 'close' event, because `terminate()` only sends a FIN
++  // and a wedged peer may never answer it. `closed()` -> `onclose` puts the
++  // connection back in the pool's `closed` queue, where it reconnects on
++  // demand. That is the same recovery path a server-side
++  // `pg_terminate_backend` produced when this was mitigated by hand.
++  function endTimedOut() {
++    terminate()
++    socket && socket.destroy()
++  }
++
+   async function secure() {
+     if (sslnegotiation !== 'direct') {
+       write(SSLRequest)
+@@ -415,12 +444,16 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+       !connection.reserved && onend(connection),
+       !connection.reserved && !initial && !query && sent.length === 0
+         ? (terminate(), new Promise(r => socket && socket.readyState !== 'closed' ? socket.once('close', r) : r()))
+-        : ending = new Promise(r => ended = r)
++        // BLO-35946: this branch deliberately skips `terminate()` while a
++        // query is in flight, but `onend()` above has *already* moved the
++        // connection out of the pool. Bound the wait so it cannot be forever.
++        : (endTimer.start(), ending = new Promise(r => ended = r))
+     )
+   }
+ 
+   function terminate() {
+     terminated = true
++    endTimer.cancel()
+     if (stream || query || initial || sent.length)
+       error(Errors.connection('CONNECTION_DESTROYED', options))
+ 
+@@ -443,6 +476,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     idleTimer.cancel()
+     lifeTimer.cancel()
+     connectTimer.cancel()
++    endTimer.cancel()
+ 
+     socket.removeAllListeners()
+     socket = null
 diff --git a/src/index.js b/src/index.js
-index c7fba3dace20173f4cb13f3f138bb6d213b43683..46512f83209e6d8cf611ded0d0e223fe3015167e 100644
+index c7fba3d..23c08d5 100644
 --- a/src/index.js
 +++ b/src/index.js
 @@ -74,6 +74,18 @@ function Postgres(a, b) {
@@ -133,3 +349,24 @@ index c7fba3dace20173f4cb13f3f138bb6d213b43683..46512f83209e6d8cf611ded0d0e223fe
      reserve,
      listen,
      begin,
+@@ -444,7 +456,7 @@ function parseOptions(a, b) {
+   'timeout' in o && (console.log('The timeout option is deprecated, use idle_timeout instead'), o.idle_timeout = o.timeout) // eslint-disable-line
+   query.sslrootcert === 'system' && (query.ssl = 'verify-full')
+ 
+-  const ints = ['idle_timeout', 'connect_timeout', 'max_lifetime', 'max_pipeline', 'backoff', 'keep_alive']
++  const ints = ['idle_timeout', 'connect_timeout', 'max_lifetime', 'max_pipeline', 'backoff', 'keep_alive', 'end_timeout']
+   const defaults = {
+     max             : globalThis.Cloudflare ? 3 : 10,
+     ssl             : false,
+@@ -452,6 +464,11 @@ function parseOptions(a, b) {
+     idle_timeout    : null,
+     connect_timeout : 30,
+     max_lifetime    : max_lifetime,
++    // BLO-35946: seconds `Connection.end()` may wait for an in-flight query
++    // before terminating the connection instead. Defaulted rather than left
++    // opt-in so a pool built somewhere that forgets to pass it still cannot
++    // leak a slot; `createDb` sets it explicitly so the value is readable.
++    end_timeout     : 120,
+     max_pipeline    : 100,
+     backoff         : backoff,
+     keep_alive      : 60,

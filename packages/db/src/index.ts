@@ -3,6 +3,8 @@ export {
   createDbFromPostgresClient,
   POSTGRES_POOL_MAX,
   POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+  POSTGRES_END_TIMEOUT_SECONDS,
+  postgresMaxLifetimeSeconds,
   readInheritedTimeoutSettings,
   formatInheritedTimeoutSettings,
   type InheritedTimeoutSetting,
