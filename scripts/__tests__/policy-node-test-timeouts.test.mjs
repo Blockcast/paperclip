@@ -78,6 +78,14 @@ function policyJobCap(region = jobRegion("policy")) {
   return cap;
 }
 
+test("policy keeps headroom for cold checkout and setup", () => {
+  const cap = policyJobCap();
+  assert.ok(
+    cap >= 20,
+    `policy needs at least a 20m cap for cold full-depth checkout plus setup; found ${cap}m`,
+  );
+});
+
 function stepName(step) {
   return step.split("\n")[0].trim();
 }
