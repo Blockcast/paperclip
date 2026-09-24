@@ -44,6 +44,22 @@ export function shouldReportCancelledRun({ merged, isInMergeQueue }) {
   return !merged && !isInMergeQueue;
 }
 
+// BLO-28886 asks the ejection signal to NAME the failing shard. Without it the
+// comment says "inspect the merge-group jobs", i.e. it re-hands the lookup back
+// to the reader -- and the whole point of this reporter is that a queue-branch
+// failure is invisible from the PR, so that lookup is exactly the expensive bit.
+//
+// No name-filtering of aggregator jobs (`verify`): a name allowlist rots on the
+// next workflow rename, and one extra job name costs a reader nothing.
+export function failingJobSummary(jobs) {
+  const failed = (Array.isArray(jobs) ? jobs : [])
+    .filter((job) => job?.conclusion === "failure" || job?.conclusion === "cancelled")
+    .map((job) => job.name)
+    .filter((name) => typeof name === "string" && name.length > 0);
+  if (failed.length === 0) return "";
+  return ` Failing ${failed.length === 1 ? "job" : "jobs"}: ${failed.map((name) => `\`${name}\``).join(", ")}.`;
+}
+
 async function githubRequest(path, options = {}) {
   const response = await fetch(`https://api.github.com${path}`, {
     ...options,
@@ -118,7 +134,21 @@ export async function reportMergeQueueFailure({ repository, headBranch, conclusi
   }
 
   const outcome = conclusion === "failure" ? "failed" : "was cancelled (a job timeout surfaces this way)";
-  const body = `${marker}\nMerge-queue ejection detected for PR #${number}. The merge-group run ${outcome} and GitHub may have removed the PR from the queue and dropped auto-merge. Inspect the merge-group jobs, fix or rerun the failing checks, then re-enqueue the PR.\n\nRun: ${runUrl}`;
+  // Best-effort: a failure here must NOT lose the ejection report. Losing the
+  // shard name degrades the comment; losing the comment leaves a stuck PR
+  // silent, which is the failure this whole script exists to prevent.
+  // One unpaginated page (default `filter=latest`, so a re-run's older attempts
+  // are excluded). Ceiling: a workflow past 100 jobs truncates -- 17 today.
+  let summary = "";
+  try {
+    const { jobs } = await githubRequest(
+      `/repos/${owner}/${repo}/actions/runs/${runId}/jobs?per_page=100`,
+    );
+    summary = failingJobSummary(jobs);
+  } catch (error) {
+    console.warn(`Could not read jobs for run ${runId}: ${error.message}`);
+  }
+  const body = `${marker}\nMerge-queue ejection detected for PR #${number}. The merge-group run ${outcome} and GitHub may have removed the PR from the queue and dropped auto-merge.${summary} Inspect the merge-group jobs, fix or rerun the failing checks, then re-enqueue the PR.\n\nRun: ${runUrl}`;
   await githubRequest(`/repos/${owner}/${repo}/issues/${number}/comments`, {
     method: "POST",
     headers: { "content-type": "application/json" },

@@ -4,6 +4,7 @@ import {
   mergeQueuePullRequestNumber,
   shouldReportMergeQueueFailure,
   shouldReportCancelledRun,
+  failingJobSummary,
 } from "../report-merge-queue-ejection.mjs";
 
 test("extracts PR numbers from merge-group synthetic refs", () => {
@@ -36,4 +37,29 @@ test("a cancelled run is reported only when the PR is neither merged nor still q
   assert.equal(shouldReportCancelledRun({ merged: true, isInMergeQueue: false }), false);
   // Still queued for a re-build: not ejected.
   assert.equal(shouldReportCancelledRun({ merged: false, isInMergeQueue: true }), false);
+});
+
+test("the ejection comment names the failing shards", () => {
+  // Shape taken from the real run that ejected #1962 (35871782486): the
+  // aggregator `verify` fails alongside the shard, and is deliberately kept.
+  assert.equal(
+    failingJobSummary([
+      { name: "General tests (workspaces-a)", conclusion: "failure" },
+      { name: "General tests (server 1/4)", conclusion: "success" },
+      { name: "verify", conclusion: "failure" },
+    ]),
+    " Failing jobs: `General tests (workspaces-a)`, `verify`.",
+  );
+  // A job killed by `timeout-minutes` surfaces as cancelled, and that is the
+  // class pr.yml deliberately trades a fast red for -- so it must be named too.
+  assert.equal(
+    failingJobSummary([{ name: "General tests (server 4/4)", conclusion: "cancelled" }]),
+    " Failing job: `General tests (server 4/4)`.",
+  );
+  // Empty, not a dangling "Failing jobs:", when the jobs read gave nothing
+  // usable -- the comment must still read as a sentence. Covers the
+  // best-effort catch path, which passes no jobs at all.
+  assert.equal(failingJobSummary([{ name: "verify", conclusion: "success" }]), "");
+  assert.equal(failingJobSummary([]), "");
+  assert.equal(failingJobSummary(undefined), "");
 });
