@@ -1,5 +1,5 @@
 diff --git a/cf/src/connection.js b/cf/src/connection.js
-index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..cdd36b6594d9fdf986556da4514a44e0a44f955a 100644
+index 8e79170..041aa2e 100644
 --- a/cf/src/connection.js
 +++ b/cf/src/connection.js
 @@ -77,6 +77,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
@@ -28,7 +28,7 @@ index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..cdd36b6594d9fdf986556da4514a44e0
      const x = socket.write(chunk, fn)
      nextWriteTimer !== null && clearImmediate(nextWriteTimer)
      chunk = nextWriteTimer = null
-@@ -417,15 +429,40 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -417,16 +429,48 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
        !connection.reserved && onend(connection),
        !connection.reserved && !initial && !query && sent.length === 0
          ? (terminate(), new Promise(r => socket && socket.readyState !== 'closed' ? socket.once('close', r) : r()))
@@ -66,12 +66,32 @@ index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..cdd36b6594d9fdf986556da4514a44e0
      if (stream || query || initial || sent.length)
        error(Errors.connection('CONNECTION_DESTROYED', options))
  
+-    clearImmediate(nextWriteTimer)
 +    closeTimer.cancel()
-     clearImmediate(nextWriteTimer)
++    // BLO-35946: `write()` only schedules a flush when `nextWriteTimer === null`,
++    // so a cleared-but-non-null handle strands every later sub-1024-byte write.
++    // `clearImmediate` does not null the handle, and the `Connection` object is
++    // reused across reconnects -- so the next connection's StartupMessage was
++    // buffered and never sent, and any bytes still in `chunk` were prepended to
++    // it. Reset both. See postgres-connection-close-race.test.ts.
++    nextWriteTimer !== null && clearImmediate(nextWriteTimer)
++    chunk = nextWriteTimer = null
      if (socket) {
        socket.removeListener('data', data)
-@@ -442,6 +479,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
-     clearImmediate(nextWriteTimer)
+       socket.removeListener('connect', connected)
+@@ -439,9 +483,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     incoming = Buffer.alloc(0)
+     remaining = 0
+     incomings = null
+-    clearImmediate(nextWriteTimer)
++    // BLO-35946: `write()` only schedules a flush when `nextWriteTimer === null`,
++    // so a cleared-but-non-null handle strands every later sub-1024-byte write.
++    // `clearImmediate` does not null the handle, and the `Connection` object is
++    // reused across reconnects -- so the next connection's StartupMessage was
++    // buffered and never sent, and any bytes still in `chunk` were prepended to
++    // it. Reset both. See postgres-connection-close-race.test.ts.
++    nextWriteTimer !== null && clearImmediate(nextWriteTimer)
++    chunk = nextWriteTimer = null
      socket.removeListener('data', data)
      socket.removeListener('connect', connected)
 +    closeTimer.cancel()
@@ -79,7 +99,7 @@ index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..cdd36b6594d9fdf986556da4514a44e0
      lifeTimer.cancel()
      connectTimer.cancel()
 diff --git a/cf/src/index.js b/cf/src/index.js
-index ffbe7aef075d6037c540cbd5e8f7e298d4345cc3..2560ab4662167edcea7fe001d06fbdf75ee8ec72 100644
+index ffbe7ae..2560ab4 100644
 --- a/cf/src/index.js
 +++ b/cf/src/index.js
 @@ -75,6 +75,18 @@ function Postgres(a, b) {
@@ -122,7 +142,7 @@ index ffbe7aef075d6037c540cbd5e8f7e298d4345cc3..2560ab4662167edcea7fe001d06fbdf7
      max_pipeline    : 100,
      backoff         : backoff,
 diff --git a/cjs/src/connection.js b/cjs/src/connection.js
-index 07f6716702ac888215c86ad6e0071aaf55ae519c..d919e6caca7e425823a2cdbd29df69d3af8a6488 100644
+index 07f6716..2d53bfd 100644
 --- a/cjs/src/connection.js
 +++ b/cjs/src/connection.js
 @@ -75,6 +75,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
@@ -151,7 +171,7 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..d919e6caca7e425823a2cdbd29df69d3
      const x = socket.write(chunk, fn)
      nextWriteTimer !== null && clearImmediate(nextWriteTimer)
      chunk = nextWriteTimer = null
-@@ -415,15 +427,40 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -415,16 +427,48 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
        !connection.reserved && onend(connection),
        !connection.reserved && !initial && !query && sent.length === 0
          ? (terminate(), new Promise(r => socket && socket.readyState !== 'closed' ? socket.once('close', r) : r()))
@@ -189,12 +209,32 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..d919e6caca7e425823a2cdbd29df69d3
      if (stream || query || initial || sent.length)
        error(Errors.connection('CONNECTION_DESTROYED', options))
  
+-    clearImmediate(nextWriteTimer)
 +    closeTimer.cancel()
-     clearImmediate(nextWriteTimer)
++    // BLO-35946: `write()` only schedules a flush when `nextWriteTimer === null`,
++    // so a cleared-but-non-null handle strands every later sub-1024-byte write.
++    // `clearImmediate` does not null the handle, and the `Connection` object is
++    // reused across reconnects -- so the next connection's StartupMessage was
++    // buffered and never sent, and any bytes still in `chunk` were prepended to
++    // it. Reset both. See postgres-connection-close-race.test.ts.
++    nextWriteTimer !== null && clearImmediate(nextWriteTimer)
++    chunk = nextWriteTimer = null
      if (socket) {
        socket.removeListener('data', data)
-@@ -440,6 +477,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
-     clearImmediate(nextWriteTimer)
+       socket.removeListener('connect', connected)
+@@ -437,9 +481,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     incoming = Buffer.alloc(0)
+     remaining = 0
+     incomings = null
+-    clearImmediate(nextWriteTimer)
++    // BLO-35946: `write()` only schedules a flush when `nextWriteTimer === null`,
++    // so a cleared-but-non-null handle strands every later sub-1024-byte write.
++    // `clearImmediate` does not null the handle, and the `Connection` object is
++    // reused across reconnects -- so the next connection's StartupMessage was
++    // buffered and never sent, and any bytes still in `chunk` were prepended to
++    // it. Reset both. See postgres-connection-close-race.test.ts.
++    nextWriteTimer !== null && clearImmediate(nextWriteTimer)
++    chunk = nextWriteTimer = null
      socket.removeListener('data', data)
      socket.removeListener('connect', connected)
 +    closeTimer.cancel()
@@ -202,7 +242,7 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..d919e6caca7e425823a2cdbd29df69d3
      lifeTimer.cancel()
      connectTimer.cancel()
 diff --git a/cjs/src/index.js b/cjs/src/index.js
-index f09c61c7e998f411560b95c9a8e1ed6a97972c11..6d92cce05dee675855eba5b48f206d9f8c387b67 100644
+index f09c61c..6d92cce 100644
 --- a/cjs/src/index.js
 +++ b/cjs/src/index.js
 @@ -74,6 +74,18 @@ function Postgres(a, b) {
@@ -245,7 +285,7 @@ index f09c61c7e998f411560b95c9a8e1ed6a97972c11..6d92cce05dee675855eba5b48f206d9f
      max_pipeline    : 100,
      backoff         : backoff,
 diff --git a/src/connection.js b/src/connection.js
-index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..50e6a362989e1359cfabead2427e4e5eea62e052 100644
+index 1b1cccd..db82760 100644
 --- a/src/connection.js
 +++ b/src/connection.js
 @@ -75,6 +75,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
@@ -274,7 +314,7 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..50e6a362989e1359cfabead2427e4e5e
      const x = socket.write(chunk, fn)
      nextWriteTimer !== null && clearImmediate(nextWriteTimer)
      chunk = nextWriteTimer = null
-@@ -415,15 +427,40 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -415,16 +427,48 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
        !connection.reserved && onend(connection),
        !connection.reserved && !initial && !query && sent.length === 0
          ? (terminate(), new Promise(r => socket && socket.readyState !== 'closed' ? socket.once('close', r) : r()))
@@ -312,12 +352,32 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..50e6a362989e1359cfabead2427e4e5e
      if (stream || query || initial || sent.length)
        error(Errors.connection('CONNECTION_DESTROYED', options))
  
+-    clearImmediate(nextWriteTimer)
 +    closeTimer.cancel()
-     clearImmediate(nextWriteTimer)
++    // BLO-35946: `write()` only schedules a flush when `nextWriteTimer === null`,
++    // so a cleared-but-non-null handle strands every later sub-1024-byte write.
++    // `clearImmediate` does not null the handle, and the `Connection` object is
++    // reused across reconnects -- so the next connection's StartupMessage was
++    // buffered and never sent, and any bytes still in `chunk` were prepended to
++    // it. Reset both. See postgres-connection-close-race.test.ts.
++    nextWriteTimer !== null && clearImmediate(nextWriteTimer)
++    chunk = nextWriteTimer = null
      if (socket) {
        socket.removeListener('data', data)
-@@ -440,6 +477,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
-     clearImmediate(nextWriteTimer)
+       socket.removeListener('connect', connected)
+@@ -437,9 +481,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     incoming = Buffer.alloc(0)
+     remaining = 0
+     incomings = null
+-    clearImmediate(nextWriteTimer)
++    // BLO-35946: `write()` only schedules a flush when `nextWriteTimer === null`,
++    // so a cleared-but-non-null handle strands every later sub-1024-byte write.
++    // `clearImmediate` does not null the handle, and the `Connection` object is
++    // reused across reconnects -- so the next connection's StartupMessage was
++    // buffered and never sent, and any bytes still in `chunk` were prepended to
++    // it. Reset both. See postgres-connection-close-race.test.ts.
++    nextWriteTimer !== null && clearImmediate(nextWriteTimer)
++    chunk = nextWriteTimer = null
      socket.removeListener('data', data)
      socket.removeListener('connect', connected)
 +    closeTimer.cancel()
@@ -325,7 +385,7 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..50e6a362989e1359cfabead2427e4e5e
      lifeTimer.cancel()
      connectTimer.cancel()
 diff --git a/src/index.js b/src/index.js
-index c7fba3dace20173f4cb13f3f138bb6d213b43683..29b30c82994173104576aec430c4e95ba3de6537 100644
+index c7fba3d..29b30c8 100644
 --- a/src/index.js
 +++ b/src/index.js
 @@ -74,6 +74,18 @@ function Postgres(a, b) {
