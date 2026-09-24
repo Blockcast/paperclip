@@ -4016,45 +4016,59 @@ export function issueRoutes(
 
     if (superseded.length === 0) return;
 
-    // One notice per batch, not per interaction: several asks dying on one
-    // comment is a single event and N comments would be noise.
-    const killedBy = superseded.find((item) => item.commentId)?.commentId ?? null;
-    const lines = superseded.map((item) => {
-      const title = item.title?.trim();
-      return `- \`${item.kind}\` \`${item.id}\`${title ? ` — ${title}` : ""}`;
-    });
+    // One notice per killing comment, not per interaction and not per sweep.
+    // Several asks dying on one comment is a single event, but a catchup batch
+    // can span several comments (each ask dies on the earliest human comment
+    // after its own createdAt), and each notice names the comment it cites.
+    const byKillingComment = new Map<string | null, typeof superseded>();
+    for (const item of superseded) {
+      const group = byKillingComment.get(item.commentId);
+      if (group) group.push(item);
+      else byKillingComment.set(item.commentId, [item]);
+    }
 
-    const body = [
-      "**Pending ask expired — superseded by a comment.**",
-      "",
-      superseded.length === 1
-        ? "This interaction was waiting for a human answer and has been expired unanswered:"
-        : `These ${superseded.length} interactions were waiting for a human answer and have been expired unanswered:`,
-      ...lines,
-      "",
-      killedBy
-        ? `Expired by comment \`${killedBy}\`, because the ask carried \`supersedeOnUserComment: true\` — which is the default when the field is omitted.`
-        : "Expired by a user comment, because the ask carried `supersedeOnUserComment: true` — which is the default when the field is omitted.",
-      "",
-      "**No answer was recorded.** If this gate still needs one, create a fresh interaction with `supersedeOnUserComment: false` so unrelated thread traffic cannot expire it again.",
-    ].join("\n");
+    for (const [killedBy, group] of byKillingComment) {
+      const lines = group.map((item) => {
+        const title = item.title?.trim();
+        return `- \`${item.kind}\` \`${item.id}\`${title ? ` — ${title}` : ""}`;
+      });
 
-    try {
-      await svc.addComment(
-        input.issue.id,
-        body,
-        { agentId: input.actor.agentId ?? undefined, runId: input.actor.runId },
-        {
-          authorType: "system",
-          // The supersession sweep is guarded on `authorUserId`, which a system
-          // comment does not have, so this notice cannot itself supersede
-          // anything. The key keeps a retried effect from double-posting.
-          idempotencyKey: killedBy ? `interaction-superseded:${killedBy}` : null,
-        },
-      );
-    } catch (error) {
-      // A missing notice must not roll back the expiry that already committed.
-      logger.error({ err: error, issueId: input.issue.id }, "failed to post interaction supersession notice");
+      const body = [
+        "**Pending ask expired — superseded by a comment.**",
+        "",
+        group.length === 1
+          ? "This interaction was waiting for a human answer and has been expired unanswered:"
+          : `These ${group.length} interactions were waiting for a human answer and have been expired unanswered:`,
+        ...lines,
+        "",
+        killedBy
+          ? `Expired by comment \`${killedBy}\`, because the ask carried \`supersedeOnUserComment: true\` — which is the default when the field is omitted.`
+          : "Expired by a user comment, because the ask carried `supersedeOnUserComment: true` — which is the default when the field is omitted.",
+        "",
+        "**No answer was recorded.** If this gate still needs one, create a fresh interaction with `supersedeOnUserComment: false` so unrelated thread traffic cannot expire it again.",
+      ].join("\n");
+
+      try {
+        await svc.addComment(
+          input.issue.id,
+          body,
+          // `authorType: "system"` is rejected for any actor carrying an
+          // agentId or userId, so pass the run alone (as the monitor
+          // convergence notice does). Who triggered the sweep is already on
+          // the expiry (`resolvedBy*`) and on its activity_log row.
+          { runId: input.actor.runId },
+          {
+            authorType: "system",
+            // The supersession sweep is guarded on `authorUserId`, which a system
+            // comment does not have, so this notice cannot itself supersede
+            // anything. The key keeps a retried effect from double-posting.
+            idempotencyKey: killedBy ? `interaction-superseded:${killedBy}` : null,
+          },
+        );
+      } catch (error) {
+        // A missing notice must not roll back the expiry that already committed.
+        logger.error({ err: error, issueId: input.issue.id }, "failed to post interaction supersession notice");
+      }
     }
   }
 
