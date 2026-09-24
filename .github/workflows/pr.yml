@@ -497,7 +497,10 @@ jobs:
         # fails this suite. A guard with no failing mutation is a comment — add
         # the mutation before you trust the fixture. Last swept 2026-09-23 after
         # BLO-34835 (victim widened to `failure`, in-flight `""` fence): 17/17
-        # dead_runs()+verdicts()+extract() mutations killed at this head. On
+        # dead_runs()+verdicts()+extract() mutations killed at this head.
+        # require_sha's `*[!0-9a-f]*` arm (merge-gate-read.sh:73) was unkilled
+        # until the 40-non-hex fixture was added; dropping `sort -n` (:222) and
+        # `-k4,4` (:236) are equivalent mutations, not unkilled guards. On
         # 2026-09-19 two had survived and were caught by sweeping
         # rather than by reading — an inert `newest_pass != ""` (deleted) and an
         # unpinned max-tracking term (fixture added). Re-run the sweep when you
