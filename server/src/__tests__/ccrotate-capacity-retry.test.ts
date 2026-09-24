@@ -470,6 +470,9 @@ describe("capacity floor ceiling is writer-independent (BLO-28919)", () => {
           provider: "anthropic",
           model: "claude-opus-4-1",
           reason: "ccrotate_capacity",
+          // penstockProbePath is written only when probePath is set, so the
+          // fixture must pass it or the completeness loop below fails.
+          probePath: "capacity",
           retryAfterSeconds: 3834,
           advertisedResumeAtIso: new Date(NOW.getTime() + 3 * 24 * 60 * 60 * 1000).toISOString(),
           clampedFromIso: new Date(NOW.getTime() + 3 * 24 * 60 * 60 * 1000).toISOString(),
@@ -512,6 +515,9 @@ describe("capacity floor ceiling is writer-independent (BLO-28919)", () => {
           provider: "anthropic",
           model: "claude-opus-4-1",
           reason: "ccrotate_capacity",
+          // penstockProbePath is written only when probePath is set, so the
+          // fixture must pass it or the completeness loop below fails.
+          probePath: "capacity",
           retryAfterSeconds: 3834,
           advertisedResumeAtIso: new Date(NOW.getTime() + 3 * 24 * 60 * 60 * 1000).toISOString(),
           clampedFromIso: new Date(NOW.getTime() + 3 * 24 * 60 * 60 * 1000).toISOString(),
