@@ -930,23 +930,17 @@ describe("BLO-20650 concurrent webhook + sweep on one alert-state record", () =>
       // Let it run right up to its state write. Bounded, so a change to the
       // webhook's shape fails this test rather than hanging it.
       for (let i = 0; i < 1000 && !reachedStateWrite; i++) await Promise.resolve();
-      expect(reachedStateWrite).toBe(true);
       return [{ principalType: "user", principalId: "board-1", status: "active", membershipRole: "owner" }];
     });
 
-    try {
-      await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
-    } catch (err) {
-      // The webhook is still parked on the gate. Release it and swallow its
-      // rejection here only, so an unhandled rejection cannot outlive this test
-      // and mask the sweep's real failure. On the success path below it is
-      // awaited normally, so a genuine webhook rejection still surfaces.
-      releaseStateWrite();
-      await webhook?.catch(() => {});
-      throw err;
-    }
+    // The sweep catches and logs a per-issue failure (runAlertEscalationSweep),
+    // so an assertion inside the members.list mock would be swallowed there.
+    // Assert the ordering out here instead, after the webhook is released and
+    // awaited: a webhook rejection surfaces first, then the ordering guard.
+    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
     releaseStateWrite();
     await webhook;
+    expect(reachedStateWrite).toBe(true);
 
     // The swap SUCCEEDED here — this is deliberately not the compensated
     // branch, which is what makes it a distinct case from the test above.
