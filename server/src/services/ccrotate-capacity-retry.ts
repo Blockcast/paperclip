@@ -256,6 +256,15 @@ const CCROTATE_CAPACITY_DECISION_KEYS = [
 ] as const;
 
 /**
+ * The subset a retry-now override clears: the `penstock*` provenance keys, but
+ * NOT the two floors. Derived from the list above so the two cannot drift. See
+ * {@link clearCcrotateCapacityDecision} for why the floors must survive.
+ */
+const CCROTATE_CAPACITY_OVERRIDE_KEYS = CCROTATE_CAPACITY_DECISION_KEYS.filter(
+  (key) => key !== "retryNotBefore" && key !== "transientRetryNotBefore",
+);
+
+/**
  * When the *current* capacity deferral chain began, ISO-8601. Set once, then
  * carried forward unchanged across every re-defer (BLO-28919).
  *
@@ -348,6 +357,7 @@ export function isCapacityGovernedRetryFloor(resultJson: unknown): boolean {
  */
 export const CCROTATE_CAPACITY_RESULT_KEYS = {
   clearedOnRedefer: CCROTATE_CAPACITY_DECISION_KEYS,
+  clearedOnOverride: CCROTATE_CAPACITY_OVERRIDE_KEYS,
   carriedAcrossRedefer: CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY,
 } as const;
 
@@ -393,14 +403,43 @@ export interface CcrotateCapacityDecision {
  * can trust that every `penstock*` field describes the park the row currently
  * holds.
  */
+/**
+ * Drop every capacity *decision* key from a `result_json`, keeping the chain
+ * origin (`CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY`) and everything unrelated.
+ *
+ * This is the first half of `applyCcrotateCapacityDecision`, split out for the
+ * one writer that invalidates a park without replacing it: `retryScheduledRetryNow`
+ * books `scheduled_retry_at` to `now` on a live parked row. After that write the
+ * advertised resume instant, the retry-after figure and the clamp provenance all
+ * describe a park the row no longer holds, and any reader that trusts them --
+ * the overdue gauge in `queued-run-age-metrics.ts` computes
+ * `greatest(scheduled_retry_at, penstockAdvertisedResumeAt)` -- would keep
+ * honouring a provider horizon a human has just overridden (BLO-34782 review).
+ * Clearing at the write restores the invariant the docblock above promises:
+ * every `penstock*` field describes the park the row currently holds.
+ *
+ * Retry-now passes `CCROTATE_CAPACITY_RESULT_KEYS.clearedOnOverride`, which
+ * keeps `retryNotBefore`/`transientRetryNotBefore`: the `capacityDrivenTransientPark`
+ * conjunct in `promoteScheduledRetryRun` (heartbeat.ts, via
+ * `readTransientRetryNotBeforeFromRun`) reads them, and dropping them lets a
+ * `transient_failure` capacity park promote with no capacity re-probe (BLO-28919).
+ */
+export function clearCcrotateCapacityDecision(
+  previous: Record<string, unknown>,
+  keys: readonly string[] = CCROTATE_CAPACITY_DECISION_KEYS,
+): Record<string, unknown> {
+  const next: Record<string, unknown> = { ...previous };
+  for (const key of keys) {
+    delete next[key];
+  }
+  return next;
+}
+
 export function applyCcrotateCapacityDecision(
   previous: Record<string, unknown>,
   decision: CcrotateCapacityDecision,
 ): Record<string, unknown> {
-  const next: Record<string, unknown> = { ...previous };
-  for (const key of CCROTATE_CAPACITY_DECISION_KEYS) {
-    delete next[key];
-  }
+  const next = clearCcrotateCapacityDecision(previous);
   // Set once, then carried forward untouched. See the key's docblock: re-seeding
   // this on each hop would stop the wall-clock horizon from ever elapsing.
   //

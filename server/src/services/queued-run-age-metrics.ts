@@ -1,4 +1,4 @@
-import { and, eq, isNotNull, lt, sql } from "drizzle-orm";
+import { and, eq, isNotNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, heartbeatRuns } from "@paperclipai/db";
 import {
@@ -75,6 +75,68 @@ export async function refreshQueuedRunAgeMetrics(db: Db, now = new Date()): Prom
 }
 
 /**
+ * The instant a parked retry is genuinely due (BLO-34782): the LATER of the
+ * booked `scheduled_retry_at` and the resume instant the provider advertised.
+ *
+ * A `ccrotate_capacity` park does not book what the provider asked for. The
+ * scheduler *clamps* it — `CCROTATE_CAPACITY_MAX_PARK_MS` caps the horizon at
+ * 15 minutes — so a pool that will not serve until 3.5 days out is booked to
+ * re-probe in ~15 minutes. Fifteen minutes later the row satisfies
+ * `scheduled_retry_at < now()` and keeps satisfying it for the entire
+ * remaining quota window, while the run is still, correctly, backing off.
+ * That defeats BLO-22094's own acceptance criterion ("a run that is merely
+ * backing off contributes nothing") in intent while meeting it in letter, and
+ * it does so fleet-wide at once: one shared quota bucket means every agent
+ * clamps together. Measured 2026-09-20, 13 of 16 capacity parks were "overdue"
+ * and five separate episodes put 10-14 agents over threshold simultaneously.
+ *
+ * Taking the later of the two restores the intent without trading away the
+ * detector. A capacity park still contributes once it runs past the instant
+ * the provider itself advertised -- which is the wedged promotion path this
+ * gauge exists to catch, not the clamp working as designed. Every other park
+ * reason writes no `penstockAdvertisedResumeAt`, so `greatest` (which ignores
+ * NULLs) collapses to the bare due time and their arithmetic is unchanged.
+ *
+ * Note the asymmetry this creates, because it is not obvious: the advertised
+ * instant is persisted *unclamped*, so the suppression window is
+ * provider-controlled even though the *booked* park deliberately distrusts it
+ * (`CCROTATE_CAPACITY_MAX_PARK_MS` exists because a long advertised horizon is
+ * not credible enough to schedule against). A provider returning an
+ * implausible resume instant therefore silences this gauge for that row until
+ * it passes. The backstop is `CAPACITY_ESCALATION_AFTER_MS`, which ends
+ * the chain on wall-clock regardless of what was advertised; the park itself
+ * also stays visible on `paperclipListParkedAgents`, which is non-paging.
+ *
+ * The regex guard is deliberate, and so is its failure direction. Both
+ * `result_json` writers of this field go through
+ * `applyCcrotateCapacityDecision` and emit `Date.toISOString()`, so anything
+ * else is corrupt. The one write that invalidates the field without replacing
+ * it, `retryScheduledRetryNow` booking `scheduled_retry_at` to `now`, clears it
+ * through `clearCcrotateCapacityDecision` in the same statement, so a due time
+ * an actor forced cannot be out-voted here by a provider horizon that no longer
+ * describes the row. An unparseable value degrades to the pre-BLO-34782 reading
+ * (the row stays eligible and may page) rather than to silence. A detector
+ * that fails loud is recoverable; one that fails quiet is the
+ * invisible-strand mode this metric was built to remove.
+ *
+ * Scope bound, so nobody reads the exclusion as total: a third write site puts
+ * the key in `context_snapshot`, not `result_json` (`heartbeat.ts:34311`), and
+ * `coalescePendingTaskScopeWake` merges only `context_snapshot`. So a capacity
+ * denial coalesced onto an existing park leaves the advertised instant
+ * invisible to this query and the row keeps counting -- failing loud, the
+ * right direction, and the likely reason 11 of 46 parks in the BLO-34782 live
+ * sample carried no `result_json` key at all.
+ */
+const effectiveRetryDueAt = sql`greatest(
+  ${heartbeatRuns.scheduledRetryAt},
+  case
+    when ${heartbeatRuns.resultJson}->>'penstockAdvertisedResumeAt'
+         ~ '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?Z$'
+    then (${heartbeatRuns.resultJson}->>'penstockAdvertisedResumeAt')::timestamptz
+  end
+)`;
+
+/**
  * Refresh the per-agent oldest-overdue-`scheduled_retry`-row-age gauge
  * (BLO-22094). {@link refreshQueuedRunAgeMetrics} above only ever sees
  * `status='queued'` rows -- a parked retry is `status: "scheduled_retry"`, a
@@ -86,11 +148,12 @@ export async function refreshQueuedRunAgeMetrics(db: Db, now = new Date()): Prom
  *
  * Ages off `scheduled_retry_at`, not `created_at`: a parked row's `due` time
  * is what a wedged promotion path fails to act on, and that is what an
- * on-call reader needs to see overrun. Only rows already past due
- * (`scheduled_retry_at < now`) count -- a run still backing off toward a
- * future due time is working as designed and must contribute nothing, or
- * this gauge would page on ordinary retry backoff instead of a stuck
- * promotion sweep.
+ * on-call reader needs to see overrun. Only rows already past due count -- a
+ * run still backing off toward a future due time is working as designed and
+ * must contribute nothing, or this gauge would page on ordinary retry backoff
+ * instead of a stuck promotion sweep. "Past due" reads
+ * {@link effectiveRetryDueAt}, not the bare column, because a capacity-clamped
+ * park books a due time far nearer than the one it is actually waiting on.
  *
  * Same "query every agent id, reset-then-set" shape as
  * {@link refreshQueuedRunAgeMetrics} so an agent with no overdue parked row
@@ -111,10 +174,23 @@ export async function refreshOverdueScheduledRetryAgeMetrics(db: Db, now = new D
       db
         .select({
           agentId: heartbeatRuns.agentId,
-          oldestDueAt: sql<Date | string | null>`min(${heartbeatRuns.scheduledRetryAt})`,
+          oldestDueAt: sql<Date | string | null>`min(${effectiveRetryDueAt})`,
         })
         .from(heartbeatRuns)
-        .where(and(eq(heartbeatRuns.status, "scheduled_retry"), lt(heartbeatRuns.scheduledRetryAt, now)))
+        .where(
+          and(
+            eq(heartbeatRuns.status, "scheduled_retry"),
+            // Kept explicit. `greatest` ignores NULLs, so without this a row
+            // with a null due time but a past advertised resume would start
+            // contributing where `scheduled_retry_at < now` had excluded it.
+            isNotNull(heartbeatRuns.scheduledRetryAt),
+            // `now.toISOString()`, not the bare Date: drizzle's `lt()` helper
+            // applies the column's type mapper, but a raw `sql` fragment binds
+            // the value straight through and postgres.js cannot serialize a
+            // Date there (ERR_INVALID_ARG_TYPE at bind time).
+            sql`${effectiveRetryDueAt} < ${now.toISOString()}::timestamptz`,
+          ),
+        )
         .groupBy(heartbeatRuns.agentId),
     ]);
 

@@ -460,10 +460,12 @@ import {
   jitterTransientRetryFloor,
   isCapacityGovernedRetryFloor,
   applyCcrotateCapacityDecision,
+  clearCcrotateCapacityDecision,
   resolveCapacityEscalation,
   resolveRoutineScopedRetry,
   CAPACITY_ESCALATION_AFTER_MS,
   CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY,
+  CCROTATE_CAPACITY_RESULT_KEYS,
   TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS,
 } from "./ccrotate-capacity-retry.js";
 import {
@@ -21162,6 +21164,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       retryNowRequestedByActorType: input.actor?.actorType ?? null,
       retryNowRequestedByActorId: input.actor?.actorId ?? null,
     };
+    // Booking the due time to `now` invalidates whatever capacity decision
+    // parked this row: the advertised resume instant, retry-after figure and
+    // clamp provenance in `result_json` now describe a park the row no longer
+    // holds. Clear them in the same write so no reader keeps honouring a
+    // provider horizon an actor has just overridden -- the overdue gauge takes
+    // `greatest(scheduled_retry_at, penstockAdvertisedResumeAt)` and would
+    // otherwise go silent on exactly the row a human is watching (BLO-34782).
+    // The chain origin is deliberately kept: it bounds the whole deferral chain
+    // on wall clock and a retry-now is not the start of a new chain. The
+    // retryNotBefore/transientRetryNotBefore floors are kept too, on purpose:
+    // promoteScheduledRetryRun's capacityDrivenTransientPark conjunct reads them,
+    // so clearing them would promote a transient_failure capacity park with no
+    // promotion-time capacity re-probe (BLO-28919).
+    // A non-object `result_json` (jsonb array or scalar) is skipped exactly as
+    // null is: `parseObject` would flatten it to `{}`, and since this is the
+    // only path that writes the column here, that would *replace* the row's
+    // value rather than clear keys from it. No writer produces that shape today.
+    const resultJson = isPlainObject(scheduled.run.resultJson)
+      ? clearCcrotateCapacityDecision(
+          scheduled.run.resultJson,
+          CCROTATE_CAPACITY_RESULT_KEYS.clearedOnOverride,
+        )
+      : undefined;
 
     const updated = await db.transaction(async (tx) => {
       const row = await tx
@@ -21169,6 +21194,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .set({
           scheduledRetryAt: now,
           contextSnapshot,
+          ...(resultJson === undefined ? {} : { resultJson }),
           updatedAt: now,
         })
         .where(and(eq(heartbeatRuns.id, scheduled.run.id), eq(heartbeatRuns.status, "scheduled_retry")))
