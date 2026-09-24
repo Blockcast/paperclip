@@ -483,11 +483,10 @@ describe("NewIssueDialog", () => {
       description: "## Acceptance criteria\n\n- Observable result",
     };
     const { root } = renderDialog(container);
-    await flush();
 
     const submitButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Task"));
-    expectSubmitEnabled(submitButton);
+    await waitForAssertion(() => expectSubmitEnabled(submitButton));
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
@@ -725,14 +724,15 @@ describe("NewIssueDialog", () => {
     };
 
     const { root } = renderDialog(container);
-    await flush();
-
-    const planningButton = container.querySelector('[data-issue-work-mode="planning"]');
-    expect(planningButton?.className).toContain("bg-accent");
 
     const submitButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Task"));
-    expectSubmitEnabled(submitButton);
+    await waitForAssertion(() => {
+      expect(container.querySelector('[data-issue-work-mode="planning"]')?.className).toContain(
+        "bg-accent",
+      );
+      expectSubmitEnabled(submitButton);
+    });
 
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -757,14 +757,15 @@ describe("NewIssueDialog", () => {
     };
 
     const { root } = renderDialog(container);
-    await flush();
-
-    const askButton = container.querySelector('[data-issue-work-mode="ask"]');
-    expect(askButton?.className).toContain("bg-accent");
 
     const submitButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Task"));
-    expectSubmitEnabled(submitButton);
+    await waitForAssertion(() => {
+      expect(container.querySelector('[data-issue-work-mode="ask"]')?.className).toContain(
+        "bg-accent",
+      );
+      expectSubmitEnabled(submitButton);
+    });
 
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
