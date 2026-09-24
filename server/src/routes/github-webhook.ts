@@ -80,6 +80,7 @@ import {
   type ListPrReviewsForAttestation,
 } from "../services/pr-review-head-attestation.js";
 import {
+  extractAllyPriorFindingDispositions,
   hasActionablePrReviewFeedback,
   hasAllyConsolidatedReviewHeading,
 } from "../services/ally-review-detection.js";
@@ -905,14 +906,72 @@ function commentsContainBackLinkMarker(bodies: string[]): boolean {
 // Self-review PR non-convergence escalation (BLO-13353 (b)).
 const DEFAULT_SELF_REVIEW_ESCALATION_THRESHOLD = 3;
 
-// Self-review = the PR was authored by the reviewer bot itself, so the bot's
-// "review" is a self-review that can't formally request changes. Detected by
-// comparing the signed-webhook PR author login to the configured reviewer bot.
-function isSelfReviewedPr(context: ResolvedEventContext, reviewerBotLogin: string | null): boolean {
+// Self-review = the PR was authored by the reviewer LANE itself, so the
+// "review" has no independent party in it and cannot break its own loop.
+//
+// BLO-35909: this used to be login equality alone — `prAuthorLogin ===
+// reviewerBotLogin` — and on this fleet that predicate carries no signal at
+// all. Every agent pushes through the same `allyblockcast[bot]` GitHub App, so
+// EVERY agent-authored PR has that author login and every Ally review has that
+// reviewer login. The comparison was therefore true for every agent PR Ally
+// ever reviewed, self-review or ordinary peer review alike, and the escalation
+// below then suppressed the author's wake on all of them (onprem-k8s#3647 /
+// BLO-34284: 8 commits, zero authored by Ally, escalated as a self-review).
+// Same trap as `merged_by: null` and the foreign-commit notice's inverted
+// author-login check: a shared identity is not evidence of authorship.
+//
+// The lane is the discriminating signal. `assigneeAgentId` is the lane that
+// owns the work — the one the reopen above is about to wake — and
+// `reviewerAgentIds` is the configured reviewer pool. A genuine self-review is
+// the two coinciding. Chosen over the git-author-email instrument
+// (selectForeignCommits) because it needs no GitHub call on the webhook path
+// and answers the same question.
+//
+// Login equality is KEPT as a precondition rather than replaced: it is what
+// still excludes a human-authored PR on a reviewer lane's issue, and it is what
+// keeps an unset `reviewerBotLogin` an off-switch for the whole feature.
+//
+// Every unknown fails CLOSED (returns false, i.e. not a self-review). The harm
+// being guarded is suppression of the author's wake, so "cannot tell" must
+// leave the author woken.
+function isSelfReviewedPr(
+  context: ResolvedEventContext,
+  reviewerBotLogin: string | null,
+  lanes: { assigneeAgentId: string | null; reviewerAgentIds: readonly string[] },
+): boolean {
   if (!reviewerBotLogin) return false;
   const author = context.prAuthorLogin;
   if (!author) return false;
-  return normalizeGithubLogin(author) === normalizeGithubLogin(reviewerBotLogin);
+  if (normalizeGithubLogin(author) !== normalizeGithubLogin(reviewerBotLogin)) return false;
+  if (!lanes.assigneeAgentId) return false;
+  return lanes.reviewerAgentIds.includes(lanes.assigneeAgentId);
+}
+
+// Whether this review's prior-finding ledger asserts that a finding an earlier
+// round already raised is STILL PRESENT — the convergence signal (BLO-35909).
+//
+// The escalation below used to fire on round count alone, and a round count
+// cannot tell a loop from progress: three rounds of disjoint, shrinking
+// findings is convergence, and was escalated as "cycled 3 times without
+// converging". Ally's own ledger already answers the question it was guessing
+// at — `still-present` blocks, `fixed`/`no-longer-applicable` retire — and
+// extractAllyPriorFindingDispositions is the single parse point for it.
+//
+// No ledger entry means no positive evidence of re-raising, so no escalation.
+// That is the same fail-closed direction as isSelfReviewedPr: an unprovable
+// loop keeps waking the author, which is recoverable; a wrongly-suppressed wake
+// is not.
+function bodyReRaisesPriorFinding(body: string | null | undefined): boolean {
+  return extractAllyPriorFindingDispositions(body).some((entry) => entry.kind === "blocks");
+}
+
+// Read from the resolve-time classification, which parsed the RAW body, for the
+// same reason isActionableReviewFeedbackContext does: `reviewBody`/`commentBody`
+// on the context are clamped, and a ledger past the clamp boundary would read
+// as "no finding re-raised" — failing in the suppressing direction. The
+// fallback only serves synthetic contexts that never went through a producer.
+function reRaisesPriorFinding(context: ResolvedEventContext): boolean {
+  return context.reviewReRaisesPriorFinding ?? bodyReRaisesPriorFinding(prFeedbackBody(context));
 }
 
 // Count prior actionable-feedback reopen cycles on this (issue, PR). Each call to
@@ -965,6 +1024,11 @@ interface ResolvedEventContext {
   // clamped for heartbeat context size, but a findings heading can occur
   // after the clamp boundary (as in frr#61 review 4968003838).
   reviewHasActionableFeedback?: boolean;
+  // BLO-35909: whether this review's prior-finding ledger asserts a finding
+  // from an earlier head is `still-present`. Classified at resolve time off the
+  // RAW body, for the same clamp reason reviewHasActionableFeedback is.
+  // Undefined on contexts no producer built; see reRaisesPriorFinding.
+  reviewReRaisesPriorFinding?: boolean;
   reviewState?: string | null;
   // pull_request_review.submitted only — the numeric GitHub review id.
   // Preferred over reviewUrl for the feedback-comment dedupe key (BLO-19497):
@@ -1559,6 +1623,8 @@ function resolveEventContextRaw(
         eventUrl: commentUrl ?? prUrl,
         commentId: (comment?.id as number | undefined) ?? null,
         commentBody: clampReviewBody(commentBody),
+        // Classified off the RAW comment body, before clampReviewBody above.
+        reviewReRaisesPriorFinding: bodyReRaisesPriorFinding(commentBody),
         commentAuthorLogin,
         prAuthorLogin: (issueUser?.login as string | undefined) ?? null,
         commentUrl,
@@ -1616,6 +1682,7 @@ function resolveEventContextRaw(
         prAuthorLogin: collected.authorLogin,
         reviewBody,
         reviewHasActionableFeedback: hasActionablePrReviewFeedback(rawReviewBody, reviewState),
+        reviewReRaisesPriorFinding: bodyReRaisesPriorFinding(rawReviewBody),
         reviewState,
         reviewId,
         reviewAuthorLogin,
@@ -6177,10 +6244,23 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         // actionable reopen cycles on a PR authored by the reviewer bot, hand
         // the issue up the chain of command instead of re-waking the author.
         // Best-effort — a failure here must never break the wake path.
+        //
+        // BLO-35909: BOTH load-bearing clauses of that sentence are tested
+        // here, and neither used to be. "self-reviewed" is now a lane
+        // comparison rather than login equality on a fleet-shared App
+        // identity, and "non-convergence" is now Ally's own `still-present`
+        // ledger assertion rather than a bare round count. Each is
+        // independently sufficient to suppress the escalation, because each
+        // being false makes the escalation's own `nextAction` text a false
+        // statement about the PR.
         if (
           reopen.reopened &&
           context.prNumber !== null &&
-          isSelfReviewedPr(context, config.prReviewerBotLogin ?? null)
+          reRaisesPriorFinding(context) &&
+          isSelfReviewedPr(context, config.prReviewerBotLogin ?? null, {
+            assigneeAgentId: effectiveAssigneeAgentId,
+            reviewerAgentIds: configuredPrReviewerAgentIds(config),
+          })
         ) {
           try {
             const cycles = await countPrReviewFeedbackCycles(
@@ -6560,6 +6640,7 @@ export const __test_buildIssueBackLinkBody = buildIssueBackLinkBody;
 export const __test_commentsContainBackLinkMarker = commentsContainBackLinkMarker;
 export const __test_backLinkAbsoluteUrl = backLinkAbsoluteUrl;
 export const __test_isSelfReviewedPr = isSelfReviewedPr;
+export const __test_bodyReRaisesPriorFinding = bodyReRaisesPriorFinding;
 export const __test_resolvePrCommentReviewGateWebhookTrigger = resolvePrCommentReviewGateWebhookTrigger;
 export const __test_readReviewGateEscalationHeadSha = readReviewGateEscalationHeadSha;
 export const __test_isActionablePrReviewComment = isActionablePrReviewComment;
