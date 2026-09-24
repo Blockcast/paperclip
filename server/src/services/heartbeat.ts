@@ -422,6 +422,7 @@ import {
   recordHeartbeatTimerSchedulerExclusion,
   recordHeartbeatPostTerminalRunEventDropped,
   recordHeartbeatTimerTick,
+  recordRetryScheduleOutcome,
   recordConcurrentRunBlocked,
   recordHeartbeatRunFailed,
   recordOrphanedManagedPodReaped,
@@ -20096,7 +20097,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { outcome: "promoted", run: promoted };
   }
 
-  async function scheduleBoundedRetryForRun(
+  async function scheduleBoundedRetryForRunUninstrumented(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
     opts?: {
@@ -21020,6 +21021,46 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       attempt: schedule.attempt,
       maxAttempts: schedule.maxAttempts,
     };
+  }
+
+  /**
+   * BLO-35472: instrumentation seam over the implementation above.
+   *
+   * A wrapper rather than an `inc()` at each of the seven return statements,
+   * because the property that matters is that *no* return path can escape the
+   * counter -- including one added later by someone who has not read this
+   * comment. The abandon path is the reason: it deliberately persists no retry
+   * row, so if its increment is ever missed there is nothing left in the
+   * database to reconstruct the decision from, and a regression that silently
+   * drops every retry looks the same as the backoff clamp working.
+   *
+   * The metric failing must never fail a retry, so the increment is swallowed.
+   */
+  async function scheduleBoundedRetryForRun(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+    opts?: {
+      now?: Date;
+      random?: () => number;
+      retryReason?: string;
+      wakeReason?: string;
+      maxAttempts?: number;
+      delayMs?: number;
+    },
+  ) {
+    const result = await scheduleBoundedRetryForRunUninstrumented(run, agent, opts);
+    try {
+      recordRetryScheduleOutcome({
+        // `not_scheduled` is reported as its errorCode: the coarse outcome
+        // would collapse routine abandonment into the same series as an issue
+        // reassignment, which is the distinction this metric exists to make.
+        outcome: result.outcome === "not_scheduled" ? result.errorCode : result.outcome,
+        retryReason: opts?.retryReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON,
+      });
+    } catch (err) {
+      logger.warn({ err, runId: run.id }, "failed to record retry schedule outcome metric");
+    }
+    return result;
   }
 
   async function scheduleInteractionContinuationInfrastructureRetryIfEligible(
