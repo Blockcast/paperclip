@@ -1,4 +1,5 @@
 import { afterAll } from "vitest";
+import { drainReactScheduler } from "./src/lib/drainReactScheduler";
 
 const storageEntries = new Map<string, string>();
 
@@ -41,16 +42,11 @@ if (typeof Element !== "undefined" && typeof Element.prototype.scrollIntoView !=
   Element.prototype.scrollIntoView = function scrollIntoView() {};
 }
 
-// React 19 schedules a passive-effect flush after every commit with passive
-// flags (a flushSync unmount in afterEach included), and that scheduler task
-// reads `window.event` before anything else. If a jsdom file finishes and the
-// environment is torn down before the task runs, it throws "window is not
-// defined" as an unhandled error and turns an all-green workspaces-a run red
-// (BLO-23426; merge groups 35903530339, 35993984182). Setup-file hooks run
-// last, so draining a few macrotasks here lets that work finish while jsdom
-// is still installed.
+// A scheduler task React left behind (see drainReactScheduler) that fires after
+// jsdom is torn down throws "window is not defined" as an unhandled error and
+// turns an all-green workspaces-a run red (BLO-23426; merge groups 35903530339,
+// 35993984182). After-hooks run in reverse registration order, so this one runs
+// after every test file's own hooks and before the environment goes away.
 if (typeof window !== "undefined") {
-  afterAll(async () => {
-    for (let i = 0; i < 3; i++) await new Promise((resolve) => setImmediate(resolve));
-  });
+  afterAll(drainReactScheduler);
 }
