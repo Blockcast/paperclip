@@ -189,6 +189,21 @@ describe("hasStillPresentDisposition", () => {
     // constant every line-anchored gate pattern shares.
     const tsNotIndented = tsSource.match(/NOT_INDENTED_CODE = String\.raw`([^`]+)`/);
     assert.ok(tsNotIndented, "ally-review-detection.ts still defines NOT_INDENTED_CODE");
+    // Bind the constant itself, not only the subset of it this corpus can
+    // reach: the ledger pattern's ` {0,3}` already rejects a tab before the
+    // `-`, so dropping the tab half from the gate's copy left every row below
+    // green, while REVIEWED_HEAD_ATTESTATION_PATTERN (which shares it) would
+    // then attest a head from a tab-indented line.
+    const mjsNotIndented = readFileSync(
+      new URL("./check-ally-review-consistency.mjs", import.meta.url),
+      "utf8",
+    ).match(/NOT_INDENTED_CODE = String\.raw`([^`]+)`/);
+    assert.ok(mjsNotIndented, "check-ally-review-consistency.mjs still defines NOT_INDENTED_CODE");
+    assert.equal(
+      tsNotIndented[1],
+      mjsNotIndented[1],
+      "NOT_INDENTED_CODE must not drift between the gate and this auditor",
+    );
     const tsRaw = tsSource.match(
       /PRIOR_FINDING_DISPOSITION_PATTERN = new RegExp\(\n\s*String\.raw`([^`]+)`,\n\s*"gim",/,
     );
@@ -271,9 +286,10 @@ describe("attestedHead", () => {
     // The converse check: the widening has a direction, and accepting a line
     // the gate rejects is the same divergence one delimiter out. The gate
     // bounds the run between emphasis and the label at `[ \t]{0,3}`, and
-    // treats four leading spaces as indented code.
+    // treats four leading spaces, or a tab, as indented code.
     assert.equal(attestedHead(`**    Reviewed head:** \`${HEAD}\``), null);
     assert.equal(attestedHead(`    Reviewed head: ${HEAD}`), null);
+    assert.equal(attestedHead(`\tReviewed head: ${HEAD}`), null);
   });
 
   it("returns null when no attestation is present", () => {
