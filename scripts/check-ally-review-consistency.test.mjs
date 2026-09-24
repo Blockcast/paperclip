@@ -669,6 +669,31 @@ describe("I1 names the mechanism a same-lane duplicate implies", () => {
     assert.match(violations.find((v) => v.startsWith("I2a")) ?? "", /APPROVED but its body reports a Critical\/Important finding/);
   });
 
+  for (const order of ["approval first", "blocker first"]) {
+    it(`fires I2e when a clean App APPROVED coexists with a different blocking App review (${order})`, () => {
+      // The BLO-19778 shape across two reviews with DIFFERENT states: the
+      // approval's own body is clean, so I2a cannot see the blocker, and the
+      // I1 supersession exemption lets both stand.
+      const approval = appReview({ id: DUPLICATE_IDS[0], state: "APPROVED", body: canonicalBody(HEAD, "### Critical Issues (0)\n### Important Issues (0)") });
+      const blocker = appReview({ id: DUPLICATE_IDS[1], state: "COMMENTED", body: canonicalBody(HEAD, "### Critical Issues (1)\n- boom") });
+      const reviews = order === "approval first" ? [approval, blocker] : [blocker, approval];
+      const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews });
+      assert.deepEqual(violations.filter((v) => v.startsWith("I1")), []);
+      assert.deepEqual(violations.filter((v) => v.startsWith("I2a")), []);
+      assert.match(
+        violations.find((v) => v.startsWith("I2e")) ?? "",
+        new RegExp(`^I2e PR #1220 @ff1c72db: Ally App APPROVED \\(${DUPLICATE_IDS[0]}\\) coexists with a different blocking Ally App review \\(${DUPLICATE_IDS[1]}\\)`),
+      );
+    });
+  }
+
+  it("does not fire I2e once the stale approval is dismissed", () => {
+    const approval = appReview({ id: DUPLICATE_IDS[0], state: "DISMISSED", body: canonicalBody(HEAD, "clean") });
+    const blocker = appReview({ id: DUPLICATE_IDS[1], state: "COMMENTED", body: canonicalBody(HEAD, "### Critical Issues (1)\n- boom") });
+    const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [approval, blocker] });
+    assert.deepEqual(violations.filter((v) => v.startsWith("I2e")), []);
+  });
+
   it("omits the clause rather than guessing when a body is empty", () => {
     const violation = findPrViolations(duplicatePr(["", ""])).find((v) => v.startsWith("I1"));
     assert.doesNotMatch(violation, /bodies are identical|bodies differ/);

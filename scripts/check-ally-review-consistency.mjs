@@ -51,8 +51,9 @@
  *       lane still carries a permitted shape.
  *   I2  No operative APPROVED review whose own body reports a Critical or
  *       Important finding, no User-seat APPROVED review coexisting with a
- *       blocking App review, and no App approval without a `Reviewed head:`
- *       attestation.
+ *       blocking App review, no App APPROVED coexisting with a different
+ *       blocking App review at one head (I2e), and no App approval without a
+ *       `Reviewed head:` attestation.
  *   I3  An operative App review has exactly one canonical body and its
  *       body-attested `Reviewed head:` matches the commit GitHub recorded it
  *       against.
@@ -547,6 +548,20 @@ export function findPrViolations(pr) {
   if (seatApprovals.length > 0 && appBlockers.length > 0) {
     violations.push(
       `I2b PR #${pr.number} @${short}: User-seat APPROVED (${seatApprovals.map((review) => review.id).join(", ")}) coexists with a blocking Ally App review (${appBlockers.map((review) => review.id).join(", ")}) — the User seat cannot mask the App blocker`,
+    );
+  }
+  // I2e: the I1 supersession exemption lets differing App bodies at one head
+  // stand as a re-review, so I1 no longer catches the BLO-19778 shape: a clean
+  // App APPROVED beside a DIFFERENT App review that blocks. I2a sees a blocker
+  // only inside the approving body itself. An undismissed APPROVED counts
+  // toward reviewDecision and a COMMENTED blocker does not, so the approval
+  // would outrank it. A re-review that supersedes a blocker dismisses the stale
+  // approval, which leaves it non-operative, so this does not fire there.
+  const appApprovals = appReviews.filter(isApproved);
+  const otherAppBlockers = appBlockers.filter((review) => !appApprovals.includes(review));
+  if (appApprovals.length > 0 && otherAppBlockers.length > 0) {
+    violations.push(
+      `I2e PR #${pr.number} @${short}: Ally App APPROVED (${appApprovals.map((review) => review.id).join(", ")}) coexists with a different blocking Ally App review (${otherAppBlockers.map((review) => review.id).join(", ")}) at one head; the standing approval outranks the blocker`,
     );
   }
   return violations;
