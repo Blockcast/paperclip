@@ -305,13 +305,15 @@ describe("classifyGuard — the four PEN-3379 production false positives", () =>
   });
 
   it("reports the whole set as zero stale and exits 0", () => {
-    // All four reds fell inside one ~8h window; classify them together at the
-    // last one, which is how a single run would have seen a repeat occurrence.
-    const now = Date.parse("2026-09-18T14:50:00Z");
+    // Each fixture is classified at its own redAt. Its `actual` is the guard's
+    // newest completion AT THAT MOMENT; at a later `now` the unfiltered read
+    // would return a later completion (both guards ran hourly), so replaying an
+    // early `actual` hours later feeds the classifier a read that cannot occur
+    // and, now that the cross-check is aged too, would red correctly.
     const summary = summarize(
       FALSE_POSITIVES.map((fixture) =>
         classifyGuard(fixture.workflow, staleIndexObservation(fixture), {
-          now,
+          now: Date.parse(fixture.redAt),
           staleHours: thresholdFor(fixture.workflow),
         }),
       ),
@@ -340,6 +342,26 @@ describe("classifyGuard — the four PEN-3379 production false positives", () =>
 
     assert.equal(result.status, "stale");
     assert.equal(result.reason, "stopped");
+  });
+
+  it("still reds a stopped guard when the cross-check is newer but also past the bar", () => {
+    // A one-second index lag puts a dead guard in the disagreement branch. The
+    // newer read refutes the age, not staleness, so it must be aged too.
+    const now = Date.parse("2026-09-24T12:00:00Z");
+    const result = classifyGuard(
+      "relay-ssl-multicert-guard.yml",
+      {
+        state: "active",
+        name: "Relay SSL Multicert",
+        newest: { updatedAt: "2026-09-14T04:00:00Z", conclusion: "success", htmlUrl: "https://x" },
+        crossCheck: { newestCompletedAt: "2026-09-14T04:00:01Z" },
+      },
+      { now, staleHours: thresholdFor("relay-ssl-multicert-guard.yml") },
+    );
+
+    assert.equal(result.status, "stale");
+    assert.equal(result.reason, "stopped");
+    assert.match(result.detail, /2026-09-14T04:00:01Z/);
   });
 
   // Absence of corroboration is not agreement. A permanently failing second
