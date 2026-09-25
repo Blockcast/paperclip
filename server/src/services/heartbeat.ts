@@ -20700,6 +20700,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function promoteScheduledRetryRun(
     dueRun: typeof heartbeatRuns.$inferSelect,
     now: Date,
+    // BLO-25944: set only by `retryScheduledRetryNow`. An operator press may
+    // shorten a capacity park; it must never spend its retry budget or end it.
+    promotionOpts: { operatorRequested?: boolean } = {},
   ): Promise<
     | { outcome: "promoted"; run: typeof heartbeatRuns.$inferSelect }
     | {
@@ -20903,7 +20906,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
       if (capacity) {
-        const nextAttempt = (dueRun.scheduledRetryAttempt ?? 0) + 1;
+        // An operator press re-probes without counting as a hop, so pressing
+        // retry-now during an outage cannot advance the chain.
+        const nextAttempt = promotionOpts.operatorRequested
+          ? (dueRun.scheduledRetryAttempt ?? 0)
+          : (dueRun.scheduledRetryAttempt ?? 0) + 1;
         // BLO-28919: the give-up condition is how long the pool has ACTUALLY
         // been down, not how many times we looked. Reading the chain origin off
         // the row rather than counting hops is what decouples outage tolerance
@@ -20914,7 +20921,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ],
           now,
         });
-        if (capacityEscalation.exhausted) {
+        // Only the automatic sweep may give up on a chain. An operator press past
+        // the horizon falls through to a re-defer, and the next sweep that finds
+        // the pool still down terminates it as before; retry-now reporting a
+        // cancelled run as a success is the failure this guard exists to stop.
+        if (capacityEscalation.exhausted && !promotionOpts.operatorRequested) {
           // The pool never recovered inside the escalation horizon. Terminate
           // the scheduled retry so it surfaces for operator attention instead
           // of looping forever.
@@ -22602,12 +22613,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           inArray(heartbeatRuns.status, statuses),
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
           // A row is a legitimate retry-lookup target either because it
-          // literally retries a prior run (retryOfRunId set — bounded run
-          // retry, dep-blocked defer, etc.) or because it's a
-          // ccrotate_capacity capacity-gate park: persistProviderCapacityRetry
-          // defers a wake before any run object exists, so there is no prior
-          // run.id to carry (BLO-25944). Without the second arm, retry-now is
-          // structurally blind to capacity parks — its only remedy.
+          // literally retries a prior run (retryOfRunId set by
+          // scheduleBoundedRetryForRun) or because it's a ccrotate_capacity
+          // capacity-gate park: persistProviderCapacityRetry defers a wake
+          // before any run object exists, so there is no prior run.id to carry
+          // (BLO-25944). Without the second arm, retry-now is structurally
+          // blind to capacity parks — its only remedy.
+          //
+          // Dep-blocked parks (DEP_BLOCKED_RETRY_REASON) have the same null
+          // retryOfRunId and are deliberately NOT matched: their promotion
+          // re-checks dependency readiness and re-parks while blocked, so
+          // retry-now could not release one, only spend its attempt budget.
+          // Resolving the blocker is what releases it.
           or(
             sql`${heartbeatRuns.retryOfRunId} is not null`,
             eq(heartbeatRuns.scheduledRetryReason, CCROTATE_CAPACITY_RETRY_REASON),
@@ -22766,7 +22783,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       },
     });
 
-    const promotion = await promoteScheduledRetryRun(updated, now);
+    const promotion = await promoteScheduledRetryRun(updated, now, { operatorRequested: true });
     const promotedRow = await getIssueRetryRun(issue.companyId, issue.id, ["queued", "running", "cancelled"]);
     const scheduledRetry = promotedRow
       ? summarizeIssueScheduledRetryRun(promotedRow)
@@ -22784,6 +22801,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         outcome: "gate_suppressed" as const,
         message: promotion.reason,
         scheduledRetry,
+      };
+    }
+    // Still parked after the press: the promotion-time re-check (provider
+    // capacity or dependency readiness) re-deferred it. Report the new horizon
+    // rather than letting it read as a promotion.
+    if (promotion.run?.status === "scheduled_retry") {
+      const retryAt = promotion.run.scheduledRetryAt
+        ? new Date(promotion.run.scheduledRetryAt).toISOString()
+        : null;
+      return {
+        outcome: "re_deferred" as const,
+        message: retryAt
+          ? `Scheduled retry could not run yet and was re-deferred to ${retryAt}`
+          : "Scheduled retry could not run yet and was re-deferred",
+        scheduledRetry: summarizeIssueScheduledRetryRun({ run: promotion.run, agentName: scheduled.agentName }),
       };
     }
     return {
