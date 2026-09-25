@@ -133,12 +133,38 @@ export function hasAllyConsolidatedReviewHeading(body: string | null | undefined
 // reintroduces the brittleness this is widening away from.
 const MARKDOWN_EMPHASIS_RUN = "[*_`]{0,3}";
 
+// Emphasis and whitespace interleave freely around the SHA, so they are matched
+// as one bounded run rather than as an emphasis run that may be followed by
+// spaces. Allowing only the latter still dropped the form that closes the label
+// and wraps the SHA separately — `**Reviewed head:** \`<sha>\`` — because the
+// single permitted run was consumed by `**` and could not then cross the space
+// to reach the backtick. That is the same failure mode as BLO-31730 (a real
+// review made invisible by its own delimiters), one delimiter combination
+// further out, so the run is widened here instead of being enumerated.
+//
+// The run is length-bounded and the line is anchored at both ends, which is
+// what keeps this from reading a prose mention: widening the wrapper cannot
+// admit trailing text after the SHA, and the exactly-one rule below — not the
+// wrapper's tightness — is what stops a required check being set on a guess.
+const ATTESTATION_WRAPPER_RUN = "[*_`\\t ]{0,6}";
+
 // Indentation is bounded to agree with the heading pattern above — see
 // NOT_INDENTED_CODE.
+//
+// The unbounded `[ \t]*` on either side of the bounded wrapper run is
+// load-bearing, not redundant with it. Bounding the wrapper is what lets
+// emphasis and whitespace interleave; leaving the plain-whitespace runs
+// unbounded is what stops that bound from truncating a long run of ordinary
+// spaces. Without them, seven or more spaces after the colon — or nine after
+// the SHA — overflow `{0,6}` and the attestation stops parsing, which this
+// module's header explains is a fail-OPEN: an unattested review is never
+// recognised, so the gate reaches not_evaluated rather than blocking. That is
+// the BLO-31730 bug class the widening exists to close, so a widening must not
+// reintroduce it one delimiter out. Regression cases for all three forms are
+// pinned in ally-review-detection.test.ts.
 const REVIEWED_HEAD_ATTESTATION_PATTERN = new RegExp(
   `(?:^|\\n)${NOT_INDENTED_CODE} {0,3}${MARKDOWN_EMPHASIS_RUN}[ \\t]{0,3}reviewed head:[ \\t]*` +
-    `${MARKDOWN_EMPHASIS_RUN}([0-9a-f]{40})${MARKDOWN_EMPHASIS_RUN}[ \\t]*` +
-    `${MARKDOWN_EMPHASIS_RUN}[ \\t]*(?=\\n|$)`,
+    `${ATTESTATION_WRAPPER_RUN}([0-9a-f]{40})${ATTESTATION_WRAPPER_RUN}[ \\t]*(?=\\n|$)`,
   "gi",
 );
 
@@ -203,12 +229,77 @@ const PRIOR_FINDING_DISPOSITION_PATTERN = new RegExp(
   "gim",
 );
 
+// The severities Ally tallies in a counted bucket. Single source for both the
+// pattern below and the "declared clean" test in
+// hasActionablePrReviewFeedback, which are 140 lines apart and were otherwise
+// silently coupled: adding a third bucket to the alternation without widening
+// that test would keep precedence applying on a two-of-three declaration.
+// Lowercase because the test compares lowercased captures; the pattern is
+// case-insensitive, so the alternation is unaffected.
+//
+// Deliberately NOT covered: UNCOUNTED_FINDINGS_HEADING_REGEX spells the same
+// alternation out literally. It is declared above this constant, so referencing
+// it there would read a temporal-dead-zone binding at module load. Adding a
+// severity here therefore widens the counted-bucket pattern and the clean
+// declaration test but leaves the uncounted-heading detector blind to it —
+// update that regex in the same change.
+const COUNTED_SEVERITIES = ["critical", "important"] as const;
+
 // The counted finding buckets a review reports, e.g. `### Important Issues (2)`.
 // Ally numbers findings within a bucket from 1, and its ledger entries name
 // that same (severity, index) pair, so these counts enumerate exactly which
 // finding identities a head raised.
-const COUNTED_FINDINGS_BUCKET_PATTERN =
-  /\b(Critical|Important)\s+Issues\b[*_]*\s*\((\d+)\)/gi;
+//
+// Line-anchored and indentation-bounded like every other structural pattern
+// here, which this one was missing (BLO-32443). Unanchored it read a bucket
+// heading quoted mid-sentence inside an inline-code span as a verdict, and
+// withoutFencedCodeBlocks cannot help: it strips *fenced* spans only, and
+// hasActionablePrReviewFeedback unions the raw and stripped readings anyway,
+// so an inline span is scanned on both passes. Measured on paperclip#1681
+// `c57fafa`, where Ally declared 0 Critical / 0 Important and the gate went
+// red 11 seconds later on `### Important Issues (1)` typed as an illustration
+// of a truncation failure mode.
+//
+// That makes this the one pattern whose false positive is self-referential: a
+// review of this file must quote bucket headings to say anything useful, so
+// unanchored it gates its own PR — and the PR fixing it, and BLO-31446's.
+//
+// Anchoring narrows on *position*, which is the property that separates a
+// verdict from a quotation. Stripping inline code before scanning would not:
+// it would also drop a real finding a reviewer happened to format as code,
+// which is the fail-open direction this module must never take (BLO-29711).
+//
+// The marker group repeats so a blockquoted heading
+// (`> ### Important Issues (1)`) still reads — quoting for emphasis is not
+// quoting as an example. UNCOUNTED_FINDINGS_HEADING_REGEX permits one such
+// run only, and the two therefore leave a gap: `> ### Critical Issues`,
+// blockquoted *and* uncounted, is matched by neither. That is pre-existing
+// and deliberately unchanged here, but it is the case a future unification
+// would silently alter, so weigh it before merging the two patterns.
+//
+// Every separator is horizontal (`[ \t]`), never `\s`, because `\s` crosses a
+// newline and an anchor that only pins the *start* of the match is not
+// line-local: `### Critical\nIssues (1)` read as a counted bucket. Worse, the
+// two patterns then disagreed — on `### Critical Issues\n(0)` this one saw a
+// zero bucket while UNCOUNTED_FINDINGS_HEADING_REGEX, whose
+// `(?![*_]*[ \t]*\()` lookahead cannot see a paren across a newline, saw an
+// uncounted heading and blocked. That contradiction is the exact failure the
+// header above warns about, so both now read horizontal whitespace only and
+// classify such a body the same way.
+//
+// The marker run is `(?:[#>][ \t]*)*` — one `[#>]` per iteration — and not
+// `(?:[#>]+[ \t]*)*`. The latter is `(x+)*`, a nested quantifier over a
+// non-empty group: a line opening with a run of `#`/`>` that then fails the
+// rest of the pattern drives the engine through all 2^(n-1) ways of splitting
+// that run, so `"#".repeat(40) + "x"` took 757ms here against 0.1ms for this
+// form. That is reachable from unclamped webhook input on a single-threaded
+// API, so it stalls the event loop rather than one request. Consuming exactly
+// one marker per iteration removes the ambiguity; the accepted language is
+// unchanged, since a run of markers is still matched one character at a time.
+const COUNTED_FINDINGS_BUCKET_PATTERN = new RegExp(
+  String.raw`^${NOT_INDENTED_CODE} {0,3}(?:[#>][ \t]*)*(?:(?:[-*+]|\d+[.)])[ \t]+)?[*_]*(${COUNTED_SEVERITIES.join("|")})[ \t]+Issues\b[*_]*[ \t]*\((\d+)\)`,
+  "gim",
+);
 
 // Ally's disposition vocabulary is three words: `fixed` and
 // `no-longer-applicable` retire a prior finding, `still-present` asserts it
@@ -358,19 +449,128 @@ export function extractAllyReportedFindingRefs(
   return refs;
 }
 
-function carriesBlockingFeedback(text: string): boolean {
-  for (const bucket of text.matchAll(/\b(?:Critical|Important)\s+Issues\b[*_]*\s*\((\d+)\)/gi)) {
-    if (Number(bucket[1]) > 0) return true;
+export interface ActionableFeedbackOptions {
+  /**
+   * Whether a `still-present` ledger entry counts as blocking feedback.
+   *
+   * Defaults to true, which is the question every live caller asks: "does this
+   * review say a finding is unresolved right now?" — and an assertion that a
+   * prior finding still stands says exactly that.
+   *
+   * The carry-forward enumeration asks a narrower question, "which findings did
+   * *this head* raise?", and passes false. A ledger entry names a finding from
+   * an earlier head, and that head is enumerated on its own account, so
+   * counting it here would attribute the block to a review whose own buckets
+   * are empty. That misattribution is not merely cosmetic: a 0/0 body yields no
+   * finding identities, so `isFullyDispositioned` is permanently false for it
+   * and no later ledger entry could ever retire the head this named — the
+   * unretirable carry-forward BLO-31446 exists to remove.
+   */
+  readonly countInheritedLedgerAssertion?: boolean;
+}
+
+function carriesBlockingFeedback(text: string, options?: ActionableFeedbackOptions): boolean {
+  // Shares COUNTED_FINDINGS_BUCKET_PATTERN with extractAllyReportedFindingRefs
+  // so the two cannot drift: a body this function reads as "no findings" is
+  // exactly one that yields no finding identities there.
+  const zeroedSeverities = new Set<string>();
+  for (const [, severity, count] of text.matchAll(COUNTED_FINDINGS_BUCKET_PATTERN)) {
+    if (Number(count) > 0) return true;
+    zeroedSeverities.add(severity!.toLowerCase());
   }
+  const declaresNoFindings = COUNTED_SEVERITIES.every((severity) => zeroedSeverities.has(severity));
+
   if (UNCOUNTED_FINDINGS_HEADING_REGEX.test(text)) return true;
   if (/^[ \t]*decision[ \t]*:[ \t]*changes_requested[ \t]*$/im.test(text)) return true;
   if (hasNonNegatedMatch(text, /\bchanges\s+requested\b/i)) return true;
   if (hasNonNegatedMatch(text, /\brequest(?:ed|s)?\s+changes\b/i)) return true;
+  // A `still-present` ledger entry positively asserts that a prior finding
+  // stands, which is a statement about this head exactly as a non-zero bucket
+  // is — so it belongs here among the hard signals rather than as a carve-out
+  // in `declaresNoFindings`. As a carve-out it only ever suppressed the
+  // `return false` below, leaving the prose fallback to decide; on any body
+  // whose prose lacks the fallback's trigger tokens the assertion was silently
+  // ignored. Measured against the three shapes: `still-present` alongside the
+  // usual "No Critical issues to fix before merge." boilerplate blocked, but
+  // the same entry under a `Recommended Action` reading "Nothing to address."
+  // — or under no `Recommended Action` at all, or in a body declaring no
+  // counted bucket — read clean. Only `blocks` is consulted, so an
+  // unrecognized verb still clears here (see RESOLVED_PRIOR_DISPOSITIONS for
+  // why that asymmetry with the carry-forward path is deliberate).
+  //
+  // The contract says a still-standing finding is mirrored into the current
+  // buckets, which would make a count non-zero and return true above; this is
+  // the defence for when that mirroring is omitted. It matters because
+  // evaluateCommentReviewGate short-circuits on a current-head attestation
+  // before consulting the carry-forward, so nothing else re-examines the entry.
+  //
+  // Matched against the `text` passed in rather than delegated to
+  // extractAllyPriorFindingDispositions, which re-applies emittedReviewText
+  // internally. Delegating made both passes of hasActionablePrReviewFeedback
+  // read stripped text, so the raw pass bought nothing here while the bucket
+  // signal beside it genuinely read raw — and an unbalanced fence anywhere
+  // above the ledger blanks it to end of body, dropping the entry and letting
+  // the raw pass's intact 0/0 clear the gate. This clause is a *blocking*
+  // predicate, so it belongs to the detecting group (emitted and raw), not the
+  // retiring group (emitted only); see the header at :26-32. The cost is that
+  // a fenced paste of a ledger now blocks, which is the false red :486-492
+  // already accepts and which the bucket clause already pays.
+  if (
+    options?.countInheritedLedgerAssertion !== false &&
+    Array.from(text.matchAll(PRIOR_FINDING_DISPOSITION_PATTERN)).some(
+      (match) => classifyPriorDisposition(match[4]!) === "blocks",
+    )
+  ) {
+    return true;
+  }
+
+  // The prose fallback below is a heuristic for reviews that carry no counted
+  // bucket at all. Ally's own clean-review boilerplate supplies its exact
+  // trigger tokens, so running it against a review that has already declared
+  // both buckets zero misreads an approval as a blocking finding -- observed on
+  // five real bodies across two repos, each phrasing the negation differently:
+  //
+  //   "1. No Critical issues to fix before merge."                    paperclip#1618
+  //   "1. No Critical or Important issues -- nothing to fix before merge."
+  //                                                                   multicast#589
+  //   "1. Fix Critical issues before merge. _(None.)_"                paperclip#1605
+  //
+  // Two candidate narrowings were considered and both fail on a real body.
+  // A negation guard cannot fix this: hasNonNegatedMatch only inspects the
+  // preceding words within a sentence, so the paperclip#1605 body's trailing
+  // "(None.)" is invisible to it however the cue list is tuned. Confining the
+  // [\s\S]{0,400} spans to one paragraph fails on paperclip#1651, where the
+  // three tokens are three unrelated list items -- the heading, then "fix" as a
+  // noun naming the PR, then a "before merging" belonging to a rebase
+  // instruction. Every token there is used in good faith, so no lexical rule
+  // can separate them.
+  //
+  // Precedence is the fix: an explicit 0/0 is a definitive statement by the
+  // reviewer and outranks a guess made from prose. Every signal above stays
+  // live, so a review that explicitly requests changes still blocks at 0/0.
+  //
+  // Measured twice against the Ally consolidated reviews on the 25 most recent
+  // Blockcast/paperclip pull requests. The window slides, so the counts are
+  // dated rather than fixed: 7 of 68 flipped when the clause was written, 5 of
+  // 62 on re-measurement. Every flip in both runs was true -> false and yielded
+  // zero finding identities; none flipped the other way, and every review
+  // carrying a counted finding still blocked.
+  //
+  // The durable form of that result, which does not slide: over the whole
+  // corpus this function's verdict is exactly "the body declares at least one
+  // counted finding" -- no review is actionable without one, and none carrying
+  // one clears. See BLO-31446.
+  if (declaresNoFindings) return false;
+
   return /\bRecommended\s+Action\b[\s\S]{0,400}\bfix\b[\s\S]{0,400}\bbefore\s+merg(?:e|es|ed|ing)\b/i.test(text);
 }
 
 /** Return whether a formal or comment-shaped review contains blocking feedback. */
-export function hasActionablePrReviewFeedback(body: string | null | undefined, state?: string | null): boolean {
+export function hasActionablePrReviewFeedback(
+  body: string | null | undefined,
+  state?: string | null,
+  options?: ActionableFeedbackOptions,
+): boolean {
   const normalizedState = state?.trim().toLowerCase();
   if (normalizedState === "changes_requested" || normalizedState === "changes-requested") return true;
   if (typeof body !== "string") return false;
@@ -384,5 +584,8 @@ export function hasActionablePrReviewFeedback(body: string | null | undefined, s
   // PR. A quoted finding costs a false red, which is visible and recoverable;
   // a missed one is neither. Same asymmetry that keeps an unrecognized ledger
   // verb from retiring a finding.
-  return carriesBlockingFeedback(text) || carriesBlockingFeedback(withoutFencedCodeBlocks(text));
+  return (
+    carriesBlockingFeedback(text, options) ||
+    carriesBlockingFeedback(withoutFencedCodeBlocks(text), options)
+  );
 }

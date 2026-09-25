@@ -15,6 +15,43 @@ const PAPERCLIP_TOOL_ACTION_SIGNING_SECRET =
   process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET ?? "playwright-e2e-tool-action-signing-secret";
 const PLAYWRIGHT_CHANNEL = process.env.PAPERCLIP_PLAYWRIGHT_CHANNEL;
 
+// `paperclipai run` auto-enables Vite dev middleware whenever the server runs
+// from source (cli/src/commands/run.ts:143), which is how the e2e webServer
+// below starts. Dev middleware serves the UI as an unbundled ES module graph,
+// and every test gets a fresh browser context with an empty HTTP cache, so each
+// navigation refetches the whole graph: measured 12-41s from document to the
+// app's first request across all 26 navigations of one CI run (BLO-33478),
+// flat over the run and unchanged on repeat hits to the same route. Nothing
+// renders in that window — CloudAccessGate holds `Loading...` until /api/health
+// resolves — so any assertion on post-boot DOM races it. Serve the built bundle
+// when one exists; a checkout without `pnpm --filter @paperclipai/ui build`
+// keeps the dev-middleware behaviour.
+const UI_DIST_INDEX = path.resolve(import.meta.dirname, "../../ui/dist/index.html");
+const UI_DIST_EXISTS = fs.existsSync(UI_DIST_INDEX);
+
+// The fallback above is silent in both directions, so in CI it would mask its
+// own removal: drop or reorder the build step and the suite reverts to dev
+// middleware, goes green but slow, and nothing in the log says why. Both CI
+// consumers of this config do build the UI first -- pr.yml via
+// `pnpm --filter @paperclipai/ui build`, e2e.yml via `pnpm -r build` -- so a
+// missing bundle under CI is a broken workflow, not a valid configuration.
+// `CI=false` is a real local convention, and a bare truthiness test on the
+// string "false" would throw at exactly the developer this fallback exists for.
+if (!UI_DIST_EXISTS && process.env.CI && process.env.CI !== "false") {
+  throw new Error(
+    `e2e: missing ${UI_DIST_INDEX}\n` +
+      "CI must build the UI bundle before running e2e: pnpm --filter @paperclipai/ui build\n" +
+      "Without it the suite silently falls back to Vite dev middleware (BLO-33478).",
+  );
+}
+
+// An explicit export wins: with a stale `ui/dist` present, asking for live
+// modules is the natural move and `UI_DIST_EXISTS` would otherwise veto it
+// silently -- the same mask-your-own-intent shape this file exists to remove.
+// Unset under CI, so the throw above still owns the CI contract.
+const UI_DEV_MIDDLEWARE =
+  process.env.PAPERCLIP_UI_DEV_MIDDLEWARE ?? (UI_DIST_EXISTS ? "false" : "true");
+
 process.env.PAPERCLIP_HOME = PAPERCLIP_HOME;
 process.env.PAPERCLIP_CONFIG = PAPERCLIP_CONFIG;
 process.env.PAPERCLIP_AGENT_JWT_SECRET = PAPERCLIP_AGENT_JWT_SECRET;
@@ -34,6 +71,16 @@ export default defineConfig({
   // state (the `enableConferenceRoomChat` experimental flag) that changes
   // which UI variant renders. Run files serially so a flag flip in one spec
   // can't change the wizard/thread under another spec mid-flight.
+  //
+  // This bounds INTRA-job parallelism only. It is NOT a ban on cross-job
+  // `--shard=i/N`: each sharded job boots its own throwaway PAPERCLIP_HOME via
+  // `mkdtempSync` + `reuseExistingServer: false`, so cross-shard flag flips
+  // cannot interact. BLO-33282 measured sharding anyway and ruled against it
+  // -- Playwright balances shards by test count, and `smoke-lab.spec.ts` was
+  // then a single 18.6m test worth 44% of the suite, so no N balanced. That
+  // file has since been split into 7 tests, which invalidates the simulation
+  // without re-running it. See the `e2e` job comment in
+  // .github/workflows/pr.yml before revisiting.
   workers: 1,
   use: {
     baseURL: BASE_URL,
@@ -73,6 +120,7 @@ export default defineConfig({
       PAPERCLIP_AGENT_JWT_SECRET,
       PAPERCLIP_TOOL_ACTION_SIGNING_SECRET,
       PAPERCLIP_BIND: "loopback",
+      PAPERCLIP_UI_DEV_MIDDLEWARE: UI_DEV_MIDDLEWARE,
       PAPERCLIP_DEPLOYMENT_MODE: "local_trusted",
       PAPERCLIP_DEPLOYMENT_EXPOSURE: "private",
     },

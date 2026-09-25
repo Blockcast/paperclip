@@ -95,6 +95,7 @@ const {
   describeTruncationCause,
   extractContainerLogDiagnostic,
   shouldAbortForCancellation,
+  selectJobOwnedPod,
   execute,
 } = await import("./execute.js");
 
@@ -539,6 +540,16 @@ describe("execute: all-invalid agent.id (N4)", () => {
 
 
 // ─── Helpers shared across execute() integration tests ───────────────────────
+
+/**
+ * ownerReferences entry the Job controller stamps on every pod it creates.
+ * Pod fixtures must carry it (or a controller-uid label) to be read as THIS
+ * execution's pod — a same-name pod without it is a stale earlier attempt and
+ * is ignored (BLO-34577, `selectJobOwnedPod`).
+ */
+function jobOwnerRef(uid: string, name = "ac-job") {
+  return { apiVersion: "batch/v1", kind: "Job", name, uid, controller: true, blockOwnerDeletion: true };
+}
 
 function makeCtx(overrides: Partial<AdapterExecutionContext> = {}): AdapterExecutionContext {
   return {
@@ -1501,7 +1512,7 @@ describe("execute: job creation", () => {
     mockCoreListPods.mockResolvedValue({
       items: [
         {
-          metadata: { name: "pod-xyz" },
+          metadata: { name: "pod-xyz", ownerReferences: [jobOwnerRef("uid-1")] },
           status: {
             phase: "Pending",
             conditions: [
@@ -1537,7 +1548,7 @@ describe("execute: waitForPod edge cases", () => {
   it("throws k8s_pod_schedule_failed when pod reaches phase=Failed immediately", async () => {
     mockCoreListPods.mockResolvedValue({
       items: [{
-        metadata: { name: "pod-fail" },
+        metadata: { name: "pod-fail", ownerReferences: [jobOwnerRef("uid-1")] },
         status: {
           phase: "Failed",
           containerStatuses: [{ name: "claude", state: { terminated: { exitCode: 137, reason: "OOMKilled" } } }],
@@ -1555,7 +1566,7 @@ describe("execute: waitForPod edge cases", () => {
   it("uses the startup timeout after the pod is already scheduled", async () => {
     mockCoreListPods.mockResolvedValue({
       items: [{
-        metadata: { name: "pod-starting" },
+        metadata: { name: "pod-starting", ownerReferences: [jobOwnerRef("uid-1")] },
         spec: { nodeName: "k8s-paperclip-1" },
         status: {
           phase: "Pending",
@@ -1588,7 +1599,7 @@ describe("execute: waitForPod edge cases", () => {
   it("throws k8s_pod_schedule_failed when init container exits non-zero", async () => {
     mockCoreListPods.mockResolvedValue({
       items: [{
-        metadata: { name: "pod-x" },
+        metadata: { name: "pod-x", ownerReferences: [jobOwnerRef("uid-1")] },
         status: {
           phase: "Pending",
           initContainerStatuses: [{
@@ -1609,7 +1620,7 @@ describe("execute: waitForPod edge cases", () => {
   it("throws k8s_pod_schedule_failed when init container has ImagePullBackOff", async () => {
     mockCoreListPods.mockResolvedValue({
       items: [{
-        metadata: { name: "pod-x" },
+        metadata: { name: "pod-x", ownerReferences: [jobOwnerRef("uid-1")] },
         status: {
           phase: "Pending",
           initContainerStatuses: [{
@@ -1630,7 +1641,7 @@ describe("execute: waitForPod edge cases", () => {
   it("throws k8s_pod_schedule_failed when main container has CrashLoopBackOff", async () => {
     mockCoreListPods.mockResolvedValue({
       items: [{
-        metadata: { name: "pod-x" },
+        metadata: { name: "pod-x", ownerReferences: [jobOwnerRef("uid-1")] },
         status: {
           phase: "Pending",
           initContainerStatuses: [],
@@ -1646,6 +1657,199 @@ describe("execute: waitForPod edge cases", () => {
 
     expect(result.errorCode).toBe("k8s_pod_schedule_failed");
     expect(result.errorMessage).toContain("crash loop");
+  });
+
+  // ── BLO-34577: a same-name pod from an EARLIER attempt is not this attempt ──
+  //
+  // The Job name is deterministic per (agentId, runId) and the server's in-run
+  // ccrotate throttle loop re-invokes execute() for the same runId, so the
+  // replacement Job shares its name with the attempt that just returned. That
+  // attempt's Job was deleted with propagationPolicy=Background, which leaves
+  // its Failed pod (claude exit 1 from the 429) matching `job-name=` for a
+  // while. Reading items[0] surfaced that stale terminal state as THIS
+  // attempt's k8s_pod_schedule_failed ~100 ms after create — a code the server
+  // treats as non-retryable — and the PR review was dropped (7 runs on
+  // 2026-09-18). These drive the real execute() path.
+  const stale429Pod = () => ({
+    metadata: {
+      name: "ac-job-prev-attempt",
+      ownerReferences: [jobOwnerRef("uid-from-the-previous-throttled-attempt")],
+      labels: { "job-name": "ac-job", "controller-uid": "uid-from-the-previous-throttled-attempt" },
+    },
+    status: {
+      phase: "Failed",
+      containerStatuses: [{ name: "claude", state: { terminated: { exitCode: 1, reason: "Error" } } }],
+      initContainerStatuses: [],
+    },
+  });
+
+  it("does not read a stale same-name pod from the previous attempt as this attempt's terminal state", async () => {
+    // Poll 1: only the stale pod exists (the controller has not created ours
+    // yet). Poll 2+: ours exists too, and is unschedulable — a deterministic,
+    // short way out of waitForPod that is unmistakably about the NEW pod.
+    mockCoreListPods
+      .mockResolvedValueOnce({ items: [stale429Pod()] })
+      .mockResolvedValue({
+        items: [
+          stale429Pod(),
+          {
+            metadata: { name: "ac-job-this-attempt", ownerReferences: [jobOwnerRef("uid-1")] },
+            status: {
+              phase: "Pending",
+              conditions: [
+                { type: "PodScheduled", status: "False", reason: "Unschedulable", message: "0/3 nodes are available" },
+              ],
+              containerStatuses: [],
+              initContainerStatuses: [],
+            },
+          },
+        ],
+      });
+    const ctx = makeCtx();
+
+    const result = await execute(ctx);
+
+    // The verdict is about OUR pod, never the stale one's `claude exited 1`.
+    expect(result.errorCode).toBe("k8s_pod_schedule_failed");
+    expect(result.errorMessage).toContain("unschedulable");
+    expect(result.errorMessage).not.toContain("claude exited 1");
+    expect(result.errorMessage).not.toContain("ac-job-prev-attempt");
+    expect(mockCoreListPods.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(ctx.onLog).toHaveBeenCalledWith(
+      "stdout",
+      expect.stringContaining("Ignoring 1 pod(s) named for Job"),
+    );
+    expect(ctx.onLog).toHaveBeenCalledWith(
+      "stdout",
+      expect.stringContaining("uid-from-the-previous-throttled-attempt"),
+    );
+  });
+
+  it("treats a listing that holds ONLY stale pods as 'no pod yet', not as a Failed pod", async () => {
+    // With podScheduleTimeoutSec=0 the schedule deadline is already past on the
+    // first poll, so the only way out is the no-pod timeout branch. Under the
+    // old items[0] read this returned "reached phase=Failed: claude exited 1".
+    mockCoreListPods.mockResolvedValue({ items: [stale429Pod()] });
+
+    const result = await execute(makeCtx({ config: { podScheduleTimeoutSec: 0 } } as Partial<AdapterExecutionContext>));
+
+    expect(result.errorCode).toBe("k8s_pod_schedule_failed");
+    expect(result.errorMessage).toContain("Timed out waiting for pod to be scheduled");
+    expect(result.errorMessage).not.toContain("claude exited 1");
+  });
+
+  it("still reads THIS attempt's own Failed pod as a failure (negative control)", async () => {
+    // Same terminal state as the stale fixture, but owned by the Job we
+    // created: this MUST still surface, or the fix would have hidden every
+    // genuine fast crash behind "no pod yet".
+    mockCoreListPods.mockResolvedValue({
+      items: [{
+        metadata: { name: "ac-job-this-attempt", ownerReferences: [jobOwnerRef("uid-1")] },
+        status: {
+          phase: "Failed",
+          containerStatuses: [{ name: "claude", state: { terminated: { exitCode: 1, reason: "Error" } } }],
+          initContainerStatuses: [],
+        },
+      }],
+    });
+
+    const result = await execute(makeCtx());
+
+    expect(result.errorCode).toBe("k8s_pod_schedule_failed");
+    expect(result.errorMessage).toContain("ac-job-this-attempt reached phase=Failed: claude exited 1");
+  });
+
+  it("scopes ownership to the ADOPTED Job's uid on the worker-restart reattach path", async () => {
+    // BLO-27155 reattach: the create 409s and the run adopts its own live Job.
+    // The pod lookup must then key on the adopted uid, not on a create result.
+    const jobName = "ac-adopted";
+    const liveUid = "live-uid-from-before-the-restart";
+    mockBatchCreateJob.mockRejectedValueOnce(
+      new ApiException(409, "Conflict", { kind: "Status", status: "Failure", reason: "AlreadyExists", code: 409 }, {}) as unknown as Error,
+    );
+    mockBatchReadJob.mockResolvedValue(makeJob({ name: jobName, uid: liveUid, runId: "run-test-001", agentId: "agent-abc" }));
+    mockCoreListPods.mockResolvedValue({
+      items: [
+        stale429Pod(),
+        {
+          metadata: { name: "ac-adopted-pod", ownerReferences: [jobOwnerRef(liveUid, jobName)] },
+          status: {
+            phase: "Pending",
+            conditions: [{ type: "PodScheduled", status: "False", reason: "Unschedulable", message: "no nodes" }],
+            containerStatuses: [],
+            initContainerStatuses: [],
+          },
+        },
+      ],
+    });
+    // The adapter builds its own deterministic name; the reservation must
+    // agree with it for adoption. Read it back from the create call by probing
+    // with a rejected create, exactly as the BLO-27155 suite does.
+    const probe = await execute(makeCtx({
+      externalRuntime: { reservationId: "r", slotId: 0, jobName, jobUid: liveUid },
+    } as unknown as Partial<AdapterExecutionContext>));
+    const builtName = mockBatchCreateJob.mock.calls[0]?.[0]?.body?.metadata?.name as string;
+    expect(builtName).toBeTruthy();
+    expect(probe.errorCode).toBe("k8s_job_create_failed"); // name mismatch => refused, as designed
+    mockBatchCreateJob.mockRejectedValueOnce(
+      new ApiException(409, "Conflict", { kind: "Status", status: "Failure", reason: "AlreadyExists", code: 409 }, {}) as unknown as Error,
+    );
+    mockBatchReadJob.mockResolvedValue(makeJob({ name: builtName, uid: liveUid, runId: "run-test-001", agentId: "agent-abc" }));
+
+    const result = await execute(makeCtx({
+      externalRuntime: { reservationId: "r", slotId: 0, jobName: builtName, jobUid: liveUid },
+    } as unknown as Partial<AdapterExecutionContext>));
+
+    expect(result.errorCode).toBe("k8s_pod_schedule_failed");
+    expect(result.errorMessage).toContain("unschedulable");
+    expect(result.errorMessage).not.toContain("claude exited 1");
+  });
+});
+
+// ─── selectJobOwnedPod (BLO-34577) ───────────────────────────────────────────
+
+describe("selectJobOwnedPod", () => {
+  const owned = (uid: string, name: string, extra: Record<string, unknown> = {}) =>
+    ({ metadata: { name, ...extra, ownerReferences: [jobOwnerRef(uid)] }, status: { phase: "Running" } }) as k8s.V1Pod;
+
+  it("returns null and no stale pods for an empty listing", () => {
+    expect(selectJobOwnedPod([], "uid-1")).toEqual({ owned: null, stale: [] });
+  });
+
+  it("selects the pod whose ownerReferences name this Job uid", () => {
+    const mine = owned("uid-1", "mine");
+    const { owned: got, stale } = selectJobOwnedPod([owned("uid-0", "theirs"), mine], "uid-1");
+    expect(got).toBe(mine);
+    expect(stale.map((p) => p.metadata?.name)).toEqual(["theirs"]);
+  });
+
+  it.each(["controller-uid", "batch.kubernetes.io/controller-uid"])(
+    "falls back to the %s label when ownerReferences are absent",
+    (label) => {
+      const mine = { metadata: { name: "mine", labels: { [label]: "uid-1" } }, status: {} } as k8s.V1Pod;
+      expect(selectJobOwnedPod([mine], "uid-1").owned).toBe(mine);
+    },
+  );
+
+  it("does not select a pod with neither an owner reference nor a controller-uid label (fail closed)", () => {
+    const anonymous = { metadata: { name: "anon", labels: { "job-name": "ac-job" } }, status: {} } as k8s.V1Pod;
+    const { owned: got, stale } = selectJobOwnedPod([anonymous], "uid-1");
+    expect(got).toBeNull();
+    expect(stale).toEqual([anonymous]);
+  });
+
+  it("ignores a non-Job owner that happens to carry the same uid", () => {
+    const pod = {
+      metadata: { name: "rs-pod", ownerReferences: [{ apiVersion: "apps/v1", kind: "ReplicaSet", name: "rs", uid: "uid-1" }] },
+      status: {},
+    } as k8s.V1Pod;
+    expect(selectJobOwnedPod([pod], "uid-1").owned).toBeNull();
+  });
+
+  it("keeps the first owned pod when the listing carries more than one for this uid", () => {
+    const first = owned("uid-1", "first");
+    const second = owned("uid-1", "second");
+    expect(selectJobOwnedPod([first, second], "uid-1")).toEqual({ owned: first, stale: [] });
   });
 });
 

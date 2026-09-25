@@ -61,7 +61,18 @@ function createApproval(status: string): ApprovalRecord {
 
 function createDbStub(selectResults: Array<Array<Record<string, unknown>>>, updateResults: ApprovalRecord[]) {
   const pendingSelectResults = [...selectResults];
-  const selectWhere = vi.fn(async () => pendingSelectResults.shift() ?? []);
+  // Drizzle's select builder is a thenable that also carries `.for()`. The stub
+  // needs both: the `hire_agent` decision path locks `budget_policies … for
+  // update` before it touches `agents` (BLO-34422), and that lock's rows are
+  // discarded, so it just drains the queue like any other select.
+  const selectWhere = vi.fn(() => {
+    const rows = pendingSelectResults.shift() ?? [];
+    const builder = Promise.resolve(rows) as Promise<typeof rows> & {
+      for: () => typeof builder;
+    };
+    builder.for = () => builder;
+    return builder;
+  });
   const innerJoin = vi.fn(() => ({ where: selectWhere }));
   const from = vi.fn(() => ({ where: selectWhere, innerJoin }));
   const select = vi.fn(() => ({ from }));

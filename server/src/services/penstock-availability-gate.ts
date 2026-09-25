@@ -1,4 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
+
+import {
+  type PenstockProbeOutcomeLabel,
+  type PenstockProbePathLabel,
+  recordPenstockAvailabilityGateProbe,
+} from "./metrics.js";
 
 export interface PenstockAvailabilityGateLogger {
   info(payload: Record<string, unknown>, msg: string): void;
@@ -33,11 +40,59 @@ export interface PenstockAvailabilityGateAllowResult {
  */
 export type PenstockProvider = "anthropic" | "codex";
 
+/**
+ * Which probe produced a verdict (BLO-29900).
+ *
+ * `capacity` is the cached `GET /v1/pools/default/capacity` the capacity-park
+ * clamp's cheapness assumption is written against. `messages_fallback` is the
+ * real `POST /v1/messages` taken when that GET yields no verdict — a call
+ * against the provider that is, by construction, currently exhausted.
+ *
+ * This rides on the deny result rather than being inferred later because the
+ * two paths are otherwise **indistinguishable downstream**: a 429 from either
+ * one persists the same `reason`, so a parked row could not say whether it had
+ * cost a provider inference call. It is a *required* field on a deny so the
+ * compiler, not a reviewer, is what catches a future deny branch that forgets
+ * to say where it came from.
+ *
+ * Aliased from the metrics module's label union rather than re-declared, so
+ * the persisted value and the `path` label cannot drift apart. Two copies of
+ * this string set would be the same duplicated-key hazard the capacity
+ * decision keys warn about, and here it would break the join between a parked
+ * row and the series that measures its cost.
+ */
+export type PenstockProbePath = PenstockProbePathLabel;
+
+/**
+ * Bounded probe outcome, for {@link recordPenstockAvailabilityGateProbe}.
+ *
+ * `inconclusive` is the load-bearing one: it is the capacity branch that
+ * returns no verdict and therefore *causes* the fallback, so its rate is the
+ * fallback's cause rather than merely its correlate. Aliased from the metrics
+ * label union for the same anti-drift reason as {@link PenstockProbePath}.
+ */
+type PenstockProbeOutcome = PenstockProbeOutcomeLabel;
+
+/**
+ * A probe's verdict plus how it should be counted. Bundled rather than derived
+ * from `result` at the call site because two distinct outcomes collapse to the
+ * same value there: a capacity readback returns `null` both when it declined to
+ * answer (`inconclusive`) and when the request itself failed (`error`). The
+ * gate fails open on the latter, so a broken probe is invisible on every other
+ * signal — losing that distinction here would make it unobservable outright.
+ */
+interface PenstockProbeObservation<T> {
+  result: T;
+  outcome: PenstockProbeOutcome;
+}
+
 export interface PenstockAvailabilityGateDenyResult {
   allow: false;
   provider: PenstockProvider;
   reason: "penstock.model_capacity_unavailable" | "penstock.model_temporarily_unavailable";
   model: string;
+  /** Which probe denied this dispatch. See {@link PenstockProbePath}. */
+  probePath: PenstockProbePath;
   resumeAt: Date | null;
   retryAfterSeconds: number | null;
 }
@@ -191,7 +246,7 @@ export function createPenstockAvailabilityGate(
 
   return {
     async checkAdapter(input: PenstockAvailabilityGateCheckInput): Promise<PenstockAvailabilityGateResult> {
-      const provider = mapAdapterToPenstockProvider(input.adapterType);
+      const provider = mapAdapterToPenstockProvider(input.adapterType, input.adapterConfig);
       if (!provider) return { allow: true };
 
       const resolved = resolvePenstockCheck(input, provider);
@@ -213,34 +268,50 @@ export function createPenstockAvailabilityGate(
         return cached.result;
       }
 
-      const readback = await readPenstockCapacity({
-        fetchImpl,
+      const readback = await observePenstockProbe({
+        path: "capacity",
         provider,
-        url: resolved.capacityUrl,
-        token: resolved.token,
         model: resolved.model,
-        agentId: input.agentId,
-        timeoutMs,
-        defaultRetryDelayMs,
-        now: nowFn,
-        log: opts.log,
+        run: () =>
+          readPenstockCapacity({
+            fetchImpl,
+            provider,
+            url: resolved.capacityUrl,
+            token: resolved.token,
+            model: resolved.model,
+            agentId: input.agentId,
+            timeoutMs,
+            defaultRetryDelayMs,
+            now: nowFn,
+            log: opts.log,
+          }),
       });
+      const messagesUrl = resolved.messagesUrl;
       const result =
         readback ??
-        (resolved.messagesUrl
-          ? await probePenstockAnthropicModel({
-              fetchImpl,
-              url: resolved.messagesUrl,
-              token: resolved.token,
+        (messagesUrl
+          ? await observePenstockProbe({
+              path: "messages_fallback",
+              provider,
               model: resolved.model,
-              agentId: input.agentId,
-              timeoutMs,
-              defaultRetryDelayMs,
-              now: nowFn,
-              log: opts.log,
+              run: () =>
+                probePenstockAnthropicModel({
+                  fetchImpl,
+                  url: messagesUrl,
+                  token: resolved.token,
+                  model: resolved.model,
+                  agentId: input.agentId,
+                  timeoutMs,
+                  defaultRetryDelayMs,
+                  now: nowFn,
+                  log: opts.log,
+                }),
             })
           : // No secondary probe for this provider: fail open, which is the
             // pre-existing behaviour for any adapter this gate did not cover.
+            // Deliberately *not* counted as a probe — nothing was sent, so
+            // counting it would inflate the denominator that fallback share is
+            // measured against.
             ({ allow: true } as PenstockAvailabilityGateResult));
       sweepExpiredCapacityCacheEntries(cache, nowMs, cacheTtlMs);
       cache.set(key, { fetchedAt: nowMs, result });
@@ -256,15 +327,87 @@ export function createPenstockAvailabilityGate(
 }
 
 /**
+ * Time one probe, count it, and hand back only its verdict.
+ *
+ * Timing uses `performance.now()` rather than the injectable `opts.now` clock:
+ * the injected clock is a *logical* clock that tests deliberately pin to a
+ * fixed instant, so measuring elapsed wall time from it would report every
+ * probe as taking 0s. Keeping the two separate means a frozen test clock
+ * governs verdicts, as intended, without silently zeroing the latency series.
+ *
+ * The metric is emitted in a `finally`, so a probe that throws is still
+ * counted. Nothing here can change a verdict, and a metrics failure must not
+ * become a dispatch failure — recording is best-effort by construction and the
+ * result is returned whatever the registry does.
+ */
+async function observePenstockProbe<T>(input: {
+  path: PenstockProbePath;
+  provider: PenstockProvider;
+  model: string;
+  run: () => Promise<PenstockProbeObservation<T>>;
+}): Promise<T> {
+  const startedAt = performance.now();
+  let outcome: PenstockProbeOutcome = "error";
+  try {
+    const observation = await input.run();
+    outcome = observation.outcome;
+    return observation.result;
+  } finally {
+    try {
+      recordPenstockAvailabilityGateProbe({
+        path: input.path,
+        outcome,
+        provider: input.provider,
+        model: input.model,
+        durationSeconds: (performance.now() - startedAt) / 1000,
+      });
+    } catch {
+      // Instrumenting the gate must never gate dispatch.
+    }
+  }
+}
+
+/**
  * Adapter → penstock provider. Only the k8s adapters are mapped: this gate
  * exists to defer k8s *dispatch*, and the `*_local` adapters do not dispatch
  * through it. Returning `null` means "not covered by this gate" and results
  * in an unconditional allow.
+ *
+ * `opencode_k8s` picks its provider per agent (BLO-34116): `PENSTOCK_PROVIDER`
+ * in `adapterConfig.env` wins, then the `provider/` prefix opencode puts on its
+ * model ids, then the historical `codex` default. A secret-ref binding for the
+ * env var is unreadable here and falls through to the model prefix.
  */
-export function mapAdapterToPenstockProvider(adapterType: string): PenstockProvider | null {
+export function mapAdapterToPenstockProvider(
+  adapterType: string,
+  adapterConfig?: unknown,
+): PenstockProvider | null {
   if (adapterType === "claude_k8s") return "anthropic";
-  if (adapterType === "opencode_k8s") return "codex";
+  if (adapterType === "opencode_k8s") {
+    const config = asRecord(adapterConfig);
+    const envProvider = readConfigEnvString(asRecord(config?.env), "PENSTOCK_PROVIDER")?.toLowerCase();
+    if (envProvider === "anthropic") return "anthropic";
+    if (envProvider === "openai") return "codex";
+    const model = readNonEmptyString(config?.model)?.toLowerCase();
+    if (model?.startsWith("anthropic/")) return "anthropic";
+    if (model?.startsWith("openai/")) return "codex";
+    return "codex";
+  }
   return null;
+}
+
+/**
+ * Model id as Penstock sees it. Opencode model ids carry a `provider/` prefix
+ * (`anthropic/claude-opus-5`) that the runtime strips before calling the
+ * provider, and Penstock's catalog is keyed on the bare id. Probe with what
+ * the runtime sends: a prefixed id 404s on the messages probe and fails open,
+ * so the fallback would never see a real 429. Any leading provider segment is
+ * stripped, not just the two built-ins: PENSTOCK_PROVIDER can route a custom
+ * opencode provider name (`penstock/claude-opus-5`) to a pool, and that prefix
+ * would 404 just the same. Results and logs keep the configured string.
+ */
+function penstockModelId(model: string): string {
+  return model.replace(/^[^/\s]+\//, "");
 }
 
 /**
@@ -307,7 +450,7 @@ function resolvePenstockCheck(
 
   try {
     return {
-      capacityUrl: buildCapacityUrl(baseUrl, model, provider),
+      capacityUrl: buildCapacityUrl(baseUrl, penstockModelId(model), provider),
       // The secondary probe is an Anthropic Messages call; there is no codex
       // equivalent implemented, so codex relies on the capacity readback alone.
       messagesUrl: provider === "anthropic" ? buildMessagesUrl(baseUrl) : null,
@@ -355,7 +498,7 @@ async function readPenstockCapacity(input: {
   defaultRetryDelayMs: number;
   now: () => Date;
   log: PenstockAvailabilityGateLogger;
-}): Promise<PenstockAvailabilityGateResult | null> {
+}): Promise<PenstockProbeObservation<PenstockAvailabilityGateResult | null>> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), input.timeoutMs);
   try {
@@ -370,10 +513,20 @@ async function readPenstockCapacity(input: {
       signal: controller.signal,
     });
 
-    if (response.status === 404) return null;
+    if (response.status === 404) return inconclusiveCapacityReadback();
 
-    if (response.status === 401 || response.status === 403 || response.status === 429 || response.status === 503) {
-      return capacityEndpointUnavailable(input, response.status);
+    if (isProbeAuthFault(response.status)) {
+      logProbeAuthFault(input.log, response.status, input.model, "capacity readback");
+      // PEN-2513 fails this open, which means it falls through to the messages
+      // probe exactly as a 404 does. Counted as its own outcome rather than
+      // `inconclusive`: an entitlement fault driving fallback traffic is the
+      // precise mislabelling PEN-2513 exists to stop, and folding it into the
+      // 404 bucket would reintroduce it inside the metric built to detect it.
+      return { result: null, outcome: "auth_fault" };
+    }
+
+    if (response.status === 429 || response.status === 503) {
+      return denyObservation(capacityEndpointUnavailable(input, response.status, "capacity"));
     }
 
     if (!response.ok) {
@@ -384,21 +537,23 @@ async function readPenstockCapacity(input: {
         },
         "penstock capacity readback failed open",
       );
-      return null;
+      return inconclusiveCapacityReadback();
     }
 
     const body = await response.json().catch(() => null);
     const state = readCapacityState(body);
-    if (!state) return null;
+    if (!state) return inconclusiveCapacityReadback();
     const capacityReason = readCapacityReason(body);
     if (state === "unknown") {
-      if (!isAuthoritativeCapacityReason(capacityReason)) return null;
-      return capacityEndpointUnavailable(input, response.status, {
-        capacityState: state,
-        capacityReason,
-      });
+      if (!isAuthoritativeCapacityReason(capacityReason)) return inconclusiveCapacityReadback();
+      return denyObservation(
+        capacityEndpointUnavailable(input, response.status, "capacity", {
+          capacityState: state,
+          capacityReason,
+        }),
+      );
     }
-    if (state === "available") return { allow: true };
+    if (state === "available") return { result: { allow: true }, outcome: "ok" };
 
     const now = input.now();
     const retry = capacityRetryFromBody(body, input.defaultRetryDelayMs, now);
@@ -407,6 +562,7 @@ async function readPenstockCapacity(input: {
       provider: input.provider,
       reason: "penstock.model_capacity_unavailable",
       model: input.model,
+      probePath: "capacity",
       resumeAt: retry.resumeAt,
       retryAfterSeconds: retry.retryAfterSeconds,
     };
@@ -416,6 +572,7 @@ async function readPenstockCapacity(input: {
         provider: result.provider,
         model: result.model,
         reason: result.reason,
+        probePath: result.probePath,
         capacityState: state,
         capacityReason,
         resumeAt: result.resumeAt?.toISOString() ?? null,
@@ -423,7 +580,7 @@ async function readPenstockCapacity(input: {
       },
       "heartbeat dispatch deferred: penstock model unavailable",
     );
-    return result;
+    return denyObservation(result);
   } catch (err) {
     input.log.warn(
       {
@@ -432,10 +589,89 @@ async function readPenstockCapacity(input: {
       },
       "penstock capacity readback failed open",
     );
-    return null;
+    return { result: null, outcome: "error" };
   } finally {
     clearTimeout(timeout);
   }
+}
+
+/**
+ * 401/403 from either probe is an *authorization* fault, not an availability
+ * one, and this gate deliberately has nothing to say about it (PEN-2513).
+ *
+ * Both probes used to deny on `401 || 403 || 429 || 503`, and every deny is
+ * booked by the caller as `CCROTATE_CAPACITY_RETRY_REASON` — `heartbeat.ts`
+ * writes that constant unconditionally and never reads the `reason` this
+ * module computes. So a permanent permission fault — an un-entitled seat, say —
+ * parks on a *capacity* horizon: mislabelled as provider throttling in every
+ * census keyed on that constant, and — because the BLO-28919 re-defer path
+ * relabels a park to the capacity reason "whatever label it arrived with" —
+ * re-deferred on that horizon indefinitely. A capacity horizon cannot expire an
+ * entitlement fault, so nothing in the loop terminates it.
+ *
+ * This is read at source, not from a park census: PEN-2513 records that the
+ * live parked population carries zero capacity-labelled parks, because the path
+ * only fires when the *probe* draws one of these statuses. That absence
+ * measures current gateway health, not the classifier, so no observed incident
+ * is claimed here. Note also that the entitlement 403s seen on failed runs are
+ * an adapter-side authentication fault on a different surface than this probe;
+ * narrowing this gate may not touch them at all.
+ *
+ * Failing open instead costs one dispatch that fails fast against the real
+ * fault, which the ordinary run-failure path records with a truthful error
+ * code and bounds by the run retry limits. That trade — a bounded, attributable
+ * failure over an unbounded, mislabelled park — is the CEO ruling on PEN-2513,
+ * which authorized narrowing the gate (shape 3) for 401/403 only.
+ *
+ * 429 and 503 are untouched on purpose: 429 is a genuine capacity signal and
+ * 503 is a genuine availability signal, so both keep their existing deny, their
+ * existing reason, and their existing place in the census split-check. How a
+ * 503-origin park should be *labelled* is the still-open half of PEN-2513 and
+ * is not decided here.
+ *
+ * Logged at `warn` under its own message rather than reusing the generic
+ * fail-open branches: an entitlement outage that fails open is otherwise
+ * indistinguishable from a stray 500, and this one needs to stay greppable.
+ */
+function isProbeAuthFault(status: number): boolean {
+  return status === 401 || status === 403;
+}
+
+function logProbeAuthFault(
+  log: PenstockAvailabilityGateLogger,
+  status: number,
+  model: string,
+  probe: "capacity readback" | "availability probe",
+): void {
+  log.warn(
+    { status, model, probe },
+    "penstock probe auth fault: not an availability signal, allowing dispatch",
+  );
+}
+
+/**
+ * The capacity endpoint declined to answer, so the caller falls through to the
+ * messages fallback.
+ *
+ * Distinct from the `error` outcome even though both yield `null`: this branch
+ * is a *successful* HTTP exchange that carried no verdict (404, non-ok status,
+ * unparseable body, non-authoritative `unknown`), whereas `error` is the
+ * request failing outright. Only the former is the fallback's cause, so
+ * collapsing them would make the fallback's own driver unmeasurable.
+ */
+function inconclusiveCapacityReadback(): PenstockProbeObservation<null> {
+  return { result: null, outcome: "inconclusive" };
+}
+
+/** Tag a deny by which `reason` it carries, so the counter separates the two. */
+function denyObservation(
+  result: PenstockAvailabilityGateDenyResult,
+): PenstockProbeObservation<PenstockAvailabilityGateDenyResult> {
+  return {
+    result,
+    outcome:
+      result.reason === "penstock.model_capacity_unavailable" ? "deny_capacity" : "deny_temporary",
+  };
 }
 
 function capacityEndpointUnavailable(
@@ -447,6 +683,7 @@ function capacityEndpointUnavailable(
     log: PenstockAvailabilityGateLogger;
   },
   status: number,
+  probePath: PenstockProbePath,
   details?: {
     capacityState?: PenstockCapacityState;
     capacityReason?: string | null;
@@ -461,6 +698,7 @@ function capacityEndpointUnavailable(
         ? "penstock.model_capacity_unavailable"
         : "penstock.model_temporarily_unavailable",
     model: input.model,
+    probePath,
     resumeAt: retry.resumeAt,
     retryAfterSeconds: retry.retryAfterSeconds,
   };
@@ -470,6 +708,7 @@ function capacityEndpointUnavailable(
       provider: result.provider,
       model: result.model,
       reason: result.reason,
+      probePath: result.probePath,
       capacityState: details?.capacityState,
       capacityReason: details?.capacityReason,
       resumeAt: result.resumeAt?.toISOString() ?? null,
@@ -496,7 +735,7 @@ async function probePenstockAnthropicModel(input: {
   defaultRetryDelayMs: number;
   now: () => Date;
   log: PenstockAvailabilityGateLogger;
-}): Promise<PenstockAvailabilityGateResult> {
+}): Promise<PenstockProbeObservation<PenstockAvailabilityGateResult>> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), input.timeoutMs);
   try {
@@ -511,14 +750,19 @@ async function probePenstockAnthropicModel(input: {
         "anthropic-version": ANTHROPIC_API_VERSION,
       },
       body: JSON.stringify({
-        model: input.model,
+        model: penstockModelId(input.model),
         max_tokens: 1,
         messages: [{ role: "user", content: "ping" }],
       }),
       signal: controller.signal,
     });
 
-    if (response.status === 401 || response.status === 403 || response.status === 429 || response.status === 503) {
+    if (isProbeAuthFault(response.status)) {
+      logProbeAuthFault(input.log, response.status, input.model, "availability probe");
+      return { result: { allow: true }, outcome: "auth_fault" };
+    }
+
+    if (response.status === 429 || response.status === 503) {
       const text = await response.text().catch(() => "");
       const parsed = parseCapacityRetry(text, response.headers, input.defaultRetryDelayMs, input.now());
       const retry = parsed ?? defaultCapacityRetry(input.defaultRetryDelayMs, input.now());
@@ -530,6 +774,7 @@ async function probePenstockAnthropicModel(input: {
             ? "penstock.model_capacity_unavailable"
             : "penstock.model_temporarily_unavailable",
         model: input.model,
+        probePath: "messages_fallback",
         resumeAt: retry.resumeAt,
         retryAfterSeconds: retry.retryAfterSeconds,
       };
@@ -539,15 +784,16 @@ async function probePenstockAnthropicModel(input: {
           provider: result.provider,
           model: result.model,
           reason: result.reason,
+          probePath: result.probePath,
           resumeAt: result.resumeAt?.toISOString() ?? null,
           retryAfterSeconds: result.retryAfterSeconds,
         },
         "heartbeat dispatch deferred: penstock model unavailable",
       );
-      return result;
+      return denyObservation(result);
     }
 
-    if (response.ok) return { allow: true };
+    if (response.ok) return { result: { allow: true }, outcome: "ok" };
 
     input.log.warn(
       {
@@ -556,7 +802,7 @@ async function probePenstockAnthropicModel(input: {
       },
       "penstock availability probe failed open",
     );
-    return { allow: true };
+    return { result: { allow: true }, outcome: "error" };
   } catch (err) {
     input.log.warn(
       {
@@ -565,7 +811,7 @@ async function probePenstockAnthropicModel(input: {
       },
       "penstock availability probe failed open",
     );
-    return { allow: true };
+    return { result: { allow: true }, outcome: "error" };
   } finally {
     clearTimeout(timeout);
   }

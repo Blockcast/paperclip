@@ -105,6 +105,15 @@ export interface BudgetPolicyAmountAssertion {
   kind: typeof BUDGET_POLICY_AMOUNT_ASSERTION;
   policyId: string;
   expectedAmountCents: number;
+  /**
+   * The amount the card recorded as the *starting* figure (`from_usd`), in
+   * cents, or null when the payload recorded none.
+   *
+   * Load-bearing, not decoration: it is the only thing that separates "this
+   * decision was never applied" from "it was applied and a later decision moved
+   * the figure again". See `classifyEnforcementAssertion`.
+   */
+  priorAmountCents: number | null;
   /** Human label for the drift message (agent name); never used for matching. */
   label: string | null;
   /** Which payload shape this came from — surfaced in the raised issue. */
@@ -124,6 +133,19 @@ export interface EnforcedBudgetPolicy {
   policyId: string;
   amount: number;
   isActive: boolean;
+  /**
+   * When the enforced *amount* last changed — `budget_policies.amount_updated_at`,
+   * not `updated_at`. `null` means "unknown", which is not the same as "never"
+   * — see `classifyEnforcementAssertion`, where an unknown change time
+   * downgrades to `unverifiable_mismatch` rather than guessing in either
+   * direction.
+   *
+   * It must be the amount-specific column. `updated_at` also moves for warn
+   * percent, hard stop, notify and active-state edits, so reading it here let
+   * an unrelated metadata toggle read as "a later decision moved the cap" and
+   * suppress a real enforcement gap (BLO-32796).
+   */
+  amountUpdatedAt: Date | null;
 }
 
 export interface ApprovalEnforcementReconcileResult {
@@ -206,6 +228,21 @@ function readAmountCents(entry: Record<string, unknown>): number | null {
 }
 
 /**
+ * The pre-decision figure, when the card recorded one.
+ *
+ * Optional by design: a payload that omits it is not malformed, it is merely
+ * unclassifiable, and `classifyEnforcementAssertion` degrades to the old
+ * two-way comparison for it rather than guessing.
+ */
+function readPriorAmountCents(entry: Record<string, unknown>): number | null {
+  const cents = asFiniteNumber(entry.from_amount_cents ?? entry.fromAmountCents);
+  if (cents !== null) return cents < 0 ? null : Math.round(cents);
+  const usd = asFiniteNumber(entry.from_usd ?? entry.fromUsd);
+  if (usd === null || usd < 0) return null;
+  return usdToCents(usd);
+}
+
+/**
  * Extract machine-checkable assertions from an approval payload.
  *
  * Two accepted shapes:
@@ -247,6 +284,7 @@ export function extractEnforcementAssertions(payload: unknown): EnforcementAsser
       kind: BUDGET_POLICY_AMOUNT_ASSERTION,
       policyId,
       expectedAmountCents,
+      priorAmountCents: readPriorAmountCents(entry),
       label: asNonEmptyString(entry.label ?? entry.agent ?? entry.scopeName),
       source: "declared",
     });
@@ -265,12 +303,179 @@ export function extractEnforcementAssertions(payload: unknown): EnforcementAsser
       kind: BUDGET_POLICY_AMOUNT_ASSERTION,
       policyId,
       expectedAmountCents,
+      priorAmountCents: readPriorAmountCents(entry),
       label: asNonEmptyString(entry.agent ?? entry.label ?? entry.scopeName),
       source: "legacy_exact_changes",
     });
   }
 
   return [...byPolicyId.values()];
+}
+
+/** Marks a prior the server read from `budget_policies`, not one the caller stated. */
+export const SERVER_POLICY_READ_PRIOR = "server_policy_read";
+
+/**
+ * Fill in the starting figure on canonical assertions that omit one, reading it
+ * from the enforcing policy row (BLO-34008).
+ *
+ * Without a prior, `classifyEnforcementAssertion` cannot run its three-way split
+ * and answers `unverifiable_mismatch` for every disagreement — so a never-applied
+ * decision and a legitimately superseded one look identical. Both get reported,
+ * which is the safe direction, but the second is the false-positive class that
+ * filed BLO-33160, BLO-33397, BLO-33416 and BLO-33772, and the first is not
+ * auto-appliable. Recording the prior is what separates them.
+ *
+ * The obvious alternative — require the caller to state `from_usd` — is the one
+ * thing the refusal's own remediation forbids ("never invent one"), and the
+ * example payload deliberately ships without it. So callers will keep omitting
+ * it, correctly. The server does not have to guess: it holds the authoritative
+ * number already, because the assertion names the `policyId`.
+ *
+ * Deliberately narrow:
+ *   - **Only fills what is absent.** A caller who stated a prior has stated
+ *     something we should not silently overwrite; `readPriorAmountCents` already
+ *     treats a wrong one as suspect and splits on `amountUpdatedAt` instead.
+ *   - **Canonical shape only.** `exact_changes` is the legacy shape on card
+ *     `6f45844e`, which already carries `from_usd`. Rewriting a shape we are not
+ *     encouraging buys nothing.
+ *   - **Unresolvable policy is left alone.** A missing or cross-company id stays
+ *     unstamped so the reconciler still reports it as `missing_policy`, rather
+ *     than the stamp quietly making a bad id look serviceable.
+ *
+ * `from_source` records that the figure is a database read, so a later reader can
+ * tell an authoritative prior from an agent-authored one on a path that writes money.
+ */
+export function stampAssertionPriors(
+  payload: unknown,
+  policies: ReadonlyMap<string, EnforcedBudgetPolicy | null>,
+): unknown {
+  const root = asRecord(payload);
+  if (!root) return payload;
+  // Read and write the same key. Deriving the write key with `in` diverges from
+  // this read: `??` falls through a present-but-`null` `enforcement_assertions`
+  // to the camelCase array, but `in` would then pick the snake_case key — so the
+  // stamped array lands under snake_case while the camelCase one this actually
+  // read stays in place unstamped. Two arrays, one payload, on a money path.
+  const snake = root.enforcement_assertions;
+  const usesSnake = snake !== undefined && snake !== null;
+  const entries = usesSnake ? snake : root.enforcementAssertions;
+  if (!Array.isArray(entries)) return payload;
+
+  let changed = false;
+  const stamped = entries.map((raw) => {
+    const entry = asRecord(raw);
+    if (!entry) return raw;
+    if (asNonEmptyString(entry.kind) !== BUDGET_POLICY_AMOUNT_ASSERTION) return raw;
+    if (readPriorAmountCents(entry) !== null) return raw;
+    const policyId = asNonEmptyString(entry.policyId ?? entry.policy_id);
+    if (!policyId) return raw;
+    const amount = policies.get(policyId)?.amount;
+    if (typeof amount !== "number") return raw;
+    changed = true;
+    return { ...entry, from_amount_cents: amount, from_source: SERVER_POLICY_READ_PRIOR };
+  });
+
+  if (!changed) return payload;
+  const key = usesSnake ? "enforcement_assertions" : "enforcementAssertions";
+  return { ...root, [key]: stamped };
+}
+
+/**
+ * What the enforcing row says happened to one decided assertion.
+ *
+ * `superseded` is the state this enum exists for. Comparing only *decided* to
+ * *enforced* yields a boolean — agree or disagree — and "never applied" and
+ * "applied, then moved again by a later decision" both land in `disagree`.
+ * Those need opposite handling: the first is the failure BLO-24631 detects, the
+ * second is the system working, and treating the second as the first is what
+ * filed BLO-33160, BLO-33397, BLO-33416 and BLO-33772 — four issues on approval
+ * `6f45844e` in four days, each costing an adjudication run to close as "yes,
+ * superseded, do not apply".
+ *
+ * The card already records the third number needed to tell them apart: the
+ * figure the change started from. Three-way:
+ *
+ * - `enforced == decided` → **applied**.
+ * - `enforced == prior`   → **never_applied**. Nobody moved it; the decision
+ *   never landed. Real drift. (A deliberate revert back to the starting figure
+ *   reads as this too — correctly: the decision is once again unapplied.)
+ * - otherwise             → the enforced figure is neither where the decision
+ *   started nor where it said to land. `from_usd` is free-form payload text
+ *   that nothing validated when the card was written, so a *wrong* prior lands
+ *   here too — and calling that `superseded` would let a bad figure in an
+ *   untrusted field make a real enforcement gap disappear. Split it on a fact
+ *   the database owns instead of on the field under suspicion:
+ *   - `policy.amountUpdatedAt > decidedAt` → **superseded**. Something moved the
+ *     enforced figure after the decision, so a later decision put it where it
+ *     is. Re-asserting a stale figure over that is exactly the "silently
+ *     applying a five-day-old figure over whatever a human since set" hazard
+ *     this reconciler refuses.
+ *   - `policy.amountUpdatedAt <= decidedAt` → **never_applied**. The amount has
+ *     not moved since the decision, so there is no later decision to be
+ *     superseded by; the card's recorded prior was simply wrong, and the gap is
+ *     real.
+ *   - either timestamp unknown → `unverifiable_mismatch`. Reported, never
+ *     written.
+ *
+ *   Reading the *amount-specific* column is load-bearing, not a nicety. This
+ *   split first shipped against `updated_at`, and `budgetService.upsertPolicy`
+ *   is the single edit path for warn percent, hard stop, notify and active
+ *   state as well as the amount — so an operator toggling warn percent on a
+ *   policy whose approved raise never landed pushed `updated_at` past
+ *   `decidedAt`, and a real enforcement gap read as a supersession: unreported
+ *   here, and unrepairable through the apply route. The suppressing edit need
+ *   not be related to the decision at all, which is what made that inference
+ *   unsound rather than merely imprecise (BLO-32796).
+ *
+ * With no recorded prior, the three-way collapses back to the two-way and the
+ * answer is `unverifiable_mismatch` — reported as drift, because failing to
+ * report a real gap is worse than reporting a supersession we cannot rule out.
+ */
+export type AssertionEnforcementState =
+  | "applied"
+  | "never_applied"
+  | "superseded"
+  | "unverifiable_mismatch"
+  | "missing_policy"
+  | "inactive_policy";
+
+/**
+ * Was the enforced *amount* changed after the decision was made?
+ *
+ * `null` when either side is unknown or unparseable — the caller must not
+ * collapse that into `false`, which would read "we have no idea" as "the amount
+ * has not moved".
+ */
+export function policyAmountChangedAfterDecision(
+  amountUpdatedAt: Date | null,
+  decidedAt: Date | string | null,
+): boolean | null {
+  const changed = toEpochMs(amountUpdatedAt);
+  const decided = toEpochMs(decidedAt);
+  if (changed === null || decided === null) return null;
+  return changed > decided;
+}
+
+function toEpochMs(value: Date | string | null): number | null {
+  if (value === null) return null;
+  const ms = value instanceof Date ? value.getTime() : new Date(value).getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
+export function classifyEnforcementAssertion(
+  assertion: EnforcementAssertion,
+  policy: EnforcedBudgetPolicy | null,
+  decidedAt: Date | string | null,
+): AssertionEnforcementState {
+  if (!policy) return "missing_policy";
+  if (!policy.isActive) return "inactive_policy";
+  if (policy.amount === assertion.expectedAmountCents) return "applied";
+  if (assertion.priorAmountCents === null) return "unverifiable_mismatch";
+  if (policy.amount === assertion.priorAmountCents) return "never_applied";
+  const movedAfter = policyAmountChangedAfterDecision(policy.amountUpdatedAt, decidedAt);
+  if (movedAfter === null) return "unverifiable_mismatch";
+  return movedAfter ? "superseded" : "never_applied";
 }
 
 /**
@@ -280,24 +485,41 @@ export function extractEnforcementAssertions(payload: unknown): EnforcementAsser
  * row exists. An absent row is drift, not a skip: "the policy this decision
  * names does not exist" is exactly as broken as a wrong figure, and silently
  * ignoring it would reproduce the original failure mode one level down.
+ *
+ * A `superseded` assertion is deliberately NOT drift — see
+ * `classifyEnforcementAssertion`. It is the one state where the enforcing
+ * object is right and the decision is stale.
  */
 export function diffEnforcementAssertions(
   assertions: readonly EnforcementAssertion[],
   enforced: ReadonlyMap<string, EnforcedBudgetPolicy | null>,
+  decidedAt: Date | string | null,
 ): EnforcementDrift[] {
   const drifts: EnforcementDrift[] = [];
   for (const assertion of assertions) {
     const policy = enforced.get(assertion.policyId) ?? null;
-    if (!policy) {
-      drifts.push({ assertion, actualAmountCents: null, reason: "missing_policy" });
-      continue;
-    }
-    if (!policy.isActive) {
-      drifts.push({ assertion, actualAmountCents: policy.amount, reason: "inactive_policy" });
-      continue;
-    }
-    if (policy.amount !== assertion.expectedAmountCents) {
-      drifts.push({ assertion, actualAmountCents: policy.amount, reason: "amount_mismatch" });
+    switch (classifyEnforcementAssertion(assertion, policy, decidedAt)) {
+      case "applied":
+      case "superseded":
+        continue;
+      case "missing_policy":
+        drifts.push({ assertion, actualAmountCents: null, reason: "missing_policy" });
+        continue;
+      case "inactive_policy":
+        drifts.push({
+          assertion,
+          actualAmountCents: policy?.amount ?? null,
+          reason: "inactive_policy",
+        });
+        continue;
+      case "never_applied":
+      case "unverifiable_mismatch":
+        drifts.push({
+          assertion,
+          actualAmountCents: policy?.amount ?? null,
+          reason: "amount_mismatch",
+        });
+        continue;
     }
   }
   return drifts;
@@ -413,6 +635,7 @@ export async function loadEnforcedBudgetPolicies(
       policyId: budgetPolicies.id,
       amount: budgetPolicies.amount,
       isActive: budgetPolicies.isActive,
+      amountUpdatedAt: budgetPolicies.amountUpdatedAt,
     })
     .from(budgetPolicies)
     .where(and(eq(budgetPolicies.companyId, companyId), inArray(budgetPolicies.id, unique)));
@@ -422,6 +645,7 @@ export async function loadEnforcedBudgetPolicies(
       policyId: row.policyId,
       amount: row.amount,
       isActive: row.isActive,
+      amountUpdatedAt: row.amountUpdatedAt,
     });
   }
   return result;
@@ -767,7 +991,7 @@ export async function reconcileApprovalEnforcement(
         const enforced =
           enforcedByCompany.get(approval.companyId) ??
           new Map<string, EnforcedBudgetPolicy | null>();
-        const drifts = diffEnforcementAssertions(assertions, enforced);
+        const drifts = diffEnforcementAssertions(assertions, enforced, approval.decidedAt);
         if (drifts.length === 0) continue;
         drifted += 1;
 

@@ -196,6 +196,34 @@ export function resolveCcrotateCapacityRetry(
  * (BLO-24011). Enumerated so a re-defer can clear the previous decision wholesale
  * before writing the current one: a key that is absent from the new decision must
  * disappear rather than linger with the old gate's value.
+ *
+ * ## `penstockReason` is a live park label, NOT a historical census field
+ *
+ * PEN-3323. `penstockReason` carries the closed two-member enum our own
+ * availability gate assigns — `penstock.model_capacity_unavailable` (429) or
+ * `penstock.model_temporarily_unavailable` (503). Because both denials book the
+ * single `scheduledRetryReason = "ccrotate_capacity"` (deliberately, to preserve
+ * BLO-28919's census split-check), this key is the ONLY place the 429 and 503
+ * origins are distinguishable. It is surfaced by the `parked-agents` endpoint.
+ *
+ * Two limits, recorded here because both are easy to discover only after
+ * building something on them:
+ *
+ * 1. **It answers "why is this agent parked right now", not "why was it parked".**
+ *    The origin is destroyed when the run later executes: the terminal write
+ *    replaces `resultJson` wholesale (`resultJson: adapterResult.resultJson`),
+ *    and more than one terminal path does so. So a run that parked and then ran
+ *    retains no `penstockReason`, and a retrospective 429-vs-503 census over
+ *    historical runs is NOT supported by this field. Extending the append-only
+ *    run *event* carrier is the route for that, not this key.
+ * 2. **Two read surfaces cannot see it, for different reasons.** The
+ *    `heartbeat.list` projection synthesizes `resultJson` from summary columns
+ *    and is structurally incapable of carrying any park key on any row; before
+ *    PEN-3323 the `parked-agents` projection simply omitted it. A read through
+ *    either one returns null for every row and reads exactly like an unpopulated
+ *    column — which is how PEN-2513 came to record it as never written. The
+ *    working single-run instrument is `GET /heartbeat-runs/:runId`, which selects
+ *    the real column.
  */
 const CCROTATE_CAPACITY_DECISION_KEYS = [
   "retryNotBefore",
@@ -206,6 +234,25 @@ const CCROTATE_CAPACITY_DECISION_KEYS = [
   "penstockRetryAfterSeconds",
   "penstockAdvertisedResumeAt",
   "penstockCapacityParkClampedFrom",
+  /**
+   * Which gate probe denied this park: "capacity" or "messages_fallback"
+   * (BLO-29900).
+   *
+   * `penstockReason` cannot answer this. A 429 from the cheap cached
+   * `GET /v1/pools/default/capacity` and a 429 from the real
+   * `POST /v1/messages` fallback both persist
+   * `penstock.model_capacity_unavailable`, so from a parked row alone it was
+   * impossible to tell whether the re-probe had consumed provider inference
+   * quota — which is exactly the cost the 15m re-probe cadence assumes it is
+   * not paying.
+   *
+   * Belongs in this list rather than beside
+   * {@link CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY}: it describes *this*
+   * denial, not the chain, so a re-defer that lands on the other path must
+   * overwrite it. A value that lingered from a previous hop would assert a
+   * probe cost this park did not pay, which is worse than no value at all.
+   */
+  "penstockProbePath",
 ] as const;
 
 /**
@@ -310,6 +357,14 @@ export interface CcrotateCapacityDecision {
   provider?: string | null;
   model?: string | null;
   reason?: string | null;
+  /**
+   * Which gate probe produced this denial ("capacity" | "messages_fallback"),
+   * persisted under `penstockProbePath` (BLO-29900). Optional so a caller with
+   * no gate result — a hand-built decision in a test, say — is not forced to
+   * invent one; the key is simply absent, which reads as "not recorded" rather
+   * than as a false claim about which probe ran.
+   */
+  probePath?: string | null;
   retryAfterSeconds?: number | null;
   /** What the provider advertised on *this* denial, ISO-8601, or null. */
   advertisedResumeAtIso: string | null;
@@ -390,6 +445,7 @@ export function applyCcrotateCapacityDecision(
   if (decision.provider != null) next.penstockProvider = decision.provider;
   if (decision.model != null) next.penstockModel = decision.model;
   if (decision.reason != null) next.penstockReason = decision.reason;
+  if (decision.probePath != null) next.penstockProbePath = decision.probePath;
   if (decision.retryAfterSeconds != null) {
     next.penstockRetryAfterSeconds = decision.retryAfterSeconds;
   }

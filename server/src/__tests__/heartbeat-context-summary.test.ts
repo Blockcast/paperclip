@@ -9,6 +9,7 @@ import {
   summarizeHeartbeatRunContextSnapshot,
   summarizeHeartbeatRunListResultJson,
 } from "../services/heartbeat.js";
+import { withRecoveryModelProfileHint } from "../services/recovery/model-profile-hint.js";
 
 describe("buildPaperclipTaskMarkdown", () => {
   it("adds planning directives for assignment and comment task context", () => {
@@ -2399,6 +2400,126 @@ describe("mergeCoalescedContextSnapshot", () => {
 
     expect(existing.githubPrNumber).toBe(824);
     expect(existing.githubPrReviewBody).toBe("Findings on #824.");
+  });
+
+  // BLO-32634. The four cases below are one unit: the first two are the
+  // load-bearing pair. Dropping the guard block unconditionally would make the
+  // first pass and the second fail, which is the non-fix this issue rules out.
+  //
+  // `statusOnlyRecoveryRunContext` mirrors the snapshot that
+  // recovery/service.ts's `source_scoped_recovery_action` wake persists, and
+  // `monitorWakeContext` mirrors what `dispatchClaimedIssueMonitor` builds.
+  const statusOnlyRecoveryRunContext = () =>
+    withRecoveryModelProfileHint({
+      issueId: "issue-1",
+      taskId: "issue-1",
+      wakeReason: "source_scoped_recovery_action",
+      source: "issue_recovery_action",
+      recoveryActionId: "recovery-1",
+      sourceIssueId: "issue-1",
+      recoveryCause: "stranded_assigned_issue",
+    }, "status_only");
+
+  const monitorWakeContext = () =>
+    withRecoveryModelProfileHint({
+      issueId: "issue-1",
+      source: "issue.monitor",
+      wakeReason: "issue_monitor_due",
+      nextCheckAt: "2026-09-08T02:00:00.000Z",
+      monitorAttemptCount: 1,
+      monitorNotes: null,
+      manualTrigger: false,
+    }, "normal_model");
+
+  // A monitor fire coalescing into a run row already stamped status-only used to
+  // inherit the whole guard tuple through `{...existing, ...incoming}`, because
+  // the drop-lists above cover only GitHub keys. The monitor's own scheduled work
+  // was then write-refused by `isStatusOnlyCheapRecoveryContext`
+  // (routes/issues.ts) — the monitor could not do the thing it was armed to do.
+  it("does not let an explicit normal-model wake inherit the status-only recovery guard", () => {
+    const merged = mergeCoalescedContextSnapshot(
+      statusOnlyRecoveryRunContext(),
+      monitorWakeContext(),
+    );
+
+    expect(merged.recoveryIntent).toBeUndefined();
+    expect(merged.modelProfile).toBeUndefined();
+    expect(merged.allowDeliverableWork).toBeUndefined();
+    expect(merged.allowDocumentUpdates).toBeUndefined();
+    expect(merged.resumeRequiresNormalModel).toBeUndefined();
+    // The monitor's own fields survive: this is a class drop, not a wipe.
+    expect(merged.wakeReason).toBe("issue_monitor_due");
+    expect(merged.monitorAttemptCount).toBe(1);
+    // Inherited non-guard recovery context is not this block's business.
+    expect(merged.recoveryActionId).toBe("recovery-1");
+  });
+
+  // The sign guard. An incoming wake that says nothing about run class must not
+  // clear the guard off a genuinely status-only run: silence is not a normal-model
+  // declaration.
+  it("keeps the status-only recovery guard when the incoming wake is silent about run class", () => {
+    const merged = mergeCoalescedContextSnapshot(statusOnlyRecoveryRunContext(), {
+      issueId: "issue-1",
+      commentId: "comment-1",
+      wakeCommentId: "comment-1",
+      wakeReason: "issue_commented",
+    });
+
+    expect(merged).toMatchObject({
+      recoveryIntent: "status_only",
+      modelProfile: "cheap",
+      allowDeliverableWork: false,
+      allowDocumentUpdates: false,
+      resumeRequiresNormalModel: true,
+    });
+  });
+
+  it("applies the status-only guard when the recovery wake is the incoming one", () => {
+    const merged = mergeCoalescedContextSnapshot(
+      { issueId: "issue-1", wakeReason: "issue_commented" },
+      statusOnlyRecoveryRunContext(),
+    );
+
+    expect(merged).toMatchObject({
+      recoveryIntent: "status_only",
+      modelProfile: "cheap",
+      resumeRequiresNormalModel: true,
+    });
+  });
+
+  // Mutual exclusivity across the coalesce. `planning_only` never supplies
+  // `modelProfile`, so before the class drop the inherited `cheap` rode along
+  // beside `recoveryIntent: planning_only` — a tuple no caller can construct
+  // directly, and one that trips neither guard predicate cleanly.
+  it("does not leave a partial guard tuple when the run class changes", () => {
+    const merged = mergeCoalescedContextSnapshot(
+      statusOnlyRecoveryRunContext(),
+      withRecoveryModelProfileHint({
+        issueId: "issue-1",
+        wakeReason: "successful_run_handoff",
+      }, "planning_only"),
+    );
+
+    expect(merged.modelProfile).toBeUndefined();
+    expect(merged).toMatchObject({
+      recoveryIntent: "planning_only",
+      allowDeliverableWork: false,
+      allowDocumentUpdates: true,
+      resumeRequiresNormalModel: false,
+    });
+  });
+
+  // Same hazard as the GitHub-key case above, pinned for the guard block: a
+  // clear implemented against `existing` rather than `merged` would strip the
+  // guard off the still-queued run row this snapshot came from.
+  it("does not mutate the caller's existing snapshot when dropping the guard block", () => {
+    const existing = statusOnlyRecoveryRunContext();
+
+    mergeCoalescedContextSnapshot(existing, monitorWakeContext());
+
+    expect(existing.recoveryIntent).toBe("status_only");
+    expect(existing.modelProfile).toBe("cheap");
+    expect(existing.resumeRequiresNormalModel).toBe(true);
   });
 });
 

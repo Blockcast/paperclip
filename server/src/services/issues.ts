@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { and, asc, desc, eq, exists, gt, gte, inArray, isNotNull, isNull, like, lt, lte, ne, notInArray, or, sql, type SQL } from "drizzle-orm";
-import type { Db } from "@paperclipai/db";
+import type { Db, DbTransaction } from "@paperclipai/db";
 import {
   activityLog,
   agentWakeupRequests,
@@ -117,14 +117,14 @@ import {
   TERMINAL_HEARTBEAT_RUN_STATUSES,
   runOwnsIssueExecutionLock,
 } from "./issue-execution-lock.js";
-import { instanceSettingsService } from "./instance-settings.js";
+import { instanceSettingsService, readInstanceSettingsOn } from "./instance-settings.js";
 import {
   assertNotDuplicatePrReviewIssue,
   lockPrReviewIssueScopes,
   normalizePrReviewRepoFullName,
 } from "./pr-review-duplicate-issue-guard.js";
 import { redactCurrentUserText } from "../log-redaction.js";
-import { redactSensitiveText } from "../redaction.js";
+import { redactRunError, redactSensitiveText } from "../redaction.js";
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
 import {
   evaluateIssueRepoBinding,
@@ -148,7 +148,14 @@ import {
 import { runEvidenceGate, type EvidenceFetchResult } from "./evidence-gate-wiring.js";
 import { countDoneWhenBullets } from "./evidence-gate.js";
 import { shouldBlockNarratedDone } from "./done-gate.js";
-import { githubHasCommitEvidence } from "./github-app-auth.js";
+import {
+  githubFetchPrHeadSha,
+  githubGetPullRequestGate,
+  githubHasCommitEvidence,
+  githubListReviewerSurfacesAtPr,
+} from "./github-app-auth.js";
+import { buildGithubTruthProbe, type TruthProbe } from "./evidence-truth.js";
+import { loadConfig } from "../config.js";
 import {
   parseIssueGraphLivenessIncidentKey,
   RECOVERY_ORIGIN_KINDS,
@@ -1007,7 +1014,6 @@ type IssueUserContextInput = {
 };
 type ProjectGoalReader = Pick<Db, "select">;
 type DbReader = Pick<Db, "select">;
-type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
 /**
  * Serialize mutations to the issue parent/blocker graph for one company.
@@ -1154,7 +1160,9 @@ export type BlockedIssueAutoResumeSuppressionReason =
   | "workspace_preflight_blocked"
   | "active_recovery_action"
   | "monitor_gate"
-  | "convergence_stalled";
+  | "convergence_stalled"
+  /** A `doc/execution-semantics.md` two-line external-wait declaration (BLO-30445). */
+  | "external_wait";
 export type BlockedIssueAutoResumeSuppression = {
   issueId: string;
   reason: BlockedIssueAutoResumeSuppressionReason;
@@ -1507,6 +1515,7 @@ async function listPendingFinalizeBlockerIssueIds(
     .select({
       issueId: workspaceOperations.issueId,
       executionWorkspaceId: workspaceOperations.executionWorkspaceId,
+      heartbeatRunId: workspaceOperations.heartbeatRunId,
       phase: workspaceOperations.phase,
       status: workspaceOperations.status,
       startedAt: workspaceOperations.startedAt,
@@ -1520,8 +1529,14 @@ async function listPendingFinalizeBlockerIssueIds(
       ),
     );
 
-  const latestAttributedByBlockerWorkspace = new Map<string, { phase: string; status: string; startedAt: Date }>();
-  const latestUnattributedByWorkspace = new Map<string, { phase: string; status: string; startedAt: Date }>();
+  type LatestOperation = {
+    phase: string;
+    status: string;
+    startedAt: Date;
+    heartbeatRunId: string | null;
+  };
+  const latestAttributedByBlockerWorkspace = new Map<string, LatestOperation>();
+  const latestUnattributedByWorkspace = new Map<string, LatestOperation>();
   for (const row of rows) {
     if (!row.executionWorkspaceId) continue;
     if (row.issueId) {
@@ -1533,6 +1548,7 @@ async function listPendingFinalizeBlockerIssueIds(
           phase: row.phase,
           status: row.status,
           startedAt: row.startedAt,
+          heartbeatRunId: row.heartbeatRunId,
         });
       }
       continue;
@@ -1544,15 +1560,99 @@ async function listPendingFinalizeBlockerIssueIds(
         phase: row.phase,
         status: row.status,
         startedAt: row.startedAt,
+        heartbeatRunId: row.heartbeatRunId,
       });
     }
   }
 
-  for (const pair of blockerWorkspacePairs) {
+  // The barrier waits for a finalize that only a *run* can deliver. Resolve the
+  // status of the run that owes each unfinalized operation so a run that can no
+  // longer deliver one does not gate its dependents forever (see below).
+  //
+  // Resolved ONCE, deliberately. The run-id lookup below and the decision loop
+  // after it must agree on which op is the relevant one for a pair: the first
+  // decides which run ids get fetched, the second decides using those fetches.
+  // Written as two loops they agree only by convention, and an edit to the
+  // resolution rule landing in just one of them produces a silent miss — the
+  // decision asks `owingRunStatusById` for an id the lookup never fetched,
+  // `get()` returns `undefined`, and the barrier fails closed on a run that is
+  // in fact dead. That is the PEN-3255 strand restored, with both loops still
+  // individually self-consistent and no test able to see it. Sharing the array
+  // makes the coupling structural instead.
+  //
+  // Note on the `??` fallback below: on a `shared_workspace` it is keyed by
+  // workspace alone, so a blocker with no attributed op inherits whichever run
+  // last wrote an *unattributed* op there. Before the run-status check that
+  // fallback could only ever hold the gate SHUT; it can now also RELEASE it,
+  // off the death of a run that may never have worked on this blocker. Its
+  // precision is therefore load-bearing in both directions where it used to be
+  // load-bearing in one. Left as-is deliberately: reaching it needs a blocker
+  // with zero attributed ops on a workspace that has unattributed ones, and the
+  // direction it errs in is the one this module's "fail toward releasing"
+  // doctrine prefers to a permanent strand. If those unattributed rows turn out
+  // to be legacy-only, narrow this to an `issueId`-scoped lookup.
+  const unfinalized = blockerWorkspacePairs.flatMap((pair) => {
     const latest = latestAttributedByBlockerWorkspace.get(`${pair.blockerIssueId}:${pair.executionWorkspaceId}`)
       ?? latestUnattributedByWorkspace.get(pair.executionWorkspaceId);
-    if (!latest) continue; // no ops recorded -> nothing to finalize for this blocker
-    if (latest.phase === "workspace_finalize" && latest.status === "succeeded") continue;
+    // No ops recorded -> nothing to finalize for this blocker. An op that IS a
+    // succeeded finalize has already cleared the barrier.
+    if (!latest) return [];
+    if (latest.phase === "workspace_finalize" && latest.status === "succeeded") return [];
+    return [{ pair, latest }];
+  });
+
+  const owingRunIds = new Set<string>();
+  for (const { latest } of unfinalized) {
+    if (latest.heartbeatRunId) owingRunIds.add(latest.heartbeatRunId);
+  }
+
+  const owingRunStatusById = new Map<string, string>();
+  if (owingRunIds.size > 0) {
+    const runRows = await dbOrTx
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          inArray(heartbeatRuns.id, [...owingRunIds]),
+        ),
+      );
+    for (const row of runRows) owingRunStatusById.set(row.id, row.status);
+  }
+
+  for (const { pair, latest } of unfinalized) {
+    // PEN-3255: the barrier had no terminal condition. Only a run writes a
+    // `workspace_finalize` op, so once the run that owed one has reached a
+    // terminal status no finalize can ever arrive — the comment on the caller
+    // promising that "a subsequent finalize wake will re-evaluate readiness"
+    // is false for that case, and the dependent stays gated forever rather
+    // than transiently. Measured instance: PEN-2969's finalize failed at
+    // 2026-09-06T02:27:34Z ("External runtime reservation no longer owns
+    // execution for run 9c34deb7…") 96s AFTER that run itself ended `failed`,
+    // and the single stuck edge then refused checkout and every
+    // `status=in_progress` write on three dependents for 9 days.
+    //
+    // Release only on positive evidence that the owing run is over. An op with
+    // no `heartbeat_run_id`, or one naming a run we cannot read, leaves the
+    // gate closed: absence of a run row is not evidence the work is finished,
+    // and a live/resumable run (`queued`, `running`, `scheduled_retry`) may
+    // still deliver the finalize.
+    //
+    // "Over" is `TERMINAL_HEARTBEAT_RUN_STATUSES` — the set that decides a run
+    // has released the issue execution lock, and the one this file already
+    // uses for every other "has this run finished?" decision. It is
+    // deliberately a 7-element superset including `interrupted`, `error` and
+    // `adapter_failed`: those are dead runs that will never write another
+    // operation, and they are precisely the run-death paths that record no
+    // finalize row. Do not narrow this to a metrics list such as
+    // `agent-scorecards.ts`'s `TERMINAL_RUN_STATUSES` — that one answers "did
+    // the agent fail?" for a failure-rate denominator and excludes those three,
+    // which would leave this barrier permanently shut on exactly the cases it
+    // exists to release. `issue-execution-lock.ts` exists because this notion
+    // had already drifted across three open-coded arrays; a fourth definition
+    // site is the defect, not the fix. Fail toward releasing.
+    const owingRunStatus = latest.heartbeatRunId ? owingRunStatusById.get(latest.heartbeatRunId) : undefined;
+    if (owingRunStatus && TERMINAL_HEARTBEAT_RUN_STATUSES.has(owingRunStatus)) continue;
     pending.add(pair.blockerIssueId);
   }
 
@@ -2175,7 +2275,26 @@ async function withIssueLabels(dbOrTx: any, rows: IssueRow[]): Promise<IssueWith
  * Shapes that record a DURABLE fact ("a PR/commit was attached to this issue"),
  * as opposed to a fact about the current comment window.
  */
-const DURABLE_LANDING_SHAPES = ["pr-link", "landing-artifact"] as const;
+// `deploy:landed` joins these because a merge cannot be undone by a later
+// push: once true it stays true, so carrying it forward is honest.
+// `review:ally-clean` deliberately does NOT — the head can move, and a review
+// that was clean at an older head says nothing about what would ship now.
+// That is the whole defect BLO-19118 / BLO-21489 are about, and caching the
+// shape would reintroduce it inside the gate meant to catch it.
+const DURABLE_LANDING_SHAPES = ["pr-link", "landing-artifact", "deploy:landed"] as const;
+
+/**
+ * The live GitHub truth probe. Built once: it is stateless, and `loadConfig`
+ * is read per call inside the deps so a config reload is picked up.
+ */
+const githubTruthProbe: TruthProbe = buildGithubTruthProbe({
+  fetchHeadSha: (ref) => githubFetchPrHeadSha(ref),
+  listReviewerSurfaces: (ref) => githubListReviewerSurfacesAtPr(ref),
+  getPullRequestGate: (ref) => githubGetPullRequestGate(ref),
+  get reviewerBotLogin() {
+    return loadConfig().prReviewerBotLogin;
+  },
+});
 
 /**
  * Carry forward durable landing evidence when re-evaluating an already-in_review
@@ -2481,6 +2600,11 @@ async function fetchEvidenceForIssue(
         type: issueWorkProducts.type,
         metadata: issueWorkProducts.metadata,
         status: issueWorkProducts.status,
+        // Required by the truth probe, which trusts a `merged` claim only from
+        // a webhook-stamped row. `dbOrTx` is `any` and the result is cast, so
+        // the compiler cannot catch a drop here — losing this column silently
+        // downgrades every PR to a confirm-with-GitHub round trip.
+        sourceTrust: issueWorkProducts.sourceTrust,
       })
       .from(issueWorkProducts)
       .where(eq(issueWorkProducts.issueId, issueId)),
@@ -2586,6 +2710,7 @@ const PRODUCTIVITY_REVIEW_TRIGGERS: readonly IssueProductivityReviewTrigger[] = 
   "long_active_duration",
   "high_churn",
   "runtime_failure_streak",
+  "runaway_execution",
 ];
 
 function lowTrustBoundaryIssueCondition(
@@ -4136,6 +4261,11 @@ export async function listBlockedIssueAutoResumeSuppressions(
   const monitorRows = await dbOrTx
     .select({
       id: issues.id,
+      // Read the FULL column, never a `substring(...)` preview. `listBlockedInboxIssues`
+      // projects the first ISSUE_LIST_DESCRIPTION_MAX_CHARS and that is exactly what made
+      // the blocked-inbox oracle disagree with its own list in BLO-31839 — a park declared
+      // past the cutoff parsed as `null`. Here that would silently drain it (BLO-30445).
+      description: issues.description,
       hasGateSignals: sql<boolean>`
         COALESCE(
           CASE
@@ -4166,6 +4296,15 @@ export async function listBlockedIssueAutoResumeSuppressions(
       addSuppression(row.id, "monitor_gate");
     } else if (row.isConvergenceStalled) {
       addSuppression(row.id, "convergence_stalled");
+    } else if (externalWaitFromDescription(row.description) !== null) {
+      // BLO-30445: the liveness classifier and the stranded-blocked reconciler held opposite
+      // views of the same row. `isDeadEndBlocked` declines to raise `blocked_without_blockers`
+      // against a declared external wait, but the reconciler had no matching exemption, so it
+      // flipped the park to `todo` within one 15m tick — and the reconciler wins, because it
+      // mutates `status`. Measured live on the BLO-30391 fixture pair: the declared row drained
+      // in the same transaction as the undeclared control, so the documented escape hatch in
+      // `doc/execution-semantics.md#declaring-an-external-wait` bought it nothing.
+      addSuppression(row.id, "external_wait");
     }
   }
 
@@ -5581,6 +5720,24 @@ function alertmanagerAggregateCreationFingerprint(
 
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
+  // BLO-34207: `update` and `addComment` are called from inside a transaction
+  // that already holds `lockIssueParentMutationCompany` (recovery's
+  // `escalateStrandedAssignedIssue`). Reading instance settings off the pooled
+  // handle there takes a SECOND pool connection while the lock is held, and
+  // with `POSTGRES_POOL_MAX=10` against 8-9 waiters on that same key the read
+  // only gets a connection when a waiter hits its `lock_timeout` — the convoy.
+  // So bind the settings reads to the caller's handle when there is one.
+  //
+  // `readInstanceSettingsOn` and not `instanceSettingsService(tx)`: the latter
+  // bootstraps the singleton row, which on a caller's tx is a row lock taken
+  // BEFORE the company graph lock and held to commit — a deadlock edge. These
+  // are pure reads, so they take the read-only view on either handle.
+  // Wrapper, not a bare alias: an alias dereferences the module binding when
+  // `issueService(db)` is constructed, so any test that partially mocks
+  // `instance-settings.js` fails just by building the service. Reading it
+  // inside the arrow keeps the dereference at call time.
+  const instanceSettingsOn = (dbOrTx: Parameters<typeof readInstanceSettingsOn>[0]) =>
+    readInstanceSettingsOn(dbOrTx);
   const treeControlSvc = issueTreeControlService(db);
 
   async function lockIssueBlockerRelations(
@@ -5630,7 +5787,7 @@ export function issueService(db: Db) {
     agentId: string,
     now: Date,
     operation: (
-      tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
+      tx: DbTransaction,
       checkoutExecutionPatch: NonNullable<Awaited<ReturnType<typeof runningCheckoutExecutionPatch>>>["patch"],
     ) => Promise<T>,
   ) {
@@ -6567,7 +6724,7 @@ export function issueService(db: Db) {
       .set({
         status: "cancelled",
         finishedAt: now,
-        error: input.reason,
+        error: redactRunError(input.reason),
         errorCode: input.errorCode,
         updatedAt: now,
       })
@@ -7527,7 +7684,7 @@ export function issueService(db: Db) {
       .set({
         status: "cancelled",
         finishedAt: now,
-        error: input.reason,
+        error: redactRunError(input.reason),
         errorCode: input.errorCode,
         updatedAt: now,
       })
@@ -7894,12 +8051,16 @@ export function issueService(db: Db) {
     /**
      * Authoritative per-agent open-assignment census for one company.
      *
-     * Why this exists: `GET /companies/:id/issues` silently clamps `limit` to
-     * {@link ISSUE_LIST_MAX_LIMIT} and returns a bare array — no total, no
-     * cursor — so a caller cannot distinguish "1000 rows is everything" from
-     * "1000 rows is a truncated prefix", and offset paging over a mutating
-     * collection duplicates and drops rows. Callers that need exact counts must
-     * not derive them from that population.
+     * Why this exists: `GET /companies/:id/issues` clamps `limit` to
+     * {@link ISSUE_LIST_MAX_LIMIT} and returns a bare array, and offset paging
+     * over a mutating collection duplicates and drops rows. Callers that need
+     * exact counts must not derive them from that population.
+     *
+     * BLO-33741 made the clamp visible — the route now reports it via the
+     * `X-Result-Truncated`/`X-Applied-Limit` response headers, so a caller can
+     * at least tell "1000 rows is everything" from "1000 rows is a prefix".
+     * That is a detection signal, NOT a substitute for this census: knowing a
+     * page was truncated still leaves you paging a moving collection.
      *
      * The completeness guarantee is structural, not advisory: the whole census
      * is computed by ONE SQL statement. Postgres evaluates a statement against
@@ -10581,7 +10742,7 @@ export function issueService(db: Db) {
           issueId: id,
         });
       }
-      const experimental = await instanceSettings.getExperimental();
+      const experimental = (await instanceSettingsOn(dbOrTx)).experimental;
       const isolatedWorkspacesEnabled = experimental.enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
         delete issueData.executionWorkspaceId;
@@ -10643,6 +10804,9 @@ export function issueService(db: Db) {
               effectiveLabelNames,
             ),
             id,
+            new Date(),
+            githubTruthProbe,
+            { unlabeledTruthBlock: loadConfig().evidenceGateUnlabeledTruthBlock },
           );
           doneGateEvidenceVerdict = doneTransitionEvidenceVerdict;
           const commitEvidence = doneTransitionEvidenceVerdict.commitEvidence ?? [];
@@ -10788,6 +10952,9 @@ export function issueService(db: Db) {
               effectiveLabelNames,
             ),
             id,
+            new Date(),
+            githubTruthProbe,
+            { unlabeledTruthBlock: loadConfig().evidenceGateUnlabeledTruthBlock },
           );
           inReviewVerdict = verdict;
           patch.lastEvidenceVerdict = isInReviewTransition
@@ -12740,8 +12907,65 @@ export function issueService(db: Db) {
       if (!comment) return null;
 
       const currentUserRedactionOptions = {
-        enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
+        enabled: (await instanceSettingsOn(dbOrTx)).general.censorUsernameInLogs,
       };
+      return redactIssueComment(comment, currentUserRedactionOptions.enabled);
+    },
+
+    /**
+     * BLO-31634: rewrite the body of a comment located by its idempotency key.
+     *
+     * The key is the authorization, not just the lookup. Only a caller able to
+     * reproduce the exact `(issue, author, key)` tuple it wrote can reach the
+     * row — and the plugin host namespaces plugin keys with the install row's
+     * id — so a plugin can edit the comments it authored and nothing else.
+     * There is deliberately no update-by-comment-id sibling: that would let
+     * anything holding the permission rewrite a human's comment, and no caller
+     * needs it.
+     *
+     * Returns null when no live row matches — a keyless (pre-0206) row, a
+     * soft-deleted one, or another author's. Callers must treat null as "not
+     * mine to edit" rather than retrying without the key.
+     *
+     * Concurrent callers converge: this is a single UPDATE, so two deliveries
+     * carrying the same edit both write the same body and neither inserts.
+     */
+    updateCommentByIdempotencyKey: async (
+      issueId: string,
+      idempotencyKey: string,
+      body: string,
+      actor: { agentId?: string | null; userId?: string | null },
+      dbOrTx: any = db,
+    ) => {
+      const currentUserRedactionOptions = {
+        enabled: (await instanceSettingsOn(dbOrTx)).general.censorUsernameInLogs,
+      };
+      const now = new Date();
+      const [comment] = await dbOrTx
+        .update(issueComments)
+        .set({
+          body: redactCurrentUserText(body, currentUserRedactionOptions),
+          updatedAt: now,
+        })
+        .where(and(
+          eq(issueComments.issueId, issueId),
+          eq(issueComments.idempotencyKey, idempotencyKey),
+          issueCommentIdempotencyAuthorScope(actor),
+          isNull(issueComments.deletedAt),
+        ))
+        .returning();
+
+      if (!comment) return null;
+
+      // The `issue_comments` activity trigger (0076) is AFTER INSERT only, so an
+      // edit would otherwise leave the thread's recency untouched. Bump the
+      // issue the same way `addComment` does and let the BEFORE UPDATE trigger
+      // on `issues` mirror it into `last_activity_at`.
+      await dbOrTx
+        .update(issues)
+        .set({ updatedAt: now })
+        .where(eq(issues.id, issueId));
+
       return redactIssueComment(comment, currentUserRedactionOptions.enabled);
     },
 
@@ -12800,7 +13024,7 @@ export function issueService(db: Db) {
       if (!issue) throw notFound("Issue not found");
 
       const currentUserRedactionOptions = {
-        enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
+        enabled: (await instanceSettingsOn(dbOrTx)).general.censorUsernameInLogs,
       };
       const redactedBody = redactCurrentUserText(body, currentUserRedactionOptions);
       const authorType = issueCommentAuthorTypeSchema.parse(

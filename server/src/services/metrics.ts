@@ -100,6 +100,71 @@ export type BackstopSkipReason = (typeof BACKSTOP_SKIP_REASONS)[number];
  * Abuse costs a counter increment on an existing series, never storage.
  */
 export const PLUGIN_WEBHOOK_DELIVERY_REJECTED_METRIC = "paperclip_plugin_webhook_delivery_rejected_total";
+/**
+ * PEN-3000: recovery actions retired by `escalateExpiredWakeHorizons`, split by whether a wake
+ * was delivered to the action's CURRENT owner.
+ *
+ * These are two different events that render identically today. `attemptCount` is the count
+ * of wakes that actually REACHED THE QUEUE, not the count of sweeps: `upsertSourceScoped`
+ * reserves `+1` per sweep and `releaseWakeAttempt` refunds it whenever `enqueueWakeup`
+ * returned null (BLO-18996 review follow-up), so reserve-then-refund nets to zero and the
+ * counter freezes at the number of delivered wakes.
+ *
+ * The claim is scoped to the CURRENT OWNER SEQUENCE, not the row's whole life: owner churn
+ * restarts the counter (`attemptCount: isNewOwnerSequence ? 1 : existing.attemptCount + 1`
+ * in `upsertSourceScopedUnlocked`), so a row that woke owner A three times, was handed to
+ * owner B, and then had B's only reservation refunded reads `attemptCount: 0` too. A row
+ * therefore reaches its horizon at 0 only after EVERY sweep since the current owner took
+ * over failed to deliver — a wake-channel failure (provider-capacity deferral, tree pause
+ * hold, wake disabled, cooldown) for that owner, not an owner who was woken and failed to
+ * converge. Nothing on the row records the lifetime delivered count, and
+ * `previousOwnerAgentId` cannot stand in for "never churned": the stranded sweep writes it
+ * from the issue's current assignee on the very first insert (`recovery/service.ts`,
+ * `previousOwnerAgentId: input.issue.assigneeAgentId`), so it is non-null on exactly the
+ * population PEN-3000 measured and gating on it would silence the series.
+ *
+ * Splitting them is what makes the first alertable. `never_delivered` is a scheduler-side
+ * fault and should page (`PaperclipRecoveryHorizonNoWakeToCurrentOwner{Elevated,Sustained}` in
+ * `deploy/helm/paperclip/templates/prometheusrule.yaml`); `delivered` is a genuine
+ * unresolvable stranding and is expected to occur at a low background rate. Measured
+ * motivation (PEN-3000, fleet sweep of 2026-09-07): 19 of 25 live expired actions were at
+ * `attemptCount: 0`, and BLO-19124 could see the symptom but not separate the populations.
+ * The action id, cause and owner stay on the paired structured log line rather than becoming
+ * labels, matching the cardinality rule used above.
+ */
+export const RECOVERY_HORIZON_EXPIRED_METRIC = "paperclip_recovery_horizon_expired_total";
+export const RECOVERY_HORIZON_DELIVERY_STATES = ["never_delivered", "delivered"] as const;
+export type RecoveryHorizonDeliveryState = (typeof RECOVERY_HORIZON_DELIVERY_STATES)[number];
+/**
+ * Relay failures in the worker-tier proxy, labeled by the reason the request
+ * never produced a worker response (BLO-31945).
+ *
+ * Exists because the only record of this failure was a log line, and the api
+ * pod's log is not an instrument: `paperclip-0` is recreated often enough that
+ * `--since=24h` silently resolves to whatever survived the last recreation
+ * (measured 2026-09-16: ~36 minutes, and `--previous` returns nothing at all).
+ * An acceptance criterion asserting "zero relay failures over a rolling 24h"
+ * was therefore unevaluable in either direction against that surface. The
+ * counter has normal retention, so the same question is a range query.
+ *
+ * Cardinality is three series by construction —
+ * {@link KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS} is a closed set, not caller
+ * input. `timeout` means the connection succeeded and the worker was still
+ * silent when the proxy's own deadline fired; `mid_stream` means the worker
+ * answered and the response then broke after headers were already flushed;
+ * `unreachable` means the request never got that far. They are separated
+ * because they route differently: `timeout` is worker latency, `mid_stream` is
+ * a worker that died or was restarted mid-response, and only `unreachable`
+ * points at a missing Service endpoint.
+ */
+export const WORKER_TIER_PROXY_FAILURES_METRIC = "paperclip_worker_tier_proxy_failures_total";
+export const KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS = [
+  "timeout",
+  "mid_stream",
+  "unreachable",
+] as const;
+export type WorkerTierProxyFailureReason =
+  (typeof KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS)[number];
 export const HEARTBEAT_RUN_FAILED_METRIC = "paperclip_heartbeat_run_failed_total";
 export const DEP_BLOCKED_WAKEUP_METRIC = "paperclip_dependency_blocked_wakeup_total";
 /**
@@ -137,8 +202,193 @@ export const ISOLATED_RUN_STARTED_METRIC = "paperclip_k8s_isolated_run_started_t
  * Unknown/empty values collapse to "unknown" to guard against future changes.
  */
 export const CCROTATE_CAPACITY_DEFERRED_METRIC = "paperclip_ccrotate_capacity_deferred_total";
+
+/**
+ * Penstock availability-gate probe counter (BLO-29900).
+ *
+ * ## Why this counter has to exist before anything else gets "fixed"
+ *
+ * `CCROTATE_CAPACITY_MAX_PARK_MS` (15m) is a deliberate trade: re-probe often
+ * rather than honour a provider horizon measured going stale within hours
+ * (BLO-23438 — ~76 runs frozen 5.2 days). That trade is sound *only if
+ * re-probing is cheap*, and the clamp's own docblock asserts exactly that —
+ * "Re-probing is a single cached GET".
+ *
+ * The assertion is **conditional, and the condition was unstated**. When
+ * `readPenstockCapacity` yields no verdict (404, non-ok status, unparseable
+ * body, or `state: "unknown"` without an authoritative reason) the gate falls
+ * through to `probePenstockAnthropicModel` — a real `POST /v1/messages`
+ * against the provider that is currently exhausted. The 30s verdict cache
+ * cannot absorb it at a ~15m cadence, and the fallback is anthropic-only,
+ * which matches the firing alert set (`LLMProxyProviderCapacityRetryStorm
+ * {provider="anthropic"}`, no codex equivalent).
+ *
+ * Before this counter, that path was **unobservable**: `penstock_proxy_requests_total`
+ * carries no `route` label, so probe traffic could not be separated from real
+ * dispatch, and both probe paths persisted the same `reason` on a 429. The
+ * fallback's existence is provable from the code; its *rate* is not provable
+ * from anything that existed. This series is what turns that into a
+ * measurement — deliberately shipped on its own, ahead of any suppression, so
+ * the decision to suppress rests on a number rather than on arithmetic over an
+ * unlabelled series (the BLO-29779 error).
+ *
+ * ## Reading it
+ *
+ * - `path="capacity"` counts every capacity **attempt**, whatever it returned.
+ *   It is the denominator: fallback share is
+ *   `{path="messages_fallback"} / {path="capacity"}`.
+ * - `path="messages_fallback"` counts the provider-inference probes actually
+ *   paid for. **An absent series means the fallback has not been taken since
+ *   process start** — the counter is not pre-seeded, deliberately, so a zero
+ *   cannot be confused with a series that was minted by seeding rather than by
+ *   a real probe. Confirm the gate is probing at all by checking the
+ *   `path="capacity"` series is advancing; do not read fallback silence alone
+ *   as health.
+ * - Cache hits do **not** increment. Only real network probes are counted, so
+ *   the ratio above is over re-probes rather than over gate calls.
+ * - **The fail-open set is path-qualified:** `path="messages_fallback"` with
+ *   `outcome=~"error|auth_fault"`. Only the fallback path returns `allow: true`
+ *   without a verdict (`penstock-availability-gate.ts:762` for the auth fault,
+ *   `:804`/`:813` for transport errors), so a *broken* probe is
+ *   indistinguishable from a healthy one on every other signal and that pair is
+ *   what an alert wants. The same two outcomes on `path="capacity"` are **not**
+ *   fail-open: they yield no verdict and fall through to the fallback, which
+ *   then decides. Alerting on `outcome="error"` alone both misses every
+ *   entitlement fail-open and fires on capacity reads that allowed nothing.
+ *
+ * Cardinality: `path` and `outcome` are fixed allow-lists (2 x 6), coerced
+ * here. `provider` is deliberately **not** coerced: it is bounded by its
+ * caller's own `PenstockProvider` union instead, because collapsing a
+ * genuinely new third provider to "unknown" would hide exactly the per-provider
+ * probe cost this series exists to attribute. `model` comes from
+ * operator-managed `adapterConfig.model`, so it is bounded by the models
+ * configured across the fleet — small, and never attacker- or request-supplied.
+ */
+export const PENSTOCK_AVAILABILITY_GATE_PROBE_METRIC = "penstock_availability_gate_probe_total";
+/**
+ * Latency of one availability-gate probe, in seconds
+ * ({@link PENSTOCK_AVAILABILITY_GATE_PROBE_METRIC} is the count).
+ *
+ * Labeled `path` and `provider` only: `model` and `outcome` are omitted on
+ * purpose because a histogram multiplies every label combination by the bucket
+ * count, and the question this series answers — "is the fallback probe
+ * materially more expensive than the capacity GET?" — does not need them. The
+ * counter keeps the finer breakdown.
+ */
+export const PENSTOCK_AVAILABILITY_GATE_PROBE_DURATION_METRIC =
+  "penstock_availability_gate_probe_duration_seconds";
+
+/** Which probe produced a verdict. Mirrors `PenstockProbePath` in the gate. */
+export const KNOWN_PENSTOCK_PROBE_PATHS = ["capacity", "messages_fallback"] as const;
+export type PenstockProbePathLabel = (typeof KNOWN_PENSTOCK_PROBE_PATHS)[number];
+
+/**
+ * Probe outcomes, as an allow-list so a future branch cannot mint a series.
+ *
+ * - `ok` — probe answered and capacity is available (the gate allows).
+ * - `deny_capacity` — answered `penstock.model_capacity_unavailable`.
+ * - `deny_temporary` — answered `penstock.model_temporarily_unavailable`.
+ * - `inconclusive` — the capacity probe returned no verdict. This is the branch
+ *   that triggers the messages fallback, so its rate is the fallback's cause.
+ *   Minted on `path="capacity"` only; the messages probe never returns it.
+ * - `auth_fault` — 401/403. Kept separate from `error` because PEN-2513's whole
+ *   finding is that an entitlement fault read as a capacity signal parks
+ *   forever on a horizon that cannot expire it. Fails **open** on
+ *   `path="messages_fallback"`; on `path="capacity"` it yields no verdict and
+ *   falls through to the fallback.
+ * - `error` — transport failure or timeout. Fails **open** on
+ *   `path="messages_fallback"`; on `path="capacity"` it falls through to the
+ *   fallback instead, so it is not a fail-open there.
+ */
+export const KNOWN_PENSTOCK_PROBE_OUTCOMES = [
+  "ok",
+  "deny_capacity",
+  "deny_temporary",
+  "inconclusive",
+  "auth_fault",
+  "error",
+] as const;
+export type PenstockProbeOutcomeLabel = (typeof KNOWN_PENSTOCK_PROBE_OUTCOMES)[number];
+
+/**
+ * Buckets sized to the gate's own 3s `timeoutMs`: sub-100ms is a healthy
+ * same-region hop, and the 3s/5s tail exists so an aborted probe is visible
+ * rather than collapsed into `+Inf`.
+ */
+const PENSTOCK_PROBE_DURATION_BUCKETS_SECONDS = [
+  0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 3, 5,
+] as const;
+
 export const HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC =
   "paperclip_heartbeat_timer_scheduler_exclusion_total";
+/**
+ * Heartbeat timer-loop liveness pair (BLO-32269). Incremented once per
+ * `tickTimers` pass with that pass's own `checked`/`enqueued` totals — the same
+ * two integers the worker already logs as
+ * `heartbeat timer tick enqueued runs {"checked":N,"enqueued":M}`.
+ *
+ * These exist so "the fleet has stopped dispatching" can be alerted on the
+ * dispatcher itself rather than on a downstream proxy. `PaperclipFleetDispatchDark`
+ * previously keyed on `absent(paperclip_agent_heartbeat_age_seconds)` (1-for-3:
+ * that gauge is conditionally emitted and blinks ~3x/day) and then on
+ * {@link ISOLATED_RUN_STARTED_METRIC}, which counts only *isolated* per-run k8s
+ * Job starts and would therefore read zero for a fleet running exclusively
+ * shared-isolation work. See BLO-32063.
+ *
+ * Read them as a pair — that is the whole point of exporting both:
+ *   - `checked > 0, enqueued = 0` — candidates were examined and the loop
+ *     deliberately enqueued nothing (none due, or every one gated). Healthy.
+ *   - `checked = 0` — *no candidate was examined*. See below; this is NOT by
+ *     itself evidence that the loop is dead.
+ * Those two states have different remediations and are indistinguishable from
+ * outside the process today.
+ *
+ * `checked = 0` is deliberately worded as "no candidate examined" rather than
+ * "no tick completed", because a tick can complete normally and still record
+ * zero. `checked` is only incremented after three `continue` filters in
+ * `tickTimers` (agent not invokable; heartbeat policy disabled or
+ * `intervalSec <= 0`; a `getWorktreeExecutionCutoff()` cutoff with no eligible
+ * issue behind it), so a fleet where every agent trips one of those yields a
+ * completed pass with `checked = 0`. The full cause list is therefore:
+ *   1. the loop is wedged or the process is dead — the case worth paging on;
+ *   2. every candidate was filtered out before the counter (above);
+ *   3. global scheduling suppression — the caller does not enter `tickTimers`
+ *      at all (`server/src/index.ts`), so nothing is recorded;
+ *   4. startup recovery is still pending (`heartbeatStartupRecoveryPending`);
+ *   5. the shutdown drain has begun (`heartbeatSchedulerStopped`);
+ *   6. the pass completed but {@link recordHeartbeatTimerTick} rejected it as
+ *      malformed and dropped **both** halves — see its own doc comment. This
+ *      should never happen (both inputs are integer accumulators) and is the
+ *      only cause of the six that emits a `logger.warn` naming the bad field,
+ *      so the worker log settles it outright.
+ * Only (1) warrants a restart, and note the trap: restarting for (4) re-enters
+ * (4). Rule out 2–6 first.
+ *
+ * There is no counter that attributes a zero `checked` to which of 2–6 caused
+ * it. {@link HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC} does NOT close that
+ * gap and must not be read as doing so: every one of its increments happens
+ * *after* `checked += 1`, so it is silent in all five of those cases.
+ * Distinguish them from process state instead — worker uptime and the
+ * scheduling-suppression record for (1)/(3), and the worker log for (4)/(5)/(6).
+ *
+ * `checked` is also a composite: agents examined, plus `issueMonitors.checked`,
+ * plus `expiredIssueMonitors.checked`. A consumer cannot decompose it, so
+ * `checked > 0` can be carried entirely by due issue monitors with zero agents
+ * examined. That is fine for a liveness rule — the loop demonstrably ran — but
+ * do not read it as "agents were considered".
+ *
+ * Deliberately unlabeled: the consumer is `sum(increase(...[15m])) == 0`, so
+ * per-agent breakdown would add cardinality without adding signal. Per-agent
+ * detail for *due ticks that were then excluded* lives in
+ * {@link HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC} — which, per the paragraph
+ * above, is a strictly narrower set than "candidates this loop skipped".
+ *
+ * Both counters are emitted by the *worker* (`StatefulSet/paperclip`), which is
+ * where the timer loop runs and which deploys independently of
+ * `Deployment/paperclip-api` (BLO-29004).
+ */
+export const HEARTBEAT_TIMER_CHECKED_METRIC = "paperclip_heartbeat_timer_checked_total";
+export const HEARTBEAT_TIMER_ENQUEUED_METRIC = "paperclip_heartbeat_timer_enqueued_total";
 
 /**
  * BLO-32553: count of adapter run events dropped because they arrived after the
@@ -221,6 +471,26 @@ export const EXTERNAL_RUNTIME_RESERVATION_STRANDED_OLDEST_AGE_METRIC =
 export const EXTERNAL_RUNTIME_RESERVATION_STRAND_METRICS_REFRESH_SUCCESS_METRIC =
   "paperclip_external_runtime_reservation_strand_metrics_refresh_success";
 /**
+ * How long each currently-held per-agent start lock has been held (PEN-3305).
+ *
+ * `withAgentStartLock` serializes queued-run dispatch per agent and has no
+ * timeout, no TTL and no owner-liveness check — deliberately, because the
+ * defect it replaced was a timeout that let a waiter run *alongside* the
+ * holder. The cost of that choice is that a section which never settles holds
+ * its agent's lock forever, and the agent then stops dispatching while
+ * presenting as `status: idle` / `errorReason: null` / `orgChainHealth:
+ * healthy`. Nothing exported that condition, so it was unobservable by
+ * construction — the same gap, and the same argument, as
+ * {@link DB_POOL_CONNECTIONS_METRIC}.
+ *
+ * Emitted only for agents whose lock is held right now, matching the
+ * convention of the per-agent backlog gauges: an absent series means no lock
+ * is held, not a zero-length hold. A healthy section is sub-second, so this is
+ * near-empty in normal operation and anything above a few seconds is real —
+ * `max by (agent_id) (...)` over it is the whole detector.
+ */
+export const AGENT_START_LOCK_HELD_SECONDS_METRIC = "paperclip_agent_start_lock_held_seconds";
+/**
  * Overdue-parked-retry age gauge (BLO-22094). {@link QUEUED_RUN_OLDEST_AGE_METRIC}
  * deliberately excludes `status='scheduled_retry'` rows -- that exclusion is
  * correct and stays (Ally review, onprem-k8s#2013: without it, a retry
@@ -289,6 +559,59 @@ export const DB_POOL_WAITING_QUERIES_METRIC = "paperclip_db_pool_waiting_queries
 /** Queue wait observed when a sanctioned GitHub PR-review run starts. */
 export const PR_REVIEW_QUEUE_WAIT_METRIC = "paperclip_pr_review_queue_wait_seconds";
 export const PR_REVIEW_QUEUE_WAIT_BUCKETS_SECONDS = [60, 300, 600, 900, 1800, 3600, 7200, 14400, 28800];
+/**
+ * BLO-21460 (2026-08-03 incident follow-up). Unlike the two metrics above
+ * (which count every unreleased reservation, healthy in-flight ones
+ * included), these two count only the backlog left AFTER each reconciliation
+ * pass — reservations still in `release_pending` (or an orphaned prelaunch
+ * state) whose Job was confirmed gone/terminal but the row didn't clear, and
+ * the oldest such row's age. In steady state both are 0: the periodic
+ * reconciler (`reapOrphanedRuns` -> `reconcileReleasePendingExternalRuntimeReservations`,
+ * every `heartbeatSchedulerIntervalMs`) and cancellation's own inline release
+ * should always be able to clear a confirmed-terminal reservation. A
+ * sustained non-zero count means reconciliation itself is failing (e.g. the
+ * scheduler is down, as it was during the incident, or the kube API is
+ * unreachable) and slots are leaking toward executor capacity exhaustion.
+ * Alert threshold: any non-zero value sustained >10 min warrants operator
+ * attention; page if oldest age exceeds a few multiples of the scheduler
+ * interval.
+ */
+export const EXTERNAL_RUNTIME_RESERVATIONS_RELEASE_PENDING_METRIC = "paperclip_external_runtime_reservations_release_pending";
+export const EXTERNAL_RUNTIME_RESERVATION_RELEASE_PENDING_OLDEST_AGE_METRIC = "paperclip_external_runtime_reservation_release_pending_oldest_age_seconds";
+/**
+ * BLO-21460. Ephemeral environment leases (`environment_leases.status =
+ * 'active'`) whose heartbeat run has already reached a terminal status —
+ * i.e. leases cancellation or normal finalization should have released but
+ * didn't. Same alerting posture as the release-pending reservation pair
+ * above: 0 in steady state, any sustained non-zero count is a leak heading
+ * toward environment/executor capacity exhaustion.
+ */
+export const ENVIRONMENT_LEASES_ORPHANED_ACTIVE_METRIC = "paperclip_environment_leases_orphaned_active";
+export const ENVIRONMENT_LEASES_ORPHANED_OLDEST_AGE_METRIC = "paperclip_environment_leases_orphaned_oldest_age_seconds";
+/**
+ * Freshness companion for the four BLO-21460 backlog gauges above (Ally
+ * review on #1304). Same role the sibling `*_refresh_success` gauges play,
+ * and load-bearing for the same reason — but the failure mode it covers is
+ * specifically the one the alert was written for.
+ *
+ * `refreshOrphanedRuntimeResourceMetrics` runs *after*
+ * `reconcileOrphanedEnvironmentLeases` in `reapOrphanedRuns`, and that sweep
+ * calls `confirmStaleKilledJobQuiesced` unguarded. A kube-API failure
+ * therefore throws past the refresh, and because `prom-client` gauges retain
+ * their last value, all four series hold their previous reading — normally
+ * `0`, the *healthy* value. Meanwhile the process is alive, so `up` stays `1`
+ * and the scrape target is present: neither the `max(up{...}) == 0` nor the
+ * `absent(up{...})` arm of PaperclipRuntimeResourceReconciliationStuck
+ * compensates. The alert would stay silent during exactly the kube-API
+ * outage its own description tells the operator to check for.
+ *
+ * One gauge for all four series rather than one each: unlike the
+ * queued-run/overdue-retry pair, these four are refreshed by a single
+ * function in one pass, so there is no partial-failure mode for a per-gauge
+ * signal to distinguish — either the pass completed or none of them updated.
+ */
+export const ORPHANED_RUNTIME_RESOURCE_METRICS_REFRESH_SUCCESS_METRIC =
+  "paperclip_orphaned_runtime_resource_metrics_refresh_success";
 /**
  * process_lost reap counter (BLO-16184, parent BLO-12292). Incremented once at
  * the reaper's `process_lost` mint, labeled by bounded `adapter`
@@ -746,6 +1069,52 @@ export const AGENT_WAKEUP_TERMINAL_FAILED_OLDEST_AGE_METRIC =
   "paperclip_agent_wakeup_terminal_failed_oldest_age_seconds";
 
 /**
+ * Runtime presence of the worker-crash recovery candidate index (BLO-21526).
+ * 1 while `heartbeat_runs_crash_recovery_pending_idx` is present, valid and
+ * ready; 0 while it is absent or invalid, which is exactly when the periodic
+ * crash reconciliation gates itself off (`skippedReason:
+ * "candidate_index_missing"`) and the recovery path stops running.
+ *
+ * This exists because migration 0226 records complete on a populated database
+ * WITHOUT building its deferred `CREATE INDEX CONCURRENTLY`, and the only
+ * signal it left behind was a `RAISE NOTICE` the production client swallows
+ * (`onnotice: () => {}`). Every other channel that could have surfaced the gap
+ * is also silent-on-healthy: the deploy guard logs only when it *changes*
+ * something, and the probe's own `logger.warn` is latched to the absent
+ * transition. A gauge is the first signal that says "present" out loud, and
+ * the only one that survives -- `paperclip-0`'s log buffer retains ~4 minutes
+ * on a pod that has been up for hours, so a once-at-startup log line is
+ * unreadable by the time anyone asks.
+ *
+ * Re-derived from `pg_class`/`pg_index` on every periodic scheduler tick, so a
+ * pod restart republishes current state and an index dropped underneath a
+ * running process is picked up within a tick rather than latching forever.
+ *
+ * Deliberately CLEARED (series goes absent) rather than set to 0 when the
+ * catalog probe itself fails: "we could not tell" is not "the index is gone",
+ * and leaving a stale 1 behind would reproduce the exact silent-healthy
+ * failure this metric exists to end. Alert on `== 0` for a real absence and
+ * `absent()` for an unobservable one.
+ *
+ * Labeled by the index name even though only one index is ever published, for
+ * the same reason {@link PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC} carries
+ * a constant `role` label: prom-client auto-publishes a bare (zero-label)
+ * Gauge at 0 the moment it is constructed, and `ensureRegistry` runs on every
+ * tier including the API tier, which never runs this probe. A bare Gauge would
+ * therefore publish a frozen `0` -- "the index is missing" -- on every API pod
+ * forever, and production scrapes both Services, so an `== 0` rule would page
+ * permanently regardless of the truth. A labeled Gauge renders no series until
+ * something calls `.set()`, so it appears only on the tier that can actually
+ * observe the catalog, and `.reset()` genuinely removes the series instead of
+ * zeroing it.
+ */
+export const CRASH_RECOVERY_CANDIDATE_INDEX_PRESENT_METRIC =
+  "paperclip_crash_recovery_candidate_index_present";
+
+/** The single index {@link CRASH_RECOVERY_CANDIDATE_INDEX_PRESENT_METRIC} tracks. */
+export const CRASH_RECOVERY_CANDIDATE_INDEX_NAME = "heartbeat_runs_crash_recovery_pending_idx";
+
+/**
  * Restart-safe gauge: 1 while an installed plugin sits in `status = 'error'`,
  * 0 otherwise (BLO-21092/BLO-20410). One sample per installed plugin, not per
  * status — the label set is only the plugin's stable identity (`plugin_id`,
@@ -830,9 +1199,35 @@ export const PLUGIN_METRIC_DROPPED_METRIC = "paperclip_plugin_metric_dropped_tot
  *   - `mimetype` — plugin-supplied and effectively open.
  * Their metrics still publish; they just publish without those labels. Adding
  * a key here is an explicit cardinality decision, not a convenience.
+ *
+ * `aggregate_key` was added for BLO-32163, and the bound is argued rather than
+ * assumed: it is `alert-aggregate:v1:["<alertname>",<dedupe-domain>]` (see the
+ * alertmanager plugin's `aggregateKeyForAlert`), so its cardinality is
+ * `alertname × dedupe-domain`. `alertname` is already accepted above as bounded
+ * by the alert-rule registry, and `dedupe-domain` is a rule-author opt-in label
+ * that is null on every rule that does not set it. So this sits in the same
+ * order as a key the list already admits, and is bounded by the rule registry —
+ * not by alert *instances*, which is the axis that would actually be unbounded.
+ *
+ * It is load-bearing that `aggregate_key` be a label and not merely present in
+ * the metric name: a wedged-fence page has to name the wedged aggregate to be
+ * actionable, and `alertname` alone cannot do it — two aggregates of the same
+ * rule differing only by dedupe-domain are distinct fences that wedge
+ * independently.
+ *
+ * `phase` (the fence lifecycle column: `active`/`firing`/`cancelling`/
+ * `finalizing`) was in the first cut of this change and is deliberately NOT
+ * here. It is trivially bounded on its own, but it multiplies the fence
+ * metrics' combination count 4× inside their own
+ * {@link PLUGIN_METRIC_CARDINALITY_BUDGET} allowance — ~23 live aggregate keys
+ * × 4 phases exceeds the 50-slot per-name budget, so admitting it would
+ * reintroduce, within one metric, exactly the starvation the per-name ledger
+ * fixes. The responder-facing value it carried is supplied in prose by the
+ * alert annotation instead.
  */
 export const PLUGIN_METRIC_PROMOTABLE_TAG_KEYS = [
   "action",
+  "aggregate_key",
   "alertname",
   "decision",
   "error_code",
@@ -925,18 +1320,22 @@ export const PLUGIN_METRIC_CONTROL_CHAR_REGEX = /[\u0000-\u001F\u007F]/g;
  * from the inbound Alertmanager webhook, so its length is chosen by whoever
  * authored the firing rule, not by us.
  *
- * The *count* of retained values is already bounded by
- * {@link PLUGIN_METRIC_CARDINALITY_BUDGET}, so an unbounded length is bloat
- * rather than a breach: prom-client never retires a label combination, so each
- * one is re-serialised on every scrape for the process lifetime. Truncating is
- * strictly better than dropping — a truncated `alertname` still identifies the
- * alert to a human reading the series, where a dropped label loses the
- * breakdown entirely.
+ * The *count* of retained values is bounded by
+ * {@link PLUGIN_METRIC_NAME_BUDGET} × {@link PLUGIN_METRIC_CARDINALITY_BUDGET}
+ * — each name carries its own combination pool (BLO-32163), so the two budgets
+ * multiply rather than the second bounding the whole plugin. That product is
+ * still finite, so an unbounded length is bloat rather than a breach:
+ * prom-client never retires a label combination, so each one is re-serialised
+ * on every scrape for the process lifetime. Truncating is strictly better than
+ * dropping — a truncated `alertname` still identifies the alert to a human
+ * reading the series, where a dropped label loses the breakdown entirely.
  *
  * 128 is comfortably above the longest alertname firing fleet-wide when this
  * was written (59 chars, `PhysicalInfra...NearConfiguredMax`) while keeping the
  * worst case bounded at roughly
- * `CARDINALITY_BUDGET x promotable-keys x 128` bytes per plugin.
+ * `NAME_BUDGET x CARDINALITY_BUDGET x promotable-keys x 128` bytes per plugin,
+ * i.e. ~3.8 MB at 50 x 50 x 12 x 128. That is 50x the pre-BLO-32163 figure,
+ * which assumed one combination pool shared across all of a plugin's names.
  */
 export const PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH = 128;
 
@@ -956,9 +1355,10 @@ export const PLUGIN_METRIC_NAME_BUDGET = 50;
 
 /**
  * Ceiling on distinct `(metric, promoted-label-values)` combinations a single
- * plugin may occupy, per process lifetime. Past it, a write **keeps its
- * `metric` label and drops its promoted labels**, so it still lands on the
- * plugin's real per-name series.
+ * **(plugin, metric name)** pair may occupy, per process lifetime — not a
+ * per-plugin pool; see the BLO-32163 paragraph below for why that distinction
+ * is load-bearing. Past it, a write **keeps its `metric` label and drops its
+ * promoted labels**, so it still lands on the plugin's real per-name series.
  *
  * The two tiers degrade on different axes, and that asymmetry is the whole
  * point (PEN-2799 review of its own first cut):
@@ -988,10 +1388,29 @@ export const PLUGIN_METRIC_NAME_BUDGET = 50;
  * restart; the alternative is persisting the ledger, which is not worth a DB
  * write per metric.
  *
- * Worst case per plugin is {@link PLUGIN_METRIC_NAME_BUDGET} name-level series
- * + this many full combinations + one `_overflow`, i.e. 151.
+ * This budget is per **(plugin, metric name)**, not per plugin, and that is
+ * load-bearing rather than a refinement (BLO-32163). A single shared pool is
+ * first-come-first-served over a *restart* lottery, so a chatty metric
+ * permanently starves a rare one — and the rare one is exactly the metric a
+ * page depends on. Measured in production 2026-09-17 on
+ * `paperclip-plugin-alertmanager`: 110 distinct series against a shared budget
+ * of 100, with `alertmanager.aggregate.fence_blocked` — the wedged-fence
+ * signal — dropping 91 writes/hr to `label_budget` while
+ * `alertmanager.alert.error` (185/hr) and `alertmanager.firing.deduped`
+ * (101/hr) held the slots. Adding a key to
+ * {@link PLUGIN_METRIC_PROMOTABLE_TAG_KEYS} cannot fix that: a full ledger
+ * rejects every new combination regardless of which keys compose it. Giving
+ * each name its own allowance is what makes a promotion actually reach the
+ * series, so the two changes ship together.
+ *
+ * Halved from 100 to keep the inflation proportionate: worst case per plugin
+ * is {@link PLUGIN_METRIC_NAME_BUDGET} name-level series + that many × this
+ * many combinations + one `_overflow`, i.e. 2551 rather than the previous 151.
+ * 50 is ~2× the largest per-name combination count any live metric has reached
+ * (24, on `alertmanager.alert.error`), and the chatty metrics already lose
+ * combinations under the shared pool, so no live breakdown regresses.
  */
-export const PLUGIN_METRIC_CARDINALITY_BUDGET = 100;
+export const PLUGIN_METRIC_CARDINALITY_BUDGET = 50;
 
 /** Label value that over-name-budget writes collapse into. */
 export const PLUGIN_METRIC_OVERFLOW_NAME = "_overflow";
@@ -1863,15 +2282,25 @@ type HeartbeatRunFailedLabel =
 
 let heartbeatRunFailed: Counter<HeartbeatRunFailedLabel> | null = null;
 let ccrotateCapacityDeferred: Counter<"adapter" | "provider"> | null = null;
+let penstockGateProbe: Counter<"path" | "outcome" | "provider" | "model"> | null = null;
+let penstockGateProbeDuration: Histogram<"path" | "provider"> | null = null;
 let heartbeatTimerSchedulerExclusion: Counter<"reason"> | null = null;
 let heartbeatPostTerminalRunEventDropped: Counter<"status"> | null = null;
+let heartbeatTimerChecked: Counter | null = null;
+let heartbeatTimerEnqueued: Counter | null = null;
 let agentZeroTokenCompletedRunStreak: Gauge<"agent_id" | "adapter"> | null = null;
 let externalRuntimeReservationEvents: Counter<"event"> | null = null;
 let externalRuntimeReservationsActive: Gauge | null = null;
 let externalRuntimeReservationOldestAge: Gauge | null = null;
 let queuedRunAgeMetricsRefreshSuccess: Gauge | null = null;
+let externalRuntimeReservationsReleasePending: Gauge | null = null;
+let externalRuntimeReservationReleasePendingOldestAge: Gauge | null = null;
+let environmentLeasesOrphanedActive: Gauge | null = null;
+let environmentLeasesOrphanedOldestAge: Gauge | null = null;
+let orphanedRuntimeResourceMetricsRefreshSuccess: Gauge | null = null;
 let externalRuntimeReservationStrandedOldestAge: Gauge<"agent_id"> | null = null;
 let externalRuntimeReservationStrandMetricsRefreshSuccess: Gauge | null = null;
+let agentStartLockHeldSeconds: Gauge<"agent_id"> | null = null;
 let processLostTotal: Counter<"adapter" | "error_bucket" | "classification"> | null = null;
 let externalLifecycleRunningRuns: Gauge<"adapter"> | null = null;
 let externalLifecycleRunSilenceGap: Histogram<"adapter" | "status"> | null = null;
@@ -1894,6 +2323,7 @@ let scheduledRetryParkHorizonRefreshSuccess: Gauge | null = null;
 let dbPoolConnections: Gauge<"state"> | null = null;
 let dbPoolWaitingQueries: Gauge | null = null;
 let pluginError: Gauge<"plugin_id" | "plugin_key"> | null = null;
+let crashRecoveryCandidateIndexPresent: Gauge<"index"> | null = null;
 let pluginMetric: Counter<
   "plugin_id" | "plugin_key" | "metric" | PluginMetricPromotableTagKey
 > | null = null;
@@ -1926,18 +2356,21 @@ let pluginMetricDropped: Counter<"plugin_id" | "plugin_key" | "reason" | "metric
  * `never emits a raw control character into the exposition` is what fails if
  * it is ever removed.
  *
- * Entries are keyed by `pluginId` and are never pruned in production — only
+ * Entries are keyed by `pluginId\0name` (BLO-32163 — see
+ * {@link PLUGIN_METRIC_CARDINALITY_BUDGET} for why the ledger is per-name
+ * rather than per-plugin) and are never pruned in production — only
  * {@link __resetMetricsForTest} clears them — so a plugin uninstalled or
  * disabled mid-process keeps its ledger for the worker's lifetime. That is
  * deliberate, not an oversight. The residue is bounded by the same two budgets
- * this ledger exists to enforce (at most 50 names and 100 combinations per
- * plugin, so ~150 short strings), and on the *default* uninstall path pruning
+ * this ledger exists to enforce (at most 50 names × 50 combinations per
+ * plugin), and on the *default* uninstall path pruning
  * would hand a reinstall a fresh budget — turning install/uninstall into a way
  * to mint unbounded series, which is exactly what the bound refuses.
  *
  * That default is a soft delete: the row survives as `uninstalled` and a
- * reinstall reuses it, so `pluginId` — and with it the ledger key — is stable
- * across the cycle. `uninstall(id, removeData = true)` instead hard-deletes the
+ * reinstall reuses it, so `pluginId` — and with it the ledger key prefix — is
+ * stable across the cycle. `uninstall(id, removeData = true)` instead
+ * hard-deletes the
  * row, so the reinstall inserts under a fresh `defaultRandom()` id and gets a
  * clean budget whether or not we prune; there the retained entry is an orphan
  * rather than a hole this closes. The rule is kept unconditional because the
@@ -1968,6 +2401,8 @@ let backstopCandidatesSkipped: Counter<"source" | "reason"> | null = null;
 let pluginWebhookDeliveryRejected:
   | Counter<"plugin_key" | "response_class" | "plugin_status">
   | null = null;
+let recoveryHorizonExpired: Counter<"delivery"> | null = null;
+let workerTierProxyFailures: Counter<"reason"> | null = null;
 
 function ensureRegistry(): {
   registry: Registry;
@@ -1975,12 +2410,21 @@ function ensureRegistry(): {
   isolatedStartedCounter: Counter<"agent_id" | "isolation_mode">;
   failedCounter: Counter<HeartbeatRunFailedLabel>;
   capacityDeferredCounter: Counter<"adapter" | "provider">;
+  penstockGateProbeCounter: Counter<"path" | "outcome" | "provider" | "model">;
+  penstockGateProbeDurationHistogram: Histogram<"path" | "provider">;
   heartbeatTimerSchedulerExclusionCounter: Counter<"reason">;
   heartbeatPostTerminalRunEventDroppedCounter: Counter<"status">;
+  heartbeatTimerCheckedCounter: Counter;
+  heartbeatTimerEnqueuedCounter: Counter;
   zeroTokenCompletedRunStreakGauge: Gauge<"agent_id" | "adapter">;
   externalRuntimeReservationEventsCounter: Counter<"event">;
   externalRuntimeReservationsActiveGauge: Gauge;
   externalRuntimeReservationOldestAgeGauge: Gauge;
+  externalRuntimeReservationsReleasePendingGauge: Gauge;
+  externalRuntimeReservationReleasePendingOldestAgeGauge: Gauge;
+  environmentLeasesOrphanedActiveGauge: Gauge;
+  environmentLeasesOrphanedOldestAgeGauge: Gauge;
+  orphanedRuntimeResourceMetricsRefreshSuccessGauge: Gauge;
   processLostTotalCounter: Counter<"adapter" | "error_bucket" | "classification">;
   externalLifecycleRunningRunsGauge: Gauge<"adapter">;
   externalLifecycleRunSilenceGapHistogram: Histogram<"adapter" | "status">;
@@ -2004,6 +2448,7 @@ function ensureRegistry(): {
   dbPoolConnectionsGauge: Gauge<"state">;
   dbPoolWaitingQueriesGauge: Gauge;
   pluginErrorGauge: Gauge<"plugin_id" | "plugin_key">;
+  crashRecoveryCandidateIndexPresentGauge: Gauge<"index">;
   pluginMetricCounter: Counter<
     "plugin_id" | "plugin_key" | "metric" | PluginMetricPromotableTagKey
   >;
@@ -2011,6 +2456,7 @@ function ensureRegistry(): {
   pluginStatusCollectorLastSuccessGauge: Gauge<"role">;
   externalRuntimeReservationStrandedOldestAgeGauge: Gauge<"agent_id">;
   externalRuntimeReservationStrandMetricsRefreshSuccessGauge: Gauge;
+  agentStartLockHeldSecondsGauge: Gauge<"agent_id">;
   prReviewQueueWaitHistogram: Histogram;
   authRequestCounter: Counter<"operation" | "outcome">;
   gbrainRecallCounter: Counter<"status">;
@@ -2024,6 +2470,8 @@ function ensureRegistry(): {
   backstopSweepCompletedCounter: Counter<"source">;
   backstopCandidatesSkippedCounter: Counter<"source" | "reason">;
   pluginWebhookDeliveryRejectedCounter: Counter<"plugin_key" | "response_class" | "plugin_status">;
+  recoveryHorizonExpiredCounter: Counter<"delivery">;
+  workerTierProxyFailuresCounter: Counter<"reason">;
 } {
   if (
     !registry
@@ -2031,15 +2479,25 @@ function ensureRegistry(): {
     || !isolatedRunStarted
     || !heartbeatRunFailed
     || !ccrotateCapacityDeferred
+    || !penstockGateProbe
+    || !penstockGateProbeDuration
     || !heartbeatTimerSchedulerExclusion
     || !heartbeatPostTerminalRunEventDropped
+    || !heartbeatTimerChecked
+    || !heartbeatTimerEnqueued
     || !agentZeroTokenCompletedRunStreak
     || !externalRuntimeReservationEvents
     || !externalRuntimeReservationsActive
     || !externalRuntimeReservationOldestAge
     || !queuedRunAgeMetricsRefreshSuccess
+    || !externalRuntimeReservationsReleasePending
+    || !externalRuntimeReservationReleasePendingOldestAge
+    || !environmentLeasesOrphanedActive
+    || !environmentLeasesOrphanedOldestAge
+    || !orphanedRuntimeResourceMetricsRefreshSuccess
     || !externalRuntimeReservationStrandedOldestAge
     || !externalRuntimeReservationStrandMetricsRefreshSuccess
+    || !agentStartLockHeldSeconds
     || !processLostTotal
     || !externalLifecycleRunningRuns
     || !externalLifecycleRunSilenceGap
@@ -2062,6 +2520,7 @@ function ensureRegistry(): {
     || !dbPoolConnections
     || !dbPoolWaitingQueries
     || !pluginError
+    || !crashRecoveryCandidateIndexPresent
     || !pluginMetric
     || !pluginMetricDropped
     || !pluginStatusCollectorLastSuccess
@@ -2078,6 +2537,8 @@ function ensureRegistry(): {
     || !backstopSweepCompleted
     || !backstopCandidatesSkipped
     || !pluginWebhookDeliveryRejected
+    || !recoveryHorizonExpired
+    || !workerTierProxyFailures
   ) {
     registry = new Registry();
     concurrentRunBlocked = new Counter({
@@ -2105,10 +2566,11 @@ function ensureRegistry(): {
       help:
         "Count of heartbeat runs that reached terminal status 'failed', labeled by agent, source issue, "
         + "adapter, error_code, invocation_source (wake reason), and bounded isolation_mode. Used to "
-        + "compute webhook-driven PR-review failure rate and detect repeated run-isolated execution-pod "
-        + "failures for one issue (BLO-7457 / BLO-9147 / BLO-17953). Agent and issue identifiers are "
-        + "retained only for run-isolated k8s_pod_schedule_failed; other failures collapse them to "
-        + "bounded fallbacks.",
+        + "compute webhook-driven PR-review failure rate and detect repeated execution-pod "
+        + "failures (BLO-7457 / BLO-9147 / BLO-17953). Agent and issue identifiers are "
+        + "retained for k8s_pod_schedule_failed in every isolation mode (run, workspace and shared are "
+        + "all execution pods); other error codes collapse them to bounded fallbacks. Note issue_id is "
+        + "legitimately 'none' for stateless PR-review runs, which are issue-less by construction.",
       labelNames: ["agent_id", "issue_id", "adapter", "error_code", "invocation_source", "isolation_mode"],
       registers: [registry],
     });
@@ -2120,6 +2582,35 @@ function ensureRegistry(): {
         + "that returned scheduled_retry with scheduledRetryReason='ccrotate_capacity'. "
         + "A sustained non-zero rate means the fleet is quota-stalled.",
       labelNames: ["adapter", "provider"],
+      registers: [registry],
+    });
+    penstockGateProbe = new Counter({
+      name: PENSTOCK_AVAILABILITY_GATE_PROBE_METRIC,
+      help:
+        "Count of penstock availability-gate probes (BLO-29900), labeled by path "
+        + "(capacity = the cached GET /v1/pools/default/capacity; messages_fallback = the "
+        + "real POST /v1/messages taken when that GET yields no verdict), bounded outcome, "
+        + "provider, and model. path=capacity counts every attempt and is the denominator "
+        + "for fallback share. Not pre-seeded: an absent messages_fallback series means the "
+        + "fallback has not been taken since process start, so confirm path=capacity is "
+        + "advancing before reading that silence as health. Cache hits are not counted, so "
+        + "the ratio is over real re-probes. The fail-open set is path-qualified: "
+        + "path=messages_fallback with outcome=error|auth_fault allows dispatch with no "
+        + "verdict, and no other signal distinguishes that from a healthy probe. Those same "
+        + "outcomes on path=capacity are NOT fail-open - they fall through to the fallback, "
+        + "which decides.",
+      labelNames: ["path", "outcome", "provider", "model"],
+      registers: [registry],
+    });
+    penstockGateProbeDuration = new Histogram({
+      name: PENSTOCK_AVAILABILITY_GATE_PROBE_DURATION_METRIC,
+      help:
+        "Seconds spent in one penstock availability-gate probe, labeled by path and provider "
+        + "(BLO-29900). Answers whether the messages_fallback probe is materially more "
+        + "expensive than the capacity GET the clamp's cheapness assumption rests on. "
+        + "Buckets run to 5s so a probe aborted at the gate's 3s timeout stays visible.",
+      labelNames: ["path", "provider"],
+      buckets: [...PENSTOCK_PROBE_DURATION_BUCKETS_SECONDS],
       registers: [registry],
     });
     heartbeatTimerSchedulerExclusion = new Counter({
@@ -2140,6 +2631,42 @@ function ensureRegistry(): {
         + "non-zero rate means an adapter is emitting from a continuation that outlives "
         + "execute() — expected only on the orphan-kill path.",
       labelNames: ["status"],
+      registers: [registry],
+    });
+    // Unlabeled on purpose (BLO-32269): consumed as
+    // `sum(increase(...[15m])) == 0`. prom-client zero-initializes an unlabeled
+    // counter at construction, so both series are present on the very first
+    // scrape after boot — a dispatch-dark rule must be able to tell "0 ticks"
+    // from "metric not published yet", and an absent series cannot.
+    heartbeatTimerChecked = new Counter({
+      name: HEARTBEAT_TIMER_CHECKED_METRIC,
+      help:
+        "Count of heartbeat timer-loop candidates examined, summed across completed "
+        + "tickTimers passes. Composite: agents examined + due issue monitors + expired "
+        + "issue monitors. Recorded on every completed pass, not only passes that "
+        + "enqueued something. Read with " + HEARTBEAT_TIMER_ENQUEUED_METRIC
+        + ": checked>0/enqueued=0 is a healthy idle loop. checked=0 means no candidate "
+        + "was examined, which is NOT by itself a dead loop -- a pass can complete with "
+        + "zero after every agent is filtered out, and the loop is also not entered "
+        + "under global scheduling suppression, during startup recovery, or during the "
+        + "shutdown drain. A completed pass is also dropped outright, both halves, if "
+        + "either input is not a non-negative finite number -- that is logged with the "
+        + "offending field and should never happen. "
+        + HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC + " cannot "
+        + "disambiguate these: it is only incremented after this counter, so it is "
+        + "silent in all of them. Rule them out from worker uptime and logs before "
+        + "restarting. Emitted by the worker, where the timer loop runs (BLO-32269).",
+      registers: [registry],
+    });
+    heartbeatTimerEnqueued = new Counter({
+      name: HEARTBEAT_TIMER_ENQUEUED_METRIC,
+      help:
+        "Count of heartbeat runs enqueued by the timer loop, summed across completed "
+        + "tickTimers passes. Mirrors the `enqueued` field of the "
+        + "'heartbeat timer tick enqueued runs' log line. Direct dispatcher-side "
+        + "replacement for the isolated-run proxy previously used by "
+        + "PaperclipFleetDispatchDark, which could not see shared-isolation work "
+        + "(BLO-32269 / BLO-32063).",
       registers: [registry],
     });
     agentZeroTokenCompletedRunStreak = new Gauge({
@@ -2205,6 +2732,53 @@ function ensureRegistry(): {
         + "and a zero value rules it out.",
       registers: [registry],
     });
+    agentStartLockHeldSeconds = new Gauge({
+      name: AGENT_START_LOCK_HELD_SECONDS_METRIC,
+      help:
+        "Seconds the per-agent queued-run dispatch start lock has currently been held (PEN-3305). "
+        + "withAgentStartLock has no timeout by design, so a section that never settles holds its "
+        + "agent's lock forever and that agent silently stops dispatching -- while still reading "
+        + "status=idle, errorReason=null, orgChainHealth=healthy. Series exist only while a lock is "
+        + "held, so absence means no hold, not a zero-length one. A healthy section is sub-second; "
+        + "sustained tens of seconds is a wedge. Per-pod, because the lock is per-process.",
+      labelNames: ["agent_id"],
+      registers: [registry],
+    });
+    externalRuntimeReservationsReleasePending = new Gauge({
+      name: EXTERNAL_RUNTIME_RESERVATIONS_RELEASE_PENDING_METRIC,
+      help:
+        "Reservations confirmed releasable (Job gone/terminal) that reconciliation still had "
+        + "not cleared as of the last pass. 0 in steady state; sustained non-zero means "
+        + "reconciliation itself is failing (BLO-21460).",
+      registers: [registry],
+    });
+    externalRuntimeReservationReleasePendingOldestAge = new Gauge({
+      name: EXTERNAL_RUNTIME_RESERVATION_RELEASE_PENDING_OLDEST_AGE_METRIC,
+      help: "Age in seconds of the oldest reservation counted by " + EXTERNAL_RUNTIME_RESERVATIONS_RELEASE_PENDING_METRIC + ".",
+      registers: [registry],
+    });
+    environmentLeasesOrphanedActive = new Gauge({
+      name: ENVIRONMENT_LEASES_ORPHANED_ACTIVE_METRIC,
+      help:
+        "Ephemeral environment leases still 'active' whose heartbeat run is already terminal. "
+        + "0 in steady state; sustained non-zero means lease release did not run for that run "
+        + "(BLO-21460).",
+      registers: [registry],
+    });
+    environmentLeasesOrphanedOldestAge = new Gauge({
+      name: ENVIRONMENT_LEASES_ORPHANED_OLDEST_AGE_METRIC,
+      help: "Age in seconds of the oldest lease counted by " + ENVIRONMENT_LEASES_ORPHANED_ACTIVE_METRIC + ".",
+      registers: [registry],
+    });
+    orphanedRuntimeResourceMetricsRefreshSuccess = new Gauge({
+      name: ORPHANED_RUNTIME_RESOURCE_METRICS_REFRESH_SUCCESS_METRIC,
+      help:
+        "1 when the orphaned runtime-resource backlog refresh (release-pending reservations "
+        + "and orphaned environment leases) completed, otherwise 0. Guards against the four "
+        + "backlog gauges holding a stale healthy 0 when the preceding sweep threw (BLO-21460).",
+      registers: [registry],
+    });
+    orphanedRuntimeResourceMetricsRefreshSuccess.set(0);
     externalRuntimeReservationStrandedOldestAge = new Gauge({
       name: EXTERNAL_RUNTIME_RESERVATION_STRANDED_OLDEST_AGE_METRIC,
       help:
@@ -2555,6 +3129,22 @@ function ensureRegistry(): {
       registers: [registry],
     });
     overdueScheduledRetryAgeMetricsRefreshSuccess.set(0);
+    crashRecoveryCandidateIndexPresent = new Gauge({
+      name: CRASH_RECOVERY_CANDIDATE_INDEX_PRESENT_METRIC,
+      help:
+        "1 while heartbeat_runs_crash_recovery_pending_idx is present, valid and "
+        + "ready; 0 while it is absent or invalid and the periodic worker-crash "
+        + "reconciliation is therefore gating itself off (BLO-21526). Migration "
+        + "0226 records complete on a populated database without building this "
+        + "deferred CONCURRENTLY index, and its RAISE NOTICE is swallowed by the "
+        + "production client, so this gauge is the only channel that states the "
+        + "index is present rather than merely staying quiet about it. Re-derived "
+        + "from pg_class/pg_index every periodic scheduler tick. The series is "
+        + "CLEARED, not zeroed, when the catalog probe itself fails: alert on == 0 "
+        + "for a real absence and absent() for an unobservable one.",
+      labelNames: ["index"],
+      registers: [registry],
+    });
     pluginError = new Gauge({
       name: PLUGIN_ERROR_METRIC,
       help:
@@ -2585,7 +3175,7 @@ function ensureRegistry(): {
         + "silently); unpromoted tags stay on the "
         + "plugin_logs row. company_id is deliberately not a label (unbounded "
         + "per tenant). Two cardinality tiers degrade on DIFFERENT axes: past "
-        + "the per-plugin tag-value budget a write keeps its 'metric' label and "
+        + "the per-(plugin, metric) tag-value budget a write keeps its 'metric' label and "
         + "drops its promoted labels, so a rule matching metric=\"<name>\" keeps "
         + "working and sum by (metric) stays exact; only a plugin exceeding the "
         + "much tighter metric-NAME budget collapses to metric=\""
@@ -2604,7 +3194,7 @@ function ensureRegistry(): {
         "Plugin metric writes not published as-submitted, by reason "
         + "(PEN-2799): 'bad_name' (name failed shape/length validation), "
         + "'bad_value' (non-finite or negative -- ctx.metrics.write is a "
-        + "counter increment), 'label_budget' (per-plugin tag-value budget "
+        + "counter increment), 'label_budget' (per-(plugin, metric) tag-value budget "
         + "exhausted, so the promoted labels were dropped but the increment "
         + "still landed on the metric's own series -- totals stay correct, only "
         + "the per-tag breakdown is lost), 'name_budget' (the plugin exceeded "
@@ -2806,6 +3396,47 @@ function ensureRegistry(): {
       labelNames: ["plugin_key", "response_class", "plugin_status"],
       registers: [registry],
     });
+    recoveryHorizonExpired = new Counter({
+      name: RECOVERY_HORIZON_EXPIRED_METRIC,
+      help:
+        "Recovery actions retired at their auto-recovery wake horizon, labeled by whether a "
+        + "wake was delivered to the action's CURRENT owner. delivery=\"never_delivered\" "
+        + "means attemptCount reached the horizon at 0 — every sweep since the current owner "
+        + "took over reserved an attempt and refunded it because enqueueWakeup delivered "
+        + "nothing, so no wake reached the queue for that owner. Owner churn restarts the "
+        + "counter, so an earlier owner may have been woken; the label does not claim the row's "
+        + "whole life. That is a wake-channel fault (capacity deferral, tree pause hold, wake "
+        + "disabled, cooldown) and is the alertable one. delivery=\"delivered\" means the current "
+        + "owner was woken at least once and the recovery still did not converge, which is a "
+        + "genuine unresolvable stranding. Action id, cause and owner are on the paired "
+        + "structured log line, not these labels.",
+      labelNames: ["delivery"],
+      registers: [registry],
+    });
+    // Zero-init both series so a scrape can distinguish "no expiry yet" from "not
+    // instrumented" — same reason the backstop gauges and the workspace-fallback counter
+    // are seeded above. Without this an alert on never_delivered cannot fire off absent().
+    for (const delivery of RECOVERY_HORIZON_DELIVERY_STATES) {
+      recoveryHorizonExpired.inc({ delivery }, 0);
+    }
+    workerTierProxyFailures = new Counter({
+      name: WORKER_TIER_PROXY_FAILURES_METRIC,
+      help:
+        "Count of worker-tier proxy relay failures, labeled by reason: 'timeout' "
+        + "(connection succeeded, the worker was still silent at the proxy deadline), "
+        + "'mid_stream' (the worker answered and the response broke after headers "
+        + "were flushed) or 'unreachable' (the request never reached a worker). "
+        + "Replaces a log grep that could not answer a 24h question, because the api "
+        + "pod's log does not survive its own recreation (BLO-31945).",
+      labelNames: ["reason"],
+      registers: [registry],
+    });
+    // Zero-init every series. An un-incremented counter is absent from the
+    // scrape, and an absent series is indistinguishable from a healthy one on
+    // every dashboard — rate() over it returns nothing rather than 0.
+    for (const reason of KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS) {
+      workerTierProxyFailures.inc({ reason }, 0);
+    }
     // Process/runtime metrics make the scrape target carry meaningful data even
     // before any refusal is reported (manual-verification check #3 on BLO-8328).
     collectDefaultMetrics({ register: registry });
@@ -2816,16 +3447,26 @@ function ensureRegistry(): {
     isolatedStartedCounter: isolatedRunStarted,
     failedCounter: heartbeatRunFailed,
     capacityDeferredCounter: ccrotateCapacityDeferred,
+    penstockGateProbeCounter: penstockGateProbe,
+    penstockGateProbeDurationHistogram: penstockGateProbeDuration,
     heartbeatTimerSchedulerExclusionCounter: heartbeatTimerSchedulerExclusion,
     heartbeatPostTerminalRunEventDroppedCounter: heartbeatPostTerminalRunEventDropped,
+    heartbeatTimerCheckedCounter: heartbeatTimerChecked,
+    heartbeatTimerEnqueuedCounter: heartbeatTimerEnqueued,
     zeroTokenCompletedRunStreakGauge: agentZeroTokenCompletedRunStreak,
     externalRuntimeReservationEventsCounter: externalRuntimeReservationEvents,
     externalRuntimeReservationsActiveGauge: externalRuntimeReservationsActive,
     externalRuntimeReservationOldestAgeGauge: externalRuntimeReservationOldestAge,
     queuedRunAgeMetricsRefreshSuccessGauge: queuedRunAgeMetricsRefreshSuccess,
+    externalRuntimeReservationsReleasePendingGauge: externalRuntimeReservationsReleasePending,
+    externalRuntimeReservationReleasePendingOldestAgeGauge: externalRuntimeReservationReleasePendingOldestAge,
+    environmentLeasesOrphanedActiveGauge: environmentLeasesOrphanedActive,
+    environmentLeasesOrphanedOldestAgeGauge: environmentLeasesOrphanedOldestAge,
+    orphanedRuntimeResourceMetricsRefreshSuccessGauge: orphanedRuntimeResourceMetricsRefreshSuccess,
     externalRuntimeReservationStrandedOldestAgeGauge: externalRuntimeReservationStrandedOldestAge,
     externalRuntimeReservationStrandMetricsRefreshSuccessGauge:
       externalRuntimeReservationStrandMetricsRefreshSuccess,
+    agentStartLockHeldSecondsGauge: agentStartLockHeldSeconds,
     processLostTotalCounter: processLostTotal,
     externalLifecycleRunningRunsGauge: externalLifecycleRunningRuns,
     externalLifecycleRunSilenceGapHistogram: externalLifecycleRunSilenceGap,
@@ -2848,6 +3489,7 @@ function ensureRegistry(): {
     dbPoolConnectionsGauge: dbPoolConnections,
     dbPoolWaitingQueriesGauge: dbPoolWaitingQueries,
     pluginErrorGauge: pluginError,
+    crashRecoveryCandidateIndexPresentGauge: crashRecoveryCandidateIndexPresent,
     pluginMetricCounter: pluginMetric,
     pluginMetricDroppedCounter: pluginMetricDropped,
     pluginStatusCollectorLastSuccessGauge: pluginStatusCollectorLastSuccess,
@@ -2864,6 +3506,8 @@ function ensureRegistry(): {
     backstopSweepCompletedCounter: backstopSweepCompleted,
     backstopCandidatesSkippedCounter: backstopCandidatesSkipped,
     pluginWebhookDeliveryRejectedCounter: pluginWebhookDeliveryRejected,
+    recoveryHorizonExpiredCounter: recoveryHorizonExpired,
+    workerTierProxyFailuresCounter: workerTierProxyFailures,
   };
 }
 
@@ -2953,8 +3597,19 @@ export function recordHeartbeatRunFailed(
   // Per-issue labels are intentionally limited to the retry-loop failure this
   // monitor needs. Keeping them on every terminal failure would retain one
   // Prometheus counter series per historical issue for the process lifetime.
+  // The `error_code` gate alone supplies that bound: it is what confines the
+  // per-issue series to one failure mode.
+  //
+  // BLO-17953: this deliberately does NOT also gate on `isolationMode === "run"`.
+  // `resolveK8sRunIsolationIdentity` returns run | workspace | shared for every
+  // k8s adapter and all three are execution pods, so gating on "run" erased
+  // `agent_id` AND `issue_id` together — one boolean feeds both labels below —
+  // for the majority of the population the alert exists to catch (measured
+  // 2026-09-12: 54.1 of 96.2 pod-schedule failures over 24h sat in
+  // workspace/shared and were therefore unattributable). Narrowing by isolation
+  // mode never added a cardinality bound; the error code already was the bound.
   const isolationMode = normalizeIsolationMode(input.isolationMode);
-  const retainSourceIds = input.errorCode === "k8s_pod_schedule_failed" && isolationMode === "run";
+  const retainSourceIds = input.errorCode === "k8s_pod_schedule_failed";
   const labels = {
     agent_id: retainSourceIds && typeof input.agentId === "string" && input.agentId.length > 0
       ? input.agentId
@@ -2996,6 +3651,82 @@ export function recordCcrotateCapacityDeferred(
   return labels;
 }
 
+export interface RecordPenstockAvailabilityGateProbeInput {
+  /** Which probe ran. Coerced to the allow-list; anything else is rejected. */
+  path: string | null | undefined;
+  /** Bounded probe outcome. Coerced to the allow-list. */
+  outcome: string | null | undefined;
+  /** Penstock provider probed (e.g. "anthropic"). */
+  provider: string | null | undefined;
+  /** Model probed, from operator-managed adapter config. */
+  model: string | null | undefined;
+  /**
+   * Wall time the probe took, in seconds. Omit when the caller has no
+   * measurement; the counter still increments so attempt counts never depend on
+   * timing being available.
+   */
+  durationSeconds?: number | null;
+}
+
+/**
+ * Longest `model` label accepted verbatim.
+ *
+ * `model` is operator-managed rather than request-supplied, so this is a
+ * backstop against a malformed config value becoming a permanent series, not a
+ * defence against a hostile caller. Truncating rather than dropping keeps a
+ * genuinely long model id readable and attributable.
+ */
+const PENSTOCK_PROBE_MODEL_LABEL_MAX_LENGTH = 120;
+
+function normalizePenstockProbeLabel<T extends string>(
+  value: string | null | undefined,
+  allowed: readonly T[],
+  fallback: T,
+): T {
+  return typeof value === "string" && (allowed as readonly string[]).includes(value)
+    ? (value as T)
+    : fallback;
+}
+
+/**
+ * Increment {@link PENSTOCK_AVAILABILITY_GATE_PROBE_METRIC} and observe
+ * {@link PENSTOCK_AVAILABILITY_GATE_PROBE_DURATION_METRIC} for one probe.
+ *
+ * Call once per **network probe**, never on a verdict-cache hit: the fallback
+ * share this series exists to measure is a ratio over real re-probes, and
+ * counting cache hits in the denominator would understate it by exactly the
+ * cache hit rate.
+ *
+ * An unrecognised `path` collapses to "capacity" and an unrecognised `outcome`
+ * to "error". Both fallbacks are deliberately the *pessimistic* reading — an
+ * uninstrumented branch shows up as a probe that failed on the cheap path
+ * rather than silently inflating the expensive one, so a labelling mistake
+ * cannot manufacture evidence that the fallback is hot.
+ */
+export function recordPenstockAvailabilityGateProbe(
+  input: RecordPenstockAvailabilityGateProbeInput,
+): { path: PenstockProbePathLabel; outcome: PenstockProbeOutcomeLabel; provider: string; model: string } {
+  const path = normalizePenstockProbeLabel(input.path, KNOWN_PENSTOCK_PROBE_PATHS, "capacity");
+  const outcome = normalizePenstockProbeLabel(input.outcome, KNOWN_PENSTOCK_PROBE_OUTCOMES, "error");
+  const provider = typeof input.provider === "string" && input.provider.length > 0
+    ? input.provider
+    : "unknown";
+  const rawModel = typeof input.model === "string" ? input.model.trim() : "";
+  const model = rawModel.length > 0
+    ? rawModel.slice(0, PENSTOCK_PROBE_MODEL_LABEL_MAX_LENGTH)
+    : "unknown";
+  const labels = { path, outcome, provider, model };
+  const registryHandles = ensureRegistry();
+  registryHandles.penstockGateProbeCounter.inc(labels);
+  if (typeof input.durationSeconds === "number" && Number.isFinite(input.durationSeconds)) {
+    registryHandles.penstockGateProbeDurationHistogram.observe(
+      { path, provider },
+      Math.max(0, input.durationSeconds),
+    );
+  }
+  return labels;
+}
+
 export function recordHeartbeatTimerSchedulerExclusion(reason: string | null | undefined): string {
   const normalized = normalizeHeartbeatTimerSchedulerExclusion(reason);
   ensureRegistry().heartbeatTimerSchedulerExclusionCounter.inc({ reason: normalized });
@@ -3025,6 +3756,66 @@ export function recordHeartbeatPostTerminalRunEventDropped(
       : "unknown";
   ensureRegistry().heartbeatPostTerminalRunEventDroppedCounter.inc({ status: normalized });
   return normalized;
+}
+
+export interface RecordHeartbeatTimerTickInput {
+  /** Candidates examined by this pass (the log line's `checked`). */
+  checked: number;
+  /** Runs enqueued by this pass (the log line's `enqueued`). */
+  enqueued: number;
+}
+
+/**
+ * Record one completed heartbeat timer pass (BLO-32269).
+ *
+ * Call this on every completed pass, including passes that enqueued nothing —
+ * that is precisely the case `HEARTBEAT_TIMER_CHECKED_METRIC` exists to make
+ * visible, and it is why this is not hung off the existing log line (which is
+ * gated on `enqueued > 0` and so would leave `_checked_total` pinned at zero on
+ * a healthy but idle fleet).
+ *
+ * Non-finite or negative inputs are dropped rather than clamped: a counter must
+ * be monotonic, and silently substituting 0 for a bad value would fabricate a
+ * "loop ran, found nothing" reading — the healthy signal — out of a bug. The
+ * drop is logged because a dropped tick is otherwise indistinguishable from a
+ * tick that never ran, which is the precise ambiguity this pair exists to
+ * remove. Both inputs are integer accumulators, so this should never fire —
+ * which is exactly why it is worth hearing about if it does.
+ *
+ * The drop is all-or-nothing across the pair, because the reading it protects
+ * is a property of the pair rather than of either field. Validating them
+ * independently would let a pass with a valid `checked` and a bad `enqueued`
+ * move `checked` while leaving `enqueued` flat — which is observationally
+ * identical to substituting 0 for the bad value, and lands on exactly the
+ * `checked > 0, enqueued = 0` shape documented above as *Healthy*. That is the
+ * worst available outcome: a fleet that has stopped enqueuing, reporting
+ * healthy-idle on the surface the alert rule reads. `enqueued` is the likelier
+ * half to break, since `tickTimers` composes it from a single field
+ * (`issueMonitors.triggered`) where `checked` sums three, so a refactor can
+ * yield `NaN` on `enqueued` alone. Dropping the pass as a unit leaves both
+ * series flat, which reads as dispatch-dark — the direction that alerts.
+ */
+export function recordHeartbeatTimerTick(input: RecordHeartbeatTimerTickInput): void {
+  const metrics = ensureRegistry();
+  const checkedValid = Number.isFinite(input.checked) && input.checked >= 0;
+  const enqueuedValid = Number.isFinite(input.enqueued) && input.enqueued >= 0;
+  if (!checkedValid || !enqueuedValid) {
+    logger.warn(
+      {
+        checked: input.checked,
+        enqueued: input.enqueued,
+        invalidFields: [
+          ...(checkedValid ? [] : ["checked"]),
+          ...(enqueuedValid ? [] : ["enqueued"]),
+        ],
+        metrics: [HEARTBEAT_TIMER_CHECKED_METRIC, HEARTBEAT_TIMER_ENQUEUED_METRIC],
+      },
+      "heartbeat timer tick metrics dropped as a pair: checked/enqueued must both be non-negative finite numbers",
+    );
+    return;
+  }
+  metrics.heartbeatTimerCheckedCounter.inc(input.checked);
+  metrics.heartbeatTimerEnqueuedCounter.inc(input.enqueued);
 }
 
 export interface RecordAgentZeroTokenCompletedRunStreakInput {
@@ -3185,6 +3976,67 @@ export function setDbPoolStats(stats: DbPoolStats): void {
   dbPoolConnectionsGauge.set({ state: "active" }, stats.active);
   dbPoolConnectionsGauge.set({ state: "connecting" }, stats.connecting);
   dbPoolWaitingQueriesGauge.set(stats.waiting);
+}
+
+/**
+ * Publish the currently-held agent start locks and their hold ages (PEN-3305).
+ *
+ * Reset-then-set, but unlike the per-agent reservation gauges this does NOT
+ * zero-fill known agents: a held lock is the exception, not a per-agent
+ * property, and zero-filling every agent would turn a near-empty series into
+ * one row per agent per pod forever. An absent series therefore means "no lock
+ * held", and `reset()` is what releases a series when its section finishes —
+ * without it a completed hold would keep reporting its final age and hold an
+ * alert open permanently.
+ *
+ * Called from the `/metrics` request path (see `refreshAgentStartLockMetrics`)
+ * because the reading is a synchronous in-memory map walk, and because the
+ * scenario worth sampling is a section wedged on the database — exactly when a
+ * DB-backed background collector would be stuck and publish nothing.
+ */
+export function setAgentStartLockHeldMetrics(
+  held: ReadonlyArray<{ agentId: string; heldMs: number }>,
+): void {
+  const gauge = ensureRegistry().agentStartLockHeldSecondsGauge;
+  gauge.reset();
+  for (const entry of held) {
+    const heldMs = Number.isFinite(entry.heldMs) ? Math.max(0, entry.heldMs) : 0;
+    gauge.set({ agent_id: entry.agentId }, heldMs / 1000);
+  }
+}
+
+/**
+ * BLO-21460. Set from the residual backlog measured AFTER each reconciliation
+ * pass (`reapOrphanedRuns` -> `reconcileReleasePendingExternalRuntimeReservations`),
+ * not the pre-pass candidate count — see the metric's doc comment for why 0 is
+ * the only healthy steady-state value.
+ */
+export function setReleasePendingExternalRuntimeReservationMetrics(input: {
+  count: number;
+  oldestAgeSeconds: number;
+}): void {
+  const metrics = ensureRegistry();
+  metrics.externalRuntimeReservationsReleasePendingGauge.set(Math.max(0, input.count));
+  metrics.externalRuntimeReservationReleasePendingOldestAgeGauge.set(Math.max(0, input.oldestAgeSeconds));
+}
+
+/** BLO-21460. Same residual-after-reconciliation convention as above, for leases. */
+export function setOrphanedEnvironmentLeaseMetrics(input: {
+  active: number;
+  oldestAgeSeconds: number;
+}): void {
+  const metrics = ensureRegistry();
+  metrics.environmentLeasesOrphanedActiveGauge.set(Math.max(0, input.active));
+  metrics.environmentLeasesOrphanedOldestAgeGauge.set(Math.max(0, input.oldestAgeSeconds));
+}
+
+/**
+ * BLO-21460. Freshness gate for the four backlog gauges above. Set `false`
+ * when the reconciliation pass threw before the refresh could run, so the
+ * alert can distinguish "measured 0" from "held a stale 0".
+ */
+export function setOrphanedRuntimeResourceMetricsRefreshSuccess(success: boolean): void {
+  ensureRegistry().orphanedRuntimeResourceMetricsRefreshSuccessGauge.set(success ? 1 : 0);
 }
 
 /**
@@ -3607,6 +4459,25 @@ export function setPluginErrorStatus(entries: ReadonlyArray<PluginErrorStatusEnt
   }
 }
 
+/**
+ * Publish whether the worker-crash recovery candidate index is usable right
+ * now (BLO-21526). Called from the periodic probe that already gates the
+ * reconciliation scan, so the gauge tracks the same fact the gate acts on
+ * instead of a second, independently-drifting catalog read.
+ *
+ * `present === null` means the probe itself failed, which is not evidence in
+ * either direction: the series is cleared so it reads as absent/unknown rather
+ * than leaving a stale 1 that would say "healthy" on no information at all.
+ */
+export function setCrashRecoveryCandidateIndexPresent(present: boolean | null): void {
+  const gauge = ensureRegistry().crashRecoveryCandidateIndexPresentGauge;
+  if (present === null) {
+    gauge.reset();
+    return;
+  }
+  gauge.set({ index: CRASH_RECOVERY_CANDIDATE_INDEX_NAME }, present ? 1 : 0);
+}
+
 export interface RecordPluginMetricInput {
   /** `plugins.id` (uuid). */
   pluginId: string;
@@ -3707,7 +4578,11 @@ export function recordPluginMetric(input: RecordPluginMetricInput): void {
       (input.declaredLabels ?? []).map((key) => String(key)),
     );
     const labels: Record<string, string> = { ...identity, metric: name };
-    const comboParts: string[] = [name];
+    // Seeded empty: the ledger key below carries `name`, so repeating it in
+    // every combination string adds no discriminating power — only an extra
+    // copy of it per combination, up to NAME_BUDGET x CARDINALITY_BUDGET of
+    // them per plugin.
+    const comboParts: string[] = [];
     let truncatedValue = false;
     let sanitizedValue = false;
     for (const key of PLUGIN_METRIC_PROMOTABLE_TAG_KEYS) {
@@ -3757,15 +4632,25 @@ export function recordPluginMetric(input: RecordPluginMetricInput): void {
 
     // Tier 2 — the tag-value axis, over combinations ever observed. NUL-joined,
     // which is injective ONLY because no part can contain a NUL — and that is
-    // now enforced here rather than assumed: every promoted value is stripped
-    // of control characters a few lines above, and `name` cleared
-    // PLUGIN_METRIC_NAME_REGEX. See pluginMetricCombinations for why a
-    // collision would be a real leak rather than a miscount.
+    // now enforced here rather than assumed: every part is a promoted value,
+    // and each was stripped of control characters a few lines above. See
+    // pluginMetricCombinations for why a collision would be a real leak rather
+    // than a miscount.
     const combo = comboParts.join("\0");
-    let seen = pluginMetricCombinations.get(pluginId);
+    // Keyed per (plugin, NAME), not per plugin — see
+    // PLUGIN_METRIC_CARDINALITY_BUDGET for why a shared pool starves the rare
+    // metric that a page depends on. The join is injective on both components,
+    // which now needs stating for both rather than one: `name` cleared tier 1
+    // above, so it is one of at most PLUGIN_METRIC_NAME_BUDGET values and
+    // cleared PLUGIN_METRIC_NAME_REGEX, which admits no NUL; `pluginId` is a
+    // `defaultRandom()` UUID (see pluginMetricCombinations), so it cannot
+    // contain one either. It moved from opaque map key to joined key component
+    // in BLO-32163, which is what put it inside this argument.
+    const ledgerKey = `${pluginId}\0${name}`;
+    let seen = pluginMetricCombinations.get(ledgerKey);
     if (!seen) {
       seen = new Set<string>();
-      pluginMetricCombinations.set(pluginId, seen);
+      pluginMetricCombinations.set(ledgerKey, seen);
     }
     if (!seen.has(combo)) {
       if (seen.size >= PLUGIN_METRIC_CARDINALITY_BUDGET) {
@@ -4000,6 +4885,26 @@ export function recordBackstopCandidateSkipped(source: BackstopSource, reason: B
 }
 
 /**
+ * Record a worker-tier proxy relay failure (BLO-31945).
+ *
+ * Paired with the existing log line, same division of labour as the webhook
+ * rejection counter: the counter answers "how many, of which kind, over what
+ * window" from a surface with normal retention, the log keeps the per-request
+ * detail (target URL, method, the error itself) that must never be a label.
+ *
+ * Must not throw — it sits on the error path of a request that is already
+ * failing, and a metrics fault has no business turning a considered 502/504
+ * into a 500.
+ */
+export function recordWorkerTierProxyFailure(reason: WorkerTierProxyFailureReason): void {
+  try {
+    ensureRegistry().workerTierProxyFailuresCounter.inc({ reason });
+  } catch (error) {
+    logger.error({ err: error, reason }, "failed to record worker-tier proxy failure metric");
+  }
+}
+
+/**
  * Record a webhook delivery turned away at the ingestion readiness guard
  * (BLO-28803).
  *
@@ -4037,6 +4942,17 @@ export function recordPluginWebhookDeliveryRejected(input: {
     );
   }
   logPluginWebhookDeliveryRejection({ ...input, pluginKey });
+}
+
+/**
+ * PEN-3000: count a recovery action retired at its wake horizon, split on delivery.
+ *
+ * `attemptCount` counts DELIVERED wakes, not sweeps (see
+ * {@link RECOVERY_HORIZON_EXPIRED_METRIC}), so 0 is the positive signal that the wake
+ * channel refused for the entire window rather than that nothing was ever scheduled.
+ */
+export function recordRecoveryHorizonExpired(delivery: RecoveryHorizonDeliveryState): void {
+  ensureRegistry().recoveryHorizonExpiredCounter.inc({ delivery });
 }
 
 export async function renderMetrics(): Promise<{ contentType: string; body: string }> {
@@ -4078,16 +4994,26 @@ export function __resetMetricsForTest(): void {
   isolatedRunStarted = null;
   heartbeatRunFailed = null;
   ccrotateCapacityDeferred = null;
+  penstockGateProbe = null;
+  penstockGateProbeDuration = null;
   heartbeatTimerSchedulerExclusion = null;
   heartbeatPostTerminalRunEventDropped = null;
+  heartbeatTimerChecked = null;
+  heartbeatTimerEnqueued = null;
   agentZeroTokenCompletedRunStreak = null;
   zeroTokenStreakAdapterByAgentId.clear();
   externalRuntimeReservationEvents = null;
   externalRuntimeReservationsActive = null;
   externalRuntimeReservationOldestAge = null;
   queuedRunAgeMetricsRefreshSuccess = null;
+  externalRuntimeReservationsReleasePending = null;
+  externalRuntimeReservationReleasePendingOldestAge = null;
+  environmentLeasesOrphanedActive = null;
+  environmentLeasesOrphanedOldestAge = null;
+  orphanedRuntimeResourceMetricsRefreshSuccess = null;
   externalRuntimeReservationStrandedOldestAge = null;
   externalRuntimeReservationStrandMetricsRefreshSuccess = null;
+  agentStartLockHeldSeconds = null;
   processLostTotal = null;
   externalLifecycleRunningRuns = null;
   externalLifecycleRunSilenceGap = null;
@@ -4106,6 +5032,7 @@ export function __resetMetricsForTest(): void {
   scheduledRetryParkHorizon = null;
   scheduledRetryParkHorizonRefreshSuccess = null;
   pluginError = null;
+  crashRecoveryCandidateIndexPresent = null;
   pluginMetric = null;
   pluginMetricDropped = null;
   pluginMetricCombinations.clear();
@@ -4122,8 +5049,10 @@ export function __resetMetricsForTest(): void {
   backstopDeferredCandidates = null;
   backstopSweepCompleted = null;
   backstopCandidatesSkipped = null;
+  recoveryHorizonExpired = null;
   gbrainRecallTotal = null;
   pluginWebhookDeliveryRejected = null;
+  workerTierProxyFailures = null;
   trackedWebhookRejectionPluginKeys.clear();
   webhookRejectionLogState.clear();
   resetDepBlockedMetrics();

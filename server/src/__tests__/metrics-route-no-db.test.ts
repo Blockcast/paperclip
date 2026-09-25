@@ -32,6 +32,18 @@ const DB_REFRESHES = [
   "refreshExternalRuntimeReservationStrandMetrics",
 ];
 
+/**
+ * The synchronous in-memory refreshes that must still run inline before the
+ * render. These are map reads rather than queries, so they are safe here — the
+ * point of listing them is that every other assertion in this file is a
+ * negative, and a negative cannot see a deletion.
+ */
+const INLINE_REFRESHES = [
+  "expireStaleRefreshFreshness",
+  "refreshDbPoolMetrics",
+  "refreshAgentStartLockMetrics",
+];
+
 /** Extract a route handler body by brace-matching from its `app.get(...)` declaration. */
 function routeHandlerSource(path: string): string {
   const start = APP_SOURCE.indexOf(`app.get("${path}"`);
@@ -59,6 +71,21 @@ describe("/metrics request path (BLO-33243)", () => {
   it("invokes none of the DB-querying refreshes", () => {
     for (const refresh of DB_REFRESHES) {
       expect(handler, `${refresh} must not run on the scrape path`).not.toContain(refresh);
+    }
+  });
+
+  it("still runs the synchronous in-memory refreshes inline", () => {
+    // Every other assertion here is a negative, and a negative is blind to a
+    // deletion: drop `refreshAgentStartLockMetrics()` from the handler and this
+    // whole suite — plus the four publication tests in
+    // agent-start-lock-liveness.test.ts — stays green while the gauge silently
+    // stops being published. That is worse for this gauge than for its two
+    // siblings, because it has no zero-fill and no freshness gate (PEN-3305):
+    // an unpublished series is indistinguishable from a fleet with no wedged
+    // locks, so the critical alert would never fire again and nothing would
+    // look wrong. Pinned as a set because all three sit on the same seam.
+    for (const refresh of INLINE_REFRESHES) {
+      expect(handler, `${refresh}() must run on the scrape path`).toContain(`${refresh}(`);
     }
   });
 

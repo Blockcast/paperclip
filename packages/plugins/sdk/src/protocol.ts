@@ -394,8 +394,14 @@ export interface GetDataParams {
 }
 
 /**
- * A fencing generation the caller must still hold for a mutating host call —
- * `issues.*` or `state.set` — to be applied.
+ * A fencing generation the caller must still hold for a mutating host call to be
+ * applied. Accepted by exactly four methods today — `state.set`,
+ * `issues.create`, `issues.update` and `issues.createComment` — because the host
+ * asserts it per method rather than generically; it is not an `issues.*`-wide
+ * facility. Notably `issues.updateComment` does not take one: the key it
+ * requires is already scoped per installation, so it cannot reach a row this
+ * plugin did not write, and no caller has needed to fence an edit. Adding it
+ * there is a host change, not just a type change.
  *
  * A plugin can enforce its own fence on its own database writes, but not on a
  * host RPC — leaving a check-before-act window between "am I still the owner?"
@@ -1704,6 +1710,31 @@ export interface WorkerToHostMethods {
       idempotencyKey?: string | null;
     },
     result: IssueComment & { deduplicated?: boolean },
+  ];
+  "issues.updateComment": [
+    params: {
+      issueId: string;
+      /**
+       * The key the comment was created with — same value, unnamespaced; the
+       * host re-applies its `plugin:<pluginId>:` prefix. Required, and it is
+       * the authorization as much as the lookup: a comment can only be edited
+       * by the installation that wrote it, so there is no way to reach a
+       * human's comment or another plugin's. Empty and whitespace-only strings
+       * are rejected rather than treated as omitted.
+       */
+      idempotencyKey: string;
+      /** Replacement body. Overwrites; there is no patch/append form. */
+      body: string;
+      companyId: string;
+      /**
+       * Must match the `authorAgentId` the comment was created with — the
+       * uniqueness scope is `(issue, author, key)`, so a mismatch resolves to a
+       * different row or to none.
+       */
+      authorAgentId?: string;
+    },
+    /** `null` when no live comment of this installation's carries that key. */
+    result: IssueComment | null,
   ];
   "issues.createInteraction": [
     params: {

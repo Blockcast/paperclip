@@ -37,6 +37,55 @@ test('passes when .spec.cjs file is changed', () => {
   assert.equal(checkTestCoverage(makeFiles(['scripts/thing.spec.cjs']), 'fix: bug').passed, true);
 });
 
+// `unittest`'s discovery convention is `test_*.py`, and review-gate-sweep.yml
+// discovers with exactly that pattern. None of the JS patterns above match it.
+test('passes when a test_*.py file is changed', () => {
+  assert.equal(
+    checkTestCoverage(makeFiles(['.github/scripts/test_sweep_stalled_ally_reviews.py']), 'fix: bug').passed,
+    true,
+  );
+});
+
+test('passes when a *_test.py file is changed', () => {
+  assert.equal(checkTestCoverage(makeFiles(['scripts/sweep_test.py']), 'fix: bug').passed, true);
+});
+
+// The exact shape that failed before this widening: a fix: PR whose only files
+// are a Python script and its Python tests. The no-tests arm fires whenever a
+// non-skip-prefixed PR matches no test file at all, so this failed regardless of
+// the fact that 273 lines of tests were right there in the diff.
+test('passes on a fix: PR touching only a Python script and its test', () => {
+  assert.equal(
+    checkTestCoverage(
+      makeFiles([
+        '.github/scripts/sweep-stalled-ally-reviews.py',
+        '.github/scripts/test_sweep_stalled_ally_reviews.py',
+        '.github/workflows/review-gate-sweep.yml',
+      ]),
+      'fix(review-gate-sweep): re-read markers before the write',
+    ).passed,
+    true,
+  );
+});
+
+// Negative control: widening for Python must not make *every* .py file count as
+// a test. Without this, a pattern as loose as /\.py$/ would pass the suite while
+// silently disabling the gate for the whole language.
+test('a non-test .py file does not satisfy the gate', () => {
+  const result = checkTestCoverage(
+    makeFiles(['.github/scripts/sweep-stalled-ally-reviews.py']),
+    'fix: bug',
+  );
+  assert.equal(result.passed, false);
+  assert.ok(result.failures[0].includes('No test files detected'));
+});
+
+// `contest.py` / `latest.py` end in the letters `test.py` but are not tests; the
+// `_` in the pattern is what keeps them out.
+test('a .py file merely ending in test.py does not satisfy the gate', () => {
+  assert.equal(checkTestCoverage(makeFiles(['scripts/latest.py']), 'fix: bug').passed, false);
+});
+
 test('a .test.mjs file does not count as a source change on a docs: PR', () => {
   // isSourceFile() excludes anything matching TEST_PATTERNS, so widening the
   // patterns must also keep .test.mjs out of the docs/chore mismatch check.

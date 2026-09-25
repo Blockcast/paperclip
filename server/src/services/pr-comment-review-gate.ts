@@ -27,8 +27,10 @@ import {
   githubFetchPrHeadSha,
   githubListIssueCommentsWithTimestamps,
   githubListPrReviewsWithTimestamps,
+  githubPostCheckRun,
   githubPostCommitStatusDetailed,
   githubReviewerIdentityMatches,
+  type GitHubCheckRunConclusion,
   type GitHubCommitStatusPostResult,
 } from "./github-app-auth.js";
 
@@ -279,9 +281,18 @@ function headsWithUndispositionedFinding(
     return [...verbs];
   };
 
+  // `countInheritedLedgerAssertion: false` keeps this enumeration answering
+  // "which findings did *this head* raise?". A `still-present` entry names an
+  // earlier head's finding, and that head is enumerated in its own right, so
+  // counting it here would name a review whose own buckets are empty — and
+  // permanently, since a 0/0 body reports no identities for any later ledger
+  // entry to retire. The current-head branch below deliberately does count it.
   return [...newestPerHead.values()]
     .filter(
-      (entry) => hasActionablePrReviewFeedback(entry.attesting.comment.body) && !isFullyDispositioned(entry),
+      (entry) =>
+        hasActionablePrReviewFeedback(entry.attesting.comment.body, undefined, {
+          countInheritedLedgerAssertion: false,
+        }) && !isFullyDispositioned(entry),
     )
     .sort((a, b) => b.timeMs - a.timeMs)
     .map((entry) => ({ ...entry.attesting, unrecognizedVerbs: unrecognizedVerbsBlocking(entry) }));
@@ -345,6 +356,22 @@ export function evaluateCommentReviewGate(input: {
     // the detail this branch exists to surface. The verb list is budgeted for
     // the same reason — the regex accepts an arbitrarily long verb, and the
     // head plus the "unrecognized ledger verb" phrase must survive intact.
+    //
+    // PEN-3157 asked whether this republishes model-authored text to a public
+    // commit status without a scrub, since the verb is lifted verbatim out of
+    // an Ally review comment body. It does not, and the reason is worth having
+    // in writing because the interpolation looks unbounded here: the verb is
+    // unbounded in LENGTH but not in ALPHABET. It reaches this line through the
+    // single capture group `([a-z][a-z-]*)` in
+    // `PRIOR_FINDING_DISPOSITION_PATTERN` (ally-review-detection.ts), the only
+    // writer of `disposition`, so it is lowercase letters and hyphens and
+    // nothing else. That admits no credential this codebase is exposed to — an
+    // AWS key id, a bearer token, a JWT and a PEM all carry uppercase, digits,
+    // or punctuation outside that class. See the invariant test in
+    // `github-write-egress-scrub.test.ts`, which fails if the class widens.
+    // Defence in depth still applies: `githubPostCommitStatusDetailed` scrubs
+    // every description on the way out, so widening the class would be caught
+    // by the boundary even if that test were deleted.
     const verbList = carried.unrecognizedVerbs
       .map((verb) => `"${verb}"`)
       .join(", ")
@@ -371,6 +398,44 @@ export function evaluateCommentReviewGate(input: {
 }
 
 /**
+ * Check-run conclusion for a verdict.
+ *
+ * This is the whole point of publishing a check-run alongside the commit
+ * status (BLO-33657). The status surface collapses `clean` and `not_evaluated`
+ * into one green `success`, because a legacy status has only four states and
+ * none of the other three is both honest and non-blocking: `pending` deadlocks
+ * every formally-reviewed PR (the constraint BLO-29711 pinned), and
+ * `failure`/`error` assert a finding that does not exist.
+ *
+ * `neutral` is the state that was missing. It renders distinctly from green in
+ * the UI and in `check-runs` API reads, and it does not block merge — so a
+ * reader can tell "reviewed and clean" from "nothing reviewed this head" by the
+ * conclusion alone, without parsing the human-readable description.
+ */
+export function commentReviewGateCheckConclusion(
+  verdict: Pick<CommentReviewGateVerdict, "state" | "outcome">,
+): GitHubCheckRunConclusion {
+  if (verdict.state === "failure") return "failure";
+  return verdict.outcome === "clean" ? "success" : "neutral";
+}
+
+/** Short check-run title, so the conclusion is legible without opening it. */
+export function commentReviewGateCheckTitle(
+  verdict: Pick<CommentReviewGateVerdict, "state" | "outcome">,
+): string {
+  switch (verdict.outcome) {
+    case "clean":
+      return "Reviewed at this head — no unresolved findings";
+    case "blocking_finding":
+      return "Unresolved finding at this head";
+    case "carried_finding":
+      return "Unresolved finding carried from an earlier head";
+    case "not_evaluated":
+      return "Not evaluated — no comment-shaped review attests this head";
+  }
+}
+
+/**
  * A green status published under a `review/`-prefixed context reads as "this
  * head was reviewed and was clean". For the `not_evaluated` outcome that
  * reading is false, and no state can fix it: `pending`/`failure` on absence
@@ -379,6 +444,11 @@ export function evaluateCommentReviewGate(input: {
  * context is now `gate/ally-comment-findings`. This predicate stays as the
  * assertion point so a future config change cannot silently move the gate back
  * under `review/` (BLO-29711).
+ *
+ * Note this only ever described the *status* surface. Renaming stopped the
+ * misreading for a reader who inspects the namespace, not for one who reads the
+ * colour; the check-run's `neutral` conclusion is what addresses the colour
+ * (BLO-33657).
  */
 export function commentReviewGateVerdictIsMisreadable(
   verdict: CommentReviewGateVerdict,
@@ -642,6 +712,8 @@ async function executeCommentReviewGateCheck(
     );
     if (!posted.ok) return { posted: false, reason: "post_failed", postFailure: posted.reason };
 
+    await publishCheckRunMirror(input, headSha, context, verdict);
+
     const retirementFailures = await supersedeRetiredContexts(input, headSha, context, config, verdict);
     if (retirementFailures.length > 0) {
       // NOT "post_failed": the live status published successfully at line 643
@@ -672,6 +744,68 @@ async function executeCommentReviewGateCheck(
   // and it is unconditional: `db` is required precisely so there is no
   // unsynchronized fall-through for a caller to reach by omission.
   return withGithubStatusDeliveryLock(input.db, `${input.repoFullName}#${headSha}`, publish);
+}
+
+/**
+ * Publish the same verdict as a check-run, alongside the commit status.
+ *
+ * Dual-emit, not a replacement. The status context may still be a required
+ * check somewhere, and this code cannot read branch protection to find out —
+ * the App gets 403 on that endpoint — so dropping it could strand every PR in a
+ * repo that requires it. The status keeps its existing states; the check-run
+ * adds the `neutral` conclusion that the status surface cannot express.
+ *
+ * Best-effort, and deliberately so: the verdict is already published on the
+ * status surface by the time this runs, and the added value here is legibility,
+ * not enforcement. Failing the whole check because the check-run write was
+ * refused would turn a *better* signal into an outage of the working one — most
+ * likely on exactly the deployments whose installation lacks `checks: write`,
+ * since that permission is independent of `statuses: write`. Logged once per
+ * repo so a missing grant is diagnosable without a log flood.
+ */
+const checkRunWriteWarnings = new Set<string>();
+
+async function publishCheckRunMirror(
+  input: PrCommentReviewGateCheckInput,
+  headSha: string,
+  context: string,
+  verdict: CommentReviewGateVerdict,
+): Promise<void> {
+  let reason: string;
+  try {
+    const result = await withBoundedRetry<GitHubCommitStatusPostResult>(
+      () =>
+        githubPostCheckRun({
+          repoFullName: input.repoFullName,
+          sha: headSha,
+          name: context,
+          conclusion: commentReviewGateCheckConclusion(verdict),
+          title: commentReviewGateCheckTitle(verdict),
+          summary: verdict.reason,
+          detailsUrl: input.prUrl ?? null,
+        }),
+      (attempt) => !attempt.ok && attempt.retryable,
+    );
+    if (result.ok) return;
+    reason = result.reason;
+  } catch (error) {
+    // "Best-effort" has to mean it too. `githubPostCheckRun` returns a
+    // classified result rather than throwing, but it can still throw for
+    // reasons outside its own error handling — an unmocked export under test,
+    // a module that failed to load. Letting that escape would reject the whole
+    // publish and lose the commit status that was already written, which is the
+    // exact "a better signal takes out the working one" outcome this function
+    // is structured to avoid.
+    reason = error instanceof Error ? error.message : String(error);
+  }
+  if (checkRunWriteWarnings.has(input.repoFullName)) return;
+  checkRunWriteWarnings.add(input.repoFullName);
+  console.warn(
+    `[pr-comment-review-gate] Could not publish the "${context}" check-run on ${input.repoFullName}: ` +
+      `${reason}. The commit status is still authoritative, but "not evaluated" and ` +
+      `"reviewed clean" both render green there — the check-run is what separates them. ` +
+      "A 403 here means the installation is missing `checks: write` (BLO-33657).",
+  );
 }
 
 /**

@@ -28,6 +28,7 @@ import {
   buildWorkspaceRuntimeDesiredStatePatch,
   buildWorkspaceTemplateData,
   cleanupExecutionWorkspaceArtifacts,
+  ensureGitWorktreeBranchCoherent,
   ensurePersistedExecutionWorkspaceAvailable,
   ensureServerWorkspaceLinksCurrent,
   ensureGitWorktreeBranchCoherent,
@@ -59,6 +60,7 @@ import {
   writeLocalServiceRegistryRecord,
 } from "../services/local-service-supervisor.ts";
 import { resolvePaperclipConfigPath } from "../paths.ts";
+import { executionWorkspaceService } from "../services/execution-workspaces.ts";
 import type { WorkspaceOperation } from "@paperclipai/shared";
 import { EXECUTION_WORKSPACE_BRANCH_TEMPLATE_KEYS } from "@paperclipai/shared";
 import type { WorkspaceOperationRecorder } from "../services/workspace-operations.js";
@@ -4079,6 +4081,34 @@ describe("realizeExecutionWorkspace", () => {
   // deliberately left outside: it exercises provision-command ordering, not the
   // inspection path, and shares none of this fixture.
   describe("submodule inspection", () => {
+    // Budget rationale for this whole block (BLO-22985).
+    //
+    // The stall cases drive a `git` shim that records its invocation in a
+    // counter file and *then* blocks on `sleep 30`. The probe times out and
+    // SIGKILLs the process group, so every counted invocation is racing its own
+    // kill: if a loaded host has not scheduled the shim as far as the counter
+    // write within `timeoutMs`, the call happens but is never recorded and the
+    // count assertion is short by one. At `timeoutMs: 300` that window is a few
+    // process spawns wide, and merge-queue CI closed it -- run 34841655169
+    // ejected an innocent PR on `expected '2' to be '3'` at the salvaged-stall
+    // case. `2_000` gives the shim ~6.7x more room while leaving the probe 15x
+    // clear of the 30s stall, so the timeout being tested still fires decisively
+    // rather than racing the stall it is supposed to outlive.
+    //
+    // The stall cases carry `120_000`, matching the sibling repair case below.
+    // Vitest honors a per-test timeout over the global in both directions (see
+    // `server/vitest.config.ts`), so the 60_000 global is a default, not a
+    // ceiling. Measured unloaded on a 64-core host, the slowest of these is the
+    // salvaged-stall case at ~7.2s -- of which ~6s is the three 2_000ms probe
+    // timeouts and only ~1.2s is real `git` work -- so 120_000 is ~16x clear
+    // unloaded, and still ~5.8x clear of the 20.8s that case took under
+    // merge-queue contention. A cap is a runtime bound, not the invariant:
+    // every case here fails on its assertions when the behaviour regresses --
+    // a fail-open override degrades a healthy checkout immediately, long before
+    // any cap -- so a generous cap removes flake without removing coverage.
+    //
+    // The cases that do not touch the probe knobs run in under ~1.1s and carry
+    // no explicit cap at all: the global already gives them ~55x.
     it("repairs missing project_primary submodules before returning the workspace", async () => {
       const { repoRoot, submodulePath } = await createTempRepoWithSubmodule();
       const { recorder, operations } = createWorkspaceOperationRecorderDouble();
@@ -4171,9 +4201,9 @@ describe("realizeExecutionWorkspace", () => {
       await fs.chmod(shimPath, 0o755);
       const previousPath = process.env.PATH;
       process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
-      // 300ms matches the sibling shim tests: long enough that the budget is not
-      // racing process startup, short enough to keep two attempts cheap.
-      setSubmoduleInspectSettingsForTests({ timeoutMs: 300, attempts: 2, retryDelayMs: 1 });
+      // Matches the sibling shim tests; see this block's budget rationale for why
+      // the probe is 2_000 rather than a number that just clears process startup.
+      setSubmoduleInspectSettingsForTests({ timeoutMs: 2_000, attempts: 2, retryDelayMs: 1 });
       // Pin the last scheduler-dependent branch. Four assertions below require the
       // *retry* path -- `attempts: 2`, "after 2 attempt(s)", and the exact probe
       // count -- and that path is only taken when the timed-out group is already
@@ -4242,9 +4272,9 @@ describe("realizeExecutionWorkspace", () => {
           // stable field rather than by matching `reason` prose.
           cause: "inconclusive_probe",
           attempts: 2,
-          timeoutMs: 300,
+          timeoutMs: 2_000,
         });
-        expect(String(degradedOp?.metadata?.reason)).toContain("timed out after 300ms");
+        expect(String(degradedOp?.metadata?.reason)).toContain("timed out after 2000ms");
 
         // Both attempts stalled and no third probe ran: an `initial` degradation
         // returns before the repair path, so the post-repair verification site is
@@ -4254,7 +4284,7 @@ describe("realizeExecutionWorkspace", () => {
         const degraded = realized.warnings.find((warning) => warning.includes("Could not inspect git submodules"));
         expect(degraded).toBeDefined();
         expect(degraded).toContain("after 2 attempt(s)");
-        expect(degraded).toContain("timed out after 300ms");
+        expect(degraded).toContain("timed out after 2000ms");
         expect(degraded).toContain("inconclusive");
 
         // The invariant, now scoped to the stage the degradation was attributed
@@ -4278,7 +4308,7 @@ describe("realizeExecutionWorkspace", () => {
         else process.env.PATH = previousPath;
         await fs.rm(shimDir, { recursive: true, force: true });
       }
-    }, 30_000);
+    }, 120_000);
 
     it("still fails the run when the initial submodule inspection exits non-zero", async () => {
       // BLO-18784 follow-up: the timeout degrade must not widen into a general
@@ -4319,7 +4349,7 @@ describe("realizeExecutionWorkspace", () => {
       expect(
         operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
       ).toBe(false);
-    }, 20_000);
+    });
 
     it("still fails the run when the post-repair submodule verification exits non-zero", async () => {
       // The post-repair re-check has its own consumer, so it needs its own guard:
@@ -4402,7 +4432,7 @@ describe("realizeExecutionWorkspace", () => {
         else process.env.PATH = previousPath;
         await fs.rm(shimDir, { recursive: true, force: true });
       }
-    }, 30_000);
+    });
 
     it("still fails the run when a stalled probe already reported a conflicted submodule", async () => {
       // BLO-18784 follow-up: `git submodule status --recursive` flushes each entry
@@ -4443,7 +4473,7 @@ describe("realizeExecutionWorkspace", () => {
       // attempts: 3 so that acting on the salvaged evidence is observable -- a
       // correct implementation stops after the first stall because it already has
       // a conclusive answer, rather than spending two more budgets on it.
-      setSubmoduleInspectSettingsForTests({ timeoutMs: 500, attempts: 3, retryDelayMs: 1 });
+      setSubmoduleInspectSettingsForTests({ timeoutMs: 2_000, attempts: 3, retryDelayMs: 1 });
 
       try {
         await expect(
@@ -4483,7 +4513,7 @@ describe("realizeExecutionWorkspace", () => {
         else process.env.PATH = previousPath;
         await fs.rm(shimDir, { recursive: true, force: true });
       }
-    }, 30_000);
+    }, 120_000);
 
     it("still degrades when a stalled submodule probe produced no fault record", async () => {
       // The converse of the test above, and the property that keeps this from
@@ -4523,7 +4553,7 @@ describe("realizeExecutionWorkspace", () => {
       await fs.chmod(shimPath, 0o755);
       const previousPath = process.env.PATH;
       process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
-      setSubmoduleInspectSettingsForTests({ timeoutMs: 300, attempts: 2, retryDelayMs: 1 });
+      setSubmoduleInspectSettingsForTests({ timeoutMs: 2_000, attempts: 2, retryDelayMs: 1 });
 
       try {
         const realized = await realizeExecutionWorkspace({
@@ -4567,7 +4597,7 @@ describe("realizeExecutionWorkspace", () => {
         else process.env.PATH = previousPath;
         await fs.rm(shimDir, { recursive: true, force: true });
       }
-    }, 30_000);
+    }, 120_000);
 
     it("does not start a submodule inspection retry while the previous timed-out process group remains alive", async () => {
       // In the CephFS-stall case this change exists for, SIGKILL can be issued
@@ -4601,7 +4631,7 @@ describe("realizeExecutionWorkspace", () => {
       await fs.chmod(shimPath, 0o755);
       const previousPath = process.env.PATH;
       process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
-      setSubmoduleInspectSettingsForTests({ timeoutMs: 300, attempts: 3, retryDelayMs: 1 });
+      setSubmoduleInspectSettingsForTests({ timeoutMs: 2_000, attempts: 3, retryDelayMs: 1 });
       setProcessGroupLivenessProbeForTests(() => true);
 
       try {
@@ -4653,7 +4683,7 @@ describe("realizeExecutionWorkspace", () => {
         else process.env.PATH = previousPath;
         await fs.rm(shimDir, { recursive: true, force: true });
       }
-    }, 30_000);
+    }, 120_000);
 
     it("does not repair salvaged missing submodules while the timed-out process group remains alive", async () => {
       const { repoRoot, submodulePath } = await createTempRepoWithSubmodule({ removeCheckout: false });
@@ -4692,7 +4722,7 @@ describe("realizeExecutionWorkspace", () => {
       await fs.chmod(shimPath, 0o755);
       const previousPath = process.env.PATH;
       process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
-      setSubmoduleInspectSettingsForTests({ timeoutMs: 300, attempts: 3, retryDelayMs: 1 });
+      setSubmoduleInspectSettingsForTests({ timeoutMs: 2_000, attempts: 3, retryDelayMs: 1 });
       setProcessGroupLivenessProbeForTests(() => true);
 
       try {
@@ -4746,7 +4776,7 @@ describe("realizeExecutionWorkspace", () => {
         else process.env.PATH = previousPath;
         await fs.rm(shimDir, { recursive: true, force: true });
       }
-    }, 30_000);
+    }, 120_000);
 
     it("reports both the submodule repair and the degradation when the post-repair re-check stalls", async () => {
       // The other timeout tests all stall the *initial* probe. This covers the
@@ -4787,7 +4817,7 @@ describe("realizeExecutionWorkspace", () => {
       await fs.chmod(shimPath, 0o755);
       const previousPath = process.env.PATH;
       process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
-      setSubmoduleInspectSettingsForTests({ timeoutMs: 300, attempts: 2, retryDelayMs: 1 });
+      setSubmoduleInspectSettingsForTests({ timeoutMs: 2_000, attempts: 2, retryDelayMs: 1 });
       // This test asserts "2 attempt(s)" and `attempts: 2` on the post-repair
       // probe, so it needs the retry branch for the same reason as above.
       setProcessGroupLivenessProbeForTests(() => false);
@@ -4847,7 +4877,7 @@ describe("realizeExecutionWorkspace", () => {
         else process.env.PATH = previousPath;
         await fs.rm(shimDir, { recursive: true, force: true });
       }
-    }, 30_000);
+    }, 120_000);
 
     it("reports both the submodule repair and the degradation when a salvaged initial stall is followed by a stalled re-check", async () => {
       // BLO-30301: this is the exact path CI drifted into when the sibling
@@ -4897,7 +4927,7 @@ describe("realizeExecutionWorkspace", () => {
       await fs.chmod(shimPath, 0o755);
       const previousPath = process.env.PATH;
       process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
-      setSubmoduleInspectSettingsForTests({ timeoutMs: 300, attempts: 2, retryDelayMs: 1 });
+      setSubmoduleInspectSettingsForTests({ timeoutMs: 2_000, attempts: 2, retryDelayMs: 1 });
       // The `repair_withheld` guard keys off whether the timed-out process group
       // survived SIGKILL. In the CI occurrence it had not, so the repair ran; pin
       // that rather than leaving it to how promptly a loaded host reaps `sleep`.
@@ -4967,7 +4997,7 @@ describe("realizeExecutionWorkspace", () => {
         else process.env.PATH = previousPath;
         await fs.rm(shimDir, { recursive: true, force: true });
       }
-    }, 30_000);
+    }, 120_000);
 
     it("ignores a non-integer submodule inspection override instead of truncating it to zero", async () => {
       // `Math.trunc(0.5)` is 0, which does not fall back: 0 attempts skips the
@@ -5014,7 +5044,7 @@ describe("realizeExecutionWorkspace", () => {
         if (previousAttempts === undefined) delete process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS;
         else process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS = previousAttempts;
       }
-    }, 20_000);
+    });
 
     it("ignores an oversized submodule inspection timeout instead of letting Node clamp it to 1ms", async () => {
       // Node clamps any `setTimeout` delay above `2^31 - 1` ms to *1ms* with a
@@ -5065,7 +5095,7 @@ describe("realizeExecutionWorkspace", () => {
         if (previousTimeout === undefined) delete process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS;
         else process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS = previousTimeout;
       }
-    }, 20_000);
+    });
 
     it("ignores an undersized submodule inspection timeout instead of turning the knob into a fail-open switch", async () => {
       // A budget too small to ever complete fails open exactly like the oversized
@@ -5115,7 +5145,7 @@ describe("realizeExecutionWorkspace", () => {
         if (previousTimeout === undefined) delete process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS;
         else process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS = previousTimeout;
       }
-    }, 20_000);
+    });
   });
 
   it("repairs worktree submodules before running provision commands", async () => {
@@ -6395,7 +6425,13 @@ describe("executeProcess (timeout classification)", () => {
     } finally {
       await fs.rm(markerDir, { recursive: true, force: true });
     }
-  }, 15_000);
+    // 40_000, matching the sibling drain-grace case below. This body sleeps a
+    // deliberate 7_500 to prove the descendant stays reaped, so its floor is
+    // ~9.8s (measured 9857ms on a quiet 64-core host, load1 ~11) and the old
+    // 15_000 left only 1.5x -- too thin for a merge-queue shard (BLO-22985).
+    // The `< 5_000` assertion above still enforces reap promptness; this only
+    // bounds a hang.
+  }, 40_000);
 
   it("destroys captured stdio when drain grace expires after a clean exit", async () => {
     // A command can exit 0 while a descendant still owns the inherited pipes.
@@ -6528,9 +6564,18 @@ describe("executeProcess (timeout classification)", () => {
       // child as a clean success once they gain a timeout budget.
       expect(result.code).toBeNull();
       expect(result.processGroupAliveAfterTimeout).toBe(true);
-      // Budget: timeoutMs (50) + SIGTERM->SIGKILL grace (5_000) + the bounded
-      // post-kill liveness wait (750, PROCESS_TIMEOUT_GROUP_LIVENESS_GRACE_MS).
-      expect(elapsed).toBeLessThan(6_500);
+      // Floor: timeoutMs (50) + SIGTERM->SIGKILL grace (5_000) + the bounded
+      // post-kill liveness wait (750, PROCESS_TIMEOUT_GROUP_LIVENESS_GRACE_MS)
+      // = 5_800, all timers -- the child is a stub, so there is no real work in
+      // the span. Measured 5819/5822/5821ms on a quiet 64-core host (load1
+      // ~10-11), i.e. ~20ms of non-timer overhead. The old 6_500 left 679ms of
+      // slack (1.12x): three chained timers only have to fire ~230ms late each
+      // to trip it, and this file's original BLO-22985 ejection was a 33%
+      // overrun on a comparable timer-dominated span. 12_000 is 2.06x the
+      // measured floor and still well inside the 15_000 per-test cap, so a
+      // genuine regression fails here with this message rather than on the
+      // harness timeout.
+      expect(elapsed).toBeLessThan(12_000);
       // Confirms the promise settled purely off the timeout timers: `exit`
       // and `close` handlers were armed but this stub never invoked them.
       expect(listeners.has("exit")).toBe(true);
@@ -7325,6 +7370,163 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     });
     await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
     await expect(readGit(worktreePath, ["status", "--porcelain", "--untracked-files=all"])).resolves.not.toBe("");
+  }, 20_000);
+
+  it("does not treat the validating issue's own workspace as a rival claimant (BLO-33610)", async () => {
+    const expectedBranch = "PAP-461-recorded";
+    const actualBranch = "PAP-461-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-461",
+      claimant: "none",
+    });
+    // The operator remedy for a poisoned worktree: rebind executionWorkspaceId -> null. That is
+    // exactly the input that used to disable the self-exclusion.
+    await db
+      .update(issues)
+      .set({ executionWorkspaceId: null })
+      .where(eq(issues.id, ids.sourceIssueId));
+
+    const contention = await executionWorkspaceService(db).findGitWorktreeContention({
+      companyId: ids.companyId,
+      worktreePath,
+      liveBranchName: actualBranch,
+      excludingExecutionWorkspaceId: null,
+      excludingSourceIssueId: ids.sourceIssueId,
+    });
+
+    expect(contention).toBeNull();
+  }, 20_000);
+
+  it("still reports a different issue's workspace on the same path as a rival claimant", async () => {
+    const expectedBranch = "PAP-462-recorded";
+    const actualBranch = "PAP-462-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-462",
+      claimant: "none",
+    });
+    await db
+      .update(issues)
+      .set({ executionWorkspaceId: null })
+      .where(eq(issues.id, ids.sourceIssueId));
+
+    // A genuine rival: a different issue, squatting the same worktree path, with a live run.
+    const rivalIssueId = randomUUID();
+    const rivalWorkspaceId = randomUUID();
+    const rivalRunId = randomUUID();
+    const later = new Date(Date.now() + 5_000);
+    await db.insert(heartbeatRuns).values({
+      id: rivalRunId,
+      companyId: ids.companyId,
+      agentId: ids.agentId,
+      invocationSource: "manual",
+      status: "running",
+      startedAt: later,
+      updatedAt: later,
+    });
+    await db.insert(issues).values({
+      id: rivalIssueId,
+      companyId: ids.companyId,
+      projectId: ids.projectId,
+      projectWorkspaceId: ids.projectWorkspaceId,
+      title: "Rival on the same path",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: ids.agentId,
+      identifier: "PAP-998",
+      executionRunId: rivalRunId,
+    });
+    await db.insert(executionWorkspaces).values({
+      id: rivalWorkspaceId,
+      companyId: ids.companyId,
+      projectId: ids.projectId,
+      projectWorkspaceId: ids.projectWorkspaceId,
+      sourceIssueId: rivalIssueId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: expectedBranch,
+      status: "active",
+      cwd: worktreePath,
+      providerRef: worktreePath,
+      baseRef: "HEAD",
+      branchName: expectedBranch,
+      providerType: "git_worktree",
+      lastUsedAt: later,
+      updatedAt: later,
+    });
+
+    const contention = await executionWorkspaceService(db).findGitWorktreeContention({
+      companyId: ids.companyId,
+      worktreePath,
+      liveBranchName: actualBranch,
+      excludingExecutionWorkspaceId: null,
+      excludingSourceIssueId: ids.sourceIssueId,
+    });
+
+    expect(contention).toMatchObject({
+      claimedByWorkspaceId: rivalWorkspaceId,
+      claimedByIssueIdentifier: "PAP-998",
+      activeRun: expect.objectContaining({ id: rivalRunId, status: "running" }),
+    });
+    // A run never contends with itself, on any path.
+    expect(contention?.activeRun?.id).not.toBe(ids.runId);
+  }, 20_000);
+
+  it("lets a self-contending dirty worktree reach the remaining quarantine preconditions", async () => {
+    const expectedBranch = "PAP-463-recorded";
+    const actualBranch = "PAP-463-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-463",
+      claimant: "none",
+    });
+    await db
+      .update(issues)
+      .set({ executionWorkspaceId: null })
+      .where(eq(issues.id, ids.sourceIssueId));
+
+    // The self-contention gate no longer fires, so validation advances to the runtime-service
+    // precondition, which fail-closes on a null workspace id on its own merits. The operator-visible
+    // reason must name that gate, not a claim the issue made against itself.
+    await expect(ensureGitWorktreeBranchCoherent({
+      db,
+      repoRoot,
+      worktreePath,
+      expectedBranchName: expectedBranch,
+      sourceIssue: {
+        id: ids.sourceIssueId,
+        identifier: ids.sourceIdentifier,
+        title: "Repair dirty branch mismatch",
+      },
+      executionWorkspaceId: null,
+      heartbeatRunId: ids.runId,
+      enableWorkspaceDirtyQuarantineRepair: true,
+    })).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          cleanliness: "dirty",
+          contention: null,
+          safeRepair: expect.objectContaining({
+            eligible: false,
+            reason: "dirty quarantine repair requires an execution workspace id for runtime-service checks",
+          }),
+        }),
+      },
+    });
   }, 20_000);
 
   it("refuses dirty quarantine repair while the execution workspace has an active runtime service", async () => {

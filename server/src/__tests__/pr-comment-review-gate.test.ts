@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 // @ts-expect-error -- plain-JS census script; imported for its own predicate so
@@ -12,6 +15,8 @@ import {
   hasAllyConsolidatedReviewHeading,
 } from "../services/ally-review-detection.js";
 import {
+  commentReviewGateCheckConclusion,
+  commentReviewGateCheckTitle,
   commentReviewGateRetirementDescription,
   commentReviewGateRetirementStatus,
   commentReviewGateVerdictIsMisreadable,
@@ -812,6 +817,110 @@ describe("evaluateCommentReviewGate — quoted review bodies", () => {
 });
 
 /**
+ * A counted bucket heading is a verdict only where a verdict can appear: at
+ * the start of a line. Quoted inline, it is a reviewer naming the format, and
+ * on a parser whose own reviews must quote that format to say anything useful
+ * that distinction gates the fix for itself (BLO-32443).
+ */
+describe("hasActionablePrReviewFeedback — counted buckets are line-anchored", () => {
+  // Verbatim from paperclip#1681's `c57fafa` review, which declares 0
+  // Critical / 0 Important and whose gate went red 11 seconds later. This is
+  // the negative control: it fails before the anchor, so a green here cannot
+  // be produced by a blanket relaxation.
+  const PR1681_REVIEW = readFileSync(
+    path.join(import.meta.dirname, "fixtures", "ally-review-pr1681-2026-09-06T112146Z.md"),
+    "utf8",
+  );
+
+  it("does not read a bucket quoted inside an inline-code span as a finding", () => {
+    // The body carries four bucket matches: the two real 0/0 headings, plus
+    // two inline-code illustrations of a truncation failure mode, one of them
+    // `### Important Issues (1)`. Only the headings are verdicts.
+    expect(PR1681_REVIEW).toContain("`### Important Issues (1)` is cut");
+    expect(hasActionablePrReviewFeedback(PR1681_REVIEW)).toBe(false);
+  });
+
+  it("still enumerates the real 0/0 buckets, so the head is not unenumerable", () => {
+    // Anchoring must narrow what counts as a verdict without blinding the
+    // carry-forward enumeration — a null here would read as "no buckets
+    // declared", which is a different and worse verdict than clean.
+    expect(extractAllyReportedFindingRefs(PR1681_REVIEW)).toEqual([]);
+  });
+
+  it.each([
+    ["markdown heading", "### Critical Issues (1)"],
+    ["bold run", "**Important Issues (2)**"],
+    ["list item", "- Critical Issues (1)"],
+    ["blockquoted heading", "> ### Important Issues (1)"],
+  ])("still blocks on a bucket in canonical position: %s", (_shape, heading) => {
+    expect(hasActionablePrReviewFeedback(reviewBody(CURRENT_HEAD, [heading]))).toBe(true);
+  });
+
+  it.each([
+    ["decision line", "decision: changes_requested"],
+    ["bare phrase", "The reviewer left changes requested on this head."],
+    ["uncounted heading", "### Critical Issues"],
+  ])("leaves the other blocking clauses intact: %s", (_shape, line) => {
+    expect(hasActionablePrReviewFeedback(reviewBody(CURRENT_HEAD, [line]))).toBe(true);
+  });
+
+  // Anchoring the start of the match is only half of line-local: every
+  // separator inside it has to be horizontal too. With `\s+` the pattern
+  // walked off the end of its own anchored line and read the next one.
+  it("does not join a severity word to an `Issues (n)` on the following line", () => {
+    expect(hasActionablePrReviewFeedback(reviewBody(CURRENT_HEAD, ["### Critical", "Issues (1)"]))).toBe(
+      false,
+    );
+  });
+
+  // The subtler half: a split count used to make the two patterns contradict
+  // each other. This one saw a zero bucket and cleared, while the uncounted
+  // heading regex — whose lookahead cannot see a paren across a newline — saw
+  // a bare heading and blocked. They must agree, and on an ambiguous split
+  // this module's stated asymmetry says agree the fail-closed way: it blocks,
+  // and declares no enumerable bucket (null, "none declared" — not [], which
+  // would assert the head genuinely reported zero findings).
+  it("classifies a bucket whose count is on the next line as an uncounted heading", () => {
+    const split = reviewBody(CURRENT_HEAD, ["### Critical Issues", "(0)"]);
+    expect(hasActionablePrReviewFeedback(split)).toBe(true);
+    expect(extractAllyReportedFindingRefs(split)).toBeNull();
+  });
+
+  // The anchor's marker run must consume one `#`/`>` per iteration. Written as
+  // `(?:[#>]+[ \t]*)*` it is `(x+)*`, and a leading marker run that then fails
+  // the rest of the pattern costs 2^(n-1) — 757ms at n=40, doubling every two
+  // characters. The body reaching this is raw webhook input on a
+  // single-threaded API, so the blowup stalls the event loop, not one request.
+  // n=64 is ~10^7x the n=40 cost, so any wall-clock bound separates the two.
+  it("matches a long leading marker run in linear time", () => {
+    const started = performance.now();
+    expect(hasActionablePrReviewFeedback("#".repeat(64) + "x")).toBe(false);
+    expect(hasActionablePrReviewFeedback(">".repeat(64) + "x")).toBe(false);
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+
+  // Same run, but a shape that genuinely is a bucket: collapsing the nested
+  // quantifier must not narrow the accepted language.
+  it("still blocks on a bucket behind a mixed marker run", () => {
+    expect(hasActionablePrReviewFeedback("> > ### Critical Issues (1)")).toBe(true);
+  });
+
+  // Adopting NOT_INDENTED_CODE moved this case: the unanchored pattern used to
+  // block on it. Four-space indentation is a code block, so this reads as
+  // quoted — consistent with every other pattern in the file. But it is a
+  // move in the fail-open direction on a module whose header says never to
+  // take that direction unexamined, so it is pinned rather than incidental.
+  // UNCOUNTED_FINDINGS_HEADING_REGEX does not catch the fallthrough either:
+  // its `(?![*_]*[ \t]*\()` lookahead sees the `(1)` and declines.
+  it("treats a bucket in an indented code block as quoted, not as a verdict", () => {
+    const indented = reviewBody(CURRENT_HEAD, ["    ### Critical Issues (1)"]);
+    expect(hasActionablePrReviewFeedback(indented)).toBe(false);
+    // Fail-closed on the enumeration side: "none declared", never a claimed [].
+    expect(extractAllyReportedFindingRefs(indented)).toBeNull();
+  });
+});
+
+/**
  * Ally wraps the attested SHA in whatever emphasis it happens to choose. The
  * suite previously built every fixture with a bare SHA, so it asserted the
  * parser correct only on the one shape it already handled (BLO-31730).
@@ -989,5 +1098,377 @@ describe("retired context supersede", () => {
       expect(description).toMatch(/"[^"]*…"\.$/);
       expect(description.split('"').length - 1).toBe(2);
     }
+  });
+});
+
+describe("commentReviewGateCheckConclusion", () => {
+  const notEvaluated = evaluateCommentReviewGate({ headSha: CURRENT_HEAD, comments: [] });
+  const clean = evaluateCommentReviewGate({
+    headSha: CURRENT_HEAD,
+    comments: [allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T21:09:19Z")],
+  });
+  const blocking = evaluateCommentReviewGate({
+    headSha: CURRENT_HEAD,
+    comments: [allyComment(blockingReview(CURRENT_HEAD), "2026-08-04T20:09:19Z")],
+  });
+  const carried = evaluateCommentReviewGate({
+    headSha: CURRENT_HEAD,
+    comments: [allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z")],
+  });
+
+  it("renders not-evaluated differently from reviewed-and-clean without reading the description", () => {
+    // The defect this exists to close: on the commit-status surface both of
+    // these are `success`, so the only thing separating "reviewed, clean" from
+    // "nothing reviewed this head" is prose nobody reads (BLO-33657).
+    expect(notEvaluated.state).toBe(clean.state);
+
+    expect(commentReviewGateCheckConclusion(clean)).toBe("success");
+    expect(commentReviewGateCheckConclusion(notEvaluated)).toBe("neutral");
+    expect(commentReviewGateCheckConclusion(notEvaluated)).not.toBe(
+      commentReviewGateCheckConclusion(clean),
+    );
+  });
+
+  it("keeps the not-evaluated conclusion non-blocking", () => {
+    // BLO-29711's constraint, pinned so a later change cannot answer the
+    // distinguishability requirement by reintroducing pending/failure-on-absence
+    // and deadlocking every formally-reviewed PR.
+    expect(["success", "neutral"]).toContain(commentReviewGateCheckConclusion(notEvaluated));
+  });
+
+  it("still blocks on a finding, at this head or carried from an earlier one", () => {
+    expect(commentReviewGateCheckConclusion(blocking)).toBe("failure");
+    expect(commentReviewGateCheckConclusion(carried)).toBe("failure");
+  });
+
+  it("covers every not-established shape, not just the empty-comment one", () => {
+    const cases = [
+      // No head supplied to evaluate against.
+      evaluateCommentReviewGate({ headSha: "", comments: [] }),
+      // An Ally review that attests some other head.
+      evaluateCommentReviewGate({
+        headSha: CURRENT_HEAD,
+        comments: [allyComment(cleanReview(INTERMEDIATE_HEAD), "2026-08-04T21:09:19Z")],
+      }),
+      // A clean review of this head from someone who is not the reviewer.
+      evaluateCommentReviewGate({
+        headSha: CURRENT_HEAD,
+        comments: [
+          { authorLogin: "someone-else", body: cleanReview(CURRENT_HEAD), createdAt: "2026-08-04T21:09:19Z" },
+        ],
+      }),
+    ];
+
+    for (const verdict of cases) {
+      expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+      expect(commentReviewGateCheckConclusion(verdict)).toBe("neutral");
+    }
+  });
+
+  it("gives each outcome its own title so the conclusion is legible unopened", () => {
+    const titles = [notEvaluated, clean, blocking, carried].map(commentReviewGateCheckTitle);
+
+    expect(new Set(titles).size).toBe(titles.length);
+    expect(commentReviewGateCheckTitle(notEvaluated)).toMatch(/not evaluated/i);
+  });
+});
+
+/**
+ * BLO-31446 — Ally's clean-review boilerplate must not read as a blocking
+ * finding.
+ *
+ * `hasActionablePrReviewFeedback` ended with an unguarded `Recommended Action`
+ * … `fix` … `before merge` prose fallback. Ally's own 0-findings closing lines
+ * supply all three tokens, so the cleaner the review, the likelier the red.
+ *
+ * Two distinct costs, and they are not equally severe — an earlier draft of
+ * this comment called the whole thing permanent, which is wrong for the first:
+ *
+ *   - Carried case (an older head is the one misread): self-clears as soon as
+ *     any clean attestation of the *current* head lands, because
+ *     `evaluateCommentReviewGate` short-circuits on a current-head attestation
+ *     before it ever consults the carry-forward. Cost is one review cycle of
+ *     red. Observed at ~22 minutes on paperclip#1651.
+ *   - Same-head case (the head being merged is the one misread): genuinely
+ *     unclearable. A 0/0 body yields no finding identities, so no
+ *     `Prior Findings Dispositioned` entry can name the finding to retire it,
+ *     and the only exit is a fresh commit.
+ *
+ * The corpus measurement behind the narrowing, and the two candidate fixes it
+ * rules out, live with the clause itself in
+ * `ally-review-detection.ts:hasActionablePrReviewFeedback`. Kept in one place
+ * deliberately: both copies were accurate, which is exactly why they would
+ * drift.
+ *
+ * The bodies below are the load-bearing lines of five real reviews, verbatim.
+ * They are trimmed to the counted buckets plus the exact `Recommended Action`
+ * lines rather than reproducing several KB of prose; the full verbatim
+ * multicast#589 and paperclip#1651 bodies were executed against both the pre-
+ * and post-fix module and classify identically to their trimmed forms here, so
+ * the trim is measured, not assumed.
+ */
+describe("clean-review precedence over the Recommended Action prose fallback", () => {
+  const CLEAN_BUCKETS = ["### Critical Issues (0)", "### Important Issues (0)"];
+
+  // Each of the five differs in where and how the negation is phrased, which is
+  // why the fix is precedence rather than another regex: `hasNonNegatedMatch`
+  // only inspects the words *preceding* a match within its sentence, so the
+  // paperclip#1605 body's trailing `_(None.)_` is invisible to any look-back
+  // guard however its cue list is tuned.
+  //
+  // The paperclip#1651 body is the shape that rules out the other candidate
+  // narrowing — confining the fallback's `[\s\S]{0,400}` spans to a single
+  // paragraph. There the three trigger tokens are three *unrelated* list items:
+  // the heading, then `fix` as a **noun naming the PR**, then a `before
+  // merging` that belongs to a rebase instruction. Nothing about that span is
+  // an instruction to fix anything, and no lexical guard can tell, because
+  // every token is used in good faith. Only the reviewer's own 0/0 tally
+  // settles it.
+  const realCleanReviews: Array<[string, string[]]> = [
+    ["paperclip#1618 @999cc70", ["1. No Critical issues to fix before merge."]],
+    ["paperclip#1612 @383f074", ["1. No Critical issues — nothing to fix before merge."]],
+    ["multicast#589 @ef7a43a", ["1. No Critical or Important issues — nothing to fix before merge."]],
+    ["paperclip#1605 @123e1d2", ["1. Fix Critical issues before merge. _(None.)_"]],
+    [
+      "paperclip#1651 @2b6763f6",
+      [
+        "1. Nothing blocks merge on correctness. Zero Critical, zero Important, and the one prior blocker is withdrawn by me.",
+        "2. With BLO-31836 cancelled as not-a-defect, this PR is the whole fix and BLO-23197 can close on it.",
+        "3. The branch is `mergeable_state: behind` — update it before merging.",
+      ],
+    ],
+  ];
+
+  for (const [source, recommendedAction] of realCleanReviews) {
+    it(`does not treat a 0/0 review as blocking: ${source}`, () => {
+      const body = reviewBody(CURRENT_HEAD, [
+        ...CLEAN_BUCKETS,
+        "### Recommended Action",
+        ...recommendedAction,
+      ]);
+
+      expect(hasActionablePrReviewFeedback(body)).toBe(false);
+    });
+  }
+
+  // The fix must narrow only the prose fallback. Every other blocking signal
+  // stays live at 0/0, so a reviewer who explicitly asks for changes is still
+  // heard even when both buckets are empty.
+  const explicitChangeRequests: Array<[string, string[], string | undefined]> = [
+    ["decision: changes_requested", ["decision: changes_requested"], undefined],
+    ["a bare `changes requested`", ["Changes requested on this head."], undefined],
+    ["a bare `request changes`", ["I request changes here."], undefined],
+    ["a formal CHANGES_REQUESTED state", [], "changes_requested"],
+  ];
+
+  for (const [label, lines, state] of explicitChangeRequests) {
+    it(`still blocks a 0/0 review carrying ${label}`, () => {
+      const body = reviewBody(CURRENT_HEAD, [...CLEAN_BUCKETS, ...lines]);
+
+      expect(hasActionablePrReviewFeedback(body, state)).toBe(true);
+    });
+  }
+
+  it("still blocks an uncounted findings heading at 0/0", () => {
+    // An uncounted heading is not a count, so a body can carry both. The
+    // heading wins: it is a finding the reviewer did not tally.
+    const body = reviewBody(CURRENT_HEAD, [...CLEAN_BUCKETS, "### Critical Issues", "- a real one"]);
+
+    expect(hasActionablePrReviewFeedback(body)).toBe(true);
+  });
+
+  it("keeps the prose fallback live when only one bucket is declared", () => {
+    // Precedence requires an explicit statement about *both* severities. One
+    // bucket at zero says nothing about the other, so this is not a 0/0
+    // declaration and the fallback must still apply.
+    const body = reviewBody(CURRENT_HEAD, [
+      "### Critical Issues (0)",
+      "### Recommended Action",
+      "Fix it before merge.",
+    ]);
+
+    expect(hasActionablePrReviewFeedback(body)).toBe(true);
+  });
+
+  it("keeps the prose fallback live when no bucket is declared", () => {
+    // Pins the same contract as the prose-only case further up this file: the
+    // fallback is load-bearing precisely where no counted bucket exists.
+    const body = reviewBody(CURRENT_HEAD, ["### Recommended Action", "Fix the gate before merge."]);
+
+    expect(hasActionablePrReviewFeedback(body)).toBe(true);
+  });
+
+  // `still-present` is the ledger verb for "this prior finding still stands",
+  // and `classifyPriorDisposition` already returns `blocks` for it. The
+  // contract says such a finding is mirrored into the current buckets, which
+  // would make a count non-zero and block before this signal is ever reached —
+  // and across the whole measured corpus that mirroring did hold, so the cases
+  // below never fire on a real body today. They pin the defence for the one
+  // occasion it would matter: a review that asserts a live finding and forgets
+  // to tally it. That is a contract violation, so the guard has to be a
+  // positive signal rather than something the surrounding prose can veto.
+  it("still blocks a 0/0 review whose ledger asserts a prior finding is still-present", () => {
+    const body = [
+      dispositioningReview(CURRENT_HEAD, OLD_HEAD, "still-present"),
+      "### Recommended Action",
+      "1. No Critical issues to fix before merge.",
+    ].join("\n");
+
+    expect(hasActionablePrReviewFeedback(body)).toBe(true);
+  });
+
+  // The case above passes for the wrong reason if `still-present` is only a
+  // carve-out inside the clean-declaration test: that shape suppresses the
+  // early `return false` and then lets the prose fallback decide, and the
+  // boilerplate it uses happens to supply the fallback's own trigger tokens.
+  // These strip the tokens away, so nothing but a positive `blocks` signal can
+  // carry them. All three returned `false` before that promotion.
+  const inertShapes: Array<[string, string[]]> = [
+    [
+      "a Recommended Action carrying none of the fallback's tokens",
+      ["### Recommended Action", "1. Nothing to address.", "2. Merge when CI is green."],
+    ],
+    ["no Recommended Action section at all", []],
+  ];
+
+  for (const [label, trailer] of inertShapes) {
+    it(`still blocks a still-present ledger entry under ${label}`, () => {
+      const body = [
+        dispositioningReview(CURRENT_HEAD, OLD_HEAD, "still-present"),
+        ...trailer,
+      ].join("\n");
+
+      expect(hasActionablePrReviewFeedback(body)).toBe(true);
+    });
+  }
+
+  it("still blocks a still-present ledger entry when no counted bucket is declared", () => {
+    // The widest of the inert shapes, and the worst: with no bucket at all
+    // `extractAllyReportedFindingRefs` returns null — "identities unknown" — so
+    // the carry-forward cannot enumerate what to retire either. The assertion
+    // in the ledger is the only signal the body carries.
+    const body = reviewBody(CURRENT_HEAD, [
+      "### Prior Findings Dispositioned (1)",
+      `- **prior:${OLD_HEAD.slice(0, 7)} important 1** — still-present — re-checked against this head.`,
+    ]);
+
+    expect(hasActionablePrReviewFeedback(body)).toBe(true);
+  });
+
+  it("still blocks a still-present ledger entry sitting under an unbalanced fence", () => {
+    // The one shape that separates reading the ledger from the text in hand
+    // from delegating to the emitted-only extractor. An unbalanced fence blanks
+    // to end of body, so a fence opened *above* the ledger takes the entry with
+    // it on the fence-stripped pass and the raw pass is the only reader left
+    // that can see it; control then reaches the clean declaration, which the
+    // raw pass's intact 0/0 satisfies, and the gate clears. `:708`/`:729` pin
+    // exactly this hazard for the bucket signal, which reads the text in hand.
+    //
+    // Fence *position* alone must not decide the verdict, which is what the
+    // second assertion holds fixed: identical body, fence moved below the
+    // ledger, where stripping cannot reach it.
+    const ledger = [
+      "### Prior Findings Dispositioned (1)",
+      `- **prior:${OLD_HEAD.slice(0, 7)} important 1** — still-present — re-checked against this head.`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+      "### Recommended Action",
+      "1. No Critical issues to fix before merge.",
+    ];
+    const unterminatedFence = ["```ts", "const unterminated = true;"];
+
+    expect(hasActionablePrReviewFeedback(reviewBody(CURRENT_HEAD, [...unterminatedFence, ...ledger]))).toBe(
+      true,
+    );
+    expect(hasActionablePrReviewFeedback(reviewBody(CURRENT_HEAD, [...ledger, ...unterminatedFence]))).toBe(
+      true,
+    );
+  });
+
+  it("clears a 0/0 review whose ledger only retires prior findings", () => {
+    // The control for the case above: `fixed` classifies as `retires`, so it
+    // must not block. Without this, the still-present guard could be satisfied
+    // by any ledger entry at all and the fix would silently stop working.
+    const body = [
+      dispositioningReview(CURRENT_HEAD, OLD_HEAD, "fixed"),
+      "### Recommended Action",
+      "1. No Critical issues to fix before merge.",
+    ].join("\n");
+
+    expect(hasActionablePrReviewFeedback(body)).toBe(false);
+  });
+
+  it("clears a 0/0 review whose ledger carries a verb this parser does not know", () => {
+    // Deliberate, and the asymmetry with the carry-forward path is the point.
+    // There the question is "was this prior finding retired?", so an
+    // `unrecognized` verb fails closed — `isRetired` demands `retires`. Here the
+    // question is "does this review report findings against *this* head?", and
+    // the 0/0 answers it directly. Only `still-present` is excluded, because it
+    // is the one verb that positively asserts a finding still stands and so
+    // contradicts the tally beside it. Widening this to `unrecognized` would
+    // block on a typo, which is why it is pinned rather than left ambiguous.
+    const body = [
+      dispositioningReview(CURRENT_HEAD, OLD_HEAD, "deferred"),
+      "### Recommended Action",
+      "1. No Critical issues to fix before merge.",
+    ].join("\n");
+
+    expect(hasActionablePrReviewFeedback(body)).toBe(false);
+  });
+
+  it("fails the gate at the current head when a still-present ledger entry rides a 0/0 body", () => {
+    // The unit assertions above cannot reach this. `evaluateCommentReviewGate`
+    // short-circuits on a current-head attestation before it consults the
+    // carry-forward, so the still-present entry is never re-examined there —
+    // the existing still-present test in this file attests INTERMEDIATE_HEAD
+    // and therefore exercises the carry-forward path instead.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(
+          [
+            dispositioningReview(CURRENT_HEAD, OLD_HEAD, "still-present"),
+            "### Recommended Action",
+            "1. No Critical issues to fix before merge.",
+          ].join("\n"),
+          "2026-09-05T20:00:00Z",
+        ),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "blocking_finding" });
+  });
+
+  it("still counts a non-zero bucket alongside clean prose", () => {
+    const body = reviewBody(CURRENT_HEAD, [
+      "### Critical Issues (0)",
+      "### Important Issues (1)",
+      "- a real finding",
+      "### Recommended Action",
+      "1. No Critical issues to fix before merge.",
+    ]);
+
+    expect(hasActionablePrReviewFeedback(body)).toBe(true);
+  });
+
+  it("reports a clean verdict end to end for a boilerplate-carrying review", () => {
+    // The user-visible outcome, not just the predicate: before the fix this
+    // head was carried forward as `carried_finding` with no ledger entry able
+    // to retire it.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(
+          reviewBody(CURRENT_HEAD, [
+            ...CLEAN_BUCKETS,
+            "### Recommended Action",
+            "1. No Critical or Important issues — nothing to fix before merge.",
+          ]),
+          "2026-09-04T03:11:21Z",
+        ),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "clean" });
   });
 });
