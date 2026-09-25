@@ -2698,7 +2698,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(notice[0]?.body).toContain("Blockcast/libmmt#444");
     expect(notice[0]?.body).toContain(headSha);
     // The terminal fact itself, in words, not just a link to a red check.
-    expect(notice[0]?.body).toContain("No review was posted, and none is coming for this head");
+    expect(notice[0]?.body).toContain("No review was posted by that run");
+    // BLO-34699: and NOT a claim about the queue, which this notice never read.
+    // "none is coming for this head — a terminal outcome, not reviewer latency"
+    // was measured false on Blockcast/pim-multicast-gateway#3237 at the moment
+    // it was written, with a queued reviewer run for that exact head 4.67h old.
+    expect(notice[0]?.body).not.toContain("none is coming");
+    expect(notice[0]?.body).not.toContain("not reviewer latency");
 
     // The comment is the durable artifact; the wake is what actually reaches an
     // agent. `in_review` is excluded from inbox-lite by design, so without this
