@@ -44,11 +44,13 @@ import {
   resolveWorkspaceRuntimeReadinessTimeoutSec,
   resolveShell,
   sanitizeRuntimeServiceBaseEnv,
+  setLockHolderScanForTests,
   setProcessGroupLivenessProbeForTests,
   setSubmoduleInspectSettingsForTests,
   startRuntimeServicesForWorkspaceControl,
   stopRuntimeServicesForExecutionWorkspace,
   type RealizedExecutionWorkspace,
+  type LockHolderScan,
   WorkspaceGitSubmoduleError,
   WorkspaceRepoMismatchError,
 } from "../services/workspace-runtime.ts";
@@ -596,6 +598,7 @@ afterEach(async () => {
   // cases. Clearing unconditionally is idempotent.
   setSubmoduleInspectSettingsForTests(null);
   setProcessGroupLivenessProbeForTests(null);
+  setLockHolderScanForTests(null);
   // Same backstop, for the `git` shim tests. They prepend a temp dir to PATH and
   // restore it in their own `finally`, so this is normally a no-op -- but a test
   // killed by the suite timeout runs that block late, and a leaked PATH whose
@@ -7639,6 +7642,19 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
   }, 20_000);
 
+  // The `/proc` walk exists only on Linux, and the platform gate refuses ahead
+  // of the liveness and age gates -- so without a seam every test of the gates
+  // *around* the scan would assert `unavailable on darwin` rather than what it
+  // means to assert, and a developer on macOS would see reds on a path they did
+  // not touch. Stating the verdict here makes these tests portable and keeps
+  // them about the gate under test. The real walk is not thereby untested: the
+  // live-holder case below runs it for real, on Linux, against a real open fd.
+  function stubLockHolderScan(verdict: LockHolderScan) {
+    setLockHolderScanForTests(async () => verdict);
+  }
+
+  const UNHELD: LockHolderScan = { holders: [] };
+
   // A run killed mid-`git` leaves a 0-byte index.lock that git never reaps, which
   // aborted the quarantine repair forever and parked the row on
   // manual_repair_required (BLO-35981).
@@ -7688,6 +7704,7 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
       claimant: "none",
     });
     const lockPath = await writeIndexLock(worktreePath, { body: "", ageMs: 21.5 * 60 * 60 * 1000 });
+    stubLockHolderScan(UNHELD);
 
     const restored = await restoreDirtyQuarantine({
       repoRoot,
@@ -7775,6 +7792,7 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
       body: "",
       ageMs: GIT_INDEX_LOCK_STALE_MS - 30_000,
     });
+    stubLockHolderScan(UNHELD);
     try {
       await expectIndexLockRefusal(
         restoreDirtyQuarantine({ repoRoot, worktreePath, expectedBranch, actualBranch, ids }),
@@ -7803,6 +7821,7 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
       body: "",
       ageMs: GIT_INDEX_LOCK_STALE_MS + 30_000,
     });
+    stubLockHolderScan(UNHELD);
 
     const restored = await restoreDirtyQuarantine({
       repoRoot,
@@ -7822,7 +7841,15 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
   // operation, which is exactly the signature the age floor would clear. An
   // open descriptor is the signal that actually discriminates, so this fixture
   // presents the "safe to break" size and age and holds the fd anyway.
-  it("refuses to break a stale 0-byte index lock while a live process holds it open", async () => {
+  //
+  // This is the one case that runs the *real* `/proc` walk rather than stubbing
+  // its verdict, so it is the coverage the seam would otherwise cost -- and it
+  // is inherently Linux-only for the same reason the seam exists. Skipped
+  // elsewhere rather than stubbed, because a stubbed `{holders: ["…"]}` would
+  // assert the refusal and prove nothing about the scan that produced it.
+  it.skipIf(process.platform !== "linux")(
+    "refuses to break a stale 0-byte index lock while a live process holds it open",
+    async () => {
     const expectedBranch = "PAP-473-recorded";
     const actualBranch = "PAP-473-live";
     const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
@@ -7849,7 +7876,9 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
       await fs.rm(lockPath, { force: true });
     }
     await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
-  }, 20_000);
+    },
+    20_000,
+  );
 
   // The liveness scan is the safety argument, so "I could not run it" must not
   // read as "nobody holds it" -- that would silently degrade the guard back to
@@ -7861,7 +7890,9 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
   // host, not a rare container configuration. Failing closed here parks the
   // row, which is the defect this change removes, and is still the correct
   // trade: an unverifiable lock is not one to break.
-  it("refuses to break a stale 0-byte index lock when /proc cannot be read", async () => {
+  it.skipIf(process.platform !== "linux")(
+    "refuses to break a stale 0-byte index lock when /proc cannot be read",
+    async () => {
     const expectedBranch = "PAP-475-recorded";
     const actualBranch = "PAP-475-live";
     const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
@@ -7875,6 +7906,13 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     });
     const lockPath = await writeIndexLock(worktreePath, { body: "", ageMs: 21.5 * 60 * 60 * 1000 });
 
+    // Failing a real readdir rather than stating the verdict, so this covers
+    // the `readdir("/proc")` catch itself -- with the verdict stubbed, deleting
+    // that catch leaves this green. That makes it Linux-only: off Linux the
+    // platform gate refuses ahead of the readdir the spy intercepts, so the
+    // test would assert the wrong refusal. Skipped there rather than stubbed,
+    // which keeps the coverage where it can run instead of trading it away.
+    //
     // Only /proc fails; every other readdir on the repair path must still work,
     // or this would pass for the wrong reason.
     const realReaddir = fs.readdir.bind(fs);
@@ -7897,7 +7935,9 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
       await fs.rm(lockPath, { force: true });
     }
     await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
-  }, 20_000);
+    },
+    20_000,
+  );
 
   // The scan is /proc-only, so on any non-Linux host it cannot run at all and
   // the break never fires -- every stale lock there still parks the row. That
@@ -7927,6 +7967,14 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     // through, so the platform gate is the only one left that can refuse.
     const lockPath = await writeIndexLock(worktreePath, { body: "", ageMs: 21.5 * 60 * 60 * 1000 });
 
+    // Deliberately NOT the scan seam. This case passes on every platform
+    // already -- the gate it asserts is reached the same way everywhere -- so
+    // stubbing the verdict would buy no portability and would cost the only
+    // coverage of the platform check inside `lockHolderPids` itself: with the
+    // verdict supplied, deleting that check leaves this test green. Mutating
+    // the global is safe because vitest runs tests within a file sequentially
+    // and nothing here opts into `concurrent`; if that ever changes, this is
+    // the test that has to move to the seam and accept the loss.
     const realPlatform = process.platform;
     Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
     try {
@@ -7938,6 +7986,64 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
       await expect(fs.stat(lockPath).then((entry) => entry.size)).resolves.toBe(0);
     } finally {
       Object.defineProperty(process, "platform", { value: realPlatform, configurable: true });
+      await fs.rm(lockPath, { force: true });
+    }
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
+  }, 20_000);
+
+  // Every gate above vets an *inode*; the rename names a *path*. Between them
+  // sits the O(processes x fds) /proc walk, so the window is the scan's whole
+  // duration. If the holder releases inside it, a live `git` can take the path
+  // afresh with O_CREAT|O_EXCL -- and renaming then moves *that* live mutex
+  // aside, losing the victim's index write. The ENOENT branch does not cover
+  // it: that is the lock being gone, not replaced.
+  //
+  // The fixture keeps size and mtime identical to the vetted lock and changes
+  // only the inode, so this cannot pass on a size or mtime comparison alone --
+  // `ino` has to be the field doing the work. Replacing it from inside the scan
+  // seam puts the swap exactly where the real race happens.
+  it("refuses to move aside an index lock that was replaced while the scan ran", async () => {
+    const expectedBranch = "PAP-477-recorded";
+    const actualBranch = "PAP-477-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-477",
+      claimant: "none",
+    });
+    const lockPath = await writeIndexLock(worktreePath, { body: "", ageMs: 21.5 * 60 * 60 * 1000 });
+    const vetted = await fs.stat(lockPath);
+    setLockHolderScanForTests(async () => {
+      // Allocated while the original still exists, then renamed over it. An
+      // `rm` followed by a `writeFile` is not enough: ext4 handed back the very
+      // same inode, so the swap was invisible to the guard -- which the
+      // assertion below caught rather than passing vacuously. This is also the
+      // closer model of the race, where a live `git` creates its own lock file.
+      const usurperPath = `${lockPath}.usurper`;
+      await fs.writeFile(usurperPath, "", "utf8");
+      await fs.utimes(usurperPath, new Date(vetted.mtimeMs), new Date(vetted.mtimeMs));
+      await fs.rename(usurperPath, lockPath);
+      const replaced = await fs.stat(lockPath);
+      // Guards the fixture itself: with the inode unchanged the test would
+      // assert nothing, and a vacuous negative control is exactly what this
+      // suite's mutation sweep exists to catch.
+      expect(replaced.ino).not.toBe(vetted.ino);
+      expect(replaced.size).toBe(vetted.size);
+      expect(replaced.mtimeMs).toBe(vetted.mtimeMs);
+      return UNHELD;
+    });
+    try {
+      await expectIndexLockRefusal(
+        restoreDirtyQuarantine({ repoRoot, worktreePath, expectedBranch, actualBranch, ids }),
+        "was replaced while its holder was being determined",
+      );
+      // The replacement -- a live git's mutex, in the case this models -- is
+      // still where its owner left it.
+      expect(existsSync(lockPath)).toBe(true);
+    } finally {
       await fs.rm(lockPath, { force: true });
     }
     await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
@@ -7969,6 +8075,7 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     const rawLockPath = await readGit(repoRoot, ["rev-parse", "--git-path", "index.lock"]);
     expect(path.isAbsolute(rawLockPath)).toBe(false);
     const lockPath = await writeIndexLock(repoRoot, { body: "", ageMs: 21.5 * 60 * 60 * 1000 });
+    stubLockHolderScan(UNHELD);
 
     const restored = await restoreDirtyQuarantine({
       repoRoot,

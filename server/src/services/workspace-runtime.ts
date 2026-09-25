@@ -1589,14 +1589,38 @@ export const GIT_INDEX_LOCK_STALE_MS = 15 * 60 * 1000;
 // to the age floor, because the invariant this guard rests on is that a lock is
 // broken only on a *positive* determination that nothing holds it -- and
 // "I could not look" is not that determination on either branch.
-type LockHolderScan =
+// `unsupported` carries the platform rather than leaving the caller to read
+// `process.platform`: that is what lets a test state the verdict directly
+// instead of mutating the global, which is only safe while nothing in the file
+// runs concurrently.
+export type LockHolderScan =
   | { holders: string[] }
-  | { holders: null; failure: "unsupported" | "unreadable" };
+  | { holders: null; failure: "unsupported"; platform: string }
+  | { holders: null; failure: "unreadable" };
+
+let lockHolderScanForTests: ((lockPath: string) => Promise<LockHolderScan>) | null = null;
+
+/**
+ * Test-only seam for the liveness scan, same convention as
+ * `setProcessGroupLivenessProbeForTests`. Without it the scan's verdict is a
+ * property of the host -- the `/proc` walk exists only on Linux -- so every
+ * test of the *gates around* it would assert the platform refusal instead of
+ * what it means to assert, and fail on a developer's macOS on a path they did
+ * not touch. Overriding it makes that verdict a fixture; the real walk is still
+ * exercised by the Linux-only live-holder test. Pass `null` to clear.
+ */
+export function setLockHolderScanForTests(
+  override: ((lockPath: string) => Promise<LockHolderScan>) | null,
+) {
+  lockHolderScanForTests = override;
+}
 
 // ponytail: O(processes x fds) scan, fine on a repair path that runs once per
 // incoherent workspace; switch to a targeted inode match if it ever gets hot.
 async function lockHolderPids(lockPath: string): Promise<LockHolderScan> {
-  if (process.platform !== "linux") return { holders: null, failure: "unsupported" };
+  if (process.platform !== "linux") {
+    return { holders: null, failure: "unsupported", platform: process.platform };
+  }
   // `/proc/*/fd` readlinks are fully canonical, but `indexLockPath` is built
   // with `path.resolve`, which does not resolve symlinks. Comparing the two
   // directly would silently match nothing whenever any component of the
@@ -1640,7 +1664,9 @@ async function ensureGitIndexIsUnlocked(worktreePath: string): Promise<string | 
   if (!rawLockPath) return null;
   // `--git-path` answers relative to the worktree for a normal repo and absolute
   // for a linked one. Resolving against `worktreePath` rather than the process
-  // cwd is what makes the `unlink` below point at the lock we just stat'd.
+  // cwd is what makes every `stat` below, and the rename, name the lock that
+  // belongs to *this* worktree -- against the server process cwd a relative
+  // answer would silently address some other repo's lock, or nothing at all.
   const indexLockPath = path.isAbsolute(rawLockPath) ? rawLockPath : path.resolve(worktreePath, rawLockPath);
   const lockStat = await fs.stat(indexLockPath).catch((error: unknown) => {
     // Only "not there" is an unlocked index. EACCES/EIO is a lock we cannot
@@ -1665,12 +1691,12 @@ async function ensureGitIndexIsUnlocked(worktreePath: string): Promise<string | 
     );
   }
 
-  const scan = await lockHolderPids(indexLockPath);
+  const scan = await (lockHolderScanForTests ?? lockHolderPids)(indexLockPath);
   if (!scan.holders) {
     throw new Error(
       `git index lock exists at ${indexLockPath} and its holder could not be determined because ${
         scan.failure === "unsupported"
-          ? `the /proc liveness scan is unavailable on ${process.platform}`
+          ? `the /proc liveness scan is unavailable on ${scan.platform}`
           : "/proc is unreadable"
       }`,
     );
@@ -1696,6 +1722,37 @@ async function ensureGitIndexIsUnlocked(worktreePath: string): Promise<string | 
   // is invisible to the scan -- and this is the only irreversible act on the
   // repair path. A rename releases the mutex exactly as an unlink does, and
   // costs one inode to keep the evidence if the verdict was wrong.
+  //
+  // Re-stat first, because everything above vetted an *inode* and the rename
+  // names a *path*. The `/proc` walk between them is O(processes x fds), so the
+  // window is measured in the scan's duration, not in syscalls: if the holder
+  // released the lock inside it, a live `git` can take the path afresh with
+  // O_CREAT|O_EXCL and the rename would move that live mutex aside, losing the
+  // victim's index write. The ENOENT branch below does not cover it -- that
+  // handles the lock being *gone*, not *replaced*. Two adjacent syscalls is
+  // still not atomic and nothing portable will be, but it shrinks the window
+  // from the scan's duration to a stat/rename pair and turns the failure from
+  // "break a live lock" into "refuse and retry next dispatch", which is the
+  // direction every other gate here already fails in.
+  const preRenameStat = await fs.stat(indexLockPath).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") return null;
+    throw new Error(
+      `git index lock at ${indexLockPath} could not be re-read before being moved aside: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  });
+  if (!preRenameStat) return null;
+  if (
+    preRenameStat.ino !== lockStat.ino ||
+    preRenameStat.size !== lockStat.size ||
+    preRenameStat.mtimeMs !== lockStat.mtimeMs
+  ) {
+    throw new Error(
+      `git index lock at ${indexLockPath} was replaced while its holder was being determined, so the scan's verdict does not describe the lock now at that path`,
+    );
+  }
+
   const quarantinedPath = `${indexLockPath}.paperclip-broken-${formatUtcBranchTimestamp()}`;
   let broken = true;
   await fs.rename(indexLockPath, quarantinedPath).catch((error: unknown) => {
