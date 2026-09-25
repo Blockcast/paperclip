@@ -449,10 +449,29 @@ export const STALE_LIVENESS_ESCALATION_AUTO_RESOLVE_MARKER = "[liveness] auto-re
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
 const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
-const EXTERNAL_WAIT_RESUME_WAKE_REASONS = new Set([
+/**
+ * PEN-2400 (Ally non-blocking 2, from the PR #1195 review): the wake reasons that
+ * resume a run parked on an external wait.
+ *
+ * This used to be declared twice — a hardcoded literal here and a
+ * `GITHUB_STATE_CHANGE_WAKE_REASONS`-derived set in `heartbeat.ts`. They were
+ * identical, but nothing held them so: a resume signal added to one and not the
+ * other wakes one path while the other suppresses it, which surfaces as a run
+ * stalled on an external wait with no attributable cause.
+ *
+ * `heartbeat.ts` imports `recovery/service.js` and recovery cannot import back,
+ * so this leaf module owns both sets — the same hoist BLO-30087 used for the
+ * agent-pod staleness bounds. `external-wait-resume-wake-reasons.test.ts` asserts
+ * the two modules resolve the *same object*, so re-introducing a local literal in
+ * `heartbeat.ts` fails rather than silently re-opening the drift.
+ */
+export const GITHUB_STATE_CHANGE_WAKE_REASONS: ReadonlySet<string> = new Set([
   "github_check_completed",
   "github_check_suite_completed",
   "github_workflow_completed",
+]);
+export const EXTERNAL_WAIT_RESUME_WAKE_REASONS: ReadonlySet<string> = new Set([
+  ...GITHUB_STATE_CHANGE_WAKE_REASONS,
   "github_pr_closed",
   "github_pr_converted_to_draft",
   "github_pr_review_submitted",
