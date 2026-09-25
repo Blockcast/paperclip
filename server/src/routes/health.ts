@@ -144,8 +144,39 @@ export function healthRoutes(
       return;
     }
 
+    // Every query this route runs for the worker's readiness probe sits inside
+    // this guard, so a failure in any of them is the 503 the chart's BLO-35948
+    // record describes rather than an unhandled 500. The bootstrap counts only
+    // run in authenticated mode, which is the mode the worker runs in.
+    let bootstrapStatus: "ready" | "bootstrap_pending" = "ready";
+    let bootstrapInviteActive = false;
     try {
       await db.execute(sql`SELECT 1`);
+      if (opts.deploymentMode === "authenticated") {
+        const roleCount = await db
+          .select({ count: count() })
+          .from(instanceUserRoles)
+          .where(sql`${instanceUserRoles.role} = 'instance_admin'`)
+          .then((rows) => Number(rows[0]?.count ?? 0));
+        bootstrapStatus = roleCount > 0 ? "ready" : "bootstrap_pending";
+
+        if (bootstrapStatus === "bootstrap_pending") {
+          const now = new Date();
+          const inviteCount = await db
+            .select({ count: count() })
+            .from(invites)
+            .where(
+              and(
+                eq(invites.inviteType, "bootstrap_ceo"),
+                isNull(invites.revokedAt),
+                isNull(invites.acceptedAt),
+                gt(invites.expiresAt, now),
+              ),
+            )
+            .then((rows) => Number(rows[0]?.count ?? 0));
+          bootstrapInviteActive = inviteCount > 0;
+        }
+      }
     } catch (error) {
       logger.warn({ err: error }, "Health check database probe failed");
       res.status(503).json({
@@ -156,34 +187,6 @@ export function healthRoutes(
         ...(exposeFullDetails ? { serverInfo } : {}),
       });
       return;
-    }
-
-    let bootstrapStatus: "ready" | "bootstrap_pending" = "ready";
-    let bootstrapInviteActive = false;
-    if (opts.deploymentMode === "authenticated") {
-      const roleCount = await db
-        .select({ count: count() })
-        .from(instanceUserRoles)
-        .where(sql`${instanceUserRoles.role} = 'instance_admin'`)
-        .then((rows) => Number(rows[0]?.count ?? 0));
-      bootstrapStatus = roleCount > 0 ? "ready" : "bootstrap_pending";
-
-      if (bootstrapStatus === "bootstrap_pending") {
-        const now = new Date();
-        const inviteCount = await db
-          .select({ count: count() })
-          .from(invites)
-          .where(
-            and(
-              eq(invites.inviteType, "bootstrap_ceo"),
-              isNull(invites.revokedAt),
-              isNull(invites.acceptedAt),
-              gt(invites.expiresAt, now),
-            ),
-          )
-          .then((rows) => Number(rows[0]?.count ?? 0));
-        bootstrapInviteActive = inviteCount > 0;
-      }
     }
 
     const persistedDevServerStatus = readPersistedDevServerStatus();
