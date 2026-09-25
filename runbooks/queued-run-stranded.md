@@ -414,7 +414,11 @@ Source: `server/src/services/agent-start-lock.ts` (`withAgentStartLock`,
 (`refreshAgentStartLockMetrics`)
 Trigger: alert `PaperclipAgentStartLockWedged` —
 `count(max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 900) >= 3`
-for 10m (retuned by BLO-36522; was `max by (agent_id) (...) > 300` for 5m)
+for 10m (retuned by BLO-36522; was `max by (agent_id) (...) > 300` for 5m).
+The rule is quoted here for readability only and lives in a different repo —
+the source of record is the lockstep pair `paperclip/paperclip-runtime-alerts-prometheusrule.yaml`
+and `monitoring/prometheus-rules-2-configmap.yaml` in `Blockcast/onprem-k8s`.
+Read `900`/`10m` there before acting on either number.
 Owner: Platform / SRE (PEN-3305)
 
 ### ⚠️ What this alert claims, and what it no longer claims (BLO-36522)
@@ -433,7 +437,8 @@ claims this section used to make were falsified on 2026-09-25:
 - *"The lock is stuck."* `resets(paperclip_agent_start_lock_held_seconds[6h])`
   = **175** on the observed agent — it is acquired and released roughly every
   two minutes. A genuinely wedged lock has **zero** resets. It is slow, not
-  stuck.
+  stuck. (The converse does not hold — zero resets does *not* establish a
+  wedge, because the series is absent between holds. See Step 4.)
 
 **There are two regimes, and the old 300s threshold could not tell them apart
 because it sat inside the normal envelope.** Over 7 days, **21 of 21 agents**
@@ -478,16 +483,28 @@ never settles holds its agent's lock for the life of the process.
 
 ⚠️ **"Never settles" is the limiting case, and it is NOT what the observed
 episodes are** (BLO-36522). The mechanism above is real and unchanged — there
-is genuinely no timeout — but every episode measured since has settled on its
-own, including the 2h14m fleet one. Read this paragraph as *"nothing external
-will break the lock"*, not as *"the hold will last until you restart it."*
-Those are different claims and only the first is supported.
+is genuinely no timeout — but every episode measured **since 2026-09-16** has
+settled on its own, including the 2h14m fleet one. Read this paragraph as
+*"nothing external will break the lock"*, not as *"the hold will last until
+you restart it."* Those are different claims and only the first is supported.
+
+⚠️ **The date bound is load-bearing, and the exception is the paragraph
+directly below.** The 2026-09-15/16 episode predates it, is the *only*
+documented instance of the fleet-scope regime this alert now fires on, and is
+on record as having ended with a pod replacement. It is **not** a
+counter-example to the self-heal claim, and it is **not** evidence for it
+either: the pod was replaced before the hold was ever observed long enough to
+settle, so that episode tells us nothing about what it would have done. Do not
+read it as precedent in either direction — and in particular, do not read it
+as authorising a restart when the signature in Step 4 is absent.
 
 That agent then dispatches nothing, while every status surface reads healthy —
 `status: idle`, `errorReason: null`, `orgChainHealth: healthy`, work piling up
 in `queued`. Measured 2026-09-15/16: five agents across two companies dark for
 6–19 h, ~70 runs stuck, ended only by a pod replacement on an identical image
-digest and StatefulSet revision.
+digest and StatefulSet revision — **a restart performed under the withdrawn
+instruction, not an observation that the hold required one** (see the
+qualification above).
 
 `PaperclipQueuedRunStranded` above fires on the *consequence* of this and will
 usually fire too, a while later. It cannot tell you the cause: a queued run
@@ -581,22 +598,48 @@ itself.** While it is still firing:
 
 ```
 max by (agent_id) (paperclip_agent_start_lock_held_seconds)      # who, and how long
-resets(paperclip_agent_start_lock_held_seconds[6h])              # 0 = genuinely stuck; >0 = cycling
+resets(paperclip_agent_start_lock_held_seconds[6h])              # see the caveat below before reading this
+count_over_time(paperclip_agent_start_lock_held_seconds[6h])     # MANDATORY companion to resets()
 paperclip_db_pool_connections{pod="paperclip-0"}                 # idle/active/waiting split
 kubectl logs -n paperclip paperclip-0 | grep "agent start lock held"
 ```
 
-Record the agent ids, the `resets` value, and the pool split **on the issue**.
-Those three together are what nobody has captured yet, and they are destroyed
-both by the self-heal and by a restart — which is exactly why the old
-restart-first instruction kept the cause unknown for as long as it did.
+⚠️ **`resets() == 0` does NOT mean "stuck" on its own, and reading it that way
+fails toward the restart this step exists to withdraw.** The server publishes
+`paperclip_agent_start_lock_held_seconds` **only for locks held at scrape
+time** (`deploy/helm/paperclip/values.yaml`), so between holds the series is
+*absent*, not zero. `resets()` counts decreases between samples that exist, so
+it returns `0` both for a genuinely monotonic hold **and** for an agent with
+barely any samples in the window — including a hold that simply began part-way
+into the range with no earlier cycling to decrease from. That second shape is
+exactly what the 2h14m episode looks like, i.e. the episode used above as the
+argument *against* restarting.
+
+**So always read the two together, and judge on sample count first:**
+
+| `count_over_time[6h]` | `resets[6h]` | reading |
+|---|---|---|
+| high (series present throughout) | `0` | monotonic hold — **genuinely stuck**, the real signature |
+| high | `>0` | cycling — routine contention, not stuck |
+| low / sparse | `0` | **inconclusive, NOT stuck** — too few samples to decrease from. Do not restart on this. |
+
+A `6h` range is also wider than most holds; scoping the range nearer the hold's
+own age makes the comparison sharper.
+
+Record the agent ids, **both** the `resets` and `count_over_time` values, and
+the pool split **on the issue**. Those together are what nobody has captured
+yet, and they are destroyed both by the self-heal and by a restart — which is
+exactly why the old restart-first instruction kept the cause unknown for as
+long as it did.
 
 **The one case that still justifies replacing the pod** is a genuinely stuck
 lock, and it has a distinct signature you can now check rather than assume:
-`resets(...[6h]) == 0` for the affected agents **and** a permanently `active`
-connection count with nothing queued — a stuck transaction — **and** zero
-dispatches (`startedAt` not moving). Absent that, wait. If you do restart,
-capture the block above first.
+the **top row** of the table above — `count_over_time(...[6h])` showing the
+series present and climbing throughout **and** `resets(...[6h]) == 0` — for
+the affected agents, **and** a permanently `active` connection count with
+nothing queued (a stuck transaction), **and** zero dispatches (`startedAt` not
+moving). All four, not `resets == 0` alone. Absent that, wait. If you do
+restart, capture the block above first.
 
 The real fix — making the critical section's awaits abortable so `fn` rejects
 and releases the lock through the existing `finally` — is out of scope of the
@@ -644,6 +687,16 @@ anyone who enables that chart elsewhere: they would get the pre-retune
 behaviour, i.e. a critical page on every single-agent hold past 300s, roughly
 390 agent-minutes a day. **Before setting `prometheusRule.enabled: true` in
 any installation, port this retune to the chart first.**
+
+The divergence is not only the number. The *rationale prose* beside it —
+`deploy/helm/paperclip/values.yaml` (`agentStartLockHeldSeconds`) and
+`deploy/helm/paperclip/tests/prometheus-rule.test.mjs` — still argues for
+pinning the alert to `LOCK_HELD_ERROR_MS` "so the log line and the page cannot
+disagree", which is the exact policy this retune abandoned, and the test
+comment's premise that "any positive threshold is silent in steady state" is
+measurably false. Both now carry a `BLO-36522` cross-reference pointing here,
+so neither reads as live policy; the chart test's `300` assertion deliberately
+still stands, because it guards the number this chart actually renders.
 
 ## References
 

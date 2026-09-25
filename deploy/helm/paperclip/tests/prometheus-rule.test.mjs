@@ -1219,6 +1219,15 @@ test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own
   // itself escalates to logger.error and says dispatch "has stopped". If the
   // constant moves and this does not, the page and the log line disagree
   // about when an agent is considered wedged.
+  //
+  // BLO-36522: "silent in steady state" is FALSE as written -- measured
+  // 2026-09-25, 21 of 21 agents crossed 300s over 7d for 2,730 agent-minutes
+  // (~390/day). Holds past 300s are routine, not exceptional. Blockcast's live
+  // rule was therefore retuned to a fleet-count expression and the log/alert
+  // numbers deliberately UNPINNED; see deploy/helm/paperclip/values.yaml
+  // (agentStartLockHeldSeconds) and runbooks/queued-run-stranded.md. This
+  // assertion still stands because THIS chart copy was not retuned -- it
+  // guards the 300 that is still rendered here, not the deployed policy.
   assert.equal(
     heldThreshold,
     "300",
