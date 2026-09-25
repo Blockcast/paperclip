@@ -7853,9 +7853,14 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
 
   // The liveness scan is the safety argument, so "I could not run it" must not
   // read as "nobody holds it" -- that would silently degrade the guard back to
-  // the bare size+age heuristic that a live writer also satisfies. Reachable in
-  // a hardened container with /proc masked. Failing closed here parks the row,
-  // which is the defect this change removes, and is still the correct trade.
+  // the bare size+age heuristic that a live writer also satisfies. This is the
+  // *environmental* way of not knowing: /proc exists and refused, which is a
+  // hardened container or a sandbox policy, and which re-running could resolve.
+  // The static way -- a platform with no /proc at all -- is the case below, and
+  // is much the larger of the two: it is every invocation on every non-Linux
+  // host, not a rare container configuration. Failing closed here parks the
+  // row, which is the defect this change removes, and is still the correct
+  // trade: an unverifiable lock is not one to break.
   it("refuses to break a stale 0-byte index lock when /proc cannot be read", async () => {
     const expectedBranch = "PAP-475-recorded";
     const actualBranch = "PAP-475-live";
@@ -7889,6 +7894,50 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
       expect(existsSync(lockPath)).toBe(true);
     } finally {
       spy.mockRestore();
+      await fs.rm(lockPath, { force: true });
+    }
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
+  }, 20_000);
+
+  // The scan is /proc-only, so on any non-Linux host it cannot run at all and
+  // the break never fires -- every stale lock there still parks the row. That
+  // is a real bound on this fix and this test is what stops it being silent:
+  // the refusal has to name the *platform* rather than blame an unreadable
+  // /proc, because the two differ in the only way an operator reading a parked
+  // row cares about -- whether re-running could ever answer differently.
+  //
+  // It deliberately does NOT fall back to the age floor on this branch. Doing
+  // so would break a lock having established nothing about who holds it, which
+  // is the argument-from-absence this guard was rewritten to stop making, and
+  // it would make that argument on the one platform where the scan that would
+  // have checked is unavailable.
+  it("refuses to break a stale 0-byte index lock on a platform with no /proc", async () => {
+    const expectedBranch = "PAP-476-recorded";
+    const actualBranch = "PAP-476-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-476",
+      claimant: "none",
+    });
+    // Empty, aged past the floor and unheld: every other gate would let this
+    // through, so the platform gate is the only one left that can refuse.
+    const lockPath = await writeIndexLock(worktreePath, { body: "", ageMs: 21.5 * 60 * 60 * 1000 });
+
+    const realPlatform = process.platform;
+    Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
+    try {
+      await expectIndexLockRefusal(
+        restoreDirtyQuarantine({ repoRoot, worktreePath, expectedBranch, actualBranch, ids }),
+        "liveness scan is unavailable on darwin",
+      );
+      expect(existsSync(lockPath)).toBe(true);
+      await expect(fs.stat(lockPath).then((entry) => entry.size)).resolves.toBe(0);
+    } finally {
+      Object.defineProperty(process, "platform", { value: realPlatform, configurable: true });
       await fs.rm(lockPath, { force: true });
     }
     await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
