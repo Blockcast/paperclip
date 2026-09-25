@@ -412,9 +412,10 @@ describe("postgres.js reconnect after the connection went away mid-write", () =>
  * "dispatch the stuck query" and retire the connection onto a *fresh*,
  * still-answering socket. Measured 0/128 after the change, 9/128 before.
  *
- * Mutation status of the six guards in the patch, measured 2026-09-24 by
- * reverting each alone against this suite:
+ * Mutation status of the seven guards in the patch, measured by reverting each
+ * alone against this suite (the first six 2026-09-24, the last 2026-09-25):
  *   - `closeTimer.start()` in `end()`            -> killed (test 1)
+ *   - `!connection.reserved &&` on that start    -> killed (reserved test, armed case)
  *   - `socket.destroy()` in `closeTimedOut()`    -> killed (test 1)
  *   - the write-handle reset in `closed()`       -> killed (reconnect test)
  *   - the write-handle reset in `terminate()`    -> SURVIVES alone
@@ -723,9 +724,14 @@ describe("postgres.js close_timeout must not bound a reserved connection", () =>
   });
 
   it("behaves identically to pristine 3.4.9, which has no bound at all", async () => {
-    // Standing control. `timer()` returns a no-op pair for a falsy interval, so
-    // this is unpatched `end()` behaviour — it must already pass, and it is what
-    // proves the assertion above is pinning the guard rather than the scenario.
+    // Standing negative control. `timer()` returns a no-op pair for a falsy
+    // interval (`src/connection.js:1044`), so this is unpatched `end()`
+    // behaviour and it must already pass. That also makes it invariant under
+    // reverting `!connection.reserved &&` — `closeTimer.start()` is inert here
+    // either way, so this pins the SCENARIO, proving the assertion above is not
+    // a harness artifact. It does NOT pin the guard: the guard is pinned by the
+    // armed test above, which is the one that goes red. Do not read this pair
+    // as redundant coverage and weaken that test.
     const harness = createHarness({ max_lifetime: null, close_timeout: null });
     try {
       expect(await retireWhileReservedThenRelease(harness)).toEqual([
