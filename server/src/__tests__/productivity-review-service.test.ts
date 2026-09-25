@@ -1725,7 +1725,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
     // …and PEN-3442's: it is accounted for in its own bucket, not silently dropped.
     expect(reviews[0]?.description).toContain(
-      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `livenessState: failed`, PEN-3442): 10",
+      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `status: failed`, PEN-3442): 10",
     );
   });
 
@@ -1930,7 +1930,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     // them to the 10 genuinely silent ones. Pre-fix this read 22.
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain(
-      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `livenessState: failed`, PEN-3442): 12",
+      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `status: failed`, PEN-3442): 12",
     );
     // They are NOT the never-invoked population: these got an adapter and used
     // it. A fix that folded the two together would report 12 here.
@@ -1985,21 +1985,20 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews).toHaveLength(1);
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain(
-      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `livenessState: failed`, PEN-3442): 12",
+      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `status: failed`, PEN-3442): 12",
     );
   });
 
   // PEN-3442 NEGATIVE CONTROL (required). The exclusion must not be able to
   // empty the trigger: a fault-terminated run is excluded, but a run that
   // executed, FINISHED, and stayed silent is still assignee behaviour and must
-  // still accumulate. Without this, a fix that excluded on `status === "failed"`
-  // — or on any predicate that also caught ordinary silent runs — would pass
-  // the two tests above while deleting the detector.
+  // still accumulate. Without this, a predicate that also caught ordinary
+  // silent runs would pass the two tests above while deleting the detector.
+  // The two tests after this one pin the other edges: `timed_out`/`cancelled`
+  // stay in the walk, and a fault-terminated run that commented still breaks it.
   //
   // The fixture is the production-faithful default (`succeeded` /
-  // `livenessState: "advanced"`), which the fleet measurement confirms is
-  // disjoint from `failed`: over 400 runs, liveness `failed` and status
-  // `failed` coincide 144/144 and no succeeded run carries it.
+  // `livenessState: "advanced"`).
   it("still fires no_comment_streak on executed runs that finished and stayed silent (PEN-3442 control)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
@@ -2020,8 +2019,93 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain(
-      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `livenessState: failed`, PEN-3442): 0",
+      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `status: failed`, PEN-3442): 0",
     );
+  });
+
+  // PEN-3442 scope. `livenessState: "failed"` is every non-succeeded terminal
+  // status, so a liveness-only predicate also excluded `timed_out` and
+  // `cancelled` runs. Those had their turn and stayed silent through it, which
+  // is exactly what this streak reports. Under the liveness-only predicate this
+  // fixture reads 8 and does not fire.
+  it("keeps timed-out and cancelled silent runs in the no_comment_streak walk (PEN-3442 scope)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const insertNow = new Date(now.getTime() - 2 * 60 * 60 * 1000);
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS - 2,
+      now: new Date(insertNow.getTime() - 60 * 60 * 1000),
+    });
+    for (const [offsetMs, status] of [[0, "timed_out"], [5 * 60 * 1000, "cancelled"]] as const) {
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: 1,
+        now: new Date(insertNow.getTime() - offsetMs),
+        status,
+        livenessState: "failed",
+        usageJson: { inputTokens: 3399, outputTokens: 5846 },
+        logBytes: 230_532,
+      });
+    }
+
+    await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
+    expect(reviews[0]?.description).toContain(
+      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `status: failed`, PEN-3442): 0",
+    );
+  });
+
+  // PEN-3442 and comment evidence. `commentRunIds` holds every comment a run
+  // authored, so a fault-terminated run can have commented mid-turn. Newest
+  // first: 5 silent runs, one `rate_limit_exhausted` run that commented, then
+  // 10 older silent runs. The commenting run must break the walk at 5; if it
+  // were excluded like a silent fault-terminated run the streak would read 15
+  // and fire against an agent that demonstrably reported.
+  it("lets a fault-terminated run that commented still break no_comment_streak (PEN-3442)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const insertNow = new Date(now.getTime() - 2 * 60 * 60 * 1000);
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now: new Date(insertNow.getTime() - 60 * 60 * 1000),
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 1,
+      now: new Date(insertNow.getTime() - 10 * 60 * 1000),
+      status: "failed",
+      errorCode: "rate_limit_exhausted",
+      livenessState: "failed",
+      usageJson: { inputTokens: 3399, outputTokens: 5846 },
+      logBytes: 230_532,
+      withRunComments: true,
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 5,
+      now: insertNow,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
 
   it("distinguishes never-invoked runs from executed-but-silent runs in the same sampled window (BLO-26165)", async () => {
@@ -2150,7 +2234,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
     expect(reviews[0]?.description).toContain(
-      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `livenessState: failed`, PEN-3442): 10",
+      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `status: failed`, PEN-3442): 10",
     );
   });
 
@@ -2353,7 +2437,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
     expect(reviews[0]?.description).toContain(
-      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `livenessState: failed`, PEN-3442): 10",
+      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `status: failed`, PEN-3442): 10",
     );
   });
 
