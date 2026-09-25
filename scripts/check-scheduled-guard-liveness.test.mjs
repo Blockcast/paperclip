@@ -321,6 +321,10 @@ describe("classifyGuard — the four PEN-3379 production false positives", () =>
 
     assert.equal(summary.staleCount, 0);
     assert.equal(summary.exitCode, 0, "not one of these four may exit non-zero");
+    // Suppressed is not healthy: the headline must not claim they completed.
+    assert.equal(summary.unknownCount, FALSE_POSITIVES.length);
+    assert.doesNotMatch(summary.headline, /^All \d+ watched/);
+    assert.match(summary.headline, /could not be assessed/);
   });
 
   // The other half of the contract. Suppression must be driven by DISAGREEMENT,
@@ -513,6 +517,27 @@ describe("selectNewestCompleted — the cross-check must not become a mute switc
 
 describe("crossCheckCompletions — the corroborating read's own failure modes", () => {
   const reader = (payload) => () => JSON.stringify(payload);
+
+  it("asks for the unfiltered, workflow-scoped page, not the index it corroborates", () => {
+    const calls = [];
+    crossCheckCompletions("Blockcast/paperclip", "relay-ssl-multicert-guard.yml", (args) => {
+      calls.push(args);
+      return JSON.stringify({ workflow_runs: [] });
+    });
+
+    assert.equal(calls.length, 1);
+    // Workflow-scoped: a repo-wide page is always fresh ordinary CI, which
+    // would mute every guard forever at exit 0.
+    assert.match(
+      calls[0][1],
+      /^repos\/Blockcast\/paperclip\/actions\/workflows\/relay-ssl-multicert-guard\.yml\/runs\?per_page=30$/,
+    );
+    // Not redundant with the anchored match above: this is the one that names
+    // the property. Without `status=completed` this read is a second opinion;
+    // with it, it is a re-read of the index PEN-3379 found wedged, and it
+    // agrees with the primary by construction.
+    assert.doesNotMatch(calls[0][1], /status=/);
+  });
 
   it("reports the newest completion from an unfiltered page", () => {
     const observed = crossCheckCompletions(
