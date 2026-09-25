@@ -51,9 +51,19 @@ export function shouldReportCancelledRun({ merged, isInMergeQueue }) {
 //
 // No name-filtering of aggregator jobs (`verify`): a name allowlist rots on the
 // next workflow rename, and one extra job name costs a reader nothing.
+//
+// The filter is on CONCLUSION, not name. A `cancelled` job is only signal when
+// nothing else failed: fail-fast cancels the siblings of a job that genuinely
+// failed, so on run 35993984182 (ejected #1976) `Build` is cancelled collateral
+// of `General tests (workspaces-a)`. Naming it sends the reader to a log that
+// contains nothing but a cancellation -- the same misdirection runOutcomeText
+// exists to prevent, one layer down. When nothing failed, a cancelled job IS the
+// cause (a `timeout-minutes` kill surfaces that way) and must still be named.
 export function failingJobSummary(jobs) {
-  const failed = (Array.isArray(jobs) ? jobs : [])
-    .filter((job) => job?.conclusion === "failure" || job?.conclusion === "cancelled")
+  const list = Array.isArray(jobs) ? jobs : [];
+  const anyFailure = list.some((job) => job?.conclusion === "failure");
+  const failed = list
+    .filter((job) => job?.conclusion === "failure" || (!anyFailure && job?.conclusion === "cancelled"))
     .map((job) => job.name)
     .filter((name) => typeof name === "string" && name.length > 0);
   if (failed.length === 0) return "";
@@ -76,7 +86,8 @@ export function runOutcomeText(conclusion, jobs) {
   return failed ? "failed" : "was cancelled (a job timeout surfaces this way)";
 }
 
-async function githubRequest(path, options = {}) {  const response = await fetch(`https://api.github.com${path}`, {
+async function githubRequest(path, options = {}) {
+  const response = await fetch(`https://api.github.com${path}`, {
     ...options,
     headers: {
       accept: "application/vnd.github+json",

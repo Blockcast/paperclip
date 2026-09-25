@@ -91,3 +91,22 @@ test("a `cancelled` run carrying a failed job is described as failed, not as a t
   assert.equal(runOutcomeText("cancelled", undefined), "was cancelled (a job timeout surfaces this way)");
   assert.equal(runOutcomeText("failure", undefined), "failed");
 });
+
+test("the rendered sentence is coherent on a fail-fast run: no cancelled collateral is named", () => {
+  // The two functions above are each correct in isolation while the sentence
+  // they compose is wrong -- that split is what hid the `Build` case. So assert
+  // on BOTH over ONE real shape: run 35993984182, verbatim from the API.
+  const jobs = [
+    { name: "Build", conclusion: "cancelled" },
+    { name: "General tests (workspaces-a)", conclusion: "failure" },
+    { name: "General tests (server 1/4)", conclusion: "success" },
+    { name: "verify", conclusion: "failure" },
+  ];
+  assert.equal(
+    `The merge-group run ${runOutcomeText("cancelled", jobs)}.${failingJobSummary(jobs)}`,
+    "The merge-group run failed. Failing jobs: `General tests (workspaces-a)`, `verify`.",
+  );
+  // `Build` was cancelled BECAUSE workspaces-a failed; its log shows only a
+  // cancellation. Naming it is the misdirection, not extra detail.
+  assert.ok(!failingJobSummary(jobs).includes("Build"));
+});
