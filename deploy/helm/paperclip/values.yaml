@@ -484,6 +484,9 @@ workerProbes:
   # "almost nothing exceeds 5s" and will invert this diagnosis if used without
   # the failure counter.
   #
+  # Superseded by BLO-35948 below: the endpoint moved to `/api/health`, and
+  # the figures are now a 20s timeout and 20s period, probes at t=0/20/40, and
+  # the third consecutive failure at t=60s. The derivation, as first written:
   # timeoutSeconds now matches liveness (10s), above the measured tail, and
   # periodSeconds moves to 15 so a probe cannot outlast its own period.
   # Worst-case endpoint removal, stated derivably rather than as `3 x period`:
@@ -511,16 +514,71 @@ workerProbes:
   # single tail-latency blip, i.e. tens of times a day, reopening exactly the
   # outage this change closes. `tests/probes.test.mjs` enforces both this
   # floor and the timeout relationship while the tier is single-replica.
+  #
+  # BLO-35948 (2026-09-24) — why this one probe targets `/api/health` while
+  # liveness and startup stay on `/healthz`.
+  #
+  # `/healthz` answers "can the event loop service a request", and nothing
+  # else. On 2026-09-24 the worker wedged for 2h15m on 9 postgres.js
+  # connections stuck in `ClientRead`: the pool was dead, every API-to-worker
+  # call returned `Connect Timeout Error (paperclip-workers:3100)` / 502 / 504,
+  # and the pod read `1/1 Ready` the entire time because `/healthz` was still
+  # answering. There was no Kubernetes signal at all. `/api/health` executes
+  # `SELECT 1` through the same pool (plus, in authenticated mode, the
+  # bootstrap role count and, while bootstrap is pending, an invite count) and
+  # 503s if any of them fails; it is the only probe-reachable route that
+  # exercises the path that actually hung. All of those queries sit inside the
+  # handler's one guard (`server/src/routes/health.ts`, pinned by
+  # `server/src/__tests__/health.test.ts`), and the probe carries no session
+  # cookie or tenant token, so `actorMiddleware` adds no query of its own.
+  #
+  # The split is the whole point. Liveness and startup must NOT do this: a
+  # query on the liveness path imports pool latency into a kill decision and
+  # restarts the singleton worker — with every in-flight agent run on it — for
+  # what is a saturation problem. See the liveness block above and
+  # `server/src/app.ts`, whose own comment already prescribed this placement:
+  # "Readiness gating on the database belongs in `/api/health`."
+  #
+  # Tolerances, derived rather than inherited. BLO-31945's rule holds and is
+  # simply re-applied to the new endpoint: a timeout below the endpoint's own
+  # tail is a false-positive generator. `/api/health` has a different, much
+  # longer tail than `/healthz` — measured 2026-09-10 under pool saturation it
+  # took 13.19s while `/healthz` answered in 6ms in the same second. So the
+  # 10s timeout that was correct for `/healthz` would fail on a merely
+  # saturated pool. timeoutSeconds is therefore 20s, ~1.5x that worst recorded
+  # non-wedge sample, and periodSeconds follows it so a probe cannot outlast
+  # its own period. Healthy-pod control, 15 samples through the Service at
+  # 2026-09-24T16:2xZ: 11.7ms-69.8ms, i.e. ~300x of headroom.
+  # `failureThreshold` stays at BLO-31945's floor of 3 — three *consecutive*
+  # failures, so a single blip cannot drop the only endpoint.
+  #
+  # Bounded time to NotReady, stated derivably rather than as `3 x period`:
+  # probes fire at t=0/20/40 and each times out 20s in, so the third
+  # consecutive failure is observed at t=60s, plus endpoint propagation.
+  #
+  # The trade-off, recorded as a decision (BLO-35948 AC4) and not left
+  # implicit: this tier has exactly ONE endpoint, so readiness failure does
+  # not shed load, it removes the Service's only backend and 502s plugin
+  # traffic. That cost is accepted here because in the wedge state those calls
+  # are ALREADY failing — the change makes them fail immediately instead of
+  # after a 10s connect timeout, and it fires the existing
+  # `PaperclipWorkerTierNoReadyEndpoints` critical alert, which is the signal
+  # the outage lacked. The genuinely new risk is the merely-slow case, and
+  # that is what the 20s timeout exists to exclude. Known circularity: while
+  # the worker is NotReady, Alertmanager webhook delivery into Paperclip is
+  # down too — but during a real wedge it is down anyway, so this changes
+  # nothing in the case that matters. The durable fix for all of it remains a
+  # second replica (BLO-29307 / BLO-29004).
   readiness:
     httpGet:
-      path: /healthz
+      path: /api/health
       port: http
       httpHeaders:
         - name: Host
           value: 127.0.0.1:3100
     initialDelaySeconds: 5
-    periodSeconds: 15
-    timeoutSeconds: 10
+    periodSeconds: 20
+    timeoutSeconds: 20
     failureThreshold: 3
   # -- Worker startup probe.
   #
