@@ -3,6 +3,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
+import {
+  productionFilesImportingTestHelpers,
+  serverFilesWritingToGitHub,
+  serverSourceFiles,
+} from "./helpers/github-writer-derivation.js";
+
 /**
  * PEN-3152 done-when 2: "the outbound direction gets its own exhaustive
  * coverage assertion, in the shape of `mcp-seed-scrub-coverage.test.ts` — so a
@@ -136,21 +142,29 @@ const WRAPPER_COVERAGE: Readonly<Record<string, Coverage>> = {
  * `github-write-egress-scrub.test.ts`, not here.
  */
 const SERVER_WRITE_COVERAGE: Readonly<Record<string, Coverage>> = {
-  // githubPostCommitStatusDetailed (context, description, target_url),
-  // githubPostIssueComment (body) and githubPostCheckRun (name, title, summary,
+  // githubPostCommitStatusDetailed (description, target_url),
+  // githubPostIssueComment (body) and githubPostCheckRun (title, summary,
   // details_url) each scrub inside the helper, so every present and future
   // caller inherits it. The installation-token POST in this file carries a JWT
   // and no authored text, and is not scrubbed.
+  //
+  // The two IDENTITY fields — a status `context` and a check-run `name` — are
+  // deliberately not on that list. They are refused rather than redacted
+  // (`gitHubIdentityFieldRedaction`, PEN-3391): a redacted name addresses the
+  // status to something no lookup and no branch-protection rule can match, so
+  // scrubbing them would trade a leak for a silent gate-liveness failure. The
+  // refusal keeps the leak closed without that trade.
   "services/github-app-auth.ts": {
     kind: "egress-scrubbed",
     runtime: SERVER_EGRESS_SCRUB,
   },
   // Builds its own requests — a caller-supplied token and an abort signal the
   // shared helper does not model — so it calls the scrub directly on the
-  // pending status's context, description and target_url. Its
-  // repository_dispatch client_payload is ids only (app, installation,
-  // delivery, PR number, head SHA) and is not scrubbed: it carries no authored
-  // text, and the detectors are tuned for prose, not protocol.
+  // pending status's description and target_url, and applies the same
+  // identity-field refusal to its context. Its repository_dispatch
+  // client_payload is ids only (app, installation, delivery, PR number, head
+  // SHA) and is not scrubbed: it carries no authored text, and the detectors
+  // are tuned for prose, not protocol.
   "services/github-review-gate-authority.ts": {
     kind: "egress-scrubbed",
     runtime: SERVER_EGRESS_SCRUB,
@@ -195,10 +209,15 @@ function readSeededGitHubMcpCommand(): string {
 }
 
 /**
- * Every non-test TypeScript file under `server/src`, as a path relative to it
- * with forward slashes ("services/github-app-auth.ts").
+ * Every non-test TypeScript file under `server/src`, and the subset of them
+ * this scan cannot prove is read-only.
  *
- * Recursive, and that is the load-bearing part. This walked
+ * Both derivations now live in `helpers/github-writer-derivation.ts` and are
+ * shared with `github-write-egress-scrub.test.ts`. They used to be duplicated
+ * byte-for-byte here, which is how the walk came to be widened by hand in two
+ * places at once on #1754 — one copy away from diverging (PEN-3391).
+ *
+ * The walk is recursive, and that is the load-bearing part. It listed
  * `server/src/services` one level deep until Ally caught the scope on #1754:
  * `server/src/routes/` (which holds `github-webhook.ts`) and
  * `server/src/services/recovery/` were both invisible to it, so a new
@@ -210,24 +229,19 @@ function readSeededGitHubMcpCommand(): string {
  * That is the third repeat of one shape: PEN-2527 enumerated `gh` and missed
  * the MCP server, PEN-3152 enumerated both wrappers and missed `server/`, and
  * this enumerated `services/` and missed its own siblings. Each time the
- * derivation was correct over a set that was quietly too small.
+ * derivation was correct over a set that was quietly too small. PEN-3391 is the
+ * fourth, one level further down: the predicate itself enumerated a single
+ * spelling of a write (`ghFetch(` plus an inline double-quoted upper-case
+ * method) and missed aliased calls, quoted variants and non-literal methods. It
+ * is now fail-closed — see the helper for what that costs and what still
+ * escapes it.
  */
-function serverSourceFiles(): string[] {
-  const { readdirSync } = require("node:fs") as typeof import("node:fs");
-  return readdirSync(serverSourceDirectory, { recursive: true, encoding: "utf8" })
-    .map((entry) => entry.split(path.sep).join("/"))
-    .filter((entry) => entry.endsWith(".ts") && !entry.endsWith(".test.ts"))
-    .sort();
+function scannedServerSourceFiles(): string[] {
+  return serverSourceFiles(serverSourceDirectory);
 }
 
-function serverFilesWritingToGitHub(): string[] {
-  return serverSourceFiles()
-    .filter((entry) => {
-      const source = readFileSync(path.join(serverSourceDirectory, entry), "utf8");
-      if (!source.includes("ghFetch(")) return false;
-      return /method:\s*"(?:POST|PATCH|PUT|DELETE)"/.test(source);
-    })
-    .sort();
+function scannedServerFilesWritingToGitHub(): string[] {
+  return serverFilesWritingToGitHub(serverSourceDirectory);
 }
 
 describe("outbound GitHub egress coverage", () => {
@@ -293,7 +307,9 @@ describe("outbound GitHub egress coverage", () => {
       // paperclip-api reaches GitHub over HTTP from server/, touching no
       // wrapper. A new file that starts writing fails here until it is
       // classified — which is the whole mechanism PEN-3152 asked for.
-      expect(serverFilesWritingToGitHub()).toEqual(Object.keys(SERVER_WRITE_COVERAGE).sort());
+      expect(scannedServerFilesWritingToGitHub()).toEqual(
+        Object.keys(SERVER_WRITE_COVERAGE).sort(),
+      );
     });
 
     it("derives that set from a walk that actually descends below server/src", () => {
@@ -308,12 +324,21 @@ describe("outbound GitHub egress coverage", () => {
       // `routes/github-webhook.ts` is the specific file Ally named on #1754:
       // it imports `githubPostIssueComment` and so is one edit away from being
       // a direct writer itself.
-      const scanned = serverSourceFiles();
+      const scanned = scannedServerSourceFiles();
       expect(scanned).toContain("routes/github-webhook.ts");
       expect(
         scanned.filter((entry) => entry.startsWith("services/recovery/")),
         "services/recovery/ is no longer reachable from the walk",
       ).not.toHaveLength(0);
+
+      // The walk skips `__tests__/` so the shared derivation helper cannot
+      // classify itself as an unscrubbed writer by quoting its own regexes.
+      // That exclusion only excludes TEST code while nothing in the running
+      // server imports from there — checked, not assumed (PEN-3391).
+      expect(
+        productionFilesImportingTestHelpers(serverSourceDirectory),
+        "a production file imports from __tests__/, so skipping it no longer excludes only test code",
+      ).toEqual([]);
     });
 
     it("the scrubber is reachable from server/, and the server wrapper still delegates to it", () => {

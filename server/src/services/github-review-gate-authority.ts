@@ -4,7 +4,11 @@ import { and, eq, inArray, lt, sql } from "drizzle-orm";
 import { githubReviewGateDeliveries, type Db } from "@paperclipai/db";
 import { loadConfig } from "../config.js";
 import { logger } from "../middleware/logger.js";
-import { getInstallationTokenResult, scrubOutboundGitHubText } from "./github-app-auth.js";
+import {
+  getInstallationTokenResult,
+  gitHubIdentityFieldRedaction,
+  scrubOutboundGitHubText,
+} from "./github-app-auth.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 
 const GITHUB_HOST = "github.com";
@@ -324,6 +328,15 @@ async function postPendingStatus(input: {
   // template or an id today; the scrub is a byte-for-byte no-op on those, and it
   // is here so that stays true if someone later interpolates a variable
   // (PEN-3157).
+  //
+  // `context` is the exception, and for the same reason as in the shared helper:
+  // it is the status's identity, so a redaction would publish under a name the
+  // outbox and branch protection cannot find. Refuse instead (PEN-3391).
+  // processDelivery re-queues this like any other failure; nothing here makes
+  // it terminal yet (PEN-3504).
+  if (gitHubIdentityFieldRedaction(input.row.statusContext, "commit-status context")) {
+    return { ok: false, reason: "review_gate_status_context_not_publishable" };
+  }
   try {
     const response = await ghFetch(
       `${gitHubApiBase(GITHUB_HOST)}/repos/${input.row.repoFullName}/statuses/${input.sha}`,
@@ -336,7 +349,7 @@ async function postPendingStatus(input: {
         },
         body: JSON.stringify({
           state: "pending",
-          context: scrubOutboundGitHubText(input.row.statusContext, "commit-status context"),
+          context: input.row.statusContext,
           description: scrubOutboundGitHubText(
             `Evaluating Ally review gate after signed webhook ${input.origin}.`,
             "commit-status description",
