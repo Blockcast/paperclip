@@ -191,10 +191,16 @@ export function postgresMaxLifetimeSeconds(): number {
  * is typed `number | null` even though the library's own default for it is a
  * function (`src/index.js:515`) that `timer()` calls (`src/connection.js:1043`).
  *
- * Declared as a narrow widening rather than casting the whole object, so every
- * other field — `max`, `connection.idle_in_transaction_session_timeout` — keeps
- * its excess-property and type checking. A blanket cast would let a typo in any
- * of them land silently. The final `as unknown as` is unavoidable — TS rejects
+ * Declared as a narrow widening rather than casting the whole object, so a
+ * top-level field like `max` keeps its excess-property and type checking —
+ * `BaseOptions` has no index signature, so a typo there is a compile error,
+ * where a blanket cast would let it land silently. Nested `connection` keys are
+ * NOT protected this way: `ConnectionParameters` carries
+ * `[name: string]: string | number | boolean` (`types/index.d.ts:343`) for
+ * arbitrary startup parameters, so a misspelled
+ * `idle_in_transaction_session_timeout` type-checks and fails at first connect
+ * instead, with Postgres `FATAL: unrecognized configuration parameter`. The
+ * final `as unknown as` is unavoidable — TS rejects
  * the direct conversion (`max_lifetime: () => number` is not comparable to the
  * shipped `number`) — but it now applies to an already-checked literal rather
  * than instead of checking it.
