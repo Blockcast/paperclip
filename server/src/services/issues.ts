@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { and, asc, desc, eq, exists, gt, gte, inArray, isNotNull, isNull, like, lt, lte, ne, notInArray, or, sql, type SQL } from "drizzle-orm";
-import type { Db } from "@paperclipai/db";
+import type { Db, DbTransaction } from "@paperclipai/db";
 import {
   activityLog,
   agentWakeupRequests,
@@ -1014,7 +1014,6 @@ type IssueUserContextInput = {
 };
 type ProjectGoalReader = Pick<Db, "select">;
 type DbReader = Pick<Db, "select">;
-type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
 /**
  * Serialize mutations to the issue parent/blocker graph for one company.
@@ -1161,7 +1160,9 @@ export type BlockedIssueAutoResumeSuppressionReason =
   | "workspace_preflight_blocked"
   | "active_recovery_action"
   | "monitor_gate"
-  | "convergence_stalled";
+  | "convergence_stalled"
+  /** A `doc/execution-semantics.md` two-line external-wait declaration (BLO-30445). */
+  | "external_wait";
 export type BlockedIssueAutoResumeSuppression = {
   issueId: string;
   reason: BlockedIssueAutoResumeSuppressionReason;
@@ -4260,6 +4261,11 @@ export async function listBlockedIssueAutoResumeSuppressions(
   const monitorRows = await dbOrTx
     .select({
       id: issues.id,
+      // Read the FULL column, never a `substring(...)` preview. `listBlockedInboxIssues`
+      // projects the first ISSUE_LIST_DESCRIPTION_MAX_CHARS and that is exactly what made
+      // the blocked-inbox oracle disagree with its own list in BLO-31839 — a park declared
+      // past the cutoff parsed as `null`. Here that would silently drain it (BLO-30445).
+      description: issues.description,
       hasGateSignals: sql<boolean>`
         COALESCE(
           CASE
@@ -4290,6 +4296,15 @@ export async function listBlockedIssueAutoResumeSuppressions(
       addSuppression(row.id, "monitor_gate");
     } else if (row.isConvergenceStalled) {
       addSuppression(row.id, "convergence_stalled");
+    } else if (externalWaitFromDescription(row.description) !== null) {
+      // BLO-30445: the liveness classifier and the stranded-blocked reconciler held opposite
+      // views of the same row. `isDeadEndBlocked` declines to raise `blocked_without_blockers`
+      // against a declared external wait, but the reconciler had no matching exemption, so it
+      // flipped the park to `todo` within one 15m tick — and the reconciler wins, because it
+      // mutates `status`. Measured live on the BLO-30391 fixture pair: the declared row drained
+      // in the same transaction as the undeclared control, so the documented escape hatch in
+      // `doc/execution-semantics.md#declaring-an-external-wait` bought it nothing.
+      addSuppression(row.id, "external_wait");
     }
   }
 
@@ -5772,7 +5787,7 @@ export function issueService(db: Db) {
     agentId: string,
     now: Date,
     operation: (
-      tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
+      tx: DbTransaction,
       checkoutExecutionPatch: NonNullable<Awaited<ReturnType<typeof runningCheckoutExecutionPatch>>>["patch"],
     ) => Promise<T>,
   ) {

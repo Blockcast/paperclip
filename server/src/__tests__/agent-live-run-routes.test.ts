@@ -563,6 +563,10 @@ describe("agent live run routes", () => {
     }));
     expect(mockLogActivity.mock.calls[0]?.[1]?.details).not.toHaveProperty("content");
     expect(mockLogActivity.mock.calls[0]?.[1]?.details).not.toHaveProperty("logRef");
+    // BLO-34738 AC 2: `withheld` is the workspace-operation route's flag. This route applies no
+    // read-time projection, so the key stays ABSENT rather than being written `false` — the
+    // `...(opts.withheld === undefined ? {} : …)` spread is the contract for existing consumers.
+    expect(mockLogActivity.mock.calls[0]?.[1]?.details).not.toHaveProperty("withheld");
   });
 
   it("audits denied run log access without reading content", async () => {
@@ -599,6 +603,39 @@ describe("agent live run routes", () => {
     }));
     expect(mockLogActivity.mock.calls[0]?.[1]?.details).not.toHaveProperty("content");
     expect(mockLogActivity.mock.calls[0]?.[1]?.details).not.toHaveProperty("logRef");
+  });
+
+  /**
+   * BLO-34738. `heartbeat.readLog` throws `notFound("Run log not found")` when the run stored no
+   * log, and the `allowed` audit sat above that call — so a 404 that disclosed nothing was booked
+   * as a read. Control: move `logRunLogAccessAudit(..., "allowed", ...)` back above `readLog` and
+   * this fails (verified, not assumed).
+   *
+   * BLO-34901: no `result` matcher. The invariant is that this 404 records NOTHING — the reader is
+   * entitled, so booking it `denied` is equally false, and a matcher pinned to `"allowed"` passes
+   * that mutation unchanged. Second control (also verified): make the route write
+   * `logRunLogAccessAudit(..., "denied", ...)` on this path and this fails.
+   *
+   * The `readLog` positive pins the path the absence assertion is about. Without it, any mutation
+   * that 404s BEFORE `readLog` writes no audit either, so the absence assertion passes while
+   * nothing is exercised — verified: a `return` above `readLog` fails this test, and fails nothing
+   * if the positive is removed.
+   */
+  it("does not audit a run log read at all when the run stored no log", async () => {
+    const app = await createApp();
+    const { notFound } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
+    mockHeartbeatService.readLog.mockRejectedValue(notFound("Run log not found"));
+
+    const res = await requestApp(
+      app,
+      (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-1/log?offset=0&limitBytes=64"),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(404);
+    expect(mockHeartbeatService.readLog).toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "heartbeat.run_log_accessed",
+    }));
   });
 
   /**
@@ -703,6 +740,44 @@ describe("agent live run routes", () => {
         offset: 4,
         limitBytes: 32,
       }),
+    }));
+  });
+
+  /**
+   * BLO-34738, the other half. Same defect one URL over: `workspaceOperations.readLog` throws
+   * `notFound("Workspace operation log not found")` when `logStore`/`logRef` is unset, and the
+   * `allowed` audit sat above it — booking `withheld: true` against a 404, on exactly the flag
+   * BLO-34631 added for audit accuracy. Control: move `audit("allowed", ...)` back above
+   * `readLog` and this fails (verified, not assumed).
+   *
+   * `logStore: null` on the fixture rather than only rejecting `readLog`: that is the shape the
+   * closure records, and it keeps the audit's own `logStore` field honest if the ordering ever
+   * regresses.
+   *
+   * BLO-34901: no `result` matcher, same reasoning as the heartbeat guard above — and second
+   * control verified here too. The `readLog` positive pins the exercised path for the same reason,
+   * with its own verified mutation: a `return` above `readLog` fails this test only while that
+   * assertion is present.
+   */
+  it("does not audit a workspace-operation log read at all when the operation stored no log", async () => {
+    mockWorkspaceOperationService.getById.mockResolvedValue(
+      workspaceOperationLogFixture({ logStore: null, logRef: null }),
+    );
+    const app = await createApp();
+    const { notFound } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
+    mockWorkspaceOperationService.readLog.mockRejectedValue(
+      notFound("Workspace operation log not found"),
+    );
+
+    const res = await requestApp(
+      app,
+      (baseUrl) => request(baseUrl).get("/api/workspace-operations/operation-1/log?offset=0&limitBytes=64"),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(404);
+    expect(mockWorkspaceOperationService.readLog).toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "workspace_operation.log_accessed",
     }));
   });
 

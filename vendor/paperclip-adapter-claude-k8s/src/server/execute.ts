@@ -1110,13 +1110,82 @@ export function describePodTerminatedError(
   return `Pod ${podName} reached phase=${phase}`;
 }
 
+// Labels the Job controller stamps on every pod it creates. `controller-uid`
+// is the legacy key (every supported release); the `batch.kubernetes.io/`
+// prefixed key was added in 1.27. Both carry the owning Job's metadata.uid.
+const JOB_CONTROLLER_UID_LABELS = ["batch.kubernetes.io/controller-uid", "controller-uid"] as const;
+
+/**
+ * Pick, from a `job-name=<jobName>` pod listing, the pod owned by THIS
+ * execution's Job — identified by the server-assigned UID returned from
+ * `createNamespacedJob` (or the adopted Job's UID).
+ *
+ * Why this exists (BLO-34577). The Job name is deterministic per
+ * (agentId, runId) — see job-manifest.ts — and the server's in-run ccrotate
+ * throttle loop re-invokes `execute()` for the SAME runId after a 429, so the
+ * replacement Job gets the same name as the attempt that just returned. That
+ * previous Job was deleted with `propagationPolicy: Background`, which removes
+ * the Job object immediately but garbage-collects its pod asynchronously. For
+ * a window after the replacement Job is created, `job-name=<name>` therefore
+ * matches BOTH the stale pod (phase=Failed, `claude exited 1` from the 429)
+ * and — once the controller creates it — the new one. Taking `items[0]` read
+ * the stale pod ~100 ms after create and reported the prior attempt's terminal
+ * state as this attempt's `k8s_pod_schedule_failed`, a code the server treats
+ * as non-retryable; the review was dropped.
+ *
+ * Ownership is read from `metadata.ownerReferences` (controller: Job, matching
+ * uid) with the controller-uid labels as the fallback. A pod carrying neither
+ * is not provably ours and is not selected — fail closed, since selecting the
+ * wrong pod is exactly the bug. Pure so the matrix is testable without a
+ * cluster.
+ */
+export function selectJobOwnedPod(
+  pods: readonly k8s.V1Pod[],
+  jobUid: string,
+): { owned: k8s.V1Pod | null; stale: k8s.V1Pod[] } {
+  let owned: k8s.V1Pod | null = null;
+  const stale: k8s.V1Pod[] = [];
+  for (const pod of pods) {
+    const meta = pod.metadata;
+    const ownerMatch = (meta?.ownerReferences ?? []).some(
+      (ref) => ref.kind === "Job" && ref.uid === jobUid,
+    );
+    const labelMatch = JOB_CONTROLLER_UID_LABELS.some((key) => meta?.labels?.[key] === jobUid);
+    if (ownerMatch || labelMatch) {
+      // The Job controller runs exactly one pod per attempt for this manifest
+      // (parallelism 1, no restart of a Failed pod is ours to wait on here);
+      // keep the first owned pod and let the caller's phase logic judge it.
+      if (!owned) owned = pod;
+      continue;
+    }
+    stale.push(pod);
+  }
+  return { owned, stale };
+}
+
+function describeStalePods(stale: readonly k8s.V1Pod[]): string {
+  return stale
+    .map((pod) => {
+      const name = pod.metadata?.name ?? "unknown";
+      const owner = pod.metadata?.ownerReferences?.find((ref) => ref.kind === "Job")?.uid
+        ?? JOB_CONTROLLER_UID_LABELS.map((key) => pod.metadata?.labels?.[key]).find(Boolean)
+        ?? "<no owner>";
+      return `${name} (owner uid ${owner}, phase=${pod.status?.phase ?? "Unknown"})`;
+    })
+    .join(", ");
+}
+
 /**
  * Wait for the Job's pod to reach a terminal or running state.
  * Returns the pod name once logs can be streamed, or throws on failure.
+ *
+ * `jobUid` scopes the lookup to the Job this execution created or adopted;
+ * same-name pods from an earlier attempt are ignored (see selectJobOwnedPod).
  */
 async function waitForPod(
   namespace: string,
   jobName: string,
+  jobUid: string,
   scheduleTimeoutMs: number,
   startTimeoutMs: number,
   onLog: AdapterExecutionContext["onLog"],
@@ -1131,12 +1200,21 @@ async function waitForPod(
   let lastStatus = "";
   let lastStatusDetails = "no pod observed yet";
   let startDeadline = 0;
+  let staleLogged = false;
   while (true) {
     const podList = await coreApi.listNamespacedPod({
       namespace,
       labelSelector,
     });
-    const pod = podList.items[0];
+    const { owned: pod, stale } = selectJobOwnedPod(podList.items, jobUid);
+    if (stale.length > 0 && !staleLogged) {
+      staleLogged = true;
+      await onLog(
+        "stdout",
+        `[paperclip] Ignoring ${stale.length} pod(s) named for Job ${jobName} but not owned by this Job (uid ${jobUid}); `
+          + `they belong to an earlier attempt still being garbage-collected: ${describeStalePods(stale)}\n`,
+      );
+    }
 
     if (!pod) {
       if (Date.now() >= scheduleDeadline) {
@@ -1304,8 +1382,13 @@ async function waitForJobCompletion(
 /**
  * Get the exit code from the Job's pod.
  */
-async function getPodExitCode(namespace: string, jobName: string, kubeconfigPath?: string): Promise<number | null> {
-  const state = await getPodTerminatedState(namespace, jobName, kubeconfigPath);
+async function getPodExitCode(
+  namespace: string,
+  jobName: string,
+  jobUid: string,
+  kubeconfigPath?: string,
+): Promise<number | null> {
+  const state = await getPodTerminatedState(namespace, jobName, jobUid, kubeconfigPath);
   return state?.exitCode ?? null;
 }
 
@@ -1335,6 +1418,7 @@ export interface PodLookupResult {
 async function lookupPodState(
   namespace: string,
   jobName: string,
+  jobUid: string,
   kubeconfigPath?: string,
 ): Promise<PodLookupResult> {
   const coreApi = getCoreApi(kubeconfigPath);
@@ -1342,7 +1426,9 @@ async function lookupPodState(
     namespace,
     labelSelector: `job-name=${jobName}`,
   });
-  const pod = podList.items[0];
+  // Same ownership scoping as waitForPod: a same-name pod from an earlier
+  // attempt must not be read as this attempt's terminal state (BLO-34577).
+  const { owned: pod } = selectJobOwnedPod(podList.items, jobUid);
   if (!pod) return { state: null, phase: null, podMissing: true };
 
   const phase = pod.status?.phase ?? null;
@@ -1371,13 +1457,14 @@ async function lookupPodState(
 async function getPodLookupWithRetry(
   namespace: string,
   jobName: string,
+  jobUid: string,
   kubeconfigPath?: string,
   attempts = 4,
   delayMs = 500,
 ): Promise<PodLookupResult> {
   let last: PodLookupResult = { state: null, phase: null, podMissing: true };
   for (let i = 0; i < attempts; i++) {
-    last = await lookupPodState(namespace, jobName, kubeconfigPath);
+    last = await lookupPodState(namespace, jobName, jobUid, kubeconfigPath);
     if (last.state) return last;
     if (last.podMissing) return last;
     // Pod exists but no terminated state.  If it is in a terminal phase the
@@ -1392,9 +1479,10 @@ async function getPodLookupWithRetry(
 async function getPodTerminatedState(
   namespace: string,
   jobName: string,
+  jobUid: string,
   kubeconfigPath?: string,
 ): Promise<PodTerminatedState | null> {
-  return (await lookupPodState(namespace, jobName, kubeconfigPath)).state;
+  return (await lookupPodState(namespace, jobName, jobUid, kubeconfigPath)).state;
 }
 
 /**
@@ -1570,6 +1658,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const coreApi = getCoreApi(kubeconfigPath);
   const batchApi = getBatchApi(kubeconfigPath);
 
+  // UID of the Job this execution created or adopted, bound once the launch
+  // identity is acknowledged. Every pod lookup below is scoped to it (BLO-34577).
+  let jobUid: string;
   try {
   const selfPod = await getSelfPodInfo(kubeconfigPath);
   const guardNamespace = asString(config.namespace, "") || selfPod.namespace;
@@ -2011,8 +2102,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         errorCode: "k8s_job_identity_unacknowledged",
       };
     }
+    // From here on every pod read is scoped to this exact Job object. The
+    // deterministic name alone cannot identify it (BLO-34577).
+    jobUid = createdJobUid;
     try {
-      await onExternalRuntimeLaunched({ jobName, jobUid: createdJobUid });
+      await onExternalRuntimeLaunched({ jobName, jobUid });
     } catch (err) {
       // Same reasoning as above.  Re-acking an adopted Job re-asserts an
       // identity the server already persisted, so a throw here means we could
@@ -2192,7 +2286,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const scheduleTimeoutMs = Math.max(0, asNumber(config.podScheduleTimeoutSec, 120)) * 1000;
     const startTimeoutMs = Math.max(0, asNumber(config.podStartTimeoutSec, 600)) * 1000;
     try {
-      podName = await waitForPod(namespace, jobName, scheduleTimeoutMs, startTimeoutMs, onLog, kubeconfigPath);
+      podName = await waitForPod(namespace, jobName, jobUid, scheduleTimeoutMs, startTimeoutMs, onLog, kubeconfigPath);
       await onLog("stdout", `[paperclip] Pod running: ${podName}\n`);
       podRunningAt = Date.now();
 
@@ -2382,7 +2476,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     }
 
-    podTerminatedState = await getPodTerminatedState(namespace, jobName, kubeconfigPath);
+    podTerminatedState = await getPodTerminatedState(namespace, jobName, jobUid, kubeconfigPath);
     exitCode = podTerminatedState?.exitCode ?? null;
     if ((exitCode ?? 0) !== 0 && podName) {
       containerLogTail = await readPodContainerLogTail({ namespace, podName, kubeconfigPath });
@@ -2538,7 +2632,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       let lookup: PodLookupResult | undefined;
       let refreshedState = podTerminatedState;
       try {
-        lookup = await getPodLookupWithRetry(namespace, jobName, kubeconfigPath);
+        lookup = await getPodLookupWithRetry(namespace, jobName, jobUid, kubeconfigPath);
         refreshedState = lookup.state;
         if (refreshedState && refreshedState.exitCode !== null) {
           exitCode = refreshedState.exitCode;

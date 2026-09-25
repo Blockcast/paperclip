@@ -88,6 +88,7 @@ import {
   type IssueWakeDiagnosticsResponse,
   type IssueRelationIssueSummary,
   type IssueWatchdogDiscoveryKind,
+  type ProjectManagedByPlugin,
   type ProjectWorkspace,
   type SourceTrustMetadata,
   type SuccessfulRunHandoffState,
@@ -244,6 +245,7 @@ import { externalObjectService } from "../services/external-objects.js";
 import {
   isStatusOnlyRecoveryContextSnapshot,
   STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
+  statusOnlyMonitorArmResumeGuidance,
 } from "../services/recovery/model-profile-hint.js";
 import {
   enqueueCommentEffects,
@@ -1935,7 +1937,12 @@ const INVALID_AGENT_IN_REVIEW_DISPOSITION_MESSAGE =
   "Keep working instead of moving to review, create a request_confirmation or ask_user_questions interaction, " +
   "link or request a pending approval, assign a human reviewer with assigneeUserId, set a typed executionState.currentParticipant through an execution policy, " +
   "or schedule an issue monitor for an external review/check with a nextCheckAt in the future — a lapsed or past-dated monitor is not a review path, " +
-  "because the strandedness sweep has already stopped counting it. After creating one of those review paths, retry the status update.";
+  "because the strandedness sweep has already stopped counting it. " +
+  "A live deliberate park (parkedDisposition / parkedUntil) is NOT on this list, and its absence is a decision rather than an oversight (BLO-33572): " +
+  "a park records that nobody is acting on this row until a stated deadline, which is the opposite of what in_review asserts, and it expires on its own — " +
+  "so admitting it here would reach in_review with no reviewer at all and merely defer this same refusal to the park's deadline. " +
+  "The strandedness sweep does count a live park, on any status, which is the point: park the row on the status that is actually true (todo/backlog) instead of moving it to review. " +
+  "After creating one of those review paths, retry the status update.";
 
 function isPendingIssueThreadInteractionReviewPath(interaction: { kind: string; status: string }) {
   return interaction.status === "pending" && REVIEW_PATH_INTERACTION_KINDS.has(interaction.kind);
@@ -3898,6 +3905,36 @@ export function issueRoutes(
     );
   }
 
+  /**
+   * The write-side half of "does anything own the next action on this row?".
+   *
+   * The read-side half is `hasExplicitWaitingPath` in
+   * services/recovery/issue-graph-liveness.ts. The two answer the same question and are
+   * deliberately NOT the same predicate: the sweep accepts a superset, and that asymmetry
+   * is safe in exactly one direction — everything this validator admits, the sweep counts.
+   * Keep it that way. PEN-2853 records the first instance (a lapsed monitor the sweep had
+   * stopped counting still cleared this gate); BLO-33572 is the second, below.
+   *
+   * BLO-33572 — a live deliberate park (`parkedUntil` in the future) is a sweep satisfier
+   * and is deliberately NOT a review path here, which is why this function never reads the
+   * column. The reasoning, since the asymmetry is surprising from the caller's side and the
+   * 422 previously listed five alternatives without saying why a sixth was missing:
+   *
+   * - The two claims are opposites, not degrees of the same claim. A park says "nobody is
+   *   acting on this, by decision of a named actor, until T." `in_review` says "someone
+   *   will act." Admitting the park would let a row reach `in_review` with no reviewer at
+   *   all — precisely the state this gate exists to prevent.
+   * - A park expires by design (that is what stops it decaying into permanent silence). So
+   *   accepting it would not answer the finding, only defer it to the park's deadline, at
+   *   which point the row is `in_review` with nothing and the sweep fires anyway.
+   * - The caller already has the disposition they want, on a different status. The sweep
+   *   honours a live park on `todo`/`backlog` too, so a parked row does not need `in_review`
+   *   — using it as a parking lot is the mistake, and the message now says so.
+   *
+   * This is the PEN-2853 sentence one predicate over: the sweep's leniency exists to avoid
+   * *seizing* a row nobody has had a chance to act on; it is not a licence to *assert* a
+   * review path.
+   */
   async function assertAgentInReviewReviewPath(input: {
     existing: {
       id: string;
@@ -6911,6 +6948,13 @@ export function issueRoutes(
         runId: run.id,
         modelProfile: "cheap",
         recoveryIntent: "status_only",
+        // BLO-34683: the shared guidance ends "take the allowed write named in this response",
+        // and of its four sharers this is the only one whose `error` names no exit — the other
+        // three carry `allowedDocumentKey`/`allowedApprovalType`. Without this key the one
+        // refusal the caller could clear IN the refused run is the one sent looking for a key
+        // that is not in the payload. `requestsCheapIssueAssigneeModelProfile` tests exactly
+        // one thing, so the allowed form is exactly the same write minus that override.
+        allowedWrite: 'the same request without `assigneeAdapterOverrides.modelProfile: "cheap"`',
         resumeRequiresNormalModel: true,
         ...STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
       },
@@ -6943,6 +6987,31 @@ export function issueRoutes(
    *
    * `loadActorRunContext` returns null for non-agent actors, so this
    * self-limits to agents and cannot affect board or user callers.
+   *
+   * BLO-34683: run class alone is NOT the condition. The harm above needs a
+   * live recovery action to escape from — but `isStatusOnlyCheapRecoveryContext`
+   * reads only `contextSnapshot`, and the monitor-CLEAR path stamps its own
+   * repair wake status-only too (`heartbeat.ts`, `reason: issue_monitor_recovery`,
+   * unconditional). So the one run dispatched to fix a cleared monitor was the
+   * one run forbidden to re-arm it: the platform removed the wake path and then
+   * refused the repair, which on an `in_review`/`blocked` row whose only path
+   * was that monitor is the BLO-27553 permanent strand. Observed live on
+   * BLO-19124, an issue that has never held a recovery action at all.
+   *
+   * So test the containment, not the provenance. This cannot be self-lifted:
+   * clearing the action requires a recorded disposition, which is the intended
+   * exit. Deliberately NOT keyed on `wakeReason === "issue_monitor_recovery"` —
+   * that is a string standing in for the condition, and it would exempt the
+   * wake class forever rather than only while nothing is containing it.
+   *
+   * Refusing while the action is `escalated` is NOT itself the BLO-27553 shape,
+   * though it looks like it: `issue-recovery-actions.ts` documents that an
+   * escalated action "does NOT wake anyone", so the issue is left with neither a
+   * monitor nor a waking action. What keeps that safe is that the live run being
+   * refused here is itself the wake — its own disposition write clears the action
+   * and restores arming, and that write is a status-only run's one allowed
+   * deliverable (BLO-25868). The row is only unreachable if this run declines to
+   * dispose of it, which is the case the handoff detector already escalates.
    */
   async function assertMonitorArmingAllowedByRunContext(
     req: Request,
@@ -6951,6 +7020,66 @@ export function issueRoutes(
   ) {
     const run = await loadActorRunContext(req, companyId);
     if (!run || !isStatusOnlyCheapRecoveryContext(run.contextSnapshot)) return;
+
+    // Containment is a property of the RUN, not of the row being patched, so
+    // BOTH scopes are consulted. Probing only the target would relocate the
+    // escape one issue sideways rather than close it: this gate runs BEFORE the
+    // assignee early-return below, and that early-return is a plain
+    // `agentId === issue.assigneeAgentId` with no run scoping — so this check is
+    // the only thing between a status-only run and any issue it is assignee of.
+    // A run contained by an active action on issue A could then arm a monitor on
+    // some other assigned issue B holding none, and collect exactly the
+    // unguarded normal-model wake BLO-32774 denies. `resumeRequiresNormalModel`
+    // is a property of the run; B's empty action list is not evidence about it.
+    // Every sibling guard here (`assertCheapRecoveryIssueAssigneeProfileAllowed`,
+    // `assertDeliverableMutationAllowedByRunContext`) keys on the run alone.
+    //
+    // EITHER scope being unresolvable FAILS CLOSED, and must keep doing so. A
+    // null `issue.id` is the creation routes, which mint the id after this gate
+    // — precisely the escape a contained run would use: create a fresh issue
+    // naming itself assignee, arm a monitor on it, collect an unguarded run. An
+    // unresolvable scope is not evidence of no containment. Note this can only
+    // ever *widen* permission relative to the unconditional refusal it replaces,
+    // and only for a run provably holding no containment on either side.
+    //
+    // BOTH stamped scope fields are read, because `contextSnapshot.issueId` alone
+    // is the WRONG scope for every class that actually holds an action. The
+    // action is keyed on the source issue — `upsertSourceScoped({ sourceIssueId:
+    // input.issue.id })`, and `listActiveForIssues` filters on that column — while
+    // the wake stamps `issueId: recovery.id` and `sourceIssueId: input.issue.id`
+    // side by side (`recovery/service.ts`, `stranded_assigned_issue` and both
+    // stale-run evaluation sites). `recovery.id` is a freshly minted recovery
+    // issue that never holds an action, so an `issueId`-only probe returns empty
+    // for exactly the class this gate's doc comment is written about, and the
+    // sideways escape stays open.
+    //
+    // At least ONE field, not both: `issue_monitor_recovery` (`heartbeat.ts`)
+    // stamps `issueId` and no `sourceIssueId` at all, so requiring both would
+    // fail closed on the very wake BLO-34683 exists to unblock.
+    //
+    // Reading BOTH also survives a coalesce, which the stamping argument alone
+    // does not cover: `mergeCoalescedContextSnapshot` is `{...existing,
+    // ...incoming}`, and it drops the guard block only when the incoming wake
+    // DECLARES a run class — so a wake silent about run class inherits the guard
+    // tuple while its own `issueId` overwrites the stamped one. Neither scope
+    // field is in `RECOVERY_GUARD_CONTEXT_KEYS`, so on that path `sourceIssueId`
+    // is the field that survives and keeps containment visible. Do not
+    // "simplify" this to one field on the grounds that one stamp site supplies
+    // only one.
+    const runContext = readObject(run.contextSnapshot);
+    const runScopeIssueIds = [runContext.issueId, runContext.sourceIssueId]
+      .map(readNonEmptyString)
+      .filter((id): id is string => id !== null);
+    // Empty ⟺ the gate refused on an unresolvable scope rather than on real
+    // containment. Carried into the 403 so the refused run is told which row to
+    // dispose of instead of being asked to guess which branch it hit.
+    let containingIssueIds: string[] = [];
+    if (issue.id && runScopeIssueIds.length > 0) {
+      const scopes = [...new Set([issue.id, ...runScopeIssueIds])];
+      const active = await recoveryActionsSvc.listActiveForIssues(companyId, scopes);
+      if (active.size === 0) return;
+      containingIssueIds = [...active.keys()];
+    }
 
     // Same shape as `assertCheapRecoveryIssueAssigneeProfileAllowed`: the
     // refusal is unconditional and single-point, the audit row is best-effort
@@ -6977,7 +7106,7 @@ export function issueRoutes(
         modelProfile: "cheap",
         recoveryIntent: "status_only",
         resumeRequiresNormalModel: true,
-        ...STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
+        ...statusOnlyMonitorArmResumeGuidance(containingIssueIds),
       },
     );
   }
@@ -7730,6 +7859,87 @@ export function issueRoutes(
     };
   }
 
+  /**
+   * Mask the one open field on a project's plugin binding (PEN-3114, door #15 of the
+   * PEN-2370 series; ask 1 — names survive, values elided).
+   *
+   * `compactIssueProject` below is a projection, and the `env: null` line in it proves
+   * the author treated this response as a withholding boundary. `managedByPlugin`
+   * crossed it verbatim. `ProjectManagedByPlugin.defaultsJson` is an open
+   * `Record<string, unknown>` (`packages/shared/src/types/project.ts`) over a `jsonb`
+   * column, and its `settings` leaf is copied straight out of a plugin manifest's
+   * `PluginManagedProjectDeclaration.settings` — "Optional plugin-specific defaults"
+   * (`packages/shared/src/types/plugin.ts`) — via `buildManagedProjectDefaults`
+   * (`services/projects.ts`). That block is authored by a plugin author rather than by
+   * a Paperclip operator, and integration config is a natural home for a credential.
+   *
+   * Enumerated rather than spread, so a field added to `ProjectManagedByPlugin` later
+   * has to be considered here instead of crossing silently — the same reason the
+   * enclosing function is a projection rather than a spread.
+   *
+   * ## Why delegate, and why to this walk
+   *
+   * `defaultsJson` goes through `maskWorkspaceRuntimeForRead` rather than a second walk
+   * written here: copying one is exactly how the array-shaped (#1574) and JSON-string
+   * (#1583) bypasses each shipped, so a finding against that walk should land here too.
+   * Its contract is the one ask 1 asks for — every value masked, every key name kept,
+   * anything that is not an object or array masked outright, depth-capped fail-closed.
+   * The last two matter more than they look: the column is `jsonb`, so the runtime value
+   * is arbitrary regardless of what the TypeScript type claims.
+   *
+   * Its `commands`/`services`/`jobs` identity carve-out is *inert* here — the platform
+   * writes `projectKey`/`displayName`/`description`/`status`/`color`/`settings` and none
+   * of those is one of those three array names. If a manifest ever did write a top-level
+   * `services` array, the carve-out would preserve only `id`/`name`/`label`/`title`
+   * strings on its entries, which that walk already discloses in the strictly more
+   * sensitive workspace-runtime position; the residual is bounded and no worse there.
+   *
+   * `withholdAgentConfigKeys` (#1581) was checked first and does not fit: it is keyed on
+   * the literal names `adapterConfig`/`runtimeConfig`, and it blanks its target to `{}`,
+   * which erases the key names ask 1 requires be kept.
+   *
+   * ## Why this is masked unconditionally, when the runtime exits above are gated
+   *
+   * The two workspace-runtime exits in this file now read
+   * `viewer.revealRuntimeConfig ? raw : …` (PEN-2852 / BLO-33407). This one deliberately
+   * does not, and the difference is the entitlement's scope rather than an oversight:
+   * `workspace_runtime:read` is defined over workspace runtime config. `defaultsJson` is
+   * plugin-manifest material with a different audience, so gating it on that flag would
+   * disclose plugin defaults to every holder of an unrelated entitlement — widening the
+   * grant while appearing to narrow it.
+   *
+   * Nor is there an entitled consumer to serve, which is what makes the gate valuable
+   * above: there, the runtime editors genuinely need raw values. Here no reader wants
+   * them (see below), so a gate would have an empty true-branch and the only effect of
+   * adding one would be the mis-scoping. If a consumer ever does need raw `defaultsJson`,
+   * it should arrive with its own entitlement rather than borrow this one.
+   *
+   * ## Why masking is safe here
+   *
+   * `defaultsJson` is retained to drive plugin reset/reconcile, and that path is
+   * write-only with respect to this response: it recomputes `defaults` from the manifest
+   * declaration and writes it to `pluginManagedResources.defaultsJson`
+   * (`services/projects.ts`), and `reset` updates the project row from the declaration
+   * too — neither ever reads this projection back. No UI reads `defaultsJson` at all:
+   * `ProjectDetail.tsx` reads `pluginDisplayName`, `pluginKey` and `resourceKey`, all of
+   * which survive untouched, and it reads them from `GET /projects/:id` rather than from
+   * this issue projection.
+   */
+  function compactIssueManagedByPlugin(managed: ProjectManagedByPlugin | null | undefined) {
+    if (!managed) return null;
+    return {
+      id: managed.id,
+      pluginId: managed.pluginId,
+      pluginKey: managed.pluginKey,
+      pluginDisplayName: managed.pluginDisplayName,
+      resourceKind: managed.resourceKind,
+      resourceKey: managed.resourceKey,
+      defaultsJson: maskWorkspaceRuntimeForRead(managed.defaultsJson),
+      createdAt: managed.createdAt,
+      updatedAt: managed.updatedAt,
+    };
+  }
+
   function compactIssueProject(
     project: Awaited<ReturnType<typeof resolveIssueProjectAndGoal>>["project"],
     viewer: WorkspaceRuntimeViewer,
@@ -7766,7 +7976,7 @@ export function issueRoutes(
         compactIssueProjectWorkspace(workspace, viewer),
       ),
       primaryWorkspace: compactIssueProjectWorkspace(project.primaryWorkspace, viewer),
-      managedByPlugin: project.managedByPlugin ?? null,
+      managedByPlugin: compactIssueManagedByPlugin(project.managedByPlugin),
       taskCount: project.taskCount,
       budget: project.budget,
       archivedAt: project.archivedAt,

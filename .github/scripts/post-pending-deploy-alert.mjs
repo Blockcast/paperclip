@@ -86,6 +86,7 @@
  */
 import { appendFileSync, readFileSync } from 'node:fs';
 import {
+  DEPLOY_WORKFLOW_FILE,
   createGitHubClient,
   renderEscalationComment,
   renderStallIssueBody,
@@ -206,6 +207,18 @@ export function buildAlert({
 }) {
   const hours = ageHours.toFixed(1);
   const pendingUrl = oldest.url ?? '(url unavailable)';
+  // The call to action must NOT be a run url. This step runs BEFORE the
+  // supersede step that cancels the very run it names, so `pendingUrl` is dead
+  // within seconds of every push and stays dead for the whole ~7h cycle —
+  // measured 2026-09-19: alert posted 23:31:17Z naming run 35455142403,
+  // cancelled 23:31:23Z, still named at 00:05Z. A human opening the link finds a
+  // cancelled run, which is this alert's own subject matter (BLO-26972).
+  //
+  // The queue filter is correct unconditionally: it lists whatever is on the
+  // gate at READ time, so no step ordering, no write-back of the replacement run
+  // id, and no supersede can stale it. `pendingUrl` is kept as observed-at-alert
+  // context and in the machine annotation, where a perishable value is honest.
+  const pendingQueueUrl = `https://github.com/${repo}/actions/workflows/${DEPLOY_WORKFLOW_FILE}?query=is%3Awaiting`;
   // A supersede replaces the run but not the stall, so these two differ whenever
   // the lane has been refreshed. Saying only one of them would either understate
   // the outage or point at a run that no longer exists.
@@ -226,7 +239,7 @@ export function buildAlert({
         `${repo} production deploy has been awaiting human approval for ${hours}h — ` +
         'the daily dispatcher is a no-op until it clears',
       description:
-        `A docker.yml deploy has been parked on the ${environment} reviewer gate since ` +
+        `A ${DEPLOY_WORKFLOW_FILE} deploy has been parked on the ${environment} reviewer gate since ` +
         `${stallSince} (${hours}h; threshold ${alertAfterHours}h).\n\n` +
         "While it waits, scheduled-production-deploy.yml's anti-stacking guard skips every " +
         'daily slot, so production drift grows and each skipped run still reports ' +
@@ -236,9 +249,13 @@ export function buildAlert({
             `current, so it is younger than the stall: it has been waiting since ${oldest.createdAt}. ` +
             'Nothing has been approved — the age above is how long a human has been needed.\n\n'
           : '') +
-        `Approve or reject the pending run to clear it: ${pendingUrl}\n\n` +
+        `Approve or reject the pending deploy to clear it: ${pendingQueueUrl}\n` +
+        'That link lists whatever is on the gate right now. Do not bookmark an individual run: ' +
+        'a stale one is cancelled and replaced whenever master moves past it, so approve ' +
+        `whichever run is waiting there. At the time of this alert that was ${pendingUrl}.\n\n` +
         `${waitingCount} deploy(s) currently waiting on this gate.` +
         (stallRecordUrl ? `\n\nDurable record (survives this alert's TTL): ${stallRecordUrl}` : ''),
+      pending_queue_url: pendingQueueUrl,
       pending_run_url: pendingUrl,
       pending_since: oldest.createdAt,
       stall_since: stallSince,
