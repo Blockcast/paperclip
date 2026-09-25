@@ -31,6 +31,7 @@ import {
   createSweepGate,
   DEFAULT_SWEEP_AGE_FLOOR_SEC,
   DEFAULT_SWEEP_INTERVAL_SEC,
+  DEFAULT_SWEEP_TIMEOUT_MS,
   MANAGED_BY_LABEL,
   MANAGED_BY_VALUE,
   RUN_ID_LABEL,
@@ -1624,7 +1625,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const guardNamespace = asString(config.namespace, "") || selfPod.namespace;
   // Best-effort, rate-limited sweep of run Secrets orphaned by a control-plane
   // crash between Secret creation and the ownerReferences patch (BLO-21857).
-  // Never throws; a cleanup path must not be able to fail a run.
+  // Never throws and never hangs: this await sits inside the per-agent creation
+  // mutex, whose slot is released only by the `finally` at the bottom of this
+  // function, so an unbounded wait here would wedge the agent permanently rather
+  // than merely delay one run. The gate enforces both bounds.
   await maybeSweepOrphanedSecrets({
     namespace: guardNamespace,
     coreApi,
@@ -1634,6 +1638,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       Math.max(0, asNumber(config.orphanSecretSweepIntervalSec, DEFAULT_SWEEP_INTERVAL_SEC)) * 1000,
     ageFloorMs:
       Math.max(0, asNumber(config.orphanSecretSweepAgeFloorSec, DEFAULT_SWEEP_AGE_FLOOR_SEC)) * 1000,
+    timeoutMs: asNumber(config.orphanSecretSweepTimeoutMs, DEFAULT_SWEEP_TIMEOUT_MS),
   });
   try {
     const existing = await withK8sConcurrencyGuardTimeout(
