@@ -27,6 +27,7 @@ import { logger } from "../middleware/logger.js";
 
 const coalesced = { onCoalesced: () => "coalesced" as const };
 const LOCK_HELD_ERROR_MS = 5 * 60_000;
+const LOCK_ABORT_MS = 4 * 60 * 60_000;
 const LOCK_HELD_WARN_MS = 30_000;
 
 type FakeQuery = Promise<unknown> & {
@@ -127,7 +128,7 @@ describe("agent start lock database cancellation seam (PEN-3328)", () => {
     expect(client.issued).toHaveLength(1);
     expect(client.issued[0]!.cancelled).toBe(false);
 
-    await vi.advanceTimersByTimeAsync(LOCK_HELD_ERROR_MS + 1_000);
+    await vi.advanceTimersByTimeAsync(LOCK_ABORT_MS + 1_000);
 
     expect(client.issued[0]!.cancelled).toBe(true);
     await expect(held).rejects.toMatchObject({ code: "57014" });
@@ -205,7 +206,7 @@ describe("agent start lock database cancellation seam (PEN-3328)", () => {
       const dialFailure = new Error("connect ECONNREFUSED (cancel request)");
       query.cancel = () => Promise.reject(dialFailure) as unknown as void;
 
-      await vi.advanceTimersByTimeAsync(LOCK_HELD_ERROR_MS + 1_000);
+      await vi.advanceTimersByTimeAsync(LOCK_ABORT_MS + 1_000);
 
       // Give the rejection every chance to be reported as unhandled.
       vi.useRealTimers();
@@ -254,7 +255,7 @@ describe("agent start lock database cancellation seam (PEN-3328)", () => {
       coalesced,
     );
     void held.catch(() => {});
-    await vi.advanceTimersByTimeAsync(LOCK_HELD_ERROR_MS + 1_000);
+    await vi.advanceTimersByTimeAsync(LOCK_ABORT_MS + 1_000);
     await expect(held).rejects.toThrow("section done");
 
     expect(secondAttempt).toBeInstanceOf(AgentStartLockAbortedError);
@@ -288,7 +289,7 @@ describe("agent start lock database cancellation seam (PEN-3328)", () => {
     const inner = client.scopedClientsSeen[0] as ReturnType<typeof makeFakeClient>;
     expect(inner.issued).toHaveLength(1);
 
-    await vi.advanceTimersByTimeAsync(LOCK_HELD_ERROR_MS + 1_000);
+    await vi.advanceTimersByTimeAsync(LOCK_ABORT_MS + 1_000);
 
     expect(inner.issued[0]!.cancelled).toBe(true);
     await expect(held).rejects.toMatchObject({ code: "57014" });
@@ -327,7 +328,7 @@ describe("agent start lock database cancellation seam (PEN-3328)", () => {
     let settled = false;
     void held.then(() => { settled = true; }, () => { settled = true; });
 
-    await vi.advanceTimersByTimeAsync(LOCK_HELD_ERROR_MS + 1_000);
+    await vi.advanceTimersByTimeAsync(LOCK_ABORT_MS + 1_000);
 
     // The honest assertion. The abort was raised and did not land: no statement
     // was ever issued to cancel, so the section is still sitting on the
@@ -353,7 +354,7 @@ describe("agent start lock database cancellation seam (PEN-3328)", () => {
       return "ran-concurrently";
     }, coalesced);
     void follow.catch(() => {});
-    await vi.advanceTimersByTimeAsync(LOCK_HELD_ERROR_MS);
+    await vi.advanceTimersByTimeAsync(LOCK_ABORT_MS);
     expect(followUpRan).toBe(false);
   });
 

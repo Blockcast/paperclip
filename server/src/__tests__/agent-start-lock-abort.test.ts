@@ -33,8 +33,11 @@ import { logger } from "../middleware/logger.js";
 
 const coalesced = { onCoalesced: () => "coalesced" as const };
 
-/** The abort threshold in `agent-start-lock.ts`. */
+/** The log-escalation threshold in `agent-start-lock.ts` — attention, not abort. */
 const LOCK_HELD_ERROR_MS = 5 * 60_000;
+
+/** The abort threshold in `agent-start-lock.ts`. */
+const LOCK_ABORT_MS = 4 * 60 * 60_000;
 
 /** The `warnTimer` tick interval in `agent-start-lock.ts`. */
 const LOCK_HELD_WARN_MS = 30_000;
@@ -91,7 +94,7 @@ describe("agent start lock cancellation (PEN-3328)", () => {
       (err: unknown) => err,
     );
 
-    await vi.advanceTimersByTimeAsync(LOCK_HELD_ERROR_MS - 1_000);
+    await vi.advanceTimersByTimeAsync(LOCK_ABORT_MS - 1_000);
     // Still held: the abort must not fire early, or a slow-but-progressing
     // section gets killed and its half-claimed runs have to be reaped.
     expect(describeHeldAgentStartLocks()).toHaveLength(1);
@@ -104,6 +107,53 @@ describe("agent start lock cancellation (PEN-3328)", () => {
     // Released by the `finally` in `runExclusively` — not by a separate path.
     expect(describeHeldAgentStartLocks()).toEqual([]);
   });
+
+  it(
+    "lets a section that passes the log-escalation threshold settle, instead of cancelling it",
+    async () => {
+      vi.useFakeTimers();
+      vi.spyOn(logger, "warn").mockImplementation(() => logger);
+      const error = vi.spyOn(logger, "error").mockImplementation(() => logger);
+      const agentId = randomUUID();
+
+      // A section that observes the signal and would reject instantly if
+      // aborted, but otherwise settles on its own — the "slow but settling"
+      // class that production measurement showed is the common case, not the
+      // exception. Over the gauge's first four days 21 of 23 agents held the
+      // lock past LOCK_HELD_ERROR_MS, peaking at 8073s, and those holds ended
+      // with no pod recreation and no container restart.
+      const work = deferred<string>();
+      const held = withAgentStartLock(
+        agentId,
+        async () => {
+          const signal = currentAgentStartLockSignal();
+          return await Promise.race([
+            work.promise,
+            new Promise<never>((_resolve, reject) => {
+              signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+            }),
+          ]);
+        },
+        coalesced,
+      );
+
+      // Well past the attention threshold — the operator-facing `error` line is
+      // expected here — but far short of the abort budget.
+      await vi.advanceTimersByTimeAsync(LOCK_HELD_ERROR_MS * 6);
+      expect(error).toHaveBeenCalled();
+      // The critical assertion: the section is still running. Cancelling here
+      // would not merely waste a pass — the dispatch demand is re-queued, so
+      // the retry would reach the same boundary and be cancelled again,
+      // turning a slow success into a permanent failure.
+      expect(describeHeldAgentStartLocks()).toHaveLength(1);
+      // `null` means no abort was ever recorded for this agent.
+      expect(describeAgentStartLockDispatchHealth(agentId)).toBeNull();
+
+      work.resolve("dispatched");
+      await expect(held).resolves.toBe("dispatched");
+      expect(describeHeldAgentStartLocks()).toEqual([]);
+    },
+  );
 
   it(
     "NEGATIVE CONTROL: a section that ignores the signal is not released, and no follow-up runs",
@@ -133,7 +183,7 @@ describe("agent start lock cancellation (PEN-3328)", () => {
       );
       void follower.catch(() => {});
 
-      await vi.advanceTimersByTimeAsync(4 * LOCK_HELD_ERROR_MS);
+      await vi.advanceTimersByTimeAsync(4 * LOCK_ABORT_MS);
 
       // These are the assertions that make the suite discriminate. If the
       // implementation ever "fixes" liveness by abandoning `fn` on a timer, the
@@ -201,7 +251,7 @@ describe("agent start lock cancellation (PEN-3328)", () => {
     // Five minutes of contention with the holder wedged. Before PEN-3328 this
     // window was unbounded; the point of the assertion is that it is bounded
     // WITHOUT the follow-up ever overlapping the holder.
-    await vi.advanceTimersByTimeAsync(LOCK_HELD_ERROR_MS + 1_000);
+    await vi.advanceTimersByTimeAsync(LOCK_ABORT_MS + 1_000);
     await secondFinished.promise;
 
     expect(await second).toBe("second-done");
@@ -225,7 +275,7 @@ describe("agent start lock cancellation (PEN-3328)", () => {
 
     const held = withAgentStartLock(agentId, abortableAwait, coalesced);
     void held.catch(() => {});
-    await vi.advanceTimersByTimeAsync(LOCK_HELD_ERROR_MS + 1_000);
+    await vi.advanceTimersByTimeAsync(LOCK_ABORT_MS + 1_000);
     await expect(held).rejects.toBeInstanceOf(AgentStartLockAbortedError);
 
     const health = describeAgentStartLockDispatchHealth(agentId);
@@ -236,7 +286,7 @@ describe("agent start lock cancellation (PEN-3328)", () => {
     expect(health?.reason).toMatch(/cancelled/i);
     expect(health?.reason).toMatch(/queued runs were not lost/i);
     expect(Date.parse(health!.abortedAt)).toBeGreaterThan(0);
-    expect(health?.heldMs).toBeGreaterThanOrEqual(LOCK_HELD_ERROR_MS);
+    expect(health?.heldMs).toBeGreaterThanOrEqual(LOCK_ABORT_MS);
 
     // The other half of the retention rule. This record *did* release, so it is
     // genuinely history and stops being reported once the window passes —
@@ -256,7 +306,7 @@ describe("agent start lock cancellation (PEN-3328)", () => {
 
     const held = withAgentStartLock(agentId, abortableAwait, coalesced);
     void held.catch(() => {});
-    await vi.advanceTimersByTimeAsync(LOCK_HELD_ERROR_MS + 1_000);
+    await vi.advanceTimersByTimeAsync(LOCK_ABORT_MS + 1_000);
     await expect(held).rejects.toBeInstanceOf(AgentStartLockAbortedError);
 
     // `paperclip_agent_start_lock_held_seconds` is gone by now — the lock was

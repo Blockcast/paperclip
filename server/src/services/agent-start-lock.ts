@@ -40,10 +40,17 @@ import { recordAgentStartLockAborted } from "./metrics.js";
  * PEN-3328 supplies the missing mechanism, and the shape of it is the whole
  * point. Each section gets an `AbortController` whose signal is published on
  * the async path ({@link currentAgentStartLockSignal}); past
- * `LOCK_HELD_ERROR_MS` the signal is aborted, which cancels the section's
+ * `LOCK_ABORT_MS` the signal is aborted, which cancels the section's
  * in-flight database work for real (see `agent-start-lock-db.ts`) so `fn`
  * *rejects* and the lock is released through the `finally` that was already
  * there.
+ *
+ * The abort threshold is deliberately separate from, and far above, the
+ * `LOCK_HELD_ERROR_MS` at which the log escalates — see `LOCK_ABORT_MS` for the
+ * production distribution that forced them apart. Aborting at the *attention*
+ * threshold would cancel sections that were going to finish, and because the
+ * cancelled work is re-queued and retried it would convert a slow success into
+ * a permanent failure.
  *
  * What this module deliberately does NOT do is stop awaiting `fn`. There is
  * still no timeout bypass. `runExclusively` awaits `execution` to completion
@@ -94,20 +101,53 @@ import { recordAgentStartLockAborted } from "./metrics.js";
 const LOCK_HELD_WARN_MS = 30_000;
 
 /**
- * Escalate the overrun log from `warn` to `error` — and abort the section
- * (PEN-3305 / PEN-3328) — past this.
+ * Escalate the overrun log from `warn` to `error` past this.
  *
- * A section that has held the lock for five minutes is no longer "falling
- * behind" — dispatch for that agent has stopped. Five minutes is well above any
- * legitimate section (the healthy case is sub-second) and well below the hours
- * a real wedge runs for.
- *
- * The log escalation and the abort deliberately share one threshold and one
- * timer tick: the moment we are willing to tell an operator that dispatch has
- * stopped is the moment we should be trying to restart it, and two thresholds
- * would let the log and the remedy disagree about when that is.
+ * This is an *attention* threshold, not a control action: it says "an operator
+ * should look", and being early costs nothing more than a log line. The
+ * `PaperclipAgentStartLockWedged` alert is pinned to this same number, where
+ * its `for: 5m` — not the threshold — is what keeps it quiet.
  */
 const LOCK_HELD_ERROR_MS = 5 * 60_000;
+
+/**
+ * Abort the section (PEN-3328) past this.
+ *
+ * ⚠️ This deliberately does NOT share {@link LOCK_HELD_ERROR_MS}. An earlier
+ * revision of this change used one number for both, reasoning that "the moment
+ * we tell an operator dispatch has stopped is the moment we should restart it",
+ * and justified 5 min as "well above any legitimate section (the healthy case
+ * is sub-second)". Production measurement refutes the premise that argument
+ * rested on. Over the first four days of `paperclip_agent_start_lock_held_seconds`
+ * (2026-09-21T16:32Z onward), `max by (agent_id) (max_over_time(...[4d]))`:
+ *
+ *   **21 of 23 agents exceeded 300 s**, peak 8073 s (2 h 14 m).
+ *
+ * Those long holds settle on their own. The 8070 s peak is a single correlated
+ * episode — three agents held concurrently, each series aging in lockstep,
+ * all released together — which ended with no pod recreation and no container
+ * restart, on a pod that kept serving for five more hours.
+ *
+ * So the section is not sub-second; it is routinely minutes and occasionally
+ * hours, and it finishes. That makes an abort at 5 min actively harmful, and
+ * not merely wasteful. Dispatch demand is preserved across an abort — the runs
+ * stay `queued` and a follow-up pass re-runs them — so cancelling a section
+ * that needs longer than the threshold does not drop the work, it *retries* it,
+ * and the retry is cancelled at the same boundary. A slow-but-succeeding
+ * dispatch would become a permanently-failing one: a livelock, and a worse
+ * outcome than the unbounded hold this change exists to fix.
+ *
+ * The threshold therefore has to clear the settling tail rather than the
+ * healthy median. Four hours is ~1.8x the worst observed settling episode and
+ * still bounds the PEN-3305 outage class (6-19 h of measured darkness) to a
+ * fraction of what it cost. Erring high is the cheap direction here: a late
+ * abort extends one agent's outage, an early one makes it permanent.
+ *
+ * ⚠️ These numbers stop being reproducible once this ships — holds past the
+ * abort boundary cease to exist by construction. Re-measure against the
+ * `paperclip_agent_start_lock_aborted_total` counter, not this gauge.
+ */
+const LOCK_ABORT_MS = 4 * 60 * 60_000;
 
 /**
  * How long a recorded abort stays visible on the agent after the fact.
@@ -192,7 +232,7 @@ export function currentAgentStartLockSignal(): AbortSignal | undefined {
 
 /**
  * Rejection raised into a dispatch section whose lock hold passed
- * `LOCK_HELD_ERROR_MS`.
+ * `LOCK_ABORT_MS`.
  *
  * Typed rather than a bare `Error` so callers can tell a cancelled dispatch
  * pass apart from a failed one. They are not the same event: a failure means
@@ -206,7 +246,7 @@ export class AgentStartLockAbortedError extends Error {
   constructor(agentId: string, heldMs: number) {
     super(
       `Queued-run dispatch for agent ${agentId} was aborted after holding the start lock for `
-      + `${Math.round(heldMs / 1000)}s (limit ${Math.round(LOCK_HELD_ERROR_MS / 1000)}s).`,
+      + `${Math.round(heldMs / 1000)}s (limit ${Math.round(LOCK_ABORT_MS / 1000)}s).`,
     );
     this.name = "AgentStartLockAbortedError";
     this.agentId = agentId;
@@ -288,33 +328,45 @@ async function runExclusively<T>(agentId: string, fn: () => Promise<T>): Promise
   // past LOCK_HELD_ERROR_MS separates "slow" from "stopped".
   let lastLoggedAtMs = startedAtMs;
   let loggedStopped = false;
+  let abortRequested = false;
+  const fields = (heldMs: number) => ({ agentId, heldMs, warnAfterMs: LOCK_HELD_WARN_MS });
   const warnTimer = setInterval(() => {
     const nowMs = Date.now();
     const heldMs = nowMs - startedAtMs;
     const stopped = heldMs >= LOCK_HELD_ERROR_MS;
-    // Past the error threshold the section is not coming back on its own, so
+    // Past the error threshold the section needs an operator's attention, so
     // back the cadence off from 30s to LOCK_HELD_ERROR_MS: a multi-hour wedge
     // should be loud enough to alert on, not thousands of identical lines.
     // Never delay the FIRST error though — that is the line an alert fires on,
     // and gating it behind the backoff would push it ~2x past the threshold.
+    //
+    // The abort is checked BEFORE this backoff returns, because the two
+    // thresholds are now far apart: LOCK_ABORT_MS lands mid-backoff, on a tick
+    // that would otherwise have been suppressed as a duplicate log line.
+    if (heldMs >= LOCK_ABORT_MS && !abortRequested) {
+      // Abort ONCE, and never stop awaiting `execution` because of it
+      // (PEN-3328). The abort is a request into the section, not a release of
+      // the lock: `fn` still has to settle before the next section starts, so
+      // mutual exclusion holds whether the abort lands or not.
+      abortRequested = true;
+      forgetExpiredAborts(nowMs);
+      lastAbortByAgent.set(agentId, { abortedAtMs: nowMs, heldMs, released: false });
+      recordAgentStartLockAborted(agentId);
+      abort.abort(new AgentStartLockAbortedError(agentId, heldMs));
+      lastLoggedAtMs = nowMs;
+      loggedStopped = true;
+      logger.error(
+        { ...fields(heldMs), errorAfterMs: LOCK_HELD_ERROR_MS, abortAfterMs: LOCK_ABORT_MS, aborted: true },
+        "agent start lock held past its abort budget; cancelling queued-run dispatch for this agent",
+      );
+      return;
+    }
     if (stopped && loggedStopped && nowMs - lastLoggedAtMs < LOCK_HELD_ERROR_MS) return;
     lastLoggedAtMs = nowMs;
-    const fields = { agentId, heldMs, warnAfterMs: LOCK_HELD_WARN_MS };
     if (stopped) {
-      // Abort on the FIRST error tick only, and never stop awaiting `execution`
-      // because of it (PEN-3328). The abort is a request into the section, not
-      // a release of the lock: `fn` still has to settle before the next section
-      // starts, so mutual exclusion holds whether the abort lands or not.
-      if (!loggedStopped) {
-        forgetExpiredAborts(nowMs);
-        lastAbortByAgent.set(agentId, { abortedAtMs: nowMs, heldMs, released: false });
-        recordAgentStartLockAborted(agentId);
-        abort.abort(new AgentStartLockAbortedError(agentId, heldMs));
-      }
-      loggedStopped = true;
-      // Reaching a LATER tick at all means the section is STILL held, i.e. the
-      // abort did not land — either the section's current await is not database
-      // work, or `cancel()` was issued and did not take.
+      // Reaching a tick after the abort means the section is STILL held, i.e.
+      // the abort did not land — either the section's current await is not
+      // database work, or `cancel()` was issued and did not take.
       //
       // There is deliberately no retry count here, because there are no
       // retries: postgres.js `Query#cancel()` disarms itself on the first call,
@@ -327,12 +379,13 @@ async function runExclusively<T>(agentId: string, fn: () => Promise<T>): Promise
       // would only ever report attempts that did nothing. See "What it does not
       // cover" in `agent-start-lock-db.ts` for why that is reported rather than
       // rescued.
+      loggedStopped = true;
       logger.error(
-        { ...fields, errorAfterMs: LOCK_HELD_ERROR_MS, aborted: true },
+        { ...fields(heldMs), errorAfterMs: LOCK_HELD_ERROR_MS, abortAfterMs: LOCK_ABORT_MS, aborted: abortRequested },
         "agent start lock held far past its budget; queued-run dispatch for this agent has stopped",
       );
     } else {
-      logger.warn(fields, "agent start lock held longer than expected; queued-run dispatch is falling behind");
+      logger.warn(fields(heldMs), "agent start lock held longer than expected; queued-run dispatch is falling behind");
     }
   }, LOCK_HELD_WARN_MS);
   warnTimer.unref?.();
