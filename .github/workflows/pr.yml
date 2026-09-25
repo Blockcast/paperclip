@@ -1361,7 +1361,11 @@ jobs:
       - name: Verify provenance version
         run: |
           set -euo pipefail
-          doc=$(sed -n 's/^| Current version | `\([^`]*\)`.*/\1/p' PROVENANCE.md | head -1)
+          # `{p;q}` rather than `| head -1`: under `set -o pipefail` a sed that
+          # keeps writing after head exits fails the step on SIGPIPE. Safe today
+          # only because there is exactly one matching row — a property of the
+          # document, not of the pipeline.
+          doc=$(sed -n '/^| Current version |/{s/^| Current version | `\([^`]*\)`.*/\1/p;q}' PROVENANCE.md)
           if [ -z "$doc" ]; then
             echo "::error::No 'Current version' row found in PROVENANCE.md."
             exit 1

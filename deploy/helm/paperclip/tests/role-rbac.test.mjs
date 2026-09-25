@@ -95,6 +95,22 @@ test("paperclip-k8s-adapters Role grants secrets:update for createOrAdoptRunSecr
   );
 });
 
+test("paperclip-k8s-adapters Role grants secrets:list for the BLO-21857 orphan-Secret sweep", () => {
+  // sweepOrphanedRunSecrets (vendor/paperclip-adapter-claude-k8s/src/server/
+  // secret-sweep.ts) opens with listNamespacedSecret under a label selector.
+  // Without `list` that first call 403s, createSweepGate's catch swallows it as
+  // non-fatal, and maybeSweep returns null on every replica forever — so the
+  // sweep ships inert. Pin it, because this regression is *invisible*: a sweep
+  // that 403s and a sweep that finds zero orphans both delete nothing and both
+  // leave the orphan gauge flat, so the feature's own dashboard cannot
+  // distinguish them. Same shape as the pods:delete pin above.
+  const verbs = secretsVerbs(renderRole());
+  assert.ok(
+    verbs.includes("list"),
+    `secrets verbs must include "list" for sweepOrphanedRunSecrets' listNamespacedSecret (got: [${verbs.join(", ")}])`,
+  );
+});
+
 test("paperclip-k8s-adapters Role retains secrets:create + secrets:patch", () => {
   // update is additive: create still mints the per-run Secret, and patch is
   // still the verb used for the mid-run updates at claude-k8s execute.js:884 /
