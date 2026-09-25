@@ -364,6 +364,26 @@ describe("classifyGuard — the four PEN-3379 production false positives", () =>
     assert.match(result.detail, /2026-09-14T04:00:01Z/);
   });
 
+  // Exactly ON the bar is past it (`>=`): 12:05Z -> 14:50Z is 165m against the
+  // 2.75h threshold. `>` in place of `>=` turns this stop into a suppression.
+  it("still reds a stopped guard whose newer cross-check sits exactly on the bar", () => {
+    const now = Date.parse("2026-09-18T14:50:00Z");
+    const result = classifyGuard(
+      "relay-ssl-multicert-guard.yml",
+      {
+        state: "active",
+        name: "Relay SSL Multicert",
+        newest: { updatedAt: "2026-09-18T11:00:00Z", conclusion: "success", htmlUrl: "https://x" },
+        crossCheck: { newestCompletedAt: "2026-09-18T12:05:00Z" },
+      },
+      { now, staleHours: thresholdFor("relay-ssl-multicert-guard.yml") },
+    );
+
+    assert.equal(result.status, "stale");
+    assert.equal(result.reason, "stopped");
+    assert.match(result.detail, /2026-09-18T12:05:00Z/);
+  });
+
   // Absence of corroboration is not agreement. A permanently failing second
   // read must not become a mute switch.
   it("leaves the red standing, annotated, when the cross-check cannot be read", () => {
@@ -615,6 +635,16 @@ describe("classifyGuard — 'never completed' rests on the same distrusted index
 
     assert.equal(result.status, "unknown");
     assert.equal(result.reason, "cross-check-disagreement");
+  });
+
+  // The other side of that minute: EXACTLY on the bar (12:05Z, 165m) is past it,
+  // a stop and not a suppression. `<=` in place of `<` mutes it.
+  it("reds as stopped when the cross-check completion sits exactly on the bar", () => {
+    const result = neverCompleted({ newestCompletedAt: "2026-09-18T12:05:00Z" });
+
+    assert.equal(result.status, "stale");
+    assert.equal(result.reason, "stopped");
+    assert.equal(result.ageMinutes, 165);
   });
 
   // A present-but-unparsable timestamp is not corroboration. It falls through to
