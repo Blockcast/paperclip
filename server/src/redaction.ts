@@ -1,5 +1,5 @@
 import { redactCommandText } from "@paperclipai/adapter-utils";
-import { envBindingSecretRefSchema, envBindingUserSecretRefSchema } from "@paperclipai/shared";
+import { envBindingSecretRefSchema, envBindingUserSecretRefSchema, REDACTED_VALUE_SENTINEL } from "@paperclipai/shared";
 
 /**
  * Tier 1: key-name stems with no ambiguous benign reading (BLO-20810 / CEO
@@ -191,7 +191,7 @@ const SECRET_TEXT_HINTS = [
   "xox",
   "github_pat_",
 ] as const;
-export const REDACTED_EVENT_VALUE = "***REDACTED***";
+export const REDACTED_EVENT_VALUE = REDACTED_VALUE_SENTINEL;
 
 function maybeContainsSecretText(input: string) {
   const lower = input.toLowerCase();

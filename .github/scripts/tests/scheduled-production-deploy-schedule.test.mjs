@@ -17,7 +17,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { selectStuckApproval } from '../post-pending-deploy-alert.mjs';
-import { REFILLING_OUTCOMES } from '../deploy-stall-record.mjs';
+import { DEPLOY_WORKFLOW_FILE, REFILLING_OUTCOMES } from '../deploy-stall-record.mjs';
 
 const WORKFLOW = 'scheduled-production-deploy.yml';
 const DAILY_CRON = '23 7 * * *';
@@ -40,6 +40,26 @@ const code = workflow
   .join('\n');
 
 const crons = [...code.matchAll(/^\s*- cron:\s*["']([^"']+)["']/gm)].map((m) => m[1]);
+
+/**
+ * The entries of the workflow's TOP-LEVEL `permissions:` block, in order.
+ *
+ * Scoped deliberately. Matching `actions:\s*write` against the whole file lets a
+ * grant declared in an unrelated job — or merely discussed in a comment — satisfy
+ * an assertion whose message claims the workflow itself holds it. Parsed from
+ * `code`, so the header's own prose about these permissions cannot stand in for
+ * them either.
+ */
+const topLevelPermissions = (() => {
+  const block = code.split(/^permissions:\n/m)[1] ?? '';
+  const granted = [];
+  for (const line of block.split('\n')) {
+    if (!/^ {2}\S/.test(line)) break; // first non-entry line ends the block
+    const entry = line.replace(/#.*$/, '').trim();
+    if (entry) granted.push(entry);
+  }
+  return granted;
+})();
 
 /** Expand a cron hour field ("7", "*", "0-6,8-23") to the hours it matches. */
 const hours = (cron) => {
@@ -264,6 +284,7 @@ test('the workflow grants exactly the permissions the new paths need, and no mor
     if (entry) granted.push(entry);
   }
   assert.deepEqual(granted, ['contents: read', 'actions: write', 'issues: write']);
+  assert.deepEqual(topLevelPermissions, granted, 'the shared parser must agree');
 });
 
 // PEN-3315. The supersede resets the pending run's age by construction — it
@@ -455,4 +476,61 @@ test('every outcome the close step fires on is classified by the resolver', () =
     nonPending.filter((outcome) => REFILLING_OUTCOMES.has(outcome)).sort(),
     ['dispatched', 'up-to-date'],
   );
+});
+
+// ---------------------------------------------------------------------------
+// The stall clock is derived from run history (deploy-stall-chain.mjs), which
+// needs the waiting run's head to test whether a cancelled predecessor is a
+// strict ancestor of it. That head arrives only through the pending-runs JSON
+// this workflow writes, and dropping the field would make the derivation
+// silently fall back to run-only ageing — which is the exact 2026-09-18
+// under-report (a 46h stall reported as 3.0h on a green run) that it fixes.
+// Unobservable until a deploy is already stuck for hours.
+// ---------------------------------------------------------------------------
+
+test('the pending-runs JSON carries headSha for the stall-clock derivation', () => {
+  const jsonFields = workflow.match(/--json\s+([A-Za-z,]+)\s*\\/g) ?? [];
+  const pendingQuery = jsonFields.find((line) => line.includes('status'));
+  assert.ok(pendingQuery, 'expected a --json query selecting the pending dispatch fields');
+  for (const field of ['databaseId', 'status', 'createdAt', 'url', 'headSha']) {
+    assert.match(
+      pendingQuery,
+      new RegExp(`\\b${field}\\b`),
+      `pending-runs JSON must select ${field}`,
+    );
+  }
+});
+
+test('the escalation step can read run history for the supersede chain', () => {
+  // The derivation calls GET /actions/workflows/docker.yml/runs and GET
+  // /compare. Both are `actions: read` / `contents: read`, which the workflow
+  // already holds — assert it has not been narrowed below what the chain needs.
+  // Block-scoped: a grant on some unrelated job would not give the ESCALATION
+  // step these, so a whole-file match would pass while the chain read 403s.
+  assert.ok(topLevelPermissions.length > 0, 'workflow must declare top-level permissions');
+  assert.ok(
+    topLevelPermissions.includes('actions: write'),
+    'cancel+dispatch still needs actions: write',
+  );
+  assert.ok(
+    topLevelPermissions.includes('contents: read'),
+    'compare needs contents: read',
+  );
+});
+
+test('the dispatcher and DEPLOY_WORKFLOW_FILE name the same workflow', () => {
+  // The shell here spells the workflow independently of the JS constant, and
+  // nothing else compares them. Rename docker.yml and you get a 404 approve
+  // link in the alert with correct-looking prose, or the reverse — both of
+  // which read as working. `code` is comment-stripped, so the file's own prose
+  // about docker.yml cannot satisfy this.
+  const invocations = [...code.matchAll(/--workflow=(\S+)/g)].map((m) => m[1]);
+  assert.ok(invocations.length > 0, 'the dispatcher must query the deploy workflow by name');
+  for (const workflowFile of invocations) {
+    assert.equal(
+      workflowFile,
+      DEPLOY_WORKFLOW_FILE,
+      `dispatcher queries ${workflowFile} but the scripts build urls for ${DEPLOY_WORKFLOW_FILE}`,
+    );
+  }
 });

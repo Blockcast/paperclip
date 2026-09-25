@@ -479,7 +479,11 @@ export type IssueProductivityReviewTrigger =
   | "no_comment_streak"
   | "long_active_duration"
   | "high_churn"
-  | "runtime_failure_streak";
+  | "runtime_failure_streak"
+  // BLO-27698 B3b: one still-live run has held its turn longer than the
+  // long-active bar. Kept distinct from `long_active_duration`, which measures
+  // time nobody was accounting for.
+  | "runaway_execution";
 
 export interface IssueProductivityReview {
   reviewIssueId: string;

@@ -119,6 +119,23 @@ export type RecoveryActionListItem = {
   outcome: string | null;
   createdAt: Date;
   updatedAt: Date;
+  /**
+   * BLO-19124: `status` alone is NOT a routing outcome, and reading it as one is a
+   * measured misread, not a hypothetical. Company-wide, `status = 'resolved'` is a
+   * single narrow transition that `classifyRecoveryHandoff` never reads — so
+   * counting it produced "resolves 1 action in 200", while ~2,546 `cancelled`
+   * actions in the same pool carried a real routing class. This list shipped
+   * projecting `status` only, which reproduces that same misread per-owner.
+   *
+   * `resolutionSnapshot` is the classifier's input, returned alongside its verdict
+   * so a consumer can audit the class without a second query. It is the action's
+   * own evidence snapshot, NOT a live read of the source issue: reading the issue
+   * live made the class flip long after the action stopped changing (BLO-33600).
+   * `null` means the action resolved before that capture shipped, which is why
+   * such rows classify `unknown` rather than being re-derived from live state.
+   */
+  resolutionSnapshot: RecoveryResolutionSnapshot | null;
+  handoffClass: HandoffClass;
 };
 
 export type RecoveryActionListOptions = {
@@ -179,6 +196,36 @@ type RecoveryActionFacts = {
 
 const ACTIVE_STATUSES = new Set(["active", "escalated"]);
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "in_review"]);
+
+/**
+ * The classifier's input, projected once so every caller reads the snapshot the
+ * same way. The existence probe keys on the assignee key alone because capture
+ * writes both keys in a single jsonb merge with explicit `?? null`
+ * (`issue-recovery-actions.ts`), so the key is present-with-null — never absent
+ * — whenever capture ran. That distinguishes "resolved before capture shipped"
+ * (no snapshot, classified `unknown`) from "captured a null assignee".
+ */
+const resolutionSnapshotColumns = {
+  hasResolutionSnapshot: sql<boolean>`${issueRecoveryActions.evidence} ? ${RESOLVED_ASSIGNEE_AGENT_ID_EVIDENCE_KEY}`,
+  resolvedAssigneeAgentId: sql<
+    string | null
+  >`${issueRecoveryActions.evidence} ->> ${RESOLVED_ASSIGNEE_AGENT_ID_EVIDENCE_KEY}`,
+  resolvedIssueStatus: sql<
+    string | null
+  >`${issueRecoveryActions.evidence} ->> ${RESOLVED_ISSUE_STATUS_EVIDENCE_KEY}`,
+} as const;
+
+type ResolutionSnapshotRow = {
+  hasResolutionSnapshot: boolean;
+  resolvedAssigneeAgentId: string | null;
+  resolvedIssueStatus: string | null;
+};
+
+function toResolutionSnapshot(row: ResolutionSnapshotRow): RecoveryResolutionSnapshot | null {
+  return row.hasResolutionSnapshot
+    ? { assigneeAgentId: row.resolvedAssigneeAgentId, issueStatus: row.resolvedIssueStatus }
+    : null;
+}
 
 /**
  * Classify a recovery action by who ended up owning the deliverable work.
@@ -266,7 +313,7 @@ export function recoveryObservabilityService(db: Db) {
 
     const limit = Math.min(500, Math.max(1, Math.floor(opts.limit ?? 100)));
     const offset = Math.max(0, Math.floor(opts.offset ?? 0));
-    return db
+    const rows = await db
       .select({
         id: issueRecoveryActions.id,
         sourceIssueId: issueRecoveryActions.sourceIssueId,
@@ -290,6 +337,7 @@ export function recoveryObservabilityService(db: Db) {
         outcome: issueRecoveryActions.outcome,
         createdAt: issueRecoveryActions.createdAt,
         updatedAt: issueRecoveryActions.updatedAt,
+        ...resolutionSnapshotColumns,
       })
       .from(issueRecoveryActions)
       .innerJoin(issues, eq(issues.id, issueRecoveryActions.sourceIssueId))
@@ -306,6 +354,24 @@ export function recoveryObservabilityService(db: Db) {
       )
       .limit(limit)
       .offset(offset);
+
+    // Same pure classifier the company-wide report uses, over inputs projected by
+    // the same `resolutionSnapshotColumns` / `toResolutionSnapshot` pair, so the
+    // per-owner list and the aggregate can never disagree about a given row.
+    return rows.map(
+      ({ hasResolutionSnapshot, resolvedAssigneeAgentId, resolvedIssueStatus, ...row }) => {
+        const resolutionSnapshot = toResolutionSnapshot({
+          hasResolutionSnapshot,
+          resolvedAssigneeAgentId,
+          resolvedIssueStatus,
+        });
+        return {
+          ...row,
+          resolutionSnapshot,
+          handoffClass: classifyRecoveryHandoff({ ...row, resolutionSnapshot }),
+        };
+      },
+    );
   }
 
   async function report(
@@ -409,13 +475,7 @@ export function recoveryObservabilityService(db: Db) {
         outcome: issueRecoveryActions.outcome,
         ownerAgentId: issueRecoveryActions.ownerAgentId,
         returnOwnerAgentId: issueRecoveryActions.returnOwnerAgentId,
-        hasResolutionSnapshot: sql<boolean>`${issueRecoveryActions.evidence} ? ${RESOLVED_ASSIGNEE_AGENT_ID_EVIDENCE_KEY}`,
-        resolvedAssigneeAgentId: sql<
-          string | null
-        >`${issueRecoveryActions.evidence} ->> ${RESOLVED_ASSIGNEE_AGENT_ID_EVIDENCE_KEY}`,
-        resolvedIssueStatus: sql<
-          string | null
-        >`${issueRecoveryActions.evidence} ->> ${RESOLVED_ISSUE_STATUS_EVIDENCE_KEY}`,
+        ...resolutionSnapshotColumns,
       })
       .from(issueRecoveryActions)
       .innerJoin(issues, eq(issues.id, issueRecoveryActions.sourceIssueId))
@@ -432,9 +492,7 @@ export function recoveryObservabilityService(db: Db) {
       outcome: row.outcome,
       ownerAgentId: row.ownerAgentId,
       returnOwnerAgentId: row.returnOwnerAgentId,
-      resolutionSnapshot: row.hasResolutionSnapshot
-        ? { assigneeAgentId: row.resolvedAssigneeAgentId, issueStatus: row.resolvedIssueStatus }
-        : null,
+      resolutionSnapshot: toResolutionSnapshot(row),
     }));
 
     const handoff: RecoveryHandoffSummary = {

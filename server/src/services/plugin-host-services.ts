@@ -2640,6 +2640,46 @@ export function buildHostServices(
         }
         return comment;
       },
+      async updateComment(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
+        // Same namespacing as `createComment` above, and it has to be: this
+        // looks the row up by the stored key, so an un-namespaced lookup would
+        // not find the plugin's own comment — and a raw natural key would reach
+        // *another* plugin's comment, or a server-internal one, and rewrite its
+        // body. The namespace is what makes "locate by key" also mean "and it is
+        // mine". If the create-side namespace is ever re-keyed, this must move
+        // with it or every edit silently becomes a no-op.
+        const callerIdempotencyKey = readNonEmptyParam(params.idempotencyKey);
+        if (!callerIdempotencyKey) {
+          throw new Error("issues.updateComment requires a non-empty idempotencyKey");
+        }
+        const comment = await issues.updateCommentByIdempotencyKey(
+          params.issueId,
+          `plugin:${pluginId}:${callerIdempotencyKey}`,
+          params.body,
+          { agentId: params.authorAgentId },
+        );
+        // A miss is the ordinary "no comment of mine to edit" answer (keyless
+        // legacy row, soft-deleted mirror, never created), not an error — the
+        // caller's fallback is to create instead, so returning null keeps that
+        // one round-trip rather than routing it through a catch.
+        if (!comment) return null;
+        await logPluginActivity({
+          companyId,
+          action: "issue.comment.updated",
+          entityType: "issue",
+          entityId: issue.id,
+          actor: { actorAgentId: params.authorAgentId ?? null },
+          details: {
+            identifier: issue.identifier,
+            commentId: comment.id,
+            bodySnippet: comment.body.slice(0, 120),
+          },
+        });
+        return comment;
+      },
       async createInteraction(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);

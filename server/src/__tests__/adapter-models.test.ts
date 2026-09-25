@@ -99,6 +99,8 @@ describe("adapter model listing", () => {
     expect(models).toEqual(claudeFallbackModels);
     expect(models.some((model) => model.id === "claude-opus-5")).toBe(true);
     expect(models.some((model) => model.id === "claude-opus-5[1m]")).toBe(true);
+    expect(models.some((model) => model.id === "claude-opus-5-5")).toBe(true);
+    expect(models.some((model) => model.id === "claude-opus-5-5[1m]")).toBe(true);
     expect(models.some((model) => model.id === "claude-opus-4-8")).toBe(true);
     // Newer flagship models are offered, but Opus 4.8 stays the default (first) option.
     expect(models[0]?.id).toBe("claude-opus-4-8");

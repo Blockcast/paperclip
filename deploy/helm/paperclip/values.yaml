@@ -269,6 +269,36 @@ githubApp:
   # that still requires the old name satisfied. Comma-separated.
   prCommentReviewGateRetiredStatusContexts: ""
 
+# -- Evidence-gate rollout flags. See docs/runbooks/evidence-gate-unlabeled-block.md.
+evidenceGate:
+  # -- Must be the string "0" or "1" — an unquoted YAML bool renders "true",
+  # which the server reads as OFF. The chart fails the render rather than let
+  # that pass silently.
+  #
+  # "1" escalates `warn` to `block` at the `in_review` transition when the gap
+  # is made ENTIRELY of truth shapes and CONTAINS `review:ally-clean`. Note the
+  # second half is `.some()`, not an exact match, so the predicate survives a
+  # future registry that re-requires a second truth shape. Today that is a
+  # no-op: `deploy:landed` is required nowhere (CTO ruling 2026-09-17), so it
+  # can never enter `missing` and a truth-only gap is always exactly
+  # `["review:ally-clean"]`.
+  #
+  # Reads "0" until PR #1857 is deployed — that is what registers the truth
+  # shapes and teaches loadConfig this variable. Setting "1" before then
+  # changes nothing, and every number in the runbook's measurement reads a
+  # structural zero.
+  #
+  # Two populations are always suppressed, at every value: a failed GitHub probe
+  # (an outage must not freeze `in_review` estate-wide) and an issue with no
+  # linked pull request (no head to review means the shape is unsatisfiable by
+  # the assignee forever).
+  #
+  # `deploy:landed` is never blocking at any value of this flag: the gate runs
+  # only on the transition INTO `in_review` and `deploy:landed` means merged, so
+  # it is unsatisfiable at the one moment it is evaluated. Keep "0" until the
+  # runbook's baseline, seven-day measurement and flip criteria pass.
+  unlabeledTruthBlock: "0"
+
 # -- Pod spec knobs.
 pod:
   # -- Share the process namespace so tini (pid 1) reaps orphaned child processes spawned by Claude agents.
@@ -627,6 +657,10 @@ prometheusRule:
   recoveryHorizonNoWakeToCurrentOwnerPagePerDay: 5
   # -- How long the high no-wake-to-current-owner count must be sustained before paging.
   recoveryHorizonNoWakeToCurrentOwnerPageFor: 1h
+  # -- How long heartbeat_runs_crash_recovery_pending_idx must read absent/invalid before warning (BLO-21526). Short: the gauge is re-derived from pg_class every periodic scheduler tick and only ever reads 0 on a tier that actually probed the catalog, so a 0 is already a settled reading rather than a transient.
+  crashRecoveryCandidateIndexMissingFor: 15m
+  # -- absent_over_time window for the crash-recovery index gauge: warn when NO pod has published it for this long (BLO-21526). Deliberately much wider than Prometheus's 5m lookback delta, because a rolling deploy publishes nothing until the first periodic tick on the new pod and paging on ordinary rollouts would train the fleet to ignore the alert. Catches sustained blindness (probe throwing, tier down, scrape broken), not a restart. Used as a range window, not a `for:` — see the rule comment.
+  crashRecoveryCandidateIndexUnobservableFor: 1h
   # -- Warn when more than this many ac-* agent pods are Unschedulable for unschedulableFor (node-pool scheduling starvation, BLO-16224). Reuses agentJobNameRegex to match agent pods.
   unschedulablePodThreshold: 0
   # -- How long agent pods must stay Unschedulable before warning (transient blips self-resolve; this catches sustained starvation).
@@ -679,6 +713,12 @@ prometheusRule:
   externalRuntimeReservationStrandMetricsRefreshFailureFor: 5m
   # -- Runbook for the stranded-reservation and metric-freshness alerts, linked from their annotations.
   externalRuntimeReservationStrandedRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/external-runtime-reservation-stranded.md"
+  # -- How long a single per-agent start lock may be held before firing (PEN-3305). Compared against paperclip_agent_start_lock_held_seconds, which the server publishes only for locks held at scrape time. Set to 300 because that is LOCK_HELD_ERROR_MS in server/src/services/agent-start-lock.ts -- the boundary at which the code itself stops calling the hold "slow" and logs "queued-run dispatch for this agent has stopped". Deliberately the SAME number rather than an independently-chosen one, so the log line an operator finds and the alert that woke them cannot disagree; if that constant moves, move this with it. NOT fitted to observed hold durations: there is no distribution to fit, because a healthy section is sub-second and the pathological one is unbounded (measured holds of 6-19 h). `for:` below stacks on top, so the first real-clock fire is at 300 + 300 = 600s of continuous hold.
+  agentStartLockHeldSeconds: 300
+  # -- Scrape-flap tolerance only (PEN-3305). The ageing lives in agentStartLockHeldSeconds above; it stacks on top of that threshold rather than testing independently, same reasoning as queuedRunStrandedFor. Unlike the sibling alerts there is no refresh-freshness gate to ride out here -- this gauge is a synchronous map walk on the scrape path -- so this window is purely "hold it across a couple of scrapes before paging".
+  agentStartLockHeldFor: 5m
+  # -- Runbook for the wedged-start-lock alert, linked from its annotation.
+  agentStartLockWedgedRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/queued-run-stranded.md#agent-start-lock-wedged-pen-3305"
   # -- Rolling window and hold time for PR-review queue-wait saturation.
   prReviewQueueWaitWindow: 6h
   prReviewQueueWaitFor: 10m

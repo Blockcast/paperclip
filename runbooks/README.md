@@ -36,6 +36,10 @@ platform cannot resolve automatically. Each runbook should be:
   recover a stranded SSH-driven run whose workspace import is failing on a
   sibling task's leftover scratch state. Trigger: blocked issue auto-comment
   cites `workspace_import_conflict` or tar `Cannot open: File exists`.
+- [`grafana-dashboard-as-code.md`](grafana-dashboard-as-code.md) — add or
+  change a Grafana panel by PR, with no Grafana UI access and no Grafana
+  credential. Trigger: a `paperclip_*` metric is scraped but nothing charts
+  it, or you are about to ask a human to edit a dashboard by hand.
 - [`k8s-live-job-block-guard.md`](k8s-live-job-block-guard.md) — the
   terminal-run/live-Job admission race invariant: a run can never go
   terminal `k8s_concurrent_run_blocked` while its own run-scoped Job is
@@ -60,6 +64,16 @@ platform cannot resolve automatically. Each runbook should be:
   snapshot cannot be refreshed safely. Trigger: alert
   `PaperclipQueuedRunStranded`, `PaperclipQueuedRunAgeMetricsRefreshFailed`,
   or `max(paperclip_queued_run_oldest_age_seconds) by (agent_id) > 1800`.
+- [`queued-run-stranded.md#agent-start-lock-wedged-pen-3305`](queued-run-stranded.md#agent-start-lock-wedged-pen-3305) —
+  an agent has held its per-agent dispatch start lock past the point the code
+  itself calls dispatch stopped. This is the *cause* side of the alert above:
+  the lock has no timeout by design, so the agent dispatches nothing until the
+  section settles or the process is replaced, while `status: idle` /
+  `errorReason: null` / `orgChainHealth: healthy` all read normal. Trigger:
+  alert `PaperclipAgentStartLockWedged`, or
+  `max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 300`
+  (threshold quoted for readability; `values.yaml`
+  `prometheusRule.agentStartLockHeldSeconds` is authoritative).
 - [`queued-run-stranded.md#overdue-scheduled-retry-blo-22094`](queued-run-stranded.md#overdue-scheduled-retry-blo-22094) —
   a `heartbeat_runs` row parked at `status='scheduled_retry'` past its own due
   time, never promoted: the retry-promotion sweep either wedged or is

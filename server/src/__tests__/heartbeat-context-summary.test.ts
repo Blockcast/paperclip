@@ -11,7 +11,7 @@ import {
 } from "../services/heartbeat.js";
 import {
   recoveryRunWriteClassNotice,
-  statusOnlyRecoveryResumeGuidance,
+  STATUS_ONLY_RESUME_PREAMBLE,
   withRecoveryModelProfileHint,
 } from "../services/recovery/model-profile-hint.js";
 
@@ -2563,8 +2563,8 @@ describe("buildPaperclipTaskMarkdown run write-containment notice", () => {
     expect(markdown).toContain("Run write-containment notice:");
     expect(markdown).toContain("cheap status-only recovery run");
     expect(markdown).toContain("`request_board_approval`");
-    // The exits, carried verbatim from the 403's guidance.
-    expect(markdown).toContain(statusOnlyRecoveryResumeGuidance(STATUS_ONLY_SNAPSHOT).resumeGuidance);
+    // The "waiting never ends" clause, carried verbatim from the 403's shared guidance.
+    expect(markdown).toContain(STATUS_ONLY_RESUME_PREAMBLE);
   });
 
   // The no-source text reaches this frame on an ordinary run — `resolveStaleRunSourceIssue`
@@ -2579,9 +2579,9 @@ describe("buildPaperclipTaskMarkdown run write-containment notice", () => {
 
     expect(markdown).toContain("Run write-containment notice:");
     expect(markdown).toContain("no approval write available at all");
-    expect(markdown).toContain(
-      statusOnlyRecoveryResumeGuidance(STATUS_ONLY_NO_SOURCE_SNAPSHOT).resumeGuidance,
-    );
+    expect(markdown).toContain(STATUS_ONLY_RESUME_PREAMBLE);
+    // The shared constant's own exit clause is unconditional, so the frame must not carry it here.
+    expect(markdown).not.toContain("You may also file a `request_board_approval`");
     expect(markdown).not.toMatch(/only approval write this run can perform/);
   });
 

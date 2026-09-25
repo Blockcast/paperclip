@@ -80,6 +80,7 @@ const {
     publishAgentLivenessGauges: vi.fn(async () => {}),
     publishGithubReviewDeadLetterGauge: vi.fn(async () => {}),
     publishAgentWakeupTerminalFailedGauge: vi.fn(async () => {}),
+    publishCrashRecoveryCandidateIndexGauge: vi.fn(async () => true),
     tickTimers: vi.fn(async () => ({ checked: 0, enqueued: 0, skipped: 0 })),
   };
   const heartbeatServiceFactoryMock = vi.fn(() => heartbeatServiceMock);
@@ -570,6 +571,58 @@ describe("startServer feedback export wiring", () => {
     }
   });
 
+  // BLO-21526 (Ally round 1 on #1933): the crash-recovery candidate-index
+  // gauge's only publisher was the gate read inside `reconcileWorkerCrashedRuns`,
+  // whose periodic call site sits below the suppression gate AND behind the
+  // `crashReconcileSweepInFlight` latch — so a suppressed replica published
+  // nothing, and the series was never published during startup recovery at
+  // all. That matters more than for the BLO-31335 gauges: suppression includes
+  // `database_restore_in_progress`, and a restored database is a leading way
+  // to end up WITHOUT the index. A cleared series also makes the `== 0`
+  // Missing alert structurally silent, leaving only Unobservable, whose
+  // remediation names three things that all look healthy under a restore.
+  it("publishes the crash-recovery candidate-index gauge on a suppressed tick, without reaching the reconcile pass", async () => {
+    const schedulerIntervalMs = 30000;
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: schedulerIntervalMs,
+    }));
+    resolveHeartbeatSchedulingSuppressionMock.mockReturnValue({
+      suppressed: true,
+      reason: "database_restore_in_progress",
+    });
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void, delay?: number) => {
+        if (delay === schedulerIntervalMs) intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    try {
+      await startServer();
+
+      // Pre-tick control, with the same caveat as the sibling tests: under
+      // suppression `startServer` skips startup recovery entirely, so this
+      // establishes only that any call seen below came FROM the tick.
+      expect(heartbeatServiceMock.publishCrashRecoveryCandidateIndexGauge).not.toHaveBeenCalled();
+
+      expect(intervalCallback).not.toBeNull();
+      intervalCallback?.();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // The point of the fix. Removing the ungated registration in index.ts
+      // must fail exactly here.
+      expect(heartbeatServiceMock.publishCrashRecoveryCandidateIndexGauge).toHaveBeenCalledTimes(1);
+      // ...and it got there without the gated pass that used to be its only
+      // publisher being reached at all.
+      expect(heartbeatServiceMock.reconcileWorkerCrashedRuns).not.toHaveBeenCalled();
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
   // BLO-33539 (Ally round 1): the undeliverable-monitor reconciler is a
   // producer-agnostic backstop, so it must not be a link in the long serial
   // recovery chain — that chain has a single terminal catch, and the
@@ -693,6 +746,14 @@ describe("startServer feedback export wiring", () => {
       // but its position relative to the *recovery* gate is a behaviour change
       // of this diff (it used to sit below) and is only covered here.
       expect(heartbeatServiceMock.publishAgentLivenessGauges).toHaveBeenCalledTimes(1);
+      // BLO-21526 (Ally round 2 on #1933): FOUR publishers now. The suppressed
+      // sibling test above pins this gauge against the suppression gate only —
+      // it never starts recovery, so it cannot see the recovery gate at all.
+      // This is the case the comment at index.ts claims and nothing asserted:
+      // a tick fired while `heartbeatStartupRecoveryPending` is true must
+      // still publish. It is the longer window of the two, because a boot
+      // lasts minutes where a suppressed tick lasts one interval.
+      expect(heartbeatServiceMock.publishCrashRecoveryCandidateIndexGauge).toHaveBeenCalledTimes(1);
       // Control that the recovery guard really is still closed. Without this the
       // test could pass for the trivial reason that recovery had already
       // drained, proving nothing about where the registrations sit.
@@ -1011,6 +1072,119 @@ describe("startServer feedback export wiring", () => {
       );
     } finally {
       releaseReconciliation?.();
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  // BLO-34207 / BLO-34471: `heartbeatRecoveryChainInFlight` single-flights the
+  // lock-taking recovery tail across ticks. That latch is the whole mechanism
+  // bounding the convoy — a tail pass walks 147 stranded candidates
+  // sequentially, each taking the company-wide issue-graph advisory lock,
+  // against a 30 s tick, so two overlapping passes contend with EACH OTHER and
+  // starve `POSTGRES_POOL_MAX=10`. It had no regression guard, which is the
+  // "test passes while missing the real failure mode" shape: every other test
+  // in this file is satisfied by an unlatched implementation.
+  //
+  // Also pins the deliberate SPLIT. The dispatch chain above the tail is
+  // unlatched on purpose (see the rationale at index.ts:1675), so a guard that
+  // only proved "the tail is single-flighted" would be equally satisfied by
+  // latching the whole tick — which reproduces the symptom the latch is
+  // deployed against.
+  it("single-flights the recovery tail across ticks while leaving dispatch unlatched", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    const idleReconcile = {
+      assignmentDispatched: 0,
+      dispatchRequeued: 0,
+      continuationRequeued: 0,
+      successfulRunHandoffEscalated: 0,
+      escalated: 0,
+      skipped: 0,
+      issueIds: [],
+    };
+    // The tail's release is observable only by a LATER tick running it again,
+    // and the chain's trailing pass is a real (unmocked) import, so there is no
+    // mock to await for "the `.finally` has run". Tick until it does; a latch
+    // that never releases simply never satisfies this and times out.
+    // Ticking inside the predicate means the tick count is however many times
+    // `waitFor` happened to retry, so every call count downstream of the first
+    // `tickUntilTailRuns` is nondeterministic: assert on the tail's own count
+    // (which this waits for) and never add a `toHaveBeenCalledTimes` on the
+    // unlatched passes after it.
+    const tickUntilTailRuns = async (times: number) =>
+      vi.waitFor(() => {
+        intervalCallback?.();
+        expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalledTimes(times);
+      });
+
+    let releaseTail: (() => void) | null = null;
+    try {
+      await startServer();
+      // Both also run once from the startup recovery sequence, which
+      // `startServer()` does NOT await — it is a fire-and-forget IIFE
+      // (index.ts:1173) only handed to `trackHeartbeatSchedulerWork` at :1351.
+      // So wait for its `reconcileStrandedAssignedIssues` pass (:1273) rather
+      // than relying on `startServer()` having more `await`s after :1173 than
+      // the chain has before it. One wait orders BOTH clears: `resumeQueuedRuns`
+      // (:1272) is awaited immediately before it in the same chain.
+      //
+      // Ordering matters because a tick returns early at :1435 while
+      // `heartbeatStartupRecoveryPending` is true, so neither pass runs from a
+      // tick until the chain finishes. A clear that lands early therefore makes
+      // the first `vi.waitFor` below TIME OUT rather than fail on the latch — a
+      // timeout here is a lost race, not a latch bug.
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalledTimes(1));
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockClear();
+      heartbeatServiceMock.resumeQueuedRuns.mockClear();
+
+      // Park the tail so it is still in flight when the next tick fires.
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockImplementationOnce(
+        () => new Promise((resolve) => {
+          releaseTail = () => resolve(idleReconcile);
+        }),
+      );
+
+      intervalCallback?.();
+      await vi.waitFor(() => expect(releaseTail).not.toBeNull());
+      await vi.waitFor(() => expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledTimes(1));
+
+      // (a) Second tick with the tail still parked must NOT start a second
+      // pass. This is the assertion the latch exists to make true, and the one
+      // that fails when the `if (!heartbeatRecoveryChainInFlight)` guard is
+      // reverted.
+      intervalCallback?.();
+      // (c) ...while the unlatched dispatch chain DOES run again. Awaiting it
+      // also gives a would-be second tail pass more than enough turns to start,
+      // so (a) below is not just observing an unresolved microtask.
+      await vi.waitFor(() => expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledTimes(2));
+      expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalledTimes(1);
+
+      // (b1) `.finally` releases the latch when the tail RESOLVES.
+      releaseTail?.();
+      releaseTail = null;
+      await tickUntilTailRuns(2);
+
+      // (b2) ...and when it REJECTS. The chain's terminal `.catch` swallows the
+      // error, so a latch released on the happy path only would leave recovery
+      // wedged estate-wide until restart, with no output at all.
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockRejectedValueOnce(
+        new Error("recovery pass blew up"),
+      );
+      await tickUntilTailRuns(3);
+      await tickUntilTailRuns(4);
+    } finally {
+      releaseTail?.();
       setIntervalSpy.mockRestore();
     }
   });

@@ -1,5 +1,5 @@
 import { and, eq, isNull } from "drizzle-orm";
-import type { Db } from "@paperclipai/db";
+import type { Db, DbTransaction } from "@paperclipai/db";
 import { branchRunClaims, externalRuntimeReservations, heartbeatRuns } from "@paperclipai/db";
 import { TERMINAL_HEARTBEAT_RUN_STATUSES } from "./issues.js";
 import { logger } from "../middleware/logger.js";
@@ -17,7 +17,6 @@ export type BranchRunClaim = typeof branchRunClaims.$inferSelect;
 
 const ACTIVE_BRANCH_CONSTRAINT = "branch_run_claims_active_branch_idx";
 const DEFAULT_BRANCH_CLAIM_LEASE_MS = 30 * 60 * 1000;
-type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type BranchClaimReadDb = Pick<Db | DbTransaction, "select">;
 
 export class BranchClaimConflictError extends Error {

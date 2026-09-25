@@ -50,51 +50,56 @@ export const PLANNING_ONLY_RECOVERY_GUARD_CONTEXT = {
 // a normal-model run, because only a recorded disposition clears the action. The narrower phrasing
 // is deliberate in both directions — it must not go stale again, and it must not read to a refused
 // agent as an instruction to go arm itself an unguarded run (that residual is BLO-32774).
+// BLO-34683: the exit list is now per-refusal, because the state it used to assert is not
+// universal and no single string is true at every call site. This constant is spread into FOUR
+// refusals — the assignee-profile, document/deliverable and approval-link gates in `issues.ts`,
+// and the approval create/modify gate in `routes/approvals.ts`; the monitor-arm gate uses
+// `statusOnlyMonitorArmResumeGuidance` below instead, for five sharers in total. Enumerate with
+// a grep across `server/src`, not across `issues.ts`: deriving this count from `issues.ts` alone
+// is what left a stale assertion in `approval-routes-idempotency.test.ts` when the text last
+// changed, and this comment is the record that licenses the next edit to the shared string.
 //
-// PEN-3275: the escalation exit is CONDITIONAL, so this is a function of the snapshot rather than a
-// constant. `approvals.ts` refuses the `request_board_approval` create outright when the run context
-// carries no source issue ("This status-only run cannot file a board escalation: its run context has
-// no source issue"), and that state is ordinary rather than exotic: the `stale_active_run_evaluation`
-// producers in `recovery/service.ts` stamp `sourceIssueId: sourceIssue?.id ?? null`, and
-// `resolveStaleRunSourceIssue` returns `null` whenever the silent run's own snapshot carries no issue
-// id — an unscoped heartbeat is exactly that — or the issue is not visible. So the detector that
-// fires on a silent ISSUELESS run dispatched a status-only wake whose guidance named an escalation
-// that run cannot file.
+// What the four sites above have in common is that they refuse on RUN CLASS ALONE — none of them
+// queries `issue_recovery_actions`, so none can say whether an action is containing the run, and a
+// text that splits on that asks the reader to resolve something the refusal never resolved. They
+// also carry no monitor, so monitor-specific advice named an object not in the payload. Both were
+// the very defect this text was widened to fix, re-emitted one call site over.
 //
-// That is the BLO-25878 shape one step in, and in the more dangerous direction: not a promise that a
-// normal-model run is coming, but a promise that a FILING is available. The agent assembles the
-// payload and gets a 403 — from text whose whole purpose is to stop it planning around an absent
-// capability, and whose refusal list is otherwise exhaustive enough to license trusting the
-// permissions too.
+// The preamble must stay true in every state, including "no recovery action exists at all": the
+// reason waiting never ends is that a run's class is fixed for its lifetime, NOT that an action is
+// pending. Phrasing it as the latter is what made the old text assert a row that need not exist.
 //
-// Derived from `statusOnlyEscalationSourceIssueId`, which is the same function `approvals.ts` gates
-// on. Sharing the predicate rather than restating the condition is what keeps the two honest: the
-// guidance names the escalation exactly when the guard would admit it.
+// PEN-3275: exported because `recoveryRunWriteClassNotice` announces the same fact in the WAKE that
+// these refusals state in their 403, and the two must not drift. The notice appends this preamble
+// alone rather than the whole of `STATUS_ONLY_RECOVERY_RESUME_GUIDANCE`: that constant ends with
+// `STATUS_ONLY_BOARD_APPROVAL_EXIT`, which names the escalation unconditionally, and the notice has
+// already resolved `statusOnlyEscalationSourceIssueId` one sentence earlier. On an issueless run the
+// two would contradict inside a single paragraph — the notice saying the run "has no approval write
+// available at all" and the appended exit offering one. The preamble is the part that is true in
+// every state, which is exactly the part the wake needs to carry.
+export const STATUS_ONLY_RESUME_PREAMBLE =
+  "No normal-model run arrives on its own: this run's class is fixed for its lifetime, and every " +
+  "wake a recovery action raises is status-only — so waiting for a normal-model run never ends.";
+
+// True at all five sharers, and the only exit that is. Kept separate so neither arm has to restate it.
 //
-// PEN-3275 round 4: the escalation's link set is EXCLUSIVE, and saying only "linked to the source
-// issue" is satisfied by a payload that also links the wider chain — which is the natural shape for
-// a board escalation about a blocked issue, and which `approvals.ts` refuses ("A status-only run may
-// only link a board escalation to its source issue"). On the run's single permitted write, the cost
-// of that omission is the whole exit rather than a retry, so the exclusivity is stated here.
-export function statusOnlyRecoveryResumeGuidance(contextSnapshot: unknown): {
-  normalModelResumeIsAutomatic: false;
-  resumeGuidance: string;
-} {
-  const preamble =
-    "No normal-model run is dispatched for this issue on its own: every wake the recovery action " +
-    "itself raises is status-only, and only a recorded disposition clears that action — so waiting " +
-    "for a normal-model run never ends. ";
-  return {
-    normalModelResumeIsAutomatic: false,
-    resumeGuidance: preamble + (statusOnlyEscalationSourceIssueId(contextSnapshot)
-      ? "Reachable exits from this run: record a valid issue disposition to clear the recovery " +
-        "action, or file a `request_board_approval` linked to the run context's source issue and " +
-        "to no other issue."
-      : "This run context carries no source issue, so it cannot file a `request_board_approval` " +
-        "either. The only reachable exit from this run is recording a valid issue disposition to " +
-        "clear the recovery action."),
-  };
-}
+// PEN-3275 round 4: the link set is EXCLUSIVE and saying only "linked to the source issue" is
+// satisfied by a payload that ALSO links the wider blocked chain — the natural shape for a board
+// escalation about a stuck issue, and one `approvals.ts` refuses outright ("A status-only run may
+// only link a board escalation to its source issue", enforced on `unrelatedIssueIds`). On the run's
+// single permitted write the cost of that omission is the whole exit rather than a retry, so the
+// exclusivity is stated here rather than left to be inferred.
+const STATUS_ONLY_BOARD_APPROVAL_EXIT =
+  "You may also file a `request_board_approval` linked to the run context's source issue and to " +
+  "no other issue.";
+
+export const STATUS_ONLY_RECOVERY_RESUME_GUIDANCE = {
+  normalModelResumeIsAutomatic: false,
+  resumeGuidance:
+    `${STATUS_ONLY_RESUME_PREAMBLE} This refusal is keyed on the run class and on nothing else, so ` +
+    "no state change on any issue lifts it within this run: record your conclusion on the issue and " +
+    `take the allowed write named in this response. ${STATUS_ONLY_BOARD_APPROVAL_EXIT}`,
+} as const;
 
 // The source issue a status-only run may link a board escalation to, or `null` if it has none.
 //
@@ -108,6 +113,35 @@ export function statusOnlyEscalationSourceIssueId(contextSnapshot: unknown): str
   if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return null;
   const sourceIssueId = (contextSnapshot as Record<string, unknown>).sourceIssueId;
   return typeof sourceIssueId === "string" && sourceIssueId.trim() ? sourceIssueId : null;
+}
+
+/**
+ * The monitor-arm gate's guidance, which unlike the three refusals above HAS resolved whether
+ * anything is containing the run — so it states the branch it took instead of offering the caller
+ * a split to guess at.
+ *
+ * `containingIssueIds` is the resolved answer and is echoed into the 403 `details`: the old text
+ * said "record a disposition to clear the recovery action" while the payload carried only the
+ * PATCHED issue id, which on a cross-issue refusal is the one row that holds no action. Naming the
+ * containing row is what makes that exit reachable rather than merely stated.
+ *
+ * Empty means the gate fell through to its fail-closed branch — an unresolvable scope, not an
+ * absence of containment — and the two must not read alike to the refused run.
+ */
+export function statusOnlyMonitorArmResumeGuidance(containingIssueIds: readonly string[]) {
+  return {
+    normalModelResumeIsAutomatic: false,
+    containingIssueIds: [...containingIssueIds],
+    resumeGuidance: containingIssueIds.length > 0
+      ? `${STATUS_ONLY_RESUME_PREAMBLE} This run is contained by an active recovery action on ` +
+        `${containingIssueIds.join(", ")}; recording a valid issue disposition there clears the ` +
+        `action, which restores monitor arming. ${STATUS_ONLY_BOARD_APPROVAL_EXIT}`
+      : `${STATUS_ONLY_RESUME_PREAMBLE} Containment could not be resolved here — this request has ` +
+        "no persisted issue yet, or the run context names no issue — so the gate fails closed " +
+        "rather than reading an unresolvable scope as an absent one. If you are creating an issue, " +
+        "let the create succeed without a monitor and arm one in a follow-up write once the id " +
+        `exists. ${STATUS_ONLY_BOARD_APPROVAL_EXIT}`,
+  };
 }
 
 // Does a run's `contextSnapshot` carry the full status-only guard tuple?
@@ -199,10 +233,13 @@ export function readRecoveryRunWriteClass(contextSnapshot: unknown): RecoveryRun
  *
  *  - It must not read as an instruction to go acquire an unguarded normal-model run. That residual
  *    is BLO-32774, and `issues.ts` closed the concrete version of it (a guarded run arming itself a
- *    monitor). The exits named here are exactly the ones `statusOnlyRecoveryResumeGuidance`
- *    names — that function's output is appended verbatim rather than re-worded, so the wake and the
- *    403 cannot drift apart and a second phrasing cannot go stale on its own. Since PEN-3275 that
- *    also means the two agree on whether the escalation exit EXISTS, not merely on its wording.
+ *    monitor). The "waiting never ends" clause is `STATUS_ONLY_RESUME_PREAMBLE` appended verbatim —
+ *    the same constant the 403s carry via `STATUS_ONLY_RECOVERY_RESUME_GUIDANCE` — so the wake and
+ *    the 403 cannot drift apart and a second phrasing cannot go stale on its own. The escalation
+ *    exit itself is stated by this notice rather than inherited, because since PEN-3275 the notice
+ *    resolves whether that exit EXISTS (`statusOnlyEscalationSourceIssueId`) and the shared constant
+ *    does not; appending the constant's own unconditional exit clause would contradict the branch
+ *    this notice just took.
  *  - It must not promise a normal-model run is coming. That was the BLO-25878 failure: three runs
  *    read `resumeRequiresNormalModel: true` as a retry that would arrive, and none did.
  *
@@ -301,14 +338,15 @@ export function recoveryRunWriteClassNotice(contextSnapshot: unknown): RecoveryR
         "linked to this run's source issue and to no other issue, and that is a single call you " +
         "cannot follow up from here — not even to comment on what you just filed. "
       : "This run's context carries no source issue, so the `request_board_approval` escalation is " +
-        "refused here too: this run has no approval write available at all. ") +
+        "refused here too: this run has no approval write available at all. The only reachable " +
+        "exit from this run is recording a valid issue disposition. ") +
     "Permitted: reads, issue comments, and recording a status disposition. " +
     "One of those refusals is also the only escalation channel off this lane: if the work this run " +
     "must finish genuinely needs an issue-document write, attempt it rather than skipping it on " +
     "the strength of this notice. The refusal is recorded against this run, and the next " +
     "corrective wake for it is dispatched planning-only, which can perform the write. An attempt " +
     "you never make is never recorded, and the wake after it is status-only again. " +
-    statusOnlyRecoveryResumeGuidance(contextSnapshot).resumeGuidance +
+    STATUS_ONLY_RESUME_PREAMBLE +
     " Confirm any of the refused writes returned before you describe it as done: composing the " +
     "claim before the call lands is how a refused write becomes a false record.");
 }

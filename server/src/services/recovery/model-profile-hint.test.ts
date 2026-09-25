@@ -9,7 +9,8 @@ import {
   scrubRecoveryModelProfileHints,
   STATUS_ONLY_RECOVERY_GUARD_CONTEXT,
   statusOnlyEscalationSourceIssueId,
-  statusOnlyRecoveryResumeGuidance,
+  STATUS_ONLY_RESUME_PREAMBLE,
+  STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
   withRecoveryModelProfileHint,
 } from "./model-profile-hint.js";
 import type { RecoveryRunWriteClassNoticeText } from "./model-profile-hint.js";
@@ -187,10 +188,15 @@ describe("recovery run write class", () => {
   });
 
   it("reuses the shared resume guidance verbatim so the wake and the 403 cannot drift", () => {
-    expect(recoveryRunWriteClassNotice(STATUS_ONLY_WITH_SOURCE))
-      .toContain(statusOnlyRecoveryResumeGuidance(STATUS_ONLY_WITH_SOURCE).resumeGuidance);
+    // The shared surface is the PREAMBLE, not the whole guidance: the constant ends with an
+    // unconditional board-approval exit, and the notice has already resolved whether that exit
+    // exists. Appending the whole of it would contradict the no-source branch in one paragraph.
+    expect(recoveryRunWriteClassNotice(STATUS_ONLY_WITH_SOURCE)).toContain(STATUS_ONLY_RESUME_PREAMBLE);
+    expect(recoveryRunWriteClassNotice(STATUS_ONLY_WITHOUT_SOURCE)).toContain(STATUS_ONLY_RESUME_PREAMBLE);
+    expect(STATUS_ONLY_RECOVERY_RESUME_GUIDANCE.resumeGuidance).toContain(STATUS_ONLY_RESUME_PREAMBLE);
+    // ...and the notice must NOT inherit the unconditional exit clause on the no-source branch.
     expect(recoveryRunWriteClassNotice(STATUS_ONLY_WITHOUT_SOURCE))
-      .toContain(statusOnlyRecoveryResumeGuidance(STATUS_ONLY_WITHOUT_SOURCE).resumeGuidance);
+      .not.toContain("You may also file a `request_board_approval`");
   });
 
   // PEN-3275 round 3. A status-only run whose context carries no source issue is refused the
@@ -232,8 +238,7 @@ describe("recovery run write class", () => {
     // Asserted on both surfaces: the notice's own clause and the shared resume guidance that
     // `approvals.ts` spreads into the 403. Either one alone leaves the other free to drift.
     expect(recoveryRunWriteClassNotice(STATUS_ONLY_WITH_SOURCE)).toContain("and to no other issue");
-    expect(statusOnlyRecoveryResumeGuidance(STATUS_ONLY_WITH_SOURCE).resumeGuidance)
-      .toContain("and to no other issue");
+    expect(STATUS_ONLY_RECOVERY_RESUME_GUIDANCE.resumeGuidance).toContain("and to no other issue");
   });
 
   // PEN-3275 round 4, and the subtlest coupling in this file. The issue-document refusal is also

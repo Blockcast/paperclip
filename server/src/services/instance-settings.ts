@@ -1,4 +1,4 @@
-import type { Db } from "@paperclipai/db";
+import type { Db, DbTransaction } from "@paperclipai/db";
 import { companies, instanceSettings } from "@paperclipai/db";
 import {
   DEFAULT_FEEDBACK_DATA_SHARING_PREFERENCE,
@@ -308,7 +308,7 @@ function toInstanceSettings(row: typeof instanceSettings.$inferSelect): Instance
  * equivalent to bootstrapping — minus the write. Writers still go through
  * `instanceSettingsService`, which keeps creating the row.
  */
-export async function readInstanceSettingsOn(dbOrTx: Db) {
+export async function readInstanceSettingsOn(dbOrTx: Db | DbTransaction) {
   const row = await dbOrTx
     .select()
     .from(instanceSettings)

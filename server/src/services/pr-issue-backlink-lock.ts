@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import type { Db } from "@paperclipai/db";
+import type { Db, DbTransaction } from "@paperclipai/db";
 import { normalizePrReviewRepoFullName } from "./pr-review-duplicate-issue-guard.js";
 
 const PR_ISSUE_BACKLINK_LOCK_PREFIX = "github:pr-issue-backlink:";
@@ -57,11 +57,18 @@ export type PrIssueBackLinkLockTimeouts = {
  * back-link is a cosmetic loss, a double-post is the defect being fixed. In the
  * healthy case no timeout is reached at all — the second delivery blocks
  * briefly, then reads the marker the first one wrote and correctly skips.
+ *
+ * `post` receives the transaction handle. Today's only caller performs GitHub
+ * I/O and no database work, so it ignores the argument — but reaching for the
+ * outer `db` from inside the critical section would take a *second* pool
+ * connection while this one is still held, which is precisely what makes the
+ * exhaustion above reachable. Handing `tx` over makes the safe handle the one
+ * already in scope, as `withGithubStatusDeliveryLock` does for the same reason.
  */
 export async function withPrIssueBackLinkLock<T>(
   db: Db,
   ref: { repoFullName: string; prNumber: number },
-  post: () => Promise<T>,
+  post: (tx: DbTransaction) => Promise<T>,
   timeouts: PrIssueBackLinkLockTimeouts = {},
 ): Promise<T> {
   const waitMs = timeouts.waitMs ?? BACKLINK_LOCK_WAIT_TIMEOUT_MS;
@@ -75,7 +82,9 @@ export async function withPrIssueBackLinkLock<T>(
       sql`select set_config('idle_in_transaction_session_timeout', ${`${holdMs}ms`}, true)`,
     );
     await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${key}, 0))`);
-    return post();
+    // Hand the transaction handle to the caller: taking a second pool
+    // connection here is what makes the exhaustion above reachable.
+    return post(tx);
   });
 }
 

@@ -133,6 +133,14 @@ export const AGENT_ENV_ALLOWLIST: ReadonlySet<string> = new Set([
   // The Penstock launcher reads this exact Secret-backed value. Keep the
   // exception narrow; adjacent PENSTOCK_* names remain default-deny.
   "PENSTOCK_API_KEY",
+  // Caveman readiness budget in ms, read by scripts/penstock-agent-runtime.mjs
+  // in the agent pod (BLO-33279). Non-secret integer; bounded by the launcher
+  // at 300000 ms and scrubbed from both child processes. Set as a literal on
+  // worker.extraEnv so one committed line is the fleet-wide default — which
+  // only works if the name is inheritable, and it was not: the value shipped
+  // on 2026-09-12, was filtered out here, and the 15000 ms default kept
+  // killing runs. See tests/penstock-worker-secret.test.mjs for the guard.
+  "PENSTOCK_READY_TIMEOUT_MS",
 
   // --- Toolchain cache locations ----------------------------------------
   // Non-secret paths. Inheriting these is in practice INERT: buildEnvVars()
