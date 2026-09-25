@@ -1,3 +1,4 @@
+import path from "node:path";
 import type { Db } from "@paperclipai/db";
 import { companies, executionWorkspaces, projectWorkspaces } from "@paperclipai/db";
 import { and, asc, eq, isNull, lte, ne, sql } from "drizzle-orm";
@@ -5,7 +6,10 @@ import { logger } from "../middleware/logger.js";
 import {
   cleanupExecutionWorkspaceArtifacts,
   inspectWorktreeReclaimSafety,
+  isReclaimFsWedgedDir,
   reclaimFsDeadlineExpiryCount,
+  reclaimFsWedgedDirCount,
+  RECLAIM_FS_OUTSTANDING_LIMIT,
   type WorktreeReclaimSafety,
 } from "./workspace-runtime.js";
 
@@ -194,6 +198,23 @@ export function executionWorkspaceCleanupService(db: Db) {
     const now = opts?.now ?? new Date();
     const limit = opts?.limit ?? 50;
 
+    // Ending a pass on the first abandoned fs call bounds one window, not the
+    // process: the trees are colocated, so the next window would pick a sibling
+    // on the same wedged mount and hold a second threadpool thread, and four
+    // such windows retire the default pool for every other fs/dns/crypto
+    // consumer in the server. Individual candidates under a wedged directory
+    // are skipped below; this is only the backstop for a spread of wedged
+    // directories. Each entry clears when its syscall finally answers, so
+    // neither needs a timer or a manual reset.
+    const wedgedDirs = reclaimFsWedgedDirCount();
+    if (wedgedDirs >= RECLAIM_FS_OUTSTANDING_LIMIT) {
+      logger.warn(
+        { wedgedDirs, limit: RECLAIM_FS_OUTSTANDING_LIMIT },
+        "reconcileExecutionWorkspaceCleanup: abandoned filesystem calls still hold threadpool threads; skipping this pass",
+      );
+      return { stamped: 0, scanned: 0, collected: 0, skipped: 0, failed: 0 };
+    }
+
     let stamped = 0;
     try {
       // Unbounded on purpose: stamping is one cheap UPDATE, and the collection
@@ -272,6 +293,14 @@ export function executionWorkspaceCleanupService(db: Db) {
       }
       scanned += 1;
       const worktreePath = candidate.providerRef ?? candidate.cwd;
+      // A sibling of a tree whose stat was abandoned is on the same wedged
+      // mount, so probing it would hold a second thread to learn the same
+      // thing. The hold clears when that syscall answers.
+      if (worktreePath && isReclaimFsWedgedDir(path.dirname(path.resolve(worktreePath)))) {
+        await deferCandidate(candidate.id, "unverifiable");
+        skipped += 1;
+        continue;
+      }
       try {
         if (candidate.providerType === "git_worktree" && worktreePath) {
           const safety = await inspectWorktreeReclaimSafety(worktreePath);

@@ -3432,23 +3432,33 @@ function deriveRepoNameFromRepoUrlForRuntime(repoUrl: string | null | undefined)
 
 async function resolvePathForWorktreeComparison(value: string): Promise<string> {
   const resolved = path.resolve(value);
-  const missingSegments: string[] = [];
-  let current = resolved;
-  while (true) {
-    try {
-      const realPath = await fs.realpath(current);
-      return path.resolve(realPath, ...missingSegments);
-    } catch {
-      const parent = path.dirname(current);
-      if (parent === current) return resolved;
-      missingSegments.unshift(path.basename(current));
-      current = parent;
+  const walk = async (): Promise<string> => {
+    const missingSegments: string[] = [];
+    let current = resolved;
+    while (true) {
+      try {
+        const realPath = await fs.realpath(current);
+        return path.resolve(realPath, ...missingSegments);
+      } catch {
+        const parent = path.dirname(current);
+        if (parent === current) return resolved;
+        missingSegments.unshift(path.basename(current));
+        current = parent;
+      }
     }
-  }
+  };
+  // One deadline for the whole walk, not one per segment. The loop's `catch`
+  // reads any failure as "this segment is missing" and climbs to the parent, so
+  // a per-segment bound on a wedged mount would abandon a thread per segment.
+  // Falling back to the lexical path fails closed: it cannot match an owned
+  // registration, so every caller skips rather than removes.
+  return withReclaimFsDeadline(walk(), resolved).catch(() => resolved);
 }
 
 async function listLinkedGitWorktreePaths(repoRoot: string): Promise<Set<string>> {
-  const output = await runGit(["worktree", "list", "--porcelain"], repoRoot);
+  const output = await runGit(["worktree", "list", "--porcelain"], repoRoot, {
+    timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS,
+  });
   const paths = new Set<string>();
   for (const line of output.split("\n")) {
     if (!line.startsWith("worktree ")) continue;
@@ -3463,10 +3473,15 @@ async function listLinkedGitWorktreePaths(repoRoot: string): Promise<Set<string>
  * Shared plumbing for the worktree-ownership guards (BLO-19607). The ownership
  * module takes git and path-normalization as parameters so it stays unit
  * testable; this binds it to the runtime's own implementations.
+ *
+ * Every git call here runs in `repoRoot`, which no inspector proves reachable —
+ * `inspectWorktreeReclaimSafety` only ever stats the worktree. So they carry the
+ * same budget the inspector uses: an unbounded await in this path is also an
+ * unbounded await in the collector's shutdown drain.
  */
 function gitWorktreeOwnershipContext(repoRoot: string) {
   return {
-    git: (args: string[], cwd: string) => runGit(args, cwd),
+    git: (args: string[], cwd: string) => runGit(args, cwd, { timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS }),
     repoRoot,
     normalizePath: resolvePathForWorktreeComparison,
   };
@@ -4733,6 +4748,7 @@ export type WorktreeReclaimSafety = {
 const WORKTREE_RECLAIM_GIT_TIMEOUT_MS = 30_000;
 
 let reclaimFsDeadlineExpiries = 0;
+const reclaimFsWedgedRoots = new Set<string>();
 
 /**
  * How many filesystem calls `withReclaimFsDeadline` has abandoned in this
@@ -4746,17 +4762,52 @@ export function reclaimFsDeadlineExpiryCount(): number {
 }
 
 /**
+ * Directories with an abandoned call still outstanding — threads held right
+ * now, one per entry, because a second call under an entry is never made.
+ *
+ * Ending the pass bounds a single window, not the process: the next window is
+ * free to abandon one more on the same wedged mount, and four such windows
+ * retire the default pool for every other fs/dns/crypto consumer in the server.
+ * So the hold is on the *directory*, which is what makes it self-clearing and
+ * keeps the collector working on every other mount instead of latching off.
+ */
+export function isReclaimFsWedgedDir(dir: string): boolean {
+  return reclaimFsWedgedRoots.has(dir);
+}
+
+export function reclaimFsWedgedDirCount(): number {
+  return reclaimFsWedgedRoots.size;
+}
+
+/** Backstop for a spread of wedged roots: half the threadpool, never more. */
+export const RECLAIM_FS_OUTSTANDING_LIMIT = Math.max(
+  1,
+  Math.floor(Number(process.env.UV_THREADPOOL_SIZE ?? 4) / 2) || 2,
+);
+
+/**
  * Bounds a filesystem call that can block indefinitely on a wedged mount. The
  * collector runs as tracked heartbeat-scheduler work, so an unbounded await in
  * its path is also an unbounded await in the shutdown drain. fs calls cannot be
  * cancelled: on expiry the call is abandoned and the caller takes its
  * fail-closed branch, with an ETIMEDOUT error in place of the errno.
+ *
+ * `target` is the path being read; its parent directory is what gets held while
+ * the abandoned call is outstanding, so colocated siblings are not probed too.
  */
-async function withReclaimFsDeadline<T>(operation: Promise<T>): Promise<T> {
+async function withReclaimFsDeadline<T>(operation: Promise<T>, target: string): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   const deadline = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
       reclaimFsDeadlineExpiries += 1;
+      const wedgedDir = path.dirname(path.resolve(target));
+      reclaimFsWedgedRoots.add(wedgedDir);
+      // Abandoned, not cancelled: the thread returns to the pool only when the
+      // syscall itself finally answers, so release the hold on settle.
+      const release = () => {
+        reclaimFsWedgedRoots.delete(wedgedDir);
+      };
+      void operation.then(release, release);
       reject(Object.assign(new Error(`filesystem call exceeded ${WORKTREE_RECLAIM_GIT_TIMEOUT_MS}ms`), {
         code: "ETIMEDOUT",
       }));
@@ -4788,7 +4839,7 @@ export async function inspectWorktreeReclaimSafety(worktreePath: string): Promis
   try {
     // Same bound as the git probes below: a stat that never returns is an
     // unreadable tree (ETIMEDOUT lands in the catch as unverifiable).
-    const stats = await withReclaimFsDeadline(fs.stat(worktreePath));
+    const stats = await withReclaimFsDeadline(fs.stat(worktreePath), worktreePath);
     if (!stats.isDirectory()) {
       return { safe: false, reason: "unverifiable", detail: `${worktreePath} exists but is not a directory` };
     }
@@ -4913,7 +4964,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
   // and do not stat the same wedged path again for the final check.
   let worktreeStatExpired = false;
   if (input.workspace.providerType === "git_worktree" && workspacePath) {
-    const worktreeExists = await withReclaimFsDeadline(directoryExists(workspacePath)).catch((err) => {
+    const worktreeExists = await withReclaimFsDeadline(directoryExists(workspacePath), workspacePath).catch((err) => {
       worktreeStatExpired = true;
       warnings.push(`Could not stat "${workspacePath}": ${(err as NodeJS.ErrnoException)?.code ?? String(err)}.`);
       return false;
@@ -4944,6 +4995,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
               phase: "worktree_cleanup",
               args: ["worktree", "remove", ...removeForceArgs, workspacePath],
               cwd: repoRoot,
+              timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS,
               metadata: {
                 workspaceId: input.workspace.id,
                 workspacePath,
@@ -4969,6 +5021,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
             phase: "worktree_cleanup",
             args: ["branch", "-d", input.workspace.branchName],
             cwd: repoRoot,
+            timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS,
             metadata: {
               workspaceId: input.workspace.id,
               workspacePath,
@@ -5019,7 +5072,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
   const cleaned =
     !workspacePath ||
     (!worktreeStatExpired &&
-      (await withReclaimFsDeadline(directoryExists(workspacePath)).then((exists) => !exists, () => false)));
+      (await withReclaimFsDeadline(directoryExists(workspacePath), workspacePath).then((exists) => !exists, () => false)));
 
   return {
     cleanedPath: workspacePath,
