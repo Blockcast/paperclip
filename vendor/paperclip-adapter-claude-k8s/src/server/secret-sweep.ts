@@ -256,6 +256,15 @@ export async function sweepOrphanedRunSecrets(opts: SweepOptions): Promise<Sweep
     MIN_SWEEP_AGE_FLOOR_SEC * 1000,
     opts.ageFloorMs ?? DEFAULT_SWEEP_AGE_FLOOR_SEC * 1000,
   );
+  // Make the override observable at the moment it happens: an operator or test
+  // that deliberately sets a low floor otherwise gets 300s with no signal, and
+  // has to infer the clamp from behaviour.
+  if (opts.ageFloorMs !== undefined && opts.ageFloorMs < ageFloorMs) {
+    await onLog(
+      "stderr",
+      `[paperclip] Orphan-secret sweep age floor raised from ${opts.ageFloorMs}ms to the ${ageFloorMs}ms minimum\n`,
+    );
+  }
   const now = opts.now ?? Date.now();
   const result: SweepResult = { swept: [], retained: [], failed: [] };
 
