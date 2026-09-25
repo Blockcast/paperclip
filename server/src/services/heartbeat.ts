@@ -740,6 +740,19 @@ const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ISSUE_EXECUTION_LOCK_HOLDING_RUN_S
 // it would re-wedge the issue behind a run nothing is driving.
 const MAX_SWEPT_ISSUE_LOCK_RELEASES = 1;
 const TASK_SCOPE_COALESCIBLE_RUN_STATUSES = ["queued", "scheduled_retry"] as const;
+/**
+ * BLO-35155: statuses that mean "a run which could still re-arm this issue's
+ * monitor exists", for the `trigger_stalled` sweep's live-consumer guard.
+ *
+ * `scheduled_retry` is EXCLUDED ON PURPOSE and must stay excluded. A park can
+ * sit for days (capacity parks have been measured with horizons ~18h out), so
+ * counting it as live would hold a `triggered` monitor open across the whole
+ * backoff and restore the forever-`triggered` stranding BLO-29606 exists to
+ * prevent — trading a false reap for a permanent one, which is the worse of the
+ * two. Deliberately NOT sourced from CANCELLABLE/EXECUTION_PATH lists, which all
+ * include it for lock-ownership purposes; that is a different question.
+ */
+const ISSUE_MONITOR_LIVE_CONSUMER_RUN_STATUSES = ["queued", "running"] as const;
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
 /**
@@ -15121,6 +15134,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * still expires only at that instant: an operator-supplied deadline is
    * authoritative, so a long explicit timeout is honoured rather than pre-empted
    * by the grace window.
+   *
+   * BLO-35155: that grace window is a proxy for "the woken run never called
+   * back", and the proxy sits below the dispatch-latency p50 of the lanes whose
+   * monitors matter most. The no-`timeoutAt` branch now additionally requires
+   * that no queued/running run exists for this issue, so `trigger_stalled`
+   * means what it says. See the predicate for the numbers.
    */
   async function tickExpiredIssueMonitors(now = new Date()) {
     const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
@@ -15143,6 +15162,55 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           sql`(${issues.executionState} -> 'monitor' ->> 'timeoutAt') is null`,
           sql`${issues.monitorLastTriggeredAt} is not null`,
           lte(issues.monitorLastTriggeredAt, triggeredStallThreshold),
+          // BLO-35155: the grace window is a PROXY for "the run that consumed
+          // this trigger never called back", and on a congested lane the proxy
+          // is wrong more often than it is right — measured on the CTO lane
+          // 2026-09-21, created->started p50 was 162m and 38% of runs started
+          // more than 4h after creation, so ~1 monitor in 3 was cleared while
+          // its own woken run was still sitting in the dispatch queue, about to
+          // re-arm. One case cleared the monitor 17s after the run started.
+          //
+          // Test the predicate directly instead: a run on this issue that is
+          // still queued/running IS the callback, just not dispatched yet. A
+          // genuinely dead run leaves no such row, so BLO-29606's fix is intact.
+          // Deliberately not `scheduled_retry` — a park can sit for days, and
+          // treating it as live would restore the forever-`triggered` stranding
+          // BLO-29606 exists to prevent.
+          //
+          // Deliberately NOT bounded on created_at >= monitorLastTriggeredAt,
+          // even though "the run that consumed this trigger" sounds like it
+          // wants one: coalescePendingTaskScopeWake delivers a monitor wake into
+          // an ALREADY-queued run and rewrites its contextSnapshot in place
+          // rather than creating a row, so the consumer is routinely older than
+          // the trigger. A created_at bound would miss exactly that case and
+          // reap the monitor out from under its live consumer.
+          //
+          // Bound on company+agent as well as issue so this probes
+          // idx_heartbeat_runs_company_agent_context_issue_created (migration
+          // 0104) rather than scanning; a reassigned issue's orphaned monitor is
+          // correctly reaped, since the old agent's run will never re-arm it.
+          //
+          // contextIssueId is the generated stored mirror of
+          // `context_snapshot ->> 'issueId'` (migration 0079) and is the column
+          // that index keys on, so the comparison has to be against it rather
+          // than the JSON path. It is `text` against a `uuid` issues.id, so the
+          // cast goes on issues.id — casting contextIssueId instead would put a
+          // cast on the indexed column and forfeit the index probe.
+          not(
+            exists(
+              db
+                .select({ live: sql`1` })
+                .from(heartbeatRuns)
+                .where(
+                  and(
+                    eq(heartbeatRuns.companyId, issues.companyId),
+                    eq(heartbeatRuns.agentId, issues.assigneeAgentId),
+                    eq(heartbeatRuns.contextIssueId, sql`${issues.id}::text`),
+                    inArray(heartbeatRuns.status, ISSUE_MONITOR_LIVE_CONSUMER_RUN_STATUSES),
+                  ),
+                ),
+            ),
+          ),
         ),
       ),
     );
