@@ -442,6 +442,10 @@ export function summarize(results) {
   const stale = results.filter((r) => r.status === "stale");
   const stopped = stale.filter((r) => STOPPED_REASONS.has(r.reason));
   const unreadable = stale.filter((r) => UNREADABLE_REASONS.has(r.reason));
+  // Suppressed, not healthy. `classifyGuard` declines to assert these stopped,
+  // so the headline must not assert the stronger thing, that they completed.
+  // They do not redden the run: exitCode stays keyed on `stale` alone.
+  const unknown = results.filter((r) => r.status === "unknown");
   const checked = results.length;
 
   const clauses = [];
@@ -454,6 +458,12 @@ export function summarize(results) {
         `is unknown (failing closed, not asserting they stopped)`,
     );
   }
+  if (unknown.length > 0) {
+    clauses.push(
+      `${unknown.length} of ${checked} could not be assessed (the run index disagreed with itself, ` +
+        `or a run timestamp would not parse), so their liveness is unknown, not asserted healthy`,
+    );
+  }
 
   return {
     checked,
@@ -461,11 +471,15 @@ export function summarize(results) {
     stale,
     stoppedCount: stopped.length,
     unreadableCount: unreadable.length,
+    unknownCount: unknown.length,
     exitCode: stale.length > 0 ? 1 : 0,
     headline:
-      stale.length === 0
-        ? `All ${checked} watched scheduled guards have completed within their liveness thresholds.`
-        : `${clauses.join("; ")}.`,
+      stale.length > 0
+        ? `${clauses.join("; ")}.`
+        : unknown.length > 0
+          ? `${checked - unknown.length} of ${checked} watched scheduled guards have completed within ` +
+            `their liveness thresholds; ${clauses.join("; ")}.`
+          : `All ${checked} watched scheduled guards have completed within their liveness thresholds.`,
   };
 }
 
