@@ -2839,16 +2839,16 @@ export function agentRoutes(
           "inbox-lite: withheld issue already held by another live run of this agent",
         );
       },
-      onWithheldForeignScheduledRetry: (issue) => {
+      onWithheldForeignScheduledRetry: (issue, holder) => {
         logger.info(
           {
             agentId: req.actor.agentId,
             issueId: issue.id,
             identifier: issue.identifier,
             callerRunId,
-            holdingRunId: issue.scheduledRetryRunId ?? null,
-            scheduledRetryAt: issue.scheduledRetryAt ?? null,
-            scheduledRetryReason: issue.scheduledRetryReason ?? null,
+            holdingRunId: holder.runId,
+            scheduledRetryAt: holder.scheduledRetryAt,
+            scheduledRetryReason: holder.scheduledRetryReason,
           },
           "inbox-lite: withheld issue attended by another run of this agent parked on a scheduled retry",
         );

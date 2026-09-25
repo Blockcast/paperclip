@@ -90,6 +90,7 @@ describe("agent inbox-lite status contract", () => {
         createdAt: "2026-07-30T01:41:56.125Z",
         updatedAt: "2026-07-30T01:41:56.125Z",
         activeRun: { id: "run-other", status: "running" },
+        scheduledRetryParkedRuns: [],
       },
       {
         id: "issue-2",
@@ -103,6 +104,7 @@ describe("agent inbox-lite status contract", () => {
         createdAt: "2026-07-30T01:42:56.125Z",
         updatedAt: "2026-07-30T01:42:56.125Z",
         activeRun: null,
+        scheduledRetryParkedRuns: [],
       },
     ]);
     mockIssueService.listDependencyReadiness.mockResolvedValue(
@@ -138,6 +140,7 @@ describe("agent inbox-lite status contract", () => {
         createdAt: "2026-07-30T01:41:56.125Z",
         updatedAt: "2026-07-30T01:41:56.125Z",
         activeRun: null,
+        scheduledRetryParkedRuns: [],
       },
       {
         id: "after-cutoff",
@@ -151,6 +154,7 @@ describe("agent inbox-lite status contract", () => {
         createdAt: "2026-07-30T01:43:56.125Z",
         updatedAt: "2026-07-30T01:43:56.125Z",
         activeRun: null,
+        scheduledRetryParkedRuns: [],
       },
     ]);
 
@@ -202,6 +206,7 @@ describe("agent inbox-lite wake-path projection", () => {
       scheduledRetryAt: null,
       scheduledRetryReason: null,
       scheduledRetryAttempt: null,
+      scheduledRetryParkedRuns: [],
       ...overrides,
     };
   }
@@ -294,7 +299,7 @@ describe("agent inbox-lite concurrent-claim guard (BLO-29965)", () => {
   const RUN_B_WOKE = Date.parse("2026-09-03T02:18:00.000Z");
 
   function parkedRetryRow(overrides: Record<string, unknown> = {}) {
-    return {
+    const row = {
       id: "issue-1",
       identifier: "BLO-31354",
       title: "Flaky merge-queue gate",
@@ -314,6 +319,21 @@ describe("agent inbox-lite concurrent-claim guard (BLO-29965)", () => {
       // run-a belongs to the SAME agent as the caller: the sibling case.
       scheduledRetryAgentId: "agent-1",
       ...overrides,
+    };
+    // By default the parked set is just the displayed row, as the projection
+    // builds it for an issue with one parked run.
+    return {
+      scheduledRetryParkedRuns: row.scheduledRetryRunId
+        ? [
+            {
+              runId: row.scheduledRetryRunId,
+              agentId: row.scheduledRetryAgentId,
+              scheduledRetryAt: row.scheduledRetryAt,
+              scheduledRetryReason: row.scheduledRetryReason,
+            },
+          ]
+        : [],
+      ...row,
     };
   }
 
@@ -350,6 +370,7 @@ describe("agent inbox-lite concurrent-claim guard (BLO-29965)", () => {
       id: "issue-1",
       scheduledRetryRunId: "run-a",
     });
+    expect(onWithheldForeignScheduledRetry.mock.calls[0]![1]).toMatchObject({ runId: "run-a" });
   });
 
   it("still offers the row to the run that OWNS the parked retry", async () => {
@@ -420,5 +441,53 @@ describe("agent inbox-lite concurrent-claim guard (BLO-29965)", () => {
 
     expect(items.map((issue) => issue.id)).toEqual(["issue-1"]);
     expect(onWithheldForeignScheduledRetry).not.toHaveBeenCalled();
+  });
+
+  // BLO-29965 review round 4. The row displays ONE retry, the earliest-due, and
+  // the previous assignee's stale retry is older, so it is the one displayed.
+  // Reading only that row failed open on "another agent's retry" and offered the
+  // issue to a second run while this agent's own sibling was parked on it.
+  it("withholds the row when the earliest-due retry is stale but a sibling is parked behind it", async () => {
+    const staleRetry = {
+      runId: "run-previous",
+      agentId: "agent-previous",
+      scheduledRetryAt: "2026-09-03T01:00:00.000Z",
+      scheduledRetryReason: "transient_failure",
+    };
+    const siblingRetry = {
+      runId: "run-a",
+      agentId: "agent-1",
+      scheduledRetryAt: RETRY_AT,
+      scheduledRetryReason: "ccrotate_capacity",
+    };
+    mockIssueService.list.mockResolvedValue([
+      parkedRetryRow({
+        scheduledRetryAt: staleRetry.scheduledRetryAt,
+        scheduledRetryReason: staleRetry.scheduledRetryReason,
+        scheduledRetryRunId: staleRetry.runId,
+        scheduledRetryAgentId: staleRetry.agentId,
+        scheduledRetryParkedRuns: [staleRetry, siblingRetry],
+      }),
+    ]);
+    const onWithheldForeignScheduledRetry = vi.fn();
+
+    const items = await loadAgentInboxLite({
+      issuesSvc: mockIssueService as unknown as LoadInboxInput["issuesSvc"],
+      recoveryActionsSvc:
+        mockRecoveryActionService as unknown as LoadInboxInput["recoveryActionsSvc"],
+      companyId: "company-1",
+      agentId: "agent-1",
+      callerRunId: "run-b",
+      limit: 100,
+      isWorktreeRuntime: false,
+      worktreeActivation: inactiveWorktreeActivation,
+      nowMs: RUN_B_WOKE,
+      onWithheldForeignScheduledRetry,
+    });
+
+    expect(items).toEqual([]);
+    expect(onWithheldForeignScheduledRetry).toHaveBeenCalledTimes(1);
+    // The audit names the run that actually holds it, not the displayed row.
+    expect(onWithheldForeignScheduledRetry.mock.calls[0]![1]).toEqual(siblingRetry);
   });
 });
