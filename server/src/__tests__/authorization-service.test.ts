@@ -4153,6 +4153,55 @@ describeEmbeddedPostgres("authorization service", () => {
       })).resolves.toMatchObject({ allowed: true, reason: "allow_simple_company_member" });
     });
 
+    /**
+     * PEN-3204. The captured output of a workspace operation reaches the wire on two
+     * different controls: the list routes project `stdoutExcerpt` / `stderrExcerpt`
+     * behind `runs:read_transcript`, while the per-operation `/log` body is withheld
+     * behind `workspace_runtime:read` (BLO-34631). PEN-3204 decided NOT to stack the
+     * transcript gate on the second one, because the entitlement is already strictly
+     * tighter — no agent resolves it, so the body is withheld from every agent.
+     *
+     * That decision rests entirely on the two actions staying disjoint for agents, and
+     * nothing else pinned it. The risk is not a grant row — `workspace_runtime:read` is
+     * unmapped in `permissionForAction`, so no grant can satisfy it — but a future
+     * widening of the agent allow-list for a *runtime-config* workflow, which the
+     * PEN-2852 comment on that list explicitly invites. That widening would open
+     * transcript bytes as a side effect, on a route whose gate was never argued about
+     * transcripts.
+     *
+     * This fails if the transcript grant ever carries into the runtime entitlement, so
+     * the coupling has to be re-decided deliberately rather than inherited.
+     */
+    it("denies workspace_runtime:read to an agent holding runs:read_transcript (PEN-3204)", async () => {
+      const company = await createCompany(db, "WorkspaceRuntimeReadTranscriptGrant");
+      const actorAgent = await createAgent(db, company.id, { role: "engineer" });
+      const peerAgent = await createAgent(db, company.id, { role: "engineer" });
+      await grantAgentPermission(db, company.id, actorAgent.id, "runs:read_transcript");
+      const authorization = authorizationService(db);
+      const actor = {
+        type: "agent" as const,
+        agentId: actorAgent.id,
+        companyId: company.id,
+        source: "agent_jwt" as const,
+      };
+
+      // Control: the grant is live on the action it was actually issued for, against a
+      // peer the actor has no relational claim to. Without this, the deny below would
+      // pass just as well on a grant that never got seeded.
+      await expect(authorization.decide({
+        actor,
+        action: "runs:read_transcript",
+        resource: { type: "agent", companyId: company.id, agentId: peerAgent.id },
+      })).resolves.toMatchObject({ allowed: true });
+
+      // The assertion: it does not carry into the entitlement guarding the `/log` body.
+      await expect(authorization.decide({
+        actor,
+        action: "workspace_runtime:read",
+        resource: { type: "company", companyId: company.id },
+      })).resolves.toMatchObject({ allowed: false });
+    });
+
     it("denies a viewer board member", async () => {
       const company = await createCompany(db, "WorkspaceRuntimeReadViewer");
       const userId = `user-${randomUUID()}`;

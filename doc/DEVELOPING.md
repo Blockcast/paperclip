@@ -743,18 +743,53 @@ either.
 | field | treatment |
 |---|---|
 | `phase`, `status`, `exitCode`, `command`, `cwd`, `metadata`, the ids, the timestamps, and the log volume/location/digest (`logStore`, `logRef`, `logBytes`, `logSha256`, `logCompressed`) | **state** — company-readable |
-| `stdoutExcerpt`, `stderrExcerpt` | **transcript** — scoped as above |
-| `GET /api/workspace-operations/:operationId/log` body | **transcript** — scoped as above |
+| `stdoutExcerpt`, `stderrExcerpt` | **transcript** — scoped on `runs:read_transcript` as above |
+| `GET /api/workspace-operations/:operationId/log` body | **transcript** — scoped, but on `workspace_runtime:read`, NOT on the run-transcript gate. See below. |
 
-The excerpts are withheld on **all three** read routes, or the boundary is not
-closed: `GET /api/heartbeat-runs/:runId/workspace-operations`,
+The excerpts are withheld on **both list routes**, or the boundary is not
+closed: `GET /api/heartbeat-runs/:runId/workspace-operations` and
 `GET /api/execution-workspaces/:id/workspace-operations` (the widest — it
-returns every operation for a workspace, including other agents' runs), and the
-per-operation `/log` above. Withheld rows carry
+returns every operation for a workspace, including other agents' runs).
+Withheld rows carry
 `withheldFields: ["stdoutExcerpt", "stderrExcerpt"]`, so a client can tell "not
 entitled" from "this operation captured no output"; every state field survives
 beside them, because hiding the operator's text is the point and hiding that an
 operation ran is not.
+
+**The per-operation `/log` body is scoped by a different control, and the
+difference is deliberate.** BLO-34631 landed a `workspace_runtime:read`
+entitlement on that route while PEN-3204 was open, so it is **not** additionally
+gated on `decideRunTranscriptRead`. That entitlement is *strictly tighter* than
+the run-transcript gate for the population this section protects:
+`workspace_runtime:read` is unmapped in `permissionForAction` and deliberately
+absent from the same-company agent allow-list (PEN-2852,
+`services/authorization.ts`), so **no agent actor resolves it** — the body is
+withheld from every agent, owner or not, and a grant row cannot satisfy it
+because the action is unmapped. Stacking the transcript gate on top would
+convert a withheld 200 into a 403 and change no bytes.
+
+Two consequences follow, and neither is an oversight:
+
+- **`runs:read_transcript` does not reach this route.** A holder of the grant
+  gets a withheld body here, unlike on the run-transcript routes. That is a real
+  narrowing of the PEN-3140 escape hatch, decided on PEN-3204 rather than
+  inherited: the grant was sized from an audit of *run* transcript reads, no
+  demand for workspace-operation log reads was measured, and human operators
+  (active non-viewer board members) retain the read, which is the principal
+  incident response actually uses. Widening it back is a product decision that
+  needs its own evidence, not a default.
+- **Withheld here means masked, not emptied.** The body returns 200 with
+  `content` replaced wholesale by the redaction sentinel
+  (`maskWorkspaceRuntimeTextForRead`), so a reader can still tell "this operation
+  logged nothing" from "the log was withheld". It is a total replacement, not a
+  heuristic scrub.
+
+Because the transcript bytes on that route now ride on an entitlement whose
+charter is *operator-authored runtime config* rather than transcript content,
+adding `workspace_runtime:read` to the agent allow-list for a runtime-config
+workflow would open the captured output as a silent side effect. That coupling
+is pinned by a test in `authorization-service.test.ts` (PEN-3204) which fails if
+a `runs:read_transcript` holder ever resolves `workspace_runtime:read`.
 
 `command` / `cwd` / `metadata` are separately masked by an **orthogonal** gate,
 `workspace_runtime:read` (`routes/workspace-response.ts`). The two compose and
@@ -848,9 +883,8 @@ reachable paths over the same material; wiring an alert or digest to some and
 not the others reproduces the blindness that got this audit rejected as a
 standalone compensating control on PEN-3140. The workspace-operation path is the
 one that had *neither* half of the control pair — no gate and no audit — until
-PEN-3204; its row is keyed `entity_type = workspace_operation` and carries the
-operation's owning run in `runId`, plus `details.ownerAgentId`, where `null`
-records the fail-closed branch (decided with no resolvable owner).
+BLO-34631 gave it both; its row is keyed `entity_type = workspace_operation` and
+carries the operation's owning run in `runId`.
 
 The audit row records the actor type/id, company id, heartbeat run id, timestamp
 (`activity_log.created_at`), access result, and the requested window (byte
@@ -865,10 +899,24 @@ query all three actions above — the two run-transcript routes are keyed
 workspace-operation route is keyed `entity_type = workspace_operation` with the
 owning run in `runId`. Querying only the `heartbeat_run` rows silently omits the
 workspace-operation path, which is the same partial-coverage blindness this
-section warns about immediately above. The event `details.result` value is `allowed` when content was
-eligible to be read and `denied` when an access check rejected the request —
-which now includes a same-company caller that lacks transcript entitlement, not
-only a cross-company one. Retention follows the deployment's normal
+section warns about immediately above.
+
+⚠️ **`details.result` does not mean the same thing on all three rows, and
+filtering on it alone under-counts.** On the two run-transcript routes the audit
+result is the *entitlement* decision — an unentitled same-company caller books
+`result: "denied"` on both, whether the response is `/log`'s 403 or `/events`'
+200-with-withheld-content. On the workspace-operation `/log` route it is not:
+that caller clears both company checks and receives a 200 whose `content` is
+masked, and the row books `result: "allowed"` with **`details.withheld: true`**
+(BLO-34631 added that flag for exactly this reason — there, the access check
+decides reachability and the entitlement decides the bytes). `details.withheld`
+is present *only* on the workspace-operation rows. An incident query that
+enumerates unentitled transcript access as `details.result = "denied"` therefore
+returns every run-route attempt and **zero** workspace-operation attempts. Read
+`result: "denied" OR details.withheld = true` across the three actions to get
+the whole set.
+
+Retention follows the deployment's normal
 `activity_log` database retention and backup policy; Paperclip does not
 currently apply a separate shorter retention window for these access-audit rows.
 
