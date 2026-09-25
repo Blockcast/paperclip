@@ -453,6 +453,23 @@ worker:
     # the launcher scrubs every PENSTOCK_* name from both child processes.
     - name: PENSTOCK_READY_TIMEOUT_MS
       value: "60000"
+    # BLO-19123: turns on the stranded-recovery hand-back drain, which returns
+    # mis-owned rows to their real owner instead of leaving them parked on a
+    # manager. The code shipped dark in #1549/#1580 so that enabling it stayed a
+    # separate decision; the CEO made that decision on 2026-09-25.
+    #
+    # Worker-only by necessity, not preference: config.ts forces
+    # heartbeatSchedulerEnabled=false whenever PAPERCLIP_NODE_ROLE=api, and the
+    # drain block in index.ts sits inside that gate. On the API Deployment this
+    # variable is read, stored, and never consulted — a silent no-op that
+    # deploys green. Verified live 2026-09-25: paperclip-0 reads
+    # PAPERCLIP_NODE_ROLE=worker, paperclip-api-* reads api.
+    #
+    # Rate is deliberately left at its defaults (10 rows per pass,
+    # 60-minute interval) so unsetting this flag loses at most one batch and
+    # every skipped row keeps its hand_back_residual_reason.
+    - name: PAPERCLIP_STRANDED_RECOVERY_HAND_BACK_DRAIN_ENABLED
+      value: "true"
 
 # Service account must mount its bearer token so the k8s-Job adapters can
 # create Jobs / read Pod logs / patch Secrets via the in-cluster kubeconfig.

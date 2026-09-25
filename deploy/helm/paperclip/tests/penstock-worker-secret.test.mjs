@@ -176,6 +176,24 @@ function buildInheritPredicate(allowlistSrc) {
     (exact.includes(name) || prefixes.some((prefix) => name.startsWith(prefix)));
 }
 
+// Literals that are deliberately NOT inherited, because the worker process is
+// their only reader. The guard below asserts inheritability, which is the right
+// invariant for a name placed here to reach agent Jobs (PENSTOCK_READY_TIMEOUT_MS)
+// and the wrong one for a name that configures the worker itself: the allowlist
+// is a credential-disclosure boundary (inherit-allowlist.ts), so widening it to
+// satisfy a test would spend real security budget on a value no agent reads.
+//
+// Membership here is the deliberate edit, exactly as adding to the allowlist is.
+// A new literal in neither list still fails the guard, which is the point.
+const WORKER_ONLY_ENV_LITERALS = new Map([
+  [
+    // BLO-19123. Read once at worker startup by config.ts and consulted only
+    // inside the heartbeat scheduler's drain block. Agent Jobs run no scheduler.
+    "PAPERCLIP_STRANDED_RECOVERY_HAND_BACK_DRAIN_ENABLED",
+    "server-side scheduler flag; no agent-side reader",
+  ],
+]);
+
 test("every literal worker.extraEnv name is inheritable by agent Jobs", () => {
   const values = readFileSync(`${repoRoot}/${blockcastValues}`, "utf8");
   // ponytail: two known ceilings in this scan, both of which degrade QUIETLY
@@ -202,10 +220,23 @@ test("every literal worker.extraEnv name is inheritable by agent Jobs", () => {
   );
 
   for (const name of literals) {
+    if (WORKER_ONLY_ENV_LITERALS.has(name)) continue;
     assert.ok(
       inheritable(name),
       `worker.extraEnv sets ${name}, but the adapter will not inherit it — ` +
-        `no agent pod will ever see the value`,
+        `no agent pod will ever see the value. If the worker is its only reader, ` +
+        `add it to WORKER_ONLY_ENV_LITERALS with the reason instead of widening ` +
+        `the adapter allowlist`,
+    );
+  }
+
+  // The exemption list must not outlive its entries: a name left here after the
+  // values file stops setting it reads as a reviewed decision about a literal
+  // that no longer exists, and would silently exempt it if it ever came back.
+  for (const name of WORKER_ONLY_ENV_LITERALS.keys()) {
+    assert.ok(
+      literals.includes(name),
+      `WORKER_ONLY_ENV_LITERALS exempts ${name}, which worker.extraEnv no longer sets`,
     );
   }
 });
@@ -255,4 +286,34 @@ export const AGENT_ENV_ALLOWED_PREFIXES: readonly string[] = [
   // Substring membership reads both comments as entries, and gets both wrong.
   assert.equal(inheritable("PENSTOCK_RUNTIME_TOKEN"), false, "a comment must not admit a name");
   assert.equal(inheritable("PENSTOCK_READY_TIMEOUT_MS"), true, "a comment must not deny a name");
+});
+
+// BLO-19123. The drain returns mis-owned recovery rows to their real owner. Its
+// block in index.ts sits inside `if (config.heartbeatSchedulerEnabled)`, and
+// config.ts forces that false whenever PAPERCLIP_NODE_ROLE=api — so setting this
+// flag on the API Deployment is read, stored, and never consulted. That failure
+// deploys green: clean rollout, correct deployed-commit, zero rows drained, and
+// nothing to distinguish it from a drain that ran and found no work. Assert the
+// placement rather than merely the presence.
+test("the hand-back drain flag is enabled on the scheduler tier only", () => {
+  const worker = render("templates/statefulset.yaml");
+  assert.match(
+    worker,
+    /- name: PAPERCLIP_STRANDED_RECOVERY_HAND_BACK_DRAIN_ENABLED\s+value: "true"/,
+    'worker must enable the drain with the literal string "true" — config.ts compares === "true"',
+  );
+  // The gate this tier must satisfy for the flag to mean anything.
+  assert.match(worker, /- name: PAPERCLIP_NODE_ROLE\s+value: worker/);
+
+  const api = render("templates/deployment-api.yaml", [
+    "--set",
+    "api.enabled=true",
+    "--set",
+    "persistence.existingClaim=paperclip-shared",
+  ]);
+  assert.doesNotMatch(
+    api,
+    /PAPERCLIP_STRANDED_RECOVERY_HAND_BACK_DRAIN_ENABLED/,
+    "the API tier runs no scheduler; the flag there is a silent no-op",
+  );
 });
