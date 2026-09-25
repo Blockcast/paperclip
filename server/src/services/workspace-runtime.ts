@@ -3999,15 +3999,20 @@ async function resolveGitRepoRootForWorkspaceCleanup(
 ): Promise<string | null> {
   if (projectWorkspaceCwd) {
     const resolvedProjectWorkspaceCwd = path.resolve(projectWorkspaceCwd);
-    const gitDir = await runGit(["rev-parse", "--git-common-dir"], resolvedProjectWorkspaceCwd)
-      .catch(() => null);
+    // Bounded: the project checkout can sit on the same wedged mount as the
+    // worktree, and spawn's chdir into it would otherwise never return.
+    const gitDir = await runGit(["rev-parse", "--git-common-dir"], resolvedProjectWorkspaceCwd, {
+      timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS,
+    }).catch(() => null);
     if (gitDir) {
       const resolvedGitDir = path.resolve(resolvedProjectWorkspaceCwd, gitDir);
       return path.dirname(resolvedGitDir);
     }
   }
 
-  const gitDir = await runGit(["rev-parse", "--git-common-dir"], worktreePath).catch(() => null);
+  const gitDir = await runGit(["rev-parse", "--git-common-dir"], worktreePath, {
+    timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS,
+  }).catch(() => null);
   if (!gitDir) return null;
   const resolvedGitDir = path.resolve(worktreePath, gitDir);
   return path.dirname(resolvedGitDir);
@@ -4727,6 +4732,19 @@ export type WorktreeReclaimSafety = {
 
 const WORKTREE_RECLAIM_GIT_TIMEOUT_MS = 30_000;
 
+let reclaimFsDeadlineExpiries = 0;
+
+/**
+ * How many filesystem calls `withReclaimFsDeadline` has abandoned in this
+ * process. Each abandoned call can still hold a libuv threadpool thread (there
+ * are 4 by default and `uv_cancel` cannot reach an executing request), so the
+ * collector ends its pass when this moves rather than feeding the next
+ * candidate on the same wedged mount another thread.
+ */
+export function reclaimFsDeadlineExpiryCount(): number {
+  return reclaimFsDeadlineExpiries;
+}
+
 /**
  * Bounds a filesystem call that can block indefinitely on a wedged mount. The
  * collector runs as tracked heartbeat-scheduler work, so an unbounded await in
@@ -4738,6 +4756,7 @@ async function withReclaimFsDeadline<T>(operation: Promise<T>): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   const deadline = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
+      reclaimFsDeadlineExpiries += 1;
       reject(Object.assign(new Error(`filesystem call exceeded ${WORKTREE_RECLAIM_GIT_TIMEOUT_MS}ms`), {
         code: "ETIMEDOUT",
       }));
@@ -4890,8 +4909,15 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
     }
   }
 
+  // A stat that hits its deadline proves nothing either way: skip removal,
+  // and do not stat the same wedged path again for the final check.
+  let worktreeStatExpired = false;
   if (input.workspace.providerType === "git_worktree" && workspacePath) {
-    const worktreeExists = await directoryExists(workspacePath);
+    const worktreeExists = await withReclaimFsDeadline(directoryExists(workspacePath)).catch((err) => {
+      worktreeStatExpired = true;
+      warnings.push(`Could not stat "${workspacePath}": ${(err as NodeJS.ErrnoException)?.code ?? String(err)}.`);
+      return false;
+    });
     if (worktreeExists) {
       if (!repoRoot) {
         warnings.push(`Could not resolve git repo root for "${workspacePath}".`);
@@ -4992,7 +5018,8 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
 
   const cleaned =
     !workspacePath ||
-    !(await directoryExists(workspacePath));
+    (!worktreeStatExpired &&
+      (await withReclaimFsDeadline(directoryExists(workspacePath)).then((exists) => !exists, () => false)));
 
   return {
     cleanedPath: workspacePath,

@@ -372,6 +372,65 @@ describeEmbeddedPostgres("reconcileExecutionWorkspaceCleanup", () => {
     expect(row?.cleanupEligibleAt?.getTime() ?? 0).toBeGreaterThan(Date.now());
   });
 
+  it("ends the pass after a stat hits its deadline instead of feeding the wedged mount another thread", async () => {
+    // An abandoned stat keeps its libuv threadpool thread until the syscall
+    // returns, and the pool is 4 threads process-wide. These trees are
+    // colocated, so continuing the batch would retire the pool one candidate at
+    // a time. The rest are re-selected next window; nothing is lost by stopping.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-wedged-pass-"));
+    tempRoots.add(root);
+    const wedgedPath = path.join(root, "wt-wedged");
+    const nextPath = path.join(root, "wt-next");
+    const wedgedId = await insertWorkspace({
+      worktreePath: wedgedPath,
+      branchName: "wt-wedged",
+      cleanupEligibleAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+      lastUsedAt: hourAgo(),
+    });
+    const nextId = await insertWorkspace({
+      worktreePath: nextPath,
+      branchName: "wt-next",
+      cleanupEligibleAt: hourAgo(),
+      lastUsedAt: hourAgo(),
+    });
+
+    const realStat = fsp.stat.bind(fsp);
+    let reachedWedged!: () => void;
+    const wedgedStatCalled = new Promise<void>((resolve) => {
+      reachedWedged = resolve;
+    });
+    // Only timers are faked: the database client and Date stay real.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const stat = vi.spyOn(fsp, "stat").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+      if (String(target) === wedgedPath) {
+        reachedWedged();
+        return new Promise(() => {});
+      }
+      return (realStat as (...args: unknown[]) => Promise<fs.Stats>)(target, ...rest);
+    }) as typeof fsp.stat);
+    try {
+      const pending = cleanup.reconcileExecutionWorkspaceCleanup();
+      await wedgedStatCalled;
+      await vi.advanceTimersByTimeAsync(30_000);
+      const result = await pending;
+
+      expect(result.scanned).toBe(1);
+      expect(result.collected).toBe(0);
+      expect(result.skipped).toBe(1);
+    } finally {
+      stat.mockRestore();
+      vi.useRealTimers();
+    }
+
+    const [wedged] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, wedgedId));
+    expect(wedged?.cleanupReason).toBe("retained_unverifiable");
+    // Never examined: still eligible, untouched, picked up next window.
+    const [next] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, nextId));
+    expect(next?.status).toBe("active");
+    expect(next?.cleanupReason).toBeNull();
+    expect(next?.cleanupEligibleAt?.getTime() ?? Infinity).toBeLessThanOrEqual(Date.now());
+  });
+
   it("does not touch a workspace that is not yet eligible", async () => {
     const { repo } = createRepoWithRemote();
     const worktreePath = path.join(path.dirname(repo), "wt-active");
