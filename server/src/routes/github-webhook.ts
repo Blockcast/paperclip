@@ -66,9 +66,12 @@ import {
 import {
   githubFetchPrHeadSha,
   githubListPullRequestCommits,
+  githubListOpenPullRequestsByBase,
+  githubResolveMergeHistoryShape,
   githubReviewerIdentityMatches,
   githubListIssueCommentBodies,
   githubPostIssueComment,
+  type MergeHistoryShape,
 } from "../services/github-app-auth.js";
 import {
   buildForeignCommitNoticeBody,
@@ -992,6 +995,10 @@ interface ResolvedEventContext {
   // deliberately NOT captured: the link keys on the BLO- ref, never the author.
   prMerged?: boolean;
   prMergedAt?: string | null;
+  // pull_request.closed only. The commit the merge produced, read solely to
+  // derive whether the merge preserved or rewrote the base's SHAs — which is
+  // what tells a stacked child to retarget vs rebase (BLO-29856).
+  prMergeCommitSha?: string | null;
   prUpdatedAt?: string | null;
   prAdditions?: number | null;
   prDeletions?: number | null;
@@ -1675,6 +1682,7 @@ function resolveEventContextRaw(
         // pulls/{n}/files fetch (enrichment), so it is not read here.
         prMerged: action === "closed" ? merged : undefined,
         prMergedAt: readStringField(pr, "merged_at"),
+        prMergeCommitSha: readStringField(pr, "merge_commit_sha"),
         prUpdatedAt: readStringField(pr, "updated_at"),
         prAdditions: typeof pr?.additions === "number" ? (pr.additions as number) : null,
         prDeletions: typeof pr?.deletions === "number" ? (pr.deletions as number) : null,
@@ -4599,6 +4607,79 @@ function githubContextMetadata(context: ResolvedEventContext) {
   };
 }
 
+/**
+ * Issues carrying a webhook-written `pull_request` work product for `externalId`
+ * (`owner/repo#123`).
+ *
+ * The two `sourceTrust` guards pin the row to this route's own system writer, so
+ * an agent-promoted work product can never make an unrelated issue look like the
+ * PR's owner.
+ *
+ * Extracted (BLO-29856) because the stacked-child fan-out needs exactly this
+ * lookup for a *different* PR than the one the delivery is about. One query, two
+ * callers — a second hand-rolled copy is how the trust guards drift apart.
+ */
+async function selectIssuesLinkedToPullRequest(db: Db, externalId: string) {
+  return db
+    .select({
+      id: issues.id,
+      companyId: issues.companyId,
+      identifier: issues.identifier,
+      assigneeAgentId: issues.assigneeAgentId,
+      status: issues.status,
+      executionState: issues.executionState,
+    })
+    .from(issueWorkProducts)
+    .innerJoin(
+      issues,
+      and(
+        eq(issues.id, issueWorkProducts.issueId),
+        eq(issues.companyId, issueWorkProducts.companyId),
+      ),
+    )
+    .where(
+      and(
+        eq(issueWorkProducts.provider, "github"),
+        eq(issueWorkProducts.type, "pull_request"),
+        eq(issueWorkProducts.externalId, externalId),
+        sql`${issueWorkProducts.metadata}->>'source' = ${PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE}`,
+        sql`${issueWorkProducts.sourceTrust}->>'promotedByActorType' = 'system'`,
+        sql`${issueWorkProducts.sourceTrust}->>'promotedByActorId' = ${PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID}`,
+      ),
+    );
+}
+
+/**
+ * What a stacked child must be told to do once its base branch merged
+ * (BLO-29856). The wording is the deliverable: "just retarget" is actively wrong
+ * after a rebase- or squash-merge, and that is the trap this wake exists to stop
+ * anyone walking into.
+ */
+function stackedChildDirective(shape: MergeHistoryShape): string {
+  switch (shape) {
+    case "merge_commit":
+      return (
+        "The base merged as a merge commit, so its commits are on the target branch " +
+        "under their original SHAs. Retargeting this PR to the base's target branch " +
+        "is sufficient; no rebase is required."
+      );
+    case "rewritten":
+      return (
+        "The base was rebase- or squash-merged, so its commits are on the target " +
+        "branch under NEW SHAs. Do NOT simply retarget: this PR's base SHA is no " +
+        "longer an ancestor, so a bare retarget replays the base PR's entire diff " +
+        "into this one. Rebase onto the target branch instead."
+      );
+    default:
+      return (
+        "The merge method could not be read, so it is unknown whether the base's " +
+        "commit SHAs were preserved. Verify before retargeting: if the base was " +
+        "rebase- or squash-merged, a bare retarget replays its whole diff into " +
+        "this PR and a rebase is required instead."
+      );
+  }
+}
+
 export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
   const router = Router();
 
@@ -5525,33 +5606,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         ? pullRequestExternalId(context.repoFullName, context.prNumber)
         : null;
     const previouslyLinkedPullRequestIssues = pullRequestWorkProductExternalId
-      ? await db
-        .select({
-          id: issues.id,
-          companyId: issues.companyId,
-          identifier: issues.identifier,
-          assigneeAgentId: issues.assigneeAgentId,
-          status: issues.status,
-          executionState: issues.executionState,
-        })
-        .from(issueWorkProducts)
-        .innerJoin(
-          issues,
-          and(
-            eq(issues.id, issueWorkProducts.issueId),
-            eq(issues.companyId, issueWorkProducts.companyId),
-          ),
-        )
-        .where(
-          and(
-            eq(issueWorkProducts.provider, "github"),
-            eq(issueWorkProducts.type, "pull_request"),
-            eq(issueWorkProducts.externalId, pullRequestWorkProductExternalId),
-            sql`${issueWorkProducts.metadata}->>'source' = ${PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE}`,
-            sql`${issueWorkProducts.sourceTrust}->>'promotedByActorType' = 'system'`,
-            sql`${issueWorkProducts.sourceTrust}->>'promotedByActorId' = ${PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID}`,
-          ),
-        )
+      ? await selectIssuesLinkedToPullRequest(db, pullRequestWorkProductExternalId)
       : [];
 
     if (context.identifiers.length === 0 && previouslyLinkedPullRequestIssues.length === 0) {
@@ -5631,6 +5686,145 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         logger.error(
           { err, prNumber: context.prNumber, repoFullName: context.repoFullName },
           "merged-PR forward-capture persist failed",
+        );
+      }
+    }
+
+    // Stacked-PR base-merge fan-out (BLO-29856). A base-branch merge is an event
+    // on a DIFFERENT PR, so every open PR stacked on top of it receives nothing:
+    // it does not become unmergeable, does not fail a check, and does not get a
+    // comment. It just quietly stops being buildable while continuing to look
+    // healthy. Observed: #1439 sat orphaned three days after #1415 merged, and
+    // only a liveness sweep noticed — i.e. the system caught the symptom (an
+    // issue with no action path) days after the cause (a base branch merged).
+    //
+    // Best-effort in both directions: it runs after the forward-capture above so
+    // a persist failure cannot swallow the wake, and it swallows its own failures
+    // so a GitHub read cannot break the delivery.
+    if (
+      eventName === "pull_request" &&
+      context.prMerged === true &&
+      context.prBranch &&
+      context.repoFullName
+    ) {
+      const mergedBaseRef = context.prBranch;
+      const stackedRepoFullName = context.repoFullName;
+      try {
+        const stacked = await githubListOpenPullRequestsByBase({
+          repoFullName: stackedRepoFullName,
+          baseRef: mergedBaseRef,
+        });
+        if ("error" in stacked) {
+          // NOT "no stacked children" — we could not find out. Logged loudly
+          // because the failure mode this block exists to break is silence, and
+          // a swallowed enumeration failure is that same silence one layer up.
+          // The standing field check (open PRs whose base branch no longer
+          // exists) is the backstop.
+          logger.warn(
+            {
+              repoFullName: stackedRepoFullName,
+              mergedBaseRef,
+              prNumber: context.prNumber,
+              reason: stacked.error,
+            },
+            "stacked-PR base-merge fan-out could not enumerate open PRs",
+          );
+        } else if (stacked.pullRequests.length > 0) {
+          if (stacked.truncated) {
+            logger.warn(
+              { repoFullName: stackedRepoFullName, mergedBaseRef, returned: stacked.pullRequests.length },
+              "stacked-PR base-merge fan-out hit the page cap; some children may not be woken",
+            );
+          }
+          // Resolved once for the whole fan-out, and only after we know there is
+          // at least one child to tell — a merge with no stacked children costs
+          // no extra GitHub read at all.
+          const mergeShape: MergeHistoryShape = context.prMergeCommitSha
+            ? await githubResolveMergeHistoryShape({
+              repoFullName: stackedRepoFullName,
+              mergeCommitSha: context.prMergeCommitSha,
+            })
+            : "unknown";
+          const directive = stackedChildDirective(mergeShape);
+          const stackedHeartbeat = heartbeatService(db, {
+            pluginWorkerManager: config.pluginWorkerManager,
+            ...config.heartbeatOptions,
+          });
+
+          for (const child of stacked.pullRequests) {
+            const childIssues = await selectIssuesLinkedToPullRequest(
+              db,
+              pullRequestExternalId(stackedRepoFullName, child.number),
+            );
+            for (const childIssue of childIssues) {
+              // An unassigned or terminal row has nobody to wake; the orphaned
+              // PR is still real, which is what the field check is for.
+              if (!childIssue.assigneeAgentId) continue;
+              if (childIssue.status === "done" || childIssue.status === "cancelled") continue;
+
+              // Keyed on (child issue, child PR, merged base) so a GitHub
+              // redelivery of the same merge is one wake, while a DIFFERENT base
+              // merging later legitimately wakes the child again. Prechecked
+              // because enqueueWakeup stores the key without enforcing it
+              // (BLO-13247).
+              const stackedIdempotencyKey =
+                `stacked_pr_base_merged:${childIssue.id}:${stackedRepoFullName}:${child.number}:${mergedBaseRef}`;
+              const alreadyWoken = await db
+                .select({ id: agentWakeupRequests.id })
+                .from(agentWakeupRequests)
+                .where(
+                  and(
+                    eq(agentWakeupRequests.agentId, childIssue.assigneeAgentId),
+                    eq(agentWakeupRequests.idempotencyKey, stackedIdempotencyKey),
+                    inArray(agentWakeupRequests.status, idempotentWakeStatuses("stable")),
+                  ),
+                )
+                .limit(1)
+                .then((rows) => rows[0] ?? null);
+              if (alreadyWoken) continue;
+
+              await stackedHeartbeat.wakeup(childIssue.assigneeAgentId, {
+                source: "automation",
+                triggerDetail: "system",
+                reason: "github_stacked_pr_base_merged",
+                idempotencyKey: stackedIdempotencyKey,
+                payload: {
+                  issueId: childIssue.id,
+                  source: "github",
+                  event: eventName,
+                  deliveryId,
+                  repoFullName: stackedRepoFullName,
+                  prNumber: child.number,
+                  prUrl: child.url,
+                  mergedBasePrNumber: context.prNumber,
+                  mergedBaseRef,
+                  mergeHistoryShape: mergeShape,
+                  directive,
+                },
+                contextSnapshot: {
+                  issueId: childIssue.id,
+                  taskId: childIssue.id,
+                  wakeReason: "github_stacked_pr_base_merged",
+                  wakeSource: "automation",
+                  wakeTriggerDetail: "system",
+                  commentSource: "github",
+                  githubEvent: eventName,
+                  githubDeliveryId: deliveryId,
+                  githubRepoFullName: stackedRepoFullName,
+                  githubPrNumber: child.number,
+                  githubMergedBasePrNumber: context.prNumber,
+                  githubMergedBaseRef: mergedBaseRef,
+                  githubMergeHistoryShape: mergeShape,
+                  githubStackedChildDirective: directive,
+                },
+              });
+            }
+          }
+        }
+      } catch (err) {
+        logger.error(
+          { err, prNumber: context.prNumber, repoFullName: stackedRepoFullName, mergedBaseRef },
+          "stacked-PR base-merge fan-out failed",
         );
       }
     }
@@ -6536,6 +6730,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
 
 // Test-only re-exports.
 export const __test_extractPaperclipIdentifiers = extractPaperclipIdentifiers;
+export const __test_stackedChildDirective = stackedChildDirective;
 export const __test_hasPrReviewerRequestMention = hasPrReviewerRequestMention;
 export const __test_hasPrReviewerAgentRequestMarker = hasPrReviewerAgentRequestMarker;
 export const __test_hasAllyConsolidatedReviewHeading = hasAllyConsolidatedReviewHeading;

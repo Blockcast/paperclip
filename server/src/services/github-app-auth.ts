@@ -276,6 +276,140 @@ export async function githubGetPullRequestGate(input: {
   return { state: body.state, merged: body.merged === true };
 }
 
+export type OpenPullRequestOnBase = {
+  number: number;
+  title: string | null;
+  url: string | null;
+  headRef: string | null;
+};
+
+export type OpenPullRequestsOnBaseResult =
+  | { pullRequests: OpenPullRequestOnBase[]; truncated: boolean }
+  | { error: string };
+
+const OPEN_PRS_ON_BASE_PAGE_SIZE = 100;
+
+/**
+ * Pure payload parse, split from the fetch so the decision logic is testable
+ * without network or credentials — the same injection-seam reasoning as
+ * `ReadPullRequestGate` in the terminal-gate reconciler.
+ */
+export function parseOpenPullRequestsOnBasePayload(body: unknown): OpenPullRequestsOnBaseResult {
+  // A non-array body is not an empty page. Treating it as one would report a
+  // confident "this branch had no stacked children" for a response we could not
+  // read at all — the same false all-clear `listOpenPullRequests` refuses.
+  if (!Array.isArray(body)) return { error: "open_pull_requests_malformed" };
+
+  const pullRequests: OpenPullRequestOnBase[] = [];
+  for (const entry of body as Array<Record<string, unknown>>) {
+    const number = entry?.number;
+    if (!Number.isInteger(number)) continue;
+    const head = entry?.head as Record<string, unknown> | undefined;
+    pullRequests.push({
+      number: number as number,
+      title: typeof entry?.title === "string" ? entry.title : null,
+      url: typeof entry?.html_url === "string" ? entry.html_url : null,
+      headRef: typeof head?.ref === "string" ? head.ref : null,
+    });
+  }
+  // One page is the whole answer for any real stacked chain. Surface the cap
+  // anyway: a full page means "there may be more", which is a different claim
+  // from "these are all of them", and a silent prefix reads as the latter.
+  return { pullRequests, truncated: body.length >= OPEN_PRS_ON_BASE_PAGE_SIZE };
+}
+
+/**
+ * Open PRs targeting `baseRef` — the stacked children of a branch (BLO-29856).
+ *
+ * Uses GitHub's own `?base=` filter rather than enumerating every open PR and
+ * filtering client-side. A stacked chain is a handful of PRs, so the server-side
+ * filter is one request instead of one per 100 open PRs in the repo.
+ *
+ * Fails closed. An unreadable enumeration is NOT an empty one, and the caller
+ * must be able to tell those apart: coercing a failed read to "no stacked
+ * children" reproduces exactly the silent no-wake this lookup exists to break.
+ */
+export async function githubListOpenPullRequestsByBase(input: {
+  repoFullName: string;
+  baseRef: string;
+  signal?: AbortSignal;
+}): Promise<OpenPullRequestsOnBaseResult> {
+  const tokenResult = await getInstallationTokenResult();
+  if (!tokenResult.ok) return { error: tokenResult.reason };
+
+  const url =
+    `${gitHubApiBase(GITHUB_HOST)}/repos/${input.repoFullName}/pulls` +
+    `?state=open&per_page=${OPEN_PRS_ON_BASE_PAGE_SIZE}&base=${encodeURIComponent(input.baseRef)}`;
+  let res: Response;
+  try {
+    res = await ghFetch(url, {
+      headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` },
+      signal: input.signal,
+    });
+  } catch {
+    return { error: "open_pull_requests_fetch_failed" };
+  }
+  if (!res.ok) {
+    const classified = await classifyGithubHttpFailure("pull_request", res);
+    return { error: classified.reason };
+  }
+  return parseOpenPullRequestsOnBasePayload(await res.json().catch(() => null));
+}
+
+/**
+ * Did the merge preserve the base PR's commit SHAs, or rewrite them? (BLO-29856)
+ *
+ * This decides what a stacked child must be told to do, and the two answers take
+ * opposite actions:
+ *
+ *  - `merge_commit` — the base's commits are on the target branch under their
+ *    original SHAs, so the child's base SHA is still an ancestor and a bare
+ *    retarget is clean.
+ *  - `rewritten` — rebase-merge and squash-merge both land the base's work under
+ *    NEW SHAs. The child's old base is no longer an ancestor, so retargeting
+ *    alone REPLAYS the base PR's entire diff into the child. It needs a rebase.
+ *
+ * Derived from the merge commit's parent count, the only signal GitHub gives:
+ * `pull_request.closed` carries no `merge_method`, and a repo's enabled merge
+ * methods say what was *allowed*, not what was *used*. Two parents is a true
+ * merge commit; one parent is squash or rebase. Squash and rebase are
+ * deliberately NOT told apart — they have the same consequence for a child.
+ *
+ * `unknown` on any read failure, and the caller must say so rather than guess.
+ * Recommending a bare retarget after a rebase is the specific trap this exists
+ * to stop, so an unverified guess in that direction is worse than no advice.
+ */
+export type MergeHistoryShape = "merge_commit" | "rewritten" | "unknown";
+
+/** Pure half of `githubResolveMergeHistoryShape`, split so it is testable without network. */
+export function parseMergeHistoryShape(body: unknown): MergeHistoryShape {
+  const parents = (body as { parents?: unknown } | null)?.parents;
+  if (!Array.isArray(parents)) return "unknown";
+  return parents.length >= 2 ? "merge_commit" : "rewritten";
+}
+
+export async function githubResolveMergeHistoryShape(input: {
+  repoFullName: string;
+  mergeCommitSha: string;
+  signal?: AbortSignal;
+}): Promise<MergeHistoryShape> {
+  const tokenResult = await getInstallationTokenResult();
+  if (!tokenResult.ok) return "unknown";
+  try {
+    const res = await ghFetch(
+      `${gitHubApiBase(GITHUB_HOST)}/repos/${input.repoFullName}/commits/${input.mergeCommitSha}`,
+      {
+        headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` },
+        signal: input.signal,
+      },
+    );
+    if (!res.ok) return "unknown";
+    return parseMergeHistoryShape(await res.json().catch(() => null));
+  } catch {
+    return "unknown";
+  }
+}
+
 /**
  * Terminal-state lookup for a single Actions run, used to decide whether a board
  * approval card that points at that run is still worth a human's attention.

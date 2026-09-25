@@ -14180,6 +14180,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return;
     }
 
+    // Default (`wake_owner`): wake the assignee AND say why on the issue itself
+    // (BLO-29856). The wake alone carries `clearReason` in its payload and the
+    // activity log, neither of which is visible on the thread — so an exhausted
+    // monitor left the issue reading exactly like one whose gates are still
+    // legitimately pending. That is the shape BLO-28908 sat in: `in_review`,
+    // monitor silently gone, nothing on the issue naming a next step, until a
+    // liveness sweep found it. `escalate_to_board` above already writes this
+    // comment; the default policy is the one that did not.
+    //
+    // Written straight to `issueComments` rather than through `issuesSvc.addComment`
+    // (which can enqueue a wake) — the wake below is the intended one. Failure is
+    // logged, never thrown: a comment that does not land must not swallow the wake.
+    try {
+      await db.insert(issueComments).values({
+        companyId: input.claimed.companyId,
+        issueId: input.claimed.id,
+        idempotencyKey: `issue-monitor-recovery:${input.claimed.id}:${input.clearReason}:${input.scheduledAtIso}`,
+        body: monitorRecoveryComment({
+          issue: input.claimed,
+          clearReason: input.clearReason,
+          recoveryPolicy: input.recoveryPolicy,
+          nextAttemptCount: input.nextAttemptCount,
+        }),
+      });
+    } catch (err) {
+      logger.warn(
+        { err, issueId: input.claimed.id, clearReason: input.clearReason },
+        "issue monitor recovery comment insert failed (non-fatal, wake still attempted)",
+      );
+    }
+
     await enqueueWakeup(input.claimed.assigneeAgentId!, {
       source: "automation",
       triggerDetail: "system",
