@@ -630,3 +630,112 @@ describe("postgres.js pool self-heal after an in-flight query never completes", 
     }
   });
 });
+
+/**
+ * BLO-35946, found in review by Ally on #2021.
+ *
+ * `end()` gates BOTH of its clauses on `!connection.reserved`:
+ *
+ *   !connection.reserved && onend(connection),
+ *   !connection.reserved && !initial && !query && sent.length === 0
+ *     ? (terminate(), ...)
+ *     : (closeTimer.start(), ending = new Promise(r => ended = r))
+ *
+ * so a reserved connection skips `onend` — it is NOT in the terminal `ended`
+ * queue — and then falls into the else branch anyway. Arming the bound there
+ * destroys a connection that is still owned by its reserver and perfectly
+ * healthy. `release()` (`c.reserved = null; onopen(c)`) then moves the
+ * terminated, socket-less object back into `open`, bypassing the reconnect
+ * `onclose` had queued; `terminated` only clears in `connect()`, which
+ * `onopen` never calls, so `execute()` short-circuits on it forever.
+ *
+ * That is this incident's exact signature — idle=0/active=1/connecting=0 with
+ * `waiting` climbing — manufactured by the fix, on a connection that never
+ * broke. Pristine 3.4.9 self-heals here, so the bound must not apply.
+ *
+ * Reachability is narrow (a reservation must straddle the random 30-60 min
+ * `max_lifetime` expiry and then outlive `close_timeout`), but `sql.reserve()`
+ * is live on the create-issue hot path via `withReservedCreateIssueAdvisoryDb`
+ * (`server/src/routes/issues.ts:419`), the blast radius is the whole pool, and
+ * `CONNECTION_DESTROYED` is not in `TRANSIENT_DB_SQLSTATES` so `db-retry` does
+ * not cover the milder variant either.
+ *
+ * Mutation-checked: reverting `!connection.reserved &&` alone in the patch's
+ * `closeTimer.start()` line turns this red (probe 0 CONNECTION_DESTROYED, then
+ * `waiting` climbing 1, 2, 3) while every other test in this file stays green.
+ */
+describe("postgres.js close_timeout must not bound a reserved connection", () => {
+  const CLOSE_TIMEOUT_SECONDS = 0.4;
+
+  /**
+   * Retires a connection while it is reserved, with the peer responsive the
+   * whole time, then releases it and asks the pool to serve again.
+   */
+  async function retireWhileReservedThenRelease(harness: Harness) {
+    await harness.sql`select 1`;
+    const reserved = await harness.sql.reserve();
+
+    // `close()` ends every connection while leaving the pool usable. Because
+    // this one is reserved, `end()` takes the else branch without ever calling
+    // `onend` — the case the bound must stay out of.
+    void (harness.sql as unknown as { close: () => Promise<void> }).close();
+
+    // Past the bound, so a wrongly-armed timer has fired by now.
+    await new Promise((resolve) => setTimeout(resolve, CLOSE_TIMEOUT_SECONDS * 1000 + 300));
+
+    reserved.release();
+    await drainImmediates();
+
+    // Four probes, not one: the first can legitimately fail on a connection
+    // being retired, and it is the *unbounded* climb afterwards that is the
+    // regression. Deliberately raced rather than awaited, so the failure shows
+    // up as an assertion instead of an opaque test timeout.
+    const outcomes: string[] = [];
+    for (let index = 0; index < 4; index += 1) {
+      outcomes.push(
+        await Promise.race([
+          harness.sql`select ${index}`.then(
+            () => "recovered",
+            (error: { code?: string }) => `rejected:${error.code ?? "unknown"}`,
+          ),
+          new Promise<string>((resolve) => setTimeout(() => resolve("still-wedged"), 600)),
+        ]),
+      );
+    }
+    return outcomes;
+  }
+
+  it("leaves a healthy reserved connection usable after release, with the bound armed", async () => {
+    const harness = createHarness({ max_lifetime: null, close_timeout: CLOSE_TIMEOUT_SECONDS });
+    try {
+      const outcomes = await retireWhileReservedThenRelease(harness);
+
+      // The pool keeps serving. With the guard reverted this reads
+      // ["rejected:CONNECTION_DESTROYED", "still-wedged", "still-wedged", "still-wedged"].
+      expect(outcomes).toEqual(["recovered", "recovered", "recovered", "recovered"]);
+
+      // And the incident arithmetic never appears: nothing is queued behind a
+      // connection the pool can no longer hand out.
+      expect(harness.poolStats().waiting).toBe(0);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+
+  it("behaves identically to pristine 3.4.9, which has no bound at all", async () => {
+    // Standing control. `timer()` returns a no-op pair for a falsy interval, so
+    // this is unpatched `end()` behaviour — it must already pass, and it is what
+    // proves the assertion above is pinning the guard rather than the scenario.
+    const harness = createHarness({ max_lifetime: null, close_timeout: null });
+    try {
+      expect(await retireWhileReservedThenRelease(harness)).toEqual([
+        "recovered",
+        "recovered",
+        "recovered",
+        "recovered",
+      ]);
+    } finally {
+      await harness.shutdown();
+    }
+  });
+});
