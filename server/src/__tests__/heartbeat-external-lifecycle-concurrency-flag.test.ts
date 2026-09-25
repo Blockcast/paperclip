@@ -334,12 +334,33 @@ describe("resolveK8sRunIsolationIdentity: writer key follows the tree, not the r
     ).toEqual({ isolationMode: "run", isolationKey: "run:run-A", reservationKey: "run:run-A" });
   });
 
-  // AC4 lower bound. `agent-shared:<agentId>` is already STRICTER than per-tree
-  // -- one writer per agent -- so substituting a tree key there would LOOSEN it
-  // and let a concurrency-1 agent hold two reservations for different issues,
-  // inverting BLO-16842's containment. Exclusivity at concurrency 1 comes from
-  // the shared key, not from this fix.
-  it("leaves the shared concurrency-1 key alone", () => {
+  // BLO-19422 REVERSES BLO-31443's AC4 lower bound. Do not "restore" this.
+  //
+  // This test used to assert the opposite -- that the concurrency-1 shared key
+  // is left alone -- on the reasoning that `agent-shared:<agentId>` is "already
+  // STRICTER than per-tree, one writer per agent", and that widening it would
+  // invert BLO-16842's containment. Both halves were wrong:
+  //
+  // - `agent-shared` is stricter along the AGENT axis and carries NO tree scope,
+  //   so it cannot exclude ACROSS agents. Agent A and agent B both running
+  //   `project_primary` on one project workspace held `agent-shared:A` and
+  //   `agent-shared:B`, both satisfied the writer index, and both wrote one
+  //   directory -- BLO-19422's measured defect. Because `concurrencyEnabled`
+  //   defaults false, this was the DEFAULT path, not an edge case.
+  // - Containment is mostly not this index's job. The per-agent ceiling is
+  //   enforced at dispatch by `availableSlots = effectiveMaxConcurrentRuns -
+  //   runningCount` in `startNextQueuedRunForAgent` -- except where BLO-12990
+  //   excludes a silent run from `countRunsOccupyingSlots`, which lets a second
+  //   run in at effective concurrency 1. There, and only there, this key was
+  //   doing real containment work and widening it gives that up. See the KNOWN
+  //   GAP on `resolveWorkspaceWriterTreeKey`: that case needs a silent run AND
+  //   an un-backfilled issue, where the cross-agent defect above needs neither.
+  //
+  // Nor does widening loosen the case the old rationale named: two runs of one
+  // agent on DIFFERENT issues of one project checkout both key
+  // `project-primary:<pw>` and still collide. Keys only diverge where the
+  // directories genuinely do.
+  it("tree-scopes the shared concurrency-1 reservation, keeping isolationKey agent-scoped", () => {
     expect(
       resolveK8sRunIsolationIdentity({
         ...base,
@@ -347,6 +368,30 @@ describe("resolveK8sRunIsolationIdentity: writer key follows the tree, not the r
         isWorkspaceIsolated: false,
         persistedExecutionWorkspaceId: null,
         perIssueWorkspaceTreeKey: treeKey,
+        effectiveMaxConcurrentRuns: 1,
+      }),
+    ).toEqual({
+      isolationMode: "shared",
+      // Unchanged, and load-bearing: `isolationKey` derives the home/session
+      // roots and gates saved-session resume. At concurrency 1 the agent keeps
+      // its warm shared roots; only `reservationKey` widens to the tree.
+      isolationKey: "agent-shared:agent-abc",
+      reservationKey: `workspace-tree:${treeKey}`,
+    });
+  });
+
+  // The lower bound that DOES still hold: with no tree key there is nothing to
+  // scope to, so the run keeps the agent-scoped key rather than being handed a
+  // more permissive one. This is the un-backfilled-issue gap documented on
+  // `resolveWorkspaceWriterTreeKey` -- accepted, not overlooked.
+  it("keeps the agent-scoped key when there is no tree to scope to", () => {
+    expect(
+      resolveK8sRunIsolationIdentity({
+        ...base,
+        runId: "run-A",
+        isWorkspaceIsolated: false,
+        persistedExecutionWorkspaceId: null,
+        perIssueWorkspaceTreeKey: null,
         effectiveMaxConcurrentRuns: 1,
       }),
     ).toEqual({ isolationMode: "shared", isolationKey: "agent-shared:agent-abc", reservationKey: "agent-shared:agent-abc" });
