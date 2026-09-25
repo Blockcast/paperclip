@@ -537,6 +537,37 @@ jobs:
         run: node --test ./scripts/check-comment-review-gate-census.test.mjs
         timeout-minutes: 1
 
+      - name: Test merge-gate reader
+        if: ${{ !cancelled() }}
+        # The fleet-mandated reader has shipped four false-GREENs, each because a
+        # filter was added without checking what it prints when it matches EVERY
+        # row: BLO-34035 (neutral dropped), BLO-34114 (dedup key not unique),
+        # BLO-34263 (dead-run filter eats the whole surface, empty output reads as
+        # a pass), BLO-34619 (supersession proxied through id ordering, then
+        # through an un-ordered sibling test). All four are pinned here. Every
+        # guard swept so far is mutation-checked — reverting any ONE alone fails
+        # this suite — but read that as a record of what the sweeps covered, not
+        # as a property of the file: the 09-19 `28/28` asserted exactly this
+        # universally while a coarse mutation hid an unkilled arm (the
+        # `*[!0-9a-f]*` arm named below). The claim is only ever as wide as the
+        # last sweep.
+        # A guard with no failing mutation is a comment — add
+        # the mutation before you trust the fixture. Last swept 2026-09-23 after
+        # BLO-34835 (victim widened to `failure`, in-flight `""` fence): 17/17
+        # dead_runs()+verdicts()+extract() mutations killed at this head.
+        # require_sha's `*[!0-9a-f]*` arm in merge-gate-read.sh was unkilled
+        # until the 40-non-hex fixture was added; dropping merge-gate-read.sh's
+        # `sort -n` and `-k4,4` are equivalent mutations, not unkilled guards. On
+        # 2026-09-19 two had survived and were caught by sweeping
+        # rather than by reading — an inert `newest_pass != ""` (deleted) and an
+        # unpinned max-tracking term (fixture added). Re-run the sweep when you
+        # add a guard; do not extend this claim on inspection alone. Anchor each
+        # mutation to the CODE line: every guard is quoted verbatim in the
+        # comment above it, so a first-occurrence replace edits the prose and
+        # reports a working guard as unkillable.
+        run: node --test ./scripts/merge-gate-read.test.mjs
+        timeout-minutes: 1
+
       - name: Test comment-review-gate merge-queue mirror
         if: ${{ !cancelled() }}
         # Guards the no-`pending` invariant in particular: a pending required
