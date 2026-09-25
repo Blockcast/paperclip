@@ -3758,8 +3758,22 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
    *
    * `countIssueRunsSince` keeps the predicate — it counts *runs on this issue*,
    * where scoping the run is the right question.
+   *
+   * `runScoped: true` restores it for the `high_churn` comment arms only. That
+   * gate asks whether the agent is churning *on this issue*, and a routine
+   * posting one receipt per fire to its log row is the row working as designed:
+   * those runs are scoped to the per-fire execution issue, so they never reach
+   * this row's `latestRuns` and `routineOnlySamplingWindow` cannot suppress
+   * them. Counting them there would let a row with no runs of its own raise
+   * `high_churn` on receipts alone.
    */
-  async function countIssueCommentsSince(companyId: string, issueId: string, agentId: string, since?: Date) {
+  async function countIssueCommentsSince(
+    companyId: string,
+    issueId: string,
+    agentId: string,
+    since?: Date,
+    options?: { runScoped?: boolean },
+  ) {
     return db
       .select({ count: sql<number>`count(*)::int` })
       .from(issueComments)
@@ -3771,6 +3785,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           eq(issueComments.authorAgentId, agentId),
           eq(heartbeatRuns.companyId, companyId),
           eq(heartbeatRuns.agentId, agentId),
+          options?.runScoped ? issueRunScopeSql(issueId) : undefined,
           since ? sql`${issueComments.createdAt} >= ${since.toISOString()}::timestamptz` : undefined,
         ),
       )
@@ -4136,6 +4151,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       assigneeRunCommentCount,
       assigneeRunCommentCountLastHour,
       assigneeRunCommentCountLastSixHours,
+      churnCommentCountLastHour,
+      churnCommentCountLastSixHours,
       latestComments,
       mostRecentDispatchAt,
       costRow,
@@ -4148,6 +4165,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id),
       countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, oneHourAgo),
       countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, sixHoursAgo),
+      countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, oneHourAgo, { runScoped: true }),
+      countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, sixHoursAgo, { runScoped: true }),
       // BLO-35893: same widening as `countIssueCommentsSince` — no
       // `issueRunScopeSql` here. `Latest Assignee Run Comments` is a list of
       // comments *on this issue*, so filtering by the authoring run's context
@@ -4553,9 +4572,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       elapsedMs !== null && elapsedMs >= thresholds.longActiveMs && !noExecutableTurnDominantAndOpen;
     const highChurn =
       runCountLastHour >= thresholds.highChurnHourly ||
-      assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||
+      churnCommentCountLastHour >= thresholds.highChurnHourly ||
       runCountLastSixHours >= thresholds.highChurnSixHours ||
-      assigneeRunCommentCountLastSixHours >= thresholds.highChurnSixHours;
+      churnCommentCountLastSixHours >= thresholds.highChurnSixHours;
     // BLO-27698 B3b: the escape hatch B3 owes. Keyed on a single run's own
     // still-live execution span, not on the episode, so it survives B3's
     // narrowing of `long_active_duration` to the unattended bucket — an episode
@@ -4635,7 +4654,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     }
     if (highChurn) {
       triggerReasons.push(
-        `${runCountLastHour} runs/${assigneeRunCommentCountLastHour} assignee-run comments in 1h; ${runCountLastSixHours} runs/${assigneeRunCommentCountLastSixHours} assignee-run comments in 6h`,
+        `${runCountLastHour} runs/${churnCommentCountLastHour} assignee-run comments in 1h; ${runCountLastSixHours} runs/${churnCommentCountLastSixHours} assignee-run comments in 6h`,
       );
     }
 

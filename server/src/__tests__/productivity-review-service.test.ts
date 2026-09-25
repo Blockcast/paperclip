@@ -27,6 +27,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { MAX_ISSUE_REQUEST_DEPTH } from "@paperclipai/shared";
 import {
+  DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY,
   DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS,
   DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
   DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS,
@@ -5497,6 +5498,44 @@ describeEmbeddedPostgres("productivity review service", () => {
     // `issueRunScopeSql` from `countIssueRunsSince` too — the cross-scope run
     // sits 3h back, so a loosened runs query would read `1/6h` here.
     expect(description).toContain("Runs in rolling windows: 0/1h, 0/6h");
+  });
+
+  // BLO-35893, the other direction. The widened count is for the reported line
+  // and the listing; the `high_churn` comment arms stay run-scoped. A routine
+  // posting one receipt per fire to its log row authors each from a run scoped
+  // to that fire's execution issue, so the row's own `latestRuns` is empty and
+  // `routineOnlySamplingWindow` cannot suppress it. Counting those receipts in
+  // the gate would raise `high_churn` on an issue with no runs of its own.
+  it("does not raise high_churn on cross-scope receipts alone", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const otherIssueId = randomUUID();
+    const receiptRuns = await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: otherIssueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY,
+      now: new Date(now.getTime() - 60_000),
+    });
+    expect(receiptRuns).toHaveLength(DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY);
+    await db.insert(issueComments).values(
+      receiptRuns.map((run, index) => {
+        const at = new Date(now.getTime() - (index + 1) * 60_000);
+        return {
+          companyId: seeded.companyId,
+          issueId: seeded.issueId,
+          authorAgentId: seeded.coderId,
+          createdByRunId: run!.id,
+          body: `Routine receipt ${index}.`,
+          createdAt: at,
+          updatedAt: at,
+        };
+      }),
+    );
+
+    await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
 
   it("recovers a Next line from an assignee comment instead of reporting 'none recorded'", async () => {
