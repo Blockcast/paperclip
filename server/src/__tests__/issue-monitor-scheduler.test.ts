@@ -1176,7 +1176,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   it("creates the recovery issue and comments when its wake is suppressed (PEN-3326)", async () => {
     const { issueId, companyId } = await seedFixture({
       agentStatus: "paused",
-      monitorAttemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS - 1,
+      monitorAttemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
       monitor: { recoveryPolicy: "create_recovery_issue" },
     });
     const heartbeat = createHeartbeat();
@@ -1245,7 +1245,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   it("stops deferring a suppressed dispatch at the attempt ceiling and escalates (PEN-3326)", async () => {
     const { issueId } = await seedFixture({
       agentStatus: "paused",
-      monitorAttemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS - 1,
+      monitorAttemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
       monitor: { recoveryPolicy: "escalate_to_board" },
     });
     const heartbeat = createHeartbeat();
@@ -1272,13 +1272,43 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(actions).toContain("issue.monitor_escalated_to_board");
   });
 
+  // The ceiling counts attempts ALREADY made (`exhaustedMonitorClearReason`), so
+  // the last in-budget suppression still defers. At `maxAttempts: 1` a monitor
+  // with no attempts yet gets exactly one deferral; checking the post-increment
+  // count gave it none, so the first paused seat destroyed the schedule.
+  it("defers the last in-budget suppressed dispatch instead of exhausting it (PEN-3326)", async () => {
+    const { issueId } = await seedFixture({
+      agentStatus: "paused",
+      monitorAttemptCount: 0,
+      monitor: { maxAttempts: 1, recoveryPolicy: "escalate_to_board" },
+    });
+    const heartbeat = createHeartbeat();
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+
+    const result = await heartbeat.__test_tickDueIssueMonitors(tickAt);
+
+    expect(result.dispatchSuppressedDeferred).toBe(1);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorNextCheckAt).not.toBeNull();
+    expect(issue.monitorAttemptCount).toBe(1);
+
+    const actions = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.map((row) => row.action));
+    expect(actions).toContain("issue.monitor_dispatch_suppressed_deferred");
+    expect(actions).not.toContain("issue.monitor_exhausted");
+  });
+
   // The default recovery policy wakes the issue's own assignee — the very seat
   // that could not be woken. Without a fallback the escalation is suppressed by
   // the same gate it is reporting, and the loss goes quiet again.
   it("leaves a comment when the owner-recovery wake is itself suppressed (PEN-3326)", async () => {
     const { issueId } = await seedFixture({
       agentStatus: "paused",
-      monitorAttemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS - 1,
+      monitorAttemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
       monitor: { recoveryPolicy: "wake_owner" },
     });
     const heartbeat = createHeartbeat();

@@ -14361,21 +14361,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         kind: "rearmed";
         result: { outcome: "dispatch_suppressed_deferred"; nextCheckAt: string; suppressionReason: string };
       }
-      | { kind: "exhausted"; clearReason: IssueExecutionMonitorClearReason }
       | { kind: "unpersistable" }
     > => {
-      // Evaluated against the INCREMENTED count, which is the count this re-arm
-      // persists. The bound is what terminates a suppression that never clears,
-      // and termination here is the loud path: `clearIssueMonitorAndRecover`
-      // logs `issue.monitor_exhausted` and fires the configured recoveryPolicy.
-      const exhausted = exhaustedMonitorClearReason({
-        monitor,
-        attemptCount: nextAttemptCount,
-        now: input.now,
-        defaultMaxAttempts: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
-      });
-      if (exhausted) return { kind: "exhausted", clearReason: exhausted };
-
+      // No exhaustion check here. The top-level `clearReason` above already ran
+      // `exhaustedMonitorClearReason` against `priorAttemptCount` and the same
+      // `input.now`, so reaching this point means the budget is not spent. This
+      // re-arm persists `nextAttemptCount`, and the next pass's top-level check
+      // routes a spent budget to `clearIssueMonitorAndRecover` (the loud path:
+      // `issue.monitor_exhausted` plus the configured recoveryPolicy), exactly as
+      // the `dependency_blocked` deferral below terminates. Re-checking the
+      // INCREMENTED count here moved the ceiling by one: at `maxAttempts: 1` a
+      // suppressed dispatch got no deferral at all.
       const retryAt = new Date(input.now.getTime() + suppressedDispatchRearmDelayMs(nextAttemptCount));
       const retryPolicy = monitor
         ? normalizeIssueExecutionPolicy({
@@ -14573,23 +14569,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (monitorSuppression.durableSkipReason) {
         const deferral = await deferSuppressedDispatch(monitorSuppression.durableSkipReason, null);
         if (deferral.kind === "rearmed") return deferral.result;
-        if (deferral.kind === "exhausted") {
-          return clearIssueMonitorAndRecover({
-            claimed,
-            policy,
-            scheduledAtIso,
-            nextAttemptCount,
-            clearReason: deferral.clearReason,
-            recoveryPolicy,
-            monitor,
-            now: input.now,
-            actorType: input.actorType,
-            actorId: input.actorId,
-            agentId: input.agentId,
-            runId: input.runId,
-            activitySource: input.activitySource,
-          });
-        }
         // `unpersistable` — fall through to the triggered patch, which at least
         // terminates the row rather than leaving it re-claiming forever. This is
         // the pre-existing behaviour for policy drift, unchanged.
@@ -14647,23 +14626,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (input.clearOnClientError && monitorSuppression.durableSkipReason) {
           const deferral = await deferSuppressedDispatch(monitorSuppression.durableSkipReason, err.message);
           if (deferral.kind === "rearmed") return deferral.result;
-          if (deferral.kind === "exhausted") {
-            return clearIssueMonitorAndRecover({
-              claimed,
-              policy,
-              scheduledAtIso,
-              nextAttemptCount,
-              clearReason: deferral.clearReason,
-              recoveryPolicy,
-              monitor,
-              now: input.now,
-              actorType: input.actorType,
-              actorId: input.actorId,
-              agentId: input.agentId,
-              runId: input.runId,
-              activitySource: input.activitySource,
-            });
-          }
           // `unpersistable` — fall through to the clear below, unchanged.
         }
         if (input.clearOnClientError) {
