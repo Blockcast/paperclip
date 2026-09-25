@@ -1,0 +1,1345 @@
+// PEN-3156: the THIRD egress door. PEN-2527 put `scrubGitHubEgressText` in front
+// of the GitHub CLI and PEN-3152 put it in front of the `github` MCP server. The
+// `git` wrapper the Helm seed writes alongside them reaches the same destination
+// with the same seat token and, on a push, publishes commit messages and file
+// contents — a strict superset of what `create_or_update_file` / `push_files`
+// carry — with no scrubber anywhere on the path.
+//
+// This door cannot be fixed the way the other two were. Both of those rewrite a
+// payload in flight, which is available to them precisely because nothing has
+// hashed it yet. A commit object is content-addressed: altering a blob or a
+// message after the fact changes that commit's SHA and every descendant's,
+// breaks any signature over them, and desynchronises the agent's local ref from
+// what landed. So the enforcement here is REFUSAL, not redaction — the push is
+// stopped and the author is told which commit to amend.
+//
+// Everything in this module is pure. Git is reached only through the injected
+// `runGit` callback, so the classification and scanning rules are testable
+// without a repository, a remote, or a network.
+
+import {
+  type GitHubEgressScrubClass,
+  scrubGitHubEgressText,
+} from "./github-egress-scrub.js";
+
+/**
+ * Git global options that consume a SEPARATE following token.
+ *
+ * Getting this set wrong is not cosmetic: it shifts which token is read as the
+ * subcommand. `git -c foo=bar push` would classify as a `foo=bar` subcommand
+ * and the push would sail past the guard, so this list is the guard's integrity
+ * rather than a parsing nicety. The `--opt=value` spelling is self-contained and
+ * is handled separately.
+ *
+ * ONE KNOWN MISMATCH WITH GIT, and it is safe in the one direction that
+ * matters. `--exec-path` takes a value only in its `=` form: bare
+ * `--exec-path` PRINTS the exec path and exits without consuming the next
+ * token. So for `git --exec-path push origin main` this scan skips `push` as a
+ * value and classifies `origin` as the subcommand — not a push, no hook
+ * injected. That costs nothing, because git does not push on that invocation
+ * either: measured against git 2.47.3, it printed `/usr/lib/git-core`, exited
+ * 0, and left the remote with no refs. An invocation that publishes nothing
+ * cannot be a hole.
+ *
+ * Do not read the rest of this set as an exact model of git's parser on the
+ * strength of that one. The property the set needs is narrower: over-skipping
+ * is safe only while the over-skipped invocation publishes nothing, and
+ * UNDER-skipping is what opens a hole. Anything added here should be checked
+ * against git for which of the two it can do.
+ */
+const VALUE_TAKING_GLOBAL_OPTIONS: ReadonlySet<string> = new Set([
+  "-C",
+  "-c",
+  "--exec-path",
+  "--git-dir",
+  "--work-tree",
+  "--namespace",
+  "--super-prefix",
+  "--config-env",
+  "--attr-source",
+]);
+
+/** The flag that skips the pre-push hook. */
+const NO_VERIFY_FLAG = "--no-verify";
+
+/**
+ * True for any token git would resolve to `--no-verify`.
+ *
+ * Matching the fully-spelled flag alone was a measured bypass. Git's
+ * `parse-options` accepts any unambiguous long-option ABBREVIATION, so
+ * `--no-veri` and `--no-verif` are `--no-verify` to git while matching no
+ * literal spelling here. Measured against git 2.47.3:
+ *
+ *   git -c core.hooksPath=<h> push --no-veri origin HEAD:refs/heads/t
+ *
+ * printed no hook output and landed the ref on the remote, while the same push
+ * without the flag ran the hook and was refused. The alias leg had the same gap
+ * (`alias.q = push --no-veri`).
+ *
+ * So this tests "could this token be that flag?" rather than enumerating
+ * spellings — the enumeration is exactly the parser-disagrees-with-git failure
+ * this module sets out to avoid, and a new git release could shorten the
+ * accepted prefix without anything here changing. `--no-ver` and shorter are
+ * ambiguous with `--no-verbose` and git rejects them outright; refusing them
+ * too costs nothing, because no command git accepts is being turned away.
+ *
+ * The length floor keeps the bare `--` end-of-options separator out.
+ *
+ * `-n` is deliberately NOT matched. For `push` it means `--dry-run`, not
+ * `--no-verify` (see the subcommand's own `-h` output), and it is harmless
+ * twice over: the pre-push hook still runs under it, and a dry run publishes
+ * nothing even if it did not. Refusing it would reject a safe command while
+ * telling the author something untrue about why.
+ *
+ * The global-option scan needs no equivalent: git does NOT abbreviate those.
+ * Measured — `--config-e`, `--config-en` and `--exec-p` are each rejected with
+ * `unknown option`.
+ */
+function isNoVerifyFlag(token: string): boolean {
+  return token.length > 2 && NO_VERIFY_FLAG.startsWith(token);
+}
+
+/** The config key whose value decides which directory git reads hooks from. */
+const HOOKS_PATH_KEY = "core.hookspath";
+
+/** The config section under which an assignment defines an alias. */
+const ALIAS_KEY_PREFIX = "alias.";
+
+/**
+ * Git verbs that do NOT publish to a remote, and so may pass through unguarded.
+ *
+ * This is an allowlist, and the direction is the point. The obvious shape is a
+ * denylist — refuse `send-pack`, guard `push`, pass everything else — and it
+ * was the shape this guard shipped with, as `subcommand === "push"`. It fails
+ * OPEN on every verb nobody thought of, which is not a hypothetical: `git
+ * send-pack <url> <ref>` classified as not-a-push, went through untouched, and
+ * published. Measured against git 2.47.3, `git -c core.hooksPath=<hooks>
+ * send-pack <remote> HEAD:refs/heads/x` printed `* [new branch]`, landed the
+ * ref, and produced no hook output at all — the guard's own injected config was
+ * present and made no difference, because `send-pack` is plumbing and never
+ * consults the pre-push hook. Only `push` runs it.
+ *
+ * So an unrecognised verb refuses. The cost is a loud, self-describing refusal
+ * on a verb that turns out to be harmless, which an operator fixes by adding it
+ * here. The cost of the other direction is a silent publish, which nobody sees.
+ *
+ * Derived from `git --list-cmds=builtins,main,others,nohelpers` at git 2.47.3
+ * (157 verbs), less three groups held back deliberately:
+ *
+ *   publishing    `push` (guarded, not listed here), `send-pack`, `http-push`,
+ *                 and `subtree`, whose `push` mode shells out to a bare `git`
+ *                 that resolves to git's own exec-path rather than back through
+ *                 this wrapper.
+ *   transport     `remote-http{,s}`, `remote-ext`, `remote-fd`, `remote-ftp{,s}`.
+ *                 Invoked directly these speak the transport protocol on stdin,
+ *                 which includes push.
+ *   server/egress `daemon`, `http-backend`, `instaweb`, `shell`, `receive-pack`,
+ *                 `upload-pack`, `upload-archive`, `imap-send`. None has an
+ *                 agent use, and each either serves the repository to the
+ *                 network or sends its contents somewhere.
+ *
+ * A third-party verb (`git lfs`, `git flow`) is unrecognised and therefore
+ * refused. That is correct for those two specifically — both publish.
+ */
+const NON_PUBLISHING_GIT_VERBS: ReadonlySet<string> = new Set([
+  "add", "am", "annotate", "apply", "archive", "bisect", "blame", "branch",
+  "bugreport", "bundle", "cat-file", "check-attr", "check-ignore",
+  "check-mailmap", "check-ref-format", "checkout", "checkout-index", "cherry",
+  "cherry-pick", "clean", "clone", "column", "commit", "commit-graph",
+  "commit-tree", "config", "count-objects", "credential", "credential-cache",
+  "credential-store", "describe", "diagnose", "diff", "diff-files",
+  "diff-index", "diff-tree", "difftool", "fast-export", "fast-import", "fetch",
+  "fetch-pack", "filter-branch", "fmt-merge-msg", "for-each-ref",
+  "for-each-repo", "format-patch", "fsck", "fsck-objects", "gc",
+  "get-tar-commit-id", "grep", "hash-object", "help", "hook", "http-fetch",
+  "index-pack", "init", "init-db", "interpret-trailers", "log", "ls-files",
+  "ls-remote", "ls-tree", "mailinfo", "mailsplit", "maintenance", "merge",
+  "merge-base", "merge-file", "merge-index", "merge-octopus", "merge-one-file",
+  "merge-ours", "merge-recursive", "merge-recursive-ours",
+  "merge-recursive-theirs", "merge-resolve", "merge-subtree", "merge-tree",
+  "mergetool", "mktag", "mktree", "multi-pack-index", "mv", "name-rev", "notes",
+  "pack-objects", "pack-redundant", "pack-refs", "patch-id", "pickaxe", "prune",
+  "prune-packed", "pull", "quiltimport", "range-diff", "read-tree", "rebase",
+  "reflog", "refs", "remote", "repack", "replace", "replay", "request-pull",
+  "rerere", "reset", "restore", "rev-list", "rev-parse", "revert", "rm",
+  "shortlog", "show", "show-branch", "show-index", "show-ref",
+  "sparse-checkout", "stage", "stash", "status", "stripspace", "switch",
+  "symbolic-ref", "tag", "unpack-file", "unpack-objects", "update-index",
+  "update-ref", "update-server-info", "var", "verify-commit", "verify-pack",
+  "verify-tag", "version", "whatchanged", "worktree", "write-tree",
+]);
+
+/**
+ * Verbs known to publish, as opposed to merely unrecognised.
+ *
+ * Enforcement does NOT read this set — {@link NON_PUBLISHING_GIT_VERBS} decides
+ * that, so a publishing verb missing from here is still refused. It exists only
+ * so the refusal can say "this publishes without running the hook" where that
+ * is known, instead of the weaker "I do not recognise this", which reads like a
+ * tooling gap rather than a security decision and invites the wrong fix.
+ */
+const KNOWN_PUBLISHING_GIT_VERBS: ReadonlySet<string> = new Set([
+  "push", "send-pack", "http-push", "subtree", "remote-http", "remote-https",
+  "remote-ext", "remote-fd", "remote-ftp", "remote-ftps",
+]);
+
+/**
+ * True when `verb` is one git will run without any chance of publishing.
+ *
+ * Case-sensitive, matching git: `git STATUS` is not `git status` (measured
+ * against git 2.47.3 — `git: 'STATUS' is not a git command`). Folding here
+ * would admit spellings git itself rejects, which is a widening with no caller.
+ */
+export function isNonPublishingGitVerb(verb: string): boolean {
+  return NON_PUBLISHING_GIT_VERBS.has(verb);
+}
+
+/** True when `verb` is a verb this guard knows publishes to a remote. */
+export function isKnownPublishingGitVerb(verb: string): boolean {
+  return KNOWN_PUBLISHING_GIT_VERBS.has(verb);
+}
+
+/**
+ * How many alias hops resolution will walk before refusing.
+ *
+ * Bounded rather than recursive because the config defining the chain is
+ * agent-writable, so an unbounded walk is a denial of service on ourselves. The
+ * bound is safe only because exhausting it REFUSES; see the post-loop check in
+ * {@link classifyGitInvocation}, where falling through instead was a measured
+ * hook bypass.
+ */
+export const ALIAS_HOP_LIMIT = 4;
+
+/**
+ * How many objects an annotated-tag chain is peeled through before refusing.
+ *
+ * Bounded for the same reason as {@link ALIAS_HOP_LIMIT} — the chain is
+ * agent-writable and a cycle must not spin a push forever — and safe for the
+ * same reason: exhausting it refuses. Set well above any legitimate shape; a
+ * tag pointing at a tag is already unusual and a chain of sixteen has no honest
+ * use.
+ */
+export const TAG_PEEL_LIMIT = 16;
+
+/**
+ * The environment `--config-env` reads through.
+ *
+ * Narrower than `NodeJS.ProcessEnv` on purpose: this module is pure, and taking
+ * the lookup as data keeps `--config-env` testable without mutating the real
+ * environment.
+ */
+export type GitEgressEnv = Readonly<Record<string, string | undefined>>;
+
+/** The key half of a `<name>=<value>` config assignment, case-folded. */
+function assignmentKey(assignment: string): string {
+  return (assignment.split("=", 1)[0] ?? "").trim().toLowerCase();
+}
+
+/**
+ * True when a `<name>=<value>` config assignment targets `core.hooksPath`.
+ *
+ * The comparison is case-folded because git config keys are case-insensitive in
+ * their section and variable names: `-c CORE.HOOKSPATH=...` sets exactly the
+ * same key as `-c core.hooksPath=...`, and a case-sensitive check here would see
+ * only one of the two spellings. Verified against git 2.47.3.
+ */
+function isHooksPathAssignment(assignment: string): boolean {
+  return assignmentKey(assignment) === HOOKS_PATH_KEY;
+}
+
+/**
+ * The alias a `<name>=<value>` config assignment defines, or null.
+ *
+ * Case-folded for the same reason {@link isHooksPathAssignment} is, and
+ * measured the same way: against git 2.47.3, `-c alias.YOLO=...` defines the
+ * alias `git yolo` runs and `-c ALIAS.zz=...` defines `git zz`, so a
+ * case-sensitive match here would see one spelling of three.
+ *
+ * An assignment carrying no `=` defines nothing. Git rejects `-c alias.b`
+ * outright (`missing value for 'alias.b'`, `fatal: unable to parse command-line
+ * config`), so there is no boolean-true alias to model.
+ */
+function aliasAssignment(
+  assignment: string,
+  options: { fromEnv: boolean; env: GitEgressEnv },
+): { name: string; expansion: string } | null {
+  const separator = assignment.indexOf("=");
+  if (separator < 0) return null;
+  const key = assignmentKey(assignment);
+  if (!key.startsWith(ALIAS_KEY_PREFIX)) return null;
+  const name = key.slice(ALIAS_KEY_PREFIX.length);
+  if (!name) return null;
+  const raw = assignment.slice(separator + 1);
+  // `--config-env` names an environment variable; `-c` carries the value itself.
+  const expansion = options.fromEnv ? options.env[raw] : raw;
+  return expansion === undefined ? null : { name, expansion };
+}
+
+interface GlobalOptionScan {
+  /** Index of the first token that is not a global option or its value. */
+  subcommandIndex: number;
+  /** A caller-supplied `core.hooksPath` override, as spelled, or null. */
+  hooksPathOverride: string | null;
+  /** Aliases this token run defines, keyed by case-folded name. */
+  aliasDefinitions: Map<string, string>;
+}
+
+/**
+ * Walk git's global options, reporting where the subcommand starts, whether the
+ * caller set `core.hooksPath` along the way, and which aliases they defined.
+ *
+ * All three outputs are security-relevant. Getting the option boundary wrong
+ * shifts which token reads as the subcommand, so `git -c foo=bar push` would
+ * classify as a `foo=bar` subcommand and sail past the guard. Missing a
+ * `core.hooksPath` override lets the caller nominate the hooks directory
+ * themselves. Missing an alias DEFINITION is the subtler one and is why
+ * `aliasDefinitions` exists at all: an alias defined here is invisible to a
+ * separate `git config --get`, so it cannot be looked up after the fact — see
+ * {@link classifyGitInvocation}.
+ *
+ * Only the separate-token `-c <name>=<value>` spelling is modelled because it is
+ * the only one git accepts: `-calias.x=push` is rejected with `unknown option`
+ * (git 2.47.3), so there is no attached short form to miss.
+ */
+function scanGlobalOptions(
+  tokens: readonly string[],
+  env: GitEgressEnv = {},
+): GlobalOptionScan {
+  let index = 0;
+  let hooksPathOverride: string | null = null;
+  const aliasDefinitions = new Map<string, string>();
+  const define = (assignment: string, fromEnv: boolean) => {
+    const alias = aliasAssignment(assignment, { fromEnv, env });
+    // Last wins, matching git: `-c alias.d=status -c alias.d=push` runs push.
+    if (alias) aliasDefinitions.set(alias.name, alias.expansion);
+  };
+  while (index < tokens.length) {
+    const token = tokens[index]!;
+    if (!token.startsWith("-")) break;
+    // `--opt=value` carries its own value; `--opt value` and `-c x=y` do not.
+    if (VALUE_TAKING_GLOBAL_OPTIONS.has(token)) {
+      const value = tokens[index + 1];
+      if (value !== undefined && (token === "-c" || token === "--config-env")) {
+        if (isHooksPathAssignment(value)) hooksPathOverride ??= `${token} ${value}`;
+        define(value, token === "--config-env");
+      }
+      index += 2;
+      continue;
+    }
+    if (token.startsWith("--config-env=")) {
+      const assignment = token.slice("--config-env=".length);
+      if (isHooksPathAssignment(assignment)) hooksPathOverride ??= token;
+      define(assignment, true);
+    }
+    index += 1;
+  }
+  return { subcommandIndex: index, hooksPathOverride, aliasDefinitions };
+}
+
+/**
+ * The leading global options of an invocation, up to but excluding the
+ * subcommand.
+ *
+ * Exported so the wrapper can resolve aliases under the same effective
+ * configuration git itself will use — `-C`, `--git-dir` and friends all select
+ * WHICH config files an alias lookup reads, and a bare `git config --get` reads
+ * the wrong ones.
+ */
+export function gitGlobalOptions(argv: readonly string[]): string[] {
+  return argv.slice(0, scanGlobalOptions(argv).subcommandIndex);
+}
+
+/** A hook bypass carried by an alias expansion rather than by argv. */
+export interface GitAliasBypass {
+  /** The alias the caller invoked. */
+  alias: string;
+  /** Its expansion, so the refusal can quote what git would have run. */
+  expansion: string;
+  /**
+   * Which bypass the expansion carries.
+   *
+   * `unquotable` is the fail-closed case: the expansion could not be tokenised
+   * the way git would tokenise it, so no claim about its contents is sound.
+   *
+   * `alias-depth` is the other one: resolution ran out of hops with the chain
+   * still unresolved, so whether it reaches a push went unanswered. Neither
+   * asserts a bypass is present — both say the question could not be settled,
+   * which is why both refuse without waiting for `isPush`.
+   */
+  reason: "no-verify" | "hooks-path" | "unquotable" | "alias-depth";
+  /**
+   * The alias names walked, in order, when the reason is `alias-depth`.
+   *
+   * Carried so the refusal can name the chain rather than just its head — the
+   * author has to find the definition to fix it.
+   */
+  chain?: readonly string[];
+}
+
+/**
+ * Split an alias expansion the way git splits it, or return null.
+ *
+ * Git does NOT split an alias on whitespace. It runs the expansion through
+ * `split_cmdline()` (`alias.c`), which applies shell-style quoting, so the
+ * tokens git acts on are not the tokens a `/\s+/` split produces. That gap was
+ * a live bypass, measured against git 2.47.3:
+ *
+ *   git -c core.hooksPath=<h> -c 'alias.q=push "--no-verify"' q origin HEAD:t
+ *
+ * split on whitespace yields the token `"--no-verify"` WITH its quotes, which
+ * matches no spelling {@link isNoVerifyFlag} accepts, so the expansion read as an
+ * ordinary push and the guard injected its hooks path as usual. Git dequoted it
+ * to `--no-verify`, skipped the hook, exited 0, and the ref landed on the
+ * remote. The scanner never ran.
+ *
+ * Rules implemented, matching `split_cmdline`: single quotes are literal to the
+ * next single quote; double quotes run to the next unescaped double quote and
+ * honour backslash escapes; a backslash outside quotes escapes the next
+ * character; quoted and bare runs concatenate within one token (`"--no-ver"ify`
+ * is one token, `--no-verify`).
+ *
+ * Returns null on an unterminated quote — which git rejects outright — so the
+ * caller can fail closed. Guessing at a string git itself will not parse is how
+ * a bypass gets waved through by a scanner that believed it understood the
+ * command.
+ */
+export function splitAliasExpansion(expansion: string): string[] | null {
+  const tokens: string[] = [];
+  let current = "";
+  let started = false;
+  let index = 0;
+
+  while (index < expansion.length) {
+    const char = expansion[index]!;
+
+    if (/\s/.test(char)) {
+      if (started) {
+        tokens.push(current);
+        current = "";
+        started = false;
+      }
+      index += 1;
+      continue;
+    }
+
+    started = true;
+
+    if (char === "'") {
+      const end = expansion.indexOf("'", index + 1);
+      if (end === -1) return null;
+      current += expansion.slice(index + 1, end);
+      index = end + 1;
+      continue;
+    }
+
+    if (char === '"') {
+      index += 1;
+      let closed = false;
+      while (index < expansion.length) {
+        const inner = expansion[index]!;
+        if (inner === "\\" && index + 1 < expansion.length) {
+          current += expansion[index + 1]!;
+          index += 2;
+          continue;
+        }
+        if (inner === '"') {
+          closed = true;
+          index += 1;
+          break;
+        }
+        current += inner;
+        index += 1;
+      }
+      if (!closed) return null;
+      continue;
+    }
+
+    if (char === "\\" && index + 1 < expansion.length) {
+      current += expansion[index + 1]!;
+      index += 2;
+      continue;
+    }
+
+    current += char;
+    index += 1;
+  }
+
+  if (started) tokens.push(current);
+  return tokens;
+}
+
+/**
+ * A verb that reached the wrapper without being cleared as non-publishing.
+ *
+ * Covers two cases the refusal wording distinguishes but enforcement does not:
+ * a verb known to publish (`send-pack`), and one simply not on the allowlist.
+ * Both refuse, because the second cannot be shown to be safe.
+ */
+export interface GitPublishVerb {
+  /** The verb git would actually have run. */
+  verb: string;
+  /** True when {@link isKnownPublishingGitVerb} recognises it. */
+  known: boolean;
+  /** The alias the caller typed, when the verb was reached through one. */
+  alias: string | null;
+  /**
+   * The alias names walked, ending at {@link verb}, when `alias` is set.
+   *
+   * Carried for the same reason `alias-depth` carries one: the author has to
+   * find the definition to fix it, and the head of the chain is rarely where
+   * the publishing verb is written.
+   */
+  chain?: readonly string[];
+}
+
+export interface GitInvocationClassification {
+  /** The resolved subcommand, or null when argv carries only global options. */
+  subcommand: string | null;
+  /** True when this invocation would contact a remote to publish refs. */
+  isPush: boolean;
+  /** True when the invocation asks git to skip hooks. */
+  hasNoVerify: boolean;
+  /** Index in argv at which the subcommand was found, or -1. */
+  subcommandIndex: number;
+  /**
+   * A caller-supplied `core.hooksPath` override among argv's global options.
+   *
+   * Injecting the guard last already beats this one (git takes the LAST `-c`
+   * for a key), but it is reported so the wrapper can refuse it explicitly
+   * rather than silently discarding what the caller asked for.
+   */
+  hooksPathOverride: string | null;
+  /**
+   * A bypass inside an alias expansion. Unlike the argv case this CANNOT be
+   * beaten by injection: git expands the alias after the command line, so the
+   * expansion's own `-c core.hooksPath=` or `--no-verify` wins.
+   */
+  aliasBypass: GitAliasBypass | null;
+  /**
+   * A `!`-prefixed shell alias reached while resolving the subcommand.
+   *
+   * Set whether or not the chain reached a push, because for a shell alias that
+   * question is unanswerable: the expansion is arbitrary shell, and deciding
+   * whether it publishes would mean parsing it. The wrapper refuses on this
+   * rather than guessing. See `classifyGitInvocation` for why passing it through
+   * is not an option.
+   */
+  shellAlias: GitShellAlias | null;
+  /**
+   * A verb that is neither `push` nor on the non-publishing allowlist.
+   *
+   * Set whether or not the chain reached a push — it is set precisely when it
+   * did NOT — so, like `shellAlias`, it must be refused ahead of the
+   * not-a-push early return. Gating it on `isPush` would discard every one of
+   * them, which is the bug it exists to close.
+   */
+  publishVerb: GitPublishVerb | null;
+}
+
+export interface GitShellAlias {
+  /** The alias the caller invoked. */
+  alias: string;
+  /** Its expansion, so the refusal can quote what git would have run. */
+  expansion: string;
+}
+
+/**
+ * Split argv into git's global options and its subcommand.
+ *
+ * Aliases are resolved when the subcommand is not `push` — `git -c
+ * alias.yolo=push yolo` is otherwise a complete bypass of this guard.
+ * Resolution has two sources, and the order between them is the fix for a
+ * measured hole:
+ *
+ *  1. Aliases the invocation DEFINES ITSELF, via `-c alias.x=...` or
+ *     `--config-env=alias.x=VAR`. These come first because git resolves them
+ *     first, and because they are invisible to any lookup made in a separate
+ *     process: `git -c alias.yolo='push --no-verify' yolo` pushes, while a
+ *     plain `git config --get alias.yolo` beside it exits 1 with no output.
+ *     Asking `resolveAlias` alone therefore returns nothing, `yolo` classifies
+ *     as not-a-push, and the argv is handed to git untouched — which then
+ *     expands the alias and skips the hook. Measured end to end against git
+ *     2.47.3: the push landed on the remote with the hook never running.
+ *  2. `resolveAlias`, for aliases that live in config files. Cheap: a local
+ *     config read with no network.
+ *
+ * Definitions accumulate ACROSS hops, because an expansion's own global options
+ * define aliases too — `alias.outer = -c alias.inner=push inner` reaches a push
+ * in git 2.47.3, so dropping the inner definition would lose the chain.
+ *
+ * Resolution is bounded rather than recursive: git permits an alias to expand to
+ * another alias, and an unbounded loop here would be a denial-of-service on a
+ * config the agent controls.
+ *
+ * An expansion is parsed with the same global-option scan as argv, not by
+ * reading its first word. `alias.sneaky = -c core.hooksPath=/tmp/empty push`
+ * expands to a push whose first word is `-c`, so a first-word test classifies it
+ * as not-a-push and the guard is never injected at all — measured as a working
+ * bypass against git 2.47.3.
+ */
+export function classifyGitInvocation(
+  argv: readonly string[],
+  resolveAlias?: (name: string) => string | null,
+  env: GitEgressEnv = {},
+): GitInvocationClassification {
+  const globals = scanGlobalOptions(argv, env);
+
+  if (globals.subcommandIndex >= argv.length) {
+    return {
+      subcommand: null,
+      isPush: false,
+      hasNoVerify: false,
+      subcommandIndex: -1,
+      hooksPathOverride: globals.hooksPathOverride,
+      aliasBypass: null,
+      shellAlias: null,
+      publishVerb: null,
+    };
+  }
+
+  const subcommandIndex = globals.subcommandIndex;
+  const subcommand = argv[subcommandIndex]!;
+  const rest = argv.slice(subcommandIndex + 1);
+  const hasNoVerify = rest.some(isNoVerifyFlag);
+
+  let isPush = subcommand === "push";
+  // Accumulated across hops, then kept only if the chain reaches a push: a
+  // bypass on an alias that never publishes anything is not this guard's
+  // business, and refusing it would break unrelated tooling.
+  let pendingBypass: GitAliasBypass | null = null;
+  let shellAlias: GitShellAlias | null = null;
+  // Set when alias resolution runs out of hops with the chain still live. Like
+  // `unquotable`, it means "is this a push?" went unanswered, so the refusal
+  // must not be gated on `isPush` — that is the very thing not known.
+  let aliasDepthExhausted = false;
+  // The verb git will actually run, when it is neither `push` nor cleared as
+  // non-publishing. Set at the one place the walk learns what that verb is.
+  let publishVerb: GitPublishVerb | null = null;
+
+  if (!isPush) {
+    const definitions = new Map(globals.aliasDefinitions);
+    // Command-line definitions beat config files, as they do in git.
+    const lookup = (name: string): string | null =>
+      definitions.get(name.toLowerCase()) ?? resolveAlias?.(name) ?? null;
+
+    let name: string | null = subcommand;
+    // Names walked, for the refusal message when the cap is exhausted.
+    const chain: string[] = [];
+    let hop = 0;
+    for (; hop < ALIAS_HOP_LIMIT && name && !isPush; hop += 1) {
+      const expansion = lookup(name);
+      // No expansion means `name` is not an alias, so it is the verb git will
+      // actually run — and this is the ONLY place in the walk where that is
+      // known. Testing here covers the bare-argv leg (`hop === 0`, `name` is
+      // the typed subcommand) and the alias-expansion leg (`hop > 0`, `name`
+      // came out of an expansion) with one test. Ally's finding named the two
+      // legs as separate call sites; they are deliberately not implemented as
+      // two, because two tests of the same property are two things that can
+      // drift, and the four bypasses already closed on this path were all
+      // drift of exactly that kind.
+      if (!expansion) {
+        if (!isNonPublishingGitVerb(name)) {
+          publishVerb = {
+            verb: name,
+            known: isKnownPublishingGitVerb(name),
+            alias: hop === 0 ? null : subcommand,
+            ...(hop === 0 ? {} : { chain: [...chain, name] }),
+          };
+        }
+        break;
+      }
+      chain.push(name);
+      // A `!`-prefixed alias is an arbitrary shell command, and it is the one
+      // expansion that escapes this guard completely — so it is recorded for
+      // refusal rather than passed through.
+      //
+      // Passing it through used to be justified on the theory that a bare `git`
+      // inside the expansion would re-enter the wrapper through PATH. Measured
+      // against git 2.47.3, that is false: git PREPENDS its exec-path to PATH
+      // for the shell it spawns, and `/usr/lib/git-core` ships a complete `git`
+      // binary. So inside a shell alias, a bare `git push` resolves to
+      // /usr/lib/git-core/git — the real one — and neither the wrapper nor the
+      // hook is reached. No absolute path is needed for the bypass; the alias
+      // supplies it. That makes this the dangerous shape: an ordinary-looking
+      // `git <name>` that silently is not guarded.
+      //
+      // Refusal is the only sound response. Deciding whether the expansion
+      // publishes would mean parsing arbitrary shell, and a textual test for
+      // `push` is defeated by any indirection. Refusing every shell alias is
+      // the conservative direction, and it is cheap: no shell alias is defined
+      // in any config the agent image ships.
+      if (expansion.startsWith("!")) {
+        shellAlias = { alias: name, expansion };
+        break;
+      }
+
+      // Tokenised the way git tokenises an alias, not on whitespace. See
+      // `splitAliasExpansion`: a `/\s+/` split leaves quotes attached, and a
+      // quoted `"--no-verify"` then matched nothing and pushed unscanned.
+      const tokens = splitAliasExpansion(expansion);
+      if (tokens === null) {
+        // Unterminated quote. Git rejects this, so it cannot reach a push — but
+        // the guard must not be the component that decides that on a guess, and
+        // a parser disagreeing with git in the permissive direction is exactly
+        // the failure this whole function exists to avoid.
+        if (!pendingBypass) pendingBypass = { alias: name, expansion, reason: "unquotable" };
+        break;
+      }
+      const expansionGlobals = scanGlobalOptions(tokens, env);
+      for (const [alias, value] of expansionGlobals.aliasDefinitions) {
+        definitions.set(alias, value);
+      }
+      if (!pendingBypass && expansionGlobals.hooksPathOverride) {
+        pendingBypass = { alias: name, expansion, reason: "hooks-path" };
+      }
+
+      const expanded: string | null = tokens[expansionGlobals.subcommandIndex] ?? null;
+      const expandedRest = tokens.slice(expansionGlobals.subcommandIndex + 1);
+      if (!pendingBypass && expandedRest.some(isNoVerifyFlag)) {
+        pendingBypass = { alias: name, expansion, reason: "no-verify" };
+      }
+
+      if (expanded === "push") {
+        isPush = true;
+        break;
+      }
+      name = expanded;
+    }
+
+    // The cap is a denial-of-service bound, not a claim that chains stop here —
+    // git resolves deeper. Leaving the loop by falling through as NOT-a-push
+    // was therefore a measured hole, and in the permissive direction: with
+    // `alias.a1=a2 … alias.a5=push`, hops 0-3 walk a1→a5 and the loop ends with
+    // `isPush` still false, so `buildGitArgv` returns argv untouched, no
+    // `core.hooksPath` is injected, and git then expands the whole chain to a
+    // push that runs no hook. Measured against git 2.47.3: `git a1 origin
+    // HEAD:refs/heads/deep5` landed the ref on the remote with the hook never
+    // running, while the same chain WITH the guard's `-c` did run it — which is
+    // what identifies the missing injection, rather than the depth itself, as
+    // the hole.
+    //
+    // Refusing is chosen over classifying it as a push. Injecting the hooks
+    // path would let the hook decide, but only for a chain whose unscanned tail
+    // carries no `--no-verify` — and the tail is unscanned precisely because
+    // the budget ran out, so that variant is closed only by assumption.
+    // Refusal holds in every case, and a chain this deep is not a shape any
+    // config the agent image ships defines.
+    //
+    // `hop` reaching the limit is what separates budget exhaustion from every
+    // `break` above, each of which leaves it short. The final lookup then
+    // separates "ran out of road" from "arrived": a chain ending in a name git
+    // would not resolve either is genuinely not a push, and must not refuse.
+    if (!isPush && !shellAlias && hop >= ALIAS_HOP_LIMIT && name) {
+      const unresolved = lookup(name);
+      if (unresolved !== null) {
+        aliasDepthExhausted = true;
+        chain.push(name);
+        if (!pendingBypass) {
+          pendingBypass = {
+            alias: subcommand,
+            expansion: unresolved,
+            reason: "alias-depth",
+            chain: [...chain],
+          };
+        }
+      }
+    }
+  }
+
+  return {
+    subcommand,
+    isPush,
+    hasNoVerify,
+    subcommandIndex,
+    hooksPathOverride: globals.hooksPathOverride,
+    // An alias bypass only matters on a push — EXCEPT for the two reasons that
+    // exist because "is it a push?" is itself the question that went
+    // unanswered, where gating on `isPush` would read the unanswered question
+    // as a "no":
+    //
+    //   unquotable   the expansion could not be tokenised the way git tokenises
+    //                one. Git happens to reject an unclosed quote itself
+    //                (measured: `fatal: bad alias.q string: unclosed quote`), so
+    //                nothing publishes either way — but gating here would make
+    //                this guard's safety depend on git's parser agreeing with
+    //                ours.
+    //   alias-depth  resolution ran out of hops with the chain still live, so
+    //                the tail that decides it was never read. Unlike the above,
+    //                git does NOT reject this one: the chain resolves fine and
+    //                pushes.
+    //
+    // Where the two parsers disagree the guard must be the stricter one; a
+    // visible refusal is the safe direction, a silent pass is not.
+    aliasBypass:
+      isPush || aliasDepthExhausted || pendingBypass?.reason === "unquotable"
+        ? pendingBypass
+        : null,
+    shellAlias,
+    publishVerb,
+  };
+}
+
+/**
+ * Raised when the hook's own stdin carries a ref-update line that does not
+ * parse.
+ *
+ * Separate from {@link GitEgressScanError} because nothing failed to READ here
+ * — git handed over input in a shape this parser does not recognise, which is a
+ * different fault with a different remedy. Both reach the same place: the
+ * runtime catches everything around the scan and refuses.
+ */
+export class GitEgressInputError extends Error {
+  constructor(readonly line: string) {
+    super(
+      `the pre-push hook received a ref update it could not parse (\`${line}\`), so the refs this push would publish could not be determined`,
+    );
+    this.name = "GitEgressInputError";
+  }
+}
+
+export interface PrePushRefUpdate {
+  localRef: string;
+  localSha: string;
+  remoteRef: string;
+  remoteSha: string;
+}
+
+/** git's all-zero sha, used for "this ref does not exist on the remote yet". */
+const NULL_SHA_RE = /^0{40,64}$/;
+
+export function isNullSha(sha: string): boolean {
+  return NULL_SHA_RE.test(sha);
+}
+
+/**
+ * Parse the pre-push hook's stdin: one `<local ref> <local sha> <remote ref>
+ * <remote sha>` line per ref being updated.
+ *
+ * Using git's own computation rather than re-deriving the range from argv is
+ * deliberate — refspec resolution, `push.default`, and tracking configuration
+ * are git's to interpret, and a second implementation of them would disagree
+ * with the push that is actually about to happen.
+ *
+ * A non-empty line that does not parse THROWS rather than being skipped. Git's
+ * format is fixed and refs cannot contain whitespace, so this is not reachable
+ * today — but skipping was the one fail-open shape left in a module that is
+ * otherwise uniformly fail-closed, and it is the worst kind: `runPrePushHook`
+ * treats an empty update list as a pass, so a line that silently failed to
+ * parse would publish its ref unscanned rather than merely under-reporting.
+ * Refusing costs nothing while the case stays unreachable, and holds if a
+ * future git widens the format.
+ */
+export function parsePrePushInput(input: string): PrePushRefUpdate[] {
+  const updates: PrePushRefUpdate[] = [];
+  for (const rawLine of input.split("\n")) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const parts = line.split(/\s+/);
+    if (parts.length < 4) throw new GitEgressInputError(line);
+    updates.push({
+      localRef: parts[0]!,
+      localSha: parts[1]!,
+      remoteRef: parts[2]!,
+      remoteSha: parts[3]!,
+    });
+  }
+  return updates;
+}
+
+export interface GitPushFinding {
+  /** Full sha of the object carrying the material — a commit, or a tag object. */
+  commit: string;
+  /** Abbreviated sha, for the message. */
+  shortCommit: string;
+  /**
+   * Commit subject, so the author can recognise it without looking it up.
+   *
+   * ALREADY SCRUBBED at construction, and that is a security invariant rather
+   * than a formatting choice. For a `message` finding the subject IS the head of
+   * the text that fired the detector, so a one-line commit would otherwise carry
+   * the material back out through the refusal — into agent stderr, into run
+   * logs, and from there into whatever the agent pastes when it reports the
+   * refusal. That is PEN-2526's shape, reached from inside the control built to
+   * prevent it. Anything reading this field is reading redacted text.
+   */
+  subject: string;
+  /**
+   * Where in the pushed object the material sits.
+   *
+   * `tag-message` is the annotated-tag object's own message, which is neither a
+   * commit message nor file content and is published by the tag ref update
+   * itself. It is a separate case because the remedy differs: a tag is retagged,
+   * not amended.
+   */
+  where: "message" | "content" | "tag-message";
+  /** Which scrub classes fired. */
+  classes: GitHubEgressScrubClass[];
+}
+
+/** Reads git. Returns stdout, or null when the command failed. */
+export type GitReader = (args: string[]) => string | null;
+
+/**
+ * A git read the scanner needed in order to reach a verdict did not succeed.
+ *
+ * This exists so an unreadable repository cannot be mistaken for a clean one.
+ * Every read below decides either WHICH commits the push would publish or WHAT
+ * is inside one, so a failure leaves the scanner with no evidence — and "no
+ * evidence of credential-shaped material" is not the same statement as "no
+ * credential-shaped material". Treating the two as equivalent turns any git
+ * error, including a `maxBuffer` overflow on a large diff, into a silent pass
+ * at exactly the moment the push is biggest.
+ */
+export class GitEgressScanError extends Error {
+  constructor(
+    readonly command: readonly string[],
+    readonly commit?: string,
+    /**
+     * Overrides the failed-read wording for a refusal that is NOT a failed
+     * read. Everything on this path refuses, but the author is told why, and
+     * "git failed" would send them to look for a broken repository when the
+     * scan in fact ran out of budget. See {@link tagPeelExhausted}.
+     */
+    reason?: string,
+  ) {
+    super(
+      reason ??
+        `\`git ${command.join(" ")}\` failed, so ${
+          commit ? `commit ${commit.slice(0, 12)}` : "the set of commits this push would publish"
+        } could not be read`,
+    );
+    this.name = "GitEgressScanError";
+  }
+
+  /**
+   * The annotated-tag peel budget ran out with another tag object still in
+   * front of the scanner, so the rest of the chain would be published
+   * unscanned.
+   */
+  static tagPeelExhausted(sha: string, limit: number): GitEgressScanError {
+    return new GitEgressScanError(
+      ["cat-file", "-t", sha],
+      sha,
+      `an annotated tag chain deeper than ${limit} objects reached ${sha.slice(0, 12)} with objects still unscanned; ` +
+        "a push of the tag ref publishes every object in the chain, so the unscanned tail cannot be reported clean. " +
+        "Recreate the tag so it points at its target directly rather than through a chain of tags.",
+    );
+  }
+}
+
+/** Run a read the verdict depends on, refusing rather than guessing on failure. */
+function readGit(runGit: GitReader, args: string[], commit?: string): string {
+  const output = runGit(args);
+  if (output === null) throw new GitEgressScanError(args, commit);
+  return output;
+}
+
+/**
+ * Commits that a push would publish for one ref update.
+ *
+ * For an existing remote ref the range is `remoteSha..localSha`. For a ref the
+ * remote does not have, `--not --remotes` excludes everything already published
+ * under any remote-tracking ref, which is what keeps a new branch off a shared
+ * base from re-reporting the entire history of the repository.
+ *
+ * A known trade-off, recorded rather than fixed: `--remotes` is EVERY remote,
+ * not the push target's. A commit present only on a second remote — a fork, an
+ * upstream — is genuinely reaching this one for the first time and is skipped.
+ * The exclusion set is therefore agent-writable via `git remote add`, which sits
+ * oddly beside the hook's refusal to scope itself by remote URL. It stays as it
+ * is because the alternative is worse in the common case: scoping to the target
+ * remote re-reports every commit a branch shares with an already-published
+ * upstream, on every push, with nothing the author can amend. The residual is
+ * narrow — material already published to another remote, i.e. already disclosed
+ * once — where the alternative's cost falls on ordinary clean pushes.
+ *
+ * Throws {@link GitEgressScanError} if `rev-list` fails: without its output the
+ * scanner does not know what the push contains, and an empty list would read as
+ * "nothing to check" and pass.
+ */
+export function commitsForRefUpdate(
+  update: PrePushRefUpdate,
+  runGit: GitReader,
+): string[] {
+  if (isNullSha(update.localSha)) return []; // a deletion publishes no content
+  const args = isNullSha(update.remoteSha)
+    ? ["rev-list", update.localSha, "--not", "--remotes"]
+    : ["rev-list", `${update.remoteSha}..${update.localSha}`];
+  return readGit(runGit, args)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+}
+
+/**
+ * Reduce a unified diff to just the content it ADDS, with the `+` markers
+ * removed.
+ *
+ * This is load-bearing, not tidying. `scrubGitHubEgressText`'s environment-dump
+ * detector anchors each assignment to the start of a line
+ * (`^[ \t]*[A-Z][A-Z0-9_]{2,}=`), and every added line in a patch arrives
+ * prefixed with `+`. Scanning raw `git show` output would therefore be blind to
+ * an environment dump — which is the exact class that caused PEN-2526, the
+ * exposure this whole control descends from. Stripping the marker restores the
+ * anchor.
+ *
+ * Only added lines are kept. Context and removed lines are, by definition,
+ * already on the remote; reporting them would refuse a push for material the
+ * author cannot remove by amending anything in this range.
+ *
+ * The parse is a hunk-state machine rather than a prefix test, and that is the
+ * fix for a measured blind spot. Skipping every line starting with `+++` — the
+ * way to drop a `+++ b/path` file header — also discarded any ADDED CONTENT
+ * LINE whose own text begins with `++`, because git emits that as `+++...`.
+ * Measured: a file whose first line is `++<token>` produced the patch line
+ * `+++<token>`, and the token was gone before `scrubGitHubEgressText` ever saw
+ * it. That drops a real detection outright, because the vendor-key, JWT and
+ * long-assignment detectors are `\b`-anchored substring matches rather than
+ * line-anchored ones, so the line carried the whole finding.
+ *
+ * Tightening to `+++ ` with a trailing space does NOT fix it — content
+ * beginning `++ ` reproduces it exactly. What separates the two is position,
+ * not spelling: `---`/`+++` are headers only BEFORE the first `@@` of a file
+ * block. Inside a hunk every line carries a one-character origin marker, so a
+ * leading `+` is content no matter what follows it, and exactly one `+` comes
+ * off.
+ *
+ * Outside a hunk the `+++ <path>` header is dropped so a path is not mistaken
+ * for content, but any OTHER `+` line is still kept. Git emits no content
+ * outside a hunk, so that branch is unreachable on real `git show` output; it
+ * is there so malformed or synthetic input over-reports rather than
+ * under-reports. Every uncertainty in this function resolves toward scanning
+ * more, because the cost of a spurious line is a false refusal the author can
+ * read, and the cost of a dropped one is a credential on the remote.
+ */
+export function addedLinesFromPatch(patch: string): string {
+  const added: string[] = [];
+  let inHunk = false;
+  for (const line of patch.split("\n")) {
+    if (inHunk) {
+      if (line.startsWith("+")) {
+        added.push(line.slice(1));
+        continue;
+      }
+      // The rest of a hunk body: context, removals, the no-newline marker, and
+      // the bare empty line git emits for an empty context line.
+      if (line === "" || line.startsWith(" ") || line.startsWith("-") || line.startsWith("\\")) {
+        continue;
+      }
+      // Anything else has left the body — a `diff --git` for the next file, or
+      // the next `@@`. Fall through to the out-of-hunk tests below.
+      inHunk = false;
+    }
+    if (line.startsWith("@@")) {
+      inHunk = true;
+      continue;
+    }
+    if (line.startsWith("+++ ")) continue;
+    if (line.startsWith("+")) added.push(line.slice(1));
+  }
+  return added.join("\n");
+}
+
+/**
+ * Scan one commit's message and its introduced content.
+ *
+ * Both legs matter and they fail differently: PEN-2526 was an environment dump
+ * interpolated into prose, which here would land in a commit MESSAGE, while the
+ * file-content leg is what makes this door a superset of the MCP write tools.
+ *
+ * Content is scanned as the commit's own patch rather than as full file bodies,
+ * so the finding is attributable to the commit that introduced the material and
+ * the remedy is a rewrite of that commit. Material already present on the remote
+ * is out of scope here by construction: it has already been published, and
+ * re-reporting it would make every push refuse with nothing the author can do.
+ *
+ * Every read throws {@link GitEgressScanError} on failure rather than being
+ * skipped. An unreadable message or patch is an unscanned commit, and letting it
+ * through would mean the guard reports clean on precisely the commits it could
+ * not inspect. Note this is distinct from an EMPTY read: git exits zero with no
+ * output for a commit with an empty message or no diff, and that genuinely is
+ * nothing to scan.
+ */
+export function scanCommit(commit: string, runGit: GitReader): GitPushFinding[] {
+  const findings: GitPushFinding[] = [];
+  const shortCommit = commit.slice(0, 12);
+  // Scrubbed HERE rather than at the point it is printed, so the invariant
+  // belongs to the finding and not to one renderer. The subject of a one-line
+  // commit is the material that fired the detector; carrying it raw in the
+  // object would leak through any sink that later reads a finding, not just
+  // through `formatRefusal`.
+  const subject = scrubGitHubEgressText(
+    readGit(runGit, ["log", "-1", "--format=%s", commit], commit).trim(),
+  ).text;
+
+  const message = readGit(runGit, ["log", "-1", "--format=%B", commit], commit);
+  if (message) {
+    const scrubbed = scrubGitHubEgressText(message);
+    if (scrubbed.redacted) {
+      findings.push({ commit, shortCommit, subject, where: "message", classes: scrubbed.classes });
+    }
+  }
+
+  // `--format=` suppresses the commit header so the message is not scanned
+  // twice and reported as two findings. `--no-color` keeps escape sequences out
+  // of the scrubbed text. `-m` makes merge commits emit a patch at all.
+  //
+  // `--text` and `--no-textconv` are SECURITY flags, not formatting ones. Both
+  // defeat a way for a file's real bytes never to reach this scanner, and each
+  // was verified against git 2.47 by committing the material and reading what
+  // `show` emitted:
+  //
+  //   --text         Without it git prints `Binary files ... differ` and NO `+`
+  //                  lines for anything it considers binary, so
+  //                  `addedLinesFromPatch` returns the empty string and the
+  //                  commit is reported clean. Two ways in: a single NUL byte in
+  //                  the first 8000 bytes makes any file binary, and a
+  //                  `.gitattributes` entry marking a path `-diff` does the same
+  //                  to a plain-ASCII one. The second is the wider hole —
+  //                  `* -diff` blanks the content leg for the WHOLE tree, needs
+  //                  no binary content at all, and is committed in the same push
+  //                  it hides.
+  //   --no-textconv  A `diff.<driver>.textconv` in the repository's own config,
+  //                  bound to a path by `.gitattributes`, replaces a file's
+  //                  content with that command's output for display. It is
+  //                  ordinary repo config, so it is agent-writable, and it
+  //                  launders the bytes before the scanner ever sees them.
+  //
+  // Size policy is the reader's `maxBuffer`, and it fails closed: an oversized
+  // read leaves spawnSync with `ENOBUFS` and a null status, `makeGitReader`
+  // returns null, and `readGit` throws rather than scanning a truncated patch.
+  // That is deliberate — the alternative is scanning a prefix and calling the
+  // rest clean, which is worst exactly when the push is biggest.
+  const patch = readGit(
+    runGit,
+    ["show", "--format=", "--no-color", "-m", "--unified=0", "--text", "--no-textconv", commit],
+    commit,
+  );
+  if (patch) {
+    const scrubbed = scrubGitHubEgressText(addedLinesFromPatch(patch));
+    if (scrubbed.redacted) {
+      findings.push({ commit, shortCommit, subject, where: "content", classes: scrubbed.classes });
+    }
+  }
+
+  return findings;
+}
+
+/**
+ * Scan the annotated-tag objects a ref update would publish.
+ *
+ * `commitsForRefUpdate` peels a tag to the commits it reaches, because that is
+ * what `rev-list` does — measured: `rev-list <tag-sha> --not --remotes` returns
+ * the tagged COMMIT and never the tag object itself. So a tag object's own
+ * message is reachable by nothing `scanCommit` reads, while a ref update naming
+ * `refs/tags/<tag>` publishes that object verbatim, free-form message included.
+ * A generated release tag that interpolates build environment into its message
+ * is the PEN-2526 class exactly, on a ref update whose commits are all clean.
+ *
+ * Lightweight tags need nothing here: their ref points straight at a commit, so
+ * `cat-file -t` reports `commit` and the commit leg already covers it.
+ *
+ * The peel loop handles a tag pointing at a tag, which git permits. It is
+ * bounded rather than `while (true)`: a malformed or cyclic chain must not spin
+ * a push forever. Exhausting that bound REFUSES rather than returning what it
+ * has, for the same reason the alias hop limit does. Pushing `refs/tags/<tag>`
+ * sends every object in the chain, not just the first, so a chain longer than
+ * the budget would publish objects — messages included — that nothing read.
+ * Returning the findings so far would be a clean verdict on an unscanned tail,
+ * which is the permissive direction and contradicts this module's rule that
+ * every uncertainty resolves toward scanning more.
+ *
+ * The budget is checked AFTER the type read, so a chain that is exactly
+ * {@link TAG_PEEL_LIMIT} tags deep and then reaches a commit terminates
+ * normally. Only a further tag object — one this loop would have had to scan
+ * and cannot — refuses.
+ *
+ * Reads throw {@link GitEgressScanError} rather than being skipped, for the same
+ * reason as every other read on this path — an unreadable tag object is an
+ * unscanned tag object, and treating it as clean would report a pass on
+ * precisely what could not be inspected.
+ */
+export function scanAnnotatedTags(
+  update: PrePushRefUpdate,
+  runGit: GitReader,
+): GitPushFinding[] {
+  if (isNullSha(update.localSha)) return []; // a deletion publishes no object
+
+  const findings: GitPushFinding[] = [];
+  let sha = update.localSha;
+
+  for (let depth = 0; ; depth += 1) {
+    if (readGit(runGit, ["cat-file", "-t", sha], sha).trim() !== "tag") break;
+
+    // A tag object is in front of us and the budget is gone: this one and
+    // everything behind it would be published unscanned. Refuse.
+    if (depth >= TAG_PEEL_LIMIT) throw GitEgressScanError.tagPeelExhausted(sha, TAG_PEEL_LIMIT);
+
+    const raw = readGit(runGit, ["cat-file", "tag", sha], sha);
+    const shortCommit = sha.slice(0, 12);
+    const { name, message } = parseTagObject(raw);
+
+    if (message) {
+      const scrubbed = scrubGitHubEgressText(message);
+      if (scrubbed.redacted) {
+        findings.push({
+          commit: sha,
+          shortCommit,
+          // Scrubbed for the same reason a commit subject is: a tag name is
+          // author-chosen free text that ends up in the refusal, and in the
+          // `git tag -f -a <name>` remedy line.
+          subject: name ? `tag ${scrubGitHubEgressText(name).text}` : "annotated tag",
+          where: "tag-message",
+          classes: scrubbed.classes,
+        });
+      }
+    }
+
+    // Follow `object` to whatever this tag points at; a commit ends the walk on
+    // the next iteration's type check.
+    const target = /^object ([0-9a-f]{40,64})$/m.exec(raw)?.[1];
+    if (!target || target === sha) break;
+    sha = target;
+  }
+
+  return findings;
+}
+
+/**
+ * Split a raw tag object into its tag name and its message.
+ *
+ * The object is a header block (`object`, `type`, `tag`, `tagger`) terminated by
+ * ONE blank line, then the free-form message. Splitting on the first blank line
+ * rather than counting headers keeps this correct if git ever adds a header, and
+ * keeps header text out of the scanned body — a `tagger` line carries an email
+ * address, which should not be reported as a finding.
+ */
+function parseTagObject(raw: string): { name: string | null; message: string } {
+  const separator = raw.indexOf("\n\n");
+  const header = separator === -1 ? raw : raw.slice(0, separator);
+  const message = separator === -1 ? "" : raw.slice(separator + 2);
+  return { name: /^tag (.+)$/m.exec(header)?.[1]?.trim() ?? null, message };
+}
+
+export function scanPrePushUpdates(
+  updates: readonly PrePushRefUpdate[],
+  runGit: GitReader,
+): GitPushFinding[] {
+  const findings: GitPushFinding[] = [];
+  const seen = new Set<string>();
+  for (const update of updates) {
+    // Tag objects first: the annotated-tag leg is about the object the ref
+    // names, which `commitsForRefUpdate` peels away before the commit leg ever
+    // sees it.
+    for (const finding of scanAnnotatedTags(update, runGit)) {
+      // A tag pushed under two refs is one problem, not two.
+      if (seen.has(finding.commit)) continue;
+      seen.add(finding.commit);
+      findings.push(finding);
+    }
+    for (const commit of commitsForRefUpdate(update, runGit)) {
+      // A commit reachable from two pushed refs is one problem, not two.
+      if (seen.has(commit)) continue;
+      seen.add(commit);
+      findings.push(...scanCommit(commit, runGit));
+    }
+  }
+  return findings;
+}
+
+/**
+ * The refusal text.
+ *
+ * It names the object and the class because a bare rejection is not actionable:
+ * the author cannot amend what they cannot locate. The oldest offending commit
+ * is called out separately because that is the one an interactive rebase has to
+ * reach, and it is the single most common thing to get wrong when the material
+ * is several commits back.
+ *
+ * Tag findings get their OWN remedy line, and the commit remedy is emitted only
+ * when a commit is actually implicated. An annotated tag is not reachable by
+ * `--amend` or `rebase -i` — it is a separate object that has to be recreated —
+ * so printing the commit advice for a tag-only refusal would send the author to
+ * a command that cannot fix what was found.
+ */
+export function formatRefusal(findings: readonly GitPushFinding[]): string {
+  const lines: string[] = [
+    "paperclip-github-egress: refusing to publish — credential-shaped material found in objects this push would make public.",
+    "",
+    "Git objects are content-addressed, so this cannot be redacted in flight the way an issue comment or a pull-request body is; the object itself has to change.",
+    "",
+  ];
+
+  const WHERE_LABEL = {
+    message: "commit message",
+    content: "file content",
+    "tag-message": "annotated tag message",
+  } as const;
+
+  // `subject` arrives scrubbed (see {@link GitPushFinding.subject}); re-applying
+  // it here is a second barrier, not a duplicate. This function is the one thing
+  // on this path that writes to a human-visible sink, so it must not depend on
+  // every present and future construction site having remembered. The scrubber
+  // carries an existing marker through untouched, so a twice-scrubbed subject
+  // renders identically to a once-scrubbed one.
+  const displaySubject = (finding: GitPushFinding): string =>
+    scrubGitHubEgressText(finding.subject).text;
+
+  for (const finding of findings) {
+    const subject = displaySubject(finding);
+    lines.push(
+      `  ${finding.shortCommit}  ${WHERE_LABEL[finding.where]}: ${finding.classes.join(", ")}${subject ? `  (${subject})` : ""}`,
+    );
+  }
+
+  const commitFindings = findings.filter((finding) => finding.where !== "tag-message");
+  const tagFindings = findings.filter((finding) => finding.where === "tag-message");
+  const oldest = commitFindings.length > 0 ? commitFindings[commitFindings.length - 1]! : null;
+  lines.push("");
+  if (oldest && commitFindings.length === 1) {
+    lines.push("To fix: remove the material, then `git commit --amend` if it is the tip commit,");
+    lines.push(`or \`git rebase -i ${oldest.shortCommit}~1\` to reach it if it is not.`);
+  } else if (oldest) {
+    lines.push(
+      `To fix: remove the material from each commit above. The oldest is ${oldest.shortCommit}, so \`git rebase -i ${oldest.shortCommit}~1\` reaches all of them.`,
+    );
+  }
+  if (tagFindings.length > 0) {
+    const names = tagFindings
+      .map((finding) => displaySubject(finding).replace(/^tag /, ""))
+      .filter((name) => name && name !== "annotated tag");
+    lines.push(
+      `To fix the annotated tag${tagFindings.length === 1 ? "" : "s"}: the message lives in the tag object, not in any commit, so \`--amend\` and \`rebase\` cannot reach it. Recreate with \`git tag -f -a ${names[0] ?? "<tag>"} -m '<clean message>'\`${names.length > 0 ? "" : " for each tag above"}.`,
+    );
+  }
+  lines.push("");
+  lines.push(
+    "If this is a false positive on a test fixture, derive the value at runtime instead of embedding a literal — that is what the existing fixtures in this repository do, and it closes the finding permanently rather than suppressing it.",
+  );
+
+  return lines.join("\n");
+}
+
+/**
+ * The refusal text for a scan that could not be completed.
+ *
+ * Deliberately distinct from {@link formatRefusal}: nothing was found, so
+ * telling the author to amend a commit would send them looking for material
+ * that may not exist. What they need to know is that this is a refusal rather
+ * than a detection, and what to do about the read that failed.
+ */
+export function formatScanFailure(error: unknown): string {
+  const detail = error instanceof Error ? error.message : String(error);
+  return [
+    "paperclip-github-egress: refusing to publish — the credential scan could not be completed.",
+    "",
+    `  ${detail}`,
+    "",
+    "This is a refusal, not a detection: nothing was found because nothing could be read.",
+    "A scan that cannot inspect the commits it is meant to check cannot report them clean,",
+    "so the push is stopped rather than allowed through unscanned.",
+    "",
+    "If git cannot read the repository, fix that and re-run. If the push is very large, the",
+    "read may have exceeded the scanner's buffer — push in smaller batches.",
+  ].join("\n");
+}
