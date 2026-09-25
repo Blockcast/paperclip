@@ -3379,8 +3379,74 @@ function ensureRegistry(): {
       labelNames: ["source", "reason"],
       registers: [registry],
     });
+    // Pre-seed every backstop series so "healthy" reads as a literal 0 rather than an
+    // absent series. The gauge already did this; the counters did not, which reproduced
+    // the exact silence defect BLO-29763 was opened to remove, one metric over: on a
+    // freshly-started process `paperclip_backstop_sweep_completed_total` is missing for
+    // any stream that has not yet completed a sweep, so AC2 ("did this loop finish a
+    // sweep in the last N minutes", answerable from metrics alone) has no series to read.
+    //
+    // What this buys, precisely: `increase(...[2h]) == 0` now RETURNS A SAMPLE for a
+    // stream that has never swept. Absent, it returned nothing and the stall was
+    // undetectable. It does NOT change `depth > 0 unless increase(...) > 0` -- `> 0`
+    // discards a zero-valued sample exactly as it discards an absent series, so that
+    // form returns the LHS and fires either way. An alert consuming this must key on
+    // `== 0` / `absent_over_time`, never on `unless ... > 0`.
+    //
+    // The seed is unconditional here, and the API tier registers these metrics without
+    // running either loop -- so after this change every api replica exports a
+    // permanently-zero completion counter. Measured 2026-09-21 on live Prometheus: the
+    // gauge is present on all 3 replicas, while `paperclip_backstop_sweep_completed_total`
+    // and `paperclip_backstop_candidates_skipped_total` exist on `paperclip-0`
+    // (`service="paperclip-workers"`) alone -- on both `paperclip-api-*` replicas those
+    // two counters are absent pre-change and read a permanent seeded 0 after it. Run
+    // dispatch is already fenced on that tier (PAPERCLIP_NODE_ROLE=api, heartbeat.ts).
+    //
+    // Constraints on a stall alert over these series, given as mechanism rather than a
+    // paste-ready predicate: two review rounds have each produced a predicate that then
+    // measured wrong against live data, because correctness here turns on topology and
+    // process lifetime that a code comment cannot track.
+    //   1. Scope to `service="paperclip-workers"`, or it pages against a tier that
+    //      legitimately never sweeps.
+    //   2. The gauge and the completion counter are ONE variable with opposite sign --
+    //      `setBackstopDeferredCandidates(src, result.candidateLimitSkipped)` against
+    //      `if (result.candidateLimitSkipped === 0) recordBackstopSweepCompleted(src)`
+    //      (recovery/service.ts). So `deferred > 0` and "no completion on that tick" are
+    //      the SAME fact, not two independent signals, and ANDing them pages forever on a
+    //      saturated-but-healthy stream. Corollary: NO predicate over these two series
+    //      detects a stall on a permanently-saturated stream -- that needs the
+    //      zero-deferred-tick fix, not an alert change.
+    //   3. The seed makes a never-swept process read identical to a drained one: both
+    //      counters sit at 0 until that process completes its first sweep. Sizing a
+    //      `for:` around that needs the sweep CADENCE -- and the cadence is NOT the 30s
+    //      scheduler tick. Neither loop is driven by that tick: both run only inside
+    //      `reconcileIssueGraphLiveness`, which sits partway down the heartbeat recovery
+    //      chain behind `reconcileStrandedAssignedIssues` and is gated by the
+    //      `heartbeatRecoveryChainInFlight` latch (index.ts, BLO-34207/#1897). A tick
+    //      that finds the chain in flight skips it silently, and the latch declaration
+    //      says outright that a sweep "routinely outlives one interval". So a completion
+    //      is one CHAIN COMPLETION, not one tick, and that period is a property of the
+    //      chain's slowest pass and of estate size -- not of these metrics, and not of
+    //      anything this file can track. Do NOT paste a `for:` constant from here.
+    //   4. PRECONDITION, not reassurance: `increase(<counter>[Nh]) == 0` is only
+    //      meaningful while process lifetime stays under N. Because a completion is
+    //      per-chain rather than per-tick, that expression currently reads as a function
+    //      of PROCESS AGE more than of sweep liveness; it is quiet today only because the
+    //      pod is replaced on a shorter period than the range window. Anything that
+    //      lengthens pod lifetime past N makes it fire permanently on a healthy stream.
+    //      Any alert built on it must state that bound, and a `for:` shorter than the
+    //      start-to-first-completion window pages on every fresh pod.
+    //      Measurements behind 3-4, and the standing caveat that this cadence moves:
+    //      BLO-29763. Three review rounds have each produced a predicate that then
+    //      measured wrong -- a number recorded here is the thing that keeps decaying.
+    //
+    // Bounded: 2 sources x (1 gauge + 1 counter + 12 reasons) = 28 series.
     for (const source of BACKSTOP_SOURCES) {
       backstopDeferredCandidates.set({ source }, 0);
+      backstopSweepCompleted.inc({ source }, 0);
+      for (const reason of BACKSTOP_SKIP_REASONS) {
+        backstopCandidatesSkipped.inc({ source, reason }, 0);
+      }
     }
     pluginWebhookDeliveryRejected = new Counter({
       name: PLUGIN_WEBHOOK_DELIVERY_REJECTED_METRIC,
