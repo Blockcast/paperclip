@@ -357,6 +357,18 @@ function retiredFindingKeys(body, head) {
  * an *earlier* head; it has no (severity, index) at this head for a ledger to
  * name, and it is enumerated on its own account at the head that raised it.
  * Fail closed.
+ *
+ * A blocker that MIRRORS that still-present finding into its counted bucket, as
+ * the reviewer contract asks, keeping its original `prior:<earlier> ...` label,
+ * is keyed here by position at THIS head all the same. That is deliberate, and
+ * it is a known false red: an approval retiring the finding only under its
+ * original name does not supersede the blocker. Keying the slot on the name it
+ * carries would clear it, and would also clear the #876 / #1220 race, because an
+ * earlier head's finding is exactly the name both racing runs can produce. It
+ * proves nothing about having read the blocker. A this-head name does, so an
+ * approval that also retires `prior:<this head> <severity> <index>` still
+ * supersedes; otherwise a new head is the exit. Ally's audit at 37522699 found
+ * the shape in none of 64 real bodies.
  */
 function supersedesBlocker(approval, blocker, head) {
   const raised = countedFindingKeys(blocker?.body);

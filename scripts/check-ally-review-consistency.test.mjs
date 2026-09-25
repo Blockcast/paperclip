@@ -770,6 +770,34 @@ describe("I1 names the mechanism a same-lane duplicate implies", () => {
     assert.match(violations.find((v) => v.startsWith("I2e")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
   });
 
+  // The contract mirrors a still-standing finding into the counted bucket under
+  // its ORIGINAL id. Keying that slot on the earlier head's name would reopen the
+  // #876 / #1220 race, since both racing runs can name an earlier head's finding,
+  // so the slot keeps its position at this head: retiring it by the earlier name
+  // alone stays fatal (a known false red), and a this-head name still clears it.
+  const mirroredBlocker = () =>
+    appReview({
+      id: DUPLICATE_IDS[0],
+      state: "COMMENTED",
+      submitted_at: "2026-09-23T10:00:00Z",
+      body: canonicalBody(
+        HEAD,
+        `### Prior Findings Dispositioned (1)\n- **prior:${OTHER.slice(0, 7)} important 1** — still-present — stands\n### Critical Issues (0)\n### Important Issues (1)\n- **prior:${OTHER.slice(0, 7)} important 1** — stands`,
+      ),
+    });
+
+  it("still fires I2e when the approval retires a mirrored finding only by its earlier-head name", () => {
+    const approval = approvalWithLedger(`- **prior:${OTHER.slice(0, 7)} important 1** — fixed — gone`);
+    const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [mirroredBlocker(), approval] });
+    assert.match(violations.find((v) => v.startsWith("I2e")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
+  });
+
+  it("does not fire I2e when the approval retires a mirrored finding by its position at this head", () => {
+    const approval = approvalWithLedger(`- **prior:${HEAD.slice(0, 7)} important 1** — fixed — gone`);
+    const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [mirroredBlocker(), approval] });
+    assert.deepEqual(violations.filter((v) => v.startsWith("I2e")), []);
+  });
+
   // Shapes the merge gate's PRIOR_FINDING_DISPOSITION_PATTERN accepts. Reading
   // either as non-retiring here would fail a supersession the gate allows.
   for (const [shape, ledger] of [
