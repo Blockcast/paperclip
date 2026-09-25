@@ -1146,10 +1146,153 @@ describeEmbeddedPostgres("productivity review service", () => {
       });
     });
 
-    // BLO-27698 A2: an issue the assignee filed against this one is deliverable
-    // progress. Every case below asserts non-generation (or generation), never
-    // that a line was rendered — the defect this AC closes is precisely a signal
-    // that was computed and printed but never consulted.
+    // BLO-35779. A rebase merge queue deliberately freezes a queued PR's head —
+    // pushing ejects it — so `synchronize` cannot fire while the PR advances,
+    // and the row's clock stops at the enqueue. GitHub emits NOTHING per-PR in
+    // between: measured on `Blockcast/paperclip`, #1948 sat 27.4h and #1654
+    // 38.9h between `added_to_merge_queue` and `removed_from_merge_queue` with
+    // no intervening event at all. 35% of 91 measured queue sits exceed the 24h
+    // bar, so a third of correctly-queued PRs read `stale` and A1 could not fire
+    // for them — 5 of 6 adjudicated post-deploy reviews, all "close as
+    // productive".
+    //
+    // NOTE the fixture shape. BLO-35779's verifying signal asked for "last
+    // synchronize 27h old, carrying a queue event 10h old". That fixture cannot
+    // fail: an `enqueued` event REWRITES the work-product row, so a 10h-old
+    // queue event leaves a 10h-old row that is already non-stale on master.
+    // The defect needs the queue event ITSELF to be the stale one.
+    describe("a PR sitting in the merge queue (BLO-35779)", () => {
+      const queued = (state: string | null) => ({
+        source: "github_pull_request_webhook",
+        sourceEventOrder: 10,
+        ...(state === null ? {} : { mergeQueueState: state }),
+      });
+
+      async function seedQueuedPr(ageHours: number, state: string | null) {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedIssueWithPullRequest({
+          prUpdatedAt: new Date(now.getTime() - ageHours * 60 * 60 * 1000),
+          metadata: queued(state),
+          issue: {
+            status: "in_progress",
+            startedAt: new Date(now.getTime() - (ageHours + 1) * 60 * 60 * 1000),
+          },
+        });
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+        return { seeded, result };
+      }
+
+      it("does not generate a long-active review for a PR enqueued 27h ago", async () => {
+        const { seeded, result } = await seedQueuedPr(27, "enqueued");
+        expect(result.created).toBe(0);
+        expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+      });
+
+      // Negative control, and the mutation guard: identical fixture with no
+      // queue event must still generate. Without this, the test above passes on
+      // a change that simply widened the window for every PR.
+      it("still fires for the same 27h-old PR with no queue event", async () => {
+        const { seeded, result } = await seedQueuedPr(27, null);
+        expect(result.created).toBe(1);
+        const [review] = await listProductivityReviews(seeded.companyId);
+        expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+      });
+
+      // A dequeued PR was EJECTED — the queue is no longer carrying it, which is
+      // the opposite of progress. Proves the read keys on the state's value and
+      // not merely on the field being present.
+      it("still fires for a PR dequeued 27h ago", async () => {
+        const { seeded, result } = await seedQueuedPr(27, "dequeued");
+        expect(result.created).toBe(1);
+        const [review] = await listProductivityReviews(seeded.companyId);
+        expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+      });
+
+      // BLO-35779 AC4 / BLO-22331 AC2 boundedness: the widened window is a hard
+      // cap, not a licence. Longest queue sit measured was 39.4h; at 50h a lost
+      // `dequeued` delivery must not hold the signal open forever.
+      it("still fires once an enqueued PR passes the 48h merge-queue cap", async () => {
+        const { seeded, result } = await seedQueuedPr(50, "enqueued");
+        expect(result.created).toBe(1);
+        const [review] = await listProductivityReviews(seeded.companyId);
+        expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+      });
+
+      // AC3: reporting and suppression must agree. A reviewer seeing "27h ago,
+      // non-stale" with no stated reason reads it as a bug in the detector.
+      it("labels the queued PR non-stale and says why", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedIssueWithPullRequest({
+          prUpdatedAt: new Date(now.getTime() - 27 * 60 * 60 * 1000),
+          metadata: queued("enqueued"),
+        });
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+          now,
+        });
+
+        await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+        expect(description).toContain("non-stale, in merge queue");
+        expect(description).not.toContain("27h ago, stale");
+      });
+
+      // The SQL half of the widening, which needs TWO PRs to be observable at
+      // all: with one, dropping the clause merely makes `progressPullRequestRow`
+      // null and the code falls back to `latestPullRequestRow` — the same row —
+      // so every test above still passes. Found by mutation-testing this guard
+      // (BLO-34263 rule): removing the SQL `or(...)` left all five green.
+      //
+      // Here the newest PR is closed-unmerged, so the fallback picks a NON-
+      // progress row and the queued PR's signal is lost. This is the shape the
+      // surrounding code comment already warns about: "a newer closed-unmerged
+      // PR must not hide an older open/draft/merged PR that is still fresh."
+      it("finds a queued PR that a newer closed PR would otherwise hide", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedIssueWithPullRequest({
+          prUpdatedAt: new Date(now.getTime() - 27 * 60 * 60 * 1000),
+          metadata: queued("enqueued"),
+          issue: {
+            status: "in_progress",
+            startedAt: new Date(now.getTime() - 28 * 60 * 60 * 1000),
+          },
+        });
+        // Newer, owns the issue too, but closed without merging — not progress.
+        await db.insert(issueWorkProducts).values({
+          companyId: seeded.companyId,
+          issueId: seeded.issueId,
+          type: "pull_request",
+          provider: "github",
+          externalId: "Blockcast/paperclip#807",
+          title: `Superseded attempt (${seeded.issuePrefix}-1)`,
+          url: "https://github.com/Blockcast/paperclip/pull/807",
+          status: "closed",
+          metadata: queued(null),
+          sourceTrust: PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST,
+          createdAt: new Date(now.getTime() - 60 * 60 * 1000),
+          updatedAt: new Date(now.getTime() - 60 * 60 * 1000),
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(0);
+        expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+      });
+    });
+
     describe("a fresh assignee-filed linked issue (A2)", () => {
       async function seedLinkedIssue(opts: {
         companyId: string;

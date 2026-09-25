@@ -88,6 +88,25 @@ const PRODUCTIVITY_REVIEW_RESERVATION_STALE_MS = 5 * 60 * 1000;
  */
 export const PRODUCTIVITY_REVIEW_PR_FRESH_MS = 24 * 60 * 60 * 1000;
 /**
+ * BLO-35779: the same window for a PR that is sitting in a merge queue.
+ *
+ * A queued PR cannot tick the ordinary clock. `sourceEventTimestampMs` comes
+ * from `pull_request` webhooks, and in a REBASE merge queue the PR's head
+ * deliberately does not move while it advances — pushing ejects it — so the one
+ * behaviour that proves progress is the one that cannot refresh the row.
+ * Measured on `Blockcast/paperclip` (91 queue sits across 52 merged PRs,
+ * 2026-09-23): median 15.5h, p90 31.7h, **35% exceed the 24h bar above**, max
+ * 39.4h. So a third of correctly-behaving queued PRs read `stale` on the
+ * ordinary window, which is exactly the population A1's suppression exists for.
+ *
+ * 48h is the measured ceiling (39.4h) plus headroom, NOT a guess, and it is a
+ * hard cap rather than a rolling window: nothing a queue emits can extend it,
+ * because GitHub emits nothing per-PR between enqueue and dequeue. That is what
+ * keeps BLO-35779 AC4 true — a lost `dequeued` delivery costs at most 48h of
+ * suppression, not indefinite suppression.
+ */
+export const PRODUCTIVITY_REVIEW_PR_MERGE_QUEUE_FRESH_MS = 48 * 60 * 60 * 1000;
+/**
  * BLO-27698 A3: window in which an assignee `Next action:` comment counts as a
  * live progress signal, matching the "in the last 6h" wording in the Manager
  * Decision block below.
@@ -323,6 +342,13 @@ type PullRequestEvidence = {
    * verdict on a `critical` row that had been dark for seven days.
    */
   ownsSourceIssue: boolean;
+  /**
+   * BLO-35779: the PR is sitting in a merge queue as of its last queue event.
+   * Widens the freshness window to
+   * `PRODUCTIVITY_REVIEW_PR_MERGE_QUEUE_FRESH_MS` — see that constant for why a
+   * queued PR cannot tick the ordinary clock, and for the measurement.
+   */
+  inMergeQueue: boolean;
 };
 
 const PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUS_VALUES = ["ready_for_review", "draft", "merged"] as const;
@@ -359,6 +385,13 @@ type PullRequestEvidenceRow = {
    * nothing" — see `pullRequestOwnsIssue`.
    */
   owningIdentifiers: unknown;
+  /**
+   * BLO-35779: merge-queue occupancy as last reported by a `pull_request`
+   * webhook. `null` means no queue event has ever touched this row — which for
+   * a repo with no merge queue is every row, so it must read as "not queued"
+   * and never as "queued".
+   */
+  mergeQueueState: string | null;
 };
 
 type ProductivityReviewEvidence = {
@@ -1371,7 +1404,13 @@ function formatDependencyGating(
 }
 
 function isFreshPullRequest(pr: PullRequestEvidence | null): pr is PullRequestEvidence {
-  return pr !== null && pr.ageMs <= PRODUCTIVITY_REVIEW_PR_FRESH_MS;
+  if (pr === null) return false;
+  // BLO-35779: a queued PR gets the wider window, because the clock this reads
+  // cannot tick while it is queued. Still a cap, not an exemption — AC4.
+  const window = pr.inMergeQueue
+    ? PRODUCTIVITY_REVIEW_PR_MERGE_QUEUE_FRESH_MS
+    : PRODUCTIVITY_REVIEW_PR_FRESH_MS;
+  return pr.ageMs <= window;
 }
 
 // Deliberately NOT a type predicate: a false result means "not progress", not
@@ -1441,6 +1480,7 @@ function toPullRequestEvidence(
     updatedAt: eventAt,
     ageMs: Math.max(0, now.getTime() - eventAt.getTime()),
     ownsSourceIssue: pullRequestOwnsIssue(row, sourceIdentifier),
+    inMergeQueue: row.mergeQueueState === "enqueued",
   };
 }
 
@@ -1464,7 +1504,14 @@ function formatPullRequestEvidence(pr: PullRequestEvidence | null) {
   const attribution = pr.ownsSourceIssue
     ? "attributed to this issue"
     : "NOT attributed to this issue";
-  return `${ref} \`${pr.status}\`, last activity ${pr.updatedAt.toISOString()} (${msToHuman(pr.ageMs)} ago, ${freshness}, ${progress}, ${attribution})`;
+  // BLO-35779: name the merge queue explicitly. Without it a queued PR renders
+  // as "36h ago, non-stale", which reads as a bug to the reviewer it is meant
+  // to inform — the wider window is only defensible if the line says why it
+  // applied. "last activity" is also literally true and misleading here: it is
+  // the last event GitHub SENT, and GitHub sends nothing per-PR while a PR
+  // advances through the queue.
+  const queue = pr.inMergeQueue ? ", in merge queue" : "";
+  return `${ref} \`${pr.status}\`, last activity ${pr.updatedAt.toISOString()} (${msToHuman(pr.ageMs)} ago, ${freshness}${queue}, ${progress}, ${attribution})`;
 }
 
 /**
@@ -4089,6 +4136,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     const nonExecutingAlsoNeverInvokedCount = nonExecutingRuns.filter(isNeverInvokedRun).length;
 
     const pullRequestFreshCutoff = new Date(now.getTime() - PRODUCTIVITY_REVIEW_PR_FRESH_MS);
+    const pullRequestMergeQueueFreshCutoff = new Date(
+      now.getTime() - PRODUCTIVITY_REVIEW_PR_MERGE_QUEUE_FRESH_MS,
+    );
     const pullRequestEvidenceSelect = {
       title: issueWorkProducts.title,
       url: issueWorkProducts.url,
@@ -4102,6 +4152,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       end`,
       branch: sql<string | null>`${issueWorkProducts.metadata}->>'branch'`,
       owningIdentifiers: sql<unknown>`${issueWorkProducts.metadata}->'owningIdentifiers'`,
+      mergeQueueState: sql<string | null>`${issueWorkProducts.metadata}->>'mergeQueueState'`,
     };
     const trustedPullRequestEvidenceWhere = and(
       eq(issueWorkProducts.companyId, sourceIssue.companyId),
@@ -4209,7 +4260,20 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           and(
             trustedPullRequestEvidenceWhere,
             inArray(issueWorkProducts.status, [...PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUS_VALUES]),
-            sql`${pullRequestEffectiveEventAtSql} >= ${pullRequestFreshCutoff.toISOString()}::timestamptz`,
+            // Mirrors `isFreshPullRequest` exactly, including the BLO-35779
+            // merge-queue widening. The two MUST agree: this clause decides
+            // which row becomes `progressPullRequestRow`, and the TS predicate
+            // then re-tests the row it picked. A queued PR excluded here would
+            // fall back to `latestPullRequestRow` and — where another PR on the
+            // same issue is newer — silently report the wrong PR as this row's
+            // progress signal.
+            or(
+              sql`${pullRequestEffectiveEventAtSql} >= ${pullRequestFreshCutoff.toISOString()}::timestamptz`,
+              and(
+                sql`${issueWorkProducts.metadata}->>'mergeQueueState' = 'enqueued'`,
+                sql`${pullRequestEffectiveEventAtSql} >= ${pullRequestMergeQueueFreshCutoff.toISOString()}::timestamptz`,
+              ),
+            ),
           ),
         )
         .orderBy(desc(pullRequestEffectiveEventAtSql))
@@ -4689,11 +4753,15 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // counts as progress.
     //
     // Bounded by construction, per BLO-22331 AC2: progress-eligibility requires
-    // `ageMs <= PRODUCTIVITY_REVIEW_PR_FRESH_MS` (24h), so a PR that stops moving
-    // ages out and the trigger fires again — this cannot suppress indefinitely.
-    // Returns null rather than a recorded suppression for the same reason the
-    // gated-elapsed check below does: `long_active_duration` is last in
-    // `choosePrimaryTrigger`'s ladder, so no other fired trigger is discarded.
+    // `ageMs <= PRODUCTIVITY_REVIEW_PR_FRESH_MS` (24h), or — for a PR sitting in
+    // a merge queue, whose clock GitHub cannot tick (BLO-35779) —
+    // `PRODUCTIVITY_REVIEW_PR_MERGE_QUEUE_FRESH_MS` (48h). Both are hard caps
+    // measured from the last GitHub event, not rolling windows, so a PR that
+    // stops moving ages out and the trigger fires again; this cannot suppress
+    // indefinitely under either. Returns null rather than a recorded suppression
+    // for the same reason the gated-elapsed check below does:
+    // `long_active_duration` is last in `choosePrimaryTrigger`'s ladder, so no
+    // other fired trigger is discarded.
     if (trigger === "long_active_duration" && isProgressPullRequest(latestPullRequest)) {
       return null;
     }
