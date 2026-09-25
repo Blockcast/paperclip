@@ -1666,11 +1666,20 @@ export function routineService(
     );
   }
 
-  // Ally review, BLO-31996: the two wake paths an open routine execution can
-  // have that are not heartbeat runs. The supersede refuses to cancel a row
-  // with either, so the gate must read that same row as live, or the fire
-  // proceeds beside a predecessor nothing will cancel. Both functions read
-  // these from here so the refused set and the gated set cannot drift apart.
+  // Ally review, BLO-31996: everything the supersede refuses to cancel lives
+  // here, because the gate must read that same row as live -- otherwise the
+  // fire proceeds beside a predecessor nothing will ever cancel. Both
+  // functions read these from here so the refused set and the gated set
+  // cannot drift apart. When you add a protection to the supersede, add it
+  // here and give the gate a matching arm in the same commit.
+  //
+  // Statuses that keep their own wake path and must survive a supersede. A
+  // routine execution parked here is waiting on a reviewer, an approval, or a
+  // pending interaction, none of which are heartbeat runs.
+  const SUPERSEDE_PROTECTED_STATUSES = ["in_review"];
+
+  // The two wake paths an open routine execution can have that are not
+  // heartbeat runs and are not visible in `issues.status`.
   //
   // The self-join is written as raw SQL rather than with drizzle's `alias()`
   // on purpose: interpolating an aliased table into a `sql` fragment emits
@@ -1792,6 +1801,11 @@ export function routineService(
     // condition, since a protected row is never cancelled at any age. A
     // protection that commits after this snapshot is caught by the second gate
     // `dispatchRoutineRun` runs after the supersede's row lock.
+    //
+    // The disjunction is the exact complement, within that shared candidate
+    // scope, of the three refusals `staleCondition` applies -- one arm each, in
+    // the same order. Adding a fourth protection to the supersede without a
+    // fourth arm here re-opens the gap this block exists to close.
     const [protectedRow] = await executor
       .select({ issue: issues })
       .from(issues)
@@ -1799,7 +1813,11 @@ export function routineService(
         and(
           issueCondition,
           isNotNull(issues.executionRunId),
-          or(hasUnresolvedBlockerEdge(), hasLiveRecoveryAction()),
+          or(
+            inArray(issues.status, SUPERSEDE_PROTECTED_STATUSES),
+            hasUnresolvedBlockerEdge(),
+            hasLiveRecoveryAction(),
+          ),
         ),
       )
       .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
@@ -1880,10 +1898,9 @@ export function routineService(
   // in-flight work, because a legitimately long-running fire is old by
   // definition and would match. See the call site's guard.
   //
-  // Statuses that keep their own wake path and must survive a supersede. A
-  // routine execution parked here is waiting on a reviewer, an approval, or a
-  // pending interaction, none of which are heartbeat runs.
-  const SUPERSEDE_PROTECTED_STATUSES = ["in_review"];
+  // The protections this refuses on are declared with the gate's shared
+  // helpers above (`SUPERSEDE_PROTECTED_STATUSES`, `hasUnresolvedBlockerEdge`,
+  // `hasLiveRecoveryAction`), so the two sets cannot drift apart.
 
   async function supersedeStaleExecutionIssues(input: {
     routine: typeof routines.$inferSelect;
@@ -1904,16 +1921,6 @@ export function routineService(
     // BLO-27553 zero-wake-path strand this change targets -- is retired.
     // `cancelled` blockers do not count as resolved, matching the
     // dependency semantics used everywhere else.
-    //
-    // The self-join is written as raw SQL rather than with drizzle's
-    // `alias()` on purpose: interpolating an aliased table into a `sql`
-    // fragment emits only the alias NAME, so the join reads
-    // `join "supersede_blocker"` -- a table that does not exist. That is
-    // a runtime 42P01 inside the dispatch transaction, not a type error,
-    // so it compiles clean and only shows up when the supersede actually
-    // matches. Aliasing here is mandatory, not cosmetic: an unaliased
-    // second `issues` in the subquery would shadow the outer statement's
-    // target and make `issues.id` below self-correlate.
     const noUnresolvedBlocker = sql`not ${hasUnresolvedBlockerEdge()}`;
     // Ally review, BLO-31996: a live recovery action is an explicit wake path
     // too, but it lives in `issue_recovery_actions`, not `issue_relations`, so
@@ -2324,9 +2331,20 @@ export function routineService(
       title,
       description,
     });
-    let supersededStaleIssues: { id: string; identifier: string | null; createdAt: Date }[] = [];
+    // Ally review, BLO-31996: `fireAgeMs` is computed where `dispatchNow` is in
+    // scope and carried on the row, rather than held as a separate instant the
+    // read site subtracts. As a sibling `let supersededAtMs = 0` it was correct
+    // only because the rows were non-empty exactly when the supersede branch
+    // had run -- a coupling invisible at the read site, where a stray 0 would
+    // publish a ~57-year `fireAgeMs` into an operator-facing warning. On the
+    // row that is unrepresentable: no row exists without its own age.
+    let supersededFires: {
+      id: string;
+      identifier: string | null;
+      createdAt: Date;
+      fireAgeMs: number;
+    }[] = [];
     let supersededFireAgeHorizonMs = 0;
-    let supersededAtMs = 0;
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await tx.execute(
@@ -2463,9 +2481,11 @@ export function routineService(
             now: dispatchNow,
             supersededByRunId: createdRun.id,
           });
-          supersededStaleIssues = superseded;
+          supersededFires = superseded.map((row) => ({
+            ...row,
+            fireAgeMs: dispatchNow.getTime() - row.createdAt.getTime(),
+          }));
           supersededFireAgeHorizonMs = fireAgeHorizonMs;
-          supersededAtMs = dispatchNow.getTime();
 
           // Ally review, BLO-31996: gate again, after the supersede's row lock.
           // The supersede decides its protections post-lock, so a blocker edge
@@ -2508,6 +2528,14 @@ export function routineService(
             executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
           });
         } catch (error) {
+          // BLO-31996: this catch cannot fire on today's path. `issueSvc.create`
+          // never sets `executionRunId` and `issues_open_routine_execution_uq`
+          // is partial on `execution_run_id is not null`, so the INSERT is
+          // outside the index; the conflict surfaces later, on the successor's
+          // checkout, where the run is first bound. Kept as defence-in-depth
+          // for a future that binds the run at creation -- NOT as a protection
+          // anything currently relies on. The gates above are what stop a
+          // duplicate open execution row, which is why they run twice.
           const isOpenExecutionConflict =
             !!error &&
             typeof error === "object" &&
@@ -2598,28 +2626,28 @@ export function routineService(
     // and do not roll back, so both are emitted only once the transaction
     // carrying the cancellation UPDATE has committed. Emitted inside the
     // supersede they attested a disposal that a later abort undid -- least
-    // useful exactly when a wedge is recurring.
-    for (const row of supersededStaleIssues) {
-      incrementRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue");
-      logger.warn(
-        {
-          routineId: input.routine.id,
-          issueId: row.id,
-          issueIdentifier: row.identifier,
-          fireCreatedAt: row.createdAt.toISOString(),
-          fireAgeMs: supersededAtMs - row.createdAt.getTime(),
-          fireAgeHorizonMs: supersededFireAgeHorizonMs,
-        },
-        "cancelled routine execution issue whose fire outlived its cadence so the successor fire can dispatch",
-      );
-    }
-    // Same reason the counter is out here: these are best-effort receipts for a
+    // useful exactly when a wedge is recurring. The receipts below share the
+    // guard for the same reason: they are best-effort attestations of a
     // cancellation that has already committed, and inside the transaction a
     // failed one would take the cancellation down with it.
-    if (supersededStaleIssues.length > 0) {
+    if (supersededFires.length > 0) {
+      for (const row of supersededFires) {
+        incrementRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue");
+        logger.warn(
+          {
+            routineId: input.routine.id,
+            issueId: row.id,
+            issueIdentifier: row.identifier,
+            fireCreatedAt: row.createdAt.toISOString(),
+            fireAgeMs: row.fireAgeMs,
+            fireAgeHorizonMs: supersededFireAgeHorizonMs,
+          },
+          "cancelled routine execution issue whose fire outlived its cadence so the successor fire can dispatch",
+        );
+      }
       await writeSupersedeReceipts({
         routine: input.routine,
-        rows: supersededStaleIssues,
+        rows: supersededFires,
         fireAgeHorizonMs: supersededFireAgeHorizonMs,
         supersededByRunId: run.id,
       });
