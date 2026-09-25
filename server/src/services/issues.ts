@@ -970,6 +970,19 @@ type IssueScheduledRetryProjection = {
   // previous assignee's retry row alive, so the new assignee read "not my run"
   // as "a sibling holds it" and hid its own work. Sibling means same agent.
   scheduledRetryAgentId: string | null;
+  // BLO-29965 review round 4. EVERY run parked on this issue, in the same
+  // tie-break order. The fields above describe one row, the earliest-due, which
+  // is what list/detail parity needs; the self-selection guard needs more. A
+  // reassigned issue keeps the previous assignee's retry alive, and a stale row
+  // is older, so it wins earliest-due by construction and would hide a live
+  // sibling retry due later.
+  scheduledRetryParkedRuns: ReadonlyArray<IssueParkedScheduledRetry>;
+};
+type IssueParkedScheduledRetry = {
+  runId: string;
+  agentId: string;
+  scheduledRetryAt: Date | null;
+  scheduledRetryReason: string | null;
 };
 const EMPTY_SCHEDULED_RETRY_PROJECTION: IssueScheduledRetryProjection = {
   scheduledRetryAt: null,
@@ -977,6 +990,7 @@ const EMPTY_SCHEDULED_RETRY_PROJECTION: IssueScheduledRetryProjection = {
   scheduledRetryAttempt: null,
   scheduledRetryRunId: null,
   scheduledRetryAgentId: null,
+  scheduledRetryParkedRuns: [],
 };
 type IssueWithLabelsAndRun = IssueWithLabels
   & { activeRun: IssueActiveRunRow | null }
@@ -2889,6 +2903,7 @@ async function scheduledRetryProjectionMapForIssues(
   issueIds: string[],
 ): Promise<Map<string, IssueScheduledRetryProjection>> {
   const map = new Map<string, IssueScheduledRetryProjection>();
+  const parkedByIssue = new Map<string, IssueParkedScheduledRetry[]>();
   const uniqueIssueIds = [...new Set(issueIds)];
   if (uniqueIssueIds.length === 0) return map;
 
@@ -2914,15 +2929,33 @@ async function scheduledRetryProjectionMapForIssues(
       .orderBy(asc(heartbeatRuns.scheduledRetryAt), asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
 
     // Rows arrive in the single-read tie-break order, so first-seen per issue is
-    // the same row `getCurrentScheduledRetryForIssue` would have returned.
-    for (const row of rows as Array<{ issueId: string | null } & IssueScheduledRetryProjection>) {
-      if (!row.issueId || map.has(row.issueId)) continue;
+    // the same row `getCurrentScheduledRetryForIssue` would have returned. Later
+    // rows only join the parked set.
+    for (const row of rows as Array<
+      { issueId: string | null; scheduledRetryRunId: string; scheduledRetryAgentId: string }
+        & Omit<IssueScheduledRetryProjection, "scheduledRetryRunId" | "scheduledRetryAgentId" | "scheduledRetryParkedRuns">
+    >) {
+      if (!row.issueId) continue;
+      const parked: IssueParkedScheduledRetry = {
+        runId: row.scheduledRetryRunId,
+        agentId: row.scheduledRetryAgentId,
+        scheduledRetryAt: row.scheduledRetryAt ?? null,
+        scheduledRetryReason: row.scheduledRetryReason ?? null,
+      };
+      const seen = parkedByIssue.get(row.issueId);
+      if (seen) {
+        seen.push(parked);
+        continue;
+      }
+      const parkedRuns = [parked];
+      parkedByIssue.set(row.issueId, parkedRuns);
       map.set(row.issueId, {
         scheduledRetryAt: row.scheduledRetryAt ?? null,
         scheduledRetryReason: row.scheduledRetryReason ?? null,
         scheduledRetryAttempt: row.scheduledRetryAttempt ?? null,
         scheduledRetryRunId: row.scheduledRetryRunId ?? null,
         scheduledRetryAgentId: row.scheduledRetryAgentId ?? null,
+        scheduledRetryParkedRuns: parkedRuns,
       });
     }
   }

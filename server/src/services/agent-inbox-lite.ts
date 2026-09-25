@@ -20,7 +20,10 @@ type AgentInboxLiteInput = {
   worktreeActivation: WorktreeRunExecutionActivationState;
   nowMs?: number;
   onWithheldForeignRun?: (issue: InboxIssue) => void;
-  onWithheldForeignScheduledRetry?: (issue: InboxIssue) => void;
+  onWithheldForeignScheduledRetry?: (
+    issue: InboxIssue,
+    holder: InboxIssue["scheduledRetryParkedRuns"][number],
+  ) => void;
 };
 
 // Keep the inbox query, worktree gate, and foreign-run suppression together.
@@ -72,16 +75,20 @@ export async function loadAgentInboxLite({
       // `activeRun`. Kept as a separate check with its own audit callback so a
       // withheld row says which of the two liveness paths withheld it — a lost
       // claim must be distinguishable, not merged into the running-run case.
-      const retryHeld = isIssueHeldByForeignScheduledRetry({
-        scheduledRetryAt: issue.scheduledRetryAt,
-        scheduledRetryRunId: issue.scheduledRetryRunId,
-        scheduledRetryAgentId: issue.scheduledRetryAgentId,
-        callerRunId,
-        callerAgentId: agentId,
-        nowMs,
-      });
-      if (retryHeld) onWithheldForeignScheduledRetry?.(issue);
-      return !retryHeld;
+      // Every parked run is checked, not just the earliest-due one the row
+      // displays: that one can be a previous assignee's stale retry.
+      const retryHolder = issue.scheduledRetryParkedRuns.find((parked) =>
+        isIssueHeldByForeignScheduledRetry({
+          scheduledRetryAt: parked.scheduledRetryAt,
+          scheduledRetryRunId: parked.runId,
+          scheduledRetryAgentId: parked.agentId,
+          callerRunId,
+          callerAgentId: agentId,
+          nowMs,
+        }),
+      );
+      if (retryHolder) onWithheldForeignScheduledRetry?.(issue, retryHolder);
+      return !retryHolder;
     })
     .map((issue) => ({
       id: issue.id,
