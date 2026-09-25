@@ -276,10 +276,41 @@ function detectScreenshotViewport(
  */
 const LIST_MARKER_SOURCE = "^(?:[-*]|\\d+[.)])\\s+";
 
-/** A completed task-list line — any list marker followed by `[x]`. */
+/*
+ * BOTH constants below are module-scoped AND carry `g`, so each owns a single
+ * mutable `lastIndex` shared by every call. That is safe here only because of
+ * WHICH method consumes them, not because of anything visible at these
+ * definitions:
+ *
+ *   - `String.prototype.match` sets `lastIndex` to 0 on entry when the regex
+ *     is global (`RegExp.prototype[Symbol.match]`), so it cannot resume from a
+ *     previous call's offset.
+ *   - `String.prototype.matchAll` iterates a CLONE, leaving the original's
+ *     `lastIndex` untouched.
+ *
+ * `.test()` / `.exec()` have neither property: they advance `lastIndex` and
+ * resume from it, so adding one against either constant would silently skip
+ * matches on alternate invocations — an every-other-call bug, which is the
+ * kind that survives a green test suite. If you need one, match against a
+ * fresh `new RegExp(LIST_MARKER_SOURCE, ...)` instead of reusing these.
+ *
+ * Dropping `g` is not the alternative: `matchAll` throws a TypeError without
+ * it, and `.match()` needs it to return ALL matches rather than the first —
+ * `detectChecklistDoneWhen` counts that array's length.
+ */
+
+/**
+ * A completed task-list line — any list marker followed by `[x]`.
+ * Global + module-scoped: consumed ONLY via `.match()`, which resets
+ * `lastIndex`. See the note above before adding a `.test()`/`.exec()` caller.
+ */
 const TASK_LIST_DONE_RE = new RegExp(`${LIST_MARKER_SOURCE}\\[[xX]\\]`, "gm");
 
-/** A list item under a criteria heading; group 1 is the criterion text. */
+/**
+ * A list item under a criteria heading; group 1 is the criterion text.
+ * Global + module-scoped: consumed ONLY via `.matchAll()`, which iterates a
+ * clone. See the note above before adding a `.test()`/`.exec()` caller.
+ */
 const LIST_ITEM_RE = new RegExp(`${LIST_MARKER_SOURCE}(.*)$`, "gm");
 
 function detectChecklistDoneWhen(
