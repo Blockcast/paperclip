@@ -1655,6 +1655,8 @@ class TestPatternCharacterClassesAreAsciiOnly(unittest.TestCase):
         # comes with them. A four-space-indented line is code to the gate, so
         # reading it here would be a new divergence introduced by the fix.
         self.assertIsNone(sweep.parse_reviewed_head("    Reviewed head: %s" % self.HEAD))
+        # The tab half of the bound, which the four-space line alone never pins.
+        self.assertIsNone(sweep.parse_reviewed_head("\tReviewed head: %s" % self.HEAD))
 
     def test_every_compiled_pattern_in_the_module_is_ascii_only(self):
         # The rule, not the four instances of it. `\b` was missed by the `[0-9]`
