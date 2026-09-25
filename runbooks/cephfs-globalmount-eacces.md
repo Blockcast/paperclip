@@ -25,6 +25,16 @@ kubectl -n paperclip get events \
   --sort-by=.lastTimestamp \
   -o custom-columns=FIRST:.firstTimestamp,LAST:.lastTimestamp,COUNT:.count,POD:.involvedObject.name,MSG:.message \
   | grep -E 'paperclip-data|globalmount'
+
+# The containerd-site signature (below) is a container-create error, so the
+# kubelet emits it under reason=Failed / FailedCreatePodSandBox, which the
+# reason=FailedMount selector above excludes. Its message names the pod volume
+# path (kubernetes.io~csi/<pvc-uid>), not the claim, so key on the path shape.
+kubectl -n paperclip get events \
+  --field-selector type=Warning,involvedObject.kind=Pod \
+  --sort-by=.lastTimestamp \
+  -o custom-columns=FIRST:.firstTimestamp,LAST:.lastTimestamp,COUNT:.count,REASON:.reason,POD:.involvedObject.name,MSG:.message \
+  | grep -E 'kubernetes\.io~csi/.*permission denied'
 ```
 
 You have this fault if you see **permission denied on a path that exists** at either site:
@@ -111,20 +121,26 @@ If that control does not return a nonzero `OOMKilled` bucket from *somewhere* in
 
 ## Verify
 
-Done is **not** "nodeplugin restarted". Done is all three:
+Done is **not** "nodeplugin restarted". Done is all four:
 
 - zero `FailedMount` Warning events for pods mounting `paperclip-data` over the full
-  event-retention window (default 1h; record start/end with `date -u`), using the scoped command
-  in "Confirm you are looking at this"; a shorter window only proves a shorter window and must be
-  reported as such;
+  event-retention window (default 1h; record start/end with `date -u`), using the first scoped
+  command in "Confirm you are looking at this"; a shorter window only proves a shorter window and
+  must be reported as such. This bullet covers only the kubelet/CSI site: zero `FailedMount`
+  events alone does not clear the fault (see the fourth bullet);
 - `Deployment/paperclip-api` reporting `Available: True` with `readyReplicas: 2`;
 - a recorded answer on what the restarts' actual cause was — a refuted hypothesis recorded here is
   a deliverable, because it stops the next responder re-deriving it.
+- zero containerd-site `permission denied` events on a `kubernetes.io~csi/…/mount` path over the
+  same window, using the second command in "Confirm you are looking at this". That signature
+  arrives under `reason=Failed` or `FailedCreatePodSandBox`, never `FailedMount`, so the first
+  bullet cannot see it.
 
 ## Outcome of the 2026-08-20 → 08-22 incident
 
 Recorded 2026-08-22T~06:5xZ, closing the second and third `Verify` bullets; the first is satisfied
-only to the ~55-min retention bound recorded below.
+only to the ~55-min retention bound recorded below. The fourth (containerd-site signature) was
+added after the incident and was not measured then.
 
 **The fault cleared on its own, with no node-level remediation performed.** Measured at 06:5xZ:
 
