@@ -1,10 +1,11 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { companies, createDb, executionWorkspaces, projects } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -138,6 +139,22 @@ describe("inspectWorktreeReclaimSafety", () => {
     fs.writeFileSync(filePath, "\n", "utf8");
 
     expect(await inspectWorktreeReclaimSafety(filePath)).toMatchObject({ safe: false, reason: "unverifiable" });
+  });
+
+  it("gives up on a stat that never returns instead of hanging the collector", async () => {
+    // A wedged mount: stat neither resolves nor rejects. The collector is tracked
+    // heartbeat-scheduler work, so without a bound this await also blocks the
+    // shutdown drain forever.
+    vi.useFakeTimers();
+    const stat = vi.spyOn(fsp, "stat").mockImplementation(() => new Promise(() => {}));
+    try {
+      const pending = inspectWorktreeReclaimSafety(path.join(os.tmpdir(), `paperclip-wedged-${randomUUID()}`));
+      await vi.runOnlyPendingTimersAsync();
+      expect(await pending).toMatchObject({ safe: false, reason: "unverifiable", detail: "stat failed: ETIMEDOUT" });
+    } finally {
+      stat.mockRestore();
+      vi.useRealTimers();
+    }
   });
 });
 
