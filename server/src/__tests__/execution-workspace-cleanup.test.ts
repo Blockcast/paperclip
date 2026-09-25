@@ -12,7 +12,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { classifyRemovalProof, executionWorkspaceCleanupService } from "../services/execution-workspace-cleanup.ts";
-import { inspectWorktreeReclaimSafety } from "../services/workspace-runtime.ts";
+import { inspectWorktreeReclaimSafety, reclaimFsWedgedDirCount } from "../services/workspace-runtime.ts";
 import { lockGitWorktreeForOwner } from "../services/git-worktree-ownership.ts";
 
 /**
@@ -146,15 +146,24 @@ describe("inspectWorktreeReclaimSafety", () => {
     // heartbeat-scheduler work, so without a bound this await also blocks the
     // shutdown drain forever.
     vi.useFakeTimers();
-    const stat = vi.spyOn(fsp, "stat").mockImplementation(() => new Promise(() => {}));
+    // Resolvable at the end: an abandoned call holds its directory until the
+    // syscall answers, and leaving that held would make every later test in
+    // this file depend on declaration order.
+    let unwedge!: () => void;
+    const stat = vi.spyOn(fsp, "stat").mockImplementation(
+      () => new Promise((resolve) => { unwedge = () => resolve(undefined as never); }),
+    );
     try {
       const pending = inspectWorktreeReclaimSafety(path.join(os.tmpdir(), `paperclip-wedged-${randomUUID()}`));
       await vi.runOnlyPendingTimersAsync();
       expect(await pending).toMatchObject({ safe: false, reason: "unverifiable", detail: "stat failed: ETIMEDOUT" });
     } finally {
+      unwedge?.();
+      await vi.advanceTimersByTimeAsync(0);
       stat.mockRestore();
       vi.useRealTimers();
     }
+    expect(reclaimFsWedgedDirCount()).toBe(0);
   });
 });
 
@@ -396,6 +405,7 @@ describeEmbeddedPostgres("reconcileExecutionWorkspaceCleanup", () => {
 
     const realStat = fsp.stat.bind(fsp);
     let reachedWedged!: () => void;
+    let unwedge: (() => void) | undefined;
     const wedgedStatCalled = new Promise<void>((resolve) => {
       reachedWedged = resolve;
     });
@@ -404,7 +414,8 @@ describeEmbeddedPostgres("reconcileExecutionWorkspaceCleanup", () => {
     const stat = vi.spyOn(fsp, "stat").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
       if (String(target) === wedgedPath) {
         reachedWedged();
-        return new Promise(() => {});
+        // Resolvable so the wedged directory does not stay held past this test.
+        return new Promise((resolve) => { unwedge = () => resolve(undefined as never); });
       }
       return (realStat as (...args: unknown[]) => Promise<fs.Stats>)(target, ...rest);
     }) as typeof fsp.stat);
@@ -418,6 +429,8 @@ describeEmbeddedPostgres("reconcileExecutionWorkspaceCleanup", () => {
       expect(result.collected).toBe(0);
       expect(result.skipped).toBe(1);
     } finally {
+      unwedge?.();
+      await vi.advanceTimersByTimeAsync(0);
       stat.mockRestore();
       vi.useRealTimers();
     }
@@ -429,6 +442,73 @@ describeEmbeddedPostgres("reconcileExecutionWorkspaceCleanup", () => {
     expect(next?.status).toBe("active");
     expect(next?.cleanupReason).toBeNull();
     expect(next?.cleanupEligibleAt?.getTime() ?? Infinity).toBeLessThanOrEqual(Date.now());
+  });
+
+  it("holds only the wedged directory, so a colocated sibling is skipped and another root still collects", async () => {
+    const wedgedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-wedged-root-"));
+    const otherRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-other-root-"));
+    tempRoots.add(wedgedRoot);
+    tempRoots.add(otherRoot);
+    const wedgedPath = path.join(wedgedRoot, "wt-wedged");
+    const siblingPath = path.join(wedgedRoot, "wt-sibling");
+    // Absent on disk, so it is provably registry-only and collectable.
+    const otherPath = path.join(otherRoot, "wt-other");
+    const hours = (n: number) => new Date(Date.now() - n * 60 * 60 * 1000);
+    await insertWorkspace({
+      worktreePath: wedgedPath, branchName: "wt-wedged", cleanupEligibleAt: hours(4), lastUsedAt: hourAgo(),
+    });
+    const siblingId = await insertWorkspace({
+      worktreePath: siblingPath, branchName: "wt-sibling", cleanupEligibleAt: hours(3), lastUsedAt: hourAgo(),
+    });
+    const otherId = await insertWorkspace({
+      worktreePath: otherPath, branchName: "wt-other", cleanupEligibleAt: hours(2), lastUsedAt: hourAgo(),
+    });
+
+    const realStat = fsp.stat.bind(fsp);
+    const statted: string[] = [];
+    let unwedge: (() => void) | undefined;
+    let reachedWedged!: () => void;
+    const wedgedStatCalled = new Promise<void>((resolve) => { reachedWedged = resolve; });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const stat = vi.spyOn(fsp, "stat").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+      statted.push(String(target));
+      if (String(target) === wedgedPath) {
+        reachedWedged();
+        return new Promise((resolve) => { unwedge = () => resolve(undefined as never); });
+      }
+      return (realStat as (...args: unknown[]) => Promise<fs.Stats>)(target, ...rest);
+    }) as typeof fsp.stat);
+    try {
+      const first = cleanup.reconcileExecutionWorkspaceCleanup();
+      await wedgedStatCalled;
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect((await first).scanned).toBe(1);
+      expect(reclaimFsWedgedDirCount()).toBe(1);
+
+      statted.length = 0;
+      const second = await cleanup.reconcileExecutionWorkspaceCleanup();
+      // The sibling shares the wedged mount, so it is deferred without a probe:
+      // statting it would hold a second threadpool thread to learn the same thing.
+      expect(statted).not.toContain(siblingPath);
+      expect(second.skipped).toBeGreaterThanOrEqual(1);
+      // ...and the hold is scoped to that directory, so an unrelated root is
+      // still collected rather than the collector latching off process-wide.
+      expect(second.collected).toBe(1);
+
+      unwedge?.();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(reclaimFsWedgedDirCount()).toBe(0);
+    } finally {
+      unwedge?.();
+      await vi.advanceTimersByTimeAsync(0);
+      stat.mockRestore();
+      vi.useRealTimers();
+    }
+
+    const [sibling] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, siblingId));
+    expect(sibling?.status).toBe("active");
+    const [other] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, otherId));
+    expect(other?.status).toBe("archived");
   });
 
   it("does not touch a workspace that is not yet eligible", async () => {
