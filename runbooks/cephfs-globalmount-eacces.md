@@ -177,3 +177,12 @@ one datum nobody obtained during 33 hours of this incident.
 
 - `queued-run-stranded.md` — the run-level symptom this produces downstream.
 - `agent-wakeup-terminal-failed.md` — recovery-action behaviour when runs die in bulk.
+- BLO-29643: the incident record for this runbook (`k8s-paperclip-6` globalmount EACCES wedging
+  the agent fleet). Its investigation, what was ruled out, and the still-open human-only
+  acceptance criterion live there.
+- BLO-29653: the same fault on the `paperclip-data` claim, filed from recovery triage during
+  the incident.
+- BLO-29730: the concurrent CephFS CSI faults on other claims in the same window (k8s-data-3
+  "not a mountpoint" strand, globalmount EACCES on the prod certs claim).
+- BLO-17976: an earlier globalmount permission-denied on `k8s-data-2`, and the reboot remedy
+  BLO-29643 found insufficient here.
