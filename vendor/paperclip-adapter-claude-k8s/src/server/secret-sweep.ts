@@ -80,6 +80,41 @@ export const DEFAULT_SWEEP_INTERVAL_SEC = 300;
  * currently survive for weeks.
  */
 export const DEFAULT_SWEEP_AGE_FLOOR_SEC = 900;
+/**
+ * Hard lower bound on the effective age floor, applied to whatever the caller
+ * supplies.  The floor is the *only* thing protecting a launch in flight, so a
+ * config knob must not be able to set it to nothing: `ageFloorMs: 0` would make
+ * every Secret a candidate the instant it is created — including the three a
+ * live launch has just written and not yet owned, whose Job does not exist yet
+ * and so fails both Job checks and the pre-delete re-read (PR #1459 review).
+ *
+ * Five minutes is far above any plausible Secret-create-to-Job-create gap,
+ * including a throttled API server, while still letting an operator tune
+ * collection well below the 15-minute default.  Clamping *up* is the right
+ * direction for a floor: a too-low value means "collect sooner", never "disable
+ * the sweep", and the failure this bound prevents is deleting live credentials.
+ */
+export const MIN_SWEEP_AGE_FLOOR_SEC = 300;
+/**
+ * Wall-clock bound on a single sweep, enforced by the gate.
+ *
+ * The sweep runs inside `execute()`'s per-agent creation mutex, which is
+ * released only in a `finally` far below the call site — so a `listNamespacedSecret`
+ * that never settles would not merely stall its own run, it would hold that
+ * agent's mutex slot for the lifetime of the process and block every subsequent
+ * `execute()` for that agent.  Swallowing rejections is not enough: a hang is
+ * not a rejection.  That the neighbouring pre-launch Job lookup already carries
+ * a 15s timeout is good evidence this API does hang here (PR #1459 review).
+ *
+ * 15s matches that neighbouring guard.  Abandoning a sweep part-way is safe by
+ * construction: deletes already issued stand, and whatever was left is picked up
+ * by the next sweep.  Note the asymmetry with the age floor above, which is
+ * deliberate rather than an oversight — a too-short timeout fails toward
+ * *leaving orphans behind*, which is visible on the dashboard, whereas a
+ * too-short age floor fails toward *deleting live credentials*.  Only the latter
+ * needs a hard clamp; this one only needs to never be zero.
+ */
+export const DEFAULT_SWEEP_TIMEOUT_MS = 15_000;
 
 type LogStream = "stdout" | "stderr";
 type LogFn = (stream: LogStream, message: string) => void | Promise<void>;
@@ -126,6 +161,13 @@ export interface SweepOptions {
    * Ignored by `sweepOrphanedRunSecrets`, which always sweeps when called.
    */
   intervalMs?: number;
+  /**
+   * Wall-clock bound on one sweep, honoured by the gate from `createSweepGate`.
+   * Ignored by `sweepOrphanedRunSecrets`, which has no timer of its own.
+   * A non-positive value falls back to the default rather than disabling the
+   * bound — see `DEFAULT_SWEEP_TIMEOUT_MS`.
+   */
+  timeoutMs?: number;
   /** Injectable clock for tests. */
   now?: number;
 }
@@ -208,7 +250,12 @@ async function confirmJobAbsent(args: {
  */
 export async function sweepOrphanedRunSecrets(opts: SweepOptions): Promise<SweepResult> {
   const { namespace, coreApi, batchApi, onLog } = opts;
-  const ageFloorMs = opts.ageFloorMs ?? DEFAULT_SWEEP_AGE_FLOOR_SEC * 1000;
+  // Clamped, not just defaulted: an explicitly-supplied 0 must not disarm the
+  // only protection a launch in flight has.  See MIN_SWEEP_AGE_FLOOR_SEC.
+  const ageFloorMs = Math.max(
+    MIN_SWEEP_AGE_FLOOR_SEC * 1000,
+    opts.ageFloorMs ?? DEFAULT_SWEEP_AGE_FLOOR_SEC * 1000,
+  );
   const now = opts.now ?? Date.now();
   const result: SweepResult = { swept: [], retained: [], failed: [] };
 
@@ -320,8 +367,14 @@ export async function sweepOrphanedRunSecrets(opts: SweepOptions): Promise<Sweep
  * No adapter lifecycle/timer hook exists to hang a real scheduler on, so the
  * sweep piggybacks on `execute()`.  The returned function runs at most once per
  * `intervalMs` however often it is called, and claims its slot *before*
- * awaiting so concurrent `execute()` calls cannot double-sweep.  Errors are
- * swallowed: a cleanup best-effort must never fail a run.
+ * awaiting so concurrent `execute()` calls cannot double-sweep.
+ *
+ * It is also where the two ways a cleanup path could damage a run are stopped,
+ * and they need different mechanisms: errors are swallowed, and a sweep that
+ * never settles is abandoned after `timeoutMs`.  A `catch` cannot do the second
+ * job — a hang is not a rejection — and the caller holds a per-agent mutex
+ * across this call, so an unbounded wait here is not one slow run but a
+ * permanently wedged agent.  See `DEFAULT_SWEEP_TIMEOUT_MS`.
  */
 export function createSweepGate(): (opts: SweepOptions) => Promise<SweepResult | null> {
   let lastSweptAt = 0;
@@ -330,8 +383,24 @@ export function createSweepGate(): (opts: SweepOptions) => Promise<SweepResult |
     const intervalMs = opts.intervalMs ?? DEFAULT_SWEEP_INTERVAL_SEC * 1000;
     if (lastSweptAt !== 0 && now - lastSweptAt < intervalMs) return null;
     lastSweptAt = now;
+    const timeoutMs =
+      opts.timeoutMs !== undefined && opts.timeoutMs > 0 ? opts.timeoutMs : DEFAULT_SWEEP_TIMEOUT_MS;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      return await sweepOrphanedRunSecrets(opts);
+      // Promise.race, so a hung API call is *abandoned*, not cancelled: the
+      // underlying request stays pending and is simply no longer awaited. That
+      // leaks one pending promise per stuck sweep — bounded by the interval gate
+      // to one per `intervalMs` — which is the cheaper of the two failures. The
+      // alternative is holding the agent's mutex forever.
+      return await Promise.race([
+        sweepOrphanedRunSecrets(opts),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`orphan-secret sweep timed out after ${timeoutMs}ms`)),
+            timeoutMs,
+          );
+        }),
+      ]);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       await opts.onLog(
@@ -339,6 +408,8 @@ export function createSweepGate(): (opts: SweepOptions) => Promise<SweepResult |
         `[paperclip] Orphan-secret sweep failed (non-fatal): ${message}\n`,
       );
       return null;
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   };
 }

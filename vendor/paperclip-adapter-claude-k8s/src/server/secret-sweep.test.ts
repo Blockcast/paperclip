@@ -6,6 +6,7 @@ import {
   DEFAULT_SWEEP_AGE_FLOOR_SEC,
   deriveOwningJobName,
   MANAGED_BY_LABEL,
+  MIN_SWEEP_AGE_FLOOR_SEC,
   RUN_ID_LABEL,
   sweepOrphanedRunSecrets,
   type SecretSweepObjectMeta,
@@ -80,6 +81,7 @@ function harness(
   return {
     deleted,
     logs,
+    secrets,
     listNamespacedSecret,
     listNamespacedJob,
     readNamespacedJob,
@@ -155,6 +157,48 @@ describe("sweepOrphanedRunSecrets", () => {
     expect(h.deleteNamespacedSecret).not.toHaveBeenCalled();
     // The floor has to actually cover the launch window for that to hold.
     expect(DEFAULT_SWEEP_AGE_FLOOR_SEC).toBeGreaterThanOrEqual(900);
+  });
+
+  // BLO-21857 review follow-up (PR #1459, allyblockcast[bot]): the age floor is
+  // the *sole* protection for a launch in flight, so config must not be able to
+  // set it to nothing. `orphanSecretSweepAgeFloorSec: 0` reaches the sweep as
+  // `ageFloorMs: 0`, under which `now - createdMs < 0` is false for every Secret
+  // — including the three a live launch wrote seconds ago, whose Job does not
+  // exist yet and so fails both Job checks and the pre-delete re-read.
+  it("keeps a seconds-old ownerless Secret even when the caller passes ageFloorMs: 0", async () => {
+    const h = harness([secret("ac-agent-run-fresh-prompt", { runId: "run-fresh", ageSec: 5 })]);
+
+    const result = await sweepOrphanedRunSecrets({ ...h.opts, ageFloorMs: 0 });
+
+    expect(result.swept).toEqual([]);
+    expect(result.retained).toEqual([
+      { name: "ac-agent-run-fresh-prompt", reason: "too_young" },
+    ]);
+    expect(h.deleteNamespacedSecret).not.toHaveBeenCalled();
+    // Clamped, not defaulted: `?? DEFAULT` would not catch an explicit 0.
+    expect(MIN_SWEEP_AGE_FLOOR_SEC).toBeGreaterThanOrEqual(300);
+  });
+
+  it("clamps up to the minimum floor, not down to a caller's unsafe value", async () => {
+    // Older than the 60s the caller asked for, younger than the enforced floor.
+    const h = harness([secret("ac-agent-run-mid-prompt", { runId: "run-mid", ageSec: 120 })]);
+
+    const result = await sweepOrphanedRunSecrets({ ...h.opts, ageFloorMs: 60_000 });
+
+    expect(result.retained).toEqual([{ name: "ac-agent-run-mid-prompt", reason: "too_young" }]);
+  });
+
+  it("still honours a caller floor above the minimum", async () => {
+    // The clamp is one-directional: it raises an unsafe floor, and must not
+    // lower a deliberately conservative one.
+    const h = harness([secret("ac-agent-run-conservative-prompt", { runId: "run-c", ageSec: 3600 })]);
+
+    const result = await sweepOrphanedRunSecrets({ ...h.opts, ageFloorMs: 7_200_000 });
+
+    expect(result.swept).toEqual([]);
+    expect(result.retained).toEqual([
+      { name: "ac-agent-run-conservative-prompt", reason: "too_young" },
+    ]);
   });
 
   it("re-reads the Job before deleting, so one created after the list snapshot is honoured", async () => {
@@ -382,5 +426,54 @@ describe("createSweepGate", () => {
 
     expect(result).toBeNull();
     expect(logs.some((l) => l.stream === "stderr" && l.message.includes("sweep failed (non-fatal)"))).toBe(true);
+  });
+
+  // A hang is not a rejection, so the catch above cannot cover this. The gate is
+  // awaited inside execute()'s per-agent creation mutex, so an unbounded wait
+  // here wedges that agent for the process lifetime (PR #1459 review).
+  it("abandons a sweep whose listing never settles, rather than hanging the caller", async () => {
+    const gate = createSweepGate();
+    const logs: { stream: string; message: string }[] = [];
+    let settled = false;
+
+    const result = await gate({
+      namespace: "paperclip",
+      // Never resolves and never rejects — the shape a stuck API call takes.
+      coreApi: {
+        listNamespacedSecret: () => new Promise(() => {}),
+        deleteNamespacedSecret: async () => ({}),
+      },
+      batchApi: { listNamespacedJob: async () => ({ items: [] }) },
+      onLog: (stream, message) => {
+        logs.push({ stream, message });
+      },
+      timeoutMs: 50,
+      now: NOW,
+    });
+    settled = true;
+
+    expect(settled).toBe(true);
+    expect(result).toBeNull();
+    expect(
+      logs.some((l) => l.stream === "stderr" && l.message.includes("timed out after 50ms")),
+    ).toBe(true);
+  });
+
+  it("falls back to the default bound rather than disabling it on a non-positive timeout", async () => {
+    const gate = createSweepGate();
+    const h = harness([secret("ac-agent-run-x-prompt", { runId: "run-x", ageSec: 3600 })]);
+    // The listing must cost at least one macrotask, or a 0ms timer loses the
+    // race to the mock's microtask resolution and the test passes without the
+    // guard. `?? DEFAULT` does not catch an explicit 0 — that is the defect.
+    h.listNamespacedSecret.mockImplementation(
+      () =>
+        new Promise((resolve) =>
+          setTimeout(() => resolve({ items: h.secrets }), 10),
+        ) as ReturnType<typeof h.listNamespacedSecret>,
+    );
+
+    const result = await gate({ ...h.opts, timeoutMs: 0, now: NOW });
+
+    expect(result?.swept).toEqual(["ac-agent-run-x-prompt"]);
   });
 });
