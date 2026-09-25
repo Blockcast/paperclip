@@ -617,6 +617,11 @@ already flagged.
 
 #### ACs 3 and 4 are satisfied vacuously, and that is worth stating plainly
 
+> **SUPERSEDED 2026-09-25 — this subsection was accurate through fire 3 and is now false.**
+> Fires 6 and 8 produced genuine `enqueue` rows, the confirmation loop resolved them, and one of
+> them (#1990) has since merged. Read it as a point-in-time record, then see
+> *[Fires 4–10 — ACs 3 and 4 exercised for real](#fires-410--acs-3-and-4-exercised-for-real)* below.
+
 The acceptance criteria expect receipt 1 to carry `enqueue` rows whose `autoMergeRequest` is set on
 GitHub, and receipt 2 to resolve each of them to `confirmed-merged` or `still-queued`. **Neither
 fire produced a single `enqueue` row**, so there was nothing to arm and nothing to confirm. Both
@@ -705,10 +710,82 @@ its armed auto-merge when this branch was force-pushed to record these receipts.
 a new head drops auto-merge and staleness-dismisses the review attesting the old head. It is noted
 so the 1 → 1 → 0 progression is not mistaken for a classifier regression.
 
-**This log is a point-in-time record through fire 3.** The routine remains `active` on its 6-hour
-trigger and will keep posting receipts to BLO-34818; that issue, not this file, is the running
-ledger. Nothing further needs appending here unless a fire produces an `enqueue` row, which is the
-event ACs 3 and 4 were actually written for.
+**This log was a point-in-time record through fire 3.** The section below carries it to fire 10.
+
+### Fires 4–10 — ACs 3 and 4 exercised for real
+
+Recorded 2026-09-25. Every PR state in this section was re-read live with
+`gh pr view <n> -R Blockcast/paperclip --json state,mergedAt` at the time of writing, not copied
+from a receipt.
+
+#### The first genuine `enqueue` rows, and the confirmation loop closing on them
+
+| receipt | posted | `enqueue` rows | confirmations for the previous receipt |
+| --- | --- | --- | --- |
+| `187a69d7` | 2026-09-23T00:21:21Z | **#1990** `mergestate:CLEAN` | `none` |
+| `aec91d73` | 2026-09-23T03:22:09Z | 0 | **#1990 → `still-queued`** (OPEN at the time) |
+| `4effd9fa` | 2026-09-23T06:48:23Z | **#1804** `mergestate:CLEAN` | `none` |
+| `aa6a0a70` | 2026-09-23T16:44:08Z | 0 | **#1804 → `still-queued`** (OPEN at the time) |
+| `98027253` | 2026-09-24T14:10:23Z | **#2001, #1985, #1976** all `mergestate:CLEAN` | `none` |
+
+**Step 3 of the routine description works end to end.** Each receipt carrying `enqueue` rows is
+followed by a receipt that resolves exactly those rows — which is the behaviour AC 4 was written
+for, and it is no longer vacuous.
+
+#### #1990 landed — the end-to-end proof
+
+#1990 was enqueued by fire 6, classified `still-queued` at its confirmation, and **merged at
+`2026-09-25T02:34:27Z`** (`gh pr view 1990 --json state,mergedAt` → `MERGED`). That is a PR the
+routine armed, tracked, and saw through to master without a hand merge.
+
+The other four rows are still open as of writing — #1804, #2001, #1985, #1976 all `state: OPEN`,
+`mergedAt: null` — so `still-queued` remains the accurate classification for them. **No receipt has
+yet printed a literal `confirmed-merged` row**, because #1990's merge fell outside the one-receipt
+confirmation window that had already resolved it.
+
+#### AC 3 names a field this repo does not use — fifth plan-vs-reality drift
+
+AC 3 expects each `enqueue` row to show `autoMergeRequest` set on GitHub. Measured, it is **null on
+every row above**, and not because a new head dropped auto-merge — the heads had not moved.
+
+The cause is mechanical: `gh api repos/Blockcast/paperclip/rules/branches/master` returns **exactly
+one rule, `merge_queue`**, and no `pull_request` rule. This repo does not land through
+`autoMergeRequest` at all. The observable artifact is an `added_to_merge_queue` timeline event, and
+the rows carry one. **Read AC 3 as "the row is in the merge queue."**
+
+One measured fact deliberately left unexplained: each `added_to_merge_queue` predates its receipt
+(6m27s for #1990, 43m54s for #1804) and is attributed to `kkroo` rather than the App — though the
+App *can* be that actor, so it is not an attribution artifact. Either the script armed nothing and
+reported a queue state already set, or it armed something GitHub attributed elsewhere. One run's
+evidence does not separate those; logged as an open question for C1 (BLO-32240), not resolved here.
+
+#### Coalescing continues to hold, and a `skipped` fire is still not a missing receipt
+
+The fires-1–4 table above generalises. Sampling the eight most recent runs, five were `skipped`
+with a `coalescedIntoRunId`, and each named an execution issue that was still live. The
+2026-09-25T01:45:00Z slot coalesced into the 19:45Z run, whose issue **BLO-36187** was still
+`in_progress` at the time of writing — which is why the newest receipt is `98027253` and not
+something from the last cycle. **Auditing this routine by counting cron slots against receipts will
+report a false defect.**
+
+#### Why this file took an extra cycle to land
+
+PR #1954 — the PR carrying this file — was itself **ejected from the merge queue at
+`2026-09-24T21:48:10Z`**. The merge-group run `36050446289` failed on
+`General tests (workspaces-a)`, whose actual failure is a `waitForServer` timeout in
+`src/__tests__/company-import-export-e2e.test.ts:291` — a server-start flake. #1954 is docs-only
+(+212/−0, one Markdown file), and a merge-group tests the PR combined with master, so this failure
+cannot have come from the PR's content. It is recorded here rather than filed as a defect: one
+flake in a queue that was otherwise draining (5 of the 8 surrounding merge-group runs succeeded) is
+not a finding.
+
+The ejection is also what made this correction possible. It had been written earlier and refused
+with `GH006 — Branches that are queued for merging cannot be updated`; dequeuing to push a
+documentation fix would have surrendered queue position, so it waited for a window it did not have
+to pay for.
+
+**The routine remains `active` on its 6-hour trigger. BLO-34818, not this file, is the running
+ledger.**
 
 ## C3 — governance sweep un-paused (2026-09-07)
 
