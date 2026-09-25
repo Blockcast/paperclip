@@ -732,6 +732,56 @@ describe("I1 names the mechanism a same-lane duplicate implies", () => {
     assert.match(violations.find((v) => v.startsWith("I2e")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
   });
 
+  it("still fires I2e for a later blocker whose findings the approval's ledger happens to name", () => {
+    // Coverage alone would exempt this: the approval retired `important 1`
+    // against the EARLIER blocker, and the later one raises `important 1` too.
+    // An approval cannot have read a blocker submitted after it, so order —
+    // not coverage — is what keeps this fatal.
+    const approval = approvalWithLedger(`- **prior:${HEAD.slice(0, 7)} important 1** — fixed — description corrected`);
+    const laterBlocker = appReview({ id: 5124950999, state: "COMMENTED", submitted_at: "2026-09-23T13:00:00Z", body: canonicalBody(HEAD, "### Critical Issues (0)\n### Important Issues (1)\n- raised after the approval") });
+    const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [blockerAtHead(), approval, laterBlocker] });
+    assert.match(violations.find((v) => v.startsWith("I2e")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
+  });
+
+  // The exemption is coverage, not presence: an approval retiring 1 of the N
+  // findings its blocker raised would otherwise stand green over the other N-1.
+  const multiFindingBlocker = () =>
+    appReview({ id: DUPLICATE_IDS[0], state: "COMMENTED", submitted_at: "2026-09-23T10:00:00Z", body: canonicalBody(HEAD, "### Critical Issues (0)\n### Important Issues (2)\n- one\n- two") });
+
+  it("still fires I2e when the approval retires only some of the findings raised at this head", () => {
+    const approval = approvalWithLedger(`- **prior:${HEAD.slice(0, 7)} important 1** — fixed — one done`);
+    const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [multiFindingBlocker(), approval] });
+    assert.match(violations.find((v) => v.startsWith("I2e")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
+  });
+
+  it("does not fire I2e when the approval retires every finding raised at this head", () => {
+    const approval = approvalWithLedger(
+      `- **prior:${HEAD.slice(0, 7)} important 1** — fixed — one done\n- **prior:${HEAD.slice(0, 7)} important 2** — no-longer-applicable — two moot`,
+    );
+    const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [multiFindingBlocker(), approval] });
+    assert.deepEqual(violations, []);
+  });
+
+  it("still fires I2e when the blocker blocks only on a still-present entry", () => {
+    // No counted bucket at this head, so no (severity, index) a ledger can name.
+    const blocker = appReview({ id: DUPLICATE_IDS[0], state: "COMMENTED", submitted_at: "2026-09-23T10:00:00Z", body: canonicalBody(HEAD, `- **prior:${OTHER.slice(0, 7)} important 1** — still-present — stands`) });
+    const approval = approvalWithLedger(`- **prior:${HEAD.slice(0, 7)} important 1** — fixed — done`);
+    const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [blocker, approval] });
+    assert.match(violations.find((v) => v.startsWith("I2e")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
+  });
+
+  // Shapes the merge gate's PRIOR_FINDING_DISPOSITION_PATTERN accepts. Reading
+  // either as non-retiring here would fail a supersession the gate allows.
+  for (const [shape, ledger] of [
+    ["an en dash separator", `- **prior:${HEAD.slice(0, 7)} important 1** – fixed – description corrected`],
+    ["a space after the opening `**`", `- **  prior:${HEAD.slice(0, 7)} important 1** — fixed — description corrected`],
+  ]) {
+    it(`does not fire I2e when the retiring entry uses ${shape}`, () => {
+      const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [blockerAtHead(), approvalWithLedger(ledger)] });
+      assert.deepEqual(violations, []);
+    });
+  }
+
   it("names the latest by id when two reviews share a submitted_at second", () => {
     const at = (id) => appReview({ id, state: "COMMENTED", submitted_at: "2026-09-06T09:35:17Z", body: canonicalBody(HEAD, `pass ${id}`) });
     for (const reviews of [[at(DUPLICATE_IDS[0]), at(DUPLICATE_IDS[1])], [at(DUPLICATE_IDS[1]), at(DUPLICATE_IDS[0])]]) {

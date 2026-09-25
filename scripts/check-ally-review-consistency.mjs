@@ -117,6 +117,17 @@ const BLOCKING_SECTION_RE =
   /^#+[ \t]*(critical|important)[^\n]*\((?!0\))\d+\)/im;
 
 /**
+ * Every counted bucket heading, with its severity and count. The `(0)` case is
+ * kept here — unlike BLOCKING_SECTION_RE, which asks "does this block?" — so
+ * that enumerating a body's findings sees an explicit empty bucket and simply
+ * contributes no indices for it.
+ *
+ * The count is captured lazily so `### Important Issues (2)` yields 2 rather
+ * than some later parenthesized number on the same line.
+ */
+const COUNTED_SECTION_GLOBAL_RE = /^#+[ \t]*(critical|important)[^\n]*?\((\d+)\)/gim;
+
+/**
  * Leading whitespace that CommonMark would render as an indented code block,
  * i.e. quoted text rather than emitted structure. Four spaces reach column
  * four, and so does a tab however few spaces precede it.
@@ -156,14 +167,28 @@ const STILL_PRESENT_DISPOSITION_RE = new RegExp(
 
 /**
  * A prior-finding disposition that retires the finding, capturing the head it
- * was raised against. The verbs are the retiring set the merge gate uses
- * (RESOLVED_PRIOR_DISPOSITIONS in server/src/services/ally-review-detection.ts);
- * an unrecognized verb does not match, so I2e fails closed on it.
+ * was raised against and the `(severity, index)` pair naming it. The verbs are
+ * the retiring set the merge gate uses (RESOLVED_PRIOR_DISPOSITIONS in
+ * server/src/services/ally-review-detection.ts); an unrecognized verb does not
+ * match, so I2e fails closed on it.
+ *
+ * Severity and index are required rather than skipped over, because I2e checks
+ * ledger *coverage* of the blocker's counted findings, not merely that the head
+ * was named once. An entry too malformed to identify a finding therefore
+ * retires nothing — a false red on an otherwise-valid supersession, which is
+ * the direction an auditor may fail in.
+ *
+ * The separator alternation and the space allowed after `**` track the gate's
+ * PRIOR_FINDING_DISPOSITION_PATTERN. Both shapes are ones the gate accepts, so
+ * omitting them here would let the gate read an entry as retiring while I2e did
+ * not — a fatal red on a supersession the gate is happy with, which is the
+ * failure class this script exists to remove.
  */
 const RETIRING_DISPOSITION_GLOBAL_RE = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE}-[ \t]*\*\*prior:([0-9a-f]{7,40})[^\n]*\*\*[ \t]*(?:—|-)[ \t]*(?:fixed|no-longer-applicable)[ \t]*(?:—|-)`,
+  String.raw`^${NOT_INDENTED_CODE}-[ \t]*\*\*[ \t]*prior:([0-9a-f]{7,40})[ \t]+([a-z]+)[ \t]+(\d+)[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*(?:fixed|no-longer-applicable)[ \t]*(?:—|–|-)`,
   "gim",
 );
+
 
 /** The single standalone attestation line Ally is required to emit. */
 const ATTESTED_HEAD_RE = new RegExp(
@@ -289,12 +314,56 @@ export function hasStillPresentDisposition(body) {
   return STILL_PRESENT_DISPOSITION_RE.test(String(body ?? ""));
 }
 
-/** True when the body retires, by name, a finding raised against `head`. */
-function retiresFindingRaisedAt(body, head) {
+/**
+ * The findings a body declares in its own counted buckets, as `severity index`
+ * keys. A bucket of N contributes indices 1..N, which is the same
+ * `(severity, index)` identity the merge gate enumerates in
+ * extractAllyReportedFindingRefs, so the two agree on what a review raised.
+ */
+function countedFindingKeys(body) {
+  const keys = new Set();
+  for (const [, severity, count] of String(body ?? "").matchAll(COUNTED_SECTION_GLOBAL_RE)) {
+    for (let index = 1; index <= Number(count); index += 1) {
+      keys.add(`${severity.toLowerCase()} ${index}`);
+    }
+  }
+  return keys;
+}
+
+/** The findings a body retires by name against `head`, in the same key space. */
+function retiredFindingKeys(body, head) {
   const normalizedHead = String(head ?? "").toLowerCase();
-  return Array.from(String(body ?? "").matchAll(RETIRING_DISPOSITION_GLOBAL_RE)).some((match) =>
-    normalizedHead.startsWith(match[1].toLowerCase()),
-  );
+  const keys = new Set();
+  for (const [, prefix, severity, index] of String(body ?? "").matchAll(
+    RETIRING_DISPOSITION_GLOBAL_RE,
+  )) {
+    if (normalizedHead.startsWith(prefix.toLowerCase())) {
+      keys.add(`${severity.toLowerCase()} ${Number(index)}`);
+    }
+  }
+  return keys;
+}
+
+/**
+ * True when `approval` retires, by name and against this head, EVERY finding
+ * `blocker` counted.
+ *
+ * Coverage rather than presence: a blocker may raise several findings at one
+ * head, and an approval retiring 1 of N would otherwise stand green over the
+ * N-1 nobody dispositioned — I2e's own harm class, reached through its exemption.
+ *
+ * A blocker with no counted findings is never superseded. That is a blocker
+ * blocking solely on a `still-present` entry, which asserts a finding raised at
+ * an *earlier* head; it has no (severity, index) at this head for a ledger to
+ * name, and it is enumerated on its own account at the head that raised it.
+ * Fail closed.
+ */
+function supersedesBlocker(approval, blocker, head) {
+  const raised = countedFindingKeys(blocker?.body);
+  if (raised.size === 0) return false;
+  const retired = retiredFindingKeys(approval?.body, head);
+  for (const key of raised) if (!retired.has(key)) return false;
+  return true;
 }
 
 export function attestedHead(body) {
@@ -586,23 +655,27 @@ export function findPrViolations(pr) {
   //
   // The other order has no such exit: a COMMENTED blocker cannot be dismissed,
   // so a clean approval that supersedes it at an unchanged head would fail here
-  // forever. That approval is exempt when it retires, by name, a finding raised
-  // against this head and lands after every other blocker. Naming is the test:
-  // only a run that read the blocker can name its finding, and a racing run
-  // never saw it. Merely carrying a ledger is not enough, because both racing
-  // reviews on #876 (ff1c72db) and on #1220 (a9ee094a) carried one, for
-  // findings raised at an earlier head. Order alone is not the test either (a
-  // race can land its approval last); it only keeps a blocker that follows the
-  // approval fatal, since dismissing the approval is the exit there. Residual:
-  // two runs racing after a same-head predecessor can both name it, so this
-  // cannot separate them; that exclusion belongs at dispatch (BLO-20074).
+  // forever. That approval is exempt from a given blocker when it retires, by
+  // name, every finding that blocker counted at this head, and lands after it.
+  // Naming is the test: only a run that read the blocker can name its findings,
+  // and a racing run never saw them. Merely carrying a ledger is not enough,
+  // because both racing reviews on #876 (ff1c72db) and on #1220 (a9ee094a)
+  // carried one, for findings raised at an earlier head. Naming the head once is
+  // not enough either: a blocker may raise several findings at it, and retiring
+  // 1 of N would leave the approval standing over the rest. Order alone is not
+  // the test (a race can land its approval last); it only keeps a blocker that
+  // follows the approval fatal, since dismissing the approval is the exit there.
+  // Residual: two runs racing after a same-head predecessor can both name it, so
+  // this cannot separate them; that exclusion belongs at dispatch (BLO-20074).
   const appApprovals = appReviews.filter(isApproved);
   const otherAppBlockers = appBlockers.filter((review) => !appApprovals.includes(review));
-  const unsupersedingApprovals = appApprovals.filter(
-    (review) =>
-      !retiresFindingRaisedAt(review.body, head) ||
-      otherAppBlockers.some((blocker) => bySubmission(blocker, review) > 0),
+  const unsupersedingApprovals = appApprovals.filter((review) =>
+    otherAppBlockers.some(
+      (blocker) =>
+        bySubmission(blocker, review) > 0 || !supersedesBlocker(review, blocker, head),
+    ),
   );
+
   if (unsupersedingApprovals.length > 0 && otherAppBlockers.length > 0) {
     violations.push(
       `I2e PR #${pr.number} @${short}: Ally App APPROVED (${unsupersedingApprovals.map((review) => review.id).join(", ")}) coexists with a different blocking Ally App review (${otherAppBlockers.map((review) => review.id).join(", ")}) at one head; the standing approval outranks the blocker`,
