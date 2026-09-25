@@ -100,7 +100,16 @@ export function parseClaudeStreamJson(stdout: string) {
   }
 
   const usageObj = parseObject(finalResult.usage);
-  const usage: UsageSummary = {
+  // BLO-29842: this package resolves `@paperclipai/adapter-utils` from the npm
+  // registry (it is outside the pnpm workspace and carries its own lockfile),
+  // so it compiles against the PUBLISHED `UsageSummary` — currently
+  // 2026.428.0, which predates `cacheCreationInputTokens` and would reject the
+  // field below as an excess property. The host reads the emitted value either
+  // way, so this is a type-visibility gap, not a runtime one. Widened locally
+  // rather than left out: omitting the field is what the finding was about.
+  // Drop the intersection once the dependency floor is raised past the release
+  // that ships the field.
+  const usage: UsageSummary & { cacheCreationInputTokens?: number } = {
     inputTokens: asNumber(usageObj.input_tokens, 0),
     cachedInputTokens: asNumber(usageObj.cache_read_input_tokens, 0),
     // BLO-29842: raw Anthropic payloads spell this snake_case. Absent for any

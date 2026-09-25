@@ -1796,6 +1796,7 @@ describe("summarizeAcpxTurnUsage no-report turns", () => {
       inputTokens: 25,
       outputTokens: 75,
       cachedInputTokens: 5,
+      cacheCreationInputTokens: 0,
     });
   });
 
