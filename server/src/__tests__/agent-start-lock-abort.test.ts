@@ -104,6 +104,14 @@ describe("agent start lock cancellation (PEN-3328)", () => {
     const outcome = await settled;
     expect(outcome).toBeInstanceOf(AgentStartLockAbortedError);
     expect((outcome as AgentStartLockAbortedError).agentId).toBe(agentId);
+    // Pins the hand-copied LOCK_ABORT_MS above to the source constant. The
+    // error message embeds the real limit, so if `agent-start-lock.ts` moves
+    // and this file's copy does not, this assertion fails loudly — whereas
+    // every `advanceTimersByTimeAsync(LOCK_ABORT_MS + ...)` in the suite would
+    // just quietly stop reaching the boundary it names and stay green.
+    expect((outcome as AgentStartLockAbortedError).message).toContain(
+      `limit ${LOCK_ABORT_MS / 1000}s`,
+    );
     // Released by the `finally` in `runExclusively` — not by a separate path.
     expect(describeHeldAgentStartLocks()).toEqual([]);
   });

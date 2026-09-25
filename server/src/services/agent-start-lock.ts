@@ -104,9 +104,18 @@ const LOCK_HELD_WARN_MS = 30_000;
  * Escalate the overrun log from `warn` to `error` past this.
  *
  * This is an *attention* threshold, not a control action: it says "an operator
- * should look", and being early costs nothing more than a log line. The
- * `PaperclipAgentStartLockWedged` alert is pinned to this same number, where
- * its `for: 5m` — not the threshold — is what keeps it quiet.
+ * should look", and being early costs nothing more than a log line. Nothing
+ * pages on it.
+ *
+ * ⚠️ `PaperclipAgentStartLockWedged` was pinned to this number until PEN-3328
+ * and deliberately is not any more — it tracks {@link LOCK_ABORT_MS}. Holds
+ * past 300 s are the normal case, not the pathological one (see the
+ * measurement on {@link LOCK_ABORT_MS}), and a `for: 5m` does not fix that:
+ * a for-window is a continuity requirement, not a magnitude one, so it only
+ * moves the fire point to 600 s. Against a settling tail reaching 8073 s it
+ * damps scrape flap and nothing else. Do not re-pin the page here to "keep
+ * one number of record": reporting and acting are different jobs, and this
+ * constant only ever does the first.
  */
 const LOCK_HELD_ERROR_MS = 5 * 60_000;
 
@@ -380,9 +389,21 @@ async function runExclusively<T>(agentId: string, fn: () => Promise<T>): Promise
       // cover" in `agent-start-lock-db.ts` for why that is reported rather than
       // rescued.
       loggedStopped = true;
+      // Split the sentence on `abortRequested`, not on `stopped`. Before the
+      // abort this line is usually describing a section that is merely slow
+      // and is going to settle — 21 of 23 agents exceeded this threshold over
+      // four days and every one finished on its own — so claiming dispatch
+      // "has stopped" here would be false in the common case. It would also be
+      // the *second* artifact saying so: `PaperclipAgentStartLockAborted`'s
+      // description names this exact string as its correlation target, and a
+      // log and a page that agree are what survives a responder's sanity
+      // check. The `aborted` field carries the truth either way, but that is
+      // the part a human skims past.
       logger.error(
         { ...fields(heldMs), errorAfterMs: LOCK_HELD_ERROR_MS, abortAfterMs: LOCK_ABORT_MS, aborted: abortRequested },
-        "agent start lock held far past its budget; queued-run dispatch for this agent has stopped",
+        abortRequested
+          ? "agent start lock held past its abort budget and the abort has not landed; queued-run dispatch for this agent has stopped"
+          : "agent start lock held far past its warn budget; queued-run dispatch for this agent is still running but overdue",
       );
     } else {
       logger.warn(fields(heldMs), "agent start lock held longer than expected; queued-run dispatch is falling behind");

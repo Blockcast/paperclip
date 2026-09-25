@@ -368,9 +368,11 @@ export const EXTERNAL_RUNTIME_RESERVATION_STRAND_METRICS_REFRESH_SUCCESS_METRIC 
  *
  * Emitted only for agents whose lock is held right now, matching the
  * convention of the per-agent backlog gauges: an absent series means no lock
- * is held, not a zero-length hold. A healthy section is sub-second, so this is
- * near-empty in normal operation and anything above a few seconds is real —
- * `max by (agent_id) (...)` over it is the whole detector.
+ * is held, not a zero-length hold. Holds of minutes to a couple of hours are
+ * routine and release on their own, so this is NOT near-empty in normal
+ * operation and "anything above a few seconds" is not the detector — the
+ * detector is `max by (agent_id) (...)` past the 4h abort boundary, which is
+ * where `PaperclipAgentStartLockWedged` sits.
  */
 export const AGENT_START_LOCK_HELD_SECONDS_METRIC = "paperclip_agent_start_lock_held_seconds";
 /**
@@ -389,9 +391,11 @@ export const AGENT_START_LOCK_HELD_SECONDS_METRIC = "paperclip_agent_start_lock_
  * stays high past the budget instead of vanishing. Splitting the counter would
  * make every recovered abort also increment the alerting series.
  *
- * Any non-zero rate is a defect worth chasing: a healthy section is sub-second
- * and the budget is five minutes, so this only increments when something inside
- * dispatch stopped responding.
+ * Any non-zero rate is a defect worth chasing. Not because a healthy section is
+ * fast — holds of minutes to a couple of hours are routine and settle on their
+ * own (worst measured: 8073s) — but because the abort budget is four hours,
+ * set deliberately to clear that settling tail. Reaching it means something
+ * inside dispatch stopped responding rather than merely ran slow.
  */
 export const AGENT_START_LOCK_ABORTED_METRIC = "paperclip_agent_start_lock_aborted_total";
 /**
@@ -2506,22 +2510,25 @@ function ensureRegistry(): {
       name: AGENT_START_LOCK_HELD_SECONDS_METRIC,
       help:
         "Seconds the per-agent queued-run dispatch start lock has currently been held (PEN-3305). "
-        + "withAgentStartLock has no timeout by design, so a section that never settles holds its "
-        + "agent's lock forever and that agent silently stops dispatching -- while still reading "
+        + "A section that never settles holds its agent's lock until the PEN-3328 abort fires at 4h "
+        + "and that agent silently stops dispatching in the meantime -- while still reading "
         + "status=idle, errorReason=null, orgChainHealth=healthy. Series exist only while a lock is "
-        + "held, so absence means no hold, not a zero-length one. A healthy section is sub-second; "
-        + "sustained tens of seconds is a wedge. Per-pod, because the lock is per-process.",
+        + "held, so absence means no hold, not a zero-length one. Holds of minutes to a couple of "
+        + "hours are routine and settle on their own (worst measured 8073s), so this is NOT "
+        + "near-empty in normal operation and tens of seconds is not a wedge; past the 4h abort "
+        + "boundary is. Per-pod, because the lock is per-process.",
       labelNames: ["agent_id"],
       registers: [registry],
     });
     agentStartLockAbortedTotal = new Counter({
       name: AGENT_START_LOCK_ABORTED_METRIC,
       help:
-        "Queued-run dispatch sections cancelled for holding the per-agent start lock past its 5m "
-        + "budget (PEN-3328). Counterpart to " + AGENT_START_LOCK_HELD_SECONDS_METRIC + ", which "
+        "Queued-run dispatch sections cancelled for holding the per-agent start lock past its 4h "
+        + "abort budget (PEN-3328). Counterpart to " + AGENT_START_LOCK_HELD_SECONDS_METRIC + ", which "
         + "cannot answer this: a cancelled section releases its lock, so its gauge series "
-        + "disappears and the event leaves no durable trace. A healthy section is sub-second, so "
-        + "any non-zero rate means something inside dispatch stopped responding. This counts the "
+        + "disappears and the event leaves no durable trace. The budget clears the observed "
+        + "settling tail (worst hold that released on its own: 8073s), so any non-zero rate means "
+        + "something inside dispatch stopped responding rather than merely ran slow. This counts the "
         + "abort, not its outcome: if the cancellation did NOT land, the agent is still wedged and "
         + "the gauge above keeps reporting it -- that condition is the gauge's job, not a label "
         + "here. Per-pod, because the lock is per-process.",

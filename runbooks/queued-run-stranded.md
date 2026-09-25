@@ -459,12 +459,22 @@ kubectl logs -n paperclip paperclip-0 | grep "agent start lock held"
 ```
 
 `agent start lock held longer than expected` (warn, every 30s) is a section
-that is slow. `agent start lock held far past its budget; queued-run dispatch
-for this agent has stopped` (error, first at 5m then every 5m) is the one this
-alert fires on. The 5-minute alert threshold is
-`prometheusRule.agentStartLockHeldSeconds`, pinned to `LOCK_HELD_ERROR_MS` in
-`agent-start-lock.ts` so the log line and the page cannot disagree about when
-an agent counts as wedged.
+that is slow. `agent start lock held far past its warn budget; queued-run
+dispatch for this agent is still running but overdue` (error, first at 5m then
+every 5m) means the section has passed the point where an operator should look
+— **it is not what this alert fires on, and it is usually a section that will
+settle by itself.** The line this alert fires on is `agent start lock held past
+its abort budget and the abort has not landed` (error, from 4h), whose `aborted`
+field reads `true`.
+
+The alert threshold is `prometheusRule.agentStartLockHeldSeconds`, pinned to
+`LOCK_ABORT_MS` (4h) in `agent-start-lock.ts` — **not** to the 5-minute
+`LOCK_HELD_ERROR_MS` log budget. The two were the same number until PEN-3328
+and deliberately are not any more: over the 14 days to 2026-09-25, 21 agents
+held past 300s (peak 8073s / 2h14m) and this alert reached `firing` for 20 of
+them, every one of which resolved with no pod recreation and no container
+restart. Escalating a log line early costs a log line; paging early routes a
+responder to Step 4 pod replacement for a section that was going to finish.
 
 #### Step 2 — do NOT clear the agent as healthy
 
@@ -506,31 +516,40 @@ count with nothing queued — a stuck transaction — alongside zero dispatches.
 #### Step 4 — recovery
 
 **Since PEN-3328 the usual case self-heals, and you should confirm that before
-reaching for a restart.** The dispatch critical section is cancellable: at the
-same 300s boundary that escalates the log to `error`, the section's abort
-signal fires, its in-flight database work is cancelled for real, `fn` rejects,
-and the lock is released through the `finally` that was already there. The
-agent resumes dispatching and its queued runs are not lost. When that happens
-you will see `PaperclipAgentStartLockAborted` rather than this alert — see the
-section below, and prefer chasing *why* a section blocked for five minutes over
-treating the recovery as the end of it.
+reaching for a restart.** The dispatch critical section is cancellable: at
+`LOCK_ABORT_MS` (4h) the section's abort signal fires, its in-flight database
+work is cancelled for real, `fn` rejects, and the lock is released through the
+`finally` that was already there. The agent resumes dispatching and its queued
+runs are not lost. When that happens you will see
+`PaperclipAgentStartLockAborted` rather than this alert — see the section
+below, and prefer chasing *why* a section blocked for four hours over treating
+the recovery as the end of it.
 
-`PaperclipAgentStartLockWedged` firing therefore now means something narrower
-and more serious than it did before PEN-3328: the abort was requested and did
-**not** land. Cancellation can only reach awaits that observe the signal —
-today, database work — so a section wedged on anything else (an unbounded
-socket, an in-process promise that never settles) still holds its lock. The
-agent row's `dispatchHealth` distinguishes the two directly, reading `stalled`
-for a requested-but-unlanded abort versus `aborted` for one that landed; read
-it **on the worker pod**, since the api tier never holds a lock and so always
-reports `null` there.
+Because this alert's threshold **is** that abort boundary, it firing means
+something narrower and more serious than it did before PEN-3328: the abort was
+requested and did **not** land. Cancellation can only reach awaits that observe
+the signal — today, database work — so a section wedged on anything else (an
+unbounded socket, an in-process promise that never settles) still holds its
+lock. The agent row's `dispatchHealth` distinguishes the two directly, reading
+`stalled` for a requested-but-unlanded abort versus `aborted` for one that
+landed; read it **on the worker pod**, since the api tier never holds a lock
+and so always reports `null` there.
 
-For that residue there is still no in-process remedy: the lock has no timeout,
-so the section must settle or the process must be replaced. Deleting the worker
-pod clears it (`kubectl delete pod -n paperclip paperclip-0`) and the queued
-runs then dispatch normally. Capture the pool gauges and the `agent start lock
-held` lines **before** restarting; the restart destroys the only evidence of
-which section was stuck.
+⚠️ **A hold shorter than 4h is not this alert and is not grounds for a
+restart.** Holds of minutes to hours are the normal case, not the pathological
+one: over the 14 days to 2026-09-25, 21 agents held past 300s with a peak of
+8073s (2h14m), and every one released on its own with no pod recreation and no
+container restart. Before PEN-3328 this page sat at 300s and fired on 20 of
+them. If you are reading a `held far past its warn budget` log line with
+`aborted: false`, the abort has not been requested yet — the section is
+overdue, not wedged, and the remedy below is the wrong one.
+
+For the genuine residue there is still no in-process remedy: the abort has
+already been tried and did not take, so the section must settle or the process
+must be replaced. Deleting the worker pod clears it (`kubectl delete pod -n
+paperclip paperclip-0`) and the queued runs then dispatch normally. Capture the
+pool gauges and the `agent start lock held` lines **before** restarting; the
+restart destroys the only evidence of which section was stuck.
 
 Abandoning a still-pending `fn` on a timer is **not** an acceptable extension of
 this: it reintroduces the BLO-20396 defect of two sections running at once.
@@ -572,33 +591,36 @@ must be synced (BLO-19095). Verify at `/api/v1/rules` before relying on it.
 
 ### What it means
 
-A queued-run dispatch section held its agent's start lock past 300s, was
-cancelled, and the lock was released. **Dispatch has already resumed and no
-queued runs were lost.** Nobody needs waking; this is a post-mortem.
+A queued-run dispatch section held its agent's start lock past `LOCK_ABORT_MS`
+(4h), was cancelled, and the lock was released. **Dispatch has already resumed
+and no queued runs were lost.** Nobody needs waking; this is a post-mortem.
 
 ### Why it is a separate alert, and not redundant with the wedge alert
 
 The two fire on opposite outcomes of the same fault, and the wedge alert
 structurally cannot cover this one. `paperclip_agent_start_lock_held_seconds`
-is emitted **only for locks held at scrape time** (`reset()` then set), and
-`PaperclipAgentStartLockWedged` waits 5m (`for:`) on top of its 300s threshold.
-The abort lands *at* 300s and deletes the series. So a successful cancellation
-is invisible to the wedge alert — the incident disappears precisely because it
-was handled. `paperclip_agent_start_lock_aborted_total` is a counter, so it
-survives the release and keeps the event answerable afterwards.
+is emitted **only for locks held at scrape time** (`reset()` then set). Both
+rules sit on the same 4h boundary, and the wedge alert's `for: 5m` is what
+separates them: a landed abort deletes the series within a scrape, so that
+window never completes and only an *unlanded* abort pages. A successful
+cancellation is therefore invisible to the wedge alert — the incident
+disappears precisely because it was handled.
+`paperclip_agent_start_lock_aborted_total` is a counter, so it survives the
+release and keeps the event answerable afterwards.
 
 ### What to do
 
 **Do not close this on the strength of the recovery.** The cancellation bounded
-the damage; it did not fix whatever blocked the section. A healthy pass is
-sub-second, so a section that sat for 300s is ~300× that and something real was
-holding it.
+the damage; it did not fix whatever blocked the section. Holds of minutes to a
+couple of hours do settle on their own — the worst measured was 8073s (2h14m)
+— so a section that reached 4h outran that tail by ~1.8× and is not the
+slow-but-healthy case.
 
 1. Read `dispatchHealth` on the agent row **on the worker pod** — `aborted`
    carries the post-mortem (`heldMs`, `abortedAt`). Via the API it will read
    `null`: the api tier never holds a lock, so it cannot answer.
-2. Correlate with the `agent start lock held far past its budget` error log for
-   the same `agentId`.
+2. Correlate with the `agent start lock held past its abort budget` error log
+   for the same `agentId`.
 3. Apply Step 3 of the wedged section above — the pool-versus-lock split and
    its trap — since the candidate causes are identical.
 

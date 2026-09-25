@@ -1172,7 +1172,7 @@ test("PaperclipExternalRuntimeReservationStrandMetricsRefreshFailed exposes a st
   );
 });
 
-test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own error boundary (PEN-3305)", () => {
+test("PaperclipAgentStartLockWedged pages on the abort boundary, so firing means the abort did not land (PEN-3305/PEN-3328)", () => {
   const rendered = renderChart([
     "--show-only",
     "templates/prometheusrule.yaml",
@@ -1214,15 +1214,25 @@ test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own
   const [, heldThreshold] = expr.match(/> (\d+)$/) ?? [];
   // The gauge is emitted only for locks held at scrape time (reset-then-set,
   // no zero-fill), so any positive threshold is silent in steady state. It is
-  // pinned to 300 on purpose: that is LOCK_HELD_ERROR_MS in
-  // server/src/services/agent-start-lock.ts, the point at which the code
-  // itself escalates to logger.error and says dispatch "has stopped". If the
-  // constant moves and this does not, the page and the log line disagree
-  // about when an agent is considered wedged.
+  // pinned to LOCK_ABORT_MS (14400s / 4h) in
+  // server/src/services/agent-start-lock.ts, NOT to LOCK_HELD_ERROR_MS (300s),
+  // and that distinction is the whole meaning of the page: the abort fires at
+  // this boundary and releases the lock, so a series still present afterwards
+  // means the abort was requested and did NOT land. If the constant moves and
+  // this does not, the page stops describing that state.
+  //
+  // ⚠️ PEN-3328: this was "300", tracking LOCK_HELD_ERROR_MS. Do not revert it
+  // on the reasoning that the page and the escalated log should share one
+  // number of record. Over the 14 days to 2026-09-25, 21 agents held past 300s
+  // (peak 8073s) and this alert reached `firing` for 20 of them -- twenty
+  // critical pages, all of which resolved on their own, routed by the runbook
+  // to pod replacement. A log line is an attention threshold where being early
+  // is free; this is a page that routes to a destructive remedy. They answer
+  // different questions and no longer share a number.
   assert.equal(
     heldThreshold,
-    "300",
-    "hold threshold must track LOCK_HELD_ERROR_MS (300s) in agent-start-lock.ts",
+    "14400",
+    "hold threshold must track LOCK_ABORT_MS (14400s) in agent-start-lock.ts, not the LOCK_HELD_ERROR_MS log budget",
   );
 
   const [, forWindow] = block.match(/\n\s+for: (.+)\n/) ?? [];
@@ -1234,22 +1244,32 @@ test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own
       : null;
   // Scrape-flap tolerance only; the ageing lives in the threshold. Same
   // stacking trap as PaperclipQueuedRunStranded -- threshold and `for:` are
-  // not independent, so check the sum, not each half.
+  // not independent. The sum is what decides whether this page means "the
+  // abort did not land", and it is anchored to the threshold rather than to a
+  // wall-clock budget, because the threshold IS the abort boundary.
   assert.ok(
     forMinutes !== null && forMinutes > 0 && forMinutes <= 10,
     `for window ${forWindow} must be a short scrape-flap tolerance (<= 10m)`,
   );
   assert.ok(
-    Number(heldThreshold) + forMinutes * 60 <= 900,
-    `hold threshold ${heldThreshold}s plus for-window ${forWindow} stacks to `
-      + `${Number(heldThreshold) + forMinutes * 60}s; a wedge must page inside 15m, `
-      + "not on the 6-19h timescale the incident actually ran",
+    Number(heldThreshold) > 8073,
+    `hold threshold ${heldThreshold}s does not clear the observed settling tail (8073s, PEN-3328). `
+      + "A critical page below that fires on holds that resolve themselves and routes the responder "
+      + "to pod replacement; `for:` cannot rescue it, because a for-window is a continuity requirement "
+      + "and not a magnitude one.",
   );
 
-  // Severity, not decoration: the hold never self-heals (the lock has no
-  // timeout, by design), so this is a per-agent dispatch outage that lasts
-  // until the process is replaced. A warning would reproduce the original
-  // failure, which was nobody being paged.
+  // Severity, not decoration: past the abort boundary the section's own
+  // cancellation has already been requested and failed to release the lock,
+  // so what remains is a per-agent dispatch outage lasting until the process
+  // is replaced. A warning would reproduce the original failure, which was
+  // nobody being paged.
+  //
+  // ⚠️ That is only true BECAUSE the threshold is the abort boundary. Below
+  // it the hold usually settles by itself -- PEN-3328 measured 21 agents past
+  // 300s over 14 days, peak 8073s, all self-resolved -- and a critical page
+  // there produced twenty false pages routed to pod replacement. Severity and
+  // threshold move together or not at all.
   assert.match(
     block,
     /\n\s+severity: critical\n/,
@@ -1277,11 +1297,12 @@ test("PaperclipAgentStartLockAborted reports the self-healed wedge the held gaug
   assert.ok(expr, "aborted-start-lock alert must render an expr");
 
   // A counter over a window, NOT the held gauge. This is the whole reason the
-  // rule exists: PEN-3328 cancels a wedged section at the same 300s boundary
-  // PaperclipAgentStartLockWedged waits 5m (`for:`) to fire on, and the held
-  // gauge is emitted only for locks held at scrape time -- so a successful
-  // cancellation deletes the series before the wedge alert ever fires. Without
-  // a durable counter the incident is invisible exactly because it was handled.
+  // rule exists: PEN-3328 cancels a wedged section at the 4h abort boundary,
+  // which is the same boundary PaperclipAgentStartLockWedged thresholds on,
+  // and the held gauge is emitted only for locks held at scrape time -- so a
+  // successful cancellation deletes the series inside the wedge alert's `for:`
+  // window and it never fires. Without a durable counter the incident is
+  // invisible exactly because it was handled.
   // If a later reader "simplifies" this onto the gauge, that blind spot returns.
   assert.match(
     expr,
@@ -1292,7 +1313,7 @@ test("PaperclipAgentStartLockAborted reports the self-healed wedge the held gaug
   // Warning, not critical, and this is the deliberate split from the wedge
   // alert beside it. By the time this fires the lock has been released and the
   // agent is dispatching again, so waking someone is wrong -- but the thing
-  // that blocked the section for five minutes has NOT been fixed, so staying
+  // that blocked the section for four hours has NOT been fixed, so staying
   // silent is also wrong.
   assert.match(
     rendered,

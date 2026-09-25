@@ -259,6 +259,13 @@ describe("agent start lock database cancellation seam (PEN-3328)", () => {
     await expect(held).rejects.toThrow("section done");
 
     expect(secondAttempt).toBeInstanceOf(AgentStartLockAbortedError);
+    // Pins this file's hand-copied LOCK_ABORT_MS to the source constant: the
+    // error message embeds the real limit. Without it, a drift between the two
+    // would make every `advanceTimersByTimeAsync(LOCK_ABORT_MS + 1_000)` above
+    // stop reaching the boundary it names while the suite stayed green.
+    expect((secondAttempt as AgentStartLockAbortedError).message).toContain(
+      `limit ${LOCK_ABORT_MS / 1000}s`,
+    );
     // Exactly one statement was ever issued — the refused one never reached the
     // client.
     expect(client.issued).toHaveLength(1);
