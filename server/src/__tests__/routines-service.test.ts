@@ -1848,14 +1848,16 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(getRoutineDispatchMetric("routine_dispatch_bypassed_stale_fire_execution_issue")).toBe(0);
   });
 
-  // Aging a fire out of the GATE is only half the fix. `issues_open_routine_execution_uq`
-  // covers every open routine-execution row with a non-null execution_run_id, so
-  // a merely-bypassed row still fails the successor's INSERT with a 23505 --
-  // which the dispatch catch rethrows once the row no longer reads as live. The
-  // predecessor must be disposed of, not ignored. `cancelled` is correct for a
-  // superseded point-in-time probe: terminal (so the index frees), honest (no
-  // measurement was taken), and it does not create the BLO-27553 zero-wake-path
-  // strand that `blocked` does.
+  // Aging a fire out of the GATE is only half the fix. A merely-bypassed row is
+  // not disposed of, so the fire creates a SECOND open routine-execution row
+  // beside it -- silently, because `issueSvc.create` leaves `execution_run_id`
+  // null and `issues_open_routine_execution_uq` is partial on that column being
+  // non-null, so the INSERT is outside the index and cannot conflict. The 23505
+  // lands later, on the successor's checkout, where `executionRunId` is first
+  // bound. The predecessor must be disposed of, not ignored. `cancelled` is
+  // correct for a superseded point-in-time probe: terminal (so the index frees),
+  // honest (no measurement was taken), and it does not create the BLO-27553
+  // zero-wake-path strand that `blocked` does.
   it("cancels the superseded fire rather than erroring or stranding it, when the row holds an execution run", async () => {
     const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
 
@@ -2149,8 +2151,10 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     resetRoutineDispatchMetrics();
     await svc.tickScheduledTriggers(new Date());
 
-    // Under the divergent clocks this row survived, the INSERT hit 23505, and
-    // dispatch threw instead of producing a fire.
+    // Under the divergent clocks this row survived, and dispatch created a
+    // silent duplicate open execution row beside it rather than a fire the
+    // predecessor blocked -- the INSERT carries no execution run, so it is
+    // outside the unique index and does not conflict.
     const [predecessor] = await db.select().from(issues).where(eq(issues.id, wedged.issue.id));
     expect(predecessor.status).toBe("cancelled");
     expect(getRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue")).toBe(1);
@@ -2160,6 +2164,55 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     // The failure mode is an errored run, so assert no run recorded a failure
     // rather than only asserting the happy row exists.
     expect(runs.filter((run) => run.status === "failed")).toHaveLength(0);
+  });
+
+  // Ally review, BLO-31996: the third supersede protection, and the one that is
+  // NOT stored outside `issues`. `SUPERSEDE_PROTECTED_STATUSES` refuses to
+  // cancel an `in_review` row because it is waiting on a reviewer, an approval
+  // or a pending interaction -- none of which are heartbeat runs, so both of
+  // the gate's join arms miss it. Before the gate carried a matching status arm
+  // this row was bypassed and refused at once: the fire proceeded and left a
+  // second open execution row beside a predecessor nothing would ever cancel.
+  // Unlike the two cases below it needs no row in another table, which is
+  // precisely why it was the arm left out of the shared set.
+  it("does not supersede a stale predecessor parked in_review, and gates the fire on it", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "coalesce_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const reviewParked = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "queued",
+      runStartedAt: new Date(Date.now() - YOUNG_RETRY_AGE_MS),
+      issueCreatedAt: new Date(Date.now() - STALE_FIRE_AGE_MS),
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+      bindExecutionRun: true,
+    });
+
+    // No blocker edge and no recovery action: the status is the ONLY protection
+    // in play, so the other two arms cannot carry this test.
+    await db
+      .update(issues)
+      .set({ status: "in_review" })
+      .where(eq(issues.id, reviewParked.issue.id));
+
+    resetRoutineDispatchMetrics();
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    // The row the supersede refused to cancel must read as live to the gate, so
+    // the fire coalesces onto it instead of creating a duplicate open row.
+    expect(run.status).toBe("coalesced");
+    expect(run.linkedIssueId).toBe(reviewParked.issue.id);
+    const [predecessor] = await db.select().from(issues).where(eq(issues.id, reviewParked.issue.id));
+    expect(predecessor.status).toBe("in_review");
+    expect(predecessor.cancelledAt).toBeNull();
+    expect(getRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue")).toBe(0);
   });
 
   // Ally review, BLO-31996: the supersede predicate must not reach a row that
@@ -2206,8 +2259,8 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     resetRoutineDispatchMetrics();
     const run = await svc.runRoutine(routine.id, { source: "schedule" });
 
-    // The row the supersede refused to cancel must read as live to the gate,
-    // so the fire coalesces onto it rather than hitting 23505 and failing.
+    // The row the supersede refused to cancel must read as live to the gate, so
+    // the fire coalesces onto it instead of creating a duplicate open row.
     expect(run.status).toBe("coalesced");
     expect(run.linkedIssueId).toBe(dependencyParked.issue.id);
     const [predecessor] = await db.select().from(issues).where(eq(issues.id, dependencyParked.issue.id));
@@ -2256,8 +2309,8 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     resetRoutineDispatchMetrics();
     const run = await svc.runRoutine(routine.id, { source: "schedule" });
 
-    // The row the supersede refused to cancel must read as live to the gate,
-    // so the fire coalesces onto it rather than hitting 23505 and failing.
+    // The row the supersede refused to cancel must read as live to the gate, so
+    // the fire coalesces onto it instead of creating a duplicate open row.
     expect(run.status).toBe("coalesced");
     expect(run.linkedIssueId).toBe(dependencyParked.issue.id);
     const [predecessor] = await db.select().from(issues).where(eq(issues.id, dependencyParked.issue.id));
@@ -2361,8 +2414,13 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     }
 
     expect(raced).toBe(true);
-    // The gate's snapshot predates the recovery action, so this is the 23505
-    // catch's re-run of the gate that has to find the protected row.
+    // The first gate's snapshot predates the recovery action, so what has to
+    // find the protected row is the SECOND gate, which `dispatchRoutineRun`
+    // runs after the supersede's row lock on a fresh statement snapshot. Not
+    // the 23505 catch: that cannot fire on this path at all, because
+    // `issueSvc.create` leaves `execution_run_id` null and the unique index is
+    // partial on it being non-null. Without the second gate this run would
+    // create a duplicate open execution row and report success.
     expect(run.status).toBe("coalesced");
     expect(run.linkedIssueId).toBe(stranded.issue.id);
     const [predecessor] = await db.select().from(issues).where(eq(issues.id, stranded.issue.id));
