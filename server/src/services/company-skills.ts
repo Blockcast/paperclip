@@ -4896,38 +4896,82 @@ export function companySkillService(db: Db) {
     return skillDir;
   }
 
+  /**
+   * Stage a directory's replacement beside `targetDir` and publish it by rename.
+   *
+   * BLO-32167. Every publisher in this file must leave `targetDir` observable in
+   * exactly two states — absent, or a complete tree — because readers sample it
+   * concurrently and none of them can tell "still being written" from "this is
+   * all there is": `resolveExistingSkillDirectory` (the available-skills
+   * catalogue), `hashPathContents` in the claude-k8s adapter (the prompt-bundle
+   * cache key), and the per-run copy that snapshots the tree into a pod. A
+   * *present but incomplete* tree raises no syscall error in any of them, so it
+   * fails silently; a *missing* one is the branch they all already classify as
+   * retryable `skill_materialization_pending` (BLO-32055 / #1669).
+   *
+   * That is why a tree only ever leaves `targetDir` by a single `rename(2)` to a
+   * dot-prefixed sibling, and is deleted there. The obvious alternative — `rm`
+   * in place — reintroduces the defect from the other end: `rm` is itself a
+   * walk, so a reader landing mid-`rm` sees a shrinking directory and hashes it
+   * happily. The rule holds for the outgoing tree, for a concurrent publisher's
+   * tree found in the slot on collision, and for `removeTarget()`. The residual
+   * exposure is the one syscall between the two renames, in which `targetDir`
+   * does not exist: an unbounded window that failed silently, traded for a
+   * one-syscall window that fails loudly and self-heals.
+   */
   async function createDirectoryReplacement(targetDir: string) {
     const parentDir = path.dirname(targetDir);
     const baseName = path.basename(targetDir);
     await fs.mkdir(parentDir, { recursive: true });
     const stagingDir = path.join(parentDir, `.${baseName}.tmp-${randomUUID()}`);
-    const previousDir = path.join(parentDir, `.${baseName}.old-${randomUUID()}`);
     await fs.rm(stagingDir, { recursive: true, force: true });
     await fs.mkdir(stagingDir, { recursive: true });
+
+    // Moves whatever is published at `targetDir` aside in one syscall. Returns
+    // the retired path, or null when there was nothing to retire.
+    async function retireTarget(): Promise<string | null> {
+      const retiredDir = path.join(parentDir, `.${baseName}.old-${randomUUID()}`);
+      try {
+        await fs.rename(targetDir, retiredDir);
+        return retiredDir;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        return null;
+      }
+    }
 
     return {
       stagingDir,
       async commit() {
-        let hasPrevious = false;
+        const retired: string[] = [];
         try {
-          await fs.rename(targetDir, previousDir);
-          hasPrevious = true;
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        }
-
-        try {
-          await fs.rename(stagingDir, targetDir);
-        } catch (error) {
-          if (hasPrevious) {
-            await fs.rename(previousDir, targetDir).catch(() => undefined);
+          for (let attempt = 0; ; attempt += 1) {
+            const previousDir = await retireTarget();
+            if (previousDir) retired.push(previousDir);
+            try {
+              await fs.rename(stagingDir, targetDir);
+              return;
+            } catch (error) {
+              const code = (error as NodeJS.ErrnoException).code;
+              // A concurrent publisher landed between our two renames. Its tree
+              // is complete by construction and ours is at least as fresh, so
+              // retire it the same way and take the slot — once; a second
+              // collision is surfaced rather than fought over.
+              if (attempt === 0 && (code === "ENOTEMPTY" || code === "EEXIST")) continue;
+              if (previousDir) await fs.rename(previousDir, targetDir).catch(() => undefined);
+              throw error;
+            }
           }
-          throw error;
+        } finally {
+          // Whatever was retired is deleted under its dot-prefixed name; a tree
+          // that was renamed back into the slot is no longer at this path.
+          for (const dir of retired) await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
         }
-
-        if (hasPrevious) {
-          await fs.rm(previousDir, { recursive: true, force: true });
-        }
+      },
+      // Stops serving `targetDir` without ever exposing a partial tree.
+      async removeTarget() {
+        const retiredDir = await retireTarget();
+        if (retiredDir) await fs.rm(retiredDir, { recursive: true, force: true });
       },
       async cleanup() {
         await fs.rm(stagingDir, { recursive: true, force: true });
@@ -5244,27 +5288,45 @@ export function companySkillService(db: Db) {
   async function materializeRuntimeSkillFiles(companyId: string, skill: CompanySkill) {
     const runtimeRoot = path.resolve(resolveManagedSkillsRoot(companyId), "__runtime__");
     const skillDir = path.resolve(runtimeRoot, buildSkillRuntimeName(skill.key, skill.slug));
-    await fs.rm(skillDir, { recursive: true, force: true });
-    await fs.mkdir(skillDir, { recursive: true });
+    // BLO-32167: staged beside the destination and published by rename (see
+    // `createDirectoryReplacement`), so a concurrent reader sees the previous
+    // complete tree, ENOENT, or the new complete tree — never a directory
+    // without `SKILL.md`. The staging and retired siblings are dot-prefixed and
+    // a runtime name never starts with a dot, so nothing enumerating
+    // `__runtime__` can mistake them for a skill. The window this closes was
+    // not small: the loop below performs a database read per inventory entry,
+    // so writing in place exposed a partial tree for N round-trips.
+    const replacement = await createDirectoryReplacement(skillDir);
+    try {
+      let wroteSkillFile = false;
+      for (const entry of skill.fileInventory) {
+        const normalizedPath = normalizePortablePath(entry.path);
+        const detail = await readFile(companyId, skill.id, normalizedPath).catch(() => null);
+        const content = detail?.content ?? (normalizedPath === "SKILL.md" ? skill.markdown : null);
+        if (content === null) continue;
+        const targetPath = path.resolve(replacement.stagingDir, entry.path);
+        await fs.mkdir(path.dirname(targetPath), { recursive: true });
+        await fs.writeFile(targetPath, content, "utf8");
+        if (normalizedPath === "SKILL.md") wroteSkillFile = true;
+      }
 
-    let wroteSkillFile = false;
-    for (const entry of skill.fileInventory) {
-      const normalizedPath = normalizePortablePath(entry.path);
-      const detail = await readFile(companyId, skill.id, normalizedPath).catch(() => null);
-      const content = detail?.content ?? (normalizedPath === "SKILL.md" ? skill.markdown : null);
-      if (content === null) continue;
-      const targetPath = path.resolve(skillDir, entry.path);
-      await fs.mkdir(path.dirname(targetPath), { recursive: true });
-      await fs.writeFile(targetPath, content, "utf8");
-      if (normalizedPath === "SKILL.md") wroteSkillFile = true;
+      if (!wroteSkillFile) {
+        // A skill whose stored SKILL.md has gone must stop being served —
+        // `resolveRuntimeSkillSource` would otherwise keep resolving the stale
+        // directory through `resolveExistingSkillDirectory`. Retired by rename,
+        // not `rm` in place: this tree was complete and live a moment ago, and
+        // unlinking it file by file would expose exactly the state this
+        // function exists to prevent.
+        await replacement.removeTarget();
+        throw unprocessable("Company skill could not be materialized because its stored SKILL.md copy is missing.");
+      }
+
+      await replacement.commit();
+      return skillDir;
+    } finally {
+      // No-op after a successful commit — the staging tree was renamed away.
+      await replacement.cleanup().catch(() => undefined);
     }
-
-    if (!wroteSkillFile) {
-      await fs.rm(skillDir, { recursive: true, force: true });
-      throw unprocessable("Company skill could not be materialized because its stored SKILL.md copy is missing.");
-    }
-
-    return skillDir;
   }
 
   function resolveVersionSnapshotPath(skillDir: string, relativePath: string) {
