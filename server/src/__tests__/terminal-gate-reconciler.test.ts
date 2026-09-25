@@ -259,8 +259,12 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
     storedGateSignals?: unknown;
     status?: string;
     monitorNextCheckAt?: Date | null;
+    /** BLO-36289: armed and never evaluated, vs armed-and-already-polling. */
+    neverTriggered?: boolean;
   }) {
     const id = randomUUID();
+    const lastTriggeredAt = input.neverTriggered ? null : LAST_POLL_AT;
+    const attemptCount = input.neverTriggered ? 0 : 3;
     await db.insert(issues).values({
       id,
       companyId: input.companyId,
@@ -272,8 +276,8 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
       originKind: "manual",
       originFingerprint: "default",
       monitorNextCheckAt: input.monitorNextCheckAt ?? null,
-      monitorLastTriggeredAt: LAST_POLL_AT,
-      monitorAttemptCount: 3,
+      monitorLastTriggeredAt: lastTriggeredAt,
+      monitorAttemptCount: attemptCount,
       monitorScheduledBy: "assignee",
       monitorNotes: `gate re-check: ${input.gateSignals.join(", ")} merged=NO`,
       executionState: {
@@ -288,10 +292,10 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
         lastDecisionId: null,
         lastDecisionOutcome: null,
         monitor: {
-          status: "triggered",
-          nextCheckAt: null,
-          lastTriggeredAt: LAST_POLL_AT.toISOString(),
-          attemptCount: 3,
+          status: input.neverTriggered ? "scheduled" : "triggered",
+          nextCheckAt: input.monitorNextCheckAt?.toISOString() ?? null,
+          lastTriggeredAt: lastTriggeredAt?.toISOString() ?? null,
+          attemptCount,
           notes: "merged=NO",
           scheduledBy: "assignee",
           gateSignals: "storedGateSignals" in input ? input.storedGateSignals : input.gateSignals,
@@ -595,6 +599,57 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
       agentId,
       identifier: "TG4-1",
       gateSignals: ["pr:blockcast/paperclip#1281:merged"],
+      status: "in_progress",
+      monitorNextCheckAt: new Date(NOW.getTime() + 60 * 60 * 1000),
+    });
+
+    const result = await reconcileTerminalGates(db, {
+      now: NOW,
+      readPullRequestGate: mergedReader(new Set(["blockcast/paperclip#1281"])),
+    });
+
+    expect(result).toMatchObject({ scanned: 0, resolved: 0 });
+    expect(await commentsFor(issueId)).toHaveLength(0);
+  });
+
+  it("resolves a monitor armed on an already-satisfied gate without waiting for nextCheckAt", async () => {
+    // BLO-36289. Same shape as TG4 — armed, next check an hour out — except this
+    // monitor has never been evaluated (attemptCount 0, lastTriggeredAt null),
+    // i.e. it was armed on a gate that was already satisfied. TG4 is the control
+    // that keeps the "still polling" exclusion honest: reverting the never-polled
+    // arm of the candidate predicate must fail THIS test and leave TG4 green.
+    const { companyId, agentId } = await createCompany("TG14");
+    const issueId = await insertStrandedGateIssue({
+      companyId,
+      agentId,
+      identifier: "TG14-1",
+      gateSignals: ["pr:blockcast/paperclip#1281:checks"],
+      status: "in_progress",
+      monitorNextCheckAt: new Date(NOW.getTime() + 60 * 60 * 1000),
+      neverTriggered: true,
+    });
+
+    const result = await reconcileTerminalGates(db, {
+      now: NOW,
+      readPullRequestGate: mergedReader(new Set(["blockcast/paperclip#1281"])),
+    });
+
+    expect(result).toMatchObject({ scanned: 1, resolved: 1 });
+    expect(await commentsFor(issueId)).toHaveLength(1);
+  });
+
+  it("does not re-admit a re-armed monitor that has already polled", async () => {
+    // The never-polled arm is deliberately `attemptCount = 0 AND
+    // lastTriggeredAt IS NULL`, not "recently armed": re-arming preserves
+    // attemptCount, so a monitor that has fired once stays out of the candidate
+    // set. That bound is what keeps this off the "every armed monitor in the
+    // fleet" cost BLO-29856 rejected.
+    const { companyId, agentId } = await createCompany("TG15");
+    const issueId = await insertStrandedGateIssue({
+      companyId,
+      agentId,
+      identifier: "TG15-1",
+      gateSignals: ["pr:blockcast/paperclip#1281:checks"],
       status: "in_progress",
       monitorNextCheckAt: new Date(NOW.getTime() + 60 * 60 * 1000),
     });

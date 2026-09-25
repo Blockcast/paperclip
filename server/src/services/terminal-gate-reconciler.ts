@@ -61,7 +61,7 @@ import { normalizeIssueMonitorGateSignals } from "./issue-execution-policy.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { listIssueDependencyReadinessMap } from "./issues.js";
 
-/** Issues scanned per pass. The population is small by construction (a monitor with declared gates and no next check). */
+/** Issues scanned per pass. The population is small by construction (a monitor with declared gates that is not polling, or has not polled yet — see `listCandidateIssues`). */
 const SCAN_LIMIT = 200;
 
 /**
@@ -313,13 +313,42 @@ type CandidateRow = {
 };
 
 /**
- * Issues whose monitor declared gates and whose polling has stopped.
+ * Issues whose monitor declared gates and is either no longer polling or has
+ * not polled yet.
  *
  * Deliberately NOT restricted to `in_progress`/`in_review`. A monitor can only
  * be *armed* on those statuses, but the population this exists for is precisely
  * the one an outage moved to `blocked` (and a restore sweep then moved to
  * `todo`) with the monitor state left behind in the JSONB. Restricting to the
  * armable statuses would exclude the worked example that motivated this module.
+ *
+ * ## Why the never-polled arm exists (BLO-36289)
+ *
+ * `monitorNextCheckAt IS NULL` alone means "polling stopped", so a monitor
+ * armed on a gate that was *already satisfied at arm time* was invisible here
+ * until its whole window elapsed. Worked example: BLO-28908's monitor was armed
+ * at 02:00 with `notes: "checks=pending, review=none"` while both check runs had
+ * finished at 01:12:50Z — 47 minutes earlier. It waited a full day and cleared
+ * `timeout_exceeded`.
+ *
+ * `attemptCount = 0 AND lastTriggeredAt IS NULL` is "armed and never evaluated",
+ * which is exactly that population and no more. It is self-limiting: a row
+ * leaves the set the first time the monitor fires, and leaves it earlier if the
+ * gate resolves (the announcement anti-join above drops it). Re-arming preserves
+ * `attemptCount`, so a re-armed monitor is not readmitted — deliberate, since
+ * the harm being closed is the *first* window, and readmitting every re-arm is
+ * the unbounded variant BLO-29856 rejected.
+ *
+ * Cost, measured 2026-09-25 against the live fleet rather than estimated: 47
+ * armed monitors, of which 9 never-triggered. All 9 declare gates; 8 declare at
+ * least one token `parseTerminalGateSignal` cannot parse (`mq:`, `heap:`,
+ * `argo:`, `approval:`, `cron:`, `insync:`, `deploy:`, `cto-ruling:`), and
+ * `resolveTerminalGate` runs its parse loop to completion *before* its read
+ * loop, so those cost zero network calls. Added GitHub reads per pass: **1**
+ * (`blockcast/onprem-k8s#3823`, deduped per pass by `gateCache`).
+ *
+ * No network call is added to `PATCH /api/issues/{id}` — the evaluation stays
+ * here, on the sweep, off the monitor-write transaction.
  */
 async function listCandidateIssues(db: Pick<Db, "select">, limit: number): Promise<CandidateRow[]> {
   return db
@@ -332,7 +361,8 @@ async function listCandidateIssues(db: Pick<Db, "select">, limit: number): Promi
     .from(issues)
     .where(and(
       notInArray(issues.status, ["done", "cancelled"]),
-      isNull(issues.monitorNextCheckAt),
+      sql`(${issues.monitorNextCheckAt} is null
+            or (${issues.monitorAttemptCount} = 0 and ${issues.monitorLastTriggeredAt} is null))`,
       visibleIssueCondition(),
       // One CASE, not two ANDed predicates: PostgreSQL does not promise to
       // evaluate a WHERE conjunct only after its neighbour, so a separate
