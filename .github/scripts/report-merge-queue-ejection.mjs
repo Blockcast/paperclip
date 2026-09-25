@@ -1,0 +1,140 @@
+#!/usr/bin/env node
+
+/**
+ * Report a failed merge-group run on the PR that GitHub ejected.
+ *
+ * Merge-group runs use refs such as gh-readonly-queue/master/pr-1306-<sha>,
+ * and do not reliably populate workflow_run.pull_requests. The PR number in
+ * the synthetic branch is therefore the durable correlation key.
+ */
+
+export function mergeQueuePullRequestNumber(headBranch) {
+  if (typeof headBranch !== "string") return null;
+  const match = headBranch.match(/(?:^|\/)pr-(\d+)(?:-|$)/i);
+  return match ? Number(match[1]) : null;
+}
+
+export function shouldReportMergeQueueFailure({ headBranch, conclusion }) {
+  // `failure` and `cancelled`. An earlier revision took `failure` only, on the
+  // premise that a `cancelled` candidate stays queued and gets re-built. Staff
+  // Engineer measured the full history (398 merge_group PR runs, 2026-08-28 ->
+  // 2026-09-18: 295 success / 80 failure / 22 cancelled) and that premise holds
+  // for 1 of the 22: 6 merged at the cancel, 14 were EJECTED and never
+  // re-added. `failure`-only therefore catches 80/94 = 85% of real ejections.
+  // A job hitting `timeout-minutes` also surfaces as `cancelled`, and pr.yml
+  // deliberately trades a fast red for a timeout -- so that class landed
+  // entirely in the blind spot too.
+  // The benign `cancelled` cases are suppressed on PR state, not on
+  // conclusion: see shouldReportCancelledRun.
+  return (
+    mergeQueuePullRequestNumber(headBranch) !== null &&
+    (conclusion === "failure" || conclusion === "cancelled")
+  );
+}
+
+export function shouldReportCancelledRun({ merged, isInMergeQueue }) {
+  // Only consulted for `cancelled`. `merged` covers the candidate whose group
+  // landed; `isInMergeQueue` covers the one still queued for a re-build. Read
+  // at an instant, so the race cuts both ways: a PR mid-re-dispatch reads
+  // out-of-queue and gets one spurious comment (bounded by the per-runId
+  // marker), and a PR re-enqueued before this handler fires reads
+  // isInMergeQueue:true and is never reported at all. The second is the one
+  // that loses data, and is accepted -- whoever re-added it already knows.
+  // Against the measured 22: 14-15 true reports, 0 false alarms.
+  return !merged && !isInMergeQueue;
+}
+
+async function githubRequest(path, options = {}) {
+  const response = await fetch(`https://api.github.com${path}`, {
+    ...options,
+    headers: {
+      accept: "application/vnd.github+json",
+      authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+      "x-github-api-version": "2022-11-28",
+      ...(options.headers ?? {}),
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`GitHub API ${response.status} for ${path}`);
+  }
+  return response.json();
+}
+
+// `isInMergeQueue` is GraphQL-only -- REST /pulls/{n} has no queue-membership
+// field, and its `mergeable_state` reads `unknown` for a queued PR (lazy
+// compute), so it cannot answer this.
+async function pullRequestQueueState(owner, repo, number) {
+  const payload = await githubRequest("/graphql", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      query: `query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){merged isInMergeQueue}}}`,
+      variables: { owner, repo, number },
+    }),
+  });
+  // GraphQL answers 200 with an `errors` array, so response.ok proves nothing.
+  if (payload.errors?.length) {
+    throw new Error(`GitHub GraphQL: ${payload.errors.map((e) => e.message).join("; ")}`);
+  }
+  const pullRequest = payload.data?.repository?.pullRequest;
+  if (!pullRequest) throw new Error(`No pull request ${owner}/${repo}#${number}`);
+  return pullRequest;
+}
+
+export async function reportMergeQueueFailure({ repository, headBranch, conclusion, runUrl, runId }) {
+  // Gate here as well as in the CLI, so the safe path is the only path.
+  if (!shouldReportMergeQueueFailure({ headBranch, conclusion })) {
+    return { reported: false, reason: "not-reportable" };
+  }
+  const number = mergeQueuePullRequestNumber(headBranch);
+
+  const [owner, repo] = repository.split("/", 2);
+  if (!owner || !repo) throw new Error(`Invalid repository: ${repository}`);
+
+  if (conclusion === "cancelled") {
+    // Deliberate: a GraphQL blip here reddens the reporter job rather than
+    // silently skipping. A silent skip loses an ejection report on a PR that is
+    // already stuck, which is the failure nobody notices.
+    const state = await pullRequestQueueState(owner, repo, number);
+    if (!shouldReportCancelledRun(state)) {
+      return { reported: false, reason: state.merged ? "merged" : "still-queued", number };
+    }
+  }
+
+  // One unpaginated page, oldest-first. GET /issues/{n}/comments does NOT honour
+  // sort/direction -- only the repo-level /issues/comments does; measured on this
+  // repo, the per-issue endpoint returns an identical first element with and
+  // without direction=desc (#1306, #1158, #1859), while the repo-level one flips.
+  // So the marker sits on the LAST page and a thread past 100 comments would
+  // re-post on every redelivery. Ceiling accepted: the busiest thread here is 12,
+  // and the blast radius is one duplicate comment. Paginate to the end if a PR
+  // thread ever approaches 100.
+  const comments = await githubRequest(
+    `/repos/${owner}/${repo}/issues/${number}/comments?per_page=100`,
+  );
+  const marker = `<!-- paperclip:merge-queue-ejection:${runId} -->`;
+  if (comments.some((comment) => comment.body?.startsWith(marker))) {
+    return { reported: false, reason: "already-reported", number };
+  }
+
+  const outcome = conclusion === "failure" ? "failed" : "was cancelled (a job timeout surfaces this way)";
+  const body = `${marker}\nMerge-queue ejection detected for PR #${number}. The merge-group run ${outcome} and GitHub may have removed the PR from the queue and dropped auto-merge. Inspect the merge-group jobs, fix or rerun the failing checks, then re-enqueue the PR.\n\nRun: ${runUrl}`;
+  await githubRequest(`/repos/${owner}/${repo}/issues/${number}/comments`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ body }),
+  });
+  return { reported: true, number };
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const { GITHUB_REPOSITORY, GITHUB_WORKFLOW_RUN_HEAD_BRANCH, GITHUB_WORKFLOW_RUN_CONCLUSION, GITHUB_SERVER_URL, GITHUB_WORKFLOW_RUN_ID } = process.env;
+  const result = await reportMergeQueueFailure({
+    repository: GITHUB_REPOSITORY,
+    headBranch: GITHUB_WORKFLOW_RUN_HEAD_BRANCH,
+    conclusion: GITHUB_WORKFLOW_RUN_CONCLUSION,
+    runUrl: `${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_WORKFLOW_RUN_ID}`,
+    runId: GITHUB_WORKFLOW_RUN_ID,
+  });
+  console.log(result.reported ? `Reported merge-queue ejection for PR #${result.number}` : `Skipped: ${result.reason}`);
+}

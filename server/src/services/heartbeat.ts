@@ -263,7 +263,6 @@ import {
   resolveAgentEmptyWorkspaceSourceDir,
   resolveDefaultAgentWorkspaceDir,
   resolveManagedProjectWorkspaceDir,
-  resolvePaperclipInstanceRoot,
 } from "../home-paths.js";
 import {
   buildHeartbeatRunIssueComment,
@@ -302,6 +301,7 @@ import {
 } from "./github-app-auth.js";
 import { loadConfig } from "../config.js";
 import { enqueueGithubCommitStatusDelivery } from "./github-status-delivery-outbox.js";
+import { resolveSharedDocSearchBoundaryPath } from "./shared-doc-search-boundary.js";
 import { pullRequestExternalId } from "./pull-request-work-products.js";
 import {
   ensureReferencedSharedDocsMaterialized,
@@ -443,6 +443,7 @@ import {
   setReleasePendingExternalRuntimeReservationMetrics,
   setOrphanedEnvironmentLeaseMetrics,
   setOrphanedRuntimeResourceMetricsRefreshSuccess,
+  setCrashRecoveryCandidateIndexPresent,
 } from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
 import { runLifecycleHook } from "./lifecycle-hook.js";
@@ -3730,6 +3731,65 @@ function isNonRetryablePrReviewTerminalOutcome(
   return recovery.adapterInvocationStarted === true;
 }
 
+/**
+ * BLO-34699: did this terminal run actually produce a REVIEW VERDICT we may
+ * publish to the PR gate?
+ *
+ * Deliberately NOT the same question as `isNonRetryablePrReviewTerminalOutcome`,
+ * whose other two callers ask "is this run terminal for recovery routing" — a
+ * pod that never scheduled IS terminal for its own run, so those must keep the
+ * wider predicate. Publishing a commit status is a different claim: it asserts
+ * something about the HEAD, and a run that never invoked its adapter made no
+ * judgement about the head at all.
+ *
+ * Measured on Blockcast/paperclip, 2026-09-19. Four heads were stamped
+ * `review/ally-complete = failure` with "ended ambiguously and was not
+ * replayed; no review was confirmed"; a genuine, non-stale formal review then
+ * landed at that EXACT head on three of them, 4h59m–5h48m later (#1929
+ * 17:04:56Z→22:53:23Z, #1931 19:42:17Z→00:55:38Z, #1932 19:56:56Z→00:56:06Z).
+ * Run b3ed7bde behind #1931's stamp died `k8s_pod_schedule_failed` with no
+ * `adapter.invoke` event at all. So the gate was not merely early, it was
+ * asserting a verdict about a head that no reviewer had yet read — and
+ * `review/ally-complete` has no writer that ever clears it, so #1929 still
+ * carries that red beside a `gate/ally-comment-findings: success` for the same
+ * head, the two gates contradicting each other ~14h on.
+ *
+ * Not a one-off: `k8s_pod_schedule_failed` is 38 of the reviewer's last 1000
+ * runs (26h window), and BLO-34577 records tenant-wide 429s being mis-tagged
+ * into it. The 5h band matches the reviewer's own dispatch-queue wait, i.e. the
+ * first dispatch was killed by capacity and a later one served the same request.
+ *
+ * `adapterInvocationStarted` is the existing durable proof of an `adapter.invoke`
+ * run event, already required by the `pr_review_output_missing` /
+ * `pr_review_verification_unavailable` arms above. All this adds is requiring it
+ * of the two infra codes as well, by requiring it of everything:
+ *  - `k8s_pod_schedule_failed` never computes it (`hasAdapterInvocationEvent` is
+ *    consulted only for `job_failed`/`job_missing`), so it can never grade — the
+ *    wanted outcome, the pod did not start;
+ *  - `job_missing` is "only produced after adapter.invoke" per the retry-admission
+ *    comment above, so it normally still grades, and the genuine
+ *    reviewer-ran-and-posted-nothing case is preserved;
+ *  - the two `pr_review_*` arms already proved it, so they are unchanged.
+ *
+ * That last point is why this is one condition and not a per-code branch, and it
+ * also sets the default for any code added to the predicate above later: a new
+ * arm publishes a verdict only once it can show the reviewer ran. Failing toward
+ * not-publishing is the safe direction — a missing status blocks under
+ * BLO-26572 exactly as a red one does, without asserting a falsehood about the
+ * head.
+ *
+ * NOTE the deliberate boundary: suppressing the false verdict does not make an
+ * uninvoked reviewer run visible. That is BLO-34577 (mis-tagged 429 → review
+ * silently dropped, no auto-retry) and is not fixed here.
+ */
+export function producedPrReviewGateVerdict(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson" | "contextSnapshot">,
+) {
+  if (!isNonRetryablePrReviewTerminalOutcome(run)) return false;
+  const recovery = parseObject(parseObject(run.resultJson).externalLifecycleRecovery);
+  return recovery.adapterInvocationStarted === true;
+}
+
 export async function assertGitWorktreeBaseWorkspaceReady(input: {
   requestedExecutionWorkspaceMode: ReturnType<typeof resolveExecutionWorkspaceMode>;
   config: Record<string, unknown>;
@@ -5562,7 +5622,7 @@ async function materializeExternalK8sSharedDocs(input: {
   }
   if (!instructionsContents) return;
 
-  const sharedDocSearchBoundaryPath = resolvePaperclipInstanceRoot();
+  const sharedDocSearchBoundaryPath = resolveSharedDocSearchBoundaryPath();
   if (!sharedDocSourceRoots(sourceRootPath, sharedDocSearchBoundaryPath).some((root) => root !== sourceRootPath)) {
     // Not fatal: shared docs may genuinely live in the bundle. Logged because an external
     // bundle configured outside the instance root silently loses the company-root lookup,
@@ -10107,8 +10167,37 @@ function unavailablePrReviewVerification(reason: string) {
  *  - an operator opted in by configuring a context name (this server does not
  *    own the branch-protection rule, so it must not invent one);
  *  - the run is a PR-review run (`derivePaperclipPrReview`);
+ *  - the run is the REVIEWER's, not the author's (`reviewKind` / `prRole`);
  *  - the wake carried a repo AND an exact head SHA — statuses are per-commit,
  *    so a guessed SHA would fail an unrelated commit.
+ *
+ * BLO-34699: `derivePaperclipPrReview` answers "is this wake ABOUT a PR", which
+ * is true of both sides of one review. The author's own agent is woken by its
+ * own `<!-- paperclip:review-request -->` marker (BLO-19522, deliberate and not
+ * being removed), so an author run carries the same repo/head/PR identity as
+ * the reviewer run and used to resolve a target here. Measured on
+ * Blockcast/pim-multicast-gateway#3237: run 974efdbd on the PR AUTHOR's agent
+ * (`prRole: "author"`, `reviewKind: null`) died `k8s_pod_schedule_failed` at pod
+ * start with zero turns, and its crash was written as `review/ally-complete =
+ * failure` — while Ally's real review for that head was still QUEUED (oldest
+ * queued reviewer run 4.67h, matching the request age). `review-gate` is a
+ * scheduled peer of `ci-gate`, so that manufactured red made the PR unmergeable
+ * and could not self-heal: the gate re-runs on `pull_request_review: submitted`
+ * and Ally's common shape is a comment-shaped review, which never re-triggers it.
+ *
+ * Gating on the context's own `reviewKind`/`prRole` rather than on the agent
+ * id: both are stamped by the code that CHOSE whom to wake — the two reviewer
+ * wake constructors (`buildPrReviewerWakeupOptions` and
+ * `queueIssueAssignmentWakeup`'s PR-review branch) each set
+ * `reviewKind: "pr_review"` AND `prRole: "reviewer"`, while the author-directed
+ * path sets `prRole: "author"` and no `reviewKind`. That is the server's own
+ * recorded answer, rather than an identity re-derived at finalize time from a
+ * reviewer-agent-id config this module does not carry.
+ *
+ * The predicate is the one already used by `evaluatePrReviewCompletionEvidence`
+ * for the same question, deliberately: require a positive `pr_review` tag, and
+ * reject a `prRole` that is present and not the reviewer's. The measured case
+ * fails both clauses.
  */
 export function resolvePrReviewGateStatusTarget(
   contextSnapshot: Record<string, unknown> | null | undefined,
@@ -10118,6 +10207,8 @@ export function resolvePrReviewGateStatusTarget(
   if (!context) return null;
   const prReview = derivePaperclipPrReview(contextSnapshot);
   if (!prReview) return null;
+  if (prReview.reviewKind !== "pr_review") return null;
+  if (prReview.prRole && prReview.prRole !== "reviewer") return null;
   const { repoFullName, headSha, prNumber, prUrl } = prReview;
   if (!repoFullName || !headSha) return null;
   return { repoFullName, sha: headSha, context, prNumber, prUrl: prUrl ?? null };
@@ -12770,14 +12861,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const body = [
       `## Ally review did not land on \`${target.repoFullName}#${target.prNumber}\``,
       "",
-      `The Paperclip reviewer run for head \`${shortSha}\` ${cause}. **No review was posted, and none is coming for this head** — this is a terminal outcome, not reviewer latency.`,
+      // BLO-34699: this used to assert "none is coming for this head — a
+      // terminal outcome, not reviewer latency". That claim is about the QUEUE,
+      // and this function has not read the queue. It was measured false on
+      // Blockcast/pim-multicast-gateway#3237 at the moment it was written: a
+      // reviewer run for that exact head was queued and 4.67h old behind a
+      // firing PaperclipPrReviewConsumerStarved. Report only what this run did;
+      // a second request for the same head can still be in flight, and the old
+      // prescribed remedy (re-request / push a new head) is actively harmful
+      // against a starved queue — a re-request lengthens it and a push voids
+      // the head.
+      `The Paperclip reviewer run for head \`${shortSha}\` ${cause}. **No review was posted by that run**, and the gate below is red on its behalf.`,
       "",
       `- Head: \`${target.sha}\``,
       `- Gate status: \`${target.context}\` set to \`failure\` on that commit`,
       ...(target.prUrl ? [`- PR: ${target.prUrl}`] : []),
       `- Reviewer run: \`${run.id}\``,
       "",
-      "Re-request the review on the PR (a start-of-body `<!-- paperclip:review-request -->` marker **and** a bare `@ally` mention — the marker alone is silently dropped), or push a new head.",
+      "Check whether another review for this exact head is still queued before acting — this notice does not know. If one is, wait for it. If none is, re-request the review on the PR (a start-of-body `<!-- paperclip:review-request -->` marker **and** a bare `@ally` mention — the marker alone is silently dropped); pushing a new head voids any at-head attestation and is the last resort.",
     ].join("\n");
 
     for (const issue of linked) {
@@ -18497,14 +18598,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * index absent or invalid — so a latched worker would silently resume the
    * sequential scan and top-N sort this gate exists to prevent, with no further
    * catalog check ever. Revalidating on every periodic pass is Ally's own first
-   * remedy and needs no tunable: this is one indexed catalog lookup per
-   * scheduler tick per replica, which is noise next to the scan it guards
-   * against, and it makes the gate recover in BOTH directions.
+   * remedy and needs no tunable: this is one indexed catalog lookup, which is
+   * noise next to the scan it guards against, and it makes the gate recover in
+   * BOTH directions.
+   *
+   * Exported as `publishCrashRecoveryCandidateIndexGauge` and called a second
+   * time per tick from above both scheduler gates (BLO-21526). Two catalog
+   * lookups per tick per replica instead of one, deliberately: the gate needs
+   * its own read so it acts on the value it published, and the gauge needs a
+   * publisher that a suppressed or still-recovering replica reaches — a
+   * database restore both suppresses the scheduler AND is a leading way to
+   * lose the index, which is exactly where the signal must not go dark.
    *
    * A probe FAILURE means we do not know, so it skips this one periodic tick
-   * (startup recovery is ungated) and the next tick asks again.
+   * (startup recovery is ungated ON THE INDEX — it is still gated on
+   * scheduling suppression) and the next tick asks again.
    */
-  async function crashRecoveryCandidateIndexPresent(): Promise<boolean> {
+  async function crashRecoveryCandidateIndexPresent(
+    source: "gate" | "gauge",
+  ): Promise<boolean> {
     try {
       const rows = await db.execute(sql`
         select 1
@@ -18519,6 +18631,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         limit 1
       `);
       const present = Array.from(rows as unknown as Iterable<unknown>).length > 0;
+      // Published on every tick, in BOTH directions (BLO-21526). The warn
+      // below is latched to the absent transition and says nothing at all
+      // while the index is healthy, which is the same silent-on-healthy shape
+      // as the migration's swallowed RAISE NOTICE; the gauge is what lets an
+      // operator or a later deploy check confirm presence rather than merely
+      // observe quiet.
+      setCrashRecoveryCandidateIndexPresent(present);
       if (present) {
         // Re-arm the warning so a later disappearance is reported again rather
         // than being silenced by a warning issued before the index existed.
@@ -18530,18 +18649,46 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logger.warn(
           {
             index: "heartbeat_runs_crash_recovery_pending_idx",
+            // Which caller probed. The two run concurrently within a tick —
+            // the gauge publisher is tracked without `await` and the gate
+            // probes later in the same tick — and the latch above can be read
+            // as `false` by both before either sets it, so the absent
+            // TRANSITION can legitimately emit two lines. Tagging them is
+            // what stops an operator reading that as two distinct failures.
+            source,
             remediation:
               "CREATE INDEX CONCURRENTLY heartbeat_runs_crash_recovery_pending_idx ON heartbeat_runs USING btree (finished_at, id) WHERE error_code = 'worker_crashed' AND crash_recovery_completed_at IS NULL",
           },
-          "worker-crash candidate index missing or invalid; periodic crash reconciliation is disabled until it is built online (startup recovery still runs)",
+          // "startup recovery covers this only while scheduling is not
+          // suppressed", not the flat "startup recovery still runs" this used
+          // to claim: this publisher is called from above both scheduler gates
+          // (BLO-21526), so it now also emits on a suppressed replica — where
+          // `startServer` skips startup recovery entirely and NEITHER recovery
+          // path is running.
+          "worker-crash candidate index missing or invalid; periodic crash reconciliation is disabled until it is built online (startup recovery covers this only while scheduling is not suppressed)",
         );
       }
       return present;
     } catch (err) {
       // Never let a catalog probe failure take out the caller, and never cache
       // it: "we could not tell" is not evidence either way. Skips this periodic
-      // tick only; startup recovery is ungated.
-      logger.warn({ err }, "failed to probe worker-crash candidate index; skipping periodic reconciliation this tick");
+      // tick only; startup recovery is ungated on the index (though it is
+      // still gated on scheduling suppression).
+      //
+      // The gauge is cleared rather than set to 0 for the same reason: an
+      // unreadable catalog must not publish "the index is gone", and a stale 1
+      // left behind would publish "healthy" on no information (BLO-21526).
+      setCrashRecoveryCandidateIndexPresent(null);
+      // The consequence is the CALLER's, not the probe's: only the gate turns
+      // this into a skipped tick. The ungated gauge publisher makes no
+      // reconciliation decision at all — and on a suppressed replica there is
+      // no periodic reconciliation for it to be skipping.
+      logger.warn(
+        { err, source },
+        source === "gate"
+          ? "failed to probe worker-crash candidate index; skipping periodic reconciliation this tick"
+          : "failed to probe worker-crash candidate index; candidate-index gauge cleared for this tick",
+      );
       return false;
     }
   }
@@ -18608,7 +18755,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // caller passes `requireCandidateIndex` and is skipped until the index
     // exists; startup recovery is never gated, because that is the primary
     // recovery path and its cost is bounded and one-off.
-    if (options.requireCandidateIndex && !(await crashRecoveryCandidateIndexPresent())) {
+    if (options.requireCandidateIndex && !(await crashRecoveryCandidateIndexPresent("gate"))) {
       return {
         reconciledRunIds: [],
         retryRunIds: [],
@@ -20059,6 +20206,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // GitHub-evidence read and transient GitHub/token failures can retry.
       // Opt-in and swallowed so status delivery can never alter exhaustion
       // handling.
+      //
+      // BLO-34699: this arm deliberately does NOT require the
+      // `adapterInvocationStarted` proof the two non-retryable arms do, and the
+      // asymmetry is the point rather than an oversight. Exhaustion is a
+      // stronger claim to terminality: the bounded chain has run to its end, so
+      // nothing further is coming from this request whether or not any single
+      // attempt reached a model call. The non-retryable arms have no such
+      // chain behind them — one crashed pod is their whole evidence — which is
+      // why they need the extra proof. Do not "fix" this by symmetry.
       await queueFailedPrReviewGateStatus(run, contextSnapshot, "retry_exhausted").catch((error) => {
         logger.warn(
           { err: error, runId: run.id },
@@ -32980,7 +33136,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * off the hot path.
    */
   async function hasQueuedReplacementIssueWake(
-    dbOrTx: typeof db | Parameters<Parameters<typeof db.transaction>[0]>[0],
+    dbOrTx: Db | DbTransaction,
     companyId: string,
     issueId: string,
     participantAgentId: string,
@@ -33194,7 +33350,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
 
       if (!issue) {
-        if (isNonRetryablePrReviewTerminalOutcome(run)) {
+        // BLO-34699: the gate arm requires proof the reviewer actually ran.
+        if (producedPrReviewGateVerdict(run)) {
           gateDelivery = await queueFailedPrReviewGateStatus(
             run,
             runContext,
@@ -33257,7 +33414,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ),
           );
       }
-      if (isNonRetryablePrReviewTerminalOutcome(run) && !finalizedRunStageSuperseded) {
+      // BLO-34699: `producedPrReviewGateVerdict`, not the wider recovery-routing
+      // predicate — a run that never invoked its adapter read nothing at this
+      // head, so it has no verdict to publish about it.
+      if (producedPrReviewGateVerdict(run) && !finalizedRunStageSuperseded) {
         // The outbox row is part of the ownership decision: a replacement run
         // cannot claim this issue until both the lock release and delivery
         // intent commit. Publishing the informational event can remain best
@@ -38821,6 +38981,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     publishAgentLivenessGauges,
     publishGithubReviewDeadLetterGauge,
     publishAgentWakeupTerminalFailedGauge,
+    // BLO-21526: exported so the gauge has a publisher ABOVE both scheduler
+    // gates, not only the gated reconciliation's own gate read. Same defect
+    // and same remedy as BLO-31335 — see the registration in index.ts.
+    publishCrashRecoveryCandidateIndexGauge: () => crashRecoveryCandidateIndexPresent("gauge"),
 
     getRunLogAccess,
 

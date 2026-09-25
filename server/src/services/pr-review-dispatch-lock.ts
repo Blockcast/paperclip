@@ -1,11 +1,10 @@
 import { and, eq, sql } from "drizzle-orm";
-import type { Db, DbTransaction } from "@paperclipai/db";
+import type { DbTransaction } from "@paperclipai/db";
 import { heartbeatRuns } from "@paperclipai/db";
 import {
   matchesTaskKey,
   prReviewTaskLockSpellings,
 } from "./pr-review-duplicate-issue-guard.js";
-
 
 const PR_REVIEW_DISPATCH_LOCK_PREFIX = "heartbeat:pr-review-dispatch:";
 
