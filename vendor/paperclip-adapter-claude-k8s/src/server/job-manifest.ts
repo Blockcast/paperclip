@@ -191,10 +191,26 @@ export function resolveScopedWritableMounts(input: {
   return mounts;
 }
 
-export function buildPodLogPath(companyId: string, agentId: string, runId: string, isolationKey?: string): string {
-  const dir = isolationKey
-    ? `/paperclip/instances/default/data/run-logs/${companyId}/${agentId}/isolated/${isolationKey}`
-    : `/paperclip/instances/default/data/run-logs/${companyId}/${agentId}`;
+/** The pod log lives on the shared data volume, which the server and the agent
+ *  pod reach at DIFFERENT absolute paths: the server always at
+ *  `SELF_POD_DATA_MOUNT_PATH`, the pod at whatever `config.workspaceMountPath`
+ *  says. `root` selects which address space you want. It defaults to the
+ *  server's, because every caller outside this module is server-side
+ *  (`tailPodLogFile`, the final read-back, the cleanup `unlink`).
+ *
+ *  Pass the pod's mount path for anything the CONTAINER executes — the `tee`
+ *  target, its `mkdir -p`, and the writable-subPath derivation. Under a custom
+ *  mount path the server root is not on the pod's volume at all, so a log
+ *  written there lands on the container filesystem and vanishes with the pod. */
+export function buildPodLogPath(
+  companyId: string,
+  agentId: string,
+  runId: string,
+  isolationKey?: string,
+  root: string = SELF_POD_DATA_MOUNT_PATH,
+): string {
+  const base = `${root}/instances/default/data/run-logs/${companyId}/${agentId}`;
+  const dir = isolationKey ? `${base}/isolated/${isolationKey}` : base;
   return `${dir}/${runId}.pod.ndjson`;
 }
 
@@ -1752,16 +1768,29 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   assertSafePathComponent("companyId", logPathCompanyId);
   assertSafePathComponent("agentId", logPathAgentId);
   assertSafePathComponent("runId", logPathRunId);
+  // ONE log file, TWO absolute paths, because the server and the agent pod
+  // mount the same volume at different roots. `podLogPath` is the server's view
+  // and is what this function returns (execute.ts tails, reads back and unlinks
+  // through it). `containerLogPath` is the pod's view and is what the container
+  // actually writes. They are byte-identical on the default mount path, and
+  // must not be conflated when `config.workspaceMountPath` is set.
   const podLogPath = buildPodLogPath(logPathCompanyId, logPathAgentId, logPathRunId, isolation.enabled ? isolation.key : undefined);
+  const containerLogPath = buildPodLogPath(
+    logPathCompanyId,
+    logPathAgentId,
+    logPathRunId,
+    isolation.enabled ? isolation.key : undefined,
+    normalizedDataMountPath,
+  );
   // Nested rw re-mounts that restore write access to exactly the trees this run
   // needs, inside the read-only `data` mount above. Built here rather than beside
-  // that mount because `podLogPath` is only known now; mount ORDER does not
+  // that mount because the log path is only known now; mount ORDER does not
   // matter (the kubelet sorts by path depth, so a parent never shadows a child).
   const scopedWritableMounts = narrowWritableSurface
     ? resolveScopedWritableMounts({
         dataMountPath,
         isolation,
-        podLogPath,
+        podLogPath: containerLogPath,
         instructionsFilePath: effectiveInstructionsFilePath,
         addDir: promptBundle?.addDir ?? null,
         companyId: logPathCompanyId,
@@ -2067,8 +2096,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         `fi && cd ${quoteShellArg(isolation.workspaceRoot)}`,
       ].join(" ")
     : "";
-  const preparePodLog = `mkdir -p ${quoteShellArg(path.posix.dirname(podLogPath))} || exit $?`;
-  const claudeInvocation = `set -o pipefail; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${buildEnvGuardSetupShell()}; ${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | tee ${quoteShellArg(podLogPath)} | ${failFastFilter} > /dev/null`;
+  // Both the mkdir and the tee run INSIDE the container, so they address the
+  // volume through the pod's mount path, never the server's.
+  const preparePodLog = `mkdir -p ${quoteShellArg(path.posix.dirname(containerLogPath))} || exit $?`;
+  const claudeInvocation = `set -o pipefail; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${buildEnvGuardSetupShell()}; ${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | tee ${quoteShellArg(containerLogPath)} | ${failFastFilter} > /dev/null`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket. Mirrors the opencode_k8s adapter.

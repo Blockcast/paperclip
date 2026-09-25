@@ -3077,6 +3077,59 @@ describe("scoped writable mounts (BLO-32734)", () => {
     expect(result.scopedWritableDirs).toContain("/paperclip/instances/default/data/k8s-isolation/workspaces/ws-1/home");
   });
 
+  // Ally review on #1820: the pod log has FOUR consumers and they split across
+  // two address spaces. Under a custom mount path the container-side three must
+  // point into the pod's volume and the server-side one must not — and all four
+  // must denote the SAME file on the SAME volume. Getting this wrong is silent:
+  // the Job runs, the log is written to the container filesystem, and it
+  // vanishes with the pod while the server tails a path that never appears.
+  it("agrees on one volume across all four pod-log consumers under a custom workspaceMountPath", () => {
+    const ctx = makeCtx();
+    ctx.config.workspaceMountPath = "/srv/agent-data";
+    setRuntimeIsolation(ctx, {
+      ...WORKSPACE_DESCRIPTOR,
+      workspaceRoot: "/srv/agent-data/instances/default/projects/co1/proj-1/_default",
+      homeRoot: "/srv/agent-data/instances/default/data/k8s-isolation/workspaces/ws-1/home",
+      sessionRoot: "/srv/agent-data/instances/default/data/k8s-isolation/workspaces/ws-1/session",
+      storage: isolatedStorage(),
+    });
+    const result = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+    const command = result.job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
+    const main = result.job.spec?.template?.spec?.containers[0]?.volumeMounts ?? [];
+
+    // The one thing every consumer must share: the path of the file RELATIVE to
+    // the volume root. Asserted as the invariant rather than as four literals,
+    // so a future re-rooting of either side cannot satisfy this test by moving
+    // both roots and quietly landing on two different files.
+    const logDirSubPath = "instances/default/data/run-logs/co1/agent-abc/isolated/workspacews-1";
+    const suffix = `${logDirSubPath}/run-abc12345.pod.ndjson`;
+
+    // (1) server-side read/tail/unlink path — execute.ts reaches the volume only
+    // at /paperclip, so this must NOT follow workspaceMountPath.
+    expect(result.podLogPath).toBe(`/paperclip/${suffix}`);
+
+    // (2) + (3) the container's own mkdir and tee — these run inside the pod, so
+    // they must follow workspaceMountPath.
+    const mkdir = `mkdir -p '/srv/agent-data/${logDirSubPath}'`;
+    const tee = `tee '/srv/agent-data/${suffix}'`;
+    expect(command).toContain(mkdir);
+    expect(command).toContain(tee);
+    expect(command.indexOf(mkdir)).toBeLessThan(command.indexOf(tee));
+    // Negative: nothing the container executes may address the server's root.
+    expect(command).not.toContain(`tee '/paperclip/${suffix}'`);
+
+    // (4) the writable subPath that makes that tee target writable at all. The
+    // regression Ally found was here: with the log path hardcoded to /paperclip,
+    // resolveScopedWritableMounts saw it as off-volume and emitted no mount, so
+    // the tee wrote under the READ-ONLY data mount.
+    const covering = main.find((m) => m.subPath && logDirSubPath.startsWith(m.subPath));
+    expect(covering, `no writable subPath mount covers ${logDirSubPath}`).toBeDefined();
+    expect(covering?.mountPath?.startsWith("/srv/agent-data/")).toBe(true);
+    // And the server is told to pre-create it through ITS root, since a subPath
+    // the kubelet has to create itself lands root:root 0755 and is EACCES for uid 1000.
+    expect(result.scopedWritableDirs).toContain(`/paperclip/${covering?.subPath ?? ""}`);
+  });
+
   // The residual, pinned deliberately: a shared-isolation run has no per-run
   // roots to derive a scope from (HOME falls back to /paperclip itself), so it
   // keeps today's broad rw mount. Narrowing it needs the roots to exist first.
