@@ -57,3 +57,16 @@ test("refresh keeps partial-shard recovery and uses the workflow token for the a
   assert.match(alarm, /action_required_count/);
   assert.match(alarm, /total_run_count/);
 });
+
+test("the stall alarm counts approval-gated runs by conclusion, not only status", () => {
+  const alarmStart = workflow.indexOf("\n      - name: Alert if the refresh PR got no CI\n");
+  assert.notEqual(alarmStart, -1, "refresh workflow must retain the no-CI alarm");
+  const alarm = workflow.slice(alarmStart);
+  // GitHub reports a run parked behind "Approve and run" as
+  // status=completed, conclusion=action_required. A status-only filter
+  // counts zero and the alarm logs "CI running normally".
+  assert.match(
+    alarm,
+    /select\(\.status == "action_required" or \.conclusion == "action_required"\)/,
+  );
+});

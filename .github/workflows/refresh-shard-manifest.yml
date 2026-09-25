@@ -248,7 +248,10 @@ jobs:
           for _ in $(seq 1 8); do
             runs_json="$(gh api "repos/${{ github.repository }}/actions/runs?head_sha=$head_sha&per_page=50")"
             total_run_count="$(printf '%s' "$runs_json" | jq '.workflow_runs | length')"
-            action_required_count="$(printf '%s' "$runs_json" | jq '[.workflow_runs[] | select(.status == "action_required")] | length')"
+            # An approval-gated run is reported as `status: completed` with
+            # `conclusion: action_required` (every weekly refresh since #1566),
+            # so matching `status` alone reads a stalled PR as healthy.
+            action_required_count="$(printf '%s' "$runs_json" | jq '[.workflow_runs[] | select(.status == "action_required" or .conclusion == "action_required")] | length')"
             if [ "${total_run_count:-0}" -gt 0 ]; then
               break
             fi
