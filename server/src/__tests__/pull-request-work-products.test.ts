@@ -99,6 +99,8 @@ describe("pullRequestWorkProductSourceEventActionOrder", () => {
     expect(pullRequestWorkProductSourceEventActionOrder({ action: "closed", prMerged: true })).toBe(50);
     expect(pullRequestWorkProductSourceEventActionOrder({ action: "reopened" })).toBe(40);
     expect(pullRequestWorkProductSourceEventActionOrder({ action: "ready_for_review" })).toBe(40);
+    expect(pullRequestWorkProductSourceEventActionOrder({ action: "enqueued" })).toBe(45);
+    expect(pullRequestWorkProductSourceEventActionOrder({ action: "dequeued" })).toBe(46);
     expect(pullRequestWorkProductSourceEventActionOrder({ action: "closed", prMerged: false })).toBe(30);
     expect(pullRequestWorkProductSourceEventActionOrder({ action: "converted_to_draft" })).toBe(20);
     expect(pullRequestWorkProductSourceEventActionOrder({ action: "synchronize" })).toBe(10);
