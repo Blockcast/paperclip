@@ -5,6 +5,7 @@ import { logger } from "../middleware/logger.js";
 import {
   cleanupExecutionWorkspaceArtifacts,
   inspectWorktreeReclaimSafety,
+  reclaimFsDeadlineExpiryCount,
   type WorktreeReclaimSafety,
 } from "./workspace-runtime.js";
 
@@ -255,7 +256,21 @@ export function executionWorkspaceCleanupService(db: Db) {
         ));
     };
 
+    // One abandoned stat per pass, at most. An fs call that hits its deadline
+    // is abandoned, not cancelled, and keeps a libuv threadpool thread until
+    // the syscall returns; these trees are colocated, so the next candidate is
+    // usually on the same wedged mount. The rest are re-selected next window.
+    const fsExpiriesAtStart = reclaimFsDeadlineExpiryCount();
+    let scanned = 0;
     for (const candidate of candidates) {
+      if (reclaimFsDeadlineExpiryCount() !== fsExpiriesAtStart) {
+        logger.warn(
+          { remaining: candidates.length - scanned },
+          "reconcileExecutionWorkspaceCleanup: a filesystem call hit its deadline; ending the pass early",
+        );
+        break;
+      }
+      scanned += 1;
       const worktreePath = candidate.providerRef ?? candidate.cwd;
       try {
         if (candidate.providerType === "git_worktree" && worktreePath) {
@@ -355,7 +370,7 @@ export function executionWorkspaceCleanupService(db: Db) {
       }
     }
 
-    return { stamped, scanned: candidates.length, collected, skipped, failed };
+    return { stamped, scanned, collected, skipped, failed };
   }
 
   return { reconcileExecutionWorkspaceCleanup, stampIdleLegacyWorkspaces };
