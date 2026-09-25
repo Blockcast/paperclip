@@ -81,6 +81,22 @@ export interface IssueLivenessWaitingPathInput {
   status: string;
 }
 
+/**
+ * BLO-22660: the one waiting path that ages out, so the only one carrying a timestamp.
+ *
+ * `createdAt` is a REQUIRED key whose value may be null/undefined, not an optional key. The
+ * fail-open is unchanged -- null, undefined and unparseable all still read as fresh -- but
+ * *omitting* the field is now a compile error. It was optional, and
+ * `listIssueBlockedInboxAttentionMap` duly selected the column, typed it, and then dropped it
+ * building this input, so every card read as fresh forever on the operator-facing surface
+ * while the recovery sweep aged it out. That pair of producers had already drifted once on
+ * `parkedUntil` (BLO-27912) and the comment asking the next author to keep them in step did
+ * not prevent this one; a required key does.
+ */
+export interface IssueLivenessPendingInteractionInput extends IssueLivenessWaitingPathInput {
+  createdAt: Date | string | null | undefined;
+}
+
 export interface IssueLivenessDependencyPathEntry {
   issueId: string;
   identifier: string | null;
@@ -123,7 +139,7 @@ export interface IssueGraphLivenessInput {
   agents: IssueLivenessAgentInput[];
   activeRuns?: IssueLivenessExecutionPathInput[];
   queuedWakeRequests?: IssueLivenessExecutionPathInput[];
-  pendingInteractions?: IssueLivenessWaitingPathInput[];
+  pendingInteractions?: IssueLivenessPendingInteractionInput[];
   pendingApprovals?: IssueLivenessWaitingPathInput[];
   openRecoveryIssues?: IssueLivenessWaitingPathInput[];
   /**
@@ -217,6 +233,33 @@ function pathKeySet(...lists: { companyId: string; issueId: string | null }[][])
   }
   return keys;
 }
+
+/**
+ * BLO-22660: a pending interaction stops counting as a live waiting path after 24h.
+ *
+ * Measured instance: BLO-22464 sat `in_review` for 17 days with no monitor, run, retry or
+ * recovery action and was never classified as needing attention, because one
+ * `request_confirmation` card had been pending for 32 days. `continuationPolicy` fires when the
+ * card is *answered*, which has no relationship to whoever the card's prose names - so a card
+ * naming a decider routes to nobody while still reading as ownership. A missing `createdAt`
+ * counts as fresh: this only ever drops a path we can prove is stale.
+ *
+ * Exported so that detection and remediation cannot disagree about the same card: the other
+ * consumer is `hasPendingWakeInteraction` in `service.ts`, which gates the sweeps that act on
+ * the findings minted here. Bounding only one half means the classifier ages a card out and
+ * mints a finding while the sweep declines to act because the card still reads as live.
+ *
+ * NOT an exhaustive list of places that believe "a pending card is a live wake path". At
+ * least two others are deliberately left unbounded, because they gate WAKES rather than
+ * findings and so fail in the opposite direction:
+ * `listBlockedIssueAutoResumeSuppressions` (`issues.ts`, `pending_interaction` suppression)
+ * and `explicitlyWaitingIssueIds` in the resolved-blocker sweep. Ageing a card out here costs
+ * a finding on a row that may be genuinely waiting; ageing one out there spends agent runs
+ * re-waking an assignee who cannot move the row, every tick, for as long as the human queue
+ * is deep -- and it is measured in weeks. If you bound those, bound them on their own
+ * evidence, not on this constant's say-so.
+ */
+export const PENDING_INTERACTION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 function readRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -485,9 +528,17 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
   const pendingApprovals = input.pendingApprovals ?? [];
   const openRecoveryIssues = input.openRecoveryIssues ?? [];
   const openPullRequestAttendance = input.openPullRequestAttendance ?? [];
+  const livePendingInteractions: IssueLivenessPendingInteractionInput[] = [];
+  const stalePendingInteractions: IssueLivenessPendingInteractionInput[] = [];
+  for (const entry of pendingInteractions) {
+    const createdAtMs = readDateMs(entry.createdAt);
+    const stale = createdAtMs !== null && nowMs - createdAtMs >= PENDING_INTERACTION_MAX_AGE_MS;
+    (stale ? stalePendingInteractions : livePendingInteractions).push(entry);
+  }
   // Indexed once per pass rather than scanned per issue — see `pathKeySet` (BLO-33225).
   const executionPathKeys = pathKeySet(activeRuns, queuedWakeRequests);
-  const interactionPathKeys = pathKeySet(pendingInteractions);
+  const interactionPathKeys = pathKeySet(livePendingInteractions);
+  const staleInteractionPathKeys = pathKeySet(stalePendingInteractions);
   const approvalPathKeys = pathKeySet(pendingApprovals);
   const recoveryPathKeys = pathKeySet(openRecoveryIssues);
   const openPullRequestPathKeys = pathKeySet(openPullRequestAttendance);
@@ -611,6 +662,18 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
   }
 
   /**
+   * BLO-22660: did this issue lose its waiting path only because an interaction aged out?
+   *
+   * Every `hasExplicitWaitingPath` caller can now newly fire on such a row, so every finding
+   * reachable from one has to say so. The default prose asserts no interaction exists and
+   * recommends adding one — both false here, and the second recommends a second card of
+   * exactly the kind that caused the finding.
+   */
+  function hasStaleInteraction(issue: IssueLivenessIssueInput) {
+    return staleInteractionPathKeys.has(pathKey(issue.companyId, issue.id));
+  }
+
+  /**
    * Does this issue still have a blocker edge that could plausibly resolve?
    *
    * `done` is the only status that retires an edge here. A `cancelled` blocker
@@ -679,20 +742,27 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
       includeStalledAssignee: true,
     });
     const isSelf = deadEnd.id === source.id;
+    const stale = hasStaleInteraction(deadEnd);
+    const pathClause = stale
+      ? "no unresolved blockers and no live action path — its issue-thread interaction has been pending over 24h"
+      : "no unresolved blockers and no wake, active run, human owner, interaction, approval, monitor, or recovery issue owning the next action";
 
     return finding({
       issue: source,
       state: "blocked_without_blockers",
       reason: isSelf
-        ? `${issueLabel(deadEnd)} is blocked with no unresolved blockers and no wake, active run, human owner, interaction, approval, monitor, or recovery issue owning the next action, so nothing can ever unblock it.`
-        : `${issueLabel(source)} is blocked by ${issueLabel(deadEnd)}, which is itself blocked with no unresolved blockers and no wake, active run, human owner, interaction, approval, monitor, or recovery issue owning the next action.`,
+        ? `${issueLabel(deadEnd)} is blocked with ${pathClause}, so nothing can ever unblock it.`
+        : `${issueLabel(source)} is blocked by ${issueLabel(deadEnd)}, which is itself blocked with ${pathClause}.`,
       dependencyPath,
       recoveryIssue: deadEnd,
       recommendedOwnerCandidateAgentIds: ownerCandidates.map((candidate) => candidate.agentId),
       recommendedOwnerCandidates: ownerCandidates,
       recommendedAction:
         `Review ${issueLabel(deadEnd)} and give it a next action: move it back to todo/in_progress so its assignee wakes, ` +
-        `add the blocker it is actually waiting on, assign a human owner or interaction if it is intentionally parked, ` +
+        `add the blocker it is actually waiting on, ` +
+        (stale
+          ? `resolve or withdraw its stale interaction and record the current owner, `
+          : `assign a human owner or interaction if it is intentionally parked, `) +
         `or close it if it is no longer required.`,
       blockerIssueId: deadEnd.id,
     });
@@ -757,11 +827,24 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     // ownerCandidates so unassigned issues don't sit silently forever.
     if (reviewIssue.assigneeUserId) return null;
 
+    // The assignee split stays the OUTER condition: an unassigned row needs the "no
+    // assignee" fact and the "assign an owner" instruction whether or not a stale card is
+    // what un-suppressed it. Leading on staleness told an unassigned row to "record the
+    // current owner" -- an owner that by construction does not exist.
+    const staleInteraction = hasStaleInteraction(reviewIssue);
     const reason = reviewIssue.assigneeAgentId
-      ? `${issueLabel(reviewIssue)} is in review with an agent assignee but no participant, interaction, approval, user owner, wake, active run, recent open pull request, or recovery issue owning the next action.`
+      ? staleInteraction
+        ? `${issueLabel(reviewIssue)} is in review with an agent assignee but no live action path — its pending issue-thread interaction is older than 24h.`
+        : `${issueLabel(reviewIssue)} is in review with an agent assignee but no participant, interaction, approval, user owner, wake, active run, recent open pull request, or recovery issue owning the next action.`
+      : staleInteraction
+      ? `${issueLabel(reviewIssue)} is in review with no assignee and no live action path — its pending issue-thread interaction is older than 24h.`
       : `${issueLabel(reviewIssue)} is in review with no assignee and no participant, interaction, approval, user owner, wake, active run, recent open pull request, or recovery issue owning the next action.`;
     const recommendedAction = reviewIssue.assigneeAgentId
-      ? `Review ${issueLabel(reviewIssue)} and make the next action explicit: add a reviewer/interaction or request a review on its linked pull request, return it to active work with a change request, mark it done if accepted, or open a bounded recovery issue.`
+      ? staleInteraction
+        ? `Resolve or withdraw ${issueLabel(reviewIssue)}'s stale interaction, then record the current owner and the next action.`
+        : `Review ${issueLabel(reviewIssue)} and make the next action explicit: add a reviewer/interaction or request a review on its linked pull request, return it to active work with a change request, mark it done if accepted, or open a bounded recovery issue.`
+      : staleInteraction
+      ? `Assign ${issueLabel(reviewIssue)} to a clear owner from the project / chain-of-command, then resolve or withdraw its stale interaction, or move it back to an active status with a change request.`
       : `Assign ${issueLabel(reviewIssue)} to a clear owner from the project / chain-of-command, or move it back to an active status with a change request.`;
 
     return finding({
@@ -816,16 +899,23 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     }
 
     if (blocker.status === "backlog" && blocker.assigneeAgentId) {
+      const stale = hasStaleInteraction(blocker);
       return finding({
         issue: source,
         state: "blocked_by_assigned_backlog_issue",
-        reason: `${issueLabel(source)} is blocked by assigned backlog issue ${issueLabel(blocker)} with no wake, active run, human owner, interaction, approval, monitor, or recovery issue owning the next action.`,
+        reason: stale
+          ? `${issueLabel(source)} is blocked by assigned backlog issue ${issueLabel(blocker)} with no live action path — its issue-thread interaction has been pending over 24h.`
+          : `${issueLabel(source)} is blocked by assigned backlog issue ${issueLabel(blocker)} with no wake, active run, human owner, interaction, approval, monitor, or recovery issue owning the next action.`,
         dependencyPath,
         recoveryIssue: blocker,
         recommendedOwnerCandidateAgentIds: ownerCandidates.map((candidate) => candidate.agentId),
         recommendedOwnerCandidates: ownerCandidates,
         recommendedAction:
-          `Review ${issueLabel(blocker)} and either move it to todo so the assignee wakes, assign a human owner or interaction if it is intentionally parked, or remove it from ${issueLabel(source)}'s blockers if it is no longer required.`,
+          `Review ${issueLabel(blocker)} and either move it to todo so the assignee wakes, ` +
+          (stale
+            ? `resolve or withdraw its stale interaction and record the current owner, `
+            : `assign a human owner or interaction if it is intentionally parked, `) +
+          `or remove it from ${issueLabel(source)}'s blockers if it is no longer required.`,
         blockerIssueId: blocker.id,
       });
     }

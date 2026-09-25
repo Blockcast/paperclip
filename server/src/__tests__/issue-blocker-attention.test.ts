@@ -1055,6 +1055,163 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     });
   });
 
+  // BLO-22660: the blocked-inbox map is the OPERATOR-FACING producer of the same classifier
+  // the recovery sweep drives, and it selected `createdAt` and then dropped it building the
+  // input, so a 32-day card read as a live waiting path here forever while the sweep aged the
+  // identical card out. Tests are not typechecked in this package (see tsconfig.typecheck.json),
+  // so the required-key guard on `IssueLivenessPendingInteractionInput` binds the production
+  // producers but cannot bind this file -- which is exactly why the behavioural pin lives here.
+  // Both arms are asserted: without the fresh arm the stale arm passes vacuously on a producer
+  // that never suppressed anything.
+  it("ages a stale pending interaction out of blocked-inbox attention (BLO-22660)", async () => {
+    const { companyId, agentId } = await createCompany("BIS");
+
+    const cardAge = async (createdAt: Date) => {
+      const reviewId = await insertIssue({
+        companyId,
+        identifier: `BIS-${createdAt.getTime()}`,
+        title: "Review behind a card",
+        status: "in_review",
+        assigneeAgentId: agentId,
+        executionState: null,
+      });
+      const interactionId = randomUUID();
+      await db.insert(issueThreadInteractions).values({
+        id: interactionId,
+        companyId,
+        issueId: reviewId,
+        kind: "request_confirmation",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        createdAt,
+        payload: { version: 1, prompt: "Accept?" },
+      });
+      const rows = await svc.list(companyId, { attention: "blocked" });
+      return { attention: rows.find((row) => row.id === reviewId)?.blockedInboxAttention ?? null, interactionId };
+    };
+
+    const { attention: fresh, interactionId: freshCardId } = await cardAge(new Date(Date.now() - 60_000));
+    const { attention: stale, interactionId: staleCardId } = await cardAge(new Date(Date.now() - 25 * 60 * 60 * 1000));
+
+    // A fresh card genuinely does own the next action, and the board is genuinely the owner.
+    expect(fresh).toMatchObject({
+      state: "awaiting_decision",
+      reason: "pending_board_decision",
+      severity: "medium",
+      owner: { type: "board" },
+    });
+    expect(fresh?.interactionId).toBe(freshCardId);
+    // A card nobody has answered in 25h does not. The row must stop naming the board as the
+    // owner of a next action it has not taken.
+    expect(stale).toMatchObject({
+      state: "needs_attention",
+      reason: "in_review_without_action_path",
+      severity: "high",
+    });
+    expect(stale?.owner.type).not.toBe("board");
+    // The stale row's recommended action is "resolve or withdraw the card", so the card it
+    // means must be named. Dropping the row from the loop left this null while the action
+    // text still told the operator to go withdraw something it declined to identify.
+    expect(stale?.interactionId).toBe(staleCardId);
+  });
+
+  // BLO-22660: the pin above is the SELF form -- the stale card sits on the row being
+  // listed, so keying the lookup on the source id happens to work. Every dependency-path
+  // form evaluates staleness on the recovery issue instead, which is a different row, and
+  // `blocked_by_assigned_backlog_issue` is never self-form at all: a blocker cannot be its
+  // own blocked issue, so that state missed 100% of the time while the self-form test stayed
+  // green. Pin the cross-row shape: card on the blocker, finding on the source.
+  it("names a stale card that sits on the blocker, not the listed row (BLO-22660)", async () => {
+    const { companyId, agentId } = await createCompany("BIX");
+    const sourceId = await insertIssue({
+      companyId,
+      identifier: "BIX-1",
+      title: "Blocked by a blocker holding a stale card",
+      status: "blocked",
+    });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "BIX-2",
+      title: "Parked blocker behind a stale card",
+      status: "backlog",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: sourceId });
+
+    const staleCardId = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id: staleCardId,
+      companyId,
+      issueId: blockerId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      createdAt: new Date(Date.now() - 25 * 60 * 60 * 1000),
+      payload: { version: 1, prompt: "Accept?" },
+    });
+
+    const rows = await svc.list(companyId, { attention: "blocked" });
+    const attention = rows.find((row) => row.id === sourceId)?.blockedInboxAttention ?? null;
+
+    expect(attention).toMatchObject({
+      state: "needs_attention",
+      reason: "blocked_by_assigned_backlog_issue",
+      recoveryIssue: { id: blockerId },
+    });
+    // The card the action text tells the operator to withdraw lives on the blocker. Keying
+    // the lookup on the listed row's id returned null here while the prose still said
+    // "resolve or withdraw its stale interaction".
+    expect(attention?.interactionId).toBe(staleCardId);
+  });
+
+  // BLO-22660: the ageing rule is deliberately asymmetric -- interactions age, approvals do
+  // not -- and that asymmetry is only correct while the classifier and this ladder agree
+  // about which paths age. Pin the pairing: a row carrying BOTH a stale card and a pending
+  // approval is still owned by the board via the approval, so it must not fall through to
+  // the stale-card finding. This fails if a later change ages approvals in one half only,
+  // which is the precise shape of the defect this PR fixed twice.
+  it("keeps a row with a stale card but a live approval on the approval path (BLO-22660)", async () => {
+    const { companyId, agentId } = await createCompany("BIA");
+    const reviewId = await insertIssue({
+      companyId,
+      identifier: "BIA-1",
+      title: "Review with a stale card and a live approval",
+      status: "in_review",
+      assigneeAgentId: agentId,
+      executionState: null,
+    });
+    await db.insert(issueThreadInteractions).values({
+      id: randomUUID(),
+      companyId,
+      issueId: reviewId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      createdAt: new Date(Date.now() - 25 * 60 * 60 * 1000),
+      payload: { version: 1, prompt: "Accept?" },
+    });
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "request_board_approval",
+      status: "pending",
+      requestedByAgentId: agentId,
+      payload: { title: "Decide this" },
+    });
+    await db.insert(issueApprovals).values({ companyId, issueId: reviewId, approvalId });
+
+    const rows = await svc.list(companyId, { attention: "blocked" });
+    const attention = rows.find((row) => row.id === reviewId)?.blockedInboxAttention ?? null;
+
+    expect(attention).toMatchObject({
+      state: "awaiting_decision",
+      reason: "pending_board_decision",
+      owner: { type: "board" },
+      approvalId,
+    });
+  });
+
   it("classifies recovery issues and missing successful-run dispositions", async () => {
     const { companyId, agentId } = await createCompany("BID");
     const sourceId = await insertIssue({ companyId, identifier: "BID-1", title: "Stopped source", status: "blocked" });

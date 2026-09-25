@@ -166,7 +166,7 @@ import {
   type RoutineSchedulerHeartbeatIssue,
   type SchedulerHeartbeatAddComment,
 } from "./recovery/routine-scheduler-heartbeat.js";
-import { classifyIssueGraphLiveness, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
+import { classifyIssueGraphLiveness, PENDING_INTERACTION_MAX_AGE_MS, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
 import {
   ACTIVE_RECOVERY_ACTION_STATUSES,
   BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES,
@@ -5041,6 +5041,7 @@ async function listIssueBlockedInboxAttentionMap(
     companyId,
     issueId: row.issueId,
     status: "pending",
+    createdAt: row.createdAt,
   }));
   const pendingApprovals = (approvalRows as BlockedInboxApprovalRow[]).map((row) => ({
     companyId,
@@ -5068,6 +5069,13 @@ async function listIssueBlockedInboxAttentionMap(
       return entries;
     });
 
+  // BLO-22660: one clock for both staleness passes. The classifier below and the ladder's
+  // `interactionCutoffMs` judge the same cards against the same threshold, so reading the
+  // clock twice lets a card that crosses 24h between them be fresh to one and stale to the
+  // other. recovery/service.ts shares a single `now` through `sharedInput` for exactly this
+  // reason; this makes the same property hold here by construction rather than by the gap
+  // between the two reads being small.
+  const now = new Date();
   const findings = classifyIssueGraphLiveness({
     issues: graphIssues.map((issue) => ({
       id: issue.id,
@@ -5108,15 +5116,36 @@ async function listIssueBlockedInboxAttentionMap(
     pendingInteractions,
     pendingApprovals,
     openRecoveryIssues,
-    now: new Date(),
+    now,
   });
   const findingByIssueId = new Map<string, IssueLivenessFinding>();
   for (const finding of findings) {
     if (!findingByIssueId.has(finding.issueId)) findingByIssueId.set(finding.issueId, finding);
   }
 
+  // BLO-22660: live cards only. This map short-circuits the reason ladder below *ahead of*
+  // the classifier finding, so feeding `createdAt` to the classifier is necessary but not
+  // sufficient on this surface -- a stale card would still be reported as
+  // `awaiting_decision` / `pending_board_decision` / medium / owner "Board", i.e. the row
+  // reads as owned by someone who has not answered in weeks. That is the exact claim this
+  // issue exists to stop making, so a provably-stale card falls through to the finding
+  // branch and the operator gets `in_review_without_action_path` naming the stale card.
+  // The stale row is kept in `staleInteractionByIssueId` rather than dropped, because that
+  // finding's recommended action is "resolve or withdraw the card" -- an instruction that
+  // needs the card's id to be actionable. Both maps are built in one pass so a row can only
+  // ever land in exactly one of them.
+  // Pending approvals are deliberately NOT aged the same way: the classifier does not age
+  // them either, and bounding them is separate work with its own evidence.
+  const interactionCutoffMs = now.getTime() - PENDING_INTERACTION_MAX_AGE_MS;
   const interactionByIssueId = new Map<string, BlockedInboxInteractionRow>();
+  const staleInteractionByIssueId = new Map<string, BlockedInboxInteractionRow>();
   for (const row of interactionRows as BlockedInboxInteractionRow[]) {
+    // Fail open exactly as the classifier does: only a card we can prove is stale is dropped.
+    const createdAtMs = row.createdAt instanceof Date ? row.createdAt.getTime() : NaN;
+    if (Number.isFinite(createdAtMs) && createdAtMs <= interactionCutoffMs) {
+      if (!staleInteractionByIssueId.has(row.issueId)) staleInteractionByIssueId.set(row.issueId, row);
+      continue;
+    }
     if (!interactionByIssueId.has(row.issueId)) interactionByIssueId.set(row.issueId, row);
   }
   const approvalByIssueId = new Map<string, BlockedInboxApprovalRow>();
@@ -5285,6 +5314,15 @@ async function listIssueBlockedInboxAttentionMap(
         leafIssue: issueRef(leaf),
         recoveryIssue: issueRef(issuesById.get(finding.recoveryIssueId)),
         sampleIssueIdentifier: leaf?.identifier ?? finding.identifier,
+        // BLO-22660: when this row fell through because its only waiting path was a stale
+        // card, `recommendedAction` tells the operator to resolve or withdraw that card.
+        // Name it. Key on `recoveryIssueId`, never on `row.id`: all three stale-aware states
+        // evaluate `hasStaleInteraction` on the recovery issue (`recoveryIssue: deadEnd` /
+        // `reviewIssue` / `blocker` in issue-graph-liveness.ts), which is a different row from
+        // the source in every dependency-path form -- and always different for
+        // `blocked_by_assigned_backlog_issue`, since a blocker is never its own blocked issue.
+        // Null on the finding states that have no stale card, which have no id to point at.
+        interactionId: staleInteractionByIssueId.get(finding.recoveryIssueId)?.id ?? null,
       }));
       continue;
     }
