@@ -8,6 +8,7 @@ if [[ ! "$marker" =~ ^[0-9a-f]{64}$ ]]; then
   echo "PAPERCLIP_APPROVAL_PLAN_SHA256 must be 64 lowercase hex characters" >&2
   exit 2
 fi
+deployment="${PAPERCLIP_API_DEPLOYMENT:-paperclip-api}"
 deployed_commit="${PAPERCLIP_DEPLOYED_COMMIT:-}"
 if [[ -n "$deployed_commit" && ! "$deployed_commit" =~ ^[0-9a-f]{40}$ ]]; then
   echo "PAPERCLIP_DEPLOYED_COMMIT must be 40 lowercase hex characters when set" >&2
@@ -29,29 +30,30 @@ cat >"$rendered"
 
 EXTRACT_UNSTAMPED_RUBY_CODE='
 marker = ARGV.fetch(0)
-deployed_commit = ARGV.fetch(2)
-docs = YAML.load_stream(File.read(ARGV.fetch(1))).compact
+deployment_name = ARGV.fetch(1)
+docs = YAML.load_stream(File.read(ARGV.fetch(2))).compact
+deployed_commit = ARGV.fetch(3)
 matches = docs.select do |doc|
   doc.is_a?(Hash) &&
     doc["apiVersion"] == "apps/v1" &&
     doc["kind"] == "Deployment" &&
-    doc.dig("metadata", "name") == "paperclip-api"
+    doc.dig("metadata", "name") == deployment_name
 end
-abort "expected exactly one apps/v1 Deployment/paperclip-api, got #{matches.length}" unless matches.length == 1
+abort "expected exactly one apps/v1 Deployment/#{deployment_name}, got #{matches.length}" unless matches.length == 1
 
 deployment = matches.fetch(0)
 template_metadata = deployment.dig("spec", "template", "metadata")
-abort "Deployment/paperclip-api has no pod-template metadata" unless template_metadata.is_a?(Hash)
+abort "Deployment/#{deployment_name} has no pod-template metadata" unless template_metadata.is_a?(Hash)
 annotations = template_metadata["annotations"]
 if annotations
   existing = annotations["paperclip.blockcast.net/approval-plan-sha256"]
   if existing && existing != marker
-    abort "Deployment/paperclip-api already carries a different approval-plan marker"
+    abort "Deployment/#{deployment_name} already carries a different approval-plan marker"
   end
   annotations.delete("paperclip.blockcast.net/approval-plan-sha256")
   existing_commit = annotations["paperclip.blockcast.net/deployed-commit"]
   if !deployed_commit.empty? && existing_commit && existing_commit != deployed_commit
-    abort "Deployment/paperclip-api already carries a different deployed-commit annotation"
+    abort "Deployment/#{deployment_name} already carries a different deployed-commit annotation"
   end
 end
 if !deployed_commit.empty?
@@ -63,7 +65,7 @@ end
 deployment.dig("spec", "template").delete("metadata") if template_metadata.empty?
 puts YAML.dump(deployment)
 '
-ruby -ryaml -e "$EXTRACT_UNSTAMPED_RUBY_CODE" "$marker" "$rendered" "$deployed_commit" >"$unstamped"
+ruby -ryaml -e "$EXTRACT_UNSTAMPED_RUBY_CODE" "$marker" "$deployment" "$rendered" "$deployed_commit" >"$unstamped"
 
 deploy_namespace="${PAPERCLIP_DEPLOY_NAMESPACE:-default}"
 
@@ -92,37 +94,38 @@ canonical_unstamped="$(
 )"
 rendered_sha256="$(printf '%s' "$canonical_unstamped" | sha256sum | awk '{print $1}')"
 if [[ "$rendered_sha256" != "$marker" ]]; then
-  echo "Deployment/paperclip-api does not match approved plan ${marker}; rendered ${rendered_sha256}" >&2
+  echo "Deployment/${deployment} does not match approved plan ${marker}; rendered ${rendered_sha256}" >&2
   exit 1
 fi
 
 STAMP_RUBY_CODE='
 marker = ARGV.fetch(0)
-deployed_commit = ARGV.fetch(2)
-docs = YAML.load_stream(File.read(ARGV.fetch(1))).compact
+deployment_name = ARGV.fetch(1)
+docs = YAML.load_stream(File.read(ARGV.fetch(2))).compact
+deployed_commit = ARGV.fetch(3)
 matches = docs.select do |doc|
   doc.is_a?(Hash) &&
     doc["apiVersion"] == "apps/v1" &&
     doc["kind"] == "Deployment" &&
-    doc.dig("metadata", "name") == "paperclip-api"
+    doc.dig("metadata", "name") == deployment_name
 end
-abort "expected exactly one apps/v1 Deployment/paperclip-api, got #{matches.length}" unless matches.length == 1
+abort "expected exactly one apps/v1 Deployment/#{deployment_name}, got #{matches.length}" unless matches.length == 1
 
 deployment = matches.fetch(0)
 template_metadata = deployment.dig("spec", "template", "metadata")
-abort "Deployment/paperclip-api has no pod-template metadata" unless template_metadata.is_a?(Hash)
+abort "Deployment/#{deployment_name} has no pod-template metadata" unless template_metadata.is_a?(Hash)
 annotations = (template_metadata["annotations"] ||= {})
 existing = annotations["paperclip.blockcast.net/approval-plan-sha256"]
 if existing && existing != marker
-  abort "Deployment/paperclip-api already carries a different approval-plan marker"
+  abort "Deployment/#{deployment_name} already carries a different approval-plan marker"
 end
 existing_commit = annotations["paperclip.blockcast.net/deployed-commit"]
 if !deployed_commit.empty? && existing_commit && existing_commit != deployed_commit
-  abort "Deployment/paperclip-api already carries a different deployed-commit annotation"
+  abort "Deployment/#{deployment_name} already carries a different deployed-commit annotation"
 end
 annotations["paperclip.blockcast.net/approval-plan-sha256"] = marker
 annotations["paperclip.blockcast.net/deployed-commit"] = deployed_commit unless deployed_commit.empty?
 
 docs.each { |doc| puts YAML.dump(doc) }
 '
-ruby -ryaml -e "$STAMP_RUBY_CODE" "$marker" "$rendered" "$deployed_commit"
+ruby -ryaml -e "$STAMP_RUBY_CODE" "$marker" "$deployment" "$rendered" "$deployed_commit"

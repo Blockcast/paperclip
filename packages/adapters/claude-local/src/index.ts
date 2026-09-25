@@ -4,12 +4,19 @@ export const type = "claude_local";
 export const label = "Claude Code";
 
 export const SANDBOX_INSTALL_COMMAND = "npm install -g @anthropic-ai/claude-code";
+// Healthy CLI first-token stalls have recovered as late as 278 minutes. Keep
+// an additional 82-minute margin while bounding truly silent processes.
+export const DEFAULT_CLAUDE_LOCAL_TIMEOUT_SEC = 6 * 60 * 60;
 
 export const models = [
   { id: "claude-opus-4-8", label: "Claude Opus 4.8" },
+  { id: "claude-opus-5-5", label: "Claude Opus 5.5" },
+  { id: "claude-opus-5-5[1m]", label: "Claude Opus 5.5 (1M)" },
   { id: "claude-opus-5", label: "Claude Opus 5" },
   { id: "claude-opus-5[1m]", label: "Claude Opus 5 (1M)" },
   { id: "claude-sonnet-5", label: "Claude Sonnet 5" },
+  { id: "claude-fable-5-1", label: "Claude Fable 5.1" },
+  { id: "claude-fable-5-1[1m]", label: "Claude Fable 5.1 (1M)" },
   { id: "claude-fable-5", label: "Claude Fable 5" },
   { id: "claude-mythos-5", label: "Claude Mythos 5" },
   { id: "claude-opus-4-7", label: "Claude Opus 4.7" },
@@ -65,7 +72,7 @@ ACP fields (only when engine="acp"):
 - warmHandleIdleMs (number, optional, default 0): keep the ACP process warm for this many ms after a successful run
 
 Operational fields:
-- timeoutSec (number, optional): run timeout in seconds
+- timeoutSec (number, optional): run timeout in seconds (local Claude CLI default: 21600 / 6 hours; legacy stored zero also uses this default). SSH keeps its historical unlimited default. Use a negative value for an explicit local or sandbox opt-out; remote sandboxes otherwise retain their execution-target backstop.
 - graceSec (number, optional): SIGTERM grace period in seconds
 
 Notes:

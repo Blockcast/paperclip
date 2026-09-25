@@ -18,6 +18,9 @@ const mockAgentService = vi.hoisted(() => ({
 
 const mockAccessService = vi.hoisted(() => ({
   ensureMembership: vi.fn(),
+  // PEN-3252: the export routes resolve a workspace-runtime viewer so the bundle discloses the same
+  // material the response boundary does. Defaults to DENY, which is what a CEO agent actually gets.
+  decide: vi.fn(async () => ({ allowed: false })),
 }));
 
 const mockBudgetService = vi.hoisted(() => ({
@@ -321,8 +324,15 @@ describe.sequential("company portability routes", () => {
       expect(res.body.rootPath).toBe("paperclip");
     }
     expect(mockCompanyPortabilityService.exportBundle).toHaveBeenCalledTimes(2);
-    expect(mockCompanyPortabilityService.exportBundle).toHaveBeenNthCalledWith(1, companyId, exportRequest);
-    expect(mockCompanyPortabilityService.exportBundle).toHaveBeenNthCalledWith(2, companyId, exportRequest);
+    // PEN-3252. `assertSameCompanyCeoAgentOrBoard` admits this principal, but `workspace_runtime:read`
+    // does not — so the bundle must be built withheld. Pinned on BOTH export routes: they are
+    // separate handlers, and wiring the entitlement into one of them is the shape of this defect.
+    expect(mockCompanyPortabilityService.exportBundle).toHaveBeenNthCalledWith(1, companyId, exportRequest, {
+      revealWorkspaceRuntime: false,
+    });
+    expect(mockCompanyPortabilityService.exportBundle).toHaveBeenNthCalledWith(2, companyId, exportRequest, {
+      revealWorkspaceRuntime: false,
+    });
   });
 
   it.sequential("allows board users to export through legacy and CEO-safe bundle routes", async () => {

@@ -52,11 +52,16 @@ RUN --mount=type=cache,target=/root/.local/share/pnpm/store,sharing=locked \
 
 FROM base AS vendor
 WORKDIR /vendor
-# Pinned commit SHAs for the kkroo forks of the two k8s-Job adapters.
-# Bump these by pushing the fork branch and updating the ARG. Public repos,
-# so no auth required at clone time.
+# The two k8s-Job adapters are sourced differently as of 2026-08-06:
 #
-# Each repo's build → `pnpm pack` (or `npm pack`) produces the .tgz the
+#   claude_k8s   — VENDORED IN-TREE at vendor/paperclip-adapter-claude-k8s/.
+#                  No clone, no pin. Edit the source and open a PR.
+#   opencode_k8s — still cloned from the kkroo fork at the pinned
+#                  ARG OPENCODE_K8S_REF below. Bump it by pushing the fork
+#                  branch and updating the ARG. Public repo, so no auth is
+#                  required at clone time.
+#
+# Each adapter's build → `pnpm pack` (or `npm pack`) produces the .tgz the
 # production stage installs. We never commit the tgz; it's reproduced on
 # every image build.
 # Re-pinned 2026-06-03 (BLO-8909) to kkroo/paperclip-adapter-opencode-k8s
@@ -176,7 +181,23 @@ WORKDIR /vendor
 # execute/job-manifest suite 230/230 and typecheck pass.
 # Bumped 2026-08-04 to 3ad3370: exclude the exact current lifecycle Job from
 # live-Job concurrency conflicts while preserving distinct-Job exclusion.
-ARG CLAUDE_K8S_REF=3ad33702052f357ec2b31b7d3051e89ed1ed4875
+#
+# ---------------------------------------------------------------------------
+# 2026-08-06 — CLAUDE_K8S_REF is RETIRED. The adapter is no longer cloned from
+# an external fork at a pinned SHA; its source now lives in this repository at
+# vendor/paperclip-adapter-claude-k8s/ and is built from there (see the
+# `COPY vendor/paperclip-adapter-claude-k8s` below).
+#
+# The changelog above is kept as the history of how that vendored source got
+# to its current state — every entry describes a commit that is now in-tree.
+#
+# Vendored under board approval bf83f96d (BLO-17980 / BLO-22506 / BLO-22514):
+# the fix site for a critical credential-exposure finding sat in a repository
+# outside our GitHub App installation, so we could neither PR it nor run it
+# through our own CI. To change adapter behaviour now, edit the vendored source
+# and open an ordinary PR. Provenance, upstream SHAs, license and an integrity
+# manifest: vendor/paperclip-adapter-claude-k8s/PROVENANCE.md
+# ---------------------------------------------------------------------------
 # Re-pinned 2026-06-14 to kkroo/paperclip-adapter-opencode-k8s master a533d11
 # (was 168688e): BLO-10448 — a transient k8s status-read error during the
 # completion poll was mislabeled as a deadline, surfacing as the bogus
@@ -357,10 +378,22 @@ ARG CLAUDE_K8S_REF=3ad33702052f357ec2b31b7d3051e89ed1ed4875
 # Bumped 2026-08-08 to 6dca020 (#56/#58): retain those fixes and restore the
 # PEN-1305 shell-command parser on the current adapter line. The vendor build
 # runs the upstream env-guard and execute suites against this exact tree.
-# Bumped 2026-08-08 to ed03316 (#60): reattach to an exact persisted lifecycle
-# Job after worker recovery instead of recreating its prompt Secret and Job.
-# Running and terminal Jobs are both recovered by name, UID, and run label.
-ARG OPENCODE_K8S_REF=ed0331690432d3c37cd7ed190ca1066c840b30c3
+# Bumped 2026-09-09 to 87a865d: add optional Caveman/Penstock and Ponytail
+# launcher wiring plus server-side credential-inheritance hardening while
+# retaining the persisted lifecycle recovery above.
+# Re-pinned 2026-09-10 to 2075ae1 (BLO-33204): CONTENT-IDENTICAL to 87a865d,
+# which was that PR's branch head and was orphaned when #62 squash-merged.
+# `git diff 87a865d 2075ae1` is empty and both carry tree
+# cd60d8476f3de8a9a8a1bafd741e468de32fae3c, so the Caveman/Penstock and
+# Ponytail wiring and the credential-inheritance hardening above are preserved
+# exactly — this moves the pin onto a reachable ref, it does not move the code.
+# `git clone` fetches only ref-reachable objects, so the orphaned SHA broke
+# every build that missed the vendor-stage cache with
+# `fatal: unable to read tree (87a865de...)`. Builds reusing a pre-force-push
+# vendor layer kept passing, which is why the break looked commit-timed rather
+# than cache-timed. scripts/check-opencode-k8s-pin-reachable.mjs now fails a PR
+# for an unreachable pin instead of waiting for a cache miss to find it.
+ARG OPENCODE_K8S_REF=2075ae1ba249e97c49a77386c81a9d88b22c481d
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest
@@ -417,12 +450,12 @@ RUN cd /vendor/adapter-utils-src \
 # rebuild we still re-resolve every transitive dep. The pnpm and npm
 # caches let those resolutions reuse tarballs from prior builds.
 
+# The claude_k8s adapter is built from in-tree vendored source (no clone, and
+# therefore no gh_token needed for it — opencode_k8s below still clones).
+COPY vendor/paperclip-adapter-claude-k8s /vendor/claude-k8s-src
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
-    --mount=type=secret,id=gh_token \
-    GH="$(cat /run/secrets/gh_token)" \
- && git -c "url.https://x-access-token:${GH}@github.com/.insteadOf=https://github.com/" \
-      clone https://github.com/kkroo/paperclip-adapter-claude-k8s.git claude-k8s \
-  && cd claude-k8s && git checkout "${CLAUDE_K8S_REF}" && rm -rf .git \
+    cd /vendor/claude-k8s-src \
+  && rm -rf node_modules dist \
   && npm ci \
   && npm install --no-save /vendor/adapter-utils.tgz \
   && npm run build \
@@ -449,6 +482,101 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
 # (the binary reads GITHUB_PERSONAL_ACCESS_TOKEN from env at startup).
 # Pin to a release tag — bump deliberately, not via :latest.
 FROM ghcr.io/github/github-mcp-server:v1.0.3 AS github-mcp
+
+# BLO-32824: this stage previously reused `gh_token`, which is
+# `PAPERCLIP_BOARD_TOKEN` for the private `kkroo/*` vendor clone and cannot read
+# the Blockcast Penstock repository. Keep the launcher credential separate: an
+# absent or unreadable `penstock_runtime_token` must fail the build rather than
+# silently producing an agent image without the runtime.
+
+# The Penstock launcher is deliberately kept as a standalone Node script. It is
+# fetched at an immutable core commit with a credential dedicated to that
+# private repository. Do not reuse `gh_token`: that secret is
+# `PAPERCLIP_BOARD_TOKEN`, which is scoped to the private `kkroo/*` vendor
+# clone. The launcher credential is mounted only for this build step, and the
+# content digest prevents a refetch from silently changing the executable.
+FROM base AS penstock-agent-runtime
+USER root
+ARG PENSTOCK_RUNTIME_REF=9878ca2499ea8a8e24ec7d8bcf3222db65ac014a
+ARG PENSTOCK_RUNTIME_SHA256=961f38a5901fe5f775188d99ca542781f8dddec42f1e2ad0100a62b6bf409324
+RUN --mount=type=secret,id=penstock_runtime_token \
+    set -eu; \
+    test -s /run/secrets/penstock_runtime_token || { \
+      echo "penstock_runtime_token is required to package the pinned launcher" >&2; \
+      exit 1; \
+    }; \
+    verify_sha256() { \
+      expected="$1"; \
+      file="$2"; \
+      actual="$(sha256sum "${file}" | awk '{print $1}')"; \
+      if [ "${actual}" != "${expected}" ]; then \
+        echo "SHA256 mismatch for ${file}: expected ${expected}, received ${actual}" >&2; \
+        return 1; \
+      fi; \
+    }; \
+    install -d -m 0755 /opt/penstock/bin; \
+    { printf 'Authorization: Bearer '; cat /run/secrets/penstock_runtime_token; printf '\n'; } | \
+      curl --fail --location --retry 5 --header @- \
+      "https://raw.githubusercontent.com/Blockcast/penstock-llm-proxy-core/${PENSTOCK_RUNTIME_REF}/scripts/penstock-agent-runtime.mjs" \
+      -o /opt/penstock/bin/penstock-agent-runtime.mjs; \
+    verify_sha256 "${PENSTOCK_RUNTIME_SHA256}" /opt/penstock/bin/penstock-agent-runtime.mjs; \
+    chmod 0555 /opt/penstock/bin/penstock-agent-runtime.mjs
+
+# Caveman is a short-lived loopback proxy per Paperclip run. Install only the
+# proxy binary from the reviewed release and verify the architecture-specific
+# upstream checksum before it is copied into the production image.
+FROM base AS caveman-proxy
+USER root
+ARG CAVEMAN_RELEASE=bin-v1.1.6
+RUN set -eu; \
+    verify_sha256() { \
+      expected="$1"; \
+      file="$2"; \
+      actual="$(sha256sum "${file}" | awk '{print $1}')"; \
+      if [ "${actual}" != "${expected}" ]; then \
+        echo "SHA256 mismatch for ${file}: expected ${expected}, received ${actual}" >&2; \
+        return 1; \
+      fi; \
+    }; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) asset=caveman-proxy_linux_amd64; expected_sha256=5085c65788a569bf978868084bc849261a2acef8c334124d6fc7240a3f83a35c ;; \
+      arm64) asset=caveman-proxy_linux_arm64; expected_sha256=6781f31728c403805e2a93af5be9e9535e4b8b1607650d8e0fbbb4b5a9b8ae52 ;; \
+      *) echo "unsupported Caveman architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac; \
+    curl --fail --location --retry 5 \
+      "https://github.com/JuliusBrussee/caveman/releases/download/${CAVEMAN_RELEASE}/${asset}" \
+      -o /usr/local/bin/caveman-proxy; \
+    verify_sha256 "${expected_sha256}" /usr/local/bin/caveman-proxy; \
+    chmod 0555 /usr/local/bin/caveman-proxy
+
+# Claude Code accepts a local marketplace directory. Bake Ponytail from the
+# reviewed commit rather than registering a moving GitHub branch at pod boot.
+FROM base AS ponytail-marketplace
+USER root
+ARG PONYTAIL_REF=0a4dd63ad4541f4f655c4108a295916f3c1d8fda
+ARG PONYTAIL_HOOKS_SHA256=dd0837e870a8b81eb45ef4adebfc413a48c6daf84329befd897640f731aa0e39
+RUN set -eu; \
+    verify_sha256() { \
+      expected="$1"; \
+      file="$2"; \
+      actual="$(sha256sum "${file}" | awk '{print $1}')"; \
+      if [ "${actual}" != "${expected}" ]; then \
+        echo "SHA256 mismatch for ${file}: expected ${expected}, received ${actual}" >&2; \
+        return 1; \
+      fi; \
+    }; \
+    git clone --no-tags https://github.com/dietrichgebert/ponytail.git /tmp/ponytail; \
+    git -C /tmp/ponytail checkout --detach "${PONYTAIL_REF}"; \
+    test "$(git -C /tmp/ponytail rev-parse HEAD)" = "${PONYTAIL_REF}"; \
+    install -d -m 0755 /opt/penstock/ponytail; \
+    git -C /tmp/ponytail archive --format=tar "${PONYTAIL_REF}" \
+      | tar -x -C /opt/penstock/ponytail; \
+    verify_sha256 "${PONYTAIL_HOOKS_SHA256}" /opt/penstock/ponytail/hooks/claude-codex-hooks.json; \
+    test -f /opt/penstock/ponytail/.claude-plugin/plugin.json; \
+    test -f /opt/penstock/ponytail/.opencode/plugins/ponytail.mjs; \
+    node -e "const fs=require('node:fs');const p=JSON.parse(fs.readFileSync('/opt/penstock/ponytail/.claude-plugin/plugin.json','utf8'));if(p.name!=='ponytail'||p.version!=='4.9.0'){console.error('unexpected Ponytail plugin identity');process.exit(1)}"; \
+    chmod -R a+rX,go-w /opt/penstock/ponytail; \
+    rm -rf /tmp/ponytail
 
 FROM base AS build
 WORKDIR /app
@@ -479,17 +607,18 @@ FROM ${RUNTIME_IMAGE} AS production
 ARG USER_UID=1000
 ARG USER_GID=1000
 WORKDIR /app
-# The kkroo forks of paperclip-adapter-claude-k8s /
-# paperclip-adapter-opencode-k8s are built from source in the `vendor` stage
-# above and installed here.
+# Both k8s-Job adapters are built from source in the `vendor` stage above and
+# installed here. claude_k8s builds from in-tree vendored source; opencode_k8s
+# builds from the pinned kkroo fork.
 #
 # Do not install a local ccrotate CLI in this image. Paperclip production uses
 # ccrotate-auth-bot / ccrotate-serve as the source of truth; a baked local
 # rotator can read stale PVC state and switch agents onto exhausted accounts.
 # Refresh procedure:
-#   1. push the relevant kkroo fork branch (kkroo/paperclip-adapter-claude-k8s#master,
-#      kkroo/paperclip-adapter-opencode-k8s#master)
-#   2. bump the *_REF ARG in the `vendor` stage
+#   claude_k8s   — edit vendor/paperclip-adapter-claude-k8s/ and open a PR.
+#                  Nothing to pin or bump.
+#   opencode_k8s — push kkroo/paperclip-adapter-opencode-k8s#master, then bump
+#                  OPENCODE_K8S_REF in the `vendor` stage.
 RUN mkdir -p /tmp/paperclip-bundled-adapters
 COPY --from=vendor /vendor/paperclip-adapter-claude-k8s.tgz /tmp/paperclip-bundled-adapters/
 COPY --from=vendor /vendor/paperclip-adapter-opencode-k8s.tgz /tmp/paperclip-bundled-adapters/
@@ -499,6 +628,9 @@ COPY --from=vendor /vendor/paperclip-adapter-opencode-k8s.tgz /tmp/paperclip-bun
 # falling back to whatever npm publishes today.
 COPY --from=vendor /vendor/adapter-utils.tgz /tmp/paperclip-bundled-adapters/
 COPY --from=github-mcp /server/github-mcp-server /usr/local/bin/github-mcp-server
+COPY --from=penstock-agent-runtime /opt/penstock/bin/penstock-agent-runtime.mjs /opt/penstock/bin/penstock-agent-runtime.mjs
+COPY --from=caveman-proxy /usr/local/bin/caveman-proxy /usr/local/bin/caveman-proxy
+COPY --from=ponytail-marketplace /opt/penstock/ponytail /opt/penstock/ponytail
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
   npm install --prefix /opt/paperclip-bundled-adapters --omit=dev --no-save --legacy-peer-deps --cache /root/.npm /tmp/paperclip-bundled-adapters/*.tgz \
   && rm -rf /tmp/paperclip-bundled-adapters \

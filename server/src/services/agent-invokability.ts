@@ -1,4 +1,4 @@
-import type { Db } from "@paperclipai/db";
+import type { Db, DbTransaction } from "@paperclipai/db";
 import { agents } from "@paperclipai/db";
 import { getAgentWorkEligibility, type AgentEligibilityAgent, type AgentOrgChainHealth } from "@paperclipai/shared";
 import { eq } from "drizzle-orm";
@@ -116,7 +116,9 @@ export function evaluateAgentInvokability(
 }
 
 export async function evaluateAgentInvokabilityFromDb(
-  db: Db,
+  // Callers holding an advisory lock MUST pass their own transaction — a second
+  // pool connection here is what convoyed on BLO-34207.
+  db: Db | DbTransaction,
   agent: AgentOrgRow | null | undefined,
 ): Promise<AgentInvokability> {
   if (!agent) return evaluateAgentInvokability(agent, []);

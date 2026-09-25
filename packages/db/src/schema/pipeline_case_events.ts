@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { check, index, jsonb, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
+import { check, index, integer, jsonb, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
 import { agents } from "./agents.js";
 import { companies } from "./companies.js";
 import { pipelineCases } from "./pipeline_cases.js";
@@ -18,6 +18,9 @@ export const pipelineCaseEvents = pgTable(
     runId: uuid("run_id"),
     fromStageId: uuid("from_stage_id").references(() => pipelineStages.id, { onDelete: "set null" }),
     toStageId: uuid("to_stage_id").references(() => pipelineStages.id, { onDelete: "set null" }),
+    // Set for stage-entry and automation-dispatch events. A case can revisit a
+    // stage, so timestamps and random event IDs are not a safe identity.
+    stageGeneration: integer("stage_generation"),
     payload: jsonb("payload").$type<Record<string, unknown>>().notNull().default({}),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

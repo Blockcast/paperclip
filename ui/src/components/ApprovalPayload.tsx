@@ -131,6 +131,12 @@ export function CeoStrategyPayload({ payload }: { payload: Record<string, unknow
 export function BudgetOverridePayload({ payload }: { payload: Record<string, unknown> }) {
   const budgetAmount = typeof payload.budgetAmount === "number" ? payload.budgetAmount : null;
   const observedAmount = typeof payload.observedAmount === "number" ? payload.observedAmount : null;
+  const remainingAmount = typeof payload.remainingAmount === "number" ? payload.remainingAmount : null;
+  const dailyBurn = typeof payload.observedDailyBurn === "number" ? payload.observedDailyBurn : null;
+  const daysRemaining = typeof payload.projectedDaysRemaining === "number"
+    ? payload.projectedDaysRemaining
+    : null;
+  const isWarning = payload.thresholdType === "soft";
   return (
     <div className="mt-3 space-y-1.5 text-sm">
       <PayloadField label="Scope" value={payload.scopeName ?? payload.scopeType} />
@@ -139,6 +145,19 @@ export function BudgetOverridePayload({ payload }: { payload: Record<string, unk
       {(budgetAmount !== null || observedAmount !== null) ? (
         <div className="rounded-md bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
           Limit {budgetAmount !== null ? formatCents(budgetAmount) : "—"} · Observed {observedAmount !== null ? formatCents(observedAmount) : "—"}
+        </div>
+      ) : null}
+      {/*
+        A warn-threshold card is only actionable if it says how long the board has
+        to act. Without the runway line the reader can see that a cap was
+        approached but not whether that means nine days or nine minutes. See
+        BLO-28793.
+      */}
+      {isWarning && remainingAmount !== null ? (
+        <div className="rounded-md bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+          {formatCents(remainingAmount)} remaining
+          {dailyBurn !== null && dailyBurn > 0 ? ` · ${formatCents(Math.round(dailyBurn))}/day` : ""}
+          {daysRemaining !== null ? ` · ~${daysRemaining} day(s) to hard stop` : ""}
         </div>
       ) : null}
       {!!payload.guidance && (

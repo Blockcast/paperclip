@@ -7,9 +7,29 @@
 //
 // This guard is fail-closed and runs on every manifest we build, so a future
 // literal credential breaks the build and the test suite rather than silently
-// shipping. It mirrors the same protection in the external claude_k8s adapter
-// (paperclip-adapter-claude-k8s `job-manifest.ts`), which renders the
-// production agent-job pods.
+// shipping.
+//
+// CORRECTION (BLO-22514). This comment used to claim the guard "mirrors the
+// same protection in the external claude_k8s adapter (job-manifest.ts), which
+// renders the production agent-job pods". That was wrong twice over, and the
+// claim mattered because it asserted coverage on the path that actually builds
+// production agent pods:
+//
+//   1. The adapter is no longer external — it is vendored in-tree at
+//      vendor/paperclip-adapter-claude-k8s/ (PR #1092).
+//   2. What the adapter has is NOT this protection. Its guard
+//      (`isSensitiveEnvName` / `findLiteralSensitiveEnvVarsInPodSpec`) is a
+//      *denylist* — the regex /TOKEN|SECRET|PASSWORD|KEY|CREDENTIAL|AUTH/i —
+//      i.e. precisely the approach the POLICY note below explains cannot hold
+//      this invariant. Calling it "the same protection" as this allowlist
+//      overstated it.
+//
+// Separately, neither guard addresses confidentiality *from the agent process*:
+// both only keep a value from surfacing via `GET Pod`, while a secretKeyRef is
+// still resolved by the kubelet into the container's environment. That gap —
+// agent pods inheriting the server's entire secret env — is closed by
+// vendor/paperclip-adapter-claude-k8s/src/server/inherit-allowlist.ts, which is
+// an allowlist on the same reasoning as this file.
 //
 // POLICY: allowlist, not denylist.
 //

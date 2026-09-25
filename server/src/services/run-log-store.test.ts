@@ -4,6 +4,10 @@ import path from "node:path";
 import os from "node:os";
 import { Readable } from "node:stream";
 import { createDurableRunLogStore } from "./run-log-store.js";
+import {
+  findTerminalResultEventInRunLogTail,
+  readRunLogTerminalTail,
+} from "./run-log-terminal-result.js";
 import type { StorageProvider } from "../storage/types.js";
 
 // In-memory StorageProvider stand-in: durable, survives the "pod roll" (local
@@ -32,6 +36,21 @@ function createMemoryProvider() {
         const err = new Error("Object not found") as Error & { name: string };
         err.name = "NoSuchKey";
         throw err;
+      }
+      if (input.range) {
+        // Faithful to S3, and load-bearing for the EOF tests below: a range
+        // whose start is past the last valid byte is UNSATISFIABLE and real
+        // providers answer 416. `Buffer.subarray` silently returns an empty
+        // buffer instead, so a permissive stand-in here would let the
+        // `bytes=total-total` bug (PEN-3129) pass every test in this file.
+        if (input.range.start >= buf.length || input.range.start > input.range.end) {
+          const err = new Error(
+            `Range ${input.range.start}-${input.range.end} not satisfiable for ${buf.length} bytes`,
+          ) as Error & { name: string; $metadata: { httpStatusCode: number } };
+          err.name = "InvalidRange";
+          err.$metadata = { httpStatusCode: 416 };
+          throw err;
+        }
       }
       const slice = input.range ? buf.subarray(input.range.start, input.range.end + 1) : buf;
       return { stream: Readable.from(slice), contentLength: slice.length };
@@ -120,6 +139,75 @@ describe("createDurableRunLogStore", () => {
     const tail = await store.read(handle, { offset: total - 3, limitBytes: 100 });
     expect(Buffer.byteLength(tail.content, "utf8")).toBe(3);
     expect(tail.nextOffset).toBeUndefined();
+  });
+
+  it("S3 fallback answers an at-EOF read as empty instead of an unsatisfiable range", async () => {
+    // The revalidation read `readRunLogTerminalTail` issues for a log that fits
+    // in the tail window: offset === totalBytes, asking "did anything land after
+    // the size probe?". Both backends floored `end` at `start`, so this built
+    // `bytes=total-total` -- one byte past the end -- which S3 answers with 416
+    // (PEN-3129). Local files tolerated it; S3 did not, and the heartbeat turned
+    // the throw into a silently skipped 429 recovery.
+    const { provider } = createMemoryProvider();
+    const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider, keyPrefix: "p" } });
+    const handle = await store.begin(begin);
+    await store.append(handle, { stream: "stdout", chunk: "terminal-line", ts: "t" });
+    await store.finalize(handle);
+    const full = await store.read(handle);
+    const total = full.totalBytes!;
+    await fs.rm(baseDir, { recursive: true, force: true }); // force the S3 path
+
+    const atEof = await store.read(handle, { offset: total, limitBytes: 256 });
+    expect(atEof.content).toBe("");
+    expect(atEof.totalBytes).toBe(total);
+    expect(atEof.nextOffset).toBeUndefined(); // nothing left to resume from
+    // Past EOF too -- the same clamp produced the same unsatisfiable range.
+    const pastEof = await store.read(handle, { offset: total + 99, limitBytes: 256 });
+    expect(pastEof.content).toBe("");
+    expect(pastEof.totalBytes).toBe(total);
+    expect(pastEof.nextOffset).toBeUndefined();
+  });
+
+  it("local read answers an at-EOF read as empty, identically to the S3 path", async () => {
+    // Same invariant on the backend that tolerated the bad range by accident.
+    // Asserted so the two cannot drift apart again -- that divergence is what
+    // kept the defect invisible to every local-file test.
+    const { provider } = createMemoryProvider();
+    const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });
+    const handle = await store.begin(begin);
+    await store.append(handle, { stream: "stdout", chunk: "line", ts: "t" });
+    const full = await store.read(handle);
+    const total = full.totalBytes!;
+    const atEof = await store.read(handle, { offset: total, limitBytes: 256 });
+    expect(atEof.content).toBe("");
+    expect(atEof.totalBytes).toBe(total);
+    expect(atEof.nextOffset).toBeUndefined();
+  });
+
+  it("recovers a terminal verdict from a SMALL S3-backed log (the PEN-3129 end-to-end case)", async () => {
+    // The population the fix exists for: a 429 refusal dies at num_turns 1, so
+    // its log is far under the tail window, and after an API pod roll the local
+    // file is gone and S3 is the only source. With the unsatisfiable range this
+    // threw, the heartbeat logged a warning and booked `job_failed` anyway.
+    const { provider } = createMemoryProvider();
+    const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider, keyPrefix: "p" } });
+    const handle = await store.begin(begin);
+    const result = JSON.stringify({
+      type: "result",
+      is_error: true,
+      api_error_status: 429,
+      result: "API Error: Request rejected (429)",
+    });
+    await store.append(handle, { stream: "stdout", chunk: `${result}\n`, ts: "2026-09-10T00:00:00Z" });
+    await store.finalize(handle);
+    await fs.rm(baseDir, { recursive: true, force: true }); // pod roll -> S3 only
+
+    const tailRead = await readRunLogTerminalTail((range) => store.read(handle, range));
+    expect(tailRead.kind).toBe("tail");
+    const terminal = findTerminalResultEventInRunLogTail(
+      tailRead.kind === "tail" ? tailRead.tail : "",
+    );
+    expect(terminal?.event.api_error_status).toBe(429);
   });
 
   it("falls back to S3 when the local file vanishes between stat() and open (TOCTOU race)", async () => {

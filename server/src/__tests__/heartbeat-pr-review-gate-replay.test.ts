@@ -196,7 +196,7 @@ describeEmbeddedPostgres(
         `UPDATE "heartbeat_runs" SET status='failed', finished_at=NOW() WHERE status IN ('queued','running')`,
       ));
       await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
-    }, 60_000);
+    });
 
     afterAll(async () => {
       await db?.execute(sql.raw(
@@ -204,7 +204,7 @@ describeEmbeddedPostgres(
       ));
       await db?.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
       await tempDb?.cleanup();
-    }, 60_000);
+    });
 
     function buildApp(reviewerAgentId: string) {
       const app = express();
@@ -353,9 +353,10 @@ describeEmbeddedPostgres(
       expect(wake).toMatchObject({
         status: "queued",
         reason: "github_pr_synchronized",
-        // Delivery-scoped so a redelivery of one push cannot be absorbed into
-        // an unrelated PR's in-flight review (BLO-18953).
-        idempotencyKey: `${TASK_KEY}:github_pr_synchronized:delivery:${FRESH_HEAD_DELIVERY_ID}`,
+        // Head-scoped (PEN-2865) so a redelivery of one push — or a duplicate
+        // delivery of the same head — cannot become a second review, while a
+        // genuinely new head still earns its own key (BLO-18953).
+        idempotencyKey: `${TASK_KEY}:github_pr_synchronized:head:${NEW_HEAD}`,
         payload: expect.objectContaining({
           taskKey: TASK_KEY,
           source: "github",
@@ -409,12 +410,12 @@ describeEmbeddedPostgres(
         {
           id: "older-unrelated-review-1",
           createdAt: new Date(queuedAt - 8 * 60_000),
-          contextSnapshot: { taskKey: "pr_review:Blockcast/onprem-k8s:42" },
+          contextSnapshot: { taskKey: "pr_review:blockcast/onprem-k8s:42" },
         },
         {
           id: "older-unrelated-review-2",
           createdAt: new Date(queuedAt - 4 * 60_000),
-          contextSnapshot: { taskKey: "pr_review:Blockcast/hindsight:7" },
+          contextSnapshot: { taskKey: "pr_review:blockcast/hindsight:7" },
         },
       ];
       const afterIssueWork = { contextSnapshot: { issueId: "unrelated-issue-work" } };

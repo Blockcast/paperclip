@@ -114,3 +114,179 @@ Resolved image ref.
 {{- printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) }}
 {{- end }}
 {{- end }}
+
+{{/*
+Resolved image pull policy.
+
+An explicit `.Values.image.pullPolicy` always wins. When it is left empty the
+policy is derived from whether the image is digest-pinned, because the safe
+answer differs between the two cases and only the chart knows which one it
+rendered:
+
+  digest set   -> IfNotPresent. A digest is content-addressed and cannot be
+                  republished, so re-resolving the manifest on every pod start
+                  cannot pick up new content — it only adds a mandatory network
+                  round-trip to the registry. That registry is
+                  harbor.blockcast.net, whose stateful backend runs on the same
+                  `workload=paperclip` node pool as paperclip itself, so the
+                  round-trip is a correlated failure domain: node churn degrades
+                  Harbor, and degraded Harbor then blocks paperclip from
+                  restarting. Observed three times — BLO-29180 (api 1/2 for
+                  2h06m), BLO-23736 (25-min control-plane outage), BLO-15520
+                  (24 pods in ImagePullBackOff). BLO-29306.
+
+  digest unset -> Always. A floating tag CAN be republished under the same name,
+                  so the manifest must be re-resolved on every start or a
+                  republish silently never lands. Keeping this branch is what
+                  makes the derivation safe to apply chart-wide: it preserves
+                  mutable-tag semantics for the documented manual
+                  `helm upgrade` path, which passes no digest (BLO-21660).
+*/}}
+{{- define "paperclip.imagePullPolicy" -}}
+{{- if .Values.image.pullPolicy }}
+{{- .Values.image.pullPolicy }}
+{{- else if .Values.image.digest }}
+{{- "IfNotPresent" }}
+{{- else }}
+{{- "Always" }}
+{{- end }}
+{{- end }}
+
+{{/* Fail rendering instead of silently disabling an enabled review-gate producer. */}}
+{{- define "paperclip.validateGithubReviewGate" -}}
+{{- if and ((.Values.githubApp).reviewGateEnabled) (not ((.Values.githubApp).reviewGateCaptureEnabled)) -}}
+{{- fail "githubApp.reviewGateEnabled requires githubApp.reviewGateCaptureEnabled=true" -}}
+{{- end -}}
+{{- if (.Values.githubApp).reviewGateCaptureEnabled -}}
+{{- if not (.Values.githubApp).enabled -}}
+{{- fail "githubApp.reviewGateCaptureEnabled requires githubApp.enabled=true" -}}
+{{- end -}}
+{{- if not (gt (len ((.Values.githubApp).reviewGateRepositories)) 0) -}}
+{{- fail "githubApp.reviewGateCaptureEnabled requires at least one githubApp.reviewGateRepositories entry" -}}
+{{- end -}}
+{{- if not (regexMatch "^[0-9]+$" (toString ((.Values.githubApp).reviewGateExpectedAppId))) -}}
+{{- fail "githubApp.reviewGateCaptureEnabled requires a numeric githubApp.reviewGateExpectedAppId" -}}
+{{- end -}}
+{{- if not (regexMatch "^[0-9]+$" (toString ((.Values.githubApp).reviewGateExpectedInstallationId))) -}}
+{{- fail "githubApp.reviewGateCaptureEnabled requires a numeric githubApp.reviewGateExpectedInstallationId" -}}
+{{- end -}}
+{{- if empty ((.Values.githubApp).prReviewGateStatusContext) -}}
+{{- fail "githubApp.reviewGateCaptureEnabled requires githubApp.prReviewGateStatusContext" -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+The API tier must not receive the Penstock org credential. `env.extra` is
+shared by both tiers, so a credential-shaped entry there is a configuration
+error rather than a convenient shortcut. The worker-only `extraEnv` block is
+the reviewed boundary for this binding.
+*/}}
+{{- define "paperclip.validateSharedEnvExtra" -}}
+{{- range $entry := .Values.env.extra -}}
+{{- if eq (toString ($entry.name | default "")) "PENSTOCK_API_KEY" -}}
+{{- fail "env.extra must not define PENSTOCK_API_KEY: bind the Penstock credential through worker.extraEnv so API pods do not receive it" -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/* Validate the exact Secret-backed Penstock binding when configured. */}}
+{{- define "paperclip.validateWorkerExtraEnv" -}}
+{{- range $entry := .Values.worker.extraEnv -}}
+{{- if eq (toString ($entry.name | default "")) "PENSTOCK_API_KEY" -}}
+{{- if hasKey $entry "value" -}}
+{{- fail "worker.extraEnv PENSTOCK_API_KEY must use valueFrom.secretKeyRef, not a literal value" -}}
+{{- end -}}
+{{- $valueFrom := (get $entry "valueFrom") | default dict -}}
+{{- $secretKeyRef := (get $valueFrom "secretKeyRef") | default dict -}}
+{{- $_ := required "worker.extraEnv PENSTOCK_API_KEY requires valueFrom.secretKeyRef.name" (get $secretKeyRef "name") -}}
+{{- $_ := required "worker.extraEnv PENSTOCK_API_KEY requires valueFrom.secretKeyRef.key" (get $secretKeyRef "key") -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+The directories the seed init container publishes the GitHub egress wrappers
+into, in the order they must appear on PATH. Derived from persistence.mountPath
+because the seed derives them the same way (`BASE={{ .Values.persistence.mountPath }}`);
+a hardcoded /paperclip would silently miss every deployment that relocates the PVC.
+*/}}
+{{- define "paperclip.wrapperBinDirs" -}}
+{{- $base := .Values.persistence.mountPath | trimSuffix "/" -}}
+{{- printf "%s/.local/bin,%s/bin" $base $base -}}
+{{- end }}
+
+{{/*
+PATH for containers that run agent tooling.
+
+PEN-2527/PEN-2526: agent-authored GitHub content is scrubbed of credential-shaped
+material by wrapper binaries the seed init container publishes into
+`<mountPath>/.local/bin` and `<mountPath>/bin`. The scrubber only sits on the
+traffic path if those directories precede /usr/bin, where the unscrubbed image
+`gh` lives. `.local/bin` is prepended by the PVC's `.profile`/`.bashrc`, which
+only a *login* shell sources; agent tool harnesses spawn non-login shells. So the
+PATH the container itself carries is the only thing that reaches the scrubber,
+which makes it a chart-level invariant rather than one operator's values file.
+
+Override with `env.path`. The override is validated rather than trusted: it must
+keep both wrapper directories ahead of /usr/bin or the render fails, because the
+failure mode being prevented is an agent that looks healthy while publishing
+unscrubbed.
+*/}}
+{{- define "paperclip.runtimePath" -}}
+{{- $wrapperDirs := splitList "," (include "paperclip.wrapperBinDirs" .) -}}
+{{- range $entry := .Values.env.extra -}}
+{{- if eq ($entry.name | toString) "PATH" -}}
+{{- fail "env.extra must not define PATH: a duplicate env var would silently override the chart-managed PATH that keeps the GitHub egress scrubber (PEN-2527) ahead of /usr/bin. Set env.path instead, which is validated." -}}
+{{- end -}}
+{{- end -}}
+{{- $path := .Values.env.path | default (printf "%s:%s:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" (index $wrapperDirs 0) (index $wrapperDirs 1)) -}}
+{{- $entries := splitList ":" $path -}}
+{{- $systemIdx := -1 -}}
+{{- range $i, $entry := $entries -}}
+{{- if and (eq $entry "/usr/bin") (lt $systemIdx 0) -}}
+{{- $systemIdx = $i -}}
+{{- end -}}
+{{- end -}}
+{{- range $dir := $wrapperDirs -}}
+{{- $idx := -1 -}}
+{{- range $i, $entry := $entries -}}
+{{- if and (eq $entry $dir) (lt $idx 0) -}}
+{{- $idx = $i -}}
+{{- end -}}
+{{- end -}}
+{{- if lt $idx 0 -}}
+{{- fail (printf "env.path must include the Paperclip GitHub egress wrapper directory %q, or agent `gh` resolves to the unscrubbed image CLI (PEN-2527)" $dir) -}}
+{{- end -}}
+{{- if and (ge $systemIdx 0) (gt $idx $systemIdx) -}}
+{{- fail (printf "env.path must place the Paperclip GitHub egress wrapper directory %q before /usr/bin, or agent `gh` resolves to the unscrubbed image CLI (PEN-2527)" $dir) -}}
+{{- end -}}
+{{- end -}}
+{{- $path -}}
+{{- end }}
+
+{{/*
+Render evidenceGate.unlabeledTruthBlock, failing loudly on anything but "0"/"1".
+
+The server reads this env var as `=== "1"` (server/src/config.ts), so a YAML bool
+— `unlabeledTruthBlock: true`, the most natural thing to write for a rollout
+flag — renders "true" and reads as OFF. It fails safe and it fails SILENTLY,
+which is the wrong shape for a flag whose entire purpose is a measured flip: the
+operator would read seven days of zero blocks as "the gate is quiet" rather than
+"the gate is off". Quote your values.
+*/}}
+{{- define "paperclip.evidenceGateUnlabeledTruthBlock" -}}
+{{- $raw := ((.Values.evidenceGate).unlabeledTruthBlock) -}}
+{{- /* Only a genuinely absent key defaults; everything else is validated.
+       `kindIs "invalid"` is the nil test, and it is deliberately NOT `empty`
+       or `default`: Go templates count boolean `false` as empty, so both of
+       those collapse `unlabeledTruthBlock: false` to "0" silently while
+       `true` fails loudly — the same unquoted-bool trap this helper exists to
+       catch, one level down. Both bools are now the same class of mistake and
+       both say so. */ -}}
+{{- $v := (kindIs "invalid" $raw | ternary "0" ($raw | toString)) -}}
+{{- if not (has $v (list "0" "1")) -}}
+{{- fail (printf "evidenceGate.unlabeledTruthBlock must be the string \"0\" or \"1\", got %q (note: an unquoted YAML bool renders \"true\"/\"false\" and the server reads either as off) — docs/runbooks/evidence-gate-unlabeled-block.md" $v) -}}
+{{- end -}}
+{{- $v | quote -}}
+{{- end }}

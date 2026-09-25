@@ -30,7 +30,7 @@
  * @see PLUGIN_SPEC.md §21.3 — `plugin_jobs` / `plugin_job_runs` tables
  */
 
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { plugins, pluginJobs, pluginJobRuns } from "@paperclipai/db";
 import type {
@@ -62,6 +62,13 @@ export interface CreateJobRunInput {
   pluginId: string;
   /** What triggered this run. */
   trigger: PluginJobRunTrigger;
+  /**
+   * Company this run is scoped to. The scheduler dispatches a job once per
+   * company configured for the plugin (BLO-20957), so this is set per
+   * dispatch; `null`/omitted for instance-level jobs (zero configured
+   * companies).
+   */
+  companyId?: string | null;
 }
 
 /**
@@ -354,6 +361,7 @@ export function pluginJobStore(db: Db) {
         .values({
           jobId: input.jobId,
           pluginId: input.pluginId,
+          companyId: input.companyId ?? null,
           trigger: input.trigger,
           status: "queued",
         })
@@ -455,6 +463,126 @@ export function pluginJobStore(db: Db) {
         .where(and(...conditions))
         .orderBy(desc(pluginJobRuns.createdAt))
         .limit(limit);
+    },
+
+    /**
+     * Active jobs whose most recent `minConsecutiveFailures` runs *for a
+     * single company* are all `failed` — a sustained per-tenant failure
+     * streak, not a single blip and not a cross-tenant smear.
+     *
+     * Used to surface a scheduled job that keeps failing (e.g. a
+     * company-scope denial the scheduler cannot resolve — BLO-20957 AC #3)
+     * as an alertable health signal instead of only an ERROR log line.
+     *
+     * ## Why this partitions by company
+     *
+     * Since BLO-20957 the scheduler fans a single tick out into one run row
+     * *per configured company*. Streaking over the raw `jobId` history —
+     * which is what this did originally — is wrong in both directions once
+     * more than one company is configured:
+     *
+     * - **False page.** Three companies each failing *once* on the same tick
+     *   write three consecutive `failed` rows, which looks identical to one
+     *   company failing three ticks running. A single blip pages.
+     * - **Missed page.** One company failing *forever* stays invisible
+     *   whenever a healthy company's `succeeded` row interleaves ahead of it,
+     *   because the "last N runs" window is then never all-failed. This is
+     *   the dangerous direction: a permanently broken tenant reads as
+     *   healthy.
+     *
+     * So the streak is computed per `(jobId, companyId)` group and the
+     * offending `companyId` is returned for the alert. Instance-scoped runs
+     * (`companyId IS NULL`) form their own group rather than being dropped,
+     * so a plugin with no configured companies can still page.
+     *
+     * Only `trigger: "schedule"` runs count. `/plugins/alerts/plugin-health`
+     * presents this as a *sustained scheduled-job* failure at `severity: page`,
+     * and manual/retry runs do not carry that meaning: three failed
+     * hand-triggered runs — or an operator retrying one broken run three times
+     * while the cron ticks green — would otherwise manufacture an on-call page
+     * out of activity that is, by definition, already being watched by a human.
+     * The inverse matters just as much: interleaved manual runs are exactly what
+     * would break the all-failed window and hide a genuinely dead schedule, the
+     * same missed-page direction the per-company grouping above exists to close.
+     *
+     * Loops per active job (and per company within it) rather than a single
+     * windowed query: `plugin_jobs` rows are few (one per manifest-declared
+     * job per installed plugin), companies per plugin are a handful, and this
+     * is a low-frequency polling path (`/plugins/alerts/plugin-health`), not
+     * a hot one.
+     *
+     * @param minConsecutiveFailures - Minimum streak length to report (e.g. 3)
+     */
+    async listJobsWithFailureStreak(
+      minConsecutiveFailures: number,
+    ): Promise<
+      Array<{
+        job: typeof pluginJobs.$inferSelect;
+        companyId: string | null;
+        consecutiveFailures: number;
+        lastError: string | null;
+      }>
+    > {
+      const activeJobs = await db
+        .select()
+        .from(pluginJobs)
+        .where(eq(pluginJobs.status, "active"));
+
+      const streaks: Array<{
+        job: typeof pluginJobs.$inferSelect;
+        companyId: string | null;
+        consecutiveFailures: number;
+        lastError: string | null;
+      }> = [];
+
+      for (const job of activeJobs) {
+        // Which tenants (plus the instance-scoped bucket) have history for
+        // this job? Distinct over the whole run history rather than a recent
+        // window, so a tenant that has been failing since before the window
+        // is still considered.
+        const companyRows = await db
+          .selectDistinct({ companyId: pluginJobRuns.companyId })
+          .from(pluginJobRuns)
+          .where(
+            and(
+              eq(pluginJobRuns.jobId, job.id),
+              eq(pluginJobRuns.trigger, "schedule"),
+            ),
+          );
+
+        for (const { companyId } of companyRows) {
+          const recentRuns = await db
+            .select()
+            .from(pluginJobRuns)
+            .where(
+              and(
+                eq(pluginJobRuns.jobId, job.id),
+                eq(pluginJobRuns.trigger, "schedule"),
+                companyId === null
+                  ? isNull(pluginJobRuns.companyId)
+                  : eq(pluginJobRuns.companyId, companyId),
+              ),
+            )
+            // `id` breaks ties deterministically: a multi-company fan-out
+            // writes its run rows within the same millisecond, so ordering on
+            // `createdAt` alone is unstable and the streak could flap between
+            // polls on identical data.
+            .orderBy(desc(pluginJobRuns.createdAt), desc(pluginJobRuns.id))
+            .limit(minConsecutiveFailures);
+
+          if (recentRuns.length < minConsecutiveFailures) continue;
+          if (!recentRuns.every((run) => run.status === "failed")) continue;
+
+          streaks.push({
+            job,
+            companyId,
+            consecutiveFailures: recentRuns.length,
+            lastError: recentRuns[0]?.error ?? null,
+          });
+        }
+      }
+
+      return streaks;
     },
   };
 }

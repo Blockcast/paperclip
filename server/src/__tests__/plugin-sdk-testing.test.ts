@@ -160,4 +160,73 @@ describe("plugin SDK test harness", () => {
     expect(JSON.stringify(comments)).not.toContain("secret plugin-visible body");
     expect(JSON.stringify(comments)).not.toContain("secret plugin metadata");
   });
+
+  it("records finance events with costs.write and dedupes on externalInvoiceId", async () => {
+    const manifest: PaperclipPluginManifestV1 = {
+      id: "paperclip.test-costs-write",
+      apiVersion: 1,
+      version: "0.1.0",
+      displayName: "Costs Write",
+      description: "Test plugin",
+      author: "Paperclip",
+      categories: ["automation"],
+      capabilities: ["costs.write"],
+      entrypoints: { worker: "./dist/worker.js" },
+    };
+    const harness = createTestHarness({ manifest });
+
+    const first = await harness.ctx.costs.recordFinanceEvent({
+      companyId: "company-1",
+      eventKind: "provider_usage_snapshot",
+      biller: "penstock",
+      provider: "anthropic",
+      amountCents: 200,
+      estimated: true,
+      externalInvoiceId: "penstock:usage:org_test:anthropic:2026-08-19T05:15:00.000Z",
+      occurredAt: "2026-08-19T05:15:00.000Z",
+    });
+    expect(first.created).toBe(true);
+
+    // A reconciler re-running over the same window must not accumulate rows.
+    const second = await harness.ctx.costs.recordFinanceEvent({
+      companyId: "company-1",
+      eventKind: "provider_usage_snapshot",
+      biller: "penstock",
+      provider: "anthropic",
+      amountCents: 200,
+      estimated: true,
+      externalInvoiceId: "penstock:usage:org_test:anthropic:2026-08-19T05:15:00.000Z",
+      occurredAt: "2026-08-19T05:15:00.000Z",
+    });
+    expect(second.created).toBe(false);
+    expect(second.id).toBe(first.id);
+
+    expect(harness.financeEvents).toHaveLength(1);
+    expect(harness.financeEvents[0]).toMatchObject({ biller: "penstock", estimated: true });
+  });
+
+  it("requires costs.write before recording a finance event", async () => {
+    const manifest: PaperclipPluginManifestV1 = {
+      id: "paperclip.test-missing-costs-write",
+      apiVersion: 1,
+      version: "0.1.0",
+      displayName: "Missing Costs Write",
+      description: "Test plugin",
+      author: "Paperclip",
+      categories: ["automation"],
+      capabilities: [],
+      entrypoints: { worker: "./dist/worker.js" },
+    };
+    const harness = createTestHarness({ manifest });
+
+    await expect(
+      harness.ctx.costs.recordFinanceEvent({
+        companyId: "company-1",
+        eventKind: "provider_usage_snapshot",
+        biller: "penstock",
+        amountCents: 200,
+        occurredAt: "2026-08-19T05:15:00.000Z",
+      }),
+    ).rejects.toThrow("missing required capability 'costs.write'");
+  });
 });

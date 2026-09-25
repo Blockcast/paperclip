@@ -1,0 +1,241 @@
+name: review-gate-sweep
+
+# Reconciler for BLO-22892, ported to this repo by BLO-28203.
+#
+# A reviewer wake fired by `pull_request.opened` is event-driven and can be
+# silently declined or starved (busy agent, capacity gate, k8s dispatch hang)
+# with no retry and no alert -- Ally "does not patrol the issue board", so a
+# lost wake stays lost forever and the PR simply sits there, unreviewed and
+# indistinguishable from one merely waiting its turn. This repo is the one
+# that carried the ~13-PR loss set measured on BLO-22892 (2026-08-15/16), so
+# it has demonstrated exposure, not theoretical exposure.
+#
+# This runs on a SCHEDULE, not an event, precisely so it does not depend on
+# the same wake-delivery path it exists to backstop.
+#
+# PREDICATE_MODE=status-free is deliberate and is the decision recorded on
+# BLO-28203. Unlike trafficcontrol and pim-multicast-gateway, this repo has
+# NO `review/ally-complete` producer: measured 2026-08-20, **0 of 100** open
+# PRs carried that status. A status-keyed sweep here would classify every PR
+# as "not pending" and silently do nothing forever -- the very failure this
+# reconciler exists to prevent, reintroduced one layer up. So the sweep keys
+# on the load-bearing half instead: non-draft, open, and no Ally consolidated
+# report at the exact head, for longer than STALL_THRESHOLD_SECONDS.
+#
+# Standing up the `review/ally-complete` gate here first was the considered
+# alternative and was rejected: it would add a new commit status to a repo
+# with a merge queue, changing merge behaviour for a reconciler that is meant
+# to be observe-and-re-fire only -- a strictly larger blast radius for no gain
+# in detection.
+#
+# AC4 (BLO-22892): the stranded condition must surface without a human
+# noticing by hand. If a re-fire ALSO goes unserviced past
+# ALARM_THRESHOLD_SECONDS, this job exits non-zero -- turning the schedule
+# persistently red on this repo's Actions tab.
+
+on:
+  schedule:
+    # Hourly, NOT every 30 minutes, and that is a rate-limit decision.
+    #
+    # In status-free mode each non-draft PR costs at least 3 requests (head
+    # commit + comments page + reviews page; `_fetch_paginated` issues one
+    # more per extra page, so a long thread costs more). Every request
+    # figure below counts one page each, which understates the uncut
+    # baseline and the saving alike -- the percentages survive, the absolute
+    # counts are floors. Measured 2026-08-21 on this repo: 147 open PRs, 119
+    # non-draft and unlocked -> ~359 requests per run. At `9,39` that is
+    # ~718/hour from this job alone, against `github.token`'s documented
+    # 1,000/hour/repository budget shared with the 26 other workflows here
+    # -- exhaustion would be the steady state, not an edge case. Hourly
+    # halves it to ~359/hour and leaves real headroom.
+    #
+    # The cheap predicate-level cut (skipping PRs that cannot be stranded)
+    # scales with STALL_THRESHOLD_SECONDS, so BLO-34521's 90m -> 18h move
+    # changed it roughly sevenfold. It runs in TWO stages, and conflating
+    # them is how this paragraph has been wrong before:
+    #
+    #   stage 1  too_young_to_be_stranded -- tests `created_at` ALONE, from
+    #            the list payload, so it saves all 3 requests. It cannot use
+    #            `committer_date`: the soundness proof needs only
+    #            `pending_since >= created_at`, and reading the committer
+    #            date would cost the very head-commit request being avoided.
+    #   stage 2  _consider_pr's `(now - pending_since) < STALL` early return
+    #            -- the head commit has now been fetched, so this tests the
+    #            real max(created_at, committer_date) and catches the old PR
+    #            pushed an hour ago. It saves the remaining 2 requests.
+    #
+    # EVERY FIGURE BELOW IS ONE SNAPSHOT, 2026-09-19T22:26Z: 111 open PRs,
+    # 105 non-draft and unlocked -> ~315 requests per run uncut.
+    #
+    #     threshold | stage 1 (x3) | stage 2 (x2) | total saved
+    #         90m   |  1 PR -> ~3  |  4 PRs -> ~8 |  ~11  (~3%)
+    #          8h   |  4 PRs -> 12 |  5 PRs -> 10 |  ~22  (~7%)
+    #         18h   |  9 PRs -> 27 | 24 PRs -> 48 |  ~75  (~24%)
+    #
+    # Deliberately one snapshot rather than the best figure for each line:
+    # every prior revision of this paragraph quoted numbers from two
+    # different measurement moments, and every one of them ended up with a
+    # figure a sibling figure contradicted -- three revisions running. Numbers
+    # from one population cannot disagree with each other. Re-measure the
+    # whole table or none of it.
+    #
+    # Read the stage columns as a pair, never the `younger` PR counts alone:
+    # 33 PRs are under 18h by `pending_since`, but only 9 of them are cut for
+    # free. Quoting 33 x 3 = ~99 (~31%) as the saving -- which this paragraph
+    # did until BLO-34521 -- charges stage 2 nothing for the head-commit
+    # request it must issue to decide. Quoting stage 1 alone (~27, ~9%)
+    # makes the opposite error and discards two thirds of what ships.
+    # Re-derive rather than inherit: every figure here tracks
+    # STALL_THRESHOLD_SECONDS and the open-PR backlog, which is why the
+    # 2026-08-21 pair above no longer reproduces.
+    #
+    # Cadence is still the larger lever (hourly vs `9,39` is worth ~315/hour
+    # against a 1,000/hour budget), but at ~24% the cut is not rounding
+    # error either.
+    #
+    # ALARM_THRESHOLD_SECONDS derives as STALL + COOLDOWN + 2h in the script,
+    # to absorb the coarser polling granularity. Deliberately no figure here:
+    # this line has gone stale against STALL twice, once per revision of
+    # BLO-34521, so read the constant rather than a copy of it.
+    #
+    # Off the hour to avoid clustering with every other cron in
+    # the org, and offset from trafficcontrol (7,37) and
+    # pim-multicast-gateway (8,38) so the repos' sweeps do not fire their
+    # re-requests at Ally at once.
+    - cron: '9 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+  # write, not read: re-firing POSTs a native review request
+  # (.../pulls/{n}/requested_reviewers), not just the marker comment.
+  pull-requests: write
+  statuses: read
+
+# No `concurrency` block, deliberately -- BLO-31818. There used to be one
+# (`group: review-gate-sweep`, `cancel-in-progress: false`), added to stop a
+# backlog of sweeps piling up on top of each other. It could not deliver that:
+# GitHub holds at most ONE pending run per concurrency group, so a group cannot
+# serialise a backlog of N -- when a new run arrives and the slot is occupied it
+# EVICTS the run sitting there. `cancel-in-progress: false` means "do not cancel
+# a RUNNING job", not "never cancel". So the only thing the group could actually
+# do for a starved backlog was discard it.
+#
+# That is not theoretical. Measured 2026-09-04 on this repo, with the `default`
+# runner pool wedged from ~13:52Z (nothing on that label executed for 5h, while
+# `arc-light`/`arc-paperclip-general` PR runs started instantly):
+#
+#   33877561971  13:20Z  success  -- last sweep that actually ran
+#   33883204083  14:20Z  queued 5h22m, zero jobs AT MEASUREMENT -- held the slot,
+#                        never evicted; a runner finally took it 19:43Z and it
+#                        ran (and failed) at 19:45Z, so re-querying it today
+#                        shows `jobs: 1`. The queue time and the non-eviction
+#                        are the load-bearing halves and both still hold.
+#   33888968885  15:21Z  cancelled, zero jobs   -- evicted at 16:22:56 by its successor
+#   33894806243  16:22Z  cancelled, zero jobs   -- evicted at 17:17:57
+#   33899818405  17:17Z  cancelled, zero jobs   -- evicted at 18:23:58
+#
+# The three CANCELLED rows are the evidence for eviction and they are stable --
+# re-querying them still returns `cancelled` with `jobs: 0`.
+# Each cancelled run's `updated_at` is exactly its successor's `created_at`, and
+# each reports `jobs: []` -- evicted while pending, never a timeout and never a
+# runner failure. This is worse than a late reconciler: the AC4 alarm (below)
+# surfaces a stranded PR by exiting non-zero, and a job that never starts cannot
+# exit non-zero, while `cancelled` is not `failure` -- so the Actions tab stays
+# clean. The backstop and the alarm on the backstop shared a single point of
+# failure.
+#
+# `cancel-in-progress: true` was the first candidate and is REJECTED: it does not
+# stop runs being cancelled, it only changes WHICH run dies -- the newest evicts
+# the oldest instead of the reverse. Cancelled-with-zero-jobs runs would still
+# appear every hour, so it fails the census this fix is verified by. It is also
+# actively worse under a dead pool, because runner allocation here is NOT FIFO by
+# creation and each new run re-enters the queue from the back.
+#
+# With no group, runs accumulate instead of evicting -- exactly what the sibling
+# guards on this label already do (`lockfile-drift-monitor`, `codeowners-guard`,
+# `relay-ssl-multicert-guard`, `ally-review-consistency` carry no `concurrency`
+# block and were merely late through the same window, never lost). The first run
+# to get a runner reconciles from live API state and re-fires whatever it finds
+# stalled, so a queued backlog costs latency, not correctness.
+#
+# RESIDUAL, stated rather than implied (BLO-31818 AC3): when capacity returns,
+# every queued sweep runs. At 90 open PRs that is ~270 reads each against the
+# 1,000/hour/repository `github.token` budget, so a long starvation window can
+# exhaust it. That degrades LOUDLY -- the script detects rate-limit exhaustion
+# explicitly and reports it, and writes stay capped by MAX_REFIRES_PER_RUN -- so
+# it turns the tab red rather than going quiet, which is the failure direction
+# this reconciler must never have.
+#
+# SECOND RESIDUAL, likewise stated rather than implied: two sweeps that execute
+# CONCURRENTLY can both re-fire the same PR. The per-PR cooldown is derived from
+# the marker comments already on the PR (`existing_marker_epochs`), i.e. from
+# GitHub state rather than run-local state -- but that check is not atomic. The
+# comments are read during the scan and the write happens later with no re-read
+# (sweep-stalled-ally-reviews.py: cooldown at `should_refire`, write at
+# `request_review`), so two runs interleaved inside that window both observe
+# `since_last >= REFIRE_COOLDOWN_SECONDS` and both fire. It is worse than a
+# duplicate comment: `request_review` deliberately DELETEs before it POSTs, to
+# force a fresh `review_requested` event that a bare POST would no-op, so the
+# interleaving also leaves a window with no pending request at all.
+#
+# Dropping the group is what newly exposes this -- it was the one thing the
+# group did deliver correctly (mutual exclusion of RUNNING jobs), even though
+# it could not serialise a queued backlog. Accepted here, not dismissed, on
+# scope and on reachability. Scope: the fix belongs in the script's write path
+# (re-read the markers immediately before the write), and this change
+# deliberately does not touch the decision logic. Reachability: cadence is
+# hourly, a healthy run takes ~2min, and REFIRE_COOLDOWN_SECONDS is 2h, so
+# runs never overlap in normal operation -- it needs a starvation backlog
+# released together, which is the scenario this change creates by preserving
+# the backlog instead of discarding it. Tracked separately; do not read the
+# absent group as making overlapping writes safe.
+
+jobs:
+  sweep:
+    name: Sweep stalled Ally reviews
+    runs-on: default
+    # WHAT THIS BOUND COVERS: a job that has STARTED and then hangs -- one
+    # stalled socket cannot hold it to the Actions 6-hour ceiling. Matches the
+    # sibling `ally-review-consistency.yml` (10m); slightly higher because this
+    # sweep makes one request per open PR. The script also bounds each
+    # individual request (REQUEST_TIMEOUT_SECONDS).
+    #
+    # WHAT IT DOES NOT COVER, and cannot: a run starved in `queued` before a
+    # runner is ever assigned. `timeout-minutes` is a JOB-level bound and only
+    # engages once the job starts, so a run with `jobs: []` is not bounded by it
+    # at any value. Measured 2026-09-04 (BLO-31818): run 33883204083 sat queued
+    # 5h22m -- 21x this 15-minute ceiling -- with `jobs: []` and this bound
+    # never engaged. (It was eventually given a runner at 19:43Z and ran for
+    # 2m16s, so a re-query now reports `jobs: 1`; the 5h22m of unbounded queue
+    # time is the part that matters here.)
+    # There is no workflow-level equivalent -- GitHub exposes no queue-time
+    # bound -- so do not try to raise or lower this number to address a starved
+    # queue. That failure mode is a runner-capacity problem, and the thing this
+    # workflow does about it is refuse to lose runs to it (see the note on the
+    # absent `concurrency` block above).
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Unit tests for the sweep's pure decision logic
+        run: python3 -m unittest discover -s .github/scripts -p 'test_sweep_*.py' -v
+
+      - name: Sweep and re-fire stalled review requests
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          # See the header comment: this repo has no `review/ally-complete`
+          # producer, so there is no pending status to key on.
+          PREDICATE_MODE: status-free
+          # Which logins' reviews count as an Ally signal for a head. Note
+          # `claude[bot]` (id 209825114) is deliberately absent -- counting it
+          # is the exact false negative that hid trafficcontrol#1448.
+          ALLY_REVIEWER_LOGINS: allyblockcast[bot],app/allyblockcast,allyblockcast
+          # The distinct User identity to request a formal review from when
+          # re-firing (see sweep-stalled-ally-reviews.py's comment on this
+          # constant for why the User, not the App, login is used here).
+          ALLY_REQUEST_REVIEWER_LOGIN: allyblockcast
+        run: python3 .github/scripts/sweep-stalled-ally-reviews.py

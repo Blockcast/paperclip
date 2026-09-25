@@ -66,11 +66,28 @@ export const DEFAULT_SEVERITY_TO_PRIORITY: Record<string, PaperclipPriority> = {
   critical: "critical",
   warning: "high",
   info: "medium",
+  // BLO-27018: `page` and `ticket` are the severity vocabulary the Blockcast
+  // Prometheus rule groups actually emit (`llm-proxy.alerts` and friends), and
+  // neither was mapped here. An unmapped severity silently falls back to
+  // FALLBACK_PRIORITY, so every `severity=page` alert — the highest urgency
+  // this fleet has — was being filed as `medium`.
+  page: "critical",
+  ticket: "low",
 };
 
 export const DEFAULT_ESCALATION_DEADLINE_MINUTES: Record<string, number> = {
   critical: 30,
   warning: 240,
+  // BLO-27018: this omission disabled the escalation ladder outright for the
+  // fleet's highest severity. `escalationDeadlineMs` returns null for an
+  // unmapped severity, the webhook handler then stores `nextEscalationAt:
+  // null`, and the per-minute sweep early-returns on that field forever. The
+  // net effect: the "no agent owner at all → board cover" safety net in
+  // escalation.ts could never fire for a `page` alert. Measured on BLO-25023 —
+  // unassigned and comment-free for 4 days while firing.
+  page: 30,
+  // `ticket` is deliberately absent: it is the low-urgency severity, so it
+  // keeps the null deadline (no ladder) rather than paging a chain.
 };
 
 /**
@@ -81,6 +98,59 @@ export const DEFAULT_ESCALATION_DEADLINE_MINUTES: Record<string, number> = {
  * `config.coverDedupWindowMinutes`.
  */
 export const DEFAULT_COVER_DEDUP_WINDOW_MINUTES = 120;
+
+/**
+ * How long an operator-closed issue mutes re-fires of its fingerprint before
+ * the plugin re-opens it anyway (BLO-24234).
+ *
+ * 24h is chosen to outlast a single on-call shift — long enough that closing a
+ * noisy issue actually buys quiet for the rest of the day, short enough that a
+ * still-firing alert cannot stay invisible across a handover. Operators who
+ * want the old unbounded mute can set `operatorSuppressionHours: 0`.
+ */
+export const DEFAULT_OPERATOR_SUPPRESSION_HOURS = 24;
+
+/**
+ * Ceiling on `operatorSuppressionHours`, applied before it is converted to
+ * milliseconds.
+ *
+ * Validating the configured value for finiteness is not enough on its own: the
+ * conversion multiplies by 3.6e6, so any input above ~5e301 overflows to
+ * `Infinity`, and `now - anchor >= Infinity` is never true. A merely large
+ * finite value is no better — 1e15 hours is ~1e11 years. Either way the window
+ * never expires, which is exactly the unbounded mute BLO-24234 exists to
+ * remove, reachable through a config typo rather than a code path.
+ *
+ * 30 days is well past any plausible deliberate mute while still guaranteeing
+ * the multiplication stays finite and the window always ends. `0` remains the
+ * explicit, documented opt-in to indefinite suppression, so clamping here
+ * takes nothing away that an operator can't still ask for on purpose.
+ */
+export const MAX_OPERATOR_SUPPRESSION_HOURS = 24 * 30;
+
+/**
+ * Severities (BLO-24177) that never produce agent-actionable work. `none` is
+ * Prometheus's convention for the always-firing `Watchdog` alert (`vector(1)`)
+ * used as a dead-man's-switch heartbeat — it is designed to fire forever, so a
+ * normal `todo` issue for it can never be legitimately resolved and just
+ * recirculates through stranded-issue recovery.
+ *
+ * Deliberately a constant and not a config key. Making it configurable would
+ * mean a `done` row this plugin closed could later be re-read by `decideRefire`
+ * as an *operator* close (it has no `resolvedAt`), muting the fingerprint for
+ * the operator-suppression window — a failure mode that only exists if the list
+ * can change. `none` has exactly one member in this estate (`Watchdog`), so the
+ * knob buys nothing and costs that bug.
+ */
+export const TERMINAL_SEVERITIES: readonly string[] = ["none"];
+
+/**
+ * Platform / SRE lane owner for Blockcast observability alerts. Its charter is
+ * "triages and closes every alertmanager-origin alert", which is precisely the
+ * `team: devops` rule groups below.
+ */
+export const BLOCKCAST_PLATFORM_SRE_AGENT_ID =
+  "d6f327a4-f2f2-4a83-bc5a-173d993cf9b6";
 
 /** Default owner routes shipped with the bundled Blockcast Alertmanager plugin. */
 export const DEFAULT_OWNER_MAP: OwnerMap = {
@@ -97,6 +167,19 @@ export const DEFAULT_OWNER_MAP: OwnerMap = {
     physical_infra_ceph: "support@blockcast.net",
     physical_infra_bmc: "support@blockcast.net",
     physical_infra_disk: "support@blockcast.net",
+  },
+  // BLO-27018: every route above keys on `class`, a label the observability
+  // rule groups do not emit at all — so `resolveOwnerEmail` iterated one key,
+  // found no `class` label, and returned `no-match` for every alert those
+  // groups produce. They were filed unassigned, which is why a ~24h penstock
+  // outage (BLO-27008) generated alerts nobody was ever woken for.
+  //
+  // Scoped deliberately to `team: devops` (4 alerts firing at time of writing)
+  // and NOT `team: platform` (53 firing — 44 of them warnings). Routing that
+  // second group by default would bury the lane's attended-WIP budget in one
+  // sweep; it needs its own sizing decision, not a default.
+  team: {
+    devops: `agent:${BLOCKCAST_PLATFORM_SRE_AGENT_ID}`,
   },
 };
 
@@ -232,6 +315,7 @@ export const DEFAULT_CONFIG: AlertmanagerPluginConfig = {
   severityToPriority: DEFAULT_SEVERITY_TO_PRIORITY,
   autoCloseOnResolve: true,
   ownerMap: DEFAULT_OWNER_MAP,
+  fallbackAgentName: "",
   issueRouteMap: DEFAULT_ISSUE_ROUTE_MAP,
   escalationDeadlineMinutes: DEFAULT_ESCALATION_DEADLINE_MINUTES,
   coverDedupWindowMinutes: DEFAULT_COVER_DEDUP_WINDOW_MINUTES,

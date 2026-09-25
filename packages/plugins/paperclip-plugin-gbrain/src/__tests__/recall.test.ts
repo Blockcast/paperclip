@@ -9,6 +9,8 @@ import {
   MAX_ENRICHMENT_SERIALIZED_BYTES,
 } from "../recall.js";
 import type { GbrainCallable } from "../pages.js";
+import { GbrainCallError } from "../gbrain-client.js";
+import { NoOAuthClientError } from "../oauth-client-manager.js";
 
 describe("RECALL_STATE_KEY + defaults", () => {
   it("exposes a stable key + depth so worker + tool agree", () => {
@@ -324,6 +326,41 @@ describe("prefetchRunContext", () => {
     });
     expect(out.ok).toBe(false);
     expect(out.reason).toMatch(/traverse_graph failed.*gbrain down/);
+    expect(out.reasonKind).toBeUndefined();
+  });
+
+  it("tags a no-oauth-client failure with reasonKind — not a generic error (BLO-23403)", async () => {
+    const client = {
+      call: vi.fn(async () => {
+        throw new NoOAuthClientError("agent-unprovisioned");
+      }),
+    };
+    const out = await prefetchRunContext({
+      client: client as unknown as GbrainCallable,
+      issueIdentifier: "BLO-1",
+      depth: 2,
+    });
+    expect(out.ok).toBe(false);
+    expect(out.reasonKind).toBe("no-oauth-client");
+    expect(out.reason).toMatch(/no client configured/);
+  });
+
+  it("tags a no-oauth-client failure wrapped in GbrainCallError (real client shape)", async () => {
+    const client = {
+      call: vi.fn(async () => {
+        // GbrainClient wraps every thrown error into GbrainCallError,
+        // preserving the original as `cause` — mirror that here.
+        const cause = new NoOAuthClientError("agent-unprovisioned");
+        throw new GbrainCallError(cause.message, cause);
+      }),
+    };
+    const out = await prefetchRunContext({
+      client: client as unknown as GbrainCallable,
+      issueIdentifier: "BLO-1",
+      depth: 2,
+    });
+    expect(out.ok).toBe(false);
+    expect(out.reasonKind).toBe("no-oauth-client");
   });
 });
 
@@ -416,6 +453,34 @@ describe("buildCacheEntry", () => {
     });
     expect(entry.status).toBe("error");
     expect(entry.note).toMatch(/HTTP 401/);
+  });
+
+  it("maps a no-oauth-client failure → status=skipped, not error (BLO-23403)", () => {
+    const entry = buildCacheEntry({
+      result: {
+        ok: false,
+        issuePageSlug: "issue-blo-1",
+        graph: null,
+        reason: "traverse_graph failed: gbrain OAuth: no client configured for agentId agent-x",
+        reasonKind: "no-oauth-client",
+      },
+      depth: 2,
+    });
+    expect(entry.status).toBe("skipped");
+    expect(entry.note).toMatch(/no client configured/);
+  });
+
+  it("still maps a configured-client auth/transport failure → status=error", () => {
+    const entry = buildCacheEntry({
+      result: {
+        ok: false,
+        issuePageSlug: "issue-blo-1",
+        graph: null,
+        reason: "traverse_graph failed: HTTP 403",
+      },
+      depth: 2,
+    });
+    expect(entry.status).toBe("error");
   });
 
   it("uses current time when nowIso omitted", () => {

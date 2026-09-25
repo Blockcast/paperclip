@@ -218,6 +218,195 @@ describe("issue graph liveness classifier", () => {
     })).toEqual([]);
   });
 
+  // BLO-27912: the deliberate-park disposition — the seventh satisfier on
+  // `hasExplicitWaitingPath`, and the only one an actor other than the row's assignee can
+  // set. Every assertion here is paired with its negative: a suppression test that does not
+  // also prove the detector still fires cannot distinguish "the park works" from "the
+  // detector is off", which is the failure mode the row's verifying signal calls out by name.
+  describe("deliberate-park disposition (BLO-27912)", () => {
+    const parkedBlocker = (overrides: Record<string, unknown> = {}) =>
+      issue({
+        id: blockerId,
+        identifier: "PAP-1704",
+        title: "Deliberately parked unblock work",
+        status: "backlog",
+        assigneeAgentId: "blocker-agent",
+        ...overrides,
+      });
+    const baseInput = (blocker: ReturnType<typeof parkedBlocker>) => ({
+      issues: [issue(), blocker],
+      relations: blocks,
+      agents: [
+        agent(),
+        manager,
+        agent({ id: "blocker-agent", name: "Blocker Agent", reportsTo: managerId }),
+      ],
+    });
+    const hoursFromNow = (hours: number) => new Date(Date.now() + hours * 60 * 60 * 1000);
+
+    it("suppresses blocked_by_assigned_backlog_issue while a park is in force, and fires without one", () => {
+      // The positive and negative halves differ in exactly one field, so the pair isolates
+      // the disposition rather than the surrounding fixture.
+      expect(classifyIssueGraphLiveness(
+        baseInput(parkedBlocker({ parkedUntil: hoursFromNow(72) })),
+      )).toEqual([]);
+
+      const unparked = classifyIssueGraphLiveness(baseInput(parkedBlocker()));
+      expect(unparked).toHaveLength(1);
+      expect(unparked[0]).toMatchObject({
+        issueId: blockedId,
+        state: "blocked_by_assigned_backlog_issue",
+        recoveryIssueId: blockerId,
+      });
+    });
+
+    it("suppresses blocked_by_unassigned_issue too, since a park answers every assignee-shaped rule", () => {
+      // BLO-24266 tripped both invariants, and the row's AC names both. An unassigned
+      // blocker is the harder case: there is no assignee to be "not working on it", so the
+      // park is the only thing standing between the leaf and a finding.
+      const unassigned = { status: "todo", assigneeAgentId: null };
+
+      expect(classifyIssueGraphLiveness(
+        baseInput(parkedBlocker({ ...unassigned, parkedUntil: hoursFromNow(24) })),
+      )).toEqual([]);
+
+      const unparked = classifyIssueGraphLiveness(baseInput(parkedBlocker(unassigned)));
+      expect(unparked.map((entry) => entry.state)).toEqual(["blocked_by_unassigned_issue"]);
+    });
+
+    it("restores detection once the park lapses, so suppression cannot become permanent", () => {
+      // The anti-silence guarantee. `parkedUntil` is compared against `now` by the
+      // classifier itself, so an elapsed park needs no un-parking write to stop suppressing
+      // — nobody has to remember to clean it up.
+      const lapsed = classifyIssueGraphLiveness(
+        baseInput(parkedBlocker({ parkedUntil: hoursFromNow(-1) })),
+      );
+      expect(lapsed.map((entry) => entry.state)).toEqual(["blocked_by_assigned_backlog_issue"]);
+
+      // And an explicit un-park (the column cleared) is detectable immediately.
+      expect(classifyIssueGraphLiveness(
+        baseInput(parkedBlocker({ parkedUntil: null })),
+      ).map((entry) => entry.state)).toEqual(["blocked_by_assigned_backlog_issue"]);
+    });
+
+    it("reads the deadline as the DB and the API supply it, and ignores an unparsable one", () => {
+      // `readDateMs` accepts Date | string; the projection in recovery/service.ts hands over
+      // a Date, while a serialized input arrives as an ISO string. Both must suppress, or
+      // the park works on one caller and not the other.
+      expect(classifyIssueGraphLiveness(
+        baseInput(parkedBlocker({ parkedUntil: hoursFromNow(48).toISOString() })),
+      )).toEqual([]);
+
+      // Fails closed: garbage in the column suppresses nothing.
+      expect(classifyIssueGraphLiveness(
+        baseInput(parkedBlocker({ parkedUntil: "not-a-timestamp" })),
+      ).map((entry) => entry.state)).toEqual(["blocked_by_assigned_backlog_issue"]);
+    });
+
+    it("does not make a cancelled blocker acceptable", () => {
+      // The deliberate asymmetry documented on `hasExplicitWaitingPath`: parking says nobody
+      // should be working on this yet, not that depending on a cancelled row is coherent.
+      // `blockedFindingForLeaf` tests the cancelled shape before consulting the predicate,
+      // so this must keep reporting regardless of the park.
+      const findings = classifyIssueGraphLiveness(
+        baseInput(parkedBlocker({ status: "cancelled", parkedUntil: hoursFromNow(72) })),
+      );
+      expect(findings.map((entry) => entry.state)).toEqual(["blocked_by_cancelled_issue"]);
+    });
+
+    // The two rules below are not named by the row's ACs, but they changed behaviour when
+    // `hasActiveParkedDisposition` went into `hasExplicitWaitingPath` rather than being
+    // scoped to a single rule. The broad placement is deliberate — a park is a structured,
+    // attributed, expiring claim that answers every assignee-shaped rule — but an
+    // undiscussed behaviour change is exactly the kind that regresses unnoticed, so pin
+    // both directions here. Unlike the `blocked_by_*` pairs above, these two fire against
+    // the row ITSELF rather than against its blocker, so each needs its own fixture.
+    it("suppresses in_review_without_action_path on a parked row, and fires without the park", () => {
+      const stalledReview = (overrides: Record<string, unknown> = {}) => issue({
+        id: "review-parked-1",
+        identifier: "PAP-1705",
+        title: "Parked review awaiting an upstream decision",
+        status: "in_review",
+        assigneeAgentId: coderId,
+        executionState: null,
+        ...overrides,
+      });
+      const input = (parked: ReturnType<typeof stalledReview>) => ({
+        issues: [parked],
+        relations: [],
+        agents: [agent(), manager],
+      });
+
+      expect(classifyIssueGraphLiveness(
+        input(stalledReview({ parkedUntil: hoursFromNow(72) })),
+      )).toEqual([]);
+
+      const unparked = classifyIssueGraphLiveness(input(stalledReview()));
+      expect(unparked.map((entry) => entry.state)).toEqual(["in_review_without_action_path"]);
+      expect(unparked[0]).toMatchObject({ issueId: "review-parked-1" });
+    });
+
+    it("suppresses blocked_without_blockers on a parked dead end, and fires without the park", () => {
+      // The dead-end shape: `blocked` with no blocker edges at all, so nothing can ever
+      // unblock it. A park is the honest answer here — `blockedWithoutBlockersFinding`'s own
+      // recommended action already says "assign a human owner or interaction if it is
+      // intentionally parked", so the park is the structured form of that instruction.
+      const deadEnd = (overrides: Record<string, unknown> = {}) => issue({
+        id: "dead-end-parked-1",
+        identifier: "PAP-1706",
+        title: "Parked dead end pending an upstream decision",
+        status: "blocked",
+        assigneeAgentId: coderId,
+        ...overrides,
+      });
+      const input = (parked: ReturnType<typeof deadEnd>) => ({
+        issues: [parked],
+        relations: [],
+        agents: [agent(), manager],
+      });
+
+      expect(classifyIssueGraphLiveness(
+        input(deadEnd({ parkedUntil: hoursFromNow(72) })),
+      )).toEqual([]);
+
+      const unparked = classifyIssueGraphLiveness(input(deadEnd()));
+      expect(unparked.map((entry) => entry.state)).toEqual(["blocked_without_blockers"]);
+      expect(unparked[0]).toMatchObject({ issueId: "dead-end-parked-1" });
+    });
+
+    // Both of the above must also come back on their own once the deadline passes — the
+    // anti-silence guarantee has to hold for every rule the park reaches, not just the two
+    // the ACs name.
+    it("restores detection on both extra rules once the park lapses", () => {
+      const lapsed = hoursFromNow(-1);
+
+      expect(classifyIssueGraphLiveness({
+        issues: [issue({
+          id: "review-parked-1",
+          identifier: "PAP-1705",
+          status: "in_review",
+          assigneeAgentId: coderId,
+          executionState: null,
+          parkedUntil: lapsed,
+        })],
+        relations: [],
+        agents: [agent(), manager],
+      }).map((entry) => entry.state)).toEqual(["in_review_without_action_path"]);
+
+      expect(classifyIssueGraphLiveness({
+        issues: [issue({
+          id: "dead-end-parked-1",
+          identifier: "PAP-1706",
+          status: "blocked",
+          assigneeAgentId: coderId,
+          parkedUntil: lapsed,
+        })],
+        relations: [],
+        agents: [agent(), manager],
+      }).map((entry) => entry.state)).toEqual(["blocked_without_blockers"]);
+    });
+  });
+
   it("does not flag an unassigned blocker that already has an active execution path", () => {
     const findings = classifyIssueGraphLiveness({
       issues: [
@@ -1054,6 +1243,87 @@ describe("issue graph liveness classifier", () => {
       });
 
       expect(findings.map((entry) => entry.state)).toEqual(["blocked_by_cancelled_issue"]);
+    });
+  });
+
+  describe("uninvokable assignee on a blocker that is itself blocked (BLO-15200)", () => {
+    const midId = "mid-1";
+    const pausedOwner = agent({ id: "blocker-agent", name: "Paused owner", status: "paused" });
+
+    // source -> blocker (blocked, paused owner) -> mid
+    const chain = [
+      { companyId, blockerIssueId: blockerId, blockedIssueId: blockedId },
+      { companyId, blockerIssueId: midId, blockedIssueId: blockerId },
+    ];
+
+    function blockedBlocker() {
+      return issue({
+        id: blockerId,
+        identifier: "BLO-14424",
+        title: "Operator-gated unblock work",
+        status: "blocked",
+        assigneeAgentId: "blocker-agent",
+      });
+    }
+
+    it("does not escalate while the blocker is still waiting on its own unresolved edge", () => {
+      // The storm shape: 53 of the 58 blockers in the 2026-08-18 census carried their
+      // own unresolved blockedBy edges, so "assign it to an active owner" could not have
+      // helped any of them -- a fresh owner wakes straight back into the same wait.
+      const findings = classifyIssueGraphLiveness({
+        issues: [
+          issue(),
+          blockedBlocker(),
+          issue({ id: midId, identifier: "BLO-14430", title: "Real upstream work", status: "todo" }),
+        ],
+        relations: chain,
+        agents: [agent(), manager, pausedOwner],
+      });
+
+      expect(findings).toEqual([]);
+    });
+
+    it("escalates once that edge resolves and the assignee is the thing holding it", () => {
+      // Deferred, not discarded. With the upstream edge done the blocker is genuinely
+      // dispatchable, so the paused assignee is now the real defect and the rule must
+      // fire -- this is what separates the fix from simply muting the invariant.
+      const findings = classifyIssueGraphLiveness({
+        issues: [
+          issue(),
+          blockedBlocker(),
+          issue({ id: midId, identifier: "BLO-14430", title: "Real upstream work", status: "done" }),
+        ],
+        relations: chain,
+        agents: [agent(), manager, pausedOwner],
+      });
+
+      expect(findings).toHaveLength(1);
+      expect(findings[0]).toMatchObject({
+        issueId: blockedId,
+        state: "blocked_by_uninvokable_assignee",
+        recoveryIssueId: blockerId,
+        incidentKey: `harness_liveness:${companyId}:${blockedId}:blocked_by_uninvokable_assignee:${blockerId}`,
+      });
+    });
+
+    it("still surfaces a real defect further down the chain", () => {
+      // Suppression must not swallow the chain walk: the cancelled edge under the
+      // blocker is a broken dependency that stays broken no matter who owns anything.
+      const findings = classifyIssueGraphLiveness({
+        issues: [
+          issue(),
+          blockedBlocker(),
+          issue({ id: midId, identifier: "BLO-14430", title: "Abandoned upstream", status: "cancelled" }),
+        ],
+        relations: chain,
+        agents: [agent(), manager, pausedOwner],
+      });
+
+      expect(findings).toHaveLength(1);
+      expect(findings[0]).toMatchObject({
+        state: "blocked_by_cancelled_issue",
+        recoveryIssueId: midId,
+      });
     });
   });
 });

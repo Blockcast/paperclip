@@ -2,6 +2,15 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
+
+// BLO-33419 asserts on the host's own log records, so the real pino logger is
+// replaced wholesale. `child()` hands back the same record every time, which is
+// what lets the test read the bindings created inside createPluginWorkerHandle.
+vi.mock("../middleware/logger.js", () => {
+  const record = { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() };
+  return { logger: { ...record, child: vi.fn(() => record) } };
+});
+
 import {
   createHostClientHandlers,
   JsonRpcCallError,
@@ -17,6 +26,20 @@ import {
   shouldDropDroppableMessage,
   MAX_WORKER_STDIN_BACKLOG_BYTES,
 } from "../services/plugin-worker-manager.js";
+import { logger } from "../middleware/logger.js";
+import { HttpError } from "../errors.js";
+
+type LogSpy = ReturnType<typeof vi.fn>;
+const logSpies = (logger as unknown as {
+  child: () => { error: LogSpy; warn: LogSpy };
+}).child();
+
+/** Structured fields logged alongside `message`, across all calls to `spy`. */
+function fieldsLoggedAs(spy: LogSpy, message: string): Record<string, unknown>[] {
+  return spy.mock.calls
+    .filter((call: unknown[]) => call[1] === message)
+    .map((call: unknown[]) => call[0] as Record<string, unknown>);
+}
 
 const FIXTURES_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 const DELAYED_WORKER_ENTRYPOINT = path.join(FIXTURES_DIR, "plugin-worker-delayed.cjs");
@@ -399,6 +422,88 @@ describe("plugin-worker-manager stderr failure context", () => {
     }
   });
 
+  it("scopes runJob invocations per company stamped on job.companyId, for a plugin with more than one configured company (BLO-20957)", async () => {
+    const companiesGet = vi.fn(async (
+      params: { companyId: string },
+      context?: { invocationScope?: { companyId?: string | null } | null },
+    ) => ({
+      id: params.companyId,
+      scopedCompanyId: context?.invocationScope?.companyId ?? null,
+    }));
+    // No `bootstrapCompanyId` — this reproduces a plugin configured by more
+    // than one company, where `plugin-loader.ts` deliberately leaves the
+    // legacy bootstrap scope undefined (`listConfigCompanyIds().length > 1`).
+    // Before BLO-20957, every runJob dispatch on a worker started this way
+    // got an empty `{}` invocation scope no matter which company the
+    // scheduler meant to run the job for, so this nested `companies.get`
+    // call would be denied with "company context is required" for both
+    // dispatches below.
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers: {
+        "companies.get": companiesGet as never,
+      },
+    });
+
+    try {
+      await handle.start();
+
+      // Company A's dispatch must resolve to company A's scope...
+      await expect(handle.call("runJob", {
+        job: {
+          jobKey: "check-alert-escalations",
+          runId: "run-a",
+          trigger: "schedule",
+          scheduledAt: "2026-08-07T00:00:00.000Z",
+          companyId: "company-a",
+          mode: "echo",
+          requestedCompanyId: "company-a",
+        },
+      } as HostToWorkerMethods["runJob"][0])).resolves.toEqual({
+        id: "company-a",
+        scopedCompanyId: "company-a",
+      });
+
+      // ...and company B's independent dispatch must resolve to company B's
+      // scope, never company A's — proving the fan-out is per-company, not a
+      // single process-wide scope shared across dispatches.
+      await expect(handle.call("runJob", {
+        job: {
+          jobKey: "check-alert-escalations",
+          runId: "run-b",
+          trigger: "schedule",
+          scheduledAt: "2026-08-07T00:00:00.000Z",
+          companyId: "company-b",
+          mode: "echo",
+          requestedCompanyId: "company-b",
+        },
+      } as HostToWorkerMethods["runJob"][0])).resolves.toEqual({
+        id: "company-b",
+        scopedCompanyId: "company-b",
+      });
+
+      expect(companiesGet).toHaveBeenNthCalledWith(
+        1,
+        { companyId: "company-a" },
+        { invocationScope: { companyId: "company-a" } },
+      );
+      expect(companiesGet).toHaveBeenNthCalledWith(
+        2,
+        { companyId: "company-b" },
+        { invocationScope: { companyId: "company-b" } },
+      );
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
   it("rejects performAction nested host calls that omit the invocation id", async () => {
     const handlers = createHostClientHandlers({
       pluginId: "test.plugin",
@@ -640,5 +745,175 @@ describe("plugin host company context guards", () => {
     } finally {
       await handle.stop().catch(() => undefined);
     }
+  });
+
+  it("forwards a host error's machine-readable code to the worker as JSON-RPC data", async () => {
+    // BLO-20738. Host services discriminate their failures with
+    // `HttpError.details.code` (`secret_verifier_unsupported`,
+    // `binding_ambiguous`, …), but until this fix only `message` and a numeric
+    // JSON-RPC code crossed to the worker — and since `HttpError` carries
+    // `status` rather than a numeric `code`, every one of them arrived as a
+    // bare INTERNAL_ERROR. A plugin could only tell two host failures apart by
+    // substring-matching English prose, so alertmanager could not distinguish
+    // "this secret cannot be verified at all" (a permanent misconfiguration,
+    // which must fail loudly and be retried) from "wrong bearer" (a routine
+    // 401). This asserts the code now survives the round trip.
+    const verifierUnsupported = Object.assign(
+      new Error("Secret verifier is unavailable: external provider reference"),
+      { status: 422, details: { code: "secret_verifier_unsupported", internalQuery: "SELECT 1" } },
+    );
+    const secretsResolve = vi.fn(async () => {
+      throw verifierUnsupported;
+    });
+    const hostHandlers = createHostClientHandlers({
+      pluginId: "test.plugin",
+      capabilities: ["secrets.read-ref"],
+      services: {
+        config: { get: vi.fn(async () => ({})) },
+        secrets: { resolve: secretsResolve },
+      } as unknown as HostServices,
+    });
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers,
+    });
+
+    try {
+      await handle.start();
+
+      const rejection = await handle.call("performAction", {
+        key: "probe",
+        params: {
+          mode: "echo",
+          hostMethod: "secrets.resolve",
+          requestedCompanyId: "company-a",
+        },
+        actorContext: {
+          type: "agent",
+          userId: null,
+          agentId: "agent-1",
+          runId: "run-1",
+          companyId: "company-a",
+        },
+        renderEnvironment: null,
+      }).then(
+        () => { throw new Error("expected the host handler failure to reject"); },
+        (err: unknown) => err,
+      );
+
+      expect(secretsResolve).toHaveBeenCalledTimes(1);
+      expect(rejection).toMatchObject({
+        data: { code: "secret_verifier_unsupported" },
+      });
+      // Only the code is projected. `details` is free-form and a worker is a
+      // lower-trust process, so forwarding it verbatim would turn this into an
+      // exfiltration channel the first time a call site attaches a query or a
+      // row to one.
+      expect((rejection as { data?: Record<string, unknown> }).data)
+        .toEqual({ code: "secret_verifier_unsupported" });
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+});
+
+/**
+ * BLO-33419 — a host-call denial is an expected, plugin-handled outcome, not a
+ * host fault. Before this, every one was an ERROR whose reason lived under the
+ * pino-pretty-reserved `err` key, so pretty-printing hoisted it onto a
+ * continuation line that Loki ingests as a separate, level-less, message-less
+ * entry. ~450 reasonless ERROR lines/hour on paperclip-0, measured 2026-09-12.
+ */
+describe("host-call denial logging", () => {
+  async function callSecretsResolve(resolveImpl: () => Promise<never>) {
+    logSpies.error.mockClear();
+    logSpies.warn.mockClear();
+
+    const hostHandlers = createHostClientHandlers({
+      pluginId: "test.plugin",
+      capabilities: ["secrets.read-ref"],
+      services: {
+        config: { get: vi.fn(async () => ({})) },
+        secrets: { resolve: vi.fn(resolveImpl) },
+      } as unknown as HostServices,
+    });
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers,
+    });
+
+    try {
+      await handle.start();
+      await handle.call("performAction", {
+        key: "probe",
+        params: {
+          mode: "echo",
+          hostMethod: "secrets.resolve",
+          requestedCompanyId: "company-a",
+        },
+        actorContext: {
+          type: "agent",
+          userId: null,
+          agentId: "agent-1",
+          runId: "run-1",
+          companyId: "company-a",
+        },
+        renderEnvironment: null,
+      }).catch(() => undefined);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  }
+
+  it("logs a denied host call once, below ERROR, with the reason on the same record", async () => {
+    // The exact production shape: plugin-secrets-handler raises a 422 carrying
+    // `binding_missing` when a secret is not bound to the calling plugin.
+    await callSecretsResolve(async () => {
+      throw new HttpError(
+        422,
+        "Secret is not bound to plugin:test.plugin at apiKeyRef",
+        { code: "binding_missing" },
+      );
+    });
+
+    expect(fieldsLoggedAs(logSpies.error, "host handler error")).toEqual([]);
+
+    const denied = fieldsLoggedAs(logSpies.warn, "host call denied");
+    expect(denied).toHaveLength(1);
+    expect(denied[0]).toMatchObject({
+      method: "secrets.resolve",
+      reason: "Secret is not bound to plugin:test.plugin at apiKeyRef",
+      reasonCode: "binding_missing",
+    });
+    // `err` is reserved by pino-pretty and gets hoisted off this record.
+    expect(denied[0]).not.toHaveProperty("err");
+  });
+
+  it("still logs a genuine host fault at ERROR, with the reason on the same record", async () => {
+    // Negative control: the fix must not be "stop logging host failures".
+    await callSecretsResolve(async () => {
+      throw new TypeError("host database handle is closed");
+    });
+
+    expect(fieldsLoggedAs(logSpies.warn, "host call denied")).toEqual([]);
+
+    const faults = fieldsLoggedAs(logSpies.error, "host handler error");
+    expect(faults).toHaveLength(1);
+    expect(faults[0]).toMatchObject({
+      method: "secrets.resolve",
+      reason: "host database handle is closed",
+    });
+    expect(faults[0]).not.toHaveProperty("err");
   });
 });

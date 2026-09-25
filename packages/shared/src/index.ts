@@ -1,10 +1,13 @@
 export { agentAdapterTypeSchema, optionalAgentAdapterTypeSchema } from "./adapter-type.js";
 export {
+  CREDENTIAL_VALUE_RES,
+  REDACTED_VALUE_SENTINEL,
   SENSITIVE_ENV_KEY_RE,
   isPlausiblySensitiveEnvValue,
   isSensitiveEnv,
   isSensitiveEnvKey,
 } from "./sensitive-env.js";
+export { REDACTED_SENTINEL } from "./secret-sentinel.js";
 export {
   getAgentOrgChainHealth,
   getAgentWorkEligibility,
@@ -207,6 +210,7 @@ export {
   ISSUE_RECOVERY_ACTION_STATUSES,
   ISSUE_RECOVERY_ACTION_OWNER_TYPES,
   ISSUE_RECOVERY_ACTION_OUTCOMES,
+  ISSUE_RECOVERY_ACTION_RETIRING_BOUNDS,
   pluginOperationIssueOriginKind,
   isPluginOperationIssueOriginKind,
   ISSUE_RELATION_TYPES,
@@ -214,6 +218,7 @@ export {
   ISSUE_TREE_HOLD_RELEASE_POLICY_STRATEGIES,
   ISSUE_TREE_HOLD_STATUSES,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
+  ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
   PIPELINE_CASE_BODY_DOCUMENT_KEY,
   SYSTEM_ISSUE_DOCUMENT_KEYS,
   isSystemIssueDocumentKey,
@@ -397,6 +402,7 @@ export {
   type IssueRecoveryActionStatus,
   type IssueRecoveryActionOwnerType,
   type IssueRecoveryActionOutcome,
+  type IssueRecoveryActionRetiringBound,
   type IssueRelationType,
   type IssueTreeControlMode,
   type IssueTreeHoldReleasePolicyStrategy,
@@ -703,6 +709,7 @@ export type {
   AdapterEnvironmentTestResult,
   AssetImage,
   Project,
+  PrimaryWorkspaceSource,
   ProjectBudgetSummary,
   ProjectCodebase,
   ProjectCodebaseOrigin,
@@ -970,6 +977,8 @@ export type {
   GitWorktreeBranchIncoherenceEvidence,
   GitWorktreeInProgressOperation,
   HeartbeatRun,
+  HeartbeatRunRetrySuccessor,
+  HeartbeatRunRetrySuccessorState,
   HeartbeatRunEvent,
   HeartbeatRunStatusPhase,
   AgentRuntimeState,
@@ -1342,7 +1351,12 @@ export {
   type ResourceMembershipUpdateResult,
 } from "./types/resource-memberships.js";
 
-export { workspaceRuntimeControlTargetSchema } from "./validators/execution-workspace.js";
+export {
+  collectBranchTemplateProblems,
+  EXECUTION_WORKSPACE_BRANCH_TEMPLATE_KEYS,
+  executionWorkspaceStrategySchema,
+  workspaceRuntimeControlTargetSchema,
+} from "./validators/execution-workspace.js";
 export {
   findWorkspaceCommandDefinition,
   listWorkspaceCommandDefinitions,
@@ -1407,6 +1421,7 @@ export type { ServerGitInfo, ServerGitLocalChanges, ServerInfoSnapshot } from ".
 
 export {
   getClosedIsolatedExecutionWorkspaceMessage,
+  isClosedExecutionWorkspace,
   isClosedIsolatedExecutionWorkspace,
 } from "./execution-workspace-guards.js";
 
@@ -1507,6 +1522,7 @@ export {
   skillTestAgentKeyScopeSchema,
   createAgentKeySchema,
   agentMineInboxQuerySchema,
+  agentMeRecoveryActionsQuerySchema,
   wakeAgentSchema,
   resetAgentSessionSchema,
   testAdapterEnvironmentSchema,
@@ -1579,6 +1595,12 @@ export {
   updateIssueSchema,
   MISPLACED_ISSUE_MONITOR_INPUT_KEYS,
   misplacedIssueMonitorInputMessage,
+  MISPLACED_ISSUE_PARKED_INPUT_KEYS,
+  misplacedIssueParkedInputMessage,
+  parkedDispositionCreateRejectionMessage,
+  issueParkedDispositionSchema,
+  PARKED_DISPOSITION_MAX_HORIZON_DAYS,
+  PARKED_DISPOSITION_MAX_HORIZON_MS,
   issueExecutionPolicySchema,
   issueExecutionStateSchema,
   resolveIssueRecoveryActionSchema,
@@ -1676,6 +1698,7 @@ export {
   type CreateAcceptedPlanDecomposition,
   type CreateIssueLabel,
   type UpdateIssue,
+  type IssueParkedDispositionInput,
   type ResolveIssueRecoveryAction,
   type CheckoutIssue,
   type AddIssueComment,
@@ -1713,8 +1736,10 @@ export {
 } from "./validators/index.js";
 export type { Milestone, CreateMilestoneInput, UpdateMilestoneInput } from "./types/milestone.js";
 export {
+  approvalGateSchema,
   createApprovalSchema,
   listApprovalsQuerySchema,
+  parseApprovalGate,
   upsertBudgetPolicySchema,
   resolveBudgetIncidentSchema,
   resolveApprovalSchema,
@@ -1722,6 +1747,7 @@ export {
   resubmitApprovalSchema,
   withdrawApprovalSchema,
   addApprovalCommentSchema,
+  type ApprovalGate,
   type CreateApproval,
   type ListApprovalsQuery,
   type UpsertBudgetPolicy,

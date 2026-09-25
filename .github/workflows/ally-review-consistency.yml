@@ -1,10 +1,34 @@
 name: Ally Review Consistency Guard
 
-# Asserts that every open PR carries at most one operative Ally review verdict
-# at its current head, that no standing APPROVED masks a Critical/Important
-# finding, and that a review's body-attested head matches the commit GitHub
-# recorded it against. See scripts/check-ally-review-consistency.mjs and
-# BLO-19778 for the incident this guards.
+# Asserts four things about every open PR: that it carries at most one
+# operative Ally review per lane at its current head; that no operative review
+# is submitted from the User seat at all, which R4 (BLO-24056) retired because
+# the seat shares a login with the authoring App and so cannot be an independent
+# verdict; that no standing APPROVED masks a Critical/Important finding, omits
+# its `Reviewed head:` attestation, or lets a seat approval stand over a
+# blocking App review; and that a review's body-attested head matches the commit
+# GitHub recorded it against.
+#
+# The seat-lane and cross-credential arms of the first check, and the
+# seat-approval-over-a-blocker arm of the third, can only fire where the seat
+# prohibition already fires. They are retained for the detail they add to a seat
+# violation, not as independent policy.
+#
+# The seat prohibition subsumes BLO-22916, whose two defects were one verdict
+# submitted under both credentials and five content-free seat approvals that
+# attested no head at all. An earlier revision of this guard treated the
+# App/User pair as the required protected-merge shape and asked only that the
+# two bodies differ, which is why the second defect was invisible to it.
+# See scripts/check-ally-review-consistency.mjs and BLO-19778 for the incident
+# this guards.
+#
+# Findings are ratcheted: every open PR is still audited and every violation is
+# still printed, but the run fails only on violations absent from
+# scripts/ally-review-consistency-baseline.json. Without that, one abandoned PR
+# holding a duplicate review pins the run red forever and a new violation moves
+# it from red to red — an auditor whose output is a constant carries no more
+# information than no auditor. A baseline entry is keyed on the head SHA and
+# review IDs, so it expires as soon as the PR is pushed to. See PEN-2847.
 
 on:
   schedule:
@@ -28,7 +52,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
-      - name: Assert one operative Ally verdict per PR head
+      - name: Assert the allowed operative Ally review shape per PR head
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ALLY_REVIEW_REPO: ${{ inputs.repo || 'Blockcast/paperclip' }}

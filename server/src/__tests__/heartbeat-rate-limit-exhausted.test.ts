@@ -9,11 +9,14 @@ import {
   heartbeatRuns,
 } from "@paperclipai/db";
 import {
+  ZERO_TOKEN_STREAK_SCAN_LIMIT,
   countConsecutiveZeroTokenCompletedRuns,
   isRateLimitExhausted,
   isRetryableK8sCcrotateThrottleResult,
+  K8S_REPLACEMENT_LAUNCH_FAILURE_AFTER_THROTTLE_KEY,
   k8sCcrotateRetryDelayMs,
   listRecentTerminalRunsForZeroTokenStreak,
+  reclassifyK8sReplacementLaunchFailureAfterThrottle,
 } from "../services/heartbeat.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -400,6 +403,118 @@ describe("k8s ccrotate no-progress throttle detection", () => {
   });
 });
 
+// BLO-34577: the in-run throttle loop relaunches the Job for the same run. On
+// 2026-09-18 the relaunch read the previous attempt's Failed pod and returned
+// `k8s_pod_schedule_failed` ~100 ms after create; the finalizer recorded that
+// code and the pr_review run was dropped without a retry, while the identical
+// 429 seen through the throttle path retried. These pin the server-side verdict.
+describe("reclassifyK8sReplacementLaunchFailureAfterThrottle (BLO-34577)", () => {
+  const TENANT_429 =
+    'API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"All Claude subscription capacity for this tenant is rate-limited"}}';
+  const zeroUsage = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
+  const throttleResult = {
+    exitCode: 1,
+    signal: null,
+    timedOut: false,
+    errorMessage: TENANT_429,
+    errorCode: null,
+    retryNotBefore: "2026-09-18T12:40:00.000Z",
+    resultJson: { api_error_status: 429, is_error: true },
+    usage: zeroUsage,
+  };
+  const launchFailure = {
+    exitCode: null,
+    signal: null,
+    timedOut: false,
+    errorMessage:
+      "Pod scheduling failed: Pod ac-ally-96fa0c75-3f2a1b-x9k2q reached phase=Failed: claude exited 1",
+    errorCode: "k8s_pod_schedule_failed",
+  };
+
+  it("finalizes a replacement-launch failure after an in-run throttle with the throttle verdict", () => {
+    const reclassified = reclassifyK8sReplacementLaunchFailureAfterThrottle({
+      launchResult: launchFailure,
+      throttleResult,
+      throttleAttempts: 2,
+    });
+    expect(reclassified).not.toBeNull();
+    // The verdict is the throttle's: the code the finalizer treats as terminal is gone...
+    expect(reclassified!.errorCode).not.toBe("k8s_pod_schedule_failed");
+    // ...and the result still classifies as the in-run throttle the loop was retrying,
+    // so the finalizer takes the provider_throttled_no_progress / rate_limit_exhausted arm.
+    expect(isRetryableK8sCcrotateThrottleResult(reclassified!)).toBe(true);
+    expect(reclassified!.resultJson).toMatchObject({ api_error_status: 429, is_error: true });
+    expect(reclassified!.retryNotBefore).toBe("2026-09-18T12:40:00.000Z");
+    // The launch failure is kept as an annotation, not lost.
+    expect(reclassified!.resultJson?.[K8S_REPLACEMENT_LAUNCH_FAILURE_AFTER_THROTTLE_KEY]).toEqual({
+      errorCode: "k8s_pod_schedule_failed",
+      errorMessage: launchFailure.errorMessage,
+      throttleAttempts: 2,
+      throttleErrorCode: null,
+    });
+    expect(reclassified!.errorMessage).toContain("rate-limited");
+    expect(reclassified!.errorMessage).toContain("after 2 in-run throttle retries");
+    expect(reclassified!.errorMessage).toContain("phase=Failed: claude exited 1");
+  });
+
+  it("leaves an ambiguous k8s_pod_schedule_failed alone when no throttle preceded it", () => {
+    // Negative control: with no observed throttle the launch failure means what it
+    // says, and the existing "does not retry ambiguous k8s_pod_schedule_failed"
+    // contract must keep applying to it.
+    expect(
+      reclassifyK8sReplacementLaunchFailureAfterThrottle({
+        launchResult: launchFailure,
+        throttleResult: null,
+        throttleAttempts: 0,
+      }),
+    ).toBeNull();
+    expect(
+      reclassifyK8sReplacementLaunchFailureAfterThrottle({
+        launchResult: launchFailure,
+        throttleResult,
+        throttleAttempts: 0,
+      }),
+    ).toBeNull();
+  });
+
+  it("only reclassifies a launch failure, never another terminal result", () => {
+    for (const launchResult of [
+      { exitCode: 0, signal: null, timedOut: false, usage: { inputTokens: 40, outputTokens: 12 } },
+      { exitCode: 1, signal: null, timedOut: false, errorCode: "adapter_failed", errorMessage: "boom" },
+      { exitCode: null, signal: null, timedOut: false, errorCode: "k8s_concurrent_run_blocked" },
+    ]) {
+      expect(
+        reclassifyK8sReplacementLaunchFailureAfterThrottle({
+          launchResult,
+          throttleResult,
+          throttleAttempts: 1,
+        }),
+      ).toBeNull();
+    }
+  });
+
+  it("does not let a non-throttle prior result stand in as the verdict", () => {
+    // The loop never retries a result with token usage, so a prior result that
+    // made progress is not a throttle chain; do not manufacture one.
+    expect(
+      reclassifyK8sReplacementLaunchFailureAfterThrottle({
+        launchResult: launchFailure,
+        throttleResult: { ...throttleResult, usage: { inputTokens: 12, outputTokens: 3 } },
+        throttleAttempts: 1,
+      }),
+    ).toBeNull();
+    // Nor a launch failure that somehow reports usage: the pod is claimed to
+    // have never run, so this is not the shape the reclassifier understands.
+    expect(
+      reclassifyK8sReplacementLaunchFailureAfterThrottle({
+        launchResult: { ...launchFailure, usage: { inputTokens: 1, outputTokens: 0 } },
+        throttleResult,
+        throttleAttempts: 1,
+      }),
+    ).toBeNull();
+  });
+});
+
 describe("countConsecutiveZeroTokenCompletedRuns", () => {
   it("counts only the newest terminal zero-token prefix", () => {
     expect(countConsecutiveZeroTokenCompletedRuns([
@@ -551,6 +666,57 @@ describeEmbeddedPostgres("listRecentTerminalRunsForZeroTokenStreak", () => {
     const rows = await listRecentTerminalRunsForZeroTokenStreak(db, agentId);
 
     expect(rows.map((row) => row.status)).toEqual(["cancelled", "failed", "succeeded"]);
+  });
+
+  // BLO-21415: this LIMIT is the zero-token gauge's saturation point, because
+  // countConsecutiveZeroTokenCompletedRuns counts a prefix of these rows. At the
+  // old value of 10 a brief blip and a badly-wedged agent both reported exactly
+  // 10, so the alert carried no severity signal above its own threshold.
+  it("scans far enough past the alert threshold to distinguish a blip from a wedge", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Wedged",
+      role: "engineer",
+      status: "idle",
+      adapterType: "opencode_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const wedgedRunCount = ZERO_TOKEN_STREAK_SCAN_LIMIT + 5;
+    const base = Date.parse("2026-07-08T12:00:00Z");
+    await db.insert(heartbeatRuns).values(
+      Array.from({ length: wedgedRunCount }, (_, i) => ({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        status: "failed" as const,
+        usageJson: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+        startedAt: new Date(base + i * 60_000),
+        finishedAt: new Date(base + i * 60_000 + 30_000),
+        createdAt: new Date(base + i * 60_000),
+      })),
+    );
+
+    const rows = await listRecentTerminalRunsForZeroTokenStreak(db, agentId);
+    expect(rows).toHaveLength(ZERO_TOKEN_STREAK_SCAN_LIMIT);
+
+    const streak = countConsecutiveZeroTokenCompletedRuns(rows);
+    expect(streak).toBe(ZERO_TOKEN_STREAK_SCAN_LIMIT);
+    // The old ceiling; a wedge must now read strictly above it.
+    expect(streak).toBeGreaterThan(10);
   });
 });
 

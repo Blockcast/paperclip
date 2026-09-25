@@ -1,4 +1,7 @@
 import express from "express";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -626,5 +629,180 @@ describe("instance settings routes", () => {
 
     expect(res.status).toBe(403);
     expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
+  });
+
+  it("warns but still saves a hook command whose absolute script is missing (BLO-28782)", async () => {
+    const app = await createApp({
+      type: "board",
+      userId: "user-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: ["company-1"],
+    });
+
+    const res = await request(app)
+      .patch("/api/instance/settings/general")
+      .send({ quotaExhaustedCmd: "node /app/server/dist/cli/ccrotate-relogin-trigger.js" });
+
+    expect(res.status).toBe(200);
+    expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalledWith({
+      quotaExhaustedCmd: "node /app/server/dist/cli/ccrotate-relogin-trigger.js",
+    });
+    expect(res.body.hookCommandWarnings).toHaveLength(1);
+    expect(res.body.hookCommandWarnings[0]).toMatchObject({
+      setting: "quotaExhaustedCmd",
+      missingPaths: ["/app/server/dist/cli/ccrotate-relogin-trigger.js"],
+    });
+    // The warning must reach the activity surface an operator already queries
+    // for hook failures, not just the HTTP response the caller may discard.
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "instance.lifecycle_hook_command_unresolved",
+        entityId: "quotaExhaustedCmd",
+        details: expect.objectContaining({
+          detectedAt: "write",
+          missingPaths: ["/app/server/dist/cli/ccrotate-relogin-trigger.js"],
+        }),
+      }),
+    );
+  });
+
+  it("does not lock an operator out of a hook script on a worker-only volume mount", async () => {
+    // The API pod serving this PATCH cannot see a volume mounted only into
+    // workers, so existsSync here says "missing" for a path that will in fact
+    // resolve where the hook is spawned. That must not refuse the write.
+    const app = await createApp({
+      type: "board",
+      userId: "user-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: ["company-1"],
+    });
+
+    const res = await request(app)
+      .patch("/api/instance/settings/general")
+      .send({ postRunCmd: "bash /paperclip/scripts/relogin.sh" });
+
+    expect(res.status).toBe(200);
+    expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalledWith({
+      postRunCmd: "bash /paperclip/scripts/relogin.sh",
+    });
+    expect(res.body.hookCommandWarnings?.[0]?.missingPaths).toEqual([
+      "/paperclip/scripts/relogin.sh",
+    ]);
+  });
+
+  it("rejects an oversized hook command before it reaches the filesystem", async () => {
+    // The audit stats every script-like token synchronously, inline in this
+    // handler. Uncapped, a 10 MB body measured ~4 s of blocked event loop, which
+    // stalls health probes and every in-flight request (BLO-28872 review). The
+    // validator is the bound; assert the write never happens.
+    const app = await createApp({
+      type: "board",
+      userId: "user-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: ["company-1"],
+    });
+
+    const oversized = Array.from({ length: 4000 }, (_, i) => `/x${i}.sh`).join(" ");
+    expect(oversized.length).toBeGreaterThan(4096);
+
+    const res = await request(app)
+      .patch("/api/instance/settings/general")
+      .send({ quotaExhaustedCmd: oversized });
+
+    expect(res.status).toBe(400);
+    expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
+  });
+
+  it("accepts a hook command whose script exists with no warning", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hook-audit-"));
+    const script = join(dir, "relogin.sh");
+    writeFileSync(script, "#!/usr/bin/env bash\nexit 0\n");
+
+    const app = await createApp({
+      type: "board",
+      userId: "user-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: ["company-1"],
+    });
+
+    const res = await request(app)
+      .patch("/api/instance/settings/general")
+      .send({ quotaExhaustedCmd: `bash ${script}` });
+
+    expect(res.status).toBe(200);
+    expect(res.body.hookCommandWarnings).toBeUndefined();
+    expect(mockLogActivity).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: "instance.lifecycle_hook_command_unresolved" }),
+    );
+  });
+
+  it("accepts clearing a hook command", async () => {
+    const app = await createApp({
+      type: "board",
+      userId: "user-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: ["company-1"],
+    });
+
+    const res = await request(app)
+      .patch("/api/instance/settings/general")
+      .send({ quotaExhaustedCmd: null });
+
+    expect(res.status).toBe(200);
+    expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalledWith({
+      quotaExhaustedCmd: null,
+    });
+    expect(res.body.hookCommandWarnings).toBeUndefined();
+  });
+
+  it("does not annotate an unrelated patch when a stored hook is already drifted", async () => {
+    // Establish real drift in the *stored* settings: this is the regression —
+    // pre-existing drift must not follow an admin into an unrelated save. The
+    // guard reads only req.body, and this test fails if it ever widens to
+    // consult stored settings.
+    mockInstanceSettingsService.getGeneral.mockResolvedValue({
+      censorUsernameInLogs: false,
+      keyboardShortcuts: false,
+      feedbackDataSharingPreference: "prompt",
+      quotaExhaustedCmd: "node /app/server/dist/cli/ccrotate-relogin-trigger.js",
+    });
+    mockInstanceSettingsService.updateGeneral.mockResolvedValue({
+      id: "instance-settings-1",
+      general: {
+        censorUsernameInLogs: false,
+        keyboardShortcuts: true,
+        feedbackDataSharingPreference: "prompt",
+        quotaExhaustedCmd: "node /app/server/dist/cli/ccrotate-relogin-trigger.js",
+      },
+    });
+
+    const app = await createApp({
+      type: "board",
+      userId: "user-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: ["company-1"],
+    });
+
+    const res = await request(app)
+      .patch("/api/instance/settings/general")
+      .send({ keyboardShortcuts: true });
+
+    expect(res.status).toBe(200);
+    expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalledWith({
+      keyboardShortcuts: true,
+    });
+    expect(res.body.hookCommandWarnings).toBeUndefined();
+    expect(mockLogActivity).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: "instance.lifecycle_hook_command_unresolved" }),
+    );
   });
 });

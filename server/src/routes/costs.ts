@@ -1,5 +1,6 @@
 import { Router } from "express";
-import type { Db } from "@paperclipai/db";
+import { and, eq } from "drizzle-orm";
+import { budgetPolicies, type Db } from "@paperclipai/db";
 import {
   createCostEventSchema,
   createFinanceEventSchema,
@@ -24,6 +25,7 @@ import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo }
 import { fetchAllQuotaWindows } from "../services/quota-windows.js";
 import { badRequest } from "../errors.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
+import type { BudgetEnforcementScope } from "../services/budgets.js";
 
 export function parseCostDateRange(query: Record<string, unknown>) {
   const fromRaw = query.from as string | undefined;
@@ -368,34 +370,78 @@ export function costRoutes(
 
     assertBoard(req);
 
-    const updated = await agents.update(agentId, { budgetMonthlyCents: req.body.budgetMonthlyCents });
+    const actor = getActorInfo(req);
+    const deferredCancellations: BudgetEnforcementScope[] = [];
+    const updated = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      // Lock the policy rows before anything touches `agents` — the one lock
+      // order for this pair, stated in full on `upsertPolicy` in `budgets.ts`.
+      // This route used to be the lone inversion: `txAgents.update` first, then
+      // the policy lock inside `upsertPolicy`'s UPDATE. Against a concurrent
+      // apply on the same agent that is a textbook ABBA deadlock — Postgres
+      // aborts one side with 40P01, which is not an `HttpError`, so the caller
+      // gets an unhandled 500 with no retry and a board cap change is the losing
+      // side as often as the apply is (BLO-32796).
+      await txDb
+        .select({ id: budgetPolicies.id })
+        .from(budgetPolicies)
+        .where(
+          and(eq(budgetPolicies.scopeType, "agent"), eq(budgetPolicies.scopeId, agentId)),
+        )
+        .for("update");
+      const txAgents = agentService(txDb);
+      // Process termination is irreversible and uses the outer DB connection.
+      // Defer it until the transaction has committed so a failed policy write
+      // cannot leave work cancelled for a cap change that rolled back.
+      const txBudgets = budgetService(txDb, {
+        cancelWorkForScope: async (scope) => {
+          deferredCancellations.push(scope);
+        },
+      });
+      const txUpdated = await txAgents.update(
+        agentId,
+        { budgetMonthlyCents: req.body.budgetMonthlyCents },
+        {
+          recordRevision: {
+            createdByAgentId: actor.agentId,
+            createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+            source: "budgets-patch",
+          },
+        },
+      );
+      if (!txUpdated) return null;
+
+      await logActivity(txDb, {
+        companyId: txUpdated.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        action: "agent.budget_updated",
+        entityType: "agent",
+        entityId: txUpdated.id,
+        details: { budgetMonthlyCents: txUpdated.budgetMonthlyCents },
+      });
+
+      await txBudgets.upsertPolicy(
+        txUpdated.companyId,
+        {
+          scopeType: "agent",
+          scopeId: txUpdated.id,
+          amount: txUpdated.budgetMonthlyCents,
+          windowKind: "calendar_month_utc",
+        },
+        req.actor.type === "board" ? req.actor.userId ?? "board" : null,
+      );
+
+      return txUpdated;
+    });
+    for (const scope of deferredCancellations) {
+      await budgetHooks.cancelWorkForScope(scope);
+    }
     if (!updated) {
       res.status(404).json({ error: "Agent not found" });
       return;
     }
-
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: updated.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      action: "agent.budget_updated",
-      entityType: "agent",
-      entityId: updated.id,
-      details: { budgetMonthlyCents: updated.budgetMonthlyCents },
-    });
-
-    await budgets.upsertPolicy(
-      updated.companyId,
-      {
-        scopeType: "agent",
-        scopeId: updated.id,
-        amount: updated.budgetMonthlyCents,
-        windowKind: "calendar_month_utc",
-      },
-      req.actor.type === "board" ? req.actor.userId ?? "board" : null,
-    );
 
     res.json(updated);
   });

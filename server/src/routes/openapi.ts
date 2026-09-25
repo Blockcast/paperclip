@@ -10,6 +10,7 @@ import {
   updateAgentInstructionsBundleSchema,
   upsertAgentInstructionsFileSchema,
   createAgentKeySchema,
+  agentMeRecoveryActionsQuerySchema,
   builtInAgentEmptyMutationSchema,
   builtInAgentProvisionSchema,
   generateSummarySlotSchema,
@@ -841,15 +842,37 @@ const AUTHENTICATED_OPERATIONS = new Set([
   "GET /api/plugins/rag-health",
 ]);
 
+// Every operation whose handler enforces instance admin. `BOARD_ONLY_PREFIXES`
+// would otherwise classify most of these as plain `board`, understating the
+// privilege boundary for spec-driven consumers. The openapi-routes suite walks
+// the route sources and fails if a handler calls `assertInstanceAdmin` without a
+// matching entry here, so keep this in sync with the routes rather than by hand.
 const INSTANCE_ADMIN_OPERATIONS = new Set([
   "POST /api/companies",
-  "POST /api/plugins/install",
   "POST /api/instance/reset",
   "POST /api/instance/database-backups",
+  "GET /api/instance/scheduler-heartbeats",
   "POST /api/service-account-tokens",
+  "GET /api/admin/users",
   "POST /api/admin/users/{userId}/promote-instance-admin",
   "POST /api/admin/users/{userId}/demote-instance-admin",
+  "GET /api/admin/users/{userId}/company-access",
   "PUT /api/admin/users/{userId}/company-access",
+  "POST /api/adapters/install",
+  "PATCH /api/adapters/{type}",
+  "PATCH /api/adapters/{type}/override",
+  "DELETE /api/adapters/{type}",
+  "POST /api/adapters/{type}/reload",
+  "POST /api/adapters/{type}/reinstall",
+  "POST /api/plugins/install",
+  "DELETE /api/plugins/{pluginId}",
+  "POST /api/plugins/{pluginId}/enable",
+  "POST /api/plugins/{pluginId}/disable",
+  "POST /api/plugins/{pluginId}/upgrade",
+  "GET /api/plugins/{pluginId}/config",
+  "POST /api/plugins/{pluginId}/config",
+  "POST /api/plugins/{pluginId}/config/test",
+  "POST /api/plugins/{pluginId}/jobs/{jobId}/trigger",
 ]);
 
 const CREATED_OPERATIONS = new Set([
@@ -1511,6 +1534,20 @@ registry.registerPath({
   path: "/api/agents/me/inbox-lite",
   tags: ["agents"],
   summary: "Get current agent inbox (lite) — todo, in_progress, blocked (in_review excluded)",
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/agents/me/recovery-actions",
+  tags: ["agents"],
+  summary: "List recovery actions the current agent OWNS (defaults to active + escalated)",
+  description:
+    "Owner-scoped view of recovery beacons. Distinct from inbox-lite, which carries " +
+    "`activeRecoveryAction` only for issues the agent is the ASSIGNEE of — a beacon " +
+    "routinely names this agent as owner on a row assigned to someone else, and those " +
+    "obligations appear only here.",
+  request: { query: agentMeRecoveryActionsQuerySchema },
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
 
@@ -2934,7 +2971,8 @@ registry.registerPath({
   method: "post",
   path: "/api/approvals/{id}/withdraw",
   tags: ["approvals"],
-  summary: "Withdraw an approval request (requesting agent or board)",
+  summary:
+    "Withdraw an undecided approval request (requesting agent or board). Accepts `pending` and `revision_requested`; a decision note already written by the board is preserved and the withdrawal reason is recorded as an approval comment.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(withdrawApprovalSchema),
@@ -2946,6 +2984,23 @@ registry.registerPath({
     403: r.forbidden,
     404: r.notFound,
     409: r.conflict,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/approvals/{id}/apply",
+  tags: ["approvals"],
+  summary:
+    "Apply the values an approved card recorded to the objects that enforce them (requesting agent). Takes no body — every figure comes from the approved payload, so this route cannot express a figure the board did not decide. Refuses when the card is not `approved` (409), the caller is not the requester or the target is the caller's own budget (403), or no assertion resolves to an exact, still-unapplied target (422). Applying is idempotent. Approval authority is unchanged: `approve`/`reject`/`request-revision` remain board-only.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
   },
 });
 
@@ -3170,6 +3225,28 @@ registry.registerPath({
     query: z.object({
       weeks: z.string().optional(),
       threshold: z.string().optional(),
+    }),
+  },
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/recovery-actions",
+  tags: ["dashboard"],
+  summary: "List issue recovery actions",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      ownerAgentId: z.string().uuid().optional(),
+      kind: z.string().optional(),
+      status: z.string().optional(),
+      limit: z.string().optional(),
+      offset: z.string().optional(),
+      // Documented because `asc` is what makes a census of the legacy tail
+      // reachable at all past the 500-row limit; the route has accepted both
+      // since BLO-19124 but neither appeared here.
+      order: z.enum(["asc", "desc"]).optional(),
     }),
   },
   responses: { 200: r.ok(), 401: r.unauthorized },
@@ -5543,6 +5620,11 @@ for (const route of [
   ["get", "/api/companies/{companyId}/search", "Search company data"],
   ["get", "/api/companies/{companyId}/search/extract", "Extract company search matches"],
   ["get", "/api/companies/{companyId}/issues/count", "Count issues in a company"],
+  [
+    "get",
+    "/api/companies/{companyId}/issues/open-assignment-census",
+    "Authoritative per-agent open-assignment census (single snapshot, not paginated)",
+  ],
 ] as const) {
   registerCurrentRoute({
     method: route[0],

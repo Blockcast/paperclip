@@ -4,6 +4,7 @@ import { heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import {
   addApprovalCommentSchema,
   createApprovalSchema,
+  isUuidLike,
   listApprovalsQuerySchema,
   requestApprovalRevisionSchema,
   resolveApprovalSchema,
@@ -18,28 +19,56 @@ import {
   logActivity,
   secretService,
 } from "../services/index.js";
-import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
-import { redactApprovalPayloadForDisplay } from "../redaction.js";
+import { actorCanReadAgentConfig, assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
+import { redactApprovalPayloadForDisplay, withholdAgentConfigFromApprovalPayload } from "../redaction.js";
+import {
+  BUDGET_POLICY_AMOUNT_ASSERTION,
+  extractEnforcementAssertions,
+  loadEnforcedBudgetPolicies,
+  stampAssertionPriors,
+} from "../services/approval-enforcement-reconciler.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { resolveApprovalWithSideEffects } from "../services/approval-resolution.js";
+import { applyApprovalEnforcement } from "../services/approval-enforcement-executor.js";
+import { heartbeatService } from "../services/heartbeat.js";
+import { STATUS_ONLY_RECOVERY_RESUME_GUIDANCE } from "../services/recovery/model-profile-hint.js";
+import {
+  buildIssueGraphLivenessBoardEscalationKey,
+  parseIssueGraphLivenessIncidentKey,
+  RECOVERY_KEY_PREFIXES,
+  RECOVERY_ORIGIN_KINDS,
+} from "../services/recovery/origins.js";
 
+/**
+ * `includeAgentConfig` is the caller's `agent_config:read` verdict, not a
+ * formatting preference — see `withholdAgentConfigFromApprovalPayload`. It is a
+ * required argument so a new approval-serializing route has to state which side
+ * of that gate it is on rather than inheriting a permissive default.
+ */
 function redactApprovalPayload<T extends { type: string; payload: Record<string, unknown> }>(
   approval: T,
-): T & { redactedFields: string[] } {
+  options: { includeAgentConfig: boolean },
+): T & { redactedFields: string[]; withheldFields: string[] } {
   const { payload, redactedFields } = redactApprovalPayloadForDisplay(approval.type, approval.payload);
+  if (options.includeAgentConfig) {
+    return { ...approval, payload, redactedFields, withheldFields: [] };
+  }
+  const withheld = withholdAgentConfigFromApprovalPayload(approval.type, payload);
   return {
     ...approval,
-    payload,
+    payload: withheld.payload,
     redactedFields,
+    withheldFields: withheld.withheldFields,
   };
 }
 
 function approvalResolutionResponse<T extends { type: string; payload: Record<string, unknown> }>(
   approval: T,
   applied: boolean,
-): T & { redactedFields: string[]; applied: boolean } {
+  options: { includeAgentConfig: boolean },
+): T & { redactedFields: string[]; withheldFields: string[]; applied: boolean } {
   return {
-    ...redactApprovalPayload(approval),
+    ...redactApprovalPayload(approval, options),
     applied,
   };
 }
@@ -57,6 +86,87 @@ function approvalResolutionResponse<T extends { type: string; payload: Record<st
 // barred regardless of the target approval's type.
 const BOARD_ESCALATION_APPROVAL_TYPE = "request_board_approval";
 
+// BLO-34008: refuse a budget card that declares no machine-checkable target.
+//
+// Approving this type writes nothing to `budget_policies` — approvalService
+// .approve() special-cases only `hire_agent` — so the only thing that can ever
+// notice an approved-but-unapplied budget decision is the enforcement reconciler,
+// and it can only see a card that declares its figures. Card `304ea443` is the
+// cost of accepting one that does not: its eight decided figures went into
+// `payload.raises`/`payload.cuts` as prose keyed by agent display name, it was
+// approved, and all eight changes were still unapplied five days later with
+// nothing able to raise a word. It remains unparseable and always will be.
+// Refusing is the only repair that does not reduce to regexing a figure out of
+// English, which BLO-32796's first guardrail forbids outright.
+//
+// Shared by create and resubmit because the guard has to hold on every route that
+// can leave a card `pending`, not just the one that files it. Resubmit replaces the
+// payload wholesale and returns the card to `pending`, so guarding creation alone
+// left the whole failure mode reachable in two calls: file a compliant card, have
+// the board send it back, then resubmit it prose-only and have it approved.
+//
+// Deliberately scoped to caller-supplied payloads. The budget watcher's own
+// threshold cards are filed through insertApproval() (services/budgets.ts) and
+// reach neither route — correctly, because such a card records that a cap was
+// *crossed*, not a decided figure to raise it *to*. There is no target to declare
+// until the board writes one at /costs, and inventing one here would be precisely
+// the guess this refusal exists to prevent.
+function budgetAssertionRefusal(type: string, payload: unknown) {
+  if (type !== "budget_override_required") return null;
+  if (extractEnforcementAssertions(payload).length > 0) return null;
+
+  return {
+    error:
+      "`budget_override_required` requires at least one machine-checkable entry in " +
+      "`payload.enforcement_assertions`; prose figures cannot be verified against enforcement",
+    details: {
+      code: "budget_approval_missing_enforcement_assertion",
+      // The `enforcement_assertions` fragment to merge into the payload — not a
+      // whole card. The refusal has to be fixable in a single retry: these cards
+      // are filed when a cap is about to stop an agent, so a guard that costs a
+      // round of guesswork is its own outage.
+      //
+      // Every field here is either forced to be replaced or safe to copy. A
+      // fragment built to be copied has to assume it *will* be, verbatim, minus
+      // only what the caller is obliged to touch:
+      //   - `policyId` — the one field the server cannot supply, so it is spelled
+      //     to be unusable rather than plausible: a copied placeholder passes here
+      //     and is then refused by the reconciler as `missing_policy`, which is
+      //     coverage in name only.
+      //   - `label` — same treatment, for the same reason one layer out. It is not
+      //     inert: extractEnforcementAssertions() reads it and describeDrift()
+      //     prepends it to the raised issue ("- CTO `<id>` — decided ..."), so a
+      //     real-looking name that survives the copy misattributes another agent's
+      //     drift to whoever the example happened to name.
+      //   - `expected_usd` — the figure the caller came to state, so it cannot
+      //     survive by accident.
+      //   - no `from_usd`: the remediation below says never to invent one, and an
+      //     example that ships a concrete starting figure invites exactly that.
+      example_assertions: [
+        {
+          kind: BUDGET_POLICY_AMOUNT_ASSERTION,
+          policyId: "<replace with the budget_policies.id uuid>",
+          expected_usd: 32000,
+          label: "<replace with the agent or scope this policy caps>",
+        },
+      ],
+      remediation:
+        "Add one entry per policy this decision changes, under `payload.enforcement_assertions`. " +
+        "`policyId` is a `budget_policies.id` uuid — NOT an agent id; read it from the budget " +
+        "policy that enforces the cap. Give the target as `expected_usd` (dollars) or " +
+        "`expected_amount_cents` (integer cents). `label` is printed into the drift report this " +
+        "assertion raises, so set it to the agent or scope this policy actually caps — a label " +
+        "left over from the example misattributes the drift. You do not need the figure the change " +
+        "starts from: the server reads it off the policy you named and records it as " +
+        "`from_amount_cents`, which is what lets a later reader tell 'never applied' from " +
+        "'applied and then superseded'. State `from_usd` / `from_amount_cents` yourself only if " +
+        "you know a prior the policy row no longer shows — never invent one. On resubmit, send the " +
+        "corrected assertions in the resubmit body: the check runs against the payload that will " +
+        "end up pending, and a card filed before this guard existed has none stored.",
+    },
+  };
+}
+
 function statusOnlyEscalationSourceIssueId(contextSnapshot: unknown): string | null {
   if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return null;
   const sourceIssueId = (contextSnapshot as Record<string, unknown>).sourceIssueId;
@@ -73,6 +183,21 @@ function isStatusOnlyCheapRecoveryContext(contextSnapshot: unknown) {
     context.resumeRequiresNormalModel === true;
 }
 
+function isPlanningOnlyRecoveryContext(contextSnapshot: unknown) {
+  if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
+  const context = contextSnapshot as Record<string, unknown>;
+  return context.recoveryIntent === "planning_only" &&
+    context.allowDeliverableWork === false &&
+    context.allowDocumentUpdates === true &&
+    context.resumeRequiresNormalModel === false;
+}
+
+type ApprovalRunContextDecision =
+  | { allowed: false }
+  | { allowed: true; boardEscalationCoalesceKey?: string };
+
+const ALLOWED: ApprovalRunContextDecision = { allowed: true };
+
 export function approvalRoutes(
   db: Db,
   options: { pluginWorkerManager?: PluginWorkerManager } = {},
@@ -82,7 +207,27 @@ export function approvalRoutes(
   const access = accessService(db);
   const issueApprovalsSvc = issueApprovalService(db);
   const secretsSvc = secretService(db);
+  // Built once, like `costRoutes` does for the sibling budget-writing route
+  // (`costs.ts`), rather than rebuilding the whole heartbeat closure graph on
+  // every apply just to reach one method.
+  const heartbeat = heartbeatService(db, {
+    pluginWorkerManager: options.pluginWorkerManager,
+  });
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
+
+  // Stamp the pre-decision figure onto any canonical assertion that omits one,
+  // reading it from the policy the assertion names (BLO-34008). Runs on both
+  // routes that can leave a card `pending`, for the same reason the refusal
+  // does: what matters is the payload that ends up decided.
+  //
+  // Called only after `budgetAssertionRefusal` has passed, so a payload with no
+  // usable assertion never reaches the lookup.
+  async function stampPriors(companyId: string, type: string, payload: unknown) {
+    if (type !== "budget_override_required") return payload;
+    const policyIds = extractEnforcementAssertions(payload).map((a) => a.policyId);
+    if (policyIds.length === 0) return payload;
+    return stampAssertionPriors(payload, await loadEnforcedBudgetPolicies(db, companyId, policyIds));
+  }
 
   async function requireApprovalAccess(req: Request, id: string) {
     const approval = await svc.getById(id);
@@ -104,15 +249,24 @@ export function approvalRoutes(
     return false;
   }
 
+  /**
+   * `company_scope:read` gets you the card; it does not get you the hire's
+   * embedded agent configuration. Second, narrower verdict resolved per request
+   * and threaded into every approval serialization. PEN-2777.
+   */
+  async function approvalReadOptions(req: Request, companyId: string) {
+    return { includeAgentConfig: await actorCanReadAgentConfig(req, access, companyId) };
+  }
+
   async function assertApprovalMutationAllowedByRunContext(
     req: Request,
     res: any,
     companyId: string,
     options: { requestedType?: unknown; requestedIssueIds?: unknown } = {},
-  ) {
-    if (req.actor.type !== "agent") return true;
+  ): Promise<ApprovalRunContextDecision> {
+    if (req.actor.type !== "agent") return ALLOWED;
     const runId = req.actor.runId?.trim();
-    if (!runId || !req.actor.agentId) return true;
+    if (!runId || !req.actor.agentId) return ALLOWED;
 
     const run = await db
       .select({
@@ -124,24 +278,33 @@ export function approvalRoutes(
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
-    if (!run || run.companyId !== companyId || run.agentId !== req.actor.agentId) return true;
-    if (!isStatusOnlyCheapRecoveryContext(run.contextSnapshot)) return true;
+    if (!run || run.companyId !== companyId || run.agentId !== req.actor.agentId) return ALLOWED;
+    const statusOnly = isStatusOnlyCheapRecoveryContext(run.contextSnapshot);
+    const planningOnly = isPlanningOnlyRecoveryContext(run.contextSnapshot);
+    if (!statusOnly && !planningOnly) return ALLOWED;
 
-    const refuse = (error: string, extra: Record<string, unknown> = {}) => {
+    const refuse = (error: string, extra: Record<string, unknown> = {}): ApprovalRunContextDecision => {
       res.status(403).json({
         error,
         details: {
           companyId,
           runId: run.id,
-          modelProfile: "cheap",
-          recoveryIntent: "status_only",
-          resumeRequiresNormalModel: true,
-          allowedApprovalType: BOARD_ESCALATION_APPROVAL_TYPE,
+          ...(statusOnly ? {
+            modelProfile: "cheap",
+            allowedApprovalType: BOARD_ESCALATION_APPROVAL_TYPE,
+            ...STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
+          } : {}),
+          recoveryIntent: planningOnly ? "planning_only" : "status_only",
+          resumeRequiresNormalModel: statusOnly,
           ...extra,
         },
       });
-      return false;
+      return { allowed: false };
     };
+
+    if (planningOnly) {
+      return refuse("Planning-only recovery runs cannot create or modify approvals");
+    }
 
     if (options.requestedType !== BOARD_ESCALATION_APPROVAL_TYPE) {
       return refuse(
@@ -235,7 +398,47 @@ export function approvalRoutes(
       );
     }
 
-    return true;
+    const boardEscalationCoalesceKey = await resolveBoardEscalationCoalesceKey(sourceIssue);
+    return boardEscalationCoalesceKey ? { allowed: true, boardEscalationCoalesceKey } : ALLOWED;
+  }
+
+  /**
+   * The key that makes one incident raise one card (BLO-24744).
+   *
+   * Only liveness escalations get one: they are the run class minted per repair target by a
+   * detector, so N of them can be dispatched for one root cause with no filer able to see the
+   * others. Every other status-only escalation is filed by an agent that chose to file it and can
+   * pass its own `idempotencyKey`.
+   *
+   * For `blocked_by_uninvokable_assignee` the human decides about the AGENT, so that is the key —
+   * one pause, one card, however many of its issues are blocking. The repair-target issue is the
+   * fallback: still enough to collapse repeat filings for that one incident across runs.
+   */
+  async function resolveBoardEscalationCoalesceKey(sourceIssue: {
+    companyId: string;
+    originKind: string | null;
+    originId: string | null;
+  }): Promise<string | null> {
+    if (sourceIssue.originKind !== RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation) return null;
+    const incident = parseIssueGraphLivenessIncidentKey(sourceIssue.originId);
+    if (!incident || incident.companyId !== sourceIssue.companyId) return null;
+
+    // The last key component is `blockerIssueId ?? participantAgentId ?? "none"`, so it is an issue
+    // id for the blocked_by_* states and an agent id (or the "none" sentinel) for the others. Only
+    // look up an id that can be one — `issues.id` is a uuid column and would raise on the sentinel.
+    const repairTarget = isUuidLike(incident.leafIssueId)
+      ? await db
+        .select({ assigneeAgentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(and(eq(issues.id, incident.leafIssueId), eq(issues.companyId, sourceIssue.companyId)))
+        .then((rows) => rows[0] ?? null)
+      : null;
+
+    return buildIssueGraphLivenessBoardEscalationKey({
+      companyId: sourceIssue.companyId,
+      state: incident.state,
+      rootCauseId: repairTarget?.assigneeAgentId ?? incident.leafIssueId,
+    });
   }
 
   router.get("/companies/:companyId/approvals", async (req, res) => {
@@ -272,7 +475,8 @@ export function approvalRoutes(
     }
 
     const result = await svc.list(companyId, filters);
-    res.json(result.map((approval) => redactApprovalPayload(approval)));
+    const readOptions = await approvalReadOptions(req, companyId);
+    res.json(result.map((approval) => redactApprovalPayload(approval, readOptions)));
   });
 
   router.get("/approvals/:id", async (req, res) => {
@@ -280,7 +484,7 @@ export function approvalRoutes(
     const approval = await getAccessibleResource(req, res, svc.getById(id), "Approval not found");
     if (!approval) return;
     if (!(await assertApprovalAccessAllowed(req, res, approval.companyId))) return;
-    res.json(redactApprovalPayload(approval));
+    res.json(redactApprovalPayload(approval, await approvalReadOptions(req, approval.companyId)));
   });
 
   router.post("/companies/:companyId/approvals", validate(createApprovalSchema), async (req, res) => {
@@ -292,10 +496,32 @@ export function approvalRoutes(
       ? rawIssueIds.filter((value: unknown): value is string => typeof value === "string")
       : [];
     const uniqueIssueIds = Array.from(new Set(issueIds));
-    if (!(await assertApprovalMutationAllowedByRunContext(req, res, companyId, {
+    const runContextDecision = await assertApprovalMutationAllowedByRunContext(req, res, companyId, {
       requestedType: req.body.type,
       requestedIssueIds: uniqueIssueIds,
-    }))) return;
+    });
+    if (!runContextDecision.allowed) return;
+    // The coalescing key below is company-scoped, which means it deliberately ignores who filed the
+    // card. That is only safe while the namespace is unforgeable: a caller that could plant a row
+    // under `harness_liveness_board:<company>:<state>:<agent>` would have the next genuine
+    // escalation for that incident silently replay ITS card instead of raising one. The ids are all
+    // guessable by any company agent, so reserve the namespace rather than rely on obscurity.
+    if (
+      !runContextDecision.boardEscalationCoalesceKey &&
+      typeof req.body.idempotencyKey === "string" &&
+      req.body.idempotencyKey.startsWith(`${RECOVERY_KEY_PREFIXES.issueGraphLivenessBoardEscalation}:`)
+    ) {
+      res.status(422).json({
+        error: "`idempotencyKey` may not use the server-reserved liveness board-escalation namespace",
+        details: {
+          reservedPrefix: `${RECOVERY_KEY_PREFIXES.issueGraphLivenessBoardEscalation}:`,
+          remediation:
+            "Choose your own idempotency key. Paperclip derives this key itself for approvals filed " +
+            "from a `harness_liveness_escalation` issue, so that one incident raises one card.",
+        },
+      });
+      return;
+    }
     const { issueIds: _issueIds, ...approvalInput } = req.body;
     const normalizedPayload =
       approvalInput.type === "hire_agent"
@@ -315,12 +541,19 @@ export function approvalRoutes(
       return;
     }
 
+    const budgetRefusal = budgetAssertionRefusal(approvalInput.type, normalizedPayload);
+    if (budgetRefusal) {
+      res.status(422).json(budgetRefusal);
+      return;
+    }
+    const persistedPayload = await stampPriors(companyId, approvalInput.type, normalizedPayload);
+
     const actor = getActorInfo(req);
     const requestedByAgentId = actor.actorType === "agent" ? actor.actorId : null;
     const requestedByUserId = actor.actorType === "user" ? actor.actorId : null;
     const payloadObj =
-      typeof normalizedPayload === "object" && normalizedPayload !== null
-        ? (normalizedPayload as Record<string, unknown>)
+      typeof persistedPayload === "object" && persistedPayload !== null
+        ? (persistedPayload as Record<string, unknown>)
         : {};
     const approvalTitle =
       typeof payloadObj.title === "string" ? payloadObj.title : undefined;
@@ -332,9 +565,14 @@ export function approvalRoutes(
           : undefined;
 
     const publishCreatedActivityRef: { current: (() => void) | null } = { current: null };
+    // A liveness escalation's card is the incident's, not the filer's: the detector mints one
+    // escalation per repair target, so the run filing this one cannot see its siblings and cannot
+    // pick a key that collapses with theirs. The server picks it, and overrides any caller key —
+    // deferring to the caller here is exactly how one pause becomes N identical cards (BLO-24744).
+    const coalesceKey = runContextDecision.boardEscalationCoalesceKey;
     const { approval, deduplicated } = await svc.createWithIdempotency(companyId, {
       ...approvalInput,
-      payload: normalizedPayload,
+      payload: persistedPayload,
       // Requester identity is derived only from the authenticated actor, and exactly one
       // requester column is populated. Letting a user also nominate `requestedByAgentId`
       // makes the idempotency key ambiguous because both requester-scoped unique indexes
@@ -346,7 +584,9 @@ export function approvalRoutes(
       decidedByUserId: null,
       decidedAt: null,
       updatedAt: new Date(),
+      ...(coalesceKey ? { idempotencyKey: coalesceKey } : {}),
     }, {
+      ...(coalesceKey ? { dedupeScope: "company" as const } : {}),
       afterCreate: async (txDb, createdApproval) => {
         if (uniqueIssueIds.length > 0) {
           await issueApprovalService(txDb).linkManyForApproval(createdApproval.id, uniqueIssueIds, {
@@ -397,7 +637,7 @@ export function approvalRoutes(
     if (deduplicated) {
       const pendingForMs = Date.now() - new Date(approval.createdAt).getTime();
       res.status(200).json({
-        ...redactApprovalPayload(approval),
+        ...redactApprovalPayload(approval, await approvalReadOptions(req, companyId)),
         deduplicated: true,
         deduplicationReason: "idempotency_key",
         pendingSince: approval.createdAt,
@@ -410,7 +650,7 @@ export function approvalRoutes(
       return;
     }
 
-    res.status(201).json(redactApprovalPayload(approval));
+    res.status(201).json(redactApprovalPayload(approval, await approvalReadOptions(req, companyId)));
   });
 
   router.get("/approvals/:id/issues", async (req, res) => {
@@ -443,7 +683,7 @@ export function approvalRoutes(
       },
     });
 
-    res.json(approvalResolutionResponse(approval, applied));
+    res.json(approvalResolutionResponse(approval, applied, await approvalReadOptions(req, approval.companyId)));
   });
 
   router.post("/approvals/:id/reject", validate(resolveApprovalSchema), async (req, res) => {
@@ -467,7 +707,7 @@ export function approvalRoutes(
       },
     });
 
-    res.json(approvalResolutionResponse(approval, applied));
+    res.json(approvalResolutionResponse(approval, applied, await approvalReadOptions(req, approval.companyId)));
   });
 
   router.post(
@@ -494,7 +734,7 @@ export function approvalRoutes(
         },
       });
 
-      res.json(approvalResolutionResponse(approval, applied));
+      res.json(approvalResolutionResponse(approval, applied, await approvalReadOptions(req, approval.companyId)));
     },
   );
 
@@ -502,7 +742,7 @@ export function approvalRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Approval not found");
     if (!existing) return;
-    if (!(await assertApprovalMutationAllowedByRunContext(req, res, existing.companyId))) return;
+    if (!(await assertApprovalMutationAllowedByRunContext(req, res, existing.companyId)).allowed) return;
 
     if (req.actor.type === "agent" && req.actor.agentId !== existing.requestedByAgentId) {
       res.status(403).json({ error: "Only requesting agent can resubmit this approval" });
@@ -531,7 +771,64 @@ export function approvalRoutes(
         normalizedPayload = { ...normalizedPayload, agentId: existing.linkedAgentId };
       }
     }
-    const approval = await svc.resubmit(id, normalizedPayload);
+    // Guard the payload that will actually end up `pending`. `svc.resubmit()` keeps
+    // the existing one when the caller supplies none, so checking only the supplied
+    // payload would let a card filed before this guard existed — every one of them,
+    // including `304ea443` — walk back to `pending` unverifiable on an empty body.
+    //
+    // Two carve-outs, both from Ally's review of `ee43166`:
+    //
+    // Status first, because only a `revision_requested` card can reach `pending`.
+    // Anything else fails in `svc.resubmit()` on status, and answering that with an
+    // assertion complaint points the caller at the wrong problem. The transactional
+    // check in the service stays authoritative; this only picks the error.
+    //
+    // Then: the stored-payload half must not apply to the budget watcher's own
+    // threshold cards. Those record that a cap was *crossed*, not a figure to raise
+    // it *to*, so they have no target to declare — the same reason creation exempts
+    // them (they are filed through insertApproval() and never reach that route).
+    // Applying it here refused the board's only resubmit affordance (ApprovalDetail
+    // sends no payload) for a card no payload can satisfy, leaving it recoverable
+    // only by API — and both `budget_override_required` cards sitting in
+    // `revision_requested` today are watcher cards. Server-filed is not forgeable:
+    // the create route derives requester identity from the authenticated actor and
+    // always populates exactly one of the two columns, so both-null means
+    // insertApproval(). A *supplied* payload is still checked — an operator who
+    // states a figure has stated one that must be verifiable.
+    const serverFiled = !existing.requestedByAgentId && !existing.requestedByUserId;
+    const skipBudgetGuard =
+      existing.status !== "revision_requested" || (serverFiled && normalizedPayload === undefined);
+    const budgetRefusal = skipBudgetGuard
+      ? null
+      : budgetAssertionRefusal(existing.type, normalizedPayload ?? existing.payload);
+    if (budgetRefusal) {
+      res.status(422).json(budgetRefusal);
+      return;
+    }
+
+    // Stamp whichever payload will actually end up `pending`, for the same reason
+    // the refusal checks that one. Stamping only a *supplied* payload left the
+    // motivating cohort uncovered: a card filed before the creation stamp existed
+    // carries an assertion with no prior, which passes the refusal above (that
+    // only requires *an* assertion, not a prior) and walks back to `pending`
+    // classifying as `unverifiable_mismatch` — the exact state this exists to
+    // eliminate. Found by Ally reviewing `b8d4f5e`.
+    //
+    // `stampAssertionPriors` returns its argument by reference when it changes
+    // nothing, so keep-vs-overwrite semantics are untouched: an empty resubmit
+    // still sends `undefined` and lets `svc.resubmit()` keep the stored payload
+    // unless there was genuinely a prior to add.
+    const stamped = await stampPriors(
+      existing.companyId,
+      existing.type,
+      normalizedPayload ?? existing.payload,
+    );
+    const resubmitPayload =
+      normalizedPayload === undefined && stamped === existing.payload
+        ? undefined
+        : (stamped as Record<string, unknown> | undefined);
+
+    const approval = await svc.resubmit(id, resubmitPayload);
     const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: approval.companyId,
@@ -543,14 +840,14 @@ export function approvalRoutes(
       entityId: approval.id,
       details: { type: approval.type },
     });
-    res.json(redactApprovalPayload(approval));
+    res.json(redactApprovalPayload(approval, await approvalReadOptions(req, approval.companyId)));
   });
 
   router.post("/approvals/:id/withdraw", validate(withdrawApprovalSchema), async (req, res) => {
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Approval not found");
     if (!existing) return;
-    if (!(await assertApprovalMutationAllowedByRunContext(req, res, existing.companyId))) return;
+    if (!(await assertApprovalMutationAllowedByRunContext(req, res, existing.companyId)).allowed) return;
 
     // Scoped exactly like resubmit: a requester may rescind its own ask, but
     // never another agent's. Board actors retain full reach.
@@ -570,7 +867,39 @@ export function approvalRoutes(
       },
     });
 
-    res.json(redactApprovalPayload(approval));
+    res.json(redactApprovalPayload(approval, await approvalReadOptions(req, approval.companyId)));
+  });
+
+  /**
+   * Apply the values an approved card recorded to the objects that enforce
+   * them (BLO-32796).
+   *
+   * Requester-scoped rather than `assertBoard`-gated, and that is the whole
+   * point: it executes a decision a board actor already made. Approval
+   * authority is untouched — `approve`/`reject`/`requestRevision` above remain
+   * board-only, and this route cannot express any figure that is not already in
+   * the approved payload, because it takes no figures at all.
+   */
+  router.post("/approvals/:id/apply", async (req, res) => {
+    const id = req.params.id as string;
+    const approval = await getAccessibleResource(req, res, svc.getById(id), "Approval not found");
+    if (!approval) return;
+    if (!(await assertApprovalMutationAllowedByRunContext(req, res, approval.companyId)).allowed) return;
+
+    const actor = getActorInfo(req);
+    const result = await applyApprovalEnforcement(
+      db,
+      id,
+      {
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId ?? null,
+        isBoard: req.actor.type === "board",
+      },
+      { cancelWorkForScope: heartbeat.cancelBudgetScopeWork },
+    );
+
+    res.json(result);
   });
 
   router.get("/approvals/:id/comments", async (req, res) => {
@@ -585,7 +914,7 @@ export function approvalRoutes(
     const id = req.params.id as string;
     const approval = await getAccessibleResource(req, res, svc.getById(id), "Approval not found");
     if (!approval) return;
-    if (!(await assertApprovalMutationAllowedByRunContext(req, res, approval.companyId))) return;
+    if (!(await assertApprovalMutationAllowedByRunContext(req, res, approval.companyId)).allowed) return;
     const actor = getActorInfo(req);
     const comment = await svc.addComment(id, req.body.body, {
       agentId: actor.agentId ?? undefined,

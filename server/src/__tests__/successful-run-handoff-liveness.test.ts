@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
 import { agents, companies, createDb, heartbeatRuns, issues } from "@paperclipai/db";
 import type { SuccessfulRunHandoffState } from "@paperclipai/shared";
 import {
@@ -8,6 +9,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import {
   hydrateSuccessfulRunHandoffLiveness,
+  resolveSuccessfulRunHandoffForTerminalIssues,
   SUCCESSFUL_RUN_HANDOFF_UNSTARTED_RUN_LIVENESS_MS,
 } from "../services/successful-run-handoff-state.js";
 
@@ -237,5 +239,127 @@ describeEmbeddedPostgres("successful run handoff liveness", () => {
     // not an accident: beyond that horizon this surface would be calling a run
     // live that the platform has already written off.
     expect(SUCCESSFUL_RUN_HANDOFF_UNSTARTED_RUN_LIVENESS_MS).toBe(6 * 60 * 60 * 1000);
+  });
+
+  /**
+   * BLO-16074. Only two writers ever emit `issue.successful_run_handoff_resolved`
+   * — a heartbeat run that takes a valid continuation path, and a PATCH whose
+   * actor is a *user*. An issue closed by an agent, by a sweeper, or by any other
+   * route therefore keeps reporting `state: "required"` forever.
+   *
+   * Measured on BLO-23447: `done` at 2026-08-10T12:35:33Z, still reporting
+   * `successfulRunHandoff.state: "required"` a day later, with the recovery
+   * action on the same issue already correctly resolved. That asymmetry is the
+   * defect — `classifySourceRecoveryRevalidation` folds a stale recovery action
+   * the moment its issue reaches a terminal status, and nothing did the same for
+   * the handoff.
+   */
+  describe("terminal source issue", () => {
+    async function setIssueStatus(issueId: string, status: string) {
+      await db.update(issues).set({ status }).where(eq(issues.id, issueId));
+    }
+
+    async function projectFor(
+      companyId: string,
+      issueId: string,
+      kind: SuccessfulRunHandoffState["state"] = "required",
+    ) {
+      const states = new Map<string, SuccessfulRunHandoffState>([
+        [
+          issueId,
+          {
+            state: kind,
+            required: kind === "required",
+            hasLiveContinuation: false,
+            sourceRunId: null,
+            correctiveRunId: null,
+            assigneeAgentId: null,
+            detectedProgressSummary: null,
+            createdAt: new Date(),
+          } satisfies SuccessfulRunHandoffState,
+        ],
+      ]);
+      await resolveSuccessfulRunHandoffForTerminalIssues(db, companyId, states);
+      return states.get(issueId)!;
+    }
+
+    it("resolves a required handoff once its issue is done", async () => {
+      const { companyId, issueId } = await seed();
+      await setIssueStatus(issueId, "done");
+
+      const state = await projectFor(companyId, issueId);
+
+      expect(state.state).toBe("resolved");
+      expect(state.required).toBe(false);
+      expect(state.resolvedBySourceIssueStatus).toBe("done");
+    });
+
+    it("resolves a required handoff once its issue is cancelled", async () => {
+      const { companyId, issueId } = await seed();
+      await setIssueStatus(issueId, "cancelled");
+
+      const state = await projectFor(companyId, issueId);
+
+      expect(state.state).toBe("resolved");
+      expect(state.required).toBe(false);
+      expect(state.resolvedBySourceIssueStatus).toBe("cancelled");
+    });
+
+    it("leaves a required handoff outstanding while its issue is still open", async () => {
+      // The bound must be a real bound. Folding an open issue's handoff would
+      // hide exactly the obligation this field exists to surface.
+      const { companyId, issueId } = await seed();
+
+      const state = await projectFor(companyId, issueId);
+
+      expect(state.state).toBe("required");
+      expect(state.required).toBe(true);
+      expect(state.resolvedBySourceIssueStatus).toBeUndefined();
+    });
+
+    it("leaves an escalated handoff escalated on a closed issue", async () => {
+      // `escalated` records that recovery took the issue over; that stays
+      // legible after closure. Only `required` is an outstanding obligation.
+      const { companyId, issueId } = await seed();
+      await setIssueStatus(issueId, "done");
+
+      const state = await projectFor(companyId, issueId, "escalated");
+
+      expect(state.state).toBe("escalated");
+      expect(state.resolvedBySourceIssueStatus).toBeUndefined();
+    });
+
+    it("does not report a live continuation on a closed issue that still has a queued run", async () => {
+      // Ordering guard. Terminal resolution runs BEFORE liveness hydration, so
+      // a closed issue can never come back carrying a live-looking corrective
+      // run — the contradiction ("resolved, but something is still running it")
+      // that made this field unreadable in the first place.
+      const { companyId, agentId, issueId } = await seed();
+      await insertRun({ companyId, agentId, issueId, status: "queued", createdAt: hoursAgo(1) });
+      await setIssueStatus(issueId, "done");
+
+      const states = new Map<string, SuccessfulRunHandoffState>([
+        [
+          issueId,
+          {
+            state: "required",
+            required: true,
+            hasLiveContinuation: false,
+            sourceRunId: null,
+            correctiveRunId: null,
+            assigneeAgentId: null,
+            detectedProgressSummary: null,
+            createdAt: new Date(),
+          } satisfies SuccessfulRunHandoffState,
+        ],
+      ]);
+      await resolveSuccessfulRunHandoffForTerminalIssues(db, companyId, states);
+      await hydrateSuccessfulRunHandoffLiveness(db, companyId, states);
+
+      const state = states.get(issueId)!;
+      expect(state.state).toBe("resolved");
+      expect(state.hasLiveContinuation).toBe(false);
+      expect(state.liveRunId).toBeNull();
+    });
   });
 });

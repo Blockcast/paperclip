@@ -1,0 +1,38 @@
+name: Report merge-queue ejections
+
+on:
+  workflow_run:
+    # Deliberate bound, not an oversight: three workflows emit merge_group runs
+    # here. Measured over 1000 merge-group runs -- PR 272/79/19 (success/failure/
+    # cancelled), commitperclip PR Review 370/2, Comment-review gate (merge queue)
+    # 255/2. `PR` alone is 98 of the 102 non-success runs, so this covers ~96% of
+    # ejections. The other two are left out until their failures are shown to
+    # actually eject; subscribing to a non-required check would comment on PRs
+    # that were never ejected.
+    workflows: [PR]
+    types: [completed]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  report:
+    if: ${{ github.event.workflow_run.event == 'merge_group' && (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') }}
+    runs-on: arc-light
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: master
+          sparse-checkout: .github/scripts/report-merge-queue-ejection.mjs
+      - name: Report ejection to PR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_WORKFLOW_RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          GITHUB_WORKFLOW_RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: node .github/scripts/report-merge-queue-ejection.mjs

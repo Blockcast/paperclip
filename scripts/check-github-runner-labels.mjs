@@ -1,11 +1,19 @@
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-const workflowsDir = path.resolve(".github/workflows");
-const workflowFiles = (await readdir(workflowsDir))
-  .filter((file) => file.endsWith(".yml") || file.endsWith(".yaml"))
-  .sort();
-const ALLOWED_RUNNERS = new Set([
+// Must stay in lockstep with `self-hosted-runner.labels` in
+// `.github/actionlint.yaml`, which declares the same pools to actionlint for
+// the workflow-parse gate (scripts/check-workflows-parse.mjs).
+//
+// The two checkers are complementary rather than redundant: this one splits
+// TERNARY_RUNNER_EXPRESSION below and validates both branches, which
+// actionlint treats as one opaque expression. But a pool added to only one
+// list produces a split verdict — the gate that does not know the label goes
+// red while the other passes, on some unrelated PR. The "runner-label
+// allowlists agree" test in scripts/check-workflows-parse.test.mjs asserts
+// the two lists match, so that drift fails loudly and by name instead.
+export const ALLOWED_RUNNERS = new Set([
   "default",
   "arc-light",
   "arc-dind",
@@ -27,7 +35,6 @@ const ALLOWED_RUNNERS = new Set([
 // below and fails closed as an unrecognized runner label.
 const TERNARY_RUNNER_EXPRESSION =
   /^\$\{\{\s*github\.event_name\s*==\s*'merge_group'\s*&&\s*'([^']*)'\s*\|\|\s*'([^']*)'\s*\}\}$/;
-const violations = [];
 
 function stripInlineComment(value) {
   let quote = null;
@@ -130,26 +137,41 @@ function extractRunsOnEntries(lines, runsOnLineIndex, rawValue) {
     : [{ value: "", lineNumber: runsOnLineIndex + 1, sourceLine }];
 }
 
-for (const file of workflowFiles) {
-  const lines = (await readFile(path.join(workflowsDir, file), "utf8")).split("\n");
+async function main() {
+  const workflowsDir = path.resolve(".github/workflows");
+  const workflowFiles = (await readdir(workflowsDir))
+    .filter((file) => file.endsWith(".yml") || file.endsWith(".yaml"))
+    .sort();
+  const violations = [];
 
-  for (const [index, line] of lines.entries()) {
-    const match = line.match(/^\s*runs-on:\s*(.*)$/);
-    if (!match) continue;
+  for (const file of workflowFiles) {
+    const lines = (await readFile(path.join(workflowsDir, file), "utf8")).split("\n");
 
-    const entries = extractRunsOnEntries(lines, index, match[1] ?? "");
-    for (const entry of entries) {
-      if (!entry.value || !ALLOWED_RUNNERS.has(entry.value)) {
-        violations.push(`${file}:${entry.lineNumber}: ${entry.sourceLine}`);
+    for (const [index, line] of lines.entries()) {
+      const match = line.match(/^\s*runs-on:\s*(.*)$/);
+      if (!match) continue;
+
+      const entries = extractRunsOnEntries(lines, index, match[1] ?? "");
+      for (const entry of entries) {
+        if (!entry.value || !ALLOWED_RUNNERS.has(entry.value)) {
+          violations.push(`${file}:${entry.lineNumber}: ${entry.sourceLine}`);
+        }
       }
     }
   }
+
+  if (violations.length > 0) {
+    console.error(`Runner labels must use one of: ${[...ALLOWED_RUNNERS].join(", ")}:`);
+    console.error(violations.join("\n"));
+    process.exitCode = 1;
+  } else {
+    console.log(`Validated ${workflowFiles.length} workflows: all runner labels use ARC.`);
+  }
 }
 
-if (violations.length > 0) {
-  console.error(`Runner labels must use one of: ${[...ALLOWED_RUNNERS].join(", ")}:`);
-  console.error(violations.join("\n"));
-  process.exitCode = 1;
-} else {
-  console.log(`Validated ${workflowFiles.length} workflows: all runner labels use ARC.`);
+// Guarded so `ALLOWED_RUNNERS` can be imported — by the allowlist-agreement
+// test in scripts/check-workflows-parse.test.mjs — without the import itself
+// running the checker and scanning the repo as a side effect.
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await main();
 }

@@ -47,6 +47,23 @@ vi.mock("../services/live-events.js", () => ({
   publishGlobalLiveEvent: vi.fn(),
 }));
 
+/**
+ * The plugin-config write path runs its read/modify/write inside one
+ * transaction guarded by `pg_advisory_xact_lock` (BLO-26529), so the fake `db`
+ * these suites pass has to offer `transaction`. Each test here drives a single
+ * request at a time, so running the callback inline against a no-op `execute`
+ * models it faithfully; the concurrent interleaving that lock exists for is
+ * covered by `plugin-config-write-race.test.ts`.
+ */
+function withTransactionSupport(db: unknown) {
+  const candidate = (db ?? {}) as Record<string, unknown>;
+  if (typeof candidate.transaction === "function") return candidate;
+  return {
+    ...candidate,
+    transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn({ execute: async () => {} }),
+  };
+}
+
 async function createApp(
   actor: Record<string, unknown>,
   loaderOverrides: Record<string, unknown> = {},
@@ -89,7 +106,7 @@ async function createApp(
     next();
   });
   app.use("/api", pluginRoutes(
-    (routeOverrides.db ?? {}) as never,
+    withTransactionSupport(routeOverrides.db ?? {}) as never,
     loader as never,
     routeOverrides.jobDeps as never,
     undefined,
@@ -1466,6 +1483,122 @@ describe.sequential("GET /api/plugins/alerts/plugin-health", () => {
     expect(res.status).toBe(403);
     expect(mockRegistry.listByStatus).not.toHaveBeenCalled();
   });
+
+  it("BLO-20957: surfaces a scheduled job with a sustained failure streak, even when the plugin worker itself is healthy", async () => {
+    mockRegistry.listByStatus.mockResolvedValue([]);
+    mockRegistry.getById.mockResolvedValue({
+      id: pluginId,
+      pluginKey: "paperclip-plugin-alertmanager",
+    });
+    const jobStore = {
+      listJobsWithFailureStreak: vi.fn().mockResolvedValue([
+        {
+          job: { id: "job-1", pluginId, jobKey: "check-alert-escalations" },
+          companyId: "company-a",
+          consecutiveFailures: 3,
+          lastError: 'Plugin is not allowed to perform "issues.list": company context is required',
+        },
+      ]),
+    };
+    const { app } = await createApp(boardActor(), {}, {
+      jobDeps: { scheduler: {}, jobStore },
+    });
+
+    const res = await request(app).get("/api/plugins/alerts/plugin-health");
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("firing");
+    expect(res.body.alerts).toHaveLength(1);
+    const alert = res.body.alerts[0];
+    expect(alert.alertname).toBe("PaperclipPluginScheduledJobFailing");
+    expect(alert.severity).toBe("page");
+    expect(alert.pluginId).toBe(pluginId);
+    expect(alert.pluginKey).toBe("paperclip-plugin-alertmanager");
+    expect(alert.jobKey).toBe("check-alert-escalations");
+    expect(alert.consecutiveFailures).toBe(3);
+    expect(alert.lastError).toContain("company context is required");
+    expect(jobStore.listJobsWithFailureStreak).toHaveBeenCalledWith(3);
+  });
+
+  it("BLO-20957 review: names the failing tenant, so a responder knows which of N companies is broken", async () => {
+    mockRegistry.listByStatus.mockResolvedValue([]);
+    mockRegistry.getById.mockResolvedValue({
+      id: pluginId,
+      pluginKey: "paperclip-plugin-slack",
+    });
+    // Two tenants of the same job failing independently must produce two
+    // distinct, individually-actionable alerts — not one smeared alert.
+    const jobStore = {
+      listJobsWithFailureStreak: vi.fn().mockResolvedValue([
+        {
+          job: { id: "job-1", pluginId, jobKey: "commit-pending-approvals" },
+          companyId: "company-a",
+          consecutiveFailures: 3,
+          lastError: "company context is required",
+        },
+        {
+          job: { id: "job-1", pluginId, jobKey: "commit-pending-approvals" },
+          companyId: "company-b",
+          consecutiveFailures: 4,
+          lastError: "company context is required",
+        },
+      ]),
+    };
+    const { app } = await createApp(boardActor(), {}, {
+      jobDeps: { scheduler: {}, jobStore },
+    });
+
+    const res = await request(app).get("/api/plugins/alerts/plugin-health");
+
+    expect(res.status).toBe(200);
+    expect(res.body.alerts).toHaveLength(2);
+    expect(res.body.alerts.map((a: { companyId: string }) => a.companyId).sort()).toEqual([
+      "company-a",
+      "company-b",
+    ]);
+    // The tenant must be legible from the human-facing text too, not only
+    // from a machine field.
+    expect(res.body.alerts[0].description).toContain("company-a");
+  });
+
+  it("BLO-20957 review: labels an instance-scoped streak instead of emitting a bare null company", async () => {
+    mockRegistry.listByStatus.mockResolvedValue([]);
+    mockRegistry.getById.mockResolvedValue({
+      id: pluginId,
+      pluginKey: "paperclip-plugin-alertmanager",
+    });
+    const jobStore = {
+      listJobsWithFailureStreak: vi.fn().mockResolvedValue([
+        {
+          job: { id: "job-1", pluginId, jobKey: "check-alert-escalations" },
+          companyId: null,
+          consecutiveFailures: 3,
+          lastError: "Failed to enumerate configured companies: registry unavailable",
+        },
+      ]),
+    };
+    const { app } = await createApp(boardActor(), {}, {
+      jobDeps: { scheduler: {}, jobStore },
+    });
+
+    const res = await request(app).get("/api/plugins/alerts/plugin-health");
+
+    expect(res.status).toBe(200);
+    const alert = res.body.alerts[0];
+    expect(alert.companyId).toBeNull();
+    expect(alert.description).toContain("instance-scoped");
+  });
+
+  it("does not query job failure streaks when no job scheduling dependencies are wired", async () => {
+    mockRegistry.listByStatus.mockResolvedValue([]);
+    const { app } = await createApp(boardActor());
+
+    const res = await request(app).get("/api/plugins/alerts/plugin-health");
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("ok");
+    expect(res.body.alerts).toEqual([]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2129,6 +2262,16 @@ describe.sequential("plugin config secret masking (BLO-20794)", () => {
 // assertions keep that decision honest, so that widening the gate has to be a
 // deliberate edit to this file rather than a silent side effect.
 describe.sequential("plugin state routes stay board-only for agent actors (BLO-22120)", () => {
+  // These assertions are all `not.toHaveBeenCalled()` on the shared hoisted
+  // `mockRegistry`, so without clearing here the block inherits whatever calls
+  // the preceding describe happened to make and fails for a reason that has
+  // nothing to do with the board-only gate it exists to protect. Every other
+  // describe in this file already does this; this one was relying on the last
+  // test before it happening to be a 403 case (BLO-20957).
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
   it("rejects an agent actor with 403 when it tries to enumerate plugin state", async () => {
     const { app } = await createApp(agentActor());
 
@@ -2231,4 +2374,109 @@ describe.sequential("plugin state routes stay board-only for agent actors (BLO-2
 
     expect(res.status).toBe(501);
   });
+});
+
+// ---------------------------------------------------------------------------
+// BLO-26530 — masking gaps in the merged BLO-20871 boundary, at the route level
+// ---------------------------------------------------------------------------
+
+describe.sequential("plugin config masking gaps (BLO-26530)", () => {
+  const TARGET_SECRET = "sentinel-target-bearer-do-not-leak";
+  const CONDITIONAL_SECRET = "sentinel-conditional-bearer-do-not-leak";
+
+  /** An array whose entries declare an immutable identity, plus a conditional arm. */
+  const gapSchema = {
+    type: "object",
+    properties: {
+      targets: {
+        type: "array",
+        items: {
+          type: "object",
+          "x-paperclip-identity": "name",
+          properties: {
+            name: { type: "string" },
+            url: { type: "string" },
+            token: { type: "string", writeOnly: true },
+          },
+        },
+      },
+      mode: { type: "string" },
+    },
+    if: { properties: { mode: { const: "managed" } } },
+    then: { properties: { lookaside: { type: "string", writeOnly: true } } },
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockRegistry.getConfig.mockReset();
+    mockRegistry.upsertConfig.mockReset();
+    ragHealthBucketCache.clear();
+    mockSecretService.getById.mockResolvedValue({ id: secretId, companyId: companyA, status: "active" });
+    mockSecretService.syncSecretRefsForTarget.mockResolvedValue([]);
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("refuses a write that posts one designated identity twice, leaving the stored credential untouched", async () => {
+    maskingPlugin(gapSchema);
+    const store = seedConfigStore({
+      targets: [{ name: "alpha", url: "https://a.example.com", token: TARGET_SECRET }],
+      mode: "direct",
+    });
+    const { app } = await createApp(adminActor());
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/config`)
+      .send({
+        companyId: companyA,
+        configJson: {
+          targets: [
+            { name: "alpha", url: "https://a.example.com", token: "__redacted__" },
+            { name: "alpha", url: "https://attacker.example.com", token: "__redacted__" },
+          ],
+          mode: "direct",
+        },
+      });
+
+    expect(res.status).toBe(400);
+    expect(res.body.unresolvedMaskPaths).toEqual(["targets.0", "targets.1"]);
+    // The credential must appear in neither resulting entry, and the rejected
+    // write must not have disturbed storage.
+    expect(JSON.stringify(res.body)).not.toContain(TARGET_SECRET);
+    expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
+    expect(store.configJson).toEqual({
+      targets: [{ name: "alpha", url: "https://a.example.com", token: TARGET_SECRET }],
+      mode: "direct",
+    });
+  }, 20_000);
+
+  it("never emits a secret declared behind a conditional branch to an authorized reader", async () => {
+    maskingPlugin(gapSchema);
+    seedConfigStore({ mode: "managed", lookaside: CONDITIONAL_SECRET });
+    const { app } = await createApp(adminActor());
+
+    const res = await request(app).get(`/api/plugins/${pluginId}/config?companyId=${companyA}`);
+
+    expect(res.status).toBe(200);
+    expect(JSON.stringify(res.body)).not.toContain(CONDITIONAL_SECRET);
+    expect(res.body.configJson).toEqual({ mode: "managed", lookaside: "__redacted__" });
+  }, 20_000);
+
+  it("round-trips a conditionally declared secret losslessly", async () => {
+    maskingPlugin(gapSchema);
+    const store = seedConfigStore({ mode: "managed", lookaside: CONDITIONAL_SECRET });
+    const { app } = await createApp(adminActor());
+
+    const read = await request(app).get(`/api/plugins/${pluginId}/config?companyId=${companyA}`);
+    expect(read.status).toBe(200);
+
+    const write = await request(app)
+      .post(`/api/plugins/${pluginId}/config`)
+      .send({ companyId: companyA, configJson: read.body.configJson });
+
+    expect(write.status).toBe(200);
+    expect(store.configJson).toEqual({ mode: "managed", lookaside: CONDITIONAL_SECRET });
+  }, 20_000);
 });
