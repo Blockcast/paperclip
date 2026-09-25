@@ -4725,6 +4725,69 @@ describe("decideRefire", () => {
     }
   });
 
+  // BLO-36376. `backlog` is absent from the list above, and that absence was the
+  // bug: it is non-terminal, so it fell through to `refresh`, which writes only
+  // the description. `inbox-lite` does not return `backlog`, so every recurrence
+  // of that alertname was absorbed into a row nobody would ever be handed —
+  // measured on `ArcRunnerListenerMissing` across a 2h45m fleet-wide CI outage
+  // that fired correctly on all ten dead scale sets and paged no one.
+  //
+  // It is treated as an operator disposition rather than promoted on contact:
+  // parking a noisy alert is a legitimate act and is honoured for the
+  // suppression window, exactly as a hand-close is. What it must not do is
+  // honour it *forever*.
+  it("does not silently absorb a re-fire into a backlog row", () => {
+    expect(
+      decideRefire(
+        { status: "backlog" },
+        { resolvedAt: null, operatorSuppressedAt: null, pluginClosedAt: null },
+        cfg(),
+        NOW,
+      ).kind,
+    ).not.toBe("refresh");
+  });
+
+  it("honours a backlog parking for the suppression window, then re-opens", () => {
+    const parked = { resolvedAt: null, operatorSuppressedAt: ago(1), pluginClosedAt: null };
+    // Inside the window: the operator's parking stands.
+    expect(decideRefire({ status: "backlog" }, parked, cfg(4), NOW).kind).toBe("suppressed");
+    // Past it: the alert never stopped firing, so the row comes back.
+    expect(decideRefire({ status: "backlog" }, parked, cfg(1), NOW)).toEqual({
+      kind: "reopen",
+      reason: "suppression_expired",
+    });
+  });
+
+  // The plugin only ever writes `todo`/`cancelled`/`done`, so it can never have
+  // authored a `backlog` row. A stale `resolvedAt` left by an earlier fire/clear
+  // cycle must not be read as "the plugin parked this" and promote on contact,
+  // which would bypass the operator's parking entirely.
+  it("never treats a backlog row as plugin-authored", () => {
+    expect(
+      decideRefire(
+        { status: "backlog" },
+        { resolvedAt: ago(1), operatorSuppressedAt: ago(1), pluginClosedAt: ago(1) },
+        cfg(4),
+        NOW,
+      ).kind,
+    ).toBe("suppressed");
+  });
+
+  // Deliberate exclusion, not an oversight: all 11 blocked alert rows were
+  // measured carrying a live `blockedBy` edge, so they already drain via
+  // `issue_blockers_resolved_sweep`. Promoting them would override a real
+  // dependency. If this ever flips, re-measure before changing it.
+  it("leaves blocked rows alone — they have a wake path via their blocker edge", () => {
+    expect(
+      decideRefire(
+        { status: "blocked" },
+        { resolvedAt: ago(1), operatorSuppressedAt: ago(99), pluginClosedAt: ago(1) },
+        cfg(),
+        NOW,
+      ),
+    ).toEqual({ kind: "refresh" });
+  });
+
   it("re-opens a terminal issue the plugin closed on resolve", () => {
     expect(
       decideRefire(

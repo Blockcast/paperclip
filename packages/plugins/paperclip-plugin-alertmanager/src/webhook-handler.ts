@@ -1322,12 +1322,39 @@ export function closedByPlugin(
  * a human or an agent dispositioned it while the alert was still firing →
  * honour that, but only until the suppression window expires (BLO-24234). See
  * `closedByPlugin` for why that distinction cannot be read off `resolvedAt`.
+ *
+ * A row *parked* in an unreachable non-terminal status is the same thing wearing
+ * a healthier-looking status, and gets the same treatment — see
+ * `UNREACHABLE_PARKED_STATUSES` (BLO-36376).
  */
 type RefireDecision =
   | { kind: "refresh" }
   | { kind: "reopen"; reason: "plugin_resolved" | "suppression_expired" }
   | { kind: "suppressed"; suppressedAt: string; firstObservation: boolean }
   | { kind: "issue_missing" };
+
+/**
+ * Non-terminal statuses that nonetheless carry no wake path, so a `refresh`
+ * into one rewrites the body and reaches nobody — the row becomes a silent
+ * sink for every recurrence of its alertname.
+ *
+ * `backlog` is not returned by `inbox-lite`, which is how an assignee is
+ * handed work. A row parked there absorbs re-fires indefinitely while looking
+ * healthier on every triage surface than the `cancelled` rows BLO-24234
+ * already covers. This is that same hole on the non-terminal side.
+ *
+ * Measured 2026-09-25 (BLO-36376), paged to exhaustion: 865 backlog rows, 9 of
+ * them refreshed inside 24h across 9 distinct alertnames. One of those,
+ * `ArcRunnerListenerMissing`, fired correctly on all ten dead scale sets
+ * through a 2h45m fleet-wide CI outage (BLO-36155) and paged no one.
+ *
+ * `blocked` is deliberately NOT in this set: all 11 blocked alert rows were
+ * measured carrying a live `blockedBy` edge, so they drain via
+ * `issue_blockers_resolved_sweep` and already have a wake path. Re-measure
+ * before adding it — a row here is promoted past its owner's parking, so a
+ * status that does have a wake path must not be listed.
+ */
+const UNREACHABLE_PARKED_STATUSES: ReadonlySet<string> = new Set(["backlog"]);
 
 export function decideRefire(
   issue: { status: string } | null | undefined,
@@ -1341,13 +1368,19 @@ export function decideRefire(
   if (!issue) return { kind: "issue_missing" };
 
   const terminal = issue.status === "done" || issue.status === "cancelled";
-  if (!terminal) return { kind: "refresh" };
-  if (closedByPlugin(issue, existing)) {
+  const parked = UNREACHABLE_PARKED_STATUSES.has(issue.status);
+  if (!terminal && !parked) return { kind: "refresh" };
+  // `closedByPlugin` only answers a question about a *close*. The plugin's only
+  // status writes are `todo`, `cancelled` and `done`, so it can never have
+  // authored a parked row — that parking is always someone else's, and falls
+  // through to the operator-suppression window below.
+  if (terminal && closedByPlugin(issue, existing)) {
     return { kind: "reopen", reason: "plugin_resolved" };
   }
 
-  // Operator-closed. Anchor the window on the first re-fire we see against the
-  // closed issue — not on the close itself, which the plugin never observes.
+  // Operator-closed, or operator-parked somewhere unreachable. Anchor the
+  // window on the first re-fire we see against the row — not on the close
+  // itself, which the plugin never observes.
   const suppressedAt = existing.operatorSuppressedAt ?? new Date(nowMs).toISOString();
   const firstObservation = !existing.operatorSuppressedAt;
   const windowMs = operatorSuppressionMs(config);
@@ -1780,7 +1813,7 @@ export async function handleFiring(
             try {
               await ctx.issues.createComment(
                 existing.paperclipIssueId,
-                `Re-opened by paperclip-plugin-alertmanager: this issue was closed by hand, but \`${alertname}\` has kept firing past the ${operatorSuppressionHoursLabel(config)} suppression window. Closing it again will suppress it for another window; silence the alert rule itself if it should stop paging.`,
+                `Re-opened by paperclip-plugin-alertmanager: this issue was closed or parked by hand, but \`${alertname}\` has kept firing past the ${operatorSuppressionHoursLabel(config)} suppression window. Closing or re-parking it will suppress it for another window; silence the alert rule itself if it should stop paging.`,
                 existing.paperclipCompanyId,
                 { fencing: firingFence(companyId, aggregateKey, firingToken) },
               );
