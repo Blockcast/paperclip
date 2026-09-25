@@ -185,8 +185,30 @@ export function postgresMaxLifetimeSeconds(): number {
   );
 }
 
+/**
+ * Two options are absent or wrong in postgres.js's shipped typings, and both
+ * are real at runtime: `close_timeout` is this repo's patch, and `max_lifetime`
+ * is typed `number | null` even though the library's own default for it is a
+ * function (`src/index.js:515`) that `timer()` calls (`src/connection.js:1043`).
+ *
+ * Declared as a narrow widening rather than casting the whole object, so every
+ * other field — `max`, `connection.idle_in_transaction_session_timeout` — keeps
+ * its excess-property and type checking. A blanket cast would let a typo in any
+ * of them land silently. The final `as unknown as` is unavoidable — TS rejects
+ * the direct conversion (`max_lifetime: () => number` is not comparable to the
+ * shipped `number`) — but it now applies to an already-checked literal rather
+ * than instead of checking it.
+ */
+type PatchedPostgresOptions = Omit<
+  NonNullable<Parameters<typeof postgres>[1]>,
+  "max_lifetime"
+> & {
+  close_timeout?: number;
+  max_lifetime?: number | (() => number) | null;
+};
+
 export function createDb(url: string) {
-  const sql = postgres(url, {
+  const sql = postgres(url, ({
     max: POSTGRES_POOL_MAX,
     max_lifetime: postgresMaxLifetimeSeconds,
     close_timeout: POSTGRES_CLOSE_TIMEOUT_SECONDS,
@@ -198,12 +220,7 @@ export function createDb(url: string) {
     connection: {
       idle_in_transaction_session_timeout: POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS,
     },
-    // Two of these are invisible to the shipped typings, so the whole object
-    // is cast rather than each field suppressed: `close_timeout` is this
-    // repo's patch, and `max_lifetime` is typed as a plain number even though
-    // the library's own default for it is a function (`src/index.js:515`) and
-    // `timer()` calls it (`src/connection.js:1043`). Both are real at runtime.
-  } as unknown as Parameters<typeof postgres>[1]);
+  } satisfies PatchedPostgresOptions) as unknown as Parameters<typeof postgres>[1]);
   // Inert in production; only embedded test databases register their URL so
   // their pools can be closed before the server stops (see registry module).
   registerTrackedClient(url, sql);
