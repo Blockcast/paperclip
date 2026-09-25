@@ -1116,12 +1116,21 @@ describe("evaluateEvidence — numbered task-list evidence (BLO-34810 review)", 
     "3. no visual regression at 1440px",
   ].join("\n");
 
-  const numberedTaskList = (marker: string) =>
-    [
-      `${marker === "-" ? "-" : "1."} [x] h-100 dead space gone`,
-      `${marker === "-" ? "-" : "2."} [x] reflows at 390px`,
-      `${marker === "-" ? "-" : "3."} [x] no 1440px regression`,
+  // Emits the marker it is GIVEN. An ordered marker (`1.`, `1)`) is
+  // renumbered per line, keeping its own delimiter; an unordered one (`-`,
+  // `*`) repeats verbatim. The earlier form hardcoded
+  // `marker === "-" ? "-" : "1."`, so `numberedTaskList("*")` silently
+  // produced `1.` items and asserted nothing whatever about `*` — in the one
+  // block whose subject is marker-blindness.
+  const numberedTaskList = (marker: string) => {
+    const ordered = /^\d+([.)])$/.exec(marker);
+    const item = (n: number) => (ordered ? `${n}${ordered[1]}` : marker);
+    return [
+      `${item(1)} [x] h-100 dead space gone`,
+      `${item(2)} [x] reflows at 390px`,
+      `${item(3)} [x] no 1440px regression`,
     ].join("\n");
+  };
 
   it("clears checklist:done-when from a numbered `[x]` task list", () => {
     const result = evaluateEvidence({
@@ -1147,7 +1156,7 @@ describe("evaluateEvidence — numbered task-list evidence (BLO-34810 review)", 
     expect(result.missing).toEqual([]);
   });
 
-  it("is marker-blind: `-` and `1.` evidence produce the same verdict", () => {
+  it("is marker-blind: `-`, `*`, `1.` and `1)` evidence produce the same verdict", () => {
     const evaluate = (body: string) =>
       evaluateEvidence({
         issue: { description: NUMBERED_CRITERIA, labels: [] },
@@ -1156,9 +1165,21 @@ describe("evaluateEvidence — numbered task-list evidence (BLO-34810 review)", 
         registry: DEFAULT_EVIDENCE_REGISTRY,
         externalDetections: { ...TRUTH_OK },
       });
-    expect(evaluate(numberedTaskList("1.")).missing).toEqual(
-      evaluate(numberedTaskList("-")).missing,
-    );
+    const baseline = evaluate(numberedTaskList("-"));
+    for (const marker of ["-", "*", "1.", "1)"]) {
+      const body = numberedTaskList(marker);
+      // Assert the FIXTURE first, not just the verdict. Parity alone cannot
+      // catch a helper that quietly falls back to one marker: a reverted
+      // `numberedTaskList("*")` emits `1.` lines, which are themselves
+      // marker-blind-clean, so the comparison below still passes while
+      // testing `1.` three times over. This line is the guard that fails.
+      expect(body.split("\n").map((l) => l.split(" ")[0])).toEqual(
+        /^\d+[.)]$/.test(marker)
+          ? [marker, `2${marker.slice(-1)}`, `3${marker.slice(-1)}`]
+          : [marker, marker, marker],
+      );
+      expect(evaluate(body).missing, `marker ${marker}`).toEqual(baseline.missing);
+    }
   });
 
   it("still warns when the task list is SHORTER than the criteria list", () => {

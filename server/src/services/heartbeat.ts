@@ -443,6 +443,7 @@ import {
   setReleasePendingExternalRuntimeReservationMetrics,
   setOrphanedEnvironmentLeaseMetrics,
   setOrphanedRuntimeResourceMetricsRefreshSuccess,
+  setCrashRecoveryCandidateIndexPresent,
 } from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
 import { runLifecycleHook } from "./lifecycle-hook.js";
@@ -3726,6 +3727,65 @@ function isNonRetryablePrReviewTerminalOutcome(
   ) {
     return false;
   }
+  const recovery = parseObject(parseObject(run.resultJson).externalLifecycleRecovery);
+  return recovery.adapterInvocationStarted === true;
+}
+
+/**
+ * BLO-34699: did this terminal run actually produce a REVIEW VERDICT we may
+ * publish to the PR gate?
+ *
+ * Deliberately NOT the same question as `isNonRetryablePrReviewTerminalOutcome`,
+ * whose other two callers ask "is this run terminal for recovery routing" — a
+ * pod that never scheduled IS terminal for its own run, so those must keep the
+ * wider predicate. Publishing a commit status is a different claim: it asserts
+ * something about the HEAD, and a run that never invoked its adapter made no
+ * judgement about the head at all.
+ *
+ * Measured on Blockcast/paperclip, 2026-09-19. Four heads were stamped
+ * `review/ally-complete = failure` with "ended ambiguously and was not
+ * replayed; no review was confirmed"; a genuine, non-stale formal review then
+ * landed at that EXACT head on three of them, 4h59m–5h48m later (#1929
+ * 17:04:56Z→22:53:23Z, #1931 19:42:17Z→00:55:38Z, #1932 19:56:56Z→00:56:06Z).
+ * Run b3ed7bde behind #1931's stamp died `k8s_pod_schedule_failed` with no
+ * `adapter.invoke` event at all. So the gate was not merely early, it was
+ * asserting a verdict about a head that no reviewer had yet read — and
+ * `review/ally-complete` has no writer that ever clears it, so #1929 still
+ * carries that red beside a `gate/ally-comment-findings: success` for the same
+ * head, the two gates contradicting each other ~14h on.
+ *
+ * Not a one-off: `k8s_pod_schedule_failed` is 38 of the reviewer's last 1000
+ * runs (26h window), and BLO-34577 records tenant-wide 429s being mis-tagged
+ * into it. The 5h band matches the reviewer's own dispatch-queue wait, i.e. the
+ * first dispatch was killed by capacity and a later one served the same request.
+ *
+ * `adapterInvocationStarted` is the existing durable proof of an `adapter.invoke`
+ * run event, already required by the `pr_review_output_missing` /
+ * `pr_review_verification_unavailable` arms above. All this adds is requiring it
+ * of the two infra codes as well, by requiring it of everything:
+ *  - `k8s_pod_schedule_failed` never computes it (`hasAdapterInvocationEvent` is
+ *    consulted only for `job_failed`/`job_missing`), so it can never grade — the
+ *    wanted outcome, the pod did not start;
+ *  - `job_missing` is "only produced after adapter.invoke" per the retry-admission
+ *    comment above, so it normally still grades, and the genuine
+ *    reviewer-ran-and-posted-nothing case is preserved;
+ *  - the two `pr_review_*` arms already proved it, so they are unchanged.
+ *
+ * That last point is why this is one condition and not a per-code branch, and it
+ * also sets the default for any code added to the predicate above later: a new
+ * arm publishes a verdict only once it can show the reviewer ran. Failing toward
+ * not-publishing is the safe direction — a missing status blocks under
+ * BLO-26572 exactly as a red one does, without asserting a falsehood about the
+ * head.
+ *
+ * NOTE the deliberate boundary: suppressing the false verdict does not make an
+ * uninvoked reviewer run visible. That is BLO-34577 (mis-tagged 429 → review
+ * silently dropped, no auto-retry) and is not fixed here.
+ */
+export function producedPrReviewGateVerdict(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson" | "contextSnapshot">,
+) {
+  if (!isNonRetryablePrReviewTerminalOutcome(run)) return false;
   const recovery = parseObject(parseObject(run.resultJson).externalLifecycleRecovery);
   return recovery.adapterInvocationStarted === true;
 }
@@ -7687,6 +7747,103 @@ export function filterIntervalOverrunCoalesceTarget<
     : target;
 }
 
+/**
+ * Context-snapshot key stamped on the run a timer wake mints because
+ * {@link filterIntervalOverrunCoalesceTarget} removed its coalesce target.
+ *
+ * PEN-1990: the rule above decides silently. It emits no log, no event and no
+ * column, so the only way to tell whether it has ever fired in production is
+ * to reconstruct overlapping same-scope run pairs out of the run corpus and
+ * infer it — which cannot distinguish a filter activation from any other
+ * reason two runs overlapped. Measured 2026-09-18, 55.8 h and 892 started runs
+ * after the rule reached production: fleet-wide longest run 4727 s against a
+ * 5400 s budget, so zero activations and nothing to attribute either way.
+ *
+ * The marker lands on the RUN rather than on `agent_wakeup_requests`, which is
+ * the row the rule is really about, because there is no HTTP route that reads
+ * wakeup requests and `GET /companies/:id/heartbeat-runs` already returns
+ * `contextSnapshot`. A capture that cannot be fetched is no capture.
+ */
+export const STALLED_COALESCE_BYPASS_SNAPSHOT_KEY = "__intervalOverrunCoalesceBypass";
+
+export type IntervalOverrunCoalesceBypass = {
+  targetRunId: string;
+  targetStartedAt: string;
+  targetAgeMs: number;
+  budgetMs: number;
+  intervalSec: number;
+};
+
+/**
+ * Describe the coalesce target {@link filterIntervalOverrunCoalesceTarget} just
+ * removed, or null when it removed nothing.
+ *
+ * Takes the before/after pair rather than re-running the predicate so the
+ * record can never disagree with the decision that was actually acted on: if
+ * the two ever diverged, a re-derivation here would describe a filter
+ * activation that did not happen (or miss one that did).
+ */
+export function describeIntervalOverrunCoalesceBypass(input: {
+  target: { id: string; startedAt: Date | string | null } | null;
+  filteredTarget: { id: string } | null;
+  intervalSec: number;
+  now: Date;
+}): IntervalOverrunCoalesceBypass | null {
+  const { target, filteredTarget, intervalSec, now } = input;
+  if (!target || filteredTarget) return null;
+  const startedAt = target.startedAt ? new Date(target.startedAt) : null;
+  // Unreachable through the filter — it only removes a target with a parseable
+  // `startedAt` — but the marker is evidence, so it reports what it can rather
+  // than emitting `NaN`/`Invalid Date` if that ever stops holding.
+  const startedAtMs = startedAt ? startedAt.getTime() : Number.NaN;
+  return {
+    targetRunId: target.id,
+    targetStartedAt: Number.isFinite(startedAtMs) ? startedAt!.toISOString() : "unknown",
+    targetAgeMs: Number.isFinite(startedAtMs) ? now.getTime() - startedAtMs : -1,
+    budgetMs: resolveStalledCoalesceBudgetMs(intervalSec),
+    intervalSec,
+  };
+}
+
+/**
+ * Snapshot keys that describe ONE run's own minting decision, and are therefore
+ * false on any later run.
+ *
+ * The retry builders replace a dead run by spreading `parseObject(
+ * run.contextSnapshot)` wholesale onto the replacement, so a key stamped by the
+ * enqueue that minted the original would ride along onto a run that never went
+ * through that path. For {@link STALLED_COALESCE_BYPASS_SNAPSHOT_KEY} that
+ * breaks both properties it exists to provide: the marker's count stops being a
+ * count of filter activations, and its `targetRunId` points at a run unrelated
+ * to the retry. It also breaks the reconciliation with the enqueue log — a
+ * propagated marker has no log line at all, so the two counts can differ in
+ * both directions and an operator is back to an unattributable discrepancy.
+ *
+ * Register a key here when it records why *this* run was created. Keys that
+ * describe the work rather than the mint (`issueId`, `wakeReason`,
+ * `depBlockedFirstParkedAt`) are meant to survive a retry and must not go here.
+ */
+const RUN_SCOPED_SNAPSHOT_MARKER_KEYS = [STALLED_COALESCE_BYPASS_SNAPSHOT_KEY] as const;
+
+/**
+ * Copy a prior run's snapshot for carry-forward onto its replacement, dropping
+ * the run-scoped markers in {@link RUN_SCOPED_SNAPSHOT_MARKER_KEYS}.
+ *
+ * Returns a new object rather than deleting in place: `parseObject` casts, it
+ * does not copy, so mutating its result would edit the caller's in-memory run
+ * row and change what every later read of `run.contextSnapshot` in the same
+ * function sees.
+ */
+export function stripRunScopedSnapshotMarkers(
+  snapshot: Record<string, unknown>,
+): Record<string, unknown> {
+  const carried = { ...snapshot };
+  for (const key of RUN_SCOPED_SNAPSHOT_MARKER_KEYS) {
+    delete carried[key];
+  }
+  return carried;
+}
+
 export function describeSessionResetReason(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ) {
@@ -10107,8 +10264,37 @@ function unavailablePrReviewVerification(reason: string) {
  *  - an operator opted in by configuring a context name (this server does not
  *    own the branch-protection rule, so it must not invent one);
  *  - the run is a PR-review run (`derivePaperclipPrReview`);
+ *  - the run is the REVIEWER's, not the author's (`reviewKind` / `prRole`);
  *  - the wake carried a repo AND an exact head SHA — statuses are per-commit,
  *    so a guessed SHA would fail an unrelated commit.
+ *
+ * BLO-34699: `derivePaperclipPrReview` answers "is this wake ABOUT a PR", which
+ * is true of both sides of one review. The author's own agent is woken by its
+ * own `<!-- paperclip:review-request -->` marker (BLO-19522, deliberate and not
+ * being removed), so an author run carries the same repo/head/PR identity as
+ * the reviewer run and used to resolve a target here. Measured on
+ * Blockcast/pim-multicast-gateway#3237: run 974efdbd on the PR AUTHOR's agent
+ * (`prRole: "author"`, `reviewKind: null`) died `k8s_pod_schedule_failed` at pod
+ * start with zero turns, and its crash was written as `review/ally-complete =
+ * failure` — while Ally's real review for that head was still QUEUED (oldest
+ * queued reviewer run 4.67h, matching the request age). `review-gate` is a
+ * scheduled peer of `ci-gate`, so that manufactured red made the PR unmergeable
+ * and could not self-heal: the gate re-runs on `pull_request_review: submitted`
+ * and Ally's common shape is a comment-shaped review, which never re-triggers it.
+ *
+ * Gating on the context's own `reviewKind`/`prRole` rather than on the agent
+ * id: both are stamped by the code that CHOSE whom to wake — the two reviewer
+ * wake constructors (`buildPrReviewerWakeupOptions` and
+ * `queueIssueAssignmentWakeup`'s PR-review branch) each set
+ * `reviewKind: "pr_review"` AND `prRole: "reviewer"`, while the author-directed
+ * path sets `prRole: "author"` and no `reviewKind`. That is the server's own
+ * recorded answer, rather than an identity re-derived at finalize time from a
+ * reviewer-agent-id config this module does not carry.
+ *
+ * The predicate is the one already used by `evaluatePrReviewCompletionEvidence`
+ * for the same question, deliberately: require a positive `pr_review` tag, and
+ * reject a `prRole` that is present and not the reviewer's. The measured case
+ * fails both clauses.
  */
 export function resolvePrReviewGateStatusTarget(
   contextSnapshot: Record<string, unknown> | null | undefined,
@@ -10118,6 +10304,8 @@ export function resolvePrReviewGateStatusTarget(
   if (!context) return null;
   const prReview = derivePaperclipPrReview(contextSnapshot);
   if (!prReview) return null;
+  if (prReview.reviewKind !== "pr_review") return null;
+  if (prReview.prRole && prReview.prRole !== "reviewer") return null;
   const { repoFullName, headSha, prNumber, prUrl } = prReview;
   if (!repoFullName || !headSha) return null;
   return { repoFullName, sha: headSha, context, prNumber, prUrl: prUrl ?? null };
@@ -12323,6 +12511,25 @@ export interface HeartbeatServiceOptions {
   beforeWakeRedeliveryEnqueueForTest?: (
     row: typeof agentWakeupRequests.$inferSelect,
   ) => Promise<void> | void;
+  /**
+   * Test-only interleaving point between enqueueWakeup's UNLOCKED coalesce
+   * read and the transaction that takes the agent lock (PEN-1990).
+   *
+   * This window is the only way to reach a `coalesced` outcome on the
+   * interval-overrun bypass path, and it cannot be reproduced by seeding the
+   * fixture up front. `rawCoalescedTarget` prefers `sameScopeQueuedRun` over
+   * the running run, and `filterIntervalOverrunCoalesceTarget` returns a
+   * non-running target unchanged -- so a queued row that is already present at
+   * the unlocked read wins that read, coalesces there, and returns before the
+   * bypass is ever computed. The queued sibling has to APPEAR in between, which
+   * is exactly the live race the `includeRunning: false` re-check exists for:
+   * "a same-task run found after taking the agent lock was created while this
+   * enqueue was waiting".
+   */
+  beforeWakeEnqueueTransactionForTest?: (input: {
+    agentId: string;
+    taskKey: string | null;
+  }) => Promise<void> | void;
 }
 
 function isTruthyRuntimeEnvValue(value: string | undefined) {
@@ -12770,14 +12977,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const body = [
       `## Ally review did not land on \`${target.repoFullName}#${target.prNumber}\``,
       "",
-      `The Paperclip reviewer run for head \`${shortSha}\` ${cause}. **No review was posted, and none is coming for this head** — this is a terminal outcome, not reviewer latency.`,
+      // BLO-34699: this used to assert "none is coming for this head — a
+      // terminal outcome, not reviewer latency". That claim is about the QUEUE,
+      // and this function has not read the queue. It was measured false on
+      // Blockcast/pim-multicast-gateway#3237 at the moment it was written: a
+      // reviewer run for that exact head was queued and 4.67h old behind a
+      // firing PaperclipPrReviewConsumerStarved. Report only what this run did;
+      // a second request for the same head can still be in flight, and the old
+      // prescribed remedy (re-request / push a new head) is actively harmful
+      // against a starved queue — a re-request lengthens it and a push voids
+      // the head.
+      `The Paperclip reviewer run for head \`${shortSha}\` ${cause}. **No review was posted by that run**, and the gate below is red on its behalf.`,
       "",
       `- Head: \`${target.sha}\``,
       `- Gate status: \`${target.context}\` set to \`failure\` on that commit`,
       ...(target.prUrl ? [`- PR: ${target.prUrl}`] : []),
       `- Reviewer run: \`${run.id}\``,
       "",
-      "Re-request the review on the PR (a start-of-body `<!-- paperclip:review-request -->` marker **and** a bare `@ally` mention — the marker alone is silently dropped), or push a new head.",
+      "Check whether another review for this exact head is still queued before acting — this notice does not know. If one is, wait for it. If none is, re-request the review on the PR (a start-of-body `<!-- paperclip:review-request -->` marker **and** a bare `@ally` mention — the marker alone is silently dropped); pushing a new head voids any at-head attestation and is the last resort.",
     ].join("\n");
 
     for (const issue of linked) {
@@ -16977,7 +17194,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
     const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
     const retryContextSnapshot = withRecoveryModelProfileHint({
-      ...contextSnapshot,
+      ...stripRunScopedSnapshotMarkers(contextSnapshot),
       retryOfRunId: run.id,
       wakeReason: "missing_issue_comment",
       retryReason: "missing_issue_comment",
@@ -17307,7 +17524,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
     const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
     const retryContextSnapshot = withRecoveryModelProfileHint({
-      ...contextSnapshot,
+      ...stripRunScopedSnapshotMarkers(contextSnapshot),
       retryOfRunId: run.id,
       wakeReason: "process_lost_retry",
       retryReason,
@@ -18497,14 +18714,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * index absent or invalid — so a latched worker would silently resume the
    * sequential scan and top-N sort this gate exists to prevent, with no further
    * catalog check ever. Revalidating on every periodic pass is Ally's own first
-   * remedy and needs no tunable: this is one indexed catalog lookup per
-   * scheduler tick per replica, which is noise next to the scan it guards
-   * against, and it makes the gate recover in BOTH directions.
+   * remedy and needs no tunable: this is one indexed catalog lookup, which is
+   * noise next to the scan it guards against, and it makes the gate recover in
+   * BOTH directions.
+   *
+   * Exported as `publishCrashRecoveryCandidateIndexGauge` and called a second
+   * time per tick from above both scheduler gates (BLO-21526). Two catalog
+   * lookups per tick per replica instead of one, deliberately: the gate needs
+   * its own read so it acts on the value it published, and the gauge needs a
+   * publisher that a suppressed or still-recovering replica reaches — a
+   * database restore both suppresses the scheduler AND is a leading way to
+   * lose the index, which is exactly where the signal must not go dark.
    *
    * A probe FAILURE means we do not know, so it skips this one periodic tick
-   * (startup recovery is ungated) and the next tick asks again.
+   * (startup recovery is ungated ON THE INDEX — it is still gated on
+   * scheduling suppression) and the next tick asks again.
    */
-  async function crashRecoveryCandidateIndexPresent(): Promise<boolean> {
+  async function crashRecoveryCandidateIndexPresent(
+    source: "gate" | "gauge",
+  ): Promise<boolean> {
     try {
       const rows = await db.execute(sql`
         select 1
@@ -18519,6 +18747,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         limit 1
       `);
       const present = Array.from(rows as unknown as Iterable<unknown>).length > 0;
+      // Published on every tick, in BOTH directions (BLO-21526). The warn
+      // below is latched to the absent transition and says nothing at all
+      // while the index is healthy, which is the same silent-on-healthy shape
+      // as the migration's swallowed RAISE NOTICE; the gauge is what lets an
+      // operator or a later deploy check confirm presence rather than merely
+      // observe quiet.
+      setCrashRecoveryCandidateIndexPresent(present);
       if (present) {
         // Re-arm the warning so a later disappearance is reported again rather
         // than being silenced by a warning issued before the index existed.
@@ -18530,18 +18765,46 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logger.warn(
           {
             index: "heartbeat_runs_crash_recovery_pending_idx",
+            // Which caller probed. The two run concurrently within a tick —
+            // the gauge publisher is tracked without `await` and the gate
+            // probes later in the same tick — and the latch above can be read
+            // as `false` by both before either sets it, so the absent
+            // TRANSITION can legitimately emit two lines. Tagging them is
+            // what stops an operator reading that as two distinct failures.
+            source,
             remediation:
               "CREATE INDEX CONCURRENTLY heartbeat_runs_crash_recovery_pending_idx ON heartbeat_runs USING btree (finished_at, id) WHERE error_code = 'worker_crashed' AND crash_recovery_completed_at IS NULL",
           },
-          "worker-crash candidate index missing or invalid; periodic crash reconciliation is disabled until it is built online (startup recovery still runs)",
+          // "startup recovery covers this only while scheduling is not
+          // suppressed", not the flat "startup recovery still runs" this used
+          // to claim: this publisher is called from above both scheduler gates
+          // (BLO-21526), so it now also emits on a suppressed replica — where
+          // `startServer` skips startup recovery entirely and NEITHER recovery
+          // path is running.
+          "worker-crash candidate index missing or invalid; periodic crash reconciliation is disabled until it is built online (startup recovery covers this only while scheduling is not suppressed)",
         );
       }
       return present;
     } catch (err) {
       // Never let a catalog probe failure take out the caller, and never cache
       // it: "we could not tell" is not evidence either way. Skips this periodic
-      // tick only; startup recovery is ungated.
-      logger.warn({ err }, "failed to probe worker-crash candidate index; skipping periodic reconciliation this tick");
+      // tick only; startup recovery is ungated on the index (though it is
+      // still gated on scheduling suppression).
+      //
+      // The gauge is cleared rather than set to 0 for the same reason: an
+      // unreadable catalog must not publish "the index is gone", and a stale 1
+      // left behind would publish "healthy" on no information (BLO-21526).
+      setCrashRecoveryCandidateIndexPresent(null);
+      // The consequence is the CALLER's, not the probe's: only the gate turns
+      // this into a skipped tick. The ungated gauge publisher makes no
+      // reconciliation decision at all — and on a suppressed replica there is
+      // no periodic reconciliation for it to be skipping.
+      logger.warn(
+        { err, source },
+        source === "gate"
+          ? "failed to probe worker-crash candidate index; skipping periodic reconciliation this tick"
+          : "failed to probe worker-crash candidate index; candidate-index gauge cleared for this tick",
+      );
       return false;
     }
   }
@@ -18608,7 +18871,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // caller passes `requireCandidateIndex` and is skipped until the index
     // exists; startup recovery is never gated, because that is the primary
     // recovery path and its cost is bounded and one-off.
-    if (options.requireCandidateIndex && !(await crashRecoveryCandidateIndexPresent())) {
+    if (options.requireCandidateIndex && !(await crashRecoveryCandidateIndexPresent("gate"))) {
       return {
         reconciledRunIds: [],
         retryRunIds: [],
@@ -20059,6 +20322,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // GitHub-evidence read and transient GitHub/token failures can retry.
       // Opt-in and swallowed so status delivery can never alter exhaustion
       // handling.
+      //
+      // BLO-34699: this arm deliberately does NOT require the
+      // `adapterInvocationStarted` proof the two non-retryable arms do, and the
+      // asymmetry is the point rather than an oversight. Exhaustion is a
+      // stronger claim to terminality: the bounded chain has run to its end, so
+      // nothing further is coming from this request whether or not any single
+      // attempt reached a model call. The non-retryable arms have no such
+      // chain behind them — one crashed pod is their whole evidence — which is
+      // why they need the extra proof. Do not "fix" this by symmetry.
       await queueFailedPrReviewGateStatus(run, contextSnapshot, "retry_exhausted").catch((error) => {
         logger.warn(
           { err: error, runId: run.id },
@@ -20272,7 +20544,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       workspaceValidationRetryPayload !== null &&
       Object.keys(workspaceValidationRetryPayload).length > 0;
     const retryContextSnapshot: Record<string, unknown> = withRecoveryModelProfileHint({
-      ...contextSnapshot,
+      ...stripRunScopedSnapshotMarkers(contextSnapshot),
       retryOfRunId: run.id,
       wakeReason,
       retryReason,
@@ -32980,7 +33252,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * off the hot path.
    */
   async function hasQueuedReplacementIssueWake(
-    dbOrTx: typeof db | Parameters<Parameters<typeof db.transaction>[0]>[0],
+    dbOrTx: Db | DbTransaction,
     companyId: string,
     issueId: string,
     participantAgentId: string,
@@ -33194,7 +33466,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
 
       if (!issue) {
-        if (isNonRetryablePrReviewTerminalOutcome(run)) {
+        // BLO-34699: the gate arm requires proof the reviewer actually ran.
+        if (producedPrReviewGateVerdict(run)) {
           gateDelivery = await queueFailedPrReviewGateStatus(
             run,
             runContext,
@@ -33257,7 +33530,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ),
           );
       }
-      if (isNonRetryablePrReviewTerminalOutcome(run) && !finalizedRunStageSuperseded) {
+      // BLO-34699: `producedPrReviewGateVerdict`, not the wider recovery-routing
+      // predicate — a run that never invoked its adapter read nothing at this
+      // head, so it has no verdict to publish about it.
+      if (producedPrReviewGateVerdict(run) && !finalizedRunStageSuperseded) {
         // The outbox row is part of the ownership decision: a replacement run
         // cannot claim this issue until both the lock release and delivery
         // intent commit. Publishing the informational event can remain best
@@ -36253,24 +36529,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       rawCoalescedTarget.scheduledRetryReason === CCROTATE_CAPACITY_RETRY_REASON
         ? rawCoalescedTarget
         : null;
+    const overrunFilterInput = filterZombieCoalesceTarget(
+      manualCapacityRetryTarget ? null : rawCoalescedTarget,
+      liveRunExecutions,
+    );
+    // The agent's own configured interval, so a slow-cadence agent gets a
+    // proportionally larger budget. `intervalSec` is always positive (clamped
+    // to [30, 86400]) and is returned even when heartbeats are disabled, so
+    // the floor in resolveStalledCoalesceBudgetMs — not this value — is what
+    // keeps fast-cadence agents safe.
+    const overrunFilterIntervalSec = resolveHeartbeatPolicyForRuntimeConfig(
+      agent.runtimeConfig,
+    ).intervalSec;
+    // One clock for the decision and for the record it produces, so the age
+    // the marker reports is the age the filter judged.
+    const overrunFilterNow = new Date();
     const coalescedTargetRun = filterIntervalOverrunCoalesceTarget({
-      target: filterZombieCoalesceTarget(
-        manualCapacityRetryTarget ? null : rawCoalescedTarget,
-        liveRunExecutions,
-      ),
+      target: overrunFilterInput,
       // PEN-1995: timer wakes only. A demand wake has no cadence to miss, so
       // its age proves nothing was lost — filtering on it would discard a live
       // target and mint a concurrent run for a manual or recovery wake. The
       // helper enforces this; it is passed rather than branched here so the
       // whole rule stays in one unit-testable place.
       source,
-      // The agent's own configured interval, so a slow-cadence agent gets a
-      // proportionally larger budget. `intervalSec` is always positive (clamped
-      // to [30, 86400]) and is returned even when heartbeats are disabled, so
-      // the floor in resolveStalledCoalesceBudgetMs — not this value — is what
-      // keeps fast-cadence agents safe.
-      intervalSec: resolveHeartbeatPolicyForRuntimeConfig(agent.runtimeConfig).intervalSec,
-      now: new Date(),
+      intervalSec: overrunFilterIntervalSec,
+      now: overrunFilterNow,
+    });
+    // PEN-1990: record the activation. Consumed twice below — stamped on the
+    // minted run's snapshot, and logged post-commit with the outcome.
+    const intervalOverrunBypass = describeIntervalOverrunCoalesceBypass({
+      target: overrunFilterInput,
+      filteredTarget: coalescedTargetRun,
+      intervalSec: overrunFilterIntervalSec,
+      now: overrunFilterNow,
     });
 
     if (coalescedTargetRun) {
@@ -36308,6 +36599,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return mergedRun;
       }
     }
+
+    await options.beforeWakeEnqueueTransactionForTest?.({
+      agentId,
+      taskKey: effectiveTaskKey,
+    });
 
     const queueOutcome = await db.transaction(async (tx) => {
       await tx.execute(
@@ -36535,7 +36831,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // connection to avoid pool starvation under concurrent wakes.
           responsibleUserId: await resolveQueuedResponsibleUserId(tx),
           wakeupRequestId: wakeupRequest.id,
-          contextSnapshot: enrichedContextSnapshot,
+          // PEN-1990: stamped only on the row we actually insert, for the same
+          // reason as the redelivery token above — `enrichedContextSnapshot` is
+          // also handed to the coalesce helpers, and a marker merged into an
+          // existing run would claim that run was minted by this filter.
+          contextSnapshot: intervalOverrunBypass
+            ? {
+                ...(enrichedContextSnapshot ?? {}),
+                [STALLED_COALESCE_BYPASS_SNAPSHOT_KEY]: intervalOverrunBypass,
+              }
+            : enrichedContextSnapshot,
           sessionIdBefore: sessionBefore,
           continuationAttempt,
           retryOfRunId: opts.retryOfRunId,
@@ -36554,6 +36859,40 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       return { kind: "queued" as const, run: newRun };
     });
+
+    // PEN-1990: one line per activation, emitted post-commit so it can never
+    // describe a decision the transaction rolled back. `outcome` is what makes
+    // this reconcile with the snapshot marker: the marker is stamped only on
+    // the run this wake inserts, so its population is exactly the lines with
+    // `outcome: "queued"`. The remainder are activations where a later gate in
+    // this enqueue (the daily cap, the post-lock task-scope re-check, the
+    // github-state coalesce, or the idempotency-key already-delivered claim)
+    // ended the wake without a mint — real activations the marker cannot
+    // carry, attributable here rather than an unexplained shortfall between
+    // the two counts.
+    //
+    // `runId` therefore means "the run this wake minted" and nothing else: it
+    // is non-null exactly when a marker was stamped, so the two records
+    // reconcile on the field as well as on `outcome`. The fold outcomes report
+    // the run they merged into under a separate key, because a consumer that
+    // grouped those on `runId` would count them as mints.
+    if (intervalOverrunBypass) {
+      logger.info(
+        {
+          agentId,
+          taskKey: effectiveTaskKey,
+          outcome: queueOutcome.kind,
+          runId: queueOutcome.kind === "queued" ? queueOutcome.run.id : null,
+          coalescedIntoRunId:
+            queueOutcome.kind === "skipped" || queueOutcome.kind === "queued"
+              ? null
+              : queueOutcome.run.id,
+          ...intervalOverrunBypass,
+        },
+        "timer wake declined to coalesce into a run that has overrun its heartbeat "
+          + "interval (PEN-1990; rule added in PEN-1995)",
+      );
+    }
 
     for (const publish of manualCapacityActivityPublishes) {
       try {
@@ -38821,6 +39160,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     publishAgentLivenessGauges,
     publishGithubReviewDeadLetterGauge,
     publishAgentWakeupTerminalFailedGauge,
+    // BLO-21526: exported so the gauge has a publisher ABOVE both scheduler
+    // gates, not only the gated reconciliation's own gate read. Same defect
+    // and same remedy as BLO-31335 — see the registration in index.ts.
+    publishCrashRecoveryCandidateIndexGauge: () => crashRecoveryCandidateIndexPresent("gauge"),
 
     getRunLogAccess,
 
