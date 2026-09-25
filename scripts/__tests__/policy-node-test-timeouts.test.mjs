@@ -78,6 +78,14 @@ function policyJobCap() {
   return cap;
 }
 
+test("policy keeps headroom for cold checkout and setup", () => {
+  const cap = policyJobCap();
+  assert.ok(
+    cap >= 20,
+    `policy needs at least a 20m cap for cold full-depth checkout plus setup; found ${cap}m`,
+  );
+});
+
 function stepName(step) {
   return step.split("\n")[0].trim();
 }
@@ -94,7 +102,7 @@ function stepName(step) {
 // under it: a bound close to the cap is still reached only after earlier steps
 // have spent part of the job budget, so the job cap kills it first and the
 // failure is a bare `cancelled` again. It holds here because the real bounds are
-// 1-3m against a 10m cap. Summing the bounds against the cap would be the wrong
+// 1-3m against a 20m cap. Summing the bounds against the cap would be the wrong
 // stronger rule — bounds are per-step worst cases and every step is expected to
 // run, so that sum exceeds any sane cap by design.
 function assertTimeouts(steps, cap = policyJobCap()) {
