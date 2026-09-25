@@ -35,6 +35,10 @@ const mockIssueApprovalService = vi.hoisted(() => ({
   listIssuesForApproval: vi.fn(),
   linkManyForApproval: vi.fn(),
 }));
+// `approvalRoutes` builds `issueService(db)` for the approval-link evaluator
+// (`assertIssueLinksAllowed`); no case here links an issue, so the stub only
+// needs to exist. Same shape as approval-create-issue-link-authorization.test.ts.
+const mockIssueService = vi.hoisted(() => ({ getById: vi.fn() }));
 const mockSecretService = vi.hoisted(() => ({
   normalizeHireApprovalPayloadForPersistence: vi.fn(),
 }));
@@ -48,6 +52,7 @@ function registerModuleMocks() {
     approvalService: () => mockApprovalService,
     heartbeatService: () => mockHeartbeatService,
     issueApprovalService: () => mockIssueApprovalService,
+    issueService: () => mockIssueService,
     logActivity: mockLogActivity,
     secretService: () => mockSecretService,
   }));
