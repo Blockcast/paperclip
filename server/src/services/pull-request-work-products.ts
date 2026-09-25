@@ -163,6 +163,17 @@ export function pullRequestWorkProductSourceEventActionOrder(
 ): number {
   if (input.prMerged === true) return 50;
   switch (input.action) {
+    // Merge-queue events rank above ready_for_review because a PR must be
+    // ready before it can be queued, and a dequeue above the enqueue it ends.
+    // `updated_at` is second-granular, so an auto-merge that queues in the same
+    // second as ready_for_review ties on timestamp, and at the default rank the
+    // enqueue was rejected and mergeQueueState never recorded (BLO-35779). The
+    // one ordering this gets wrong, a dequeue and re-enqueue inside one second,
+    // keeps `dequeued`, which fails closed: the PR keeps its normal window.
+    case "dequeued":
+      return 46;
+    case "enqueued":
+      return 45;
     case "ready_for_review":
     case "reopened":
       return 40;
