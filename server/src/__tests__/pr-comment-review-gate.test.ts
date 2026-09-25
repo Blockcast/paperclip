@@ -10,6 +10,8 @@ import {
   extractAllyReviewedHeadSha,
   hasActionablePrReviewFeedback,
   hasAllyConsolidatedReviewHeading,
+  isPublishableToken,
+  parseAllyVerdictBlock,
 } from "../services/ally-review-detection.js";
 import {
   commentReviewGateCheckConclusion,
@@ -459,6 +461,154 @@ describe("evaluateCommentReviewGate", () => {
     expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
     expect(verdict.reason).toContain('unrecognized ledger verb "deferred"');
     expect(verdict.reason).toContain(OLD_HEAD.slice(0, 7));
+  });
+
+  it("never publishes an unsupported severity key verbatim (PEN-3157)", () => {
+    // Sibling of the ledger-verb case below, one JSON object over: an
+    // unsupported `findings` key is model-authored, and asSeverityCounts quotes
+    // it into the `unreadable` reason, which becomes the commit-status
+    // description and the *uncapped* check-run summary. The verb guard did not
+    // cover it, and the verb test would not have caught it — the leak was the
+    // same token one field away from the one that was fixtured.
+    const token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+    const verdictFor = (severityKey: string) =>
+      evaluateCommentReviewGate({
+        headSha: CURRENT_HEAD,
+        comments: [
+          allyComment(
+            [
+              "## Ally — Consolidated PR Review",
+              "<!-- ally-verdict:1",
+              JSON.stringify({
+                head: CURRENT_HEAD,
+                findings: { critical: 0, important: 0, [severityKey]: 1 },
+              }),
+              "-->",
+              `Reviewed head: ${CURRENT_HEAD}`,
+            ].join("\n"),
+            "2026-08-04T21:09:19Z",
+          ),
+        ],
+      });
+
+    const leaked = verdictFor(token);
+    expect(leaked.reason ?? "").not.toContain(token);
+    expect(leaked.reason ?? "").not.toContain("ghp_");
+    // A URL is alphabet-conforming nowhere near the verb alphabet, so it must
+    // be withheld too — `.toLowerCase()` mangles case but is not a guard.
+    expect(verdictFor("https://hooks.example.io/s3cr3t-9f2a").reason ?? "").not.toContain("s3cr3t");
+    // Withheld, not dropped: the reader must still learn which defect this is.
+    expect(leaked.reason ?? "").toContain("unsupported severity");
+
+    // Positive control. A conforming typo is still named, or the assertions
+    // above would pass on a guard that simply stopped reporting the key — and
+    // naming the rejected key is the whole point of this reason string.
+    expect(verdictFor("critcal").reason ?? "").toContain("critcal");
+  });
+
+  it("never publishes a ledger verb outside the prose parser's alphabet (PEN-3157)", () => {
+    // An unrecognized verb is quoted verbatim into the commit-status
+    // description, and githubPostCommitStatusDetailed POSTs that description
+    // unscrubbed — github-egress-outbound-coverage.test.ts classifies it so.
+    // PRIOR_FINDING_DISPOSITION_PATTERN's `[a-z][a-z-]*` bounded what
+    // model-authored text could reach that boundary. Typing the structured
+    // field as a non-empty string dropped the bound, so a credential-shaped
+    // token in the JSON ledger was published where the identical token in
+    // prose was refused. Measured on this fixture before the bound:
+    //   structured -> ...unrecognized ledger verb "ghp_abcdef...0123456789".
+    //   prose      -> ...is still undispositioned; no comment attests...
+    // Guarded at the publisher rather than the parser: an unknown verb already
+    // fails closed as `unrecognized`, so rejecting the block would only
+    // manufacture a red — and would put the gate out of step with the two peer
+    // readers that accept any non-empty string.
+    const token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+    const structuredLedger = (verb: string) =>
+      [
+        "## Ally — Consolidated PR Review",
+        "<!-- ally-verdict:1",
+        JSON.stringify({
+          head: INTERMEDIATE_HEAD,
+          findings: { critical: 0, important: 0, suggestions: 0 },
+          dispositions: [{ head: OLD_HEAD.slice(0, 7), severity: "important", index: 1, verb }],
+        }),
+        "-->",
+        `Reviewed head: ${INTERMEDIATE_HEAD}`,
+        "### Critical Issues (0)",
+        "### Important Issues (0)",
+      ].join("\n");
+
+    const carriedFor = (verb: string) =>
+      evaluateCommentReviewGate({
+        headSha: CURRENT_HEAD,
+        comments: [
+          allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+          allyComment(structuredLedger(verb), "2026-08-04T21:09:19Z"),
+        ],
+      });
+
+    const leaked = carriedFor(token);
+    expect(leaked).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    expect(leaked.reason).not.toContain(token);
+    expect(leaked.reason).not.toContain("ghp_");
+    // Withheld, not dropped: the reader must still learn that the red is
+    // vocabulary drift rather than a genuinely open finding.
+    expect(leaked.reason).toContain("unrecognized ledger verb");
+
+    // Positive control. Without it the assertions above would also pass on a
+    // fixture the block parser never read at all — a false all-clear.
+    expect(carriedFor("deferred").reason).toContain('unrecognized ledger verb "deferred"');
+  });
+
+  it("the publisher's alphabet is the parser's alphabet", () => {
+    // `[a-z][a-z-]*` appears TWICE in ally-review-detection.ts: as
+    // PUBLISHABLE_TOKEN_ALPHABET behind isPublishableToken, and as a literal
+    // verb group inside PRIOR_FINDING_DISPOSITION_PATTERN. The duplication is
+    // deliberate — the PEN-3157 pin in master's github-write-egress-scrub.test
+    // reads that group out of the pattern's own source text, so interpolating
+    // the constant there reads as a widening of a security bound. THIS TEST IS
+    // WHAT MAKES THE DUPLICATION SAFE, so it is load-bearing rather than
+    // belt-and-braces: it drives both copies and pins that they agree, which is
+    // non-trivial because they embed the alphabet differently — one anchored
+    // `^…$`, one inside a larger bold-list-item match.
+    //
+    // The bound only holds if the publisher's copy is no WIDER than the
+    // parser's: a verb the parser will extract from prose and the publisher
+    // then refuses is merely withheld, but the reverse is the PEN-3157 leak.
+    const verbs = [
+      "fixed",
+      "wontfix",
+      "not-reproducible",
+      "a",
+      "fixed (partially)",
+      "Fixed",
+      "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+      "AKIAIOSFODNN7EXAMPLE",
+      "eyJhbGciOiJIUzI1NiJ9",
+      "-leading",
+      "fixed1",
+      "fixed_ok",
+      "",
+    ];
+
+    for (const verb of verbs) {
+      // Drive the real prose parser rather than re-spelling its regex here.
+      const body = [
+        "## Ally — Consolidated PR Review",
+        `- **prior:731ced5 important 1** — ${verb} — note.`,
+      ].join("\n");
+      const parserAdmits = extractAllyPriorFindingDispositions(body).some(
+        (entry) => entry.disposition === verb,
+      );
+      expect(
+        isPublishableToken(verb),
+        `publisher vs parser disagree on ${JSON.stringify(verb)}`,
+      ).toBe(parserAdmits);
+    }
+
+    // Positive control: the corpus must actually exercise both answers, or the
+    // loop above passes on a corpus that is entirely one-sided.
+    expect(verbs.filter((v) => isPublishableToken(v)).length).toBeGreaterThan(0);
+    expect(verbs.filter((v) => !isPublishableToken(v)).length).toBeGreaterThan(0);
   });
 
   it("keeps the ordinary reason when no unrecognized verb is involved", () => {
@@ -1278,6 +1428,160 @@ describe("clean-review precedence over the Recommended Action prose fallback", (
     );
   });
 
+  // The same assertion, carried by the STRUCTURED block instead of prose.
+  //
+  // Every block-carrying still-present fixture above attests INTERMEDIATE_HEAD
+  // while evaluating CURRENT_HEAD, so all of them exercise the carried path and
+  // none placed the entry at the head under evaluation — the case one head over
+  // from the one written. That gap hid a fail-open: the `ok` branch of
+  // hasActionablePrReviewFeedback decided from `verdict.findings` alone, so a
+  // block stating `{"critical":0,"important":0}` beside a ledger entry saying a
+  // prior Critical is `still-present` returned false. evaluateCommentReviewGate
+  // short-circuits on a current-head attestation before consulting the
+  // carry-forward, so nothing downstream re-examined it and the gate published
+  // `success`/`clean`. A regression against master, where the identical body
+  // without a block blocks via the prose clause. Found by Ally in review of
+  // #1721 at 8e6e84bd.
+  const blockCarryingStillPresent = (headSha: string, verb: string) =>
+    [
+      "## Ally — Consolidated PR Review",
+      "",
+      "<!-- ally-verdict:1",
+      JSON.stringify({
+        head: headSha,
+        findings: { critical: 0, important: 0, suggestions: 0 },
+        dispositions: [{ head: OLD_HEAD.slice(0, 7), severity: "critical", index: 1, verb }],
+      }),
+      "-->",
+      "",
+      `Reviewed head: ${headSha}`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+      "### Recommended Action",
+      "1. No Critical issues to fix before merge.",
+    ].join("\n");
+
+  it("still blocks a structured 0/0 block whose ledger asserts still-present at this head", () => {
+    expect(hasActionablePrReviewFeedback(blockCarryingStillPresent(CURRENT_HEAD, "still-present"))).toBe(
+      true,
+    );
+  });
+
+  it("does not clear the head when a structured still-present block is evaluated end to end", () => {
+    // Driven through the real evaluator, because the unit above passes while
+    // the gate still goes green if the short-circuit ordering is what leaks.
+    // This is the assertion that would have caught the regression.
+    expect(
+      evaluateCommentReviewGate({
+        headSha: CURRENT_HEAD,
+        comments: [allyComment(blockCarryingStillPresent(CURRENT_HEAD, "still-present"), "2026-08-04T21:09:19Z")],
+      }),
+    ).not.toMatchObject({ state: "success" });
+  });
+
+  it("clears a structured block whose ledger only retires prior findings", () => {
+    // Control for both cases above: `fixed` classifies as `retires`. Without
+    // it the new guard could be satisfied by any ledger entry at all, which
+    // would red-wedge every review that correctly reports a fix.
+    expect(hasActionablePrReviewFeedback(blockCarryingStillPresent(CURRENT_HEAD, "fixed"))).toBe(false);
+  });
+
+  // The last uncovered quadrant of the block/prose drift matrix. The counts
+  // axis fails a block closed when prose contradicts it (proseCountContradicting);
+  // the ledger axis had no twin, so a block whose `dispositions` are absent,
+  // `[]`, or merely missing the entry took the `ok` branch, found zero counts,
+  // found an empty ledger, and returned false -- while the identical body
+  // *without* a block blocks via the prose ledger clause in
+  // carriesBlockingFeedback. The producer
+  // template mandates emitting both the block and the prose ledger, which is
+  // exactly how the two come to disagree on this field. Found by Ally in
+  // review of #1721 at 1d6f3785.
+  const proseLedgerAgainstBlock = (verb: string, dispositions?: unknown[]) =>
+    [
+      "## Ally — Consolidated PR Review",
+      "",
+      "<!-- ally-verdict:1",
+      JSON.stringify({
+        head: CURRENT_HEAD,
+        findings: { critical: 0, important: 0, suggestions: 0 },
+        ...(dispositions === undefined ? {} : { dispositions }),
+      }),
+      "-->",
+      "",
+      `Reviewed head: ${CURRENT_HEAD}`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+      "### Prior Findings Dispositioned (1)",
+      `- **prior:${OLD_HEAD.slice(0, 7)} critical 1** — ${verb} — the guard is unchanged.`,
+      "### Recommended Action",
+      "1. No Critical issues to fix before merge.",
+    ].join("\n");
+
+  for (const [label, dispositions] of [
+    ["omits `dispositions`", undefined],
+    ["states `dispositions: []`", []],
+    ["names only a retired entry", [{ head: OLD_HEAD.slice(0, 7), severity: "important", index: 1, verb: "fixed" }]],
+  ] as const) {
+    it(`fails a block closed when it ${label} and the prose ledger still stands`, () => {
+      // Both shapes matter: absence is legitimately "this review retires
+      // nothing", and a partially-drifted ledger is the same hole one entry in.
+      const body = proseLedgerAgainstBlock("still-present", dispositions);
+      expect(parseAllyVerdictBlock(body)).toMatchObject({ kind: "unreadable" });
+      expect(hasActionablePrReviewFeedback(body)).toBe(true);
+    });
+  }
+
+  it("does not clear the head when a block contradicting its prose ledger is evaluated end to end", () => {
+    // The load-bearing assertion. The unit above passes while the gate still
+    // goes green if evaluateCommentReviewGate reaches `success` by another
+    // route, which is how this family of fail-opens has escaped every time.
+    expect(
+      evaluateCommentReviewGate({
+        headSha: CURRENT_HEAD,
+        comments: [allyComment(proseLedgerAgainstBlock("still-present", []), "2026-08-04T21:09:19Z")],
+      }),
+    ).not.toMatchObject({ state: "success" });
+  });
+
+  it("reports a block contradicting its prose ledger as unreadable, never as carrying a finding", () => {
+    // The acceptance criterion this row exists for: `blocking_finding` must be
+    // reachable only from a structured finding. A body the parser cannot
+    // reconcile is unreadable, which is a distinguishable red.
+    expect(parseAllyVerdictBlock(proseLedgerAgainstBlock("still-present", []))).toMatchObject({
+      reason: expect.stringContaining("prose ledger"),
+    });
+  });
+
+  it("clears a block whose prose ledger only retires prior findings", () => {
+    // Control, and the one that keeps this from being a widening: a prose
+    // `fixed` entry the block omits clears either way, so failing closed on it
+    // would be a false red with no fail-open behind it -- the #1675 direction.
+    expect(parseAllyVerdictBlock(proseLedgerAgainstBlock("fixed", []))).toMatchObject({ kind: "ok" });
+    expect(hasActionablePrReviewFeedback(proseLedgerAgainstBlock("fixed", []))).toBe(false);
+  });
+
+  it("stays readable when the block's ledger agrees with its prose ledger", () => {
+    // The real contract-compliant shape: both state the same standing entry.
+    // It must block, but as a *structured* finding rather than as an
+    // unreadable verdict, or every genuine still-present review reads broken.
+    const agreeing = proseLedgerAgainstBlock("still-present", [
+      { head: OLD_HEAD.slice(0, 7), severity: "critical", index: 1, verb: "still-present" },
+    ]);
+    expect(parseAllyVerdictBlock(agreeing)).toMatchObject({ kind: "ok" });
+    expect(hasActionablePrReviewFeedback(agreeing)).toBe(true);
+  });
+
+  it("does not count a structured still-present entry when the caller asks the narrower question", () => {    // The carry-forward enumeration asks "which findings did *this head*
+    // raise?" and passes false, for the reason ActionableFeedbackOptions
+    // documents. The structured clause is gated on the same option as its
+    // prose twin, so the two cannot drift on which question they answer.
+    expect(
+      hasActionablePrReviewFeedback(blockCarryingStillPresent(CURRENT_HEAD, "still-present"), undefined, {
+        countInheritedLedgerAssertion: false,
+      }),
+    ).toBe(false);
+  });
+
   it("clears a 0/0 review whose ledger only retires prior findings", () => {
     // The control for the case above: `fixed` classifies as `retires`, so it
     // must not block. Without this, the still-present guard could be satisfied
@@ -1363,5 +1667,242 @@ describe("clean-review precedence over the Recommended Action prose fallback", (
     });
 
     expect(verdict).toMatchObject({ state: "success", outcome: "clean" });
+  });
+});
+
+describe("commit-status description budget", () => {
+  // GitHub caps a commit-status description at 140 characters and
+  // `githubPostCommitStatusDetailed` slices to that before the POST, so an
+  // overlong reason is never rejected — it is silently cut. What gets cut is
+  // the tail, and the tail of the clean reason is the source attribution, the
+  // one field that says whether the structured block or the prose fallback
+  // produced the green (BLO-32695). Losing it is exactly the silent regression
+  // the attribution exists to make visible.
+  const MAX = 140;
+
+  // Both branches of the `source` ternary, driven through the real evaluator
+  // rather than re-rendered here: a copy of the sentence would keep passing
+  // after the real one grew.
+  const structured = evaluateCommentReviewGate({
+    headSha: CURRENT_HEAD,
+    comments: [
+      allyComment(
+        [
+          "## Ally — Consolidated PR Review",
+          "",
+          "<!-- ally-verdict:1",
+          JSON.stringify({
+            head: CURRENT_HEAD,
+            findings: { critical: 0, important: 0, suggestions: 0 },
+            dispositions: [],
+          }),
+          "-->",
+          "",
+          `Reviewed head: ${CURRENT_HEAD}`,
+        ].join("\n"),
+        "2026-08-04T21:09:19Z",
+      ),
+    ],
+  });
+  const prose = evaluateCommentReviewGate({
+    headSha: CURRENT_HEAD,
+    comments: [allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T21:09:19Z")],
+  });
+
+  it("keeps both clean descriptions inside GitHub's cap", () => {
+    // Positive control: assert we actually exercised both branches, so a
+    // regression that collapses them to one phrasing cannot pass vacuously.
+    expect(structured).toMatchObject({ state: "success", outcome: "clean" });
+    expect(prose).toMatchObject({ state: "success", outcome: "clean" });
+    expect(structured.reason).not.toBe(prose.reason);
+
+    for (const verdict of [structured, prose]) {
+      expect(verdict.reason.length).toBeLessThanOrEqual(MAX);
+    }
+  });
+});
+
+/**
+ * Equal-timestamp ties at each of the three newest-wins scans.
+ *
+ * GitHub's created_at is second-resolution and
+ * executeCommentReviewGateCheck concatenates two independently-ordered
+ * surfaces, so nothing makes the array order meaningful. Each scan used to end
+ * in `time >= best`, so a tie handed the verdict to whichever comment the array
+ * happened to list last — and all three flipped *open*. Every case asserts both
+ * orders, because a case aimed at one site cannot reach the others: the
+ * pre-existing multi-comment cases all use distinct timestamps, and the one at
+ * "an unattested newer review does not displace" pins the attested/unattested
+ * axis with a 12-hour gap.
+ */
+describe("equal-timestamp ties resolve to the conservative verdict", () => {
+  const TIE = "2026-08-04T20:09:19Z";
+  const LATER = "2026-08-04T20:09:20Z";
+
+  const bothOrders = (a: ReturnType<typeof allyComment>, b: ReturnType<typeof allyComment>) =>
+    [
+      [a, b],
+      [b, a],
+    ].map((comments) => evaluateCommentReviewGate({ headSha: CURRENT_HEAD, comments }));
+
+  it("latestAttestingAllyComment: a finding at this head beats a clean review of the same second", () => {
+    for (const verdict of bothOrders(
+      allyComment(blockingReview(CURRENT_HEAD), TIE),
+      allyComment(cleanReview(CURRENT_HEAD), TIE),
+    )) {
+      expect(verdict).toMatchObject({ state: "failure", outcome: "blocking_finding" });
+    }
+  });
+
+  it("latestAttestingAllyComment: a strictly later clean review still clears it", () => {
+    // Control. The tie rule must not turn "newest wins" into "a finding always
+    // wins", which would wedge every PR whose finding was later cleared.
+    for (const verdict of bothOrders(
+      allyComment(blockingReview(CURRENT_HEAD), TIE),
+      allyComment(cleanReview(CURRENT_HEAD), LATER),
+    )) {
+      expect(verdict).toMatchObject({ state: "success", outcome: "clean" });
+    }
+  });
+
+  it("headsWithUndispositionedFinding: a carried finding beats a clean review of the same second", () => {
+    for (const verdict of bothOrders(
+      allyComment(blockingReview(OLD_HEAD), TIE),
+      allyComment(cleanReview(OLD_HEAD), TIE),
+    )) {
+      expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    }
+  });
+
+  it("headsWithUndispositionedFinding: a strictly later clean review of that head still clears it", () => {
+    for (const verdict of bothOrders(
+      allyComment(blockingReview(OLD_HEAD), TIE),
+      allyComment(cleanReview(OLD_HEAD), LATER),
+    )) {
+      expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+    }
+  });
+
+  it("headsWithUndispositionedFinding: a tied finding the ledger retires loses nothing", () => {
+    // The reason the tie is resolved on the final verdict rather than by
+    // preferring the blocking body inside the loop: preferring it there hands
+    // the slot to a body isFullyDispositioned filters back out, and the head
+    // goes green off a candidate that was never consulted. Here the tied
+    // blocking body is retired by name, so the head clears on its own terms
+    // rather than because the clean body happened to take the slot.
+    const comments = [
+      allyComment(blockingReview(OLD_HEAD), TIE),
+      allyComment(cleanReview(OLD_HEAD), TIE),
+      allyComment(dispositioningReview(INTERMEDIATE_HEAD, OLD_HEAD, "fixed"), LATER),
+    ];
+
+    for (const order of [comments, [...comments].reverse()]) {
+      expect(evaluateCommentReviewGate({ headSha: CURRENT_HEAD, comments: order })).toMatchObject({
+        state: "success",
+        outcome: "not_evaluated",
+      });
+    }
+  });
+
+  /** An unreadable verdict block, claiming `headSha` in prose, or no head. */
+  const unreadableReview = (headSha: string | null) =>
+    [
+      "## Ally — Consolidated PR Review",
+      "<!-- ally-verdict:1",
+      "{ this is not json",
+      "-->",
+      ...(headSha ? [`Reviewed head: ${headSha}`] : []),
+    ].join("\n");
+
+  it("newestAllyConsolidatedReviewComments: an unreadable block beats a clean review of the same second", () => {
+    for (const verdict of bothOrders(
+      allyComment(unreadableReview(CURRENT_HEAD), TIE),
+      allyComment(cleanReview(CURRENT_HEAD), TIE),
+    )) {
+      expect(verdict).toMatchObject({ state: "failure", outcome: "unreadable_verdict" });
+    }
+  });
+
+  /**
+   * The tie-break must be the caller's *whole* predicate, not a subset of it.
+   *
+   * newestAllyConsolidatedReviewComments picked one unreadable review out of the
+   * tied set, but evaluateCommentReviewGate then requires that review to also
+   * be in scope for this head. Where two unreadable reviews tie, the subset
+   * predicate could hand the slot to the out-of-scope one, whose claim the
+   * caller discards — and the in-scope unreadable review is never examined.
+   * Both flips fail open, which is the BLO-29711 direction (Ally, #1721 at
+   * 9fd4b499). A null claim is in scope: "cannot tell which head this
+   * examined" is an ambiguity, not an exemption.
+   */
+  it("newestAllyConsolidatedReviewComments: an out-of-scope unreadable review cannot take the slot", () => {
+    for (const inScope of [unreadableReview(CURRENT_HEAD), unreadableReview(null)]) {
+      for (const verdict of bothOrders(
+        allyComment(unreadableReview(OLD_HEAD), TIE),
+        allyComment(inScope, TIE),
+      )) {
+        expect(verdict).toMatchObject({ state: "failure", outcome: "unreadable_verdict" });
+      }
+    }
+  });
+
+  it("newestAllyConsolidatedReviewComments: two unreadable reviews of other heads stay out of scope", () => {
+    for (const verdict of bothOrders(
+      allyComment(unreadableReview(OLD_HEAD), TIE),
+      allyComment(unreadableReview(INTERMEDIATE_HEAD), TIE),
+    )) {
+      expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+    }
+  });
+
+  /** An unreadable block of an unsupported version — a *different* reason. */
+  const unsupportedVersionReview = (headSha: string) =>
+    [
+      "## Ally — Consolidated PR Review",
+      "<!-- ally-verdict:2",
+      '{ "head": "x" }',
+      "-->",
+      `Reviewed head: ${headSha}`,
+    ].join("\n");
+
+  /**
+   * The last place array order was visible in output. Two in-scope unreadable
+   * reviews tied at one second agree on {state, outcome} but not on
+   * `block.reason`, and that string is the commit-status description and the
+   * check-run summary — so the same input named a different cause on each run
+   * (Ally, #1721 at 31532b48). Asserts the *property* (order-independence)
+   * rather than a chosen string, so reversing the comparator's sense cannot
+   * silently keep this green.
+   */
+  it("the unreadable cause is named deterministically", () => {
+    const reasons = bothOrders(
+      allyComment(unreadableReview(CURRENT_HEAD), TIE),
+      allyComment(unsupportedVersionReview(CURRENT_HEAD), TIE),
+    ).map((verdict) => {
+      expect(verdict).toMatchObject({ state: "failure", outcome: "unreadable_verdict" });
+      return verdict.reason;
+    });
+
+    expect(reasons[0]).toBe(reasons[1]);
+    // Both causes are genuinely reachable from this input, so the assertion
+    // above is not vacuously satisfied by one of them never being produced.
+    expect(reasons[0]).toMatch(/not valid JSON|unsupported ally-verdict version/);
+  });
+
+  /**
+   * The cross-head sort is not a verdict, but it is output. Both entries carry
+   * a finding, so `failure/carried_finding` is stable either way — the head
+   * named in the commit-status text was not (Ally, #1721 at 9fd4b499).
+   */
+  it("headsWithUndispositionedFinding: the carried head is named deterministically", () => {
+    const named = bothOrders(
+      allyComment(blockingReview(OLD_HEAD), TIE),
+      allyComment(blockingReview(INTERMEDIATE_HEAD), TIE),
+    ).map((verdict) => {
+      expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+      return verdict.outcome === "carried_finding" ? verdict.carriedFromHeadSha : null;
+    });
+
+    expect(named[0]).toBe(named[1]);
   });
 });

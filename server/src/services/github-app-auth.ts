@@ -487,6 +487,20 @@ export async function githubFetchPrAuthorLogin(input: {
  * would let a bare `Reviewed head:` line bind to an unrelated 40-hex on the
  * following line — setting a required check on a guess, which is the one thing
  * the exactly-one rule exists to prevent.
+ *
+ * Sharing the grammar is also what BLO-32695 needs one layer down. While this
+ * file carried its own heading and attestation regexes, a block-backed review
+ * could be credited by the merge gate while reading as "no review at head"
+ * here — the #1675 false red, reproduced in a second parser. The shared heading
+ * pattern is the wider of the two (it admits the bold and alternate-dash forms
+ * Ally actually emits); forgery is not the risk it guards, because
+ * `githubHasReviewerEvidenceForPr` credits a body only after matching the
+ * reviewer App identity.
+ *
+ * An unreadable verdict block yields false here, exactly as it yields a
+ * non-`success` verdict in the gate: no evidence re-runs the reviewer, whereas
+ * crediting a verdict nothing could parse would let a run that died mid-flow
+ * self-attest.
  */
 const commentAttestsHead = (body: string, head: string): boolean =>
   hasAllyConsolidatedReviewHeading(body) && extractAllyReviewedHeadSha(body) === head;

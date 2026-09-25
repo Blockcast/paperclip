@@ -1115,5 +1115,669 @@ class TestCommentBodyIsModeAware(unittest.TestCase):
         self.assertIn("awaiting review", body)
 
 
+class TestParseReviewedHead(unittest.TestCase):
+    """The structured verdict block is the primary source.
+
+    Before this, a body carrying a block plus a #1675-shaped prose line (an
+    attested SHA trailed by a parenthetical) read as "no attestation" here while
+    the merge gate read it as attesting the head -- the reader disagreement that
+    is the BLO-32695 finding.
+    """
+
+    HEAD = "c" * 40
+
+    def block(self, head):
+        return (
+            '<!-- ally-verdict:1\n'
+            '{"head":"%s","findings":{"critical":0,"important":0,"suggestions":0}}\n'
+            "-->" % head
+        )
+
+    def test_block_wins_when_prose_is_unparseable(self):
+        body = "%s\n\n## Ally — Consolidated PR Review\nReviewed head: %s (unchanged since my last pass)\n" % (
+            self.block(self.HEAD),
+            self.HEAD,
+        )
+        self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
+
+    def test_block_alone_attests(self):
+        self.assertEqual(sweep.parse_reviewed_head(self.block(self.HEAD)), self.HEAD)
+
+    def test_prose_alone_still_attests(self):
+        self.assertEqual(
+            sweep.parse_reviewed_head("Reviewed head: %s" % self.HEAD), self.HEAD
+        )
+
+    def test_disagreement_fails_closed(self):
+        body = "%s\nReviewed head: %s" % (self.block(self.HEAD), "d" * 40)
+        self.assertIsNone(sweep.parse_reviewed_head(body))
+
+    def test_two_blocks_fail_closed_without_falling_back_to_prose(self):
+        body = "%s\n%s\nReviewed head: %s" % (
+            self.block(self.HEAD),
+            self.block(self.HEAD),
+            self.HEAD,
+        )
+        self.assertIsNone(sweep.parse_reviewed_head(body))
+
+    def test_unterminated_block_fails_closed_without_falling_back_to_prose(self):
+        body = '<!-- ally-verdict:1\n{"head":"%s"}\nReviewed head: %s' % (
+            self.HEAD,
+            self.HEAD,
+        )
+        self.assertIsNone(sweep.parse_reviewed_head(body))
+
+    def test_unsupported_version_fails_closed(self):
+        self.assertIsNone(
+            sweep.parse_reviewed_head('<!-- ally-verdict:2\n{"head":"%s"}\n-->' % self.HEAD)
+        )
+
+    def test_partial_sha_in_block_fails_closed(self):
+        self.assertIsNone(
+            sweep.parse_reviewed_head(
+                '<!-- ally-verdict:1\n{"head":"%s"}\n-->' % self.HEAD[:7]
+            )
+        )
+
+    def test_two_keys_normalizing_to_one_severity_fail_closed(self):
+        """Peer review of #1721 at 8e6e84bd -- shared by all three readers.
+
+        `json.loads` keeps "critical" and "Critical" as distinct keys; they
+        become one severity only at the `.lower()` in severity_counts, where an
+        unconditional assignment let the last one win. So a block stating a
+        Critical could read clean. Reachable precisely because the keys differ
+        in case -- an exact duplicate is collapsed by the parser before this
+        code sees it. Both orders, because last-wins made the verdict depend on
+        key order and a guard catching only one order leaves the dangerous one.
+        """
+        for payload in (
+            '{"critical":0,"Critical":1,"important":0}',
+            '{"Critical":1,"critical":0,"important":0}',
+        ):
+            body = '<!-- ally-verdict:1\n{"head":"%s","findings":%s}\n-->' % (
+                self.HEAD,
+                payload,
+            )
+            self.assertIsNone(sweep.parse_reviewed_head(body), payload)
+
+    def test_distinct_severities_are_still_accepted(self):
+        """Control: without it the guard would reject every honest verdict."""
+        body = (
+            '<!-- ally-verdict:1\n'
+            '{"head":"%s","findings":{"critical":0,"important":0,"suggestions":1}}\n'
+            "-->" % self.HEAD
+        )
+        self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
+
+    def test_a_zero_padded_version_reads_the_same_here_as_in_the_two_js_readers(self):
+        """Peer review of #1721, Suggestion 1 -- the version compare diverged.
+
+        This compared `raw_version != str(1)` while ally-review-detection.ts and
+        check-ally-review-consistency.mjs both use `Number(raw) !== 1`, so
+        `ally-verdict:01` was readable to the merge gate and unreadable here.
+        The sweep then treats the review as no signal for that head and
+        re-requests a review that already happened. Two parsers disagreeing
+        about one body is the BLO-31730 failure, not a formatting nicety.
+        """
+        body = '<!-- ally-verdict:01\n{"head":"%s","findings":{"critical":0,"important":0}}\n-->' % self.HEAD
+        self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
+
+    def test_a_space_after_the_colon_is_the_block_it_plainly_is(self):
+        """Peer review of #1721, Important 2.
+
+        The emitter is a model transcribing a template out of a fenced example,
+        so pretty-printing a space here is the likeliest single drift. It used
+        to match neither the block nor the opener pattern, so it read `absent`
+        and fell through to the prose path this row retires.
+        """
+        body = '<!-- ally-verdict: 1\n{"head":"%s","findings":{"critical":0,"important":0}}\n-->' % self.HEAD
+        self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
+
+    def test_a_garbled_version_fails_closed_rather_than_vanishing(self):
+        """The opener is version-agnostic so the strict pattern can be the only
+        reader of the version. `:v1` and a missing version previously missed
+        both patterns and degraded silently to prose."""
+        for opener in ('<!-- ally-verdict:v1', '<!-- ally-verdict '):
+            body = '%s\n{"head":"%s"}\n-->\nReviewed head: %s' % (
+                opener,
+                self.HEAD,
+                self.HEAD,
+            )
+            self.assertIsNone(sweep.parse_reviewed_head(body), opener)
+
+    def test_quoted_block_is_a_body_discussing_one_not_emitting_one(self):
+        body = "> <!-- ally-verdict:1\n> {\"head\":\"%s\"}\n> -->\nReviewed head: %s" % (
+            "d" * 40,
+            self.HEAD,
+        )
+        self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
+
+
+class TestVerdictCountsMirrorTheGate(unittest.TestCase):
+    """Peer review of #1721, Important 2 -- the count rule landed in one reader
+    of three.
+
+    A block whose counts the merge gate rejects is red there with
+    `unreadable_verdict`, whose only escape is one more review. This sweep is
+    what asks for that review, and it used to read the same body as a perfectly
+    good attestation -- so the red had no escape route at all.
+    """
+
+    HEAD = "c" * 40
+
+    def body(self, findings, *prose):
+        return "\n".join(
+            [
+                '<!-- ally-verdict:1\n{"head":"%s","findings":%s}\n-->' % (self.HEAD, findings),
+                "",
+                "## Ally — Consolidated PR Review",
+            ]
+            + list(prose)
+        )
+
+    def test_a_positive_bucket_against_a_stated_zero_is_unreadable(self):
+        body = self.body('{"critical":0,"important":0}', "### Critical Issues (2)")
+        self.assertIsNone(sweep.parse_reviewed_head(body))
+
+    def test_control_agreeing_counts_still_attest(self):
+        body = self.body('{"critical":0,"important":0}', "### Critical Issues (0)")
+        self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
+
+    def test_a_sentence_referencing_a_prior_pass_does_not_fail_it_closed(self):
+        body = self.body(
+            '{"critical":0,"important":0}',
+            "### Critical Issues (0)",
+            "",
+            "Both Critical Issues (2) from the previous pass are fixed.",
+        )
+        self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
+
+    def test_a_quoted_bucket_does_not_fail_it_closed(self):
+        for quoted in ("> ### Critical Issues (2)", "```\n### Critical Issues (2)\n```"):
+            body = self.body('{"critical":0,"important":0}', quoted)
+            self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD, quoted)
+
+    def test_findings_the_gate_rejects_are_rejected_here_too(self):
+        # Absent counts are not zero counts; an unknown severity is not a key to
+        # drop; and `true` is not 1, however Python spells its bools.
+        for findings in ('{}', '{"critical":0}', '{"critical":0,"important":0,"typo":0}',
+                         '{"critical":true,"important":0}', '{"critical":-1,"important":0}'):
+            self.assertIsNone(sweep.parse_reviewed_head(self.body(findings)), findings)
+
+
+class TestVerdictLedgerMirrorsTheGate(unittest.TestCase):
+    """Peer review of #1721 at 1d6f3785 -- the count rule's twin on the other
+    field the gate decides from.
+
+    `carriesBlockingFeedback` reads `dispositions` for a blocking verb exactly
+    as it reads `findings` for a non-zero count, so a block whose ledger is
+    absent, `[]`, or merely missing the entry suppressed a prose ledger entry
+    saying a prior finding still stands. Same asymmetry as the counts class
+    above: the gate goes red on `unreadable_verdict` and this sweep is the only
+    automatic route back, so a divergence here leaves the red with no escape.
+    """
+
+    HEAD = "e" * 40
+
+    def body(self, dispositions, verb):
+        return "\n".join(
+            [
+                '<!-- ally-verdict:1\n{"head":"%s","findings":{"critical":0,"important":0}%s}\n-->'
+                % (self.HEAD, dispositions),
+                "",
+                "## Ally — Consolidated PR Review",
+                "### Critical Issues (0)",
+                "- **prior:abc1234 critical 1** — %s — the guard is unchanged." % verb,
+            ]
+        )
+
+    def test_a_standing_prose_ledger_against_a_block_retiring_everything(self):
+        for dispositions in ("", ',"dispositions":[]'):
+            self.assertIsNone(
+                sweep.parse_reviewed_head(self.body(dispositions, "still-present")),
+                dispositions or "absent",
+            )
+
+    def test_a_partially_drifted_ledger_is_the_same_hole(self):
+        dispositions = ',"dispositions":[{"head":"abc1234","severity":"important","index":1,"verb":"fixed"}]'
+        self.assertIsNone(sweep.parse_reviewed_head(self.body(dispositions, "still-present")))
+
+    def test_control_a_prose_ledger_that_only_retires_still_attests(self):
+        # Keeps this fail-closed rather than a widening: a `fixed` entry the
+        # block omits clears either way, so reddening it buys nothing and costs
+        # the #1675 direction.
+        self.assertEqual(
+            sweep.parse_reviewed_head(self.body(',"dispositions":[]', "fixed")), self.HEAD
+        )
+
+    def test_control_a_block_carrying_the_standing_entry_still_attests(self):
+        dispositions = (
+            ',"dispositions":[{"head":"abc1234","severity":"critical","index":1,'
+            '"verb":"still-present"}]'
+        )
+        self.assertEqual(
+            sweep.parse_reviewed_head(self.body(dispositions, "still-present")), self.HEAD
+        )
+
+    def test_a_quoted_or_fenced_ledger_does_not_fail_it_closed(self):
+        # Over-matching here re-requests a review Ally already gave, which is
+        # the duplicate-COMMENTED loop this file exists downstream of.
+        for quoted in (
+            "> - **prior:abc1234 critical 1** — still-present — stands.",
+            "```\n- **prior:abc1234 critical 1** — still-present — stands.\n```",
+            "    - **prior:abc1234 critical 1** — still-present — stands.",
+        ):
+            body = "\n".join(
+                [
+                    '<!-- ally-verdict:1\n{"head":"%s","findings":{"critical":0,"important":0},'
+                    '"dispositions":[]}\n-->' % self.HEAD,
+                    "",
+                    "## Ally — Consolidated PR Review",
+                    quoted,
+                ]
+            )
+            self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD, quoted)
+
+
+class TestVerdictBlockMirrorsTheGateOnFencesAndLedgers(unittest.TestCase):
+    """Peer review of #1721 at 97b4ddd1 -- the remaining two reader divergences.
+
+    Both are the same defect as TestVerdictCountsMirrorTheGate: a rule landed in
+    some readers and not this one, so the gate and this sweep disagree about one
+    body. Disagreeing in this direction is the expensive one -- with
+    ally_has_reviewed_head false the sweep re-fires a request on a head Ally
+    already reviewed, and each duplicate is a COMMENTED review that cannot be
+    dismissed.
+    """
+
+    HEAD = "d" * 40
+
+    def block(self, extra=""):
+        return '<!-- ally-verdict:1\n{"head":"%s","findings":{"critical":0,"important":0}%s}\n-->' % (
+            self.HEAD,
+            extra,
+        )
+
+    def body(self, *rest):
+        return "\n".join([self.block(), "", "## Ally — Consolidated PR Review"] + list(rest))
+
+    def test_a_fenced_example_of_the_marker_is_not_a_second_block(self):
+        # The gate counts blocks over fence-stripped text (parseAllyVerdictBlock
+        # reads emittedReviewText), so a quoted marker is invisible there:
+        # blocks=1, openers=1 -> ok. Read raw, this saw blocks=2, openers=2 ->
+        # unreadable. It fires first on a review quoting the template, which is
+        # the likeliest shape for a review *of this feature*.
+        body = self.body("Here is the emitted form:", "", "```markdown", self.block(), "```")
+        self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
+
+    def test_control_a_real_second_block_is_still_unreadable(self):
+        # Without this the test above passes for a reader that stopped counting
+        # blocks at all.
+        body = self.body("", self.block())
+        self.assertIsNone(sweep.parse_reviewed_head(body))
+
+    def test_a_tilde_or_longer_fenced_example_is_not_a_second_block_either(self):
+        # The test above pinned the ``` form only, so the same harm reopened
+        # under every other CommonMark fence the gate handles: a ~~~ opener, and
+        # a longer backtick run wrapping a ``` fence. Both read `ok` at the
+        # gate and `unreadable` here until this reader matched it.
+        for opener, closer in (("~~~", "~~~"), ("````markdown", "````")):
+            body = self.body("Here is the emitted form:", "", opener, self.block(), closer)
+            self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD, opener)
+
+    def test_only_a_same_char_run_at_least_as_long_closes_a_fence(self):
+        # Fence-length and fence-char matching are the halves a delimiter
+        # widening leaves behind. If ``` closed a ```` fence, or ~~~ closed a
+        # ``` one, the quoted block after it would re-appear as a second block
+        # and the body would read `unreadable` again.
+        for opener, inner, closer in (
+            ("````markdown", "```", "````"),
+            ("```markdown", "~~~", "```"),
+        ):
+            body = self.body("As emitted:", "", opener, self.block(), inner, self.block(), closer)
+            self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD, opener)
+
+    def test_an_inline_backtick_span_does_not_open_a_phantom_fence(self):
+        # CommonMark bars a backtick from a backtick fence's info string. Without
+        # that rule this line opens a fence that never closes, blanking the rest
+        # of the body -- so the second block below goes unseen and a genuinely
+        # unreadable body reads `ok`. The assertion is the same as the
+        # real-second-block control precisely because the harm is masking it.
+        body = self.body("``` `example` is prose, not a fence opener", self.block())
+        self.assertIsNone(sweep.parse_reviewed_head(body))
+
+    def test_a_malformed_ledger_is_rejected_here_too(self):
+        # Validation had covered one of the two fields the payload carries. TS
+        # rejects these via asDispositions and the mjs via stillPresentIn, while
+        # this dropped through to ("ok", head) -- so the gate went red on
+        # `unreadable_verdict` with no mechanism left to clear it.
+        for dispositions in (
+            '"nope"',
+            "42",
+            "null",
+            '[{"head":"deadbee","severity":"critical","verb":"fixed"}]',
+            '[{"head":"deadbee","severity":"critical","index":0,"verb":"fixed"}]',
+            '[{"head":"deadbee","severity":"critical","index":true,"verb":"fixed"}]',
+            '[{"head":"xyz","severity":"critical","index":1,"verb":"fixed"}]',
+            '[{"head":"deadbee","severity":"","index":1,"verb":"fixed"}]',
+            '[{"head":"deadbee","severity":"critical","index":1,"verb":"  "}]',
+            '["not an object"]',
+        ):
+            body = self.body_with_dispositions(dispositions)
+            self.assertIsNone(sweep.parse_reviewed_head(body), dispositions)
+
+    def test_control_a_well_formed_or_absent_ledger_still_attests(self):
+        # `null` is deliberately absent from this list: both JS readers key on
+        # `undefined`, so an explicit null fails Array.isArray and is unreadable
+        # there. Collapsing the two is why this takes the payload rather than
+        # the field.
+        self.assertEqual(sweep.parse_reviewed_head(self.body()), self.HEAD)
+        for dispositions in (
+            "[]",
+            '[{"head":"deadbee","severity":"critical","index":1,"verb":"fixed"}]',
+            '[{"head":"deadbee","severity":"recommended-action","index":4,"verb":"withdrawn"}]',
+        ):
+            body = self.body_with_dispositions(dispositions)
+            self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD, dispositions)
+
+    def body_with_dispositions(self, dispositions):
+        return "\n".join(
+            [self.block(',"dispositions":%s' % dispositions), "", "## Ally — Consolidated PR Review"]
+        )
+
+
+class TestFloatFormattedIntegersMirrorNumberIsInteger(unittest.TestCase):
+    """Ally review of #1721 at bbe6d640 -- `isinstance(_, int)` is not that.
+
+    `json.loads` yields floats for `0.0`, `0e0` and `1e3`; every one is an
+    integer to `Number.isInteger`, so the gate and the mjs read these bodies
+    `ok` while this reader read them `unreadable`. Same harm direction as the
+    two divergences above: the sweep re-requests a review of a head Ally
+    already reviewed, and a COMMENTED duplicate cannot be dismissed.
+
+    The pre-existing `true` cases pin the other direction and cannot catch
+    this, which is why these are separate rather than added to that list.
+    """
+
+    HEAD = "e" * 40
+
+    def body(self, payload):
+        return "\n".join(
+            ['<!-- ally-verdict:1\n{"head":"%s",%s}\n-->' % (self.HEAD, payload), "",
+             "## Ally — Consolidated PR Review"]
+        )
+
+    def test_float_formatted_counts_still_attest(self):
+        for findings in ('{"critical":0.0,"important":0.0}',
+                         '{"critical":0e0,"important":0}',
+                         '{"critical":1e3,"important":0}'):
+            body = self.body('"findings":%s' % findings)
+            self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD, findings)
+
+    def test_a_float_formatted_ledger_index_still_attests(self):
+        body = self.body(
+            '"findings":{"critical":0,"important":0},'
+            '"dispositions":[{"head":"deadbee","severity":"critical","index":1.0,"verb":"fixed"}]'
+        )
+        self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
+
+    def test_control_non_integral_and_bool_are_still_rejected(self):
+        # Number.isInteger(0.5) is false and a bool is not a number in JS, so
+        # widening to floats must not have widened past integral ones.
+        for payload in ('"findings":{"critical":0.5,"important":0}',
+                        '"findings":{"critical":true,"important":0}',
+                        '"findings":{"critical":1e4,"important":0}',
+                        '"findings":{"critical":0,"important":0},'
+                        '"dispositions":[{"head":"deadbee","severity":"critical",'
+                        '"index":1.5,"verb":"fixed"}]'):
+            self.assertIsNone(sweep.parse_reviewed_head(self.body(payload)), payload)
+
+
+class TestIsConsolidatedAllyCommentForHead(unittest.TestCase):
+    HEAD = "c" * 40
+
+    def test_block_before_heading_still_matches(self):
+        """Ally emits the verdict block first, so the heading is not byte 0.
+
+        `body.startswith("## Ally")` rejected Ally's own emitted bodies.
+        """
+        body = '<!-- ally-verdict:1\n{"head":"%s","findings":{"critical":0,"important":0}}\n-->\n\n## Ally — Consolidated PR Review\nReviewed head: %s\n' % (
+            self.HEAD,
+            self.HEAD,
+        )
+        self.assertTrue(sweep.is_consolidated_ally_comment_for_head(body, self.HEAD))
+
+    def test_heading_first_still_matches(self):
+        body = "## Ally — Consolidated PR Review\nReviewed head: %s\n" % self.HEAD
+        self.assertTrue(sweep.is_consolidated_ally_comment_for_head(body, self.HEAD))
+
+    def test_no_heading_does_not_match(self):
+        body = "Reviewed head: %s\n" % self.HEAD
+        self.assertFalse(sweep.is_consolidated_ally_comment_for_head(body, self.HEAD))
+
+    def test_heading_without_attestation_does_not_match(self):
+        self.assertFalse(
+            sweep.is_consolidated_ally_comment_for_head(
+                "## Ally — Consolidated PR Review\n", self.HEAD
+            )
+        )
+
+
+class TestVerdictBlockMirrorsJsCharacterSemantics(unittest.TestCase):
+    """Peer review of #1721 at d3412cce -- the same reader split one layer down.
+
+    The fence and ledger rules above made this reader agree with the gate about
+    *which constructs* it recognises. These pin the *character sets* underneath
+    them: Python's `\\d`, `str.strip` and `json.loads` are each a superset of
+    the JavaScript primitive they mirror, so a body could still be read by one
+    reader and refused by the other with every construct-level rule in place.
+
+    Both harms named on the divergent rows are the ones this module's own
+    docstrings already describe, and they run in opposite directions -- which
+    is why neither masks the other and each needs its own case.
+    """
+
+    HEAD = "e" * 40
+
+    def block(self, version="1", head=None, extra=""):
+        return '<!-- ally-verdict:%s\n{"head":"%s","findings":{"critical":0,"important":0}%s}\n-->' % (
+            version,
+            self.HEAD if head is None else head,
+            extra,
+        )
+
+    def body(self, *rest, **kw):
+        return "\n".join(
+            [self.block(**kw), "", "## Ally - Consolidated PR Review"] + list(rest)
+        )
+
+    def test_a_unicode_digit_version_is_unreadable_not_version_one(self):
+        # int("\u0661") == 1 in Python, so a Unicode-aware `\d` would accept
+        # this as a supported version and record the head as reviewed -- while
+        # both JS readers match no block at all, count the opener, and go
+        # `unreadable_verdict`. Gate red, sweep silent, and the sweep is the
+        # only automatic route back.
+        for digit in ("\u0661", "\uff11"):
+            self.assertIsNone(sweep.parse_reviewed_head(self.body(version=digit)), digit)
+
+    def test_control_an_ascii_digit_version_is_still_read(self):
+        # Without this the test above passes for a reader that stopped parsing
+        # versions entirely. `01` is pinned for the same reason it is elsewhere:
+        # the JS readers use Number(), so a string compare would split them.
+        for digit in ("1", "01"):
+            self.assertEqual(
+                sweep.parse_reviewed_head(self.body(version=digit)), self.HEAD, digit
+            )
+
+    def test_a_unicode_digit_bucket_count_is_not_a_bucket(self):
+        # The mirror image, and the reason a single `\d` rule is not enough:
+        # here Unicode-awareness makes this reader see a contradiction the JS
+        # readers cannot see. The gate stays green while the sweep re-requests
+        # review on a head Ally already reviewed -- spam, and each duplicate is
+        # a COMMENTED review that cannot be dismissed.
+        body = self.body("### Critical Issues (\u0661)")
+        self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
+
+    def test_control_an_ascii_bucket_count_still_contradicts(self):
+        body = self.body("### Critical Issues (1)")
+        self.assertIsNone(sweep.parse_reviewed_head(body))
+
+    def test_head_padding_is_trimmed_exactly_as_javascript_trims_it(self):
+        # str.strip() differs from String.prototype.trim in *both* directions,
+        # so a bare strip splits the readers either way round, and each
+        # direction needs its own case.
+        #
+        # U+0085 is Python-only whitespace: strip() removes it, trim() keeps
+        # it, so the JS SHA test fails and the gate reads `unreadable` while
+        # this read a clean attestation. U+FEFF is the exact reverse -- trim()
+        # removes it, strip() keeps it -- so before js_trim this reader alone
+        # refused a head both JS readers accept.
+        #
+        # U+001C..U+001F are the other Python-only whitespace and are
+        # deliberately NOT here: they are JSON control characters, so both
+        # json.loads and JSON.parse refuse the payload before any trim runs.
+        # Asserting on them would pass with or without js_trim.
+        self.assertIsNone(
+            sweep.parse_reviewed_head(
+                self.body(head="\u0085" + self.HEAD + "\u0085")
+            )
+        )
+        self.assertEqual(
+            sweep.parse_reviewed_head(
+                self.body(head="\ufeff" + self.HEAD + "\ufeff")
+            ),
+            self.HEAD,
+        )
+        # Agreement controls -- whitespace both runtimes trim. These fail if
+        # js_trim is narrowed to just the two characters above.
+        for pad in ("\u0020", "\u00a0", "\u2028", "\u3000"):
+            self.assertEqual(
+                sweep.parse_reviewed_head(self.body(head=pad + self.HEAD + pad)),
+                self.HEAD,
+                repr(pad),
+            )
+
+    def test_a_json_literal_javascript_rejects_is_unreadable(self):
+        # json.loads accepts the bare NaN/Infinity literals as an extension;
+        # JSON.parse raises on all three. Reachable only through a key no
+        # reader validates today, but the block's own comment anticipates a
+        # future free-text field, and closing it at the parser cannot rot as
+        # fields are added.
+        for literal in ("NaN", "Infinity", "-Infinity"):
+            body = self.body(extra=',"note":%s' % literal)
+            self.assertIsNone(sweep.parse_reviewed_head(body), literal)
+
+    def test_control_an_unvalidated_extra_key_is_otherwise_ignored(self):
+        # The gate destructures head/findings/dispositions and ignores the
+        # rest, so rejecting every extra key would be its own divergence.
+        self.assertEqual(
+            sweep.parse_reviewed_head(self.body(extra=',"note":"anything"')), self.HEAD
+        )
+
+
+class TestPatternCharacterClassesAreAsciiOnly(unittest.TestCase):
+    """Peer review of #1721 at d05a49f3 -- `\\b` and IGNORECASE, the two members
+    of the class above that the `[0-9]` fix did not reach.
+
+    The gate builds its regexes with "gm"/"gim"/"gi" and never the `u` flag, so
+    every character class in them is ASCII-only. Python's are not. Measured
+    exhaustively over U+0000..U+10FFFF at this head: 138495 code points are word
+    characters to Python's `\\b` and not to JavaScript's, and exactly three --
+    U+0130, U+0131, U+017F -- fold into the ASCII letters these patterns spell.
+
+    Both harms run in the *silent* direction, which is why they are pinned
+    rather than documented: the sweep records the head as reviewed, so the one
+    automatic route back from a red gate never fires.
+    """
+
+    HEAD = "c" * 40
+
+    def test_a_non_ascii_word_char_after_the_prefix_still_counts_an_opener(self):
+        # `<!-- ally-verdict١` -- Python's `\b` finds no boundary between
+        # `t` and an Arabic-Indic digit, so an opener-counting rule built on it
+        # sees `absent` and falls through to the prose line, which on real data
+        # is usually readable. Both JS readers count the opener, find no block,
+        # and go `unreadable_verdict`. Gate red, sweep silent.
+        for drift in ("١", "１", "é"):
+            body = "<!-- ally-verdict%s1\n{}\n-->\n\nReviewed head: %s" % (drift, self.HEAD)
+            self.assertEqual(
+                len(sweep.VERDICT_OPENER_PATTERN.findall(body)), 1, repr(drift)
+            )
+            self.assertIsNone(sweep.parse_reviewed_head(body), repr(drift))
+
+    def test_control_an_ascii_non_word_char_after_the_prefix_is_unchanged(self):
+        # Without this the test above passes for a pattern that dropped `\b`
+        # and matched the bare prefix unconditionally -- which would also count
+        # an opener for a marker that never drifted at all.
+        ok = (
+            '<!-- ally-verdict:1\n{"head":"%s","findings":{"critical":0,"important":0}}\n-->'
+            % self.HEAD
+        )
+        self.assertEqual(sweep.parse_reviewed_head(ok), self.HEAD)
+        for control in ("<!-- ally-verdict:v1", "<!-- ally-verdict {"):
+            body = "%s\n{}\n-->\n\nReviewed head: %s" % (control, self.HEAD)
+            self.assertEqual(
+                len(sweep.VERDICT_OPENER_PATTERN.findall(body)), 1, control
+            )
+            self.assertIsNone(sweep.parse_reviewed_head(body), control)
+
+    def test_a_folded_bucket_heading_is_no_bucket_here_either(self):
+        # Python folds U+017F into `s`, so `### Critical Iſſues (1)` over a
+        # block stating 0 reads as a contradiction here and as no bucket at all
+        # to the gate -- gate green, sweep re-requesting a head Ally reviewed.
+        # The mirror image of the row above, so neither masks the other.
+        block = '<!-- ally-verdict:1\n{"head":"%s","findings":{"critical":0,"important":0}}\n-->' % self.HEAD
+        body = "%s\n\n### Critical Iſſues (1)" % block
+        self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD)
+
+    def test_control_an_ascii_bucket_heading_still_contradicts(self):
+        block = '<!-- ally-verdict:1\n{"head":"%s","findings":{"critical":0,"important":0}}\n-->' % self.HEAD
+        self.assertIsNone(sweep.parse_reviewed_head("%s\n\n### Critical Issues (1)" % block))
+
+    def test_a_folded_attestation_label_is_not_an_attestation(self):
+        # Not in the reported finding, and reachable by the same flag: the
+        # prose pattern's IGNORECASE folds U+0131 into `i`, so `Revıewed head:`
+        # attests here and not at the gate. Silent direction again, and it is
+        # the fallback the two rows above route *to*.
+        self.assertIsNone(sweep.parse_reviewed_head("Revıewed head: %s" % self.HEAD))
+        self.assertEqual(sweep.parse_reviewed_head("REVIEWED HEAD: %s" % self.HEAD), self.HEAD)
+
+    def test_the_prose_fallback_reads_the_wrapped_forms_the_gate_reads(self):
+        # 3 of the 25 attesting bodies on #1721 wrap the SHA in backticks. The
+        # gate carries ATTESTATION_WRAPPER_RUN / MARKDOWN_EMPHASIS_RUN for
+        # exactly these; without them this reader is narrower than the gate and
+        # re-requests a review that already attests.
+        for form in (
+            "Reviewed head: `%s`",
+            "**Reviewed head:** `%s`",
+            "_Reviewed head:_ %s",
+        ):
+            self.assertEqual(
+                sweep.parse_reviewed_head(form % self.HEAD), self.HEAD, form
+            )
+
+    def test_control_an_indented_code_attestation_is_not_read(self):
+        # The wrapper runs widen the pattern; the gate's NOT_INDENTED_CODE bound
+        # comes with them. A four-space-indented line is code to the gate, so
+        # reading it here would be a new divergence introduced by the fix.
+        self.assertIsNone(sweep.parse_reviewed_head("    Reviewed head: %s" % self.HEAD))
+        # The tab half of the bound, which the four-space line alone never pins.
+        self.assertIsNone(sweep.parse_reviewed_head("\tReviewed head: %s" % self.HEAD))
+
+    def test_every_compiled_pattern_in_the_module_is_ascii_only(self):
+        # The rule, not the four instances of it. `\b` was missed by the `[0-9]`
+        # fix because that fix enumerated the constructs it had seen; this
+        # fails for any pattern added later, including one using a construct
+        # nobody has hit yet.
+        import re as _re
+
+        offenders = [
+            name
+            for name, value in vars(sweep).items()
+            if isinstance(value, _re.Pattern) and not value.flags & _re.ASCII
+        ]
+        self.assertEqual(offenders, [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -71,25 +71,428 @@ def parse_list(value, fallback):
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+# Every pattern in this file carries re.ASCII, and that is a parity rule rather
+# than a style one. Python's `\b`, `\w` and IGNORECASE folding are all
+# Unicode-aware; the gate's regexes are built with "gm"/"gim"/"gi" and never the
+# `u` flag, so JavaScript's are ASCII-only. Measured over the whole Unicode
+# range at this head: 138495 code points are word characters to Python's `\b`
+# and not to JavaScript's, and exactly three -- U+0130, U+0131, U+017F -- fold
+# into the ASCII letters these patterns spell. re.ASCII closes both at once and
+# cannot be reasoned wrong per site, which an explicit character class can.
+# TestPatternCharacterClassesAreAsciiOnly pins the rule for patterns added
+# later, including ones using a construct nobody has hit yet.
+ASCII_RE = re.ASCII
+
+# Mirrors MARKDOWN_EMPHASIS_RUN / ATTESTATION_WRAPPER_RUN in the gate. Without
+# them this reader is *narrower* than the gate on the prose path: of the 25
+# attesting bodies on #1721, 3 wrap the SHA in backticks, which the gate reads
+# and a bare pattern does not. The indent bound is the gate's NOT_INDENTED_CODE
+# for the same reason in the other direction -- an attestation inside an
+# indented code block is prose to a bare `[ \t]*` and code to the gate.
+MARKDOWN_EMPHASIS_RUN = r"[*_`]{0,3}"
+ATTESTATION_WRAPPER_RUN = r"[*_`\t ]{0,6}"
+
 # The immutable head attestation Ally writes into every consolidated body:
 # a standalone "Reviewed head: <40 lowercase hex>" line. This is what binds a
 # signal to a revision -- NOT review.commit_id, and NOT a substring scan.
 REVIEWED_HEAD_PATTERN = re.compile(
-    r"^[ \t]*Reviewed head:[ \t]*([0-9a-f]{40})[ \t]*$", re.IGNORECASE | re.MULTILINE
+    r"^(?! *\t)(?! {4}) {0,3}"
+    + MARKDOWN_EMPHASIS_RUN
+    + r"[ \t]{0,3}Reviewed head:[ \t]*"
+    + ATTESTATION_WRAPPER_RUN
+    + r"([0-9a-f]{40})"
+    + ATTESTATION_WRAPPER_RUN
+    + r"[ \t]*$",
+    re.IGNORECASE | re.MULTILINE | ASCII_RE,
 )
+
+
+# Ally's structured verdict block -- the primary source, mirroring
+# server/src/services/ally-review-detection.ts so this reader and the merge gate
+# cannot disagree about which tree was reviewed. The prose line above is the
+# fallback for a body that carries no block.
+VERDICT_BLOCK_PATTERN = re.compile(
+    # `[0-9]`, never `\d`: Python's `\d` is Unicode-aware and JavaScript's is
+    # ASCII-only, so `ally-verdict:١` (U+0661) parses as version 1 here and
+    # matches nothing in either JS reader. The gate then counts an opener with
+    # no block and goes `unreadable_verdict` while this sweep records the head
+    # as reviewed -- verbatim the divergence `parse_verdict_block_head` below
+    # exists to prevent. Same rule at EMITTED_BUCKET_PATTERN, where it inverts.
+    r"^(?! *\t)(?! {4}) {0,3}(?![ \t]*>)<!--[ \t]*ally-verdict:[ \t]*([0-9]+)(.*?)-->",
+    re.MULTILINE | re.DOTALL | ASCII_RE,
+)
+VERDICT_OPENER_PATTERN = re.compile(
+    r"^(?! *\t)(?! {4}) {0,3}(?![ \t]*>)<!--[ \t]*ally-verdict\b", re.MULTILINE | ASCII_RE
+)
+SUPPORTED_VERDICT_VERSION = 1
+FULL_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE | ASCII_RE)
+# Ledger entries name the head they were raised at as Ally wrote it, which is
+# abbreviated. Mirrors the bound in `asDispositions` / `stillPresentIn`.
+ABBREV_SHA_PATTERN = re.compile(r"^[0-9a-f]{7,40}$", re.IGNORECASE | ASCII_RE)
+
+# Mirrors BLOCKING_SEVERITIES / VERDICT_SEVERITIES / MAX_VERDICT_FINDING_COUNT
+# in ally-review-detection.ts. A block whose counts that reader rejects must be
+# unreadable here too, or this sweep sees an attestation where the gate sees a
+# broken verdict -- and then declines to re-request the one review that could
+# clear the red.
+BLOCKING_SEVERITIES = ("critical", "important")
+VERDICT_SEVERITIES = frozenset(BLOCKING_SEVERITIES + ("suggestions",))
+MAX_VERDICT_FINDING_COUNT = 1000
+
+# A counted bucket the review *emits*, e.g. `### Critical Issues (2)`. Anchored
+# to the emitted heading form for the reason the module's copy is: an
+# unanchored bucket also matches a sentence *referencing* an earlier pass's
+# counts, and over-matching fails a clean review closed.
+EMITTED_BUCKET_PATTERN = re.compile(
+    r"^(?! *\t)(?! {4}) {0,3}(?![ \t]*>)(?:#{1,6}[ \t]*)?[*_]{0,3}"
+    # `[0-9]` for the reason given at VERDICT_BLOCK_PATTERN, and here the harm
+    # runs the other way: `### Critical Issues (١)` over a block stating 0 is
+    # no bucket at all to the JS readers -- no contradiction, gate green --
+    # while Unicode `\d` would make it a contradiction here, sending the sweep
+    # to re-request review on a head Ally already reviewed.
+    r"(Critical|Important)[ \t]+Issues[ \t]*[*_]{0,3}[ \t]*\(([0-9]+)\)[*_]{0,3}[ \t]*$",
+    re.IGNORECASE | re.MULTILINE | ASCII_RE,
+)
+
+# A prose ledger entry, e.g. `- **prior:abc1234 critical 1** - still-present -`.
+# Composed character-for-character as PRIOR_FINDING_DISPOSITION_PATTERN in
+# ally-review-detection.ts, including the `(?! *\t)(?! {4})` indentation bound
+# and the em/en/hyphen alternation. `[0-9]` rather than `\d` for the reason
+# given at EMITTED_BUCKET_PATTERN, and the harm runs the same way here: a
+# Unicode digit is no ledger entry at all to the JS readers, so widening it
+# would send this sweep to re-request a review Ally already gave.
+#
+# Strict rather than reusing the looser `**prior:[^\n]***` form in
+# check-ally-review-consistency.mjs. That reader is an auditor, where
+# over-matching costs a reported violation; here it costs a duplicate review
+# request, which is the BLO-22892/BLO-28203 loop.
+PRIOR_FINDING_DISPOSITION_PATTERN = re.compile(
+    r"^(?! *\t)(?! {4}) {0,3}-[ \t]*\*\*[ \t]*prior:[0-9a-f]{7,40}[ \t]+[a-z]+[ \t]+[0-9]+"
+    r"[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*([a-z][a-z-]*)[ \t]*(?:—|–|-)",
+    re.IGNORECASE | re.MULTILINE | ASCII_RE,
+)
+
+# The verb that asserts a prior finding still stands. Mirrors
+# BLOCKING_PRIOR_DISPOSITIONS in check-ally-review-consistency.mjs and the
+# `blocks` arm of classifyPriorDisposition in ally-review-detection.ts. An
+# unrecognized verb is deliberately not blocking in any of the three.
+BLOCKING_PRIOR_DISPOSITIONS = frozenset(("still-present",))
+
+FENCE_OPEN_PATTERN = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$", ASCII_RE)
+FENCE_CLOSE_PATTERN = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$", ASCII_RE)
+
+
+def without_fenced_spans(text):
+    """Blank fenced spans so a quoted bucket cannot fail a block closed.
+
+    Mirrors withoutFencedCodeBlocks in the gate exactly -- tilde fences, fence
+    length matching and the backtick info-string rule. A simpler toggle here is
+    not a scoping choice but a divergence: the two readers then disagree about
+    how many blocks a body contains, which is the BLO-31730 cross-reader
+    failure one layer down, and it fires first on a review that quotes the
+    marker template -- the likeliest shape for a review of this feature.
+    Applied to the count cross-check and to the block and opener counts in
+    parse_verdict_block_head, not to the prose attestation pattern, whose own
+    fence handling is the residual documented on parse_reviewed_head.
+    """
+    if "```" not in text and "~~~" not in text:
+        return text
+    lines = []
+    open_fence = None
+    for line in text.split("\n"):
+        if open_fence:
+            close = FENCE_CLOSE_PATTERN.match(line)
+            lines.append("")
+            if close and close.group(1)[0] == open_fence[0] and len(close.group(1)) >= open_fence[1]:
+                open_fence = None
+            continue
+        fence = FENCE_OPEN_PATTERN.match(line)
+        # Per CommonMark a backtick fence's info string may not itself contain
+        # a backtick. Honoring that keeps an inline span from opening a phantom
+        # fence that would blank the rest of a genuine review.
+        if fence and not (fence.group(1)[0] == "`" and "`" in fence.group(2)):
+            open_fence = (fence.group(1)[0], len(fence.group(1)))
+            lines.append("")
+        else:
+            lines.append(line)
+    # An unclosed fence blanks to end of body, matching how GitHub renders it.
+    return "\n".join(lines)
+
+
+# The exact character set ECMAScript's String.prototype.trim removes:
+# WhiteSpace (TAB, VT, FF, ZWNBSP, and the Space_Separator category) plus
+# LineTerminator (LF, CR, LS, PS). Python's str.strip() is a different set in
+# *both* directions -- it removes U+001C..U+001F and U+0085, which JS keeps,
+# and it keeps U+FEFF, which JS removes -- so a bare .strip() on any field this
+# reader shares with the JS readers is the same class of divergence as `\d`.
+JS_WHITESPACE = (
+    # WhiteSpace: TAB, VT, FF, ZWNBSP ...
+    "\u0009\u000b\u000c\ufeff"
+    # ... and the Space_Separator (Zs) category.
+    "\u0020\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005"
+    "\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000"
+    # LineTerminator: LF, CR, LS, PS.
+    "\u000a\u000d\u2028\u2029"
+)
+
+
+def js_trim(value):
+    """`String.prototype.trim`, not `str.strip`. See JS_WHITESPACE."""
+    return value.strip(JS_WHITESPACE)
+
+
+def reject_js_nonfinite(literal):
+    """Make json.loads refuse what JSON.parse refuses.
+
+    Python accepts the bare `NaN`/`Infinity`/`-Infinity` literals as a JSON
+    extension; `JSON.parse` raises on all three. The counts and ledger indices
+    are already held to `is_js_integer`, so the gap is only reachable through a
+    key no reader validates -- but the block's own comment anticipates a future
+    free-text field, and one extra key carrying `NaN` would read `ok` here and
+    `unreadable` at the gate. Closing it at the parser costs one argument and
+    cannot rot as fields are added.
+    """
+    raise ValueError("JSON.parse rejects the %s literal" % literal)
+
+
+def is_js_integer(value):
+    """Whether `Number.isInteger` would accept this JSON value.
+
+    `isinstance(value, int)` is not that predicate, and the gap splits this
+    reader from both JS readers in the direction that hurts. `json.loads`
+    yields floats for `0.0`, `0e0` and `1e3`, every one of which is an integer
+    to `Number.isInteger`; `isinstance(0.0, int)` is False, so a
+    float-formatted count or ledger index read `unreadable` here while the gate
+    and the mjs read `ok`. Consequence is the loop the docstring on
+    parse_verdict_block_head names: no attestation here -> the sweep re-requests
+    a review of a head Ally already reviewed, and a `COMMENTED` duplicate cannot
+    be dismissed (Ally review of #1721 at bbe6d640; BLO-22892/BLO-28203).
+
+    bool stays rejected: it is an int subclass here and not a number in JS. An
+    int too large for float64 parses as Infinity in JS, where Number.isInteger
+    is False -- OverflowError from float() is that same answer, so it is caught
+    rather than special-cased.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return float(value).is_integer()
+    except OverflowError:
+        return False
+
+
+def severity_counts(raw):
+    """Per-severity counts, or None when the payload cannot be trusted.
+
+    Absent counts are not zero counts and an unknown severity key is not a key
+    to drop; both are routes by which a block claiming a finding reads
+    identically to a clean one.
+    """
+    if not isinstance(raw, dict):
+        return None
+    counts = {}
+    for severity, value in raw.items():
+        if not is_js_integer(value):
+            return None
+        if value < 0 or value > MAX_VERDICT_FINDING_COUNT:
+            return None
+        key = js_trim(severity).lower() if isinstance(severity, str) else None
+        if key not in VERDICT_SEVERITIES:
+            return None
+        # Two keys normalizing to one severity: last-wins would let
+        # {"critical":1,"Critical":0} read clean. Mirrors the guard in
+        # ally-review-detection.ts and check-ally-review-consistency.mjs -- all
+        # three readers shared the bug identically, so none of them caught it.
+        if key in counts:
+            return None
+        counts[key] = value
+    if any(severity not in counts for severity in BLOCKING_SEVERITIES):
+        return None
+    return counts
+
+
+def dispositions_ok(payload):
+    """Whether the ledger is readable, mirroring `asDispositions` field for field.
+
+    Takes the whole payload, not `payload["dispositions"]`, because absent and
+    explicitly-null are different answers and `.get()` collapses them. Both JS
+    readers key on `undefined`: an absent ledger is legitimate (a review that
+    retires nothing emits none) and reads as empty, while an explicit `null`
+    fails `Array.isArray` and reads as unreadable. Taking the dict is what lets
+    `"dispositions" in payload` tell those apart; passing the value could not.
+
+    This reader never uses the entries -- it only wants the head -- but it must
+    still agree with the other two about whether the block is readable at all.
+    Without this the validation covered one of the two fields the payload
+    carries: TS rejects a malformed ledger (`asDispositions` -> None ->
+    unreadable) and so does the mjs (`stillPresentIn`), while this dropped
+    through to ("ok", head).
+
+    That is the exact harm named in the comment justifying why `findings` is
+    validated here, and worse in this direction: the gate goes red on
+    `unreadable_verdict` while this sweep sees a review that already happened,
+    so it never re-requests the one that would clear it -- and the sweep is the
+    only automatic route back. Found in peer review of #1721 at 97b4ddd1 with
+    `{"head": "<40-hex>", "findings": {...}, "dispositions": "nope"}`:
+    ("ok", head) here, `failure` at the gate.
+    """
+    if "dispositions" not in payload:
+        return True
+    raw = payload["dispositions"]
+    if not isinstance(raw, list):
+        return False
+    for item in raw:
+        if not isinstance(item, dict):
+            return False
+        head = item.get("head")
+        if not isinstance(head, str) or not ABBREV_SHA_PATTERN.match(js_trim(head)):
+            return False
+        for field in ("severity", "verb"):
+            value = item.get(field)
+            if not isinstance(value, str) or not js_trim(value):
+                return False
+        index = item.get("index")
+        # Same JS-integer predicate as the counts above, for the same reason:
+        # `"index": 1.0` is an integer to the gate and to the mjs.
+        if not is_js_integer(index) or index < 1:
+            return False
+    return True
+
+
+def prose_count_contradicts(text, counts):
+    """A positive emitted bucket against a stated zero -- mirrors
+    proseCountContradicting in ally-review-detection.ts."""
+    for severity, count in EMITTED_BUCKET_PATTERN.findall(without_fenced_spans(text)):
+        key = severity.lower()
+        if key in BLOCKING_SEVERITIES and int(count) > 0 and counts.get(key) == 0:
+            return True
+    return False
+
+
+def prose_disposition_contradicts(text, payload):
+    """A prose ledger entry that still stands against a block retiring them all.
+
+    Mirrors proseDispositionContradicting in ally-review-detection.ts. The gate
+    reads `dispositions` for a blocking verb exactly as it reads `findings` for
+    a non-zero count, so a block whose ledger is absent, `[]`, or merely missing
+    the entry suppresses a prose entry saying a prior finding stands. Without
+    this the gate goes red on `unreadable_verdict` while this sweep sees a
+    review that already happened and never re-requests the one that would clear
+    it -- the same asymmetry the `findings` check above exists for.
+
+    Asymmetric like that one: a block already carrying a blocking verb cannot
+    fail open, so the prose is not consulted, and a prose entry that only
+    retires clears either way.
+    """
+    for entry in payload.get("dispositions") or ():
+        verb = entry.get("verb") if isinstance(entry, dict) else None
+        if isinstance(verb, str) and js_trim(verb).lower() in BLOCKING_PRIOR_DISPOSITIONS:
+            return False
+    for verb in PRIOR_FINDING_DISPOSITION_PATTERN.findall(without_fenced_spans(text)):
+        if verb.lower() in BLOCKING_PRIOR_DISPOSITIONS:
+            return True
+    return False
+
+# Same latitude the previous `startswith("## Ally") and "Consolidated PR Review"
+# in body` pair allowed, minus the first-byte anchor.
+CONSOLIDATED_HEADING_PATTERN = re.compile(
+    r"^[ \t]*##[ \t]*Ally\b.*Consolidated PR Review",
+    re.MULTILINE | re.IGNORECASE | ASCII_RE,
+)
+
+
+def parse_verdict_block_head(body):
+    """Return ("ok", head) / ("absent", None) / ("unreadable", None).
+
+    "absent" means fall back to the prose line. "unreadable" means a block is
+    present but cannot be trusted, and must NOT fall back -- falling back would
+    put the retired prose regex back on the critical path for exactly the
+    bodies the block exists to carry.
+
+    Counted over fence-stripped text, because the gate counts over fence-stripped
+    text: parseAllyVerdictBlock reads emittedReviewText(body). Reading the raw
+    body here made a fenced ```markdown example of the marker a *second* block --
+    gate blocks=1/openers=1 -> ok, this reader blocks=2/openers=2 -> unreadable,
+    on one body. The consequence is the one this file's own docstring at the
+    stalled-review check names: with ally_has_reviewed_head false the sweep
+    re-fires a request on a head Ally already reviewed, and each duplicate is a
+    COMMENTED review that cannot be dismissed -- "spam, and eventually a false
+    alarm, not reconciliation". It fires first on a review quoting the template,
+    which is the likeliest shape for a review *of this feature* (found in peer
+    review of #1721 at 97b4ddd1).
+
+    Scoped to the block and opener count. parse_reviewed_head still matches the
+    prose attestation against raw text; that fence divergence is the pre-existing
+    documented residual and is deliberately not widened here.
+    """
+    text = without_fenced_spans(body or "")
+    blocks = VERDICT_BLOCK_PATTERN.findall(text)
+    openers = VERDICT_OPENER_PATTERN.findall(text)
+    # An opener with no terminator is a truncated payload, not an older review.
+    if len(openers) > len(blocks):
+        return ("unreadable", None)
+    if not blocks:
+        return ("absent", None)
+    if len(blocks) > 1:
+        return ("unreadable", None)
+    raw_version, raw_payload = blocks[0]
+    # int, not string: the two JS readers use `Number(raw)`, so a string
+    # compare would split them on `ally-verdict:01` -- readable to the gate,
+    # unreadable here, and this sweep would re-request a review that already
+    # happened. Cross-reader divergence is the BLO-31730 failure.
+    if int(raw_version) != SUPPORTED_VERDICT_VERSION:
+        return ("unreadable", None)
+    try:
+        parsed = json.loads(js_trim(raw_payload), parse_constant=reject_js_nonfinite)
+    except ValueError:
+        return ("unreadable", None)
+    if not isinstance(parsed, dict):
+        return ("unreadable", None)
+    head = parsed.get("head")
+    if not isinstance(head, str) or not FULL_SHA_PATTERN.match(js_trim(head)):
+        return ("unreadable", None)
+    # The counts the gate reads, read here too. A block whose findings that
+    # reader rejects -- or whose own emitted buckets contradict it -- is a
+    # broken verdict, and a broken verdict attests nothing. Without this the
+    # gate is red on `unreadable_verdict` while this sweep sees a review that
+    # already happened and never re-requests the one that would clear it.
+    counts = severity_counts(parsed.get("findings"))
+    if counts is None:
+        return ("unreadable", None)
+    # The other field the payload carries, held to the same rule.
+    if not dispositions_ok(parsed):
+        return ("unreadable", None)
+    if prose_count_contradicts(text, counts):
+        return ("unreadable", None)
+    # The same rule on the other field the payload carries.
+    if prose_disposition_contradicts(text, parsed):
+        return ("unreadable", None)
+    return ("ok", js_trim(head).lower())
 
 
 def parse_reviewed_head(body):
     """Return the single attested head OID, or None.
 
-    Requires EXACTLY ONE standalone attestation line. Zero means the body makes
-    no claim about which revision it covers; more than one is ambiguous. Both
-    fail closed -- the caller treats them as "not a signal for this head".
+    The structured block wins when present. Prose is the fallback and requires
+    EXACTLY ONE standalone attestation line: zero means the body makes no claim
+    about which revision it covers, more than one is ambiguous. Both fail closed
+    -- the caller treats them as "not a signal for this head".
+
+    Asymmetric on purpose, matching `extractAllyReviewedHeadSha`: only a prose
+    line *disagreeing* with the block is fatal. An absent or unparseable prose
+    line is not -- that is the #1675 body (an attested SHA trailed by a
+    parenthetical), which the prose regex cannot read.
     """
-    matches = REVIEWED_HEAD_PATTERN.findall(body or "")
-    if len(matches) != 1:
+    kind, block_head = parse_verdict_block_head(body)
+    if kind == "unreadable":
         return None
-    return matches[0].lower()
+    matches = REVIEWED_HEAD_PATTERN.findall(body or "")
+    prose_head = matches[0].lower() if len(matches) == 1 else None
+    if kind == "absent":
+        return prose_head
+    if prose_head is not None and prose_head != block_head:
+        return None
+    return block_head
 
 
 def attests_head(body, head_sha):
@@ -104,9 +507,11 @@ def attests_head(body, head_sha):
 
 
 def is_consolidated_ally_comment_for_head(body, head_sha):
+    # Not `startswith`: the verdict block legitimately precedes the heading, so
+    # anchoring on "## Ally" being the first byte misses Ally's own emitted
+    # bodies. Require the heading on its own line instead.
     return (
-        body.startswith("## Ally")
-        and "Consolidated PR Review" in body
+        CONSOLIDATED_HEADING_PATTERN.search(body or "") is not None
         and attests_head(body, head_sha)
     )
 
