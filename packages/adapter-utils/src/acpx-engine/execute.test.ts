@@ -3,11 +3,13 @@ import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AcpRuntimeOptions } from "acpx/runtime";
 import type { AdapterRuntimeMcpAccess } from "@paperclipai/adapter-utils";
 import { DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC } from "@paperclipai/adapter-utils/execution-target";
+import { ACP_ENGINE_SESSION_PROGRESS_MAX_DELAY_MS } from "./constants.js";
 import {
+  awaitPreTurnWithProgress,
   awaitRuntimePrepareWithProgress,
   awaitSessionWithProgress,
   createAcpxEngineExecutor,
@@ -2174,6 +2176,235 @@ describe("ACPX runtime prepare progress (PEN-1995)", () => {
       // Exact key set, not an exclusion list: a payload field added later has
       // to be re-justified here rather than inherited silently.
       expect(Object.keys(entry).sort()).toEqual(["elapsedMs", "observedAt", "stage", "type"]);
+    }
+  });
+});
+
+describe("ACPX pre-turn progress (PEN-2555)", () => {
+  function collector() {
+    const lines: Array<Record<string, unknown>> = [];
+    const ctx = {
+      onLog: async (_stream: "stdout" | "stderr", text: string) => {
+        for (const line of text.split("\n")) {
+          if (!line.trim()) continue;
+          try {
+            lines.push(JSON.parse(line) as Record<string, unknown>);
+          } catch {
+            // non-JSON prose lines are not part of this contract
+          }
+        }
+      },
+    } as never;
+    const ticks = () => lines.filter((entry) => entry.type === "acpx.pre_turn");
+    const stages = () => ticks().map((entry) => entry.stage as string);
+    return { lines, ctx, ticks, stages };
+  }
+
+  const fastDelays = { firstDelayMs: 5, maxDelayMs: 10 };
+
+  it("brackets a normal pre-turn phase with started/completed and tags the phase", async () => {
+    const { ctx, ticks, stages } = collector();
+
+    const built = await awaitPreTurnWithProgress(
+      ctx,
+      { phase: "build_prompt" },
+      async () => "prompt",
+      fastDelays,
+    );
+
+    expect(built).toBe("prompt");
+    expect(stages()).toEqual(["started", "completed"]);
+    expect(ticks().every((entry) => entry.phase === "build_prompt")).toBe(true);
+    expect(typeof ticks()[1]?.elapsedMs).toBe("number");
+  });
+
+  it("keeps reporting while a pre-turn phase stalls, and stops once it settles", async () => {
+    const { ctx, stages } = collector();
+    // Definite-assignment for the same reason as the sibling blocks above:
+    // the executor assigns synchronously but control-flow analysis cannot see it.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    const pending = awaitPreTurnWithProgress(
+      ctx,
+      { phase: "configure_session" },
+      async () => {
+        await gate;
+        return "configured";
+      },
+      fastDelays,
+    );
+
+    const waitingTicks = () => stages().filter((stage) => stage === "waiting").length;
+    const deadlineMs = Date.now() + 2_000;
+    while (waitingTicks() < 2 && Date.now() < deadlineMs) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(
+      waitingTicks(),
+      `ticker did not keep reporting; observed stages: [${stages().join(", ")}]`,
+    ).toBeGreaterThanOrEqual(2);
+
+    release();
+    await pending;
+    expect(stages().at(-1)).toBe("completed");
+
+    // Once settled the ticker must be silent, or it would keep a finished run
+    // looking alive.
+    const settledCount = stages().length;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(stages().length).toBe(settledCount);
+  });
+
+  it("stops ticking and records failure when a pre-turn phase rejects, preserving the error", async () => {
+    const { ctx, stages } = collector();
+
+    await expect(
+      awaitPreTurnWithProgress(
+        ctx,
+        { phase: "configure_session" },
+        async () => {
+          throw new Error("ACP_SET_MODE_FAILED");
+        },
+        fastDelays,
+      ),
+    ).rejects.toThrow("ACP_SET_MODE_FAILED");
+
+    expect(stages()).toEqual(["started", "failed"]);
+
+    const before = stages().length;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(stages().length).toBe(before);
+  });
+
+  // The property this ticket exists for. A run parked in the pre-turn window
+  // must never accrue enough silence to be accused, at any duration -- the
+  // detector declares `suspicious` at 1h and `critical` at 4h, and the measured
+  // healthy pre-session waits ran to 289.6 min (PEN-2533), above both. Driven at
+  // the PRODUCTION delay constants, not `fastDelays`, because the claim is about
+  // the shipped cadence and would be vacuous at 5 ms ticks.
+  it("keeps a multi-hour pre-turn stall reporting inside the suspicion threshold at 1h, 4h and 5h", async () => {
+    vi.useFakeTimers();
+    try {
+      const { ctx, ticks } = collector();
+      const emittedAtMs: number[] = [];
+      const startMs = Date.now();
+
+      const pending = awaitPreTurnWithProgress(
+        ctx,
+        { phase: "build_prompt" },
+        // Never settles: the wedged `fs.readFile` on the network mount this
+        // bracket exists to cover.
+        () => new Promise<string>(() => {}),
+      );
+      void pending;
+
+      const HOUR_MS = 60 * 60 * 1000;
+      // The server flushes output progress at most every 60s and declares
+      // suspicion at 1h; asserting against the tick ceiling keeps this test
+      // inside this package rather than importing a server constant, which
+      // would invert the layering (see awaitPhaseWithProgress).
+      const TICK_CEILING_MS = ACP_ENGINE_SESSION_PROGRESS_MAX_DELAY_MS;
+
+      let seen = 0;
+      const recordNew = () => {
+        for (; seen < ticks().length; seen += 1) emittedAtMs.push(Date.now());
+      };
+      recordNew();
+
+      for (const hours of [1, 4, 5]) {
+        while (Date.now() - startMs < hours * HOUR_MS) {
+          await vi.advanceTimersByTimeAsync(30_000);
+          recordNew();
+        }
+        // Positive control: a broken ticker would leave this at the single
+        // `started` tick, and a gap assertion alone would pass vacuously.
+        expect(
+          emittedAtMs.length,
+          `no progress ticks accumulated by ${hours}h`,
+        ).toBeGreaterThan(hours * 6);
+
+        const gaps = emittedAtMs.slice(1).map((at, index) => at - emittedAtMs[index]!);
+        const largestGapMs = Math.max(...gaps, Date.now() - emittedAtMs.at(-1)!);
+        expect(
+          largestGapMs,
+          `largest silence by ${hours}h was ${largestGapMs}ms`,
+        ).toBeLessThanOrEqual(TICK_CEILING_MS);
+        expect(largestGapMs).toBeLessThan(HOUR_MS);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Wiring check: the helper only matters if the real executor routes BOTH
+  // pre-turn awaits through it, and does so in the window between the handshake
+  // settling and `acpx.session`. That window is the one the detector reads as
+  // silence, so assert the position, not just the presence.
+  it("routes the real executor's configure and prompt build through the ticker, between handshake and session", async () => {
+    const { logs } = await runExecutor({ agent: "claude" });
+
+    const events = logs
+      .filter((entry) => entry.stream === "stdout")
+      .flatMap((entry) => entry.text.split("\n"))
+      .filter((line) => line.trim().startsWith("{"))
+      .map((line) => {
+        try {
+          return JSON.parse(line) as Record<string, unknown>;
+        } catch {
+          return null;
+        }
+      })
+      .filter((entry): entry is Record<string, unknown> => entry !== null);
+
+    const preTurn = events.filter((entry) => entry.type === "acpx.pre_turn");
+    expect(preTurn.map((entry) => `${entry.phase}:${entry.stage}`)).toEqual([
+      "configure_session:started",
+      "configure_session:completed",
+      "build_prompt:started",
+      "build_prompt:completed",
+    ]);
+
+    // Assert presence positively: a missing marker yields -1, which would
+    // otherwise satisfy the comparisons below and pass vacuously.
+    const handshakeTerminalAt = events.findIndex(
+      (entry) => entry.type === "acpx.session_establish" && entry.stage === "established",
+    );
+    const sessionAt = events.findIndex((entry) => entry.type === "acpx.session");
+    expect(handshakeTerminalAt).toBeGreaterThanOrEqual(0);
+    expect(sessionAt).toBeGreaterThanOrEqual(0);
+
+    for (const tick of preTurn) {
+      const at = events.indexOf(tick);
+      expect(at).toBeGreaterThan(handshakeTerminalAt);
+      expect(at).toBeLessThan(sessionAt);
+    }
+  });
+
+  it("never emits prompt, credential, environment, or path material", async () => {
+    const { ctx, ticks } = collector();
+
+    await awaitPreTurnWithProgress(
+      ctx,
+      { phase: "build_prompt" },
+      async () => "prompt",
+      fastDelays,
+    );
+
+    expect(ticks().length).toBeGreaterThan(0);
+    for (const entry of ticks()) {
+      // Exact key set, not an exclusion list: a payload field added later has
+      // to be re-justified here rather than inherited silently. `phase` is a
+      // fixed enum of two literals, never a path or a prompt.
+      expect(Object.keys(entry).sort()).toEqual([
+        "elapsedMs",
+        "observedAt",
+        "phase",
+        "stage",
+        "type",
+      ]);
     }
   });
 });

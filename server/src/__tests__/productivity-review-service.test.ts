@@ -9,6 +9,7 @@ import {
   companies,
   companyMemberships,
   createDb,
+  executionWorkspaces,
   heartbeatRuns,
   issueApprovals,
   issueComments,
@@ -17,6 +18,8 @@ import {
   issues,
   plugins,
   pluginState,
+  projects,
+  workspaceOperations,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -36,6 +39,7 @@ import {
 import { logActivity } from "../services/activity-log.js";
 import { RECOVERY_ORIGIN_KINDS } from "../services/recovery/origins.js";
 import { PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST } from "../services/pull-request-work-products.js";
+import { terminalGateResolutionIdempotencyKey } from "../services/terminal-gate-reconciler.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -85,7 +89,7 @@ describeEmbeddedPostgres("productivity review service", () => {
 
   afterAll(async () => {
     await tempDb?.cleanup();
-  }, 60_000);
+  });
 
   async function linkApproval(
     companyId: string,
@@ -194,6 +198,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     issuePrefix: string;
     blockedIssueId: string;
     blockerStatus?: "todo" | "done";
+    executionWorkspaceId?: string;
   }) {
     const blockerId = randomUUID();
     const createdAt = new Date("2026-04-28T09:00:00.000Z");
@@ -204,6 +209,7 @@ describeEmbeddedPostgres("productivity review service", () => {
       status: input.blockerStatus ?? "todo",
       priority: "medium",
       originKind: "manual",
+      executionWorkspaceId: input.executionWorkspaceId ?? null,
       issueNumber: 900,
       identifier: `${input.issuePrefix}-900`,
       createdAt,
@@ -228,6 +234,11 @@ describeEmbeddedPostgres("productivity review service", () => {
     contextSource?: string;
     status?: string;
     startedAt?: Date | null;
+    // Derived from `createdAt` (i.e. `now`) by default, which is wrong for any
+    // fixture that back-dates `startedAt`: the run then spans the whole episode
+    // and B1 reads it as 100% executing time. Set explicitly to model a run that
+    // both started AND ended in the past.
+    finishedAt?: Date | null;
     nextAction?: string | null;
     livenessState?: string | null;
     usageJson?: Record<string, unknown> | null;
@@ -264,7 +275,12 @@ describeEmbeddedPostgres("productivity review service", () => {
         invocationSource: "assignment",
         triggerDetail: "system",
         startedAt: input.startedAt === undefined ? createdAt : input.startedAt,
-        finishedAt: (input.status ?? "succeeded") === "succeeded" ? new Date(createdAt.getTime() + 30_000) : null,
+        finishedAt:
+          input.finishedAt !== undefined
+            ? input.finishedAt
+            : (input.status ?? "succeeded") === "succeeded"
+              ? new Date(createdAt.getTime() + 30_000)
+              : null,
         contextSnapshot: {
           issueId: input.issueId,
           taskId: input.issueId,
@@ -464,6 +480,14 @@ describeEmbeddedPostgres("productivity review service", () => {
   // commits from that same morning.
   describe("pull-request evidence (BLO-19566)", () => {
     async function seedIssueWithPullRequest(opts: {
+      /**
+       * PEN-3219: the PR title is what decides attribution for a row carrying
+       * no recorded `owningIdentifiers`. Defaults to a title naming the seeded
+       * issue — i.e. what a PR actually doing this row's work looks like.
+       * Pass a title naming some other identifier to seed the counterfeit
+       * signal: a PR attached to this row only because it mentioned it.
+       */
+      title?: string;
       prUpdatedAt: Date;
       status?: string;
       metadata?: Record<string, unknown> | null;
@@ -478,7 +502,7 @@ describeEmbeddedPostgres("productivity review service", () => {
         type: "pull_request",
         provider: "github",
         externalId: "Blockcast/paperclip#806",
-        title: "Widen the authz grant",
+        title: opts.title ?? `Widen the authz grant (${seeded.issuePrefix}-1)`,
         url: opts.url === undefined ? "https://github.com/Blockcast/paperclip/pull/806" : opts.url,
         status: opts.status ?? "ready_for_review",
         metadata: opts.metadata === undefined
@@ -630,6 +654,240 @@ describeEmbeddedPostgres("productivity review service", () => {
       expect(description).toContain("The second signal is already present");
     });
 
+    // PEN-3219. A `pull_request` work product is written for EVERY issue a PR
+    // references anywhere, so a long-lived registry/invariant row accumulates
+    // every PR that name-drops it. Before this, the most recently *touched*
+    // member of that pile became the row's progress signal and the review told
+    // its reviewer "the second signal is already present" — on PEN-2370, a
+    // `critical` row dark for seven days carrying 44 such rows, none its own.
+    //
+    // NOTE for anyone adding a case here: the rendered phrase "attributed to
+    // this issue" is a SUBSTRING of "NOT attributed to this issue", so a lone
+    // `toContain("attributed to this issue")` passes on an unattributed PR.
+    // Always pair it with `not.toContain("NOT attributed to this issue")`.
+    describe("attribution of the linked PR (PEN-3219)", () => {
+      // The measured PEN-3216 shape: the row's ONLY fresh progress-eligible PR
+      // is titled for, owned by, and driven from a different issue.
+      it("does not count a fresh progress PR that belongs to another issue", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedIssueWithPullRequest({
+          prUpdatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+          title: "feat(security): scope run-transcript reads to own-run (ZZQ-3142)",
+        });
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+          now,
+        });
+
+        const service = productivityReviewService(db);
+        await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+        const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+        // The PR is still SHOWN — suppressing it would hide real information —
+        // but it no longer licenses the verdict.
+        expect(description).toContain("https://github.com/Blockcast/paperclip/pull/806");
+        expect(description).toContain("NOT attributed to this issue");
+        expect(description).not.toContain("The second signal is already present");
+        // And the reviewer is told why, rather than left to infer it from a
+        // line that still looks like progress.
+        expect(description).toContain("A linked PR moved recently, but it is NOT attributed to this issue");
+        expect(description).toContain("Do not treat it as grounds for \"Close as productive\"");
+      });
+
+      // The counterfeit signal must not shadow a real one: an unattributed PR
+      // that moved more recently cannot hide this row's own fresh PR.
+      it("picks this issue's own PR over a newer one belonging to another issue", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedIssueWithPullRequest({
+          prUpdatedAt: new Date(now.getTime() - 5 * 60 * 60 * 1000),
+        });
+        await db.insert(issueWorkProducts).values({
+          companyId: seeded.companyId,
+          issueId: seeded.issueId,
+          type: "pull_request",
+          provider: "github",
+          externalId: "Blockcast/paperclip#1741",
+          title: "feat(security): scope run-transcript reads to own-run (ZZQ-3142)",
+          url: "https://github.com/Blockcast/paperclip/pull/1741",
+          status: "ready_for_review",
+          metadata: { source: "github_pull_request_webhook", sourceEventOrder: 10 },
+          sourceTrust: PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST,
+          createdAt: new Date(now.getTime() - 60 * 60 * 1000),
+          updatedAt: new Date(now.getTime() - 60 * 60 * 1000),
+        });
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+          now,
+        });
+
+        const service = productivityReviewService(db);
+        await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+        const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+        expect(description).toContain("The second signal is already present");
+        expect(description).toContain("https://github.com/Blockcast/paperclip/pull/806");
+        expect(description).not.toContain("https://github.com/Blockcast/paperclip/pull/1741");
+      });
+
+      // The attributed PR must be found however many unattributed PRs moved
+      // after it. An earlier revision paged the candidates 25 at a time before
+      // filtering for ownership, so a registry row name-dropped by 25 PRs
+      // inside one day would have had its own PR pushed off the page and read
+      // as "no second signal" — the false-negative twin of the PEN-3216 bug.
+      it("finds this issue's own PR behind 30 newer PRs belonging to other issues", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedIssueWithPullRequest({
+          prUpdatedAt: new Date(now.getTime() - 5 * 60 * 60 * 1000),
+        });
+        await db.insert(issueWorkProducts).values(
+          Array.from({ length: 30 }, (_, i) => {
+            const touchedAt = new Date(now.getTime() - (60 - i) * 60 * 1000);
+            return {
+              companyId: seeded.companyId,
+              issueId: seeded.issueId,
+              type: "pull_request",
+              provider: "github",
+              externalId: `Blockcast/paperclip#${2000 + i}`,
+              title: `feat(other): unrelated work that mentions this row (ZZQ-${3000 + i})`,
+              url: `https://github.com/Blockcast/paperclip/pull/${2000 + i}`,
+              status: "ready_for_review",
+              metadata: { source: "github_pull_request_webhook", sourceEventOrder: 10 + i },
+              sourceTrust: PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST,
+              createdAt: touchedAt,
+              updatedAt: touchedAt,
+            };
+          }),
+        );
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+          now,
+        });
+
+        const service = productivityReviewService(db);
+        await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+        const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+        expect(description).toContain("The second signal is already present");
+        expect(description).toContain("https://github.com/Blockcast/paperclip/pull/806");
+        expect(description).not.toContain("NOT attributed to this issue");
+      });
+
+      // The webhook records the resolved owning set at write time, which is the
+      // only way a PR that claims its issue solely in a labeled BODY line can be
+      // recognised here — the row never stores the body.
+      it("attributes by the recorded owning set, not just the title", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedIssueWithPullRequest({
+          prUpdatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+          title: "chore: no identifier in this title at all",
+        });
+        await db
+          .update(issueWorkProducts)
+          .set({
+            metadata: {
+              source: "github_pull_request_webhook",
+              sourceEventOrder: 10,
+              owningIdentifiers: [`${seeded.issuePrefix}-1`],
+            },
+          })
+          .where(eq(issueWorkProducts.issueId, seeded.issueId));
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+          now,
+        });
+
+        const service = productivityReviewService(db);
+        await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+        const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+        expect(description).toContain("attributed to this issue");
+        expect(description).not.toContain("NOT attributed to this issue");
+        expect(description).toContain("The second signal is already present");
+      });
+
+      // A recorded EMPTY set is authoritative — the PR named no owner anywhere,
+      // so it is attributable to nothing. Only a missing key means "unknown"
+      // and falls back to deriving from the fields the row carries.
+      it("treats a recorded empty owning set as attributable to nothing", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedIssueWithPullRequest({
+          prUpdatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+        });
+        await db
+          .update(issueWorkProducts)
+          .set({
+            metadata: {
+              source: "github_pull_request_webhook",
+              sourceEventOrder: 10,
+              owningIdentifiers: [],
+            },
+          })
+          .where(eq(issueWorkProducts.issueId, seeded.issueId));
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+          now,
+        });
+
+        const service = productivityReviewService(db);
+        await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+        const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+        expect(description).toContain("NOT attributed to this issue");
+        expect(description).not.toContain("The second signal is already present");
+      });
+
+      // Legacy rows (written before the owning set was recorded) fall back to
+      // the tiers the row still carries. The branch is one of them, and real
+      // branches are lowercase where the identifier pattern is uppercase-only.
+      it("attributes a legacy row by its lowercase branch", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedIssueWithPullRequest({
+          prUpdatedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+          title: "chore: no identifier in this title at all",
+        });
+        await db
+          .update(issueWorkProducts)
+          .set({
+            metadata: {
+              source: "github_pull_request_webhook",
+              sourceEventOrder: 10,
+              branch: `cto/${seeded.issuePrefix.toLowerCase()}-1-widen-grant`,
+            },
+          })
+          .where(eq(issueWorkProducts.issueId, seeded.issueId));
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+          now,
+        });
+
+        const service = productivityReviewService(db);
+        await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+        const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+        expect(description).toContain("attributed to this issue");
+        expect(description).not.toContain("NOT attributed to this issue");
+        expect(description).toContain("The second signal is already present");
+      });
+    });
+
     it("reads a delayed first delivery as stale by GitHub event time, not DB receipt time", async () => {
       // A first webhook delivery can land long after the PR event (retry,
       // backfill, outage drain). The row then inserts with `updatedAt = now`,
@@ -644,7 +902,7 @@ describeEmbeddedPostgres("productivity review service", () => {
         type: "pull_request",
         provider: "github",
         externalId: "Blockcast/paperclip#806",
-        title: "Widen the authz grant",
+        title: `Widen the authz grant (${seeded.issuePrefix}-1)`,
         url: "https://github.com/Blockcast/paperclip/pull/806",
         status: "ready_for_review",
         metadata: {
@@ -885,6 +1143,468 @@ describeEmbeddedPostgres("productivity review service", () => {
         expect(result.created).toBe(1);
         const [review] = await listProductivityReviews(seeded.companyId);
         expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+      });
+    });
+
+    // BLO-27698 A2: an issue the assignee filed against this one is deliverable
+    // progress. Every case below asserts non-generation (or generation), never
+    // that a line was rendered — the defect this AC closes is precisely a signal
+    // that was computed and printed but never consulted.
+    describe("a fresh assignee-filed linked issue (A2)", () => {
+      async function seedLinkedIssue(opts: {
+        companyId: string;
+        createdByAgentId: string | null;
+        createdAt: Date;
+        parentId?: string | null;
+        blockedByIssueId?: string | null;
+      }) {
+        const linkedId = randomUUID();
+        await db.insert(issues).values({
+          id: linkedId,
+          companyId: opts.companyId,
+          title: "Decomposed: wire the adapter",
+          status: "todo",
+          parentId: opts.parentId ?? null,
+          createdByAgentId: opts.createdByAgentId,
+          createdAt: opts.createdAt,
+          updatedAt: opts.createdAt,
+        });
+        if (opts.blockedByIssueId) {
+          // `type: "blocks"` reads issueId -> relatedIssueId, so this is
+          // "the source blocks the new issue".
+          await db.insert(issueRelations).values({
+            companyId: opts.companyId,
+            issueId: opts.blockedByIssueId,
+            relatedIssueId: linkedId,
+            type: "blocks",
+            createdByAgentId: opts.createdByAgentId,
+            createdAt: opts.createdAt,
+            updatedAt: opts.createdAt,
+          });
+        }
+        return linkedId;
+      }
+
+      it("does not generate a long-active review while a fresh sub-issue exists", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedAssignedIssue({
+          status: "in_progress",
+          startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+        });
+        await seedLinkedIssue({
+          companyId: seeded.companyId,
+          createdByAgentId: seeded.coderId,
+          createdAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+          parentId: seeded.issueId,
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(0);
+        expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+      });
+
+      // The second arm of the structural OR, and it is not redundant with the
+      // first: an assignee that files follow-up work and records the dependency
+      // writes an `issue_relations` edge and NO `parentId`.
+      //
+      // Edge direction is deliberate and load-bearing. It is the SOURCE that
+      // blocks the new issue, not the reverse. An unresolved blocker pointing AT
+      // the source would make the source dependency-blocked, and generation
+      // already skips those outright (`productivity-review.ts:5071-5073`,
+      // BLO-22436) — so that fixture would go green without A2's gate existing at
+      // all. Which is also the honest scope note for this AC: the "block with an
+      // unblock owner" shape needs no gate here, because it is already exempt.
+      it("does not generate while a fresh relation-linked issue exists, with no parent link", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedAssignedIssue({
+          status: "in_progress",
+          startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+        });
+        await seedLinkedIssue({
+          companyId: seeded.companyId,
+          createdByAgentId: seeded.coderId,
+          createdAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+          parentId: null,
+          blockedByIssueId: seeded.issueId,
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(0);
+      });
+
+      // BLO-22331 AC2 boundedness guard. The episode bound alone does not bound
+      // anything — an episode grows without limit — so this proves the 24h
+      // freshness intersection is what actually makes the suppression lapse.
+      it("still fires once the linked issue ages past the freshness window", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedAssignedIssue({
+          status: "in_progress",
+          startedAt: new Date(now.getTime() - 31 * 60 * 60 * 1000),
+        });
+        await seedLinkedIssue({
+          companyId: seeded.companyId,
+          createdByAgentId: seeded.coderId,
+          createdAt: new Date(now.getTime() - 30 * 60 * 60 * 1000),
+          parentId: seeded.issueId,
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(1);
+        const [review] = await listProductivityReviews(seeded.companyId);
+        expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+      });
+
+      // Negative control for the reference test. An assignee filing unrelated
+      // work in the same company is not progress on THIS issue; without a
+      // structural edge the gate must not engage. Guards against the cheap
+      // implementation that counts any issue the agent created.
+      it("still fires for a fresh assignee-created issue that does not reference the source", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedAssignedIssue({
+          status: "in_progress",
+          startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+        });
+        await seedLinkedIssue({
+          companyId: seeded.companyId,
+          createdByAgentId: seeded.coderId,
+          createdAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+          parentId: null,
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(1);
+      });
+
+      // The creator is load-bearing too: a linked issue somebody ELSE filed says
+      // nothing about whether the assignee is working.
+      it("still fires when the linked issue was created by another agent", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedAssignedIssue({
+          status: "in_progress",
+          startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+        });
+        await seedLinkedIssue({
+          companyId: seeded.companyId,
+          createdByAgentId: seeded.managerId,
+          createdAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+          parentId: seeded.issueId,
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(1);
+      });
+
+      // The defect this gate almost shipped with, pinned directly rather than
+      // left to the three `assignment wake` replay tests that happened to catch
+      // it. A productivity review row is written as a CHILD of its source issue
+      // with `createdByAgentId` set to the assignee, so a naive "assignee filed a
+      // linked issue" predicate scores the review itself as progress — and the
+      // detector switches itself off 24h after firing once. Fixture mirrors the
+      // real row: same parent + creator as A2's positive case, differing only in
+      // `originKind`.
+      it("does not count a generated productivity review as the assignee's progress", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedAssignedIssue({
+          status: "in_progress",
+          startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+        });
+        await insertProductivityReview({
+          seeded,
+          createdAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+          issueNumber: 2,
+          identifier: `${seeded.issuePrefix}-2`,
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(1);
+      });
+    });
+
+    // BLO-27698 A3: the rubric has told reviewers for three releases that a
+    // run-linked `Next action:` comment in the last 6h means "close as
+    // productive". These assert that code now applies the same criterion.
+    describe("a fresh run-linked `Next action:` comment (A3)", () => {
+      async function seedNextActionComment(opts: {
+        companyId: string;
+        issueId: string;
+        agentId: string;
+        createdAt: Date;
+        runLinked: boolean;
+        now: Date;
+        episodeStartAt?: Date;
+      }) {
+        const [run] = opts.runLinked
+          ? await insertRuns({
+            companyId: opts.companyId,
+            agentId: opts.agentId,
+            issueId: opts.issueId,
+            count: 1,
+            now: opts.now,
+            nextAction: null,
+            // Anchored to the episode start, and this is load-bearing rather
+            // than cosmetic. `activeStartedAt` takes `max(run.startedAt)` when
+            // that is at or after the episode start, so a run stamped `now` —
+            // `insertRuns`'s default — resets the episode clock and collapses
+            // `elapsedMs` to 0. `long_active_duration` then cannot fire at all,
+            // and every assertion here would pass without the A3 gate existing:
+            // the suppression cases vacuously, the "still fires" cases not at
+            // all. A3 is the one AC whose signal REQUIRES a run, so it is the
+            // one place this bites.
+            //
+            // BLO-27698 B1/B3: `finishedAt` must be pinned too. Left to default
+            // it lands at `now + 30s`, so the run spans the whole episode, the
+            // executing bucket swallows `elapsedMs`, `unattendedMs` collapses to
+            // ~0, and `long_active_duration` cannot fire for a reason that has
+            // nothing to do with A3. Anchor the episode with a SHORT run.
+            startedAt: opts.episodeStartAt ?? opts.now,
+            finishedAt: new Date((opts.episodeStartAt ?? opts.now).getTime() + 30_000),
+          })
+          : [null];
+        await db.insert(issueComments).values({
+          companyId: opts.companyId,
+          issueId: opts.issueId,
+          authorAgentId: opts.agentId,
+          createdByRunId: run?.id ?? null,
+          body: "Rebased onto master.\n\nNext action: land the migration once CI clears.",
+          createdAt: opts.createdAt,
+          updatedAt: opts.createdAt,
+        });
+      }
+
+      // Non-vacuity control for the suppression case below, and the reason it
+      // exists: the identical fixture minus the comment MUST generate. Without
+      // this, a fixture whose episode clock had collapsed would report
+      // `created: 0` for a reason having nothing to do with A3, and the
+      // suppression test would pass while asserting nothing.
+      it("control: the same fixture with no next-action comment still fires", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const episodeStartAt = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+        const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStartAt });
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: 1,
+          now,
+          nextAction: null,
+          startedAt: episodeStartAt,
+          // BLO-27698 B1/B3: short run at the anchor — see `seedNextActionComment`.
+          finishedAt: new Date(episodeStartAt.getTime() + 30_000),
+          withRunComments: true,
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(1);
+        const [review] = await listProductivityReviews(seeded.companyId);
+        expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+      });
+
+      it("does not generate a long-active review over a fresh run-linked next action", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedAssignedIssue({
+          status: "in_progress",
+          startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+        });
+        await seedNextActionComment({
+          companyId: seeded.companyId,
+          issueId: seeded.issueId,
+          agentId: seeded.coderId,
+          createdAt: new Date(now.getTime() - 60 * 60 * 1000),
+          runLinked: true,
+          now,
+          episodeStartAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(0);
+        expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+      });
+
+      // BLO-22331 AC2 boundedness guard: stop commenting and the trigger returns.
+      it("still fires once the next-action comment ages past the 6h window", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedAssignedIssue({
+          status: "in_progress",
+          startedAt: new Date(now.getTime() - 9 * 60 * 60 * 1000),
+        });
+        await seedNextActionComment({
+          companyId: seeded.companyId,
+          issueId: seeded.issueId,
+          agentId: seeded.coderId,
+          createdAt: new Date(now.getTime() - (6 * 60 + 30) * 60 * 1000),
+          runLinked: true,
+          now,
+          episodeStartAt: new Date(now.getTime() - 9 * 60 * 60 * 1000),
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(1);
+      });
+
+      // The rubric says "run-linked", so the gate must too. An unlinked comment
+      // is still REPORTED (the `Current next action:` fallback exists precisely
+      // to recover it) but is not evidence that a turn happened — so this asserts
+      // both halves: the review fires, and the line is printed anyway.
+      it("still fires for an unlinked next-action comment, while still reporting it", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedAssignedIssue({
+          status: "in_progress",
+          startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+        });
+        await seedNextActionComment({
+          companyId: seeded.companyId,
+          issueId: seeded.issueId,
+          agentId: seeded.coderId,
+          createdAt: new Date(now.getTime() - 60 * 60 * 1000),
+          runLinked: false,
+          now,
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(1);
+        const [review] = await listProductivityReviews(seeded.companyId);
+        expect(review?.description).toContain("land the migration once CI clears");
+      });
+
+      // The decoupling itself, which is the half of A3 that is not a gate.
+      // Raising the trigger bar to 12h must NOT widen the evidence lookback: a
+      // 7h-old comment is stale at any bar. Before the split, one constant fed
+      // both, so this fixture would have suppressed.
+      it("does not widen the comment lookback when `longActiveMs` is raised", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const seeded = await seedAssignedIssue({
+          status: "in_progress",
+          startedAt: new Date(now.getTime() - 13 * 60 * 60 * 1000),
+        });
+        await seedNextActionComment({
+          companyId: seeded.companyId,
+          issueId: seeded.issueId,
+          agentId: seeded.coderId,
+          createdAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+          runLinked: true,
+          now,
+          episodeStartAt: new Date(now.getTime() - 13 * 60 * 60 * 1000),
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+          thresholds: { longActiveMs: 12 * 60 * 60 * 1000 },
+        });
+
+        expect(result.created).toBe(1);
+      });
+
+      // The other half of the decoupling, and the direction the first version
+      // missed: LOWERING `longActiveMs` must not let a PRE-EPISODE comment
+      // suppress. `longActiveMs` has no lower clamp, so at a 1-minute bar the
+      // fixed 6h evidence window is 360x the trigger bar — without intersecting
+      // it with the episode, a `Next action:` from a *previous* episode on the
+      // same issue suppresses every review of the current one, indefinitely
+      // (BLO-22331 AC2). The comment here is run-linked and inside 6h, so the
+      // ONLY thing that can make this fire is the episode-start clamp.
+      it("does not let a pre-episode next-action comment suppress when `longActiveMs` is lowered", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const episodeStartAt = new Date(now.getTime() - 10 * 60 * 1000);
+        const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStartAt });
+        await seedNextActionComment({
+          companyId: seeded.companyId,
+          issueId: seeded.issueId,
+          agentId: seeded.coderId,
+          // Before the episode began, but well inside the 6h evidence window.
+          createdAt: new Date(now.getTime() - 3 * 60 * 60 * 1000),
+          runLinked: true,
+          now,
+          episodeStartAt,
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+          thresholds: { longActiveMs: 60_000 },
+        });
+
+        expect(result.created).toBe(1);
+        const [review] = await listProductivityReviews(seeded.companyId);
+        expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+      });
+
+      // `runLinked` is a property of the WINDOW, not of the newest comment. The
+      // rubric asks whether *a* run-linked comment exists in the last 6h, so a
+      // later unlinked comment — an out-of-band note, a human-triggered edit —
+      // must not mask an earlier run-linked one and flip the gate off. Read off
+      // the newest row alone this fixture generates a review against an assignee
+      // that posted exactly the artifact the rubric asks for.
+      it("suppresses on a run-linked comment masked by a newer unlinked one", async () => {
+        const now = new Date("2026-04-30T12:00:00.000Z");
+        const episodeStartAt = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+        const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStartAt });
+        await seedNextActionComment({
+          companyId: seeded.companyId,
+          issueId: seeded.issueId,
+          agentId: seeded.coderId,
+          createdAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+          runLinked: true,
+          now,
+          episodeStartAt,
+        });
+        await seedNextActionComment({
+          companyId: seeded.companyId,
+          issueId: seeded.issueId,
+          agentId: seeded.coderId,
+          // Newer, and NOT run-linked — the masking comment.
+          createdAt: new Date(now.getTime() - 60 * 60 * 1000),
+          runLinked: false,
+          now,
+        });
+
+        const result = await productivityReviewService(db).reconcileProductivityReviews({
+          now,
+          companyId: seeded.companyId,
+        });
+
+        expect(result.created).toBe(0);
+        expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
       });
     });
   });
@@ -1588,6 +2308,235 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.dependencyBlockedSuppressed).toBe(0);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain("Primary trigger: `high_churn`");
+  });
+
+  // BLO-22887 AC2: the two cells above are the "still warranted on other
+  // grounds" case — BLO-22436 suppresses a dependency-blocked source whose
+  // fired set is entirely closable, so *every* blocked source that reaches the
+  // body builder is one a blocker does not excuse. Until now the body said
+  // nothing about the blocker at all, so a manager read `Elapsed accounting`'s
+  // unattended figure with no indication that the control plane independently
+  // classified the issue as dependency-blocked — the exact subsystem
+  // disagreement this issue was filed for. The line reports blocker STATE and
+  // says so: the readiness map carries no edge timestamps, so subtracting an
+  // unmeasured span from the wall-clock buckets would swap a known-wrong
+  // attribution for an invented one.
+  // The full rendered line, not the count prefix: the "reviewed anyway" clause
+  // and the caveat are the part a reviewer cannot get from the source issue,
+  // and a prefix match passes with both deleted (Ally review, PR #1722).
+  const DEPENDENCY_LINE_ONE_BLOCKER =
+    "- Dependency accounting: 1 unresolved `blockedBy` blocker at this evidence pass; reviewed anyway because `high_churn` fired, which an unresolved blocker does not excuse — blocker state at this pass, not a measured span: the elapsed figures above are wall-clock and are NOT reduced by this, so dependency-blocked time of unrecorded length is already inside them";
+  // Runs dispatched 30m ago: `activeStartedAt` anchors on the latest run
+  // `startedAt`, and `insertRuns`'s default (`startedAt = createdAt = now`)
+  // reports a 0m episode, which pins nothing.
+  const dispatchedThirtyMinutesAgo = (now: Date) => new Date(now.getTime() - 30 * 60 * 1000);
+  // BLO-27698 B1: `insertRuns` backdates `startedAt` without backdating
+  // `finishedAt`, so these runs' live spans cover the whole episode and the 30m
+  // lands in `executing` rather than `unattended`. Both BLO-22887 cells below
+  // still pin the *same* split with and without the blocker, which is the
+  // property they exist to guard — the dependency bucket is reported beside the
+  // elapsed figures, never folded into them. Which bucket carries the 30m is
+  // B1's business, not theirs.
+  const ELAPSED_LINE_30M_EXECUTING =
+    "- Elapsed accounting: 0m monitor-gated, 30m executing, 0m unattended (no monitor armed during this episode)";
+
+  it("reports a dependency-blocked bucket alongside the elapsed split when a review still fires on a non-closable trigger (BLO-22887)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      withRunComments: true,
+      startedAt: dispatchedThirtyMinutesAgo(now),
+    });
+    await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain(DEPENDENCY_LINE_ONE_BLOCKER);
+    // Reported next to the elapsed split, never folded into it: the split is
+    // byte-identical to the one the resolved-blocker cell below reports with no
+    // dependency line at all.
+    expect(review?.description).toContain(ELAPSED_LINE_30M_EXECUTING);
+  });
+
+  // BLO-22887 AC2 over-reporting guard, and the counterpart to BLO-22436's
+  // cell-3 regression guard: an accounting line that renders unconditionally
+  // would pass the cell above while telling every reviewer in the fleet that
+  // an unblocked issue is dependency-blocked. Keyed on *unresolved*, so a
+  // `done` blocker is a stronger control than no edge at all — the edge still
+  // exists, and readiness is what decides.
+  it("omits the dependency accounting line when the source issue's only blocker is resolved (BLO-22887)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      withRunComments: true,
+      startedAt: dispatchedThirtyMinutesAgo(now),
+    });
+    await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+      blockerStatus: "done",
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `high_churn`");
+    expect(review?.description).not.toContain("Dependency accounting");
+    // Same seeding as the cell above minus the unresolved blocker, same
+    // elapsed split: the bucket is never subtracted from the wall-clock figures.
+    expect(review?.description).toContain(ELAPSED_LINE_30M_EXECUTING);
+  });
+
+  // BLO-22887 AC2: a `done` blocker whose execution workspace has not finalized
+  // is still unresolved (`listDependencyReadiness`'s workspace-finalize
+  // barrier), and the line says which kind it is — the remedy differs (wait
+  // for sync-back vs. chase the blocker's assignee).
+  it("names the done-but-awaiting-finalize subset in the dependency accounting line (BLO-22887)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      withRunComments: true,
+    });
+    const projectId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    await db.insert(projects).values({ id: projectId, companyId: seeded.companyId, name: "Finalize barrier" });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId: seeded.companyId,
+      projectId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Finalize barrier workspace",
+    });
+    const blockerId = await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+      blockerStatus: "done",
+      executionWorkspaceId,
+    });
+    // The blocker's latest op on its workspace is not a succeeded
+    // `workspace_finalize`, so readiness keeps it unresolved.
+    await db.insert(workspaceOperations).values({
+      companyId: seeded.companyId,
+      executionWorkspaceId,
+      issueId: blockerId,
+      phase: "worktree_prepare",
+      status: "succeeded",
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain(
+      "- Dependency accounting: 1 unresolved `blockedBy` blocker at this evidence pass (1 `done` but awaiting workspace finalize); reviewed anyway because `high_churn` fired, which an unresolved blocker does not excuse — blocker state at this pass, not a measured span: the elapsed figures above",
+    );
+  });
+
+  // Ally review (PR #1722): `Elapsed accounting` renders only when
+  // `monitorGating` was computed, which needs an `in_progress` source — so
+  // every `todo` candidate carries the dependency line with no elapsed split
+  // above it (and the refresh comment, which prints no unconditional elapsed
+  // figure, with nothing at all). The caveat has to say so rather than point
+  // at figures that are not on the page.
+  it("does not point the dependency caveat at an elapsed split that was never rendered (BLO-22887)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({ status: "todo" });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      withRunComments: true,
+    });
+    await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("- Current active elapsed time: unknown");
+    expect(review?.description).not.toContain("Elapsed accounting");
+    expect(review?.description).toContain(
+      "- Dependency accounting: 1 unresolved `blockedBy` blocker at this evidence pass; reviewed anyway because `high_churn` fired, which an unresolved blocker does not excuse — blocker state at this pass, not a measured span: no elapsed split was computed for this episode, so there is no wall-clock figure this reduces",
+    );
+    expect(review?.description).not.toContain("elapsed figures above");
+  });
+
+  // BLO-22887 AC2: the refresh comment is what lands in the manager's
+  // notifications, and it already mirrors `Elapsed accounting` /
+  // `No-executable-turn accounting` for exactly that reason. A dependency
+  // bucket that appeared only in the description would leave the summary
+  // telling a different story from the artifact it summarises.
+  it("carries the dependency accounting line into the refresh comment (BLO-22887)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      withRunComments: true,
+    });
+    await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+    });
+
+    const service = productivityReviewService(db);
+    // `high_churn` is the non-closable trigger keeping this review alive, and
+    // it reads a rolling 1h window — so the refresh has to land while the
+    // seeded runs are still inside it. Shorten the refresh interval to the
+    // hard floor and step 6 minutes rather than the 1h default, which would
+    // age the runs out and stop generating the review entirely.
+    const thresholds = { refreshIntervalMs: PRODUCTIVITY_REVIEW_MIN_REFRESH_INTERVAL_MS };
+    await service.reconcileProductivityReviews({ now, companyId: seeded.companyId, thresholds });
+    const [review] = await listProductivityReviews(seeded.companyId);
+    const refreshed = await service.reconcileProductivityReviews({
+      now: new Date(now.getTime() + 6 * 60 * 1000),
+      companyId: seeded.companyId,
+      thresholds,
+    });
+
+    expect(refreshed.updated).toBe(1);
+    const refreshComments = await listRefreshComments(review!.id);
+    expect(refreshComments.length).toBeGreaterThan(0);
+    expect(refreshComments.at(-1)?.body).toContain(DEPENDENCY_LINE_ONE_BLOCKER);
   });
 
   // BLO-22436: once the blocker resolves (or the edge is removed), the same
@@ -2832,6 +3781,201 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(hold.held).toBe(false);
   });
 
+  // BLO-27698 C1/C2: the assignee's live slot occupancy, and the capacity
+  // verdict cell that occupancy unlocks. The four fallback verdicts on a
+  // `long_active_duration` review all presuppose an agent that had a turn and
+  // used it poorly; before this a reviewer had to reconstruct saturation from
+  // Kubernetes and then force one of those four anyway.
+  describe("assignee concurrency evidence (BLO-27698 C1/C2)", () => {
+    // Seeds `running` rows for the agent on OTHER issues — the slots that
+    // starve this issue are held by other work, which is exactly why the count
+    // must not be issue-scoped.
+    //
+    // `count` rows are stamped fresh (1 min before `now`) and so occupy a slot;
+    // `staleCount` rows are stamped an hour back, past RUN_STALE_SILENCE_MS
+    // (15 min), and so do NOT — the dispatcher's slot gate excludes them, so
+    // the report must too. Freshness is explicit here rather than incidental:
+    // these rows previously carried an hour-old `startedAt` and passed only
+    // because the count was unconditional.
+    async function occupySlots(input: {
+      companyId: string;
+      agentId: string;
+      now: Date;
+      count: number;
+      staleCount?: number;
+    }) {
+      const rows = [
+        ...Array.from({ length: input.count }, () => input.now.getTime() - 60 * 1000),
+        ...Array.from({ length: input.staleCount ?? 0 }, () => input.now.getTime() - 60 * 60 * 1000),
+      ];
+      if (rows.length === 0) return;
+      await db.insert(heartbeatRuns).values(
+        rows.map((startedAtMs) => ({
+          id: randomUUID(),
+          companyId: input.companyId,
+          agentId: input.agentId,
+          status: "running" as const,
+          invocationSource: "assignment" as const,
+          startedAt: new Date(startedAtMs),
+          contextSnapshot: { issueId: randomUUID() },
+        })),
+      );
+    }
+
+    async function reviewFor(opts: {
+      slots: number;
+      staleSlots?: number;
+      adapterType?: string;
+      runtimeConfig?: Record<string, unknown>;
+    }) {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue({
+        status: "in_progress",
+        startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      });
+      if (opts.adapterType || opts.runtimeConfig) {
+        await db
+          .update(agents)
+          .set({
+            ...(opts.adapterType ? { adapterType: opts.adapterType } : {}),
+            ...(opts.runtimeConfig ? { runtimeConfig: opts.runtimeConfig } : {}),
+          })
+          .where(eq(agents.id, seeded.coderId));
+      }
+      await occupySlots({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        now,
+        count: opts.slots,
+        staleCount: opts.staleSlots,
+      });
+
+      await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+      const [review] = await listProductivityReviews(seeded.companyId);
+      return review;
+    }
+
+    it("states the live running-runs-to-enforced-ceiling ratio (C1)", async () => {
+      // codex_local is not external-lifecycle, so the enforced ceiling is the
+      // raw policy value — no BLO-15959 clamp.
+      const review = await reviewFor({ slots: 2, runtimeConfig: { heartbeat: { maxConcurrentRuns: 5 } } });
+      expect(review?.description).toContain(
+        "- Assignee live concurrency: 2/5 running runs against the dispatcher's enforced ceiling",
+      );
+      // Not saturated: no capacity claim, and no capacity verdict offered.
+      expect(review?.description).not.toContain("**saturated**");
+    });
+
+    it("reports the external-lifecycle clamp, not the configured value, as the ceiling (C1)", async () => {
+      // BLO-15959: concurrencyEnabled defaults off, so a k8s agent configured
+      // for 8 is really held to 1. Reporting 8 here would tell a reviewer the
+      // agent had 7 free slots it declined to use — the exact inversion of the
+      // truth. This assertion is what makes the reported ceiling load-bearing
+      // rather than decorative.
+      const review = await reviewFor({
+        slots: 1,
+        adapterType: "claude_k8s",
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 8 } },
+      });
+      expect(review?.description).toContain("- Assignee live concurrency: 1/1 running runs");
+      expect(review?.description).toContain("held to 1 because external-lifecycle `concurrencyEnabled` is off");
+      expect(review?.description).toContain("**saturated**");
+    });
+
+    it("offers the capacity/platform verdict when the assignee is saturated (C2)", async () => {
+      const review = await reviewFor({ slots: 3, runtimeConfig: { heartbeat: { maxConcurrentRuns: 3 } } });
+      expect(review?.description).toContain("Route to platform/SRE as a capacity/dispatch constraint");
+      expect(review?.description).toContain("all 3 of the assignee's run slots occupied");
+      // The cell must precede the four assignee-directed verdicts, which are
+      // the wrong instruction for an agent that never got a turn.
+      expect(review!.description!.indexOf("Route to platform/SRE as a capacity/dispatch constraint"))
+        .toBeLessThan(review!.description!.indexOf("- Request decomposition"));
+      // Ally finding 2 on #1856: `assigneeConcurrency` is ONE sample taken at
+      // `now`, so it cannot carry an episode-wide claim. The cell must say what
+      // it measured and ask the reviewer to confirm, not instruct them not to
+      // record under-performance across hours it never observed.
+      expect(review?.description).toContain("occupied as of this evidence snapshot");
+      expect(review?.description).toContain("not established across the whole episode");
+      expect(review?.description).not.toContain("do not record this as assignee under-performance");
+    });
+
+    it("does not emit the categorical exoneration on a small, non-dominant no-executable-turn span (C2)", async () => {
+      // Ally finding 1 on #1856: the `noExecutableTurn` arm fired on `> 0`, so
+      // ~30s of queue time inside a 7h episode emitted the full "the assignee
+      // was not given an executable turn … do not record this as assignee
+      // under-performance". The five original C2 tests all seeded `slots` only,
+      // leaving `noExecutableTurnMs` incidentally 0 — this arm was never driven
+      // by any of them, which is why the defect survived them.
+      //
+      // Free slots deliberately: this isolates the turn-time arm. 4m of a 7h
+      // episode is ~1%, far below NO_EXECUTABLE_TURN_DOMINANT_SHARE.
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+      const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+      await insertNeverDispatchedRun({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        createdAt: new Date(now.getTime() - 34 * 60 * 1000),
+        finishedAt: new Date(now.getTime() - 30 * 60 * 1000),
+      });
+
+      await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+      const [review] = await listProductivityReviews(seeded.companyId);
+
+      expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+      // Still OFFERED — a real capacity block the reviewer should see. Only the
+      // wording is graded; withholding the cell would be the other failure.
+      expect(review?.description).toContain("Route to platform/SRE as a capacity/dispatch constraint");
+      expect(review?.description).toContain("PARTIAL capacity block");
+      expect(review?.description).toContain("Confirm it held for the period in question before routing");
+      // The categorical half must NOT appear: 4m does not exonerate 7h.
+      expect(review?.description).not.toContain("was not given an executable turn");
+      expect(review?.description).not.toContain("do not record this as assignee under-performance");
+      // And the four assignee-directed verdicts stay on the table.
+      expect(review?.description).toContain("- Request decomposition");
+    });
+
+    it("withholds the capacity verdict when the assignee had free slots (C2 negative control)", async () => {
+      // The important half. An always-present capacity cell would become the
+      // default verdict for every slow episode — the opposite failure to the
+      // one C2 fixes, and a strictly worse one, because it excuses real
+      // inactivity rather than merely failing to explain a stall.
+      const review = await reviewFor({ slots: 0, runtimeConfig: { heartbeat: { maxConcurrentRuns: 4 } } });
+      expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+      expect(review?.description).toContain("- Assignee live concurrency: 0/4 running runs");
+      expect(review?.description).not.toContain("Route to platform/SRE as a capacity/dispatch constraint");
+      // The four assignee-directed verdicts are still offered.
+      expect(review?.description).toContain("- Request decomposition");
+    });
+
+    it("excludes stale running rows from the occupancy count (C1/C2 regression)", async () => {
+      // The dispatcher's slot gate counts only NON-stale running rows
+      // (BLO-12990): a row silent past RUN_STALE_SILENCE_MS does not starve new
+      // work. Counting every `running` row here reported `2/2 … saturated` and
+      // offered the capacity verdict while dispatch would still have admitted a
+      // turn — a false capacity explanation, which is worse than none because
+      // it reads as measurement and excuses inactivity that was never excused.
+      // Both rows below are silent for an hour, so every effective slot is in
+      // fact free.
+      const review = await reviewFor({
+        slots: 0,
+        staleSlots: 2,
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 2 } },
+      });
+      expect(review?.description).toContain("- Assignee live concurrency: 0/2 running runs");
+      expect(review?.description).not.toContain("**saturated**");
+      expect(review?.description).not.toContain("Route to platform/SRE as a capacity/dispatch constraint");
+      expect(review?.description).toContain("- Request decomposition");
+    });
+  });
+
   // BLO-19848: `long_active_duration` measured raw wall-clock from
   // issues.started_at to now with no reference to whether anything was actually
   // executing, so an issue pinned by a non-live executionRunId kept accruing
@@ -3314,12 +4458,26 @@ describeEmbeddedPostgres("productivity review service", () => {
 
     expect(result.created).toBe(1);
     const [review] = await listProductivityReviews(seeded.companyId);
-    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    // BLO-27698 B3b: this fixture IS the runaway case — a `running` run signalling
+    // a minute ago, executing unbroken since the last dispatch — so the relocation
+    // lands here, exactly as the B1 note below predicted. The elapsed-accounting
+    // guard this test exists for is unaffected: the report still renders, and the
+    // 21h 18m figure is still asserted absent from both buckets.
+    expect(review?.description).toContain("Primary trigger: `runaway_execution`");
     // Anchored at the last dispatch (09:44), not at checkout (21:42).
-    expect(review?.description).toContain("9h 16m unattended");
+    // BLO-27698 B1: the anchored span now reads as `executing` rather than
+    // `unattended` — the run is `running` and emitting, so it covers the whole
+    // episode. Only the bucket label moved; the quantity under test is the same,
+    // the review still fires (`created: 1` above, because the suppression gate
+    // compares `unattendedMs + executingMs`), and the 21h 18m guard below is
+    // asserted against BOTH buckets so it cannot be evaded through the new one.
+    // A 9h 16m unbroken executing span is the runaway case B3b must relocate to a
+    // named runtime/cost trigger before B3 narrows the gate to `unattendedMs`.
+    expect(review?.description).toContain("9h 16m executing");
     // The regression this exists to catch: charging the whole 21h 18m
     // checkout-to-now span, queue wait included, to the assignee.
     expect(review?.description).not.toContain("21h 18m unattended");
+    expect(review?.description).not.toContain("21h 18m executing");
   });
 
   it("does not exclude a queue wait that overlapped another run's live work (BLO-25722)", async () => {
@@ -3363,9 +4521,16 @@ describeEmbeddedPostgres("productivity review service", () => {
 
     // 430m episode, anchored at 12:00. The 6h 50m overlapping queue wait stays
     // in: a live run was working the issue throughout.
+    //
+    // BLO-27698 B1: "stays in" is still the assertion — the span is not excused
+    // from the episode — but it now reads as `executing`, because the run
+    // covering it is `running` and emitting. `created: 1` is unchanged: the
+    // suppression gate compares `unattendedMs + executingMs`, so B1 moves the
+    // label without moving the verdict. B3 is what narrows that gate, and B3b is
+    // where this shape has to resurface as a runtime/cost trigger.
     expect(result.created).toBe(1);
     const [review] = await listProductivityReviews(seeded.companyId);
-    expect(review?.description).toContain("7h 0m unattended");
+    expect(review?.description).toContain("7h 0m executing");
     expect(review?.description).not.toContain("Excluded as non-live execution hold");
   });
 
@@ -3638,6 +4803,16 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("fleet-capacity signal, not assignee inactivity");
     expect(review?.description).toContain(`run \`${runId}\``);
     expect(review?.description).toContain(`No-executable-turn accounting:`);
+    // BLO-27698 C2 positive control for the wording split (Ally finding 1 on
+    // #1856). The retry spans essentially the whole 7h episode, so the
+    // no-executable-turn share clears NO_EXECUTABLE_TURN_DOMINANT_SHARE and
+    // this — unlike a 4m span or a single concurrency sample — genuinely IS
+    // episode-scoped evidence. Pinned here because grading the cell down to
+    // "partial" everywhere would be the opposite over-correction, and nothing
+    // else in the suite would catch it.
+    expect(review?.description).toContain("the assignee was not given an executable turn");
+    expect(review?.description).toContain("do not record this as assignee under-performance");
+    expect(review?.description).not.toContain("PARTIAL capacity block");
   });
 
   it("surfaces the no-executable-turn bucket in evidence and does not let long_active_duration ride along when a different trigger fires (BLO-23248 AC, generalized by BLO-23624)", async () => {
@@ -4173,8 +5348,18 @@ describeEmbeddedPostgres("productivity review service", () => {
 
   it("still creates a long_active_duration review once the run actually starts and runs past the threshold", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
-    const checkoutAt = new Date(now.getTime() - 12 * 60 * 60 * 1000);
-    const dispatchedAt = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const checkoutAt = new Date(now.getTime() - 14 * 60 * 60 * 1000);
+    // BLO-27698 B3: was 7h. The trigger now measures the *unattended* bucket, and
+    // this run carries no liveness stamps, so `runLiveInterval` credits it the 2h
+    // silence grace from its dispatch and the rest of the episode is unattended.
+    // At a 7h episode that left a 5h residue — under the 6h bar — so the fixture
+    // was measuring the silence grace rather than the property it names. Moved to
+    // 9h so the unattended residue (7h) clears the bar on its own, which is what
+    // "runs past the threshold" has to mean once executing time is its own bucket.
+    // The BLO-22016 contrast with the queued-never-started case above is unchanged:
+    // that one is withheld for having no dispatch at all, this one fires because it
+    // has one.
+    const dispatchedAt = new Date(now.getTime() - 9 * 60 * 60 * 1000);
     const seeded = await seedAssignedIssue({
       status: "in_progress",
       startedAt: checkoutAt,
@@ -4656,6 +5841,149 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("5m monitor-gated, 19h 55m unattended");
     expect(review?.description).toContain("monitor lapsed at");
     expect(review?.description).toContain("never re-armed");
+  });
+
+  // BLO-22887 verifying-signal cell 1. The three tests below deliberately reuse
+  // the fixture immediately above, because that fixture reproduces the *shape*
+  // of the reported defect — monitor lapses early, is never re-armed, long
+  // unattended remainder — on an issue the control plane independently holds
+  // dependency-blocked, which is how BLO-22703 fired `long_active_duration` on
+  // BLO-21016. Its shape, not its numbers: this fixture's own accounting is
+  // `5m monitor-gated, 19h 55m unattended` (asserted in cell 3), not
+  // BLO-22703's. Keeping the fixture byte-identical and adding only the blocker
+  // is what makes these a control/treatment pair rather than three unrelated
+  // scenarios.
+  //
+  // The BLO-22436 suppression tests all drive `no_comment_streak`, so until now
+  // `long_active_duration` — the one trigger this ticket was filed about, and
+  // the one whose elapsed accounting crosses into the monitor-lapse subsystem —
+  // had no generation-gate coverage at all. The gate is trigger-set-generic, so
+  // this is a regression guard on an intersection, not a new behaviour.
+  it("suppresses a long_active_duration review for a dependency-blocked issue whose monitor deliberately lapsed (BLO-22887)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const activeStartedAt = new Date(now.getTime() - 20 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: activeStartedAt,
+      monitorNextCheckAt: new Date(activeStartedAt.getTime() + 5 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    // Pins *which* mechanism suppressed it. `created: 0` alone is satisfied by
+    // the long-active predicate never firing — i.e. by the fixture silently
+    // rotting into a no-op — which is the failure mode that would make this
+    // test pass for the wrong reason.
+    expect(result.dependencyBlockedSuppressed).toBe(1);
+    // Pins gate *ordering*, not monitor state: the dependency gate `continue`s
+    // before the monitor gate, so this cannot fail while the assertion above
+    // holds. Kept here as the ordering pin; cell 2 omits it as redundant.
+    expect(result.monitorScheduledSuppressed).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // BLO-22887 verifying-signal cell 2. The AC names the signal as
+  // `scheduledRetryReason: dependency_blocked`, which is real
+  // (`DEP_BLOCKED_RETRY_REASON`, heartbeat.ts) but is NOT what the detector
+  // gates on — the gate reads `listDependencyReadiness`, i.e. the `blockedBy`
+  // edge. Those are not independent: the park is only ever written with a
+  // non-empty `unresolvedBlockerIssueIds` (heartbeat.ts, dep-blocked wake
+  // deferral), so the retry reason is a downstream marker of the same graph
+  // state, and BLO-21016 carried both at once exactly as this fixture does.
+  //
+  // The park is placed OVERDUE only because that is the state a real
+  // `issue_dependencies_blocked` park reaches once its due time passes — the
+  // position is not load-bearing. The BLO-19848/BLO-23248 pinning path cannot
+  // classify this row in either position: `classifyNoExecutableTurnRun`
+  // returns null for a `scheduled_retry` whose reason is not
+  // `ccrotate_capacity` and whose errorCode is not `rate_limit_exhausted`
+  // (productivity-review.ts, `isCapacityClass`), and this cell overrides both
+  // helper defaults. The only other `scheduledRetryAt` consumer,
+  // `liveSegmentStartedAt`, needs `status === "running"` plus an
+  // `issue.executionRunId` the helper deliberately leaves null. So the park row
+  // is inert with respect to the gate under test, and this cell must land on
+  // the same counters as cell 1: asserting invariance under the AC's named
+  // signal is the point — it is AC fidelity, not a second suppression path. The
+  // near-duplicate of cell 1 is deliberate.
+  it("suppresses a long_active_duration review for an issue parked on an overdue dependency_blocked retry (BLO-22887)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const activeStartedAt = new Date(now.getTime() - 20 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: activeStartedAt,
+      monitorNextCheckAt: new Date(activeStartedAt.getTime() + 5 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+    });
+    await insertCapacityScheduledRetryRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      createdAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+      scheduledRetryAt: new Date(now.getTime() - 60 * 60 * 1000),
+      scheduledRetryReason: "dependency_blocked",
+      errorCode: "issue_dependencies_blocked",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.dependencyBlockedSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // BLO-22887 verifying-signal cell 3 (over-suppression guard). Named
+  // explicitly because cells 1 and 2 are both "no review emitted": a change
+  // that simply stopped emitting `long_active_duration` would satisfy them
+  // while disabling the detector. This is the same fixture with the blocker
+  // resolved rather than absent, so it also pins that the gate reads blocker
+  // *state* and not the mere existence of a relation row.
+  it("still emits the long_active_duration review once the blocker is resolved (BLO-22887)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const activeStartedAt = new Date(now.getTime() - 20 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: activeStartedAt,
+      monitorNextCheckAt: new Date(activeStartedAt.getTime() + 5 * 60 * 1000),
+      monitorScheduledBy: "assignee",
+    });
+    await addBlocker({
+      companyId: seeded.companyId,
+      issuePrefix: seeded.issuePrefix,
+      blockedIssueId: seeded.issueId,
+      blockerStatus: "done",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    expect(result.dependencyBlockedSuppressed).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    expect(review?.description).toContain("5m monitor-gated, 19h 55m unattended");
+    // A resolved blocker leaves no unresolved edge, so the BLO-22887 bucket
+    // must not render — the line's presence is itself the signal.
+    expect(review?.description).not.toContain("Dependency accounting");
   });
 
   // BLO-25877 defect 2 regression guard: the still-armed branch reports
@@ -5802,7 +7130,17 @@ describeEmbeddedPostgres("productivity review service", () => {
     // Nothing of the cohort is even attempted on this pass — the back-off is a
     // hard exclusion, not a re-ordering, so it cannot occupy a single slot.
     expect(second.failed).toBe(0);
-  });
+    // BLO-22985: 120s, matching the two sibling full-window tests above and
+    // below. This one was authored without a cap and inherited the 60s global,
+    // which is not enough: it inserts 500 rows and then drives 250 failing
+    // finalizes, each with its own back-off UPDATE. Measured 32.5s unloaded
+    // (64-core host, load ~10) — only 1.8x under the global, so a merge-queue
+    // runner pod at 1.0-1.8 cores runs it straight past the deadline. It did,
+    // ejecting #1854 from the master queue on 2026-09-17 (run 35226379587).
+    // 120s is 3.7x the measured cost and still catches a genuine hang: the
+    // failure this test exists to detect is an unbounded recovery loop, which
+    // does not finish at any budget.
+  }, 120_000);
 
   it("replays missing finalized review side effects without duplicating them", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
@@ -6537,6 +7875,952 @@ describeEmbeddedPostgres("productivity review service", () => {
     );
   });
 
+  // BLO-27698 B1: executing time is a third bucket, not a share of "unattended".
+  // A run that was demonstrably executing means the assignee had its turn and was
+  // taking it — the opposite reader action from "nobody was watching" — so
+  // collapsing the two tells an adjudicating manager the wrong thing.
+  //
+  // Note the fixture shape: `activeStartedAt` is the most recent *dispatch*
+  // (`mostRecentDispatchAt`), so a run seeded mid-episode silently redefines the
+  // episode to start at itself. The run therefore starts exactly at
+  // `issue.startedAt`, which is also the real shape — the current run's live span
+  // begins at the episode boundary by construction.
+  //
+  // 10h episode, monitor lapsed 2h in, run live for the first 3h. Executing is
+  // scoped to the unwatched suffix, so only the run's third hour (the part past
+  // the lapse) counts: 2h gated + 1h executing + 7h unattended === 10h, the
+  // `gatedMs + executingMs + unattendedMs === elapsedMs` invariant in rendered
+  // form. The first two executing hours stay inside the gated prefix on purpose —
+  // the monitor was accounting for them.
+  //
+  // Still fires, deliberately: the suppression gate compares
+  // `unattendedMs + executingMs` (8h) against the 6h bar, bit-identical to the
+  // pre-B1 `unattendedMs` it replaced. Narrowing that to the 7h unattended bucket
+  // is B3's job, in its own PR — doing it here would be the compute-without-
+  // consult failure BLO-27225 exists to document.
+  it("reports executing time as a third elapsed bucket distinct from gated and unattended", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 10 * 60 * 60 * 1000);
+    const monitorLastTriggeredAt = new Date(startedAt.getTime() + 2 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt,
+      monitorNextCheckAt: null,
+      monitorScheduledBy: "assignee",
+      monitorLastTriggeredAt,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      status: "succeeded",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      finishedAt: new Date(startedAt.getTime() + 3 * 60 * 60 * 1000),
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+      livenessState: "advanced",
+      nextAction: null,
+      createdAt: startedAt,
+      updatedAt: startedAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain(
+      `- Elapsed accounting: 2h 0m monitor-gated, 1h 0m executing, 7h 0m unattended (monitor fired on schedule at ${monitorLastTriggeredAt.toISOString()} and enqueued a successor run`,
+    );
+  });
+
+  // The no-monitor branch attributes the whole episode to the unwatched suffix,
+  // so the entire live span comes out of it: 0 + 3 + 7 === 10.
+  it("carves executing time out of a wholly unattended episode", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 10 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      status: "succeeded",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      finishedAt: new Date(startedAt.getTime() + 3 * 60 * 60 * 1000),
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+      livenessState: "advanced",
+      nextAction: null,
+      createdAt: startedAt,
+      updatedAt: startedAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain(
+      "- Elapsed accounting: 0m monitor-gated, 3h 0m executing, 7h 0m unattended (no monitor armed during this episode)",
+    );
+  });
+
+  // The still-armed branch must be untouched by B1, and this is the guard that
+  // pins it. Executing time is carved out of the unwatched suffix only, and that
+  // branch has none — the whole episode is the gated prefix — so a live run must
+  // leave the line reading exactly as it did before, `unattendedMs` still 0 and
+  // `gatedIsUpperBound` still true.
+  //
+  // Carving the overlap out of the gated prefix instead would shrink `gatedMs`
+  // below the episode and break the "≤15h monitor-gated, ≥0m unattended" upper
+  // bound the B3a regression guard above depends on — the indefinite-suppression
+  // hazard BLO-22331 AC2 forbids, reachable through a bucket change rather than
+  // through the predicate.
+  it("leaves the still-armed upper-bound split unchanged when a run was executing", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 15 * 60 * 60 * 1000);
+    const armedUntil = new Date(now.getTime() + 30 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt,
+      monitorNextCheckAt: armedUntil,
+      monitorScheduledBy: null,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      status: "succeeded",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      finishedAt: new Date(startedAt.getTime() + 6 * 60 * 60 * 1000),
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+      livenessState: "advanced",
+      nextAction: null,
+      createdAt: startedAt,
+      updatedAt: startedAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain(
+      `- Elapsed accounting: ≤15h 0m monitor-gated, ≥0m unattended (monitor armed until ${armedUntil.toISOString()}`,
+    );
+    // Scoped to the bucket's rendered form: the prose elsewhere in the report
+    // uses the bare word, so a `not.toContain("executing")` would fail on text
+    // this change never touches.
+    expect(review?.description).not.toContain(" executing,");
+  });
+
+  // BLO-27698 B3 — the trigger now reads the *unattended* bucket, not the whole
+  // episode. 13h episode, no monitor, a run that executed the first 7h and then
+  // finished: 0m gated + 7h executing + 6h unattended. Pre-B3 this fired, because
+  // the gate compared `unattendedMs + executingMs` (13h) against the 6h bar. The
+  // 6h unattended residue is still at the bar, so this case is NOT suppressed by
+  // the unattended arm — it is suppressed by B2's dominance arm, which is what
+  // makes this the B2 test rather than a second B3 one.
+  //
+  // `runaway_execution` cannot rescue it either: that trigger keys on a run still
+  // signalling now, and this one is terminal. So `created: 0` here is the whole
+  // B2 claim — an episode more than half spent executing is not assignee
+  // inactivity — and it is the assertion that fails if the dominance arm is
+  // dropped.
+  it("suppresses long_active_duration when executing time dominates the episode", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 13 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      status: "succeeded",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      finishedAt: new Date(startedAt.getTime() + 7 * 60 * 60 * 1000),
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+      livenessState: "advanced",
+      nextAction: null,
+      createdAt: startedAt,
+      updatedAt: startedAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // BLO-27698 B2 boundedness (BLO-22331 AC2) — the same fixture one hour later.
+  // The executing span is unchanged at 7h, so at a 14h episode its share is
+  // exactly 0.5, the strict `>` in `isDominantEpisodeShare` goes false, and the
+  // review fires on 7h of unattended time.
+  //
+  // This is the guard that the B2 arm cannot become indefinite: it is not gated
+  // on any liveness flag, so the only thing that ever clears it is the episode
+  // outgrowing twice the executing time. One hour of drift either side of that
+  // boundary flips the verdict, which is what "bounded" has to mean here.
+  it("fires again once the episode outgrows twice the executing time", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 14 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      status: "succeeded",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      finishedAt: new Date(startedAt.getTime() + 7 * 60 * 60 * 1000),
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+      livenessState: "advanced",
+      nextAction: null,
+      createdAt: startedAt,
+      updatedAt: startedAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    expect(review?.description).toContain("- Elapsed accounting: 0m monitor-gated, 7h 0m executing, 7h 0m unattended");
+  });
+
+  // BLO-27698 B2 boundedness, the case the test above cannot reach (Ally review
+  // on fe4e9dcb). Both fixtures above let the episode clock run — they set no
+  // `executionRunId`, so `nonLiveExecutionHoldSince` returns null,
+  // `attributableEndAt` is `now`, and `elapsedMs` grows every reconcile. That is
+  // what makes the share test self-clearing there, and it is exactly the
+  // assumption that fails here.
+  //
+  // A silent `running` HOLDER pins `attributableEndAt` at the fixed
+  // `lastSignal + NON_LIVE_EXECUTION_SILENCE_MS`. `elapsedMs`, `executingMs` and
+  // `unattendedMs` then freeze, so the ratio is constant across every subsequent
+  // reconcile and can never cross back under the bar — indefinite suppression,
+  // the BLO-22331 AC2 hazard. Advancing `now` cannot rescue it the way the
+  // boundedness test does, because advancing `now` no longer moves the episode.
+  //
+  // The holder carries NO `startedAt`, which is the documented shape for one
+  // (see the `activeStartedAt` comment at productivity-review.ts:3784 — a holder
+  // pinned via `executionRunId` tracks liveness through `lastOutputAt` instead).
+  // That detail is what makes the case reachable, and the review's own worked
+  // example is not: a holder that *does* carry `startedAt` necessarily spans the
+  // whole episode, because the anchor is `max(startedAt)` — which is at or after
+  // the holder's own start — while the episode END is that same holder's silence
+  // point. Unattended collapses to 0 and the first arm suppresses before B2 is
+  // ever consulted. Here the executing time comes from a terminal sibling that
+  // ran the first 9h, so the two ends are decoupled and the 7h residue is real.
+  //
+  // 16h episode, 9h executing (9/16 > 0.5, so the dominance arm engages), 7h
+  // unattended (above the 6h bar, so the first arm does not). `runaway_execution`
+  // declines because the sibling is terminal and no longer signalling.
+  it("fires long_active_duration when a dominant executing share is frozen by a non-live holder", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const hours = (n: number) => new Date(now.getTime() - n * 60 * 60 * 1000);
+    const holderId = randomUUID();
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: hours(18),
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        // The holder: `running`, no `startedAt`, last signal 4h stale. Pins
+        // `attributableEndAt` at 2h ago and contributes no live span of its own
+        // (`runLiveInterval` returns null without a `startedAt`).
+        id: holderId,
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        status: "running",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt: null,
+        lastOutputAt: hours(4),
+        contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+        livenessState: "advanced",
+        nextAction: null,
+        createdAt: hours(19),
+        updatedAt: hours(4),
+      },
+      {
+        // Terminal sibling carrying the executing time. Starts before the issue's
+        // own `startedAt` so it cannot pull the anchor forward.
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        status: "succeeded",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt: hours(19),
+        finishedAt: hours(9),
+        contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+        livenessState: "advanced",
+        nextAction: null,
+        createdAt: hours(19),
+        updatedAt: hours(9),
+      },
+    ]);
+    await db
+      .update(issues)
+      .set({ executionRunId: holderId, checkoutRunId: holderId, executionLockedAt: hours(4) })
+      .where(eq(issues.id, seeded.issueId));
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    // Anchors the positive: without the `trailingHoldMs === 0` conjunct the
+    // dominance arm suppresses this outright and `created` is 0.
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    // The frozen figures themselves, so a future change that "fixes" this by
+    // moving the episode window rather than bounding the arm also fails here.
+    expect(review?.description).toContain("- Elapsed accounting: 0m monitor-gated, 9h 0m executing, 7h 0m unattended");
+  });
+
+  // BLO-27698 B3 — the narrowing itself, isolated from B2's dominance arm. 9h
+  // episode, no monitor, a run that executed the first 4h and then finished:
+  // 0m gated + 4h executing + 5h unattended.
+  //
+  // Every number here is load-bearing, and the fixture was wrong once before it
+  // was right — the first version (13h episode, 4h executing, 1h unattended)
+  // asserted `created: 0` and passed with B3 reverted, because 4h + 1h never
+  // cleared the 6h bar in the first place. It proved nothing. The control that
+  // matters is: restore B1's `unattendedMs + executingMs` addend and this must go
+  // red, which requires the sum (9h) above the bar and the unattended component
+  // (5h) below it.
+  //
+  // Executing is 4/9, NOT dominant, so B2's arm cannot be what suppresses this.
+  // The run is terminal, so `runaway_execution` cannot rescue it. That leaves the
+  // unattended arm as the only possible cause of `created: 0`.
+  //
+  // `gatedIsUpperBound` is false here (no monitor was ever armed), which is the
+  // B3a precondition — the unattended figure is measured, so it is safe to gate
+  // on. The still-armed converse, where `unattendedMs: 0` is a deliberate upper
+  // bound and generation must STILL occur, is pinned by "marks monitor-gated time
+  // as an upper bound while the monitor is still armed" above.
+  it("does not fire long_active_duration on executing time once the unattended residue is below the bar", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 9 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      status: "succeeded",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      finishedAt: new Date(startedAt.getTime() + 4 * 60 * 60 * 1000),
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+      livenessState: "advanced",
+      nextAction: null,
+      createdAt: startedAt,
+      updatedAt: startedAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // BLO-27698 B3b — the case B3 drops, relocated rather than lost. Same 13h
+  // episode and the same run, except it is still `running` and still signalling,
+  // so its turn never came back. B3 alone would make this silent: executing
+  // covers the episode, the unattended residue is ~0, and the trigger that used
+  // to catch it now reads only that residue.
+  //
+  // The assertion is deliberately on the trigger name, not just on `created: 1`.
+  // A review that fires as `long_active_duration` here would carry the wrong
+  // rubric — its four verdicts all ask what progress the assignee showed while
+  // it was NOT working — and the manager's question for a run that is still
+  // executing is a different one.
+  it("relocates a still-executing runaway run to its own trigger", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 13 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      status: "running",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      lastOutputAt: new Date(now.getTime() - 60 * 1000),
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+      livenessState: "advanced",
+      nextAction: null,
+      createdAt: startedAt,
+      updatedAt: startedAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `runaway_execution`");
+    expect(review?.description).toContain("a single run has been executing continuously for 13h");
+    // The rubric has to move with the trigger, or the relocation is cosmetic.
+    expect(review?.description).toContain("this is a runtime/cost question");
+    expect(review?.description).not.toContain("A \"Close as productive\" verdict requires");
+  });
+
+  // BLO-27698 B3b boundedness — a `running` row is not by itself an executing
+  // run. Same fixture with the last signal 3h stale: `runLiveInterval` caps the
+  // span at last-signal + NON_LIVE_EXECUTION_SILENCE_MS (2h), so the run is no
+  // longer live as of `now` and cannot claim the runaway trigger.
+  //
+  // Without this the trigger would fire on a wedged holder forever — the run
+  // status alone never changes — which is the same indefinite hazard as reading
+  // an upper-bound bucket as measured.
+  it("does not treat a silent running row as a runaway execution", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 13 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      status: "running",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      lastOutputAt: new Date(now.getTime() - 3 * 60 * 60 * 1000),
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+      livenessState: "advanced",
+      nextAction: null,
+      createdAt: startedAt,
+      updatedAt: startedAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description ?? "").not.toContain("Primary trigger: `runaway_execution`");
+    // Ally review follow-up: anchor the negative. Asserting only the absence of a
+    // trigger name would also pass if review generation broke outright for an
+    // unrelated reason, which would make this test stop discriminating silently.
+    //
+    // Nothing fires here, and that is the B3 + B3b design meeting rather than a
+    // gap: `runLiveInterval` caps this run at last-signal + 2h, so ~12h of the
+    // 13h episode is still attributed to *executing* — which leaves `unattendedMs`
+    // ~1h, below the bar, so B3 declines `long_active_duration` — while the span
+    // ends an hour before `now`, so it is not live and B3b declines
+    // `runaway_execution`. A wedged-but-silent holder is `no_comment_streak`'s
+    // case, not either B-group trigger's.
+    expect(result.created).toBe(0);
+  });
+
+  // BLO-27698 B3b (Ally review follow-up) — pins the human-gate opt-out that
+  // outranking `long_active_duration` creates. Every suppression gate in this
+  // file is keyed on `trigger === "long_active_duration"`, so selecting
+  // `runaway_execution` bypasses the approval gate, the pending-monitor
+  // suppression and the A1 progress-PR gate at once. That is intended — a run
+  // burning compute past the bar is not excused by a monitor that says "wake me
+  // later" — but it was previously unstated and unpinned: every other runaway
+  // fixture sets `monitorNextCheckAt: null`, so nothing would have caught a
+  // silent flip in either direction.
+  //
+  // Fires the trigger *through* an armed future monitor, which is exactly the
+  // configuration that suppresses `long_active_duration` in the sibling test
+  // below. If someone later decides a monitor should suppress runaway runs,
+  // this test must be changed deliberately rather than discovered broken.
+  it("fires runaway_execution through an armed monitor that would suppress long_active_duration", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 13 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt,
+      // Armed, in the future, and never yet fired — the shape
+      // `currentPendingMonitorForReviewSuppression` holds a review back on.
+      monitorNextCheckAt: new Date(now.getTime() + 60 * 60 * 1000),
+      monitorLastTriggeredAt: null,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      status: "running",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      lastOutputAt: new Date(now.getTime() - 60 * 1000),
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+      livenessState: "advanced",
+      nextAction: null,
+      createdAt: startedAt,
+      updatedAt: startedAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `runaway_execution`");
+    // Not merely "a review fired" — it must not have been recorded as a
+    // monitor-suppressed review, which is the shape the gate would have produced.
+    expect(review?.description).not.toContain("Suppressed by a scheduled monitor");
+  });
+
+  // BLO-27698 B3b (Ally review on 7f4fbc43b) — `runaway_execution` is the only
+  // trigger in the set whose subject is a single in-flight run, and every option
+  // in its rubric ("let it finish", "bound it", "route to platform/SRE") is an
+  // instruction to a live process. Its real retirement predicate is therefore
+  // *the run ended*; source-`done` is a strictly narrower proxy. Before the
+  // `execution_ended` arm, the ordinary shape — run executes past the bar, review
+  // fires, run exits, issue stays `in_progress` — stranded an unanswerable review
+  // in a manager's queue indefinitely, because generation cannot retire one
+  // either (`createOrUpdateReview` returns null the moment no trigger fires, so
+  // an open review whose trigger stopped firing is never revisited).
+  //
+  // The source is deliberately NOT `done` here: that is the pre-existing
+  // `terminal_source` arm, and asserting `closedTerminalSourceReviews` is 0 is
+  // what stops this passing through it.
+  it("retires an open runaway_execution review once its run has stopped executing", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 13 * 60 * 60 * 1000);
+    const finishedAt = new Date(now.getTime() - 30 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      // Terminal: `runLiveInterval` ends a terminal row at `finishedAt`, which is
+      // in the past, so `stillSignalling` is false and `liveExecutingMs` is 0.
+      status: "succeeded",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      finishedAt,
+      lastOutputAt: finishedAt,
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+      livenessState: "advanced",
+      nextAction: null,
+      createdAt: startedAt,
+      updatedAt: startedAt,
+    });
+    const reviewId = await insertProductivityReview({ seeded, createdAt: startedAt });
+    await logActivity(db, {
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: reviewId,
+      details: { trigger: "runaway_execution", sourceIssueId: seeded.issueId },
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.closedExecutionEndedReviews).toBe(1);
+    expect(result.closedTerminalSourceReviews).toBe(0);
+    expect(result.closedDependencyBlockedReviews).toBe(0);
+    expect(result.closedSuppressedMonitorReviews).toBe(0);
+    const [review] = await db.select().from(issues).where(eq(issues.id, reviewId));
+    expect(review?.status).toBe("done");
+    const [closed] = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityId, reviewId),
+          eq(activityLog.action, "issue.productivity_review_suppressed_open_review_closed"),
+        ),
+      );
+    // The source status is carried so a reader can see this retired on the run,
+    // not on the issue — the distinction the whole arm exists to draw.
+    expect(closed?.details).toMatchObject({
+      suppressedBy: "execution_ended",
+      sourceStatus: "in_progress",
+    });
+  });
+
+  // The converse, and the more important of the pair: a genuinely runaway run
+  // must stay flagged. Identical fixture except the run is still `running` and
+  // signalling, which is the only difference the `execution_ended` predicate is
+  // allowed to key on. Without this, the arm above could degrade into a blanket
+  // retirement of every `runaway_execution` review and the suite would stay green
+  // — B3b's own acceptance criterion is that a runaway run stays detectable.
+  it("keeps an open runaway_execution review while its run is still executing", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 13 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      status: "running",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      // Signalled a minute ago, so `runLiveInterval` caps the span at `now` and
+      // `stillSignalling` holds.
+      lastOutputAt: new Date(now.getTime() - 60 * 1000),
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+      livenessState: "advanced",
+      nextAction: null,
+      createdAt: startedAt,
+      updatedAt: startedAt,
+    });
+    const reviewId = await insertProductivityReview({ seeded, createdAt: startedAt });
+    await logActivity(db, {
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: reviewId,
+      details: { trigger: "runaway_execution", sourceIssueId: seeded.issueId },
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.closedExecutionEndedReviews).toBe(0);
+    const [review] = await db.select().from(issues).where(eq(issues.id, reviewId));
+    expect(review?.status).not.toBe("done");
+    expect(
+      await countReviewActivity(reviewId, "issue.productivity_review_suppressed_open_review_closed"),
+    ).toBe(0);
+  });
+
+  // BLO-27698 B3b (Ally review follow-up) — `reconcileProductivityReviews`
+  // selects candidates in `["todo", "in_progress"]`, but `elapsedMs` is null for
+  // anything not `in_progress`. Without the `elapsedMs !== null` guard,
+  // `runaway_execution` keys purely on a live run span and so fires on a `todo`
+  // issue that still carries a signalling `running` row — an issue released back
+  // to `todo` mid-run, or a checkout that never landed. `long_active_duration`
+  // is structurally incapable of producing that report, so this trigger must not
+  // introduce it: such a review renders "Current active elapsed time: unknown"
+  // with no `Elapsed accounting` line, i.e. it would be evidence-free as well as
+  // wrong.
+  it("does not fire runaway_execution on a todo issue with a live running row", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 13 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "todo",
+      startedAt,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      status: "running",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      // Signalling as of `now`, so the span IS live — the guard, not staleness,
+      // is what has to stop this. Restoring the unguarded predicate turns this red.
+      lastOutputAt: new Date(now.getTime() - 60 * 1000),
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+      livenessState: "advanced",
+      nextAction: null,
+      createdAt: startedAt,
+      updatedAt: startedAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description ?? "").not.toContain("Primary trigger: `runaway_execution`");
+    expect(result.created).toBe(0);
+  });
+
+  // BLO-27698 B3b (Ally reviews on 2e95b50b and 160720b4) — episode attribution
+  // must ask "is anything live on this issue", not "is the *holder* live".
+  // `nonLiveExecutionHoldSince` keys only on `issue.executionRunId`, so a parked
+  // holder truncates the episode into the past even while another run of the same
+  // assignee is still executing on the same issue.
+  //
+  // The fixture is that exact shape and nothing else: a `queued` holder last
+  // signalling 11h ago plus a live sibling that has been `running` for 13h and is
+  // still signalling. Holder-only, the episode reads 2h, and *both* `elapsedMs`
+  // and `liveExecutingMs` are cut to it — so B2, B3 and B3b were blind to the
+  // sibling between them and a 13h runaway produced no review at all. That was
+  // the coverage gap B3b's AC forbids ("do not silently drop it").
+  //
+  // With `siblingStillExecuting` extending `attributableEndAt` to `now`, the two
+  // figures move together: 13h executing inside a 13h episode. That is what makes
+  // firing safe here — the self-contradictory evidence pack the tail clamp was
+  // added to prevent ("executing continuously for 13h" above "Current active
+  // elapsed time: 2h") is unrepresentable, so consistency is no longer bought by
+  // discarding the burn. Both halves are asserted below; asserting only the
+  // trigger would pass on exactly the contradiction this rejects.
+  //
+  // Mutation control: dropping the `siblingStillExecuting` term from
+  // `attributableEndAt` turns this red — the episode collapses to 2h, nothing
+  // clears the 6h bar, and `created` falls to 0.
+  //
+  // BLO-18307 is not weakened. Its shape is a parked holder with *nothing* live,
+  // which still truncates exactly as before — see the non-live execution hold
+  // tests above, which pin that path independently.
+  it("fires runaway_execution on a live sibling while the holder is parked, with a self-consistent episode", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 13 * 60 * 60 * 1000);
+    // The holder's last signal — `attributableEndAt` if liveness were holder-only.
+    const holderLastSignal = new Date(now.getTime() - 11 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+    });
+    const siblingId = randomUUID();
+    const holderId = randomUUID();
+    await db.insert(heartbeatRuns).values([
+      {
+        // Live sibling: signalling as of `now`, so its span IS live and only the
+        // tail clamp can bound it.
+        id: siblingId,
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        status: "running",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt,
+        lastOutputAt: new Date(now.getTime() - 60 * 1000),
+        contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+        livenessState: "advanced",
+        nextAction: null,
+        createdAt: startedAt,
+        updatedAt: startedAt,
+      },
+      {
+        // Parked holder: `queued` returns `lastSignal` from
+        // `nonLiveExecutionHoldSince`, truncating the episode to 11h ago.
+        id: holderId,
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        status: "queued",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt: null,
+        lastOutputAt: holderLastSignal,
+        contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+        livenessState: "advanced",
+        nextAction: null,
+        createdAt: holderLastSignal,
+        updatedAt: holderLastSignal,
+      },
+    ]);
+    await db
+      .update(issues)
+      .set({ executionRunId: holderId, checkoutRunId: holderId, executionLockedAt: holderLastSignal })
+      .where(eq(issues.id, seeded.issueId));
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    // Dropping `siblingStillExecuting` from `attributableEndAt` turns this red.
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(result.scanned).toBe(1);
+    expect(result.created).toBe(1);
+    expect(review?.description ?? "").toContain("Primary trigger: `runaway_execution`");
+    // The episode and the burn agree. Holder-only these read 13h and 2h, which is
+    // the contradiction the tail clamp was added to suppress; fixing attribution
+    // removes it instead.
+    expect(review?.description ?? "").toContain("executing continuously for 13h 0m");
+    expect(review?.description ?? "").toContain("Current active elapsed time: 13h 0m");
+    expect(review?.description ?? "").toContain("13h 0m executing");
+  });
+
+  // BLO-27698 B3b (Ally review on 06b87852): the tail extension above must be
+  // bounded by the sibling's own live span, not applied as a duration-blind
+  // boolean. These two cases pin the two halves of that bound: a sibling whose
+  // live segment began *after* the holder parked cannot resurrect the park
+  // before it, and the sibling's own burn still counts in full.
+  //
+  // The reachable shape is a *promoted* sibling, not a freshly dispatched one,
+  // and the difference is load-bearing. `activeStartedAt` is `max(startedAt)`
+  // over the issue's runs, so a sibling that merely started 10m ago also drags
+  // the episode anchor to 10m ago and bounds `elapsedMs` on its own — the
+  // review's worked example is not reachable that way. A run promoted out of a
+  // park keeps its pre-park `startedAt` (promoteDueScheduledRetry writes only
+  // status/error/updatedAt; the claim preserves `startedAt ?? claimedAt`), so
+  // the anchor stays at 13h while the live segment is minutes old. That is the
+  // gap `runLiveInterval`/`liveSegmentStartedAt` already exclude for the holder,
+  // and what `siblingSegmentStart` extends issue-wide.
+  //
+  // Mutation control for both: drop `siblingSegmentStart` from `segmentStart`
+  // and both turn red — the first fires `long_active_duration` reporting 13h of
+  // "active elapsed time" for an episode that was 11h of park, and the second
+  // re-reports 7h of burn as 13h.
+  const seedParkedHolderWithPromotedSibling = async (now: Date, siblingParkEndedAt: Date) => {
+    const startedAt = new Date(now.getTime() - 13 * 60 * 60 * 1000);
+    // The holder's last signal — `attributableEndAt` if liveness were holder-only.
+    const holderLastSignal = new Date(now.getTime() - 11 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+    });
+    const siblingId = randomUUID();
+    const holderId = randomUUID();
+    await db.insert(heartbeatRuns).values([
+      {
+        // Promoted sibling: `startedAt` is the preserved pre-park dispatch, so it
+        // anchors the episode at 13h, while its live span starts at the park
+        // boundary. Signalling as of `now`, so it is genuinely live.
+        id: siblingId,
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        status: "running",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt,
+        scheduledRetryAt: siblingParkEndedAt,
+        lastOutputAt: new Date(now.getTime() - 60 * 1000),
+        contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+        livenessState: "advanced",
+        nextAction: null,
+        createdAt: startedAt,
+        updatedAt: startedAt,
+      },
+      {
+        // Parked holder, with a `startedAt` so it is not `dispatch_backlog` and
+        // not `currentHolderNeverDispatched` — nothing else holds the trigger.
+        // `queued` returns `lastSignal` from `nonLiveExecutionHoldSince`.
+        id: holderId,
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        status: "queued",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt,
+        lastOutputAt: holderLastSignal,
+        contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+        livenessState: "advanced",
+        nextAction: null,
+        createdAt: holderLastSignal,
+        updatedAt: holderLastSignal,
+      },
+    ]);
+    await db
+      .update(issues)
+      .set({ executionRunId: holderId, checkoutRunId: holderId, executionLockedAt: holderLastSignal })
+      .where(eq(issues.id, seeded.issueId));
+    return seeded;
+  };
+
+  it("does not resurrect a holder park when a sibling has only just gone live", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    // 10 minutes of live segment — far short of the 6h bar on its own, but enough
+    // to make `siblingStillExecuting` true and so, on a blind boolean, to
+    // re-attribute the holder's whole 11h park into `elapsedMs`.
+    const seeded = await seedParkedHolderWithPromotedSibling(now, new Date(now.getTime() - 10 * 60 * 1000));
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.scanned).toBe(1);
+    expect(result.created).toBe(0);
+  });
+
+  it("counts a live sibling's own burn in full without the park before it", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    // 7h of live segment, beginning 4h after the holder parked: over the 6h bar
+    // either way, which is what makes this the load-bearing half — it
+    // distinguishes "bounded" from "suppressed".
+    const seeded = await seedParkedHolderWithPromotedSibling(now, new Date(now.getTime() - 7 * 60 * 60 * 1000));
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(result.created).toBe(1);
+    expect(review?.description ?? "").toContain("Primary trigger: `runaway_execution`");
+    expect(review?.description ?? "").toContain("executing continuously for 7h 0m");
+    expect(review?.description ?? "").toContain("Current active elapsed time: 7h 0m");
+    // The excluded 6h is still disclosed rather than silently dropped — the
+    // second half of the defect, where `trailingHoldMs` went to 0 and the line
+    // stopped rendering, so the park was neither counted out nor visible as in.
+    expect(review?.description ?? "").toContain("Excluded as non-live execution hold: 6h 0m");
+  });
+
   it("does not suppress no-comment productivity reviews for future monitor waits", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue({
@@ -6782,6 +9066,74 @@ describeEmbeddedPostgres("productivity review service", () => {
       .where(eq(activityLog.action, "issue.productivity_review_suppressed_open_review_closed"));
     expect(closeEntries).toHaveLength(1);
     expect(closeEntries[0]?.entityId).toBe(reviewId);
+    expect(closeEntries[0]?.details).toMatchObject({
+      suppressedBy: "terminal_source",
+      sourceStatus: "done",
+      sourceIssueId: seeded.issueId,
+    });
+  });
+
+  // BLO-27698 B3b (Ally review on 2e95b50b) — `runaway_execution` rides the same
+  // `done`-retires arm as `long_active_duration`, for the same reason: it is a
+  // runtime/cost alarm on a run executing *right now*, so once the source
+  // reaches `done` that run has finished and every option in its rubric ("let it
+  // finish", "bound it", "route to platform") is a question about a run that no
+  // longer exists. Without this the review sits unanswerable in a reviewer's
+  // queue forever.
+  //
+  // Deliberately paired with the sibling above rather than parameterised: the
+  // two arms are separate per-trigger decisions, and `cancelled` must still
+  // retire neither.
+  it("closes an open runaway-execution productivity review once its source issue is done", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "done",
+      startedAt: new Date(now.getTime() - 13 * 60 * 60 * 1000),
+    });
+    const reviewId = randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Review productivity for source",
+      status: "todo",
+      priority: "medium",
+      parentId: seeded.issueId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await logActivity(db, {
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: reviewId,
+      details: {
+        trigger: "runaway_execution",
+        sourceIssueId: seeded.issueId,
+      },
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    // Dropping `runaway_execution` from the `done` arm turns this red.
+    expect(result.closedTerminalSourceReviews).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.status).toBe("done");
+
+    const closeEntries = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_suppressed_open_review_closed"));
+    expect(closeEntries).toHaveLength(1);
     expect(closeEntries[0]?.details).toMatchObject({
       suppressedBy: "terminal_source",
       sourceStatus: "done",
@@ -7807,5 +10159,223 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.failed).toBe(0);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.requestDepth).toBe(MAX_ISSUE_REQUEST_DEPTH);
+  });
+
+  // BLO-27515: the exact BLO-24166 shape. The monitor's declared gate
+  // (`pr:blockcast/paperclip#1281:merged`) was satisfied 16 minutes after its
+  // last poll, polling had already stopped, and the review then fired at the 6h
+  // mark on an issue whose work had landed 2.5 days earlier. The terminal-gate
+  // reconciler records the resolution board-side; generation must consume that
+  // record and file nothing.
+  async function armTerminatedGateMonitor(input: { issueId: string; gateSignals: string[] }) {
+    await db
+      .update(issues)
+      .set({
+        monitorNextCheckAt: null,
+        monitorScheduledBy: "assignee",
+        monitorLastTriggeredAt: new Date("2026-04-28T05:00:00.000Z"),
+        monitorAttemptCount: 3,
+        executionState: {
+          status: "idle",
+          currentStageId: null,
+          currentStageIndex: null,
+          currentStageType: null,
+          currentParticipant: null,
+          returnAssignee: null,
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          monitor: {
+            status: "triggered",
+            nextCheckAt: null,
+            lastTriggeredAt: "2026-04-28T05:00:00.000Z",
+            attemptCount: 3,
+            notes: "merged=NO",
+            scheduledBy: "assignee",
+            gateSignals: input.gateSignals,
+            gateSource: "gates",
+            convergenceCount: 3,
+            clearedAt: null,
+            clearReason: null,
+          },
+        } as never,
+      })
+      .where(eq(issues.id, input.issueId));
+    for (const signal of input.gateSignals) {
+      const match = /^pr:([^:]+):[a-z0-9_-]+$/.exec(signal);
+      if (!match) continue;
+      await db.insert(issueWorkProducts).values({
+        companyId: (await db.select({ companyId: issues.companyId }).from(issues).where(eq(issues.id, input.issueId)))[0]!.companyId,
+        issueId: input.issueId,
+        type: "pull_request",
+        provider: "github",
+        externalId: match[1],
+        title: match[1],
+        status: "merged",
+        metadata: { source: "github_pull_request_webhook" },
+        sourceTrust: {
+          preset: "standard",
+          disposition: "promoted",
+          promotedByActorType: "system",
+          promotedByActorId: "github_pull_request_webhook",
+        },
+      });
+    }
+  }
+
+  async function recordTerminalGateResolution(input: {
+    companyId: string;
+    issueId: string;
+    gateSignals: string[];
+  }) {
+    await db.insert(issueComments).values({
+      companyId: input.companyId,
+      issueId: input.issueId,
+      authorType: "system",
+      idempotencyKey: terminalGateResolutionIdempotencyKey(input.gateSignals),
+      body: "Terminal gate resolved (test fixture).",
+    });
+  }
+
+  it("does not file a long_active_duration review when the terminal gate is already resolved (BLO-27515)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    const gateSignals = ["pr:blockcast/paperclip#1281:merged"];
+    await armTerminatedGateMonitor({ issueId: seeded.issueId, gateSignals });
+    await recordTerminalGateResolution({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      gateSignals,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    // Countable on its own, like every other suppression: a silenced review that
+    // is invisible is the failure mode this whole area keeps relearning.
+    expect(result.terminalGateResolvedSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+
+    const suppressions = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_suppressed"));
+    expect(suppressions).toHaveLength(1);
+    expect((suppressions[0]?.details as { suppressedBy?: string })?.suppressedBy)
+      .toBe("terminal_gate_resolved");
+  });
+
+  it("still files the review when the same monitor gate has NOT been resolved (BLO-27515)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await armTerminatedGateMonitor({
+      issueId: seeded.issueId,
+      gateSignals: ["pr:blockcast/paperclip#1281:merged"],
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.terminalGateResolvedSuppressed).toBe(0);
+    expect(result.created).toBe(1);
+  });
+
+  it("does not let a resolution recorded for a different gate set suppress the review (BLO-27515)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await armTerminatedGateMonitor({
+      issueId: seeded.issueId,
+      gateSignals: ["pr:blockcast/paperclip#1281:merged"],
+    });
+    // A re-arm on a new gate leaves the old resolution comment behind. It must
+    // stop matching, or oversight never resumes.
+    await recordTerminalGateResolution({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      gateSignals: ["pr:blockcast/paperclip#1400:merged"],
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.terminalGateResolvedSuppressed).toBe(0);
+    expect(result.created).toBe(1);
+  });
+
+  it("still files when a non-closable trigger co-fires with long_active_duration under a resolved gate (BLO-27515)", async () => {
+    // A resolved gate explains elapsed wall-clock. It does not explain runs that
+    // executed and burned cost, so `high_churn` evidence must survive it — the
+    // same evasion `isDependencyBlockedClosableTriggerSet` refuses.
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    const gateSignals = ["pr:blockcast/paperclip#1281:merged"];
+    await armTerminatedGateMonitor({ issueId: seeded.issueId, gateSignals });
+    await recordTerminalGateResolution({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      gateSignals,
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      withRunComments: true,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.terminalGateResolvedSuppressed).toBe(0);
+    expect(result.created).toBe(1);
+  });
+
+  it("resumes long-active oversight after the terminal-gate quiet window expires (BLO-27515)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    const gateSignals = ["pr:blockcast/paperclip#1281:merged"];
+    await armTerminatedGateMonitor({ issueId: seeded.issueId, gateSignals });
+    await db.insert(issueComments).values({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      authorType: "system",
+      idempotencyKey: terminalGateResolutionIdempotencyKey(gateSignals),
+      body: "Terminal gate resolved.",
+      createdAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.terminalGateResolvedSuppressed).toBe(0);
+    expect(result.created).toBe(1);
   });
 });

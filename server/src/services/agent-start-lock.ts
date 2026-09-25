@@ -25,9 +25,25 @@ import { logger } from "../middleware/logger.js";
  *
  * There is no timeout bypass. A timeout must never downgrade mutual exclusion —
  * that was the defect. Liveness comes instead from (a) removing the re-entrancy
- * that used to self-deadlock and (b) bounding the critical section's work. A
- * section that overruns `LOCK_HELD_WARN_MS` is logged loudly rather than
- * silently overtaken.
+ * that used to self-deadlock and (b) bounding the critical section's work.
+ *
+ * ⚠️ (b) is an expectation, not an enforced invariant, and PEN-3305 is what it
+ * costs when it does not hold. Nothing here bounds `fn`: the lock is released
+ * if and only if `fn` settles, so a section that never settles holds its
+ * agent's lock for the life of the process. The agent then stops dispatching
+ * while reading `status: idle` / `errorReason: null` / `orgChainHealth:
+ * healthy`. Measured 2026-09-15/16: five agents across two companies went dark
+ * for 6–19 h each and the outage ended only when the pod was replaced — an
+ * in-process lock dies with the process, which is why a restart "fixed" it.
+ *
+ * This module does NOT solve that, and must not be read as having solved it.
+ * What it does is refuse to hide it: an overrunning section is re-logged for as
+ * long as it is held (escalating to `error` past `LOCK_HELD_ERROR_MS`) and its
+ * hold age is exported per agent via {@link describeHeldAgentStartLocks}. The
+ * real fix is to make the critical section's awaits genuinely abortable so `fn`
+ * *rejects* — which releases the lock through the existing `finally` without
+ * ever running two sections at once. Abandoning a still-pending `fn` on a timer
+ * would reintroduce the original defect, so it is not an option here.
  *
  * Re-entrancy matters here and is not hypothetical. `startNextQueuedRunForAgent`
  * calls `reapOrphanedRuns`, which is not agent-scoped and can reach
@@ -62,6 +78,16 @@ import { logger } from "../middleware/logger.js";
 const LOCK_HELD_WARN_MS = 30_000;
 
 /**
+ * Escalate the overrun log from `warn` to `error` past this (PEN-3305).
+ *
+ * A section that has held the lock for five minutes is no longer "falling
+ * behind" — dispatch for that agent has stopped, and nothing in this module
+ * will ever restart it. Five minutes is well above any legitimate section (the
+ * healthy case is sub-second) and well below the hours a real wedge runs for.
+ */
+const LOCK_HELD_ERROR_MS = 5 * 60_000;
+
+/**
  * Maximum number of distinct agents whose locks may be held on a single async
  * path. Bounds reap → promote → dispatch amplification; beyond this depth a
  * nested dispatch is detached to top level rather than recursing further, so
@@ -74,6 +100,15 @@ const runningByAgent = new Map<string, Promise<void>>();
 
 /** The single coalesced follow-up queued behind the running section, if any. */
 const followUpByAgent = new Map<string, Promise<unknown>>();
+
+/**
+ * When each agent's currently-held section started, for the liveness gauge.
+ *
+ * Kept in step with {@link runningByAgent} — same key, same lifetime, same
+ * marker-identity guard on delete — so the two cannot disagree about whether an
+ * agent's lock is held.
+ */
+const heldSinceByAgent = new Map<string, number>();
 
 /**
  * Follow-up passes that were scheduled without a waiter, because scheduling
@@ -119,6 +154,7 @@ async function runExclusively<T>(agentId: string, fn: () => Promise<T>): Promise
     settleMarker = resolve;
   });
   runningByAgent.set(agentId, marker);
+  heldSinceByAgent.set(agentId, startedAtMs);
 
   // Wrap so a synchronous throw from `fn` surfaces as a rejection rather than
   // escaping before the lock bookkeeping below is installed.
@@ -127,19 +163,49 @@ async function runExclusively<T>(agentId: string, fn: () => Promise<T>): Promise
   // and still lets the coalesced follow-up run.
   void execution.then(settleMarker, settleMarker);
 
-  const warnTimer = setTimeout(() => {
-    logger.warn(
-      { agentId, heldMs: Date.now() - startedAtMs, warnAfterMs: LOCK_HELD_WARN_MS },
-      "agent start lock held longer than expected; queued-run dispatch is falling behind",
-    );
+  // Repeating, NOT one-shot (PEN-3305). This was a `setTimeout`, so a section
+  // that wedged forever logged exactly one line — at t+30s — and was then
+  // invisible for as long as it held the lock. A 16-hour hold and a 31-second
+  // one produced identical evidence, which is why a multi-agent, multi-company
+  // dispatch outage ran for 19 hours without anything reporting it. Re-logging
+  // makes the hold's *duration* readable from the log alone, and escalating
+  // past LOCK_HELD_ERROR_MS separates "slow" from "stopped".
+  let lastLoggedAtMs = startedAtMs;
+  let loggedStopped = false;
+  const warnTimer = setInterval(() => {
+    const nowMs = Date.now();
+    const heldMs = nowMs - startedAtMs;
+    const stopped = heldMs >= LOCK_HELD_ERROR_MS;
+    // Past the error threshold the section is not coming back on its own, so
+    // back the cadence off from 30s to LOCK_HELD_ERROR_MS: a multi-hour wedge
+    // should be loud enough to alert on, not thousands of identical lines.
+    // Never delay the FIRST error though — that is the line an alert fires on,
+    // and gating it behind the backoff would push it ~2x past the threshold.
+    if (stopped && loggedStopped && nowMs - lastLoggedAtMs < LOCK_HELD_ERROR_MS) return;
+    lastLoggedAtMs = nowMs;
+    const fields = { agentId, heldMs, warnAfterMs: LOCK_HELD_WARN_MS };
+    if (stopped) {
+      loggedStopped = true;
+      logger.error(
+        { ...fields, errorAfterMs: LOCK_HELD_ERROR_MS },
+        "agent start lock held far past its budget; queued-run dispatch for this agent has stopped",
+      );
+    } else {
+      logger.warn(fields, "agent start lock held longer than expected; queued-run dispatch is falling behind");
+    }
   }, LOCK_HELD_WARN_MS);
   warnTimer.unref?.();
 
   try {
     return await execution;
   } finally {
-    clearTimeout(warnTimer);
-    if (runningByAgent.get(agentId) === marker) runningByAgent.delete(agentId);
+    clearInterval(warnTimer);
+    // Identity-guarded: if a later section already took this agent's lock, the
+    // map entries are ITS state, not ours, and must not be cleared.
+    if (runningByAgent.get(agentId) === marker) {
+      runningByAgent.delete(agentId);
+      heldSinceByAgent.delete(agentId);
+    }
   }
 }
 
@@ -275,6 +341,31 @@ export function runDetachedFromAgentStartLock<T>(fn: () => T): T {
 }
 
 /**
+ * Snapshot every currently-held agent start lock and how long it has been held.
+ *
+ * Exported because this module's failure mode is *silence*, not noise
+ * (PEN-3305). A wedged section holds its agent's lock forever — there is no
+ * timeout, by design (see the header) — and the agent then presents as
+ * `status: idle` / `errorReason: null` / `orgChainHealth: healthy` while its
+ * queued runs pile up untouched. Measured 2026-09-15/16: five agents across
+ * two companies went dark for 6–19 h each, no surface anywhere reported it,
+ * and the outage ended only when the control-plane pod was replaced.
+ *
+ * Deliberately synchronous and DB-free: the caller publishes this on the
+ * `/metrics` request path, because a section wedged on a pool acquisition is
+ * exactly when a DB-backed collector would itself be stuck and report nothing.
+ * Same reasoning as `refreshDbPoolMetrics`.
+ */
+export function describeHeldAgentStartLocks(): Array<{ agentId: string; heldMs: number }> {
+  const nowMs = Date.now();
+  const held: Array<{ agentId: string; heldMs: number }> = [];
+  for (const [agentId, startedAtMs] of heldSinceByAgent) {
+    held.push({ agentId, heldMs: Math.max(0, nowMs - startedAtMs) });
+  }
+  return held;
+}
+
+/**
  * Test-only: await every dispatch pass that was scheduled without a waiter.
  *
  * A detached pass can itself schedule another, so this loops until the set is
@@ -291,4 +382,5 @@ export function _resetAgentStartLocksForTesting() {
   runningByAgent.clear();
   followUpByAgent.clear();
   detachedFollowUps.clear();
+  heldSinceByAgent.clear();
 }

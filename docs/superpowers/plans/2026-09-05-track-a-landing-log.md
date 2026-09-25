@@ -473,3 +473,181 @@ deployed commit" clause is unusable as written — third measurement, unchanged.
 `gh api "repos/Blockcast/paperclip/actions/runs?status=waiting"` → `total_count: 0`. The slot is
 **empty**: `34019412658` (the originally-named stale run) and `34324444180` are both terminal, so
 the fleet deploy mutex is released. I dispatched nothing on this row in any run.
+
+---
+
+# Track C landing log — routines and the governance sweep
+
+Appended by CTO for [BLO-32241](https://paperclip.blockcast.net/BLO/issues/BLO-32241) (Track C3–C4).
+Track A's sections above are unmodified. The 2026-09-04 plan names this file as the shared landing
+log for all five tracks, so C/B/D/E append their own sections here rather than opening parallel logs.
+
+## C1 — landing classifier script
+
+Owned by [BLO-32240](https://paperclip.blockcast.net/BLO/issues/BLO-32240) (Ally). Not filled here.
+
+## C2 — landing routine that runs the classifier
+
+Owned by [BLO-32511](https://paperclip.blockcast.net/BLO/issues/BLO-32511) (CTO), blocked by C1.
+
+The *original* C2 — adding a `human_gate_aged` rule to the `Agent health & stalled-issue check`
+routine — was **dropped** by engineering-review decision D2. The governance sweep already carries
+the ratified priority-weighted human-gated ageing rule
+([BLO-19130](https://paperclip.blockcast.net/BLO/issues/BLO-19130)), and its own spec says
+*"Do **not** stand up a second routine."* Routine `a03b2236-a1f8-4014-806f-aeccf2374da8` was
+therefore left untouched, verified this run: `human_gate_aged` occurs **0** times in its
+description and it remains at **revision 50**. Nothing needed reverting.
+
+## C3 — governance sweep un-paused (2026-09-07)
+
+Routine `8b764d66-b598-4517-a249-e9a1dee82f06`
+(*Weekly governance sweep — AC/verifying-signal + human-gated ageing*), located by title with
+exactly one match among the company's 18 routines, moved `paused` → `active`.
+
+It had not fired since **2026-08-17T09:00:12Z**, so it had missed two Mondays (08-24 and 08-31),
+with a third (09-07) due at 09:00Z on the day of the write. That silence is cause (4) in the plan: nothing was ageing
+the human-assigned `in_review` queue while 101 issues sat on one human for 22–87 days.
+
+**Invariants asserted against the LIVE description before activating.** Counts are fixed-string
+*occurrences*, not matching lines, so a repeated phrase on one line cannot inflate a count:
+
+| Assertion | Required | Measured |
+|---|---|---|
+| `This routine is REPORT-ONLY. It cancels nothing, ever.` | = 1 | 1 |
+| `It never calls cancel, and never modifies any issue` | = 1 | 1 |
+| `resolveAcPolicyFilingTarget` | >= 1 | 2 |
+| `Human-gated ageing escalation (BLO-19130)` | = 1 | 1 |
+| `Do **not** stand up a second routine` | = 1 | 1 |
+
+No count was zero, so activation proceeded. A supplementary audit for issue-mutating verbs
+(`paperclipUpdateIssue`, `status: "cancelled"`, `cancelIssue`) returned **zero** matches, consistent
+with the report-only contract. No cancel step was added, and none ever should be: CEO ruling
+[BLO-19484](https://paperclip.blockcast.net/BLO/issues/BLO-19484) retired that step permanently
+after 0 safe executions in 4 runs.
+
+**The write, and why it could not corrupt the spec.** The PATCH body was exactly
+`{"status":"active","baseRevisionId":"99d18d94-1bfa-4fdc-b95a-05157cadbc12"}` — the server
+shallow-merges, so the 27,317-byte description never went on the wire and never passed through a
+model context. Read back live after the write:
+
+- `status`: **`active`**
+- revision: 14 → 15 (`325734e5-c23c-4a3d-b082-c575ddeddf69`), a status-only revision
+- description: **byte-identical** to the pre-PATCH capture (`cmp` clean), with all five invariants
+  re-asserted at the same counts afterwards
+- trigger `0606ff6f-5445-4f1e-b835-9da8dcf2fc58`: `0 9 * * 1` UTC, `enabled: true` — **unchanged**
+
+**Why un-pausing with two missed fires is safe — and what actually fired.** Both policies were
+confirmed *before* the write: `catchUpPolicy: skip_missed` (missed Mondays are not replayed) and
+`concurrencyPolicy: skip_if_active` (no overlapping runs). The pre-write prediction was that exactly
+one fire was due, at 2026-09-07T09:00:00Z, and that a replaying catch-up policy would instead have
+queued three sweeps at once.
+
+**Observed, from `GET /api/routines/8b764d66-…/runs` after the fact — recorded because the
+mechanism was not the one predicted: activation itself fired the routine immediately.** Run
+`b711b104-125d-4615-8246-9305eef620f4` was created at `2026-09-07T08:31:31.993Z`, 65 seconds
+*before* the C4 capture below, with `source: schedule` and `triggeredAt: 2026-08-24T09:00:00.000Z`
+(`__paperclipRoutineWindowClosesAt: 2026-09-07T09:00:00.000Z`) — a catch-up run stamped with the
+08-24 slot, not a fire at the cron boundary. The 08-31 slot was not replayed. The 09:00:00Z boundary
+fire (run `358312e5-7c6c-47eb-96fd-431f083e2d81`, created 09:00:05Z) was then `skipped` with
+`coalescedIntoRunId: b711b104-…`, consistent with `skip_if_active` — `b711b104` was still running and
+only completed at `18:45:53.410Z`. All 16 prior executions of this routine (2026-05-04 → 2026-08-17)
+triggered between `09:00:04` and `09:00:34`; this is the only one that has ever fired off-boundary.
+
+The safety *outcome* held — one execution, not three, and nothing was cancelled — but
+`skip_missed` did not mean "no run until the next cron slot". The next agent to un-pause a routine
+should plan for one immediate fire on activation, and should verify it against `/runs`, not against
+the routine row (see the C4 note below).
+
+## C4 — routine evidence
+
+Captured to `/tmp/track-c-evidence.json` at 2026-09-07T08:32:37Z and reproduced verbatim:
+
+```json
+{
+  "capturedAt": "2026-09-07T08:32:37Z",
+  "capturedBy": "CTO 386c81e8-e454-41ba-8e1d-7bb692331185",
+  "issue": "BLO-32241",
+  "track": "C3-C4",
+  "routines": [
+    {
+      "id": "8b764d66-b598-4517-a249-e9a1dee82f06",
+      "title": "Weekly governance sweep — AC/verifying-signal + human-gated ageing",
+      "status": "active",
+      "role": "Track C3 target - un-paused this run",
+      "latestRevisionId": "325734e5-c23c-4a3d-b082-c575ddeddf69",
+      "latestRevisionNumber": 15,
+      "catchUpPolicy": "skip_missed",
+      "concurrencyPolicy": "skip_if_active",
+      "activityGatePolicy": "always",
+      "activityGateScope": "company",
+      "assigneeAgentId": "386c81e8-e454-41ba-8e1d-7bb692331185",
+      "parentIssueId": "7b54e724-63d2-45e6-a4fb-43fb94777e6c",
+      "lastTriggeredAt": "2026-08-17T09:00:12.695Z",
+      "lastEnqueuedAt": "2026-08-17T09:00:12.695Z",
+      "triggers": [
+        {
+          "id": "0606ff6f-5445-4f1e-b835-9da8dcf2fc58",
+          "kind": "schedule",
+          "cronExpression": "0 9 * * 1",
+          "timezone": "UTC",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "a03b2236-a1f8-4014-806f-aeccf2374da8",
+      "title": "Agent health & stalled-issue check",
+      "status": "active",
+      "role": "old C2 target - DROPPED per D2, deliberately untouched",
+      "latestRevisionId": "ab2d8e3b-10b8-4d41-a4dc-2eb6e03298fe",
+      "latestRevisionNumber": 50,
+      "catchUpPolicy": "enqueue_missed_with_cap",
+      "concurrencyPolicy": "always_enqueue",
+      "updatedAt": "2026-09-07T06:07:45.403Z",
+      "updatedByAgentId": "d2ade02d-112c-4da2-b61f-2301254a154c",
+      "humanGateAgedOccurrences": 0,
+      "triggers": [
+        {
+          "id": "fac2860d-304d-4346-ae1e-9500081a2724",
+          "kind": "schedule",
+          "cronExpression": "7 */6 * * *",
+          "timezone": "UTC",
+          "enabled": true
+        }
+      ]
+    }
+  ],
+  "c3Invariants": {
+    "This routine is REPORT-ONLY. It cancels nothing, ever.": 1,
+    "It never calls cancel, and never modifies any issue": 1,
+    "resolveAcPolicyFilingTarget": 2,
+    "Human-gated ageing escalation (BLO-19130)": 1,
+    "Do **not** stand up a second routine": 1
+  },
+  "descriptionUnchangedByPatch": true,
+  "firstFireDueAt": "2026-09-07T09:00:00Z"
+}
+```
+
+**Three fields in that block were already stale at `capturedAt`.** The capture at `08:32:37Z` is 65
+seconds *after* run `b711b104` was created at `08:31:31.993Z`, yet `lastTriggeredAt` and
+`lastEnqueuedAt` still read `2026-08-17T09:00:12.695Z`, and `firstFireDueAt` records the 09:00
+prediction rather than the fire that had already happened. The JSON is left verbatim above; the
+corrected values are: first fire at `2026-09-07T08:31:31.993Z` (run `b711b104-…`), and the routine
+row's `lastTriggeredAt` = `lastEnqueuedAt` now read `2026-09-07T09:00:00.000Z` (live 2026-09-14) —
+the boundary run's stamp. That is the cause worth one line: the routine row's `lastTriggeredAt` was
+not advanced by the on-activation catch-up run at all, so a capture keyed off the routine row cannot
+see that fire. Tracks B/D/E reusing this capture pattern should read `/api/routines/<id>/runs`
+alongside the routine row.
+
+### First fire after un-pausing
+
+An earlier revision of this section stated the sweep had **not** fired as of 2026-09-07T08:38Z.
+**That was wrong** — it had fired about 6.5 minutes before that observation. Run
+`b711b104-125d-4615-8246-9305eef620f4` (created `2026-09-07T08:31:31.993Z`, `source: schedule`,
+`triggeredAt: 2026-08-24T09:00:00.000Z`, `completed` at `18:45:53.410Z`) minted report issue
+[BLO-32535](https://paperclip.blockcast.net/BLO/issues/BLO-32535) at `08:31:32.147Z`
+(`originKind: routine_execution`, `originId: 8b764d66-…`, `originRunId: b711b104-…`). BLO-32535
+started at `15:32:01.144Z` and is `done` (`completedAt: 2026-09-07T18:45:52.507Z`). The 09:00:00Z
+boundary run `358312e5-7c6c-47eb-96fd-431f083e2d81` was `skipped` and coalesced into `b711b104`.
+The human-gated ageing rows are BLO-32535's own output and are deliberately not transcribed here.

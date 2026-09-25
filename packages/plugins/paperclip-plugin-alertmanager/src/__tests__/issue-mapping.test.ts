@@ -5,6 +5,7 @@ import {
   buildIssueTitle,
   effectiveAlertStatus,
   extractObservabilityUrls,
+  isTerminalSeverity,
   renderDrillInLinks,
   severityToPriority,
 } from "../issue-mapping.js";
@@ -35,10 +36,16 @@ describe("severityToPriority", () => {
     expect(severityToPriority("critical")).toBe("critical");
     expect(severityToPriority("warning")).toBe("high");
     expect(severityToPriority("info")).toBe("medium");
+    // BLO-27018: `page` and `ticket` are part of the emitted vocabulary, not
+    // unknown values. `page` previously appeared in the "unknown severities"
+    // case below, which pinned the defect: the fleet's highest-urgency alert
+    // was mapped to `medium`.
+    expect(severityToPriority("page")).toBe("critical");
+    expect(severityToPriority("ticket")).toBe("low");
   });
 
   it("falls back to medium for unknown severities", () => {
-    expect(severityToPriority("page")).toBe("medium");
+    expect(severityToPriority("nonsense")).toBe("medium");
     expect(severityToPriority(undefined)).toBe("medium");
     expect(severityToPriority("")).toBe("medium");
   });
@@ -56,6 +63,25 @@ describe("severityToPriority", () => {
     expect(
       severityToPriority("warning", { critical: "high" }),
     ).toBe("high");
+  });
+});
+
+describe("isTerminalSeverity (BLO-24177)", () => {
+  it("matches the built-in default terminal severity (none)", () => {
+    expect(isTerminalSeverity("none")).toBe(true);
+  });
+
+  it("does not match accepted severities by default", () => {
+    expect(isTerminalSeverity("critical")).toBe(false);
+    expect(isTerminalSeverity("warning")).toBe(false);
+    expect(isTerminalSeverity("info")).toBe(false);
+    expect(isTerminalSeverity(undefined)).toBe(false);
+    expect(isTerminalSeverity("")).toBe(false);
+  });
+
+  it("matches case-insensitively and trims whitespace", () => {
+    expect(isTerminalSeverity("NONE")).toBe(true);
+    expect(isTerminalSeverity(" None ")).toBe(true);
   });
 });
 

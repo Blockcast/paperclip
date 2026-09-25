@@ -9,11 +9,19 @@ on:
       - checks_requested
 
 concurrency:
-  # Pull requests are stable by number. A merge-group head SHA changes every
-  # time GitHub re-stages the queue, so key the sole active build for each
-  # merge-queue base branch instead. The repository merge queue is configured
-  # with maximumEntriesToBuild=1; a newer generation must replace the old one.
-  group: pr-${{ github.event.pull_request.number || github.event.merge_group.base_ref || github.run_id }}
+  # Pull requests are stable by number. Merge groups key on `head_ref`, which is
+  # unique per queue entry AND per generation (`pr-1778-2ace7b68` vs
+  # `pr-1778-e34a14b0` after a re-stage). `base_ref` is a constant
+  # (`refs/heads/master`), so it collapses every merge-group build into one slot
+  # and, with cancel-in-progress, the newer entry kills the older one. That is
+  # invisible at maximumEntriesToBuild=1 but silently defeats any raise above 1:
+  # the head's build would be cancelled by the entry queued behind it (BLO-22902).
+  #
+  # Superseding a destroyed generation does not depend on this key. GitHub
+  # cancels a destroyed merge group's runs itself: run 08:48:57Z
+  # (pr-1770-2ace7b68) was cancelled at 09:05:23Z, 73s before any successor run
+  # existed, so no concurrency rule could have done it (measured 2026-09-13).
+  group: pr-${{ github.event.pull_request.number || github.event.merge_group.head_ref || github.run_id }}
   cancel-in-progress: true
 
 env:
@@ -115,6 +123,18 @@ jobs:
       - name: Validate ARC runner labels
         if: ${{ !cancelled() }}
         run: node ./scripts/check-github-runner-labels.mjs
+
+      - name: Ban inline transaction-handle re-derivations (BLO-34812)
+        # BLO-34656 swept 21 copies of this alias out of 20 files and left a
+        # comment as the only thing holding it at zero. Those 21 copies are
+        # the evidence that a comment does not hold.
+        if: ${{ !cancelled() }}
+        run: node ./scripts/check-db-transaction-alias.mjs
+
+      - name: Test transaction-handle alias ban (BLO-34812)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-db-transaction-alias.test.mjs
+        timeout-minutes: 1
 
       - name: Validate Dockerfile deps stage
         if: ${{ !cancelled() }}
@@ -302,6 +322,11 @@ jobs:
         run: node --test ./scripts/__tests__/policy-step-kill-classifier.test.mjs
         timeout-minutes: 1
 
+      - name: Test PR work-product backfill link rule
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/backfill-pr-work-products.test.mjs
+        timeout-minutes: 1
+
       - name: Test @penstock publish-drift comparison
         if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/penstock-publish-drift.test.mjs
@@ -310,6 +335,11 @@ jobs:
       - name: Test Ally agent instruction contract
         if: ${{ !cancelled() }}
         run: node --test ./scripts/ally-agent-idempotency-contract.test.mjs
+        timeout-minutes: 1
+
+      - name: Test scheduled-guard liveness detector (PEN-3281)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-scheduled-guard-liveness.test.mjs
         timeout-minutes: 1
 
       - name: Reject git push in adapter/runtime code
@@ -363,6 +393,18 @@ jobs:
         run: node --test ./.github/scripts/tests/check-pr-test-coverage.test.mjs
         timeout-minutes: 1
 
+      # BLO-26636. This suite existed but was wired into no workflow, so it had
+      # never run — which is exactly why the two defects it now pins survived:
+      # a login allowlist that matched neither deployment's App (so the gate
+      # could never update its own comment), and a `pull_request_target` trigger
+      # list missing `edited` (so the fix the gate asks for re-ran nothing).
+      # Both are properties of the commitperclip gate that only fail on a live
+      # PR, days later, as a stalled review.
+      - name: Test commitperclip quality-gate orchestrator (BLO-26636)
+        if: ${{ !cancelled() }}
+        run: node --test ./.github/scripts/tests/run-quality-gates.test.mjs
+        timeout-minutes: 1
+
       # Guards the one property of the BLO-28888 soak workflow that cannot be
       # re-checked after the fact: that it stays dispatch-only. Adding its
       # ~50-90 minutes to a per-PR trigger would be invisible until it was
@@ -398,12 +440,22 @@ jobs:
       # rarely to observe a 6h condition, which no assertion about the script
       # itself can catch. Those tests pin the sampling cadence and the step
       # ORDER the cadence depends on.
-      - name: Test stuck production-approval escalation (PEN-2848, BLO-33400)
+      #
+      # PEN-3315 adds two more. The supersede suite pins that guard (1)'s new
+      # bounded exit approves nothing and refuses a run whose target is still
+      # current; the record suite pins that superseding a run cannot reset the
+      # escalation's stall clock. Both properties are unobservable in production
+      # until a deploy is already stuck for hours, which is the wrong moment to
+      # discover either of them regressed.
+      - name: Test stuck production-approval escalation (PEN-2848, BLO-33400, PEN-3315)
         if: ${{ !cancelled() }}
         run: |
           node --test \
             ./.github/scripts/tests/post-pending-deploy-alert.test.mjs \
-            ./.github/scripts/tests/scheduled-production-deploy-schedule.test.mjs
+            ./.github/scripts/tests/scheduled-production-deploy-schedule.test.mjs \
+            ./.github/scripts/tests/supersede-stale-deploy.test.mjs \
+            ./.github/scripts/tests/deploy-stall-record.test.mjs \
+            ./.github/scripts/tests/deploy-stall-chain.test.mjs
         timeout-minutes: 1
 
       # BLO-28203. The stalled-Ally-review sweep's decision suite otherwise runs
@@ -466,6 +518,14 @@ jobs:
       - name: Test Ally review-consistency guard
         if: ${{ !cancelled() }}
         run: node --test ./scripts/check-ally-review-consistency.test.mjs
+        timeout-minutes: 1
+
+      - name: Test landing classifier
+        if: ${{ !cancelled() }}
+        # The classifier itself is not run here. It only ever reports in CI
+        # (`--apply` is opt-in) but it makes one `gh` call per open PR, and the
+        # routine that owns the live fire is BLO-32511.
+        run: node --test ./scripts/land-clean-prs.test.mjs
         timeout-minutes: 1
 
       - name: Test comment-review-gate census
@@ -578,6 +638,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: pnpm run test:multer-security-override
 
+      - name: Test js-yaml security override
+        if: ${{ !cancelled() }}
+        run: pnpm run test:js-yaml-security-override
+
       - name: Verify release package bootstrap for changed manifests
         if: ${{ !cancelled() }}
         run: |
@@ -600,6 +664,26 @@ jobs:
       - name: Test lockfile overrides consistency guard
         if: ${{ !cancelled() }}
         run: node --test ./scripts/check-lockfile-overrides-consistency.test.mjs
+        timeout-minutes: 1
+
+      # BLO-27611. The escalation half of the guard above: the hourly drift
+      # monitor's only recipient. Its delivery path runs exclusively inside the
+      # scheduled job, and only on the branch where master is ALREADY drifted,
+      # so a regression there is invisible until the one run that needed it —
+      # and the failure mode is silence, which is what the issue is about.
+      - name: Test lockfile drift alert delivery (BLO-27611)
+        if: ${{ !cancelled() }}
+        run: node --test ./.github/scripts/tests/post-lockfile-drift-alert.test.mjs
+        timeout-minutes: 1
+
+      # BLO-26675. Same shape as the drift alert above: the only thing this
+      # reporter does is speak up after a merge-group run has already failed,
+      # so its failure mode is silence on a path that by definition only runs
+      # when something else broke. The PR-number extraction is the load-bearing
+      # part -- it decides WHICH pull request gets commented on.
+      - name: Test merge-queue ejection reporter (BLO-26675)
+        if: ${{ !cancelled() }}
+        run: node --test ./.github/scripts/tests/report-merge-queue-ejection.test.mjs
         timeout-minutes: 1
 
       - name: Validate dependency resolution when manifests change
@@ -703,7 +787,53 @@ jobs:
           node-version: 24
 
       - name: Install helm
+        # Pinned: BLO-31405 removed the `policy` copy of the chart render and
+        # with it the only pinned setup-helm in this file, leaving the render
+        # that gates `verify` floating on whatever `@v4` resolved to that day.
+        # A helm release that changes template output would fail every PR with
+        # no version to point at.
+        #
+        # Bumped by hand: dependabot's github-actions ecosystem updates `uses:`
+        # refs, not `with:` inputs, so nothing moves this line automatically.
+        # BLO-31516.
+        #
+        # Drift checked 2026-09-20 — the load-bearing token here, because every
+        # figure below decays from it. Stated so it stays measurable rather than
+        # merely disclosed. Against helm/helm releases on that date: v3.16.3 was
+        # published 2024-11-14, so this pin is ~22 months behind. The newest
+        # release is v3.22.0 (2026-09-10) — NOT a 4.x, because helm maintains
+        # both lines in parallel (v4.0.0 shipped 2025-11-12, newest 4.x is
+        # v4.3.0, 2026-09-09, one day older than the 3.x tip). So the low-risk
+        # bump is v3.22.0, staying on the pinned major; moving to 4.x is a
+        # separate call. Either way a bump changes render output, so it belongs
+        # in its own PR with its own green `Helm chart` rather than riding
+        # along here. Re-run that comparison when you change the pin, or when
+        # the date above is more than a quarter old: if the gap has grown, that
+        # is the signal to bump. A prose reword does not need it — the previous
+        # pass (2026-09-04, tip v3.21.4) moved only the tip, not the verdict.
+        #
+        # Prose rather than a soft assertion in the suite, chosen not defaulted:
+        # asserting "the pin is within N releases of the tip" means querying the
+        # helm/helm releases API from a policy test, and that trades a decaying
+        # comment for a gate that goes red on GitHub rate limits and offline
+        # runners. BLO-29182 was exactly that failure — network I/O inside this
+        # job with no bound below the job cap. A stale date misleads a reader
+        # who is already editing this line; a flaky assertion fails PRs that
+        # never touched it. So the decay is accepted deliberately, and bounded
+        # by pinning it to a date a reader can re-run in one API call:
+        #
+        #   gh api repos/helm/helm/releases \
+        #     --jq '.[]|select(.prerelease|not)
+        #           |"\(.tag_name)\t\(.published_at[:10])"' | head -6
+        #
+        # One page is enough and `--paginate` is wrong here: the 3.x and 4.x
+        # tips interleave by date on page 1 (verified 2026-09-21 — v4.3.0
+        # 2026-09-09, v3.22.0 2026-09-10, v4.2.4, v3.21.4 ...), and paginating
+        # re-applies the filter per page, so later pages emit 2018-era tags.
+        # Read the newest tag of EACH major, not just the newest tag.
         uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
 
       - name: Test Helm chart renders
         run: node --test ./deploy/helm/paperclip/tests/*.test.mjs
@@ -1578,11 +1708,38 @@ jobs:
     # Keep PR browser suites off the org-wide default pool. Merge groups use
     # the queue's reserved capacity so unrelated repos cannot delay admission.
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-e2e' }}
-    # The serial browser suite covers 43 flows. 90, not 75, sized against the
-    # measured p100 of SUCCESSFUL runs rather than the median. Every ratio here
+    # The serial browser suite covers 49 flows (43 before BLO-33282 split
+    # smoke-lab into 7). 90, not 75, sized against the measured p100 of
+    # SUCCESSFUL runs rather than the median. Every ratio here
     # is stated one way -- p100 as a percentage OF THE CAP -- so it can be
     # compared across jobs without inverting anything.
     #
+    # CURRENT REGIME (2026-09-18 onwards). The suite level-shifted ~3.5x DOWN
+    # between 09-17 and 09-18 and has held there. 337 e2e jobs over
+    # 2026-09-16..09-19, split at that boundary:
+    #
+    #   09-16..09-17  n=157 success  job p50 31.7 / p90 48.3 / p100 74.4
+    #                                suite p50 27.5 / p90 42.3 / p100 67.6  1 kill
+    #   09-18..09-19  n=125 success  job p50 14.4 / p90 22.0 / p100 36.2
+    #                                suite p50  7.8 / p90 14.7 / p100 32.2  0 kills
+    #
+    # p100 is now 40% of the cap, not 81%. The shift is NOT the BLO-33282
+    # smoke-lab split (which merged 09-19, a day later, and whose file was 1.11m
+    # of a 4.1m suite by then) and NOT the BLO-33478 built-bundle change: on
+    # 09-18, branches whose head did NOT contain 23f5799e7 ran 9.2-20.1m,
+    # i.e. as fast as those that did. The speedup tracks the DATE, not any
+    # commit content. Cause UNKNOWN and unchased -- likely runner-side. Both
+    # hypotheses above are recorded as FALSIFIED so nobody re-derives them.
+    #
+    # 90 is RETAINED, deliberately, and not re-sized down to this regime. It is
+    # robust to the uncertainty in a way a tighter cap would not be: if the
+    # improvement is durable, 90 costs nothing (a cap only bills when it fires,
+    # and it has not fired in 146 jobs); if it reverts, 90 is exactly the value
+    # the pre-shift window below sized. Sizing a cap tight against an
+    # unexplained 2-day improvement is the mistake BLO-32794 was filed to
+    # correct, in the other direction.
+    #
+    # PRIOR REGIME, and still the binding arithmetic if the shift reverts.
     # Measured over 600 pr.yml runs / 598 e2e jobs (2026-09-03..09-11), 434
     # successful: p50 36.0m, p90 52.6m, p100 73.2m. Against the old 75m that is
     # 98% of cap, i.e. 1.8m of margin; against 90 it is 81%, i.e. 16.8m.
@@ -1622,28 +1779,36 @@ jobs:
     # occupancy. Only worst-case single-job occupancy rises (+15m). How much 90
     # costs is NOT yet known -- nothing observes how long a killed job would
     # have taken, which is exactly what this change makes measurable.
-    # Deliberately left below the ~107m that Playwright's own limits can produce
-    # (43 tests x 60s timeout x `retries: 1`, plus the 300s webServer boot and
-    # measured setup), so a genuinely wedged suite is still killed rather than
-    # sitting on a runner.
+    # Deliberately left below the ceiling Playwright's own limits can produce
+    # (42 tests x 60s + 7 smoke-lab tests x 8m, all x `retries: 1`, plus the
+    # 300s webServer boot and measured setup ~= 215m), so a genuinely wedged
+    # suite is still killed rather than sitting on a runner. That figure read
+    # ~107m before BLO-33282 split smoke-lab, and it was understated even then
+    # -- it charged the old 30m `setTimeout` override as 60s.
     #
     # 90 is the DURABLE value, not a stop-gap. BLO-33282 evaluated cross-job
     # sharding as the alternative and ruled against it on measurement; do not
     # re-open it as "the fix nobody got round to".
     #
     # Why sharding does not help here. Per-file wall-times over 6 full runs:
-    # `smoke-lab.spec.ts` is ONE test (`test.setTimeout(1_800_000)`, 7 CI-safe
-    # P1-P7 scenarios in one `describe.serial` body) taking 18.6m median /
-    # 22.9m p100 -- 44% of a 42.1m suite. Playwright balances shards by TEST
-    # COUNT, not duration (testGroups.ts `filterForShard`: "Shards are still
-    # balanced by the number of tests, not files"), and shards non-parallel
-    # files as whole groups. So `--shard=i/N` puts that one 18.6m test in a
-    # shard with ~half the other 42 tests: simulated against the real algorithm
-    # the wall-time miss vs `suite/N` is +34% (N=2), +91% (N=3), +100% (N=4) --
-    # all failing BLO-33282's own <=20% balance criterion. A `--grep
-    # @smoke-lab` / `--grep-invert` split DOES balance (+12%, wall 23.6m), but
-    # 18.6m is an irreducible floor at ANY N because a single test cannot be
-    # split, so N>2 buys nothing.
+    # `smoke-lab.spec.ts` took 18.6m median / 28.1m p100 -- 44% of a 42.1m
+    # suite. Playwright balances shards by TEST COUNT, not duration
+    # (testGroups.ts `filterForShard`: "Shards are still balanced by the number
+    # of tests, not files"), and shards non-parallel files as whole groups. So
+    # when that file was ONE test, `--shard=i/N` put it in a shard with ~half
+    # the other 42 tests: simulated against the real algorithm the wall-time
+    # miss vs `suite/N` was +34% (N=2), +91% (N=3), +100% (N=4) -- all failing
+    # BLO-33282's own <=20% balance criterion. A `--grep @smoke-lab` /
+    # `--grep-invert` split DID balance (+12%, wall 23.6m).
+    #
+    # BLO-33282 then took the OTHER branch of its own AC2 and split that one
+    # test into 7 (one per P1-P7 scenario, plain `describe`, 8m each). That was
+    # for retry blast radius, not for sharding -- a single hung scenario used to
+    # cost 2 x 30m and kill the job by itself. But it also removes the 18.6m
+    # irreducible floor the pre-split arithmetic above rests on, so the shard
+    # simulation is STALE and must be re-run against the new 49-test shape
+    # before anyone quotes those percentages again. It is not evidence that
+    # sharding now works; nobody has measured it.
     #
     # The blocker is pool capacity, not suite structure: `arc-e2e` is
     # maxRunners 8 and was observed at 8/8 with 2 pending. Over this window 42%
@@ -1658,6 +1823,17 @@ jobs:
     # 100% and 2/4 99%, policy 99%, server 1/4 98%, Typecheck 96%) and 46 cap
     # kills file-wide costing ~25.7 runner-hours/week. See BLO-32794 for the
     # full per-job table before sizing any other cap here by eye.
+    #
+    # Setup gained a UI build step (1m44s) below, so the setup side of that
+    # table is now understated by about that much. Headroom still grew, not
+    # shrank -- like for like, one basis, both attempts green: job end to end
+    # 22.3m -> 11.9m and the `Run e2e tests` step 19.6m -> 6.6m (34802954363
+    # attempt 2 at pre-fix head fabf0e90b, against 35015220512). The build is
+    # what buys that: it lets the suite skip dev middleware (BLO-33478). The
+    # ~59m figure sometimes quoted for the same baseline is the suite step of
+    # attempt 1 of that run, which FAILED -- that is the clearest evidence the
+    # flake is real, but it is not a baseline. Re-measure before trimming this
+    # cap.
     timeout-minutes: 90
 
     steps:
@@ -1739,6 +1915,13 @@ jobs:
             "secrets": { "provider": "local_encrypted", "strictMode": false }
           }
           CONF
+
+      # Without a built bundle the e2e server falls back to Vite dev middleware
+      # and serves the UI as an unbundled module graph, costing 12-41s per
+      # navigation (BLO-33478). Build once so the suite exercises the same
+      # static bundle production serves.
+      - name: Build UI bundle for e2e
+        run: pnpm --filter @paperclipai/ui build
 
       - name: Run e2e tests
         env:

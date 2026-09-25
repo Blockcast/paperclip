@@ -1,0 +1,196 @@
+name: Sandbox provider tests
+
+# BLO-34222. `packages/plugins/sandbox-providers/**` is excluded from
+# pnpm-workspace.yaml so the providers stay installable standalone without
+# churning the root pnpm-lock.yaml. That exclusion is deliberate and this
+# workflow does not touch it -- the workspace file and the root lockfile are
+# unchanged by this lane. The same applies to
+# `packages/plugins/examples/plugin-orchestration-smoke-example`, the other
+# `!` plugin exclusion, which this lane also covers.
+#
+# The unintended consequence is what this closes. Measured at master
+# 2026-09-15: 0 of 33 workflows referenced the tree. Because the packages are
+# not workspace members, no root `pnpm -r test` reaches them and nothing else
+# picked them up either, so ~200 maintained tests -- including
+# image-allowlist.ts (an allowlist, which fails open when it regresses),
+# cilium-network-policy.ts (network isolation for agent workloads) and
+# secret-manager.ts -- had never gated anything. A regression in any of them
+# would have reached a merge with a fully green board, because no gate was
+# looking. Absence of a red signal here was indistinguishable from a pass.
+#
+# WHY A ROOT INSTALL FIRST, WHEN THE POINT IS A STANDALONE TREE
+#
+# Every one of the seven providers imports `@paperclipai/plugin-sdk`, whose
+# package.json `exports` resolve only into `./dist`. Until the SDK is built
+# those imports fail to RESOLVE, and vitest reports an unresolvable import as a
+# *collection* failure -- the file never runs, and its tests are never counted.
+#
+# That is not hypothetical, and it is the exact failure this workflow exists to
+# prevent, one level down. A bare `pnpm install --ignore-workspace && pnpm test`
+# in kubernetes/ reports a confident "174 passed" while silently failing to
+# collect plugin.test.ts and plugin-lease-lifecycle.test.ts. With the SDK built
+# first the same tree reports 192 passed across 18 files. The 18-test gap was
+# invisible in a green-looking summary. So the SDK is built up front via
+# scripts/ensure-plugin-build-deps.mjs -- the same helper these packages' own
+# prebuild/typecheck scripts already call, not a new mechanism -- and the loop
+# below fails the job if any suite fails to collect.
+#
+# HONEST LIMIT: THIS IS REVIEW-TIME SIGNAL, NOT A MERGE GATE
+#
+# `on.pull_request` + `paths:` means this lane does not run in the merge queue:
+# `merge_group` events carry no paths filter, so a job cannot be both
+# path-scoped and merge-queue-gating in one trigger (see the same trade-off
+# documented at length in stack-package-tests.yml). A master-targeting PR that
+# is re-staged in the queue therefore merges without re-running this lane.
+# Making it a required check is a deliberate separate decision -- BLO-34222
+# explicitly did not assert it -- and would mean running the tree on every
+# merge-group entry regardless of paths. Visibility on the PR is the bulk of
+# the value and is what this file buys.
+
+on:
+  pull_request:
+    paths:
+      - "packages/plugins/sandbox-providers/**"
+      - "packages/plugins/examples/plugin-orchestration-smoke-example/**"
+      - ".github/workflows/sandbox-provider-tests.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sandbox-provider-tests-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Sandbox provider tests
+    # arc-light, not ubuntu-latest. BLO-34222 asked for ubuntu-latest to keep
+    # load off the saturated self-hosted pool, but this repo's own workflow
+    # gates forbid it: `ubuntu-latest` is absent from ALLOWED_RUNNERS in
+    # scripts/check-github-runner-labels.mjs and from the label list in
+    # .github/actionlint.yaml, and a "runner-label allowlists agree" test binds
+    # those two together. No workflow in this repo uses a GitHub-hosted runner.
+    # Adding one is a fleet-routing and billing decision, not a detail of this
+    # lane, so this takes the lightest allowed pool instead. See BLO-34222.
+    runs-on: arc-light
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: ./.github/actions/setup-pnpm
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      # Needed only to build the SDK the providers import; the providers
+      # themselves are installed standalone below. --frozen-lockfile keeps this
+      # honest: if it ever mutates the root lockfile, the job fails here.
+      - name: Install root workspace
+        run: pnpm install --frozen-lockfile
+
+      - name: Build @paperclipai/shared and @paperclipai/plugin-sdk
+        run: node scripts/ensure-plugin-build-deps.mjs
+
+      - name: Run sandbox provider tests
+        run: |
+          set -uo pipefail
+
+          # Discovered, not enumerated: a provider added later is covered with
+          # no edit here, which is the failure mode that produced BLO-34222 in
+          # the first place. Picks up the nested cloudflare/bridge-template too.
+          #
+          # BOTH pnpm-workspace.yaml `!` plugin exclusions are covered, not just
+          # the one BLO-34222 names. plugin-orchestration-smoke-example is
+          # excluded for the same stated reason (no lockfile churn for a local
+          # example) and had the same invisible-not-skipped property. Covering
+          # one and not the other would leave the defect alive in the sibling
+          # tree. `packages/services/**` is the third exclusion and is
+          # deliberately NOT here: it ships via per-service Docker workflows
+          # that already run its tests, and it is Python + npm, not pnpm.
+          roots=(
+            packages/plugins/sandbox-providers
+            packages/plugins/examples/plugin-orchestration-smoke-example
+          )
+
+          # Check each root SEPARATELY, before find runs. `mapfile < <(find A B)`
+          # cannot do this job: process substitution is not a pipeline, so
+          # pipefail never reaches find and errexit does not fire on it either.
+          # With two roots a missing A only makes find print to stderr and exit
+          # 1 -- it still returns B's manifests, so `manifests` is non-empty and
+          # an emptiness check passes while covering none of the providers.
+          for root in "${roots[@]}"; do
+            [ -d "$root" ] && continue
+            echo "::error::${root} is missing; this workflow's paths filter is now pointing at nothing."
+            echo "Path moved or renamed. Update the paths: filter and this list together."
+            exit 1
+          done
+
+          mapfile -t manifests < <(
+            find "${roots[@]}" -name package.json -not -path '*/node_modules/*' | sort
+          )
+
+          if [ "${#manifests[@]}" -eq 0 ]; then
+            echo "::error::No package.json found under: ${roots[*]}"
+            exit 1
+          fi
+
+          failed=()
+          ran=0
+          for manifest in "${manifests[@]}"; do
+            dir=$(dirname "$manifest")
+            jq -e '.scripts.test' "$manifest" >/dev/null 2>&1 || continue
+            ran=$((ran + 1))
+            echo "::group::${dir}"
+            # Two install shapes, and they are not interchangeable.
+            #
+            # The sandbox providers carry only third-party deps, so they
+            # install standalone -- that is the shape the workspace exclusion
+            # exists to preserve. No --frozen-lockfile: they intentionally ship
+            # no lockfile, which is the whole point of the exclusion.
+            #
+            # plugin-orchestration-smoke-example instead depends on
+            # @paperclipai/* through `workspace:*`, which --ignore-workspace
+            # cannot resolve at all -- it fails outright with
+            # ERR_PNPM_WORKSPACE_PKG_NOT_FOUND. Its deps come from the root
+            # install above: vitest hoists from the root node_modules, and the
+            # SDK arrives via the root postinstall hook
+            # scripts/link-plugin-dev-sdk.mjs, whose own excludedPluginDirs()
+            # lists exactly these two trees. So it needs no install of its own.
+            if grep -q '"workspace:' "$manifest"; then
+              install=(true)
+            else
+              install=(pnpm -C "$dir" install --ignore-workspace)
+            fi
+            if "${install[@]}" && pnpm -C "$dir" test; then
+              echo "PASS ${dir}"
+            else
+              echo "::error::${dir} tests failed"
+              failed+=("$dir")
+            fi
+            echo "::endgroup::"
+          done
+
+          # Every package is run before the job fails, so one CI round reports
+          # every broken provider rather than only the first.
+          if [ "$ran" -eq 0 ]; then
+            echo "::error::Found ${#manifests[@]} package(s) but none declares a test script."
+            exit 1
+          fi
+
+          echo "Ran ${ran} package(s); ${#failed[@]} failed."
+          if [ "${#failed[@]}" -ne 0 ]; then
+            printf '::error::failed: %s\n' "${failed[*]}"
+            exit 1
+          fi
+
+      # The exclusion's stated purpose is no root-lockfile churn. Assert it
+      # rather than trusting it: the standalone installs above must not have
+      # written through to the root lockfile.
+      - name: Assert root lockfile unchanged
+        run: git diff --exit-code pnpm-lock.yaml

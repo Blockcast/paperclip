@@ -4,6 +4,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   type Db,
+  type DbTransaction,
 } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import {
@@ -11,11 +12,11 @@ import {
   githubGetLatestCommitStatusForContext,
   githubHasReviewerEvidenceForPr,
   githubPostCommitStatusDetailed,
+  scrubOutboundGitHubText,
   type GitHubCommitStatusState,
 } from "./github-app-auth.js";
 
 type DeliveryRow = typeof githubCommitStatusDeliveries.$inferSelect;
-type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 // Either handle works for the delivery bookkeeping below. Code reached from
 // inside withGithubStatusDeliveryLock must use the transaction handle so the
 // critical section does not take a second pool connection.
@@ -507,6 +508,26 @@ export async function enqueueGithubCommitStatusDelivery(
   } in ('delivered', 'skipped') and ${
     githubCommitStatusDeliveries.sourceRunId
   } = ${sourceRunId})`;
+  // Scrub BEFORE this 140-char cap, not only at the send. The replay path
+  // hands `row.description` to githubPostCommitStatusDetailed, which scrubs
+  // it — but by then the value has already been truncated here, and a
+  // credential straddling the cut loses the prefix or terminator its detector
+  // needs. The surviving fragment then matches nothing, is persisted, and is
+  // published on every replay. Scrubbing first also means the durable
+  // `description` never holds credential-shaped text at rest, which the
+  // send-time scrub cannot achieve from here (PEN-3157).
+  //
+  // Bound ONCE and reused by both arms of the upsert below. It used to be
+  // inlined into `values` only, leaving the ON CONFLICT arm on a raw
+  // `input.description.slice(0, 140)` — trim-then-scrub, the exact defect this
+  // block exists to prevent, on what is in practice the DOMINANT path: the
+  // conflict target is (repo, sha, context), so every re-evaluation of the
+  // same gate context on the same head takes the update arm, not the insert.
+  // Deriving both from one binding is what stops the two paths diverging again.
+  const scrubbedDescription = scrubOutboundGitHubText(
+    input.description,
+    "outbox commit-status description",
+  ).slice(0, 140);
   const values = {
     companyId,
     sourceRunId,
@@ -515,7 +536,7 @@ export async function enqueueGithubCommitStatusDelivery(
     context: input.context,
     state: input.state,
     forceWrite: input.forceWrite ?? false,
-    description: input.description.slice(0, 140),
+    description: scrubbedDescription,
     targetUrl: input.targetUrl ?? null,
     prNumber: input.prNumber,
     prUrl: input.prUrl ?? null,
@@ -545,7 +566,7 @@ export async function enqueueGithubCommitStatusDelivery(
         prUrl: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.prUrl} else ${input.prUrl ?? null} end`,
         state: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.state} else ${input.state} end`,
         forceWrite: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.forceWrite} else ${input.forceWrite ?? false} end`,
-        description: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.description} else ${input.description.slice(0, 140)} end`,
+        description: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.description} else ${scrubbedDescription} end`,
         targetUrl: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.targetUrl} else ${input.targetUrl ?? null} end`,
         status: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.status} else 'queued' end`,
         attempts: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.attempts} else 0 end`,

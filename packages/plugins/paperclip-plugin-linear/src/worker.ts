@@ -64,17 +64,6 @@ let currentCtx: PluginContext | null = null;
 
 const inFlightCreates = new Set<string>();
 
-// Same idea for bridged comments, keyed by Linear comment UUID (BLO-3267).
-// The `listComments` sentinel check below is a read-then-write and cannot see a
-// sibling delivery that has not written yet, so simultaneous deliveries of one
-// comment both pass it. Duplicate pairs observed in the wild were ~3ms apart —
-// far inside a `listComments` round-trip — so the sentinel alone only covers
-// sequential retries. Plugin workers run on the singleton worker StatefulSet
-// (the multi-replica API tier 503s plugin operations), so a process-local set
-// covers the deployed topology; the sentinel check remains as the second layer
-// that survives a restart, and would be the only layer if that tier ever scales.
-const inFlightComments = new Set<string>();
-
 // Tracks Paperclip issue IDs that were just created from Linear webhooks.
 // The issue.created event handler checks this to avoid a feedback loop
 // (webhook creates Paperclip issue → issue.created fires → would push back to Linear).
@@ -3600,97 +3589,231 @@ async function handleWebhookEvent(
     if (!link) return;
 
     const commentBody = data.body as string;
+    // An edit that *clears* the body exits here, leaving the mirror on its
+    // pre-edit text. Deliberate: a bridged comment whose body is empty renders
+    // as a bare `**Author** (from Linear):` header, and there is no delete verb
+    // on the comment path to reach for instead. Before BLO-31634 every edit was
+    // dropped so this was invisible; it is now the one edit shape that does not
+    // propagate.
     if (!commentBody || commentBody.includes("[synced from Paperclip]")) return;
 
-    // BLO-2973: idempotency-check by Linear comment UUID before creating.
-    // Linear retries webhook deliveries on transient failures (and our own
-    // retry layer can fire the handler twice for the same payload). Without
-    // this check, every retry creates a duplicate paperclip comment.
+    // BLO-31657: dedup by Linear comment UUID, in the database.
     //
-    // We embed a sentinel HTML comment in the bridged body — invisible in
-    // rendered markdown, but a stable, content-addressable marker we can
-    // grep when listing existing comments. Falls back to skipping the
-    // create if listing fails (better an occasional missed sync than a
-    // duplicate sync).
+    // Linear retries webhook deliveries on transient failures (and our own
+    // retry layer can fire the handler twice for the same payload), so without
+    // dedup every retry creates a duplicate paperclip comment (BLO-2973).
+    //
+    // This used to be two cooperating layers: a `listComments` scan for a
+    // sentinel HTML comment, plus a process-local `inFlightComments` claim
+    // (BLO-3267) to cover the concurrent case the scan structurally could not —
+    // a read-then-write cannot see a sibling that has not written yet, and the
+    // duplicate pair actually observed landed 3ms apart. The Set is gone
+    // outright and the scan is gone from the `create` path: the host now offers
+    // `idempotencyKey`, which dedups in the insert itself against a partial
+    // unique index, so it is atomic, holds across concurrent deliveries, and —
+    // unlike a process-local Set — keeps holding if the plugin tier ever runs
+    // more than one replica. The scan survives only as the legacy-row guard on
+    // `update`, described below.
+    //
+    // Dropping the scan off the `create` path also drops one RPC round-trip
+    // per bridged comment, which is the overwhelming majority of deliveries.
+    //
+    // The sentinel is still *written*, for two reasons. It is the legacy-row
+    // fallback just below, and it is the only mapping a *reader outside this
+    // handler* could use: `listComments` does return `idempotencyKey`, but the
+    // host namespaces the stored value with the plugin install row's PK, which
+    // nothing outside the host knows. Edit propagation (BLO-31634) does not use
+    // it — that correlates on the key, below.
+    //
+    // Legacy rows: comments bridged before this shipped carry the sentinel but
+    // `idempotency_key IS NULL`, and all three partial indexes in 0206 are
+    // `WHERE idempotency_key IS NOT NULL`. So a legacy row is not in the index,
+    // `ON CONFLICT` cannot fire against it, and the key dedups against nothing.
+    //
+    // On `create` that is bounded and safe: a `create` redelivery is a Linear
+    // (or own-retry-layer) retry of the original, so the exposure really is
+    // confined to the deploy window and fails in the safe direction — one extra
+    // comment, correct body.
+    //
+    // On `update` it is neither. `update` is admitted by the guard above and is
+    // an unbounded trigger: editing a comment bridged last month delivers here
+    // today, misses the key, and inserts a *second* mirror carrying the edited
+    // body while the original keeps the stale one — two versions in the thread
+    // with nothing marking which is current. That is the one case where the
+    // failure is not additive noise, and it covers the whole pre-deploy backlog
+    // until each comment has been edited once. So the sentinel scan is retained
+    // for `update` only — and only for the legacy rows, since a keyed mirror is
+    // now found and rewritten by `updateComment` before the scan runs.
+    //
+    // It has to be a pre-check rather than a post-insert fallback: `ON CONFLICT
+    // DO NOTHING` reports the miss only after the row is written, by which point
+    // the duplicate exists. There is nothing to fall back to.
+    //
+    // A backfill would retire the sentinel outright, and was considered and
+    // rejected as riskier than the bug: the host namespaces the key with the
+    // *install row's* PK (`plugin:${pluginId}:`, `plugin-host-services.ts`), so
+    // a migration would have to resolve which install bridged each comment, per
+    // company; and duplicate pairs from BLO-2973/BLO-3267 are known to exist in
+    // this exact population, so backfilling one key across a pair violates the
+    // unique index and fails the migration.
     const linearCommentId = data.id as string | undefined;
     if (!linearCommentId) {
-      ctx.logger.warn("Comment webhook missing data.id; skipping idempotency check (may double-post)");
-    } else {
-      // Claim the comment id synchronously — before the first `await` below —
-      // so a simultaneous delivery of the same comment sees the claim instead
-      // of racing us through the `listComments` check (BLO-3267).
-      if (inFlightComments.has(linearCommentId)) {
-        ctx.logger.info(`Skipping duplicate webhook comment ${linearCommentId} — already in flight`);
-        return;
-      }
-      inFlightComments.add(linearCommentId);
+      // The one delivery shape with no correlation handle at all: it cannot be
+      // keyed on create, so it cannot be found on update either. An edit of one
+      // re-bridges as a new comment. Linear does not produce this — the warning
+      // exists so that if it ever does, the duplicate has a named cause.
+      ctx.logger.warn("Comment webhook missing data.id; creating without an idempotency key (may double-post)");
     }
 
-    try {
-      if (linearCommentId) {
-        try {
-          const existing = await ctx.issues.listComments(link.paperclipIssueId, link.paperclipCompanyId);
-          const sentinel = `<!-- linear-comment-id: ${linearCommentId} -->`;
-          if (existing.some((c) => typeof c.body === "string" && c.body.includes(sentinel))) {
-            ctx.logger.info(`Webhook comment ${linearCommentId} already mirrored to ${link.linearIdentifier}; skipping`);
-            return;
-          }
-        } catch (err) {
-          ctx.logger.warn(`Idempotency check failed for comment ${linearCommentId}: ${err}; proceeding (may double-post)`);
-        }
-      }
+    const userName = (data.user as Record<string, unknown>)?.name as string ?? "Linear user";
 
-      const userName = (data.user as Record<string, unknown>)?.name as string ?? "Linear user";
+    // Bare `BLO-1234`-style refs in Linear text would otherwise be linkified
+    // by the UI to Paperclip's own `/issues/BLO-1234` — same identifier
+    // scheme, different issues. Wrap them as proper Linear links here so the
+    // UI rewrite skips them.
+    const workspaceSlug = await resolveLinearWorkspaceSlug(ctx, link.linearUrl);
+    const safeBody = linkifyBareLinearIssueRefs(commentBody, workspaceSlug);
 
-      // Bare `BLO-1234`-style refs in Linear text would otherwise be linkified
-      // by the UI to Paperclip's own `/issues/BLO-1234` — same identifier
-      // scheme, different issues. Wrap them as proper Linear links here so the
-      // UI rewrite skips them.
-      const workspaceSlug = await resolveLinearWorkspaceSlug(ctx, link.linearUrl);
-      const safeBody = linkifyBareLinearIssueRefs(commentBody, workspaceSlug);
+    // Prepend the sentinel so the legacy-row guard below can match this comment
+    // back to its Linear source. The HTML comment renders invisibly.
+    const sentinelPrefix = linearCommentId
+      ? `<!-- linear-comment-id: ${linearCommentId} -->\n`
+      : "";
+    // Built once: an `update` either writes this over the existing mirror or,
+    // failing that, creates it.
+    const mirrorBody = `${sentinelPrefix}**${userName}** (from Linear):\n\n${safeBody}`;
 
-      // Prepend the sentinel so future webhook deliveries can detect this
-      // comment was already mirrored. The HTML comment renders invisibly.
-      const sentinelPrefix = linearCommentId
-        ? `<!-- linear-comment-id: ${linearCommentId} -->\n`
-        : "";
-
+    if (action === "update" && linearCommentId) {
+      // BLO-31634: propagate the edit rather than skipping it.
+      //
+      // A Linear edit keeps the comment's UUID, so the key derived from it is
+      // unchanged and identifies the mirror written by the original `create`.
+      // That is why the correlation is the key and not the sentinel: the key is
+      // also the *authorization* — the host namespaces it per installation, so
+      // this can only ever rewrite a comment this plugin wrote. There is no
+      // update-by-comment-id call to reach for, deliberately.
+      //
+      // Idempotent by construction. A single `UPDATE ... WHERE key = ...`
+      // inserts nothing, so a redelivered or concurrent edit writes the same
+      // body twice and still leaves exactly one comment — the guarantee
+      // BLO-31657 bought for `create`, at no extra cost here.
+      //
+      // `null` and a throw are different findings and must not share a branch.
+      // `null` is an answer — no keyed mirror exists — and the legacy scan below
+      // is the right next step. A throw is the *absence* of an answer, and the
+      // scan cannot stand in for one: every keyed mirror carries the sentinel
+      // too (written above, at `sentinelPrefix`), so on a throw the scan matches
+      // this comment's own sentinel and reports a keyless legacy row that is not
+      // one. Hence `updated` is hoisted and the catch returns.
+      let updated: Awaited<ReturnType<typeof ctx.issues.updateComment>>;
       try {
-        await ctx.issues.createComment(
+        updated = await ctx.issues.updateComment(
           link.paperclipIssueId,
-          `${sentinelPrefix}**${userName}** (from Linear):\n\n${safeBody}`,
+          `linear-comment:${linearCommentId}`,
+          mirrorBody,
           link.paperclipCompanyId,
         );
+      } catch (err) {
+        // Nothing here can recover the edit, and that is deliberate rather than
+        // unfinished. `onWebhook` catches everything this function throws (see
+        // the handler's own try/catch) and returns normally, so there is no
+        // retry layer to rethrow into — and falling through to `createComment`
+        // would only have the key dedup against the mirror we just failed to
+        // rewrite, spending a round-trip to log "already mirrored" about an edit
+        // that did not land. The mirror keeps its pre-edit body until Linear
+        // delivers another edit of the same comment.
+        //
+        // So the one thing that matters is that the log names the real cause:
+        // an operator reading it is debugging exactly this failure.
+        ctx.logger.warn(`Failed to propagate comment edit ${linearCommentId} to ${link.linearIdentifier}: ${err}; mirror left with its pre-edit body`);
+        return;
+      }
 
+      if (updated) {
+        // An in-place body rewrite leaves no trace in the thread the way a new
+        // comment does, so log it: an edit that silently replaces text is
+        // exactly the mutation that wants an audit trail.
         await ctx.activity.log({
           companyId: link.paperclipCompanyId,
           message: `issue.comment.synced_from_linear`,
           entityType: "issue",
           entityId: link.paperclipIssueId,
-          metadata: { source: "linear", identifier: link.linearIdentifier, author: userName, bodySnippet: commentBody.slice(0, 120), action: "comment.synced", linearCommentId: linearCommentId ?? null },
+          metadata: { source: "linear", identifier: link.linearIdentifier, author: userName, bodySnippet: commentBody.slice(0, 120), action: "comment.edit_synced", linearCommentId },
         });
-
-        ctx.logger.info(`Webhook bridged comment to ${link.linearIdentifier}`);
-      } catch (err) {
-        ctx.logger.warn(`Webhook failed to bridge comment: ${err}`);
+        ctx.logger.info(`Webhook propagated comment edit ${linearCommentId} to ${link.linearIdentifier} as comment ${updated.id}`);
+        return;
       }
-    } finally {
-      // Release after the create *attempt* resolves — not before it, and not
-      // only on success. Releasing earlier would reopen a window where the
-      // claim is gone and no sentinel is written yet, i.e. neither layer
-      // covers the comment.
+
+      // `updated === null`: no keyed mirror. Either this comment predates
+      // BLO-31657 (sentinel, no key) or it was never bridged at all — the scan
+      // below separates those, because only the first must not be re-created.
+      try {
+        const existing = await ctx.issues.listComments(link.paperclipIssueId, link.paperclipCompanyId);
+        const sentinel = `<!-- linear-comment-id: ${linearCommentId} -->`;
+        const mirrored = existing.find((c) => typeof c.body === "string" && c.body.includes(sentinel));
+        if (mirrored) {
+          // A legacy mirror has no key, so `updateComment` cannot reach it and
+          // this edit cannot propagate. Skipping keeps the thread at one
+          // comment with a stale body, which beats two with no marker for which
+          // is current. Self-retires: this population only shrinks.
+          ctx.logger.info(`Webhook comment ${linearCommentId} is mirrored to ${link.linearIdentifier} as pre-BLO-31657 comment ${mirrored.id} (no idempotency key); cannot propagate edit, skipping`);
+          return;
+        }
+      } catch (err) {
+        ctx.logger.warn(`Legacy-row check failed for comment ${linearCommentId}: ${err}; proceeding (may double-post a pre-BLO-31657 mirror)`);
+      }
+    }
+
+    try {
+      const created = await ctx.issues.createComment(
+        link.paperclipIssueId,
+        mirrorBody,
+        link.paperclipCompanyId,
+        linearCommentId ? { idempotencyKey: `linear-comment:${linearCommentId}` } : undefined,
+      );
+
+      // A duplicate delivery gets the first delivery's comment handed back
+      // rather than an error. Return before logging activity: the row already
+      // existed, so recording `comment.synced` again would report a sync that
+      // did not happen, once per duplicate delivery — exactly the noise the
+      // key is bought to remove.
       //
-      // On the success path the sentinel is already visible to the next
-      // delivery by the time the claim drops, so the handoff is clean. On the
-      // failure paths (`createComment` threw, `resolveLinearWorkspaceSlug`
-      // threw) there is deliberately no sentinel to hand off to, and the claim
-      // must still drop: holding it would make one failed delivery permanently
-      // suppress that comment's own retry — a worse bug than the double-post
-      // this guards. Do not "tighten" this by moving the delete into the
-      // success branch; see the `releases the in-flight claim when the bridged
-      // create fails` and `... when workspace-slug resolution throws` tests,
-      // which pin exactly that.
-      if (linearCommentId) inFlightComments.delete(linearCommentId);
+      // In practice this is a `create`-only branch. An `update` of a keyed
+      // mirror is rewritten above and returns there; an `update` whose rewrite
+      // *threw* also returns there, rather than arriving here to dedup against
+      // the row it failed to rewrite; an `update` of a legacy mirror stops at
+      // the sentinel guard. One residual reaches here: an `update` that found no
+      // keyed mirror (`null`) and whose `listComments` then threw, so neither
+      // mechanism could rule out a legacy mirror. That one may double-post, and
+      // the warn above names it — an extra comment with the correct body, which
+      // is the safe direction and the same exposure `create` already carries.
+      //
+      // An `update` of a mirror that was since soft-deleted reaches here and
+      // *should*: `updateComment` filters `deleted_at IS NULL`, the scan cannot
+      // see it either (a deleted comment comes back with its body blanked), and
+      // all three 0206 indexes are `WHERE ... deleted_at IS NULL` as well as
+      // `idempotency_key IS NOT NULL`, so the insert succeeds. The edit
+      // re-bridges, which is what you want once the mirror is gone, and all
+      // three mechanisms agree rather than diverging.
+      if (created.deduplicated) {
+        ctx.logger.info(`Webhook comment ${linearCommentId} already mirrored to ${link.linearIdentifier}; skipping`);
+        return;
+      }
+
+      await ctx.activity.log({
+        companyId: link.paperclipCompanyId,
+        message: `issue.comment.synced_from_linear`,
+        entityType: "issue",
+        entityId: link.paperclipIssueId,
+        metadata: { source: "linear", identifier: link.linearIdentifier, author: userName, bodySnippet: commentBody.slice(0, 120), action: "comment.synced", linearCommentId: linearCommentId ?? null },
+      });
+
+      ctx.logger.info(`Webhook bridged comment to ${link.linearIdentifier}`);
+    } catch (err) {
+      // No claim to release and no sentinel to hand off: a failed delivery
+      // leaves no trace, so the next retry of this comment is free to try
+      // again and will dedup against the key if a sibling won the race.
+      ctx.logger.warn(`Webhook failed to bridge comment: ${err}`);
     }
   }
 

@@ -10,11 +10,12 @@
  * state 0226 leaves behind, it must build the index and fail loudly — never
  * silently — if the build does not leave a valid index in place.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import postgres from "postgres";
 import { applyPendingMigrations } from "./client.js";
 import {
   ensurePendingConcurrentIndexes,
+  PENDING_CONCURRENT_INDEXES,
   SERIALIZING_LOCK_KEY,
   type ConcurrentIndexSpec,
 } from "./concurrent-index-guard.js";
@@ -27,6 +28,9 @@ const INDEX_NAME = "heartbeat_runs_crash_recovery_pending_idx";
 const INDEX_DEFINITION =
   "ON heartbeat_runs USING btree (finished_at, id) "
   + "WHERE error_code = 'worker_crashed' AND crash_recovery_completed_at IS NULL";
+const CRASH_RECOVERY_SPEC = PENDING_CONCURRENT_INDEXES.find(
+  (spec) => spec.migration === "0226_heartbeat_runs_crash_recovery_index.sql",
+)!;
 
 const cleanups: Array<() => Promise<void>> = [];
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -63,10 +67,17 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
   it("builds the deferred index migration 0226 leaves absent on a populated table", async () => {
     const { database, sql } = await seedPopulatedDatabaseWithoutIndex();
 
-    const results = await ensurePendingConcurrentIndexes(database.connectionString);
+    const results = await ensurePendingConcurrentIndexes(database.connectionString, {
+      specs: [CRASH_RECOVERY_SPEC],
+    });
 
     expect(results).toEqual([
-      { name: INDEX_NAME, table: "heartbeat_runs", action: "created" },
+      {
+        migration: CRASH_RECOVERY_SPEC.migration,
+        name: INDEX_NAME,
+        table: "heartbeat_runs",
+        action: "created",
+      },
     ]);
     const [{ indisvalid }] = await sql<{ indisvalid: boolean }[]>`
       select indisvalid from pg_index where indexrelid = to_regclass(${`public.${INDEX_NAME}`})
@@ -78,10 +89,17 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
     const { database, sql } = await seedPopulatedDatabaseWithoutIndex();
     await sql.unsafe(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ${INDEX_NAME} ${INDEX_DEFINITION}`);
 
-    const results = await ensurePendingConcurrentIndexes(database.connectionString);
+    const results = await ensurePendingConcurrentIndexes(database.connectionString, {
+      specs: [CRASH_RECOVERY_SPEC],
+    });
 
     expect(results).toEqual([
-      { name: INDEX_NAME, table: "heartbeat_runs", action: "already-valid" },
+      {
+        migration: CRASH_RECOVERY_SPEC.migration,
+        name: INDEX_NAME,
+        table: "heartbeat_runs",
+        action: "already-valid",
+      },
     ]);
   }, 60_000);
 
@@ -93,10 +111,17 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
     await sql.unsafe(`CREATE INDEX CONCURRENTLY ${INDEX_NAME} ${INDEX_DEFINITION}`);
     await sql.unsafe(`UPDATE pg_index SET indisvalid = FALSE WHERE indexrelid = '${INDEX_NAME}'::regclass`);
 
-    const results = await ensurePendingConcurrentIndexes(database.connectionString);
+    const results = await ensurePendingConcurrentIndexes(database.connectionString, {
+      specs: [CRASH_RECOVERY_SPEC],
+    });
 
     expect(results).toEqual([
-      { name: INDEX_NAME, table: "heartbeat_runs", action: "rebuilt" },
+      {
+        migration: CRASH_RECOVERY_SPEC.migration,
+        name: INDEX_NAME,
+        table: "heartbeat_runs",
+        action: "rebuilt",
+      },
     ]);
     const [{ indisvalid }] = await sql<{ indisvalid: boolean }[]>`
       select indisvalid from pg_index where indexrelid = to_regclass(${`public.${INDEX_NAME}`})
@@ -107,12 +132,7 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
   it("throws — rather than reporting success — when the online build does not leave a valid index", async () => {
     const { database } = await seedPopulatedDatabaseWithoutIndex();
     const brokenSpec: ConcurrentIndexSpec = {
-      migration: "0226_heartbeat_runs_crash_recovery_index.sql",
-      name: INDEX_NAME,
-      table: "heartbeat_runs",
-      accessMethod: "btree",
-      keyColumns: ["finished_at", "id"],
-      predicate: "error_code = 'worker_crashed'::text AND crash_recovery_completed_at IS NULL",
+      ...CRASH_RECOVERY_SPEC,
       // References a column that does not exist, so the build itself fails
       // and this must surface as a thrown error, not a silently-empty result.
       createStatement:
@@ -138,7 +158,9 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
         "WHERE error_code = 'worker_crashed' AND crash_recovery_completed_at IS NULL",
     );
 
-    await expect(ensurePendingConcurrentIndexes(database.connectionString)).rejects.toThrow(
+    await expect(
+      ensurePendingConcurrentIndexes(database.connectionString, { specs: [CRASH_RECOVERY_SPEC] }),
+    ).rejects.toThrow(
       /does not match migration 0226_heartbeat_runs_crash_recovery_index\.sql's definition/,
     );
 
@@ -167,7 +189,9 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
     cleanups.push(async () => holder.end());
     await holder.unsafe(`select pg_advisory_lock(hashtextextended('${SERIALIZING_LOCK_KEY}', 0))`);
 
-    const second = ensurePendingConcurrentIndexes(database.connectionString);
+    const second = ensurePendingConcurrentIndexes(database.connectionString, {
+      specs: [CRASH_RECOVERY_SPEC],
+    });
 
     // While the holder keeps the lock, the second caller must not resolve --
     // race it against a short timer and confirm the timer wins.
@@ -181,6 +205,70 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
     await holder.unsafe(`select pg_advisory_unlock(hashtextextended('${SERIALIZING_LOCK_KEY}', 0))`);
 
     const results = await second;
-    expect(results).toEqual([{ name: INDEX_NAME, table: "heartbeat_runs", action: "created" }]);
+    expect(results).toEqual([{
+      migration: CRASH_RECOVERY_SPEC.migration,
+      name: INDEX_NAME,
+      table: "heartbeat_runs",
+      action: "created",
+    }]);
+  }, 60_000);
+
+  it("surfaces the build failure rather than a cleanup failure, and still closes the pool (BLO-34039)", async () => {
+    const { database } = await seedPopulatedDatabaseWithoutIndex();
+    // Leaving the session in an aborted transaction as the build fails is the
+    // cheapest real reproduction of a broken-session cleanup: every later
+    // statement on that connection -- the two timeout resets and the advisory
+    // unlock in the `finally` -- then errors with "current transaction is
+    // aborted", which used to replace the build error and skip `sql.end()`.
+    const abortingSpec: ConcurrentIndexSpec = {
+      ...CRASH_RECOVERY_SPEC,
+      createStatement: "BEGIN; SELECT 1 / 0;",
+    };
+    // Deliberately passing no `log`: with one supplied, `log` (the no-op-by-
+    // default progress channel) and `warn` (the cleanup channel) are the SAME
+    // function object, so this assertion could not tell them apart and would
+    // still pass if cleanup regressed onto `log`. Spying the `console.warn`
+    // default discriminates that, and is also the only branch the two
+    // production callers ever take -- neither passes options.
+    //
+    // The spy also throws once, on the first cleanup message: a reporter that
+    // itself throws must not replace the build error nor skip the steps after
+    // it, `sql.end()` included. That is the same masking defect one layer up,
+    // so the three assertions below pin both guards at once.
+    const warned: string[] = [];
+    let reporterShouldThrow = true;
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation((message: string) => {
+      if (!message.startsWith("concurrent-index cleanup:")) return;
+      warned.push(message);
+      if (reporterShouldThrow) {
+        reporterShouldThrow = false;
+        throw new Error("cleanup reporter exploded");
+      }
+    });
+    cleanups.push(async () => warnSpy.mockRestore());
+
+    await expect(
+      ensurePendingConcurrentIndexes(database.connectionString, {
+        specs: [abortingSpec],
+      }),
+    ).rejects.toThrow(/division by zero/);
+
+    // Three, not two: the reporter threw on the first one, and the two steps
+    // after it still ran and still reported.
+    expect(warned).toHaveLength(3);
+
+    // The advisory lock is session-scoped, so Postgres only releases it when
+    // the backend exits -- it is therefore gone if and only if `sql.end()`
+    // ran despite the unlock throwing.
+    const probe = postgres(database.connectionString, { max: 1 });
+    cleanups.push(async () => probe.end());
+    let locked = false;
+    for (let attempt = 0; attempt < 20 && !locked; attempt += 1) {
+      [{ locked }] = await probe.unsafe(
+        `select pg_try_advisory_lock(hashtextextended('${SERIALIZING_LOCK_KEY}', 0)) as locked`,
+      );
+      if (!locked) await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    expect(locked).toBe(true);
   }, 60_000);
 });

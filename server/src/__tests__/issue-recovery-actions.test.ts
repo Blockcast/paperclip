@@ -7,9 +7,11 @@ import {
   agents,
   agentWakeupRequests,
   activityLog,
+  approvals,
   companies,
   createDb,
   heartbeatRuns,
+  issueApprovals,
   issueComments,
   issueRecoveryActions,
   issueRelations,
@@ -27,9 +29,10 @@ import { truncateCompanyScopedTestState } from "./helpers/truncate-company-scope
 import { errorHandler } from "../middleware/index.js";
 import { logger } from "../middleware/logger.js";
 import { issueRoutes } from "../routes/issues.js";
+import { approvalService } from "../services/approvals.js";
 import { buildPaperclipWakePayload } from "../services/heartbeat.js";
 import { computeIssueMonitorGateFingerprint } from "../services/issue-execution-policy.js";
-import { issueRecoveryActionService, recoveryHandoffGrantIsWithinTtl } from "../services/issue-recovery-actions.js";
+import { RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS, issueRecoveryActionService, recoveryHandoffGrantIsWithinTtl } from "../services/issue-recovery-actions.js";
 import { issueService } from "../services/issues.js";
 import { recoveryObservabilityService } from "../services/recovery-observability.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
@@ -1246,6 +1249,123 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
+  it("does not take a second pool connection while holding the issue-graph lock", async () => {
+    const { coderId, sourceIssue } = await seedCompany();
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => ({ id: randomUUID() })) });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "agent is not invokable",
+      errorCode: "agent_not_invokable",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+
+    // BLO-34207: the escalation holds `lockIssueParentMutationCompany` inside
+    // its `db.transaction` callback. A pooled statement issued from inside that
+    // callback needs a second connection; with POSTGRES_POOL_MAX = 10 and the
+    // lock's waiters holding the rest of the pool, the holder idled until a
+    // waiter hit lock_timeout and dispatch stalled fleet-wide. Record every
+    // pooled statement issued while a transaction callback is open.
+    type AnyFn = (...args: unknown[]) => unknown;
+    const dbRecord = db as unknown as Record<string, AnyFn>;
+    const pooledMethods = ["select", "insert", "update", "delete", "execute"] as const;
+    const originals = new Map<string, { fn: AnyFn; own: boolean }>();
+    for (const method of ["transaction", ...pooledMethods]) {
+      originals.set(method, {
+        fn: dbRecord[method]!.bind(db),
+        own: Object.prototype.hasOwnProperty.call(db, method),
+      });
+    }
+    let openTransactions = 0;
+    const pooledInsideTransaction: string[] = [];
+    dbRecord.transaction = async (...args: unknown[]) => {
+      openTransactions += 1;
+      try {
+        return await originals.get("transaction")!.fn(...args);
+      } finally {
+        openTransactions -= 1;
+      }
+    };
+    for (const method of pooledMethods) {
+      dbRecord[method] = (...args: unknown[]) => {
+        if (openTransactions > 0) {
+          // Name the offending call site so a regression reads as a location,
+          // not as a bare method name.
+          const frames = (new Error().stack ?? "")
+            .split("\n")
+            .map((line) => line.trim())
+            .filter((line) => line.includes("/services/") && !line.includes("node_modules"))
+            .slice(0, 2)
+            .map((line) => line.replace(/^at /, "").replace(/ \(.*$/, ""));
+          pooledInsideTransaction.push(`${method} @ ${frames.join(" <- ") || "unknown"}`);
+        }
+        return originals.get(method)!.fn(...args);
+      };
+    }
+    try {
+      await recovery.escalateStrandedAssignedIssue({
+        issue: sourceIssue,
+        previousStatus: "in_progress",
+        latestRun,
+        comment: "Automatic continuation recovery failed.",
+      });
+    } finally {
+      for (const [method, original] of originals) {
+        if (original.own) dbRecord[method] = original.fn;
+        else delete dbRecord[method];
+      }
+    }
+
+    // Fixed here: the escalation body's own `getCompanyIssuePrefix`, `getAgent`
+    // and `getLatestIssueRun` reads now run on `tx`, and so does owner
+    // resolution (BLO-34207: `resolveStrandedIssueRecoveryOwnerAgentId` ->
+    // `getAgent` / `isAgentInvokable` / `budgets.getInvocationBlock` /
+    // instance settings). This ratchet fails on any new pooled call site and
+    // on a regression of any of them.
+    // Empty on purpose: nothing may run pooled under the lock any more. Master
+    // dropped `getLatestIssueRun` (29cdd6ab3) and this PR moved the last one,
+    // `getOrCreateRow`, onto the caller tx (`readInstanceSettingsOn`); it is
+    // asserted forbidden by name below, so it must not be allowlisted here.
+    const knownPooledUnderLock: string[] = [];
+    const unexpected = pooledInsideTransaction.filter(
+      (entry) => !knownPooledUnderLock.some((name) => entry.includes(name)),
+    );
+    expect(unexpected).toEqual([]);
+    expect(pooledInsideTransaction.filter((entry) => entry.includes("getCompanyIssuePrefix"))).toEqual([]);
+    expect(
+      pooledInsideTransaction.filter((entry) => entry.includes("getAgent <- escalateStrandedAssignedIssue")),
+    ).toEqual([]);
+    // Substring match, so this also covers `getLatestIssueRunForAgentStage` and
+    // `getLatestIssueRunSince` — none of the three may run pooled under the lock.
+    expect(pooledInsideTransaction.filter((entry) => entry.includes("getLatestIssueRun"))).toEqual([]);
+    // BLO-34207. Named individually rather than relying on the `unexpected`
+    // filter above: an allowlist entry is a substring match, so a future entry
+    // that happens to contain one of these names would silently re-admit it.
+    for (const name of [
+      // BLO-34207: `issuesSvc.update` / `addComment` read instance settings on
+      // the caller handle now (`instanceSettingsOn`), so the singleton read no
+      // longer takes a second pool connection under the graph lock.
+      "getOrCreateRow",
+      "resolveStrandedIssueRecoveryOwnerAgentId",
+      "resolveInvokableRecoveryAgentId",
+      "isAgentInvokable",
+      "evaluateAgentInvokabilityFromDb",
+      "getInvocationBlock",
+    ]) {
+      expect(pooledInsideTransaction.filter((entry) => entry.includes(name))).toEqual([]);
+    }
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(actionRows).toHaveLength(1);
+  });
+
   it("does not mutate an ownerless action on repeated sweep passes", async () => {
     const { coderId, managerId, sourceIssue } = await seedCompany();
     await db.update(agents).set({ status: "paused" }).where(eq(agents.id, coderId));
@@ -1683,6 +1803,62 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       latestRunErrorCode: "k8s_pod_schedule_failed",
     });
   });
+
+  // BLO-27463 AC#2: provider-capacity terminations must be classified infra-class —
+  // no org-chain reassignment. `rate_limit_exhausted` and `provider_throttled_no_progress`
+  // both carry errorFamily `rate_limit_exhausted` (heartbeat.ts
+  // `readHeartbeatRunErrorFamily`) and were absent from ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES,
+  // so a provider declining to serve moved `ownerAgentId` up the manager ladder for an
+  // event nobody on this side caused. Measured on the 4-week recovery-observability window
+  // 2026-09-13: 9 `provider_throttled_no_progress` + 8 `rate_limit_exhausted` actions filed
+  // under cause `stranded_assigned_issue`.
+  //
+  // Asserted per-code rather than in one case because the two are set members that can drift
+  // apart, and asserted on ownership (the acceptance criterion) rather than on a counter.
+  for (const errorCode of ["rate_limit_exhausted", "provider_throttled_no_progress"] as const) {
+    it(`re-dispatches a ${errorCode} provider-capacity failure to the existing assignee instead of the manager`, async () => {
+      const { managerId, coderId, sourceIssue } = await seedCompany();
+      const enqueueWakeup = vi.fn<
+        (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+      >(async () => ({ id: randomUUID() }));
+      const recovery = recoveryService(db, { enqueueWakeup });
+      const latestRun = {
+        id: randomUUID(),
+        agentId: coderId,
+        status: "failed",
+        error: "provider capacity throttle (429) — the provider advertised availability no " +
+          "earlier than 2026-09-13T01:17:00.262Z",
+        errorCode,
+        contextSnapshot: { retryReason: "issue_continuation_needed" },
+        livenessState: "needs_followup",
+        resultJson: null,
+        usageJson: null,
+        createdAt: new Date(),
+      } as const;
+
+      await recovery.escalateStrandedAssignedIssue({
+        issue: sourceIssue,
+        previousStatus: "in_progress",
+        latestRun,
+        comment: "Automatic continuation recovery failed.",
+      });
+
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+      expect(action).toMatchObject({
+        kind: "stranded_assigned_issue",
+        ownerAgentId: coderId,
+        returnOwnerAgentId: coderId,
+      });
+      expect(action?.ownerAgentId).not.toBe(managerId);
+
+      const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+      expect(updatedIssue).toMatchObject({ assigneeAgentId: coderId });
+      expect(enqueueWakeup).toHaveBeenCalledWith(coderId, expect.anything());
+    });
+  }
 
   it("keeps the original return owner after a temporary invocability fallback", async () => {
     const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
@@ -2398,30 +2574,93 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   // re-measured on the row itself: its monitor was cleared with `monitorAttemptCount: 8`
   // and it carried two `ready_for_review` PR work products written by the same webhook
   // that had already woken that owner from those PRs earlier the same day.
+  // Shared by the PEN-2791 and PEN-3352 blocks below. Both measure exemptions from the
+  // SAME seizable shape, so they must not seed subtly different rows -- PEN-3198's rule
+  // that two gates asking one question must not answer it differently applies to the
+  // fixtures that pin them just as much as to the predicates themselves.
+  // The PEN-2370 shape: productive succeeded run, no monitor, no blockers. Without an
+  // open PR this escalates -- which the first test below asserts, so the rest are
+  // known to be measuring the exemption rather than a row that was never at risk.
+  async function seedSeizableProductiveRow() {
+    const seeded = await seedCompany();
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "succeeded",
+      livenessState: "advanced",
+      startedAt: new Date(Date.now() - 45 * 60_000),
+      finishedAt: new Date(Date.now() - 40 * 60_000),
+      contextSnapshot: {
+        issueId: seeded.sourceIssueId,
+        retryReason: "issue_continuation_needed",
+        source: "issue.productive_terminal_continuation_recovery",
+      },
+    });
+    return seeded;
+  }
+
+  // The same row, except its continuation retry died on infrastructure instead of
+  // exiting 0. Under the BLO-32679 ruling this population IS reached: the exemption is
+  // consulted whenever the latest run never executed a model turn
+  // (`isInfraFailureRun`), not only on the succeeded arm. The run below is seeded to
+  // that never-executed shape, so the tests using this helper measure the exemption
+  // itself rather than a row the predicate declines to look at. The one test that
+  // varies it -- by giving the run real token usage -- is asserting the boundary, where
+  // an interrupted turn stays seizable.
+  //
+  // `job_failed` specifically, because that is the sweep's own retry giving up:
+  // `reconcileStrandedAssignedIssues` issues the `issue_continuation_needed`
+  // continuation, the lifecycle Job exhausts its backoff, and the resulting
+  // `latestRun.status = "failed"` is what disqualifies the row. Note the error code is
+  // NOT in `isInfraClassStrandedFailure`, so `infraClassCause` reads false on it.
+  async function seedSeizableFailedContinuationRow() {
+    const seeded = await seedCompany();
+    // Returned so callers that mutate this run address it by id. Scoping the update
+    // by `agentId` instead would be correct only while this helper inserts exactly
+    // one run for that agent -- an invariant of a shared helper two call sites away.
+    const failedRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: failedRunId,
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      // BLO-32679: `livenessState` and the usage/log pair are what
+      // `isInfraFailureRun` reads, so they are the difference between a run that never
+      // reached a model call and one interrupted mid-turn. Seeded to the measured
+      // production shape: of 71 live `stranded_assigned_issue` actions on company
+      // `aaced805` (2026-09-16), 71/71 carried `livenessState: "failed"`, and 49
+      // carried null usage with logs at most 4,738 bytes against a 200,000 ceiling.
+      // Leaving `livenessState` unset would make this row never-executed=false and
+      // quietly turn the exemption test below into a test of a row the predicate never
+      // looks at.
+      livenessState: "failed",
+      usageJson: null,
+      logBytes: null,
+      error: "BackoffLimitExceeded: Job has reached the specified backoff limit",
+      errorCode: "job_failed",
+      startedAt: new Date(Date.now() - 45 * 60_000),
+      finishedAt: new Date(Date.now() - 40 * 60_000),
+      contextSnapshot: {
+        issueId: seeded.sourceIssueId,
+        retryReason: "issue_continuation_needed",
+        source: "issue.productive_terminal_continuation_recovery",
+      },
+    });
+    return { ...seeded, failedRunId };
+  }
+
+  async function sweep() {
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    return recovery.reconcileStrandedAssignedIssues();
+  }
+
   describe("PEN-2791 open pull request as an attendance path", () => {
-    // The PEN-2370 shape: productive succeeded run, no monitor, no blockers. Without an
-    // open PR this escalates -- which the first test below asserts, so the rest are
-    // known to be measuring the exemption rather than a row that was never at risk.
-    async function seedSeizableProductiveRow() {
-      const seeded = await seedCompany();
-      await db.insert(heartbeatRuns).values({
-        id: randomUUID(),
-        companyId: seeded.companyId,
-        agentId: seeded.coderId,
-        invocationSource: "assignment",
-        triggerDetail: "system",
-        status: "succeeded",
-        livenessState: "advanced",
-        startedAt: new Date(Date.now() - 45 * 60_000),
-        finishedAt: new Date(Date.now() - 40 * 60_000),
-        contextSnapshot: {
-          issueId: seeded.sourceIssueId,
-          retryReason: "issue_continuation_needed",
-          source: "issue.productive_terminal_continuation_recovery",
-        },
-      });
-      return seeded;
-    }
 
     // Built through the real producer, not hand-written literals: the predicate filters
     // on the webhook's metadata source and system source-trust, so if either constant
@@ -2462,12 +2701,6 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         ...(input.updatedAt ? { updatedAt: input.updatedAt } : {}),
       });
       return fields;
-    }
-
-    async function sweep() {
-      const enqueueWakeup = vi.fn(async () => null);
-      const recovery = recoveryService(db, { enqueueWakeup });
-      return recovery.reconcileStrandedAssignedIssues();
     }
 
     it("escalates the PEN-2370 shape when no pull request is recorded (control)", async () => {
@@ -2551,6 +2784,425 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       // a schedule. Unbounded, this disjunct would hold an abandoned PR's issue
       // `in_progress` and unattended forever -- PEN-2791's own failure, entered from the
       // other side.
+      const result = await sweep();
+
+      expect(result.escalated).toBe(1);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("blocked");
+    });
+
+    // BLO-32679. These three pin the boundary of the exemption on the OTHER axis: not
+    // "which PRs count" but "which runs let the question be asked at all". The control
+    // establishes the shape is seizable; the second shows a never-executed run does not
+    // void a fresh PR; the third shows an executed-then-died run still does.
+    it("escalates the failed-continuation shape when no pull request is recorded (control)", async () => {
+      const { sourceIssueId } = await seedSeizableFailedContinuationRow();
+
+      const result = await sweep();
+
+      // Establishes the row is genuinely at risk, so the next test measures the
+      // exemption's reach rather than a row that was never seizable.
+      expect(result.escalated).toBe(1);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("blocked");
+    });
+
+    it("skips a fresh webhook-written open pull request when the latest run never executed", async () => {
+      const { companyId, sourceIssueId } = await seedSeizableFailedContinuationRow();
+      const fields = await insertPullRequestWorkProduct({
+        companyId,
+        issueId: sourceIssueId,
+        prNumber: 2434,
+      });
+      // Guard the guard, as above: an open status is what makes this a test of the
+      // exemption and not of a terminal PR.
+      expect(fields.status).toBe("ready_for_review");
+
+      const result = await sweep();
+
+      // BLO-32679, honoured. The seeded run failed before reaching a model call, so it
+      // interrupted no turn and says nothing about whether anyone will come back to the
+      // issue -- only that a runtime broke. The webhook-written open PR does answer that
+      // question, and is bounded by its own freshness grace (asserted above).
+      //
+      // Measured 2026-09-08 on company `aaced805`: 38 of 70 live
+      // `stranded_assigned_issue` actions were on rows matching this exact shape and
+      // were seized anyway, because the predicate was never consulted on the failed arm.
+      expect(result.escalated).toBe(0);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("in_progress");
+    });
+
+    it("still escalates a fresh webhook-written open pull request when the failed run had executed", async () => {
+      const { companyId, sourceIssueId, failedRunId } = await seedSeizableFailedContinuationRow();
+      // The boundary the BLO-32679 ruling draws, and the reason the exemption is keyed on
+      // `isInfraFailureRun` rather than on the error code. This run burned tokens before
+      // dying, so a turn WAS interrupted and its intent is unknown -- and if that
+      // interrupted work was what would have moved the PR, the webhook wake never comes.
+      //
+      // Not hypothetical: this is the one row out of 71 live actions (company
+      // `aaced805`, 2026-09-16) that had executed -- 6,531 input + 3,983 output tokens,
+      // 158,380 log bytes, under an `adapter_failed` code. Every error code in that
+      // population, including that one, is in `ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES`, so
+      // a code-keyed exemption would have suppressed recovery on a genuinely interrupted
+      // turn.
+      //
+      // Only the usage/log pair is varied off the shared seed, NOT the error code:
+      // `adapter_failed` is in `TRANSIENT_INFRA_CONTINUATION_ERROR_CODES`, so copying
+      // the live row's code verbatim would route this to the bounded-retry arm and the
+      // test would read `escalated: 0` for a reason that has nothing to do with the
+      // predicate under test. Holding the code at the control's `job_failed` keeps
+      // execution the single variable between this test and the one above.
+      await db.update(heartbeatRuns)
+        .set({
+          usageJson: { inputTokens: 6531, outputTokens: 3983 },
+          logBytes: 158380,
+        })
+        .where(eq(heartbeatRuns.id, failedRunId));
+      const fields = await insertPullRequestWorkProduct({
+        companyId,
+        issueId: sourceIssueId,
+        prNumber: 2434,
+      });
+      expect(fields.status).toBe("ready_for_review");
+
+      const result = await sweep();
+
+      expect(result.escalated).toBe(1);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("blocked");
+    });
+  });
+
+  // PEN-3352. PEN-2791 gave an open PR a durable attendance path; a pending board
+  // approval — the same class of object, a human gate on a queue measured in days — got
+  // none. So a row whose only gate was a board card had the monitor as its sole path,
+  // and the convergence guard retiring that monitor (correctly, against a gate the
+  // assignee cannot move) is what made the row seizable.
+  //
+  // Live instance PEN-2727, seized 2026-09-17T12:56:20Z with `latestRunStatus:
+  // succeeded` and `latestRunErrorCode: null` while linked to pending approval
+  // `71e27d35`.
+  //
+  // The tests below are deliberately weighted toward the NEGATIVE cases, because the
+  // hazard in this change is over-exemption: a row protected from seizure whose decision
+  // wake goes to some other agent is darker than one that gets seized, not safer.
+  describe("PEN-3352 pending board approval as an attendance path", () => {
+    async function insertBoardApproval(input: {
+      companyId: string;
+      issueId: string | null;
+      requestedByAgentId: string | null;
+      status?: string;
+      createdAt?: Date;
+      updatedAt?: Date;
+    }) {
+      const approvalId = randomUUID();
+      // `updated_at` follows `created_at` unless a caller moves it deliberately. Both
+      // columns are `defaultNow()`, so the real insert path leaves them EQUAL at filing
+      // and only `resubmit` separates them — back-dating `created_at` alone would seed a
+      // row production cannot produce (filed two weeks ago, touched a moment ago) and
+      // would make every aged-out test silently assert nothing once the predicate reads
+      // `GREATEST(created_at, updated_at)`. Caught exactly that way: the pre-existing
+      // grace test went green-to-red on the predicate change, because the fixture, not
+      // the code, was wrong.
+      const stamp = input.updatedAt ?? input.createdAt;
+      await db.insert(approvals).values({
+        id: approvalId,
+        companyId: input.companyId,
+        type: "request_board_approval",
+        requestedByAgentId: input.requestedByAgentId,
+        status: input.status ?? "pending",
+        payload: { title: "Authorize the seat purchase" },
+        ...(input.createdAt ? { createdAt: input.createdAt } : {}),
+        ...(stamp ? { updatedAt: stamp } : {}),
+      });
+      // `issueId: null` seeds a card that exists but is linked to nothing, so the
+      // issue-scoping clause can be measured without the link row confounding it.
+      if (input.issueId) {
+        await db.insert(issueApprovals).values({
+          companyId: input.companyId,
+          issueId: input.issueId,
+          approvalId,
+        });
+      }
+      return approvalId;
+    }
+
+    it("escalates the board-gated shape when no approval is linked (control)", async () => {
+      const { sourceIssueId } = await seedSeizableProductiveRow();
+
+      const result = await sweep();
+
+      // Establishes the row is genuinely seizable, so every test below measures the
+      // exemption rather than a row that was never at risk.
+      expect(result.escalated).toBe(1);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("blocked");
+    });
+
+    it("does not escalate when the assignee's own pending board approval is linked", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedSeizableProductiveRow();
+      await insertBoardApproval({
+        companyId,
+        issueId: sourceIssueId,
+        requestedByAgentId: coderId,
+      });
+
+      const result = await sweep();
+
+      // `approval-resolution.ts` wakes `requestedByAgentId` on approve, reject AND
+      // revision-requested, and all three reasons are in
+      // `RUNNING_ISSUE_WAKE_REASONS_REQUIRING_FOLLOWUP`, so the decision reaches this
+      // agent even if a run is in flight when it lands.
+      expect(result.escalated).toBe(0);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("in_progress");
+      expect(updated?.assigneeAgentId).toBe(coderId);
+      expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+    });
+
+    it("still escalates when the pending approval was filed by a different agent", async () => {
+      const { companyId, managerId, coderId, sourceIssueId } = await seedSeizableProductiveRow();
+      await insertBoardApproval({
+        companyId,
+        issueId: sourceIssueId,
+        requestedByAgentId: managerId,
+      });
+
+      const result = await sweep();
+
+      // THE case this predicate exists to get right, and the one a copy of the PR path
+      // would get wrong. The PR webhook wakes the issue's assignee, so that predicate can
+      // ignore identity; an approval decision wakes the REQUESTER. Measured 2026-09-17,
+      // 8 of 20 linked (approval, issue) pairs in the reference company had requester !=
+      // assignee — including PEN-2727 itself. Exempting this row would protect it from
+      // recovery while leaving it genuinely dark.
+      expect(result.escalated).toBe(1);
+      expect(coderId).not.toBe(managerId);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("blocked");
+    });
+
+    it("still escalates for a pending approval with no requesting agent", async () => {
+      const { companyId, sourceIssueId } = await seedSeizableProductiveRow();
+      await insertBoardApproval({
+        companyId,
+        issueId: sourceIssueId,
+        requestedByAgentId: null,
+      });
+
+      // `queueRequesterWake` returns immediately without a requester agent, so a
+      // board- or system-filed card (every `budget_override_required` row) predicts no
+      // agent wake at all. Same shape as the hand-created PR row above: a claim that
+      // someone is waiting is not evidence that anyone will be woken.
+      const result = await sweep();
+
+      expect(result.escalated).toBe(1);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("blocked");
+    });
+
+    it("still escalates once the approval has been decided", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedSeizableProductiveRow();
+      await insertBoardApproval({
+        companyId,
+        issueId: sourceIssueId,
+        requestedByAgentId: coderId,
+        status: "approved",
+      });
+
+      // A decided card has already spent its wake. Mirrors the merged-PR case: the
+      // external event source has nothing further to emit.
+      const result = await sweep();
+
+      expect(result.escalated).toBe(1);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("blocked");
+    });
+
+    it("still escalates for a revision-requested approval", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedSeizableProductiveRow();
+      await insertBoardApproval({
+        companyId,
+        issueId: sourceIssueId,
+        requestedByAgentId: coderId,
+        status: "revision_requested",
+      });
+
+      // Deliberately narrower than the issue-graph liveness classifier, which counts
+      // `pending` and `revision_requested` alike. That gate asks "does anything own the
+      // next action" — and a revision request is owned, by the requester. This gate asks
+      // "will an external event wake this agent", and the board has already answered:
+      // the next move is the assignee resubmitting, not an event arriving.
+      const result = await sweep();
+
+      expect(result.escalated).toBe(1);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("blocked");
+    });
+
+    it("stops believing a pending approval that has aged past the grace", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedSeizableProductiveRow();
+      const graceMs = loadConfig().pendingBoardApprovalAttendanceGraceMs;
+      await insertBoardApproval({
+        companyId,
+        issueId: sourceIssueId,
+        requestedByAgentId: coderId,
+        createdAt: new Date(Date.now() - (graceMs + 60 * 60_000)),
+      });
+
+      // The bound is the load-bearing half, exactly as on the PR path. Unbounded, this
+      // disjunct would hold the issue of a card nobody will ever decide `in_progress`
+      // and unattended forever — PEN-2791's own failure entered from the other side, and
+      // the reason `kind: "external_service"` (which is exempt from the convergence
+      // guard outright) is not the right escape hatch for a human gate.
+      const result = await sweep();
+
+      expect(result.escalated).toBe(1);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("blocked");
+    });
+
+    it("keeps believing a stale-filed approval that was resubmitted inside the grace", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedSeizableProductiveRow();
+      const graceMs = loadConfig().pendingBoardApprovalAttendanceGraceMs;
+      await insertBoardApproval({
+        companyId,
+        issueId: sourceIssueId,
+        requestedByAgentId: coderId,
+        // Filed well outside the grace, revision-requested, then resubmitted an hour ago.
+        // `resubmit` is the one writer that returns a row to `pending` while moving
+        // `updated_at` and leaving `created_at` at the original filing instant, so this is
+        // the exact shape that `created_at`-only bounding got wrong: a fresh board
+        // decision is owed, and the row would have read as a two-week-old dead card.
+        createdAt: new Date(Date.now() - (graceMs + 7 * 24 * 60 * 60_000)),
+        updatedAt: new Date(Date.now() - 60 * 60_000),
+      });
+
+      const result = await sweep();
+
+      expect(result.escalated).toBe(0);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("in_progress");
+    });
+
+    it("keeps believing a card the real resubmit path returned to pending", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedSeizableProductiveRow();
+      const graceMs = loadConfig().pendingBoardApprovalAttendanceGraceMs;
+      const filedAt = new Date(Date.now() - (graceMs + 7 * 24 * 60 * 60_000));
+      const approvalId = await insertBoardApproval({
+        companyId,
+        issueId: sourceIssueId,
+        requestedByAgentId: coderId,
+        createdAt: filedAt,
+      });
+
+      // The test above hand-writes the post-resubmit shape; this one DRIVES it through the
+      // real producers, because the shape is only meaningful if production can still make
+      // it. That is a cross-module invariant — the predicate lives in `recovery/service.ts`
+      // and the writers in `services/approvals.ts` — and a hand-written fixture cannot fail
+      // when the writers change underneath it.
+      //
+      // What this pins, verified by breaking each one and watching it go red: `created_at`
+      // survives the round trip (so the aged-out tests above keep measuring something), and
+      // the real two-step chain yields a row this predicate exempts.
+      //
+      // What it does NOT pin, stated because the obvious reading is wrong: it does not
+      // catch `resubmit` ceasing to move `updated_at`. Measured — patch that write out and
+      // this test still passes, because `requestRevision` moved `updated_at` one step
+      // earlier and `GREATEST()` is already fresh. Freshness on a resubmitted row is
+      // produced by the revision→resubmit chain JOINTLY, not by `resubmit` alone, so no
+      // single-writer test can pin it.
+      //
+      // Residual hazard, deliberately left visible rather than papered over: a NEW writer
+      // that bumps `updated_at` on a row it leaves `pending` would silently widen this
+      // exemption by up to the full grace, and nothing here would catch it. The live
+      // near-miss is `services/agents.ts`, which edits `payload` on rows explicitly scoped
+      // to `pending` and is harmless for one reason only — it omits `updatedAt`.
+      await approvalService(db).requestRevision(approvalId, "board-user", "Needs a cost line.");
+      const resubmitted = await approvalService(db).resubmit(approvalId);
+
+      // Guard the premise before measuring the behaviour, so a change to the producers
+      // fails HERE with a legible cause rather than as an unexplained escalation count.
+      expect(resubmitted.status).toBe("pending");
+      expect(resubmitted.createdAt.getTime()).toBe(filedAt.getTime());
+      expect(resubmitted.updatedAt.getTime()).toBeGreaterThan(filedAt.getTime());
+
+      // The approval path must be the ONLY thing exempting this row, or the assertion
+      // below would pass for a reason this test does not name. `services/approvals.ts`
+      // never writes `agent_wakeup_requests` — wakes are queued from
+      // `approval-resolution.ts`, which these two methods do not call — so this should be
+      // empty, and it is asserted rather than assumed so a future wake-on-resubmit cannot
+      // quietly take over as the thing keeping the row alive.
+      const queuedWakes = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.companyId, companyId));
+      expect(queuedWakes).toHaveLength(0);
+
+      const result = await sweep();
+
+      expect(result.escalated).toBe(0);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("in_progress");
+    });
+
+    it("does not exempt a row whose fresh approval is linked to a different issue", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedSeizableProductiveRow();
+      // Same company, same requester, same `pending` status, inside the grace — differing
+      // only in that no `issue_approvals` row ties it to this issue. Without the
+      // `issueApprovals.issueId` clause this would be an AGENT-level exemption: one open
+      // card would shield every issue that agent holds. This test is what keeps the
+      // exemption issue-level.
+      await insertBoardApproval({
+        companyId,
+        issueId: null,
+        requestedByAgentId: coderId,
+      });
+
+      const result = await sweep();
+
+      expect(result.escalated).toBe(1);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("blocked");
+    });
+
+    it("does not escalate a fresh pending approval when the latest run never executed", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedSeizableFailedContinuationRow();
+      await insertBoardApproval({
+        companyId,
+        issueId: sourceIssueId,
+        requestedByAgentId: coderId,
+      });
+
+      const result = await sweep();
+
+      // Follows the PR path onto the BLO-32679 gate rather than staying on the
+      // succeeded-only one. That ruling landed while this branch was open and the earlier
+      // revision of this test pre-committed to flipping with it, precisely so the two
+      // gates stay one policy (PEN-3198). The argument transfers unchanged: a run that
+      // never reached a model call cannot have decided a board card, so a card that was
+      // pending before it started is still pending after — the run is evidence about the
+      // runtime, not about attendance.
+      expect(result.escalated).toBe(0);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("in_progress");
+    });
+
+    it("still escalates an aged-out approval when the latest run never executed", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedSeizableFailedContinuationRow();
+      const graceMs = loadConfig().pendingBoardApprovalAttendanceGraceMs;
+      await insertBoardApproval({
+        companyId,
+        issueId: sourceIssueId,
+        requestedByAgentId: coderId,
+        createdAt: new Date(Date.now() - (graceMs + 60 * 60_000)),
+      });
+
+      // The grace is what makes admitting this disjunct onto the infra-failure gate
+      // bounded rather than an unbounded belief. Pinned separately from the succeeded-arm
+      // grace test because the two gates are different call sites and only a test proves
+      // the bound travelled with the disjunct.
       const result = await sweep();
 
       expect(result.escalated).toBe(1);
@@ -7268,6 +7920,22 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       );
       expect(escalationComment?.body).toContain("cause `stranded_assigned_issue`");
       expect(escalationComment?.body).toContain(`to owner \`${managerId}\``);
+
+      // BLO-19124: the announcement must not contradict the grant the same
+      // codebase gives the previous owner. `agentHasRecoveryHandoffGrantOnIssue`
+      // (BLO-18906, TTL BLO-20263) keeps `issue:comment` open to exactly
+      // `previousOwnerAgentId` for RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS after
+      // this transfer — the grant itself is covered in
+      // `authorization-service.test.ts`. What this pins is that the only
+      // agent-facing sentence about it AGREES: the old text said "can no longer
+      // PATCH or comment", so on BLO-33322 the previous owner completed the work
+      // and recorded nothing, believing it had no channel.
+      expect(escalationComment?.body).not.toContain("no longer PATCH or comment");
+      expect(escalationComment?.body).toContain("CAN still comment here");
+      // The quoted window is derived, so raising the TTL without re-reading this
+      // prose fails here rather than shipping a sentence that under-states it.
+      const ttlHours = Math.round(RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS / (60 * 60 * 1000));
+      expect(escalationComment?.body).toContain(`for ${ttlHours} hours after this transfer`);
     });
   });
 
@@ -8436,7 +9104,624 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         .where(eq(issueRecoveryActions.id, action.id));
       expect(stillFolded).toMatchObject({ status: "cancelled" });
     });
+  });
 
+  /**
+   * BLO-32566. A status-only recovery wake cannot write an issue document. So once a run on
+   * the issue has been refused exactly that write, re-dispatching status-only guarantees the
+   * identical 403 — and because only a recorded disposition clears the recovery action, while
+   * the action is active *every* wake on the issue is status-only, the issue can never produce
+   * the deliverable that would clear it. Reproduced four times (BLO-31222 x3, then on
+   * BLO-32566 itself, where a completed and verified instrument revision could not be landed).
+   *
+   * BLO-23197 applied this escalation to the successful-run-handoff lane and explicitly scoped
+   * the stranded lane out as follow-up; these are the follow-up's assertions.
+   *
+   * These run against embedded Postgres deliberately. The failure mode being guarded is a
+   * `select()` that omits `statusOnlyDocumentWriteRefusedAt` — which disables the escalation in
+   * production while a unit test built from a row *literal* still passes. Only a test that
+   * reads the column back through the real projection can catch it.
+   */
+  describe("stranded recovery wakes escalate off status-only after a refused document write", () => {
+    /** Newest run for the issue, optionally carrying the refusal stamp. */
+    async function seedNewestIssueRun(input: {
+      companyId: string;
+      agentId: string;
+      issueId: string;
+      refusedAt: Date | null;
+    }) {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId: input.companyId,
+        agentId: input.agentId,
+        invocationSource: "automation",
+        status: "succeeded",
+        contextSnapshot: { issueId: input.issueId },
+        statusOnlyDocumentWriteRefusedAt: input.refusedAt,
+        startedAt: new Date("2026-09-07T16:10:00.000Z"),
+        finishedAt: new Date("2026-09-07T16:15:00.000Z"),
+      });
+      return runId;
+    }
+
+    async function seedBlockedRecovery() {
+      const fixture = await seedCompany();
+      await db
+        .update(issues)
+        .set({ status: "blocked", assigneeAgentId: fixture.coderId })
+        .where(eq(issues.id, fixture.sourceIssueId));
+      const [action] = await db
+        .insert(issueRecoveryActions)
+        .values({
+          companyId: fixture.companyId,
+          sourceIssueId: fixture.sourceIssueId,
+          kind: "stranded_assigned_issue",
+          cause: "stranded_assigned_issue",
+          status: "active",
+          ownerType: "agent",
+          ownerAgentId: fixture.managerId,
+          returnOwnerAgentId: fixture.coderId,
+          fingerprint: `source_scoped_recovery:${fixture.companyId}:${fixture.sourceIssueId}:blocked`,
+          evidence: {},
+          nextAction: "Wake the owner to re-drive the stranded issue.",
+        })
+        .returning();
+      return { ...fixture, action: action! };
+    }
+
+    /**
+     * The `job_missing` shape this suite already proves escalates to exactly one stranded
+     * recovery wake through `reconcileStrandedAssignedIssues`, optionally carrying the
+     * refusal stamp. Returns the run id so a test can assert which run the rows name.
+     */
+    async function seedStrandedJobMissingRun(input: {
+      companyId: string;
+      agentId: string;
+      issueId: string;
+      refusedAt: Date | null;
+    }) {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId: input.companyId,
+        agentId: input.agentId,
+        invocationSource: "automation",
+        status: "failed",
+        error: "External lifecycle Job is missing while heartbeat run is still running",
+        errorCode: "job_missing",
+        resultJson: {
+          externalLifecycleRecovery: { adapterInvocationStarted: true },
+        },
+        contextSnapshot: { issueId: input.issueId },
+        statusOnlyDocumentWriteRefusedAt: input.refusedAt,
+        startedAt: new Date("2026-09-07T16:10:00.000Z"),
+        finishedAt: new Date("2026-09-07T16:15:00.000Z"),
+      });
+      return runId;
+    }
+
+    /** `details` of every activity row on the issue, oldest first, optionally filtered on `details.source`. */
+    async function issueActivityDetails(companyId: string, issueId: string, source?: string) {
+      const rows = await db
+        .select({ details: activityLog.details })
+        .from(activityLog)
+        .where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityId, issueId)))
+        .orderBy(activityLog.createdAt);
+      return rows
+        .map((row) => (row.details ?? {}) as Record<string, unknown>)
+        .filter((details) => source === undefined || details.source === source);
+    }
+
+    const DISPATCHED = "recovery.stranded_recovery_wake_dispatched";
+    const ESCALATED = "recovery.reconcile_stranded_assigned_issue";
+
+    // The wake backstop is the only re-wake path for an action whose issue is `blocked`
+    // (STRANDED_RECOVERY_WAKE_BACKSTOP_ISSUE_STATUSES), and it was absent from the audit that
+    // produced this issue — which named only the two paths inside
+    // `enqueueSourceScopedStrandedRecoveryWake`. Gating those and not this one would leave the
+    // trap intact for every blocked issue.
+    it("wake backstop escalates to planning_only when the newest run was refused a document write", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedBlockedRecovery();
+      const refusedRunId = await seedNewestIssueRun({
+        companyId,
+        agentId: coderId,
+        issueId: sourceIssueId,
+        refusedAt: new Date("2026-09-07T16:15:00.000Z"),
+      });
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      const result = await recovery.reconcileStrandedRecoveryWakeBackstop({ companyId });
+
+      expect(result).toMatchObject({ checked: 1, healed: 1 });
+      expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+      const opts = enqueueWakeup.mock.calls[0]?.[1] as any;
+      // `planning_only` is the minimum escalation that clears the trap: document writes are
+      // allowed again while deliverable/annotation writes stay barred.
+      expect(opts).toMatchObject({
+        reason: "source_scoped_recovery_action",
+        contextSnapshot: {
+          recoveryIntent: "planning_only",
+          allowDocumentUpdates: true,
+          allowDeliverableWork: false,
+          resumeRequiresNormalModel: false,
+        },
+        payload: { recoveryIntent: "planning_only", allowDocumentUpdates: true },
+      });
+      // The cheap profile is what binds the run to the status-only lane, so its ABSENCE is the
+      // load-bearing assertion — a `planning_only` intent that still carried `modelProfile:
+      // cheap` would re-enter the same refusal.
+      expect(opts.contextSnapshot.modelProfile).toBeUndefined();
+      expect(opts.payload.modelProfile).toBeUndefined();
+
+      // Discoverable without reading the blocked issue's own documents — the surface the first
+      // two occurrences were reported on and lost.
+      const [entry] = await db
+        .select({ details: activityLog.details })
+        .from(activityLog)
+        .where(and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.entityId, sourceIssueId),
+          eq(activityLog.actorId, "stranded_recovery_wake_backstop"),
+        ));
+      expect(entry?.details).toMatchObject({
+        recoveryWorkClass: "planning_only",
+        escalatedAfterDocumentWriteRefusal: true,
+        documentWriteRefusedRunId: refusedRunId,
+      });
+    });
+
+    // Guards the SIGN of the check. Without this, a fix that escalated unconditionally would
+    // pass the test above while silently moving every stranded recovery wake onto the normal
+    // model — the failure in the expensive direction.
+    it("wake backstop stays status-only when no document write was refused", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedBlockedRecovery();
+      await seedNewestIssueRun({
+        companyId,
+        agentId: coderId,
+        issueId: sourceIssueId,
+        refusedAt: null,
+      });
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      const result = await recovery.reconcileStrandedRecoveryWakeBackstop({ companyId });
+
+      expect(result).toMatchObject({ checked: 1, healed: 1 });
+      const opts = enqueueWakeup.mock.calls[0]?.[1] as any;
+      expect(opts).toMatchObject({
+        contextSnapshot: {
+          recoveryIntent: "status_only",
+          allowDocumentUpdates: false,
+          modelProfile: "cheap",
+        },
+      });
+      const [entry] = await db
+        .select({ details: activityLog.details })
+        .from(activityLog)
+        .where(and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.entityId, sourceIssueId),
+          eq(activityLog.actorId, "stranded_recovery_wake_backstop"),
+        ));
+      expect(entry?.details).toMatchObject({
+        recoveryWorkClass: "status_only",
+        escalatedAfterDocumentWriteRefusal: false,
+        documentWriteRefusedRunId: null,
+      });
+    });
+
+    // The escalation-time path, which covers the todo/in_progress/in_review statuses the
+    // backstop does not select — the statuses the reported BLO-31222 occurrences were in.
+    //
+    // The seed is the `job_missing` shape this suite already proves escalates to exactly one
+    // status-only recovery wake. The stamp is placed on that swept run so the gate is
+    // exercised end-to-end through the real sweep and the real projection; in production it
+    // arrives on a later status-only recovery run, which the next sweep then reads as
+    // `latestRun`. What is asserted here is the wiring — that the wake's work class is derived
+    // from the stamp rather than hardcoded.
+    it("escalation-time wake escalates to planning_only after a refused document write", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedCompany();
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId: coderId,
+        invocationSource: "automation",
+        status: "failed",
+        error: "External lifecycle Job is missing while heartbeat run is still running",
+        errorCode: "job_missing",
+        resultJson: {
+          externalLifecycleRecovery: { adapterInvocationStarted: true },
+        },
+        contextSnapshot: { issueId: sourceIssueId },
+        statusOnlyDocumentWriteRefusedAt: new Date("2026-09-07T16:15:00.000Z"),
+        startedAt: new Date("2026-09-07T16:10:00.000Z"),
+        finishedAt: new Date("2026-09-07T16:15:00.000Z"),
+      });
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      const result = await recovery.reconcileStrandedAssignedIssues();
+
+      expect(result).toMatchObject({ escalated: 1 });
+      const recoveryWake = enqueueWakeup.mock.calls
+        .map((call) => call[1] as any)
+        .find((opts) => opts?.reason === "source_scoped_recovery_action");
+      expect(recoveryWake).toBeDefined();
+      expect(recoveryWake.contextSnapshot).toMatchObject({
+        recoveryIntent: "planning_only",
+        allowDocumentUpdates: true,
+        allowDeliverableWork: false,
+      });
+      expect(recoveryWake.contextSnapshot.modelProfile).toBeUndefined();
+    });
+
+    // Sign guard for the escalation-time path: the same seed without the stamp must stay
+    // status-only. This is the pairing that proves the stamp is the variable — the identical
+    // sweep, one field different.
+    it("escalation-time wake stays status-only when no document write was refused", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedCompany();
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId: coderId,
+        invocationSource: "automation",
+        status: "failed",
+        error: "External lifecycle Job is missing while heartbeat run is still running",
+        errorCode: "job_missing",
+        resultJson: {
+          externalLifecycleRecovery: { adapterInvocationStarted: true },
+        },
+        contextSnapshot: { issueId: sourceIssueId },
+        statusOnlyDocumentWriteRefusedAt: null,
+        startedAt: new Date("2026-09-07T16:10:00.000Z"),
+        finishedAt: new Date("2026-09-07T16:15:00.000Z"),
+      });
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      const result = await recovery.reconcileStrandedAssignedIssues();
+
+      expect(result).toMatchObject({ escalated: 1 });
+      const recoveryWake = enqueueWakeup.mock.calls
+        .map((call) => call[1] as any)
+        .find((opts) => opts?.reason === "source_scoped_recovery_action");
+      expect(recoveryWake).toBeDefined();
+      expect(recoveryWake.contextSnapshot).toMatchObject({
+        recoveryIntent: "status_only",
+        allowDocumentUpdates: false,
+        modelProfile: "cheap",
+      });
+      // And the dispatch row agrees — the same sign guard on the delivery telemetry.
+      const [dispatched] = await issueActivityDetails(companyId, sourceIssueId, DISPATCHED);
+      expect(dispatched).toMatchObject({
+        recoveryWorkClass: "status_only",
+        escalatedAfterDocumentWriteRefusal: false,
+        documentWriteRefusedRunId: null,
+      });
+    });
+
+    /**
+     * Path B — the `assignee_fallback` branch (`attemptCount > 1`, owner != assignee, no new
+     * activity). This is the branch BLO-31836's reopen bar was specifically about: it exists to
+     * wake the **source assignee** when the upward owner has gone quiet, and it dispatched them
+     * status-only unconditionally. Asserted separately from Path A because the two differ in
+     * both the woken agent and the idempotency key, and only this one wakes the assignee.
+     */
+    it("assignee_fallback wake escalates to planning_only and targets the assignee", async () => {
+      const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+      // hasNewActivitySinceLastAttempt must be false: issue activity older than the action's
+      // last attempt. Both are pinned so the branch condition does not depend on wall clock.
+      await db
+        .update(issues)
+        .set({ lastActivityAt: new Date("2026-09-07T10:00:00.000Z") })
+        .where(eq(issues.id, sourceIssueId));
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId: coderId,
+        invocationSource: "automation",
+        status: "failed",
+        error: "External lifecycle Job is missing while heartbeat run is still running",
+        errorCode: "job_missing",
+        resultJson: {
+          externalLifecycleRecovery: { adapterInvocationStarted: true },
+        },
+        contextSnapshot: { issueId: sourceIssueId },
+        statusOnlyDocumentWriteRefusedAt: new Date("2026-09-07T09:30:00.000Z"),
+        startedAt: new Date("2026-09-07T09:00:00.000Z"),
+        finishedAt: new Date("2026-09-07T09:30:00.000Z"),
+      });
+      // Owner is the manager, assignee is the coder -> ownerIsNonAssignee. `attemptCount` above
+      // 1 and a `lastAttemptAt` after the issue's activity put the sweep on Path B.
+      await db.insert(issueRecoveryActions).values({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        cause: "stranded_assigned_issue",
+        status: "active",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        returnOwnerAgentId: coderId,
+        attemptCount: 2,
+        lastAttemptAt: new Date("2026-09-07T11:00:00.000Z"),
+        fingerprint: `source_scoped_recovery:${companyId}:${sourceIssueId}:stale-fingerprint`,
+        evidence: {},
+        nextAction: "Wake the owner to re-drive the stranded issue.",
+      });
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      await recovery.reconcileStrandedAssignedIssues();
+
+      const fallback = enqueueWakeup.mock.calls
+        .find(([, opts]) => typeof (opts as any)?.idempotencyKey === "string"
+          && (opts as any).idempotencyKey.endsWith(":assignee_fallback"));
+      expect(fallback).toBeDefined();
+      // The assignee, not the owner -- that is what makes this branch the one the reopen bar named.
+      expect(fallback![0]).toBe(coderId);
+      expect((fallback![1] as any).contextSnapshot).toMatchObject({
+        suppressedNonAssigneeWake: true,
+        recoveryIntent: "planning_only",
+        allowDocumentUpdates: true,
+      });
+      expect((fallback![1] as any).contextSnapshot.modelProfile).toBeUndefined();
+    });
+
+    /**
+     * Sign guard for Path B, paired with the case above: the identical seed minus the
+     * refusal stamp must stay status-only. Without it a Path B gate wired to escalate
+     * unconditionally would pass the positive case, which is the failure in the expensive
+     * direction — every assignee_fallback wake onto the normal model.
+     */
+    it("assignee_fallback wake stays status-only when no document write was refused", async () => {
+      const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+      await db
+        .update(issues)
+        .set({ lastActivityAt: new Date("2026-09-07T10:00:00.000Z") })
+        .where(eq(issues.id, sourceIssueId));
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId: coderId,
+        invocationSource: "automation",
+        status: "failed",
+        error: "External lifecycle Job is missing while heartbeat run is still running",
+        errorCode: "job_missing",
+        resultJson: {
+          externalLifecycleRecovery: { adapterInvocationStarted: true },
+        },
+        contextSnapshot: { issueId: sourceIssueId },
+        statusOnlyDocumentWriteRefusedAt: null,
+        startedAt: new Date("2026-09-07T09:00:00.000Z"),
+        finishedAt: new Date("2026-09-07T09:30:00.000Z"),
+      });
+      await db.insert(issueRecoveryActions).values({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        cause: "stranded_assigned_issue",
+        status: "active",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        returnOwnerAgentId: coderId,
+        attemptCount: 2,
+        lastAttemptAt: new Date("2026-09-07T11:00:00.000Z"),
+        fingerprint: `source_scoped_recovery:${companyId}:${sourceIssueId}:stale-fingerprint`,
+        evidence: {},
+        nextAction: "Wake the owner to re-drive the stranded issue.",
+      });
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      await recovery.reconcileStrandedAssignedIssues();
+
+      const fallback = enqueueWakeup.mock.calls
+        .find(([, opts]) => typeof (opts as any)?.idempotencyKey === "string"
+          && (opts as any).idempotencyKey.endsWith(":assignee_fallback"));
+      expect(fallback).toBeDefined();
+      expect(fallback![0]).toBe(coderId);
+      expect((fallback![1] as any).contextSnapshot).toMatchObject({
+        suppressedNonAssigneeWake: true,
+        recoveryIntent: "status_only",
+        allowDocumentUpdates: false,
+        modelProfile: "cheap",
+      });
+    });
+
+    /**
+     * BLO-32566 (review): the escalation activity row is written inside a transaction that
+     * commits BEFORE the wake is enqueued, so the only thing it can honestly record is the
+     * gate's INPUT — the issue's newest run was refused a document write. Whether a
+     * planning-capable wake actually went out because of it is written by
+     * `enqueueSourceScopedStrandedRecoveryWake` on a separate row, after `enqueueWakeup`
+     * returned a queued run. Both rows are read from the same locked newest-run read, which
+     * this asserts by checking they name the same refused run; `input.latestRun` (the sweep's
+     * classification run, nulled or scope-narrowed on four caller paths) has no path to
+     * either.
+     */
+    it("records the refusal on the escalation row and the delivered work class on the dispatch row", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedCompany();
+      const refusedRunId = await seedStrandedJobMissingRun({
+        companyId,
+        agentId: coderId,
+        issueId: sourceIssueId,
+        refusedAt: new Date("2026-09-07T16:15:00.000Z"),
+      });
+      const wakeRunId = randomUUID();
+      const enqueueWakeup = vi.fn(async () => ({ id: wakeRunId }));
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      await recovery.reconcileStrandedAssignedIssues();
+
+      const [escalation] = await issueActivityDetails(companyId, sourceIssueId, ESCALATED);
+      expect(escalation).toMatchObject({ documentWriteRefusedRunId: refusedRunId });
+      // The delivery claim is NOT here: this row committed before the enqueue ran.
+      expect(escalation).not.toHaveProperty("recoveryWorkClass");
+      expect(escalation).not.toHaveProperty("escalatedAfterDocumentWriteRefusal");
+
+      const dispatched = await issueActivityDetails(companyId, sourceIssueId, DISPATCHED);
+      expect(dispatched).toHaveLength(1);
+      expect(dispatched[0]).toMatchObject({
+        wakeupRunId: wakeRunId,
+        recoveryWorkClass: "planning_only",
+        escalatedAfterDocumentWriteRefusal: true,
+        documentWriteRefusedRunId: refusedRunId,
+      });
+    });
+
+    /**
+     * BLO-32566 (review): `enqueueWakeup` returns null on its non-delivery paths (capacity
+     * deferral, pause hold, cooldown, …) and the attempt is refunded. No wake reached anyone,
+     * so nothing may claim a planning-capable wake went out. The transaction-time claim this
+     * replaces did exactly that — it could not see the enqueue's result because it committed
+     * before the enqueue ran.
+     */
+    it("records no delivered escalation when the wake is not delivered", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedCompany();
+      const refusedRunId = await seedStrandedJobMissingRun({
+        companyId,
+        agentId: coderId,
+        issueId: sourceIssueId,
+        refusedAt: new Date("2026-09-07T16:15:00.000Z"),
+      });
+      const enqueueWakeup = vi.fn(async () => null);
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      const result = await recovery.reconcileStrandedAssignedIssues();
+
+      expect(result).toMatchObject({ escalated: 1 });
+      // The wake WAS attempted, at the escalated class — it just was not delivered.
+      const recoveryWake = enqueueWakeup.mock.calls
+        .map((call) => call[1] as any)
+        .find((opts) => opts?.reason === "source_scoped_recovery_action");
+      expect(recoveryWake?.contextSnapshot).toMatchObject({ recoveryIntent: "planning_only" });
+      const [escalation] = await issueActivityDetails(companyId, sourceIssueId, ESCALATED);
+      expect(escalation).toMatchObject({ documentWriteRefusedRunId: refusedRunId });
+      expect(escalation).not.toHaveProperty("recoveryWorkClass");
+      expect(await issueActivityDetails(companyId, sourceIssueId, DISPATCHED)).toHaveLength(0);
+    });
+
+    /**
+     * BLO-32566 (review): the exhaustion gate inside `enqueueSourceScopedStrandedRecoveryWake`
+     * refuses to enqueue once the action's wake budget is spent, so a refused newest run on an
+     * exhausted action must produce no delivered-escalation telemetry. The transaction-time
+     * derivation this replaces predicted delivery from owner + cause alone, did not know the
+     * exhaustion gate existed, and claimed `planning_only` for wakes the gate then refused to
+     * send. Drives the real escalation helper past the budget against one owner, as the
+     * BLO-18996 exhaustion tests do, and asserts delivered claims == delivered wakes.
+     */
+    it("records no delivered escalation once the wake budget is exhausted", async () => {
+      const { companyId, coderId, sourceIssue, sourceIssueId } = await seedCompany();
+      const refusedRunId = await seedNewestIssueRun({
+        companyId,
+        agentId: coderId,
+        issueId: sourceIssueId,
+        refusedAt: new Date("2026-09-07T16:15:00.000Z"),
+      });
+      // The mock queues no run row, so the refused run stays the issue's newest throughout:
+      // every sweep below sees the stamp and would escalate if it dispatched at all.
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      const recovery = recoveryService(db, { enqueueWakeup });
+      const baseRun = {
+        agentId: coderId,
+        status: "failed",
+        error: "agent is not invokable",
+        errorCode: "agent_not_invokable",
+        contextSnapshot: { retryReason: "issue_continuation_needed" },
+        livenessState: "needs_followup",
+        resultJson: null,
+        usageJson: null,
+        createdAt: new Date(),
+      } as const;
+
+      for (let attempt = 0; attempt < defaultRecoveryActionMaxAttempts + 2; attempt += 1) {
+        await recovery.escalateStrandedAssignedIssue({
+          issue: sourceIssue,
+          previousStatus: "in_progress",
+          latestRun: { ...baseRun, id: randomUUID() },
+          comment: "Automatic continuation recovery failed.",
+        });
+      }
+
+      const deliveredWakes = enqueueWakeup.mock.calls
+        .filter(([, opts]) => (opts as any)?.reason === "source_scoped_recovery_action");
+      expect(deliveredWakes).toHaveLength(defaultRecoveryActionMaxAttempts);
+      // One dispatch row per delivered wake, each escalated — and not one more.
+      const dispatched = await issueActivityDetails(companyId, sourceIssueId, DISPATCHED);
+      expect(dispatched).toHaveLength(defaultRecoveryActionMaxAttempts);
+      for (const row of dispatched) {
+        expect(row).toMatchObject({
+          recoveryWorkClass: "planning_only",
+          escalatedAfterDocumentWriteRefusal: true,
+          documentWriteRefusedRunId: refusedRunId,
+        });
+      }
+      // The exhausted sweeps still recorded the refusal — the fact stays queryable — but
+      // carry no delivery claim.
+      const exhausted = (await issueActivityDetails(companyId, sourceIssueId))
+        .filter((row) => row.recoveryWakeBudgetExhausted === true);
+      expect(exhausted.length).toBeGreaterThan(0);
+      for (const row of exhausted) {
+        expect(row).toMatchObject({ documentWriteRefusedRunId: refusedRunId });
+        expect(row).not.toHaveProperty("recoveryWorkClass");
+        expect(row).not.toHaveProperty("escalatedAfterDocumentWriteRefusal");
+      }
+    });
+
+    /**
+     * BLO-32566 (review): `workspace_validation_failed` and `configuration_incomplete`
+     * dispatch no stranded wake at all, so a refused document write on those causes is a
+     * refusal that was RECORDED, not an escalation that was DELIVERED. The escalation row
+     * keeps the raw fact — still queryable — and no dispatch row exists to claim a work class
+     * for it.
+     */
+    it("does not report an escalation after refusal when the cause dispatches no wake", async () => {
+      const { companyId, coderId, sourceIssue, sourceIssueId } = await seedCompany();
+      const refusedRunId = await seedNewestIssueRun({
+        companyId,
+        agentId: coderId,
+        issueId: sourceIssueId,
+        refusedAt: new Date("2026-09-07T16:15:00.000Z"),
+      });
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      await recovery.escalateStrandedAssignedIssue({
+        issue: sourceIssue,
+        previousStatus: "in_progress",
+        latestRun: {
+          id: randomUUID(),
+          agentId: coderId,
+          status: "failed",
+          error: "workspace branch mismatch",
+          errorCode: "workspace_validation_failed",
+          contextSnapshot: {},
+          livenessState: "failed",
+          resultJson: {},
+        } as any,
+        comment: "Workspace failed validation.",
+        recoveryCause: "workspace_validation_failed",
+      });
+
+      const [escalation] = await issueActivityDetails(
+        companyId,
+        sourceIssueId,
+        "recovery.reconcile_workspace_validation_failed",
+      );
+      // The refusal itself stays on the row; only the "was escalated" claim is absent.
+      expect(escalation).toMatchObject({ documentWriteRefusedRunId: refusedRunId });
+      expect(escalation).not.toHaveProperty("recoveryWorkClass");
+      expect(escalation).not.toHaveProperty("escalatedAfterDocumentWriteRefusal");
+      expect(await issueActivityDetails(companyId, sourceIssueId, DISPATCHED)).toHaveLength(0);
+      expect(
+        enqueueWakeup.mock.calls.some(([, opts]) => (opts as any)?.reason === "source_scoped_recovery_action"),
+      ).toBe(false);
+    });
+  });
+
+  describe("recovery sweep status coverage", () => {
     /**
      * The invariant, not the instance. Every non-terminal status must be selectable by some
      * sweep; otherwise an active recovery action on it is a zombie no reconciler can service.

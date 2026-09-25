@@ -306,10 +306,65 @@ env:
 # Worker tier also runs plugin workers and scheduled plugin jobs. Linear's
 # periodic sync can transiently burn CPU over large BLO backlogs; keep enough
 # headroom for Alertmanager webhooks and health probes to complete.
+#
+# NOTE: this ONE block renders into BOTH tiers — templates/statefulset.yaml
+# (paperclip-0, the singleton worker) and templates/deployment-api.yaml
+# (paperclip-api, 2 replicas) both do `toYaml .Values.resources`. There is no
+# `api.resources`. So any change here multiplies by 3 pods, not 1.
 resources:
   requests:
     cpu: 1500m
-    memory: 2Gi
+    # 7Gi (was 2Gi) — PEN-2957 / PEN-2943. Pinned by
+    # tests/worker-memory-request.test.mjs, which also asserts the two invariants
+    # below (request >= heap ceiling, request < limit) on both tiers.
+    #
+    # WHY: Burstable pods are ranked for eviction by usage-above-request. At
+    # 2Gi the worker — heartbeat scheduler + plugin-worker host for every
+    # claude_local agent — peaked at ~3x its request, so the most load-bearing
+    # pod in the namespace was the first one the kubelet would kill under node
+    # pressure. This is a RELIABILITY change and reclaims nothing.
+    #
+    # WHY 7Gi, NOT THE 5Gi PEN-2943 PROPOSED: measured 2026-09-04, 14d
+    # max_over_time(container_memory_working_set_bytes) — the signal the kubelet
+    # ranks eviction on (NOT container_memory_usage_bytes, which adds reclaimable
+    # page cache and read 6.19 GiB on the same selector that day):
+    #   paperclip-0 (worker)  peak 5.86 GiB
+    #   paperclip-api         peak 4.70 GiB across replicas
+    # 5Gi is below that peak AND below the --max-old-space-size=6144 heap ceiling
+    # pinned in NODE_OPTIONS above, so it would have left the same failure mode
+    # in place under exactly the load that triggers it. 7Gi clears both and
+    # stays 3Gi under the 10Gi limit, so the pod remains Burstable — which is
+    # what makes the eviction-ranking argument apply at all. Same sizing as
+    # paperclip-pg on PEN-2956.
+    #
+    # COST: this block renders on the worker AND both API replicas (see NOTE
+    # above), so +5Gi here is +15 GiB of RESERVATION (not usage) at steady
+    # state; an API rollout (maxSurge 1, maxUnavailable 0, DoNotSchedule
+    # hostname spread) transiently needs a 7Gi slot on a third distinct host.
+    # The API tier is over-provisioned at its ~0.85 GiB steady state; splitting
+    # `api.resources` out of the chart is the cleaner fix, deliberately not
+    # bundled here.
+    #
+    # AFFORDABILITY is a check to re-run at merge time, not a figure to trust
+    # from a comment: every headroom number pinned in earlier revisions of this
+    # block was wrong within hours. What binds is a FULL 7Gi request fitting on
+    # the node a pod lands on — the scheduler re-evaluates the whole request on
+    # every reschedule, not the +5Gi delta. So: the workload=paperclip pool
+    # needs a node with phase-filtered headroom >= 7Gi for the worker, and one
+    # more on a host without an API replica for the surge pod. Fewer than that
+    # means re-deciding this value, not merging. Re-derive with:
+    #   sum by (node) (kube_node_status_allocatable{resource="memory"})
+    #   - sum by (node) (
+    #       kube_pod_container_resource_requests{resource="memory"}
+    #       * on (namespace,pod) group_left()
+    #       (max by (namespace,pod) (kube_pod_status_phase{phase=~"Running|Pending"} == 1))
+    #     )
+    # The phase join is mandatory: unfiltered, the query also counts requests
+    # of Succeeded and Failed pods that hold no memory, which under-reports
+    # headroom by tens of GiB on the worst node and GROWS with retained Job
+    # history (the retention PEN-2957 item B capped). Direction and cause are
+    # durable; the magnitude is not, so none is written here.
+    memory: 7Gi
   limits:
     cpu: "4"
     # 10Gi steady-state limit: off-heap bursts measured up to ~5Gi (and a 6Gi
@@ -418,7 +473,8 @@ tolerations:
     operator: Equal
     value: paperclip
     effect: NoSchedule
-  # With pve3 excluded (below), the API's hard two-host spread left pve2 as the
+  # When pve3 was excluded outright (a hard rule that ran 2026-09-05 to 09-12),
+  # the API's hard two-host spread left pve2 as the
   # only host for the second replica, and pve2 saturates under CI bursts
   # (34-49% steal on paperclip-10, 2026-09-06 03:00Z; pod-local /api/health up
   # to 9.9 s against a 10 s liveness timeout). paperclip-8 (pve1, 32 cores)
@@ -447,36 +503,30 @@ tolerations:
     value: "true"
     effect: NoSchedule
 
-# Keep production off nodes whose Proxmox host is pve3 (BLO-32054). pve3 runs
-# ~172 vCPUs on 80 cores and steals 20-40% of CPU time from every guest; a 5 s
-# liveness probe on a stalled vCPU misses its deadline and the kubelet kills a
-# healthy container (paperclip-api + paperclip-0 on 2026-09-05). Nodes already
-# carry blockcast.net/pve-storage-domain=<pve host>, so the rule keys on that.
-# The API template merges this beside its own podAntiAffinity; the StatefulSet
-# takes it verbatim. Drop the entry once pve3 is rebalanced (tracked in
-# BLO-32054).
+# Bias production away from saturated Proxmox hosts (BLO-32054). pve3 steals
+# 20-40% of CPU time from every guest; a 5 s liveness probe on a stalled vCPU
+# misses its deadline and the kubelet kills a healthy container (paperclip-api
+# + paperclip-0 on 2026-09-05). pve2 saturates the same way under CI runner
+# bursts (49% steal on paperclip-10, 2026-09-06 03:00Z). Nodes carry
+# blockcast.net/pve-storage-domain=<pve host>, so the rules key on that. The
+# API template merges this beside its own podAntiAffinity; the StatefulSet
+# takes it verbatim.
 #
-# pve2 saturates the same way whenever CI runner bursts land on
-# paperclip-5/-10/-11 (load 135/80 seen 2026-09-05 17:30Z, 20-24% steal;
-# 148/80 and 49% steal on 2026-09-06 03:00Z), but it is still not excluded
-# outright: the API's hard two-host spread (api.spreadAcrossNodes) needs a
-# second eligible node, pve4 hosts only paperclip-3, and the pve1 nodes
-# paperclip-1/-4 carry arc-dind-reserved, which production does not tolerate.
-# A NotIn [pve2, pve3] rule therefore wedged the rollout with a replica
-# Pending (2026-09-05 17:45Z). Instead: prefer pve4 outright, fall back to any
-# host that is not pve2, and let the spread rule place the second replica on
-# the best remaining host. Since the arc-multicast-integ-reserved toleration
-# above, that host is paperclip-8 (pve1); pve2 stays reachable only as the
-# fallback if paperclip-8 is full. This is a scheduler bias, not a pin.
+# Every rule here is PREFERRED, deliberately. A hard `required NotIn [pve3]`
+# shipped 2026-09-05 and was removed 2026-09-12 by CEO ruling on BLO-32054: it
+# excluded 4 of 11 nodes and stacked with the API's hard two-host spread
+# (api.spreadAcrossNodes, whenUnsatisfiable: DoNotSchedule) over only 5
+# uncordoned eligible nodes, so a cordon during an incident could leave a
+# replica Pending — the same failure a NotIn [pve2, pve3] rule already caused
+# on 2026-09-05 17:45Z. Steal is a capacity problem, not a correctness one:
+# preferring away captures nearly all the benefit without the outage tail.
+#
+# Resulting gradient (weights sum): pve4 = pve1 = 150 > pve3 = 50 > pve2 = 0.
+# pve1 joins pve4 at weight 100 on 7d hypervisor CPU (pve1 p95 0.829, above
+# 0.85 only 3.7% of the week; pve4 p95 0.552; pve2 58.2% and pve3 57.5% of the
+# week above 0.85). pve3 stays reachable as a last resort rather than excluded.
 affinity:
   nodeAffinity:
-    requiredDuringSchedulingIgnoredDuringExecution:
-      nodeSelectorTerms:
-        - matchExpressions:
-            - key: blockcast.net/pve-storage-domain
-              operator: NotIn
-              values:
-                - pve3
     preferredDuringSchedulingIgnoredDuringExecution:
       - weight: 100
         preference:
@@ -485,6 +535,7 @@ affinity:
               operator: In
               values:
                 - pve4
+                - pve1
       - weight: 50
         preference:
           matchExpressions:
@@ -574,6 +625,12 @@ githubApp:
   # posts success — step 7 of the rollout above, on penstock-llm-proxy-core, or
   # a pre-existing external writer as on onprem-k8s.
   prReviewGateStatusContext: review/ally-complete
+
+# The live value of the unlabeled truth block. Flip it here, not in values.yaml.
+# Procedure, baseline, flip and abort criteria:
+# docs/runbooks/evidence-gate-unlabeled-block.md
+evidenceGate:
+  unlabeledTruthBlock: "0"
 
 # paperclip-plugin-gbrain reads per-agent OAuth client credentials through
 # Penstock/Authbot. The mounted Secret below contains only the managed service
