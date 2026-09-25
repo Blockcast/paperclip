@@ -2127,4 +2127,31 @@ describe("execute: orphan-secret sweep wire-up (BLO-21857)", () => {
     expect(result.errorCode ?? "").not.toContain("secret");
     expect(result.errorMessage ?? "").not.toContain("secrets forbidden");
   });
+
+  // PR #1459 review: the sweep is awaited inside the per-agent creation mutex,
+  // which is released only by the `finally` at the bottom of execute(). A
+  // rejection is caught by the gate, but a *hang* is not a rejection — so before
+  // the timeout, a wedged listNamespacedSecret stalled the run that triggered it
+  // AND held that agent's mutex slot for the lifetime of the process, blocking
+  // every later execute() for the same agent. Both calls below hang forever
+  // without the bound, so asserting that they settle at all is the regression.
+  it("survives a listNamespacedSecret that never settles, and frees the agent mutex", async () => {
+    vi.resetModules();
+    mockCoreListSecrets.mockImplementation(() => new Promise(() => {}));
+
+    const { execute: freshExecute } = await import("./execute.js");
+    // Same agent id => same creation-mutex key => the second call queues behind
+    // the first. A short sweep bound keeps the test fast; 15s is the default.
+    const config = { orphanSecretSweepTimeoutMs: 100 };
+    const first = freshExecute(makeCtx({ config, runId: "run-hang-1" })).catch(() => "settled");
+    const second = freshExecute(makeCtx({ config, runId: "run-hang-2" })).catch(() => "settled");
+
+    const outcome = await Promise.race([
+      Promise.all([first, second]).then(() => "settled"),
+      new Promise((resolve) => setTimeout(() => resolve("stuck"), 10_000)),
+    ]);
+
+    expect(outcome).toBe("settled");
+    expect(mockCoreListSecrets).toHaveBeenCalled();
+  }, 20_000);
 });
