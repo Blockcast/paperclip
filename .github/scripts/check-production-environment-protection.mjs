@@ -4,11 +4,30 @@
  *
  * Reads the live GitHub environment that gates `helm upgrade` (default:
  * paperclip-production) and asserts the controls the board ratified on
- * approval b75f8156:
- *   1. a `required_reviewers` protection rule with prevent_self_review === true
- *      whose reviewer set is exactly the ratified set
+ * approval 60e271b7 (2026-09-14), which SUPERSEDES approval b75f8156
+ * (2026-08-03) as the authoritative record of the intended shape:
+ *   1. a `required_reviewers` protection rule whose reviewer list is non-empty
+ *      and whose membership is exactly the ratified set
  *   2. can_admins_bypass === false
  *   3. deployment_branch_policy.protected_branches === true
+ *
+ * WHICH RECORD IS AUTHORITATIVE (BLO-34896 / BLO-34527) — do not re-derive this.
+ * b75f8156 ratified two reviewers plus prevent_self_review. On 2026-08-30 the
+ * environment was narrowed to `[kkroo]` with prevent_self_review=false. Card
+ * 60e271b7 asked the board which of the two shapes was intended and was
+ * APPROVED on 2026-09-14T19:57:20Z, ruling (A): the narrowed shape IS the
+ * intended shape, reconcile the guard and not the environment. The ruling is
+ * recorded on BLO-34527. Three separate agent runs have now re-litigated this
+ * question; the answer lives here so a fourth does not have to.
+ *
+ * WHY prevent_self_review IS NO LONGER ASSERTED. It was re-ratified as false by
+ * 60e271b7, so asserting it would make the guard permanently red about a
+ * deliberate board decision — which erodes the same slack-relay channel this
+ * check depends on. It is still reported under `observed` so the single-approver
+ * posture stays visible in every alert and run log. The residual risk (one
+ * person can both dispatch and approve a production deploy, and their
+ * unavailability is a total deploy outage) is recorded on BLO-22329, not here:
+ * a detector should assert the ratified shape, not re-argue it.
  *
  * Why the reviewer set is compared by membership and not merely for
  * non-emptiness (BLO-22329): the 2026-08-08 drift *added* `kkroo` — a repo
@@ -28,10 +47,12 @@ import { writeFileSync } from 'node:fs';
 import { ghFetch } from './get-bot-token.mjs';
 
 /**
- * The reviewer set ratified on approval b75f8156. Changing it is deliberately a
- * code change: the PR is the audit trail that the two silent edits lacked.
+ * The reviewer set ratified on approval 60e271b7 (2026-09-14), superseding the
+ * ['eyad-hussein', 'MohamedElmdary'] set of b75f8156. Changing it is
+ * deliberately a code change: the PR is the audit trail that the two silent
+ * edits lacked.
  */
-export const RATIFIED_REVIEWERS = ['eyad-hussein', 'MohamedElmdary'];
+export const RATIFIED_REVIEWERS = ['kkroo'];
 
 /** A reviewer entry is either a User (login) or a Team (slug). */
 function reviewerName(entry) {
@@ -71,10 +92,28 @@ export function evaluateEnvironmentProtection(env, options = {}) {
     ? rule.reviewers.map(reviewerName).filter(Boolean)
     : [];
 
-  if (rule == null || reviewers.length === 0 || rule.prevent_self_review !== true) {
+  // THE DANGEROUS STATE: no rule at all, or a rule with nobody on it. Either
+  // way there is no effective gate on a production deploy, which is the one
+  // thing this check exists to shout about. Never weaken this clause to make a
+  // run go green (BLO-34896 AC2).
+  //
+  // `prevent_self_review` is deliberately NOT a disjunct here. It used to be,
+  // and because `||` short-circuits, the live prevent_self_review=false state
+  // sent every run down this branch and the membership comparison in the `else`
+  // below became UNREACHABLE — so the 2026-08-30 narrowing to [kkroo] was never
+  // actually reported as a membership change, only as a self-review complaint.
+  // A compound clause that skips a sibling check is how a tolerated drift masks
+  // an untolerated one; keep these conditions about "is there a gate at all".
+  //
+  // `rule == null` is SUBSUMED by `reviewers.length === 0` (an absent rule makes
+  // `reviewers` derive to []), so it survives mutation testing — it is kept for
+  // legibility, not coverage. Do not read the absent-rule test below as a guard
+  // on this term specifically.
+  if (rule == null || reviewers.length === 0) {
     violation(
       VIOLATION_KINDS.REQUIRED_REVIEWERS_RULE,
-      'required_reviewers: missing, or reviewers is empty, or prevent_self_review is not true',
+      'required_reviewers: rule is missing, or its reviewer list is empty — ' +
+        'there is no effective approval gate on production deploys',
     );
   } else {
     // Compare membership case-insensitively; GitHub logins are case-preserving
@@ -192,8 +231,10 @@ async function main() {
   if (compliant) {
     console.log(
       `PASS: ${repo} environment '${environmentName}' matches the ratified protection shape ` +
-        `(required_reviewers ${JSON.stringify(observed.reviewers)} + prevent_self_review, ` +
-        'can_admins_bypass=false, deployment_branch_policy.protected_branches=true).',
+        `(required_reviewers ${JSON.stringify(observed.reviewers)}, ` +
+        `can_admins_bypass=false, deployment_branch_policy.protected_branches=true). ` +
+        `Observed prevent_self_review=${JSON.stringify(observed.prevent_self_review)} ` +
+        '(re-ratified as permitted by approval 60e271b7; reported, not asserted).',
     );
     writeSummary({ status: 'compliant', repo, environment: environmentName, observed });
     process.exitCode = 0;

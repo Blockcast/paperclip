@@ -1,0 +1,56 @@
+import { describe, expect, it } from "vitest";
+
+import manifest from "./manifest.js";
+
+/**
+ * BLO-32163 — the manifest half of the metric-label promotion gate.
+ *
+ * A plugin tag becomes a Prometheus label only if it appears in BOTH the
+ * platform allow-list (`PLUGIN_METRIC_PROMOTABLE_TAG_KEYS`, pinned in
+ * `server/src/__tests__/plugin-metric-exposition.test.ts`) AND this manifest's
+ * `metricLabels`. Neither side can see the other at build time, so each pins
+ * its own half.
+ *
+ * ⚠ NO CI LANE RUNS THIS FILE. This package is in `UNEXECUTED_WITH_TESTS` in
+ * `scripts/__tests__/vitest-project-coverage.test.mjs` (PEN-2506), so these
+ * assertions are green-by-not-running. The manifest half is pinned for real in
+ * `server/src/__tests__/plugin-metric-exposition.test.ts`, which imports this
+ * manifest directly from a lane CI does execute. This file becomes a live
+ * second guard the day PEN-2506 wires the package in; until then do not treat
+ * it as coverage.
+ *
+ * Why this is worth a test rather than left to review: dropping a key here
+ * degrades *silently*. The metric keeps publishing and the alert rule keeps
+ * evaluating — the series simply loses the label, so a wedged-fence page stops
+ * naming which aggregate is stuck while still looking healthy on every
+ * dashboard. There is no error to notice and no gap in the graph.
+ */
+describe("alertmanager manifest — promoted metric labels", () => {
+  it("declares the labels a wedged-fence page needs to be actionable", () => {
+    // `aggregate_key` identifies the specific wedged fence. `alertname` alone
+    // cannot: two aggregates of the same rule differing only by
+    // dedupe-domain are distinct fences that wedge independently.
+    expect(manifest.metricLabels).toContain("aggregate_key");
+  });
+
+  it("does not declare phase, which would 4x the fence combination count", () => {
+    // Not an oversight and not free to re-add: ~23 live aggregate keys × 4
+    // lifecycle phases exceeds the 50-slot per-name label budget, so promoting
+    // `phase` would starve `aggregate_key` inside the fence metric's own
+    // allowance — the same failure the per-name ledger exists to fix, one
+    // level down. See PLUGIN_METRIC_PROMOTABLE_TAG_KEYS.
+    expect(manifest.metricLabels).not.toContain("phase");
+  });
+
+  it("keeps the pre-existing PEN-2799 labels", () => {
+    // Regression guard: BLO-32163 added to this list and must not have
+    // replaced it.
+    for (const key of ["alertname", "severity", "version"]) {
+      expect(manifest.metricLabels).toContain(key);
+    }
+  });
+
+  it("declares the metrics.write capability the labels are meaningless without", () => {
+    expect(manifest.capabilities).toContain("metrics.write");
+  });
+});

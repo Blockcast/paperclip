@@ -86,11 +86,12 @@ const approvalPayloadSchema = z.object({
     "`budget_override_required`: such a card carrying no parseable assertion is refused with " +
     "`budget_approval_missing_enforcement_assertion` (BLO-34008), whose `details.remediation` " +
     "gives the full shape — approving one writes nothing to `budget_policies`, so an undeclared " +
-    "figure is unverifiable forever. Optionally add the figure the change starts from as " +
-    "`from_usd` / `from_amount_cents` when you already know it: the approval-enforcement " +
-    "reconciler reads it as the recorded prior, which is what lets it tell a decision that was " +
-    "never applied from one that was later superseded; without it a mismatch can only be " +
-    "reported as `unverifiable_mismatch`. Never invent one. For every other type it stays " +
+    "figure is unverifiable forever. You do not need to supply the figure the change starts " +
+    "from: the server reads it off the policy the assertion names and records it as " +
+    "`from_amount_cents`, which is what lets the approval-enforcement reconciler tell a decision " +
+    "that was never applied from one that was later superseded. Send `from_usd` / " +
+    "`from_amount_cents` yourself only if you know a prior the policy row no longer shows — " +
+    "never invent one. For every other type it stays " +
     "optional; today only `budget_policy_amount` is " +
     "checked, and unknown kinds are ignored.",
 );

@@ -31,7 +31,7 @@ export function isGraphifyReindexArtifactOnlyPr({ author, branch, files }) {
   );
 }
 
-function buildComment(author, failures, informational) {
+export function buildComment(author, failures, informational) {
   if (failures.length === 0 && informational.length === 0) {
     return `✅ All checks passing — ready for Greptile review and maintainer approval.\n\n${COMMENT_SIGNATURE}`;
   }
@@ -52,7 +52,11 @@ function buildComment(author, failures, informational) {
   }
 
   lines.push(
-    '\nOnce updated, push a new commit and these checks will re-run automatically.\n',
+    // Most of what this gate fails on lives in the PR description or title,
+    // and `pull_request_target: edited` re-fires the check for those — so do
+    // not send the author to push a no-op commit to re-trigger a body check
+    // (BLO-26636).
+    '\nOnce updated, these checks re-run automatically: editing the PR description or title re-triggers them, as does pushing a new commit.\n',
     COMMENT_SIGNATURE
   );
 
@@ -66,9 +70,26 @@ export async function findExistingComment(fetchFromGitHub, token, repo, prNumber
       token
     );
 
+    // Match on the signature this script itself writes plus `type === 'Bot'`,
+    // NOT on a hard-coded App login. get-bot-token.mjs resolves the App from
+    // COMMITPERCLIP_APP_ID by design, so the author is `commitperclip[bot]`
+    // upstream and `allyblockcast[bot]` on Blockcast — the old allowlist
+    // hard-coded the upstream login, so on Blockcast `existing` was
+    // permanently null: failing runs POSTed a duplicate every time, and
+    // passing runs fell through the `|| existing` guard in main() and left the
+    // stale failure comment standing forever (BLO-26636). `type === 'Bot'` is
+    // what keeps a human comment quoting the signature out of the PATCH path.
+    //
+    // `endsWith`, not `includes`: on Blockcast every agent posts as
+    // `allyblockcast[bot]`, so `type === 'Bot'` discriminates nothing against
+    // an agent comment that merely *quotes* `— commitperclip` (they routinely
+    // do). Since `.find` returns the first match in ascending id order, such a
+    // comment posted before ours would take the PATCH — destroying content
+    // that is not ours and leaving our stale comment standing. buildComment
+    // puts the signature last in both branches, so anchoring on that is the
+    // property we actually own.
     const existing = comments.find(
-      c => (c.user.login === 'commitperclip[bot]' || c.user.login === 'commitperclip') &&
-           c.body.includes(COMMENT_SIGNATURE)
+      c => c.user?.type === 'Bot' && (c.body ?? '').trimEnd().endsWith(COMMENT_SIGNATURE)
     );
     if (existing) return existing;
 

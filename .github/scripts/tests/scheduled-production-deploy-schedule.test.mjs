@@ -17,7 +17,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { selectStuckApproval } from '../post-pending-deploy-alert.mjs';
-import { REFILLING_OUTCOMES } from '../deploy-stall-record.mjs';
+import { DEPLOY_WORKFLOW_FILE, REFILLING_OUTCOMES } from '../deploy-stall-record.mjs';
 
 const WORKFLOW = 'scheduled-production-deploy.yml';
 const DAILY_CRON = '23 7 * * *';
@@ -516,4 +516,21 @@ test('the escalation step can read run history for the supersede chain', () => {
     topLevelPermissions.includes('contents: read'),
     'compare needs contents: read',
   );
+});
+
+test('the dispatcher and DEPLOY_WORKFLOW_FILE name the same workflow', () => {
+  // The shell here spells the workflow independently of the JS constant, and
+  // nothing else compares them. Rename docker.yml and you get a 404 approve
+  // link in the alert with correct-looking prose, or the reverse — both of
+  // which read as working. `code` is comment-stripped, so the file's own prose
+  // about docker.yml cannot satisfy this.
+  const invocations = [...code.matchAll(/--workflow=(\S+)/g)].map((m) => m[1]);
+  assert.ok(invocations.length > 0, 'the dispatcher must query the deploy workflow by name');
+  for (const workflowFile of invocations) {
+    assert.equal(
+      workflowFile,
+      DEPLOY_WORKFLOW_FILE,
+      `dispatcher queries ${workflowFile} but the scripts build urls for ${DEPLOY_WORKFLOW_FILE}`,
+    );
+  }
 });

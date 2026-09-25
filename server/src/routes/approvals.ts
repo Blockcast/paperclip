@@ -26,6 +26,8 @@ import { redactApprovalPayloadForDisplay, withholdAgentConfigFromApprovalPayload
 import {
   BUDGET_POLICY_AMOUNT_ASSERTION,
   extractEnforcementAssertions,
+  loadEnforcedBudgetPolicies,
+  stampAssertionPriors,
 } from "../services/approval-enforcement-reconciler.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { resolveApprovalWithSideEffects } from "../services/approval-resolution.js";
@@ -156,10 +158,11 @@ function budgetAssertionRefusal(type: string, payload: unknown) {
         "policy that enforces the cap. Give the target as `expected_usd` (dollars) or " +
         "`expected_amount_cents` (integer cents). `label` is printed into the drift report this " +
         "assertion raises, so set it to the agent or scope this policy actually caps — a label " +
-        "left over from the example misattributes the drift. If you have the figure the change " +
-        "starts from, record it as `from_usd` / `from_amount_cents`: it is retained on the card " +
-        "so a later reader can tell 'never applied' from 'applied and then superseded'. Nothing " +
-        "reads it yet, so never invent one — only the target is required. On resubmit, send the " +
+        "left over from the example misattributes the drift. You do not need the figure the change " +
+        "starts from: the server reads it off the policy you named and records it as " +
+        "`from_amount_cents`, which is what lets a later reader tell 'never applied' from " +
+        "'applied and then superseded'. State `from_usd` / `from_amount_cents` yourself only if " +
+        "you know a prior the policy row no longer shows — never invent one. On resubmit, send the " +
         "corrected assertions in the resubmit body: the check runs against the payload that will " +
         "end up pending, and a card filed before this guard existed has none stored.",
     },
@@ -214,6 +217,20 @@ export function approvalRoutes(
     pluginWorkerManager: options.pluginWorkerManager,
   });
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
+
+  // Stamp the pre-decision figure onto any canonical assertion that omits one,
+  // reading it from the policy the assertion names (BLO-34008). Runs on both
+  // routes that can leave a card `pending`, for the same reason the refusal
+  // does: what matters is the payload that ends up decided.
+  //
+  // Called only after `budgetAssertionRefusal` has passed, so a payload with no
+  // usable assertion never reaches the lookup.
+  async function stampPriors(companyId: string, type: string, payload: unknown) {
+    if (type !== "budget_override_required") return payload;
+    const policyIds = extractEnforcementAssertions(payload).map((a) => a.policyId);
+    if (policyIds.length === 0) return payload;
+    return stampAssertionPriors(payload, await loadEnforcedBudgetPolicies(db, companyId, policyIds));
+  }
 
   async function requireApprovalAccess(req: Request, id: string) {
     const approval = await svc.getById(id);
@@ -617,13 +634,14 @@ export function approvalRoutes(
       res.status(422).json(budgetRefusal);
       return;
     }
+    const persistedPayload = await stampPriors(companyId, approvalInput.type, normalizedPayload);
 
     const actor = getActorInfo(req);
     const requestedByAgentId = actor.actorType === "agent" ? actor.actorId : null;
     const requestedByUserId = actor.actorType === "user" ? actor.actorId : null;
     const payloadObj =
-      typeof normalizedPayload === "object" && normalizedPayload !== null
-        ? (normalizedPayload as Record<string, unknown>)
+      typeof persistedPayload === "object" && persistedPayload !== null
+        ? (persistedPayload as Record<string, unknown>)
         : {};
     const approvalTitle =
       typeof payloadObj.title === "string" ? payloadObj.title : undefined;
@@ -642,7 +660,7 @@ export function approvalRoutes(
     const coalesceKey = runContextDecision.boardEscalationCoalesceKey;
     const { approval, deduplicated } = await svc.createWithIdempotency(companyId, {
       ...approvalInput,
-      payload: normalizedPayload,
+      payload: persistedPayload,
       // Requester identity is derived only from the authenticated actor, and exactly one
       // requester column is populated. Letting a user also nominate `requestedByAgentId`
       // makes the idempotency key ambiguous because both requester-scoped unique indexes
@@ -876,7 +894,29 @@ export function approvalRoutes(
       return;
     }
 
-    const approval = await svc.resubmit(id, normalizedPayload);
+    // Stamp whichever payload will actually end up `pending`, for the same reason
+    // the refusal checks that one. Stamping only a *supplied* payload left the
+    // motivating cohort uncovered: a card filed before the creation stamp existed
+    // carries an assertion with no prior, which passes the refusal above (that
+    // only requires *an* assertion, not a prior) and walks back to `pending`
+    // classifying as `unverifiable_mismatch` — the exact state this exists to
+    // eliminate. Found by Ally reviewing `b8d4f5e`.
+    //
+    // `stampAssertionPriors` returns its argument by reference when it changes
+    // nothing, so keep-vs-overwrite semantics are untouched: an empty resubmit
+    // still sends `undefined` and lets `svc.resubmit()` keep the stored payload
+    // unless there was genuinely a prior to add.
+    const stamped = await stampPriors(
+      existing.companyId,
+      existing.type,
+      normalizedPayload ?? existing.payload,
+    );
+    const resubmitPayload =
+      normalizedPayload === undefined && stamped === existing.payload
+        ? undefined
+        : (stamped as Record<string, unknown> | undefined);
+
+    const approval = await svc.resubmit(id, resubmitPayload);
     const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: approval.companyId,

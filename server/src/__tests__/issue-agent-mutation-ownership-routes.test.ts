@@ -4,6 +4,7 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { extractAgentMentionIds } from "@paperclipai/shared";
 import { REDACTED_EVENT_VALUE } from "../redaction.js";
+import { ACTIVE_RECOVERY_ACTION_STATUSES } from "../services/issue-recovery-actions.js";
 
 const issueId = "11111111-1111-4111-8111-111111111111";
 const companyId = "22222222-2222-4222-8222-222222222222";
@@ -12,6 +13,14 @@ const peerAgentId = "44444444-4444-4444-8444-444444444444";
 const staleAgentId = "66666666-1111-4666-8666-666666666666";
 const ownerRunId = "55555555-5555-4555-8555-555555555555";
 const recoveryActionId = "77777777-7777-4777-8777-777777777777";
+// A second issue the guarded agent is also assignee of — the run's own recovery
+// scope, distinct from the row being patched (BLO-34683 review, Critical).
+const peerIssueId = "88888888-8888-4888-8888-888888888888";
+// The freshly minted RECOVERY issue a stranded-recovery wake stamps as its
+// `contextSnapshot.issueId`, distinct from the `sourceIssueId` the action is
+// actually keyed on. It never holds an action, which is the whole point: it is
+// the id an `issueId`-only probe would ask about and get nothing back for.
+const recoveryIssueId = "99999999-9999-4999-8999-999999999999";
 
 const mockIssueService = vi.hoisted(() => ({
   addComment: vi.fn(),
@@ -3617,6 +3626,33 @@ describe("agent issue mutation checkout ownership", () => {
     allowDeliverableWork: false,
     allowDocumentUpdates: false,
     resumeRequiresNormalModel: true,
+    // BLO-34683: every status-only dispatch site stamps `issueId` (audited across
+    // `recovery/service.ts`, `heartbeat.ts`, `run-liveness-continuations.ts`,
+    // `productivity-review.ts`; the three `retryContextSnapshot` sites inherit it
+    // by spreading the prior snapshot). It is here because the gate now reads the
+    // RUN's own scope, and an absent one fails closed — so without this line every
+    // refusal below would pass on the missing-scope branch rather than on the
+    // containment it means to assert, which is the "cannot fail" defect twice over.
+    issueId,
+  };
+
+  // The route reads only whether the returned Map is non-empty; it never inspects
+  // `.status`. So a mock that returns a canned Map makes `escalated` behaviourally
+  // identical to `active`, and deleting "escalated" from ACTIVE_RECOVERY_ACTION_STATUSES
+  // leaves the suite green — the property the escalated case exists to pin lives in
+  // that constant's `inArray`, which a canned mock bypasses entirely. Mirroring the
+  // real query here, driven off the real constant, is what gives it a failing mutation.
+  const containedBy = (...actions: Record<string, unknown>[]) => {
+    mockIssueRecoveryActionService.listActiveForIssues.mockImplementation((async (
+      _companyId: string,
+      ids: string[],
+    ) => new Map(
+      actions
+        .filter((action) => (ACTIVE_RECOVERY_ACTION_STATUSES as readonly string[])
+          .includes(action.status as string))
+        .filter((action) => ids.includes(action.sourceIssueId as string))
+        .map((action) => [action.sourceIssueId as string, action]),
+    )) as never);
   };
 
   // The gate sits *below* the `runtime:manage` decision, and the suite default
@@ -3651,6 +3687,11 @@ describe("agent issue mutation checkout ownership", () => {
   it("refuses a status-only recovery run arming a monitor on its own issue", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress", executionPolicy: null }));
     mockAccessService.decide.mockImplementation(decideWithRuntimeManage);
+    // BLO-34683: the containment this guard exists to hold. Without an active
+    // action there is nothing to escape from, and the suite default is empty —
+    // so this line is load-bearing, not scene-setting. Reverting the
+    // recovery-action arm of the predicate is what this case must catch.
+    containedBy(makeRecoveryAction({ status: "active" }));
     const app = await createApp(ownerActor(), createRunContextDb(statusOnlyRecoveryContext));
 
     const res = await armMonitorPatch(app, "self-armed by a guarded run");
@@ -3678,6 +3719,217 @@ describe("agent issue mutation checkout ownership", () => {
       }),
       expect.anything(),
     );
+  });
+
+  // BLO-34683. The paired half of the containment case directly above: same
+  // actor, same request body, same status-only run class — the ONLY difference
+  // is that no recovery action is active. It must be allowed, because the
+  // monitor-CLEAR path stamps its own repair wake status-only, so refusing here
+  // means the one run dispatched to restore a cleared monitor is the one run
+  // barred from restoring it. Observed live on BLO-19124, which has never held
+  // a recovery action.
+  //
+  // The two cases must DISAGREE for the suite to pass, so reverting the guard
+  // change alone turns this red while the case above stays green.
+  it("lets a status-only recovery run arm a monitor when no recovery action is active", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress", executionPolicy: null }));
+    mockAccessService.decide.mockImplementation(decideWithRuntimeManage);
+    mockIssueRecoveryActionService.listActiveForIssues.mockResolvedValue(new Map() as never);
+    const app = await createApp(ownerActor(), createRunContextDb({
+      ...statusOnlyRecoveryContext,
+      // The real shape of the wake this bug was found on (`heartbeat.ts`,
+      // `issue_monitor_recovery`), so the case exercises the stamped context
+      // rather than a hand-made one.
+      issueId,
+      source: "issue.monitor.recovery",
+      wakeReason: "issue_monitor_recovery",
+      clearReason: "max_attempts_exhausted",
+    }));
+
+    const res = await armMonitorPatch(app, "re-armed by the monitor-recovery wake");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueRecoveryActionService.listActiveForIssues).toHaveBeenCalledWith(companyId, [issueId]);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({
+        executionPolicy: expect.objectContaining({
+          monitor: expect.objectContaining({ notes: "re-armed by the monitor-recovery wake" }),
+        }),
+      }),
+    );
+    // AC3: nothing may hand this run an exit that names an object the issue
+    // does not have. The strongest form of that is raising no 403 at all.
+    expect(mockLogActivity).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        details: expect.objectContaining({ reason: "deny_status_only_recovery_monitor_arm" }),
+      }),
+      expect.anything(),
+    );
+  });
+
+  // BLO-34683. `escalated` is inside ACTIVE_RECOVERY_ACTION_STATUSES, so it
+  // still holds containment — an escalated action is exactly the one a contained
+  // agent has the most reason to want out of.
+  //
+  // The mutation that must break this is deleting "escalated" from that constant:
+  // `containedBy` filters on the real list, mirroring the `inArray` in
+  // `issue-recovery-actions.ts`, so shrinking it makes this arm return an empty
+  // Map and the route permit. Asserting the 403 alone would not catch that,
+  // because the route never reads `.status`.
+  it("still refuses a status-only recovery run while the recovery action is escalated", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress", executionPolicy: null }));
+    mockAccessService.decide.mockImplementation(decideWithRuntimeManage);
+    containedBy(makeRecoveryAction({ status: "escalated" }));
+    const app = await createApp(ownerActor(), createRunContextDb(statusOnlyRecoveryContext));
+
+    const res = await armMonitorPatch(app, "self-armed while escalated");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("Cheap status-only recovery runs cannot arm issue monitors");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  // BLO-34683 review (Critical). Containment is a property of the RUN, not of
+  // the row being patched, and this gate runs BEFORE an assignee early-return
+  // that carries no run scoping — so probing the target alone would relocate the
+  // escape one issue sideways rather than close it. Here the run is contained on
+  // its own source issue and patches a DIFFERENT assigned issue holding no
+  // action: the third case where the two scopes disagree, which is what the
+  // target-only predicate got wrong and what neither case above can see.
+  it("refuses a contained status-only run arming a monitor on another issue it is assigned", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress", executionPolicy: null }));
+    mockAccessService.decide.mockImplementation(decideWithRuntimeManage);
+    // Active on the RUN's source issue only. The patched issue is clean, so a
+    // target-scoped probe sees nothing and admits the arm.
+    containedBy(makeRecoveryAction({ status: "active", sourceIssueId: peerIssueId }));
+    const app = await createApp(ownerActor(), createRunContextDb({
+      ...statusOnlyRecoveryContext,
+      issueId: peerIssueId,
+    }));
+
+    const res = await armMonitorPatch(app, "armed sideways from a contained run");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("Cheap status-only recovery runs cannot arm issue monitors");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    // Both scopes must reach the query, or the refusal above is the right answer
+    // reached for the wrong reason.
+    expect(mockIssueRecoveryActionService.listActiveForIssues)
+      .toHaveBeenCalledWith(companyId, [issueId, peerIssueId]);
+  });
+
+  // BLO-34683 review (Critical), the fail-closed half. An unresolvable run scope
+  // is not evidence of no containment, so it refuses exactly as a null issue id
+  // does on the create path. Relative to the unconditional refusal this gate
+  // replaces that is no loss: permission only ever widens for a run provably
+  // uncontained on BOTH sides.
+  it("refuses a status-only run whose own context carries no issue scope", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress", executionPolicy: null }));
+    mockAccessService.decide.mockImplementation(decideWithRuntimeManage);
+    containedBy();
+    const app = await createApp(ownerActor(), createRunContextDb({
+      ...statusOnlyRecoveryContext,
+      issueId: undefined,
+    }));
+
+    const res = await armMonitorPatch(app, "armed from an unscoped run");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    // No query at all: with the scope unresolvable there is nothing to ask.
+    expect(mockIssueRecoveryActionService.listActiveForIssues).not.toHaveBeenCalled();
+  });
+
+  // BLO-34683 review (Critical), the shape the system ACTUALLY dispatches. The
+  // case above sets `contextSnapshot.issueId` to the action-bearing issue, and
+  // no status-only site that carries an action produces that: the wake stamps
+  // `issueId: recovery.id` and `sourceIssueId: input.issue.id` side by side
+  // (`recovery/service.ts`, `stranded_assigned_issue` + both stale-run
+  // evaluation sites), while `upsertSourceScoped` keys the action on the SOURCE
+  // issue and `listActiveForIssues` filters on that column. So `recovery.id` is
+  // an id nothing is ever active on.
+  //
+  // This is the mutation the `sourceIssueId` read must fail: drop it and the
+  // scopes become [patched, recoveryIssueId], the query returns empty, and the
+  // route permits the sideways arm for the exact class the gate is written
+  // about. The case above cannot see that — its run scope IS the action-bearing
+  // issue, so it stays green either way.
+  it("refuses a contained run whose context issue id is the recovery issue, not the action-bearing one", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress", executionPolicy: null }));
+    mockAccessService.decide.mockImplementation(decideWithRuntimeManage);
+    containedBy(makeRecoveryAction({ status: "active", sourceIssueId: peerIssueId }));
+    const app = await createApp(ownerActor(), createRunContextDb({
+      ...statusOnlyRecoveryContext,
+      // The two fields DISAGREE, which is the live shape and the reason an
+      // `issueId`-only probe was the wrong question.
+      issueId: recoveryIssueId,
+      sourceIssueId: peerIssueId,
+      wakeReason: "issue_assigned",
+      source: "recovery.stranded_assigned_issue",
+    }));
+
+    const res = await armMonitorPatch(app, "armed from a stranded-recovery run");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("Cheap status-only recovery runs cannot arm issue monitors");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    // All three ids must reach the query. Asserting the 403 alone would pass on
+    // a probe that happened to refuse for another reason.
+    expect(mockIssueRecoveryActionService.listActiveForIssues)
+      .toHaveBeenCalledWith(companyId, [issueId, recoveryIssueId, peerIssueId]);
+    // AC3 / Important: the refused run is told WHICH row is containing it. The
+    // patched issue holds no action, so a payload carrying only `issueId` names
+    // the one row where the stated exit cannot be taken.
+    expect(res.body.details.containingIssueIds).toEqual([peerIssueId]);
+    expect(res.body.details.resumeGuidance).toContain(peerIssueId);
+  });
+
+  // BLO-34683 review (Suggestion 2). The mirror of the cross-issue case: here
+  // the PATCHED row holds the action and the run's own scope is clean. Without
+  // it, dropping `issue.id` from the `scopes` array breaks nothing — every other
+  // case in this block is carried by a run-scope id, so the target arm would
+  // have no mutation that turns it red.
+  it("refuses a status-only run arming a monitor on a target issue that holds the action", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress", executionPolicy: null }));
+    mockAccessService.decide.mockImplementation(decideWithRuntimeManage);
+    // Active on the patched issue only.
+    containedBy(makeRecoveryAction({ status: "active", sourceIssueId: issueId }));
+    const app = await createApp(ownerActor(), createRunContextDb({
+      ...statusOnlyRecoveryContext,
+      issueId: peerIssueId,
+    }));
+
+    const res = await armMonitorPatch(app, "armed on the contained target");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("Cheap status-only recovery runs cannot arm issue monitors");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(res.body.details.containingIssueIds).toEqual([issueId]);
+  });
+
+  // BLO-34683 review (Important). The fail-closed branch must not be served the
+  // contained branch's text: there is no action to dispose of, so "record a
+  // disposition to clear it" would name an object that does not exist — the
+  // defect this PR fixes, re-emitted at the gate that fixes it. Pinned on the
+  // empty id list rather than on prose, so rewording the string cannot silently
+  // merge the two branches back together.
+  it("does not offer a disposition exit when the refusal was an unresolvable scope", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress", executionPolicy: null }));
+    mockAccessService.decide.mockImplementation(decideWithRuntimeManage);
+    containedBy();
+    const app = await createApp(ownerActor(), createRunContextDb({
+      ...statusOnlyRecoveryContext,
+      issueId: undefined,
+    }));
+
+    const res = await armMonitorPatch(app, "armed from an unscoped run");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.details.containingIssueIds).toEqual([]);
+    expect(res.body.details.resumeGuidance).toContain("Containment could not be resolved");
+    expect(res.body.details.normalModelResumeIsAutomatic).toBe(false);
   });
 
   // The paired half, and the half that makes this a fix rather than a blanket
@@ -4014,6 +4266,45 @@ describe("agent issue mutation checkout ownership", () => {
     expect(res.body.error).toContain(expectedError);
     expect(mockIssueService.create).not.toHaveBeenCalled();
     expect(mockIssueService.createChild).not.toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  // BLO-34683. `STATUS_ONLY_RECOVERY_RESUME_GUIDANCE` ends "take the allowed write named in this
+  // response". That is a promise about the PAYLOAD, and of its four sharers this is the only one
+  // whose `error` string names no exit — the document gate names the PUT path and both approval
+  // gates name `request_board_approval`, so at those three the pointer resolves in prose as well
+  // as in `allowedDocumentKey`/`allowedApprovalType`. Here it resolves nowhere unless `details`
+  // carries the key, which made the single refusal a run CAN clear within its own lifetime the
+  // one sent looking for something absent.
+  //
+  // Both halves are asserted because either alone is satisfiable while the pair is broken: the
+  // clause can point at a key that is missing (the defect), and the key can sit in a payload
+  // whose guidance never tells the reader to look for it. Mutation: drop `allowedWrite` from
+  // `issues.ts` and the second expect goes red on its own.
+  //
+  // One route, not all three: the refusal is single-point in
+  // `assertCheapRecoveryIssueAssigneeProfileAllowed`, so the payload shape is the same at each.
+  it("names the immediately-takeable write in the cheap-profile refusal it promises to name", async () => {
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb({
+        modelProfile: "cheap",
+        recoveryIntent: "status_only",
+        allowDeliverableWork: false,
+        allowDocumentUpdates: false,
+        resumeRequiresNormalModel: true,
+      }),
+    );
+
+    const res = await request(app).patch(`/api/issues/${issueId}`).send({
+      assigneeAdapterOverrides: { modelProfile: "cheap" },
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.details.resumeGuidance).toContain("the allowed write named in this response");
+    // The allowed form is the same write minus the one field
+    // `requestsCheapIssueAssigneeModelProfile` tests — not a different endpoint, and not a wait.
+    expect(res.body.details.allowedWrite).toContain("assigneeAdapterOverrides.modelProfile");
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 

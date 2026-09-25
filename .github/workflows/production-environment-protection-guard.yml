@@ -1,11 +1,12 @@
 name: Production Environment Protection Guard
 
 # Re-reads the live `paperclip-production` GitHub environment and asserts the
-# board-ratified protection shape (approval b75f8156). Exists because a closed
-# approval card was being treated as evidence the control existed: the
-# protection has now silently drifted three times (2026-07-31 never applied,
-# 2026-08-04 lapsed, 2026-08-08 widened under an incident override that was
-# never restored) and each time nobody noticed for 2-6 days. See BLO-22329.
+# board-ratified protection shape (approval 60e271b7, 2026-09-14, which
+# SUPERSEDES b75f8156). Exists because a closed approval card was being treated
+# as evidence the control existed: the protection has now silently drifted three
+# times (2026-07-31 never applied, 2026-08-04 lapsed, 2026-08-08 widened under
+# an incident override that was never restored) and each time nobody noticed for
+# 2-6 days. See BLO-22329, and BLO-34896 for which record is authoritative.
 #
 # A red workflow run is deliberately NOT the alerting path — it only emails the
 # last committer, which is the exact failure mode being fixed. Drift is pushed

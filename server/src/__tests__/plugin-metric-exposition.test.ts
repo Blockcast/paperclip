@@ -5,12 +5,14 @@ import {
   PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH,
   PLUGIN_METRIC_NAME_BUDGET,
   PLUGIN_METRIC_OVERFLOW_NAME,
+  PLUGIN_METRIC_PROMOTABLE_TAG_KEYS,
   PLUGIN_METRIC_TAG_LABEL_PREFIX,
   PLUGIN_METRIC_TOTAL_METRIC,
   __resetMetricsForTest,
   recordPluginMetric,
   renderMetrics,
 } from "../services/metrics.js";
+import alertmanagerManifest from "../../../packages/plugins/paperclip-plugin-alertmanager/src/manifest.js";
 
 /**
  * PEN-2799 — plugin-contributed metrics must reach Prometheus.
@@ -434,11 +436,16 @@ describe("recordPluginMetric — cardinality budget", () => {
         declaredLabels: ["alertname"],
       });
     }
-    // A second plugin must not inherit the first's exhausted budget.
+    // A second plugin must not inherit the first's exhausted budget. The name
+    // is deliberately the SAME as the first plugin's: under a name-only ledger
+    // key the pool is already full here and this write degrades, failing the
+    // assertions below. A differing name would satisfy them on its own and
+    // leave the `pluginId` half of the composite key unguarded — which is what
+    // this test looked like before BLO-32163 made the key composite.
     recordPluginMetric({
       pluginId: "plugin-uuid-2",
       pluginKey: "other.plugin",
-      name: "b.metric",
+      name: "a.metric",
       value: 1,
       tags: { alertname: "B-0" },
       declaredLabels: ["alertname"],
@@ -462,27 +469,39 @@ describe("recordPluginMetric — cardinality budget", () => {
     // Fill the budget to its last slot, then spend that slot on A. B must then
     // find the budget exhausted. If B collides with A in the ledger it will be
     // treated as seen and publish normally, and this assertion fails.
+    //
+    // The two writes only render to ONE key under a printable separator if
+    // their differing values sit in ADJACENT promotable slots: an unpromoted
+    // slot between them contributes its own separator and keeps the joins
+    // distinct either way, which makes the mutation pass and the guard
+    // vacuous. Derived from the head of the list rather than named, because
+    // naming them is exactly what broke this once — BLO-32163 inserted
+    // `aggregate_key` between the hardcoded `action` and `alertname`, and a
+    // space-separator mutation went green on all 35 tests.
+    const [K1, K2] = PLUGIN_METRIC_PROMOTABLE_TAG_KEYS;
+    const DECLARED = [K1, K2];
+
     for (let i = 0; i < PLUGIN_METRIC_CARDINALITY_BUDGET - 1; i += 1) {
       recordPluginMetric({
         ...PLUGIN,
         name: "m",
         value: 1,
-        tags: { action: `fill-${i}` },
-        declaredLabels: ["action", "alertname"],
+        tags: { [K1]: `fill-${i}` },
+        declaredLabels: DECLARED,
       });
     }
 
-    // A: action="x y", alertname="z"   → space-joined "m x y z …"
+    // A: K1="x y", K2="z"   → space-joined "… x y z …"
     recordPluginMetric({
       ...PLUGIN, name: "m", value: 1,
-      tags: { action: "x y", alertname: "z" },
-      declaredLabels: ["action", "alertname"],
+      tags: { [K1]: "x y", [K2]: "z" },
+      declaredLabels: DECLARED,
     });
-    // B: action="x", alertname="y z"   → space-joined "m x y z …"  (identical)
+    // B: K1="x", K2="y z"   → space-joined "… x y z …"  (identical)
     recordPluginMetric({
       ...PLUGIN, name: "m", value: 1,
-      tags: { action: "x", alertname: "y z" },
-      declaredLabels: ["action", "alertname"],
+      tags: { [K1]: "x", [K2]: "y z" },
+      declaredLabels: DECLARED,
     });
 
     const dropped = await seriesFor(PLUGIN_METRIC_DROPPED_METRIC);
@@ -496,7 +515,7 @@ describe("recordPluginMetric — cardinality budget", () => {
     expect(series.filter((l) => l.includes(`metric="${PLUGIN_METRIC_OVERFLOW_NAME}"`)))
       .toHaveLength(0);
     expect(
-      series.filter((l) => l.includes('metric="m"') && !l.includes("action=")),
+      series.filter((l) => l.includes('metric="m"') && !l.includes(`${K1}=`)),
     ).toHaveLength(1);
   });
 
@@ -508,10 +527,13 @@ describe("recordPluginMetric — cardinality budget", () => {
     // `alertname`/`severity` are verbatim Alertmanager webhook labels, and
     // JSON.parse of a body containing \u0000 yields that code point intact.
     //
-    // `alertname` and `severity` sit at promotable indices 1 and 7, so the
-    // join places a fixed run of 6 NULs between them (the five empty
-    // unpromoted slots between). Six NULs inside one value therefore straddle
-    // that boundary and make the two writes below render to one key.
+    // `alertname` and `severity` are separated by FIVE unpromoted slots in
+    // PLUGIN_METRIC_PROMOTABLE_TAG_KEYS, so the join places a fixed run of six
+    // NULs between them. Six NULs inside one value therefore straddle that
+    // boundary and make the two writes below render to one key. Stated as the
+    // gap rather than as absolute indices because inserting a key before the
+    // pair shifts both (BLO-32163 moved them from 1 and 7 to 2 and 8) while
+    // leaving the gap — and so this constant — unchanged.
     const NUL6 = "\u0000".repeat(6);
 
     for (let i = 0; i < PLUGIN_METRIC_CARDINALITY_BUDGET - 1; i += 1) {
@@ -607,5 +629,134 @@ describe("recordPluginMetric — never throws", () => {
         } as Parameters<typeof recordPluginMetric>[0]),
       ).not.toThrow();
     }
+  });
+});
+
+/**
+ * BLO-32163 — a wedged aggregate lifecycle fence must be nameable from the
+ * page alone.
+ *
+ * The promotion gate is two-sided by construction (see
+ * PLUGIN_METRIC_PROMOTABLE_TAG_KEYS): a tag becomes a label only if BOTH this
+ * allow-list and the emitting plugin's manifest `metricLabels` carry the key.
+ * That means either side regressing drops the label while the metric keeps
+ * publishing — the series still exists, the rule still evaluates, and the page
+ * simply stops saying which aggregate is stuck. There is no error and no gap
+ * in the graph, so both sides are pinned.
+ *
+ * BOTH halves are pinned HERE, from the real manifest, because this is a lane
+ * CI actually runs. `packages/plugins/paperclip-plugin-alertmanager` owns test
+ * files but no CI lane executes it — it is listed in `UNEXECUTED_WITH_TESTS`
+ * in `scripts/__tests__/vitest-project-coverage.test.mjs` (PEN-2506). So the
+ * in-package `manifest-metric-labels.test.ts` is a guard that will start
+ * running when PEN-2506 wires the package in, not one that runs today; relying
+ * on it would leave the manifest half unpinned while claiming it was pinned.
+ *
+ * Importing the manifest by relative path does not make the plugin a server
+ * dependency — it is a test-only import, the same shape as
+ * `linear-webhook-fixture-replay.test.ts` uses for the Linear manifest.
+ */
+describe("BLO-32163 — fence-blocked labels survive the two-sided promotion gate", () => {
+  // The REAL manifest, not a mirror of it. A literal copy here would pass
+  // while `manifest.ts` drifted, which is the whole silent-degradation path.
+  const MANIFEST_METRIC_LABELS = alertmanagerManifest.metricLabels ?? [];
+  const FENCE_METRIC = "alertmanager.aggregate.fence_blocked";
+  const AGGREGATE_KEY = 'alert-aggregate:v1:["ArgoAppOutOfSyncTooLong",null]';
+  const RENDERED_AGGREGATE_KEY = `${PLUGIN_METRIC_TAG_LABEL_PREFIX}aggregate_key="alert-aggregate:v1:[\\"ArgoAppOutOfSyncTooLong\\",null]"`;
+
+  function writeFence(): void {
+    recordPluginMetric({
+      ...PLUGIN,
+      name: FENCE_METRIC,
+      value: 930,
+      tags: { alertname: "ArgoAppOutOfSyncTooLong", aggregate_key: AGGREGATE_KEY },
+      declaredLabels: MANIFEST_METRIC_LABELS,
+    });
+  }
+
+  it("promotes aggregate_key for the fence-blocked shape", async () => {
+    writeFence();
+
+    const series = await seriesFor(PLUGIN_METRIC_TOTAL_METRIC);
+    expect(series).toHaveLength(1);
+    expect(series[0]).toContain(`metric="${FENCE_METRIC}"`);
+    // The identifying label. Asserted on the rendered exposition, so a change
+    // that promotes the key but mangles the value still fails here.
+    expect(series[0]).toContain(RENDERED_AGGREGATE_KEY);
+  });
+
+  it("admits aggregate_key to the platform allow-list", () => {
+    // Guards the silent-degradation path: dropping the key from the allow-list
+    // leaves a fence page that cannot name the wedged aggregate.
+    expect(PLUGIN_METRIC_PROMOTABLE_TAG_KEYS).toContain("aggregate_key");
+  });
+
+  it("keeps phase off the allow-list", () => {
+    // Admitting it would 4x the fence metrics' combination count inside their
+    // own per-name budget — the starvation below, one level down.
+    expect(PLUGIN_METRIC_PROMOTABLE_TAG_KEYS).not.toContain("phase");
+  });
+
+  it("declares aggregate_key in the alertmanager manifest", () => {
+    // The MANIFEST half of the gate. `promotes aggregate_key for the
+    // fence-blocked shape` above also fails if this key is dropped, because it
+    // now feeds `declaredLabels` from the real manifest — but it fails as "the
+    // rendered series lost a label", which does not say where to look. This
+    // names it. Mutation-checked: deleting "aggregate_key" from manifest.ts
+    // fails this test and that one, and nothing else.
+    expect(MANIFEST_METRIC_LABELS).toContain("aggregate_key");
+  });
+
+  it("keeps phase out of the alertmanager manifest", () => {
+    // Either side of the gate can readmit `phase` independently, so the
+    // exclusion is pinned on both. ~23 live aggregate keys x 4 lifecycle
+    // phases overruns the 50-slot per-name budget and starves aggregate_key.
+    expect(MANIFEST_METRIC_LABELS).not.toContain("phase");
+  });
+
+  /**
+   * The defect that made the promotion above worthless in production.
+   *
+   * The ledger used to be keyed on `pluginId` alone, so one shared budget was
+   * consumed first-come-first-served across every metric name the plugin
+   * emits. Measured 2026-09-17: `paperclip-plugin-alertmanager` held 110
+   * distinct series against a shared budget of 100, and the fence metric — the
+   * rare one a page depends on — lost the lottery to `alertmanager.alert.error`
+   * and `alertmanager.firing.deduped`, dropping 91 writes/hr to `label_budget`.
+   * Adding `aggregate_key` to the allow-list could not fix that: a full ledger
+   * rejects every new combination regardless of which keys compose it.
+   *
+   * This is the test that fails if the ledger key is reverted to `pluginId`.
+   */
+  it("does not let a chatty metric starve the fence metric's labels", async () => {
+    // Exhaust a different metric name's entire allowance.
+    for (let i = 0; i < PLUGIN_METRIC_CARDINALITY_BUDGET + 5; i += 1) {
+      recordPluginMetric({
+        ...PLUGIN,
+        name: "alertmanager.alert.error",
+        value: 1,
+        tags: { alertname: `ChattyRule${i}` },
+        declaredLabels: MANIFEST_METRIC_LABELS,
+      });
+    }
+
+    writeFence();
+
+    const fence = (await seriesFor(PLUGIN_METRIC_TOTAL_METRIC)).filter((line) =>
+      line.includes(`metric="${FENCE_METRIC}"`),
+    );
+    expect(fence).toHaveLength(1);
+    expect(fence[0]).toContain(RENDERED_AGGREGATE_KEY);
+
+    // And the chatty metric still gets told it overflowed, on its own name.
+    const dropped = await seriesFor(PLUGIN_METRIC_DROPPED_METRIC);
+    expect(
+      dropped.some(
+        (line) =>
+          line.includes('reason="label_budget"')
+          && line.includes('metric="alertmanager.alert.error"'),
+      ),
+    ).toBe(true);
+    expect(dropped.some((line) => line.includes(`metric="${FENCE_METRIC}"`))).toBe(false);
   });
 });

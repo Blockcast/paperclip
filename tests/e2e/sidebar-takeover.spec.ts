@@ -52,6 +52,15 @@ async function createCompany(board: APIRequestContext): Promise<{ id: string; pr
 }
 
 test.describe("Sidebar takeover (collapse + secondary pane)", () => {
+  // Last spec in this suite still on the bare 60s default. It is normally far
+  // inside that budget -- 96 observations across 24 post-#1880 runs peaked at
+  // 9.8s -- but under load it has blown the cap outright: on run 34745075160
+  // ":151" failed both attempts on a bare 60s timeout and ":102" went flaky on
+  // the same cap, in the same job. Take the ceiling its five siblings already
+  // take so a slow runner costs wall-time instead of a red merge gate
+  // (BLO-33320).
+  test.setTimeout(180_000);
+
   let board: APIRequestContext;
   let baseUrl: string;
   let companyId: string;
