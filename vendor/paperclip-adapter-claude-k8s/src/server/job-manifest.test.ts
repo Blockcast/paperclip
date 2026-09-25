@@ -18,6 +18,15 @@ import {
   validateAgentCommand,
   validatePonytailPluginPath,
   validatePonytailDefaultMode,
+  buildToolRlimitInitShell,
+  parseMemoryQuantityToKiB,
+  resolveToolMemoryLimitKb,
+  TOOL_MEMORY_LIMIT_CONFIG_KEY,
+  TOOL_RLIMIT_DIR,
+  TOOL_RLIMIT_FILE,
+  TOOL_RLIMIT_BASHENV,
+  TOOL_RLIMIT_ZDOTDIR,
+  ZSH_DOTFILES,
 } from "./job-manifest.js";
 import type { SelfPodInfo } from "./k8s-client.js";
 
@@ -2870,5 +2879,321 @@ describe("env name classification gate (BLO-29804)", () => {
 
     expect(secretBacked).toEqual(EXPECTED_SECRET_BACKED);
     expect(Object.keys(envSecret?.data ?? {}).sort()).toEqual(EXPECTED_SECRET_BACKED);
+  });
+});
+
+// BLO-34477: a Bash-tool command that outlives its timeout is backgrounded,
+// not killed, and under `memory.oom.group=1` one runaway child walks the whole
+// `claude` cgroup to its limit and the kernel SIGKILLs the run (exit 137,
+// OOMKilled; 12 pods >5 GiB in 24 h against a ~0.5 GiB norm). The adapter
+// bounds each child with RLIMIT_DATA applied by every shell the agent spawns,
+// while the `claude` process itself — exec'd from POSIX `sh -c` — stays uncapped.
+describe("tool-child memory cap (BLO-34477)", () => {
+  let ctx: AdapterExecutionContext;
+  let selfPod: SelfPodInfo;
+  let tempDirs: string[];
+
+  beforeEach(() => {
+    ctx = makeCtx();
+    selfPod = makeSelfPod();
+    tempDirs = [];
+  });
+
+  afterEach(() => {
+    for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
+  });
+
+  const initCommand = (): string => {
+    const { job } = buildJobManifest({ ctx, selfPod });
+    return job.spec?.template?.spec?.initContainers?.[0]?.command?.[2] ?? "";
+  };
+  const claudeEnv = (): Map<string, string | undefined> => {
+    const { job } = buildJobManifest({ ctx, selfPod });
+    const claude = job.spec?.template?.spec?.containers?.find((c) => c.name === "claude");
+    return new Map((claude?.env ?? []).map((e) => [e.name, e.value]));
+  };
+
+  describe("parseMemoryQuantityToKiB", () => {
+    it("converts binary, decimal and bare-byte quantities to whole KiB", () => {
+      expect(parseMemoryQuantityToKiB("8Gi", "f")).toBe(8 * 1024 * 1024);
+      expect(parseMemoryQuantityToKiB("6144Mi", "f")).toBe(6144 * 1024);
+      expect(parseMemoryQuantityToKiB("1536Mi", "f")).toBe(1536 * 1024);
+      expect(parseMemoryQuantityToKiB("2G", "f")).toBe(Math.floor(2e9 / 1024));
+      expect(parseMemoryQuantityToKiB("4096", "f")).toBe(4);
+      expect(parseMemoryQuantityToKiB(" 1Ki ", "f")).toBe(1);
+    });
+
+    it("rejects fractional, milli, negative, empty and malformed quantities", () => {
+      for (const bad of ["1.5Gi", "8gi", "500m", "-1Gi", "", "8Gi; rm -rf /", "abc"]) {
+        expect(() => parseMemoryQuantityToKiB(bad, "resources.limits.memory")).toThrow(/integer Kubernetes memory quantity/);
+      }
+      expect(() => parseMemoryQuantityToKiB("512", "f")).toThrow(/at least 1Ki/);
+    });
+  });
+
+  describe("resolveToolMemoryLimitKb", () => {
+    it("defaults to half the container memory limit", () => {
+      expect(resolveToolMemoryLimitKb({}, "8Gi")).toBe(4 * 1024 * 1024);
+      expect(resolveToolMemoryLimitKb({ [TOOL_MEMORY_LIMIT_CONFIG_KEY]: "" }, "6144Mi")).toBe(3072 * 1024);
+      expect(resolveToolMemoryLimitKb({ [TOOL_MEMORY_LIMIT_CONFIG_KEY]: null }, "4Gi")).toBe(2 * 1024 * 1024);
+    });
+
+    it("lets an explicit non-negative integer (number or digit string) win, and 0 disables", () => {
+      expect(resolveToolMemoryLimitKb({ [TOOL_MEMORY_LIMIT_CONFIG_KEY]: 1048576 }, "8Gi")).toBe(1048576);
+      expect(resolveToolMemoryLimitKb({ [TOOL_MEMORY_LIMIT_CONFIG_KEY]: " 2097152 " }, "8Gi")).toBe(2097152);
+      expect(resolveToolMemoryLimitKb({ [TOOL_MEMORY_LIMIT_CONFIG_KEY]: 0 }, "8Gi")).toBe(0);
+      expect(resolveToolMemoryLimitKb({ [TOOL_MEMORY_LIMIT_CONFIG_KEY]: "0" }, "8Gi")).toBe(0);
+    });
+
+    it("refuses anything that is not a plain integer — the value lands in a shell command", () => {
+      for (const bad of ["4Gi", "-1", -1, 1.5, "1048576; rm -rf /", "$(id)", true, {}]) {
+        expect(() => resolveToolMemoryLimitKb({ [TOOL_MEMORY_LIMIT_CONFIG_KEY]: bad }, "8Gi")).toThrow(
+          /toolMemoryKb must be a non-negative integer number of KiB/,
+        );
+      }
+    });
+
+    it("degrades an unparseable container memory limit to no cap with a warning instead of aborting the Job", () => {
+      const warnings: string[] = [];
+      expect(resolveToolMemoryLimitKb({}, "1.5Gi", (message) => warnings.push(message))).toBe(0);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toMatch(/resources\.limits\.memory="1\.5Gi" cannot be halved/);
+      expect(warnings[0]).toMatch(/no RLIMIT_DATA cap/);
+      expect(warnings[0]).toMatch(/toolMemoryKb/);
+    });
+
+    it("still refuses a malformed explicit toolMemoryKb (it is interpolated into a shell command)", () => {
+      const warnings: string[] = [];
+      expect(() => resolveToolMemoryLimitKb({ "resources.limits.toolMemoryKb": "1.5Gi" }, "8Gi", (message) => warnings.push(message))).toThrow(
+        /toolMemoryKb must be a non-negative integer number of KiB/,
+      );
+      expect(warnings).toEqual([]);
+    });
+  });
+
+  describe("manifest", () => {
+    it("writes the cap onto the runtime-cache emptyDir at half the default 8Gi limit", () => {
+      const cmd = initCommand();
+      expect(TOOL_RLIMIT_DIR).toBe("/runtime-cache/tool-rlimit");
+      expect(cmd).toContain(`mkdir -p '${TOOL_RLIMIT_ZDOTDIR}'`);
+      expect(cmd).toContain(`'ulimit -d 4194304 2>/dev/null || true' > '${TOOL_RLIMIT_FILE}'`);
+      // zsh entry point: apply the cap, then defer to the user's own file.
+      // The inner single quotes are escaped the POSIX way ('\'') by the same
+      // quoter the rest of the init command uses.
+      expect(cmd).toContain(
+        `printf '%s\\n' '. '\\''${TOOL_RLIMIT_FILE}'\\''' 'if [ -r "$HOME/.zshenv" ]; then . "$HOME/.zshenv"; fi' > '${TOOL_RLIMIT_ZDOTDIR}/.zshenv'`,
+      );
+      // bash entry point: same shape as the zsh one. It must chain .bashrc
+      // because SHLVL=2 stops bash reading that file on its own, so without
+      // this the cap would REPLACE the pod's environment file rather than add
+      // to it (shared-HOME agents lose ANTHROPIC_BASE_URL/CCROTATE_SERVE_*).
+      expect(cmd).toContain(
+        `printf '%s\\n' '. '\\''${TOOL_RLIMIT_FILE}'\\''' 'if [ -r "$HOME/.bashrc" ]; then . "$HOME/.bashrc"; fi' > '${TOOL_RLIMIT_BASHENV}'`,
+      );
+      // ...and the bash rc must NOT be chained from rlimit.sh itself, which zsh
+      // and POSIX sh source directly.
+      expect(cmd).not.toContain(`.bashrc"; fi' > '${TOOL_RLIMIT_FILE}'`);
+      // Every other zsh dotfile is a pure chaining stub, so ZDOTDIR loses nothing.
+      for (const name of ZSH_DOTFILES.filter((n) => n !== ".zshenv")) {
+        expect(cmd).toContain(`printf '%s\\n' 'if [ -r "$HOME/${name}" ]; then . "$HOME/${name}"; fi' > '${TOOL_RLIMIT_ZDOTDIR}/${name}'`);
+      }
+    });
+
+    it("derives the cap from a configured memory limit", () => {
+      ctx.config["resources.limits.memory"] = "6144Mi";
+      expect(initCommand()).toContain("ulimit -d 3145728 2>/dev/null || true");
+    });
+
+    it("honours an explicit resources.limits.toolMemoryKb over the derivation", () => {
+      ctx.config["resources.limits.memory"] = "8Gi";
+      ctx.config[TOOL_MEMORY_LIMIT_CONFIG_KEY] = 1048576;
+      expect(initCommand()).toContain("ulimit -d 1048576 2>/dev/null || true");
+    });
+
+    it("0 disables the cap but still writes a readable BASH_ENV file", () => {
+      ctx.config[TOOL_MEMORY_LIMIT_CONFIG_KEY] = 0;
+      const cmd = initCommand();
+      expect(cmd).not.toContain("ulimit -d");
+      expect(cmd).toContain(`'# cap disabled (${TOOL_MEMORY_LIMIT_CONFIG_KEY}=0)' > '${TOOL_RLIMIT_FILE}'`);
+    });
+
+    it("fails the manifest build on a non-integer cap rather than interpolating it", () => {
+      ctx.config[TOOL_MEMORY_LIMIT_CONFIG_KEY] = "4Gi";
+      expect(() => buildJobManifest({ ctx, selfPod })).toThrow(/toolMemoryKb must be a non-negative integer/);
+    });
+
+    it("points the claude container's BASH_ENV and ZDOTDIR at the emptyDir files, classified SAFE_LITERAL", () => {
+      const env = claudeEnv();
+      expect(env.get("BASH_ENV")).toBe(TOOL_RLIMIT_BASHENV);
+      expect(env.get("ZDOTDIR")).toBe(TOOL_RLIMIT_ZDOTDIR);
+      expect(classifyEnvName("BASH_ENV")).toBe("SAFE_LITERAL");
+      expect(classifyEnvName("ZDOTDIR")).toBe("SAFE_LITERAL");
+    });
+
+    // Without this, BASH_ENV is set but never read for a bash tool shell:
+    // libuv gives the child socket stdio, and bash skips $BASH_ENV entirely on
+    // its rshd/sshd branch (isnetconn(fd 0) && SHLVL < 2). Pinned so the arm
+    // cannot be dropped as a redundant-looking assignment; the behavioural half
+    // is asserted by the "without SHLVL ..." case below.
+    it("ships SHLVL=2 so bash does not skip BASH_ENV on its rshd branch", () => {
+      expect(claudeEnv().get("SHLVL")).toBe("2");
+      expect(classifyEnvName("SHLVL")).toBe("SAFE_LITERAL");
+    });
+
+    it("keeps BASH_ENV/ZDOTDIR on the emptyDir even when HOME is a per-run isolated root", () => {
+      setRuntimeIsolation(ctx, {
+        isolationMode: "run",
+        isolationKey: "run:run-abc12345",
+        workspaceRoot: "/runtime-cache/paperclip-runs/run-abc12345/workspace",
+        homeRoot: "/runtime-cache/paperclip-runs/run-abc12345/home",
+        sessionRoot: "/runtime-cache/paperclip-runs/run-abc12345/session",
+        cacheRoot: "/runtime-cache/paperclip-runs/run-abc12345/cache",
+        tmpRoot: "/runtime-cache/paperclip-runs/run-abc12345/tmp",
+        storage: isolatedStorage("ephemeral"),
+      });
+      const env = claudeEnv();
+      expect(env.get("HOME")).toBe("/runtime-cache/paperclip-runs/run-abc12345/home");
+      expect(env.get("BASH_ENV")).toBe(TOOL_RLIMIT_BASHENV);
+      expect(env.get("ZDOTDIR")).toBe(TOOL_RLIMIT_ZDOTDIR);
+    });
+
+    it("both containers mount the runtime-cache volume the cap lives on, and the init command parses", () => {
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const spec = job.spec?.template?.spec;
+      const init = spec?.initContainers?.[0];
+      const claude = spec?.containers?.find((c) => c.name === "claude");
+      const mountedAt = (c: k8s.V1Container | undefined) => (c?.volumeMounts ?? []).find((m) => m.mountPath === "/runtime-cache")?.name;
+      expect(mountedAt(init)).toBe("runtime-cache");
+      expect(mountedAt(claude)).toBe("runtime-cache");
+      const syntaxCheck = spawnSync("/bin/sh", ["-n", "-c", init?.command?.[2] ?? ""], { encoding: "utf8" });
+      expect(syntaxCheck.stderr).toBe("");
+      expect(syntaxCheck.status).toBe(0);
+    });
+  });
+
+  describe("generated shell, executed", () => {
+    // Runs the exact init lines in a real POSIX sh against a temp dir standing
+    // in for /runtime-cache, then asks each shell the agent might spawn what
+    // its RLIMIT_DATA is. `ulimit -d` reports KiB. 1 GiB is below every hard
+    // limit a CI runner has, so lowering to it always succeeds.
+    const CAP_KB = 1048576;
+    const which = (bin: string): boolean => spawnSync("sh", ["-c", `command -v ${bin}`], { encoding: "utf8" }).status === 0;
+    // Darwin's setrlimit(RLIMIT_DATA) returns EINVAL for any lowering, so the
+    // "cap applied" assertions can only be made where the kernel honours the
+    // knob (Linux — the adapter's only deployment target, and CI). The probe
+    // asks the host, not the platform string, so a Linux box with an odd hard
+    // limit is skipped honestly rather than failing on an unrelated cause.
+    const hostCanLowerRlimitData =
+      spawnSync("/bin/sh", ["-c", `ulimit -d ${CAP_KB} 2>/dev/null && ulimit -d`], { encoding: "utf8" }).stdout.trim() === String(CAP_KB);
+    const itOnCapableHost = hostCanLowerRlimitData ? it : it.skip;
+    const install = (limitKb: number): { dir: string; home: string } => {
+      const base = mkdtempSync(join(tmpdir(), "blo34477-"));
+      tempDirs.push(base);
+      const dir = join(base, "runtime-cache", "tool-rlimit");
+      const home = join(base, "home");
+      mkdirSync(home, { recursive: true });
+      mkdirSync(join(base, "runtime-cache"), { recursive: true });
+      const run = spawnSync("/bin/sh", ["-c", buildToolRlimitInitShell(dir, limitKb).join("; ")], { encoding: "utf8" });
+      expect(run.stderr).toBe("");
+      expect(run.status).toBe(0);
+      return { dir, home };
+    };
+    const ulimitD = (argv: string[], env: Record<string, string>): string =>
+      spawnSync(argv[0], argv.slice(1), { encoding: "utf8", env: { PATH: process.env.PATH ?? "", ...env } }).stdout.trim();
+
+    // `ulimitD` already reproduces the PRODUCTION spawn shape exactly: default
+    // stdio, so libuv allocates fd 0 with socketpair(), and a child environment
+    // rebuilt as { PATH, ...overrides }, so SHLVL is never inherited. That is
+    // the shape Claude Code spawns a tool shell in, which is why the assertions
+    // below can run unconditionally on every host instead of behind a probe.
+    //
+    // They previously sat behind `bashHonorsBashEnv()`, which was subject to the
+    // very bug it guarded: it probed through `ulimitD`, so it always hit bash's
+    // rshd/sshd branch (isnetconn(fd 0) && SHLVL < 2 -> source ~/.bashrc and
+    // return before $BASH_ENV), returned false on every POSIX host, and silently
+    // skipped these assertions forever — which is how a dead BASH_ENV arm passed
+    // review twice. Do not reintroduce a host probe here; if bash is missing the
+    // test skips honestly on `which`, and a real delivery regression must fail.
+    const bashEnvArm = (dir: string, home: string): Record<string, string> => ({
+      HOME: home,
+      BASH_ENV: `${dir}/bashenv.sh`,
+      // Exactly what job-manifest.ts puts in the claude container env.
+      SHLVL: "2",
+    });
+    // Reports the two inputs to bash's rshd branch alongside the limit, so a
+    // failure says why: a bare `ulimit -d` here reads `unlimited` on that branch
+    // even when the configuration is correct.
+    const bashDiag = (env: Record<string, string>): string =>
+      ulimitD(
+        ["bash", "-c", 'ulimit -d; echo "rc=$? hard=$(ulimit -H -d) version=$BASH_VERSION shlvl=${SHLVL:-unset} fd0=$(readlink /proc/self/fd/0) uid=$(id -ru)/$(id -u)"'],
+        env,
+      ).replace(/\n/g, " ");
+    const itWithBash = which("bash") ? itOnCapableHost : it.skip;
+
+    itWithBash("bash under BASH_ENV, and POSIX sh sourcing the file, report the cap", () => {
+      const { dir, home } = install(CAP_KB);
+      expect(ulimitD(["/bin/sh", "-c", `. '${dir}/rlimit.sh'; ulimit -d`], { HOME: home })).toBe(String(CAP_KB));
+      const env = bashEnvArm(dir, home);
+      expect(ulimitD(["bash", "-c", "ulimit -d"], env), bashDiag(env)).toBe(String(CAP_KB));
+      // A grandchild inherits it — the property that bounds the whole subtree.
+      expect(ulimitD(["bash", "-c", "sh -c 'ulimit -d'"], env), bashDiag(env)).toBe(String(CAP_KB));
+    });
+
+    // SHLVL=2 does not ADD a startup file, it SWAPS one: off the rshd branch
+    // bash stops sourcing ~/.bashrc. On a shared-HOME agent that file supplies
+    // ANTHROPIC_BASE_URL/CCROTATE_SERVE_*, JAVA_HOME and PATH entries, so the
+    // BASH_ENV stub has to chain it back or the cap silently costs the agent
+    // its environment. Both properties asserted together: cap AND chain.
+    itWithBash("the BASH_ENV stub applies the cap AND still sources the user's own $HOME/.bashrc", () => {
+      const { dir, home } = install(CAP_KB);
+      writeFileSync(join(home, ".bashrc"), "export BLO34477_BASHRC=reached\n");
+      const env = bashEnvArm(dir, home);
+      expect(ulimitD(["bash", "-c", "ulimit -d"], env), bashDiag(env)).toBe(String(CAP_KB));
+      expect(ulimitD(["bash", "-c", 'printf %s "$BLO34477_BASHRC"'], env)).toBe("reached");
+    });
+
+    // The reason SHLVL=2 is in the manifest, pinned so nobody deletes it as a
+    // redundant assignment: drop it and the identical spawn takes bash's rshd
+    // branch and never reaches $BASH_ENV, so the cap silently does not apply.
+    // If this ever starts failing, bash changed its startup rules — revisit
+    // job-manifest.ts's SHLVL arm rather than deleting this test.
+    //
+    // Asserted against the measured uncapped baseline rather than
+    // `.not.toBe(CAP)`, so a bash that fails to start (empty stdout) fails the
+    // test instead of passing it vacuously.
+    itWithBash("without SHLVL the BASH_ENV arm is dead on socket stdin — why the manifest sets SHLVL=2", () => {
+      const { dir, home } = install(CAP_KB);
+      const baseline = ulimitD(["bash", "-c", "ulimit -d"], { HOME: home });
+      expect(baseline, bashDiag({ HOME: home })).not.toBe(String(CAP_KB));
+      expect(baseline).not.toBe("");
+      const env = { HOME: home, BASH_ENV: `${dir}/bashenv.sh` };
+      expect(ulimitD(["bash", "-c", "ulimit -d"], env), bashDiag(env)).toBe(baseline);
+    });
+
+    it("POSIX sh -c — the shape that launches claude — ignores BASH_ENV and stays uncapped", () => {
+      const { dir, home } = install(CAP_KB);
+      const baseline = ulimitD(["/bin/sh", "-c", "ulimit -d"], { HOME: home });
+      expect(baseline).not.toBe(String(CAP_KB));
+      expect(ulimitD(["/bin/sh", "-c", "ulimit -d"], { HOME: home, BASH_ENV: `${dir}/rlimit.sh` })).toBe(baseline);
+    });
+
+    (which("zsh") ? itOnCapableHost : it.skip)("zsh under ZDOTDIR applies the cap and still sources the user's own $HOME dotfiles", () => {
+      const { dir, home } = install(CAP_KB);
+      writeFileSync(join(home, ".zshenv"), "export BLO34477_CHAIN=reached\n");
+      const env = { HOME: home, ZDOTDIR: `${dir}/zdotdir` };
+      expect(ulimitD(["zsh", "-c", "ulimit -d"], env)).toBe(String(CAP_KB));
+      expect(ulimitD(["zsh", "-c", "printf %s \"$BLO34477_CHAIN\""], env)).toBe("reached");
+      // A grandchild inherits it.
+      expect(ulimitD(["zsh", "-c", "sh -c 'ulimit -d'"], env)).toBe(String(CAP_KB));
+    });
+
+    it("a disabled cap leaves every shell at its baseline", () => {
+      const { dir, home } = install(0);
+      const baseline = ulimitD(["/bin/sh", "-c", "ulimit -d"], { HOME: home });
+      expect(ulimitD(["/bin/sh", "-c", `. '${dir}/rlimit.sh'; ulimit -d`], { HOME: home })).toBe(baseline);
+      if (which("zsh")) {
+        expect(ulimitD(["zsh", "-c", "ulimit -d"], { HOME: home, ZDOTDIR: `${dir}/zdotdir` })).toBe(baseline);
+      }
+    });
   });
 });
