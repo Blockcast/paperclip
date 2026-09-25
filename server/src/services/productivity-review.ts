@@ -4654,7 +4654,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     }
     if (highChurn) {
       triggerReasons.push(
-        `${runCountLastHour} runs/${churnCommentCountLastHour} assignee-run comments in 1h; ${runCountLastSixHours} runs/${churnCommentCountLastSixHours} assignee-run comments in 6h`,
+        // Scoped to runs woken for this issue, unlike the issue-wide
+        // `Assignee run-linked comments` evidence line in the same document, so
+        // the label says so: the two numbers differ exactly when a cross-scope
+        // receipt landed here (BLO-35893).
+        `${runCountLastHour} runs/${churnCommentCountLastHour} assignee comments from runs woken for this issue in 1h; ${runCountLastSixHours} runs/${churnCommentCountLastSixHours} in 6h`,
       );
     }
 
@@ -5092,7 +5096,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       "",
       `- No-comment / runtime-failure streak: ${evidence.thresholds.noCommentStreakRuns} consecutive terminal runs`,
       `- Long active duration: ${msToHuman(evidence.thresholds.longActiveMs)}`,
-      `- High churn: ${evidence.thresholds.highChurnHourly}/1h or ${evidence.thresholds.highChurnSixHours}/6h runs/assignee-run comments`,
+      `- High churn: ${evidence.thresholds.highChurnHourly}/1h or ${evidence.thresholds.highChurnSixHours}/6h runs/assignee comments from runs woken for this issue`,
       `- Resolved-review snooze: ${msToHuman(evidence.thresholds.resolvedSnoozeMs)}`,
       "",
       "## Latest Runs",

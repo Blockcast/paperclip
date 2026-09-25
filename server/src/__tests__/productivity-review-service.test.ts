@@ -2273,7 +2273,9 @@ describeEmbeddedPostgres("productivity review service", () => {
     // the non-closable trigger beneath it, and that trigger's evidence is what
     // the review has to carry.
     expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
-    expect(review?.description).toContain("runs/0 assignee-run comments in 1h");
+    // The trigger count is run-scoped and says so; the issue-wide evidence line
+    // in the same description is a different number under a different label.
+    expect(review?.description).toContain("runs/0 assignee comments from runs woken for this issue in 1h");
   });
 
   // BLO-22436 (Ally follow-up): the generation gate is scoped to the same
