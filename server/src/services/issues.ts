@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { and, asc, desc, eq, exists, gt, gte, inArray, isNotNull, isNull, like, lt, lte, ne, notInArray, or, sql, type SQL } from "drizzle-orm";
-import type { Db } from "@paperclipai/db";
+import type { Db, DbTransaction } from "@paperclipai/db";
 import {
   activityLog,
   agentWakeupRequests,
@@ -148,7 +148,14 @@ import {
 import { runEvidenceGate, type EvidenceFetchResult } from "./evidence-gate-wiring.js";
 import { countDoneWhenBullets } from "./evidence-gate.js";
 import { shouldBlockNarratedDone } from "./done-gate.js";
-import { githubHasCommitEvidence } from "./github-app-auth.js";
+import {
+  githubFetchPrHeadSha,
+  githubGetPullRequestGate,
+  githubHasCommitEvidence,
+  githubListReviewerSurfacesAtPr,
+} from "./github-app-auth.js";
+import { buildGithubTruthProbe, type TruthProbe } from "./evidence-truth.js";
+import { loadConfig } from "../config.js";
 import {
   parseIssueGraphLivenessIncidentKey,
   RECOVERY_ORIGIN_KINDS,
@@ -1007,7 +1014,6 @@ type IssueUserContextInput = {
 };
 type ProjectGoalReader = Pick<Db, "select">;
 type DbReader = Pick<Db, "select">;
-type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
 /**
  * Serialize mutations to the issue parent/blocker graph for one company.
@@ -1154,7 +1160,9 @@ export type BlockedIssueAutoResumeSuppressionReason =
   | "workspace_preflight_blocked"
   | "active_recovery_action"
   | "monitor_gate"
-  | "convergence_stalled";
+  | "convergence_stalled"
+  /** A `doc/execution-semantics.md` two-line external-wait declaration (BLO-30445). */
+  | "external_wait";
 export type BlockedIssueAutoResumeSuppression = {
   issueId: string;
   reason: BlockedIssueAutoResumeSuppressionReason;
@@ -2267,7 +2275,26 @@ async function withIssueLabels(dbOrTx: any, rows: IssueRow[]): Promise<IssueWith
  * Shapes that record a DURABLE fact ("a PR/commit was attached to this issue"),
  * as opposed to a fact about the current comment window.
  */
-const DURABLE_LANDING_SHAPES = ["pr-link", "landing-artifact"] as const;
+// `deploy:landed` joins these because a merge cannot be undone by a later
+// push: once true it stays true, so carrying it forward is honest.
+// `review:ally-clean` deliberately does NOT — the head can move, and a review
+// that was clean at an older head says nothing about what would ship now.
+// That is the whole defect BLO-19118 / BLO-21489 are about, and caching the
+// shape would reintroduce it inside the gate meant to catch it.
+const DURABLE_LANDING_SHAPES = ["pr-link", "landing-artifact", "deploy:landed"] as const;
+
+/**
+ * The live GitHub truth probe. Built once: it is stateless, and `loadConfig`
+ * is read per call inside the deps so a config reload is picked up.
+ */
+const githubTruthProbe: TruthProbe = buildGithubTruthProbe({
+  fetchHeadSha: (ref) => githubFetchPrHeadSha(ref),
+  listReviewerSurfaces: (ref) => githubListReviewerSurfacesAtPr(ref),
+  getPullRequestGate: (ref) => githubGetPullRequestGate(ref),
+  get reviewerBotLogin() {
+    return loadConfig().prReviewerBotLogin;
+  },
+});
 
 /**
  * Carry forward durable landing evidence when re-evaluating an already-in_review
@@ -2573,6 +2600,11 @@ async function fetchEvidenceForIssue(
         type: issueWorkProducts.type,
         metadata: issueWorkProducts.metadata,
         status: issueWorkProducts.status,
+        // Required by the truth probe, which trusts a `merged` claim only from
+        // a webhook-stamped row. `dbOrTx` is `any` and the result is cast, so
+        // the compiler cannot catch a drop here — losing this column silently
+        // downgrades every PR to a confirm-with-GitHub round trip.
+        sourceTrust: issueWorkProducts.sourceTrust,
       })
       .from(issueWorkProducts)
       .where(eq(issueWorkProducts.issueId, issueId)),
@@ -4229,6 +4261,11 @@ export async function listBlockedIssueAutoResumeSuppressions(
   const monitorRows = await dbOrTx
     .select({
       id: issues.id,
+      // Read the FULL column, never a `substring(...)` preview. `listBlockedInboxIssues`
+      // projects the first ISSUE_LIST_DESCRIPTION_MAX_CHARS and that is exactly what made
+      // the blocked-inbox oracle disagree with its own list in BLO-31839 — a park declared
+      // past the cutoff parsed as `null`. Here that would silently drain it (BLO-30445).
+      description: issues.description,
       hasGateSignals: sql<boolean>`
         COALESCE(
           CASE
@@ -4259,6 +4296,15 @@ export async function listBlockedIssueAutoResumeSuppressions(
       addSuppression(row.id, "monitor_gate");
     } else if (row.isConvergenceStalled) {
       addSuppression(row.id, "convergence_stalled");
+    } else if (externalWaitFromDescription(row.description) !== null) {
+      // BLO-30445: the liveness classifier and the stranded-blocked reconciler held opposite
+      // views of the same row. `isDeadEndBlocked` declines to raise `blocked_without_blockers`
+      // against a declared external wait, but the reconciler had no matching exemption, so it
+      // flipped the park to `todo` within one 15m tick — and the reconciler wins, because it
+      // mutates `status`. Measured live on the BLO-30391 fixture pair: the declared row drained
+      // in the same transaction as the undeclared control, so the documented escape hatch in
+      // `doc/execution-semantics.md#declaring-an-external-wait` bought it nothing.
+      addSuppression(row.id, "external_wait");
     }
   }
 
@@ -5741,7 +5787,7 @@ export function issueService(db: Db) {
     agentId: string,
     now: Date,
     operation: (
-      tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
+      tx: DbTransaction,
       checkoutExecutionPatch: NonNullable<Awaited<ReturnType<typeof runningCheckoutExecutionPatch>>>["patch"],
     ) => Promise<T>,
   ) {
@@ -10758,6 +10804,9 @@ export function issueService(db: Db) {
               effectiveLabelNames,
             ),
             id,
+            new Date(),
+            githubTruthProbe,
+            { unlabeledTruthBlock: loadConfig().evidenceGateUnlabeledTruthBlock },
           );
           doneGateEvidenceVerdict = doneTransitionEvidenceVerdict;
           const commitEvidence = doneTransitionEvidenceVerdict.commitEvidence ?? [];
@@ -10903,6 +10952,9 @@ export function issueService(db: Db) {
               effectiveLabelNames,
             ),
             id,
+            new Date(),
+            githubTruthProbe,
+            { unlabeledTruthBlock: loadConfig().evidenceGateUnlabeledTruthBlock },
           );
           inReviewVerdict = verdict;
           patch.lastEvidenceVerdict = isInReviewTransition

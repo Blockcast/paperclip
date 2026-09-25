@@ -483,6 +483,15 @@ export function publicRuntimeServices(
  * BLO-34631 — that route has no agent consumer (no MCP tool, not bridge-allowlisted; only
  * `ui/src/pages/AgentDetail.tsx` and `paperclip run workspace-log` read it). Masking a pointer whose
  * route still served the bytes would have been theatre.
+ *
+ * BLO-34738: "no agent consumer" is NOT what bounds the loss, and reading it that way is a trap.
+ * `paperclip run workspace-log` (`cli/src/commands/client/run.ts:243`) sends whatever key `ctx.api`
+ * holds, so a non-sandboxed agent with a direct key does reach that route — and gets
+ * `REDACTED_VALUE_SENTINEL`. What actually bounds it is the excerpt-disclosure decision recorded
+ * two paragraphs above: `stdoutExcerpt`/`stderrExcerpt` still cross to an unentitled reader, so the
+ * handles point at strictly less than the row already discloses. If a later ticket revisits
+ * BLO-34631 AC 3 and masks those excerpts, this justification goes with it — re-decide the handles
+ * in that same change rather than inheriting this paragraph.
  */
 export function publicWorkspaceOperation(
   operation: WorkspaceOperation,
