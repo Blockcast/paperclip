@@ -49,8 +49,12 @@ export function shouldReportCancelledRun({ merged, isInMergeQueue }) {
 // to the reader -- and the whole point of this reporter is that a queue-branch
 // failure is invisible from the PR, so that lookup is exactly the expensive bit.
 //
-// No name-filtering of aggregator jobs (`verify`): a name allowlist rots on the
-// next workflow rename, and one extra job name costs a reader nothing.
+// No name-filtering of aggregator jobs: a name allowlist rots on the next
+// workflow rename. Aggregators are excluded STRUCTURALLY instead -- see
+// causalJobs(). An earlier revision of this comment argued "one extra job name
+// costs a reader nothing"; measured, that was wrong. On the two `policy`
+// timeout ejections of 2026-09-23/25 the extra name was the ONLY name, and it
+// was the wrong one.
 //
 // The filter is on CONCLUSION, not name. A `cancelled` job is only signal when
 // nothing else failed: fail-fast cancels the siblings of a job that genuinely
@@ -59,8 +63,52 @@ export function shouldReportCancelledRun({ merged, isInMergeQueue }) {
 // contains nothing but a cancellation -- the same misdirection runOutcomeText
 // exists to prevent, one layer down. When nothing failed, a cancelled job IS the
 // cause (a `timeout-minutes` kill surfaces that way) and must still be named.
+//
+// Both rules below need the same input -- the non-success jobs that could
+// actually be a CAUSE -- so they share causalJobs() rather than each deriving
+// it. That sharing is the point: the two used to disagree, and a reader only
+// ever sees the sentence they compose.
+const isNonSuccess = (job) => job?.conclusion === "failure" || job?.conclusion === "cancelled";
+
+/**
+ * Non-success jobs minus the aggregator lanes that merely report upstream death.
+ *
+ * `verify` needs: every other lane, so it goes red whenever anything it waits
+ * on dies -- it is a MESSENGER, never a cause. Naming it is the same
+ * misdirection as naming fail-fast collateral, and it is the one the
+ * conclusion filter above cannot catch, because `verify` is a genuine
+ * `failure` rather than a `cancelled`. Measured on the two `policy`
+ * timeout ejections in the 2026-09-23/25 window (runs 35948766367 and
+ * 36015721472): the comment read "The merge-group run failed. Failing job:
+ * `verify`." -- the reader is sent to a log whose entire content is "upstream
+ * lane(s) did not run", and `policy`, killed at its 600s cap, is never named.
+ *
+ * Detected structurally, not by name: an allowlist of aggregator names rots on
+ * the next workflow rename. A job that starts only after EVERY other
+ * non-success job has finished ran last by construction, which is what being
+ * downstream of all of them means. Deliberately the narrowest form of that
+ * test -- "after SOME other job" would drop a genuine second failure that
+ * merely started late.
+ */
+export function causalJobs(jobs) {
+  const list = (Array.isArray(jobs) ? jobs : []).filter(isNonSuccess);
+  const at = (value) => Date.parse(value ?? "");
+  const causal = list.filter((job) => {
+    const started = at(job.started_at);
+    const others = list.filter((other) => other !== job);
+    if (!others.length || Number.isNaN(started)) return true;
+    return !others.every((other) => {
+      const done = at(other.completed_at);
+      return !Number.isNaN(done) && started >= done;
+    });
+  });
+  // A single non-success job is vacuously "last"; never report nothing when
+  // something did fail.
+  return causal.length ? causal : list;
+}
+
 export function failingJobSummary(jobs) {
-  const list = Array.isArray(jobs) ? jobs : [];
+  const list = causalJobs(jobs);
   const anyFailure = list.some((job) => job?.conclusion === "failure");
   const failed = list
     .filter((job) => job?.conclusion === "failure" || (!anyFailure && job?.conclusion === "cancelled"))
@@ -79,10 +127,14 @@ export function failingJobSummary(jobs) {
 // after-teardown `ReferenceError: window is not defined` with 3075/3075 tests
 // passing. Reading the run-level conclusion alone sends the reader to look for
 // an infra timeout that is not there.
+//
+// Reads the same causalJobs() set as failingJobSummary: `verify`'s own
+// `failure` used to flip this to "failed" on a run whose real cause was
+// `policy` hitting its cap, so the sentence asserted a failure and then named
+// only the messenger.
 export function runOutcomeText(conclusion, jobs) {
   const failed =
-    conclusion === "failure" ||
-    (Array.isArray(jobs) ? jobs : []).some((job) => job?.conclusion === "failure");
+    conclusion === "failure" || causalJobs(jobs).some((job) => job?.conclusion === "failure");
   return failed ? "failed" : "was cancelled (a job timeout surfaces this way)";
 }
 
