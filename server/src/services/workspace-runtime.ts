@@ -4728,6 +4728,29 @@ export type WorktreeReclaimSafety = {
 const WORKTREE_RECLAIM_GIT_TIMEOUT_MS = 30_000;
 
 /**
+ * Bounds a filesystem call that can block indefinitely on a wedged mount. The
+ * collector runs as tracked heartbeat-scheduler work, so an unbounded await in
+ * its path is also an unbounded await in the shutdown drain. fs calls cannot be
+ * cancelled: on expiry the call is abandoned and the caller takes its
+ * fail-closed branch, with an ETIMEDOUT error in place of the errno.
+ */
+async function withReclaimFsDeadline<T>(operation: Promise<T>): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(Object.assign(new Error(`filesystem call exceeded ${WORKTREE_RECLAIM_GIT_TIMEOUT_MS}ms`), {
+        code: "ETIMEDOUT",
+      }));
+    }, WORKTREE_RECLAIM_GIT_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([operation, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * Fail-closed pre-check for reclaiming a worktree's disk (BLO-22984).
  *
  * `cleanupExecutionWorkspaceArtifacts` removes with `--force --force`, which is
@@ -4744,7 +4767,9 @@ export async function inspectWorktreeReclaimSafety(worktreePath: string): Promis
   // tree it never read. Only an errno that *proves* nothing is there counts as
   // missing; every other failure is unverifiable.
   try {
-    const stats = await fs.stat(worktreePath);
+    // Same bound as the git probes below: a stat that never returns is an
+    // unreadable tree (ETIMEDOUT lands in the catch as unverifiable).
+    const stats = await withReclaimFsDeadline(fs.stat(worktreePath));
     if (!stats.isDirectory()) {
       return { safe: false, reason: "unverifiable", detail: `${worktreePath} exists but is not a directory` };
     }
