@@ -750,8 +750,12 @@ export async function startServer(): Promise<StartedServer> {
       inheritedTimeouts.lockTimeout,
     ]);
   } catch (error) {
+    // "read or publish": the gauge write is inside this guard too, so a throw
+    // from the registry path lands here as well. Naming only the read would
+    // point an operator at the database when the read had in fact succeeded
+    // and printed its line immediately above.
     logger.warn(
-      `Could not read the database timeout environment: ${error instanceof Error ? error.message : String(error)}`,
+      `Could not read or publish the database timeout environment: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
   
