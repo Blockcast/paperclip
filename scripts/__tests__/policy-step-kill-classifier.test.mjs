@@ -668,12 +668,33 @@ test("policy declares every permission the classifier needs, checkout included",
   assert.match(permissions, /^ {6}checks: read$/m, "checks: read reads the timeout annotation itself");
 });
 
+// Only comments and blank lines may sit between the step name and its `uses:`.
+// That tolerance is what lets BLO-31690 document the checkout bound in place;
+// the invariant is that the `uses:` found is still THAT step's, so anything
+// which is not a comment — a permissions block, another step — breaks the match.
+const CHECKOUT_STEP = /\n {6}- name: Checkout repository\n(?: {8}#[^\n]*\n|\n)* {8}uses: actions\/checkout@v6\n/;
+
 test("policy still checks out the repository under that permissions block", () => {
-  assert.match(
-    policyRegion(),
-    /\n      - name: Checkout repository\n        uses: actions\/checkout@v6\n/,
-    "the permissions block must not have displaced the checkout step",
+  assert.match(policyRegion(), CHECKOUT_STEP, "the permissions block must not have displaced the checkout step");
+});
+
+test("the checkout assertion still fails when the step is displaced or removed", () => {
+  const region = policyRegion();
+
+  // Displaced: a non-comment line between the name and the `uses:`. This is the
+  // case the tolerance could have widened into accepting, and the one a
+  // `[\s\S]*` between-pattern would wrongly pass.
+  const displaced = region.replace(
+    /(\n {6}- name: Checkout repository\n)/,
+    "$1      - name: Interposed\n        run: true\n",
   );
+  assert.notEqual(displaced, region, "the displacement mutation must have applied");
+  assert.doesNotMatch(displaced, CHECKOUT_STEP);
+
+  // Removed outright.
+  const without = region.replace(/\n {8}uses: actions\/checkout@v6\n/, "\n");
+  assert.notEqual(without, region, "the removal mutation must have applied");
+  assert.doesNotMatch(without, CHECKOUT_STEP);
 });
 
 test("the classifier can never change whether policy passes or fails", () => {

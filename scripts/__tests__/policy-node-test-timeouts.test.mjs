@@ -72,8 +72,8 @@ function timeoutMinutes(text, indent) {
 
 // Sizing is per-step evidence and belongs with the step; this reads only the
 // ceiling that every step bound has to sit under.
-function policyJobCap() {
-  const cap = timeoutMinutes(jobRegion("policy"), 4);
+function policyJobCap(region = jobRegion("policy")) {
+  const cap = timeoutMinutes(region, 4);
   assert.ok(cap > 0, "policy must declare a job-level timeout-minutes");
   return cap;
 }
@@ -93,8 +93,26 @@ function stepName(step) {
 // `bound < cap` is a ceiling, not a guarantee of attributability at every value
 // under it: a bound close to the cap is still reached only after earlier steps
 // have spent part of the job budget, so the job cap kills it first and the
-// failure is a bare `cancelled` again. It holds here because the real bounds are
-// 1-3m against a 10m cap. Summing the bounds against the cap would be the wrong
+// failure is a bare `cancelled` again. It holds for the `node --test` steps
+// `assertTimeouts` covers because their real bounds are 1-3m against the job cap
+// `policyJobCap()` reads from pr.yml (15 at the time of writing).
+//
+// The setup bounds `assertSetupBounded` guards are larger and do NOT all clear
+// that hurdle the same way. Checkout is step 1 and pnpm step 3, so nothing has
+// spent the budget before them and their 12m/3m bounds are reached as written.
+// `Set up Python` is NOT near the front -- step 43 of 77 as this is written,
+// and the exact index is expected to rot, which is the point: what matters is
+// only that dozens of steps precede it. Measured over 167 `policy` job attempts
+// in 2026-09-21..09-23, step-time already spent when it starts is p50 4.28m,
+// p90 7.32m. Its 5m bound is attribution only while that spend leaves 5m of
+// room under the cap, which today it does (the step's own p100 is 1.95m, so the
+// bound fires as intended in essentially every observed run). Checkout is the
+// dominant term in that preceding spend and drifts upward with history, so
+// checkout growth is what would convert python's bound from attribution into a
+// no-op -- re-check this one when checkout moves, rather than assuming the
+// step-1 argument covers it.
+//
+// Summing the bounds against the cap would be the wrong
 // stronger rule — bounds are per-step worst cases and every step is expected to
 // run, so that sum exceeds any sane cap by design.
 function assertTimeouts(steps, cap = policyJobCap()) {
@@ -131,8 +149,8 @@ test("the timeout guard fails when a node --test bound reaches the job cap", () 
   assert.throws(() => assertTimeouts(mutated, cap), /must sit below the/);
 });
 
-// BLO-32670. Three of the 41 bounded steps in `policy` measured a p100 above
-// 50% of the old 60s budget over 58 sampled runs; the other 38 were all at or
+// BLO-32670. Three of `policy`'s bounded steps measured a p100 above
+// 50% of the old 60s budget over 58 sampled runs; the rest were all at or
 // under 25%. These three are the fork-heavy ones — they shell out per case, so
 // their wall time tracks runner CPU contention rather than their own work,
 // which is why they inflate while their neighbours (dominated by deliberate
@@ -809,5 +827,169 @@ test("the chart render job pins the helm it renders with (BLO-31516)", () => {
   assert.ok(
     pin[1] || !/^\d+\.\d*0+$/.test(version),
     `unquoted ${version} is a YAML float and reaches the action as ${Number(version)}; quote it or name the patch component`,
+  );
+});
+
+// BLO-31690. `policy`'s cap is sized against measured setup cost, and until this
+// PR none of the three setup steps carried a bound — so a wedged fetch could only
+// ever surface as an unattributable job-cap `cancelled`, the exact mode the cap
+// raise exists to remove. That makes the bounds load-bearing rather than
+// decorative, and by this file's own convention that means gating them: a bound
+// nothing asserts is a bound that can be quietly deleted.
+//
+// Deliberately NO figure is asserted here. The sizing argument lives in the
+// workflow comment, because every absolute number this PR wrote into a guard or
+// a comment has rotted at least once — the checkout bound's own residual band
+// went 0.2m → 1.1m → 0 across three measurements, and the 6m bound was overtaken
+// by the next window's 6.63m p100. What does not rot is that a bound EXISTS and
+// SITS UNDER THE CAP, since a step bound at or above the job cap can never fire
+// and silently stops being attribution.
+const POLICY_SETUP_STEPS = [
+  { label: "checkout", marker: "uses: actions/checkout@" },
+  { label: "pnpm", marker: "uses: ./.github/actions/setup-pnpm" },
+  { label: "python", marker: "uses: actions/setup-python@" },
+];
+
+function findSetupStep(region, marker) {
+  const step = region
+    .split("\n      - name: ")
+    .slice(1)
+    .find((candidate) => candidate.includes(marker));
+  assert.ok(step, `policy must contain a step using ${marker}`);
+  return step;
+}
+
+function assertSetupBounded(region, { label, marker }) {
+  // Both reads go through `timeoutMinutes` rather than a local `(\d+)`: this is
+  // the file that documents BLO-32670, and a hand-rolled integer pattern reads
+  // `timeout-minutes: 6.5` as declaring no bound at all — failing the step with
+  // the exact opposite of what its author wrote. The workflow comment tells the
+  // next reader these bounds are drifting ratios worth re-measuring, so a
+  // fractional right-size is the anticipated next edit, not a hypothetical one.
+  // Takes the caller's region, not the live one: the mutation tests below pass
+  // a MUTATED region, and re-reading pr.yml here would silently guard the
+  // unmutated file instead.
+  const jobCap = policyJobCap(region);
+  const stepBound = timeoutMinutes(findSetupStep(region, marker), 8);
+  assert.ok(stepBound > 0, `policy's ${label} step must declare a step-level timeout-minutes`);
+  assert.ok(
+    stepBound < jobCap,
+    `${label} bound ${stepBound}m must sit below the ${jobCap}m job cap`,
+  );
+}
+
+function assertCheckoutBounded(region) {
+  assertSetupBounded(region, POLICY_SETUP_STEPS[0]);
+}
+
+test("policy's setup steps are bounded, and inside the job's budget (BLO-31690)", () => {
+  const region = jobRegion("policy");
+  for (const step of POLICY_SETUP_STEPS) assertSetupBounded(region, step);
+});
+
+// Strip only the bound belonging to the named step. Anchored on the same
+// `findSetupStep` chunk the guard reads, so the two agree by construction: an
+// `indexOf(marker)` anchor instead would diverge the moment a bound is written
+// ABOVE its `uses:` line (legal YAML, and checkout already carries a comment
+// block there), and would then strip the NEXT step's bound. Shares
+// TIMEOUT_MINUTES with the guard so the strip still bites when the bound is
+// written fractionally — the fractional test below is what holds that, since
+// against the integer bounds in the file today a hand-rolled `\d+` strips
+// identically.
+function stripSetupBound(region, marker) {
+  const step = findSetupStep(region, marker);
+  return region.replace(step, step.replace(new RegExp(`\\n {8}${TIMEOUT_MINUTES}\\n`), "\n"));
+}
+
+const stripCheckoutBound = (region) => stripSetupBound(region, POLICY_SETUP_STEPS[0].marker);
+
+test("each setup guard fails when its own bound is removed", () => {
+  const region = jobRegion("policy");
+  for (const step of POLICY_SETUP_STEPS) {
+    assert.throws(
+      () => assertSetupBounded(stripSetupBound(region, step.marker), step),
+      /step-level timeout-minutes/,
+      `removing the ${step.label} bound must fail the ${step.label} guard`,
+    );
+  }
+});
+
+// Pins the anchor `stripSetupBound` uses, because the two plausible anchors
+// agree on the file as written today and only diverge on a legal edit. With the
+// bound written ABOVE its `uses:` line, an `indexOf(marker)` anchor starts its
+// search past the bound and strips the NEXT step's instead -- measured: it
+// leaves checkout's bound intact and removes pnpm's. That is loud rather than
+// silent (the mutation test above would fail, not pass), but it fails on the
+// wrong step and sends the reader to the wrong guard. Without this test the
+// step-chunk anchor is a preference the next editor can revert unnoticed.
+test("the bound strip follows the step, not the position of its `uses:` line", () => {
+  const { marker, label } = POLICY_SETUP_STEPS[0];
+  const region = jobRegion("policy");
+  const step = findSetupStep(region, marker);
+  const bound = step.match(new RegExp(`\\n {8}${TIMEOUT_MINUTES}\\n`));
+  assert.ok(bound, `${label} must declare a bound for this test to move`);
+
+  // Legal YAML: keys within a step are unordered, so hoist the bound above
+  // `uses:` and require the strip to still find it.
+  const hoisted = step.replace(bound[0], "\n").replace(`\n        ${marker}`, `\n        ${bound[1] ? `timeout-minutes: ${bound[1]}` : ""}\n        ${marker}`);
+  const moved = region.replace(step, hoisted);
+  assert.ok(
+    findSetupStep(moved, marker).includes("timeout-minutes:"),
+    "the hoisted region must still declare the bound, or this test proves nothing",
+  );
+
+  assert.throws(
+    () => assertSetupBounded(stripSetupBound(moved, marker), POLICY_SETUP_STEPS[0]),
+    /step-level timeout-minutes/,
+    `${label}'s bound must be stripped wherever in its step it is written`,
+  );
+});
+
+// `assertSetupBounded` compares against the cap in the region it was HANDED.
+// Re-reading the live file there would silently guard the unmutated pr.yml, so
+// every mutation test above would be asserting against the real cap rather than
+// the one in its own fixture — passing for the wrong reason. Nothing else in
+// this file mutates the cap, so without this test that distinction is invisible
+// and the parameter can be dropped unnoticed.
+test("the setup guard reads the cap from the region it was handed, not the live file", () => {
+  const { label } = POLICY_SETUP_STEPS[0];
+  const region = jobRegion("policy");
+  const lowered = region.replace(
+    new RegExp(`\\n {4}${TIMEOUT_MINUTES}\\n`),
+    "\n    timeout-minutes: 1\n",
+  );
+  assert.notEqual(lowered, region, "the job cap must be rewritable for this test to prove anything");
+  assert.equal(timeoutMinutes(lowered, 4), 1, "the fixture must actually carry the lowered cap");
+
+  assert.throws(
+    () => assertSetupBounded(lowered, POLICY_SETUP_STEPS[0]),
+    /must sit below/,
+    `${label}'s bound must be compared against the handed-in cap, not the live one`,
+  );
+});
+
+// The guard must survive the fractional right-size its own workflow comment
+// anticipates. Ally caught this reading `timeout-minutes: 6.5` as no bound at
+// all; both reads fail at once, so exercise both. Half-step whatever is written
+// rather than substituting literals, so a routine right-size of either number
+// cannot make this pass vacuously.
+test("the checkout guard accepts fractional bounds (BLO-32670)", () => {
+  const halfStep = (text, indent) =>
+    text.replace(new RegExp(`(\\n {${indent}}timeout-minutes: )(\\d+)(\\n)`), "$1$2.5$3");
+  const region = jobRegion("policy");
+  const at = region.indexOf("uses: actions/checkout@");
+  assert.notEqual(at, -1, "policy must contain an actions/checkout step");
+  // Job cap (4-space) first, then the checkout step's own bound, anchored at
+  // its `uses:` line so a bound belonging to an earlier step cannot be hit.
+  const fractional =
+    halfStep(region.slice(0, at), 4) + halfStep(region.slice(at), 8);
+  assert.match(fractional, /\n {4}timeout-minutes: \d+\.5\n/, "the job cap must be fractional");
+  assert.match(fractional, /\n {8}timeout-minutes: \d+\.5\n/, "the step bound must be fractional");
+  assert.doesNotThrow(() => assertCheckoutBounded(fractional));
+  // And the deletion mutation above must still bite against a fractional bound;
+  // this is the only case that holds `stripCheckoutBound`'s shared pattern.
+  assert.throws(
+    () => assertCheckoutBounded(stripCheckoutBound(fractional)),
+    /step-level timeout-minutes/,
   );
 });
