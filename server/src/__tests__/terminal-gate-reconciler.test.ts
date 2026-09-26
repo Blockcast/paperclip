@@ -192,6 +192,36 @@ describe("buildTerminalGateResolvedComment", () => {
     expect(body).toContain("merged");
     expect(body).toContain("BLO-27515");
   });
+
+  it("does not claim nothing is polling an armed monitor", () => {
+    // BLO-36289. This comment is system-authored and read by agents deciding
+    // whether a row is stranded, and the documented repair for a stranded row
+    // DESTROYS the wake path it already had. So on a row admitted by the
+    // never-polled arm — armed, first check still in the future — the stranded
+    // copy is not merely imprecise, it is the 86%-false-positive strand signal.
+    // Reverting either branch in the builder must fail this test.
+    const nextCheckAt = new Date("2026-09-25T21:30:00.000Z");
+    const armed = buildTerminalGateResolvedComment({
+      signals: ["pr:blockcast/paperclip#1281:checks"],
+      mergedPullRequests: ["blockcast/paperclip#1281"],
+      armedNextCheckAt: nextCheckAt,
+    });
+    expect(armed).not.toContain("nothing is polling it");
+    expect(armed).not.toContain("The monitor stopped re-checking");
+    expect(armed).not.toContain("re-arm the monitor");
+    expect(armed).toContain(nextCheckAt.toISOString());
+    expect(armed).toContain("live wake path");
+
+    // The stranded population keeps its copy: an omitted/null armedNextCheckAt
+    // is the "polling stopped" case and must still say so.
+    const stranded = buildTerminalGateResolvedComment({
+      signals: ["pr:blockcast/paperclip#1281:merged"],
+      mergedPullRequests: ["blockcast/paperclip#1281"],
+    });
+    expect(stranded).toContain("nothing is polling it");
+    expect(stranded).toContain("re-arm the monitor");
+    expect(stranded).not.toContain("live wake path");
+  });
 });
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -261,10 +291,22 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
     monitorNextCheckAt?: Date | null;
     /** BLO-36289: armed and never evaluated, vs armed-and-already-polling. */
     neverTriggered?: boolean;
+    /**
+     * Independent overrides for the two halves of the never-polled conjunct.
+     * `neverTriggered` alone correlates them perfectly, so with it as the only
+     * lever no fixture can produce `(attemptCount >= 1, lastTriggeredAt null)`
+     * or `(attemptCount 0, lastTriggeredAt set)` — and then either conjunct can
+     * be deleted with the suite green. TG15/TG16 use these to make each half
+     * independently mutation-killable.
+     */
+    monitorAttemptCount?: number;
+    monitorLastTriggeredAt?: Date | null;
   }) {
     const id = randomUUID();
-    const lastTriggeredAt = input.neverTriggered ? null : LAST_POLL_AT;
-    const attemptCount = input.neverTriggered ? 0 : 3;
+    const lastTriggeredAt = "monitorLastTriggeredAt" in input
+      ? (input.monitorLastTriggeredAt ?? null)
+      : (input.neverTriggered ? null : LAST_POLL_AT);
+    const attemptCount = input.monitorAttemptCount ?? (input.neverTriggered ? 0 : 3);
     await db.insert(issues).values({
       id,
       companyId: input.companyId,
@@ -292,7 +334,7 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
         lastDecisionId: null,
         lastDecisionOutcome: null,
         monitor: {
-          status: input.neverTriggered ? "scheduled" : "triggered",
+          status: lastTriggeredAt === null ? "scheduled" : "triggered",
           nextCheckAt: input.monitorNextCheckAt?.toISOString() ?? null,
           lastTriggeredAt: lastTriggeredAt?.toISOString() ?? null,
           attemptCount,
@@ -635,15 +677,21 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
     });
 
     expect(result).toMatchObject({ scanned: 1, resolved: 1 });
-    expect(await commentsFor(issueId)).toHaveLength(1);
+    const posted = await commentsFor(issueId);
+    expect(posted).toHaveLength(1);
+    // The DB path must select the ARMED copy, not just any copy: this row has a
+    // live wake path, and the stranded wording would invite a repair that
+    // destroys it.
+    expect(posted[0]!.body).not.toContain("nothing is polling it");
+    expect(posted[0]!.body).toContain("live wake path");
   });
 
-  it("does not re-admit a re-armed monitor that has already polled", async () => {
-    // The never-polled arm is deliberately `attemptCount = 0 AND
-    // lastTriggeredAt IS NULL`, not "recently armed": re-arming preserves
-    // attemptCount, so a monitor that has fired once stays out of the candidate
-    // set. That bound is what keeps this off the "every armed monitor in the
-    // fleet" cost BLO-29856 rejected.
+  it("does not admit a monitor that has polled without recording a trigger", async () => {
+    // Kills the `attemptCount = 0` half of the never-polled conjunct on its own.
+    // `(attemptCount 1, lastTriggeredAt null)` — a monitor that fired but left no
+    // trigger timestamp — passes the `lastTriggeredAt is null` half, so dropping
+    // the attemptCount half admits it and this test fails. TG4 cannot cover this:
+    // its attemptCount is 3, so it stays excluded under that same mutation.
     const { companyId, agentId } = await createCompany("TG15");
     const issueId = await insertStrandedGateIssue({
       companyId,
@@ -652,6 +700,8 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
       gateSignals: ["pr:blockcast/paperclip#1281:checks"],
       status: "in_progress",
       monitorNextCheckAt: new Date(NOW.getTime() + 60 * 60 * 1000),
+      monitorAttemptCount: 1,
+      monitorLastTriggeredAt: null,
     });
 
     const result = await reconcileTerminalGates(db, {
@@ -661,6 +711,64 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
 
     expect(result).toMatchObject({ scanned: 0, resolved: 0 });
     expect(await commentsFor(issueId)).toHaveLength(0);
+  });
+
+  it("does not admit a monitor that recorded a trigger without incrementing its attempt count", async () => {
+    // Kills the `lastTriggeredAt is null` half on its own, the mirror of TG15.
+    // `(attemptCount 0, lastTriggeredAt set)` passes the attemptCount half, so
+    // dropping the lastTriggeredAt half admits it and this test fails.
+    //
+    // Together TG15/TG16 are what makes the bound a guard rather than a comment:
+    // re-arming preserves attemptCount, so a re-armed monitor stays out of the
+    // candidate set, and that is what keeps this off the "every armed monitor in
+    // the fleet" cost BLO-29856 rejected.
+    const { companyId, agentId } = await createCompany("TG16");
+    const issueId = await insertStrandedGateIssue({
+      companyId,
+      agentId,
+      identifier: "TG16-1",
+      gateSignals: ["pr:blockcast/paperclip#1281:checks"],
+      status: "in_progress",
+      monitorNextCheckAt: new Date(NOW.getTime() + 60 * 60 * 1000),
+      monitorAttemptCount: 0,
+      monitorLastTriggeredAt: LAST_POLL_AT,
+    });
+
+    const result = await reconcileTerminalGates(db, {
+      now: NOW,
+      readPullRequestGate: mergedReader(new Set(["blockcast/paperclip#1281"])),
+    });
+
+    expect(result).toMatchObject({ scanned: 0, resolved: 0 });
+    expect(await commentsFor(issueId)).toHaveLength(0);
+  });
+
+  it("uses the stranded copy for a never-polled monitor whose first check is already overdue", async () => {
+    // The armed copy claims a live wake path. An OVERDUE first check is by
+    // definition a wake that did not happen, so claiming it there would be the
+    // mirror of the false signal the armed branch exists to avoid. Reverting the
+    // `> now` gate at the call site must fail this test.
+    const { companyId, agentId } = await createCompany("TG17");
+    const issueId = await insertStrandedGateIssue({
+      companyId,
+      agentId,
+      identifier: "TG17-1",
+      gateSignals: ["pr:blockcast/paperclip#1281:checks"],
+      status: "in_progress",
+      monitorNextCheckAt: new Date(NOW.getTime() - 60 * 60 * 1000),
+      neverTriggered: true,
+    });
+
+    const result = await reconcileTerminalGates(db, {
+      now: NOW,
+      readPullRequestGate: mergedReader(new Set(["blockcast/paperclip#1281"])),
+    });
+
+    expect(result).toMatchObject({ scanned: 1, resolved: 1 });
+    const posted = await commentsFor(issueId);
+    expect(posted).toHaveLength(1);
+    expect(posted[0]!.body).toContain("nothing is polling it");
+    expect(posted[0]!.body).not.toContain("live wake path");
   });
 
   it("does not resolve an issue that still has an unresolved blocker edge", async () => {
