@@ -861,6 +861,28 @@ export const ISSUE_MONITOR_DISPATCH_LAPSE_MS = 15 * 60 * 1000;
  * consumed the trigger, and died without re-arming or clearing.
  */
 export const ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS = 4 * 60 * 60 * 1000;
+/**
+ * BLO-35155: ceiling on how old a queued/running run may be and still count as
+ * the live consumer suppressing the `trigger_stalled` sweep.
+ *
+ * Without it the guard is UNBOUNDED, and a run that never reaches a terminal
+ * status holds the monitor `triggered` forever — BLO-29606's permanent strand
+ * re-entered through a new door. The asymmetry is the whole argument: a false
+ * reap self-corrects (the owner wake fires and the assignee re-arms), a never-
+ * reap does not. So a wedged queue must degrade back to bounded BLO-29606
+ * behaviour rather than hold the row open.
+ *
+ * 6x the grace (24h) costs nothing against the distribution this fix targets —
+ * the measured CTO-lane created->started p90 is 379m and the max 518m (8.6h),
+ * so a genuine slow dispatch has ~2.8x headroom over the worst case observed.
+ *
+ * NOTE this is an absolute-age ceiling on the consumer, NOT the
+ * `created_at >= monitorLastTriggeredAt` bound deliberately rejected at the
+ * predicate below. That one is relative to the trigger and would miss the
+ * coalescing case (the consumer is routinely OLDER than the trigger); this one
+ * only asks whether the consumer is plausibly still going to be dispatched.
+ */
+export const ISSUE_MONITOR_LIVE_CONSUMER_MAX_AGE_MS = 6 * ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS;
 const ISSUE_MONITOR_DISPATCH_REARM_DELAY_MS = 5 * 60 * 1000;
 const ISSUE_MONITOR_DISPATCH_WATCHDOG_SERVICE = "paperclip_monitor_dispatch";
 const ISSUE_MONITOR_DISPATCH_WATCHDOG_GATE_PREFIX = "heartbeat_run:";
@@ -15144,6 +15166,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function tickExpiredIssueMonitors(now = new Date()) {
     const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
     const triggeredStallThreshold = new Date(now.getTime() - ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS);
+    const liveConsumerFloor = new Date(now.getTime() - ISSUE_MONITOR_LIVE_CONSUMER_MAX_AGE_MS);
     const expiredMonitorTimeoutCondition = and(
       sql`${issues.executionState} -> 'monitor' ->> 'status' = 'triggered'`,
       or(
@@ -15185,6 +15208,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // the trigger. A created_at bound would miss exactly that case and
           // reap the monitor out from under its live consumer.
           //
+          // There IS an absolute-age ceiling on the consumer
+          // (ISSUE_MONITOR_LIVE_CONSUMER_MAX_AGE_MS, 24h) and it is a different
+          // question from the bound above: without it this guard is unbounded,
+          // so a run wedged `queued` forever would hold the monitor `triggered`
+          // forever — BLO-29606's permanent strand, re-entered. A false reap
+          // self-corrects via the owner wake; a never-reap does not. It also
+          // keeps the probe on the index's trailing `created_at` column rather
+          // than reaching every historical run for the issue.
+          //
           // Bound on company+agent as well as issue so this probes
           // idx_heartbeat_runs_company_agent_context_issue_created (migration
           // 0104) rather than scanning; a reassigned issue's orphaned monitor is
@@ -15207,6 +15239,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                     eq(heartbeatRuns.agentId, issues.assigneeAgentId),
                     eq(heartbeatRuns.contextIssueId, sql`${issues.id}::text`),
                     inArray(heartbeatRuns.status, ISSUE_MONITOR_LIVE_CONSUMER_RUN_STATUSES),
+                    gte(heartbeatRuns.createdAt, liveConsumerFloor),
                   ),
                 ),
             ),
