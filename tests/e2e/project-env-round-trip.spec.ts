@@ -189,9 +189,13 @@ function expectMaskedBoth(env: unknown, where: string) {
  * node was removed". Reading those diffs as state shows the container flickering in and out, which
  * is an artifact of the format.
  *
- * Polling on the row list also puts the rows actually seen into the failure message, so if a
- * genuine blanking ever does occur it reports the populated-then-emptied container distinctly
- * instead of collapsing to `[]` as an unmount does.
+ * The row list alone cannot tell an unmount from the one blanking worth fearing. If the editor
+ * adopted an empty `value` it would render ZERO rows (`rowsFromValue({})` is `[]`) inside a
+ * container that stays mounted, so its names read `[]`, exactly what an unmount reads. The poll
+ * therefore also counts the container, and the failure message separates the two:
+ * `containers: 0` is the editor gone, `containers: 1` with `rows: []` is the editor present with
+ * its rows emptied. (A blanking of VALUES alone leaves the names intact, so this poll passes and
+ * the `toHaveValue` after it is what fails.)
  */
 async function valueInputFor(page: Page, editor: Locator, key: string): Promise<Locator> {
   const names = editor.getByLabel("Variable name");
@@ -199,14 +203,38 @@ async function valueInputFor(page: Page, editor: Locator, key: string): Promise<
   await expect
     .poll(
       async () => {
+        const containers = await editor.count();
         seen = await names.evaluateAll((els) => els.map((el) => (el as HTMLInputElement).value));
-        return seen;
+        return { containers, rows: seen };
       },
       { message: `env editor never showed a row named ${key}` },
     )
-    .toContain(key);
+    .toMatchObject({ containers: 1, rows: expect.arrayContaining([key]) });
   return editor.getByLabel("Variable value").nth(seen.indexOf(key));
 }
+
+/**
+ * Pins the distinction `valueInputFor`'s comment promises. Static DOM, so neither state depends on
+ * reproducing the redirect: both read `rows: []`, and only the container count separates them.
+ */
+test("project env: the row lookup fails differently for an unmounted editor and an emptied one", async ({
+  page,
+}) => {
+  const editor = page.locator('div[class*="container/env"]');
+  const failureFor = async (html: string) => {
+    await page.setContent(html);
+    return valueInputFor(page, editor, KEEP_KEY).then(
+      () => "resolved",
+      (error: Error) => error.message,
+    );
+  };
+
+  const unmounted = await failureFor("<main></main>");
+  const emptied = await failureFor('<div class="@container/env"></div>');
+  expect(unmounted).toMatch(/"containers": 0/);
+  expect(emptied).not.toMatch(/"containers": 0/);
+  expect(emptied).toMatch(/"rows": Array \[\]/);
+});
 
 test("project env: editing one binding in the UI saves without 422 and leaves the others intact", async ({
   page,
