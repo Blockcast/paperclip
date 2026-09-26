@@ -21512,11 +21512,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * including another run of this same agent or a future persisted status — is a
    * run this wake would lose to.
    *
-   * Deliberately still counted as actionable: an issue whose blockers are
-   * unresolved. `checkout()` 422s on those, so they are not workable either, but
-   * suppressing their wakes would remove the only path by which an agent notices
-   * and escalates an ageing blocker. Unavailable-because-busy is transient;
-   * unavailable-because-blocked needs someone to look.
+   * BLO-36317: a `todo` issue with unresolved blockers is likewise not
+   * actionable. BLO-19749 deliberately kept those counted, on the reasoning that
+   * suppressing their wakes "would remove the only path by which an agent
+   * notices and escalates an ageing blocker". That premise was wrong in two
+   * ways. It is not the only path — `issue-graph-liveness` raises an ageing
+   * blocker against `stalled_blocker_assignee`, which routes to the *blocker's*
+   * owner, the one party that can move it; waking the blocked lane cannot.
+   * And it overrode an explicit opt-in: `skipTimerWhenNoActionableWork` is
+   * default-off, so an agent that sets it has already asked not to be woken for
+   * work it cannot pick up. Measured cost of the override on one lane: 9 Opus
+   * runs in a day, each exiting with a restatement of an unchanged blocker
+   * signature, 16 consecutive such wakes in total.
+   *
+   * Scoped to `todo` only. A blocked `in_progress` issue stays actionable: it
+   * may still need its assignee awake to hand off, finish a partial, or unpark
+   * itself, and over-suppression is the direction BLO-19749's guards exist to
+   * prevent.
+   *
+   * Readiness comes from `listDependencyReadiness()` rather than a hand-rolled
+   * blocker join so the predicate agrees with `checkout()` exactly — including
+   * a `cancelled` blocker (unresolved until the edge is removed) and the
+   * workspace-finalize barrier, where a blocker that IS `done` still gates.
    */
   async function hasActionableTimerWork(agent: typeof agents.$inferSelect) {
     const heldByNonReapableRun = exists(
@@ -21545,8 +21562,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ),
         ),
     );
-    const row = await db
-      .select({ id: issues.id })
+    const candidates = await db
+      .select({ id: issues.id, status: issues.status })
       .from(issues)
       .where(
         and(
@@ -21557,10 +21574,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           inArray(issues.status, [...TIMER_ACTIONABLE_ISSUE_STATUSES]),
           not(heldByNonReapableRun),
         ),
-      )
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
-    return Boolean(row);
+      );
+    if (candidates.length === 0) return false;
+    // `in_progress` is status-only by design — see the docblock.
+    if (candidates.some((row) => row.status !== "todo")) return true;
+
+    const todoIssueIds = candidates.map((row) => row.id);
+    const readiness = await issuesSvc.listDependencyReadiness(agent.companyId, todoIssueIds);
+    return todoIssueIds.some(
+      (issueId) => (readiness.get(issueId)?.unresolvedBlockerIssueIds ?? []).length === 0,
+    );
   }
 
   async function markTimerHeartbeatChecked(agentId: string, source: WakeupOptions["source"]) {
@@ -34860,7 +34883,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // did: the park outlives the reason it was created.
     if (policy.skipTimerWhenNoActionableWork && genericTimerWake && !(await hasActionableTimerWork(agent))) {
       await writeSkippedHeartbeatRequest("heartbeat.timer.no_actionable_work", {
-        reason: "No assigned todo or in_progress issue requires this agent before timer adapter invocation.",
+        reason: "No assigned todo or in_progress issue is available to this agent before timer adapter invocation.",
       });
       await markTimerHeartbeatChecked(agentId, source);
       return null;
