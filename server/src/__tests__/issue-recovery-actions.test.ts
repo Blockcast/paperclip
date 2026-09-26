@@ -6143,6 +6143,143 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(enqueueWakeup).toHaveBeenCalledTimes(1);
   });
 
+  describe("a closed PR discharges its non-convergence action (PEN-3397)", () => {
+    // These beacons had no resolution-on-merge and no resolution-on-close, so a
+    // moot one sat on its owner's plate forever. Measured live: `6542ffc8` asked
+    // the CTO to "take over" onprem-k8s#3076 for 3 DAYS after that PR merged —
+    // the PR merged 3h22m after the action was created, and 3h22m after its own
+    // `timeoutAt`. PEN-2756 bounded the shape; a bound stops it re-firing, it does
+    // not notice that the thing it is escalating about is over.
+    async function seedBeacon(overrides?: { prNumber?: number }) {
+      const fixture = await seedCompany();
+      const enqueueWakeup = vi.fn(async () => null);
+      const recovery = recoveryService(db, { enqueueWakeup } as any);
+      await recovery.escalateStalledSelfReviewPr({
+        issueId: fixture.sourceIssueId,
+        prNumber: overrides?.prNumber ?? 3076,
+        repoFullName: "Blockcast/onprem-k8s",
+        cycleCount: 4,
+      });
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, fixture.sourceIssueId));
+      return { ...fixture, recovery, action: action! };
+    }
+
+    it("resolves a merged PR's beacon without touching the source issue", async () => {
+      const { companyId, sourceIssueId, coderId, recovery } = await seedBeacon();
+
+      const result = await recovery.closePrReviewNonConvergenceForClosedPr({
+        repoFullName: "Blockcast/onprem-k8s",
+        prNumber: 3076,
+        merged: true,
+        candidateIssues: [{ id: sourceIssueId, companyId }],
+      });
+
+      expect(result.closed).toBe(1);
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+      expect(action!.status).toBe("resolved");
+      expect(action!.outcome).toBe("restored");
+      expect(action!.resolvedAt).not.toBeNull();
+
+      // The action closes; the WORK does not. A merged PR does not mean the
+      // issue's Done-when was evaluated, so moving the row here would silently
+      // complete work nobody checked.
+      const [issue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(issue!.status).toBe("in_progress");
+      expect(issue!.assigneeAgentId).toBe(coderId);
+    });
+
+    it("discharges a beacon that has already gone escalated", async () => {
+      // This is the population that was actually stuck. `escalated` is where
+      // `escalateExpiredWakeHorizons` parks a spent beacon, and it is deliberately
+      // NOT terminal — it stays in ACTIVE_RECOVERY_ACTION_STATUSES so the row keeps
+      // holding `issue_recovery_actions_active_source_uq`. Both live instances were
+      // in exactly this state. A discharge that only handled `active` would have
+      // left them precisely as stuck as before.
+      const { companyId, sourceIssueId, recovery, action } = await seedBeacon();
+      await db
+        .update(issueRecoveryActions)
+        .set({ status: "escalated", retiringBound: "timeout_horizon" })
+        .where(eq(issueRecoveryActions.id, action.id));
+
+      const result = await recovery.closePrReviewNonConvergenceForClosedPr({
+        repoFullName: "Blockcast/onprem-k8s",
+        prNumber: 3076,
+        merged: true,
+        candidateIssues: [{ id: sourceIssueId, companyId }],
+      });
+
+      expect(result.closed).toBe(1);
+      const [after] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      expect(after!.status).toBe("resolved");
+    });
+
+    it("cancels rather than resolves when the PR closed unmerged", async () => {
+      const { companyId, sourceIssueId, recovery } = await seedBeacon();
+
+      const result = await recovery.closePrReviewNonConvergenceForClosedPr({
+        repoFullName: "Blockcast/onprem-k8s",
+        prNumber: 3076,
+        merged: false,
+        candidateIssues: [{ id: sourceIssueId, companyId }],
+      });
+
+      expect(result.closed).toBe(1);
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+      // The loop ended, but it did not converge — recording `restored` here would
+      // assert a success that never happened.
+      expect(action!.status).toBe("cancelled");
+      expect(action!.outcome).toBe("cancelled");
+    });
+
+    it("leaves a beacon for a DIFFERENT PR on the same issue untouched", async () => {
+      // The guard that makes a wide candidate list safe. The webhook passes every
+      // issue the PR mentions OR was ever linked to, so without fingerprint
+      // matching this would close an unrelated PR's live escalation. Seeded on the
+      // same issue and same repo, differing only in PR number.
+      const { companyId, sourceIssueId, recovery } = await seedBeacon({ prNumber: 4242 });
+
+      const result = await recovery.closePrReviewNonConvergenceForClosedPr({
+        repoFullName: "Blockcast/onprem-k8s",
+        prNumber: 3076,
+        merged: true,
+        candidateIssues: [{ id: sourceIssueId, companyId }],
+      });
+
+      expect(result.closed).toBe(0);
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+      expect(action!.status).toBe("active");
+      expect(action!.resolvedAt).toBeNull();
+    });
+
+    it("names the discharge route in nextAction, with the action id in the body", async () => {
+      // The omission this replaces cost two agents an investigation and produced a
+      // filed finding that NO agent-facing discharge route exists. The old text
+      // ended at "or record a disposition" — an outcome with no mechanism. Both
+      // agents inferred a REST shape, put the action id in the path, and got a
+      // uniform 404 that reads as route-absence rather than a wrong URL.
+      const { action } = await seedBeacon();
+      expect(action.nextAction).toContain("/recovery-actions/resolve");
+      expect(action.nextAction).toContain("BODY");
+      // The exact trap: the id must not appear as a path segment.
+      expect(action.nextAction).not.toContain(`/recovery-actions/${action.id}`);
+    });
+  });
+
   it("clears a beacon on an in_progress row without writing a status (PEN-2756)", async () => {
     // The row seeded here is `in_progress` and assigned to the coder — the exact
     // shape 4 of the 6 beacons found in the fleet census sat on. `in_progress` is
