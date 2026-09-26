@@ -492,9 +492,10 @@ settled on its own, including the 2h14m fleet one. Read this paragraph as
 you restart it."* Those are different claims and only the first is supported.
 
 ⚠️ **The date bound is load-bearing, and the exception is the paragraph
-directly below.** The 2026-09-15/16 episode predates it, is the *only*
-documented instance of the fleet-scope regime the retuned alert fires on, and is
-on record as having ended with a pod replacement. It is **not** a
+directly below.** The 2026-09-15/16 episode predates it and is the *only*
+documented fleet-scope episode that ended with a pod replacement. It is not the
+only fleet-scope episode: the 2h14m 2026-09-24 one above was also three agents
+in lockstep, and released on its own. The 09-15/16 episode is **not** a
 counter-example to the self-heal claim, and it is **not** evidence for it
 either: the pod was replaced before the hold was ever observed long enough to
 settle, so that episode tells us nothing about what it would have done. Do not
