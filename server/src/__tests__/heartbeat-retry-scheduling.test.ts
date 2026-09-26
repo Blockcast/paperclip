@@ -15,6 +15,7 @@ import {
   issueComments,
   issueRelations,
   issues,
+  issueWorkProducts,
   projects,
   routineRuns,
   routineTriggers,
@@ -93,6 +94,25 @@ const mockAdapterExecute = vi.hoisted(() =>
 vi.mock("../telemetry.ts", () => ({
   getTelemetryClient: () => ({ track: vi.fn() }),
 }));
+
+// PEN-3487: the notifier now reads whether its gate context is required on the
+// PR's base branch. Mocked so the assertions below name a branch-protection
+// verdict rather than whatever a credential-less test host happens to return.
+const mockGithubGetPrRequiredStatusContext = vi.hoisted(() =>
+  vi.fn(async (): Promise<
+    import("../services/github-app-auth.ts").PrRequiredStatusContextLookup
+  > => ({ outcome: "unknown", reason: "test_default" })),
+);
+
+vi.mock("../services/github-app-auth.ts", async () => {
+  const actual = await vi.importActual<typeof import("../services/github-app-auth.ts")>(
+    "../services/github-app-auth.ts",
+  );
+  return {
+    ...actual,
+    githubGetPrRequiredStatusContext: mockGithubGetPrRequiredStatusContext,
+  };
+});
 
 vi.mock("@paperclipai/shared/telemetry", async () => {
   const actual = await vi.importActual<typeof import("@paperclipai/shared/telemetry")>(
@@ -3405,6 +3425,125 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
       expect(events.at(-1)?.message).toContain("Bounded retry exhausted");
       expect(events.some((e) => e.message.includes("gate status"))).toBe(false);
+    });
+
+    /**
+     * PEN-3487: the notice this exhaustion posts has to say whether its red gate
+     * actually blocks the merge, because that answer is per-repository and the
+     * reader cannot derive it.
+     *
+     * Measured 2026-09-24: `review/ally-complete` is one of ten required
+     * contexts on Blockcast/penstock-llm-proxy-core, is required on nothing in
+     * Blockcast/paperclip (whose `master` requires exactly `verify`), and
+     * Blockcast/onprem-k8s requires no contexts at all. PEN-3487 itself is the
+     * cost of that ambiguity — filed and escalated as a stranded merge pipeline
+     * on paperclip#1867, which read `mergeable: true` throughout, and paperclip
+     * #1960 merged carrying this exact failed status.
+     *
+     * Seeds an UNASSIGNED linked issue on purpose. The wake path is already
+     * covered in heartbeat-process-recovery.test.ts; what is under test here is
+     * the text of the comment, and an unassigned issue reaches it without
+     * dragging wake dispatch into a retry-scheduling suite.
+     */
+    async function seedIssueLinkedToExhaustedPr(companyId: string) {
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "PEN-3487 gate requiredness is unreadable at the point of reading",
+        status: "in_review",
+        priority: "high",
+        responsibleUserId: "responsible-user",
+        issueNumber: 7,
+        identifier: "TPR-7",
+      });
+      await db.insert(issueWorkProducts).values({
+        companyId,
+        issueId,
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/hang#7",
+        title: "PEN-3487 gate requiredness is unreadable at the point of reading",
+        url: "https://github.com/Blockcast/hang/pull/7",
+        status: "ready_for_review",
+      });
+      return issueId;
+    }
+
+    async function exhaustPrReviewRunWithLinkedIssue() {
+      const runId = randomUUID();
+      const companyId = randomUUID();
+      const now = new Date();
+      await seedRetryFixture({
+        runId,
+        companyId,
+        agentId: randomUUID(),
+        now,
+        errorCode: "pr_review_output_missing",
+        scheduledRetryAttempt: 2,
+        contextSnapshot: prReviewSnapshot,
+      });
+      const issueId = await seedIssueLinkedToExhaustedPr(companyId);
+      const outcome = await heartbeat.scheduleBoundedRetry(runId, {
+        now,
+        retryReason: "transient_failure",
+        wakeReason: "github_pr_synchronized",
+        maxAttempts: 2,
+        delayMs: 1_000,
+      });
+      expect(outcome).toMatchObject({ outcome: "retry_exhausted" });
+      const notices = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId));
+      expect(notices).toHaveLength(1);
+      return notices[0]!.body;
+    }
+
+    it("tells the linked issue the gate does NOT block merge where it is not required (PEN-3487)", async () => {
+      process.env[GATE_CONTEXT_ENV] = "review/ally-complete";
+      mockGithubGetPrRequiredStatusContext.mockResolvedValueOnce({
+        outcome: "not_required",
+        baseRef: "master",
+        branchProtected: true,
+        requiredContexts: ["verify"],
+      });
+
+      const body = await exhaustPrReviewRunWithLinkedIssue();
+
+      // The fact the reader needs, in words, naming the branch it was read on.
+      expect(body).toContain("**not a required status check**");
+      expect(body).toContain("does not block merge");
+      expect(body).toContain("`master`");
+      // ...and what IS required there, so "not this one" is not the whole answer.
+      expect(body).toContain("`verify`");
+      // Neither terminality nor blockage is claimed. Each of these was asserted
+      // by an earlier revision of this notice and each was measured false:
+      // "none is coming"/"terminal outcome"/"not reviewer latency" (BLO-34699),
+      // and a bare red gate reading as a merge block (PEN-3487).
+      expect(body).not.toContain("none is coming");
+      expect(body).not.toContain("terminal outcome");
+      expect(body).not.toContain("not reviewer latency");
+      expect(body).not.toContain("**is a required status check**");
+    });
+
+    it("refuses to say rather than reassuring when branch protection is unreadable (PEN-3487)", async () => {
+      // The one collapse that must never happen: an unread gate is not a
+      // cleared gate. If this degraded to the not_required wording, a throttled
+      // or unauthorized GitHub read would print a confident all-clear over a
+      // context that may well be blocking the merge.
+      process.env[GATE_CONTEXT_ENV] = "review/ally-complete";
+      mockGithubGetPrRequiredStatusContext.mockResolvedValueOnce({
+        outcome: "unknown",
+        reason: "required_context_branch_http_403",
+      });
+
+      const body = await exhaustPrReviewRunWithLinkedIssue();
+
+      expect(body).toContain("**unread**");
+      expect(body).toContain("required_context_branch_http_403");
+      expect(body).not.toContain("not a required status check");
+      expect(body).not.toContain("does not block merge");
     });
 
     // BLO-34699: the PR author's own agent is woken by its own review-request
