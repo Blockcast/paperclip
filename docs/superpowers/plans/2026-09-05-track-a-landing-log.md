@@ -762,26 +762,36 @@ The cause is in the script, not in #2020. `scripts/land-clean-prs.mjs:433` arms 
 when it cannot infer one. Every `enqueue` row that armed was `mergestate:CLEAN` and the only one
 that has ever failed is `mergestate:BLOCKED` — a clean correlation across all seven distinct
 `enqueue` rows to date, but one distinct failing PR, so **whether `BLOCKED` is the discriminator is
-not established**. Logged as an open question for C1 ([BLO-32240](https://paperclip.blockcast.net/BLO/issues/BLO-32240)),
-not resolved here: the fix is a change to the script, outside this routine's remit.
+not established**. Filed as [BLO-36804](https://paperclip.blockcast.net/BLO/issues/BLO-36804)
+against the script's owner, not resolved here: the fix is a change to the script, outside this
+routine's remit. Routed there rather than to C1 ([BLO-32240](https://paperclip.blockcast.net/BLO/issues/BLO-32240)),
+which is `done` — a closed issue is not a wake path.
 
 This is recorded rather than smoothed over for the same reason the coalescing note below is: a log
 that reads a nine-fire silent failure as a successful enqueue is producing exactly the false defect
 — in the flattering direction — that this document warns about.
 
-#### Two PRs landed — the end-to-end proof
+#### Landed end to end — the routine's proof
 
 #1990 was enqueued by fire 6, classified `still-queued` at its confirmation, and **merged at
 `2026-09-25T02:34:27Z`**. #1804 was enqueued by `4effd9fa`, classified `still-queued` by
-`aa6a0a70`, and **merged at `2026-09-25T15:27:33Z`** (both `gh pr view <n> --json state,mergedAt` →
-`MERGED`, re-read 2026-09-26). Two PRs the routine armed, tracked, and saw through to master
-without a hand merge.
+`aa6a0a70`, and **merged at `2026-09-25T15:27:33Z`**. #2001 was enqueued by `98027253`, classified
+`still-queued` by `933af750`, and **merged at `2026-09-26T15:16:52Z`** (all three
+`gh pr view <n> --json state,mergedAt` → `MERGED`, re-read 2026-09-26). PRs the routine armed,
+tracked, and saw through to master without a hand merge.
 
-The remaining rows are open as of writing — #2001, #1985, #1976, #2020, #1774 all `state: OPEN`,
-`mergedAt: null` — so `still-queued` remains the accurate classification for the four that armed.
-For #2020 it is accurate only about the PR's state, not about the routine's: it never entered the
-queue. **No receipt has yet printed a literal `confirmed-merged` row**, because both merges fell
-outside the one-receipt confirmation window that had already resolved those rows.
+**No running total is recorded here**, deliberately: a count in this document is stale at the next
+merge, which has now put a wrong number in this section twice.
+[BLO-34818](https://paperclip.blockcast.net/BLO/issues/BLO-34818) is the ledger — count from the
+receipts.
+
+The remaining rows are open as of writing — #1985, #1976, #2020, #1774 all `state: OPEN`,
+`mergedAt: null` — so `still-queued` remains the accurate classification for the three of them that
+armed. For #2020 it is accurate only about the PR's state, not about the routine's: it never entered
+the queue. **No receipt has yet printed a literal `confirmed-merged` row**, because each merge fell
+outside the one-receipt confirmation window that had already resolved its row — #2001 is the
+sharpest case, merging 39 minutes after the most recent receipt (`517622da`, 14:37:43Z) resolved it
+`still-queued`.
 
 #### AC 3 names a field this repo does not use — fifth plan-vs-reality drift
 
@@ -797,7 +807,9 @@ One measured fact deliberately left unexplained: each `added_to_merge_queue` pre
 (6m27s for #1990, 43m54s for #1804) and is attributed to `kkroo` rather than the App — though the
 App *can* be that actor, so it is not an attribution artifact. Either the script armed nothing and
 reported a queue state already set, or it armed something GitHub attributed elsewhere. One run's
-evidence does not separate those; logged as an open question for C1 (BLO-32240), not resolved here.
+evidence does not separate those; logged on
+[BLO-36804](https://paperclip.blockcast.net/BLO/issues/BLO-36804) alongside the arming defect above
+— it is the same question about the same code path — not resolved here.
 
 #### Coalescing continues to hold, and a `skipped` fire is still not a missing receipt
 
