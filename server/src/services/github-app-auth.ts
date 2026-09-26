@@ -518,6 +518,14 @@ const commentAttestsHead = (body: string, head: string): boolean =>
  * several attestations and ignores quoted text, so every ambiguous body lands
  * on the unchanged arm rather than on a guess.
  *
+ * No `hasAllyConsolidatedReviewHeading` guard here, unlike `commentAttestsHead`
+ * above. The asymmetry is deliberate: a review object is itself proof a review
+ * happened, so the marker is read only for WHICH head, whereas a comment has no
+ * such proof and needs the heading to be told apart from ordinary PR chatter.
+ * Do not harmonise the two — adding the guard here would send every review whose
+ * body Ally shapes differently back onto bare `commit_id`, i.e. straight back
+ * into the fail-open above.
+ *
  * Applied per review, never across the set: one lying review must not suppress
  * a different, honest review at the same head.
  */
