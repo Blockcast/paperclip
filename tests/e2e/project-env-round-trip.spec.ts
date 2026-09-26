@@ -1,5 +1,5 @@
 import { expect, test, type APIRequestContext, type Locator, type Page } from "@playwright/test";
-import { REDACTED_SENTINEL } from "@paperclipai/shared";
+import { REDACTED_SENTINEL, deriveProjectUrlKey } from "@paperclipai/shared";
 
 /**
  * PEN-3033 — the project `env` read-mask + write-merge round trip, driven in the running app.
@@ -94,6 +94,12 @@ test.afterAll(async ({ request }) => {
 
 type Seed = {
   projectId: string;
+  /**
+   * The route ref the app considers CANONICAL for this project. Navigating by anything else —
+   * `projectId`, notably — makes `ProjectDetail` redirect, and that redirect destroys the page
+   * mid-test. See the comment on the `page.goto` below.
+   */
+  projectRef: string;
   prefix: string;
   keepValue: string;
   editValue: string;
@@ -139,6 +145,9 @@ async function seedProject(request: APIRequestContext): Promise<Seed> {
 
   return {
     projectId: created.id,
+    // Mirrors `projectRouteRef` (`ui/src/lib/utils.ts:227`), whose non-ASCII fallback branch
+    // cannot fire here — the seeded name is ASCII by construction a few lines up.
+    projectRef: created.urlKey ?? deriveProjectUrlKey(created.name, created.id),
     prefix: company.issuePrefix ?? company.prefix ?? company.urlKey ?? "E2E",
     keepValue,
     editValue,
@@ -160,19 +169,72 @@ function expectMaskedBoth(env: unknown, where: string) {
 /**
  * Resolves a row's value input by first asserting the name input beside it, so a change in row
  * ordering fails loudly here instead of silently editing the wrong row further down.
+ *
+ * Auto-waiting rather than snapshotting, which is load-bearing: a one-shot `names.count()` reads a
+ * single instant, and this editor's ancestors legitimately re-render underneath it (a save echo, a
+ * refetch settling). When the container is momentarily absent the scoped locator resolves to zero
+ * rows and a snapshot read fails outright instead of waiting the render out — BLO-36601, where
+ * this threw `rows present: []` 40ms after a `toHaveCount(2)` four lines earlier had passed.
+ *
+ * `rows present: []` there did NOT mean the editor had blanked its rows — it was UNMOUNTED, by the
+ * route redirect described on the `page.goto` below. That is established from `ProjectDetail`'s own
+ * control flow, not from the trace: a query-key change makes `data` `undefined`, so `:716` returns
+ * `<PageSkeleton>` and never reaches this editor. The editor's `value`-adoption effect
+ * (`environment-variables-editor/index.tsx`) therefore cannot have run with an empty value, because
+ * the component was not mounted to receive one.
+ *
+ * Do NOT try to re-confirm that from the trace's frame snapshots. They are INCREMENTAL — run
+ * 36187220561 carries one full 69KB snapshot and then 463-3574 byte diffs — so a missing
+ * `@container/env` node in a later snapshot means "this diff did not touch that subtree", not "the
+ * node was removed". Reading those diffs as state shows the container flickering in and out, which
+ * is an artifact of the format.
+ *
+ * The row list alone cannot tell an unmount from the one blanking worth fearing. If the editor
+ * adopted an empty `value` it would render ZERO rows (`rowsFromValue({})` is `[]`) inside a
+ * container that stays mounted, so its names read `[]`, exactly what an unmount reads. The poll
+ * therefore also counts the container, and the failure message separates the two:
+ * `containers: 0` is the editor gone, `containers: 1` with `rows: []` is the editor present with
+ * its rows emptied. (A blanking of VALUES alone leaves the names intact, so this poll passes and
+ * the `toHaveValue` after it is what fails.)
  */
 async function valueInputFor(page: Page, editor: Locator, key: string): Promise<Locator> {
   const names = editor.getByLabel("Variable name");
-  const count = await names.count();
-  for (let i = 0; i < count; i += 1) {
-    if ((await names.nth(i).inputValue()) === key) {
-      return editor.getByLabel("Variable value").nth(i);
-    }
-  }
-  const seen: string[] = [];
-  for (let i = 0; i < count; i += 1) seen.push(await names.nth(i).inputValue());
-  throw new Error(`no env row named ${key}; rows present: ${JSON.stringify(seen)}`);
+  let seen: string[] = [];
+  await expect
+    .poll(
+      async () => {
+        const containers = await editor.count();
+        seen = await names.evaluateAll((els) => els.map((el) => (el as HTMLInputElement).value));
+        return { containers, rows: seen };
+      },
+      { message: `env editor never showed a row named ${key}` },
+    )
+    .toMatchObject({ containers: 1, rows: expect.arrayContaining([key]) });
+  return editor.getByLabel("Variable value").nth(seen.indexOf(key));
 }
+
+/**
+ * Pins the distinction `valueInputFor`'s comment promises. Static DOM, so neither state depends on
+ * reproducing the redirect: both read `rows: []`, and only the container count separates them.
+ */
+test("project env: the row lookup fails differently for an unmounted editor and an emptied one", async ({
+  page,
+}) => {
+  const editor = page.locator('div[class*="container/env"]');
+  const failureFor = async (html: string) => {
+    await page.setContent(html);
+    return valueInputFor(page, editor, KEEP_KEY).then(
+      () => "resolved",
+      (error: Error) => error.message,
+    );
+  };
+
+  const unmounted = await failureFor("<main></main>");
+  const emptied = await failureFor('<div class="@container/env"></div>');
+  expect(unmounted).toMatch(/"containers": 0/);
+  expect(emptied).not.toMatch(/"containers": 0/);
+  expect(emptied).toMatch(/"rows": Array \[\]/);
+});
 
 test("project env: editing one binding in the UI saves without 422 and leaves the others intact", async ({
   page,
@@ -194,7 +256,26 @@ test("project env: editing one binding in the UI saves without 422 and leaves th
   const fetched = await getRes.json();
   expectMaskedBoth(fetched.env, "get response");
 
-  await page.goto(`/${seed.prefix}/projects/${seed.projectId}/configuration`);
+  // `projectRef`, NOT `projectId`. `ProjectDetail` keys its project query on the ROUTE ref
+  // (`ui/src/pages/ProjectDetail.tsx:401`) and canonicalises a non-slug ref with a
+  // `navigate(..., { replace: true })` (`:547`). Arriving by UUID therefore renders the whole page,
+  // then swaps the route ref under it — which changes the query key, so `data` is `undefined`,
+  // `isLoading` is true, and `:716` returns `<PageSkeleton>`. Everything mounted before the
+  // redirect, this editor included, is destroyed and rebuilt. That teardown is the generator
+  // behind BLO-36601. Measured in run 36187220561's trace network log — the project detail is
+  // fetched FOUR times under THREE distinct query keys:
+  //   21:14:08.166  <uuid>                     <- fires before the company resolves, see below
+  //   21:14:09.913  <uuid>                     <- same key, refetch
+  //   21:14:10.005  <uuid>?companyId=…         <- key changes, `lookupCompanyId` resolved
+  //   21:14:10.634  env-round-trip-…?companyId <- key changes again, THE REDIRECT
+  // The fourth is the one that unmounts the page mid-assertion.
+  //
+  // Arriving on the canonical ref means `:537`'s `routeProjectRef === canonicalProjectRef` guard
+  // returns early, so no redirect fires. It also holds `canFetchProject` (`:392`) false until the
+  // company resolves — the `isUuidLike(routeProjectRef)` disjunct is what lets the UUID form fetch
+  // early and produce the extra keys above — so the query runs once, under one key, and the editor
+  // mounts once.
+  await page.goto(`/${seed.prefix}/projects/${seed.projectRef}/configuration`);
 
   const editor = page.locator('div[class*="container/env"]');
   await expect(editor).toHaveCount(1);
