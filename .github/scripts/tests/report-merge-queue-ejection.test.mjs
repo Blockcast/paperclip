@@ -190,6 +190,51 @@ test("a lone failing job is never dropped for being vacuously last", () => {
   assert.equal(failingJobSummary([{ name: "policy", conclusion: "cancelled" }]), " Failing job: `policy`.");
 });
 
+test("an in-flight job is not a cause: a null conclusion is excluded, not read as non-success", () => {
+  // Pins the `Boolean(job?.conclusion)` guard in isNonSuccess. `null` is not in
+  // GOOD_CONCLUSIONS, so WITHOUT the guard an unfinished job reads as a
+  // non-success cause and gets named -- and its log contains no failure at all,
+  // which is verbatim the misdirection this module exists to prevent. Measured
+  // on this shape: guarded names `General tests (workspaces-a)` alone, unguarded
+  // names `e2e` too.
+  //
+  // Every other clause here has a failing mutation; before this test the guard
+  // had none (deleting it left 12 pass / 0 fail), i.e. it was a comment rather
+  // than a guard.
+  //
+  // NOT a claim that a completed merge_group run commonly carries a null
+  // conclusion. This is a read-time race -- the jobs endpoint is read just after
+  // the workflow_run completed event -- so a sample of long-settled runs cannot
+  // discriminate, and 10 recent completed runs carried none. The claim is only
+  // that the guard is load-bearing and its removal is silent.
+  const jobs = [
+    { name: "e2e", conclusion: null, started_at: "2026-09-24T10:00:00Z", completed_at: null },
+    { name: "General tests (workspaces-a)", conclusion: "failure", started_at: "2026-09-24T10:01:00Z", completed_at: "2026-09-24T10:20:00Z" },
+  ];
+  assert.deepEqual(causalJobs(jobs).map((job) => job.name), ["General tests (workspaces-a)"]);
+  assert.equal(failingJobSummary(jobs), " Failing job: `General tests (workspaces-a)`.");
+});
+
+test("an unknown job conclusion renders the generic `failed`, not a timeout assertion", () => {
+  // runOutcomeText keys on an allowlist of TIMEOUT-SHAPED conclusions, so a
+  // value this file has never seen falls to the generic "failed" rather than
+  // asserting a timeout that did not happen -- the same misdirection
+  // runOutcomeText exists to prevent, arriving through the enum instead of
+  // through the run conclusion. Fails if the job-level test goes back to the
+  // positive `conclusion === "failure"`, under which every new enum value
+  // renders the timeout parenthetical.
+  assert.equal(runOutcomeText("cancelled", [{ name: "e2e", conclusion: "stale" }]), "failed");
+  // The two states that ARE timeout-shaped still render it.
+  assert.equal(
+    runOutcomeText("cancelled", [{ name: "policy", conclusion: "timed_out" }]),
+    "was cancelled (a job timeout surfaces this way)",
+  );
+  assert.equal(
+    runOutcomeText("cancelled", [{ name: "policy", conclusion: "cancelled" }]),
+    "was cancelled (a job timeout surfaces this way)",
+  );
+});
+
 test("a job that started after SOME but not ALL others is kept (guards the narrowness of causalJobs)", () => {
   // The `every` in causalJobs has to be `every`, not `some`. `b` starts after
   // `a` finished but while `c` is still running, so it is NOT last and is a

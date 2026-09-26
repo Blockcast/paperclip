@@ -107,9 +107,19 @@ const isNonSuccess = (job) => Boolean(job?.conclusion) && !GOOD_CONCLUSIONS.incl
  * staggered only by arc-* runner assignment. NOT fixed by widening -- the
  * `policy`/`verify` pair below is also two jobs and dropping the later one is
  * correct there. The discriminator is the needs: graph and the jobs API does
- * not carry it. Cost is a dropped name, not a wrong one, so it degrades to a
- * second ejection rather than misdirection. Upgrade path: read the needs: graph
- * from pr.yml, or have the workflow emit it. Pinned by the `ceiling:` test.
+ * not carry it. Cost is a dropped name, not a wrong one -- PROVIDED the
+ * surviving job is itself a real death, which is the reachable shape: the
+ * `policy`-timeout pair drops the later `e2e` and names `policy`, which did
+ * genuinely die. If the survivor were `cancelled` collateral the cost WOULD be a
+ * wrong name, because anyRealDeath in failingJobSummary is computed over the
+ * post-causalJobs list, so dropping the real failure stops it suppressing the
+ * collateral. That shape needs collateral whose causer is absent from the set,
+ * and fail-fast only cancels a sibling BECAUSE something failed -- so the causer
+ * is in the set too and n is 3, which restores the right answer. Unreachable as
+ * far as fail-fast semantics go; not proven impossible. On the reachable shape
+ * it therefore degrades to a second ejection rather than misdirection. Upgrade
+ * path: read the needs: graph from pr.yml, or have the workflow emit it. Pinned
+ * by the `ceiling:` test.
  */
 export function causalJobs(jobs) {
   const list = (Array.isArray(jobs) ? jobs : []).filter(isNonSuccess);
@@ -157,9 +167,28 @@ export function failingJobSummary(jobs) {
 // `failure` used to flip this to "failed" on a run whose real cause was
 // `policy` hitting its cap, so the sentence asserted a failure and then named
 // only the messenger.
+//
+// The JOB-level test is an allowlist of timeout-SHAPED states, not the positive
+// `conclusion === "failure"` it used to be. Under the positive form every future
+// enum value (`stale`, ...) rendered the timeout parenthetical over a run that
+// did not time out -- asserting an infra timeout that is not there is precisely
+// the misdirection above, arriving through the enum instead of through the run
+// conclusion. The complement defaults an unseen value to the generic "failed",
+// which is the cheaper direction to be wrong in.
+//
+// Deliberately NOT the same partition as failingJobSummary, which treats
+// `timed_out` as a real death and always names it. Different questions: "is this
+// job worth naming as a cause" vs "does the run as a whole read as a timeout".
+// A `timed_out` job is both a real cause AND timeout-shaped.
+//
+// The RUN-level `conclusion === "failure"` stays positive: a run GitHub marks
+// `failure` did fail, and `cancelled` is the only other value this handler is
+// ever invoked with (see shouldReportMergeQueueFailure).
+const TIMEOUT_SHAPED = ["cancelled", "timed_out"];
 export function runOutcomeText(conclusion, jobs) {
   const failed =
-    conclusion === "failure" || causalJobs(jobs).some((job) => job?.conclusion === "failure");
+    conclusion === "failure" ||
+    causalJobs(jobs).some((job) => !TIMEOUT_SHAPED.includes(job?.conclusion));
   return failed ? "failed" : "was cancelled (a job timeout surfaces this way)";
 }
 
