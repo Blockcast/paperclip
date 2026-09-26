@@ -1,0 +1,633 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Paperclip control-plane platform metrics. Delivered to the operator Grafana by the paperclip Helm chart (deploy/helm/paperclip/templates/grafana-dashboard.yaml) as a ConfigMap labelled grafana_dashboard=1, which the kiwigrid sidecar adopts from any namespace. Do NOT hand-import this: the datasource uid is substituted at render time from grafanaDashboard.datasourceUid, and only the `cluster` datasource scrapes the paperclip control plane. Owner lane: Platform/SRE.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "links": [],
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 2,
+      "panels": [],
+      "title": "claude_k8s adapter",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "__PAPERCLIP_DS_UID__"
+      },
+      "description": "Per-(agent_id, reason, isolation labels) view of the claude_k8s adapter's concurrent-run-blocked counter (claude_k8s_concurrent_run_blocked_total), exposed by the paperclip control plane via prom-client and scraped by the `paperclip-control-plane` Prometheus job (monitoring/prometheus-configmap.yaml). Existing reasons include live_job_for_active_run, live_job_for_unknown_run, and live_job_for_terminated_run; BLO-12212 adds isolation audit reasons such as shared_mode_serialized and unknown_isolation_blocked plus labels isolation_mode, isolation_key, task_key, and session_id when the control-plane build exposes them. The series are normally ABSENT, so an empty panel is healthy. Counter is cumulative; rising unknown/shared-mode series are the audit signal to investigate.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 1
+      },
+      "id": 1,
+      "links": [
+        {
+          "targetBlank": true,
+          "title": "claude_k8s concurrent-run-blocked context (BLO-4296)",
+          "url": "${runbook_base}/BLO/issues/BLO-4296"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PAPERCLIP_DS_UID__"
+          },
+          "editorMode": "code",
+          "expr": "sum by (agent_id, reason, isolation_mode, isolation_key, task_key, session_id) (claude_k8s_concurrent_run_blocked_total)",
+          "legendFormat": "{{agent_id}} / {{reason}} / {{isolation_mode}}",
+          "refId": "A"
+        }
+      ],
+      "title": "claude_k8s concurrent-run-blocked (by agent / reason / isolation)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "__PAPERCLIP_DS_UID__"
+      },
+      "description": "Focused view of shared-mode serialization reasons. This keeps the pre-isolation k8s_concurrent_run_blocked signal visible while isolated concurrency rolls out; sustained values mean the runner is still serialized or a descriptor is missing/shared.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "blocks / hour",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 10
+      },
+      "id": 3,
+      "links": [
+        {
+          "targetBlank": true,
+          "title": "K8s isolation audit context (BLO-12212)",
+          "url": "${runbook_base}/BLO/issues/BLO-12212"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PAPERCLIP_DS_UID__"
+          },
+          "editorMode": "code",
+          "expr": "sum by (agent_id, isolation_mode, isolation_key, task_key, session_id, reason) (increase(claude_k8s_concurrent_run_blocked_total{reason=\"shared_mode_serialized\"}[1h]))",
+          "legendFormat": "{{agent_id}} / {{reason}} / {{isolation_key}}",
+          "refId": "A"
+        }
+      ],
+      "title": "claude_k8s shared-mode blocks (1h increase)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "__PAPERCLIP_DS_UID__"
+      },
+      "description": "Focused view of fail-closed unknown-isolation blocks. Any non-zero series means a live Job was missing or had malformed isolation metadata and blocked isolated starts until an operator inspects the conflicting agent/task/session.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "blocks / hour",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 10
+      },
+      "id": 4,
+      "links": [
+        {
+          "targetBlank": true,
+          "title": "K8s isolation audit context (BLO-12212)",
+          "url": "${runbook_base}/BLO/issues/BLO-12212"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PAPERCLIP_DS_UID__"
+          },
+          "editorMode": "code",
+          "expr": "sum by (agent_id, isolation_mode, isolation_key, task_key, session_id, reason) (increase(claude_k8s_concurrent_run_blocked_total{reason=\"unknown_isolation_blocked\"}[1h]))",
+          "legendFormat": "{{agent_id}} / {{reason}} / {{isolation_key}}",
+          "refId": "A"
+        }
+      ],
+      "title": "claude_k8s unknown-isolation blocks (1h increase)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 19
+      },
+      "id": 5,
+      "panels": [],
+      "title": "Session unavailable recovery (BLO-18012 bound)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "__PAPERCLIP_DS_UID__"
+      },
+      "description": "Agents currently in status='error', split by a bounded error_reason bucket (paperclip_agent_status_error_agents, added in BLO-22498). session_unavailable is the BLO-18012 condition: an agent whose opencode/adapter session did not survive a control-plane restart. other and none are shown for contrast and are NOT that condition -- keeping them visible is the point, because a generic 'agents in error' count cannot tell them apart and would raise a false BLO-18012 alarm on any unrelated failure. Observed live on 2026-09-10: two agents sat in error for 2581s and 594s and NEITHER was session_unavailable (one was BackoffLimitExceeded).\n\nREAD THIS PANEL BACKWARDS FROM THE OTHERS ON THIS DASHBOARD: the exporter publishes every bucket on every pass, including empty ones, so healthy reads as a flat line at 0. An EMPTY panel means the control plane is not reporting -- a fault, not health.\n\nmax by (error_reason), never sum: the gauge is fleet-wide and identical on every replica, so a bare sum would multiply the count by the replica count.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "session_unavailable"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 3
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 25
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 20
+      },
+      "id": 6,
+      "links": [
+        {
+          "targetBlank": true,
+          "title": "BLO-18012 - the <=2 min recovery bound this measures",
+          "url": "${runbook_base}/BLO/issues/BLO-18012"
+        },
+        {
+          "targetBlank": true,
+          "title": "BLO-22498 - exporter + panel rationale",
+          "url": "${runbook_base}/BLO/issues/BLO-22498"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PAPERCLIP_DS_UID__"
+          },
+          "editorMode": "code",
+          "expr": "max by (error_reason) (paperclip_agent_status_error_agents)",
+          "legendFormat": "{{error_reason}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Agents in error by reason (session_unavailable = the BLO-18012 condition)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "__PAPERCLIP_DS_UID__"
+      },
+      "description": "Seconds the OLDEST agent stuck in the session_unavailable bucket has continuously held status='error' (paperclip_agent_status_error_oldest_age_seconds). The red dashed line at 120s is BLO-18012's acceptance bound: 'time-to-recovery <= a small fixed window (target: <= 2 min), independent of that agent's heartbeat interval'. Crossing it is a real finding to report on BLO-18012, NOT something to retune this panel to hide.\n\nDELIBERATELY SCOPED TO session_unavailable. Charting every bucket here would drag in unrelated long-lived failures -- the 2581s BackoffLimitExceeded agent seen on 2026-09-10 would have sailed over the 2-min line and read as a BLO-18012 breach that never happened. The bound applies to this condition only.\n\nLower bound, never an overstatement: age derives from agents.updated_at, so an unrelated write to a still-errored row resets the clock. This series can under-report a breach; it cannot invent one. Reads 0 when nothing is wedged, and an empty panel means the exporter is down.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "mappings": [],
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 120
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 20
+      },
+      "id": 7,
+      "links": [
+        {
+          "targetBlank": true,
+          "title": "BLO-18012 - the <=2 min recovery bound this measures",
+          "url": "${runbook_base}/BLO/issues/BLO-18012"
+        },
+        {
+          "targetBlank": true,
+          "title": "BLO-22498 - exporter + panel rationale",
+          "url": "${runbook_base}/BLO/issues/BLO-22498"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PAPERCLIP_DS_UID__"
+          },
+          "editorMode": "code",
+          "expr": "max by (error_reason) (paperclip_agent_status_error_oldest_age_seconds{error_reason=\"session_unavailable\"})",
+          "legendFormat": "max time-in-error (session_unavailable)",
+          "refId": "A"
+        }
+      ],
+      "title": "Session unavailable: max time-in-error vs the 2-min bound",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "1m",
+  "schemaVersion": 39,
+  "tags": [
+    "paperclip",
+    "platform",
+    "claude_k8s",
+    "blo-18012",
+    "session-unavailable"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {
+          "selected": true,
+          "text": "https://paperclip.blockcast.net",
+          "value": "https://paperclip.blockcast.net"
+        },
+        "description": "Base URL of the Paperclip board (no trailing slash). Defaults to the Blockcast Paperclip board so provisioned panel context links resolve without manual import input.",
+        "hide": 0,
+        "label": "Runbook base URL",
+        "name": "runbook_base",
+        "options": [
+          {
+            "selected": true,
+            "text": "https://paperclip.blockcast.net",
+            "value": "https://paperclip.blockcast.net"
+          }
+        ],
+        "query": "https://paperclip.blockcast.net",
+        "skipUrlSync": false,
+        "type": "constant"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "utc",
+  "title": "Paperclip Platform",
+  "uid": "paperclip-platform",
+  "version": 1,
+  "weekStart": ""
+}
