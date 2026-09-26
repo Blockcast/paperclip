@@ -132,6 +132,37 @@ test("a `policy` timeout is named as the cause, not the `verify` lane that merel
     `The merge-group run ${runOutcomeText("cancelled", jobs)}.${failingJobSummary(jobs)}`,
     "The merge-group run was cancelled (a job timeout surfaces this way). Failing job: `policy`.",
   );
+  // Same shape, `timed_out` instead of `cancelled`. That value is in GitHub's
+  // documented conclusion enum; under a denylist of bad states it was invisible
+  // to causalJobs, so `policy` vanished, `verify` became vacuously causal and
+  // the comment named the messenger -- verbatim the bug causalJobs kills. Fails
+  // if isNonSuccess or the failingJobSummary filter goes back to enumerating
+  // bad states.
+  const timedOut = [{ ...jobs[0], conclusion: "timed_out" }, jobs[1]];
+  assert.equal(
+    `The merge-group run ${runOutcomeText("cancelled", timedOut)}.${failingJobSummary(timedOut)}`,
+    "The merge-group run was cancelled (a job timeout surfaces this way). Failing job: `policy`.",
+  );
+});
+
+test("ceiling: with exactly two non-success jobs the later one is dropped even if genuine", () => {
+  // Pins the KNOWN GAP documented on causalJobs, so the next reader does not
+  // re-derive it. At n=2 "started after ALL others" collapses into "after SOME
+  // other", so the narrowness guarded by the test above buys nothing and `e2e`
+  // -- a genuine independent failure -- is dropped. Reachable: `verify` needs:
+  // neither `canary_dry_run` nor `e2e`, so a failure confined to those two
+  // leaves `verify` green and the set at exactly two.
+  //
+  // Asserting the CURRENT behaviour deliberately. Widening causalJobs is the
+  // wrong fix -- the policy/verify pair above is also two jobs and dropping the
+  // later one is correct there; only the needs: graph separates them, and the
+  // jobs API does not carry it. Cost is a dropped name, not a wrong one.
+  const jobs = [
+    { name: "canary_dry_run", conclusion: "failure", started_at: "2026-09-24T10:01:00Z", completed_at: "2026-09-24T10:03:00Z" },
+    { name: "e2e", conclusion: "failure", started_at: "2026-09-24T10:05:00Z", completed_at: "2026-09-24T10:40:00Z" },
+  ];
+  assert.deepEqual(causalJobs(jobs).map((job) => job.name), ["canary_dry_run"]);
+  assert.equal(failingJobSummary(jobs), " Failing job: `canary_dry_run`.");
 });
 
 test("a late-starting second failure is still named: only a job after ALL others is dropped", () => {
