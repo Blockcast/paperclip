@@ -143,6 +143,7 @@ import {
 } from "../services/task-watchdog-scope.js";
 import type { TaskWatchdogServiceDeps, taskWatchdogService } from "../services/task-watchdogs.js";
 import { logger } from "../middleware/logger.js";
+import { urlForLog } from "../middleware/http-log-policy.js";
 import { conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
 import { actorCanReadAgentConfig, assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
 import {
@@ -7288,8 +7289,14 @@ export function issueRoutes(
         // function's doc comment). Log the request line too, or a restore
         // refusal and an upsert refusal are indistinguishable in production —
         // both would read `documentKey: undefined`.
+        //
+        // `urlForLog`, not a raw `req.originalUrl`: this is an issues route, so
+        // the scrub is the identity here today and nothing is lost. The point
+        // is that "a URL safe to log" has ONE definition (PEN-2996) — this was
+        // the last log site outside it, so the next entry added to
+        // `UNLOGGABLE_REQUEST_BODY_PATHS` needs no re-audit of this file.
         logger.warn(
-          { err, runId: run.id, issueId: issue.id, documentKey, method: req.method, url: req.originalUrl },
+          { err, runId: run.id, issueId: issue.id, documentKey, method: req.method, url: urlForLog(req.originalUrl) },
           "status_only_document_write_refusal_stamp_failed",
         );
       }
