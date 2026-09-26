@@ -4071,18 +4071,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     const commentCapableRuns = executedTerminalRuns.filter((run) => !isNeverInvokedRun(run));
     // BLO-36535: a run that executed a turn and was then killed by
     // infrastructure could not finish it, so its missing comment is not
-    // silence. `isNeverExecutedRun` above does not catch these — both of its
-    // arms are ZERO-TOKEN predicates, and this population is their strict
-    // complement: tokens burned, then killed. The measured instance is 34
-    // terminal runs on BLO-32472, 34 of them infra-class (18 `adapter_failed`
-    // from a provider 403 on the `org_penstock` seat entitlement, 12
-    // `rate_limit_exhausted`, 2 `job_failed`, 1 `provider_throttled_no_progress`,
-    // 1 `k8s_pod_schedule_failed`), one of which burned 20,957 output tokens /
-    // $4.92 before the 403. Zero application failures. `runtime_failure_streak`
-    // does not catch them either — it outranks this trigger in
-    // `choosePrimaryTrigger`'s ladder but keys on the same zero-token
-    // signature — so without this filter the population falls between the two
-    // buckets and lands silently in the conduct one.
+    // silence. See `isInfraClassErrorCodeRun` for why membership is by error
+    // code only, and why neither the message arm nor a `livenessState` guard
+    // may be added. The rest of this note is call-site specific.
     //
     // Excluded, NOT streak-breaking, symmetrically with the two populations
     // above: breaking here would assert "the agent was given a turn and used
@@ -4093,15 +4084,33 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // stretch is not evidence the agent spoke.
     //
     // Reported, not dropped (the BLO-27698 B3b shape): `infraClassKilledRunCount`
-    // below renders in both evidence blocks. A chronically infra-killed lane
-    // stays visible through the recovery lane rather than through this trigger —
+    // renders in both evidence blocks. A chronically infra-killed lane stays
+    // visible through the recovery lane rather than through this trigger —
     // `stranded_assigned_issue` recovery actions stamp `infraClassCause: true`
-    // off the same `ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES` set (recovery/service.ts),
-    // which is exactly how the platform had already classified BLO-32472's cause
-    // on the very review row that then billed it to the assignee. Provider fault
-    // is owned by BLO-34726, not by a productivity review.
-    const infraClassKilledRunCount = commentCapableRuns.filter(isInfraClassErrorCodeRun).length;
-    const noCommentEligibleRuns = commentCapableRuns.filter((run) => !isInfraClassErrorCodeRun(run));
+    // off the same `ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES` set, which is exactly
+    // how the platform had already classified BLO-32472's cause on the very
+    // review row that then billed it to the assignee. Provider fault is owned
+    // by BLO-34726, not by a productivity review.
+    //
+    // `&& !commentRunIds.has(run.id)` is load-bearing, and this is the first
+    // exclusion in this function that needs it. The walk below breaks ONLY on
+    // `commentRunIds.has(run.id)`, so a run removed from the array is never
+    // tested and can no longer break the streak. The two exclusions above are
+    // safe without the guard because both are zero-token / no-telemetry
+    // predicates — those runs provably never got a turn, so they cannot appear
+    // in `commentRunIds`. This population is the first that CAN have commented:
+    // that is the whole premise of the narrowing. Without the guard, a run that
+    // posted its comment and was THEN killed by a provider 403 would be
+    // filtered out, the walk would bridge across it, and the streak would count
+    // an agent that demonstrably spoke inside the window — re-manufacturing the
+    // conduct false positive this change exists to remove, in the same
+    // direction. That ordering (comment first, killed later) is the modal shape
+    // on this fleet, because the run-comment protocol has agents post before
+    // continuing to work. A run that spoke is not an exclusion; it is evidence.
+    const isInfraKilledSilentRun = (run: (typeof commentCapableRuns)[number]) =>
+      isInfraClassErrorCodeRun(run) && !commentRunIds.has(run.id);
+    const infraClassKilledRunCount = commentCapableRuns.filter(isInfraKilledSilentRun).length;
+    const noCommentEligibleRuns = commentCapableRuns.filter((run) => !isInfraKilledSilentRun(run));
     // Of the runs actually eligible for the streak walk, how many carry the
     // comment-policy-exempt status. Scoped to the eligible population (not all
     // terminal runs) so the "DID execute" claim is literally true of every run

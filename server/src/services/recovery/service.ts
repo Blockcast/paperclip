@@ -887,10 +887,6 @@ type StrandedRecoveryCause =
 
 type StrandedPreviousStatus = "todo" | "in_progress" | "in_review";
 
-// `ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES` moved to ./zero-token-startup-failure.js
-// (BLO-36535) so productivity-review reads the same set rather than a second
-// copy. Imported above; the membership rationale travels with the definition.
-
 type SuccessfulRunHandoffRecoveryEvidence = {
   sourceRunId: string | null;
   correctiveRunId: string;
