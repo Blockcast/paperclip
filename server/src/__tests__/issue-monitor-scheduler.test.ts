@@ -27,7 +27,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { heartbeatService, ISSUE_MONITOR_DISPATCH_LAPSE_MS, ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS } from "../services/heartbeat.js";
+import { heartbeatService, ISSUE_MONITOR_DISPATCH_LAPSE_MS, ISSUE_MONITOR_LIVE_CONSUMER_MAX_AGE_MS, ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS } from "../services/heartbeat.js";
 import {
   DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
   normalizeIssueExecutionPolicy,
@@ -1505,7 +1505,121 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
     expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
       status: "cleared",
+      // Assert the ARM, not just the outcome: with only `status` asserted this
+      // passes whichever branch of the OR cleared the monitor, including the
+      // fallback the guard is supposed to be suppressing here.
+      clearReason: "timeout_exceeded",
     });
+  });
+
+  // BLO-35155 (Ally review, Important 1): the live-consumer guard must be
+  // BOUNDED. A run that never reaches a terminal status would otherwise hold the
+  // monitor `triggered` forever — BLO-29606's permanent strand re-entered through
+  // a new door. The asymmetry is the point: a false reap self-corrects via the
+  // owner wake, a never-reap does not, so a wedged queue has to degrade back to
+  // bounded BLO-29606 behaviour.
+  it("reaps a triggered monitor whose queued run is older than the live-consumer ceiling", async () => {
+    const { companyId, agentId, issueId, lastTriggeredAt } = await seedExpiredTriggeredFixture({ timeoutAt: null });
+    const tickAt = new Date(lastTriggeredAt.getTime() + ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS + 60 * 1000);
+    // Wedged: queued since well before the ceiling and never dispatched. The
+    // measured production shape is a row created before the worktree execution
+    // cutoff, which every dispatch/resume path filters on, so it is never
+    // dispatched, never resumed, and therefore never terminal.
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      status: "queued",
+      invocationSource: "scheduled",
+      createdAt: new Date(tickAt.getTime() - ISSUE_MONITOR_LIVE_CONSUMER_MAX_AGE_MS - 60 * 60 * 1000),
+      contextSnapshot: { issueId, wakeReason: "issue_monitor_due" },
+    });
+
+    const heartbeat = createHeartbeat();
+    await heartbeat.tickTimers(tickAt);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "trigger_stalled",
+    });
+  });
+
+  // BLO-35155 (Ally review, Important 2): `scheduled_retry` is excluded from
+  // ISSUE_MONITOR_LIVE_CONSUMER_RUN_STATUSES on purpose — a park can sit for days
+  // and counting it as live would restore the forever-`triggered` stranding. That
+  // decision sat between two near-identical status lists defended only by a
+  // comment, so the mutation "harmonize these lists" failed nothing. Pin it.
+  it("reaps a triggered monitor whose only run is parked in scheduled_retry", async () => {
+    const { companyId, agentId, issueId, lastTriggeredAt } = await seedExpiredTriggeredFixture({ timeoutAt: null });
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "scheduled_retry",
+      invocationSource: "scheduled",
+      createdAt: new Date(lastTriggeredAt.getTime() + 1000),
+      contextSnapshot: { issueId, wakeReason: "issue_monitor_due" },
+    });
+
+    const heartbeat = createHeartbeat();
+    await heartbeat.tickTimers(new Date(lastTriggeredAt.getTime() + ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS + 60 * 1000));
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "trigger_stalled",
+    });
+
+    // Nothing promotes a synthetic park, so retire it or afterEach's
+    // settle-wait (which requires zero non-terminal runs) never returns.
+    await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, runId));
+  });
+
+  // BLO-35155 (Ally review, Suggestion 2): the guard joins on the issue's CURRENT
+  // assignee, so a run queued by a previous assignee is not a live consumer — it
+  // can never re-arm this monitor. Untested behaviour change until now.
+  it("reaps a triggered monitor whose queued run belongs to a previous assignee", async () => {
+    const { companyId, agentId, issueId, lastTriggeredAt } = await seedExpiredTriggeredFixture({ timeoutAt: null });
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "queued",
+      invocationSource: "scheduled",
+      createdAt: new Date(lastTriggeredAt.getTime() + 1000),
+      contextSnapshot: { issueId, wakeReason: "issue_monitor_due" },
+    });
+
+    const newAssigneeId = randomUUID();
+    await db.insert(agents).values({
+      id: newAssigneeId,
+      companyId,
+      name: "Monitor Bot II",
+      role: "engineer",
+      status: "active",
+      adapterType: "process",
+      adapterConfig: { command: process.execPath, args: ["-e", ""], cwd: process.cwd() },
+      runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } },
+      permissions: {},
+    });
+    seededAgentIds.add(newAssigneeId);
+    await db.update(issues).set({ assigneeAgentId: newAssigneeId }).where(eq(issues.id, issueId));
+
+    const heartbeat = createHeartbeat();
+    await heartbeat.tickTimers(new Date(lastTriggeredAt.getTime() + ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS + 60 * 1000));
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "trigger_stalled",
+    });
+
+    // The old assignee has no work left, so its queued run is never dispatched
+    // and afterEach's settle-wait would block on it. Retire it explicitly.
+    await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, runId));
   });
 
   // Regression guard: an operator-supplied deadline stays authoritative. A monitor
