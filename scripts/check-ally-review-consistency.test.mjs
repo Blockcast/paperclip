@@ -762,6 +762,16 @@ describe("I1 names the mechanism a same-lane duplicate implies", () => {
     assert.deepEqual(violations, []);
   });
 
+  it("counts a bucket by the number after its heading, not a later parenthesized one", () => {
+    // The merge gate reads the count straight after `Issues`, so this heading
+    // raises two findings. A greedy capture would read `(1)` and let one
+    // retirement stand as full coverage.
+    const blocker = appReview({ id: DUPLICATE_IDS[0], state: "COMMENTED", submitted_at: "2026-09-23T10:00:00Z", body: canonicalBody(HEAD, "### Critical Issues (0)\n### Important Issues (2), was (1)\n- one\n- two") });
+    const approval = approvalWithLedger(`- **prior:${HEAD.slice(0, 7)} important 1** - fixed - one done`);
+    const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [blocker, approval] });
+    assert.match(violations.find((v) => v.startsWith("I2e")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
+  });
+
   it("still fires I2e when the blocker blocks only on a still-present entry", () => {
     // No counted bucket at this head, so no (severity, index) a ledger can name.
     const blocker = appReview({ id: DUPLICATE_IDS[0], state: "COMMENTED", submitted_at: "2026-09-23T10:00:00Z", body: canonicalBody(HEAD, `- **prior:${OTHER.slice(0, 7)} important 1** — still-present — stands`) });
