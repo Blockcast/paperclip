@@ -133,6 +133,12 @@ export {
   environmentCustomImageService,
 } from "./environment-custom-images.js";
 export {
+  EXECUTION_WORKSPACE_IDLE_GRACE_MS,
+  EXECUTION_WORKSPACE_LEGACY_IDLE_MS,
+  executionWorkspaceCleanupService,
+  type ExecutionWorkspaceCleanupResult,
+} from "./execution-workspace-cleanup.js";
+export {
   environmentCustomImageTerminalConnectionRegistry,
   environmentCustomImageTerminalSessionStore,
   EnvironmentCustomImageTerminalConnectionRegistry,

@@ -50,6 +50,7 @@ import {
   bootstrapExecutionPolicyFromEnv,
   EXTERNAL_LIFECYCLE_COLD_BOOT_REATTACH_GRACE_MS,
   environmentCustomImageService,
+  executionWorkspaceCleanupService,
   heartbeatService,
   instanceSettingsService,
   reconcileBuiltInAgentsOnStartup,
@@ -1138,6 +1139,22 @@ export async function startServer(): Promise<StartedServer> {
   // overlap the latch exists to remove, so this reports and does not act.
   let heartbeatRecoveryChainInFlight = false;
   let heartbeatRecoveryChainStartedAt = 0;
+  // BLO-22984: the same latch, for the execution-workspace collector. It is
+  // its own tracked pass (below), and `setInterval` fires the next callback on
+  // schedule whether or not the previous one settled, so without this a slow
+  // pass (50 candidates, up to three `runGit` calls at 30 s each) overlaps the
+  // next tick's and the trailing pass's `deferCandidate` can land on a row the
+  // leading pass already archived. Every collector pass is idempotent, so a
+  // tick that finds one running skips it. The startup pass sets it too.
+  //
+  // It inherits the hang-not-reject failure mode described on
+  // `heartbeatRecoveryChainInFlight` above, and the collector is where a hang
+  // is reachable: its `fs.stat` on a candidate path has no timeout, and one
+  // wedged mount stops collection for the life of the process with no output.
+  // `executionWorkspaceCollectorStartedAt` makes that absence visible. Like
+  // the chain's stamp it reports and does not act.
+  let executionWorkspaceCollectorInFlight = false;
+  let executionWorkspaceCollectorStartedAt = 0;
   // 10 ticks. Above the normal case (a sweep routinely outlives one interval —
   // that is what the latch is for) and far below the hours a wedged chain would
   // otherwise sit silent.
@@ -1174,6 +1191,7 @@ export async function startServer(): Promise<StartedServer> {
     drainHeartbeatRunsForShutdown = heartbeat.drainRunningRunsForShutdown;
     prepareHotRestartShutdown = heartbeat.prepareHotRestartShutdown;
     const environmentCustomImages = environmentCustomImageService(db as any, { pluginWorkerManager });
+    const executionWorkspaceCleanup = executionWorkspaceCleanupService(db as any);
     const routines = routineService(db as any, { pluginWorkerManager });
     const tools = toolAccessService(db as any, {
       deploymentMode: config.deploymentMode,
@@ -1376,6 +1394,32 @@ export async function startServer(): Promise<StartedServer> {
             "startup failed-wake-dispatch reconciliation retried durable wake failures (BLO-14395)",
           );
         }
+
+        // BLO-22984: the only consumer of `execution_workspaces.cleanup_eligible_at`.
+        // Logged unconditionally — a collector that never runs is indistinguishable
+        // from one that runs and finds nothing, and the previous code was believed
+        // to collect for weeks while reclaiming zero bytes.
+        // Not awaited: this must not hold `heartbeatStartupRecoveryPending` and
+        // starve every periodic pass on a slow git/fs (prior:19b276c important 2
+        // principle). It gates nothing below it; it is tracked for the shutdown
+        // drain and holds the collector latch so the first tick does not double it.
+        // It may take the latch without testing it only because
+        // `heartbeatStartupRecoveryPending` is still true here and the tick
+        // early-returns on it, so no periodic pass can be holding it yet.
+        executionWorkspaceCollectorInFlight = true;
+        executionWorkspaceCollectorStartedAt = Date.now();
+        trackHeartbeatSchedulerWork(executionWorkspaceCleanup
+          .reconcileExecutionWorkspaceCleanup()
+          .then((workspacesCollected) => {
+            logger.info({ ...workspacesCollected }, "startup execution-workspace collector");
+          })
+          .catch((err) => {
+            logger.error({ err }, "startup execution-workspace collector failed");
+          })
+          .finally(() => {
+            executionWorkspaceCollectorInFlight = false;
+            executionWorkspaceCollectorStartedAt = 0;
+          }));
       })().catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
       }).finally(() => {
@@ -1699,6 +1743,52 @@ export async function startServer(): Promise<StartedServer> {
             .catch((err) => {
               logger.error({ err }, "periodic detached-queued-run sweeper failed");
             }));
+
+          if (heartbeatSchedulerStopped) return;
+
+          // BLO-22984: the only consumer of `execution_workspaces.cleanup_eligible_at`.
+          // Deliberately its own tracked pass rather than a link in the recovery
+          // chain below: that chain has a single trailing `.catch`, so one
+          // unrelated reconciler rejecting would silently skip every pass after
+          // it. A collector that never runs is indistinguishable from one that
+          // runs and finds nothing — which is how the previous worktree
+          // reclamation was believed to work for weeks while freeing zero bytes.
+          // It depends on no upstream pass; the stamps it selects on are written
+          // at run end and by its own backfill.
+          //
+          // Single-flighted by `executionWorkspaceCollectorInFlight`, for the
+          // reason given on `crashReconcileSweepInFlight` above: a pass can
+          // outlive the interval and the next tick must skip it, not double it.
+          if (!executionWorkspaceCollectorInFlight) {
+            executionWorkspaceCollectorInFlight = true;
+            executionWorkspaceCollectorStartedAt = Date.now();
+            trackHeartbeatSchedulerWork(executionWorkspaceCleanup
+              .reconcileExecutionWorkspaceCleanup()
+              .then((workspacesCollected) => {
+                // Unconditional: the zero row is the evidence that it ran at all.
+                logger.info({ ...workspacesCollected }, "periodic execution-workspace collector");
+              })
+              .catch((err) => {
+                logger.error({ err }, "periodic execution-workspace collector failed");
+              })
+              .finally(() => {
+                executionWorkspaceCollectorInFlight = false;
+                executionWorkspaceCollectorStartedAt = 0;
+              }));
+          } else if (
+            Date.now() - executionWorkspaceCollectorStartedAt >
+            HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS
+          ) {
+            // Skipping is normal and silent; a pass in flight for many ticks is
+            // not. Reported, not acted on: see the latch declaration.
+            logger.warn(
+              {
+                inFlightMs: Date.now() - executionWorkspaceCollectorStartedAt,
+                warnAfterMs: HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS,
+              },
+              "periodic execution-workspace collector still in flight across many ticks; workspaces are not being collected",
+            );
+          }
 
           if (heartbeatSchedulerStopped) return;
 

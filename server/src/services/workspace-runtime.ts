@@ -3430,25 +3430,53 @@ function deriveRepoNameFromRepoUrlForRuntime(repoUrl: string | null | undefined)
   }
 }
 
-async function resolvePathForWorktreeComparison(value: string): Promise<string> {
+/** Exported for the registry-walk ceiling test; the runtime injects it as `normalizePath`. */
+export async function resolvePathForWorktreeComparison(value: string): Promise<string> {
   const resolved = path.resolve(value);
-  const missingSegments: string[] = [];
-  let current = resolved;
-  while (true) {
-    try {
-      const realPath = await fs.realpath(current);
-      return path.resolve(realPath, ...missingSegments);
-    } catch {
-      const parent = path.dirname(current);
-      if (parent === current) return resolved;
-      missingSegments.unshift(path.basename(current));
-      current = parent;
+  const walk = async (): Promise<string> => {
+    const missingSegments: string[] = [];
+    let current = resolved;
+    while (true) {
+      try {
+        const realPath = await fs.realpath(current);
+        return path.resolve(realPath, ...missingSegments);
+      } catch {
+        const parent = path.dirname(current);
+        if (parent === current) return resolved;
+        missingSegments.unshift(path.basename(current));
+        current = parent;
+      }
     }
-  }
+  };
+  // One deadline for the whole walk, not one per segment. The loop's `catch`
+  // reads any failure as "this segment is missing" and climbs to the parent, so
+  // a per-segment bound on a wedged mount would abandon a thread per segment.
+  //
+  // Skip the walk entirely once this directory already holds a thread. This is
+  // the only fs consumer on the ownership path: `findGitWorktreeRegistration`
+  // calls it once per registration, so without the pre-check a single
+  // collector candidate would abandon one thread per colocated registration —
+  // 128 of them on the population this collector exists to drain. Guarding
+  // here rather than threading a stop signal through the ownership module
+  // covers `listLinkedGitWorktreePaths` and every future caller too.
+  //
+  // Both the pre-check and the expiry fall back to the lexical path, which is
+  // what the comparison already did on every wedge. Note what that costs: the
+  // two sides of `findGitWorktreeRegistration` are compared *after*
+  // normalization, so a fallback on one side only can miss a registration that
+  // a successful walk would have matched. A miss is not a false match — it
+  // authorizes removal with single `--force` rather than double
+  // (`git-worktree-ownership.ts:474`), which is precisely the case git's own
+  // lock is the backstop for, and the collector only reaches here after
+  // `inspectWorktreeReclaimSafety` has proven the tree clean and pushed.
+  if (isReclaimFsWedgedDir(path.dirname(resolved))) return resolved;
+  return withReclaimFsDeadline(walk(), resolved).catch(() => resolved);
 }
 
 async function listLinkedGitWorktreePaths(repoRoot: string): Promise<Set<string>> {
-  const output = await runGit(["worktree", "list", "--porcelain"], repoRoot);
+  const output = await runGit(["worktree", "list", "--porcelain"], repoRoot, {
+    timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS,
+  });
   const paths = new Set<string>();
   for (const line of output.split("\n")) {
     if (!line.startsWith("worktree ")) continue;
@@ -3463,10 +3491,15 @@ async function listLinkedGitWorktreePaths(repoRoot: string): Promise<Set<string>
  * Shared plumbing for the worktree-ownership guards (BLO-19607). The ownership
  * module takes git and path-normalization as parameters so it stays unit
  * testable; this binds it to the runtime's own implementations.
+ *
+ * Every git call here runs in `repoRoot`, which no inspector proves reachable —
+ * `inspectWorktreeReclaimSafety` only ever stats the worktree. So they carry the
+ * same budget the inspector uses: an unbounded await in this path is also an
+ * unbounded await in the collector's shutdown drain.
  */
 function gitWorktreeOwnershipContext(repoRoot: string) {
   return {
-    git: (args: string[], cwd: string) => runGit(args, cwd),
+    git: (args: string[], cwd: string) => runGit(args, cwd, { timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS }),
     repoRoot,
     normalizePath: resolvePathForWorktreeComparison,
   };
@@ -3999,15 +4032,20 @@ async function resolveGitRepoRootForWorkspaceCleanup(
 ): Promise<string | null> {
   if (projectWorkspaceCwd) {
     const resolvedProjectWorkspaceCwd = path.resolve(projectWorkspaceCwd);
-    const gitDir = await runGit(["rev-parse", "--git-common-dir"], resolvedProjectWorkspaceCwd)
-      .catch(() => null);
+    // Bounded: the project checkout can sit on the same wedged mount as the
+    // worktree, and spawn's chdir into it would otherwise never return.
+    const gitDir = await runGit(["rev-parse", "--git-common-dir"], resolvedProjectWorkspaceCwd, {
+      timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS,
+    }).catch(() => null);
     if (gitDir) {
       const resolvedGitDir = path.resolve(resolvedProjectWorkspaceCwd, gitDir);
       return path.dirname(resolvedGitDir);
     }
   }
 
-  const gitDir = await runGit(["rev-parse", "--git-common-dir"], worktreePath).catch(() => null);
+  const gitDir = await runGit(["rev-parse", "--git-common-dir"], worktreePath, {
+    timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS,
+  }).catch(() => null);
   if (!gitDir) return null;
   const resolvedGitDir = path.resolve(worktreePath, gitDir);
   return path.dirname(resolvedGitDir);
@@ -4718,6 +4756,168 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   };
 }
 
+export type WorktreeReclaimSafety = {
+  /** True only when reclaiming the disk provably discards no work. */
+  safe: boolean;
+  reason: "missing" | "clean" | "dirty" | "unpushed" | "unverifiable";
+  detail: string | null;
+};
+
+const WORKTREE_RECLAIM_GIT_TIMEOUT_MS = 30_000;
+
+const reclaimFsWedgedRoots = new Map<string, number>();
+
+/**
+ * Directories with an abandoned call still outstanding — threads held right
+ * now, refcounted because a directory can hold more than one.
+ *
+ * Ending the pass bounds a single window, not the process: the next window is
+ * free to abandon one more on the same wedged mount, and four such windows
+ * retire the default pool for every other fs/dns/crypto consumer in the server.
+ * So the hold is on the *directory*, which is what makes it self-clearing and
+ * keeps the collector working on every other mount instead of latching off.
+ *
+ * Refcounted, not a set: the pre-checks below make a second call under a held
+ * directory rare rather than impossible — two callers can both check before
+ * either expires, and the run-teardown and operator-PATCH callers of
+ * `withReclaimFsDeadline` share this map. With a set, whichever syscall
+ * answered first would clear the hold while the other still held its thread,
+ * so the count the backstop reads would understate the pool in use.
+ */
+export function isReclaimFsWedgedDir(dir: string): boolean {
+  return reclaimFsWedgedRoots.has(dir);
+}
+
+/** Threads held by abandoned calls right now, summed across directories. */
+export function reclaimFsOutstandingCount(): number {
+  let outstanding = 0;
+  for (const held of reclaimFsWedgedRoots.values()) outstanding += held;
+  return outstanding;
+}
+
+/**
+ * Backstop for a spread of wedged roots: half the threadpool. A bounded burst,
+ * not a bound — both gates that read it are pre-checks, so a candidate admitted
+ * at `limit - 1` can still hold its inspector stat, its registry walk and its
+ * cleanup-side stat before the next loop-top read sees any of them: `limit + 2`
+ * from the collector alone on the default pool of 4. The run-teardown and
+ * operator-PATCH callers of `withReclaimFsDeadline` never consult it at all.
+ */
+export const RECLAIM_FS_OUTSTANDING_LIMIT = (() => {
+  // `Number.isFinite` rather than `|| 2`, which would also catch the legitimate
+  // 0 that `UV_THREADPOOL_SIZE=1` floors to — the one pool size where the
+  // backstop most needs to be 1.
+  const poolSize = Number(process.env.UV_THREADPOOL_SIZE ?? 4);
+  return Number.isFinite(poolSize) ? Math.max(1, Math.floor(poolSize / 2)) : 2;
+})();
+
+/**
+ * Bounds a filesystem call that can block indefinitely on a wedged mount. The
+ * collector runs as tracked heartbeat-scheduler work, so an unbounded await in
+ * its path is also an unbounded await in the shutdown drain. fs calls cannot be
+ * cancelled: on expiry the call is abandoned and the caller takes its
+ * fail-closed branch, with an ETIMEDOUT error in place of the errno.
+ *
+ * `target` is the path being read; its parent directory is what gets held while
+ * the abandoned call is outstanding, so colocated siblings are not probed too.
+ */
+async function withReclaimFsDeadline<T>(operation: Promise<T>, target: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const wedgedDir = path.dirname(path.resolve(target));
+      reclaimFsWedgedRoots.set(wedgedDir, (reclaimFsWedgedRoots.get(wedgedDir) ?? 0) + 1);
+      // Abandoned, not cancelled: the thread returns to the pool only when the
+      // syscall itself finally answers, so release the hold on settle.
+      const release = () => {
+        const outstanding = (reclaimFsWedgedRoots.get(wedgedDir) ?? 1) - 1;
+        if (outstanding > 0) reclaimFsWedgedRoots.set(wedgedDir, outstanding);
+        else reclaimFsWedgedRoots.delete(wedgedDir);
+      };
+      void operation.then(release, release);
+      reject(Object.assign(new Error(`filesystem call exceeded ${WORKTREE_RECLAIM_GIT_TIMEOUT_MS}ms`), {
+        code: "ETIMEDOUT",
+      }));
+    }, WORKTREE_RECLAIM_GIT_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([operation, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Fail-closed pre-check for reclaiming a worktree's disk (BLO-22984).
+ *
+ * `cleanupExecutionWorkspaceArtifacts` removes with `--force --force`, which is
+ * correct for its existing callers — a persist-rollback tearing down a tree it
+ * created seconds earlier, and an explicit operator PATCH. A background
+ * collector has neither of those warrants, so it asks this first and leaves
+ * anything it cannot *prove* clean alone. Every failure mode returns
+ * `unverifiable`, never `clean`: an unreadable tree is a reason to skip, not a
+ * reason to proceed.
+ */
+export async function inspectWorktreeReclaimSafety(worktreePath: string): Promise<WorktreeReclaimSafety> {
+  // Deliberately not `directoryExists`, which is `stat().catch(() => false)`:
+  // that collapses EACCES/EIO/ESTALE into "missing" and so returns `safe` for a
+  // tree it never read. Only an errno that *proves* nothing is there counts as
+  // missing; every other failure is unverifiable.
+  try {
+    // Same bound as the git probes below: a stat that never returns is an
+    // unreadable tree (ETIMEDOUT lands in the catch as unverifiable).
+    const stats = await withReclaimFsDeadline(fs.stat(worktreePath), worktreePath);
+    if (!stats.isDirectory()) {
+      return { safe: false, reason: "unverifiable", detail: `${worktreePath} exists but is not a directory` };
+    }
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      // Nothing materialized: only a registry entry can remain, and removing
+      // that discards no work.
+      return { safe: true, reason: "missing", detail: null };
+    }
+    return { safe: false, reason: "unverifiable", detail: `stat failed: ${code ?? String(error)}` };
+  }
+
+  const git = async (args: string[]): Promise<{ ok: true; out: string } | { ok: false; error: string }> => {
+    try {
+      return { ok: true, out: await runGit(args, worktreePath, { timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS }) };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  };
+
+  const status = await git(["status", "--porcelain"]);
+  if (!status.ok) return { safe: false, reason: "unverifiable", detail: `git status failed: ${status.error}` };
+  if (status.out.trim()) {
+    const changed = status.out.trim().split("\n");
+    return {
+      safe: false,
+      reason: "dirty",
+      detail: `${changed.length} uncommitted path(s), first: ${changed[0]?.trim() ?? ""}`,
+    };
+  }
+
+  const head = await git(["rev-parse", "HEAD"]);
+  if (!head.ok) return { safe: false, reason: "unverifiable", detail: `git rev-parse HEAD failed: ${head.error}` };
+  const headSha = head.out.trim();
+  if (!headSha) return { safe: false, reason: "unverifiable", detail: "empty HEAD" };
+
+  // Containment in any remote-tracking branch is the cheap proof that HEAD is
+  // published. It deliberately does not care *which* remote branch: a topic
+  // branch pushed for review counts, and that is the common shape here.
+  const remotes = await git(["branch", "-r", "--contains", headSha]);
+  if (!remotes.ok) {
+    return { safe: false, reason: "unverifiable", detail: `git branch -r --contains failed: ${remotes.error}` };
+  }
+  if (!remotes.out.trim()) {
+    return { safe: false, reason: "unpushed", detail: `HEAD ${headSha.slice(0, 9)} is on no remote branch` };
+  }
+
+  return { safe: true, reason: "clean", detail: null };
+}
+
 export async function cleanupExecutionWorkspaceArtifacts(input: {
   workspace: {
     id: string;
@@ -4787,8 +4987,15 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
     }
   }
 
+  // A stat that hits its deadline proves nothing either way: skip removal,
+  // and do not stat the same wedged path again for the final check.
+  let worktreeStatExpired = false;
   if (input.workspace.providerType === "git_worktree" && workspacePath) {
-    const worktreeExists = await directoryExists(workspacePath);
+    const worktreeExists = await withReclaimFsDeadline(directoryExists(workspacePath), workspacePath).catch((err) => {
+      worktreeStatExpired = true;
+      warnings.push(`Could not stat "${workspacePath}": ${(err as NodeJS.ErrnoException)?.code ?? String(err)}.`);
+      return false;
+    });
     if (worktreeExists) {
       if (!repoRoot) {
         warnings.push(`Could not resolve git repo root for "${workspacePath}".`);
@@ -4815,6 +5022,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
               phase: "worktree_cleanup",
               args: ["worktree", "remove", ...removeForceArgs, workspacePath],
               cwd: repoRoot,
+              timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS,
               metadata: {
                 workspaceId: input.workspace.id,
                 workspacePath,
@@ -4840,6 +5048,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
             phase: "worktree_cleanup",
             args: ["branch", "-d", input.workspace.branchName],
             cwd: repoRoot,
+            timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS,
             metadata: {
               workspaceId: input.workspace.id,
               workspacePath,
@@ -4889,7 +5098,8 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
 
   const cleaned =
     !workspacePath ||
-    !(await directoryExists(workspacePath));
+    (!worktreeStatExpired &&
+      (await withReclaimFsDeadline(directoryExists(workspacePath), workspacePath).then((exists) => !exists, () => false)));
 
   return {
     cleanedPath: workspacePath,

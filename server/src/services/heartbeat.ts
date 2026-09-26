@@ -308,6 +308,7 @@ import {
   normalizeInstructionsEntryFile,
   sharedDocSourceRoots,
 } from "@paperclipai/adapter-opencode-local/server";
+import { EXECUTION_WORKSPACE_IDLE_GRACE_MS } from "./execution-workspace-cleanup.js";
 import {
   buildWorkspaceReadyComment,
   cleanupExecutionWorkspaceArtifacts,
@@ -30053,6 +30054,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             providerRef: executionWorkspace.worktreePath,
             status: "active",
             lastUsedAt: new Date(),
+            // BLO-22984: reuse un-stamps. The collector's only predicate is
+            // `cleanupEligibleAt`, and a workspace being realized right now is
+            // by definition not idle, so clearing here is what keeps a
+            // per-issue workspace alive across runs while leaving a run-scoped
+            // one — which is never reused — stamped until it is collected.
+            cleanupEligibleAt: null,
+            cleanupReason: null,
             metadata: nextExecutionWorkspaceMetadata,
           })
         : resolvedProjectId
@@ -33046,6 +33054,51 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               failureReason: latestRun?.error ?? undefined,
             }).catch(() => undefined);
             await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
+            // BLO-22984: end-of-run teardown for the execution workspace.
+            //
+            // Nothing used to touch this row when a run ended, so a worktree
+            // outlived every run that ever used it and `cleanup_eligible_at`
+            // was a field no query read. Stamping rather than removing inline
+            // is deliberate: removal is slow, can fail, and this `finally`
+            // must stay non-throwing (see the note above), so the collector
+            // owns the destructive half and this owns the decision. A reused
+            // workspace has the stamp cleared again at realization, so only a
+            // genuinely idle one — including every run-scoped one, which is
+            // never reused — reaches the collector.
+            if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
+              const endedExecutionWorkspaceId = asString(
+                parseObject(latestRun.contextSnapshot).executionWorkspaceId,
+                "",
+              ).trim();
+              if (endedExecutionWorkspaceId) {
+                await db
+                  .update(executionWorkspaces)
+                  .set({
+                    cleanupEligibleAt: new Date(Date.now() + EXECUTION_WORKSPACE_IDLE_GRACE_MS),
+                    cleanupReason: "run_ended",
+                    updatedAt: new Date(),
+                  })
+                  .where(and(
+                    eq(executionWorkspaces.id, endedExecutionWorkspaceId),
+                    eq(executionWorkspaces.companyId, run.companyId),
+                    // Linked git worktrees only: they are the population that
+                    // leaks, and they are the only thing the collector removes.
+                    // Stamping a shared `local_fs` row would write a field
+                    // nothing reads — the exact defect this fixes.
+                    eq(executionWorkspaces.providerType, "git_worktree"),
+                    // Never re-stamp a row somebody archived on purpose (e.g.
+                    // the workspace-validation quarantine, which nulls the
+                    // stamp precisely so its evidence is preserved).
+                    ne(executionWorkspaces.status, "archived"),
+                  ))
+                  .catch((error) => {
+                    logger.warn(
+                      { error, runId: run.id, executionWorkspaceId: endedExecutionWorkspaceId },
+                      "failed to stamp execution workspace cleanup eligibility at run end",
+                    );
+                  });
+              }
+            }
             if (runScratch && latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
               const scratchForCleanup = runScratch;
               let scratchCleanup: Awaited<ReturnType<typeof cleanupHeartbeatRunScratch>> | null = null;
