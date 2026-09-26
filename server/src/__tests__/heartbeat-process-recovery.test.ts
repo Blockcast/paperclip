@@ -281,6 +281,7 @@ vi.mock("../adapters/index.ts", async () => {
 import {
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
+  STALLED_COALESCE_BYPASS_SNAPSHOT_KEY,
   heartbeatService,
   type HeartbeatEnvironmentRuntime,
   redactDetectedSuccessfulRunProgressSummaryForBoard,
@@ -3681,6 +3682,71 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       retryReason: "issue_continuation_needed",
       cause: "process_lost",
     });
+  });
+
+  // PEN-1990: the bypass marker records why ITS OWN run was minted, so it must
+  // not ride a carried-forward snapshot onto the run that replaces a dead one.
+  // This is the `process_lost` carry specifically because it is the reachable
+  // one: process loss is routine on this fleet, and a run minted *because* its
+  // predecessor overran its heartbeat budget is an agent already burning
+  // wall-clock, so the two correlate rather than being independent.
+  //
+  // A propagated marker breaks both properties the marker exists to provide —
+  // its count stops being a count of filter activations, and its `targetRunId`
+  // points at a run unrelated to the retry. It also breaks the reconciliation
+  // with the enqueue log: a propagated marker has no `outcome: "queued"` line
+  // at all, so the two counts can now differ in BOTH directions and an
+  // operator differencing them is back to the unattributable discrepancy this
+  // instrument was added to remove.
+  it("drops the interval-overrun bypass marker when carrying a snapshot onto a process-loss retry", async () => {
+    const { companyId, runId } = await seedRunFixture({
+      adapterType: "openclaw_gateway",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+      contextSnapshot: {
+        wakeReason: "issue_monitor_due",
+        nextCheckAt: "2026-03-19T00:00:00.000Z",
+        [STALLED_COALESCE_BYPASS_SNAPSHOT_KEY]: {
+          targetRunId: "00000000-0000-4000-8000-00000000dead",
+          targetStartedAt: "2026-03-18T22:00:00.000Z",
+          targetAgeMs: 7_200_000,
+          budgetMs: 5_400_000,
+          intervalSec: 3600,
+        },
+      },
+    });
+    const heartbeat = createHeartbeat();
+
+    expect(await heartbeat.reapOrphanedRuns()).toEqual({ reaped: 1, runIds: [runId] });
+
+    const retry = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.retryOfRunId, runId)))
+      .then((rows) => rows[0] ?? null);
+    expect(retry).not.toBeNull();
+    expect(retry?.contextSnapshot).not.toHaveProperty(STALLED_COALESCE_BYPASS_SNAPSHOT_KEY);
+    // Carrying the snapshot forward is the whole point of the retry builder, so
+    // a strip that took the work-describing keys with it would be a regression
+    // rather than a fix. `nextCheckAt` is the carried key that has no other
+    // source on the retry — asserting only the two keys the builder overwrites
+    // would pass against a strip that emptied the snapshot.
+    expect(retry?.contextSnapshot).toMatchObject({
+      wakeReason: "process_lost_retry",
+      retryReason: "issue_continuation_needed",
+      retryOfRunId: runId,
+      nextCheckAt: "2026-03-19T00:00:00.000Z",
+    });
+    // The marker still belongs to the run it was actually stamped on: the strip
+    // copies rather than deleting in place, so it must not have reached back
+    // through `parseObject` (which casts, not copies) onto the source row.
+    const source = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(source?.contextSnapshot).toHaveProperty(STALLED_COALESCE_BYPASS_SNAPSHOT_KEY);
   });
 
   it("does not retry a lost monitor dispatch while another monitor wake remains scheduled", async () => {
@@ -13023,24 +13089,121 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // increment per concurrent caller — so this still fails if a retry path double-increments.
     expect(actions[0]?.attemptCount).toBeGreaterThanOrEqual(1);
     expect(actions[0]?.attemptCount).toBeLessThanOrEqual(8);
-    // Pin WHICH bound retired it. The creation-anchored horizon is hours out here, so the
-    // budget is the only bound that can have fired — which makes this the one assertion that
-    // fails if the wake path ever goes back to hardcoding the bound on a disjunctive gate.
+    // Pin the retirement to `retiringBound`, the durable record of WHY the row retired —
+    // never to `attemptCount`.
     //
-    // Keyed on the OBSERVED attempt count, not on config. How many of the 8 concurrent
-    // reserves actually land is scheduling-dependent (measured 4, 6 and 7 on three runs of
-    // this suite against a budget of 5), so "was the budget exhausted?" is only answerable
-    // from the row itself. Both regimes are asserted rather than one being skipped, so the
-    // branch cannot rot into a silent no-op, and the pairing — retired iff the budget was
-    // reached — holds whichever way the race falls.
-    if ((actions[0]?.attemptCount ?? 0) >= defaultRecoveryActionMaxAttempts) {
-      expect(actions[0]?.status).toBe("escalated");
-      expect(actions[0]?.retiringBound).toBe("attempt_budget");
-    } else {
-      expect(actions[0]?.status).toBe("active");
-      expect(actions[0]?.retiringBound).toBeNull();
-    }
+    // BLO-35010: the BLO-33410 branch keyed this on `attemptCount >= budget` and so asserted
+    // that a retired row must read at or above the budget. It does not. Retirement runs
+    // through `retireAndReleaseWakeAttempt`, which REFUNDS the reserved attempt in the same
+    // statement that escalates, and a sweep whose `enqueueWakeup` returns null refunds too —
+    // so a correctly-escalated row routinely reads BELOW the budget and the `else` arm then
+    // demanded `active` of it (`expected 'escalated' to be 'active'`, run 35544923341).
+    // `retiringBound` is written with `coalesce`, first writer wins permanently, and no
+    // refund touches it.
+    //
+    // What the two lines below DO and DO NOT catch, stated honestly because a guard whose
+    // claimed mutation passes is documentation (BLO-34263), and the weaker version of that
+    // mistake is what this PR is fixing.
+    //
+    // The pairing catches a MISMATCH only: escalated with no bound, or a bound with no
+    // escalation. It is silent on retirement never firing at all — that reads as
+    // `null` + `active` and passes. Which bound fired is deliberately not pinned here: both
+    // are reachable under this race and neither may satisfy the other's expectation, so
+    // `attempt_budget` discrimination lives in the deterministic
+    // `issue-recovery-actions.test.ts` cases and `timeout_horizon` in the test below.
+    //
+    // The set membership is documentation, not a guard: `[null, attempt_budget,
+    // timeout_horizon]` is every value this call site can write, and the other two enum
+    // members are only written alongside a terminal status that this query's
+    // `inArray(status, ["active","escalated"])` filter already excludes. Kept only so the
+    // reachable set is written down next to the pairing that consumes it.
+    const retiringBound = actions[0]?.retiringBound ?? null;
+    expect([null, "attempt_budget", "timeout_horizon"]).toContain(retiringBound);
+    expect(actions[0]?.status).toBe(retiringBound === null ? "active" : "escalated");
     await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
+  });
+
+  it("retires a stranded recovery action on the wall-clock horizon with its attempt budget unspent", async () => {
+    // BLO-35010: the regime the race test above cannot reach deterministically — whether it
+    // enters this one is scheduling-dependent — and the regime BLO-33410's `attemptCount`
+    // branch asserted was unreachable. Per BLO-19124 it is the DOMINANT production shape: 0
+    // of 245 rows ever reached the attempt budget, every observed retirement came from the
+    // horizon, and the retirement's own refund puts the count back below the budget.
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "adapter_exit_code",
+    });
+
+    // The state a long-lived action reaches: horizon burned, budget barely touched. Seeded
+    // rather than swept into, because the sweep escalates the issue out of the stranded set
+    // on its first pass — one sweep is the only entry this path gets. The sweep reuses this
+    // row rather than inserting a second one because `getActiveForIssue` keys reuse on
+    // `(companyId, sourceIssueId, status IN active)` alone; `fingerprint` is NOT load-bearing
+    // here — the upsert overwrites it with `input.fingerprint` unconditionally, and with an
+    // `active` status and an owner set `shouldReuseStrandedRecoveryAction` returns false
+    // whether or not it matches. It is written in the shape the sweep computes only so the
+    // fixture reads like a real row.
+    //
+    // `evidence.sourceScopedWakeHorizonAt` is load-bearing, not decoration. Horizon
+    // preservation reads it first (`issue-recovery-actions.ts:452`); without it the upsert
+    // falls through to `existing.maxAttempts !== null ? existingTimeoutAt : null` (`:459`),
+    // whose own comment scopes it to "rows written before the evidence key existed". That
+    // arm happens to yield the same past date today, so the test would pass — but deleting
+    // a transitional backfill would then flip `isNewlyBoundedSequence`, re-arm `timeoutAt`
+    // from now, and fail this test as though production had regressed. A row the sweep
+    // creates carries the key (`:642-647`); seeding it routes preservation through the
+    // steady-state path the assertions below actually claim to exercise.
+    const seededHorizonAt = new Date(Date.now() - 60_000);
+    const [seeded] = await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: issueId,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerAgentId: agentId,
+      previousOwnerAgentId: agentId,
+      returnOwnerAgentId: agentId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `source_scoped_recovery:${companyId}:${issueId}:stranded_assigned_issue:${agentId}`,
+      nextAction: "Restore a live execution path.",
+      attemptCount: 1,
+      maxAttempts: defaultRecoveryActionMaxAttempts,
+      evidence: { sourceScopedWakeHorizonAt: seededHorizonAt.toISOString() },
+      timeoutAt: seededHorizonAt,
+    }).returning();
+    expect(seeded?.retiringBound).toBeNull();
+
+    await heartbeat.reconcileStrandedAssignedIssues();
+
+    const rows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(
+        eq(issueRecoveryActions.companyId, companyId),
+        eq(issueRecoveryActions.sourceIssueId, issueId),
+      ));
+    // Length before index: the query has no ORDER BY, so with a second row present `rows[0]`
+    // is arbitrary and the id check below would fail ~half of runs instead of every run —
+    // a flake introduced by the test that exists to remove one.
+    expect(rows).toHaveLength(1);
+    const retired = rows[0] ?? null;
+    expect(retired?.id).toBe(seeded!.id);
+    expect(retired?.status).toBe("escalated");
+    expect(retired?.retiringBound).toBe("timeout_horizon");
+    // The point of the row: retired, with the budget demonstrably NOT reached. Either of the
+    // upsert's two arms gets there — the sweep increments to 2 and `retireAndReleaseWakeAttempt`
+    // refunds to 1 in the same statement that escalates, or, if the routed owner differs from
+    // the seeded one, `isNewOwnerSequence` RESETS the count to 1 and the refund lands it at 0.
+    // Both are below the budget, which is what BLO-33410's `attemptCount` branch called
+    // unreachable.
+    //
+    // Bounded at 1, not at the budget: the two arms above are the complete reachable set, so
+    // `toBeLessThan(defaultRecoveryActionMaxAttempts)` would admit 2-4 and let the comment
+    // drift from the code. One sweep is one upsert and one refund, so this is deterministic —
+    // the same standard this PR applies to the race test's set membership.
+    expect(retired?.attemptCount).toBeLessThanOrEqual(1);
+    expect(retired?.attemptCount).toBeLessThan(defaultRecoveryActionMaxAttempts);
   });
 
   it("blocks stranded recovery issues in place instead of creating nested recovery issues", async () => {

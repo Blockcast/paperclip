@@ -312,6 +312,29 @@ jobs:
         run: node --test ./scripts/__tests__/merge-group-concurrency.test.mjs
         timeout-minutes: 1
 
+      - name: Test vendored-provenance union-merge invariants (BLO-34872)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/provenance-union-merge.test.mjs
+        timeout-minutes: 1
+
+      - name: Require vendored-adapter source changes to be logged (BLO-35109)
+        # Replaces the stored 64-hex integrity manifest that used to live in
+        # vendor/paperclip-adapter-claude-k8s/PROVENANCE.md and was verified by
+        # the vendor_claude_k8s job. That hash was single-valued by construction,
+        # so every pair of concurrent vendored PRs produced two different values
+        # on one line and always conflicted -- and `merge=union` (BLO-34872)
+        # structurally cannot reach a single-valued field. This asserts the same
+        # property the hash existed for -- vendored source does not change
+        # without a provenance row -- off the diff, which stores nothing and so
+        # cannot conflict.
+        #
+        # Runs in this job rather than in vendor_claude_k8s because this one
+        # already checks out full history (fetch-depth: 0); the vendored job
+        # checks out at depth 1 and cannot resolve $PR_BASE_SHA.
+        if: ${{ !cancelled() }}
+        run: node ./scripts/check-vendored-provenance-log.mjs --base "$PR_BASE_SHA" --head "$PR_HEAD_SHA"
+        timeout-minutes: 1
+
       - name: Test policy node-test timeouts
         if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/policy-node-test-timeouts.test.mjs
@@ -1170,7 +1193,26 @@ jobs:
     # caps bite today. Bring 110 back down when it lands.
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
-      fail-fast: false
+      # BLO-33021: fail-fast is right for `pull_request` (one push, show the
+      # author every red at once) and wrong for `merge_group`, where there is
+      # exactly one landing candidate under maximumEntriesToBuild=1 and the
+      # only question is pass/fail. Measured on merge group
+      # gh-readonly-queue/master/pr-1393-7cf49b59 (run 34759050138): the
+      # `workspaces-b` leg failed at 13:34:05Z -- 18 minutes in -- and the four
+      # 110-minute `server n/4` legs kept running for another 40+ minutes,
+      # because the merge queue cannot evict a candidate until the required
+      # check reports. Six of the 22 merge-group attempts in the preceding 26h
+      # failed that way, each burning a full group duration (server-shard p100
+      # is 89.7m per the timeout table below) on a verdict already decided.
+      # Queue depth was 28 and the head had waited 26.3h.
+      #
+      # Cancelling the siblings does not soften the gate: `needs.general_tests
+      # .result` is `failure` whenever any leg failed regardless of cancelled
+      # peers, so the `verify` lane's `success | cancelled | skipped` pass-case
+      # is not reachable through this change. A cancelled leg can only reach
+      # `scripts/classify-lane-failures.mjs`, which by its own contract may
+      # change the wording of a red run and never the gate.
+      fail-fast: ${{ github.event_name == 'merge_group' }}
       # Every matrix entry gets an isolated ARC pod/database. Serializing this
       # matrix only lengthens the critical path and leaves on-prem capacity
       # unused when it is available.
@@ -1291,28 +1333,14 @@ jobs:
       - name: Test
         run: npm test
 
-      # Guards the PROVENANCE.md integrity manifest. If someone edits the
-      # vendored source, this hash changes and PROVENANCE.md must be updated
-      # in the same PR — otherwise the recorded provenance silently drifts
-      # from what is actually in the tree.
-      - name: Verify provenance manifest
-        run: |
-          set -euo pipefail
-          actual=$(git ls-files \
-            | grep -vxE 'LICENSE|PROVENANCE\.md' \
-            | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d' ' -f1)
-          recorded=$(grep -oE '^[0-9a-f]{64}$' PROVENANCE.md | head -1)
-          echo "actual:   $actual"
-          echo "recorded: $recorded"
-          if [ -z "$recorded" ]; then
-            echo "::error::No 64-hex integrity hash found in PROVENANCE.md."
-            exit 1
-          fi
-          if [ "$actual" != "$recorded" ]; then
-            echo "::error::Vendored source changed but PROVENANCE.md integrity hash was not updated."
-            echo "Update the hash in vendor/paperclip-adapter-claude-k8s/PROVENANCE.md to: $actual"
-            exit 1
-          fi
+      # The stored 64-hex integrity manifest that used to be verified here was
+      # removed under BLO-35109: it was single-valued, so every pair of
+      # concurrent vendored PRs conflicted on it, and it could not tell a bad
+      # merge from two good ones (it failed on every combination of two
+      # correctly-merged changes). The property it existed for -- vendored
+      # source does not change without a provenance row -- is now asserted off
+      # the diff by the `Require vendored-adapter source changes to be logged`
+      # step in the `policy` job, which stores nothing and so cannot conflict.
 
   verify:
     # Preserve the legacy required-check name while the underlying work runs in parallel.

@@ -7747,6 +7747,103 @@ export function filterIntervalOverrunCoalesceTarget<
     : target;
 }
 
+/**
+ * Context-snapshot key stamped on the run a timer wake mints because
+ * {@link filterIntervalOverrunCoalesceTarget} removed its coalesce target.
+ *
+ * PEN-1990: the rule above decides silently. It emits no log, no event and no
+ * column, so the only way to tell whether it has ever fired in production is
+ * to reconstruct overlapping same-scope run pairs out of the run corpus and
+ * infer it — which cannot distinguish a filter activation from any other
+ * reason two runs overlapped. Measured 2026-09-18, 55.8 h and 892 started runs
+ * after the rule reached production: fleet-wide longest run 4727 s against a
+ * 5400 s budget, so zero activations and nothing to attribute either way.
+ *
+ * The marker lands on the RUN rather than on `agent_wakeup_requests`, which is
+ * the row the rule is really about, because there is no HTTP route that reads
+ * wakeup requests and `GET /companies/:id/heartbeat-runs` already returns
+ * `contextSnapshot`. A capture that cannot be fetched is no capture.
+ */
+export const STALLED_COALESCE_BYPASS_SNAPSHOT_KEY = "__intervalOverrunCoalesceBypass";
+
+export type IntervalOverrunCoalesceBypass = {
+  targetRunId: string;
+  targetStartedAt: string;
+  targetAgeMs: number;
+  budgetMs: number;
+  intervalSec: number;
+};
+
+/**
+ * Describe the coalesce target {@link filterIntervalOverrunCoalesceTarget} just
+ * removed, or null when it removed nothing.
+ *
+ * Takes the before/after pair rather than re-running the predicate so the
+ * record can never disagree with the decision that was actually acted on: if
+ * the two ever diverged, a re-derivation here would describe a filter
+ * activation that did not happen (or miss one that did).
+ */
+export function describeIntervalOverrunCoalesceBypass(input: {
+  target: { id: string; startedAt: Date | string | null } | null;
+  filteredTarget: { id: string } | null;
+  intervalSec: number;
+  now: Date;
+}): IntervalOverrunCoalesceBypass | null {
+  const { target, filteredTarget, intervalSec, now } = input;
+  if (!target || filteredTarget) return null;
+  const startedAt = target.startedAt ? new Date(target.startedAt) : null;
+  // Unreachable through the filter — it only removes a target with a parseable
+  // `startedAt` — but the marker is evidence, so it reports what it can rather
+  // than emitting `NaN`/`Invalid Date` if that ever stops holding.
+  const startedAtMs = startedAt ? startedAt.getTime() : Number.NaN;
+  return {
+    targetRunId: target.id,
+    targetStartedAt: Number.isFinite(startedAtMs) ? startedAt!.toISOString() : "unknown",
+    targetAgeMs: Number.isFinite(startedAtMs) ? now.getTime() - startedAtMs : -1,
+    budgetMs: resolveStalledCoalesceBudgetMs(intervalSec),
+    intervalSec,
+  };
+}
+
+/**
+ * Snapshot keys that describe ONE run's own minting decision, and are therefore
+ * false on any later run.
+ *
+ * The retry builders replace a dead run by spreading `parseObject(
+ * run.contextSnapshot)` wholesale onto the replacement, so a key stamped by the
+ * enqueue that minted the original would ride along onto a run that never went
+ * through that path. For {@link STALLED_COALESCE_BYPASS_SNAPSHOT_KEY} that
+ * breaks both properties it exists to provide: the marker's count stops being a
+ * count of filter activations, and its `targetRunId` points at a run unrelated
+ * to the retry. It also breaks the reconciliation with the enqueue log — a
+ * propagated marker has no log line at all, so the two counts can differ in
+ * both directions and an operator is back to an unattributable discrepancy.
+ *
+ * Register a key here when it records why *this* run was created. Keys that
+ * describe the work rather than the mint (`issueId`, `wakeReason`,
+ * `depBlockedFirstParkedAt`) are meant to survive a retry and must not go here.
+ */
+const RUN_SCOPED_SNAPSHOT_MARKER_KEYS = [STALLED_COALESCE_BYPASS_SNAPSHOT_KEY] as const;
+
+/**
+ * Copy a prior run's snapshot for carry-forward onto its replacement, dropping
+ * the run-scoped markers in {@link RUN_SCOPED_SNAPSHOT_MARKER_KEYS}.
+ *
+ * Returns a new object rather than deleting in place: `parseObject` casts, it
+ * does not copy, so mutating its result would edit the caller's in-memory run
+ * row and change what every later read of `run.contextSnapshot` in the same
+ * function sees.
+ */
+export function stripRunScopedSnapshotMarkers(
+  snapshot: Record<string, unknown>,
+): Record<string, unknown> {
+  const carried = { ...snapshot };
+  for (const key of RUN_SCOPED_SNAPSHOT_MARKER_KEYS) {
+    delete carried[key];
+  }
+  return carried;
+}
+
 export function describeSessionResetReason(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ) {
@@ -12414,6 +12511,25 @@ export interface HeartbeatServiceOptions {
   beforeWakeRedeliveryEnqueueForTest?: (
     row: typeof agentWakeupRequests.$inferSelect,
   ) => Promise<void> | void;
+  /**
+   * Test-only interleaving point between enqueueWakeup's UNLOCKED coalesce
+   * read and the transaction that takes the agent lock (PEN-1990).
+   *
+   * This window is the only way to reach a `coalesced` outcome on the
+   * interval-overrun bypass path, and it cannot be reproduced by seeding the
+   * fixture up front. `rawCoalescedTarget` prefers `sameScopeQueuedRun` over
+   * the running run, and `filterIntervalOverrunCoalesceTarget` returns a
+   * non-running target unchanged -- so a queued row that is already present at
+   * the unlocked read wins that read, coalesces there, and returns before the
+   * bypass is ever computed. The queued sibling has to APPEAR in between, which
+   * is exactly the live race the `includeRunning: false` re-check exists for:
+   * "a same-task run found after taking the agent lock was created while this
+   * enqueue was waiting".
+   */
+  beforeWakeEnqueueTransactionForTest?: (input: {
+    agentId: string;
+    taskKey: string | null;
+  }) => Promise<void> | void;
 }
 
 function isTruthyRuntimeEnvValue(value: string | undefined) {
@@ -17078,7 +17194,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
     const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
     const retryContextSnapshot = withRecoveryModelProfileHint({
-      ...contextSnapshot,
+      ...stripRunScopedSnapshotMarkers(contextSnapshot),
       retryOfRunId: run.id,
       wakeReason: "missing_issue_comment",
       retryReason: "missing_issue_comment",
@@ -17408,7 +17524,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
     const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
     const retryContextSnapshot = withRecoveryModelProfileHint({
-      ...contextSnapshot,
+      ...stripRunScopedSnapshotMarkers(contextSnapshot),
       retryOfRunId: run.id,
       wakeReason: "process_lost_retry",
       retryReason,
@@ -20428,7 +20544,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       workspaceValidationRetryPayload !== null &&
       Object.keys(workspaceValidationRetryPayload).length > 0;
     const retryContextSnapshot: Record<string, unknown> = withRecoveryModelProfileHint({
-      ...contextSnapshot,
+      ...stripRunScopedSnapshotMarkers(contextSnapshot),
       retryOfRunId: run.id,
       wakeReason,
       retryReason,
@@ -36413,24 +36529,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       rawCoalescedTarget.scheduledRetryReason === CCROTATE_CAPACITY_RETRY_REASON
         ? rawCoalescedTarget
         : null;
+    const overrunFilterInput = filterZombieCoalesceTarget(
+      manualCapacityRetryTarget ? null : rawCoalescedTarget,
+      liveRunExecutions,
+    );
+    // The agent's own configured interval, so a slow-cadence agent gets a
+    // proportionally larger budget. `intervalSec` is always positive (clamped
+    // to [30, 86400]) and is returned even when heartbeats are disabled, so
+    // the floor in resolveStalledCoalesceBudgetMs — not this value — is what
+    // keeps fast-cadence agents safe.
+    const overrunFilterIntervalSec = resolveHeartbeatPolicyForRuntimeConfig(
+      agent.runtimeConfig,
+    ).intervalSec;
+    // One clock for the decision and for the record it produces, so the age
+    // the marker reports is the age the filter judged.
+    const overrunFilterNow = new Date();
     const coalescedTargetRun = filterIntervalOverrunCoalesceTarget({
-      target: filterZombieCoalesceTarget(
-        manualCapacityRetryTarget ? null : rawCoalescedTarget,
-        liveRunExecutions,
-      ),
+      target: overrunFilterInput,
       // PEN-1995: timer wakes only. A demand wake has no cadence to miss, so
       // its age proves nothing was lost — filtering on it would discard a live
       // target and mint a concurrent run for a manual or recovery wake. The
       // helper enforces this; it is passed rather than branched here so the
       // whole rule stays in one unit-testable place.
       source,
-      // The agent's own configured interval, so a slow-cadence agent gets a
-      // proportionally larger budget. `intervalSec` is always positive (clamped
-      // to [30, 86400]) and is returned even when heartbeats are disabled, so
-      // the floor in resolveStalledCoalesceBudgetMs — not this value — is what
-      // keeps fast-cadence agents safe.
-      intervalSec: resolveHeartbeatPolicyForRuntimeConfig(agent.runtimeConfig).intervalSec,
-      now: new Date(),
+      intervalSec: overrunFilterIntervalSec,
+      now: overrunFilterNow,
+    });
+    // PEN-1990: record the activation. Consumed twice below — stamped on the
+    // minted run's snapshot, and logged post-commit with the outcome.
+    const intervalOverrunBypass = describeIntervalOverrunCoalesceBypass({
+      target: overrunFilterInput,
+      filteredTarget: coalescedTargetRun,
+      intervalSec: overrunFilterIntervalSec,
+      now: overrunFilterNow,
     });
 
     if (coalescedTargetRun) {
@@ -36468,6 +36599,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return mergedRun;
       }
     }
+
+    await options.beforeWakeEnqueueTransactionForTest?.({
+      agentId,
+      taskKey: effectiveTaskKey,
+    });
 
     const queueOutcome = await db.transaction(async (tx) => {
       await tx.execute(
@@ -36695,7 +36831,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // connection to avoid pool starvation under concurrent wakes.
           responsibleUserId: await resolveQueuedResponsibleUserId(tx),
           wakeupRequestId: wakeupRequest.id,
-          contextSnapshot: enrichedContextSnapshot,
+          // PEN-1990: stamped only on the row we actually insert, for the same
+          // reason as the redelivery token above — `enrichedContextSnapshot` is
+          // also handed to the coalesce helpers, and a marker merged into an
+          // existing run would claim that run was minted by this filter.
+          contextSnapshot: intervalOverrunBypass
+            ? {
+                ...(enrichedContextSnapshot ?? {}),
+                [STALLED_COALESCE_BYPASS_SNAPSHOT_KEY]: intervalOverrunBypass,
+              }
+            : enrichedContextSnapshot,
           sessionIdBefore: sessionBefore,
           continuationAttempt,
           retryOfRunId: opts.retryOfRunId,
@@ -36714,6 +36859,40 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       return { kind: "queued" as const, run: newRun };
     });
+
+    // PEN-1990: one line per activation, emitted post-commit so it can never
+    // describe a decision the transaction rolled back. `outcome` is what makes
+    // this reconcile with the snapshot marker: the marker is stamped only on
+    // the run this wake inserts, so its population is exactly the lines with
+    // `outcome: "queued"`. The remainder are activations where a later gate in
+    // this enqueue (the daily cap, the post-lock task-scope re-check, the
+    // github-state coalesce, or the idempotency-key already-delivered claim)
+    // ended the wake without a mint — real activations the marker cannot
+    // carry, attributable here rather than an unexplained shortfall between
+    // the two counts.
+    //
+    // `runId` therefore means "the run this wake minted" and nothing else: it
+    // is non-null exactly when a marker was stamped, so the two records
+    // reconcile on the field as well as on `outcome`. The fold outcomes report
+    // the run they merged into under a separate key, because a consumer that
+    // grouped those on `runId` would count them as mints.
+    if (intervalOverrunBypass) {
+      logger.info(
+        {
+          agentId,
+          taskKey: effectiveTaskKey,
+          outcome: queueOutcome.kind,
+          runId: queueOutcome.kind === "queued" ? queueOutcome.run.id : null,
+          coalescedIntoRunId:
+            queueOutcome.kind === "skipped" || queueOutcome.kind === "queued"
+              ? null
+              : queueOutcome.run.id,
+          ...intervalOverrunBypass,
+        },
+        "timer wake declined to coalesce into a run that has overrun its heartbeat "
+          + "interval (PEN-1990; rule added in PEN-1995)",
+      );
+    }
 
     for (const publish of manualCapacityActivityPublishes) {
       try {

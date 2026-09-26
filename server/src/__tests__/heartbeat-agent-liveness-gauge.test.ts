@@ -543,3 +543,74 @@ describeEmbeddedPostgres("agent-liveness gauges (BLO-23413)", () => {
     });
   });
 });
+
+// BLO-33152. Deliberately OUTSIDE describeEmbeddedPostgres: every test above
+// imports these names by SYMBOL, so changing a constant's VALUE in metrics.ts
+// leaves all of them green -- and a host without embedded Postgres would skip
+// the pin along with them. This pin is the entire guard, so it always runs.
+describe("wire names for the BLO-22498 gauges are a cross-repo contract (BLO-33152)", () => {
+  it("pins the exact series names Blockcast/onprem-k8s hardcodes in its Grafana PromQL", async () => {
+    // DOWNSTREAM CONSUMER:
+    //   Blockcast/onprem-k8s -> monitoring/dashboards/paperclip-platform.json
+    // Those panels hardcode these strings in their PromQL. Renaming one here
+    // does not break a panel loudly -- it blanks it, and an ABSENT series
+    // renders identically to a RECOVERED one: a quiet, healthy-looking fleet
+    // that is measuring nothing. That is precisely the failure the BLO-22498
+    // panels exist to detect, so the name is load-bearing past this repo.
+    //
+    // If you are here because you renamed a constant: change the dashboard
+    // JSON in onprem-k8s in the same PR, then update these literals. Updating
+    // them alone makes the test green and the panel blind.
+    expect(AGENT_ERROR_REASON_AGENTS_METRIC).toBe("paperclip_agent_status_error_agents");
+    expect(AGENT_ERROR_REASON_OLDEST_AGE_METRIC).toBe(
+      "paperclip_agent_status_error_oldest_age_seconds",
+    );
+    // Pinned defensively as the same exporter family, NOT as a live contract:
+    // repo-wide grep of onprem-k8s on 2026-09-20 found 0 references to this
+    // name -- not in the dashboard above, not in the paperclip Prometheus
+    // rules. It is the agent_id-scoped series the two reason-bucketed gauges
+    // were added to disambiguate, so it is the obvious next thing a dashboard
+    // reaches for; the pin costs one line. Do not cite the dashboard for it.
+    expect(AGENT_ERROR_DURATION_SECONDS_METRIC).toBe(
+      "paperclip_agent_status_error_duration_seconds",
+    );
+
+    // The dashboard hardcodes the LABEL and the BUCKET VALUE too:
+    //   max by (error_reason) (...{error_reason="session_unavailable"})
+    // Renaming either blanks the panel with every metric name still intact --
+    // identical failure, identical blast radius. The label is a bare literal
+    // in metrics.ts's `labelNames`, not a shared constant, so read BOTH off
+    // the registered series rather than off symbols: that asserts the wire
+    // shape Prometheus actually scrapes, and it catches a rename that is
+    // CONSISTENT across producer and constants -- the only kind that blanks
+    // the panel silently, since an inconsistent one already throws at init.
+    // A symbol-level `toBe` on the bucket constant is deliberately absent: it
+    // has no mutation that fails it alone, because the zero-fill below
+    // derives from that same constant. The zero-fill is also what makes this
+    // readable with no database.
+    //
+    // BOTH reason-gauges are checked, not just one. The dashboard reads
+    // `max by (error_reason)` off each, and the two gauges declare INDEPENDENT
+    // bare `error_reason` literals (metrics.ts `labelNames`, one per gauge).
+    // So a rename of a single gauge's label blanks exactly that panel and
+    // leaves the other reporting normally -- a half-dark dashboard, which is
+    // harder to notice than a wholly dark one. Verified by mutation: renaming
+    // the agents gauge's label alone passed a single-gauge version of this
+    // assertion.
+    const registry = getMetricsRegistry();
+    for (const metricName of [
+      AGENT_ERROR_REASON_AGENTS_METRIC,
+      AGENT_ERROR_REASON_OLDEST_AGE_METRIC,
+    ]) {
+      const gauge = registry.getSingleMetric(metricName);
+      expect(gauge, `${metricName} must be registered`).toBeTruthy();
+      const series = (await gauge!.get()) as {
+        values: Array<{ labels: Record<string, string> }>;
+      };
+      expect(
+        series.values.map((entry) => entry.labels),
+        `${metricName} must publish the session_unavailable bucket under the error_reason label`,
+      ).toContainEqual({ error_reason: "session_unavailable" });
+    }
+  });
+});
