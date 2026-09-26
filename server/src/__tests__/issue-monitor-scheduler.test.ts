@@ -1212,6 +1212,49 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(comments[0]?.body).toContain("could not be delivered");
   });
 
+  // PEN-3326 follow-up: the wake fallback swallows 4xx and rethrows anything
+  // else, which is right — but the recovery-issue row has already committed by
+  // then, so a rethrow that skipped the creation log would leave the row
+  // discoverable by `originId` and by nothing else. The `finally` closes that
+  // trail gap. A CHECK violation on the wake insert stands in for the 5xx: it
+  // takes the identical `throw err` branch (not an `HttpError` at all), and the
+  // tick's own catch keeps it from escaping the sweep.
+  it("logs the recovery-issue creation even when its wake throws (PEN-3326)", async () => {
+    const { issueId, companyId } = await seedFixture({
+      monitorAttemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+      monitor: { recoveryPolicy: "create_recovery_issue" },
+    });
+    await db.execute(
+      sql`alter table agent_wakeup_requests add constraint pen_3326_force_wake_failure check (reason <> 'issue_monitor_recovery_issue')`,
+    );
+
+    try {
+      const heartbeat = createHeartbeat();
+      await expect(heartbeat.tickTimers(new Date("2026-04-11T12:31:00.000Z"))).resolves.toBeDefined();
+
+      const activity = await db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.entityId, issueId))
+        .then((rows) => rows);
+      const created = activity.find((row) => row.action === "issue.monitor_recovery_issue_created");
+      // The point of the change: present at all, and labelled as a failed wake
+      // rather than defaulting to the "delivered" reading.
+      expect(created).toBeDefined();
+      expect(created?.details).toMatchObject({ recoveryWakeFailed: true });
+      expect(activity.map((row) => row.action)).not.toContain("issue.monitor_recovery_wake_suppressed");
+
+      const recoveryIssue = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.originId, issueId))
+        .then((rows) => rows.find((row) => row.companyId === companyId && row.originKind === "stranded_issue_recovery") ?? null);
+      expect(recoveryIssue).toMatchObject({ parentId: issueId });
+    } finally {
+      await db.execute(sql`alter table agent_wakeup_requests drop constraint pen_3326_force_wake_failure`);
+    }
+  });
+
   // The manual path reaches the return-null gates too (`clearOnClientError:
   // false` only scopes the THROW-branch deferral). A null return has no error to
   // surface, so it re-arms rather than logging a phantom trigger, and the caller

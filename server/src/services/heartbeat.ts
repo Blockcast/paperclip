@@ -13941,42 +13941,55 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // that could not be woken. The row is the unsuppressible artifact; a
       // declined wake must not throw past the `issue.monitor_recovery_issue_created`
       // log below, so route it through the same comment fallback as `wake_owner`.
-      let recoveryWakeSuppressed = false;
-      if (recoveryIssue.assigneeAgentId) {
-        const wake = await enqueueRecoveryWakeOrComment(recoveryIssue.assigneeAgentId, {
-          source: "automation",
-          triggerDetail: "system",
-          reason: "issue_monitor_recovery_issue",
-          idempotencyKey: `issue-monitor-recovery-issue:${input.claimed.id}:${input.clearReason}:${input.scheduledAtIso}`,
-          payload: withRecoveryModelProfileHint({ issueId: recoveryIssue.id, sourceIssueId: input.claimed.id }, "status_only"),
-          requestedByActorType: input.actorType,
-          requestedByActorId: input.actorId,
-          contextSnapshot: withRecoveryModelProfileHint({
-            issueId: recoveryIssue.id,
-            sourceIssueId: input.claimed.id,
-            source: "issue.monitor.recovery_issue",
-            wakeReason: "issue_monitor_recovery_issue",
-          }, "status_only"),
-        }, "The recovery-issue wake could not be delivered");
-        recoveryWakeSuppressed = wake === "suppressed";
+      //
+      // The fallback swallows 4xx only and rethrows 5xx, which is right — a server
+      // fault is not this tick's to absorb. But the recovery-issue row has already
+      // committed by then, so letting that rethrow skip the log below would leave
+      // the row discoverable by `originId` and by nothing else. Hence `finally`:
+      // the creation is logged on every exit, and the wake's own outcome is
+      // labelled rather than defaulting to "delivered" — `suppressed` for the 4xx
+      // fallback, `failed` for the 5xx that is about to propagate.
+      let recoveryWakeOutcome: "queued" | "suppressed" | "failed" = "queued";
+      try {
+        if (recoveryIssue.assigneeAgentId) {
+          recoveryWakeOutcome = await enqueueRecoveryWakeOrComment(recoveryIssue.assigneeAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "issue_monitor_recovery_issue",
+            idempotencyKey: `issue-monitor-recovery-issue:${input.claimed.id}:${input.clearReason}:${input.scheduledAtIso}`,
+            payload: withRecoveryModelProfileHint({ issueId: recoveryIssue.id, sourceIssueId: input.claimed.id }, "status_only"),
+            requestedByActorType: input.actorType,
+            requestedByActorId: input.actorId,
+            contextSnapshot: withRecoveryModelProfileHint({
+              issueId: recoveryIssue.id,
+              sourceIssueId: input.claimed.id,
+              source: "issue.monitor.recovery_issue",
+              wakeReason: "issue_monitor_recovery_issue",
+            }, "status_only"),
+          }, "The recovery-issue wake could not be delivered");
+        }
+      } catch (err) {
+        recoveryWakeOutcome = "failed";
+        throw err;
+      } finally {
+        await logActivity(db, {
+          companyId: input.claimed.companyId,
+          actorType: input.actorType,
+          actorId: input.actorId,
+          agentId: input.agentId,
+          runId: input.runId,
+          action: "issue.monitor_recovery_issue_created",
+          entityType: "issue",
+          entityId: input.claimed.id,
+          details: {
+            ...details,
+            recoveryIssueId: recoveryIssue.id,
+            recoveryIdentifier: recoveryIssue.identifier,
+            ...(recoveryWakeOutcome === "suppressed" ? { recoveryWakeSuppressed: true } : {}),
+            ...(recoveryWakeOutcome === "failed" ? { recoveryWakeFailed: true } : {}),
+          },
+        });
       }
-
-      await logActivity(db, {
-        companyId: input.claimed.companyId,
-        actorType: input.actorType,
-        actorId: input.actorId,
-        agentId: input.agentId,
-        runId: input.runId,
-        action: "issue.monitor_recovery_issue_created",
-        entityType: "issue",
-        entityId: input.claimed.id,
-        details: {
-          ...details,
-          recoveryIssueId: recoveryIssue.id,
-          recoveryIdentifier: recoveryIssue.identifier,
-          ...(recoveryWakeSuppressed ? { recoveryWakeSuppressed: true } : {}),
-        },
-      });
       return;
     }
 
@@ -14347,6 +14360,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // `durableSkipReason`. Reading the status instead would be wrong in both
     // directions: it cannot see the return-null gates at all, and it cannot tell
     // `budget.blocked`'s 409 from a 409 raised by anything else.
+    //
+    // One more return-null writer exists, and it is the only `durableSkipReason`
+    // set outside the funnel at `enqueueWakeup`'s single skip helper:
+    // `pipeline_stage_exit_cancellation_pending`. It fires only on
+    // `issue.status === "cancelled"`, which the tick's own claim filter excludes
+    // (`in_progress`/`in_review`), so reaching it needs a cancellation to commit
+    // in the window between the claim and the gate. It is deliberately NOT
+    // special-cased here: the deferral is still the least-wrong answer, since the
+    // alternative on this path is the triggered patch that asserts a wake nobody
+    // queued. Known consequence, tracked separately — the re-arm leaves a future
+    // `monitorNextCheckAt` on a cancelled row, no later tick can claim it back
+    // (same status filter), and nothing else nulls that column on cancellation,
+    // so `hasActiveMonitorPath` reads a wake path that will never dispatch.
     const monitorSuppression: WakeSuppressionOutcome = {
       durableSkipReason: null,
       providerCapacityDeferred: false,
