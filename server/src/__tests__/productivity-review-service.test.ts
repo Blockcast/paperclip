@@ -28,6 +28,7 @@ import {
 import { MAX_ISSUE_REQUEST_DEPTH } from "@paperclipai/shared";
 import {
   DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY,
+  DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_SIX_HOURS,
   DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS,
   DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
   DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS,
@@ -5533,6 +5534,48 @@ describeEmbeddedPostgres("productivity review service", () => {
           updatedAt: at,
         };
       }),
+    );
+
+    await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // The same gate at the 6h window. A routine firing every ~10 minutes clears
+  // 30/6h while never reaching 10/1h, so on this row class the 6h arm is the
+  // easier one to trip, and the fixture above (all receipts in the last hour)
+  // cannot see it. Kept separate so each fixture pins exactly one window.
+  it("does not raise high_churn on cross-scope receipts spread across six hours", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const otherIssueId = randomUUID();
+    const receiptRuns = await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: otherIssueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_SIX_HOURS,
+      now: new Date(now.getTime() - 60_000),
+    });
+    const receiptTimes = receiptRuns.map((_, index) => new Date(now.getTime() - (index + 1) * 11 * 60_000));
+    // Guards the fixture itself: enough for the 6h arm, too few for the 1h arm.
+    const hourAgo = now.getTime() - 60 * 60_000;
+    const sixHoursAgo = now.getTime() - 6 * 60 * 60_000;
+    expect(receiptTimes.filter((at) => at.getTime() > sixHoursAgo).length).toBeGreaterThanOrEqual(
+      DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_SIX_HOURS,
+    );
+    expect(receiptTimes.filter((at) => at.getTime() > hourAgo).length).toBeLessThan(
+      DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY,
+    );
+    await db.insert(issueComments).values(
+      receiptRuns.map((run, index) => ({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        authorAgentId: seeded.coderId,
+        createdByRunId: run!.id,
+        body: `Routine receipt ${index}.`,
+        createdAt: receiptTimes[index]!,
+        updatedAt: receiptTimes[index]!,
+      })),
     );
 
     await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: seeded.companyId });
