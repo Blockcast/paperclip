@@ -12,8 +12,13 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { classifyRemovalProof, executionWorkspaceCleanupService } from "../services/execution-workspace-cleanup.ts";
-import { inspectWorktreeReclaimSafety, reclaimFsOutstandingCount } from "../services/workspace-runtime.ts";
-import { lockGitWorktreeForOwner } from "../services/git-worktree-ownership.ts";
+import {
+  inspectWorktreeReclaimSafety,
+  RECLAIM_FS_OUTSTANDING_LIMIT,
+  reclaimFsOutstandingCount,
+  resolvePathForWorktreeComparison,
+} from "../services/workspace-runtime.ts";
+import { findGitWorktreeRegistration, lockGitWorktreeForOwner } from "../services/git-worktree-ownership.ts";
 
 /**
  * BLO-22984. A collector fails silently exactly like a detector: one that never
@@ -199,6 +204,63 @@ describe("inspectWorktreeReclaimSafety", () => {
       stat.mockRestore();
       vi.useRealTimers();
     }
+  });
+
+  it("abandons one thread for a wedged registry, not one per colocated registration", async () => {
+    // The registry walk is the other route past the entry gate, and it scales
+    // with the *population* rather than with the candidate count:
+    // `findGitWorktreeRegistration` normalizes every registration it lists, so
+    // on the 128-registration population this collector exists to drain, one
+    // candidate against a wedged mount would abandon 128 threads — a pool of 4.
+    // Driven through the real call site rather than by calling the normalizer
+    // twice, because it is the loop that does the damage.
+    //
+    // `realpath`, not `stat`: the walk and the inspector use different calls,
+    // which is why the existing wedge fixtures above do not cover this one.
+    vi.useFakeTimers();
+    const parent = path.join(os.tmpdir(), `paperclip-wedged-registry-${randomUUID()}`);
+    const registrations = ["wt-a", "wt-b", "wt-c"].map((name) => path.join(parent, name));
+    const unwedge: Array<() => void> = [];
+    // Resolves to the path it was asked about — realpath's no-symlink answer.
+    // Resolving to nothing instead would make the walk read it as a missing
+    // segment and climb to the parent, issuing a second never-settling call,
+    // so the hold would never release and the teardown below would not clear.
+    const realpath = vi.spyOn(fsp, "realpath").mockImplementation(
+      ((target: fs.PathLike) => new Promise((resolve) => {
+        unwedge.push(() => resolve(String(target) as never));
+      })) as typeof fsp.realpath,
+    );
+    try {
+      const pending = findGitWorktreeRegistration({
+        git: async () => registrations.map((worktree) => `worktree ${worktree}\nbranch refs/heads/${path.basename(worktree)}\n`).join("\n"),
+        repoRoot: parent,
+        worktreePath: registrations[0]!,
+        normalizePath: resolvePathForWorktreeComparison,
+      });
+      // Drain until quiet rather than once. With the pre-check only the first
+      // normalize ever arms a deadline, so every later pass is a no-op; without
+      // it each normalize arms its own *after* the previous one expired, and a
+      // single tick would leave this hanging on `pending`. Failing the mutation
+      // on the count below is a far better signal than failing it on a timeout,
+      // which is indistinguishable from an environmental stall.
+      for (let i = 0; i < registrations.length + 1; i += 1) {
+        await vi.runOnlyPendingTimersAsync();
+      }
+      const found = await pending;
+
+      // The whole point: N registrations, one held thread.
+      expect(reclaimFsOutstandingCount()).toBe(1);
+      expect(unwedge).toHaveLength(1);
+      // And the fallback still answers — both sides normalize lexically, so
+      // the match the walk would have made is still made.
+      expect(found?.worktree).toBe(registrations[0]);
+    } finally {
+      for (const release of unwedge) release();
+      await vi.advanceTimersByTimeAsync(0);
+      realpath.mockRestore();
+      vi.useRealTimers();
+    }
+    expect(reclaimFsOutstandingCount()).toBe(0);
   });
 });
 
@@ -545,6 +607,102 @@ describeEmbeddedPostgres("reconcileExecutionWorkspaceCleanup", () => {
     const [other] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, otherId));
     expect(other?.status).toBe("archived");
   });
+
+  it("ends the pass once abandoned calls reach the threadpool ceiling, even under unrelated roots", async () => {
+    // The entry gate bounds where a pass *starts*; this covers where it ends.
+    // The targeted break above only fires on the inspector-expiry path. When
+    // the *cleanup-side* stat expires instead — inspector already succeeded,
+    // mount wedged between the two reads — the candidate defers and continues,
+    // so outstanding grows with no break. Under one root the colocated
+    // pre-check would deflect the next candidate; each of these gets its own
+    // root so nothing deflects them and only the in-loop re-check can stop the
+    // pass. Sized off the limit rather than a literal, since it is derived
+    // from UV_THREADPOOL_SIZE.
+    const wedgedPaths: string[] = [];
+    const hours = (n: number) => new Date(Date.now() - n * 60 * 60 * 1000);
+    for (let i = 0; i < RECLAIM_FS_OUTSTANDING_LIMIT; i += 1) {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), `paperclip-ceiling-${i}-`));
+      tempRoots.add(root);
+      // Absent on disk, so the inspector reads ENOENT and returns safe; the
+      // only stat that can hang is the cleanup-side one.
+      const wtPath = path.join(root, `wt-ceiling-${i}`);
+      wedgedPaths.push(wtPath);
+      await insertWorkspace({
+        worktreePath: wtPath,
+        branchName: `wt-ceiling-${i}`,
+        cleanupEligibleAt: hours(10 - i),
+        lastUsedAt: hourAgo(),
+      });
+    }
+    // Youngest eligibility, so it sorts last and is the candidate the ceiling
+    // must leave unscanned. Absent on disk, so it would otherwise collect.
+    const trailingRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-ceiling-trailing-"));
+    tempRoots.add(trailingRoot);
+    const trailingPath = path.join(trailingRoot, "wt-trailing");
+    const trailingId = await insertWorkspace({
+      worktreePath: trailingPath,
+      branchName: "wt-trailing",
+      cleanupEligibleAt: hours(1),
+      lastUsedAt: hourAgo(),
+    });
+
+    const realStat = fsp.stat.bind(fsp);
+    const seen = new Map<string, number>();
+    const statted: string[] = [];
+    const unwedge: Array<() => void> = [];
+    // One signal per wedging candidate. The deadline's timer only exists once
+    // its stat has actually been called, and that call happens after a real
+    // inspect + git/ownership pass — so advancing fake time on a fixed loop
+    // races it and advances past nothing. Wait for each call, then advance.
+    const reached: Array<() => void> = [];
+    const statCalled = wedgedPaths.map(() => new Promise<void>((resolve) => { reached.push(resolve); }));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const stat = vi.spyOn(fsp, "stat").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+      const key = String(target);
+      statted.push(key);
+      const nth = (seen.get(key) ?? 0) + 1;
+      seen.set(key, nth);
+      // First stat per path is the inspector's (real ENOENT -> safe/missing);
+      // the second is the cleanup-side one, and that is the one that hangs.
+      const wedgedIndex = wedgedPaths.indexOf(key);
+      if (nth > 1 && wedgedIndex >= 0) {
+        reached[wedgedIndex]?.();
+        return new Promise((resolve) => { unwedge.push(() => resolve(undefined as never)); });
+      }
+      return (realStat as (...args: unknown[]) => Promise<fs.Stats>)(target, ...rest);
+    }) as typeof fsp.stat);
+    try {
+      const pending = cleanup.reconcileExecutionWorkspaceCleanup();
+      for (const called of statCalled) {
+        await called;
+        await vi.advanceTimersByTimeAsync(30_000);
+      }
+      const result = await pending;
+
+      expect(reclaimFsOutstandingCount()).toBe(RECLAIM_FS_OUTSTANDING_LIMIT);
+      // Scanned exactly the wedging candidates and stopped: the trailing one is
+      // never examined, so its eligibility is not pushed out either.
+      expect(result.scanned).toBe(RECLAIM_FS_OUTSTANDING_LIMIT);
+      expect(statted).not.toContain(trailingPath);
+      expect(result.collected).toBe(0);
+    } finally {
+      for (const release of unwedge) release();
+      await vi.advanceTimersByTimeAsync(0);
+      stat.mockRestore();
+      vi.useRealTimers();
+    }
+
+    const [trailing] = await db
+      .select()
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, trailingId));
+    expect(trailing?.status).toBe("active");
+    expect(trailing?.cleanupReason).toBeNull();
+    expect(trailing?.cleanupEligibleAt?.getTime() ?? Infinity).toBeLessThanOrEqual(Date.now());
+    // Each wedging candidate runs a full inspect + teardown against a real
+    // repo before its cleanup-side stat can expire, so this is slower than the
+    // inspector-expiry tests above; 60s is not enough headroom.
+  }, 180_000);
 
   it("does not touch a workspace that is not yet eligible", async () => {
     const { repo } = createRepoWithRemote();
