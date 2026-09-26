@@ -55,6 +55,169 @@ describe("isClaudeModelNotFoundError", () => {
   });
 });
 
+describe("isClaudeTransientUpstreamError — transcript independence (PEN-3223)", () => {
+  // Deliberately omits "Failed to authenticate": this adapter's
+  // CLAUDE_AUTH_REQUIRED_RE matches that phrase, so including it would make the
+  // login veto return false and the test would pass without exercising the
+  // haystack narrowing at all.
+  const entitlement403 = {
+    type: "result",
+    subtype: "success",
+    is_error: true,
+    api_error_status: 403,
+    result:
+      "API Error: 403 The connected subscription for org 'org_penstock' provider 'anthropic' " +
+      "is not entitled to serve this request; re-entitle the seat and retry",
+  };
+
+  const poisonedStdout = [
+    '{"type":"system","subtype":"init","session_id":"s1","model":"claude-opus-4-6"}',
+    '{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result",' +
+      '"content":"upstream returned 429 rate_limit_error; the pool was throttled and temporarily unavailable"}]}}',
+  ].join("\n");
+
+  it("does not classify a permanent 403 as transient when the transcript discusses rate limits", () => {
+    expect(
+      isClaudeTransientUpstreamError({ parsed: entitlement403, stdout: poisonedStdout }),
+    ).toBe(false);
+  });
+
+  it("classifies that 403 identically with and without the poisoned transcript", () => {
+    expect(isClaudeTransientUpstreamError({ parsed: entitlement403, stdout: poisonedStdout })).toBe(
+      isClaudeTransientUpstreamError({ parsed: entitlement403, stdout: "" }),
+    );
+  });
+
+  it("still classifies a genuine upstream throttle from the terminal result event", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: {
+          type: "result",
+          subtype: "success",
+          is_error: true,
+          api_error_status: 429,
+          result: "API Error: Request rejected (429) · All Claude subscription capacity is rate-limited",
+        },
+        stdout: '{"type":"system","subtype":"init","session_id":"s1"}',
+      }),
+    ).toBe(true);
+  });
+
+  it("reads api_error_status so the verdict does not rest solely on CLI prose", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: {
+          type: "result",
+          subtype: "success",
+          is_error: true,
+          api_error_status: 503,
+          result: "The request could not be completed.",
+        },
+      }),
+    ).toBe(true);
+  });
+
+  // `execute.ts`'s `!parsed` fallback calls this with `parsed: null`, `stdout` and
+  // `stderr` when the CLI died without emitting a result event. The narrowing must
+  // not reach that path: with no result event there are no bounded surfaces, and
+  // `parseFallbackErrorMessage` derives only from stderr, so a transient signal
+  // that reached stdout alone would otherwise be dropped and lose its retry family.
+  it("still classifies a transcript-only 429 when no result event ever arrived", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: null,
+        stdout: "API Error: 429 rate_limit_error — upstream is rate limited",
+        stderr: "",
+        errorMessage: "Claude exited with code 1",
+      }),
+    ).toBe(true);
+  });
+
+  it("still classifies a transcript-only 503 when no result event ever arrived", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: null,
+        stdout: "API Error: 503 upstream temporarily unavailable",
+        stderr: "",
+        errorMessage: "Claude exited with code 1",
+      }),
+    ).toBe(true);
+  });
+
+  it("does not invent a transient label when the no-result transcript is clean", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: null,
+        stdout: '{"type":"assistant","message":{"content":[{"type":"text","text":"done"}]}}',
+        stderr: "",
+        errorMessage: "Claude exited with code 1",
+      }),
+    ).toBe(false);
+  });
+
+  // `execute.ts` derives `parsed` as `parsedStream.resultJson ?? parseJson(stdout)`,
+  // so a run that emitted NO result event but whose stdout is a single parseable
+  // JSON object arrives here with `parsed` truthy. Gating the narrowing on
+  // truthiness rather than on the result-event shape dropped the transcript for
+  // that population: `result`, `errors[]` and `api_error_status` are all absent,
+  // `describeClaudeFailure` returns null, and the haystack collapses to
+  // `Claude exited with code N`. These pin the shape gate.
+  it("classifies a transcript-only 429 when parsed is a truthy NON-result object", () => {
+    const nonResult = { type: "error", error: { message: "API Error: 429 rate_limit_error" } };
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: nonResult,
+        stdout: JSON.stringify(nonResult),
+        stderr: "",
+        errorMessage: "Claude exited with code 1",
+      }),
+    ).toBe(true);
+  });
+
+  it("classifies a transcript-only 503 when parsed is a truthy NON-result object", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: { type: "system", subtype: "init", session_id: "s1" },
+        stdout: "API Error: 503 upstream temporarily unavailable",
+        stderr: "",
+        errorMessage: "Claude exited with code 1",
+      }),
+    ).toBe(true);
+  });
+
+  it("does not invent a transient label when a NON-result parsed has a clean transcript", () => {
+    const nonResult = { type: "error", error: { message: "workspace path not found" } };
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: nonResult,
+        stdout: JSON.stringify(nonResult),
+        stderr: "",
+        errorMessage: "Claude exited with code 1",
+      }),
+    ).toBe(false);
+  });
+
+  it("still narrows a genuine result event, so the 403 fix is not widened back open", () => {
+    // Same poisoned transcript as above, but `parsed` IS a result event: the
+    // transcript must stay out of the haystack.
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: {
+          type: "result",
+          subtype: "success",
+          is_error: true,
+          api_error_status: 403,
+          result:
+            "API Error: 403 The connected subscription for org 'org_penstock' provider " +
+            "'anthropic' is not entitled to serve this request; re-entitle the seat and retry",
+        },
+        stdout: "upstream returned 429 rate_limit_error; throttled and temporarily unavailable",
+        stderr: "",
+      }),
+    ).toBe(false);
+  });
+});
+
 describe("isClaudeTransientUpstreamError", () => {
   it("classifies the 'out of extra usage' subscription window failure as provider quota", () => {
     expect(

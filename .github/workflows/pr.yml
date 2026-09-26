@@ -1342,6 +1342,32 @@ jobs:
       # the diff by the `Require vendored-adapter source changes to be logged`
       # step in the `policy` job, which stores nothing and so cannot conflict.
 
+      # PEN-3223: the vendored version is recorded in two hand-maintained
+      # places — package.json `version` and PROVENANCE.md's Origin table
+      # `Current version` — and nothing else compares them. That pair drifted on
+      # PR#1862 and survived three heads. Since BLO-35109 withdrew the stored
+      # integrity hash, this step is the ONLY machine-checked link between
+      # PROVENANCE.md and the tree beside it; the `policy` job's provenance-log
+      # check asserts that vendored source carries a log row, not that the
+      # recorded version is true. The failure is quiet and lands later: the next
+      # vendored change reads the stale table field and bumps from there.
+      - name: Verify vendored version is recorded consistently
+        run: |
+          set -euo pipefail
+          pkg=$(node -p 'require("./package.json").version')
+          recorded=$(sed -n 's/^| Current version | `\([^`]*\)`.*/\1/p' PROVENANCE.md | head -1)
+          echo "package.json:   $pkg"
+          echo "PROVENANCE.md:  $recorded"
+          if [ -z "$recorded" ]; then
+            echo "::error::No 'Current version' row found in PROVENANCE.md's Origin table."
+            exit 1
+          fi
+          if [ "$pkg" != "$recorded" ]; then
+            echo "::error::PROVENANCE.md records version '$recorded' but package.json is '$pkg'."
+            echo "Update the 'Current version' row in vendor/paperclip-adapter-claude-k8s/PROVENANCE.md to: $pkg"
+            exit 1
+          fi
+
   verify:
     # Preserve the legacy required-check name while the underlying work runs in parallel.
     # Serialized server suites run inside the four general-server matrix jobs,
