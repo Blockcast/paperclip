@@ -543,6 +543,7 @@ describe("CompanyEnvironments — test provider button", () => {
     });
     await flushReact();
 
+    await waitForAssertion(() => expect(testProviderButtons(container)).toHaveLength(1));
     await act(async () => {
       testProviderButtons(container)[0].dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
@@ -582,6 +583,7 @@ describe("CompanyEnvironments — test provider button", () => {
     });
     await flushReact();
 
+    await waitForAssertion(() => expect(testProviderButtons(container)).toHaveLength(1));
     await act(async () => {
       testProviderButtons(container)[0].dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
