@@ -764,9 +764,15 @@ the run-transcript gate for the population this section protects:
 `workspace_runtime:read` is unmapped in `permissionForAction` and deliberately
 absent from the same-company agent allow-list (PEN-2852,
 `services/authorization.ts`), so **no agent actor resolves it** — the body is
-withheld from every agent, owner or not, and a grant row cannot satisfy it
-because the action is unmapped. Stacking the transcript gate on top would
-convert a withheld 200 into a 403 and change no bytes.
+withheld from every agent, owner or not. Reaching for a grant row is a dead end
+for two *independent* reasons: the action is unmapped, so the generic
+`permissionKey` fallback at the bottom of `decideBase` never fires for it — and
+`workspace_runtime:read` is not a `PermissionKey` at all, so there is no row to
+insert in the first place. The second reason is compiler-held (it is absent
+from `PERMISSION_KEYS`, `packages/shared/src/constants.ts`) and is therefore
+the one a future implementer cannot accidentally undo; widening the allow-list
+is the only lever that works. Stacking the transcript gate on top would convert
+a withheld 200 into a 403 and change no bytes.
 
 Two consequences follow, and neither is an oversight:
 
@@ -916,12 +922,13 @@ an `entity_type = workspace_operation` sweep scoped by `companyId` and time
 window (or by the specific `entity_id`s) to get the whole set.
 
 ⚠️ **`details.result` does not mean the same thing on all three rows, and
-filtering on it alone under-counts.** On the two run-transcript routes the audit
-result is the *entitlement* decision — an unentitled same-company caller books
-`result: "denied"` on both, whether the response is `/log`'s 403 or `/events`'
-200-with-withheld-content. On the workspace-operation `/log` route it is not:
-that caller clears both company checks and receives a 200 whose `content` is
-masked, and the row books `result: "allowed"` with **`details.withheld: true`**
+filtering on it alone under-counts.** On the two run-transcript routes an
+unentitled same-company caller books `result: "denied"`, whether the response is
+`/log`'s 403 or `/events`' 200-with-withheld-content. (That implication runs one
+way only on `/log` — see the classification note below.) On the
+workspace-operation `/log` route it is not: that caller clears both company
+checks and receives a 200 whose `content` is masked, and the row books
+`result: "allowed"` with **`details.withheld: true`**
 (BLO-34631 added that flag for exactly this reason — there, the access check
 decides reachability and the entitlement decides the bytes). `details.withheld`
 is present *only* on the workspace-operation rows. An incident query that
@@ -929,6 +936,23 @@ enumerates unentitled transcript access as `details.result = "denied"` therefore
 returns every run-route attempt and **zero** workspace-operation attempts. Read
 `result: "denied" OR details.withheld = true` across the three actions to get
 the whole set.
+
+⚠️ **`denied` also conflates two different failures — a separate axis from the
+under-count above, and one the recommended query does not fix.** That query
+still returns the whole set; this is conflation, not omission. But a responder
+*classifying* what it returns needs to know that `denied` is not one thing:
+
+| action | what `result: "denied"` covers |
+|---|---|
+| `heartbeat.run_events_accessed` | entitlement denial **only** — a cross-tenant caller exits through `getAccessibleResource` (`routes/authz.ts`), which 404s and writes no audit row at all |
+| `heartbeat.run_log_accessed` | entitlement denial **or** either company-boundary denial (the cross-tenant 404, the `assertCompanyAccess` failure) — all three book the identical row shape, and `logLogAccessAudit` writes no field that separates them |
+| `workspace_operation.log_accessed` | company-boundary denial **only** — an entitlement denial books `allowed` + `withheld: true` instead, per the block above |
+
+So counting "same-company unentitled reads" off `result: "denied"` silently
+folds in cross-tenant probes on `heartbeat_run` rows, and on
+`workspace_operation` rows counts *nothing but* cross-tenant probes. Isolating
+an entitlement failure specifically requires comparing the actor's company
+against the row's `companyId` rather than reading `result` alone.
 
 Retention follows the deployment's normal
 `activity_log` database retention and backup policy; Paperclip does not
