@@ -5583,6 +5583,73 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
 
+  // BLO-36717: the two fixtures above pin the *gate* — they prove a cross-scope
+  // receipt cannot raise `high_churn`. Neither reaches the rendered trigger
+  // string, because in both the gate correctly does not fire, so no string is
+  // produced at all. This one pins the *consumer*: `high_churn` fires, and the
+  // two counters hold different non-zero values, so the rendered line says
+  // which one it read. Without that divergence the assertion is vacuous — the
+  // pre-existing fixture behind the `runs/0` assertion seeds zero comments, so
+  // both counters read 0 and the widened counter renders identically.
+  it("renders the run-scoped churn count, not the widened one, in the high_churn trigger string", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    // Run-scoped: 10 runs woken for this issue, each leaving a comment here.
+    // Enough on its own to trip the hourly arm, so the gate fires on the
+    // run-scoped count and the mutation below cannot change *whether* a review
+    // is created — only what the trigger string says.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY,
+      now,
+      withRunComments: true,
+    });
+    // Cross-scope: 3 more comments on this issue authored by runs woken
+    // elsewhere. Invisible to the run-scoped counter, counted by the widened
+    // one — the only thing making the two numbers differ.
+    const receiptRuns = await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: randomUUID(),
+      count: 3,
+      now: new Date(now.getTime() - 30_000),
+    });
+    await db.insert(issueComments).values(
+      receiptRuns.map((run, index) => {
+        const at = new Date(now.getTime() - (index + 1) * 90_000);
+        return {
+          companyId: seeded.companyId,
+          issueId: seeded.issueId,
+          authorAgentId: seeded.coderId,
+          createdByRunId: run.id!,
+          body: `Cross-scope receipt ${index}.`,
+          createdAt: at,
+          updatedAt: at,
+        };
+      }),
+    );
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    const description = review?.description ?? "";
+    expect(description).toContain("Primary trigger: `high_churn`");
+    // The divergence, asserted in the same document: the widened evidence line
+    // reads 13 while the trigger string reads 10. If these two ever agree the
+    // fixture has gone vacuous and the mutation check proves nothing.
+    expect(description).toContain("Assignee run-linked comments total/window: 13 total, 13/1h, 13/6h");
+    expect(description).toContain(
+      "10 runs/10 assignee comments from runs woken for this issue in 1h; 10 runs/10 in 6h",
+    );
+    expect(description).not.toContain("10 runs/13 assignee comments from runs woken for this issue in 1h");
+  });
+
   it("recovers a Next line from an assignee comment instead of reporting 'none recorded'", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
