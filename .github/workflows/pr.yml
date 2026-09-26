@@ -1187,10 +1187,18 @@ jobs:
     # typecheck_release_registry above for the pool-occupancy model.
     #
     # 110 is a ceiling raise and not the durable fix for the server shards.
-    # BLO-28956 (the 2.0x serialized route/authz imbalance across those four
-    # shards) would LOWER their p100 instead of raising their ceiling. This row
-    # is deliberately NOT blocked on it: that row is unowned backlog, and these
-    # caps bite today. Bring 110 back down when it lands.
+    # BLO-28956 (the serialized route/authz imbalance across those four
+    # shards) is the fix that LOWERS their p100 instead of raising the
+    # ceiling, and it has now landed: phase 2 is partitioned by recorded
+    # duration like phase 1, and both phases write their own row to the job
+    # summary so a regression in either is legible without opening the log.
+    #
+    # These caps are deliberately UNCHANGED by that landing. The predicted
+    # balance is 1.00x on both lanes, but predicted is not measured -- the
+    # manifest models per-file test time, not the fixed import/setup cost or
+    # runner-to-runner speed, and a shard that is well-packed can still be
+    # slow. Lower these only against observed `Vitest phase durations` rows
+    # from three consecutive master-based runs, not against the prediction.
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       # BLO-33021: fail-fast is right for `pull_request` (one push, show the

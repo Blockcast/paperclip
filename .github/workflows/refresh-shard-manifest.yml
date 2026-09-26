@@ -56,7 +56,12 @@ jobs:
   measure:
     name: Measure shard ${{ matrix.shard_index }}
     runs-on: default
-    timeout-minutes: 90
+    # 120, not 90: BLO-28956 widened the measured set from the 536 general-server
+    # suites to all 666 server suites (the serialized route/authz lane now draws
+    # its partition from this manifest too). A measure shard's slowest observed
+    # general-only pass was already ~56 min, and the slice it measures is ~24%
+    # larger now. A timeout here loses the week's refresh silently.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
