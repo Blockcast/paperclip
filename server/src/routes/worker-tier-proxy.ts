@@ -183,15 +183,15 @@ async function fetchWithStartupRetry(
   targetUrl: string,
   init: RequestInit,
   retry: boolean,
-  retryBudgetMs?: number,
   // Logged in place of `targetUrl`, which carries the caller-supplied query
-  // string. Optional only so the signature stays back-compatible; it
-  // deliberately does NOT default to `targetUrl`, because that would make the
-  // leak silently reappear for any caller that forgot to pass it. An absent
-  // value logs a placeholder instead — a missing diagnostic, not a secret.
-  targetUrlForLog?: string,
+  // string. REQUIRED, and ordered ahead of the optional `retryBudgetMs` so it
+  // can be: the compiler is what stops a new caller from reintroducing the
+  // leak (PEN-2996), rather than a runtime placeholder nothing can test. It
+  // deliberately has no default — defaulting to `targetUrl` would make the
+  // leak silently reappear for any caller that forgot to pass it.
+  targetUrlForLog: string,
+  retryBudgetMs?: number,
 ): Promise<Response> {
-  const loggedTargetUrl = targetUrlForLog ?? "[OMITTED: unscrubbed target url]";
   let attempt = 0;
   let backoffMs = PROXY_GET_RETRY_INITIAL_MS;
   const startedAtMs = Date.now();
@@ -208,7 +208,7 @@ async function fetchWithStartupRetry(
       if (remainingBudgetMs <= 0) throw err;
       const nextRetryMs = Math.min(backoffMs, remainingBudgetMs);
       logger.warn(
-        { err, targetUrl: loggedTargetUrl, method: init.method, attempt, nextRetryMs },
+        { err, targetUrl: targetUrlForLog, method: init.method, attempt, nextRetryMs },
         "worker-tier proxy: worker tier fetch failed; retrying idempotent request",
       );
       await sleep(nextRetryMs, signal ?? new AbortController().signal);
@@ -318,7 +318,7 @@ function createWorkerProxyHandler(
         body: body as BodyInit | undefined,
         redirect: "manual",
         signal: controller.signal,
-      }, retryStartupRace, retryBudgetMs, targetUrlForLog);
+      }, retryStartupRace, targetUrlForLog, retryBudgetMs);
 
       if (upstream.status >= 500) {
         // The worker tier reached us but failed the operation. Forward it
