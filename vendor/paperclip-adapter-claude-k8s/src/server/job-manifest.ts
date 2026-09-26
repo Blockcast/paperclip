@@ -113,6 +113,76 @@ function assertNormalizedPath(field: string, value: string): void {
 }
 
 /**
+ * A linked git worktree (the `git_worktree` execution-workspace strategy) keeps
+ * its git state OUTSIDE its own tree: `.git` is a file naming
+ * `<common>/worktrees/<id>` (index, HEAD, reflogs), and `<common>` holds the refs
+ * and the object store every commit writes into. Covering `workspaceRoot` alone
+ * yields a run that can edit files but cannot `git add`/`commit`/`checkout`, all
+ * EROFS under the read-only data mount. Returns `<common>`, which covers both, or
+ * null when `workspaceRoot` is not a verifiable linked worktree.
+ *
+ * The pointer lives in the run's OWN writable tree, so it is agent-controlled:
+ * taken at face value, one run could aim it at a foreign company's repo and have
+ * the next run mount that repo rw. It is accepted only when git's own two-way
+ * registration holds, none of which a scoped run can forge outside its own
+ * trees: the target has the `<common>/worktrees/<id>` shape (so `<common>` comes
+ * from path arithmetic, never from the agent-writable `commondir` file), its
+ * `gitdir` file points back at this worktree's `.git`, and `<common>/HEAD`
+ * exists. The last rejects a registration forged inside the worktree itself,
+ * whose shape would otherwise name the worktree's parent dir as `<common>`.
+ *
+ * Read through `serverRoot`, where THIS process reaches the volume; see
+ * `buildPodLogPath` for why that differs from the pod's `dataMountPath`.
+ */
+export function resolveLinkedWorktreeCommonDir(
+  workspaceRoot: string,
+  dataMountPath: string,
+  serverRoot: string = SELF_POD_DATA_MOUNT_PATH,
+): string | null {
+  const prefix = dataMountPath.endsWith("/") ? dataMountPath : `${dataMountPath}/`;
+  // Off-volume paths are not the server's to read (e.g. the pod-local
+  // `/runtime-cache` emptyDir), and not ours to scope either.
+  const read = (podPath: string): string | null => {
+    if (!podPath.startsWith(prefix)) return null;
+    try {
+      return readFileSync(path.posix.join(serverRoot, podPath.slice(prefix.length)), "utf8").trim();
+    } catch {
+      return null;
+    }
+  };
+  const dotGit = path.posix.join(workspaceRoot, ".git");
+  // A missing `.git`, or a directory (EISDIR), is an ordinary checkout or no
+  // repo at all: its git state is already inside `workspaceRoot`.
+  const pointer = /^gitdir: (.+)$/.exec(read(dotGit) ?? "")?.[1];
+  if (!pointer) return null;
+  const gitDir = path.posix.resolve(workspaceRoot, pointer);
+  const common = path.posix.dirname(path.posix.dirname(gitDir));
+  const backPointer = read(path.posix.join(gitDir, "gitdir"));
+  const reason =
+    path.posix.basename(path.posix.dirname(gitDir)) !== "worktrees"
+      ? "gitdir_not_a_worktree_registration"
+      : backPointer === null || path.posix.resolve(gitDir, backPointer) !== dotGit
+        ? "gitdir_back_pointer_mismatch"
+        : read(path.posix.join(common, "HEAD")) === null
+          ? "common_dir_not_a_git_dir"
+          : null;
+  if (reason === null) return common;
+  // Named rather than silent: the run proceeds narrowed, and git then fails
+  // EROFS mid-run, which is unreadable without this.
+  console.warn(
+    JSON.stringify({
+      level: "warn",
+      event: "claude_k8s.worktree_gitdir_rejected",
+      msg: "linked worktree git dir not made writable; git writes in this run will fail read-only",
+      reason,
+      workspaceRoot,
+      gitDir,
+    }),
+  );
+  return null;
+}
+
+/**
  * Derives the set of trees an agent pod must be able to WRITE, so the rest of
  * the shared `data` PVC can be mounted read-only (BLO-32734).
  *
@@ -140,8 +210,10 @@ export function resolveScopedWritableMounts(input: {
   instructionsFilePath: string | null;
   addDir: string | null;
   companyId: string;
+  /** Where this process reaches the same volume; see `resolveLinkedWorktreeCommonDir`. */
+  serverDataMountPath?: string;
 }): ScopedWritableMount[] {
-  const { dataMountPath, isolation, podLogPath, instructionsFilePath, addDir, companyId } = input;
+  const { dataMountPath, isolation, podLogPath, instructionsFilePath, addDir, companyId, serverDataMountPath } = input;
   const prefix = dataMountPath.endsWith("/") ? dataMountPath : `${dataMountPath}/`;
 
   // Trees written at their own absolute location. A falsy entry means the field
@@ -152,6 +224,11 @@ export function resolveScopedWritableMounts(input: {
     ["isolation.homeRoot", isolation.homeRoot],
     ["isolation.sessionRoot", isolation.sessionRoot],
     ["isolation.workspaceRoot", isolation.workspaceRoot],
+    // A linked worktree's index, refs and objects live outside `workspaceRoot`.
+    [
+      "isolation.workspaceRoot git common dir",
+      resolveLinkedWorktreeCommonDir(isolation.workspaceRoot, dataMountPath, serverDataMountPath) ?? "",
+    ],
     ["isolation.cacheRoot", isolation.cacheRoot],
     ["isolation.tmpRoot", isolation.tmpRoot],
     ["isolation.promptCacheRoot", isolation.promptCacheRoot],
