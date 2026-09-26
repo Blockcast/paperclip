@@ -26,6 +26,7 @@ export const RETRY_NOW_OUTCOME_HEADLINE: Record<IssueRetryNowOutcome, string> = 
   already_promoted: "Retry already running",
   no_scheduled_retry: "No scheduled retry",
   gate_suppressed: "Couldn't retry now",
+  re_deferred: "Retry re-deferred",
 };
 
 export function useRetryNowMutation(
@@ -60,6 +61,12 @@ export function useRetryNowMutation(
           title: RETRY_NOW_OUTCOME_HEADLINE.gate_suppressed,
           body: response.message,
           tone: "error",
+        });
+      } else if (response.outcome === "re_deferred") {
+        pushToast({
+          title: RETRY_NOW_OUTCOME_HEADLINE.re_deferred,
+          body: response.message,
+          tone: "warn",
         });
       }
     },

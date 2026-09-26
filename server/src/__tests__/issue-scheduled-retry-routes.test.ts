@@ -22,6 +22,11 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { CCROTATE_CAPACITY_RETRY_REASON, heartbeatService } from "../services/heartbeat.js";
+import {
+  CAPACITY_ESCALATION_AFTER_MS,
+  CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY,
+} from "../services/ccrotate-capacity-retry.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -204,6 +209,173 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
 
     return { companyId, agentId, issueId, sourceRunId, retryRunId, scheduledRetryAt };
   }
+
+  // BLO-25944: a ccrotate_capacity park is written by persistProviderCapacityRetry
+  // when a wake is denied by the provider-capacity gate — it defers *before* any
+  // run object exists, so unlike a bounded run retry it never sets retryOfRunId.
+  // Seed it through the real writer (a wakeup() denied by an injected penstock
+  // gate) rather than hand-inserting a row, so the test pins the actual shape
+  // persistProviderCapacityRetry produces.
+  async function seedIssueWithCapacityPark() {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          wakeOnDemand: true,
+          maxConcurrentRuns: 1,
+        },
+      },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Capacity-parked issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+
+    const capacityDenied = heartbeatService(db, {
+      skipQueuedRunDispatch: true,
+      penstockAvailabilityGate: {
+        async checkAdapter() {
+          return {
+            allow: false as const,
+            provider: "anthropic" as const,
+            reason: "penstock.model_capacity_unavailable" as const,
+            model: "claude-opus-4-8",
+            resumeAt: null,
+            retryAfterSeconds: 60,
+          };
+        },
+        _resetForTesting() {},
+      },
+    });
+
+    const wakeResult = await capacityDenied.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+    });
+    expect(wakeResult).toBeNull();
+
+    const [parkedRun] = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId)));
+
+    return { companyId, agentId, issueId, parkedRun, capacityDenied };
+  }
+
+  it("promotes a ccrotate_capacity park that has no retryOfRunId (BLO-25944)", async () => {
+    const { companyId, issueId, parkedRun } = await seedIssueWithCapacityPark();
+
+    expect(parkedRun).toMatchObject({
+      status: "scheduled_retry",
+      scheduledRetryReason: CCROTATE_CAPACITY_RETRY_REASON,
+      retryOfRunId: null,
+    });
+
+    const res = await request(createApp(boardActor(companyId)))
+      .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.outcome).not.toBe("no_scheduled_retry");
+    expect(res.body).toMatchObject({
+      outcome: "promoted",
+      scheduledRetry: {
+        runId: parkedRun.id,
+        status: "queued",
+      },
+    });
+
+    const [promoted] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, parkedRun.id));
+    expect(promoted).toEqual({ status: "queued" });
+  });
+
+  // The route test above resolves the default heartbeat service, whose penstock
+  // gate allows, so it only reaches the pool-recovered branch. These drive
+  // retry-now through the denying service so the promotion-time re-check also
+  // denies: the branch an operator actually hits during a capacity incident.
+  it("re-defers a capacity park without spending an attempt when the pool is still down (BLO-25944)", async () => {
+    const { issueId, parkedRun, capacityDenied } = await seedIssueWithCapacityPark();
+    const attemptBefore = parkedRun.scheduledRetryAttempt ?? 0;
+    const before = Date.now();
+
+    const result = await capacityDenied.retryScheduledRetryNow({
+      issueId,
+      actor: { actorType: "user", actorId: "local-board" },
+    });
+
+    expect(result.outcome).toBe("re_deferred");
+    expect(result.scheduledRetry).toMatchObject({ runId: parkedRun.id, status: "scheduled_retry" });
+    const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, parkedRun.id));
+    expect(row.status).toBe("scheduled_retry");
+    expect(row.scheduledRetryAttempt ?? 0).toBe(attemptBefore);
+    expect(new Date(row.scheduledRetryAt!).getTime()).toBeGreaterThan(before);
+  });
+
+  it("does not cancel a capacity park past the escalation horizon; only the sweep does (BLO-25944)", async () => {
+    const { issueId, parkedRun, capacityDenied } = await seedIssueWithCapacityPark();
+    const chainOrigin = new Date(Date.now() - CAPACITY_ESCALATION_AFTER_MS - 60_000).toISOString();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        resultJson: {
+          ...((parkedRun.resultJson as Record<string, unknown> | null) ?? {}),
+          [CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY]: chainOrigin,
+        },
+      })
+      .where(eq(heartbeatRuns.id, parkedRun.id));
+
+    const result = await capacityDenied.retryScheduledRetryNow({
+      issueId,
+      actor: { actorType: "user", actorId: "local-board" },
+    });
+
+    expect(result.outcome).toBe("re_deferred");
+    const [afterPress] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, parkedRun.id));
+    // A capacity park carries errorCode rate_limit_exhausted from the moment it
+    // is written, so status and finishedAt are what distinguish a live park.
+    expect(afterPress.status).toBe("scheduled_retry");
+    expect(afterPress.finishedAt).toBeNull();
+
+    // Control: the same row, once due, is still terminated by the automatic
+    // sweep, so the guard is scoped to the operator press and nothing else.
+    await db
+      .update(heartbeatRuns)
+      .set({ scheduledRetryAt: new Date(Date.now() - 1_000) })
+      .where(eq(heartbeatRuns.id, parkedRun.id));
+    await capacityDenied.promoteDueScheduledRetries(new Date());
+    const [afterSweep] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, parkedRun.id));
+    expect(afterSweep.status).toBe("cancelled");
+    expect(afterSweep.error).toMatch(/provider capacity retry exhausted/);
+  });
 
   it("surfaces the current scheduled retry in the issue read model", async () => {
     const { companyId, issueId, agentId, sourceRunId, retryRunId, scheduledRetryAt } = await seedIssueWithRetry();
