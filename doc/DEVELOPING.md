@@ -1164,19 +1164,43 @@ the whole set.
 ⚠️ **`denied` also conflates two different failures — a separate axis from the
 under-count above, and one the recommended query does not fix.** That query
 still returns the whole set; this is conflation, not omission. But a responder
-*classifying* what it returns needs to know that `denied` is not one thing:
+*classifying* what it returns needs to know that `denied` is not one thing.
+
+One leg is easy to misread as a boundary denial and is not. The two `/log`
+routes wrap `assertCompanyAccess` in a `try`/`catch` that audits `denied`, but
+that call is reached only *after* `hasCompanyAccess` has already passed, so its
+cross-tenant throws (`routes/authz.ts`) re-test a predicate that just succeeded
+and cannot fire, and its remaining throws are gated on a non-safe method. On a
+GET the one leg still live is `RESPONSIBLE_USER_UNAVAILABLE` — an agent on an
+`onBehalfOfUserId` JWT whose responsible user has no active membership in the
+company. It is deliberately not safe-method-gated (unlike its
+`RESPONSIBLE_USER_UNAUTHORIZED` sibling) and throws unless the opt-in shadow
+mode is on (`services/authorization.ts`). That caller is **same-company**.
 
 | action | what `result: "denied"` covers |
 |---|---|
-| `heartbeat.run_events_accessed` | entitlement denial **only** — a cross-tenant caller exits through `getAccessibleResource` (`routes/authz.ts`), which 404s and writes no audit row at all |
-| `heartbeat.run_log_accessed` | entitlement denial **or** either company-boundary denial (the cross-tenant 404, the `assertCompanyAccess` failure) — all three book the identical row shape, and `logLogAccessAudit` writes no field that separates them |
-| `workspace_operation.log_accessed` | company-boundary denial **only** — an entitlement denial books `allowed` + `withheld: true` instead, per the block above |
+| `heartbeat.run_events_accessed` | entitlement denial **only** — but two denials book **no row at all**: both the cross-tenant caller and the same-company responsible-user-unavailable caller exit inside `getAccessibleResource` (`routes/authz.ts`), which 404s or throws upstream of this route's single audit call |
+| `heartbeat.run_log_accessed` | entitlement denial, **or** a cross-tenant 404, **or** a same-company responsible-user-unavailable denial — all three book the identical row shape |
+| `workspace_operation.log_accessed` | a cross-tenant 404 **or** a same-company responsible-user-unavailable denial — **never** an entitlement denial, which books `allowed` + `withheld: true` instead, per the block above |
 
-So counting "same-company unentitled reads" off `result: "denied"` silently
-folds in cross-tenant probes on `heartbeat_run` rows, and on
-`workspace_operation` rows counts *nothing but* cross-tenant probes. Isolating
-an entitlement failure specifically requires comparing the actor's company
-against the row's `companyId` rather than reading `result` alone.
+So counting "same-company unentitled reads" off `result: "denied"` folds in
+cross-tenant probes on both `heartbeat_run` and `workspace_operation` rows, and
+on `workspace_operation` rows finds no entitlement denial at all. Isolating one
+takes two filters, and neither is a plain predicate over `activity_log`:
+
+- **The row's `companyId` is the *entity's* company** (`run.companyId` /
+  `operation.companyId`) — the actor's own company is nowhere on the row, whose
+  actor fields are `actorType`, `actorId`, `agentId`, `details.actorSource` and
+  `details.actorRunId`. Splitting cross-tenant from same-company is therefore a
+  join — to `agents.company_id` for an agent actor, to company membership for a
+  user actor — not a comparison between two columns of the row.
+- **Within same-company, `details.actorSource` finishes the job on one action
+  and only narrows it on the other.** On `workspace_operation.log_accessed`
+  there is no entitlement leg, so every same-company `denied` is
+  responsible-user-unavailable. On `heartbeat.run_log_accessed` both are
+  reachable: a non-`agent_jwt` `actorSource` is necessarily the entitlement
+  denial, while an `agent_jwt` row stays ambiguous — that actor can fail either
+  way and no field on the row separates them.
 
 Retention follows the deployment's normal
 `activity_log` database retention and backup policy; Paperclip does not
