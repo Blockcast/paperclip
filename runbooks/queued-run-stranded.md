@@ -459,7 +459,7 @@ curve is smooth and knee-free (2,730 agent-min >300s → 1,565 >900s → 963
 |---|---|---|
 | duration | seconds → ~10 min | hours |
 | agents | one at a time | **≥3 simultaneously, in lockstep** |
-| frequency | continuous, all 21 agents | ~1 episode/week |
+| frequency | continuous, nearly every agent | ~1 episode/week |
 | pages? | **no, by design** | yes |
 
 **Simultaneity is the discriminator**, which is why the expression counts
@@ -474,6 +474,24 @@ out-of-band Slack path precisely *because* the suspected fault is in
 paperclip's own dispatcher — routing it `warning` would put the page behind
 the component it is reporting on. **The action is diagnostic capture, not a
 restart** (Step 4).
+
+⚠️ **The coverage this retune GIVES UP: a solo indefinite hold now pages on
+nothing.** Stated here because it is the one cost of the change that is not
+self-evident from the expression. After #3985 lands, the three alerts that
+could catch a single agent whose lock is held for the life of the process all
+decline to: this one needs **≥3** agents, `PaperclipQueuedRunStrandedFleet`
+needs **≥5**, and the per-agent `PaperclipQueuedRunStranded` it superseded is
+gone. So "the fleet alert already covers user-visible impact" is true only in
+the fleet regime.
+
+That is a deliberate trade, not an oversight, and the evidence supports it:
+solo holds are measured to **cycle** (175 resets/6h — acquired and released
+about every 2 minutes), and the founding 2026-09-15/16 incident was five
+agents, so the retuned expression would have caught it. The residual is the
+case never yet observed — one agent, monotonic, indefinite. **If you are
+triaging a single stuck agent, no page will have brought you here**; reach for
+`max by (agent_id) (paperclip_agent_start_lock_held_seconds)` directly, and
+read the `resets()` caveat in Step 4 before concluding it is stuck.
 
 **What holds the locks for 2h14m is still UNKNOWN.** This retune makes the
 alert describe reality; it does not explain the stall. Recorded lead, untested
