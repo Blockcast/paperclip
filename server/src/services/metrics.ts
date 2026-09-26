@@ -58,6 +58,60 @@ export const BACKSTOP_SOURCES = [
   "issue_graph_liveness.backstop",
   "stranded_recovery_wake_backstop",
 ] as const;
+
+/**
+ * Isolation-workspace reaper sweep metrics (BLO-36814).
+ *
+ * The reaper (BLO-31222) performs a daily **irreversible** delete pass over
+ * `data/k8s-isolation/workspaces/` and until now emitted a pino log line and
+ * nothing else. A reaper that stopped ticking looked identical on every
+ * dashboard to one that ticks and finds nothing — which is literally half of
+ * how BLO-36735 found that it had never been switched on at all.
+ *
+ * **Series presence is itself the liveness signal, so nothing here is
+ * pre-seeded at zero in `ensureRegistry()`.** Seeding would make "deployed but
+ * never ran" indistinguishable from "ran and found nothing" on every counter —
+ * reintroducing the exact blind spot this exists to remove. Instead
+ * `recordIsolationWorkspaceReapSweep` materializes every child, including the
+ * zero-valued ones, at the end of each sweep: after one tick the series exist
+ * with honest values, and before the first tick they do not exist at all.
+ *
+ * `scanned` and `deleted` are first-class names rather than `outcome` labels
+ * because they are the denominator and the headline of a destructive pass.
+ * `skipped_layout` and `retained_resurrected` are first-class for a different
+ * reason: non-zero on either is a *finding*, not routine, and folding them
+ * into a generic outcome label makes them vanish under any `sum by ()` an
+ * operator writes without thinking about it.
+ */
+export const ISOLATION_WORKSPACE_REAPER_SCANNED_METRIC = "isolation_workspace_reaper_scanned_total";
+export const ISOLATION_WORKSPACE_REAPER_DELETED_METRIC = "isolation_workspace_reaper_deleted_total";
+export const ISOLATION_WORKSPACE_REAPER_SKIPPED_LAYOUT_METRIC =
+  "isolation_workspace_reaper_skipped_layout_total";
+export const ISOLATION_WORKSPACE_REAPER_RETAINED_RESURRECTED_METRIC =
+  "isolation_workspace_reaper_retained_resurrected_total";
+export const ISOLATION_WORKSPACE_REAPER_ENTRIES_METRIC =
+  "isolation_workspace_reaper_entries_total";
+export const ISOLATION_WORKSPACE_REAPER_SWEEPS_METRIC = "isolation_workspace_reaper_sweeps_total";
+export const ISOLATION_WORKSPACE_REAPER_LAST_SWEEP_METRIC =
+  "isolation_workspace_reaper_last_sweep_timestamp_seconds";
+/** Routine per-entry outcomes. The two *findings* fields are NOT in here. */
+export const ISOLATION_WORKSPACE_REAPER_ENTRY_OUTCOMES = [
+  "eligible",
+  "retained_in_use",
+  "retained_fresh",
+  "vanished",
+  "failed",
+] as const;
+/**
+ * How the pass ended. `capped` and `lookup_faulted` both stop with work
+ * remaining, but only the second means the remaining directories were never
+ * assessed at all — see `IsolationWorkspaceReapResult.lookupFaulted`.
+ */
+export const ISOLATION_WORKSPACE_REAPER_STOP_REASONS = [
+  "complete",
+  "capped",
+  "lookup_faulted",
+] as const;
 export type BackstopSource = (typeof BACKSTOP_SOURCES)[number];
 export const BACKSTOP_SKIP_REASONS = [
   "not_ready", "existing_wake", "live_path", "pause_hold", "interaction",
@@ -2403,6 +2457,13 @@ let pluginWebhookDeliveryRejected:
   | null = null;
 let recoveryHorizonExpired: Counter<"delivery"> | null = null;
 let workerTierProxyFailures: Counter<"reason"> | null = null;
+let isolationReaperScanned: Counter<"dry_run"> | null = null;
+let isolationReaperDeleted: Counter<"dry_run"> | null = null;
+let isolationReaperSkippedLayout: Counter<"dry_run"> | null = null;
+let isolationReaperRetainedResurrected: Counter<"dry_run"> | null = null;
+let isolationReaperEntries: Counter<"dry_run" | "outcome"> | null = null;
+let isolationReaperSweeps: Counter<"dry_run" | "stop_reason"> | null = null;
+let isolationReaperLastSweep: Gauge<"dry_run"> | null = null;
 
 function ensureRegistry(): {
   registry: Registry;
@@ -2472,6 +2533,13 @@ function ensureRegistry(): {
   pluginWebhookDeliveryRejectedCounter: Counter<"plugin_key" | "response_class" | "plugin_status">;
   recoveryHorizonExpiredCounter: Counter<"delivery">;
   workerTierProxyFailuresCounter: Counter<"reason">;
+  isolationReaperScannedCounter: Counter<"dry_run">;
+  isolationReaperDeletedCounter: Counter<"dry_run">;
+  isolationReaperSkippedLayoutCounter: Counter<"dry_run">;
+  isolationReaperRetainedResurrectedCounter: Counter<"dry_run">;
+  isolationReaperEntriesCounter: Counter<"dry_run" | "outcome">;
+  isolationReaperSweepsCounter: Counter<"dry_run" | "stop_reason">;
+  isolationReaperLastSweepGauge: Gauge<"dry_run">;
 } {
   if (
     !registry
@@ -2539,6 +2607,13 @@ function ensureRegistry(): {
     || !pluginWebhookDeliveryRejected
     || !recoveryHorizonExpired
     || !workerTierProxyFailures
+    || !isolationReaperScanned
+    || !isolationReaperDeleted
+    || !isolationReaperSkippedLayout
+    || !isolationReaperRetainedResurrected
+    || !isolationReaperEntries
+    || !isolationReaperSweeps
+    || !isolationReaperLastSweep
   ) {
     registry = new Registry();
     concurrentRunBlocked = new Counter({
@@ -3382,6 +3457,84 @@ function ensureRegistry(): {
     for (const source of BACKSTOP_SOURCES) {
       backstopDeferredCandidates.set({ source }, 0);
     }
+    isolationReaperScanned = new Counter({
+      name: ISOLATION_WORKSPACE_REAPER_SCANNED_METRIC,
+      help:
+        "Directories the isolation-workspace reaper examined, summed over sweeps "
+        + "(BLO-36814). The denominator for every other reaper series. Absent "
+        + "means the reaper has not completed a sweep in this process — NOT that "
+        + "it swept and found nothing; these series are deliberately not "
+        + "pre-seeded so those two states stay distinguishable.",
+      labelNames: ["dry_run"],
+      registers: [registry],
+    });
+    isolationReaperDeleted = new Counter({
+      name: ISOLATION_WORKSPACE_REAPER_DELETED_METRIC,
+      help:
+        "Workspace directories irreversibly removed by the isolation-workspace "
+        + "reaper (BLO-36814). Counts real unlinks only, so it is always 0 under "
+        + "dry_run=\"true\" and can never overstate reclaimed space. The "
+        + "would-have-removed count of a dry run is "
+        + ISOLATION_WORKSPACE_REAPER_ENTRIES_METRIC + "{outcome=\"eligible\"} — read "
+        + "its dry_run label before treating that as a deletion.",
+      labelNames: ["dry_run"],
+      registers: [registry],
+    });
+    isolationReaperSkippedLayout = new Counter({
+      name: ISOLATION_WORKSPACE_REAPER_SKIPPED_LAYOUT_METRIC,
+      help:
+        "Directories skipped UNEXAMINED because their top level did not match the "
+        + "{home, session} allowlist (BLO-36814). Its own series, not an outcome "
+        + "label: a rise above baseline means the tree is more heterogeneous than "
+        + "the allowlist was validated against. BLO-36735 measured that baseline "
+        + "as 1 at maxAgeDays=30 (a stray wt-blo-19094 git worktree).",
+      labelNames: ["dry_run"],
+      registers: [registry],
+    });
+    isolationReaperRetainedResurrected = new Counter({
+      name: ISOLATION_WORKSPACE_REAPER_RETAINED_RESURRECTED_METRIC,
+      help:
+        "Workspaces idle at the sweep's opening snapshot but used again before "
+        + "this pass reached its unlink — i.e. that came within one query of "
+        + "being deleted underneath a live run (BLO-36814). Its own series, not "
+        + "an outcome label: any non-zero value is a finding, and this counter's "
+        + "frequency is the only evidence that can confirm or retire the exposure "
+        + "window the pre-unlink re-read exists to close.",
+      labelNames: ["dry_run"],
+      registers: [registry],
+    });
+    isolationReaperEntries = new Counter({
+      name: ISOLATION_WORKSPACE_REAPER_ENTRIES_METRIC,
+      help:
+        "Routine per-entry isolation-workspace reaper outcomes, labeled by bounded "
+        + "outcome (eligible, retained_in_use, retained_fresh, vanished, failed). "
+        + "The two findings outcomes — skipped_layout and retained_resurrected — "
+        + "are deliberately NOT in this counter; they have their own series so no "
+        + "sum-by aggregates them away.",
+      labelNames: ["dry_run", "outcome"],
+      registers: [registry],
+    });
+    isolationReaperSweeps = new Counter({
+      name: ISOLATION_WORKSPACE_REAPER_SWEEPS_METRIC,
+      help:
+        "Completed isolation-workspace reaper sweeps, labeled by how the pass "
+        + "ended (BLO-36814). capped = maxDeletesPerTick stopped it with work "
+        + "remaining; lookup_faulted = the pre-unlink re-read faulted, so the "
+        + "remaining directories were never assessed at all.",
+      labelNames: ["dry_run", "stop_reason"],
+      registers: [registry],
+    });
+    isolationReaperLastSweep = new Gauge({
+      name: ISOLATION_WORKSPACE_REAPER_LAST_SWEEP_METRIC,
+      help:
+        "Unix timestamp of the last completed isolation-workspace reaper sweep "
+        + "(BLO-36814). This is the liveness signal: `time() - max(...)` exceeding "
+        + "2x the configured interval means a daily irreversible-delete sweep has "
+        + "silently stopped ticking, which no counter can express on its own "
+        + "because a healthy idle sweep and a dead one both add zero.",
+      labelNames: ["dry_run"],
+      registers: [registry],
+    });
     pluginWebhookDeliveryRejected = new Counter({
       name: PLUGIN_WEBHOOK_DELIVERY_REJECTED_METRIC,
       help:
@@ -3508,6 +3661,13 @@ function ensureRegistry(): {
     pluginWebhookDeliveryRejectedCounter: pluginWebhookDeliveryRejected,
     recoveryHorizonExpiredCounter: recoveryHorizonExpired,
     workerTierProxyFailuresCounter: workerTierProxyFailures,
+    isolationReaperScannedCounter: isolationReaperScanned,
+    isolationReaperDeletedCounter: isolationReaperDeleted,
+    isolationReaperSkippedLayoutCounter: isolationReaperSkippedLayout,
+    isolationReaperRetainedResurrectedCounter: isolationReaperRetainedResurrected,
+    isolationReaperEntriesCounter: isolationReaperEntries,
+    isolationReaperSweepsCounter: isolationReaperSweeps,
+    isolationReaperLastSweepGauge: isolationReaperLastSweep,
   };
 }
 
@@ -4882,6 +5042,72 @@ export function recordBackstopSweepCompleted(source: BackstopSource): void {
 
 export function recordBackstopCandidateSkipped(source: BackstopSource, reason: BackstopSkipReason): void {
   ensureRegistry().backstopCandidatesSkippedCounter.inc({ source, reason });
+}
+
+/**
+ * Record one completed isolation-workspace reaper sweep (BLO-36814).
+ *
+ * Every child is materialized on every sweep, **including the zero-valued
+ * ones**. That is the point rather than an inefficiency: a tick that deletes
+ * nothing must still produce a readable `deleted_total{dry_run="false"} 0`, so
+ * "swept and found nothing" is distinguishable from "never swept" — the latter
+ * being the absence of the series entirely. A helper that only incremented
+ * non-zero fields would make the healthy-idle case look exactly like the dead
+ * case, which is the failure this whole module exists to remove.
+ *
+ * Called on the completion path of a sweep that has already done its
+ * irreversible work, so it must not throw: a metrics fault has no business
+ * turning a successful delete pass into an error the scheduler logs as a
+ * failed sweep.
+ */
+export function recordIsolationWorkspaceReapSweep(
+  result: {
+    scanned: number;
+    eligible: number;
+    deleted: number;
+    skippedLayout: number;
+    retainedInUse: number;
+    retainedResurrected: number;
+    retainedFresh: number;
+    vanished: number;
+    failed: number;
+    capped: boolean;
+    lookupFaulted: boolean;
+  },
+  options: { dryRun: boolean; now?: () => number },
+): void {
+  try {
+    const m = ensureRegistry();
+    const dry_run = options.dryRun ? "true" : "false";
+    m.isolationReaperScannedCounter.inc({ dry_run }, result.scanned);
+    m.isolationReaperDeletedCounter.inc({ dry_run }, result.deleted);
+    m.isolationReaperSkippedLayoutCounter.inc({ dry_run }, result.skippedLayout);
+    m.isolationReaperRetainedResurrectedCounter.inc({ dry_run }, result.retainedResurrected);
+
+    const byOutcome: Record<(typeof ISOLATION_WORKSPACE_REAPER_ENTRY_OUTCOMES)[number], number> = {
+      eligible: result.eligible,
+      retained_in_use: result.retainedInUse,
+      retained_fresh: result.retainedFresh,
+      vanished: result.vanished,
+      failed: result.failed,
+    };
+    for (const outcome of ISOLATION_WORKSPACE_REAPER_ENTRY_OUTCOMES) {
+      m.isolationReaperEntriesCounter.inc({ dry_run, outcome }, byOutcome[outcome]);
+    }
+
+    // `lookupFaulted` wins when both are set: it is the stronger statement —
+    // capped means a budget stopped an assessed pass, faulted means the
+    // remainder was never assessed. Every stop_reason child is materialized so
+    // a dashboard can read 0 capped sweeps rather than no data.
+    const stopReason = result.lookupFaulted ? "lookup_faulted" : result.capped ? "capped" : "complete";
+    for (const reason of ISOLATION_WORKSPACE_REAPER_STOP_REASONS) {
+      m.isolationReaperSweepsCounter.inc({ dry_run, stop_reason: reason }, reason === stopReason ? 1 : 0);
+    }
+
+    m.isolationReaperLastSweepGauge.set({ dry_run }, Math.floor((options.now ?? Date.now)() / 1000));
+  } catch (error) {
+    logger.error({ err: error }, "failed to record isolation-workspace reaper sweep metrics");
+  }
 }
 
 /**
