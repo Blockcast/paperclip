@@ -498,6 +498,359 @@ the ratified priority-weighted human-gated ageing rule
 therefore left untouched, verified this run: `human_gate_aged` occurs **0** times in its
 description and it remains at **revision 50**. Nothing needed reverting.
 
+### The replacement C2 — `Land clean-reviewed PRs` (created 2026-09-20 by Ally)
+
+Re-scoped C2 is a *new* routine that runs the C1 classifier, not an edit to an existing one.
+Created by Ally, because both remaining calls are self-service-only: `POST /companies/:id/routines`
+rejects any `assigneeAgentId` that is not the caller
+(`server/src/routes/routines.ts:100-106`, CTO measured `403`), and the fire path likewise refuses a
+foreign agent id. No board card was filed — per the 2026-09-12 CEO ruling
+([BLO-33624](https://paperclip.blockcast.net/BLO/issues/BLO-33624)) this is a capability question,
+not an approval one. **Neither call hit a third guard**; both succeeded first attempt.
+
+| field | value |
+| --- | --- |
+| routine id | `022cdf7f-e719-4992-b9c6-5bb36801995c` |
+| title | `Land clean-reviewed PRs` |
+| assignee | Ally `e0a5011d-5c94-4801-be52-64c14f98ac26` |
+| status / priority | `active` / `high` |
+| concurrencyPolicy | `skip_if_active` |
+| catchUpPolicy | `skip_missed` (server default) |
+| revision | 2 (rev 1 = create, rev 2 = "Created schedule trigger") |
+| trigger id | `50cb6f35-fd8c-46ad-aa24-6b6a4bf13e36` |
+| trigger | `schedule`, `45 */6 * * *`, `America/Los_Angeles`, `enabled: true` |
+| first `nextRunAt` | `2026-09-20T13:45:00.000Z` |
+| audit issue | [BLO-34818](https://paperclip.blockcast.net/BLO/issues/BLO-34818) `ad731b30-0579-4f2c-b5de-2190967bec50` |
+
+**Description fidelity — verified mechanically, not by eye.** The live `description` was diffed
+against the CTO's verbatim block extracted programmatically from comment `db9e6844-…` on
+[BLO-32511](https://paperclip.blockcast.net/BLO/issues/BLO-32511) (`awk` between the code fences, no
+retyping). Both sides are **2284 bytes** and `diff` is empty — byte-for-byte identical, em-dash and
+7-space code indents included. Re-run the check any time with:
+
+    curl -sS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+      "$PAPERCLIP_API_URL/api/routines/022cdf7f-e719-4992-b9c6-5bb36801995c" | jq -r .description
+
+#### Correction to the plan's step 4: `heartbeat/invoke` does not fire a routine
+
+This is a fourth drift, on top of the CTO's three. The plan and the handoff both say to fire by hand
+with `POST /api/agents/<ally>/heartbeat/invoke`. That call wakes the **agent**; it does not fire the
+**routine**, so on its own it mints no execution issue and can produce no receipt. The manual-fire
+path is a separate endpoint (`skills/paperclip/references/routines.md`, "Manual Run"):
+
+    POST /api/routines/{routineId}/run
+    { "source": "manual", "triggerId": "…", "idempotencyKey": "…" }
+
+Fire 1 used it, with `idempotencyKey: blo-32511-fire-1` so a retry cannot double-fire.
+
+#### Fire 1 — 2026-09-20T10:43:04.948Z (manual)
+
+| field | value |
+| --- | --- |
+| routine run id | `28859a4f-06e5-407f-af86-a79dcd464f76` |
+| source / trigger | `manual`, attributed to trigger `50cb6f35-…` |
+| status | `issue_created` |
+| execution issue | [BLO-34858](https://paperclip.blockcast.net/BLO/issues/BLO-34858) `dc3d926b-672a-4756-92aa-402613736356` |
+
+**The fire-1 dispatch lag cleared on its own, and it was 2h18m — not the ~12 or ~18 minutes
+recorded earlier.** Both smaller figures are wrong and are corrected here; the second dropped the
+hours component. Measured from the API timestamps:
+
+| event | timestamp | elapsed |
+| --- | --- | --- |
+| fire minted BLO-34858 (`todo`, `high`, Ally, `activeRun: null`) | `2026-09-20T10:43:04.948Z` | — |
+| run `230a8b6d-3736-4cfb-a661-2ab392371513` picked it up | `2026-09-20T13:01:18.951Z` | **+2h18m14s** |
+| receipt 1 posted | `2026-09-20T13:10:13.997Z` | +8m55s |
+
+The creating run still held its own checkout across that window, which is the most likely reason
+the wake found nothing free to take. No intervention was needed. The figure matters because a
+2h18m dispatch lag against a 6h cron period is a third of the window — worth watching, where an
+18-minute lag would not be.
+
+**The workspace-binding risk flagged above did not materialise.** Neither receipt contains an
+`aborted:script-missing` row; both are full classifications, so the execution runs did find
+`scripts/land-clean-prs.mjs`. The routine still carries no `projectId` or workspace binding, so the
+risk remains live for future fires — it was simply not the thing that broke. What did break is
+recorded under fire 3 below, and it is unrelated.
+
+#### Receipt 1 — 2026-09-20T13:10:13.997Z, from fire 1
+
+Comment [`e5b20c74`](https://paperclip.blockcast.net/BLO/issues/BLO-34818#comment-e5b20c74-7476-434b-b470-745fb2808ebe)
+on BLO-34818, posted by run `230a8b6d`. First line is exactly `<!-- landing-routine-receipt -->`.
+
+| tally | count |
+| --- | --- |
+| `already-enqueued` | 1 (#1954) |
+| `codeowner-review-requested` | 13 |
+| `skip` | 107 |
+| `stale-enqueue` | 2 (#1444 at 753.8h, #1271 at 849.0h) |
+| **`enqueue`** | **0** |
+| rows total | 123 |
+
+Confirmations section reads `first fire — no previous receipt`, which is the value step 3 of the
+routine description specifies for a first fire.
+
+#### Fire 2 — 2026-09-20T19:45:00Z (schedule) → receipt 2 at 20:50:12.506Z
+
+| field | value |
+| --- | --- |
+| routine run id | `e7e5ce9e-9640-4d0c-b661-ab771e747df9` |
+| source | `schedule`, trigger `50cb6f35-…` |
+| status | `issue_created` |
+| execution issue | [BLO-34946](https://paperclip.blockcast.net/BLO/issues/BLO-34946) `34cf59eb-3a43-44bd-b17b-13230fbe84eb` |
+| receipt | [`31344cc1`](https://paperclip.blockcast.net/BLO/issues/BLO-34818#comment-31344cc1-387f-4059-8462-d44c32400443), run `fc878f8c` |
+
+| tally | count |
+| --- | --- |
+| `already-enqueued` | 1 (#1954) |
+| `codeowner-review-requested` | 20 |
+| `skip` | 106 |
+| `stale-enqueue` | 0 |
+| **`enqueue`** | **0** |
+| rows total | 127 |
+
+Confirmations section reads `none` — the correct output when the previous receipt had no `enqueue`
+rows. Receipt 1's two `stale-enqueue` rows do not appear in that category in receipt 2: **#1444 and
+#1271 both reclassified to `skip` · `checks:FAILURE`**. Stated as observed; no mechanism is claimed
+here, and in particular this is *not* evidence that the classifier suppresses a stale enqueue it has
+already flagged.
+
+#### ACs 3 and 4 are satisfied vacuously, and that is worth stating plainly
+
+> **SUPERSEDED 2026-09-25 — this subsection was accurate through fire 3 and is now false.**
+> Fires 6 and 8 produced genuine `enqueue` rows, the confirmation loop resolved them, and one of
+> them (#1990) has since merged. Read it as a point-in-time record, then see
+> *[Fires 4–10 — ACs 3 and 4 exercised for real](#fires-410--acs-3-and-4-exercised-for-real)* below.
+
+The acceptance criteria expect receipt 1 to carry `enqueue` rows whose `autoMergeRequest` is set on
+GitHub, and receipt 2 to resolve each of them to `confirmed-merged` or `still-queued`. **Neither
+fire produced a single `enqueue` row**, so there was nothing to arm and nothing to confirm. Both
+criteria hold, but neither was exercised. No `gh pr view <n> --json state,mergedAt` verification was
+run, because there are zero `confirmed-merged` rows to verify.
+
+The reason is not a routine defect — it is the state of the fleet's open PRs. Across 127 rows the
+classifier found that essentially every candidate fails a real gate before landing is even
+considered: `checks:FAILURE`/`QUEUED`/`IN_PROGRESS` dominates, `owner-approval-pending` accounts for
+20, and the rest are `human-author`, `review:missing`, `review:blocking`, `review:stale-head` or
+`mergestate:DIRTY`. The routine is correctly declining to merge PRs that are not clean. **The first
+genuine end-to-end exercise of ACs 3 and 4 will be the first fire that meets a PR with green checks
+and an owner approval at head**, and that has not happened yet in three fires.
+
+#### Fires coalesce: two of the four slots minted no issue, by design
+
+`concurrencyPolicy: skip_if_active` does not merely drop a fire — it records it as `skipped` with a
+`coalescedIntoRunId` pointing at the run that was still live. Two of four fires took that path:
+
+| triggered | run | status | outcome |
+| --- | --- | --- | --- |
+| 2026-09-20T10:43:04Z | `28859a4f` | `completed` | manual; minted BLO-34858 → receipt 1 |
+| 2026-09-20T13:45:00Z | `af449f27` | `skipped` | coalesced into `28859a4f` (BLO-34858 still live); no separate receipt |
+| 2026-09-20T19:45:00Z | `e7e5ce9e` | `issue_created` | minted BLO-34946 → receipt 2 |
+| 2026-09-21T01:45:00Z | `73032a7a` | `skipped` | coalesced into `e7e5ce9e` (BLO-34946 still live) → receipt 3, late, via BLO-34946's recovery run |
+
+So **four cron slots produced three receipts, and that is correct behaviour, not a missing
+receipt.** A coalesced fire is explicitly not a separate fire; the "one receipt per fire" criterion
+must be read against runs that reached `issue_created`/`completed`, not against cron slots. Anyone
+auditing this routine by counting cron slots against receipts will report a false defect.
+
+Note the two coalesced slots resolved *differently*, which is the subtle part: 13:45Z produced no
+receipt of its own, while 01:45Z did — because its target issue BLO-34946 was still open and got
+re-woken, whereas BLO-34858 had already closed. **Coalescing therefore does not reliably drop a
+slot; whether a receipt appears depends on the target issue's lifecycle at wake time.** Do not infer
+a fixed receipts-per-slot ratio from either case.
+
+#### Fire 3 — the 01:45Z slot failed on infrastructure, then recovered unaided
+
+BLO-34946 was re-woken for the coalesced 01:45Z slot, and that run
+(`934e605e-5562-45a5-8f16-4f9ad2679b70`) failed at `03:10Z` with `adapter_failed` —
+`Claude exited with code 1 [pod: reason=Error, container_log=penstock agent runtime: Caveman proxy
+did not become ready]`. Infrastructure, not the script and not the routine.
+
+**For seven hours BLO-34946 read `blocked` with `blockedBy: []`, which looks exactly like the
+zero-wake-path strand of [BLO-27553](https://paperclip.blockcast.net/BLO/issues/BLO-27553) and was
+not one.** It carried `activeRecoveryAction.status: "active"`, attempt 1 of 5, `timeoutAt`
+`2026-09-21T09:10:46Z`, `wakePolicy: wake_owner` → Ally. That is a live wake path, and per the
+2026-09-13 amendment to that rule a `PATCH {status}` would have **discharged the recovery action and
+deleted the working wake path** — the repair is strictly worse than the apparent defect. It was left
+untouched deliberately.
+
+**That decision is now confirmed by outcome, not just by rule.** The recovery action fired on its
+own and the issue completed without any intervention:
+
+| event | timestamp |
+| --- | --- |
+| run failed `adapter_failed`, recovery action opened (attempt 1/5) | `2026-09-21T03:10:46Z` |
+| recovery run `a60a4b12-d3fd-4fca-964a-c03255eb9663` posted receipt 3 | `2026-09-21T07:16:33.433Z` |
+| BLO-34946 `completed`, `status: done`, `activeRecoveryAction: null` | `2026-09-21T07:20:47.348Z` |
+
+Had the `blocked` + `blockedBy: []` shape been "repaired" by a status write at any point in that
+window, the recovery action would have been discharged and this fire would have produced no receipt
+at all. **This is a worked example of the amendment's central claim: on that shape the cheap
+reading manufactures work against a lane that is behaving correctly.** The discriminator is
+`activeRecoveryAction.status == "active"` with a future `timeoutAt`, and it was readable throughout.
+
+#### Receipt 3 — 2026-09-21T07:16:33.433Z, from the recovered 01:45Z slot
+
+Comment [`19519080`](https://paperclip.blockcast.net/BLO/issues/BLO-34818#comment-19519080-60a3-4584-9c07-c79c9b3f5665), run `a60a4b12`.
+
+| tally | count |
+| --- | --- |
+| `codeowner-review-requested` | 29 |
+| `skip` | 99 |
+| `stale-enqueue` | 1 |
+| `already-enqueued` | 0 |
+| **`enqueue`** | **0** |
+| rows total | 129 |
+
+Confirmations section reads `none`. Three fires, three receipts, **still zero `enqueue` rows** — so
+ACs 3 and 4 remain unexercised, and the reading above about fleet CI health holds across all three.
+
+`already-enqueued` drops to 0 here because #1954 — the only PR that had ever held that status — lost
+its armed auto-merge when this branch was force-pushed to record these receipts. That is expected:
+a new head drops auto-merge and staleness-dismisses the review attesting the old head. It is noted
+so the 1 → 1 → 0 progression is not mistaken for a classifier regression.
+
+**This log was a point-in-time record through fire 3.** The section below carries it to fire 10.
+
+### Fires 4–10 — ACs 3 and 4 exercised for real
+
+Recorded 2026-09-25, corrected 2026-09-26. Every PR state and every receipt id in this section was
+re-read live at the 2026-09-26 correction — PR states with
+`gh pr view <n> -R Blockcast/paperclip --json state,mergedAt`, receipts from the BLO-34818 comment
+ledger — not copied from an earlier draft.
+
+#### The first genuine `enqueue` rows, and the confirmation loop closing on them
+
+| receipt | posted | `enqueue` rows | confirmations for the previous receipt |
+| --- | --- | --- | --- |
+| `187a69d7` | 2026-09-23T00:21:21Z | **#1990** `mergestate:CLEAN` | `none` |
+| `aec91d73` | 2026-09-23T03:22:09Z | 0 | **#1990 → `still-queued`** (OPEN at the time) |
+| `4effd9fa` | 2026-09-23T06:48:23Z | **#1804** `mergestate:CLEAN` | `none` |
+| `aa6a0a70` | 2026-09-23T16:44:08Z | 0 | **#1804 → `still-queued`** (OPEN at the time) |
+| `98027253` | 2026-09-24T14:10:23Z | **#2001, #1985, #1976** all `mergestate:CLEAN` | `none` |
+| `933af750` | 2026-09-25T07:18:04Z | **#2020** `mergestate:BLOCKED` — **arm failed**, **#1774** `mergestate:CLEAN` | **#2001, #1985, #1976 → `still-queued`** (all OPEN) |
+| `85529fad` | 2026-09-25T08:12:04Z | **#2020** `mergestate:BLOCKED` — **arm failed** | **#2020, #1774 → `still-queued`** (both OPEN) |
+
+**Step 3 of the routine description works end to end for the rows that actually armed** — #1990,
+#1804, #2001, #1985, #1976 and #1774. Each receipt carrying those rows is followed by a receipt
+that resolves exactly them, which is the behaviour AC 4 was written for, and it is no longer
+vacuous. **#2020 is the exception and it is not a latency story** — see below.
+
+This table is the record **through `85529fad` (2026-09-25T08:12:04Z)** and is deliberately not
+extended past it — the ledger keeps growing and a table that chases it is stale on every fire.
+Later receipts exist and live on BLO-34818, which is the running ledger. Both of the two rows added
+here carry `enqueue` rows *and* resolve the previous receipt's rows, so the confirmation half of
+the loop is closing on every cycle, not only on the three recorded above them. The arming half is
+not, for #2020.
+
+#### #2020 — an `enqueue` row that has never armed, nine fires deep
+
+The receipt rows this table summarises carry a fourth column it drops, and for #2020 that column is
+the whole story:
+
+    | #2020 | `enqueue` | `mergestate:BLOCKED` | failed: --merge, --rebase, or --squash required when not running interactively |
+    | #1774 | `enqueue` | `mergestate:CLEAN`   | auto-merge armed |
+
+Read live from the BLO-34818 ledger on 2026-09-26, #2020 carries that identical failure on **nine
+consecutive receipts** — `933af750` (09-25T07:18Z), `85529fad`, `07eccc8e`, `a36fe303`, `1997d81b`,
+`e96f388d`, `acc91d82`, `7df31c9d`, `8ae54c04` (09-26T08:17Z) — and the 09-26T14:37Z receipt
+`517622da` flags it again. So the `still-queued` confirmations recorded for #2020 above report a
+steady state that **never started**: nothing was ever queued to stay queued.
+
+The cause is in the script, not in #2020. `scripts/land-clean-prs.mjs:433` arms with
+`gh pr merge <n> --repo <repo> --auto` and supplies no merge method; `gh` refuses non-interactively
+when it cannot infer one. Every `enqueue` row that armed was `mergestate:CLEAN` and the only one
+that has ever failed is `mergestate:BLOCKED` — a clean correlation across all seven distinct
+`enqueue` rows to date, but one distinct failing PR, so **whether `BLOCKED` is the discriminator is
+not established**. Filed as [BLO-36804](https://paperclip.blockcast.net/BLO/issues/BLO-36804)
+against the script's owner, not resolved here: the fix is a change to the script, outside this
+routine's remit. Routed there rather than to C1 ([BLO-32240](https://paperclip.blockcast.net/BLO/issues/BLO-32240)),
+which is `done` — a closed issue is not a wake path.
+
+This is recorded rather than smoothed over for the same reason the coalescing note below is: a log
+that reads a nine-fire silent failure as a successful enqueue is producing exactly the false defect
+— in the flattering direction — that this document warns about.
+
+#### Landed end to end — the routine's proof
+
+#1990 was enqueued by `187a69d7`, classified `still-queued` by `aec91d73`, and **merged at
+`2026-09-25T02:34:27Z`**. #1804 was enqueued by `4effd9fa`, classified `still-queued` by
+`aa6a0a70`, and **merged at `2026-09-25T15:27:33Z`**. #2001 was enqueued by `98027253`, classified
+`still-queued` by `933af750`, and **merged at `2026-09-26T15:16:52Z`** (all three
+`gh pr view <n> --json state,mergedAt` → `MERGED`, re-read 2026-09-26). PRs the routine armed,
+tracked, and saw through to master without a hand merge.
+
+**No running total is recorded here**, deliberately: a count in this document is stale at the next
+merge, which has now put a wrong number in this section twice.
+[BLO-34818](https://paperclip.blockcast.net/BLO/issues/BLO-34818) is the ledger — count from the
+receipts.
+
+The remaining rows are open as of writing — #1985, #1976, #2020, #1774 all `state: OPEN`,
+`mergedAt: null` — so `still-queued` remains the accurate classification for the three of them that
+armed. For #2020 it is accurate only about the PR's state, not about the routine's: it never entered
+the queue. **No receipt has yet printed a literal `confirmed-merged` row**, because each merge fell
+outside the one-receipt confirmation window that had already resolved its row. Resolution-to-merge
+was 1d23h12m for #1990 (`aec91d73`, `2026-09-23T03:22:09Z`), 1d22h43m for #1804 (`aa6a0a70`,
+`2026-09-23T16:44:08Z`) and 1d07h58m for #2001 (`933af750`, `2026-09-25T07:18:04Z`) — #2001 is the
+sharpest of the three and still misses its window by more than a day. Every later receipt that names
+#2001 at all carries it only as a `skip` / `mergestate:UNKNOWN` classifier row, not a confirmation;
+the last of those is `8ae54c04` (`2026-09-26T08:17:49Z`), 6h59m before the merge.
+
+#### AC 3 names a field this repo does not use — fifth plan-vs-reality drift
+
+AC 3 expects each `enqueue` row to show `autoMergeRequest` set on GitHub. Measured, it is **null on
+every row above**, and not because a new head dropped auto-merge — the heads had not moved.
+
+The cause is mechanical: `gh api repos/Blockcast/paperclip/rules/branches/master` returns **exactly
+one rule, `merge_queue`**, and no `pull_request` rule. This repo does not land through
+`autoMergeRequest` at all. The observable artifact is an `added_to_merge_queue` timeline event, and
+the rows carry one. **Read AC 3 as "the row is in the merge queue."**
+
+One measured fact deliberately left unexplained: each `added_to_merge_queue` predates its receipt
+(6m27s for #1990, 43m54s for #1804) and is attributed to `kkroo` rather than the App — though the
+App *can* be that actor, so it is not an attribution artifact. Either the script armed nothing and
+reported a queue state already set, or it armed something GitHub attributed elsewhere. One run's
+evidence does not separate those; logged on
+[BLO-36804](https://paperclip.blockcast.net/BLO/issues/BLO-36804) alongside the arming defect above
+— it is the same question about the same code path — not resolved here. That row carries the
+question as context but is **not gated on it**: all three of its `Done when` bullets are about the
+arming defect and its classification, so BLO-36804 can close green with the ordering question still
+open. A later reader should treat it closing as evidence about the arming defect only.
+
+#### Coalescing continues to hold, and a `skipped` fire is still not a missing receipt
+
+The fires-1–4 table above generalises. Sampling the eight most recent runs, five were `skipped`
+with a `coalescedIntoRunId`, and each named an execution issue that was still live. The
+2026-09-25T01:45:00Z slot coalesced into the 19:45Z run, whose issue **BLO-36187** ran
+`07:06:30.815Z` → `07:19:14.898Z` and posted receipt **`933af750` at `07:18:04.891Z`**, inside its
+own window. So the coalesced slot behaved like the fire-3 precedent recorded above: one receipt for
+the surviving run, none for the slot that was absorbed. **Auditing this routine by counting cron
+slots against receipts will report a false defect** — in either direction. Counting slots
+over-counts; taking the newest receipt you happen to have cached under-counts.
+
+#### Why this file took an extra cycle to land
+
+PR #1954 — the PR carrying this file — was itself **ejected from the merge queue at
+`2026-09-24T21:48:10Z`**. The merge-group run `36050446289` failed on
+`General tests (workspaces-a)`, whose actual failure is a `waitForServer` timeout in
+`cli/src/__tests__/company-import-export-e2e.test.ts:291` — a server-start flake. (vitest prints
+that path relative to the `paperclipai` workspace, i.e. without the `cli/` prefix; it is written in
+full here so the line opens from the repo root.) #1954 is docs-only
+(one Markdown file, no executable surface), and a merge-group tests the PR combined with master, so
+this failure cannot have come from the PR's content. It is recorded here rather than filed as a
+defect: one flake in a queue that was otherwise draining is not a finding. (An earlier draft said
+"5 of the 8 surrounding merge-group runs succeeded"; the count is dropped because it never named
+its window and does not reproduce on either natural reading of one. The qualitative claim is what
+the argument rests on, and it holds on every window tried.)
+
+The ejection is also what made this correction possible. It had been written earlier and refused
+with `GH006 — Branches that are queued for merging cannot be updated`; dequeuing to push a
+documentation fix would have surrendered queue position, so it waited for a window it did not have
+to pay for.
+
+**The routine remains `active` on its 6-hour trigger. BLO-34818, not this file, is the running
+ledger.**
+
 ## C3 — governance sweep un-paused (2026-09-07)
 
 Routine `8b764d66-b598-4517-a249-e9a1dee82f06`
