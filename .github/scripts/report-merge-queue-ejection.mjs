@@ -68,7 +68,16 @@ export function shouldReportCancelledRun({ merged, isInMergeQueue }) {
 // actually be a CAUSE -- so they share causalJobs() rather than each deriving
 // it. That sharing is the point: the two used to disagree, and a reader only
 // ever sees the sentence they compose.
-const isNonSuccess = (job) => job?.conclusion === "failure" || job?.conclusion === "cancelled";
+//
+// Stated as an allowlist of GOOD states, not a denylist of bad ones. The same
+// argument as the aggregator-name allowlist below: a denylist rots as the enum
+// grows, and this one was already one value short -- `timed_out` is in GitHub's
+// documented jobs[].conclusion enum and was invisible here, which reintroduced
+// the exact bug causalJobs() exists to kill (the timed-out lane is dropped, the
+// messenger it kills becomes the only name). `conclusion` is null mid-flight,
+// so the truthiness guard is what keeps an in-progress job from being a cause.
+const GOOD_CONCLUSIONS = ["success", "skipped", "neutral"];
+const isNonSuccess = (job) => Boolean(job?.conclusion) && !GOOD_CONCLUSIONS.includes(job.conclusion);
 
 /**
  * Non-success jobs minus the aggregator lanes that merely report upstream death.
@@ -89,6 +98,18 @@ const isNonSuccess = (job) => job?.conclusion === "failure" || job?.conclusion =
  * downstream of all of them means. Deliberately the narrowest form of that
  * test -- "after SOME other job" would drop a genuine second failure that
  * merely started late.
+ *
+ * ponytail: known ceiling at EXACTLY TWO non-success jobs, where "after ALL
+ * others" and "after SOME other" are the same predicate, so the narrowness
+ * above buys nothing and a genuine late second failure IS dropped. Reachable:
+ * `verify` needs: 8 lanes but not `policy`, `canary_dry_run` or `e2e`, so a
+ * failure confined to the last two leaves `verify` green and the set at two,
+ * staggered only by arc-* runner assignment. NOT fixed by widening -- the
+ * `policy`/`verify` pair below is also two jobs and dropping the later one is
+ * correct there. The discriminator is the needs: graph and the jobs API does
+ * not carry it. Cost is a dropped name, not a wrong one, so it degrades to a
+ * second ejection rather than misdirection. Upgrade path: read the needs: graph
+ * from pr.yml, or have the workflow emit it. Pinned by the `ceiling:` test.
  */
 export function causalJobs(jobs) {
   const list = (Array.isArray(jobs) ? jobs : []).filter(isNonSuccess);
@@ -109,9 +130,13 @@ export function causalJobs(jobs) {
 
 export function failingJobSummary(jobs) {
   const list = causalJobs(jobs);
-  const anyFailure = list.some((job) => job?.conclusion === "failure");
+  // `cancelled` is the one non-success state that is usually COLLATERAL, so it
+  // is named only when nothing else died. Every other state in `list` is a real
+  // death and is always named -- keyed on the complement so a new enum value
+  // (`timed_out`, `stale`, ...) is reported rather than silently dropped.
+  const anyRealDeath = list.some((job) => job?.conclusion !== "cancelled");
   const failed = list
-    .filter((job) => job?.conclusion === "failure" || (!anyFailure && job?.conclusion === "cancelled"))
+    .filter((job) => job?.conclusion !== "cancelled" || !anyRealDeath)
     .map((job) => job.name)
     .filter((name) => typeof name === "string" && name.length > 0);
   if (failed.length === 0) return "";
