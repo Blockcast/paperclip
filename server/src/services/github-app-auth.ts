@@ -356,6 +356,44 @@ export async function githubListOpenPullRequestsByBase(input: {
   return parseOpenPullRequestsOnBasePayload(await res.json().catch(() => null));
 }
 
+export type BranchState = "exists" | "deleted" | "unknown";
+
+/**
+ * Does `branch` still exist? (BLO-29856)
+ *
+ * Disambiguates an empty stacked-child enumeration. When a merged PR's head
+ * branch is deleted (`delete_branch_on_merge`, or the "Delete branch" button),
+ * GitHub auto-retargets every PR based on it. Those children no longer match
+ * `?base=<merged head>`, so the enumeration returns nothing, and the retarget
+ * is bare with no rebase: the exact state a rewriting merge makes unsafe.
+ *
+ * 404 reads as `deleted`: callers have just read this repository's pulls with
+ * the same token, so the repository itself is visible. Any other unreadable
+ * answer is `unknown`, never `exists`, so a failed read cannot pass for proof
+ * that the empty enumeration was the whole story.
+ */
+export async function githubResolveBranchState(input: {
+  repoFullName: string;
+  branch: string;
+  signal?: AbortSignal;
+}): Promise<BranchState> {
+  const tokenResult = await getInstallationTokenResult();
+  if (!tokenResult.ok) return "unknown";
+  try {
+    const res = await ghFetch(
+      `${gitHubApiBase(GITHUB_HOST)}/repos/${input.repoFullName}/branches/${encodeURIComponent(input.branch)}`,
+      {
+        headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` },
+        signal: input.signal,
+      },
+    );
+    if (res.ok) return "exists";
+    return res.status === 404 ? "deleted" : "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
 /**
  * Did the merge preserve the base PR's commit SHAs, or rewrite them? (BLO-29856)
  *

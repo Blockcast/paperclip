@@ -31,6 +31,7 @@ import {
   GITHUB_PR_COMMITS_ENDPOINT_LIMIT,
   githubPostCommitStatus,
   githubPostCommitStatusDetailed,
+  githubResolveBranchState,
   githubReviewerAppSlug,
   githubReviewerIdentityMatches,
   normalizeGithubLogin,
@@ -332,6 +333,63 @@ describe("githubHasCommitEvidence", () => {
       repoFullName: "Blockcast/paperclip",
       sha: "abcdef1234567",
     })).resolves.toEqual({ error: "commit_http_503" });
+  });
+});
+
+// An empty stacked-child enumeration is only trustworthy while the merged head
+// branch still exists: once GitHub deletes it, it auto-retargets every child
+// away from `?base=` (BLO-29856). `exists` is the one answer that lets the
+// fan-out stay quiet, so no failed read may produce it.
+describe("githubResolveBranchState", () => {
+  const stubBranchResponse = (response: () => Response) => {
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      if (String(url).includes("/access_tokens")) {
+        return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+      }
+      return response();
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  };
+
+  it("reads a readable branch as exists, encoding a slashed branch name", async () => {
+    setCreds();
+    const fetchMock = stubBranchResponse(() => jsonResponse({ name: "se/base" }));
+
+    await expect(githubResolveBranchState({
+      repoFullName: "Blockcast/paperclip",
+      branch: "se/base",
+    })).resolves.toBe("exists");
+    expect(fetchMock.mock.calls.some(([url]) =>
+      String(url).endsWith("/repos/Blockcast/paperclip/branches/se%2Fbase"))).toBe(true);
+  });
+
+  it("reads a 404 as deleted, so an empty enumeration is not taken as no children", async () => {
+    setCreds();
+    stubBranchResponse(() => jsonResponse({ message: "Branch not found" }, false, 404));
+
+    await expect(githubResolveBranchState({
+      repoFullName: "Blockcast/paperclip",
+      branch: "se/base",
+    })).resolves.toBe("deleted");
+  });
+
+  it("returns unknown, never exists, when the branch cannot be read", async () => {
+    setCreds();
+    stubBranchResponse(() => jsonResponse({ message: "unavailable" }, false, 503));
+    await expect(githubResolveBranchState({ repoFullName: "Blockcast/paperclip", branch: "se/base" }))
+      .resolves.toBe("unknown");
+
+    stubBranchResponse(() => {
+      throw new Error("socket hang up");
+    });
+    await expect(githubResolveBranchState({ repoFullName: "Blockcast/paperclip", branch: "se/base" }))
+      .resolves.toBe("unknown");
+
+    clearCreds();
+    _resetInstallationTokenCache();
+    await expect(githubResolveBranchState({ repoFullName: "Blockcast/paperclip", branch: "se/base" }))
+      .resolves.toBe("unknown");
   });
 });
 

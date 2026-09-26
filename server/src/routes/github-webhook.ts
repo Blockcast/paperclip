@@ -67,6 +67,7 @@ import {
   githubFetchPrHeadSha,
   githubListPullRequestCommits,
   githubListOpenPullRequestsByBase,
+  githubResolveBranchState,
   githubResolveMergeHistoryShape,
   githubReviewerIdentityMatches,
   githubListIssueCommentBodies,
@@ -5729,7 +5730,29 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             },
             "stacked-PR base-merge fan-out could not enumerate open PRs",
           );
-        } else if (stacked.pullRequests.length > 0) {
+        } else if (stacked.pullRequests.length === 0) {
+          // Empty is only "no stacked children" while the merged head branch
+          // still exists. Once GitHub deletes it (`delete_branch_on_merge`), it
+          // auto-retargets every child, bare with no rebase, so they no longer
+          // match `?base=` and nobody is woken. Read AFTER the enumeration: a
+          // branch that exists now existed then, so its empty list is truthful.
+          const headBranchState = await githubResolveBranchState({
+            repoFullName: stackedRepoFullName,
+            branch: mergedBaseRef,
+          });
+          if (headBranchState !== "exists") {
+            logger.warn(
+              {
+                repoFullName: stackedRepoFullName,
+                mergedBaseRef,
+                prNumber: context.prNumber,
+                headBranchState,
+              },
+              "stacked-PR base-merge fan-out found no open PRs on a head branch that no longer provably exists; " +
+                "GitHub may have auto-retargeted stacked children without a rebase, and none were woken",
+            );
+          }
+        } else {
           if (stacked.truncated) {
             logger.warn(
               { repoFullName: stackedRepoFullName, mergedBaseRef, returned: stacked.pullRequests.length },
@@ -5738,7 +5761,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           }
           // Resolved once for the whole fan-out, and only after we know there is
           // at least one child to tell — a merge with no stacked children costs
-          // no extra GitHub read at all.
+          // no merge-shape read at all.
           const mergeShape: MergeHistoryShape = context.prMergeCommitSha
             ? await githubResolveMergeHistoryShape({
               repoFullName: stackedRepoFullName,
