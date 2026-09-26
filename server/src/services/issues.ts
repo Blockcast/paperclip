@@ -4266,8 +4266,27 @@ export async function listBlockedIssueAutoResumeSuppressions(
       // the blocked-inbox oracle disagree with its own list in BLO-31839 — a park declared
       // past the cutoff parsed as `null`. Here that would silently drain it (BLO-30445).
       description: issues.description,
+      // BLO-27553: the liveness clause is load-bearing, and its absence made this
+      // suppression PERMANENT. `gateSignals` is written into `executionState.monitor`
+      // when a monitor is armed and is NEVER erased when that monitor is cleared or
+      // expires — `clearReason` is set alongside it and the array stays. So the bare
+      // `jsonb_array_length(...) > 0` test answered "did this row ever have a monitor",
+      // not "is a monitor gating it now", and returned true forever for every row that
+      // had ever armed one. Measured 2026-09-26: 19 of 23 estate-wide strands carried
+      // `gateSignals` on a monitor already `cleared` (`trigger_stalled` /
+      // `timeout_exceeded`), while 0 of 14 sampled rows the reconciler DID drain carried
+      // a cleared monitor. The reconciler that exists to drain these rows was skipping
+      // exactly them, and agent instructions mandate declaring `gateSignals` (BLO-29716),
+      // so following the monitor guidance is what made a row undrainable.
+      //
+      // Liveness matches the reconciler's own candidate predicate and arm 2 of the wake-path
+      // detector: a NULL or OVERDUE `nextCheckAt` is a wake that will not happen. This is a
+      // no-op for `stranded_blocked_reconciler`, which already filters live monitors upstream;
+      // it narrows the other three trigger paths, which do not.
       hasGateSignals: sql<boolean>`
-        COALESCE(
+        ${issues.monitorNextCheckAt} IS NOT NULL
+        AND ${issues.monitorNextCheckAt} > now()
+        AND COALESCE(
           CASE
             WHEN jsonb_typeof(${issues.executionState} -> 'monitor' -> 'gateSignals') = 'array'
               THEN jsonb_array_length(${issues.executionState} -> 'monitor' -> 'gateSignals')
