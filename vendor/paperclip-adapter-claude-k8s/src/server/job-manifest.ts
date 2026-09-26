@@ -92,6 +92,40 @@ const LARGE_PROMPT_THRESHOLD_BYTES = 256 * 1024;
 const RUNTIME_CACHE_VOLUME_NAME = "runtime-cache";
 const RUNTIME_CACHE_MOUNT_PATH = "/runtime-cache";
 const RUNTIME_CACHE_SIZE_LIMIT = "20Gi";
+
+/**
+ * Caches whose DEFAULT location is derived from $HOME, and therefore land on
+ * the persistent PVC whenever isolation puts HOME there (BLO-15567).
+ *
+ * `pnpm` is the expensive one. Its store defaults to
+ * `${XDG_DATA_HOME:-$HOME/.local/share}/pnpm/store`, and XDG_DATA_HOME is not
+ * set anywhere in this manifest — so in `workspace` isolation mode the store
+ * followed HOME onto `/paperclip`. Measured 2026-09-25 across 881 persistent
+ * workspace homes: `.local/share/pnpm` = **259.9 GiB** (96.4% of all home
+ * bytes), 128 independent stores, median 2.7 GiB, max 9.9 GiB. Every other
+ * package-manager cache here was already redirected; pnpm was the one that
+ * silently was not, which is why it grew to be the single largest consumer of
+ * a PVC that reached 89% full.
+ *
+ * `PNPM_HOME` rather than `XDG_DATA_HOME`, deliberately: verified in the agent
+ * image (pnpm 12.6.0) that both relocate the store, but XDG_DATA_HOME moves
+ * *everything* under `~/.local/share` — application state, not just cache —
+ * for no extra reclaim, since pnpm is already 96.4% of it.
+ *
+ * ⚠ RUSTUP_HOME is deliberately ABSENT. The agent image installs the Rust
+ * toolchains into `/usr/local/rustup`; pointing RUSTUP_HOME at an empty
+ * ephemeral dir removes every installed toolchain and breaks `cargo`/`rustc`
+ * outright. CARGO_HOME is safe to move by contrast — verified empty in the
+ * image, with the `cargo` binary on PATH at `/usr/local/bin` — so it only ever
+ * accumulates a regenerable registry cache.
+ */
+function PNPM_CARGO_CACHE_ENV(root: string): Record<string, string> {
+  return {
+    PNPM_HOME: `${root}/pnpm`,
+    CARGO_HOME: `${root}/cargo`,
+    CARGO_TARGET_DIR: `${root}/cargo-target`,
+  };
+}
 const RUNTIME_CACHE_ENV: Record<string, string> = {
   XDG_CACHE_HOME: `${RUNTIME_CACHE_MOUNT_PATH}/xdg`,
   GOCACHE: `${RUNTIME_CACHE_MOUNT_PATH}/go-build`,
@@ -100,6 +134,7 @@ const RUNTIME_CACHE_ENV: Record<string, string> = {
   BUN_INSTALL_CACHE: `${RUNTIME_CACHE_MOUNT_PATH}/bun`,
   PIP_CACHE_DIR: `${RUNTIME_CACHE_MOUNT_PATH}/pip`,
   PLAYWRIGHT_BROWSERS_PATH: `${RUNTIME_CACHE_MOUNT_PATH}/ms-playwright`,
+  ...PNPM_CARGO_CACHE_ENV(RUNTIME_CACHE_MOUNT_PATH),
 };
 
 type IsolationStorage = "ephemeral" | "persistent";
@@ -728,6 +763,22 @@ export const ENV_NAME_CLASSIFICATION: readonly EnvNameClassification[] = [
     reason: "Playwright browser download path.",
   },
   {
+    name: "PNPM_HOME",
+    classification: "SAFE_LITERAL",
+    reason:
+      "pnpm store + global-bin path (BLO-15567). Defaults to $HOME/.local/share/pnpm, which followed HOME onto the persistent PVC and reached 259.9 GiB.",
+  },
+  {
+    name: "CARGO_HOME",
+    classification: "SAFE_LITERAL",
+    reason: "Cargo registry cache path (BLO-15567). Not RUSTUP_HOME — the image toolchains live there.",
+  },
+  {
+    name: "CARGO_TARGET_DIR",
+    classification: "SAFE_LITERAL",
+    reason: "Rust build output path (BLO-15567).",
+  },
+  {
     name: "TMPDIR",
     classification: "SAFE_LITERAL",
     reason: "Run-scoped temp dir (BLO-16219). Load-bearing for triaging concurrent-run collisions.",
@@ -1083,6 +1134,7 @@ function buildEnvVars(
         BUN_INSTALL_CACHE: `${isolation.cacheRoot}/bun`,
         PIP_CACHE_DIR: `${isolation.cacheRoot}/pip`,
         PLAYWRIGHT_BROWSERS_PATH: `${isolation.cacheRoot}/ms-playwright`,
+        ...PNPM_CARGO_CACHE_ENV(isolation.cacheRoot),
         // Run-scoped so concurrent stateless Jobs never share a writable temp
         // directory (BLO-16219) — previously unset here, defaulting to the
         // image's shared /tmp and colliding across concurrent runs.

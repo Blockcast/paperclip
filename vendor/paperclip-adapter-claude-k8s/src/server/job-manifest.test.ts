@@ -1179,6 +1179,18 @@ describe("buildJobManifest", () => {
       expect(env.get("CLAUDE_CONFIG_DIR")).toBe("/paperclip/k8s-isolation/workspace-1/session/.claude");
       expect(env.get("TMPDIR")).toBe("/runtime-cache/paperclip-workspaces/workspace-1/tmp");
       expect(env.get("XDG_CACHE_HOME")).toBe("/runtime-cache/paperclip-workspaces/workspace-1/cache/xdg");
+      // BLO-15567: HOME is persistent here, so any cache that DEFAULTS to a
+      // $HOME-derived path lands on the PVC unless named. pnpm's store
+      // (`$HOME/.local/share/pnpm`) was the unnamed one and reached 259.9 GiB
+      // across 881 workspace homes. Assert every such path is off /paperclip.
+      for (const key of ["PNPM_HOME", "CARGO_HOME", "CARGO_TARGET_DIR"]) {
+        expect(env.get(key)).toBe(
+          `/runtime-cache/paperclip-workspaces/workspace-1/cache/${
+            { PNPM_HOME: "pnpm", CARGO_HOME: "cargo", CARGO_TARGET_DIR: "cargo-target" }[key]
+          }`,
+        );
+        expect(env.get(key)?.startsWith("/paperclip")).toBe(false);
+      }
       expect(container?.command?.join(" ")).not.toContain("git clone --shared");
     });
 
@@ -1210,6 +1222,14 @@ describe("buildJobManifest", () => {
       expect(env.get("BUN_INSTALL_CACHE")).toBe("/runtime-cache/bun");
       expect(env.get("PIP_CACHE_DIR")).toBe("/runtime-cache/pip");
       expect(env.get("PLAYWRIGHT_BROWSERS_PATH")).toBe("/runtime-cache/ms-playwright");
+      // BLO-15567: $HOME-derived by default, so they must be named explicitly
+      // or they follow HOME onto the persistent PVC under isolation.
+      expect(env.get("PNPM_HOME")).toBe("/runtime-cache/pnpm");
+      expect(env.get("CARGO_HOME")).toBe("/runtime-cache/cargo");
+      expect(env.get("CARGO_TARGET_DIR")).toBe("/runtime-cache/cargo-target");
+      // RUSTUP_HOME must stay at the image default (/usr/local/rustup) — an
+      // empty ephemeral dir has no toolchains and breaks cargo/rustc.
+      expect(env.get("RUSTUP_HOME")).toBeUndefined();
     });
 
     it("overrides inherited cache paths with the job-local runtime-cache mount", () => {
