@@ -1182,6 +1182,41 @@ describe("buildJobManifest", () => {
       expect(container?.command?.join(" ")).not.toContain("git clone --shared");
     });
 
+    // BLO-36583: pnpm's store is data, not cache, so it was reached by none of
+    // the cache vars and followed HOME onto the PVC once per workspace —
+    // 259.87 GiB across 128 near-identical stores. It must land on a single
+    // shared path that is on the same filesystem as the persistent workspace,
+    // because pnpm hardlinks store objects into node_modules and silently
+    // ignores a store configured on another device.
+    it("shares one pnpm store across persistent workspaces, and keeps it per-run when ephemeral", () => {
+      const roots = {
+        isolationMode: "workspace" as const,
+        isolationKey: "workspace:workspace-1",
+        workspaceRoot: "/paperclip/workspaces/workspace-1",
+        homeRoot: "/paperclip/k8s-isolation/workspace-1/home",
+        sessionRoot: "/paperclip/k8s-isolation/workspace-1/session",
+        cacheRoot: "/runtime-cache/paperclip-workspaces/workspace-1/cache",
+        tmpRoot: "/runtime-cache/paperclip-workspaces/workspace-1/tmp",
+      };
+      const pnpmHomeFor = (workspace: "ephemeral" | "persistent") => {
+        ctx.context = { paperclipWorkspace: { cwd: roots.workspaceRoot } };
+        setRuntimeIsolation(ctx, { ...roots, storage: isolatedStorage(workspace) });
+        const { job } = buildJobManifest({ ctx, selfPod });
+        const env = new Map(job.spec?.template?.spec?.containers[0]?.env?.map((e) => [e.name, e.value]));
+        return env.get("PNPM_HOME");
+      };
+
+      // Persistent workspace: shared, and on the PVC alongside the checkout —
+      // not under the ephemeral cacheRoot, which is a different filesystem.
+      expect(pnpmHomeFor("persistent")).toBe(
+        "/paperclip/instances/default/data/k8s-isolation/pnpm-store",
+      );
+      // Ephemeral workspace: nothing outlives the run, so keep it run-scoped.
+      expect(pnpmHomeFor("ephemeral")).toBe(
+        "/runtime-cache/paperclip-workspaces/workspace-1/cache/pnpm",
+      );
+    });
+
     it("lets a runtime shared descriptor override legacy isolated config", () => {
       ctx.config = { isolationMode: "isolated", isolationKey: "config-key" };
       ctx.context = { paperclipWorkspace: { cwd: "/paperclip/shared-workspace" } };
