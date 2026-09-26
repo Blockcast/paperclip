@@ -302,6 +302,57 @@ env:
     # serviceAccountName hard-fails at Job build instead of launching.
     - name: PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME
       value: paperclip
+    # Isolation-workspace reaper (BLO-31222; switched on under BLO-36735).
+    #
+    # Shared list, NOT worker.extraEnv. The reaper only ever runs on the worker,
+    # but that is enforced in code — server/src/index.ts:2019 skips the whole
+    # block, the dynamic import included, when PAPERCLIP_NODE_ROLE=api — so the
+    # Helm knob does not have to carry the tier split as well. worker.extraEnv
+    # means something else here: it is the channel the claude_k8s adapter reads
+    # to hand values down into agent Job pods, and penstock-worker-secret.test.mjs
+    # asserts every literal in it is inheritable. A server-only flag put there
+    # fails that guard, and the only way to satisfy it would be to widen the agent
+    # inherit allowlist for a value no agent reads. The price of this list is that
+    # flipping the flag also rolls the two API replicas, which ignore it.
+    #
+    # The reaper shipped 2026-09-02 and was never enabled, so every reclaim on
+    # data/k8s-isolation/workspaces since has been a hand pass at ~7 min/dir.
+    #
+    # BOTH flags are required for an observation-only tick: ENABLED is what
+    # starts the sweep at all, DRY_RUN only decides whether it unlinks. DRY_RUN
+    # on its own is inert, because the `if` that imports the module reads
+    # ENABLED. This change is step 1 (log the match set, delete nothing); step 2
+    # flips DRY_RUN to "false" once that production log line has been read. That
+    # split is property 2 of the module: "deploy the code" and "perform the
+    # deletion" must not be the same act.
+    - name: PAPERCLIP_ISOLATION_WORKSPACE_REAPER_ENABLED
+      value: "true"
+    - name: PAPERCLIP_ISOLATION_WORKSPACE_REAPER_DRY_RUN
+      value: "true"
+    # 30d — the code default, stated rather than inherited, because it is the
+    # only threshold whose match set has been audited: 448 dirs by hand under
+    # BLO-31222, and all 929 on 2026-09-26 by running the shipped
+    # reapIsolationWorkspaces() against the live tree. That sweep returned
+    # scanned=929 eligible=4 retainedInUse=126 retainedFresh=798 skippedLayout=1
+    # — 0.71 GiB, and all four eligible dirs have no execution_workspaces row at
+    # all, i.e. exactly the orphan cohort the module was aimed at.
+    #
+    # Deliberately NOT lower. `lastUsedAt` is refreshed on reuse and these
+    # workspaces are reused for months, which is what makes a 30d match set
+    # unowned orphans. The same sweep at 14d matches 352 dirs / 34 GiB, but those
+    # are live workspaces whose deletion costs a cold start each — a separate
+    # decision with its own audit, not a knob to turn while enabling.
+    - name: PAPERCLIP_ISOLATION_WORKSPACE_REAPER_MAX_AGE_DAYS
+      value: "30"
+    # 200 — also the code default, made explicit so it stays inert on purpose
+    # rather than by luck. It does not bind today (4 eligible << 200). It becomes
+    # load-bearing the moment MAX_AGE_DAYS drops: unlink here is MDS-metadata
+    # bound, measured at 145 files/s serial, and the tree averages ~6.9k entries
+    # per directory — so a capped 200-directory tick is ~1.4M entries, ~2.7h of
+    # MDS pressure borne by every other CephFS consumer on the cluster. The four
+    # directories eligible today total 42,892 entries, ~5 min.
+    - name: PAPERCLIP_ISOLATION_WORKSPACE_REAPER_MAX_DELETES_PER_TICK
+      value: "200"
 
 # Worker tier also runs plugin workers and scheduled plugin jobs. Linear's
 # periodic sync can transiently burn CPU over large BLO backlogs; keep enough
