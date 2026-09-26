@@ -223,11 +223,18 @@ describe("githubGetPullRequestGate", () => {
  * degrade to `not_required`: "we could not read branch protection" and "we read
  * it and this context is absent" are opposite facts, and collapsing them puts a
  * confident all-clear on an unread gate.
+ *
+ * There are two surfaces that can require a check, and `branches/{b}` reports
+ * only one of them. `Blockcast/hang-mmt-fec` is the worked case (measured
+ * 2026-09-26): empty classic `required_status_checks`, while org ruleset
+ * `19274071` requires `review/ally-complete` on `main`. Absence is therefore
+ * only asserted once BOTH surfaces have been read.
  */
 describe("githubGetPrRequiredStatusContext", () => {
   const stubFetch = (input: {
     pull?: { status?: number; body?: unknown };
     branch?: { status?: number; body?: unknown };
+    rules?: { status?: number; body?: unknown };
   }) => {
     const seen: string[] = [];
     const fetchMock = vi.fn(async (url: string | URL) => {
@@ -239,6 +246,13 @@ describe("githubGetPrRequiredStatusContext", () => {
       if (href.includes("/pulls/")) {
         const status = input.pull?.status ?? 200;
         return jsonResponse(input.pull?.body ?? { base: { ref: "master" } }, status < 400, status);
+      }
+      // Must precede the branch arm: `/rules/branches/{ref}` also contains
+      // `/branches/`, and matching it as the classic read would make every
+      // ruleset assertion below silently test the wrong endpoint.
+      if (href.includes("/rules/branches/")) {
+        const status = input.rules?.status ?? 200;
+        return jsonResponse(input.rules?.body ?? [], status < 400, status);
       }
       const status = input.branch?.status ?? 200;
       return jsonResponse(input.branch?.body ?? {}, status < 400, status);
@@ -266,10 +280,62 @@ describe("githubGetPrRequiredStatusContext", () => {
       outcome: "required",
       baseRef: "master",
       requiredContexts: ["review/ally-complete", "verify"],
+      source: "branch_protection",
     });
     // Protection is read off the PR's OWN base, not the repo default, so a PR
     // stacked onto a release branch is answered about the branch it targets.
     expect(seen.some((url) => url.endsWith("/repos/Blockcast/penstock-llm-proxy-core/branches/master"))).toBe(true);
+    // Presence needs one surface only — a ruleset cannot un-require what classic
+    // protection requires, so the second call is skipped.
+    expect(seen.some((url) => url.includes("/rules/branches/"))).toBe(false);
+  });
+
+  it("reports required from a ruleset that classic branch protection cannot see", async () => {
+    // The Blockcast/hang-mmt-fec shape: classic protection holds nothing, an org
+    // ruleset supplies the context. Reading `branches/{b}` alone answers
+    // `not_required` here — a confident "does not block merge" about a gate that
+    // does, and the empty union is a 200, so no `unknown` guard catches it.
+    setCreds();
+    const seen = stubFetch({
+      branch: {
+        body: {
+          protected: true,
+          protection: {
+            enabled: false,
+            required_status_checks: { checks: [], contexts: [], enforcement_level: "off" },
+          },
+        },
+      },
+      rules: {
+        body: [
+          { type: "pull_request", parameters: { required_approving_review_count: 1 } },
+          {
+            type: "required_status_checks",
+            ruleset_id: 19274071,
+            ruleset_source_type: "Organization",
+            parameters: {
+              required_status_checks: [
+                { context: "review/ally-complete" },
+                { context: "Check" },
+                { context: "Runner policy" },
+              ],
+            },
+          },
+        ],
+      },
+    });
+
+    await expect(githubGetPrRequiredStatusContext({
+      repoFullName: "Blockcast/hang-mmt-fec",
+      prNumber: 593,
+      context: "review/ally-complete",
+    })).resolves.toEqual({
+      outcome: "required",
+      baseRef: "master",
+      requiredContexts: ["Check", "Runner policy", "review/ally-complete"],
+      source: "ruleset",
+    });
+    expect(seen.some((url) => url.endsWith("/repos/Blockcast/hang-mmt-fec/rules/branches/master"))).toBe(true);
   });
 
   it("reports not_required and names what IS required there", async () => {
@@ -332,27 +398,72 @@ describe("githubGetPrRequiredStatusContext", () => {
     });
   });
 
+  it("unions both surfaces into requiredContexts when neither carries the context", async () => {
+    setCreds();
+    stubFetch({
+      branch: {
+        body: { protected: true, protection: { enabled: true, required_status_checks: { contexts: ["verify"] } } },
+      },
+      rules: {
+        body: [{
+          type: "required_status_checks",
+          parameters: { required_status_checks: [{ context: "Runner policy" }, { context: "verify" }] },
+        }],
+      },
+    });
+
+    await expect(githubGetPrRequiredStatusContext({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 1867,
+      context: "review/ally-complete",
+    })).resolves.toEqual({
+      outcome: "not_required",
+      baseRef: "master",
+      branchProtected: true,
+      requiredContexts: ["Runner policy", "verify"],
+    });
+  });
+
   it.each([
-    { label: "no credentials", creds: false, stub: {}, reason: "missing_github_app_credentials" },
+    { label: "no credentials", creds: false, stub: {}, reason: "missing_github_app_credentials", baseRef: undefined },
     {
       label: "the PR read fails",
       creds: true,
       stub: { pull: { status: 503 } },
       reason: "required_context_pull_request_http_503",
+      baseRef: undefined,
     },
     {
       label: "the PR carries no base ref",
       creds: true,
       stub: { pull: { body: {} } },
       reason: "required_context_base_ref_missing",
+      baseRef: undefined,
     },
     {
       label: "branch protection is unreadable",
       creds: true,
       stub: { branch: { status: 404 } },
       reason: "required_context_branch_http_404",
+      baseRef: "master",
     },
-  ])("answers unknown, never not_required, when $label", async ({ creds, stub, reason }) => {
+    {
+      // Classic said no and the second surface is unreadable, so "absent" is
+      // unproven. This is the case that must not shortcut to `not_required`.
+      label: "classic protection is empty and the ruleset read fails",
+      creds: true,
+      stub: { branch: { body: { protected: true } }, rules: { status: 500 } },
+      reason: "required_context_rules_http_500",
+      baseRef: "master",
+    },
+    {
+      label: "the ruleset read returns a non-array body",
+      creds: true,
+      stub: { branch: { body: { protected: true } }, rules: { body: { message: "nope" } } },
+      reason: "required_context_rules_body_missing",
+      baseRef: "master",
+    },
+  ])("answers unknown, never not_required, when $label", async ({ creds, stub, reason, baseRef }) => {
     if (creds) setCreds();
     stubFetch(stub);
 
@@ -360,7 +471,7 @@ describe("githubGetPrRequiredStatusContext", () => {
       repoFullName: "Blockcast/paperclip",
       prNumber: 1867,
       context: "review/ally-complete",
-    })).resolves.toEqual({ outcome: "unknown", reason });
+    })).resolves.toEqual(baseRef ? { outcome: "unknown", reason, baseRef } : { outcome: "unknown", reason });
   });
 });
 

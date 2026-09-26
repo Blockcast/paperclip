@@ -10415,17 +10415,24 @@ export function describePrReviewGateMergeImpact(input: {
 }): string {
   const { lookup, context, repoFullName } = input;
   if (lookup.outcome === "required") {
-    return `- Merge impact: \`${context}\` **is a required status check** on \`${repoFullName}\`'s \`${lookup.baseRef}\`, so this red gate does block merge there.`;
+    const via = lookup.source === "ruleset"
+      ? " It is required by a repository or organization ruleset, which `branches/{branch}` does not report."
+      : "";
+    return `- Merge impact: \`${context}\` **is a required status check** on \`${repoFullName}\`'s \`${lookup.baseRef}\`, so this red gate does block merge there.${via}`;
   }
   if (lookup.outcome === "not_required") {
+    // Name the surfaces actually read. "Requires no status checks" is the most
+    // load-bearing sentence in this notice, and it is only honest because both
+    // classic protection and the rulesets in effect were read (PEN-3487).
     const others = lookup.requiredContexts.length > 0
       ? ` Required there: ${lookup.requiredContexts.map((name) => `\`${name}\``).join(", ")}.`
       : lookup.branchProtected
-      ? " That branch is protected but requires no status checks."
-      : " That branch has no branch protection.";
+      ? " That branch is protected but requires no status checks, in either classic branch protection or any ruleset in effect."
+      : " That branch has no branch protection and no ruleset requires a status check on it.";
     return `- Merge impact: \`${context}\` is **not a required status check** on \`${repoFullName}\`'s \`${lookup.baseRef}\`, so this red gate does not block merge there.${others}`;
   }
-  return `- Merge impact: **unread** — Paperclip could not read branch protection for this PR's base (\`${lookup.reason}\`), so whether \`${context}\` blocks merge on \`${repoFullName}\` is unknown here. Read it before assuming either way; the required set differs per repository.`;
+  const where = lookup.baseRef ? ` (\`${lookup.baseRef}\`)` : "";
+  return `- Merge impact: **unread** — Paperclip could not read branch protection for this PR's base${where} (\`${lookup.reason}\`), so whether \`${context}\` blocks merge on \`${repoFullName}\` is unknown here. Read it before assuming either way; the required set differs per repository.`;
 }
 
 function appendReviewOutputEvidenceText(parts: string[], value: unknown, budget: { remaining: number }) {

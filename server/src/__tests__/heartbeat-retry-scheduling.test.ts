@@ -37,6 +37,7 @@ import {
   K8S_REPLACEMENT_LAUNCH_FAILURE_AFTER_THROTTLE_KEY,
   MAX_TURN_CONTINUATION_RETRY_REASON,
   MAX_TURN_CONTINUATION_WAKE_REASON,
+  describePrReviewGateMergeImpact,
   heartbeatService,
   isRetryableInteractionContinuationInfrastructureFailure,
   probeStaleKillReviewEvidence,
@@ -3544,6 +3545,80 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       expect(body).toContain("required_context_branch_http_403");
       expect(body).not.toContain("not a required status check");
       expect(body).not.toContain("does not block merge");
+    });
+
+    /**
+     * The `required` branch is the one that asks the reader to ACT, and it was
+     * the only one of the three never positively asserted — the two notice
+     * tests above pin `not_required` and `unknown` exactly and reference the
+     * required wording only as a `.not.toContain`. `describePrReviewGateMergeImpact`
+     * is exported and pure, so all three branches are asserted directly here.
+     */
+    describe("describePrReviewGateMergeImpact", () => {
+      const render = (lookup: Parameters<typeof describePrReviewGateMergeImpact>[0]["lookup"]) =>
+        describePrReviewGateMergeImpact({
+          lookup,
+          context: "review/ally-complete",
+          repoFullName: "Blockcast/penstock-llm-proxy-core",
+        });
+
+      it("says the gate DOES block merge where the context is required", () => {
+        const line = render({
+          outcome: "required",
+          baseRef: "main",
+          requiredContexts: ["review/ally-complete", "verify"],
+          source: "branch_protection",
+        });
+
+        expect(line).toContain("**is a required status check**");
+        expect(line).toContain("does block merge");
+        expect(line).toContain("`main`");
+        // The reassuring reading must be unreachable from this branch.
+        expect(line).not.toContain("does not block merge");
+        expect(line).not.toContain("**unread**");
+      });
+
+      it("names the ruleset when that is the surface requiring it", () => {
+        // A ruleset is precisely the surface a reader cannot see from
+        // `branches/{b}`, so saying which one required it is the actionable
+        // part — it tells them where to look.
+        const line = render({
+          outcome: "required",
+          baseRef: "main",
+          requiredContexts: ["review/ally-complete"],
+          source: "ruleset",
+        });
+
+        expect(line).toContain("**is a required status check**");
+        expect(line).toContain("ruleset");
+      });
+
+      it("refuses to claim either way when the lookup is unknown", () => {
+        const line = render({ outcome: "unknown", reason: "required_context_rules_http_500", baseRef: "main" });
+
+        expect(line).toContain("**unread**");
+        expect(line).toContain("required_context_rules_http_500");
+        // `baseRef` survives onto the unknown variant so the notice can name
+        // the branch it failed to read.
+        expect(line).toContain("`main`");
+        expect(line).not.toContain("does not block merge");
+        expect(line).not.toContain("**is a required status check**");
+      });
+
+      it("states not_required only about a branch where both surfaces were read", () => {
+        const line = render({
+          outcome: "not_required",
+          baseRef: "master",
+          branchProtected: true,
+          requiredContexts: [],
+        });
+
+        expect(line).toContain("**not a required status check**");
+        expect(line).toContain("does not block merge");
+        // The load-bearing sentence names the surfaces actually read, so it
+        // cannot be mistaken for a classic-protection-only answer.
+        expect(line).toContain("any ruleset in effect");
+      });
     });
 
     // BLO-34699: the PR author's own agent is woken by its own review-request
