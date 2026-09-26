@@ -1795,39 +1795,81 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     expect(rows[0]?.status).toBe("pending");
   });
 
-  it("keeps legacy request confirmations pending when comment supersede was not stored", async () => {
-    const { companyId, issueId } = await seedConfirmationIssue("Legacy confirmation without comment supersede flag");
+  // BLO-35308: the omitted field resolving to `true` is the fact the whole
+  // defect rests on, and it was the one thing no test pinned. Assert the
+  // resolved default explicitly for every supersedable kind, so a future change
+  // to the default is a deliberate edit to this list rather than a silent
+  // behaviour change nobody notices.
+  it.each([
+    ["ask_user_questions", {
+      version: 1,
+      questions: [{
+        id: "scope",
+        prompt: "Choose the scope",
+        selectionMode: "single",
+        options: [{ id: "phase-1", label: "Phase 1" }],
+      }],
+    }],
+    ["request_confirmation", { version: 1, prompt: "Proceed?" }],
+    ["request_checkbox_confirmation", {
+      version: 1,
+      prompt: "Confirm the items",
+      options: [{ id: "one", label: "One" }],
+    }],
+  ] as const)(
+    "resolves supersedeOnUserComment to true for %s when the field is omitted",
+    async (kind, payload) => {
+      const { companyId, issueId } = await seedConfirmationIssue(`Default resolution ${kind}`);
 
-    await db.insert(issueThreadInteractions).values({
-      id: randomUUID(),
-      companyId,
-      issueId,
+      const created = await interactionsSvc.create({ id: issueId, companyId }, {
+        kind,
+        payload,
+      } as unknown as CreateIssueThreadInteraction, { userId: "local-board" });
+
+      expect((created.payload as { supersedeOnUserComment?: boolean }).supersedeOnUserComment).toBe(true);
+
+      const [row] = await db
+        .select()
+        .from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.id, created.id));
+      expect((row?.payload as { supersedeOnUserComment?: boolean }).supersedeOnUserComment).toBe(true);
+    },
+  );
+
+  // BLO-35308: the pre-existing opt-out tests posted exactly one comment, so a
+  // regression that superseded on the Nth comment rather than the first would
+  // have passed them. A human gate waits days and collects routine traffic.
+  it("keeps an opted-out confirmation pending across many unrelated user comments", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Opt-out survives repeated comments");
+
+    await interactionsSvc.create({ id: issueId, companyId }, {
       kind: "request_confirmation",
-      status: "pending",
-      continuationPolicy: { kind: "none" },
       payload: {
         version: 1,
-        prompt: "Proceed with the current draft?",
+        prompt: "Sign off the dry run?",
+        supersedeOnUserComment: false,
       },
-      createdByUserId: "local-board",
-    });
+    } as CreateIssueThreadInteraction, { userId: "local-board" });
 
-    const expired = await interactionsSvc.expireRequestConfirmationsSupersededByComment({
-      id: issueId,
-      companyId,
-    }, {
-      id: randomUUID(),
-      createdAt: new Date(Date.now() + 1_000),
-      authorUserId: "local-board",
-    }, {
-      userId: "local-board",
-    });
+    for (let i = 0; i < 5; i += 1) {
+      const expired = await interactionsSvc.expireRequestConfirmationsSupersededByComment({
+        id: issueId,
+        companyId,
+      }, {
+        id: randomUUID(),
+        createdAt: new Date(Date.now() + (i + 1) * 1_000),
+        authorUserId: "local-board",
+      }, {
+        userId: "local-board",
+      });
+      expect(expired).toHaveLength(0);
+    }
 
-    expect(expired).toHaveLength(0);
     const rows = await db.select().from(issueThreadInteractions);
     expect(rows).toHaveLength(1);
     expect(rows[0]?.status).toBe("pending");
   });
+
 
   it("keeps legacy request confirmations pending when comment supersede was not stored", async () => {
     const { companyId, issueId } = await seedConfirmationIssue("Legacy confirmation without comment supersede flag");
@@ -2017,6 +2059,35 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       id: issueId,
       companyId,
     })).resolves.toEqual([]);
+  });
+
+  // BLO-35308: the route posts the supersession notice as a system comment with
+  // `{ runId }` alone. The route suite mocks addComment, so pin here that the
+  // real service persists that shape idempotently and rejects the agent-actor
+  // shape the notice used to pass (which the route's catch then swallowed).
+  it("persists a runId-only system notice idempotently and rejects one carrying an agentId", async () => {
+    const { issueId } = await seedConfirmationIssue("Supersession notice actor");
+    const idempotencyKey = `interaction-superseded:${randomUUID()}`;
+
+    const posted = await issuesSvc.addComment(issueId, "Pending ask expired.", { runId: null }, {
+      authorType: "system",
+      idempotencyKey,
+    });
+    expect(posted).toMatchObject({ authorType: "system", authorAgentId: null, authorUserId: null });
+
+    const retried = await issuesSvc.addComment(issueId, "Pending ask expired.", { runId: null }, {
+      authorType: "system",
+      idempotencyKey,
+    });
+    expect(retried).toMatchObject({ id: posted.id, deduplicated: true });
+
+    await expect(issuesSvc.addComment(issueId, "Pending ask expired.", { agentId: randomUUID(), runId: null }, {
+      authorType: "system",
+      idempotencyKey: `interaction-superseded:${randomUUID()}`,
+    })).rejects.toThrow("Comment authorType must match authenticated actor");
+
+    const rows = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(rows).toHaveLength(1);
   });
 
   it("does not repair historical confirmations from run-originated comments", async () => {
