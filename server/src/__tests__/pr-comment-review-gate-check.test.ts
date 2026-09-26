@@ -17,32 +17,30 @@ vi.mock("../config.js", () => ({ loadConfig: () => h.cfg }));
 const mockListComments = vi.hoisted(() => vi.fn());
 const mockListReviews = vi.hoisted(() => vi.fn());
 const mockFetchHeadSha = vi.hoisted(() => vi.fn());
+const mockFetchPrAuthor = vi.hoisted(() => vi.fn());
 const mockPostStatus = vi.hoisted(() => vi.fn());
 const mockPostCheckRun = vi.hoisted(() => vi.fn());
 const mockStatusDeliveryLock = vi.hoisted(() => vi.fn());
 
-vi.mock("../services/github-app-auth.js", () => ({
+// Only the network calls are mocked. The identity predicates are imported for
+// real via `importOriginal`: they are pure, and the hand-rolled copy this mock
+// used to carry could drift from the shipped one — which is precisely the class
+// of bug this suite exists to catch.
+vi.mock("../services/github-app-auth.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/github-app-auth.js")>()),
   githubFetchPrHeadSha: mockFetchHeadSha,
+  githubFetchPrAuthorLogin: mockFetchPrAuthor,
   githubListIssueCommentsWithTimestamps: mockListComments,
   githubListPrReviewsWithTimestamps: mockListReviews,
   githubPostCommitStatusDetailed: mockPostStatus,
   githubPostCheckRun: mockPostCheckRun,
-  githubReviewerIdentityMatches: (login: string, configuredLogin: string) => {
-    const candidate = login.trim().toLowerCase().replace(/^@/, "");
-    const configured = configuredLogin.trim().toLowerCase().replace(/^@/, "");
-    const appSlug = configured.endsWith("[bot]")
-      ? configured.slice(0, -"[bot]".length)
-      : configured.startsWith("app/")
-        ? configured.slice("app/".length)
-        : "";
-    return candidate === `${appSlug}[bot]` || candidate === `app/${appSlug}`;
-  },
 }));
 
 vi.mock("../services/github-status-delivery-outbox.js", () => ({
   withGithubStatusDeliveryLock: mockStatusDeliveryLock,
 }));
 
+import { admitsNothingEvaluated } from "../../../scripts/check-comment-review-gate-census.mjs";
 import { runPrCommentReviewGateCheck } from "../services/pr-comment-review-gate.js";
 
 // `db` is required on the input: the gate takes the shared delivery lock
@@ -64,6 +62,14 @@ function blockingCommentFor(headSha: string) {
   };
 }
 
+function cleanCommentFor(headSha: string, createdAt = "2026-08-04T22:09:19Z") {
+  return {
+    login: "allyblockcast[bot]",
+    body: `## Ally — Consolidated PR Review\nReviewed head: ${headSha}\n### Critical Issues (0)\n### Important Issues (0)`,
+    createdAt,
+  };
+}
+
 beforeEach(() => {
   h.cfg.prCommentReviewGateStatusContext = "review/ally-comment-gate";
   h.cfg.prCommentReviewGateRetiredStatusContexts = [];
@@ -71,6 +77,7 @@ beforeEach(() => {
   mockListComments.mockReset();
   mockListReviews.mockReset();
   mockFetchHeadSha.mockReset();
+  mockFetchPrAuthor.mockReset();
   mockPostStatus.mockReset();
   mockPostCheckRun.mockReset();
   mockStatusDeliveryLock.mockReset();
@@ -78,6 +85,9 @@ beforeEach(() => {
   // Default both surfaces to empty; each test overrides the one it exercises.
   mockListComments.mockResolvedValue([]);
   mockListReviews.mockResolvedValue([]);
+  // A PR author who is not the reviewer identity, so the existing fixtures keep
+  // their meaning; the self-attestation tests override it (BLO-34316).
+  mockFetchPrAuthor.mockResolvedValue("some-contributor");
   mockPostCheckRun.mockResolvedValue({ ok: true, statusCode: 201 });
 });
 
@@ -241,6 +251,168 @@ describe("runPrCommentReviewGateCheck", () => {
     });
   });
 
+  it("publishes neutral, not success, when the PR author wrote the attestation", async () => {
+    // BLO-34316. The live shape: agent PRs and agent reviews carry the same App
+    // identity, so the author's own comment reached the gate's strongest green.
+    mockFetchPrAuthor.mockResolvedValue("allyblockcast[bot]");
+    mockListComments.mockResolvedValue([
+      {
+        login: "allyblockcast[bot]",
+        body: `## Ally — Consolidated PR Review\nReviewed head: ${TARGET.headSha}\n### Critical Issues (0)\n### Important Issues (0)`,
+        createdAt: "2026-08-04T22:09:19Z",
+      },
+    ]);
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "success", outcome: "not_evaluated" },
+    });
+    expect(mockFetchPrAuthor).toHaveBeenCalledWith({
+      repoFullName: TARGET.repoFullName,
+      prNumber: TARGET.prNumber,
+    });
+    expect(mockPostCheckRun).toHaveBeenCalledWith(
+      expect.objectContaining({ conclusion: "neutral" }),
+    );
+    // Non-blocking on the status surface (BLO-29711): never pending/failure.
+    expect(mockPostStatus).toHaveBeenCalledWith(expect.objectContaining({ state: "success" }));
+  });
+
+  it("leaves the prior status untouched when the PR author cannot be read", async () => {
+    // Publishing on incomplete evidence would overwrite a correct earlier
+    // verdict with a weaker one on a transient failure. Same shape as an
+    // unreadable comment surface. The comment must be a CLEAN attestation:
+    // that is the only outcome whose verdict depends on the author, so it is
+    // the only one where an unreadable author may withhold a publish.
+    mockFetchPrAuthor.mockResolvedValue(null);
+    mockListComments.mockResolvedValue([
+      {
+        login: "allyblockcast[bot]",
+        body: `## Ally — Consolidated PR Review\nReviewed head: ${TARGET.headSha}\n### Critical Issues (0)\n### Important Issues (0)`,
+        createdAt: "2026-08-04T22:09:19Z",
+      },
+    ]);
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toEqual({
+      posted: false,
+      reason: "fetch_failed",
+    });
+    expect(mockPostStatus).not.toHaveBeenCalled();
+  }, 10_000);
+
+  it("still publishes a red when the PR author cannot be read", async () => {
+    // Regression: the author fetch was an unconditional precondition for
+    // publishing ANY verdict, so a transient failure on `GET /pulls/{n}` —
+    // while the comment surfaces stayed healthy — dropped a `failure` the
+    // previous code published. No status had ever existed for the head, so the
+    // merge surface showed the finding as absent rather than red.
+    mockFetchPrAuthor.mockResolvedValue(null);
+    mockListComments.mockResolvedValue([blockingCommentFor(TARGET.headSha)]);
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "failure", outcome: "blocking_finding" },
+    });
+    expect(mockPostStatus).toHaveBeenCalledWith(expect.objectContaining({ state: "failure" }));
+    // Both reds are author-blind, so the fetch is never even attempted.
+    expect(mockFetchPrAuthor).not.toHaveBeenCalled();
+  });
+
+  it("still publishes a carried finding when the PR author cannot be read", async () => {
+    // The other author-blind red. A finding raised against an earlier head
+    // carries forward (BLO-29711); it must not go silent on an author fetch.
+    mockFetchPrAuthor.mockResolvedValue(null);
+    mockListComments.mockResolvedValue([blockingCommentFor("0".repeat(40))]);
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "failure", outcome: "carried_finding" },
+    });
+    expect(mockFetchPrAuthor).not.toHaveBeenCalled();
+  });
+
+  it("clears a carried finding when a DISTINCT author's comment attests the head", async () => {
+    // BLO-34316 regression. The carried-finding branch consumes the withheld
+    // positive, so gating the author fetch on `outcome === "not_evaluated"`
+    // never fetched here — and `clean` is unreachable on the author-blind pass
+    // by construction. Result was a green->red flip on a merge-blocking status
+    // for a head an independent reviewer did attest.
+    mockFetchPrAuthor.mockResolvedValue("some-contributor");
+    mockListComments.mockResolvedValue([
+      blockingCommentFor("0".repeat(40)),
+      cleanCommentFor(TARGET.headSha),
+    ]);
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "success", outcome: "clean" },
+    });
+    expect(mockFetchPrAuthor).toHaveBeenCalledWith({
+      repoFullName: TARGET.repoFullName,
+      prNumber: TARGET.prNumber,
+    });
+  });
+
+  it("tells a self-attesting author why their attestation did not clear the carry", async () => {
+    // Same input, author == reviewer identity. The red is correct here, but it
+    // must name the real reason: before the fetch reached this route the tail
+    // always rendered "not known to be independent", asserting the author was
+    // unreadable when it had simply never been requested.
+    mockFetchPrAuthor.mockResolvedValue("allyblockcast[bot]");
+    mockListComments.mockResolvedValue([
+      blockingCommentFor("0".repeat(40)),
+      cleanCommentFor(TARGET.headSha),
+    ]);
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "failure", outcome: "carried_finding" },
+    });
+    expect(mockPostStatus).toHaveBeenCalledWith(
+      expect.objectContaining({
+        state: "failure",
+        description: expect.stringContaining("the only comment attesting it is the PR author's own"),
+      }),
+    );
+  });
+
+  it("publishes a carried finding whose author fetch failed rather than going silent", async () => {
+    // The fetch is now reached on a `failure` too, so its failure handling has
+    // to branch on `verdict.state`: withholding a red on an unreadable author
+    // would drop a finding the comment surfaces already justify.
+    mockFetchPrAuthor.mockResolvedValue(null);
+    mockListComments.mockResolvedValue([
+      blockingCommentFor("0".repeat(40)),
+      cleanCommentFor(TARGET.headSha),
+    ]);
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "failure", outcome: "carried_finding" },
+    });
+    expect(mockFetchPrAuthor).toHaveBeenCalled();
+  }, 10_000);
+
+  it("does not fetch the PR author when nothing attests the head", async () => {
+    // `not_evaluated` for "no comment attests this head" is reached from the
+    // comment surfaces alone, so it costs no request inside the serialized lock.
+    mockListComments.mockResolvedValue([]);
+    mockListReviews.mockResolvedValue([]);
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "success", outcome: "not_evaluated" },
+    });
+    expect(mockFetchPrAuthor).not.toHaveBeenCalled();
+  });
+
   it("leaves the prior status untouched when the reviews surface cannot be read", async () => {
     // Half the history is not a verdict. Symmetric with the issue-comment path.
     mockListComments.mockResolvedValue([]);
@@ -287,11 +459,10 @@ describe("retired status contexts", () => {
 
     const retired = postFor("review/ally-comment");
     expect(retired).toMatchObject({ sha: TARGET.headSha, state: "success" });
-    // This is what the census greps for. A retirement pointer that still
-    // admitted "nothing attests" would leave AC#1 failing under the old name.
-    expect(retired?.description).not.toMatch(
-      /no Ally consolidated-review comment attests|no head SHA was supplied/i,
-    );
+    // Pinned against the census's own predicate, not a copy of its regex: the
+    // copy went stale the moment the census grew a third alternative, leaving
+    // this guard narrower than the audit it exists to mirror.
+    expect(admitsNothingEvaluated(retired?.description)).toBe(false);
     expect(retired?.description).toContain("gate/ally-comment-findings");
     expect(retired?.description.length).toBeLessThanOrEqual(140);
   });
