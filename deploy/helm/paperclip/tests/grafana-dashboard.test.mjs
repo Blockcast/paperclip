@@ -67,8 +67,32 @@ function renderDashboard(extraArgs = [], key = DASHBOARD_KEY) {
   return { rendered, dashboard: JSON.parse(body) };
 }
 
+// Slice out ONE rendered manifest by its metadata.name. Slicing merely *from*
+// the name to end-of-render is still fail-open -- it swallows every manifest
+// that follows, so a later labelled ConfigMap satisfies the assertion made
+// about this one. Mutation-proven: stripping the funnel's sidecar label alone
+// left the slice-to-end form green, carried by the platform ConfigMap below it.
+// Bounding at the next unindented `---` is safe here because the embedded
+// dashboard JSON is a 4-space-indented block scalar, so it cannot contain one.
+// Labels follow `name:` within metadata in this template, so starting at the
+// name (rather than at `apiVersion:`) still covers them.
+const manifestNamed = (rendered, name) => {
+  const start = rendered.indexOf(`name: ${name}\n`);
+  assert.ok(start !== -1, `render must contain a manifest named ${name}`);
+  const end = rendered.indexOf("\n---", start);
+  return end === -1 ? rendered.slice(start) : rendered.slice(start, end);
+};
+
+// A row collapsed in the Grafana UI re-exports with its children nested under
+// `row.panels` instead of as top-level siblings. Every row is `collapsed: false`
+// today, so this flatten is a no-op -- but a PARTIAL collapse would silently
+// drop those panels out of every target assertion below, which is a fail-open.
+// (A total collapse fails loudly: `uids` empties and the deepEqual fires.)
+const flattenPanels = (panels = []) =>
+  panels.flatMap((panel) => [panel, ...flattenPanels(panel.panels)]);
+
 const allTargets = (dashboard) =>
-  dashboard.panels.flatMap((panel) =>
+  flattenPanels(dashboard.panels).flatMap((panel) =>
     (panel.targets ?? []).map((target) => ({ panel, target })),
   );
 
@@ -84,8 +108,15 @@ test("Blockcast values render the Grafana dashboard ConfigMap with the sidecar l
     /name: paperclip-grafana-dashboard-review-request-funnel/,
     "Blockcast values must render the review-request funnel dashboard ConfigMap",
   );
+
+  // Scope the label match to THIS ConfigMap. Matched against the whole render
+  // it is fail-open: any one labelled ConfigMap anywhere satisfies it, and this
+  // chart now renders three.
   assert.match(
-    rendered,
+    manifestNamed(
+      rendered,
+      "paperclip-grafana-dashboard-review-request-funnel",
+    ),
     /^\s+grafana_dashboard: "1"$/m,
     'dashboard ConfigMap must carry grafana_dashboard: "1" or the Grafana sidecar will not adopt it',
   );
@@ -136,7 +167,7 @@ test("every dashboard target is pinned to a datasource uid that can see papercli
 test("the funnel panel plots all four required delivery states (BLO-20171 acceptance criterion)", () => {
   const { dashboard } = renderDashboard();
 
-  const funnel = dashboard.panels.find((panel) =>
+  const funnel = flattenPanels(dashboard.panels).find((panel) =>
     panel.title.startsWith("Delivery funnel by state"),
   );
   assert.ok(funnel, "dashboard must carry a delivery-funnel panel");
@@ -196,7 +227,9 @@ test("the restart-safe dead-letter gauge is on the dashboard (BLO-20171 acceptan
   const { dashboard } = renderDashboard();
 
   const gaugeTargets = allTargets(dashboard).filter(({ target }) =>
-    target.expr?.includes("paperclip_github_review_request_dead_letter_unresolved"),
+    target.expr?.includes(
+      "paperclip_github_review_request_dead_letter_unresolved",
+    ),
   );
 
   assert.ok(
@@ -372,9 +405,7 @@ test("Blockcast values render the Paperclip Platform dashboard ConfigMap with th
     "Blockcast values must render the Paperclip Platform dashboard ConfigMap",
   );
 
-  const block = rendered.slice(
-    rendered.indexOf("name: paperclip-grafana-dashboard-platform"),
-  );
+  const block = manifestNamed(rendered, "paperclip-grafana-dashboard-platform");
   assert.match(
     block,
     /^\s+grafana_dashboard: "1"$/m,
@@ -397,7 +428,10 @@ test("the platform dashboard carries no import-only datasource scaffolding (BLO-
     !("__inputs" in dashboard),
     "__inputs is import-UI scaffolding; a provisioned dashboard must pin its datasource instead",
   );
-  assert.ok(!("__requires" in dashboard), "__requires is import-UI scaffolding");
+  assert.ok(
+    !("__requires" in dashboard),
+    "__requires is import-UI scaffolding",
+  );
   assert.ok(
     !JSON.stringify(dashboard).includes("${DS_"),
     "no panel may resolve its datasource through a template variable; it would silently fall back to the Grafana default",
@@ -428,7 +462,10 @@ test("the platform dashboard charts both BLO-18012 series, discriminated by erro
   const countExpr = exprs.find((expr) =>
     expr.includes("paperclip_agent_status_error_agents"),
   );
-  assert.ok(countExpr, "dashboard must chart paperclip_agent_status_error_agents");
+  assert.ok(
+    countExpr,
+    "dashboard must chart paperclip_agent_status_error_agents",
+  );
   assert.match(
     countExpr,
     /by \(error_reason\)/,
@@ -460,7 +497,7 @@ test("the time-in-error panel shows the 2-min BLO-18012 bound as a threshold (BL
   // and the bound is meaningless if the axis is not in seconds.
   const { dashboard } = renderDashboard([], PLATFORM_KEY);
 
-  const panel = dashboard.panels.find(({ targets }) =>
+  const panel = flattenPanels(dashboard.panels).find(({ targets }) =>
     (targets ?? []).some(({ expr }) =>
       expr?.includes("paperclip_agent_status_error_oldest_age_seconds"),
     ),
@@ -479,9 +516,15 @@ test("the time-in-error panel shows the 2-min BLO-18012 bound as a threshold (BL
     ),
     "the panel must carry a red threshold at 120s -- BLO-18012's <=2 min recovery bound",
   );
-  assert.notEqual(
-    defaults.custom?.thresholdsStyle?.mode,
-    "off",
+  // Assert a drawing mode positively rather than asserting `!== "off"`. The
+  // `?? "off"` is the load-bearing half: an ABSENT thresholdsStyle is Grafana's
+  // not-drawn default, so a negative assertion passes on `undefined` and misses
+  // the likeliest way this regresses -- the key being dropped rather than
+  // respelled. Mutation-proven: deleting `custom.thresholdsStyle`, and deleting
+  // the whole `custom` block, both left the old `notEqual` form green.
+  assert.match(
+    defaults.custom?.thresholdsStyle?.mode ?? "off",
+    /^(line|dashed|area|line\+area|dashed\+area)$/,
     "the threshold must be drawn on the plot; an unrendered threshold is not a visible bound",
   );
 });
