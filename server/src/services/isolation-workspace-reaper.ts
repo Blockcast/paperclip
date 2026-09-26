@@ -99,6 +99,7 @@ import path from "node:path";
 import type { Db } from "@paperclipai/db";
 import { executionWorkspaces } from "@paperclipai/db";
 import { logger as defaultLogger } from "../middleware/logger.js";
+import { recordIsolationWorkspaceReapSweep } from "./metrics.js";
 
 /** Top-level entries a reapable isolation workspace may contain, sorted. */
 export const REAPABLE_LAYOUT = ["home", "session"] as const;
@@ -465,6 +466,12 @@ export async function reapIsolationWorkspaces(
     { root, maxAgeDays: options.maxAgeDays, dryRun: options.dryRun === true, ...result },
     "isolation-workspace reaper sweep complete",
   );
+  // BLO-36814. The log line above lives on one pod with log retention; this is
+  // the scraped surface that says a daily irreversible-delete sweep is still
+  // ticking. Both, deliberately: the counters answer "how many, of which
+  // outcome, over what window" long after the pod is gone, the log keeps the
+  // per-directory detail that must never become a label.
+  recordIsolationWorkspaceReapSweep(result, { dryRun: options.dryRun === true, now });
   return result;
 }
 
