@@ -7,7 +7,12 @@
     "comes back to life is re-audited automatically. Entries are therefore expected to go stale;",
     "the guard warns about ones that match nothing and pruning them never changes the verdict.",
     "Adding an entry suppresses a real finding: name the PR, the owning issue, and why.",
-    "Empty since BLO-25764 (2026-09-23): every entry here suppressed an I1 same-head App duplicate, and all six had gone stale. That shape is no longer a violation when the bodies differ (a re-review supersedes), so those entries can never match again."
+    "Empty since BLO-25764 (2026-09-23). Six entries were removed: four I1 and two I3. The reason that",
+    "covers all six is head supersession — every baselined head had moved (#1304 -> 2687a148, #1360 ->",
+    "66782c03, #1525 -> 7745835e all merged; #1316 pushed to cd7e0c84), and a fingerprint embeds the",
+    "head, so none of them can match again. Separately, the I1 shape four of them suppressed is no",
+    "longer a violation when the bodies differ (a re-review supersedes); that exemption is I1-only and",
+    "does not reach I3, which asserts one canonical body and a matching attestation."
   ],
   "entries": []
 }
