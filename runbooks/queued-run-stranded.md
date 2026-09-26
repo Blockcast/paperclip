@@ -414,11 +414,14 @@ Source: `server/src/services/agent-start-lock.ts` (`withAgentStartLock`,
 (`refreshAgentStartLockMetrics`)
 Trigger: alert `PaperclipAgentStartLockWedged` —
 `count(max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 900) >= 3`
-for 10m (retuned by BLO-36522; was `max by (agent_id) (...) > 300` for 5m).
+for 10m once BLO-36522's retune lands. That retune is in `Blockcast/onprem-k8s#3985`,
+**not yet merged**: until it lands, the live rule is still
+`max by (agent_id) (...) > 300` for 5m, and this alert still fires on
+single-agent routine contention.
 The rule is quoted here for readability only and lives in a different repo —
 the source of record is the lockstep pair `paperclip/paperclip-runtime-alerts-prometheusrule.yaml`
 and `monitoring/prometheus-rules-2-configmap.yaml` in `Blockcast/onprem-k8s`.
-Read `900`/`10m` there before acting on either number.
+Read the numbers there before acting on either one.
 Owner: Platform / SRE (PEN-3305)
 
 ### ⚠️ What this alert claims, and what it no longer claims (BLO-36522)
@@ -460,8 +463,8 @@ agents rather than raising the duration bound. Backtested at 179 fleet-minutes
 retains.
 
 **Severity stays `critical`, on a new basis.** The old justification was the
-non-self-healing claim above, which is dead. It stays critical because it now
-fires only on the fleet-scope episode, and because it must keep the
+non-self-healing claim above, which is dead. It stays critical because, once
+#3985 lands, it fires only on the fleet-scope episode, and because it must keep the
 out-of-band Slack path precisely *because* the suspected fault is in
 paperclip's own dispatcher — routing it `warning` would put the page behind
 the component it is reporting on. **The action is diagnostic capture, not a
@@ -490,7 +493,7 @@ you restart it."* Those are different claims and only the first is supported.
 
 ⚠️ **The date bound is load-bearing, and the exception is the paragraph
 directly below.** The 2026-09-15/16 episode predates it, is the *only*
-documented instance of the fleet-scope regime this alert now fires on, and is
+documented instance of the fleet-scope regime the retuned alert fires on, and is
 on record as having ended with a pod replacement. It is **not** a
 counter-example to the self-heal claim, and it is **not** evidence for it
 either: the pod was replaced before the hold was ever observed long enough to
@@ -535,7 +538,8 @@ that is slow. `agent start lock held far past its budget; queued-run dispatch
 for this agent has stopped` (error, first at 5m then every 5m) is driven by
 `LOCK_HELD_ERROR_MS` (300s) in `agent-start-lock.ts`.
 
-⚠️ **The log line and this alert deliberately no longer share a number.**
+⚠️ **Once #3985 lands, the log line and this alert deliberately no longer
+share a number.** Until then the live rule is still pinned to the same 300s.
 Before BLO-36522 they were pinned together at 300s so "the log line and the
 page cannot disagree". That pinning was abandoned on purpose: 300s is the
 right boundary for the *log* — it is where the code stops calling a hold slow
@@ -624,7 +628,8 @@ argument *against* restarting.
 | low / sparse | `0` | **inconclusive, NOT stuck** — too few samples to decrease from. Do not restart on this. |
 
 A `6h` range is also wider than most holds; scoping the range nearer the hold's
-own age makes the comparison sharper.
+own age makes the comparison sharper for diagnosis. The restart gate below
+deliberately keeps the `[6h]` range.
 
 Record the agent ids, **both** the `resets` and `count_over_time` values, and
 the pool split **on the issue**. Those together are what nobody has captured
@@ -640,6 +645,12 @@ the affected agents, **and** a permanently `active` connection count with
 nothing queued (a stuck transaction), **and** zero dispatches (`startedAt` not
 moving). All four, not `resets == 0` alone. Absent that, wait. If you do
 restart, capture the block above first.
+
+That gate cannot be met until the hold is roughly six hours old. The series
+does not exist before acquisition, so a younger hold cannot be present
+throughout a `[6h]` window and lands in the inconclusive third row. This is
+deliberate: in practice the gate means "wait about 6h", and the one long hold
+observed end to end (2h14m) released on its own well inside that.
 
 The real fix — making the critical section's awaits abortable so `fn` rejects
 and releases the lock through the existing `finally` — is out of scope of the
@@ -678,9 +689,11 @@ does **not** make the page live. The rule must also land in the two lockstep
 must be synced (BLO-19095). Verify at `/api/v1/rules` before relying on it.
 
 ⚠️ **KNOWN DIVERGENCE, accepted and recorded rather than fixed (BLO-36522).**
-The BLO-36522 retune landed in the two `Blockcast/onprem-k8s` copies — the
-only ones that fire at Blockcast — and **deliberately not** in the chart copy
-above, which still carries `max by (agent_id) (...) > 300` for 5m wired to
+The BLO-36522 retune is prepared for the two `Blockcast/onprem-k8s` copies (the
+only ones that fire at Blockcast) in `Blockcast/onprem-k8s#3985`, which is
+**not yet merged**: until it lands, the live rule is still `> 300` for 5m and
+this alert still fires on single-agent routine contention. It is
+**deliberately not** in the chart copy above, which still carries `max by (agent_id) (...) > 300` for 5m wired to
 `prometheusRule.agentStartLockHeldSeconds` / `LOCK_HELD_ERROR_MS`. It renders
 nothing here, so this costs Blockcast nothing today. It is a landmine for
 anyone who enables that chart elsewhere: they would get the pre-retune
