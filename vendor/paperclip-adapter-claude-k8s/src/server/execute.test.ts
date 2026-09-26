@@ -39,28 +39,37 @@ const mockReadSkillEntries = vi.hoisted(() => vi.fn());
 // Module-level state for fs mock - kept for future use if mock is needed
 const mockFsContent = new Map<string, string>();
 
-vi.mock("./k8s-client.js", () => ({
-  getLogApi: () => ({ log: mockLogFn }),
-  getBatchApi: () => ({
-    listNamespacedJob: mockBatchListJobs,
-    createNamespacedJob: mockBatchCreateJob,
-    readNamespacedJob: mockBatchReadJob,
-    deleteNamespacedJob: mockBatchDeleteJob,
-    patchNamespacedJob: mockBatchPatchJob,
-  }),
-  getCoreApi: () => ({
-    listNamespacedPod: mockCoreListPods,
-    readNamespacedPodLog: mockCoreReadPodLog,
-    createNamespacedSecret: mockCoreCreateSecret,
-    readNamespacedSecret: mockCoreReadSecret,
-    replaceNamespacedSecret: mockCoreReplaceSecret,
-    patchNamespacedSecret: mockCorePatchSecret,
-    deleteNamespacedSecret: mockCoreDeleteSecret,
-  }),
-  getAuthzApi: () => ({}),
-  getSelfPodInfo: mockGetSelfPodInfo,
-  resetCache: vi.fn(),
-}));
+// Partial mock via importOriginal, same reason as the prompt-cache and
+// server-utils mocks below: only the API accessors need replacing, and a
+// whole-module replacement silently drops every other export the module gains
+// later (BLO-32734 added SELF_POD_DATA_MOUNT_PATH and broke 4 tests here that
+// way). k8s-client.ts has no import-time side effects, so evaluating the real
+// module is free.
+vi.mock("./k8s-client.js", async (importOriginal) => {
+  const original = await importOriginal<typeof import("./k8s-client.js")>();
+  return Object.assign(Object.create(null), original, {
+    getLogApi: () => ({ log: mockLogFn }),
+    getBatchApi: () => ({
+      listNamespacedJob: mockBatchListJobs,
+      createNamespacedJob: mockBatchCreateJob,
+      readNamespacedJob: mockBatchReadJob,
+      deleteNamespacedJob: mockBatchDeleteJob,
+      patchNamespacedJob: mockBatchPatchJob,
+    }),
+    getCoreApi: () => ({
+      listNamespacedPod: mockCoreListPods,
+      readNamespacedPodLog: mockCoreReadPodLog,
+      createNamespacedSecret: mockCoreCreateSecret,
+      readNamespacedSecret: mockCoreReadSecret,
+      replaceNamespacedSecret: mockCoreReplaceSecret,
+      patchNamespacedSecret: mockCorePatchSecret,
+      deleteNamespacedSecret: mockCoreDeleteSecret,
+    }),
+    getAuthzApi: () => ({}),
+    getSelfPodInfo: mockGetSelfPodInfo,
+    resetCache: vi.fn(),
+  });
+});
 
 const mockPrepareBundle = vi.fn();
 // Partial mock via importOriginal, matching the server-utils mock below: only

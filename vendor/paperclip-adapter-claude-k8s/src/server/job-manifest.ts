@@ -15,6 +15,7 @@ import path from "node:path";
 import type { ClaudePromptBundle } from "./prompt-cache.js";
 import { buildEnvGuardSetupShell } from "./env-guard.js";
 import { SERVER_ONLY_ENV_DENY } from "./inherit-allowlist.js";
+import { SELF_POD_DATA_MOUNT_PATH } from "./k8s-client.js";
 
 /**
  * Default path to the project-scope .mcp.json that paperclip's helm-chart seed-init
@@ -79,10 +80,214 @@ function assertSafeAbsolutePath(field: string, value: string): void {
   }
 }
 
-export function buildPodLogPath(companyId: string, agentId: string, runId: string, isolationKey?: string): string {
-  const dir = isolationKey
-    ? `/paperclip/instances/default/data/run-logs/${companyId}/${agentId}/isolated/${isolationKey}`
-    : `/paperclip/instances/default/data/run-logs/${companyId}/${agentId}`;
+/** One nested rw re-mount of the shared `data` volume, scoped to `subPath`. */
+export type ScopedWritableMount = { subPath: string; mountPath: string };
+
+/**
+ * Agent-ad-hoc scratch trees directly under `dataMountPath`. These are not
+ * adapter contract — nothing in this builder reads or writes them — but agents
+ * across every company have a long-standing habit of using them, so they are
+ * re-mounted at the SAME path with a company-scoped `subPath`. An agent keeps
+ * writing `/paperclip/work/foo` verbatim and lands in its own company's subdir:
+ * cross-company write closes without any convention changing, which is what
+ * makes this safe for writers this builder cannot enumerate.
+ */
+const SCRATCH_DIR_NAMES = ["work", "wt"] as const;
+
+/**
+ * Rejects a path that is not already canonical. `path.posix.normalize` collapses
+ * `.`/`..`, so a value that differs from its own normalization contained
+ * traversal syntax — which, interpolated into a `subPath`, would escape the
+ * company scope this whole mechanism exists to establish. Fail the build rather
+ * than emit a mount whose effective target is not the path it names.
+ *
+ * Deliberately NOT "must be under dataMountPath": `tmpRoot` and `cacheRoot`
+ * legitimately point at the node-local `/runtime-cache` emptyDir, and rejecting
+ * those would fail every isolated run. Containment is enforced by the
+ * `startsWith(prefix)` partition in `resolveScopedWritableMounts` instead.
+ */
+function assertNormalizedPath(field: string, value: string): void {
+  if (path.posix.normalize(value) !== value) {
+    throw new Error(`${field} must be a normalized absolute path (no "." or ".." segments): ${value}`);
+  }
+}
+
+/**
+ * A linked git worktree (the `git_worktree` execution-workspace strategy) keeps
+ * its git state OUTSIDE its own tree: `.git` is a file naming
+ * `<common>/worktrees/<id>` (index, HEAD, reflogs), and `<common>` holds the refs
+ * and the object store every commit writes into. Covering `workspaceRoot` alone
+ * yields a run that can edit files but cannot `git add`/`commit`/`checkout`, all
+ * EROFS under the read-only data mount. Returns `<common>`, which covers both, or
+ * null when `workspaceRoot` is not a verifiable linked worktree.
+ *
+ * The pointer lives in the run's OWN writable tree, so it is agent-controlled:
+ * taken at face value, one run could aim it at a foreign company's repo and have
+ * the next run mount that repo rw. It is accepted only when git's own two-way
+ * registration holds, none of which a scoped run can forge outside its own
+ * trees: the target has the `<common>/worktrees/<id>` shape (so `<common>` comes
+ * from path arithmetic, never from the agent-writable `commondir` file), its
+ * `gitdir` file points back at this worktree's `.git`, and `<common>/HEAD`
+ * exists. The last rejects a registration forged inside the worktree itself,
+ * whose shape would otherwise name the worktree's parent dir as `<common>`.
+ *
+ * Read through `serverRoot`, where THIS process reaches the volume; see
+ * `buildPodLogPath` for why that differs from the pod's `dataMountPath`.
+ */
+export function resolveLinkedWorktreeCommonDir(
+  workspaceRoot: string,
+  dataMountPath: string,
+  serverRoot: string = SELF_POD_DATA_MOUNT_PATH,
+): string | null {
+  const prefix = dataMountPath.endsWith("/") ? dataMountPath : `${dataMountPath}/`;
+  // Off-volume paths are not the server's to read (e.g. the pod-local
+  // `/runtime-cache` emptyDir), and not ours to scope either.
+  const read = (podPath: string): string | null => {
+    if (!podPath.startsWith(prefix)) return null;
+    try {
+      return readFileSync(path.posix.join(serverRoot, podPath.slice(prefix.length)), "utf8").trim();
+    } catch {
+      return null;
+    }
+  };
+  const dotGit = path.posix.join(workspaceRoot, ".git");
+  // A missing `.git`, or a directory (EISDIR), is an ordinary checkout or no
+  // repo at all: its git state is already inside `workspaceRoot`.
+  const pointer = /^gitdir: (.+)$/.exec(read(dotGit) ?? "")?.[1];
+  if (!pointer) return null;
+  const gitDir = path.posix.resolve(workspaceRoot, pointer);
+  const common = path.posix.dirname(path.posix.dirname(gitDir));
+  const backPointer = read(path.posix.join(gitDir, "gitdir"));
+  const reason =
+    path.posix.basename(path.posix.dirname(gitDir)) !== "worktrees"
+      ? "gitdir_not_a_worktree_registration"
+      : backPointer === null || path.posix.resolve(gitDir, backPointer) !== dotGit
+        ? "gitdir_back_pointer_mismatch"
+        : read(path.posix.join(common, "HEAD")) === null
+          ? "common_dir_not_a_git_dir"
+          : null;
+  if (reason === null) return common;
+  // Named rather than silent: the run proceeds narrowed, and git then fails
+  // EROFS mid-run, which is unreadable without this.
+  console.warn(
+    JSON.stringify({
+      level: "warn",
+      event: "claude_k8s.worktree_gitdir_rejected",
+      msg: "linked worktree git dir not made writable; git writes in this run will fail read-only",
+      reason,
+      workspaceRoot,
+      gitDir,
+    }),
+  );
+  return null;
+}
+
+/**
+ * Derives the set of trees an agent pod must be able to WRITE, so the rest of
+ * the shared `data` PVC can be mounted read-only (BLO-32734).
+ *
+ * Why a mount and not file modes: every agent pod runs as the same uid (1000),
+ * so no `chmod`/`chown`/POSIX-ACL change can separate one company from another —
+ * a company dir carrying stricter `2755`/`644` modes was still fully writable
+ * from a foreign pod. The boundary has to be something uid-independent, and
+ * `subPath` is: the kubelet binds only that subtree into the container, so paths
+ * outside it are not merely unreadable but absent from the mount namespace.
+ *
+ * The set is DERIVED from the values the builder already computes — the
+ * isolation descriptor's roots, the pod-log path, the instructions bundle, the
+ * prompt bundle — rather than hand-listed. That is the point: a hand-listed set
+ * is a floor that can only contain the paths whoever wrote it happened to know,
+ * and it silently drifts the first time a root moves. Deriving it means the
+ * mount and the path it is meant to cover cannot disagree.
+ *
+ * Returns a minimal set: any target that is a descendant of another target is
+ * dropped, since the ancestor's mount already makes it writable.
+ */
+export function resolveScopedWritableMounts(input: {
+  dataMountPath: string;
+  isolation: JobIsolation;
+  podLogPath: string;
+  instructionsFilePath: string | null;
+  addDir: string | null;
+  companyId: string;
+  /** Where this process reaches the same volume; see `resolveLinkedWorktreeCommonDir`. */
+  serverDataMountPath?: string;
+}): ScopedWritableMount[] {
+  const { dataMountPath, isolation, podLogPath, instructionsFilePath, addDir, companyId, serverDataMountPath } = input;
+  const prefix = dataMountPath.endsWith("/") ? dataMountPath : `${dataMountPath}/`;
+
+  // Trees written at their own absolute location. A falsy entry means the field
+  // is unset for this run (e.g. `promptCacheRoot` is "" on a runtime descriptor,
+  // `sessionRoot` defaults to `homeRoot`), not that it resolves to the volume root.
+  const candidates: Array<[string, string]> = [
+    ["podLogPath", path.posix.dirname(podLogPath)],
+    ["isolation.homeRoot", isolation.homeRoot],
+    ["isolation.sessionRoot", isolation.sessionRoot],
+    ["isolation.workspaceRoot", isolation.workspaceRoot],
+    // A linked worktree's index, refs and objects live outside `workspaceRoot`.
+    [
+      "isolation.workspaceRoot git common dir",
+      resolveLinkedWorktreeCommonDir(isolation.workspaceRoot, dataMountPath, serverDataMountPath) ?? "",
+    ],
+    ["isolation.cacheRoot", isolation.cacheRoot],
+    ["isolation.tmpRoot", isolation.tmpRoot],
+    ["isolation.promptCacheRoot", isolation.promptCacheRoot],
+    // The agent's OWN instructions bundle stays writable: `instructionsBundleMode:
+    // managed` makes that directory the canonical store of the agent's charter,
+    // which agents edit. Only FOREIGN bundles become unreachable.
+    ["instructionsFilePath", instructionsFilePath ? path.posix.dirname(instructionsFilePath) : ""],
+    ["promptBundle.addDir", addDir ?? ""],
+  ];
+
+  const onVolume: string[] = [];
+  for (const [field, raw] of candidates) {
+    if (!raw) continue;
+    assertSafeAbsolutePath(field, raw);
+    assertNormalizedPath(field, raw);
+    // Off-volume roots (the `/runtime-cache` emptyDir, `/tmp`) are already
+    // writable and are not ours to scope.
+    if (raw !== dataMountPath && !raw.startsWith(prefix)) continue;
+    if (raw === dataMountPath) {
+      throw new Error(`${field} must not be the data mount root itself (${dataMountPath}); that would re-open the whole volume for writing`);
+    }
+    if (!onVolume.includes(raw)) onVolume.push(raw);
+  }
+
+  // Drop any target an ancestor target already covers.
+  const minimal = onVolume.filter(
+    (candidate) => !onVolume.some((other) => other !== candidate && candidate.startsWith(`${other}/`)),
+  );
+
+  const mounts: ScopedWritableMount[] = minimal
+    .sort()
+    .map((absolute) => ({ subPath: absolute.slice(prefix.length), mountPath: absolute }));
+
+  for (const name of SCRATCH_DIR_NAMES) {
+    mounts.push({ subPath: `${name}/${companyId}`, mountPath: `${prefix}${name}` });
+  }
+  return mounts;
+}
+
+/** The pod log lives on the shared data volume, which the server and the agent
+ *  pod reach at DIFFERENT absolute paths: the server always at
+ *  `SELF_POD_DATA_MOUNT_PATH`, the pod at whatever `config.workspaceMountPath`
+ *  says. `root` selects which address space you want. It defaults to the
+ *  server's, because every caller outside this module is server-side
+ *  (`tailPodLogFile`, the final read-back, the cleanup `unlink`).
+ *
+ *  Pass the pod's mount path for anything the CONTAINER executes — the `tee`
+ *  target, its `mkdir -p`, and the writable-subPath derivation. Under a custom
+ *  mount path the server root is not on the pod's volume at all, so a log
+ *  written there lands on the container filesystem and vanishes with the pod. */
+export function buildPodLogPath(
+  companyId: string,
+  agentId: string,
+  runId: string,
+  isolationKey?: string,
+  root: string = SELF_POD_DATA_MOUNT_PATH,
+): string {
+  const base = `${root}/instances/default/data/run-logs/${companyId}/${agentId}`;
+  const dir = isolationKey ? `${base}/isolated/${isolationKey}` : base;
   return `${dir}/${runId}.pod.ndjson`;
 }
 
@@ -890,6 +1095,13 @@ export interface JobBuildResult {
   /** Resolved ServiceAccount for the Job's pod template — echoed here so
    *  callers can log/report it without a cluster read (BLO-21812). */
   serviceAccountName: string;
+  /** Absolute paths, ON THE SERVER'S OWN FILESYSTEM, backing this Job's nested
+   *  rw `subPath` mounts. The caller must create them before the Job: without
+   *  fsGroup the kubelet creates a missing subPath dir as root:root 0755, which
+   *  the pod's uid 1000 cannot write (BLO-32734). Only ever populated when the
+   *  Job mounts the server's own PVC, so the server can reach them; empty when
+   *  the run keeps the broad rw mount. */
+  scopedWritableDirs: string[];
 }
 
 function sanitizeForK8sName(value: string, maxLen = 16): string {
@@ -1516,9 +1728,59 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       ? { name: "data", persistentVolumeClaim: { claimName: dataClaimName } }
       : { name: "data", emptyDir: {} },
   );
+  // BLO-32734 — the `data` PVC is shared by every company and every agent pod
+  // runs as uid 1000, so the mount is the only thing that can scope it. Mount it
+  // READ-ONLY and re-mount the few trees a run genuinely writes rw, nested
+  // inside it, via `subPath` (see `resolveScopedWritableMounts`).
+  //
+  // Gated on `isolation.enabled`, and that gate is structural rather than a
+  // carve-out of convenience: a shared-isolation run has no per-run roots at all
+  // (`homeRoot`/`sessionRoot` are ""), so HOME and CLAUDE_CONFIG_DIR fall back to
+  // `dataMountPath` and `${dataMountPath}/.claude`. There is nothing to derive a
+  // scope from, and a read-only mount would fail the run at env-guard install.
+  // Such runs keep today's broad rw mount — a stated residual, not a fix.
+  //
+  // Also gated on the Job's `data` volume being THIS server's own PVC. The
+  // `subPath` targets are pre-created by the server through its own mount (see
+  // `scopedWritableDirs`), and that only lands in the Job's volume when both
+  // name the same claim. A per-Job `emptyDir` (no claim) is never shared, so
+  // there is nothing to scope and nothing the server could pre-create; a
+  // foreign `workspaceVolumeClaim` is a volume this process does not hold, so
+  // the kubelet would create the targets root:root and uid 1000 would EACCES at
+  // init. Both keep the broad rw mount rather than emit a Job that cannot start.
+  const narrowWritableSurface =
+    isolation.enabled && dataClaimName !== "" && dataClaimName === selfPod.pvcClaimName;
+  // Every one of those fallbacks used to be silent, so whether a production Job
+  // actually got the narrowed mount depended on runtime config nobody could
+  // read off the cluster. Name the reason the gate fell through — once as a
+  // structured server-side warn, once as a Job annotation (see `metadata`) so
+  // it is observable per Job. Classification only: the decision above is the
+  // gate, this merely says which leg of it did not hold.
+  const broadDataMountReason: "isolation_disabled" | "no_claim" | "foreign_claim" | null = narrowWritableSurface
+    ? null
+    : !isolation.enabled
+      ? "isolation_disabled"
+      : dataClaimName === ""
+        ? "no_claim"
+        : "foreign_claim";
+  if (broadDataMountReason !== null) {
+    console.warn(
+      JSON.stringify({
+        level: "warn",
+        event: "claude_k8s.data_mount_broad_rw",
+        msg: "data volume mounted broad rw; BLO-32734 subPath narrowing not applied",
+        reason: broadDataMountReason,
+        runId,
+        jobName,
+        dataClaimName,
+        selfPvcClaimName: selfPod.pvcClaimName ?? "",
+      }),
+    );
+  }
   volumeMounts.push({
     name: "data",
     mountPath: dataMountPath,
+    ...(narrowWritableSurface ? { readOnly: true } : {}),
   });
 
   // Mount secret volumes inherited from the Deployment pod
@@ -1583,7 +1845,51 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   assertSafePathComponent("companyId", logPathCompanyId);
   assertSafePathComponent("agentId", logPathAgentId);
   assertSafePathComponent("runId", logPathRunId);
+  // ONE log file, TWO absolute paths, because the server and the agent pod
+  // mount the same volume at different roots. `podLogPath` is the server's view
+  // and is what this function returns (execute.ts tails, reads back and unlinks
+  // through it). `containerLogPath` is the pod's view and is what the container
+  // actually writes. They are byte-identical on the default mount path, and
+  // must not be conflated when `config.workspaceMountPath` is set.
   const podLogPath = buildPodLogPath(logPathCompanyId, logPathAgentId, logPathRunId, isolation.enabled ? isolation.key : undefined);
+  const containerLogPath = buildPodLogPath(
+    logPathCompanyId,
+    logPathAgentId,
+    logPathRunId,
+    isolation.enabled ? isolation.key : undefined,
+    normalizedDataMountPath,
+  );
+  // Nested rw re-mounts that restore write access to exactly the trees this run
+  // needs, inside the read-only `data` mount above. Built here rather than beside
+  // that mount because the log path is only known now; mount ORDER does not
+  // matter (the kubelet sorts by path depth, so a parent never shadows a child).
+  const scopedWritableMounts = narrowWritableSurface
+    ? resolveScopedWritableMounts({
+        dataMountPath,
+        isolation,
+        podLogPath: containerLogPath,
+        instructionsFilePath: effectiveInstructionsFilePath,
+        addDir: promptBundle?.addDir ?? null,
+        companyId: logPathCompanyId,
+      })
+    : [];
+  // Absolute paths the SERVER must create before the Job exists. Without
+  // fsGroup, the kubelet creates a missing `subPath` dir as root:root 0755,
+  // which is EACCES for uid 1000 — so a first run for a new company or workspace
+  // would fail. The server already holds the broad rw mount, and pre-creating
+  // lets ownership inherit from the 2775 setgid parent instead. Deliberately NOT
+  // fsGroup: on a whole-volume mount that recursively chowns ~1.5 TB of CephFS
+  // on every pod start.
+  //
+  // Addressed through the SERVER's mount of the volume, not the pod's: a
+  // `subPath` is relative to the volume root, and the server reaches that root
+  // at SELF_POD_DATA_MOUNT_PATH whatever `workspaceMountPath` the pod uses.
+  // Joining onto `dataMountPath` would, under a custom mount path, mkdir on the
+  // server's own root filesystem and leave the Job's volume untouched.
+  const scopedWritableDirs = scopedWritableMounts.map((m) => path.posix.join(SELF_POD_DATA_MOUNT_PATH, m.subPath));
+  for (const mount of scopedWritableMounts) {
+    volumeMounts.push({ name: "data", mountPath: mount.mountPath, subPath: mount.subPath });
+  }
   // Refresh OAuth credentials via ccrotate before invoking claude. The shared
   // /paperclip/.claude/.credentials.json on the RWX PVC may contain an expired
   // access token (claude OAuth tokens last ~30-60 min and the paperclip pod
@@ -1867,8 +2173,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         `fi && cd ${quoteShellArg(isolation.workspaceRoot)}`,
       ].join(" ")
     : "";
-  const preparePodLog = `mkdir -p ${quoteShellArg(path.posix.dirname(podLogPath))} || exit $?`;
-  const claudeInvocation = `set -o pipefail; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${buildEnvGuardSetupShell()}; ${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | tee ${quoteShellArg(podLogPath)} | ${failFastFilter} > /dev/null`;
+  // Both the mkdir and the tee run INSIDE the container, so they address the
+  // volume through the pod's mount path, never the server's.
+  const preparePodLog = `mkdir -p ${quoteShellArg(path.posix.dirname(containerLogPath))} || exit $?`;
+  const claudeInvocation = `set -o pipefail; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${buildEnvGuardSetupShell()}; ${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | tee ${quoteShellArg(containerLogPath)} | ${failFastFilter} > /dev/null`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket. Mirrors the opencode_k8s adapter.
@@ -1976,7 +2284,19 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // the invariant ("every volumeMount resolves to a declared volume", asserted
   // across both containers and every PVC/secret combination).
   const initVolumeMounts: k8s.V1VolumeMount[] = [
-    { name: "data", mountPath: dataMountPath },
+    {
+      name: "data",
+      mountPath: dataMountPath,
+      ...(narrowWritableSurface ? { readOnly: true } : {}),
+    },
+    // Same nested rw re-mounts as the main container. The init container creates
+    // the isolation roots and the Chrome profile dir INSIDE this mount, so
+    // without these it would EACCES against the read-only parent on every run.
+    ...scopedWritableMounts.map((mount) => ({
+      name: "data",
+      mountPath: mount.mountPath,
+      subPath: mount.subPath,
+    })),
     { name: "prompt", mountPath: "/tmp/prompt" },
     // Needed so the BrowserMetrics symlink target above resolves in the init
     // container; same emptyDir instance the main container mounts.
@@ -2046,6 +2366,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       annotations: {
         "paperclip.io/adapter-type": "claude_k8s",
         "paperclip.io/agent-name": agent.name,
+        // `scoped` when the BLO-32734 read-only-plus-subPath narrowing applied,
+        // `broad:<reason>` when the gate fell through to the whole-PVC rw mount.
+        "paperclip.io/data-mount-scope":
+          broadDataMountReason === null ? "scoped" : `broad:${broadDataMountReason}`,
       },
     },
     spec: {
@@ -2114,5 +2438,5 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     );
   }
 
-  return { job, jobName, namespace, prompt, claudeArgs, promptMetrics, promptSecret, envSecret, mcpConfigSecret, skippedLabels, podLogPath, serviceAccountName };
+  return { job, jobName, namespace, prompt, claudeArgs, promptMetrics, promptSecret, envSecret, mcpConfigSecret, skippedLabels, podLogPath, serviceAccountName, scopedWritableDirs };
 }

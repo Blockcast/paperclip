@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type * as k8s from "@kubernetes/client-node";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import {
@@ -18,7 +18,9 @@ import {
   validateAgentCommand,
   validatePonytailPluginPath,
   validatePonytailDefaultMode,
+  resolveScopedWritableMounts,
 } from "./job-manifest.js";
+import type { JobIsolation } from "./job-manifest.js";
 import type { SelfPodInfo } from "./k8s-client.js";
 
 function makeCtx(overrides: Partial<AdapterExecutionContext> = {}): AdapterExecutionContext {
@@ -2870,5 +2872,456 @@ describe("env name classification gate (BLO-29804)", () => {
 
     expect(secretBacked).toEqual(EXPECTED_SECRET_BACKED);
     expect(Object.keys(envSecret?.data ?? {}).sort()).toEqual(EXPECTED_SECRET_BACKED);
+  });
+});
+
+// BLO-32734 — the shared `data` PVC is mounted whole and rw into every agent
+// pod, and every pod runs as uid 1000, so no file mode can separate one company
+// from another. These pin the mount-level boundary that replaces it: a read-only
+// parent with nested rw `subPath` re-mounts for exactly the trees a run writes.
+describe("scoped writable mounts (BLO-32734)", () => {
+  const WORKSPACE_DESCRIPTOR = {
+    isolationMode: "workspace",
+    isolationKey: "workspace:ws-1",
+    workspaceRoot: "/paperclip/instances/default/projects/co1/proj-1/_default",
+    homeRoot: "/paperclip/instances/default/data/k8s-isolation/workspaces/ws-1/home",
+    sessionRoot: "/paperclip/instances/default/data/k8s-isolation/workspaces/ws-1/session",
+    cacheRoot: "/runtime-cache/paperclip-workspaces/ws-1/cache",
+    tmpRoot: "/runtime-cache/paperclip-workspaces/ws-1/tmp",
+  };
+
+  function mountsFor(ctx: AdapterExecutionContext) {
+    const { job } = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+    const spec = job.spec?.template?.spec;
+    return {
+      main: spec?.containers[0]?.volumeMounts ?? [],
+      init: spec?.initContainers?.[0]?.volumeMounts ?? [],
+    };
+  }
+
+  function isolatedCtx() {
+    const ctx = makeCtx();
+    setRuntimeIsolation(ctx, { ...WORKSPACE_DESCRIPTOR, storage: isolatedStorage() });
+    return ctx;
+  }
+
+  it("mounts the data volume read-only and re-mounts only the run's own trees rw", () => {
+    const { main } = mountsFor(isolatedCtx());
+    const parent = main.find((m) => m.mountPath === "/paperclip" && !m.subPath);
+    expect(parent?.readOnly).toBe(true);
+
+    const scoped = main.filter((m) => m.name === "data" && m.subPath);
+    // Every nested re-mount is writable and scoped to a subtree, never the root.
+    for (const mount of scoped) {
+      expect(mount.readOnly).toBeFalsy();
+      expect(mount.subPath).toBeTruthy();
+      expect(mount.subPath).not.toBe("");
+    }
+    const byPath = new Map(scoped.map((m) => [m.mountPath, m.subPath]));
+    // The run's own workspace, session/home tree and pod-log dir stay writable.
+    expect(byPath.get("/paperclip/instances/default/projects/co1/proj-1/_default")).toBe(
+      "instances/default/projects/co1/proj-1/_default",
+    );
+    expect(byPath.get("/paperclip/instances/default/data/k8s-isolation/workspaces/ws-1/home")).toBe(
+      "instances/default/data/k8s-isolation/workspaces/ws-1/home",
+    );
+    expect(byPath.get("/paperclip/instances/default/data/run-logs/co1/agent-abc/isolated/workspacews-1")).toBeTruthy();
+  });
+
+  // The actual boundary assertion: a foreign company's trees must be covered by
+  // NO writable mount. Asserting the allow-list alone would pass even if an
+  // extra mount re-opened the volume.
+  it("leaves no writable mount covering a foreign company's trees", () => {
+    const { main, init } = mountsFor(isolatedCtx());
+    const foreign = [
+      "/paperclip/instances/default/data/run-logs/co2/agent-zzz",
+      "/paperclip/instances/default/projects/co2/proj-9/_default",
+      "/paperclip/instances/default/companies/co2/agents/agent-zzz/instructions",
+      "/paperclip/.claude/settings.json",
+      "/paperclip/.claude/paperclip-env-guard.mjs",
+      "/paperclip/.mcp.json",
+    ];
+    for (const container of [main, init]) {
+      const writable = container.filter((m) => !m.readOnly);
+      for (const target of foreign) {
+        const covering = writable.filter(
+          (m) => target === m.mountPath || target.startsWith(`${m.mountPath}/`),
+        );
+        expect(covering, `${target} must not be writable, covered by ${JSON.stringify(covering)}`).toEqual([]);
+      }
+    }
+  });
+
+  it("company-scopes the shared scratch trees without moving their paths", () => {
+    const { main } = mountsFor(isolatedCtx());
+    const byPath = new Map(main.filter((m) => m.subPath).map((m) => [m.mountPath, m.subPath]));
+    // Agents keep writing /paperclip/work verbatim; it lands in co1's subdir.
+    expect(byPath.get("/paperclip/work")).toBe("work/co1");
+    expect(byPath.get("/paperclip/wt")).toBe("wt/co1");
+  });
+
+  it("gives the init container the same scoped mounts as the main container", () => {
+    const { main, init } = mountsFor(isolatedCtx());
+    const scopedOf = (mounts: typeof main) =>
+      mounts.filter((m) => m.subPath).map((m) => `${m.mountPath}=>${m.subPath}`).sort();
+    // The init container mkdir -p's the isolation roots INSIDE this mount, so a
+    // missing re-mount there is an EACCES on every run rather than a drift.
+    expect(scopedOf(init)).toEqual(scopedOf(main));
+    expect(init.find((m) => m.mountPath === "/paperclip" && !m.subPath)?.readOnly).toBe(true);
+  });
+
+  it("reports every scoped dir so the caller can pre-create it", () => {
+    const result = buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod() });
+    const scoped = (result.job.spec?.template?.spec?.containers[0]?.volumeMounts ?? [])
+      .filter((m) => m.subPath)
+      .map((m) => `/paperclip/${m.subPath}`)
+      .sort();
+    // Without fsGroup the kubelet would create these root:root 0755, so the
+    // reported list must cover every subPath the manifest actually declares.
+    expect(result.scopedWritableDirs.slice().sort()).toEqual(scoped);
+  });
+
+  it("collapses a target an ancestor target already covers", () => {
+    const ctx = makeCtx();
+    setRuntimeIsolation(ctx, {
+      ...WORKSPACE_DESCRIPTOR,
+      // sessionRoot nested under homeRoot: one mount must cover both.
+      sessionRoot: "/paperclip/instances/default/data/k8s-isolation/workspaces/ws-1/home/session",
+      storage: isolatedStorage(),
+    });
+    const { main } = mountsFor(ctx);
+    const paths = main.filter((m) => m.subPath).map((m) => m.mountPath);
+    expect(paths).toContain("/paperclip/instances/default/data/k8s-isolation/workspaces/ws-1/home");
+    expect(paths).not.toContain("/paperclip/instances/default/data/k8s-isolation/workspaces/ws-1/home/session");
+  });
+
+  // A `..` in a server-supplied root would escape the company scope the subPath
+  // exists to establish, so the build must fail rather than emit that mount.
+  it("refuses to build when a descriptor root is not normalized", () => {
+    const ctx = makeCtx();
+    setRuntimeIsolation(ctx, {
+      ...WORKSPACE_DESCRIPTOR,
+      homeRoot: "/paperclip/instances/default/data/k8s-isolation/workspaces/../../../../home",
+      storage: isolatedStorage(),
+    });
+    expect(() => buildJobManifest({ ctx, selfPod: makeSelfPod() })).toThrow(/normalized absolute path/);
+  });
+
+  it("refuses to build when a root resolves to the data mount root itself", () => {
+    const ctx = makeCtx();
+    setRuntimeIsolation(ctx, { ...WORKSPACE_DESCRIPTOR, homeRoot: "/paperclip", storage: isolatedStorage() });
+    expect(() => buildJobManifest({ ctx, selfPod: makeSelfPod() })).toThrow(/must not be the data mount root/);
+  });
+
+  // The server pre-creates the subPath targets through its own /paperclip mount,
+  // so narrowing is only sound when the Job's `data` volume IS that PVC. For any
+  // other backing the kubelet would create the targets root:root and uid 1000
+  // would EACCES at init — so those keep the broad rw mount instead.
+  function broadRwOnly(result: ReturnType<typeof buildJobManifest>) {
+    const spec = result.job.spec?.template?.spec;
+    for (const mounts of [spec?.containers[0]?.volumeMounts, spec?.initContainers?.[0]?.volumeMounts]) {
+      const data = (mounts ?? []).filter((m) => m.name === "data");
+      expect(data).toHaveLength(1);
+      expect(data[0]?.readOnly).toBeFalsy();
+      expect(data[0]?.subPath).toBeUndefined();
+    }
+    expect(result.scopedWritableDirs).toEqual([]);
+  }
+
+  it("keeps the broad rw mount when the data volume is a per-Job emptyDir (no PVC)", () => {
+    const result = buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod({ pvcClaimName: null }) });
+    expect(result.job.spec?.template?.spec?.volumes?.find((v) => v.name === "data")).toEqual({
+      name: "data",
+      emptyDir: {},
+    });
+    // Nothing is shared, so there is nothing to scope — and nothing the server
+    // could pre-create in a volume that does not exist until the pod does.
+    broadRwOnly(result);
+  });
+
+  it("keeps the broad rw mount when the Job's claim is not the server's own PVC", () => {
+    const ctx = isolatedCtx();
+    ctx.config.workspaceVolumeClaim = "some-other-claim";
+    const result = buildJobManifest({ ctx, selfPod: makeSelfPod({ pvcClaimName: "paperclip-data" }) });
+    expect(result.job.spec?.template?.spec?.volumes?.find((v) => v.name === "data")?.persistentVolumeClaim).toEqual({
+      claimName: "some-other-claim",
+    });
+    // The server does not hold that volume, so a server-side mkdir could not
+    // land in it; emitting subPath mounts anyway would be a Job that cannot start.
+    broadRwOnly(result);
+  });
+
+  it("addresses the pre-create targets through the server's own mount under a custom workspaceMountPath", () => {
+    const ctx = makeCtx();
+    ctx.config.workspaceMountPath = "/srv/agent-data";
+    setRuntimeIsolation(ctx, {
+      ...WORKSPACE_DESCRIPTOR,
+      workspaceRoot: "/srv/agent-data/instances/default/projects/co1/proj-1/_default",
+      homeRoot: "/srv/agent-data/instances/default/data/k8s-isolation/workspaces/ws-1/home",
+      sessionRoot: "/srv/agent-data/instances/default/data/k8s-isolation/workspaces/ws-1/session",
+      storage: isolatedStorage(),
+    });
+    const result = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+    const main = result.job.spec?.template?.spec?.containers[0]?.volumeMounts ?? [];
+    // The pod sees its scoped trees where IT mounts the volume...
+    expect(main.find((m) => m.mountPath === "/srv/agent-data" && !m.subPath)?.readOnly).toBe(true);
+    expect(main.find((m) => m.subPath === "instances/default/data/k8s-isolation/workspaces/ws-1/home")?.mountPath).toBe(
+      "/srv/agent-data/instances/default/data/k8s-isolation/workspaces/ws-1/home",
+    );
+    // ...but the server can only reach that same volume at /paperclip, so the
+    // dirs it is told to mkdir must be addressed there — not under /srv/agent-data,
+    // which on the server is its own root filesystem.
+    expect(result.scopedWritableDirs.length).toBeGreaterThan(0);
+    for (const dir of result.scopedWritableDirs) {
+      expect(dir.startsWith("/paperclip/")).toBe(true);
+      expect(dir.startsWith("/srv/agent-data")).toBe(false);
+    }
+    expect(result.scopedWritableDirs).toContain("/paperclip/instances/default/data/k8s-isolation/workspaces/ws-1/home");
+  });
+
+  // Ally review on #1820: the pod log has FOUR consumers and they split across
+  // two address spaces. Under a custom mount path the container-side three must
+  // point into the pod's volume and the server-side one must not — and all four
+  // must denote the SAME file on the SAME volume. Getting this wrong is silent:
+  // the Job runs, the log is written to the container filesystem, and it
+  // vanishes with the pod while the server tails a path that never appears.
+  it("agrees on one volume across all four pod-log consumers under a custom workspaceMountPath", () => {
+    const ctx = makeCtx();
+    ctx.config.workspaceMountPath = "/srv/agent-data";
+    setRuntimeIsolation(ctx, {
+      ...WORKSPACE_DESCRIPTOR,
+      workspaceRoot: "/srv/agent-data/instances/default/projects/co1/proj-1/_default",
+      homeRoot: "/srv/agent-data/instances/default/data/k8s-isolation/workspaces/ws-1/home",
+      sessionRoot: "/srv/agent-data/instances/default/data/k8s-isolation/workspaces/ws-1/session",
+      storage: isolatedStorage(),
+    });
+    const result = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+    const command = result.job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
+    const main = result.job.spec?.template?.spec?.containers[0]?.volumeMounts ?? [];
+
+    // The one thing every consumer must share: the path of the file RELATIVE to
+    // the volume root. Asserted as the invariant rather than as four literals,
+    // so a future re-rooting of either side cannot satisfy this test by moving
+    // both roots and quietly landing on two different files.
+    const logDirSubPath = "instances/default/data/run-logs/co1/agent-abc/isolated/workspacews-1";
+    const suffix = `${logDirSubPath}/run-abc12345.pod.ndjson`;
+
+    // (1) server-side read/tail/unlink path — execute.ts reaches the volume only
+    // at /paperclip, so this must NOT follow workspaceMountPath.
+    expect(result.podLogPath).toBe(`/paperclip/${suffix}`);
+
+    // (2) + (3) the container's own mkdir and tee — these run inside the pod, so
+    // they must follow workspaceMountPath.
+    const mkdir = `mkdir -p '/srv/agent-data/${logDirSubPath}'`;
+    const tee = `tee '/srv/agent-data/${suffix}'`;
+    expect(command).toContain(mkdir);
+    expect(command).toContain(tee);
+    expect(command.indexOf(mkdir)).toBeLessThan(command.indexOf(tee));
+    // Negative: nothing the container executes may address the server's root.
+    expect(command).not.toContain(`tee '/paperclip/${suffix}'`);
+
+    // (4) the writable subPath that makes that tee target writable at all. The
+    // regression Ally found was here: with the log path hardcoded to /paperclip,
+    // resolveScopedWritableMounts saw it as off-volume and emitted no mount, so
+    // the tee wrote under the READ-ONLY data mount.
+    const covering = main.find((m) => m.subPath && logDirSubPath.startsWith(m.subPath));
+    expect(covering, `no writable subPath mount covers ${logDirSubPath}`).toBeDefined();
+    expect(covering?.mountPath?.startsWith("/srv/agent-data/")).toBe(true);
+    // And the server is told to pre-create it through ITS root, since a subPath
+    // the kubelet has to create itself lands root:root 0755 and is EACCES for uid 1000.
+    expect(result.scopedWritableDirs).toContain(`/paperclip/${covering?.subPath ?? ""}`);
+  });
+
+  // The residual, pinned deliberately: a shared-isolation run has no per-run
+  // roots to derive a scope from (HOME falls back to /paperclip itself), so it
+  // keeps today's broad rw mount. Narrowing it needs the roots to exist first.
+  it("keeps the broad rw mount for a shared-isolation run", () => {
+    const ctx = makeCtx();
+    setRuntimeIsolation(ctx, { isolationMode: "shared", isolationKey: "agent-shared:agent-abc" });
+    const result = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+    const main = result.job.spec?.template?.spec?.containers[0]?.volumeMounts ?? [];
+    const parent = main.find((m) => m.mountPath === "/paperclip");
+    expect(parent?.readOnly).toBeFalsy();
+    expect(main.filter((m) => m.subPath)).toEqual([]);
+    expect(result.scopedWritableDirs).toEqual([]);
+  });
+
+  // The three broad-rw fallbacks above are SILENT by construction: whether a
+  // production Job actually got the narrowed mount depends on runtime config
+  // that is invisible in the manifest, so the fix's coverage cannot be read off
+  // the cluster. Every fallback therefore names its reason twice — once as a
+  // structured warn on the server, once as a Job annotation — and the scoped
+  // path stamps `scoped`, so a missing warn is distinguishable from a Job that
+  // never reached the gate.
+  describe("names the reason whenever the broad rw mount is emitted", () => {
+    const SCOPE_ANNOTATION = "paperclip.io/data-mount-scope";
+    let warn: ReturnType<typeof vi.spyOn>;
+    beforeEach(() => {
+      warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    });
+    afterEach(() => {
+      warn.mockRestore();
+    });
+    function broadRwWarnings(): Record<string, unknown>[] {
+      return warn.mock.calls
+        .map(([line]) => (typeof line === "string" && line.startsWith("{") ? JSON.parse(line) : null))
+        .filter((entry) => entry?.event === "claude_k8s.data_mount_broad_rw");
+    }
+
+    it("isolation_disabled — a shared-isolation run", () => {
+      const ctx = makeCtx();
+      setRuntimeIsolation(ctx, { isolationMode: "shared", isolationKey: "agent-shared:agent-abc" });
+      const { job } = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+      expect(job.metadata?.annotations?.[SCOPE_ANNOTATION]).toBe("broad:isolation_disabled");
+      const entries = broadRwWarnings();
+      expect(entries).toHaveLength(1);
+      expect(entries[0]).toMatchObject({
+        reason: "isolation_disabled",
+        runId: "run-abc12345",
+        jobName: job.metadata?.name,
+        dataClaimName: "paperclip-data",
+        selfPvcClaimName: "paperclip-data",
+      });
+    });
+
+    it("no_claim — a per-Job emptyDir", () => {
+      const { job } = buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod({ pvcClaimName: null }) });
+      expect(job.metadata?.annotations?.[SCOPE_ANNOTATION]).toBe("broad:no_claim");
+      const entries = broadRwWarnings();
+      expect(entries).toHaveLength(1);
+      expect(entries[0]).toMatchObject({ reason: "no_claim", dataClaimName: "", selfPvcClaimName: "" });
+    });
+
+    it("foreign_claim — names the Job's claim and the server's own", () => {
+      const ctx = isolatedCtx();
+      ctx.config.workspaceVolumeClaim = "some-other-claim";
+      const { job } = buildJobManifest({ ctx, selfPod: makeSelfPod({ pvcClaimName: "paperclip-data" }) });
+      expect(job.metadata?.annotations?.[SCOPE_ANNOTATION]).toBe("broad:foreign_claim");
+      const entries = broadRwWarnings();
+      expect(entries).toHaveLength(1);
+      expect(entries[0]).toMatchObject({
+        reason: "foreign_claim",
+        dataClaimName: "some-other-claim",
+        selfPvcClaimName: "paperclip-data",
+      });
+    });
+
+    it("scoped — stamps `scoped` and warns nothing", () => {
+      const { job } = buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod() });
+      expect(job.metadata?.annotations?.[SCOPE_ANNOTATION]).toBe("scoped");
+      expect(broadRwWarnings()).toEqual([]);
+    });
+  });
+
+  // Ally review on #1820 (Critical): a `git_worktree` workspace keeps its git
+  // state OUTSIDE workspaceRoot, so covering workspaceRoot alone emits a Job that
+  // can edit files but cannot commit. Built on a real `git worktree add` so git
+  // itself, not a hand-written layout, says where that state lives. The temp dir
+  // stands in for the volume at both the pod's and the server's mount.
+  describe("linked git worktree workspaces", () => {
+    let volume: string;
+    let warn: ReturnType<typeof vi.spyOn>;
+    beforeEach(() => {
+      volume = mkdtempSync(join(tmpdir(), "claude-k8s-worktree-"));
+      warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    });
+    afterEach(() => {
+      rmSync(volume, { recursive: true, force: true });
+      warn.mockRestore();
+    });
+
+    function git(cwd: string, ...args: string[]): string {
+      const result = spawnSync("git", ["-C", cwd, ...args], {
+        encoding: "utf8",
+        env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
+      });
+      if (result.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
+      return result.stdout.trim();
+    }
+    function repoWithWorktree(companyId: string) {
+      const repo = join(volume, "instances/default/projects", companyId, "proj-1/_default");
+      mkdirSync(repo, { recursive: true });
+      git(repo, "init", "-q");
+      git(repo, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "init");
+      // The server's default worktree layout: `<repo>/.paperclip/worktrees/<branch>`.
+      const worktree = join(repo, ".paperclip/worktrees/br");
+      git(repo, "worktree", "add", "-q", "-b", "br", worktree);
+      return { repo, worktree };
+    }
+    function writableFor(workspaceRoot: string): string[] {
+      const isolationRoot = join(volume, "instances/default/data/k8s-isolation/workspaces/ws-1");
+      return resolveScopedWritableMounts({
+        dataMountPath: volume,
+        serverDataMountPath: volume,
+        isolation: {
+          enabled: true,
+          mode: "workspace",
+          source: "runtime",
+          key: "workspacews-1",
+          root: isolationRoot,
+          homeRoot: join(isolationRoot, "home"),
+          sessionRoot: join(isolationRoot, "session"),
+          workspaceRoot,
+          cacheRoot: "/runtime-cache/ws-1/cache",
+          tmpRoot: "/runtime-cache/ws-1/tmp",
+          promptCacheRoot: "",
+          storage: isolatedStorage() as JobIsolation["storage"],
+        },
+        podLogPath: join(volume, "instances/default/data/run-logs/co1/agent-abc/run-abc12345.pod.ndjson"),
+        instructionsFilePath: null,
+        addDir: null,
+        companyId: "co1",
+      }).map((m) => m.mountPath);
+    }
+    const covered = (mounts: string[], target: string) =>
+      mounts.some((m) => target === m || target.startsWith(`${m}/`));
+    const rejections = () =>
+      warn.mock.calls
+        .map(([line]) => (typeof line === "string" && line.startsWith("{") ? JSON.parse(line) : null))
+        .filter((entry) => entry?.event === "claude_k8s.worktree_gitdir_rejected")
+        .map((entry) => entry.reason);
+
+    it("makes writable every dir a commit in the worktree writes into", () => {
+      const { worktree } = repoWithWorktree("co1");
+      const mounts = writableFor(worktree);
+      // `index.lock` is the first thing `git add`/`commit`/`status` create;
+      // the common dir holds the refs and the object store.
+      for (const query of [["--git-dir"], ["--git-common-dir"], ["--git-path", "index.lock"]]) {
+        const target = git(worktree, "rev-parse", "--path-format=absolute", ...query);
+        expect(covered(mounts, target), `${query.join(" ")} ${target} not covered by ${JSON.stringify(mounts)}`).toBe(true);
+      }
+      expect(rejections()).toEqual([]);
+    });
+
+    it("adds nothing for an ordinary checkout, whose .git already sits inside workspaceRoot", () => {
+      const { repo } = repoWithWorktree("co1");
+      expect(writableFor(repo).filter((m) => m.startsWith(repo))).toEqual([repo]);
+      expect(rejections()).toEqual([]);
+    });
+
+    // The `.git` pointer sits in the run's OWN writable tree, so a prior run can
+    // rewrite it. Taken at face value, that would let one company's run have the
+    // next one mount another company's repo rw.
+    it("refuses a pointer re-aimed at another company's worktree registration", () => {
+      const own = repoWithWorktree("co1");
+      const foreign = repoWithWorktree("co2");
+      const foreignGitDir = git(foreign.worktree, "rev-parse", "--path-format=absolute", "--git-dir");
+      writeFileSync(join(own.worktree, ".git"), `gitdir: ${foreignGitDir}\n`);
+      const mounts = writableFor(own.worktree);
+      expect(covered(mounts, join(foreign.repo, ".git")), JSON.stringify(mounts)).toBe(false);
+      expect(rejections()).toEqual(["gitdir_back_pointer_mismatch"]);
+    });
+
+    // Shape-valid and back-pointer-valid, both written from inside the run's own
+    // tree. Accepted, `<common>` would be `<repo>/.paperclip`, re-opening every
+    // sibling worktree of the repo.
+    it("refuses a registration forged inside the worktree itself", () => {
+      const { repo, worktree } = repoWithWorktree("co1");
+      writeFileSync(join(worktree, ".git"), `gitdir: ${worktree}\n`);
+      writeFileSync(join(worktree, "gitdir"), `${join(worktree, ".git")}\n`);
+      const mounts = writableFor(worktree);
+      expect(covered(mounts, join(repo, ".paperclip/worktrees/sibling")), JSON.stringify(mounts)).toBe(false);
+      expect(rejections()).toEqual(["common_dir_not_a_git_dir"]);
+    });
   });
 });
