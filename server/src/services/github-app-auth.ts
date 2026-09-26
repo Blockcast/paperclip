@@ -492,6 +492,41 @@ const commentAttestsHead = (body: string, head: string): boolean =>
   hasAllyConsolidatedReviewHeading(body) && extractAllyReviewedHeadSha(body) === head;
 
 /**
+ * Whether one formal review is evidence the reviewer read THIS head.
+ *
+ * `commitId` alone cannot answer that. GitHub re-anchors `reviews[].commit_id`
+ * FORWARD onto the new head when the branch is updated, so the comparison fails
+ * OPEN: it does not reject a stale review, it accepts one that never saw the
+ * head being credited. Measured n=128 (BLO-27234): 8 confirmed re-anchorings,
+ * all 8 APPROVED, 6 not even the latest review. Live instance at the time of
+ * writing — `pim-multicast-gateway#3354` review 5318980026: `APPROVED`,
+ * `commit_id` equal to the head, body attesting `c01651f5`, six commits back.
+ *
+ * So when the body states which head it read, that statement wins in BOTH
+ * directions — it is immutable, where `commit_id` is not. This is a
+ * DISAGREEMENT rule, deliberately not an absence rule:
+ *
+ *   - marker present, names a different head -> reject, whatever `commit_id` says
+ *   - marker present, names this head        -> accept, whatever `commit_id` says
+ *   - no usable marker                       -> unchanged, credit `commit_id`
+ *
+ * The third arm is load-bearing and must stay. Requiring a marker would be the
+ * right answer for MERGE AUTHORIZATION, where an unproven review costs only a
+ * wait, and the wrong one for run-output attestation, which is the only
+ * question this predicate is asked: failing it closed is BLO-28920, ~66 paid
+ * retries in 3h. `extractAllyReviewedHeadSha` already returns null for zero or
+ * several attestations and ignores quoted text, so every ambiguous body lands
+ * on the unchanged arm rather than on a guess.
+ *
+ * Applied per review, never across the set: one lying review must not suppress
+ * a different, honest review at the same head.
+ */
+const reviewAttestsHead = (review: ReviewerReview, head: string): boolean => {
+  const attested = extractAllyReviewedHeadSha(review.body);
+  return attested === null ? review.commitId === head : attested === head;
+};
+
+/**
  * Page cap for BOTH evidence surfaces below. Deliberately far smaller than
  * `GITHUB_COMMENT_PAGINATION_HARD_LIMIT_PAGES` (500), because this predicate runs
  * on every reviewer-run completion and so its request budget is a hot path,
@@ -695,9 +730,14 @@ export async function githubListReviewerSurfacesAtPr(input: {
  * Found when the configured App identity left EITHER surface at the exact head,
  * because Ally posts on either and each surface is individually blind to the
  * other:
- *  - a formal SUBMITTED review with `commit_id === headSha`, in any submitted
+ *  - a formal SUBMITTED review that attests this head, in any submitted
  *    state (`COMMENTED` / `CHANGES_REQUESTED` / `APPROVED` / `DISMISSED` — a
- *    dismissed review still happened, it was only disposed of afterwards); or
+ *    dismissed review still happened, it was only disposed of afterwards).
+ *    "Attests" is `reviewAttestsHead`: the body's own `Reviewed head:` line
+ *    when it has exactly one, else `commit_id`. The body wins because
+ *    `commit_id` re-anchors FORWARD onto a new head and so fails OPEN
+ *    (BLO-35545); the `commit_id` fallback stays for bodyless reviews because
+ *    requiring an attestation here is the BLO-28920 paid-retry loop; or
  *  - an issue comment carrying the canonical consolidated-review heading and a
  *    single `Reviewed head:` attestation equal to that head (comment-mode
  *    reviews file no review object and so carry no `commit_id`).
@@ -871,10 +911,11 @@ export async function githubHasReviewerEvidenceForPr(input: {
 
   // 1) Formal reviews — the configured App at this exact head, in any SUBMITTED
   // state. `COMMENTED` counts: see the merge-authorization vs attestation note
-  // above.
+  // above. `reviewAttestsHead` prefers the body's own immutable statement of
+  // which head it read over the forward-re-anchoring `commit_id`.
   const reviews = await listReviewerReviews(args);
   if ("error" in reviews) return { error: reviews.error };
-  if (reviews.some((review) => review.commitId === headSha)) return { found: true, via: "review" };
+  if (reviews.some((review) => reviewAttestsHead(review, headSha))) return { found: true, via: "review" };
 
   // 2) Comment-shaped reviews — the second surface. Ally frequently reviews by
   // posting a consolidated comment and files no review object at all, so a PR it

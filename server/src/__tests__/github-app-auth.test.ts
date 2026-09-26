@@ -443,6 +443,129 @@ describe("githubHasReviewerEvidenceForPr", () => {
     });
   });
 
+  // BLO-35545. `reviews[].commit_id` is MUTABLE: GitHub re-anchors it forward
+  // onto the new head when the branch is updated, so comparing it to the head
+  // fails OPEN — it accepts a review that never saw the code being credited.
+  // Real instance this is modelled on, `pim-multicast-gateway#3354` review
+  // 5318980026: APPROVED, `commit_id` equal to the then-head 9ff2afac, body
+  // attesting c01651f5 — six commits back — on a human-authored PR, which is
+  // what puts an App APPROVED review in front of this predicate at all.
+  it("BLO-35545: rejects a review whose body attests a head different from commit_id", async () => {
+    setCreds();
+    const attestedOther = "c01651f54681fca1a55ba93e60c36554110d3149";
+    stubGithub({
+      reviews: [
+        {
+          user: { login: "allyblockcast[bot]" },
+          commit_id: headSha,
+          state: "APPROVED",
+          body: `## Ally — Consolidated PR Review\n\nReviewed head: ${attestedOther}\n\n0 Critical / 0 Important.`,
+        },
+      ],
+    });
+
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      found: false,
+    });
+  });
+
+  // The other direction of the same disagreement rule: the body is immutable,
+  // so it is believed when it AGREES too. A review whose commit_id lags the
+  // head but which states it read the head is still evidence.
+  it("BLO-35545: credits a review attesting this head even when commit_id names another", async () => {
+    setCreds();
+    stubGithub({
+      reviews: [
+        {
+          user: { login: "allyblockcast[bot]" },
+          commit_id: "1111111111111111111111111111111111111111",
+          state: "COMMENTED",
+          body: `## Ally — Consolidated PR Review\n\nReviewed head: ${headSha}\n\n0 Critical / 0 Important.`,
+        },
+      ],
+    });
+
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      found: true,
+      via: "review",
+    });
+  });
+
+  // The liveness carve-out, and the reason this is a disagreement rule rather
+  // than an absence rule. A markerless review at head must keep passing:
+  // requiring an attestation here is BLO-28920 (~66 paid retries in 3h).
+  it("BLO-35545: still credits a markerless COMMENTED review at head (liveness carve-out)", async () => {
+    setCreds();
+    stubGithub({
+      reviews: [
+        {
+          user: { login: "allyblockcast[bot]" },
+          commit_id: headSha,
+          state: "COMMENTED",
+          body: "Looks fine to me.",
+        },
+      ],
+    });
+
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      found: true,
+      via: "review",
+    });
+  });
+
+  // Rejection is per review, never across the set. #3354 carried three honest
+  // COMMENTED reviews alongside the one lying APPROVED review; one bad row must
+  // not suppress a good one at the same head.
+  it("BLO-35545: one mis-attesting review does not suppress an honest review at head", async () => {
+    setCreds();
+    stubGithub({
+      reviews: [
+        {
+          user: { login: "allyblockcast[bot]" },
+          commit_id: headSha,
+          state: "APPROVED",
+          body: `## Ally — Consolidated PR Review\n\nReviewed head: c01651f54681fca1a55ba93e60c36554110d3149\n`,
+        },
+        {
+          user: { login: "allyblockcast[bot]" },
+          commit_id: headSha,
+          state: "COMMENTED",
+          body: "No marker here.",
+        },
+      ],
+    });
+
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      found: true,
+      via: "review",
+    });
+  });
+
+  // An ambiguous body is not a verdict. `extractAllyReviewedHeadSha` returns
+  // null for two attestations, so the row falls to the unchanged commit_id arm
+  // rather than being rejected on a guess.
+  it("BLO-35545: two attestations are ambiguous, so the commit_id arm still applies", async () => {
+    setCreds();
+    stubGithub({
+      reviews: [
+        {
+          user: { login: "allyblockcast[bot]" },
+          commit_id: headSha,
+          state: "APPROVED",
+          body:
+            "## Ally — Consolidated PR Review\n\n"
+            + "Reviewed head: c01651f54681fca1a55ba93e60c36554110d3149\n"
+            + "Reviewed head: 1111111111111111111111111111111111111111\n",
+        },
+      ],
+    });
+
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      found: true,
+      via: "review",
+    });
+  });
+
   it("does not let an approved same-slug user-seat review satisfy the App gate", async () => {
     setCreds();
     stubGithub({
