@@ -70,10 +70,22 @@ async function resolveBaseRef(
 
   if (remote === null) return { reason: `no local ${branch} ref and fetching is disabled` };
 
+  // `--depth=1` only when the checkout is ALREADY shallow. On a full clone it
+  // writes `.git/shallow` and permanently truncates the developer's history —
+  // measured 3 commits -> 1, breaking `log`/`blame`/`bisect` until someone
+  // works out they need `git fetch --unshallow`. This path is reached from
+  // `pnpm typecheck`/`build`/`generate`/`migrate`, so the blast radius is a
+  // routine command, and the damage is silent and persistent. Ordinary clones
+  // never get here (they resolve `origin/master` above); single-branch clones
+  // and pruned-`master` checkouts do. CI is already shallow at `fetch-depth: 1`,
+  // so it keeps the flag and its behaviour is unchanged.
+  //
   // `!== null`, not truthiness: `git fetch` reports everything on stderr and
   // exits 0 with EMPTY stdout, so a truthy test reads every success as failure
   // and silently disables the guard in exactly the CI job it exists for.
-  if ((await tryGit(repoDir, ["fetch", "--no-tags", "--depth=1", remote, branch])) !== null) {
+  const isShallow = (await tryGit(repoDir, ["rev-parse", "--is-shallow-repository"]))?.trim() === "true";
+  const depth = isShallow ? ["--depth=1"] : [];
+  if ((await tryGit(repoDir, ["fetch", "--no-tags", ...depth, remote, branch])) !== null) {
     return { ref: "FETCH_HEAD" };
   }
 
