@@ -7099,7 +7099,6 @@ const K8S_ISOLATION_OWNED_ENV_KEYS = new Set([
   "PLAYWRIGHT_BROWSERS_PATH",
   // BLO-15567: these three default to $HOME-derived paths, so under isolation
   // they follow HOME onto the persistent PVC unless the adapter owns them.
-  "PNPM_HOME",
   "CARGO_HOME",
   "CARGO_TARGET_DIR",
   "PAPERCLIP_WORKSPACE_CWD",
