@@ -85,9 +85,24 @@ rules:
   # patch would leave stale keys from the prior attempt and drop that guard.
   # Granting `update` beside the `create`+`delete` already held is not a
   # privilege increase — the same end state is reachable by delete-then-create.
+  #
+  # `list` (BLO-21857) — required by the orphan-Secret sweep in
+  # vendor/paperclip-adapter-claude-k8s/src/server/secret-sweep.ts, whose first
+  # call is listNamespacedSecret with a label selector. Unlike `update`, this IS
+  # a real (if small) widening: a Secret list returns `data` for every match,
+  # not just names, so the SA can now read the values of every Secret in this
+  # namespace rather than only those it can name for a `get`. The sweep itself
+  # reads nothing but `metadata` — but the verb does not know that, and the
+  # grant is what gets audited, not the caller.
+  #
+  # Without it the sweep 403s on its first call, createSweepGate swallows that
+  # as non-fatal, and the feature is inert in a way no dashboard can show: a
+  # sweep that 403s and a sweep that finds zero orphans look identical. Same
+  # class as the pods:delete case recorded above, which 403'd in prod until the
+  # grant landed.
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["create", "delete", "get", "patch", "update"]
+    verbs: ["create", "delete", "get", "list", "patch", "update"]
   # PVCs — adapter looks up the shared PVC claim name (paperclip-data) to mount
   # at /paperclip in agent Job pods. opencode-k8s additionally creates/deletes
   # per-agent PVCs by default — `agentDbMode` defaults to `dedicated_pvc`

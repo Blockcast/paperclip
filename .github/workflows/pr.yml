@@ -1342,6 +1342,51 @@ jobs:
       # the diff by the `Require vendored-adapter source changes to be logged`
       # step in the `policy` job, which stores nothing and so cannot conflict.
 
+      # Guards the "Current version" row, which neither the retired hash nor the
+      # provenance log covers. The log above asserts that vendored source does
+      # not change without a row being appended; it says nothing about whether
+      # the version PROVENANCE.md *records* still matches the tree. A version
+      # bump touches package.json + package-lock.json and appends a log row, so
+      # both of those guards pass while the recorded identity goes stale. That
+      # is exactly what happened on #1459 (doc said -blockcast.2, package said
+      # .3), caught by a reviewer rather than by CI. PROVENANCE.md is the stated
+      # source of truth for which release is in the tree, so a wrong value here
+      # misdirects the next audit or incident response.
+      #
+      # This is a *state* invariant and so could in principle conflict the way
+      # the hash did — but it cannot in practice: it is single-valued per
+      # release, not per tree, so two concurrent PRs only collide when both bump
+      # the version, which is a genuine conflict worth surfacing rather than the
+      # spurious one BLO-35109 removed.
+      - name: Verify provenance version
+        run: |
+          set -euo pipefail
+          # `{p;q}` rather than `| head -1`: under `set -o pipefail` a sed that
+          # keeps writing after head exits fails the step on SIGPIPE. Safe today
+          # only because there is exactly one matching row — a property of the
+          # document, not of the pipeline.
+          doc=$(sed -n '/^| Current version |/{s/^| Current version | `\([^`]*\)`.*/\1/p;q}' PROVENANCE.md)
+          if [ -z "$doc" ]; then
+            echo "::error::No 'Current version' row found in PROVENANCE.md."
+            exit 1
+          fi
+          # The lockfile carries the version twice and npm ci does not compare
+          # either copy against package.json, so both are checked explicitly.
+          pkg=$(node -p 'require("./package.json").version')
+          lock=$(node -p 'require("./package-lock.json").version')
+          lock_self=$(node -p 'require("./package-lock.json").packages[""].version')
+          echo "PROVENANCE.md:              $doc"
+          echo "package.json:               $pkg"
+          echo "package-lock.json:          $lock"
+          echo "package-lock.json packages: $lock_self"
+          for found in "$pkg" "$lock" "$lock_self"; do
+            if [ "$found" != "$doc" ]; then
+              echo "::error::Version drift in the vendored tree: PROVENANCE.md records $doc but a manifest says $found."
+              echo "Set the same version in package.json, package-lock.json (both copies), and the 'Current version' row of PROVENANCE.md."
+              exit 1
+            fi
+          done
+
   verify:
     # Preserve the legacy required-check name while the underlying work runs in parallel.
     # Serialized server suites run inside the four general-server matrix jobs,
