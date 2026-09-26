@@ -288,6 +288,18 @@ export const AGENT_ENV_ALLOWED_PREFIXES: readonly string[] = [
   assert.equal(inheritable("PENSTOCK_READY_TIMEOUT_MS"), true, "a comment must not deny a name");
 });
 
+// Duplicate env names are legal in a PodSpec and the kubelet applies the LAST
+// one, so `assert.match` proves an occurrence EXISTS, not that it is the one the
+// container receives — an appended override reads as green. Return the effective
+// value instead: the last `value:` bound to this name, raw so callers can decide
+// whether the quoting matters. Only a `value:` on the line immediately following
+// matches, so a `valueFrom:` entry cannot borrow a later entry's literal.
+function effectiveEnv(rendered, name) {
+  const binding = new RegExp(`- name: ${name}[^\\S\\n]*\\n[^\\S\\n]*value: (.+)`, "g");
+  const bindings = [...rendered.matchAll(binding)];
+  return bindings.length ? bindings.at(-1)[1].trim() : undefined;
+}
+
 // BLO-19123. The drain returns mis-owned recovery rows to their real owner. Its
 // block in index.ts sits inside `if (config.heartbeatSchedulerEnabled)`, and
 // config.ts forces that false whenever PAPERCLIP_NODE_ROLE=api — so setting this
@@ -297,13 +309,27 @@ export const AGENT_ENV_ALLOWED_PREFIXES: readonly string[] = [
 // placement rather than merely the presence.
 test("the hand-back drain flag is enabled on the scheduler tier only", () => {
   const worker = render("templates/statefulset.yaml");
-  assert.match(
-    worker,
-    /- name: PAPERCLIP_STRANDED_RECOVERY_HAND_BACK_DRAIN_ENABLED\s+value: "true"/,
+  assert.equal(
+    effectiveEnv(worker, "PAPERCLIP_STRANDED_RECOVERY_HAND_BACK_DRAIN_ENABLED"),
+    '"true"',
     'worker must enable the drain with the literal string "true" — config.ts compares === "true"',
   );
-  // The gate this tier must satisfy for the flag to mean anything.
-  assert.match(worker, /- name: PAPERCLIP_NODE_ROLE\s+value: worker/);
+  // heartbeatSchedulerEnabled is `role !== "api" && HEARTBEAT_SCHEDULER_ENABLED
+  // !== "false"`, and the flag above only means anything inside that gate. The
+  // role half is asserted below; this is the other half, which env.extra can set
+  // on BOTH tiers. Quote-insensitive because only the string reaching the
+  // process matters, and YAML spells it two ways.
+  assert.notEqual(
+    effectiveEnv(worker, "HEARTBEAT_SCHEDULER_ENABLED")?.replace(/^"|"$/g, ""),
+    "false",
+    "the drain block sits inside the heartbeat scheduler gate; disabling the " +
+      "scheduler leaves the flag set and never consulted",
+  );
+  // Topology invariant, NOT a drain precondition: dropping this var defaults the
+  // role to "all", which leaves the scheduler enabled and the drain running. It
+  // is asserted because this tier is meant to be the worker, so a change here
+  // should be deliberate — not because the drain would break without it.
+  assert.equal(effectiveEnv(worker, "PAPERCLIP_NODE_ROLE"), "worker");
 
   const api = render("templates/deployment-api.yaml", [
     "--set",
