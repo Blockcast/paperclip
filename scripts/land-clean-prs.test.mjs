@@ -12,9 +12,12 @@ import {
   classifyFromListing,
   classifyPr,
   failingChecks,
+  applyRow,
   isFatalGhError,
   isMainModule,
+  markFailure,
   latestCheckStates,
+  renderReceipt,
   settleMinutesFrom,
   targetRepos,
   unsatisfiedOwners,
@@ -686,5 +689,66 @@ describe("helpers", () => {
     assert.equal(isMainModule("", "file:///tmp/land-clean-prs.mjs"), false);
     assert.equal(isMainModule("/tmp/other.mjs", "file:///tmp/land-clean-prs.mjs"), false);
     assert.equal(isMainModule("/tmp/land-clean-prs.mjs", "file:///tmp/land-clean-prs.mjs"), true);
+  });
+});
+
+describe("applyRow", () => {
+  /**
+   * Regression for BLO-36804. `gh pr merge --auto` only infers a merge method
+   * when the PR base branch has a merge queue, so a PR targeting a stacked
+   * feature branch failed with "--merge, --rebase, or --squash required" on 9
+   * consecutive fires while still reporting `enqueue`.
+   */
+  it("arms auto-merge with an explicit merge method", () => {
+    const calls = [];
+    const outcome = applyRow("o/r", { number: 7, action: "enqueue" }, (args) => {
+      calls.push(args);
+      return "";
+    });
+    // Not "armed": the same call queues, arms, or merges outright depending on
+    // the base, and this defect was a receipt naming an action it had not taken.
+    assert.equal(outcome, "merge requested");
+    assert.deepEqual(calls, [["pr", "merge", "7", "--repo", "o/r", "--auto", "--rebase"]]);
+  });
+
+  it("disarms a stale enqueue without a merge method", () => {
+    const calls = [];
+    applyRow("o/r", { number: 8, action: "stale-enqueue" }, (args) => {
+      calls.push(args);
+      return args[0] === "api" ? "[]" : "";
+    });
+    assert.deepEqual(calls[0], ["pr", "merge", "8", "--repo", "o/r", "--disable-auto"]);
+    assert.equal(calls.at(-1)[0], "pr");
+    assert.equal(calls.at(-1)[1], "comment");
+  });
+
+  it("leaves unknown actions alone", () => {
+    assert.equal(applyRow("o/r", { number: 9, action: "hold" }, () => {
+      throw new Error("must not shell out");
+    }), null);
+  });
+});
+
+describe("markFailure", () => {
+  /**
+   * The receipt tallies by action, so a failure recorded only in `detail` is
+   * invisible to the summary line. That is how 9 silent fires survived review.
+   */
+  it("moves the failure into the action column and keeps prior detail", () => {
+    const row = markFailure(
+      { number: 7, action: "enqueue", detail: "clean at head" },
+      "  --merge, --rebase, or --squash required\nusage: gh pr merge\n",
+    );
+    assert.equal(row.action, "enqueue-failed");
+    assert.equal(row.detail, "clean at head — failed: --merge, --rebase, or --squash required");
+  });
+
+  it("is visible in the receipt tally", () => {
+    const receipt = renderReceipt([
+      { number: 1, action: "enqueue", reason: "clean", detail: "" },
+      markFailure({ number: 2, action: "enqueue", reason: "clean", detail: "" }, "boom"),
+    ]);
+    assert.match(receipt, /enqueue: 1/);
+    assert.match(receipt, /enqueue-failed: 1/);
   });
 });
