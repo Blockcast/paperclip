@@ -1282,4 +1282,191 @@ describeEmbeddedPostgres("pipeline routes", () => {
     expect(res.body.details.version).toBe(2);
     expect(res.body.details.stage.key).toBe("intake");
   });
+
+  /**
+   * PEN-3266. Route-level coverage for the `pipeline_stages.config` carrier.
+   *
+   * The sibling suite (`pipeline-stage-workspace-settings-withholding.test.ts`) exercises
+   * `publicPipelineStageConfig` directly, which proves the projection is CORRECT but not that any
+   * given route APPLIES it. Every exit below returns a whole `pipeline_stages` row — some by
+   * `...row` spread — so the wiring is exactly the thing that can be forgotten, and a unit test of
+   * the helper cannot see it. These cases drive the real router against the real
+   * `accessService`, so the entitlement decision is the production one rather than a mock.
+   *
+   * ⛔ Every planted value is invented. No real command or path is quoted, per PEN-2370.
+   */
+  describe("PEN-3266 stage config withholding across the case read surface", () => {
+    const STAGE_COMMAND_SENTINEL = "sentinel-route-provision-must-not-egress";
+    const STAGE_RUNTIME_SENTINEL = "sentinel-route-runtime-must-not-egress";
+
+    function plantedStageConfig(existing: unknown) {
+      const base = existing && typeof existing === "object" && !Array.isArray(existing)
+        ? existing as Record<string, unknown>
+        : {};
+      // MERGED, not replaced: the seeded review stage already carries the `approveToStageKey` /
+      // `rejectToStageKey` that `normalizeStageConfig` requires, and dropping them would make
+      // `reviewConfigForStage` throw — turning a withholding test into a 500-response test.
+      return {
+        ...base,
+        onEnter: {
+          type: "run_routine",
+          executionWorkspaceSettings: {
+            mode: "isolated_workspace",
+            workspaceStrategy: {
+              type: "git_worktree",
+              provisionCommand: STAGE_COMMAND_SENTINEL,
+              teardownCommand: `${STAGE_COMMAND_SENTINEL}-teardown`,
+            },
+            workspaceRuntime: { services: [{ name: "web", command: STAGE_RUNTIME_SENTINEL }] },
+          },
+        },
+      };
+    }
+
+    /**
+     * Planted with a direct UPDATE rather than through `POST /pipelines`, on purpose: an operator
+     * authors this config, and going through the create route would drag in
+     * `validateStageAutomationConfig` and a backing routine that have nothing to do with the
+     * carrier. This models the stored row, which is what every route below reads.
+     *
+     * Planted AFTER the transition for the same reason — an `onEnter` block present during a
+     * stage entry is automation input, and this test is about the read path, not that machinery.
+     */
+    async function seedCarrier() {
+      const company = await seedCompany();
+      const boardHttp = request(app(boardActor));
+      const pipeline = await boardHttp
+        .post(`/api/companies/${company.id}/pipelines`)
+        .send({ key: "carrier", name: "Carrier" })
+        .expect(201);
+      const parent = await boardHttp
+        .post(`/api/pipelines/${pipeline.body.id}/cases`)
+        .send({ caseKey: "carrier-parent", title: "Carrier parent" })
+        .expect(201);
+      const child = await boardHttp
+        .post(`/api/pipelines/${pipeline.body.id}/cases`)
+        .send({ caseKey: "carrier-child", title: "Carrier child", parentCaseId: parent.body.case.id })
+        .expect(201);
+      // `listReviewCases` only returns cases sitting in a `review`-kind stage. Without this the
+      // review-cases body is `[]` and every assertion against it is vacuous.
+      await boardHttp
+        .post(`/api/cases/${child.body.case.id}/transition`)
+        .send({ toStageKey: "review", expectedVersion: 1 })
+        .expect(200);
+
+      // Every stage, so `allowedNextStages` — the widest exit, which returns every stage in the
+      // pipeline rather than just the case's own — carries it too.
+      const stages = await db.select().from(pipelineStages).where(eq(pipelineStages.pipelineId, pipeline.body.id));
+      for (const stage of stages) {
+        await db
+          .update(pipelineStages)
+          .set({ config: plantedStageConfig(stage.config) })
+          .where(eq(pipelineStages.id, stage.id));
+      }
+
+      const [agent] = await db.insert(agents).values({
+        companyId: company.id,
+        name: "Ordinary Agent",
+        role: "engineer",
+        adapterType: "codex_local",
+      }).returning();
+      await db.insert(companyMemberships).values({
+        companyId: company.id,
+        principalType: "agent",
+        principalId: agent!.id,
+        status: "active",
+        membershipRole: "member",
+      });
+      // Deliberately NO `workspace_runtime:read` grant: this models the actor class the ticket
+      // names — an ordinary same-company agent.
+      const unentitledActor: Express.Request["actor"] = {
+        type: "agent",
+        agentId: agent!.id,
+        companyId: company.id,
+        runId: randomUUID(),
+        source: "agent_key",
+      };
+
+      return {
+        company,
+        pipelineId: pipeline.body.id as string,
+        parentCaseId: parent.body.case.id as string,
+        childCaseId: child.body.case.id as string,
+        unentitled: request(app(unentitledActor)),
+        entitled: boardHttp,
+      };
+    }
+
+    it("withholds the commands from an unentitled reader on every case read exit", async () => {
+      const seeded = await seedCarrier();
+
+      const responses = await Promise.all([
+        seeded.unentitled.get(`/api/companies/${seeded.company.id}/review-cases`).expect(200),
+        seeded.unentitled.get(`/api/pipelines/${seeded.pipelineId}/cases`).expect(200),
+        seeded.unentitled.get(`/api/cases/${seeded.parentCaseId}/children`).expect(200),
+        seeded.unentitled.get(`/api/cases/${seeded.childCaseId}`).expect(200),
+        seeded.unentitled.get(`/api/cases/${seeded.childCaseId}/context-pack`).expect(200),
+      ]);
+
+      for (const response of responses) {
+        const body = JSON.stringify(response.body);
+        expect(body).not.toContain(STAGE_COMMAND_SENTINEL);
+        expect(body).not.toContain(STAGE_RUNTIME_SENTINEL);
+      }
+    });
+
+    /**
+     * Positive control for the assertions above, in the same run. `not.toContain` passes just as
+     * happily when the fixture never reached the response at all — a stage without the planted
+     * config, a route that 404s, a serializer that drops the key. This proves the sentinel IS
+     * reachable through these exits and that the withholding above is the reason it is absent.
+     */
+    it("discloses the same bytes to an entitled reader, proving the sentinel reaches these exits", async () => {
+      const seeded = await seedCarrier();
+
+      const responses = await Promise.all([
+        seeded.entitled.get(`/api/companies/${seeded.company.id}/review-cases`).expect(200),
+        seeded.entitled.get(`/api/pipelines/${seeded.pipelineId}/cases`).expect(200),
+        seeded.entitled.get(`/api/cases/${seeded.parentCaseId}/children`).expect(200),
+        seeded.entitled.get(`/api/cases/${seeded.childCaseId}`).expect(200),
+      ]);
+
+      for (const response of responses) {
+        expect(JSON.stringify(response.body)).toContain(STAGE_COMMAND_SENTINEL);
+      }
+    });
+
+    /**
+     * `reviewConfig` is a SECOND carrier on the review-cases response, under a key whose name
+     * suggests it only holds review-routing fields. It is built by `reviewConfigForStage`
+     * (`services/pipelines.ts`), which spreads `normalizeStageConfig(...)` — and that strips only
+     * `automation`, `assigneeAgentId` and `reviewerKind`, so `onEnter` survives it intact. Masking
+     * `stage` alone would have left the commands egressing here, which is why this is pinned
+     * separately rather than folded into the sweep above.
+     */
+    it("masks the reviewConfig copy, not only the stage row, on the review-cases exit", async () => {
+      const seeded = await seedCarrier();
+
+      const withheldRes = await seeded.unentitled
+        .get(`/api/companies/${seeded.company.id}/review-cases`)
+        .expect(200);
+      const revealedRes = await seeded.entitled
+        .get(`/api/companies/${seeded.company.id}/review-cases`)
+        .expect(200);
+
+      // A review-stage case has to exist, or both bodies are `[]` and every assertion is vacuous.
+      expect(revealedRes.body.length).toBeGreaterThan(0);
+      for (const row of revealedRes.body) {
+        expect(row.reviewConfig.onEnter.executionWorkspaceSettings.workspaceStrategy.provisionCommand)
+          .toBe(STAGE_COMMAND_SENTINEL);
+        // The review-routing fields the board UI reads must survive the mask.
+        expect(row.reviewConfig.approveToStageKey).toBe("done");
+      }
+      for (const row of withheldRes.body) {
+        expect(row.reviewConfig.onEnter.executionWorkspaceSettings.workspaceStrategy.provisionCommand)
+          .not.toBe(STAGE_COMMAND_SENTINEL);
+        expect(row.reviewConfig.approveToStageKey).toBe("done");
+      }
+    });
+  });
 });
