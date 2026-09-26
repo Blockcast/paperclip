@@ -1811,6 +1811,98 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Never-invoked runs excluded (terminal, no adapter ever created");
   });
 
+  // BLO-36535, Ally review on #2040: the exclusion must not swallow a run that
+  // SPOKE. The walk breaks only on `commentRunIds.has(run.id)`, so a run removed
+  // from `noCommentEligibleRuns` is never tested and can no longer break the
+  // streak. This population is the first excluded one that CAN have commented —
+  // the two zero-token exclusions above provably never got a turn — so the
+  // guard is needed here and only here.
+  //
+  // The seeded ordering (comment posted, run killed later) is the modal shape on
+  // this fleet: the run-comment protocol has agents post before continuing to
+  // work, so an `adapter_failed` 403 lands after the comment, not before.
+  //
+  // Without the `&& !commentRunIds.has(run.id)` guard the streak bridges across
+  // the commenting run and reads 14, firing `no_comment_streak` against an agent
+  // that demonstrably spoke 6 runs ago — the same conduct false positive this
+  // change exists to remove, in the same direction.
+  it("lets an infra-killed run that DID comment break the no-comment streak (BLO-36535)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    // 10m spacing, not the 1m default: 15 runs packed into 15 minutes trips
+    // `high_churn` (10/1h) and a review is created on THAT trigger, which would
+    // make this test pass for the wrong reason pre-fix. Spread out, the only
+    // trigger that can fire here is the one under test.
+    const base = {
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      spacingMs: 600_000,
+    };
+    // Newest: 5 runs that executed and stayed silent.
+    await insertRuns({ ...base, count: 5, now });
+    // The breaker: executed a turn, POSTED ITS RUN COMMENT, then died on a 403.
+    await insertRuns({
+      ...base,
+      count: 1,
+      now: new Date(now.getTime() - 50 * 60_000),
+      status: "failed",
+      livenessState: "failed",
+      usageJson: { inputTokens: 148_221, outputTokens: 20_957 },
+      errorCode: "adapter_failed",
+      withRunComments: true,
+    });
+    // Oldest: 9 more silent executed runs, enough that bridging crosses the
+    // threshold of 10 while breaking correctly stops at 5.
+    await insertRuns({ ...base, count: 9, now: new Date(now.getTime() - 60 * 60_000) });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // BLO-36535, Ally review on #2040: the reported count must stay equal to what
+  // was actually excluded. A commenting infra run is not an exclusion — it is
+  // evidence — so it must be absent from `infraClassKilledRunCount` too, and the
+  // streak must stop at it rather than bridging (11, not 20).
+  it("excludes a commenting infra-killed run from the reported excluded count (BLO-36535)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const base = {
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      spacingMs: 600_000,
+    };
+    await insertRuns({ ...base, count: 11, now });
+    await insertRuns({
+      ...base,
+      count: 1,
+      now: new Date(now.getTime() - 110 * 60_000),
+      status: "failed",
+      livenessState: "failed",
+      usageJson: { inputTokens: 148_221, outputTokens: 20_957 },
+      errorCode: "adapter_failed",
+      withRunComments: true,
+    });
+    await insertRuns({ ...base, count: 9, now: new Date(now.getTime() - 120 * 60_000) });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+    // 11, not 20: the walk stopped at the commenting run instead of bridging it.
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 11");
+    // 0, not 1: a run that spoke is not counted as taken by infrastructure.
+    expect(reviews[0]?.description).toContain(
+      "Infra-killed runs excluded (terminal, executed a turn then died of an infrastructure fault — `errorCode` in the shared infra-class set, BLO-36535): 0",
+    );
+  });
+
   // BLO-36535 negative control, pinning the over-exclusion direction.
   // `claude_truncated` is matched by `isInfraClassStrandedFailure`'s MESSAGE arm
   // in recovery/service.ts, which is documented audit-only there — a truncated
