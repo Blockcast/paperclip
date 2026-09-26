@@ -1284,6 +1284,7 @@ type DirtyQuarantineRepairResult = {
   rescueCommitSha: string;
   fileCount: number;
   clearedInProgressOperation: GitWorktreeInProgressOperation | null;
+  quarantinedIndexLockPath: string | null;
   sourceAuditCommentId: string | null;
   claimantAuditCommentId: string | null;
 };
@@ -1543,12 +1544,235 @@ async function assertDirtyQuarantineRuntimeServicesStopped(input: {
   throw branchIncoherenceValidationFailure(input.evidence);
 }
 
-async function assertGitIndexIsUnlocked(worktreePath: string) {
-  const indexLockPath = await runGit(["rev-parse", "--git-path", "index.lock"], worktreePath)
-    .catch(() => null);
-  if (indexLockPath && existsSync(indexLockPath)) {
-    throw new Error(`git index lock exists at ${indexLockPath}`);
+// A run killed mid-`git` leaves a 0-byte `index.lock` behind and git will not
+// reap it, because it cannot tell a dead owner from a live one. Neither can the
+// lock file: git creates it `O_CREAT|O_EXCL` at 0 bytes, does every expensive
+// step holding it (blob hashing, tree walk, object writes), and serialises the
+// index into it only in the last moment before the rename. Measured against a
+// live `git add` stalled in a clean filter, size stayed 0 and mtime stayed
+// frozen at creation for the whole run -- so "empty and old" is what a *slow
+// live writer* looks like, not what a dead one leaves behind. Neither size nor
+// mtime is evidence of abandonment, and this guard does not treat them as such.
+//
+// An open descriptor is evidence: git holds the lock open from creation to
+// rename, so `lockHolderPids` below is a positive liveness signal rather than
+// an absence of one. Measured on both commands that plausibly run long here --
+// `git add` (clean filter) and `git checkout` (smudge filter, a separate
+// unpack_trees path) -- each showed a live holding fd while size stayed 0 and
+// mtime stayed frozen.
+//
+// What the scan can see is bounded by the PID namespace it runs in: holders
+// under another uid, on another pod sharing the volume, or in a sandbox Job pod
+// that does not share this namespace are all invisible to it, and nothing here
+// can see them. Which of those applies is a property of the isolation mode in
+// play, and this code does not know the mode -- so the scan is treated as
+// authoritative only for the namespace it can actually read, never as proof
+// that no holder exists anywhere. The age floor is a mitigation for that
+// residue, deliberately not the safety argument. The break is a rename, not a
+// delete, so the residue stays recoverable.
+export const GIT_INDEX_LOCK_STALE_MS = 15 * 60 * 1000;
+
+// Git holds `index.lock` open from creation to rename, so a descriptor naming
+// it is a live owner. `holders: null` is "holder unknown", which must never
+// read as "no holder" -- the caller refuses on it either way. The two ways of
+// not knowing are reported apart because they are not the same fact:
+//
+//   "unsupported" -- this platform has no `/proc` to walk, so the scan cannot
+//     run here and never will. Static; re-running changes nothing. The break is
+//     therefore Linux-only, and on any other host a stale lock still parks the
+//     row exactly as it did before this change (BLO-35981).
+//   "unreadable"  -- `/proc` exists and refused (masked in a hardened
+//     container, or a sandbox policy). Environmental; it can change.
+//
+// Collapsing them loses the one thing an operator reading a parked row needs:
+// whether re-running could ever produce a different answer. Neither falls back
+// to the age floor, because the invariant this guard rests on is that a lock is
+// broken only on a *positive* determination that nothing holds it -- and
+// "I could not look" is not that determination on either branch.
+// `unsupported` carries the platform rather than leaving the caller to read
+// `process.platform`: that is what lets a test state the verdict directly
+// instead of mutating the global, which is only safe while nothing in the file
+// runs concurrently.
+export type LockHolderScan =
+  | { holders: string[] }
+  | { holders: null; failure: "unsupported"; platform: string }
+  | { holders: null; failure: "unreadable" };
+
+let lockHolderScanForTests: ((lockPath: string) => Promise<LockHolderScan>) | null = null;
+
+/**
+ * Test-only seam for the liveness scan, same convention as
+ * `setProcessGroupLivenessProbeForTests`. Without it the scan's verdict is a
+ * property of the host -- the `/proc` walk exists only on Linux -- so every
+ * test of the *gates around* it would assert the platform refusal instead of
+ * what it means to assert, and fail on a developer's macOS on a path they did
+ * not touch. Overriding it makes that verdict a fixture; the real walk is still
+ * exercised by the Linux-only live-holder test. Pass `null` to clear.
+ */
+export function setLockHolderScanForTests(
+  override: ((lockPath: string) => Promise<LockHolderScan>) | null,
+) {
+  lockHolderScanForTests = override;
+}
+
+// ponytail: O(processes x fds) scan, fine on a repair path that runs once per
+// incoherent workspace; switch to a targeted inode match if it ever gets hot.
+async function lockHolderPids(lockPath: string): Promise<LockHolderScan> {
+  if (process.platform !== "linux") {
+    return { holders: null, failure: "unsupported", platform: process.platform };
   }
+  // `/proc/*/fd` readlinks are fully canonical, but `indexLockPath` is built
+  // with `path.resolve`, which does not resolve symlinks. Comparing the two
+  // directly would silently match nothing whenever any component of the
+  // worktree path is a symlink -- a miss that reads as "no holder", which is
+  // the one direction this scan must never fail in.
+  //
+  // The fallback to the uncanonicalised path looks like exactly that miss, and
+  // is safe only because of where this runs: the caller already `stat`ed this
+  // same path successfully two statements earlier, so the one way `realpath`
+  // fails here is the lock being unlinked in between -- i.e. its owner finished
+  // and there is no holder to miss. Such a lock resolves as success at the
+  // pre-rename re-stat below, which returns for a lock already gone -- not at
+  // the rename's `ENOENT` catch, which only backstops the two-syscall gap
+  // after that re-stat.
+  const canonicalLockPath = await fs.realpath(lockPath).catch(() => lockPath);
+  const entries = await fs.readdir("/proc").catch(() => null);
+  if (!entries) return { holders: null, failure: "unreadable" };
+  const holders: string[] = [];
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    // Unreadable (another uid, or exited mid-scan) -- skip rather than fail the
+    // whole scan; the age floor is what covers the holders we cannot read.
+    const fds = await fs.readdir(`/proc/${entry}/fd`).catch(() => null);
+    if (!fds) continue;
+    for (const fd of fds) {
+      const target = await fs.readlink(`/proc/${entry}/fd/${fd}`).catch(() => null);
+      if (target === canonicalLockPath) {
+        holders.push(entry);
+        break;
+      }
+    }
+  }
+  return { holders };
+}
+
+// Returns the path of the lock it broke, or null when there was nothing to
+// break. Every refusal below keeps "index lock" in the message so
+// `formatDirtyQuarantineFailure` still reports it as index contention.
+async function ensureGitIndexIsUnlocked(worktreePath: string): Promise<string | null> {
+  const rawLockPath = await runGit(["rev-parse", "--git-path", "index.lock"], worktreePath)
+    .catch(() => null);
+  if (!rawLockPath) return null;
+  // `--git-path` answers relative to the worktree for a normal repo and absolute
+  // for a linked one. Resolving against `worktreePath` rather than the process
+  // cwd is what makes every `stat` below, and the rename, name the lock that
+  // belongs to *this* worktree -- against the server process cwd a relative
+  // answer would silently address some other repo's lock, or nothing at all.
+  const indexLockPath = path.isAbsolute(rawLockPath) ? rawLockPath : path.resolve(worktreePath, rawLockPath);
+  const lockStat = await fs.stat(indexLockPath).catch((error: unknown) => {
+    // Only "not there" is an unlocked index. EACCES/EIO is a lock we cannot
+    // vet, and an unvettable lock has to refuse rather than read as absent.
+    if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") return null;
+    throw new Error(
+      `git index lock at ${indexLockPath} could not be read: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  });
+  if (!lockStat) return null;
+
+  // Serialised index state, written just before the rename. Never remove it: a
+  // partially-written index is genuinely indistinguishable from a complete one,
+  // so there is no verdict to reach here. This bounds the fix -- a run killed
+  // inside that final serialise window still parks the row permanently, exactly
+  // as before. The window is short relative to the rest of a git write, so this
+  // is the rarer half of the original defect, not the common one, but "stale
+  // index locks self-heal" is not what this guard delivers (BLO-35981).
+  if (lockStat.size > 0) {
+    throw new Error(
+      `git index lock exists at ${indexLockPath} and holds ${lockStat.size} bytes of serialised index state`,
+    );
+  }
+
+  const scan = await (lockHolderScanForTests ?? lockHolderPids)(indexLockPath);
+  if (!scan.holders) {
+    throw new Error(
+      `git index lock exists at ${indexLockPath} and its holder could not be determined because ${
+        scan.failure === "unsupported"
+          ? `the /proc liveness scan is unavailable on ${scan.platform}`
+          : "/proc is unreadable"
+      }`,
+    );
+  }
+  if (scan.holders.length > 0) {
+    throw new Error(
+      `git index lock exists at ${indexLockPath} and is held open by live pid ${scan.holders.join(", ")}`,
+    );
+  }
+
+  // A future mtime yields a negative age and refuses here. That is deliberate,
+  // not incidental: a lock stamped by a clock we do not share is not one to
+  // break on an age argument.
+  const ageMs = Date.now() - lockStat.mtimeMs;
+  if (ageMs < GIT_INDEX_LOCK_STALE_MS) {
+    throw new Error(
+      `git index lock exists at ${indexLockPath} and was created ${Math.round(ageMs / 1000)}s ago, under the ${Math.round(GIT_INDEX_LOCK_STALE_MS / 60000)}m staleness floor`,
+    );
+  }
+
+  // Move it aside rather than delete it. The verdict above is evidential, not
+  // certain -- a holder under another uid or on another pod sharing the volume
+  // is invisible to the scan -- and this is the only irreversible act on the
+  // repair path. A rename releases the mutex exactly as an unlink does, and
+  // costs one inode to keep the evidence if the verdict was wrong.
+  //
+  // Re-stat first, because everything above vetted an *inode* and the rename
+  // names a *path*. The `/proc` walk between them is O(processes x fds), so the
+  // window is measured in the scan's duration, not in syscalls: if the holder
+  // released the lock inside it, a live `git` can take the path afresh with
+  // O_CREAT|O_EXCL and the rename would move that live mutex aside, losing the
+  // victim's index write. The ENOENT branch below does not cover it -- that
+  // handles the lock being *gone*, not *replaced*. Two adjacent syscalls is
+  // still not atomic and nothing portable will be, but it shrinks the window
+  // from the scan's duration to a stat/rename pair and turns the failure from
+  // "break a live lock" into "refuse and retry next dispatch", which is the
+  // direction every other gate here already fails in.
+  const preRenameStat = await fs.stat(indexLockPath).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") return null;
+    throw new Error(
+      `git index lock at ${indexLockPath} could not be re-read before being moved aside: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  });
+  // Released during the scan: its owner finished and the index is unlocked, so
+  // this, not the rename's ENOENT catch below, is the usual way the lock
+  // vanishing mid-repair resolves as success.
+  if (!preRenameStat) return null;
+  if (
+    preRenameStat.ino !== lockStat.ino ||
+    preRenameStat.size !== lockStat.size ||
+    preRenameStat.mtimeMs !== lockStat.mtimeMs
+  ) {
+    throw new Error(
+      `git index lock at ${indexLockPath} was replaced while its holder was being determined, so the scan's verdict does not describe the lock now at that path`,
+    );
+  }
+
+  const quarantinedPath = `${indexLockPath}.paperclip-broken-${formatUtcBranchTimestamp()}`;
+  let broken = true;
+  await fs.rename(indexLockPath, quarantinedPath).catch((error: unknown) => {
+    // Gone between the stat and here: its owner finished normally, or a sibling
+    // repair won the race. Either way the index is unlocked, which is the whole
+    // post-condition -- turning that into a failure would reinstate the
+    // permanent park this guard exists to remove.
+    if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") {
+      broken = false;
+      return;
+    }
+    throw new Error(
+      `git index lock exists at ${indexLockPath} and could not be moved aside: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  });
+  return broken ? quarantinedPath : null;
 }
 
 function fingerprintWorkspaceBranchIncoherence(input: {
@@ -2107,7 +2331,7 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
   let rescueBranchCreated = false;
   let expectedBranchRestored = false;
   try {
-    await assertGitIndexIsUnlocked(input.worktreePath);
+    const quarantinedIndexLockPath = await ensureGitIndexIsUnlocked(input.worktreePath);
     await recordGitOperation(input.recorder, {
       phase: input.phase ?? "worktree_prepare",
       args: ["checkout", "-b", rescueBranch],
@@ -2242,6 +2466,7 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
       rescueCommitSha,
       fileCount,
       clearedInProgressOperation,
+      quarantinedIndexLockPath,
       ...comments,
     };
   } catch (error) {
@@ -2492,7 +2717,7 @@ export async function ensureGitWorktreeBranchCoherent(input: {
       reconciledForward: false,
       dirtyQuarantineRepair: result,
       warnings: [
-        `Execution workspace dirty worktree state was quarantined on rescue branch "${result.rescueBranch}" (${formatShortSha(result.rescueCommitSha)}; ${result.fileCount} ${result.fileCount === 1 ? "file" : "files"}) before restoring recorded branch "${expectedBranchName}".${result.clearedInProgressOperation ? ` An interrupted git ${GIT_IN_PROGRESS_OPERATION_LABELS[result.clearedInProgressOperation]} was also cleared; its in-flight state is preserved on the rescue branch.` : ""}`,
+        `Execution workspace dirty worktree state was quarantined on rescue branch "${result.rescueBranch}" (${formatShortSha(result.rescueCommitSha)}; ${result.fileCount} ${result.fileCount === 1 ? "file" : "files"}) before restoring recorded branch "${expectedBranchName}".${result.clearedInProgressOperation ? ` An interrupted git ${GIT_IN_PROGRESS_OPERATION_LABELS[result.clearedInProgressOperation]} was also cleared; its in-flight state is preserved on the rescue branch.` : ""}${result.quarantinedIndexLockPath ? ` An abandoned 0-byte git index lock was broken first; no process visible to this pod held it open, and it was preserved at "${result.quarantinedIndexLockPath}".` : ""}`,
       ],
     };
   }
