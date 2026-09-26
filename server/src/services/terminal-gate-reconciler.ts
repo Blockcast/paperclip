@@ -217,19 +217,40 @@ export async function resolveTerminalGate(input: {
 export function buildTerminalGateResolvedComment(input: {
   signals: readonly string[];
   mergedPullRequests: readonly string[];
+  /**
+   * The monitor's pending first check, for a row admitted by the never-polled
+   * arm (BLO-36289). Non-null means the monitor is **armed** — it has a live
+   * wake path and simply has not reached its first check — which is the
+   * opposite of the stranded case this module was built for.
+   *
+   * The branch is not cosmetic. This comment is system-authored and read by
+   * agents deciding whether a row is stranded, and the documented repair for a
+   * stranded row *destroys* the wake path it already had. Asserting "nothing is
+   * polling it" over an armed monitor is the same false signal as the
+   * 86%-false-positive strand detector, so the two populations must not share
+   * copy.
+   */
+  armedNextCheckAt?: Date | null;
 }) {
+  const armed = input.armedNextCheckAt != null;
   const prLines = input.mergedPullRequests.map((pr) => `- \`${pr}\` — **merged**`).join("\n");
   const signalLines = input.signals.map((signal) => `\`${signal}\``).join(", ");
   return [
-    "**Terminal gate resolved — this issue's monitor gate is satisfied, but nothing is polling it.**",
+    armed
+      ? "**Terminal gate resolved — this issue's gate was already satisfied when its monitor was armed.**"
+      : "**Terminal gate resolved — this issue's monitor gate is satisfied, but nothing is polling it.**",
     "",
-    "The monitor stopped re-checking (converged to a stall, was cleared, or its run was killed) while its declared gate was still unsatisfied. A board-side re-read now finds it satisfied:",
+    armed
+      ? `The monitor is armed and scheduled; its first check is not due until \`${input.armedNextCheckAt!.toISOString()}\`. A board-side re-read finds the declared gate already satisfied, so that wait buys nothing:`
+      : "The monitor stopped re-checking (converged to a stall, was cleared, or its run was killed) while its declared gate was still unsatisfied. A board-side re-read now finds it satisfied:",
     "",
     prLines,
     "",
     `Declared gate signals: ${signalLines}`,
     "",
-    "No run was dispatched to produce this — re-reading a pull request is one API call, and waking an agent to do it is not. Nothing here closes the issue: a merged gate proves the gate resolved, not that the acceptance criteria are met. Verify the acceptance criteria against the merged artifact and close, or re-arm the monitor on whatever is genuinely still outstanding.",
+    armed
+      ? "No run was dispatched to produce this — re-reading a pull request is one API call, and waking an agent to do it is not. Nothing here closes the issue: a merged gate proves the gate resolved, not that the acceptance criteria are met. Verify the acceptance criteria against the merged artifact and close. **The monitor is still armed, so this issue has a live wake path — do not treat it as stranded and do not repair it as one.**"
+      : "No run was dispatched to produce this — re-reading a pull request is one API call, and waking an agent to do it is not. Nothing here closes the issue: a merged gate proves the gate resolved, not that the acceptance criteria are met. Verify the acceptance criteria against the merged artifact and close, or re-arm the monitor on whatever is genuinely still outstanding.",
     "",
     "_Posted by the terminal-gate reconciler (BLO-27515)._",
   ].join("\n");
@@ -310,6 +331,8 @@ type CandidateRow = {
   companyId: string;
   identifier: string | null;
   executionState: unknown;
+  /** Non-null == admitted by the never-polled arm, i.e. armed. See the comment builder. */
+  monitorNextCheckAt: Date | null;
 };
 
 /**
@@ -357,6 +380,7 @@ async function listCandidateIssues(db: Pick<Db, "select">, limit: number): Promi
       companyId: issues.companyId,
       identifier: issues.identifier,
       executionState: issues.executionState,
+      monitorNextCheckAt: issues.monitorNextCheckAt,
     })
     .from(issues)
     .where(and(
@@ -569,6 +593,18 @@ export async function reconcileTerminalGates(
         body: buildTerminalGateResolvedComment({
           signals: verdict.signals,
           mergedPullRequests: verdict.mergedPullRequests,
+          // Only a check still in the FUTURE is a live wake path. A non-null
+          // `monitorNextCheckAt` here always means the row came in via the
+          // never-polled arm (the other arm requires it to be null), but an
+          // *overdue* first check is by definition a wake that did not happen —
+          // so claiming "live wake path, do not treat as stranded" over it would
+          // be the mirror of the false signal this branch exists to avoid. The
+          // stranded copy, including its re-arm advice, is the true one there.
+          armedNextCheckAt:
+            entry.candidate.monitorNextCheckAt !== null
+              && entry.candidate.monitorNextCheckAt.getTime() > now.getTime()
+              ? entry.candidate.monitorNextCheckAt
+              : null,
         }),
       })
       .onConflictDoNothing()

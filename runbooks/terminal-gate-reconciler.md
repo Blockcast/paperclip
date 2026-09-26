@@ -2,9 +2,17 @@
 
 ## What it does
 
-Re-reads the pull-request gates a **terminated** issue monitor declared in
+Re-reads the pull-request gates an issue monitor declared in
 `executionPolicy.monitor.gateSignals`, and — when every one of them is merged —
 posts a system comment on the issue naming the resolved gate.
+
+Two populations qualify (`listCandidateIssues`): a **terminated** monitor, which
+has stopped polling (`monitorNextCheckAt IS NULL`); and an **armed but never
+evaluated** monitor (`monitorAttemptCount = 0 AND monitorLastTriggeredAt IS
+NULL`), which was armed on a gate that was already satisfied and would otherwise
+wait out its whole window before anything looked — BLO-36289. The comment copy
+branches on which one it is: the armed variant states the monitor is still armed
+and must not be treated as stranded.
 
 It dispatches nothing, closes nothing, and clears no monitor.
 
