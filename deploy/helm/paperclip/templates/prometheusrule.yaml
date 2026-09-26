@@ -807,10 +807,16 @@ spec:
           # That absence is deliberate; do not "fix" it by adding an
           # `and on(instance) (...)` join to a series that does not exist.
           #
-          # Silent in steady state without a zero-fill: the gauge is emitted
-          # only for locks held RIGHT NOW (`reset()` then set), so an agent
-          # with no held lock has no series rather than a 0, and a healthy
-          # section is sub-second.
+          # No zero-fill, deliberately: the gauge is emitted only for locks
+          # held RIGHT NOW (`reset()` then set), so an agent with no held lock
+          # has no series rather than a 0. That is what keeps any positive
+          # threshold quiet for an IDLE agent, and it is the whole of the
+          # argument -- it says nothing about how long a held lock runs.
+          # Holds of minutes to a couple of hours are routine and release on
+          # their own (see the ⚠️ below), so this gauge is NOT near-empty in
+          # normal operation and "anything above a few seconds" is not the
+          # detector. server/src/services/metrics.ts states the same of the
+          # same gauge; the two must not drift apart.
           #
           # Threshold is LOCK_ABORT_MS (14400s / 4h) from agent-start-lock.ts,
           # NOT the LOCK_HELD_ERROR_MS (300s) log budget. Pinning it there is
@@ -833,11 +839,27 @@ spec:
           # to a destructive remedy are different questions and no longer share
           # a number; the `error` log still escalates at 300s.
           #
-          # `for:` stacks on top as scrape-flap tolerance only, so the first
-          # real-clock fire is at 14400 + 300 = 14700s (4h05m): the abort has
-          # been requested and has had five minutes to land. The consequence of
-          # a hold is covered the whole time by PaperclipQueuedRunStranded,
-          # which does not wait on this threshold.
+          # `for:` stacks on top, so the first real-clock fire is at
+          # 14400 + 300 = 14700s (4h05m). That window is NOT mere scrape-flap
+          # tolerance any more: since this rule and PaperclipAgentStartLockAborted
+          # below share the same 4h boundary, the window is the abort's LANDING
+          # BUDGET and the only thing separating the two. A landed abort deletes
+          # the series inside a scrape, so this window never completes and only
+          # the UNLANDED abort pages. Shortening it therefore does not merely
+          # reduce flap tolerance -- it pages `critical` on a section that
+          # recovered, the exact false-page class PEN-3328 exists to remove.
+          # prometheus-rule.test.mjs floors it for that reason.
+          #
+          # The consequence of a hold is separately visible the whole time via
+          # PaperclipQueuedRunStranded -- but visible is not paged: that alert
+          # is `severity: warning` at 1440s + `for: 5m` (~29m), and it is gated
+          # on `paperclip_queued_run_age_metrics_refresh_success == 1`, a
+          # dependency this gauge deliberately does not have. Stated honestly,
+          # the net change for a genuinely wedged agent is: before, `critical`
+          # at 600s; after, `warning` at ~29m and `critical` at 4h05m. That
+          # four-hour delay on a true wedge is the accepted cost of not paging
+          # on the settling tail -- twenty measured false pages against one
+          # delayed true positive.
           expr: max by (agent_id) (paperclip_agent_start_lock_held_seconds) > {{ .Values.prometheusRule.agentStartLockHeldSeconds }}
           for: {{ .Values.prometheusRule.agentStartLockHeldFor }}
           labels:
@@ -883,7 +905,7 @@ spec:
             severity: warning
           annotations:
             summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} had a queued-run dispatch section cancelled after overrunning its budget"
-            description: "Agent {{`{{ $labels.agent_id }}`}} held its per-agent start lock past {{ .Values.prometheusRule.agentStartLockHeldSeconds }}s and the section was cancelled (PEN-3328), so the lock released and dispatch has RESUMED -- queued runs were not lost and this is not an outage. Treat it as evidence of the underlying hang, not of the recovery: the section outran the worst hold ever observed settling on its own (8073s) by ~1.8x, so this is not the slow-but-healthy case. Correlate with the `agent start lock held past its abort budget` error log for the same agentId, and check `dispatchHealth` on the agent row (worker tier only) for the post-mortem. If this repeats for one agent_id, the cancellation is masking a persistent condition -- most likely pool exhaustion or a circular advisory-lock wait in lockIssueOwnership -- and that is what to fix. See the runbook."
+            description: "Agent {{`{{ $labels.agent_id }}`}} held its per-agent start lock past its abort budget and the section was cancelled (PEN-3328), so the lock released and dispatch has RESUMED -- queued runs were not lost and this is not an outage. That budget is LOCK_ABORT_MS in server/src/services/agent-start-lock.ts: compiled in, NOT the chart's agentStartLockHeldSeconds, which this alert does not threshold on -- read the constant rather than a rendered number. Treat it as evidence of the underlying hang, not of the recovery: the section outran the worst hold ever observed settling on its own (8073s) by ~1.8x, so this is not the slow-but-healthy case. Correlate with the `agent start lock held past its abort budget` error log for the same agentId, and check `dispatchHealth` on the agent row (worker tier only) for the post-mortem. If this repeats for one agent_id, the cancellation is masking a persistent condition -- most likely pool exhaustion or a circular advisory-lock wait in lockIssueOwnership -- and that is what to fix. See the runbook."
             runbook_url: {{ .Values.prometheusRule.agentStartLockAbortedRunbookUrl | quote }}
     - name: paperclip-pr-review-queue
       rules:

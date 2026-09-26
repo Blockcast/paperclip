@@ -413,31 +413,47 @@ Source: `server/src/services/agent-start-lock.ts` (`withAgentStartLock`,
 `server/src/services/scrape-metrics-collector.ts`
 (`refreshAgentStartLockMetrics`)
 Trigger: alert `PaperclipAgentStartLockWedged` —
-`max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 300` for 5m
-(the `300` is quoted for readability only; `deploy/helm/paperclip/values.yaml`
+`max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 14400` for 5m
+(the `14400` is quoted for readability only; `deploy/helm/paperclip/values.yaml`
 `prometheusRule.agentStartLockHeldSeconds` is the source of record, pinned by
-the chart test to `LOCK_HELD_ERROR_MS` in `agent-start-lock.ts` — read it there
-before acting on the number)
-Owner: Platform / SRE (PEN-3305)
+the chart test to `LOCK_ABORT_MS` in `agent-start-lock.ts` — **not** to the
+`LOCK_HELD_ERROR_MS` log budget, which answers a different question and no
+longer shares this number — read it there before acting on it)
+Owner: Platform / SRE (PEN-3305, re-fitted in PEN-3328)
 
 ### The invariant, and why it is a cause alert rather than a consequence one
 
-`withAgentStartLock` serializes queued-run dispatch per agent. It has **no
-timeout, no TTL and no owner-liveness check**, deliberately: the defect
-BLO-20396 removed was a timeout that let a waiter run *alongside* the holder.
-The lock is released if and only if `fn` settles, so a critical section that
-never settles holds its agent's lock for the life of the process.
+`withAgentStartLock` serializes queued-run dispatch per agent. It has **no TTL
+and no owner-liveness check**, deliberately: the defect BLO-20396 removed was a
+timeout that let a waiter run *alongside* the holder, so mutual exclusion is
+never downgraded by a clock. PEN-3328 added the only bound that is safe under
+that constraint — the section is **cancellable**. At `LOCK_ABORT_MS` (4h) its
+abort signal fires, `fn` rejects, and the lock releases through the `finally`
+that was always there. One section at a time, always.
 
-That agent then dispatches nothing, while every status surface reads healthy —
-`status: idle`, `errorReason: null`, `orgChainHealth: healthy`, work piling up
-in `queued`. Measured 2026-09-15/16: five agents across two companies dark for
-6–19 h, ~70 runs stuck, ended only by a pod replacement on an identical image
-digest and StatefulSet revision.
+That bound is not a cure, which is why this alert still exists. Cancellation
+only reaches awaits that observe the signal, so a section wedged on something
+that ignores it (an unbounded socket, a promise that never settles) holds its
+lock for the life of the process anyway. The agent then dispatches nothing
+while every status surface reads healthy — `status: idle`, `errorReason: null`,
+`orgChainHealth: healthy`, work piling up in `queued`. Measured 2026-09-15/16,
+before any bound existed: five agents across two companies dark for 6–19 h,
+~70 runs stuck, ended only by a pod replacement on an identical image digest
+and StatefulSet revision.
 
-`PaperclipQueuedRunStranded` above fires on the *consequence* of this and will
-usually fire too, a while later. It cannot tell you the cause: a queued run
-strands identically under slot starvation, a scheduler-tick gap or a dropped
-dispatch. This alert names the mechanism directly, and fires sooner.
+`PaperclipQueuedRunStranded` above fires on the *consequence* of this, and
+since PEN-3328 moved this alert onto the 4h abort boundary it now fires
+**sooner** rather than later: `warning` at ~29m (1440s + `for: 5m`, and gated
+on `paperclip_queued_run_age_metrics_refresh_success == 1`) against this
+alert's `critical` at 4h05m. That ordering is deliberate — the consequence is
+worth surfacing early and cheaply, the cause is worth *paging* on only once the
+abort has been given its chance to land. Note what it means in practice: for
+the first four hours a genuine wedge is a warning nobody is woken for. That is
+the accepted cost of not paging on the settling tail, which cost twenty false
+critical pages at the old 300s threshold. `PaperclipQueuedRunStranded` also
+cannot tell you the cause — a queued run strands identically under slot
+starvation, a scheduler-tick gap or a dropped dispatch. This alert names the
+mechanism directly, and it is the one that means a human must act.
 
 ### What to do when paged
 

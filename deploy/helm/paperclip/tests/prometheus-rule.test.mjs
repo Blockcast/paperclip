@@ -1242,14 +1242,29 @@ test("PaperclipAgentStartLockWedged pages on the abort boundary, so firing means
     : /^(\d+)h$/.test(forWindow.trim())
       ? Number(forWindow.trim().slice(0, -1)) * 60
       : null;
-  // Scrape-flap tolerance only; the ageing lives in the threshold. Same
-  // stacking trap as PaperclipQueuedRunStranded -- threshold and `for:` are
-  // not independent. The sum is what decides whether this page means "the
-  // abort did not land", and it is anchored to the threshold rather than to a
-  // wall-clock budget, because the threshold IS the abort boundary.
+  // NOT scrape-flap tolerance, despite the sibling `*For` values that are.
+  // Same stacking trap as PaperclipQueuedRunStranded -- threshold and `for:`
+  // are not independent, and the sum is what decides whether this page means
+  // "the abort did not land" -- but since PEN-3328 this window carries a
+  // second, load-bearing job: it is the abort's LANDING BUDGET. This alert and
+  // PaperclipAgentStartLockAborted sit on the same 4h boundary, and a landed
+  // abort deletes the held series inside a scrape, so this window is the only
+  // thing that keeps a recovered section from paging `critical`.
+  //
+  // ⚠️ Hence a FLOOR, not just a ceiling. The threshold above is pinned to a
+  // measurement (> 8073); this window has no equivalent measurement available,
+  // because abort-to-release latency cannot be observed until aborts exist in
+  // production -- so the floor is the shipped value and the burden is on any
+  // edit that lowers it. Anything that delays release past the window
+  // (cancellation reaching a fresh connection, a statement tearing down, an
+  // unlucky scrape) reintroduces the false-page class PEN-3328 removed.
+  // Raising it is safe; lowering it needs evidence, not the "free flap
+  // tolerance" reading that values.yaml used to invite.
   assert.ok(
-    forMinutes !== null && forMinutes > 0 && forMinutes <= 10,
-    `for window ${forWindow} must be a short scrape-flap tolerance (<= 10m)`,
+    forMinutes !== null && forMinutes >= 5 && forMinutes <= 10,
+    `for window ${forWindow} must be the abort's landing budget (>= 5m), not a bare scrape-flap tolerance, `
+      + "and must stay <= 10m so the page still lands promptly. A shorter window pages `critical` on a "
+      + "section whose abort landed just after the window opened, which is the false-page class PEN-3328 removed.",
   );
   assert.ok(
     Number(heldThreshold) > 8073,
