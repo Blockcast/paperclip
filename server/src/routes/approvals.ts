@@ -31,7 +31,12 @@ import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { resolveApprovalWithSideEffects } from "../services/approval-resolution.js";
 import { applyApprovalEnforcement } from "../services/approval-enforcement-executor.js";
 import { heartbeatService } from "../services/heartbeat.js";
-import { STATUS_ONLY_RECOVERY_RESUME_GUIDANCE } from "../services/recovery/model-profile-hint.js";
+import {
+  isPlanningOnlyRecoveryContextSnapshot,
+  isStatusOnlyRecoveryContextSnapshot,
+  statusOnlyEscalationSourceIssueId,
+  STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
+} from "../services/recovery/model-profile-hint.js";
 import {
   buildIssueGraphLivenessBoardEscalationKey,
   parseIssueGraphLivenessIncidentKey,
@@ -167,30 +172,13 @@ function budgetAssertionRefusal(type: string, payload: unknown) {
   };
 }
 
-function statusOnlyEscalationSourceIssueId(contextSnapshot: unknown): string | null {
-  if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return null;
-  const sourceIssueId = (contextSnapshot as Record<string, unknown>).sourceIssueId;
-  return typeof sourceIssueId === "string" && sourceIssueId.trim() ? sourceIssueId : null;
-}
-
-function isStatusOnlyCheapRecoveryContext(contextSnapshot: unknown) {
-  if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
-  const context = contextSnapshot as Record<string, unknown>;
-  return context.modelProfile === "cheap" &&
-    context.recoveryIntent === "status_only" &&
-    context.allowDeliverableWork === false &&
-    context.allowDocumentUpdates === false &&
-    context.resumeRequiresNormalModel === true;
-}
-
-function isPlanningOnlyRecoveryContext(contextSnapshot: unknown) {
-  if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
-  const context = contextSnapshot as Record<string, unknown>;
-  return context.recoveryIntent === "planning_only" &&
-    context.allowDeliverableWork === false &&
-    context.allowDocumentUpdates === true &&
-    context.resumeRequiresNormalModel === false;
-}
+// PEN-3275: both predicates are now derived from the canonical tuples in `model-profile-hint.ts`
+// rather than hand-repeated here. This file carried the last two hand-written copies — the exact
+// shape BLO-32774 removed from the status-only guard in `issues.ts`, and dangerous in the same
+// direction: a key added to either tuple would leave these guards testing the old shape and
+// failing OPEN on a write-containment control.
+const isStatusOnlyCheapRecoveryContext = isStatusOnlyRecoveryContextSnapshot;
+const isPlanningOnlyRecoveryContext = isPlanningOnlyRecoveryContextSnapshot;
 
 type ApprovalRunContextDecision =
   | { allowed: false }
@@ -258,6 +246,16 @@ export function approvalRoutes(
     return { includeAgentConfig: await actorCanReadAgentConfig(req, access, companyId) };
   }
 
+  // PEN-3275: `recoveryRunWriteClassNotice` (`services/recovery/model-profile-hint.ts`) RESTATES
+  // this verdict in the wake prompt — the full approval refusal list, the `request_board_approval`
+  // carve-out, and the "no source issue ⇒ no approval write at all" branch all claim what this
+  // function does. Change what is admitted here and update those sentences in the same edit.
+  //
+  // ADDING A CALL SITE counts as changing it, and that is the case this comment was written for:
+  // the notice enumerates one entry per call site in `REFUSED_APPROVAL_OPERATIONS`, and round 6 of
+  // that PR found `apply` refused here but absent from the enumeration — a list that presents
+  // itself as exhaustive while omitting an operation licenses the agent to plan around it. Add the
+  // guard to a new route, add the operation to that constant.
   async function assertApprovalMutationAllowedByRunContext(
     req: Request,
     res: any,

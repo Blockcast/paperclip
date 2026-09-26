@@ -28,7 +28,7 @@ export const PLANNING_ONLY_RECOVERY_GUARD_CONTEXT = {
   resumeRequiresNormalModel: false,
 } as const;
 
-// Attached to every 403 whose `details` carry `resumeRequiresNormalModel: true`.
+// Builds the guidance attached to every 403 whose `details` carry `resumeRequiresNormalModel: true`.
 //
 // That flag states a real *requirement* — the refused work does need a normal-model run — but on its
 // own it reads as a *promise* that such a run will come around, and callers wait for it. They wait
@@ -68,13 +68,30 @@ export const PLANNING_ONLY_RECOVERY_GUARD_CONTEXT = {
 // The preamble must stay true in every state, including "no recovery action exists at all": the
 // reason waiting never ends is that a run's class is fixed for its lifetime, NOT that an action is
 // pending. Phrasing it as the latter is what made the old text assert a row that need not exist.
-const STATUS_ONLY_RESUME_PREAMBLE =
+//
+// PEN-3275: exported because `recoveryRunWriteClassNotice` announces the same fact in the WAKE that
+// these refusals state in their 403, and the two must not drift. The notice appends this preamble
+// alone rather than the whole of `STATUS_ONLY_RECOVERY_RESUME_GUIDANCE`: that constant ends with
+// `STATUS_ONLY_BOARD_APPROVAL_EXIT`, which names the escalation unconditionally, and the notice has
+// already resolved `statusOnlyEscalationSourceIssueId` one sentence earlier. On an issueless run the
+// two would contradict inside a single paragraph — the notice saying the run "has no approval write
+// available at all" and the appended exit offering one. The preamble is the part that is true in
+// every state, which is exactly the part the wake needs to carry.
+export const STATUS_ONLY_RESUME_PREAMBLE =
   "No normal-model run arrives on its own: this run's class is fixed for its lifetime, and every " +
   "wake a recovery action raises is status-only — so waiting for a normal-model run never ends.";
 
 // True at all five sharers, and the only exit that is. Kept separate so neither arm has to restate it.
+//
+// PEN-3275 round 4: the link set is EXCLUSIVE and saying only "linked to the source issue" is
+// satisfied by a payload that ALSO links the wider blocked chain — the natural shape for a board
+// escalation about a stuck issue, and one `approvals.ts` refuses outright ("A status-only run may
+// only link a board escalation to its source issue", enforced on `unrelatedIssueIds`). On the run's
+// single permitted write the cost of that omission is the whole exit rather than a retry, so the
+// exclusivity is stated here rather than left to be inferred.
 const STATUS_ONLY_BOARD_APPROVAL_EXIT =
-  "You may also file a `request_board_approval` linked to the run context's source issue.";
+  "You may also file a `request_board_approval` linked to the run context's source issue and to " +
+  "no other issue.";
 
 export const STATUS_ONLY_RECOVERY_RESUME_GUIDANCE = {
   normalModelResumeIsAutomatic: false,
@@ -83,6 +100,102 @@ export const STATUS_ONLY_RECOVERY_RESUME_GUIDANCE = {
     "no state change on any issue lifts it within this run: record your conclusion on the issue and " +
     `take the allowed write named in this response. ${STATUS_ONLY_BOARD_APPROVAL_EXIT}`,
 } as const;
+
+// The source issue a status-only run may link a board escalation to, or `null` if it has none.
+//
+// PEN-3275: hoisted out of `approvals.ts` so the ANNOUNCEMENT and the GUARD read one function. The
+// guard tuple deliberately does not include this key — `isStatusOnlyRecoveryContextSnapshot` tests
+// `modelProfile` plus the four `STATUS_ONLY_RECOVERY_GUARD_CONTEXT` keys and nothing else, so a
+// snapshot with `sourceIssueId: null` is still fully status-only and still contained. Escalation
+// availability is a SEPARATE question from containment, and the two must not be merged: adding this
+// key to the tuple would make an issueless run read as unconstrained, which fails OPEN.
+export function statusOnlyEscalationSourceIssueId(contextSnapshot: unknown): string | null {
+  if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return null;
+  const sourceIssueId = (contextSnapshot as Record<string, unknown>).sourceIssueId;
+  return typeof sourceIssueId === "string" && sourceIssueId.trim() ? sourceIssueId : null;
+}
+
+/**
+ * Every approval operation `assertApprovalMutationAllowedByRunContext` can refuse, so the two
+ * notice sentences below and the tests that pin them read one list instead of maintaining three
+ * copies of it by hand.
+ *
+ * NOT one entry per call site, though the counts coincide today. There are seven call sites — in
+ * `approvals.ts`: create, resubmit, withdraw, apply, comments; and in `issues.ts`: link and unlink —
+ * and seven entries, but the mapping is not 1:1 in either direction: `create` accounts for both
+ * `creating` and `modifying` (there is no modify-approval route at all), while `linking or
+ * unlinking` is one entry covering two call sites. A maintainer who validates this list by counting
+ * call sites gets the right answer by accident, so count it as "every operation the guard can
+ * refuse" instead. `modifying` is kept despite naming no route because the 403 itself answers in
+ * "create/modify" terms, and a notice that dropped the word would stop matching the error text the
+ * reader is holding.
+ *
+ * Only create passes `requestedType`, so every other operation compares `undefined` against the
+ * permitted type and is refused on BOTH lanes.
+ *
+ * PEN-3275 round 6: `applying` was the entry three successive hand-written copies omitted, while
+ * `POST /approvals/:id/apply` was refused the whole time. It is the worst one to omit — that route
+ * is deliberately requester-scoped rather than board-gated (see its doc comment in `approvals.ts`),
+ * because it executes a decision a board actor already made, so the agent this notice addresses is
+ * its intended caller and reaches for it exactly after filing the one escalation it is allowed.
+ * The 403 does not close the gap either: it answers "create/modify", which does not name `apply`.
+ *
+ * Add a call site, add an entry here. This list presents itself as exhaustive, and an incomplete
+ * exhaustive list licenses the reader to plan around what it omits.
+ */
+export const REFUSED_APPROVAL_OPERATIONS = [
+  "creating",
+  "modifying",
+  "commenting on",
+  "resubmitting",
+  "withdrawing",
+  "applying",
+  "linking or unlinking",
+] as const;
+
+const REFUSED_APPROVAL_OPERATIONS_TEXT = REFUSED_APPROVAL_OPERATIONS.join(", ");
+
+/**
+ * Every write a status-only recovery run MAY perform — the positive counterpart to
+ * `REFUSED_APPROVAL_OPERATIONS`, rendered into the `Permitted:` sentence so the notice's two halves
+ * are maintained as one list instead of as prose that drifts apart.
+ *
+ * PEN-3275 round 7: this sentence was hand-written as "reads, issue comments, and recording a
+ * status disposition" — a bare three-item list, four sentences after a refusal clause that
+ * (correctly, since BLO-34683) refuses monitor arming only *while a recovery action is active*. The
+ * two clauses disagreed, and the omission landed on the wake class this notice exists for:
+ * `issue_monitor_recovery` is stamped status-only and dispatched specifically to re-arm a monitor
+ * that was just cleared, on an issue that typically holds no recovery action — so the guard would
+ * have PERMITTED the arm while the notice implied it was unavailable. Nothing fails when that
+ * happens: the run declines the write, terminates cleanly, and the issue loses its wake path. That
+ * is the BLO-34683 harm re-entering through the clause beside the one that was fixed.
+ *
+ * An entry naming a CONDITIONALLY refused write must carry the same condition its refusal clause
+ * states, so the two read as one verdict rather than as a contradiction the reader has to
+ * adjudicate. The test file pins that coupling by slicing the notice at `Permitted:` and requiring
+ * each conditional refusal to reappear on this side; round 5 pinned only the ABSENCE of an
+ * "only exit" literal, which a three-item list does not trip, and that is how this omission passed.
+ *
+ * Arming and clearing are listed SEPARATELY and deliberately. Only arming is conditional; clearing
+ * is permitted outright, by its own carve-out in `assertCanManageIssueMonitor` (`issues.ts`, gated
+ * on `options.monitorArmed !== false`) whose comment explains that refusing it "would strand an
+ * issue whose stale monitor a status-only run is tidying up". Lumping the two under the arming
+ * condition would under-state clearing — which is the exact defect this entry was added to fix,
+ * reproduced one write over.
+ */
+export const STATUS_ONLY_PERMITTED_WRITES = [
+  "reads",
+  "issue comments",
+  "recording a status disposition",
+  "upserting the status-adjudication document",
+  "clearing an issue monitor",
+  "arming an issue monitor when no recovery action covers the issue being armed or this run's own " +
+    "or source issue",
+] as const;
+
+const STATUS_ONLY_PERMITTED_WRITES_TEXT =
+  `${STATUS_ONLY_PERMITTED_WRITES.slice(0, -1).join(", ")}, and ` +
+  `${STATUS_ONLY_PERMITTED_WRITES[STATUS_ONLY_PERMITTED_WRITES.length - 1]}`;
 
 /**
  * The monitor-arm gate's guidance, which unlike the three refusals above HAS resolved whether
@@ -128,6 +241,210 @@ export function isStatusOnlyRecoveryContextSnapshot(contextSnapshot: unknown): b
   const context = contextSnapshot as Record<string, unknown>;
   if (context.modelProfile !== RECOVERY_MODEL_PROFILE_KEY) return false;
   return Object.entries(STATUS_ONLY_RECOVERY_GUARD_CONTEXT).every(([key, value]) => context[key] === value);
+}
+
+// The planning-only counterpart, derived from its own tuple for the same reason.
+//
+// PEN-3275: this predicate was hand-repeated in `approvals.ts` and `issues.ts` — the exact shape
+// BLO-32774 removed from the status-only guard, and left in place here only because nothing had
+// needed a SHARED planning-only read yet. `modelProfile` is deliberately not tested: the
+// `planning_only` arm of `withRecoveryModelProfileHint` scrubs it rather than setting it, so
+// requiring a value would make the predicate unsatisfiable, and the BLO-32634 residual means a
+// coalesced escalation can legitimately retain `modelProfile: "cheap"` while being planning-capable.
+export function isPlanningOnlyRecoveryContextSnapshot(contextSnapshot: unknown): boolean {
+  if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
+  const context = contextSnapshot as Record<string, unknown>;
+  return Object.entries(PLANNING_ONLY_RECOVERY_GUARD_CONTEXT).every(([key, value]) => context[key] === value);
+}
+
+export type RecoveryRunWriteClass = Extract<RecoveryModelProfileWorkClass, "status_only" | "planning_only">;
+
+declare const recoveryRunWriteClassNoticeBrand: unique symbol;
+
+/**
+ * The rendered write-containment notice, branded.
+ *
+ * PEN-3275 round 4: `buildPaperclipTaskMarkdown` frames this text as "System-generated, not
+ * user-authored task data.", and it takes it pre-rendered because the status-only wording is
+ * conditional on the snapshot — so the caller, not the frame, chooses the text. That is the right
+ * split, but it left the authority claim asserted by POSITION: any string in that argument would
+ * have been framed as system-authored. The brand moves the claim into the type, at no runtime
+ * cost — `recoveryRunWriteClassNotice` is the only thing that can mint one.
+ */
+export type RecoveryRunWriteClassNoticeText = string & {
+  readonly [recoveryRunWriteClassNoticeBrand]: true;
+};
+
+/**
+ * Which write-containment class is this run executing under, if any?
+ *
+ * Returns `null` for an ordinary run — including a wake that positively declared itself
+ * `normal_model`, which carries no guard tuple by design. Callers must treat `null` as
+ * "unconstrained", never as "unknown".
+ *
+ * Reads the guard tuple rather than `RECOVERY_WORK_CLASS_KEY`. The tuple is what the route guards
+ * in `approvals.ts` and `issues.ts` actually enforce against, so deriving the ANNOUNCEMENT from the
+ * same input is what keeps the two honest: a run told it is status-only is exactly a run those
+ * guards will refuse. `recoveryWorkClass` is the declaration and can be absent on an older or
+ * coalesced snapshot, so announcing from it would go quiet precisely where the guards still bite.
+ *
+ * Status-only is tested first because it is the narrower tuple; the two are mutually exclusive
+ * (`recoveryIntent` cannot hold both values), so the order is for readability, not correctness.
+ */
+export function readRecoveryRunWriteClass(contextSnapshot: unknown): RecoveryRunWriteClass | null {
+  if (isStatusOnlyRecoveryContextSnapshot(contextSnapshot)) return "status_only";
+  if (isPlanningOnlyRecoveryContextSnapshot(contextSnapshot)) return "planning_only";
+  return null;
+}
+
+/**
+ * PEN-3275. The agent-facing announcement of a run's write-containment class, for the wake prompt.
+ *
+ * Until now the class was stated ONLY in the body of a 403, which is to say: after the agent had
+ * already planned around a capability it does not have. Reads are unaffected and most writes
+ * succeed, so there is no earlier signal — the mode is discovered mid-task, on a refusal.
+ *
+ * Measured cost of that silence (PEN-3248, 2026-09-15): an agent composed a long comment stating
+ * "I have commented on card X", the approval-comment write 403'd as the comment was being posted,
+ * and the claim shipped. It needed a retraction; absent one it would have stood as a durable
+ * non-event a peer could have relied on. Two agents hit the same refusal on the same row. The
+ * defect is not the restriction — that is a deliberate cost and write-containment control — it is
+ * that the restriction was unannounced until it fired.
+ *
+ * Two things this text must NOT do, both load-bearing:
+ *
+ *  - It must not read as an instruction to go acquire an unguarded normal-model run. That residual
+ *    is BLO-32774, and `issues.ts` closed the concrete version of it (a guarded run arming itself a
+ *    monitor). The "waiting never ends" clause is `STATUS_ONLY_RESUME_PREAMBLE` appended verbatim —
+ *    the same constant the 403s carry via `STATUS_ONLY_RECOVERY_RESUME_GUIDANCE` — so the wake and
+ *    the 403 cannot drift apart and a second phrasing cannot go stale on its own. The escalation
+ *    exit itself is stated by this notice rather than inherited, because since PEN-3275 the notice
+ *    resolves whether that exit EXISTS (`statusOnlyEscalationSourceIssueId`) and the shared constant
+ *    does not; appending the constant's own unconditional exit clause would contradict the branch
+ *    this notice just took.
+ *  - It must not promise a normal-model run is coming. That was the BLO-25878 failure: three runs
+ *    read `resumeRequiresNormalModel: true` as a retry that would arrive, and none did.
+ *
+ * The refusal lists name OPERATIONS, not objects, because the guards key on the operation and the
+ * object-shaped phrasing predicted the wrong thing. `assertApprovalMutationAllowedByRunContext`
+ * admits only the CREATE route: `approvals.ts` passes `requestedType` at the create call site and
+ * nowhere else, so the comment, resubmit and withdraw routes all compare
+ * `undefined !== BOARD_ESCALATION_APPROVAL_TYPE` and refuse — on the run's own escalation included.
+ * An earlier draft read "creating or modifying approvals (except a single `request_board_approval`
+ * …)", which invites exactly the PEN-3248 write: comment on the card you just filed.
+ *
+ * Enumerated against the five guards that consume these predicates, not from memory:
+ * `assertApprovalMutationAllowedByRunContext` (`approvals.ts`), and in `issues.ts`
+ * `assertApprovalMutationAllowedByRunContext` (link/unlink),
+ * `assertDeliverableMutationAllowedByRunContext` (documents, deliverables, annotations),
+ * `assertMonitorArmingAllowedByRunContext` and `assertCheapRecoveryIssueAssigneeProfileAllowed`.
+ * The last two do not consult the planning-only predicate, which is why `planning_only` names
+ * neither. If you add a guard that consumes them, add it here: this list presents itself as
+ * exhaustive, and an incomplete exhaustive list licenses the reader to plan around what it omits.
+ * Cited by name rather than `file:line` deliberately — these call sites move under unrelated
+ * churn, and a stale line number in a security-control comment reads as authority.
+ *
+ * The monitor-arming clause names a CONDITION, not a flat verdict, because since BLO-34683 its
+ * guard is conditional: `assertMonitorArmingAllowedByRunContext` refuses only while a recovery
+ * action is active on the target issue or on the run's own or source issue, and fails closed when
+ * it cannot tell. The `issue_monitor_recovery` wake (`heartbeat.ts`) is itself stamped status-only
+ * and is dispatched to re-arm a cleared monitor, so a flat refusal talks that run out of the one
+ * write it exists to make, and nothing fails when it does. Keep the clause keyed to that guard.
+ *
+ * No branch may present one exit from the run as the only one. The escalation clause below names
+ * the document-write attempt as a second exit on every status-only run, so a categorical sentence
+ * in the same paragraph contradicts it, and it is the more quotable of the two: an agent planning
+ * from it skips the attempt, which restores the starvation round 4 closed.
+ *
+ * Neither notice states WHY the run is contained, and `planning_only`'s omission is the deliberate
+ * one. An earlier draft opened "escalated after a status-only run was refused a document write",
+ * which is true of only one of that class's two producers: `successful-run-handoff.ts` selects it
+ * as `issue.workMode === "planning" || Boolean(run.statusOnlyDocumentWriteRefusedAt)`, and the
+ * `workMode` arm — the older path, which that file's own comment notes "only ever fired for
+ * `planning` issues" — involves no refusal and stamps nothing. So a planning-workMode issue read a
+ * notice asserting a prior-run event that never happened: the PEN-3248 failure class one step
+ * removed, an agent narrating an act that did not occur, on the very lane whose notice tells it to
+ * confirm before claiming. Provenance is not what a reader needs from a containment notice — it
+ * needs to know what will be refused — and a sentence enumerating origins rots the moment a third
+ * appears. Where the origin matters it is already on the handoff record's `details`
+ * (`escalatedAfterDocumentWriteRefusal`). Do not reintroduce a causal clause here.
+ *
+ * PEN-3275: takes the whole `contextSnapshot` rather than a class, for the same reason
+ * `readRecoveryRunWriteClass` does. The status-only lane's escalation exit is conditional on the
+ * snapshot carrying a `sourceIssueId`, so a notice selected by class alone could only state that
+ * exit unconditionally — which is false for a reachable run, and false in the direction that sends
+ * an agent into the 403 this notice exists to pre-empt. One input, one output: the class, the
+ * escalation clause and the appended resume guidance are all derived here from the same object the
+ * route guards will test, so they cannot disagree with each other or with enforcement.
+ *
+ * PEN-3275 round 4, and the one place this notice must NOT simply deter the write it names. One
+ * entry in the status-only refusal list — the issue-document write — is also BLO-23197's escalation
+ * SIGNAL. `assertDeliverableMutationAllowedByRunContext` (`issues.ts`) stamps
+ * `statusOnlyDocumentWriteRefusedAt` only when a status-only run ACTUALLY ATTEMPTS that write and is
+ * refused, and every producer of `planning_only` keys on that column — `successful-run-handoff.ts`
+ * (`workMode === "planning" || Boolean(run.statusOnlyDocumentWriteRefusedAt)`) and both
+ * `recovery/service.ts` paths via `documentWriteRefusedRunId`, the backstop included, so there is no
+ * independent route. `workMode` reads `standard` in precisely the deadlocking case, which is why the
+ * refusal itself had to become the signal.
+ *
+ * So announcing the refusal in advance can DISABLE the escalation it warns about: a compliant agent
+ * reads the list, does not attempt the write, nothing is stamped, and the next corrective wake is
+ * status-only again — BLO-23197's deadlock ("measured live on BLO-23032 and five times since")
+ * restored by this notice working exactly as designed. Nothing fails when that happens: the run
+ * terminates cleanly, and the BLO-23197 tests drive the guard directly so they keep passing.
+ *
+ * The notice therefore names the attempt as the channel rather than leaving the refusal standing as
+ * a bare prohibition. Two rejected alternatives, recorded because both look cheaper:
+ *
+ *  - Stamp the column when the notice is RENDERED. It decouples the signal from the attempt, but it
+ *    stamps on every status-only wake regardless of whether a document was ever needed, so every
+ *    such run that ends without a disposition is escalated to a document-write-capable lane. That is
+ *    a write-containment control failing OPEN, which is the direction this file refuses everywhere
+ *    else (see `isStatusOnlyRecoveryContextSnapshot` on why `sourceIssueId` stays out of the tuple).
+ *  - Add a separate "request the escalation" route. The attempt already IS that request — same
+ *    stamp, same consequence, one fewer verb — so the route would be a second spelling of an
+ *    existing channel, and a second spelling is the drift hazard the rest of this PR removed.
+ *
+ * Keep this clause. It is prose, but it is prose that carries a mechanism, and deleting it silently
+ * reverts BLO-23197 with every test still green.
+ */
+export function recoveryRunWriteClassNotice(contextSnapshot: unknown): RecoveryRunWriteClassNoticeText | null {
+  const writeClass = readRecoveryRunWriteClass(contextSnapshot);
+  if (!writeClass) return null;
+  const mint = (text: string) => text as RecoveryRunWriteClassNoticeText;
+  if (writeClass === "planning_only") {
+    return mint(
+      "This wake is a planning-only recovery run. Issue document updates are permitted. Refused " +
+      `with 403: ${REFUSED_APPROVAL_OPERATIONS_TEXT} approvals — every approval write, with no ` +
+      "`request_board_approval` exception on " +
+      "this lane — and all deliverable and annotation writes. Confirm any of those returned before " +
+      "you describe it as done.");
+  }
+  return mint(
+    "This wake is a cheap status-only recovery run. Reads and issue comments behave normally, so " +
+    "there is no other signal that writes are contained. Refused with 403: " +
+    `${REFUSED_APPROVAL_OPERATIONS_TEXT} approvals — including the ` +
+    "`request_board_approval` this run may itself file; assigning downstream issue work to the " +
+    "cheap model profile; arming issue monitors while a recovery action is active on the issue " +
+    "being armed or on this run's own or source issue, and whenever the server cannot tell, as " +
+    "on an issue this run is creating; writing issue documents other than upserting " +
+    "the status-adjudication document; and all deliverable and annotation writes. " +
+    (statusOnlyEscalationSourceIssueId(contextSnapshot)
+      ? "The only approval write this run can perform is creating a `request_board_approval` " +
+        "linked to this run's source issue and to no other issue, and that is a single call you " +
+        "cannot follow up from here — not to comment on what you just filed, and not to apply it " +
+        "once it is decided. "
+      : "This run's context carries no source issue, so the `request_board_approval` escalation is " +
+        "refused here too: this run has no approval write available at all. ") +
+    `Permitted: ${STATUS_ONLY_PERMITTED_WRITES_TEXT}. ` +
+    "One of those refusals is also the only escalation channel off this lane: if the work this run " +
+    "must finish genuinely needs an issue-document write, attempt it rather than skipping it on " +
+    "the strength of this notice. The refusal is recorded against this run, and the next " +
+    "corrective wake for it is dispatched planning-only, which can perform the write. An attempt " +
+    "you never make is never recorded, and the wake after it is status-only again. " +
+    STATUS_ONLY_RESUME_PREAMBLE +
+    " Confirm any of the refused writes returned before you describe it as done: composing the " +
+    "claim before the call lands is how a refused write becomes a false record.");
 }
 
 const RECOVERY_MODEL_PROFILE_HINT_KEYS = [

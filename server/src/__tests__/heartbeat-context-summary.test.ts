@@ -9,7 +9,30 @@ import {
   summarizeHeartbeatRunContextSnapshot,
   summarizeHeartbeatRunListResultJson,
 } from "../services/heartbeat.js";
-import { withRecoveryModelProfileHint } from "../services/recovery/model-profile-hint.js";
+import {
+  recoveryRunWriteClassNotice,
+  REFUSED_APPROVAL_OPERATIONS,
+  STATUS_ONLY_RESUME_PREAMBLE,
+  withRecoveryModelProfileHint,
+} from "../services/recovery/model-profile-hint.js";
+
+// PEN-3275: the notice is derived from a real producer snapshot rather than named by class, so
+// these tests exercise the same path the wake does. The status-only lane has TWO reachable texts,
+// differing only in whether the snapshot carries a `sourceIssueId` — the escalation clause is
+// conditional on it. Both are fixtures here; the branch-selection logic itself is asserted in
+// `model-profile-hint.test.ts`, and what these add is that each text survives the markdown frame.
+const STATUS_ONLY_SNAPSHOT = withRecoveryModelProfileHint(
+  { issueId: "issue-1", sourceIssueId: "issue-1" },
+  "status_only",
+);
+const STATUS_ONLY_NO_SOURCE_SNAPSHOT = withRecoveryModelProfileHint(
+  { issueId: "issue-1", sourceIssueId: null },
+  "status_only",
+);
+const PLANNING_ONLY_SNAPSHOT = withRecoveryModelProfileHint({ issueId: "issue-1" }, "planning_only");
+const STATUS_ONLY_NOTICE = recoveryRunWriteClassNotice(STATUS_ONLY_SNAPSHOT);
+const STATUS_ONLY_NO_SOURCE_NOTICE = recoveryRunWriteClassNotice(STATUS_ONLY_NO_SOURCE_SNAPSHOT);
+const PLANNING_ONLY_NOTICE = recoveryRunWriteClassNotice(PLANNING_ONLY_SNAPSHOT);
 
 describe("buildPaperclipTaskMarkdown", () => {
   it("adds planning directives for assignment and comment task context", () => {
@@ -2520,6 +2543,204 @@ describe("mergeCoalescedContextSnapshot", () => {
     expect(existing.recoveryIntent).toBe("status_only");
     expect(existing.modelProfile).toBe("cheap");
     expect(existing.resumeRequiresNormalModel).toBe(true);
+  });
+});
+
+// PEN-3275. The run's write-containment class reaches the agent through the task markdown —
+// the one surface it reads before planning. Previously it was stated only in a 403, i.e. after
+// the agent had committed to work the run cannot perform.
+describe("buildPaperclipTaskMarkdown run write-containment notice", () => {
+  const issue = {
+    id: "issue-1",
+    identifier: "PAP-1",
+    title: "Do the thing",
+    workMode: "standard",
+    description: null,
+  };
+
+  it("announces a status-only run and names its reachable exits", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue, recoveryRunWriteClassNotice: STATUS_ONLY_NOTICE });
+
+    expect(markdown).toContain("Run write-containment notice:");
+    expect(markdown).toContain("cheap status-only recovery run");
+    expect(markdown).toContain("`request_board_approval`");
+    // The "waiting never ends" clause, carried verbatim from the 403's shared guidance.
+    expect(markdown).toContain(STATUS_ONLY_RESUME_PREAMBLE);
+  });
+
+  // The no-source text reaches this frame on an ordinary run — `resolveStaleRunSourceIssue`
+  // returns null for a silent unscoped heartbeat — and it is the text that must NOT offer a
+  // filing. Asserted at the markdown level and not only at the notice level: the frame is what
+  // the agent actually reads, and a clause dropped between the two would be invisible upstream.
+  it("carries the no-source status-only text through the markdown frame without offering a filing", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue,
+      recoveryRunWriteClassNotice: STATUS_ONLY_NO_SOURCE_NOTICE,
+    });
+
+    expect(markdown).toContain("Run write-containment notice:");
+    expect(markdown).toContain("no approval write available at all");
+    expect(markdown).toContain(STATUS_ONLY_RESUME_PREAMBLE);
+    // The shared constant's own exit clause is unconditional, so the frame must not carry it here.
+    expect(markdown).not.toContain("You may also file a `request_board_approval`");
+    expect(markdown).not.toMatch(/only approval write this run can perform/);
+  });
+
+  // The refusal list must name the OPERATION, not just the object. `approvals.ts` passes
+  // `requestedType` at the create call site only, so commenting on / resubmitting / withdrawing /
+  // applying an approval compares `undefined` against the permitted type and refuses — on the
+  // run's own escalation included. PEN-3248's false record was exactly an approval comment, so a
+  // notice that named only "creating or modifying approvals (except a `request_board_approval` …)"
+  // pointed the reader into the one 403 this notice exists to pre-empt.
+  //
+  // PEN-3275 round 6: iterated over `REFUSED_APPROVAL_OPERATIONS` rather than over a literal copy
+  // of it. The hand-maintained copy that used to live here listed three of the seven operations,
+  // which is how `applying` stayed unannounced while the guard refused it — a list that names a
+  // subset cannot fail when the subset is wrong.
+  it("names the approval operations it cannot follow its own escalation up with", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue, recoveryRunWriteClassNotice: STATUS_ONLY_NOTICE });
+
+    for (const operation of REFUSED_APPROVAL_OPERATIONS) {
+      expect(markdown).toContain(operation);
+    }
+    expect(markdown).toContain("this run may itself file");
+    expect(markdown).toContain("not to comment on what you just filed");
+    expect(markdown).toContain("not to apply it");
+  });
+
+  // `assertCheapRecoveryIssueAssigneeProfileAllowed` (`issues.ts:6813`) is a status-only refusal
+  // that the first draft's enumeration omitted. The list presents itself as exhaustive, so an
+  // omission is worse than an explicitly partial list — it licenses planning around what is absent.
+  it("names the cheap-assignee-profile refusal, and scopes it to status-only", () => {
+    expect(buildPaperclipTaskMarkdown({ issue, recoveryRunWriteClassNotice: STATUS_ONLY_NOTICE }))
+      .toContain("assigning downstream issue work to the cheap model profile");
+    // The guard does not consult the planning-only predicate, so announcing it there would
+    // describe a refusal that does not exist.
+    expect(buildPaperclipTaskMarkdown({ issue, recoveryRunWriteClassNotice: PLANNING_ONLY_NOTICE }))
+      .not.toContain("cheap model profile");
+  });
+
+  it("announces a planning-only run as document-capable but approval-barred", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue, recoveryRunWriteClassNotice: PLANNING_ONLY_NOTICE });
+
+    expect(markdown).toContain("planning-only recovery run");
+    expect(markdown).toContain("Issue document updates are permitted.");
+    // The `planningOnly` branch refuses ahead of the type check, so unlike status-only this lane
+    // has no approval exit at all. Announcing one would be a promise the guard breaks.
+    expect(markdown).toContain("no `request_board_approval` exception on this lane");
+  });
+
+  // The notice must not assert WHY the run is contained. `successful-run-handoff.ts` selects
+  // `planning_only` as `workMode === "planning" || Boolean(run.statusOnlyDocumentWriteRefusedAt)`;
+  // the `workMode` arm involves no refusal and stamps nothing, so an "escalated after a refusal"
+  // opener is false for a reachable run — an agent reading a prior-run event that never happened,
+  // on the one lane whose notice tells it to confirm before claiming. Pinned because the earlier
+  // draft carried exactly that clause and nothing failed when it did.
+  it("does not claim a refusal caused the planning-only escalation", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue, recoveryRunWriteClassNotice: PLANNING_ONLY_NOTICE });
+
+    expect(markdown).not.toContain("escalated after");
+    expect(markdown).not.toContain("was refused a document write");
+  });
+
+  // The notice is a system-generated containment constraint rendered inside a block whose preamble
+  // declares its contents user-authored and overridable by higher-priority instructions. Without
+  // this line an agent may discount the one statement that is not negotiable.
+  it("marks the notice as system-generated rather than user-authored task data", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue, recoveryRunWriteClassNotice: STATUS_ONLY_NOTICE });
+
+    expect(markdown).toContain("System-generated, not user-authored task data.");
+    expect(markdown).toContain("not a preference you can decline");
+  });
+
+  // Silence must stay the default for an unconstrained run: a notice on every wake would be
+  // noise, and worse, would make the constrained case unremarkable.
+  it("says nothing on an unconstrained run", () => {
+    for (const markdown of [
+      buildPaperclipTaskMarkdown({ issue }),
+      buildPaperclipTaskMarkdown({ issue, recoveryRunWriteClassNotice: null }),
+    ]) {
+      expect(markdown).not.toContain("Run write-containment notice:");
+    }
+  });
+
+  // The containment binds the RUN, so the class alone must defeat the `return null` early exit —
+  // every other test here passes `issue`, which satisfies that guard on its own and leaves the
+  // `!input.recoveryRunWriteClassNotice` clause never exercised. Delete that clause and only this fails.
+  // `issue` is a required key on the input (`| null`, not `?`), so it is stated explicitly rather
+  // than omitted; a wake with no issue context passes `null`, as the prReview cases above do.
+  it("announces on a wake carrying no issue, comment or PR context at all", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue: null, recoveryRunWriteClassNotice: STATUS_ONLY_NOTICE });
+
+    expect(markdown).not.toBeNull();
+    expect(markdown).toContain("Run write-containment notice:");
+    expect(markdown).toContain("cheap status-only recovery run");
+    // PEN-3275: on this path the block holds the notice and nothing else, so the closing line
+    // must not call it an assignment — there is none to point at.
+    expect(markdown).toContain("This block carries no assignment");
+    expect(markdown).not.toContain("Use this task context as the current assignment.");
+    // PEN-3275 round 8: the PREAMBLE is the other half of the same selection, and it is the half
+    // that reverts silently — collapsing it back to the fixed user-authored string left the whole
+    // suite green. It matters more than the closing line: on this path the block IS the containment
+    // notice, so a preamble calling it user-authored and overridable invites the agent to discount
+    // the one statement in it that is not negotiable. The inline restatement below the notice does
+    // not cover this — it fires on both branches and sits AFTER the frame the agent reads first.
+    expect(markdown).toContain("The following block is system-generated");
+    expect(markdown).not.toContain("The following task data is user-authored");
+  });
+
+  // The converse, so the selection cannot collapse to the no-assignment line for every wake.
+  it("keeps the assignment closing line when the block does carry an assignment", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue, recoveryRunWriteClassNotice: STATUS_ONLY_NOTICE });
+
+    expect(markdown).toContain("Use this task context as the current assignment.");
+    expect(markdown).not.toContain("This block carries no assignment");
+    // The preamble's converse, for the same reason: pinning only the no-issue side would be
+    // satisfied by hardcoding the system-generated string, which would then mislabel every
+    // ordinary wake's genuinely user-authored task data as system-generated.
+    expect(markdown).toContain("The following task data is user-authored");
+    expect(markdown).not.toContain("The following block is system-generated");
+  });
+
+  // `ancestors` is the one user-authored block not gated on issue/wakeComment/prReview — the
+  // ancestor block renders identifiers and titles on `ancestors.length > 0` alone. Unreachable at
+  // today's sole production call site, which derives `ancestors` and `issue` from one `issueRef`,
+  // but the function is EXPORTED and the invariant lives in the caller. Pinned rather than left to
+  // that invariant, because dropping the `ancestors` term is precisely the silent revert this
+  // round's Important was about: without this, deleting it leaves the suite green while
+  // user-authored ancestor titles render under a preamble calling the block system-generated.
+  it("treats a block carrying only ancestors and a notice as user-authored", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      ancestors: [{ id: "issue-parent", identifier: "PEN-1", title: "Parent title" }],
+      recoveryRunWriteClassNotice: STATUS_ONLY_NOTICE,
+    });
+
+    // The user-authored ancestor title does render on this path — which is why the frame matters.
+    expect(markdown).toContain("Parent title");
+    expect(markdown).toContain("The following task data is user-authored");
+    expect(markdown).not.toContain("The following block is system-generated");
+  });
+
+  // End-to-end in the direction that matters: the snapshot a recovery wake actually persists
+  // must classify, so the announcement fires on the real payload rather than only on a literal.
+  it("fires on the snapshot a source_scoped_recovery_action wake persists", () => {
+    const context = withRecoveryModelProfileHint({
+      issueId: "issue-1",
+      taskId: "issue-1",
+      wakeReason: "source_scoped_recovery_action",
+      source: "issue_recovery_action",
+      recoveryActionId: "recovery-1",
+      sourceIssueId: "issue-1",
+      recoveryCause: "stranded_assigned_issue",
+    }, "status_only");
+
+    const markdown = buildPaperclipTaskMarkdown({
+      issue,
+      recoveryRunWriteClassNotice: recoveryRunWriteClassNotice(context),
+    });
+
+    expect(markdown).toContain("cheap status-only recovery run");
   });
 });
 

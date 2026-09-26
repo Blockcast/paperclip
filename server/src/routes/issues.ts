@@ -243,7 +243,9 @@ import {
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
 import {
+  isPlanningOnlyRecoveryContextSnapshot,
   isStatusOnlyRecoveryContextSnapshot,
+  statusOnlyEscalationSourceIssueId,
   STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
   statusOnlyMonitorArmResumeGuidance,
 } from "../services/recovery/model-profile-hint.js";
@@ -6894,16 +6896,11 @@ export function issueRoutes(
   // BLO-32774: the five keys used to be repeated here. They are now derived from
   // `STATUS_ONLY_RECOVERY_GUARD_CONTEXT`, so editing the tuple can no longer
   // leave this guard testing a stale shape and quietly failing open.
+  //
+  // PEN-3275: the planning-only predicate below was still hand-written, carrying
+  // the same hazard for `PLANNING_ONLY_RECOVERY_GUARD_CONTEXT`. Both are now derived.
   const isStatusOnlyCheapRecoveryContext = isStatusOnlyRecoveryContextSnapshot;
-
-  function isPlanningOnlyRecoveryContext(contextSnapshot: unknown) {
-    if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
-    const context = contextSnapshot as Record<string, unknown>;
-    return context.recoveryIntent === "planning_only" &&
-      context.allowDeliverableWork === false &&
-      context.allowDocumentUpdates === true &&
-      context.resumeRequiresNormalModel === false;
-  }
+  const isPlanningOnlyRecoveryContext = isPlanningOnlyRecoveryContextSnapshot;
 
   function requestsCheapIssueAssigneeModelProfile(input: { assigneeAdapterOverrides?: unknown }) {
     const overrides = input.assigneeAdapterOverrides;
@@ -6931,6 +6928,10 @@ export function issueRoutes(
     return run;
   }
 
+  // PEN-3275: `recoveryRunWriteClassNotice` (`services/recovery/model-profile-hint.ts`) RESTATES
+  // this verdict in prose, in the wake prompt, before the agent plans. Change the condition here
+  // and that sentence silently becomes a lie — which is how round 6 shipped a notice claiming a
+  // flat refusal for a guard BLO-34683 had already made conditional. Update both together.
   async function assertCheapRecoveryIssueAssigneeProfileAllowed(
     req: Request,
     res: Response,
@@ -7012,6 +7013,13 @@ export function issueRoutes(
    * and restores arming, and that write is a status-only run's one allowed
    * deliverable (BLO-25868). The row is only unreachable if this run declines to
    * dispose of it, which is the case the handoff detector already escalates.
+   *
+   * PEN-3275: `recoveryRunWriteClassNotice` (`services/recovery/model-profile-hint.ts`) RESTATES
+   * this verdict in the wake prompt. This is the guard that proved the hazard — the BLO-34683
+   * change above made the refusal conditional, the notice kept saying "arming issue monitors"
+   * flatly, and the run dispatched to repair a cleared monitor read the notice and declined the
+   * arm this guard would have permitted. The notice now names the CONDITION; if that condition
+   * changes again, change the sentence in the same edit.
    */
   async function assertMonitorArmingAllowedByRunContext(
     req: Request,
@@ -7241,6 +7249,14 @@ export function issueRoutes(
     // `standard` in exactly the deadlocking case and queues another status-only
     // wake into the identical 403.
     //
+    // PEN-3275: the wake prompt now ANNOUNCES this refusal before the agent
+    // plans, which means a compliant agent would never reach this stamp — the
+    // announcement would silently disable the escalation. So
+    // `recoveryRunWriteClassNotice` tells the reader to attempt the write
+    // anyway, naming it as the escalation channel. That sentence and this stamp
+    // are one mechanism: removing either leaves the other inert, and nothing
+    // fails when it happens.
+    //
     // Documents only: the escalation target is `planning_only`, which permits
     // document updates but still bars deliverables and annotations, so a refused
     // deliverable write would be escalated onto a lane that still cannot perform
@@ -7318,6 +7334,9 @@ export function issueRoutes(
     return false;
   }
 
+  // PEN-3275: `recoveryRunWriteClassNotice` (`services/recovery/model-profile-hint.ts`) RESTATES
+  // this verdict in the wake prompt, including the `request_board_approval` carve-out and its
+  // link-set exclusivity. Change what is admitted here and update that sentence in the same edit.
   async function assertApprovalMutationAllowedByRunContext(
     req: Request,
     res: Response,
@@ -7333,8 +7352,16 @@ export function issueRoutes(
       error:
         planningOnly
           ? "Planning-only recovery runs cannot link or unlink approvals"
-          : "Cheap status-only recovery runs cannot link or unlink approvals; to escalate from this run, " +
-            "create a `request_board_approval` with the run context's source issue in `issueIds` instead",
+          // PEN-3275: the redirect is only offered when the guard would actually admit it.
+          // `approvals.ts` refuses the create when the run context carries no source issue, so on
+          // an issueless status-only run the old unconditional phrasing sent a refused caller
+          // straight into a second refusal.
+          : statusOnlyEscalationSourceIssueId(run.contextSnapshot)
+            ? "Cheap status-only recovery runs cannot link or unlink approvals; to escalate from this run, " +
+              "create a `request_board_approval` with the run context's source issue in `issueIds` instead"
+            : "Cheap status-only recovery runs cannot link or unlink approvals, and this run context " +
+              "carries no source issue, so it cannot file a `request_board_approval` either; record a " +
+              "status disposition instead",
       details: {
         issueId: issue.id,
         runId: run.id,
