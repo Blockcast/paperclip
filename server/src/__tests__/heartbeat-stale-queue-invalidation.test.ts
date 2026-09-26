@@ -13,6 +13,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueDocuments,
+  issueRelations,
   issues,
 } from "@paperclipai/db";
 import {
@@ -653,6 +654,172 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         assigneeAgentId: agentId,
       },
     ]);
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "schedule",
+    });
+
+    expect(run).not.toBeNull();
+    await waitForCondition(async () => countExecuteCallsForRun(run!.id) > 0);
+    expect(countExecuteCallsForRun(run!.id)).toBe(1);
+  });
+
+  /**
+   * BLO-36317. `checkout()` has two refusal modes; BLO-19749 closed the
+   * run-held one and deliberately left blocker edges counted as actionable. On
+   * a lane whose every `todo` row is blocker-gated that made
+   * `skipTimerWhenNoActionableWork` unable to ever fire — 9 full runs in a day,
+   * each exiting with a restatement of an unchanged blocker signature.
+   *
+   * Scoped to `todo`: a blocked `in_progress` row stays actionable.
+   */
+  async function seedBlockedTodo(input: {
+    companyId: string;
+    agentId: string;
+    title: string;
+    blockerStatus: string;
+    dependentStatus?: string;
+  }) {
+    const blockerId = randomUUID();
+    const dependentId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: blockerId,
+        companyId: input.companyId,
+        title: `${input.title} blocker`,
+        status: input.blockerStatus,
+        priority: "high",
+      },
+      {
+        id: dependentId,
+        companyId: input.companyId,
+        title: input.title,
+        status: input.dependentStatus ?? "todo",
+        priority: "high",
+        assigneeAgentId: input.agentId,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      id: randomUUID(),
+      companyId: input.companyId,
+      // `blocks`: issueId is the blocker, relatedIssueId the dependent.
+      issueId: blockerId,
+      relatedIssueId: dependentId,
+      type: "blocks",
+    });
+    return { blockerId, dependentId };
+  }
+
+  it("skips generic timer wakes when every actionable todo issue is blocker-gated", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: {
+        enabled: true,
+        skipTimerWhenNoActionableWork: true,
+      },
+    });
+    await seedBlockedTodo({ companyId, agentId, title: "gated", blockerStatus: "todo" });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "schedule",
+    });
+
+    expect(run).toBeNull();
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+
+    const [wakeup] = await db
+      .select({ status: agentWakeupRequests.status, reason: agentWakeupRequests.reason })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeup).toMatchObject({
+      status: "skipped",
+      reason: "heartbeat.timer.no_actionable_work",
+    });
+  });
+
+  it("skips generic timer wakes when the only todo blocker is cancelled", async () => {
+    // Matches checkout: only a `done` blocker retires the edge. A cancelled
+    // blocker stays unresolved until an operator removes the relation.
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: {
+        enabled: true,
+        skipTimerWhenNoActionableWork: true,
+      },
+    });
+    await seedBlockedTodo({ companyId, agentId, title: "gated", blockerStatus: "cancelled" });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "schedule",
+    });
+
+    expect(run).toBeNull();
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+  });
+
+  it("allows generic timer wakes when a blocker-gated issue coexists with a dependency-ready one", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: {
+        enabled: true,
+        skipTimerWhenNoActionableWork: true,
+      },
+    });
+    await seedBlockedTodo({ companyId, agentId, title: "gated", blockerStatus: "todo" });
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId,
+      title: "free",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "schedule",
+    });
+
+    expect(run).not.toBeNull();
+    await waitForCondition(async () => countExecuteCallsForRun(run!.id) > 0);
+    expect(countExecuteCallsForRun(run!.id)).toBe(1);
+  });
+
+  it("counts a todo issue whose blockers are all done as actionable", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: {
+        enabled: true,
+        skipTimerWhenNoActionableWork: true,
+      },
+    });
+    await seedBlockedTodo({ companyId, agentId, title: "released", blockerStatus: "done" });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "schedule",
+    });
+
+    expect(run).not.toBeNull();
+    await waitForCondition(async () => countExecuteCallsForRun(run!.id) > 0);
+    expect(countExecuteCallsForRun(run!.id)).toBe(1);
+  });
+
+  it("leaves a blocker-gated in_progress issue actionable", async () => {
+    // Over-suppression guard: an in_progress row may still need its assignee
+    // awake to hand off or finish a partial, blockers or not.
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: {
+        enabled: true,
+        skipTimerWhenNoActionableWork: true,
+      },
+    });
+    await seedBlockedTodo({
+      companyId,
+      agentId,
+      title: "gated in flight",
+      blockerStatus: "todo",
+      dependentStatus: "in_progress",
+    });
 
     const run = await heartbeat.wakeup(agentId, {
       source: "timer",
