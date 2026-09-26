@@ -252,7 +252,12 @@ const deliver = (ctx: PluginContext, fenceWait?: Partial<AggregateFenceWaitPolic
  * built once and each case is handed an empty one by truncating instead.
  *
  * The table list is read from the catalog rather than hardcoded, so a future
- * migration cannot leave state leaking between cases silently.
+ * migration cannot leave state leaking between cases silently. It covers the
+ * `public` FK stubs as well as the plugin namespace: nothing seeds them today,
+ * but the `alert_escalation_covers` path cannot be exercised without rows in
+ * them, and those rows would otherwise outlive the case that wrote them. The
+ * CASCADE direction is safe either way — the namespace tables reference
+ * `public`, never the reverse.
  */
 let truncateAll: string;
 
@@ -261,14 +266,14 @@ beforeAll(async () => {
   await applyMigrations(db);
   const tables = await db.query<{ qualified: string }>(
     `SELECT format('%I.%I', schemaname, tablename) AS qualified
-       FROM pg_tables WHERE schemaname = $1`,
-    [NAMESPACE],
+       FROM pg_tables WHERE schemaname = ANY($1)`,
+    [[NAMESPACE, "public"]],
   );
   expect(tables.rows.length).toBeGreaterThan(0);
   truncateAll = `TRUNCATE ${tables.rows
     .map((r) => r.qualified)
     .join(", ")} RESTART IDENTITY CASCADE`;
-});
+}, 30_000);
 
 beforeEach(async () => {
   await db.query(truncateAll);
