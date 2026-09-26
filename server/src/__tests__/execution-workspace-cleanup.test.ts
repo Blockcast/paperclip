@@ -234,7 +234,14 @@ describe("inspectWorktreeReclaimSafety", () => {
       const pending = findGitWorktreeRegistration({
         git: async () => registrations.map((worktree) => `worktree ${worktree}\nbranch refs/heads/${path.basename(worktree)}\n`).join("\n"),
         repoRoot: parent,
-        worktreePath: registrations[0]!,
+        // The *last* registration, deliberately: the walk matches and returns,
+        // so an earlier one would leave the rest unvisited and drive every
+        // normalize against one identical string. The guard keys on the parent
+        // directory, so a fixture that never varies the path cannot tell it
+        // from a per-path memo — both answer 1. Matching last means four
+        // normalizes over three distinct paths: 1 held with the pre-check, 3
+        // under a per-path memo, 4 with neither.
+        worktreePath: registrations[2]!,
         normalizePath: resolvePathForWorktreeComparison,
       });
       // Drain until quiet rather than once. With the pre-check only the first
@@ -253,7 +260,7 @@ describe("inspectWorktreeReclaimSafety", () => {
       expect(unwedge).toHaveLength(1);
       // And the fallback still answers — both sides normalize lexically, so
       // the match the walk would have made is still made.
-      expect(found?.worktree).toBe(registrations[0]);
+      expect(found?.worktree).toBe(registrations[2]);
     } finally {
       for (const release of unwedge) release();
       await vi.advanceTimersByTimeAsync(0);
@@ -691,6 +698,12 @@ describeEmbeddedPostgres("reconcileExecutionWorkspaceCleanup", () => {
       stat.mockRestore();
       vi.useRealTimers();
     }
+    // Released, like the wedge tests above. This one parks exactly the limit,
+    // so leaking it would leave the process-global count *at* the threshold
+    // and every later test in this file would break at the loop top with
+    // `scanned: 0`, on DB state that was never reached. It is also the only
+    // coverage of the cleanup-side deadline's release path.
+    expect(reclaimFsOutstandingCount()).toBe(0);
 
     const [trailing] = await db
       .select()
@@ -699,9 +712,13 @@ describeEmbeddedPostgres("reconcileExecutionWorkspaceCleanup", () => {
     expect(trailing?.status).toBe("active");
     expect(trailing?.cleanupReason).toBeNull();
     expect(trailing?.cleanupEligibleAt?.getTime() ?? Infinity).toBeLessThanOrEqual(Date.now());
-    // Each wedging candidate runs a full inspect + teardown against a real
-    // repo before its cleanup-side stat can expire, so this is slower than the
-    // inspector-expiry tests above; 60s is not enough headroom.
+    // Each candidate costs a real-fs inspect, git spawns against a directory
+    // that is not a repo, and DB round trips, all before its cleanup-side stat
+    // can expire — so this is slower than the inspector-expiry tests above and
+    // 60s is not enough headroom. (No repo is created here: the roots are bare
+    // mkdtemp dirs and the worktree paths are deliberately absent.) The cost
+    // scales with RECLAIM_FS_OUTSTANDING_LIMIT while this budget does not;
+    // it assumes the small limit a default threadpool gives.
   }, 180_000);
 
   it("does not touch a workspace that is not yet eligible", async () => {
