@@ -3430,7 +3430,8 @@ function deriveRepoNameFromRepoUrlForRuntime(repoUrl: string | null | undefined)
   }
 }
 
-async function resolvePathForWorktreeComparison(value: string): Promise<string> {
+/** Exported for the registry-walk ceiling test; the runtime injects it as `normalizePath`. */
+export async function resolvePathForWorktreeComparison(value: string): Promise<string> {
   const resolved = path.resolve(value);
   const walk = async (): Promise<string> => {
     const missingSegments: string[] = [];
@@ -4794,7 +4795,14 @@ export function reclaimFsOutstandingCount(): number {
   return outstanding;
 }
 
-/** Backstop for a spread of wedged roots: half the threadpool, never more. */
+/**
+ * Backstop for a spread of wedged roots: half the threadpool. A bounded burst,
+ * not a bound — both gates that read it are pre-checks, so a candidate admitted
+ * at `limit - 1` can still hold its inspector stat, its registry walk and its
+ * cleanup-side stat before the next loop-top read sees any of them: `limit + 2`
+ * from the collector alone on the default pool of 4. The run-teardown and
+ * operator-PATCH callers of `withReclaimFsDeadline` never consult it at all.
+ */
 export const RECLAIM_FS_OUTSTANDING_LIMIT = (() => {
   // `Number.isFinite` rather than `|| 2`, which would also catch the legitimate
   // 0 that `UV_THREADPOOL_SIZE=1` floors to — the one pool size where the

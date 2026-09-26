@@ -287,6 +287,14 @@ export function executionWorkspaceCleanupService(db: Db) {
       // makes the ceiling in `RECLAIM_FS_OUTSTANDING_LIMIT` hold within a pass
       // and not just across them. Breaking before `scanned` leaves the rest
       // untouched for the next window.
+      //
+      // Process-global on purpose, where the targeted break below is
+      // deliberately not: that break asks "did *this* pass wedge", which a
+      // shared count answers wrongly, while this asks "is the pool exhausted",
+      // and the pool is process-wide — so a concurrent teardown's held threads
+      // are exactly what it must count. The cost is that the warning cannot
+      // tell an operator whose holds these are; split `own`/`total` if that
+      // distinction ever has to be actioned.
       const outstanding = reclaimFsOutstandingCount();
       if (outstanding >= RECLAIM_FS_OUTSTANDING_LIMIT) {
         logger.warn(
