@@ -7662,7 +7662,10 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     const rawLockPath = await readGit(worktreePath, ["rev-parse", "--git-path", "index.lock"]);
     const lockPath = path.isAbsolute(rawLockPath) ? rawLockPath : path.resolve(worktreePath, rawLockPath);
     await fs.writeFile(lockPath, input.body, "utf8");
-    const stamp = new Date(Date.now() - input.ageMs);
+    // Whole seconds: `utimes` converts a Date to float seconds, so a millisecond
+    // stamp can land as ...431.999 and fail to round-trip through `new Date()`,
+    // which flaked the replaced-lock fixture's own mtime check.
+    const stamp = new Date(Math.floor((Date.now() - input.ageMs) / 1000) * 1000);
     await fs.utimes(lockPath, stamp, stamp);
     return lockPath;
   }
@@ -8047,6 +8050,37 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
       await fs.rm(lockPath, { force: true });
     }
     await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
+  }, 20_000);
+
+  // The lock's holder finishing inside the /proc walk is the common way it
+  // vanishes mid-repair, and it resolves at the pre-rename re-stat, not at the
+  // rename's ENOENT catch. Rethrowing there would reinstate the permanent park.
+  it("completes the repair when the lock is released while the scan runs", async () => {
+    const expectedBranch = "PAP-478-recorded";
+    const actualBranch = "PAP-478-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-478",
+      claimant: "none",
+    });
+    const lockPath = await writeIndexLock(worktreePath, { body: "", ageMs: 21.5 * 60 * 60 * 1000 });
+    setLockHolderScanForTests(async () => {
+      await fs.rm(lockPath, { force: true });
+      return UNHELD;
+    });
+
+    const restored = await restoreDirtyQuarantine({ repoRoot, worktreePath, expectedBranch, actualBranch, ids });
+
+    expect(restored?.branchName).toBe(expectedBranch);
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(expectedBranch);
+    // Nothing was moved aside, so the repair must not report breaking a lock.
+    expect(restored?.warnings.some((entry) => entry.includes("abandoned 0-byte git index lock"))).toBe(false);
+    const lockDir = await fs.readdir(path.dirname(lockPath));
+    expect(lockDir.filter((name) => name.includes("paperclip-broken"))).toEqual([]);
   }, 20_000);
 
   // `--git-path` answers relative (".git/index.lock") for a normal repo and
