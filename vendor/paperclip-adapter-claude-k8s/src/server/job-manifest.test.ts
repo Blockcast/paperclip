@@ -1179,6 +1179,17 @@ describe("buildJobManifest", () => {
       expect(env.get("CLAUDE_CONFIG_DIR")).toBe("/paperclip/k8s-isolation/workspace-1/session/.claude");
       expect(env.get("TMPDIR")).toBe("/runtime-cache/paperclip-workspaces/workspace-1/tmp");
       expect(env.get("XDG_CACHE_HOME")).toBe("/runtime-cache/paperclip-workspaces/workspace-1/cache/xdg");
+      // BLO-15567: CARGO_TARGET_DIR defaults to <pkg>/target inside the
+      // checkout, which is on the PVC here — that is the byte-moving fix.
+      // CARGO_HOME is image-set (/home/node/.cargo, overlay); pinned anyway so
+      // the value does not depend on image-rollout state. Cargo honours a
+      // cross-device redirect (verified with CWD on the PVC), so assert both
+      // land off /paperclip. pnpm does NOT and is handled elsewhere — see the
+      // CARGO_CACHE_ENV doc comment.
+      for (const [key, leaf] of [["CARGO_HOME", "cargo"], ["CARGO_TARGET_DIR", "cargo-target"]]) {
+        expect(env.get(key)).toBe(`/runtime-cache/paperclip-workspaces/workspace-1/cache/${leaf}`);
+        expect(env.get(key)?.startsWith("/paperclip")).toBe(false);
+      }
       expect(container?.command?.join(" ")).not.toContain("git clone --shared");
     });
 
@@ -1210,6 +1221,14 @@ describe("buildJobManifest", () => {
       expect(env.get("BUN_INSTALL_CACHE")).toBe("/runtime-cache/bun");
       expect(env.get("PIP_CACHE_DIR")).toBe("/runtime-cache/pip");
       expect(env.get("PLAYWRIGHT_BROWSERS_PATH")).toBe("/runtime-cache/ms-playwright");
+      // BLO-15567: CARGO_TARGET_DIR is unset in the image (defaults into the
+      // checkout); CARGO_HOME is image-set and pinned here so the manifest
+      // value does not depend on image-rollout state.
+      expect(env.get("CARGO_HOME")).toBe("/runtime-cache/cargo");
+      expect(env.get("CARGO_TARGET_DIR")).toBe("/runtime-cache/cargo-target");
+      // RUSTUP_HOME must stay at the image default (/usr/local/rustup) — an
+      // empty ephemeral dir has no toolchains and breaks cargo/rustc.
+      expect(env.get("RUSTUP_HOME")).toBeUndefined();
     });
 
     it("overrides inherited cache paths with the job-local runtime-cache mount", () => {

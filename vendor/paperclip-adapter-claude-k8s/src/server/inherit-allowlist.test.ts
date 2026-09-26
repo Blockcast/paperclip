@@ -67,6 +67,8 @@ const KEEP_SET = [
   "PLAYWRIGHT_BROWSERS_PATH",
   "XDG_CACHE_HOME",
   "npm_config_cache",
+  "CARGO_HOME",
+  "CARGO_TARGET_DIR",
 ];
 
 describe("inherit allowlist — deny set", () => {
