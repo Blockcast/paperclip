@@ -15,6 +15,7 @@ import {
   assertPrListComplete,
   attestedHead,
   duplicateBodyAcrossIdentities,
+  findPrNotices,
   findPrViolations,
   findViolations,
   hasBlockingFindings,
@@ -611,14 +612,219 @@ describe("I1 names the mechanism a same-lane duplicate implies", () => {
     assert.match(violation, /submit step is at-least-once/);
   });
 
-  it("calls differing bodies a double-compute needing exclusion, not idempotency", () => {
-    // paperclip#1220: two reviews 10 s apart carried different bodies, so a
-    // timing threshold misfiles this case as a retry.
-    const violation = findPrViolations(
+  it("exempts differing bodies: a re-review of one head supersedes, it does not duplicate", () => {
+    // BLO-25764. paperclip#1220 (10 s apart) and #1972 (33.6 h apart) are the
+    // same observable shape, and #1972 is a legitimate re-review after a
+    // description-only fix that could not move the head. Measured over every
+    // same-head App duplicate pair on the open PRs (n=15) the gap runs
+    // 3 s → 33.6 h with no separation, so nothing here distinguishes the race
+    // from the re-review. Asserting at-most-1 over it can never pass.
+    const violations = findPrViolations(
       duplicatePr([canonicalBody(HEAD, "first pass"), canonicalBody(HEAD, "second pass")]),
+    );
+    assert.deepEqual(violations.filter((v) => v.startsWith("I1")), []);
+  });
+
+  it("still reports the superseded pair as a notice rather than dropping the signal", () => {
+    const notices = findPrNotices(
+      duplicatePr([canonicalBody(HEAD, "first pass"), canonicalBody(HEAD, "second pass")]),
+    );
+    assert.equal(notices.length, 1);
+    assert.match(notices[0], /2 operative Ally App reviews/);
+    assert.match(notices[0], /standing verdict/);
+  });
+
+  it("keeps failing when only SOME bodies repeat — a mixed set still contains a repeated submit", () => {
+    const violation = findPrViolations(
+      duplicatePr([canonicalBody(), canonicalBody(), canonicalBody(HEAD, "third")]),
     ).find((v) => v.startsWith("I1"));
-    assert.match(violation, /bodies differ/);
-    assert.match(violation, /exclusion, not submit idempotency/);
+    assert.match(violation, /some bodies are identical and some differ/);
+  });
+
+  it("does not exempt the User seat, which may not submit a verdict at all", () => {
+    const pr = {
+      number: 1193,
+      headSha: HEAD,
+      reviews: [
+        seatReview({ id: 3, body: canonicalBody(HEAD, "a") }),
+        seatReview({ id: 4, body: canonicalBody(HEAD, "b") }),
+      ],
+    };
+    assert.match(
+      findPrViolations(pr).find((v) => v.startsWith("I1")) ?? "",
+      /^I1 PR #1193 @ff1c72db: 2 operative Ally User seat reviews/,
+    );
+  });
+
+  it("exempts I1 only — a superseded review that approves over a blocker is still fatal", () => {
+    // The exemption must not become a hiding place: every review in the set is
+    // still carried through I2/I3/I4.
+    const violations = findPrViolations(
+      duplicatePr([
+        canonicalBody(HEAD, "### Important Issues (1)\n- boom"),
+        canonicalBody(HEAD, "clean second pass"),
+      ]),
+    );
+    assert.deepEqual(violations.filter((v) => v.startsWith("I1")), []);
+    assert.match(violations.find((v) => v.startsWith("I2a")) ?? "", /APPROVED but its body reports a Critical\/Important finding/);
+  });
+
+  for (const order of ["approval first", "blocker first"]) {
+    it(`fires I2e when a clean App APPROVED coexists with a different blocking App review (${order})`, () => {
+      // The BLO-19778 shape across two reviews with DIFFERENT states: the
+      // approval's own body is clean, so I2a cannot see the blocker, and the
+      // I1 supersession exemption lets both stand.
+      const approval = appReview({ id: DUPLICATE_IDS[0], state: "APPROVED", body: canonicalBody(HEAD, "### Critical Issues (0)\n### Important Issues (0)") });
+      const blocker = appReview({ id: DUPLICATE_IDS[1], state: "COMMENTED", body: canonicalBody(HEAD, "### Critical Issues (1)\n- boom") });
+      const reviews = order === "approval first" ? [approval, blocker] : [blocker, approval];
+      const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews });
+      assert.deepEqual(violations.filter((v) => v.startsWith("I1")), []);
+      assert.deepEqual(violations.filter((v) => v.startsWith("I2a")), []);
+      assert.match(
+        violations.find((v) => v.startsWith("I2e")) ?? "",
+        new RegExp(`^I2e PR #1220 @ff1c72db: Ally App APPROVED \\(${DUPLICATE_IDS[0]}\\) coexists with a different blocking Ally App review \\(${DUPLICATE_IDS[1]}\\)`),
+      );
+    });
+  }
+
+  it("does not fire I2e once the stale approval is dismissed", () => {
+    const approval = appReview({ id: DUPLICATE_IDS[0], state: "DISMISSED", body: canonicalBody(HEAD, "clean") });
+    const blocker = appReview({ id: DUPLICATE_IDS[1], state: "COMMENTED", body: canonicalBody(HEAD, "### Critical Issues (1)\n- boom") });
+    const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [approval, blocker] });
+    assert.deepEqual(violations.filter((v) => v.startsWith("I2e")), []);
+  });
+
+  // The other order: a COMMENTED blocker cannot be dismissed, so a clean
+  // re-review that supersedes it at an unchanged head needs its own exit.
+  const blockerAtHead = () =>
+    appReview({ id: DUPLICATE_IDS[0], state: "COMMENTED", submitted_at: "2026-09-23T10:00:00Z", body: canonicalBody(HEAD, "### Critical Issues (0)\n### Important Issues (1)\n- wrong PR description") });
+  const approvalWithLedger = (ledger) =>
+    appReview({
+      id: DUPLICATE_IDS[1],
+      state: "APPROVED",
+      submitted_at: "2026-09-23T12:00:00Z",
+      body: canonicalBody(HEAD, `### Prior Findings Dispositioned (1)\n${ledger}\n### Critical Issues (0)\n### Important Issues (0)`),
+    });
+
+  it("does not fire I2e when the approval retires, by name, the finding raised at this head", () => {
+    const approval = approvalWithLedger(`- **prior:${HEAD.slice(0, 7)} important 1** — fixed — description corrected`);
+    const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [blockerAtHead(), approval] });
+    assert.deepEqual(violations, []);
+  });
+
+  for (const [why, ledger] of [
+    // #876 and #1220: both racing reviews carried a ledger for an earlier head.
+    ["retires a finding raised at an earlier head", `- **prior:${OTHER.slice(0, 7)} important 1** — fixed — gone`],
+    ["names this head with an unrecognized verb", `- **prior:${HEAD.slice(0, 7)} important 1** — superseded — gone`],
+    ["quotes a same-head entry as indented code", `    - **prior:${HEAD.slice(0, 7)} important 1** — fixed — gone`],
+  ]) {
+    it(`still fires I2e when the approval only ${why}`, () => {
+      const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [blockerAtHead(), approvalWithLedger(ledger)] });
+      assert.match(violations.find((v) => v.startsWith("I2e")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
+    });
+  }
+
+  it("still fires I2e for a blocker submitted after the approval that retired its predecessor", () => {
+    // Dismissing the approval is the exit in this order, so the ledger buys nothing.
+    const approval = approvalWithLedger(`- **prior:${HEAD.slice(0, 7)} important 1** — fixed — description corrected`);
+    const laterBlocker = appReview({ id: 5124950999, state: "COMMENTED", submitted_at: "2026-09-23T13:00:00Z", body: canonicalBody(HEAD, "### Critical Issues (1)\n- new") });
+    const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [blockerAtHead(), approval, laterBlocker] });
+    assert.match(violations.find((v) => v.startsWith("I2e")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
+  });
+
+  it("still fires I2e for a later blocker whose findings the approval's ledger happens to name", () => {
+    // Coverage alone would exempt this: the approval retired `important 1`
+    // against the EARLIER blocker, and the later one raises `important 1` too.
+    // An approval cannot have read a blocker submitted after it, so order —
+    // not coverage — is what keeps this fatal.
+    const approval = approvalWithLedger(`- **prior:${HEAD.slice(0, 7)} important 1** — fixed — description corrected`);
+    const laterBlocker = appReview({ id: 5124950999, state: "COMMENTED", submitted_at: "2026-09-23T13:00:00Z", body: canonicalBody(HEAD, "### Critical Issues (0)\n### Important Issues (1)\n- raised after the approval") });
+    const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [blockerAtHead(), approval, laterBlocker] });
+    assert.match(violations.find((v) => v.startsWith("I2e")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
+  });
+
+  // The exemption is coverage, not presence: an approval retiring 1 of the N
+  // findings its blocker raised would otherwise stand green over the other N-1.
+  const multiFindingBlocker = () =>
+    appReview({ id: DUPLICATE_IDS[0], state: "COMMENTED", submitted_at: "2026-09-23T10:00:00Z", body: canonicalBody(HEAD, "### Critical Issues (0)\n### Important Issues (2)\n- one\n- two") });
+
+  it("still fires I2e when the approval retires only some of the findings raised at this head", () => {
+    const approval = approvalWithLedger(`- **prior:${HEAD.slice(0, 7)} important 1** — fixed — one done`);
+    const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [multiFindingBlocker(), approval] });
+    assert.match(violations.find((v) => v.startsWith("I2e")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
+  });
+
+  it("does not fire I2e when the approval retires every finding raised at this head", () => {
+    const approval = approvalWithLedger(
+      `- **prior:${HEAD.slice(0, 7)} important 1** — fixed — one done\n- **prior:${HEAD.slice(0, 7)} important 2** — no-longer-applicable — two moot`,
+    );
+    const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [multiFindingBlocker(), approval] });
+    assert.deepEqual(violations, []);
+  });
+
+  it("counts a bucket by the number after its heading, not a later parenthesized one", () => {
+    // The merge gate reads the count straight after `Issues`, so this heading
+    // raises two findings. A greedy capture would read `(1)` and let one
+    // retirement stand as full coverage.
+    const blocker = appReview({ id: DUPLICATE_IDS[0], state: "COMMENTED", submitted_at: "2026-09-23T10:00:00Z", body: canonicalBody(HEAD, "### Critical Issues (0)\n### Important Issues (2), was (1)\n- one\n- two") });
+    const approval = approvalWithLedger(`- **prior:${HEAD.slice(0, 7)} important 1** - fixed - one done`);
+    const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [blocker, approval] });
+    assert.match(violations.find((v) => v.startsWith("I2e")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
+  });
+
+  it("still fires I2e when the blocker blocks only on a still-present entry", () => {
+    // No counted bucket at this head, so no (severity, index) a ledger can name.
+    const blocker = appReview({ id: DUPLICATE_IDS[0], state: "COMMENTED", submitted_at: "2026-09-23T10:00:00Z", body: canonicalBody(HEAD, `- **prior:${OTHER.slice(0, 7)} important 1** — still-present — stands`) });
+    const approval = approvalWithLedger(`- **prior:${HEAD.slice(0, 7)} important 1** — fixed — done`);
+    const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [blocker, approval] });
+    assert.match(violations.find((v) => v.startsWith("I2e")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
+  });
+
+  // The contract mirrors a still-standing finding into the counted bucket under
+  // its ORIGINAL id. Keying that slot on the earlier head's name would reopen the
+  // #876 / #1220 race, since both racing runs can name an earlier head's finding,
+  // so the slot keeps its position at this head: retiring it by the earlier name
+  // alone stays fatal (a known false red), and a this-head name still clears it.
+  const mirroredBlocker = () =>
+    appReview({
+      id: DUPLICATE_IDS[0],
+      state: "COMMENTED",
+      submitted_at: "2026-09-23T10:00:00Z",
+      body: canonicalBody(
+        HEAD,
+        `### Prior Findings Dispositioned (1)\n- **prior:${OTHER.slice(0, 7)} important 1** — still-present — stands\n### Critical Issues (0)\n### Important Issues (1)\n- **prior:${OTHER.slice(0, 7)} important 1** — stands`,
+      ),
+    });
+
+  it("still fires I2e when the approval retires a mirrored finding only by its earlier-head name", () => {
+    const approval = approvalWithLedger(`- **prior:${OTHER.slice(0, 7)} important 1** — fixed — gone`);
+    const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [mirroredBlocker(), approval] });
+    assert.match(violations.find((v) => v.startsWith("I2e")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
+  });
+
+  it("does not fire I2e when the approval retires a mirrored finding by its position at this head", () => {
+    const approval = approvalWithLedger(`- **prior:${HEAD.slice(0, 7)} important 1** — fixed — gone`);
+    const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [mirroredBlocker(), approval] });
+    assert.deepEqual(violations.filter((v) => v.startsWith("I2e")), []);
+  });
+
+  // Shapes the merge gate's PRIOR_FINDING_DISPOSITION_PATTERN accepts. Reading
+  // either as non-retiring here would fail a supersession the gate allows.
+  for (const [shape, ledger] of [
+    ["an en dash separator", `- **prior:${HEAD.slice(0, 7)} important 1** – fixed – description corrected`],
+    ["a space after the opening `**`", `- **  prior:${HEAD.slice(0, 7)} important 1** — fixed — description corrected`],
+  ]) {
+    it(`does not fire I2e when the retiring entry uses ${shape}`, () => {
+      const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [blockerAtHead(), approvalWithLedger(ledger)] });
+      assert.deepEqual(violations, []);
+    });
+  }
+
+  it("names the latest by id when two reviews share a submitted_at second", () => {
+    const at = (id) => appReview({ id, state: "COMMENTED", submitted_at: "2026-09-06T09:35:17Z", body: canonicalBody(HEAD, `pass ${id}`) });
+    for (const reviews of [[at(DUPLICATE_IDS[0]), at(DUPLICATE_IDS[1])], [at(DUPLICATE_IDS[1]), at(DUPLICATE_IDS[0])]]) {
+      assert.match(findPrNotices({ number: 1220, headSha: HEAD, reviews })[0], new RegExp(`the latest \\(${DUPLICATE_IDS[1]},`));
+    }
   });
 
   it("omits the clause rather than guessing when a body is empty", () => {
@@ -633,13 +839,9 @@ describe("I1 names the mechanism a same-lane duplicate implies", () => {
     const identical = findPrViolations(duplicatePr([canonicalBody(), canonicalBody()])).find((v) =>
       v.startsWith("I1"),
     );
-    const differing = findPrViolations(
-      duplicatePr([canonicalBody(HEAD, "a"), canonicalBody(HEAD, "b")]),
-    ).find((v) => v.startsWith("I1"));
     const bodiless = findPrViolations(duplicatePr(["", ""])).find((v) => v.startsWith("I1"));
 
     assert.equal(violationFingerprint(identical), "I1:1220:ff1c72db:5124949902,5124950225");
-    assert.equal(violationFingerprint(identical), violationFingerprint(differing));
     assert.equal(violationFingerprint(identical), violationFingerprint(bodiless));
   });
 });
@@ -1088,31 +1290,27 @@ describe("the committed baseline", () => {
   );
 
   it("parses under the same validation the guard applies at runtime", () => {
-    assert.ok(parseBaseline(raw).length > 0);
+    assert.deepEqual(parseBaseline(raw), []);
   });
 
-  it("suppresses exactly the violation set measured on 2026-09-01 and nothing else", () => {
-    const measured = [
-      REAL_I1_1525,
-      REAL_I3_1525,
-      "I1 PR #1360 @6a7e86b8: 2 operative Ally App reviews (COMMENTED/5002830694, COMMENTED/5003133252) — expected at most 1 in the app lane",
-      "I1 PR #1316 @0110ccd1: 2 operative Ally App reviews (COMMENTED/4911401804, COMMENTED/4913256943) — expected at most 1 in the app lane",
-      "I3 PR #1316 @0110ccd1: Ally App review 4913256943 is not canonical — expected one consolidated-review heading and one Reviewed head attestation",
-      "I1 PR #1304 @61360b5a: 2 operative Ally App reviews (COMMENTED/5062643059, COMMENTED/5062648138) — expected at most 1 in the app lane",
-    ];
-    const { failing, suppressed, staleEntries } = applyBaseline(measured, parseBaseline(raw));
-    assert.deepEqual(failing, [], "the run goes green on the state that pinned it red");
-    assert.equal(suppressed.length, measured.length);
-    assert.deepEqual(staleEntries, [], "no entry suppresses something that is not happening");
+  it("is empty, so nothing is suppressed and nothing can go stale", () => {
+    // BLO-25764. All six entries suppressed an I1 same-head App duplicate and
+    // all six had gone stale. An empty baseline is the honest state: the guard
+    // now passes on its own verdict rather than on six dead suppressions, and
+    // it emits no stale-entry warnings to train readers to ignore it.
+    const { failing, suppressed, staleEntries } = applyBaseline([], parseBaseline(raw));
+    assert.deepEqual(failing, []);
+    assert.deepEqual(suppressed, []);
+    assert.deepEqual(staleEntries, []);
   });
 
-  it("still fails on a new violation alongside the baselined set", () => {
+  it("still fails on a new violation, with nothing left to suppress it", () => {
     const withNewFinding = [
       REAL_I1_1525,
       "I1 PR #1601 @abcdef12: 2 operative Ally App reviews (COMMENTED/5111111111, COMMENTED/5222222222) — expected at most 1 in the app lane",
     ];
     const { failing } = applyBaseline(withNewFinding, parseBaseline(raw));
-    assert.equal(failing.length, 1);
-    assert.match(failing[0].violation, /PR #1601/);
+    assert.equal(failing.length, 2);
+    assert.ok(failing.some(({ violation }) => /PR #1601/.test(violation)));
   });
 });
