@@ -444,9 +444,14 @@ claims this section used to make were falsified on 2026-09-25:
   wedge, because the series is absent between holds. See Step 4.)
 
 **There are two regimes, and the old 300s threshold could not tell them apart
-because it sat inside the normal envelope.** Over 7 days, **21 of 21 agents**
+because it sat inside the normal envelope.** Over 7 days, **21 of 23 agents**
 crossed 300s, for **2,730 agent-minutes** (~390/day fleet-wide) — a continuous
-condition, not a page. Magnitude cannot separate them either: the exceedance
+condition, not a page. ⚠️ That agent count is a **sliding 7d window and it
+moves**: re-measured 2026-09-26 it was **22 of 23**, because one of the two
+agents that had been under threshold (peaks of 30.2s and 116.1s on 09-25) rose
+to 572.0s. Cite it with its date, and do not restate it as "all agents" — the
+argument rests on the proportion being overwhelming, not on it being universal.
+Magnitude cannot separate the regimes either: the exceedance
 curve is smooth and knee-free (2,730 agent-min >300s → 1,565 >900s → 963
 >1800s → 492 >3600s), so no single-agent duration has a natural cut.
 

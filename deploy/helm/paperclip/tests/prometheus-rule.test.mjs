@@ -1228,8 +1228,10 @@ test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own
   // about when an agent is considered wedged.
   //
   // BLO-36522: "silent in steady state" is FALSE as written -- measured
-  // 2026-09-25, 21 of 21 agents crossed 300s over 7d for 2,730 agent-minutes
-  // (~390/day). Holds past 300s are routine, not exceptional. Blockcast's live
+  // 2026-09-25, 21 of 23 agents crossed 300s over 7d for 2,730 agent-minutes
+  // (~390/day). That agent count slides with the 7d window -- re-measured
+  // 22 of 23 on 2026-09-26 -- so cite it with its date and never as "all
+  // agents". Holds past 300s are routine, not exceptional. Blockcast's live
   // rule is therefore being retuned to a fleet-count expression, with the
   // log/alert numbers deliberately UNPINNED (Blockcast/onprem-k8s#3985,
   // unmerged; until it lands the live rule is still > 300 and the two still
@@ -1385,11 +1387,20 @@ test("the start-lock retune prose does not run ahead of the evidence (BLO-36522)
       `${relPath} must keep its start-lock section for the BLO-36522 guard to scan; `
         + "a renamed heading or key would otherwise make this assertion vacuous",
     );
+    // The alternation covers the two withdrawn claims in the wordings they
+    // have actually appeared in. "unbounded" and "21 of 21" are here because
+    // BLO-36522 shipped both INSIDE this scanned region while the guard
+    // certified it clean: an alternation only audits the phrasings it lists,
+    // so a region can look reviewed and still carry the claim in other words.
+    // Add a phrasing here when you retire one in prose, not instead of it.
     assert.doesNotMatch(
       section,
-      /does not self-heal|never self-heals|process must be replaced|process is replaced/,
+      /does not self-heal|never self-heals|process must be replaced|process is replaced|unbounded|21 of 21/,
       `${relPath} must not restate the "does not self-heal" / "replace the process" `
-        + "claims BLO-36522 withdrew; they are false as measured 2026-09-25",
+        + "claims BLO-36522 withdrew; they are false as measured 2026-09-25. "
+        + 'Nor "unbounded" (the 6-19 h episode ended in a pod replacement before '
+        + 'the hold could settle) nor "21 of 21" (it was 21 of 23 on 2026-09-25 '
+        + "and 22 of 23 on 2026-09-26 -- a sliding window, cite it with its date)",
     );
   }
 });
