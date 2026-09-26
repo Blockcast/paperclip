@@ -136,6 +136,7 @@ import {
   recordBackstopSweepCompleted,
   recordRecoveryHorizonExpired,
   setBackstopDeferredCandidates,
+  CAVEMAN_PROXY_NOT_READY_ERROR_CODE,
 } from "../metrics.js";
 import {
   isInfraFailureRun,
@@ -868,6 +869,11 @@ type StrandedPreviousStatus = "todo" | "in_progress" | "in_review";
 
 const ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES = new Set([
   "job_failed",
+  // BLO-33441: a `job_failed` that the pod's own diagnostics proved was the
+  // Caveman readiness timeout. It was a member of this set until it got its own
+  // code, and it is the same class of fault (the agent never started), so it
+  // stays — the relabel is for the census, not a routing decision.
+  CAVEMAN_PROXY_NOT_READY_ERROR_CODE,
   "k8s_pod_schedule_failed",
   "adapter_failed",
   "external_lifecycle_stale_killed",

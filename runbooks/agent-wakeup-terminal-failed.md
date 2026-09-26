@@ -132,6 +132,7 @@ wake table has no `error_code` column, only free-text `error`.
 | `external_lifecycle_stale_killed` | the reviewer Job went silent past the 45m hard-stale window and was force-terminated | check the PR for an existing review; if none, re-request (Step 3) |
 | `job_failed` | the Job exited non-zero | read the run log first — a re-request will hit the same failure if the cause is deterministic |
 | `job_missing` | the Job vanished before completing | re-request |
+| `caveman_proxy_not_ready` | the Caveman proxy missed its readiness budget before the agent process started | infra fault; re-request once proxy startup is healthy ([BLO-33279](https://paperclip.blockcast.net/BLO/issues/BLO-33279)) |
 | `adapter_failed` / `process_lost` | infrastructure fault below the agent | re-request once infra is healthy |
 | `agent_not_found` | the wake targeted an agent that no longer resolves | do **not** re-request; fix the routing |
 | `none` | no run row, or no code recorded (e.g. the "deferred wake could not be promoted" path) | inspect `w.error` prose |
