@@ -1257,14 +1257,15 @@ test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own
       + "not on the 6-19h timescale the incident actually ran",
   );
 
-  // Severity, not decoration: the hold never self-heals (the lock has no
-  // timeout, by design), so this is a per-agent dispatch outage that lasts
-  // until the process is replaced. A warning would reproduce the original
-  // failure, which was nobody being paged.
+  // Severity, not decoration: the lock has no timeout, so nothing external
+  // will break the hold (BLO-36522 withdrew the stronger "never self-heals /
+  // lasts until the process is replaced" reading -- measured holds do settle).
+  // A warning would reproduce the original failure, which was nobody being
+  // paged.
   assert.match(
     block,
     /\n\s+severity: critical\n/,
-    "a non-self-healing per-agent dispatch outage must page, not warn",
+    "an unbroken per-agent dispatch outage must page, not warn",
   );
   assert.match(
     block,
@@ -1278,7 +1279,17 @@ test("the start-lock retune prose does not run ahead of the evidence (BLO-36522)
   // drifting. values.yaml is read by third parties enabling this chart
   // elsewhere: calling the fleet-count retune Blockcast's live rule while
   // Blockcast/onprem-k8s#3985 is unmerged hands them an unproven expression as
-  // proven. When #3985 merges, update the prose and this test together.
+  // proven -- and the mirror error, still calling it pending after #3985 lands,
+  // hands them `> 300` when the live rule is `> 900`.
+  //
+  // This test CANNOT observe #3985's state (CI has no read of onprem-k8s), so
+  // it deliberately enforces only that the prose stays DEFINITE about that
+  // state, in EITHER direction. Pinning it to "pending" would make the correct
+  // post-merge edit a red build whose failure message argues the now-false
+  // claim back in. The gate on which direction is true is the must-update
+  // checklist on Blockcast/onprem-k8s#3985, which names this file by path --
+  // that is where the merge event actually happens, and this repo has no
+  // signal for it.
   const values = readFileSync(
     path.join(repoRoot, "deploy/helm/paperclip/values.yaml"),
     "utf8",
@@ -1287,17 +1298,24 @@ test("the start-lock retune prose does not run ahead of the evidence (BLO-36522)
   // otherwise slice from the last character and pass vacuously.
   const warningIndex = values.indexOf("# WARNING (BLO-36522)");
   assert.notStrictEqual(warningIndex, -1, "values.yaml must keep the BLO-36522 start-lock WARNING");
-  const warning = values.slice(warningIndex, values.indexOf("\n", warningIndex));
+  // Guard this -1 too: a WARNING on the final line with no trailing newline
+  // would otherwise slice(warningIndex, -1) and silently drop its last char.
+  const warningEnd = values.indexOf("\n", warningIndex);
+  const warning = values.slice(warningIndex, warningEnd === -1 ? undefined : warningEnd);
   assert.match(
     warning,
-    /in Blockcast\/onprem-k8s#3985, not yet merged; until it lands the live rule is still `> 300`/,
-    "values.yaml must describe the retune as pending in #3985, with the live rule still > 300",
+    /in Blockcast\/onprem-k8s#3985, (?:not yet merged; until it lands the live rule is still `> 300`|merged; the live rule is now `> 900`)/,
+    "values.yaml must state #3985's status definitely: pending with the live rule still > 300, or merged with it now > 900",
   );
-  assert.doesNotMatch(
-    warning,
-    /live rule in Blockcast\/onprem-k8s is now|NO LONGER the deployed policy/,
-    "values.yaml must not describe the unmerged retune as deployed",
-  );
+  // Only meaningful while the prose claims pending -- after #3985 lands, saying
+  // the retune is deployed is the correct statement, not the forbidden one.
+  if (/not yet merged/.test(warning)) {
+    assert.doesNotMatch(
+      warning,
+      /live rule in Blockcast\/onprem-k8s is now|NO LONGER the deployed policy/,
+      "values.yaml must not describe the unmerged retune as deployed",
+    );
+  }
 
   // The 2h14m 2026-09-24 episode was three agents in lockstep, i.e. the
   // fleet-scope regime, and it self-healed. Calling 09-15/16 the only
@@ -1321,6 +1339,25 @@ test("the start-lock retune prose does not run ahead of the evidence (BLO-36522)
     /only\*?\s+documented\s+fleet-scope\s+episode\s+that\s+ended\s+with\s+a\s+pod\s+replacement/,
     "runbook must narrow the 09-15/16 claim to the only fleet-scope episode ended by a pod replacement",
   );
+
+  // The withdrawn claim has now been removed at five sites across four heads,
+  // each found by re-grepping the phrase rather than by re-reading the diff --
+  // so assert the class is gone instead of waiting for a sixth site. These two
+  // files carry it only as live operator instruction (a rendered alert
+  // annotation and the runbook index), never as quotation. queued-run-stranded
+  // .md and this file are excluded on purpose: both quote the claim in order to
+  // withdraw it, which is the one place it still belongs.
+  for (const relPath of [
+    "deploy/helm/paperclip/templates/prometheusrule.yaml",
+    "runbooks/README.md",
+  ]) {
+    assert.doesNotMatch(
+      readFileSync(path.join(repoRoot, relPath), "utf8"),
+      /does not self-heal|never self-heals|process must be replaced|process is replaced/,
+      `${relPath} must not restate the "does not self-heal" / "replace the process" `
+        + "claims BLO-36522 withdrew; they are false as measured 2026-09-25",
+    );
+  }
 });
 
 test("PaperclipRecoveryHorizonNoWakeToCurrentOwner{Elevated,Sustained} key on the never_delivered series only and take their thresholds from values (PEN-3000)", () => {

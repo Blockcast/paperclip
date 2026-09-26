@@ -67,8 +67,10 @@ platform cannot resolve automatically. Each runbook should be:
 - [`queued-run-stranded.md#agent-start-lock-wedged-pen-3305`](queued-run-stranded.md#agent-start-lock-wedged-pen-3305) —
   an agent has held its per-agent dispatch start lock past the point the code
   itself calls dispatch stopped. This is the *cause* side of the alert above:
-  the lock has no timeout by design, so the agent dispatches nothing until the
-  section settles or the process is replaced, while `status: idle` /
+  the lock has no timeout by design, so nothing external breaks the hold and
+  the agent dispatches nothing until the section settles — which measured
+  holds do on their own (BLO-36522; replacing the process is *not* the
+  remedy), while `status: idle` /
   `errorReason: null` / `orgChainHealth: healthy` all read normal. Trigger:
   alert `PaperclipAgentStartLockWedged`, or
   `max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 300`
