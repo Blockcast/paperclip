@@ -10,6 +10,8 @@ import contextlib
 import importlib.util
 import io
 import os
+import tempfile
+import time
 import unittest
 import urllib.error
 
@@ -544,10 +546,16 @@ class TestSweepIsolation(unittest.TestCase):
     def setUp(self):
         self._real_fetch = sweep._fetch_paginated
         self._real_consider = sweep._consider_pr
+        self._real_refire = sweep._refire_pr
+        # The re-fire pass is a separate function now, so a test that stubs
+        # only _consider_pr would let a "would re-fire" verdict reach the
+        # real network. Stub it by default; tests about the write override it.
+        sweep._refire_pr = lambda *a, **k: None
 
     def tearDown(self):
         sweep._fetch_paginated = self._real_fetch
         sweep._consider_pr = self._real_consider
+        sweep._refire_pr = self._real_refire
 
     def _install_prs(self, prs):
         def fake_fetch(api_base_url, path, token):
@@ -999,12 +1007,18 @@ class TestRefireBudget(unittest.TestCase):
     def setUp(self):
         self._real_fetch = sweep._fetch_paginated
         self._real_consider = sweep._consider_pr
+        self._real_refire = sweep._refire_pr
         self._real_max = sweep.MAX_REFIRES_PER_RUN
+        self._real_max_attempts = sweep.MAX_REFIRE_ATTEMPTS_PER_RUN
+        self.refired = []
+        sweep._refire_pr = lambda o, r, pr, h, p, t, u, n: self.refired.append(pr["number"])
 
     def tearDown(self):
         sweep._fetch_paginated = self._real_fetch
         sweep._consider_pr = self._real_consider
+        sweep._refire_pr = self._real_refire
         sweep.MAX_REFIRES_PER_RUN = self._real_max
+        sweep.MAX_REFIRE_ATTEMPTS_PER_RUN = self._real_max_attempts
 
     def _install_prs(self, prs):
         def fake_fetch(api_base_url, path, token):
@@ -1012,25 +1026,190 @@ class TestRefireBudget(unittest.TestCase):
 
         sweep._fetch_paginated = fake_fetch
 
+    def _eligible_at(self, ages):
+        """Stub _consider_pr so PR n is eligible with pending_since ages[n]."""
+        def fake_consider(o, r, pr, t, u, n):
+            return (pr, pr["head"]["sha"], ages[pr["number"]], True, "re-fired")
+
+        sweep._consider_pr = fake_consider
+
     def test_over_budget_prs_are_deferred_not_dropped(self):
         sweep.MAX_REFIRES_PER_RUN = 2
         self._install_prs([_pr(1), _pr(2), _pr(3), _pr(4)])
         seen = []
 
-        def fake_consider(o, r, pr, t, u, n, may_refire=True, dry_run=False):
-            seen.append((pr["number"], may_refire))
-            if not may_refire:
-                return (pr, pr["head"]["sha"], 100.0, False,
-                        "%s -- over budget" % sweep.DEFERRED_REASON_PREFIX)
+        def fake_consider(o, r, pr, t, u, n):
+            seen.append(pr["number"])
             return (pr, pr["head"]["sha"], 100.0, True, "re-fired")
 
         sweep._consider_pr = fake_consider
         results = sweep.sweep("o", "r", "tok", "https://api.github.com", now=0.0)
 
-        self.assertEqual([n for n, _ in seen], [1, 2, 3, 4], "every PR is still evaluated")
-        self.assertEqual([m for _, m in seen], [True, True, False, False])
+        self.assertEqual(seen, [1, 2, 3, 4], "every PR is still evaluated")
         self.assertEqual(len(results), 4, "deferred PRs stay in the accounting")
-        self.assertTrue(results[2][4].startswith(sweep.DEFERRED_REASON_PREFIX))
+        self.assertEqual(len(self.refired), 2, "the cap still bounds the writes")
+        deferred = [r for r in results if str(r[4]).startswith(sweep.DEFERRED_REASON_PREFIX)]
+        self.assertEqual(len(deferred), 2)
+
+    def test_budget_goes_to_the_longest_waiting_not_to_list_order(self):
+        """PEN-3394 regression.
+
+        `GET /pulls?state=open` returns NEWEST FIRST, and the budget used to
+        be spent while walking that list -- so the newest eligible PRs took
+        every slot and the oldest never got one. Measured on paperclip over
+        five consecutive runs: in every one, every re-fired PR number was
+        strictly greater than every deferred number. #1862 went 50h with no
+        re-fire while newer PRs were re-fired hourly.
+
+        List order here is newest-first (4, 3, 2, 1) while the waits run the
+        other way, so a regression to positional spending re-fires {4, 3}.
+        """
+        sweep.MAX_REFIRES_PER_RUN = 2
+        self._install_prs([_pr(4), _pr(3), _pr(2), _pr(1)])
+        self._eligible_at({1: 100.0, 2: 200.0, 3: 300.0, 4: 400.0})
+
+        results = sweep.sweep("o", "r", "tok", "https://api.github.com", now=0.0)
+
+        self.assertEqual(sorted(self.refired), [1, 2], "longest-waiting two win the budget")
+        self.assertEqual(
+            sorted(r[0]["number"] for r in results
+                   if str(r[4]).startswith(sweep.DEFERRED_REASON_PREFIX)),
+            [3, 4],
+        )
+        self.assertEqual(
+            [r[0]["number"] for r in results], [4, 3, 2, 1],
+            "the accounting still reports in list order, unsorted",
+        )
+
+    def test_a_failed_refire_does_not_strand_the_remaining_refires(self):
+        sweep.MAX_REFIRES_PER_RUN = 3
+        self._install_prs([_pr(1), _pr(2), _pr(3)])
+        self._eligible_at({1: 100.0, 2: 200.0, 3: 300.0})
+        attempted = []
+
+        def flaky_refire(o, r, pr, h, p, t, u, n):
+            attempted.append(pr["number"])
+            if pr["number"] == 2:
+                raise urllib.error.URLError("connection reset")
+
+        sweep._refire_pr = flaky_refire
+        results = sweep.sweep("o", "r", "tok", "https://api.github.com", now=0.0)
+
+        self.assertEqual(attempted, [1, 2, 3], "#3 is still attempted after #2 failed")
+        by_number = {r[0]["number"]: r for r in results}
+        self.assertTrue(by_number[1][3])
+        self.assertTrue(by_number[3][3])
+        self.assertFalse(by_number[2][3], "a failed write must not read as re-fired")
+        self.assertTrue(
+            str(by_number[2][4]).startswith(sweep.SWEEP_ERROR_REASON_PREFIX),
+            "and must not read as a clean skip either",
+        )
+
+    def test_a_failed_refire_does_not_consume_a_budget_slot(self):
+        """PEN-3394 review regression.
+
+        A failed write posts no marker, so should_refire's cooldown never
+        engages: the PR keeps the longest wait and sorts back to rank 0 on
+        the next run, forever. If that failure spent a slot, then
+        MAX_REFIRES_PER_RUN permanently-failing PRs would consume the whole
+        budget every run and nobody would be served -- the same starvation
+        this change exists to fix, through a different door.
+
+        #1 waits longest and always fails. Against attempt-counting this
+        re-fires only {2}; the budget must instead fall through to {2, 3}.
+        """
+        sweep.MAX_REFIRES_PER_RUN = 2
+        self._install_prs([_pr(1), _pr(2), _pr(3), _pr(4)])
+        self._eligible_at({1: 100.0, 2: 200.0, 3: 300.0, 4: 400.0})
+        attempted = []
+
+        def always_fails_on_1(o, r, pr, h, p, t, u, n):
+            attempted.append(pr["number"])
+            if pr["number"] == 1:
+                raise urllib.error.HTTPError(
+                    "u", 403, "resource not accessible by integration", {}, None
+                )
+            self.refired.append(pr["number"])
+
+        sweep._refire_pr = always_fails_on_1
+        results = sweep.sweep("o", "r", "tok", "https://api.github.com", now=0.0)
+
+        self.assertEqual(attempted, [1, 2, 3], "the failure falls through to the next-ranked PR")
+        self.assertEqual(self.refired, [2, 3], "a full budget is still DELIVERED")
+        by_number = {r[0]["number"]: r for r in results}
+        self.assertFalse(by_number[1][3], "the failed write must not read as re-fired")
+        self.assertIn(sweep.REFIRE_WRITE_FAILURE_TOKEN, str(by_number[1][4]))
+        self.assertTrue(
+            str(by_number[4][4]).startswith(sweep.DEFERRED_REASON_PREFIX),
+            "#4 is deferred because the budget was delivered, not because it was burnt",
+        )
+
+    def test_the_attempt_ceiling_bounds_the_fall_through(self):
+        """Counting successes must not let a run of failures walk the whole set.
+
+        Every write fails here, so nothing ever consumes the delivery cap.
+        MAX_REFIRE_ATTEMPTS_PER_RUN is the only thing that stops the loop.
+        """
+        sweep.MAX_REFIRES_PER_RUN = 5
+        sweep.MAX_REFIRE_ATTEMPTS_PER_RUN = 2
+        self._install_prs([_pr(1), _pr(2), _pr(3), _pr(4)])
+        self._eligible_at({1: 100.0, 2: 200.0, 3: 300.0, 4: 400.0})
+        attempted = []
+
+        def always_fails(o, r, pr, h, p, t, u, n):
+            attempted.append(pr["number"])
+            raise urllib.error.URLError("connection reset")
+
+        sweep._refire_pr = always_fails
+        results = sweep.sweep("o", "r", "tok", "https://api.github.com", now=0.0)
+
+        self.assertEqual(attempted, [1, 2], "the attempt ceiling caps the API calls")
+        deferred = [r for r in results if str(r[4]).startswith(sweep.DEFERRED_REASON_PREFIX)]
+        self.assertEqual(sorted(r[0]["number"] for r in deferred), [3, 4])
+        self.assertIn(
+            "MAX_REFIRE_ATTEMPTS_PER_RUN", str(deferred[0][4]),
+            "the deferral must name the ceiling that actually bit, not the delivery cap",
+        )
+        for res in deferred:
+            self.assertIsNotNone(res[2], "a deferred PR keeps pending_since so it can still ALARM")
+
+    def test_rate_limit_in_the_read_pass_still_spends_the_refire_budget(self):
+        """PEN-3394: the read pass `break`s into pass 2 rather than returning.
+
+        Under the old single pass, PRs walked before exhaustion had ALREADY
+        been written. Now the writes all happen in pass 2, so a `return` here
+        would make an exhausted run issue ZERO re-fires -- and worse, leave
+        the already-decided PRs at refire=True with no write attempted, so
+        main()'s `refired = [r for r in results if r[3]]` would report
+        re-fires that never occurred.
+
+        The pre-existing rate-limit test cannot catch that: it returns
+        refire=False for every PR, so pass 2 finds an empty eligible set and
+        passes identically against `return` and against `break`. This one
+        makes #1 eligible before #2 exhausts the budget.
+        """
+        self._install_prs([_pr(1), _pr(2), _pr(3)])
+        considered = []
+
+        def limited(o, r, pr, t, u, n):
+            considered.append(pr["number"])
+            if pr["number"] == 2:
+                raise sweep.RateLimitExhausted("budget spent")
+            return (pr, pr["head"]["sha"], 100.0, True, "re-fired")
+
+        sweep._consider_pr = limited
+        results = sweep.sweep("o", "r", "tok", "https://api.github.com", now=0.0)
+
+        self.assertEqual(considered, [1, 2], "the READ pass still aborts")
+        self.assertEqual(
+            self.refired, [1],
+            "but the decided PR is still written -- the re-asks are the product",
+        )
+        by_number = {r[0]["number"]: r for r in results}
+        self.assertTrue(by_number[1][3], "and it reports as re-fired because it was")
+        for n in (2, 3):
+            self.assertIn(sweep.RATE_LIMIT_TOKEN, str(by_number[n][4]))
+            self.assertFalse(by_number[n][3], "unevaluated PRs must not report phantom re-fires")
 
     def test_deferred_pr_still_carries_pending_since_so_it_can_alarm(self):
         """Rate-limiting a write must never suppress the alarm.
@@ -1040,14 +1219,38 @@ class TestRefireBudget(unittest.TestCase):
         """
         sweep.MAX_REFIRES_PER_RUN = 0
         self._install_prs([_pr(1)])
+        self._eligible_at({1: 100.0})
 
-        def fake_consider(o, r, pr, t, u, n, may_refire=True, dry_run=False):
-            return (pr, pr["head"]["sha"], 100.0, False,
-                    "%s -- over budget" % sweep.DEFERRED_REASON_PREFIX)
-
-        sweep._consider_pr = fake_consider
         results = sweep.sweep("o", "r", "tok", "https://api.github.com", now=0.0)
 
+        self.assertTrue(str(results[0][4]).startswith(sweep.DEFERRED_REASON_PREFIX))
+        self.assertIsNotNone(results[0][2])
+        self.assertTrue(
+            sweep.is_alarming({"is_draft": False, "pending_since": results[0][2]},
+                              100.0 + sweep.ALARM_THRESHOLD_SECONDS)
+        )
+
+    def test_write_failed_pr_still_carries_pending_since_so_it_can_alarm(self):
+        """The write-side twin of the deferred test above; BLO-22892 class.
+
+        A rejected write must not drop pending_since: the PR was read in
+        full, so its alarm verdict is exact, and sweep_is_degraded's floor
+        of max(3, 10%) does not backstop a few write failures on a large
+        open-PR list.
+        """
+        sweep.MAX_REFIRES_PER_RUN = 1
+        self._install_prs([_pr(1)])
+        self._eligible_at({1: 100.0})
+
+        def failing_refire(*args):
+            raise RuntimeError("boom")
+
+        sweep._refire_pr = failing_refire
+
+        results = sweep.sweep("o", "r", "tok", "https://api.github.com", now=0.0)
+
+        self.assertTrue(str(results[0][4]).startswith(sweep.SWEEP_ERROR_REASON_PREFIX))
+        self.assertIn(sweep.REFIRE_WRITE_FAILURE_TOKEN, str(results[0][4]))
         self.assertIsNotNone(results[0][2])
         self.assertTrue(
             sweep.is_alarming({"is_draft": False, "pending_since": results[0][2]},
@@ -1113,6 +1316,306 @@ class TestCommentBodyIsModeAware(unittest.TestCase):
         body = sweep.build_comment_body(7, "b" * 40, 3 * HOUR, requested_login="allyblockcast", mode="status-free")
         self.assertNotIn(sweep.STATUS_CONTEXT, body)
         self.assertIn("awaiting review", body)
+
+
+class _RendersMainSummary:
+    """Harness for asserting on what main() writes to GITHUB_STEP_SUMMARY.
+
+    A plain mixin, not a TestCase, so unittest does not collect it as a
+    suite of its own -- the fixtures below are shared by two classes that
+    assert on different paragraphs of the same rendered summary.
+    """
+
+    def setUp(self):
+        self._real_sweep = sweep.sweep
+        self._env = {
+            k: os.environ.get(k)
+            for k in ("GITHUB_REPOSITORY", "GITHUB_TOKEN", "GITHUB_STEP_SUMMARY")
+        }
+        os.environ["GITHUB_REPOSITORY"] = "Blockcast/paperclip"
+        os.environ["GITHUB_TOKEN"] = "t"
+
+    def tearDown(self):
+        sweep.sweep = self._real_sweep
+        for key, value in self._env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def _summary_for(self, results):
+        """Run main() over `results` and return what it wrote to the summary."""
+        handle, path = tempfile.mkstemp()
+        os.close(handle)
+        os.environ["GITHUB_STEP_SUMMARY"] = path
+        sweep.sweep = lambda *a, **k: results
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                sweep.main([])
+        except SystemExit:
+            pass
+        try:
+            with open(path, encoding="utf-8") as summary:
+                return summary.read()
+        finally:
+            os.unlink(path)
+
+    def _write_failure(self, number, exc_name="RateLimitExhausted", pending_since=None):
+        # A failed write keeps the pending_since it was read with (the read
+        # succeeded; only the write was rejected). Defaulting it to None
+        # would encode the alarm-suppressed state -- the BLO-22892 class --
+        # as the normal shape. Fresh by default so `alarming` stays 0 in
+        # the tests that do not care.
+        if pending_since is None:
+            pending_since = time.time()
+        return (
+            _pr(number), "%040x" % number, pending_since, False,
+            "%s -- %s (%s)"
+            % (sweep.SWEEP_ERROR_REASON_PREFIX, sweep.REFIRE_WRITE_FAILURE_TOKEN, exc_name),
+        )
+
+    def _read_failure(self, number):
+        return (
+            _pr(number), "%040x" % number, None, False,
+            "%s -- %s" % (sweep.SWEEP_ERROR_REASON_PREFIX, sweep.RATE_LIMIT_TOKEN),
+        )
+
+    def _deferred(self, number):
+        return (
+            _pr(number), "%040x" % number, 1.0, False,
+            "%s -- over budget" % sweep.DEFERRED_REASON_PREFIX,
+        )
+
+    def _refired(self, number):
+        return (_pr(number), "%040x" % number, 1.0, True, "re-fired")
+
+
+class TestFailureSummaryAttribution(_RendersMainSummary, unittest.TestCase):
+    """A write-pass failure must not be reported as a read-pass abort.
+
+    Both record the exception type in their reason, so a rate-limited WRITE
+    reads "re-fire write failed (RateLimitExhausted)" and contains
+    RATE_LIMIT_TOKEN as a substring. Bucketing on that alone printed "never
+    attempted ... the run aborted" directly above a table row saying the
+    write failed -- the summary contradicting itself. The two have different
+    remedies (fewer reads vs. a write-side rejection), and an operator reads
+    this during exactly the incident the script backstops.
+    """
+
+    NEVER_ATTEMPTED = "never attempted"
+
+    def test_a_rate_limited_write_is_not_reported_as_never_attempted(self):
+        """The regression. Reverting the REFIRE_WRITE_FAILURE_TOKEN exclusion
+        in main()'s `rate_limited` filter makes this fail."""
+        summary = self._summary_for([self._write_failure(1), self._write_failure(2)])
+
+        self.assertNotIn(self.NEVER_ATTEMPTED, summary)
+        self.assertIn("DID win a slot and were attempted", summary)
+
+    def test_a_read_pass_rate_limit_is_still_reported_as_never_attempted(self):
+        """Positive control for the test above.
+
+        Without this, deleting the `rate_limited` bucket outright would pass
+        the regression test while destroying the reporting it exists for.
+        """
+        summary = self._summary_for([self._read_failure(1), self._read_failure(2)])
+
+        self.assertIn(self.NEVER_ATTEMPTED, summary)
+        self.assertNotIn("DID win a slot", summary)
+
+    def test_both_kinds_in_one_run_are_counted_separately(self):
+        """The buckets partition; neither absorbs the other's members."""
+        summary = self._summary_for(
+            [self._read_failure(1), self._write_failure(2), self._write_failure(3)]
+        )
+
+        self.assertIn("1 of them were never attempted", summary)
+        self.assertIn("2 of them DID win a slot", summary)
+
+    def test_write_failures_are_explained_when_nothing_is_deferred(self):
+        """The explanation used to be nested under `if deferred:`.
+
+        Write failures and deferrals are independent: a run with rejected
+        writes and an empty deferral list printed no account of them at all,
+        which is precisely the shape of the reproduction above.
+        """
+        summary = self._summary_for([self._write_failure(1)])
+
+        self.assertNotIn("deferred past this run's re-fire budget", summary)
+        self.assertIn("does NOT consume the MAX_REFIRES_PER_RUN", summary)
+
+    def test_a_non_rate_limit_write_failure_is_still_attributed_to_the_write(self):
+        """The bucket keys off the write token, not the exception type."""
+        summary = self._summary_for([self._write_failure(1, exc_name="HTTPError")])
+
+        self.assertIn("DID win a slot and were attempted", summary)
+        self.assertNotIn(self.NEVER_ATTEMPTED, summary)
+
+
+class TestDeferralHeaderReportsMeasuredDelivery(_RendersMainSummary, unittest.TestCase):
+    """Write-failures WITH deferrals -- the combination that renders the
+    deferral header and the DEGRADED paragraph at the same time.
+
+    Neither was covered: the write-failure cases all had an empty deferral
+    list and the deferral cases had no failures, so the two paragraphs that
+    interpolate `failed` were only ever exercised in the states where the
+    conflation is invisible. In this state the header interpolated the
+    CONSTANT MAX_REFIRES_PER_RUN as the count delivered -- reporting a
+    fully-spent budget two lines under "re-fired 0" -- and promised a
+    rotation that cannot happen, because a failed write posts no marker, so
+    starts no cooldown, so those PRs keep their longer waits and rank ahead
+    again. The population is stationary, not rotating.
+    """
+
+    def _spent_budget_claim(self):
+        """What the header must NOT say: the cap, reported as delivered."""
+        return "%d of MAX_REFIRES_PER_RUN=%d delivered" % (
+            sweep.MAX_REFIRES_PER_RUN,
+            sweep.MAX_REFIRES_PER_RUN,
+        )
+
+    def test_a_run_that_delivered_nothing_does_not_report_a_spent_budget(self):
+        """The regression. Reverting to the constant makes this fail."""
+        summary = self._summary_for(
+            [self._write_failure(n) for n in (1, 2)] + [self._deferred(3)]
+        )
+
+        self.assertIn(
+            "0 of MAX_REFIRES_PER_RUN=%d delivered" % sweep.MAX_REFIRES_PER_RUN, summary
+        )
+        self.assertNotIn(self._spent_budget_claim(), summary)
+        # Attempts = delivered + rejected writes, so both failures count.
+        self.assertIn(
+            "2 of MAX_REFIRE_ATTEMPTS_PER_RUN=%d attempted"
+            % sweep.MAX_REFIRE_ATTEMPTS_PER_RUN,
+            summary,
+        )
+
+    def test_the_delivered_figure_is_the_measured_count_not_the_cap(self):
+        """Two delivered under a cap of five must read as two, so the header
+        cannot pass by coincidence on a run that happens to spend it all."""
+        summary = self._summary_for(
+            [self._refired(1), self._refired(2), self._deferred(3)]
+        )
+
+        self.assertIn(
+            "2 of MAX_REFIRES_PER_RUN=%d delivered" % sweep.MAX_REFIRES_PER_RUN, summary
+        )
+        self.assertNotIn(self._spent_budget_claim(), summary)
+        # No write failed, so attempted must equal delivered: the cap here
+        # would read as write failures that never happened.
+        self.assertIn(
+            "2 of MAX_REFIRE_ATTEMPTS_PER_RUN=%d attempted"
+            % sweep.MAX_REFIRE_ATTEMPTS_PER_RUN,
+            summary,
+        )
+
+    def test_the_rotation_guarantee_is_withdrawn_when_a_write_failed(self):
+        """A failed write starts no cooldown, so the deferred set does not
+        advance. Claiming it does reads a starvation as fairness working."""
+        summary = self._summary_for([self._write_failure(1), self._deferred(2)])
+
+        self.assertIn("do **not** rank first next run", summary)
+        self.assertNotIn("so these rank first next run", summary)
+
+    def test_the_rotation_guarantee_still_holds_when_every_write_landed(self):
+        """Positive control. Without it, deleting the rotation clause
+        outright would pass the test above while destroying the claim this
+        PR exists to make true."""
+        summary = self._summary_for([self._refired(1), self._deferred(2)])
+
+        self.assertIn("so these rank first next run", summary)
+        self.assertNotIn("do **not** rank first next run", summary)
+
+    def test_a_write_only_failure_does_not_discredit_the_alarm_count(self):
+        """Every PR was READ; only the write was rejected. `alarming` is
+        therefore exact, and telling the operator to discount it removes the
+        one trustworthy number on the run where it is the only signal.
+
+        Three failures, because sweep_is_degraded has a floor of 3 -- below
+        it nothing renders and the assertion would pass vacuously.
+        """
+        summary = self._summary_for([self._write_failure(n) for n in (1, 2, 3)])
+
+        self.assertIn("This run is DEGRADED", summary)
+        self.assertIn("read in full and failed on the re-fire WRITE", summary)
+        self.assertNotIn("could not be read", summary)
+
+    def test_a_read_failure_still_discredits_the_alarm_count(self):
+        """Positive control for the test above: gating the sentence must not
+        delete it. A PR that could not be read cannot be shown un-stranded."""
+        summary = self._summary_for([self._read_failure(n) for n in (1, 2, 3)])
+
+        self.assertIn("This run is DEGRADED", summary)
+        self.assertIn("could not be read", summary)
+        self.assertNotIn("read in full and failed on the re-fire WRITE", summary)
+
+    def test_a_mixed_run_attributes_each_failure_kind_to_its_own_side(self):
+        """Neither clause absorbs the other's members."""
+        summary = self._summary_for(
+            [self._read_failure(n) for n in (1, 2, 3)] + [self._write_failure(4)]
+        )
+
+        self.assertIn("3 could not be read", summary)
+        self.assertIn("1 PR(s) were read in full and failed on the re-fire WRITE", summary)
+        self.assertNotIn("is trustworthy", summary)
+        self.assertIn("they are not what makes `alarming=", summary)
+
+    def test_the_write_clause_states_the_verdict_is_exact_not_that_they_are_counted(self):
+        """Re-fire eligibility (STALL_THRESHOLD) is below the alarm threshold,
+        so a write-failed PR is normally NOT alarming. Claiming they "are
+        counted in `alarming=N`" pointed the operator at an alarm table that
+        does not list them. The true property is that their verdict is
+        exact; rendered against a non-zero count so the sentence cannot pass
+        by reading `alarming=0` as vacuously true."""
+        summary = self._summary_for([
+            self._write_failure(
+                1, pending_since=time.time() - sweep.ALARM_THRESHOLD_SECONDS - 60
+            ),
+            self._write_failure(2),
+            self._write_failure(3),
+        ])
+
+        self.assertIn("This run is DEGRADED", summary)
+        self.assertIn("`alarming=1` is trustworthy", summary)
+        self.assertNotIn("counted in `alarming=", summary)
+
+
+class TestAttemptCeilingIsClamped(unittest.TestCase):
+    """MAX_REFIRE_ATTEMPTS_PER_RUN below MAX_REFIRES_PER_RUN makes the
+    delivery cap unreachable, and the deferral message would then name the
+    attempt ceiling while implying the budget had been spent. Operator-set,
+    so the clamp is about making the state unrepresentable, not likely."""
+
+    def _reload_with(self, **env):
+        previous = {k: os.environ.get(k) for k in env}
+        os.environ.update({k: str(v) for k, v in env.items()})
+        try:
+            module = importlib.util.module_from_spec(_SPEC)
+            _SPEC.loader.exec_module(module)
+            return module
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_an_attempt_ceiling_below_the_delivery_cap_is_raised_to_it(self):
+        module = self._reload_with(MAX_REFIRES_PER_RUN=5, MAX_REFIRE_ATTEMPTS_PER_RUN=2)
+
+        self.assertEqual(module.MAX_REFIRE_ATTEMPTS_PER_RUN, 5)
+
+    def test_an_attempt_ceiling_above_the_delivery_cap_is_left_alone(self):
+        """The clamp must not flatten a deliberately generous ceiling."""
+        module = self._reload_with(MAX_REFIRES_PER_RUN=5, MAX_REFIRE_ATTEMPTS_PER_RUN=40)
+
+        self.assertEqual(module.MAX_REFIRE_ATTEMPTS_PER_RUN, 40)
+
+    def test_the_default_is_still_twice_the_delivery_cap(self):
+        module = self._reload_with(MAX_REFIRES_PER_RUN=7, MAX_REFIRE_ATTEMPTS_PER_RUN="")
+
+        self.assertEqual(module.MAX_REFIRE_ATTEMPTS_PER_RUN, 14)
 
 
 if __name__ == "__main__":

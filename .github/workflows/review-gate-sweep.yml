@@ -164,9 +164,11 @@ permissions:
 # every queued sweep runs. At 90 open PRs that is ~270 reads each against the
 # 1,000/hour/repository `github.token` budget, so a long starvation window can
 # exhaust it. That degrades LOUDLY -- the script detects rate-limit exhaustion
-# explicitly and reports it, and writes stay capped by MAX_REFIRES_PER_RUN -- so
-# it turns the tab red rather than going quiet, which is the failure direction
-# this reconciler must never have.
+# explicitly and reports it, and writes stay capped by
+# MAX_REFIRE_ATTEMPTS_PER_RUN (2x MAX_REFIRES_PER_RUN by default; each re-fire
+# is 2 writes, so at most 20 requests -- negligible beside the reads above) --
+# so it turns the tab red rather than going quiet, which is the failure
+# direction this reconciler must never have.
 #
 # SECOND RESIDUAL, likewise stated rather than implied: two sweeps that execute
 # CONCURRENTLY can both re-fire the same PR. The per-PR cooldown is derived from
