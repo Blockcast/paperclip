@@ -714,9 +714,10 @@ so the 1 → 1 → 0 progression is not mistaken for a classifier regression.
 
 ### Fires 4–10 — ACs 3 and 4 exercised for real
 
-Recorded 2026-09-25. Every PR state in this section was re-read live with
-`gh pr view <n> -R Blockcast/paperclip --json state,mergedAt` at the time of writing, not copied
-from a receipt.
+Recorded 2026-09-25, corrected 2026-09-26. Every PR state and every receipt id in this section was
+re-read live at the 2026-09-26 correction — PR states with
+`gh pr view <n> -R Blockcast/paperclip --json state,mergedAt`, receipts from the BLO-34818 comment
+ledger — not copied from an earlier draft.
 
 #### The first genuine `enqueue` rows, and the confirmation loop closing on them
 
@@ -727,21 +728,31 @@ from a receipt.
 | `4effd9fa` | 2026-09-23T06:48:23Z | **#1804** `mergestate:CLEAN` | `none` |
 | `aa6a0a70` | 2026-09-23T16:44:08Z | 0 | **#1804 → `still-queued`** (OPEN at the time) |
 | `98027253` | 2026-09-24T14:10:23Z | **#2001, #1985, #1976** all `mergestate:CLEAN` | `none` |
+| `933af750` | 2026-09-25T07:18:04Z | **#2020** `mergestate:BLOCKED`, **#1774** `mergestate:CLEAN` | **#2001, #1985, #1976 → `still-queued`** (all OPEN) |
+| `85529fad` | 2026-09-25T08:12:04Z | **#2020** `mergestate:BLOCKED` | **#2020, #1774 → `still-queued`** (both OPEN) |
 
 **Step 3 of the routine description works end to end.** Each receipt carrying `enqueue` rows is
 followed by a receipt that resolves exactly those rows — which is the behaviour AC 4 was written
 for, and it is no longer vacuous.
 
-#### #1990 landed — the end-to-end proof
+This table is the record **through `85529fad` (2026-09-25T08:12:04Z)** and is deliberately not
+extended past it — the ledger keeps growing and a table that chases it is stale on every fire.
+Later receipts exist and live on BLO-34818, which is the running ledger. Both of the two rows added
+here carry `enqueue` rows *and* resolve the previous receipt's rows, so the loop is closing on every
+cycle, not only on the three recorded above them.
+
+#### Two PRs landed — the end-to-end proof
 
 #1990 was enqueued by fire 6, classified `still-queued` at its confirmation, and **merged at
-`2026-09-25T02:34:27Z`** (`gh pr view 1990 --json state,mergedAt` → `MERGED`). That is a PR the
-routine armed, tracked, and saw through to master without a hand merge.
+`2026-09-25T02:34:27Z`**. #1804 was enqueued by `4effd9fa`, classified `still-queued` by
+`aa6a0a70`, and **merged at `2026-09-25T15:27:33Z`** (both `gh pr view <n> --json state,mergedAt` →
+`MERGED`, re-read 2026-09-26). Two PRs the routine armed, tracked, and saw through to master
+without a hand merge.
 
-The other four rows are still open as of writing — #1804, #2001, #1985, #1976 all `state: OPEN`,
+The remaining rows are open as of writing — #2001, #1985, #1976, #2020, #1774 all `state: OPEN`,
 `mergedAt: null` — so `still-queued` remains the accurate classification for them. **No receipt has
-yet printed a literal `confirmed-merged` row**, because #1990's merge fell outside the one-receipt
-confirmation window that had already resolved it.
+yet printed a literal `confirmed-merged` row**, because both merges fell outside the one-receipt
+confirmation window that had already resolved those rows.
 
 #### AC 3 names a field this repo does not use — fifth plan-vs-reality drift
 
@@ -763,10 +774,12 @@ evidence does not separate those; logged as an open question for C1 (BLO-32240),
 
 The fires-1–4 table above generalises. Sampling the eight most recent runs, five were `skipped`
 with a `coalescedIntoRunId`, and each named an execution issue that was still live. The
-2026-09-25T01:45:00Z slot coalesced into the 19:45Z run, whose issue **BLO-36187** was still
-`in_progress` at the time of writing — which is why the newest receipt is `98027253` and not
-something from the last cycle. **Auditing this routine by counting cron slots against receipts will
-report a false defect.**
+2026-09-25T01:45:00Z slot coalesced into the 19:45Z run, whose issue **BLO-36187** ran
+`07:06:30.815Z` → `07:19:14.898Z` and posted receipt **`933af750` at `07:18:04.891Z`**, inside its
+own window. So the coalesced slot behaved like the fire-3 precedent recorded above: one receipt for
+the surviving run, none for the slot that was absorbed. **Auditing this routine by counting cron
+slots against receipts will report a false defect** — in either direction. Counting slots
+over-counts; taking the newest receipt you happen to have cached under-counts.
 
 #### Why this file took an extra cycle to land
 
@@ -774,10 +787,10 @@ PR #1954 — the PR carrying this file — was itself **ejected from the merge q
 `2026-09-24T21:48:10Z`**. The merge-group run `36050446289` failed on
 `General tests (workspaces-a)`, whose actual failure is a `waitForServer` timeout in
 `src/__tests__/company-import-export-e2e.test.ts:291` — a server-start flake. #1954 is docs-only
-(+212/−0, one Markdown file), and a merge-group tests the PR combined with master, so this failure
-cannot have come from the PR's content. It is recorded here rather than filed as a defect: one
-flake in a queue that was otherwise draining (5 of the 8 surrounding merge-group runs succeeded) is
-not a finding.
+(one Markdown file, no executable surface), and a merge-group tests the PR combined with master, so
+this failure cannot have come from the PR's content. It is recorded here rather than filed as a
+defect: one flake in a queue that was otherwise draining (5 of the 8 surrounding merge-group runs
+succeeded) is not a finding.
 
 The ejection is also what made this correction possible. It had been written earlier and refused
 with `GH006 — Branches that are queued for merging cannot be updated`; dequeuing to push a
