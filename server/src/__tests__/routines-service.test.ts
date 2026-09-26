@@ -2269,6 +2269,57 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(getRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue")).toBe(0);
   });
 
+  // Ally review, BLO-31996: the same protected predecessor on the production
+  // row shape, `executionRunId` null (the seed helper's default). The supersede
+  // never cancels an unbound row, so the gate is the only thing between it and a
+  // second open execution row -- and the INSERT is outside the unique index, so
+  // nothing fails loudly. Every protected-arm case above binds the run, which is
+  // how the gate's inherited `executionRunId IS NOT NULL` scope went unnoticed.
+  it("gates the fire on a protected stale predecessor whose execution run is not bound", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "coalesce_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const dependencyParked = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "queued",
+      runStartedAt: new Date(Date.now() - YOUNG_RETRY_AGE_MS),
+      issueCreatedAt: new Date(Date.now() - STALE_FIRE_AGE_MS),
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+    });
+
+    const blocker = await issueSvc.create(companyId, {
+      title: "Real blocker",
+      assigneeAgentId: agentId,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blocker.id,
+      relatedIssueId: dependencyParked.issue.id,
+      type: "blocks",
+    });
+    await db
+      .update(issues)
+      .set({ status: "blocked" })
+      .where(eq(issues.id, dependencyParked.issue.id));
+
+    resetRoutineDispatchMetrics();
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    expect(run.status).toBe("coalesced");
+    expect(run.linkedIssueId).toBe(dependencyParked.issue.id);
+    const [predecessor] = await db.select().from(issues).where(eq(issues.id, dependencyParked.issue.id));
+    expect(predecessor.status).toBe("blocked");
+    expect(predecessor.executionRunId).toBeNull();
+    expect(getRoutineDispatchMetric("routine_dispatch_superseded_stale_execution_issue")).toBe(0);
+  });
+
   // Ally review, BLO-31996: a live recovery action is a wake path stored in
   // `issue_recovery_actions`, not `issue_relations`, so the blocker-edge check
   // alone would still let the supersede cancel its source row.

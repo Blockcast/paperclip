@@ -1793,26 +1793,32 @@ export function routineService(
     }
 
     // Ally review, BLO-31996: a row `supersedeStaleExecutionIssues` refuses to
-    // cancel must gate the fire too. It stays open with its execution run, so
-    // proceeding would put a successor beside it (the INSERT carries no run yet,
-    // so the unique index does not stop it) -- where before the fire-age arm
-    // this same row read as live and the fire coalesced. Scoped like the supersede's own
-    // candidate set (`executionRunId` bound); age is deliberately not a
-    // condition, since a protected row is never cancelled at any age. A
-    // protection that commits after this snapshot is caught by the second gate
-    // `dispatchRoutineRun` runs after the supersede's row lock.
+    // cancel must gate the fire too. It stays open, so proceeding would put a
+    // successor beside it (the INSERT carries no run yet, so the unique index
+    // does not stop it) -- where before the fire-age arm this same row read as
+    // live and the fire coalesced. Age is deliberately not a condition, since a
+    // protected row is never cancelled at any age. A protection that commits
+    // after this snapshot is caught by the second gate `dispatchRoutineRun`
+    // runs after the supersede's row lock.
     //
-    // The disjunction is the exact complement, within that shared candidate
-    // scope, of the three refusals `staleCondition` applies -- one arm each, in
-    // the same order. Adding a fourth protection to the supersede without a
-    // fourth arm here re-opens the gap this block exists to close.
+    // Deliberately NOT scoped to `executionRunId` bound, unlike the supersede's
+    // candidate set. That scope mirrors the unique index and answers "may this
+    // row be cancelled?"; this answers "is there a row to coalesce onto?". A run
+    // is bound only while it holds the lock, and a queued retry releases it
+    // (heartbeat enqueue, BLO-21621), so an unbound row is the normal production
+    // shape, and the supersede never cancels one. The invariant is inclusion,
+    // not equality: every row the supersede refuses is gated here, and so is
+    // every protected row it was never eligible to cancel.
+    //
+    // One arm per refusal `staleCondition` applies, in the same order. Adding a
+    // fourth protection to the supersede without a fourth arm here re-opens the
+    // gap this block exists to close.
     const [protectedRow] = await executor
       .select({ issue: issues })
       .from(issues)
       .where(
         and(
           issueCondition,
-          isNotNull(issues.executionRunId),
           or(
             inArray(issues.status, SUPERSEDE_PROTECTED_STATUSES),
             hasUnresolvedBlockerEdge(),
