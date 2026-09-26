@@ -657,6 +657,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: pnpm run test:browserslist-security-override
 
+      - name: Test agent-health preflight fixtures
+        if: ${{ !cancelled() }}
+        run: pnpm run test:agent-health-preflight
+
       - name: Test multer security override
         if: ${{ !cancelled() }}
         run: pnpm run test:multer-security-override
