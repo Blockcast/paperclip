@@ -1172,7 +1172,7 @@ test("PaperclipExternalRuntimeReservationStrandMetricsRefreshFailed exposes a st
   );
 });
 
-test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own error boundary (PEN-3305)", () => {
+test("PaperclipAgentStartLockWedged pages on the abort boundary, so firing means the abort did not land (PEN-3305/PEN-3328)", () => {
   const rendered = renderChart([
     "--show-only",
     "templates/prometheusrule.yaml",
@@ -1214,15 +1214,25 @@ test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own
   const [, heldThreshold] = expr.match(/> (\d+)$/) ?? [];
   // The gauge is emitted only for locks held at scrape time (reset-then-set,
   // no zero-fill), so any positive threshold is silent in steady state. It is
-  // pinned to 300 on purpose: that is LOCK_HELD_ERROR_MS in
-  // server/src/services/agent-start-lock.ts, the point at which the code
-  // itself escalates to logger.error and says dispatch "has stopped". If the
-  // constant moves and this does not, the page and the log line disagree
-  // about when an agent is considered wedged.
+  // pinned to LOCK_ABORT_MS (14400s / 4h) in
+  // server/src/services/agent-start-lock.ts, NOT to LOCK_HELD_ERROR_MS (300s),
+  // and that distinction is the whole meaning of the page: the abort fires at
+  // this boundary and releases the lock, so a series still present afterwards
+  // means the abort was requested and did NOT land. If the constant moves and
+  // this does not, the page stops describing that state.
+  //
+  // ⚠️ PEN-3328: this was "300", tracking LOCK_HELD_ERROR_MS. Do not revert it
+  // on the reasoning that the page and the escalated log should share one
+  // number of record. Over the 14 days to 2026-09-25, 21 agents held past 300s
+  // (peak 8073s) and this alert reached `firing` for 20 of them -- twenty
+  // critical pages, all of which resolved on their own, routed by the runbook
+  // to pod replacement. A log line is an attention threshold where being early
+  // is free; this is a page that routes to a destructive remedy. They answer
+  // different questions and no longer share a number.
   assert.equal(
     heldThreshold,
-    "300",
-    "hold threshold must track LOCK_HELD_ERROR_MS (300s) in agent-start-lock.ts",
+    "14400",
+    "hold threshold must track LOCK_ABORT_MS (14400s) in agent-start-lock.ts, not the LOCK_HELD_ERROR_MS log budget",
   );
 
   const [, forWindow] = block.match(/\n\s+for: (.+)\n/) ?? [];
@@ -1232,24 +1242,49 @@ test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own
     : /^(\d+)h$/.test(forWindow.trim())
       ? Number(forWindow.trim().slice(0, -1)) * 60
       : null;
-  // Scrape-flap tolerance only; the ageing lives in the threshold. Same
-  // stacking trap as PaperclipQueuedRunStranded -- threshold and `for:` are
-  // not independent, so check the sum, not each half.
+  // NOT scrape-flap tolerance, despite the sibling `*For` values that are.
+  // Same stacking trap as PaperclipQueuedRunStranded -- threshold and `for:`
+  // are not independent, and the sum is what decides whether this page means
+  // "the abort did not land" -- but since PEN-3328 this window carries a
+  // second, load-bearing job: it is the abort's LANDING BUDGET. This alert and
+  // PaperclipAgentStartLockAborted sit on the same 4h boundary, and a landed
+  // abort deletes the held series inside a scrape, so this window is the only
+  // thing that keeps a recovered section from paging `critical`.
+  //
+  // ⚠️ Hence a FLOOR, not just a ceiling. The threshold above is pinned to a
+  // measurement (> 8073); this window has no equivalent measurement available,
+  // because abort-to-release latency cannot be observed until aborts exist in
+  // production -- so the floor is the shipped value and the burden is on any
+  // edit that lowers it. Anything that delays release past the window
+  // (cancellation reaching a fresh connection, a statement tearing down, an
+  // unlucky scrape) reintroduces the false-page class PEN-3328 removed.
+  // Raising it is safe; lowering it needs evidence, not the "free flap
+  // tolerance" reading that values.yaml used to invite.
   assert.ok(
-    forMinutes !== null && forMinutes > 0 && forMinutes <= 10,
-    `for window ${forWindow} must be a short scrape-flap tolerance (<= 10m)`,
+    forMinutes !== null && forMinutes >= 5 && forMinutes <= 10,
+    `for window ${forWindow} must be the abort's landing budget (>= 5m), not a bare scrape-flap tolerance, `
+      + "and must stay <= 10m so the page still lands promptly. A shorter window pages `critical` on a "
+      + "section whose abort landed just after the window opened, which is the false-page class PEN-3328 removed.",
   );
   assert.ok(
-    Number(heldThreshold) + forMinutes * 60 <= 900,
-    `hold threshold ${heldThreshold}s plus for-window ${forWindow} stacks to `
-      + `${Number(heldThreshold) + forMinutes * 60}s; a wedge must page inside 15m, `
-      + "not on the 6-19h timescale the incident actually ran",
+    Number(heldThreshold) > 8073,
+    `hold threshold ${heldThreshold}s does not clear the observed settling tail (8073s, PEN-3328). `
+      + "A critical page below that fires on holds that resolve themselves and routes the responder "
+      + "to pod replacement; `for:` cannot rescue it, because a for-window is a continuity requirement "
+      + "and not a magnitude one.",
   );
 
-  // Severity, not decoration: the hold never self-heals (the lock has no
-  // timeout, by design), so this is a per-agent dispatch outage that lasts
-  // until the process is replaced. A warning would reproduce the original
-  // failure, which was nobody being paged.
+  // Severity, not decoration: past the abort boundary the section's own
+  // cancellation has already been requested and failed to release the lock,
+  // so what remains is a per-agent dispatch outage lasting until the process
+  // is replaced. A warning would reproduce the original failure, which was
+  // nobody being paged.
+  //
+  // ⚠️ That is only true BECAUSE the threshold is the abort boundary. Below
+  // it the hold usually settles by itself -- PEN-3328 measured 21 agents past
+  // 300s over 14 days, peak 8073s, all self-resolved -- and a critical page
+  // there produced twenty false pages routed to pod replacement. Severity and
+  // threshold move together or not at all.
   assert.match(
     block,
     /\n\s+severity: critical\n/,
@@ -1259,6 +1294,73 @@ test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own
     block,
     /runbook_url: "[^"]*runbooks\/queued-run-stranded\.md#agent-start-lock-wedged-pen-3305"/,
     "wedged-start-lock alert must link the runbook section from its annotation",
+  );
+});
+
+test("PaperclipAgentStartLockAborted reports the self-healed wedge the held gauge cannot (PEN-3328)", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  assert.match(rendered, /alert: PaperclipAgentStartLockAborted/);
+  const [, expr] = rendered.match(
+    /alert: PaperclipAgentStartLockAborted[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.ok(expr, "aborted-start-lock alert must render an expr");
+
+  // A counter over a window, NOT the held gauge. This is the whole reason the
+  // rule exists: PEN-3328 cancels a wedged section at the 4h abort boundary,
+  // which is the same boundary PaperclipAgentStartLockWedged thresholds on,
+  // and the held gauge is emitted only for locks held at scrape time -- so a
+  // successful cancellation deletes the series inside the wedge alert's `for:`
+  // window and it never fires. Without a durable counter the incident is
+  // invisible exactly because it was handled.
+  // If a later reader "simplifies" this onto the gauge, that blind spot returns.
+  //
+  // ⚠️ This assertion pins the rendered STRING and cannot see the semantics it
+  // depends on. `increase()` reads `last - first`, so the expression is correct
+  // only because `seedAgentStartLockAbortedSeries`
+  // (server/src/services/metrics.ts, called from `runExclusively`) publishes
+  // the per-agent series at 0 when the lock is taken. Unseeded, the series is
+  // born at 1 on the first abort and `increase` evaluates to 0 forever, so this
+  // alert would never fire while this test stayed green. The test that actually
+  // discriminates lives beside the seed, in
+  // server/src/__tests__/agent-start-lock-abort.test.ts ("publishes the abort
+  // counter at 0 when the lock is taken"). Change either side and check both.
+  assert.match(
+    expr,
+    /increase\(paperclip_agent_start_lock_aborted_total\[1h\]\) > 0/,
+    "aborted alert must read the durable counter over a window, not the transient held gauge",
+  );
+
+  // Warning, not critical, and this is the deliberate split from the wedge
+  // alert beside it. By the time this fires the lock has been released and the
+  // agent is dispatching again, so waking someone is wrong -- but the thing
+  // that blocked the section for four hours has NOT been fixed, so staying
+  // silent is also wrong.
+  assert.match(
+    rendered,
+    /alert: PaperclipAgentStartLockAborted[\s\S]*?\n\s+severity: warning\n/,
+    "a self-healed dispatch wedge must warn rather than page",
+  );
+  // The anchor is load-bearing, not cosmetic. The wedged section runs "do NOT
+  // clear the agent as healthy" and ends in pod replacement; the aborted
+  // section opens "Dispatch has already resumed and no queued runs were lost".
+  // Linking the wedged anchor here would send a responder to replace a pod that
+  // already recovered -- the exact work this alert's description calls
+  // unnecessary. Pinned per-alert so the two cannot silently converge again.
+  assert.match(
+    rendered,
+    /alert: PaperclipAgentStartLockAborted[\s\S]*?runbook_url: "[^"]*runbooks\/queued-run-stranded\.md#agent-start-lock-aborted-pen-3328"/,
+    "aborted-start-lock alert must link its OWN runbook section, not the wedged one",
+  );
+  assert.match(
+    rendered,
+    /alert: PaperclipAgentStartLockWedged[\s\S]*?runbook_url: "[^"]*runbooks\/queued-run-stranded\.md#agent-start-lock-wedged-pen-3305"/,
+    "wedged-start-lock alert must keep linking the wedged runbook section",
   );
 });
 

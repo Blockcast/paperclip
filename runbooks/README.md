@@ -67,13 +67,26 @@ platform cannot resolve automatically. Each runbook should be:
 - [`queued-run-stranded.md#agent-start-lock-wedged-pen-3305`](queued-run-stranded.md#agent-start-lock-wedged-pen-3305) —
   an agent has held its per-agent dispatch start lock past the point the code
   itself calls dispatch stopped. This is the *cause* side of the alert above:
-  the lock has no timeout by design, so the agent dispatches nothing until the
-  section settles or the process is replaced, while `status: idle` /
-  `errorReason: null` / `orgChainHealth: healthy` all read normal. Trigger:
-  alert `PaperclipAgentStartLockWedged`, or
-  `max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 300`
+  since PEN-3328 the section is cancellable and aborts at 4h, but cancellation
+  only reaches awaits that observe the signal, so a section wedged on anything
+  else still dispatches nothing until it settles or the process is replaced,
+  while `status: idle` / `errorReason: null` / `orgChainHealth: healthy` all
+  read normal. Firing therefore means the abort was requested and did **not**
+  land. Trigger: alert `PaperclipAgentStartLockWedged`, or
+  `max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 14400`
   (threshold quoted for readability; `values.yaml`
-  `prometheusRule.agentStartLockHeldSeconds` is authoritative).
+  `prometheusRule.agentStartLockHeldSeconds` is authoritative). The self-healed
+  case — abort requested and landed — is the entry below instead.
+- [`queued-run-stranded.md#agent-start-lock-aborted-pen-3328`](queued-run-stranded.md#agent-start-lock-aborted-pen-3328) —
+  the same fault as above with the opposite outcome: the section overran the 4h
+  abort budget, cancellation **landed**, the lock released and dispatch has
+  already resumed. Deliberately `warning` and a post-mortem — nobody needs
+  waking, and the wedged runbook's pod replacement is exactly the wrong action
+  here. It needs its own rule because the held gauge is emitted only while a
+  lock is held, so a successful cancellation deletes the series and the handled
+  incident would otherwise be invisible precisely because it was handled.
+  Trigger: alert `PaperclipAgentStartLockAborted`, or
+  `increase(paperclip_agent_start_lock_aborted_total[1h]) > 0`.
 - [`queued-run-stranded.md#overdue-scheduled-retry-blo-22094`](queued-run-stranded.md#overdue-scheduled-retry-blo-22094) —
   a `heartbeat_runs` row parked at `status='scheduled_retry'` past its own due
   time, never promoted: the retry-promotion sweep either wedged or is

@@ -485,11 +485,36 @@ export const EXTERNAL_RUNTIME_RESERVATION_STRAND_METRICS_REFRESH_SUCCESS_METRIC 
  *
  * Emitted only for agents whose lock is held right now, matching the
  * convention of the per-agent backlog gauges: an absent series means no lock
- * is held, not a zero-length hold. A healthy section is sub-second, so this is
- * near-empty in normal operation and anything above a few seconds is real —
- * `max by (agent_id) (...)` over it is the whole detector.
+ * is held, not a zero-length hold. Holds of minutes to a couple of hours are
+ * routine and release on their own, so this is NOT near-empty in normal
+ * operation and "anything above a few seconds" is not the detector — the
+ * detector is `max by (agent_id) (...)` past the 4h abort boundary, which is
+ * where `PaperclipAgentStartLockWedged` sits.
  */
 export const AGENT_START_LOCK_HELD_SECONDS_METRIC = "paperclip_agent_start_lock_held_seconds";
+/**
+ * Dispatch sections cancelled for overrunning the start-lock budget (PEN-3328).
+ *
+ * The companion to {@link AGENT_START_LOCK_HELD_SECONDS_METRIC}, and it exists
+ * because that gauge cannot answer this question. A cancelled section releases
+ * its lock, so its series *disappears* — the gauge is how you see a wedge while
+ * it is happening, and this is how you see that it happened at all. Without it
+ * an abort at 03:00 leaves no durable trace anywhere Prometheus can reach.
+ *
+ * Deliberately unlabelled beyond the agent, and in particular it does NOT carry
+ * a "did the cancellation land" label. The two are different shapes: an abort
+ * is an event and belongs on a counter, while "still wedged afterwards" is a
+ * *condition* and is already exactly what the gauge reports — a series that
+ * stays high past the budget instead of vanishing. Splitting the counter would
+ * make every recovered abort also increment the alerting series.
+ *
+ * Any non-zero rate is a defect worth chasing. Not because a healthy section is
+ * fast — holds of minutes to a couple of hours are routine and settle on their
+ * own (worst measured: 8073s) — but because the abort budget is four hours,
+ * set deliberately to clear that settling tail. Reaching it means something
+ * inside dispatch stopped responding rather than merely ran slow.
+ */
+export const AGENT_START_LOCK_ABORTED_METRIC = "paperclip_agent_start_lock_aborted_total";
 /**
  * Overdue-parked-retry age gauge (BLO-22094). {@link QUEUED_RUN_OLDEST_AGE_METRIC}
  * deliberately excludes `status='scheduled_retry'` rows -- that exclusion is
@@ -2301,6 +2326,7 @@ let orphanedRuntimeResourceMetricsRefreshSuccess: Gauge | null = null;
 let externalRuntimeReservationStrandedOldestAge: Gauge<"agent_id"> | null = null;
 let externalRuntimeReservationStrandMetricsRefreshSuccess: Gauge | null = null;
 let agentStartLockHeldSeconds: Gauge<"agent_id"> | null = null;
+let agentStartLockAbortedTotal: Counter<"agent_id"> | null = null;
 let processLostTotal: Counter<"adapter" | "error_bucket" | "classification"> | null = null;
 let externalLifecycleRunningRuns: Gauge<"adapter"> | null = null;
 let externalLifecycleRunSilenceGap: Histogram<"adapter" | "status"> | null = null;
@@ -2457,6 +2483,7 @@ function ensureRegistry(): {
   externalRuntimeReservationStrandedOldestAgeGauge: Gauge<"agent_id">;
   externalRuntimeReservationStrandMetricsRefreshSuccessGauge: Gauge;
   agentStartLockHeldSecondsGauge: Gauge<"agent_id">;
+  agentStartLockAbortedTotalCounter: Counter<"agent_id">;
   prReviewQueueWaitHistogram: Histogram;
   authRequestCounter: Counter<"operation" | "outcome">;
   gbrainRecallCounter: Counter<"status">;
@@ -2498,6 +2525,7 @@ function ensureRegistry(): {
     || !externalRuntimeReservationStrandedOldestAge
     || !externalRuntimeReservationStrandMetricsRefreshSuccess
     || !agentStartLockHeldSeconds
+    || !agentStartLockAbortedTotal
     || !processLostTotal
     || !externalLifecycleRunningRuns
     || !externalLifecycleRunSilenceGap
@@ -2736,11 +2764,33 @@ function ensureRegistry(): {
       name: AGENT_START_LOCK_HELD_SECONDS_METRIC,
       help:
         "Seconds the per-agent queued-run dispatch start lock has currently been held (PEN-3305). "
-        + "withAgentStartLock has no timeout by design, so a section that never settles holds its "
-        + "agent's lock forever and that agent silently stops dispatching -- while still reading "
+        + "A section that never settles holds its agent's lock until the PEN-3328 abort fires at 4h "
+        + "and that agent silently stops dispatching in the meantime -- while still reading "
         + "status=idle, errorReason=null, orgChainHealth=healthy. Series exist only while a lock is "
-        + "held, so absence means no hold, not a zero-length one. A healthy section is sub-second; "
-        + "sustained tens of seconds is a wedge. Per-pod, because the lock is per-process.",
+        + "held, so absence means no hold, not a zero-length one. Holds of minutes to a couple of "
+        + "hours are routine and settle on their own (worst measured 8073s), so this is NOT "
+        + "near-empty in normal operation and tens of seconds is not a wedge; past the 4h abort "
+        + "boundary is. Per-pod, because the lock is per-process.",
+      labelNames: ["agent_id"],
+      registers: [registry],
+    });
+    agentStartLockAbortedTotal = new Counter({
+      name: AGENT_START_LOCK_ABORTED_METRIC,
+      help:
+        "Queued-run dispatch sections cancelled for holding the per-agent start lock past its 4h "
+        + "abort budget (PEN-3328). Counterpart to " + AGENT_START_LOCK_HELD_SECONDS_METRIC + ", which "
+        + "cannot answer this: a cancelled section releases its lock, so its gauge series "
+        + "disappears and the event leaves no durable trace. The budget clears the observed "
+        + "settling tail (worst hold that released on its own: 8073s), so any non-zero rate means "
+        + "something inside dispatch stopped responding rather than merely ran slow. This counts the "
+        + "abort, not its outcome: if the cancellation did NOT land, the agent is still wedged and "
+        + "the gauge above keeps reporting it -- that condition is the gauge's job, not a label "
+        + "here. Per-pod, because the lock is per-process. Seeded at 0 by "
+        + "seedAgentStartLockAbortedSeries when an agent takes the lock, so a series exists before "
+        + "its first event and the first abort reads as a 0->1 transition: `increase()` takes "
+        + "last-first, so a series born at 1 would evaluate to 0 forever and the alert would never "
+        + "fire. A 0 here therefore means \"this agent dispatched on this pod and was never "
+        + "aborted\", which is the healthy reading, NOT a missing metric.",
       labelNames: ["agent_id"],
       registers: [registry],
     });
@@ -3467,6 +3517,7 @@ function ensureRegistry(): {
     externalRuntimeReservationStrandMetricsRefreshSuccessGauge:
       externalRuntimeReservationStrandMetricsRefreshSuccess,
     agentStartLockHeldSecondsGauge: agentStartLockHeldSeconds,
+    agentStartLockAbortedTotalCounter: agentStartLockAbortedTotal,
     processLostTotalCounter: processLostTotal,
     externalLifecycleRunningRunsGauge: externalLifecycleRunningRuns,
     externalLifecycleRunSilenceGapHistogram: externalLifecycleRunSilenceGap,
@@ -3976,6 +4027,57 @@ export function setDbPoolStats(stats: DbPoolStats): void {
   dbPoolConnectionsGauge.set({ state: "active" }, stats.active);
   dbPoolConnectionsGauge.set({ state: "connecting" }, stats.connecting);
   dbPoolWaitingQueriesGauge.set(stats.waiting);
+}
+
+/**
+ * Count one dispatch section cancelled for overrunning the start-lock budget
+ * (PEN-3328).
+ *
+ * Incremented from the lock itself rather than from a scrape-path refresh: an
+ * abort is an *event*, and by the time the next scrape arrives the section has
+ * released its lock and left nothing behind to sample. Whether the cancellation
+ * then landed is not recorded here — see the metric's doc comment; a
+ * cancellation that did not land leaves the gauge high, which is the reading
+ * that already means "this agent is still not dispatching".
+ */
+export function recordAgentStartLockAborted(agentId: string): void {
+  ensureRegistry().agentStartLockAbortedTotalCounter.inc({ agent_id: agentId });
+}
+
+/**
+ * Create this agent's aborted-counter series at 0 when it takes the start lock,
+ * before any abort has happened (PEN-3328 review).
+ *
+ * Load-bearing for PaperclipAgentStartLockAborted, not cosmetic. prom-client
+ * renders no series at all for a labelled metric that has never been written
+ * (confirmed against the pinned 15.1.3), so without this seed the series is
+ * BORN AT 1 on the first abort. `increase()` needs two samples in the range and
+ * takes `last - first`: at the first evaluation after birth there is one sample
+ * and the element is dropped, and at every later one the samples read
+ * `[1, 1, …]`, so the result is 0. Prometheus's counter-birth extrapolation in
+ * `extrapolatedRate` is gated on `resultValue > 0` and therefore does not
+ * rescue it. `increase(...[1h]) > 0` would be permanently false for the FIRST
+ * abort of any `agent_id` on any pod — and since the 4h budget is ~1.8x the
+ * worst hold ever measured settling on its own, and a deploy resets the series,
+ * in practice every real abort is a first abort. The alert would have been
+ * silent for all of them, leaving exactly the self-healed-wedge blind spot it
+ * was added to close.
+ *
+ * Seeded at ACQUISITION rather than at process start because that is what keeps
+ * the `agent_id` label the alert's annotation reads — a boot-time seed has no
+ * agent to name. The gap between this 0 and any increment is LOCK_ABORT_MS (4h),
+ * thousands of scrape intervals, so the 0 is always sampled long before the 1;
+ * the seed could not be squeezed into a single scrape even deliberately.
+ * Cardinality is one series per agent per pod, the same bound the held gauge
+ * already accepts while locks are held.
+ *
+ * Same discipline, and for the same reason, as ALERTING_GITHUB_SUPPRESSION_CAUSES
+ * and the unlabeled `heartbeatTimerChecked` above: a series an alert *selects*
+ * must exist before its first event, because absent-vs-zero is not a
+ * distinction the query language can make after the fact.
+ */
+export function seedAgentStartLockAbortedSeries(agentId: string): void {
+  ensureRegistry().agentStartLockAbortedTotalCounter.inc({ agent_id: agentId }, 0);
 }
 
 /**
@@ -5014,6 +5116,7 @@ export function __resetMetricsForTest(): void {
   externalRuntimeReservationStrandedOldestAge = null;
   externalRuntimeReservationStrandMetricsRefreshSuccess = null;
   agentStartLockHeldSeconds = null;
+  agentStartLockAbortedTotal = null;
   processLostTotal = null;
   externalLifecycleRunningRuns = null;
   externalLifecycleRunSilenceGap = null;

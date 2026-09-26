@@ -844,15 +844,21 @@ spec:
       rules:
         - alert: PaperclipAgentStartLockWedged
           # PEN-3305. `withAgentStartLock` serializes queued-run dispatch per
-          # agent and has no timeout, no TTL and no owner-liveness check --
-          # deliberately, because the defect BLO-20396 removed was a timeout
-          # that let a waiter run ALONGSIDE the holder. The cost of that
-          # choice is that a section which never settles holds its agent's
-          # lock for the life of the process, and the agent then dispatches
-          # nothing while presenting as `status: idle` / `errorReason: null` /
-          # `orgChainHealth: healthy`. Measured 2026-09-15/16: five agents
-          # across two companies dark for 6-19 h, ~70 runs stuck in `queued`,
-          # ended only by a pod replacement on an identical image.
+          # agent. It has no TTL and no owner-liveness check, and it never
+          # stops awaiting `fn` -- deliberately, because the defect BLO-20396
+          # removed was a timeout that let a waiter run ALONGSIDE the holder.
+          # Until PEN-3328 it had no bound of any kind, so a section which
+          # never settled held its agent's lock for the life of the process,
+          # and the agent then dispatched nothing while presenting as
+          # `status: idle` / `errorReason: null` / `orgChainHealth: healthy`.
+          # Measured 2026-09-15/16: five agents across two companies dark for
+          # 6-19 h, ~70 runs stuck in `queued`, ended only by a pod replacement
+          # on an identical image.
+          #
+          # PEN-3328 added the bound that was missing: the section is now
+          # cancellable, so at LOCK_ABORT_MS `fn` rejects and the lock is
+          # released. That does not make this rule redundant -- it is what
+          # gives it a meaning worth paging on (see the threshold note below).
           #
           # This is the reported half of that. The gauge alone only closed the
           # "nobody could have looked" gap; the incident's actual failure was
@@ -869,27 +875,126 @@ spec:
           # That absence is deliberate; do not "fix" it by adding an
           # `and on(instance) (...)` join to a series that does not exist.
           #
-          # Silent in steady state without a zero-fill: the gauge is emitted
-          # only for locks held RIGHT NOW (`reset()` then set), so an agent
-          # with no held lock has no series rather than a 0, and a healthy
-          # section is sub-second.
+          # No zero-fill, deliberately: the gauge is emitted only for locks
+          # held RIGHT NOW (`reset()` then set), so an agent with no held lock
+          # has no series rather than a 0. That is what keeps any positive
+          # threshold quiet for an IDLE agent, and it is the whole of the
+          # argument -- it says nothing about how long a held lock runs.
+          # Holds of minutes to a couple of hours are routine and release on
+          # their own (see the ⚠️ below), so this gauge is NOT near-empty in
+          # normal operation and "anything above a few seconds" is not the
+          # detector. server/src/services/metrics.ts states the same of the
+          # same gauge; the two must not drift apart.
           #
-          # Threshold is LOCK_HELD_ERROR_MS (300s) from agent-start-lock.ts --
-          # the same boundary at which the code itself stops calling the hold
-          # "slow" and logs "queued-run dispatch for this agent has stopped".
-          # Keeping one number of record means the log line an operator finds
-          # and the alert that woke them agree. `for:` stacks on top as
-          # scrape-flap tolerance only, so the first real-clock fire is at
-          # 300 + 300 = 600s of continuous hold -- three orders of magnitude
-          # inside the 19h this alert exists to have caught.
+          # Threshold is LOCK_ABORT_MS (14400s / 4h) from agent-start-lock.ts,
+          # NOT the LOCK_HELD_ERROR_MS (300s) log budget. Pinning it there is
+          # what makes this page mean something a responder can act on: the
+          # abort fires at that boundary and releases the lock, so the gauge is
+          # gone within a scrape if it lands. A series that is STILL present
+          # afterwards therefore means the abort was requested and did not
+          # land, which is the one state in this family that does not
+          # self-heal and the only one worth waking someone for.
+          #
+          # ⚠️ Do NOT move this back onto LOCK_HELD_ERROR_MS to "keep one
+          # number of record". That was the original PEN-3305 design and the
+          # gauge it shipped refutes the premise behind it. Over the 14 days to
+          # 2026-09-25, 21 agents held past 300s (peak 8073s / 2h14m) and this
+          # alert reached `firing` for 20 of them -- twenty critical pages, all
+          # of which resolved on their own with no pod recreation and no
+          # container restart. At 300s this rule paged on the normal case and
+          # sent the responder to Step 4 pod replacement. An attention
+          # threshold (a log line; being early is free) and a page that routes
+          # to a destructive remedy are different questions and no longer share
+          # a number; the `error` log still escalates at 300s.
+          #
+          # `for:` stacks on top, so the first real-clock fire is at
+          # 14400 + 300 = 14700s (4h05m). That window is NOT mere scrape-flap
+          # tolerance any more: since this rule and PaperclipAgentStartLockAborted
+          # below share the same 4h boundary, the window is the abort's LANDING
+          # BUDGET and the only thing separating the two. A landed abort deletes
+          # the series inside a scrape, so this window never completes and only
+          # the UNLANDED abort pages. Shortening it therefore does not merely
+          # reduce flap tolerance -- it pages `critical` on a section that
+          # recovered, the exact false-page class PEN-3328 exists to remove.
+          # prometheus-rule.test.mjs floors it for that reason.
+          #
+          # The consequence of a hold is separately visible the whole time via
+          # PaperclipQueuedRunStranded -- but visible is not paged: that alert
+          # is `severity: warning` at 1440s + `for: 5m` (~29m), and it is gated
+          # on `paperclip_queued_run_age_metrics_refresh_success == 1`, a
+          # dependency this gauge deliberately does not have. Stated honestly,
+          # the net change for a genuinely wedged agent is: before, `critical`
+          # at 600s; after, `warning` at ~29m and `critical` at 4h05m. That
+          # four-hour delay on a true wedge is the accepted cost of not paging
+          # on the settling tail -- twenty measured false pages against one
+          # delayed true positive.
           expr: max by (agent_id) (paperclip_agent_start_lock_held_seconds) > {{ .Values.prometheusRule.agentStartLockHeldSeconds }}
           for: {{ .Values.prometheusRule.agentStartLockHeldFor }}
           labels:
             severity: critical
           annotations:
-            summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} has held its start lock for longer than {{ .Values.prometheusRule.agentStartLockHeldSeconds }}s and has stopped dispatching"
-            description: "Agent {{`{{ $labels.agent_id }}`}} has held its per-agent start lock for {{`{{ $value | printf \"%.0f\" }}`}}s (PEN-3305). Queued-run dispatch for THIS agent is stopped for as long as the hold lasts, and it does not self-heal: the lock has no timeout by design, so the section must settle or the process must be replaced. The agent will still read `status: idle` / `errorReason: null` / `orgChainHealth: healthy` and its runs will sit in `queued` -- do NOT clear that as healthy. Correlate with the `agent start lock held far past its budget` error log (same agentId, re-logged every 5m) and with PaperclipQueuedRunStranded for the same agent_id, which fires on the consequence rather than the cause. See the runbook for the pool-exhaustion-versus-lock split; note that a pod restart clearing it does NOT discriminate between the two, because lockIssueOwnership is pg_advisory_xact_lock and dies with the connection."
+            summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} held its start lock past the {{ .Values.prometheusRule.agentStartLockHeldSeconds }}s abort boundary and the abort did not land"
+            description: "Agent {{`{{ $labels.agent_id }}`}} has held its per-agent start lock for {{`{{ $value | printf \"%.0f\" }}`}}s (PEN-3305/PEN-3328). Queued-run dispatch for THIS agent is stopped for as long as the hold lasts. Past this threshold the section's abort signal has ALREADY fired and failed to release the lock -- cancellation only reaches awaits that observe the signal, so a section wedged on something else (an unbounded socket, a promise that never settles) survives it. That residue does not self-heal: the section must settle or the process must be replaced. The agent will still read `status: idle` / `errorReason: null` / `orgChainHealth: healthy` and its runs will sit in `queued` -- do NOT clear that as healthy. Confirm the abort really did not land before replacing anything: `dispatchHealth` on the agent row reads `stalled` for requested-but-unlanded versus `aborted` for landed, and must be read on the WORKER pod (the api tier never holds a lock and always reports `null`). Correlate with the `agent start lock held past its abort budget` error log for the same agentId, and with PaperclipQueuedRunStranded, which fires on the consequence rather than the cause. A hold under this threshold is NOT this alert and is usually a slow section that settles by itself -- 21 agents held past 300s in the 14 days to 2026-09-25, peak 8073s, all self-resolved. See the runbook for the pool-exhaustion-versus-lock split; note that a pod restart clearing it does NOT discriminate between the two, because lockIssueOwnership is pg_advisory_xact_lock and dies with the connection."
             runbook_url: {{ .Values.prometheusRule.agentStartLockWedgedRunbookUrl | quote }}
+        - alert: PaperclipAgentStartLockAborted
+          # PEN-3328. The companion to PaperclipAgentStartLockWedged above, and
+          # the two are deliberately not redundant -- they fire on opposite
+          # outcomes of the same fault.
+          #
+          # PEN-3328 made the dispatch critical section cancellable, so a
+          # wedged section now rejects at LOCK_ABORT_MS and releases its lock
+          # instead of holding it for the life of the process. That is a
+          # self-heal, which is exactly why it needs its own rule: the wedge
+          # alert above reads a gauge that is emitted ONLY for locks held right
+          # now, so the moment cancellation works the series disappears. Both
+          # rules sit on the same 4h boundary, and the wedge alert's `for: 5m`
+          # is what separates them -- a landed abort deletes the series inside
+          # a scrape, so the wedge alert's window never completes and only the
+          # UNLANDED abort pages. The handled incident would otherwise be
+          # invisible precisely because it was handled.
+          #
+          # A counter is the right shape for that: it survives the release, so
+          # the event stays answerable after the fact. `increase(...[1h]) > 0`
+          # rather than a rate threshold because ONE abort is already the
+          # signal -- reaching the abort boundary means a section outran the
+          # worst hold ever measured settling on its own (8073s) by ~1.8x, so
+          # it is not the slow-but-healthy case the 300s log budget catches.
+          # The cancellation bounded the damage; it did not fix whatever hung,
+          # and that cause is still there.
+          #
+          # `warning`, not `critical`, and the split is the point: by the time
+          # this fires the agent is dispatching again and queued runs were not
+          # lost, so nobody needs waking. Sustained or repeating aborts are the
+          # thing to chase, and `increase` over an hour surfaces that without a
+          # second rule.
+          # ⚠️ This expression depends on a SERVER-SIDE seed and is wrong
+          # without it. `increase()` takes `last - first` over the range, so it
+          # can only read a difference between two samples -- it cannot read a
+          # value. prom-client renders no series at all for a labelled metric
+          # that was never written, so an unseeded
+          # paperclip_agent_start_lock_aborted_total{agent_id} would be BORN AT
+          # 1 on the first abort: one sample at the first evaluation (element
+          # dropped), then `[1, 1, ...]` forever, giving 0. Prometheus's
+          # counter-birth correction in `extrapolatedRate` is gated on
+          # `resultValue > 0`, so it does not apply. `0 > 0` is false, and since
+          # the 4h budget is ~1.8x the worst hold ever measured settling on its
+          # own -- and a deploy resets the series -- every real abort is in
+          # practice a FIRST abort. The alert would be silent for all of them.
+          # `seedAgentStartLockAbortedSeries` in server/src/services/metrics.ts,
+          # called from `runExclusively` when the lock is taken, is what makes
+          # the first abort a 0->1 transition. If that seed is removed this
+          # alert stops firing SILENTLY -- it does not error, it just never
+          # matches. Do not "simplify" it to a bare `> 0` on the counter either:
+          # an absolute counter value latches for the life of the process and
+          # would page forever after one abort.
+          expr: increase(paperclip_agent_start_lock_aborted_total[{{ .Values.prometheusRule.agentStartLockAbortedWindow }}]) > 0
+          for: {{ .Values.prometheusRule.agentStartLockAbortedFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} had a queued-run dispatch section cancelled after overrunning its budget"
+            description: "Agent {{`{{ $labels.agent_id }}`}} held its per-agent start lock past its abort budget and the section was cancelled (PEN-3328), so the lock released and dispatch has RESUMED -- queued runs were not lost and this is not an outage. That budget is LOCK_ABORT_MS in server/src/services/agent-start-lock.ts: compiled in, NOT the chart's agentStartLockHeldSeconds, which this alert does not threshold on -- read the constant rather than a rendered number. Treat it as evidence of the underlying hang, not of the recovery: the section outran the worst hold ever observed settling on its own (8073s) by ~1.8x, so this is not the slow-but-healthy case. Correlate with the `agent start lock held past its abort budget` error log for the same agentId, and check `dispatchHealth` on the agent row (worker tier only) for the post-mortem. If this repeats for one agent_id, the cancellation is masking a persistent condition -- most likely pool exhaustion or a circular advisory-lock wait in lockIssueOwnership -- and that is what to fix. See the runbook."
+            runbook_url: {{ .Values.prometheusRule.agentStartLockAbortedRunbookUrl | quote }}
     - name: paperclip-pr-review-queue
       rules:
         - alert: PaperclipPrReviewQueueWaitSaturated

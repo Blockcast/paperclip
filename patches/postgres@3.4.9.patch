@@ -43,6 +43,37 @@ index ffbe7aef075d6037c540cbd5e8f7e298d4345cc3..af2f3aa8e75697602375b0d6ba26f6ad
      reserve,
      listen,
      begin,
+diff --git a/cf/src/query.js b/cf/src/query.js
+index 0d44a15cd9e42beaf11d4be6ccde60223e09508a..74e2d05eeabcd700df1e7ef7c56d992b05b167b5 100644
+--- a/cf/src/query.js
++++ b/cf/src/query.js
+@@ -50,7 +50,25 @@ export class Query extends Promise {
+   }
+ 
+   cancel() {
+-    return this.canceller && (this.canceller(this), this.canceller = null)
++    // PEN-3328: return the canceller's promise instead of discarding it.
++    // `cancel()` on an EXECUTING statement dials a fresh connection to send a
++    // CancelRequest, and that dial rejects asynchronously when it fails --
++    // connection.js `cancel` has both `catch (error) { reject(error) }` around
++    // `connect()` and `socket.once('error', reject)`. Upstream's comma
++    // expression evaluated that promise and threw the reference away, so the
++    // rejection could never reach a handler and surfaced as an
++    // unhandledRejection; Paperclip's process crash guard turns one of those
++    // into a deliberate worker exit, so a failed cancel dial took down every
++    // agent's in-flight dispatch. Returning it lets the caller attach a handler
++    // (see server/src/services/agent-start-lock-db.ts `cancelQuery`).
++    //
++    // The self-disarm is preserved exactly, including its order: the canceller
++    // is invoked first and nulled immediately after, so a second `cancel()` is
++    // still a no-op and returns undefined.
++    if (!this.canceller) return
++    const cancelled = this.canceller(this)
++    this.canceller = null
++    return cancelled
+   }
+ 
+   simple() {
 diff --git a/cjs/src/connection.js b/cjs/src/connection.js
 index 07f6716702ac888215c86ad6e0071aaf55ae519c..0ac92ecf452d68276c169ee2c4d29005c04cbf64 100644
 --- a/cjs/src/connection.js
@@ -88,6 +119,37 @@ index f09c61c7e998f411560b95c9a8e1ed6a97972c11..2dd06f4e865a094ea2b9cc1ff085bedd
      reserve,
      listen,
      begin,
+diff --git a/cjs/src/query.js b/cjs/src/query.js
+index 45327f2fabcdbf8f8ec5020675012c310c04fee6..5ebfa4c654d624333aafaf6738fb32974a009807 100644
+--- a/cjs/src/query.js
++++ b/cjs/src/query.js
+@@ -50,7 +50,25 @@ const Query = module.exports.Query = class Query extends Promise {
+   }
+ 
+   cancel() {
+-    return this.canceller && (this.canceller(this), this.canceller = null)
++    // PEN-3328: return the canceller's promise instead of discarding it.
++    // `cancel()` on an EXECUTING statement dials a fresh connection to send a
++    // CancelRequest, and that dial rejects asynchronously when it fails --
++    // connection.js `cancel` has both `catch (error) { reject(error) }` around
++    // `connect()` and `socket.once('error', reject)`. Upstream's comma
++    // expression evaluated that promise and threw the reference away, so the
++    // rejection could never reach a handler and surfaced as an
++    // unhandledRejection; Paperclip's process crash guard turns one of those
++    // into a deliberate worker exit, so a failed cancel dial took down every
++    // agent's in-flight dispatch. Returning it lets the caller attach a handler
++    // (see server/src/services/agent-start-lock-db.ts `cancelQuery`).
++    //
++    // The self-disarm is preserved exactly, including its order: the canceller
++    // is invoked first and nulled immediately after, so a second `cancel()` is
++    // still a no-op and returns undefined.
++    if (!this.canceller) return
++    const cancelled = this.canceller(this)
++    this.canceller = null
++    return cancelled
+   }
+ 
+   simple() {
 diff --git a/src/connection.js b/src/connection.js
 index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..657f98fc9d37f585a359f593ca09ec35336f3bbc 100644
 --- a/src/connection.js
@@ -133,3 +195,34 @@ index c7fba3dace20173f4cb13f3f138bb6d213b43683..46512f83209e6d8cf611ded0d0e223fe
      reserve,
      listen,
      begin,
+diff --git a/src/query.js b/src/query.js
+index 0d44a15cd9e42beaf11d4be6ccde60223e09508a..74e2d05eeabcd700df1e7ef7c56d992b05b167b5 100644
+--- a/src/query.js
++++ b/src/query.js
+@@ -50,7 +50,25 @@ export class Query extends Promise {
+   }
+ 
+   cancel() {
+-    return this.canceller && (this.canceller(this), this.canceller = null)
++    // PEN-3328: return the canceller's promise instead of discarding it.
++    // `cancel()` on an EXECUTING statement dials a fresh connection to send a
++    // CancelRequest, and that dial rejects asynchronously when it fails --
++    // connection.js `cancel` has both `catch (error) { reject(error) }` around
++    // `connect()` and `socket.once('error', reject)`. Upstream's comma
++    // expression evaluated that promise and threw the reference away, so the
++    // rejection could never reach a handler and surfaced as an
++    // unhandledRejection; Paperclip's process crash guard turns one of those
++    // into a deliberate worker exit, so a failed cancel dial took down every
++    // agent's in-flight dispatch. Returning it lets the caller attach a handler
++    // (see server/src/services/agent-start-lock-db.ts `cancelQuery`).
++    //
++    // The self-disarm is preserved exactly, including its order: the canceller
++    // is invoked first and nulled immediately after, so a second `cancel()` is
++    // still a no-op and returns undefined.
++    if (!this.canceller) return
++    const cancelled = this.canceller(this)
++    this.canceller = null
++    return cancelled
+   }
+ 
+   simple() {
