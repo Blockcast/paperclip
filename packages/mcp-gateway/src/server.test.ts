@@ -1417,12 +1417,25 @@ describe("mcp gateway lifecycle compatibility", () => {
   it("keeps aggregate initialize available when one upstream is unhealthy", async () => {
     const alpha = await createStrictMcpUpstream([{ name: "search", description: "Alpha search" }]);
     const hanging = await createHangingUpstream();
+    // `GatewayState.upstreamTimeoutMs` is ONE global budget, not per-upstream,
+    // so this deadline applies to the healthy `alpha` as much as to `stuck`.
+    // With `failureThreshold: 1`, a single `alpha` response slower than the
+    // budget opens its breaker for the rest of the test and `tools/list`
+    // returns `[]`. At the previous 150 ms that left a local in-process
+    // upstream almost no margin: on a CPU-starved runner it lost the race and
+    // this test failed `expected [] to deeply equal [ 'alpha__search' ]`,
+    // ejecting the merge group for #1952 on 2026-09-21.
+    //
+    // `hanging` never answers at all, so raising the budget does not weaken
+    // what this test checks — it only costs wall-clock. Reproduced directly:
+    // squeezing this to 1 ms reproduces that exact assertion locally.
+    const UPSTREAM_TIMEOUT_MS = 1_000;
     const gateway = await createAggregateGateway(
       {
         alpha: { url: alpha.url, credentialHeaders: [] },
         stuck: { url: hanging.url, credentialHeaders: [] },
       },
-      { timeoutMs: 150, failureThreshold: 1 },
+      { timeoutMs: UPSTREAM_TIMEOUT_MS, failureThreshold: 1 },
     );
 
     const start = Date.now();
@@ -1432,7 +1445,11 @@ describe("mcp gateway lifecycle compatibility", () => {
 
     expect(initialize.status).toBe(200);
     expect(clientSessionId).toBeTruthy();
-    expect(elapsed).toBeLessThan(1000);
+    // Proportional to the budget above, not an absolute wall-clock number:
+    // what this asserts is "initialize returns near the timeout rather than
+    // hanging on `stuck`", and an absolute bound re-introduces exactly the
+    // steal sensitivity this change removes.
+    expect(elapsed).toBeLessThan(UPSTREAM_TIMEOUT_MS * 5);
     expect(gateway.state.breaker.stateOf("stuck")).toBe("open");
 
     const list = await postJson(
