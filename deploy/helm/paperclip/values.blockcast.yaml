@@ -305,9 +305,12 @@ env:
     # Isolation-workspace reaper (BLO-31222; switched on under BLO-36735).
     #
     # Shared list, NOT worker.extraEnv. The reaper only ever runs on the worker,
-    # but that is enforced in code — server/src/index.ts:2019 skips the whole
-    # block, the dynamic import included, when PAPERCLIP_NODE_ROLE=api — so the
-    # Helm knob does not have to carry the tier split as well. worker.extraEnv
+    # but that is enforced in code — the
+    # `config.isolationWorkspaceReaperEnabled && paperclipNodeRole !== "api"`
+    # gate in server/src/index.ts skips the whole block, the dynamic import
+    # included, on the API tier — so the Helm knob does not have to carry the
+    # tier split as well. (Gate named rather than line-numbered on purpose: a
+    # pinned line rots on the next edit to that file.) worker.extraEnv
     # means something else here: it is the channel the claude_k8s adapter reads
     # to hand values down into agent Job pods, and penstock-worker-secret.test.mjs
     # asserts every literal in it is inheritable. A server-only flag put there
@@ -318,13 +321,25 @@ env:
     # The reaper shipped 2026-09-02 and was never enabled, so every reclaim on
     # data/k8s-isolation/workspaces since has been a hand pass at ~7 min/dir.
     #
+    # The tree swept is DEFAULT_ISOLATION_WORKSPACE_ROOT, hardcoded to
+    # /paperclip/instances/default/data/k8s-isolation/workspaces in
+    # server/src/services/isolation-workspace-reaper.ts:106. It agrees with
+    # env.instanceId (L57) by convention, not by construction. A divergence does
+    # not error: readdir's ENOENT branch returns an empty result, so a sweep
+    # aimed at nothing reports scanned=0 and looks like a clean tree. Read the
+    # match count, not the absence of an error.
+    #
     # BOTH flags are required for an observation-only tick: ENABLED is what
     # starts the sweep at all, DRY_RUN only decides whether it unlinks. DRY_RUN
     # on its own is inert, because the `if` that imports the module reads
-    # ENABLED. This change is step 1 (log the match set, delete nothing); step 2
-    # flips DRY_RUN to "false" once that production log line has been read. That
-    # split is property 2 of the module: "deploy the code" and "perform the
-    # deletion" must not be the same act.
+    # ENABLED. They fail OPPOSITE ways — config.ts parses each as `=== "true"`,
+    # so an absent ENABLED means the sweep never starts, but an absent DRY_RUN
+    # means it deletes. Deleting the DRY_RUN line below is therefore identical
+    # to setting it "false". This change is step 1 (log the match set, delete
+    # nothing); step 2 edits that value to "false" — it does not remove the
+    # line — once the production log line has been read. That split is
+    # property 2 of the module: "deploy the code" and "perform the deletion"
+    # must not be the same act.
     - name: PAPERCLIP_ISOLATION_WORKSPACE_REAPER_ENABLED
       value: "true"
     - name: PAPERCLIP_ISOLATION_WORKSPACE_REAPER_DRY_RUN
