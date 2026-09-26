@@ -1631,9 +1631,10 @@ async function lockHolderPids(lockPath: string): Promise<LockHolderScan> {
   // is safe only because of where this runs: the caller already `stat`ed this
   // same path successfully two statements earlier, so the one way `realpath`
   // fails here is the lock being unlinked in between -- i.e. its owner finished
-  // and there is no holder to miss. A lock that vanishes mid-repair is handled
-  // for real by the `ENOENT` branch on the rename below, which treats it as an
-  // already-unlocked index rather than a failure.
+  // and there is no holder to miss. Such a lock resolves as success at the
+  // pre-rename re-stat below, which returns for a lock already gone -- not at
+  // the rename's `ENOENT` catch, which only backstops the two-syscall gap
+  // after that re-stat.
   const canonicalLockPath = await fs.realpath(lockPath).catch(() => lockPath);
   const entries = await fs.readdir("/proc").catch(() => null);
   if (!entries) return { holders: null, failure: "unreadable" };
