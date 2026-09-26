@@ -1678,9 +1678,29 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 3");
   });
 
-  it("counts a failed run that produced token usage toward the no-comment streak — only zero-token failures are never-executed (BLO-21769 positive control)", async () => {
+  // PEN-3442 AMENDS BLO-21769. This test used to assert that a failed,
+  // token-bearing run COUNTS toward `no_comment_streak`. That is the defect
+  // PEN-3442 filed: the run executed, burned tokens, and was killed before it
+  // could post — provider fault, not assignee silence.
+  //
+  // BLO-21769's actual invariant is untouched and still asserted below: a
+  // token-bearing failure is NOT never-executed, so it must not reach
+  // `runtime_failure_streak`. That trigger is the platform-owner-facing
+  // infrastructure signal and feeding it billed, productive runs would be the
+  // wrong fix for this defect. Only the inference "it executed, therefore its
+  // silence is the assignee's" is withdrawn.
+  it("keeps a failed run that produced token usage out of BOTH streaks — executed, but killed before it could comment (BLO-21769 / PEN-3442)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
+    // Older: a genuine silent streak, so a review exists to read and the
+    // assertion is a number rather than an absence. Pre-fix this read 20.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now: new Date(now.getTime() - 90 * 60 * 1000),
+    });
     await insertRuns({
       companyId: seeded.companyId,
       agentId: seeded.coderId,
@@ -1700,7 +1720,13 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews).toHaveLength(1);
     expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
+    // BLO-21769's surviving invariant: a token-bearing failure is not
+    // never-executed, so it stays out of the infrastructure trigger.
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
+    // …and PEN-3442's: it is accounted for in its own bucket, not silently dropped.
+    expect(reviews[0]?.description).toContain(
+      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `status: failed`, PEN-3442): 10",
+    );
   });
 
   // BLO-26165 / BLO-23096: the 25-run `preferred_workspace_unrealizable`
@@ -1843,6 +1869,245 @@ describeEmbeddedPostgres("productivity review service", () => {
     );
   });
 
+  // PEN-3442. The defect: `no_comment_streak` counted runs that executed a
+  // turn, burned tokens, and were then killed by a provider fault before
+  // reaching the point where a run posts its issue comment. To the detector
+  // those are indistinguishable from an agent working steadily and declining
+  // to report; they are the opposite — work destroyed in flight.
+  //
+  // The fixture is the production shape measured on PEN-1990 (CEO, 2026-09-22;
+  // re-measured live 2026-09-24): terminal `failed` runs carrying
+  // `rate_limit_exhausted`, `livenessState: "failed"`, and NON-ZERO tokens.
+  // That last field is what makes them leak — `isInfraFailureRun` requires zero
+  // tokens, so `isNeverExecutedRun` does not catch them and they land in the
+  // streak numerator. The filed identity was exact: the card's "12 consecutive
+  // …" was precisely the 12 billed `rate_limit_exhausted` runs, $28.69 and
+  // 87,474 output tokens of destroyed work.
+  //
+  // Seeded alongside a genuine silent streak so the assertion is a number
+  // rather than an absence, and so it pins the exclusion as *transparent* to
+  // the walk (it continues through to the older runs) rather than a
+  // streak-breaker. Breaking there would assert "the assignee commented here",
+  // which is exactly what did not happen.
+  it("excludes runs killed mid-turn by a provider fault from no_comment_streak, without breaking the walk (PEN-3442)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    // Anchored outside the 1h/6h high_churn windows so the fixture cannot trip
+    // `high_churn` and muddy which trigger won.
+    const insertNow = new Date(now.getTime() - 2 * 60 * 60 * 1000);
+    // Older: a genuine silent streak. These executed, finished their turn, and
+    // did not comment — real assignee silence, and the streak that must
+    // survive the fix.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now: new Date(insertNow.getTime() - 60 * 60 * 1000),
+    });
+    // Most recent: the PEN-1990 shape. Token counts are a real measured row
+    // (2026-09-22T10:25:45Z, 319 KB of log) — substantial work, none committed.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 12,
+      now: insertNow,
+      status: "failed",
+      errorCode: "rate_limit_exhausted",
+      livenessState: "failed",
+      usageJson: { inputTokens: 3399, outputTokens: 5846 },
+      logBytes: 230_532,
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    // The 12 fault-terminated runs are excluded, and the walk continues past
+    // them to the 10 genuinely silent ones. Pre-fix this read 22.
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
+    expect(reviews[0]?.description).toContain(
+      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `status: failed`, PEN-3442): 12",
+    );
+    // They are NOT the never-invoked population: these got an adapter and used
+    // it. A fix that folded the two together would report 12 here.
+    expect(reviews[0]?.description).toContain(
+      "Never-invoked runs excluded (terminal, no adapter ever created — `usageJson`/`logStore`/`logRef` null, `logBytes` null or 0, BLO-26165): 0",
+    );
+    // …and they are not infrastructure telemetry either: `runtime_failure_streak`
+    // keys on zero tokens, and these burned some. Pinning this is what stops a
+    // future widening from "fixing" this defect by feeding billed, productive
+    // runs to the platform-owner-facing trigger instead.
+    expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
+  });
+
+  // PEN-3442, generality. The defect was filed on `rate_limit_exhausted`, but
+  // the leak is not that error code — it is "executed, then killed". Measured
+  // on PEN-1990 live (2026-09-24), a `claude_transient_upstream` run burned
+  // 32,805 output tokens across 1.3 MB of log before dying, and counted toward
+  // the same streak.
+  //
+  // This is the test that fails against the narrower fix the issue offered as
+  // its first option (an `errorCode` allowlist seeded from the filed table):
+  // any such list would have had to predict this member. Keying on
+  // `livenessState` catches it without enumerating anything.
+  it("excludes a fault-terminated run whatever the provider error code (PEN-3442 generality)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const insertNow = new Date(now.getTime() - 2 * 60 * 60 * 1000);
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now: new Date(insertNow.getTime() - 60 * 60 * 1000),
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 12,
+      now: insertNow,
+      status: "failed",
+      errorCode: "claude_transient_upstream",
+      livenessState: "failed",
+      usageJson: { inputTokens: 12_154, outputTokens: 32_805 },
+      logBytes: 1_304_478,
+    });
+
+    const service = productivityReviewService(db);
+    await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
+    expect(reviews[0]?.description).toContain(
+      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `status: failed`, PEN-3442): 12",
+    );
+  });
+
+  // PEN-3442 NEGATIVE CONTROL (required). The exclusion must not be able to
+  // empty the trigger: a fault-terminated run is excluded, but a run that
+  // executed, FINISHED, and stayed silent is still assignee behaviour and must
+  // still accumulate. Without this, a predicate that also caught ordinary
+  // silent runs would pass the two tests above while deleting the detector.
+  // The two tests after this one pin the other edges: `timed_out`/`cancelled`
+  // stay in the walk, and a fault-terminated run that commented still breaks it.
+  //
+  // The fixture is the production-faithful default (`succeeded` /
+  // `livenessState: "advanced"`).
+  it("still fires no_comment_streak on executed runs that finished and stayed silent (PEN-3442 control)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      usageJson: { inputTokens: 3399, outputTokens: 5846 },
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
+    expect(reviews[0]?.description).toContain(
+      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `status: failed`, PEN-3442): 0",
+    );
+  });
+
+  // PEN-3442 scope. `livenessState: "failed"` is every non-succeeded terminal
+  // status, so a liveness-only predicate also excluded `timed_out` and
+  // `cancelled` runs. Those had their turn and stayed silent through it, which
+  // is exactly what this streak reports. Under the liveness-only predicate this
+  // fixture reads 8 and does not fire.
+  it("keeps timed-out and cancelled silent runs in the no_comment_streak walk (PEN-3442 scope)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const insertNow = new Date(now.getTime() - 2 * 60 * 60 * 1000);
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS - 2,
+      now: new Date(insertNow.getTime() - 60 * 60 * 1000),
+    });
+    for (const [offsetMs, status] of [[0, "timed_out"], [5 * 60 * 1000, "cancelled"]] as const) {
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: 1,
+        now: new Date(insertNow.getTime() - offsetMs),
+        status,
+        livenessState: "failed",
+        usageJson: { inputTokens: 3399, outputTokens: 5846 },
+        logBytes: 230_532,
+      });
+    }
+
+    await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
+    expect(reviews[0]?.description).toContain(
+      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `status: failed`, PEN-3442): 0",
+    );
+  });
+
+  // PEN-3442 and comment evidence. `commentRunIds` holds every comment a run
+  // authored, so a fault-terminated run can have commented mid-turn. Newest
+  // first: 5 silent runs, one `rate_limit_exhausted` run that commented, then
+  // 10 older silent runs. The commenting run must break the walk at 5; if it
+  // were excluded like a silent fault-terminated run the streak would read 15
+  // and fire against an agent that demonstrably reported.
+  it("lets a fault-terminated run that commented still break no_comment_streak (PEN-3442)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const insertNow = new Date(now.getTime() - 2 * 60 * 60 * 1000);
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now: new Date(insertNow.getTime() - 60 * 60 * 1000),
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 1,
+      now: new Date(insertNow.getTime() - 10 * 60 * 1000),
+      status: "failed",
+      errorCode: "rate_limit_exhausted",
+      livenessState: "failed",
+      usageJson: { inputTokens: 3399, outputTokens: 5846 },
+      logBytes: 230_532,
+      withRunComments: true,
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 5,
+      now: insertNow,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
   it("distinguishes never-invoked runs from executed-but-silent runs in the same sampled window (BLO-26165)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
@@ -1929,12 +2194,24 @@ describeEmbeddedPostgres("productivity review service", () => {
   // BLO-22097: a post-model failure whose result event never arrives leaves
   // `usageJson: null` even though the model produced output — null usage is
   // unknown, not a measured zero. `logBytes` far above the boilerplate-only
-  // ceiling corroborates that a turn actually ran, so the run must count
-  // toward `no_comment_streak` rather than being dropped from the walk as
-  // never-executed.
-  it("counts a claude_truncated-shaped run (null usage, high logBytes) toward the no-comment streak (BLO-22097)", async () => {
+  // ceiling corroborates that a turn actually ran, so the run must NOT be
+  // dropped from the walk as never-executed.
+  //
+  // PEN-3442 AMENDS the conclusion, not the premise. BLO-22097 established
+  // that the turn ran; it then treated "ran" as sufficient for "the assignee
+  // was silent". A `claude_truncated` run is killed mid-turn by definition, so
+  // it never reached the comment checkpoint. It is still not never-executed —
+  // asserted below — it is fault-terminated.
+  it("keeps a claude_truncated-shaped run (null usage, high logBytes) out of BOTH streaks (BLO-22097 / PEN-3442)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now: new Date(now.getTime() - 90 * 60 * 1000),
+    });
     await insertRuns({
       companyId: seeded.companyId,
       agentId: seeded.coderId,
@@ -1956,6 +2233,9 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
+    expect(reviews[0]?.description).toContain(
+      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `status: failed`, PEN-3442): 10",
+    );
   });
 
   // BLO-22097 positive control: a large log does not override an *explicit*
@@ -2121,9 +2401,20 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 10");
   });
 
-  it("counts a null-usage run toward the no-comment streak one byte past the 200,000-byte logBytes ceiling (BLO-22097)", async () => {
+  // PEN-3442 amends this the same way as the two above: the 200,000-byte
+  // ceiling still decides never-executed vs executed — asserted by the
+  // `Runtime-failure streak: 0` line — but executing is no longer sufficient
+  // to make the silence the assignee's when the run was killed mid-turn.
+  it("keeps a null-usage run one byte past the 200,000-byte logBytes ceiling out of BOTH streaks (BLO-22097 / PEN-3442)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now: new Date(now.getTime() - 90 * 60 * 1000),
+    });
     await insertRuns({
       companyId: seeded.companyId,
       agentId: seeded.coderId,
@@ -2145,6 +2436,9 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
+    expect(reviews[0]?.description).toContain(
+      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `status: failed`, PEN-3442): 10",
+    );
   });
 
   // BLO-22436: `cancelQueuedRunForBlockedDependencies` (heartbeat.ts) cancels
