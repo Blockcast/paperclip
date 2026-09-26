@@ -11510,14 +11510,16 @@ export function issueRoutes(
     await assertCanManageIssueMonitor(access, req, issue.companyId, issue, true);
 
     const actor = getActorInfo(req);
-    await heartbeat.triggerIssueMonitor(issue.id, {
+    // PEN-3326: a check-now under a tree hold or `wakeOnDemand: false` re-arms
+    // the monitor instead of firing; surface that outcome rather than a bare ok.
+    const result = await heartbeat.triggerIssueMonitor(issue.id, {
       actorType: actor.actorType,
       actorId: actor.actorId,
       agentId: actor.agentId ?? null,
       runId: actor.runId ?? null,
     });
 
-    res.json({ ok: true });
+    res.json({ ok: true, ...result });
   });
 
   router.post("/issues/:id/scheduled-retry/retry-now", async (req, res) => {

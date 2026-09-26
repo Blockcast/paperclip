@@ -163,6 +163,8 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     issueStatus?: "in_progress" | "in_review";
     monitorAttemptCount?: number;
     monitor?: Record<string, unknown>;
+    /** PEN-3326: `false` drives the skip-then-return-null gate (`heartbeat.wakeOnDemand.disabled`). */
+    wakeOnDemand?: boolean;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -201,7 +203,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       runtimeConfig: {
         heartbeat: {
           enabled: false,
-          wakeOnDemand: true,
+          wakeOnDemand: input?.wakeOnDemand ?? true,
         },
       },
       permissions: {},
@@ -574,7 +576,10 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(issue.monitorNextCheckAt, "watchdog stands down once dispatch happened").toBeNull();
     expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
       status: "cleared",
-      clearReason: "dispatch_skipped",
+      // PEN-3326: a watchdog standing down is a HEALTHY outcome and no longer
+      // shares `dispatch_skipped` — the field the API surfaces — with "we
+      // declined the dispatch and dropped the timer".
+      clearReason: "dispatch_watchdog_recovered",
     });
 
     const activity = await db
@@ -1040,13 +1045,355 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     });
   });
 
-  it("clears due monitors that cannot be dispatched and records a skip", async () => {
-    const { issueId } = await seedFixture({ agentStatus: "paused" });
+  // PEN-3326: a dispatch the platform SUPPRESSED is not a verdict on this issue —
+  // the agent is paused or not invokable right now, on a condition a human
+  // clears. This used to clear the monitor outright, which made a recoverable
+  // pause permanently destructive: resuming the seat does not bring the schedule
+  // back, and the row then reads healthy on every field an observer checks.
+  it("defers instead of destroying a monitor whose dispatch was suppressed (PEN-3326)", async () => {
+    const { issueId, agentId } = await seedFixture({ agentStatus: "paused" });
     const heartbeat = createHeartbeat();
     const tickAt = new Date("2026-04-11T12:31:00.000Z");
 
-    const result = await heartbeat.tickTimers(tickAt);
+    const result = await heartbeat.__test_tickDueIssueMonitors(tickAt);
 
+    expect(result.skipped).toBe(0);
+    expect(result.triggered).toBe(0);
+    expect(result.dispatchSuppressedDeferred).toBe(1);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    // First attempt: 5 minutes, the base of the backoff ladder.
+    expect(issue.monitorNextCheckAt?.toISOString()).toBe("2026-04-11T12:36:00.000Z");
+    // The attempt is consumed. Without this the `maxAttempts` bound below is a
+    // bound in name only, and the row also keeps misrepresenting its own history.
+    expect(issue.monitorAttemptCount).toBe(1);
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "scheduled",
+      attemptCount: 1,
+    });
+
+    const activity = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows);
+    const actions = activity.map((row) => row.action);
+    expect(actions).toContain("issue.monitor_dispatch_suppressed_deferred");
+    expect(actions).not.toContain("issue.monitor_skipped");
+    expect(actions).not.toContain("issue.monitor_triggered");
+
+    // The gate's own durable label survives onto the row, where it did not before.
+    const deferral = activity.find((row) => row.action === "issue.monitor_dispatch_suppressed_deferred");
+    expect(deferral?.details).toMatchObject({
+      suppressionReason: "agent.not_invokable",
+      monitorAttemptCount: 1,
+      previousCheckAt: "2026-04-11T12:30:00.000Z",
+    });
+
+    // The suppression is still recorded off-row exactly as before — this fix
+    // changes what happens to the TIMER, not what the gate records.
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.status).toBe("skipped");
+    expect(wakeup?.reason).toBe("agent.not_invokable");
+  });
+
+  // The other half of the same defect: a gate that declines with a plain `null`
+  // (no throw) used to fall through to the triggered patch and log
+  // `issue.monitor_triggered` for a wake that was never queued. `wakeOnDemand:
+  // false` drives that gate; nothing else in the fixture changes.
+  it("defers a dispatch declined on the return-null path (wakeOnDemand disabled) (PEN-3326)", async () => {
+    const { issueId, agentId } = await seedFixture({ wakeOnDemand: false });
+    const heartbeat = createHeartbeat();
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+
+    const result = await heartbeat.__test_tickDueIssueMonitors(tickAt);
+
+    expect(result.dispatchSuppressedDeferred).toBe(1);
+    expect(result.triggered).toBe(0);
+    expect(result.skipped).toBe(0);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorNextCheckAt?.toISOString()).toBe("2026-04-11T12:36:00.000Z");
+    expect(issue.monitorAttemptCount).toBe(1);
+
+    const activity = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows);
+    const actions = activity.map((row) => row.action);
+    expect(actions).toContain("issue.monitor_dispatch_suppressed_deferred");
+    expect(actions).not.toContain("issue.monitor_triggered");
+    const deferral = activity.find((row) => row.action === "issue.monitor_dispatch_suppressed_deferred");
+    // No throw on this path, so the gate contributed no sentence. The durable
+    // label itself is asserted on the wakeup row below: the activity scrubber's
+    // JWT-shape heuristic (`redaction.ts` JWT_VALUE_RE) masks any three-segment
+    // dotted string, and `heartbeat.wakeOnDemand.disabled` is one.
+    expect(deferral?.details).toMatchObject({
+      reason: null,
+      monitorAttemptCount: 1,
+      previousCheckAt: "2026-04-11T12:30:00.000Z",
+    });
+
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.status).toBe("skipped");
+    expect(wakeup?.reason).toBe("heartbeat.wakeOnDemand.disabled");
+  });
+
+  // Return-null suppression under policy drift: the deferral cannot be
+  // persisted, so the `unpersistable` branch falls through to the triggered
+  // patch, which terminates the row. Pre-existing drift behaviour, unchanged.
+  it("still terminates a return-null suppression whose monitor policy has drifted away (PEN-3326)", async () => {
+    const { issueId } = await seedFixture({ wakeOnDemand: false });
+    await db
+      .update(issues)
+      .set({ executionPolicy: { mode: "normal", commentRequired: true, stages: [] } })
+      .where(eq(issues.id, issueId));
+    const heartbeat = createHeartbeat();
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+
+    const result = await heartbeat.__test_tickDueIssueMonitors(tickAt);
+
+    expect(result.dispatchSuppressedDeferred).toBe(0);
+    expect(result.triggered).toBe(1);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorNextCheckAt).toBeNull();
+  });
+
+  // `create_recovery_issue` assigns the recovery issue to the source issue's own
+  // assignee, the seat that just could not be woken. Its wake must not throw out
+  // of the tick past the recovery-issue log; the row is the artifact, and the
+  // suppression lands as a comment on the source issue.
+  it("creates the recovery issue and comments when its wake is suppressed (PEN-3326)", async () => {
+    const { issueId, companyId } = await seedFixture({
+      agentStatus: "paused",
+      monitorAttemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+      monitor: { recoveryPolicy: "create_recovery_issue" },
+    });
+    const heartbeat = createHeartbeat();
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+
+    await expect(heartbeat.tickTimers(tickAt)).resolves.toBeDefined();
+
+    const activity = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows);
+    const actions = activity.map((row) => row.action);
+    expect(actions).toContain("issue.monitor_exhausted");
+    expect(actions).toContain("issue.monitor_recovery_wake_suppressed");
+    expect(actions).toContain("issue.monitor_recovery_issue_created");
+    const created = activity.find((row) => row.action === "issue.monitor_recovery_issue_created");
+    expect(created?.details).toMatchObject({ recoveryWakeSuppressed: true });
+
+    const recoveryIssue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originId, issueId))
+      .then((rows) => rows.find((row) => row.companyId === companyId && row.originKind === "stranded_issue_recovery") ?? null);
+    expect(recoveryIssue).toMatchObject({ parentId: issueId });
+
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId))
+      .then((rows) => rows);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("could not be delivered");
+  });
+
+  // PEN-3326 follow-up: the wake fallback swallows 4xx and rethrows anything
+  // else, which is right — but the recovery-issue row has already committed by
+  // then, so a rethrow that skipped the creation log would leave the row
+  // discoverable by `originId` and by nothing else. The `finally` closes that
+  // trail gap. A CHECK violation on the wake insert stands in for the 5xx: it
+  // takes the identical `throw err` branch (not an `HttpError` at all), and the
+  // tick's own catch keeps it from escaping the sweep.
+  it("logs the recovery-issue creation even when its wake throws (PEN-3326)", async () => {
+    const { issueId, companyId } = await seedFixture({
+      monitorAttemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+      monitor: { recoveryPolicy: "create_recovery_issue" },
+    });
+    await db.execute(
+      sql`alter table agent_wakeup_requests add constraint pen_3326_force_wake_failure check (reason <> 'issue_monitor_recovery_issue')`,
+    );
+
+    try {
+      const heartbeat = createHeartbeat();
+      await expect(heartbeat.tickTimers(new Date("2026-04-11T12:31:00.000Z"))).resolves.toBeDefined();
+
+      const activity = await db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.entityId, issueId))
+        .then((rows) => rows);
+      const created = activity.find((row) => row.action === "issue.monitor_recovery_issue_created");
+      // The point of the change: present at all, and labelled as a failed wake
+      // rather than defaulting to the "delivered" reading.
+      expect(created).toBeDefined();
+      expect(created?.details).toMatchObject({ recoveryWakeFailed: true });
+      expect(activity.map((row) => row.action)).not.toContain("issue.monitor_recovery_wake_suppressed");
+
+      const recoveryIssue = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.originId, issueId))
+        .then((rows) => rows.find((row) => row.companyId === companyId && row.originKind === "stranded_issue_recovery") ?? null);
+      expect(recoveryIssue).toMatchObject({ parentId: issueId });
+    } finally {
+      await db.execute(sql`alter table agent_wakeup_requests drop constraint pen_3326_force_wake_failure`);
+    }
+  });
+
+  // The manual path reaches the return-null gates too (`clearOnClientError:
+  // false` only scopes the THROW-branch deferral). A null return has no error to
+  // surface, so it re-arms rather than logging a phantom trigger, and the caller
+  // is told so through the outcome instead of a bare ok.
+  it("check-now under a suppressed wake re-arms and reports the deferral (PEN-3326)", async () => {
+    const { issueId } = await seedFixture({ wakeOnDemand: false });
+    const heartbeat = createHeartbeat();
+    const now = new Date("2026-04-11T12:31:00.000Z");
+
+    const result = await heartbeat.triggerIssueMonitor(issueId, {
+      now,
+      actorType: "user",
+      actorId: "local-board",
+    });
+
+    expect(result.outcome).toBe("dispatch_suppressed_deferred");
+    expect(result).toMatchObject({
+      nextCheckAt: "2026-04-11T12:36:00.000Z",
+      suppressionReason: "heartbeat.wakeOnDemand.disabled",
+    });
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorNextCheckAt?.toISOString()).toBe("2026-04-11T12:36:00.000Z");
+    expect(issue.monitorAttemptCount).toBe(1);
+  });
+
+  // The deferral is bounded, and exhausting it must be LOUD rather than another
+  // silent clear. `escalate_to_board` is used here because it is the one recovery
+  // policy that cannot itself be suppressed by the same paused seat — see the
+  // wake_owner fallback test below.
+  it("stops deferring a suppressed dispatch at the attempt ceiling and escalates (PEN-3326)", async () => {
+    const { issueId } = await seedFixture({
+      agentStatus: "paused",
+      monitorAttemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+      monitor: { recoveryPolicy: "escalate_to_board" },
+    });
+    const heartbeat = createHeartbeat();
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+
+    const result = await heartbeat.__test_tickDueIssueMonitors(tickAt);
+
+    expect(result.dispatchSuppressedDeferred).toBe(0);
+    expect(result.skipped).toBe(1);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorNextCheckAt).toBeNull();
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "max_attempts_exhausted",
+    });
+
+    const actions = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.map((row) => row.action));
+    expect(actions).toContain("issue.monitor_exhausted");
+    expect(actions).toContain("issue.monitor_escalated_to_board");
+  });
+
+  // The ceiling counts attempts ALREADY made (`exhaustedMonitorClearReason`), so
+  // the last in-budget suppression still defers. At `maxAttempts: 1` a monitor
+  // with no attempts yet gets exactly one deferral; checking the post-increment
+  // count gave it none, so the first paused seat destroyed the schedule.
+  it("defers the last in-budget suppressed dispatch instead of exhausting it (PEN-3326)", async () => {
+    const { issueId } = await seedFixture({
+      agentStatus: "paused",
+      monitorAttemptCount: 0,
+      monitor: { maxAttempts: 1, recoveryPolicy: "escalate_to_board" },
+    });
+    const heartbeat = createHeartbeat();
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+
+    const result = await heartbeat.__test_tickDueIssueMonitors(tickAt);
+
+    expect(result.dispatchSuppressedDeferred).toBe(1);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorNextCheckAt).not.toBeNull();
+    expect(issue.monitorAttemptCount).toBe(1);
+
+    const actions = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.map((row) => row.action));
+    expect(actions).toContain("issue.monitor_dispatch_suppressed_deferred");
+    expect(actions).not.toContain("issue.monitor_exhausted");
+  });
+
+  // The default recovery policy wakes the issue's own assignee — the very seat
+  // that could not be woken. Without a fallback the escalation is suppressed by
+  // the same gate it is reporting, and the loss goes quiet again.
+  it("leaves a comment when the owner-recovery wake is itself suppressed (PEN-3326)", async () => {
+    const { issueId } = await seedFixture({
+      agentStatus: "paused",
+      monitorAttemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+      monitor: { recoveryPolicy: "wake_owner" },
+    });
+    const heartbeat = createHeartbeat();
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+
+    await heartbeat.tickTimers(tickAt);
+
+    const actions = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.map((row) => row.action));
+    expect(actions).toContain("issue.monitor_exhausted");
+    expect(actions).toContain("issue.monitor_recovery_wake_suppressed");
+
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId))
+      .then((rows) => rows);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("maximum attempt count");
+    expect(comments[0]?.body).toContain("could not be delivered");
+  });
+
+  // Policy drift — `monitorNextCheckAt` still set while the monitor policy is
+  // gone — has nothing to rebuild, so the deferral cannot be persisted and the
+  // pre-existing clear must still terminate the row. Deferring without a write
+  // would leave the column in the past and the attempt unincremented, i.e. a row
+  // that re-claims forever against a frozen attempt count.
+  it("still clears a suppressed dispatch whose monitor policy has drifted away (PEN-3326)", async () => {
+    const { issueId } = await seedFixture({ agentStatus: "paused" });
+    await db
+      .update(issues)
+      .set({ executionPolicy: { mode: "normal", commentRequired: true, stages: [] } })
+      .where(eq(issues.id, issueId));
+    const heartbeat = createHeartbeat();
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+
+    const result = await heartbeat.__test_tickDueIssueMonitors(tickAt);
+
+    expect(result.dispatchSuppressedDeferred).toBe(0);
     expect(result.skipped).toBe(1);
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
@@ -1056,12 +1403,12 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       clearReason: "dispatch_skipped",
     });
 
-    const activity = await db
+    const actions = await db
       .select()
       .from(activityLog)
       .where(eq(activityLog.entityId, issueId))
       .then((rows) => rows.map((row) => row.action));
-    expect(activity).toContain("issue.monitor_skipped");
+    expect(actions).toContain("issue.monitor_skipped");
   });
 
   // BLO-23061: a monitor armed WITHOUT an explicit maxAttempts is unbounded, so

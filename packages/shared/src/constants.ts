@@ -504,7 +504,14 @@ export const ISSUE_EXECUTION_MONITOR_CLEAR_REASONS = [
   "invalid_status",
   "invalid_assignee",
   "suppressed_by_status",
+  // PEN-3326: "the scheduler declined to dispatch this wake and consumed the
+  // timer." It used to name a second, unrelated and *healthy* event as well —
+  // the dispatch watchdog settling because its watched run left the queue — so
+  // `clearReason`, which is the field the API surfaces, could not tell "we gave
+  // up and deleted your timer" from "the watchdog resolved fine". The watchdog
+  // outcome now has its own reason below; keep these two distinct.
   "dispatch_skipped",
+  "dispatch_watchdog_recovered",
   "timeout_exceeded",
   "max_attempts_exhausted",
   "convergence_stalled",
