@@ -1823,6 +1823,74 @@ describe("execute: waitForPod edge cases", () => {
     expect(result.errorMessage).not.toContain("Init container failed");
   });
 
+  // BLO-33503 review follow-up: the docker-enabled shape. `dind` is an
+  // initContainer with restartPolicy: "Always" (a native sidecar) and is torn
+  // down when the main container exits, so its non-zero exit is collateral to
+  // the claude failure rather than its cause. Without the sidecar skip the init
+  // loop throws first and reports `Init container "dind" failed with exit code
+  // 137`, discarding the real OOMKill — the same mislabel class this PR removes.
+  it("does not blame the DinD sidecar when the main container died", async () => {
+    mockCoreListPods.mockResolvedValue({
+      items: [{
+        metadata: { name: "pod-x", ownerReferences: [jobOwnerRef("uid-1")] },
+        spec: {
+          initContainers: [
+            { name: "write-prompt" },
+            { name: "dind", restartPolicy: "Always" },
+          ],
+        },
+        status: {
+          phase: "Failed",
+          initContainerStatuses: [
+            { name: "write-prompt", state: { terminated: { exitCode: 0, reason: "Completed" } } },
+            { name: "dind", state: { terminated: { exitCode: 137, reason: "Error" } } },
+          ],
+          containerStatuses: [{
+            name: "claude",
+            state: { terminated: { exitCode: 137, reason: "OOMKilled" } },
+          }],
+        },
+      }],
+    });
+
+    const result = await execute(makeCtx());
+
+    expect(result.errorMessage).toContain("Pod terminated before startup");
+    expect(result.errorMessage).toContain("OOMKilled");
+    expect(result.errorMessage).not.toContain("dind");
+    expect(result.errorMessage).not.toContain("Init container failed");
+  });
+
+  // Sidecars are skipped only for *terminated* state. One stuck waiting still
+  // blocks startup and must still be named — the guard above must not widen
+  // into "ignore the sidecar entirely".
+  it("still reports a DinD sidecar that cannot start", async () => {
+    mockCoreListPods.mockResolvedValue({
+      items: [{
+        metadata: { name: "pod-x", ownerReferences: [jobOwnerRef("uid-1")] },
+        spec: {
+          initContainers: [
+            { name: "write-prompt" },
+            { name: "dind", restartPolicy: "Always" },
+          ],
+        },
+        status: {
+          phase: "Pending",
+          initContainerStatuses: [
+            { name: "write-prompt", state: { terminated: { exitCode: 0, reason: "Completed" } } },
+            { name: "dind", state: { waiting: { reason: "ImagePullBackOff", message: "back-off pulling image docker:dind" } } },
+          ],
+          containerStatuses: [],
+        },
+      }],
+    });
+
+    const result = await execute(makeCtx());
+
+    expect(result.errorMessage).toContain("Init container failed");
+    expect(result.errorMessage).toContain("dind");
+  });
+
   // BLO-33503 true-positive control: a genuine scheduling failure must still
   // report "Pod scheduling failed", so the fix cannot be satisfied by
   // relabelling everything away from the scheduling category. This one passes

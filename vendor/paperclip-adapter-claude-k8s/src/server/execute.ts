@@ -1334,9 +1334,23 @@ async function waitForPod(
     // check: restartPolicy is Never (job-manifest.ts), so a failed init
     // container takes the whole pod to phase=Failed, and the generic
     // "terminated" branch below would swallow the specific cause (BLO-33503).
+    //
+    // A native sidecar is the exception: an initContainer carrying its own
+    // restartPolicy: "Always" (the DinD sidecar, job-manifest.ts) overrides the
+    // pod-level Never and is *designed* to terminate when the main container
+    // exits.  Its non-zero exit (SIGKILL 137 past the grace period, SIGTERM 143)
+    // is collateral to a main-container failure, not the cause of one, so it
+    // must not outrank describePodTerminatedError below.  Only its *terminated*
+    // state is collateral — a sidecar stuck waiting still blocks startup, so the
+    // waiting branches below apply to it as they do to any init container.
+    const sidecarNames = new Set(
+      (pod.spec?.initContainers ?? [])
+        .filter((c) => (c as { restartPolicy?: string }).restartPolicy === "Always")
+        .map((c) => c.name),
+    );
     for (const init of initStatuses) {
       const terminated = init.state?.terminated;
-      if (terminated && (terminated.exitCode ?? 0) !== 0) {
+      if (terminated && (terminated.exitCode ?? 0) !== 0 && !sidecarNames.has(init.name)) {
         throw new PodWaitError("init_container", `Init container "${init.name}" failed with exit code ${terminated.exitCode}: ${terminated.reason ?? terminated.message ?? "unknown"}`);
       }
       const waiting = init.state?.waiting;
