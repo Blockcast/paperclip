@@ -252,17 +252,28 @@ export async function sweepOrphanedRunSecrets(opts: SweepOptions): Promise<Sweep
   const { namespace, coreApi, batchApi, onLog } = opts;
   // Clamped, not just defaulted: an explicitly-supplied 0 must not disarm the
   // only protection a launch in flight has.  See MIN_SWEEP_AGE_FLOOR_SEC.
+  //
+  // isFinite, not `??`: Math.max is NaN-transparent, so a NaN floor would make
+  // `now - createdMs < ageFloorMs` false for every Secret and disarm the age
+  // check completely -- the exact failure the clamp exists to prevent, reached
+  // through a different door than an explicit 0.  The execute.ts call site
+  // cannot produce NaN (asNumber filters it), but this function is exported
+  // with `ageFloorMs?: number`, so the clamp must not depend on a guarantee
+  // held in another module.  Infinity is rejected for the same reason.
   const ageFloorMs = Math.max(
     MIN_SWEEP_AGE_FLOOR_SEC * 1000,
-    opts.ageFloorMs ?? DEFAULT_SWEEP_AGE_FLOOR_SEC * 1000,
+    Number.isFinite(opts.ageFloorMs)
+      ? (opts.ageFloorMs as number)
+      : DEFAULT_SWEEP_AGE_FLOOR_SEC * 1000,
   );
   // Make the override observable at the moment it happens: an operator or test
   // that deliberately sets a low floor otherwise gets 300s with no signal, and
-  // has to infer the clamp from behaviour.
-  if (opts.ageFloorMs !== undefined && opts.ageFloorMs < ageFloorMs) {
+  // has to infer the clamp from behaviour.  `!==` rather than `<` so a rejected
+  // non-finite floor is reported too -- `NaN < x` is false and would be silent.
+  if (opts.ageFloorMs !== undefined && opts.ageFloorMs !== ageFloorMs) {
     await onLog(
       "stderr",
-      `[paperclip] Orphan-secret sweep age floor raised from ${opts.ageFloorMs}ms to the ${ageFloorMs}ms minimum\n`,
+      `[paperclip] Orphan-secret sweep age floor raised to ${ageFloorMs}ms (requested ${opts.ageFloorMs}ms)\n`,
     );
   }
   const now = opts.now ?? Date.now();
