@@ -543,6 +543,7 @@ export function classifyPr(pr, { now = Date.now(), settleMinutes = CHECK_SETTLE_
 
   if (UNLANDABLE_MERGE_STATES.has(mergeState)) return row("skip", `mergestate:${mergeState}`);
 
+
   return row("enqueue", `mergestate:${mergeState}`);
 }
 
@@ -634,28 +635,84 @@ function fetchOpenPrs(repo) {
 }
 
 /** Posts `body` unless a comment carrying `marker` is already on the PR. */
-function commentOnce(repo, number, marker, body) {
+function commentOnce(repo, number, marker, body, run = gh) {
   const existing = JSON.parse(
-    gh(["api", `repos/${repo}/issues/${number}/comments`, "--paginate"]),
+    run(["api", `repos/${repo}/issues/${number}/comments`, "--paginate"]),
   );
   if (existing.some((comment) => String(comment?.body ?? "").includes(marker))) return "already-posted";
-  gh(["pr", "comment", String(number), "--repo", repo, "--body", `${marker}\n${body}`]);
+  run(["pr", "comment", String(number), "--repo", repo, "--body", `${marker}\n${body}`]);
   return "posted";
 }
 
-function applyRow(repo, row) {
+/**
+ * `--rebase` is mandatory, not cosmetic. `gh pr merge --auto` only infers a
+ * merge method when the PR's BASE BRANCH has a merge queue — `isMergeQueueEnabled`
+ * is a property of the base ref, not of this PR's mergeability. A PR stacked on
+ * a feature branch therefore falls back to classic auto-merge, and with all
+ * three merge methods enabled on this repo `gh` refuses non-interactively with
+ * "--merge, --rebase, or --squash required". That refusal landed in `detail`
+ * while the row still reported `enqueue`, so #2020 read as enqueued across 9
+ * consecutive fires having armed nothing (BLO-36804).
+ *
+ * Safe on the queue path: measured 2026-09-26 against a queue-enabled base, `gh`
+ * prints "The merge strategy for master is set by the merge queue", exits 0, and
+ * the queue's own REBASE wins — the flag is discarded, not honoured. So this
+ * cannot change what already-working rows do. `--rebase` names that same method
+ * and keeps stacked branches free of merge commits, which is what keeps them
+ * rebaseable for the queue later (BLO-22300).
+ *
+ * NECESSARY BUT NOT SUFFICIENT, and deliberately so. Past `gh`'s client-side
+ * check, GitHub still refuses auto-merge on a base with no protection rules:
+ * "Protected branch rules not configured for this branch
+ * (enablePullRequestAutoMerge)", measured the same day on #1906. Such a PR is
+ * unenqueueable however clean it is. The classifier does NOT try to predict
+ * that — whether a base is protected, queue-enabled, or neither is per-repo
+ * server state, and this script is about to sweep repos whose default branch is
+ * not even `master` (multicast is `main`). Modelling it here would mean a wrong
+ * model silently skipping a whole repo, which is worse than the bug being fixed.
+ * GitHub is the authority; we attempt, it rules, and `markFailure` puts the
+ * verdict in the receipt's action column where it is visible.
+ *
+ * ## `--auto` does not always mean auto
+ *
+ * `gh` drops the auto-merge request and performs an IMMEDIATE merge when the PR
+ * is already mergeable and the base has no queue to wait for — `--auto` is a
+ * request to wait for gates, and a PR with no outstanding gates has nothing to
+ * wait for. Measured 2026-09-26: this exact call landed #2020 on the spot,
+ * `parents=1`, no `auto_merge_enabled` event. Supplying the method therefore
+ * converts a permanently-failing no-op into a real merge for clean PRs on
+ * unprotected bases.
+ *
+ * That is accepted on purpose: on such a base there is no queue to land through,
+ * so merging IS landing, and this classifier is the gate — Ally clean at head,
+ * every check green, owner approvals satisfied, mergestate CLEAN, capped at
+ * MAX_ENQUEUES_PER_FIRE per fire. A queue-enabled base is unaffected, because
+ * the queue path is chosen before the mergeability test. But the outcome string
+ * must not claim "armed" for a merge that already happened — this whole defect
+ * was a receipt reporting an action it had not taken.
+ *
+ * ponytail: that costs one doomed call per stacked PR per fire on an
+ * unprotected base. Acceptable because it self-heals the moment the base is
+ * protected or the PR is retargeted, and it needs no per-repo config. If the
+ * noise ever matters, skip rows whose base is unprotected — one
+ * `gh api repos/{repo}/branches/{base}` per distinct base, not per PR.
+ */
+export function applyRow(repo, row, run = gh) {
   if (row.action === "enqueue") {
-    gh(["pr", "merge", String(row.number), "--repo", repo, "--auto"]);
-    return "auto-merge armed";
+    run(["pr", "merge", String(row.number), "--repo", repo, "--auto", "--rebase"]);
+    // Deliberately not "armed": this call queues, arms, or merges outright
+    // depending on the base, and the receipt must not name the one it guessed.
+    return "merge requested";
   }
   if (row.action === "stale-enqueue") {
-    gh(["pr", "merge", String(row.number), "--repo", repo, "--disable-auto"]);
+    run(["pr", "merge", String(row.number), "--repo", repo, "--disable-auto"]);
     return commentOnce(
       repo,
       row.number,
       STALE_ENQUEUE_MARKER,
       `Auto-merge had been armed for over ${STALE_ENQUEUE_HOURS}h without landing, so the landing ` +
         `routine disarmed it. It will re-arm on the next fire once this PR classifies clean.`,
+      run,
     );
   }
   if (row.action === "codeowner-review-requested") {
@@ -666,6 +723,7 @@ function applyRow(repo, row) {
       `This PR is clean at its current head but still has an outstanding code-owner review ` +
         `request (${row.detail}). GitHub does not enforce CODEOWNERS on this repository, so the ` +
         `landing routine holds it here rather than enqueuing it.`,
+      run,
     );
   }
   return null;
@@ -708,6 +766,24 @@ export function settleMinutesFrom(value = process.env.LAND_CLEAN_PRS_SETTLE_MINU
   return parsed;
 }
 
+/**
+ * Records a non-fatal apply failure in the `action` column, not just `detail`.
+ * `renderReceipt` tallies by action, so a failure left only in free text is
+ * invisible to the summary line — which is how #2020 reported `enqueue` for 25
+ * hours while arming nothing.
+ *
+ * Renaming the action also drops the row out of `main`'s `spent` tally, which
+ * counts `enqueue` rows against the per-fire cap. That is the wanted reading: a
+ * failed enqueue consumed no queue slot.
+ */
+export function markFailure(row, message) {
+  row.action = `${row.action}-failed`;
+  row.detail = [row.detail, `failed: ${String(message).trim().split("\n")[0]}`]
+    .filter(Boolean)
+    .join(" — ");
+  return row;
+}
+
 function runRepo(repo, apply, settleMinutes, spent, rotted) {
   const rows = classifyAll(fetchOpenPrs(repo), { settleMinutes, spent });
 
@@ -732,9 +808,7 @@ function runRepo(repo, apply, settleMinutes, spent, rotted) {
         console.error(`\nAborted the fire: ${row.detail}`);
         process.exit(1);
       }
-      row.detail = [row.detail, `failed: ${message.trim().split("\n")[0]}`]
-        .filter(Boolean)
-        .join(" — ");
+      markFailure(row, message);
     }
   }
 
