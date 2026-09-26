@@ -1205,10 +1205,17 @@ test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own
   // performed on the scrape itself. Asserting the exact shape is what stops a
   // later reader "restoring" a join against a series that does not exist,
   // which would make the alert permanently unevaluable rather than noisy.
+  //
+  // BLO-36522: this shape is what THIS chart copy renders, and this copy is
+  // deliberately unretuned. Porting Blockcast's fleet-count retune
+  // (`count(max by (agent_id) (...) > 900) >= 3`, for 10m) is expected to
+  // change this shape AND the two assertions below (`heldThreshold == "300"`
+  // and the 900s stacking cap) -- that is a correct port, not a regression.
   assert.match(
     expr,
     /^max by \(agent_id\) \(paperclip_agent_start_lock_held_seconds\) > (\d+)$/,
-    "wedged-start-lock alert must threshold the per-agent max of the hold gauge, with no refresh-freshness join",
+    "wedged-start-lock alert must threshold the per-agent max of the hold gauge, with no refresh-freshness join"
+      + " (unretuned chart copy -- porting the BLO-36522 fleet-count form changes this shape and the two assertions below)",
   );
 
   const [, heldThreshold] = expr.match(/> (\d+)$/) ?? [];
@@ -1253,8 +1260,10 @@ test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own
   assert.ok(
     Number(heldThreshold) + forMinutes * 60 <= 900,
     `hold threshold ${heldThreshold}s plus for-window ${forWindow} stacks to `
-      + `${Number(heldThreshold) + forMinutes * 60}s; a wedge must page inside 15m, `
-      + "not on the 6-19h timescale the incident actually ran",
+      + `${Number(heldThreshold) + forMinutes * 60}s; this unretuned copy's 300s threshold `
+      + "must not drift far enough to stop being a prompt page on the condition it still "
+      + "renders (BLO-36522: the retuned fleet-count pair stacks to 900 + 600 = 1500s by "
+      + "design, and porting it is expected to move this cap with it)",
   );
 
   // Severity, not decoration: the lock has no timeout, so nothing external
@@ -1342,17 +1351,42 @@ test("the start-lock retune prose does not run ahead of the evidence (BLO-36522)
 
   // The withdrawn claim has now been removed at five sites across four heads,
   // each found by re-grepping the phrase rather than by re-reading the diff --
-  // so assert the class is gone instead of waiting for a sixth site. These two
-  // files carry it only as live operator instruction (a rendered alert
-  // annotation and the runbook index), never as quotation. queued-run-stranded
-  // .md and this file are excluded on purpose: both quote the claim in order to
-  // withdraw it, which is the one place it still belongs.
-  for (const relPath of [
-    "deploy/helm/paperclip/templates/prometheusrule.yaml",
-    "runbooks/README.md",
+  // so assert the class is gone instead of waiting for a sixth site. These
+  // three files carry start-lock guidance as live operator/operator-adjacent
+  // instruction, never as quotation. queued-run-stranded.md and this file are
+  // excluded on purpose: both quote the claim in order to withdraw it, which
+  // is the one place it still belongs.
+  //
+  // Each file is sliced to its start-lock region rather than scanned whole.
+  // The phrases are ordinary English, and prometheusrule.yaml is a 909-line
+  // multi-alert template while README.md indexes every runbook -- a future
+  // alert whose hold genuinely does not self-heal would otherwise fail here
+  // with a message about BLO-36522, and the likely repair is weakening this
+  // guard. The `assert.ok` on each slice is what stops a renamed heading or
+  // key turning the scan into a vacuous pass.
+  for (const [relPath, region] of [
+    [
+      "deploy/helm/paperclip/templates/prometheusrule.yaml",
+      /\n\s+- alert: PaperclipAgentStartLockWedged\n[\s\S]*?(?=\n\s+- alert: |\n\s+- name: |$)/,
+    ],
+    [
+      "runbooks/README.md",
+      /\n- \[`queued-run-stranded\.md#agent-start-lock-wedged-pen-3305`\][\s\S]*?(?=\n- \[|$)/,
+    ],
+    [
+      "deploy/helm/paperclip/values.yaml",
+      /\n\s+# -- How long a single per-agent start lock may be held[\s\S]*?agentStartLockWedgedRunbookUrl: .*/,
+    ],
   ]) {
+    const [section] =
+      readFileSync(path.join(repoRoot, relPath), "utf8").match(region) ?? [];
+    assert.ok(
+      section,
+      `${relPath} must keep its start-lock section for the BLO-36522 guard to scan; `
+        + "a renamed heading or key would otherwise make this assertion vacuous",
+    );
     assert.doesNotMatch(
-      readFileSync(path.join(repoRoot, relPath), "utf8"),
+      section,
       /does not self-heal|never self-heals|process must be replaced|process is replaced/,
       `${relPath} must not restate the "does not self-heal" / "replace the process" `
         + "claims BLO-36522 withdrew; they are false as measured 2026-09-25",
