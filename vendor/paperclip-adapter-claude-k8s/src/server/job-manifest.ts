@@ -124,12 +124,36 @@ const RUNTIME_CACHE_ENV: Record<string, string> = {
  * symlink. That fallback is also why a wrong value here degrades safely: the
  * worst case is a shared store at the mount root, never a per-workspace one.
  *
- * ponytail: one store shared by all persistent workspaces. `pnpm store prune`
- * run from inside one workspace would evict objects the others still reference
- * (it only sees its own projects); nothing in the fleet runs it today. If that
- * changes, give each *agent* its own store rather than each workspace.
+ * Scoped per COMPANY, not fleet-wide. A store is a writable, hardlink-source
+ * directory: an object written by one company's agent gets hardlinked into
+ * another's `node_modules`, so a shared root would erase the tenancy boundary
+ * that `isolationRoot` (`.../k8s-isolation/${companyId}/${agentId}/${key}`)
+ * maintains everywhere else in this file. That is not latent — the isolation
+ * root already holds two live company UUIDs. The dedup cost is ~nil: the 6.98x
+ * duplication measured above is *within* a company, across workspaces
+ * converging on the same dependency set.
+ *
+ * Deliberately NOT derived from the operator-configurable `isolationRoot`. This
+ * must stay on the PVC even when an operator repoints that elsewhere, and the
+ * cross-device fallback below makes the divergence safe rather than broken.
+ *
+ * `PNPM_HOME` is also pnpm's global *bin* directory, so the path is named
+ * `pnpm` (not `pnpm-store`) to match pnpm's own layout: bins land in
+ * `<root>/<companyId>/`, the store in `<root>/<companyId>/store/v11`.
+ *
+ * ponytail: one store shared by all of a company's persistent workspaces.
+ * `pnpm store prune` run from inside one workspace would evict objects the
+ * others still reference (it only sees its own projects); nothing in the fleet
+ * runs it today. If that changes, give each *agent* its own store rather than
+ * each workspace.
  */
-const SHARED_PNPM_STORE_PATH = "/paperclip/instances/default/data/k8s-isolation/pnpm-store";
+const SHARED_PNPM_STORE_ROOT = "/paperclip/instances/default/data/k8s-isolation/pnpm";
+
+function sharedPnpmStorePath(rawCompanyId: string): string {
+  const companyId = sanitizeForK8sPath(rawCompanyId);
+  assertSafePathComponent("companyId", companyId);
+  return `${SHARED_PNPM_STORE_ROOT}/${companyId}`;
+}
 
 type IsolationStorage = "ephemeral" | "persistent";
 
@@ -760,7 +784,7 @@ export const ENV_NAME_CLASSIFICATION: readonly EnvNameClassification[] = [
     name: "PNPM_HOME",
     classification: "SAFE_LITERAL",
     reason:
-      "pnpm store path. Shared across persistent workspaces so the content-addressed store is not duplicated per workspace (BLO-36583).",
+      "pnpm store path. Shared across a company's persistent workspaces so the content-addressed store is not duplicated per workspace (BLO-36583).",
   },
   {
     name: "TMPDIR",
@@ -1120,13 +1144,13 @@ function buildEnvVars(
         PLAYWRIGHT_BROWSERS_PATH: `${isolation.cacheRoot}/ms-playwright`,
         // pnpm's store is data, not cache, so none of the vars above reach it
         // and it followed HOME onto the PVC once per workspace (BLO-36583).
-        // Shared when the workspace is persistent — same filesystem as the
-        // checkout, which pnpm requires to hardlink into node_modules; per-run
-        // otherwise, where cacheRoot is already ephemeral. See
-        // SHARED_PNPM_STORE_PATH.
+        // Shared per company when the workspace is persistent — same filesystem
+        // as the checkout, which pnpm requires to hardlink into node_modules;
+        // per-run otherwise, where cacheRoot is already ephemeral. See
+        // SHARED_PNPM_STORE_ROOT.
         PNPM_HOME:
           isolation.storage.workspace === "persistent"
-            ? SHARED_PNPM_STORE_PATH
+            ? sharedPnpmStorePath(agent.companyId)
             : `${isolation.cacheRoot}/pnpm`,
         // Run-scoped so concurrent stateless Jobs never share a writable temp
         // directory (BLO-16219) — previously unset here, defaulting to the
