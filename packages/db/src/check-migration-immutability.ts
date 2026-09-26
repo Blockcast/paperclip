@@ -21,9 +21,18 @@ export type MigrationImmutabilityOptions = {
   branch?: string;
 };
 
+/**
+ * Why nothing was checked. Only `no-work-tree` is benign — `pnpm build` runs
+ * this inside the Docker image, which has no `.git` (`.dockerignore:1`). The
+ * other two mean we ARE in a work tree and simply could not compare, which is
+ * the false-green this guard exists to prevent, so they must fail rather than
+ * skip. `main()` branches on this tag, not on the prose in `reason`.
+ */
+export type UncheckedCause = "no-work-tree" | "no-base" | "diff-failed";
+
 export type MigrationImmutabilityResult =
   /** No comparable base was available, so nothing was checked. */
-  | { checked: false; reason: string }
+  | { checked: false; cause: UncheckedCause; reason: string }
   | { checked: true; baseRef: string; offenders: string[] };
 
 async function git(repoDir: string, args: string[]): Promise<string> {
@@ -95,10 +104,12 @@ export async function checkMigrationImmutability(
   const branch = options.branch ?? "master";
 
   const toplevel = (await tryGit(startDir, ["rev-parse", "--show-toplevel"]))?.trim();
-  if (!toplevel) return { checked: false, reason: `${startDir} is not inside a git work tree` };
+  if (!toplevel) {
+    return { checked: false, cause: "no-work-tree", reason: `${startDir} is not inside a git work tree` };
+  }
 
   const base = await resolveBaseRef(toplevel, remote, branch);
-  if ("reason" in base) return { checked: false, reason: base.reason };
+  if ("reason" in base) return { checked: false, cause: "no-base", reason: base.reason };
 
   const diff = await tryGit(toplevel, [
     "diff",
@@ -108,7 +119,9 @@ export async function checkMigrationImmutability(
     "--",
     migrationsPath,
   ]);
-  if (diff === null) return { checked: false, reason: `\`git diff ${base.ref}\` failed` };
+  if (diff === null) {
+    return { checked: false, cause: "diff-failed", reason: `\`git diff ${base.ref}\` failed` };
+  }
 
   // Only `.sql` directly in the migrations folder. `meta/_journal.json` is
   // bookkeeping and is supposed to change; nested paths are not migrations.
@@ -128,7 +141,8 @@ export function formatOffenders(offenders: string[], baseRef: string): string {
     `Applied migration(s) edited: ${offenders.join(", ")}.\n` +
     `These files already exist on ${baseRef}, so every already-migrated database has ` +
     `applied them and recorded the sha256 of their ORIGINAL bytes in ` +
-    `drizzle.__drizzle_migrations. That table has no \`name\` column, so ` +
+    `drizzle.__drizzle_migrations. On the stock drizzle schema that table has no ` +
+    `\`name\` column, so ` +
     `loadAppliedMigrations() reconstructs the applied set by hashing each file's CURRENT ` +
     `content (mapHashesToMigrationFiles). Changing even a comment or a blank line changes ` +
     `the hash, the stored row resolves to nothing, and the migration reads as PENDING ` +
@@ -140,15 +154,22 @@ export function formatOffenders(offenders: string[], baseRef: string): string {
   );
 }
 
-async function main() {
-  const result = await checkMigrationImmutability();
+export async function main(options: MigrationImmutabilityOptions = {}) {
+  const result = await checkMigrationImmutability(options);
 
   if (!result.checked) {
-    // Not a failure: `pnpm build` runs this inside the Docker image, which has
-    // no `.git`. Loud on stderr so a CI job that quietly stops checking is
-    // visible in the log rather than passing as a green guard.
-    console.error(`${basename(process.argv[1])}: skipped — ${result.reason}`);
-    return;
+    // Only the Docker case is benign: `pnpm build` runs this inside the image,
+    // which has no `.git`. Loud on stderr so a job that quietly stops checking
+    // is visible in the log rather than passing as a green guard.
+    if (result.cause === "no-work-tree") {
+      console.error(`${basename(process.argv[1])}: skipped — ${result.reason}`);
+      return;
+    }
+    // We are in a work tree and could not compare. In CI that is exactly the
+    // load-bearing path — `build` checks out at the default `fetch-depth: 1`,
+    // so the fetch at resolveBaseRef() is the only way a base exists, and a
+    // transient failure there used to exit 0 and silently disable the guard.
+    throw new Error(`could not verify migration immutability — ${result.reason}`);
   }
 
   if (result.offenders.length > 0) throw new Error(formatOffenders(result.offenders, result.baseRef));
