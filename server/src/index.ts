@@ -60,7 +60,7 @@ import {
   toolAccessService,
 } from "./services/index.js";
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
-import { setDbEffectiveTimeouts } from "./services/metrics.js";
+import { setDbInheritedTimeouts } from "./services/metrics.js";
 import { auditConfiguredHookCommandsOnBoot } from "./services/lifecycle-hook-command-audit.js";
 import {
   parseAdapterRegistryEnv,
@@ -744,7 +744,7 @@ export async function startServer(): Promise<StartedServer> {
           ? " — statement_timeout is disabled, so a blocked query is bounded by nothing server-side (PEN-3365)"
           : ""),
     );
-    setDbEffectiveTimeouts([
+    setDbInheritedTimeouts([
       inheritedTimeouts.statementTimeout,
       inheritedTimeouts.idleInTransactionSessionTimeout,
       inheritedTimeouts.lockTimeout,

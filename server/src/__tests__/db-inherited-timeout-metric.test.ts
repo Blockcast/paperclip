@@ -14,14 +14,22 @@
  * `disabled` for a missing measurement, or who reads the value in the probe's
  * milliseconds while the series is named `_seconds`, gets the step-3 decision
  * backwards in the direction that silently leaves the pool unbounded.
+ *
+ * The series name is asserted for the same reason. It reports what the pool
+ * INHERITS, which for `idle_in_transaction_session_timeout` is provably not
+ * its effective value — `createDb` sets that to 120 s in its own startup
+ * packet and the probe deliberately reads on a connection carrying none of
+ * those overrides. Under an `_effective_` name that series reading `0` would
+ * say "unbounded" about the one setting #1921 already bounds, and the name is
+ * what lands in PromQL where no doc comment is read.
  */
 
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  DB_EFFECTIVE_TIMEOUT_METRIC,
+  DB_INHERITED_TIMEOUT_METRIC,
   __resetMetricsForTest,
   renderMetrics,
-  setDbEffectiveTimeouts,
+  setDbInheritedTimeouts,
 } from "../services/metrics.js";
 
 afterEach(() => {
@@ -38,7 +46,7 @@ async function seriesFor(metric: string): Promise<string[]> {
 /** Parse `metric{setting="x",source="y"} 1.5` into a keyed lookup. */
 async function readings(): Promise<Map<string, { value: number; source: string }>> {
   const out = new Map<string, { value: number; source: string }>();
-  for (const line of await seriesFor(DB_EFFECTIVE_TIMEOUT_METRIC)) {
+  for (const line of await seriesFor(DB_INHERITED_TIMEOUT_METRIC)) {
     const setting = line.match(/setting="([^"]+)"/)?.[1];
     const source = line.match(/source="([^"]+)"/)?.[1];
     const value = Number(line.slice(line.lastIndexOf(" ") + 1));
@@ -48,10 +56,20 @@ async function readings(): Promise<Map<string, { value: number; source: string }
 }
 
 describe("inherited DB timeout exposition (PEN-3365)", () => {
+  it("names the series for what it measures: inherited, not effective", () => {
+    // Not cosmetic. `createDb` bounds idle-in-transaction at 120s in the pool's
+    // startup packet (#1921) and this probe deliberately does not observe that,
+    // so under an `_effective_` name the resulting 0 would assert "unbounded"
+    // about a setting that is bounded. The name is the part that reaches
+    // PromQL, dashboards and alert rules; the help string is not read there.
+    expect(DB_INHERITED_TIMEOUT_METRIC).toBe("paperclip_db_inherited_timeout_seconds");
+    expect(DB_INHERITED_TIMEOUT_METRIC).not.toContain("effective");
+  });
+
   it("publishes one series per setting, carrying the attributing source", async () => {
-    setDbEffectiveTimeouts([
+    setDbInheritedTimeouts([
       { name: "statement_timeout", valueMs: 30_000, source: "user" },
-      { name: "idle_in_transaction_session_timeout", valueMs: 120_000, source: "session" },
+      { name: "idle_in_transaction_session_timeout", valueMs: 120_000, source: "database" },
       { name: "lock_timeout", valueMs: null, source: "default" },
     ]);
 
@@ -69,7 +87,7 @@ describe("inherited DB timeout exposition (PEN-3365)", () => {
   });
 
   it("converts the probe's milliseconds to the seconds the metric name promises", async () => {
-    setDbEffectiveTimeouts([{ name: "statement_timeout", valueMs: 30_000, source: "user" }]);
+    setDbInheritedTimeouts([{ name: "statement_timeout", valueMs: 30_000, source: "user" }]);
 
     // 30 not 30000 — a reader sizing an explicit timeout against a 1000x
     // overstatement would conclude we already inherit a bound three orders of
@@ -78,7 +96,7 @@ describe("inherited DB timeout exposition (PEN-3365)", () => {
   });
 
   it("publishes a disabled timeout as 0, the way Postgres encodes it", async () => {
-    setDbEffectiveTimeouts([{ name: "statement_timeout", valueMs: null, source: "default" }]);
+    setDbInheritedTimeouts([{ name: "statement_timeout", valueMs: null, source: "default" }]);
 
     // This is the unbounded case PEN-3365 exists for. It must be a present
     // series reading 0, never an absent one: absence is reserved for "the
@@ -90,12 +108,12 @@ describe("inherited DB timeout exposition (PEN-3365)", () => {
   });
 
   it("retires a stale source series when the reading moves", async () => {
-    setDbEffectiveTimeouts([{ name: "statement_timeout", valueMs: null, source: "default" }]);
-    setDbEffectiveTimeouts([{ name: "statement_timeout", valueMs: 30_000, source: "user" }]);
+    setDbInheritedTimeouts([{ name: "statement_timeout", valueMs: null, source: "default" }]);
+    setDbInheritedTimeouts([{ name: "statement_timeout", valueMs: 30_000, source: "user" }]);
 
     // Without reset() both label sets would persist, and a reader taking the
     // first or the max would get the retired `default`/0 reading back.
-    const lines = await seriesFor(DB_EFFECTIVE_TIMEOUT_METRIC);
+    const lines = await seriesFor(DB_INHERITED_TIMEOUT_METRIC);
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain('source="user"');
   });
@@ -103,6 +121,6 @@ describe("inherited DB timeout exposition (PEN-3365)", () => {
   it("exposes nothing at all until the probe reports", async () => {
     // The probe is wrapped so it can never block startup, so "no series" is a
     // real state and must stay distinguishable from any reading.
-    expect(await seriesFor(DB_EFFECTIVE_TIMEOUT_METRIC)).toHaveLength(0);
+    expect(await seriesFor(DB_INHERITED_TIMEOUT_METRIC)).toHaveLength(0);
   });
 });
