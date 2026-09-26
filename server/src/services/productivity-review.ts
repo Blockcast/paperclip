@@ -1887,6 +1887,60 @@ function isTerminalGateClosableTriggerSet(triggers: unknown) {
     && triggers.every((trigger) => trigger === "long_active_duration");
 }
 
+// BLO-35725 (Ally review on eb48670e): which triggers a `done` source retires.
+// This MUST be the set form, for exactly the reason BLO-22436 gives one arm
+// over. Keying on the primary trigger alone was safe for the first two members
+// by accident, not by design: `runaway_execution` (rank 4) and
+// `long_active_duration` (rank 5) both sit *below* `no_comment_streak` (2) and
+// `high_churn` (3) in `choosePrimaryTrigger`'s ladder, so neither can be primary
+// while an accountability trigger fired. `runtime_failure_streak` sits at the
+// *top* of that ladder and is the first member for which the accident stops
+// holding — it presents a closable primary while carrying a non-closable
+// accountability record underneath.
+//
+// The overlap is the norm rather than a corner, on the file's own arithmetic:
+// `runtimeFailure` fires at `runtimeFailureStreak >= noCommentStreakRuns` and
+// `highChurn` at `runCountLastHour >= highChurnHourly` (one of its two
+// disjuncts; the six-hour arm only widens the overlap), both defaulting to 10,
+// and `countIssueRunsSince` is an unfiltered count — infra-failure runs count
+// toward churn in full. Ten fast infra-failing runs inside an hour trip both.
+// Retiring that row would destroy the `high_churn` cost record permanently:
+// generation only scans `["todo", "in_progress"]` sources, so a `done` source
+// can never re-fire it.
+//
+// Requires a non-empty set: absent/empty provenance is unknown and fails closed.
+function isTerminalSourceClosableTriggerSet(triggers: unknown) {
+  return Array.isArray(triggers) && triggers.length > 0
+    && triggers.every((trigger) => trigger === "long_active_duration"
+      || trigger === "runaway_execution"
+      || trigger === "runtime_failure_streak");
+}
+
+// Close-path form. With persisted provenance the set form decides, and that is
+// robust however the ladder is later reordered.
+//
+// The legacy fallback (rows minted before `firedTriggers` was persisted) is
+// deliberately asymmetric, and the asymmetry is the point:
+//   - `long_active_duration` / `runaway_execution` keep the old primary-trigger
+//     behaviour. Their ladder position makes it provably safe, and failing
+//     closed would strand every legacy row open forever — generation skips
+//     `done` sources, so nothing would ever reopen them. That is precisely the
+//     defect BLO-20549 added this close path to fix.
+//   - `runtime_failure_streak` fails closed. For these rows we cannot tell
+//     whether `high_churn` co-fired, and falling back would reintroduce the
+//     hole above for exactly the rows we cannot inspect. It is also new, so
+//     there is no stranding risk to trade against: no legacy row carries it.
+//
+// ⚠ The first bullet depends on `runaway_execution` and `long_active_duration`
+// staying *below* the accountability triggers in `choosePrimaryTrigger`. If you
+// reorder that ladder, this fallback must go fail-closed too.
+function isTerminalSourceClosableRecord(trigger: unknown, firedTriggers: unknown) {
+  if (firedTriggers === undefined || firedTriggers === null) {
+    return trigger === "long_active_duration" || trigger === "runaway_execution";
+  }
+  return isTerminalSourceClosableTriggerSet(firedTriggers);
+}
+
 // Close-path form: the persisted `details.firedTriggers` when the review was
 // minted with one, else the single `details.trigger` for rows written before
 // BLO-22436's follow-up. The fallback is deliberately the *old* behaviour and
@@ -3454,14 +3508,42 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       // source still open, and that case is retired by the `execution_ended`
       // arm below on the real predicate (Ally review on 7f4fbc43b). The two
       // overlap deliberately — this one costs no extra read when it applies.
+      // `runtime_failure_streak` rides it too (BLO-35725): like the two above
+      // and unlike the accountability triggers, its rubric is entirely
+      // forward-looking about a *live* condition — "diagnose the
+      // dispatch/runtime fault", "confirm the fault has cleared and let the
+      // issue continue unattended". It is explicitly not an agent-conduct
+      // record: `isSoftStopTrigger` omits it because withholding the agent's
+      // next turn would punish it for the platform's failure. Once the source
+      // reaches `done` the faults did not prevent delivery and there is no
+      // turn left to release, so every option in its rubric is moot.
+      // Source-`done` is a convenience proxy here exactly as it is for
+      // `runaway_execution`, and for the same reason it is safe: a completed
+      // source does not prove the fault cleared fleet-wide, but a per-source
+      // review is the wrong instrument for a fleet-wide fault (that is
+      // BLO-34556's job) and a still-faulting assignee re-fires on its *next*
+      // source. Not on this one: this arm is gated on `done` by construction and
+      // generation only scans `["todo", "in_progress"]` sources, so nothing
+      // re-fires for this source ever again (Ally review on eb48670e — the
+      // unscoped version of this sentence is true only in the `execution_ended`
+      // arm below, which is deliberately not gated on terminal status).
+      // No member of this arm carries a soft-stop — `isSoftStopTrigger` is
+      // exactly the accountability pair this arm excludes — so retiring it on a
+      // self-settable status grants the reviewed agent nothing it did not
+      // already have. That membership, not any contrast between the three
+      // members, is the discriminator to check before widening this arm
+      // (Ally review on 52dcdb96).
       // This does not extend to `cancelled`; an assignee can abandon and later
       // restore their own source issue, so cancellation must not retire its
       // oversight artifact. It also does not extend to historical/accountability
       // triggers (`no_comment_streak`, `high_churn`) or missing provenance:
       // completion does not invalidate those signals, and unknown trigger
-      // semantics fail closed.
+      // semantics fail closed. That exclusion is enforced over the *whole*
+      // fired set, not the primary trigger — see
+      // `isTerminalSourceClosableRecord` for why the distinction only started
+      // mattering when `runtime_failure_streak` joined.
       if (
-        (trigger === "long_active_duration" || trigger === "runaway_execution")
+        isTerminalSourceClosableRecord(trigger, reviewFiredTriggersById.get(review.id))
         && sourceIssue.status === "done"
       ) {
         suppressedBy = "terminal_source";
