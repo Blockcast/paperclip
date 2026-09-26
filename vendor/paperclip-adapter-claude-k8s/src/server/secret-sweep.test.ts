@@ -188,8 +188,34 @@ describe("sweepOrphanedRunSecrets", () => {
     expect(result.retained).toEqual([{ name: "ac-agent-run-mid-prompt", reason: "too_young" }]);
   });
 
-  it("still honours a caller floor above the minimum", async () => {
-    // The clamp is one-directional: it raises an unsafe floor, and must not
+  // BLO-21857 review follow-up (PR #1459, allyblockcast[bot]): Math.max is
+  // NaN-transparent, so `Math.max(MIN, NaN)` is NaN and `now - createdMs < NaN`
+  // is false for *every* Secret — the age check is not merely lowered, it is
+  // switched off, which is the one outcome the clamp exists to prevent. The
+  // execute.ts call site cannot produce NaN (asNumber filters it), but this
+  // function is exported with `ageFloorMs?: number`, so the guard must hold
+  // without relying on a caller one module away.
+  it("rejects a non-finite caller floor instead of disarming the age check", async () => {
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY]) {
+      const h = harness([secret("ac-agent-run-nan-prompt", { runId: "run-nan", ageSec: 5 })]);
+
+      const result = await sweepOrphanedRunSecrets({ ...h.opts, ageFloorMs: bad });
+
+      // Survives because the floor fell back to the default, not because a NaN
+      // comparison happened to be false — `reason` distinguishes the two.
+      expect(result.swept).toEqual([]);
+      expect(result.retained).toEqual([
+        { name: "ac-agent-run-nan-prompt", reason: "too_young" },
+      ]);
+      expect(h.deleteNamespacedSecret).not.toHaveBeenCalled();
+      // And the rejection is reported: `NaN < x` is false, so a `<` test here
+      // would be silently skipped.
+      expect(h.logs).toHaveLength(1);
+      expect(h.logs[0].message).toContain("age floor raised");
+    }
+  });
+
+  it("still honours a caller floor above the minimum", async () => {    // The clamp is one-directional: it raises an unsafe floor, and must not
     // lower a deliberately conservative one.
     const h = harness([secret("ac-agent-run-conservative-prompt", { runId: "run-c", ageSec: 3600 })]);
 
@@ -199,6 +225,28 @@ describe("sweepOrphanedRunSecrets", () => {
     expect(result.retained).toEqual([
       { name: "ac-agent-run-conservative-prompt", reason: "too_young" },
     ]);
+  });
+
+  // BLO-21857 review follow-up (PR #1459, allyblockcast[bot]): the clamp log had
+  // zero coverage — deleting the whole `onLog` block left this file green, so the
+  // one signal an operator gets that their configured floor was overridden could
+  // be removed silently. Both halves matter: it must speak on an override, and
+  // must stay quiet otherwise, or it is noise on every default sweep.
+  it("logs the clamp when a caller floor is raised, and stays silent when it is not", async () => {
+    const h = harness([secret("ac-agent-run-mid-prompt", { runId: "run-mid", ageSec: 120 })]);
+
+    await sweepOrphanedRunSecrets({ ...h.opts, ageFloorMs: 60_000 });
+    expect(h.logs).toHaveLength(1);
+    expect(h.logs[0].stream).toBe("stderr");
+    expect(h.logs[0].message).toContain("60000ms");
+    expect(h.logs[0].message).toContain(`${MIN_SWEEP_AGE_FLOOR_SEC * 1000}ms`);
+
+    // Above the minimum, and the default path (ageFloorMs undefined): no clamp
+    // happened, so there is nothing to report.
+    const quiet = harness([secret("ac-agent-run-c-prompt", { runId: "run-c", ageSec: 120 })]);
+    await sweepOrphanedRunSecrets({ ...quiet.opts, ageFloorMs: 7_200_000 });
+    await sweepOrphanedRunSecrets({ ...quiet.opts, ageFloorMs: undefined });
+    expect(quiet.logs).toEqual([]);
   });
 
   it("re-reads the Job before deleting, so one created after the list snapshot is honoured", async () => {
