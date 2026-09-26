@@ -94,8 +94,37 @@ const RUNTIME_CACHE_MOUNT_PATH = "/runtime-cache";
 const RUNTIME_CACHE_SIZE_LIMIT = "20Gi";
 
 /**
- * Cargo paths whose DEFAULT location is derived from $HOME, and therefore land
- * on the persistent PVC whenever isolation puts HOME there (BLO-15567).
+ * Cargo cache paths pinned onto the ephemeral cache root (BLO-15567). The two
+ * keys are here for DIFFERENT reasons — do not collapse them into one premise.
+ *
+ * `CARGO_TARGET_DIR` is the one that moves bytes. It is genuinely unset in the
+ * agent image, so it defaults to `<pkg>/target` INSIDE the checkout — which is
+ * on the PVC under `workspace` isolation. Naming it here is the actual fix.
+ *
+ * `CARGO_HOME` is NOT $HOME-derived on the current image: `ENV
+ * CARGO_HOME=/home/node/.cargo` is baked in at `Dockerfile.agent-toolchain`
+ * (a7d4db965, 2026-08-30), and `/home/node` is the container overlay, never a
+ * mount. So on a pod running that image or newer this redirect moves an
+ * already-ephemeral cache, and does not by itself reclaim PVC space. It is
+ * still worth setting, for two reasons: an explicit manifest env is
+ * independent of image-ROLLOUT state, so it also covers pods still running an
+ * image older than a7d4db965; and it bounds the cache under the volume's
+ * `sizeLimit` instead of node ephemeral-storage.
+ *
+ * That second reason is not hypothetical. 1.75 GiB of `.cargo` sits across 8
+ * isolation workspace homes on the PVC, and 5 of them carry real registry
+ * writes (`registry/src/**`, `.cargo-ok`) dated 2026-09-03 → 09-10 — i.e.
+ * AFTER the image ENV landed. Whether that is rollout lag or a non-claude
+ * adapter (the `opencode_k8s` path in BLO-15567 AC3, gated on BLO-15643) is
+ * NOT established; it is recorded here as an observation, not a diagnosis.
+ * Either way those bytes are pre-existing and this change does not reclaim
+ * them — that needs a separate pass.
+ *
+ * ⚠ TRADEOFF: `target/` now lands on the `runtime-cache` emptyDir, which
+ * carries `RUNTIME_CACHE_SIZE_LIMIT` (20Gi) and is shared with the eight other
+ * caches above, Playwright browsers included. Exceeding an emptyDir sizeLimit
+ * EVICTS the pod mid-run — abrupt, where PVC overflow was slow and visible.
+ * Low probability at current Rust volume; revisit if that grows.
  *
  * ⚠ RUSTUP_HOME is deliberately ABSENT. The agent image installs the Rust
  * toolchains into `/usr/local/rustup`; pointing RUSTUP_HOME at an empty

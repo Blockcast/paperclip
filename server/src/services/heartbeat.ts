@@ -7097,8 +7097,10 @@ const K8S_ISOLATION_OWNED_ENV_KEYS = new Set([
   "BUN_INSTALL_CACHE",
   "PIP_CACHE_DIR",
   "PLAYWRIGHT_BROWSERS_PATH",
-  // BLO-15567: these three default to $HOME-derived paths, so under isolation
-  // they follow HOME onto the persistent PVC unless the adapter owns them.
+  // BLO-15567: CARGO_TARGET_DIR is unset in the image and defaults to
+  // <pkg>/target inside the checkout, i.e. on the persistent PVC. CARGO_HOME
+  // is image-set (/home/node/.cargo, container overlay) — owned here so the
+  // manifest value is independent of image-rollout state. See CARGO_CACHE_ENV.
   "CARGO_HOME",
   "CARGO_TARGET_DIR",
   "PAPERCLIP_WORKSPACE_CWD",
