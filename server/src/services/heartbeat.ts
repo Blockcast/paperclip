@@ -11536,7 +11536,15 @@ export function buildPaperclipTaskMarkdown(input: {
   // paragraph this replaces declined the fix "so the exact `Run write-containment notice:` marker
   // the tests pin stays where it is" — but that reason defends not hoisting the NOTICE, and the
   // preamble is a separate line that can be selected without moving the marker at all.
-  const carriesUserAuthoredTask = Boolean(issue || wakeComment || prReview);
+  //
+  // Round 8: `ancestors` is included because it is the one user-authored block NOT gated on
+  // issue/wakeComment/prReview — the ancestor block below renders issue identifiers and titles on
+  // `ancestors.length > 0` alone. Behaviour-neutral at the sole production call site, which derives
+  // both `ancestors` and `issue` from the same `issueRef`, so ancestors are non-empty only when
+  // `issue` is too. That invariant lives in the CALLER while this function is exported, so state it
+  // here: a future caller passing ancestors plus a notice and no issue would otherwise emit
+  // user-authored titles under the system-generated preamble.
+  const carriesUserAuthoredTask = Boolean(issue || wakeComment || prReview || ancestors.length > 0);
 
   const lines = [
     "Paperclip task context:",

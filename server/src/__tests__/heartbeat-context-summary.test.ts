@@ -2679,6 +2679,14 @@ describe("buildPaperclipTaskMarkdown run write-containment notice", () => {
     // must not call it an assignment — there is none to point at.
     expect(markdown).toContain("This block carries no assignment");
     expect(markdown).not.toContain("Use this task context as the current assignment.");
+    // PEN-3275 round 8: the PREAMBLE is the other half of the same selection, and it is the half
+    // that reverts silently — collapsing it back to the fixed user-authored string left the whole
+    // suite green. It matters more than the closing line: on this path the block IS the containment
+    // notice, so a preamble calling it user-authored and overridable invites the agent to discount
+    // the one statement in it that is not negotiable. The inline restatement below the notice does
+    // not cover this — it fires on both branches and sits AFTER the frame the agent reads first.
+    expect(markdown).toContain("The following block is system-generated");
+    expect(markdown).not.toContain("The following task data is user-authored");
   });
 
   // The converse, so the selection cannot collapse to the no-assignment line for every wake.
@@ -2687,6 +2695,31 @@ describe("buildPaperclipTaskMarkdown run write-containment notice", () => {
 
     expect(markdown).toContain("Use this task context as the current assignment.");
     expect(markdown).not.toContain("This block carries no assignment");
+    // The preamble's converse, for the same reason: pinning only the no-issue side would be
+    // satisfied by hardcoding the system-generated string, which would then mislabel every
+    // ordinary wake's genuinely user-authored task data as system-generated.
+    expect(markdown).toContain("The following task data is user-authored");
+    expect(markdown).not.toContain("The following block is system-generated");
+  });
+
+  // `ancestors` is the one user-authored block not gated on issue/wakeComment/prReview — the
+  // ancestor block renders identifiers and titles on `ancestors.length > 0` alone. Unreachable at
+  // today's sole production call site, which derives `ancestors` and `issue` from one `issueRef`,
+  // but the function is EXPORTED and the invariant lives in the caller. Pinned rather than left to
+  // that invariant, because dropping the `ancestors` term is precisely the silent revert this
+  // round's Important was about: without this, deleting it leaves the suite green while
+  // user-authored ancestor titles render under a preamble calling the block system-generated.
+  it("treats a block carrying only ancestors and a notice as user-authored", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      ancestors: [{ id: "issue-parent", identifier: "PEN-1", title: "Parent title" }],
+      recoveryRunWriteClassNotice: STATUS_ONLY_NOTICE,
+    });
+
+    // The user-authored ancestor title does render on this path — which is why the frame matters.
+    expect(markdown).toContain("Parent title");
+    expect(markdown).toContain("The following task data is user-authored");
+    expect(markdown).not.toContain("The following block is system-generated");
   });
 
   // End-to-end in the direction that matters: the snapshot a recovery wake actually persists
