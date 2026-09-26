@@ -1223,8 +1223,10 @@ test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own
   // BLO-36522: "silent in steady state" is FALSE as written -- measured
   // 2026-09-25, 21 of 21 agents crossed 300s over 7d for 2,730 agent-minutes
   // (~390/day). Holds past 300s are routine, not exceptional. Blockcast's live
-  // rule was therefore retuned to a fleet-count expression and the log/alert
-  // numbers deliberately UNPINNED; see deploy/helm/paperclip/values.yaml
+  // rule is therefore being retuned to a fleet-count expression, with the
+  // log/alert numbers deliberately UNPINNED (Blockcast/onprem-k8s#3985,
+  // unmerged; until it lands the live rule is still > 300 and the two still
+  // share 300); see deploy/helm/paperclip/values.yaml
   // (agentStartLockHeldSeconds) and runbooks/queued-run-stranded.md. This
   // assertion still stands because THIS chart copy was not retuned -- it
   // guards the 300 that is still rendered here, not the deployed policy.
@@ -1268,6 +1270,56 @@ test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own
     block,
     /runbook_url: "[^"]*runbooks\/queued-run-stranded\.md#agent-start-lock-wedged-pen-3305"/,
     "wedged-start-lock alert must link the runbook section from its annotation",
+  );
+});
+
+test("the start-lock retune prose does not run ahead of the evidence (BLO-36522)", () => {
+  // Nothing renders from these two passages, so only an assertion catches them
+  // drifting. values.yaml is read by third parties enabling this chart
+  // elsewhere: calling the fleet-count retune Blockcast's live rule while
+  // Blockcast/onprem-k8s#3985 is unmerged hands them an unproven expression as
+  // proven. When #3985 merges, update the prose and this test together.
+  const values = readFileSync(
+    path.join(repoRoot, "deploy/helm/paperclip/values.yaml"),
+    "utf8",
+  );
+  // Same -1 hazard as the terminal-failed runbook guard: a renamed marker would
+  // otherwise slice from the last character and pass vacuously.
+  const warningIndex = values.indexOf("# WARNING (BLO-36522)");
+  assert.notStrictEqual(warningIndex, -1, "values.yaml must keep the BLO-36522 start-lock WARNING");
+  const warning = values.slice(warningIndex, values.indexOf("\n", warningIndex));
+  assert.match(
+    warning,
+    /in Blockcast\/onprem-k8s#3985, not yet merged; until it lands the live rule is still `> 300`/,
+    "values.yaml must describe the retune as pending in #3985, with the live rule still > 300",
+  );
+  assert.doesNotMatch(
+    warning,
+    /live rule in Blockcast\/onprem-k8s is now|NO LONGER the deployed policy/,
+    "values.yaml must not describe the unmerged retune as deployed",
+  );
+
+  // The 2h14m 2026-09-24 episode was three agents in lockstep, i.e. the
+  // fleet-scope regime, and it self-healed. Calling 09-15/16 the only
+  // fleet-scope instance erases the page's strongest datum and leaves a
+  // restart as the sole precedent for the condition now paging.
+  const runbook = readFileSync(
+    path.join(repoRoot, "runbooks/queued-run-stranded.md"),
+    "utf8",
+  );
+  const sectionIndex = runbook.indexOf("## Agent start lock wedged (PEN-3305)");
+  assert.notStrictEqual(sectionIndex, -1, "runbook must keep the start-lock section heading");
+  const nextSection = runbook.indexOf("\n## ", sectionIndex + 1);
+  const section = runbook.slice(sectionIndex, nextSection === -1 ? undefined : nextSection);
+  assert.doesNotMatch(
+    section,
+    /only\*?\s+documented\s+instance\s+of\s+the\s+fleet-scope\s+regime/,
+    "runbook must not call 2026-09-15/16 the only fleet-scope instance; 2026-09-24 was one too",
+  );
+  assert.match(
+    section,
+    /only\*?\s+documented\s+fleet-scope\s+episode\s+that\s+ended\s+with\s+a\s+pod\s+replacement/,
+    "runbook must narrow the 09-15/16 claim to the only fleet-scope episode ended by a pod replacement",
   );
 });
 
