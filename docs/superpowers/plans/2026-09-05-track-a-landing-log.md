@@ -728,18 +728,46 @@ ledger — not copied from an earlier draft.
 | `4effd9fa` | 2026-09-23T06:48:23Z | **#1804** `mergestate:CLEAN` | `none` |
 | `aa6a0a70` | 2026-09-23T16:44:08Z | 0 | **#1804 → `still-queued`** (OPEN at the time) |
 | `98027253` | 2026-09-24T14:10:23Z | **#2001, #1985, #1976** all `mergestate:CLEAN` | `none` |
-| `933af750` | 2026-09-25T07:18:04Z | **#2020** `mergestate:BLOCKED`, **#1774** `mergestate:CLEAN` | **#2001, #1985, #1976 → `still-queued`** (all OPEN) |
-| `85529fad` | 2026-09-25T08:12:04Z | **#2020** `mergestate:BLOCKED` | **#2020, #1774 → `still-queued`** (both OPEN) |
+| `933af750` | 2026-09-25T07:18:04Z | **#2020** `mergestate:BLOCKED` — **arm failed**, **#1774** `mergestate:CLEAN` | **#2001, #1985, #1976 → `still-queued`** (all OPEN) |
+| `85529fad` | 2026-09-25T08:12:04Z | **#2020** `mergestate:BLOCKED` — **arm failed** | **#2020, #1774 → `still-queued`** (both OPEN) |
 
-**Step 3 of the routine description works end to end.** Each receipt carrying `enqueue` rows is
-followed by a receipt that resolves exactly those rows — which is the behaviour AC 4 was written
-for, and it is no longer vacuous.
+**Step 3 of the routine description works end to end for the rows that actually armed** — #1990,
+#1804, #2001, #1985, #1976 and #1774. Each receipt carrying those rows is followed by a receipt
+that resolves exactly them, which is the behaviour AC 4 was written for, and it is no longer
+vacuous. **#2020 is the exception and it is not a latency story** — see below.
 
 This table is the record **through `85529fad` (2026-09-25T08:12:04Z)** and is deliberately not
 extended past it — the ledger keeps growing and a table that chases it is stale on every fire.
 Later receipts exist and live on BLO-34818, which is the running ledger. Both of the two rows added
-here carry `enqueue` rows *and* resolve the previous receipt's rows, so the loop is closing on every
-cycle, not only on the three recorded above them.
+here carry `enqueue` rows *and* resolve the previous receipt's rows, so the confirmation half of
+the loop is closing on every cycle, not only on the three recorded above them. The arming half is
+not, for #2020.
+
+#### #2020 — an `enqueue` row that has never armed, nine fires deep
+
+The receipt rows this table summarises carry a fourth column it drops, and for #2020 that column is
+the whole story:
+
+    | #2020 | `enqueue` | `mergestate:BLOCKED` | failed: --merge, --rebase, or --squash required when not running interactively |
+    | #1774 | `enqueue` | `mergestate:CLEAN`   | auto-merge armed |
+
+Read live from the BLO-34818 ledger on 2026-09-26, #2020 carries that identical failure on **nine
+consecutive receipts** — `933af750` (09-25T07:18Z), `85529fad`, `07eccc8e`, `a36fe303`, `1997d81b`,
+`e96f388d`, `acc91d82`, `7df31c9d`, `8ae54c04` (09-26T08:17Z) — and the 09-26T14:37Z receipt
+`517622da` flags it again. So the `still-queued` confirmations recorded for #2020 above report a
+steady state that **never started**: nothing was ever queued to stay queued.
+
+The cause is in the script, not in #2020. `scripts/land-clean-prs.mjs:433` arms with
+`gh pr merge <n> --repo <repo> --auto` and supplies no merge method; `gh` refuses non-interactively
+when it cannot infer one. Every `enqueue` row that armed was `mergestate:CLEAN` and the only one
+that has ever failed is `mergestate:BLOCKED` — a clean correlation across all seven distinct
+`enqueue` rows to date, but one distinct failing PR, so **whether `BLOCKED` is the discriminator is
+not established**. Logged as an open question for C1 ([BLO-32240](https://paperclip.blockcast.net/BLO/issues/BLO-32240)),
+not resolved here: the fix is a change to the script, outside this routine's remit.
+
+This is recorded rather than smoothed over for the same reason the coalescing note below is: a log
+that reads a nine-fire silent failure as a successful enqueue is producing exactly the false defect
+— in the flattering direction — that this document warns about.
 
 #### Two PRs landed — the end-to-end proof
 
@@ -750,9 +778,10 @@ cycle, not only on the three recorded above them.
 without a hand merge.
 
 The remaining rows are open as of writing — #2001, #1985, #1976, #2020, #1774 all `state: OPEN`,
-`mergedAt: null` — so `still-queued` remains the accurate classification for them. **No receipt has
-yet printed a literal `confirmed-merged` row**, because both merges fell outside the one-receipt
-confirmation window that had already resolved those rows.
+`mergedAt: null` — so `still-queued` remains the accurate classification for the four that armed.
+For #2020 it is accurate only about the PR's state, not about the routine's: it never entered the
+queue. **No receipt has yet printed a literal `confirmed-merged` row**, because both merges fell
+outside the one-receipt confirmation window that had already resolved those rows.
 
 #### AC 3 names a field this repo does not use — fifth plan-vs-reality drift
 
@@ -786,11 +815,15 @@ over-counts; taking the newest receipt you happen to have cached under-counts.
 PR #1954 — the PR carrying this file — was itself **ejected from the merge queue at
 `2026-09-24T21:48:10Z`**. The merge-group run `36050446289` failed on
 `General tests (workspaces-a)`, whose actual failure is a `waitForServer` timeout in
-`src/__tests__/company-import-export-e2e.test.ts:291` — a server-start flake. #1954 is docs-only
+`cli/src/__tests__/company-import-export-e2e.test.ts:291` — a server-start flake. (vitest prints
+that path relative to the `paperclipai` workspace, i.e. without the `cli/` prefix; it is written in
+full here so the line opens from the repo root.) #1954 is docs-only
 (one Markdown file, no executable surface), and a merge-group tests the PR combined with master, so
 this failure cannot have come from the PR's content. It is recorded here rather than filed as a
-defect: one flake in a queue that was otherwise draining (5 of the 8 surrounding merge-group runs
-succeeded) is not a finding.
+defect: one flake in a queue that was otherwise draining is not a finding. (An earlier draft said
+"5 of the 8 surrounding merge-group runs succeeded"; the count is dropped because it never named
+its window and does not reproduce on either natural reading of one. The qualitative claim is what
+the argument rests on, and it holds on every window tried.)
 
 The ejection is also what made this correction possible. It had been written earlier and refused
 with `GH006 — Branches that are queued for merging cannot be updated`; dequeuing to push a
