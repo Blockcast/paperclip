@@ -106,6 +106,7 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
     assigneeAgentId?: string | null;
     description?: string | null;
     executionState?: Record<string, unknown> | null;
+    monitorNextCheckAt?: Date | null;
   }) {
     const id = randomUUID();
     await db.insert(issues).values({
@@ -120,6 +121,7 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
       originKind: "manual",
       originFingerprint: "default",
       executionState: input.executionState ?? null,
+      monitorNextCheckAt: input.monitorNextCheckAt ?? null,
     });
     return id;
   }
@@ -385,9 +387,13 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
       companyId,
       identifier: "SB6-1",
       status: "blocked",
+      // BLO-27553: the live `nextCheckAt` is what makes this fixture match its own name.
+      // Without it the row is not gated by anything — it just carries the residue of a
+      // monitor that has already stopped firing, which is the strand shape below.
+      monitorNextCheckAt: new Date(Date.now() + 60_000),
       executionState: {
         monitor: {
-          status: "triggered",
+          status: "scheduled",
           gateSignals: ["pr:example/repo#1:review"],
         },
       },
@@ -397,6 +403,73 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
 
     expect(result.reconciled).toBe(0);
     expect(await statusOf(gated)).toBe("blocked");
+  });
+
+  // BLO-27553. The matched pair is the point: asserting only that the cleared-monitor row
+  // drains cannot distinguish "the liveness clause works" from "the reconciler swept
+  // everything", so the live-monitor control must survive the SAME sweep.
+  //
+  // `gateSignals` is written when a monitor is armed and is never erased when that monitor
+  // is cleared, so testing the array's presence answered "did this row EVER have a monitor".
+  // That pinned every such row `blocked` permanently — measured 2026-09-26 on 19 of 23
+  // estate-wide strands, all carrying `clearReason` `trigger_stalled` / `timeout_exceeded`.
+  it("sweeps a row whose monitor was cleared but still carries gateSignals, and not its live twin", async () => {
+    const { companyId } = await createCompany("SB7");
+    const cleared = await insertIssue({
+      companyId,
+      identifier: "SB7-1",
+      status: "blocked",
+      monitorNextCheckAt: null,
+      executionState: {
+        monitor: {
+          status: "cleared",
+          clearReason: "trigger_stalled",
+          clearedAt: new Date(Date.now() - 3_600_000).toISOString(),
+          gateSignals: ["mergequeue:example/repo#1:pos=10"],
+        },
+      },
+    });
+    const live = await insertIssue({
+      companyId,
+      identifier: "SB7-2",
+      status: "blocked",
+      monitorNextCheckAt: new Date(Date.now() + 60_000),
+      executionState: {
+        monitor: {
+          status: "scheduled",
+          gateSignals: ["mergequeue:example/repo#1:pos=10"],
+        },
+      },
+    });
+
+    const result = await reconcileStrandedBlockedIssues(db);
+
+    expect(await statusOf(cleared)).toBe("todo");
+    expect(await statusOf(live)).toBe("blocked");
+    expect(result.reconciled).toBeGreaterThanOrEqual(1);
+  });
+
+  // An OVERDUE `nextCheckAt` is a wake that did not happen, so it is not a gate either.
+  // Split from the `null` case above because only this one exercises the `> now()` half of
+  // the clause: drop that comparison and this row stays `blocked` while SB7-1 still drains.
+  it("sweeps a row whose monitor nextCheckAt is overdue", async () => {
+    const { companyId } = await createCompany("SB8");
+    const overdue = await insertIssue({
+      companyId,
+      identifier: "SB8-1",
+      status: "blocked",
+      monitorNextCheckAt: new Date(Date.now() - 3_600_000),
+      executionState: {
+        monitor: {
+          status: "scheduled",
+          gateSignals: ["pr:example/repo#2:review"],
+        },
+      },
+    });
+
+    await reconcileStrandedBlockedIssues(db);
+
+    expect(await statusOf(overdue)).toBe("todo");
   });
 
   // BLO-30445: the matched pair is the whole point. Asserting only that the declared row
