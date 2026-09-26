@@ -132,6 +132,38 @@ describe("checkMigrationImmutability", () => {
     }
   });
 
+  it("leaves a full clone full — `--depth=1` only when already shallow", async () => {
+    // BLO-36745 review: `fetch --depth=1` writes `.git/shallow` even when the
+    // repo was not shallow, permanently truncating history (measured 3 commits
+    // -> 1) and breaking log/blame/bisect until `git fetch --unshallow`. The
+    // path is reached from a routine `pnpm typecheck`/`build`, so the damage is
+    // silent. CI is already shallow and keeps the flag; this pins the other arm.
+    const consumer = await mkdtemp(join(tmpdir(), "migration-immutability-full-"));
+    const isShallow = async () =>
+      (
+        await execFileAsync("git", ["rev-parse", "--is-shallow-repository"], { cwd: consumer })
+      ).stdout.trim();
+    try {
+      await execFileAsync("git", ["clone", "--branch", "comment-edit", repo, consumer]);
+      await execFileAsync("git", ["update-ref", "-d", "refs/remotes/origin/master"], { cwd: consumer });
+      expect(await isShallow()).toBe("false"); // precondition: the arm under test
+
+      const result = await checkMigrationImmutability({
+        repoDir: consumer,
+        migrationsPath: MIGRATIONS,
+        remote: "origin",
+        branch: "master",
+      });
+
+      // The guard must still work...
+      expect(result).toMatchObject({ checked: true, baseRef: "FETCH_HEAD" });
+      // ...without having shallowed the checkout to do it.
+      expect(await isShallow()).toBe("false");
+    } finally {
+      await rm(consumer, { recursive: true, force: true });
+    }
+  });
+
   it("fetches the released branch when no local ref exists — the CI shape", async () => {
     // The jobs that run `check:migrations` check out with the default
     // `fetch-depth: 1`, so `origin/master` is absent and the fetch fallback is
@@ -204,6 +236,27 @@ describe("main", () => {
   it("resolves when the base is resolvable and no migration was edited", async () => {
     await git("checkout", "master");
     await expect(main({ ...OFFLINE, repoDir: repo })).resolves.toBeUndefined();
+  });
+
+  it("resolves, not throws, for no-work-tree — the Docker path `pnpm build` takes", async () => {
+    // The asymmetric branch in `main()`: `no-work-tree` soft-skips, the other
+    // two causes throw. Without this case, flipping that `if` to `if (false)`
+    // leaves the whole file green while `pnpm build` starts failing inside the
+    // image (`.dockerignore:1` strips `.git`, so the guard cannot run there).
+    //
+    // A BARE repo, not a bare tmpdir: `tmpdir()` can itself sit inside a
+    // checkout, which would make this `no-base` and throw for the wrong reason
+    // — that ambiguity is why the sibling `checkMigrationImmutability` case is
+    // deliberately lenient. A bare repo's `.git` shadows any ancestor, so
+    // `rev-parse --show-toplevel` fails as "must be run in a work tree"
+    // everywhere this suite runs.
+    const outside = await mkdtemp(join(tmpdir(), "bare-no-work-tree-"));
+    try {
+      await execFileAsync("git", ["init", "--bare", "."], { cwd: outside });
+      await expect(main({ ...OFFLINE, repoDir: outside })).resolves.toBeUndefined();
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
   });
 });
 
