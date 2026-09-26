@@ -3412,13 +3412,18 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     // reviewer, so before the resolver read these tags a crashed author run was
     // published as the reviewer's verdict on the head. Asserted at the call
     // site, not only over the pure predicate: this is the case that must
-    // enqueue no `github_commit_status` delivery at all. One row per guard
-    // clause so neither can hide behind the other under mutation (BLO-34263) —
-    // `measured` is the shape seen on pim-multicast-gateway#3237.
+    // enqueue no `github_commit_status` delivery at all. `measured` is the
+    // shape seen on pim-multicast-gateway#3237. The third row is what makes the
+    // BLO-34263 mutation claim true here: both author rows carry
+    // `prRole: "author"`, so they are caught by the prRole clause and survive a
+    // solo revert of the `reviewKind` clause. Only an untagged PR-shaped wake
+    // reaches that clause alone — revert it by itself and that row, and only
+    // that row, fails.
     it.each([
       { label: "measured author shape (no reviewKind)", overrides: { reviewKind: undefined, prRole: "author" } },
       { label: "author run that is tagged pr_review", overrides: { prRole: "author" } },
-    ])("writes no gate-status event for the PR author's own run — $label", async ({ overrides }) => {
+      { label: "PR-shaped wake carrying no tag at all", overrides: { reviewKind: undefined, prRole: undefined } },
+    ])("writes no gate-status event for a run that is not the reviewer's — $label", async ({ overrides }) => {
       process.env[GATE_CONTEXT_ENV] = "review/ally-complete";
       const { events } = await exhaustPrReviewRun({ ...prReviewSnapshot, ...overrides });
 
