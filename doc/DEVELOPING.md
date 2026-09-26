@@ -884,7 +884,9 @@ not the others reproduces the blindness that got this audit rejected as a
 standalone compensating control on PEN-3140. The workspace-operation path is the
 one that had *neither* half of the control pair — no gate and no audit — until
 BLO-34631 gave it both; its row is keyed `entity_type = workspace_operation` and
-carries the operation's owning run in `runId`.
+carries the operation's owning run in `runId` — which is **`null`** for a
+workspace-scoped operation that has no owning run, so a run pivot alone never
+sees those. See the sweep below.
 
 The audit row records the actor type/id, company id, heartbeat run id, timestamp
 (`activity_log.created_at`), access result, and the requested window (byte
@@ -900,6 +902,18 @@ workspace-operation route is keyed `entity_type = workspace_operation` with the
 owning run in `runId`. Querying only the `heartbeat_run` rows silently omits the
 workspace-operation path, which is the same partial-coverage blindness this
 section warns about immediately above.
+
+⚠️ **The run pivot does not close the workspace-operation path either — it
+misses every run-less operation.** `workspace_operations.heartbeatRunId` is
+nullable (`packages/shared/src/types/workspace-operation.ts`), the route writes
+it through to the audit row verbatim, and `listForRun` *deliberately* also
+returns the workspace-scoped cleanup rows that have no owning run
+(`services/workspace-operations.ts`). `/log` takes a bare operation id, so those
+rows are reachable and audited like any other — they simply book `runId: null`.
+Filtering `entity_type = workspace_operation` by `runId = <runId>` therefore
+returns every run-attached read and **zero** run-less ones. Pair the pivot with
+an `entity_type = workspace_operation` sweep scoped by `companyId` and time
+window (or by the specific `entity_id`s) to get the whole set.
 
 ⚠️ **`details.result` does not mean the same thing on all three rows, and
 filtering on it alone under-counts.** On the two run-transcript routes the audit

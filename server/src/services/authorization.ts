@@ -2228,8 +2228,18 @@ export function authorizationService(db: Db) {
     // agent decision, never widen one — pinned by a test in
     // `authorization-service.test.ts`.
     //
-    // If an agent workflow genuinely needs the runtime config, give it an
-    // explicit, auditable grant rather than widening this list.
+    // If an agent workflow genuinely needs the runtime config, note that a grant
+    // row CANNOT deliver it, and reaching for one is a dead end: the action is
+    // unmapped in `permissionForAction` (returns `null`), so the generic
+    // `permissionKey` fallback at the bottom of `decideBase` never fires for it —
+    // and `workspace_runtime:read` is not a `PermissionKey` at all, so there is no
+    // row to insert in the first place. Widening this list is the only lever that
+    // works, which is precisely why it has to be argued deliberately rather than
+    // done in passing: the captured workspace-operation output (the
+    // `/workspace-operations/:operationId/log` body) rides on this same
+    // entitlement, so widening for a runtime-config workflow would open transcript
+    // bytes as a silent side effect. See PEN-3204 and the transcript section of
+    // `doc/DEVELOPING.md`; pinned by a test in `authorization-service.test.ts`.
     if (
       input.action === "agent:read" ||
       input.action === "company_scope:read" ||

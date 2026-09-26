@@ -4161,13 +4161,23 @@ describeEmbeddedPostgres("authorization service", () => {
      * transcript gate on the second one, because the entitlement is already strictly
      * tighter — no agent resolves it, so the body is withheld from every agent.
      *
-     * That decision rests entirely on the two actions staying disjoint for agents, and
-     * nothing else pinned it. The risk is not a grant row — `workspace_runtime:read` is
-     * unmapped in `permissionForAction`, so no grant can satisfy it — but a future
-     * widening of the agent allow-list for a *runtime-config* workflow, which the
-     * PEN-2852 comment on that list explicitly invites. That widening would open
-     * transcript bytes as a side effect, on a route whose gate was never argued about
-     * transcripts.
+     * That decision rests on the two actions staying disjoint for agents. That splits
+     * into two properties, and they are pinned by different mechanisms — only one of
+     * them needs a test.
+     *
+     * The grant half needs no runtime pin, because the compiler holds it:
+     * `workspace_runtime:read` is unmapped in `permissionForAction` AND is not a
+     * `PermissionKey` at all, so there is no grant row to issue and the generic
+     * `permissionKey` fallback never fires. Removing the action from that null-return
+     * list does not quietly leave this test green — it makes the closing `return action`
+     * fail to typecheck (TS2322: not assignable to `PermissionKey | null`), so the grant
+     * path cannot be reopened by accident. Verified by mutation, 2026-09-26.
+     *
+     * The allow-list half is the one with no structural guard, so it is what this test
+     * pins: a future widening of the same-company agent allow-list below for a
+     * *runtime-config* workflow, which the PEN-2852 comment on that list explicitly
+     * invites. That widening would open transcript bytes as a side effect, on a route
+     * whose gate was never argued about transcripts, and it compiles cleanly.
      *
      * This fails if the transcript grant ever carries into the runtime entitlement, so
      * the coupling has to be re-decided deliberately rather than inherited.
