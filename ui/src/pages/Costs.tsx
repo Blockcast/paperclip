@@ -9,6 +9,7 @@ import type {
   FinanceEvent,
   QuotaWindow,
 } from "@paperclipai/shared";
+import { promptTokens, totalTokens as sumTotalTokens } from "@paperclipai/shared";
 import { ArrowDownLeft, ArrowUpRight, ChevronDown, ChevronRight, Coins, DollarSign, ReceiptText } from "lucide-react";
 import { budgetsApi } from "../api/budgets";
 import { costsApi } from "../api/costs";
@@ -45,7 +46,7 @@ function currentWeekRange(): { from: string; to: string } {
 }
 
 function ProviderTabLabel({ provider, rows }: { provider: string; rows: CostByProviderModel[] }) {
-  const totalTokens = rows.reduce((sum, row) => sum + row.inputTokens + row.cachedInputTokens + row.outputTokens, 0);
+  const totalTokens = rows.reduce((sum, row) => sum + sumTotalTokens(row), 0);
   const totalCost = rows.reduce((sum, row) => sum + row.costCents, 0);
   return (
     <span className="flex items-center gap-1.5">
@@ -57,7 +58,7 @@ function ProviderTabLabel({ provider, rows }: { provider: string; rows: CostByPr
 }
 
 function BillerTabLabel({ biller, rows }: { biller: string; rows: CostByBiller[] }) {
-  const totalTokens = rows.reduce((sum, row) => sum + row.inputTokens + row.cachedInputTokens + row.outputTokens, 0);
+  const totalTokens = rows.reduce((sum, row) => sum + sumTotalTokens(row), 0);
   const totalCost = rows.reduce((sum, row) => sum + row.costCents, 0);
   return (
     <span className="flex items-center gap-1.5">
@@ -452,7 +453,7 @@ export function Costs() {
   const providerTabItems = useMemo(() => {
     const providerKeys = Array.from(byProvider.keys());
     const allTokens = providerKeys.reduce(
-      (sum, provider) => sum + (byProvider.get(provider)?.reduce((acc, row) => acc + row.inputTokens + row.cachedInputTokens + row.outputTokens, 0) ?? 0),
+      (sum, provider) => sum + (byProvider.get(provider)?.reduce((acc, row) => acc + sumTotalTokens(row), 0) ?? 0),
       0,
     );
     const allCents = providerKeys.reduce(
@@ -484,7 +485,7 @@ export function Costs() {
   const billerTabItems = useMemo(() => {
     const billerKeys = Array.from(byBiller.keys());
     const allTokens = billerKeys.reduce(
-      (sum, biller) => sum + (byBiller.get(biller)?.reduce((acc, row) => acc + row.inputTokens + row.cachedInputTokens + row.outputTokens, 0) ?? 0),
+      (sum, biller) => sum + (byBiller.get(biller)?.reduce((acc, row) => acc + sumTotalTokens(row), 0) ?? 0),
       0,
     );
     const allCents = billerKeys.reduce(
@@ -515,7 +516,7 @@ export function Costs() {
 
   const inferenceTokenTotal =
     (spendData?.byAgent ?? []).reduce(
-      (sum, row) => sum + row.inputTokens + row.cachedInputTokens + row.outputTokens,
+      (sum, row) => sum + sumTotalTokens(row),
       0,
     );
 
@@ -748,7 +749,7 @@ export function Costs() {
                               <div className="text-right text-sm tabular-nums">
                                 <div className="font-medium">{formatCents(row.costCents)}</div>
                                 <div className="text-xs text-muted-foreground">
-                                  in {formatTokens(row.inputTokens + row.cachedInputTokens)} · out {formatTokens(row.outputTokens)}
+                                  in {formatTokens(promptTokens(row) + row.cachedInputTokens)} · out {formatTokens(row.outputTokens)}
                                 </div>
                                 {(row.apiRunCount > 0 || row.subscriptionRunCount > 0) ? (
                                   <div className="text-xs text-muted-foreground">
@@ -787,7 +788,7 @@ export function Costs() {
                                           <span className="ml-1 font-normal text-muted-foreground">({sharePct}%)</span>
                                         </div>
                                         <div className="text-muted-foreground">
-                                          {formatTokens(modelRow.inputTokens + modelRow.cachedInputTokens + modelRow.outputTokens)} tok
+                                          {formatTokens(sumTotalTokens(modelRow))} tok
                                         </div>
                                       </div>
                                     </div>

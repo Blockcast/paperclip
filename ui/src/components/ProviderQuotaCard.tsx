@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import type { CostByProviderModel, CostWindowSpendRow, QuotaWindow } from "@paperclipai/shared";
+import { promptTokens } from "@paperclipai/shared";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { QuotaBar } from "./QuotaBar";
@@ -59,12 +60,21 @@ export function ProviderQuotaCard({
     let inputTokens = 0, outputTokens = 0, costCents = 0;
     let apiRunCount = 0, subRunCount = 0, subInputTokens = 0, subOutputTokens = 0;
     for (const r of rows) {
-      inputTokens += r.inputTokens;
+      // BLO-29842: cache writes are billed prompt tokens that used to be folded
+      // into inputTokens. Adding them back here keeps these volume totals
+      // measuring the same thing they did before the column was split out.
+      inputTokens += promptTokens(r);
       outputTokens += r.outputTokens;
       costCents += r.costCents;
       apiRunCount += r.apiRunCount;
       subRunCount += r.subscriptionRunCount;
-      subInputTokens += r.subscriptionInputTokens;
+      // The subscription counts are a parallel flat block rather than a nested
+      // BilledTokenCounts, so they are reshaped rather than re-added by hand —
+      // a second spelling of this sum is what BLO-29842 was fixing.
+      subInputTokens += promptTokens({
+        inputTokens: r.subscriptionInputTokens,
+        cacheCreationInputTokens: r.subscriptionCacheCreationInputTokens,
+      });
       subOutputTokens += r.subscriptionOutputTokens;
     }
     const totalTokens = inputTokens + outputTokens;
@@ -204,7 +214,7 @@ export function ProviderQuotaCard({
                   // omit windows with no data rather than showing false $0.00 zeros
                   if (!row) return null;
                   const cents = row.costCents;
-                  const tokens = row.inputTokens + row.outputTokens;
+                  const tokens = promptTokens(row) + row.outputTokens;
                   const barPct = maxWindowCents > 0 ? (cents / maxWindowCents) * 100 : 0;
                   return (
                     <div key={w} className="space-y-1">
@@ -273,7 +283,7 @@ export function ProviderQuotaCard({
             <div className="border-t border-border" />
             <div className="space-y-3">
               {rows.map((row) => {
-                const rowTokens = row.inputTokens + row.outputTokens;
+                const rowTokens = promptTokens(row) + row.outputTokens;
                 const tokenPct = totalTokens > 0 ? (rowTokens / totalTokens) * 100 : 0;
                 const costPct = totalCostCents > 0 ? (row.costCents / totalCostCents) * 100 : 0;
                 return (
