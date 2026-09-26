@@ -553,6 +553,8 @@ describe("derivePaperclipPrReview", () => {
       reviewAuthorLogin: null,
       requestCommentBody: null,
       requestCommentAuthorLogin: null,
+      // BLO-23395: only populated on a github_pr_merge_queue_evicted wake.
+      mergeQueueEvictionBody: null,
       prAuthorLogin: null,
     });
   });

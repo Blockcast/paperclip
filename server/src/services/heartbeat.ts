@@ -10538,6 +10538,11 @@ export function buildPaperclipTaskMarkdown(input: {
     reviewAuthorLogin?: string | null;
     requestCommentBody?: string | null;
     requestCommentAuthorLogin?: string | null;
+    // BLO-23395: the merge-queue eviction notice posted by
+    // .github/workflows/merge-queue-eviction-detector.yml, inlined by the
+    // webhook so the eviction directive can state the cause without the woken
+    // agent fetching githubEventUrl.
+    mergeQueueEvictionBody?: string | null;
     // BLO-20886 AC3: `pull_request.user.login` from the signed webhook. Gates
     // the "YOUR pull request" possessive and the push instruction — see
     // resolveThirdPartyPrAuthor.
