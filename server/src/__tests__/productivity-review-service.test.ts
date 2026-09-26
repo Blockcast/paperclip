@@ -1703,6 +1703,175 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
   });
 
+
+  // BLO-36535: the measured BLO-32472 window — 34 terminal issue-linked runs,
+  // 34 of them infra-class by `errorCode`, zero application failures. Every one
+  // burned real tokens before the kill (the worst at 20,957 output tokens /
+  // $4.92, then a provider 403 on the `org_penstock` seat entitlement), so
+  // `isInfraFailureRun`'s zero-token test reads false for all of them and
+  // pre-fix the whole window landed in the `no_comment_streak` numerator as
+  // conduct. `runtime_failure_streak` does not catch them either — it outranks
+  // this trigger in the ladder but keys on the same zero-token signature — so
+  // the population fell between the two buckets and silently landed in the
+  // conduct one. The streak reached 13 against a threshold of 10 and re-fired
+  // on the same non-signal; adjudication closed "close as productive".
+  //
+  // Non-zero `outputTokens` is load-bearing in every group: a zero-token
+  // fixture passes against the PRE-fix code and would prove nothing.
+  //
+  // Spacing is 2.5h to model the real ~3-day window rather than compress it.
+  // 34 runs inside an hour would trip `high_churn` instead, and "no review is
+  // generated" would then pass for the wrong reason.
+  it("generates no productivity review for a window that is entirely infra-killed turn-executing runs (BLO-36535 / BLO-32472 replay)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const spacingMs = 2.5 * 60 * 60 * 1000;
+    const base = { companyId: seeded.companyId, agentId: seeded.coderId, issueId: seeded.issueId };
+    // The five error codes measured on BLO-32472, in their measured counts.
+    // Every one is already enumerated in the shared infra-class set the
+    // recovery router reads, which is the point: the platform had classified
+    // this cause as infra on the review row while the trigger billed it to the
+    // assignee.
+    const window: Array<{ count: number; errorCode: string; usageJson: Record<string, number> }> = [
+      { count: 18, errorCode: "adapter_failed", usageJson: { inputTokens: 148_221, outputTokens: 20_957 } },
+      { count: 12, errorCode: "rate_limit_exhausted", usageJson: { inputTokens: 61_004, outputTokens: 8_313 } },
+      { count: 2, errorCode: "job_failed", usageJson: { inputTokens: 12_880, outputTokens: 1_904 } },
+      { count: 1, errorCode: "provider_throttled_no_progress", usageJson: { inputTokens: 9_221, outputTokens: 742 } },
+      { count: 1, errorCode: "k8s_pod_schedule_failed", usageJson: { inputTokens: 7_508, outputTokens: 611 } },
+    ];
+    let offset = 0;
+    for (const group of window) {
+      await insertRuns({
+        ...base,
+        count: group.count,
+        now: new Date(now.getTime() - offset * spacingMs),
+        spacingMs,
+        status: "failed",
+        livenessState: "failed",
+        usageJson: group.usageJson,
+        errorCode: group.errorCode,
+      });
+      offset += group.count;
+    }
+    expect(offset).toBe(34);
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // BLO-36535: the walk semantics, stated as a test rather than left to be
+  // rediscovered. Infra-killed runs are excluded from `noCommentEligibleRuns`,
+  // NOT treated as streak-breakers — so genuine silence on either side of an
+  // infra gap bridges into one contiguous streak of 10 rather than being cut
+  // into two runs of 5. That is the correct reading: an infra outage in the
+  // middle of a silent stretch is not evidence the agent spoke.
+  //
+  // This assertion pins BOTH failure directions at once. Pre-fix the streak
+  // reads 14 (the gap counted as silence); a filter that broke the walk instead
+  // of bridging it would read 5. Only bridging reads 10.
+  it("bridges genuine silence either side of an infra-killed gap and reports the excluded count (BLO-36535)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const base = { companyId: seeded.companyId, agentId: seeded.coderId, issueId: seeded.issueId };
+    // Newest: 5 runs that executed and stayed silent.
+    await insertRuns({ ...base, count: 5, now });
+    // Middle: 4 infra-killed runs that DID execute a turn (real tokens).
+    await insertRuns({
+      ...base,
+      count: 4,
+      now: new Date(now.getTime() - 5 * 60_000),
+      status: "failed",
+      livenessState: "failed",
+      usageJson: { inputTokens: 148_221, outputTokens: 20_957 },
+      errorCode: "adapter_failed",
+    });
+    // Oldest: 5 more silent executed runs.
+    await insertRuns({ ...base, count: 5, now: new Date(now.getTime() - 9 * 60_000) });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
+    // The excluded population is reported, not dropped (the BLO-27698 B3b
+    // shape): a manager reading a streak of 10 alongside this count can see
+    // that 4 further runs in the window were taken by infrastructure.
+    expect(reviews[0]?.description).toContain(
+      "Infra-killed runs excluded (terminal, executed a turn then died of an infrastructure fault — `errorCode` in the shared infra-class set, BLO-36535): 4",
+    );
+    // Disjoint from the zero-token populations by construction — these runs
+    // burned tokens, so neither of those counts moves.
+    expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
+    expect(reviews[0]?.description).toContain("Never-invoked runs excluded (terminal, no adapter ever created");
+  });
+
+  // BLO-36535 negative control, pinning the over-exclusion direction.
+  // `claude_truncated` is matched by `isInfraClassStrandedFailure`'s MESSAGE arm
+  // in recovery/service.ts, which is documented audit-only there — a truncated
+  // run executed a long turn and could have commented. The exclusion keys on
+  // `errorCode` membership only, so this run stays in the numerator.
+  it("keeps a claude_truncated run with real tokens in the no-comment streak — code arm only, never the message arm (BLO-36535)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      status: "failed",
+      livenessState: "failed",
+      usageJson: { inputTokens: 92_400, outputTokens: 14_118 },
+      errorCode: "claude_truncated",
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
+    expect(reviews[0]?.description).toContain(
+      "Infra-killed runs excluded (terminal, executed a turn then died of an infrastructure fault — `errorCode` in the shared infra-class set, BLO-36535): 0",
+    );
+  });
+
+  // BLO-36535 negative control, pinning BLO-26165's false negative shut: an
+  // application-class `errorCode` is not in the infra set, so a run that
+  // executed and failed on its own merits still counts as silence. The sibling
+  // case — `errorCode` null entirely — is covered by the BLO-21769 positive
+  // control above. `"unknown"` is a real observed value, not a stand-in for a
+  // missing code (BLO-21769).
+  it("keeps an application-failure run with real tokens in the no-comment streak (BLO-36535 negative control)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      status: "failed",
+      livenessState: "failed",
+      usageJson: { inputTokens: 4_180, outputTokens: 903 },
+      errorCode: "unknown",
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
+  });
   // BLO-26165 / BLO-23096: the 25-run `preferred_workspace_unrealizable`
   // streak that produced the false-positive review this issue was opened for.
   // Nothing capable of writing a comment ever existed, so the assignee-facing
