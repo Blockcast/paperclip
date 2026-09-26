@@ -12283,25 +12283,96 @@ export function issueRoutes(
         });
       }
     } catch (err) {
-      if (err instanceof HttpError && err.status === 422) {
-        logger.warn(
-          {
-            issueId: id,
-            companyId: existing.companyId,
-            assigneePatch: {
-              assigneeAgentId: normalizedAssigneeAgentId === undefined ? "__omitted__" : normalizedAssigneeAgentId,
-              assigneeUserId:
-                req.body.assigneeUserId === undefined ? "__omitted__" : req.body.assigneeUserId,
+      if (err instanceof HttpError) {
+        if (err.status === 422) {
+          logger.warn(
+            {
+              issueId: id,
+              companyId: existing.companyId,
+              assigneePatch: {
+                assigneeAgentId: normalizedAssigneeAgentId === undefined ? "__omitted__" : normalizedAssigneeAgentId,
+                assigneeUserId:
+                  req.body.assigneeUserId === undefined ? "__omitted__" : req.body.assigneeUserId,
+              },
+              currentAssignee: {
+                assigneeAgentId: existing.assigneeAgentId,
+                assigneeUserId: existing.assigneeUserId,
+              },
+              error: err.message,
+              details: err.details,
             },
-            currentAssignee: {
-              assigneeAgentId: existing.assigneeAgentId,
-              assigneeUserId: existing.assigneeUserId,
-            },
-            error: err.message,
-            details: err.details,
-          },
-          "issue update rejected with 422",
-        );
+            "issue update rejected with 422",
+          );
+        }
+        // PEN-3255: every `commentBody` write in this handler happens *below*
+        // the `svc.update` call above, so a refused write discards the comment
+        // the same PATCH carried — no row, no log line, and nothing in the
+        // response saying so. An operator who bundles "move this to
+        // in_progress" with the note explaining why loses the note and keeps
+        // only a 422 about blockers. That was the third Done-when on PEN-3255,
+        // found while the unresolved-blocker guard was refusing every status
+        // write on PEN-2976.
+        //
+        // The comment is deliberately NOT persisted. It almost always narrates
+        // a transition that did not happen ("moving to in_progress because …"),
+        // so writing it anyway would record a false narrative against the row;
+        // and writing it *before* the guard would strand an orphan comment on
+        // every other refusal too. Making the drop explicit is the honest fix —
+        // the caller learns the note needs re-posting, and
+        // `POST /issues/:id/comments` is a separate path this guard does not
+        // touch.
+        //
+        // Keyed on `err instanceof HttpError` rather than on a status, because
+        // the drop is a property of *where* the comment is written and not of
+        // which check refused: `commentPersisted: false` is unconditionally
+        // true for anything escaping this `try`. Narrowing it to 422 left the
+        // identical silent drop on the racier half of the very guard this fixes
+        // — `expectedNoUnresolvedBlockers` refuses with `conflict(...)` (409,
+        // `services/issues.ts`), as do the `expectedCurrentStatus` /
+        // `expectedCurrentAssigneeAgentId` / `expectedCurrent*RunId` /
+        // `expectedCurrentExecution{State,Policy}` preconditions this route
+        // sets above. Each of those snapshots the same row the route already
+        // read, so they fire only when a concurrent writer moves the row inside
+        // the window — a real production race, but one no single-request test
+        // can stage deterministically. The `logger.warn` above stays 422-scoped
+        // so this widening adds no log volume.
+        //
+        // Non-HttpError is rethrown untouched: wrapping an unexpected throw
+        // would rewrite its status and lose its stack for no gain.
+        if (commentBody) {
+          // A non-object `details` is preserved under `detail` rather than
+          // spread into nonsense. No producer on this path passes a scalar
+          // today, but discarding an unknown-typed field to tidy a branch is
+          // the same class of silent loss this change exists to remove — and
+          // the reachable producer set is every `unprocessable(...)` *and*
+          // `conflict(...)` in `svc.update`, so it is not a set this route can
+          // pin. `null` folds in with `undefined`: both mean "no details", and
+          // a literal `{ detail: null }` would be noise.
+          const refusalDetails =
+            typeof err.details === "object" && err.details !== null && !Array.isArray(err.details)
+              ? (err.details as Record<string, unknown>)
+              : err.details === undefined || err.details === null
+                ? {}
+                : { detail: err.details };
+          const wrapped = new HttpError(err.status, err.message, {
+            ...refusalDetails,
+            commentPersisted: false,
+            commentHint:
+              "The `comment` carried by this PATCH was not saved, because the update it accompanied did not land. " +
+              "Re-post it with POST /api/issues/:id/comments, which is a separate path and is not subject to this guard.",
+          });
+          // Re-wrapping resets the stack to this `catch`. That is harmless for
+          // the 4xx refusals this branch was written for, but the widening
+          // above from 422 to any `HttpError` also catches the done-gate's
+          // `HttpError(503, "Done-gate commit evidence verification
+          // unavailable", …)`, and `middleware/error-handler.ts` forwards
+          // `stack` into `attachErrorContext` and `trackErrorHandlerCrash` for
+          // `status >= 500` — so without this a 5xx from a PATCH carrying a
+          // comment would report this route's catch as its origin instead of
+          // the throw site.
+          wrapped.stack = err.stack;
+          throw wrapped;
+        }
       }
       throw err;
     }

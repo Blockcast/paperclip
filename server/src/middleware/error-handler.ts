@@ -105,6 +105,34 @@ export function errorHandler(
       res.status(422).json({
         error: "missing-evidence",
         missing: (err.details as { missing: unknown[] }).missing,
+        // PEN-3255 (#1895 review): this branch answers with a deliberately
+        // narrow body and never emits `details`, so the dropped-comment
+        // announcement the issues route attaches there — see the `catch`
+        // around `svc.update` in `routes/issues.ts` — was built and then
+        // thrown away before the caller saw it. That left the silent drop
+        // alive on what is plausibly the most-travelled refusal on that route:
+        // the documented agent loop is "attach evidence, then move to
+        // `in_review`", and bundling the explanation into that same PATCH is
+        // the normal shape, so `PATCH { status: "in_review", comment: "…" }`
+        // refused by the evidence gate is exactly the request that loses a
+        // note. Everything else about the `{error, missing}` contract agents
+        // read is unchanged, and a refusal that carried no comment still gets
+        // neither key.
+        //
+        // `commentHint` is type-guarded like every sibling spread below, since
+        // `details` is a bare `Record<string, unknown>`; `commentPersisted` is
+        // deliberately *not* conditioned on it. The two are independent on
+        // purpose: `commentPersisted: false` is the announcement, and the hint
+        // is a convenience. Gating the pair together would mean a producer that
+        // someday omits or mistypes the hint silently deletes the announcement
+        // as well — reintroducing precisely the silent drop this branch exists
+        // to close, in the one place nobody would look for it.
+        ...(details?.commentPersisted === false
+          ? {
+              commentPersisted: false,
+              ...(typeof details.commentHint === "string" ? { commentHint: details.commentHint } : {}),
+            }
+          : {}),
       });
       return;
     }
