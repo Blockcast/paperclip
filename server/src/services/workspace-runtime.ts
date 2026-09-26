@@ -1742,6 +1742,9 @@ async function ensureGitIndexIsUnlocked(worktreePath: string): Promise<string | 
       }`,
     );
   });
+  // Released during the scan: its owner finished and the index is unlocked, so
+  // this, not the rename's ENOENT catch below, is the usual way the lock
+  // vanishing mid-repair resolves as success.
   if (!preRenameStat) return null;
   if (
     preRenameStat.ino !== lockStat.ino ||
@@ -2713,7 +2716,7 @@ export async function ensureGitWorktreeBranchCoherent(input: {
       reconciledForward: false,
       dirtyQuarantineRepair: result,
       warnings: [
-        `Execution workspace dirty worktree state was quarantined on rescue branch "${result.rescueBranch}" (${formatShortSha(result.rescueCommitSha)}; ${result.fileCount} ${result.fileCount === 1 ? "file" : "files"}) before restoring recorded branch "${expectedBranchName}".${result.clearedInProgressOperation ? ` An interrupted git ${GIT_IN_PROGRESS_OPERATION_LABELS[result.clearedInProgressOperation]} was also cleared; its in-flight state is preserved on the rescue branch.` : ""}${result.quarantinedIndexLockPath ? ` An abandoned 0-byte git index lock was broken first; no process held it open, and it was preserved at "${result.quarantinedIndexLockPath}".` : ""}`,
+        `Execution workspace dirty worktree state was quarantined on rescue branch "${result.rescueBranch}" (${formatShortSha(result.rescueCommitSha)}; ${result.fileCount} ${result.fileCount === 1 ? "file" : "files"}) before restoring recorded branch "${expectedBranchName}".${result.clearedInProgressOperation ? ` An interrupted git ${GIT_IN_PROGRESS_OPERATION_LABELS[result.clearedInProgressOperation]} was also cleared; its in-flight state is preserved on the rescue branch.` : ""}${result.quarantinedIndexLockPath ? ` An abandoned 0-byte git index lock was broken first; no process visible to this pod held it open, and it was preserved at "${result.quarantinedIndexLockPath}".` : ""}`,
       ],
     };
   }
