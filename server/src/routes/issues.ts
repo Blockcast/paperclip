@@ -6893,6 +6893,10 @@ export function issueRoutes(
     return run;
   }
 
+  // PEN-3275: `recoveryRunWriteClassNotice` (`services/recovery/model-profile-hint.ts`) RESTATES
+  // this verdict in prose, in the wake prompt, before the agent plans. Change the condition here
+  // and that sentence silently becomes a lie — which is how round 6 shipped a notice claiming a
+  // flat refusal for a guard BLO-34683 had already made conditional. Update both together.
   async function assertCheapRecoveryIssueAssigneeProfileAllowed(
     req: Request,
     res: Response,
@@ -6974,6 +6978,13 @@ export function issueRoutes(
    * and restores arming, and that write is a status-only run's one allowed
    * deliverable (BLO-25868). The row is only unreachable if this run declines to
    * dispose of it, which is the case the handoff detector already escalates.
+   *
+   * PEN-3275: `recoveryRunWriteClassNotice` (`services/recovery/model-profile-hint.ts`) RESTATES
+   * this verdict in the wake prompt. This is the guard that proved the hazard — the BLO-34683
+   * change above made the refusal conditional, the notice kept saying "arming issue monitors"
+   * flatly, and the run dispatched to repair a cleared monitor read the notice and declined the
+   * arm this guard would have permitted. The notice now names the CONDITION; if that condition
+   * changes again, change the sentence in the same edit.
    */
   async function assertMonitorArmingAllowedByRunContext(
     req: Request,
@@ -7288,6 +7299,9 @@ export function issueRoutes(
     return false;
   }
 
+  // PEN-3275: `recoveryRunWriteClassNotice` (`services/recovery/model-profile-hint.ts`) RESTATES
+  // this verdict in the wake prompt, including the `request_board_approval` carve-out and its
+  // link-set exclusivity. Change what is admitted here and update that sentence in the same edit.
   async function assertApprovalMutationAllowedByRunContext(
     req: Request,
     res: Response,

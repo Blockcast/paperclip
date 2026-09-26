@@ -246,6 +246,16 @@ export function approvalRoutes(
     return { includeAgentConfig: await actorCanReadAgentConfig(req, access, companyId) };
   }
 
+  // PEN-3275: `recoveryRunWriteClassNotice` (`services/recovery/model-profile-hint.ts`) RESTATES
+  // this verdict in the wake prompt — the full approval refusal list, the `request_board_approval`
+  // carve-out, and the "no source issue ⇒ no approval write at all" branch all claim what this
+  // function does. Change what is admitted here and update those sentences in the same edit.
+  //
+  // ADDING A CALL SITE counts as changing it, and that is the case this comment was written for:
+  // the notice enumerates one entry per call site in `REFUSED_APPROVAL_OPERATIONS`, and round 6 of
+  // that PR found `apply` refused here but absent from the enumeration — a list that presents
+  // itself as exhaustive while omitting an operation licenses the agent to plan around it. Add the
+  // guard to a new route, add the operation to that constant.
   async function assertApprovalMutationAllowedByRunContext(
     req: Request,
     res: any,

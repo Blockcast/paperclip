@@ -116,6 +116,37 @@ export function statusOnlyEscalationSourceIssueId(contextSnapshot: unknown): str
 }
 
 /**
+ * Every approval operation `assertApprovalMutationAllowedByRunContext` can refuse — ONE ENTRY PER
+ * CALL SITE of that guard — so the two notice sentences below and the tests that pin them read one
+ * list instead of maintaining three copies of it by hand.
+ *
+ * The call sites are, in `approvals.ts`: create, resubmit, withdraw, apply, comments; and in
+ * `issues.ts`: link and unlink. Only create passes `requestedType`, so every other operation
+ * compares `undefined` against the permitted type and is refused on BOTH lanes.
+ *
+ * PEN-3275 round 6: `applying` was the entry three successive hand-written copies omitted, while
+ * `POST /approvals/:id/apply` was refused the whole time. It is the worst one to omit — that route
+ * is deliberately requester-scoped rather than board-gated (see its doc comment in `approvals.ts`),
+ * because it executes a decision a board actor already made, so the agent this notice addresses is
+ * its intended caller and reaches for it exactly after filing the one escalation it is allowed.
+ * The 403 does not close the gap either: it answers "create/modify", which does not name `apply`.
+ *
+ * Add a call site, add an entry here. This list presents itself as exhaustive, and an incomplete
+ * exhaustive list licenses the reader to plan around what it omits.
+ */
+export const REFUSED_APPROVAL_OPERATIONS = [
+  "creating",
+  "modifying",
+  "commenting on",
+  "resubmitting",
+  "withdrawing",
+  "applying",
+  "linking or unlinking",
+] as const;
+
+const REFUSED_APPROVAL_OPERATIONS_TEXT = REFUSED_APPROVAL_OPERATIONS.join(", ");
+
+/**
  * The monitor-arm gate's guidance, which unlike the three refusals above HAS resolved whether
  * anything is containing the run — so it states the branch it took instead of offering the caller
  * a split to guess at.
@@ -333,15 +364,15 @@ export function recoveryRunWriteClassNotice(contextSnapshot: unknown): RecoveryR
   if (writeClass === "planning_only") {
     return mint(
       "This wake is a planning-only recovery run. Issue document updates are permitted. Refused " +
-      "with 403: creating, modifying, commenting on, resubmitting, withdrawing, linking or " +
-      "unlinking approvals — every approval write, with no `request_board_approval` exception on " +
+      `with 403: ${REFUSED_APPROVAL_OPERATIONS_TEXT} approvals — every approval write, with no ` +
+      "`request_board_approval` exception on " +
       "this lane — and all deliverable and annotation writes. Confirm any of those returned before " +
       "you describe it as done.");
   }
   return mint(
     "This wake is a cheap status-only recovery run. Reads and issue comments behave normally, so " +
-    "there is no other signal that writes are contained. Refused with 403: creating, modifying, " +
-    "commenting on, resubmitting, withdrawing, linking or unlinking approvals — including the " +
+    "there is no other signal that writes are contained. Refused with 403: " +
+    `${REFUSED_APPROVAL_OPERATIONS_TEXT} approvals — including the ` +
     "`request_board_approval` this run may itself file; assigning downstream issue work to the " +
     "cheap model profile; arming issue monitors while a recovery action is active on the issue " +
     "being armed or on this run's own or source issue, and whenever the server cannot tell, as " +
@@ -350,7 +381,8 @@ export function recoveryRunWriteClassNotice(contextSnapshot: unknown): RecoveryR
     (statusOnlyEscalationSourceIssueId(contextSnapshot)
       ? "The only approval write this run can perform is creating a `request_board_approval` " +
         "linked to this run's source issue and to no other issue, and that is a single call you " +
-        "cannot follow up from here — not even to comment on what you just filed. "
+        "cannot follow up from here — not to comment on what you just filed, and not to apply it " +
+        "once it is decided. "
       : "This run's context carries no source issue, so the `request_board_approval` escalation is " +
         "refused here too: this run has no approval write available at all. ") +
     "Permitted: reads, issue comments, and recording a status disposition. " +

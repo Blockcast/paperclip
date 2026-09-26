@@ -6,6 +6,7 @@ import {
   recoveryRunWriteClassNotice,
   RECOVERY_WORK_CLASS_KEY,
   recoveryAssigneeAdapterOverrides,
+  REFUSED_APPROVAL_OPERATIONS,
   scrubRecoveryModelProfileHints,
   STATUS_ONLY_RECOVERY_GUARD_CONTEXT,
   statusOnlyEscalationSourceIssueId,
@@ -221,11 +222,46 @@ describe("recovery run write class", () => {
     const withoutSource = recoveryRunWriteClassNotice(STATUS_ONLY_WITHOUT_SOURCE) ?? "";
 
     expect(withSource).toContain("The only approval write this run can perform is creating a");
-    expect(withSource).toContain("not even to comment on what you just filed");
+    // The follow-ups named here are the two the guard refuses immediately after that one permitted
+    // create — commenting and applying. Applying is the one round 6 found missing, and it is the
+    // likelier reach of the two: `POST /approvals/:id/apply` is requester-scoped precisely so the
+    // filing agent can execute the decision, which it cannot do from this lane.
+    expect(withSource).toContain("not to comment on what you just filed");
+    expect(withSource).toContain("not to apply it");
 
     expect(withoutSource).toContain("no approval write available at all");
     // The load-bearing negative: no sentence may offer the filing to a run that cannot make it.
     expect(withoutSource).not.toMatch(/only approval write this run can perform|or file a `request_board_approval`/);
+  });
+
+  // PEN-3275 round 6. The approval enumeration has now been wrong twice, in the same direction
+  // both times: an operation the guard refuses was missing from a list that presents itself as
+  // exhaustive (round 2 lost commenting/resubmitting/withdrawing; round 6 lost applying). The fix
+  // is structural rather than another hand-added word — both notices render from
+  // `REFUSED_APPROVAL_OPERATIONS`, and this pins every entry of it onto BOTH lanes, so a new call
+  // site is one array entry away from being announced and cannot be half-added.
+  //
+  // Asserted against the exported constant, not against a literal copy of it: a copy is the third
+  // hand-maintained list, which is the defect this test exists to stop recurring.
+  it("names every refused approval operation on both contained lanes", () => {
+    const notices = [
+      recoveryRunWriteClassNotice(STATUS_ONLY_WITH_SOURCE) ?? "",
+      recoveryRunWriteClassNotice(STATUS_ONLY_WITHOUT_SOURCE) ?? "",
+      recoveryRunWriteClassNotice(PLANNING_ONLY) ?? "",
+    ];
+
+    expect(notices.every((notice) => notice.length > 0)).toBe(true);
+    for (const notice of notices) {
+      for (const operation of REFUSED_APPROVAL_OPERATIONS) {
+        expect(notice).toContain(operation);
+      }
+    }
+
+    // `applying` is the round-6 entry specifically, and the one whose absence was most costly:
+    // `POST /approvals/:id/apply` is deliberately requester-scoped rather than board-gated, so the
+    // agent this notice addresses is its intended caller. Named apart from the loop so that
+    // deleting it from the constant fails here with the reason attached, not just with a diff.
+    expect(REFUSED_APPROVAL_OPERATIONS).toContain("applying");
   });
 
   // PEN-3275 round 4. The link set on that single permitted write is EXCLUSIVE: `approvals.ts`

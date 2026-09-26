@@ -11,6 +11,7 @@ import {
 } from "../services/heartbeat.js";
 import {
   recoveryRunWriteClassNotice,
+  REFUSED_APPROVAL_OPERATIONS,
   STATUS_ONLY_RESUME_PREAMBLE,
   withRecoveryModelProfileHint,
 } from "../services/recovery/model-profile-hint.js";
@@ -2586,19 +2587,25 @@ describe("buildPaperclipTaskMarkdown run write-containment notice", () => {
   });
 
   // The refusal list must name the OPERATION, not just the object. `approvals.ts` passes
-  // `requestedType` at the create call site only, so commenting on / resubmitting / withdrawing an
-  // approval compares `undefined` against the permitted type and refuses — on the run's own
-  // escalation included. PEN-3248's false record was exactly an approval comment, so a notice that
-  // named only "creating or modifying approvals (except a `request_board_approval` …)" pointed the
-  // reader into the one 403 this notice exists to pre-empt.
+  // `requestedType` at the create call site only, so commenting on / resubmitting / withdrawing /
+  // applying an approval compares `undefined` against the permitted type and refuses — on the
+  // run's own escalation included. PEN-3248's false record was exactly an approval comment, so a
+  // notice that named only "creating or modifying approvals (except a `request_board_approval` …)"
+  // pointed the reader into the one 403 this notice exists to pre-empt.
+  //
+  // PEN-3275 round 6: iterated over `REFUSED_APPROVAL_OPERATIONS` rather than over a literal copy
+  // of it. The hand-maintained copy that used to live here listed three of the seven operations,
+  // which is how `applying` stayed unannounced while the guard refused it — a list that names a
+  // subset cannot fail when the subset is wrong.
   it("names the approval operations it cannot follow its own escalation up with", () => {
     const markdown = buildPaperclipTaskMarkdown({ issue, recoveryRunWriteClassNotice: STATUS_ONLY_NOTICE });
 
-    for (const operation of ["commenting on", "resubmitting", "withdrawing"]) {
+    for (const operation of REFUSED_APPROVAL_OPERATIONS) {
       expect(markdown).toContain(operation);
     }
     expect(markdown).toContain("this run may itself file");
-    expect(markdown).toContain("not even to comment on what you just filed");
+    expect(markdown).toContain("not to comment on what you just filed");
+    expect(markdown).toContain("not to apply it");
   });
 
   // `assertCheapRecoveryIssueAssigneeProfileAllowed` (`issues.ts:6813`) is a status-only refusal
