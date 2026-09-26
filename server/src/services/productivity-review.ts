@@ -3743,7 +3743,37 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .then((rows) => rows[0]?.count ?? 0);
   }
 
-  async function countIssueCommentsSince(companyId: string, issueId: string, agentId: string, since?: Date) {
+  /**
+   * BLO-35893: counts every assignee comment **on this issue** that is
+   * run-linked, deliberately WITHOUT `issueRunScopeSql`. The join to
+   * `heartbeatRuns` is retained only to enforce "run-linked, by this agent" —
+   * the scope predicate is over the *run's* context columns, not the comment's
+   * issue, so ANDing it in narrowed the counter to "…by a run woken on this
+   * issue". That is a strictly narrower fact than the `Assignee run-linked
+   * comments total/window` line claims, and routine-backed rows hit it every
+   * time: routine dispatch wakes the agent on a fresh per-fire execution issue
+   * (`routines.ts`, `queueIssueAssignmentWakeup`), so a receipt posted to a
+   * long-lived log row is authored by a run scoped elsewhere, forever. Measured
+   * on BLO-35321: 11 such comments reported as `2 total, 0/6h`.
+   *
+   * `countIssueRunsSince` keeps the predicate — it counts *runs on this issue*,
+   * where scoping the run is the right question.
+   *
+   * `runScoped: true` restores it for the `high_churn` comment arms only. That
+   * gate asks whether the agent is churning *on this issue*, and a routine
+   * posting one receipt per fire to its log row is the row working as designed:
+   * those runs are scoped to the per-fire execution issue, so they never reach
+   * this row's `latestRuns` and `routineOnlySamplingWindow` cannot suppress
+   * them. Counting them there would let a row with no runs of its own raise
+   * `high_churn` on receipts alone.
+   */
+  async function countIssueCommentsSince(
+    companyId: string,
+    issueId: string,
+    agentId: string,
+    since?: Date,
+    options?: { runScoped?: boolean },
+  ) {
     return db
       .select({ count: sql<number>`count(*)::int` })
       .from(issueComments)
@@ -3755,7 +3785,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           eq(issueComments.authorAgentId, agentId),
           eq(heartbeatRuns.companyId, companyId),
           eq(heartbeatRuns.agentId, agentId),
-          issueRunScopeSql(issueId),
+          options?.runScoped ? issueRunScopeSql(issueId) : undefined,
           since ? sql`${issueComments.createdAt} >= ${since.toISOString()}::timestamptz` : undefined,
         ),
       )
@@ -4121,6 +4151,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       assigneeRunCommentCount,
       assigneeRunCommentCountLastHour,
       assigneeRunCommentCountLastSixHours,
+      churnCommentCountLastHour,
+      churnCommentCountLastSixHours,
       latestComments,
       mostRecentDispatchAt,
       costRow,
@@ -4133,6 +4165,12 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id),
       countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, oneHourAgo),
       countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, sixHoursAgo),
+      countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, oneHourAgo, { runScoped: true }),
+      countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, sixHoursAgo, { runScoped: true }),
+      // BLO-35893: same widening as `countIssueCommentsSince` — no
+      // `issueRunScopeSql` here. `Latest Assignee Run Comments` is a list of
+      // comments *on this issue*, so filtering by the authoring run's context
+      // dropped every cross-issue-run receipt (9 of 11 on BLO-35321).
       db
         .select({ comment: issueComments })
         .from(issueComments)
@@ -4144,7 +4182,6 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
             eq(issueComments.authorAgentId, sourceAgent.id),
             eq(heartbeatRuns.companyId, sourceIssue.companyId),
             eq(heartbeatRuns.agentId, sourceAgent.id),
-            issueRunScopeSql(sourceIssue.id),
           ),
         )
         .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
@@ -4535,9 +4572,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       elapsedMs !== null && elapsedMs >= thresholds.longActiveMs && !noExecutableTurnDominantAndOpen;
     const highChurn =
       runCountLastHour >= thresholds.highChurnHourly ||
-      assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||
+      churnCommentCountLastHour >= thresholds.highChurnHourly ||
       runCountLastSixHours >= thresholds.highChurnSixHours ||
-      assigneeRunCommentCountLastSixHours >= thresholds.highChurnSixHours;
+      churnCommentCountLastSixHours >= thresholds.highChurnSixHours;
     // BLO-27698 B3b: the escape hatch B3 owes. Keyed on a single run's own
     // still-live execution span, not on the episode, so it survives B3's
     // narrowing of `long_active_duration` to the unattended bucket — an episode
@@ -4617,7 +4654,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     }
     if (highChurn) {
       triggerReasons.push(
-        `${runCountLastHour} runs/${assigneeRunCommentCountLastHour} assignee-run comments in 1h; ${runCountLastSixHours} runs/${assigneeRunCommentCountLastSixHours} assignee-run comments in 6h`,
+        // Scoped to runs woken for this issue, unlike the issue-wide
+        // `Assignee run-linked comments` evidence line in the same document, so
+        // the label says so: the two numbers differ exactly when a cross-scope
+        // receipt landed here (BLO-35893).
+        `${runCountLastHour} runs/${churnCommentCountLastHour} assignee comments from runs woken for this issue in 1h; ${runCountLastSixHours} runs/${churnCommentCountLastSixHours} in 6h`,
       );
     }
 
@@ -5055,7 +5096,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       "",
       `- No-comment / runtime-failure streak: ${evidence.thresholds.noCommentStreakRuns} consecutive terminal runs`,
       `- Long active duration: ${msToHuman(evidence.thresholds.longActiveMs)}`,
-      `- High churn: ${evidence.thresholds.highChurnHourly}/1h or ${evidence.thresholds.highChurnSixHours}/6h runs/assignee-run comments`,
+      `- High churn: ${evidence.thresholds.highChurnHourly}/1h or ${evidence.thresholds.highChurnSixHours}/6h runs/assignee comments from runs woken for this issue`,
       `- Resolved-review snooze: ${msToHuman(evidence.thresholds.resolvedSnoozeMs)}`,
       "",
       "## Latest Runs",

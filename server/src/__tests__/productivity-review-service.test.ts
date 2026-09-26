@@ -27,6 +27,8 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { MAX_ISSUE_REQUEST_DEPTH } from "@paperclipai/shared";
 import {
+  DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY,
+  DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_SIX_HOURS,
   DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS,
   DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
   DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS,
@@ -2272,7 +2274,9 @@ describeEmbeddedPostgres("productivity review service", () => {
     // the non-closable trigger beneath it, and that trigger's evidence is what
     // the review has to carry.
     expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
-    expect(review?.description).toContain("runs/0 assignee-run comments in 1h");
+    // The trigger count is run-scoped and says so; the issue-wide evidence line
+    // in the same description is a different number under a different label.
+    expect(review?.description).toContain("runs/0 assignee comments from runs woken for this issue in 1h");
   });
 
   // BLO-22436 (Ally follow-up): the generation gate is scoped to the same
@@ -5440,6 +5444,142 @@ describeEmbeddedPostgres("productivity review service", () => {
     });
 
     expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // BLO-35893: the comment counters used to AND in `issueRunScopeSql`, a
+  // predicate over the authoring *run's* context columns rather than over the
+  // comment's issue. Every routine-backed row hit this structurally — routine
+  // dispatch wakes the agent on a fresh per-fire execution issue, so a receipt
+  // posted back to the long-lived log row is authored by a run scoped
+  // elsewhere, forever. BLO-35321 reported 11 such comments as `2 total, 0/6h`.
+  it("counts an assignee comment whose authoring run was scoped to a different issue", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    // Streak runs on the SOURCE issue, all older than 6h, so both run-scoped
+    // windows stay at 0 and only the comment counter can move. That is what
+    // makes the control below meaningful.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    // The routine shape: a run woken on some other issue, posting its receipt
+    // here. `contextIssueId` is generated from `contextSnapshot->>'issueId'`.
+    const otherIssueId = randomUUID();
+    const commentAt = new Date(now.getTime() - 3 * 60 * 60 * 1000);
+    const [crossScopeRun] = await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: otherIssueId,
+      count: 1,
+      now: commentAt,
+    });
+    await db.insert(issueComments).values({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      authorAgentId: seeded.coderId,
+      createdByRunId: crossScopeRun!.id,
+      body: "Landing receipt: merged PR #1234.",
+      createdAt: commentAt,
+      updatedAt: commentAt,
+    });
+
+    await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    const [review] = await listProductivityReviews(seeded.companyId);
+    const description = review?.description ?? "";
+    expect(description).toContain("Assignee run-linked comments total/window: 1 total, 0/1h, 1/6h");
+    // The exact pre-fix rendering, which scoped the count to runs woken here.
+    expect(description).not.toContain("Assignee run-linked comments total/window: 0 total");
+    // ...and the comment is listed, not just counted.
+    expect(description).toContain(`run \`${crossScopeRun!.id}\`: Landing receipt: merged PR #1234.`);
+    // CONTROL: the run-scoped counters were NOT loosened along with the comment
+    // counter. Without this, the test passes on a change that strips
+    // `issueRunScopeSql` from `countIssueRunsSince` too — the cross-scope run
+    // sits 3h back, so a loosened runs query would read `1/6h` here.
+    expect(description).toContain("Runs in rolling windows: 0/1h, 0/6h");
+  });
+
+  // BLO-35893, the other direction. The widened count is for the reported line
+  // and the listing; the `high_churn` comment arms stay run-scoped. A routine
+  // posting one receipt per fire to its log row authors each from a run scoped
+  // to that fire's execution issue, so the row's own `latestRuns` is empty and
+  // `routineOnlySamplingWindow` cannot suppress it. Counting those receipts in
+  // the gate would raise `high_churn` on an issue with no runs of its own.
+  it("does not raise high_churn on cross-scope receipts alone", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const otherIssueId = randomUUID();
+    const receiptRuns = await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: otherIssueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY,
+      now: new Date(now.getTime() - 60_000),
+    });
+    expect(receiptRuns).toHaveLength(DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY);
+    await db.insert(issueComments).values(
+      receiptRuns.map((run, index) => {
+        const at = new Date(now.getTime() - (index + 1) * 60_000);
+        return {
+          companyId: seeded.companyId,
+          issueId: seeded.issueId,
+          authorAgentId: seeded.coderId,
+          createdByRunId: run!.id,
+          body: `Routine receipt ${index}.`,
+          createdAt: at,
+          updatedAt: at,
+        };
+      }),
+    );
+
+    await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // The same gate at the 6h window. A routine firing every ~10 minutes clears
+  // 30/6h while never reaching 10/1h, so on this row class the 6h arm is the
+  // easier one to trip, and the fixture above (all receipts in the last hour)
+  // cannot see it. Kept separate so each fixture pins exactly one window.
+  it("does not raise high_churn on cross-scope receipts spread across six hours", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const otherIssueId = randomUUID();
+    const receiptRuns = await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: otherIssueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_SIX_HOURS,
+      now: new Date(now.getTime() - 60_000),
+    });
+    const receiptTimes = receiptRuns.map((_, index) => new Date(now.getTime() - (index + 1) * 11 * 60_000));
+    // Guards the fixture itself: enough for the 6h arm, too few for the 1h arm.
+    const hourAgo = now.getTime() - 60 * 60_000;
+    const sixHoursAgo = now.getTime() - 6 * 60 * 60_000;
+    expect(receiptTimes.filter((at) => at.getTime() > sixHoursAgo).length).toBeGreaterThanOrEqual(
+      DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_SIX_HOURS,
+    );
+    expect(receiptTimes.filter((at) => at.getTime() > hourAgo).length).toBeLessThan(
+      DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY,
+    );
+    await db.insert(issueComments).values(
+      receiptRuns.map((run, index) => ({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        authorAgentId: seeded.coderId,
+        createdByRunId: run!.id,
+        body: `Routine receipt ${index}.`,
+        createdAt: receiptTimes[index]!,
+        updatedAt: receiptTimes[index]!,
+      })),
+    );
+
+    await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
 
