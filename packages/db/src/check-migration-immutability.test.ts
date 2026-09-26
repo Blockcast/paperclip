@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
-import { checkMigrationImmutability, formatOffenders } from "./check-migration-immutability.js";
+import { checkMigrationImmutability, formatOffenders, main } from "./check-migration-immutability.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -171,6 +171,39 @@ describe("checkMigrationImmutability", () => {
     } finally {
       await rm(outside, { recursive: true, force: true });
     }
+  });
+});
+
+/**
+ * `main()` is where the two `checked: false` causes are told apart, and until
+ * BLO-36745's review it was the only behaviour here with no test. Collapsing
+ * them made a failed `git fetch` exit 0 — a silently disabled guard on the one
+ * path CI actually takes, since `build` checks out at `fetch-depth: 1` and the
+ * fetch is therefore load-bearing on every run.
+ */
+describe("main", () => {
+  it("throws when it is in a work tree but cannot resolve a base", async () => {
+    // The CI shape, reproduced offline: a real work tree whose base ref does
+    // not resolve. Exiting 0 here is the false green the guard exists to stop.
+    await expect(
+      main({ ...OFFLINE, repoDir: repo, branch: "no-such-released-branch" }),
+    ).rejects.toThrow(/could not verify migration immutability/);
+  });
+
+  it("throws, naming the file, when an applied migration was edited", async () => {
+    await git("checkout", "comment-edit");
+    try {
+      await expect(main({ ...OFFLINE, repoDir: repo })).rejects.toThrow(
+        new RegExp(`${MIGRATIONS}/0001_alpha\\.sql`),
+      );
+    } finally {
+      await git("checkout", "master");
+    }
+  });
+
+  it("resolves when the base is resolvable and no migration was edited", async () => {
+    await git("checkout", "master");
+    await expect(main({ ...OFFLINE, repoDir: repo })).resolves.toBeUndefined();
   });
 });
 
