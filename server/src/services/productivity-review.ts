@@ -3766,13 +3766,20 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
    * this row's `latestRuns` and `routineOnlySamplingWindow` cannot suppress
    * them. Counting them there would let a row with no runs of its own raise
    * `high_churn` on receipts alone.
+   *
+   * BLO-36717: `options` and `runScoped` are both REQUIRED rather than
+   * defaulted. The two counts answer different questions and the wrong one is a
+   * silent regression of the bug above — an omitted option would hand a future
+   * caller the widened count with nothing at the call site to show it, and on
+   * the `high_churn` arms that is a live gate. Making it explicit costs five
+   * call sites and turns the mistake into a type error.
    */
   async function countIssueCommentsSince(
     companyId: string,
     issueId: string,
     agentId: string,
-    since?: Date,
-    options?: { runScoped?: boolean },
+    since: Date | undefined,
+    options: { runScoped: boolean },
   ) {
     return db
       .select({ count: sql<number>`count(*)::int` })
@@ -3785,7 +3792,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           eq(issueComments.authorAgentId, agentId),
           eq(heartbeatRuns.companyId, companyId),
           eq(heartbeatRuns.agentId, agentId),
-          options?.runScoped ? issueRunScopeSql(issueId) : undefined,
+          options.runScoped ? issueRunScopeSql(issueId) : undefined,
           since ? sql`${issueComments.createdAt} >= ${since.toISOString()}::timestamptz` : undefined,
         ),
       )
@@ -4162,11 +4169,21 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     ] = await Promise.all([
       countIssueRunsSince(sourceIssue.companyId, sourceAgent.id, sourceIssue.id, oneHourAgo),
       countIssueRunsSince(sourceIssue.companyId, sourceAgent.id, sourceIssue.id, sixHoursAgo),
-      countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id),
-      countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, oneHourAgo),
-      countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, sixHoursAgo),
-      countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, oneHourAgo, { runScoped: true }),
-      countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, sixHoursAgo, { runScoped: true }),
+      countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, undefined, {
+        runScoped: false,
+      }),
+      countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, oneHourAgo, {
+        runScoped: false,
+      }),
+      countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, sixHoursAgo, {
+        runScoped: false,
+      }),
+      countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, oneHourAgo, {
+        runScoped: true,
+      }),
+      countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, sixHoursAgo, {
+        runScoped: true,
+      }),
       // BLO-35893: same widening as `countIssueCommentsSince` — no
       // `issueRunScopeSql` here. `Latest Assignee Run Comments` is a list of
       // comments *on this issue*, so filtering by the authoring run's context
