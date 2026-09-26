@@ -110,6 +110,13 @@ describe("worker-tier proxy — webhook query string never reaches a log line", 
       .send({ type: "event_callback" });
 
     const payload = loggedPayload();
+    // BLO-31945 split this catch into three messages (`timeout` / `mid_stream` /
+    // `unreachable`) selected by `timedOut` / `res.headersSent`. A dead port
+    // takes the `unreachable` branch, so this positive control is pinned to
+    // that one — it is here to prove the assertion below is not passing
+    // vacuously against a line that never fired. The other two branches log the
+    // same `targetUrlForLog`, so neither can leak; if this string ever changes,
+    // re-point it rather than deleting it.
     expect(payload).toContain("failed to relay request to worker tier");
     expect(payload).not.toContain(QUERY_SENTINEL);
   });
