@@ -69,8 +69,9 @@ platform cannot resolve automatically. Each runbook should be:
   itself calls dispatch stopped. This is the *cause* side of the alert above:
   the lock has no timeout by design, so nothing external breaks the hold and
   the agent dispatches nothing until the section settles — which measured
-  holds do on their own (BLO-36522; replacing the process is *not* the
-  remedy), while `status: idle` /
+  holds since 2026-09-16 have done on their own (BLO-36522; replacing the
+  process is *not* the default remedy — see the runbook's Step 4 gate),
+  while `status: idle` /
   `errorReason: null` / `orgChainHealth: healthy` all read normal. Trigger:
   alert `PaperclipAgentStartLockWedged`, or
   `max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 300`
