@@ -4747,19 +4747,7 @@ export type WorktreeReclaimSafety = {
 
 const WORKTREE_RECLAIM_GIT_TIMEOUT_MS = 30_000;
 
-let reclaimFsDeadlineExpiries = 0;
 const reclaimFsWedgedRoots = new Set<string>();
-
-/**
- * How many filesystem calls `withReclaimFsDeadline` has abandoned in this
- * process. Each abandoned call can still hold a libuv threadpool thread (there
- * are 4 by default and `uv_cancel` cannot reach an executing request), so the
- * collector ends its pass when this moves rather than feeding the next
- * candidate on the same wedged mount another thread.
- */
-export function reclaimFsDeadlineExpiryCount(): number {
-  return reclaimFsDeadlineExpiries;
-}
 
 /**
  * Directories with an abandoned call still outstanding — threads held right
@@ -4799,7 +4787,6 @@ async function withReclaimFsDeadline<T>(operation: Promise<T>, target: string): 
   let timer: NodeJS.Timeout | undefined;
   const deadline = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
-      reclaimFsDeadlineExpiries += 1;
       const wedgedDir = path.dirname(path.resolve(target));
       reclaimFsWedgedRoots.add(wedgedDir);
       // Abandoned, not cancelled: the thread returns to the pool only when the

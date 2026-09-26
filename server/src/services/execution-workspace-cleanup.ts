@@ -7,7 +7,6 @@ import {
   cleanupExecutionWorkspaceArtifacts,
   inspectWorktreeReclaimSafety,
   isReclaimFsWedgedDir,
-  reclaimFsDeadlineExpiryCount,
   reclaimFsWedgedDirCount,
   RECLAIM_FS_OUTSTANDING_LIMIT,
   type WorktreeReclaimSafety,
@@ -277,20 +276,8 @@ export function executionWorkspaceCleanupService(db: Db) {
         ));
     };
 
-    // One abandoned stat per pass, at most. An fs call that hits its deadline
-    // is abandoned, not cancelled, and keeps a libuv threadpool thread until
-    // the syscall returns; these trees are colocated, so the next candidate is
-    // usually on the same wedged mount. The rest are re-selected next window.
-    const fsExpiriesAtStart = reclaimFsDeadlineExpiryCount();
     let scanned = 0;
     for (const candidate of candidates) {
-      if (reclaimFsDeadlineExpiryCount() !== fsExpiriesAtStart) {
-        logger.warn(
-          { remaining: candidates.length - scanned },
-          "reconcileExecutionWorkspaceCleanup: a filesystem call hit its deadline; ending the pass early",
-        );
-        break;
-      }
       scanned += 1;
       const worktreePath = candidate.providerRef ?? candidate.cwd;
       // A sibling of a tree whose stat was abandoned is on the same wedged
@@ -316,6 +303,20 @@ export function executionWorkspaceCleanupService(db: Db) {
               },
               "reconcileExecutionWorkspaceCleanup: retained worktree with unreclaimable state",
             );
+            // The probe we just made hit its deadline: the call is abandoned,
+            // not cancelled, so it holds a libuv threadpool thread until the
+            // syscall finally answers. End the pass rather than push out the
+            // eligibility of every colocated sibling behind it — they are
+            // re-selected untouched next window, and the directory hold above
+            // keeps any that are selected from being probed.
+            //
+            // Keyed on the directory this candidate just probed, not on a
+            // process-wide expiry count: `withReclaimFsDeadline` is shared with
+            // the run-teardown and operator-PATCH callers of
+            // `cleanupExecutionWorkspaceArtifacts`, so a count would let an
+            // unrelated concurrent teardown end this pass and be logged as the
+            // collector's own wedge.
+            if (isReclaimFsWedgedDir(path.dirname(path.resolve(worktreePath)))) break;
             continue;
           }
         }
