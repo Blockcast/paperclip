@@ -609,11 +609,23 @@ describeEmbeddedPostgres("heartbeat timer suppression is not bypassed by park/pr
     expect(parked.retryOfRunId).toBeNull();
   });
 
-  it("keeps counting a todo row with unresolved blockers as actionable", async () => {
-    // AC4: the deliberate behavior. `hasActionableTimerWork` filters on status,
-    // so a row that is still `todo`/`in_progress` counts even when its blockers
-    // are unresolved — only `status: blocked` is excluded. This fix must not
-    // narrow that.
+  it("stops counting a todo row with unresolved blockers as actionable (BLO-36317)", async () => {
+    // SUPERSEDED, deliberately. This case previously asserted the opposite and
+    // was pinned by BLO-31344's AC "No change weakens the deliberate behavior
+    // for dependency-blocked rows that sit in `todo`/`in_progress`" — itself a
+    // do-no-harm scope fence on that ticket's own fix, inherited from
+    // BLO-19749's docblock rather than re-decided on its merits.
+    //
+    // BLO-36317 re-decided it and falsified the underlying premise. That
+    // premise was that suppressing these wakes "would remove the only path by
+    // which an agent notices and escalates an ageing blocker". It is not the
+    // only path: `issue-graph-liveness` raises an ageing blocker against
+    // `stalled_blocker_assignee`, routing to the *blocker's* owner — the one
+    // party that can move it. Waking the blocked lane cannot.
+    //
+    // Note the fence is narrowed, not removed: `in_progress` is untouched and
+    // is pinned by the next case. Only `todo` flips, because a `todo` row with
+    // unresolved blockers provably cannot be checked out (`checkout()` 422s).
     const { companyId, agentId } = await seedAgent();
     const blockerId = randomUUID();
     const dependentId = randomUUID();
@@ -641,7 +653,49 @@ describeEmbeddedPostgres("heartbeat timer suppression is not bypassed by park/pr
 
     const run = await heartbeat.wakeup(agentId, { source: "timer", triggerDetail: "schedule" });
 
-    // Not suppressed: no skipped no-actionable-work row was written.
+    // Suppressed: the blocker-gated todo row is the agent's only candidate.
+    const wakeups = await db
+      .select({ reason: agentWakeupRequests.reason, status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(
+      wakeups.filter((row) => row.reason === "heartbeat.timer.no_actionable_work"),
+    ).toHaveLength(1);
+    expect(run).toBeNull();
+  });
+
+  it("keeps counting an in_progress row with unresolved blockers as actionable (BLO-31344 AC, surviving half)", async () => {
+    // The half of BLO-31344's fence BLO-36317 does NOT narrow, pinned here
+    // because it previously had no test of its own. A blocked `in_progress`
+    // row may still need its assignee awake to hand off, finish a partial, or
+    // unpark itself. Over-suppression is the direction that must not regress.
+    const { companyId, agentId } = await seedAgent();
+    const blockerId = randomUUID();
+    const dependentId = randomUUID();
+    await db.insert(issues).values([
+      { id: blockerId, companyId, title: "Blocker", status: "todo", priority: "high", assigneeAgentId: null },
+      {
+        id: dependentId,
+        companyId,
+        title: "In progress with unresolved blockers",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: dependentId,
+      type: "blocks",
+    });
+    const heartbeat = heartbeatService(db, {
+      penstockAvailabilityGate: allowingGate(),
+      skipQueuedRunDispatch: true,
+    });
+
+    const run = await heartbeat.wakeup(agentId, { source: "timer", triggerDetail: "schedule" });
+
     const wakeups = await db
       .select({ reason: agentWakeupRequests.reason, status: agentWakeupRequests.status })
       .from(agentWakeupRequests)
