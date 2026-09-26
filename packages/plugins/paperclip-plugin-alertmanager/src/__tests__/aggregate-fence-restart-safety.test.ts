@@ -22,7 +22,7 @@
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { PGlite } from "@electric-sql/pglite";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import {
   AlertDeliveryIncompleteError,
@@ -244,12 +244,42 @@ const deliver = (ctx: PluginContext, fenceWait?: Partial<AggregateFenceWaitPolic
     fenceWait,
   );
 
-beforeEach(async () => {
+/**
+ * Booting WASM Postgres and replaying every migration costs ~1.6s on an idle
+ * machine, and this suite did it per test. On a saturated CI runner that blew
+ * vitest's 10s hook timeout and reddened unrelated PRs — inside a merge group it
+ * ejected them (BLO-36739). The schema is identical for every case, so it is
+ * built once and each case is handed an empty one by truncating instead.
+ *
+ * The table list is read from the catalog rather than hardcoded, so a future
+ * migration cannot leave state leaking between cases silently. It covers the
+ * `public` FK stubs as well as the plugin namespace: nothing seeds them today,
+ * but the `alert_escalation_covers` path cannot be exercised without rows in
+ * them, and those rows would otherwise outlive the case that wrote them. The
+ * CASCADE direction is safe either way — the namespace tables reference
+ * `public`, never the reverse.
+ */
+let truncateAll: string;
+
+beforeAll(async () => {
   db = new PGlite();
   await applyMigrations(db);
+  const tables = await db.query<{ qualified: string }>(
+    `SELECT format('%I.%I', schemaname, tablename) AS qualified
+       FROM pg_tables WHERE schemaname = ANY($1)`,
+    [[NAMESPACE, "public"]],
+  );
+  expect(tables.rows.length).toBeGreaterThan(0);
+  truncateAll = `TRUNCATE ${tables.rows
+    .map((r) => r.qualified)
+    .join(", ")} RESTART IDENTITY CASCADE`;
+}, 30_000);
+
+beforeEach(async () => {
+  await db.query(truncateAll);
 });
 
-afterEach(async () => {
+afterAll(async () => {
   await db.close();
 });
 

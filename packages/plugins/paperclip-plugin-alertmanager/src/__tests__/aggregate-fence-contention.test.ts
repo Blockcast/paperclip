@@ -26,7 +26,7 @@
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { PGlite } from "@electric-sql/pglite";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import {
   AlertDeliveryIncompleteError,
@@ -233,12 +233,39 @@ function deferred<T = void>() {
   return { promise, resolve };
 }
 
-beforeEach(async () => {
+/**
+ * Built once per file rather than per test: the WASM Postgres boot plus the
+ * migration replay cost ~1.6s each time and blew vitest's 10s hook timeout on a
+ * saturated CI runner, reddening unrelated PRs (BLO-36739). Truncating gives
+ * each case the same empty schema a fresh database did. The table list comes
+ * from the catalog so a new migration cannot silently leak state between cases,
+ * and covers the `public` FK stubs as well as the plugin namespace: nothing
+ * seeds them today, but the `alert_escalation_covers` path cannot be exercised
+ * without rows in them, and those rows would otherwise outlive the case that
+ * wrote them. The CASCADE direction is safe either way — the namespace tables
+ * reference `public`, never the reverse.
+ */
+let truncateAll: string;
+
+beforeAll(async () => {
   db = new PGlite();
   await applyMigrations(db);
+  const tables = await db.query<{ qualified: string }>(
+    `SELECT format('%I.%I', schemaname, tablename) AS qualified
+       FROM pg_tables WHERE schemaname = ANY($1)`,
+    [[NAMESPACE, "public"]],
+  );
+  expect(tables.rows.length).toBeGreaterThan(0);
+  truncateAll = `TRUNCATE ${tables.rows
+    .map((r) => r.qualified)
+    .join(", ")} RESTART IDENTITY CASCADE`;
+}, 30_000);
+
+beforeEach(async () => {
+  await db.query(truncateAll);
 });
 
-afterEach(async () => {
+afterAll(async () => {
   await db.close();
 });
 
