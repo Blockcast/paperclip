@@ -10,8 +10,10 @@ import {
   WATCHED_GUARDS,
   WATCHED_WORKFLOWS,
   classifyGuard,
+  crossCheckCompletions,
   describeStopMode,
   resolveStaleHours,
+  selectNewestCompleted,
   summarize,
 } from "./check-scheduled-guard-liveness.mjs";
 
@@ -145,7 +147,7 @@ describe("classifyGuard — reconstruction of the 2026-09-15 outage (PEN-3281)",
     assert.equal(first.reason, "stopped");
     assert.equal(first.ageMinutes, 364);
     assert.match(first.detail, /last completed 6h ago/);
-    assert.match(first.detail, /past the 4h liveness threshold/);
+    assert.match(first.detail, new RegExp(`past the ${DEFAULT_STALE_HOURS}h liveness threshold`));
   });
 
   // Mutation check: the same guards, same code path, healthy timings. If this
@@ -164,7 +166,7 @@ describe("classifyGuard — reconstruction of the 2026-09-15 outage (PEN-3281)",
   });
 });
 
-describe("classifyGuard — the 4h threshold against measured gap distribution", () => {
+describe("classifyGuard — the 165-minute threshold against measured gap distribution", () => {
   const now = Date.parse("2026-09-15T12:00:00Z");
 
   // Ordinary cron jitter on this repo topped out at 118 min across all six
@@ -184,23 +186,505 @@ describe("classifyGuard — the 4h threshold against measured gap distribution",
     assert.equal(over.status, "stale");
   });
 
-  // Honest limitation, asserted rather than left in prose: in the 2026-09-14
-  // event the lockfile guard's gap reached only 213 min, under the 4h bar. The
-  // event is still caught — detection is per-event, and the other five breach.
-  it("catches the 2026-09-14 event on five of six legs", () => {
-    const gaps = { a: 305, b: 291, c: 268, d: 254, e: 241, "lockfile-drift-monitor.yml": 213 };
-    const results = Object.entries(gaps).map(([workflow, minutes]) =>
-      classifyGuard(workflow, completedAgo(workflow, minutes * MINUTE, { now }), { now }),
+  // The band is (118, 213): above the jitter ceiling, below the shortest leg of
+  // the outage cluster. 165 sits mid-band at 1.40x the ceiling. Asserted so a
+  // later "let's relax it a bit" edit has to argue with the data.
+  it("sits strictly inside the admissible band", () => {
+    const bar = DEFAULT_STALE_HOURS * 60;
+    assert.ok(bar > 118, `bar ${bar} must clear the 118-min jitter ceiling`);
+    assert.ok(bar < 213, `bar ${bar} must sit under the 213-min shortest outage leg`);
+  });
+
+  const EVENT_2026_09_14_LEGS = [305, 291, 268, 254, 241, 213];
+
+  it("is retrospectively over the bar on all six legs of the 2026-09-14 event", () => {
+    const results = EVENT_2026_09_14_LEGS.map((minutes, index) =>
+      classifyGuard(`leg-${index}.yml`, completedAgo(`leg-${index}`, minutes * MINUTE, { now }), { now }),
     );
     const summary = summarize(results);
 
-    assert.equal(summary.staleCount, 5);
-    assert.equal(summary.exitCode, 1, "the event is reported even though one leg is under the bar");
-    assert.equal(
-      results.find((r) => r.workflow === "lockfile-drift-monitor.yml").status,
-      "ok",
-      "documents the known miss rather than pretending full coverage",
+    assert.equal(summary.staleCount, 6);
+    assert.equal(summary.exitCode, 1);
+  });
+
+  // The number that actually decides coverage, and the reason 240 was wrong.
+  // An HOURLY detector only samples once every 60 min, so a leg of length G is
+  // catchable for G-bar minutes and only GUARANTEED to be sampled when
+  // G - bar > 60. Retrospective "is it over the bar" flatters both bars; this
+  // is the honest instrument.
+  it("guarantees a catch on 5 of 6 legs at 165 min where 240 min guarantees 1", () => {
+    const guaranteed = (bar) => EVENT_2026_09_14_LEGS.filter((leg) => leg - bar > 60).length;
+
+    assert.equal(guaranteed(DEFAULT_STALE_HOURS * 60), 5);
+    assert.equal(guaranteed(240), 1, "the shipped 240-min bar guaranteed a catch on one leg only");
+  });
+});
+
+describe("classifyGuard — the four PEN-3379 production false positives", () => {
+  // NOT a synthetic reconstruction. These are the four reds this detector
+  // actually produced in production between 2026-09-18T06:59Z and 14:50Z, the
+  // only four it had ever produced on the detection step — and all four were
+  // wrong. `claimed` is the completion the filtered `status=completed&per_page=1`
+  // read returned as [0]; `actual` is the completion that guard genuinely had,
+  // 14-23 minutes before the red. Both guards ran every hour throughout and
+  // read state=active.
+  const FALSE_POSITIVES = [
+    {
+      redAt: "2026-09-18T06:59:00Z",
+      workflow: "relay-ssl-multicert-guard.yml",
+      name: "Relay SSL Multicert",
+      claimed: "2026-09-12T04:32:39Z",
+      actual: "2026-09-18T06:42:30Z",
+    },
+    {
+      redAt: "2026-09-18T08:52:00Z",
+      workflow: "ally-review-consistency.yml",
+      name: "Ally Review Consistency",
+      claimed: "2026-09-12T04:35:43Z",
+      actual: "2026-09-18T08:38:43Z",
+    },
+    {
+      redAt: "2026-09-18T10:51:00Z",
+      workflow: "relay-ssl-multicert-guard.yml",
+      name: "Relay SSL Multicert",
+      claimed: "2026-09-12T04:32:39Z",
+      actual: "2026-09-18T10:27:48Z",
+    },
+    {
+      redAt: "2026-09-18T14:50:00Z",
+      workflow: "relay-ssl-multicert-guard.yml",
+      name: "Relay SSL Multicert",
+      claimed: "2026-09-12T04:32:39Z",
+      actual: "2026-09-18T14:32:34Z",
+    },
+  ];
+
+  /** The stale-index observation as the detector saw it, with the cross-check attached. */
+  function staleIndexObservation({ name, claimed, actual }) {
+    return {
+      state: "active",
+      name,
+      newest: {
+        updatedAt: claimed,
+        conclusion: "success",
+        htmlUrl: "https://github.com/Blockcast/paperclip/actions/runs/1",
+      },
+      crossCheck: { newestCompletedAt: actual },
+    };
+  }
+
+  // The positive control. Without the cross-check this fixture MUST still red,
+  // or the test proves nothing about the fix — it would pass just as happily
+  // against a classifier that never reds at all.
+  it("reproduces all four reds when the cross-check is absent (shipped behaviour)", () => {
+    for (const fixture of FALSE_POSITIVES) {
+      const { crossCheck, ...withoutCrossCheck } = staleIndexObservation(fixture);
+      const result = classifyGuard(fixture.workflow, withoutCrossCheck, {
+        now: Date.parse(fixture.redAt),
+        staleHours: thresholdFor(fixture.workflow),
+      });
+
+      assert.equal(result.status, "stale", `${fixture.workflow} @ ${fixture.redAt}`);
+      assert.equal(result.reason, "stopped");
+      assert.ok(result.ageMinutes > 140 * 60, "the fixture really does carry the ~6-day bogus age");
+    }
+  });
+
+  it("suppresses all four once the unfiltered cross-check contradicts the index", () => {
+    for (const fixture of FALSE_POSITIVES) {
+      const result = classifyGuard(fixture.workflow, staleIndexObservation(fixture), {
+        now: Date.parse(fixture.redAt),
+        staleHours: thresholdFor(fixture.workflow),
+      });
+
+      assert.equal(result.status, "unknown", `${fixture.workflow} @ ${fixture.redAt} must not red`);
+      assert.equal(result.reason, "cross-check-disagreement");
+      // Re-aged against the completion that really happened: 14-23 min, not ~150h.
+      assert.ok(result.ageMinutes < 30, `re-aged to ${result.ageMinutes}m against the real completion`);
+    }
+  });
+
+  it("reports the whole set as zero stale and exits 0", () => {
+    // Each fixture is classified at its own redAt. Its `actual` is the guard's
+    // newest completion AT THAT MOMENT; at a later `now` the unfiltered read
+    // would return a later completion (both guards ran hourly), so replaying an
+    // early `actual` hours later feeds the classifier a read that cannot occur
+    // and, now that the cross-check is aged too, would red correctly.
+    const summary = summarize(
+      FALSE_POSITIVES.map((fixture) =>
+        classifyGuard(fixture.workflow, staleIndexObservation(fixture), {
+          now: Date.parse(fixture.redAt),
+          staleHours: thresholdFor(fixture.workflow),
+        }),
+      ),
     );
+
+    assert.equal(summary.staleCount, 0);
+    assert.equal(summary.exitCode, 0, "not one of these four may exit non-zero");
+    // Suppressed is not healthy: the headline must not claim they completed.
+    assert.equal(summary.unknownCount, FALSE_POSITIVES.length);
+    assert.doesNotMatch(summary.headline, /^All \d+ watched/);
+    assert.match(summary.headline, /could not be assessed/);
+  });
+
+  // The other half of the contract. Suppression must be driven by DISAGREEMENT,
+  // not by the cross-check existing — otherwise the fix mutes the detector and
+  // reproduces PEN-3281 by a different route.
+  it("still reds a genuinely stopped guard when both reads agree", () => {
+    const now = Date.parse("2026-09-18T14:50:00Z");
+    const result = classifyGuard(
+      "relay-ssl-multicert-guard.yml",
+      {
+        state: "active",
+        name: "Relay SSL Multicert",
+        newest: { updatedAt: "2026-09-12T04:32:39Z", conclusion: "success", htmlUrl: "https://x" },
+        // The unfiltered read corroborates: nothing newer has completed.
+        crossCheck: { newestCompletedAt: "2026-09-12T04:32:39Z" },
+      },
+      { now, staleHours: thresholdFor("relay-ssl-multicert-guard.yml") },
+    );
+
+    assert.equal(result.status, "stale");
+    assert.equal(result.reason, "stopped");
+  });
+
+  it("still reds a stopped guard when the cross-check is newer but also past the bar", () => {
+    // A one-second index lag puts a dead guard in the disagreement branch. The
+    // newer read refutes the age, not staleness, so it must be aged too.
+    const now = Date.parse("2026-09-24T12:00:00Z");
+    const result = classifyGuard(
+      "relay-ssl-multicert-guard.yml",
+      {
+        state: "active",
+        name: "Relay SSL Multicert",
+        newest: { updatedAt: "2026-09-14T04:00:00Z", conclusion: "success", htmlUrl: "https://x" },
+        crossCheck: { newestCompletedAt: "2026-09-14T04:00:01Z" },
+      },
+      { now, staleHours: thresholdFor("relay-ssl-multicert-guard.yml") },
+    );
+
+    assert.equal(result.status, "stale");
+    assert.equal(result.reason, "stopped");
+    assert.match(result.detail, /2026-09-14T04:00:01Z/);
+  });
+
+  // Exactly ON the bar is past it (`>=`): 12:05Z -> 14:50Z is 165m against the
+  // 2.75h threshold. `>` in place of `>=` turns this stop into a suppression.
+  it("still reds a stopped guard whose newer cross-check sits exactly on the bar", () => {
+    const now = Date.parse("2026-09-18T14:50:00Z");
+    const result = classifyGuard(
+      "relay-ssl-multicert-guard.yml",
+      {
+        state: "active",
+        name: "Relay SSL Multicert",
+        newest: { updatedAt: "2026-09-18T11:00:00Z", conclusion: "success", htmlUrl: "https://x" },
+        crossCheck: { newestCompletedAt: "2026-09-18T12:05:00Z" },
+      },
+      { now, staleHours: thresholdFor("relay-ssl-multicert-guard.yml") },
+    );
+
+    assert.equal(result.status, "stale");
+    assert.equal(result.reason, "stopped");
+    assert.match(result.detail, /2026-09-18T12:05:00Z/);
+  });
+
+  // Absence of corroboration is not agreement. A permanently failing second
+  // read must not become a mute switch.
+  it("leaves the red standing, annotated, when the cross-check cannot be read", () => {
+    const now = Date.parse("2026-09-18T14:50:00Z");
+    const result = classifyGuard(
+      "relay-ssl-multicert-guard.yml",
+      {
+        state: "active",
+        name: "Relay SSL Multicert",
+        newest: { updatedAt: "2026-09-12T04:32:39Z", conclusion: "success", htmlUrl: "https://x" },
+        crossCheck: { error: true },
+      },
+      { now, staleHours: thresholdFor("relay-ssl-multicert-guard.yml") },
+    );
+
+    assert.equal(result.status, "stale");
+    assert.match(result.detail, /cross-check read could not be made/);
+  });
+});
+
+describe("selectNewestCompleted — the cross-check must not become a mute switch", () => {
+  /**
+   * An unfiltered run page as the API returns it: ordered by `created_at` DESC,
+   * mixing queued/in-progress entries in with completed ones.
+   */
+  function page(...runs) {
+    return runs.map(([createdAt, updatedAt, status]) => ({
+      created_at: createdAt,
+      updated_at: updatedAt,
+      status,
+    }));
+  }
+
+  // THE failure this selection exists to avoid, and the one a `max(updated_at)`
+  // implementation gets wrong. The guard genuinely stopped on 09-12. Someone
+  // then re-ran an ancient run — the ordinary triage reflex on a stalled guard —
+  // which bumped that entry's `updated_at` to 09-18 WITHOUT moving its
+  // `created_at`, so it stays near the bottom of the page.
+  //
+  // `max(updated_at)` reads 09-18, contradicts the filtered read, and suppresses
+  // the alarm: a mute, co-located with the outage it would hide. Taking the
+  // first completed entry in `created_at` order cannot be fooled this way.
+  it("takes the newest-CREATED completion, not the largest updated_at", () => {
+    const observed = selectNewestCompleted(
+      page(
+        ["2026-09-12T04:32:39Z", "2026-09-12T04:32:39Z", "completed"],
+        ["2026-09-12T03:31:12Z", "2026-09-12T03:33:40Z", "completed"],
+        // The re-run: ancient created_at, fresh updated_at.
+        ["2026-09-06T11:20:00Z", "2026-09-18T14:00:00Z", "completed"],
+      ),
+    );
+
+    assert.equal(observed, "2026-09-12T04:32:39.000Z");
+    assert.notEqual(observed, "2026-09-18T14:00:00.000Z", "a re-run of an old run is not a fresh completion");
+  });
+
+  it("drives that page through the classifier without suppressing a real outage", () => {
+    const result = classifyGuard(
+      "relay-ssl-multicert-guard.yml",
+      {
+        state: "active",
+        name: "Relay SSL Multicert",
+        newest: { updatedAt: "2026-09-12T04:32:39Z", conclusion: "success", htmlUrl: "https://x" },
+        crossCheck: {
+          newestCompletedAt: selectNewestCompleted(
+            page(
+              ["2026-09-12T04:32:39Z", "2026-09-12T04:32:39Z", "completed"],
+              ["2026-09-06T11:20:00Z", "2026-09-18T14:00:00Z", "completed"],
+            ),
+          ),
+        },
+      },
+      {
+        now: Date.parse("2026-09-18T14:50:00Z"),
+        staleHours: thresholdFor("relay-ssl-multicert-guard.yml"),
+      },
+    );
+
+    assert.equal(result.status, "stale", "a re-run must not demote a genuine outage to unknown");
+    assert.equal(result.reason, "stopped");
+  });
+
+  // The other direction: the four real false positives must still be suppressed
+  // when the cross-check is derived from a PAGE rather than handed in ready-made.
+  it("still recovers the real completion behind each PEN-3379 false positive", () => {
+    const observed = selectNewestCompleted(
+      page(
+        ["2026-09-18T06:31:02Z", "2026-09-18T06:42:30Z", "completed"],
+        ["2026-09-18T05:30:55Z", "2026-09-18T05:33:10Z", "completed"],
+      ),
+    );
+
+    assert.equal(observed, "2026-09-18T06:42:30.000Z", "the completion the filtered index failed to return");
+  });
+
+  it("skips queued and in-progress entries sitting above the newest completion", () => {
+    const observed = selectNewestCompleted(
+      page(
+        ["2026-09-22T07:31:00Z", "2026-09-22T07:31:00Z", "queued"],
+        ["2026-09-22T06:43:09Z", "2026-09-22T06:44:10Z", "in_progress"],
+        ["2026-09-22T05:28:10Z", "2026-09-22T05:30:01Z", "completed"],
+      ),
+    );
+
+    assert.equal(observed, "2026-09-22T05:30:01.000Z");
+  });
+
+  it("returns null when the page holds no completed run at all", () => {
+    assert.equal(selectNewestCompleted(page(["2026-09-22T07:31:00Z", "2026-09-22T07:31:00Z", "queued"])), null);
+    assert.equal(selectNewestCompleted([]), null);
+    assert.equal(selectNewestCompleted(undefined), null);
+  });
+
+  // Null withholds corroboration, which leaves the red STANDING. Falling through
+  // to an older run instead would answer a different question than the one asked.
+  it("returns null rather than an older run when the newest completion will not parse", () => {
+    const observed = selectNewestCompleted(
+      page(
+        ["2026-09-12T04:32:39Z", "not-a-timestamp", "completed"],
+        ["2026-09-12T03:31:12Z", "2026-09-12T03:33:40Z", "completed"],
+      ),
+    );
+
+    assert.equal(observed, null);
+  });
+});
+
+describe("crossCheckCompletions — the corroborating read's own failure modes", () => {
+  const reader = (payload) => () => JSON.stringify(payload);
+
+  it("asks for the unfiltered, workflow-scoped page, not the index it corroborates", () => {
+    const calls = [];
+    crossCheckCompletions("Blockcast/paperclip", "relay-ssl-multicert-guard.yml", (args) => {
+      calls.push(args);
+      return JSON.stringify({ workflow_runs: [] });
+    });
+
+    assert.equal(calls.length, 1);
+    // Workflow-scoped: a repo-wide page is always fresh ordinary CI, which
+    // would mute every guard forever at exit 0.
+    assert.match(
+      calls[0][1],
+      /^repos\/Blockcast\/paperclip\/actions\/workflows\/relay-ssl-multicert-guard\.yml\/runs\?per_page=30$/,
+    );
+    // Not redundant with the anchored match above: this is the one that names
+    // the property. Without `status=completed` this read is a second opinion;
+    // with it, it is a re-read of the index PEN-3379 found wedged, and it
+    // agrees with the primary by construction.
+    assert.doesNotMatch(calls[0][1], /status=/);
+  });
+
+  it("reports the newest completion from an unfiltered page", () => {
+    const observed = crossCheckCompletions(
+      "Blockcast/paperclip",
+      "relay-ssl-multicert-guard.yml",
+      reader({
+        workflow_runs: [
+          { created_at: "2026-09-18T06:31:02Z", updated_at: "2026-09-18T06:42:30Z", status: "completed" },
+          { created_at: "2026-09-18T05:30:55Z", updated_at: "2026-09-18T05:33:10Z", status: "completed" },
+        ],
+      }),
+    );
+
+    assert.deepEqual(observed, { newestCompletedAt: "2026-09-18T06:42:30.000Z" });
+  });
+
+  it("reports null — not an error — when the page genuinely holds no completed run", () => {
+    const observed = crossCheckCompletions(
+      "Blockcast/paperclip",
+      "relay-ssl-multicert-guard.yml",
+      reader({ workflow_runs: [{ created_at: "2026-09-22T07:31:00Z", updated_at: "2026-09-22T07:31:00Z", status: "queued" }] }),
+    );
+
+    // Distinct from {error: true}: this is a successful read that found
+    // nothing, which is evidence. An error is the absence of evidence.
+    assert.deepEqual(observed, { newestCompletedAt: null });
+  });
+
+  it("reports {error: true} when the read throws, so the red is left standing", () => {
+    const observed = crossCheckCompletions("Blockcast/paperclip", "relay-ssl-multicert-guard.yml", () => {
+      throw new Error("gh: API rate limit exceeded");
+    });
+
+    // THE branch that decides whether a broken second read degrades to "no
+    // corroboration, red stands" or becomes a mute switch. classifyGuard only
+    // suppresses on `!error && newestCompletedAt`, so `{error: true}` must not
+    // be confused with either a null or a timestamp.
+    assert.deepEqual(observed, { error: true });
+    assert.equal(observed.newestCompletedAt, undefined);
+  });
+
+  it("reports {error: true} on a malformed body rather than throwing out of the run", () => {
+    const observed = crossCheckCompletions(
+      "Blockcast/paperclip",
+      "relay-ssl-multicert-guard.yml",
+      () => "<html>502 Bad Gateway</html>",
+    );
+
+    assert.deepEqual(observed, { error: true });
+  });
+
+  it("tolerates a well-formed body with no workflow_runs key", () => {
+    const observed = crossCheckCompletions("Blockcast/paperclip", "relay-ssl-multicert-guard.yml", reader({}));
+
+    assert.deepEqual(observed, { newestCompletedAt: null });
+  });
+});
+
+describe("classifyGuard — 'never completed' rests on the same distrusted index", () => {
+  const now = Date.parse("2026-09-18T14:50:00Z");
+  const staleHours = 2.75;
+
+  function neverCompleted(crossCheck) {
+    return classifyGuard(
+      "relay-ssl-multicert-guard.yml",
+      { state: "active", name: "Relay SSL Multicert", newest: null, crossCheck },
+      { now, staleHours },
+    );
+  }
+
+  it("still reds when the cross-check agrees there is no completed run", () => {
+    const result = neverCompleted({ newestCompletedAt: null });
+
+    assert.equal(result.status, "stale");
+    assert.equal(result.reason, "never-completed");
+  });
+
+  it("still reds when no cross-check was supplied at all", () => {
+    const result = neverCompleted(undefined);
+
+    assert.equal(result.status, "stale");
+    assert.equal(result.reason, "never-completed");
+  });
+
+  it("still reds when the cross-check could not be read — absence is not agreement", () => {
+    const result = neverCompleted({ error: true });
+
+    assert.equal(result.status, "stale", "an unreadable second read must not mute the alarm");
+    assert.equal(result.reason, "never-completed");
+  });
+
+  it("suppresses when the unfiltered read finds any completion — 'never' is then a fiction", () => {
+    const result = neverCompleted({ newestCompletedAt: "2026-09-18T14:32:34Z" });
+
+    assert.equal(result.status, "unknown");
+    assert.equal(result.reason, "cross-check-disagreement");
+    assert.match(result.detail, /NOT being\s+asserted to have stopped/);
+  });
+
+  // "Never completed" is refuted by ANY completion, however old. But refuting
+  // "never" does not establish "alive": the cross-check timestamp is aged
+  // against staleHours, and a six-day-old completion is a stopped guard, not a
+  // disagreement to suppress. The empty filtered page must not mute a dead guard.
+  it("reds as stopped, citing the cross-check timestamp, when the only completion is past the bar; refuting 'never' does not establish 'alive'", () => {
+    const result = neverCompleted({ newestCompletedAt: "2026-09-12T04:32:39Z" });
+
+    assert.equal(result.status, "stale");
+    assert.equal(result.reason, "stopped");
+    // 2026-09-12T04:32:39Z -> 2026-09-18T14:50:00Z is 6d 10h 17m 21s = 9257m (floored).
+    assert.equal(result.ageMinutes, 9257);
+    assert.match(result.detail, /2026-09-12T04:32:39Z/);
+    assert.match(result.detail, /past the 2\.75h liveness threshold/);
+    assert.equal(result.lastRunUrl, null);
+  });
+
+  // Inside the bar by one minute: 2h44m against a 2h45m threshold still reads
+  // as a disagreement, not a stop.
+  it("still suppresses when the cross-check completion sits just inside the bar", () => {
+    const result = neverCompleted({ newestCompletedAt: "2026-09-18T12:06:00Z" });
+
+    assert.equal(result.status, "unknown");
+    assert.equal(result.reason, "cross-check-disagreement");
+  });
+
+  // The other side of that minute: EXACTLY on the bar (12:05Z, 165m) is past it,
+  // a stop and not a suppression. `<=` in place of `<` mutes it.
+  it("reds as stopped when the cross-check completion sits exactly on the bar", () => {
+    const result = neverCompleted({ newestCompletedAt: "2026-09-18T12:05:00Z" });
+
+    assert.equal(result.status, "stale");
+    assert.equal(result.reason, "stopped");
+    assert.equal(result.ageMinutes, 165);
+  });
+
+  // A present-but-unparsable timestamp is not corroboration. It falls through to
+  // the red rather than being read as either fresh or stale.
+  it("falls through to never-completed when the cross-check timestamp is present but unparsable", () => {
+    const result = neverCompleted({ newestCompletedAt: "not-a-timestamp" });
+
+    assert.equal(result.status, "stale");
+    assert.equal(result.reason, "never-completed");
+  });
+
+  it("annotates the never-completed red when the cross-check could not be read", () => {
+    const result = neverCompleted({ error: true });
+
+    assert.match(result.detail, /cross-check read could not be made/);
   });
 });
 
@@ -402,10 +886,17 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     assert.ok(twiceDaily > 14.6, "would red on ordinary twice-daily jitter");
     assert.ok(twiceDaily < 17.71, "would sail over the 2026-09-15 outage it must catch");
 
-    // The hourly six keep 4h; a shared global threshold is the bug this replaced.
+    // The hourly six share one bar; a shared GLOBAL threshold across cadences is
+    // the bug this replaced. Asserted against DEFAULT_STALE_HOURS rather than a
+    // literal so moving the bar stays a one-line change with a reason attached
+    // (PEN-3379 moved it 4h -> 2.75h).
     for (const workflow of WATCHED_WORKFLOWS) {
       if (workflow === "production-environment-protection-guard.yml") continue;
-      assert.equal(byWorkflow.get(workflow), 4, `${workflow} should be on the hourly 4h bar`);
+      assert.equal(
+        byWorkflow.get(workflow),
+        DEFAULT_STALE_HOURS,
+        `${workflow} should be on the hourly ${DEFAULT_STALE_HOURS}h bar`,
+      );
     }
   });
 });
