@@ -773,7 +773,7 @@ that reads a nine-fire silent failure as a successful enqueue is producing exact
 
 #### Landed end to end — the routine's proof
 
-#1990 was enqueued by fire 6, classified `still-queued` at its confirmation, and **merged at
+#1990 was enqueued by `187a69d7`, classified `still-queued` by `aec91d73`, and **merged at
 `2026-09-25T02:34:27Z`**. #1804 was enqueued by `4effd9fa`, classified `still-queued` by
 `aa6a0a70`, and **merged at `2026-09-25T15:27:33Z`**. #2001 was enqueued by `98027253`, classified
 `still-queued` by `933af750`, and **merged at `2026-09-26T15:16:52Z`** (all three
@@ -789,9 +789,12 @@ The remaining rows are open as of writing — #1985, #1976, #2020, #1774 all `st
 `mergedAt: null` — so `still-queued` remains the accurate classification for the three of them that
 armed. For #2020 it is accurate only about the PR's state, not about the routine's: it never entered
 the queue. **No receipt has yet printed a literal `confirmed-merged` row**, because each merge fell
-outside the one-receipt confirmation window that had already resolved its row — #2001 is the
-sharpest case, merging 39 minutes after the most recent receipt (`517622da`, 14:37:43Z) resolved it
-`still-queued`.
+outside the one-receipt confirmation window that had already resolved its row. Resolution-to-merge
+was 1d23h12m for #1990 (`aec91d73`, `2026-09-23T03:22:09Z`), 1d22h43m for #1804 (`aa6a0a70`,
+`2026-09-23T16:44:08Z`) and 1d07h58m for #2001 (`933af750`, `2026-09-25T07:18:04Z`) — #2001 is the
+sharpest of the three and still misses its window by more than a day. Every later receipt that names
+#2001 at all carries it only as a `skip` / `mergestate:UNKNOWN` classifier row, not a confirmation;
+the last of those is `8ae54c04` (`2026-09-26T08:17:49Z`), 6h59m before the merge.
 
 #### AC 3 names a field this repo does not use — fifth plan-vs-reality drift
 
@@ -809,7 +812,10 @@ App *can* be that actor, so it is not an attribution artifact. Either the script
 reported a queue state already set, or it armed something GitHub attributed elsewhere. One run's
 evidence does not separate those; logged on
 [BLO-36804](https://paperclip.blockcast.net/BLO/issues/BLO-36804) alongside the arming defect above
-— it is the same question about the same code path — not resolved here.
+— it is the same question about the same code path — not resolved here. That row carries the
+question as context but is **not gated on it**: all three of its `Done when` bullets are about the
+arming defect and its classification, so BLO-36804 can close green with the ordering question still
+open. A later reader should treat it closing as evidence about the arming defect only.
 
 #### Coalescing continues to hold, and a `skipped` fire is still not a missing receipt
 
