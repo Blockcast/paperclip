@@ -11,6 +11,7 @@ const repoRoot = path.resolve(
 );
 
 const DASHBOARD_KEY = "github-review-request-funnel.json";
+const PLATFORM_KEY = "paperclip-platform.json";
 
 function renderChart(extraArgs = []) {
   return execFileSync(
@@ -36,16 +37,16 @@ function renderChart(extraArgs = []) {
  * indentation survives templating and that the `__PAPERCLIP_DS_UID__`
  * placeholder was substituted. Reading the source file would assert neither.
  */
-function renderDashboard(extraArgs = []) {
+function renderDashboard(extraArgs = [], key = DASHBOARD_KEY) {
   const rendered = renderChart([
     "--show-only",
     "templates/grafana-dashboard.yaml",
     ...extraArgs,
   ]);
 
-  const marker = `${DASHBOARD_KEY}: |`;
+  const marker = `${key}: |`;
   const start = rendered.indexOf(marker);
-  assert.notEqual(start, -1, `rendered ConfigMap has no ${DASHBOARD_KEY} key`);
+  assert.notEqual(start, -1, `rendered ConfigMap has no ${key} key`);
 
   const body = rendered
     .slice(rendered.indexOf("\n", start) + 1)
@@ -333,6 +334,11 @@ test("grafanaDashboard.enabled=false renders no ConfigMap (chart stays installab
     /paperclip-grafana-dashboard-review-request-funnel/,
     "disabling the flag must drop the dashboard ConfigMap entirely",
   );
+  assert.doesNotMatch(
+    rendered,
+    /paperclip-grafana-dashboard-platform/,
+    "disabling the flag must drop every dashboard ConfigMap, not just the first",
+  );
 });
 
 test("the datasource uid is overridable for clusters whose paperclip-scraping Prometheus is named differently", () => {
@@ -340,6 +346,156 @@ test("the datasource uid is overridable for clusters whose paperclip-scraping Pr
     "--set",
     "grafanaDashboard.datasourceUid=some-other-prom",
   ]);
+
+  const uids = new Set(
+    allTargets(dashboard).map(({ target }) => target.datasource?.uid),
+  );
+  assert.deepEqual([...uids], ["some-other-prom"]);
+});
+
+// ---------------------------------------------------------------------------
+// Paperclip Platform dashboard (BLO-22498) -- BLO-18012's operational signal.
+// ---------------------------------------------------------------------------
+
+test("Blockcast values render the Paperclip Platform dashboard ConfigMap with the sidecar label (BLO-22498)", () => {
+  // AC 3 of BLO-22498 is the verb "renders", not "is merged". The panel JSON
+  // sat correct-and-undeployed on onprem-k8s master for 12 days because that
+  // repo's monitoring/dashboards/ directory is not a delivery path -- nothing
+  // renders it into a ConfigMap. This chart is the delivery path, and without
+  // the exact label pair below the ConfigMap is inert: it deploys fine and no
+  // dashboard ever appears.
+  const rendered = renderChart();
+
+  assert.match(
+    rendered,
+    /name: paperclip-grafana-dashboard-platform/,
+    "Blockcast values must render the Paperclip Platform dashboard ConfigMap",
+  );
+
+  const block = rendered.slice(
+    rendered.indexOf("name: paperclip-grafana-dashboard-platform"),
+  );
+  assert.match(
+    block,
+    /^\s+grafana_dashboard: "1"$/m,
+    'the platform dashboard ConfigMap must carry grafana_dashboard: "1" or the Grafana sidecar will not adopt it',
+  );
+});
+
+test("the platform dashboard carries no import-only datasource scaffolding (BLO-22498 green-over-blind trap)", () => {
+  // The onprem-k8s copy is written for Grafana's import UI: `__inputs`,
+  // `__requires`, and a `DS_PROMETHEUS` datasource template variable whose
+  // `current` is the NAME "Prometheus". Those are honoured only by the import
+  // dialog. A sidecar-provisioned dashboard resolves ${DS_PROMETHEUS} against
+  // the Grafana default datasource instead -- `thanos`, which does not scrape
+  // the paperclip control plane -- so every panel renders "No data" while the
+  // dashboard looks perfectly healthy in review. Deploying that would satisfy
+  // "a panel exists" and fail "a panel renders".
+  const { rendered, dashboard } = renderDashboard([], PLATFORM_KEY);
+
+  assert.ok(
+    !("__inputs" in dashboard),
+    "__inputs is import-UI scaffolding; a provisioned dashboard must pin its datasource instead",
+  );
+  assert.ok(!("__requires" in dashboard), "__requires is import-UI scaffolding");
+  assert.ok(
+    !JSON.stringify(dashboard).includes("${DS_"),
+    "no panel may resolve its datasource through a template variable; it would silently fall back to the Grafana default",
+  );
+  assert.ok(
+    !rendered.includes("__PAPERCLIP_DS_UID__"),
+    "the datasource placeholder must be substituted at render time",
+  );
+
+  const uids = new Set(
+    allTargets(dashboard).map(({ target }) => target.datasource?.uid),
+  );
+  assert.deepEqual(
+    [...uids],
+    ["cluster"],
+    "all platform panel targets must query the `cluster` datasource uid",
+  );
+});
+
+test("the platform dashboard charts both BLO-18012 series, discriminated by error_reason (BLO-22498 AC 1/2)", () => {
+  // A generic "agents in error" count cannot tell a session_unavailable agent
+  // from an unrelated failure and would raise a false BLO-18012 alarm on any
+  // of them -- observed live 2026-09-10, a 2581s BackoffLimitExceeded agent.
+  // The by-reason split is what makes the panel answer the question asked.
+  const { dashboard } = renderDashboard([], PLATFORM_KEY);
+  const exprs = allTargets(dashboard).map(({ target }) => target.expr ?? "");
+
+  const countExpr = exprs.find((expr) =>
+    expr.includes("paperclip_agent_status_error_agents"),
+  );
+  assert.ok(countExpr, "dashboard must chart paperclip_agent_status_error_agents");
+  assert.match(
+    countExpr,
+    /by \(error_reason\)/,
+    "the agents-in-error count must be split by error_reason; the aggregate cannot isolate the BLO-18012 condition",
+  );
+  assert.match(
+    countExpr,
+    /^max by/,
+    "the gauge is fleet-wide and identical on every replica; a bare sum multiplies the count by the replica count",
+  );
+
+  const ageExpr = exprs.find((expr) =>
+    expr.includes("paperclip_agent_status_error_oldest_age_seconds"),
+  );
+  assert.ok(
+    ageExpr,
+    "dashboard must chart paperclip_agent_status_error_oldest_age_seconds",
+  );
+  assert.match(
+    ageExpr,
+    /error_reason="session_unavailable"/,
+    "the time-in-error panel must be scoped to session_unavailable; unrelated long-lived failures would read as a BLO-18012 breach that never happened",
+  );
+});
+
+test("the time-in-error panel shows the 2-min BLO-18012 bound as a threshold (BLO-22498 AC 3)", () => {
+  // AC 3 requires "a visible threshold line at the BLO-18012 bound". A red
+  // step alone is not visible on a timeseries unless thresholdsStyle is on,
+  // and the bound is meaningless if the axis is not in seconds.
+  const { dashboard } = renderDashboard([], PLATFORM_KEY);
+
+  const panel = dashboard.panels.find(({ targets }) =>
+    (targets ?? []).some(({ expr }) =>
+      expr?.includes("paperclip_agent_status_error_oldest_age_seconds"),
+    ),
+  );
+  assert.ok(panel, "the time-in-error panel must exist");
+
+  const defaults = panel.fieldConfig?.defaults ?? {};
+  assert.equal(
+    defaults.unit,
+    "s",
+    "the panel plots seconds; any other unit makes the 120 threshold mean something else",
+  );
+  assert.ok(
+    (defaults.thresholds?.steps ?? []).some(
+      (step) => step.color === "red" && step.value === 120,
+    ),
+    "the panel must carry a red threshold at 120s -- BLO-18012's <=2 min recovery bound",
+  );
+  assert.notEqual(
+    defaults.custom?.thresholdsStyle?.mode,
+    "off",
+    "the threshold must be drawn on the plot; an unrendered threshold is not a visible bound",
+  );
+});
+
+test("the platform dashboard uid is stable, so the URL posted on BLO-18012 keeps resolving", () => {
+  const { dashboard } = renderDashboard([], PLATFORM_KEY);
+  assert.equal(dashboard.uid, "paperclip-platform");
+});
+
+test("the platform dashboard datasource uid is overridable alongside the funnel's", () => {
+  const { dashboard } = renderDashboard(
+    ["--set", "grafanaDashboard.datasourceUid=some-other-prom"],
+    PLATFORM_KEY,
+  );
 
   const uids = new Set(
     allTargets(dashboard).map(({ target }) => target.datasource?.uid),
