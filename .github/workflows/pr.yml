@@ -1344,12 +1344,13 @@ jobs:
 
       # PEN-3223: the vendored version is recorded in two hand-maintained
       # places — package.json `version` and PROVENANCE.md's Origin table
-      # `Current version` — and the hash above cannot see them disagree, since
-      # PROVENANCE.md is excluded from the manifest by design. That pair drifted
-      # on PR#1862 and survived three heads. The failure is quiet and lands
-      # later: the next vendored change reads the stale table field, bumps from
-      # there, and reuses a `-blockcast.N` already published against different
-      # bytes.
+      # `Current version` — and nothing else compares them. That pair drifted on
+      # PR#1862 and survived three heads. Since BLO-35109 withdrew the stored
+      # integrity hash, this step is the ONLY machine-checked link between
+      # PROVENANCE.md and the tree beside it; the `policy` job's provenance-log
+      # check asserts that vendored source carries a log row, not that the
+      # recorded version is true. The failure is quiet and lands later: the next
+      # vendored change reads the stale table field and bumps from there.
       - name: Verify vendored version is recorded consistently
         run: |
           set -euo pipefail
@@ -1366,107 +1367,6 @@ jobs:
             echo "Update the 'Current version' row in vendor/paperclip-adapter-claude-k8s/PROVENANCE.md to: $pkg"
             exit 1
           fi
-
-      # PEN-3223 follow-up. The two checks above are both WITHIN-TREE: the hash
-      # compares PROVENANCE.md against the source beside it, and the version
-      # check compares two fields of this one checkout. Neither can see the axis
-      # this actually failed on — the same `-blockcast.N` claimed by two
-      # different byte-sets on diverged histories.
-      #
-      # Worked instance: this branch took `0.2.6-blockcast.10`, and 1h54m later
-      # master independently took `.10` for BLO-32908 (91b1c8cca) against
-      # different bytes. Merging master produced NO conflict in package.json —
-      # both sides already read `.10` — so the version check passed green while
-      # the reuse stood, and the hash check only forced a recompute of the
-      # *hash*, never the *version*. It took a human-authored review to catch.
-      #
-      # Deliberately narrow: this fires only when the base and this tree name
-      # the SAME version while their recorded manifest hashes DIFFER. Equal
-      # hashes mean identical bytes, where a shared version is correct and must
-      # stay green — that is what keeps this from reddening every PR that merely
-      # touches vendor/ after an unrelated trunk bump. When it does fire, the
-      # bytes genuinely differ and PROVENANCE.md's own Versioning rules already
-      # require a bump; the check is reporting that requirement, not adding one.
-      - name: Verify vendored version does not collide with the base branch
-        run: |
-          set -euo pipefail
-          base="${BASE_REF:-}"
-          if [ -z "$base" ]; then
-            echo "::notice::No base ref or base SHA — nothing to compare against; collision check did NOT run."
-            exit 0
-          fi
-          if ! git fetch --no-tags --depth=1 origin "$base" 2>/dev/null; then
-            echo "::warning::Could not fetch base '$base'; collision check did NOT run."
-            exit 0
-          fi
-
-          pkg_path=vendor/paperclip-adapter-claude-k8s/package.json
-          prov_path=vendor/paperclip-adapter-claude-k8s/PROVENANCE.md
-
-          # A base without the vendored package at all (or without a recorded
-          # hash) leaves nothing to collide with.
-          if ! git show "FETCH_HEAD:$pkg_path" >/dev/null 2>&1; then
-            echo "::notice::Base '$base' has no vendored package — collision check did NOT run."
-            exit 0
-          fi
-
-          base_version=$(git show "FETCH_HEAD:$pkg_path" | node -p 'JSON.parse(require("fs").readFileSync(0,"utf8")).version')
-          base_hash=$(git show "FETCH_HEAD:$prov_path" 2>/dev/null | grep -oE '^[0-9a-f]{64}$' | head -1 || true)
-          head_version=$(node -p 'require("./package.json").version')
-          head_hash=$(grep -oE '^[0-9a-f]{64}$' PROVENANCE.md | head -1)
-
-          echo "base ($base): version=$base_version hash=${base_hash:-<none>}"
-          echo "head:          version=$head_version hash=$head_hash"
-
-          if [ -z "$base_hash" ]; then
-            echo "::notice::Base records no integrity hash — cannot compare bytes; collision check did NOT run."
-            exit 0
-          fi
-          if [ "$head_version" != "$base_version" ]; then
-            echo "Version differs from base — no collision."
-            exit 0
-          fi
-          if [ "$head_hash" = "$base_hash" ]; then
-            echo "Version matches base and bytes are identical — vendored package unchanged."
-            exit 0
-          fi
-
-          echo "::error::Vendored version '$head_version' is already used on '$base' against different bytes (base hash ${base_hash}, this tree ${head_hash})."
-          echo "Two byte-sets would claim one version. Bump the -blockcast.N suffix in:"
-          echo "  vendor/paperclip-adapter-claude-k8s/package.json      (version)"
-          echo "  vendor/paperclip-adapter-claude-k8s/package-lock.json (both self-version entries)"
-          echo "  vendor/paperclip-adapter-claude-k8s/PROVENANCE.md     ('Current version' row)"
-          echo "then recompute the integrity hash as the LAST step."
-          echo "Re-read the base and any in-flight PR touching vendor/ before picking N — the next integer is not necessarily free."
-          exit 1
-        env:
-          # Two lanes, resolved differently ON PURPOSE — this job carries no
-          # `if:`/`needs:` guard, so it runs in the merge queue too, and
-          # `github.base_ref` is populated ONLY for pull_request events. Wiring
-          # this to `github.base_ref` alone left the step taking its empty-base
-          # arm in every `merge_group` build, where a skipped run is
-          # indistinguishable from a passed one (caught in review of e7eff177).
-          #
-          # Do NOT collapse this to the workflow-level `PR_BASE_SHA` at the top
-          # of this file, however tempting the symmetry. That resolves the PR
-          # lane to `github.event.pull_request.base.sha`, which is the base as
-          # of the PR's creation and does NOT advance as master does: measured
-          # on this very PR, `base.sha` b722f584 was **49 commits behind**
-          # master. The collision this guard exists for is exactly a version
-          # master takes AFTER the branch did (`.10`, 1h54m later), so a stale
-          # base SHA would look green through the defect. The PR lane must
-          # resolve to the LIVE tip, which is what the branch name gives.
-          #
-          # The merge queue is the opposite case: `merge_group.base_ref` is the
-          # constant `refs/heads/master` (see the concurrency comment at the top
-          # of this file), while `base_sha` is the exact commit the queue entry
-          # was built on — which, unlike master's tip, already contains the PRs
-          # merging ahead of this one. That is the in-flight-PR axis a
-          # branch-name compare structurally cannot see.
-          #
-          # `git fetch --no-tags --depth=1 origin <sha>` works unchanged against
-          # GitHub (verified against this repo), so the consumer needs no branch.
-          BASE_REF: ${{ github.base_ref || github.event.merge_group.base_sha }}
 
   verify:
     # Preserve the legacy required-check name while the underlying work runs in parallel.
