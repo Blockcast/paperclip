@@ -627,6 +627,7 @@ argument *against* restarting.
 | high (series present throughout) | `0` | monotonic hold — **genuinely stuck**, the real signature |
 | high | `>0` | cycling — routine contention, not stuck |
 | low / sparse | `0` | **inconclusive, NOT stuck** — too few samples to decrease from. Do not restart on this. |
+| low / sparse | `>0` | cycling — **not stuck**. A decrease was observed, so the lock released at least once however few the samples. |
 
 A `6h` range is also wider than most holds; scoping the range nearer the hold's
 own age makes the comparison sharper for diagnosis. The restart gate below
