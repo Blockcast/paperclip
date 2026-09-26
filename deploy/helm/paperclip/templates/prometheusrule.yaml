@@ -899,6 +899,26 @@ spec:
           # lost, so nobody needs waking. Sustained or repeating aborts are the
           # thing to chase, and `increase` over an hour surfaces that without a
           # second rule.
+          # ⚠️ This expression depends on a SERVER-SIDE seed and is wrong
+          # without it. `increase()` takes `last - first` over the range, so it
+          # can only read a difference between two samples -- it cannot read a
+          # value. prom-client renders no series at all for a labelled metric
+          # that was never written, so an unseeded
+          # paperclip_agent_start_lock_aborted_total{agent_id} would be BORN AT
+          # 1 on the first abort: one sample at the first evaluation (element
+          # dropped), then `[1, 1, ...]` forever, giving 0. Prometheus's
+          # counter-birth correction in `extrapolatedRate` is gated on
+          # `resultValue > 0`, so it does not apply. `0 > 0` is false, and since
+          # the 4h budget is ~1.8x the worst hold ever measured settling on its
+          # own -- and a deploy resets the series -- every real abort is in
+          # practice a FIRST abort. The alert would be silent for all of them.
+          # `seedAgentStartLockAbortedSeries` in server/src/services/metrics.ts,
+          # called from `runExclusively` when the lock is taken, is what makes
+          # the first abort a 0->1 transition. If that seed is removed this
+          # alert stops firing SILENTLY -- it does not error, it just never
+          # matches. Do not "simplify" it to a bare `> 0` on the counter either:
+          # an absolute counter value latches for the life of the process and
+          # would page forever after one abort.
           expr: increase(paperclip_agent_start_lock_aborted_total[{{ .Values.prometheusRule.agentStartLockAbortedWindow }}]) > 0
           for: {{ .Values.prometheusRule.agentStartLockAbortedFor }}
           labels:

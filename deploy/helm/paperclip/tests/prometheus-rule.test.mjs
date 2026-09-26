@@ -1319,6 +1319,17 @@ test("PaperclipAgentStartLockAborted reports the self-healed wedge the held gaug
   // window and it never fires. Without a durable counter the incident is
   // invisible exactly because it was handled.
   // If a later reader "simplifies" this onto the gauge, that blind spot returns.
+  //
+  // ⚠️ This assertion pins the rendered STRING and cannot see the semantics it
+  // depends on. `increase()` reads `last - first`, so the expression is correct
+  // only because `seedAgentStartLockAbortedSeries`
+  // (server/src/services/metrics.ts, called from `runExclusively`) publishes
+  // the per-agent series at 0 when the lock is taken. Unseeded, the series is
+  // born at 1 on the first abort and `increase` evaluates to 0 forever, so this
+  // alert would never fire while this test stayed green. The test that actually
+  // discriminates lives beside the seed, in
+  // server/src/__tests__/agent-start-lock-abort.test.ts ("publishes the abort
+  // counter at 0 when the lock is taken"). Change either side and check both.
   assert.match(
     expr,
     /increase\(paperclip_agent_start_lock_aborted_total\[1h\]\) > 0/,

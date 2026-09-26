@@ -2531,7 +2531,12 @@ function ensureRegistry(): {
         + "something inside dispatch stopped responding rather than merely ran slow. This counts the "
         + "abort, not its outcome: if the cancellation did NOT land, the agent is still wedged and "
         + "the gauge above keeps reporting it -- that condition is the gauge's job, not a label "
-        + "here. Per-pod, because the lock is per-process.",
+        + "here. Per-pod, because the lock is per-process. Seeded at 0 by "
+        + "seedAgentStartLockAbortedSeries when an agent takes the lock, so a series exists before "
+        + "its first event and the first abort reads as a 0->1 transition: `increase()` takes "
+        + "last-first, so a series born at 1 would evaluate to 0 forever and the alert would never "
+        + "fire. A 0 here therefore means \"this agent dispatched on this pod and was never "
+        + "aborted\", which is the healthy reading, NOT a missing metric.",
       labelNames: ["agent_id"],
       registers: [registry],
     });
@@ -3688,6 +3693,42 @@ export function setDbPoolStats(stats: DbPoolStats): void {
  */
 export function recordAgentStartLockAborted(agentId: string): void {
   ensureRegistry().agentStartLockAbortedTotalCounter.inc({ agent_id: agentId });
+}
+
+/**
+ * Create this agent's aborted-counter series at 0 when it takes the start lock,
+ * before any abort has happened (PEN-3328 review).
+ *
+ * Load-bearing for PaperclipAgentStartLockAborted, not cosmetic. prom-client
+ * renders no series at all for a labelled metric that has never been written
+ * (confirmed against the pinned 15.1.3), so without this seed the series is
+ * BORN AT 1 on the first abort. `increase()` needs two samples in the range and
+ * takes `last - first`: at the first evaluation after birth there is one sample
+ * and the element is dropped, and at every later one the samples read
+ * `[1, 1, …]`, so the result is 0. Prometheus's counter-birth extrapolation in
+ * `extrapolatedRate` is gated on `resultValue > 0` and therefore does not
+ * rescue it. `increase(...[1h]) > 0` would be permanently false for the FIRST
+ * abort of any `agent_id` on any pod — and since the 4h budget is ~1.8x the
+ * worst hold ever measured settling on its own, and a deploy resets the series,
+ * in practice every real abort is a first abort. The alert would have been
+ * silent for all of them, leaving exactly the self-healed-wedge blind spot it
+ * was added to close.
+ *
+ * Seeded at ACQUISITION rather than at process start because that is what keeps
+ * the `agent_id` label the alert's annotation reads — a boot-time seed has no
+ * agent to name. The gap between this 0 and any increment is LOCK_ABORT_MS (4h),
+ * thousands of scrape intervals, so the 0 is always sampled long before the 1;
+ * the seed could not be squeezed into a single scrape even deliberately.
+ * Cardinality is one series per agent per pod, the same bound the held gauge
+ * already accepts while locks are held.
+ *
+ * Same discipline, and for the same reason, as ALERTING_GITHUB_SUPPRESSION_CAUSES
+ * and the unlabeled `heartbeatTimerChecked` above: a series an alert *selects*
+ * must exist before its first event, because absent-vs-zero is not a
+ * distinction the query language can make after the fact.
+ */
+export function seedAgentStartLockAbortedSeries(agentId: string): void {
+  ensureRegistry().agentStartLockAbortedTotalCounter.inc({ agent_id: agentId }, 0);
 }
 
 /**

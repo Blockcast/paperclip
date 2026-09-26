@@ -305,6 +305,54 @@ describe("agent start lock cancellation (PEN-3328)", () => {
     expect(describeAgentStartLockDispatchHealth(agentId)).toBeNull();
   });
 
+  it("publishes the abort counter at 0 when the lock is taken, so a first abort is a transition `increase()` can see", async () => {
+    vi.useFakeTimers();
+    const agentId = randomUUID();
+    const neverAbortedAgentId = randomUUID();
+    const { renderMetrics } = await import("../services/metrics.js");
+    const section = deferred<string>();
+
+    const held = withAgentStartLock(agentId, () => section.promise, coalesced);
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    // The series must EXIST, at 0, while nothing has aborted — this is the
+    // assertion the alert's correctness rests on, and it discriminates: delete
+    // `seedAgentStartLockAbortedSeries` from `runExclusively` and prom-client
+    // renders no series at all for a labelled metric that was never written,
+    // so this `toContain` fails outright.
+    //
+    // Why it matters (PEN-3328 review): PaperclipAgentStartLockAborted is
+    // `increase(...[1h]) > 0`, and `increase` takes `last - first` over the
+    // range. A series born at 1 is dropped at the first evaluation (one sample)
+    // and reads `[1, 1, …]` at every later one, so the result is 0 forever —
+    // Prometheus's counter-birth correction is gated on `resultValue > 0` and
+    // does not apply. Since the 4h budget is ~1.8x the worst hold ever measured
+    // settling on its own, and a deploy resets the series, every real abort is
+    // in practice a FIRST abort. The alert would have been silent for all of
+    // them. The 0 seeded here is what makes the first abort a 0->1 transition.
+    const { body } = await renderMetrics();
+    expect(body).toContain(`paperclip_agent_start_lock_aborted_total{agent_id="${agentId}"} 0`);
+
+    // Seeded per ACQUISITION, not per known agent. A boot-time zero-fill would
+    // have no agent to name — the alert's annotation reads `{{ $labels.agent_id }}`
+    // — and would put one series per agent per pod on the wire whether or not
+    // that agent ever dispatched here. Absence for a non-dispatching agent is
+    // the correct reading, so pin it rather than leaving it to chance.
+    expect(body).not.toContain(`agent_id="${neverAbortedAgentId}"`);
+
+    section.resolve("ok");
+    await expect(held).resolves.toBe("ok");
+
+    // The seed has to OUTLIVE the section. The lock releasing is what deletes
+    // the held gauge's series; if the counter went with it, the 0 would never
+    // be sampled by a scrape and the born-at-1 problem would return by another
+    // route. A durable counter is the whole reason this metric exists.
+    const { body: afterRelease } = await renderMetrics();
+    expect(afterRelease).toContain(
+      `paperclip_agent_start_lock_aborted_total{agent_id="${agentId}"} 0`,
+    );
+  });
+
   it("counts the abort on a metric, because the gauge series vanishes with the lock", async () => {
     vi.useFakeTimers();
     vi.spyOn(logger, "warn").mockImplementation(() => logger);
@@ -314,6 +362,18 @@ describe("agent start lock cancellation (PEN-3328)", () => {
 
     const held = withAgentStartLock(agentId, abortableAwait, coalesced);
     void held.catch(() => {});
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    // Read the counter BEFORE the abort, so what this test pins is the
+    // 0 -> 1 TRANSITION rather than the final value. `increase()` cannot see a
+    // value; it can only see a difference between two samples, so a test that
+    // asserts `1` alone would still pass against a series born at 1 — which is
+    // precisely the defect this guards (PEN-3328 review).
+    const { body: beforeAbort } = await renderMetrics();
+    expect(beforeAbort).toContain(
+      `paperclip_agent_start_lock_aborted_total{agent_id="${agentId}"} 0`,
+    );
+
     await vi.advanceTimersByTimeAsync(LOCK_ABORT_MS + 1_000);
     await expect(held).rejects.toBeInstanceOf(AgentStartLockAbortedError);
 

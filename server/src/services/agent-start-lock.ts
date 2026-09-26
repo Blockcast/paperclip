@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 
 import { logger } from "../middleware/logger.js";
-import { recordAgentStartLockAborted } from "./metrics.js";
+import { recordAgentStartLockAborted, seedAgentStartLockAbortedSeries } from "./metrics.js";
 
 /**
  * Per-agent serialization for queued-run dispatch (BLO-20396).
@@ -318,6 +318,13 @@ async function runExclusively<T>(agentId: string, fn: () => Promise<T>): Promise
   });
   runningByAgent.set(agentId, marker);
   heldSinceByAgent.set(agentId, startedAtMs);
+  // Publish this agent's abort counter at 0 now, while nothing has aborted
+  // (PEN-3328 review). The alert on that counter is `increase(...[1h]) > 0`,
+  // and a labelled prom-client series does not exist until it is written — so
+  // without this the series would be born at 1 on the first abort, `increase`
+  // would read `last - first == 0`, and the alert would be silent for exactly
+  // the events it was added to catch. See seedAgentStartLockAbortedSeries.
+  seedAgentStartLockAbortedSeries(agentId);
 
   // Wrap so a synchronous throw from `fn` surfaces as a rejection rather than
   // escaping before the lock bookkeeping below is installed.
@@ -360,8 +367,16 @@ async function runExclusively<T>(agentId: string, fn: () => Promise<T>): Promise
       abortRequested = true;
       forgetExpiredAborts(nowMs);
       lastAbortByAgent.set(agentId, { abortedAtMs: nowMs, heldMs, released: false });
-      recordAgentStartLockAborted(agentId);
+      // Abort FIRST, count second (PEN-3328 review). The abort is the
+      // load-bearing action and the counter is telemetry about it, so the
+      // cheap ordering guarantee is worth taking: this runs in a
+      // `setInterval` callback, where a throw escapes to the process rather
+      // than to a caller, and if `ensureRegistry()` or `inc()` ever threw with
+      // the old order the abort would simply never be requested — turning a
+      // metrics fault into the permanent dispatch wedge this module exists to
+      // prevent.
       abort.abort(new AgentStartLockAbortedError(agentId, heldMs));
+      recordAgentStartLockAborted(agentId);
       lastLoggedAtMs = nowMs;
       loggedStopped = true;
       logger.error(
