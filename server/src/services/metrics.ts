@@ -556,6 +556,41 @@ export const DB_POOL_CONNECTIONS_METRIC = "paperclip_db_pool_connections";
  * because it counts queries, not connections.
  */
 export const DB_POOL_WAITING_QUERIES_METRIC = "paperclip_db_pool_waiting_queries";
+/**
+ * The timeout environment the application pool actually inherits from the
+ * server, in seconds, by `setting` and by the `source` Postgres attributes it
+ * to (PEN-3365). `0` means the setting is disabled, matching Postgres' own
+ * encoding — so `statement_timeout` reading `0` is the unbounded case, not a
+ * missing measurement.
+ *
+ * This exists because the same reading already shipped as a one-shot startup
+ * log line (`Database timeout environment: …`) and that made it *write-only in
+ * practice*. Measured 2026-09-26: no `paperclip-api` or worker pod had
+ * restarted in over 2 days, the API log runs ~2.2 lines/sec (so the line sits
+ * ~390k lines behind the tail), `kubectl logs` is 403 from an agent seat, and
+ * the read-only k8s tooling exposes only `tail`. A value nobody can read
+ * cannot gate a decision, and PEN-3365 step 3 is explicitly gated on this
+ * reading.
+ *
+ * `source` is a label rather than a second series because it is the half that
+ * answers the actual question. The repo asserts a role-level 30 s
+ * `statement_timeout` in two places, but no `ALTER ROLE` exists in either
+ * `Blockcast/paperclip` or `Blockcast/onprem-k8s`; `source=default` means
+ * nothing sets it and the assertion is false, while `database`/`user` means we
+ * genuinely inherit a bound. Cardinality is bounded: 3 settings x the small
+ * fixed set of `pg_settings.source` values.
+ *
+ * ⚠️ Do NOT substitute `postgres_exporter`'s `pg_settings_statement_timeout_seconds`
+ * for this. That series reflects the *exporter's own session* (its labels carry
+ * its job name), so it reports whatever short timeout the exporter sets to
+ * bound its scrapes — 8 s when this was written — and says nothing about what
+ * the application pool inherits.
+ *
+ * Set once at startup, from the same probe that writes the log line. Absence of
+ * the series therefore means the probe did not complete (it is wrapped so it
+ * can never block startup), which is distinguishable from any reading.
+ */
+export const DB_EFFECTIVE_TIMEOUT_METRIC = "paperclip_db_effective_timeout_seconds";
 /** Queue wait observed when a sanctioned GitHub PR-review run starts. */
 export const PR_REVIEW_QUEUE_WAIT_METRIC = "paperclip_pr_review_queue_wait_seconds";
 export const PR_REVIEW_QUEUE_WAIT_BUCKETS_SECONDS = [60, 300, 600, 900, 1800, 3600, 7200, 14400, 28800];
@@ -2322,6 +2357,7 @@ let scheduledRetryParkHorizon: Gauge<"agent_id"> | null = null;
 let scheduledRetryParkHorizonRefreshSuccess: Gauge | null = null;
 let dbPoolConnections: Gauge<"state"> | null = null;
 let dbPoolWaitingQueries: Gauge | null = null;
+let dbEffectiveTimeout: Gauge<"setting" | "source"> | null = null;
 let pluginError: Gauge<"plugin_id" | "plugin_key"> | null = null;
 let crashRecoveryCandidateIndexPresent: Gauge<"index"> | null = null;
 let pluginMetric: Counter<
@@ -2447,6 +2483,7 @@ function ensureRegistry(): {
   scheduledRetryParkHorizonRefreshSuccessGauge: Gauge;
   dbPoolConnectionsGauge: Gauge<"state">;
   dbPoolWaitingQueriesGauge: Gauge;
+  dbEffectiveTimeoutGauge: Gauge<"setting" | "source">;
   pluginErrorGauge: Gauge<"plugin_id" | "plugin_key">;
   crashRecoveryCandidateIndexPresentGauge: Gauge<"index">;
   pluginMetricCounter: Counter<
@@ -2519,6 +2556,7 @@ function ensureRegistry(): {
     || !scheduledRetryParkHorizonRefreshSuccess
     || !dbPoolConnections
     || !dbPoolWaitingQueries
+    || !dbEffectiveTimeout
     || !pluginError
     || !crashRecoveryCandidateIndexPresent
     || !pluginMetric
@@ -2730,6 +2768,17 @@ function ensureRegistry(): {
         "Statements queued with no pool connection yet (BLO-33243). postgres.js only enqueues "
         + "here once every connection is busy, so a sustained non-zero value IS pool exhaustion "
         + "and a zero value rules it out.",
+      registers: [registry],
+    });
+    dbEffectiveTimeout = new Gauge({
+      name: DB_EFFECTIVE_TIMEOUT_METRIC,
+      help:
+        "Timeout environment the application pool inherits from the server, in seconds, by "
+        + "setting and by the pg_settings source that set it (PEN-3365). 0 means disabled, as "
+        + "Postgres encodes it, so statement_timeout=0 is the unbounded case. source=default "
+        + "means nothing sets it; database/user means a real inherited bound. Do not read "
+        + "postgres_exporter's pg_settings_* for this -- that reports the exporter's own session.",
+      labelNames: ["setting", "source"],
       registers: [registry],
     });
     agentStartLockHeldSeconds = new Gauge({
@@ -3488,6 +3537,7 @@ function ensureRegistry(): {
     scheduledRetryParkHorizonRefreshSuccessGauge: scheduledRetryParkHorizonRefreshSuccess,
     dbPoolConnectionsGauge: dbPoolConnections,
     dbPoolWaitingQueriesGauge: dbPoolWaitingQueries,
+    dbEffectiveTimeoutGauge: dbEffectiveTimeout,
     pluginErrorGauge: pluginError,
     crashRecoveryCandidateIndexPresentGauge: crashRecoveryCandidateIndexPresent,
     pluginMetricCounter: pluginMetric,
@@ -3976,6 +4026,43 @@ export function setDbPoolStats(stats: DbPoolStats): void {
   dbPoolConnectionsGauge.set({ state: "active" }, stats.active);
   dbPoolConnectionsGauge.set({ state: "connecting" }, stats.connecting);
   dbPoolWaitingQueriesGauge.set(stats.waiting);
+}
+
+/**
+ * One inherited timeout setting, as {@link readInheritedTimeoutSettings}
+ * reports it. Declared structurally here, like {@link DbPoolStats}, so the
+ * metrics module keeps no dependency on `@paperclip/db`.
+ *
+ * `valueMs === null` is the probe's encoding for "disabled".
+ */
+export interface DbEffectiveTimeoutSetting {
+  readonly name: string;
+  readonly valueMs: number | null;
+  readonly source: string;
+}
+
+/**
+ * Publish the inherited timeout environment (PEN-3365).
+ *
+ * Called once at startup, from the same probe that logs
+ * `Database timeout environment: …`, because that log line is unreadable in
+ * practice — see {@link DB_EFFECTIVE_TIMEOUT_METRIC} for the measurement.
+ *
+ * `reset()` first so a re-probe cannot leave a stale `source` series alongside
+ * the current one: `source` is a label, so a value moving from `default` to
+ * `user` would otherwise publish both, and a reader taking the max or the
+ * first would silently get the retired reading.
+ *
+ * `null` is published as `0`, which is Postgres' own encoding for a disabled
+ * timeout and what `pg_settings` returns. That keeps `== 0` meaning "unbounded"
+ * for a reader who knows Postgres, rather than inventing a sentinel.
+ */
+export function setDbEffectiveTimeouts(settings: readonly DbEffectiveTimeoutSetting[]): void {
+  const { dbEffectiveTimeoutGauge } = ensureRegistry();
+  dbEffectiveTimeoutGauge.reset();
+  for (const { name, valueMs, source } of settings) {
+    dbEffectiveTimeoutGauge.set({ setting: name, source }, valueMs === null ? 0 : valueMs / 1000);
+  }
 }
 
 /**

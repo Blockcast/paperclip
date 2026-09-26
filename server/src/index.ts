@@ -60,6 +60,7 @@ import {
   toolAccessService,
 } from "./services/index.js";
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
+import { setDbEffectiveTimeouts } from "./services/metrics.js";
 import { auditConfiguredHookCommandsOnBoot } from "./services/lifecycle-hook-command-audit.js";
 import {
   parseAdapterRegistryEnv,
@@ -727,6 +728,13 @@ export async function startServer(): Promise<StartedServer> {
   // means one blocked query can hang a recovery pass indefinitely (PEN-3365);
   // that is the reading the explicit-timeout decision is gated on. Probing is
   // strictly diagnostic, so it must never prevent the server from starting.
+  //
+  // The reading is published as a gauge as well as logged. The log line alone
+  // proved unreadable: it is emitted once at startup, and by 2026-09-26 no pod
+  // had restarted in over two days, leaving it ~390k lines behind a tail-only
+  // log reader with `kubectl logs` 403 from an agent seat. The gauge makes the
+  // gating reading answerable by query at any time instead of only in the
+  // minutes after a restart nobody controls.
   try {
     const inheritedTimeouts = await readInheritedTimeoutSettings(activeDatabaseConnectionString);
     const unbounded = inheritedTimeouts.statementTimeout.valueMs === null;
@@ -736,6 +744,11 @@ export async function startServer(): Promise<StartedServer> {
           ? " — statement_timeout is disabled, so a blocked query is bounded by nothing server-side (PEN-3365)"
           : ""),
     );
+    setDbEffectiveTimeouts([
+      inheritedTimeouts.statementTimeout,
+      inheritedTimeouts.idleInTransactionSessionTimeout,
+      inheritedTimeouts.lockTimeout,
+    ]);
   } catch (error) {
     logger.warn(
       `Could not read the database timeout environment: ${error instanceof Error ? error.message : String(error)}`,
