@@ -102,6 +102,35 @@ const RUNTIME_CACHE_ENV: Record<string, string> = {
   PLAYWRIGHT_BROWSERS_PATH: `${RUNTIME_CACHE_MOUNT_PATH}/ms-playwright`,
 };
 
+/**
+ * Shared pnpm store for persistent-workspace isolation (BLO-36583).
+ *
+ * Every var in RUNTIME_CACHE_ENV redirects a *cache* directory. pnpm's
+ * content-addressed store is not one: it lives under XDG_DATA_HOME, i.e.
+ * `$HOME/.local/share/pnpm`. So it silently followed `HOME` onto the CephFS PVC
+ * and minted one full store per workspace — measured 2026-09-25 at 259.87 GiB
+ * across 128 stores (96.4% of all per-workspace HOME bytes, against 4.78 GiB of
+ * `.rustup` and 1.75 GiB of `.cargo`). Sampling 8 of those stores found 412,557
+ * objects collapsing to 59,098 unique — 6.98x duplication, with 7 of the 8
+ * holding the same ~58,920 objects — so one shared store serves them all.
+ *
+ * It must stay on the SAME FILESYSTEM as the checkout. pnpm hardlinks store
+ * objects into `node_modules`, and when the configured store is on another
+ * device it silently ignores the configuration and falls back to
+ * `<mount>/.pnpm-store`. Pointing this at the ephemeral runtime-cache while the
+ * workspace lives on the PVC therefore does not work, and would cost the
+ * hardlinks if it did; verified against pnpm 12.6.0 through PNPM_HOME,
+ * XDG_DATA_HOME, npm_config_store_dir, PNPM_STORE_DIR, `.npmrc store-dir` and a
+ * symlink. That fallback is also why a wrong value here degrades safely: the
+ * worst case is a shared store at the mount root, never a per-workspace one.
+ *
+ * ponytail: one store shared by all persistent workspaces. `pnpm store prune`
+ * run from inside one workspace would evict objects the others still reference
+ * (it only sees its own projects); nothing in the fleet runs it today. If that
+ * changes, give each *agent* its own store rather than each workspace.
+ */
+const SHARED_PNPM_STORE_PATH = "/paperclip/instances/default/data/k8s-isolation/pnpm-store";
+
 type IsolationStorage = "ephemeral" | "persistent";
 
 export type JobIsolation = {
@@ -728,6 +757,12 @@ export const ENV_NAME_CLASSIFICATION: readonly EnvNameClassification[] = [
     reason: "Playwright browser download path.",
   },
   {
+    name: "PNPM_HOME",
+    classification: "SAFE_LITERAL",
+    reason:
+      "pnpm store path. Shared across persistent workspaces so the content-addressed store is not duplicated per workspace (BLO-36583).",
+  },
+  {
     name: "TMPDIR",
     classification: "SAFE_LITERAL",
     reason: "Run-scoped temp dir (BLO-16219). Load-bearing for triaging concurrent-run collisions.",
@@ -1083,6 +1118,16 @@ function buildEnvVars(
         BUN_INSTALL_CACHE: `${isolation.cacheRoot}/bun`,
         PIP_CACHE_DIR: `${isolation.cacheRoot}/pip`,
         PLAYWRIGHT_BROWSERS_PATH: `${isolation.cacheRoot}/ms-playwright`,
+        // pnpm's store is data, not cache, so none of the vars above reach it
+        // and it followed HOME onto the PVC once per workspace (BLO-36583).
+        // Shared when the workspace is persistent — same filesystem as the
+        // checkout, which pnpm requires to hardlink into node_modules; per-run
+        // otherwise, where cacheRoot is already ephemeral. See
+        // SHARED_PNPM_STORE_PATH.
+        PNPM_HOME:
+          isolation.storage.workspace === "persistent"
+            ? SHARED_PNPM_STORE_PATH
+            : `${isolation.cacheRoot}/pnpm`,
         // Run-scoped so concurrent stateless Jobs never share a writable temp
         // directory (BLO-16219) — previously unset here, defaulting to the
         // image's shared /tmp and colliding across concurrent runs.
