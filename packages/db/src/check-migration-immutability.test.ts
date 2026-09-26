@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
@@ -59,6 +60,17 @@ beforeAll(async () => {
   await write(`${MIGRATIONS}/meta/_journal.json`, JSON.stringify({ entries: [{ idx: 0, tag: "0001_alpha" }] }));
   await write("packages/db/src/client.ts", "export const x = 1;\n");
   await commit("release 0001");
+
+  // `master` is deliberately deeper than one commit, and these are load-bearing
+  // — do not flatten them. The shallow-arm case below discriminates on how much
+  // of `master` the fetch pulled down, and against a single-commit `master`
+  // that count is 1 with or without `--depth=1` (measured), i.e. the case would
+  // pass on broken code. Nothing here touches migrations, so every other case
+  // is indifferent; the branches below all fork from this deepened tip.
+  for (const rev of [2, 3]) {
+    await write("packages/db/src/client.ts", `export const x = 1; // rev ${rev}\n`);
+    await commit(`unrelated history ${rev}`);
+  }
 
   // AC 1: a comments-only edit to a migration that is already on master.
   await git("checkout", "-b", "comment-edit");
@@ -159,6 +171,50 @@ describe("checkMigrationImmutability", () => {
       expect(result).toMatchObject({ checked: true, baseRef: "FETCH_HEAD" });
       // ...without having shallowed the checkout to do it.
       expect(await isShallow()).toBe("false");
+    } finally {
+      await rm(consumer, { recursive: true, force: true });
+    }
+  });
+
+  it("fetches only one commit into an already-shallow checkout — the CI shape", async () => {
+    // The other arm of the same branch. `git fetch` without `--depth` does not
+    // unshallow, so `is-shallow` reads `true` either way and every other case
+    // in this file stays green with `const depth = []` substituted at
+    // check-migration-immutability.ts:87 — a surviving mutation, confirmed.
+    // The only observable difference is how much of `master` came down, and on
+    // CI's `fetch-depth: 1` checkout that is one commit versus the whole
+    // branch, on `typecheck`/`build`/`generate`/`migrate` alike (BLO-36817).
+    //
+    // `file://`, NOT a local path: `git clone --depth=1 <path>` prints
+    // "--depth is ignored in local clones" and hands back a FULL repo, which
+    // would silently re-test the case above. The `is-shallow` precondition is
+    // what turns that into a loud failure instead of a false green.
+    const consumer = await mkdtemp(join(tmpdir(), "migration-immutability-shallow-"));
+    const inConsumer = async (...args: string[]) =>
+      (await execFileAsync("git", args, { cwd: consumer })).stdout.trim();
+    try {
+      await execFileAsync("git", [
+        "clone",
+        "--depth=1",
+        "--branch",
+        "comment-edit",
+        pathToFileURL(repo).href,
+        consumer,
+      ]);
+      expect(await inConsumer("rev-parse", "--is-shallow-repository")).toBe("true");
+      await inConsumer("update-ref", "-d", "refs/remotes/origin/master");
+
+      const result = await checkMigrationImmutability({
+        repoDir: consumer,
+        migrationsPath: MIGRATIONS,
+        remote: "origin",
+        branch: "master",
+      });
+
+      // The guard must still work...
+      expect(result).toMatchObject({ checked: true, baseRef: "FETCH_HEAD" });
+      // ...having fetched one commit, not all of `master`.
+      expect(await inConsumer("rev-list", "--count", "FETCH_HEAD")).toBe("1");
     } finally {
       await rm(consumer, { recursive: true, force: true });
     }
