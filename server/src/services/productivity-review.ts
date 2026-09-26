@@ -48,6 +48,7 @@ import {
 import { resolveOwningPaperclipIdentifiers } from "./paperclip-identifiers.js";
 import {
   isDependencyBlockedRun,
+  isInfraClassErrorCodeRun,
   isInfraFailureRun,
   runUsageTokenCounts,
 } from "./recovery/zero-token-startup-failure.js";
@@ -397,6 +398,15 @@ type ProductivityReviewEvidence = {
   // `nonExecutingAlsoNeverInvokedCount` measures the intersection rather than
   // assuming disjointness.
   neverInvokedRunCount: number;
+  // BLO-36535: count of terminal runs excluded from the `noCommentStreak` walk
+  // because their `errorCode` names an infrastructure fault
+  // (`isInfraClassErrorCodeRun`) — the run executed a turn and infrastructure
+  // killed it before it could finish. Disjoint from `neverInvokedRunCount` and
+  // from `nonExecutingRunCount` by construction: both of those are zero-token
+  // populations, this one is runs that burned tokens. Reported so a manager can
+  // see how much of the window was taken by infrastructure without re-deriving
+  // it from raw run telemetry.
+  infraClassKilledRunCount: number;
   // BLO-26165 (narrowing): of the runs eligible for the `noCommentStreak` walk,
   // how many carry `issueCommentStatus: "not_applicable"` —
   // `finalizeIssueCommentPolicy` exempted them from the comment requirement
@@ -4058,7 +4068,40 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // almost every wake reason — the exact inverse of the false positive this
     // issue was opened for. See `isNeverInvokedRun`.
     const neverInvokedRunCount = terminalRuns.filter(isNeverInvokedRun).length;
-    const noCommentEligibleRuns = executedTerminalRuns.filter((run) => !isNeverInvokedRun(run));
+    const commentCapableRuns = executedTerminalRuns.filter((run) => !isNeverInvokedRun(run));
+    // BLO-36535: a run that executed a turn and was then killed by
+    // infrastructure could not finish it, so its missing comment is not
+    // silence. `isNeverExecutedRun` above does not catch these — both of its
+    // arms are ZERO-TOKEN predicates, and this population is their strict
+    // complement: tokens burned, then killed. The measured instance is 34
+    // terminal runs on BLO-32472, 34 of them infra-class (18 `adapter_failed`
+    // from a provider 403 on the `org_penstock` seat entitlement, 12
+    // `rate_limit_exhausted`, 2 `job_failed`, 1 `provider_throttled_no_progress`,
+    // 1 `k8s_pod_schedule_failed`), one of which burned 20,957 output tokens /
+    // $4.92 before the 403. Zero application failures. `runtime_failure_streak`
+    // does not catch them either — it outranks this trigger in
+    // `choosePrimaryTrigger`'s ladder but keys on the same zero-token
+    // signature — so without this filter the population falls between the two
+    // buckets and lands silently in the conduct one.
+    //
+    // Excluded, NOT streak-breaking, symmetrically with the two populations
+    // above: breaking here would assert "the agent was given a turn and used
+    // it" at a point where infrastructure took the turn away. The consequence
+    // is deliberate and worth stating — removing these runs bridges genuine
+    // silence on either side of an infra gap into one contiguous streak, which
+    // is the correct reading, because an infra outage in the middle of a silent
+    // stretch is not evidence the agent spoke.
+    //
+    // Reported, not dropped (the BLO-27698 B3b shape): `infraClassKilledRunCount`
+    // below renders in both evidence blocks. A chronically infra-killed lane
+    // stays visible through the recovery lane rather than through this trigger —
+    // `stranded_assigned_issue` recovery actions stamp `infraClassCause: true`
+    // off the same `ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES` set (recovery/service.ts),
+    // which is exactly how the platform had already classified BLO-32472's cause
+    // on the very review row that then billed it to the assignee. Provider fault
+    // is owned by BLO-34726, not by a productivity review.
+    const infraClassKilledRunCount = commentCapableRuns.filter(isInfraClassErrorCodeRun).length;
+    const noCommentEligibleRuns = commentCapableRuns.filter((run) => !isInfraClassErrorCodeRun(run));
     // Of the runs actually eligible for the streak walk, how many carry the
     // comment-policy-exempt status. Scoped to the eligible population (not all
     // terminal runs) so the "DID execute" claim is literally true of every run
@@ -4597,7 +4640,15 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       const neverInvokedNote = neverInvokedRunCount > 0
         ? ` (${neverInvokedRunCount} run(s) in the sampled window never had an adapter created and are excluded, not counted toward this streak; these mostly overlap the non-executing runs reported separately, so the two counts do not sum)`
         : "";
-      triggerReasons.push(`${noCommentStreak} consecutive terminal, turn-executing issue-linked runs had no run-created issue comment${neverInvokedNote}`);
+      // BLO-36535: stated separately from `neverInvokedNote` because the two
+      // populations are disjoint — that one never got an adapter, this one got a
+      // full turn and had it taken away mid-flight — and because a reader who
+      // sees a streak of N alongside a large infra count needs to know the
+      // streak was measured over neither.
+      const infraKilledNote = infraClassKilledRunCount > 0
+        ? ` (${infraClassKilledRunCount} run(s) in the sampled window executed a turn and were then killed by an infrastructure fault; they are excluded, not counted toward this streak, and unlike the never-invoked runs above they do NOT overlap the non-executing count, which is zero-token by construction)`
+        : "";
+      triggerReasons.push(`${noCommentStreak} consecutive terminal, turn-executing issue-linked runs had no run-created issue comment${neverInvokedNote}${infraKilledNote}`);
     }
     if (runawayExecution) {
       triggerReasons.push(
@@ -4849,6 +4900,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       runtimeFailureStreak,
       runtimeFailureUsageBasis,
       neverInvokedRunCount,
+      infraClassKilledRunCount,
       commentExemptExecutedRunCount,
       nonExecutingRunCount,
       nonExecutingDominantErrorCode,
@@ -4988,6 +5040,12 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- No-comment streak (terminal, turn-executing runs): ${evidence.noCommentStreak}`,
       `- Runtime-failure streak (terminal, never-executed runs): ${evidence.runtimeFailureStreak}`,
       `- Never-invoked runs excluded (terminal, no adapter ever created — \`usageJson\`/\`logStore\`/\`logRef\` null, \`logBytes\` null or 0, BLO-26165): ${evidence.neverInvokedRunCount}`,
+      // BLO-36535: rendered next to the never-invoked count because both are
+      // exclusions from the same walk, but they are disjoint populations — that
+      // one never got an adapter, this one executed a turn and had it killed —
+      // so the two counts do sum, unlike the never-invoked/non-executing pair
+      // below.
+      `- Infra-killed runs excluded (terminal, executed a turn then died of an infrastructure fault — \`errorCode\` in the shared infra-class set, BLO-36535): ${evidence.infraClassKilledRunCount}`,
       // BLO-29535 (Ally suggestion on a38c12fe2): "not excluded from the streak
       // walk", NOT "counted toward the streak". This count is taken over every
       // run in `noCommentEligibleRuns`, while `noCommentStreak` is only the
@@ -5142,6 +5200,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- No-comment streak: ${evidence.noCommentStreak}`,
       `- Runtime-failure streak: ${evidence.runtimeFailureStreak}`,
       `- Never-invoked runs excluded (no adapter created): ${evidence.neverInvokedRunCount}`,
+      `- Infra-killed runs excluded (executed a turn, then killed by infrastructure): ${evidence.infraClassKilledRunCount}`,
       // BLO-29535: same wording fix as the description's evidence block — this
       // count is every streak-eligible exempt run, not the streak prefix, and
       // a bare "(counted)" sitting under "No-comment streak" read as "counted
