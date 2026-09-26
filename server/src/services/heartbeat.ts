@@ -6684,11 +6684,13 @@ export function parseSessionCompactionPolicy(agent: typeof agents.$inferSelect):
 // precedence is consecutive-failures → runs → raw-input → age (first match wins);
 // consecutive-failures is checked first because a poisoned session that never does
 // any model work will never trip the other thresholds (BLO-10889 / BLO-10866 WS2).
-// `latestRawInputTokens` is the NON-cached raw input of the latest run
-// (readRawUsageTotals prefers rawInputTokens, which excludes cached reads) — the
-// ceiling gates re-inflation across wakes, not cache hits. The raw-input comparison
-// is inclusive (>=), so a wake that lands exactly on the threshold rotates. A
-// zero/disabled threshold (value <= 0) disables that trigger.
+// `latestRawInputTokens` is the latest run's raw prompt input: fresh input plus
+// cache creation, via the shared `promptTokens`, with cache READS the one input
+// class left out (BLO-29842). readRawUsageTotals supplies both legs from their
+// raw, pre-compaction counts. The ceiling gates re-inflation across wakes, not
+// cache hits. The raw-input comparison is inclusive (>=), so a wake that lands
+// exactly on the threshold rotates. A zero/disabled threshold (value <= 0)
+// disables that trigger.
 export function computeSessionCompactionReason(input: {
   policy: SessionCompactionPolicy;
   runsCount: number;
