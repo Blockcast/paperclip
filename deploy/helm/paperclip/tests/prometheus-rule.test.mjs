@@ -1205,10 +1205,17 @@ test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own
   // performed on the scrape itself. Asserting the exact shape is what stops a
   // later reader "restoring" a join against a series that does not exist,
   // which would make the alert permanently unevaluable rather than noisy.
+  //
+  // BLO-36522: this shape is what THIS chart copy renders, and this copy is
+  // deliberately unretuned. Porting Blockcast's fleet-count retune
+  // (`count(max by (agent_id) (...) > 900) >= 3`, for 10m) is expected to
+  // change this shape AND the two assertions below (`heldThreshold == "300"`
+  // and the 900s stacking cap) -- that is a correct port, not a regression.
   assert.match(
     expr,
     /^max by \(agent_id\) \(paperclip_agent_start_lock_held_seconds\) > (\d+)$/,
-    "wedged-start-lock alert must threshold the per-agent max of the hold gauge, with no refresh-freshness join",
+    "wedged-start-lock alert must threshold the per-agent max of the hold gauge, with no refresh-freshness join"
+      + " (unretuned chart copy -- porting the BLO-36522 fleet-count form changes this shape and the two assertions below)",
   );
 
   const [, heldThreshold] = expr.match(/> (\d+)$/) ?? [];
@@ -1219,6 +1226,17 @@ test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own
   // itself escalates to logger.error and says dispatch "has stopped". If the
   // constant moves and this does not, the page and the log line disagree
   // about when an agent is considered wedged.
+  //
+  // BLO-36522: "silent in steady state" is FALSE as written -- measured
+  // 2026-09-25, 21 of 21 agents crossed 300s over 7d for 2,730 agent-minutes
+  // (~390/day). Holds past 300s are routine, not exceptional. Blockcast's live
+  // rule is therefore being retuned to a fleet-count expression, with the
+  // log/alert numbers deliberately UNPINNED (Blockcast/onprem-k8s#3985,
+  // unmerged; until it lands the live rule is still > 300 and the two still
+  // share 300); see deploy/helm/paperclip/values.yaml
+  // (agentStartLockHeldSeconds) and runbooks/queued-run-stranded.md. This
+  // assertion still stands because THIS chart copy was not retuned -- it
+  // guards the 300 that is still rendered here, not the deployed policy.
   assert.equal(
     heldThreshold,
     "300",
@@ -1242,24 +1260,138 @@ test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own
   assert.ok(
     Number(heldThreshold) + forMinutes * 60 <= 900,
     `hold threshold ${heldThreshold}s plus for-window ${forWindow} stacks to `
-      + `${Number(heldThreshold) + forMinutes * 60}s; a wedge must page inside 15m, `
-      + "not on the 6-19h timescale the incident actually ran",
+      + `${Number(heldThreshold) + forMinutes * 60}s; this unretuned copy's 300s threshold `
+      + "must not drift far enough to stop being a prompt page on the condition it still "
+      + "renders (BLO-36522: the retuned fleet-count pair stacks to 900 + 600 = 1500s by "
+      + "design, and porting it is expected to move this cap with it)",
   );
 
-  // Severity, not decoration: the hold never self-heals (the lock has no
-  // timeout, by design), so this is a per-agent dispatch outage that lasts
-  // until the process is replaced. A warning would reproduce the original
-  // failure, which was nobody being paged.
+  // Severity, not decoration: the lock has no timeout, so nothing external
+  // will break the hold (BLO-36522 withdrew the stronger "never self-heals /
+  // lasts until the process is replaced" reading -- measured holds do settle).
+  // A warning would reproduce the original failure, which was nobody being
+  // paged.
   assert.match(
     block,
     /\n\s+severity: critical\n/,
-    "a non-self-healing per-agent dispatch outage must page, not warn",
+    "an unbroken per-agent dispatch outage must page, not warn",
   );
   assert.match(
     block,
     /runbook_url: "[^"]*runbooks\/queued-run-stranded\.md#agent-start-lock-wedged-pen-3305"/,
     "wedged-start-lock alert must link the runbook section from its annotation",
   );
+});
+
+test("the start-lock retune prose does not run ahead of the evidence (BLO-36522)", () => {
+  // Nothing renders from these two passages, so only an assertion catches them
+  // drifting. values.yaml is read by third parties enabling this chart
+  // elsewhere: calling the fleet-count retune Blockcast's live rule while
+  // Blockcast/onprem-k8s#3985 is unmerged hands them an unproven expression as
+  // proven -- and the mirror error, still calling it pending after #3985 lands,
+  // hands them `> 300` when the live rule is `> 900`.
+  //
+  // This test CANNOT observe #3985's state (CI has no read of onprem-k8s), so
+  // it deliberately enforces only that the prose stays DEFINITE about that
+  // state, in EITHER direction. Pinning it to "pending" would make the correct
+  // post-merge edit a red build whose failure message argues the now-false
+  // claim back in. The gate on which direction is true is the must-update
+  // checklist on Blockcast/onprem-k8s#3985, which names this file by path --
+  // that is where the merge event actually happens, and this repo has no
+  // signal for it.
+  const values = readFileSync(
+    path.join(repoRoot, "deploy/helm/paperclip/values.yaml"),
+    "utf8",
+  );
+  // Same -1 hazard as the terminal-failed runbook guard: a renamed marker would
+  // otherwise slice from the last character and pass vacuously.
+  const warningIndex = values.indexOf("# WARNING (BLO-36522)");
+  assert.notStrictEqual(warningIndex, -1, "values.yaml must keep the BLO-36522 start-lock WARNING");
+  // Guard this -1 too: a WARNING on the final line with no trailing newline
+  // would otherwise slice(warningIndex, -1) and silently drop its last char.
+  const warningEnd = values.indexOf("\n", warningIndex);
+  const warning = values.slice(warningIndex, warningEnd === -1 ? undefined : warningEnd);
+  assert.match(
+    warning,
+    /in Blockcast\/onprem-k8s#3985, (?:not yet merged; until it lands the live rule is still `> 300`|merged; the live rule is now `> 900`)/,
+    "values.yaml must state #3985's status definitely: pending with the live rule still > 300, or merged with it now > 900",
+  );
+  // Only meaningful while the prose claims pending -- after #3985 lands, saying
+  // the retune is deployed is the correct statement, not the forbidden one.
+  if (/not yet merged/.test(warning)) {
+    assert.doesNotMatch(
+      warning,
+      /live rule in Blockcast\/onprem-k8s is now|NO LONGER the deployed policy/,
+      "values.yaml must not describe the unmerged retune as deployed",
+    );
+  }
+
+  // The 2h14m 2026-09-24 episode was three agents in lockstep, i.e. the
+  // fleet-scope regime, and it self-healed. Calling 09-15/16 the only
+  // fleet-scope instance erases the page's strongest datum and leaves a
+  // restart as the sole precedent for the condition now paging.
+  const runbook = readFileSync(
+    path.join(repoRoot, "runbooks/queued-run-stranded.md"),
+    "utf8",
+  );
+  const sectionIndex = runbook.indexOf("## Agent start lock wedged (PEN-3305)");
+  assert.notStrictEqual(sectionIndex, -1, "runbook must keep the start-lock section heading");
+  const nextSection = runbook.indexOf("\n## ", sectionIndex + 1);
+  const section = runbook.slice(sectionIndex, nextSection === -1 ? undefined : nextSection);
+  assert.doesNotMatch(
+    section,
+    /only\*?\s+documented\s+instance\s+of\s+the\s+fleet-scope\s+regime/,
+    "runbook must not call 2026-09-15/16 the only fleet-scope instance; 2026-09-24 was one too",
+  );
+  assert.match(
+    section,
+    /only\*?\s+documented\s+fleet-scope\s+episode\s+that\s+ended\s+with\s+a\s+pod\s+replacement/,
+    "runbook must narrow the 09-15/16 claim to the only fleet-scope episode ended by a pod replacement",
+  );
+
+  // The withdrawn claim has now been removed at five sites across four heads,
+  // each found by re-grepping the phrase rather than by re-reading the diff --
+  // so assert the class is gone instead of waiting for a sixth site. These
+  // three files carry start-lock guidance as live operator/operator-adjacent
+  // instruction, never as quotation. queued-run-stranded.md and this file are
+  // excluded on purpose: both quote the claim in order to withdraw it, which
+  // is the one place it still belongs.
+  //
+  // Each file is sliced to its start-lock region rather than scanned whole.
+  // The phrases are ordinary English, and prometheusrule.yaml is a 909-line
+  // multi-alert template while README.md indexes every runbook -- a future
+  // alert whose hold genuinely does not self-heal would otherwise fail here
+  // with a message about BLO-36522, and the likely repair is weakening this
+  // guard. The `assert.ok` on each slice is what stops a renamed heading or
+  // key turning the scan into a vacuous pass.
+  for (const [relPath, region] of [
+    [
+      "deploy/helm/paperclip/templates/prometheusrule.yaml",
+      /\n\s+- alert: PaperclipAgentStartLockWedged\n[\s\S]*?(?=\n\s+- alert: |\n\s+- name: |$)/,
+    ],
+    [
+      "runbooks/README.md",
+      /\n- \[`queued-run-stranded\.md#agent-start-lock-wedged-pen-3305`\][\s\S]*?(?=\n- \[|$)/,
+    ],
+    [
+      "deploy/helm/paperclip/values.yaml",
+      /\n\s+# -- How long a single per-agent start lock may be held[\s\S]*?agentStartLockWedgedRunbookUrl: .*/,
+    ],
+  ]) {
+    const [section] =
+      readFileSync(path.join(repoRoot, relPath), "utf8").match(region) ?? [];
+    assert.ok(
+      section,
+      `${relPath} must keep its start-lock section for the BLO-36522 guard to scan; `
+        + "a renamed heading or key would otherwise make this assertion vacuous",
+    );
+    assert.doesNotMatch(
+      section,
+      /does not self-heal|never self-heals|process must be replaced|process is replaced/,
+      `${relPath} must not restate the "does not self-heal" / "replace the process" `
+        + "claims BLO-36522 withdrew; they are false as measured 2026-09-25",
+    );
+  }
 });
 
 test("PaperclipRecoveryHorizonNoWakeToCurrentOwner{Elevated,Sustained} key on the never_delivered series only and take their thresholds from values (PEN-3000)", () => {
