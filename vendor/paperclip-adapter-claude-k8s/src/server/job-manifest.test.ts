@@ -18,7 +18,9 @@ import {
   validateAgentCommand,
   validatePonytailPluginPath,
   validatePonytailDefaultMode,
+  resolveScopedWritableMounts,
 } from "./job-manifest.js";
+import type { JobIsolation } from "./job-manifest.js";
 import type { SelfPodInfo } from "./k8s-client.js";
 
 function makeCtx(overrides: Partial<AdapterExecutionContext> = {}): AdapterExecutionContext {
@@ -3208,6 +3210,118 @@ describe("scoped writable mounts (BLO-32734)", () => {
       const { job } = buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod() });
       expect(job.metadata?.annotations?.[SCOPE_ANNOTATION]).toBe("scoped");
       expect(broadRwWarnings()).toEqual([]);
+    });
+  });
+
+  // Ally review on #1820 (Critical): a `git_worktree` workspace keeps its git
+  // state OUTSIDE workspaceRoot, so covering workspaceRoot alone emits a Job that
+  // can edit files but cannot commit. Built on a real `git worktree add` so git
+  // itself, not a hand-written layout, says where that state lives. The temp dir
+  // stands in for the volume at both the pod's and the server's mount.
+  describe("linked git worktree workspaces", () => {
+    let volume: string;
+    let warn: ReturnType<typeof vi.spyOn>;
+    beforeEach(() => {
+      volume = mkdtempSync(join(tmpdir(), "claude-k8s-worktree-"));
+      warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    });
+    afterEach(() => {
+      rmSync(volume, { recursive: true, force: true });
+      warn.mockRestore();
+    });
+
+    function git(cwd: string, ...args: string[]): string {
+      const result = spawnSync("git", ["-C", cwd, ...args], {
+        encoding: "utf8",
+        env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
+      });
+      if (result.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
+      return result.stdout.trim();
+    }
+    function repoWithWorktree(companyId: string) {
+      const repo = join(volume, "instances/default/projects", companyId, "proj-1/_default");
+      mkdirSync(repo, { recursive: true });
+      git(repo, "init", "-q");
+      git(repo, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "init");
+      // The server's default worktree layout: `<repo>/.paperclip/worktrees/<branch>`.
+      const worktree = join(repo, ".paperclip/worktrees/br");
+      git(repo, "worktree", "add", "-q", "-b", "br", worktree);
+      return { repo, worktree };
+    }
+    function writableFor(workspaceRoot: string): string[] {
+      const isolationRoot = join(volume, "instances/default/data/k8s-isolation/workspaces/ws-1");
+      return resolveScopedWritableMounts({
+        dataMountPath: volume,
+        serverDataMountPath: volume,
+        isolation: {
+          enabled: true,
+          mode: "workspace",
+          source: "runtime",
+          key: "workspacews-1",
+          root: isolationRoot,
+          homeRoot: join(isolationRoot, "home"),
+          sessionRoot: join(isolationRoot, "session"),
+          workspaceRoot,
+          cacheRoot: "/runtime-cache/ws-1/cache",
+          tmpRoot: "/runtime-cache/ws-1/tmp",
+          promptCacheRoot: "",
+          storage: isolatedStorage() as JobIsolation["storage"],
+        },
+        podLogPath: join(volume, "instances/default/data/run-logs/co1/agent-abc/run-abc12345.pod.ndjson"),
+        instructionsFilePath: null,
+        addDir: null,
+        companyId: "co1",
+      }).map((m) => m.mountPath);
+    }
+    const covered = (mounts: string[], target: string) =>
+      mounts.some((m) => target === m || target.startsWith(`${m}/`));
+    const rejections = () =>
+      warn.mock.calls
+        .map(([line]) => (typeof line === "string" && line.startsWith("{") ? JSON.parse(line) : null))
+        .filter((entry) => entry?.event === "claude_k8s.worktree_gitdir_rejected")
+        .map((entry) => entry.reason);
+
+    it("makes writable every dir a commit in the worktree writes into", () => {
+      const { worktree } = repoWithWorktree("co1");
+      const mounts = writableFor(worktree);
+      // `index.lock` is the first thing `git add`/`commit`/`status` create;
+      // the common dir holds the refs and the object store.
+      for (const query of [["--git-dir"], ["--git-common-dir"], ["--git-path", "index.lock"]]) {
+        const target = git(worktree, "rev-parse", "--path-format=absolute", ...query);
+        expect(covered(mounts, target), `${query.join(" ")} ${target} not covered by ${JSON.stringify(mounts)}`).toBe(true);
+      }
+      expect(rejections()).toEqual([]);
+    });
+
+    it("adds nothing for an ordinary checkout, whose .git already sits inside workspaceRoot", () => {
+      const { repo } = repoWithWorktree("co1");
+      expect(writableFor(repo).filter((m) => m.startsWith(repo))).toEqual([repo]);
+      expect(rejections()).toEqual([]);
+    });
+
+    // The `.git` pointer sits in the run's OWN writable tree, so a prior run can
+    // rewrite it. Taken at face value, that would let one company's run have the
+    // next one mount another company's repo rw.
+    it("refuses a pointer re-aimed at another company's worktree registration", () => {
+      const own = repoWithWorktree("co1");
+      const foreign = repoWithWorktree("co2");
+      const foreignGitDir = git(foreign.worktree, "rev-parse", "--path-format=absolute", "--git-dir");
+      writeFileSync(join(own.worktree, ".git"), `gitdir: ${foreignGitDir}\n`);
+      const mounts = writableFor(own.worktree);
+      expect(covered(mounts, join(foreign.repo, ".git")), JSON.stringify(mounts)).toBe(false);
+      expect(rejections()).toEqual(["gitdir_back_pointer_mismatch"]);
+    });
+
+    // Shape-valid and back-pointer-valid, both written from inside the run's own
+    // tree. Accepted, `<common>` would be `<repo>/.paperclip`, re-opening every
+    // sibling worktree of the repo.
+    it("refuses a registration forged inside the worktree itself", () => {
+      const { repo, worktree } = repoWithWorktree("co1");
+      writeFileSync(join(worktree, ".git"), `gitdir: ${worktree}\n`);
+      writeFileSync(join(worktree, "gitdir"), `${join(worktree, ".git")}\n`);
+      const mounts = writableFor(worktree);
+      expect(covered(mounts, join(repo, ".paperclip/worktrees/sibling")), JSON.stringify(mounts)).toBe(false);
+      expect(rejections()).toEqual(["common_dir_not_a_git_dir"]);
     });
   });
 });
