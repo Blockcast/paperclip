@@ -518,6 +518,20 @@ function scheduleDuplicateCandidateShownActivity(input: {
 }
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
+/**
+ * Query params that change which issues list() returns but that the general COUNT(*)
+ * path in issueService.count() does not express. Accepting one would return a count of
+ * a wider set than the caller asked for, with nothing in the response to reveal it.
+ */
+const COUNT_UNSUPPORTED_FILTERS = [
+  "q",
+  "descendantOf",
+  "labelId",
+  "participantAgentId",
+  "touchedByUserId",
+  "inboxArchivedByUserId",
+  "unreadForUserId",
+] as const;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
 });
@@ -3021,6 +3035,31 @@ function logIssueListRequest(input: {
       visibilityHint: input.req.header("x-paperclip-tab-visible") ?? null,
     }, "safe authenticated GET observed");
   });
+}
+
+/**
+ * Pages through `fetchPage` until it returns a short page, handing each page to `visit`.
+ *
+ * attention=blocked is served by listBlockedInboxIssues, which pages by offset only and
+ * ignores sortField/afterId, so that path advances `offset`; a keyset cursor there would
+ * re-read page one forever. Every other path walks the immutable id order with a keyset
+ * cursor, because offset paging over the mutable activity order re-ranks rows touched
+ * mid-walk, which both double-counts and skips them.
+ */
+export async function walkIssueListPages<Row extends { id: string }>(
+  fetchPage: (page: { offset?: number; afterId?: string }) => Promise<Row[]>,
+  opts: { blocked: boolean; pageSize: number },
+  visit: (rows: Row[]) => Promise<void>,
+): Promise<void> {
+  let offset = 0;
+  let afterId: string | undefined;
+  while (true) {
+    const rows = await fetchPage(opts.blocked ? { offset } : { afterId });
+    await visit(rows);
+    if (rows.length < opts.pageSize) return;
+    if (opts.blocked) offset += rows.length;
+    else afterId = rows[rows.length - 1]!.id;
+  }
 }
 
 export function issueRoutes(
@@ -8269,6 +8308,7 @@ export function issueRoutes(
     const attention = req.query.attention as string | undefined;
     const sortField = req.query.sortField as string | undefined;
     const sortDir = req.query.sortDir as string | undefined;
+    const afterId = req.query.afterId as string | undefined;
     const view = req.query.view as string | undefined;
     const compactView = view === "compact";
     const hasPlanDocument = parseOptionalBooleanQuery(req.query.hasPlanDocument);
@@ -8308,13 +8348,38 @@ export function issueRoutes(
       res.status(400).json({ error: "offset must be a non-negative integer" });
       return;
     }
-    if (sortField !== undefined && sortField !== "updated") {
-      res.status(400).json({ error: "sortField must be 'updated' when provided" });
+    if (sortField !== undefined && sortField !== "updated" && sortField !== "id") {
+      res.status(400).json({ error: "sortField must be 'updated' or 'id' when provided" });
       return;
     }
     if (sortDir !== undefined && sortDir !== "asc" && sortDir !== "desc") {
       res.status(400).json({ error: "sortDir must be 'asc' or 'desc' when provided" });
       return;
+    }
+    if (afterId !== undefined) {
+      if (typeof afterId !== "string" || !isUuidLike(afterId.trim())) {
+        res.status(400).json({ error: "afterId must be an issue UUID" });
+        return;
+      }
+      // Keyset paging is only meaningful against the immutable id order; allowing it
+      // on the mutable activity order would hand back a cursor that silently skips rows.
+      if (sortField !== "id") {
+        res.status(400).json({ error: "afterId requires sortField=id" });
+        return;
+      }
+      // offset applies on top of the keyset predicate, so combining them would
+      // silently skip `offset` rows per page.
+      if (parsedOffset !== null && parsedOffset > 0) {
+        res.status(400).json({ error: "afterId cannot be combined with offset" });
+        return;
+      }
+      // attention=blocked is served by the blocked-inbox listing, which pages by
+      // offset only and ignores afterId, so a cursor there would return page one on
+      // every request and never advance.
+      if (attention === "blocked") {
+        res.status(400).json({ error: "afterId cannot be combined with attention=blocked" });
+        return;
+      }
     }
     if (hasPlanDocument === null) {
       res.status(400).json({ error: "hasPlanDocument must be true or false when provided" });
@@ -8382,8 +8447,9 @@ export function issueRoutes(
       q: req.query.q as string | undefined,
       limit,
       offset,
-      sortField: sortField === "updated" ? "updated" : undefined,
+      sortField: sortField === "updated" ? "updated" : sortField === "id" ? "id" : undefined,
       sortDir: sortDir === "asc" || sortDir === "desc" ? sortDir : undefined,
+      afterId: afterId?.trim() || undefined,
     };
     const requestKey = issueListRequestKey({
       req,
@@ -8569,8 +8635,8 @@ export function issueRoutes(
     }
     const attention = req.query.attention as string | undefined;
     const hasPlanDocument = parseOptionalBooleanQuery(req.query.hasPlanDocument);
-    if (attention !== "blocked") {
-      res.status(400).json({ error: "issues/count currently requires attention=blocked" });
+    if (attention !== undefined && attention !== "blocked") {
+      res.status(400).json({ error: "attention must be 'blocked' when provided" });
       return;
     }
     if (req.query.limit !== undefined || req.query.offset !== undefined) {
@@ -8581,13 +8647,37 @@ export function issueRoutes(
       res.status(400).json({ error: "hasPlanDocument must be true or false when provided" });
       return;
     }
+    // The general (non-blocked) count is a single COUNT(*) over a narrower condition set
+    // than list(). Any filter it cannot express must 400 rather than be dropped: silently
+    // counting a wider set is worse than refusing, because the caller cannot tell.
+    if (attention === undefined) {
+      const unsupported = COUNT_UNSUPPORTED_FILTERS.filter((key) => {
+        const value = req.query[key];
+        return value !== undefined && value !== "";
+      });
+      if (unsupported.length > 0) {
+        res.status(400).json({
+          error: `issues/count cannot honor ${unsupported.join(", ")}; omit them or use attention=blocked`,
+        });
+        return;
+      }
+    }
+    const assigneeUserFilterRaw = req.query.assigneeUserId as string | undefined;
+    const assigneeUserId =
+      assigneeUserFilterRaw === "me" && req.actor.type === "board"
+        ? req.actor.userId
+        : assigneeUserFilterRaw;
+    if (assigneeUserFilterRaw === "me" && (!assigneeUserId || req.actor.type !== "board")) {
+      res.status(403).json({ error: "assigneeUserId=me requires board authentication" });
+      return;
+    }
 
-    const blockedCountFilters = {
-      attention: "blocked",
+    const countFilters = {
+      attention: attention === "blocked" ? "blocked" as const : undefined,
       status: req.query.status as string | string[] | undefined,
       assigneeAgentId: req.query.assigneeAgentId as string | undefined,
       participantAgentId: req.query.participantAgentId as string | undefined,
-      assigneeUserId: req.query.assigneeUserId as string | undefined,
+      assigneeUserId,
       projectId: req.query.projectId as string | undefined,
       workspaceId: req.query.workspaceId as string | undefined,
       executionWorkspaceId: req.query.executionWorkspaceId as string | undefined,
@@ -8603,8 +8693,8 @@ export function issueRoutes(
         req.query.excludeRoutineExecutions === "true" || req.query.excludeRoutineExecutions === "1",
       includePluginOperations:
         req.query.includePluginOperations === "true" || req.query.includePluginOperations === "1",
-      includeBlockedBy: true,
-      includeBlockedInboxAttention: true,
+      includeBlockedBy: attention === "blocked",
+      includeBlockedInboxAttention: attention === "blocked",
       hasPlanDocument,
       q: req.query.q as string | undefined,
     } as const;
@@ -8621,30 +8711,33 @@ export function issueRoutes(
       }
       if (trustResolution?.kind === "low_trust_review") {
         const count = await svc.count(companyId, {
-          ...blockedCountFilters,
+          ...countFilters,
           lowTrustBoundary: trustResolution.boundary,
         });
         res.json({ count });
         return;
       }
 
-      let offset = 0;
+      const blocked = countFilters.attention === "blocked";
       let visibleCount = 0;
-      while (true) {
-        const rows = await svc.list(companyId, {
-          ...blockedCountFilters,
-          limit: ISSUE_LIST_MAX_LIMIT,
-          offset,
-        });
-        visibleCount += (await filterIssuesForActor(req, rows)).length;
-        if (rows.length < ISSUE_LIST_MAX_LIMIT) break;
-        offset += rows.length;
-      }
+      await walkIssueListPages(
+        (page) =>
+          svc.list(
+            companyId,
+            blocked
+              ? { ...countFilters, limit: ISSUE_LIST_MAX_LIMIT, offset: page.offset }
+              : { ...countFilters, limit: ISSUE_LIST_MAX_LIMIT, sortField: "id", afterId: page.afterId },
+          ),
+        { blocked, pageSize: ISSUE_LIST_MAX_LIMIT },
+        async (rows) => {
+          visibleCount += (await filterIssuesForActor(req, rows)).length;
+        },
+      );
       res.json({ count: visibleCount });
       return;
     }
 
-    const count = await svc.count(companyId, blockedCountFilters);
+    const count = await svc.count(companyId, countFilters);
     res.json({ count });
   });
 
