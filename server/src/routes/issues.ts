@@ -3911,9 +3911,19 @@ export function issueRoutes(
    * The read-side half is `hasExplicitWaitingPath` in
    * services/recovery/issue-graph-liveness.ts. The two answer the same question and are
    * deliberately NOT the same predicate: the sweep accepts a superset, and that asymmetry
-   * is safe in exactly one direction — everything this validator admits, the sweep counts.
-   * Keep it that way. PEN-2853 records the first instance (a lapsed monitor the sweep had
-   * stopped counting still cleared this gate); BLO-33572 is the second, below.
+   * is safe in exactly one direction — everything this validator admits, the sweep counts,
+   * EXCEPT the typed participant (below). Keep it that way. PEN-2853 records the first
+   * instance (a lapsed monitor the sweep had stopped counting still cleared this gate);
+   * BLO-33572 is the second, below.
+   *
+   * BLO-35613 — the exception, and it runs the other way.
+   * `typed_execution_state_current_participant` is not an arm of `hasExplicitWaitingPath` at
+   * all; the sweep honours it in `reviewFinding`, and only when the participant is an
+   * invokable agent of this issue's company, where `hasExecutionParticipant` here admits any
+   * non-empty `agentId`. So on that one path the sweep is STRICTER, and a row this validator
+   * admits can still be reported `invalid_review_participant`. That fails safe — flagged,
+   * not silently unattended — and the `hasExplicitWaitingPath` docblock records why the
+   * participant must not be migrated onto that predicate to "complete" the subset.
    *
    * BLO-33572 — a live deliberate park (`parkedUntil` in the future) is a sweep satisfier
    * and is deliberately NOT a review path here, which is why this function never reads the
