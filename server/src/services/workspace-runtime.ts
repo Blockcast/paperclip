@@ -3450,8 +3450,25 @@ async function resolvePathForWorktreeComparison(value: string): Promise<string> 
   // One deadline for the whole walk, not one per segment. The loop's `catch`
   // reads any failure as "this segment is missing" and climbs to the parent, so
   // a per-segment bound on a wedged mount would abandon a thread per segment.
-  // Falling back to the lexical path fails closed: it cannot match an owned
-  // registration, so every caller skips rather than removes.
+  //
+  // Skip the walk entirely once this directory already holds a thread. This is
+  // the only fs consumer on the ownership path: `findGitWorktreeRegistration`
+  // calls it once per registration, so without the pre-check a single
+  // collector candidate would abandon one thread per colocated registration —
+  // 128 of them on the population this collector exists to drain. Guarding
+  // here rather than threading a stop signal through the ownership module
+  // covers `listLinkedGitWorktreePaths` and every future caller too.
+  //
+  // Both the pre-check and the expiry fall back to the lexical path, which is
+  // what the comparison already did on every wedge. Note what that costs: the
+  // two sides of `findGitWorktreeRegistration` are compared *after*
+  // normalization, so a fallback on one side only can miss a registration that
+  // a successful walk would have matched. A miss is not a false match — it
+  // authorizes removal with single `--force` rather than double
+  // (`git-worktree-ownership.ts:474`), which is precisely the case git's own
+  // lock is the backstop for, and the collector only reaches here after
+  // `inspectWorktreeReclaimSafety` has proven the tree clean and pushed.
+  if (isReclaimFsWedgedDir(path.dirname(resolved))) return resolved;
   return withReclaimFsDeadline(walk(), resolved).catch(() => resolved);
 }
 
@@ -4747,31 +4764,44 @@ export type WorktreeReclaimSafety = {
 
 const WORKTREE_RECLAIM_GIT_TIMEOUT_MS = 30_000;
 
-const reclaimFsWedgedRoots = new Set<string>();
+const reclaimFsWedgedRoots = new Map<string, number>();
 
 /**
  * Directories with an abandoned call still outstanding — threads held right
- * now, one per entry, because a second call under an entry is never made.
+ * now, refcounted because a directory can hold more than one.
  *
  * Ending the pass bounds a single window, not the process: the next window is
  * free to abandon one more on the same wedged mount, and four such windows
  * retire the default pool for every other fs/dns/crypto consumer in the server.
  * So the hold is on the *directory*, which is what makes it self-clearing and
  * keeps the collector working on every other mount instead of latching off.
+ *
+ * Refcounted, not a set: the pre-checks below make a second call under a held
+ * directory rare rather than impossible — two callers can both check before
+ * either expires, and the run-teardown and operator-PATCH callers of
+ * `withReclaimFsDeadline` share this map. With a set, whichever syscall
+ * answered first would clear the hold while the other still held its thread,
+ * so the count the backstop reads would understate the pool in use.
  */
 export function isReclaimFsWedgedDir(dir: string): boolean {
   return reclaimFsWedgedRoots.has(dir);
 }
 
-export function reclaimFsWedgedDirCount(): number {
-  return reclaimFsWedgedRoots.size;
+/** Threads held by abandoned calls right now, summed across directories. */
+export function reclaimFsOutstandingCount(): number {
+  let outstanding = 0;
+  for (const held of reclaimFsWedgedRoots.values()) outstanding += held;
+  return outstanding;
 }
 
 /** Backstop for a spread of wedged roots: half the threadpool, never more. */
-export const RECLAIM_FS_OUTSTANDING_LIMIT = Math.max(
-  1,
-  Math.floor(Number(process.env.UV_THREADPOOL_SIZE ?? 4) / 2) || 2,
-);
+export const RECLAIM_FS_OUTSTANDING_LIMIT = (() => {
+  // `Number.isFinite` rather than `|| 2`, which would also catch the legitimate
+  // 0 that `UV_THREADPOOL_SIZE=1` floors to — the one pool size where the
+  // backstop most needs to be 1.
+  const poolSize = Number(process.env.UV_THREADPOOL_SIZE ?? 4);
+  return Number.isFinite(poolSize) ? Math.max(1, Math.floor(poolSize / 2)) : 2;
+})();
 
 /**
  * Bounds a filesystem call that can block indefinitely on a wedged mount. The
@@ -4788,11 +4818,13 @@ async function withReclaimFsDeadline<T>(operation: Promise<T>, target: string): 
   const deadline = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
       const wedgedDir = path.dirname(path.resolve(target));
-      reclaimFsWedgedRoots.add(wedgedDir);
+      reclaimFsWedgedRoots.set(wedgedDir, (reclaimFsWedgedRoots.get(wedgedDir) ?? 0) + 1);
       // Abandoned, not cancelled: the thread returns to the pool only when the
       // syscall itself finally answers, so release the hold on settle.
       const release = () => {
-        reclaimFsWedgedRoots.delete(wedgedDir);
+        const outstanding = (reclaimFsWedgedRoots.get(wedgedDir) ?? 1) - 1;
+        if (outstanding > 0) reclaimFsWedgedRoots.set(wedgedDir, outstanding);
+        else reclaimFsWedgedRoots.delete(wedgedDir);
       };
       void operation.then(release, release);
       reject(Object.assign(new Error(`filesystem call exceeded ${WORKTREE_RECLAIM_GIT_TIMEOUT_MS}ms`), {

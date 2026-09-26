@@ -7,7 +7,7 @@ import {
   cleanupExecutionWorkspaceArtifacts,
   inspectWorktreeReclaimSafety,
   isReclaimFsWedgedDir,
-  reclaimFsWedgedDirCount,
+  reclaimFsOutstandingCount,
   RECLAIM_FS_OUTSTANDING_LIMIT,
   type WorktreeReclaimSafety,
 } from "./workspace-runtime.js";
@@ -205,10 +205,10 @@ export function executionWorkspaceCleanupService(db: Db) {
     // are skipped below; this is only the backstop for a spread of wedged
     // directories. Each entry clears when its syscall finally answers, so
     // neither needs a timer or a manual reset.
-    const wedgedDirs = reclaimFsWedgedDirCount();
-    if (wedgedDirs >= RECLAIM_FS_OUTSTANDING_LIMIT) {
+    const outstandingAtEntry = reclaimFsOutstandingCount();
+    if (outstandingAtEntry >= RECLAIM_FS_OUTSTANDING_LIMIT) {
       logger.warn(
-        { wedgedDirs, limit: RECLAIM_FS_OUTSTANDING_LIMIT },
+        { outstanding: outstandingAtEntry, limit: RECLAIM_FS_OUTSTANDING_LIMIT },
         "reconcileExecutionWorkspaceCleanup: abandoned filesystem calls still hold threadpool threads; skipping this pass",
       );
       return { stamped: 0, scanned: 0, collected: 0, skipped: 0, failed: 0 };
@@ -278,6 +278,23 @@ export function executionWorkspaceCleanupService(db: Db) {
 
     let scanned = 0;
     for (const candidate of candidates) {
+      // The gate above bounds where a pass *starts*; this bounds where it ends.
+      // Sampling it only at entry let one pass outrun the threadpool: the
+      // targeted break below fires on the directory this pass probed, but a
+      // candidate under a different parent is still probed normally, and the
+      // cleanup-side stat (`workspace-runtime.ts`, after the inspector already
+      // succeeded) defers and continues rather than breaking. Re-reading here
+      // makes the ceiling in `RECLAIM_FS_OUTSTANDING_LIMIT` hold within a pass
+      // and not just across them. Breaking before `scanned` leaves the rest
+      // untouched for the next window.
+      const outstanding = reclaimFsOutstandingCount();
+      if (outstanding >= RECLAIM_FS_OUTSTANDING_LIMIT) {
+        logger.warn(
+          { outstanding, limit: RECLAIM_FS_OUTSTANDING_LIMIT, scanned },
+          "reconcileExecutionWorkspaceCleanup: abandoned filesystem calls hold the threadpool; ending this pass",
+        );
+        break;
+      }
       scanned += 1;
       const worktreePath = candidate.providerRef ?? candidate.cwd;
       // A sibling of a tree whose stat was abandoned is on the same wedged
@@ -305,10 +322,12 @@ export function executionWorkspaceCleanupService(db: Db) {
             );
             // The probe we just made hit its deadline: the call is abandoned,
             // not cancelled, so it holds a libuv threadpool thread until the
-            // syscall finally answers. End the pass rather than push out the
-            // eligibility of every colocated sibling behind it — they are
-            // re-selected untouched next window, and the directory hold above
-            // keeps any that are selected from being probed.
+            // syscall finally answers. End the pass rather than probe every
+            // colocated sibling behind it — one abandoned thread each, to
+            // learn the same thing about the same mount. They are left
+            // untouched by *this* pass; next window the directory pre-check
+            // above defers them by one grace window without a probe, which is
+            // one cheap UPDATE rather than a held thread.
             //
             // Keyed on the directory this candidate just probed, not on a
             // process-wide expiry count: `withReclaimFsDeadline` is shared with

@@ -12,7 +12,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { classifyRemovalProof, executionWorkspaceCleanupService } from "../services/execution-workspace-cleanup.ts";
-import { inspectWorktreeReclaimSafety, reclaimFsWedgedDirCount } from "../services/workspace-runtime.ts";
+import { inspectWorktreeReclaimSafety, reclaimFsOutstandingCount } from "../services/workspace-runtime.ts";
 import { lockGitWorktreeForOwner } from "../services/git-worktree-ownership.ts";
 
 /**
@@ -163,7 +163,42 @@ describe("inspectWorktreeReclaimSafety", () => {
       stat.mockRestore();
       vi.useRealTimers();
     }
-    expect(reclaimFsWedgedDirCount()).toBe(0);
+    expect(reclaimFsOutstandingCount()).toBe(0);
+  });
+
+  it("refcounts the hold, so one answered syscall does not release a directory another still holds", async () => {
+    vi.useFakeTimers();
+    // Two abandoned calls under ONE directory. A `Set` collapses them to a
+    // single entry, so the first syscall to answer clears the hold while the
+    // second thread is still held — and the backstop then reads a threadpool
+    // that is emptier than it is. The pre-checks make this rare rather than
+    // impossible: two callers can both check before either expires, and the
+    // run-teardown and operator-PATCH callers share the same map.
+    const dir = path.join(os.tmpdir(), `paperclip-wedged-${randomUUID()}`);
+    const unwedge: Array<() => void> = [];
+    const stat = vi.spyOn(fsp, "stat").mockImplementation(
+      () => new Promise((resolve) => { unwedge.push(() => resolve(undefined as never)); }),
+    );
+    try {
+      const first = inspectWorktreeReclaimSafety(path.join(dir, "wt-a"));
+      const second = inspectWorktreeReclaimSafety(path.join(dir, "wt-b"));
+      await vi.runOnlyPendingTimersAsync();
+      await Promise.all([first, second]);
+      expect(reclaimFsOutstandingCount()).toBe(2);
+
+      unwedge[0]?.();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(reclaimFsOutstandingCount()).toBe(1);
+
+      unwedge[1]?.();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(reclaimFsOutstandingCount()).toBe(0);
+    } finally {
+      for (const release of unwedge) release();
+      await vi.advanceTimersByTimeAsync(0);
+      stat.mockRestore();
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -483,7 +518,7 @@ describeEmbeddedPostgres("reconcileExecutionWorkspaceCleanup", () => {
       await wedgedStatCalled;
       await vi.advanceTimersByTimeAsync(30_000);
       expect((await first).scanned).toBe(1);
-      expect(reclaimFsWedgedDirCount()).toBe(1);
+      expect(reclaimFsOutstandingCount()).toBe(1);
 
       statted.length = 0;
       const second = await cleanup.reconcileExecutionWorkspaceCleanup();
@@ -497,7 +532,7 @@ describeEmbeddedPostgres("reconcileExecutionWorkspaceCleanup", () => {
 
       unwedge?.();
       await vi.advanceTimersByTimeAsync(0);
-      expect(reclaimFsWedgedDirCount()).toBe(0);
+      expect(reclaimFsOutstandingCount()).toBe(0);
     } finally {
       unwedge?.();
       await vi.advanceTimersByTimeAsync(0);
