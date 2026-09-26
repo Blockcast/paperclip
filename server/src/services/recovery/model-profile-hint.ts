@@ -262,6 +262,18 @@ export function readRecoveryRunWriteClass(contextSnapshot: unknown): RecoveryRun
  * Cited by name rather than `file:line` deliberately — these call sites move under unrelated
  * churn, and a stale line number in a security-control comment reads as authority.
  *
+ * The monitor-arming clause names a CONDITION, not a flat verdict, because since BLO-34683 its
+ * guard is conditional: `assertMonitorArmingAllowedByRunContext` refuses only while a recovery
+ * action is active on the target issue or on the run's own or source issue, and fails closed when
+ * it cannot tell. The `issue_monitor_recovery` wake (`heartbeat.ts`) is itself stamped status-only
+ * and is dispatched to re-arm a cleared monitor, so a flat refusal talks that run out of the one
+ * write it exists to make, and nothing fails when it does. Keep the clause keyed to that guard.
+ *
+ * No branch may present one exit from the run as the only one. The escalation clause below names
+ * the document-write attempt as a second exit on every status-only run, so a categorical sentence
+ * in the same paragraph contradicts it, and it is the more quotable of the two: an agent planning
+ * from it skips the attempt, which restores the starvation round 4 closed.
+ *
  * Neither notice states WHY the run is contained, and `planning_only`'s omission is the deliberate
  * one. An earlier draft opened "escalated after a status-only run was refused a document write",
  * which is true of only one of that class's two producers: `successful-run-handoff.ts` selects it
@@ -331,15 +343,16 @@ export function recoveryRunWriteClassNotice(contextSnapshot: unknown): RecoveryR
     "there is no other signal that writes are contained. Refused with 403: creating, modifying, " +
     "commenting on, resubmitting, withdrawing, linking or unlinking approvals — including the " +
     "`request_board_approval` this run may itself file; assigning downstream issue work to the " +
-    "cheap model profile; arming issue monitors; writing issue documents other than upserting " +
+    "cheap model profile; arming issue monitors while a recovery action is active on the issue " +
+    "being armed or on this run's own or source issue, and whenever the server cannot tell, as " +
+    "on an issue this run is creating; writing issue documents other than upserting " +
     "the status-adjudication document; and all deliverable and annotation writes. " +
     (statusOnlyEscalationSourceIssueId(contextSnapshot)
       ? "The only approval write this run can perform is creating a `request_board_approval` " +
         "linked to this run's source issue and to no other issue, and that is a single call you " +
         "cannot follow up from here — not even to comment on what you just filed. "
       : "This run's context carries no source issue, so the `request_board_approval` escalation is " +
-        "refused here too: this run has no approval write available at all. The only reachable " +
-        "exit from this run is recording a valid issue disposition. ") +
+        "refused here too: this run has no approval write available at all. ") +
     "Permitted: reads, issue comments, and recording a status disposition. " +
     "One of those refusals is also the only escalation channel off this lane: if the work this run " +
     "must finish genuinely needs an issue-document write, attempt it rather than skipping it on " +

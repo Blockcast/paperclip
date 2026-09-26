@@ -224,7 +224,6 @@ describe("recovery run write class", () => {
     expect(withSource).toContain("not even to comment on what you just filed");
 
     expect(withoutSource).toContain("no approval write available at all");
-    expect(withoutSource).toContain("The only reachable exit from this run is recording a valid");
     // The load-bearing negative: no sentence may offer the filing to a run that cannot make it.
     expect(withoutSource).not.toMatch(/only approval write this run can perform|or file a `request_board_approval`/);
   });
@@ -269,6 +268,33 @@ describe("recovery run write class", () => {
     expect(recoveryRunWriteClassNotice(PLANNING_ONLY)).not.toMatch(/attempt it/i);
   });
 
+  // PEN-3275 round 5. The no-source branch used to end "The only reachable exit from this run is
+  // recording a valid issue disposition.", three sentences before the clause above names the
+  // document-write attempt as a second exit. The categorical sentence is the more quotable one, and
+  // an agent planning from it skips the attempt: the round-4 starvation, restored on the branch
+  // `issue_monitor_recovery` and issueless stale-run evaluations emit. Exits are enumerated by the
+  // "Permitted:" sentence and the escalation clause, so no sentence may claim to be the only one.
+  it("never presents a single exit as the only one on either status-only branch", () => {
+    for (const snapshot of [STATUS_ONLY_WITH_SOURCE, STATUS_ONLY_WITHOUT_SOURCE]) {
+      expect(recoveryRunWriteClassNotice(snapshot) ?? "").not.toMatch(/only (reachable )?exit/i);
+    }
+  });
+
+  // BLO-34683 made the monitor-arm guard conditional: `assertMonitorArmingAllowedByRunContext`
+  // returns when no active recovery action covers the target issue or the run's scope, and fails
+  // closed when it cannot tell. The `issue_monitor_recovery` wake is stamped status-only
+  // (`heartbeat.ts`) and is dispatched to re-arm, so a flat "arming issue monitors" refusal tells
+  // that run the guard will refuse the one write it exists to make, when the guard would allow it.
+  // Pinned on the condition's anchors, so a rewording that keeps the condition keeps passing.
+  it("names the monitor-arm refusal by its containment condition, not as a flat verdict", () => {
+    for (const snapshot of [STATUS_ONLY_WITH_SOURCE, STATUS_ONLY_WITHOUT_SOURCE]) {
+      const notice = recoveryRunWriteClassNotice(snapshot) ?? "";
+      expect(notice).toMatch(/arming issue monitors while a recovery action is active/);
+      expect(notice).toMatch(/cannot tell/);
+      expect(notice).not.toMatch(/arming issue monitors[;.]/);
+    }
+  });
+
   // PEN-3275 round 4. `buildPaperclipTaskMarkdown` frames this text as system-authored, and until
   // the brand landed that authority was asserted by argument POSITION — any string in that slot
   // was framed the same way. `@ts-expect-error` is the assertion: it fails the build if the error
@@ -288,8 +314,9 @@ describe("recovery run write class", () => {
   });
 
   // BLO-25878 / BLO-32774. The notice must not read as a promise that a normal-model run is
-  // coming, nor as an instruction to go arm oneself an unguarded one — `issues.ts` refuses
-  // exactly that monitor arm, so suggesting it would send the reader into another 403.
+  // coming, nor as an instruction to go arm oneself an unguarded one. `issues.ts` refuses that
+  // monitor arm while a recovery action contains the run (BLO-34683), and a run told to arm its
+  // way out is being steered toward the unguarded normal-model run that containment exists to deny.
   it("neither promises a normal-model run nor steers the reader into arming one", () => {
     for (const notice of eachNotice()) {
       expect(notice).not.toMatch(/arm a monitor|monitor to resume|wait for a normal-model run/i);
