@@ -116,13 +116,22 @@ export function statusOnlyEscalationSourceIssueId(contextSnapshot: unknown): str
 }
 
 /**
- * Every approval operation `assertApprovalMutationAllowedByRunContext` can refuse — ONE ENTRY PER
- * CALL SITE of that guard — so the two notice sentences below and the tests that pin them read one
- * list instead of maintaining three copies of it by hand.
+ * Every approval operation `assertApprovalMutationAllowedByRunContext` can refuse, so the two
+ * notice sentences below and the tests that pin them read one list instead of maintaining three
+ * copies of it by hand.
  *
- * The call sites are, in `approvals.ts`: create, resubmit, withdraw, apply, comments; and in
- * `issues.ts`: link and unlink. Only create passes `requestedType`, so every other operation
- * compares `undefined` against the permitted type and is refused on BOTH lanes.
+ * NOT one entry per call site, though the counts coincide today. There are seven call sites — in
+ * `approvals.ts`: create, resubmit, withdraw, apply, comments; and in `issues.ts`: link and unlink —
+ * and seven entries, but the mapping is not 1:1 in either direction: `create` accounts for both
+ * `creating` and `modifying` (there is no modify-approval route at all), while `linking or
+ * unlinking` is one entry covering two call sites. A maintainer who validates this list by counting
+ * call sites gets the right answer by accident, so count it as "every operation the guard can
+ * refuse" instead. `modifying` is kept despite naming no route because the 403 itself answers in
+ * "create/modify" terms, and a notice that dropped the word would stop matching the error text the
+ * reader is holding.
+ *
+ * Only create passes `requestedType`, so every other operation compares `undefined` against the
+ * permitted type and is refused on BOTH lanes.
  *
  * PEN-3275 round 6: `applying` was the entry three successive hand-written copies omitted, while
  * `POST /approvals/:id/apply` was refused the whole time. It is the worst one to omit — that route
@@ -145,6 +154,48 @@ export const REFUSED_APPROVAL_OPERATIONS = [
 ] as const;
 
 const REFUSED_APPROVAL_OPERATIONS_TEXT = REFUSED_APPROVAL_OPERATIONS.join(", ");
+
+/**
+ * Every write a status-only recovery run MAY perform — the positive counterpart to
+ * `REFUSED_APPROVAL_OPERATIONS`, rendered into the `Permitted:` sentence so the notice's two halves
+ * are maintained as one list instead of as prose that drifts apart.
+ *
+ * PEN-3275 round 7: this sentence was hand-written as "reads, issue comments, and recording a
+ * status disposition" — a bare three-item list, four sentences after a refusal clause that
+ * (correctly, since BLO-34683) refuses monitor arming only *while a recovery action is active*. The
+ * two clauses disagreed, and the omission landed on the wake class this notice exists for:
+ * `issue_monitor_recovery` is stamped status-only and dispatched specifically to re-arm a monitor
+ * that was just cleared, on an issue that typically holds no recovery action — so the guard would
+ * have PERMITTED the arm while the notice implied it was unavailable. Nothing fails when that
+ * happens: the run declines the write, terminates cleanly, and the issue loses its wake path. That
+ * is the BLO-34683 harm re-entering through the clause beside the one that was fixed.
+ *
+ * An entry naming a CONDITIONALLY refused write must carry the same condition its refusal clause
+ * states, so the two read as one verdict rather than as a contradiction the reader has to
+ * adjudicate. The test file pins that coupling by slicing the notice at `Permitted:` and requiring
+ * each conditional refusal to reappear on this side; round 5 pinned only the ABSENCE of an
+ * "only exit" literal, which a three-item list does not trip, and that is how this omission passed.
+ *
+ * Arming and clearing are listed SEPARATELY and deliberately. Only arming is conditional; clearing
+ * is permitted outright, by its own carve-out in `assertCanManageIssueMonitor` (`issues.ts`, gated
+ * on `options.monitorArmed !== false`) whose comment explains that refusing it "would strand an
+ * issue whose stale monitor a status-only run is tidying up". Lumping the two under the arming
+ * condition would under-state clearing — which is the exact defect this entry was added to fix,
+ * reproduced one write over.
+ */
+export const STATUS_ONLY_PERMITTED_WRITES = [
+  "reads",
+  "issue comments",
+  "recording a status disposition",
+  "upserting the status-adjudication document",
+  "clearing an issue monitor",
+  "arming an issue monitor when no recovery action covers the issue being armed or this run's own " +
+    "or source issue",
+] as const;
+
+const STATUS_ONLY_PERMITTED_WRITES_TEXT =
+  `${STATUS_ONLY_PERMITTED_WRITES.slice(0, -1).join(", ")}, and ` +
+  `${STATUS_ONLY_PERMITTED_WRITES[STATUS_ONLY_PERMITTED_WRITES.length - 1]}`;
 
 /**
  * The monitor-arm gate's guidance, which unlike the three refusals above HAS resolved whether
@@ -385,7 +436,7 @@ export function recoveryRunWriteClassNotice(contextSnapshot: unknown): RecoveryR
         "once it is decided. "
       : "This run's context carries no source issue, so the `request_board_approval` escalation is " +
         "refused here too: this run has no approval write available at all. ") +
-    "Permitted: reads, issue comments, and recording a status disposition. " +
+    `Permitted: ${STATUS_ONLY_PERMITTED_WRITES_TEXT}. ` +
     "One of those refusals is also the only escalation channel off this lane: if the work this run " +
     "must finish genuinely needs an issue-document write, attempt it rather than skipping it on " +
     "the strength of this notice. The refusal is recorded against this run, and the next " +

@@ -9,6 +9,7 @@ import {
   REFUSED_APPROVAL_OPERATIONS,
   scrubRecoveryModelProfileHints,
   STATUS_ONLY_RECOVERY_GUARD_CONTEXT,
+  STATUS_ONLY_PERMITTED_WRITES,
   statusOnlyEscalationSourceIssueId,
   STATUS_ONLY_RESUME_PREAMBLE,
   STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
@@ -314,6 +315,57 @@ describe("recovery run write class", () => {
     for (const snapshot of [STATUS_ONLY_WITH_SOURCE, STATUS_ONLY_WITHOUT_SOURCE]) {
       expect(recoveryRunWriteClassNotice(snapshot) ?? "").not.toMatch(/only (reachable )?exit/i);
     }
+  });
+
+  // PEN-3275 round 7. The comment above is right that the `Permitted:` sentence is half the exit
+  // enumeration, but the assertion above pins only the ABSENCE of an "only exit" literal — and a
+  // bare three-item list does not contain that literal. So the enumeration silently dropped monitor
+  // arming, the status-adjudication upsert, and monitor clearing, and this suite stayed green. An
+  // absence pin cannot catch an omission; these two assert the coupling itself.
+  //
+  // Each row below is a write the notice refuses CONDITIONALLY. A conditional refusal asserts the
+  // write is sometimes available, so the permitted side must name it too — otherwise the notice
+  // refuses in one sentence what it declines to offer in the next, and a compliant agent plans
+  // around the shorter list. `issue_monitor_recovery` is dispatched status-only specifically to
+  // re-arm a just-cleared monitor, so that agent is the one this costs. Add a conditional refusal,
+  // add a row.
+  const CONDITIONAL_REFUSALS = [
+    {
+      write: "monitor arming",
+      refusal: /arming issue monitors while a recovery action is active/,
+      permitted: /arming an issue monitor when no recovery action covers/,
+    },
+    {
+      write: "status-adjudication document upsert",
+      refusal: /writing issue documents other than upserting the status-adjudication document/,
+      permitted: /upserting the status-adjudication document/,
+    },
+  ] as const;
+
+  it("names every conditionally refused write on the permitted side too", () => {
+    for (const snapshot of [STATUS_ONLY_WITH_SOURCE, STATUS_ONLY_WITHOUT_SOURCE]) {
+      const notice = recoveryRunWriteClassNotice(snapshot) ?? "";
+      const permittedIndex = notice.indexOf("Permitted:");
+      expect(permittedIndex).toBeGreaterThan(-1);
+      // Sliced deliberately: matching the whole notice would be satisfied by the refusal clause
+      // itself, which is exactly the contradiction under test.
+      const permitted = notice.slice(permittedIndex);
+      for (const { write, refusal, permitted: onPermittedSide } of CONDITIONAL_REFUSALS) {
+        expect(notice, `${write}: refusal clause`).toMatch(refusal);
+        expect(permitted, `${write}: permitted side`).toMatch(onPermittedSide);
+      }
+    }
+  });
+
+  it("renders every permitted-write entry into the status-only notice", () => {
+    for (const snapshot of [STATUS_ONLY_WITH_SOURCE, STATUS_ONLY_WITHOUT_SOURCE]) {
+      const notice = recoveryRunWriteClassNotice(snapshot) ?? "";
+      for (const entry of STATUS_ONLY_PERMITTED_WRITES) expect(notice).toContain(entry);
+    }
+    // Clearing is permitted OUTRIGHT — `assertCanManageIssueMonitor` skips the containment gate
+    // when `monitorArmed === false`. Pinned apart from the loop so a tidy-up that folds it into the
+    // arming entry's condition, and thereby under-states it, fails here.
+    expect(STATUS_ONLY_PERMITTED_WRITES).toContain("clearing an issue monitor");
   });
 
   // BLO-34683 made the monitor-arm guard conditional: `assertMonitorArmingAllowedByRunContext`
