@@ -1418,6 +1418,81 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(recoveryWakeups).toHaveLength(0);
   });
 
+  // BLO-35155: the grace window is a proxy for "the woken run never called back",
+  // and on a congested lane 38% of runs start AFTER it expires — so the sweep was
+  // clearing monitors whose own woken run was still queued and about to re-arm.
+  // Both directions are asserted here on purpose: a one-sided test passes on code
+  // that never reaps anything at all.
+  it("leaves a triggered monitor alone while its woken run is still queued past the grace", async () => {
+    const { companyId, agentId, issueId, lastTriggeredAt } = await seedExpiredTriggeredFixture({ timeoutAt: null });
+    const runId = randomUUID();
+    // Created just after the trigger, still undispatched 6h later — the measured
+    // shape (BLO-26675: created 09:26Z, startedAt 15:47Z).
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "queued",
+      invocationSource: "scheduled",
+      createdAt: new Date(lastTriggeredAt.getTime() + 1000),
+      contextSnapshot: { issueId, wakeReason: "issue_monitor_due" },
+    });
+
+    const heartbeat = createHeartbeat();
+    const tickAt = new Date(lastTriggeredAt.getTime() + ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS + 2 * 60 * 60 * 1000);
+    await heartbeat.tickTimers(tickAt);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "triggered",
+      clearReason: null,
+    });
+    expect(issue.monitorWakeRequestedAt).toBeNull();
+
+    // Other direction: once that run reaches a terminal state nothing will re-arm
+    // the monitor, so BLO-29606's reap must still fire, unchanged.
+    await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, runId));
+    const laterTick = new Date(tickAt.getTime() + 60 * 1000);
+    await heartbeat.tickTimers(laterTick);
+
+    const reaped = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(parseIssueExecutionState(reaped.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "trigger_stalled",
+    });
+    const recoveryWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows.filter((row) => row.reason === "issue_monitor_recovery"));
+    expect(recoveryWakeups).toHaveLength(1);
+  });
+
+  // AC3 / BLO-35155: the live-run guard is scoped to the no-`timeoutAt` fallback
+  // only. An explicit operator deadline is authoritative and still expires at its
+  // instant even with a queued run outstanding. This is what fails if the guard
+  // is attached to the wrong branch of the OR.
+  it("still expires a past explicit timeoutAt while a run for the issue is queued", async () => {
+    const { companyId, agentId, issueId, timeoutAt, lastTriggeredAt } = await seedExpiredTriggeredFixture();
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      status: "queued",
+      invocationSource: "scheduled",
+      createdAt: new Date(lastTriggeredAt.getTime() + 1000),
+      contextSnapshot: { issueId, wakeReason: "issue_monitor_due" },
+    });
+
+    const heartbeat = createHeartbeat();
+    await heartbeat.tickTimers(new Date(timeoutAt!.getTime() + 60 * 1000));
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+    });
+  });
+
   // Regression guard: an operator-supplied deadline stays authoritative. A monitor
   // whose timeoutAt is still in the future is NOT pre-empted by the grace window,
   // even once the trigger is older than the grace.
