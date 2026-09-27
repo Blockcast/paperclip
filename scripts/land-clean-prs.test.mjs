@@ -156,6 +156,21 @@ describe("classifyPr rule order", () => {
       assert.equal(classify({ mergeStateStatus: state }).action, "enqueue");
     }
   });
+
+  it("holds UNSTABLE even when the check rule passes, because gh would merge it outright", () => {
+    // `gh pr merge --auto` merges immediately for CLEAN, HAS_HOOKS and UNSTABLE
+    // (cli/cli isImmediatelyMergeable). A red Ally verdict status is ignored by
+    // the check rule, so the mergestate rule is the only thing holding this PR.
+    const row = classify({
+      mergeStateStatus: "UNSTABLE",
+      statusCheckRollup: [
+        { name: "verify", conclusion: "SUCCESS" },
+        { __typename: "StatusContext", context: "gate/ally-comment-findings", state: "FAILURE" },
+      ],
+    });
+    assert.equal(row.action, "skip");
+    assert.equal(row.reason, "mergestate:UNSTABLE");
+  });
 });
 
 describe("Ally verdict selection (BLO-32240)", () => {

@@ -163,7 +163,16 @@ const ALLY_VERDICT_STATUS_RE = /^(?:review|gate)\/ally-/i;
  * Merge states that mean the PR cannot land as it stands. BLOCKED and BEHIND
  * are deliberately absent: BLOCKED is the normal state of a PR awaiting the
  * code-owner approval we may have just requested, and BEHIND is what the merge
- * queue exists to resolve. `--auto` waits for both correctly.
+ * queue exists to resolve. gh never merges either outright, so `--auto` arms
+ * and waits where auto-merge is available and lands in `enqueue-failed` where
+ * it is not.
+ *
+ * This set is also a merge gate, not only a hold list. `gh pr merge --auto`
+ * merges immediately instead of arming when the state is CLEAN, HAS_HOOKS or
+ * UNSTABLE (`isImmediatelyMergeable`, cli/cli `pkg/cmd/pr/merge/merge.go`).
+ * UNSTABLE is a non-passing status the check rule can miss, because that rule
+ * ignores Ally verdict statuses by design, so dropping it here turns a hold
+ * into an immediate merge past a red status. A test pins it.
  */
 const UNLANDABLE_MERGE_STATES = new Set(["DIRTY", "UNSTABLE", "UNKNOWN"]);
 
