@@ -35061,7 +35061,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       cooldownSec: policy.cooldownSec,
       lastHeartbeatAt: agent.lastHeartbeatAt,
     });
-    if (cooldown.active) {
+    // BLO-34578 review: the scheduler's own ticks are exempt. `tickTimers` only
+    // gets here once `intervalSec` has elapsed since the agent's last TIMER tick,
+    // and an enabled policy clamps `cooldownSec` to `intervalSec`, so the
+    // cooldown adds nothing for them. What it would add is the old
+    // `lastHeartbeatAt` baseline: every run stamps that column, so an event-busy
+    // agent would have each tick spent here, and this skip row is itself a timer
+    // row, so it advances the baseline and the tick is lost. Timer-sourced wakes
+    // from the API are still throttled.
+    const schedulerTimerTick =
+      opts.requestedByActorType === "system" && opts.requestedByActorId === "heartbeat_scheduler";
+    if (cooldown.active && !schedulerTimerTick) {
       await writeSkippedRequest("heartbeat.cooldown.active");
       logger.debug(
         { agentId, source, cooldownSec: policy.cooldownSec, cooldownRemainingSec: cooldown.remainingSec, preset: policy.preset },
@@ -40059,27 +40069,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // timer ledger is the loop's own concern. Writing it here leaves the
       // capacity gate's contract untouched — `durableSkipReason` stays null, the
       // wake is still postponed rather than declined — while recording the true
-      // fact that the timer evaluated this agent at `now`. Same shape as the two
-      // skip writers above, including the `lastHeartbeatAt` bump, so an agent
-      // still on the fallback below behaves identically.
+      // fact that the timer evaluated this agent at `now`. Unlike the two skip
+      // writers above it leaves `lastHeartbeatAt` alone: no run happened, and no
+      // reader on the timer path uses that column any more (the baseline below is
+      // the timer row or `createdAt`, and the cooldown exempts scheduler ticks),
+      // so a bump would only keep the liveness signal fresh for the length of a
+      // capacity outage.
       const writeTimerProviderCapacityDeferred = async (agent: typeof agents.$inferSelect) => {
-        await db.transaction(async (tx) => {
-          await tx.insert(agentWakeupRequests).values({
-            companyId: agent.companyId,
-            agentId: agent.id,
-            source: "timer",
-            triggerDetail: "system",
-            reason: "provider_capacity_deferred",
-            payload: { heartbeatSkip: { reason: "provider_capacity_deferred" } },
-            status: "skipped",
-            requestedByActorType: "system",
-            requestedByActorId: "heartbeat_scheduler",
-            finishedAt: now,
-          });
-          await tx
-            .update(agents)
-            .set({ lastHeartbeatAt: now, updatedAt: now })
-            .where(eq(agents.id, agent.id));
+        await db.insert(agentWakeupRequests).values({
+          companyId: agent.companyId,
+          agentId: agent.id,
+          source: "timer",
+          triggerDetail: "system",
+          reason: "provider_capacity_deferred",
+          payload: { heartbeatSkip: { reason: "provider_capacity_deferred" } },
+          status: "skipped",
+          requestedByActorType: "system",
+          requestedByActorId: "heartbeat_scheduler",
+          finishedAt: now,
         });
       };
 
@@ -40127,7 +40134,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // baseline from it needs no new column and no new state key. Batched here
       // rather than queried per-agent in the loop, same as
       // `assignedLiveWorkAgentIds` above, and served by the partial index
-      // `agent_wakeup_requests_timer_baseline_idx` (migration 0246) — the
+      // `agent_wakeup_requests_timer_baseline_idx` (migration 0247) — the
       // pre-existing `(agent_id, requested_at)` index does NOT cover this, since
       // it carries no `source` column and would make each agent's whole
       // append-only history the scan bound on the largest table in the schema.

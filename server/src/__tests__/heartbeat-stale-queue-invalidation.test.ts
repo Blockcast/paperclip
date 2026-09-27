@@ -301,7 +301,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
   });
 
   it("rate-limits skipped generic timer wakes by advancing the timer baseline", async () => {
-    const { agentId } = await seedCompanyAndAgent({
+    const { companyId, agentId } = await seedCompanyAndAgent({
       heartbeatConfig: {
         enabled: true,
         intervalSec: 60,
@@ -309,9 +309,25 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       },
     });
     const now = new Date();
+    const lastTimerTickAt = new Date(now.getTime() - 120_000);
+    // The timer baseline is the agent's last `source: "timer"` wakeup row, not
+    // `lastHeartbeatAt` (BLO-34578), so the tick is armed by seeding that row
+    // outside the 60s interval.
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "timer",
+      triggerDetail: "system",
+      reason: "heartbeat_timer",
+      status: "completed",
+      requestedByActorType: "system",
+      requestedByActorId: "heartbeat_scheduler",
+      requestedAt: lastTimerTickAt,
+      finishedAt: lastTimerTickAt,
+    });
     await db
       .update(agents)
-      .set({ lastHeartbeatAt: new Date(now.getTime() - 120_000) })
+      .set({ lastHeartbeatAt: lastTimerTickAt })
       .where(eq(agents.id, agentId));
 
     const firstTick = await heartbeat.tickTimers(now);
@@ -324,16 +340,20 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     const wakeups = await db
       .select({ reason: agentWakeupRequests.reason })
       .from(agentWakeupRequests)
-      .where(eq(agentWakeupRequests.agentId, agentId));
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .orderBy(agentWakeupRequests.requestedAt);
     const [agent] = await db
       .select({ lastHeartbeatAt: agents.lastHeartbeatAt })
       .from(agents)
       .where(eq(agents.id, agentId));
 
-    expect(wakeups).toHaveLength(1);
-    expect(wakeups[0]?.reason).toBe("heartbeat.timer.no_actionable_work");
+    // The seeded tick, then exactly one skip: the second pass wrote nothing.
+    expect(wakeups.map((wakeup) => wakeup.reason)).toEqual([
+      "heartbeat_timer",
+      "heartbeat.timer.no_actionable_work",
+    ]);
     expect(agent?.lastHeartbeatAt).toBeInstanceOf(Date);
-    expect(agent?.lastHeartbeatAt?.getTime()).toBeGreaterThan(now.getTime() - 120_000);
+    expect(agent?.lastHeartbeatAt?.getTime()).toBeGreaterThan(lastTimerTickAt.getTime());
   });
 
   it("allows generic timer wakes when the agent has assigned todo work", async () => {

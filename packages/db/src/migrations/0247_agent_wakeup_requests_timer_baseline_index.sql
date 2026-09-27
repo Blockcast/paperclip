@@ -55,13 +55,13 @@ BEGIN
     )
     THEN
       RAISE EXCEPTION USING
-        MESSAGE = 'migration 0246 found an invalid or incorrectly defined timer baseline index',
+        MESSAGE = 'migration 0247 found an invalid or incorrectly defined timer baseline index',
         HINT = 'Run DROP INDEX CONCURRENTLY IF EXISTS agent_wakeup_requests_timer_baseline_idx; then CREATE INDEX CONCURRENTLY agent_wakeup_requests_timer_baseline_idx ON agent_wakeup_requests USING btree (agent_id, requested_at DESC) WHERE source = ''timer''; then retry migrations.';
     END IF;
   ELSE
     IF EXISTS (SELECT 1 FROM "agent_wakeup_requests" LIMIT 1) THEN
       RAISE EXCEPTION USING
-        MESSAGE = 'migration 0246 requires online index precreation',
+        MESSAGE = 'migration 0247 requires online index precreation',
         HINT = 'Run CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_wakeup_requests_timer_baseline_idx ON agent_wakeup_requests USING btree (agent_id, requested_at DESC) WHERE source = ''timer''; then retry migrations.';
     END IF;
 
@@ -70,7 +70,7 @@ BEGIN
     LOCK TABLE "agent_wakeup_requests" IN SHARE MODE;
     IF EXISTS (SELECT 1 FROM "agent_wakeup_requests" LIMIT 1) THEN
       RAISE EXCEPTION USING
-        MESSAGE = 'migration 0246 requires online index precreation',
+        MESSAGE = 'migration 0247 requires online index precreation',
         HINT = 'Run CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_wakeup_requests_timer_baseline_idx ON agent_wakeup_requests USING btree (agent_id, requested_at DESC) WHERE source = ''timer''; then retry migrations.';
     END IF;
 
