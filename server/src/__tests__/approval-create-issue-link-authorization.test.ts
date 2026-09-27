@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { APPROVAL_LINKED_ISSUE_IDS_MAX } from "@paperclipai/shared";
 
 /**
  * BLO-23763: `POST /companies/:companyId/approvals` accepted an `issueIds` array
@@ -391,6 +392,32 @@ describe("POST /companies/:companyId/approvals — issueIds authorization (BLO-2
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(res.body.details.refusedIssueIds).toEqual([PEER_ISSUE_ID]);
+  });
+
+  it("rejects an issueIds array over the cap before authorizing any id", async () => {
+    // Ally review, PR #1271: every id costs a sequential issue read plus an
+    // authorization decision, even one that does not exist, so an uncapped array
+    // made one request as expensive as the JSON body limit allows.
+    mockIssueService.getById.mockResolvedValue(makeIssue());
+    const app = await createApp(agentActor());
+
+    const overCap = await request(app)
+      .post(`/api/companies/${COMPANY_ID}/approvals`)
+      .send(createBody(Array.from({ length: APPROVAL_LINKED_ISSUE_IDS_MAX + 1 }, () => OWN_ISSUE_ID)));
+
+    expect(overCap.status, JSON.stringify(overCap.body)).toBe(400);
+    expect(overCap.body.details).toContainEqual(
+      expect.objectContaining({ code: "too_big", path: ["issueIds"] }),
+    );
+    expect(mockIssueService.getById).not.toHaveBeenCalled();
+    expect(mockApprovalService.createWithIdempotency).not.toHaveBeenCalled();
+
+    // The control: the cap itself is accepted, so the 400 above is the bound.
+    const atCap = await request(app)
+      .post(`/api/companies/${COMPANY_ID}/approvals`)
+      .send(createBody(Array.from({ length: APPROVAL_LINKED_ISSUE_IDS_MAX }, () => OWN_ISSUE_ID)));
+
+    expect([200, 201], JSON.stringify(atCap.body)).toContain(atCap.status);
   });
 
   it("leaves board actors unaffected", async () => {

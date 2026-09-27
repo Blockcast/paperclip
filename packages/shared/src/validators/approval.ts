@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { APPROVAL_STATUSES, APPROVAL_TYPES } from "../constants.js";
+import { APPROVAL_LINKED_ISSUE_IDS_MAX, APPROVAL_STATUSES, APPROVAL_TYPES } from "../constants.js";
 import { multilineTextSchema } from "./text.js";
 
 const approvalTitleMessage =
@@ -100,7 +100,7 @@ export const createApprovalSchema = z.object({
   type: z.enum(APPROVAL_TYPES),
   requestedByAgentId: z.string().uuid().optional().nullable(),
   payload: approvalPayloadSchema,
-  issueIds: z.array(z.string().uuid()).optional(),
+  issueIds: z.array(z.string().uuid()).max(APPROVAL_LINKED_ISSUE_IDS_MAX).optional(),
   idempotencyKey: z
     .string()
     .trim()

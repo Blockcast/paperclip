@@ -689,6 +689,15 @@ export type ApprovalStatus = (typeof APPROVAL_STATUSES)[number];
 export const APPROVAL_UNDECIDED_STATUSES = ["pending", "revision_requested"] as const;
 export type ApprovalUndecidedStatus = (typeof APPROVAL_UNDECIDED_STATUSES)[number];
 
+/**
+ * Most issues one approval may link at creation (`issueIds` on approval create,
+ * `sourceIssueIds` on agent hire). Each id is authorized on its own, sequentially,
+ * before anything is written, so an uncapped array let one request queue one issue
+ * read plus an authorization decision per element, bounded only by the JSON body
+ * limit (PR #1271). Matches the issue-id arrays on task-bridge key scopes.
+ */
+export const APPROVAL_LINKED_ISSUE_IDS_MAX = 50;
+
 export const SECRET_PROVIDERS = [
   "local_encrypted",
   "aws_secrets_manager",

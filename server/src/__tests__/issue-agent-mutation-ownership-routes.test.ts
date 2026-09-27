@@ -4221,6 +4221,43 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueApprovalService.link).not.toHaveBeenCalled();
   });
 
+  // Ally review, PR #1271: a creator/manager-chain refusal carries the grant's
+  // *allow* reason, which `deniedBoundaryReason` maps to its `deny_missing_grant`
+  // fallback. Without `boundaryReason` the row claimed the actor held no grant when
+  // it held a comment-only one, and nothing on the row recovered the truth.
+  it("records the verbatim grant reason when refusing a manager-chain approval link", async () => {
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action !== "tasks:manage_active_checkouts",
+      action: input.action,
+      reason:
+        input.action === "issue:mutate"
+          ? "allow_manager_chain"
+          : input.action === "tasks:manage_active_checkouts"
+          ? "deny_missing_grant"
+          : "allow_explicit_grant",
+      explanation: "Manager-chain test boundary.",
+    }));
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo" }));
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/approvals`)
+      .send({ approvalId: "88888888-8888-4888-8888-888888888888" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.details.reason).toBe("allow_manager_chain");
+    expect(mockIssueApprovalService.link).not.toHaveBeenCalled();
+    const call = mockLogActivity.mock.calls.find(
+      ([, entry]) => (entry as { action?: string }).action === "issue_write_denied",
+    );
+    expect(call, "expected an issue_write_denied record for the manager-chain refusal").toBeTruthy();
+    expect((call![1] as { details: Record<string, unknown> }).details).toMatchObject({
+      attemptedAction: "issue:mutate",
+      reason: "deny_missing_grant",
+      boundaryReason: "allow_manager_chain",
+      responseStatus: 403,
+    });
+  });
+
   it.each([
     [
       "issue create",
@@ -5731,6 +5768,24 @@ describe("agent issue mutation checkout ownership", () => {
         .send({ status: "done", comment: "Stage decision." });
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.assertPendingReviewRunOwnership).not.toHaveBeenCalled();
+    });
+
+    // A deliberate exception, named in the approval-link evaluator's header (Ally,
+    // PR #1271): an inert approval card is not a stage decision, and the fence's
+    // terminal-lock cleanup is a write the side-effect-free evaluator must not
+    // make. Pinned so reinstating the fence, or dropping it from the header, has to
+    // change this test too.
+    it("does not fence the assignee's second run off linking an approval to its own pending review", async () => {
+      allowCommentDecide();
+      mockIssueService.getById.mockResolvedValue(await lockedPendingReviewForOwner());
+
+      const res = await request(await createApp(ownerActorFromSweepRun()))
+        .post(`/api/issues/${issueId}/approvals`)
+        .send({ approvalId: "88888888-8888-4888-8888-888888888888" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueApprovalService.link).toHaveBeenCalled();
       expect(mockIssueService.assertPendingReviewRunOwnership).not.toHaveBeenCalled();
     });
 

@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { APPROVAL_LINKED_ISSUE_IDS_MAX } from "@paperclipai/shared";
 
 /**
  * BLO-24699 AC #4: `POST /companies/:companyId/agent-hires` is the third door to a
@@ -348,6 +349,26 @@ describe("agent-hires sourceIssueIds authorization (BLO-24699)", () => {
     // Proves the hire actually proceeded rather than merely failing some other way.
     expect(mockAgentService.create).toHaveBeenCalled();
     expect(mockIssueApprovalService.linkManyForApproval).not.toHaveBeenCalled();
+  }, ROUTE_IMPORT_TIMEOUT_MS);
+
+  it("rejects a sourceIssueIds array over the cap before authorizing any id", async () => {
+    // Ally review, PR #1271: the same per-id authorization loop as approval create,
+    // so the same uncapped-array amplifier, closed by the same shared bound.
+    mockIssueService.getById.mockImplementation(async (id: string) =>
+      id === PEER_ISSUE_ID ? peerIssue() : null,
+    );
+
+    const res = await request(await createApp())
+      .post(`/api/companies/${COMPANY_ID}/agent-hires`)
+      .send(hireBody(Array.from({ length: APPROVAL_LINKED_ISSUE_IDS_MAX + 1 }, () => PEER_ISSUE_ID)));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    // The bound, not some other validation failure in the body.
+    expect(res.body.details).toContainEqual(
+      expect.objectContaining({ code: "too_big", path: ["sourceIssueIds"] }),
+    );
+    expect(mockIssueService.getById).not.toHaveBeenCalled();
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
   }, ROUTE_IMPORT_TIMEOUT_MS);
 
   it("refuses a stale task-watchdog source link with 409, matching the link route", async () => {
