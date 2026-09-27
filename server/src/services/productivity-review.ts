@@ -1987,8 +1987,8 @@ function isUnchangedSampleClosableTriggerSet(triggers: unknown) {
 //
 // The overlap is the norm rather than a corner, on the file's own arithmetic:
 // `runtimeFailure` fires at `runtimeFailureStreak >= noCommentStreakRuns` and
-// `highChurn` at `runCountLastHour >= highChurnHourly` (one of its two
-// disjuncts; the six-hour arm only widens the overlap), both defaulting to 10,
+// `highChurn` at `runCountLastHour >= highChurnHourly` (one of its four
+// disjuncts; the six-hour arms only widen the overlap), both defaulting to 10,
 // and `countIssueRunsSince` is an unfiltered count — infra-failure runs count
 // toward churn in full. Ten fast infra-failing runs inside an hour trip both.
 // Retiring that row would destroy the `high_churn` cost record permanently:
