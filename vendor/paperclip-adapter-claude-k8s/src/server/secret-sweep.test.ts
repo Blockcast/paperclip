@@ -195,8 +195,13 @@ describe("sweepOrphanedRunSecrets", () => {
   // execute.ts call site cannot produce NaN (asNumber filters it), but this
   // function is exported with `ageFloorMs?: number`, so the guard must hold
   // without relying on a caller one module away.
-  it("rejects a non-finite caller floor instead of disarming the age check", async () => {
-    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY]) {
+  //
+  // it.each, not a `for` loop: both values shared one `it`, so a failure named
+  // neither and the loop short-circuited — a broken NaN arm meant you never
+  // learned whether Infinity had also regressed.
+  it.each([Number.NaN, Number.POSITIVE_INFINITY])(
+    "rejects %p as a caller floor instead of disarming the age check",
+    async (bad) => {
       const h = harness([secret("ac-agent-run-nan-prompt", { runId: "run-nan", ageSec: 5 })]);
 
       const result = await sweepOrphanedRunSecrets({ ...h.opts, ageFloorMs: bad });
@@ -209,13 +214,16 @@ describe("sweepOrphanedRunSecrets", () => {
       ]);
       expect(h.deleteNamespacedSecret).not.toHaveBeenCalled();
       // And the rejection is reported: `NaN < x` is false, so a `<` test here
-      // would be silently skipped.
+      // would be silently skipped. This assertion is also the ONLY one that
+      // fails on the Infinity arm — every other observable reads like correct
+      // behaviour there — so it is not incidental to a test about age floors.
       expect(h.logs).toHaveLength(1);
-      expect(h.logs[0].message).toContain("age floor raised");
-    }
-  });
+      expect(h.logs[0].message).toContain("age floor overridden");
+    },
+  );
 
-  it("still honours a caller floor above the minimum", async () => {    // The clamp is one-directional: it raises an unsafe floor, and must not
+  it("still honours a caller floor above the minimum", async () => {
+    // The clamp is one-directional: it raises an unsafe floor, and must not
     // lower a deliberately conservative one.
     const h = harness([secret("ac-agent-run-conservative-prompt", { runId: "run-c", ageSec: 3600 })]);
 
@@ -238,7 +246,7 @@ describe("sweepOrphanedRunSecrets", () => {
     await sweepOrphanedRunSecrets({ ...h.opts, ageFloorMs: 60_000 });
     expect(h.logs).toHaveLength(1);
     expect(h.logs[0].stream).toBe("stderr");
-    expect(h.logs[0].message).toContain("60000ms");
+    expect(h.logs[0].message).toContain("requested 60000");
     expect(h.logs[0].message).toContain(`${MIN_SWEEP_AGE_FLOOR_SEC * 1000}ms`);
 
     // Above the minimum, and the default path (ageFloorMs undefined): no clamp

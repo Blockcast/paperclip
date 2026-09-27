@@ -260,6 +260,13 @@ export async function sweepOrphanedRunSecrets(opts: SweepOptions): Promise<Sweep
   // cannot produce NaN (asNumber filters it), but this function is exported
   // with `ageFloorMs?: number`, so the clamp must not depend on a guarantee
   // held in another module.  Infinity is rejected for the same reason.
+  //
+  // The highest-consequence value isFinite rejects is `undefined`, and that is
+  // why `!Number.isNaN(opts.ageFloorMs)` is NOT an equivalent simplification:
+  // Number.isNaN(undefined) is false (unlike global isNaN), so undefined would
+  // pass through to Math.max(300000, undefined) -> NaN -> age check disarmed
+  // on the DEFAULT path, and live Secrets get deleted.  The old `?? DEFAULT`
+  // handled undefined structurally; isFinite now carries that job implicitly.
   const ageFloorMs = Math.max(
     MIN_SWEEP_AGE_FLOOR_SEC * 1000,
     Number.isFinite(opts.ageFloorMs)
@@ -270,10 +277,12 @@ export async function sweepOrphanedRunSecrets(opts: SweepOptions): Promise<Sweep
   // that deliberately sets a low floor otherwise gets 300s with no signal, and
   // has to infer the clamp from behaviour.  `!==` rather than `<` so a rejected
   // non-finite floor is reported too -- `NaN < x` is false and would be silent.
+  // "overridden", not "raised": `!==` covers the lowering too (Infinity yields
+  // the 900000 default, which went DOWN), so the verb has to cover both.
   if (opts.ageFloorMs !== undefined && opts.ageFloorMs !== ageFloorMs) {
     await onLog(
       "stderr",
-      `[paperclip] Orphan-secret sweep age floor raised to ${ageFloorMs}ms (requested ${opts.ageFloorMs}ms)\n`,
+      `[paperclip] Orphan-secret sweep age floor overridden to ${ageFloorMs}ms (requested ${opts.ageFloorMs})\n`,
     );
   }
   const now = opts.now ?? Date.now();
