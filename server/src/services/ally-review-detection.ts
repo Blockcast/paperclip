@@ -301,12 +301,12 @@ const COUNTED_FINDINGS_BUCKET_PATTERN = new RegExp(
   "gim",
 );
 
-// Ally's disposition vocabulary is three words: `fixed` and
-// `no-longer-applicable` retire a prior finding, `still-present` asserts it
-// stands. That matches scripts/check-ally-review-consistency.mjs, which treats
-// `still-present` alone as a blocking verdict (I2c). `no-longer-applicable`
-// means the finding does not apply to this code — often that it was incorrect
-// as filed — so it retires without implying anything changed.
+// Ally's disposition vocabulary. `fixed` and `no-longer-applicable` retire a
+// prior finding, `still-present` asserts it stands. That matches
+// scripts/check-ally-review-consistency.mjs, which treats `still-present` alone
+// as a blocking verdict (I2c). `no-longer-applicable` means the finding does
+// not apply to this code — often that it was incorrect as filed — so it retires
+// without implying anything changed.
 //
 // An unrecognized verb deliberately does NOT retire. The failure modes are
 // asymmetric: failing closed on a new verb leaves a PR visibly red until
@@ -321,6 +321,29 @@ const RESOLVED_PRIOR_DISPOSITIONS = new Set(["fixed", "no-longer-applicable"]);
 // `still-present` is self-explanatory, whereas one held red by a verb nobody
 // taught this parser is a mystery worth naming.
 const BLOCKING_PRIOR_DISPOSITIONS = new Set(["still-present"]);
+
+// The verb for a finding the reviewer accepts as real and has deliberately
+// deferred to a follow-up issue (BLO-36903). Before it existed, that state had
+// no truthful spelling: `fixed` and `no-longer-applicable` are both false of a
+// live defect, and `still-present` — the only honest option left — blocks. So
+// Ally's own recommended landing path ("track it on a follow-up and land") was
+// unreachable through the ledger, and the residual had to be demoted to prose,
+// which is exactly where a record stops being auditable.
+//
+// It is a THIRD kind rather than a member of RESOLVED_PRIOR_DISPOSITIONS, and
+// that distinction is the whole point: `retires` means the defect is gone,
+// `defers` means it is still there and someone decided to ship anyway. Both
+// stop holding a PR red; only one of them is clean. Callers that collapse the
+// two lose the ability to tell a human approver which happened, which AC2 of
+// BLO-36903 exists to prevent.
+//
+// Companion contract change, in Ally's own instructions: a `tracked` item is
+// NOT mirrored into the current head's counted bucket, where `still-present`
+// is. That mirroring is what actually holds a current head red — the gate
+// short-circuits on a non-zero bucket before it ever reads the ledger — so the
+// verb alone would have changed nothing on the shape that motivated it. The
+// ledger keeps the record; the bucket stops asserting a fix is owed.
+const DEFERRED_PRIOR_DISPOSITIONS = new Set(["tracked"]);
 
 /** One finding, identified the way Ally's ledger identifies it. */
 export interface AllyFindingRef {
@@ -340,8 +363,13 @@ export interface AllyDispositionedPriorFinding extends AllyFindingRef {
  * `unrecognized` is not an error state — it is the fail-closed branch. It
  * exists as its own kind purely so a gate can say *why* a finding was not
  * retired instead of leaving a silently unexplained red.
+ *
+ * `defers` and `retires` both stop a finding holding a PR red, and are
+ * deliberately not merged: `retires` asserts the defect is gone, `defers`
+ * asserts it is still there and was accepted. A caller that treats them alike
+ * reports a deferral as clean, which is the misstatement BLO-36903 filed.
  */
-export type PriorDispositionKind = "retires" | "blocks" | "unrecognized";
+export type PriorDispositionKind = "retires" | "defers" | "blocks" | "unrecognized";
 
 export interface AllyPriorFindingDisposition extends AllyDispositionedPriorFinding {
   /** The verb exactly as written, lowercased. */
@@ -352,6 +380,7 @@ export interface AllyPriorFindingDisposition extends AllyDispositionedPriorFindi
 export function classifyPriorDisposition(disposition: string): PriorDispositionKind {
   const verb = disposition.trim().toLowerCase();
   if (RESOLVED_PRIOR_DISPOSITIONS.has(verb)) return "retires";
+  if (DEFERRED_PRIOR_DISPOSITIONS.has(verb)) return "defers";
   if (BLOCKING_PRIOR_DISPOSITIONS.has(verb)) return "blocks";
   return "unrecognized";
 }
