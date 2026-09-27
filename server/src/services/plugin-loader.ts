@@ -616,24 +616,38 @@ export function buildPluginInstallArgs(
  * behaviour rather than taking a working plugin offline. A tree that installs
  * but still has no SDK is caught downstream by the consistency guard, as it is
  * now.
+ *
+ * `fallbackToLegacyPeerDeps: false` opts out, and the SDK-tree repair path is
+ * the one caller that does. There the retry cannot help *by construction* — it
+ * is exactly the argv that can never place `node_modules/@paperclipai/plugin-sdk`
+ * in the tree — so both of its outcomes are failure: either it throws, or it
+ * "succeeds" and the `requireInstalledInTree` re-probe rejects the tree anyway.
+ * What it does buy is a second 120s timeout and a second `--save` write over the
+ * tree, inside the serial boot loop that `loadAll()` awaits *before* selecting
+ * ready rows. With the four `ISOLATED_SDK_PLUGIN_PACKAGES` latched and a slow or
+ * unreachable registry, that is every plugin — healthy ones included — waiting
+ * ~16 minutes instead of ~8.
  */
-async function npmInstallPlugin(
+export async function npmInstallPlugin(
   spec: string,
   targetInstallDir: string,
-  options: { installPeers: boolean },
+  options: { installPeers: boolean; fallbackToLegacyPeerDeps?: boolean },
 ): Promise<void> {
   // --cache uses a writable temp dir to avoid EPERM on root-owned ~/.npm cache.
   const npmCacheDir = path.join(os.tmpdir(), "paperclip-npm-cache");
-  const run = (installPeers: boolean): Promise<unknown> =>
+  const run = async (installPeers: boolean): Promise<void> => {
     // execFile (not exec) to avoid shell injection from package name/version.
-    execFileAsync("npm", buildPluginInstallArgs(spec, targetInstallDir, npmCacheDir, { installPeers }), {
+    await execFileAsync("npm", buildPluginInstallArgs(spec, targetInstallDir, npmCacheDir, { installPeers }), {
       timeout: 120_000, // 2 minute timeout for npm install
     });
+  };
 
   try {
     await run(options.installPeers);
   } catch (err) {
+    // Only a peer-resolving attempt has a different argv left to try.
     if (!options.installPeers) throw err;
+    if (options.fallbackToLegacyPeerDeps === false) throw err;
     logger.child({ service: "plugin-loader" }).warn(
       { spec, installDir: targetInstallDir, err: err instanceof Error ? err.message : String(err) },
       "plugin-loader: peer-resolving install failed; retrying with --legacy-peer-deps",
@@ -2302,13 +2316,21 @@ export function pluginLoader(
     }
 
     const attempt = spent + 1;
-    // Reinstall at the recorded version: a repair must not silently upgrade the
-    // plugin. Peers are on, which is what pulls the SDK the package declares.
+    // Reinstall at the recorded version where there is one, so a repair does not
+    // silently upgrade the plugin; a row carrying no version has no pin to
+    // restore and resolves `latest`, exactly as the npm install path does. Peers
+    // are on, which is what pulls the SDK the package declares.
     const spec = plugin.version ? `${plugin.packageName}@${plugin.version}` : plugin.packageName;
 
     let failure: string | null = null;
     try {
-      await npmInstallPlugin(spec, probeDir, { installPeers: true });
+      await npmInstallPlugin(spec, probeDir, {
+        installPeers: true,
+        // The legacy retry cannot place a peer, so here it can only add a second
+        // 120s timeout and a second --save write before the identical failure —
+        // inside the serial loop loadAll() awaits. See npmInstallPlugin.
+        fallbackToLegacyPeerDeps: false,
+      });
     } catch (err) {
       failure = err instanceof Error ? err.message : String(err);
     }

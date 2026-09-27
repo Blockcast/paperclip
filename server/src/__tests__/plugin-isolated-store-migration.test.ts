@@ -58,7 +58,7 @@ vi.mock("node:child_process", async (importOriginal) => {
 });
 
 const { createDb, plugins } = await import("@paperclipai/db");
-const { pluginLoader, TORN_STORE_ERROR_MARKER, SDK_NOT_INSTALLED_ERROR_MARKER, buildPluginInstallArgs } =
+const { pluginLoader, TORN_STORE_ERROR_MARKER, SDK_NOT_INSTALLED_ERROR_MARKER, buildPluginInstallArgs, npmInstallPlugin } =
   await import("../services/plugin-loader.js");
 const { ISOLATED_SDK_PLUGIN_PACKAGES, resolveDefaultInstallDir } = await import(
   "../bootstrap/isolated-sdk-plugins.js"
@@ -509,6 +509,51 @@ describeEmbeddedPostgres("BLO-20961 — pre-isolation rows migrate into an isola
     expect(isolatedArgs.join(" ")).not.toContain(SDK_PACKAGE);
   });
 
+  it("retries a failed peer-resolving install with --legacy-peer-deps, and that retry is what keeps the install alive", async () => {
+    // The fallback is this change's central non-regression claim: three of the
+    // four isolated packages are healthy today, and if resolving one of their
+    // peer trees ERESOLVEs we must land the pre-BLO-34795 argv rather than fail
+    // the install outright. Nothing else in the suite reaches the *succeeding*
+    // retry — the budget test fails both invocations, so it only ever pins the
+    // double-failure shape.
+    const dir = await mkdtemp(path.join(os.tmpdir(), "paperclip-fallback-"));
+    cleanupPaths.add(dir);
+
+    npmMock.onInstall = (argv) => {
+      if (!argv.includes(dir)) return;
+      if (!argv.includes("--legacy-peer-deps")) {
+        throw new Error("ERESOLVE could not resolve peer dependency");
+      }
+    };
+
+    await expect(npmInstallPlugin(ISOLATED_PACKAGE, dir, { installPeers: true })).resolves.toBeUndefined();
+
+    const calls = installArgsFor(dir);
+    expect(calls.length).toBe(2);
+    expect(calls[0]).not.toContain("--legacy-peer-deps");
+    expect(calls[1]).toContain("--legacy-peer-deps");
+  }, 30_000);
+
+  it("does not retry when the caller opts out — the SDK repair path must not pay for a retry that cannot help", async () => {
+    // Complement of the test above, and the guard on the repair path's opt-out.
+    // `--legacy-peer-deps` cannot place a peer, so on the repair path the retry
+    // can only add a second 120s timeout and a second --save write before the
+    // identical failure — inside the serial boot loop `loadAll()` awaits before
+    // selecting ready rows. A second call here is the boot-stall regression.
+    const dir = await mkdtemp(path.join(os.tmpdir(), "paperclip-nofallback-"));
+    cleanupPaths.add(dir);
+
+    npmMock.onInstall = (argv) => {
+      if (argv.includes(dir)) throw new Error("ERESOLVE could not resolve peer dependency");
+    };
+
+    await expect(
+      npmInstallPlugin(ISOLATED_PACKAGE, dir, { installPeers: true, fallbackToLegacyPeerDeps: false }),
+    ).rejects.toThrow(/ERESOLVE/);
+
+    expect(installArgsFor(dir).length).toBe(1);
+  }, 30_000);
+
   it("stops reinstalling after the boot budget, leaving the exhausting failure in lastError", async () => {
     process.env["PAPERCLIP_PLUGIN_BOOT_ACTIVATION_RETRY_LIMIT"] = "1";
 
@@ -540,9 +585,13 @@ describeEmbeddedPostgres("BLO-20961 — pre-isolation rows migrate into an isola
     expect(firstBoot?.lastError).toContain("E404 Not Found");
     expect(firstBoot?.lastError).toContain(SDK_NOT_INSTALLED_ERROR_MARKER);
 
-    // Budget is spent across boots, not reset by each one.
+    // Budget is spent across boots, not reset by each one. Exactly one npm call
+    // per attempt: the repair path opts out of the --legacy-peer-deps fallback,
+    // so a failed peer install does not buy a second 120s timeout in the serial
+    // boot loop. `toBe(1)` rather than `toBeGreaterThan(0)` is deliberate — it
+    // is what fails if the opt-out is ever dropped.
     const afterFirstBoot = installArgsFor(isolatedDir).length;
-    expect(afterFirstBoot).toBeGreaterThan(0);
+    expect(afterFirstBoot).toBe(1);
 
     await loader.loadAll();
     const [secondBoot] = await db.select().from(plugins);
