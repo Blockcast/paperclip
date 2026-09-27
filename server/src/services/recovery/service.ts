@@ -13348,6 +13348,7 @@ export function recoveryService(
       exhaustedSkipped: 0,
       cooldownSkipped: 0,
       livePathSkipped: 0,
+      livePathQueuedWakeSkipped: 0,
       interactionSkipped: 0,
       pauseHoldSkipped: 0,
       claimLost: 0,
@@ -13537,11 +13538,19 @@ export function recoveryService(
         result.cooldownSkipped += 1;
         continue;
       }
-      if (
-        await hasActiveExecutionPath(candidate.companyId, candidate.issueId, ownerAgentId) ||
-        await hasQueuedIssueWake(candidate.companyId, candidate.issueId, ownerAgentId)
-      ) {
+      // Split deliberately, and the order is load-bearing: this reproduces the exact
+      // short-circuit of the single `||` it replaces, so a candidate held by a live run
+      // still never evaluates the queued-wake probe. What changes is only that the two
+      // arms are now countable apart. One counter over a union could not say whether the
+      // queued-wake arm was doing any work at all, so BLO-19124 could not size a fix aimed
+      // at it -- if the active-run arm dominates, an age bound on `hasQueuedIssueWake`
+      // moves nothing and nobody could have told.
+      if (await hasActiveExecutionPath(candidate.companyId, candidate.issueId, ownerAgentId)) {
         result.livePathSkipped += 1;
+        continue;
+      }
+      if (await hasQueuedIssueWake(candidate.companyId, candidate.issueId, ownerAgentId)) {
+        result.livePathQueuedWakeSkipped += 1;
         continue;
       }
       if (await hasPendingWakeInteraction(candidate.companyId, candidate.issueId)) {
@@ -13727,6 +13736,7 @@ export function recoveryService(
           exhaustedSkipped: result.exhaustedSkipped,
           cooldownSkipped: result.cooldownSkipped,
           livePathSkipped: result.livePathSkipped,
+          livePathQueuedWakeSkipped: result.livePathQueuedWakeSkipped,
           interactionSkipped: result.interactionSkipped,
           pauseHoldSkipped: result.pauseHoldSkipped,
           claimLost: result.claimLost,
@@ -13742,7 +13752,9 @@ export function recoveryService(
     for (const [reason, count] of [
       ["no_owner", result.noOwnerSkipped], ["cause", result.causeSkipped],
       ["exhausted", result.exhaustedSkipped], ["cooldown", result.cooldownSkipped],
-      ["live_path", result.livePathSkipped], ["interaction", result.interactionSkipped],
+      ["live_path", result.livePathSkipped],
+      ["live_path_queued_wake", result.livePathQueuedWakeSkipped],
+      ["interaction", result.interactionSkipped],
       ["pause_hold", result.pauseHoldSkipped], ["claim_lost", result.claimLost],
       ["deferred_or_failed", result.deferredOrFailed], ["enqueue_failed", result.enqueueFailed],
     ] as const) {
@@ -13935,7 +13947,11 @@ export function recoveryService(
     result.strandedRecoveryWakesHealed = strandedRecoveryWakeBackstop.healed;
     result.strandedRecoveryWakeExhaustedSkipped = strandedRecoveryWakeBackstop.exhaustedSkipped;
     result.strandedRecoveryWakeCooldownSkipped = strandedRecoveryWakeBackstop.cooldownSkipped;
-    result.strandedRecoveryWakeLivePathSkipped = strandedRecoveryWakeBackstop.livePathSkipped;
+    // Stays the union total, which is what this field has always meant. The per-arm split
+    // lives on the sweep result and the metric; widening this roll-up would only add an
+    // unread field, while leaving it at the active-run arm alone would silently under-report.
+    result.strandedRecoveryWakeLivePathSkipped = strandedRecoveryWakeBackstop.livePathSkipped
+      + strandedRecoveryWakeBackstop.livePathQueuedWakeSkipped;
     result.strandedRecoveryWakeDeferredOrFailed = strandedRecoveryWakeBackstop.deferredOrFailed;
     result.strandedRecoveryWakeEnqueueFailed = strandedRecoveryWakeBackstop.enqueueFailed;
     result.strandedRecoveryWakeIssueIds = strandedRecoveryWakeBackstop.issueIds;
