@@ -1224,17 +1224,45 @@ and on one action even both together fall short, so a third source is needed:
 - **The discriminator that row lacks is in the log stream, not in
   `activity_log`.** The responsible-user denial is not silent:
   `throwOrShadowResponsibleUserCompanyAccessDeny` (`routes/authz.ts`) emits a
-  structured `logger.warn` *before* deciding whether to throw, carrying `code`
-  (`RESPONSIBLE_USER_UNAVAILABLE` vs `RESPONSIBLE_USER_UNAUTHORIZED`),
-  `authzMode`, `companyId`, `actorAgentId`, `responsibleUserId` and `method`.
-  Nothing on the cross-tenant or entitlement paths emits it. So correlate a
-  same-company `denied` row against that stream on `actorAgentId` +
-  `companyId` + time: a match is the responsible-user leg, no match is the
-  entitlement denial. Two caveats — it fires in shadow mode too (with
-  `authzMode: "shadow"`), where no denial row is booked to correlate against;
-  and the log stream's retention is not `activity_log`'s, so on an older row
-  the absence of a match may mean the logs aged out rather than that the
-  denial was an entitlement one.
+  structured `logger.warn` *before* deciding whether to throw, carrying
+  `action: "company_access"` — the field that selects these lines out of the
+  stream — plus `code` (`RESPONSIBLE_USER_UNAVAILABLE` vs
+  `RESPONSIBLE_USER_UNAUTHORIZED`), `authzMode`, `companyId`, `actorAgentId`,
+  `responsibleUserId` and `method`. Two limits on what that buys. **`code` does
+  not discriminate here:** all three routes are GETs and the
+  `RESPONSIBLE_USER_UNAUTHORIZED` branch is gated on a non-safe method, so on
+  these paths this emitter can only ever write `RESPONSIBLE_USER_UNAVAILABLE`.
+  **And it is not the only emitter:** `applyResponsibleUserIntersection`
+  (`services/authorization.ts`) writes its own warn — "responsible-user
+  authorization intersection denied" — carrying the same `companyId`,
+  `actorAgentId`, `authzMode` and `code`, but `action: <the authz action>`
+  (`runs:read_transcript` on these routes). It fires only when the **agent**
+  was entitled and its responsible user was not, and that denial *is* booked at
+  the entitlement call site — so an entitlement-path row can carry a warn after
+  all. The claim that holds is the narrower one: nothing on the **cross-tenant**
+  path emits a warn, and an entitlement denial where the **agent** lacked the
+  grant emits none either. Filter on `action` before correlating anything.
+- **Correlate in enforce mode only, and treat the join as probabilistic.** In
+  enforce mode, match a same-company `denied` row against the
+  `action: "company_access"` lines on `actorAgentId` + `companyId` + time: a
+  match is the responsible-user leg, no match is the entitlement denial. Do
+  **not** run this under shadow. The ⚠️ block above already answers the question
+  directly there, and the correlation *inverts*: the warn still fires, but the
+  throw is suppressed, so the row it would have matched is never booked — while
+  the same-company `denied` that *is* booked on `heartbeat.run_log_accessed`
+  comes from the entitlement leg further down the same request and matches the
+  warn on every key. Following the rule in shadow mode therefore discards a
+  genuine insider unentitled transcript read as an availability failure, which
+  is the one direction this section exists to prevent. Even in enforce mode the
+  join is time-fuzzy: the warn carries no request or run correlator at all, so
+  the row's own `runId` and `details.actorRunId` have nothing on the log side
+  to join to, and `assertCompanyAccess` is called from over twenty call sites
+  in `routes/agents.ts` alone, so a busy agent emits these warns from unrelated
+  requests in the same window. Tighten a candidate match with the warn's
+  `method` and `action` rather than taking agent + company + timestamp
+  proximity. Finally, the log stream's retention is not `activity_log`'s, so
+  on an older row the absence of a match may mean the logs aged out rather
+  than that the denial was an entitlement one.
 
 Retention follows the deployment's normal
 `activity_log` database retention and backup policy; Paperclip does not
