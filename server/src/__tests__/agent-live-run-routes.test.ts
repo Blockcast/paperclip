@@ -55,6 +55,17 @@ const routeAgentId = "11111111-1111-4111-8111-111111111111";
 const WORKSPACE_OPERATION_LOG_SENTINEL =
   "TOKEN_FIXTURE=sentinel-operation-log-not-a-real-credential ./deploy.sh";
 
+/**
+ * BLO-35509. Source of truth: `server/src/routes/agents.ts` (`logRunLogAccessAudit`). Declared
+ * once because two of the uses below are `not.toHaveBeenCalledWith` absence guards, and an
+ * absence guard keyed on a literal nobody emits passes vacuously — a typo confined to that one
+ * site is silent, since the positives hold their own copies and keep passing. Verified on
+ * `master`: typo `:637` or `:780` alone and all 35 still pass. Sharing the const makes that
+ * shape a reference error instead.
+ */
+const HEARTBEAT_RUN_LOG_ACCESSED = "heartbeat.run_log_accessed";
+const WORKSPACE_OPERATION_LOG_ACCESSED = "workspace_operation.log_accessed";
+
 function workspaceOperationLogFixture(overrides: Record<string, unknown> = {}) {
   return {
     id: "operation-1",
@@ -549,7 +560,7 @@ describe("agent live run routes", () => {
       actorType: "user",
       actorId: "local-board",
       agentId: null,
-      action: "heartbeat.run_log_accessed",
+      action: HEARTBEAT_RUN_LOG_ACCESSED,
       entityType: "heartbeat_run",
       entityId: "run-1",
       runId: "run-1",
@@ -588,7 +599,7 @@ describe("agent live run routes", () => {
       actorType: "agent",
       actorId: routeAgentId,
       agentId: routeAgentId,
-      action: "heartbeat.run_log_accessed",
+      action: HEARTBEAT_RUN_LOG_ACCESSED,
       entityType: "heartbeat_run",
       entityId: "run-1",
       runId: "run-1",
@@ -634,7 +645,7 @@ describe("agent live run routes", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(404);
     expect(mockHeartbeatService.readLog).toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
-      action: "heartbeat.run_log_accessed",
+      action: HEARTBEAT_RUN_LOG_ACCESSED,
     }));
   });
 
@@ -669,7 +680,7 @@ describe("agent live run routes", () => {
     // disclosed. Without `withheld` the record is indistinguishable from a real disclosure, and
     // "who read this log" over-reports.
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
-      action: "workspace_operation.log_accessed",
+      action: WORKSPACE_OPERATION_LOG_ACCESSED,
       details: expect.objectContaining({ result: "allowed", withheld: true }),
     }));
   });
@@ -690,7 +701,7 @@ describe("agent live run routes", () => {
       companyId: "company-1",
       actorType: "user",
       actorId: "local-board",
-      action: "workspace_operation.log_accessed",
+      action: WORKSPACE_OPERATION_LOG_ACCESSED,
       entityType: "workspace_operation",
       entityId: "operation-1",
       // The operation's own run, so an audit reader can join back to the run that produced it.
@@ -730,7 +741,7 @@ describe("agent live run routes", () => {
       actorType: "agent",
       actorId: routeAgentId,
       agentId: routeAgentId,
-      action: "workspace_operation.log_accessed",
+      action: WORKSPACE_OPERATION_LOG_ACCESSED,
       entityType: "workspace_operation",
       entityId: "operation-1",
       details: expect.objectContaining({
@@ -777,7 +788,7 @@ describe("agent live run routes", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(404);
     expect(mockWorkspaceOperationService.readLog).toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
-      action: "workspace_operation.log_accessed",
+      action: WORKSPACE_OPERATION_LOG_ACCESSED,
     }));
   });
 

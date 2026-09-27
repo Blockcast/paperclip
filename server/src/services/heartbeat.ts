@@ -363,6 +363,7 @@ import {
 } from "./issue-tree-control.js";
 import { RUN_STALE_SILENCE_MS } from "./issue-run-holding.js";
 import { describeSharedCheckoutOccupancy } from "./shared-checkout-occupancy.js";
+import { resolveWorkspaceWriterTreeKey } from "./workspace-writer-key.js";
 import {
   countRunsOccupyingSlots,
   resolveAgentConcurrencyPolicy,
@@ -422,6 +423,7 @@ import {
   recordHeartbeatTimerSchedulerExclusion,
   recordHeartbeatPostTerminalRunEventDropped,
   recordHeartbeatTimerTick,
+  recordRetryScheduleOutcome,
   recordConcurrentRunBlocked,
   recordHeartbeatRunFailed,
   recordOrphanedManagedPodReaped,
@@ -460,10 +462,12 @@ import {
   jitterTransientRetryFloor,
   isCapacityGovernedRetryFloor,
   applyCcrotateCapacityDecision,
+  clearCcrotateCapacityDecision,
   resolveCapacityEscalation,
   resolveRoutineScopedRetry,
   CAPACITY_ESCALATION_AFTER_MS,
   CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY,
+  CCROTATE_CAPACITY_RESULT_KEYS,
   TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS,
 } from "./ccrotate-capacity-retry.js";
 import {
@@ -754,23 +758,20 @@ type HeartbeatRunTerminalStatus = (typeof HEARTBEAT_RUN_TERMINAL_STATUSES)[numbe
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
 const OPEN_ROUTINE_EXECUTION_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"] as const;
 const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
-const GITHUB_STATE_CHANGE_WAKE_REASONS = new Set([
-  "github_check_completed",
-  "github_check_suite_completed",
-  "github_workflow_completed",
-]);
-const EXTERNAL_WAIT_RESUME_WAKE_REASONS = new Set([
-  ...GITHUB_STATE_CHANGE_WAKE_REASONS,
-  "github_pr_closed",
-  "github_pr_converted_to_draft",
-  "github_pr_review_submitted",
-  "github_pr_synchronized",
-  "issue_monitor_due",
-]);
+// PEN-2400 (Ally non-blocking 2): these two sets used to be declared here AND as a
+// hardcoded literal in recovery/service.ts. Identical, with nothing holding them so.
+// recovery/service.js is the leaf (heartbeat imports it; it cannot import back) and now
+// owns both — see the rationale beside the declarations there.
+import {
+  EXTERNAL_WAIT_RESUME_WAKE_REASONS,
+  GITHUB_STATE_CHANGE_WAKE_REASONS,
+} from "./recovery/service.js";
 export {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
   ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
+  EXTERNAL_WAIT_RESUME_WAKE_REASONS,
+  GITHUB_STATE_CHANGE_WAKE_REASONS,
 } from "./recovery/service.js";
 export const ACTIVE_RUN_OUTPUT_PROGRESS_FLUSH_INTERVAL_MS = 60 * 1000;
 export const ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS = 5 * 1000;
@@ -7001,7 +7002,18 @@ export function resolveK8sRunIsolationIdentity(input: {
       input.perIssueWorkspaceTreeKey,
     );
   }
-  return runUniqueIdentity({ isolationMode: "shared", isolationKey: `agent-shared:${input.agentId}` });
+  // BLO-19422: this is the DEFAULT exit -- `concurrencyEnabled` is false unless
+  // an operator sets it, so `effectiveMaxConcurrentRuns` is a hard 1 for every
+  // external-lifecycle agent and every such run lands here. `agent-shared:
+  // <agentId>` carries no tree scope, so two AGENTS on one shared project
+  // checkout held distinct keys and both wrote it. Tree-scope the reservation
+  // here too; `isolationKey` stays agent-scoped so warm session/home roots are
+  // untouched. See `withTreeScopedReservationKey` for why the old "shared is
+  // already stricter" reasoning was wrong.
+  return withTreeScopedReservationKey(
+    { isolationMode: "shared", isolationKey: `agent-shared:${input.agentId}` },
+    input.perIssueWorkspaceTreeKey,
+  );
 }
 
 /**
@@ -7051,14 +7063,11 @@ export function resolveK8sRunIsolationIdentity(input: {
  * this key gates.
  *
  * THE INVARIANT for the reservation key: only ever replace a key that is
- * RUN-UNIQUE. A key that already names a shared tree is at least as strict as
- * the per-issue key, so substituting it would loosen exclusivity instead of
- * tightening it. Three keys are therefore left alone, each for its own reason:
+ * RUN-UNIQUE, or one whose scope is NARROWER THAN THE TREE. A key that already
+ * names a shared tree is at least as strict as the per-issue key, so
+ * substituting it would loosen exclusivity instead of tightening it. Two keys
+ * are therefore left alone:
  *
- * - `shared` (`agent-shared:<agentId>`) is already STRICTER than per-tree — one
- *   writer per agent. Substituting a per-tree key there would *loosen* it and
- *   let an effective-concurrency-1 agent hold two reservations for different
- *   issues, inverting BLO-16842's containment.
  * - `workspace:<id>` for an EXPLICITLY reused persisted workspace already names
  *   the tree, and several issues may share one such workspace, so a per-issue
  *   key would let those issues write it concurrently. Gated at the call site in
@@ -7069,6 +7078,39 @@ export function resolveK8sRunIsolationIdentity(input: {
  * - stateless PR review never reaches this helper; it returns run-scoped
  *   isolation ahead of every other branch and must stay fully ephemeral.
  *
+ * BLO-19422: `shared` (`agent-shared:<agentId>`) USED TO BE left alone here, on
+ * the reasoning that one-writer-per-agent is already stricter than per-tree.
+ * That was wrong, and it is the whole defect. `agent-shared` is stricter along
+ * the AGENT axis and carries no tree scope at all, so it cannot exclude ACROSS
+ * agents: agent A and agent B both running `project_primary` against project
+ * workspace pw-1 hold `agent-shared:A` and `agent-shared:B`, both satisfy the
+ * writer index, and both write one directory. That is BLO-19422 verbatim, and
+ * because `concurrencyEnabled` defaults false (`resolveExternalLifecycle
+ * Concurrency` returns a hard 1), this exit is the DEFAULT posture rather than
+ * an edge case.
+ *
+ * The "inverting BLO-16842's containment" half of that rationale is weaker than
+ * it looks, but it is NOT free: the per-agent ceiling is enforced at dispatch by
+ * `availableSlots = effectiveMaxConcurrentRuns - runningCount` in
+ * `startNextQueuedRunForAgent`, not by this index -- EXCEPT where BLO-12990
+ * excludes a silent run from `countRunsOccupyingSlots`. One silent running row
+ * leaves `runningRunRows.length === 1` (so the zero-rows guard does not fire)
+ * while `runningCount` collapses to 0, so `availableSlots = 1 - 0 = 1` and a
+ * second run IS admitted at effective concurrency 1. In exactly that case
+ * `agent-shared` was not a belt over braces -- it was the sole restraint, and
+ * widening the key gives it up. That narrow loss is stated as a KNOWN GAP on
+ * `resolveWorkspaceWriterTreeKey`; it needs a silent run AND an un-backfilled
+ * issue, where the cross-agent case this buys needs no loophole at all and is
+ * the measured default defect. The trade is deliberate, not an oversight.
+ *
+ * The cost is real and deliberate: this serializes ALL issues of one project
+ * workspace across ALL agents, because they are one mutable directory. That is
+ * the correct outcome for a shared checkout, and it is the same trade the
+ * module doc makes -- serializing runs that could have been parallel costs
+ * latency, letting two runs share one tree corrupts a checkout. It does not
+ * touch runs that get their own worktree: those key on the ISSUE and stay
+ * independent across issues.
+ *
  * `isolationMode` is untouched, so every filesystem root keeps deriving from
  * `runId`/`persistedExecutionWorkspaceId` exactly as before.
  */
@@ -7077,7 +7119,7 @@ function withTreeScopedReservationKey(
   perIssueWorkspaceTreeKey: string | null | undefined,
 ): K8sRunIsolationIdentity {
   const treeKey = readNonEmptyString(perIssueWorkspaceTreeKey ?? null);
-  if (!treeKey || identity.isolationMode === "shared") return runUniqueIdentity(identity);
+  if (!treeKey) return runUniqueIdentity(identity);
   return { ...identity, reservationKey: `workspace-tree:${treeKey}` };
 }
 
@@ -20212,7 +20254,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { outcome: "promoted", run: promoted };
   }
 
-  async function scheduleBoundedRetryForRun(
+  async function scheduleBoundedRetryForRunUninstrumented(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
     opts?: {
@@ -21138,6 +21180,46 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
+  /**
+   * BLO-35472: instrumentation seam over the implementation above.
+   *
+   * A wrapper rather than an `inc()` at each of the seven return statements,
+   * because the property that matters is that *no* return path can escape the
+   * counter -- including one added later by someone who has not read this
+   * comment. The abandon path is the reason: it deliberately persists no retry
+   * row, so if its increment is ever missed there is nothing left in the
+   * database to reconstruct the decision from, and a regression that silently
+   * drops every retry looks the same as the backoff clamp working.
+   *
+   * The metric failing must never fail a retry, so the increment is swallowed.
+   */
+  async function scheduleBoundedRetryForRun(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+    opts?: {
+      now?: Date;
+      random?: () => number;
+      retryReason?: string;
+      wakeReason?: string;
+      maxAttempts?: number;
+      delayMs?: number;
+    },
+  ) {
+    const result = await scheduleBoundedRetryForRunUninstrumented(run, agent, opts);
+    try {
+      recordRetryScheduleOutcome({
+        // `not_scheduled` is reported as its errorCode: the coarse outcome
+        // would collapse routine abandonment into the same series as an issue
+        // reassignment, which is the distinction this metric exists to make.
+        outcome: result.outcome === "not_scheduled" ? result.errorCode : result.outcome,
+        retryReason: opts?.retryReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON,
+      });
+    } catch (err) {
+      logger.warn({ err, runId: run.id }, "failed to record retry schedule outcome metric");
+    }
+    return result;
+  }
+
   async function scheduleInteractionContinuationInfrastructureRetryIfEligible(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -21278,6 +21360,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       retryNowRequestedByActorType: input.actor?.actorType ?? null,
       retryNowRequestedByActorId: input.actor?.actorId ?? null,
     };
+    // Booking the due time to `now` invalidates whatever capacity decision
+    // parked this row: the advertised resume instant, retry-after figure and
+    // clamp provenance in `result_json` now describe a park the row no longer
+    // holds. Clear them in the same write so no reader keeps honouring a
+    // provider horizon an actor has just overridden -- the overdue gauge takes
+    // `greatest(scheduled_retry_at, penstockAdvertisedResumeAt)` and would
+    // otherwise go silent on exactly the row a human is watching (BLO-34782).
+    // The chain origin is deliberately kept: it bounds the whole deferral chain
+    // on wall clock and a retry-now is not the start of a new chain. The
+    // retryNotBefore/transientRetryNotBefore floors are kept too, on purpose:
+    // promoteScheduledRetryRun's capacityDrivenTransientPark conjunct reads them,
+    // so clearing them would promote a transient_failure capacity park with no
+    // promotion-time capacity re-probe (BLO-28919).
+    // A non-object `result_json` (jsonb array or scalar) is skipped exactly as
+    // null is: `parseObject` would flatten it to `{}`, and since this is the
+    // only path that writes the column here, that would *replace* the row's
+    // value rather than clear keys from it. No writer produces that shape today.
+    const resultJson = isPlainObject(scheduled.run.resultJson)
+      ? clearCcrotateCapacityDecision(
+          scheduled.run.resultJson,
+          CCROTATE_CAPACITY_RESULT_KEYS.clearedOnOverride,
+        )
+      : undefined;
 
     const updated = await db.transaction(async (tx) => {
       const row = await tx
@@ -21285,6 +21390,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .set({
           scheduledRetryAt: now,
           contextSnapshot,
+          ...(resultJson === undefined ? {} : { resultJson }),
           updatedAt: now,
         })
         .where(and(eq(heartbeatRuns.id, scheduled.run.id), eq(heartbeatRuns.status, "scheduled_retry")))
@@ -24606,7 +24712,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               "reservation reconciler released runtime slot but agent finalization failed",
             );
           });
-          if (!options.suppressDispatch) await startNextQueuedRunForAgent(run.agentId);
+          // PEN-2400 (Ally non-blocking 1): guard this the same way as the two
+          // siblings above. By this line the release has already COMMITTED, so
+          // the row is drained. An unguarded throw here lands in the per-row
+          // `catch` below, whose meaning is "this reservation may still be
+          // held" — it increments `failedRowCount`, clears
+          // `paperclip_orphaned_runtime_resource_metrics_refresh_success` and
+          // pages PaperclipRuntimeResourceReconciliationStuck about a backlog
+          // that does not exist. Dispatch is follow-on work with its own retry
+          // (the next `resumeQueuedRuns` pass), so log it and let the sweep
+          // report the truth about the reservation.
+          if (!options.suppressDispatch) {
+            await startNextQueuedRunForAgent(run.agentId).catch((error) => {
+              logger.warn(
+                { error, runId: run.id, agentId: run.agentId },
+                "reservation reconciler released runtime slot but follow-on queued dispatch failed",
+              );
+            });
+          }
         }
         if (released && terminalPrelaunchOrphan) {
           logger.warn(
@@ -25953,7 +26076,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         suppressPromotion: retryContinuesContextIssue,
       });
       if (!opts?.suppressDispatchAfterReap && !promotedRunDispatched) {
-        await startNextQueuedRunForAgent(run.agentId);
+        // PEN-2400: second of the two unguarded batch-loop sites (see
+        // `resumeQueuedRuns`). This runs inside `for (const { run } of
+        // activeRuns)` with no per-iteration catch, so a rejecting dispatch used
+        // to abandon the reap of every run after this one — including their
+        // `releaseLeasesForRun` calls, which is the held-resource harm Ally
+        // described. It also skipped this run's own `appendRunEvent` below,
+        // after its terminal status had already been persisted.
+        //
+        // This one swallows rather than collecting and rethrowing the way
+        // `resumeQueuedRuns` does, and the asymmetry is deliberate:
+        // `reapOrphanedRuns` sits MID-chain in the periodic tick in index.ts,
+        // ahead of `promoteDueScheduledRetries` and `resumeQueuedRuns`. A
+        // rejection here lands in that chain's `.catch()` and skips both, so
+        // rethrowing would re-create the abandon-the-rest harm one level up —
+        // and it would discard this pass's reap summary as well. Dispatch is
+        // recoverable: the next `resumeQueuedRuns` re-drives any agent still
+        // holding queued runs.
+        await startNextQueuedRunForAgent(run.agentId).catch((error: unknown) => {
+          logger.warn(
+            { error, runId: run.id, agentId: run.agentId },
+            "reapOrphanedRuns: post-reap dispatch failed for one agent; continuing the pass",
+          );
+        });
       }
 
       await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
@@ -26014,8 +26159,43 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ));
 
     const agentIds = [...new Set(queuedRuns.map((r) => r.agentId))];
+    // PEN-2400: found while verifying Ally non-blocking 1 against its sibling
+    // call sites. The reservation reconciler Ally named already has per-row
+    // isolation (BLO-21460, added after that review), so the "one throw
+    // abandons the rest of the batch" harm Ally described no longer lands
+    // there — it lands on the two loops that still have no per-iteration
+    // catch: this one, and the `activeRuns` loop in `reapOrphanedRuns`. Both
+    // are fleet-wide: one agent's dispatch rejecting abandoned dispatch for
+    // every agent after it in the pass.
+    //
+    // Isolate per agent, but do NOT swallow: collect and rethrow once the pass
+    // is complete. Continuing the loop is what fixes the batch-abort harm;
+    // discarding the error would be a separate, unasked-for change that blinds
+    // the caller's failure log and drops the BLO-12990 contract that this
+    // function rejects when a dispatch fails.
+    //
+    // Rethrowing is free HERE specifically because `resumeQueuedRuns` is the
+    // last pass in the periodic chain in index.ts — nothing downstream is
+    // skipped by it. That is exactly why `reapOrphanedRuns` below swallows
+    // instead: it sits MID-chain, so rethrowing there would abandon
+    // `promoteDueScheduledRetries` and this function for the whole tick,
+    // reproducing the same abandon-the-rest harm one level up.
+    const dispatchFailures: unknown[] = [];
     for (const agentId of agentIds) {
-      await startNextQueuedRunForAgent(agentId);
+      await startNextQueuedRunForAgent(agentId).catch((error: unknown) => {
+        dispatchFailures.push(error);
+        logger.warn(
+          { error, agentId },
+          "resumeQueuedRuns: dispatch failed for one agent; continuing the pass",
+        );
+      });
+    }
+    if (dispatchFailures.length === 1) throw dispatchFailures[0];
+    if (dispatchFailures.length > 1) {
+      throw new AggregateError(
+        dispatchFailures,
+        `resumeQueuedRuns: dispatch failed for ${dispatchFailures.length} of ${agentIds.length} agents`,
+      );
     }
   }
 
@@ -29364,47 +29544,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ? randomUUID()
             : null
         );
-    // BLO-31443: the writer reservation must exclude on the TREE this run will
-    // work in, not on the run. The literal `cwd` is unavailable here -- it needs
-    // `repoRoot` from a `git rev-parse` against `resolvedWorkspace.cwd`, which is
-    // not resolved until ~700 lines below, and the reservation has to be bound
-    // before the workspace is realized. Under `per_issue` runScope the resolved
-    // path is a pure function of the issue (identifier + title -> branch name ->
-    // directory, with no run input), so the issue IS the equivalence class of
-    // that path: keying on it collides exactly when two runs would share a tree.
-    //
-    // Scoped by `projectWorkspaceId` because one issue can hold trees in several
-    // repos of a multi-repo project, and those are genuinely independent.
-    //
-    // Two deliberate exclusions:
-    // - `per_run` runScope appends a run token to the branch, hence to the
-    //   directory, so those runs are already tree-unique and must NOT collide.
-    // - a stateless PR review is run-unique by construction and is filtered in
-    //   the resolver ahead of every other branch.
-    //
-    // Conservative in the one case where issue and path disagree: an issue
-    // retitled between runs resolves to a NEW directory while keeping its id, so
-    // this over-serializes rather than under-serializes. Serializing two runs
-    // that could have been parallel costs latency; letting two runs share one
-    // tree corrupts a checkout.
-    const perIssueWorkspaceTreeKey =
-      issueRef?.id &&
-      paperclipPrReview === null &&
-      !executionWorkspaceUsesPerRunScopeForIssue &&
-      (
-        workspaceIsolationRequested ||
-        workspaceReuseRequest.existingExecutionWorkspaceAvailable ||
-        executionWorkspaceUsesGitWorktree({
-          agentConfig: config,
-          projectPolicy: projectExecutionWorkspacePolicy,
-          issueSettings: issueExecutionWorkspaceSettings,
-          mode: requestedExecutionWorkspaceMode,
-          legacyUseProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null,
-          issueAdapterConfig: issueAssigneeOverrides?.adapterConfig ?? null,
-        })
-      )
-        ? `${issueRef.projectWorkspaceId ?? "no-project-workspace"}:${issueRef.id}`
-        : null;
+    // BLO-31443 / BLO-19422: the writer reservation must exclude on the TREE this
+    // run will work in, not on the run. The literal `cwd` is unavailable here --
+    // it needs `repoRoot` from a `git rev-parse` against `resolvedWorkspace.cwd`,
+    // which is not resolved until ~700 lines below, and the reservation has to be
+    // bound before the workspace is realized. So the key is derived from the
+    // equivalence class of that path instead; see `resolveWorkspaceWriterTreeKey`
+    // for which class applies to which shape and why.
+    const runResolvesToOwnTree =
+      workspaceIsolationRequested ||
+      workspaceReuseRequest.existingExecutionWorkspaceAvailable ||
+      executionWorkspaceUsesGitWorktree({
+        agentConfig: config,
+        projectPolicy: projectExecutionWorkspacePolicy,
+        issueSettings: issueExecutionWorkspaceSettings,
+        mode: requestedExecutionWorkspaceMode,
+        legacyUseProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null,
+        issueAdapterConfig: issueAssigneeOverrides?.adapterConfig ?? null,
+      });
+    const perIssueWorkspaceTreeKey = resolveWorkspaceWriterTreeKey({
+      statelessPrReview: paperclipPrReview !== null,
+      runResolvesToOwnTree,
+      usesPerRunScope: executionWorkspaceUsesPerRunScopeForIssue,
+      issue: issueRef
+        ? { id: issueRef.id ?? null, projectWorkspaceId: issueRef.projectWorkspaceId ?? null }
+        : null,
+    });
     const k8sIsolationIdentity = resolveK8sRunIsolationIdentity({
       adapterType: agent.adapterType,
       runId: run.id,

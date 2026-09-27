@@ -8,6 +8,7 @@ import {
   createHttpLogger,
   shouldOmitRequestBodyFromLog,
   shouldSilenceHttpSuccessLog,
+  urlForLog,
 } from "../middleware/http-log-policy.js";
 
 describe("shouldSilenceHttpSuccessLog", () => {
@@ -106,6 +107,32 @@ describe("shouldOmitRequestBodyFromLog", () => {
     expect(shouldOmitRequestBodyFromLog("/api/plugins/slack")).toBe(false);
     expect(shouldOmitRequestBodyFromLog("/api/plugins/slack/config")).toBe(false);
     expect(shouldOmitRequestBodyFromLog(undefined)).toBe(false);
+  });
+});
+
+// PEN-2996: this middleware is not the only place a request URL reaches a log
+// line — the worker-tier proxy logs one too — so the rule is exported rather
+// than reimplemented at each call site.
+describe("urlForLog", () => {
+  it("drops the query string on untrusted webhook routes", () => {
+    expect(urlForLog("/api/plugins/slack/webhooks/slack-events?companyId=c1&token=shh"))
+      .toBe("/api/plugins/slack/webhooks/slack-events");
+  });
+
+  it("keeps the query string everywhere else", () => {
+    expect(urlForLog("/api/issues?cursor=abc")).toBe("/api/issues?cursor=abc");
+  });
+
+  it("passes undefined through so callers can log an absent URL as absent", () => {
+    expect(urlForLog(undefined)).toBeUndefined();
+  });
+
+  it("does NOT match an absolute URL, which is why callers scrub before prepending an origin", () => {
+    // The route patterns are anchored at the path root. Handing this an
+    // already-absolute upstream URL would silently scrub nothing — the trap
+    // the worker-tier proxy has to avoid when building its target URL.
+    const absolute = "http://worker:3000/api/plugins/slack/webhooks/slack-events?token=shh";
+    expect(urlForLog(absolute)).toBe(absolute);
   });
 });
 

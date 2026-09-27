@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
-import { agents, approvals, companies, createDb } from "@paperclipai/db";
+import { agents, approvals, budgetIncidents, budgetPolicies, companies, createDb } from "@paperclipai/db";
 import fs from "node:fs";
 import path from "node:path";
 import url from "node:url";
@@ -861,5 +861,150 @@ describe("approval undecided-status scope stays bound across all three sites", (
     for (const clause of clauses) {
       expect(normalize(clause), `schema clause drifted: ${clause}`).toBe(expected);
     }
+  });
+});
+
+/**
+ * BLO-29085 — a budget card decided through the generic approvals surface used to
+ * mark itself terminal and leave its `budget_incidents` row `open` forever. The
+ * scope stays paused with no live card, and the stranded open row suppresses every
+ * subsequent card for the same (policy, window, threshold), so nothing re-arms it.
+ *
+ * Only `budgetService.resolveIncident` closes the pair, and it writes the approvals
+ * table directly rather than through this service — so these tests pin the refusal
+ * without touching that path. The negative cases are load-bearing: the guard is
+ * keyed on an *open incident*, not on the type, so a budget card that owns no open
+ * lifecycle must still be decidable here.
+ */
+describeEmbeddedPostgres("approvalService refuses to strand an open budget incident (BLO-29085)", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-approval-budget-incident-");
+    db = createDb(tempDb.connectionString);
+  }, 120_000);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockLogActivity.mockResolvedValue(undefined);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seedIncidentCard(incidentStatus: "open" | "resolved" | null) {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Budget incident company",
+      issuePrefix: `B${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+    });
+
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "budget_override_required",
+      status: "pending",
+      // Server-filed, exactly as the budget watcher files it.
+      requestedByAgentId: null,
+      requestedByUserId: null,
+      payload: { title: "Budget hard stop reached" },
+    });
+
+    if (incidentStatus === null) return { companyId, approvalId, incidentId: null };
+
+    const windowStart = new Date("2026-09-01T00:00:00.000Z");
+    const policyId = randomUUID();
+    await db.insert(budgetPolicies).values({
+      id: policyId,
+      companyId,
+      scopeType: "company",
+      scopeId: companyId,
+      metric: "spend",
+      windowKind: "calendar_month_utc",
+      amount: 100_000,
+      hardStopEnabled: true,
+    });
+
+    const incidentId = randomUUID();
+    await db.insert(budgetIncidents).values({
+      id: incidentId,
+      companyId,
+      policyId,
+      scopeType: "company",
+      scopeId: companyId,
+      metric: "spend",
+      windowKind: "calendar_month_utc",
+      windowStart,
+      windowEnd: new Date("2026-10-01T00:00:00.000Z"),
+      thresholdType: "hard",
+      amountLimit: 100_000,
+      amountObserved: 100_001,
+      status: incidentStatus,
+      approvalId,
+    });
+
+    return { companyId, approvalId, incidentId };
+  }
+
+  async function readStatus(approvalId: string) {
+    const [row] = await db.select().from(approvals).where(eq(approvals.id, approvalId));
+    return row.status;
+  }
+
+  for (const verb of ["approve", "reject", "withdraw"] as const) {
+    it(`refuses to ${verb} a budget card whose incident is still open, without mutating it`, async () => {
+      const { approvalId, incidentId } = await seedIncidentCard("open");
+      const svc = approvalService(db);
+
+      const call =
+        verb === "withdraw"
+          ? svc.withdraw(approvalId, "moot", withdrawalActor)
+          : svc[verb](approvalId, "board-user", "decided in the wrong place");
+
+      await expect(call).rejects.toMatchObject({
+        status: 422,
+        details: { code: "budget_incident_open", incidentId },
+      });
+
+      // The whole point: the card stays decidable where the incident lives.
+      expect(await readStatus(approvalId)).toBe("pending");
+      const [incident] = await db
+        .select()
+        .from(budgetIncidents)
+        .where(eq(budgetIncidents.id, incidentId!));
+      expect(incident.status).toBe("open");
+    });
+  }
+
+  it("names the budget route in the refusal so the caller can act on it", async () => {
+    const { companyId, approvalId, incidentId } = await seedIncidentCard("open");
+
+    await expect(
+      approvalService(db).approve(approvalId, "board-user", null),
+    ).rejects.toMatchObject({
+      details: { route: `/api/companies/${companyId}/budget-incidents/${incidentId}/resolve` },
+    });
+  });
+
+  it("still decides a budget card whose incident is already closed", async () => {
+    const { approvalId } = await seedIncidentCard("resolved");
+
+    const result = await approvalService(db).approve(approvalId, "board-user", "cap already raised");
+
+    expect(result.applied).toBe(true);
+    expect(await readStatus(approvalId)).toBe("approved");
+  });
+
+  it("still decides a caller-filed budget card that owns no incident", async () => {
+    const { approvalId } = await seedIncidentCard(null);
+
+    const result = await approvalService(db).reject(approvalId, "board-user", "not needed");
+
+    expect(result.applied).toBe(true);
+    expect(await readStatus(approvalId)).toBe("rejected");
   });
 });

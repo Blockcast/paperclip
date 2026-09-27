@@ -1,5 +1,5 @@
 import { createHmac, randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -2854,5 +2854,51 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     const run = await svc.firePublicTrigger(trigger.publicId!, { payload: { source: "test" } });
 
     expect(run).toMatchObject({ source: "webhook", status: "issue_created" });
+  });
+
+  // BLO-28952: `issueSvc.create` commits the execution issue on its own
+  // connection, so a rollback of the dispatch transaction erases the
+  // `routine_runs` row the issue's `originRunId` names — and the compensation
+  // inside that transaction rolls back with it. The invariant asserted here is
+  // the one that failed in production: every `routine_execution` issue must
+  // resolve to a run row for its routine.
+  //
+  // The abort is produced for real rather than mocked: the wakeup hook runs
+  // inside the dispatch transaction, at which point that session is
+  // `idle in transaction`, so terminating it makes every subsequent statement
+  // on the transaction fail exactly as a database-level abort does.
+  it("keeps the execution issue's originRunId resolvable when the dispatch transaction rolls back", async () => {
+    const { companyId, routine, svc } = await seedFixture({
+      wakeup: async () => {
+        await db.execute(sql`
+          select pg_terminate_backend(pid)
+          from pg_stat_activity
+          where datname = current_database()
+            and pid <> pg_backend_pid()
+            and state = 'idle in transaction'
+        `);
+        return null;
+      },
+    });
+
+    await expect(svc.runRoutine(routine.id, { source: "manual" })).rejects.toThrow();
+
+    const executionIssue = await db
+      .select({ id: issues.id, originRunId: issues.originRunId })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originId, routine.id)))
+      .then((rows) => rows[0] ?? null);
+    // The issue survives the rollback — that is the defect's premise, not an
+    // assertion about desired behaviour.
+    expect(executionIssue?.originRunId).toBeTruthy();
+
+    const reconciledRun = await db
+      .select()
+      .from(routineRuns)
+      .where(eq(routineRuns.id, executionIssue!.originRunId!))
+      .then((rows) => rows[0] ?? null);
+
+    expect(reconciledRun).toMatchObject({ routineId: routine.id, status: "failed" });
+    expect(reconciledRun?.failureReason).toBeTruthy();
   });
 });

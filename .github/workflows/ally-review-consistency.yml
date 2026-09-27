@@ -29,6 +29,15 @@ name: Ally Review Consistency Guard
 # it from red to red — an auditor whose output is a constant carries no more
 # information than no auditor. A baseline entry is keyed on the head SHA and
 # review IDs, so it expires as soon as the PR is pushed to. See PEN-2847.
+#
+# Findings are additionally scoped to PRs GitHub would still merge from. A
+# finding on a draft or conflicting PR is printed as a warning and does not fail
+# the run, because such a PR cannot reach master without first changing state —
+# a transition this hourly run re-observes, at which point the finding fails
+# again. There is deliberately no "untouched for N days" window: staleness is
+# not a state GitHub enforces anything against, so a clean month-old PR merges
+# on a click with no transition and no run in between. See prDormancy() in the
+# script for the measurement behind that split.
 
 on:
   schedule:

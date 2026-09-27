@@ -33,14 +33,39 @@ jobs:
     # A merge-group is the sole landing candidate and must not wait behind the
     # pull-request review backlog that saturates arc-light.
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
-    # 20, not 10, because this job also pays for a cold, full-depth checkout
-    # before pnpm and the policy suite can start. Run 35968078306 attempt 4
-    # spent 7m52s in checkout alone and was killed by the old 10m cap during a
-    # bounded test step; there was no assertion failure. `./.github/actions/
-    # setup-pnpm` may also spend a second attempt on a stalled npm registry
-    # (BLO-28813). Keep every step bound unchanged and give setup plus the
-    # existing validation budget a finite, attributable ceiling.
-    timeout-minutes: 20
+    # THIS IS A HANG DETECTOR, NOT A PERFORMANCE BUDGET.
+    # Sized by the BLO-35615 rule. Do NOT re-tune it from observed durations.
+    #
+    #   timeout-minutes = ceil( W95 / (F * 60) ),  floored at 6 x T_best
+    #
+    #   W95    = 364 CPU-seconds. p95 counter delta of
+    #            container_cpu_usage_seconds_total{container="runner"} over the
+    #            job's own start..end, n=33 successful runs, 2026-09-19..09-24.
+    #            CPU-seconds measures WORK and is invariant to supply.
+    #   F      = 0.32 cores -- measured arc-light supply floor (2026-09-23;
+    #            re-measured 2026-09-24 = 0.3175). arc-light requests 250m with
+    #            NO cpu limit, so achieved supply spans 0.32..12.4 cores (39x).
+    #            Taken from arc-light, not arc-merge-queue, because one scalar
+    #            must cover the worse of the two pools this job runs on.
+    #   T_best = 217s, fastest observed healthy run.
+    #
+    #   ceil( 364 / 19.2 ) = 19   and   ceil( 6 * 217 / 60 ) = 22   => 22
+    #
+    # Both forms are LOWER bounds on a hang detector, so where they disagree the
+    # larger wins -- here the interim form is larger because only 33 of 67 runs
+    # still had pod metrics inside Prometheus' ~5d retention, so W95 is the
+    # under-sampled one. Rule: BLO-35615. This pass: BLO-35886.
+    #
+    # Why 10 was not survivable: healthy successful runs measured p50 371s /
+    # p95 555s / max 600s -- the max IS the old cap, i.e. the cap was already
+    # truncating healthy work, which is exactly what BLO-31690 filed. The
+    # pnpm-retry reasoning below remains true and is now subsumed: a second
+    # registry attempt is work, and work is what W95 already counts.
+    #
+    # PRESERVED -- previous basis: "10, not 5 ... `./.github/actions/setup-pnpm`
+    # may spend a second attempt on a stalled npm registry (BLO-28813). Worst
+    # case here is roughly 2 x (bootstrap + 120s fetch) + backoff ~= 5m."
+    timeout-minutes: 22
     # BLO-32682: the step-kill classifier at the end of this job reads the run's
     # own step conclusions and annotations back off the Actions API, and
     # `pr.yml` declares no workflow-level `permissions:`. Under a restricted
@@ -270,7 +295,7 @@ jobs:
       # on a PR whose diff touched only `server/src/services/recovery/*`.
       # Sizing an ~9s task at 60s reads as 7x headroom; against a p100 that is
       # already 5x the median it was not. The bound still catches a hang, far
-      # inside the 20m job cap — it is no longer a duration tripwire.
+      # inside the 22m job cap — it is no longer a duration tripwire.
       - name: Test approval admissibility-probe backoff (BLO-28471)
         if: ${{ !cancelled() }}
         run: node --test ./scripts/approve-paperclip-api-digest.test.js
@@ -560,6 +585,37 @@ jobs:
         run: node --test ./scripts/check-comment-review-gate-census.test.mjs
         timeout-minutes: 1
 
+      - name: Test merge-gate reader
+        if: ${{ !cancelled() }}
+        # The fleet-mandated reader has shipped four false-GREENs, each because a
+        # filter was added without checking what it prints when it matches EVERY
+        # row: BLO-34035 (neutral dropped), BLO-34114 (dedup key not unique),
+        # BLO-34263 (dead-run filter eats the whole surface, empty output reads as
+        # a pass), BLO-34619 (supersession proxied through id ordering, then
+        # through an un-ordered sibling test). All four are pinned here. Every
+        # guard swept so far is mutation-checked — reverting any ONE alone fails
+        # this suite — but read that as a record of what the sweeps covered, not
+        # as a property of the file: the 09-19 `28/28` asserted exactly this
+        # universally while a coarse mutation hid an unkilled arm (the
+        # `*[!0-9a-f]*` arm named below). The claim is only ever as wide as the
+        # last sweep.
+        # A guard with no failing mutation is a comment — add
+        # the mutation before you trust the fixture. Last swept 2026-09-23 after
+        # BLO-34835 (victim widened to `failure`, in-flight `""` fence): 17/17
+        # dead_runs()+verdicts()+extract() mutations killed at this head.
+        # require_sha's `*[!0-9a-f]*` arm in merge-gate-read.sh was unkilled
+        # until the 40-non-hex fixture was added; dropping merge-gate-read.sh's
+        # `sort -n` and `-k4,4` are equivalent mutations, not unkilled guards. On
+        # 2026-09-19 two had survived and were caught by sweeping
+        # rather than by reading — an inert `newest_pass != ""` (deleted) and an
+        # unpinned max-tracking term (fixture added). Re-run the sweep when you
+        # add a guard; do not extend this claim on inspection alone. Anchor each
+        # mutation to the CODE line: every guard is quoted verbatim in the
+        # comment above it, so a first-occurrence replace edits the prose and
+        # reports a working guard as unkillable.
+        run: node --test ./scripts/merge-gate-read.test.mjs
+        timeout-minutes: 1
+
       - name: Test comment-review-gate merge-queue mirror
         if: ${{ !cancelled() }}
         # Guards the no-`pending` invariant in particular: a pending required
@@ -765,7 +821,7 @@ jobs:
         # has already happened, and must never be able to change the outcome —
         # `policy` fails on the step conclusions themselves either way.
         continue-on-error: true
-        # Bounded well inside the 20-minute job ceiling: it makes a handful of
+        # Bounded well inside the 22-minute job ceiling: it makes a handful of
         # API calls on a pool that is, by construction, busy enough to have just
         # killed a step.
         timeout-minutes: 3
@@ -798,7 +854,21 @@ jobs:
   helm_chart:
     name: Helm chart
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
-    timeout-minutes: 10
+    # HANG DETECTOR, NOT A PERFORMANCE BUDGET. BLO-35615 rule; do NOT re-tune
+    # from observed durations. W95 = 277 CPU-seconds (p95 counter delta of
+    # container_cpu_usage_seconds_total{container="runner"} over the job,
+    # n=39 successful runs, 2026-09-19..09-24); F = 0.32 cores, the measured
+    # arc-light floor (2026-09-23, re-measured 09-24 = 0.3175). F is taken from
+    # arc-light, not arc-merge-queue, because one scalar must cover the worse of
+    # the two pools this job runs on.
+    #   primary: ceil( 277 / (0.32 * 60) ) = ceil( 14.4 ) = 15   <- binds
+    #   floor:   ceil( 6 * T_best / 60 )   = ceil( 6 * 35 / 60 ) = 4
+    # Both forms are lower bounds; where they disagree the larger wins (see
+    # `policy` above, where the floor is the binding one).
+    # Not previously filed as a cap row -- swept in with BLO-35886 because it is
+    # the same defect on the same runner class in the same file, and leaving it
+    # at 10 guarantees a sixth row later.
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -1305,7 +1375,18 @@ jobs:
     # in CI compiles or exercises it. Without this job it is dead-lettered.
     name: Vendored claude_k8s adapter
     runs-on: arc-light
-    timeout-minutes: 10
+    # HANG DETECTOR, NOT A PERFORMANCE BUDGET. BLO-35615 rule; do NOT re-tune
+    # from observed durations. W95 = 210 CPU-seconds (p95 counter delta of
+    # container_cpu_usage_seconds_total{container="runner"} over the job,
+    # n=50 successful runs, 2026-09-19..09-24); F = 0.32 cores, the measured
+    # arc-light floor (2026-09-23, re-measured 09-24 = 0.3175).
+    #   primary: ceil( 210 / (0.32 * 60) ) = ceil( 10.9 ) = 11   <- binds
+    #   floor:   ceil( 6 * T_best / 60 )   = ceil( 6 * 62 / 60 ) = 7
+    # Both forms are lower bounds; where they disagree the larger wins (see
+    # `policy` above, where the floor is the binding one).
+    # Not previously filed as a cap row -- swept in with BLO-35886 for the same
+    # reason as helm_chart above. 10 sat 0.9m under the floor requirement.
+    timeout-minutes: 11
     defaults:
       run:
         working-directory: vendor/paperclip-adapter-claude-k8s
@@ -1365,7 +1446,13 @@ jobs:
     # previous 5 minutes a slow classify step could time `verify` out and lose
     # the annotation entirely — the one thing this job exists to emit. The
     # classify step carries its own tighter bound, so this ceiling only has to
-    # cover the setup around it. Same headroom reasoning as `policy` above.
+    # cover the setup around it. This 10 is NOT derived by the BLO-35615 rule
+    # that sizes `policy` above: W95 = 27 CPU-seconds, but over only n=3 runs
+    # (2026-09-19..09-24), which is too few to be a usable p95. It is far below
+    # the 600 x 0.32 = 192 CPU-seconds this cap supplies at that rule's F = 0.32
+    # floor -- ~7x headroom -- so 10 cannot fire on a healthy run. Re-measure
+    # W95 and apply the rule before lowering it; do not tune it from observed
+    # durations.
     timeout-minutes: 10
     # BLO-28999: the classify step below is this workflow's first GITHUB_TOKEN
     # consumer, and `pr.yml` declares no workflow-level `permissions:`. Under a

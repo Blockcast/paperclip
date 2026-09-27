@@ -43,11 +43,12 @@ import {
   __test_hasPrReviewerRequestMention,
   __test_hasPrReviewerAgentRequestMarker,
   __test_hasAllyConsolidatedReviewHeading,
-  __test_hasAllyConsolidatedReviewHeader,
   __test_idempotentWakeStatuses,
   __test_prReviewerWakeIdempotencyScope,
   __test_readReviewGateEscalationHeadSha,
   __test_isActionablePrReviewComment,
+  __test_classifyPrReviewComment,
+  __test_isReviewShapedPrComment,
   __test_isReviewGateEscalationProducer,
   __test_recordWorkflowRunSighting,
   __test_resolvePrCommentReviewGateWebhookTrigger,
@@ -1697,14 +1698,225 @@ describe("github-webhook pure helpers", () => {
     expect(__test_hasAllyConsolidatedReviewHeading("    ## Ally — Consolidated PR Review")).toBe(false);
     expect(__test_hasAllyConsolidatedReviewHeading(null)).toBe(false);
     expect(__test_hasAllyConsolidatedReviewHeading(undefined)).toBe(false);
+  });
 
-    // The WHOLE-body helper keeps its broader behaviour: it gates a different
-    // call site (isActionablePrReviewComment), where a relayed review body must
-    // still count as review feedback whoever forwarded it.
-    expect(
-      __test_hasAllyConsolidatedReviewHeader("@ally re-review — your Ally — Consolidated PR Review flagged X"),
-    ).toBe(true);
-    expect(__test_hasAllyConsolidatedReviewHeader("> ## Ally — Consolidated PR Review")).toBe(true);
+  describe("an agent's own PR reply is not review feedback (PEN-3383)", () => {
+    const REVIEWER = "allyblockcast[bot]";
+
+    // Reduced from the real body: onprem-k8s#3672 comment 5740414507, posted by
+    // an agent explaining why it was NOT pushing to a frozen head. Its ONLY
+    // actionable signal is the literal inside the fence — verified by deleting
+    // that fence from the real body, which flips it to non-actionable. The
+    // agent was quoting review-gate source while discussing the gate's own
+    // regex, which is exactly the shape that makes this self-reinforcing.
+    const agentReplyQuotingGateSource = [
+      "## Both suggestions accepted — deferring the edit, because this head is frozen",
+      "",
+      "`review/ally-complete` reads `pending :: Ally self-review ... is not authoritative`,",
+      "so this exact SHA is what a scarce approver is being asked to approve.",
+      "",
+      "```python",
+      "#   - negation is read only within the SAME clause, so a negator belonging",
+      '#     to a neighbouring clause leaves the match standing ("not a blocking',
+      '#     finding, but changes requested" fails).',
+      "```",
+    ].join("\n");
+
+    it("does not classify an agent reply quoting gate source as review feedback", () => {
+      // The body IS findings-shaped to the shared predicate...
+      expect(__test_hasActionablePrReviewFeedback(agentReplyQuotingGateSource)).toBe(true);
+      // ...and the author IS the configured reviewer login, because agents post
+      // through the reviewer's own App seat. Before PEN-3383 those two facts
+      // alone woke the agent against its own comment.
+      expect(__test_classifyPrReviewComment(agentReplyQuotingGateSource, REVIEWER, REVIEWER)).toBe(
+        "suppressed_unstructured",
+      );
+      expect(__test_isActionablePrReviewComment(agentReplyQuotingGateSource, REVIEWER, REVIEWER)).toBe(false);
+    });
+
+    it("the reviewer identity alone no longer admits a structureless comment", () => {
+      const bare = "Rebased and force-pushed. The earlier changes requested are addressed.";
+      expect(__test_hasActionablePrReviewFeedback(bare)).toBe(true);
+      expect(__test_isActionablePrReviewComment(bare, REVIEWER, REVIEWER)).toBe(false);
+    });
+
+    it("still routes a genuine consolidated review posted as a comment", () => {
+      const realReview = [
+        "## Ally — Consolidated PR Review",
+        "",
+        "### Important Issues (1)",
+        "",
+        "- I1: the readiness probe points at the wrong port.",
+        "",
+        "### Recommended Action",
+        "",
+        "Fix I1 before merge.",
+      ].join("\n");
+      expect(__test_classifyPrReviewComment(realReview, REVIEWER, REVIEWER)).toBe("actionable");
+      expect(__test_isActionablePrReviewComment(realReview, REVIEWER, REVIEWER)).toBe(true);
+    });
+
+    it("accepts a `Reviewed head:` attestation as the second structure signal", () => {
+      // Independent of the header, so a template change to one cannot suppress
+      // every comment-shaped review at once.
+      const attested = [
+        "Reviewed head: `9492770188f0c0dd2b1e2f6a5c4d3e2f1a0b9c8d`",
+        "",
+        "### Critical Issues (1)",
+        "",
+        "- C1: the migration drops the column before the backfill runs.",
+      ].join("\n");
+      expect(__test_isReviewShapedPrComment(attested)).toBe(true);
+      expect(__test_isActionablePrReviewComment(attested, REVIEWER, REVIEWER)).toBe(true);
+    });
+
+    it("keeps a mid-body header routing: line-anchored is not body-anchored", () => {
+      // paperclip#1877 comment 5686789134 is a genuine Ally review that opens
+      // with prose and carries its header mid-body. The first cut of this
+      // predicate stayed un-anchored to keep it, on the belief that the only
+      // alternative was byte-0 anchoring. hasAllyConsolidatedReviewHeading is
+      // LINE-anchored (`im`), so this routes without the un-anchored hole.
+      const supplementary = [
+        "_Supplementary pass — a concurrent Ally run already submitted the operative verdict._",
+        "",
+        "## Ally — Consolidated PR Review",
+        "",
+        "### Important Issues (1)",
+        "",
+        "- I1: the retry budget is unbounded.",
+      ].join("\n");
+      expect(__test_isActionablePrReviewComment(supplementary, REVIEWER, REVIEWER)).toBe(true);
+    });
+
+    it("reports a non-reviewer structureless body as plain non-feedback, not a suppression", () => {
+      // Only the reviewer identity could have been admitted before, so only
+      // that case is a behaviour change worth reporting.
+      const bare = "Rebased. The earlier changes requested are addressed.";
+      expect(__test_classifyPrReviewComment(bare, "some-human", REVIEWER)).toBe("not_feedback");
+    });
+
+    // -- the quoting residual --------------------------------------------
+    //
+    // Quoting the review you are replying to is the single most common shape
+    // of a reply-to-review, and the first cut of this predicate admitted every
+    // one of these. Each is verified false here AND actionable-or-not noted:
+    // the fenced case is the load-bearing one, because it is also
+    // hasActionablePrReviewFeedback true, so admitting it produced a real
+    // self-wake rather than a harmless misclassification.
+    it("does not admit a review quoted inside a fenced block", () => {
+      const quoted = [
+        "Thanks — addressing these now. For context the review said:",
+        "",
+        "```markdown",
+        "## Ally — Consolidated PR Review",
+        "Reviewed head: 016999f72fca54f76184aeea4d5d0c7fe8e5d349",
+        "",
+        "### Important Issues (1)",
+        "- changes requested on the retry budget",
+        "```",
+        "",
+        "I disagree with the second one and will reply on the PR.",
+      ].join("\n");
+      // Findings-shaped to the shared predicate -- this is what made the old
+      // `hasActionablePrReviewFeedback` conjunct unable to bound the case.
+      expect(__test_hasActionablePrReviewFeedback(quoted)).toBe(true);
+      expect(__test_isReviewShapedPrComment(quoted)).toBe(false);
+      expect(__test_isActionablePrReviewComment(quoted, REVIEWER, REVIEWER)).toBe(false);
+    });
+
+    it("does not admit a review pasted as a 4-space indented block", () => {
+      // NOT_INDENTED_CODE, shared with extractAllyReviewedHeadSha so the two
+      // cannot disagree about what counts as code.
+      const indented = [
+        "Quoting the review I am replying to:",
+        "",
+        "    ## Ally — Consolidated PR Review",
+        "    Reviewed head: 016999f72fca54f76184aeea4d5d0c7fe8e5d349",
+      ].join("\n");
+      expect(__test_isReviewShapedPrComment(indented)).toBe(false);
+    });
+
+    it("does not admit a blockquoted or SHA-less attestation", () => {
+      // The hand-rolled regex admitted a `>` prefix explicitly and required no
+      // SHA at all. extractAllyReviewedHeadSha requires exactly one standalone
+      // full 40-hex attestation: "an absent or ambiguous attestation must not
+      // be guessed at."
+      expect(__test_isReviewShapedPrComment("> Reviewed head: 016999f7\n\nI froze this head.")).toBe(false);
+      expect(__test_isReviewShapedPrComment("Reviewed head:\n\nnothing else here")).toBe(false);
+      expect(__test_isReviewShapedPrComment("Reviewed head: 016999f7")).toBe(false);
+    });
+
+    it("keeps the BLO-31730 emphasis forms of a genuine attestation", () => {
+      // Reusing extractAllyReviewedHeadSha inherits these; the hand-rolled
+      // regex dropped them, so it was looser on evasion AND tighter on real
+      // reviews at the same time.
+      const sha = "016999f72fca54f76184aeea4d5d0c7fe8e5d349";
+      expect(__test_isReviewShapedPrComment(`**Reviewed head:** \`${sha}\``)).toBe(true);
+      expect(__test_isReviewShapedPrComment(`Reviewed head: ${sha}`)).toBe(true);
+    });
+
+    // -- the drop is observable -------------------------------------------
+    //
+    // Today every hit is an agent reply being correctly excluded. If Ally's
+    // template ever stops emitting both structure signals, a real
+    // comment-shaped review lands here and this callback is the only thing
+    // that would say so -- so the alarm itself needs a test.
+    const feedbackEvent = (
+      body: string,
+      options: Parameters<typeof __test_resolveEventContext>[2] = {},
+    ) =>
+      __test_resolveEventContext("issue_comment", {
+        action: "created",
+        issue: {
+          number: 1940,
+          title: "require review structure before an App-seat comment is review feedback",
+          body: "Closes PEN-3383",
+          html_url: "https://github.com/Blockcast/paperclip/pull/1940",
+          pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/1940" },
+          user: { login: "allyblockcast[bot]" },
+        },
+        comment: {
+          id: 5740414507,
+          body,
+          html_url: "https://github.com/Blockcast/paperclip/pull/1940#issuecomment-5740414507",
+          user: { login: REVIEWER, type: "Bot" },
+        },
+        repository: { full_name: "Blockcast/paperclip" },
+      }, { prReviewerBotLogin: REVIEWER, ...options });
+
+    it("reports a structureless reviewer-identity drop exactly once", () => {
+      const suppressed: Array<Record<string, unknown>> = [];
+      const ctx = feedbackEvent(agentReplyQuotingGateSource, {
+        onSuppressedReviewFeedback: (info) => suppressed.push({ ...info }),
+      });
+      expect(ctx).toBeNull();
+      expect(suppressed).toHaveLength(1);
+      expect(suppressed[0]).toMatchObject({
+        repoFullName: "Blockcast/paperclip",
+        prNumber: 1940,
+        commentId: 5740414507,
+        commentAuthorLogin: REVIEWER,
+      });
+    });
+
+    it("does not report the drop when the body is also a review request", () => {
+      // The `!reviewerRequest` conjunct. A marker-led body still routes as a
+      // REQUEST and loses nothing, so reporting it here would make this signal
+      // noise instead of the template-drift alarm it exists to be.
+      const alsoARequest = [
+        "<!-- paperclip:review-request -->",
+        "@ally please re-review — the changes requested earlier are addressed.",
+      ].join("\n");
+      expect(__test_classifyPrReviewComment(alsoARequest, REVIEWER, REVIEWER)).toBe(
+        "suppressed_unstructured",
+      );
+      const suppressed: Array<Record<string, unknown>> = [];
+      const ctx = feedbackEvent(alsoARequest, {
+        onSuppressedReviewFeedback: (info) => suppressed.push({ ...info }),
+      });
+      expect(ctx?.wakeReason).toBe("github_pr_review_requested");
+      expect(suppressed).toHaveLength(0);
+    });
   });
 
   it("anchors the agent review-request marker to literal byte 0 of the body (BLO-18865)", () => {
@@ -1986,9 +2198,10 @@ describe("github-webhook pure helpers", () => {
       // THE test for the `!reviewFeedback` conjunct (BLO-32381 Suggestion 1).
       // Both predicates must be live simultaneously, which needs a body that is
       // marker-led AND satisfies isActionablePrReviewComment. That second half
-      // does not require the reviewer-bot author: hasAllyConsolidatedReviewHeader
-      // is un-anchored, so an embedded review header qualifies the body on its
-      // own -- which is why this shape is reachable from the gate's own author.
+      // does not require the reviewer-bot author: the structure test carries no
+      // author requirement, so an embedded review header on its own unfenced
+      // line qualifies the body -- which is why this shape is reachable from the
+      // gate's own author.
       const body = [
         legacyMarker,
         "",
@@ -10822,6 +11035,15 @@ describe("PR review feedback comment heading (BLO-19067)", () => {
   it("keeps the changes-requested wording when no review state is present", () => {
     // Body-heuristic path: an `issue_comment` review carries no formal state
     // and only reaches this builder when the body already carries findings.
+    //
+    // PEN-3383: the fixture now carries the consolidated header, because
+    // findings-shaped text alone no longer reaches this builder. Agents post
+    // through the reviewer's own App seat, so author identity cannot separate
+    // Ally's review output from an agent's reply to it, and admission requires
+    // review STRUCTURE. A genuine comment-shaped Ally review always carries
+    // that header — this fixture is MORE realistic than the bare findings body
+    // it replaces, not a concession to the guard. The assertion under test (the
+    // stateless heading/directive wording) is unchanged.
     const ctx = __test_resolveEventContext("issue_comment", {
       action: "created",
       issue: {
@@ -10831,13 +11053,16 @@ describe("PR review feedback comment heading (BLO-19067)", () => {
       },
       comment: {
         id: 1,
-        body: "### Important Issues (1)\n\nI1: wrong route.",
+        body: "## Ally — Consolidated PR Review\n\n### Important Issues (1)\n\nI1: wrong route.",
         html_url: "https://github.com/Blockcast/Network-Operator-Portal/pull/591#issuecomment-1",
         user: { login: "allyblockcast[bot]" },
       },
       repository: { full_name: "Blockcast/Network-Operator-Portal" },
     });
     expect(ctx).not.toBeNull();
+    // The state really is absent — otherwise this asserts the default branch
+    // for the wrong reason.
+    expect(ctx?.reviewState ?? null).toBeNull();
     const comment = __test_buildPrReviewFeedbackComment(ctx!);
     expect(comment).toContain("## Changes Requested");
   });

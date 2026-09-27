@@ -871,6 +871,111 @@ describe("BLO-20650 concurrent webhook + sweep on one alert-state record", () =>
     expect(coverRow.cancelled_at).not.toBeNull();
   });
 
+  /**
+   * BLO-33497 — the compensation above is reached only when the swap is
+   * REFUSED, so it does not cover the interleaving where the swap SUCCEEDS.
+   * The webhook cascaded only *before* storing `resolvedAt`, which allowed:
+   * the resolve's cascade runs while the cover still does not exist (no
+   * membership to mark), the sweep then creates the cover and wins its swap
+   * against a record the webhook has not written yet, and only afterwards does
+   * the webhook store `resolvedAt`. Nothing compensates, and no later resolve
+   * can ever cascade into that cover again — it is orphaned open with an
+   * unresolved member for an alert that has already cleared.
+   *
+   * The fix is a SECOND cascade in `handleResolved`, behind the state write.
+   * Simply moving the existing one is wrong: `ctx.state.set` is the commit
+   * point, and `worker.test.ts`'s "fails the delivery without marking resolved
+   * when cover cleanup fails" pins the cascade ahead of it so a failure leaves
+   * `resolvedAt` unwritten. Two calls answer the two failures — the first makes
+   * cleanup a precondition of committing, the second sees a cover that did not
+   * exist when the first ran, since a swap that succeeds means the cover was
+   * created before the commit.
+   */
+  it("closes the cover when the resolve cascades before it exists and stores state after the swap", async () => {
+    const exhausted: AlertStateRecord = { ...unresolved(), escalationAttempt: 1 };
+    const covers = buildFakeAlertmanagerStore();
+
+    // Hold the webhook's authoritative (un-guarded) state write open until the
+    // sweep has finished, and report when it is reached. That *is* the
+    // interleaving: everything the webhook does before storing `resolvedAt`
+    // happens first, and the store itself happens last. Gating on the write
+    // rather than on a tick count keeps it exact in both orderings.
+    let reachedStateWrite = false;
+    let releaseStateWrite!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseStateWrite = resolve; });
+    const base = buildFakeStateStore(exhausted);
+    const store = {
+      ...base,
+      set: vi.fn(async (ref: unknown, value: AlertStateRecord, options?: { ifMatch?: unknown }) => {
+        if (!options || !("ifMatch" in options)) {
+          reachedStateWrite = true;
+          await gate;
+        }
+        return base.set(ref, value, options);
+      }),
+    } as unknown as ReturnType<typeof buildFakeStateStore>;
+
+    const { ctx, mocks } = sweepContext(exhausted, null, covers);
+    mocks.state = store as never;
+
+    // The resolve shares the sweep's covers/members tables, so its cascade is
+    // real rather than modelled — that is the whole point of this test. Every
+    // other table keeps the permissive single-delivery answers `resolveContext`
+    // already uses, so the only difference from the sibling test above is the
+    // cascade's visibility of the membership.
+    const resolveDb = {
+      namespace: "ns",
+      execute: async (sql: string, params: unknown[] = []) =>
+        sql.includes("cover") ? covers.db.execute(sql, params) : { rowCount: 0 },
+      query: async (sql: string, params: unknown[] = []) =>
+        sql.includes("cover") ? covers.db.query(sql, params) : [],
+    };
+
+    let webhook!: Promise<unknown>;
+    mocks.access.members.list = vi.fn(async () => {
+      // Start the resolve inside `createCover`, at the same await the
+      // compensated test uses — after the membership guard, before the cover
+      // issue exists.
+      webhook = handleResolved(
+        { ...(resolveContext(store) as unknown as Record<string, unknown>), db: resolveDb } as unknown as PluginContext,
+        config(),
+        resolvedAlert,
+      );
+      // Let it run right up to its state write. Bounded, so a change to the
+      // webhook's shape fails this test rather than hanging it.
+      for (let i = 0; i < 1000 && !reachedStateWrite; i++) await Promise.resolve();
+      return [{ principalType: "user", principalId: "board-1", status: "active", membershipRole: "owner" }];
+    });
+
+    // The sweep catches and logs a per-issue failure (runAlertEscalationSweep),
+    // so an assertion inside the members.list mock would be swallowed there.
+    // Assert the ordering out here instead, after the webhook is released and
+    // awaited: a webhook rejection surfaces first, then the ordering guard.
+    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+    releaseStateWrite();
+    await webhook;
+    expect(reachedStateWrite).toBe(true);
+
+    // The swap SUCCEEDED here — this is deliberately not the compensated
+    // branch, which is what makes it a distinct case from the test above.
+    expect(store.read().escalationComplete).toBe(true);
+    expect(store.read().resolvedAt).toBe("2026-07-11T02:00:00Z");
+    // The two lines above hold on the refused-swap branch too, since the
+    // webhook's own write sets both. Only the claimed path posts the
+    // chain-exhausted comment, so this pins the test to the branch it names.
+    expect(mocks.issues.createComment).toHaveBeenCalledWith(
+      "issue-1", expect.stringContaining("Agent chain exhausted"), "company-1",
+    );
+    // No cover may be left open with an unresolved member for a cleared alert.
+    // Both assertions fail with the cascade moved back ahead of the state
+    // write: membership stays open, which blocks the closing claim, so
+    // `reconcileStuckCovers` cannot clean it up either.
+    const [coverRow] = [...covers.covers.values()];
+    expect(coverRow).toBeDefined();
+    expect(covers.openMemberCount(coverRow.cover_issue_id)).toBe(0);
+    expect(coverRow.cancelled_at).not.toBeNull();
+  });
+
   it("refuses a stale sweep write against a record any other writer touched", async () => {
     // Same guard, non-resolve mutation: any concurrent rewrite must void the
     // sweep's read. Otherwise this would be a special case for one field

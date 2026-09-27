@@ -11173,7 +11173,7 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
 
   async function seedOwnershipIssue(params: {
     checkoutStatus: "running" | "failed" | "timed_out";
-    actorRunStatus?: "queued" | "running" | "failed" | "timed_out" | "succeeded";
+    actorRunStatus?: "queued" | "running" | "failed" | "timed_out" | "succeeded" | "scheduled_retry";
     assigneeMatchesActor?: boolean;
   }) {
     const companyId = randomUUID();
@@ -11232,8 +11232,10 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
         agentId: actorAgentId,
         status: actorRunStatus,
         invocationSource: "manual",
-        startedAt: actorRunStatus === "running" ? new Date() : null,
-        finishedAt: actorRunStatus === "queued" || actorRunStatus === "running" ? null : new Date(),
+        // `scheduled_retry` with startedAt set is the retry ladder parking a run
+        // that DID start: not reapable, yet refused by the grant gate.
+        startedAt: actorRunStatus === "running" || actorRunStatus === "scheduled_retry" ? new Date() : null,
+        finishedAt: actorRunStatus === "queued" || actorRunStatus === "running" || actorRunStatus === "scheduled_retry" ? null : new Date(),
       },
     ]);
     await db.insert(issues).values({
@@ -11336,6 +11338,129 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
     expect(row).toEqual({
       checkoutRunId: null,
       executionRunId: null,
+    });
+  });
+
+  // BLO-28441: a run the server has already marked terminal keeps executing for
+  // ~10 minutes and its comments still succeed, so it publishes analysis derived
+  // from a state the server considers dead. The guard's refusal is correct; what
+  // was missing was any way for the caller to learn the refusal is about ITSELF.
+  //
+  // Note this lands in the no-holder branch on purpose: the ladder releases the
+  // dead holder's lock in the same call, so both lock columns read null and the
+  // pre-BLO-28441 remediation told a run that can never succeed to "retry once".
+  it("names the actor's own terminal run status in the ownership 409", async () => {
+    const seeded = await seedOwnershipIssue({ checkoutStatus: "failed", actorRunStatus: "succeeded" });
+
+    await expect(
+      svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId),
+    ).rejects.toMatchObject({
+      status: 409,
+      details: {
+        actorRunId: seeded.actorRunId,
+        actorRunStatus: "succeeded",
+      },
+    });
+
+    const err = await svc
+      .assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId)
+      .then(() => null, (caught) => caught as { details?: Record<string, unknown> });
+    // The caller must be able to act on this without further investigation, so
+    // the hoisted remediation has to blame the caller's run, not the holder.
+    expect(String(err?.details?.remediation)).toContain(seeded.actorRunId);
+    expect(String(err?.details?.remediation)).toContain("succeeded");
+  });
+
+  it("names a started run parked in scheduled_retry as dead, not retryable", async () => {
+    // `runningCheckoutExecutionPatch` refuses anything but `running`; a run the
+    // retry ladder parked in `scheduled_retry` after it started is refused just
+    // the same, yet it is not reapable (startedAt is set), so gating the
+    // remediation on reapability sent it back to "retry once" -- a retry that
+    // can never succeed. This fixture keeps the actor run distinct from the
+    // holder on purpose: a parked run that is its OWN holder is granted by
+    // `resolveSameRunOwnership` before any status check and never gets here
+    // (BLO-35402).
+    const seeded = await seedOwnershipIssue({ checkoutStatus: "failed", actorRunStatus: "scheduled_retry" });
+
+    const err = await svc
+      .assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId)
+      .then(() => null, (caught) => caught as { status?: number; details?: Record<string, unknown> });
+    expect(err?.status).toBe(409);
+    expect(err?.details?.actorRunStatus).toBe("scheduled_retry");
+    expect(String(err?.details?.remediation)).toContain(seeded.actorRunId);
+    expect(String(err?.details?.remediation)).toContain("scheduled_retry");
+    expect(String(err?.details?.remediation)).not.toContain("retry once");
+  });
+
+  it("reports the actor's run status without weakening the live-holder fence", async () => {
+    // The adversarial twin: both runs genuinely live. The guard's DECISION must
+    // be byte-identical to before — this is an observability change only, and a
+    // widened guard would let a run the server declared dead seize a lock.
+    const seeded = await seedOwnershipIssue({ checkoutStatus: "running", actorRunStatus: "running" });
+
+    await expect(
+      svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId),
+    ).rejects.toMatchObject({
+      status: 409,
+      details: {
+        // Existing payload preserved: the BLOCKING run id must remain present.
+        checkoutRunId: seeded.staleRunId,
+        executionRunId: seeded.staleRunId,
+        actorRunId: seeded.actorRunId,
+        // A live actor is reported as live, and must NOT be told to stop working.
+        actorRunStatus: "running",
+        holderLiveness: "live",
+      },
+    });
+
+    // The live holder still owns the row: nothing was adopted or released.
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, seeded.issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      checkoutRunId: seeded.staleRunId,
+      executionRunId: seeded.staleRunId,
+    });
+  });
+
+  // BLO-28441 names both routes in its acceptance criterion. The PATCH-side
+  // guard is pinned above; this pins the `POST /checkout` conflict, which is the
+  // route the original wedge was discovered on. Without it, dropping the
+  // `describeIssueLockConflict` spread from the checkout 409 passes the suite.
+  it("names the actor's own terminal run status in the checkout 409", async () => {
+    const seeded = await seedOwnershipIssue({ checkoutStatus: "running", actorRunStatus: "succeeded" });
+
+    await expect(
+      svc.checkout(seeded.issueId, seeded.actorAgentId, ["todo"], seeded.actorRunId),
+    ).rejects.toMatchObject({
+      status: 409,
+      message: "Issue checkout conflict",
+      details: {
+        checkoutRunId: seeded.staleRunId,
+        executionRunId: seeded.staleRunId,
+        actorRunId: seeded.actorRunId,
+        actorRunStatus: "succeeded",
+        holderLiveness: "live",
+      },
+    });
+
+    // The live holder still owns the row: the rejected checkout adopted nothing.
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, seeded.issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      checkoutRunId: seeded.staleRunId,
+      executionRunId: seeded.staleRunId,
     });
   });
 

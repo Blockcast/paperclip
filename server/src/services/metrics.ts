@@ -534,6 +534,78 @@ export const SCHEDULED_RETRY_PARK_HORIZON_METRIC =
 export const SCHEDULED_RETRY_PARK_HORIZON_REFRESH_SUCCESS_METRIC =
   "paperclip_scheduled_retry_park_horizon_refresh_success";
 /**
+ * Retry-scheduling decisions, by outcome and retry reason (BLO-35472).
+ *
+ * The sibling {@link SCHEDULED_RETRY_PARK_HORIZON_METRIC} is a *max over live
+ * retries*, so it cannot see this: mass abandonment removes the long-horizon
+ * rows and the gauge goes **down**, which reads identically to the backoff
+ * clamp working. `routine_retry_abandoned` in particular creates no retry row
+ * at all -- by design, the owning routine's next scheduled fire takes the work
+ * -- so there is nothing in `heartbeat_runs` for any row-counting query to
+ * find. This counter is the only instrument that sees the decision itself.
+ *
+ * `outcome` is the return outcome, except that `not_scheduled` is reported as
+ * its `errorCode` -- the coarse `not_scheduled` label would collapse "the
+ * routine window cannot accept a useful retry" into the same series as "the
+ * issue was reassigned", which is the distinction this metric exists to make.
+ */
+export const RETRY_SCHEDULE_OUTCOME_METRIC = "paperclip_retry_schedule_outcome_total";
+/**
+ * Retry-scheduling outcomes, as an allow-list so a future branch cannot mint a
+ * series. `scheduled` and `retry_exhausted` are returned outcomes; the rest are
+ * `not_scheduled` error codes, from `scheduleBoundedRetryForRun`'s own returns
+ * and from `evaluateScheduledRetryGate`.
+ *
+ * `scheduled` is the retry-row creation rate, `routine_retry_abandoned` is the
+ * abandon count, and their ratio is the abandon share -- all three of
+ * BLO-29052 verifying signal #3 off one counter.
+ */
+export const KNOWN_RETRY_SCHEDULE_OUTCOMES = [
+  "scheduled",
+  "retry_exhausted",
+  "routine_retry_abandoned",
+  "agent_not_invokable",
+  "budget_blocked",
+  "issue_dependencies_blocked",
+  "issue_execution_lock_changed",
+  "issue_not_found",
+  "issue_not_in_progress",
+  "issue_paused",
+  "issue_reassigned",
+  "issue_review_participant_changed",
+  "issue_cancelled",
+  "issue_terminal_status",
+  "other",
+] as const;
+export type RetryScheduleOutcomeLabel = (typeof KNOWN_RETRY_SCHEDULE_OUTCOMES)[number];
+/**
+ * Retry reasons reaching `scheduleBoundedRetryForRun`. Every in-tree caller
+ * passes one of these constants, but the service exposes the call publicly
+ * (`scheduleBoundedRetry` on the heartbeat service, used by recovery,
+ * productivity-review and task-watchdogs), so the reason is coerced here rather
+ * than trusted -- an unbounded `retryReason` on a path that runs for every
+ * retry of every agent is exactly the cardinality blow-up this metric must not
+ * cause. Anything unrecognised lands in `other`, which keeps the counter
+ * correct (just less granular) instead of minting a series per typo.
+ */
+export const KNOWN_RETRY_SCHEDULE_REASONS = [
+  "transient_failure",
+  "ccrotate_capacity",
+  "capacity_blocked",
+  "job_failed",
+  "dependency_blocked",
+  "interaction_continuation_infra_retry",
+  "execution_review_participant_recovery",
+  "max_turns_continuation",
+  "session_unavailable",
+  "zero_token_session_reset",
+  "issue_continuation_needed",
+  "missing_issue_comment",
+  "queued_run_detachment_recovery",
+  "other",
+] as const;
+export type RetryScheduleReasonLabel = (typeof KNOWN_RETRY_SCHEDULE_REASONS)[number];
+/**
  * postgres.js connection-pool occupancy, by `state` (BLO-33243).
  *
  * There was no pool instrumentation anywhere in this fleet, which made pool
@@ -2282,6 +2354,7 @@ type HeartbeatRunFailedLabel =
 
 let heartbeatRunFailed: Counter<HeartbeatRunFailedLabel> | null = null;
 let ccrotateCapacityDeferred: Counter<"adapter" | "provider"> | null = null;
+let retryScheduleOutcome: Counter<"outcome" | "retry_reason"> | null = null;
 let penstockGateProbe: Counter<"path" | "outcome" | "provider" | "model"> | null = null;
 let penstockGateProbeDuration: Histogram<"path" | "provider"> | null = null;
 let heartbeatTimerSchedulerExclusion: Counter<"reason"> | null = null;
@@ -2410,6 +2483,7 @@ function ensureRegistry(): {
   isolatedStartedCounter: Counter<"agent_id" | "isolation_mode">;
   failedCounter: Counter<HeartbeatRunFailedLabel>;
   capacityDeferredCounter: Counter<"adapter" | "provider">;
+  retryScheduleOutcomeCounter: Counter<"outcome" | "retry_reason">;
   penstockGateProbeCounter: Counter<"path" | "outcome" | "provider" | "model">;
   penstockGateProbeDurationHistogram: Histogram<"path" | "provider">;
   heartbeatTimerSchedulerExclusionCounter: Counter<"reason">;
@@ -2479,6 +2553,7 @@ function ensureRegistry(): {
     || !isolatedRunStarted
     || !heartbeatRunFailed
     || !ccrotateCapacityDeferred
+    || !retryScheduleOutcome
     || !penstockGateProbe
     || !penstockGateProbeDuration
     || !heartbeatTimerSchedulerExclusion
@@ -2713,6 +2788,21 @@ function ensureRegistry(): {
       registers: [registry],
     });
     scheduledRetryParkHorizonRefreshSuccess.set(0);
+    retryScheduleOutcome = new Counter({
+      name: RETRY_SCHEDULE_OUTCOME_METRIC,
+      help:
+        "Count of retry-scheduling decisions (BLO-35472), by bounded outcome and retry reason. "
+        + "Incremented once per scheduleBoundedRetryForRun return. outcome='scheduled' is the "
+        + "retry-row creation rate; outcome='routine_retry_abandoned' is a retry deliberately not "
+        + "created because the owning routine's window cannot accept a useful one, so the next "
+        + "scheduled fire takes the work. That branch persists no row, so it is invisible to "
+        + SCHEDULED_RETRY_PARK_HORIZON_METRIC + ", which is a max over LIVE retries and therefore "
+        + "falls when retries are dropped. Not pre-seeded: an absent series means never "
+        + "incremented, so pair any zero-abandon reading with a populated control series before "
+        + "concluding no abandons occurred rather than no scrape.",
+      labelNames: ["outcome", "retry_reason"],
+      registers: [registry],
+    });
     dbPoolConnections = new Gauge({
       name: DB_POOL_CONNECTIONS_METRIC,
       help:
@@ -3447,6 +3537,7 @@ function ensureRegistry(): {
     isolatedStartedCounter: isolatedRunStarted,
     failedCounter: heartbeatRunFailed,
     capacityDeferredCounter: ccrotateCapacityDeferred,
+    retryScheduleOutcomeCounter: retryScheduleOutcome,
     penstockGateProbeCounter: penstockGateProbe,
     penstockGateProbeDurationHistogram: penstockGateProbeDuration,
     heartbeatTimerSchedulerExclusionCounter: heartbeatTimerSchedulerExclusion,
@@ -3648,6 +3739,42 @@ export function recordCcrotateCapacityDeferred(
       : "unknown",
   };
   ensureRegistry().capacityDeferredCounter.inc(labels);
+  return labels;
+}
+
+export interface RecordRetryScheduleOutcomeInput {
+  /**
+   * The return outcome, or -- for a `not_scheduled` return -- its `errorCode`.
+   * Coerced to {@link KNOWN_RETRY_SCHEDULE_OUTCOMES}; anything else is `other`.
+   */
+  outcome: string | null | undefined;
+  /** Retry reason. Coerced to {@link KNOWN_RETRY_SCHEDULE_REASONS}. */
+  retryReason: string | null | undefined;
+}
+
+/**
+ * Increment {@link RETRY_SCHEDULE_OUTCOME_METRIC}. Call once per
+ * `scheduleBoundedRetryForRun` return, on every path -- the abandon path
+ * especially, since it persists nothing and is otherwise unobservable.
+ *
+ * Both labels are coerced to their allow-lists, so worst-case series count is
+ * `KNOWN_RETRY_SCHEDULE_OUTCOMES.length * KNOWN_RETRY_SCHEDULE_REASONS.length`
+ * regardless of what a caller passes. Deliberately carries no `agent_id`:
+ * {@link SCHEDULED_RETRY_PARK_HORIZON_METRIC} already holds that axis, and this
+ * is a fleet-level rate.
+ */
+export function recordRetryScheduleOutcome(
+  input: RecordRetryScheduleOutcomeInput,
+): { outcome: RetryScheduleOutcomeLabel; retry_reason: RetryScheduleReasonLabel } {
+  const labels = {
+    outcome: (KNOWN_RETRY_SCHEDULE_OUTCOMES as readonly string[]).includes(input.outcome ?? "")
+      ? (input.outcome as RetryScheduleOutcomeLabel)
+      : ("other" as const),
+    retry_reason: (KNOWN_RETRY_SCHEDULE_REASONS as readonly string[]).includes(input.retryReason ?? "")
+      ? (input.retryReason as RetryScheduleReasonLabel)
+      : ("other" as const),
+  };
+  ensureRegistry().retryScheduleOutcomeCounter.inc(labels);
   return labels;
 }
 
@@ -4994,6 +5121,7 @@ export function __resetMetricsForTest(): void {
   isolatedRunStarted = null;
   heartbeatRunFailed = null;
   ccrotateCapacityDeferred = null;
+  retryScheduleOutcome = null;
   penstockGateProbe = null;
   penstockGateProbeDuration = null;
   heartbeatTimerSchedulerExclusion = null;
