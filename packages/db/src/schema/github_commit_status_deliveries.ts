@@ -17,6 +17,16 @@ export const githubCommitStatusDeliveries = pgTable(
     context: text("context").notNull(),
     state: text("state").notNull().default("failure"),
     forceWrite: boolean("force_write").notNull().default(false),
+    /**
+     * Re-run the comment-review gate evaluation instead of replaying `state`.
+     *
+     * The gate's live evaluation is a void-detached promise fired after the
+     * webhook ack, and it is the sole writer of its status context, so a single
+     * lost evaluation leaves the previous verdict standing forever (BLO-36819).
+     * A row flagged here carries no verdict of its own — `state` is only the
+     * placeholder the column's NOT NULL requires.
+     */
+    reevaluate: boolean("reevaluate").notNull().default(false),
     description: text("description").notNull(),
     targetUrl: text("target_url"),
     prNumber: integer("pr_number").notNull(),

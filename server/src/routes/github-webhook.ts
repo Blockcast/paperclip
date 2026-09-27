@@ -54,6 +54,7 @@ import {
   recordDependabotWebhookDiagnostic,
   resolveDependabotIssueAssigneeId,
 } from "../services/dependabot-alert-issues.js";
+import { loadConfig } from "../config.js";
 import { logger } from "../middleware/logger.js";
 import { HttpError } from "../errors.js";
 import { redactSensitiveText } from "../redaction.js";
@@ -996,6 +997,18 @@ function resolvePrCommentReviewGateWebhookTrigger(
 // PR→issue back-link (BLO-13353, #973 symptom-1). A hidden marker makes the
 // one-time post idempotent across redeliveries/reopens: if any existing PR
 // comment carries it, we never post again.
+/**
+ * How long the durable comment-review gate backstop waits before it fires.
+ *
+ * It must outlast the live evaluation it backs up, or every webhook would pay
+ * for a second evaluation instead of only the ones that lose theirs. The live
+ * path's own bounded retries settle in seconds; the longest lag ever measured
+ * between a review and its gate status was ~6 minutes (onprem-k8s#4017), so 15
+ * gives that case room and still bounds a genuinely lost verdict to a quarter
+ * of an hour rather than forever.
+ */
+const COMMENT_REVIEW_GATE_REEVALUATION_DELAY_MS = 15 * 60_000;
+
 const PR_ISSUE_BACKLINK_MARKER = "<!-- paperclip-issue-backlink -->";
 
 function backLinkAbsoluteUrl(publicBaseUrl: string, issuePrefix: string, identifier: string): string {
@@ -5379,6 +5392,65 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       config.prReviewerBotLogin,
     );
     if (commentReviewGateTrigger) {
+      // The head this delivery is about, read from the signed payload only.
+      // `headSha` is absent on the review and comment triggers by design — the
+      // live evaluation resolves the head itself so a status is never written
+      // to a commit the branch has moved past — so take it from the payload's
+      // own `pull_request.head.sha` here. `issue_comment` carries no head at
+      // all and gets no backstop rather than an API read before the ack; Ally
+      // has used the reviews surface for 33 of 33 measured consolidated
+      // reviews, so that is the rare path, not the common one.
+      const commentReviewGateBackstopSha =
+        commentReviewGateTrigger.headSha
+        ?? readStringField(
+          (payload.pull_request as Record<string, unknown> | undefined)?.head as
+            | Record<string, unknown>
+            | undefined,
+          "sha",
+        );
+      // Durable backstop, queued BEFORE the detached evaluation below and
+      // before this request acks (BLO-36819). That evaluation is the sole
+      // writer of this status context and has no retry that outlives the
+      // process: a fetch failure past its bounded retries, a refused status
+      // POST, or an API pod restart mid-flight all leave the previous verdict
+      // standing forever. frr#105 sat red for hours after a clean at-head
+      // review for exactly that reason.
+      //
+      // Cheap because it is self-cancelling: the outbox skips the row when a
+      // status for this context was written at or after the row was queued, so
+      // on every webhook whose live evaluation lands — which is ~98% of them —
+      // this costs one upsert and one status read, and no GitHub write.
+      // `loadConfig()`, not the injected route config: the gate's status
+      // context is deployment configuration (the same value
+      // runPrCommentReviewGateCheck reads), not a route seam.
+      const commentReviewGateContext = loadConfig().prCommentReviewGateStatusContext.trim();
+      if (commentReviewGateContext && commentReviewGateBackstopSha) {
+        try {
+          await enqueueGithubCommitStatusDelivery(db, {
+            companyId: null,
+            sourceRunId: null,
+            repoFullName: commentReviewGateTrigger.repoFullName,
+            sha: commentReviewGateBackstopSha,
+            context: commentReviewGateContext,
+            // Placeholder: a reevaluate row computes its own verdict and never
+            // publishes this state. `pending` is the safe value if a future
+            // change ever did replay it.
+            state: "pending",
+            description: "Comment-review gate re-evaluation queued.",
+            reevaluate: true,
+            delayMs: COMMENT_REVIEW_GATE_REEVALUATION_DELAY_MS,
+            prNumber: commentReviewGateTrigger.prNumber,
+            prUrl: commentReviewGateTrigger.prUrl,
+          });
+        } catch (err) {
+          // Never fail the ack for the backstop. Losing it costs the behavior
+          // we had before this existed, not a redelivery storm.
+          logger.warn(
+            { err, deliveryId, event: eventName, ...commentReviewGateTrigger },
+            "github webhook comment-review gate re-evaluation enqueue failed (non-fatal)",
+          );
+        }
+      }
       // Build the input once and hand the SAME object to both branches, so the
       // injection seam observes the real argument — including `db`. When the
       // seam was called with the bare trigger, no webhook-level test could
