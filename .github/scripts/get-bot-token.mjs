@@ -66,7 +66,13 @@ export function rateLimitWaitMs(headers, now = Date.now()) {
   const retryAfter = Number(headers.get('retry-after'));
   if (Number.isFinite(retryAfter) && retryAfter > 0) return retryAfter * 1000;
   const reset = Number(headers.get('x-ratelimit-reset'));
-  if (Number.isFinite(reset) && reset > 0) return Math.max(0, reset * 1000 - now);
+  if (Number.isFinite(reset) && reset > 0) {
+    // A reset already at or behind our clock (skew, or a second limit after an
+    // earlier sleep) must not become a zero wait: that re-requests at full rate
+    // against an API that is refusing us. Fall back to the headerless floor.
+    const wait = reset * 1000 - now;
+    return wait > 0 ? wait : RATE_LIMIT_MIN_WAIT_MS;
+  }
   return RATE_LIMIT_MIN_WAIT_MS;
 }
 
@@ -126,13 +132,15 @@ export async function ghFetch(path, token, options = {}) {
       const err = new Error(
         `${RATE_LIMIT_NOT_EVALUATED}: GitHub API ${method} ${path} → ${res.status} rate limited. ` +
         `Next retry needs ${Math.round(waitMs / 1000)}s but only ${Math.max(0, Math.round(remainingMs / 1000))}s of ` +
-        `the ${RATE_LIMIT_RETRY_BUDGET_MS / 1000}s budget remains. The request never completed.`
+        `the ${Math.round(retryBudgetMs / 1000)}s budget remains. The request never completed.`
       );
       err.rateLimited = true;
       throw err;
     }
     console.warn(`[ghFetch] ${path} → ${res.status} rate limited; retrying in ${Math.round(waitMs / 1000)}s`);
-    await sleep(waitMs);
+    // Pass the caller's signal so an abort (e.g. an expired advisory budget)
+    // ends the wait at once instead of after it, and clears its timer.
+    await sleep(waitMs, undefined, { signal: externalSignal });
   }
 }
 
@@ -144,7 +152,7 @@ export function exitFatal(err, gateLabel, exit = process.exit) {
   if (err?.rateLimited) {
     console.error(
       `::error::${gateLabel} DID NOT EVALUATE THE DIFF. A GitHub rate limit outlived the ` +
-      `${RATE_LIMIT_RETRY_BUDGET_MS / 1000}s retry budget, so no gate ran. This is NOT a quality or ` +
+      `retry budget, so no gate ran. This is NOT a quality or ` +
       `security finding — re-run the job once the limit clears.`
     );
   }
