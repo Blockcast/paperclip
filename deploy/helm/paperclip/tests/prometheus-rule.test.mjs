@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import path from "node:path";
@@ -1438,5 +1438,59 @@ test("PaperclipCrashRecoveryCandidateIndex{Missing,Unobservable} distinguish a m
     missingBlock,
     /PAPERCLIP_RESTORE_IN_PROGRESS/,
     "the remediation must name the restore alias too, since either variable alone suppresses",
+  );
+});
+
+test("PaperclipIsolationWorkspaceReaperStopped is gauge-keyed, dry_run-collapsed, and links its runbook (BLO-36814)", () => {
+  const rendered = renderChart(["--set", "prometheusRule.enabled=true"]);
+
+  const [, block] = rendered.match(
+    /(alert: PaperclipIsolationWorkspaceReaperStopped[\s\S]*?)(?=\n\s+- alert:|\n\s+- name:|$)/,
+  ) ?? [];
+  assert.ok(block, "the reaper-stopped alert must render a block");
+
+  // The metric name carries the `paperclip_` prefix 64 of 74 registered names
+  // use. This is a one-way door: once this expr, the runbook PromQL and the
+  // onprem-k8s copy select a name, renaming breaks all three at once.
+  assert.match(
+    block,
+    /paperclip_isolation_workspace_reaper_last_sweep_timestamp_seconds/,
+    "the alert must read the paperclip_-prefixed gauge",
+  );
+
+  // Gauge, NOT rate(). This is the whole design call: a reaper that stopped
+  // ticking and one that ticks and finds nothing are identical on every
+  // counter, because both add zero. Only the timestamp gauge separates them,
+  // so a future edit "simplifying" this to a rate over the scanned counter
+  // silently reintroduces the blind spot the alert exists to close.
+  const [, expr] = block.match(/\n\s+expr: (.+)\n/) ?? [];
+  assert.ok(expr, "the reaper-stopped alert must render an expr");
+  assert.doesNotMatch(
+    expr,
+    /rate\(|increase\(/,
+    "the expr must key on the last-sweep gauge, not a counter rate -- a sweep "
+      + "that deletes nothing adds zero to every counter and is indistinguishable "
+      + "from a sweep that never ran",
+  );
+  // `max by (dry_run)` collapses the per-pod dimension (BLO-23413 multi-replica
+  // guard) while keeping the two modes apart, so a dry-run tick can never
+  // satisfy the liveness check for the live one.
+  assert.match(
+    expr,
+    /max by \(dry_run\)/,
+    "the expr must aggregate with max by (dry_run): replica-invariant, but not "
+      + "collapsing a dry-run tick into the live series",
+  );
+
+  assert.match(
+    block,
+    /runbook_url: "[^"]*runbooks\/isolation-workspace-reaper\.md"/,
+    "the reaper-stopped alert must link its runbook",
+  );
+  // The link is only worth asserting if it resolves; the per-alert runbook
+  // check elsewhere in this file does not cover a newly added page.
+  assert.ok(
+    existsSync(path.join(repoRoot, "runbooks/isolation-workspace-reaper.md")),
+    "runbooks/isolation-workspace-reaper.md must exist for the runbook_url to resolve",
   );
 });

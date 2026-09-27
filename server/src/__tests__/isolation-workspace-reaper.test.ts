@@ -780,4 +780,57 @@ describe("reapIsolationWorkspaces metrics", () => {
     ).toBe(before.liveEligible);
     expect(await valueOf(ISOLATION_WORKSPACE_REAPER_DELETED_METRIC, { dry_run: "true" })).toBe(0);
   });
+
+  it("still emits series when the root does not exist, tagged root_absent", async () => {
+    // The blind spot this guards: an ENABLED reaper pointed at the WRONG path
+    // scans nothing and, before BLO-36814, returned without touching the
+    // registry — so it was indistinguishable from a DISABLED one on every
+    // dashboard while the real tree grew unreclaimed (the BLO-31222 shape).
+    const missing = path.join(root, "definitely-not-a-root");
+    const before = {
+      rootAbsent:
+        (await valueOf(ISOLATION_WORKSPACE_REAPER_SWEEPS_METRIC, {
+          dry_run: "false",
+          stop_reason: "root_absent",
+        })) ?? 0,
+      complete:
+        (await valueOf(ISOLATION_WORKSPACE_REAPER_SWEEPS_METRIC, {
+          dry_run: "false",
+          stop_reason: "complete",
+        })) ?? 0,
+    };
+
+    const res = await reapIsolationWorkspaces({
+      root: missing,
+      maxAgeDays: 30,
+      now,
+      logger: silentLogger,
+      lookupWorkspaceUsage: usageLookup({}),
+    });
+    expect(res).toMatchObject({ scanned: 0, deleted: 0 });
+
+    // Liveness: the gauge advanced, so "enabled but pointed nowhere" is
+    // readable as a sweep that happened rather than as absence.
+    expect(
+      await valueOf(ISOLATION_WORKSPACE_REAPER_LAST_SWEEP_METRIC, { dry_run: "false" }),
+    ).toBe(Math.floor(NOW / 1000));
+    expect(
+      await valueOf(ISOLATION_WORKSPACE_REAPER_SCANNED_METRIC, { dry_run: "false" }),
+    ).toBeDefined();
+
+    // …and it is NOT folded into `complete`. Collapsing the two would let a
+    // misconfigured reaper read as a healthy sweep over an empty tree.
+    expect(
+      await valueOf(ISOLATION_WORKSPACE_REAPER_SWEEPS_METRIC, {
+        dry_run: "false",
+        stop_reason: "root_absent",
+      }),
+    ).toBe(before.rootAbsent + 1);
+    expect(
+      await valueOf(ISOLATION_WORKSPACE_REAPER_SWEEPS_METRIC, {
+        dry_run: "false",
+        stop_reason: "complete",
+      }),
+    ).toBe(before.complete);
+  });
 });

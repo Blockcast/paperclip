@@ -22,6 +22,10 @@
 
 import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from "prom-client";
 import { logger } from "../middleware/logger.js";
+// Type-only, so it is erased at runtime and creates no import cycle with the
+// reaper (which imports the recorder below). Structurally restating the result
+// shape here would let a NEW result field be added and silently go unrecorded.
+import type { IsolationWorkspaceReapResult } from "./isolation-workspace-reaper.js";
 import { resetDepBlockedMetrics, snapshotDepBlockedMetrics } from "./dep-blocked-metrics.js";
 import {
   resetBlockerResolvedWakeMetrics,
@@ -83,17 +87,17 @@ export const BACKSTOP_SOURCES = [
  * into a generic outcome label makes them vanish under any `sum by ()` an
  * operator writes without thinking about it.
  */
-export const ISOLATION_WORKSPACE_REAPER_SCANNED_METRIC = "isolation_workspace_reaper_scanned_total";
-export const ISOLATION_WORKSPACE_REAPER_DELETED_METRIC = "isolation_workspace_reaper_deleted_total";
+export const ISOLATION_WORKSPACE_REAPER_SCANNED_METRIC = "paperclip_isolation_workspace_reaper_scanned_total";
+export const ISOLATION_WORKSPACE_REAPER_DELETED_METRIC = "paperclip_isolation_workspace_reaper_deleted_total";
 export const ISOLATION_WORKSPACE_REAPER_SKIPPED_LAYOUT_METRIC =
-  "isolation_workspace_reaper_skipped_layout_total";
+  "paperclip_isolation_workspace_reaper_skipped_layout_total";
 export const ISOLATION_WORKSPACE_REAPER_RETAINED_RESURRECTED_METRIC =
-  "isolation_workspace_reaper_retained_resurrected_total";
+  "paperclip_isolation_workspace_reaper_retained_resurrected_total";
 export const ISOLATION_WORKSPACE_REAPER_ENTRIES_METRIC =
-  "isolation_workspace_reaper_entries_total";
-export const ISOLATION_WORKSPACE_REAPER_SWEEPS_METRIC = "isolation_workspace_reaper_sweeps_total";
+  "paperclip_isolation_workspace_reaper_entries_total";
+export const ISOLATION_WORKSPACE_REAPER_SWEEPS_METRIC = "paperclip_isolation_workspace_reaper_sweeps_total";
 export const ISOLATION_WORKSPACE_REAPER_LAST_SWEEP_METRIC =
-  "isolation_workspace_reaper_last_sweep_timestamp_seconds";
+  "paperclip_isolation_workspace_reaper_last_sweep_timestamp_seconds";
 /** Routine per-entry outcomes. The two *findings* fields are NOT in here. */
 export const ISOLATION_WORKSPACE_REAPER_ENTRY_OUTCOMES = [
   "eligible",
@@ -106,11 +110,21 @@ export const ISOLATION_WORKSPACE_REAPER_ENTRY_OUTCOMES = [
  * How the pass ended. `capped` and `lookup_faulted` both stop with work
  * remaining, but only the second means the remaining directories were never
  * assessed at all — see `IsolationWorkspaceReapResult.lookupFaulted`.
+ *
+ * `root_absent` is deliberately NOT folded into `complete`, even though both
+ * scan zero directories. An absent root is the ordinary state on a
+ * non-k8s-isolation deployment, but it is ALSO what an enabled reaper pointed
+ * at the wrong path looks like — the BLO-31222 shape, where a real tree grows
+ * unreclaimed while the sweep reports success over an empty one. Collapsing
+ * the two would leave that case reading as a healthy `complete` sweep with
+ * `scanned=0`, which is the same blind spot BLO-36814 exists to remove, one
+ * layer in.
  */
 export const ISOLATION_WORKSPACE_REAPER_STOP_REASONS = [
   "complete",
   "capped",
   "lookup_faulted",
+  "root_absent",
 ] as const;
 export type BackstopSource = (typeof BACKSTOP_SOURCES)[number];
 export const BACKSTOP_SKIP_REASONS = [
@@ -5061,20 +5075,17 @@ export function recordBackstopCandidateSkipped(source: BackstopSource, reason: B
  * failed sweep.
  */
 export function recordIsolationWorkspaceReapSweep(
-  result: {
-    scanned: number;
-    eligible: number;
-    deleted: number;
-    skippedLayout: number;
-    retainedInUse: number;
-    retainedResurrected: number;
-    retainedFresh: number;
-    vanished: number;
-    failed: number;
-    capped: boolean;
-    lookupFaulted: boolean;
+  result: IsolationWorkspaceReapResult,
+  options: {
+    dryRun: boolean;
+    now: () => number;
+    /**
+     * Overrides the stop reason derived from `result`. Only the root-absent
+     * path needs this: it returns a zero-valued result that is structurally
+     * indistinguishable from a clean `complete` sweep.
+     */
+    stopReason?: (typeof ISOLATION_WORKSPACE_REAPER_STOP_REASONS)[number];
   },
-  options: { dryRun: boolean; now?: () => number },
 ): void {
   try {
     const m = ensureRegistry();
@@ -5099,12 +5110,14 @@ export function recordIsolationWorkspaceReapSweep(
     // capped means a budget stopped an assessed pass, faulted means the
     // remainder was never assessed. Every stop_reason child is materialized so
     // a dashboard can read 0 capped sweeps rather than no data.
-    const stopReason = result.lookupFaulted ? "lookup_faulted" : result.capped ? "capped" : "complete";
+    const stopReason =
+      options.stopReason ??
+      (result.lookupFaulted ? "lookup_faulted" : result.capped ? "capped" : "complete");
     for (const reason of ISOLATION_WORKSPACE_REAPER_STOP_REASONS) {
       m.isolationReaperSweepsCounter.inc({ dry_run, stop_reason: reason }, reason === stopReason ? 1 : 0);
     }
 
-    m.isolationReaperLastSweepGauge.set({ dry_run }, Math.floor((options.now ?? Date.now)() / 1000));
+    m.isolationReaperLastSweepGauge.set({ dry_run }, Math.floor(options.now() / 1000));
   } catch (error) {
     logger.error({ err: error }, "failed to record isolation-workspace reaper sweep metrics");
   }
