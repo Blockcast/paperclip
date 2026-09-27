@@ -1285,12 +1285,19 @@ and on one action even both together fall short, so a third source is needed:
   `company_access` warn still fires, but the throw is suppressed, so the row it
   would have matched is never booked — while the same-company `denied` that
   *is* booked on `heartbeat.run_log_accessed` comes from the entitlement leg
-  further down the same request and matches the warn on every key. (The second
-  emitter is enforce-only by construction: under shadow it returns the agent's
-  own decision, so it books nothing.) Following the rule in shadow mode
-  therefore discards a genuine insider unentitled transcript read as an
-  availability failure, which is the one direction this section exists to
-  prevent.
+  further down the same request and matches the warn on every key. The second
+  emitter inverts the same way and for the same reason:
+  `applyResponsibleUserIntersection` (`services/authorization.ts`) writes its
+  warn *before* choosing what to return, then returns the agent's own decision
+  under shadow — so the line **is** emitted and the denial books nothing.
+  Following the rule in shadow mode therefore discards a genuine insider
+  unentitled transcript read as an availability failure, which is the one
+  direction this section exists to prevent.
+
+  **Neither emitter is enforce-only, and the presence of either warn is not
+  evidence the deployment is enforcing.** Read `authzMode` on the line itself:
+  both emitters carry it as their first field, and it is the only mode signal
+  either one gives you.
 
   Even in enforce mode the join is time-fuzzy: neither warn carries a request
   or run correlator, so the row's own `runId` and `details.actorRunId` have
