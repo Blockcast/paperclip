@@ -60,7 +60,7 @@ export const BACKSTOP_SOURCES = [
 ] as const;
 export type BackstopSource = (typeof BACKSTOP_SOURCES)[number];
 export const BACKSTOP_SKIP_REASONS = [
-  "not_ready", "existing_wake", "live_path", "pause_hold", "interaction",
+  "not_ready", "existing_wake", "live_path", "live_path_queued_wake", "pause_hold", "interaction",
   "no_owner", "cause", "exhausted", "cooldown", "claim_lost",
   "deferred_or_failed", "enqueue_failed",
 ] as const;
