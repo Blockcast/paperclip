@@ -376,10 +376,17 @@ function declaredTimeouts(projectDir) {
   } catch {
     return { testTimeout: false, hookTimeout: false, config: false };
   }
+  // Strip `//` comments first, as the sibling guard in
+  // run-vitest-stable-shard.test.mjs does. These configs carry long comments
+  // that name both knobs, so a commented-out `// testTimeout: 5_000,` -- or
+  // prose merely discussing one -- would otherwise register as declared. That
+  // is a fail-open inside a test whose whole purpose is catching fail-open
+  // protection.
+  const code = source.replace(/^\s*\/\/.*$/gm, "");
   return {
     config: true,
-    testTimeout: /\btestTimeout\s*:/.test(source),
-    hookTimeout: /\bhookTimeout\s*:/.test(source),
+    testTimeout: /\btestTimeout\s*:/.test(code),
+    hookTimeout: /\bhookTimeout\s*:/.test(code),
   };
 }
 
@@ -409,9 +416,21 @@ test("the embedded-Postgres detector is not vacuous", () => {
   // Positive control. Without it, a rename of `startEmbeddedPostgresTestDatabase`
   // or a move of the PGlite import would make the sweep above pass by matching
   // nothing at all -- the same fail-open shape the inert CLI flags had.
+  //
+  // Both alternation branches need an anchor, because they are matched by
+  // disjoint sets of packages. `server` and `packages/db` match solely via
+  // `startEmbeddedPostgresTestDatabase`; `paperclip-plugin-alertmanager` has
+  // zero hits on that name and is found only by the PGlite branch. Asserting
+  // the first two alone would leave the PGlite branch uncontrolled, so
+  // alertmanager could silently drop out of the sweep -- and it is the package
+  // responsible for most of the merge-queue ejections this guard exists for.
   const boots = readConfiguredProjectDirs().filter(bootsEmbeddedPostgres);
   assert.ok(
-    boots.includes("server") && boots.includes("packages/db"),
-    `expected the detector to find server and packages/db, got: ${boots.join(", ") || "(none)"}`,
+    boots.includes("server") &&
+      boots.includes("packages/db") &&
+      boots.includes("packages/plugins/paperclip-plugin-alertmanager"),
+    `expected the detector to find server, packages/db and ` +
+      `packages/plugins/paperclip-plugin-alertmanager (the latter pins the PGlite ` +
+      `branch), got: ${boots.join(", ") || "(none)"}`,
   );
 });
