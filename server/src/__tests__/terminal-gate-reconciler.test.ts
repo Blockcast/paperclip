@@ -771,6 +771,36 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
     expect(posted[0]!.body).not.toContain("live wake path");
   });
 
+  it("uses the stranded copy for a never-polled monitor on a row the scheduler will not fire", async () => {
+    // TG14's shape (never evaluated, first check an hour out) on a `todo` row.
+    // The candidate query admits every status but done/cancelled by design, but
+    // the scheduler only fires rows `issueAllowsMonitor` admits, so this future
+    // check is a wake that will never happen. Claiming "live wake path" here
+    // suppresses the repair on a row that has none. Dropping the eligibility
+    // conjunct at the call site must fail this test and leave TG14 green.
+    const { companyId, agentId } = await createCompany("TG18");
+    const issueId = await insertStrandedGateIssue({
+      companyId,
+      agentId,
+      identifier: "TG18-1",
+      gateSignals: ["pr:blockcast/paperclip#1281:checks"],
+      status: "todo",
+      monitorNextCheckAt: new Date(NOW.getTime() + 60 * 60 * 1000),
+      neverTriggered: true,
+    });
+
+    const result = await reconcileTerminalGates(db, {
+      now: NOW,
+      readPullRequestGate: mergedReader(new Set(["blockcast/paperclip#1281"])),
+    });
+
+    expect(result).toMatchObject({ scanned: 1, resolved: 1 });
+    const posted = await commentsFor(issueId);
+    expect(posted).toHaveLength(1);
+    expect(posted[0]!.body).toContain("nothing is polling it");
+    expect(posted[0]!.body).not.toContain("live wake path");
+  });
+
   it("does not resolve an issue that still has an unresolved blocker edge", async () => {
     // BLO-18294 folds unresolved blockers into the monitor's gate set, so a live
     // blocker means the gate is not satisfied however the PRs read.

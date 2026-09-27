@@ -57,7 +57,7 @@ import type { Db } from "@paperclipai/db";
 import { issueComments, issueWorkProducts, issues } from "@paperclipai/db";
 import { logger as defaultLogger } from "../middleware/logger.js";
 import { githubGetPullRequestGate, type PullRequestGateResult } from "./github-app-auth.js";
-import { normalizeIssueMonitorGateSignals } from "./issue-execution-policy.js";
+import { issueAllowsMonitor, normalizeIssueMonitorGateSignals } from "./issue-execution-policy.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { listIssueDependencyReadinessMap } from "./issues.js";
 
@@ -331,8 +331,12 @@ type CandidateRow = {
   companyId: string;
   identifier: string | null;
   executionState: unknown;
-  /** Non-null == admitted by the never-polled arm, i.e. armed. See the comment builder. */
+  /** Non-null == admitted by the never-polled arm. Armed only if it can also fire; see the call site. */
   monitorNextCheckAt: Date | null;
+  /** The scheduler's eligibility tuple (`issueAllowsMonitor`); this query does not filter on it. */
+  status: string;
+  assigneeAgentId: string | null;
+  assigneeUserId: string | null;
 };
 
 /**
@@ -381,6 +385,9 @@ async function listCandidateIssues(db: Pick<Db, "select">, limit: number): Promi
       identifier: issues.identifier,
       executionState: issues.executionState,
       monitorNextCheckAt: issues.monitorNextCheckAt,
+      status: issues.status,
+      assigneeAgentId: issues.assigneeAgentId,
+      assigneeUserId: issues.assigneeUserId,
     })
     .from(issues)
     .where(and(
@@ -600,9 +607,20 @@ export async function reconcileTerminalGates(
           // so claiming "live wake path, do not treat as stranded" over it would
           // be the mirror of the false signal this branch exists to avoid. The
           // stranded copy, including its re-arm advice, is the true one there.
+          //
+          // A future check is necessary but not sufficient: the scheduler only
+          // ever selects rows `issueAllowsMonitor` admits, and this query admits
+          // every status but done/cancelled by design (the blocked -> todo
+          // restore population). A future check on a row that cannot fire is a
+          // wake that will never happen, so it gets the stranded copy too.
           armedNextCheckAt:
             entry.candidate.monitorNextCheckAt !== null
               && entry.candidate.monitorNextCheckAt.getTime() > now.getTime()
+              && issueAllowsMonitor(
+                entry.candidate.status,
+                entry.candidate.assigneeAgentId,
+                entry.candidate.assigneeUserId,
+              )
               ? entry.candidate.monitorNextCheckAt
               : null,
         }),

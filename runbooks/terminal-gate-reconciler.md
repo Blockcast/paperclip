@@ -11,8 +11,12 @@ has stopped polling (`monitorNextCheckAt IS NULL`); and an **armed but never
 evaluated** monitor (`monitorAttemptCount = 0 AND monitorLastTriggeredAt IS
 NULL`), which was armed on a gate that was already satisfied and would otherwise
 wait out its whole window before anything looked — BLO-36289. The comment copy
-branches on which one it is: the armed variant states the monitor is still armed
-and must not be treated as stranded.
+branches on whether the monitor can still wake the issue: the armed variant, which
+states the monitor is still armed and must not be treated as stranded, is used
+only when the first check is still in the future AND the row is one the
+scheduler will fire (`issueAllowsMonitor`: agent-assigned, no user assignee,
+`in_progress`/`in_review`). An overdue check, or a `todo`/`blocked`/human-assigned
+row, gets the stranded copy.
 
 It dispatches nothing, closes nothing, and clears no monitor.
 
