@@ -15,7 +15,7 @@ function blockEventLoop(ms: number): void {
 }
 
 /**
- * Blocks until the sampler reports a stall, or the deadline passes.
+ * Blocks until the sampler reports a stall, or the attempt budget is spent.
  *
  * A single block is a coin flip at these settings, and waiting longer cannot
  * recover a lost one. After the block, our sampler's timer and the histogram's
@@ -27,19 +27,26 @@ function blockEventLoop(ms: number): void {
  * 1000ms, where the histogram is overdue by nearly a full second more than the
  * sampler and always wins — 0 misses in 26 blocks of 1100ms and 3000ms — which
  * is why this is a test-only concern and the module is unchanged.
+ *
+ * The budget is an ATTEMPT COUNT, not a wall-clock deadline (BLO-37114). It
+ * was a 5s deadline, which made the number of coin flips a function of how
+ * fast the host was: ~8 attempts on an idle worker (so ~0.2^8, never fails)
+ * but 1-2 on a starved merge-queue worker, where 0.2 surfaces as a routine
+ * red build. Counting attempts makes the failure probability 0.2^10 ≈ 1e-7
+ * on every host. Worst case is 10 × ~610ms ≈ 6.1s of real time, well inside
+ * the 60s testTimeout in server/vitest.config.ts.
  */
 async function blockUntilStallObserved(
   observed: ReadonlyArray<unknown>,
-  deadlineMs = 5_000,
+  attempts = 10,
 ): Promise<void> {
-  const end = Date.now() + deadlineMs;
-  do {
+  for (let i = 0; i < attempts && observed.length === 0; i += 1) {
     // The histogram only measures once the loop has iterated after enable(),
     // so yield first — blocking in the same tick records nothing.
     await sleep(60);
     blockEventLoop(400);
     await sleep(150);
-  } while (observed.length === 0 && Date.now() < end);
+  }
 }
 
 describe("resolveStallThresholdMs", () => {
