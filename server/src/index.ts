@@ -1119,6 +1119,10 @@ export async function startServer(): Promise<StartedServer> {
   let heartbeatSchedulerStopped = false;
   let heartbeatStartupRecoveryPending = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
+  // PEN-3314. Separate timer from `heartbeatSchedulerInterval` on purpose — see
+  // the watchdog registration below for why the recovery-chain detector must
+  // not ride the heartbeat tick.
+  let heartbeatRecoveryChainWatchdogInterval: ReturnType<typeof setInterval> | null = null;
   /**
    * BLO-19123. Last time the hand-back drain actually ran, so its cadence is decoupled from
    * the scheduler's.
@@ -1467,6 +1471,59 @@ export async function startServer(): Promise<StartedServer> {
     if (toolHealthSweep.failed > 0) {
       logger.warn({ ...toolHealthSweep }, "startup tool connection health sweep found failing connections");
     }
+
+    // PEN-3314. Deliberately its OWN timer, not part of the heartbeat tick
+    // below. The tick reaches the recovery-chain latch only after two
+    // `resolveSchedulingSuppression()` round-trips and a suppression branch, so
+    // it is downstream of the very resource whose exhaustion this detector
+    // exists to report: when the pool saturates — `active` pinned at
+    // POSTGRES_POOL_MAX with a long `waiting` queue, the BLO-34207 state — every
+    // tick parks on those awaits and none arrives here. Reporting from there
+    // would therefore go SILENT exactly when the chain is wedged, and worse than
+    // silent: the in-flight gauge would hold the `0` written by the last settle,
+    // so the worker would export a confident "no pass outstanding" throughout
+    // the incident. That is the same fabricated-health failure the tick body's
+    // own comment above says this code exists to remove.
+    //
+    // This callback reads two in-memory variables and writes two metrics. It
+    // touches no database, takes no lock, and awaits nothing, so nothing the
+    // chain can do to the pool can starve it.
+    heartbeatRecoveryChainWatchdogInterval = setInterval(() => {
+      try {
+        if (heartbeatSchedulerStopped) return;
+        if (!heartbeatRecoveryChainInFlight) {
+          // No pass outstanding. Written every tick rather than only on settle
+          // so the series stays live even if a settle path is ever missed.
+          recordHeartbeatRecoveryChainInflight(0);
+          return;
+        }
+        const inFlightMs = Math.max(0, Date.now() - heartbeatRecoveryChainStartedAt);
+        recordHeartbeatRecoveryChainInflight(inFlightMs);
+        if (inFlightMs > HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS) {
+          if (!heartbeatRecoveryChainStallCounted) {
+            // Latch before the record, matching the log's own ordering: a
+            // throwing recorder must not re-arm a once-per-pass signal.
+            heartbeatRecoveryChainStallCounted = true;
+            recordHeartbeatRecoveryChainStalled();
+          }
+          // A chain in flight across many ticks is not normal. Reported, not
+          // acted on — see the latch declaration for why clearing it would
+          // re-admit the overlap the latch exists to remove.
+          logger.warn(
+            {
+              inFlightMs,
+              warnAfterMs: HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS,
+            },
+            "periodic heartbeat recovery chain still in flight across many ticks; recovery passes are not running",
+          );
+        }
+      } catch (err) {
+        // An uncaught throw from a bare timer callback takes the process down,
+        // and this watchdog runs precisely when the worker is already degraded.
+        // Losing a metric sample is survivable; losing the worker is the outage.
+        logger.warn({ err }, "heartbeat recovery chain watchdog tick failed");
+      }
+    }, config.heartbeatSchedulerIntervalMs);
 
     heartbeatSchedulerInterval = setInterval(() => {
       // Async so the suppression checks below can honor the override-aware
@@ -2019,29 +2076,20 @@ export async function startServer(): Promise<StartedServer> {
                 heartbeatRecoveryChainStartedAt = 0;
               }));
           } else {
-            const inFlightMs = Math.max(0, Date.now() - heartbeatRecoveryChainStartedAt);
             // Every skipped tick, not just the stalled ones: a sustained skip
             // rate is how "the chain is outrunning the interval" becomes
             // visible, and that is observable hours before the heap ceiling.
+            //
+            // PEN-3314: this is the ONLY recovery-chain signal that belongs on
+            // the tick, because it is the only one whose subject *is* the tick —
+            // "a tick reached the latch and had to skip". The in-flight gauge and
+            // the stall report deliberately live on the watchdog timer instead;
+            // both describe the pass rather than the tick, and both must keep
+            // reporting when no tick gets this far. That split is also what makes
+            // a flat skip counter readable: paired with a climbing in-flight
+            // gauge it now means "ticks are not arriving", which is a distinct
+            // and worse condition than "the chain is keeping up".
             recordHeartbeatRecoveryChainSkipped();
-            recordHeartbeatRecoveryChainInflight(inFlightMs);
-            if (inFlightMs > HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS) {
-              if (!heartbeatRecoveryChainStallCounted) {
-                // Latch before the record, matching the log's own ordering: a
-                // throwing recorder must not re-arm a once-per-pass signal.
-                heartbeatRecoveryChainStallCounted = true;
-                recordHeartbeatRecoveryChainStalled();
-              }
-              // Skipping is normal and silent; a chain that has been in flight for
-              // many ticks is not. Reported, not acted on — see the latch decl.
-              logger.warn(
-                {
-                  inFlightMs,
-                  warnAfterMs: HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS,
-                },
-                "periodic heartbeat recovery chain still in flight across many ticks; recovery passes are not running",
-              );
-            }
           }
         }
       })();
@@ -2463,6 +2511,10 @@ export async function startServer(): Promise<StartedServer> {
       if (heartbeatSchedulerInterval) {
         clearInterval(heartbeatSchedulerInterval);
         heartbeatSchedulerInterval = null;
+      }
+      if (heartbeatRecoveryChainWatchdogInterval) {
+        clearInterval(heartbeatRecoveryChainWatchdogInterval);
+        heartbeatRecoveryChainWatchdogInterval = null;
       }
 
       const heartbeatShutdown = await coordinateHeartbeatSchedulerShutdown({

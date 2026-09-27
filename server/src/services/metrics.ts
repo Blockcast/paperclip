@@ -67,7 +67,7 @@ export const BACKSTOP_SOURCES = [
  * previous pass was still running (PEN-3314).
  *
  * The chain is launched fire-and-forget from a fixed 30 s `setInterval`, so
- * before the gate existed a pass that ran long simply overlapped its
+ * before the latch existed a pass that ran long simply overlapped its
  * predecessor — invisibly. That invisibility is the reason this cost a
  * multi-day fleet outage: each overlapping pass pins its own copy of the whole
  * visible issue graph, so the only externally observable symptom was the worker
@@ -82,6 +82,13 @@ export const BACKSTOP_SOURCES = [
  * a skipped tick is later work, not lost work — but it does mean recovery
  * latency now tracks chain duration rather than the interval, which is worth an
  * operator's attention well before the heap is.
+ *
+ * ⚠ This counter alone cannot tell "healthy" from "wedged", because it is the
+ * one series here that the heartbeat tick still writes: it counts ticks that
+ * reached the latch, so it goes FLAT both when the chain is comfortably keeping
+ * up and when no tick is arriving at all. Disambiguate against the in-flight
+ * gauge, which is refreshed independently of the tick — flat skips with a
+ * climbing in-flight gauge is the second case, and it is the more urgent one.
  */
 export const HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC = "paperclip_heartbeat_recovery_chain_skipped_total";
 /**
@@ -111,9 +118,15 @@ export const HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC = "paperclip_heartbeat_rec
  * signal that distinguishes a chain taking 35 s from a chain that has been
  * wedged for six hours — see {@link HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC}.
  *
- * It is refreshed on every skipped tick, so it updates once per scheduler
- * interval for exactly as long as the chain is overrunning. A pass that finishes
- * within the interval never produces a skip and correctly leaves this at `0`.
+ * It is refreshed by a dedicated timer of its own, NOT by the heartbeat tick, and
+ * that distinction is the whole reason the series can be trusted. The tick only
+ * reaches the recovery-chain latch after two `resolveSchedulingSuppression()`
+ * round-trips; under the pool saturation this metric exists to catch, every tick
+ * parks on those awaits, so a tick-driven refresh would freeze at whatever the
+ * last settle wrote — `0` — and the worker would read idle and healthy for the
+ * duration of the incident. The refreshing timer awaits nothing and queries
+ * nothing, so `0` here means "no pass outstanding", unconditionally, rather than
+ * "no pass outstanding as of the last tick that got far enough to say".
  */
 export const HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC = "paperclip_heartbeat_recovery_chain_inflight_seconds";
 /**
@@ -123,7 +136,7 @@ export const HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC = "paperclip_heartbeat_rec
  * Non-zero means a pass stopped settling entirely — not merely ran slow, which
  * shows up as skips instead — and therefore that **every recovery pass on this
  * worker is halted**: orphan reaping, retry promotion, stranded-issue
- * reconciliation, watchdogs, the lot. The gate deliberately does not self-clear
+ * reconciliation, watchdogs, the lot. The latch deliberately does not self-clear
  * (force-clearing would re-admit the overlapping passes that cause the heap
  * leak, under exactly the saturated-pool conditions that raised the alarm), so
  * this state persists until the chain returns or the process restarts.
@@ -3845,7 +3858,9 @@ function ensureRegistry(): {
       name: HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC,
       help:
         "How long the currently outstanding periodic recovery chain has been running, in "
-        + "seconds; 0 when none is outstanding (PEN-3314). Refreshed on every skipped tick. "
+        + "seconds; 0 when none is outstanding (PEN-3314). Refreshed by a dedicated timer that "
+        + "touches no database, so it stays live when pool saturation stops the heartbeat tick "
+        + "from reporting. "
         + "This is the overlap alert: it crosses heartbeatSchedulerIntervalMs while the "
         + "offending pass is still running, hours before the heap ceiling is reached.",
       registers: [registry],
