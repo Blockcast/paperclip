@@ -488,6 +488,21 @@ jobs:
         run: node --test ./.github/scripts/tests/run-quality-gates.test.mjs
         timeout-minutes: 1
 
+      # BLO-37010. Same shape as BLO-26636 above: both suites existed and were
+      # wired into no workflow, so they had never run. get-bot-token's suite now
+      # holds the shared ghFetch rate-limit retry that keeps a 403 the gate never
+      # evaluated from reporting as a quality/security verdict — a guard nothing
+      # would enforce if the suite stayed unwired.
+      - name: Test commitperclip token + rate-limit retry (BLO-37010)
+        if: ${{ !cancelled() }}
+        run: node --test ./.github/scripts/tests/get-bot-token.test.mjs
+        timeout-minutes: 1
+
+      - name: Test commitperclip security gate (BLO-37010)
+        if: ${{ !cancelled() }}
+        run: node --test ./.github/scripts/tests/check-pr-security.test.mjs
+        timeout-minutes: 2
+
       # Guards the one property of the BLO-28888 soak workflow that cannot be
       # re-checked after the fact: that it stays dispatch-only. Adding its
       # ~50-90 minutes to a per-PR trigger would be invisible until it was

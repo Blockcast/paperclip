@@ -8,7 +8,7 @@
  * Exit: 0 if all quality gates pass, 1 if any fail.
  */
 import { fileURLToPath } from 'node:url';
-import { ghFetch } from './get-bot-token.mjs';
+import { ghFetch, exitFatal } from './get-bot-token.mjs';
 import { fetchAllPullRequestFiles } from './fetch-pr-files.mjs';
 import { checkTemplate } from './check-pr-template.mjs';
 import { checkLinkedIssue } from './check-pr-linked-issue.mjs';
@@ -178,5 +178,5 @@ async function main() {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  main().catch(e => { console.error(e.message); process.exit(1); });
+  main().catch(e => exitFatal(e, 'commitperclip quality gates'));
 }

@@ -8,7 +8,7 @@
  * Exit: always 0 — security flags are silent, never block the PR visibly.
  */
 import { fileURLToPath } from 'node:url';
-import { ghFetch } from './get-bot-token.mjs';
+import { ghFetch, exitFatal } from './get-bot-token.mjs';
 import { fetchAllPullRequestFiles } from './fetch-pr-files.mjs';
 import { resolveBaseRef } from './check-pr-dependencies.mjs';
 
@@ -165,7 +165,10 @@ export async function validateSensitivePaths(token, repo, prNumber, baseRef, fet
     } catch (err) {
       // 404 means the file/directory no longer exists at this path
       if (String(err.message).includes('404')) stale.push(path);
-      // Other errors (network, rate limit) — re-throw so we don't silently miss them
+      // Everything else re-throws so we don't silently miss it. ghFetch has
+      // already spent its rate-limit retry budget by the time a rate-limit
+      // error reaches here, and it arrives carrying RATE_LIMIT_NOT_EVALUATED
+      // so the fatal handler can say the gate never ran (BLO-37010).
       else throw err;
     }
   }));
@@ -522,5 +525,5 @@ async function main() {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  main().catch(e => { console.error(e.message); process.exit(1); });
+  main().catch(e => exitFatal(e, 'commitperclip security gates'));
 }
