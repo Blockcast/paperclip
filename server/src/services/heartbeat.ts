@@ -513,7 +513,12 @@ import { PROVIDER_CAPACITY_MAX_HORIZON_MS } from "./provider-capacity-horizon-bo
 import { productivityReviewService } from "./productivity-review.js";
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run-handoff-state.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
-import { LOCK_HELD_WARN_MS, runDetachedFromAgentStartLock, withAgentStartLock } from "./agent-start-lock.js";
+import {
+  LOCK_HELD_WARN_MS,
+  markAgentStartLockPhase,
+  runDetachedFromAgentStartLock,
+  withAgentStartLock,
+} from "./agent-start-lock.js";
 import {
   evaluateAgentInvokability,
   evaluateAgentInvokabilityFromDb,
@@ -12810,6 +12815,16 @@ export interface HeartbeatServiceOptions {
     taskKey: string | null;
   }) => Promise<void> | void;
 }
+
+/**
+ * Freshness window for the shared start-lock orphan reap (BLO-36922).
+ *
+ * Short enough that dispatch never acts on materially stale reap state, long
+ * enough to collapse a synchronized wake wave into one fleet sweep. Override
+ * with `AGENT_START_LOCK_REAP_TTL_MS`; `0` disables the TTL and leaves only the
+ * single-flight coalescing.
+ */
+const START_LOCK_REAP_TTL_DEFAULT_MS = 5_000;
 
 function isTruthyRuntimeEnvValue(value: string | undefined) {
   return value === "true" || value === "1" || value === "yes" || value === "on";
@@ -25614,6 +25629,67 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
   }
 
+  /**
+   * In-flight sweep shared by every start-lock caller, and when the last one
+   * finished. See {@link reapOrphanedRunsForStartLock}.
+   */
+  let sharedStartLockReap: Promise<unknown> | null = null;
+  let sharedStartLockReapCompletedAtMs = 0;
+
+  /**
+   * Coalescing wrapper for the reap on the queued-run dispatch critical path
+   * (BLO-36922).
+   *
+   * `startNextQueuedRunForAgent` calls `reapOrphanedRuns` from *inside*
+   * `withAgentStartLock`, and the reap is FLEET-WIDE, not agent-scoped: every
+   * `running` row joined to `agents`, a namespace-wide `listManagedAgentJobs`,
+   * `cleanupManagedJobsWithoutRun`, then per-run reservation reads and per-Job
+   * deletes. So N agents waking together run N identical whole-fleet sweeps
+   * concurrently, each holding a different agent's lock, each slowing the rest
+   * through the one shared in-pod Kubernetes client. That is self-amplifying,
+   * and it produces exactly the measured signature: agents entering the stall
+   * staggered over ~13 minutes (3 -> 6 -> 8 -> 11 -> 14) and releasing in a
+   * single step, with the DB pool idle and apiserver latency at its LOWEST
+   * throughout -- work queued client-side never reaches the server. Same window
+   * showed 8 `k8s_concurrency_guard_unreachable` trips from in-pod calls while
+   * `kubectl` from outside answered in 1.6s.
+   *
+   * A fleet sweep has no per-agent semantics, so concurrent callers can share
+   * one result for free, and a caller arriving just after a sweep finished
+   * gains nothing by running a second one. Hence single-flight plus a short
+   * freshness TTL.
+   *
+   * ponytail: TTL is wall-clock, not a real invalidation. A skipped caller
+   * dispatches against reap state up to TTL old, which at worst delays one slot
+   * release by that much -- the follow-up pass picks it up. If that ever
+   * matters, key the TTL on a fleet-state version instead of a timestamp.
+   *
+   * Direct callers of `reapOrphanedRuns` (the periodic reaper, tests) are
+   * deliberately left alone: this is a dispatch-path fix, and the row-level
+   * dedup those callers rely on is a separate, still-tested invariant.
+   */
+  async function reapOrphanedRunsForStartLock(): Promise<"ran" | "joined" | "skipped_fresh"> {
+    if (sharedStartLockReap) {
+      await sharedStartLockReap;
+      return "joined";
+    }
+    const configuredTtlMs = Number.parseInt(process.env.AGENT_START_LOCK_REAP_TTL_MS ?? "", 10);
+    const ttlMs = Number.isFinite(configuredTtlMs) && configuredTtlMs >= 0
+      ? configuredTtlMs
+      : START_LOCK_REAP_TTL_DEFAULT_MS;
+    if (ttlMs > 0 && Date.now() - sharedStartLockReapCompletedAtMs < ttlMs) return "skipped_fresh";
+    // Assign before awaiting so a caller that arrives during this sweep joins
+    // it rather than starting a second one. `.finally` stamps the completion
+    // time on failure too, so a failing sweep backs off instead of being
+    // retried by every waking agent.
+    sharedStartLockReap = reapOrphanedRuns({ suppressDispatchAfterReap: true }).finally(() => {
+      sharedStartLockReapCompletedAtMs = Date.now();
+      sharedStartLockReap = null;
+    });
+    await sharedStartLockReap;
+    return "ran";
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; suppressDispatchAfterReap?: boolean }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
@@ -28119,6 +28195,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         resumeContinuation: dispatchPassOptions.resumeContinuation === true,
         suppressHeadRescanDemand: dispatchPassOptions.suppressHeadRescanDemand === true,
       });
+      markAgentStartLockPhase(agentId, "agent_load");
       let agent = await getAgent(agentId);
       if (!agent) return [];
       const invokability = await getAgentInvokability(agent);
@@ -28155,18 +28232,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // Timed in `finally` so a sweep that stalls and then throws (its first
         // `running` select sits outside its per-stage catches, so a slow pool
         // acquire that rejects propagates) still logs its duration.
+        //
+        // BLO-36922: the sweep below is single-flight across agents, so a wake
+        // wave now shares one sweep; `reapMs` then includes time spent joined to
+        // another agent's in-flight sweep, which is still time this lock was held.
+        markAgentStartLockPhase(agentId, "reap");
         const reapStartedAtMs = Date.now();
+        let reapDisposition: "ran" | "joined" | "skipped_fresh" | undefined;
         try {
-          await reapOrphanedRuns({ suppressDispatchAfterReap: true });
+          reapDisposition = await reapOrphanedRunsForStartLock();
         } finally {
           const reapMs = Date.now() - reapStartedAtMs;
           if (reapMs >= LOCK_HELD_WARN_MS) {
             logger.warn(
-              { agentId, reapMs, warnAfterMs: LOCK_HELD_WARN_MS },
+              { agentId, reapMs, reapDisposition, warnAfterMs: LOCK_HELD_WARN_MS },
               "orphan reap alone exceeded the agent start lock budget; it is holding dispatch for this agent",
             );
           }
         }
+        logger.debug(
+          { agentId, reapDisposition },
+          "startNextQueuedRunForAgent: start-lock orphan reap disposition (BLO-36922)",
+        );
       }
       // BLO-12990 Fix #1 / BLO-20775: stale/silent running runs must not block new
       // high-priority work. Fetch full run rows so `isRunOccupyingSlot` can partition
@@ -28175,6 +28262,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // against, so the productivity review reports the same slot population dispatch
       // enforces (BLO-27698 C1) — its rationale, including why this uses the NEWEST
       // stamp rather than the first non-null, is documented there.
+      markAgentStartLockPhase(agentId, "slot_check");
       const dispatchNow = new Date();
       const runningRunRows = await listRunningRunsForAgent(agentId);
       const runningCount = countRunsOccupyingSlots(runningRunRows, dispatchNow.getTime());
@@ -28276,6 +28364,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // applies to a prefix that is entirely prunable. Paging with a keyset
       // cursor lets one pass walk past a wall of invalid or blocked rows and
       // still reach real work.
+      markAgentStartLockPhase(agentId, "queue_scan");
       const issueById = new Map<string, { id: string; status: string; priority: string | null }>();
       const dependencyReadiness = new Map<
         string,
@@ -29258,6 +29347,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // concurrently with the review that already owns this PR task.
             continue;
           }
+          markAgentStartLockPhase(agentId, "claim");
           const claimed = await claimQueuedRun(queuedRun, companyAgents);
           if (!claimed) {
             if (await scheduleEmergencyContinuationForStillQueuedRun(queuedRun)) {
@@ -40178,6 +40268,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     prepareHotRestartShutdown,
     reconcileHotRestartAdoption,
     reapOrphanedRuns,
+    // Exposed so the dispatch-path coalescing (BLO-36922) is directly testable;
+    // production callers reach it through `startNextQueuedRunForAgent`.
+    reapOrphanedRunsForStartLock,
     reconcileOrphanedEnvironmentLeases,
     refreshOrphanedRuntimeResourceMetrics,
     resumeRunningExternalRuntimeRuns,
