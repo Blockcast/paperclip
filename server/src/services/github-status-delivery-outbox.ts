@@ -466,6 +466,44 @@ async function processGateReevaluation(db: Db, row: DeliveryRow): Promise<void> 
     await failPermanentDelivery(db, fencedRow, "comment_review_gate_not_configured", { result });
     return;
   }
+  if (result.reason === "retirement_failed" && result.retirementDeliveries?.length) {
+    // The live status DID publish; only the retired-context cleanup did not.
+    // Mirror `github-webhook.ts`: give each retirement its own durable row and
+    // close this one as `delivered`, because the verdict it existed to publish
+    // is published.
+    //
+    // Retrying this row instead loses the retirement outright. `retryOrFailDelivery`
+    // does not reset `createdAt`, so the next attempt reads the status THIS run
+    // just wrote, the freshness guard above necessarily sees it as at-or-after
+    // `createdAt`, and the row terminates `skipped: live_evaluation_published` —
+    // a reason that is also false, since the backstop published, not the live path.
+    for (const delivery of result.retirementDeliveries) {
+      await enqueueGithubCommitStatusDelivery(db, {
+        // Provenance-less for the same reason as the webhook path: a retirement
+        // is triggered by a gate evaluation, not an agent run.
+        companyId: null,
+        sourceRunId: null,
+        repoFullName: fencedRow.repoFullName,
+        sha: delivery.sha,
+        context: delivery.context,
+        state: delivery.state,
+        description: delivery.description,
+        targetUrl: delivery.targetUrl,
+        prNumber: fencedRow.prNumber,
+        prUrl: fencedRow.prUrl,
+        forceWrite: true,
+      });
+    }
+    await markTerminal(
+      db,
+      fencedRow,
+      "delivered",
+      "info",
+      `Re-evaluated comment-review gate for ${fencedRow.context} on ${fencedRow.repoFullName}@${fencedRow.sha.slice(0, 7)}; queued ${result.retirementDeliveries.length} retired-context retry(s)`,
+      { reason: "reevaluated_retirement_requeued", retirementDeliveries: result.retirementDeliveries },
+    );
+    return;
+  }
   await retryOrFailDelivery(db, fencedRow, `comment_review_gate_${result.reason}`, { result });
 }
 

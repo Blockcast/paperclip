@@ -210,8 +210,12 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
     postStatus?: number;
     postBody?: unknown;
     postHeaders?: Record<string, string>;
+    // Fail the status POST for these contexts only, so a test can drive the
+    // live write succeeding while a retired-context supersede does not. 422 is
+    // classified non-retryable, which keeps the bounded retry from sleeping.
+    failPostContexts?: string[];
   }) {
-    const fetchMock = vi.fn(async (url: string | URL) => {
+    const fetchMock = vi.fn(async (url: string | URL, init?: RequestInit) => {
       const u = String(url);
       if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
       if (/\/commits\/[^/]+\/statuses(?:\?|$)/.test(u)) return jsonResponse(options.latestStatuses ?? []);
@@ -229,6 +233,8 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
       if (u.includes("/issues/") && u.includes("/comments")) return jsonResponse(options.comments ?? []);
       if (u.includes("/check-runs")) return jsonResponse({ id: 2 }, true, 201);
       if (/\/statuses\/[0-9a-f]{7,40}(?:\?|$)/i.test(u)) {
+        const context = String(JSON.parse(String(init?.body ?? "{}")).context ?? "");
+        if (options.failPostContexts?.includes(context)) return jsonResponse({ message: "nope" }, false, 422);
         const status = options.postStatus ?? 201;
         return jsonResponse(options.postBody ?? { id: 1 }, status < 400, status, options.postHeaders);
       }
@@ -1106,6 +1112,7 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
 
     afterEach(() => {
       h.cfg.prCommentReviewGateStatusContext = "";
+      h.cfg.prCommentReviewGateRetiredStatusContexts = [];
     });
 
     it("re-runs the evaluation and publishes the verdict the live path lost", async () => {
@@ -1170,6 +1177,45 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
 
       expect(await readDelivery(delivery.id)).toMatchObject({ status: "delivered" });
       expect(postedGateStates(fetchMock)).toEqual(["failure"]);
+    });
+
+    // The live status published; only the retired-context cleanup did not.
+    // Retrying this row instead of handing the retirement its own durable row
+    // loses it outright: `retryOrFailDelivery` keeps `createdAt`, so the next
+    // attempt reads the status this very run wrote and terminates
+    // `skipped: live_evaluation_published` — false, and the retired context
+    // keeps a stale verdict standing. Same failure class this backstop exists
+    // to remove, in the retirement dimension.
+    it("queues a durable retirement retry instead of self-suppressing on retirement_failed", async () => {
+      setCreds();
+      h.cfg.prCommentReviewGateRetiredStatusContexts = ["review/ally-comment"];
+      const delivery = await seedReevaluation();
+      const fetchMock = stubGithub({
+        latestStatuses: [{ context: GATE_CONTEXT, state: "failure", created_at: "2026-09-26T16:32:20Z" }],
+        reviews: [cleanAllyReview(HEAD_SHA)],
+        comments: [],
+        failPostContexts: ["review/ally-comment"],
+      });
+
+      await expect(pollGitHubCommitStatusDeliveriesOnce(db)).resolves.toBe(1);
+
+      // The verdict this row existed to publish did publish.
+      expect(postedGateStates(fetchMock)).toEqual(["success"]);
+      expect(await readDelivery(delivery.id)).toMatchObject({
+        status: "delivered",
+        lastResult: { reason: "reevaluated_retirement_requeued" },
+      });
+      const retirement = await db
+        .select()
+        .from(githubCommitStatusDeliveries)
+        .where(eq(githubCommitStatusDeliveries.context, "review/ally-comment"))
+        .then((rows) => rows[0] ?? null);
+      expect(retirement).toMatchObject({
+        status: "queued",
+        sha: HEAD_SHA,
+        forceWrite: true,
+        reevaluate: false,
+      });
     });
 
     it("holds the first attempt back by the requested delay", async () => {

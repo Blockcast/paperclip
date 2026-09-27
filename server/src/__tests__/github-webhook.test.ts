@@ -3518,6 +3518,11 @@ describeEmbeddedPostgres("github-webhook route", () => {
       expect(rows[0]!.nextAttemptAt.getTime()).toBeGreaterThan(before + 10 * 60_000);
     });
 
+    // Known hole, deliberately not closed: a second trigger arriving while a
+    // backstop row is already `processing` is absorbed by
+    // `preserveExistingDelivery`, which keeps the original `createdAt`, so the
+    // newer review gets no backstop of its own. It also needs that newer
+    // review's live evaluation to be lost, which makes it rare enough to leave.
     it("collapses repeated triggers at one head onto a single backstop row", async () => {
       const sha = "b".repeat(40);
       const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
@@ -3566,6 +3571,26 @@ describeEmbeddedPostgres("github-webhook route", () => {
           .from(githubCommitStatusDeliveries)
           .where(eq(githubCommitStatusDeliveries.prNumber, 107)),
       ).toHaveLength(0);
+    });
+
+    // Mutation-killer for the OTHER half of the same guard. Deleting the
+    // `commentReviewGateContext &&` test enqueues `context: ""` rows on every
+    // trigger in a deployment that never opted into the gate; without this,
+    // only the `commentReviewGateBackstopSha` half is pinned.
+    it("queues nothing when the gate status context is unconfigured", async () => {
+      delete process.env.PAPERCLIP_PR_COMMENT_REVIEW_GATE_STATUS_CONTEXT;
+      const sha = "c".repeat(40);
+      const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+
+      const response = await postReview(app, {
+        action: "submitted",
+        repository: { full_name: "Blockcast/frr" },
+        pull_request: { number: 108, head: { sha }, html_url: "https://github.com/Blockcast/frr/pull/108" },
+        review: { user: { login: "allyblockcast[bot]" }, body: "## Ally — Consolidated PR Review" },
+      });
+
+      expect(response.status).toBe(200);
+      expect(await readBackstops(sha)).toHaveLength(0);
     });
   });
 
