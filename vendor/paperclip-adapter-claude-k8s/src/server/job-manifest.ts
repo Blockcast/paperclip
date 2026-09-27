@@ -87,8 +87,27 @@ export function buildPodLogPath(companyId: string, agentId: string, runId: strin
 }
 
 /** Prompts above this size (bytes) are staged via a Secret instead of an
- *  init container env var, protecting against the ~1 MiB PodSpec limit. */
-const LARGE_PROMPT_THRESHOLD_BYTES = 256 * 1024;
+ *  init container env var.
+ *
+ *  The binding ceiling is the kernel's, not the PodSpec's. `PROMPT_CONTENT` is
+ *  passed to the init container's `execve` as a single `NAME=value` string, and
+ *  Linux caps ONE such string at MAX_ARG_STRLEN = 32 pages = 131_072 B —
+ *  independently of the (much larger) total arg+env budget and of the ~1 MiB
+ *  PodSpec limit this constant used to be sized against. Over that, `execve`
+ *  fails E2BIG: the pod dies in the write-prompt init container before any model
+ *  turn, so the run cannot report its own breakage and mislabels as
+ *  `k8s_pod_schedule_failed` (BLO-33503), sending triage at the cluster.
+ *
+ *  At 256 KiB this left a dead band: prompts of 128–256 KiB took the env-var
+ *  path straight into that rejection, three times taking a routine fully dark
+ *  (BLO-36854). Staying under MAX_ARG_STRLEN closes it — every prompt the kernel
+ *  would reject now takes the Secret path, which already existed and is
+ *  unchanged. 8 KiB of headroom covers the `PROMPT_CONTENT=` prefix.
+ *
+ *  Note this bounds only the ENV path. The Secret path keeps its own ~1 MiB
+ *  ceiling, so a prompt above that still fails — but loudly, at Secret creation,
+ *  instead of silently in an init container. */
+const LARGE_PROMPT_THRESHOLD_BYTES = 120 * 1024;
 const RUNTIME_CACHE_VOLUME_NAME = "runtime-cache";
 const RUNTIME_CACHE_MOUNT_PATH = "/runtime-cache";
 const RUNTIME_CACHE_SIZE_LIMIT = "20Gi";
