@@ -199,10 +199,16 @@ describe("sweepOrphanedRunSecrets", () => {
   // it.each, not a `for` loop: both values shared one `it`, so a failure named
   // neither and the loop short-circuited — a broken NaN arm meant you never
   // learned whether Infinity had also regressed.
+  //
+  // `%s`, not `%p`: `%p` is Jest-only and vitest leaves it verbatim, so both
+  // cases printed the same literal title and a failure still named neither —
+  // the very defect the `for` loop was split up to fix.
   it.each([Number.NaN, Number.POSITIVE_INFINITY])(
-    "rejects %p as a caller floor instead of disarming the age check",
+    "rejects %s as a caller floor instead of disarming the age check",
     async (bad) => {
-      const h = harness([secret("ac-agent-run-nan-prompt", { runId: "run-nan", ageSec: 5 })]);
+      // Tagged per arm so the fixture in a failure matches the title above it.
+      const tag = String(bad).toLowerCase();
+      const h = harness([secret(`ac-agent-run-${tag}-prompt`, { runId: `run-${tag}`, ageSec: 5 })]);
 
       const result = await sweepOrphanedRunSecrets({ ...h.opts, ageFloorMs: bad });
 
@@ -210,7 +216,7 @@ describe("sweepOrphanedRunSecrets", () => {
       // comparison happened to be false — `reason` distinguishes the two.
       expect(result.swept).toEqual([]);
       expect(result.retained).toEqual([
-        { name: "ac-agent-run-nan-prompt", reason: "too_young" },
+        { name: `ac-agent-run-${tag}-prompt`, reason: "too_young" },
       ]);
       expect(h.deleteNamespacedSecret).not.toHaveBeenCalled();
       // And the rejection is reported: `NaN < x` is false, so a `<` test here
