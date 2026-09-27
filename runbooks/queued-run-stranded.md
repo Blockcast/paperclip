@@ -10,7 +10,10 @@ Triggers:
 - `PaperclipQueuedRunStranded` — an agent's oldest queued run is older than
   `queuedRunStrandedAgeSeconds` (1440 seconds by default), and the age
   snapshot refreshed successfully. The five-minute alert hold means it can
-  fire before 30 minutes of real queue wait.
+  fire before 30 minutes of real queue wait. This is the per-agent form this
+  chart renders. Blockcast's live `onprem-k8s` rules replaced it with the
+  fleet-scoped `PaperclipQueuedRunStrandedFleet` (≥5 agents past 1800s, for
+  15m; BLO-29665), which also links here.
 - `PaperclipQueuedRunAgeMetricsRefreshFailed` — the most recent `/metrics`
   database refresh failed, so queued-run ages are stale and intentionally do
   not qualify the stranded-run alert.
@@ -475,23 +478,34 @@ paperclip's own dispatcher — routing it `warning` would put the page behind
 the component it is reporting on. **The action is diagnostic capture, not a
 restart** (Step 4).
 
-⚠️ **The coverage this retune GIVES UP: a solo indefinite hold now pages on
-nothing.** Stated here because it is the one cost of the change that is not
-self-evident from the expression. After #3985 lands, the three alerts that
-could catch a single agent whose lock is held for the life of the process all
-decline to: this one needs **≥3** agents, `PaperclipQueuedRunStrandedFleet`
-needs **≥5**, and the per-agent `PaperclipQueuedRunStranded` it superseded is
-gone. So "the fleet alert already covers user-visible impact" is true only in
-the fleet regime.
+⚠️ **The coverage this retune GIVES UP, in Blockcast's live rules: a solo
+indefinite hold now pages on nothing.** Stated here because it is the one cost
+of the change that is not self-evident from the expression. After #3985 lands,
+none of the three alerts that could catch a single agent whose lock is held for
+the life of the process does so in Blockcast's live `onprem-k8s` rules: this
+one needs **≥3** agents, `PaperclipQueuedRunStrandedFleet` needs **≥5**, and
+the per-agent `PaperclipQueuedRunStranded` it superseded is already gone from
+them (BLO-29665). The ≥5 is read from the lockstep pair cited under
+Trigger above, which is also where #3985 puts the ≥3; neither fleet-count form
+exists in this repo. So "the fleet alert already covers user-visible impact"
+is true only in the fleet regime.
 
 That is a deliberate trade, not an oversight, and the evidence supports it:
 solo holds are measured to **cycle** (175 resets/6h — acquired and released
 about every 2 minutes), and the founding 2026-09-15/16 incident was five
 agents, so the retuned expression would have caught it. The residual is the
-case never yet observed — one agent, monotonic, indefinite. **If you are
-triaging a single stuck agent, no page will have brought you here**; reach for
+case never yet observed: one agent, monotonic, indefinite. **On Blockcast's
+live `onprem-k8s` rules, if you are triaging a single stuck agent, no page will
+have brought you here**; reach for
 `max by (agent_id) (paperclip_agent_start_lock_held_seconds)` directly, and
 read the `resets()` caveat in Step 4 before concluding it is stuck.
+
+**This chart copy keeps that coverage.** It still renders the per-agent
+`PaperclipQueuedRunStranded` (`deploy/helm/paperclip/templates/prometheusrule.yaml`,
+`queuedRunStrandedAgeSeconds`, 1440s by default), and its own start-lock rule
+is the unretuned single-agent `> 300` (see KNOWN DIVERGENCE below). An
+installation that enabled the chart still pages on a solo hold, and on its
+stranded consequence.
 
 **What holds the locks for 2h14m is still UNKNOWN.** This retune makes the
 alert describe reality; it does not explain the stall. Recorded lead, untested
@@ -533,10 +547,14 @@ digest and StatefulSet revision — **a restart performed under the withdrawn
 instruction, not an observation that the hold required one** (see the
 qualification above).
 
-`PaperclipQueuedRunStranded` above fires on the *consequence* of this and will
-usually fire too, a while later. It cannot tell you the cause: a queued run
-strands identically under slot starvation, a scheduler-tick gap or a dropped
-dispatch. This alert names the mechanism directly, and fires sooner.
+In this chart copy, `PaperclipQueuedRunStranded` above fires on the
+*consequence* of this and will usually fire too, a while later. In Blockcast's
+live `onprem-k8s` rules that per-agent form is gone (BLO-29665), and its
+successor `PaperclipQueuedRunStrandedFleet` fires on the consequence only once
+≥5 agents strand at once (see the coverage note above). Neither can tell you
+the cause: a queued run strands identically under slot starvation, a
+scheduler-tick gap or a dropped dispatch. This alert names the mechanism
+directly, and fires sooner.
 
 ### What to do when paged
 
