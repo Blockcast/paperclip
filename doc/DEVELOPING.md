@@ -743,18 +743,59 @@ either.
 | field | treatment |
 |---|---|
 | `phase`, `status`, `exitCode`, `command`, `cwd`, `metadata`, the ids, the timestamps, and the log volume/location/digest (`logStore`, `logRef`, `logBytes`, `logSha256`, `logCompressed`) | **state** — company-readable |
-| `stdoutExcerpt`, `stderrExcerpt` | **transcript** — scoped as above |
-| `GET /api/workspace-operations/:operationId/log` body | **transcript** — scoped as above |
+| `stdoutExcerpt`, `stderrExcerpt` | **transcript** — scoped on `runs:read_transcript` as above |
+| `GET /api/workspace-operations/:operationId/log` body | **transcript** — scoped, but on `workspace_runtime:read`, NOT on the run-transcript gate. See below. |
 
-The excerpts are withheld on **all three** read routes, or the boundary is not
-closed: `GET /api/heartbeat-runs/:runId/workspace-operations`,
+The excerpts are withheld on **both list routes**, or the boundary is not
+closed: `GET /api/heartbeat-runs/:runId/workspace-operations` and
 `GET /api/execution-workspaces/:id/workspace-operations` (the widest — it
-returns every operation for a workspace, including other agents' runs), and the
-per-operation `/log` above. Withheld rows carry
+returns every operation for a workspace, including other agents' runs).
+Withheld rows carry
 `withheldFields: ["stdoutExcerpt", "stderrExcerpt"]`, so a client can tell "not
 entitled" from "this operation captured no output"; every state field survives
 beside them, because hiding the operator's text is the point and hiding that an
 operation ran is not.
+
+**The per-operation `/log` body is scoped by a different control, and the
+difference is deliberate.** BLO-34631 landed a `workspace_runtime:read`
+entitlement on that route while PEN-3204 was open, so it is **not** additionally
+gated on `decideRunTranscriptRead`. That entitlement is *strictly tighter* than
+the run-transcript gate for the population this section protects:
+`workspace_runtime:read` is unmapped in `permissionForAction` and deliberately
+absent from the same-company agent allow-list (PEN-2852,
+`services/authorization.ts`), so **no agent actor resolves it** — the body is
+withheld from every agent, owner or not. Reaching for a grant row is a dead end
+for two *independent* reasons: the action is unmapped, so the generic
+`permissionKey` fallback at the bottom of `decideBase` never fires for it — and
+`workspace_runtime:read` is not a `PermissionKey` at all, so there is no row to
+insert in the first place. The second reason is compiler-held (it is absent
+from `PERMISSION_KEYS`, `packages/shared/src/constants.ts`) and is therefore
+the one a future implementer cannot accidentally undo; widening the allow-list
+is the only lever that works. Stacking the transcript gate on top would convert
+a withheld 200 into a 403 and change no bytes.
+
+Two consequences follow, and neither is an oversight:
+
+- **`runs:read_transcript` does not reach this route.** A holder of the grant
+  gets a withheld body here, unlike on the run-transcript routes. That is a real
+  narrowing of the PEN-3140 escape hatch, decided on PEN-3204 rather than
+  inherited: the grant was sized from an audit of *run* transcript reads, no
+  demand for workspace-operation log reads was measured, and human operators
+  (active non-viewer board members) retain the read, which is the principal
+  incident response actually uses. Widening it back is a product decision that
+  needs its own evidence, not a default.
+- **Withheld here means masked, not emptied.** The body returns 200 with
+  `content` replaced wholesale by the redaction sentinel
+  (`maskWorkspaceRuntimeTextForRead`), so a reader can still tell "this operation
+  logged nothing" from "the log was withheld". It is a total replacement, not a
+  heuristic scrub.
+
+Because the transcript bytes on that route now ride on an entitlement whose
+charter is *operator-authored runtime config* rather than transcript content,
+adding `workspace_runtime:read` to the agent allow-list for a runtime-config
+workflow would open the captured output as a silent side effect. That coupling
+is pinned by a test in `authorization-service.test.ts` (PEN-3204) which fails if
+a `runs:read_transcript` holder ever resolves `workspace_runtime:read`.
 
 `command` / `cwd` / `metadata` are separately masked by an **orthogonal** gate,
 `workspace_runtime:read` (`routes/workspace-response.ts`). The two compose and
@@ -848,9 +889,10 @@ reachable paths over the same material; wiring an alert or digest to some and
 not the others reproduces the blindness that got this audit rejected as a
 standalone compensating control on PEN-3140. The workspace-operation path is the
 one that had *neither* half of the control pair — no gate and no audit — until
-PEN-3204; its row is keyed `entity_type = workspace_operation` and carries the
-operation's owning run in `runId`, plus `details.ownerAgentId`, where `null`
-records the fail-closed branch (decided with no resolvable owner).
+BLO-34631 gave it both; its row is keyed `entity_type = workspace_operation` and
+carries the operation's owning run in `runId` — which is **`null`** for a
+workspace-scoped operation that has no owning run, so a run pivot alone never
+sees those. See the sweep below.
 
 The audit row records the actor type/id, company id, heartbeat run id, timestamp
 (`activity_log.created_at`), access result, and the requested window (byte
@@ -865,10 +907,202 @@ query all three actions above — the two run-transcript routes are keyed
 workspace-operation route is keyed `entity_type = workspace_operation` with the
 owning run in `runId`. Querying only the `heartbeat_run` rows silently omits the
 workspace-operation path, which is the same partial-coverage blindness this
-section warns about immediately above. The event `details.result` value is `allowed` when content was
-eligible to be read and `denied` when an access check rejected the request —
-which now includes a same-company caller that lacks transcript entitlement, not
-only a cross-company one. Retention follows the deployment's normal
+section warns about immediately above.
+
+⚠️ **The run pivot does not close the workspace-operation path either — it
+misses every run-less operation.** `workspace_operations.heartbeatRunId` is
+nullable (`packages/shared/src/types/workspace-operation.ts`), the route writes
+it through to the audit row verbatim, and `listForRun` *deliberately* also
+returns the workspace-scoped cleanup rows that have no owning run
+(`services/workspace-operations.ts`). `/log` takes a bare operation id, so those
+rows are reachable and audited like any other — they simply book `runId: null`.
+Filtering `entity_type = workspace_operation` by `runId = <runId>` therefore
+returns every run-attached read and **zero** run-less ones. Pair the pivot with
+an `entity_type = workspace_operation` sweep scoped by `companyId` and time
+window (or by the specific `entity_id`s) to get the whole set.
+
+⚠️ **`details.result` does not mean the same thing on all three rows, and
+filtering on it alone under-counts.** On the two run-transcript routes an
+unentitled same-company caller books `result: "denied"`, whether the response is
+`/log`'s 403 or `/events`' 200-with-withheld-content. (That implication runs one
+way only on `/log` — see the classification note below.) On the
+workspace-operation `/log` route it is not: that caller clears both company
+checks and receives a 200 whose `content` is masked, and the row books
+`result: "allowed"` with **`details.withheld: true`**
+(BLO-34631 added that flag for exactly this reason — there, the access check
+decides reachability and the entitlement decides the bytes). `details.withheld`
+is present *only* on the workspace-operation rows. An incident query that
+enumerates unentitled transcript access as `details.result = "denied"` therefore
+returns every run-route attempt and **zero** workspace-operation attempts. Read
+`result: "denied" OR details.withheld = true` across the three actions to get
+the whole set.
+
+⚠️ **`denied` also conflates two different failures — a separate axis from the
+under-count above, and one the recommended query does not fix.** That query
+still returns the whole set; this is conflation, not omission. But a responder
+*classifying* what it returns needs to know that `denied` is not one thing.
+
+One leg is easy to misread as a boundary denial and is not. The two `/log`
+routes wrap `assertCompanyAccess` in a `try`/`catch` that audits `denied`, but
+that call is reached only *after* `hasCompanyAccess` has already passed, so its
+cross-tenant throws (`routes/authz.ts`) re-test a predicate that just succeeded
+and cannot fire, and its remaining throws are gated on a non-safe method. On a
+GET the one leg still live is `RESPONSIBLE_USER_UNAVAILABLE` — an agent actor
+carrying a responsible user whose membership in the company is not `active`.
+That is **not** a JWT-only shape: an **agent API key** carries one too, always
+(`middleware/auth.ts` refuses a key whose responsible user is missing, so every
+key actor that authenticates has one). The check itself (`routes/authz.ts`)
+gates on the actor having a responsible user at all and never reads `source`.
+It is deliberately not safe-method-gated (unlike its
+`RESPONSIBLE_USER_UNAUTHORIZED` sibling) and throws unless the opt-in shadow
+mode is on (`services/authorization.ts`). That caller is **same-company**.
+
+⚠️ **The table below describes enforce mode.** Under
+`PAPERCLIP_RESPONSIBLE_USER_AUTHZ_MODE=shadow` (or the
+`PAPERCLIP_RESPONSIBLE_USER_AUTHZ_SHADOW` boolean) that throw is suppressed,
+`assertCompanyAccess` completes, the `catch` never runs, and the
+responsible-user leg leaves every row: a same-company `denied` on
+`heartbeat.run_log_accessed` is then unambiguously an entitlement denial, and
+`workspace_operation.log_accessed` books no same-company `denied` at all. Check
+the deployment's mode before classifying against this table.
+
+| action | what `result: "denied"` covers |
+|---|---|
+| `heartbeat.run_events_accessed` | an entitlement denial **or**, in enforce mode, a responsible-user *authorization* denial — `/events` runs the same `decideRunTranscriptRead`, so the intersection denial books here too. Two other denials book **no row at all**: both the cross-tenant caller and the same-company responsible-user-*unavailable* caller exit inside `getAccessibleResource` (`routes/authz.ts`), which 404s or throws upstream of this route's single audit call |
+| `heartbeat.run_log_accessed` | an entitlement denial, **or** a cross-tenant 404, **or** a same-company responsible-user-*unavailable* denial, **or**, in enforce mode, a responsible-user *authorization* denial — all four book the identical row shape |
+| `workspace_operation.log_accessed` | a cross-tenant 404 **or** a same-company responsible-user-unavailable denial — **never** an entitlement denial, which books `allowed` + `withheld: true` instead, per the block above |
+
+So counting "same-company unentitled reads" off `result: "denied"` folds in
+cross-tenant probes on both `heartbeat_run` and `workspace_operation` rows,
+folds in responsible-user denials on the run actions, and on
+`workspace_operation` rows finds no entitlement denial at all. Isolating one
+takes two filters, neither of which is a plain predicate over `activity_log` —
+and on one action even both together fall short, so a third source is needed:
+
+- **The row's `companyId` is the *entity's* company** (`run.companyId` /
+  `operation.companyId`) — the actor's own company is nowhere on the row, whose
+  actor fields are `actorType`, `actorId`, `agentId`, `details.actorSource` and
+  `details.actorRunId`. Splitting cross-tenant from same-company is therefore a
+  join — to `agents.company_id` for an agent actor, to company membership for a
+  user actor — not a comparison between two columns of the row.
+- **Within same-company, `details.actorSource` finishes the job on one action
+  and does not touch the other.** On `workspace_operation.log_accessed` there
+  is no entitlement leg, so every same-company `denied` is
+  responsible-user-unavailable whatever the source says. On
+  `heartbeat.run_log_accessed` both legs are reachable and `actorSource` does
+  **not** separate them. An agent actor books `agent_jwt` or `agent_key` and
+  nothing else (`routes/authz.ts`), and both values are ambiguous: `agent_key`
+  always carries a responsible user, `agent_jwt` carries one whenever the claim
+  is signed, and either can fail either way. So a same-company `denied` on that
+  action is **not** decomposable from the row alone. Filtering it to
+  `actorSource != 'agent_jwt'` and reporting the result as unentitled
+  transcript reads promotes a responsible-user **availability** failure — an
+  offboarded owner, a stale key — into an insider **entitlement** finding.
+- **The discriminator that row lacks is in the log stream, not in
+  `activity_log`.** The responsible-user denial is not silent:
+  `throwOrShadowResponsibleUserCompanyAccessDeny` (`routes/authz.ts`) emits a
+  structured `logger.warn` *before* deciding whether to throw, carrying
+  `action: "company_access"` — the field that selects these lines out of the
+  stream — plus `code` (`RESPONSIBLE_USER_UNAVAILABLE` vs
+  `RESPONSIBLE_USER_UNAUTHORIZED`), `authzMode`, `companyId`, `actorAgentId`,
+  `responsibleUserId` and `method`. Two limits on what that buys. **`code` does
+  not discriminate *within this emitter*:** all three routes are GETs and the
+  `RESPONSIBLE_USER_UNAUTHORIZED` branch is gated on a non-safe method, so on
+  these paths this emitter can only ever write `RESPONSIBLE_USER_UNAVAILABLE`.
+  **And it is not the only emitter:** `applyResponsibleUserIntersection`
+  (`services/authorization.ts`) writes its own warn — "responsible-user
+  authorization intersection denied" — carrying the same `companyId`,
+  `actorAgentId`, `authzMode` and `code`, but `action: <the authz action>`
+  (`runs:read_transcript` on these routes). It fires only when the **agent**
+  was entitled and its responsible user was not, and that denial *is* booked at
+  the entitlement call site — so an entitlement-path row can carry a warn after
+  all. The claim that holds is the narrower one: nothing on the **cross-tenant**
+  path emits a warn, and an entitlement denial where the **agent** lacked the
+  grant emits none either. Both emitters are in scope for the correlation
+  below — do **not** filter the stream to one of them.
+- **Correlate in enforce mode only, against *both* emitters, and treat the join
+  as probabilistic.** In enforce mode, match a same-company `denied` row
+  against the warn stream on `actorAgentId` + `companyId` + time, and read the
+  matched line's `action`:
+  - `action: "company_access"` — the responsible-user **availability** leg
+    (`code` is always `RESPONSIBLE_USER_UNAVAILABLE` here, per the bullet
+    above).
+  - `action: "runs:read_transcript"` with `code: RESPONSIBLE_USER_UNAUTHORIZED`
+    — the responsible-user **authorization** leg. `denyCode` is `UNAUTHORIZED`
+    exactly when the responsible user exists *and* holds an active membership
+    (`services/authorization.ts`), so this is the case where the agent passed
+    `assertCompanyAccess` silently and was then denied on the intersection.
+  - **no match on either** — the agent's own entitlement denial.
+
+  Filtering the stream to `action: "company_access"` and calling the residue
+  the entitlement denial is the mistake this bullet exists to prevent: it sorts
+  the authorization leg into "entitlement denial", so the responder reports an
+  insider unentitled transcript read by an agent that **was** entitled — the
+  denial came from its responsible user — and the investigation is pointed at
+  the wrong principal. The row cannot correct that on its own: the decision's
+  `RESPONSIBLE_USER_UNAUTHORIZED` code travels to the client in the 403 body
+  via `authorizationDeniedDetails` and is **not** among the fields the audit
+  writes (`result`, `actorSource`, `actorRunId`, `offset`, `limitBytes`,
+  `logStore`). This is the same harm as the `actorSource` trap above, reached
+  by a different mechanism. Note that `code` *is* the discriminator on the
+  second emitter even though it is constant on the first — it is a property of
+  each emitter, not of the stream.
+
+  Reachability is not marginal, which is why the two-emitter form matters: an
+  agent **API key** always carries a responsible user (`middleware/auth.ts`
+  refuses a key whose responsible user is missing before building the actor),
+  `runs:read_transcript` is a *mapped* action, and a mapped action skips the
+  `allow_simple_company_member` visibility branch that unmapped read actions
+  take — so the responsible user is re-decided against a per-user
+  `runs:read_transcript` grant row that most members do not hold.
+
+  Do **not** run any of this under shadow. The ⚠️ block above already answers
+  the question directly there, and the correlation *inverts*: the
+  `company_access` warn still fires, but the throw is suppressed, so the row it
+  would have matched is never booked — while the same-company `denied` that
+  *is* booked on `heartbeat.run_log_accessed` comes from the entitlement leg
+  further down the same request and matches the warn on every key. The second
+  emitter inverts the same way and for the same reason:
+  `applyResponsibleUserIntersection` (`services/authorization.ts`) writes its
+  warn *before* choosing what to return, then returns the agent's own decision
+  under shadow — so the line **is** emitted and the denial books nothing.
+  Following the rule in shadow mode therefore discards a genuine insider
+  unentitled transcript read as an availability failure, which is the one
+  direction this section exists to prevent.
+
+  **Neither emitter is enforce-only, and the presence of either warn is not
+  evidence the deployment is enforcing.** Read `authzMode` on the line itself:
+  both emitters carry it as their first field, and it is the only mode signal
+  either one gives you.
+
+  Even in enforce mode the join is time-fuzzy: neither warn carries a request
+  or run correlator, so the row's own `runId` and `details.actorRunId` have
+  nothing on the log side to join to. For the `company_access` leg the
+  imprecision is larger than per-request noise, because its condition — "this
+  agent's responsible user has no active membership in this company" — is a
+  **state**, not an event: while it holds, essentially every company-scoped
+  request that agent makes emits the warn, from over twenty `assertCompanyAccess`
+  call sites in `routes/agents.ts` alone. So a match establishes that the
+  responsible user was unavailable *around that time* and carries almost no
+  per-request information. That cuts both ways, and the useful half is the
+  contrapositive: a single matching warn anywhere in the window is enough, so
+  the responder does not need per-request alignment. Restricting candidates to
+  `method: "GET"` buys one narrowing and only one — it drops the write-route
+  noise from the other `assertCompanyAccess` call sites, since all three of
+  these routes are GETs. ⚠️ Apply that filter to the `company_access` leg
+  **only**: `method` is a field of the first emitter's warn, and the
+  intersection warn does not carry it at all, so a blanket `method: "GET"`
+  predicate over the whole stream silently drops every authorization-leg line
+  and reproduces the single-emitter mistake this bullet exists to prevent.
+  (`action` cannot tighten anything here either; it is the field being read to
+  classify the match, so it is fixed by construction.)
+  Finally, the log stream's retention is not `activity_log`'s, so on an older
+  row the absence of a match may mean the logs aged out rather than that the
+  denial was an entitlement one — though the state-not-event property above
+  makes an aged-out `company_access` leg less likely than a single-event join
+  would be.
+
+Retention follows the deployment's normal
 `activity_log` database retention and backup policy; Paperclip does not
 currently apply a separate shorter retention window for these access-audit rows.
 
