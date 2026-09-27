@@ -60,11 +60,13 @@ function capacityDenyingGate(): PenstockAvailabilityGate {
  * sweeps an agent's already-assigned backlog, so the effect ran backwards --
  * the busier an agent was, the less its own queue was ever swept.
  *
- * The four cases below are the whole contract: the timer fires off its own
+ * The five cases below are the whole contract: the timer fires off its own
  * history, it does not re-fire off that same history, an agent with no timer
  * history fires once and thereby acquires one, and the provider-capacity gate —
  * the one timer exit that used to write no history at all — records its tick so
  * a capacity outage cannot make the scheduler re-enter it every 30 seconds.
+ * The fifth pins that the cooldown gate inside `wakeup()` does not bring the
+ * `lastHeartbeatAt` baseline back for the scheduler's own ticks.
  */
 
 const INTERVAL_SEC = 600;
@@ -111,6 +113,7 @@ describeEmbeddedPostgres("timer baseline is the last timer tick, not the last ru
      */
     lastHeartbeatAt: Date;
     createdAt: Date;
+    cooldownSec?: number;
   }) {
     await db.insert(companies).values({
       id: input.companyId,
@@ -134,6 +137,7 @@ describeEmbeddedPostgres("timer baseline is the last timer tick, not the last ru
           intervalSec: INTERVAL_SEC,
           wakeOnDemand: true,
           maxConcurrentRuns: 4,
+          ...(input.cooldownSec === undefined ? {} : { cooldownSec: input.cooldownSec }),
         },
       },
       permissions: {},
@@ -296,5 +300,39 @@ describeEmbeddedPostgres("timer baseline is the last timer tick, not the last ru
     // capacity path every pass (30s in production) and each pass commits another
     // parked run, because a bare timer wake has no task key and cannot coalesce.
     expect(await countScheduledRetryRuns(agentId)).toBe(1);
+  });
+
+  it("fires under a cooldown as long as the interval, because the cooldown does not read lastHeartbeatAt for scheduler ticks", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const now = new Date("2026-09-19T11:00:00.000Z");
+
+    await seedTimerAgent({
+      companyId,
+      agentId,
+      // Relative to the wall clock, not to `now`: the cooldown gate inside
+      // `wakeup()` reads `Date.now()`, while `now` only drives `tickTimers`.
+      lastHeartbeatAt: new Date(Date.now() - 30_000),
+      createdAt: new Date("2026-09-01T00:00:00.000Z"),
+      // The worst case: cooldownSec is clamped to intervalSec, so with the
+      // cooldown reading `lastHeartbeatAt` every tick of an event-busy agent is
+      // spent as `heartbeat.cooldown.active`, and that skip row advances the
+      // timer baseline, so the tick is lost rather than retried.
+      cooldownSec: INTERVAL_SEC,
+    });
+    await seedTimerWakeupRequest({
+      companyId,
+      agentId,
+      requestedAt: new Date("2026-09-19T09:00:00.000Z"),
+    });
+
+    const result = await heartbeatService(db, { skipQueuedRunDispatch: true }).tickTimers(now);
+
+    expect(result).toMatchObject({ checked: 1, enqueued: 1 });
+    const cooldownSkips = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.reason, "heartbeat.cooldown.active"));
+    expect(cooldownSkips).toHaveLength(0);
   });
 });
