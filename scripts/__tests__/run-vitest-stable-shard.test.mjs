@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -76,12 +77,32 @@ test("shard flags are rejected for the parallel workspace groups", () => {
   assert.notEqual(result.status, 0, "workspace groups must not accept shard flags");
 });
 
-test("the workspace-b group uses ARC-safe Vitest timeouts", () => {
+test("the workspace-b group keeps --testTimeout and never passes --hookTimeout", () => {
+  // Narrowed from the assertion this replaces (BLO-37184), which required both
+  // `--testTimeout=30000` and `--hookTimeout=60000`. Measured on vitest 4.1.8
+  // against packages/db (declares neither): under `--project`, `--testTimeout`
+  // reaches the resolved project config -- 30000 lets a 7s test pass, 1000
+  // reports "Test timed out in 1000ms.", omitting it reports 5000ms -- while
+  // `--hookTimeout` never lands. 60000, 2000 and absent all report "Hook timed
+  // out in 10000ms."; the 2000 row rules out a precedence fight, because a
+  // config overriding the CLI would still honour a TIGHTER deadline.
+  //
+  // The harm was not the wasted flag, it was that it READ as protection while
+  // all 18 group-B projects ran on the bare 10s hook default. A hook budget
+  // only binds from the package's own vitest.config.ts, which
+  // scripts/__tests__/vitest-project-coverage.test.mjs enforces for every
+  // project booting embedded Postgres.
   const dryRun = dryRunJson(["--mode", "general", "--group", "general-workspaces-b"]);
-  assert.deepEqual(dryRun.generalWorkspacesBVitestArgs, [
-    "--testTimeout=30000",
-    "--hookTimeout=60000",
-  ]);
+  assert.deepEqual(dryRun.generalWorkspacesBVitestArgs, ["--testTimeout=30000"]);
+  // Strip `//` comments first -- the measurement table above the constant in
+  // run-vitest-stable.mjs quotes the flag, and that prose is the whole reason
+  // the next reader will not re-add it.
+  const code = readFileSync(script, "utf8").replace(/^\s*\/\/.*$/gm, "");
+  assert.ok(
+    !/--hookTimeout/.test(code),
+    "run-vitest-stable.mjs must not pass --hookTimeout: it is inert under Vitest 4 `projects`. " +
+      "Set hookTimeout in the package's own vitest.config.ts instead.",
+  );
 });
 
 test("duration-aware partition balances skewed weights better than round-robin", () => {

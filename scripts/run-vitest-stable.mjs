@@ -66,12 +66,31 @@ const serializedServerVitestArgs = [
   "--no-file-parallelism",
   "--maxWorkers=1",
 ];
-// Workspace projects run concurrently inside each Vitest invocation. ARC CPU
-// contention can stretch otherwise healthy filesystem/process tests beyond
-// Vitest's 5-second default without indicating a hang.
+// `--testTimeout` reaches a project's resolved config under Vitest 4
+// `projects`; `--hookTimeout` does NOT. Measured on vitest 4.1.8, one probe
+// package (packages/db, which declares neither), 2026-09-27 (BLO-37184):
+//
+//   --testTimeout=30000  -> a 7s test passes
+//   --testTimeout=1000   -> "Test timed out in 1000ms."
+//   (no flag)            -> "Test timed out in 5000ms."
+//   --hookTimeout=60000  -> "Hook timed out in 10000ms."
+//   --hookTimeout=2000   -> "Hook timed out in 10000ms."   <- even TIGHTENING is ignored
+//   (no flag)            -> "Hook timed out in 10000ms."
+//
+// The tightening row is the one that settles it: a project config overriding
+// the CLI would still honour 2000ms, so `--hookTimeout` is not losing a
+// precedence fight, it never lands. It is specific to the projects path --
+// the same flag run flat from inside packages/db reports "Hook timed out in
+// 2000ms." So `--hookTimeout=60000` sat on this line reading as protection
+// while all 18 general-workspaces-b projects ran on the bare 10s default,
+// which is what made BLO-36739's alertmanager flake hard to diagnose.
+//
+// A hook budget only binds from the package's own vitest.config.ts (verified:
+// `hookTimeout: 30_000` there makes a 12s hook pass under `--project`).
+// scripts/__tests__/vitest-project-coverage.test.mjs enforces that for every
+// project booting embedded Postgres. Do not re-add `--hookTimeout` here.
 const arcWorkspaceVitestArgs = [
   "--testTimeout=30000",
-  "--hookTimeout=60000",
 ];
 
 function toRepoPath(file) {
