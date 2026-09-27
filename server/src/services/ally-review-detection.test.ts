@@ -193,10 +193,52 @@ describe("prior-finding dispositions", () => {
     expect(classifyPriorDisposition("maybe")).toBe("unrecognized");
   });
 
+  // BLO-36903. `tracked` is its own kind, not a member of the retiring set:
+  // `retires` claims the defect is gone and `defers` claims it is still there
+  // and was accepted. Collapsing them would report a deferral as clean, which
+  // is the misstatement this verb was added to avoid.
+  it("classifies tracked as defers, distinct from retires", () => {
+    expect(classifyPriorDisposition("tracked")).toBe("defers");
+    expect(classifyPriorDisposition("tracked")).not.toBe("retires");
+    expect(classifyPriorDisposition("TRACKED")).toBe("defers");
+    expect(classifyPriorDisposition("  tracked  ")).toBe("defers");
+  });
+
+  // The fail-closed default must survive the widening. A verb adjacent to the
+  // new one is the case that would break if `defers` were ever implemented as a
+  // prefix or substring test rather than set membership.
+  it("still fails closed on a verb adjacent to the new one", () => {
+    for (const verb of ["tracking", "track", "tracked-elsewhere", "deferred", "accepted"]) {
+      expect(classifyPriorDisposition(verb)).toBe("unrecognized");
+    }
+  });
+
   it("extracts a blocks entry from the ledger", () => {
     const ledger = `### Prior Findings Dispositioned
 - **prior:${OTHER.slice(0, 7)} important 1** — still-present — the null check is still missing`;
     const entries = extractAllyPriorFindingDispositions(body(`Reviewed head: ${SHA}`, ledger));
     expect(entries.some((e) => e.kind === "blocks")).toBe(true);
+  });
+
+  it("extracts a defers entry from the ledger", () => {
+    const ledger = `### Prior Findings Dispositioned (1)
+- **prior:${OTHER.slice(0, 7)} important 1** — tracked — accepted onto BLO-36822.`;
+    const entries = extractAllyPriorFindingDispositions(body(`Reviewed head: ${SHA}`, ledger));
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ kind: "defers", disposition: "tracked", index: 1 });
+  });
+
+  // A `tracked` entry must not make a body actionable on its own — that is what
+  // lets a review carrying one still read as landable. `still-present` in the
+  // same slot does block, which is the control proving this asserts something.
+  it("does not block on a tracked entry, where still-present does", () => {
+    const entry = (verb: string) =>
+      body(
+        `Reviewed head: ${SHA}`,
+        `### Prior Findings Dispositioned (1)
+- **prior:${OTHER.slice(0, 7)} important 1** — ${verb} — see the follow-up.`,
+      );
+    expect(hasActionablePrReviewFeedback(entry("tracked"))).toBe(false);
+    expect(hasActionablePrReviewFeedback(entry("still-present"))).toBe(true);
   });
 });
