@@ -34,10 +34,11 @@ name: Ally Review Consistency Guard
 # finding on a draft or conflicting PR is printed as a warning and does not fail
 # the run, because such a PR cannot reach master without first changing state —
 # a transition this hourly run re-observes, at which point the finding fails
-# again. There is deliberately no "untouched for N days" window: staleness is
-# not a state GitHub enforces anything against, so a clean month-old PR merges
-# on a click with no transition and no run in between. See prDormancy() in the
-# script for the measurement behind that split.
+# again. An "untouched for N days" window applies ONLY where GitHub reported no
+# usable merge state: staleness is not a state GitHub enforces anything
+# against, so a clean month-old PR merges on a click with no transition and no
+# run in between, and CLEAN/BEHIND/UNSTABLE therefore stay fatal at any age.
+# See prDormancy() in the script for the three tiers and the measurement.
 
 on:
   schedule:

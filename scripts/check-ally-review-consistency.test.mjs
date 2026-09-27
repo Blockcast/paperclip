@@ -28,6 +28,7 @@ import {
   isAllySeatReviewer,
   isMainModule,
   MAX_IDLE_DAYS,
+  parseMaxIdleDays,
   operativeAllyReviews,
   main,
   parseBaseline,
@@ -1507,5 +1508,23 @@ describe("PR_LIST_FIELDS", () => {
         `${field} must be fetched or the clause that reads it goes inert`,
       );
     }
+  });
+});
+
+describe("parseMaxIdleDays", () => {
+  it("defaults to 14 only when the variable is unset", () => {
+    assert.equal(parseMaxIdleDays(undefined), 14);
+    assert.equal(parseMaxIdleDays("7"), 7);
+  });
+
+  it("refuses the values that would read every unresolved PR as dormant", () => {
+    // "" is what an Actions `env:` bound to an unset variable or input yields.
+    for (const raw of ["", "  ", "0", "-1"]) {
+      assert.throws(() => parseMaxIdleDays(raw), /ALLY_REVIEW_MAX_IDLE_DAYS/, JSON.stringify(raw));
+    }
+  });
+
+  it("refuses a non-numeric value rather than silently never deferring", () => {
+    assert.throws(() => parseMaxIdleDays("abc"), /ALLY_REVIEW_MAX_IDLE_DAYS/);
   });
 });
