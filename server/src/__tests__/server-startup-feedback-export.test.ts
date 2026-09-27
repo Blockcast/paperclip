@@ -1586,6 +1586,106 @@ describe("startServer feedback export wiring", () => {
     }
   });
 
+  // PEN-3314, from Ally's review of 38422e1 (Important): a detector sitting
+  // downstream of the resource whose exhaustion it reports is silent in exactly
+  // the case it exists for. The heartbeat tick reaches the recovery-chain latch
+  // only after two `resolveSchedulingSuppression()` round-trips; when the pool
+  // saturates — the BLO-34207 state, `active` pinned at POSTGRES_POOL_MAX with a
+  // long `waiting` queue — every tick parks on those awaits and none arrives.
+  //
+  // The resulting signal is not merely missing, it is INVERTED: the in-flight
+  // gauge would hold the `0` written by the last settle, so a wedged worker
+  // exports a confident "no pass outstanding" for the duration of the incident.
+  // This pins the fix — in-flight and stall are driven by their own timer, which
+  // queries nothing and so cannot be starved by the pool.
+  //
+  // The skip assertion is the positive control, and it is load-bearing: without
+  // it this test would pass for the wrong reason if the suppression hang failed
+  // to actually starve the tick. Skips flat + in-flight climbing IS the
+  // saturation signature.
+  it("keeps reporting in-flight while pool saturation starves the heartbeat tick", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    // Every callback, not just the last: the point of this test is that more
+    // than one timer is now involved, so a last-wins capture would silently
+    // test the tick again and assert nothing new.
+    const intervalCallbacks: Array<() => void> = [];
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallbacks.push(callback);
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    const idleReconcile = {
+      assignmentDispatched: 0,
+      dispatchRequeued: 0,
+      continuationRequeued: 0,
+      successfulRunHandoffEscalated: 0,
+      escalated: 0,
+      skipped: 0,
+      issueIds: [],
+    };
+
+    const readSeries = async (metric: string): Promise<number | null> => {
+      const { body } = await renderMetrics();
+      const line = body
+        .split("\n")
+        .find((candidate) => candidate.startsWith(`${metric} `));
+      return line ? Number(line.slice(metric.length + 1)) : null;
+    };
+
+    let releaseTail: (() => void) | null = null;
+    try {
+      await startServer();
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalledTimes(1));
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockClear();
+
+      // Park the tail so a pass is genuinely outstanding when saturation hits.
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockImplementationOnce(
+        () => new Promise((resolve) => {
+          releaseTail = () => resolve(idleReconcile);
+        }),
+      );
+
+      // The scheduler tick is the last timer registered (every other
+      // `setInterval`-spying test in this file depends on that too).
+      const schedulerTick = intervalCallbacks[intervalCallbacks.length - 1];
+      schedulerTick?.();
+      await vi.waitFor(() => expect(releaseTail).not.toBeNull());
+
+      const skippedBefore = (await readSeries(HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC)) ?? 0;
+
+      // Saturate: the suppression lookups never come back, so no tick body can
+      // reach the latch from here on.
+      resolveHeartbeatSchedulingSuppressionMock.mockImplementation(
+        () => new Promise(() => {}),
+      );
+
+      // Fire every timer. The scheduler parks on the hung lookup; the watchdog
+      // does not await anything and reports regardless.
+      for (const callback of intervalCallbacks) callback();
+
+      await vi.waitFor(async () => {
+        const inflight = await readSeries(HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC);
+        expect(inflight).not.toBeNull();
+        expect(inflight).toBeGreaterThan(0);
+      });
+
+      // Positive control: the tick really was starved, so the one series the
+      // tick still owns did NOT move. Were this to advance, the hang above
+      // failed to reproduce saturation and the in-flight assertion proves
+      // nothing about tick-independence.
+      expect(await readSeries(HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC)).toBe(skippedBefore);
+    } finally {
+      releaseTail?.();
+      setIntervalSpy.mockRestore();
+    }
+  });
+
   it("refuses authenticated public startup without an external database URL", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       deploymentExposure: "public",
