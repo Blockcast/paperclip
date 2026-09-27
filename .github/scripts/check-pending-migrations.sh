@@ -46,6 +46,20 @@ JOB_NAME="paperclip-migration-preflight-$(date +%s)-${RANDOM}"
 cleanup() { kubectl -n "${NS}" delete job "${JOB_NAME}" --ignore-not-found --wait=false >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
+# Both non-verdict exits need these: they carry the pull duration, the image
+# size and the eviction message that otherwise force the operator to go
+# describe a pod the job's 300s TTL is already deleting.
+dump_pod_events() {
+  echo "--- pod events ---"
+  if [ -n "${pod_name:-}" ]; then
+    kubectl -n "${NS}" get events --field-selector "involvedObject.name=${pod_name}" \
+      --sort-by=.lastTimestamp 2>&1 | tail -20 || echo "(no events available)"
+  else
+    echo "(no pod was created for job/${JOB_NAME})"
+  fi
+  echo "--- end pod events ---"
+}
+
 echo "pending-migration pre-flight: running ${IMAGE_REPO}@${DIGEST} as job/${JOB_NAME} in ${NS}"
 
 kubectl -n "${NS}" apply -f - >/dev/null <<YAML
@@ -144,16 +158,8 @@ startup_seconds=$(( $(date +%s) - startup_began ))
 
 if [ "${container_started}" -ne 1 ]; then
   # The check never ran, so this says nothing about the migrations. Surface the
-  # pod events inline: they carry the pull duration and image size that
-  # otherwise force the operator to go describe the pod by hand.
-  echo "--- pod events ---"
-  if [ -n "${pod_name}" ]; then
-    kubectl -n "${NS}" get events --field-selector "involvedObject.name=${pod_name}" \
-      --sort-by=.lastTimestamp 2>&1 | tail -20 || echo "(no events available)"
-  else
-    echo "(no pod was created for job/${JOB_NAME})"
-  fi
-  echo "--- end pod events ---"
+  # pod events inline.
+  dump_pod_events
   # Bailing early on a decided error and exhausting the budget are different
   # facts; saying "within Ns of the ${STARTUP_TIMEOUT_SECONDS}s budget" for the
   # former would imply the budget was the constraint when it was not.
@@ -187,7 +193,24 @@ fi
 
 # Distinguish "the check ran and said no" from "the check never ran". Both stop
 # the deploy, but they need different operator responses.
-if kubectl -n "${NS}" wait --for=condition=failed "job/${JOB_NAME}" --timeout=10s >/dev/null 2>&1; then
+#
+# An eviction is checked FIRST because it satisfies the `failed` condition
+# without ever producing a verdict: the kubelet stamps status.reason=Evicted,
+# backoffLimit is 0 so nothing replaces the pod, and the Job trips `failed` via
+# BackoffLimitExceeded. Phase 1's start-stamp guard does not catch this one --
+# it covers a pod that dies *before* its container runs, and an eviction whose
+# kill lands just after the pull can stamp a real startedAt on a container that
+# lived about a second. Measured on the 2026-09-27T01:58Z production deploy
+# (run 36279683355): the preflight pod was evicted three times for
+# ephemeral-storage on k8s-data-6, logs read "(no logs available)", and the
+# gate still printed the migration verdict below -- sending the one human
+# approval in four days of ProductionDeployApprovalStuck off to look for an
+# index that does not exist.
+pod_reason="$(kubectl -n "${NS}" get pod "${pod_name}" -o jsonpath='{.status.reason}' 2>/dev/null || true)"
+if [ "${pod_reason}" = "Evicted" ]; then
+  dump_pod_events
+  echo "pending-migration pre-flight: INCONCLUSIVE — the pre-flight pod was evicted by the kubelet after its container started, so the migration check never reached a verdict. This is node pressure, not a migration verdict; re-run the deploy rather than precreating an index. Not starting the rollout blind" >&2
+elif kubectl -n "${NS}" wait --for=condition=failed "job/${JOB_NAME}" --timeout=10s >/dev/null 2>&1; then
   echo "pending-migration pre-flight: FAILED — a pending migration needs its index precreated (see remediation above)" >&2
 else
   echo "pending-migration pre-flight: INCONCLUSIVE — the container started within ${startup_seconds}s but the migration check produced no result within its ${TIMEOUT_SECONDS}s run budget. The image pull is NOT implicated; treat this as migrations actually in trouble. Not starting the rollout blind" >&2
