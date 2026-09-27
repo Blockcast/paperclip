@@ -1192,13 +1192,14 @@ the deployment's mode before classifying against this table.
 
 | action | what `result: "denied"` covers |
 |---|---|
-| `heartbeat.run_events_accessed` | entitlement denial **only** — but two denials book **no row at all**: both the cross-tenant caller and the same-company responsible-user-unavailable caller exit inside `getAccessibleResource` (`routes/authz.ts`), which 404s or throws upstream of this route's single audit call |
-| `heartbeat.run_log_accessed` | entitlement denial, **or** a cross-tenant 404, **or** a same-company responsible-user-unavailable denial — all three book the identical row shape |
+| `heartbeat.run_events_accessed` | an entitlement denial **or**, in enforce mode, a responsible-user *authorization* denial — `/events` runs the same `decideRunTranscriptRead`, so the intersection denial books here too. Two other denials book **no row at all**: both the cross-tenant caller and the same-company responsible-user-*unavailable* caller exit inside `getAccessibleResource` (`routes/authz.ts`), which 404s or throws upstream of this route's single audit call |
+| `heartbeat.run_log_accessed` | an entitlement denial, **or** a cross-tenant 404, **or** a same-company responsible-user-*unavailable* denial, **or**, in enforce mode, a responsible-user *authorization* denial — all four book the identical row shape |
 | `workspace_operation.log_accessed` | a cross-tenant 404 **or** a same-company responsible-user-unavailable denial — **never** an entitlement denial, which books `allowed` + `withheld: true` instead, per the block above |
 
 So counting "same-company unentitled reads" off `result: "denied"` folds in
-cross-tenant probes on both `heartbeat_run` and `workspace_operation` rows, and
-on `workspace_operation` rows finds no entitlement denial at all. Isolating one
+cross-tenant probes on both `heartbeat_run` and `workspace_operation` rows,
+folds in responsible-user denials on the run actions, and on
+`workspace_operation` rows finds no entitlement denial at all. Isolating one
 takes two filters, neither of which is a plain predicate over `activity_log` —
 and on one action even both together fall short, so a third source is needed:
 
@@ -1229,7 +1230,7 @@ and on one action even both together fall short, so a third source is needed:
   stream — plus `code` (`RESPONSIBLE_USER_UNAVAILABLE` vs
   `RESPONSIBLE_USER_UNAUTHORIZED`), `authzMode`, `companyId`, `actorAgentId`,
   `responsibleUserId` and `method`. Two limits on what that buys. **`code` does
-  not discriminate here:** all three routes are GETs and the
+  not discriminate *within this emitter*:** all three routes are GETs and the
   `RESPONSIBLE_USER_UNAUTHORIZED` branch is gated on a non-safe method, so on
   these paths this emitter can only ever write `RESPONSIBLE_USER_UNAVAILABLE`.
   **And it is not the only emitter:** `applyResponsibleUserIntersection`
@@ -1241,28 +1242,82 @@ and on one action even both together fall short, so a third source is needed:
   the entitlement call site — so an entitlement-path row can carry a warn after
   all. The claim that holds is the narrower one: nothing on the **cross-tenant**
   path emits a warn, and an entitlement denial where the **agent** lacked the
-  grant emits none either. Filter on `action` before correlating anything.
-- **Correlate in enforce mode only, and treat the join as probabilistic.** In
-  enforce mode, match a same-company `denied` row against the
-  `action: "company_access"` lines on `actorAgentId` + `companyId` + time: a
-  match is the responsible-user leg, no match is the entitlement denial. Do
-  **not** run this under shadow. The ⚠️ block above already answers the question
-  directly there, and the correlation *inverts*: the warn still fires, but the
-  throw is suppressed, so the row it would have matched is never booked — while
-  the same-company `denied` that *is* booked on `heartbeat.run_log_accessed`
-  comes from the entitlement leg further down the same request and matches the
-  warn on every key. Following the rule in shadow mode therefore discards a
-  genuine insider unentitled transcript read as an availability failure, which
-  is the one direction this section exists to prevent. Even in enforce mode the
-  join is time-fuzzy: the warn carries no request or run correlator at all, so
-  the row's own `runId` and `details.actorRunId` have nothing on the log side
-  to join to, and `assertCompanyAccess` is called from over twenty call sites
-  in `routes/agents.ts` alone, so a busy agent emits these warns from unrelated
-  requests in the same window. Tighten a candidate match with the warn's
-  `method` and `action` rather than taking agent + company + timestamp
-  proximity. Finally, the log stream's retention is not `activity_log`'s, so
-  on an older row the absence of a match may mean the logs aged out rather
-  than that the denial was an entitlement one.
+  grant emits none either. Both emitters are in scope for the correlation
+  below — do **not** filter the stream to one of them.
+- **Correlate in enforce mode only, against *both* emitters, and treat the join
+  as probabilistic.** In enforce mode, match a same-company `denied` row
+  against the warn stream on `actorAgentId` + `companyId` + time, and read the
+  matched line's `action`:
+  - `action: "company_access"` — the responsible-user **availability** leg
+    (`code` is always `RESPONSIBLE_USER_UNAVAILABLE` here, per the bullet
+    above).
+  - `action: "runs:read_transcript"` with `code: RESPONSIBLE_USER_UNAUTHORIZED`
+    — the responsible-user **authorization** leg. `denyCode` is `UNAUTHORIZED`
+    exactly when the responsible user exists *and* holds an active membership
+    (`services/authorization.ts`), so this is the case where the agent passed
+    `assertCompanyAccess` silently and was then denied on the intersection.
+  - **no match on either** — the agent's own entitlement denial.
+
+  Filtering the stream to `action: "company_access"` and calling the residue
+  the entitlement denial is the mistake this bullet exists to prevent: it sorts
+  the authorization leg into "entitlement denial", so the responder reports an
+  insider unentitled transcript read by an agent that **was** entitled — the
+  denial came from its responsible user — and the investigation is pointed at
+  the wrong principal. The row cannot correct that on its own: the decision's
+  `RESPONSIBLE_USER_UNAUTHORIZED` code travels to the client in the 403 body
+  via `authorizationDeniedDetails` and is **not** among the fields the audit
+  writes (`result`, `actorSource`, `actorRunId`, `offset`, `limitBytes`,
+  `logStore`). This is the same harm as the `actorSource` trap above, reached
+  by a different mechanism. Note that `code` *is* the discriminator on the
+  second emitter even though it is constant on the first — it is a property of
+  each emitter, not of the stream.
+
+  Reachability is not marginal, which is why the two-emitter form matters: an
+  agent **API key** always carries a responsible user (`middleware/auth.ts`
+  refuses a key whose responsible user is missing before building the actor),
+  `runs:read_transcript` is a *mapped* action, and a mapped action skips the
+  `allow_simple_company_member` visibility branch that unmapped read actions
+  take — so the responsible user is re-decided against a per-user
+  `runs:read_transcript` grant row that most members do not hold.
+
+  Do **not** run any of this under shadow. The ⚠️ block above already answers
+  the question directly there, and the correlation *inverts*: the
+  `company_access` warn still fires, but the throw is suppressed, so the row it
+  would have matched is never booked — while the same-company `denied` that
+  *is* booked on `heartbeat.run_log_accessed` comes from the entitlement leg
+  further down the same request and matches the warn on every key. (The second
+  emitter is enforce-only by construction: under shadow it returns the agent's
+  own decision, so it books nothing.) Following the rule in shadow mode
+  therefore discards a genuine insider unentitled transcript read as an
+  availability failure, which is the one direction this section exists to
+  prevent.
+
+  Even in enforce mode the join is time-fuzzy: neither warn carries a request
+  or run correlator, so the row's own `runId` and `details.actorRunId` have
+  nothing on the log side to join to. For the `company_access` leg the
+  imprecision is larger than per-request noise, because its condition — "this
+  agent's responsible user has no active membership in this company" — is a
+  **state**, not an event: while it holds, essentially every company-scoped
+  request that agent makes emits the warn, from over twenty `assertCompanyAccess`
+  call sites in `routes/agents.ts` alone. So a match establishes that the
+  responsible user was unavailable *around that time* and carries almost no
+  per-request information. That cuts both ways, and the useful half is the
+  contrapositive: a single matching warn anywhere in the window is enough, so
+  the responder does not need per-request alignment. Restricting candidates to
+  `method: "GET"` buys one narrowing and only one — it drops the write-route
+  noise from the other `assertCompanyAccess` call sites, since all three of
+  these routes are GETs. ⚠️ Apply that filter to the `company_access` leg
+  **only**: `method` is a field of the first emitter's warn, and the
+  intersection warn does not carry it at all, so a blanket `method: "GET"`
+  predicate over the whole stream silently drops every authorization-leg line
+  and reproduces the single-emitter mistake this bullet exists to prevent.
+  (`action` cannot tighten anything here either; it is the field being read to
+  classify the match, so it is fixed by construction.)
+  Finally, the log stream's retention is not `activity_log`'s, so on an older
+  row the absence of a match may mean the logs aged out rather than that the
+  denial was an entitlement one — though the state-not-event property above
+  makes an aged-out `company_access` leg less likely than a single-event join
+  would be.
 
 Retention follows the deployment's normal
 `activity_log` database retention and backup policy; Paperclip does not
