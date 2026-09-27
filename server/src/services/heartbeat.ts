@@ -19658,6 +19658,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // all, so an unreadable catalog genuinely warns once per caller
             // per tick, and `source` is what stops an operator reading those
             // two lines as two distinct failures.
+            //
+            // It is still load-bearing HERE, for a different reason: because
+            // exactly one line is emitted, the caller that won is the only
+            // caller this episode reports. `source: "gauge"` therefore says
+            // the gauge publisher — registered above both scheduler gates
+            // (see this function's doc comment) — got there because the gate
+            // never ran at all, i.e. the replica is suppressed and NEITHER
+            // recovery path is active. `source: "gate"` says reconciliation is
+            // running and skipping ticks. Same message, opposite blast radius;
+            // dropping the field collapses them.
             source,
             remediation:
               "CREATE INDEX CONCURRENTLY heartbeat_runs_crash_recovery_pending_idx ON heartbeat_runs USING btree (finished_at, id) WHERE error_code = 'worker_crashed' AND crash_recovery_completed_at IS NULL",
@@ -19686,6 +19696,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // this into a skipped tick. The ungated gauge publisher makes no
       // reconciliation decision at all — and on a suppressed replica there is
       // no periodic reconciliation for it to be skipping.
+      //
+      // `source` here is the double-warn tag the absent-transition branch
+      // above is NOT: this path has no latch, so both callers warn every tick
+      // and the field is what stops an operator reading those two lines as two
+      // distinct catalog failures.
       logger.warn(
         { err, source },
         source === "gate"
