@@ -17,28 +17,6 @@ import { isValidRoutineDateString } from "../routine-variables.js";
 
 const routineVariableValueSchema = z.union([z.string(), z.number().finite(), z.boolean()]);
 
-// The routine description is handed to the execution pod as an env var, so it is bounded by
-// MAX_ARG_STRLEN (131_072). Over that, the pod dies in the write-prompt init container before
-// any model turn — which also makes the routine unable to report its own breakage. Keep ~1KB
-// back for the variable name and "=".
-export const ROUTINE_DESCRIPTION_MAX_BYTES = 130_000;
-
-function utf8ByteLength(value: string) {
-  return new TextEncoder().encode(value).length;
-}
-
-// NOT z.string().max(): that counts UTF-16 code units, and these bodies are dense with emoji
-// (3-4 bytes each, 1-2 code units), so a code-unit cap fails open on exactly the bodies at risk.
-const routineDescriptionSchema = z.string().superRefine((value, ctx) => {
-  const bytes = utf8ByteLength(value);
-  if (bytes > ROUTINE_DESCRIPTION_MAX_BYTES) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: `Routine description is ${bytes} bytes as UTF-8, over the ${ROUTINE_DESCRIPTION_MAX_BYTES} byte limit by ${bytes - ROUTINE_DESCRIPTION_MAX_BYTES}. It is passed to the execution pod as an env var; an oversized body kills every run before it reaches a model turn.`,
-    });
-  }
-});
-
 export const routineVariableSchema = z.object({
   name: z.string().trim().regex(/^[A-Za-z][A-Za-z0-9_]*$/),
   label: z.string().trim().max(120).optional().nullable(),
@@ -87,7 +65,7 @@ export const createRoutineSchema = z.object({
   goalId: z.string().uuid().optional().nullable(),
   parentIssueId: z.string().uuid().optional().nullable(),
   title: z.string().trim().min(1).max(200),
-  description: routineDescriptionSchema.optional().nullable(),
+  description: z.string().optional().nullable(),
   assigneeAgentId: z.string().uuid().optional().nullable(),
   priority: z.enum(ISSUE_PRIORITIES).optional().default("medium"),
   status: z.enum(ROUTINE_STATUSES).optional().default("active"),
