@@ -17,24 +17,33 @@ function blockEventLoop(ms: number): void {
 /**
  * Blocks until the sampler reports a stall, or the attempt budget is spent.
  *
- * A single block is a coin flip at these settings, and waiting longer cannot
- * recover a lost one. After the block, our sampler's timer and the histogram's
- * own timer are both overdue; whichever libuv runs first wins, and if ours does
- * the histogram is re-armed before it can record, so `max` reads 0 and the
- * stall is gone for good. At `sampleMs: 50` the two come due within the
- * histogram's 20ms resolution of each other, so ours wins ~20% of the time
- * (measured 19-40 misses per 120-150 blocks, idle host). Production samples at
- * 1000ms, where the histogram is overdue by nearly a full second more than the
- * sampler and always wins — 0 misses in 26 blocks of 1100ms and 3000ms — which
- * is why this is a test-only concern and the module is unchanged.
+ * A single block is a gamble at these settings — not an even one, see the
+ * measured rate below — and waiting longer cannot recover a lost one. After
+ * the block, our sampler's timer and the histogram's own timer are both
+ * overdue; whichever libuv runs first wins, and if ours does the histogram is
+ * re-armed before it can record, so `max` reads 0 and the stall is gone for
+ * good. At `sampleMs: 50` the two come due within the histogram's 20ms
+ * resolution of each other, so ours wins 13-33% of the time (measured 19-40
+ * misses per 120-150 blocks, idle host). Production samples at 1000ms, where
+ * the histogram is overdue by nearly a full second more than the sampler and
+ * always wins — 0 misses in 26 blocks of 1100ms and 3000ms — which is why
+ * this is a test-only concern and the module is unchanged.
  *
  * The budget is an ATTEMPT COUNT, not a wall-clock deadline (BLO-37114). It
- * was a 5s deadline, which made the number of coin flips a function of how
- * fast the host was: ~8 attempts on an idle worker (so ~0.2^8, never fails)
- * but 1-2 on a starved merge-queue worker, where 0.2 surfaces as a routine
- * red build. Counting attempts makes the failure probability 0.2^10 ≈ 1e-7
- * on every host. Worst case is 10 × ~610ms ≈ 6.1s of real time, well inside
- * the 60s testTimeout in server/vitest.config.ts.
+ * was a 5s deadline, which made the number of attempts a function of how fast
+ * the host was: ~8 on an idle worker (never fails) but 1-2 on a starved
+ * merge-queue worker, where a one-in-three miss rate surfaces as a routine
+ * red build. Counting attempts pins the failure probability to the same value
+ * on every host — 1e-9 at the optimistic end of the measured interval and
+ * 0.33^10 ≈ 1.7e-5 at the pessimistic end. Worst case is 10 × ~610ms ≈ 6.1s
+ * of real time, well inside the 60s testTimeout in server/vitest.config.ts.
+ *
+ * Trade-off taken knowingly: the old deadline always failed fast and legibly,
+ * on `expect(lines.length).toBeGreaterThan(0)`. On a pathologically starved
+ * host an attempt budget can instead run into the 60s testTimeout and surface
+ * as an opaque "test timed out", losing that message. The ~10x headroom makes
+ * that unlikely, and a host-independent failure rate is worth more than a
+ * better error on the host where it was already failing.
  */
 async function blockUntilStallObserved(
   observed: ReadonlyArray<unknown>,

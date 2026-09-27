@@ -66,9 +66,19 @@ const serializedServerVitestArgs = [
   "--no-file-parallelism",
   "--maxWorkers=1",
 ];
-// Workspace projects run concurrently inside each Vitest invocation. ARC CPU
-// contention can stretch otherwise healthy filesystem/process tests beyond
-// Vitest's 5-second default without indicating a hang.
+// ⚠ INERT — do NOT read these as protection (BLO-37184, measured 2026-09-27).
+// Under Vitest 4 `projects`, these root CLI flags do not reach a project's own
+// resolved config, so every general-workspaces-b project runs on Vitest's
+// 5s/10s defaults no matter what is set here. Evidence: job 108539569768 ran
+// `--project paperclip-plugin-alertmanager --hookTimeout=60000` under vitest
+// 4.1.8 and still failed with `Hook timed out in 10000ms` — the bare default.
+//
+// The only thing that takes effect is a testTimeout/hookTimeout in the
+// package's own vitest.config.ts. packages/db and
+// packages/plugins/paperclip-plugin-alertmanager set theirs (BLO-37114); the
+// rest of group B is still on the defaults. Left in place rather than deleted
+// here because removing it also touches the dry-run diagnostics below and
+// run-vitest-stable-shard.test.mjs; BLO-37184 owns that.
 const arcWorkspaceVitestArgs = [
   "--testTimeout=30000",
   "--hookTimeout=60000",
