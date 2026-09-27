@@ -85,6 +85,7 @@ case "$args" in
     if [ "$elapsed" -ge "\${STUB_READY_AFTER:-0}" ]; then echo "\${STUB_TERMINAL_PHASE:-Running}"; else echo "Pending"; fi
     exit 0 ;;
   *"waiting.reason"*)      echo "\${STUB_WAITING_REASON:-ContainerCreating}"; exit 0 ;;
+  *"{.status.reason}"*)    echo "\${STUB_POD_REASON:-}"; exit 0 ;;
   *"get events"*)          echo "Normal Pulled Successfully pulled image in 3m3.14s. Image size: 1695082158 bytes"; exit 0 ;;
   *" logs "*)              echo "stub pre-flight output"; exit 0 ;;
   *"condition=complete"*)
@@ -215,6 +216,34 @@ test("a failing check still reports the migration verdict", () => {
   assert.equal(code, 1);
   assert.match(output, /FAILED — a pending migration needs its index precreated/);
   assert.match(output, /stub pre-flight output/, "the remediation logs must be surfaced");
+});
+
+test("an eviction AFTER the container starts is not reported as a migration verdict", () => {
+  // The companion to the never-started case below, and the one phase 1 cannot
+  // catch. A pod evicted while pulling can still have its container Created,
+  // Started and Killed within the same second once the pull lands, which
+  // stamps a real startedAt -- so phase 1 correctly reads "started" and hands
+  // phase 2 a Job whose `failed` condition is already true via
+  // BackoffLimitExceeded. Reading that as FAILED prints a migration verdict
+  // for a check that produced no logs at all.
+  //
+  // Measured in production on 2026-09-27 (run 36279683355, k8s-data-6 under
+  // ephemeral-storage DiskPressure): the deploy was refused with "a pending
+  // migration needs its index precreated" beside "(no logs available)".
+  const { code, output } = runPreflight({
+    STUB_POD_REASON: "Evicted",
+    STUB_JOB_RESULT: "failed",
+  });
+
+  assert.equal(code, 1, "an evicted check must still fail closed");
+  assert.doesNotMatch(
+    output,
+    /a pending migration needs its index precreated/,
+    "an evicted pod produced no verdict, so it must not be reported as one",
+  );
+  assert.match(output, /INCONCLUSIVE/);
+  assert.match(output, /evicted by the kubelet/);
+  assert.match(output, /--- pod events ---/, "the operator needs the eviction message inline");
 });
 
 test("a check that completes between polls is not mistaken for never having started", () => {
