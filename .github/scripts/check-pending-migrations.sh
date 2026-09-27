@@ -206,11 +206,28 @@ fi
 # gate still printed the migration verdict below -- sending the one human
 # approval in four days of ProductionDeployApprovalStuck off to look for an
 # index that does not exist.
-pod_reason="$(kubectl -n "${NS}" get pod "${pod_name}" -o jsonpath='{.status.reason}' 2>/dev/null || true)"
-if [ "${pod_reason}" = "Evicted" ]; then
-  dump_pod_events
-  echo "pending-migration pre-flight: INCONCLUSIVE — the pre-flight pod was evicted by the kubelet after its container started, so the migration check never reached a verdict. This is node pressure, not a migration verdict; re-run the deploy rather than precreating an index. Not starting the rollout blind" >&2
-elif kubectl -n "${NS}" wait --for=condition=failed "job/${JOB_NAME}" --timeout=10s >/dev/null 2>&1; then
+#
+# The same holds for every other kubelet disruption reason, and for a pod that
+# no longer exists at all: an API-initiated eviction (drain, autoscaler,
+# descheduler), preemption and NodeLost pod GC delete the pod rather than
+# stamping it, so the read fails. That failure is kept distinct from an empty
+# reason, which is a pod that ran and exited on its own -- the one shape that
+# is a migration verdict. A gone pod's logs are gone too, so there is no
+# remediation to point at either way. ttlSecondsAfterFinished (300s) cannot
+# remove a pod that finished normally before this read, which runs as soon as
+# phase 2 sees the Job terminal.
+pod_reason="$(kubectl -n "${NS}" get pod "${pod_name}" -o jsonpath='{.status.reason}' 2>/dev/null)" || pod_reason="__gone__"
+case "${pod_reason}" in
+  Evicted|Preempting|Shutdown|Terminated|NodeAffinity|UnexpectedAdmissionError)
+    dump_pod_events
+    echo "pending-migration pre-flight: INCONCLUSIVE: the pre-flight pod was stopped by the kubelet (status.reason=${pod_reason}) after its container started, so the migration check never reached a verdict. This is node disruption, not a migration verdict; re-run the deploy rather than precreating an index. Not starting the rollout blind" >&2
+    exit 1 ;;
+  __gone__)
+    dump_pod_events
+    echo "pending-migration pre-flight: INCONCLUSIVE: the pre-flight pod no longer exists (deleted by an API eviction, preemption, node shutdown or pod GC), so the migration check never reached a verdict. Re-run the deploy rather than precreating an index. Not starting the rollout blind" >&2
+    exit 1 ;;
+esac
+if kubectl -n "${NS}" wait --for=condition=failed "job/${JOB_NAME}" --timeout=10s >/dev/null 2>&1; then
   echo "pending-migration pre-flight: FAILED — a pending migration needs its index precreated (see remediation above)" >&2
 else
   echo "pending-migration pre-flight: INCONCLUSIVE — the container started within ${startup_seconds}s but the migration check produced no result within its ${TIMEOUT_SECONDS}s run budget. The image pull is NOT implicated; treat this as migrations actually in trouble. Not starting the rollout blind" >&2
