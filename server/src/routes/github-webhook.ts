@@ -5423,9 +5423,13 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       // `loadConfig()`, not the injected route config: the gate's status
       // context is deployment configuration (the same value
       // runPrCommentReviewGateCheck reads), not a route seam.
-      const commentReviewGateContext = loadConfig().prCommentReviewGateStatusContext.trim();
-      if (commentReviewGateContext && commentReviewGateBackstopSha) {
-        try {
+      // The config read sits INSIDE the try (BLO-36819 review): loadConfig()
+      // re-derives the config file on every call and can throw, and a throw
+      // here would skip the live evaluation below and fail the ack. Losing the
+      // backstop is the tolerable outcome; losing the gate is not.
+      try {
+        const commentReviewGateContext = loadConfig().prCommentReviewGateStatusContext.trim();
+        if (commentReviewGateContext && commentReviewGateBackstopSha) {
           await enqueueGithubCommitStatusDelivery(db, {
             companyId: null,
             sourceRunId: null,
@@ -5442,14 +5446,14 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             prNumber: commentReviewGateTrigger.prNumber,
             prUrl: commentReviewGateTrigger.prUrl,
           });
-        } catch (err) {
-          // Never fail the ack for the backstop. Losing it costs the behavior
-          // we had before this existed, not a redelivery storm.
-          logger.warn(
-            { err, deliveryId, event: eventName, ...commentReviewGateTrigger },
-            "github webhook comment-review gate re-evaluation enqueue failed (non-fatal)",
-          );
         }
+      } catch (err) {
+        // Never fail the ack for the backstop. Losing it costs the behavior
+        // we had before this existed, not a redelivery storm.
+        logger.warn(
+          { err, deliveryId, event: eventName, ...commentReviewGateTrigger },
+          "github webhook comment-review gate re-evaluation enqueue failed (non-fatal)",
+        );
       }
       // Build the input once and hand the SAME object to both branches, so the
       // injection seam observes the real argument — including `db`. When the

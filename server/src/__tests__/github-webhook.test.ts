@@ -3518,6 +3518,41 @@ describeEmbeddedPostgres("github-webhook route", () => {
       expect(rows[0]!.nextAttemptAt.getTime()).toBeGreaterThan(before + 10 * 60_000);
     });
 
+    // The backstop's config read must be inside its own try. loadConfig()
+    // re-derives the config file on every call and can throw; outside the try
+    // that throw skipped the live evaluation below and failed the ack, so a
+    // bad edit to the config file stopped the gate entirely.
+    it("still acks and fires the live evaluation when the backstop's config read throws", async () => {
+      const sha = "d".repeat(40);
+      const previousCapture = process.env.PAPERCLIP_GITHUB_REVIEW_GATE_CAPTURE_ENABLED;
+      // Capture enabled with none of its settings makes loadConfig() throw.
+      process.env.PAPERCLIP_GITHUB_REVIEW_GATE_CAPTURE_ENABLED = "true";
+      try {
+        const calls: unknown[] = [];
+        const app = buildApp({
+          prReviewerBotLogin: "allyblockcast[bot]",
+          runPrCommentReviewGateCheck: async (input) => {
+            calls.push(input);
+            return { posted: false as const, reason: "not_configured" as const };
+          },
+        });
+
+        const response = await postReview(app, {
+          action: "submitted",
+          repository: { full_name: "Blockcast/frr" },
+          pull_request: { number: 107, head: { sha }, html_url: "https://github.com/Blockcast/frr/pull/107" },
+          review: { user: { login: "allyblockcast[bot]" }, body: "## Ally \u2014 Consolidated PR Review" },
+        });
+
+        expect(response.status).toBe(200);
+        expect(calls).toHaveLength(1);
+        expect(await readBackstops(sha)).toHaveLength(0);
+      } finally {
+        if (previousCapture === undefined) delete process.env.PAPERCLIP_GITHUB_REVIEW_GATE_CAPTURE_ENABLED;
+        else process.env.PAPERCLIP_GITHUB_REVIEW_GATE_CAPTURE_ENABLED = previousCapture;
+      }
+    });
+
     // Known hole, deliberately not closed: a second trigger arriving while a
     // backstop row is already `processing` is absorbed by
     // `preserveExistingDelivery`, which keeps the original `createdAt`, so the
