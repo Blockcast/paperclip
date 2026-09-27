@@ -1,5 +1,5 @@
 import { and, asc, desc, eq, inArray, isNotNull, isNull, lte, sql } from "drizzle-orm";
-import type { Db } from "@paperclipai/db";
+import type { Db, DbTransaction } from "@paperclipai/db";
 import { issueRecoveryActions, issues } from "@paperclipai/db";
 import type {
   IssueRecoveryAction,
@@ -82,7 +82,6 @@ export const RESOLVED_ISSUE_STATUS_EVIDENCE_KEY = "resolvedIssueStatus";
 export const RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS = 24 * 60 * 60 * 1000;
 
 type IssueRecoveryActionRow = typeof issueRecoveryActions.$inferSelect;
-type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type DbOrTransaction = Db | DbTransaction;
 
 export type UpsertIssueRecoveryActionInput = {

@@ -10,6 +10,8 @@ export const DEFAULT_CLAUDE_LOCAL_TIMEOUT_SEC = 6 * 60 * 60;
 
 export const models = [
   { id: "claude-opus-4-8", label: "Claude Opus 4.8" },
+  { id: "claude-opus-5-5", label: "Claude Opus 5.5" },
+  { id: "claude-opus-5-5[1m]", label: "Claude Opus 5.5 (1M)" },
   { id: "claude-opus-5", label: "Claude Opus 5" },
   { id: "claude-opus-5[1m]", label: "Claude Opus 5 (1M)" },
   { id: "claude-sonnet-5", label: "Claude Sonnet 5" },

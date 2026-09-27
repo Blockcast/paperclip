@@ -50,5 +50,10 @@ describe("skills catalog package artifacts", () => {
     expect(paths).toContain("catalog/bundled/software-development/github-pr-workflow/SKILL.md");
     expect(paths).toContain("catalog/optional/browser/agent-browser/SKILL.md");
     expect(paths).toContain("package.json");
-  }, 120_000);
+    // 300s, not 120s: this test shells out to `npm pack` (and a cold `pnpm build`),
+    // so its wall-time tracks runner speed, which varies ~3.7x across the fleet.
+    // Measured 2026-09-21 over five CI runs: 33.5s / 35.8s / 67.3s / 93.1s / 123.2s
+    // -- the last one blew the old 120s cap and ejected an unrelated PR (BLO-28886).
+    // Same trade as the e2e caps in BLO-33320: a slow runner costs wall-time, not a red.
+  }, 300_000);
 });

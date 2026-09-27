@@ -1331,8 +1331,16 @@ describe("approval routes idempotent retries", () => {
     // ...but it is explicitly not a promise that one will be dispatched.
     expect(res.body.details.normalModelResumeIsAutomatic).toBe(false);
     // And both reachable exits are named, so waiting is never the only reading.
-    expect(res.body.details.resumeGuidance).toContain("record a valid issue disposition");
+    //
+    // BLO-34683: the do-now exit no longer reads "record a valid issue disposition". This site
+    // refuses on RUN CLASS ALONE — it never queries `issue_recovery_actions` — so it cannot know
+    // an action exists to disposition, and naming one was false in exactly the state BLO-34683 is
+    // about. The BLO-25878 contract is unchanged and is what this asserts: an exit the refused run
+    // can take inside this run, plus the board-approval exit.
+    expect(res.body.details.resumeGuidance).toContain("record your conclusion on the issue");
     expect(res.body.details.resumeGuidance).toContain("request_board_approval");
+    // The exit that is NOT reachable here must not be offered: this refusal cannot see an action.
+    expect(res.body.details.resumeGuidance).not.toContain("clears the action");
   });
 
   it("does not offer status-only resume guidance to a planning-only run", async () => {

@@ -234,7 +234,35 @@ const CCROTATE_CAPACITY_DECISION_KEYS = [
   "penstockRetryAfterSeconds",
   "penstockAdvertisedResumeAt",
   "penstockCapacityParkClampedFrom",
+  /**
+   * Which gate probe denied this park: "capacity" or "messages_fallback"
+   * (BLO-29900).
+   *
+   * `penstockReason` cannot answer this. A 429 from the cheap cached
+   * `GET /v1/pools/default/capacity` and a 429 from the real
+   * `POST /v1/messages` fallback both persist
+   * `penstock.model_capacity_unavailable`, so from a parked row alone it was
+   * impossible to tell whether the re-probe had consumed provider inference
+   * quota — which is exactly the cost the 15m re-probe cadence assumes it is
+   * not paying.
+   *
+   * Belongs in this list rather than beside
+   * {@link CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY}: it describes *this*
+   * denial, not the chain, so a re-defer that lands on the other path must
+   * overwrite it. A value that lingered from a previous hop would assert a
+   * probe cost this park did not pay, which is worse than no value at all.
+   */
+  "penstockProbePath",
 ] as const;
+
+/**
+ * The subset a retry-now override clears: the `penstock*` provenance keys, but
+ * NOT the two floors. Derived from the list above so the two cannot drift. See
+ * {@link clearCcrotateCapacityDecision} for why the floors must survive.
+ */
+const CCROTATE_CAPACITY_OVERRIDE_KEYS = CCROTATE_CAPACITY_DECISION_KEYS.filter(
+  (key) => key !== "retryNotBefore" && key !== "transientRetryNotBefore",
+);
 
 /**
  * When the *current* capacity deferral chain began, ISO-8601. Set once, then
@@ -329,6 +357,7 @@ export function isCapacityGovernedRetryFloor(resultJson: unknown): boolean {
  */
 export const CCROTATE_CAPACITY_RESULT_KEYS = {
   clearedOnRedefer: CCROTATE_CAPACITY_DECISION_KEYS,
+  clearedOnOverride: CCROTATE_CAPACITY_OVERRIDE_KEYS,
   carriedAcrossRedefer: CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY,
 } as const;
 
@@ -338,6 +367,14 @@ export interface CcrotateCapacityDecision {
   provider?: string | null;
   model?: string | null;
   reason?: string | null;
+  /**
+   * Which gate probe produced this denial ("capacity" | "messages_fallback"),
+   * persisted under `penstockProbePath` (BLO-29900). Optional so a caller with
+   * no gate result — a hand-built decision in a test, say — is not forced to
+   * invent one; the key is simply absent, which reads as "not recorded" rather
+   * than as a false claim about which probe ran.
+   */
+  probePath?: string | null;
   retryAfterSeconds?: number | null;
   /** What the provider advertised on *this* denial, ISO-8601, or null. */
   advertisedResumeAtIso: string | null;
@@ -366,14 +403,43 @@ export interface CcrotateCapacityDecision {
  * can trust that every `penstock*` field describes the park the row currently
  * holds.
  */
+/**
+ * Drop every capacity *decision* key from a `result_json`, keeping the chain
+ * origin (`CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY`) and everything unrelated.
+ *
+ * This is the first half of `applyCcrotateCapacityDecision`, split out for the
+ * one writer that invalidates a park without replacing it: `retryScheduledRetryNow`
+ * books `scheduled_retry_at` to `now` on a live parked row. After that write the
+ * advertised resume instant, the retry-after figure and the clamp provenance all
+ * describe a park the row no longer holds, and any reader that trusts them --
+ * the overdue gauge in `queued-run-age-metrics.ts` computes
+ * `greatest(scheduled_retry_at, penstockAdvertisedResumeAt)` -- would keep
+ * honouring a provider horizon a human has just overridden (BLO-34782 review).
+ * Clearing at the write restores the invariant the docblock above promises:
+ * every `penstock*` field describes the park the row currently holds.
+ *
+ * Retry-now passes `CCROTATE_CAPACITY_RESULT_KEYS.clearedOnOverride`, which
+ * keeps `retryNotBefore`/`transientRetryNotBefore`: the `capacityDrivenTransientPark`
+ * conjunct in `promoteScheduledRetryRun` (heartbeat.ts, via
+ * `readTransientRetryNotBeforeFromRun`) reads them, and dropping them lets a
+ * `transient_failure` capacity park promote with no capacity re-probe (BLO-28919).
+ */
+export function clearCcrotateCapacityDecision(
+  previous: Record<string, unknown>,
+  keys: readonly string[] = CCROTATE_CAPACITY_DECISION_KEYS,
+): Record<string, unknown> {
+  const next: Record<string, unknown> = { ...previous };
+  for (const key of keys) {
+    delete next[key];
+  }
+  return next;
+}
+
 export function applyCcrotateCapacityDecision(
   previous: Record<string, unknown>,
   decision: CcrotateCapacityDecision,
 ): Record<string, unknown> {
-  const next: Record<string, unknown> = { ...previous };
-  for (const key of CCROTATE_CAPACITY_DECISION_KEYS) {
-    delete next[key];
-  }
+  const next = clearCcrotateCapacityDecision(previous);
   // Set once, then carried forward untouched. See the key's docblock: re-seeding
   // this on each hop would stop the wall-clock horizon from ever elapsing.
   //
@@ -418,6 +484,7 @@ export function applyCcrotateCapacityDecision(
   if (decision.provider != null) next.penstockProvider = decision.provider;
   if (decision.model != null) next.penstockModel = decision.model;
   if (decision.reason != null) next.penstockReason = decision.reason;
+  if (decision.probePath != null) next.penstockProbePath = decision.probePath;
   if (decision.retryAfterSeconds != null) {
     next.penstockRetryAfterSeconds = decision.retryAfterSeconds;
   }

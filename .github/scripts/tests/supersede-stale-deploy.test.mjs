@@ -15,11 +15,11 @@ import {
   CANCEL_POLL_ATTEMPTS,
   CANCEL_POLL_DELAY_MS,
   DEPLOY_REF,
-  DEPLOY_WORKFLOW_FILE,
   confirmSupersede,
   selectSupersedeCandidate,
   waitForCancel,
 } from '../supersede-stale-deploy.mjs';
+import { DEPLOY_WORKFLOW_FILE } from '../deploy-stall-record.mjs';
 
 const NOW = new Date('2026-09-01T12:00:00.000Z');
 const run = (createdAt, extra = {}) => ({

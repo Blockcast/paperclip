@@ -2,7 +2,7 @@ import { Router, type Request } from "express";
 import { z } from "zod";
 import { and, asc, desc, eq, ilike, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
-import type { Db } from "@paperclipai/db";
+import type { Db, DbTransaction } from "@paperclipai/db";
 import {
   agents,
   documents,
@@ -84,7 +84,7 @@ import {
 
 /** Per-stage instructions document keys look like `stage-instructions:{stageId}`. */
 const STAGE_INSTRUCTIONS_PREFIX = "stage-instructions:";
-type PipelineRouteDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
+type PipelineRouteDb = Db | DbTransaction;
 
 const stageKindSchema = z.enum(["open", "working", "review", "done", "cancelled"]);
 const jsonObjectSchema = z.record(z.string(), z.unknown());

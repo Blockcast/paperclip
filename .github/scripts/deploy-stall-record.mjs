@@ -47,6 +47,17 @@
  */
 import { appendFileSync } from 'node:fs';
 
+/**
+ * The production deploy workflow: what the dispatcher dispatches, what
+ * supersede cancels, and what the alert points a human at. It lives here
+ * because every module in this lane already imports this one, so there is
+ * exactly one spelling of it and no new module edge to get it.
+ *
+ * `scheduled-production-deploy.yml` spells it independently in shell
+ * (`--workflow=docker.yml`); the schedule test pins the two together.
+ */
+export const DEPLOY_WORKFLOW_FILE = 'docker.yml';
+
 export const STALL_LABEL = 'production-deploy-stall';
 export const STALL_LABEL_COLOR = 'b60205';
 export const STALL_ISSUE_TITLE =

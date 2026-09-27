@@ -166,3 +166,111 @@ describe("agent inbox-lite status contract", () => {
     expect(items.map((issue) => issue.id)).toEqual(["after-cutoff"]);
   });
 });
+
+// BLO-34421: the WIP doctrine's attendance predicate is
+// `activeRun != null` OR a future `monitorNextCheckAt` OR `scheduledRetryAt != null`.
+// inbox-lite's projection hydrated only the first, so the other two arms read as
+// absent keys and the predicate collapsed to `attended = 0` across a whole lane —
+// which is the input to a demotion pass. These assertions are on KEY PRESENCE, not
+// truthiness: a value-only test passes on the broken payload, because every value it
+// would read is legitimately null on most rows.
+describe("agent inbox-lite wake-path projection", () => {
+  const WAKE_PATH_KEYS = [
+    "monitorNextCheckAt",
+    "scheduledRetryAt",
+    "scheduledRetryReason",
+    "scheduledRetryAttempt",
+  ] as const;
+
+  const NOW = new Date("2026-09-17T11:14:00.000Z");
+
+  function baseRow(id: string, overrides: Record<string, unknown>) {
+    return {
+      id,
+      identifier: `BLO-${id}`,
+      title: id,
+      status: "in_progress",
+      priority: "high",
+      projectId: null,
+      goalId: null,
+      parentId: null,
+      createdAt: "2026-07-30T01:41:56.125Z",
+      updatedAt: "2026-07-30T01:41:56.125Z",
+      activeRun: null,
+      monitorNextCheckAt: null,
+      scheduledRetryAt: null,
+      scheduledRetryReason: null,
+      scheduledRetryAttempt: null,
+      ...overrides,
+    };
+  }
+
+  // The doctrine's own predicate, applied to whatever shape it is handed.
+  function attendedCount(rows: Array<Record<string, unknown>>) {
+    return rows.filter((row) => {
+      const monitorAt = row.monitorNextCheckAt as Date | string | null | undefined;
+      return (
+        row.activeRun != null ||
+        row.scheduledRetryAt != null ||
+        (monitorAt != null && new Date(monitorAt as string).getTime() > NOW.getTime())
+      );
+    }).length;
+  }
+
+  const sourceRows = [
+    baseRow("live-monitor", { monitorNextCheckAt: new Date("2026-09-17T12:00:00.000Z") }),
+    baseRow("parked-retry", {
+      scheduledRetryAt: new Date("2026-09-17T11:20:00.000Z"),
+      scheduledRetryReason: "ccrotate_capacity",
+      scheduledRetryAttempt: 2,
+    }),
+    // Overdue monitor is NOT a wake path — a scheduled time in the past is by
+    // definition a wake that did not happen.
+    baseRow("overdue-monitor", { monitorNextCheckAt: new Date("2026-09-17T10:00:00.000Z") }),
+    baseRow("genuinely-idle", {}),
+  ];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockIssueService.list.mockResolvedValue(sourceRows);
+    mockIssueService.listDependencyReadiness.mockResolvedValue(new Map());
+    mockRecoveryActionService.listActiveForIssues.mockResolvedValue(new Map());
+  });
+
+  it("emits every wake-path key on every row, present-and-null rather than absent", async () => {
+    const items = await loadInbox();
+
+    expect(items).toHaveLength(sourceRows.length);
+    for (const item of items) {
+      for (const key of WAKE_PATH_KEYS) {
+        // `in`, not a value check: absent and always-null are both failures here,
+        // and only `in` can tell them apart.
+        expect(Object.keys(item)).toContain(key);
+      }
+    }
+
+    const idle = items.find((item) => item.id === "genuinely-idle")!;
+    expect(idle.monitorNextCheckAt).toBeNull();
+    expect(idle.scheduledRetryAt).toBeNull();
+    expect(idle.scheduledRetryReason).toBeNull();
+    expect(idle.scheduledRetryAttempt).toBeNull();
+  });
+
+  it("agrees with the source rows on the attendance count", async () => {
+    const items = await loadInbox();
+
+    // live-monitor + parked-retry. Before the fix this read 0.
+    expect(attendedCount(sourceRows)).toBe(2);
+    expect(attendedCount(items as unknown as Array<Record<string, unknown>>)).toBe(
+      attendedCount(sourceRows),
+    );
+  });
+
+  it("carries the retry reason and attempt, not just the timestamp", async () => {
+    const items = await loadInbox();
+    const parked = items.find((item) => item.id === "parked-retry")!;
+
+    expect(parked.scheduledRetryReason).toBe("ccrotate_capacity");
+    expect(parked.scheduledRetryAttempt).toBe(2);
+  });
+});

@@ -1010,3 +1010,11 @@ export async function resetPostgresDatabase(
 }
 
 export type Db = ReturnType<typeof createDb>;
+
+/**
+ * The open transaction handle drizzle hands to a `db.transaction(...)` callback.
+ * Split across two aliases so the one-line nested-`Parameters` incantation this
+ * type replaces appears nowhere in the tree (BLO-34656).
+ */
+type DbTransactionCallback = Parameters<Db["transaction"]>[0];
+export type DbTransaction = Parameters<DbTransactionCallback>[0];

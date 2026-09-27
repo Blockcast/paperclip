@@ -1,5 +1,5 @@
 import { and, eq, ne, sql } from "drizzle-orm";
-import type { Db } from "@paperclipai/db";
+import type { Db, DbTransaction } from "@paperclipai/db";
 import {
   companySecretBindings,
   companySecretProviderConfigs,
@@ -10,8 +10,6 @@ import {
 import type { McpConnectionCredentialRef, SecretProvider, ToolCredentialSecretRef } from "@paperclipai/shared";
 import { getSecretProvider } from "../secrets/provider-registry.js";
 import type { SecretProviderVaultRuntimeConfig } from "../secrets/types.js";
-
-type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
 type OAuthTokenKind = "access_token" | "refresh_token";
 

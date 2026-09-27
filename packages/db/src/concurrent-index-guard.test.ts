@@ -10,7 +10,7 @@
  * state 0226 leaves behind, it must build the index and fail loudly — never
  * silently — if the build does not leave a valid index in place.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import postgres from "postgres";
 import { applyPendingMigrations } from "./client.js";
 import {
@@ -211,5 +211,64 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
       table: "heartbeat_runs",
       action: "created",
     }]);
+  }, 60_000);
+
+  it("surfaces the build failure rather than a cleanup failure, and still closes the pool (BLO-34039)", async () => {
+    const { database } = await seedPopulatedDatabaseWithoutIndex();
+    // Leaving the session in an aborted transaction as the build fails is the
+    // cheapest real reproduction of a broken-session cleanup: every later
+    // statement on that connection -- the two timeout resets and the advisory
+    // unlock in the `finally` -- then errors with "current transaction is
+    // aborted", which used to replace the build error and skip `sql.end()`.
+    const abortingSpec: ConcurrentIndexSpec = {
+      ...CRASH_RECOVERY_SPEC,
+      createStatement: "BEGIN; SELECT 1 / 0;",
+    };
+    // Deliberately passing no `log`: with one supplied, `log` (the no-op-by-
+    // default progress channel) and `warn` (the cleanup channel) are the SAME
+    // function object, so this assertion could not tell them apart and would
+    // still pass if cleanup regressed onto `log`. Spying the `console.warn`
+    // default discriminates that, and is also the only branch the two
+    // production callers ever take -- neither passes options.
+    //
+    // The spy also throws once, on the first cleanup message: a reporter that
+    // itself throws must not replace the build error nor skip the steps after
+    // it, `sql.end()` included. That is the same masking defect one layer up,
+    // so the three assertions below pin both guards at once.
+    const warned: string[] = [];
+    let reporterShouldThrow = true;
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation((message: string) => {
+      if (!message.startsWith("concurrent-index cleanup:")) return;
+      warned.push(message);
+      if (reporterShouldThrow) {
+        reporterShouldThrow = false;
+        throw new Error("cleanup reporter exploded");
+      }
+    });
+    cleanups.push(async () => warnSpy.mockRestore());
+
+    await expect(
+      ensurePendingConcurrentIndexes(database.connectionString, {
+        specs: [abortingSpec],
+      }),
+    ).rejects.toThrow(/division by zero/);
+
+    // Three, not two: the reporter threw on the first one, and the two steps
+    // after it still ran and still reported.
+    expect(warned).toHaveLength(3);
+
+    // The advisory lock is session-scoped, so Postgres only releases it when
+    // the backend exits -- it is therefore gone if and only if `sql.end()`
+    // ran despite the unlock throwing.
+    const probe = postgres(database.connectionString, { max: 1 });
+    cleanups.push(async () => probe.end());
+    let locked = false;
+    for (let attempt = 0; attempt < 20 && !locked; attempt += 1) {
+      [{ locked }] = await probe.unsafe(
+        `select pg_try_advisory_lock(hashtextextended('${SERIALIZING_LOCK_KEY}', 0)) as locked`,
+      );
+      if (!locked) await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    expect(locked).toBe(true);
   }, 60_000);
 });

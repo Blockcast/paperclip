@@ -551,6 +551,21 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
    * nobody should be working on this yet; it does not say a dependency on a cancelled row
    * is a coherent thing to wait for.
    *
+   * Nor does a park reach `in_review`'s write-side gate — `assertAgentInReviewReviewPath`
+   * in routes/issues.ts, which answers this same question on the write path and accepts a
+   * strict SUBSET of the paths this module honours. Four of its five are arms of this
+   * predicate. The fifth, `typed_execution_state_current_participant`, is NOT: it is
+   * honoured by `reviewFinding` below instead, under a stricter test than the validator's
+   * (the participant must be an invokable agent of the same company, not merely a non-empty
+   * agentId). Do not migrate it here to "complete" the subset: `reviewFinding` early-returns
+   * on this predicate, so an arm for the participant would make its participant branch
+   * unreachable and silently delete `invalid_review_participant` detection, on every status
+   * and every rule. The reverse direction does not hold either and must not be "fixed":
+   * BLO-33572 records why the park in particular stays off the validator's list (a park
+   * asserts nobody is acting, `in_review` asserts someone is), and PEN-2853 records the same
+   * asymmetry for the monitor. Widening the validator is a semantic change; go read its
+   * comment first.
+   *
    * `openPullRequestPathKeys` is the eighth (PEN-3198) and the only one no *person* sets
    * at all: it is written by the GitHub webhook. That matters for the BLO-27912 defect
    * above rather than merely lengthening the list. Every other satisfier is a claim by

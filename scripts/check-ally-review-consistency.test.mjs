@@ -12,6 +12,7 @@ import {
   allyReviewLane,
   applyBaseline,
   assertHeadSha,
+  assertLiveScopeNonVacuous,
   assertPrListComplete,
   attestedHead,
   duplicateBodyAcrossIdentities,
@@ -27,6 +28,8 @@ import {
   isMainModule,
   operativeAllyReviews,
   parseBaseline,
+  partitionByMergeEligibility,
+  prDormancy,
   sameLaneBodyRelation,
   violationFingerprint,
 } from "./check-ally-review-consistency.mjs";
@@ -1088,10 +1091,15 @@ describe("the committed baseline", () => {
   );
 
   it("parses under the same validation the guard applies at runtime", () => {
-    assert.ok(parseBaseline(raw).length > 0);
+    assert.ok(Array.isArray(parseBaseline(raw)));
   });
 
-  it("suppresses exactly the violation set measured on 2026-09-01 and nothing else", () => {
+  it("is empty, and an empty baseline suppresses nothing", () => {
+    // The six founding entries self-expired by head movement and were pruned in
+    // PEN-2847. The property that matters is that emptying the file did not turn
+    // the ratchet off: feed it the exact set it used to suppress and every one
+    // must now fail. Asserting only `length === 0` would pass just as well if
+    // `applyBaseline` had been broken into suppressing everything.
     const measured = [
       REAL_I1_1525,
       REAL_I3_1525,
@@ -1100,19 +1108,127 @@ describe("the committed baseline", () => {
       "I3 PR #1316 @0110ccd1: Ally App review 4913256943 is not canonical — expected one consolidated-review heading and one Reviewed head attestation",
       "I1 PR #1304 @61360b5a: 2 operative Ally App reviews (COMMENTED/5062643059, COMMENTED/5062648138) — expected at most 1 in the app lane",
     ];
-    const { failing, suppressed, staleEntries } = applyBaseline(measured, parseBaseline(raw));
-    assert.deepEqual(failing, [], "the run goes green on the state that pinned it red");
-    assert.equal(suppressed.length, measured.length);
-    assert.deepEqual(staleEntries, [], "no entry suppresses something that is not happening");
+    const entries = parseBaseline(raw);
+    assert.equal(entries.length, 0);
+    const { failing, suppressed, staleEntries } = applyBaseline(measured, entries);
+    assert.equal(failing.length, measured.length, "an empty baseline must suppress nothing");
+    assert.deepEqual(suppressed, []);
+    assert.deepEqual(staleEntries, [], "no entry left to go stale");
   });
 
-  it("still fails on a new violation alongside the baselined set", () => {
+  it("still fails on a new violation alongside a baselined set", () => {
+    // Pinned to an explicit entry list, not the committed file, so this keeps
+    // testing the ratchet after the committed baseline was emptied.
     const withNewFinding = [
       REAL_I1_1525,
       "I1 PR #1601 @abcdef12: 2 operative Ally App reviews (COMMENTED/5111111111, COMMENTED/5222222222) — expected at most 1 in the app lane",
     ];
-    const { failing } = applyBaseline(withNewFinding, parseBaseline(raw));
+    const { failing, suppressed } = applyBaseline(withNewFinding, [entry()]);
+    assert.equal(suppressed.length, 1, "the baselined one is still suppressed");
     assert.equal(failing.length, 1);
     assert.match(failing[0].violation, /PR #1601/);
+  });
+});
+
+describe("prDormancy", () => {
+  it("defers a conflicting PR — GitHub will not merge from DIRTY", () => {
+    assert.equal(prDormancy({ number: 1, mergeStateStatus: "DIRTY" }), "merge state DIRTY");
+  });
+
+  it("defers a draft PR", () => {
+    assert.equal(prDormancy({ number: 1, isDraft: true, mergeStateStatus: "CLEAN" }), "draft");
+  });
+
+  for (const state of ["CLEAN", "BEHIND", "UNSTABLE", "BLOCKED"]) {
+    it(`keeps ${state} live — it can still reach master`, () => {
+      assert.equal(prDormancy({ number: 1, mergeStateStatus: state }), null);
+    });
+  }
+
+  // The fail-closed edge. mergeStateStatus is computed lazily server-side and
+  // GitHub extends the enum without notice, so anything unrecognised, absent or
+  // malformed has to stay in scope. An allow-list would have dropped the 5 of 121
+  // PRs sitting at UNKNOWN on 2026-09-20 straight out of the audit.
+  for (const [label, pr] of [
+    ["UNKNOWN", { number: 1, mergeStateStatus: "UNKNOWN" }],
+    ["a state added after this was written", { number: 1, mergeStateStatus: "SOME_NEW_STATE" }],
+    ["a missing field", { number: 1 }],
+    ["an explicit null", { number: 1, mergeStateStatus: null }],
+    ["a non-boolean isDraft", { number: 1, isDraft: "yes", mergeStateStatus: "CLEAN" }],
+  ]) {
+    it(`treats ${label} as live rather than dropping it from the audit`, () => {
+      assert.equal(prDormancy(pr), null);
+    });
+  }
+});
+
+describe("assertLiveScopeNonVacuous", () => {
+  it("throws when every open PR classified unmergeable", () => {
+    // "Green because it stopped checking" is the outcome PEN-2847 calls worse
+    // than the permanent red it replaced, so this is a throw, not a warning.
+    const allDormant = [
+      { number: 1, mergeStateStatus: "DIRTY" },
+      { number: 2, isDraft: true },
+    ];
+    assert.throws(() => assertLiveScopeNonVacuous(allDormant, "o/r"), /scoping bug, not a clean repo/);
+  });
+
+  it("passes when at least one PR could merge", () => {
+    const mixed = [
+      { number: 1, mergeStateStatus: "DIRTY" },
+      { number: 2, mergeStateStatus: "CLEAN" },
+    ];
+    assert.doesNotThrow(() => assertLiveScopeNonVacuous(mixed, "o/r"));
+  });
+
+  it("does not fire on a repo with no open PRs at all", () => {
+    assert.doesNotThrow(() => assertLiveScopeNonVacuous([], "o/r"));
+    assert.doesNotThrow(() => assertLiveScopeNonVacuous(undefined, "o/r"));
+  });
+});
+
+describe("partitionByMergeEligibility", () => {
+  const finding = (pr) => ({
+    violation: `I1 PR #${pr} @abcdef12: 2 operative Ally App reviews (COMMENTED/5111111111, COMMENTED/5222222222)`,
+    fingerprint: `I1:${pr}:abcdef12:5111111111,5222222222`,
+  });
+
+  it("defers a finding on a conflicting PR and keeps one on a mergeable PR failing", () => {
+    const { failing, deferred } = partitionByMergeEligibility(
+      [finding(1220), finding(1757)],
+      [
+        { number: 1220, mergeStateStatus: "DIRTY" },
+        { number: 1757, mergeStateStatus: "CLEAN" },
+      ],
+    );
+    assert.equal(failing.length, 1);
+    assert.match(failing[0].violation, /PR #1757/);
+    assert.equal(deferred.length, 1);
+    assert.match(deferred[0].violation, /PR #1220/);
+    assert.equal(deferred[0].reason, "merge state DIRTY");
+  });
+
+  it("keeps a finding failing when its PR cannot be resolved", () => {
+    // Unparseable number, or a PR missing from the fetched set. "I could not tell
+    // whether this matters" must not read as "this does not matter".
+    const { failing, deferred } = partitionByMergeEligibility(
+      [finding(9999), { violation: "mangled", fingerprint: "?:?:?:" }],
+      [{ number: 1220, mergeStateStatus: "DIRTY" }],
+    );
+    assert.equal(failing.length, 2);
+    assert.deepEqual(deferred, []);
+  });
+
+  it("does not deferral-launder a finding whose PR later becomes mergeable", () => {
+    // The bounded-exposure claim: the same finding on the same head returns to
+    // failing as soon as GitHub stops blocking the merge, with no push required.
+    const prs = [{ number: 1220, mergeStateStatus: "DIRTY" }];
+    assert.equal(partitionByMergeEligibility([finding(1220)], prs).deferred.length, 1);
+    prs[0].mergeStateStatus = "CLEAN";
+    assert.equal(partitionByMergeEligibility([finding(1220)], prs).failing.length, 1);
+  });
+
+  it("passes an empty finding set through untouched", () => {
+    assert.deepEqual(partitionByMergeEligibility([], []), { failing: [], deferred: [] });
   });
 });

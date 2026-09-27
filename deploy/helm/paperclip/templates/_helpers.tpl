@@ -264,3 +264,29 @@ unscrubbed.
 {{- end -}}
 {{- $path -}}
 {{- end }}
+
+{{/*
+Render evidenceGate.unlabeledTruthBlock, failing loudly on anything but "0"/"1".
+
+The server reads this env var as `=== "1"` (server/src/config.ts), so a YAML bool
+— `unlabeledTruthBlock: true`, the most natural thing to write for a rollout
+flag — renders "true" and reads as OFF. It fails safe and it fails SILENTLY,
+which is the wrong shape for a flag whose entire purpose is a measured flip: the
+operator would read seven days of zero blocks as "the gate is quiet" rather than
+"the gate is off". Quote your values.
+*/}}
+{{- define "paperclip.evidenceGateUnlabeledTruthBlock" -}}
+{{- $raw := ((.Values.evidenceGate).unlabeledTruthBlock) -}}
+{{- /* Only a genuinely absent key defaults; everything else is validated.
+       `kindIs "invalid"` is the nil test, and it is deliberately NOT `empty`
+       or `default`: Go templates count boolean `false` as empty, so both of
+       those collapse `unlabeledTruthBlock: false` to "0" silently while
+       `true` fails loudly — the same unquoted-bool trap this helper exists to
+       catch, one level down. Both bools are now the same class of mistake and
+       both say so. */ -}}
+{{- $v := (kindIs "invalid" $raw | ternary "0" ($raw | toString)) -}}
+{{- if not (has $v (list "0" "1")) -}}
+{{- fail (printf "evidenceGate.unlabeledTruthBlock must be the string \"0\" or \"1\", got %q (note: an unquoted YAML bool renders \"true\"/\"false\" and the server reads either as off) — docs/runbooks/evidence-gate-unlabeled-block.md" $v) -}}
+{{- end -}}
+{{- $v | quote -}}
+{{- end }}

@@ -10,15 +10,24 @@ const user = (login) => ({ type: 'User', reviewer: { login } });
 
 // ── evaluateEnvironmentProtection ────────────────────────────────────────────
 
+// The EXACT live shape of paperclip-production, re-read 2026-09-21T07:0xZ:
+//   {"can_admins_bypass":false,"updated_at":"2026-08-30T07:13:06Z",
+//    "rules":[{"type":"branch_policy"},
+//             {"type":"required_reviewers","prevent_self_review":false,
+//              "reviewers":["kkroo"]}]}
+// Ratified as intended by board approval 60e271b7 (2026-09-14), superseding
+// b75f8156. This fixture IS the acceptance criterion for BLO-34896: the guard
+// must be green on it *without* the environment moving. Note prevent_self_review
+// is false here on purpose — see the "reported, not asserted" test below.
 const COMPLIANT_ENV = {
   can_admins_bypass: false,
-  updated_at: '2026-08-06T05:55:07Z',
+  updated_at: '2026-08-30T07:13:06Z',
   protection_rules: [
     { id: 61677470, type: 'branch_policy' },
     {
       id: 61904232,
       type: 'required_reviewers',
-      prevent_self_review: true,
+      prevent_self_review: false,
       reviewers: RATIFIED_REVIEWERS.map(user),
     },
   ],
@@ -30,6 +39,13 @@ test('evaluateEnvironmentProtection: passes the board-ratified shape', () => {
   assert.equal(result.compliant, true);
   assert.deepEqual(result.violations, []);
   assert.deepEqual(result.observed.reviewers, RATIFIED_REVIEWERS);
+});
+
+test('evaluateEnvironmentProtection: the ratified reviewer set is the 60e271b7 set, not the superseded b75f8156 one', () => {
+  // Pins the record that BLO-34896 exists to stop re-deriving. If someone
+  // restores the two-reviewer set without a new board ruling, this fails and
+  // the PR diff is the place that conversation happens.
+  assert.deepEqual(RATIFIED_REVIEWERS, ['kkroo']);
 });
 
 test('evaluateEnvironmentProtection: flags the 2026-08-04 lapse shape (required_reviewers gone, admin bypass true)', () => {
@@ -48,7 +64,7 @@ test('evaluateEnvironmentProtection: flags the 2026-08-04 lapse shape (required_
   assert.match(result.violations[1], /can_admins_bypass/);
 });
 
-test('evaluateEnvironmentProtection: flags the 2026-08-08 WIDENING shape (extra admin reviewer + admin bypass)', () => {
+test('evaluateEnvironmentProtection: flags the 2026-08-08 WIDENING shape (extra admin reviewers + admin bypass)', () => {
   // Exact live shape re-probed 2026-08-14T08:46Z: the 08-08 "temporary" override
   // that was never restored. A non-emptiness check passes this; membership
   // comparison is what catches it. Regression guard for BLO-22329.
@@ -70,7 +86,7 @@ test('evaluateEnvironmentProtection: flags the 2026-08-08 WIDENING shape (extra 
   const result = evaluateEnvironmentProtection(widenedEnv);
   assert.equal(result.compliant, false);
   assert.equal(result.violations.length, 2);
-  assert.match(result.violations[0], /required_reviewers membership.*kkroo/);
+  assert.match(result.violations[0], /required_reviewers membership.*eyad-hussein.*MohamedElmdary/);
   assert.match(result.violations[1], /can_admins_bypass/);
 });
 
@@ -89,7 +105,7 @@ test('evaluateEnvironmentProtection: flags a removed ratified reviewer', () => {
   };
   const result = evaluateEnvironmentProtection(env);
   assert.equal(result.compliant, false);
-  assert.match(result.violations[0], /required_reviewers membership.*missing.*MohamedElmdary/);
+  assert.match(result.violations[0], /required_reviewers membership.*missing.*kkroo/);
 });
 
 test('evaluateEnvironmentProtection: reviewer membership is case-insensitive', () => {
@@ -101,7 +117,7 @@ test('evaluateEnvironmentProtection: reviewer membership is case-insensitive', (
         id: 2,
         type: 'required_reviewers',
         prevent_self_review: true,
-        reviewers: [user('Eyad-Hussein'), user('mohamedelmdary')],
+        reviewers: [user('KKroo')],
       },
     ],
   };
@@ -134,6 +150,11 @@ test('evaluateEnvironmentProtection: resolves Team reviewers by slug', () => {
   assert.deepEqual(result.observed.reviewers, ['release-approvers']);
 });
 
+// ── the dangerous state: no effective gate (BLO-34896 AC2) ───────────────────
+// These two are the negative control for the reconciliation. The guard was made
+// green against the live prevent_self_review=false shape; it must NOT have gone
+// green by weakening its detection of "there is no approval gate at all".
+
 test('evaluateEnvironmentProtection: flags empty reviewers as non-compliant even if the rule exists', () => {
   const env = {
     ...COMPLIANT_ENV,
@@ -145,9 +166,51 @@ test('evaluateEnvironmentProtection: flags empty reviewers as non-compliant even
   const result = evaluateEnvironmentProtection(env);
   assert.equal(result.compliant, false);
   assert.match(result.violations[0], /required_reviewers/);
+  assert.deepEqual(result.violationKinds, ['required_reviewers_rule']);
 });
 
-test('evaluateEnvironmentProtection: flags prevent_self_review !== true even with reviewers present', () => {
+test('evaluateEnvironmentProtection: flags an absent required_reviewers rule', () => {
+  const env = {
+    ...COMPLIANT_ENV,
+    protection_rules: [{ id: 1, type: 'branch_policy' }],
+  };
+  const result = evaluateEnvironmentProtection(env);
+  assert.equal(result.compliant, false);
+  assert.deepEqual(result.violationKinds, ['required_reviewers_rule']);
+});
+
+test('evaluateEnvironmentProtection: prevent_self_review is REPORTED but not asserted', () => {
+  // Re-ratified as permitted-false by approval 60e271b7 (2026-09-14), so it must
+  // not fail the run — that is the whole point of BLO-34896. It must still show
+  // up in `observed`, which is what carries the single-approver posture into
+  // every alert and run log.
+  const result = evaluateEnvironmentProtection(COMPLIANT_ENV);
+  assert.equal(result.compliant, true);
+  assert.equal(result.observed.prevent_self_review, false);
+
+  // ...and flipping it the other way is a strengthening, not a violation.
+  const stricter = evaluateEnvironmentProtection({
+    ...COMPLIANT_ENV,
+    protection_rules: [
+      { id: 1, type: 'branch_policy' },
+      {
+        id: 2,
+        type: 'required_reviewers',
+        prevent_self_review: true,
+        reviewers: RATIFIED_REVIEWERS.map(user),
+      },
+    ],
+  });
+  assert.equal(stricter.compliant, true);
+});
+
+test('evaluateEnvironmentProtection: prevent_self_review=false does NOT mask the membership check', () => {
+  // The defect this reconciliation fixed. `prevent_self_review !== true` used to
+  // be a disjunct of the required_reviewers_rule clause, and because `||`
+  // short-circuits, the live false value sent every run down that branch and the
+  // membership comparison in the `else` was unreachable. A tolerated drift was
+  // hiding an untolerated one. Mutation guard: re-add that disjunct and this
+  // fails, because the result collapses to required_reviewers_rule.
   const env = {
     ...COMPLIANT_ENV,
     protection_rules: [
@@ -156,13 +219,12 @@ test('evaluateEnvironmentProtection: flags prevent_self_review !== true even wit
         id: 2,
         type: 'required_reviewers',
         prevent_self_review: false,
-        reviewers: RATIFIED_REVIEWERS.map(user),
+        reviewers: [user('somebody-unratified')],
       },
     ],
   };
   const result = evaluateEnvironmentProtection(env);
-  assert.equal(result.compliant, false);
-  assert.match(result.violations[0], /required_reviewers/);
+  assert.deepEqual(result.violationKinds, ['required_reviewers_membership']);
 });
 
 test('evaluateEnvironmentProtection: flags missing deployment_branch_policy.protected_branches', () => {
@@ -199,7 +261,8 @@ test('evaluateEnvironmentProtection: violationKinds stays in lockstep with viola
 });
 
 test('evaluateEnvironmentProtection: a membership widening is kind-tagged distinctly from a bypass flip', () => {
-  // The live 2026-09-01 shape: kkroo added, but can_admins_bypass still false.
+  // A membership widening with can_admins_bypass still false: an extra reviewer
+  // beyond the ratified set, which is exactly the 2026-08-08 incident shape.
   const widened = evaluateEnvironmentProtection({
     ...COMPLIANT_ENV,
     protection_rules: [
@@ -208,7 +271,7 @@ test('evaluateEnvironmentProtection: a membership widening is kind-tagged distin
         id: 61904232,
         type: 'required_reviewers',
         prevent_self_review: true,
-        reviewers: [...RATIFIED_REVIEWERS, 'kkroo'].map(user),
+        reviewers: [...RATIFIED_REVIEWERS, 'eyad-hussein'].map(user),
       },
     ],
   });
@@ -224,7 +287,7 @@ test('evaluateEnvironmentProtection: a membership widening is kind-tagged distin
         id: 61904232,
         type: 'required_reviewers',
         prevent_self_review: true,
-        reviewers: [...RATIFIED_REVIEWERS, 'kkroo'].map(user),
+        reviewers: [...RATIFIED_REVIEWERS, 'eyad-hussein'].map(user),
       },
     ],
   });
@@ -245,7 +308,7 @@ test('evaluateEnvironmentProtection: violation kinds carry no observed values', 
         id: 61904232,
         type: 'required_reviewers',
         prevent_self_review: true,
-        reviewers: [...RATIFIED_REVIEWERS, 'kkroo'].map(user),
+        reviewers: [...RATIFIED_REVIEWERS, 'eyad-hussein'].map(user),
       },
     ],
   });

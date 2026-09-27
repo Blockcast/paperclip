@@ -1,8 +1,6 @@
 import { sql } from "drizzle-orm";
-import type { Db } from "@paperclipai/db";
+import type { Db, DbTransaction } from "@paperclipai/db";
 import { normalizePrReviewRepoFullName } from "./pr-review-duplicate-issue-guard.js";
-
-type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
 const PR_ISSUE_BACKLINK_LOCK_PREFIX = "github:pr-issue-backlink:";
 
