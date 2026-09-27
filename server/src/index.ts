@@ -70,6 +70,12 @@ import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-sh
 import { summarizeStrandedRecoveryHandBackPass } from "./services/recovery/service.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
+import {
+  recordHeartbeatRecoveryChainDuration,
+  recordHeartbeatRecoveryChainInflight,
+  recordHeartbeatRecoveryChainSkipped,
+  recordHeartbeatRecoveryChainStalled,
+} from "./services/metrics.js";
 import { createApiTierPluginWorkerManagerStub } from "./services/plugin-worker-manager-stub.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
@@ -1139,6 +1145,13 @@ export async function startServer(): Promise<StartedServer> {
   // overlap the latch exists to remove, so this reports and does not act.
   let heartbeatRecoveryChainInFlight = false;
   let heartbeatRecoveryChainStartedAt = 0;
+  // PEN-3314: latches the stall COUNTER to once per stalled pass. The warn log
+  // below deliberately still repeats every tick — an unresolved halt should keep
+  // saying so — but a counter that ticked with it would conflate "how many
+  // passes stalled" with "how long one of them has been stalled", and the first
+  // is the alertable quantity. Reset when a new pass starts, not when one ends,
+  // so a pass that never settles cannot re-arm it.
+  let heartbeatRecoveryChainStallCounted = false;
   // BLO-22984: the same latch, for the execution-workspace collector. It is
   // its own tracked pass (below), and `setInterval` fires the next callback on
   // schedule whether or not the previous one settled, so without this a slow
@@ -1885,6 +1898,7 @@ export async function startServer(): Promise<StartedServer> {
           if (!heartbeatRecoveryChainInFlight) {
             heartbeatRecoveryChainInFlight = true;
             heartbeatRecoveryChainStartedAt = Date.now();
+            heartbeatRecoveryChainStallCounted = false;
             trackHeartbeatSchedulerWork(heartbeat
               .reconcileStrandedAssignedIssues()
               .then(async (reconciled) => {
@@ -1974,22 +1988,43 @@ export async function startServer(): Promise<StartedServer> {
                 logger.error({ err }, "periodic heartbeat recovery failed");
               })
               .finally(() => {
+                // Read the duration BEFORE clearing the start stamp. A backwards
+                // clock must not produce a negative value on a gauge that only
+                // ever means "how long did this take".
+                recordHeartbeatRecoveryChainDuration(
+                  Math.max(0, Date.now() - heartbeatRecoveryChainStartedAt),
+                );
+                // No pass is outstanding now. Leaving the previous value behind
+                // would keep the overlap alert firing against a worker that has
+                // already recovered.
+                recordHeartbeatRecoveryChainInflight(0);
                 heartbeatRecoveryChainInFlight = false;
                 heartbeatRecoveryChainStartedAt = 0;
               }));
-          } else if (
-            Date.now() - heartbeatRecoveryChainStartedAt >
-            HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS
-          ) {
-            // Skipping is normal and silent; a chain that has been in flight for
-            // many ticks is not. Reported, not acted on — see the latch decl.
-            logger.warn(
-              {
-                inFlightMs: Date.now() - heartbeatRecoveryChainStartedAt,
-                warnAfterMs: HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS,
-              },
-              "periodic heartbeat recovery chain still in flight across many ticks; recovery passes are not running",
-            );
+          } else {
+            const inFlightMs = Math.max(0, Date.now() - heartbeatRecoveryChainStartedAt);
+            // Every skipped tick, not just the stalled ones: a sustained skip
+            // rate is how "the chain is outrunning the interval" becomes
+            // visible, and that is observable hours before the heap ceiling.
+            recordHeartbeatRecoveryChainSkipped();
+            recordHeartbeatRecoveryChainInflight(inFlightMs);
+            if (inFlightMs > HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS) {
+              if (!heartbeatRecoveryChainStallCounted) {
+                // Latch before the record, matching the log's own ordering: a
+                // throwing recorder must not re-arm a once-per-pass signal.
+                heartbeatRecoveryChainStallCounted = true;
+                recordHeartbeatRecoveryChainStalled();
+              }
+              // Skipping is normal and silent; a chain that has been in flight for
+              // many ticks is not. Reported, not acted on — see the latch decl.
+              logger.warn(
+                {
+                  inFlightMs,
+                  warnAfterMs: HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS,
+                },
+                "periodic heartbeat recovery chain still in flight across many ticks; recovery passes are not running",
+              );
+            }
           }
         }
       })();
