@@ -272,7 +272,25 @@ export async function reapIsolationWorkspaces(
     entries = await fs.readdir(root, { withFileTypes: true });
   } catch (err) {
     // An absent root is the normal case on a non-k8s-isolation deployment.
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return result;
+    //
+    // BLO-36814: record it anyway. Returning here without touching the
+    // registry leaves an ENABLED reaper pointed at a WRONG path looking
+    // exactly like a disabled one — absent series, no alert, tree growing
+    // unreclaimed. That is the BLO-31222 incident shape, and it is the same
+    // blind spot this metric exists to remove. `root_absent` keeps it
+    // distinguishable from a clean sweep over a tree that really is empty.
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      log.info(
+        { root, maxAgeDays: options.maxAgeDays, dryRun: options.dryRun === true, ...result },
+        "isolation-workspace reaper sweep complete (root absent)",
+      );
+      recordIsolationWorkspaceReapSweep(result, {
+        dryRun: options.dryRun === true,
+        now,
+        stopReason: "root_absent",
+      });
+      return result;
+    }
     throw err;
   }
 
