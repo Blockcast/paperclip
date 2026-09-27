@@ -1525,8 +1525,9 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     // measured production shape is a row created before the worktree execution
     // cutoff, which every dispatch/resume path filters on, so it is never
     // dispatched, never resumed, and therefore never terminal.
+    const wedgedRunId = randomUUID();
     await db.insert(heartbeatRuns).values({
-      id: randomUUID(),
+      id: wedgedRunId,
       companyId,
       agentId,
       status: "queued",
@@ -1543,6 +1544,21 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       status: "cleared",
       clearReason: "trigger_stalled",
     });
+
+    // Ally review (c0i1): the reap's recovery wake is task-scoped to this issue,
+    // so coalescePendingTaskScopeWake would absorb it into the wedged run (no age
+    // bound there) and nothing would ever dispatch it. The reap has to retire the
+    // run it just declared dead so the wake lands on a fresh run.
+    const wedged = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, wedgedRunId)).then((rows) => rows[0]!);
+    expect(wedged).toMatchObject({ status: "cancelled", errorCode: "issue_monitor_live_consumer_expired" });
+    const recoveryRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId))
+      .then((rows) => rows.filter((row) =>
+        row.id !== wedgedRunId &&
+        (row.contextSnapshot as Record<string, unknown> | null)?.wakeReason === "issue_monitor_recovery"));
+    expect(recoveryRuns).toHaveLength(1);
   });
 
   // BLO-35155 (Ally review, Important 2): `scheduled_retry` is excluded from

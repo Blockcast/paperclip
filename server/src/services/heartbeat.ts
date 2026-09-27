@@ -15492,6 +15492,52 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ),
           )
           .returning();
+        // BLO-35155 (Ally review c0i1): the fallback arm reaps past a queued run
+        // only once it is older than liveConsumerFloor, i.e. once the ceiling has
+        // declared it undispatchable. The recovery wake this reap enqueues is
+        // scoped to the same issue, and coalescePendingTaskScopeWake has no age
+        // bound, so it would be absorbed into that dead run and never dispatched.
+        // Retire those runs with the claim so the wake lands on a fresh run. An
+        // explicit timeoutAt never consulted the ceiling, so it is left alone.
+        if (updated?.assigneeAgentId && parseObject(parseObject(updated.executionState).monitor).timeoutAt == null) {
+          const reason = "Cancelled because it stayed queued past the issue monitor live-consumer ceiling; the monitor recovery wake replaces it";
+          const expiredConsumers = await tx
+            .update(heartbeatRuns)
+            .set({
+              status: "cancelled",
+              finishedAt: now,
+              error: reason,
+              errorCode: "issue_monitor_live_consumer_expired",
+              updatedAt: now,
+            })
+            .where(
+              and(
+                eq(heartbeatRuns.companyId, updated.companyId),
+                eq(heartbeatRuns.agentId, updated.assigneeAgentId),
+                eq(heartbeatRuns.contextIssueId, updated.id),
+                eq(heartbeatRuns.status, "queued"),
+                lt(heartbeatRuns.createdAt, liveConsumerFloor),
+              ),
+            )
+            .returning({ id: heartbeatRuns.id, wakeupRequestId: heartbeatRuns.wakeupRequestId });
+          const wakeupRequestIds = expiredConsumers
+            .map((run) => run.wakeupRequestId)
+            .filter((id): id is string => Boolean(id));
+          if (wakeupRequestIds.length > 0) {
+            await tx
+              .update(agentWakeupRequests)
+              .set({ status: "cancelled", finishedAt: now, error: reason, updatedAt: now })
+              .where(inArray(agentWakeupRequests.id, wakeupRequestIds));
+          }
+          for (const run of expiredConsumers) {
+            await releaseIssueRunOwnership(tx, {
+              issueId: updated.id,
+              companyId: updated.companyId,
+              runId: run.id,
+              updatedAt: now,
+            });
+          }
+        }
         return (updated ?? null) as IssueMonitorDispatchRow | null;
       });
 
