@@ -541,12 +541,14 @@ export function findViolations(prs) {
  *     without first re-entering scope. For `DIRTY` the exposure is usually nil —
  *     resolving conflicts means pushing, which moves the head, which sheds the
  *     violation outright.
- *   - **Not-updated-in-N-days (still rejected).** Staleness is not a state GitHub
- *     enforces anything against. A `CLEAN` PR untouched for 30 days merges on a
- *     click, with no push, no transition, and no run in between — the guard never
- *     gets its chance to red. That is unbounded fail-open on exactly the BLO-19778
- *     incident, and it is why #1525's two-day-old `BEHIND` measurement killed the
- *     window approach and still does.
+ *   - **Not-updated-in-N-days (only where GitHub reported no usable state).**
+ *     Staleness is not a state GitHub enforces anything against. A `CLEAN` PR
+ *     untouched for 30 days merges on a click, with no push, no transition, and
+ *     no run in between, so a window applied to a REPORTED state would be
+ *     unbounded fail-open on exactly the BLO-19778 incident (and #1525's
+ *     two-day-old `BEHIND` measurement is why). The window therefore applies
+ *     only when `mergeStateStatus` is unresolved; `CLEAN`, `BEHIND` and
+ *     `UNSTABLE` stay live at any age. See `prDormancy()` for the three tiers.
  *
  * Measured on the 121 open PRs of 2026-09-20: 71 live, 50 dormant. #1316
  * (`UNSTABLE`) and #1360 (`BEHIND`) — two of the four PRs that originally pinned
@@ -706,7 +708,27 @@ export const UNRESOLVED_MERGE_STATES = new Set(["", "UNKNOWN"]);
  * and only 4 (1.3%) lived longer than 14d at all. A PR's last touch is never
  * earlier than its creation, so this is the conservative side of that figure.
  */
-export const MAX_IDLE_DAYS = Number(process.env.ALLY_REVIEW_MAX_IDLE_DAYS ?? 14);
+export const MAX_IDLE_DAYS = parseMaxIdleDays(process.env.ALLY_REVIEW_MAX_IDLE_DAYS);
+
+/**
+ * Reads `ALLY_REVIEW_MAX_IDLE_DAYS`: unset means 14, anything else must be a
+ * positive finite number or this throws. `""` is what an Actions `env:` bound to
+ * an unset variable or input yields, and `Number("")` is 0, which would read
+ * every unresolved PR touched more than 0 days ago as dormant -- green because
+ * it stopped checking. A negative value fails open the same way.
+ */
+export function parseMaxIdleDays(raw) {
+  if (raw === undefined) {
+    return 14;
+  }
+  const days = Number(raw);
+  if (String(raw).trim() === "" || !Number.isFinite(days) || days <= 0) {
+    throw new Error(
+      `ALLY_REVIEW_MAX_IDLE_DAYS must be a positive number of days, got ${JSON.stringify(raw)}`,
+    );
+  }
+  return days;
+}
 
 /** Days since the PR was last touched, or `null` if that cannot be determined. */
 export function idleDays(pr, now) {
@@ -740,6 +762,13 @@ export function idleDays(pr, now) {
  *
  * Absence of evidence still keeps a finding fatal everywhere else: an unparseable
  * or missing `updatedAt`, and any idle PR inside the window, stay live.
+ *
+ * Residual, not closed here: a PR touched INSIDE the window whose state flips
+ * `DIRTY` <-> `UNKNOWN` still changes the run's verdict between runs (tier 1
+ * defers it, tier 3 keeps it live). The measured `UNKNOWN` population was all
+ * touched within 7 days, so this is the common cohort, not a corner. Closing it
+ * needs state carried across runs, e.g. preferring a PR's last reported state
+ * over `UNKNOWN`.
  */
 export function prDormancy(pr, now = Date.now()) {
   if (pr?.isDraft === true) {
