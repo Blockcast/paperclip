@@ -37,6 +37,7 @@ import { RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS, issueRecoveryActionService, reco
 import { issueService } from "../services/issues.js";
 import { recoveryObservabilityService } from "../services/recovery-observability.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
+import { BACKSTOP_CANDIDATES_SKIPPED_METRIC, renderMetrics } from "../services/metrics.js";
 import { buildPullRequestWorkProductFields } from "../services/pull-request-work-products.js";
 import { loadConfig } from "../config.js";
 import {
@@ -1041,8 +1042,37 @@ describeEmbeddedPostgres("issue recovery actions", () => {
    * Both arms are asserted because the halves must disagree: seeding only the queued wake
    * still passes a collapsed implementation if you assert the union, and seeding only the
    * live run cannot catch the two counters being swapped.
+   *
+   * The emitted Prometheus label is asserted alongside the sweep result, not instead of it,
+   * because they can disagree. The result fields are computed at the two gates; the labels
+   * are bound to them by a separate table at the end of the sweep. Swapping that table's two
+   * rows leaves every result field, log line and type correct and inverts only the deployed
+   * series — which is the series BLO-19124 is read from, i.e. the silent inversion this test
+   * exists to prevent, displaced one layer out onto the read surface. Read through
+   * `renderMetrics()` rather than a mock on the recorder: that is the exact text Prometheus
+   * scrapes, so it also pins the label *names*, and it cannot drift from the real registry.
+   * Deltas, not absolutes — the counter is process-wide and other cases in this file sweep too.
    */
   it("counts the live-run and queued-wake arms of the live-path gate apart", async () => {
+    // Absent and zero are the same reading for a delta: a series that has never fired does
+    // not exist yet, which is the very absent-vs-zero ambiguity #1946 fixes for the absolute.
+    const skipLabel = async (reason: string): Promise<number> => {
+      const { body } = await renderMetrics();
+      const line = new RegExp(
+        `^${BACKSTOP_CANDIDATES_SKIPPED_METRIC}\\{source="stranded_recovery_wake_backstop",reason="${reason}"\\} (\\d+)$`,
+        "m",
+      );
+      return Number(body.match(line)?.[1] ?? 0);
+    };
+    const armDeltas = async <T>(run: () => Promise<T>): Promise<{ result: T; livePath: number; queuedWake: number }> => {
+      const before = { livePath: await skipLabel("live_path"), queuedWake: await skipLabel("live_path_queued_wake") };
+      const result = await run();
+      return {
+        result,
+        livePath: (await skipLabel("live_path")) - before.livePath,
+        queuedWake: (await skipLabel("live_path_queued_wake")) - before.queuedWake,
+      };
+    };
     const seedGatedCandidate = async (fingerprintSuffix: string) => {
       const seeded = await seedCompany();
       await db
@@ -1078,7 +1108,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     };
 
     // Arm 1: a live run, nothing queued. Pins the ordering — swapping the two counters
-    // fails here.
+    // fails here, and swapping the two label rows fails on `livePath`/`queuedWake`.
     const liveRun = await seedGatedCandidate("live-run-arm");
     await db.insert(heartbeatRuns).values({
       id: randomUUID(),
@@ -1089,15 +1119,21 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       status: "running",
       contextSnapshot: { issueId: liveRun.sourceIssueId, wakeReason: "issue_assigned" },
     });
-    expect(await sweep(liveRun.companyId)).toMatchObject({
+    const liveRunArm = await armDeltas(() => sweep(liveRun.companyId));
+    expect(liveRunArm.result).toMatchObject({
       checked: 1,
       healed: 0,
       livePathSkipped: 1,
       livePathQueuedWakeSkipped: 0,
     });
+    expect({ livePath: liveRunArm.livePath, queuedWake: liveRunArm.queuedWake }).toEqual({
+      livePath: 1,
+      queuedWake: 0,
+    });
 
     // Arm 2: a queued wake, no run. Pins the split — collapsing back to one counter
-    // attributes this to `livePathSkipped` and fails here.
+    // attributes this to `livePathSkipped` and fails here. Dropping the
+    // `live_path_queued_wake` label row leaves both deltas at 0 and fails here too.
     const queuedWake = await seedGatedCandidate("queued-wake-arm");
     await db.insert(agentWakeupRequests).values({
       companyId: queuedWake.companyId,
@@ -1108,11 +1144,16 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       status: "queued",
       payload: { issueId: queuedWake.sourceIssueId },
     });
-    expect(await sweep(queuedWake.companyId)).toMatchObject({
+    const queuedWakeArm = await armDeltas(() => sweep(queuedWake.companyId));
+    expect(queuedWakeArm.result).toMatchObject({
       checked: 1,
       healed: 0,
       livePathSkipped: 0,
       livePathQueuedWakeSkipped: 1,
+    });
+    expect({ livePath: queuedWakeArm.livePath, queuedWake: queuedWakeArm.queuedWake }).toEqual({
+      livePath: 0,
+      queuedWake: 1,
     });
   });
 

@@ -128,6 +128,11 @@ export const ISOLATION_WORKSPACE_REAPER_STOP_REASONS = [
 ] as const;
 export type BackstopSource = (typeof BACKSTOP_SOURCES)[number];
 export const BACKSTOP_SKIP_REASONS = [
+  // `live_path` is NOT comparable across sources, so do not `sum by (reason)` over both.
+  // For `stranded_recovery_wake_backstop` it is the active-run arm ALONE, with the
+  // queued-owner-wake arm split out as `live_path_queued_wake` (BLO-19124). For
+  // `issue_graph_liveness.backstop` it is still the union of both probes behind one `||`.
+  // Scope every query by `source`.
   "not_ready", "existing_wake", "live_path", "live_path_queued_wake", "pause_hold", "interaction",
   "no_owner", "cause", "exhausted", "cooldown", "claim_lost",
   "deferred_or_failed", "enqueue_failed",
