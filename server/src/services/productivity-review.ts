@@ -399,12 +399,14 @@ type ProductivityReviewEvidence = {
   neverInvokedRunCount: number;
   // PEN-3442: count of terminal runs excluded from the `noCommentStreak` walk
   // because they executed a turn and were then killed before finishing it
-  // (`isFaultTerminatedTurnRun`). Disjoint from `neverInvokedRunCount` by
-  // construction — those runs never got an adapter, these got one and burned
-  // tokens with it — so the evidence block can distinguish "never had a chance
-  // to comment" from "was working and got cut off" from "executed and chose to
-  // stay silent", which is the only one of the three that is assignee
-  // behaviour.
+  // (`isSilentFaultTerminatedRun` — `isFaultTerminatedTurnRun` AND no comment,
+  // so a fault-terminated run that commented mid-turn is NOT counted here; it
+  // stays in the walk and breaks the streak). Disjoint from
+  // `neverInvokedRunCount` by construction — those runs never got an adapter,
+  // these got one and burned tokens with it — so the evidence block can
+  // distinguish "never had a chance to comment" from "was working and got cut
+  // off" from "executed and chose to stay silent", which is the only one of the
+  // three that is assignee behaviour.
   faultTerminatedExecutedRunCount: number;
   // BLO-26165 (narrowing): of the runs eligible for the `noCommentStreak` walk,
   // how many carry `issueCommentStatus: "not_applicable"` —
@@ -2101,7 +2103,9 @@ function isNeverInvokedRun(
  *    stays in: the run is excluded on the classifier's agreement, not ahead
  *    of it, as it was before this predicate existed. For a `failed` run the
  *    classifier only ever answers `"failed"`, so this conjunct matters only in
- *    that window, and the null-liveness fixture in the service test pins it.
+ *    that window, and "keeps executed failed runs whose liveness has not
+ *    landed in the no_comment_streak walk (PEN-3442)" in
+ *    `productivity-review-service.test.ts` pins it.
  *  - **Durability.** An error-code list drifts. The fleet measurement found the
  *    leak was *not* confined to the `rate_limit_exhausted` class the defect was
  *    filed on: a `claude_transient_upstream` run on PEN-1990 burned 32,805
@@ -4678,7 +4682,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       // manager reading "turn-executing … had no comment" would otherwise
       // reasonably infer the assignee chose not to report.
       const faultTerminatedNote = faultTerminatedExecutedRunCount > 0
-        ? ` (${faultTerminatedExecutedRunCount} run(s) executed a turn and were killed by a fault before finishing it — \`status: failed\` — and are excluded, not counted toward this streak; their silence is a provider fault, not assignee behaviour)`
+        ? ` (${faultTerminatedExecutedRunCount} run(s) executed a turn and were killed by a fault before finishing it — \`status\` and \`livenessState\` both \`failed\` — and are excluded, not counted toward this streak; their silence is a provider fault, not assignee behaviour)`
         : "";
       triggerReasons.push(`${noCommentStreak} consecutive terminal, turn-executing issue-linked runs had no run-created issue comment${neverInvokedNote}${faultTerminatedNote}`);
     }
@@ -5072,7 +5076,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- No-comment streak (terminal, turn-executing runs): ${evidence.noCommentStreak}`,
       `- Runtime-failure streak (terminal, never-executed runs): ${evidence.runtimeFailureStreak}`,
       `- Never-invoked runs excluded (terminal, no adapter ever created — \`usageJson\`/\`logStore\`/\`logRef\` null, \`logBytes\` null or 0, BLO-26165): ${evidence.neverInvokedRunCount}`,
-      `- Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — \`status: failed\`, PEN-3442): ${evidence.faultTerminatedExecutedRunCount}`,
+      `- Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — \`status\` and \`livenessState\` both \`failed\`, PEN-3442): ${evidence.faultTerminatedExecutedRunCount}`,
       // BLO-29535 (Ally suggestion on a38c12fe2): "not excluded from the streak
       // walk", NOT "counted toward the streak". This count is taken over every
       // run in `noCommentEligibleRuns`, while `noCommentStreak` is only the

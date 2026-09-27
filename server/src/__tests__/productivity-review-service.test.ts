@@ -1725,7 +1725,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
     // …and PEN-3442's: it is accounted for in its own bucket, not silently dropped.
     expect(reviews[0]?.description).toContain(
-      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `status: failed`, PEN-3442): 10",
+      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `status` and `livenessState` both `failed`, PEN-3442): 10",
     );
   });
 
@@ -1930,7 +1930,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     // them to the 10 genuinely silent ones. Pre-fix this read 22.
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain(
-      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `status: failed`, PEN-3442): 12",
+      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `status` and `livenessState` both `failed`, PEN-3442): 12",
     );
     // They are NOT the never-invoked population: these got an adapter and used
     // it. A fix that folded the two together would report 12 here.
@@ -1985,7 +1985,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews).toHaveLength(1);
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain(
-      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `status: failed`, PEN-3442): 12",
+      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `status` and `livenessState` both `failed`, PEN-3442): 12",
     );
   });
 
@@ -1994,8 +1994,9 @@ describeEmbeddedPostgres("productivity review service", () => {
   // executed, FINISHED, and stayed silent is still assignee behaviour and must
   // still accumulate. Without this, a predicate that also caught ordinary
   // silent runs would pass the two tests above while deleting the detector.
-  // The two tests after this one pin the other edges: `timed_out`/`cancelled`
-  // stay in the walk, and a fault-terminated run that commented still breaks it.
+  // The three tests after this one pin the other edges: `timed_out`/`cancelled`
+  // stay in the walk, a `failed` run whose liveness has not been classified yet
+  // stays in too, and a fault-terminated run that commented still breaks it.
   //
   // The fixture is the production-faithful default (`succeeded` /
   // `livenessState: "advanced"`).
@@ -2019,7 +2020,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain(
-      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `status: failed`, PEN-3442): 0",
+      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `status` and `livenessState` both `failed`, PEN-3442): 0",
     );
   });
 
@@ -2060,7 +2061,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain(
-      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `status: failed`, PEN-3442): 0",
+      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `status` and `livenessState` both `failed`, PEN-3442): 0",
     );
   });
 
@@ -2103,7 +2104,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain(
-      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it \u2014 `status: failed`, PEN-3442): 0",
+      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it \u2014 `status` and `livenessState` both `failed`, PEN-3442): 0",
     );
   });
 
@@ -2277,7 +2278,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
     expect(reviews[0]?.description).toContain(
-      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `status: failed`, PEN-3442): 10",
+      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `status` and `livenessState` both `failed`, PEN-3442): 10",
     );
   });
 
@@ -2480,7 +2481,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
     expect(reviews[0]?.description).toContain(
-      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `status: failed`, PEN-3442): 10",
+      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it — `status` and `livenessState` both `failed`, PEN-3442): 10",
     );
   });
 
