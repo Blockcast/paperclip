@@ -107,6 +107,8 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
     description?: string | null;
     executionState?: Record<string, unknown> | null;
     monitorNextCheckAt?: Date | null;
+    monitorAttemptCount?: number;
+    executionPolicy?: Record<string, unknown> | null;
   }) {
     const id = randomUUID();
     await db.insert(issues).values({
@@ -122,6 +124,8 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
       originFingerprint: "default",
       executionState: input.executionState ?? null,
       monitorNextCheckAt: input.monitorNextCheckAt ?? null,
+      monitorAttemptCount: input.monitorAttemptCount ?? 0,
+      executionPolicy: input.executionPolicy ?? null,
     });
     return id;
   }
@@ -470,6 +474,53 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
     await reconcileStrandedBlockedIssues(db);
 
     expect(await statusOf(overdue)).toBe("todo");
+  });
+
+  // Called directly because `reconcileStrandedBlockedIssues` cannot reach this: its candidate
+  // predicate drops every future `nextCheckAt` before `monitor_gate` runs, so a constant
+  // `false` suppression passes every sweep-level test above. The three eager trigger paths
+  // have no such filter, so the liveness test here is their whole behaviour. It must match
+  // `hasValidBlockerMonitor` on all three conditions: a future `nextCheckAt` is not enough
+  // once the policy `timeoutAt` has passed or the attempts are spent.
+  it("suppresses as monitor_gate only while the gateSignals monitor is still a valid wake", async () => {
+    const { companyId } = await createCompany("SBMG");
+    const gateState = { monitor: { status: "scheduled", gateSignals: ["pr:example/repo#3:review"] } };
+    const hourMs = 3_600_000;
+    const insertGated = (identifier: string, fields: Partial<Parameters<typeof insertIssue>[0]>) =>
+      insertIssue({ companyId, identifier, status: "blocked", executionState: gateState, ...fields });
+
+    const live = await insertGated("SBMG-1", {
+      monitorNextCheckAt: new Date(Date.now() + hourMs),
+      monitorAttemptCount: 1,
+      executionPolicy: { monitor: { timeoutAt: new Date(Date.now() + 24 * hourMs).toISOString(), maxAttempts: 3 } },
+    });
+    const cleared = await insertGated("SBMG-2", {
+      monitorNextCheckAt: null,
+      executionState: {
+        monitor: { status: "cleared", clearReason: "trigger_stalled", gateSignals: ["pr:example/repo#3:review"] },
+      },
+    });
+    const overdue = await insertGated("SBMG-3", { monitorNextCheckAt: new Date(Date.now() - hourMs) });
+    const timedOut = await insertGated("SBMG-4", {
+      monitorNextCheckAt: new Date(Date.now() + 24 * hourMs),
+      executionPolicy: { monitor: { timeoutAt: new Date(Date.now() - hourMs).toISOString() } },
+    });
+    const exhausted = await insertGated("SBMG-5", {
+      monitorNextCheckAt: new Date(Date.now() + hourMs),
+      monitorAttemptCount: 3,
+      executionPolicy: { monitor: { maxAttempts: 3 } },
+    });
+
+    const suppressed = await listBlockedIssueAutoResumeSuppressions(
+      db,
+      companyId,
+      [live, cleared, overdue, timedOut, exhausted],
+      { triggerPath: "eager_status_recompute" },
+    );
+
+    expect(suppressed.get(live)).toMatchObject({ reason: "monitor_gate" });
+    const deadWakes = { cleared, overdue, timedOut, exhausted };
+    expect(Object.entries(deadWakes).filter(([, id]) => suppressed.has(id)).map(([name]) => name)).toEqual([]);
   });
 
   // BLO-30445: the matched pair is the whole point. Asserting only that the declared row
