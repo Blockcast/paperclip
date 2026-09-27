@@ -676,6 +676,21 @@ export const ENV_NAME_CLASSIFICATION: readonly EnvNameClassification[] = [
     reason: "Must be readable off the pod spec — it is the first thing checked when session resume misbehaves.",
   },
   {
+    name: "BASH_ENV",
+    classification: "SAFE_LITERAL",
+    reason: "Runtime-cache path of the RLIMIT_DATA cap file bash sources for tool-spawned children (BLO-34477); a filename, no credential material.",
+  },
+  {
+    name: "ZDOTDIR",
+    classification: "SAFE_LITERAL",
+    reason: "Runtime-cache directory of the zsh dotfile stubs that apply the tool-child RLIMIT_DATA cap and chain to $HOME (BLO-34477); a path, no credential material.",
+  },
+  {
+    name: "SHLVL",
+    classification: "SAFE_LITERAL",
+    reason: "Set to 2 so bash does not take its rshd/sshd startup branch and therefore honours $BASH_ENV for tool children (BLO-34477); a shell nesting counter, no credential material.",
+  },
+  {
     name: "CLAUDE_CONFIG_DIR",
     classification: "SAFE_LITERAL",
     reason: "Path to the run's Claude config dir under the isolation root.",
@@ -1067,6 +1082,39 @@ function buildEnvVars(
   // HOME must live on the mounted data PVC to enable session resume. Isolated
   // mode scopes Claude config/cache/session state away from shared /paperclip.
   merged.HOME = isolation.enabled ? isolation.homeRoot : "/paperclip";
+  // BLO-34477: zsh sources $ZDOTDIR/.zshenv on every start, and bash sources
+  // $BASH_ENV on a non-interactive start ONLY when it does not take its
+  // rshd/sshd branch, so every Bash-tool command picks up the RLIMIT_DATA cap
+  // the write-prompt init container wrote onto the runtime-cache emptyDir.
+  // POSIX `sh` (dash on this image) reads neither, so the `sh -c` that launches
+  // `claude` — and therefore `claude` itself — is not capped.
+  //
+  // SHLVL=2 is load-bearing, not cosmetic. bash's run_startup_files() treats a
+  // shell as "run by rshd/sshd" when isnetconn(fileno(stdin)) && SHLVL < 2; on
+  // that branch it sources ~/.bashrc and RETURNS BEFORE $BASH_ENV is consulted.
+  // libuv allocates child stdio with socketpair(), so fd 0 of anything Claude
+  // Code spawns is a socket and the test always passes — meaning that without
+  // this variable the BASH_ENV arm is dead for a bash tool shell and the cap is
+  // advertised but never applied. Measured in the agent image and on a second
+  // host (bash 5.2.21/5.2.37): socket stdin + SHLVL unset -> `ulimit -d`
+  // unlimited; the same spawn with SHLVL=2 -> capped. Do not delete this as a
+  // redundant assignment. Today's image uses zsh as the tool shell, so the
+  // ZDOTDIR arm already covers it and this closes the bash-tool-shell case.
+  //
+  // Not an off-by-one: bash increments SHLVL during initialisation, before
+  // run_startup_files() evaluates `shell_level < 2`, so a shipped 1 already
+  // clears the branch (measured: child reports shlvl=2). 2 is for margin —
+  // do not "correct" it to 1.
+  //
+  // Clearing that branch also stops bash sourcing ~/.bashrc, so BASH_ENV points
+  // at a bash-specific stub that applies the cap AND chains $HOME/.bashrc
+  // (TOOL_RLIMIT_BASHENV) rather than at rlimit.sh directly. Without that chain
+  // this fix would swap the pod's environment file for the cap instead of
+  // adding the cap to it — on a shared-HOME agent that silently drops
+  // ANTHROPIC_BASE_URL/CCROTATE_SERVE_* and the PATH entries .bashrc sets.
+  merged.BASH_ENV = TOOL_RLIMIT_BASHENV;
+  merged.ZDOTDIR = TOOL_RLIMIT_ZDOTDIR;
+  merged.SHLVL = "2";
   if (isolation.enabled) {
     merged.CLAUDE_CONFIG_DIR = `${isolation.sessionRoot}/.claude`;
     merged.XDG_CONFIG_HOME = `${isolation.sessionRoot}/.config`;
@@ -1199,6 +1247,193 @@ const DIND_WAIT_PREAMBLE =
  * manifest so misprovisioning surfaces at launch as a named, actionable
  * error instead of a scattered `Forbidden` days later.
  */
+// ---------------------------------------------------------------------------
+// BLO-34477: per-child memory ceiling for tool-spawned processes.
+//
+// Agent Job pods run under cgroup v2 with kubelet's default
+// `memory.oom.group=1`, so when the `claude` container hits its memory limit
+// the kernel SIGKILLs EVERY process in the container as a group — the run dies
+// (exit 137 / OOMKilled) even when the culprit was a single runaway child.
+// Claude Code's Bash tool backgrounds, rather than kills, a command that
+// exceeds its timeout, so one pathological grep/node/python can walk the whole
+// cgroup to its limit unobserved (12 pods >5 GiB in 24 h; typical is ~0.5 GiB).
+//
+// The fix bounds each child, not the container: every shell the agent spawns
+// applies RLIMIT_DATA (`ulimit -d`) from a file the init container writes onto
+// the per-pod runtime-cache emptyDir, which both containers mount. zsh reads
+// `$ZDOTDIR/.zshenv` on every start, and bash reads `$BASH_ENV` on a
+// non-interactive start — but only off its rshd/sshd branch, which is why the
+// claude container also sets `SHLVL=2` (see the env builder: socket stdin from
+// libuv + SHLVL < 2 makes bash source ~/.bashrc and return before BASH_ENV, so
+// without SHLVL the bash arm delivers nothing). Together they bind every
+// Bash-tool command, and the cap is inherited by its descendants — but NOT by
+// the already-running `claude` process, which is exec'd from `sh -c` (dash on
+// this image; POSIX sh reads neither variable). A runaway child now fails alone
+// with ENOMEM, and the model sees a real error instead of a silent orphan.
+//
+// Why the emptyDir and not `$HOME/.zshenv`: HOME may be a persistent, shared
+// PVC path (legacy shared mode), a per-run runtime-cache path, or — with a
+// custom `workspaceMountPath` — a path the init container cannot even see.
+// The emptyDir is per-pod, always mounted in both containers, and dies with
+// the pod, so the cap is rewritten fresh every run with no marker, no shared
+// file to race on, and no stale value to un-append. The ZDOTDIR stubs chain to
+// the user's own `$HOME/.z*` files, and the `BASH_ENV` stub chains
+// `$HOME/.bashrc`, so nothing an agent relies on is lost — the cap is added to
+// the environment HOME would have given it, not substituted for it.
+//
+// RLIMIT_DATA rather than RLIMIT_AS: `claude` maps ~73 GiB of virtual address
+// space (V8 pointer-compression cages) against <1 GiB resident, so no `-v`
+// value that leaves node runnable is below an 8 GiB cgroup. RLIMIT_DATA counts
+// writable private anonymous mappings — actual heap growth — which is what
+// fills the cgroup.
+//
+// The default cap is half the container memory limit: the largest child plus
+// everything else in the container (bounded above by the request-sized
+// baseline, which is well under the other half) stays below the cgroup limit,
+// so the group kill cannot be reached by one child. `resources.limits.toolMemoryKb`
+// overrides it per agent; `0` disables the cap.
+// ---------------------------------------------------------------------------
+
+export const TOOL_MEMORY_LIMIT_CONFIG_KEY = "resources.limits.toolMemoryKb";
+export const TOOL_RLIMIT_DIR = `${RUNTIME_CACHE_MOUNT_PATH}/tool-rlimit`;
+/** Sourced by zsh via the `ZDOTDIR` stub, and by bash via the `bashenv.sh` stub. */
+export const TOOL_RLIMIT_FILE = `${TOOL_RLIMIT_DIR}/rlimit.sh`;
+/**
+ * `BASH_ENV` target. A bash-specific stub rather than `rlimit.sh` itself:
+ * clearing bash's rshd/sshd branch (see `SHLVL` in the env builder) also stops
+ * bash sourcing `$HOME/.bashrc`, which on a shared-HOME agent is a real file
+ * supplying `ANTHROPIC_BASE_URL`/`CCROTATE_SERVE_*`, `JAVA_HOME` and `PATH`
+ * entries. This stub applies the cap and then chains `$HOME/.bashrc`, so the
+ * agent keeps the environment it would have had from HOME alone, plus the cap —
+ * the same invariant the ZDOTDIR stubs already hold for zsh. It must be a
+ * separate file from `rlimit.sh`: the `.zshenv` stub and the POSIX-`sh` path
+ * source `rlimit.sh` directly, and chaining a bash rc inside it would pull
+ * `.bashrc` into zsh and sh.
+ */
+export const TOOL_RLIMIT_BASHENV = `${TOOL_RLIMIT_DIR}/bashenv.sh`;
+/** `ZDOTDIR` for the claude container; holds chaining stubs for every zsh dotfile. */
+export const TOOL_RLIMIT_ZDOTDIR = `${TOOL_RLIMIT_DIR}/zdotdir`;
+/** Every dotfile zsh looks up under ZDOTDIR; each stub defers to `$HOME/<name>`. */
+export const ZSH_DOTFILES = [".zshenv", ".zprofile", ".zshrc", ".zlogin", ".zlogout"] as const;
+
+const MEMORY_QUANTITY_RE = /^([0-9]+)(Ki|Mi|Gi|Ti|Pi|k|M|G|T|P)?$/;
+const MEMORY_UNIT_BYTES: Record<string, number> = {
+  "": 1,
+  Ki: 1024,
+  Mi: 1024 ** 2,
+  Gi: 1024 ** 3,
+  Ti: 1024 ** 4,
+  Pi: 1024 ** 5,
+  k: 1e3,
+  M: 1e6,
+  G: 1e9,
+  T: 1e12,
+  P: 1e15,
+};
+
+/**
+ * Parse an integer Kubernetes memory quantity (`8Gi`, `6144Mi`, `2G`, plain
+ * bytes) to whole KiB. Fractional quantities (`1.5Gi`) and the `m`
+ * (milli) suffix are rejected: the value feeds `ulimit -d`, which takes
+ * integer KiB, and a memory limit expressed that way is an operator error
+ * worth surfacing at manifest-build time rather than rounding silently.
+ */
+export function parseMemoryQuantityToKiB(raw: string, field: string): number {
+  const match = MEMORY_QUANTITY_RE.exec(raw.trim());
+  if (!match) {
+    throw new Error(`${field} must be an integer Kubernetes memory quantity such as 8Gi or 6144Mi: ${raw}`);
+  }
+  const kib = Math.floor((Number(match[1]) * MEMORY_UNIT_BYTES[match[2] ?? ""]) / 1024);
+  if (!Number.isSafeInteger(kib) || kib <= 0) {
+    throw new Error(`${field} must be at least 1Ki: ${raw}`);
+  }
+  return kib;
+}
+
+/**
+ * Resolve the RLIMIT_DATA cap (KiB) applied to tool-spawned children. Unset
+ * derives half of the container memory limit; an explicit non-negative integer
+ * (number or digit string) wins; `0` disables the cap. A malformed explicit
+ * value throws — it is interpolated into a shell command, so only digits may
+ * pass. A container limit this derivation cannot read (a legal but fractional
+ * Kubernetes quantity such as `1.5Gi`, or a unit outside the parser) is NOT a
+ * reason to refuse the Job: that limit was already valid before this cap
+ * existed and the cluster still enforces it. It degrades to no cap (`0`) with
+ * a warning so the operator can pin `toolMemoryKb` explicitly.
+ */
+export function resolveToolMemoryLimitKb(
+  config: Record<string, unknown>,
+  containerMemoryLimit: string,
+  warn: (message: string) => void = (message) => console.warn(message),
+): number {
+  const raw = config[TOOL_MEMORY_LIMIT_CONFIG_KEY];
+  if (raw === undefined || raw === null || (typeof raw === "string" && raw.trim() === "")) {
+    try {
+      return Math.floor(parseMemoryQuantityToKiB(containerMemoryLimit, "resources.limits.memory") / 2);
+    } catch (error) {
+      warn(
+        `resources.limits.memory=${JSON.stringify(containerMemoryLimit)} cannot be halved into a tool RLIMIT_DATA cap ` +
+          `(${error instanceof Error ? error.message : String(error)}); running tool children with no RLIMIT_DATA cap. ` +
+          `Set ${TOOL_MEMORY_LIMIT_CONFIG_KEY} (KiB) explicitly to cap them.`,
+      );
+      return 0;
+    }
+  }
+  const value =
+    typeof raw === "number"
+      ? raw
+      : typeof raw === "string" && /^[0-9]+$/.test(raw.trim())
+        ? Number(raw.trim())
+        : Number.NaN;
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${TOOL_MEMORY_LIMIT_CONFIG_KEY} must be a non-negative integer number of KiB (0 disables the cap): ${String(raw)}`);
+  }
+  return value;
+}
+
+/**
+ * Shell lines for the write-prompt init container (busybox `sh`) that install
+ * the cap under `dir` (the runtime-cache emptyDir, mounted by both containers):
+ *
+ *  1. `<dir>/rlimit.sh` — the `ulimit -d` line (or a "disabled" comment when
+ *     the cap is 0, so the stubs always point at a readable file).
+ *  2. `<dir>/bashenv.sh` — the `BASH_ENV` target: sources rlimit.sh, then the
+ *     user's `$HOME/.bashrc`. Separate from rlimit.sh because zsh and POSIX sh
+ *     source that file directly and must not pull in a bash rc.
+ *  3. `<dir>/zdotdir/.zshenv` — sources rlimit.sh, then the user's
+ *     `$HOME/.zshenv`. The other zsh dotfiles get pure chaining stubs so an
+ *     interactive/login zsh under `ZDOTDIR` behaves exactly as it would with
+ *     HOME alone. `$HOME` is deliberately left unexpanded: the shell that
+ *     sources the stub resolves it.
+ *
+ * Everything is rewritten unconditionally: the emptyDir is per-pod, so there is
+ * no earlier state to preserve and a changed cap takes effect on the next run.
+ */
+export function buildToolRlimitInitShell(dir: string, limitKb: number): string[] {
+  const q = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
+  const rlimitFile = `${dir}/rlimit.sh`;
+  const bashenvFile = `${dir}/bashenv.sh`;
+  const zdotdir = `${dir}/zdotdir`;
+  const rlimitLines = [
+    "# paperclip claude_k8s (BLO-34477): RLIMIT_DATA cap for tool-spawned children so a runaway fails alone with ENOMEM instead of the cgroup OOM-killing the whole run. Rewritten by the write-prompt init container on every run.",
+    limitKb > 0 ? `ulimit -d ${limitKb} 2>/dev/null || true` : `# cap disabled (${TOOL_MEMORY_LIMIT_CONFIG_KEY}=0)`,
+  ];
+  const chain = (name: string) => `if [ -r "$HOME/${name}" ]; then . "$HOME/${name}"; fi`;
+  const parts = [
+    `mkdir -p ${q(zdotdir)}`,
+    `printf '%s\\n' ${rlimitLines.map(q).join(" ")} > ${q(rlimitFile)}`,
+    // Cap first, then the user's own .bashrc — SHLVL=2 means bash no longer
+    // reads it on its own, so without this chain the fix would silently strip
+    // the pod's environment file from a directly-spawned bash.
+    `printf '%s\\n' ${[`. ${q(rlimitFile)}`, chain(".bashrc")].map(q).join(" ")} > ${q(bashenvFile)}`,
+  ];
+  for (const name of ZSH_DOTFILES) {
+    const lines = name === ".zshenv" ? [`. ${q(rlimitFile)}`, chain(name)] : [chain(name)];
+    parts.push(`printf '%s\\n' ${lines.map(q).join(" ")} > ${q(`${zdotdir}/${name}`)}`);
+  }
+  return parts;
+}
+
 export function resolveServiceAccountName(config: Record<string, unknown>): string {
   const perAgent = asString(config.serviceAccountName, "").trim();
   if (perAgent) return perAgent;
@@ -1969,6 +2204,13 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       : []),
     `mkdir -p ${browserChromeDir} ${browserMetricsTargetQ}`,
     `[ -L ${browserMetricsLink} ] || { rm -rf ${browserMetricsLink}; ln -sfn ${browserMetricsTargetQ} ${browserMetricsLink}; }`,
+  );
+  // BLO-34477: install the tool-child RLIMIT_DATA cap onto the runtime-cache
+  // emptyDir. Both containers mount it at RUNTIME_CACHE_MOUNT_PATH (see
+  // initVolumeMounts below and the main container's volumeMounts), and the
+  // claude container's BASH_ENV / ZDOTDIR point at what is written here.
+  initCommandParts.push(
+    ...buildToolRlimitInitShell(TOOL_RLIMIT_DIR, resolveToolMemoryLimitKb(config, containerResources.limits?.memory ?? "")),
   );
   // The `data` volume is declared unconditionally above (PVC-backed, or an
   // `emptyDir` when no claim is configured), so this mount needs no condition
