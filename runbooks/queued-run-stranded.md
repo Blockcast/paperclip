@@ -491,7 +491,7 @@ exists in this repo. So "the fleet alert already covers user-visible impact"
 is true only in the fleet regime.
 
 That is a deliberate trade, not an oversight, and the evidence supports it:
-solo holds are measured to **cycle** (175 resets/6h — acquired and released
+the solo hold measured **cycled** (175 resets/6h — acquired and released
 about every 2 minutes), and the founding 2026-09-15/16 incident was five
 agents, so the retuned expression would have caught it. The residual is the
 case never yet observed: one agent, monotonic, indefinite. **On Blockcast's
