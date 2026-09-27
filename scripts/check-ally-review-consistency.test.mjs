@@ -165,6 +165,25 @@ describe("hasStillPresentDisposition", () => {
       false,
     );
   });
+
+  // BLO-36903 AC5. This auditor and the merge gate
+  // (server/src/services/ally-review-detection.ts) must agree on every verb, and
+  // they model the vocabulary differently: the gate enumerates all four kinds,
+  // while this script tests only for the blocking one and treats everything
+  // else as non-blocking. Agreement on `tracked` therefore comes for free — but
+  // "for free" is exactly the kind of claim that stops being true silently, so
+  // it is pinned rather than argued. `classifyPriorDisposition("tracked")` is
+  // `defers`, not `blocks`; if someone ever adds a second blocking verb there,
+  // this assertion is what fails here instead of the two parsers diverging in
+  // production, which is the BLO-31730 failure class.
+  it("does NOT treat a tracked disposition as blocking", () => {
+    assert.equal(
+      hasStillPresentDisposition(
+        "- **prior:354d5b9 important 1** — tracked — accepted onto the follow-up issue",
+      ),
+      false,
+    );
+  });
 });
 
 describe("attestedHead", () => {
