@@ -1,4 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+// PEN-3314: deliberately the real metrics module, not a mock — see the
+// recovery-chain series test below for why a spy would not prove anything.
+import {
+  HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC,
+  HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC,
+  HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC,
+  HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC,
+  renderMetrics,
+} from "../services/metrics.js";
 
 const ORIGINAL_PAPERCLIP_API_URL = process.env.PAPERCLIP_API_URL;
 const ORIGINAL_PAPERCLIP_RUNTIME_API_URL = process.env.PAPERCLIP_RUNTIME_API_URL;
@@ -1455,6 +1464,122 @@ describe("startServer feedback export wiring", () => {
       );
       await tickUntilTailRuns(3);
       await tickUntilTailRuns(4);
+    } finally {
+      releaseTail?.();
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  // PEN-3314: the latch above is deployed and, until this, exported nothing.
+  // That is the actual finding on that row — a recurrence of the heap leak the
+  // latch was deployed against is currently UNDETECTABLE, because the only
+  // evidence the chain is overrunning was a log line nobody alerts on.
+  //
+  // This asserts against the rendered `/metrics` body rather than a spy on the
+  // recorder functions. A spy would pass with the metric registered but never
+  // exported, which is precisely the failure being fixed: the question is not
+  // "was the recorder called" but "does the series reach the endpoint an alert
+  // reads". `../services/metrics.js` is deliberately left unmocked for that.
+  //
+  // ⚠️ Like every other `setInterval`-spying test in this file, this one only
+  // passes as part of a whole-file run. The spy returns a bare number, and
+  // `startEventLoopStallLogging` calls `.unref()` on what `setInterval` returns
+  // — survivable only because an earlier, unmocked `startServer()` has already
+  // latched that module's `activeStop` singleton (event-loop-stall-log.ts:70),
+  // so this call returns early and never reaches `unref`. Running this test
+  // alone with `-t` makes the mocked call the first one and fails on
+  // `timer.unref is not a function`. That is the harness, not a regression.
+  it("exports recovery-chain skip, in-flight and duration series as the latch drives them", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    const idleReconcile = {
+      assignmentDispatched: 0,
+      dispatchRequeued: 0,
+      continuationRequeued: 0,
+      successfulRunHandoffEscalated: 0,
+      escalated: 0,
+      skipped: 0,
+      issueIds: [],
+    };
+
+    // Read one unlabeled series out of the exposition body. Returns null when
+    // the series is absent, so "absent" and "zero" stay distinguishable — the
+    // whole point of the zero-initialization these metrics rely on.
+    const readSeries = async (metric: string): Promise<number | null> => {
+      const { body } = await renderMetrics();
+      const line = body
+        .split("\n")
+        .find((candidate) => candidate.startsWith(`${metric} `));
+      return line ? Number(line.slice(metric.length + 1)) : null;
+    };
+
+    let releaseTail: (() => void) | null = null;
+    try {
+      await startServer();
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalledTimes(1));
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockClear();
+      heartbeatServiceMock.resumeQueuedRuns.mockClear();
+
+      // Every series must already exist. An alert of the documented form
+      // ("inflight > heartbeatSchedulerIntervalMs") never evaluates against an
+      // absent series, so a worker whose FIRST chain wedges would be silent
+      // exactly when it matters most.
+      expect(await readSeries(HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC)).not.toBeNull();
+      expect(await readSeries(HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC)).not.toBeNull();
+      expect(await readSeries(HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC)).not.toBeNull();
+      expect(await readSeries(HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC)).not.toBeNull();
+
+      const skippedBefore = (await readSeries(HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC)) ?? 0;
+
+      // Park the tail so it is still in flight when the next tick fires.
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockImplementationOnce(
+        () => new Promise((resolve) => {
+          releaseTail = () => resolve(idleReconcile);
+        }),
+      );
+
+      intervalCallback?.();
+      await vi.waitFor(() => expect(releaseTail).not.toBeNull());
+      await vi.waitFor(() => expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledTimes(1));
+
+      // A tick that STARTS a pass is not a skip. Without this the counter would
+      // be satisfied by incrementing on every tick, which would make the
+      // "chain is overrunning" signal indistinguishable from "the worker is up".
+      expect(await readSeries(HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC)).toBe(skippedBefore);
+
+      // Second tick with the tail still parked: this one IS a skip.
+      intervalCallback?.();
+      await vi.waitFor(() => expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledTimes(2));
+      expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalledTimes(1);
+
+      expect(await readSeries(HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC)).toBe(skippedBefore + 1);
+      // Still well inside the 10-tick stall threshold, so the skip must NOT be
+      // reported as a stall. These two mean different things: a skip is the
+      // chain running slow, a stall is it having stopped settling altogether,
+      // and only the second is a page.
+      expect(await readSeries(HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC)).toBe(0);
+
+      // The pass settles: the in-flight gauge must return to 0, or the overlap
+      // alert keeps firing against a worker that has already recovered.
+      releaseTail?.();
+      releaseTail = null;
+      await vi.waitFor(async () => {
+        expect(await readSeries(HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC)).toBe(0);
+      });
+      const duration = await readSeries(HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC);
+      expect(duration).not.toBeNull();
+      expect(duration).toBeGreaterThanOrEqual(0);
     } finally {
       releaseTail?.();
       setIntervalSpy.mockRestore();
