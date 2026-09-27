@@ -15,6 +15,9 @@ import {
   scanTestPatterns,
   scanSensitivePaths,
   startScriptWatchdog,
+  SCRIPT_WATCHDOG_MS,
+  WATCHDOG_RETRY_RESERVE_MS,
+  watchdogBoundFetch,
   syncDraftAdvisory,
   validateSensitivePaths,
 } from '../check-pr-security.mjs';
@@ -599,4 +602,23 @@ test('ghFetch: aborts the request when the per-call timeout elapses', async () =
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+// ── watchdogBoundFetch ───────────────────────────────────────────────────────
+
+test('watchdogBoundFetch: a read gets only the retry budget left before the watchdog', async () => {
+  const seen = [];
+  const fetchImpl = async (path, token, options) => { seen.push(options); return {}; };
+  let clock = 1_000;
+  const gh = watchdogBoundFetch(1_000, fetchImpl, () => clock);
+  const signal = new AbortController().signal;
+
+  clock = 1_000 + 30_000;
+  await gh('/repos/o/r/pulls/1', 'tok', { signal });
+  assert.equal(seen[0].retryBudgetMs, SCRIPT_WATCHDOG_MS - WATCHDOG_RETRY_RESERVE_MS - 30_000);
+  assert.equal(seen[0].signal, signal, 'caller options still pass through');
+
+  clock = 1_000 + SCRIPT_WATCHDOG_MS;
+  await gh('/repos/o/r/pulls/1', 'tok');
+  assert.equal(seen[1].retryBudgetMs, 0, 'no budget once the watchdog deadline has passed');
 });

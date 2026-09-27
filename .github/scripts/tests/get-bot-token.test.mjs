@@ -6,6 +6,7 @@ import {
   RATE_LIMIT_RETRY_BUDGET_MS,
   exitFatal,
   ghFetch,
+  rateLimitWaitMs,
   resolveInstallationId,
 } from '../get-bot-token.mjs';
 
@@ -128,6 +129,37 @@ test('ghFetch: does NOT retry a write, on a 5xx or a rate limit (BLO-19827: no i
     } finally {
       h.restore();
     }
+  }
+});
+
+test('rateLimitWaitMs: a reset at or behind our clock waits the floor, never zero', () => {
+  const now = 1_700_000_000_000;
+  for (const resetMs of [now - 5_000, now]) {
+    const headers = new Headers({ 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(resetMs / 1000) });
+    assert.equal(rateLimitWaitMs(headers, now), RATE_LIMIT_MIN_WAIT_MS, `reset ${resetMs - now}ms from now`);
+  }
+});
+
+test('ghFetch: an abort during a rate-limit wait ends the wait at once', { timeout: 5_000 }, async () => {
+  const h = harness([response(429, { body: '{"message":"You have exceeded a secondary rate limit"}' })]);
+  const controller = new AbortController();
+  const reason = new Error('advisory budget expired');
+  setTimeout(() => controller.abort(reason), 20);
+  const startedAt = Date.now();
+  // Settles only on abort, as node:timers/promises does for a pending delay. If
+  // ghFetch drops the signal this never settles and the test times out.
+  const sleep = (ms, _value, { signal } = {}) => new Promise((_, reject) => {
+    signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+  });
+  try {
+    await assert.rejects(ghFetch('/repos/o/r/pulls/1', 'tok', { signal: controller.signal, sleep }), err => {
+      assert.equal(err, reason);
+      return true;
+    });
+    assert.ok(Date.now() - startedAt < 1_000, `waited ${Date.now() - startedAt}ms after the abort`);
+    assert.equal(h.calls.length, 1, 'an aborted wait must not re-request');
+  } finally {
+    h.restore();
   }
 });
 
