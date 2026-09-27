@@ -66,6 +66,13 @@ import {
   reconcileAdapterAvailability,
 } from "./services/adapter-registry-bootstrap.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
+import { createSingleFlightGate } from "./services/single-flight-gate.js";
+import {
+  recordHeartbeatRecoveryChainDuration,
+  recordHeartbeatRecoveryChainInflight,
+  recordHeartbeatRecoveryChainSkipped,
+  recordHeartbeatRecoveryChainStalled,
+} from "./services/metrics.js";
 import { summarizeStrandedRecoveryHandBackPass } from "./services/recovery/service.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
@@ -1133,15 +1140,50 @@ export async function startServer(): Promise<StartedServer> {
   // The latch inherits `crashReconcileSweepInFlight`'s failure mode: a pass that
   // HANGS rather than rejects never clears it, and periodic recovery then stops
   // estate-wide until restart with no output at all — the symptom is an absence.
-  // `heartbeatRecoveryChainStartedAt` makes that absence visible. It is not a
-  // timeout: clearing the latch without cancelling the work would re-admit the
-  // overlap the latch exists to remove, so this reports and does not act.
-  let heartbeatRecoveryChainInFlight = false;
-  let heartbeatRecoveryChainStartedAt = 0;
+  // `stallAfterMs` makes that absence visible. It is not a timeout: clearing the
+  // latch without cancelling the work would re-admit the overlap the latch exists
+  // to remove, so this reports and does not act.
+  //
+  // PEN-3314: the latch is `createSingleFlightGate` rather than a pair of local
+  // `let`s so the skip/duration/in-flight/stall signals reach `/metrics`. The
+  // behaviour is unchanged — same skip semantics, same report-don't-clear stall
+  // handling — but a log line is not an instrument: the worker pod is recreated
+  // often enough that a retrospective log read silently resolves to whatever
+  // survived the last recreation, which is why the heap regression this latch
+  // was deployed against went 10 days unattributed.
   // 10 ticks. Above the normal case (a sweep routinely outlives one interval —
   // that is what the latch is for) and far below the hours a wedged chain would
   // otherwise sit silent.
   const HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS = 10 * config.heartbeatSchedulerIntervalMs;
+  const heartbeatRecoveryChainGate = createSingleFlightGate({
+    stallAfterMs: HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS,
+    onSkip: (elapsedMs) => {
+      recordHeartbeatRecoveryChainSkipped();
+      // How long the pass a tick just yielded to has been running. This is the
+      // series PEN-3365 sizes a `statement_timeout` against, so it is recorded
+      // on the skip (where the elapsed time is observable) rather than only at
+      // settle (which a wedged pass never reaches).
+      recordHeartbeatRecoveryChainInflight(elapsedMs);
+    },
+    onSettled: (durationMs) => {
+      recordHeartbeatRecoveryChainDuration(durationMs);
+      // Nothing is outstanding now; leaving the last skip's value on the gauge
+      // would read as a permanently wedged chain.
+      recordHeartbeatRecoveryChainInflight(0);
+    },
+    onStalled: (elapsedMs) => {
+      // Skipping is normal and silent; a chain that has been in flight for many
+      // ticks is not. Reported, not acted on — see the latch decl above.
+      recordHeartbeatRecoveryChainStalled();
+      logger.warn(
+        {
+          inFlightMs: elapsedMs,
+          warnAfterMs: HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS,
+        },
+        "periodic heartbeat recovery chain still in flight across many ticks; recovery passes are not running",
+      );
+    },
+  });
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
     let tracked: Promise<void>;
@@ -1733,7 +1775,7 @@ export async function startServer(): Promise<StartedServer> {
           // Periodically reap orphaned runs (5-min staleness threshold) and make sure
           // persisted queued work is still being driven forward.
           //
-          // Deliberately NOT under `heartbeatRecoveryChainInFlight`. These four
+          // Deliberately NOT under `heartbeatRecoveryChainGate`. These four
           // passes are the dispatch path — `resumeQueuedRuns` is what actually
           // starts a queued run — and they do not iterate the stranded
           // candidate set under `lockIssueParentMutationCompany`, which is the
@@ -1786,16 +1828,20 @@ export async function startServer(): Promise<StartedServer> {
 
           if (heartbeatSchedulerStopped) return;
 
-          // The lock-taking tail, single-flighted across ticks. Block form (not
-          // an early `return`) so a pass appended after it still runs while a
+          // The lock-taking tail, single-flighted across ticks.
+          //
+          // Scope is deliberate and is NOT the whole chain: the dispatch passes
+          // above stay unlatched for the BLO-34471 reasons recorded there.
+          // Gating them on this tail would couple dispatch to the tail's slowest
+          // pass and reproduce the symptom the latch is deployed against.
+          //
+          // `run` returns `null` on a skipped tick rather than throwing or
+          // early-returning, so a pass appended after this one still runs while a
           // chain is in flight — at 147 sequential candidates against a 30 s
           // tick, "in flight" is the steady state, so an early return would
           // make any later sibling silently dead. Matches
           // `crashReconcileSweepInFlight` above.
-          if (!heartbeatRecoveryChainInFlight) {
-            heartbeatRecoveryChainInFlight = true;
-            heartbeatRecoveryChainStartedAt = Date.now();
-            trackHeartbeatSchedulerWork(heartbeat
+          const recoveryChain = heartbeatRecoveryChainGate.run(() => heartbeat
               .reconcileStrandedAssignedIssues()
               .then(async (reconciled) => {
                 if (
@@ -1882,25 +1928,11 @@ export async function startServer(): Promise<StartedServer> {
               })
               .catch((err) => {
                 logger.error({ err }, "periodic heartbeat recovery failed");
-              })
-              .finally(() => {
-                heartbeatRecoveryChainInFlight = false;
-                heartbeatRecoveryChainStartedAt = 0;
               }));
-          } else if (
-            Date.now() - heartbeatRecoveryChainStartedAt >
-            HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS
-          ) {
-            // Skipping is normal and silent; a chain that has been in flight for
-            // many ticks is not. Reported, not acted on — see the latch decl.
-            logger.warn(
-              {
-                inFlightMs: Date.now() - heartbeatRecoveryChainStartedAt,
-                warnAfterMs: HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS,
-              },
-              "periodic heartbeat recovery chain still in flight across many ticks; recovery passes are not running",
-            );
-          }
+          // `null` means the gate skipped this tick, so there is nothing for the
+          // shutdown drain to wait on. The skip, the duration and the stall are
+          // recorded by the gate's callbacks, not here.
+          if (recoveryChain) trackHeartbeatSchedulerWork(recoveryChain);
         }
       })();
     }, config.heartbeatSchedulerIntervalMs);
