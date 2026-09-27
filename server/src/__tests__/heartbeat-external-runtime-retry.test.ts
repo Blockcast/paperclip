@@ -119,6 +119,8 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
   let db!: ReturnType<typeof createDb>;
   let heartbeat!: ReturnType<typeof heartbeatService>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  // PEN-2400: installed by the dispatch-failure test only; see beforeAll.
+  let queuedDispatchFailureForTest: ((agentId: string) => void) | null = null;
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("heartbeat-external-runtime-retry-");
@@ -127,6 +129,13 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       penstockAvailabilityGate: {
         checkAdapter: async () => ({ allow: true }),
         _resetForTesting() {},
+      },
+      // PEN-2400: seam for making a queued-run dispatch reject. Inert unless a
+      // test installs `queuedDispatchFailureForTest`; every DB-shaped dispatch
+      // failure is an early `return []` rather than a rejection, so this hook is
+      // the only way to exercise the throwing branch.
+      beforeQueuedDispatchPassForTest: async (input) => {
+        queuedDispatchFailureForTest?.(input.agentId);
       },
     });
     // afterEach only re-arms the passthrough for the *next* test -- without
@@ -141,6 +150,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
   }, 120_000);
 
   afterEach(async () => {
+    queuedDispatchFailureForTest = null;
     mockAdapterExecute.mockReset();
     mockListAgentJobRunStatuses.mockReset().mockResolvedValue(null);
     mockListLiveAgentJobRunIds.mockReset().mockResolvedValue(null);
@@ -185,6 +195,19 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       .split("\n")
       .find((row) =>
         row.startsWith("paperclip_external_runtime_reservation_strand_metrics_refresh_success "));
+    if (!line) return null;
+    const value = Number(line.trim().split(/\s+/).at(-1));
+    return Number.isFinite(value) ? value : null;
+  }
+
+  // PEN-2400: the sibling gauge for the reconciliation sweep itself (BLO-21460).
+  // 1 = the sweep drained its backlog; 0 = at least one row failed, so the four
+  // backlog gauges must not be read as a healthy 0.
+  async function readOrphanedRuntimeResourceRefreshSuccess(): Promise<number | null> {
+    const { body } = await renderMetrics();
+    const line = body
+      .split("\n")
+      .find((row) => row.startsWith("paperclip_orphaned_runtime_resource_metrics_refresh_success "));
     if (!line) return null;
     const value = Number(line.trim().split(/\s+/).at(-1));
     return Number.isFinite(value) ? value : null;
@@ -1531,6 +1554,63 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
 
     expect(reservation.releasedAt).toBeNull();
     expect(reservation.state).toBe("launched");
+  }, 120_000);
+
+  /**
+   * PEN-2400 (Ally non-blocking 1 on PR #1195).
+   *
+   * `startNextQueuedRunForAgent` is called unguarded at every other site in
+   * heartbeat.ts, and correctly so — those are single-subject paths whose caller
+   * owns the failure. The reservation reconciler is the exception: it runs inside
+   * a per-reservation batch loop whose `catch` means "this reservation may still
+   * be held", incrementing `failedRowCount` and driving the
+   * `paperclip_orphaned_runtime_resource_metrics_refresh_success` gauge to 0.
+   *
+   * By the dispatch line the release has already COMMITTED — the slot is free.
+   * So a dispatch failure landing in that catch reports a reservation-backlog
+   * failure that did not happen, on a sweep that in fact drained the row. The
+   * gauge assertion below is the discriminator: with the unguarded `await` it
+   * reads 0, with the `.catch()` it reads 1.
+   */
+  it("reports a released slot as drained even when the follow-on queued dispatch throws (PEN-2400)", async () => {
+    const { runId, agentId } = await seedLaunchedReservationForTerminalRun({
+      runStatus: "interrupted",
+      slotId: 3,
+    });
+
+    mockReadAgentJobRunStatusByName.mockImplementation(async (name: string) => ({
+      phase: "missing" as const,
+      reason: "NotFound",
+      message: `Kubernetes Job ${name} was not found`,
+      name,
+    }));
+
+    const dispatchAttempts: string[] = [];
+    queuedDispatchFailureForTest = (dispatchAgentId) => {
+      dispatchAttempts.push(dispatchAgentId);
+      throw new Error("simulated queued-dispatch failure (PEN-2400)");
+    };
+
+    await heartbeat.reapOrphanedRuns();
+
+    // POSITIVE CONTROL. Everything below is vacuous if the reconciler never
+    // reached the dispatch line — `startNextQueuedRunForAgent` has four early
+    // returns ahead of this hook, any of which would make the throw unreachable
+    // and the gauge read 1 for reasons that have nothing to do with the fix.
+    expect(dispatchAttempts).toContain(agentId);
+
+    const reservation = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.runId, runId))
+      .then((rows) => rows[0]);
+
+    // The release committed before the dispatch was attempted.
+    expect(reservation.releasedAt).not.toBeNull();
+    expect(reservation.state).toBe("released");
+
+    // ...so the sweep must not report itself as having failed to drain.
+    expect(await readOrphanedRuntimeResourceRefreshSuccess()).toBe(1);
   }, 120_000);
 
   // BLO-21256: audit of whether ExternalRuntimeIsolationConflictError -- the

@@ -42,7 +42,8 @@ export interface EventLoopStallLogOptions {
    * reads 0 and the stall is lost, unrecoverably. The default 1000ms leaves the
    * histogram overdue by nearly a second more, so it always wins (0 misses in
    * 26 blocks). At 50ms the two are within the resolution and ours wins ~20% of
-   * the time; only the tests go that low, and they retry the block.
+   * the time on an idle host and ~70% under CPU contention (BLO-22985); only
+   * the tests go that low, and they retry the block a bounded number of times.
    */
   sampleMs?: number;
   log?: (fields: Record<string, number>, message: string) => void;

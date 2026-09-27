@@ -32,17 +32,29 @@ Look at the `labels` array. The label name(s) tell you which evidence shapes the
 
 | Label | Required shapes |
 |---|---|
-| `frontend`, `ui`, `cms-published` | `screenshot:1440x900` + `screenshot:390x844` + `checklist:done-when` + `landing-artifact` |
-| `backend` | `test-output` + `checklist:done-when` + `landing-artifact` |
+| `frontend`, `ui`, `cms-published` | `screenshot:1440x900` + `screenshot:390x844` + `checklist:done-when` + `landing-artifact` + `review:ally-clean` |
+| `backend` | `test-output` + `checklist:done-when` + `landing-artifact` + `review:ally-clean` |
 | `infra` | `kubectl-state` + `probe-output` |
 | `cms-data-op` | `url-probe` |
-| `db-migration`, `migration` | `migration-output` + `landing-artifact` |
+| `db-migration`, `migration` | `migration-output` + `landing-artifact` + `review:ally-clean` |
 | `pr` | `pr-link` |
-| (no label or unrecognized) | `checklist:done-when` (weak default — verdict will be `warn`, not `block`) |
+| (no label or unrecognized) | `checklist:done-when` + `review:ally-clean` (weak default — see the note below on when `review:ally-clean` can block) |
 
-Multiple labels union their required sets. A `frontend + pr` issue needs all of `screenshot:1440x900`, `screenshot:390x844`, `checklist:done-when`, `landing-artifact`, `pr-link`.
+`deploy:landed` appears in no row on purpose: it is **detected but required nowhere** (CTO ruling 2026-09-17). See its section below.
 
-`infra` and `cms-data-op` intentionally do NOT require `landing-artifact`: their existing shapes already demand live, hard-to-fake state (a real `kubectl get`, a real HTTP probe), and some ops changes are legitimately applied ahead of a PR landing.
+Multiple labels union their required sets. A `frontend + pr` issue needs all of `screenshot:1440x900`, `screenshot:390x844`, `checklist:done-when`, `landing-artifact`, `review:ally-clean`, `pr-link`.
+
+`infra` and `cms-data-op` intentionally do NOT require `landing-artifact`: their existing shapes already demand live, hard-to-fake state (a real `kubectl get`, a real HTTP probe), and some ops changes are legitimately applied ahead of a PR landing. They are excluded from `review:ally-clean` for the same reason, as is `pr` — that label exists to deliver an OPEN PR for a human decision.
+
+**The two truth shapes are computed by the server, and whether a gap made only of them blocks depends on one operator flag.** With `PAPERCLIP_EVIDENCE_UNLABELED_BLOCK` off — the default — such a gap records `warn` with the `truth-gap-warn-only` diagnostic. With it on, a gap that *contains* `review:ally-clean` escalates to `block` with `unlabeled-truth-block`. A *mixed* gap is unchanged at either setting — a `frontend` issue missing its screenshots still blocks on the screenshots.
+
+Three things are never blocking, at any value of that flag:
+
+- **`deploy:landed`.** The gate blocks only on the transition INTO `in_review`, and `deploy:landed` means merged, so it is unsatisfiable at the one moment it is evaluated. That is also why it is **not a required shape on any path** (CTO ruling 2026-09-17) — it appears in no row of the table above.
+- **A failed GitHub probe** (`unlabeled-truth-block-suppressed:probe-failed`). "We could not ask GitHub" is not "GitHub says this was never reviewed".
+- **An issue with no linked pull request.** `review:ally-clean` needs a head to review; with no PR there is no head, so you could never satisfy it (CTO ruling 2026-09-16). Two diagnostics, because the populations differ: an **unlabeled** issue drops the shape from `required` outright, so it no longer holds the verdict below `pass`, and records `truth-shapes-not-required:no-linked-pull-request` — doc-only and refactor work is exactly why the unlabeled path is the weak one. The drop is not by itself a `pass`: the unlabeled path still requires `checklist:done-when`, so an issue with no criteria bullets stays `warn` on `missing-done-when-bullets` / `missing-description`. A **labeled** issue keeps it required, because its assignee can open a PR, and only has the escalation suppressed: `unlabeled-truth-block-suppressed:no-linked-pull-request`.
+
+If you are reading this because a transition was refused, the verdict's `diagnostics` names which case you are in. The flip is governed by `docs/runbooks/evidence-gate-unlabeled-block.md`.
 
 Source of truth: `server/src/services/evidence-shapes.ts` (`DEFAULT_EVIDENCE_REGISTRY`).
 
@@ -72,6 +84,28 @@ Implementation complete: https://github.com/Blockcast/paperclip/pull/774
 If you legitimately have no PR yet (e.g. you're still iterating locally), you are not ready for `in_review` — open a draft PR first. A draft PR clears *this* gate, which only asks for repo-resident evidence. It does **not** get you an automatic review: while `draft: true`, automatic reviewer wakes are suppressed, so pushing fixups to a draft never triggers one, and a draft that was neither marked ready nor explicitly submitted with the marker request has not been reviewed.
 
 To actually be reviewed, request it explicitly: post a PR comment whose **first byte** is `<!-- paperclip:review-request -->`, followed by `@ally` and your concrete review focus. That path works on drafts and ready PRs alike. A bare `@ally` from an agent reaches nobody — agent comments are authored by Ally's own bot identity, and the webhook drops self-authored alias mentions to avoid review-request loops. See the Staff Engineer / implementer instructions for "GitHub PR Review Handoff Hygiene".
+
+#### `review:ally-clean`
+
+**You cannot produce this shape by writing anything.** The server finds the pull requests Paperclip linked to this issue — every PR that references the issue identifier **anywhere**: branch, title, or body, including a bare prose mention — fetches Ally's reviews and comments, and asks the same judge the merge gate uses (`evaluateCommentReviewGate`) whether Ally's review at the PR's **current head** has zero open Critical or Important findings. Pasting a PR URL does nothing. A PR that does not name this issue at all is not this issue's PR — and, per the fourth bullet below, the converse bites harder.
+
+> **Ownership and linkage are different rules; do not substitute one for the other.** *Ownership* (branch, title, or a labeled `Fixes:`/`Closes:`/`Refs:` line) decides wakes and attribution. The truth shapes read the **wider** set, with no ownership filter — so a PR that merely mentions you counts. Reasoning from the ownership rule here rules out exactly the case most likely to hold your shape missing.
+
+Fails after you think you are done when:
+
+- **You pushed after Ally reviewed.** The attested head is now stale and the shape reverts to missing. Request review again with a comment whose first byte is `<!-- paperclip:review-request -->`.
+- **Ally left a Critical or Important finding.** Fix it, push, request again. A `COMMENTED` review with findings is not clean.
+- **Nobody has reviewed at all.** A green `gate/ally-comment-findings` status does not mean reviewed — read its description; `success` there can also mean *nothing attests to this head*. The shape reads the review surface, not the status.
+- **Another PR mentions this issue.** *Every* linked PR must be clean; the server aggregates with `every`. A PR you did not write becomes one of this issue's linked PRs if it names the identifier **anywhere** — branch, title, or body, and a bare prose mention such as an informational `Related: BLO-1234` is enough — and while that PR is unreviewed or carries findings, your shape stays missing with no signal on your own PR explaining why. Check the issue's `pull_request` work products, not just your own branch.
+- **More than five PRs are linked.** Both truth shapes are withheld entirely rather than answered from a subset, with a `too-many-linked-prs:` diagnostic. Same symptom as "not reviewed", different cause.
+
+#### `deploy:landed`
+
+Also server-computed: **every** linked PR is merged — the server aggregates with `every`, exactly as `review:ally-clean` does, and withholds both shapes entirely past the same five-PR cap. Open, draft, or closed-unmerged does not satisfy it.
+
+This shape is **not required on any path** (CTO ruling 2026-09-17) and is never blocking at the `in_review` transition — see the note under the table. Do not read it as "merge before you move to `in_review`"; `in_review` is the state work waits *for* review in. It is detected and reported through `allDetected` so the scorecards and the rollout measurement can see which issues reached review with their code already landed.
+
+"Landed" means merged, not running in production. Use the `infra` shapes for that.
 
 #### `screenshot:1440x900` and `screenshot:390x844`
 
