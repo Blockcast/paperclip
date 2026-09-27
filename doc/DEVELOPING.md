@@ -1171,11 +1171,24 @@ routes wrap `assertCompanyAccess` in a `try`/`catch` that audits `denied`, but
 that call is reached only *after* `hasCompanyAccess` has already passed, so its
 cross-tenant throws (`routes/authz.ts`) re-test a predicate that just succeeded
 and cannot fire, and its remaining throws are gated on a non-safe method. On a
-GET the one leg still live is `RESPONSIBLE_USER_UNAVAILABLE` — an agent on an
-`onBehalfOfUserId` JWT whose responsible user has no active membership in the
-company. It is deliberately not safe-method-gated (unlike its
+GET the one leg still live is `RESPONSIBLE_USER_UNAVAILABLE` — an agent actor
+carrying a responsible user whose membership in the company is not `active`.
+That is **not** a JWT-only shape: an **agent API key** carries one too, always
+(`middleware/auth.ts` refuses a key whose responsible user is missing, so every
+key actor that authenticates has one). The check itself (`routes/authz.ts`)
+gates on the actor having a responsible user at all and never reads `source`.
+It is deliberately not safe-method-gated (unlike its
 `RESPONSIBLE_USER_UNAUTHORIZED` sibling) and throws unless the opt-in shadow
 mode is on (`services/authorization.ts`). That caller is **same-company**.
+
+⚠️ **The table below describes enforce mode.** Under
+`PAPERCLIP_RESPONSIBLE_USER_AUTHZ_MODE=shadow` (or the
+`PAPERCLIP_RESPONSIBLE_USER_AUTHZ_SHADOW` boolean) that throw is suppressed,
+`assertCompanyAccess` completes, the `catch` never runs, and the
+responsible-user leg leaves every row: a same-company `denied` on
+`heartbeat.run_log_accessed` is then unambiguously an entitlement denial, and
+`workspace_operation.log_accessed` books no same-company `denied` at all. Check
+the deployment's mode before classifying against this table.
 
 | action | what `result: "denied"` covers |
 |---|---|
@@ -1186,7 +1199,8 @@ mode is on (`services/authorization.ts`). That caller is **same-company**.
 So counting "same-company unentitled reads" off `result: "denied"` folds in
 cross-tenant probes on both `heartbeat_run` and `workspace_operation` rows, and
 on `workspace_operation` rows finds no entitlement denial at all. Isolating one
-takes two filters, and neither is a plain predicate over `activity_log`:
+takes two filters, neither of which is a plain predicate over `activity_log` —
+and on one action even both together fall short, so a third source is needed:
 
 - **The row's `companyId` is the *entity's* company** (`run.companyId` /
   `operation.companyId`) — the actor's own company is nowhere on the row, whose
@@ -1195,12 +1209,32 @@ takes two filters, and neither is a plain predicate over `activity_log`:
   join — to `agents.company_id` for an agent actor, to company membership for a
   user actor — not a comparison between two columns of the row.
 - **Within same-company, `details.actorSource` finishes the job on one action
-  and only narrows it on the other.** On `workspace_operation.log_accessed`
-  there is no entitlement leg, so every same-company `denied` is
-  responsible-user-unavailable. On `heartbeat.run_log_accessed` both are
-  reachable: a non-`agent_jwt` `actorSource` is necessarily the entitlement
-  denial, while an `agent_jwt` row stays ambiguous — that actor can fail either
-  way and no field on the row separates them.
+  and does not touch the other.** On `workspace_operation.log_accessed` there
+  is no entitlement leg, so every same-company `denied` is
+  responsible-user-unavailable whatever the source says. On
+  `heartbeat.run_log_accessed` both legs are reachable and `actorSource` does
+  **not** separate them. An agent actor books `agent_jwt` or `agent_key` and
+  nothing else (`routes/authz.ts`), and both values are ambiguous: `agent_key`
+  always carries a responsible user, `agent_jwt` carries one whenever the claim
+  is signed, and either can fail either way. So a same-company `denied` on that
+  action is **not** decomposable from the row alone. Filtering it to
+  `actorSource != 'agent_jwt'` and reporting the result as unentitled
+  transcript reads promotes a responsible-user **availability** failure — an
+  offboarded owner, a stale key — into an insider **entitlement** finding.
+- **The discriminator that row lacks is in the log stream, not in
+  `activity_log`.** The responsible-user denial is not silent:
+  `throwOrShadowResponsibleUserCompanyAccessDeny` (`routes/authz.ts`) emits a
+  structured `logger.warn` *before* deciding whether to throw, carrying `code`
+  (`RESPONSIBLE_USER_UNAVAILABLE` vs `RESPONSIBLE_USER_UNAUTHORIZED`),
+  `authzMode`, `companyId`, `actorAgentId`, `responsibleUserId` and `method`.
+  Nothing on the cross-tenant or entitlement paths emits it. So correlate a
+  same-company `denied` row against that stream on `actorAgentId` +
+  `companyId` + time: a match is the responsible-user leg, no match is the
+  entitlement denial. Two caveats — it fires in shadow mode too (with
+  `authzMode: "shadow"`), where no denial row is booked to correlate against;
+  and the log stream's retention is not `activity_log`'s, so on an older row
+  the absence of a match may mean the logs aged out rather than that the
+  denial was an entitlement one.
 
 Retention follows the deployment's normal
 `activity_log` database retention and backup policy; Paperclip does not
