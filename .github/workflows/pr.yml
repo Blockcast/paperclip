@@ -161,6 +161,16 @@ jobs:
         run: node --test ./scripts/check-db-transaction-alias.test.mjs
         timeout-minutes: 1
 
+      - name: Embedded-DB packages declare their own Vitest timeouts (BLO-37114)
+        # The root --testTimeout/--hookTimeout flags in run-vitest-stable.mjs do
+        # not reach a project's resolved config under Vitest 4 `projects`
+        # (BLO-37184), so only a value in the package's own vitest.config.ts
+        # binds. Deleting one is therefore silent at the point of deletion and
+        # surfaces later as a merge-queue ejection.
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-embedded-db-vitest-timeouts.test.mjs
+        timeout-minutes: 1
+
       - name: Validate Dockerfile deps stage
         if: ${{ !cancelled() }}
         run: |
