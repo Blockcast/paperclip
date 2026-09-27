@@ -2064,6 +2064,49 @@ describeEmbeddedPostgres("productivity review service", () => {
     );
   });
 
+  // PEN-3442 and unclassified liveness. For a `failed` run the classifier only
+  // ever answers `"failed"`, so the `livenessState` conjunct changes the result
+  // only while classification has not landed: the setup-failure write is gated
+  // on the run still being `running`, and the backfill is asynchronous. Such a
+  // run stays in the walk until the classifier agrees. Under `status: "failed"`
+  // alone the two null-liveness runs below would be excluded, the streak would
+  // read 8, and no review would fire.
+  it("keeps executed failed runs whose liveness has not landed in the no_comment_streak walk (PEN-3442)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const insertNow = new Date(now.getTime() - 2 * 60 * 60 * 1000);
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS - 2,
+      now: new Date(insertNow.getTime() - 60 * 60 * 1000),
+    });
+    for (const offsetMs of [0, 5 * 60 * 1000]) {
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: 1,
+        now: new Date(insertNow.getTime() - offsetMs),
+        status: "failed",
+        livenessState: null,
+        usageJson: { inputTokens: 3399, outputTokens: 5846 },
+        logBytes: 230_532,
+      });
+    }
+
+    await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
+    expect(reviews[0]?.description).toContain(
+      "Fault-terminated runs excluded (terminal, executed a turn then killed before finishing it \u2014 `status: failed`, PEN-3442): 0",
+    );
+  });
+
   // PEN-3442 and comment evidence. `commentRunIds` holds every comment a run
   // authored, so a fault-terminated run can have commented mid-turn. Newest
   // first: 5 silent runs, one `rate_limit_exhausted` run that commented, then

@@ -2098,7 +2098,10 @@ function isNeverInvokedRun(
  *    budget, the other was stopped by an operator. Staying silent through
  *    either is the assignee behaviour this streak reports, so they stay in
  *    the walk. A null `livenessState` (classification not landed yet) also
- *    stays in, as it did before this predicate existed.
+ *    stays in: the run is excluded on the classifier's agreement, not ahead
+ *    of it, as it was before this predicate existed. For a `failed` run the
+ *    classifier only ever answers `"failed"`, so this conjunct matters only in
+ *    that window, and the null-liveness fixture in the service test pins it.
  *  - **Durability.** An error-code list drifts. The fleet measurement found the
  *    leak was *not* confined to the `rate_limit_exhausted` class the defect was
  *    filed on: a `claude_transient_upstream` run on PEN-1990 burned 32,805
