@@ -20,7 +20,18 @@ const h = vi.hoisted(() => ({
     githubAppInstallationId: "",
     githubAppPrivateKey: "",
     prReviewerBotLogin: "allyblockcast[bot]",
-  } as Record<string, string>,
+    // Read by pr-comment-review-gate, which the `reevaluate` rows below drive
+    // for real rather than through a seam.
+    prCommentReviewGateStatusContext: "",
+    prCommentReviewGateRetiredStatusContexts: [] as string[],
+  } as Record<string, unknown> & {
+    githubAppId: string;
+    githubAppInstallationId: string;
+    githubAppPrivateKey: string;
+    prReviewerBotLogin: string;
+    prCommentReviewGateStatusContext: string;
+    prCommentReviewGateRetiredStatusContexts: string[];
+  },
 }));
 
 vi.mock("../config.js", () => ({ loadConfig: () => h.cfg }));
@@ -216,6 +227,7 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
         return jsonResponse(options.reviews ?? []);
       }
       if (u.includes("/issues/") && u.includes("/comments")) return jsonResponse(options.comments ?? []);
+      if (u.includes("/check-runs")) return jsonResponse({ id: 2 }, true, 201);
       if (/\/statuses\/[0-9a-f]{7,40}(?:\?|$)/i.test(u)) {
         const status = options.postStatus ?? 201;
         return jsonResponse(options.postBody ?? { id: 1 }, status < 400, status, options.postHeaders);
@@ -1039,6 +1051,147 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
       status: "failed_permanent",
       lastError: "missing_github_app_credentials",
       lastErrorKind: "permanent",
+    });
+  });
+
+  // BLO-36819. The comment-review gate evaluation runs on a void-detached
+  // promise fired after the webhook ack, and it is the sole writer of its
+  // status context — so one lost evaluation (fetch failure past its bounded
+  // retries, refused POST, or a pod restart mid-flight) leaves the previous
+  // verdict standing forever. frr#105 sat `failure` for hours after a clean
+  // at-head review. A `reevaluate` row re-runs the evaluation here; unlike
+  // every other row in this table it carries no verdict of its own.
+  describe("comment-review gate re-evaluation", () => {
+    const GATE_CONTEXT = "gate/ally-comment-findings";
+
+    function cleanAllyReview(sha: string) {
+      return {
+        user: { login: "allyblockcast[bot]" },
+        state: "COMMENTED",
+        submitted_at: "2026-09-26T16:45:29Z",
+        body: `## Ally — Consolidated PR Review\nReviewed head: ${sha}\n### Critical Issues (0)\n### Important Issues (0)`,
+      };
+    }
+
+    async function seedReevaluation(options: { queuedAt?: Date } = {}) {
+      h.cfg.prCommentReviewGateStatusContext = GATE_CONTEXT;
+      const delivery = await enqueueGithubCommitStatusDelivery(db, {
+        companyId: null,
+        sourceRunId: null,
+        repoFullName: "Blockcast/frr",
+        sha: HEAD_SHA,
+        context: GATE_CONTEXT,
+        state: "pending",
+        description: "Comment-review gate re-evaluation queued.",
+        reevaluate: true,
+        prNumber: 105,
+        prUrl: "https://github.com/Blockcast/frr/pull/105",
+      });
+      if (options.queuedAt) {
+        await db
+          .update(githubCommitStatusDeliveries)
+          .set({ createdAt: options.queuedAt })
+          .where(eq(githubCommitStatusDeliveries.id, delivery.id));
+      }
+      return delivery;
+    }
+
+    function postedGateStates(fetchMock: ReturnType<typeof vi.fn>): string[] {
+      return fetchMock.mock.calls
+        .filter(([url]) => /\/statuses\/[0-9a-f]{40}$/i.test(String(url)))
+        .map(([, init]) => JSON.parse(String((init as RequestInit | undefined)?.body ?? "{}")))
+        .filter((body: { context?: string }) => body.context === GATE_CONTEXT)
+        .map((body: { state?: string }) => String(body.state));
+    }
+
+    afterEach(() => {
+      h.cfg.prCommentReviewGateStatusContext = "";
+    });
+
+    it("re-runs the evaluation and publishes the verdict the live path lost", async () => {
+      setCreds();
+      const delivery = await seedReevaluation();
+      const fetchMock = stubGithub({
+        // The frozen verdict: written before this row was queued, so it is no
+        // evidence that the live evaluation for this row ever landed.
+        latestStatuses: [{ context: GATE_CONTEXT, state: "failure", created_at: "2026-09-26T16:32:20Z" }],
+        reviews: [cleanAllyReview(HEAD_SHA)],
+        comments: [],
+      });
+
+      await expect(pollGitHubCommitStatusDeliveriesOnce(db)).resolves.toBe(1);
+
+      expect(await readDelivery(delivery.id)).toMatchObject({
+        status: "delivered",
+        lastResult: { reason: "reevaluated" },
+      });
+      expect(postedGateStates(fetchMock)).toEqual(["success"]);
+    });
+
+    // The guard is deliberately "a status was written at or after this row was
+    // queued", not handleFreshCommitStatusIfPresent: that helper also
+    // short-circuits on any `success` regardless of age, which would make this
+    // backstop blind to a review that turns a green head red.
+    it("skips when the live evaluation already published for this head", async () => {
+      setCreds();
+      const delivery = await seedReevaluation({ queuedAt: new Date("2026-09-26T16:45:30Z") });
+      const fetchMock = stubGithub({
+        latestStatuses: [{ context: GATE_CONTEXT, state: "success", created_at: "2026-09-26T16:45:34Z" }],
+        reviews: [cleanAllyReview(HEAD_SHA)],
+        comments: [],
+      });
+
+      await pollGitHubCommitStatusDeliveriesOnce(db);
+
+      expect(await readDelivery(delivery.id)).toMatchObject({
+        status: "skipped",
+        lastResult: { reason: "live_evaluation_published" },
+      });
+      expect(postedGateStates(fetchMock)).toEqual([]);
+    });
+
+    it("re-evaluates rather than skipping when the only green status predates the row", async () => {
+      setCreds();
+      const delivery = await seedReevaluation();
+      const fetchMock = stubGithub({
+        latestStatuses: [{ context: GATE_CONTEXT, state: "success", created_at: "2026-09-26T16:32:20Z" }],
+        reviews: [
+          {
+            user: { login: "allyblockcast[bot]" },
+            state: "COMMENTED",
+            submitted_at: "2026-09-26T16:45:29Z",
+            body: `## Ally — Consolidated PR Review\nReviewed head: ${HEAD_SHA}\n### Important Issues (1)\nFix before merge.`,
+          },
+        ],
+        comments: [],
+      });
+
+      await pollGitHubCommitStatusDeliveriesOnce(db);
+
+      expect(await readDelivery(delivery.id)).toMatchObject({ status: "delivered" });
+      expect(postedGateStates(fetchMock)).toEqual(["failure"]);
+    });
+
+    it("holds the first attempt back by the requested delay", async () => {
+      const before = Date.now();
+      h.cfg.prCommentReviewGateStatusContext = GATE_CONTEXT;
+      const delivery = await enqueueGithubCommitStatusDelivery(db, {
+        companyId: null,
+        sourceRunId: null,
+        repoFullName: "Blockcast/frr",
+        sha: HEAD_SHA,
+        context: GATE_CONTEXT,
+        state: "pending",
+        description: "Comment-review gate re-evaluation queued.",
+        reevaluate: true,
+        delayMs: 15 * 60_000,
+        prNumber: 105,
+        prUrl: "https://github.com/Blockcast/frr/pull/105",
+      });
+
+      expect(delivery.nextAttemptAt.getTime()).toBeGreaterThan(before + 10 * 60_000);
+      // Not due yet, so the poller must not claim it.
+      await expect(pollGitHubCommitStatusDeliveriesOnce(db)).resolves.toBe(0);
     });
   });
 });

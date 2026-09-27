@@ -8,12 +8,13 @@ import { randomUUID } from "node:crypto";
 import crypto from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   agents,
   agentWakeupRequests,
   companies,
   createDb,
+  githubCommitStatusDeliveries,
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
@@ -3364,6 +3365,123 @@ describeEmbeddedPostgres("github-webhook route", () => {
     // with the bare trigger, the real handle was unobservable from here and a
     // caller could drop it without any test noticing.
     expect(calls[0]!.db).toBeDefined();
+  });
+
+  // BLO-36819. The live evaluation above is void-detached and fired after the
+  // ack, and it is the sole writer of its status context — so a fetch failure
+  // past its bounded retries, a refused POST, or a pod restart mid-flight
+  // leaves the previous verdict standing forever. frr#105 sat `failure` for
+  // hours after a clean at-head review for exactly that reason. These pin the
+  // durable backstop that is queued BEFORE the ack.
+  describe("comment-review gate durable backstop", () => {
+    const previousContext = process.env.PAPERCLIP_PR_COMMENT_REVIEW_GATE_STATUS_CONTEXT;
+
+    beforeEach(() => {
+      process.env.PAPERCLIP_PR_COMMENT_REVIEW_GATE_STATUS_CONTEXT = "gate/ally-comment-findings";
+    });
+
+    // afterEach, not afterAll: the backstop enqueue is keyed off this env var,
+    // so leaving it set would silently add outbox rows to every later test in
+    // the file.
+    afterEach(() => {
+      if (previousContext === undefined) delete process.env.PAPERCLIP_PR_COMMENT_REVIEW_GATE_STATUS_CONTEXT;
+      else process.env.PAPERCLIP_PR_COMMENT_REVIEW_GATE_STATUS_CONTEXT = previousContext;
+    });
+
+    async function readBackstops(sha: string) {
+      return db
+        .select()
+        .from(githubCommitStatusDeliveries)
+        .where(eq(githubCommitStatusDeliveries.sha, sha));
+    }
+
+    function postReview(app: express.Express, payload: Record<string, unknown>) {
+      const { body, signature } = signedRequest(payload);
+      return request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request_review")
+        .set("x-hub-signature-256", signature)
+        .set("content-type", "application/json")
+        .send(body);
+    }
+
+    it("queues a delayed re-evaluation row for an Ally review", async () => {
+      const sha = "a".repeat(40);
+      const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+      const before = Date.now();
+
+      const response = await postReview(app, {
+        action: "submitted",
+        repository: { full_name: "Blockcast/frr" },
+        pull_request: { number: 105, head: { sha }, html_url: "https://github.com/Blockcast/frr/pull/105" },
+        review: { user: { login: "allyblockcast[bot]" }, body: "## Ally — Consolidated PR Review" },
+      });
+
+      expect(response.status).toBe(200);
+      const rows = await readBackstops(sha);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        repoFullName: "Blockcast/frr",
+        context: "gate/ally-comment-findings",
+        prNumber: 105,
+        reevaluate: true,
+        status: "queued",
+      });
+      // Delayed, not immediate: firing before the live evaluation has had time
+      // to land would buy a second evaluation on EVERY webhook instead of only
+      // on the ones that lose theirs.
+      expect(rows[0]!.nextAttemptAt.getTime()).toBeGreaterThan(before + 10 * 60_000);
+    });
+
+    it("collapses repeated triggers at one head onto a single backstop row", async () => {
+      const sha = "b".repeat(40);
+      const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+      const payload = {
+        action: "submitted",
+        repository: { full_name: "Blockcast/frr" },
+        pull_request: { number: 106, head: { sha }, html_url: "https://github.com/Blockcast/frr/pull/106" },
+        review: { user: { login: "allyblockcast[bot]" }, body: "## Ally — Consolidated PR Review" },
+      };
+
+      await postReview(app, payload);
+      await postReview(app, payload);
+
+      expect(await readBackstops(sha)).toHaveLength(1);
+    });
+
+    // Pins the known gap rather than leaving it to look covered. An
+    // `issue_comment` payload carries no PR head at all, and reading one would
+    // mean a GitHub call before the ack. Ally used the reviews surface for 33
+    // of 33 measured consolidated reviews, so this is the rare path.
+    it("does not queue a backstop for a comment-shaped review, which carries no head sha", async () => {
+      const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+      const { body, signature } = signedRequest({
+        action: "created",
+        repository: { full_name: "Blockcast/frr" },
+        issue: {
+          number: 107,
+          pull_request: { url: "https://api.github.com/repos/Blockcast/frr/pulls/107" },
+        },
+        comment: {
+          user: { login: "allyblockcast[bot]" },
+          body: "## Ally — Consolidated PR Review\n### Important Issues (0)",
+        },
+      });
+
+      await request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "issue_comment")
+        .set("x-hub-signature-256", signature)
+        .set("content-type", "application/json")
+        .send(body);
+
+      expect(
+        await db
+          .select()
+          .from(githubCommitStatusDeliveries)
+          .where(eq(githubCommitStatusDeliveries.prNumber, 107)),
+      ).toHaveLength(0);
+    });
   });
 
   it("leaves reviewer wakes queued when the webhook runs on the API tier", async () => {
