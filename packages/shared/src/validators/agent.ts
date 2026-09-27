@@ -3,6 +3,7 @@ import {
   AGENT_ICON_NAMES,
   AGENT_ROLES,
   AGENT_STATUSES,
+  APPROVAL_LINKED_ISSUE_IDS_MAX,
   INBOX_MINE_ISSUE_STATUS_FILTER,
 } from "../constants.js";
 import { agentAdapterTypeSchema } from "../adapter-type.js";
@@ -232,7 +233,7 @@ export type BuiltInAgentReset = z.infer<typeof builtInAgentResetSchema>;
 
 export const createAgentHireSchema = createAgentSchema.extend({
   sourceIssueId: z.string().uuid().optional().nullable(),
-  sourceIssueIds: z.array(z.string().uuid()).optional(),
+  sourceIssueIds: z.array(z.string().uuid()).max(APPROVAL_LINKED_ISSUE_IDS_MAX).optional(),
 });
 
 export type CreateAgentHire = z.infer<typeof createAgentHireSchema>;

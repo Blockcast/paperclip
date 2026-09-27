@@ -4431,11 +4431,14 @@ export function issueRoutes(
     // `linkIssueApprovalSchema`-validated to `{approvalId}`, so recording it at
     // this call site is safe and restores the trail.
     await recordDeniedIssueWrite(req, issue, "issue:mutate", {
-      // The evaluator's refusal reasons are either an `IssueAccessDecision`
-      // reason passed straight through or one of its own `deny_*` literals, so
-      // this narrows cleanly; `deniedBoundaryReason` carries the safe fallback
-      // for anything that ever fails to.
+      // The evaluator's refusal reasons are one of its own `deny_*` literals, a
+      // denied `IssueAccessDecision` reason, or, on the creator/manager-chain
+      // branch, the *allow* reason of a grant that is comment-only here. That
+      // last case does not narrow: `deniedBoundaryReason` maps it to its
+      // `deny_missing_grant` fallback, so `boundaryReason` carries the verbatim
+      // value, as at every sibling call site (Ally, PR #1271).
       reason: deniedBoundaryReason(verdict.reason as IssueAccessDecision["reason"]),
+      boundaryReason: verdict.reason as IssueAccessDecision["reason"],
       responseStatus: responseStatusForDeniedWrite(res, verdict.status),
     });
     return false;
@@ -10839,9 +10842,11 @@ export function issueRoutes(
     // `assertAgentIssueMutationAllowed` + `assertCanManageIssueApprovalLinks` pair,
     // so this route and `POST /companies/:companyId/approvals` reach the same
     // verdict. It is a faithful mirror of the mutation helper's boundary that
-    // additionally honours the productivity-review grant (BLO-23036) and does not
-    // seize the issue's checkout lock merely to annotate it. The 409 conflict
-    // contract for another agent's active checkout is preserved by the evaluator.
+    // additionally honours the productivity-review grant (BLO-23036), does not
+    // seize the issue's checkout lock merely to annotate it, and does not fence the
+    // assignee's other runs off a locked pending review (see the evaluator header).
+    // The 409 conflict contract for another agent's active checkout is preserved by
+    // the evaluator.
     if (!(await assertIssueApprovalLinkAllowed(req, res, issue))) return;
 
     const actor = getActorInfo(req);

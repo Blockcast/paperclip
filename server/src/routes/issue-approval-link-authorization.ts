@@ -65,6 +65,16 @@ import {
  *   bookkeeping about who is *executing* the issue, not about who may annotate it.
  *   Refusing here would strand an agent filing an escalation from a heartbeat run
  *   while its execution run holds the lock.
+ * - **No pending-review run-ownership fence.** The mutation helper fences the
+ *   issue's own assignee, on a run other than the lock holder, off a live-locked
+ *   pending `in_review` stage (`isForeignRunOfLockedPendingReview` →
+ *   `assertPendingReviewRunOwnership`, BLO-22666). This does not reproduce it, on
+ *   the same grounds as the checkout lock above and reason 1: that fence guards
+ *   *stage decisions*, and an inert approval card is not one; and it is not a read,
+ *   since the service clears terminal runs' locks before it re-checks ownership,
+ *   which an evaluator that authorizes N issues must not do to N rows. So the
+ *   assignee's second run may attach an approval to its own pending review. Found
+ *   in review of PR #1271.
  *
  * ## The task-watchdog subtree gate, and the one branch this is NOT a mirror of
  *
@@ -94,8 +104,8 @@ import {
  * omits the service keeps allowing at every door instead of fail-closing at the
  * two this evaluator newly gates. Found in review of PR #1271.
  *
- * Every branch is now a faithful mirror, and each denial is at least as strict as
- * the link route's.
+ * Outside the deliberate differences listed above, every branch is now a faithful
+ * mirror, and each denial is at least as strict as the link route's.
  */
 
 export type IssueApprovalLinkAuthorizationIssue = {
