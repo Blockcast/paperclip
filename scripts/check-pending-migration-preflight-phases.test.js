@@ -57,6 +57,34 @@ const spentFloor = (budgetSeconds) => (budgetSeconds - CLOCK_GRANULARITY_SECONDS
 // erase. One second is not enough: the stub's clock origin is its first call,
 // which is the `apply` the script makes *before* stamping startup_began, so the
 // two origins can land in different seconds and the script's reported
+test("any kubelet disruption after the container starts is not reported as a migration verdict", () => {
+  // Eviction is one member of the class. Preemption stamps its own reason and
+  // is equally not a verdict; before this case only `Evicted` was recognised.
+  const { code, output } = runPreflight({
+    STUB_POD_REASON: "Preempting",
+    STUB_JOB_RESULT: "failed",
+  });
+
+  assert.equal(code, 1, "a disrupted check must still fail closed");
+  assert.doesNotMatch(output, /a pending migration needs its index precreated/);
+  assert.match(output, /stopped by the kubelet \(status\.reason=Preempting\)/);
+});
+
+test("a pre-flight pod deleted after its container starts is not reported as a migration verdict", () => {
+  // An API-initiated eviction (drain, autoscaler, descheduler) deletes the pod
+  // instead of stamping status.reason, so the reason read fails. That must not
+  // collapse into the empty reason of a pod that ran and exited on its own.
+  const { code, output } = runPreflight({
+    STUB_POD_GONE: "1",
+    STUB_JOB_RESULT: "failed",
+  });
+
+  assert.equal(code, 1, "a vanished check must still fail closed");
+  assert.doesNotMatch(output, /a pending migration needs its index precreated/);
+  assert.match(output, /INCONCLUSIVE/);
+  assert.match(output, /pre-flight pod no longer exists/);
+});
+
 // startup_seconds reads 1s short of this. At RUN_BUDGET_SECONDS + 1 that
 // under-report lands exactly on the budget and the strict comparison fails.
 const SLOW_PULL_SECONDS = RUN_BUDGET_SECONDS + CLOCK_GRANULARITY_SECONDS + 1;
@@ -85,7 +113,11 @@ case "$args" in
     if [ "$elapsed" -ge "\${STUB_READY_AFTER:-0}" ]; then echo "\${STUB_TERMINAL_PHASE:-Running}"; else echo "Pending"; fi
     exit 0 ;;
   *"waiting.reason"*)      echo "\${STUB_WAITING_REASON:-ContainerCreating}"; exit 0 ;;
-  *"{.status.reason}"*)    echo "\${STUB_POD_REASON:-}"; exit 0 ;;
+  *"{.status.reason}"*)
+    # STUB_POD_GONE models a pod deleted rather than stamped (API eviction,
+    # preemption, NodeLost GC): the read fails instead of printing a reason.
+    if [ "\${STUB_POD_GONE:-0}" = 1 ]; then echo "Error from server (NotFound)" >&2; exit 1; fi
+    echo "\${STUB_POD_REASON:-}"; exit 0 ;;
   *"get events"*)          echo "Normal Pulled Successfully pulled image in 3m3.14s. Image size: 1695082158 bytes"; exit 0 ;;
   *" logs "*)              echo "stub pre-flight output"; exit 0 ;;
   *"condition=complete"*)
@@ -242,7 +274,7 @@ test("an eviction AFTER the container starts is not reported as a migration verd
     "an evicted pod produced no verdict, so it must not be reported as one",
   );
   assert.match(output, /INCONCLUSIVE/);
-  assert.match(output, /evicted by the kubelet/);
+  assert.match(output, /stopped by the kubelet \(status\.reason=Evicted\)/);
   assert.match(output, /--- pod events ---/, "the operator needs the eviction message inline");
 });
 
