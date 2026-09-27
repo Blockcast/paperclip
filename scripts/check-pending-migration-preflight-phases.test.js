@@ -57,34 +57,6 @@ const spentFloor = (budgetSeconds) => (budgetSeconds - CLOCK_GRANULARITY_SECONDS
 // erase. One second is not enough: the stub's clock origin is its first call,
 // which is the `apply` the script makes *before* stamping startup_began, so the
 // two origins can land in different seconds and the script's reported
-test("any kubelet disruption after the container starts is not reported as a migration verdict", () => {
-  // Eviction is one member of the class. Preemption stamps its own reason and
-  // is equally not a verdict; before this case only `Evicted` was recognised.
-  const { code, output } = runPreflight({
-    STUB_POD_REASON: "Preempting",
-    STUB_JOB_RESULT: "failed",
-  });
-
-  assert.equal(code, 1, "a disrupted check must still fail closed");
-  assert.doesNotMatch(output, /a pending migration needs its index precreated/);
-  assert.match(output, /stopped by the kubelet \(status\.reason=Preempting\)/);
-});
-
-test("a pre-flight pod deleted after its container starts is not reported as a migration verdict", () => {
-  // An API-initiated eviction (drain, autoscaler, descheduler) deletes the pod
-  // instead of stamping status.reason, so the reason read fails. That must not
-  // collapse into the empty reason of a pod that ran and exited on its own.
-  const { code, output } = runPreflight({
-    STUB_POD_GONE: "1",
-    STUB_JOB_RESULT: "failed",
-  });
-
-  assert.equal(code, 1, "a vanished check must still fail closed");
-  assert.doesNotMatch(output, /a pending migration needs its index precreated/);
-  assert.match(output, /INCONCLUSIVE/);
-  assert.match(output, /pre-flight pod no longer exists/);
-});
-
 // startup_seconds reads 1s short of this. At RUN_BUDGET_SECONDS + 1 that
 // under-report lands exactly on the budget and the strict comparison fails.
 const SLOW_PULL_SECONDS = RUN_BUDGET_SECONDS + CLOCK_GRANULARITY_SECONDS + 1;
@@ -274,8 +246,40 @@ test("an eviction AFTER the container starts is not reported as a migration verd
     "an evicted pod produced no verdict, so it must not be reported as one",
   );
   assert.match(output, /INCONCLUSIVE/);
-  assert.match(output, /stopped by the kubelet \(status\.reason=Evicted\)/);
+  assert.match(output, /stopped by the cluster \(status\.reason=Evicted\)/);
   assert.match(output, /--- pod events ---/, "the operator needs the eviction message inline");
+});
+
+test("any disruption reason after the container starts is not reported as a migration verdict", () => {
+  // Eviction is one member of the class. Only an empty reason is a verdict, so
+  // reasons the script never names must still be treated as disruption:
+  // NodeLost is stamped by the node lifecycle controller and left for pod GC,
+  // and DeadlineExceeded is an activeDeadlineSeconds kill.
+  for (const reason of ["Preempting", "NodeLost", "DeadlineExceeded"]) {
+    const { code, output } = runPreflight({
+      STUB_POD_REASON: reason,
+      STUB_JOB_RESULT: "failed",
+    });
+
+    assert.equal(code, 1, `a check disrupted by ${reason} must still fail closed`);
+    assert.doesNotMatch(output, /a pending migration needs its index precreated/);
+    assert.match(output, new RegExp(`stopped by the cluster \\(status\\.reason=${reason}\\)`));
+  }
+});
+
+test("a pre-flight pod deleted after its container starts is not reported as a migration verdict", () => {
+  // An API-initiated eviction (drain, autoscaler, descheduler) deletes the pod
+  // instead of stamping status.reason, so the reason read fails. That must not
+  // collapse into the empty reason of a pod that ran and exited on its own.
+  const { code, output } = runPreflight({
+    STUB_POD_GONE: "1",
+    STUB_JOB_RESULT: "failed",
+  });
+
+  assert.equal(code, 1, "a vanished check must still fail closed");
+  assert.doesNotMatch(output, /a pending migration needs its index precreated/);
+  assert.match(output, /INCONCLUSIVE/);
+  assert.match(output, /pre-flight pod no longer exists/);
 });
 
 test("a check that completes between polls is not mistaken for never having started", () => {
