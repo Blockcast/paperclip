@@ -1351,6 +1351,42 @@ test("the start-lock retune prose does not run ahead of the evidence (BLO-36522)
     "runbook must narrow the 09-15/16 claim to the only fleet-scope episode ended by a pod replacement",
   );
 
+  // The coverage note describes Blockcast's live onprem-k8s rules, which this
+  // chart does not match: PaperclipQueuedRunStrandedFleet exists only there,
+  // and this chart still renders the per-agent PaperclipQueuedRunStranded. At
+  // 201525fc the note named the fleet alert without saying where it lives, so a
+  // chart installation read "its per-agent page is gone" while this template
+  // still rendered one. Read the template rather than pinning either state: a
+  // claim that depends on a fleet form this chart lacks must be scoped to
+  // onprem-k8s, and while the per-agent alert renders here the section must
+  // say so. (Its presence is asserted independently by the BLO-21116 test.)
+  // The prose phrase is matched with \s+ because the runbook hard-wraps; a
+  // literal-space pattern would never match and would pass vacuously.
+  const template = readFileSync(
+    path.join(repoRoot, "deploy/helm/paperclip/templates/prometheusrule.yaml"),
+    "utf8",
+  );
+  if (!/- alert: PaperclipQueuedRunStrandedFleet\b/.test(template)) {
+    for (const paragraph of runbook.split(/\n\s*\n/)) {
+      if (/PaperclipQueuedRunStrandedFleet|no\s+page\s+will\s+have\s+brought\s+you\s+here/.test(paragraph)) {
+        assert.match(
+          paragraph,
+          /onprem-k8s/,
+          "runbook paragraph depends on a fleet-count alert this chart does not render "
+            + `(PaperclipQueuedRunStrandedFleet) without scoping the claim to Blockcast/onprem-k8s:\n${paragraph}`,
+        );
+      }
+    }
+  }
+  if (/- alert: PaperclipQueuedRunStranded\b/.test(template)) {
+    assert.match(
+      section,
+      /still renders the per-agent\s+`PaperclipQueuedRunStranded`/,
+      "runbook start-lock section must say this chart copy still renders the per-agent "
+        + "PaperclipQueuedRunStranded, so a chart installation keeps that coverage",
+    );
+  }
+
   // The withdrawn claim has now been removed at five sites across four heads,
   // each found by re-grepping the phrase rather than by re-reading the diff --
   // so assert the class is gone instead of waiting for a sixth site. These
