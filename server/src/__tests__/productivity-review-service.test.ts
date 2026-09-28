@@ -11161,6 +11161,38 @@ describeEmbeddedPostgres("productivity review service", () => {
       expect(result.created).toBe(0);
     });
 
+    // A retired stale *reservation* is not an answer. It carries
+    // `status: "done"` with NULL identifier/issueNumber and no `hiddenAt`, and
+    // its `createdAt` postdates the frozen sample by construction — so before
+    // the `isNotNull(identifier)` arm it silenced the source permanently, this
+    // query being unbounded. Nobody ever saw it: no body, no assignee.
+    it("ignores a retired reservation with no identifier — a row no human ever saw is not a resolution", async () => {
+      const seeded = await seedFrozenRuntimeFailureSample();
+      await db.insert(issues).values({
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        title: "Stale productivity-review reservation retired by the recovery pass",
+        status: "done",
+        priority: "high",
+        originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+        originId: seeded.issueId,
+        originFingerprint: `productivity-review:${seeded.issueId}`,
+        parentId: seeded.issueId,
+        issueNumber: null,
+        identifier: null,
+        createdAt: hoursAgo(30),
+        updatedAt: hoursAgo(29),
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.unchangedSampleSuppressed).toBe(0);
+      expect(result.created).toBe(1);
+    });
+
     // AC1 control. Without this the gate could match every input and the test
     // above would still pass — "never fires" is indistinguishable from "fixed".
     it("still files when one run postdates the resolved review: the gate must discriminate", async () => {

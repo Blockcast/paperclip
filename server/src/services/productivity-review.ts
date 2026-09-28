@@ -2539,6 +2539,27 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
    *
    * `cancelled` counts alongside `done`: both mean a human or manager has seen
    * this evidence and stopped. Matches `findRecentResolvedProductivityReview`.
+   *
+   * `isNotNull(identifier)` enforces exactly that premise, and without it the
+   * premise is false. `retireStaleProductivityReviewReservation` parks a stale
+   * *reservation* at `status: "done"` with `identifier`/`issueNumber` still
+   * NULL and no `hiddenAt`, so it would otherwise satisfy both the status arm
+   * and `visibleIssueCondition()`. A reservation is minted from this same
+   * evidence, so its `createdAt` postdates the frozen sample by construction —
+   * and because this query is unbounded, one such row would silence every
+   * future `runtime_failure_streak` review on that source permanently. It is
+   * reachable on a live source: the `review_owner_changed` and
+   * `unreviewable_source` retirement arms do not require a terminal source. A
+   * retired reservation never rendered a body and was never assigned, so it
+   * answered nothing and must not count as an answer.
+   *
+   * The invariant that makes the `createdAt` anchor sound — that
+   * `newestSampledRunAt <= priorTerminalReviewAt` implies the sample is
+   * *identical* to the one the prior review saw — holds only while
+   * `heartbeat_runs` rows are append-only. Retention pruning would move
+   * `newestSampledRunAt` backwards and make this gate fire over evidence the
+   * prior review never saw, failing open in the silencing direction. Any future
+   * pruning of that table has to revisit this gate.
    */
   async function findLatestTerminalProductivityReviewCreatedAt(companyId: string, sourceIssueId: string) {
     return db
@@ -2550,6 +2571,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
           eq(issues.originId, sourceIssueId),
           inArray(issues.status, ["done", "cancelled"]),
+          isNotNull(issues.identifier),
           visibleIssueCondition(),
         ),
       )
@@ -6285,6 +6307,15 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       // The field measurement this gate ships with has to distinguish "the
       // sample-staleness gate fired" from "cadence caps fired"; a shared
       // counter makes that unreadable.
+      //
+      // It measures the steady state, not the whole population. The gate sits
+      // after `findRecentResolvedProductivityReview` and
+      // `hasRepeatedTerminalReviewsInBackoff`, both of which increment
+      // `snoozed` and `continue`, so while a source is still inside
+      // `resolvedSnoozeMs` or the repeat backoff those win and this stays 0.
+      // That ordering is deliberate — it keeps the extra query off candidates
+      // a cadence cap already stopped — but it means a low reading early in a
+      // loop is under-reporting, not absence.
       unchangedSampleSuppressed: 0,
       closedSuppressedMonitorReviews: 0,
       closedTerminalSourceReviews: 0,
@@ -6563,6 +6594,19 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       // empty sample cannot reach here. Say that rather than implying a
       // mutation-tested guard — if the accepted set ever widens, the arm starts
       // carrying weight and needs a real test then.
+      //
+      // Known residual: this `continue` skips `createOrUpdateReview`, so it
+      // suppresses a *refresh* as well as a creation. Reachable — a review
+      // filed while the source was `in_progress` fired
+      // `{long_active_duration, runtime_failure_streak}`, so this gate did not
+      // apply; once the source goes non-active the set narrows to
+      // `{runtime_failure_streak}` and that already-open review stops being
+      // refreshed, while no arm of `closeOpenSuppressedReviews` retires it
+      // (all are scoped to `long_active_duration` / `runaway_execution` /
+      // terminal source). It sits open with a body naming the older trigger.
+      // Accepted: the review is already filed and assigned, so a human still
+      // has it, and a stale body beats the refresh churn this replaces.
+      // BLO-35725 is the row that widens the retirement arm to this trigger.
       if (isUnchangedSampleClosableTriggerSet(evidence.firedTriggers)) {
         const newestSampledRunAt = evidence.latestRuns[0]?.createdAt ?? null;
         if (newestSampledRunAt) {
