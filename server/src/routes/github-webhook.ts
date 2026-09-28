@@ -3134,11 +3134,26 @@ async function withPrReviewerTaskLock<T>(
  * for a few milliseconds each; the critical section is two statements plus the
  * enqueue, so even a large burst drains far inside GitHub's webhook timeout.
  *
- * This is a bound, not the structural fix. Doing the enqueue on the lock's own
- * connection would remove the second checkout entirely, but `enqueueWakeup`
- * opens its own transaction and threading one through it is a much wider
- * change to the wake path — deliberately left for structural review rather
- * than folded in here.
+ * This is a bound, not the structural fix, and BLO-37330 decided it stays that
+ * way. Doing the enqueue on the lock's own connection would remove the second
+ * checkout entirely — that is how every other nesting path was fixed (recovery,
+ * issues, environment leases, both outboxes all thread `tx` through). It does
+ * not transfer here.
+ *
+ * Measured 2026-09-28: `enqueueWakeup` (`services/heartbeat.ts`) is ~2,650
+ * lines and opens **three independent** `db.transaction(...)` blocks, each
+ * committing on its own. Threading this lock's `tx` in would fold all three
+ * into the caller's transaction, so they would commit or roll back as one unit
+ * *and* the advisory lock would be held across the whole wake. That changes the
+ * durability semantics of the wake path — a wake request that today survives a
+ * later failure would begin disappearing with it — which is a behaviour change
+ * to the dispatch path, not a refactor. The sibling conversions were all single
+ * short transactions where no such semantics existed to break.
+ *
+ * So the second checkout is deliberate and the concurrency bound below is what
+ * makes it safe. The pool it is derived from is sized against a written
+ * server-side budget (`doc/DATABASE-CONNECTION-BUDGET.md`), so the bound now
+ * scales with a number that has been re-derived rather than inherited.
  *
  * Exported for test: the invariant that matters is `2 * bound < poolMax`, and
  * pinning it as a property of the derivation covers pool sizes no integration

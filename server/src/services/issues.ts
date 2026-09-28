@@ -5762,7 +5762,7 @@ export function issueService(db: Db) {
   // that already holds `lockIssueParentMutationCompany` (recovery's
   // `escalateStrandedAssignedIssue`). Reading instance settings off the pooled
   // handle there takes a SECOND pool connection while the lock is held, and
-  // with `POSTGRES_POOL_MAX=10` against 8-9 waiters on that same key the read
+  // with `POSTGRES_POOL_MAX` against 8-9 waiters on that same key the read
   // only gets a connection when a waiter hits its `lock_timeout` — the convoy.
   // So bind the settings reads to the caller's handle when there is one.
   //

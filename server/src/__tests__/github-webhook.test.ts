@@ -5790,9 +5790,12 @@ describeEmbeddedPostgres("github-webhook route", () => {
       for (const poolMax of [1, 2, 3]) {
         expect(derivePrReviewerWakeMaxConcurrency(poolMax)).toBe(1);
       }
-      // The shipped pool keeps the previously-hardcoded value, so this is a
-      // refactor of *how* the bound is obtained, not a behaviour change.
-      expect(derivePrReviewerWakeMaxConcurrency(POSTGRES_POOL_MAX)).toBe(4);
+      // The shipped pool. BLO-37330 raised POSTGRES_POOL_MAX 10 -> 20 against
+      // the written server-side budget (doc/DATABASE-CONNECTION-BUDGET.md),
+      // which carries the bound 4 -> 9. Pinned so a future pool change has to
+      // come back through this invariant rather than silently widening the
+      // number of concurrent double-checkouts.
+      expect(derivePrReviewerWakeMaxConcurrency(POSTGRES_POOL_MAX)).toBe(9);
     });
 
     // Ally's review of this PR: `no_reviewer` re-armed on the *contention*
