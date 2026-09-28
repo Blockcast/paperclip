@@ -2611,6 +2611,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         taskKey: `pr_review:Blockcast/libmmt:444:${headSha}`,
         githubRepoFullName: "Blockcast/libmmt",
         githubPrNumber: 444,
+        githubPrUrl: "https://github.com/Blockcast/libmmt/pull/444",
         githubHeadSha: headSha,
       },
     });
@@ -2706,6 +2707,21 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // it was written, with a queued reviewer run for that exact head 4.67h old.
     expect(notice[0]?.body).not.toContain("none is coming");
     expect(notice[0]?.body).not.toContain("not reviewer latency");
+    // BLO-37268: and it must not prescribe the destructive remedy. Measured on
+    // Blockcast/multicast#778: the notice fired twice telling the assignee to
+    // push a new head; the review it declared absent landed on that exact head
+    // 72 minutes after the second notice, and a push would have voided it plus
+    // both pending markers plus 10/10 green required contexts.
+    expect(notice[0]?.body).not.toContain("push a new head");
+    // The band that lets a reader tell a dead review from a slow one (BLO-34410).
+    expect(notice[0]?.body).toContain("p50 of ~4h11m");
+    // ...and the three things a push actually costs, named.
+    expect(notice[0]?.body).toContain("still in flight");
+    expect(notice[0]?.body).toContain("pending review-request marker at the old head");
+    expect(notice[0]?.body).toContain("green required-check set");
+    // The fix must not strip the notice's useful content: run id, head, PR URL.
+    expect(notice[0]?.body).toContain(runId);
+    expect(notice[0]?.body).toContain("https://github.com/Blockcast/libmmt/pull/444");
 
     // The comment is the durable artifact; the wake is what actually reaches an
     // agent. `in_review` is excluded from inbox-lite by design, so without this
