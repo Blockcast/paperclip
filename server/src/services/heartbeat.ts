@@ -25346,11 +25346,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   /**
-   * In-flight sweep shared by every start-lock caller, and when the last one
-   * finished. See {@link reapOrphanedRunsForStartLock}.
+   * Start-lock sweep state (BLO-36922). `joinableStartLockReap` is a sweep that
+   * has not read fleet state yet, so a caller that joins it still gets a
+   * snapshot taken after it arrived. `inFlightStartLockReap` has already read,
+   * so its result can predate a caller and must not be shared with one. See
+   * {@link reapOrphanedRunsForStartLock}.
    */
-  let sharedStartLockReap: Promise<unknown> | null = null;
+  let joinableStartLockReap: Promise<unknown> | null = null;
+  let inFlightStartLockReap: Promise<unknown> | null = null;
   let sharedStartLockReapCompletedAtMs = 0;
+
+  function scheduleStartLockReap(after: Promise<unknown>) {
+    const sweep = after.then(() => {
+      // The sweep reads fleet state from here on, so a later arrival must not
+      // join it. `.finally` stamps the completion time on failure too, so with
+      // a TTL set a failing sweep backs off instead of being retried by every
+      // waking agent.
+      joinableStartLockReap = null;
+      const running: Promise<unknown> = reapOrphanedRuns({ suppressDispatchAfterReap: true }).finally(() => {
+        sharedStartLockReapCompletedAtMs = Date.now();
+        if (inFlightStartLockReap === running) inFlightStartLockReap = null;
+      });
+      inFlightStartLockReap = running;
+      return running;
+    });
+    // Assigned before any await, so callers arriving in the same tick join
+    // this sweep rather than scheduling another.
+    joinableStartLockReap = sweep;
+    return sweep;
+  }
 
   /**
    * Coalescing wrapper for the reap on the queued-run dispatch critical path
@@ -25370,10 +25394,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * showed 8 `k8s_concurrency_guard_unreachable` trips from in-pod calls while
    * `kubectl` from outside answered in 1.6s.
    *
-   * A fleet sweep has no per-agent semantics, so concurrent callers can share
-   * one result for free. Hence single-flight. The optional freshness TTL is
-   * off by default: see {@link START_LOCK_REAP_TTL_DEFAULT_MS} for why a
-   * sequential caller does need its own sweep.
+   * A fleet sweep has no per-agent semantics, so callers can share one, but
+   * only one that read fleet state after they arrived. A caller joins a sweep
+   * that has not started reading yet. A caller arriving while a sweep is
+   * already reading waits for it, then shares the single sweep chained after
+   * it with everyone else who arrived meanwhile. Joining the reading sweep
+   * instead would hand back a snapshot from before the caller woke: a run whose
+   * Job died since still reads `running`, and dispatch then cancels same-issue
+   * queued work as `duplicate_dispatch_suppressed`. A wake wave therefore costs
+   * at most two sweeps, not N.
+   *
+   * The optional freshness TTL is off by default: see
+   * {@link START_LOCK_REAP_TTL_DEFAULT_MS} for why a sequential caller does
+   * need its own sweep.
    *
    * ponytail: TTL is wall-clock, not a real invalidation. A skipped caller
    * dispatches against reap state up to TTL old, and a run whose Job died
@@ -25386,24 +25419,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * dedup those callers rely on is a separate, still-tested invariant.
    */
   async function reapOrphanedRunsForStartLock(): Promise<"ran" | "joined" | "skipped_fresh"> {
-    if (sharedStartLockReap) {
-      await sharedStartLockReap;
+    if (joinableStartLockReap) {
+      await joinableStartLockReap;
       return "joined";
+    }
+    if (inFlightStartLockReap) {
+      // The reading sweep's own failure belongs to its callers. This caller is
+      // served by the chained sweep, so it must not inherit that rejection.
+      await scheduleStartLockReap(inFlightStartLockReap.catch(() => undefined));
+      return "ran";
     }
     const configuredTtlMs = Number.parseInt(process.env.AGENT_START_LOCK_REAP_TTL_MS ?? "", 10);
     const ttlMs = Number.isFinite(configuredTtlMs) && configuredTtlMs >= 0
       ? configuredTtlMs
       : START_LOCK_REAP_TTL_DEFAULT_MS;
     if (ttlMs > 0 && Date.now() - sharedStartLockReapCompletedAtMs < ttlMs) return "skipped_fresh";
-    // Assign before awaiting so a caller that arrives during this sweep joins
-    // it rather than starting a second one. `.finally` stamps the completion
-    // time on failure too, so with a TTL set a failing sweep backs off instead
-    // of being retried by every waking agent.
-    sharedStartLockReap = reapOrphanedRuns({ suppressDispatchAfterReap: true }).finally(() => {
-      sharedStartLockReapCompletedAtMs = Date.now();
-      sharedStartLockReap = null;
-    });
-    await sharedStartLockReap;
+    await scheduleStartLockReap(Promise.resolve());
     return "ran";
   }
 
