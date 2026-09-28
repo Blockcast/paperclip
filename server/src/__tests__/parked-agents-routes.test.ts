@@ -16,6 +16,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { agentRoutes } from "../routes/agents.js";
+import { CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY } from "../services/ccrotate-capacity-retry.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -257,6 +258,31 @@ describeEmbeddedPostgres("parked agents route", () => {
     expect(exhausted.penstockReason).toBe("penstock.model_capacity_unavailable");
     expect(outage.penstockReason).toBe("penstock.model_temporarily_unavailable");
     expect(unlabelled.penstockReason).toBeNull();
+  });
+
+  it("surfaces the advertised resume instant under the writer's key, so a rename cannot null it", async () => {
+    // The alert runbook sends on-call here to see a capacity park's advertised
+    // resume instant (BLO-35263). Seeding through the writer's binding rather
+    // than the literal is the point: rename the constant and this row moves
+    // with it, so a projection still reading the old literal returns null here.
+    const companyId = await seedCompany();
+    const agentId = await seedAgent(companyId, "PlatformSREEngineer");
+    const advertisedResumeAt = new Date(Date.now() + 3 * 60 * 60_000).toISOString();
+    await seedRun({
+      companyId,
+      agentId,
+      status: "scheduled_retry",
+      scheduledRetryAt: new Date(Date.now() + 60_000),
+      scheduledRetryReason: "ccrotate_capacity",
+      scheduledRetryAttempt: 1,
+      resultJson: { [CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY]: advertisedResumeAt },
+    });
+
+    const res = await request(createApp(boardActor(companyId)))
+      .get(`/api/companies/${companyId}/parked-agents`)
+      .expect(200);
+
+    expect(res.body.agents[0].penstockAdvertisedResumeAt).toBe(advertisedResumeAt);
   });
 
   it("flags a park whose due time has already passed", async () => {
