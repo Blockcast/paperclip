@@ -34,9 +34,23 @@ function dryRunJson(args) {
   return JSON.parse(result.stdout);
 }
 
-// Match the PR matrix. The reusable release workflow's three-way matrix is
-// checked independently by release-verify-workflow.test.mjs.
-const SHARD_COUNT = 4;
+// Derived from the PR matrix, never pinned: count the `general-server` entries
+// in pr.yml's general_tests job, so the cover and balance assertions below run
+// at the K every PR and merge-group build executes. A pinned literal kept
+// passing at 4 after the matrix moved to 6 (BLO-36439).
+// pr-ci-shard-folding.test.mjs checks those entries agree with their labels,
+// shard_index and shard_count. The reusable release workflow's three-way
+// matrix is checked independently by release-verify-workflow.test.mjs.
+function prMatrixShardCount() {
+  const workflow = readFileSync(path.join(repoRoot, ".github", "workflows", "pr.yml"), "utf8");
+  const start = workflow.indexOf("\n  general_tests:\n");
+  const end = workflow.indexOf("\n  verify:\n", start + 1);
+  assert.ok(start !== -1 && end !== -1, "pr.yml must define general_tests followed by verify");
+  const count = workflow.slice(start, end).match(/\n          - group: general-server\n/g)?.length ?? 0;
+  assert.ok(count >= 2, `pr.yml general_tests must declare at least two general-server shards, found ${count}`);
+  return count;
+}
+const SHARD_COUNT = prMatrixShardCount();
 
 test("the general-server shards form a complete, non-overlapping partition", () => {
   const shards = Array.from({ length: SHARD_COUNT }, (_, index) =>
