@@ -12,17 +12,18 @@ export default defineConfig({
     // server/vitest.config.ts records taking ~40s on the contended ARC pool.
     // In THIS package 30 suites boot it, and a per-call timeout argument
     // overrides the config — which almost every block already passes. Measured
-    // 2026-09-27 over those 30 files: 90 of 122 `it`/hook openers close with an
-    // explicit timeout, and of the four blocks that do fall through to the
-    // values below, NONE boots a database (`backup-lib.test.ts:55` buffered
-    // writer; `unjournaled-migrations-apply.test.ts:32`, whose own comment says
-    // "Needs no database"; `client.test.ts:126` reads a directory;
-    // `pipelines-schema.test.ts:50`, whose boot is in the `beforeAll`).
+    // 2026-09-28 over those 30 files: 117 of 122 `it`/hook openers close with an
+    // explicit timeout, so exactly 5 fall through to the values below. Four are
+    // `it` blocks and NONE of them boots a database (`backup-lib.test.ts:55`
+    // buffered writer; `unjournaled-migrations-apply.test.ts:32`, whose own
+    // comment says "Needs no database"; `client.test.ts:126` reads a directory;
+    // `pipelines-schema.test.ts:50`, whose boot is in the `beforeAll`). The
+    // fifth is the bare `afterEach` at `pool-timeout-bounds.test.ts:49`.
     // So `testTimeout` reaches no Postgres-booting body at all, and
-    // `hookTimeout` reaches exactly one block: the bare `afterEach` at
-    // `pool-timeout-bounds.test.ts:49`. In particular it does NOT cover
-    // `pipelines-schema.test.ts:41`, the one `beforeAll` boot — that hook
-    // closes `}, 60_000)` itself, as does its `afterAll` at :46.
+    // `hookTimeout` reaches exactly one block: that bare `afterEach`. In
+    // particular it does NOT cover `pipelines-schema.test.ts:41`, the one
+    // `beforeAll` boot — that hook closes `}, 60_000)` itself, as does its
+    // `afterAll` at :46.
     // Contrast the alertmanager package, where a per-test `beforeEach` closes
     // with no argument and `hookTimeout` is therefore the whole fix.
     //
