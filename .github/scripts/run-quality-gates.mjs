@@ -114,17 +114,20 @@ async function upsertComment(token, repo, prNumber, body, existing) {
 }
 
 // Posting the comment is delivery, not evaluation: by the time it runs every
-// gate has already produced its verdict. A rate-limited read or write here must
-// not reach exitFatal, whose "did not evaluate the diff" annotation would then
-// be false and would discard the real verdict. Other errors still propagate.
+// gate has already produced its verdict, so no delivery failure may decide the
+// exit code. Letting one reach exitFatal would discard the verdict and exit 1
+// even when every gate passed. That covers a rate-limited POST/PATCH too:
+// ghFetch never retries writes, so it throws those as a plain Error with no
+// `rateLimited` flag, and keying on the flag would miss exactly the write.
+// Same line postFlaggedSecurityResult takes for the security advisory.
 export async function deliverComment(post) {
   try {
     await post();
     return true;
   } catch (err) {
-    if (!err?.rateLimited) throw err;
+    const message = err instanceof Error ? err.message : String(err);
     console.error(
-      '::warning::commitperclip could not post its comment (rate limited). The verdict below is still authoritative.'
+      `::warning::commitperclip could not post its comment (${message}). The verdict below is still authoritative.`
     );
     return false;
   }

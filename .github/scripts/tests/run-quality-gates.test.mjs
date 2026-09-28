@@ -264,21 +264,23 @@ test('isGraphifyReindexArtifactOnlyPr: rejects empty file lists', () => {
   assert.equal(result, false);
 });
 
-// A rate limit while posting the comment arrives after every gate has already
-// decided. It must leave the verdict standing instead of reaching exitFatal,
-// which would report a completed evaluation as one that never ran.
-test('deliverComment: a rate-limited post does not throw, so the gate verdict still decides the exit', async () => {
+// A delivery failure arrives after every gate has already decided. It must
+// leave the verdict standing instead of reaching exitFatal, which would exit 1
+// regardless of the verdict.
+test('deliverComment: a rate-limited read (flagged by ghFetch) does not throw', async () => {
   const delivered = await deliverComment(async () => {
     throw Object.assign(new Error('GitHub API rate limit exceeded'), { rateLimited: true });
   });
   assert.equal(delivered, false);
 });
 
-test('deliverComment: any other delivery error still propagates', async () => {
-  await assert.rejects(
-    deliverComment(async () => { throw new Error('GitHub API 500'); }),
-    /GitHub API 500/,
-  );
+// The write shape ghFetch really produces: it never retries a POST/PATCH, so a
+// rate-limited comment write is a plain Error with no `rateLimited` flag.
+test('deliverComment: a rate-limited comment write (plain, unflagged Error) does not throw', async () => {
+  const delivered = await deliverComment(async () => {
+    throw new Error('GitHub API PATCH /repos/o/r/issues/comments/1 → 403: {"message":"API rate limit exceeded"}');
+  });
+  assert.equal(delivered, false);
 });
 
 test('deliverComment: reports success when the post completes', async () => {
