@@ -350,10 +350,13 @@ test('the budget constants mirror the three timeout-minutes in commitperclip-rev
 });
 
 test('the review job records its start before any other step', () => {
-  const steps = workflow.slice(workflow.indexOf('\n  review:\n'));
-  const first = steps.slice(steps.indexOf('    steps:\n')).match(/\n      - name: ([^\n]+)\n        run: ([^\n]+)/);
-  assert.equal(first[1], 'Record job start');
-  assert.match(first[2], /REVIEW_JOB_STARTED_AT_MS=\$\(date \+%s%3N\)" >> "\$GITHUB_ENV"/);
+  // Split the job's step list into items and take the first one, so this
+  // checks position, not just presence: a Record job start step that drifts
+  // behind checkout, Dependency Review or setup-node would make the budget
+  // measure a near-zero elapsed on exactly the cold runner it exists for.
+  const job = workflow.slice(workflow.indexOf('\n  review:\n'));
+  const firstStep = job.slice(job.indexOf('    steps:\n')).split('\n      - ')[1];
+  assert.match(firstStep, /^name: Record job start\n        run: [^\n]*REVIEW_JOB_STARTED_AT_MS=\$\(date \+%s%3N\)" >> "\$GITHUB_ENV"/);
 });
 
 // Whatever the steps before this one spent, the funded sleeps, the reserve and
