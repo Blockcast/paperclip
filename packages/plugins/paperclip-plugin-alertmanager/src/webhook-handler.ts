@@ -2822,6 +2822,30 @@ function buildRecoveredStateRecord(
  * retry — a malformed or unsupported-version payload, or a filtered alert —
  * never when something that could succeed later has failed.
  */
+/**
+ * The API tier's worker-proxy deadline, mirrored here for reporting only.
+ *
+ * Deliberately a mirrored literal and not an import: it lives in
+ * `PROXY_REQUEST_TIMEOUT_MS` (server/src/routes/worker-tier-proxy.ts), which is
+ * host-side code this plugin worker cannot import. Nothing here enforces it —
+ * it is used to label a delivery that has already blown past it, so a drift
+ * between the two values costs a mislabelled metric, never a behaviour change.
+ */
+const WORKER_PROXY_DEADLINE_MS = 120_000;
+
+/**
+ * Elapsed wall-clock at which a single delivery logs which alert it is on.
+ *
+ * Half the proxy deadline, deliberately. This handler has no deadline of its
+ * own — it always runs the whole batch to completion — so the 504 Alertmanager
+ * sees is emitted by the *API tier* while this loop is still running, and the
+ * worker has never recorded what it was doing at the time. That is why
+ * BLO-37485 read as "invisible from the worker side": the evidence was not
+ * missing, it was never written. Warning at the halfway mark is what makes a
+ * give-up attributable to a specific alert instead of inferred from the client.
+ */
+const SLOW_DELIVERY_WARN_MS = WORKER_PROXY_DEADLINE_MS / 2;
+
 export async function handleWebhook(
   ctx: PluginContext,
   config: AlertmanagerPluginConfig,
@@ -2873,7 +2897,26 @@ export async function handleWebhook(
   // so a wedged fence stays O(1) in batch size on the failure path.
   const fenceWedgedMemo: AggregateFenceWedgedMemo = new Set();
 
-  for (const alert of body.alerts) {
+  const deliveryStartedAt = Date.now();
+  let slowDeliveryWarned = false;
+
+  for (const [alertIndex, alert] of body.alerts.entries()) {
+    // Checked before the label filter so the warning fires on elapsed time
+    // rather than on reaching a billable alert: a batch can be slow and then
+    // spend its last seconds on filtered alerts, and that is still the
+    // delivery that gets abandoned.
+    if (!slowDeliveryWarned) {
+      const elapsedMs = Date.now() - deliveryStartedAt;
+      if (elapsedMs > SLOW_DELIVERY_WARN_MS) {
+        slowDeliveryWarned = true;
+        ctx.logger.warn(
+          `paperclip-plugin-alertmanager: slow delivery — ${elapsedMs}ms elapsed after ${alertIndex} of ${body.alerts.length} alerts; next is ${
+            alert.labels.alertname ?? "unknown"
+          } (${alert.fingerprint}). The API tier abandons this request at ${WORKER_PROXY_DEADLINE_MS}ms, after which Alertmanager discards the whole batch.`,
+        );
+      }
+    }
+
     if (!alertMatchesLabelFilter(alert, config.acceptOnlyLabels)) {
       await ctx.metrics.write("alertmanager.webhook.filtered", 1, {
         alertname: alert.labels.alertname ?? "unknown",
@@ -3029,6 +3072,48 @@ export async function handleWebhook(
         );
       }
     }
+  }
+
+  // Per-delivery timing (BLO-37485).
+  //
+  // This runs even when the API tier gave up on the request long ago: nothing
+  // aborts the handler when the proxy's fetch is abandoned, so a delivery that
+  // blew the deadline still reaches this line and still reports. That is the
+  // only case worth measuring here, and it is precisely the case the host-side
+  // `plugin_webhook_deliveries.duration_ms` column records but does not expose
+  // — that column is readable only through the board-gated plugin dashboard
+  // route and is capped at the last 10 rows.
+  //
+  // Counters, not a histogram, because `ctx.metrics.write` is the only channel
+  // a plugin has. Mean delivery cost is
+  // `increase(duration_ms) / increase(completed)`; mean per-alert cost is
+  // `increase(duration_ms) / increase(alerts_received)`, which is the number
+  // that decides whether the deadline is mis-set for real batch cost.
+  //
+  // Untagged on purpose: promoted tag keys share a 50-slot per-name label
+  // budget (see manifest `metricLabels`), and an `alertname` tag here would
+  // spend it for an aggregate that is only ever read summed. The per-delivery
+  // attribution lives in the log line above, where cardinality is free.
+  const deliveryMs = Date.now() - deliveryStartedAt;
+  try {
+    await ctx.metrics.write("alertmanager.webhook.duration_ms", deliveryMs);
+    await ctx.metrics.write("alertmanager.webhook.completed", 1);
+    await ctx.metrics.write(
+      "alertmanager.webhook.alerts_received",
+      body.alerts.length,
+    );
+    if (deliveryMs > WORKER_PROXY_DEADLINE_MS) {
+      // The worker-side count of destroyed batches. The Alertmanager-side grep
+      // this issue shipped with conflates retry attempts with terminal
+      // give-ups; this one counts deliveries that actually outran the deadline.
+      await ctx.metrics.write("alertmanager.webhook.deadline_exceeded", 1);
+    }
+  } catch (metricErr) {
+    // Best-effort, matching every other metric write in this handler: a
+    // telemetry outage must not change a delivery's outcome.
+    ctx.logger.error(
+      `paperclip-plugin-alertmanager: failed to record delivery timing metrics: ${String(metricErr)}`,
+    );
   }
 
   if (failedFingerprints.length > 0) {
