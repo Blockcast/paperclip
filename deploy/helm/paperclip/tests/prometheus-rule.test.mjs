@@ -1449,9 +1449,11 @@ test("PaperclipIsolationWorkspaceReaperStopped is gauge-keyed, dry_run-collapsed
   ) ?? [];
   assert.ok(block, "the reaper-stopped alert must render a block");
 
-  // The metric name carries the `paperclip_` prefix 64 of 74 registered names
-  // use. This is a one-way door: once this expr, the runbook PromQL and the
-  // onprem-k8s copy select a name, renaming breaks all three at once.
+  // The metric name carries the `paperclip_` prefix that the overwhelming
+  // majority of registered names use (the handful that do not name other
+  // subsystems: penstock_*, claude_k8s_*). This is a one-way door: once this
+  // expr, the runbook PromQL and the onprem-k8s copy select a name, renaming
+  // breaks all three at once.
   assert.match(
     block,
     /paperclip_isolation_workspace_reaper_last_sweep_timestamp_seconds/,

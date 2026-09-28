@@ -23,8 +23,10 @@
 import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from "prom-client";
 import { logger } from "../middleware/logger.js";
 // Type-only, so it is erased at runtime and creates no import cycle with the
-// reaper (which imports the recorder below). Structurally restating the result
-// shape here would let a NEW result field be added and silently go unrecorded.
+// reaper (which imports the recorder below). This buys a RENAME guarantee: a
+// field the recorder reads cannot be renamed out from under it. It does not
+// catch a NEW field going unrecorded -- byOutcome is keyed on ENTRY_OUTCOMES,
+// so an added result field still compiles and is still ignored.
 import type { IsolationWorkspaceReapResult } from "./isolation-workspace-reaper.js";
 import { resetDepBlockedMetrics, snapshotDepBlockedMetrics } from "./dep-blocked-metrics.js";
 import {

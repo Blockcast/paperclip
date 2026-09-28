@@ -23,7 +23,7 @@ sum by (stop_reason) (increase(paperclip_isolation_workspace_reaper_sweeps_total
 
 1. **Is it still enabled?** `PAPERCLIP_ISOLATION_WORKSPACE_REAPER_ENABLED=true` must be on the **worker** StatefulSet — the reaper is gated to `paperclipNodeRole !== "api"`. It is opt-in and defaults off, so a values change or a rollback silently stops it.
 2. **Is it pointed at a root that exists?** `stop_reason="root_absent"` means the sweep ran and found no tree at all. On a non-k8s-isolation deployment that is correct and expected. On **this** cluster it is a misconfiguration: the reaper is enabled, ticking, and reporting success over a path that is not the tree — while the real tree grows unreclaimed. That is the BLO-31222 shape, and it is why this stop reason is not folded into `complete` ([BLO-36814](https://paperclip.blockcast.net/BLO/issues/BLO-36814)). Confirm the worker's `PAPERCLIP_ISOLATION_WORKSPACE_ROOT` (or the `DEFAULT_ISOLATION_WORKSPACE_ROOT` fallback) against the live mount.
-3. **Is the worker up and scraped?** A dead worker drops the series entirely rather than freezing it, which this alert cannot see (see "Why there is no absence rule"). `PaperclipPluginStatusCollectorAbsent` covers that case.
+3. **Is the worker up and scraped?** A dead worker drops the series entirely rather than freezing it, which this alert cannot see (see "Why there is no absence rule"). **Nothing covers that case per pod** — check `up{job="paperclip-control-plane", service="paperclip-workers"}` yourself rather than waiting for a page.
 4. **Is it failing per-tick?** `grep 'isolation-workspace reaper sweep failed'` in worker logs. A throwing sweep never reaches the gauge, so repeated failures present exactly as a stall.
 5. **Is it wedged mid-sweep?** Ticks are serialized — a sweep that outruns its interval against a slow MDS blocks the next one. `stop_reason="lookup_faulted"` means the pre-unlink re-read faulted and the remaining directories were never assessed at all.
 
@@ -40,8 +40,8 @@ Neither is part of this alert; both are non-routine when non-zero.
 
 ## Why there is no absence rule
 
-The companion `absent_over_time()` pattern used by `PaperclipPluginStatusCollectorAbsent` is deliberately **not** applied to this series. That collector starts unconditionally on every worker, so an absent series there can only mean breakage. This reaper is opt-in, so an absent series is its ordinary disabled state — an absence rule would page continuously on any deployment that has not turned it on.
+An absence rule is deliberately **not** applied to this series — the opposite call to `PaperclipPluginStatusCollectorAbsent`, for a reason specific to this sweep rather than an oversight. That collector starts unconditionally on every worker, so an absent series there can only mean breakage. This reaper is opt-in, so an absent series is its ordinary disabled state — an absence rule would page continuously on any deployment that has not turned it on.
 
-The gap that leaves is a worker pod dying before `time() - gauge` can cross a ~2-day threshold. That is already covered, critically, by `PaperclipPluginStatusCollectorAbsent`.
+The gap that leaves — a worker pod that dies, dropping the series before `time() - gauge` can cross a ~2-day threshold — is **real, and nothing covers it per pod**. `PaperclipPluginStatusCollectorAbsent` (`severity: warning`) needs `up == 1` for the pod, so a dead pod is exactly the case it cannot see; `PaperclipWakeTerminalFailedGaugeAbsent` (`severity: warning`) fires only once the series is gone fleet-wide. Single-pod death is **accepted as uncovered**: a false page on a deliberately disabled reaper costs trust in the rest of the alert file.
 
 **If the reaper was disabled on purpose, this alert resolves on its own once the series ages out. It does not need silencing.**
