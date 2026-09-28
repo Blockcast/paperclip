@@ -61,9 +61,21 @@ describe("postgres connection budget", () => {
     const peakAppProcesses = readNumber(doc, /^÷ *(\d+) +peak processes/m, "peak processes");
 
     const availableToPaperclip = maxConnections - superuserReserved;
-    // Derived, not restated: whatever the arithmetic block does not hand to
-    // application pools is by definition reserved for everything else.
-    const nonAppReserved = availableToPaperclip - appPoolBudget;
+    // Summed from the reserve lines, not derived by subtraction. An earlier
+    // revision computed this as `availableToPaperclip - appPoolBudget`, which
+    // cancels the ceiling out of the comparison below: the verdict reduced to
+    // `peakAppProcesses x POSTGRES_POOL_MAX <= appPoolBudget - margin`, so a
+    // measured `max_connections` change that left the arithmetic block alone
+    // still passed while the budget overflowed.
+    const nonAppReserved =
+      readNumber(doc, /^− *(\d+) +postgres-exporter$/m, "postgres-exporter reserve") +
+      readNumber(doc, /^− *(\d+) +overlapping cronjob one-shots$/m, "cronjob reserve") +
+      readNumber(doc, /^− *(\d+) +transient createUtilitySql pools$/m, "createUtilitySql reserve") +
+      readNumber(doc, /^− *(\d+) +operator headroom$/m, "operator headroom reserve");
+    // The block's own subtotal must follow from the table and the reserves, so
+    // a ceiling re-measured in the table but not carried into the arithmetic
+    // fails here even in the direction that would otherwise pass (more room).
+    expect(availableToPaperclip - nonAppReserved).toBe(appPoolBudget);
     const peakDemand = peakAppProcesses * POSTGRES_POOL_MAX + nonAppReserved;
 
     // The failure this guards is asymmetric: too small is a client-side queue,

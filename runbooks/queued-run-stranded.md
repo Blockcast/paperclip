@@ -607,7 +607,7 @@ The known-plausible wedge is a second pool connection taken while holding
 `lockIssueOwnership`, against `POSTGRES_POOL_MAX` with no acquire timeout
 (`issue-recovery-actions.test.ts` still allowlists five such call sites under
 BLO-34207). Read the current pool size off `packages/db/src/client.ts` rather
-than assuming 10 — BLO-37330 raised it to 20 against the server-side budget in
+than assuming 10 — BLO-37330 re-derived it against the server-side budget in
 `doc/DATABASE-CONNECTION-BUDGET.md`. Check the pool gauges for the **worker**
 pod, which is the only tier that dispatches:
 
