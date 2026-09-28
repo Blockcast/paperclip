@@ -165,10 +165,16 @@ export const SECURITY_STEP_TIMEOUT_MS = 3 * 60_000;
 // timeout-minutes stays the hard backstop for that tail.
 export function qualityRetryBudgetMs(jobStartedAtMs, now = Date.now()) {
   if (!Number.isFinite(jobStartedAtMs) || jobStartedAtMs <= 0) {
-    throw new Error(
+    const err = new Error(
       'REVIEW_JOB_STARTED_AT_MS is not set: the review job\'s first step must record it, ' +
       'because the retry budget is what is left of the job, not a guess.'
     );
+    // Nothing has been evaluated yet, so exitFatal must say "did not run",
+    // not let the workflow point at a commitperclip comment that never got posted.
+    err.notEvaluated =
+      'The review job did not record REVIEW_JOB_STARTED_AT_MS, so the retry budget could not be sized and no gate ran. ' +
+      'Fix the job\'s Record job start step, then re-run.';
+    throw err;
   }
   const jobLeftMs = jobStartedAtMs + REVIEW_JOB_TIMEOUT_MS - SECURITY_STEP_TIMEOUT_MS - now;
   return Math.max(0, Math.min(QUALITY_STEP_TIMEOUT_MS, jobLeftMs) - RATE_LIMIT_MIN_WAIT_MS);

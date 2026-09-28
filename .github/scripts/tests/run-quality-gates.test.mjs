@@ -15,7 +15,7 @@ import {
   findExistingComment,
   isGraphifyReindexArtifactOnlyPr,
 } from '../run-quality-gates.mjs';
-import { RATE_LIMIT_MIN_WAIT_MS } from '../get-bot-token.mjs';
+import { RATE_LIMIT_MIN_WAIT_MS, exitFatal } from '../get-bot-token.mjs';
 
 const workflow = readFileSync(
   path.resolve(
@@ -356,7 +356,7 @@ test('the review job records its start before any other step', () => {
   // measure a near-zero elapsed on exactly the cold runner it exists for.
   const job = workflow.slice(workflow.indexOf('\n  review:\n'));
   const firstStep = job.slice(job.indexOf('    steps:\n')).split('\n      - ')[1];
-  assert.match(firstStep, /^name: Record job start\n        run: [^\n]*REVIEW_JOB_STARTED_AT_MS=\$\(date \+%s%3N\)" >> "\$GITHUB_ENV"/);
+  assert.match(firstStep, /^name: Record job start\n(        #[^\n]*\n)*        run: [^\n]*REVIEW_JOB_STARTED_AT_MS=\$\(\( \$\(date \+%s\) \* 1000 \)\)" >> "\$GITHUB_ENV"/);
 });
 
 // Whatever the steps before this one spent, the funded sleeps, the reserve and
@@ -382,6 +382,33 @@ test('qualityRetryBudgetMs refuses to guess when the job start was not recorded'
   for (const missing of [Number(undefined), 0, Number('')]) {
     assert.throws(() => qualityRetryBudgetMs(missing, 1_000), /REVIEW_JOB_STARTED_AT_MS is not set/);
   }
+});
+
+// The throw fires before any gate runs, so it must reach the workflow as "did
+// not run" (not_evaluated=true), not as a failure pointing at a comment that was
+// never posted.
+test('a missing job start reaches exitFatal as not-evaluated, with its own reason', () => {
+  let thrown;
+  try { qualityRetryBudgetMs(Number(undefined), 1_000); } catch (e) { thrown = e; }
+  assert.ok(thrown, 'qualityRetryBudgetMs must throw without a recorded start');
+  const dir = mkdtempSync(path.join(tmpdir(), 'budget-not-evaluated-'));
+  const out = path.join(dir, 'github_output');
+  writeFileSync(out, '');
+  const lines = [];
+  const error = console.error;
+  console.error = msg => lines.push(String(msg));
+  let code;
+  try {
+    exitFatal(thrown, 'commitperclip quality gates', c => { code = c; }, out);
+  } finally {
+    console.error = error;
+  }
+  assert.equal(code, 1);
+  assert.equal(readFileSync(out, 'utf8'), 'not_evaluated=true\n');
+  const annotation = lines.find(l => l.includes('DID NOT EVALUATE THE DIFF'));
+  assert.ok(annotation, lines.join('\n'));
+  assert.match(annotation, /REVIEW_JOB_STARTED_AT_MS/);
+  assert.doesNotMatch(annotation, /rate limit/i);
 });
 
 // On a warm runner the shared budget must still fund more than one headerless
