@@ -2173,6 +2173,146 @@ describe("buildJobManifest", () => {
       const promptEnv = init?.env?.find((e: { name: string }) => e.name === "PROMPT_CONTENT");
       expect(Buffer.byteLength(`PROMPT_CONTENT=${promptEnv?.value ?? ""}`, "utf-8") + 1).toBe(MAX_ARG_STRLEN);
     });
+
+    // The invariant behind the number, asserted directly so it cannot drift:
+    // whatever the threshold is, the env path must never carry a string the
+    // kernel would reject. Fails for ANY threshold >= MAX_ARG_STRLEN.
+    it("never puts a PROMPT_CONTENT string over MAX_ARG_STRLEN in the PodSpec", () => {
+      // Non-vacuity guard: a threshold regressed DOWNWARD sends every case to
+      // the Secret path, so the loop below would `continue` ten times and the
+      // test would pass having asserted nothing. Proving at least one case
+      // actually took the env path makes that impossible (BLO-37287 rider 1).
+      let sawEnvPath = false;
+      for (const kib of [1, 64, 119, 120, 121, 128, 130, 160, 200, 300]) {
+        ctx.config = { promptTemplate: "x".repeat(kib * 1024) };
+        const value = promptEnvValue(buildJobManifest({ ctx, selfPod }).job);
+        if (value === undefined) continue; // took the Secret path — not exec'd as a string
+        sawEnvPath = true;
+        expect(
+          Buffer.byteLength(`PROMPT_CONTENT=${value}`, "utf-8"),
+          `${kib} KiB prompt was delivered as an env var the kernel would reject`,
+        ).toBeLessThan(MAX_ARG_STRLEN);
+      }
+      expect(sawEnvPath, "no case took the env path — the assertions above never ran").toBe(true);
+    });
+
+    // BLO-37287: generalised from the PROMPT_CONTENT-only invariant above to
+    // EVERY literal env string on EVERY container. That is the shape that
+    // catches this class rather than one instance of it — the prompt path
+    // (BLO-36854) and the wake payload are the two found so far, and a third
+    // unbounded SAFE_LITERAL would be caught here on the day it is added.
+    const oversizeEnvStrings = (job: k8s.V1Job) => {
+      const spec = job.spec?.template?.spec;
+      return [...(spec?.containers ?? []), ...(spec?.initContainers ?? [])].flatMap((c) =>
+        (c.env ?? [])
+          .filter((e) => typeof e.value === "string")
+          .map((e) => ({ container: c.name, name: e.name, bytes: Buffer.byteLength(`${e.name}=${e.value}`, "utf-8") }))
+          .filter((e) => e.bytes >= MAX_ARG_STRLEN),
+      );
+    };
+
+    /** Asserts the invariant and, on failure, names the container, the var and
+     *  the actual byte count — a generic red here sends triage at the cluster
+     *  (BLO-33503), which is the whole failure mode this guards. */
+    const expectNoOversizeEnv = (job: k8s.V1Job) => {
+      const offenders = oversizeEnvStrings(job);
+      expect(
+        offenders,
+        `env strings the kernel would reject with E2BIG: ${offenders
+          .map((o) => `${o.container}/${o.name}=${o.bytes}B (limit ${MAX_ARG_STRLEN})`)
+          .join(", ")}`,
+      ).toEqual([]);
+    };
+
+    it("never puts any NAME=value env string over MAX_ARG_STRLEN on any container", () => {
+      // The reachable worst case, not the observed one: the server passes each
+      // comment's `metadata` through raw and the schema permits ~4 MB of it.
+      // Revert the shed in stringifyPaperclipWakePayload and this reds naming
+      // the byte count (BLO-34263 mutation rule).
+      const hugeMetadata = {
+        version: 1,
+        sections: Array.from({ length: 20 }, (_, s) => ({
+          title: `section-${s}`,
+          rows: Array.from({ length: 50 }, () => ({ type: "code", code: "z".repeat(4_000) })),
+        })),
+      };
+      const ctxWithHugeWake = makeCtx({
+        context: {
+          paperclipWake: {
+            reason: "issue_commented",
+            issue: { id: "i1", identifier: "BLO-37287", title: "t" },
+            commentIds: ["c1"],
+            latestCommentId: "c1",
+            comments: [{ id: "c1", body: "hello", metadata: hugeMetadata, presentation: null }],
+          },
+        },
+      });
+      const { job } = buildJobManifest({ ctx: ctxWithHugeWake, selfPod: makeSelfPod() });
+
+      expectNoOversizeEnv(job);
+
+      // AC3: shedding must not silently lose context — the agent has to be able
+      // to see that it happened and refetch. A shed payload that looks complete
+      // is a quieter failure than the crash, not a fix.
+      const wakeValue = job.spec?.template?.spec?.containers?.[0]?.env?.find(
+        (e) => e.name === "PAPERCLIP_WAKE_PAYLOAD_JSON",
+      )?.value;
+      expect(wakeValue, "wake payload env var missing entirely — that IS silent loss").toBeDefined();
+      const parsed = JSON.parse(wakeValue!);
+      expect(parsed.fallbackFetchNeeded).toBe(true);
+      expect(parsed.truncated).toBe(true);
+      // Tier 1 sheds only metadata/presentation, so routing context survives.
+      expect(parsed.issue?.identifier).toBe("BLO-37287");
+      expect(parsed.latestCommentId).toBe("c1");
+    });
+
+    it("sheds to routing-only when the oversize field is not a comment field", () => {
+      // `executionStage`, `taskWatchdog`, `skillTest` and `activeTreeHold` are
+      // raw contextSnapshot passthroughs with no server-side cap, so dropping
+      // comment metadata alone does not always get under the ceiling. Without
+      // tier 2 the invariant would hold only for the comment-shaped case.
+      // The oversize `title` additionally pins that tier 2 bounds the strings
+      // it keeps rather than trusting upstream to have bounded them.
+      const ctxHugeStage = makeCtx({
+        context: {
+          paperclipWake: {
+            reason: "issue_commented",
+            issue: { id: "i1", identifier: "BLO-37287", title: "T".repeat(200 * 1024) },
+            latestCommentId: "c1",
+            executionStage: { blob: "q".repeat(300 * 1024) },
+          },
+        },
+      });
+      const { job } = buildJobManifest({ ctx: ctxHugeStage, selfPod: makeSelfPod() });
+      expectNoOversizeEnv(job);
+      const parsed = JSON.parse(
+        job.spec?.template?.spec?.containers?.[0]?.env?.find((e) => e.name === "PAPERCLIP_WAKE_PAYLOAD_JSON")!.value!,
+      );
+      expect(parsed.fallbackFetchNeeded).toBe(true);
+      expect(parsed.issue?.identifier).toBe("BLO-37287");
+      expect(parsed.executionStage).toBeUndefined();
+    });
+
+    it("leaves a normal-sized wake payload untouched", () => {      // The other half of the mutation guard: shedding must not fire on the
+      // ~10 KB payloads actually measured in production (BLO-37287 AC1), or
+      // every wake would silently degrade to an API refetch.
+      const ctxNormal = makeCtx({
+        context: {
+          paperclipWake: {
+            reason: "issue_commented",
+            issue: { id: "i1", identifier: "BLO-1", title: "t" },
+            comments: [{ id: "c1", body: "x".repeat(4_000), metadata: { version: 1 }, presentation: null }],
+          },
+        },
+      });
+      const { job } = buildJobManifest({ ctx: ctxNormal, selfPod: makeSelfPod() });
+      const value = job.spec?.template?.spec?.containers?.[0]?.env?.find(
+        (e) => e.name === "PAPERCLIP_WAKE_PAYLOAD_JSON",
+      )?.value;
+      const parsed = JSON.parse(value!);
+      expect(parsed.payloadShed).toBeUndefined();
+      expect(parsed.comments[0].metadata).toEqual({ version: 1 });
+    });
   });
 
   describe("pod log file tailing", () => {
