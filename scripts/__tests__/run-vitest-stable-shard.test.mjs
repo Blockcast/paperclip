@@ -76,12 +76,17 @@ test("shard flags are rejected for the parallel workspace groups", () => {
   assert.notEqual(result.status, 0, "workspace groups must not accept shard flags");
 });
 
-test("the workspace-b group uses ARC-safe Vitest timeouts", () => {
+test("the workspace-b group passes no Vitest timeout flags", () => {
+  // This test used to assert the OPPOSITE -- that the lane passes
+  // `--testTimeout=30000 --hookTimeout=60000`. It passed for months while
+  // those flags did nothing: the root config declares its packages via
+  // `projects: [...]`, and a root-level CLI timeout never reaches a project's
+  // own config, so all 18 workspaces-b packages ran at Vitest's 5s/10s
+  // defaults (BLO-37369). Asserting a flag is PRESENT says nothing about
+  // whether it takes effect. The budgets now live in each package's
+  // vitest.config.ts; vitest-project-coverage.test.mjs holds that line.
   const dryRun = dryRunJson(["--mode", "general", "--group", "general-workspaces-b"]);
-  assert.deepEqual(dryRun.generalWorkspacesBVitestArgs, [
-    "--testTimeout=30000",
-    "--hookTimeout=60000",
-  ]);
+  assert.deepEqual(dryRun.generalWorkspacesBVitestArgs, []);
 });
 
 test("duration-aware partition balances skewed weights better than round-robin", () => {
