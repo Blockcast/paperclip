@@ -12662,12 +12662,16 @@ export interface HeartbeatServiceOptions {
 /**
  * Freshness window for the shared start-lock orphan reap (BLO-36922).
  *
- * Short enough that dispatch never acts on materially stale reap state, long
- * enough to collapse a synchronized wake wave into one fleet sweep. Override
- * with `AGENT_START_LOCK_REAP_TTL_MS`; `0` disables the TTL and leaves only the
- * single-flight coalescing.
+ * Default `0`: single-flight coalescing only, no TTL skip. A skipped reap is
+ * not just a delayed slot release. When a run's Job dies inside the window,
+ * the dead run still reads `running`, so dispatch cancels queued work for the
+ * same issue as `duplicate_dispatch_suppressed` instead of running it
+ * ("reaps orphaned k8s runs before dispatching queued work for the same
+ * issue" in heartbeat-process-recovery.test.ts). Set
+ * `AGENT_START_LOCK_REAP_TTL_MS` to a positive value only as an incident knob
+ * that accepts that risk.
  */
-const START_LOCK_REAP_TTL_DEFAULT_MS = 5_000;
+const START_LOCK_REAP_TTL_DEFAULT_MS = 0;
 
 function isTruthyRuntimeEnvValue(value: string | undefined) {
   return value === "true" || value === "1" || value === "yes" || value === "on";
@@ -25367,14 +25371,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * `kubectl` from outside answered in 1.6s.
    *
    * A fleet sweep has no per-agent semantics, so concurrent callers can share
-   * one result for free, and a caller arriving just after a sweep finished
-   * gains nothing by running a second one. Hence single-flight plus a short
-   * freshness TTL.
+   * one result for free. Hence single-flight. The optional freshness TTL is
+   * off by default: see {@link START_LOCK_REAP_TTL_DEFAULT_MS} for why a
+   * sequential caller does need its own sweep.
    *
    * ponytail: TTL is wall-clock, not a real invalidation. A skipped caller
-   * dispatches against reap state up to TTL old, which at worst delays one slot
-   * release by that much -- the follow-up pass picks it up. If that ever
-   * matters, key the TTL on a fleet-state version instead of a timestamp.
+   * dispatches against reap state up to TTL old, and a run whose Job died
+   * inside that window makes dispatch cancel same-issue queued work. If a TTL
+   * is ever needed by default, key it on a fleet-state version instead of a
+   * timestamp.
    *
    * Direct callers of `reapOrphanedRuns` (the periodic reaper, tests) are
    * deliberately left alone: this is a dispatch-path fix, and the row-level
@@ -25392,8 +25397,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (ttlMs > 0 && Date.now() - sharedStartLockReapCompletedAtMs < ttlMs) return "skipped_fresh";
     // Assign before awaiting so a caller that arrives during this sweep joins
     // it rather than starting a second one. `.finally` stamps the completion
-    // time on failure too, so a failing sweep backs off instead of being
-    // retried by every waking agent.
+    // time on failure too, so with a TTL set a failing sweep backs off instead
+    // of being retried by every waking agent.
     sharedStartLockReap = reapOrphanedRuns({ suppressDispatchAfterReap: true }).finally(() => {
       sharedStartLockReapCompletedAtMs = Date.now();
       sharedStartLockReap = null;
