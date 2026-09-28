@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   buildComment,
+  deliverComment,
   findExistingComment,
   isGraphifyReindexArtifactOnlyPr,
 } from '../run-quality-gates.mjs';
@@ -261,4 +262,37 @@ test('isGraphifyReindexArtifactOnlyPr: rejects empty file lists', () => {
   });
 
   assert.equal(result, false);
+});
+
+// A rate limit while posting the comment arrives after every gate has already
+// decided. It must leave the verdict standing instead of reaching exitFatal,
+// which would report a completed evaluation as one that never ran.
+test('deliverComment: a rate-limited post does not throw, so the gate verdict still decides the exit', async () => {
+  const delivered = await deliverComment(async () => {
+    throw Object.assign(new Error('GitHub API rate limit exceeded'), { rateLimited: true });
+  });
+  assert.equal(delivered, false);
+});
+
+test('deliverComment: any other delivery error still propagates', async () => {
+  await assert.rejects(
+    deliverComment(async () => { throw new Error('GitHub API 500'); }),
+    /GitHub API 500/,
+  );
+});
+
+test('deliverComment: reports success when the post completes', async () => {
+  let posted = false;
+  assert.equal(await deliverComment(async () => { posted = true; }), true);
+  assert.equal(posted, true);
+});
+
+test('main posts the comment through deliverComment, not directly', () => {
+  const source = readFileSync(
+    path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../run-quality-gates.mjs'),
+    'utf8',
+  );
+  const main = source.slice(source.indexOf('async function main()'));
+  assert.match(main, /await deliverComment\(async \(\) => \{\s*const existing = await findExistingComment\(/);
+  assert.equal((main.match(/findExistingComment\(/g) ?? []).length, 1);
 });

@@ -113,6 +113,23 @@ async function upsertComment(token, repo, prNumber, body, existing) {
   }
 }
 
+// Posting the comment is delivery, not evaluation: by the time it runs every
+// gate has already produced its verdict. A rate-limited read or write here must
+// not reach exitFatal, whose "did not evaluate the diff" annotation would then
+// be false and would discard the real verdict. Other errors still propagate.
+export async function deliverComment(post) {
+  try {
+    await post();
+    return true;
+  } catch (err) {
+    if (!err?.rateLimited) throw err;
+    console.error(
+      '::warning::commitperclip could not post its comment (rate limited). The verdict below is still authoritative.'
+    );
+    return false;
+  }
+}
+
 async function main() {
   const { GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR, PR_BRANCH } = process.env;
 
@@ -168,10 +185,12 @@ async function main() {
   const commentBody = buildComment(author, allFailures, informational);
 
   // Post comment if there are failures/informational, or update existing comment
-  const existing = await findExistingComment(ghFetch, GH_TOKEN, GH_REPO, prNumber);
-  if (allFailures.length > 0 || informational.length > 0 || existing) {
-    await upsertComment(GH_TOKEN, GH_REPO, prNumber, commentBody, existing);
-  }
+  await deliverComment(async () => {
+    const existing = await findExistingComment(ghFetch, GH_TOKEN, GH_REPO, prNumber);
+    if (allFailures.length > 0 || informational.length > 0 || existing) {
+      await upsertComment(GH_TOKEN, GH_REPO, prNumber, commentBody, existing);
+    }
+  });
 
   console.log(JSON.stringify({ passed: allPassed, failures: allFailures, informational }));
   process.exit(allPassed ? 0 : 1);
