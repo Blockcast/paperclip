@@ -40,9 +40,11 @@
  * CLOSED: a computed value; more than one `test: {}` in the file (a shared base
  * object, a `mergeConfig` source), where which block binds cannot be decided
  * without resolving the config, so the scan refuses instead of guessing the
- * first; a regex literal containing a quote character (`blankNonCode` does not
- * lex regexes, so it reads on into string-blanking mode); and a key sharing its
- * source line with anything else, since `readTimeoutLiteral` is line-anchored
+ * first — counted ANCHORLESS, because a line-anchored count misses the
+ * anchored-base/inline-export orientation and selects the dead block; a regex
+ * literal containing a quote character (`blankNonCode` does not lex regexes, so
+ * it reads on into string-blanking mode); and a key sharing its source line
+ * with anything else, since `readTimeoutLiteral` is line-anchored
  * (`environment: "node", testTimeout: 60_000,` reads as undeclared). Each
  * surfaces as a loud `null`, never as a false green.
  */
@@ -143,7 +145,11 @@ export function extractTestBlock(source) {
   // without resolving `defineConfig`/`mergeConfig`/spreads. Refuse rather than
   // guess: guessing the first would scan a shared base object whose timeouts
   // bind nothing, and report a package as covered while it runs at 5s/10s.
-  if ((code.match(/^\s*test\s*:\s*\{/gm) ?? []).length > 1) return null;
+  // Counted WITHOUT the line anchor the selection match below uses, on purpose.
+  // Anchoring the count reopens the hole one orientation out: a line-anchored
+  // base block plus an INLINE exported one counts 1, the guard stays quiet, and
+  // the base block is selected. `\b` keeps `latest:` and friends out.
+  if ((code.match(/\btest\s*:\s*\{/g) ?? []).length > 1) return null;
   const open = code.match(/^\s*test\s*:\s*\{/m);
   if (!open) return null;
   const start = open.index + open[0].length;
@@ -231,12 +237,13 @@ test('extractTestBlock refuses a file with more than one test: {} block', () => 
   // A shared base object whose timeouts are never spread into the exported
   // config. Taking the FIRST block reads 120_000/120_000 off `base` and reports
   // the package as covered while Vitest runs it at 5s/10s — a false green over
-  // precisely the regression this guard exists to stop. Note the base block
-  // must be line-anchored to be a candidate at all: written inline
-  // (`const base = { test: { ... } };`) it is invisible to the line-anchored
-  // match, and the file then reads as declaring nothing and fails CLOSED for a
-  // different reason. This shape is the one that actually reaches a false green.
-  const twoBlocks = [
+  // precisely the regression this guard exists to stop.
+  //
+  // Both orientations are fixtures because the multiplicity count and the
+  // selection match use DIFFERENT regexes: the count is anchorless, selection
+  // is line-anchored. Shape C is the one a line-anchored COUNT misses — it
+  // counts 1, so the guard stays quiet and selects the dead base block.
+  const twoBlocksAnchored = [
     'const base = {',
     '  test: {',
     '    testTimeout: 120_000,',
@@ -250,8 +257,34 @@ test('extractTestBlock refuses a file with more than one test: {} block', () => 
     '});',
     '',
   ].join('\n');
-  assert.equal(extractTestBlock(twoBlocks), null);
-  assert.equal(readTimeoutLiteral(extractTestBlock(twoBlocks) ?? '', 'testTimeout'), null);
+  assert.equal(extractTestBlock(twoBlocksAnchored), null);
+  assert.equal(readTimeoutLiteral(extractTestBlock(twoBlocksAnchored) ?? '', 'testTimeout'), null);
+
+  // Shape C: line-anchored base, INLINE export. Measured at 08352aac this read
+  // testTimeout=120000 hookTimeout=120000 off `base` and passed green.
+  const anchoredBaseInlineExport = [
+    'const base = {',
+    '  test: {',
+    '    testTimeout: 120_000,',
+    '    hookTimeout: 120_000,',
+    '  },',
+    '};',
+    'export default defineConfig({ test: { environment: "node" } });',
+    '',
+  ].join('\n');
+  assert.equal(extractTestBlock(anchoredBaseInlineExport), null);
+  assert.equal(
+    readTimeoutLiteral(extractTestBlock(anchoredBaseInlineExport) ?? '', 'testTimeout'),
+    null,
+  );
+
+  // Fully inline: never reached a false green even before the anchorless count,
+  // because the line-anchored SELECTION match finds nothing and returns null.
+  // Kept as a fixture so that path stays covered if the anchors ever move.
+  const bothInline =
+    'const base = { test: { testTimeout: 120_000 } };\n' +
+    'export default defineConfig({ test: { environment: "node" } });\n';
+  assert.equal(extractTestBlock(bothInline), null);
 });
 
 test('readTimeoutLiteral parses, and refuses what it cannot vouch for', () => {
