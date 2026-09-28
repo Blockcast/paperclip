@@ -731,4 +731,30 @@ describe("buildGithubTruthProbe", () => {
     expect(r.probeFailed).toBe(true);
     expect(r.detections["review:ally-clean"]).toBeUndefined();
   });
+
+  // The comment surface refuses a `tracked` deferral as `deferred_finding`; the
+  // formal surface must too, because on an App-authored PR the formal review is
+  // the only artifact and the comment surface reads not_evaluated.
+  //
+  // The default fixture author is `some-human`, i.e. INDEPENDENT, and that is
+  // load-bearing here: the BLO-34969 independence gate would withhold this
+  // detection on its own for a self-attested body, so a self-attested fixture
+  // would make this row pass whether or not the deferral is honored. The
+  // deferral must be the only reason the detection is absent.
+  it("a formal 0/0 review at head carrying a tracked deferral is not clean", async () => {
+    const tracked = clean.replace(
+      "### Recommended Action",
+      "### Prior Findings Dispositioned (1)\n- **prior:abcdef0 important 1** - tracked - accepted onto BLO-36822.\n\n### Recommended Action",
+    );
+    const r = await buildGithubTruthProbe(
+      deps({
+        listReviewerSurfaces: async () => ({
+          reviews: [{ login: ALLY, body: tracked, state: "COMMENTED", commitId: HEAD, submittedAt: "2026-09-06T00:00:00Z" }],
+          comments: [],
+        }),
+      }),
+    )({ workProducts: [wp()] });
+    expect(r.detections["review:ally-clean"]).toBeUndefined();
+    expect(r.probeFailed).toBe(false);
+  });
 });
