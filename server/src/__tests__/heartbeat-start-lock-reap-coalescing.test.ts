@@ -145,6 +145,69 @@ describeEmbeddedPostgres("start-lock orphan reap coalescing (BLO-36922)", () => 
     expect(dispositions).toEqual(["ran", "joined", "joined"]);
   });
 
+  it("does not serve a caller that arrives mid-sweep the in-flight sweep's stale result", async () => {
+    await seedFleet(3);
+    process.env.AGENT_START_LOCK_REAP_TTL_MS = "0";
+    const heartbeat = heartbeatService(db);
+    const first = deferred<null>();
+    const second = deferred<null>();
+    let calls = 0;
+    listManagedAgentJobsMock.mockImplementation(async () => {
+      calls += 1;
+      return calls === 1 ? first.promise : second.promise;
+    });
+
+    const early = heartbeat.reapOrphanedRunsForStartLock();
+    // The first sweep has read fleet state, so anything arriving now would get
+    // a snapshot from before it woke if it joined this sweep.
+    await vi.waitFor(() => expect(calls).toBe(1));
+    let lateSettled = false;
+    const late = [
+      heartbeat.reapOrphanedRunsForStartLock(),
+      heartbeat.reapOrphanedRunsForStartLock(),
+    ];
+    void Promise.all(late).then(() => {
+      lateSettled = true;
+    });
+
+    first.resolve(null);
+    expect(await early).toBe("ran");
+    // The guard: late callers are not released by the sweep that predates
+    // them. They wait for a second sweep, which they share.
+    await vi.waitFor(() => expect(calls).toBe(2));
+    expect(lateSettled).toBe(false);
+    second.resolve(null);
+    expect(await Promise.all(late)).toEqual(["ran", "joined"]);
+    expect(calls).toBe(2);
+  });
+
+  it("serves mid-sweep arrivals from the chained sweep when the in-flight one fails", async () => {
+    await seedFleet(1);
+    process.env.AGENT_START_LOCK_REAP_TTL_MS = "0";
+    const heartbeat = heartbeatService(db);
+    const first = deferred<null>();
+    let calls = 0;
+    listManagedAgentJobsMock.mockImplementation(async () => {
+      calls += 1;
+      if (calls === 1) {
+        await first.promise;
+        throw new Error("apiserver unreachable");
+      }
+      return null;
+    });
+
+    const early = heartbeat.reapOrphanedRunsForStartLock();
+    await vi.waitFor(() => expect(calls).toBe(1));
+    const late = heartbeat.reapOrphanedRunsForStartLock();
+    first.resolve(null);
+
+    // The failure belongs to the sweep's own caller. The late caller never
+    // depended on that sweep, so it gets its own result instead.
+    await expect(early).rejects.toThrow("apiserver unreachable");
+    expect(await late).toBe("ran");
+    expect(calls).toBe(2);
+  });
+
   it("skips a second sweep inside the freshness TTL, and runs again once it lapses", async () => {
     await seedFleet(2);
     process.env.AGENT_START_LOCK_REAP_TTL_MS = "60000";
