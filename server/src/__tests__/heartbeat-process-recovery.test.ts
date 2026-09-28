@@ -2719,7 +2719,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // substring form.
     expect(notice[0]?.body).not.toMatch(/push(?:ing)? a new head/i);
     // The band that lets a reader tell a dead review from a slow one (BLO-34410).
-    expect(notice[0]?.body).toContain("p50 of ~4h11m");
+    // Pattern, not literal: this asserts that a band IS named, not that it is
+    // forever 4h11m. BLO-34410 invites re-measurement, and a re-measure should
+    // not turn a correct notice into a red test.
+    expect(notice[0]?.body).toMatch(/p50 of ~\d+h\d+m/);
     // ...and the three things a push actually costs, named.
     expect(notice[0]?.body).toContain("still in flight");
     expect(notice[0]?.body).toContain("pending review-request marker at the old head");
