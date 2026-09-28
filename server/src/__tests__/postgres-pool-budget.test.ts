@@ -19,17 +19,6 @@ const BUDGET_PATH = fileURLToPath(
   new URL("../../../doc/DATABASE-CONNECTION-BUDGET.md", import.meta.url),
 );
 
-/** Peak concurrent application processes sharing this Postgres instance. */
-const PEAK_APP_PROCESSES = 4;
-
-/**
- * Non-application connections the budget reserves: postgres-exporter,
- * overlapping `psql` cronjob one-shots, transient `createUtilitySql` pools and
- * operator headroom. Kept as one number because the budget doc is where the
- * breakdown belongs.
- */
-const NON_APP_RESERVED = 17;
-
 function readBudget(): string {
   return readFileSync(BUDGET_PATH, "utf8");
 }
@@ -53,21 +42,40 @@ describe("postgres connection budget", () => {
     expect(stated).toBe(POSTGRES_POOL_MAX);
   });
 
-  it("keeps peak demand inside the server's advertised ceiling", () => {
+  it("keeps peak demand inside the server's ceiling with the stated margin", () => {
     const doc = readBudget();
+
+    // Every input is parsed, none restated. An earlier revision hardcoded the
+    // peak-process count and the non-application reserve here while parsing the
+    // other two, which let the half that encodes the consumer model drift out
+    // of step with the doc silently — the exact failure mode this file exists
+    // to catch, reproduced one level up.
     const maxConnections = readNumber(doc, /\| `max_connections` \| \*\*(\d+)\*\*/, "max_connections");
     const superuserReserved = readNumber(
       doc,
       /\| `superuser_reserved_connections` \| \*\*(\d+)\*\*/,
       "superuser_reserved_connections",
     );
+    const appPoolBudget = readNumber(doc, /^= *(\d+) +for application pools$/m, "application pool budget");
+    const margin = readNumber(doc, /^− *(\d+) +estimation margin$/m, "estimation margin");
+    const peakAppProcesses = readNumber(doc, /^÷ *(\d+) +peak processes/m, "peak processes");
 
     const availableToPaperclip = maxConnections - superuserReserved;
-    const peakDemand = PEAK_APP_PROCESSES * POSTGRES_POOL_MAX + NON_APP_RESERVED;
+    // Derived, not restated: whatever the arithmetic block does not hand to
+    // application pools is by definition reserved for everything else.
+    const nonAppReserved = availableToPaperclip - appPoolBudget;
+    const peakDemand = peakAppProcesses * POSTGRES_POOL_MAX + nonAppReserved;
 
     // The failure this guards is asymmetric: too small is a client-side queue,
     // too large is Postgres refusing connections outright. Only the second one
     // takes the fleet down, so the ceiling is the side that gets the assertion.
-    expect(peakDemand).toBeLessThanOrEqual(availableToPaperclip);
+    //
+    // The margin is subtracted rather than merely documented. Asserting against
+    // the bare ceiling passes at exact equality — peak demand consuming 100% of
+    // what the role can open — and the doc is explicit that its own inputs are
+    // declared configuration rather than observed backends. One un-modelled
+    // consumer past a zero-slack budget is `FATAL: sorry, too many clients
+    // already`, so the guard has to fail before the ceiling, not at it.
+    expect(peakDemand).toBeLessThanOrEqual(availableToPaperclip - margin);
   });
 });
