@@ -7565,7 +7565,7 @@ export function recoveryService(
       // stamp, and escalates then — the cost of losing the race is one status-only wake
       // out of the attempt budget, not a permanent status-only trap.
       // On the caller tx: this runs while `lockIssueOwnership` is held, so a pooled
-      // read would take a second connection out of POSTGRES_POOL_MAX=10 while holding
+      // read would take a second connection out of POSTGRES_POOL_MAX while holding
       // the lock (BLO-34207). Freshness is unchanged — these transactions run at
       // READ COMMITTED, where each statement takes its own snapshot at statement
       // start, so the tx read observes exactly the committed rows a pooled read would.

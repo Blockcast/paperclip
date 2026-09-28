@@ -1353,7 +1353,7 @@ describe("startServer feedback export wiring", () => {
   // bounding the convoy — a tail pass walks 147 stranded candidates
   // sequentially, each taking the company-wide issue-graph advisory lock,
   // against a 30 s tick, so two overlapping passes contend with EACH OTHER and
-  // starve `POSTGRES_POOL_MAX=10`. It had no regression guard, which is the
+  // starve `POSTGRES_POOL_MAX`. It had no regression guard, which is the
   // "test passes while missing the real failure mode" shape: every other test
   // in this file is satisfied by an unlatched implementation.
   //

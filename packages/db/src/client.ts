@@ -60,7 +60,7 @@ export type ApplyPendingMigrationsOptions = {
 /**
  * Connection-pool ceiling for the application client.
  *
- * This was previously postgres.js's implicit default (also 10), which meant
+ * This was previously postgres.js's implicit default of 10, which meant
  * callers that must reason about pool capacity had no value to read and could
  * only restate the number in prose. Declaring it here makes it a single source
  * of truth: `PR_REVIEWER_WAKE_MAX_CONCURRENCY` in `routes/github-webhook.ts`
@@ -74,17 +74,23 @@ export type ApplyPendingMigrationsOptions = {
  *
  * ---
  *
- * BLO-35946 AC3 asked for this value to be reconciled against its consumers.
- * It has been measured, and the honest answer is that **10 is inherited, not
- * deliberate, and it is below steady-state demand.** Recorded here rather than
- * changed, because sizing it needs the server-side `max_connections` budget
- * across all replicas and no such budget is documented in either
- * `Blockcast/paperclip` or `Blockcast/onprem-k8s`. Changing the number without
- * it would trade a client-side queue for a server-side connection refusal.
+ * BLO-35946 AC3 asked for this value to be reconciled against its consumers,
+ * and BLO-37330 then sized it. The server-side ceiling it has to fit inside is
+ * written down in `doc/DATABASE-CONNECTION-BUDGET.md` — read that before
+ * changing this number, and re-derive it there rather than here.
  *
- * Measured against this constant (2026-09-24, single API/worker process, one
- * shared pool — note `server/src/index.ts:543` may create a *second* 10-slot
- * pool for `databaseMigrationUrl`):
+ * In short (measured 2026-09-28): `max_connections` 100 −
+ * `superuser_reserved_connections` 3 = 97 on a single `paperclip-pg` instance;
+ * ~17 of those go to the postgres-exporter, overlapping `psql` cronjob
+ * one-shots, transient `createUtilitySql` pools and operator headroom; the
+ * remaining 80 divides across a peak of **4** application processes (3
+ * `paperclip-api` pods mid-rollout at `maxSurge: 1`, plus the 1 worker), which
+ * is what puts this at 20. Raising it further needs `max_connections` raised
+ * on the server in the same change, or Postgres starts refusing connections
+ * instead of the client queueing — the worse failure.
+ *
+ * 10 was never deliberate: it was postgres.js's inherited default, and it sat
+ * below steady-state demand. Measured against a single process on 2026-09-24:
  *
  * | source                                              | connections |
  * |-----------------------------------------------------|-------------|
@@ -95,25 +101,31 @@ export type ApplyPendingMigrationsOptions = {
  * | agent run executions                                 | unbounded  |
  *
  * These are not mutually exclusive — they share one pool in one process — so a
- * conservative floor is ~19 concurrent demands with zero API traffic.
+ * conservative floor is ~19 concurrent demands with zero API traffic, which 10
+ * did not clear and 20 does.
+ *
+ * There is no second application pool in production: `server/src/index.ts:553`
+ * creates one only when `DATABASE_MIGRATION_URL` is set
+ * (`server/src/config.ts:1154`), and that is unset on both workloads.
  *
  * {@link POSTGRES_POOL_MAX} has exactly one derived consumer,
- * `derivePrReviewerWakeMaxConcurrency` (`routes/github-webhook.ts:3013`), which
- * yields 4 and reserves 8 of the 10 on the reasoning that `2 * bound < poolMax`.
- * That derivation implicitly assumes the PR path is the only thing on the pool,
- * which the table above contradicts.
+ * `derivePrReviewerWakeMaxConcurrency` (`routes/github-webhook.ts`), which now
+ * yields 9 and reserves 18 of the 20 on the reasoning that `2 * bound <
+ * poolMax`. That derivation still assumes the PR path is the only thing on the
+ * pool, which the table above contradicts — the larger pool widens the margin
+ * but does not repair the assumption.
  *
- * Exactly one live nested acquire remains (`github-webhook.ts:3092` takes a
- * transaction-scoped advisory lock, then `heartbeat.wakeup()` inside it opens
- * its own claim transaction at `heartbeat.ts:23786`). Every other nesting path
- * — recovery, issues, environment leases, both outboxes — was converted to
- * thread `tx` through rather than take a second pooled connection, which is why
- * the two prior incidents at this number (`server/src/index.ts:1114`,
- * `services/issues.ts:5723`) were each fixed by removing a nest rather than by
- * sizing the pool. That is the pattern this note exists to flag: the number has
- * now been paid for twice and never re-derived.
+ * Exactly one live nested acquire remains (`withPrReviewerTaskLock` in
+ * `routes/github-webhook.ts` takes a transaction-scoped advisory lock, then
+ * `heartbeat.wakeup()` inside it opens its own claim transaction). Every other
+ * nesting path — recovery, issues, environment leases, both outboxes — was
+ * converted to thread `tx` through rather than take a second pooled connection,
+ * which is why the two prior incidents at this number
+ * (`server/src/index.ts:1114`, `services/issues.ts:5723`) were each fixed by
+ * removing a nest rather than by sizing the pool. That last one is kept
+ * deliberately; the reason is recorded at its call site.
  */
-export const POSTGRES_POOL_MAX = 10;
+export const POSTGRES_POOL_MAX = 20;
 
 /**
  * How long a pooled application connection may sit inside an open transaction
