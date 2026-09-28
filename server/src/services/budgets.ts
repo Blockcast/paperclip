@@ -532,38 +532,81 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
     // to prevent -- against a measured ~5h board decision latency. The soft card
     // fires at warnPercent, where the same $11,200 of remaining cap is ~9 days of
     // runway at the worst observed burn. The hard card is untouched.
-    const approval = await insertApproval(db, {
-      companyId: policy.companyId,
-      type: "budget_override_required",
-      requestedByUserId: null,
-      requestedByAgentId: null,
-      status: "pending",
-      payload,
-      idempotencyKey: budgetApprovalIdempotencyKey(policy.id, thresholdType, start),
-    })
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    //
+    // Claim the incident FIRST, in one transaction, and let the card follow it. The
+    // `existing` read above is an unlocked fast path, not a guard, so it cannot stop
+    // two watcher passes from both reaching this point; the only serialization either
+    // row has is `budget_incidents_policy_window_threshold_idx`, the partial unique
+    // index on (policy_id, window_start, threshold_type). Filing the approval first
+    // put that index *after* the card, so both passes committed a card and only the
+    // loser then collided -- and because a server-filed card has both requester
+    // columns null, neither partial index in 0212_approval_create_idempotency.sql
+    // covers it (both require a non-null requester) and its `idempotencyKey` is
+    // decorative. Withdraw is requester-scoped, so the orphan was board-only to
+    // clear and the queue accrued one at every threshold crossing (BLO-37275).
+    return db.transaction(async (tx) => {
+      const claimed = await tx
+        .insert(budgetIncidents)
+        .values({
+          companyId: policy.companyId,
+          policyId: policy.id,
+          scopeType: policy.scopeType,
+          scopeId: policy.scopeId,
+          metric: policy.metric,
+          windowKind: policy.windowKind,
+          windowStart: start,
+          windowEnd: end,
+          thresholdType,
+          amountLimit: policy.amount,
+          amountObserved,
+          status: "open",
+          approvalId: null,
+        })
+        .onConflictDoNothing()
+        .returning()
+        .then((rows) => rows[0] ?? null);
 
-    const incident = await db
-      .insert(budgetIncidents)
-      .values({
+      // Lost the race: a concurrent pass committed this incident, and its card, between
+      // our read above and this insert. Return the winner's row rather than filing a
+      // second card for one threshold crossing. A *dismissed* incident is outside the
+      // partial index, so re-crossing after a dismissal still claims a fresh row here.
+      if (!claimed) {
+        const winner = await tx
+          .select()
+          .from(budgetIncidents)
+          .where(
+            and(
+              eq(budgetIncidents.policyId, policy.id),
+              eq(budgetIncidents.windowStart, start),
+              eq(budgetIncidents.thresholdType, thresholdType),
+              ne(budgetIncidents.status, "dismissed"),
+            ),
+          )
+          .then((rows) => rows[0] ?? null);
+        return winner ? { incident: winner, created: false } : null;
+      }
+
+      const approval = await insertApproval(tx as unknown as Db, {
         companyId: policy.companyId,
-        policyId: policy.id,
-        scopeType: policy.scopeType,
-        scopeId: policy.scopeId,
-        metric: policy.metric,
-        windowKind: policy.windowKind,
-        windowStart: start,
-        windowEnd: end,
-        thresholdType,
-        amountLimit: policy.amount,
-        amountObserved,
-        status: "open",
-        approvalId: approval?.id ?? null,
+        type: "budget_override_required",
+        requestedByUserId: null,
+        requestedByAgentId: null,
+        status: "pending",
+        payload,
+        idempotencyKey: budgetApprovalIdempotencyKey(policy.id, thresholdType, start),
       })
-      .returning()
-      .then((rows) => rows[0] ?? null);
-    return incident ? { incident, created: true } : null;
+        .returning()
+        .then((rows) => rows[0] ?? null);
+
+      const linked = await tx
+        .update(budgetIncidents)
+        .set({ approvalId: approval?.id ?? null, updatedAt: new Date() })
+        .where(eq(budgetIncidents.id, claimed.id))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+
+      return { incident: linked ?? claimed, created: true };
+    });
   }
 
   async function resolveOpenSoftIncidents(policyId: string) {

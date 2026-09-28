@@ -44,11 +44,21 @@ function createDbStub(selectResults: SelectResult[]) {
   const insert = vi.fn(() => ({
     values: insertValues.mockImplementation(() => ({
       returning: insertReturning,
+      // createIncidentIfNeeded claims the incident row with onConflictDoNothing so the
+      // partial unique index serializes concurrent passes (BLO-37275).
+      onConflictDoNothing: () => ({ returning: insertReturning }),
     })),
   }));
 
   const updateSet = vi.fn();
-  const updateWhere = vi.fn(async () => pendingUpdates.shift() ?? []);
+  // Awaitable for `await db.update().set().where()`, and also `.returning()`-able for
+  // the approval-linking update in createIncidentIfNeeded.
+  const updateWhere = vi.fn(() => {
+    const rows = pendingUpdates.shift() ?? [];
+    const result = Promise.resolve(rows) as Promise<unknown[]> & { returning: () => Promise<unknown[]> };
+    result.returning = async () => rows;
+    return result;
+  });
   const update = vi.fn(() => ({
     set: updateSet.mockImplementation(() => ({
       where: updateWhere,
@@ -58,12 +68,17 @@ function createDbStub(selectResults: SelectResult[]) {
   const pendingInserts: unknown[][] = [];
   const pendingUpdates: unknown[][] = [];
 
+  const db: Record<string, unknown> = {
+    select,
+    insert,
+    update,
+  };
+  // createIncidentIfNeeded writes the incident and its card in one transaction; the
+  // stub runs the callback inline against itself, which is all these tests observe.
+  db.transaction = vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn(db));
+
   return {
-    db: {
-      select,
-      insert,
-      update,
-    },
+    db,
     queueInsert: (rows: unknown[]) => {
       pendingInserts.push(rows);
     },
@@ -147,12 +162,22 @@ describe("budgetService", () => {
       [{ firstEventAt: new Date("2026-08-01T00:00:00Z") }],
     ]);
 
+    // Incident first, then its card: createIncidentIfNeeded claims the incident row
+    // up front so the partial unique index serializes concurrent passes, and links
+    // the card to it afterwards (BLO-37275).
+    dbStub.queueInsert([{
+      id: "incident-1",
+      companyId: "company-1",
+      policyId: "policy-1",
+      approvalId: null,
+    }]);
     dbStub.queueInsert([{
       id: "approval-1",
       companyId: "company-1",
       status: "pending",
     }]);
-    dbStub.queueInsert([{
+    // The linking update, then the agent pause.
+    dbStub.queueUpdate([{
       id: "incident-1",
       companyId: "company-1",
       policyId: "policy-1",
@@ -185,8 +210,12 @@ describe("budgetService", () => {
         thresholdType: "hard",
         amountLimit: 100,
         amountObserved: 150,
-        approvalId: "approval-1",
+        // Claimed before the card exists; the link is the update asserted below.
+        approvalId: null,
       }),
+    );
+    expect(dbStub.updateSet).toHaveBeenCalledWith(
+      expect.objectContaining({ approvalId: "approval-1" }),
     );
     expect(dbStub.updateSet).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -617,6 +646,73 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
       expect(call.details).not.toHaveProperty("prompt");
       expect(call.details).not.toHaveProperty("message");
     }
+  });
+
+  it("files exactly one card when two passes cross the same threshold concurrently (BLO-37275)", async () => {
+    const { companyId, agentId } = await createBudgetFixture();
+    const cancelWorkForScope = vi.fn().mockResolvedValue(undefined);
+    const service = budgetService(db, { cancelWorkForScope });
+    const [policy] = await db
+      .insert(budgetPolicies)
+      .values({
+        companyId,
+        scopeType: "agent",
+        scopeId: agentId,
+        metric: "billed_cents",
+        windowKind: "calendar_month_utc",
+        amount: 100,
+        warnPercent: 80,
+        // Warn only: the hard path resolves and re-files incidents, which would
+        // measure a different race than the one this pins.
+        hardStopEnabled: false,
+        notifyEnabled: true,
+        isActive: true,
+      })
+      .returning();
+
+    const softEvent = await insertCostEvent({ companyId, agentId, costCents: 80 });
+
+    // Concurrent, NOT sequential -- the sequential double-evaluate above already
+    // passes on the unfixed code, because the unlocked `existing` read catches the
+    // second pass. Two passes in flight together both clear that read before either
+    // writes, which is the 126 ms production race (cards 1b2264ec / 3c254101).
+    // `allSettled` so the unfixed failure reads as the count assertion below rather
+    // than as an opaque unique-violation rejection: unfixed, both passes commit a
+    // card and the loser then dies on budget_incidents_policy_window_threshold_idx.
+    const outcomes = await Promise.allSettled([
+      service.evaluateCostEvent(softEvent),
+      service.evaluateCostEvent(softEvent),
+    ]);
+
+    // Card count first: the defect is the duplicate CARD, and the rejection asserted
+    // below is only its side effect. Unfixed, this reads "expected 2 to be 1" -- a
+    // server-filed card has both requester columns null, so withdraw (requester-scoped)
+    // is board-only and a duplicate here is unclearable by any agent, not just untidy.
+    const approvalRows = await db.select().from(approvals).where(eq(approvals.companyId, companyId));
+    expect(approvalRows).toHaveLength(1);
+    expect(approvalRows[0]).toMatchObject({
+      type: "budget_override_required",
+      status: "pending",
+      requestedByAgentId: null,
+      requestedByUserId: null,
+    });
+
+    const incidentRows = await db
+      .select()
+      .from(budgetIncidents)
+      .where(eq(budgetIncidents.companyId, companyId));
+    expect(incidentRows).toHaveLength(1);
+    expect(incidentRows[0]).toMatchObject({ thresholdType: "soft", status: "open" });
+    expect(approvalRows[0]!.idempotencyKey).toBe(
+      `budget:${policy!.id}:soft:${incidentRows[0]!.windowStart.toISOString()}`,
+    );
+    // The surviving incident still points at the surviving card: the losing pass
+    // must not leave the winner's incident unlinked.
+    expect(incidentRows[0]!.approvalId).toBe(approvalRows[0]!.id);
+
+    // Unfixed, the loser commits its card and only then collides on
+    // budget_incidents_policy_window_threshold_idx, so this reads ["fulfilled","rejected"].
+    expect(outcomes.map((outcome) => outcome.status)).toEqual(["fulfilled", "fulfilled"]);
   });
 
   it("files the override card at warnPercent with multi-day runway, once, while the scope is still running (BLO-28793)", async () => {
