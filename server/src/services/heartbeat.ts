@@ -15327,7 +15327,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .set({
               status: "cancelled",
               finishedAt: now,
-              error: reason,
+              error: sanitizeRunErrorForStorage(reason),
               errorCode: "issue_monitor_live_consumer_expired",
               updatedAt: now,
             })
