@@ -562,7 +562,23 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
           status: "open",
           approvalId: null,
         })
-        .onConflictDoNothing()
+        // Targeted, not bare: a bare DO NOTHING swallows *any* unique violation on
+        // this table, so a second unique index added later would be silently
+        // reinterpreted as "lost the race", the winner-select below would find no
+        // row, and the card would never be filed -- a silent no-op in the exact path
+        // this reorder exists to make reliable. Restating the partial predicate is
+        // the cost, and it fails the safe way round: an inference spec that stops
+        // matching the index raises 42P10 at query time and reddens the concurrency
+        // test below, where a bare DO NOTHING would just stop filing cards.
+        //
+        // `where`, NOT `targetWhere`: drizzle 0.45.2 only reads `targetWhere` from
+        // the onConflictDoUpdate config. onConflictDoNothing takes `{ target, where }`
+        // and drops any other key, which emits a bare `on conflict (cols) do nothing`
+        // with no predicate -- that matches no partial index and is itself a 42P10.
+        .onConflictDoNothing({
+          target: [budgetIncidents.policyId, budgetIncidents.windowStart, budgetIncidents.thresholdType],
+          where: sql`${budgetIncidents.status} <> 'dismissed'`,
+        })
         .returning()
         .then((rows) => rows[0] ?? null);
 
