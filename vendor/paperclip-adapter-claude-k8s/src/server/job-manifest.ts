@@ -102,12 +102,27 @@ export function buildPodLogPath(companyId: string, agentId: string, runId: strin
  *  path straight into that rejection, three times taking a routine fully dark
  *  (BLO-36854). Staying under MAX_ARG_STRLEN closes it — every prompt the kernel
  *  would reject now takes the Secret path, which already existed and is
- *  unchanged. 8 KiB of headroom covers the `PROMPT_CONTENT=` prefix.
+ *  unchanged. The 8 KiB gap below MAX_ARG_STRLEN is deliberate slack, not a
+ *  measured requirement: the `PROMPT_CONTENT=` prefix costs 15 bytes, and the
+ *  remaining ~8 KiB is margin. Do not reclaim it on the theory that the prefix
+ *  grew — it never will by more than a few bytes.
  *
  *  Note this bounds only the ENV path. The Secret path keeps its own ~1 MiB
  *  ceiling, so a prompt above that still fails — but loudly, at Secret creation,
  *  instead of silently in an init container. */
 const LARGE_PROMPT_THRESHOLD_BYTES = 120 * 1024;
+
+/** Linux `MAX_ARG_STRLEN` — 32 pages. Caps ONE `NAME=value` string passed to
+ *  `execve`, independently of the total arg+env budget and of the ~1 MiB
+ *  PodSpec limit. `strnlen_user` counts the terminating NUL, so the largest
+ *  payload that actually fits is one byte under. */
+const MAX_ARG_STRLEN = 131_072;
+const MAX_ENV_STRING_BYTES = MAX_ARG_STRLEN - 1;
+
+const WAKE_PAYLOAD_ENV_NAME = "PAPERCLIP_WAKE_PAYLOAD_JSON";
+/** Budget for the value alone — the kernel bounds the whole `NAME=value`. */
+const WAKE_PAYLOAD_MAX_VALUE_BYTES = MAX_ENV_STRING_BYTES - (WAKE_PAYLOAD_ENV_NAME.length + 1);
+
 const RUNTIME_CACHE_VOLUME_NAME = "runtime-cache";
 const RUNTIME_CACHE_MOUNT_PATH = "/runtime-cache";
 const RUNTIME_CACHE_SIZE_LIMIT = "20Gi";
@@ -310,11 +325,61 @@ function joinPromptSections(sections: string[], separator = "\n\n"): string {
   return sections.filter((s) => s.trim().length > 0).join(separator);
 }
 
+/** Shed an oversize wake payload down to something `execve` will accept.
+ *
+ *  The server caps every large term it builds (comment bodies 8 x 4_000 chars,
+ *  continuation summary 4_000, child summaries 20) — but passes each comment's
+ *  `metadata` and `presentation` through raw, and the comment-metadata schema
+ *  permits 20 sections x 50 rows x 4_000 chars (~4 MB, 30x this ceiling). So
+ *  the reachable maximum is unbounded by anything upstream even though the
+ *  measured maximum is ~10 KB (BLO-37287, AC1).
+ *
+ *  Sheds rather than truncates: a sliced JSON string is unparseable, which
+ *  would lose the whole payload instead of the largest part of it. Both tiers
+ *  set the existing `truncated`/`fallbackFetchNeeded` contract, which the agent
+ *  skill already documents as "fetch the thread from the API", so no wake
+ *  context is silently dropped (AC3). */
+function shedOversizeWakePayload(wake: Record<string, unknown>): string {
+  const flags = { truncated: true, fallbackFetchNeeded: true, payloadShed: true };
+  const comments = Array.isArray(wake.comments) ? wake.comments : [];
+
+  // Tier 1: drop only the two uncapped passthrough fields. Everything the
+  // server already bounded — including every comment body — survives.
+  const tier1 = JSON.stringify({
+    ...wake,
+    ...flags,
+    comments: comments.map((c) =>
+      c && typeof c === "object" ? { ...(c as Record<string, unknown>), metadata: null, presentation: null } : c,
+    ),
+  });
+  if (Buffer.byteLength(tier1, "utf8") <= WAKE_PAYLOAD_MAX_VALUE_BYTES) return tier1;
+
+  // Tier 2: routing identifiers only. Every string is bounded HERE rather than
+  // trusted from upstream, so this tier cannot exceed the budget no matter what
+  // the server sent — that is what makes the PodSpec invariant total.
+  const cap = (v: unknown, n: number) => (typeof v === "string" ? v.slice(0, n) : null);
+  const issue = wake.issue && typeof wake.issue === "object" ? (wake.issue as Record<string, unknown>) : null;
+  return JSON.stringify({
+    ...flags,
+    reason: cap(wake.reason, 200),
+    issue: issue
+      ? { id: cap(issue.id, 64), identifier: cap(issue.identifier, 64), title: cap(issue.title, 240) }
+      : null,
+    commentIds: (Array.isArray(wake.commentIds) ? wake.commentIds : [])
+      .filter((v): v is string => typeof v === "string")
+      .slice(0, 8)
+      .map((v) => v.slice(0, 64)),
+    latestCommentId: cap(wake.latestCommentId, 64),
+  });
+}
+
 function stringifyPaperclipWakePayload(wake: unknown): string | null {
   if (!wake || typeof wake !== "object") return null;
   try {
     const json = JSON.stringify(wake);
-    return json === "{}" ? null : json;
+    if (json === "{}") return null;
+    if (Buffer.byteLength(json, "utf8") <= WAKE_PAYLOAD_MAX_VALUE_BYTES) return json;
+    return shedOversizeWakePayload(wake as Record<string, unknown>);
   } catch {
     return null;
   }
