@@ -23,7 +23,7 @@
  * the same run reported `import 51.94s`. An ejection costs a full re-traverse
  * of a ~64-deep queue.
  *
- * Deliberately NOT a glob over every vitest.config.ts. The three packages are
+ * Deliberately NOT a glob over every vitest.config.ts. The four packages are
  * named because the claim is specific — these boot a real database — and a
  * repo-wide floor would be a different, unmeasured policy. Add a package here
  * when it starts booting one.
@@ -35,10 +35,13 @@
  * the `null` path tested below, and failing CLOSED. Placement was the hole that
  * fails silently, and it is closed at BOTH levels: outside `test: {}`, and
  * inside a nested child of it (`sequence`, `poolOptions.forks`, `coverage`),
- * where Vitest equally ignores the key. Two known ceilings, both failing
- * CLOSED: a computed value, and a regex literal containing a quote character
+ * where Vitest equally ignores the key. Three known ceilings, all failing
+ * CLOSED: a computed value; a regex literal containing a quote character
  * (`blankNonCode` does not lex regexes, so it reads on into string-blanking
- * mode). Each surfaces as a loud `null`, never as a false green.
+ * mode); and a key sharing its source line with anything else, since
+ * `readTimeoutLiteral` is line-anchored (`environment: "node", testTimeout:
+ * 60_000,` reads as undeclared). Each surfaces as a loud `null`, never as a
+ * false green.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -56,12 +59,18 @@ const EMBEDDED_DB_PACKAGES = [
   'packages/db',
   'packages/plugins/paperclip-plugin-alertmanager',
   // 237 of server's test files reach `startEmbeddedPostgresTestDatabase`/`new
-  // PGlite(` — the largest exposure of the three, and the precedent the other
-  // two configs cite. Its run path passes no timeout flags at all
+  // PGlite(` — the largest exposure of the four, and the precedent the other
+  // configs cite. Its run path passes no timeout flags at all
   // (`serializedServerVitestArgs` in run-vitest-stable.mjs is only
   // `--no-file-parallelism --maxWorkers=1`), so its config file is the single
   // thing holding these values.
   'server',
+  // Same shape as server, one package out: `startEmbeddedPostgresTestDatabase`
+  // at five call sites across worktree/routines/company-import-export, and its
+  // own config names "the embedded-Postgres + real-git-worktree integration
+  // suites here". Runs as project `paperclipai` in group A, invoked with the
+  // same `serializedServerVitestArgs` — so no CLI fallback here either.
+  'cli',
 ];
 
 /**
