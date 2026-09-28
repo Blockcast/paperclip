@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { activityLog, agents, companies, companySkills, createDb, heartbeatRuns } from "@paperclipai/db";
+import { activityLog, agents, authUsers, companies, companySkills, createDb, heartbeatRuns } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -139,15 +139,24 @@ describeEmbeddedPostgres("truncateCompanyScopedTestState", () => {
   });
 
   /**
-   * Regression cover for BLO-35765.
+   * BLO-35765: the same failure mode with a different straggler.
    *
-   * Same shape, different straggler. `company-skills-service.test.ts` had no
-   * supertest in it at all — there the surviving writer is a test that blew its
-   * 60s budget. Vitest fails a timed-out test but does not cancel it, so its
-   * `forkSkill` calls keep inserting into `company_skills` while `afterEach`
-   * runs. `company_skills.company_id` has no `onDelete` action, so a straggler
-   * landing between `delete(companySkills)` and `delete(companies)` breaks the
-   * parent delete and buries the timeout under a second annotation.
+   * `company-skills-service.test.ts` had no supertest in it at all -- there the
+   * surviving writer is a test that blew its 60s budget. Vitest fails a
+   * timed-out test but does not cancel it, so its `forkSkill` calls keep
+   * inserting into `company_skills` while `afterEach` runs.
+   * `company_skills.company_id` has no `onDelete` action, so a straggler landing
+   * between `delete(companySkills)` and `delete(companies)` breaks the parent
+   * delete and buries the timeout under a second annotation.
+   *
+   * What these tests do NOT do: guard that file's `afterEach`. Reverting it to
+   * the ordered delete list fails none of them, because a race inside another
+   * suite's hook cannot be forced deterministically from here. What they pin
+   * instead is the helper: the first test documents the wedged state the race
+   * leaves behind, on which the ordered list's remaining `delete(companies)`
+   * step fails; the second proves the helper, called with the exact options
+   * that `afterEach` passes, clears that same state; the third is a smoke test
+   * only.
    */
   async function seedSkillCompany() {
     const companyId = randomUUID();
@@ -191,8 +200,37 @@ describeEmbeddedPostgres("truncateCompanyScopedTestState", () => {
     expect(cause?.constraint_name).toBe("company_skills_company_id_companies_id_fk");
   });
 
-  it("cannot be made to fail by company_skills writes racing it concurrently", async () => {
+  it("clears that same straggler state with the options company-skills-service.test.ts passes", async () => {
     const companyId = await seedSkillCompany();
+    await db.delete(companySkills);
+    await insertStragglerSkill(companyId);
+    // `authUsers` is not reachable from the companies cascade, which is why that
+    // suite's `afterEach` must name its physical table, "user", explicitly.
+    const now = new Date();
+    await db.insert(authUsers).values({
+      id: randomUUID(),
+      name: "Straggler User",
+      email: `straggler-${randomUUID()}@example.com`,
+      emailVerified: true,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await truncateCompanyScopedTestState(db, { extraTruncateTables: ["user"] });
+
+    expect(await db.select().from(companySkills)).toHaveLength(0);
+    expect(await db.select().from(companies)).toHaveLength(0);
+    expect(await db.select().from(authUsers)).toHaveLength(0);
+  });
+
+  it("smoke: survives company_skills writes racing it concurrently", async () => {
+    const companyId = await seedSkillCompany();
+
+    // Not regression cover. There is no forcing mechanism, so these assertions
+    // hold under every interleaving: a straggler that commits first is
+    // truncated, one that blocks is rejected and swallowed. It fails only if the
+    // helper itself throws under concurrent writers, and it cannot prove the
+    // race window was ever entered.
 
     const stragglers = Array.from({ length: 12 }, () =>
       insertStragglerSkill(companyId).catch(() => "rejected-harmlessly"),
