@@ -1887,6 +1887,32 @@ function isTerminalGateClosableTriggerSet(triggers: unknown) {
     && triggers.every((trigger) => trigger === "long_active_duration");
 }
 
+// BLO-37071: which triggers an *unchanged run sample* excuses. Only
+// `runtime_failure_streak`, and the scoping is the whole point.
+//
+// `runtime_failure_streak` is computed by walking `latestRuns` newest-first and
+// breaking on the first non-infra-failure run. That query carries no time
+// predicate (`collectEvidence`, `MAX_RUNS_FOR_STREAK`), so on a source that has
+// stopped running the sample is frozen: the streak can never acquire a
+// streak-breaker, and the trigger re-fires forever over byte-identical
+// evidence. A review already resolved against that exact sample has answered
+// everything the next one could say.
+//
+// `long_active_duration` is deliberately excluded and must stay excluded: its
+// evidence is elapsed wall-clock from `issues.started_at` to `now`, which grows
+// precisely *because* nothing is running. Suppressing it on a frozen sample
+// would be a new false negative — the case it exists to catch. `high_churn`,
+// `no_comment_streak` and `runaway_execution` are excluded for the same reason
+// in weaker form: none of them is a pure function of `latestRuns`, so an
+// unchanged sample is not evidence that their evidence is unchanged.
+//
+// Set form, and every trigger must match: a review that also fired anything
+// else still files.
+function isUnchangedSampleClosableTriggerSet(triggers: unknown) {
+  return Array.isArray(triggers) && triggers.length > 0
+    && triggers.every((trigger) => trigger === "runtime_failure_streak");
+}
+
 // Close-path form: the persisted `details.firedTriggers` when the review was
 // minted with one, else the single `details.trigger` for rows written before
 // BLO-22436's follow-up. The fallback is deliberately the *old* behaviour and
@@ -2392,6 +2418,38 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .orderBy(desc(issues.updatedAt))
       .limit(1)
       .then((rows) => rows[0] ?? null);
+  }
+
+  /**
+   * BLO-37071: `createdAt` of the newest already-resolved review on this source,
+   * or null when it has none.
+   *
+   * Deliberately `createdAt` and not `updatedAt`, and deliberately unbounded in
+   * time. The question this answers is "what run sample had a review already
+   * been minted against", which is fixed at mint time — `updatedAt` moves when
+   * the review is resolved, which would let a slow triage make a sample look
+   * newer than the evidence it was drawn from. And a frozen sample stays frozen
+   * indefinitely, so any cutoff here would just re-open the loop it closes.
+   *
+   * `cancelled` counts alongside `done`: both mean a human or manager has seen
+   * this evidence and stopped. Matches `findRecentResolvedProductivityReview`.
+   */
+  async function findLatestTerminalProductivityReviewCreatedAt(companyId: string, sourceIssueId: string) {
+    return db
+      .select({ createdAt: issues.createdAt })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
+          eq(issues.originId, sourceIssueId),
+          inArray(issues.status, ["done", "cancelled"]),
+          visibleIssueCondition(),
+        ),
+      )
+      .orderBy(desc(issues.createdAt), desc(issues.id))
+      .limit(1)
+      .then((rows) => rows[0]?.createdAt ?? null);
   }
 
   async function hasRepeatedTerminalReviewsInBackoff(companyId: string, sourceIssueId: string, now: Date) {
@@ -3211,6 +3269,44 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     logger.info(
       details,
       "productivity review long_active_duration suppressed by an already-resolved terminal gate (BLO-27515)",
+    );
+  }
+
+  /**
+   * BLO-37071: a `runtime_failure_streak` review was already resolved against
+   * this exact run sample and no run has happened since. Recorded on the source
+   * issue so the next reader can tell "the detector stayed quiet because nothing
+   * changed" from "the detector stopped firing".
+   */
+  async function recordUnchangedSampleSuppression(
+    sourceIssue: IssueRow,
+    evidence: ProductivityReviewEvidence,
+    priorReviewCreatedAt: Date,
+    newestRunCreatedAt: Date,
+  ) {
+    const details = {
+      source: "productivity_review.reconcile",
+      sourceIssueId: sourceIssue.id,
+      trigger: evidence.trigger,
+      firedTriggers: evidence.firedTriggers,
+      suppressedBy: "unchanged_run_sample",
+      priorTerminalReviewCreatedAt: priorReviewCreatedAt.toISOString(),
+      newestSampledRunCreatedAt: newestRunCreatedAt.toISOString(),
+      runtimeFailureStreak: evidence.runtimeFailureStreak,
+    };
+    await logActivity(db, {
+      companyId: sourceIssue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: sourceIssue.assigneeAgentId,
+      action: "issue.productivity_review_suppressed",
+      entityType: "issue",
+      entityId: sourceIssue.id,
+      details,
+    });
+    logger.info(
+      details,
+      "productivity review runtime_failure_streak suppressed: run sample unchanged since the last resolved review (BLO-37071)",
     );
   }
 
@@ -5402,6 +5498,19 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       return { kind: "creation_capped" as const, reviewIssueId: null };
     }
 
+    // BLO-37071: this cap asks "has anyone touched the SOURCE ISSUE between
+    // reviews" — `countConsecutiveNoActionProductivityReviews` walks
+    // `activityLog` rows on the source. It is NOT a sample-staleness check, and
+    // the two only coincide while a row is completely untouched.
+    //
+    // Read that limit literally before relying on it: on a
+    // `runtime_failure_streak` source, ANY activityLog row — a comment from
+    // another lane, a label, a priority edit, a dependency sweep — resets this
+    // streak to 0 and re-arms `maxConsecutiveNoActionReviews` more reviews over
+    // a byte-identical frozen run sample. That it bounded the BLO-37071 loop at
+    // 3 was coincidence, not design. The sample-staleness gate in
+    // `reconcileProductivityReviews` supplements this cap; neither replaces the
+    // other.
     const consecutiveNoActionReviews = await countConsecutiveNoActionProductivityReviews(
       evidence.sourceIssue.companyId,
       evidence.sourceIssue.id,
@@ -5945,6 +6054,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       approvalGatedSuppressed: 0,
       dependencyBlockedSuppressed: 0,
       terminalGateResolvedSuppressed: 0,
+      // BLO-37071: its own counter, deliberately not folded into `snoozed`.
+      // The field measurement this gate ships with has to distinguish "the
+      // sample-staleness gate fired" from "cadence caps fired"; a shared
+      // counter makes that unreadable.
+      unchangedSampleSuppressed: 0,
       closedSuppressedMonitorReviews: 0,
       closedTerminalSourceReviews: 0,
       closedDependencyBlockedReviews: 0,
@@ -6206,6 +6320,35 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       if (await hasRepeatedTerminalReviewsInBackoff(candidate.companyId, candidate.id, now)) {
         result.snoozed += 1;
         continue;
+      }
+      // BLO-37071. Placed after the two cadence snoozes so it costs a query only
+      // on candidates that would otherwise mint, and after `collectEvidence`
+      // because it needs `latestRuns`.
+      //
+      // Both no-ops below are load-bearing (AC3). A source with no resolved
+      // review, or with no sampled runs at all, falls straight through — a gate
+      // that matched those would degrade the detector to "never fires", which is
+      // indistinguishable from "fixed".
+      //
+      // The empty-`latestRuns` arm is unreachable today and is kept as
+      // fail-open defence, not as live coverage: the only trigger this gate
+      // accepts needs `noCommentStreakRuns` sampled runs to fire at all, so an
+      // empty sample cannot reach here. Say that rather than implying a
+      // mutation-tested guard — if the accepted set ever widens, the arm starts
+      // carrying weight and needs a real test then.
+      if (isUnchangedSampleClosableTriggerSet(evidence.firedTriggers)) {
+        const newestSampledRunAt = evidence.latestRuns[0]?.createdAt ?? null;
+        if (newestSampledRunAt) {
+          const priorTerminalReviewAt = await findLatestTerminalProductivityReviewCreatedAt(
+            candidate.companyId,
+            candidate.id,
+          );
+          if (priorTerminalReviewAt && newestSampledRunAt.getTime() <= priorTerminalReviewAt.getTime()) {
+            await recordUnchangedSampleSuppression(candidate, evidence, priorTerminalReviewAt, newestSampledRunAt);
+            result.unchangedSampleSuppressed += 1;
+            continue;
+          }
+        }
       }
       let prefix = prefixCache.get(candidate.companyId);
       if (!prefix) {
