@@ -717,6 +717,25 @@ export const KNOWN_RETRY_SCHEDULE_REASONS = [
 ] as const;
 export type RetryScheduleReasonLabel = (typeof KNOWN_RETRY_SCHEDULE_REASONS)[number];
 /**
+ * Coerce a raw `scheduled_retry_reason` to the allow-list above. Shared by the
+ * outcome counter and the park-horizon gauge so the two cannot drift apart:
+ * a reason present on one and folded to `other` on the next would make a
+ * per-reason alert bound and its rate series disagree about the same park.
+ */
+export function coerceRetryScheduleReason(reason: string | null | undefined): RetryScheduleReasonLabel {
+  return (KNOWN_RETRY_SCHEDULE_REASONS as readonly string[]).includes(reason ?? "")
+    ? (reason as RetryScheduleReasonLabel)
+    : "other";
+}
+/**
+ * Placeholder `reason` for an agent with no live parked run. Keeps the
+ * BLO-25036 invariant that every known agent always carries a series, without
+ * zero-filling the agent x reason cross product. Deliberately outside
+ * {@link KNOWN_RETRY_SCHEDULE_REASONS}: it is not a park class, it is always 0,
+ * and an alert rule that bounded it would be bounding nothing.
+ */
+export const NO_SCHEDULED_RETRY_PARK_REASON = "none";
+/**
  * postgres.js connection-pool occupancy, by `state` (BLO-33243).
  *
  * There was no pool instrumentation anywhere in this fleet, which made pool
@@ -2647,7 +2666,7 @@ function ensureRegistry(): {
   queuedRunAgeMetricsRefreshSuccessGauge: Gauge;
   overdueScheduledRetryOldestAgeGauge: Gauge<"agent_id">;
   overdueScheduledRetryAgeMetricsRefreshSuccessGauge: Gauge;
-  scheduledRetryParkHorizonGauge: Gauge<"agent_id">;
+  scheduledRetryParkHorizonGauge: Gauge<"agent_id" | "reason">;
   scheduledRetryParkHorizonRefreshSuccessGauge: Gauge;
   dbPoolConnectionsGauge: Gauge<"state">;
   dbPoolWaitingQueriesGauge: Gauge;
@@ -2924,8 +2943,15 @@ function ensureRegistry(): {
     queuedRunAgeMetricsRefreshSuccess.set(0);
     scheduledRetryParkHorizon = new Gauge({
       name: SCHEDULED_RETRY_PARK_HORIZON_METRIC,
-      help: "Booked scheduled_retry park horizon in seconds, by agent.",
-      labelNames: ["agent_id"],
+      help:
+        "Booked scheduled_retry park horizon in seconds, by agent and park reason (BLO-31174). "
+        + "`reason` is load-bearing, not decoration: legitimate ceilings differ by class and span "
+        + "288x (max_turns_continuation 300s, ccrotate_capacity 900s, dependency_blocked 3600s, "
+        + "transient_failure 9000s), so any single threshold across all of them fires on designed "
+        + "backoff in one class while missing a 6x clamp breach in another. Bound each reason "
+        + "against its own constant. reason='none' is a zero-filled placeholder meaning the agent "
+        + "has no live park at all -- it is not a park class and must never carry a bound.",
+      labelNames: ["agent_id", "reason"],
       registers: [registry],
     });
     scheduledRetryParkHorizonRefreshSuccess = new Gauge({
@@ -4086,9 +4112,7 @@ export function recordRetryScheduleOutcome(
     outcome: (KNOWN_RETRY_SCHEDULE_OUTCOMES as readonly string[]).includes(input.outcome ?? "")
       ? (input.outcome as RetryScheduleOutcomeLabel)
       : ("other" as const),
-    retry_reason: (KNOWN_RETRY_SCHEDULE_REASONS as readonly string[]).includes(input.retryReason ?? "")
-      ? (input.retryReason as RetryScheduleReasonLabel)
-      : ("other" as const),
+    retry_reason: coerceRetryScheduleReason(input.retryReason),
   };
   ensureRegistry().retryScheduleOutcomeCounter.inc(labels);
   return labels;
@@ -4372,23 +4396,46 @@ export function setQueuedRunAgeMetricsRefreshSuccess(success: boolean): void {
   ensureRegistry().queuedRunAgeMetricsRefreshSuccessGauge.set(success ? 1 : 0);
 }
 
-/** Publish the maximum booked park horizon for each live scheduled retry. */
+/**
+ * Publish the maximum booked park horizon for each live scheduled retry, keyed
+ * by agent AND park reason (BLO-31174). Aggregating across reasons was the
+ * second defect on this gauge: `max by (agent_id)` over classes whose ceilings
+ * span 288x can only be thresholded at a value that is simultaneously below one
+ * class's designed backoff and above another's clamp.
+ */
 export function setScheduledRetryParkHorizonMetrics(
-  entries: ReadonlyArray<{ agentId: string | null | undefined; horizonSeconds: number }>,
+  entries: ReadonlyArray<{
+    agentId: string | null | undefined;
+    reason: string | null | undefined;
+    horizonSeconds: number;
+  }>,
   knownAgentIds: ReadonlySet<string>,
 ): void {
   const gauge = ensureRegistry().scheduledRetryParkHorizonGauge;
   gauge.reset();
-  const maxByAgentId = new Map<string, number>();
+  // Every known agent carries a zero placeholder, so a drained agent reads 0
+  // rather than vanishing. Emitted unconditionally: `none` is always 0, so it
+  // can never win a `max by (agent_id)` over a real park, which is what keeps
+  // the pre-BLO-31174 fleet-wide rule reading exactly as it did before.
+  for (const agentId of knownAgentIds) {
+    gauge.set({ agent_id: agentId, reason: NO_SCHEDULED_RETRY_PARK_REASON }, 0);
+  }
+  const maxByLabels = new Map<string, { agentId: string; reason: string; horizonSeconds: number }>();
   for (const entry of entries) {
     const agentId = normalizeAgentId(entry.agentId, knownAgentIds);
+    const reason = coerceRetryScheduleReason(entry.reason);
     const horizonSeconds = Number.isFinite(entry.horizonSeconds) ? Math.max(0, entry.horizonSeconds) : 0;
-    const current = maxByAgentId.get(agentId);
-    if (current === undefined || horizonSeconds > current) maxByAgentId.set(agentId, horizonSeconds);
+    // Distinct reasons can fold to the same `other` label, so re-max here
+    // rather than trusting the query's GROUP BY to have produced unique keys.
+    const key = `${agentId} ${reason}`;
+    const current = maxByLabels.get(key);
+    if (current === undefined || horizonSeconds > current.horizonSeconds) {
+      maxByLabels.set(key, { agentId, reason, horizonSeconds });
+    }
   }
-  for (const agentId of knownAgentIds) gauge.set({ agent_id: agentId }, maxByAgentId.get(agentId) ?? 0);
-  const unknownHorizon = maxByAgentId.get(UNKNOWN_AGENT_ID);
-  if (unknownHorizon !== undefined) gauge.set({ agent_id: UNKNOWN_AGENT_ID }, unknownHorizon);
+  for (const { agentId, reason, horizonSeconds } of maxByLabels.values()) {
+    gauge.set({ agent_id: agentId, reason }, horizonSeconds);
+  }
 }
 
 export function setScheduledRetryParkHorizonRefreshSuccess(success: boolean): void {

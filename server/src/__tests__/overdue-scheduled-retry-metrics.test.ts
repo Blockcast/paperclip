@@ -452,7 +452,7 @@ describeEmbeddedPostgres("refreshOverdueScheduledRetryAgeMetrics (BLO-22094)", (
 
     await refreshScheduledRetryParkHorizonMetrics(db);
     const { body } = await renderMetrics();
-    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}"} 1594`);
+    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}",reason="other"} 1594`);
     expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_REFRESH_SUCCESS_METRIC} 1`);
   });
 
@@ -476,7 +476,7 @@ describeEmbeddedPostgres("refreshOverdueScheduledRetryAgeMetrics (BLO-22094)", (
     await refreshScheduledRetryParkHorizonMetrics(db);
     await refreshOverdueScheduledRetryAgeMetrics(db, now);
     const { body } = await renderMetrics();
-    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}"} 518000`);
+    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}",reason="other"} 518000`);
     expect(body).toContain(`paperclip_overdue_scheduled_retry_oldest_age_seconds{agent_id="${agentId}"} 0`);
   });
 
@@ -513,7 +513,7 @@ describeEmbeddedPostgres("refreshOverdueScheduledRetryAgeMetrics (BLO-22094)", (
     // Each booking chose one hour, so the gauge must read one hour regardless of
     // how long the row has been re-parking. Against created_at this read 39600
     // and breached the 5400s alert threshold ~7x over on a healthy row.
-    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}"} 3600`);
+    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}",reason="dependency_blocked"} 3600`);
   });
 
   it("does not report a negative horizon for a re-touched past-due park", async () => {
@@ -537,6 +537,64 @@ describeEmbeddedPostgres("refreshOverdueScheduledRetryAgeMetrics (BLO-22094)", (
 
     await refreshScheduledRetryParkHorizonMetrics(db);
     const { body } = await renderMetrics();
-    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}"} 0`);
+    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}",reason="other"} 0`);
+  });
+
+  // BLO-31174 second defect. The guard is the SEPARATION, not the labelling: on
+  // one agent, a designed transient park and a clamp-breaching capacity park are
+  // indistinguishable to `max by (agent_id)`, which returns the transient value
+  // and hides the capacity one entirely. Without the `reason` groupBy this test
+  // fails on both counts -- the two rows collapse to a single series carrying
+  // 8630, and the 3600 is simply gone.
+  it("separates park classes so a clamp breach is not masked by designed backoff", async () => {
+    const { companyId, agentId } = await insertCompanyAndAgent();
+    const now = new Date("2026-09-28T01:16:00.000Z");
+    const base = {
+      companyId,
+      agentId,
+      invocationSource: "assignment" as const,
+      status: "scheduled_retry" as const,
+      contextSnapshot: {},
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    await db.insert(heartbeatRuns).values([
+      {
+        ...base,
+        // The observed 2026-09-28 re-fire: 7200s final ladder hop x 1.1987
+        // jitter, inside the designed [7200, 9000] band. Healthy.
+        scheduledRetryAt: new Date(now.getTime() + 8_630_000),
+        scheduledRetryAttempt: 4,
+        scheduledRetryReason: "transient_failure",
+      },
+      {
+        ...base,
+        // 4x past CCROTATE_CAPACITY_MAX_PARK_MS (900s). This is the writer bug
+        // class BLO-28919 fixed, and it is what the detector exists to catch.
+        scheduledRetryAt: new Date(now.getTime() + 3_600_000),
+        scheduledRetryAttempt: 2,
+        scheduledRetryReason: "ccrotate_capacity",
+      },
+    ]);
+
+    await refreshScheduledRetryParkHorizonMetrics(db);
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}",reason="transient_failure"} 8630`);
+    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}",reason="ccrotate_capacity"} 3600`);
+  });
+
+  it("zero-fills an agent with no live park without inventing a park class", async () => {
+    const { agentId } = await insertCompanyAndAgent();
+
+    await refreshScheduledRetryParkHorizonMetrics(db);
+    const { body } = await renderMetrics();
+    // The BLO-25036 invariant: a drained agent reads 0 rather than vanishing.
+    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}",reason="none"} 0`);
+    // `none` is a placeholder, not a class. Nothing may ever bound it above 0,
+    // so assert it cannot be confused with a real reason carrying a real value.
+    expect(body).not.toMatch(
+      new RegExp(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}\\{agent_id="${agentId}",reason="none"\\} [1-9]`),
+    );
   });
 });

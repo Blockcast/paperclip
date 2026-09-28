@@ -261,6 +261,20 @@ export async function refreshOverdueScheduledRetryAgeMetrics(db: Db, now = new D
  * understatement, not a blind spot.
  *
  * `queued_at` represents a later promotion back to queued and must not be used.
+ *
+ * The result is grouped by `scheduled_retry_reason` as well as agent, and the
+ * reason is published as a gauge label (BLO-31174, second defect). The classes
+ * this column selects among have legitimate maxima that differ by 288x -- 300s
+ * for `max_turns_continuation` and k8s isolation, 900s for `ccrotate_capacity`,
+ * 3,600s for `dependency_blocked` (`Math.min(..., 3_600_000)`), 9,000s for the
+ * `transient_failure` ladder's final 2h hop plus 25% jitter -- so a single
+ * threshold aggregated over all of them is wrong in both directions at once. At
+ * the 5,400s bound the alert shipped with, every run reaching transient attempt
+ * 4 breaches BY DESIGN (1,016 breaching samples across 12 agents in the 7 days
+ * to 2026-09-28, every one inside [5590, 8978], i.e. below the transient
+ * ceiling), while a capacity park sitting at 4x its own 900s clamp -- the writer
+ * bug BLO-28919 fixed -- stays invisible. Bound each reason against its own
+ * constant instead of retuning one number.
  */
 export async function refreshScheduledRetryParkHorizonMetrics(db: Db): Promise<void> {
   try {
@@ -269,17 +283,19 @@ export async function refreshScheduledRetryParkHorizonMetrics(db: Db): Promise<v
       db
         .select({
           agentId: heartbeatRuns.agentId,
+          reason: heartbeatRuns.scheduledRetryReason,
           horizonSeconds: sql<number | string>`max(extract(epoch from ${heartbeatRuns.scheduledRetryAt} - ${heartbeatRuns.updatedAt}))`,
         })
         .from(heartbeatRuns)
         .where(and(eq(heartbeatRuns.status, "scheduled_retry"), isNotNull(heartbeatRuns.scheduledRetryAt)))
-        .groupBy(heartbeatRuns.agentId),
+        .groupBy(heartbeatRuns.agentId, heartbeatRuns.scheduledRetryReason),
     ]);
 
     const knownAgentIds = new Set(agentRows.map((row) => row.id));
     setScheduledRetryParkHorizonMetrics(
       horizonByAgent.map((row) => ({
         agentId: row.agentId,
+        reason: row.reason,
         // Clamp as the overdue sibling does: a row whose due time has already
         // passed can be touched again (see the known limit above), which would
         // otherwise surface a negative horizon. Lateness is BLO-22094's gauge.
