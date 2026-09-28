@@ -555,6 +555,162 @@ describe("credential health (BLO-20572)", () => {
   });
 });
 
+/**
+ * BLO-37485 — per-delivery timing.
+ *
+ * The API tier abandons this request at 120s and Alertmanager then discards
+ * the whole batch, but the handler has no deadline of its own and keeps
+ * running. Before this instrumentation the worker recorded nothing about how
+ * long a delivery took, which is why the class read as "invisible from the
+ * worker side" — the evidence was never written, not merely unread.
+ *
+ * Time is advanced inside a mocked host call rather than by counting
+ * `Date.now()` calls, so these stay honest if the handler's call count
+ * changes.
+ */
+describe("handleWebhook — delivery timing (BLO-37485)", () => {
+  const stubClock = (startMs: number) => {
+    let nowMs = startMs;
+    const spy = vi.spyOn(Date, "now").mockImplementation(() => nowMs);
+    return {
+      spy,
+      advance: (byMs: number) => {
+        nowMs += byMs;
+      },
+    };
+  };
+
+  it("reports duration, delivery count and batch size on a normal delivery", async () => {
+    const { ctx, mocks } = mkCtx();
+    const clock = stubClock(1_000_000);
+    mocks.issues.create.mockImplementation(async () => {
+      clock.advance(250);
+      return { id: "issue-1" };
+    });
+
+    try {
+      await handleWebhook(ctx, baseConfig(), true, baseInput());
+    } finally {
+      clock.spy.mockRestore();
+    }
+
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.webhook.duration_ms",
+      250,
+    );
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.webhook.completed",
+      1,
+    );
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.webhook.alerts_received",
+      1,
+    );
+    // A fast delivery must not be counted as a destroyed batch, or the metric
+    // that is supposed to measure AC3 reads non-zero forever.
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.webhook.deadline_exceeded",
+      1,
+    );
+  });
+
+  it("counts a delivery that outran the 120s proxy deadline", async () => {
+    const { ctx, mocks } = mkCtx();
+    const clock = stubClock(1_000_000);
+    mocks.issues.create.mockImplementation(async () => {
+      clock.advance(130_000);
+      return { id: "issue-1" };
+    });
+
+    try {
+      await handleWebhook(ctx, baseConfig(), true, baseInput());
+    } finally {
+      clock.spy.mockRestore();
+    }
+
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.webhook.duration_ms",
+      130_000,
+    );
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.webhook.deadline_exceeded",
+      1,
+    );
+  });
+
+  it("names the alert in flight once a delivery passes the halfway mark", async () => {
+    const { ctx, mocks } = mkCtx();
+    const envelope = baseEnvelope({
+      alerts: [
+        baseAlert(),
+        baseAlert({
+          labels: { alertname: "ArcRunnerPoolSaturated", severity: "warning" },
+          fingerprint: "ffff0000ffff0000",
+        }),
+      ],
+    });
+    const clock = stubClock(1_000_000);
+    mocks.issues.create.mockImplementation(async () => {
+      clock.advance(70_000);
+      return { id: "issue-1" };
+    });
+
+    try {
+      await handleWebhook(
+        ctx,
+        baseConfig(),
+        true,
+        baseInput({ parsedBody: envelope, rawBody: JSON.stringify(envelope) }),
+      );
+    } finally {
+      clock.spy.mockRestore();
+    }
+
+    const slow = mocks.logger.warn.mock.calls
+      .map((call) => String(call[0]))
+      .filter((line) => line.includes("slow delivery"));
+
+    // Exactly one: the warning latches, so a 29-alert batch cannot emit 29
+    // near-identical lines and bury the delivery that matters.
+    expect(slow).toHaveLength(1);
+    // The attribution AC1 asks for — which alert, and how far in.
+    expect(slow[0]).toContain("ArcRunnerPoolSaturated");
+    expect(slow[0]).toContain("ffff0000ffff0000");
+    expect(slow[0]).toContain("1 of 2 alerts");
+  });
+
+  it("stays silent on a delivery that never approaches the deadline", async () => {
+    const { ctx, mocks } = mkCtx();
+    await handleWebhook(ctx, baseConfig(), true, baseInput());
+    expect(
+      mocks.logger.warn.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.includes("slow delivery")),
+    ).toHaveLength(0);
+  });
+
+  it("still completes the delivery when the timing metric write fails", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.metrics.write.mockImplementation(async (name: string) => {
+      if (name === "alertmanager.webhook.duration_ms") {
+        throw new Error("metrics backend unavailable");
+      }
+    });
+
+    // Telemetry is best-effort everywhere else in this handler; timing must not
+    // become the one metric that can fail a delivery and force a retry.
+    await expect(
+      handleWebhook(ctx, baseConfig(), true, baseInput()),
+    ).resolves.toBeUndefined();
+
+    expect(
+      mocks.logger.error.mock.calls
+        .map((call) => String(call[0]))
+        .some((line) => line.includes("failed to record delivery timing")),
+    ).toBe(true);
+  });
+});
+
 describe("handleWebhook — schema validation", () => {
   it("drops malformed payloads (writes a metric, returns 200-equivalent)", async () => {
     const { ctx, mocks } = mkCtx();
