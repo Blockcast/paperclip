@@ -2064,16 +2064,35 @@ export async function startServer(): Promise<StartedServer> {
               .finally(() => {
                 // Read the duration BEFORE clearing the start stamp. A backwards
                 // clock must not produce a negative value on a gauge that only
-                // ever means "how long did this take".
-                recordHeartbeatRecoveryChainDuration(
-                  Math.max(0, Date.now() - heartbeatRecoveryChainStartedAt),
-                );
-                // No pass is outstanding now. Leaving the previous value behind
-                // would keep the overlap alert firing against a worker that has
-                // already recovered.
-                recordHeartbeatRecoveryChainInflight(0);
+                // ever means "how long did this take". Captured into a local
+                // rather than recorded here, because the latch must be cleared
+                // first — see below.
+                const elapsedMs = Math.max(0, Date.now() - heartbeatRecoveryChainStartedAt);
+                // Clear the latch BEFORE any fallible call. Both recorders route
+                // through `ensureRegistry()` and prom-client validates on `.set()`,
+                // so either can throw; a throw between here and the clear would
+                // leave the latch set and every later tick would take the skip
+                // branch for the life of the process — orphan reaping, retry
+                // promotion, stranded-issue reconciliation and the watchdogs all
+                // halted until restart. The rejection is swallowed by
+                // `trackHeartbeatSchedulerWork`, so that wedge would be silent.
+                // Same reasoning as the watchdog's own `try`/`catch` above:
+                // losing a metric sample is survivable, losing the chain is the
+                // outage.
                 heartbeatRecoveryChainInFlight = false;
                 heartbeatRecoveryChainStartedAt = 0;
+                try {
+                  recordHeartbeatRecoveryChainDuration(elapsedMs);
+                  // No pass is outstanding now. Leaving the previous value behind
+                  // would keep the overlap alert firing against a worker that has
+                  // already recovered.
+                  recordHeartbeatRecoveryChainInflight(0);
+                } catch (err) {
+                  logger.error(
+                    { err },
+                    "failed to record heartbeat recovery chain settle metrics; chain latch already cleared",
+                  );
+                }
               }));
           } else {
             // Every skipped tick, not just the stalled ones: a sustained skip

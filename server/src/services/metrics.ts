@@ -5651,9 +5651,16 @@ export function recordHeartbeatRecoveryChainSkipped(): void {
   ensureRegistry().heartbeatRecoveryChainSkippedCounter.inc();
 }
 
-/** PEN-3314: a recovery chain settled (success or failure) after `durationMs`. */
+/**
+ * PEN-3314: a recovery chain settled (success or failure) after `durationMs`.
+ *
+ * Clamped here as well as at the call site, matching
+ * `recordHeartbeatRecoveryChainInflight`. Both gauges mean "a duration", and
+ * both are equally undefined on a backwards clock, so the guarantee belongs to
+ * the metric rather than to its one caller.
+ */
 export function recordHeartbeatRecoveryChainDuration(durationMs: number): void {
-  ensureRegistry().heartbeatRecoveryChainDurationGauge.set(durationMs / 1000);
+  ensureRegistry().heartbeatRecoveryChainDurationGauge.set(Math.max(0, durationMs) / 1000);
 }
 
 /**

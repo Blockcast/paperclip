@@ -1,11 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-// PEN-3314: deliberately the real metrics module, not a mock — see the
-// recovery-chain series test below for why a spy would not prove anything.
+// PEN-3314: deliberately the real metrics module, save for ONE pass-through
+// override — see the `vi.mock` below and the recovery-chain series test for why
+// a blanket spy would not prove anything.
 import {
   HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC,
   HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC,
   HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC,
   HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC,
+  recordHeartbeatRecoveryChainDuration,
   renderMetrics,
 } from "../services/metrics.js";
 
@@ -232,6 +234,20 @@ vi.mock("@paperclipai/db", async (importOriginal) => ({
   formatDatabaseBackupResult: vi.fn(() => "ok"),
   runDatabaseBackup: vi.fn(),
 }));
+
+// PEN-3314 review follow-up: a PASS-THROUGH partial mock, not a replacement.
+// Every export stays the genuine article — including `renderMetrics` and the
+// metric-name constants — so the recovery-chain series test below still drives
+// the real recorder all the way to the rendered `/metrics` body. The single
+// wrapped function exists only so the wedge-safety test can force it to throw;
+// its default implementation is the real one, delegated to on every call.
+vi.mock("../services/metrics.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/metrics.js")>();
+  return {
+    ...actual,
+    recordHeartbeatRecoveryChainDuration: vi.fn(actual.recordHeartbeatRecoveryChainDuration),
+  };
+});
 
 vi.mock("../app.js", () => ({
   createApp: createAppMock,
@@ -1466,6 +1482,88 @@ describe("startServer feedback export wiring", () => {
       await tickUntilTailRuns(4);
     } finally {
       releaseTail?.();
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  // PEN-3314 review follow-up: the latch must be cleared BEFORE the settle
+  // path's fallible recorders, so a throwing metrics call costs a sample rather
+  // than the chain.
+  //
+  // The test above proves the latch releases when the pass resolves and when it
+  // rejects. Both of those are the pass's own outcome. This one covers the third
+  // way `.finally` can exit — a throw raised INSIDE the `.finally` body itself —
+  // which neither of them reaches, because both recorders are called with real
+  // values that never throw. That is exactly why the original ordering shipped
+  // review-clean: no test made a recorder fail.
+  //
+  // The consequence being guarded is total and silent. `trackHeartbeatSchedulerWork`
+  // maps both settlement arms to `undefined`, so a throw here produces no
+  // unhandled rejection, no crash and no log; the only evidence would be every
+  // later tick taking the skip branch for the life of the process, halting
+  // orphan reaping, retry promotion, stranded-issue reconciliation and the
+  // watchdogs until restart.
+  //
+  // ⚠️ Whole-file run only, same `setInterval`/`unref` reason as the test above.
+  it("clears the recovery-chain latch even when a settle recorder throws", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    const durationMock = vi.mocked(recordHeartbeatRecoveryChainDuration);
+
+    // Same shape as the test above: the release is observable only by a LATER
+    // tick running the tail again, so tick until it does. A latch that never
+    // releases simply never satisfies this and times out.
+    const tickUntilTailRuns = async (times: number) =>
+      vi.waitFor(() => {
+        intervalCallback?.();
+        expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalledTimes(times);
+      });
+
+    try {
+      await startServer();
+      // Order against the startup recovery sequence before touching the latch —
+      // a tick returns early while `heartbeatStartupRecoveryPending` is true.
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalledTimes(1));
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockClear();
+      durationMock.mockClear();
+
+      // Fail the FIRST recorder on the settle path, which is the worst case: it
+      // is the earliest fallible call, so an implementation that clears the latch
+      // after any of them is caught here.
+      durationMock.mockImplementationOnce(() => {
+        throw new Error("prom-client registry blew up");
+      });
+
+      // Pass 1 runs and settles straight through the throwing recorder.
+      await tickUntilTailRuns(1);
+      await vi.waitFor(() => expect(durationMock).toHaveBeenCalledTimes(1));
+
+      // Positive control. Without this the test would also pass if the recorder
+      // were never called at all — in which case nothing was proved about a
+      // throw, and the assertion below would be satisfied by an ordinary settle.
+      expect(durationMock.mock.results[0]?.type).toBe("throw");
+
+      // The assertion. The latch was cleared before the throw, so a later tick
+      // starts a new pass. With the clears back after the recorders this times
+      // out, because the chain is wedged for the life of the process.
+      await tickUntilTailRuns(2);
+    } finally {
+      durationMock.mockReset();
+      durationMock.mockImplementation(
+        (await vi.importActual<typeof import("../services/metrics.js")>("../services/metrics.js"))
+          .recordHeartbeatRecoveryChainDuration,
+      );
       setIntervalSpy.mockRestore();
     }
   });
