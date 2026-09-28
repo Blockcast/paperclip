@@ -78,14 +78,6 @@ function policyJobCap(region = jobRegion("policy")) {
   return cap;
 }
 
-test("policy keeps headroom for cold checkout and setup", () => {
-  const cap = policyJobCap();
-  assert.ok(
-    cap >= 20,
-    `policy needs at least a 20m cap for cold full-depth checkout plus setup; found ${cap}m`,
-  );
-});
-
 function stepName(step) {
   return step.split("\n")[0].trim();
 }
@@ -141,6 +133,25 @@ function assertTimeouts(steps, cap = policyJobCap()) {
     );
   }
 }
+
+// The `policy` job cap is a hang detector sized by the BLO-35615 rule in
+// pr.yml, not a performance budget, so this pins only a floor: the smaller of
+// that rule's two branches as last derived (`ceil( 364 / 19.2 ) = 19`, the W95
+// branch; the 6 x T_best branch gives 22). What must fail loudly is a revert
+// toward the old 10m, which BLO-31690 measured as truncating healthy runs
+// (healthy max 600s = the cap). Any value the rule yields today passes. If a
+// later BLO-35615 pass lands both branches below 19, lower this constant in
+// the same change as pr.yml and cite that pass; do not raise the cap to fit.
+const POLICY_JOB_CAP_FLOOR_MINUTES = 19;
+
+test("policy job cap stays at or above the BLO-35615 hang-detector floor", () => {
+  const cap = policyJobCap();
+  assert.ok(
+    cap >= POLICY_JOB_CAP_FLOOR_MINUTES,
+    `policy job cap ${cap}m is below ${POLICY_JOB_CAP_FLOOR_MINUTES}m, the smaller branch of the ` +
+      "BLO-35615 hang-detector rule in pr.yml; re-derive the cap by that rule rather than tuning it",
+  );
+});
 
 test("every policy node --test step has a step-level timeout", () => {
   assertTimeouts(nodeTestSteps());
