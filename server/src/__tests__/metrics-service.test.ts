@@ -1329,6 +1329,14 @@ describe("setQueuedRunOldestAgeMetrics (BLO-21116)", () => {
 });
 
 describe("heartbeat recovery chain gate metrics (PEN-3314)", () => {
+  // Compare the whole line, not `toContain` on the body: `toContain` matches a
+  // value PREFIX, so `… 0` is satisfied by a rendered `… 0.0455` and `… 2400`
+  // by `… 2400.5`. That would let a near-zero value pass as zero in the very
+  // test whose point is that zero and absent must not look alike.
+  const expectSeries = (body: string, metric: string, value: string) => {
+    expect(body.split("\n")).toContain(`${metric} ${value}`);
+  };
+
   it("publishes every series at zero before any overlap", async () => {
     const { body } = await renderMetrics();
     // Zero-initialized on purpose: an absent series and a healthy worker must
@@ -1336,10 +1344,10 @@ describe("heartbeat recovery chain gate metrics (PEN-3314)", () => {
     // if a worker's very first chain wedges, an alert of the documented form
     // ("> heartbeatSchedulerIntervalMs") would otherwise never evaluate at all,
     // because the series it reads does not exist yet.
-    expect(body).toContain(`${HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC} 0`);
-    expect(body).toContain(`${HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC} 0`);
-    expect(body).toContain(`${HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC} 0`);
-    expect(body).toContain(`${HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC} 0`);
+    expectSeries(body, HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC, "0");
+    expectSeries(body, HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC, "0");
+    expectSeries(body, HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC, "0");
+    expectSeries(body, HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC, "0");
   });
 
   it("counts skipped ticks and reports the last chain duration in seconds", async () => {
@@ -1350,8 +1358,8 @@ describe("heartbeat recovery chain gate metrics (PEN-3314)", () => {
     recordHeartbeatRecoveryChainDuration(45_500);
 
     const { body } = await renderMetrics();
-    expect(body).toContain(`${HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC} 2`);
-    expect(body).toContain(`${HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC} 45.5`);
+    expectSeries(body, HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC, "2");
+    expectSeries(body, HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC, "45.5");
   });
 
   it("reports the OUTSTANDING pass separately from the last completed one", async () => {
@@ -1362,8 +1370,8 @@ describe("heartbeat recovery chain gate metrics (PEN-3314)", () => {
     recordHeartbeatRecoveryChainInflight(2_400_000);
 
     const { body } = await renderMetrics();
-    expect(body).toContain(`${HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC} 12`);
-    expect(body).toContain(`${HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC} 2400`);
+    expectSeries(body, HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC, "12");
+    expectSeries(body, HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC, "2400");
   });
 
   it("clears the in-flight gauge when the pass ends, so the alert stops firing", async () => {
@@ -1371,7 +1379,7 @@ describe("heartbeat recovery chain gate metrics (PEN-3314)", () => {
     recordHeartbeatRecoveryChainInflight(0);
 
     const { body } = await renderMetrics();
-    expect(body).toContain(`${HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC} 0`);
+    expectSeries(body, HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC, "0");
   });
 
   it("never publishes a negative in-flight duration", async () => {
@@ -1380,7 +1388,7 @@ describe("heartbeat recovery chain gate metrics (PEN-3314)", () => {
     recordHeartbeatRecoveryChainInflight(-5_000);
 
     const { body } = await renderMetrics();
-    expect(body).toContain(`${HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC} 0`);
+    expectSeries(body, HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC, "0");
   });
 
   it("counts a stalled pass separately from a skipped tick", async () => {
@@ -1392,8 +1400,8 @@ describe("heartbeat recovery chain gate metrics (PEN-3314)", () => {
     recordHeartbeatRecoveryChainStalled();
 
     const { body } = await renderMetrics();
-    expect(body).toContain(`${HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC} 1`);
-    expect(body).toContain(`${HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC} 1`);
+    expectSeries(body, HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC, "1");
+    expectSeries(body, HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC, "1");
   });
 
   it("keeps every series unlabeled so they stay roster-independent", async () => {

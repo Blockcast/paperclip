@@ -125,8 +125,16 @@ export const HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC = "paperclip_heartbeat_rec
  * parks on those awaits, so a tick-driven refresh would freeze at whatever the
  * last settle wrote — `0` — and the worker would read idle and healthy for the
  * duration of the incident. The refreshing timer awaits nothing and queries
- * nothing, so `0` here means "no pass outstanding", unconditionally, rather than
- * "no pass outstanding as of the last tick that got far enough to say".
+ * nothing, so `0` here means "no pass outstanding" independently of whether any
+ * tick got far enough to say so, rather than "no pass outstanding as of the last
+ * tick that got far enough to say".
+ *
+ * Scope, so that `0` is not read more broadly than it holds: this covers the
+ * *periodic* chain only, which is what the metric name says. The startup
+ * recovery sequence runs several of the same reconcilers outside the latch, and
+ * this timer is armed while that pass may still be running, so during the
+ * startup window the gauge reports `0` with a recovery pass genuinely
+ * outstanding. That window is uncovered rather than misreported.
  */
 export const HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC = "paperclip_heartbeat_recovery_chain_inflight_seconds";
 /**
