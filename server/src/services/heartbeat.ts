@@ -304,7 +304,10 @@ import {
 import { loadConfig } from "../config.js";
 import { enqueueGithubCommitStatusDelivery } from "./github-status-delivery-outbox.js";
 import { resolveSharedDocSearchBoundaryPath } from "./shared-doc-search-boundary.js";
-import { pullRequestExternalId } from "./pull-request-work-products.js";
+import {
+  pullRequestExternalId,
+  recordedPullRequestOwners,
+} from "./pull-request-work-products.js";
 import {
   ensureReferencedSharedDocsMaterialized,
   normalizeInstructionsEntryFile,
@@ -13222,7 +13225,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * design, so a comment alone would leave exactly the silence this fixes).
    *
    * The link is the `pull_request` work product, matched on company + PR
-   * identity only. Deliberately NOT narrowed to system-promoted rows the way
+   * identity and then narrowed to the issues that work product records as its
+   * OWNERS (BLO-37225 — a row is written for every issue the PR merely
+   * mentions). Deliberately NOT narrowed to system-promoted rows the way
    * the webhook's `previouslyLinkedPullRequestIssues` lookup is: that lookup
    * gates a wake that acts on webhook-supplied content, whereas this one only
    * reports a fact this server itself just derived, and agent-registered PR work
@@ -13249,12 +13254,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     target: NonNullable<ReturnType<typeof resolvePrReviewGateStatusTarget>>,
     reason: "retry_exhausted" | "non_retryable_external_lifecycle",
   ) {
-    const linked = await db
+    const linkedRows = await db
       .select({
         id: issues.id,
         identifier: issues.identifier,
         status: issues.status,
         assigneeAgentId: issues.assigneeAgentId,
+        owningIdentifiers: sql<unknown>`${issueWorkProducts.metadata}->'owningIdentifiers'`,
       })
       .from(issueWorkProducts)
       .innerJoin(
@@ -13275,6 +13281,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ),
         ),
       );
+    // BLO-37225: a PR work product is written for EVERY issue the PR references
+    // anywhere -- the row is evidence about the PR, not a wake (see
+    // PullRequestWorkProductInput.owningIdentifiers). So the join above is the
+    // mention set, not the link set, and notifying all of it sends this notice
+    // to provenance citations and explicit "not touched, deliberately" scope
+    // notes. Measured on Blockcast/paperclip#2062: 7 issues, 2 lanes, ~10
+    // notices each over 91 minutes, one of them an issue whose only appearance
+    // in the body was a sentence saying the PR does not touch it.
+    //
+    // Narrowed to the owners the webhook resolved, which is the same field the
+    // evidence gate reads. `null` (row predates the field) keeps the row rather
+    // than dropping it: unlike the evidence gate, whose safe direction is to
+    // withhold a progress signal, this notifier's failure mode is the silence
+    // BLO-33589 exists to remove. Over-notifying a legacy row is the status quo;
+    // under-notifying one is a regression.
+    const linked = linkedRows.filter((row) => {
+      const owners = recordedPullRequestOwners(row.owningIdentifiers);
+      return !owners || (row.identifier !== null && owners.includes(row.identifier));
+    });
     if (linked.length === 0) {
       logger.info(
         {
@@ -13283,6 +13308,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           companyScoped: true,
           repoFullName: target.repoFullName,
           prNumber: target.prNumber,
+          // Distinguishes "this PR is not in Paperclip at all" from "every row
+          // holding it is a mention, not an owner" (BLO-37225) — the same log
+          // line otherwise reads identically for both.
+          mentionRowCount: linkedRows.length,
         },
         "failed PR-review gate has no linked Paperclip issue in the reviewer run's company to notify",
       );
