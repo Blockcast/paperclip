@@ -139,28 +139,49 @@ export async function deliverComment(post, outputFile = process.env.GITHUB_OUTPU
   }
 }
 
-// timeout-minutes of the "Run quality gates" step in commitperclip-review.yml.
-// A test pins the two together.
+// timeout-minutes of, in commitperclip-review.yml: the "Run quality gates"
+// step, the `review` job it runs in, and the "Run security gates" step that
+// follows it. A test pins each constant to the file.
 export const QUALITY_STEP_TIMEOUT_MS = 5 * 60_000;
+export const REVIEW_JOB_TIMEOUT_MS = 10 * 60_000;
+export const SECURITY_STEP_TIMEOUT_MS = 3 * 60_000;
 
 // Whole-script budget for the rate-limit sleeps of every read here. This is a
 // different scope from ghFetch's RATE_LIMIT_RETRY_BUDGET_MS, which is sized per
-// call (it funds one headerless retry), so it is derived from the step it runs
-// under instead. It holds back one RATE_LIMIT_MIN_WAIT_MS for what can still
-// run after the last funded sleep: the requests that follow it (each capped at
-// GH_FETCH_DEFAULT_TIMEOUT_MS, and writes never sleep, so four of them fit)
-// and the verdict print. That leaves 240s, which funds three headerless 60s
-// waits across the script with margin for request time.
-export const QUALITY_RETRY_BUDGET_MS = QUALITY_STEP_TIMEOUT_MS - RATE_LIMIT_MIN_WAIT_MS;
+// call (it funds one headerless retry).
+//
+// The binding cap is the job's, not this step's: whatever the steps before
+// this one used (a cold ARC runner can spend minutes on setup-node and
+// Dependency Review, and those steps have no cap of their own) comes out of
+// the same 10 minutes, and the security step after it still needs its 3. So
+// the budget is measured at run time from the job's start (recorded by the
+// job's first step as REVIEW_JOB_STARTED_AT_MS): the smaller of what this
+// step's cap leaves and what the job leaves once the security step's cap is
+// set aside, minus one RATE_LIMIT_MIN_WAIT_MS held back for the verdict print
+// and the requests after the last funded sleep. That reserve is a soft
+// allowance, not a bound: each request is capped at GH_FETCH_DEFAULT_TIMEOUT_MS
+// and writes never sleep, but fetchAllPullRequestFiles and findExistingComment
+// paginate, so a large PR can issue more than the reserve covers. The step's
+// timeout-minutes stays the hard backstop for that tail.
+export function qualityRetryBudgetMs(jobStartedAtMs, now = Date.now()) {
+  if (!Number.isFinite(jobStartedAtMs) || jobStartedAtMs <= 0) {
+    throw new Error(
+      'REVIEW_JOB_STARTED_AT_MS is not set: the review job\'s first step must record it, ' +
+      'because the retry budget is what is left of the job, not a guess.'
+    );
+  }
+  const jobLeftMs = jobStartedAtMs + REVIEW_JOB_TIMEOUT_MS - SECURITY_STEP_TIMEOUT_MS - now;
+  return Math.max(0, Math.min(QUALITY_STEP_TIMEOUT_MS, jobLeftMs) - RATE_LIMIT_MIN_WAIT_MS);
+}
 
 // ghFetch gives EACH read its own per-call budget, and two of this script's
 // reads paginate, so short rate limits on successive pages could sum past the
 // step's timeout. The step would then be killed before exitFatal printed its
 // not-evaluated annotation. Every read here instead draws on one shared
-// QUALITY_RETRY_BUDGET_MS, measured from script start, so the sum is capped
-// and an exhausted budget fails fast into exitFatal. Same idea as
-// check-pr-security's watchdogBoundFetch.
-export function budgetBoundFetch(startedAt, budgetMs = QUALITY_RETRY_BUDGET_MS, fetchImpl = ghFetch, now = Date.now) {
+// budget, measured from script start, so the sum is capped and an exhausted
+// budget fails fast into exitFatal. Same idea as check-pr-security's
+// watchdogBoundFetch.
+export function budgetBoundFetch(startedAt, budgetMs, fetchImpl = ghFetch, now = Date.now) {
   return (path, token, options = {}) => fetchImpl(path, token, {
     retryBudgetMs: Math.max(0, startedAt + budgetMs - now()),
     ...options,
@@ -168,7 +189,8 @@ export function budgetBoundFetch(startedAt, budgetMs = QUALITY_RETRY_BUDGET_MS, 
 }
 
 async function main() {
-  const gh = budgetBoundFetch(Date.now());
+  const startedAt = Date.now();
+  const gh = budgetBoundFetch(startedAt, qualityRetryBudgetMs(Number(process.env.REVIEW_JOB_STARTED_AT_MS), startedAt));
   const { GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR, PR_BRANCH } = process.env;
 
   if (!GH_TOKEN || !GH_REPO || !PR_NUMBER) {

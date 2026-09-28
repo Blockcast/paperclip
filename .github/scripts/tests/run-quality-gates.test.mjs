@@ -6,8 +6,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   budgetBoundFetch,
-  QUALITY_RETRY_BUDGET_MS,
+  qualityRetryBudgetMs,
   QUALITY_STEP_TIMEOUT_MS,
+  REVIEW_JOB_TIMEOUT_MS,
+  SECURITY_STEP_TIMEOUT_MS,
   buildComment,
   deliverComment,
   findExistingComment,
@@ -335,22 +337,56 @@ test('budgetBoundFetch: reads share one shrinking budget and get 0 once it is sp
   assert.deepEqual(seen, [100, 40, 0]);
 });
 
-test('QUALITY_STEP_TIMEOUT_MS matches the "Run quality gates" step timeout-minutes', () => {
-  const workflow = readFileSync(
-    path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../workflows/commitperclip-review.yml'),
-    'utf8',
-  );
-  const step = workflow.slice(workflow.indexOf('- name: Run quality gates'));
-  const minutes = Number(step.slice(0, step.indexOf('\n      - name:')).match(/timeout-minutes: (\d+)/)[1]);
-  assert.equal(QUALITY_STEP_TIMEOUT_MS, minutes * 60_000);
+// timeout-minutes of the block that starts at `marker`, up to the next sibling.
+function timeoutMinutesOf(marker, sibling) {
+  const block = workflow.slice(workflow.indexOf(marker));
+  return Number(block.slice(0, block.indexOf(sibling)).match(/timeout-minutes: (\d+)/)[1]);
+}
+
+test('the budget constants mirror the three timeout-minutes in commitperclip-review.yml', () => {
+  assert.equal(QUALITY_STEP_TIMEOUT_MS, timeoutMinutesOf('- name: Run quality gates', '\n      - name:') * 60_000);
+  assert.equal(SECURITY_STEP_TIMEOUT_MS, timeoutMinutesOf('- name: Run security gates', '\n      - name:') * 60_000);
+  assert.equal(REVIEW_JOB_TIMEOUT_MS, timeoutMinutesOf('\n  review:\n', '\n    steps:') * 60_000);
 });
 
-// The shared budget is whole-script, so it must fund more than one headerless
+test('the review job records its start before any other step', () => {
+  const steps = workflow.slice(workflow.indexOf('\n  review:\n'));
+  const first = steps.slice(steps.indexOf('    steps:\n')).match(/\n      - name: ([^\n]+)\n        run: ([^\n]+)/);
+  assert.equal(first[1], 'Record job start');
+  assert.match(first[2], /REVIEW_JOB_STARTED_AT_MS=\$\(date \+%s%3N\)" >> "\$GITHUB_ENV"/);
+});
+
+// Whatever the steps before this one spent, the funded sleeps, the reserve and
+// the security step's cap must still fit inside the job's cap, so the job is
+// never cancelled mid-sleep (which would surface as a red `review` with no
+// not_evaluated annotation). 23-75s is the measured warm range; 300s is the
+// cold case the job's timeout comment describes.
+test('qualityRetryBudgetMs never lets the job outlive its timeout, warm or cold', () => {
+  for (const elapsed of [0, 23_000, 75_000, 180_000, 300_000, 420_000, 600_000]) {
+    const budget = qualityRetryBudgetMs(1_000, 1_000 + elapsed);
+    assert.ok(budget >= 0, `elapsed ${elapsed}: ${budget}`);
+    assert.ok(budget <= QUALITY_STEP_TIMEOUT_MS - RATE_LIMIT_MIN_WAIT_MS, `elapsed ${elapsed}: ${budget}`);
+    if (budget > 0) {
+      assert.ok(
+        elapsed + budget + RATE_LIMIT_MIN_WAIT_MS + SECURITY_STEP_TIMEOUT_MS <= REVIEW_JOB_TIMEOUT_MS,
+        `elapsed ${elapsed}: budget ${budget} overruns the job`,
+      );
+    }
+  }
+});
+
+test('qualityRetryBudgetMs refuses to guess when the job start was not recorded', () => {
+  for (const missing of [Number(undefined), 0, Number('')]) {
+    assert.throws(() => qualityRetryBudgetMs(missing, 1_000), /REVIEW_JOB_STARTED_AT_MS is not set/);
+  }
+});
+
+// On a warm runner the shared budget must still fund more than one headerless
 // rate-limit wait. Model ghFetch's pre-sleep check with real request time: each
 // read spends `rtt`, fails if the 60s floor exceeds what is left of its budget,
 // else sleeps it and retries once (another `rtt`). The old per-call 120s funded
 // the first read and failed the second at ~61s.
-test('the default shared budget funds three headerless rate-limited reads with request time', async () => {
+test('a warm job funds three headerless rate-limited reads with request time', async () => {
   const rtt = 1_000;
   let clock = 0;
   const funded = [];
@@ -361,11 +397,11 @@ test('the default shared budget funds three headerless rate-limited reads with r
     clock += RATE_LIMIT_MIN_WAIT_MS + rtt;
     funded.push(p);
   };
-  const gh = budgetBoundFetch(0, undefined, fakeGhFetch, () => clock);
+  const warmElapsed = 30_000;
+  const gh = budgetBoundFetch(0, qualityRetryBudgetMs(-warmElapsed + 1e12, 1e12), fakeGhFetch, () => clock);
   for (const p of ['/pull', '/files?page=2', '/comments?page=2']) await gh(p, 't');
   assert.deepEqual(funded, ['/pull', '/files?page=2', '/comments?page=2']);
   assert.ok(clock < QUALITY_STEP_TIMEOUT_MS - RATE_LIMIT_MIN_WAIT_MS, `used ${clock}ms`);
-  assert.equal(QUALITY_RETRY_BUDGET_MS, QUALITY_STEP_TIMEOUT_MS - RATE_LIMIT_MIN_WAIT_MS);
 });
 
 test('main routes every read through the shared budget, not bare ghFetch', () => {
@@ -374,7 +410,7 @@ test('main routes every read through the shared budget, not bare ghFetch', () =>
     'utf8',
   );
   const main = source.slice(source.indexOf('async function main()'));
-  assert.match(main, /const gh = budgetBoundFetch\(Date\.now\(\)\)/);
+  assert.match(main, /const gh = budgetBoundFetch\(startedAt, qualityRetryBudgetMs\(Number\(process\.env\.REVIEW_JOB_STARTED_AT_MS\), startedAt\)\)/);
   assert.equal((main.match(/\bghFetch\b/g) ?? []).length, 0);
   assert.match(main, /checkDependencies\([^)]*, gh\)/);
 });
