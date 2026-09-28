@@ -422,6 +422,32 @@ export function extractAllyPriorFindingDispositions(
 }
 
 /**
+ * How many prior findings this review accepts as tracked on a follow-up.
+ *
+ * Deliberately NOT a filter over extractAllyPriorFindingDispositions. On a
+ * current-head review a `defers` entry retires nothing; it downgrades a clean
+ * verdict to a deferred one, so it is a *detecting* predicate (see the file
+ * header). Emitted-only would fail open: Ally's template puts `Reviewed head:`
+ * above the findings and the ledger below them, so an unbalanced fence opened
+ * in between blanks the ledger while the attestation survives, and a head whose
+ * residual was accepted reads as `clean` -- the misstatement BLO-36903 exists
+ * to prevent. The cost is a false deferral for a fenced example ledger:
+ * visible and recoverable, where a false clean is neither. Same trade the
+ * `blocks` clause in carriesBlockingFeedback makes.
+ *
+ * Reads the raw body alone because, for this pattern, raw already is the more
+ * conservative reading: PRIOR_FINDING_DISPOSITION_PATTERN is line-anchored and
+ * uses horizontal separators only, so blanking fenced lines can remove a match
+ * but never create one. Revisit that if the pattern ever gains a `\s`.
+ */
+export function countAllyDeferredPriorFindings(body: string | null | undefined): number {
+  if (typeof body !== "string") return 0;
+  return Array.from(body.matchAll(PRIOR_FINDING_DISPOSITION_PATTERN)).filter(
+    (match) => classifyPriorDisposition(match[4]!) === "defers",
+  ).length;
+}
+
+/**
  * The findings a review reports, as the identities Ally's ledger would use, or
  * `null` when they cannot be enumerated.
  *
