@@ -142,6 +142,46 @@ describe("agent start lock liveness reporting (PEN-3305)", () => {
     expect(describeHeldAgentStartLocks()).toEqual([]);
   });
 
+  /**
+   * BLO-36922. `startNextQueuedRunForAgent` marks `claim` once per candidate
+   * inside its loop, so an unconditional `phaseSinceMs` reset would restart
+   * the clock every iteration: a stall grinding a long queue would report a
+   * small `phaseMs` forever, and only a single hung `claimQueuedRun` could
+   * ever show `phaseMs` close to `heldMs`.
+   */
+  it("does not restart the phase clock when the section re-marks the phase it is already in", async () => {
+    vi.useFakeTimers();
+    const agentId = randomUUID();
+    const gate = deferred<string>();
+
+    const held = withAgentStartLock(agentId, async () => {
+      markAgentStartLockPhase(agentId, "claim");
+      return gate.promise;
+    }, coalesced);
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Re-mark `claim` on every iteration, exactly as the claim loop does.
+    for (let i = 0; i < 10; i += 1) {
+      await vi.advanceTimersByTimeAsync(5_000);
+      markAgentStartLockPhase(agentId, "claim");
+    }
+
+    // phaseMs must span the whole loop, not the last iteration (5_000).
+    expect(describeHeldAgentStartLocks()).toEqual([
+      { agentId, heldMs: 50_000, phase: "claim", phaseMs: 50_000 },
+    ]);
+
+    // A genuine phase change still restarts the clock.
+    markAgentStartLockPhase(agentId, "slot_check");
+    await vi.advanceTimersByTimeAsync(7_000);
+    expect(describeHeldAgentStartLocks()).toEqual([
+      { agentId, heldMs: 57_000, phase: "slot_check", phaseMs: 7_000 },
+    ]);
+
+    gate.resolve("done");
+    await held;
+  });
+
   it("publishes the phase as its own series, leaving the held gauge single-series", async () => {
     __resetMetricsForTest();
     setAgentStartLockHeldMetrics([
