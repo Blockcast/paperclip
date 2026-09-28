@@ -6,11 +6,14 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   budgetBoundFetch,
+  QUALITY_RETRY_BUDGET_MS,
+  QUALITY_STEP_TIMEOUT_MS,
   buildComment,
   deliverComment,
   findExistingComment,
   isGraphifyReindexArtifactOnlyPr,
 } from '../run-quality-gates.mjs';
+import { RATE_LIMIT_MIN_WAIT_MS } from '../get-bot-token.mjs';
 
 const workflow = readFileSync(
   path.resolve(
@@ -319,7 +322,7 @@ test('commitperclip-review: an undelivered comment is not reported as "see commi
 });
 
 // Each read gets only what is left of ONE budget measured from script start,
-// so paginated reads cannot each draw a fresh RATE_LIMIT_RETRY_BUDGET_MS.
+// so paginated reads cannot each draw a fresh per-call budget.
 test('budgetBoundFetch: reads share one shrinking budget and get 0 once it is spent', async () => {
   const seen = [];
   let clock = 1_000;
@@ -330,6 +333,39 @@ test('budgetBoundFetch: reads share one shrinking budget and get 0 once it is sp
   clock = 1_500;
   await gh('/c', 't');
   assert.deepEqual(seen, [100, 40, 0]);
+});
+
+test('QUALITY_STEP_TIMEOUT_MS matches the "Run quality gates" step timeout-minutes', () => {
+  const workflow = readFileSync(
+    path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../workflows/commitperclip-review.yml'),
+    'utf8',
+  );
+  const step = workflow.slice(workflow.indexOf('- name: Run quality gates'));
+  const minutes = Number(step.slice(0, step.indexOf('\n      - name:')).match(/timeout-minutes: (\d+)/)[1]);
+  assert.equal(QUALITY_STEP_TIMEOUT_MS, minutes * 60_000);
+});
+
+// The shared budget is whole-script, so it must fund more than one headerless
+// rate-limit wait. Model ghFetch's pre-sleep check with real request time: each
+// read spends `rtt`, fails if the 60s floor exceeds what is left of its budget,
+// else sleeps it and retries once (another `rtt`). The old per-call 120s funded
+// the first read and failed the second at ~61s.
+test('the default shared budget funds three headerless rate-limited reads with request time', async () => {
+  const rtt = 1_000;
+  let clock = 0;
+  const funded = [];
+  const fakeGhFetch = async (p, _t, { retryBudgetMs }) => {
+    const deadline = clock + retryBudgetMs;
+    clock += rtt;
+    if (RATE_LIMIT_MIN_WAIT_MS > deadline - clock) throw new Error(`unfunded: ${p}`);
+    clock += RATE_LIMIT_MIN_WAIT_MS + rtt;
+    funded.push(p);
+  };
+  const gh = budgetBoundFetch(0, undefined, fakeGhFetch, () => clock);
+  for (const p of ['/pull', '/files?page=2', '/comments?page=2']) await gh(p, 't');
+  assert.deepEqual(funded, ['/pull', '/files?page=2', '/comments?page=2']);
+  assert.ok(clock < QUALITY_STEP_TIMEOUT_MS - RATE_LIMIT_MIN_WAIT_MS, `used ${clock}ms`);
+  assert.equal(QUALITY_RETRY_BUDGET_MS, QUALITY_STEP_TIMEOUT_MS - RATE_LIMIT_MIN_WAIT_MS);
 });
 
 test('main routes every read through the shared budget, not bare ghFetch', () => {

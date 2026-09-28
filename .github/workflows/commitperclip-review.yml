@@ -145,8 +145,9 @@ jobs:
         run: node .github/scripts/run-quality-gates.mjs
         continue-on-error: true
         # Backstop only: every read in the script shares one
-        # RATE_LIMIT_RETRY_BUDGET_MS (budgetBoundFetch), so an exhausted
-        # budget ends in exitFatal's annotation well before this cap.
+        # QUALITY_RETRY_BUDGET_MS (budgetBoundFetch), derived from this cap
+        # (keep QUALITY_STEP_TIMEOUT_MS in step with it; a test checks), so an
+        # exhausted budget ends in exitFatal's annotation before the cap.
         timeout-minutes: 5
         env:
           GH_TOKEN: ${{ steps.token.outputs.value }}
