@@ -32,9 +32,13 @@
  * dependency-free `node --test` with no transpile step. Comments and string
  * bodies are blanked before scanning, so the real ceiling is a config that
  * computes these values rather than writing literals — handled deliberately by
- * the `null` path tested below, and failing CLOSED. Placement, not
- * computation, was the hole that fails silently; that is what the `test: {}`
- * scoping closes.
+ * the `null` path tested below, and failing CLOSED. Placement was the hole that
+ * fails silently, and it is closed at BOTH levels: outside `test: {}`, and
+ * inside a nested child of it (`sequence`, `poolOptions.forks`, `coverage`),
+ * where Vitest equally ignores the key. Two known ceilings, both failing
+ * CLOSED: a computed value, and a regex literal containing a quote character
+ * (`blankNonCode` does not lex regexes, so it reads on into string-blanking
+ * mode). Each surfaces as a loud `null`, never as a false green.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -110,11 +114,14 @@ export function blankNonCode(source) {
 }
 
 /**
- * Returns the body of the top-level `test: { ... }` block, or null if it cannot
- * be delimited. Scoping matters: Vitest ignores `testTimeout`/`hookTimeout`
- * written anywhere else in `defineConfig`, so a key matched outside this block
- * is not a setting — it is the exact silent misconfiguration this guard exists
- * to catch.
+ * Returns the body of the first `test: { ... }` block with every nested child
+ * object blanked, or null if it cannot be delimited. Scoping matters twice
+ * over: Vitest ignores `testTimeout`/`hookTimeout` written anywhere else in
+ * `defineConfig`, AND ignores them inside a child of `test` such as
+ * `sequence: {}` or `poolOptions: { forks: {} }`. Both read as "declared" to a
+ * naive scan while the package silently runs at 5s/10s — the exact
+ * misconfiguration this guard exists to catch. Newlines survive blanking so the
+ * line-anchored key match stays aligned.
  */
 export function extractTestBlock(source) {
   const code = blankNonCode(source);
@@ -123,12 +130,18 @@ export function extractTestBlock(source) {
   const start = open.index + open[0].length;
   let depth = 1;
   let i = start;
+  let out = '';
   while (i < code.length && depth > 0) {
     const char = code[i++];
+    const before = depth;
     if (char === '{') depth++;
     else if (char === '}') depth--;
+    if (depth === 0) break;
+    // `before > 1` blanks a child's closing brace too, so no stray `}` leaks
+    // back into the body at depth 1.
+    out += (before > 1 || depth > 1) && char !== '\n' ? ' ' : char;
   }
-  return depth === 0 ? code.slice(start, i - 1) : null;
+  return depth === 0 ? out : null;
 }
 
 /**
@@ -154,6 +167,45 @@ test('extractTestBlock scopes to the block Vitest actually reads', () => {
   assert.equal(readTimeoutLiteral(extractTestBlock(misplaced) ?? '', 'testTimeout'), null);
   // No test block at all.
   assert.equal(extractTestBlock('export default defineConfig({});\n'), null);
+});
+
+test('extractTestBlock blanks nested children of test: {}', () => {
+  // Inside `sequence: {}` — a block `server/vitest.config.ts` really carries.
+  // Vitest drops the package to 5s/10s; must NOT read as declared.
+  const nested = [
+    'export default defineConfig({',
+    '  test: {',
+    '    sequence: {',
+    '      testTimeout: 60_000,',
+    '    },',
+    '  },',
+    '});',
+    '',
+  ].join('\n');
+  assert.equal(readTimeoutLiteral(extractTestBlock(nested) ?? '', 'testTimeout'), null);
+  // Two levels down, where pool tuning conventionally goes.
+  const pool = [
+    'export default defineConfig({',
+    '  test: {',
+    '    poolOptions: { forks: {',
+    '      hookTimeout: 120_000,',
+    '    } },',
+    '  },',
+    '});',
+    '',
+  ].join('\n');
+  assert.equal(readTimeoutLiteral(extractTestBlock(pool) ?? '', 'hookTimeout'), null);
+  // A sibling at the block's own depth still reads, with a child present.
+  const both = [
+    'export default defineConfig({',
+    '  test: {',
+    '    sequence: { hooks: "list" },',
+    '    testTimeout: 60_000,',
+    '  },',
+    '});',
+    '',
+  ].join('\n');
+  assert.equal(readTimeoutLiteral(extractTestBlock(both), 'testTimeout'), 60000);
 });
 
 test('readTimeoutLiteral parses, and refuses what it cannot vouch for', () => {
