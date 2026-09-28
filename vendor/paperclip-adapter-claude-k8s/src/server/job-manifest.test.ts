@@ -4022,6 +4022,48 @@ describe("scoped writable mounts (BLO-32734)", () => {
     expect(byPath.get("/paperclip/wt")).toBe("wt/co1");
   });
 
+  // BLO-36583 landed the shared pnpm store on this volume a week before this
+  // narrowing merged, and the two never touched the same lines — so the rebase
+  // was clean and the store was still uncovered. Asserted as "a writable mount
+  // covers PNPM_HOME", read off the manifest, rather than as a path literal:
+  // the next path added to this volume has to survive the same question.
+  it("keeps PNPM_HOME writable under the narrowed mount", () => {
+    for (const mountPath of ["/paperclip", "/srv/agent-data"]) {
+      const ctx = makeCtx();
+      ctx.config = { ...(ctx.config ?? {}), workspaceMountPath: mountPath };
+      setRuntimeIsolation(ctx, { ...WORKSPACE_DESCRIPTOR, storage: isolatedStorage("persistent") });
+      const { job, scopedWritableDirs } = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+      const containers = [job.spec?.template?.spec?.containers[0], job.spec?.template?.spec?.initContainers?.[0]];
+
+      const pnpmHome = new Map(
+        containers[0]?.env?.map((e) => [e.name, e.value]),
+      ).get("PNPM_HOME");
+      // The store is on the POD's volume, whatever the operator mounted it at.
+      expect(pnpmHome).toBe(`${mountPath}/instances/default/data/k8s-isolation/pnpm/co1`);
+
+      for (const container of containers) {
+        const mounts = container?.volumeMounts ?? [];
+        expect(mounts.find((m) => m.mountPath === mountPath && !m.subPath)?.readOnly).toBe(true);
+        const covering = mounts.filter(
+          (m) => m.subPath && !m.readOnly && (pnpmHome === m.mountPath || pnpmHome!.startsWith(`${m.mountPath}/`)),
+        );
+        expect(covering, `no writable mount covers ${pnpmHome}`).not.toEqual([]);
+      }
+      // And it is pre-created through the SERVER's root — a subPath the kubelet
+      // creates itself is root:root 0755, which is EACCES for uid 1000.
+      expect(scopedWritableDirs).toContain("/paperclip/instances/default/data/k8s-isolation/pnpm/co1");
+    }
+  });
+
+  // The ephemeral half: PNPM_HOME moves under cacheRoot, which is the
+  // off-volume runtime-cache emptyDir, so it must NOT mint a mount here.
+  it("emits no pnpm store mount for an ephemeral workspace", () => {
+    const ctx = makeCtx();
+    setRuntimeIsolation(ctx, { ...WORKSPACE_DESCRIPTOR, storage: isolatedStorage("ephemeral") });
+    const { main } = mountsFor(ctx);
+    expect(main.filter((m) => m.subPath?.startsWith("instances/default/data/k8s-isolation/pnpm/"))).toEqual([]);
+  });
+
   it("gives the init container the same scoped mounts as the main container", () => {
     const { main, init } = mountsFor(isolatedCtx());
     const scopedOf = (mounts: typeof main) =>

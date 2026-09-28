@@ -234,6 +234,15 @@ export function resolveScopedWritableMounts(input: {
     ["isolation.cacheRoot", isolation.cacheRoot],
     ["isolation.tmpRoot", isolation.tmpRoot],
     ["isolation.promptCacheRoot", isolation.promptCacheRoot],
+    // The shared pnpm store (BLO-36583) is a SIBLING of the isolation root, not
+    // a descendant, so no root above covers it. It is company-scoped, which is
+    // exactly the boundary the `work/<companyId>` scratch remap below holds.
+    // Only on a persistent workspace — otherwise `PNPM_HOME` is under
+    // `cacheRoot`, which is off-volume and already writable.
+    [
+      "sharedPnpmStore",
+      isolation.storage.workspace === "persistent" ? sharedPnpmStorePath(companyId, dataMountPath) : "",
+    ],
     // The agent's OWN instructions bundle stays writable: `instructionsBundleMode:
     // managed` makes that directory the canonical store of the agent's charter,
     // which agents edit. Only FOREIGN bundles become unreachable.
@@ -427,6 +436,13 @@ const RUNTIME_CACHE_ENV: Record<string, string> = {
  * must stay on the PVC even when an operator repoints that elsewhere, and the
  * cross-device fallback below makes the divergence safe rather than broken.
  *
+ * It IS rooted at the data mount, because the mount is the PVC — the two are
+ * the same requirement, not competing ones. Hardcoding `/paperclip` here would
+ * put the store off-volume under a custom `config.workspaceMountPath`: it would
+ * write to the container filesystem and vanish with the pod, and
+ * `resolveScopedWritableMounts` would drop it as off-volume and emit no rw
+ * mount for it. Same two-address-space defect as `buildPodLogPath`.
+ *
  * `PNPM_HOME` is also pnpm's global *bin* directory, so the path is named
  * `pnpm` (not `pnpm-store`) to match pnpm's own layout: bins land in
  * `<root>/<companyId>/`, the store in `<root>/<companyId>/store/v11`.
@@ -437,12 +453,24 @@ const RUNTIME_CACHE_ENV: Record<string, string> = {
  * runs it today. If that changes, give each *agent* its own store rather than
  * each workspace.
  */
-const SHARED_PNPM_STORE_ROOT = "/paperclip/instances/default/data/k8s-isolation/pnpm";
+const SHARED_PNPM_STORE_SUBPATH = "instances/default/data/k8s-isolation/pnpm";
 
-function sharedPnpmStorePath(rawCompanyId: string): string {
+function sharedPnpmStorePath(rawCompanyId: string, dataMountPath: string): string {
   const companyId = sanitizeForK8sPath(rawCompanyId);
   assertSafePathComponent("companyId", companyId);
-  return `${SHARED_PNPM_STORE_ROOT}/${companyId}`;
+  return `${dataMountPath}/${SHARED_PNPM_STORE_SUBPATH}/${companyId}`;
+}
+
+/** Where the agent POD reaches the shared data volume. Operator-configurable,
+ *  so every path the container addresses on that volume must be built from it
+ *  rather than from the `/paperclip` default. Resolved in one place because two
+ *  callers need it at different points in the build (`buildEnvVars`, which runs
+ *  before the mount is declared, and the mount itself). */
+function resolveDataMountPath(config: Record<string, unknown>): string {
+  const configured = asString(config.workspaceMountPath, "").trim();
+  if (!configured) return "/paperclip";
+  assertSafeAbsolutePath("config.workspaceMountPath", configured);
+  return configured;
 }
 
 type IsolationStorage = "ephemeral" | "persistent";
@@ -1571,10 +1599,10 @@ function buildEnvVars(
         // Shared per company when the workspace is persistent — same filesystem
         // as the checkout, which pnpm requires to hardlink into node_modules;
         // per-run otherwise, where cacheRoot is already ephemeral. See
-        // SHARED_PNPM_STORE_ROOT.
+        // SHARED_PNPM_STORE_SUBPATH.
         PNPM_HOME:
           isolation.storage.workspace === "persistent"
-            ? sharedPnpmStorePath(agent.companyId)
+            ? sharedPnpmStorePath(agent.companyId, resolveDataMountPath(config))
             : `${isolation.cacheRoot}/pnpm`,
         ...CARGO_CACHE_ENV(isolation.cacheRoot),
         // Run-scoped so concurrent stateless Jobs never share a writable temp
@@ -2243,18 +2271,16 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // `effectiveConfig` (built in execute.ts) lands these env-supplied
   // values into `config.workspaceVolumeClaim` / `config.workspaceMountPath`.
   const envWorkspaceClaim = asString(config.workspaceVolumeClaim, "").trim();
-  const envWorkspaceMountPath = asString(config.workspaceMountPath, "").trim();
   const dataClaimName = envWorkspaceClaim || selfPod.pvcClaimName || "";
-  const dataMountPath = envWorkspaceMountPath || "/paperclip";
-  if (envWorkspaceMountPath) assertSafeAbsolutePath("config.workspaceMountPath", envWorkspaceMountPath);
+  const dataMountPath = resolveDataMountPath(config);
   // Kubernetes rejects a Pod outright when one container declares two
   // volumeMounts at the same `mountPath`, so an operator-supplied
   // `workspaceMountPath` that happens to equal a path this builder already
   // emits (`/tmp/prompt`, `/runtime-cache`, or an inherited secret mount) does
   // not "win" — it produces a manifest that never admits, and the operator sees
   // an opaque API rejection rather than the config mistake that caused it.
-  // `assertSafeAbsolutePath` above does not catch this: it validates the shape
-  // of the path, not whether the path is already taken.
+  // `assertSafeAbsolutePath` in `resolveDataMountPath` does not catch this: it
+  // validates the shape of the path, not whether the path is already taken.
   //
   // Fail closed at construction with a message that names the conflict. Only
   // EXACT duplicates are a conflict HERE — nesting (`/paperclip` alongside
