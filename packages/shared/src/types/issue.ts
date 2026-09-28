@@ -480,7 +480,10 @@ export interface IssueBlockedInboxAttention {
 // productivity-review.ts) and both label maps derive from this tuple, so adding
 // a trigger is one line here plus a label in each map — the maps are
 // `Record<Trigger, string>`, so a missing label is a red build, not a silent
-// fallback. The trigger round-trips through markdown via
+// fallback — plus a predicate in `choosePrimaryTrigger` and a push in
+// `firedTriggers`, neither of which the compiler can enforce: both read a
+// hand-written set of booleans, so a tuple member with no predicate compiles
+// clean and can never fire. The trigger round-trips through markdown via
 // `extractReviewTriggerFromDescription` rather than a DB enum, so a
 // hand-maintained allowlist that drifted failed quietly — it silently stopped
 // parsing an already-written review rather than failing a typecheck.
