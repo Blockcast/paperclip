@@ -1,4 +1,4 @@
-import type { Db } from "@paperclipai/db";
+import type { Db, DbTransaction } from "@paperclipai/db";
 import { companies, instanceSettings } from "@paperclipai/db";
 import {
   DEFAULT_FEEDBACK_DATA_SHARING_PREFERENCE,
@@ -14,10 +14,6 @@ import {
   type PatchInstanceExperimentalSettings,
 } from "@paperclipai/shared";
 import { eq } from "drizzle-orm";
-
-// Same shape as `agent-invokability.ts` / `recovery/service.ts`: a caller's
-// open transaction handle, which the db package does not export as a name.
-type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
 const DEFAULT_SINGLETON_KEY = "default";
 const instanceGeneralSettingsStorageSchema = instanceGeneralSettingsSchema.strip();

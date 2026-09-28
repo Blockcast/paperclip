@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { asc, eq } from "drizzle-orm";
+import { asc, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import {
@@ -45,6 +45,7 @@ import {
   ISSUE_LIST_MAX_LIMIT,
   issueService,
   parseExecutiveHoldMarkerTimestamp,
+  recomputeBlockedIssuesStatusIfReady,
 } from "../services/issues.ts";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import {
@@ -5921,6 +5922,169 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     });
   });
 
+  // BLO-30445. `listBlockedIssueAutoResumeSuppressions` gates the blocker-resolved wake as
+  // well as the reconciler flip, so adding `external_wait` to it decides a second question
+  // the ticket never asked: what happens to a row carrying BOTH a real blocker edge and a
+  // declaration, when that blocker closes. The intended answer is that the declared park
+  // OUTLIVES its structural blocker — the human gate is still live, and resuming on the
+  // blocker alone would drain a park that is still genuinely waiting. That is the same
+  // semantic BLO-3496 already established for executive holds one describe block up (see
+  // the comment at the `resolved_blocker_sweep` call site); `external_wait` only joins it.
+  //
+  // The consequence is deliberate and worth stating plainly: such a row keeps `status`
+  // `blocked` with zero unresolved blockers and NO wake path. `isDeadEndBlocked` also
+  // declines to flag it, so the blocked inbox — which surfaces it as `external_wait` with
+  // the declared owner and action — is its only surface. That is the documented contract
+  // for a human-only gate (it does not move on a timer), not an oversight; the cost is that
+  // a STALE declaration nobody removed parks the row just as effectively as a live one.
+  // Removing the two lines when the gate clears is the declaring agent's job.
+  describe("blocked auto-resume external wait suppression (BLO-30445)", () => {
+    it("suppresses all three non-reconciler auto-resume callers for a declared external wait, but not for its undeclared twin", async () => {
+      const companyId = randomUUID();
+      const assigneeAgentId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(agents).values({
+        id: assigneeAgentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+
+      // One blocker, two dependents differing ONLY in the declaration. Both are evaluated
+      // in the same `listWakeableBlockedDependents` call, so "the declared row is absent"
+      // cannot be confused with "the wake did not fire at all" — the same matched-pair
+      // shape as the reconciler test.
+      const blockerId = randomUUID();
+      const declaredId = randomUUID();
+      const controlId = randomUUID();
+      await db.insert(issues).values([
+        { id: blockerId, companyId, title: "Blocker", status: "done", priority: "medium" },
+        {
+          id: declaredId,
+          companyId,
+          title: "Declared external wait",
+          status: "blocked",
+          priority: "medium",
+          assigneeAgentId,
+          description: [
+            "Waiting on the ruleset change.",
+            "external owner: kkroo",
+            "external action: approve the onprem-k8s ruleset change",
+          ].join("\n"),
+        },
+        {
+          id: controlId,
+          companyId,
+          title: "Undeclared twin",
+          status: "blocked",
+          priority: "medium",
+          assigneeAgentId,
+          // Same gate, named in prose only — the documented non-match.
+          description: "Waiting on kkroo to approve the onprem-k8s ruleset change.",
+        },
+      ]);
+      await svc.update(declaredId, { blockedByIssueIds: [blockerId] });
+      await svc.update(controlId, { blockedByIssueIds: [blockerId] });
+
+      await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([
+        expect.objectContaining({ id: controlId, assigneeAgentId }),
+      ]);
+
+      // Second caller: the periodic resolved-blocker sweep. Read-only like the wake, and a
+      // pure pass-through to the same suppression map, so the fixture above covers it as-is.
+      await expect(
+        svc.listResolvedBlockerDependentsToSweep(companyId, {
+          minBlockerResolvedAge: { milliseconds: 0 },
+        }),
+      ).resolves.toEqual([expect.objectContaining({ id: controlId, assigneeAgentId })]);
+
+      // Third caller, and the only one of the three that MUTATES `status`. It is unreachable
+      // from `svc` — `recomputeBlockedIssuesStatusIfReady` is called only from the route
+      // layer — so it has to be invoked directly or the flip is never exercised at all. Run
+      // it last: it drains the control, which would then drop out of the two reads above.
+      await expect(
+        recomputeBlockedIssuesStatusIfReady(db, companyId, [declaredId, controlId], {
+          triggerPath: "eager_status_recompute",
+        }),
+      ).resolves.toEqual([controlId]);
+
+      const statusesAfter = await db
+        .select({ id: issues.id, status: issues.status })
+        .from(issues)
+        .where(inArray(issues.id, [declaredId, controlId]));
+      expect(new Map(statusesAfter.map((row) => [row.id, row.status]))).toEqual(
+        new Map([
+          [declaredId, "blocked"],
+          [controlId, "todo"],
+        ]),
+      );
+    });
+
+    it("resumes the wake once the declaration is removed", async () => {
+      const companyId = randomUUID();
+      const assigneeAgentId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(agents).values({
+        id: assigneeAgentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+
+      const blockerId = randomUUID();
+      const declaredId = randomUUID();
+      await db.insert(issues).values([
+        { id: blockerId, companyId, title: "Blocker", status: "done", priority: "medium" },
+        {
+          id: declaredId,
+          companyId,
+          title: "Declared external wait",
+          status: "blocked",
+          priority: "medium",
+          assigneeAgentId,
+          description: [
+            "external owner: kkroo",
+            "external action: approve the onprem-k8s ruleset change",
+          ].join("\n"),
+        },
+      ]);
+      await svc.update(declaredId, { blockedByIssueIds: [blockerId] });
+
+      await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([]);
+
+      // Clearing the declaration is the declaring agent's exit from the park, so it must
+      // put the row straight back on the wake path — otherwise the park is a one-way door.
+      await db
+        .update(issues)
+        .set({ description: "Gate cleared; resuming." })
+        .where(eq(issues.id, declaredId));
+
+      await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([
+        expect.objectContaining({ id: declaredId, assigneeAgentId }),
+      ]);
+    });
+  });
+
   describe("listResolvedBlockerDependentsToSweep executive hold suppression (BLO-3496)", () => {
     async function setupBlockedDependentWithExecutive(opts: {
       ctoRole?: string;
@@ -11009,7 +11173,7 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
 
   async function seedOwnershipIssue(params: {
     checkoutStatus: "running" | "failed" | "timed_out";
-    actorRunStatus?: "queued" | "running" | "failed" | "timed_out" | "succeeded";
+    actorRunStatus?: "queued" | "running" | "failed" | "timed_out" | "succeeded" | "scheduled_retry";
     assigneeMatchesActor?: boolean;
   }) {
     const companyId = randomUUID();
@@ -11068,8 +11232,10 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
         agentId: actorAgentId,
         status: actorRunStatus,
         invocationSource: "manual",
-        startedAt: actorRunStatus === "running" ? new Date() : null,
-        finishedAt: actorRunStatus === "queued" || actorRunStatus === "running" ? null : new Date(),
+        // `scheduled_retry` with startedAt set is the retry ladder parking a run
+        // that DID start: not reapable, yet refused by the grant gate.
+        startedAt: actorRunStatus === "running" || actorRunStatus === "scheduled_retry" ? new Date() : null,
+        finishedAt: actorRunStatus === "queued" || actorRunStatus === "running" || actorRunStatus === "scheduled_retry" ? null : new Date(),
       },
     ]);
     await db.insert(issues).values({
@@ -11172,6 +11338,129 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
     expect(row).toEqual({
       checkoutRunId: null,
       executionRunId: null,
+    });
+  });
+
+  // BLO-28441: a run the server has already marked terminal keeps executing for
+  // ~10 minutes and its comments still succeed, so it publishes analysis derived
+  // from a state the server considers dead. The guard's refusal is correct; what
+  // was missing was any way for the caller to learn the refusal is about ITSELF.
+  //
+  // Note this lands in the no-holder branch on purpose: the ladder releases the
+  // dead holder's lock in the same call, so both lock columns read null and the
+  // pre-BLO-28441 remediation told a run that can never succeed to "retry once".
+  it("names the actor's own terminal run status in the ownership 409", async () => {
+    const seeded = await seedOwnershipIssue({ checkoutStatus: "failed", actorRunStatus: "succeeded" });
+
+    await expect(
+      svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId),
+    ).rejects.toMatchObject({
+      status: 409,
+      details: {
+        actorRunId: seeded.actorRunId,
+        actorRunStatus: "succeeded",
+      },
+    });
+
+    const err = await svc
+      .assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId)
+      .then(() => null, (caught) => caught as { details?: Record<string, unknown> });
+    // The caller must be able to act on this without further investigation, so
+    // the hoisted remediation has to blame the caller's run, not the holder.
+    expect(String(err?.details?.remediation)).toContain(seeded.actorRunId);
+    expect(String(err?.details?.remediation)).toContain("succeeded");
+  });
+
+  it("names a started run parked in scheduled_retry as dead, not retryable", async () => {
+    // `runningCheckoutExecutionPatch` refuses anything but `running`; a run the
+    // retry ladder parked in `scheduled_retry` after it started is refused just
+    // the same, yet it is not reapable (startedAt is set), so gating the
+    // remediation on reapability sent it back to "retry once" -- a retry that
+    // can never succeed. This fixture keeps the actor run distinct from the
+    // holder on purpose: a parked run that is its OWN holder is granted by
+    // `resolveSameRunOwnership` before any status check and never gets here
+    // (BLO-35402).
+    const seeded = await seedOwnershipIssue({ checkoutStatus: "failed", actorRunStatus: "scheduled_retry" });
+
+    const err = await svc
+      .assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId)
+      .then(() => null, (caught) => caught as { status?: number; details?: Record<string, unknown> });
+    expect(err?.status).toBe(409);
+    expect(err?.details?.actorRunStatus).toBe("scheduled_retry");
+    expect(String(err?.details?.remediation)).toContain(seeded.actorRunId);
+    expect(String(err?.details?.remediation)).toContain("scheduled_retry");
+    expect(String(err?.details?.remediation)).not.toContain("retry once");
+  });
+
+  it("reports the actor's run status without weakening the live-holder fence", async () => {
+    // The adversarial twin: both runs genuinely live. The guard's DECISION must
+    // be byte-identical to before — this is an observability change only, and a
+    // widened guard would let a run the server declared dead seize a lock.
+    const seeded = await seedOwnershipIssue({ checkoutStatus: "running", actorRunStatus: "running" });
+
+    await expect(
+      svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId),
+    ).rejects.toMatchObject({
+      status: 409,
+      details: {
+        // Existing payload preserved: the BLOCKING run id must remain present.
+        checkoutRunId: seeded.staleRunId,
+        executionRunId: seeded.staleRunId,
+        actorRunId: seeded.actorRunId,
+        // A live actor is reported as live, and must NOT be told to stop working.
+        actorRunStatus: "running",
+        holderLiveness: "live",
+      },
+    });
+
+    // The live holder still owns the row: nothing was adopted or released.
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, seeded.issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      checkoutRunId: seeded.staleRunId,
+      executionRunId: seeded.staleRunId,
+    });
+  });
+
+  // BLO-28441 names both routes in its acceptance criterion. The PATCH-side
+  // guard is pinned above; this pins the `POST /checkout` conflict, which is the
+  // route the original wedge was discovered on. Without it, dropping the
+  // `describeIssueLockConflict` spread from the checkout 409 passes the suite.
+  it("names the actor's own terminal run status in the checkout 409", async () => {
+    const seeded = await seedOwnershipIssue({ checkoutStatus: "running", actorRunStatus: "succeeded" });
+
+    await expect(
+      svc.checkout(seeded.issueId, seeded.actorAgentId, ["todo"], seeded.actorRunId),
+    ).rejects.toMatchObject({
+      status: 409,
+      message: "Issue checkout conflict",
+      details: {
+        checkoutRunId: seeded.staleRunId,
+        executionRunId: seeded.staleRunId,
+        actorRunId: seeded.actorRunId,
+        actorRunStatus: "succeeded",
+        holderLiveness: "live",
+      },
+    });
+
+    // The live holder still owns the row: the rejected checkout adopted nothing.
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, seeded.issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      checkoutRunId: seeded.staleRunId,
+      executionRunId: seeded.staleRunId,
     });
   });
 

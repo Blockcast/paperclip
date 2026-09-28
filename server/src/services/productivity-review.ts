@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
-import type { Db } from "@paperclipai/db";
+import type { Db, DbTransaction } from "@paperclipai/db";
 import { clampIssueRequestDepth } from "@paperclipai/shared";
 import {
   activityLog,
@@ -33,6 +33,10 @@ import { withIssueMonitorQueueLock } from "./issue-monitor-queue-lock.js";
 import { issueService } from "./issues.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import {
+  listResolvedTerminalGates,
+  readIssueMonitorGateSignals,
+} from "./terminal-gate-reconciler.js";
+import {
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
@@ -44,6 +48,7 @@ import {
 import { resolveOwningPaperclipIdentifiers } from "./paperclip-identifiers.js";
 import {
   isDependencyBlockedRun,
+  isInfraClassErrorCodeRun,
   isInfraFailureRun,
   runUsageTokenCounts,
 } from "./recovery/zero-token-startup-failure.js";
@@ -393,6 +398,15 @@ type ProductivityReviewEvidence = {
   // `nonExecutingAlsoNeverInvokedCount` measures the intersection rather than
   // assuming disjointness.
   neverInvokedRunCount: number;
+  // BLO-36535: count of terminal runs excluded from the `noCommentStreak` walk
+  // because their `errorCode` names an infrastructure fault
+  // (`isInfraClassErrorCodeRun`) — the run executed a turn and infrastructure
+  // killed it before it could finish. Disjoint from `neverInvokedRunCount` and
+  // from `nonExecutingRunCount` by construction: both of those are zero-token
+  // populations, this one is runs that burned tokens. Reported so a manager can
+  // see how much of the window was taken by infrastructure without re-deriving
+  // it from raw run telemetry.
+  infraClassKilledRunCount: number;
   // BLO-26165 (narrowing): of the runs eligible for the `noCommentStreak` walk,
   // how many carry `issueCommentStatus: "not_applicable"` —
   // `finalizeIssueCommentPolicy` exempted them from the comment requirement
@@ -1851,6 +1865,38 @@ function isDependencyBlockedClosableTriggerSet(triggers: unknown) {
   return Array.isArray(triggers) && triggers.length > 0 && triggers.every(isDependencyBlockedClosableTrigger);
 }
 
+// BLO-27515: which triggers a *resolved* terminal gate excuses. Only
+// `long_active_duration`, and the scoping matters more here than it looks.
+//
+// A satisfied gate explains exactly one thing: the elapsed wall-clock was spent
+// waiting on something that has since happened, and no assignee run was
+// dispatched to notice. It explains nothing about conduct. `high_churn` and
+// `runtime_failure_streak` are records of runs that did execute and did burn
+// cost or fail; a pull request merging does not make either untrue.
+// `no_comment_streak` is excluded too, unlike the dependency-blocked set above:
+// a dependency gate *causes* silence by cancelling queued runs before dispatch,
+// whereas a monitor gate does not stop the assignee from commenting — so
+// silence under a resolved gate is still worth a manager's attention.
+//
+// Set form, and every trigger must be closable: a review that also fired a
+// non-closable trigger still files.
+//
+// State the limit honestly rather than claiming more than the code does. This
+// bounds an evasion; it does not close it. Three things stand between a
+// declared gate and a silenced review: the set must be purely
+// `long_active_duration` (any conduct trigger alongside it still files); the
+// cited PR must be a webhook-promoted GitHub work product *of this issue*
+// (`listResolvedTerminalGates`); and the suppression is bounded by
+// `longActiveMs`. What remains open is that *any* such work product qualifies —
+// an assignee whose issue legitimately owns a merged PR can arm a monitor on it
+// after the fact and buy a bounded `long_active_duration` suppression it did
+// not spend the time on. "Tied to the issue's intended work" is not mechanically
+// expressible here, so the binding is webhook provenance, and that is weaker.
+function isTerminalGateClosableTriggerSet(triggers: unknown) {
+  return Array.isArray(triggers) && triggers.length > 0
+    && triggers.every((trigger) => trigger === "long_active_duration");
+}
+
 // Close-path form: the persisted `details.firedTriggers` when the review was
 // minted with one, else the single `details.trigger` for rows written before
 // BLO-22436's follow-up. The fallback is deliberately the *old* behaviour and
@@ -2067,7 +2113,7 @@ function dominantErrorCode(
  * the BLO-3737 refresh-throttle critical section accept this so the read and the
  * write land on the same connection (and therefore inside the same advisory lock).
  */
-type DbOrTx = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
+type DbOrTx = Db | DbTransaction;
 
 export function productivityReviewService(db: Db, deps?: ProductivityReviewServiceDeps) {
   const issuesSvc = issueService(db);
@@ -3144,6 +3190,41 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
   }
 
   /**
+   * BLO-27515: audit the suppression so a silenced review is still legible. The
+   * detector reads only the recorded resolution — the gate itself was re-read
+   * board-side by the terminal-gate reconciler, which also left a comment on
+   * the source issue naming the resolved gate.
+   */
+  async function recordTerminalGateResolvedSuppression(
+    sourceIssue: IssueRow,
+    evidence: ProductivityReviewEvidence,
+  ) {
+    const details = {
+      source: "productivity_review.reconcile",
+      sourceIssueId: sourceIssue.id,
+      trigger: evidence.trigger,
+      firedTriggers: evidence.firedTriggers,
+      suppressedBy: "terminal_gate_resolved",
+      gateSignals: readIssueMonitorGateSignals(sourceIssue.executionState),
+      elapsedMs: evidence.elapsedMs,
+    };
+    await logActivity(db, {
+      companyId: sourceIssue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: sourceIssue.assigneeAgentId,
+      action: "issue.productivity_review_suppressed",
+      entityType: "issue",
+      entityId: sourceIssue.id,
+      details,
+    });
+    logger.info(
+      details,
+      "productivity review long_active_duration suppressed by an already-resolved terminal gate (BLO-27515)",
+    );
+  }
+
+  /**
    * BLO-20549: sweep already-open productivity reviews and retire the ones whose alarm no longer
    * stands. This is the only place that can retire them — the reconcile candidate query scans
    * `todo`/`in_progress` sources only, so once a source reaches a terminal status it drops out of
@@ -3987,7 +4068,49 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // almost every wake reason — the exact inverse of the false positive this
     // issue was opened for. See `isNeverInvokedRun`.
     const neverInvokedRunCount = terminalRuns.filter(isNeverInvokedRun).length;
-    const noCommentEligibleRuns = executedTerminalRuns.filter((run) => !isNeverInvokedRun(run));
+    const commentCapableRuns = executedTerminalRuns.filter((run) => !isNeverInvokedRun(run));
+    // BLO-36535: a run that executed a turn and was then killed by
+    // infrastructure could not finish it, so its missing comment is not
+    // silence. See `isInfraClassErrorCodeRun` for why membership is by error
+    // code only, and why neither the message arm nor a `livenessState` guard
+    // may be added. The rest of this note is call-site specific.
+    //
+    // Excluded, NOT streak-breaking, symmetrically with the two populations
+    // above: breaking here would assert "the agent was given a turn and used
+    // it" at a point where infrastructure took the turn away. The consequence
+    // is deliberate and worth stating — removing these runs bridges genuine
+    // silence on either side of an infra gap into one contiguous streak, which
+    // is the correct reading, because an infra outage in the middle of a silent
+    // stretch is not evidence the agent spoke.
+    //
+    // Reported, not dropped (the BLO-27698 B3b shape): `infraClassKilledRunCount`
+    // renders in both evidence blocks. A chronically infra-killed lane stays
+    // visible through the recovery lane rather than through this trigger —
+    // `stranded_assigned_issue` recovery actions stamp `infraClassCause: true`
+    // off the same `ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES` set, which is exactly
+    // how the platform had already classified BLO-32472's cause on the very
+    // review row that then billed it to the assignee. Provider fault is owned
+    // by BLO-34726, not by a productivity review.
+    //
+    // `&& !commentRunIds.has(run.id)` is load-bearing, and this is the first
+    // exclusion in this function that needs it. The walk below breaks ONLY on
+    // `commentRunIds.has(run.id)`, so a run removed from the array is never
+    // tested and can no longer break the streak. The two exclusions above are
+    // safe without the guard because both are zero-token / no-telemetry
+    // predicates — those runs provably never got a turn, so they cannot appear
+    // in `commentRunIds`. This population is the first that CAN have commented:
+    // that is the whole premise of the narrowing. Without the guard, a run that
+    // posted its comment and was THEN killed by a provider 403 would be
+    // filtered out, the walk would bridge across it, and the streak would count
+    // an agent that demonstrably spoke inside the window — re-manufacturing the
+    // conduct false positive this change exists to remove, in the same
+    // direction. That ordering (comment first, killed later) is the modal shape
+    // on this fleet, because the run-comment protocol has agents post before
+    // continuing to work. A run that spoke is not an exclusion; it is evidence.
+    const isInfraKilledSilentRun = (run: (typeof commentCapableRuns)[number]) =>
+      isInfraClassErrorCodeRun(run) && !commentRunIds.has(run.id);
+    const infraClassKilledRunCount = commentCapableRuns.filter(isInfraKilledSilentRun).length;
+    const noCommentEligibleRuns = commentCapableRuns.filter((run) => !isInfraKilledSilentRun(run));
     // Of the runs actually eligible for the streak walk, how many carry the
     // comment-policy-exempt status. Scoped to the eligible population (not all
     // terminal runs) so the "DID execute" claim is literally true of every run
@@ -4526,7 +4649,15 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       const neverInvokedNote = neverInvokedRunCount > 0
         ? ` (${neverInvokedRunCount} run(s) in the sampled window never had an adapter created and are excluded, not counted toward this streak; these mostly overlap the non-executing runs reported separately, so the two counts do not sum)`
         : "";
-      triggerReasons.push(`${noCommentStreak} consecutive terminal, turn-executing issue-linked runs had no run-created issue comment${neverInvokedNote}`);
+      // BLO-36535: stated separately from `neverInvokedNote` because the two
+      // populations are disjoint — that one never got an adapter, this one got a
+      // full turn and had it taken away mid-flight — and because a reader who
+      // sees a streak of N alongside a large infra count needs to know the
+      // streak was measured over neither.
+      const infraKilledNote = infraClassKilledRunCount > 0
+        ? ` (${infraClassKilledRunCount} run(s) in the sampled window executed a turn and were then killed by an infrastructure fault; they are excluded, not counted toward this streak, and unlike the never-invoked runs above they do NOT overlap the non-executing count, which is zero-token by construction)`
+        : "";
+      triggerReasons.push(`${noCommentStreak} consecutive terminal, turn-executing issue-linked runs had no run-created issue comment${neverInvokedNote}${infraKilledNote}`);
     }
     if (runawayExecution) {
       triggerReasons.push(
@@ -4778,6 +4909,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       runtimeFailureStreak,
       runtimeFailureUsageBasis,
       neverInvokedRunCount,
+      infraClassKilledRunCount,
       commentExemptExecutedRunCount,
       nonExecutingRunCount,
       nonExecutingDominantErrorCode,
@@ -4917,6 +5049,12 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- No-comment streak (terminal, turn-executing runs): ${evidence.noCommentStreak}`,
       `- Runtime-failure streak (terminal, never-executed runs): ${evidence.runtimeFailureStreak}`,
       `- Never-invoked runs excluded (terminal, no adapter ever created — \`usageJson\`/\`logStore\`/\`logRef\` null, \`logBytes\` null or 0, BLO-26165): ${evidence.neverInvokedRunCount}`,
+      // BLO-36535: rendered next to the never-invoked count because both are
+      // exclusions from the same walk, but they are disjoint populations — that
+      // one never got an adapter, this one executed a turn and had it killed —
+      // so the two counts do sum, unlike the never-invoked/non-executing pair
+      // below.
+      `- Infra-killed runs excluded (terminal, executed a turn then died of an infrastructure fault — \`errorCode\` in the shared infra-class set, BLO-36535): ${evidence.infraClassKilledRunCount}`,
       // BLO-29535 (Ally suggestion on a38c12fe2): "not excluded from the streak
       // walk", NOT "counted toward the streak". This count is taken over every
       // run in `noCommentEligibleRuns`, while `noCommentStreak` is only the
@@ -5071,6 +5209,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- No-comment streak: ${evidence.noCommentStreak}`,
       `- Runtime-failure streak: ${evidence.runtimeFailureStreak}`,
       `- Never-invoked runs excluded (no adapter created): ${evidence.neverInvokedRunCount}`,
+      `- Infra-killed runs excluded (executed a turn, then killed by infrastructure): ${evidence.infraClassKilledRunCount}`,
       // BLO-29535: same wording fix as the description's evidence block — this
       // count is every streak-eligible exempt run, not the streak prefix, and
       // a bare "(counted)" sitting under "No-comment streak" read as "counted
@@ -5873,6 +6012,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       monitorScheduledSuppressed: 0,
       approvalGatedSuppressed: 0,
       dependencyBlockedSuppressed: 0,
+      terminalGateResolvedSuppressed: 0,
       closedSuppressedMonitorReviews: 0,
       closedTerminalSourceReviews: 0,
       closedDependencyBlockedReviews: 0,
@@ -6041,6 +6181,18 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     }
 
     const prefixCache = new Map<string, string>();
+
+    // BLO-27515: sources whose terminated monitor declared pull-request gates
+    // that a board-side re-read has since found satisfied. This is a plain
+    // lookup of an already-recorded result — the detector never reads GitHub
+    // itself. Re-evaluation lives in the terminal-gate reconciler precisely so
+    // that the gate is observed on its own cadence rather than only once an
+    // issue has already crossed the 6h threshold this detector measures.
+    const terminalGateResolutions = await listResolvedTerminalGates(
+      db,
+      candidates.map((candidate) => ({ id: candidate.id, executionState: candidate.executionState })),
+    );
+
     for (const candidate of candidates) {
       if (recoveredReservations.recoveredSourceIssueIds.has(candidate.id)) {
         continue;
@@ -6083,6 +6235,21 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       if (isMonitorScheduledSuppression(evidence)) {
         await recordMonitorScheduledSuppression(evidence);
         result.monitorScheduledSuppressed += 1;
+        continue;
+      }
+      // Checked after the approval and monitor gates on purpose. Both of those
+      // describe a gate that is still *live* — a pending approval, a monitor
+      // with a future check — and are the more accurate explanation whenever
+      // they apply. A recorded resolution outlives the monitor that produced
+      // it, so a same-signal re-arm would otherwise be reported here under a
+      // gate that has since been re-opened.
+      if (
+        terminalGateResolutions.has(candidate.id) &&
+        now.getTime() - terminalGateResolutions.get(candidate.id)!.createdAt.getTime() < thresholds.longActiveMs &&
+        isTerminalGateClosableTriggerSet(evidence.firedTriggers)
+      ) {
+        await recordTerminalGateResolvedSuppression(candidate, evidence);
+        result.terminalGateResolvedSuppressed += 1;
         continue;
       }
       // BLO-22887 AC2: attach the dependency bucket for the survivors of the

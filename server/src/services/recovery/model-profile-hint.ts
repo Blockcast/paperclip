@@ -50,15 +50,68 @@ export const PLANNING_ONLY_RECOVERY_GUARD_CONTEXT = {
 // a normal-model run, because only a recorded disposition clears the action. The narrower phrasing
 // is deliberate in both directions — it must not go stale again, and it must not read to a refused
 // agent as an instruction to go arm itself an unguarded run (that residual is BLO-32774).
+// BLO-34683: the exit list is now per-refusal, because the state it used to assert is not
+// universal and no single string is true at every call site. This constant is spread into FOUR
+// refusals — the assignee-profile, document/deliverable and approval-link gates in `issues.ts`,
+// and the approval create/modify gate in `routes/approvals.ts`; the monitor-arm gate uses
+// `statusOnlyMonitorArmResumeGuidance` below instead, for five sharers in total. Enumerate with
+// a grep across `server/src`, not across `issues.ts`: deriving this count from `issues.ts` alone
+// is what left a stale assertion in `approval-routes-idempotency.test.ts` when the text last
+// changed, and this comment is the record that licenses the next edit to the shared string.
+//
+// What the four sites above have in common is that they refuse on RUN CLASS ALONE — none of them
+// queries `issue_recovery_actions`, so none can say whether an action is containing the run, and a
+// text that splits on that asks the reader to resolve something the refusal never resolved. They
+// also carry no monitor, so monitor-specific advice named an object not in the payload. Both were
+// the very defect this text was widened to fix, re-emitted one call site over.
+//
+// The preamble must stay true in every state, including "no recovery action exists at all": the
+// reason waiting never ends is that a run's class is fixed for its lifetime, NOT that an action is
+// pending. Phrasing it as the latter is what made the old text assert a row that need not exist.
+const STATUS_ONLY_RESUME_PREAMBLE =
+  "No normal-model run arrives on its own: this run's class is fixed for its lifetime, and every " +
+  "wake a recovery action raises is status-only — so waiting for a normal-model run never ends.";
+
+// True at all five sharers, and the only exit that is. Kept separate so neither arm has to restate it.
+const STATUS_ONLY_BOARD_APPROVAL_EXIT =
+  "You may also file a `request_board_approval` linked to the run context's source issue.";
+
 export const STATUS_ONLY_RECOVERY_RESUME_GUIDANCE = {
   normalModelResumeIsAutomatic: false,
   resumeGuidance:
-    "No normal-model run is dispatched for this issue on its own: every wake the recovery action " +
-    "itself raises is status-only, and only a recorded disposition clears that action — so waiting " +
-    "for a normal-model run never ends. Reachable exits from this run: record a valid issue " +
-    "disposition to clear the recovery action, or file a `request_board_approval` linked to the " +
-    "run context's source issue.",
+    `${STATUS_ONLY_RESUME_PREAMBLE} This refusal is keyed on the run class and on nothing else, so ` +
+    "no state change on any issue lifts it within this run: record your conclusion on the issue and " +
+    `take the allowed write named in this response. ${STATUS_ONLY_BOARD_APPROVAL_EXIT}`,
 } as const;
+
+/**
+ * The monitor-arm gate's guidance, which unlike the three refusals above HAS resolved whether
+ * anything is containing the run — so it states the branch it took instead of offering the caller
+ * a split to guess at.
+ *
+ * `containingIssueIds` is the resolved answer and is echoed into the 403 `details`: the old text
+ * said "record a disposition to clear the recovery action" while the payload carried only the
+ * PATCHED issue id, which on a cross-issue refusal is the one row that holds no action. Naming the
+ * containing row is what makes that exit reachable rather than merely stated.
+ *
+ * Empty means the gate fell through to its fail-closed branch — an unresolvable scope, not an
+ * absence of containment — and the two must not read alike to the refused run.
+ */
+export function statusOnlyMonitorArmResumeGuidance(containingIssueIds: readonly string[]) {
+  return {
+    normalModelResumeIsAutomatic: false,
+    containingIssueIds: [...containingIssueIds],
+    resumeGuidance: containingIssueIds.length > 0
+      ? `${STATUS_ONLY_RESUME_PREAMBLE} This run is contained by an active recovery action on ` +
+        `${containingIssueIds.join(", ")}; recording a valid issue disposition there clears the ` +
+        `action, which restores monitor arming. ${STATUS_ONLY_BOARD_APPROVAL_EXIT}`
+      : `${STATUS_ONLY_RESUME_PREAMBLE} Containment could not be resolved here — this request has ` +
+        "no persisted issue yet, or the run context names no issue — so the gate fails closed " +
+        "rather than reading an unresolvable scope as an absent one. If you are creating an issue, " +
+        "let the create succeed without a monitor and arm one in a follow-up write once the id " +
+        `exists. ${STATUS_ONLY_BOARD_APPROVAL_EXIT}`,
+  };
+}
 
 // Does a run's `contextSnapshot` carry the full status-only guard tuple?
 //

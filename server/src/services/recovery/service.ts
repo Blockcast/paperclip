@@ -1,5 +1,5 @@
 import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, notInArray, or, sql } from "drizzle-orm";
-import type { Db } from "@paperclipai/db";
+import type { Db, DbTransaction } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -118,6 +118,7 @@ import {
 } from "./origins.js";
 import { postRoutineSchedulerFailureHeartbeat } from "./routine-scheduler-heartbeat.js";
 import {
+  PENDING_INTERACTION_MAX_AGE_MS,
   classifyIssueGraphLiveness,
   type IssueLivenessFinding,
 } from "./issue-graph-liveness.js";
@@ -140,13 +141,12 @@ import {
 import {
   isInfraFailureRun,
   isLegacySessionUnavailableAdapterMismatch,
+  ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES,
   isZeroTokenStartupFailureRun,
   isZeroTokenSessionResetRetryRun,
   SESSION_UNAVAILABLE_RECOVERY_MAX_ATTEMPTS,
   ZERO_TOKEN_SESSION_RESET_RETRY_REASON,
 } from "./zero-token-startup-failure.js";
-
-type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
 /**
  * The recovery transaction has already upserted its source-scoped action when
@@ -451,10 +451,29 @@ export const STALE_LIVENESS_ESCALATION_AUTO_RESOLVE_MARKER = "[liveness] auto-re
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
 const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
-const EXTERNAL_WAIT_RESUME_WAKE_REASONS = new Set([
+/**
+ * PEN-2400 (Ally non-blocking 2, from the PR #1195 review): the wake reasons that
+ * resume a run parked on an external wait.
+ *
+ * This used to be declared twice — a hardcoded literal here and a
+ * `GITHUB_STATE_CHANGE_WAKE_REASONS`-derived set in `heartbeat.ts`. They were
+ * identical, but nothing held them so: a resume signal added to one and not the
+ * other wakes one path while the other suppresses it, which surfaces as a run
+ * stalled on an external wait with no attributable cause.
+ *
+ * `heartbeat.ts` imports `recovery/service.js` and recovery cannot import back,
+ * so this leaf module owns both sets — the same hoist BLO-30087 used for the
+ * agent-pod staleness bounds. `external-wait-resume-wake-reasons.test.ts` asserts
+ * the two modules resolve the *same object*, so re-introducing a local literal in
+ * `heartbeat.ts` fails rather than silently re-opening the drift.
+ */
+export const GITHUB_STATE_CHANGE_WAKE_REASONS: ReadonlySet<string> = new Set([
   "github_check_completed",
   "github_check_suite_completed",
   "github_workflow_completed",
+]);
+export const EXTERNAL_WAIT_RESUME_WAKE_REASONS: ReadonlySet<string> = new Set([
+  ...GITHUB_STATE_CHANGE_WAKE_REASONS,
   "github_pr_closed",
   "github_pr_converted_to_draft",
   "github_pr_review_submitted",
@@ -867,14 +886,6 @@ type StrandedRecoveryCause =
   | typeof SUCCESSFUL_RUN_MISSING_STATE_REASON;
 
 type StrandedPreviousStatus = "todo" | "in_progress" | "in_review";
-
-const ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES = new Set([
-  "job_failed",
-  "k8s_pod_schedule_failed",
-  "adapter_failed",
-  "external_lifecycle_stale_killed",
-  "k8s_concurrency_guard_unreachable",
-]);
 
 type SuccessfulRunHandoffRecoveryEvidence = {
   sourceRunId: string | null;
@@ -2785,6 +2796,18 @@ export function recoveryService(
     return rows.length > 0;
   }
 
+  /**
+   * BLO-22660: bounded on the same 24h threshold the liveness classifier uses, because this
+   * is the remediation half of the belief that classifier encodes. These sweeps skip a row
+   * when a wake card is pending; the classifier mints a finding once that card ages out. If
+   * only one half aged, the overlap population (pending, wake policy, older than 24h) would
+   * get a finding that every sweep then declined to act on.
+   *
+   * The `continuationPolicy` filter is not a substitute for ageing: a `wake_assignee` card
+   * fires when it is *answered*, so a card nobody has answered in 32 days is precisely the
+   * shape that never fires. `createdAt` is `notNull().defaultNow()`, so unlike the
+   * classifier's in-memory input there is no missing-timestamp row for this to drop.
+   */
   async function hasPendingWakeInteraction(companyId: string, issueId: string) {
     return db
       .select({ id: issueThreadInteractions.id })
@@ -2795,16 +2818,27 @@ export function recoveryService(
           eq(issueThreadInteractions.issueId, issueId),
           eq(issueThreadInteractions.status, "pending"),
           inArray(issueThreadInteractions.continuationPolicy, ["wake_assignee", "wake_assignee_on_accept"]),
+          gt(issueThreadInteractions.createdAt, new Date(Date.now() - PENDING_INTERACTION_MAX_AGE_MS)),
         ),
       )
       .limit(1)
       .then((rows) => Boolean(rows[0]));
   }
 
+  // PEN-3352: named rather than three adjacent bare `number` positionals. The three
+  // graces differ by more than an order of magnitude (6h / 7d / 14d) and a transposition
+  // between them is type-silent — it would surface only as a subtly wrong seizure window,
+  // which is the hardest kind of defect to attribute in this sweep. The fourth addition
+  // to this signature is the moment to make that unrepresentable.
+  type DurableWaitGraces = {
+    monitor: number;
+    openPullRequest: number;
+    pendingBoardApproval: number;
+  };
+
   async function hasPersistedDurableWaitPath(
     issue: typeof issues.$inferSelect,
-    graceMs: number,
-    openPullRequestGraceMs: number,
+    graces: DurableWaitGraces,
   ) {
     // BLO-24782: this used to be `if (issue.monitorNextCheckAt) return true`, which
     // accepted a check instant already in the past. That was not simply a looser
@@ -2814,9 +2848,11 @@ export function recoveryService(
     // two genuinely disagreed in both directions about the same monitor. Delegating
     // makes that divergence unrepresentable rather than merely tested for: there is now
     // one definition of "the monitor is still a live wake path", and it is bounded.
-    if (hasActiveMonitorPath(issue, graceMs)) return true;
+    if (hasActiveMonitorPath(issue, graces.monitor)) return true;
 
-    if (await hasOpenPullRequestWakePath(issue, openPullRequestGraceMs)) return true;
+    if (await hasOpenPullRequestWakePath(issue, graces.openPullRequest)) return true;
+
+    if (await hasPendingBoardApprovalWakePath(issue, graces.pendingBoardApproval)) return true;
 
     return db
       .select({ id: issueRelations.issueId })
@@ -2952,6 +2988,99 @@ export function recoveryService(
           eq(issueWorkProducts.companyId, issue.companyId),
           eq(issueWorkProducts.issueId, issue.id),
           ...openPullRequestWakePathConditions(freshSinceIso),
+        ),
+      )
+      .limit(1)
+      .then((rows) => Boolean(rows[0]));
+  }
+
+  /**
+   * Whether a PENDING board approval linked to this issue still constitutes an automatic
+   * path back to life FOR THIS ISSUE'S ASSIGNEE.
+   *
+   * PEN-3352, filed against PEN-2791's omission. A board card awaiting a human is the
+   * same class of object as an open PR awaiting a merge press — the normal resting state
+   * of correct work, on a queue measured in days — and it was the one such class with no
+   * durable path here. The consequence is the one written on `hasOpenPullRequestWakePath`
+   * above: the convergence guard's whole job, against a gate it cannot move, is to stop
+   * re-arming and clear `monitorNextCheckAt`, so on a row whose only gate is a board card
+   * the guard behaving correctly is precisely what made the row seizable.
+   *
+   * Live instance PEN-2727: seized 2026-09-17T12:56:20Z as `stranded_assigned_issue` with
+   * `latestRunStatus: succeeded` and `latestRunErrorCode: null` — fired on the absence of
+   * a counted path, not on a fault — while linked to pending approval `71e27d35`.
+   *
+   * ⚠️ The clause that makes this NOT a copy of the PR predicate, and the reason it must
+   * not be written as one. The two wakes have different targets:
+   *
+   *   - `github-webhook.ts` wakes `effectiveAssigneeAgentId` — the ISSUE'S ASSIGNEE. So
+   *     `hasOpenPullRequestWakePath` can be assignee-agnostic: whoever holds the row is
+   *     by construction the actor the webhook will wake.
+   *   - `approval-resolution.ts` wakes `approval.requestedByAgentId` — the REQUESTER, who
+   *     need not hold the row and frequently does not.
+   *
+   * Measured 2026-09-17 across all 17 pending approvals in the reference company: of 20
+   * linked (approval, issue) pairs, **8 had requester != assignee**. Without the equality
+   * clause this disjunct would suppress seizure on rows whose decision wake lands on a
+   * different agent entirely — protecting them from recovery while leaving them genuinely
+   * dark, which is a strictly worse failure than the one being fixed. PEN-2727 itself is
+   * such a pair today (requester Cfo, assignee Ceo, following the seizure that moved it),
+   * so the motivating row is deliberately NOT exempted by this predicate until its
+   * assignee and its requester are the same agent again. The repair for that shape is to
+   * put the row back with the agent who filed the card, not to widen this.
+   *
+   * `requestedByAgentId IS NOT NULL` is load-bearing for the same reason the PR path
+   * insists on webhook provenance: `queueRequesterWake` returns immediately without a
+   * requester agent, so a board-filed or system-filed card (every
+   * `budget_override_required` row) predicts no wake at all. A human-filed card says a
+   * human is waiting, which is not the same claim as an agent being woken.
+   *
+   * Scoped to `pending` ONLY, deliberately excluding `revision_requested` even though the
+   * issue-graph liveness classifier counts both. There the question is "does anything own
+   * the next action", and a revision request is owned — by the requester. Here the
+   * question is "will an external event wake this agent", and the board has already
+   * answered: the next move is the requester resubmitting, which is the assignee acting,
+   * not an event arriving. Counting it would credit a wake that has already been spent.
+   *
+   * The other half of that story is the resubmission, and it is why the grace reads
+   * `GREATEST(createdAt, updatedAt)` rather than `createdAt`: when the requester does
+   * resubmit, the row returns to `pending` and a fresh board decision is owed again.
+   * Bounding on `createdAt` alone would date that live wait from the original filing, so
+   * a card filed on day 0 and resubmitted on day 20 reports no path and is seizable while
+   * a genuine decision is still coming. `updatedAt` is safe to read here precisely because
+   * this predicate is scoped to `pending`: of the eleven `update(approvals)` sites under
+   * `server/src` (excluding tests — `grep -rn 'update(approvals)' server/src
+   * --include='*.ts' | grep -v __tests__`, re-runnable rather than asserted), the only one
+   * that leaves a row `pending` while touching `updatedAt` is `resubmit`
+   * (`services/approvals.ts`) — `addComment` writes `approval_comments` only, the column
+   * has no `$onUpdate` and no trigger, and every other write either moves the row out of
+   * `pending` or leaves `updatedAt` alone. The nearest miss is `services/agents.ts`, which
+   * edits `payload` on rows scoped to `pending` and is harmless only because it does not
+   * set `updatedAt`. So on a `pending` row `updatedAt` carries exactly one signal, and it
+   * is the one this predicate wants. See `pendingBoardApprovalAttendanceGraceMs` for the
+   * measured decision-latency distribution behind the 14d default.
+   */
+  async function hasPendingBoardApprovalWakePath(
+    issue: typeof issues.$inferSelect,
+    graceMs: number,
+  ) {
+    // An unassigned row has no assignee for the decision wake to reach, and is not the
+    // stranded-ASSIGNED population in any case. Returning early keeps the SQL's equality
+    // clause from having to express "null equals null is not a match".
+    if (!issue.assigneeAgentId) return false;
+    const filedSinceIso = new Date(Date.now() - graceMs).toISOString();
+    return db
+      .select({ approvalId: issueApprovals.approvalId })
+      .from(issueApprovals)
+      .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+      .where(
+        and(
+          eq(issueApprovals.companyId, issue.companyId),
+          eq(issueApprovals.issueId, issue.id),
+          eq(approvals.companyId, issue.companyId),
+          eq(approvals.status, "pending"),
+          eq(approvals.requestedByAgentId, issue.assigneeAgentId),
+          sql`GREATEST(${approvals.createdAt}, ${approvals.updatedAt}) > ${filedSinceIso}::timestamptz`,
         ),
       )
       .limit(1)
@@ -8507,13 +8636,15 @@ export function recoveryService(
     // restart -- the next tick sees the new value -- while making the cost O(1) in the
     // candidate count.
     //
-    // PEN-2791 added a second grace to this pass. Both come off ONE `loadConfig()` --
-    // adding a `loadConfig().openPullRequestAttendanceGraceMs` beside the existing line
-    // would have doubled exactly the per-tick subprocess cost the single read exists to
-    // remove.
+    // PEN-2791 added a second grace to this pass, PEN-3352 a third. All come off ONE
+    // `loadConfig()` -- adding a `loadConfig().openPullRequestAttendanceGraceMs` beside
+    // the existing line would have doubled exactly the per-tick subprocess cost the
+    // single read exists to remove.
     const recoverySweepConfig = loadConfig();
     const lapsedMonitorGraceMs = recoverySweepConfig.lapsedMonitorGraceMs;
     const openPullRequestAttendanceGraceMs = recoverySweepConfig.openPullRequestAttendanceGraceMs;
+    const pendingBoardApprovalAttendanceGraceMs =
+      recoverySweepConfig.pendingBoardApprovalAttendanceGraceMs;
     const reconcileStrandedCandidate = async (issue: (typeof candidates)[number]) => {
       const executionState = issue.status === "in_review"
         ? parseIssueExecutionState(issue.executionState)
@@ -8724,11 +8855,11 @@ export function recoveryService(
       // population without creating a class of row that can never be recovered.
       if (
         (latestRun?.status === "succeeded" || isExternalWaitYieldRun(latestRun)) &&
-        await hasPersistedDurableWaitPath(
-          issue,
-          lapsedMonitorGraceMs,
-          openPullRequestAttendanceGraceMs,
-        )
+        await hasPersistedDurableWaitPath(issue, {
+          monitor: lapsedMonitorGraceMs,
+          openPullRequest: openPullRequestAttendanceGraceMs,
+          pendingBoardApproval: pendingBoardApprovalAttendanceGraceMs,
+        })
       ) {
         result.skipped += 1;
         return;
@@ -8742,11 +8873,22 @@ export function recoveryService(
       // agent's last real state is whatever the previous run left, and if that was
       // "parked with a fresh open PR", it still holds.
       //
-      // Only the PR disjunct is admitted here, NOT the whole of
+      // Only the two POSITIVE-EVIDENCE disjuncts are admitted here, NOT the whole of
       // `hasPersistedDurableWaitPath`: a lapsed monitor or a blocker edge is a claim the
-      // sweep makes from absence, whereas a webhook-written open PR is positive external
-      // evidence bounded by its own freshness grace. Widening further would reintroduce
-      // the unbounded belief this scoping exists to prevent.
+      // sweep makes from absence, whereas a webhook-written open PR and a pending board
+      // approval are both rows some external actor wrote, each bounded by its own
+      // freshness grace. Widening further would reintroduce the unbounded belief this
+      // scoping exists to prevent.
+      //
+      // PEN-3352 joined the approval disjunct to the PR one here rather than leaving it
+      // on the succeeded-only gate above. The two gates answer one question and PEN-3198
+      // forbids them answering it differently; on the criterion this comment already
+      // states, a pending card qualifies for the same reason a PR does. The argument
+      // transfers verbatim: a run that never started cannot have decided a board card, so
+      // if the agent's last real state was "parked on a fresh pending approval", that
+      // still holds. Leaving it out would have made an infra-failed run seize exactly the
+      // rows the succeeded arm protects — a divergence created by which gate the row
+      // happened to enter, not by anything true about it.
       //
       // Keyed on `isInfraFailureRun`, not on error code. Measured 2026-09-16 over the 71
       // live `stranded_assigned_issue` actions on company `aaced805`: 70 never executed,
@@ -8756,7 +8898,8 @@ export function recoveryService(
       // turn wearing an infra error code, and it stays seizable.
       if (
         latestRun && isInfraFailureRun(latestRun) &&
-        await hasOpenPullRequestWakePath(issue, openPullRequestAttendanceGraceMs)
+        (await hasOpenPullRequestWakePath(issue, openPullRequestAttendanceGraceMs) ||
+          await hasPendingBoardApprovalWakePath(issue, pendingBoardApprovalAttendanceGraceMs))
       ) {
         result.skipped += 1;
         return;
@@ -10194,6 +10337,7 @@ export function recoveryService(
           companyId: issueThreadInteractions.companyId,
           issueId: issueThreadInteractions.issueId,
           status: issueThreadInteractions.status,
+          createdAt: issueThreadInteractions.createdAt,
         })
         .from(issueThreadInteractions)
         .where(eq(issueThreadInteractions.status, "pending")),

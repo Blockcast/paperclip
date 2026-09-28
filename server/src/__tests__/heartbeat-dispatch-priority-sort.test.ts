@@ -5072,6 +5072,153 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     await boundedHeartbeat.drainInFlightExecutions(60_000);
   }, 120_000);
 
+  // PEN-2400 (Ally non-blocking 1): the test above proves `resumeQueuedRuns`
+  // still REJECTS when a dispatch fails, but it uses a single agent, so it
+  // cannot tell "the pass aborted at the first failure" apart from "the pass
+  // continued". This one is the discriminator for the batch-abort fix: the
+  // failing agent is whichever the unordered agent sweep reaches first, and the
+  // assertion is that the OTHER agent was still dispatched. Unguarded, the
+  // throw escapes the `for` loop and the survivor is never dispatched, so this
+  // fails; guarded, it passes. It also re-asserts the rejection, so the fix
+  // cannot be "achieved" by swallowing the error.
+  it("dispatches every agent when one agent's dispatch fails, and still surfaces the failure", async () => {
+    const companyId = randomUUID();
+    const firstAgentId = randomUUID();
+    const secondAgentId = randomUUID();
+    const agentIds = [firstAgentId, secondAgentId];
+    const issuePrefix = `B${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    // Each agent gets the same two-run shape as the single-agent test above: an
+    // earlier claim that should dispatch, and a later emergency-lane run whose
+    // refusal status read is the injection point.
+    const claimRunIdByAgentId = new Map(agentIds.map((agentId) => [agentId, randomUUID()]));
+    const refusedRunIdByAgentId = new Map(agentIds.map((agentId) => [agentId, randomUUID()]));
+    const agentIdByRefusedRunId = new Map(
+      [...refusedRunIdByAgentId].map(([agentId, runId]) => [runId, agentId]),
+    );
+
+    // Fail whichever agent the sweep happens to reach first; the sweep derives
+    // its agent list from an unordered select, so pinning a specific agent here
+    // would make the test pass vacuously whenever that agent sorted last.
+    let failedAgentId: string | null = null;
+    const boundedHeartbeat = heartbeatService(db, {
+      penstockGate: allowPenstockGate,
+      beforeQueuedDispatchRefusalStatusReadForTest: (run) => {
+        if (failedAgentId !== null) return;
+        if (agentIdByRefusedRunId.get(run.id) !== run.agentId) return;
+        failedAgentId = run.agentId;
+        throw new Error("injected refusal status read failure");
+      },
+    });
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "BatchDispatchIsolationCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values(
+      agentIds.map((agentId, index) => ({
+        id: agentId,
+        companyId,
+        name: `BatchDispatchAgent${index + 1}`,
+        role: "engineer",
+        status: "idle" as const,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { enabled: true, wakeOnDemand: true, maxConcurrentRuns: 2 } },
+        permissions: {},
+      })),
+    );
+
+    let issueNumber = 0;
+    for (const agentId of agentIds) {
+      const runIds = [claimRunIdByAgentId.get(agentId)!, refusedRunIdByAgentId.get(agentId)!];
+      for (const [index, runId] of runIds.entries()) {
+        const isRefusedRun = index === 1;
+        const issueId = randomUUID();
+        const wakeId = randomUUID();
+        const createdAt = new Date(Date.now() + index);
+        issueNumber += 1;
+        await db.insert(issues).values({
+          id: issueId,
+          companyId,
+          title: isRefusedRun ? "Later refused claim" : "First claim",
+          status: isRefusedRun ? "todo" : "in_progress",
+          priority: "critical",
+          assigneeAgentId: agentId,
+          issueNumber,
+          identifier: `${issuePrefix}-${issueNumber}`,
+        });
+        await db.insert(agentWakeupRequests).values({
+          id: wakeId,
+          companyId,
+          agentId,
+          source: "assignment",
+          triggerDetail: "system",
+          reason: "issue_assigned",
+          payload: { issueId },
+          status: "queued",
+          runId,
+          requestedAt: createdAt,
+          updatedAt: createdAt,
+        });
+        await db.insert(heartbeatRuns).values({
+          id: runId,
+          companyId,
+          agentId,
+          invocationSource: "assignment",
+          triggerDetail: "system",
+          status: "queued",
+          wakeupRequestId: wakeId,
+          contextSnapshot: {
+            issueId,
+            wakeReason: "issue_assigned",
+            ...(isRefusedRun
+              ? { paperclipK8sIsolationRetryAt: new Date(Date.now() + 60 * 60_000).toISOString() }
+              : {}),
+          },
+          createdAt,
+          updatedAt: createdAt,
+        });
+      }
+    }
+
+    const dispatchedRunIds: string[] = [];
+    mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+      dispatchedRunIds.push(args.runId);
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        resultJson: { exitCode: 0 },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    // The failure is isolated per agent but NOT swallowed: the pass finishes,
+    // then rethrows.
+    await expect(boundedHeartbeat.resumeQueuedRuns()).rejects.toThrow(
+      "injected refusal status read failure",
+    );
+
+    expect(failedAgentId).not.toBeNull();
+    const survivingAgentId = failedAgentId === firstAgentId ? secondAgentId : firstAgentId;
+    const survivingRunId = claimRunIdByAgentId.get(survivingAgentId)!;
+
+    await waitForRunToSettle(boundedHeartbeat, survivingRunId, 60_000);
+
+    // The discriminator: the agent the sweep reached AFTER the throwing one was
+    // still dispatched. Unguarded, the throw escapes the loop and this is empty.
+    expect(dispatchedRunIds).toContain(survivingRunId);
+    // And the injection really did bite, so the pass was not trivially
+    // failure-free.
+    expect(dispatchedRunIds).not.toContain(refusedRunIdByAgentId.get(failedAgentId!)!);
+    await boundedHeartbeat.drainInFlightExecutions(60_000);
+  }, 120_000);
+
   it("advances emergency keysets past default-generated sub-millisecond timestamps", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

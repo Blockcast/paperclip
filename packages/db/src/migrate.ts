@@ -38,9 +38,10 @@ async function main(): Promise<void> {
     // deferred index, so migration state alone is not sufficient evidence.
     const indexResults = await ensurePendingConcurrentIndexes(resolved.connectionString);
     for (const result of indexResults) {
-      if (result.action !== "already-valid") {
-        console.log(`Built deferred index ${result.name} on ${result.table} (${result.action})`);
-      }
+      // Printed unconditionally, including "already-valid" (BLO-21526): a line
+      // only on change makes a verified index indistinguishable from a guard
+      // that never ran, which is the defect this guard exists to close.
+      console.log(`Deferred index ${result.name} on ${result.table}: ${result.action}`);
     }
   } finally {
     await resolved.stop();

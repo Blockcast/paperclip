@@ -15,7 +15,7 @@ type RoutineTemplateInput = string | null | undefined | Array<string | null | un
  * Built-in variable names that are automatically available in routine templates
  * without needing to be defined in the routine's variables list.
  */
-export const BUILTIN_ROUTINE_VARIABLE_NAMES = new Set(["date", "timestamp"]);
+export const BUILTIN_ROUTINE_VARIABLE_NAMES = new Set(["date", "timestamp", "scheduled_at"]);
 
 export function isBuiltinRoutineVariable(name: string): boolean {
   return BUILTIN_ROUTINE_VARIABLE_NAMES.has(name);
@@ -33,15 +33,26 @@ const HUMAN_TIMESTAMP_FORMATTER = new Intl.DateTimeFormat("en-US", {
 });
 
 /**
- * Returns current values for all built-in routine variables.
- * `date` expands to the current date in YYYY-MM-DD format (UTC).
+ * Returns values for all built-in routine variables, as of `at`.
+ *
+ * `at` is the instant the fire BELONGS to, not the instant it is dispatched. For a
+ * scheduled routine the caller passes the cron tick, so a catch-up fire that dispatches
+ * hours late still renders its own window rather than the dispatch instant, and a
+ * multi-slot catch-up renders N distinct values instead of N copies of `now`. Callers
+ * with no scheduled slot (manual/api/webhook) omit it and get the current time.
+ *
+ * `date` expands to `at`'s date in YYYY-MM-DD format (UTC).
  * `timestamp` expands to a human-readable date and time (e.g. "April 28, 2026 at 12:17 PM UTC").
+ * `scheduled_at` expands to the full ISO-8601 instant, so the window survives into the
+ * execution issue's own title/description — the only surface that outlives a rolled-back
+ * `routine_runs` row (BLO-28952).
  */
-export function getBuiltinRoutineVariableValues(): Record<string, string> {
-  const now = new Date();
+export function getBuiltinRoutineVariableValues(at?: Date | null): Record<string, string> {
+  const instant = at ?? new Date();
   return {
-    date: now.toISOString().slice(0, 10),
-    timestamp: HUMAN_TIMESTAMP_FORMATTER.format(now),
+    date: instant.toISOString().slice(0, 10),
+    timestamp: HUMAN_TIMESTAMP_FORMATTER.format(instant),
+    scheduled_at: instant.toISOString(),
   };
 }
 

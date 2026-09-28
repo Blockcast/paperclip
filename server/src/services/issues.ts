@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { and, asc, desc, eq, exists, gt, gte, inArray, isNotNull, isNull, like, lt, lte, ne, notInArray, or, sql, type SQL } from "drizzle-orm";
-import type { Db } from "@paperclipai/db";
+import type { Db, DbTransaction } from "@paperclipai/db";
 import {
   activityLog,
   agentWakeupRequests,
@@ -166,7 +166,7 @@ import {
   type RoutineSchedulerHeartbeatIssue,
   type SchedulerHeartbeatAddComment,
 } from "./recovery/routine-scheduler-heartbeat.js";
-import { classifyIssueGraphLiveness, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
+import { classifyIssueGraphLiveness, PENDING_INTERACTION_MAX_AGE_MS, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
 import {
   ACTIVE_RECOVERY_ACTION_STATUSES,
   BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES,
@@ -1014,7 +1014,6 @@ type IssueUserContextInput = {
 };
 type ProjectGoalReader = Pick<Db, "select">;
 type DbReader = Pick<Db, "select">;
-type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
 /**
  * Serialize mutations to the issue parent/blocker graph for one company.
@@ -1161,7 +1160,9 @@ export type BlockedIssueAutoResumeSuppressionReason =
   | "workspace_preflight_blocked"
   | "active_recovery_action"
   | "monitor_gate"
-  | "convergence_stalled";
+  | "convergence_stalled"
+  /** A `doc/execution-semantics.md` two-line external-wait declaration (BLO-30445). */
+  | "external_wait";
 export type BlockedIssueAutoResumeSuppression = {
   issueId: string;
   reason: BlockedIssueAutoResumeSuppressionReason;
@@ -4260,6 +4261,11 @@ export async function listBlockedIssueAutoResumeSuppressions(
   const monitorRows = await dbOrTx
     .select({
       id: issues.id,
+      // Read the FULL column, never a `substring(...)` preview. `listBlockedInboxIssues`
+      // projects the first ISSUE_LIST_DESCRIPTION_MAX_CHARS and that is exactly what made
+      // the blocked-inbox oracle disagree with its own list in BLO-31839 — a park declared
+      // past the cutoff parsed as `null`. Here that would silently drain it (BLO-30445).
+      description: issues.description,
       hasGateSignals: sql<boolean>`
         COALESCE(
           CASE
@@ -4290,6 +4296,15 @@ export async function listBlockedIssueAutoResumeSuppressions(
       addSuppression(row.id, "monitor_gate");
     } else if (row.isConvergenceStalled) {
       addSuppression(row.id, "convergence_stalled");
+    } else if (externalWaitFromDescription(row.description) !== null) {
+      // BLO-30445: the liveness classifier and the stranded-blocked reconciler held opposite
+      // views of the same row. `isDeadEndBlocked` declines to raise `blocked_without_blockers`
+      // against a declared external wait, but the reconciler had no matching exemption, so it
+      // flipped the park to `todo` within one 15m tick — and the reconciler wins, because it
+      // mutates `status`. Measured live on the BLO-30391 fixture pair: the declared row drained
+      // in the same transaction as the undeclared control, so the documented escape hatch in
+      // `doc/execution-semantics.md#declaring-an-external-wait` bought it nothing.
+      addSuppression(row.id, "external_wait");
     }
   }
 
@@ -5026,6 +5041,7 @@ async function listIssueBlockedInboxAttentionMap(
     companyId,
     issueId: row.issueId,
     status: "pending",
+    createdAt: row.createdAt,
   }));
   const pendingApprovals = (approvalRows as BlockedInboxApprovalRow[]).map((row) => ({
     companyId,
@@ -5053,6 +5069,13 @@ async function listIssueBlockedInboxAttentionMap(
       return entries;
     });
 
+  // BLO-22660: one clock for both staleness passes. The classifier below and the ladder's
+  // `interactionCutoffMs` judge the same cards against the same threshold, so reading the
+  // clock twice lets a card that crosses 24h between them be fresh to one and stale to the
+  // other. recovery/service.ts shares a single `now` through `sharedInput` for exactly this
+  // reason; this makes the same property hold here by construction rather than by the gap
+  // between the two reads being small.
+  const now = new Date();
   const findings = classifyIssueGraphLiveness({
     issues: graphIssues.map((issue) => ({
       id: issue.id,
@@ -5093,15 +5116,36 @@ async function listIssueBlockedInboxAttentionMap(
     pendingInteractions,
     pendingApprovals,
     openRecoveryIssues,
-    now: new Date(),
+    now,
   });
   const findingByIssueId = new Map<string, IssueLivenessFinding>();
   for (const finding of findings) {
     if (!findingByIssueId.has(finding.issueId)) findingByIssueId.set(finding.issueId, finding);
   }
 
+  // BLO-22660: live cards only. This map short-circuits the reason ladder below *ahead of*
+  // the classifier finding, so feeding `createdAt` to the classifier is necessary but not
+  // sufficient on this surface -- a stale card would still be reported as
+  // `awaiting_decision` / `pending_board_decision` / medium / owner "Board", i.e. the row
+  // reads as owned by someone who has not answered in weeks. That is the exact claim this
+  // issue exists to stop making, so a provably-stale card falls through to the finding
+  // branch and the operator gets `in_review_without_action_path` naming the stale card.
+  // The stale row is kept in `staleInteractionByIssueId` rather than dropped, because that
+  // finding's recommended action is "resolve or withdraw the card" -- an instruction that
+  // needs the card's id to be actionable. Both maps are built in one pass so a row can only
+  // ever land in exactly one of them.
+  // Pending approvals are deliberately NOT aged the same way: the classifier does not age
+  // them either, and bounding them is separate work with its own evidence.
+  const interactionCutoffMs = now.getTime() - PENDING_INTERACTION_MAX_AGE_MS;
   const interactionByIssueId = new Map<string, BlockedInboxInteractionRow>();
+  const staleInteractionByIssueId = new Map<string, BlockedInboxInteractionRow>();
   for (const row of interactionRows as BlockedInboxInteractionRow[]) {
+    // Fail open exactly as the classifier does: only a card we can prove is stale is dropped.
+    const createdAtMs = row.createdAt instanceof Date ? row.createdAt.getTime() : NaN;
+    if (Number.isFinite(createdAtMs) && createdAtMs <= interactionCutoffMs) {
+      if (!staleInteractionByIssueId.has(row.issueId)) staleInteractionByIssueId.set(row.issueId, row);
+      continue;
+    }
     if (!interactionByIssueId.has(row.issueId)) interactionByIssueId.set(row.issueId, row);
   }
   const approvalByIssueId = new Map<string, BlockedInboxApprovalRow>();
@@ -5270,6 +5314,15 @@ async function listIssueBlockedInboxAttentionMap(
         leafIssue: issueRef(leaf),
         recoveryIssue: issueRef(issuesById.get(finding.recoveryIssueId)),
         sampleIssueIdentifier: leaf?.identifier ?? finding.identifier,
+        // BLO-22660: when this row fell through because its only waiting path was a stale
+        // card, `recommendedAction` tells the operator to resolve or withdraw that card.
+        // Name it. Key on `recoveryIssueId`, never on `row.id`: all three stale-aware states
+        // evaluate `hasStaleInteraction` on the recovery issue (`recoveryIssue: deadEnd` /
+        // `reviewIssue` / `blocker` in issue-graph-liveness.ts), which is a different row from
+        // the source in every dependency-path form -- and always different for
+        // `blocked_by_assigned_backlog_issue`, since a blocker is never its own blocked issue.
+        // Null on the finding states that have no stale card, which have no id to point at.
+        interactionId: staleInteractionByIssueId.get(finding.recoveryIssueId)?.id ?? null,
       }));
       continue;
     }
@@ -5772,7 +5825,7 @@ export function issueService(db: Db) {
     agentId: string,
     now: Date,
     operation: (
-      tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
+      tx: DbTransaction,
       checkoutExecutionPatch: NonNullable<Awaited<ReturnType<typeof runningCheckoutExecutionPatch>>>["patch"],
     ) => Promise<T>,
   ) {
@@ -6679,7 +6732,15 @@ export function issueService(db: Db) {
     return activeReservation !== null;
   }
 
-  async function isTerminalOrMissingHeartbeatRun(runId: string, dbOrTx: DbReader = db) {
+  /**
+   * PEN-2400 (Ally non-blocking 4): named for what it actually returns. Since
+   * PEN-2074 this is not a status predicate — a terminal run that still holds an
+   * unreleased `externalRuntimeReservations` row returns `false`, because the run
+   * is parked on an external wait and still owns its slot. The old name
+   * (`isTerminalOrMissingHeartbeatRun`) promised a pure status read, so a caller
+   * going by the signature would adopt a lock out from under a live reservation.
+   */
+  async function isReleasedTerminalOrMissingHeartbeatRun(runId: string, dbOrTx: DbReader = db) {
     const run = await dbOrTx
       .select({ status: heartbeatRuns.status })
       .from(heartbeatRuns)
@@ -7440,28 +7501,76 @@ export function issueService(db: Db) {
       input.checkoutRunId,
       input.executionRunId,
     ].filter((runId): runId is string => Boolean(runId)))].sort();
+
+    // BLO-28441: read the ACTOR's own run in the same round trip as the holders'.
+    // A run the server has already marked terminal keeps executing for ~10 more
+    // minutes, and every health signal available to it — `/agents/me`, its own
+    // pod, `lastHeartbeatAt` — reads clean, so it cannot discover why its writes
+    // are refused. Its comments still succeed, so it goes on publishing confident
+    // analysis derived from a state the server considers dead. Reporting the
+    // holder alone cannot explain that 409: the cause is the caller, not the row.
+    const lookupRunIds = [...new Set([...ownerRunIds, input.actorRunId]
+      .filter((runId): runId is string => Boolean(runId)))];
+
+    let runRows: {
+      id: string;
+      agentId: string | null;
+      status: string;
+      startedAt: Date | null;
+    }[] = [];
+    let lookupFailed = false;
+    if (lookupRunIds.length > 0) {
+      try {
+        runRows = await db
+          .select({
+            id: heartbeatRuns.id,
+            agentId: heartbeatRuns.agentId,
+            status: heartbeatRuns.status,
+            startedAt: heartbeatRuns.startedAt,
+          })
+          .from(heartbeatRuns)
+          .where(inArray(heartbeatRuns.id, lookupRunIds))
+          .orderBy(asc(heartbeatRuns.id));
+      } catch {
+        lookupFailed = true;
+      }
+    }
+    const runById = new Map(runRows.map((run) => [run.id, run]));
+
+    const actorRun = input.actorRunId ? runById.get(input.actorRunId) ?? null : null;
+    const actorRunStatus = actorRun?.status ?? null;
+    // Only claim the caller's own run is dead when a row was actually read and
+    // the gate this mirrors would refuse it: `runningCheckoutExecutionPatch`
+    // grants the lock only to a run whose status is exactly `running`, so
+    // anything else -- terminal, never-started, or parked in `scheduled_retry`
+    // with startedAt set by the retry ladder -- is refused on that path. This
+    // is NOT a universal rule for `assertCheckoutOwner`: `resolveSameRunOwnership`
+    // is consulted first and grants a run that is its own holder without
+    // reading its status, so a parked run whose lock columns point at itself
+    // never reaches this 409 at all (BLO-35402 tracks closing that; it is a
+    // behaviour change and out of scope here). Mirroring the `running` condition
+    // rather than `isReapableHeartbeatRunRow` matters for the parked case,
+    // which reapability treats as alive and which otherwise gets the "retry
+    // once" misdirection this remediation replaces. A missing row, or a failed
+    // lookup, is NOT evidence of death — telling a healthy run to stop working
+    // is the expensive direction to be wrong in, so this fails closed to the
+    // existing holder-shaped remediation.
+    const actorRunRemediation = actorRun != null && actorRunStatus !== "running"
+      ? `Your own run (${input.actorRunId}) is \`${actorRunStatus}\`, so the server will not grant it this lock however the holder resolves. Do NOT retry and do NOT re-file a platform bug — stop working this issue and let your successor run pick it up. Note your comments still succeed, so anything you publish from here is derived from a run the server considers dead.`
+      : null;
+
     if (ownerRunIds.length === 0) {
       return {
         lockHolders: [],
         holderLiveness: "no_holder" as const,
         concurrentSiblingRun: false,
-        remediation: "No lock holder was present in the conflict snapshot; retry once, then re-read the issue before escalating.",
+        actorRunStatus,
+        remediation: actorRunRemediation
+          ?? "No lock holder was present in the conflict snapshot; retry once, then re-read the issue before escalating.",
       };
     }
 
-    let ownerRuns;
-    try {
-      ownerRuns = await db
-        .select({
-          id: heartbeatRuns.id,
-          agentId: heartbeatRuns.agentId,
-          status: heartbeatRuns.status,
-          startedAt: heartbeatRuns.startedAt,
-        })
-        .from(heartbeatRuns)
-        .where(inArray(heartbeatRuns.id, ownerRunIds))
-        .orderBy(asc(heartbeatRuns.id));
-    } catch {
+    if (lookupFailed) {
       return {
         lockHolders: ownerRunIds.map((runId) => ({
           runId,
@@ -7472,10 +7581,11 @@ export function issueService(db: Db) {
         })),
         holderLiveness: "unknown" as const,
         concurrentSiblingRun: false,
+        actorRunStatus,
         remediation: "The lock-holder status could not be read; retry once, then re-read the issue before escalating.",
       };
     }
-    const ownerRunById = new Map(ownerRuns.map((run) => [run.id, run]));
+    const ownerRunById = runById;
 
     const holders = ownerRunIds.map((runId) => {
       const run = ownerRunById.get(runId) ?? null;
@@ -7499,14 +7609,18 @@ export function issueService(db: Db) {
       // 409 is a bug at all.
       holderLiveness: liveHolders.length > 0 ? ("live" as const) : ("not_live" as const),
       concurrentSiblingRun: liveSiblings.length > 0,
+      actorRunStatus,
       // `remediation` specifically: the error handler hoists a string under this
       // key to the top level of the response body, so the fix path is visible
       // without the caller having to dig into `details`.
-      remediation: liveHolders.length === 0
+      //
+      // A dead caller outranks every holder-shaped explanation: if the actor's
+      // own run cannot hold a lock, what the holder is doing is irrelevant.
+      remediation: actorRunRemediation ?? (liveHolders.length === 0
         ? "The lock holder was not live in this snapshot. Retry once so a terminal or queued holder can be reaped; escalate only if the conflict persists."
         : liveSiblings.length > 0
           ? `Expected: a concurrent run of your own agent (${liveSiblings.map((holder) => holder.runId).join(", ")}) is live and holds this issue. Do NOT retry or re-file a platform bug — yield this issue to the sibling run, or wait for it to finish and the lock releases automatically.`
-          : `Another agent's live run (${liveHolders.map((holder) => holder.runId).join(", ")}) holds this issue. Comment instead of mutating, or wait for that run to finish.`,
+          : `Another agent's live run (${liveHolders.map((holder) => holder.runId).join(", ")}) holds this issue. Comment instead of mutating, or wait for that run to finish.`),
     };
   }
 
@@ -11843,7 +11957,7 @@ export function issueService(db: Db) {
         (current.assigneeAgentId === agentId || current.assigneeAgentId == null)
       ) {
         const expectedExecutionRunId = current.executionRunId;
-        const stale = await isTerminalOrMissingHeartbeatRun(expectedExecutionRunId);
+        const stale = await isReleasedTerminalOrMissingHeartbeatRun(expectedExecutionRunId);
         if (stale) {
           const now = new Date();
           const adopted = await withLockedIssueCheckoutExecution(
@@ -11986,6 +12100,18 @@ export function issueService(db: Db) {
         assigneeAgentId: current.assigneeAgentId,
         checkoutRunId: current.checkoutRunId,
         executionRunId: current.executionRunId,
+        // BLO-28441: `POST /checkout` refused the lock without ever naming the
+        // caller, so a run the server had already marked terminal could not tell
+        // "the holder is busy" from "I am dead". Same helper as the PATCH-side
+        // ownership guard, so both routes report the conflict the same way.
+        actorAgentId: agentId,
+        actorRunId: checkoutRunId,
+        ...(await describeIssueLockConflict({
+          checkoutRunId: current.checkoutRunId,
+          executionRunId: current.executionRunId,
+          actorAgentId: agentId,
+          actorRunId: checkoutRunId,
+        })),
       });
     },
 

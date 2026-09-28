@@ -50,6 +50,7 @@ import {
   bootstrapExecutionPolicyFromEnv,
   EXTERNAL_LIFECYCLE_COLD_BOOT_REATTACH_GRACE_MS,
   environmentCustomImageService,
+  executionWorkspaceCleanupService,
   heartbeatService,
   instanceSettingsService,
   reconcileBuiltInAgentsOnStartup,
@@ -356,11 +357,19 @@ export async function startServer(): Promise<StartedServer> {
     // index (BLO-21526 — migration 0226), so an unchanged migration state is
     // not evidence the index exists. Failure here fails startup, so a deploy
     // that skips the online build fails visibly instead of silently.
+    // Logged unconditionally, including "already-valid" (BLO-21526): logging
+    // only when the guard *changed* something reproduces the very defect this
+    // guard replaced — a healthy verified index and a step that never ran both
+    // emit nothing, so the deployed index state is unreadable. One line per
+    // startup per listed index makes `kubectl logs` a standing index-presence
+    // receipt, which is the only runtime check available to an identity with no
+    // database query channel.
     const indexResults = await ensurePendingConcurrentIndexes(connectionString);
     for (const result of indexResults) {
-      if (result.action !== "already-valid") {
-        logger.info({ index: result.name, table: result.table, action: result.action }, `${label}: built deferred index`);
-      }
+      logger.info(
+        { index: result.name, table: result.table, action: result.action },
+        `${label}: deferred index ${result.name} is ${result.action}`,
+      );
     }
 
     return summary;
@@ -1130,6 +1139,22 @@ export async function startServer(): Promise<StartedServer> {
   // overlap the latch exists to remove, so this reports and does not act.
   let heartbeatRecoveryChainInFlight = false;
   let heartbeatRecoveryChainStartedAt = 0;
+  // BLO-22984: the same latch, for the execution-workspace collector. It is
+  // its own tracked pass (below), and `setInterval` fires the next callback on
+  // schedule whether or not the previous one settled, so without this a slow
+  // pass (50 candidates, up to three `runGit` calls at 30 s each) overlaps the
+  // next tick's and the trailing pass's `deferCandidate` can land on a row the
+  // leading pass already archived. Every collector pass is idempotent, so a
+  // tick that finds one running skips it. The startup pass sets it too.
+  //
+  // It inherits the hang-not-reject failure mode described on
+  // `heartbeatRecoveryChainInFlight` above, and the collector is where a hang
+  // is reachable: its `fs.stat` on a candidate path has no timeout, and one
+  // wedged mount stops collection for the life of the process with no output.
+  // `executionWorkspaceCollectorStartedAt` makes that absence visible. Like
+  // the chain's stamp it reports and does not act.
+  let executionWorkspaceCollectorInFlight = false;
+  let executionWorkspaceCollectorStartedAt = 0;
   // 10 ticks. Above the normal case (a sweep routinely outlives one interval —
   // that is what the latch is for) and far below the hours a wedged chain would
   // otherwise sit silent.
@@ -1166,6 +1191,7 @@ export async function startServer(): Promise<StartedServer> {
     drainHeartbeatRunsForShutdown = heartbeat.drainRunningRunsForShutdown;
     prepareHotRestartShutdown = heartbeat.prepareHotRestartShutdown;
     const environmentCustomImages = environmentCustomImageService(db as any, { pluginWorkerManager });
+    const executionWorkspaceCleanup = executionWorkspaceCleanupService(db as any);
     const routines = routineService(db as any, { pluginWorkerManager });
     const tools = toolAccessService(db as any, {
       deploymentMode: config.deploymentMode,
@@ -1368,6 +1394,32 @@ export async function startServer(): Promise<StartedServer> {
             "startup failed-wake-dispatch reconciliation retried durable wake failures (BLO-14395)",
           );
         }
+
+        // BLO-22984: the only consumer of `execution_workspaces.cleanup_eligible_at`.
+        // Logged unconditionally — a collector that never runs is indistinguishable
+        // from one that runs and finds nothing, and the previous code was believed
+        // to collect for weeks while reclaiming zero bytes.
+        // Not awaited: this must not hold `heartbeatStartupRecoveryPending` and
+        // starve every periodic pass on a slow git/fs (prior:19b276c important 2
+        // principle). It gates nothing below it; it is tracked for the shutdown
+        // drain and holds the collector latch so the first tick does not double it.
+        // It may take the latch without testing it only because
+        // `heartbeatStartupRecoveryPending` is still true here and the tick
+        // early-returns on it, so no periodic pass can be holding it yet.
+        executionWorkspaceCollectorInFlight = true;
+        executionWorkspaceCollectorStartedAt = Date.now();
+        trackHeartbeatSchedulerWork(executionWorkspaceCleanup
+          .reconcileExecutionWorkspaceCleanup()
+          .then((workspacesCollected) => {
+            logger.info({ ...workspacesCollected }, "startup execution-workspace collector");
+          })
+          .catch((err) => {
+            logger.error({ err }, "startup execution-workspace collector failed");
+          })
+          .finally(() => {
+            executionWorkspaceCollectorInFlight = false;
+            executionWorkspaceCollectorStartedAt = 0;
+          }));
       })().catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
       }).finally(() => {
@@ -1393,27 +1445,33 @@ export async function startServer(): Promise<StartedServer> {
       void (async () => {
         if (heartbeatSchedulerStopped) return;
 
-        // All three gauge publishers are registered above BOTH gates — the
+        // All four gauge publishers are registered above BOTH gates — the
         // startup-recovery gate immediately below and the scheduling-suppression
-        // gate further down (BLO-31335).
+        // gate further down (BLO-31335, extended by BLO-21526).
         //
         // The startup-recovery gate matters as much as the suppression one, and
-        // for the same reason. Every one of these gauges is zero-initialized at
-        // registration, so a replica that early-returned here would not render
-        // "No data" while recovery ran — it would export a confident `0`. That
-        // chain (crash reconciliation, orphan reaping, reattach, issue-graph
-        // liveness, watchdogs, silent-run scan, productivity, blocker
-        // dependents, wake dispatches) is long and serial, so the exposure is
-        // "recovery duration + one tick", not "one tick", and it lands hardest
-        // on a replica crash-looping through startup. Fabricated health is the
-        // defect this issue exists to remove; time-boxing it to boot does not
-        // make it a different defect.
+        // for the same reason. The three BLO-31335 gauges are zero-initialized
+        // at registration, so a replica that early-returned here would not
+        // render "No data" while recovery ran — it would export a confident
+        // `0`. That chain (crash reconciliation, orphan reaping, reattach,
+        // issue-graph liveness, watchdogs, silent-run scan, productivity,
+        // blocker dependents, wake dispatches) is long and serial, so the
+        // exposure is "recovery duration + one tick", not "one tick", and it
+        // lands hardest on a replica crash-looping through startup. Fabricated
+        // health is the defect this issue exists to remove; time-boxing it to
+        // boot does not make it a different defect.
         //
-        // Publishing during recovery is safe: all three are read-only queries
+        // The candidate-index gauge fails the other way — it is labeled, so it
+        // renders nothing until probed — and it still belongs above this gate:
+        // an unpublished series makes its `== 0` alert structurally silent, and
+        // recovery is exactly when a database that just came back without the
+        // index is being reconciled against.
+        //
+        // Publishing during recovery is safe: all four are read-only queries
         // plus a full-rewrite metric set, so a value observed mid-recovery is
         // self-correcting on the next tick rather than sticky.
         //
-        // All three registrations are synchronous and precede this callback's
+        // All four registrations are synchronous and precede this callback's
         // first `await`, so hoisting them above the recovery gate does not open
         // a BLO-20822 shutdown-drain window: `heartbeatSchedulerStopped` is
         // still checked first, and the work is registered with
@@ -1455,6 +1513,28 @@ export async function startServer(): Promise<StartedServer> {
           .catch((err) => {
             // Defensive only, as above.
             logger.error({ err }, "periodic wake-terminal-failed gauge publication failed");
+          }));
+
+        // BLO-21526: the crash-recovery candidate-index gauge, for the same
+        // reason and in the same place. Its only publisher used to be the
+        // gate read inside the periodic reconciliation below, which sits under
+        // the suppression gate AND the `crashReconcileSweepInFlight` latch, so
+        // the series went dark on a suppressed replica and was never published
+        // at all during startup recovery. `database_restore_in_progress`
+        // suppresses the scheduler and is a leading way to end up WITHOUT the
+        // index, so that was blindness precisely where the risk concentrates —
+        // and a cleared series makes the `== 0` Missing alert structurally
+        // silent, leaving only Unobservable, whose remediation then names
+        // three things that all look healthy under a restore.
+        //
+        // The gate below keeps its own read: it must act on the value it
+        // publishes, not on a value this unit read at some other moment.
+        trackHeartbeatSchedulerWork(heartbeat
+          .publishCrashRecoveryCandidateIndexGauge()
+          .catch((err) => {
+            // Defensive only: the probe wraps its own body in try/catch, clears
+            // the gauge and returns false rather than throwing.
+            logger.error({ err }, "periodic crash-recovery candidate-index gauge publication failed");
           }));
 
         if (heartbeatStartupRecoveryPending) return;
@@ -1663,6 +1743,52 @@ export async function startServer(): Promise<StartedServer> {
             .catch((err) => {
               logger.error({ err }, "periodic detached-queued-run sweeper failed");
             }));
+
+          if (heartbeatSchedulerStopped) return;
+
+          // BLO-22984: the only consumer of `execution_workspaces.cleanup_eligible_at`.
+          // Deliberately its own tracked pass rather than a link in the recovery
+          // chain below: that chain has a single trailing `.catch`, so one
+          // unrelated reconciler rejecting would silently skip every pass after
+          // it. A collector that never runs is indistinguishable from one that
+          // runs and finds nothing — which is how the previous worktree
+          // reclamation was believed to work for weeks while freeing zero bytes.
+          // It depends on no upstream pass; the stamps it selects on are written
+          // at run end and by its own backfill.
+          //
+          // Single-flighted by `executionWorkspaceCollectorInFlight`, for the
+          // reason given on `crashReconcileSweepInFlight` above: a pass can
+          // outlive the interval and the next tick must skip it, not double it.
+          if (!executionWorkspaceCollectorInFlight) {
+            executionWorkspaceCollectorInFlight = true;
+            executionWorkspaceCollectorStartedAt = Date.now();
+            trackHeartbeatSchedulerWork(executionWorkspaceCleanup
+              .reconcileExecutionWorkspaceCleanup()
+              .then((workspacesCollected) => {
+                // Unconditional: the zero row is the evidence that it ran at all.
+                logger.info({ ...workspacesCollected }, "periodic execution-workspace collector");
+              })
+              .catch((err) => {
+                logger.error({ err }, "periodic execution-workspace collector failed");
+              })
+              .finally(() => {
+                executionWorkspaceCollectorInFlight = false;
+                executionWorkspaceCollectorStartedAt = 0;
+              }));
+          } else if (
+            Date.now() - executionWorkspaceCollectorStartedAt >
+            HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS
+          ) {
+            // Skipping is normal and silent; a pass in flight for many ticks is
+            // not. Reported, not acted on: see the latch declaration.
+            logger.warn(
+              {
+                inFlightMs: Date.now() - executionWorkspaceCollectorStartedAt,
+                warnAfterMs: HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS,
+              },
+              "periodic execution-workspace collector still in flight across many ticks; workspaces are not being collected",
+            );
+          }
 
           if (heartbeatSchedulerStopped) return;
 
@@ -2081,6 +2207,39 @@ export async function startServer(): Promise<StartedServer> {
         "Approval-gate reconciler enabled (BLO-29359)",
       );
       startApprovalGateReconciler(db, config.approvalGateReconcilerIntervalMinutes * 60 * 1000);
+    }
+  }
+  // Terminal-gate reconciler (BLO-27515). Worker-tier singleton. Re-reads the
+  // pull-request gates a *terminated* monitor declared (`gateSignals`), so a
+  // gate that resolves after the monitor's last poll — because the convergence
+  // guard stopped re-arming, or because an outage killed the run that would
+  // have — is observed board-side instead of waiting for an assignee run that
+  // may never be dispatched. Records the outcome as a comment; deliberately
+  // dispatches nothing and closes nothing.
+  //
+  // Gated on GitHub App credentials for the same reason as the two reconcilers
+  // above: without them every gate read fails closed as `gate_read_failed` and
+  // nothing can ever resolve, while the candidate scan still runs every pass —
+  // and unlike the siblings it logs nothing on the unresolved path, so an inert
+  // sweep would be silent.
+  if (config.terminalGateReconcilerEnabled && config.paperclipNodeRole !== "api") {
+    const { githubAppCredentialsConfigured } = await import("./services/github-app-auth.js");
+    if (!githubAppCredentialsConfigured()) {
+      logger.warn(
+        "Terminal-gate reconciler disabled: GitHub App credentials are not configured (BLO-27515)",
+      );
+    } else {
+      const { startTerminalGateReconciler } = await import(
+        "./services/terminal-gate-reconciler.js"
+      );
+      logger.info(
+        { intervalMinutes: config.terminalGateReconcilerIntervalMinutes },
+        "Terminal-gate reconciler enabled (BLO-27515)",
+      );
+      startTerminalGateReconciler(
+        db,
+        config.terminalGateReconcilerIntervalMinutes * 60 * 1000,
+      );
     }
   }
 

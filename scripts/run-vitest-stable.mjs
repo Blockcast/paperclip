@@ -42,6 +42,10 @@ const nonServerProjects = [
   "@paperclipai/adapter-pi-local",
   "@paperclipai/plugin-sdk",
   "@paperclipai/create-paperclip-plugin",
+  // Unscoped, matching its package.json `name` -- `--project` matches the
+  // package name, not the directory. Its 10 suites, including the BLO-32113
+  // aggregate-fence reclaim regressions, ran in no CI lane before this.
+  "paperclip-plugin-alertmanager",
   "@paperclipai/mcp-external",
   "@paperclipai/mcp-server",
   "@paperclipai/mcp-gateway",

@@ -1,3 +1,6 @@
+import { afterAll } from "vitest";
+import { drainReactScheduler } from "./src/lib/drainReactScheduler";
+
 const storageEntries = new Map<string, string>();
 
 function installStorageMock(target: Record<string, unknown>) {
@@ -37,4 +40,13 @@ if (typeof window !== "undefined" && window.localStorage !== globalThis.localSto
 // this on the prototype themselves and restore it afterwards.
 if (typeof Element !== "undefined" && typeof Element.prototype.scrollIntoView !== "function") {
   Element.prototype.scrollIntoView = function scrollIntoView() {};
+}
+
+// A scheduler task React left behind (see drainReactScheduler) that fires after
+// jsdom is torn down throws "window is not defined" as an unhandled error and
+// turns an all-green workspaces-a run red (BLO-23426; merge groups 35903530339,
+// 35993984182). After-hooks run in reverse registration order, so this one runs
+// after every test file's own hooks and before the environment goes away.
+if (typeof window !== "undefined") {
+  afterAll(drainReactScheduler);
 }

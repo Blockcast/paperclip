@@ -1,5 +1,5 @@
 import { and, count, eq, gte, inArray, isNull, lt, notInArray, sql } from "drizzle-orm";
-import type { Db } from "@paperclipai/db";
+import type { Db, DbTransaction } from "@paperclipai/db";
 import {
   companies,
   companyLogos,
@@ -61,9 +61,7 @@ export function companyService(db: Db) {
   const heartbeat = heartbeatService(db);
   const builtInAgents = builtInAgentService(db);
 
-  type CompanyTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
-
-  async function applyArchiveCascadeInTx(tx: CompanyTx, id: string) {
+  async function applyArchiveCascadeInTx(tx: DbTransaction, id: string) {
     const pausedAgentRows = await tx
       .update(agents)
       .set({

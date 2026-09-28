@@ -29,6 +29,7 @@ import { Router } from "express";
 import crypto from "node:crypto";
 import {
   type Db,
+  type DbTransaction,
   POSTGRES_POOL_MAX,
   agents,
   agentWakeupRequests,
@@ -65,9 +66,13 @@ import {
 import {
   githubFetchPrHeadSha,
   githubListPullRequestCommits,
+  githubListOpenPullRequestsByBase,
+  githubResolveBranchState,
+  githubResolveMergeHistoryShape,
   githubReviewerIdentityMatches,
   githubListIssueCommentBodies,
   githubPostIssueComment,
+  type MergeHistoryShape,
 } from "../services/github-app-auth.js";
 import {
   buildForeignCommitNoticeBody,
@@ -79,6 +84,7 @@ import {
   type ListPrReviewsForAttestation,
 } from "../services/pr-review-head-attestation.js";
 import {
+  extractAllyReviewedHeadSha,
   hasActionablePrReviewFeedback,
   hasAllyConsolidatedReviewHeading,
 } from "../services/ally-review-detection.js";
@@ -114,7 +120,6 @@ import {
   type GithubReviewGateAuthorityConfig,
 } from "../services/github-review-gate-authority.js";
 
-type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type PrReviewerSelectionDb = Pick<Db | DbTransaction, "select">;
 
 // Keep lock contention well below GitHub's webhook timeout. If this bounded
@@ -317,10 +322,6 @@ function isConfiguredPrReviewerAuthor(
   const configured = normalizeGithubLogin(configuredLogin || DEFAULT_PR_REVIEWER_BOT_LOGIN);
   if (configured && normalizedLogin === configured) return true;
   return normalizedLogin === "ally" || normalizedLogin === "allyblockcast" || normalizedLogin === "blockcast-ci-packages";
-}
-
-function hasAllyConsolidatedReviewHeader(body: string | null | undefined): boolean {
-  return typeof body === "string" && /\bAlly\s*(?:—|-|:)\s*Consolidated\s+PR\s+Review\b/i.test(body);
 }
 
 // Explicit "a Paperclip agent is asking for review" marker (BLO-18865).
@@ -572,13 +573,106 @@ function isClaudeCodeReviewServiceNotice(
   return !hasActionablePrReviewFeedback(rawBody, state);
 }
 
+// PEN-3383: a genuine comment-shaped review carries review STRUCTURE. Two
+// independent signals, so a template change to one cannot silently suppress
+// every comment-shaped review at once.
+//
+// Both are reused from ally-review-detection rather than re-derived here, and
+// that is the correction of record for this predicate. The first cut hand-rolled
+// a bare substring test and a `Reviewed head:` regex, which left the residual
+// this issue exists to close: a reply QUOTING a review — the single most common
+// shape of a reply-to-review — still qualified. Measured on the real bodies:
+//
+//   quoted in a ```markdown fence  hand-rolled true  / shared false (actionable)
+//   4-space-indented paste          hand-rolled true  / shared false
+//   `> Reviewed head:` blockquote   hand-rolled true  / shared false
+//   bare label, no SHA at all       hand-rolled true  / shared false
+//
+// The fenced row is the one that matters: it is also hasActionablePrReviewFeedback
+// true, so under the hand-rolled predicate it produced a real self-wake. That
+// conjunct cannot bound the fenced case, because a fence is precisely what
+// defeats it — onprem-k8s#3672 5740414507 was actionable SOLELY because of one.
+//
+// The shared helpers fence-strip, share NOT_INDENTED_CODE, and require exactly
+// one standalone full 40-hex attestation ("an absent or ambiguous attestation
+// must not be guessed at"), so they also keep the BLO-31730 emphasis forms the
+// hand-rolled regex dropped — looser on evasion AND tighter on genuine forms was
+// strictly the wrong trade.
+//
+// Anchoring was never the dichotomy the first cut assumed. hasAllyConsolidatedReviewHeading
+// is LINE-anchored (`im`), not body-anchored like PR_REVIEWER_AGENT_REQUEST_MARKER_PATTERN,
+// so paperclip#1877 comment 5686789134 — a genuine review opening with prose and
+// carrying its header mid-body — still passes. Verified against that exact body.
+function isReviewShapedPrComment(body: string | null | undefined): boolean {
+  return hasAllyConsolidatedReviewHeading(body) || extractAllyReviewedHeadSha(body) !== null;
+}
+
+type PrReviewCommentVerdict =
+  | "actionable"
+  // Findings-shaped text from the reviewer identity, but no review structure —
+  // the PEN-3383 shape. Reported so the closure is visible, never silent.
+  | "suppressed_unstructured"
+  | "not_feedback";
+
+// PEN-3383: identity alone MUST NOT admit a comment-shaped review.
+//
+// Agents post PR comments through the same GitHub App as the reviewer, so
+// `commentAuthorLogin` is `allyblockcast[bot]` for BOTH Ally's review output and
+// an agent's own reply to that review (the shared-seat fact already documented
+// at PR_REVIEWER_AGENT_REQUEST_MARKER_PATTERN, which is why the REQUEST path
+// needs a marker). This predicate used to accept
+// `isConfiguredPrReviewerAuthor(...) || <a bare substring test for the
+// consolidated header>`, so for the App seat the identity clause
+// short-circuited and the verdict reduced to hasActionablePrReviewFeedback on
+// the raw body alone.
+//
+// That predicate deliberately reads the RAW body as well as the fence-stripped
+// one and blocks if either matches, because for a REVIEW a quoted finding is a
+// cheap false red (see its own comment). For an agent REPLY the same property is
+// not cheap: an agent discussing review tooling pastes the literal
+// `changes requested` inside a fenced block, `carriesBlockingFeedback` matches
+// it, and the agent is woken as `github_pr_review_feedback` against itself —
+// with its own prose rendered back as "## Changes Requested / Reviewer:
+// allyblockcast[bot]", and a directive to push a follow-up commit. On a PR whose
+// head was deliberately frozen awaiting a scarce human approval, following that
+// directive dismisses the approval (`dismiss_stale_reviews_on_push: true`).
+//
+// Verified, not reasoned: onprem-k8s#3672 comment 5740414507 is actionable
+// solely because of a fenced ```python block quoting `changes requested`;
+// deleting that one fence flips it to false. The negation guard is NOT at fault
+// here — the same body's "no blocking changes requested" is correctly ignored.
+//
+// Measured over 1,389 App-seat PR comments on Blockcast/paperclip +
+// Blockcast/onprem-k8s (~200 PRs each): 13 classified actionable today, 2 after
+// requiring structure. All 11 newly suppressed are agent replies or
+// `paperclip:review-request` markers — including both instances PEN-3383
+// confirmed (5740414507, 5714317633) — and neither surviving genuine Ally review
+// is affected. The review-request markers keep routing as REQUESTS: this
+// predicate only feeds `reviewFeedback`, and `reviewerRequest` wins the ternary.
+//
+// Formal reviews are untouched. They arrive as `pull_request_review` and carry a
+// real `state`, so they never reach this function.
+function classifyPrReviewComment(
+  body: string | null | undefined,
+  authorLogin: string | null | undefined,
+  configuredReviewerLogin: string | null | undefined,
+): PrReviewCommentVerdict {
+  if (!hasActionablePrReviewFeedback(body)) return "not_feedback";
+  if (isReviewShapedPrComment(body)) return "actionable";
+  // Structure is missing. Only the reviewer identity could have admitted this
+  // before, so only that case is a behaviour CHANGE worth reporting; a
+  // structureless body from any other author was already dropped here.
+  return isConfiguredPrReviewerAuthor(authorLogin, configuredReviewerLogin)
+    ? "suppressed_unstructured"
+    : "not_feedback";
+}
+
 function isActionablePrReviewComment(
   body: string | null | undefined,
   authorLogin: string | null | undefined,
   configuredReviewerLogin: string | null | undefined,
 ): boolean {
-  if (!hasActionablePrReviewFeedback(body)) return false;
-  return isConfiguredPrReviewerAuthor(authorLogin, configuredReviewerLogin) || hasAllyConsolidatedReviewHeader(body);
+  return classifyPrReviewComment(body, authorLogin, configuredReviewerLogin) === "actionable";
 }
 
 /**
@@ -992,6 +1086,10 @@ interface ResolvedEventContext {
   // deliberately NOT captured: the link keys on the BLO- ref, never the author.
   prMerged?: boolean;
   prMergedAt?: string | null;
+  // pull_request.closed only. The commit the merge produced, read solely to
+  // derive whether the merge preserved or rewrote the base's SHAs — which is
+  // what tells a stacked child to retarget vs rebase (BLO-29856).
+  prMergeCommitSha?: string | null;
   prUpdatedAt?: string | null;
   prAdditions?: number | null;
   prDeletions?: number | null;
@@ -1152,6 +1250,21 @@ function resolveEventContextRaw(
       headSha: string;
       commentAuthorLogin: string | null;
       commentAuthorType: string | null;
+    }) => void;
+    // PEN-3383: invoked when a reviewer-identity comment carried findings-shaped
+    // text but no review structure, so it is no longer routed as review
+    // feedback. Its own callback for the same reason as its siblings: this file
+    // treats an invisible drop as a defect in itself (BLO-18273, BLO-32381), and
+    // this one has a specific failure mode worth watching. If Ally's review
+    // template ever stops emitting both the consolidated header and the
+    // `Reviewed head:` attestation, a REAL comment-shaped review lands here
+    // instead, and this is the only trace that would say so.
+    onSuppressedReviewFeedback?: (info: {
+      repoFullName: string | null;
+      prNumber: number | null;
+      commentId: number | null;
+      commentAuthorLogin: string | null;
+      commentUrl: string | null;
     }) => void;
   } = {},
 ): ResolvedEventContext | null {
@@ -1317,11 +1430,12 @@ function resolveEventContextRaw(
       const reviewerRequest =
         (!commentAuthorIsReviewerBot || agentReviewRequest) &&
         hasPrReviewerRequestMention(commentBody);
-      const reviewFeedback = isActionablePrReviewComment(
+      const reviewFeedbackVerdict = classifyPrReviewComment(
         commentBody,
         commentAuthorLogin,
         options.prReviewerBotLogin,
       );
+      const reviewFeedback = reviewFeedbackVerdict === "actionable";
       // BLO-32381: the review gate's terminal "I have given up" state. See
       // readReviewGateEscalationHeadSha for the marker contract and why the
       // retry marker is deliberately excluded.
@@ -1486,6 +1600,25 @@ function resolveEventContextRaw(
           });
         }
       }
+      // PEN-3383: report the structureless-feedback drop only when it actually
+      // changes the outcome — i.e. when nothing else claims this delivery. A
+      // body that is also a review REQUEST or an ESCALATION still produces a
+      // context on those paths and loses nothing, and reporting it there would
+      // make this signal noise instead of the template-drift alarm it exists to
+      // be.
+      if (
+        reviewFeedbackVerdict === "suppressed_unstructured" &&
+        !reviewerRequest &&
+        !reviewGateEscalation
+      ) {
+        options.onSuppressedReviewFeedback?.({
+          repoFullName,
+          prNumber: (issue.number as number | undefined) ?? null,
+          commentId: (comment?.id as number | undefined) ?? null,
+          commentAuthorLogin,
+          commentUrl: readStringField(comment, "html_url"),
+        });
+      }
       if (!reviewerRequest && !reviewFeedback && !reviewGateEscalation) return null;
       // BLO-9293: on a PR's issue_comment payload, `issue.user.login` is the PR
       // author (the comment author is `comment.user.login`, captured separately).
@@ -1545,8 +1678,8 @@ function resolveEventContextRaw(
         //
         // Keyed on the GUARDED classification, not on the parsed marker. A
         // marker-led body that is also actionable feedback (reachable from any
-        // author: hasAllyConsolidatedReviewHeader is un-anchored and carries no
-        // author requirement) resolves as `github_pr_review_feedback`, and on
+        // author: isReviewShapedPrComment is line-anchored but carries no author
+        // requirement) resolves as `github_pr_review_feedback`, and on
         // that path the head must come from the live-head lookup in the route
         // (`resolvePrReviewHeadSha`), which only runs when `headSha` is absent.
         // Spreading the marker head here would hand a comment-body-supplied SHA
@@ -1675,6 +1808,7 @@ function resolveEventContextRaw(
         // pulls/{n}/files fetch (enrichment), so it is not read here.
         prMerged: action === "closed" ? merged : undefined,
         prMergedAt: readStringField(pr, "merged_at"),
+        prMergeCommitSha: readStringField(pr, "merge_commit_sha"),
         prUpdatedAt: readStringField(pr, "updated_at"),
         prAdditions: typeof pr?.additions === "number" ? (pr.additions as number) : null,
         prDeletions: typeof pr?.deletions === "number" ? (pr.deletions as number) : null,
@@ -3187,6 +3321,30 @@ async function attemptPrReviewerWake(params: {
       // terminal for this delivery.
       if (wakeResult) {
         recordGithubReviewRequestDelivery({ state: "queued", reason: context.wakeReason });
+        // BLO-22758: the success side must be as loud as the failures. Every
+        // other outcome of this function logs (duplicate/no_reviewer/declined
+        // above, deferred and lock-loss in the caller), so before this line a
+        // *served* PR and a PR whose wake was never enqueued emitted a
+        // byte-identical webhook trail — "the wake was created and the run was
+        // lost" and "the wake was never created" were observationally
+        // identical. The counter alone cannot close that: it is aggregate, so
+        // it cannot answer the question for ONE PR. `runId` is the join key to
+        // the run's own lifecycle logs, which is what makes the terminal state
+        // (served / deadline-killed / still queued) recoverable from logs.
+        logger.info(
+          {
+            agentId: reviewerAgentId,
+            event: eventName,
+            deliveryId,
+            idempotencyKey,
+            wakeReason: context.wakeReason,
+            prNumber: context.prNumber,
+            repoFullName: context.repoFullName,
+            runId: wakeResult.id,
+            wakeupRequestId: wakeResult.wakeupRequestId,
+          },
+          "github webhook reviewer wake enqueued",
+        );
         return "queued";
       }
       // The terminal `suppressed` increment is NOT emitted here: the wake
@@ -3895,12 +4053,15 @@ function prFeedbackAuthorLogin(context: ResolvedEventContext): string | null {
 //
 // `github_pr_review_feedback` has exactly ONE producer (the issue_comment case
 // of resolveEventContext), and that producer reaches the wakeReason ternary only
-// when `reviewFeedback` is true — i.e. only when isActionablePrReviewComment,
-// and therefore hasActionablePrReviewFeedback, has ALREADY passed on the RAW
-// comment body. A non-actionable comment does not become a non-actionable
-// feedback context; it becomes no context at all (`return null`). So the
-// classification for this branch happened at resolve time, on better input, and
-// repeating it here is at best redundant.
+// when `reviewFeedback` is true — i.e. only when classifyPrReviewComment
+// returned "actionable" (PEN-3383 renamed the call site; isActionablePrReviewComment
+// is the equivalent boolean wrapper), and therefore hasActionablePrReviewFeedback
+// has ALREADY passed on the RAW comment body. PEN-3383 additionally requires
+// review STRUCTURE there, which only ever makes this branch narrower — so the
+// argument below is unaffected. A non-actionable comment does not become a
+// non-actionable feedback context; it becomes no context at all (`return null`).
+// So the classification for this branch happened at resolve time, on better
+// input, and repeating it here is at best redundant.
 //
 // At worst it is a fleet-wide outage. The comment path populates `commentBody`
 // and leaves `reviewBody` UNDEFINED (prFeedbackBody exists precisely to coalesce
@@ -4575,6 +4736,79 @@ function githubContextMetadata(context: ResolvedEventContext) {
   };
 }
 
+/**
+ * Issues carrying a webhook-written `pull_request` work product for `externalId`
+ * (`owner/repo#123`).
+ *
+ * The two `sourceTrust` guards pin the row to this route's own system writer, so
+ * an agent-promoted work product can never make an unrelated issue look like the
+ * PR's owner.
+ *
+ * Extracted (BLO-29856) because the stacked-child fan-out needs exactly this
+ * lookup for a *different* PR than the one the delivery is about. One query, two
+ * callers — a second hand-rolled copy is how the trust guards drift apart.
+ */
+async function selectIssuesLinkedToPullRequest(db: Db, externalId: string) {
+  return db
+    .select({
+      id: issues.id,
+      companyId: issues.companyId,
+      identifier: issues.identifier,
+      assigneeAgentId: issues.assigneeAgentId,
+      status: issues.status,
+      executionState: issues.executionState,
+    })
+    .from(issueWorkProducts)
+    .innerJoin(
+      issues,
+      and(
+        eq(issues.id, issueWorkProducts.issueId),
+        eq(issues.companyId, issueWorkProducts.companyId),
+      ),
+    )
+    .where(
+      and(
+        eq(issueWorkProducts.provider, "github"),
+        eq(issueWorkProducts.type, "pull_request"),
+        eq(issueWorkProducts.externalId, externalId),
+        sql`${issueWorkProducts.metadata}->>'source' = ${PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE}`,
+        sql`${issueWorkProducts.sourceTrust}->>'promotedByActorType' = 'system'`,
+        sql`${issueWorkProducts.sourceTrust}->>'promotedByActorId' = ${PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID}`,
+      ),
+    );
+}
+
+/**
+ * What a stacked child must be told to do once its base branch merged
+ * (BLO-29856). The wording is the deliverable: "just retarget" is actively wrong
+ * after a rebase- or squash-merge, and that is the trap this wake exists to stop
+ * anyone walking into.
+ */
+function stackedChildDirective(shape: MergeHistoryShape): string {
+  switch (shape) {
+    case "merge_commit":
+      return (
+        "The base merged as a merge commit, so its commits are on the target branch " +
+        "under their original SHAs. Retargeting this PR to the base's target branch " +
+        "is sufficient; no rebase is required."
+      );
+    case "rewritten":
+      return (
+        "The base was rebase- or squash-merged, so its commits are on the target " +
+        "branch under NEW SHAs. Do NOT simply retarget: this PR's base SHA is no " +
+        "longer an ancestor, so a bare retarget replays the base PR's entire diff " +
+        "into this one. Rebase onto the target branch instead."
+      );
+    default:
+      return (
+        "The merge method could not be read, so it is unknown whether the base's " +
+        "commit SHAs were preserved. Verify before retargeting: if the base was " +
+        "rebase- or squash-merged, a bare retarget replays its whole diff into " +
+        "this PR and a rebase is required instead."
+      );
+  }
+}
+
 export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
   const router = Router();
 
@@ -4758,6 +4992,34 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           "github webhook wakes skipped: claude[bot] submitted a formal review whose body is the " +
             "Claude Code Review paused/disabled org-settings notice, not findings (BLO-23059); " +
             "neither the reviewer counter-review wake nor the PR-author wake was enqueued",
+        );
+      },
+      // PEN-3383: `warn`, for the same reason as the escalation drop below —
+      // the interesting case is not the one this fires on today. Today every
+      // hit is an agent's own PR reply being correctly kept out of the feedback
+      // path. But if Ally's review template ever stops emitting BOTH the
+      // consolidated header and the `Reviewed head:` attestation, a genuine
+      // comment-shaped review lands here and is dropped, and this line is the
+      // only thing that would say so. A sustained run of these on bodies that
+      // read like real reviews means the structure predicate needs widening,
+      // not that the reviewer went quiet.
+      onSuppressedReviewFeedback: (info) => {
+        logger.warn(
+          {
+            event: eventName,
+            deliveryId,
+            repoFullName: info.repoFullName,
+            prNumber: info.prNumber,
+            commentId: info.commentId,
+            commentAuthorLogin: info.commentAuthorLogin,
+            commentUrl: info.commentUrl,
+            suppressionReason: "review_feedback_comment_not_review_shaped",
+          },
+          "github webhook review-feedback wake skipped: a reviewer-identity comment carried " +
+            "findings-shaped text but no review structure (no consolidated header, no " +
+            "`Reviewed head:` attestation), so it is an agent's own PR reply rather than a " +
+            "review (PEN-3383). Identity cannot separate the two -- agents post through the " +
+            "reviewer's own GitHub App seat",
         );
       },
       // BLO-32381: `warn`, not `info`, and deliberately so. Unlike the
@@ -5501,33 +5763,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         ? pullRequestExternalId(context.repoFullName, context.prNumber)
         : null;
     const previouslyLinkedPullRequestIssues = pullRequestWorkProductExternalId
-      ? await db
-        .select({
-          id: issues.id,
-          companyId: issues.companyId,
-          identifier: issues.identifier,
-          assigneeAgentId: issues.assigneeAgentId,
-          status: issues.status,
-          executionState: issues.executionState,
-        })
-        .from(issueWorkProducts)
-        .innerJoin(
-          issues,
-          and(
-            eq(issues.id, issueWorkProducts.issueId),
-            eq(issues.companyId, issueWorkProducts.companyId),
-          ),
-        )
-        .where(
-          and(
-            eq(issueWorkProducts.provider, "github"),
-            eq(issueWorkProducts.type, "pull_request"),
-            eq(issueWorkProducts.externalId, pullRequestWorkProductExternalId),
-            sql`${issueWorkProducts.metadata}->>'source' = ${PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE}`,
-            sql`${issueWorkProducts.sourceTrust}->>'promotedByActorType' = 'system'`,
-            sql`${issueWorkProducts.sourceTrust}->>'promotedByActorId' = ${PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID}`,
-          ),
-        )
+      ? await selectIssuesLinkedToPullRequest(db, pullRequestWorkProductExternalId)
       : [];
 
     if (context.identifiers.length === 0 && previouslyLinkedPullRequestIssues.length === 0) {
@@ -5607,6 +5843,167 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         logger.error(
           { err, prNumber: context.prNumber, repoFullName: context.repoFullName },
           "merged-PR forward-capture persist failed",
+        );
+      }
+    }
+
+    // Stacked-PR base-merge fan-out (BLO-29856). A base-branch merge is an event
+    // on a DIFFERENT PR, so every open PR stacked on top of it receives nothing:
+    // it does not become unmergeable, does not fail a check, and does not get a
+    // comment. It just quietly stops being buildable while continuing to look
+    // healthy. Observed: #1439 sat orphaned three days after #1415 merged, and
+    // only a liveness sweep noticed — i.e. the system caught the symptom (an
+    // issue with no action path) days after the cause (a base branch merged).
+    //
+    // Best-effort in both directions: it runs after the forward-capture above so
+    // a persist failure cannot swallow the wake, and it swallows its own failures
+    // so a GitHub read cannot break the delivery.
+    if (
+      eventName === "pull_request" &&
+      context.prMerged === true &&
+      context.prBranch &&
+      context.repoFullName
+    ) {
+      const mergedBaseRef = context.prBranch;
+      const stackedRepoFullName = context.repoFullName;
+      try {
+        const stacked = await githubListOpenPullRequestsByBase({
+          repoFullName: stackedRepoFullName,
+          baseRef: mergedBaseRef,
+        });
+        if ("error" in stacked) {
+          // NOT "no stacked children" — we could not find out. Logged loudly
+          // because the failure mode this block exists to break is silence, and
+          // a swallowed enumeration failure is that same silence one layer up.
+          // The standing field check (open PRs whose base branch no longer
+          // exists) is the backstop.
+          logger.warn(
+            {
+              repoFullName: stackedRepoFullName,
+              mergedBaseRef,
+              prNumber: context.prNumber,
+              reason: stacked.error,
+            },
+            "stacked-PR base-merge fan-out could not enumerate open PRs",
+          );
+        } else if (stacked.pullRequests.length === 0) {
+          // Empty is only "no stacked children" while the merged head branch
+          // still exists. Once GitHub deletes it (`delete_branch_on_merge`), it
+          // auto-retargets every child, bare with no rebase, so they no longer
+          // match `?base=` and nobody is woken. Read AFTER the enumeration: a
+          // branch that exists now existed then, so its empty list is truthful.
+          const headBranchState = await githubResolveBranchState({
+            repoFullName: stackedRepoFullName,
+            branch: mergedBaseRef,
+          });
+          if (headBranchState !== "exists") {
+            logger.warn(
+              {
+                repoFullName: stackedRepoFullName,
+                mergedBaseRef,
+                prNumber: context.prNumber,
+                headBranchState,
+              },
+              "stacked-PR base-merge fan-out found no open PRs on a head branch that no longer provably exists; " +
+                "GitHub may have auto-retargeted stacked children without a rebase, and none were woken",
+            );
+          }
+        } else {
+          if (stacked.truncated) {
+            logger.warn(
+              { repoFullName: stackedRepoFullName, mergedBaseRef, returned: stacked.pullRequests.length },
+              "stacked-PR base-merge fan-out hit the page cap; some children may not be woken",
+            );
+          }
+          // Resolved once for the whole fan-out, and only after we know there is
+          // at least one child to tell — a merge with no stacked children costs
+          // no merge-shape read at all.
+          const mergeShape: MergeHistoryShape = context.prMergeCommitSha
+            ? await githubResolveMergeHistoryShape({
+              repoFullName: stackedRepoFullName,
+              mergeCommitSha: context.prMergeCommitSha,
+            })
+            : "unknown";
+          const directive = stackedChildDirective(mergeShape);
+          const stackedHeartbeat = heartbeatService(db, {
+            pluginWorkerManager: config.pluginWorkerManager,
+            ...config.heartbeatOptions,
+          });
+
+          for (const child of stacked.pullRequests) {
+            const childIssues = await selectIssuesLinkedToPullRequest(
+              db,
+              pullRequestExternalId(stackedRepoFullName, child.number),
+            );
+            for (const childIssue of childIssues) {
+              // An unassigned or terminal row has nobody to wake; the orphaned
+              // PR is still real, which is what the field check is for.
+              if (!childIssue.assigneeAgentId) continue;
+              if (childIssue.status === "done" || childIssue.status === "cancelled") continue;
+
+              // Keyed on (child issue, child PR, merged base) so a GitHub
+              // redelivery of the same merge is one wake, while a DIFFERENT base
+              // merging later legitimately wakes the child again. Prechecked
+              // because enqueueWakeup stores the key without enforcing it
+              // (BLO-13247).
+              const stackedIdempotencyKey =
+                `stacked_pr_base_merged:${childIssue.id}:${stackedRepoFullName}:${child.number}:${mergedBaseRef}`;
+              const alreadyWoken = await db
+                .select({ id: agentWakeupRequests.id })
+                .from(agentWakeupRequests)
+                .where(
+                  and(
+                    eq(agentWakeupRequests.agentId, childIssue.assigneeAgentId),
+                    eq(agentWakeupRequests.idempotencyKey, stackedIdempotencyKey),
+                    inArray(agentWakeupRequests.status, idempotentWakeStatuses("stable")),
+                  ),
+                )
+                .limit(1)
+                .then((rows) => rows[0] ?? null);
+              if (alreadyWoken) continue;
+
+              await stackedHeartbeat.wakeup(childIssue.assigneeAgentId, {
+                source: "automation",
+                triggerDetail: "system",
+                reason: "github_stacked_pr_base_merged",
+                idempotencyKey: stackedIdempotencyKey,
+                payload: {
+                  issueId: childIssue.id,
+                  source: "github",
+                  event: eventName,
+                  deliveryId,
+                  repoFullName: stackedRepoFullName,
+                  prNumber: child.number,
+                  prUrl: child.url,
+                  mergedBasePrNumber: context.prNumber,
+                  mergedBaseRef,
+                  mergeHistoryShape: mergeShape,
+                  directive,
+                },
+                contextSnapshot: {
+                  issueId: childIssue.id,
+                  taskId: childIssue.id,
+                  wakeReason: "github_stacked_pr_base_merged",
+                  wakeSource: "automation",
+                  wakeTriggerDetail: "system",
+                  commentSource: "github",
+                  githubEvent: eventName,
+                  githubDeliveryId: deliveryId,
+                  githubRepoFullName: stackedRepoFullName,
+                  githubPrNumber: child.number,
+                  githubMergedBasePrNumber: context.prNumber,
+                  githubMergedBaseRef: mergedBaseRef,
+                  githubMergeHistoryShape: mergeShape,
+                  githubStackedChildDirective: directive,
+                },
+              });
+            }
+          }
+        }
+      } catch (err) {
+        logger.error(
+          { err, prNumber: context.prNumber, repoFullName: stackedRepoFullName, mergedBaseRef },
+          "stacked-PR base-merge fan-out failed",
         );
       }
     }
@@ -6512,10 +6909,10 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
 
 // Test-only re-exports.
 export const __test_extractPaperclipIdentifiers = extractPaperclipIdentifiers;
+export const __test_stackedChildDirective = stackedChildDirective;
 export const __test_hasPrReviewerRequestMention = hasPrReviewerRequestMention;
 export const __test_hasPrReviewerAgentRequestMarker = hasPrReviewerAgentRequestMarker;
 export const __test_hasAllyConsolidatedReviewHeading = hasAllyConsolidatedReviewHeading;
-export const __test_hasAllyConsolidatedReviewHeader = hasAllyConsolidatedReviewHeader;
 export const __test_verifyGithubSignature = verifyGithubSignature;
 export const __test_resolveEventContext = resolveEventContext;
 export const __test_shouldFirePrReviewerWake = shouldFirePrReviewerWake;
@@ -6539,6 +6936,8 @@ export const __test_isSelfReviewedPr = isSelfReviewedPr;
 export const __test_resolvePrCommentReviewGateWebhookTrigger = resolvePrCommentReviewGateWebhookTrigger;
 export const __test_readReviewGateEscalationHeadSha = readReviewGateEscalationHeadSha;
 export const __test_isActionablePrReviewComment = isActionablePrReviewComment;
+export const __test_classifyPrReviewComment = classifyPrReviewComment;
+export const __test_isReviewShapedPrComment = isReviewShapedPrComment;
 export const __test_isReviewGateEscalationProducer = isReviewGateEscalationProducer;
 export const __test_buildReviewGateEscalationExternalKey = buildReviewGateEscalationExternalKey;
 export const __test_buildReviewGateEscalationComment = buildReviewGateEscalationComment;

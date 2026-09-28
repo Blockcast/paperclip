@@ -52,7 +52,7 @@ export function buildAlert({ exitCode, summary, runUrl, repo, environment, now }
     ? `The ${environment} environment could NOT be read, so its protection state is unknown. ` +
       `This is never a pass. Reason: ${summary?.reason ?? 'unknown'}`
     : `The ${environment} environment no longer matches the board-ratified protection shape ` +
-      `(approval b75f8156). Violations:\n` +
+      `(approval 60e271b7, which supersedes b75f8156). Violations:\n` +
       (summary?.violations ?? ['(summary unavailable — see run log)'])
         .map((v) => `  - ${v}`)
         .join('\n');

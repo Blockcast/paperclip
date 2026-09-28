@@ -33,6 +33,7 @@ import {
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
   JOB_FAILED_HEARTBEAT_RETRY_MAX_ATTEMPTS,
+  K8S_REPLACEMENT_LAUNCH_FAILURE_AFTER_THROTTLE_KEY,
   MAX_TURN_CONTINUATION_RETRY_REASON,
   MAX_TURN_CONTINUATION_WAKE_REASON,
   heartbeatService,
@@ -3245,6 +3246,51 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     }
   });
 
+  // BLO-34577: a replacement Job launch that failed before its pod ran, after
+  // this run already observed a zero-progress 429, is finalized with the throttle
+  // verdict (provider_throttled_no_progress / rate_limit_exhausted) carrying the
+  // launch failure as an annotation. That verdict is what re-queues the pr_review
+  // -- previously the run kept `k8s_pod_schedule_failed` and the review dropped.
+  describe("BLO-34577 replacement-launch failure after an in-run throttle", () => {
+    const annotation = {
+      [K8S_REPLACEMENT_LAUNCH_FAILURE_AFTER_THROTTLE_KEY]: {
+        errorCode: "k8s_pod_schedule_failed",
+        errorMessage: "Pod scheduling failed: Pod ac-ally-x reached phase=Failed: claude exited 1",
+        throttleAttempts: 2,
+        throttleErrorCode: null,
+      },
+    };
+
+    it("schedules the bounded retry for pr_review and issue contexts once finalized as the throttle", () => {
+      for (const contextSnapshot of [
+        { wakeReason: "github_pr_opened", reviewKind: "pr_review", githubPrNumber: 3212 },
+        { taskKey: "pr_review:Blockcast/pim-multicast-gateway:3212" },
+        { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      ]) {
+        expect(
+          shouldScheduleAutomaticRunRetry({
+            errorCode: "provider_throttled_no_progress",
+            resultJson: { errorFamily: "rate_limit_exhausted", api_error_status: 429, ...annotation },
+            contextSnapshot,
+          }),
+        ).toBe(true);
+      }
+    });
+
+    it("does not retry when the launch failure was recorded verbatim, annotation or not", () => {
+      // Negative control: the fix is the VERDICT, not the annotation. A run that
+      // kept `k8s_pod_schedule_failed` -- and a stale transient family in its
+      // merged resultJson -- still hits the ambiguous-outcome reject first.
+      expect(
+        shouldScheduleAutomaticRunRetry({
+          errorCode: "k8s_pod_schedule_failed",
+          resultJson: { errorFamily: "rate_limit_exhausted", ...annotation },
+          contextSnapshot: { wakeReason: "github_pr_opened", reviewKind: "pr_review", githubPrNumber: 3212 },
+        }),
+      ).toBe(false);
+    });
+  });
+
   // BLO-17456: when a PR-review chain exhausts, the reviewer never posts its
   // required status, so the PR sits on "Expected — waiting for status" forever.
   // These drive the real exhaustion path (no mocks): loadConfig() reads
@@ -3293,8 +3339,17 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       return { events, runId };
     }
 
+    // BLO-34699: `reviewKind`/`prRole` are load-bearing, not decoration. The
+    // seeded `pr_review_output_missing` errorCode is only reachable through
+    // evaluatePrReviewCompletionEvidence, which returns `not_applicable` unless
+    // reviewKind === "pr_review" and prRole is absent or "reviewer" — so a
+    // snapshot without them is a shape production cannot mint. Omitting them
+    // also made the three negative cases below pass vacuously, for the tag
+    // check rather than for the condition each one names.
     const prReviewSnapshot = {
       wakeReason: "github_pr_synchronized",
+      reviewKind: "pr_review",
+      prRole: "reviewer",
       githubPrNumber: 7,
       githubRepoFullName: "Blockcast/hang",
       githubHeadSha: HEAD_SHA,
@@ -3350,6 +3405,30 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
       expect(events.at(-1)?.message).toContain("Bounded retry exhausted");
       expect(events.some((e) => e.message.includes("gate status"))).toBe(false);
+    });
+
+    // BLO-34699: the PR author's own agent is woken by its own review-request
+    // marker (BLO-19522) and carries the same repo/head/PR identity as the
+    // reviewer, so before the resolver read these tags a crashed author run was
+    // published as the reviewer's verdict on the head. Asserted at the call
+    // site, not only over the pure predicate: this is the case that must
+    // enqueue no `github_commit_status` delivery at all. One row per guard
+    // clause so neither can hide behind the other under mutation (BLO-34263) —
+    // `measured` is the shape seen on pim-multicast-gateway#3237.
+    it.each([
+      { label: "measured author shape (no reviewKind)", overrides: { reviewKind: undefined, prRole: "author" } },
+      { label: "author run that is tagged pr_review", overrides: { prRole: "author" } },
+    ])("writes no gate-status event for the PR author's own run — $label", async ({ overrides }) => {
+      process.env[GATE_CONTEXT_ENV] = "review/ally-complete";
+      const { events } = await exhaustPrReviewRun({ ...prReviewSnapshot, ...overrides });
+
+      expect(events.at(-1)?.message).toContain("Bounded retry exhausted");
+      expect(events.some((e) => e.message.includes("gate status"))).toBe(false);
+      const deliveries = await db
+        .select()
+        .from(githubCommitStatusDeliveries)
+        .where(eq(githubCommitStatusDeliveries.sha, HEAD_SHA));
+      expect(deliveries).toHaveLength(0);
     });
   });
 

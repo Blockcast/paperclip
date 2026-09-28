@@ -486,21 +486,61 @@ describe("issue validators", () => {
       expect(text).toMatch(/DEFAULT page size is 30/);
     });
 
-    // PEN-3413: `commit_id` is not immutable — GitHub rewrites it onto the new head when a
-    // force-push orphans the reviewed commit, hours after submission, so a `commit_id`-only
-    // check credits an approval of a tree the reviewer never read. This description IS the
-    // implementation for the hand-performed gate re-check, so the body-attestation
-    // requirement has to survive a size-motivated trim. Assert the invariants, not the prose.
-    it("refuses a formal review whose body attests a head other than its commit_id", () => {
+    // BLO-35277: `commit_id` re-anchors FORWARD on APPROVED reviews when the head moves, so
+    // `commit_id == head` fails OPEN — it accepts a review that never saw the head being acted on.
+    // This was the fourth copy of that recipe found and the only one no agent bundle write can
+    // reach. Assert the invariants rather than the prose, so wording stays free to change.
+    it("warns that `commit_id` is mutable and does not prescribe it as the record of the reviewed head", () => {
       const text = issueExecutionMonitorPolicySchema.shape.gateSignals.description ?? "";
-      // The stamp alone must not read as sufficient.
-      expect(text).toMatch(/NOT SUFFICIENT|not immutable/);
-      // Name the mechanism, so nobody re-derives it as a submit-time race.
-      expect(text).toMatch(/force-push/i);
-      // The refusal, and the direction the disagreement resolves in.
-      expect(text).toMatch(/attesting a DIFFERENT head refuses the entry/i);
-      // …and its narrowness: an unattested body is still credited on the stamp.
-      expect(text).toMatch(/no attestation still rides on `commit_id`/i);
+      // The mechanism and its direction of failure, in those terms.
+      expect(text).toMatch(/commit_id` IS MUTABLE/i);
+      expect(text).toMatch(/RE-ANCHORS it FORWARD/i);
+      expect(text).toMatch(/fails OPEN/i);
+      // The immutable body marker is what records which head was read; commit_id corroborates.
+      expect(text).toMatch(/Reviewed head: <40-hex>` marker in the review BODY/);
+      expect(text).toMatch(/treat `commit_id` as corroboration at most/i);
+      // The CREDITING sentence itself must name the marker as the thing read, and must not reach
+      // `commit_id` before it does — the crediting CONDITION is where the recipe gets reinstated.
+      // SCOPE, stated precisely because the next editor reads this to decide if they are covered:
+      // the lookahead is phrasing-blind only for the region BEFORE the marker phrase. It stops
+      // matching there, so a requirement APPENDED after it ("…corroboration at most. Also require
+      // that its `commit_id` IS the head the PR is currently at.") falls through to the verb-list
+      // guard below — which has known paraphrase gaps ("IS", "currently at") and does not catch
+      // that shape. Measured, not reasoned. Closing it needs the lookahead anchored to the end of
+      // the SURFACE 1 sentence group; `commit_id` appears legitimately four times inside SURFACE 1
+      // (mutability warning, `commit_id == head` fails OPEN, corroboration, COMMENTED anchor), so
+      // a blanket ban on the region is not available and the narrower guard is deliberate.
+      expect(text).toMatch(/Credit an entry only when(?:(?!commit_id)[^])*?Reviewed head: <40-hex>` marker in the review BODY/);
+      // SURFACE 1 must stay labelled a liveness signal, so the empirically safe use survives.
+      expect(text).toMatch(/LIVENESS check/i);
+      // The re-anchoring sample covers COMMENTED and APPROVED only (BLO-27234, n=128). The other
+      // two submitted states must stay labelled unmeasured rather than inheriting COMMENTED's
+      // clean result, which is a stronger instruction, not a weaker one.
+      expect(text).toMatch(/CHANGES_REQUESTED \/ DISMISSED are UNMEASURED, not cleared/i);
+      // The old recipe must not come back as a PARAPHRASE either, not just as a verbatim revert.
+      // The previous exact-string guards passed on "its `commit_id` matches the PR's current
+      // head", which sits perfectly happily beside the mutability warning and reinstates the
+      // prescription anyway.
+      expect(text).not.toMatch(/`commit_id`[^.]{0,60}\b(equals?|matches?|identical to|the same as)\b[^.]{0,40}current head/i);
+      // The staleness comparison must NAME the immutable marker as the thing compared, so
+      // swapping `commit_id` back into that sentence fails here however it is phrased.
+      expect(text).toMatch(/staleness by comparing the attested `Reviewed head:`/i);
+      // The `githubHasReviewerEvidenceForPr` pointer must stay SCOPED. PEN-3413 closed the LOUD
+      // half — a body attesting a DIFFERENT head is now refused outright — but the predicate still
+      // credits a BODYLESS review on `review.commitId === headSha` alone, in any SUBMITTED state
+      // including APPROVED. So an unqualified "mirror it" still tells an agent to re-derive the
+      // recipe removed above, just via the narrower bodyless door (BLO-35277 review, paperclip#1988).
+      expect(text).toMatch(/do NOT carry (that|its `commit_id` keying) over to (a bodyless )?`?APPROVED/i);
+      // ...and the pointer must not imply the server is FINE. `APPROVED` is reachable there on any
+      // human-authored PR, so the text has to say the residual fail-open SURVIVES — otherwise a
+      // later audit of `github-app-auth.ts` reads this as "already assessed, sound" and stops.
+      // That is the one follow-up that matters (BLO-35545), so the tracking id is pinned too.
+      expect(text).toMatch(/`?APPROVED`? IS a state (it|the server) runs on/i);
+      // NARROWED is the honest word and the load-bearing one: "cleared" would retire BLO-35545,
+      // "unchanged" would deny the guard this PR adds. Pin the residual, not the prose around it.
+      expect(text).toMatch(/fail-open is NARROWED, not cleared/i);
+      expect(text).toMatch(/NO body marker still rides on `commit_id` alone/i);
+      expect(text).toMatch(/BLO-35545/);
     });
   });
 

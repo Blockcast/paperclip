@@ -104,6 +104,7 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
     identifier: string;
     status: string;
     assigneeAgentId?: string | null;
+    description?: string | null;
     executionState?: Record<string, unknown> | null;
   }) {
     const id = randomUUID();
@@ -114,6 +115,7 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
       title: input.identifier,
       status: input.status,
       priority: "medium",
+      description: input.description ?? null,
       assigneeAgentId: input.assigneeAgentId ?? null,
       originKind: "manual",
       originFingerprint: "default",
@@ -395,6 +397,67 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
 
     expect(result.reconciled).toBe(0);
     expect(await statusOf(gated)).toBe("blocked");
+  });
+
+  // BLO-30445: the matched pair is the whole point. Asserting only that the declared row
+  // survives cannot distinguish "the exemption works" from "the reconciler stopped running",
+  // and the QA fixture pair this replicates (BLO-30442 / BLO-30443) drained in the SAME
+  // transaction — so the control has to be reconciled in the same sweep, not a later one.
+  it("does not sweep an issue with a declared external wait, but still sweeps its undeclared twin", async () => {
+    const { companyId } = await createCompany("SBXW");
+    const declared = await insertIssue({
+      companyId,
+      identifier: "SBXW-1",
+      status: "blocked",
+      description: [
+        "Waiting on the ruleset change.",
+        "external owner: kkroo",
+        "external action: approve the onprem-k8s ruleset change",
+      ].join("\n"),
+    });
+    // Same gate, named in prose only — the documented non-match.
+    const control = await insertIssue({
+      companyId,
+      identifier: "SBXW-2",
+      status: "blocked",
+      description: "Waiting on kkroo to approve the onprem-k8s ruleset change.",
+    });
+
+    const result = await reconcileStrandedBlockedIssues(db);
+
+    expect(result.reconciled).toBe(1);
+    expect(await statusOf(declared)).toBe("blocked");
+    expect(await statusOf(control)).toBe("todo");
+
+    const suppressed = await listBlockedIssueAutoResumeSuppressions(db, companyId, [declared, control]);
+    expect(suppressed.get(declared)).toMatchObject({ reason: "external_wait" });
+    expect(suppressed.has(control)).toBe(false);
+
+    // Idempotent across ticks: AC1 wants the park to hold past more than one sweep.
+    expect((await reconcileStrandedBlockedIssues(db)).reconciled).toBe(0);
+    expect(await statusOf(declared)).toBe("blocked");
+  });
+
+  // The suppression reads the full `description` column. Callers that project a
+  // `substring(...)` preview parse a past-the-cutoff declaration as `null` (BLO-31839); if
+  // this one ever did, a long-description park would drain silently.
+  it("honours a declaration that sits past the description preview cutoff", async () => {
+    const { companyId } = await createCompany("SBXWL");
+    const declared = await insertIssue({
+      companyId,
+      identifier: "SBXWL-1",
+      status: "blocked",
+      description: [
+        "x".repeat(4000),
+        "external owner: kkroo",
+        "external action: approve the ruleset change",
+      ].join("\n"),
+    });
+
+    const result = await reconcileStrandedBlockedIssues(db);
+
+    expect(result.reconciled).toBe(0);
+    expect(await statusOf(declared)).toBe("blocked");
   });
 
   it("does not sweep an issue with an active stranded-run recovery action pointing at itself", async () => {

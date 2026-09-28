@@ -256,6 +256,63 @@ function detectScreenshotViewport(
   return looseFilename.test(text);
 }
 
+/**
+ * A markdown list item's leading marker: unordered (`-`/`*`) or ordered
+ * (`1.`, `1)`). ONE source, consumed by both the criteria counter
+ * (`doneWhenBulletKeys`) and the evidence task-list counter
+ * (`detectChecklistDoneWhen`), because those two are the halves of a single
+ * comparison — criteria count vs evidence count — and a marker the one side
+ * reads but the other does not makes the shape unsatisfiable rather than
+ * merely under-counted.
+ *
+ * That is not hypothetical: BLO-34810 widened the criteria side alone, which
+ * left `1. [x]` evidence (valid GFM, renders as a checkbox) matching zero
+ * task-list lines against a now-correct criteria count. Keep them sharing
+ * this constant rather than restating the character class.
+ *
+ * `^` carries no indent allowance: a nested item is a sub-point of the item
+ * above it, not an item of its own. `\s+` after the marker is what keeps
+ * `1.2.3 is the pinned version` from reading as a list item.
+ */
+const LIST_MARKER_SOURCE = "^(?:[-*]|\\d+[.)])\\s+";
+
+/*
+ * BOTH constants below are module-scoped AND carry `g`, so each owns a single
+ * mutable `lastIndex` shared by every call. That is safe here only because of
+ * WHICH method consumes them, not because of anything visible at these
+ * definitions:
+ *
+ *   - `String.prototype.match` sets `lastIndex` to 0 on entry when the regex
+ *     is global (`RegExp.prototype[Symbol.match]`), so it cannot resume from a
+ *     previous call's offset.
+ *   - `String.prototype.matchAll` iterates a CLONE, leaving the original's
+ *     `lastIndex` untouched.
+ *
+ * `.test()` / `.exec()` have neither property: they advance `lastIndex` and
+ * resume from it, so adding one against either constant would silently skip
+ * matches on alternate invocations — an every-other-call bug, which is the
+ * kind that survives a green test suite. If you need one, match against a
+ * fresh `new RegExp(LIST_MARKER_SOURCE, ...)` instead of reusing these.
+ *
+ * Dropping `g` is not the alternative: `matchAll` throws a TypeError without
+ * it, and `.match()` needs it to return ALL matches rather than the first —
+ * `detectChecklistDoneWhen` counts that array's length.
+ */
+
+/**
+ * A completed task-list line — any list marker followed by `[x]`.
+ * Global + module-scoped: consumed ONLY via `.match()`, which resets
+ * `lastIndex`. See the note above before adding a `.test()`/`.exec()` caller.
+ */
+const TASK_LIST_DONE_RE = new RegExp(`${LIST_MARKER_SOURCE}\\[[xX]\\]`, "gm");
+
+/**
+ * A list item under a criteria heading; group 1 is the criterion text.
+ * Global + module-scoped: consumed ONLY via `.matchAll()`, which iterates a
+ * clone. See the note above before adding a `.test()`/`.exec()` caller.
+ */
+const LIST_ITEM_RE = new RegExp(`${LIST_MARKER_SOURCE}(.*)$`, "gm");
+
 function detectChecklistDoneWhen(
   text: string,
   issueDescription: string | null | undefined,
@@ -280,12 +337,13 @@ function detectChecklistDoneWhen(
   // A "checklist" is either:
   //  (a) A markdown table with N >= doneWhenBullets rows that include an
   //      explicit completion marker in any cell.
-  //  (b) A completed task-list with N >= doneWhenBullets `- [x]` lines.
+  //  (b) A completed task-list with N >= doneWhenBullets `[x]` lines, under
+  //      any list marker the criteria side also counts.
 
   const statusMarker = /✅|✓|✔|❌|✗|\[[xX]\]/;
 
   // (b) Task list count.
-  const taskListMatches = text.match(/^[-*]\s+\[[xX]\]/gm);
+  const taskListMatches = text.match(TASK_LIST_DONE_RE);
   if (taskListMatches && taskListMatches.length >= doneWhenBullets) return true;
 
   // (a) Markdown table — count rows that contain a status marker.
@@ -441,9 +499,32 @@ export function hasDoneWhenHeading(description: string): boolean {
   return doneWhenSections(description).length > 0;
 }
 
+/**
+ * One key per criterion line under a recognized heading. A criterion carries
+ * an unordered marker (`-`/`*`) or an ordered one (`1.`, `1)`).
+ *
+ * Ordered items were unmatched until BLO-34810, which made a fully-specified
+ * numbered acceptance-criteria list count as zero criteria — so
+ * `detectChecklistDoneWhen` short-circuited false and the row carried a
+ * permanent `missing: ["checklist:done-when"]` that no comment could clear.
+ * The only workarounds were renumbering the criteria (breaking every
+ * cross-thread "AC 3" citation) or duplicating them into a parallel bullet
+ * list that then drifts from the original.
+ *
+ * `^` is deliberately not preceded by an indent allowance: a nested item is a
+ * sub-point of the criterion above it, not a criterion of its own, and
+ * counting it would inflate the required evidence-row count.
+ *
+ * The marker class is shared with the evidence task-list counter via
+ * `LIST_MARKER_SOURCE` — see that constant for why the two must not drift.
+ *
+ * Keys are normalized bullet TEXT, so the caller's cross-section dedup is
+ * blind to which marker was used — a criteria list cannot be double-counted
+ * by restating it under a synonym heading with the other marker style.
+ */
 function doneWhenBulletKeys(body: string): string[] {
   return Array.from(
-    body.matchAll(/^[-*]\s+(.*)$/gm),
+    body.matchAll(LIST_ITEM_RE),
     (match, index) => {
       const normalized = (match[1] ?? "").trim().replace(/\s+/g, " ").toLowerCase();
       return normalized ? `text:${normalized}` : `empty:${index}`;

@@ -990,6 +990,225 @@ describe("countDoneWhenBullets — criteria heading synonyms (BLO-19047)", () =>
   });
 });
 
+describe("countDoneWhenBullets — ordered list markers (BLO-34810)", () => {
+  // The two fixtures differ ONLY in list marker. Before the fix the numbered
+  // one counted 0, so `detectChecklistDoneWhen` short-circuited false and the
+  // row carried a `missing: ["checklist:done-when"]` no comment could clear.
+  const CRITERIA = ["cards drop the dead space", "grid reflows at 390px", "no 1440px regression"];
+  const bulleted = `## Acceptance criteria\n${CRITERIA.map((c) => `- ${c}`).join("\n")}`;
+  const numbered = `## Acceptance criteria\n${CRITERIA.map((c, i) => `${i + 1}. ${c}`).join("\n")}`;
+
+  it("counts `1.` items identically to `-` items", () => {
+    expect(countDoneWhenBullets(numbered)).toBe(3);
+    expect(countDoneWhenBullets(numbered)).toBe(countDoneWhenBullets(bulleted));
+  });
+
+  it("counts `1)` items", () => {
+    expect(countDoneWhenBullets("## Acceptance criteria\n1) a\n2) b")).toBe(2);
+  });
+
+  it("counts past a single digit", () => {
+    const items = Array.from({ length: 12 }, (_, i) => `${i + 1}. criterion ${i + 1}`).join("\n");
+    expect(countDoneWhenBullets(`## Acceptance criteria\n${items}`)).toBe(12);
+  });
+
+  it("does not count a nested item as its own criterion", () => {
+    // A sub-point belongs to the criterion above it. Counting it would inflate
+    // the required evidence-row count, which is a harder failure to see than
+    // the under-count this fix repairs.
+    expect(countDoneWhenBullets("## Acceptance criteria\n1. a\n   1. a sub-point\n2. b")).toBe(2);
+    expect(countDoneWhenBullets("## Acceptance criteria\n- a\n  - a sub-point\n- b")).toBe(2);
+  });
+
+  it("does not count a decimal or a bare number as a criterion", () => {
+    expect(countDoneWhenBullets("## Acceptance criteria\n1.2.3 is the pinned version")).toBe(0);
+    expect(countDoneWhenBullets("## Acceptance criteria\n2024 was the year")).toBe(0);
+  });
+
+  it("dedups the same criterion restated under a synonym with the other marker", () => {
+    // Keys are normalized TEXT, so mixing markers cannot inflate the count.
+    const description = "## Acceptance criteria\n1. a\n2. b\n\n## Success criteria\n- a\n- b";
+    expect(countDoneWhenBullets(description)).toBe(2);
+  });
+
+  it("still reports zero when there are no criteria at all", () => {
+    expect(countDoneWhenBullets("## Acceptance criteria\n\nTBD — to be written.")).toBe(0);
+    expect(countDoneWhenBullets("Just some prose, no heading.")).toBe(0);
+  });
+});
+
+describe("evaluateEvidence — numbered acceptance criteria (BLO-34810)", () => {
+  const NUMBERED_CRITERIA = [
+    "## Acceptance criteria",
+    "1. cards drop the h-100 dead space",
+    "2. grid reflows at 390px",
+    "3. no visual regression at 1440px",
+  ].join("\n");
+
+  const MARKER_TABLE = [
+    "| Criterion | Status | Evidence |",
+    "|---|---|---|",
+    "| h-100 dead space gone | ✅ | screenshot |",
+    "| reflows at 390px | ✅ | screenshot |",
+    "| no 1440px regression | ✅ | screenshot |",
+  ].join("\n");
+
+  it("clears checklist:done-when for a numbered criteria list", () => {
+    const result = evaluateEvidence({
+      issue: { description: NUMBERED_CRITERIA, labels: [] },
+      comments: [agentComment(MARKER_TABLE)],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
+    });
+    expect(result.verdict).toBe("pass");
+    expect(result.missing).toEqual([]);
+    expect(result.evidenceFound).toContain("checklist:done-when");
+    expect(result.diagnostics).not.toContain("missing-done-when-bullets");
+  });
+
+  it("still warns a row with a recognized heading but no criteria", () => {
+    // The fix must not blanket-suppress the diagnostic: a genuinely
+    // criteria-free row keeps warning.
+    const result = evaluateEvidence({
+      issue: { description: "## Acceptance criteria\n\nTBD.", labels: [] },
+      comments: [agentComment(MARKER_TABLE)],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
+    });
+    expect(result.verdict).toBe("warn");
+    expect(result.missing).toEqual(["checklist:done-when"]);
+    expect(result.diagnostics).toContain("missing-done-when-bullets");
+    // The heading IS recognized, so the gate must not tell the agent to
+    // rename it. This is the discriminator between the two failure modes.
+    expect(result.diagnostics).not.toContain("no-done-when-heading");
+  });
+
+  it("still emits no-done-when-heading when the heading is unrecognized", () => {
+    // Numbered criteria under `## Definition of done` are still invisible —
+    // the marker fix must not paper over a heading the gate cannot see.
+    const result = evaluateEvidence({
+      issue: { description: "## Definition of done\n1. a\n2. b", labels: [] },
+      comments: [agentComment(MARKER_TABLE)],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
+    });
+    expect(result.missing).toEqual(["checklist:done-when"]);
+    expect(result.diagnostics).toContain("missing-done-when-bullets");
+    expect(result.diagnostics).toContain("no-done-when-heading");
+  });
+});
+
+describe("evaluateEvidence — numbered task-list evidence (BLO-34810 review)", () => {
+  // The criteria-side widening alone left the OTHER half of the same
+  // comparison narrow: evidence written as `1. [x]` (valid GFM, renders as a
+  // checkbox) matched zero task-list lines against a now-correct criteria
+  // count, so the shape stayed unsatisfiable — and harder to diagnose,
+  // because the criteria count now looked right. Every other
+  // `evaluateEvidence` case here supplies a marker TABLE, which is exactly
+  // why the task-list path needs its own case.
+  const NUMBERED_CRITERIA = [
+    "## Acceptance criteria",
+    "1. cards drop the h-100 dead space",
+    "2. grid reflows at 390px",
+    "3. no visual regression at 1440px",
+  ].join("\n");
+
+  // Emits the marker it is GIVEN. An ordered marker (`1.`, `1)`) is
+  // renumbered per line, keeping its own delimiter; an unordered one (`-`,
+  // `*`) repeats verbatim. The earlier form hardcoded
+  // `marker === "-" ? "-" : "1."`, so `numberedTaskList("*")` silently
+  // produced `1.` items and asserted nothing whatever about `*` — in the one
+  // block whose subject is marker-blindness.
+  const numberedTaskList = (marker: string) => {
+    const ordered = /^\d+([.)])$/.exec(marker);
+    const item = (n: number) => (ordered ? `${n}${ordered[1]}` : marker);
+    return [
+      `${item(1)} [x] h-100 dead space gone`,
+      `${item(2)} [x] reflows at 390px`,
+      `${item(3)} [x] no 1440px regression`,
+    ].join("\n");
+  };
+
+  it("clears checklist:done-when from a numbered `[x]` task list", () => {
+    const result = evaluateEvidence({
+      issue: { description: NUMBERED_CRITERIA, labels: [] },
+      comments: [agentComment(numberedTaskList("1."))],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
+    });
+    expect(result.verdict).toBe("pass");
+    expect(result.missing).toEqual([]);
+    expect(result.evidenceFound).toContain("checklist:done-when");
+  });
+
+  it("reads `1)` markers too", () => {
+    const result = evaluateEvidence({
+      issue: { description: NUMBERED_CRITERIA, labels: [] },
+      comments: [agentComment("1) [x] a\n2) [x] b\n3) [x] c")],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
+    });
+    expect(result.missing).toEqual([]);
+  });
+
+  it("is marker-blind: `-`, `*`, `1.` and `1)` evidence produce the same verdict", () => {
+    const evaluate = (body: string) =>
+      evaluateEvidence({
+        issue: { description: NUMBERED_CRITERIA, labels: [] },
+        comments: [agentComment(body)],
+        workProducts: [],
+        registry: DEFAULT_EVIDENCE_REGISTRY,
+        externalDetections: { ...TRUTH_OK },
+      });
+    const baseline = evaluate(numberedTaskList("-"));
+    for (const marker of ["-", "*", "1.", "1)"]) {
+      const body = numberedTaskList(marker);
+      // Assert the FIXTURE first, not just the verdict. Parity alone cannot
+      // catch a helper that quietly falls back to one marker: a reverted
+      // `numberedTaskList("*")` emits `1.` lines, which are themselves
+      // marker-blind-clean, so the comparison below still passes while
+      // testing `1.` three times over. This line is the guard that fails.
+      expect(body.split("\n").map((l) => l.split(" ")[0])).toEqual(
+        /^\d+[.)]$/.test(marker)
+          ? [marker, `2${marker.slice(-1)}`, `3${marker.slice(-1)}`]
+          : [marker, marker, marker],
+      );
+      expect(evaluate(body).missing, `marker ${marker}`).toEqual(baseline.missing);
+    }
+  });
+
+  it("still warns when the task list is SHORTER than the criteria list", () => {
+    // Widening the marker must not widen the count comparison: two ticked
+    // items cannot discharge three criteria.
+    const result = evaluateEvidence({
+      issue: { description: NUMBERED_CRITERIA, labels: [] },
+      comments: [agentComment("1. [x] a\n2. [x] b")],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
+    });
+    expect(result.verdict).toBe("warn");
+    expect(result.missing).toEqual(["checklist:done-when"]);
+  });
+
+  it("does not accept an UNTICKED numbered list as evidence", () => {
+    // `[ ]` is a criterion restated, not a criterion met.
+    const result = evaluateEvidence({
+      issue: { description: NUMBERED_CRITERIA, labels: [] },
+      comments: [agentComment("1. [ ] a\n2. [ ] b\n3. [ ] c")],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: { ...TRUTH_OK },
+    });
+    expect(result.missing).toEqual(["checklist:done-when"]);
+  });
+});
+
 describe("evaluateEvidence — criteria heading synonyms (BLO-19047)", () => {
   // Regression for the exact BLO-18833 shape: a description written to the
   // company issue-creation policy (which mandates `## Acceptance criteria`)

@@ -1,9 +1,8 @@
 import { and, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
-import { heartbeatRuns, issueRelations, issues, type Db } from "@paperclipai/db";
+import { heartbeatRuns, issueRelations, issues, type Db, type DbTransaction } from "@paperclipai/db";
 import { TERMINAL_HEARTBEAT_RUN_STATUS_VALUES } from "./issue-execution-lock.js";
 import { buildIssueMonitorEligibilityPatch } from "./issue-execution-policy.js";
 
-type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type DbOrTransaction = Db | DbTransaction;
 
 /**

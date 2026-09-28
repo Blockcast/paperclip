@@ -1,0 +1,20 @@
+# BLO-34872: the vendored adapter's per-patch log is append-only, so every PR
+# touching that tree used to conflict with every other one on it — 4 rebases on
+# PR #1873 alone, PROVENANCE.md the only conflicting file each time. Union merge
+# keeps both sides' appended rows instead.
+#
+# Scoped to this one file deliberately, and it must stay scoped. A union merge
+# is only safe on an append-only list of independent rows: it resolves by
+# keeping both sides' added lines, so it cannot reconcile an interior edit and
+# cannot choose between two values of a field that has only one. PROVENANCE.md
+# is prose and single-valued tables, so union-merging it would interleave both
+# sides' text rather than merge it.
+#
+# That is also why nothing single-valued may move *into* this file. BLO-35109
+# deleted the 64-hex integrity hash that used to live in PROVENANCE.md for
+# exactly this reason: under a union both candidates survive, and CI's
+# `grep … | head -1` would then resolve the provenance verdict by sort order
+# rather than by the tree. `provenance-union-merge.test.mjs` asserts both
+# halves -- that this file is union-merged, that PROVENANCE.md is not, and that
+# neither carries a 64-hex line.
+vendor/paperclip-adapter-claude-k8s/PROVENANCE-CHANGES.md merge=union

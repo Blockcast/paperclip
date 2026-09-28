@@ -1618,6 +1618,73 @@ export function routineService(
     return null;
   }
 
+  // BLO-28952: `issueSvc.create` runs on its own connection, so the execution
+  // issue commits independently of the dispatch transaction that owns the
+  // `routine_runs` row pointing at it. The dispatch transaction's own catch
+  // block cannot compensate for that: once any statement errors, Postgres
+  // fails every later statement on the connection with 25P02, so the
+  // compensating `delete(issues)`, `finalizeRun` and `updateRoutineTouchedState`
+  // in that catch roll back alongside the run row. Net result is a durable
+  // execution issue whose `originRunId` names a row that never existed, which
+  // is unresolvable for anything that reads the run to identify the fire.
+  //
+  // Repair it here instead, on a fresh connection, after the rollback has
+  // already happened. The run row is re-persisted under its original id so the
+  // orphan's `originRunId` resolves, and the failed fire stays visible rather
+  // than vanishing from the routine's history. The issue is deliberately left
+  // in place: it is durable and assigned, so deleting it would discard work an
+  // agent may already have been woken for, and re-persisting the run is enough
+  // to restore the invariant.
+  async function reconcileRolledBackDispatch(input: {
+    run: typeof routineRuns.$inferSelect;
+    issueId: string | null;
+    nextRunAt?: Date | null;
+    error: unknown;
+  }) {
+    const failureReason = input.error instanceof Error ? input.error.message : String(input.error);
+    // A coalesced or skipped fire had already reached its terminal status
+    // inside the transaction (finalizeRun ran before the abort), so re-persist
+    // that status rather than relabelling the fire failed: those paths create
+    // no issue, so a "failed" row with no linked issue would never self-correct.
+    const reachedTerminal = input.run.status === "coalesced" || input.run.status === "skipped";
+    const reinsert: typeof routineRuns.$inferInsert = reachedTerminal
+      ? { ...input.run, updatedAt: new Date() }
+      : {
+          ...input.run,
+          status: "failed",
+          linkedIssueId: input.issueId,
+          failureReason,
+          completedAt: new Date(),
+          updatedAt: new Date(),
+        };
+    try {
+      const [reinserted] = await db
+        .insert(routineRuns)
+        .values(reinsert)
+        // A failure raised by COMMIT itself leaves the outcome ambiguous, so
+        // never clobber a row that did survive.
+        .onConflictDoNothing({ target: routineRuns.id })
+        .returning({ id: routineRuns.id });
+      // The row survived, so that fire's outcome is already recorded on the
+      // trigger; rewriting it here would clobber the successful fire's result.
+      if (!reinserted) return;
+      await updateRoutineTouchedState({
+        routineId: input.run.routineId,
+        triggerId: input.run.triggerId,
+        triggeredAt: input.run.triggeredAt,
+        status: reinsert.status ?? "failed",
+        issueId: reachedTerminal ? input.run.linkedIssueId : undefined,
+        nextRunAt: input.nextRunAt,
+      });
+    } catch (err) {
+      // Best effort by construction — this must never mask the original abort.
+      logger.error(
+        { err, routineId: input.run.routineId, runId: input.run.id, issueId: input.issueId },
+        "failed to reconcile rolled-back routine dispatch",
+      );
+    }
+  }
+
   async function finalizeRun(runId: string, patch: Partial<typeof routineRuns.$inferInsert>, executor: Db = db) {
     return executor
       .update(routineRuns)
@@ -1810,8 +1877,14 @@ export function routineService(
       ...input,
       automaticVariables,
     });
-    const allVariables = { ...getBuiltinRoutineVariableValues(), ...automaticVariables, ...resolvedVariables };
+    // Resolve the slot BEFORE interpolating: the built-ins render `triggeredAt`, not the
+    // dispatch instant, so a late or multi-slot catch-up stamps each issue with its own window.
     const triggeredAt = input.triggeredAtOverride ?? new Date();
+    const allVariables = {
+      ...getBuiltinRoutineVariableValues(triggeredAt),
+      ...automaticVariables,
+      ...resolvedVariables,
+    };
     const nextRunAt = input.nextRunAtOverride !== undefined
       ? input.nextRunAtOverride
       : input.trigger?.kind === "schedule" && input.trigger.cronExpression && input.trigger.timezone
@@ -1852,6 +1925,10 @@ export function routineService(
       title,
       description,
     });
+    // Captured so a rollback of the dispatch transaction can still be
+    // reconciled from outside it — see reconcileRolledBackDispatch.
+    let dispatchedRun: typeof routineRuns.$inferSelect | null = null;
+    let dispatchedIssueId: string | null = null;
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await tx.execute(
@@ -1914,6 +1991,7 @@ export function routineService(
           responsibleUserId,
         })
         .returning();
+      dispatchedRun = createdRun;
 
       let createdIssue: Awaited<ReturnType<typeof issueSvc.create>> | null = null;
       try {
@@ -1950,7 +2028,8 @@ export function routineService(
             issueId: activeIssue.id,
             nextRunAt,
           }, txDb);
-          return updated ?? createdRun;
+          dispatchedRun = updated ?? createdRun;
+          return dispatchedRun;
         }
 
         try {
@@ -2017,9 +2096,11 @@ export function routineService(
             issueId: existingIssue.id,
             nextRunAt,
           }, txDb);
-          return updated ?? createdRun;
+          dispatchedRun = updated ?? createdRun;
+          return dispatchedRun;
         }
 
+        dispatchedIssueId = createdIssue.id;
         // Keep the dispatch lock until the issue is linked to a queued heartbeat run.
         await queueIssueAssignmentWakeup({
           heartbeat,
@@ -2062,6 +2143,18 @@ export function routineService(
         }, txDb);
         return failed ?? createdRun;
       }
+    }).catch(async (error: unknown) => {
+      // The transaction rolled back. Anything it wrote is gone, including the
+      // catch block above; the execution issue it created is not.
+      if (dispatchedRun) {
+        await reconcileRolledBackDispatch({
+          run: dispatchedRun,
+          issueId: dispatchedIssueId,
+          nextRunAt,
+          error,
+        });
+      }
+      throw error;
     });
 
     if (input.source === "schedule" || input.source === "webhook") {

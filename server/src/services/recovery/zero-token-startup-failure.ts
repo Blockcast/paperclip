@@ -120,6 +120,76 @@ export function isDependencyBlockedRun(run: Pick<NeverExecutedRunInput, "errorCo
   return run.errorCode === "issue_dependencies_blocked";
 }
 
+// Error codes that name an infrastructure fault by the code ALONE: the run
+// never got to succeed or fail on its own merits, and the assignee had no part
+// in it.
+//
+// BLO-36535 moved this here from recovery/service.ts, where it was private, so
+// the productivity review can ask the same question the recovery router already
+// answers. Two definitions would drift in the dangerous direction — the review
+// billing a provider outage to an agent whose run the router had *already*
+// stamped `infraClassCause: true` on the very same review row. Same reasoning
+// as BLO-32679's move of `isInfraFailureRun` below.
+export const ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES = new Set([
+  "job_failed",
+  "k8s_pod_schedule_failed",
+  "adapter_failed",
+  "external_lifecycle_stale_killed",
+  "k8s_concurrency_guard_unreachable",
+  // BLO-27463: provider capacity throttling. Both codes carry errorFamily
+  // `rate_limit_exhausted` (see heartbeat.ts `readHeartbeatRunErrorFamily`) — the
+  // provider refused to serve, which is infra-class by exactly the BLO-20933
+  // argument used for a vanished pod: the run never got to succeed or fail on its
+  // own merits, and the assignee had no part in it. Moving `ownerAgentId` up the
+  // manager ladder for a provider's capacity decision concentrates load on the
+  // manager for an event nobody on this side caused.
+  //
+  // Their sibling `provider_quota` never reaches the routing union — recovery's
+  // `resolveStrandedRecoveryCause` re-causes it via `isProviderQuotaRecovery` —
+  // because it carries an authoritative reset instant and so gets the quota
+  // monitor/retry path. These two do not carry one, so they stay
+  // `stranded_assigned_issue` and are corrected at the routing decision rather
+  // than by widening that quota predicate onto runs whose retry horizon it
+  // cannot resolve.
+  //
+  // Scope note: this fixes ROUTING only, not the attempt budget. Deliberately not
+  // added to TRANSIENT_INFRA_CONTINUATION_ERROR_CODES — BLO-5681's counterfactual
+  // asserts a `rate_limit_exhausted` continuation retry still produces a recovery
+  // action at zero tokens, and granting bounded retries here makes that (and two
+  // adjacent retry-count guards) fail. Changing the budget is a separate decision
+  // against those guards, not a side effect of fixing ownership.
+  "rate_limit_exhausted",
+  "provider_throttled_no_progress",
+]);
+
+// True when a run died of an infrastructure fault, REGARDLESS of how much work
+// it did first. This is the strict complement of `isInfraFailureRun` below,
+// which is a zero-token test and therefore blind to the population BLO-36535
+// was opened for: a run that burned 20,957 output tokens / $4.92 and was then
+// killed by a provider 403 (`adapter_failed`) has a real `usageJson`, so
+// `isInfraFailureRun` returns false and the productivity review reads the
+// missing run comment as agent silence. Infrastructure killed it mid-flight.
+//
+// Membership is by CODE ONLY, and that is load-bearing in both directions:
+//
+//   - Never widen this to `isInfraClassStrandedFailure`'s message arm
+//     (recovery/service.ts). That arm matches `claude_truncated`, which is a run
+//     that executed a long turn and COULD have commented; its own note there
+//     documents it as audit-only for exactly this reason.
+//   - Never add a `livenessState` guard. BLO-23096 showed that one inert —
+//     `classifyRunLiveness` returns `"failed"` for every non-`succeeded` run and
+//     never returns null, so a liveness test disqualifies the population it was
+//     written to catch.
+//
+// The bias is `isNeverInvokedRun`'s: prefer counting. Wrongly excluding a run
+// recreates BLO-26165's fleet-wide false negative (a genuinely silent agent
+// reads clean); wrongly counting one produces a review a manager can dismiss
+// from the evidence block. A closed enumerated set is the only shape that keeps
+// that bias honest — no heuristic, no inference.
+export function isInfraClassErrorCodeRun(run: Pick<NeverExecutedRunInput, "errorCode">): boolean {
+  return ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES.has(run.errorCode ?? "");
+}
+
 // True when a run's most recent classification is `failed` liveness AND it
 // burned zero input+output tokens. That combination means the agent never
 // got a model turn — the runtime crashed, the process was killed, or every

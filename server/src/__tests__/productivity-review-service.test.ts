@@ -39,6 +39,7 @@ import {
 import { logActivity } from "../services/activity-log.js";
 import { RECOVERY_ORIGIN_KINDS } from "../services/recovery/origins.js";
 import { PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST } from "../services/pull-request-work-products.js";
+import { terminalGateResolutionIdempotencyKey } from "../services/terminal-gate-reconciler.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -1702,6 +1703,267 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
   });
 
+
+  // BLO-36535: the measured BLO-32472 window — 34 terminal issue-linked runs,
+  // 34 of them infra-class by `errorCode`, zero application failures. Every one
+  // burned real tokens before the kill (the worst at 20,957 output tokens /
+  // $4.92, then a provider 403 on the `org_penstock` seat entitlement), so
+  // `isInfraFailureRun`'s zero-token test reads false for all of them and
+  // pre-fix the whole window landed in the `no_comment_streak` numerator as
+  // conduct. `runtime_failure_streak` does not catch them either — it outranks
+  // this trigger in the ladder but keys on the same zero-token signature — so
+  // the population fell between the two buckets and silently landed in the
+  // conduct one. The streak reached 13 against a threshold of 10 and re-fired
+  // on the same non-signal; adjudication closed "close as productive".
+  //
+  // Non-zero `outputTokens` is load-bearing in every group: a zero-token
+  // fixture passes against the PRE-fix code and would prove nothing.
+  //
+  // Spacing is 2.5h to model the real ~3-day window rather than compress it.
+  // 34 runs inside an hour would trip `high_churn` instead, and "no review is
+  // generated" would then pass for the wrong reason.
+  it("generates no productivity review for a window that is entirely infra-killed turn-executing runs (BLO-36535 / BLO-32472 replay)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const spacingMs = 2.5 * 60 * 60 * 1000;
+    const base = { companyId: seeded.companyId, agentId: seeded.coderId, issueId: seeded.issueId };
+    // The five error codes measured on BLO-32472, in their measured counts.
+    // Every one is already enumerated in the shared infra-class set the
+    // recovery router reads, which is the point: the platform had classified
+    // this cause as infra on the review row while the trigger billed it to the
+    // assignee.
+    const window: Array<{ count: number; errorCode: string; usageJson: Record<string, number> }> = [
+      { count: 18, errorCode: "adapter_failed", usageJson: { inputTokens: 148_221, outputTokens: 20_957 } },
+      { count: 12, errorCode: "rate_limit_exhausted", usageJson: { inputTokens: 61_004, outputTokens: 8_313 } },
+      { count: 2, errorCode: "job_failed", usageJson: { inputTokens: 12_880, outputTokens: 1_904 } },
+      { count: 1, errorCode: "provider_throttled_no_progress", usageJson: { inputTokens: 9_221, outputTokens: 742 } },
+      { count: 1, errorCode: "k8s_pod_schedule_failed", usageJson: { inputTokens: 7_508, outputTokens: 611 } },
+    ];
+    let offset = 0;
+    for (const group of window) {
+      await insertRuns({
+        ...base,
+        count: group.count,
+        now: new Date(now.getTime() - offset * spacingMs),
+        spacingMs,
+        status: "failed",
+        livenessState: "failed",
+        usageJson: group.usageJson,
+        errorCode: group.errorCode,
+      });
+      offset += group.count;
+    }
+    expect(offset).toBe(34);
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // BLO-36535: the walk semantics, stated as a test rather than left to be
+  // rediscovered. Infra-killed runs are excluded from `noCommentEligibleRuns`,
+  // NOT treated as streak-breakers — so genuine silence on either side of an
+  // infra gap bridges into one contiguous streak of 10 rather than being cut
+  // into two runs of 5. That is the correct reading: an infra outage in the
+  // middle of a silent stretch is not evidence the agent spoke.
+  //
+  // This assertion pins BOTH failure directions at once. Pre-fix the streak
+  // reads 14 (the gap counted as silence); a filter that broke the walk instead
+  // of bridging it would read 5. Only bridging reads 10.
+  it("bridges genuine silence either side of an infra-killed gap and reports the excluded count (BLO-36535)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const base = { companyId: seeded.companyId, agentId: seeded.coderId, issueId: seeded.issueId };
+    // Newest: 5 runs that executed and stayed silent.
+    await insertRuns({ ...base, count: 5, now });
+    // Middle: 4 infra-killed runs that DID execute a turn (real tokens).
+    await insertRuns({
+      ...base,
+      count: 4,
+      now: new Date(now.getTime() - 5 * 60_000),
+      status: "failed",
+      livenessState: "failed",
+      usageJson: { inputTokens: 148_221, outputTokens: 20_957 },
+      errorCode: "adapter_failed",
+    });
+    // Oldest: 5 more silent executed runs.
+    await insertRuns({ ...base, count: 5, now: new Date(now.getTime() - 9 * 60_000) });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
+    // The excluded population is reported, not dropped (the BLO-27698 B3b
+    // shape): a manager reading a streak of 10 alongside this count can see
+    // that 4 further runs in the window were taken by infrastructure.
+    expect(reviews[0]?.description).toContain(
+      "Infra-killed runs excluded (terminal, executed a turn then died of an infrastructure fault — `errorCode` in the shared infra-class set, BLO-36535): 4",
+    );
+    // Disjoint from the zero-token populations by construction — these runs
+    // burned tokens, so neither of those counts moves.
+    expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 0");
+    expect(reviews[0]?.description).toContain("Never-invoked runs excluded (terminal, no adapter ever created");
+  });
+
+  // BLO-36535, Ally review on #2040: the exclusion must not swallow a run that
+  // SPOKE. The walk breaks only on `commentRunIds.has(run.id)`, so a run removed
+  // from `noCommentEligibleRuns` is never tested and can no longer break the
+  // streak. This population is the first excluded one that CAN have commented —
+  // the two zero-token exclusions above provably never got a turn — so the
+  // guard is needed here and only here.
+  //
+  // The seeded ordering (comment posted, run killed later) is the modal shape on
+  // this fleet: the run-comment protocol has agents post before continuing to
+  // work, so an `adapter_failed` 403 lands after the comment, not before.
+  //
+  // Without the `&& !commentRunIds.has(run.id)` guard the streak bridges across
+  // the commenting run and reads 14, firing `no_comment_streak` against an agent
+  // that demonstrably spoke 6 runs ago — the same conduct false positive this
+  // change exists to remove, in the same direction.
+  it("lets an infra-killed run that DID comment break the no-comment streak (BLO-36535)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    // 10m spacing, not the 1m default: 15 runs packed into 15 minutes trips
+    // `high_churn` (10/1h) and a review is created on THAT trigger, which would
+    // make this test pass for the wrong reason pre-fix. Spread out, the only
+    // trigger that can fire here is the one under test.
+    const base = {
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      spacingMs: 600_000,
+    };
+    // Newest: 5 runs that executed and stayed silent.
+    await insertRuns({ ...base, count: 5, now });
+    // The breaker: executed a turn, POSTED ITS RUN COMMENT, then died on a 403.
+    await insertRuns({
+      ...base,
+      count: 1,
+      now: new Date(now.getTime() - 50 * 60_000),
+      status: "failed",
+      livenessState: "failed",
+      usageJson: { inputTokens: 148_221, outputTokens: 20_957 },
+      errorCode: "adapter_failed",
+      withRunComments: true,
+    });
+    // Oldest: 9 more silent executed runs, enough that bridging crosses the
+    // threshold of 10 while breaking correctly stops at 5.
+    await insertRuns({ ...base, count: 9, now: new Date(now.getTime() - 60 * 60_000) });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // BLO-36535, Ally review on #2040: the reported count must stay equal to what
+  // was actually excluded. A commenting infra run is not an exclusion — it is
+  // evidence — so it must be absent from `infraClassKilledRunCount` too, and the
+  // streak must stop at it rather than bridging (11, not 20).
+  it("excludes a commenting infra-killed run from the reported excluded count (BLO-36535)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const base = {
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      spacingMs: 600_000,
+    };
+    await insertRuns({ ...base, count: 11, now });
+    await insertRuns({
+      ...base,
+      count: 1,
+      now: new Date(now.getTime() - 110 * 60_000),
+      status: "failed",
+      livenessState: "failed",
+      usageJson: { inputTokens: 148_221, outputTokens: 20_957 },
+      errorCode: "adapter_failed",
+      withRunComments: true,
+    });
+    await insertRuns({ ...base, count: 9, now: new Date(now.getTime() - 120 * 60_000) });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+    // 11, not 20: the walk stopped at the commenting run instead of bridging it.
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 11");
+    // 0, not 1: a run that spoke is not counted as taken by infrastructure.
+    expect(reviews[0]?.description).toContain(
+      "Infra-killed runs excluded (terminal, executed a turn then died of an infrastructure fault — `errorCode` in the shared infra-class set, BLO-36535): 0",
+    );
+  });
+
+  // BLO-36535 negative control, pinning the over-exclusion direction.
+  // `claude_truncated` is matched by `isInfraClassStrandedFailure`'s MESSAGE arm
+  // in recovery/service.ts, which is documented audit-only there — a truncated
+  // run executed a long turn and could have commented. The exclusion keys on
+  // `errorCode` membership only, so this run stays in the numerator.
+  it("keeps a claude_truncated run with real tokens in the no-comment streak — code arm only, never the message arm (BLO-36535)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      status: "failed",
+      livenessState: "failed",
+      usageJson: { inputTokens: 92_400, outputTokens: 14_118 },
+      errorCode: "claude_truncated",
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
+    expect(reviews[0]?.description).toContain(
+      "Infra-killed runs excluded (terminal, executed a turn then died of an infrastructure fault — `errorCode` in the shared infra-class set, BLO-36535): 0",
+    );
+  });
+
+  // BLO-36535 negative control, pinning BLO-26165's false negative shut: an
+  // application-class `errorCode` is not in the infra set, so a run that
+  // executed and failed on its own merits still counts as silence. The sibling
+  // case — `errorCode` null entirely — is covered by the BLO-21769 positive
+  // control above. `"unknown"` is a real observed value, not a stand-in for a
+  // missing code (BLO-21769).
+  it("keeps an application-failure run with real tokens in the no-comment streak (BLO-36535 negative control)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      status: "failed",
+      livenessState: "failed",
+      usageJson: { inputTokens: 4_180, outputTokens: 903 },
+      errorCode: "unknown",
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
+  });
   // BLO-26165 / BLO-23096: the 25-run `preferred_workspace_unrealizable`
   // streak that produced the false-positive review this issue was opened for.
   // Nothing capable of writing a comment ever existed, so the assignee-facing
@@ -10158,5 +10420,223 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.failed).toBe(0);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.requestDepth).toBe(MAX_ISSUE_REQUEST_DEPTH);
+  });
+
+  // BLO-27515: the exact BLO-24166 shape. The monitor's declared gate
+  // (`pr:blockcast/paperclip#1281:merged`) was satisfied 16 minutes after its
+  // last poll, polling had already stopped, and the review then fired at the 6h
+  // mark on an issue whose work had landed 2.5 days earlier. The terminal-gate
+  // reconciler records the resolution board-side; generation must consume that
+  // record and file nothing.
+  async function armTerminatedGateMonitor(input: { issueId: string; gateSignals: string[] }) {
+    await db
+      .update(issues)
+      .set({
+        monitorNextCheckAt: null,
+        monitorScheduledBy: "assignee",
+        monitorLastTriggeredAt: new Date("2026-04-28T05:00:00.000Z"),
+        monitorAttemptCount: 3,
+        executionState: {
+          status: "idle",
+          currentStageId: null,
+          currentStageIndex: null,
+          currentStageType: null,
+          currentParticipant: null,
+          returnAssignee: null,
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          monitor: {
+            status: "triggered",
+            nextCheckAt: null,
+            lastTriggeredAt: "2026-04-28T05:00:00.000Z",
+            attemptCount: 3,
+            notes: "merged=NO",
+            scheduledBy: "assignee",
+            gateSignals: input.gateSignals,
+            gateSource: "gates",
+            convergenceCount: 3,
+            clearedAt: null,
+            clearReason: null,
+          },
+        } as never,
+      })
+      .where(eq(issues.id, input.issueId));
+    for (const signal of input.gateSignals) {
+      const match = /^pr:([^:]+):[a-z0-9_-]+$/.exec(signal);
+      if (!match) continue;
+      await db.insert(issueWorkProducts).values({
+        companyId: (await db.select({ companyId: issues.companyId }).from(issues).where(eq(issues.id, input.issueId)))[0]!.companyId,
+        issueId: input.issueId,
+        type: "pull_request",
+        provider: "github",
+        externalId: match[1],
+        title: match[1],
+        status: "merged",
+        metadata: { source: "github_pull_request_webhook" },
+        sourceTrust: {
+          preset: "standard",
+          disposition: "promoted",
+          promotedByActorType: "system",
+          promotedByActorId: "github_pull_request_webhook",
+        },
+      });
+    }
+  }
+
+  async function recordTerminalGateResolution(input: {
+    companyId: string;
+    issueId: string;
+    gateSignals: string[];
+  }) {
+    await db.insert(issueComments).values({
+      companyId: input.companyId,
+      issueId: input.issueId,
+      authorType: "system",
+      idempotencyKey: terminalGateResolutionIdempotencyKey(input.gateSignals),
+      body: "Terminal gate resolved (test fixture).",
+    });
+  }
+
+  it("does not file a long_active_duration review when the terminal gate is already resolved (BLO-27515)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    const gateSignals = ["pr:blockcast/paperclip#1281:merged"];
+    await armTerminatedGateMonitor({ issueId: seeded.issueId, gateSignals });
+    await recordTerminalGateResolution({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      gateSignals,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    // Countable on its own, like every other suppression: a silenced review that
+    // is invisible is the failure mode this whole area keeps relearning.
+    expect(result.terminalGateResolvedSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+
+    const suppressions = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_suppressed"));
+    expect(suppressions).toHaveLength(1);
+    expect((suppressions[0]?.details as { suppressedBy?: string })?.suppressedBy)
+      .toBe("terminal_gate_resolved");
+  });
+
+  it("still files the review when the same monitor gate has NOT been resolved (BLO-27515)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await armTerminatedGateMonitor({
+      issueId: seeded.issueId,
+      gateSignals: ["pr:blockcast/paperclip#1281:merged"],
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.terminalGateResolvedSuppressed).toBe(0);
+    expect(result.created).toBe(1);
+  });
+
+  it("does not let a resolution recorded for a different gate set suppress the review (BLO-27515)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await armTerminatedGateMonitor({
+      issueId: seeded.issueId,
+      gateSignals: ["pr:blockcast/paperclip#1281:merged"],
+    });
+    // A re-arm on a new gate leaves the old resolution comment behind. It must
+    // stop matching, or oversight never resumes.
+    await recordTerminalGateResolution({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      gateSignals: ["pr:blockcast/paperclip#1400:merged"],
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.terminalGateResolvedSuppressed).toBe(0);
+    expect(result.created).toBe(1);
+  });
+
+  it("still files when a non-closable trigger co-fires with long_active_duration under a resolved gate (BLO-27515)", async () => {
+    // A resolved gate explains elapsed wall-clock. It does not explain runs that
+    // executed and burned cost, so `high_churn` evidence must survive it — the
+    // same evasion `isDependencyBlockedClosableTriggerSet` refuses.
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    const gateSignals = ["pr:blockcast/paperclip#1281:merged"];
+    await armTerminatedGateMonitor({ issueId: seeded.issueId, gateSignals });
+    await recordTerminalGateResolution({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      gateSignals,
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      withRunComments: true,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.terminalGateResolvedSuppressed).toBe(0);
+    expect(result.created).toBe(1);
+  });
+
+  it("resumes long-active oversight after the terminal-gate quiet window expires (BLO-27515)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    const gateSignals = ["pr:blockcast/paperclip#1281:merged"];
+    await armTerminatedGateMonitor({ issueId: seeded.issueId, gateSignals });
+    await db.insert(issueComments).values({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      authorType: "system",
+      idempotencyKey: terminalGateResolutionIdempotencyKey(gateSignals),
+      body: "Terminal gate resolved.",
+      createdAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.terminalGateResolvedSuppressed).toBe(0);
+    expect(result.created).toBe(1);
   });
 });

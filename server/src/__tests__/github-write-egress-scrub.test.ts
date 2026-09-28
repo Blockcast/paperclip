@@ -1,8 +1,14 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { generateKeyPairSync } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import {
+  productionFilesImportingTestHelpers,
+  serverFilesWritingToGitHub,
+  serverSourceFiles,
+} from "./helpers/github-writer-derivation.js";
 
 /**
  * PEN-3157: the egress scrub must be on the path of every server-side GitHub
@@ -328,6 +334,148 @@ describe("githubPostCheckRun egress scrub", () => {
   });
 });
 
+describe("identity fields are refused, not redacted (PEN-3391)", () => {
+  /**
+   * PEN-3391 done-when 3/4: `context` was scrubbed on the way out while the
+   * delivery outbox keyed its upsert on the RAW value and
+   * `githubGetLatestCommitStatusForContext` filtered on the RAW value. Had a
+   * context ever matched a detector, the status would have been published under
+   * a redacted name while every lookup used the unredacted one — the gate
+   * unable to observe its own status.
+   *
+   * The resolution is neither "scrub everywhere" nor "exempt it": the write is
+   * REFUSED when the identity would change. That keeps the leak closed AND
+   * makes publish/lookup agreement structural — the write proceeds only when
+   * the scrub is a no-op, so a caller keying on the raw value is provably
+   * keying on what was published.
+   *
+   * These tests exist so a later "make the scrub consistent" refactor cannot
+   * silently flip it back. The row asked for exactly that pin.
+   */
+  it("refuses a commit status whose context carries credential-shaped material", async () => {
+    setCreds();
+    const fetchMock = stubGitHub();
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const result = await githubPostCommitStatusDetailed({
+      repoFullName: REPO,
+      sha: SHA,
+      context: `review/${FAKE_GITHUB_PAT}`,
+      state: "success",
+      description: "ok",
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      retryable: false,
+      reason: "commit_status_context_not_publishable",
+    });
+    // Nothing was published — not a redacted status, nothing at all.
+    expect(
+      fetchMock.mock.calls.filter(([url]) => String(url).includes("/statuses/")),
+      "a status was published despite the refusal",
+    ).toHaveLength(0);
+    // Non-retryable is load-bearing: the same input scrubs the same way every
+    // time, so a retrying caller would spin forever on a configuration bug.
+    expect(errorSpy).toHaveBeenCalled();
+    const logged = String(errorSpy.mock.calls[0]?.[0] ?? "");
+    expect(logged).toContain("REFUSED");
+    // The log must name the classes, never the matched text — quoting it would
+    // re-publish the secret into the transcripts PEN-3139 is narrowing.
+    expect(logged).not.toContain(FAKE_GITHUB_PAT);
+  });
+
+  it("refuses a check-run whose name carries credential-shaped material", async () => {
+    setCreds();
+    const fetchMock = stubGitHub();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const result = await githubPostCheckRun({
+      repoFullName: REPO,
+      sha: SHA,
+      name: `verify-${FAKE_AWS_KEY_ID}`,
+      conclusion: "success",
+      title: "t",
+      summary: "s",
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      retryable: false,
+      reason: "check_run_name_not_publishable",
+    });
+    expect(
+      fetchMock.mock.calls.filter(([url]) => String(url).includes("/check-runs")),
+    ).toHaveLength(0);
+  });
+
+  it("publishes an ordinary context and name byte-for-byte, so lookups still match", async () => {
+    // The other half of the pin, and the one that makes the refusal safe to
+    // ship: the overwhelmingly common path must be untouched. A required
+    // context is matched by exact string, so any rewriting here — including a
+    // well-meaning normalisation — breaks branch protection silently.
+    setCreds();
+    const fetchMock = stubGitHub();
+
+    await expect(
+      githubPostCommitStatusDetailed({
+        repoFullName: REPO,
+        sha: SHA,
+        context: "review/ally-complete",
+        state: "success",
+        description: "Ally reviewed this head, clean.",
+      }),
+    ).resolves.toEqual({ ok: true, statusCode: 201 });
+
+    expect(writtenBody(fetchMock).context).toBe("review/ally-complete");
+  });
+
+  it("keeps the outbox key and the lookup filter equal to what was published", () => {
+    // The disagreement PEN-3391 names is between three sites, so pin the
+    // invariant that ties them rather than restating one of them: the outbox
+    // persists `input.context` verbatim and the lookup filters on
+    // `input.context`, and both are now correct precisely because the write
+    // helper publishes `input.context` unchanged or not at all.
+    const appAuth = readFileSync(
+      path.join(repoRoot, "server/src/services/github-app-auth.ts"),
+      "utf8",
+    );
+    const statusHelper = appAuth.slice(
+      appAuth.indexOf("export async function githubPostCommitStatusDetailed"),
+    );
+    // Refused, not redacted. If someone reintroduces the scrub here, the outbox
+    // key and the published context diverge again — and this fails.
+    expect(statusHelper).not.toContain('scrubOutboundGitHubText(input.context');
+    expect(statusHelper).toContain('gitHubIdentityFieldRedaction(input.context');
+
+    const lookupHelper = appAuth.slice(
+      appAuth.indexOf("export async function githubGetLatestCommitStatusForContext"),
+    );
+    expect(lookupHelper).toContain("status.context === input.context");
+
+    const outbox = readFileSync(
+      path.join(repoRoot, "server/src/services/github-status-delivery-outbox.ts"),
+      "utf8",
+    );
+    expect(outbox).toContain("context: input.context");
+  });
+
+  it("applies the same refusal to the one writer outside the shared helper", () => {
+    // github-review-gate-authority.ts builds its own request, so it is the
+    // place a per-call-site control goes stale. It scrubs its prose fields and
+    // must refuse on its identity field, exactly like the shared helper.
+    const authority = readFileSync(
+      path.join(repoRoot, "server/src/services/github-review-gate-authority.ts"),
+      "utf8",
+    );
+    expect(authority).toContain("gitHubIdentityFieldRedaction(input.row.statusContext");
+    expect(authority).not.toContain("scrubOutboundGitHubText(input.row.statusContext");
+    // Its prose fields stay scrubbed — the refusal narrows nothing.
+    expect(authority).toContain('"commit-status description"');
+    expect(authority).toContain('"commit-status target_url"');
+  });
+});
+
 describe("the scrub is reachable from server/ at all", () => {
   it("is exported from the adapter-utils barrel", () => {
     // The mechanical fact PEN-3157 turned on: `server/` imports the package by
@@ -358,9 +506,10 @@ describe("the scrub is reachable from server/ at all", () => {
 
   it("leaves no server-side GitHub writer outside the scrub", () => {
     // Derived from source at file granularity, the same way PEN-3152's outbound
-    // coverage table derives its writer set: a `ghFetch(` call plus a mutating
-    // method. A NEW file that starts writing to GitHub fails here until it
-    // either routes through the shared helpers or calls the scrub itself.
+    // coverage table derives its writer set — and now from the SAME function, in
+    // `helpers/github-writer-derivation.ts`. The two copies were byte-identical
+    // and were widened by hand in lockstep once already (PEN-3157); PEN-3391
+    // extracted them so the next widening cannot reach only one.
     //
     // Enumerate-then-filter rather than grepping for an expected name: a
     // pathspec that matches nothing returns the same empty set as "everything
@@ -373,30 +522,53 @@ describe("the scrub is reachable from server/ at all", () => {
     // outside it, so a new `ghFetch`-based write in either would ship
     // unscrubbed with this test green. Widening it finds the same two writers
     // today — the gap was in what the guard could see, not in what it covered.
+    //
+    // PEN-3391 fixed the second half of that same shape: the walk saw every
+    // file, but the PREDICATE recognised only `ghFetch(` plus an inline
+    // double-quoted upper-case method, so an aliased call or a `'post'` was
+    // classified as a read and never checked. It is now fail-closed — a
+    // candidate must be PROVABLY read-only — and the alphabet it accepts is
+    // pinned by a fail-first suite next to the helper.
     const serverSrc = path.join(repoRoot, "server/src");
-    const scanned = readdirSync(serverSrc, { recursive: true, encoding: "utf8" })
-      .map((entry) => entry.split(path.sep).join("/"))
-      .filter((entry) => entry.endsWith(".ts") && !entry.endsWith(".test.ts"));
+    const scanned = serverSourceFiles(serverSrc);
 
     // Scope control. A non-recursive regression still finds both writers below
     // (they sit directly in `services/`), so the only thing that catches it is
     // asserting the walk reaches a file it could not otherwise see.
     expect(scanned).toContain("routes/github-webhook.ts");
 
-    const writers = scanned.filter((entry) => {
-      const source = readFileSync(path.join(serverSrc, entry), "utf8");
-      if (!source.includes("ghFetch(")) return false;
-      return /method:\s*"(?:POST|PATCH|PUT|DELETE)"/.test(source);
-    });
+    // The walk skips `__tests__/` so the derivation helper does not classify
+    // itself. That is sound only while the running server imports nothing from
+    // there, which is checked rather than assumed (PEN-3391).
+    expect(
+      productionFilesImportingTestHelpers(serverSrc),
+      "a production file imports from __tests__/, so skipping it no longer excludes only test code",
+    ).toEqual([]);
+
+    const writers = serverFilesWritingToGitHub(serverSrc);
     // Positive control: the derivation must actually find the file we know
     // writes, or an empty `writers` would make the assertion below vacuous.
+    // The predicate's own alphabet — aliased calls, non-literal methods — is
+    // pinned separately in `helpers/github-writer-derivation.test.ts`, because
+    // a positive control over the tree can only prove it finds TODAY's writers.
     expect(writers).toContain("services/github-app-auth.ts");
 
     for (const writer of writers) {
       const source = readFileSync(path.join(serverSrc, writer), "utf8");
-      expect(source, `${writer} writes to GitHub without reaching the egress scrub`).toContain(
-        "scrubOutboundGitHubText",
-      );
+      // The message has to describe what was actually measured, not what is
+      // most likely. The predicate is fail-closed, so a hit means "this scan
+      // could not PROVE this is read-only" — which includes the false-positive
+      // case of a file that merely says "method" somewhere. Reporting that as
+      // "writes to GitHub" would send someone hunting for a write that is not
+      // there, and the obvious way to make such a failure go away is to weaken
+      // the guard. So name the remedy for both cases.
+      expect(
+        source,
+        `${writer} references ghFetch and this scan cannot prove it is read-only, so it must ` +
+          `call scrubOutboundGitHubText. If it genuinely does not write, pin every \`method\` to ` +
+          `a quoted GET/HEAD/OPTIONS literal — see __tests__/helpers/github-writer-derivation.ts ` +
+          `for why the predicate errs in this direction.`,
+      ).toContain("scrubOutboundGitHubText");
     }
   });
 });

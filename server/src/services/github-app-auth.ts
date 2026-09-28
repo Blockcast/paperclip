@@ -277,6 +277,178 @@ export async function githubGetPullRequestGate(input: {
   return { state: body.state, merged: body.merged === true };
 }
 
+export type OpenPullRequestOnBase = {
+  number: number;
+  title: string | null;
+  url: string | null;
+  headRef: string | null;
+};
+
+export type OpenPullRequestsOnBaseResult =
+  | { pullRequests: OpenPullRequestOnBase[]; truncated: boolean }
+  | { error: string };
+
+const OPEN_PRS_ON_BASE_PAGE_SIZE = 100;
+
+/**
+ * Pure payload parse, split from the fetch so the decision logic is testable
+ * without network or credentials — the same injection-seam reasoning as
+ * `ReadPullRequestGate` in the terminal-gate reconciler.
+ */
+export function parseOpenPullRequestsOnBasePayload(body: unknown): OpenPullRequestsOnBaseResult {
+  // A non-array body is not an empty page. Treating it as one would report a
+  // confident "this branch had no stacked children" for a response we could not
+  // read at all — the same false all-clear `listOpenPullRequests` refuses.
+  if (!Array.isArray(body)) return { error: "open_pull_requests_malformed" };
+
+  const pullRequests: OpenPullRequestOnBase[] = [];
+  for (const entry of body as Array<Record<string, unknown>>) {
+    const number = entry?.number;
+    if (!Number.isInteger(number)) continue;
+    const head = entry?.head as Record<string, unknown> | undefined;
+    pullRequests.push({
+      number: number as number,
+      title: typeof entry?.title === "string" ? entry.title : null,
+      url: typeof entry?.html_url === "string" ? entry.html_url : null,
+      headRef: typeof head?.ref === "string" ? head.ref : null,
+    });
+  }
+  // One page is the whole answer for any real stacked chain. Surface the cap
+  // anyway: a full page means "there may be more", which is a different claim
+  // from "these are all of them", and a silent prefix reads as the latter.
+  return { pullRequests, truncated: body.length >= OPEN_PRS_ON_BASE_PAGE_SIZE };
+}
+
+/**
+ * Open PRs targeting `baseRef` — the stacked children of a branch (BLO-29856).
+ *
+ * Uses GitHub's own `?base=` filter rather than enumerating every open PR and
+ * filtering client-side. A stacked chain is a handful of PRs, so the server-side
+ * filter is one request instead of one per 100 open PRs in the repo.
+ *
+ * Fails closed. An unreadable enumeration is NOT an empty one, and the caller
+ * must be able to tell those apart: coercing a failed read to "no stacked
+ * children" reproduces exactly the silent no-wake this lookup exists to break.
+ */
+export async function githubListOpenPullRequestsByBase(input: {
+  repoFullName: string;
+  baseRef: string;
+  signal?: AbortSignal;
+}): Promise<OpenPullRequestsOnBaseResult> {
+  const tokenResult = await getInstallationTokenResult();
+  if (!tokenResult.ok) return { error: tokenResult.reason };
+
+  const url =
+    `${gitHubApiBase(GITHUB_HOST)}/repos/${input.repoFullName}/pulls` +
+    `?state=open&per_page=${OPEN_PRS_ON_BASE_PAGE_SIZE}&base=${encodeURIComponent(input.baseRef)}`;
+  let res: Response;
+  try {
+    res = await ghFetch(url, {
+      headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` },
+      signal: input.signal,
+    });
+  } catch {
+    return { error: "open_pull_requests_fetch_failed" };
+  }
+  if (!res.ok) {
+    const classified = await classifyGithubHttpFailure("pull_request", res);
+    return { error: classified.reason };
+  }
+  return parseOpenPullRequestsOnBasePayload(await res.json().catch(() => null));
+}
+
+export type BranchState = "exists" | "deleted" | "unknown";
+
+/**
+ * Does `branch` still exist? (BLO-29856)
+ *
+ * Disambiguates an empty stacked-child enumeration. When a merged PR's head
+ * branch is deleted (`delete_branch_on_merge`, or the "Delete branch" button),
+ * GitHub auto-retargets every PR based on it. Those children no longer match
+ * `?base=<merged head>`, so the enumeration returns nothing, and the retarget
+ * is bare with no rebase: the exact state a rewriting merge makes unsafe.
+ *
+ * 404 reads as `deleted`: callers have just read this repository's pulls with
+ * the same token, so the repository itself is visible. Any other unreadable
+ * answer is `unknown`, never `exists`, so a failed read cannot pass for proof
+ * that the empty enumeration was the whole story.
+ */
+export async function githubResolveBranchState(input: {
+  repoFullName: string;
+  branch: string;
+  signal?: AbortSignal;
+}): Promise<BranchState> {
+  const tokenResult = await getInstallationTokenResult();
+  if (!tokenResult.ok) return "unknown";
+  try {
+    const res = await ghFetch(
+      `${gitHubApiBase(GITHUB_HOST)}/repos/${input.repoFullName}/branches/${encodeURIComponent(input.branch)}`,
+      {
+        headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` },
+        signal: input.signal,
+      },
+    );
+    if (res.ok) return "exists";
+    return res.status === 404 ? "deleted" : "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+/**
+ * Did the merge preserve the base PR's commit SHAs, or rewrite them? (BLO-29856)
+ *
+ * This decides what a stacked child must be told to do, and the two answers take
+ * opposite actions:
+ *
+ *  - `merge_commit` — the base's commits are on the target branch under their
+ *    original SHAs, so the child's base SHA is still an ancestor and a bare
+ *    retarget is clean.
+ *  - `rewritten` — rebase-merge and squash-merge both land the base's work under
+ *    NEW SHAs. The child's old base is no longer an ancestor, so retargeting
+ *    alone REPLAYS the base PR's entire diff into the child. It needs a rebase.
+ *
+ * Derived from the merge commit's parent count, the only signal GitHub gives:
+ * `pull_request.closed` carries no `merge_method`, and a repo's enabled merge
+ * methods say what was *allowed*, not what was *used*. Two parents is a true
+ * merge commit; one parent is squash or rebase. Squash and rebase are
+ * deliberately NOT told apart — they have the same consequence for a child.
+ *
+ * `unknown` on any read failure, and the caller must say so rather than guess.
+ * Recommending a bare retarget after a rebase is the specific trap this exists
+ * to stop, so an unverified guess in that direction is worse than no advice.
+ */
+export type MergeHistoryShape = "merge_commit" | "rewritten" | "unknown";
+
+/** Pure half of `githubResolveMergeHistoryShape`, split so it is testable without network. */
+export function parseMergeHistoryShape(body: unknown): MergeHistoryShape {
+  const parents = (body as { parents?: unknown } | null)?.parents;
+  if (!Array.isArray(parents)) return "unknown";
+  return parents.length >= 2 ? "merge_commit" : "rewritten";
+}
+
+export async function githubResolveMergeHistoryShape(input: {
+  repoFullName: string;
+  mergeCommitSha: string;
+  signal?: AbortSignal;
+}): Promise<MergeHistoryShape> {
+  const tokenResult = await getInstallationTokenResult();
+  if (!tokenResult.ok) return "unknown";
+  try {
+    const res = await ghFetch(
+      `${gitHubApiBase(GITHUB_HOST)}/repos/${input.repoFullName}/commits/${input.mergeCommitSha}`,
+      {
+        headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` },
+        signal: input.signal,
+      },
+    );
+    if (!res.ok) return "unknown";
+    return parseMergeHistoryShape(await res.json().catch(() => null));
+  } catch {
+    return "unknown";
+  }
+}
+
 /**
  * Terminal-state lookup for a single Actions run, used to decide whether a board
  * approval card that points at that run is still worth a human's attention.
@@ -1233,6 +1405,72 @@ export function scrubOutboundGitHubText(value: string, field: string): string {
 }
 
 /**
+ * Guard an **identity** field bound for GitHub: refuse the write rather than
+ * redact it (PEN-3391).
+ *
+ * ## Why identity fields are not scrubbed like prose
+ *
+ * `scrubOutboundGitHubText` redacts and proceeds. That is right for prose — a
+ * commit-status `description`, a check-run `summary` — where a redacted string
+ * is a degraded but still-serviceable version of the same message.
+ *
+ * It is wrong for a field that is a NAME. A commit status is addressed by
+ * `(repo, sha, context)` and a check-run by `(repo, sha, name)`; those values
+ * are what branch protection matches a required check against, what
+ * `githubGetLatestCommitStatusForContext` filters on, and what the delivery
+ * outbox keys its upsert on. Redacting one does not degrade the identity, it
+ * substitutes a DIFFERENT one. The status would be published under a name
+ * nothing looks up: branch protection would go on waiting for a context that
+ * will never arrive, the outbox would key its row on the unredacted value it
+ * was handed, and the gate would be unable to observe its own status. That is a
+ * silent gate-liveness failure — the control stays green while the thing it
+ * gates is stuck.
+ *
+ * PEN-3157 already reached this conclusion at the enqueue boundary, where it
+ * declined to scrub `context` because doing so "would risk the delivery
+ * identity". The same argument holds at the send boundary; it just bites later.
+ * The code did both things and justified only one, which is what PEN-3391 was
+ * filed to settle.
+ *
+ * ## Why refuse rather than simply exempt the field
+ *
+ * Exempting it (leaving `context` unscrubbed) would restore the leak the scrub
+ * exists to prevent: commit-status contexts are public on a public repo.
+ * Refusing keeps both properties at once —
+ *
+ * - **nothing leaks**, because a credential-bearing identity is never published; and
+ * - **publish and lookup cannot disagree**, because the write proceeds only
+ *   when the scrub is a byte-for-byte no-op. Callers may therefore keep using
+ *   the raw value as a key, and are provably keying on what was published.
+ *
+ * The refusal is deterministic: the same input scrubs the same way every time,
+ * so a retry cannot succeed. That is a property of this function, not a
+ * guarantee that callers stop retrying. The review-gate delivery loop
+ * (`github-review-gate-authority.ts`) re-queues every non-ok result with
+ * backoff and has no terminal failure state, so a refused context there is
+ * retried indefinitely, as `review_gate_persisted_payload_invalid` and
+ * `review_gate_pull_payload_invalid` already are (PEN-3504). It is logged at
+ * `error` rather than `warn` because, unlike a redaction, no write happened.
+ *
+ * A caller reaching this has a configuration bug — every context in this repo
+ * is a fixed operator-set literal — so the refusal is a loud stop, not a
+ * degradation path.
+ *
+ * @returns the detected classes when the write must be refused, or `null` when
+ *          the field is publishable unchanged.
+ */
+export function gitHubIdentityFieldRedaction(value: string, field: string): string[] | null {
+  const result = scrubGitHubEgressText(value);
+  if (!result.redacted) return null;
+  console.error(
+    `[github-egress] REFUSED an outbound GitHub write: the ${field} is an identity field and ` +
+      `credential-shaped material was detected in it (${result.classes.join(", ")}). Nothing was ` +
+      `published — redacting it would address the status to a name no lookup can find.`,
+  );
+  return result.classes;
+}
+
+/**
  * Post a commit status as the GitHub App with a classified result so callers
  * can retry transient failures and surface permanent configuration/permission
  * failures separately.
@@ -1261,7 +1499,14 @@ export async function githubPostCommitStatusDetailed(input: {
   const description = input.description
     ? scrubOutboundGitHubText(input.description, "commit-status description").slice(0, 140)
     : undefined;
-  const context = scrubOutboundGitHubText(input.context, "commit-status context");
+  // `context` is the status's IDENTITY, not prose: branch protection matches a
+  // required check on it and `githubGetLatestCommitStatusForContext` filters on
+  // it. Refuse rather than redact, so publish and lookup cannot disagree — see
+  // `gitHubIdentityFieldRedaction` (PEN-3391).
+  if (gitHubIdentityFieldRedaction(input.context, "commit-status context")) {
+    return { ok: false, retryable: false, reason: "commit_status_context_not_publishable" };
+  }
+  const context = input.context;
   const targetUrl = input.targetUrl
     ? scrubOutboundGitHubText(input.targetUrl, "commit-status target_url")
     : input.targetUrl;
@@ -1330,7 +1575,13 @@ export async function githubPostCheckRun(input: {
   // and a check-run has no 140-char cap — so it publishes MORE of it. Scrubbed
   // here like every other free-text field this file writes, so the helper's
   // callers inherit the control rather than each remembering it (PEN-3157).
-  const name = scrubOutboundGitHubText(input.name, "check-run name");
+  // `name` is the check-run's IDENTITY — it is what a required check is matched
+  // on and what a `check-runs` read selects by — so it is refused, not redacted,
+  // for the same reason as a commit-status `context` (PEN-3391).
+  if (gitHubIdentityFieldRedaction(input.name, "check-run name")) {
+    return { ok: false, retryable: false, reason: "check_run_name_not_publishable" };
+  }
+  const name = input.name;
   const title = scrubOutboundGitHubText(input.title, "check-run title");
   const summary = scrubOutboundGitHubText(input.summary, "check-run summary");
   const detailsUrl = input.detailsUrl

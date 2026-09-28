@@ -4,6 +4,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   type Db,
+  type DbTransaction,
 } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import {
@@ -16,7 +17,6 @@ import {
 } from "./github-app-auth.js";
 
 type DeliveryRow = typeof githubCommitStatusDeliveries.$inferSelect;
-type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 // Either handle works for the delivery bookkeeping below. Code reached from
 // inside withGithubStatusDeliveryLock must use the transaction handle so the
 // critical section does not take a second pool connection.

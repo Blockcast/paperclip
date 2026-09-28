@@ -22,13 +22,14 @@
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { PGlite } from "@electric-sql/pglite";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import {
   AlertDeliveryIncompleteError,
   type AggregateFenceWaitPolicy,
   handleWebhook,
   reconcileAbandonedAggregateFences,
+  resolveWorkerSlot,
   workerFenceIdentity,
 } from "../webhook-handler.js";
 import { DEFAULT_ISSUE_ROUTE_MAP } from "../constants.js";
@@ -244,12 +245,42 @@ const deliver = (ctx: PluginContext, fenceWait?: Partial<AggregateFenceWaitPolic
     fenceWait,
   );
 
-beforeEach(async () => {
+/**
+ * Booting WASM Postgres and replaying every migration costs ~1.6s on an idle
+ * machine, and this suite did it per test. On a saturated CI runner that blew
+ * vitest's 10s hook timeout and reddened unrelated PRs — inside a merge group it
+ * ejected them (BLO-36739). The schema is identical for every case, so it is
+ * built once and each case is handed an empty one by truncating instead.
+ *
+ * The table list is read from the catalog rather than hardcoded, so a future
+ * migration cannot leave state leaking between cases silently. It covers the
+ * `public` FK stubs as well as the plugin namespace: nothing seeds them today,
+ * but the `alert_escalation_covers` path cannot be exercised without rows in
+ * them, and those rows would otherwise outlive the case that wrote them. The
+ * CASCADE direction is safe either way — the namespace tables reference
+ * `public`, never the reverse.
+ */
+let truncateAll: string;
+
+beforeAll(async () => {
   db = new PGlite();
   await applyMigrations(db);
+  const tables = await db.query<{ qualified: string }>(
+    `SELECT format('%I.%I', schemaname, tablename) AS qualified
+       FROM pg_tables WHERE schemaname = ANY($1)`,
+    [[NAMESPACE, "public"]],
+  );
+  expect(tables.rows.length).toBeGreaterThan(0);
+  truncateAll = `TRUNCATE ${tables.rows
+    .map((r) => r.qualified)
+    .join(", ")} RESTART IDENTITY CASCADE`;
+}, 30_000);
+
+beforeEach(async () => {
+  await db.query(truncateAll);
 });
 
-afterEach(async () => {
+afterAll(async () => {
   await db.close();
 });
 
@@ -1114,5 +1145,81 @@ describe("BLO-31036 — state and event publication carry the generation too", (
     expect(fence?.firing_token).toBe("token-replacement");
     expect(sent!.match.firing_token).not.toBe("token-replacement");
     expect(sent!.match.firing_token).toEqual(expect.any(String));
+  });
+});
+
+/**
+ * The slot itself — the input every identity predicate above is keyed on.
+ *
+ * The cases above all use `workerFenceIdentity().slot` on both sides, so they
+ * pass whatever that value happens to be. In production it was
+ * `unknown-slot:<uuid>`, freshly minted per process, because the plugin host
+ * forks this worker without `HOSTNAME` in its process environment (measured on
+ * `paperclip-0`, 2026-09-23: the parent server process carries it, the
+ * alertmanager plugin child does not). A per-process slot equals no stored
+ * slot, so both identity arms were dead and only the elapsed-time backstop ever
+ * drained a fence. This block is the guard the suite was missing: it asserts
+ * the slot is a real host identity, rather than asserting that the predicates
+ * agree with themselves.
+ */
+describe("resolveWorkerSlot", () => {
+  it("prefers HOSTNAME when the process environment carries it", () => {
+    expect(resolveWorkerSlot("id-1", { HOSTNAME: " paperclip-0 " }, () => "ignored")).toBe(
+      "paperclip-0",
+    );
+  });
+
+  it("falls back to the UTS hostname when HOSTNAME is absent — the production case", () => {
+    // Reverting the os.hostname() arm fails here and only here.
+    expect(resolveWorkerSlot("id-2", {}, () => "paperclip-0")).toBe("paperclip-0");
+  });
+
+  it("is stable across processes in the same pod, which is what makes the steal possible", () => {
+    const readOsHostname = () => "paperclip-0";
+    expect(resolveWorkerSlot("dead-instance", {}, readOsHostname)).toBe(
+      resolveWorkerSlot("live-instance", {}, readOsHostname),
+    );
+  });
+
+  it("stays per-process when nothing identifies the host, so it steals nothing", () => {
+    expect(resolveWorkerSlot("id-3", {}, () => "")).toBe("unknown-slot:id-3");
+    expect(resolveWorkerSlot("id-4", {}, () => "localhost")).toBe("unknown-slot:id-4");
+    expect(
+      resolveWorkerSlot("id-5", {}, () => {
+        throw new Error("no UTS namespace");
+      }),
+    ).toBe("unknown-slot:id-5");
+  });
+
+  /**
+   * The generic-name guard is about the *value* being shareable, not its
+   * source, so it has to run on the env arm too — `HOSTNAME` is overridable
+   * per plugin through the worker manager's `options.env`. Before the fix the
+   * env arm returned ahead of the guard and this yielded the slot `localhost`,
+   * the exact value the OS arm rejects.
+   */
+  it("rejects a generic name from HOSTNAME, not just from the UTS namespace", () => {
+    expect(resolveWorkerSlot("id-6", { HOSTNAME: "localhost" }, () => "paperclip-0")).toBe(
+      "unknown-slot:id-6",
+    );
+  });
+
+  /**
+   * Two hosts left on a distro default (`localhost.localdomain`) against one
+   * Paperclip database would share a slot and mutually steal each other's live
+   * fences. An exact, case-sensitive `!== "localhost"` let every one of these
+   * through; each case below fails on that version.
+   */
+  it.each(["localhost.localdomain", "LOCALHOST", "localhost6", "Localhost.localdomain"])(
+    "treats the generic name %s as unidentifiable",
+    (hostname) => {
+      expect(resolveWorkerSlot("id-7", {}, () => hostname)).toBe("unknown-slot:id-7");
+    },
+  );
+
+  it("lower-cases the slot so one host cannot hold two slots across a restart", () => {
+    expect(resolveWorkerSlot("id-8", {}, () => "Paperclip-0")).toBe(
+      resolveWorkerSlot("id-9", { HOSTNAME: "paperclip-0" }, () => "ignored"),
+    );
   });
 });

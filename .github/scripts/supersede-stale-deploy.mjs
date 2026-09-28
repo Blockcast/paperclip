@@ -100,6 +100,7 @@
  */
 import { readFileSync } from 'node:fs';
 import {
+  DEPLOY_WORKFLOW_FILE,
   STALL_UNREFILLED_LABEL,
   createGitHubClient,
   renderSupersedeComment,
@@ -108,7 +109,6 @@ import {
   tryComment,
 } from './deploy-stall-record.mjs';
 
-export const DEPLOY_WORKFLOW_FILE = 'docker.yml';
 export const DEPLOY_REF = 'master';
 
 /**

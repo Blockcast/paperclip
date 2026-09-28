@@ -55,6 +55,17 @@ const routeAgentId = "11111111-1111-4111-8111-111111111111";
 const WORKSPACE_OPERATION_LOG_SENTINEL =
   "TOKEN_FIXTURE=sentinel-operation-log-not-a-real-credential ./deploy.sh";
 
+/**
+ * BLO-35509. Source of truth: `server/src/routes/agents.ts` (`logRunLogAccessAudit`). Declared
+ * once because two of the uses below are `not.toHaveBeenCalledWith` absence guards, and an
+ * absence guard keyed on a literal nobody emits passes vacuously — a typo confined to that one
+ * site is silent, since the positives hold their own copies and keep passing. Verified on
+ * `master`: typo `:637` or `:780` alone and all 35 still pass. Sharing the const makes that
+ * shape a reference error instead.
+ */
+const HEARTBEAT_RUN_LOG_ACCESSED = "heartbeat.run_log_accessed";
+const WORKSPACE_OPERATION_LOG_ACCESSED = "workspace_operation.log_accessed";
+
 function workspaceOperationLogFixture(overrides: Record<string, unknown> = {}) {
   return {
     id: "operation-1",
@@ -549,7 +560,7 @@ describe("agent live run routes", () => {
       actorType: "user",
       actorId: "local-board",
       agentId: null,
-      action: "heartbeat.run_log_accessed",
+      action: HEARTBEAT_RUN_LOG_ACCESSED,
       entityType: "heartbeat_run",
       entityId: "run-1",
       runId: "run-1",
@@ -588,7 +599,7 @@ describe("agent live run routes", () => {
       actorType: "agent",
       actorId: routeAgentId,
       agentId: routeAgentId,
-      action: "heartbeat.run_log_accessed",
+      action: HEARTBEAT_RUN_LOG_ACCESSED,
       entityType: "heartbeat_run",
       entityId: "run-1",
       runId: "run-1",
@@ -610,8 +621,18 @@ describe("agent live run routes", () => {
    * log, and the `allowed` audit sat above that call — so a 404 that disclosed nothing was booked
    * as a read. Control: move `logRunLogAccessAudit(..., "allowed", ...)` back above `readLog` and
    * this fails (verified, not assumed).
+   *
+   * BLO-34901: no `result` matcher. The invariant is that this 404 records NOTHING — the reader is
+   * entitled, so booking it `denied` is equally false, and a matcher pinned to `"allowed"` passes
+   * that mutation unchanged. Second control (also verified): make the route write
+   * `logRunLogAccessAudit(..., "denied", ...)` on this path and this fails.
+   *
+   * The `readLog` positive pins the path the absence assertion is about. Without it, any mutation
+   * that 404s BEFORE `readLog` writes no audit either, so the absence assertion passes while
+   * nothing is exercised — verified: a `return` above `readLog` fails this test, and fails nothing
+   * if the positive is removed.
    */
-  it("does not audit an allowed run log read when the run stored no log", async () => {
+  it("does not audit a run log read at all when the run stored no log", async () => {
     const app = await createApp();
     const { notFound } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
     mockHeartbeatService.readLog.mockRejectedValue(notFound("Run log not found"));
@@ -622,9 +643,9 @@ describe("agent live run routes", () => {
     );
 
     expect(res.status, JSON.stringify(res.body)).toBe(404);
+    expect(mockHeartbeatService.readLog).toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
-      action: "heartbeat.run_log_accessed",
-      details: expect.objectContaining({ result: "allowed" }),
+      action: HEARTBEAT_RUN_LOG_ACCESSED,
     }));
   });
 
@@ -659,7 +680,7 @@ describe("agent live run routes", () => {
     // disclosed. Without `withheld` the record is indistinguishable from a real disclosure, and
     // "who read this log" over-reports.
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
-      action: "workspace_operation.log_accessed",
+      action: WORKSPACE_OPERATION_LOG_ACCESSED,
       details: expect.objectContaining({ result: "allowed", withheld: true }),
     }));
   });
@@ -680,7 +701,7 @@ describe("agent live run routes", () => {
       companyId: "company-1",
       actorType: "user",
       actorId: "local-board",
-      action: "workspace_operation.log_accessed",
+      action: WORKSPACE_OPERATION_LOG_ACCESSED,
       entityType: "workspace_operation",
       entityId: "operation-1",
       // The operation's own run, so an audit reader can join back to the run that produced it.
@@ -720,7 +741,7 @@ describe("agent live run routes", () => {
       actorType: "agent",
       actorId: routeAgentId,
       agentId: routeAgentId,
-      action: "workspace_operation.log_accessed",
+      action: WORKSPACE_OPERATION_LOG_ACCESSED,
       entityType: "workspace_operation",
       entityId: "operation-1",
       details: expect.objectContaining({
@@ -743,8 +764,13 @@ describe("agent live run routes", () => {
    * `logStore: null` on the fixture rather than only rejecting `readLog`: that is the shape the
    * closure records, and it keeps the audit's own `logStore` field honest if the ordering ever
    * regresses.
+   *
+   * BLO-34901: no `result` matcher, same reasoning as the heartbeat guard above — and second
+   * control verified here too. The `readLog` positive pins the exercised path for the same reason,
+   * with its own verified mutation: a `return` above `readLog` fails this test only while that
+   * assertion is present.
    */
-  it("does not audit an allowed workspace-operation log read when the operation stored no log", async () => {
+  it("does not audit a workspace-operation log read at all when the operation stored no log", async () => {
     mockWorkspaceOperationService.getById.mockResolvedValue(
       workspaceOperationLogFixture({ logStore: null, logRef: null }),
     );
@@ -760,9 +786,9 @@ describe("agent live run routes", () => {
     );
 
     expect(res.status, JSON.stringify(res.body)).toBe(404);
+    expect(mockWorkspaceOperationService.readLog).toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
-      action: "workspace_operation.log_accessed",
-      details: expect.objectContaining({ result: "allowed" }),
+      action: WORKSPACE_OPERATION_LOG_ACCESSED,
     }));
   });
 

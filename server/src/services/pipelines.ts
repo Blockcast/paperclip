@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
-import type { Db } from "@paperclipai/db";
+import type { Db, DbTransaction } from "@paperclipai/db";
 import {
   agentWakeupRequests,
   agents,
@@ -178,7 +178,7 @@ export type PipelineAutomationExecutionResult =
   | { status: "succeeded"; execution: typeof pipelineAutomationExecutions.$inferSelect }
   | { status: "failed"; execution: typeof pipelineAutomationExecutions.$inferSelect };
 
-type PipelineDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
+type PipelineDb = Db | DbTransaction;
 
 type PipelineRetryPlanInternal = PipelineAutomationRetryPlan & {
   targetStageRow: typeof pipelineStages.$inferSelect | null;

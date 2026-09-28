@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 // @ts-expect-error -- plain-JS census script; imported for its own predicate so
@@ -810,6 +813,110 @@ describe("evaluateCommentReviewGate — quoted review bodies", () => {
         comments: [allyComment(indented, "2026-09-05T00:00:00Z")],
       }),
     ).toMatchObject({ state: "success", outcome: "not_evaluated" });
+  });
+});
+
+/**
+ * A counted bucket heading is a verdict only where a verdict can appear: at
+ * the start of a line. Quoted inline, it is a reviewer naming the format, and
+ * on a parser whose own reviews must quote that format to say anything useful
+ * that distinction gates the fix for itself (BLO-32443).
+ */
+describe("hasActionablePrReviewFeedback — counted buckets are line-anchored", () => {
+  // Verbatim from paperclip#1681's `c57fafa` review, which declares 0
+  // Critical / 0 Important and whose gate went red 11 seconds later. This is
+  // the negative control: it fails before the anchor, so a green here cannot
+  // be produced by a blanket relaxation.
+  const PR1681_REVIEW = readFileSync(
+    path.join(import.meta.dirname, "fixtures", "ally-review-pr1681-2026-09-06T112146Z.md"),
+    "utf8",
+  );
+
+  it("does not read a bucket quoted inside an inline-code span as a finding", () => {
+    // The body carries four bucket matches: the two real 0/0 headings, plus
+    // two inline-code illustrations of a truncation failure mode, one of them
+    // `### Important Issues (1)`. Only the headings are verdicts.
+    expect(PR1681_REVIEW).toContain("`### Important Issues (1)` is cut");
+    expect(hasActionablePrReviewFeedback(PR1681_REVIEW)).toBe(false);
+  });
+
+  it("still enumerates the real 0/0 buckets, so the head is not unenumerable", () => {
+    // Anchoring must narrow what counts as a verdict without blinding the
+    // carry-forward enumeration — a null here would read as "no buckets
+    // declared", which is a different and worse verdict than clean.
+    expect(extractAllyReportedFindingRefs(PR1681_REVIEW)).toEqual([]);
+  });
+
+  it.each([
+    ["markdown heading", "### Critical Issues (1)"],
+    ["bold run", "**Important Issues (2)**"],
+    ["list item", "- Critical Issues (1)"],
+    ["blockquoted heading", "> ### Important Issues (1)"],
+  ])("still blocks on a bucket in canonical position: %s", (_shape, heading) => {
+    expect(hasActionablePrReviewFeedback(reviewBody(CURRENT_HEAD, [heading]))).toBe(true);
+  });
+
+  it.each([
+    ["decision line", "decision: changes_requested"],
+    ["bare phrase", "The reviewer left changes requested on this head."],
+    ["uncounted heading", "### Critical Issues"],
+  ])("leaves the other blocking clauses intact: %s", (_shape, line) => {
+    expect(hasActionablePrReviewFeedback(reviewBody(CURRENT_HEAD, [line]))).toBe(true);
+  });
+
+  // Anchoring the start of the match is only half of line-local: every
+  // separator inside it has to be horizontal too. With `\s+` the pattern
+  // walked off the end of its own anchored line and read the next one.
+  it("does not join a severity word to an `Issues (n)` on the following line", () => {
+    expect(hasActionablePrReviewFeedback(reviewBody(CURRENT_HEAD, ["### Critical", "Issues (1)"]))).toBe(
+      false,
+    );
+  });
+
+  // The subtler half: a split count used to make the two patterns contradict
+  // each other. This one saw a zero bucket and cleared, while the uncounted
+  // heading regex — whose lookahead cannot see a paren across a newline — saw
+  // a bare heading and blocked. They must agree, and on an ambiguous split
+  // this module's stated asymmetry says agree the fail-closed way: it blocks,
+  // and declares no enumerable bucket (null, "none declared" — not [], which
+  // would assert the head genuinely reported zero findings).
+  it("classifies a bucket whose count is on the next line as an uncounted heading", () => {
+    const split = reviewBody(CURRENT_HEAD, ["### Critical Issues", "(0)"]);
+    expect(hasActionablePrReviewFeedback(split)).toBe(true);
+    expect(extractAllyReportedFindingRefs(split)).toBeNull();
+  });
+
+  // The anchor's marker run must consume one `#`/`>` per iteration. Written as
+  // `(?:[#>]+[ \t]*)*` it is `(x+)*`, and a leading marker run that then fails
+  // the rest of the pattern costs 2^(n-1) — 757ms at n=40, doubling every two
+  // characters. The body reaching this is raw webhook input on a
+  // single-threaded API, so the blowup stalls the event loop, not one request.
+  // n=64 is ~10^7x the n=40 cost, so any wall-clock bound separates the two.
+  it("matches a long leading marker run in linear time", () => {
+    const started = performance.now();
+    expect(hasActionablePrReviewFeedback("#".repeat(64) + "x")).toBe(false);
+    expect(hasActionablePrReviewFeedback(">".repeat(64) + "x")).toBe(false);
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+
+  // Same run, but a shape that genuinely is a bucket: collapsing the nested
+  // quantifier must not narrow the accepted language.
+  it("still blocks on a bucket behind a mixed marker run", () => {
+    expect(hasActionablePrReviewFeedback("> > ### Critical Issues (1)")).toBe(true);
+  });
+
+  // Adopting NOT_INDENTED_CODE moved this case: the unanchored pattern used to
+  // block on it. Four-space indentation is a code block, so this reads as
+  // quoted — consistent with every other pattern in the file. But it is a
+  // move in the fail-open direction on a module whose header says never to
+  // take that direction unexamined, so it is pinned rather than incidental.
+  // UNCOUNTED_FINDINGS_HEADING_REGEX does not catch the fallthrough either:
+  // its `(?![*_]*[ \t]*\()` lookahead sees the `(1)` and declines.
+  it("treats a bucket in an indented code block as quoted, not as a verdict", () => {
+    const indented = reviewBody(CURRENT_HEAD, ["    ### Critical Issues (1)"]);
+    expect(hasActionablePrReviewFeedback(indented)).toBe(false);
+    // Fail-closed on the enumeration side: "none declared", never a claimed [].
+    expect(extractAllyReportedFindingRefs(indented)).toBeNull();
   });
 });
 
