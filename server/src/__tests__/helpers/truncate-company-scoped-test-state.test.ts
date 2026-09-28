@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { activityLog, agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
+import { activityLog, agents, companies, companySkills, createDb, heartbeatRuns } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -135,6 +135,73 @@ describeEmbeddedPostgres("truncateCompanyScopedTestState", () => {
     // A straggler that lost the race may have left nothing; one that won was
     // truncated. Either way the table is empty and cleanup did not throw.
     expect(await db.select().from(heartbeatRuns)).toHaveLength(0);
+    expect(await db.select().from(companies)).toHaveLength(0);
+  });
+
+  /**
+   * Regression cover for BLO-35765.
+   *
+   * Same shape, different straggler. `company-skills-service.test.ts` had no
+   * supertest in it at all — there the surviving writer is a test that blew its
+   * 60s budget. Vitest fails a timed-out test but does not cancel it, so its
+   * `forkSkill` calls keep inserting into `company_skills` while `afterEach`
+   * runs. `company_skills.company_id` has no `onDelete` action, so a straggler
+   * landing between `delete(companySkills)` and `delete(companies)` breaks the
+   * parent delete and buries the timeout under a second annotation.
+   */
+  async function seedSkillCompany() {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Skill Straggler Co",
+      issuePrefix: `K${randomUUID().replace(/-/g, "").slice(0, 5).toUpperCase()}`,
+    });
+    return companyId;
+  }
+
+  /** The straggler: a fork insert from a timed-out test that is still running. */
+  async function insertStragglerSkill(companyId: string) {
+    const slug = `fork-${randomUUID()}`;
+    await db.insert(companySkills).values({
+      companyId,
+      key: `company/${companyId}/${slug}`,
+      slug,
+      name: "Straggler Skill",
+      markdown: "# Straggler Skill\n",
+      sourceType: "local_path",
+    });
+  }
+
+  it("documents the failure mode: a straggler company_skills insert breaks the parent delete", async () => {
+    const companyId = await seedSkillCompany();
+
+    // The state the race produces: cleanup already passed its
+    // `delete(companySkills)` step, and only then did the fork insert land.
+    await db.delete(companySkills);
+    await insertStragglerSkill(companyId);
+
+    const failure = await db
+      .delete(companies)
+      .then(() => null)
+      .catch((err: unknown) => err);
+
+    expect(failure, "expected the parent delete to be refused").not.toBeNull();
+    const cause = (failure as { cause?: { code?: string; constraint_name?: string } }).cause;
+    expect(cause?.code).toBe("23503");
+    expect(cause?.constraint_name).toBe("company_skills_company_id_companies_id_fk");
+  });
+
+  it("cannot be made to fail by company_skills writes racing it concurrently", async () => {
+    const companyId = await seedSkillCompany();
+
+    const stragglers = Array.from({ length: 12 }, () =>
+      insertStragglerSkill(companyId).catch(() => "rejected-harmlessly"),
+    );
+
+    await truncateCompanyScopedTestState(db);
+    await Promise.all(stragglers);
+
+    expect(await db.select().from(companySkills)).toHaveLength(0);
     expect(await db.select().from(companies)).toHaveLength(0);
   });
 });
