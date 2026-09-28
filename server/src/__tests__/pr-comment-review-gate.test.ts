@@ -861,35 +861,39 @@ describe("evaluateCommentReviewGate — self-attestation", () => {
  * Hazard fixtures for the disposition ledger's missing author exclusion
  * (BLO-34389). The defect is real and still open: an author-written `## Ally`
  * comment can retire its own carried finding, turning this gate's `failure`
- * into a pass. What these pin is the two ways of *fixing* it that must not
- * ship — both of which compile and read as correct at the call site.
+ * into a pass.
  *
- * Every fixture here uses a SINGLE shared login, because that is the only
- * shape that occurs in production: on an agent PR the author and the reviewer
- * are both `allyblockcast[bot]`. A fixture that varies the login instead tests
- * a case this fleet never produces, and passes while the shipped gate is
- * broken — which is exactly how a login-equality exclusion gets mistaken for a
- * working fix. The lane, not the login, is the discriminator this needs, and
- * no such discriminator exists yet.
+ * Both fixtures use a SINGLE shared login, because that is the only shape that
+ * occurs in production: on an agent PR the author and the reviewer are both
+ * `allyblockcast[bot]`. A fixture that varies the login instead tests a case
+ * this fleet never produces, and passes while the shipped gate is broken —
+ * which is exactly how a login-equality exclusion gets mistaken for a working
+ * fix. The lane, not the login, is the discriminator this needs, and no such
+ * discriminator exists yet.
+ *
+ * `prAuthorLogin` is INERT on the path both fixtures exercise, and that is
+ * deliberate rather than an oversight: `evaluateCommentReviewGate` reads it
+ * only inside the `if (forHead)` branch (`pr-comment-review-gate.ts:399`,
+ * `:412`), and neither fixture attests CURRENT_HEAD, so control reaches
+ * `headsWithUndispositionedFinding(comments, reviewerBotLogin)` — which takes
+ * no author argument at all. Setting it here encodes the assumption these
+ * fixtures exist to fence: it becomes load-bearing only once a fix threads an
+ * identity into one of those two functions.
+ *
+ * WHAT IS NOT FENCED HERE, and must be when the lane field lands: the
+ * anti-deadlock AC — "a retirement written by a DIFFERENT LANE still retires".
+ * It is not expressible today, because expressing it requires a lane field
+ * that does not exist yet (BLO-32695 / #1721's `reviewer: <agent-uuid>`). An
+ * attempt at it on login-only inputs is not merely weak, it is contradictory:
+ * it would assert `outcome !== "carried_finding"` on the exact input the
+ * open-defect witness below asserts IS eventually carried, so no single
+ * implementation could satisfy both and the likelier repair would be deleting
+ * the anti-fail-open guard — the direction this block exists to prevent.
+ * Placement (2) is meanwhile already fenced without it: the pre-existing
+ * retirement test above feeds the same two comments and asserts the strictly
+ * stronger `{ state: "success", outcome: "not_evaluated" }`.
  */
 describe("evaluateCommentReviewGate — ledger author exclusion hazards", () => {
-  // Placement (2): excluding the author at `ledger.push`. On an agent PR every
-  // ledger entry is the author's by login, so the ledger empties, nothing ever
-  // retires, and the head is permanently red — unclearable by any review,
-  // contradicting BLO-29711's anti-deadlock constraint.
-  it("still retires a carried finding when author and reviewer share one login", () => {
-    const verdict = evaluateCommentReviewGate({
-      headSha: CURRENT_HEAD,
-      prAuthorLogin: ALLY_BOT_LOGIN,
-      comments: [
-        allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
-        allyComment(dispositioningReview(INTERMEDIATE_HEAD, OLD_HEAD, "fixed"), "2026-08-04T21:09:19Z"),
-      ],
-    });
-
-    expect(verdict.outcome).not.toBe("carried_finding");
-  });
-
   // Placement (1): excluding the author inside `isAllyConsolidatedReviewComment`
   // — the smallest diff, and the worse one. That filter feeds the carried-head
   // map as well as the ledger, so on an agent PR no head is ever carried and
@@ -904,10 +908,14 @@ describe("evaluateCommentReviewGate — ledger author exclusion hazards", () => 
     expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
   });
 
-  // The defect itself, recorded as known-failing so it retires itself: this
-  // flips to a suite failure the moment a real lane discriminator lands, which
-  // is the prompt to assert the fixed behavior here instead.
-  it.fails("accepts an author-lane retirement today — the open BLO-34389 defect", () => {
+  // The open defect, asserted POSITIVELY as the behavior it actually produces
+  // today rather than via `it.fails`. Both forms retire themselves the moment a
+  // real lane discriminator lands — this one goes red because the outcome stops
+  // matching — but `it.fails` is satisfied by ANY throw, so a later rename or
+  // signature change would turn it green-by-crash and it would silently stop
+  // watching the defect. A guard that cannot tell its own subject from an
+  // unrelated crash is a comment (BLO-34263).
+  it("accepts an author-lane retirement today — the open BLO-34389 defect", () => {
     const verdict = evaluateCommentReviewGate({
       headSha: CURRENT_HEAD,
       prAuthorLogin: ALLY_BOT_LOGIN,
@@ -917,7 +925,10 @@ describe("evaluateCommentReviewGate — ledger author exclusion hazards", () => 
       ],
     });
 
-    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    // When the lane exclusion lands this becomes
+    // `{ state: "failure", outcome: "carried_finding" }`, and this assertion is
+    // the prompt to say so here.
+    expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
   });
 });
 
