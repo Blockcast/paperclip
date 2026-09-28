@@ -35,7 +35,11 @@
  */
 import type { EvidenceShape } from "./evidence-shapes.js";
 import { evaluateCommentReviewGate } from "./pr-comment-review-gate.js";
-import { extractAllyReviewedHeadSha, hasActionablePrReviewFeedback } from "./ally-review-detection.js";
+import {
+  countAllyDeferredPriorFindings,
+  extractAllyReviewedHeadSha,
+  hasActionablePrReviewFeedback,
+} from "./ally-review-detection.js";
 import { PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID } from "./pull-request-work-products.js";
 import type { ReviewerSurfaces } from "./github-app-auth.js";
 
@@ -228,8 +232,18 @@ async function probeOne(
     // surface's clean win — a false pass arriving through the veto instead of
     // through the detection. `evidence-truth.test.ts` pins that direction with
     // a bodyless CHANGES_REQUESTED against a clean comment.
+    //
+    // A `tracked` ledger entry does not block (it is a supported, accepted
+    // residual), so hasActionablePrReviewFeedback lets a 0/0 body carrying one
+    // through. The comment surface refuses it as `deferred_finding`; the formal
+    // surface must refuse it by the same helper, or an App-authored PR, whose
+    // artifact of record is a formal review, reads `review:ally-clean` for a
+    // head with a live accepted residual (BLO-36903).
     const formalClean =
-      newest !== undefined && !formalBlocking && extractAllyReviewedHeadSha(newest.body) === normalizedHead;
+      newest !== undefined &&
+      !formalBlocking &&
+      extractAllyReviewedHeadSha(newest.body) === normalizedHead &&
+      countAllyDeferredPriorFindings(newest.body) === 0;
 
     // Each surface is individually blind to the other — Ally files a formal
     // review on some PRs and only a comment on others — so SILENCE on one is

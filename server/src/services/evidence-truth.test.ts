@@ -121,6 +121,25 @@ describe("buildGithubTruthProbe", () => {
     expect(r.detections["review:ally-clean"]).toBe(true);
   });
 
+  // The comment surface refuses a `tracked` deferral as `deferred_finding`; the
+  // formal surface must too, because on an App-authored PR the formal review is
+  // the only artifact and the comment surface reads not_evaluated.
+  it("a formal 0/0 review at head carrying a tracked deferral is not clean", async () => {
+    const tracked = clean.replace(
+      "### Recommended Action",
+      "### Prior Findings Dispositioned (1)\n- **prior:abcdef0 important 1** - tracked - accepted onto BLO-36822.\n\n### Recommended Action",
+    );
+    const r = await buildGithubTruthProbe(
+      deps({
+        listReviewerSurfaces: async () => ({
+          reviews: [{ login: ALLY, body: tracked, state: "COMMENTED", commitId: HEAD, submittedAt: "2026-09-06T00:00:00Z" }],
+          comments: [],
+        }),
+      }),
+    )({ workProducts: [wp()] });
+    expect(r.detections["review:ally-clean"]).toBeUndefined();
+  });
+
   it("a formal review at head with Important(1), or CHANGES_REQUESTED, is not clean", async () => {
     const a = await buildGithubTruthProbe(
       deps({
