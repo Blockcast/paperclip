@@ -5,7 +5,10 @@
  * Creates a draft security advisory in the repo if any check fires.
  *
  * Env: GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR
- * Exit: always 0 — security flags are silent, never block the PR visibly.
+ * Exit: 0 on any completed run, including one that flagged — security flags are
+ *   silent and never block the PR visibly, and the watchdog holds that at 90s.
+ *   1 only when the run did not complete: exitFatal, which also annotates that
+ *   no check evaluated the diff so the red step is not read as a finding.
  */
 import { fileURLToPath } from 'node:url';
 import { ghFetch, exitFatal, GH_FETCH_DEFAULT_TIMEOUT_MS } from './get-bot-token.mjs';
