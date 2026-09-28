@@ -9,7 +9,7 @@
  */
 import { appendFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { ghFetch, exitFatal, RATE_LIMIT_RETRY_BUDGET_MS } from './get-bot-token.mjs';
+import { ghFetch, exitFatal, RATE_LIMIT_MIN_WAIT_MS } from './get-bot-token.mjs';
 import { fetchAllPullRequestFiles } from './fetch-pr-files.mjs';
 import { checkTemplate } from './check-pr-template.mjs';
 import { checkLinkedIssue } from './check-pr-linked-issue.mjs';
@@ -139,14 +139,28 @@ export async function deliverComment(post, outputFile = process.env.GITHUB_OUTPU
   }
 }
 
-// ghFetch gives EACH read its own RATE_LIMIT_RETRY_BUDGET_MS, and two of this
-// script's reads paginate, so short rate limits on successive pages could sum
-// past the step's timeout. The step would then be killed before exitFatal
-// printed its not-evaluated annotation. Every read here instead draws on one
-// shared budget, measured from script start, so the sum is capped and an
-// exhausted budget fails fast into exitFatal. Same idea as check-pr-security's
-// watchdogBoundFetch.
-export function budgetBoundFetch(startedAt, budgetMs = RATE_LIMIT_RETRY_BUDGET_MS, fetchImpl = ghFetch, now = Date.now) {
+// timeout-minutes of the "Run quality gates" step in commitperclip-review.yml.
+// A test pins the two together.
+export const QUALITY_STEP_TIMEOUT_MS = 5 * 60_000;
+
+// Whole-script budget for the rate-limit sleeps of every read here. This is a
+// different scope from ghFetch's RATE_LIMIT_RETRY_BUDGET_MS, which is sized per
+// call (it funds one headerless retry), so it is derived from the step it runs
+// under instead. It holds back one RATE_LIMIT_MIN_WAIT_MS for what can still
+// run after the last funded sleep: the requests that follow it (each capped at
+// GH_FETCH_DEFAULT_TIMEOUT_MS, and writes never sleep, so four of them fit)
+// and the verdict print. That leaves 240s, which funds three headerless 60s
+// waits across the script with margin for request time.
+export const QUALITY_RETRY_BUDGET_MS = QUALITY_STEP_TIMEOUT_MS - RATE_LIMIT_MIN_WAIT_MS;
+
+// ghFetch gives EACH read its own per-call budget, and two of this script's
+// reads paginate, so short rate limits on successive pages could sum past the
+// step's timeout. The step would then be killed before exitFatal printed its
+// not-evaluated annotation. Every read here instead draws on one shared
+// QUALITY_RETRY_BUDGET_MS, measured from script start, so the sum is capped
+// and an exhausted budget fails fast into exitFatal. Same idea as
+// check-pr-security's watchdogBoundFetch.
+export function budgetBoundFetch(startedAt, budgetMs = QUALITY_RETRY_BUDGET_MS, fetchImpl = ghFetch, now = Date.now) {
   return (path, token, options = {}) => fetchImpl(path, token, {
     retryBudgetMs: Math.max(0, startedAt + budgetMs - now()),
     ...options,
