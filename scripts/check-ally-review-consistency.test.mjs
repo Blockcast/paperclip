@@ -1179,6 +1179,37 @@ describe("assertLiveScopeNonVacuous", () => {
     assert.throws(() => assertLiveScopeNonVacuous(allDormant, "o/r"), /scoping bug, not a clean repo/);
   });
 
+  it("carries the classification histogram in the throw", () => {
+    // `main` asserts before it logs the scope summary, so the vacuous case —
+    // the single scenario that summary was added to illuminate — is the one
+    // scenario it never reaches. Without the counts in the message the operator
+    // is told the scope collapsed but not which clause swallowed the
+    // population.
+    const allDormant = [
+      { number: 1, mergeStateStatus: "DIRTY" },
+      { number: 2, isDraft: true },
+    ];
+    assert.throws(() => assertLiveScopeNonVacuous(allDormant, "o/r"), (e) => {
+      assert.match(e.message, /dormant by \[.*merge state DIRTY 1.*\]/);
+      assert.match(e.message, /dormant by \[.*draft 1.*\]/);
+      assert.match(e.message, /merge states \[.*DIRTY 1.*\]/);
+      return true;
+    });
+  });
+
+  it("names every field the classifier reads in its remediation hint", () => {
+    // The hint tells the operator which fetched fields to check. `updatedAt`
+    // became a third dormancy input and was missing from it, so the one field
+    // most likely to be dropped was the one the message did not mention.
+    const allDormant = [{ number: 1, mergeStateStatus: "DIRTY" }];
+    assert.throws(() => assertLiveScopeNonVacuous(allDormant, "o/r"), (e) => {
+      for (const field of ["isDraft", "mergeStateStatus", "updatedAt"]) {
+        assert.ok(e.message.includes(field), `hint must name ${field}`);
+      }
+      return true;
+    });
+  });
+
   it("passes when at least one PR could merge", () => {
     const mixed = [
       { number: 1, mergeStateStatus: "DIRTY" },
@@ -1354,7 +1385,7 @@ describe("scopeSummary", () => {
   // "never classified anything" were indistinguishable — which is how a working
   // scope was read as a broken one for a full review cycle on PEN-2847.
   it("reports live/dormant counts even when nothing was deferred", () => {
-    const line = scopeSummary(
+    const { line, live } = scopeSummary(
       [
         { number: 1, mergeStateStatus: "CLEAN", updatedAt: daysAgo(1) },
         { number: 2, mergeStateStatus: "UNKNOWN", updatedAt: daysAgo(1) },
@@ -1367,10 +1398,13 @@ describe("scopeSummary", () => {
     assert.match(line, /0 finding\(s\) deferred/);
     assert.match(line, /CLEAN 1/);
     assert.match(line, /UNKNOWN 1/);
+    // Returned so `main` reports the same number it printed rather than taking
+    // its own pass over the population.
+    assert.equal(live, 2);
   });
 
   it("breaks the dormant population down by reason", () => {
-    const line = scopeSummary(
+    const { line, live } = scopeSummary(
       [
         { number: 1, mergeStateStatus: "CLEAN", updatedAt: daysAgo(1) },
         { number: 2, mergeStateStatus: "DIRTY", updatedAt: daysAgo(1) },
@@ -1385,16 +1419,37 @@ describe("scopeSummary", () => {
     assert.match(line, /draft 1/);
     assert.match(line, /untouched, merge state unresolved 1/);
     assert.match(line, /1 finding\(s\) deferred/);
+    assert.equal(live, 1);
   });
 
   it("names an absent merge state rather than dropping it from the histogram", () => {
-    const line = scopeSummary([{ number: 1, updatedAt: daysAgo(1) }], [], NOW);
-    assert.match(line, /\(ABSENT\) 1/);
+    assert.match(scopeSummary([{ number: 1, updatedAt: daysAgo(1) }], [], NOW).line, /\(ABSENT\) 1/);
+    assert.match(
+      scopeSummary([{ number: 1, mergeStateStatus: null, updatedAt: daysAgo(1) }], [], NOW).line,
+      /\(ABSENT\) 1/,
+    );
+  });
+
+  it("labels an empty-string merge state instead of printing a bare count", () => {
+    // `""` is a value UNRESOLVED_MERGE_STATES deliberately recognises, so it
+    // reaches the histogram. Under `??` it rendered as `merge states [ 1]` — a
+    // count with no label, in the one line whose job is telling "classified
+    // nothing" from "nothing to classify".
+    const { line } = scopeSummary(
+      [
+        { number: 1, mergeStateStatus: "", updatedAt: daysAgo(1) },
+        { number: 2, mergeStateStatus: "CLEAN", updatedAt: daysAgo(1) },
+      ],
+      [],
+      NOW,
+    );
+    assert.match(line, /merge states \[(?:\(ABSENT\) 1, CLEAN 1|CLEAN 1, \(ABSENT\) 1)\]/);
+    assert.doesNotMatch(line, /merge states \[ /);
   });
 
   it("survives an empty repo", () => {
-    assert.match(scopeSummary([], [], NOW), /0 live \/ 0 open PR\(s\)/);
-    assert.match(scopeSummary(undefined, undefined, NOW), /0 finding\(s\) deferred/);
+    assert.match(scopeSummary([], [], NOW).line, /0 live \/ 0 open PR\(s\)/);
+    assert.match(scopeSummary(undefined, undefined, NOW).line, /0 finding\(s\) deferred/);
   });
 });
 
@@ -1452,6 +1507,13 @@ describe("main — reporting on the branch that actually runs", () => {
     assert.match(errs, /guard FAILED/);
     assert.match(out, /Liveness scope: 2 live \/ 2 open PR\(s\)/);
     assert.match(out, /0 finding\(s\) deferred/);
+    // `exit` is injected and an injected exit returns, so the failing branch
+    // must `return` after it or execution falls through to the pass message.
+    // `main` is exported now, which makes a non-terminating exit a supported
+    // call shape rather than a test-only artifact — and a failing run that also
+    // prints "guard passed" is exactly the untrustworthy output PEN-2847 set
+    // out to remove.
+    assert.doesNotMatch(out, /guard passed/);
   });
 
   it("prints it on a PASSING run too", () => {
