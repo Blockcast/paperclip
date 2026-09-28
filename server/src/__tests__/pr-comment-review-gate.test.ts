@@ -345,6 +345,37 @@ describe("evaluateCommentReviewGate", () => {
     expect(verdict).toMatchObject({ state: "success", outcome: "clean" });
   });
 
+  it("does not let an unbalanced fence above the ledger downgrade a deferral to clean", () => {
+    // Ally's template attests the head in its opening lines and puts the ledger
+    // after the buckets, so a fence left open between them blanks the ledger on
+    // the emitted-only reading while the attestation and the 0/0 survive. Read
+    // that way the head went `clean` / `success`: a false claim that an accepted
+    // residual was fixed. Moving the fence below the ledger holds the body
+    // otherwise fixed, so fence position alone cannot be what decides it.
+    const buckets = ["### Critical Issues (0)", "### Important Issues (0)"];
+    const ledger = [
+      "### Prior Findings Dispositioned (1)",
+      `- **prior:${OLD_HEAD.slice(0, 7)} important 1** - tracked - accepted onto the follow-up.`,
+    ];
+    const unterminatedFence = ["```ts", "const unterminated = true;"];
+
+    for (const lines of [
+      [...buckets, ...unterminatedFence, ...ledger],
+      [...buckets, ...ledger, ...unterminatedFence],
+    ]) {
+      const verdict = evaluateCommentReviewGate({
+        headSha: CURRENT_HEAD,
+        comments: [
+          allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+          allyComment(reviewBody(CURRENT_HEAD, lines), "2026-08-04T21:09:19Z"),
+        ],
+      });
+
+      expect(verdict).toMatchObject({ state: "success", outcome: "deferred_finding" });
+      expect(verdict.reason).toMatch(/accepts 1 prior finding as tracked/);
+    }
+  });
+
   it("does not let a tracked entry clear a head that still carries a finding", () => {
     // Precedence: a `tracked` ledger entry is a statement about one prior
     // finding, not about the review carrying it. A current head that raises its

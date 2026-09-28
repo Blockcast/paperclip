@@ -15,6 +15,7 @@ import { loadConfig } from "../config.js";
 import type { Db } from "@paperclipai/db";
 import { withGithubStatusDeliveryLock } from "./github-status-delivery-outbox.js";
 import {
+  countAllyDeferredPriorFindings,
   extractAllyPriorFindingDispositions,
   extractAllyReportedFindingRefs,
   extractAllyReviewedHeadSha,
@@ -490,22 +491,26 @@ export function evaluateCommentReviewGate(input: {
       // still counted, because a ledger entry is by construction about an earlier
       // head; what is scoped is which review is speaking.
       //
+      // Counted from the raw body, not through the emitted-only
+      // extractAllyPriorFindingDispositions: here `defers` retires nothing, it
+      // downgrades `clean`, so an unbalanced fence above the ledger must not be
+      // able to erase it and publish a false `success`. The carry-forward's
+      // `isDisposed` is a retiring use and correctly stays emitted-only.
+      //
       // Gated behind the independence check above, not in front of it: a
       // deferral is a POSITIVE claim about what a review decided, so crediting a
       // self-attested one would let an author launder their own residual into a
       // non-blocking gate — the same fail-open the `clean` branch is guarded
       // against (BLO-34316). A self-attested deferral falls through to the
       // carry-forward ledger instead.
-      const deferred = extractAllyPriorFindingDispositions(forHead.comment.body).filter(
-        (entry) => entry.kind === "defers",
-      );
-      if (deferred.length > 0) {
+      const deferred = countAllyDeferredPriorFindings(forHead.comment.body);
+      if (deferred > 0) {
         return {
           state: "success",
           outcome: "deferred_finding",
           reason:
-            `Ally's review of this head accepts ${deferred.length} prior ` +
-            `${deferred.length === 1 ? "finding" : "findings"} as tracked on a follow-up, not fixed.`,
+            `Ally's review of this head accepts ${deferred} prior ` +
+            `${deferred === 1 ? "finding" : "findings"} as tracked on a follow-up, not fixed.`,
         };
       }
       return {
