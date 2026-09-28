@@ -1,6 +1,7 @@
 import { and, eq, isNotNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, heartbeatRuns } from "@paperclipai/db";
+import { CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY } from "./ccrotate-capacity-retry.js";
 import {
   setOverdueScheduledRetryAgeMetrics,
   setOverdueScheduledRetryAgeMetricsRefreshSuccess,
@@ -75,6 +76,14 @@ export async function refreshQueuedRunAgeMetrics(db: Db, now = new Date()): Prom
 }
 
 /**
+ * The `result_json` key carrying the provider's advertised resume instant,
+ * named through its TS binding so a rename cannot silently desync the gauge
+ * from the writer (BLO-35263). The YAML triage query's copy is pinned by
+ * `prometheusrule-result-json-keys.test.ts`.
+ */
+const advertisedResumeAt = sql`${heartbeatRuns.resultJson}->>${CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY}`;
+
+/**
  * The instant a parked retry is genuinely due (BLO-34782): the LATER of the
  * booked `scheduled_retry_at` and the resume instant the provider advertised.
  *
@@ -130,9 +139,9 @@ export async function refreshQueuedRunAgeMetrics(db: Db, now = new Date()): Prom
 const effectiveRetryDueAt = sql`greatest(
   ${heartbeatRuns.scheduledRetryAt},
   case
-    when ${heartbeatRuns.resultJson}->>'penstockAdvertisedResumeAt'
+    when ${advertisedResumeAt}
          ~ '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?Z$'
-    then (${heartbeatRuns.resultJson}->>'penstockAdvertisedResumeAt')::timestamptz
+    then (${advertisedResumeAt})::timestamptz
   end
 )`;
 
