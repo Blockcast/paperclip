@@ -13193,7 +13193,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ...(target.prUrl ? [`- PR: ${target.prUrl}`] : []),
       `- Reviewer run: \`${run.id}\``,
       "",
-      "Check whether another review for this exact head is still queued before acting — this notice does not know. If one is, wait for it. If none is, re-request the review on the PR (a start-of-body `<!-- paperclip:review-request -->` marker **and** a bare `@ally` mention — the marker alone is silently dropped); pushing a new head voids any at-head attestation and is the last resort.",
+      // BLO-37268: name the measured queue band, so a reader can tell a dead
+      // review from a slow one without re-deriving it. Measured on BLO-34410:
+      // reviewer dispatch wait is p50 ~4h11m, and the widely-quoted 5-74min
+      // figure is SERVICE time, not response time — so silence at a few hours
+      // is inside the normal envelope, not evidence of a terminal state.
+      "Check whether another review for this exact head is still queued before acting — this notice has not read the queue. Reviewer dispatch wait has measured a p50 of ~4h11m (BLO-34410), so silence on its own does not mean the review is dead.",
+      "",
+      // BLO-37268: the remedy is the non-destructive one, and the destructive
+      // one is named only to be warned against. Moving the head was measured to
+      // cost all three of these at once on Blockcast/multicast#778, where the
+      // review the notice declared absent landed 72 minutes later.
+      "If nothing is queued, re-request the review on the PR: a start-of-body `<!-- paperclip:review-request -->` marker **and** a bare `@ally` mention (the marker alone is silently dropped). Do not move the head to force a re-review — a new head voids any review still in flight, voids every pending review-request marker at the old head, and re-burns the entire green required-check set.",
     ].join("\n");
 
     for (const issue of linked) {
