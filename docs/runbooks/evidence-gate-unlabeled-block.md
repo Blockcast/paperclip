@@ -224,8 +224,18 @@ measuring the deploy. It is still the correct baseline for the seven-day
 measurement, which measures the **flip**, and it was taken before that window
 opened (`PAPERCLIP_EVIDENCE_UNLABELED_BLOCK` still `"0"`).
 
-Window `2026-08-28T13:32:51Z` → `2026-09-27T13:32:51Z`. Agents with
-`reviewedIssues: 0` are omitted (`reviewPassRate: null`, nothing to step down).
+Window `2026-08-28T13:32:51Z` → `2026-09-27T13:32:51Z`. The table is keyed on
+display name; the `jq` above emits `agentId`, so map with
+`paperclipListAgents` (or `GET /api/companies/$PAPERCLIP_COMPANY_ID/agents`)
+before comparing.
+
+These 13 are the **complete** non-zero set for the window. The other 5 agents
+on the roster had `reviewedIssues: 0` and are omitted (`reviewPassRate: null`,
+nothing to step down): **Reflection Coach**, **Summarizer**, **Operator
+(devbox)**, **Caveman Canary Claude v2**, **Caveman Canary OpenCode v2** — all
+`pending_approval` or `paused`, all created before the capture. A name in the
+follow-up that is not in either list is a genuinely new agent, not a
+previously-omitted one.
 
 | agent | reviewedIssues | passedReviews | reviewPassRate |
 |---|---|---|---|
