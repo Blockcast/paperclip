@@ -1166,7 +1166,7 @@ export async function startServer(): Promise<StartedServer> {
   // overlap the latch exists to remove, so this reports and does not act.
   let heartbeatRecoveryChainInFlight = false;
   let heartbeatRecoveryChainStartedAt = 0;
-  // PEN-3314: latches the stall COUNTER to once per stalled pass. The warn log
+  // PEN-3314: latches the stall COUNTER to once per stalled pass. The error log
   // below deliberately still repeats every tick — an unresolved halt should keep
   // saying so — but a counter that ticked with it would conflate "how many
   // passes stalled" with "how long one of them has been stalled", and the first
@@ -1509,7 +1509,15 @@ export async function startServer(): Promise<StartedServer> {
           // A chain in flight across many ticks is not normal. Reported, not
           // acted on — see the latch declaration for why clearing it would
           // re-admit the overlap the latch exists to remove.
-          logger.warn(
+          //
+          // `error`, not `warn`, to match what the matching series already
+          // documents ({@link HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC}: "Page
+          // on this. It is rare by design and it does not resolve itself").
+          // Every recovery pass on this worker is halted by the time this
+          // fires. The skip branch no longer logs at all, so raising the level
+          // costs nothing in volume, and it lets a log-based alert reach the
+          // same conclusion as a metric-based one.
+          logger.error(
             {
               inFlightMs,
               warnAfterMs: HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS,
