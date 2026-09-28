@@ -57,7 +57,11 @@ import type { Db } from "@paperclipai/db";
 import { issueComments, issueWorkProducts, issues } from "@paperclipai/db";
 import { logger as defaultLogger } from "../middleware/logger.js";
 import { githubGetPullRequestGate, type PullRequestGateResult } from "./github-app-auth.js";
-import { issueAllowsMonitor, normalizeIssueMonitorGateSignals } from "./issue-execution-policy.js";
+import {
+  exhaustedMonitorClearReason,
+  issueAllowsMonitor,
+  normalizeIssueMonitorGateSignals,
+} from "./issue-execution-policy.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { listIssueDependencyReadinessMap } from "./issues.js";
 
@@ -150,6 +154,33 @@ export function readIssueMonitorGateSignals(executionState: unknown): string[] {
   const signals = (monitor as { gateSignals?: unknown }).gateSignals;
   if (!Array.isArray(signals)) return [];
   return normalizeIssueMonitorGateSignals(signals);
+}
+
+/**
+ * The monitor's declared bounds, in the shape `exhaustedMonitorClearReason` reads.
+ *
+ * Read off `executionState.monitor` — where `monitorMetadataFromPolicy`
+ * (issue-execution-policy.ts) copies them at arm time — rather than re-parsing
+ * `executionPolicy` with `normalizeIssueExecutionPolicy`. That helper *throws*
+ * on a policy it cannot parse, which on this sweep would abort the whole pass
+ * over one malformed row; this module fails closed per row everywhere else
+ * (see the CASE expression in `listCandidateIssues` for the same reasoning).
+ * Anything unreadable here therefore reads as "no bound declared", which is the
+ * same verdict the bound-less majority already gets.
+ */
+export function readIssueMonitorBounds(
+  executionState: unknown,
+): { timeoutAt: string | null; maxAttempts: number | null } {
+  const monitor =
+    executionState && typeof executionState === "object"
+      ? (executionState as { monitor?: unknown }).monitor
+      : null;
+  if (!monitor || typeof monitor !== "object") return { timeoutAt: null, maxAttempts: null };
+  const { timeoutAt, maxAttempts } = monitor as { timeoutAt?: unknown; maxAttempts?: unknown };
+  return {
+    timeoutAt: typeof timeoutAt === "string" ? timeoutAt : null,
+    maxAttempts: typeof maxAttempts === "number" ? maxAttempts : null,
+  };
 }
 
 /**
@@ -608,11 +639,24 @@ export async function reconcileTerminalGates(
           // be the mirror of the false signal this branch exists to avoid. The
           // stranded copy, including its re-arm advice, is the true one there.
           //
-          // A future check is necessary but not sufficient: the scheduler only
-          // ever selects rows `issueAllowsMonitor` admits, and this query admits
-          // every status but done/cancelled by design (the blocked -> todo
-          // restore population). A future check on a row that cannot fire is a
-          // wake that will never happen, so it gets the stranded copy too.
+          // A future check is necessary but not sufficient, on two independent
+          // counts. First, the scheduler only ever selects rows
+          // `issueAllowsMonitor` admits, and this query admits every status but
+          // done/cancelled by design (the blocked -> todo restore population).
+          // Second, selection is not the same question as whether the monitor
+          // has any road left: `exhaustedMonitorClearReason` returns
+          // `timeout_exceeded` off `timeoutAt` alone, and nothing constrains
+          // `nextCheckAt <= timeoutAt` — "check in 6h, give up after 2h" arms
+          // fine, and the scheduler's next evaluation clears it rather than
+          // firing it. Either way a future check is a wake that will never
+          // happen, so it gets the stranded copy too.
+          //
+          // `attemptCount: 0` is the literal truth here rather than a
+          // simplification: a non-null `monitorNextCheckAt` can only have come
+          // in via the never-polled arm, whose predicate *is*
+          // `monitorAttemptCount = 0`. `defaultMaxAttempts` is deliberately
+          // omitted — the scheduler's ceiling is about repeated polling, and
+          // nothing has polled yet.
           armedNextCheckAt:
             entry.candidate.monitorNextCheckAt !== null
               && entry.candidate.monitorNextCheckAt.getTime() > now.getTime()
@@ -621,6 +665,11 @@ export async function reconcileTerminalGates(
                 entry.candidate.assigneeAgentId,
                 entry.candidate.assigneeUserId,
               )
+              && exhaustedMonitorClearReason({
+                monitor: readIssueMonitorBounds(entry.candidate.executionState),
+                attemptCount: 0,
+                now,
+              }) === null
               ? entry.candidate.monitorNextCheckAt
               : null,
         }),

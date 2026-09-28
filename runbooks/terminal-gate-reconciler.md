@@ -13,10 +13,14 @@ NULL`), which was armed on a gate that was already satisfied and would otherwise
 wait out its whole window before anything looked — BLO-36289. The comment copy
 branches on whether the monitor can still wake the issue: the armed variant, which
 states the monitor is still armed and must not be treated as stranded, is used
-only when the first check is still in the future AND the row is one the
+only when the first check is still in the future, AND the row is one the
 scheduler will fire (`issueAllowsMonitor`: agent-assigned, no user assignee,
-`in_progress`/`in_review`). An overdue check, or a `todo`/`blocked`/human-assigned
-row, gets the stranded copy.
+`in_progress`/`in_review`), AND the monitor has road left to run
+(`exhaustedMonitorClearReason`, evaluated at `attemptCount 0`). An overdue check,
+a `todo`/`blocked`/human-assigned row, or a monitor already past its own
+`timeoutAt` — nothing constrains `nextCheckAt <= timeoutAt`, so "check in 6h,
+give up after 2h" arms fine and is cleared rather than fired — gets the stranded
+copy.
 
 It dispatches nothing, closes nothing, and clears no monitor.
 
