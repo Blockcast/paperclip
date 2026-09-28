@@ -44,6 +44,7 @@ import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
 import {
   PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE,
   PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID,
+  recordedPullRequestOwners,
 } from "./pull-request-work-products.js";
 import { resolveOwningPaperclipIdentifiers } from "./paperclip-identifiers.js";
 import {
@@ -1458,12 +1459,10 @@ function isProgressPullRequest(pr: PullRequestEvidence | null): boolean {
  */
 function pullRequestOwnsIssue(row: PullRequestEvidenceRow, sourceIdentifier: string | null): boolean {
   if (!sourceIdentifier) return false;
-  const recorded = row.owningIdentifiers;
   // An empty recorded array IS authoritative — the PR named no owner anywhere,
   // so it is attributable to nothing. Only null/absent means "not recorded".
-  if (Array.isArray(recorded)) {
-    return recorded.some((value) => typeof value === "string" && value === sourceIdentifier);
-  }
+  const recorded = recordedPullRequestOwners(row.owningIdentifiers);
+  if (recorded) return recorded.includes(sourceIdentifier);
   return resolveOwningPaperclipIdentifiers({
     title: row.title,
     branch: row.branch,

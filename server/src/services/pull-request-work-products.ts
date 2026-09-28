@@ -186,6 +186,22 @@ export function pullRequestWorkProductSourceEventActionOrder(
   }
 }
 
+/**
+ * Read `metadata.owningIdentifiers` back off a stored row, preserving the
+ * null-vs-empty distinction the writer above encodes.
+ *
+ * Returns `null` for "not recorded" (row predates the field) and an array —
+ * possibly empty, which IS authoritative — otherwise. Consumers differ on what
+ * to do with `null`, and deliberately so: productivity-review re-derives
+ * ownership from the row's surviving tiers and withholds a progress signal when
+ * that fails, while the PR-review-gate notifier keeps the row, because its
+ * failure direction is silence. Only the read is shared.
+ */
+export function recordedPullRequestOwners(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  return value.filter((entry): entry is string => typeof entry === "string");
+}
+
 export function buildPullRequestWorkProductFields(
   input: PullRequestWorkProductInput,
 ): PullRequestWorkProductFields {
