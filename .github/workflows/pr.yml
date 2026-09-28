@@ -342,6 +342,11 @@ jobs:
         run: node --test ./scripts/__tests__/provenance-union-merge.test.mjs
         timeout-minutes: 1
 
+      - name: Test alertmanager Vitest timeout budget (BLO-22902)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/alertmanager-vitest-timeouts.test.mjs
+        timeout-minutes: 1
+
       - name: Require vendored-adapter source changes to be logged (BLO-35109)
         # Replaces the stored 64-hex integrity manifest that used to live in
         # vendor/paperclip-adapter-claude-k8s/PROVENANCE.md and was verified by
