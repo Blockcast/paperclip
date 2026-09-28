@@ -2,7 +2,8 @@
 
 The server-side ceiling that `POSTGRES_POOL_MAX` (`packages/db/src/client.ts`)
 must fit inside. This file exists because that constant was sized three times
-by incident (`server/src/index.ts:1114`, `services/issues.ts:5723`, BLO-35940)
+by incident (the stranded-reconcile chain latch in `server/src/index.ts`,
+`issueService`'s instance-settings read in `services/issues.ts`, BLO-35940)
 and never once against the server it actually connects to — there was no
 budget to check it against. BLO-37330.
 
@@ -63,9 +64,10 @@ single pod in place and never doubles.
 
 ### There is no second application pool
 
-`server/src/index.ts:553` creates a second pool only when
-`config.databaseMigrationUrl` is set, and that resolves solely from
-`DATABASE_MIGRATION_URL` (`server/src/config.ts:1154`). That variable is **not
+`server/src/index.ts` creates a second pool only in the
+`config.databaseMigrationUrl` branch, and that resolves solely from
+`DATABASE_MIGRATION_URL` (`databaseMigrationUrl` in `server/src/config.ts`).
+That variable is **not
 set on either workload** — verified on both `paperclip-api` and the `paperclip`
 StatefulSet. So `pluginMigrationDb` aliases the main pool and the earlier
 "may create a second 10-slot pool" note is, in this deployment, false.
@@ -87,31 +89,57 @@ them opens a `POSTGRES_POOL_MAX`-sized pool:
 −  4   transient createUtilitySql pools
 −  4   operator headroom
 = 80   for application pools
+−  8   estimation margin
+= 72   budgeted to application pools
 ÷  4   peak processes (3 API mid-rollout + 1 worker)
-= 20   per pool
+= 18   per pool
 ```
 
-**`POSTGRES_POOL_MAX = 20`.**
+**`POSTGRES_POOL_MAX = 18`.**
 
-At steady state (2 API + 1 worker) that is 60 + 17 = **77 of 100**. At peak
-mid-rollout it is 80 + 17 = **97 of 100**, with the 3 superuser-reserved
-connections still untouched underneath.
+At steady state (2 API + 1 worker) that is 54 + 17 = **71 of 100**. At peak
+mid-rollout it is 72 + 17 = **89 of 100**, leaving 8 unclaimed beneath the
+role's 97 and the 3 superuser-reserved connections untouched below that.
 
-This clears the ~19-concurrent-demand floor measured for a single process on
-2026-09-24 (PR-reviewer wakes 8, scheduler tick ~11, plugin jobs 10, one
-`getDeleteConstraints` precheck 8 — overlapping subsystems sharing one pool),
-which the previous value of 10 did not.
+### Why the margin is a line in the arithmetic and not a rounding habit
+
+Every number in the consumers table is *declared* configuration, not an
+observed backend count — and the section below explains why observing them is
+not currently possible at all. A budget with no slack is therefore one
+un-modelled consumer away from `FATAL: sorry, too many clients already`: a
+second operator `psql`, a fourth overlapping cronjob, a fifth transient
+`createUtilitySql`. Sizing to the exact ceiling would spend the whole server
+budget on the strength of estimates the document itself declines to vouch for.
+
+The 8 is one full application pool's worth of headroom short of a rollout —
+enough to absorb any single un-modelled consumer in the table above.
+
+### What 18 does not do
+
+It does **not** clear the ~19-concurrent-demand floor measured for a single
+process on 2026-09-24 (PR-reviewer wakes 8, scheduler tick ~11, plugin jobs 10,
+one `getDeleteBlastRadius` precheck 8 — overlapping subsystems sharing one
+pool). Clearing that worst case, where every subsystem peaks simultaneously,
+would need ≥19 per pool and would consume the entire margin above.
+
+That residual is deliberate, because the two failures are not comparable. A
+pool that is one short of its worst case makes the 19th caller *wait* —
+`postgres.js` queues rather than throwing. A pool that is one over the server's
+ceiling makes Postgres *refuse*, which takes the fleet down. 10 → 18 removes the
+steady-state starvation this row was filed for; buying the last unit of the
+worst case would cost the protection against the outage.
 
 It also keeps `derivePrReviewerWakeMaxConcurrency`'s invariant
-(`routes/github-webhook.ts`): `floor(20/2) − 1 = 9`, and `9 × 2 = 18 < 20`.
+(`routes/github-webhook.ts`): `floor(18/2) − 1 = 8`, and `8 × 2 = 16 < 18`.
 
 ### Raising it further needs a server-side change first
 
-20 is the largest value that fits 4 processes inside 97 with the non-application
-consumers accounted for. Anything above ~21 requires raising `max_connections`
-on `paperclip-pg` (or putting a pooler in front of it) **in the same change** —
-otherwise the client stops queueing and Postgres starts refusing connections,
-which is the worse failure.
+18 is the largest value that fits 4 processes inside 97 while carrying the
+8-connection margin. Anything above ~21 breaches the ceiling outright even with
+no margin at all, and requires raising `max_connections` on `paperclip-pg` (or
+putting a pooler in front of it) **in the same change** — otherwise the client
+stops queueing and Postgres starts refusing connections, which is the worse
+failure.
 
 ## Known gap: live backend counts are not measurable
 
