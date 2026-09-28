@@ -32,8 +32,12 @@ describe("PAPERCLIP_EVIDENCE_UNLABELED_BLOCK", () => {
   });
 
   // "0" is the shipped Helm default; "true" is the plausible operator typo.
-  // Both must read as off, so a misconfigured flip fails closed.
-  it.each(["0", "true"])("stays off for %o", (value) => {
+  // Both must read as off, so a misconfigured flip fails closed. " 1" and
+  // "yes" are tripwires, not redundant cases: " 1" fails a coercing guard
+  // (`Number(e) === 1`, `parseInt`) and "yes" fails an allowlist
+  // (`["1", "yes", "on"].includes(e)`). Together they also catch a denylist
+  // (`e && e !== "0" && e !== "true"`), which fails OPEN on "false" or "off".
+  it.each(["0", "true", "yes", " 1"])("stays off for %o", (value) => {
     process.env.PAPERCLIP_EVIDENCE_UNLABELED_BLOCK = value;
 
     expect(loadConfig().evidenceGateUnlabeledTruthBlock).toBe(false);
