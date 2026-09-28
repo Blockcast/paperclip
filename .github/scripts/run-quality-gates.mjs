@@ -7,8 +7,9 @@
  * Env: GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR, PR_BRANCH
  * Exit: 0 if all quality gates pass, 1 if any fail.
  */
+import { appendFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { ghFetch, exitFatal } from './get-bot-token.mjs';
+import { ghFetch, exitFatal, RATE_LIMIT_RETRY_BUDGET_MS } from './get-bot-token.mjs';
 import { fetchAllPullRequestFiles } from './fetch-pr-files.mjs';
 import { checkTemplate } from './check-pr-template.mjs';
 import { checkLinkedIssue } from './check-pr-linked-issue.mjs';
@@ -120,7 +121,11 @@ async function upsertComment(token, repo, prNumber, body, existing) {
 // ghFetch never retries writes, so it throws those as a plain Error with no
 // `rateLimited` flag, and keying on the flag would miss exactly the write.
 // Same line postFlaggedSecurityResult takes for the security advisory.
-export async function deliverComment(post) {
+//
+// A failed delivery is still recorded as `comment_delivered=false`, so the
+// workflow can say the failures are in the job log rather than pointing the
+// author at a comment that was never posted.
+export async function deliverComment(post, outputFile = process.env.GITHUB_OUTPUT) {
   try {
     await post();
     return true;
@@ -129,11 +134,27 @@ export async function deliverComment(post) {
     console.error(
       `::warning::commitperclip could not post its comment (${message}). The verdict below is still authoritative.`
     );
+    if (outputFile) appendFileSync(outputFile, 'comment_delivered=false\n');
     return false;
   }
 }
 
+// ghFetch gives EACH read its own RATE_LIMIT_RETRY_BUDGET_MS, and two of this
+// script's reads paginate, so short rate limits on successive pages could sum
+// past the step's timeout. The step would then be killed before exitFatal
+// printed its not-evaluated annotation. Every read here instead draws on one
+// shared budget, measured from script start, so the sum is capped and an
+// exhausted budget fails fast into exitFatal. Same idea as check-pr-security's
+// watchdogBoundFetch.
+export function budgetBoundFetch(startedAt, budgetMs = RATE_LIMIT_RETRY_BUDGET_MS, fetchImpl = ghFetch, now = Date.now) {
+  return (path, token, options = {}) => fetchImpl(path, token, {
+    retryBudgetMs: Math.max(0, startedAt + budgetMs - now()),
+    ...options,
+  });
+}
+
 async function main() {
+  const gh = budgetBoundFetch(Date.now());
   const { GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR, PR_BRANCH } = process.env;
 
   if (!GH_TOKEN || !GH_REPO || !PR_NUMBER) {
@@ -154,8 +175,8 @@ async function main() {
 
   // Fetch PR data once — gates use this, no redundant API calls
   const [pr, files] = await Promise.all([
-    ghFetch(`/repos/${GH_REPO}/pulls/${prNumber}`, GH_TOKEN),
-    fetchAllPullRequestFiles(ghFetch, GH_REPO, prNumber, GH_TOKEN),
+    gh(`/repos/${GH_REPO}/pulls/${prNumber}`, GH_TOKEN),
+    fetchAllPullRequestFiles(gh, GH_REPO, prNumber, GH_TOKEN),
   ]);
 
   const prBody = pr.body ?? '';
@@ -172,7 +193,7 @@ async function main() {
       Promise.resolve(checkDedupSearch(prBody, prTitle)),
       Promise.resolve(checkTestCoverage(files, prTitle)),
       Promise.resolve(checkLockfile(files, author, branch)),
-      checkDependencies(files, GH_TOKEN, GH_REPO, prNumber, pr.base?.ref),
+      checkDependencies(files, GH_TOKEN, GH_REPO, prNumber, pr.base?.ref, gh),
     ]);
 
   const allFailures = [
@@ -189,7 +210,7 @@ async function main() {
 
   // Post comment if there are failures/informational, or update existing comment
   await deliverComment(async () => {
-    const existing = await findExistingComment(ghFetch, GH_TOKEN, GH_REPO, prNumber);
+    const existing = await findExistingComment(gh, GH_TOKEN, GH_REPO, prNumber);
     if (allFailures.length > 0 || informational.length > 0 || existing) {
       await upsertComment(GH_TOKEN, GH_REPO, prNumber, commentBody, existing);
     }

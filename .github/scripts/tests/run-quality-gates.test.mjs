@@ -1,9 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  budgetBoundFetch,
   buildComment,
   deliverComment,
   findExistingComment,
@@ -297,4 +299,46 @@ test('main posts the comment through deliverComment, not directly', () => {
   const main = source.slice(source.indexOf('async function main()'));
   assert.match(main, /await deliverComment\(async \(\) => \{\s*const existing = await findExistingComment\(/);
   assert.equal((main.match(/findExistingComment\(/g) ?? []).length, 1);
+});
+
+test('deliverComment: a failed delivery records comment_delivered=false; a delivered one records nothing', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'rqg-'));
+  const failed = path.join(dir, 'failed');
+  const ok = path.join(dir, 'ok');
+  writeFileSync(failed, '');
+  writeFileSync(ok, '');
+  await deliverComment(async () => { throw new Error('GitHub API POST → 403'); }, failed);
+  await deliverComment(async () => {}, ok);
+  assert.equal(readFileSync(failed, 'utf8'), 'comment_delivered=false\n');
+  assert.equal(readFileSync(ok, 'utf8'), '');
+});
+
+test('commitperclip-review: an undelivered comment is not reported as "see commitperclip comment"', () => {
+  assert.match(workflow, /QUALITY_COMMENT_DELIVERED: \$\{\{ steps\.quality\.outputs\.comment_delivered \}\}/);
+  assert.match(workflow, /elif \[ "\$\{QUALITY_COMMENT_DELIVERED\}" = "false" \]; then\s*\n\s*echo "One or more quality gates failed, but the commitperclip comment could not be posted/);
+});
+
+// Each read gets only what is left of ONE budget measured from script start,
+// so paginated reads cannot each draw a fresh RATE_LIMIT_RETRY_BUDGET_MS.
+test('budgetBoundFetch: reads share one shrinking budget and get 0 once it is spent', async () => {
+  const seen = [];
+  let clock = 1_000;
+  const gh = budgetBoundFetch(1_000, 100, async (_p, _t, options) => { seen.push(options.retryBudgetMs); }, () => clock);
+  await gh('/a', 't');
+  clock = 1_060;
+  await gh('/b', 't');
+  clock = 1_500;
+  await gh('/c', 't');
+  assert.deepEqual(seen, [100, 40, 0]);
+});
+
+test('main routes every read through the shared budget, not bare ghFetch', () => {
+  const source = readFileSync(
+    path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../run-quality-gates.mjs'),
+    'utf8',
+  );
+  const main = source.slice(source.indexOf('async function main()'));
+  assert.match(main, /const gh = budgetBoundFetch\(Date\.now\(\)\)/);
+  assert.equal((main.match(/\bghFetch\b/g) ?? []).length, 0);
+  assert.match(main, /checkDependencies\([^)]*, gh\)/);
 });
