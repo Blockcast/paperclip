@@ -163,12 +163,18 @@ export async function validateSensitivePaths(token, repo, prNumber, baseRef, fet
     try {
       await fetchFromGitHub(buildContentsPath(repo, path, resolvedBaseRef), token);
     } catch (err) {
-      // 404 means the file/directory no longer exists at this path
-      if (String(err.message).includes('404')) stale.push(path);
-      // Everything else re-throws so we don't silently miss it. ghFetch has
-      // already spent its rate-limit retry budget by the time a rate-limit
-      // error reaches here, and it arrives carrying RATE_LIMIT_NOT_EVALUATED
-      // so the fatal handler can say the gate never ran (BLO-37010).
+      // A rate-limited read never completed, so it says nothing about the
+      // path. Re-throw it BEFORE the 404 match: its message carries wait and
+      // budget seconds, and any of them can be 404. ghFetch has already spent
+      // its retry budget, and the error carries RATE_LIMIT_NOT_EVALUATED so
+      // the fatal handler can say the gate never ran (BLO-37010).
+      if (err?.rateLimited) throw err;
+      // 404 means the file/directory no longer exists at this path. Match
+      // ghFetch's own "→ <status>" delimiter, not a bare "404": the message
+      // also carries the request URL, whose ref is a base SHA that can
+      // contain those digits.
+      if (String(err.message).includes('→ 404')) stale.push(path);
+      // Everything else re-throws so we don't silently miss it.
       else throw err;
     }
   }));

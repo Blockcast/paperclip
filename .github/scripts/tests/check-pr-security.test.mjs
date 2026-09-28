@@ -498,6 +498,38 @@ test('validateSensitivePaths: returns only 404 paths and rethrows non-404 errors
   );
 });
 
+test('validateSensitivePaths: a rate-limited read re-throws even when its message contains 404 (BLO-37010)', async () => {
+  // The not-evaluated message interpolates wait and budget seconds; a reset
+  // ~404s out reads "Next retry needs 404s". That is not a missing path.
+  const realistic = new Error(
+    'RATE_LIMIT_NOT_EVALUATED: GitHub API GET /contents/foo → 403 rate limited. Next retry needs 404s but only 12s of the 60s budget remains.',
+  );
+  realistic.rateLimited = true;
+  await assert.rejects(
+    validateSensitivePaths('token', 'paperclipai/paperclip', 6469, 'main', async () => { throw realistic; }),
+    err => err === realistic,
+  );
+  // Precedence: the structured flag decides, not the message text. Even text
+  // that matches the 404 delimiter must not turn a read that never completed
+  // into a stale-path finding.
+  const flagged = new Error('RATE_LIMIT_NOT_EVALUATED: GitHub API GET /contents/foo → 404 rate limited.');
+  flagged.rateLimited = true;
+  await assert.rejects(
+    validateSensitivePaths('token', 'paperclipai/paperclip', 6469, 'main', async () => { throw flagged; }),
+    err => err === flagged,
+  );
+});
+
+test('validateSensitivePaths: a non-404 failure whose URL contains 404 re-throws, not stale (BLO-37010)', async () => {
+  // The request URL carries the base SHA as ?ref=, and a SHA can contain 404.
+  await assert.rejects(
+    validateSensitivePaths('token', 'paperclipai/paperclip', 6469, 'main', async () => {
+      throw new Error('GitHub API GET /repos/p/p/contents/foo?ref=ab404cd → 403: Resource not accessible');
+    }),
+    /403: Resource not accessible/,
+  );
+});
+
 // ── scanTestPatterns ─────────────────────────────────────────────────────────
 
 test('scanTestPatterns: flags outbound fetch in test file', () => {

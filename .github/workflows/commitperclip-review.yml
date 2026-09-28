@@ -173,6 +173,15 @@ jobs:
         if: >-
           (github.event.pull_request.user.login || steps.pr_context.outputs.author) != 'dependabot[bot]' &&
           steps.quality.outcome == 'failure'
+        env:
+          # Set by exitFatal when a rate limit outlived the retry budget. The
+          # step stays red either way; only its explanation changes, because
+          # no commitperclip comment exists for a run whose gates never ran.
+          QUALITY_NOT_EVALUATED: ${{ steps.quality.outputs.not_evaluated }}
         run: |
-          echo "One or more quality gates failed. See commitperclip comment on the PR for details."
+          if [ "${QUALITY_NOT_EVALUATED}" = "true" ]; then
+            echo "Quality gates did not run: a GitHub rate limit outlived the retry budget (see the ::error:: annotation from the step above). This is not a verdict on the diff; re-run the job."
+          else
+            echo "One or more quality gates failed. See commitperclip comment on the PR for details."
+          fi
           exit 1

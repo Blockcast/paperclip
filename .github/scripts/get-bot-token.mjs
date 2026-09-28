@@ -9,6 +9,7 @@
  * These are used by all other gate scripts.
  */
 import { createSign } from 'node:crypto';
+import { appendFileSync } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 
@@ -147,7 +148,7 @@ export async function ghFetch(path, token, options = {}) {
 // Every gate script funnels its fatal path through here so a rate-limit
 // exhaustion cannot be read as a verdict on the code. Without this the failing
 // check is indistinguishable from a genuine finding (BLO-37010).
-export function exitFatal(err, gateLabel, exit = process.exit) {
+export function exitFatal(err, gateLabel, exit = process.exit, outputFile = process.env.GITHUB_OUTPUT) {
   console.error(err.message);
   if (err?.rateLimited) {
     console.error(
@@ -155,6 +156,9 @@ export function exitFatal(err, gateLabel, exit = process.exit) {
       `retry budget, so no gate ran. This is NOT a quality or ` +
       `security finding — re-run the job once the limit clears.`
     );
+    // A later workflow step reports this step's failure in its own words; the
+    // output lets it say "did not run" instead of re-asserting "failed".
+    if (outputFile) appendFileSync(outputFile, 'not_evaluated=true\n');
   }
   exit(1);
 }
