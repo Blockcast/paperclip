@@ -2712,7 +2712,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // push a new head; the review it declared absent landed on that exact head
     // 72 minutes after the second notice, and a push would have voided it plus
     // both pending markers plus 10/10 green required contexts.
-    expect(notice[0]?.body).not.toContain("push a new head");
+    // Regex, not substring: master's own replacement wording was "pushing a new
+    // head voids any at-head attestation and is the last resort" — the same
+    // destructive advice one inflection apart, which toContain("push a new
+    // head") passes on. Mutation-tested: that wording trips this and not the
+    // substring form.
+    expect(notice[0]?.body).not.toMatch(/push(?:ing)? a new head/i);
     // The band that lets a reader tell a dead review from a slow one (BLO-34410).
     expect(notice[0]?.body).toContain("p50 of ~4h11m");
     // ...and the three things a push actually costs, named.
