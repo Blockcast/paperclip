@@ -4,14 +4,15 @@ import { basename, join, resolve } from "node:path";
 import { CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY } from "../services/ccrotate-capacity-retry.js";
 
 /**
- * Pins the third copy of `penstockAdvertisedResumeAt` (BLO-35263).
+ * Pins the fourth copy of `penstockAdvertisedResumeAt` (BLO-35263).
  *
- * The key is written in three places that must agree, and only the TS constant
- * is rename-safe. Exporting it lets `queued-run-age-metrics.ts` interpolate
- * rather than repeat the literal, which makes a rename loud for two of the
- * three. The on-call triage query lives in a Helm template and cannot import a
- * TS constant, so the third copy is pinned here instead -- by the test rather
- * than by the compiler, because there is nothing else that can hold it.
+ * The key is named in four places that must agree, and only the TS constant
+ * is rename-safe. Exporting it lets `queued-run-age-metrics.ts` and the
+ * `parked-agents` route read through it rather than repeat the literal, which
+ * makes three of the four rename-safe. The on-call triage query lives in a Helm
+ * template and cannot import a TS constant, so the fourth copy is pinned here
+ * instead -- by the test rather than by the compiler, because there is nothing
+ * else that can hold it.
  *
  * Without this, a rename compiles clean and no existing test fails: the metrics
  * suite writes the literal into `result_json` itself, so it moves with the

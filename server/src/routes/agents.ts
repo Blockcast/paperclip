@@ -72,6 +72,7 @@ import { environmentService } from "../services/environments.js";
 import { resolveEnvironmentExecutionTarget } from "../services/environment-execution-target.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { derivePaperclipPrReview } from "../services/heartbeat.js";
+import { CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY } from "../services/ccrotate-capacity-retry.js";
 import {
   evaluateStrandedRunRecovery,
   STRANDED_RUN_RECOVERY_MIN_AGE_MS,
@@ -4810,6 +4811,10 @@ export function agentRoutes(
     );
     const parked = visible.map((row) => {
       const result = (row.resultJson ?? {}) as Record<string, unknown>;
+      // Read through the writer's binding: `result` is `Record<string, unknown>`,
+      // so a bare-literal property read here would not be type-checked and a
+      // rename would silently null this field (BLO-35263).
+      const advertisedResumeAt = result[CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY];
       const dueMs = row.scheduledRetryAt?.getTime() ?? null;
       return {
         agentId: row.agentId,
@@ -4844,8 +4849,7 @@ export function agentRoutes(
         penstockReason: typeof result.penstockReason === "string" ? result.penstockReason : null,
         penstockRetryAfterSeconds:
           typeof result.penstockRetryAfterSeconds === "number" ? result.penstockRetryAfterSeconds : null,
-        penstockAdvertisedResumeAt:
-          typeof result.penstockAdvertisedResumeAt === "string" ? result.penstockAdvertisedResumeAt : null,
+        penstockAdvertisedResumeAt: typeof advertisedResumeAt === "string" ? advertisedResumeAt : null,
         capacityParkClampedFrom:
           typeof result.penstockCapacityParkClampedFrom === "string"
             ? result.penstockCapacityParkClampedFrom

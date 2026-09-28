@@ -196,23 +196,23 @@ export function resolveCcrotateCapacityRetry(
  *
  * Exported for the same reason as {@link CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY}
  * below, but the drift it guards is worse because it crosses a language
- * boundary. Three sites must agree and
- * only this one is rename-safe: the writer below, the `result_json ->> ...`
+ * boundary. Four sites must agree: the writer below, the `result_json ->> ...`
  * SQL fragment in `queued-run-age-metrics.ts` that computes the overdue gauge's
- * effective due time, and the on-call triage query embedded in
- * `deploy/helm/paperclip/templates/prometheusrule.yaml`.
+ * effective due time, the `parked-agents` projection in `routes/agents.ts`
+ * (the endpoint the alert's runbook sends on-call to), and the on-call triage
+ * query embedded in `deploy/helm/paperclip/templates/prometheusrule.yaml`.
  *
- * A rename that misses either consumer compiles clean and fails silently in
+ * A rename that misses any consumer compiles clean and fails silently in
  * the paging direction: `greatest` ignores the NULL from the now-unmatched key,
  * the gauge degrades to the bare `scheduled_retry_at` column, and it resumes
  * paging on exactly the capacity-clamped population BLO-34782 removed — while
  * the triage query the responder reaches for degrades identically at the same
  * moment, so the instrument used to check the alert corroborates it.
  *
- * Interpolating this binding into the SQL fragment makes a rename loud for two
- * of the three. The YAML cannot import a TS constant, so the third is pinned
- * instead by `prometheusrule-result-json-keys.test.ts`, which asserts every
- * occurrence in that query equals this value.
+ * Reading through this binding in the SQL fragment and the route makes three
+ * of the four rename-safe. The YAML cannot import a TS constant, so the fourth
+ * is pinned instead by `prometheusrule-result-json-keys.test.ts`, which
+ * asserts every occurrence in that query equals this value.
  */
 export const CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY = "penstockAdvertisedResumeAt";
 
