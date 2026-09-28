@@ -39,6 +39,18 @@ STARTUP_TIMEOUT_SECONDS="${PREFLIGHT_STARTUP_TIMEOUT_SECONDS:-600}"
 # tests can drive real waits without spending real minutes; nothing in CI or the
 # deploy job sets it.
 POLL_SECONDS="${PREFLIGHT_POLL_SECONDS:-5}"
+# The Job's TTL is counted past this script's last read of it, not from the
+# Job finishing, because on a failed Job those are a full run budget apart:
+# phase 2's `kubectl wait --for=condition=complete` never sees Complete go true
+# on a failed Job, so it returns only when TIMEOUT_SECONDS runs out
+# (kubernetes/kubectl#1629; see the stub note in
+# scripts/check-pending-migration-preflight-phases.test.js), and only then are
+# the logs, status.reason and the `failed` condition read. A fixed TTL races
+# those reads as soon as the run budget approaches it, and the loser is a
+# genuine FAILED verdict reported as a vanished pod. The 300s beyond the run
+# budget covers the POLL_SECONDS gap before phase 2 starts, the 10s `failed`
+# wait and kubectl round-trips, however far the run budget is raised.
+JOB_TTL_SECONDS=$(( TIMEOUT_SECONDS + 300 ))
 
 [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "DIGEST is not a sha256 digest: ${DIGEST}" >&2; exit 1; }
 
@@ -48,7 +60,7 @@ trap cleanup EXIT
 
 # Both non-verdict exits need these: they carry the pull duration, the image
 # size and the eviction message that otherwise force the operator to go
-# describe a pod the job's 300s TTL is already deleting.
+# describe a pod the job's TTL is already deleting.
 dump_pod_events() {
   echo "--- pod events ---"
   if [ -n "${pod_name:-}" ]; then
@@ -72,7 +84,7 @@ metadata:
     paperclip.dev/purpose: migration-preflight
 spec:
   backoffLimit: 0
-  ttlSecondsAfterFinished: 300
+  ttlSecondsAfterFinished: ${JOB_TTL_SECONDS}
   template:
     metadata:
       labels:
@@ -216,9 +228,9 @@ fi
 # whatever upstream adds next) is disruption. An API-initiated eviction (drain,
 # autoscaler, descheduler) deletes the pod instead, so the read fails; that is
 # kept distinct from an empty reason. A gone pod's logs are gone too, so there is no
-# remediation to point at either way. ttlSecondsAfterFinished (300s) cannot
-# remove a pod that finished normally before this read, which runs as soon as
-# phase 2 sees the Job terminal.
+# remediation to point at either way. The Job's own TTL cannot be what removed
+# a pod that finished normally: this read lands up to a full run budget after
+# the Job finished, and JOB_TTL_SECONDS is counted past that.
 pod_reason="$(kubectl -n "${NS}" get pod "${pod_name}" -o jsonpath='{.status.reason}' 2>/dev/null)" || pod_reason="__gone__"
 case "${pod_reason}" in
   "")

@@ -7,7 +7,7 @@
 // allowance -- and a static assertion cannot tell that apart from a fix.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -70,7 +70,7 @@ if [ -f "$STUB_STATE/start" ]; then start=$(cat "$STUB_STATE/start"); else start
 elapsed=$(( now - start ))
 echo "$args" >> "$STUB_STATE/calls"
 case "$args" in
-  *"apply -f"*)            cat >/dev/null; exit 0 ;;
+  *"apply -f"*)            cat > "$STUB_STATE/manifest"; exit 0 ;;
   *"delete job"*)          exit 0 ;;
   *"get pods -l job-name"*) [ "\${STUB_NO_POD:-0}" = 1 ] || echo "preflight-pod-0"; exit 0 ;;
   *"startedAt"*)
@@ -126,6 +126,8 @@ exit 0
 function runPreflight(env = {}) {
   const dir = mkdtempSync(join(tmpdir(), "preflight-stub-"));
   const kubectl = join(dir, "kubectl");
+  const manifestPath = join(dir, "manifest");
+  const manifest = () => (existsSync(manifestPath) ? readFileSync(manifestPath, "utf8") : "");
   writeFileSync(kubectl, STUB);
   chmodSync(kubectl, 0o755);
 
@@ -148,9 +150,10 @@ function runPreflight(env = {}) {
   };
 
   try {
-    return { code: 0, output: execFileSync("bash", [SCRIPT], { ...options, stdio: "pipe" }) };
+    const output = execFileSync("bash", [SCRIPT], { ...options, stdio: "pipe" });
+    return { code: 0, output, manifest: manifest() };
   } catch (error) {
-    return { code: error.status ?? 1, output: `${error.stdout ?? ""}${error.stderr ?? ""}` };
+    return { code: error.status ?? 1, output: `${error.stdout ?? ""}${error.stderr ?? ""}`, manifest: manifest() };
   }
 }
 
@@ -280,6 +283,25 @@ test("a pre-flight pod deleted after its container starts is not reported as a m
   assert.doesNotMatch(output, /a pending migration needs its index precreated/);
   assert.match(output, /INCONCLUSIVE/);
   assert.match(output, /pre-flight pod no longer exists/);
+});
+
+test("the job's TTL outlives the reads a raised run budget delays", () => {
+  // A failed Job is not seen by phase 2 until the run budget runs out (see the
+  // condition=complete stub note), and only then does the script read the logs
+  // and status.reason. A TTL counted from the Job finishing would cascade the
+  // pod away mid-wait once the budget approached it, and a genuine FAILED
+  // verdict would read as a vanished pod. 900s is three times the fixed 300s
+  // TTL the Job carried before; the stub's complete result returns at once, so
+  // the raised budget costs no wall clock.
+  const runBudget = 900;
+  const { code, output, manifest } = runPreflight({ PREFLIGHT_TIMEOUT_SECONDS: String(runBudget) });
+
+  assert.equal(code, 0, output);
+  const ttl = Number(manifest.match(/^\s*ttlSecondsAfterFinished:\s*(\d+)\s*$/m)?.[1]);
+  assert.ok(
+    ttl > runBudget,
+    `the Job must outlive a ${runBudget}s run budget, or the reads after it race the TTL (got ttlSecondsAfterFinished=${ttl})`,
+  );
 });
 
 test("a check that completes between polls is not mistaken for never having started", () => {
