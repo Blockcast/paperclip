@@ -9,12 +9,15 @@
 // distinguish the two, so this script goes back to the Actions API for the
 // per-job detail the aggregator cannot see.
 //
-// Two independent signals, either of which is sufficient:
+// Three independent signals, any of which is sufficient:
 //
 //   1. A `failure`-level annotation whose message is a known runner-loss
 //      string ("The operation was canceled.", "The runner has received a
 //      shutdown signal.", "lost communication with the server").
 //   2. The job concluded `failure` but NO step concluded `failure`.
+//   3. The job never reached its own body: every step the workflow declares is
+//      `skipped`, and the only steps that failed are the runner's pre-body
+//      setup. See PRE_BODY_SETUP_STEP_NAMES below.
 //
 // Signal 2 alone is not enough, and the asymmetry matters: an empty failing-step
 // set reliably means an abort, but a NON-empty one means nothing. On runner loss
@@ -25,6 +28,17 @@
 // carried "The operation was canceled." AND an empty failing-step set, while
 // genuine failures (e2e job 96224412919, policy job 96228076444) carried
 // "Process completed with exit code 1." and a non-empty one.
+//
+// That asymmetry is correct for a kill mid-body, and it is exactly what leaves
+// signal 3 with work to do (PEN-3583). When the runner dies BEFORE the body
+// starts, the failing step is the runner setup itself, so the failing-step set
+// is non-empty and signal 2 declines; and the annotation is "Process completed
+// with exit code 130." rather than a cancellation string, so signal 1 declines
+// too. Measured: run 36303595922 attempt 2, job 108655477890 ("General tests
+// (workspaces-b)") — `Set up runner` `failure`, every declared step `skipped`,
+// no repository checked out, no dependency installed, not one test run, and
+// `verify` still announced it as something that "may reflect a real problem
+// with the PR diff".
 //
 // One case defeats both signals and is therefore handled as an override ahead
 // of them: a `timeout-minutes` expiry, which GitHub renders in the same shape as
@@ -68,6 +82,29 @@ const RUNNER_LOSS_PATTERNS = [
 // is never classified), so nothing is broken. A future step-level timeout on a
 // lane would need its own pattern here.
 const JOB_TIMEOUT_PATTERNS = [/has exceeded the maximum execution time/i];
+
+// PEN-3583, signal 3. GitHub wraps every job in synthetic steps it owns rather
+// than the workflow: `Set up job` and `Set up runner` run before the first
+// declared step, and `Complete job` runs after the last one. Everything else in
+// `steps` is the job BODY — the steps `pr.yml` actually declares.
+//
+// The two sets are split because they are load-bearing in opposite directions.
+// A failure confined to the pre-body set means the lane died before it could
+// read anything the PR wrote; the postamble is merely excluded from the
+// all-skipped test below, because GitHub runs `Complete job` even on a job that
+// died in setup and marks it `success`. That is the trap in this shape: the
+// measured job's steps are NOT "all skipped after checkout" — steps 3-9 are
+// skipped and step 10 `Complete job` is `success` — so a rule phrased as "every
+// step from checkout onward is skipped" matches nothing and the signal is born
+// inert. Matching on the declared body only is what makes it fire.
+//
+// Names, not indices: a step's position moves whenever `pr.yml` gains or loses
+// a step, and these three names are GitHub's own and stable across lanes.
+const PRE_BODY_SETUP_STEP_NAMES = new Set(["set up job", "set up runner"]);
+const RUNNER_POSTAMBLE_STEP_NAMES = new Set(["complete job"]);
+
+const normalizedStepName = (step) =>
+  typeof step?.name === "string" ? step.name.trim().toLowerCase() : "";
 
 /**
  * Classify a single Actions job as an infrastructure kill or a real failure.
@@ -129,6 +166,60 @@ export function classifyJobFailure(job, annotations = null) {
   const steps = Array.isArray(job?.steps) ? job.steps : [];
   const hasFailingStep = steps.some((step) => step?.conclusion === "failure");
   if (!hasFailingStep) return "infrastructure";
+
+  // Signal 3 (PEN-3583): the job never reached its own body.
+  //
+  // Sound on a stronger ground than either signal above. Those two infer an
+  // interruption from how the wreckage LOOKS — an annotation string, or a step
+  // shape that a kill happens to leave behind. This one reads a property of the
+  // lane: a job whose every declared step is `skipped` never checked out a
+  // repository, never installed a dependency and never ran a test, so it cannot
+  // have OBSERVED the diff, and a lane that did not observe the diff cannot be
+  // evidence about it. That holds whatever killed the runner, so no annotation
+  // string needs to be enumerated in advance.
+  //
+  // Deliberately NOT matched on the exit code, though the measured instance
+  // carries "Process completed with exit code 130." (SIGINT, 128+2) and that is
+  // already distinguishable from the "exit code 1." of a genuine failure. A test
+  // process may legitimately exit on a signal — a suite that shells out to
+  // something killed by the OOM killer exits 137 — so an exit code is a fact
+  // about one process at one moment, whereas "nothing the workflow declared
+  // ever ran" is a property of the whole lane. Structural, not a timing artifact.
+  //
+  // Disjoint from the `timeout-minutes` override in two independent ways, and
+  // the ordering is the one that does not depend on being right about the shape:
+  // the override returns above, so it wins positionally whatever the steps look
+  // like (asserted by test, with a fixture carrying this exact shape AND a
+  // timeout annotation). Separately, a job-level expiry leaves the in-flight
+  // step `cancelled` and the steps BEFORE it `success` — TIMED_OUT_JOB's
+  // `Checkout repository` is `success` — so it fails the all-skipped test here
+  // as well. The second fact is the one BLO-28813/BLO-33313 care about; the
+  // first is what keeps it true if GitHub ever renders a timeout differently.
+  //
+  // Scope caveat, in the spirit of the step-level-timeout note above: this
+  // excuses a lane for a diff that cannot reach runner setup. A workflow's
+  // `container:` or `services:` block IS diff-controlled and IS consumed by
+  // `Set up runner`, so a PR that pointed one at a bad image would fail here for
+  // a reason genuinely its own. No lane in `pr.yml` declares either today
+  // (checked at this commit), so nothing is currently mislabelled — but a lane
+  // that gains one would need that case excluded here.
+  const bodySteps = steps.filter((step) => {
+    const name = normalizedStepName(step);
+    return !PRE_BODY_SETUP_STEP_NAMES.has(name) && !RUNNER_POSTAMBLE_STEP_NAMES.has(name);
+  });
+  const everyFailureIsPreBodySetup = steps
+    .filter((step) => step?.conclusion === "failure")
+    .every((step) => PRE_BODY_SETUP_STEP_NAMES.has(normalizedStepName(step)));
+  // `bodySteps.length > 0` guards against the vacuous read: a job we cannot see
+  // any declared step for has not been SHOWN to have skipped its body, and
+  // `every` on an empty array would answer `true` and excuse it anyway.
+  if (
+    bodySteps.length > 0 &&
+    bodySteps.every((step) => step?.conclusion === "skipped") &&
+    everyFailureIsPreBodySetup
+  ) {
+    return "infrastructure";
+  }
 
   return "reported";
 }
