@@ -422,10 +422,21 @@ export function describeHeldAgentStartLocks(): Array<{
  *
  * No-op when this agent's lock is not held, so a mark that lands after the
  * section released cannot create a phantom entry.
+ *
+ * Re-marking the phase the section is already in is also a no-op, because
+ * `phaseSinceMs` means "since this phase was entered".
+ * `startNextQueuedRunForAgent` marks `claim` once per candidate inside its
+ * loop, so an unconditional reset would restart the clock on every iteration:
+ * a stall spent grinding 200 candidates would report a small `phaseMs`
+ * throughout, and only a single hung `claimQueuedRun` could ever show
+ * `phaseMs` close to `heldMs` — defeating the reading documented above, which
+ * is the line that names the blocker. Guarding here rather than at that one
+ * call site covers every looped mark, including future ones.
  */
 export function markAgentStartLockPhase(agentId: string, phase: string): void {
   const entry = heldSinceByAgent.get(agentId);
   if (!entry) return;
+  if (entry.phase === phase) return;
   entry.phase = phase;
   entry.phaseSinceMs = Date.now();
 }
