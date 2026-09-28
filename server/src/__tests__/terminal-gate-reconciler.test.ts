@@ -301,6 +301,8 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
      */
     monitorAttemptCount?: number;
     monitorLastTriggeredAt?: Date | null;
+    /** BLO-36289: the monitor's own horizon, independent of `nextCheckAt`. */
+    monitorTimeoutAt?: Date | null;
   }) {
     const id = randomUUID();
     const lastTriggeredAt = "monitorLastTriggeredAt" in input
@@ -334,9 +336,13 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
         lastDecisionId: null,
         lastDecisionOutcome: null,
         monitor: {
-          status: lastTriggeredAt === null ? "scheduled" : "triggered",
+          // Keyed on BOTH halves, not on `lastTriggeredAt` alone: TG15 exists to
+          // prove the two columns can disagree, and deriving this from one of
+          // them silently re-correlates them inside the fixture.
+          status: attemptCount === 0 && lastTriggeredAt === null ? "scheduled" : "triggered",
           nextCheckAt: input.monitorNextCheckAt?.toISOString() ?? null,
           lastTriggeredAt: lastTriggeredAt?.toISOString() ?? null,
+          timeoutAt: input.monitorTimeoutAt?.toISOString() ?? null,
           attemptCount,
           notes: "merged=NO",
           scheduledBy: "assignee",
@@ -799,6 +805,67 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
     expect(posted).toHaveLength(1);
     expect(posted[0]!.body).toContain("nothing is polling it");
     expect(posted[0]!.body).not.toContain("live wake path");
+  });
+
+  it("uses the stranded copy for a never-polled monitor already past its own timeout", async () => {
+    // TG14's shape (eligible row, never evaluated, first check an hour out) with
+    // a `timeoutAt` already behind us — "check in 1h, give up 1h ago". Nothing
+    // constrains `nextCheckAt <= timeoutAt`, and `buildInitialIssueMonitorFields`
+    // only rejects a monitor exhausted AT ARM TIME, so this arms fine and the
+    // scheduler's next evaluation clears it `timeout_exceeded` rather than firing
+    // it. Selection eligibility cannot see that — it is a bounds question — so
+    // dropping the `exhaustedMonitorClearReason` conjunct at the call site must
+    // fail this test and leave TG14 green.
+    const { companyId, agentId } = await createCompany("TG19");
+    const issueId = await insertStrandedGateIssue({
+      companyId,
+      agentId,
+      identifier: "TG19-1",
+      gateSignals: ["pr:blockcast/paperclip#1281:checks"],
+      status: "in_progress",
+      monitorNextCheckAt: new Date(NOW.getTime() + 60 * 60 * 1000),
+      monitorTimeoutAt: new Date(NOW.getTime() - 60 * 60 * 1000),
+      neverTriggered: true,
+    });
+
+    const result = await reconcileTerminalGates(db, {
+      now: NOW,
+      readPullRequestGate: mergedReader(new Set(["blockcast/paperclip#1281"])),
+    });
+
+    expect(result).toMatchObject({ scanned: 1, resolved: 1 });
+    const posted = await commentsFor(issueId);
+    expect(posted).toHaveLength(1);
+    expect(posted[0]!.body).toContain("nothing is polling it");
+    expect(posted[0]!.body).not.toContain("live wake path");
+  });
+
+  it("still claims a live wake path when the monitor's timeout is ahead of its first check", async () => {
+    // The negative control for TG19: same shape, `timeoutAt` in the FUTURE. A
+    // declared timeout is the common case, so a conjunct that rejected every
+    // bounded monitor would silently delete the armed branch — TG14 alone cannot
+    // catch that, because it leaves `timeoutAt` null.
+    const { companyId, agentId } = await createCompany("TG20");
+    const issueId = await insertStrandedGateIssue({
+      companyId,
+      agentId,
+      identifier: "TG20-1",
+      gateSignals: ["pr:blockcast/paperclip#1281:checks"],
+      status: "in_progress",
+      monitorNextCheckAt: new Date(NOW.getTime() + 60 * 60 * 1000),
+      monitorTimeoutAt: new Date(NOW.getTime() + 6 * 60 * 60 * 1000),
+      neverTriggered: true,
+    });
+
+    const result = await reconcileTerminalGates(db, {
+      now: NOW,
+      readPullRequestGate: mergedReader(new Set(["blockcast/paperclip#1281"])),
+    });
+
+    expect(result).toMatchObject({ scanned: 1, resolved: 1 });
+    const posted = await commentsFor(issueId);
+    expect(posted).toHaveLength(1);
+    expect(posted[0]!.body).toContain("live wake path");
   });
 
   it("does not resolve an issue that still has an unresolved blocker edge", async () => {
