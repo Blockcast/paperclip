@@ -715,6 +715,50 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
     expect(outcomes.map((outcome) => outcome.status)).toEqual(["fulfilled", "fulfilled"]);
   });
 
+  it("claims a fresh incident when the threshold is re-crossed after a dismissal (BLO-37275)", async () => {
+    const { companyId, agentId } = await createBudgetFixture();
+    const cancelWorkForScope = vi.fn().mockResolvedValue(undefined);
+    const service = budgetService(db, { cancelWorkForScope });
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "agent",
+      scopeId: agentId,
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      amount: 100,
+      warnPercent: 80,
+      hardStopEnabled: false,
+      notifyEnabled: true,
+      isActive: true,
+    });
+
+    const softEvent = await insertCostEvent({ companyId, agentId, costCents: 80 });
+    await service.evaluateCostEvent(softEvent);
+
+    // The board dismisses it, the scope keeps burning, and the threshold is crossed
+    // again. `budget_incidents_policy_window_threshold_idx` is partial on
+    // `status <> 'dismissed'`, so the dismissed row sits outside it and must not
+    // arbitrate the next claim. The claim's ON CONFLICT restates that predicate, so
+    // this is the one path where the two copies drifting apart would show up: a
+    // predicate that dropped the `<> 'dismissed'` term would match the dismissed row,
+    // swallow the insert, and leave the re-crossing permanently uncarded.
+    await db.update(budgetIncidents).set({ status: "dismissed" }).where(eq(budgetIncidents.companyId, companyId));
+    await service.evaluateCostEvent(softEvent);
+
+    const incidentRows = await db
+      .select()
+      .from(budgetIncidents)
+      .where(eq(budgetIncidents.companyId, companyId));
+    expect(incidentRows.map((row) => row.status).sort()).toEqual(["dismissed", "open"]);
+
+    // A fresh incident means a fresh card: the dismissal is the board saying "not
+    // this one", not "stop telling me about this policy for the rest of the window".
+    const cards = await db.select().from(approvals).where(eq(approvals.companyId, companyId));
+    expect(cards).toHaveLength(2);
+    const reopened = incidentRows.find((row) => row.status === "open");
+    expect(cards.map((card) => card.id)).toContain(reopened!.approvalId);
+  });
+
   it("files the override card at warnPercent with multi-day runway, once, while the scope is still running (BLO-28793)", async () => {
     const { companyId, agentId } = await createBudgetFixture();
     const cancelWorkForScope = vi.fn().mockResolvedValue(undefined);
