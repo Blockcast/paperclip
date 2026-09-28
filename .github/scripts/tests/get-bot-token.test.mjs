@@ -1,5 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   RATE_LIMIT_MIN_WAIT_MS,
   RATE_LIMIT_NOT_EVALUATED,
@@ -191,6 +194,27 @@ test('exitFatal: a rate-limit exhaustion exits 1 AND says the gate never ran', (
   }
   assert.equal(code, 1, 'still a red check — it just is not a verdict on the code');
   assert.ok(lines.some(l => l.includes('DID NOT EVALUATE THE DIFF')), lines.join('\n'));
+});
+
+test('exitFatal: a rate-limit exhaustion marks the step output not_evaluated; a finding does not', () => {
+  // The workflow's follow-up step reads this to say "did not run" instead of
+  // "gates failed" -- no commitperclip comment exists for a run that never ran.
+  const dir = mkdtempSync(join(tmpdir(), 'exitfatal-'));
+  const out = join(dir, 'github_output');
+  writeFileSync(out, '');
+  const error = console.error;
+  console.error = () => {};
+  try {
+    exitFatal(new Error('Missing test coverage for server/src/foo.ts'), 'quality gates', () => {}, out);
+    assert.equal(readFileSync(out, 'utf8'), '', 'a real finding must not be marked not-evaluated');
+    const err = new Error(`${RATE_LIMIT_NOT_EVALUATED}: ...`);
+    err.rateLimited = true;
+    exitFatal(err, 'quality gates', () => {}, out);
+  } finally {
+    console.error = error;
+  }
+  assert.equal(readFileSync(out, 'utf8'), 'not_evaluated=true\n');
+  rmSync(dir, { recursive: true, force: true });
 });
 
 // ── installation resolution ──────────────────────────────────────────────────
