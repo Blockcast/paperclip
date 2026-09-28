@@ -26,7 +26,7 @@
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { PGlite } from "@electric-sql/pglite";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import {
   AlertDeliveryIncompleteError,
@@ -51,6 +51,7 @@ const ALERTNAME = "CronJobSuccessStale";
 const SELF = workerFenceIdentity();
 
 let db: PGlite;
+let truncateAll: string;
 
 async function applyMigrations(pg: PGlite): Promise<void> {
   const dir = path.resolve(__dirname, "../../migrations");
@@ -63,6 +64,24 @@ async function applyMigrations(pg: PGlite): Promise<void> {
   for (const file of files) {
     await pg.exec(await readFile(path.join(dir, file), "utf8"));
   }
+}
+
+/**
+ * One TRUNCATE covering every table the migrations created, plus the stubbed
+ * core tables. Read from the catalog rather than hardcoded, so a table added by
+ * a later migration cannot silently leak state between tests.
+ */
+async function buildTruncateAll(pg: PGlite): Promise<string> {
+  const rows = (
+    await pg.query<{ qualified: string }>(
+      `SELECT quote_ident(schemaname) || '.' || quote_ident(tablename) AS qualified
+         FROM pg_tables WHERE schemaname IN ($1, 'public')`,
+      [NAMESPACE],
+    )
+  ).rows;
+  // A catalog query that matched nothing would make truncation a silent no-op.
+  expect(rows.length).toBeGreaterThan(0);
+  return `TRUNCATE ${rows.map((r) => r.qualified).join(", ")} RESTART IDENTITY CASCADE;`;
 }
 
 function realDb(pg: PGlite) {
@@ -233,12 +252,18 @@ function deferred<T = void>() {
   return { promise, resolve };
 }
 
-beforeEach(async () => {
+/** See the identical note in aggregate-fence-restart-safety.test.ts (BLO-31036). */
+beforeAll(async () => {
   db = new PGlite();
   await applyMigrations(db);
+  truncateAll = await buildTruncateAll(db);
 });
 
-afterEach(async () => {
+beforeEach(async () => {
+  await db.exec(truncateAll);
+});
+
+afterAll(async () => {
   await db.close();
 });
 

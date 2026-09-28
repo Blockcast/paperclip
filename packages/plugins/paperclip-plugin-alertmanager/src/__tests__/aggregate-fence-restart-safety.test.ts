@@ -22,7 +22,7 @@
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { PGlite } from "@electric-sql/pglite";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import {
   AlertDeliveryIncompleteError,
@@ -53,6 +53,7 @@ const DEAD_PREDECESSOR = { instanceId: "instance-dead-predecessor", slot: SELF.s
 const FOREIGN_HOST = { instanceId: "instance-foreign", slot: "paperclip-api-xyz" };
 
 let db: PGlite;
+let truncateAll: string;
 
 /**
  * Apply every migration in `migrations/`, in filename order, exactly as the
@@ -74,6 +75,24 @@ async function applyMigrations(pg: PGlite): Promise<void> {
   for (const file of files) {
     await pg.exec(await readFile(path.join(dir, file), "utf8"));
   }
+}
+
+/**
+ * One TRUNCATE covering every table the migrations created, plus the stubbed
+ * core tables. Read from the catalog rather than hardcoded, so a table added by
+ * a later migration cannot silently leak state between tests.
+ */
+async function buildTruncateAll(pg: PGlite): Promise<string> {
+  const rows = (
+    await pg.query<{ qualified: string }>(
+      `SELECT quote_ident(schemaname) || '.' || quote_ident(tablename) AS qualified
+         FROM pg_tables WHERE schemaname IN ($1, 'public')`,
+      [NAMESPACE],
+    )
+  ).rows;
+  // A catalog query that matched nothing would make truncation a silent no-op.
+  expect(rows.length).toBeGreaterThan(0);
+  return `TRUNCATE ${rows.map((r) => r.qualified).join(", ")} RESTART IDENTITY CASCADE;`;
 }
 
 /** A `ctx.db` backed by the real database. */
@@ -245,12 +264,25 @@ const deliver = (ctx: PluginContext, fenceWait?: Partial<AggregateFenceWaitPolic
     fenceWait,
   );
 
-beforeEach(async () => {
+/**
+ * Migrate once, not once per test. Building a fresh PGlite and replaying every
+ * migration for each of these tests put the hook within noise of vitest's 10s
+ * default `hookTimeout`, so under merge-group CPU contention it tipped over and
+ * ejected unrelated PRs from the queue (BLO-31036, reported 2026-09-28).
+ * Per-test isolation comes from truncating instead: these tests set all their
+ * own state explicitly via `seedFence`, so an empty schema is all they need.
+ */
+beforeAll(async () => {
   db = new PGlite();
   await applyMigrations(db);
+  truncateAll = await buildTruncateAll(db);
 });
 
-afterEach(async () => {
+beforeEach(async () => {
+  await db.exec(truncateAll);
+});
+
+afterAll(async () => {
   await db.close();
 });
 
