@@ -80,7 +80,9 @@ jobs:
       # First step, so the quality gates can size their retry budget from what
       # is left of this job's timeout-minutes (qualityRetryBudgetMs).
       - name: Record job start
-        run: echo "REVIEW_JOB_STARTED_AT_MS=$(date +%s%3N)" >> "$GITHUB_ENV"
+        # Whole seconds, not GNU-only %3N: a date without %N would emit a
+        # literal "%3N", and the floored stamp only makes the budget smaller.
+        run: echo "REVIEW_JOB_STARTED_AT_MS=$(( $(date +%s) * 1000 ))" >> "$GITHUB_ENV"
 
       - name: Checkout base branch (never PR or queue-candidate code)
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -186,16 +188,17 @@ jobs:
           (github.event.pull_request.user.login || steps.pr_context.outputs.author) != 'dependabot[bot]' &&
           steps.quality.outcome == 'failure'
         env:
-          # Set by exitFatal when a rate limit outlived the retry budget. The
-          # step stays red either way; only its explanation changes, because
-          # no commitperclip comment exists for a run whose gates never ran.
+          # Set by exitFatal when no gate ran (a rate limit outlived the retry
+          # budget, or the budget could not be sized). The step stays red either
+          # way; only its explanation changes, because no commitperclip comment
+          # exists for a run whose gates never ran.
           QUALITY_NOT_EVALUATED: ${{ steps.quality.outputs.not_evaluated }}
           # Set by deliverComment when the verdict exists but its comment
           # could not be posted, so there is no comment to point at.
           QUALITY_COMMENT_DELIVERED: ${{ steps.quality.outputs.comment_delivered }}
         run: |
           if [ "${QUALITY_NOT_EVALUATED}" = "true" ]; then
-            echo "Quality gates did not run: a GitHub rate limit outlived the retry budget (see the ::error:: annotation from the step above). This is not a verdict on the diff; re-run the job."
+            echo "Quality gates did not run (the ::error:: annotation from the step above says why). This is not a verdict on the diff."
           elif [ "${QUALITY_COMMENT_DELIVERED}" = "false" ]; then
             echo "One or more quality gates failed, but the commitperclip comment could not be posted (see the ::warning:: from the step above). The failures are listed in the 'Run quality gates' step log."
           else

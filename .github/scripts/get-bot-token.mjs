@@ -145,17 +145,18 @@ export async function ghFetch(path, token, options = {}) {
   }
 }
 
-// Every gate script funnels its fatal path through here so a rate-limit
-// exhaustion cannot be read as a verdict on the code. Without this the failing
-// check is indistinguishable from a genuine finding (BLO-37010).
+// Every gate script funnels its fatal path through here so a failure that
+// evaluated nothing cannot be read as a verdict on the code: a rate-limit
+// exhaustion (ghFetch sets err.rateLimited), or any error a caller marks with
+// err.notEvaluated = '<why no gate ran>'. Without this the failing check is
+// indistinguishable from a genuine finding (BLO-37010).
 export function exitFatal(err, gateLabel, exit = process.exit, outputFile = process.env.GITHUB_OUTPUT) {
   console.error(err.message);
-  if (err?.rateLimited) {
-    console.error(
-      `::error::${gateLabel} DID NOT EVALUATE THE DIFF. A GitHub rate limit outlived the ` +
-      `retry budget, so no gate ran. This is NOT a quality or ` +
-      `security finding — re-run the job once the limit clears.`
-    );
+  const why = err?.rateLimited
+    ? 'A GitHub rate limit outlived the retry budget, so no gate ran. Re-run the job once the limit clears.'
+    : err?.notEvaluated;
+  if (why) {
+    console.error(`::error::${gateLabel} DID NOT EVALUATE THE DIFF. ${why} This is NOT a quality or security finding.`);
     // A later workflow step reports this step's failure in its own words; the
     // output lets it say "did not run" instead of re-asserting "failed".
     if (outputFile) appendFileSync(outputFile, 'not_evaluated=true\n');
