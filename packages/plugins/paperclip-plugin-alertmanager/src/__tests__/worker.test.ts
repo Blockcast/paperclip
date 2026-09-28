@@ -641,11 +641,19 @@ describe("handleWebhook — delivery timing (BLO-37485)", () => {
   it("names the alert in flight once a delivery passes the halfway mark", async () => {
     const { ctx, mocks } = mkCtx();
     const envelope = baseEnvelope({
+      // Three, not two: the latch only has anything to latch against from the
+      // *second* over-threshold iteration onward. With two alerts this test
+      // passed with the latch deleted — the guard was untested until the batch
+      // was long enough to re-warn.
       alerts: [
         baseAlert(),
         baseAlert({
           labels: { alertname: "ArcRunnerPoolSaturated", severity: "warning" },
           fingerprint: "ffff0000ffff0000",
+        }),
+        baseAlert({
+          labels: { alertname: "CiliumAgentRestarting", severity: "warning" },
+          fingerprint: "aaaa1111aaaa1111",
         }),
       ],
     });
@@ -671,12 +679,13 @@ describe("handleWebhook — delivery timing (BLO-37485)", () => {
       .filter((line) => line.includes("slow delivery"));
 
     // Exactly one: the warning latches, so a 29-alert batch cannot emit 29
-    // near-identical lines and bury the delivery that matters.
+    // near-identical lines and bury the delivery that matters. Alerts 2 and 3
+    // are both past the threshold here, so this genuinely pins the latch.
     expect(slow).toHaveLength(1);
     // The attribution AC1 asks for — which alert, and how far in.
     expect(slow[0]).toContain("ArcRunnerPoolSaturated");
     expect(slow[0]).toContain("ffff0000ffff0000");
-    expect(slow[0]).toContain("1 of 2 alerts");
+    expect(slow[0]).toContain("1 of 3 alerts");
   });
 
   it("stays silent on a delivery that never approaches the deadline", async () => {
