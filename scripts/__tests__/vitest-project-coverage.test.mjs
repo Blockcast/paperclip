@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -319,4 +319,91 @@ test("UNEXECUTED_WITH_TESTS has no stale entries", () => {
       `${name} is now executed by CI -- remove it from UNEXECUTED_WITH_TESTS and close ${issue}`,
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// BLO-37369: the same "reads as configured, does nothing" failure, one layer
+// down. The driver used to hand `--testTimeout=30000 --hookTimeout=60000` to
+// every workspaces-b invocation. Those flags are accepted without error and
+// IGNORED: the root config declares its packages via `projects: [...]`, and a
+// root-level CLI timeout does not reach a project's own config. So all 18
+// workspaces-b packages ran at Vitest's 5s test / 10s hook defaults -- exactly
+// the condition the flags' own comment claimed to prevent -- and the resulting
+// hook timeouts read as unrelated flakes, evicting merge-queue candidates.
+//
+// Measured on Vitest 4.1.8 with a 12s `beforeEach`: passing --hookTimeout=60000
+// on the CLI fails at `Hook timed out in 10000ms`; the same value in the
+// package's vitest.config.ts passes.
+//
+// These two tests are the mutation-testable guard. Moving a flag back into
+// arcWorkspaceVitestArgs fails the first; dropping a budget from any
+// workspaces-b package config fails the second. Note that asserting the flags
+// are PRESENT in the driver args is not a guard -- that assertion passed for
+// the entire period the flags were inert.
+// ---------------------------------------------------------------------------
+
+const ARC_TEST_TIMEOUT_MS = 30_000;
+const ARC_HOOK_TIMEOUT_MS = 60_000;
+
+function projectDirsByPackageName() {
+  return new Map(readConfiguredProjectDirs().map((dir) => [packageNameFor(dir), dir]));
+}
+
+function declaredTimeout(source, option) {
+  const match = new RegExp(`^\\s*${option}:\\s*([0-9_]+)`, "m").exec(source);
+  return match ? Number(match[1].replaceAll("_", "")) : null;
+}
+
+test("the workspaces-b driver passes no Vitest timeout flags", () => {
+  const offending = driverProjects().generalWorkspacesBVitestArgs.filter((arg) =>
+    /^--(test|hook)Timeout(=|$)/.test(arg),
+  );
+
+  assert.deepEqual(
+    offending,
+    [],
+    `scripts/run-vitest-stable.mjs passes ${offending.join(" ")} to the workspaces-b lane. ` +
+      `A root-level CLI timeout does not reach a project config -- Vitest accepts the flag ` +
+      `and ignores it, leaving every package on the 5s/10s defaults (BLO-37369). Set the ` +
+      `budget in the package's own vitest.config.ts instead.`,
+  );
+});
+
+test("every workspaces-b package declares the ARC timeout budgets in its own config", () => {
+  const dirsByName = projectDirsByPackageName();
+  const projects = driverProjects().generalWorkspacesBProjects;
+  assert.ok(projects.length > 0, "expected the driver to enumerate workspaces-b projects");
+
+  const wrong = [];
+  for (const name of projects) {
+    const dir = dirsByName.get(name);
+    assert.ok(dir, `${name} is run by the workspaces-b lane but is not in vitest.config.ts`);
+    const config = path.join(repoRoot, dir, "vitest.config.ts");
+    if (!existsSync(config)) {
+      wrong.push(`  - ${name} (${dir}): no vitest.config.ts, so it runs at Vitest's defaults`);
+      continue;
+    }
+    const source = readFileSync(config, "utf8");
+    for (const [option, expected] of [
+      ["testTimeout", ARC_TEST_TIMEOUT_MS],
+      ["hookTimeout", ARC_HOOK_TIMEOUT_MS],
+    ]) {
+      const declared = declaredTimeout(source, option);
+      if (declared === null) {
+        wrong.push(`  - ${name} (${dir}): ${option} is not declared`);
+      } else if (declared < expected) {
+        wrong.push(`  - ${name} (${dir}): ${option} is ${declared}ms, below the ${expected}ms ARC budget`);
+      }
+    }
+  }
+
+  assert.deepEqual(
+    wrong,
+    [],
+    `These workspaces-b packages do not carry the ARC timeout budgets in their own ` +
+      `vitest.config.ts, so they run at Vitest's 5s test / 10s hook defaults under ARC ` +
+      `contention (BLO-37369):\n${wrong.join("\n")}\n\n` +
+      `The driver cannot set these for you -- a root-level CLI timeout is ignored by a ` +
+      `project config. Raising a budget above the ARC floor is fine; omitting it is not.`,
+  );
 });

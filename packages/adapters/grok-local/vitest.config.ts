@@ -8,7 +8,5 @@ export default defineConfig({
     // reach a project config, it is accepted and ignored (BLO-37369).
     testTimeout: 30_000,
     hookTimeout: 60_000,
-    environment: "node",
-    include: ["src/**/*.test.ts"],
   },
 });

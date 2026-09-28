@@ -66,13 +66,15 @@ const serializedServerVitestArgs = [
   "--no-file-parallelism",
   "--maxWorkers=1",
 ];
-// Workspace projects run concurrently inside each Vitest invocation. ARC CPU
-// contention can stretch otherwise healthy filesystem/process tests beyond
-// Vitest's 5-second default without indicating a hang.
-const arcWorkspaceVitestArgs = [
-  "--testTimeout=30000",
-  "--hookTimeout=60000",
-];
+// Per-test and per-hook budgets are deliberately NOT set here. The root config
+// declares its packages via `projects: [...]`, and a root-level Vitest CLI flag
+// does not reach a project's own config: `--hookTimeout=60000` is accepted
+// without error and ignored, so every workspaces-b package ran at Vitest's 5s
+// test / 10s hook defaults while this array read as protection (BLO-37369).
+// The ARC budgets now live in each package's vitest.config.ts, which is the
+// only place Vitest reads them. vitest-project-coverage.test.mjs fails if they
+// move back here.
+const arcWorkspaceVitestArgs = [];
 
 function toRepoPath(file) {
   return toRepoPathFromRoot(repoRoot, file);
