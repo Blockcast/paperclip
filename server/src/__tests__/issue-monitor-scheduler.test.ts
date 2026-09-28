@@ -16,6 +16,7 @@ import {
   executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
+  instanceSettings,
   issueComments,
   issueDocuments,
   issueRelations,
@@ -27,6 +28,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
 import { heartbeatService, ISSUE_MONITOR_DISPATCH_LAPSE_MS, ISSUE_MONITOR_LIVE_CONSUMER_MAX_AGE_MS, ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS } from "../services/heartbeat.js";
 import {
   DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
@@ -48,8 +50,8 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   const seededAgentIds = new Set<string>();
   const heartbeatServices = new Set<ReturnType<typeof heartbeatService>>();
-  const createHeartbeat = () => {
-    const service = heartbeatService(db);
+  const createHeartbeat = (options?: Parameters<typeof heartbeatService>[1]) => {
+    const service = heartbeatService(db, options);
     heartbeatServices.add(service);
     return service;
   };
@@ -146,6 +148,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     await db.delete(agents);
     await db.delete(companySkills);
     await db.delete(companies);
+    await db.delete(instanceSettings);
   }
 
   afterEach(async () => {
@@ -1517,48 +1520,84 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   // monitor `triggered` forever — BLO-29606's permanent strand re-entered through
   // a new door. The asymmetry is the point: a false reap self-corrects via the
   // owner wake, a never-reap does not, so a wedged queue has to degrade back to
-  // bounded BLO-29606 behaviour.
-  it("reaps a triggered monitor whose queued run is older than the live-consumer ceiling", async () => {
+  // bounded BLO-29606 behaviour. Every case below asserts the reap past a queued
+  // run older than the ceiling; they differ only in what the reap does to it.
+  //
+  // `runVsWorktreeCutoff` arms a worktree execution cutoff before or after that
+  // run's createdAt; omitted means production (no worktree runtime, no cutoff).
+  async function reapPastOverAgeQueuedRun(runVsWorktreeCutoff?: "run_before_cutoff" | "run_after_cutoff") {
     const { companyId, agentId, issueId, lastTriggeredAt } = await seedExpiredTriggeredFixture({ timeoutAt: null });
     const tickAt = new Date(lastTriggeredAt.getTime() + ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS + 60 * 1000);
-    // Wedged: queued since well before the ceiling and never dispatched. The
-    // measured production shape is a row created before the worktree execution
-    // cutoff, which every dispatch/resume path filters on, so it is never
-    // dispatched, never resumed, and therefore never terminal.
-    const wedgedRunId = randomUUID();
+    const overAgeRunId = randomUUID();
+    const overAgeCreatedAt = new Date(tickAt.getTime() - ISSUE_MONITOR_LIVE_CONSUMER_MAX_AGE_MS - 60 * 60 * 1000);
     await db.insert(heartbeatRuns).values({
-      id: wedgedRunId,
+      id: overAgeRunId,
       companyId,
       agentId,
       status: "queued",
       invocationSource: "scheduled",
-      createdAt: new Date(tickAt.getTime() - ISSUE_MONITOR_LIVE_CONSUMER_MAX_AGE_MS - 60 * 60 * 1000),
+      createdAt: overAgeCreatedAt,
       contextSnapshot: { issueId, wakeReason: "issue_monitor_due" },
     });
 
-    const heartbeat = createHeartbeat();
-    await heartbeat.tickTimers(tickAt);
+    let runtimeEnv: Record<string, string | undefined> | undefined;
+    if (runVsWorktreeCutoff) {
+      // The issue row is created at wall-clock now, after either cutoff, so its
+      // own system wakes (the recovery wake) are not cutoff-skipped.
+      runtimeEnv = { ...process.env, PAPERCLIP_IN_WORKTREE: "true", PAPERCLIP_INSTANCE_ID: "test-worktree" };
+      const cutoffOffsetMs = runVsWorktreeCutoff === "run_before_cutoff" ? 60 * 60 * 1000 : -60 * 60 * 1000;
+      const cutoff = new Date(overAgeCreatedAt.getTime() + cutoffOffsetMs);
+      await instanceSettingsService(db, { runtimeEnv, now: () => cutoff })
+        .updateExperimental({ enableWorktreeRunExecution: true });
+    }
+    await createHeartbeat({ runtimeEnv }).tickTimers(tickAt);
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
     expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
       status: "cleared",
       clearReason: "trigger_stalled",
     });
-
-    // Ally review (c0i1): the reap's recovery wake is task-scoped to this issue,
-    // so coalescePendingTaskScopeWake would absorb it into the wedged run (no age
-    // bound there) and nothing would ever dispatch it. The reap has to retire the
-    // run it just declared dead so the wake lands on a fresh run.
-    const wedged = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, wedgedRunId)).then((rows) => rows[0]!);
-    expect(wedged).toMatchObject({ status: "cancelled", errorCode: "issue_monitor_live_consumer_expired" });
-    const recoveryRuns = await db
+    const overAgeRun = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, overAgeRunId)).then((rows) => rows[0]!);
+    const otherRecoveryRuns = await db
       .select()
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.agentId, agentId))
       .then((rows) => rows.filter((row) =>
-        row.id !== wedgedRunId &&
+        row.id !== overAgeRunId &&
         (row.contextSnapshot as Record<string, unknown> | null)?.wakeReason === "issue_monitor_recovery"));
-    expect(recoveryRuns).toHaveLength(1);
+    return { overAgeRun, otherRecoveryRuns };
+  }
+
+  // Ally review (7799aed9, Important 1): in production the dispatch scan has no
+  // age filter and is oldest-first, so an over-age queued run is at the head of
+  // the queue, not wedged. The reap must leave it, and the context coalesced into
+  // it, alone; the recovery wake rides on it instead of creating a second run.
+  it("reaps past an over-age queued run without cancelling it outside a worktree", async () => {
+    const { overAgeRun, otherRecoveryRuns } = await reapPastOverAgeQueuedRun();
+    expect(overAgeRun.status).not.toBe("cancelled");
+    expect(overAgeRun.errorCode).not.toBe("issue_monitor_live_consumer_expired");
+    expect((overAgeRun.contextSnapshot as Record<string, unknown> | null)?.wakeReason).toBe("issue_monitor_recovery");
+    expect(otherRecoveryRuns).toHaveLength(0);
+  });
+
+  // Same, in an armed worktree for a run created AFTER the cutoff: the dispatch
+  // scan admits it, so the cutoff bound on the cancel has to spare it.
+  it("reaps past an over-age queued run created after an armed worktree cutoff without cancelling it", async () => {
+    const { overAgeRun, otherRecoveryRuns } = await reapPastOverAgeQueuedRun("run_after_cutoff");
+    expect(overAgeRun.status).not.toBe("cancelled");
+    expect(overAgeRun.errorCode).not.toBe("issue_monitor_live_consumer_expired");
+    expect((overAgeRun.contextSnapshot as Record<string, unknown> | null)?.wakeReason).toBe("issue_monitor_recovery");
+    expect(otherRecoveryRuns).toHaveLength(0);
+  });
+
+  // Ally review (c0i1): a run created before an armed worktree's execution cutoff
+  // is filtered out of every dispatch scan, so it is never terminal. The reap's
+  // task-scoped recovery wake would coalesce into it (no age bound there) and
+  // never dispatch, so the reap retires it and the wake lands on a fresh run.
+  it("cancels an over-age queued run created before an armed worktree cutoff so the recovery wake gets a fresh run", async () => {
+    const { overAgeRun, otherRecoveryRuns } = await reapPastOverAgeQueuedRun("run_before_cutoff");
+    expect(overAgeRun).toMatchObject({ status: "cancelled", errorCode: "issue_monitor_live_consumer_expired" });
+    expect(otherRecoveryRuns).toHaveLength(1);
   });
 
   // BLO-35155 (Ally review, Important 2): `scheduled_retry` is excluded from

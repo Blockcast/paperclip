@@ -15362,6 +15362,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
     const triggeredStallThreshold = new Date(now.getTime() - ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS);
     const liveConsumerFloor = new Date(now.getTime() - ISSUE_MONITOR_LIVE_CONSUMER_MAX_AGE_MS);
+    const worktreeExecutionCutoff = await getWorktreeExecutionCutoff();
     const expiredMonitorTimeoutCondition = and(
       sql`${issues.executionState} -> 'monitor' ->> 'status' = 'triggered'`,
       or(
@@ -15493,14 +15494,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           )
           .returning();
         // BLO-35155 (Ally review c0i1): the fallback arm reaps past a queued run
-        // only once it is older than liveConsumerFloor, i.e. once the ceiling has
-        // declared it undispatchable. The recovery wake this reap enqueues is
-        // scoped to the same issue, and coalescePendingTaskScopeWake has no age
-        // bound, so it would be absorbed into that dead run and never dispatched.
-        // Retire those runs with the claim so the wake lands on a fresh run. An
+        // once it is older than liveConsumerFloor. The recovery wake this reap
+        // enqueues is scoped to the same issue, and coalescePendingTaskScopeWake
+        // has no age bound, so it coalesces into that run. That is only a strand
+        // when the run can never be dispatched, which is true of exactly one
+        // shape: a run created before an armed worktree's execution cutoff,
+        // which the queued-run dispatch scan filters out. Retire those runs with
+        // the claim so the wake lands on a fresh run. This is deliberately not
+        // narrowed to the run that consumed this monitor's trigger: every row it
+        // touches is one the dispatch scan will never admit, so no wake merged
+        // into it can be delivered whichever wake queued it.
+        //
+        // Outside that shape (always, in production: the cutoff is null) an
+        // over-age queued run is at the HEAD of the oldest-first dispatch queue,
+        // and it is a coalescing accumulator carrying every wake merged into it.
+        // Cancelling it would discard that context for a status-only recovery
+        // run, so it is left alone and the recovery wake rides on it. An
         // explicit timeoutAt never consulted the ceiling, so it is left alone.
-        if (updated?.assigneeAgentId && parseObject(parseObject(updated.executionState).monitor).timeoutAt == null) {
-          const reason = "Cancelled because it stayed queued past the issue monitor live-consumer ceiling; the monitor recovery wake replaces it";
+        if (
+          worktreeExecutionCutoff &&
+          updated?.assigneeAgentId &&
+          parseObject(parseObject(updated.executionState).monitor).timeoutAt == null
+        ) {
+          const reason = "Cancelled because it was queued before the worktree execution cutoff, so it can never dispatch, and past the issue monitor live-consumer ceiling; the monitor recovery wake replaces it";
           const expiredConsumers = await tx
             .update(heartbeatRuns)
             .set({
@@ -15517,6 +15533,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 eq(heartbeatRuns.contextIssueId, updated.id),
                 eq(heartbeatRuns.status, "queued"),
                 lt(heartbeatRuns.createdAt, liveConsumerFloor),
+                lt(heartbeatRuns.createdAt, worktreeExecutionCutoff),
               ),
             )
             .returning({ id: heartbeatRuns.id, wakeupRequestId: heartbeatRuns.wakeupRequestId });
