@@ -1506,15 +1506,19 @@ describe("startServer feedback export wiring", () => {
   //
   // ⚠️ Whole-file run only, same `setInterval`/`unref` reason as the test above.
   it("clears the recovery-chain latch even when a settle recorder throws", async () => {
+    const schedulerIntervalMs = 30000;
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: true,
-      heartbeatSchedulerIntervalMs: 30000,
+      heartbeatSchedulerIntervalMs: schedulerIntervalMs,
     }));
+    // Filter on the delay rather than taking the last registration: the
+    // watchdog and the two config-gated sweepers also call `setInterval`, and
+    // whether they register after the tick is outside this test's control.
     let intervalCallback: (() => void) | null = null;
     const setIntervalSpy = vi
       .spyOn(globalThis, "setInterval")
-      .mockImplementation(((callback: () => void) => {
-        intervalCallback = callback;
+      .mockImplementation(((callback: () => void, delay?: number) => {
+        if (delay === schedulerIntervalMs) intervalCallback = callback;
         return 1 as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
 
@@ -1588,15 +1592,18 @@ describe("startServer feedback export wiring", () => {
   // alone with `-t` makes the mocked call the first one and fails on
   // `timer.unref is not a function`. That is the harness, not a regression.
   it("exports recovery-chain skip, in-flight and duration series as the latch drives them", async () => {
+    const schedulerIntervalMs = 30000;
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: true,
-      heartbeatSchedulerIntervalMs: 30000,
+      heartbeatSchedulerIntervalMs: schedulerIntervalMs,
     }));
+    // Delay-filtered for the same reason as the test above: this must be the
+    // scheduler tick, not whichever timer happened to register last.
     let intervalCallback: (() => void) | null = null;
     const setIntervalSpy = vi
       .spyOn(globalThis, "setInterval")
-      .mockImplementation(((callback: () => void) => {
-        intervalCallback = callback;
+      .mockImplementation(((callback: () => void, delay?: number) => {
+        if (delay === schedulerIntervalMs) intervalCallback = callback;
         return 1 as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
 
