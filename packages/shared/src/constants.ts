@@ -317,10 +317,12 @@ export type IssueRecoveryActionKind = (typeof ISSUE_RECOVERY_ACTION_KINDS)[numbe
  * BLO-37677: does this kind's action exist to RESTORE a wake path to the source issue?
  *
  * `classifySourceRecoveryRevalidation` cancels an active action once the source issue is
- * observed to have a wake path of its own (human owner, agent owner on a dispatchable
- * status, typed review participant, pending interaction/approval, scheduled monitor). That
- * theory holds only for the kinds below marked `true`, whose whole job is to put a wake path
- * back — once the issue has one, the action genuinely is redundant.
+ * observed to have a wake path of its own. The full set of branches the carve-out covers is
+ * six, not five: unresolved first-class blockers on a `blocked` issue (which drain via
+ * `issue_blockers_resolved_sweep`), human owner, agent owner on a dispatchable status, typed
+ * review participant, pending interaction/approval, and scheduled monitor. That theory holds
+ * only for the kinds below marked `true`, whose whole job is to put a wake path back — once
+ * the issue has one, the action genuinely is redundant.
  *
  * It is wrong for `pr_review_non_convergence`, which escalates a *quality* condition to a
  * *different* owner and deliberately leaves the source issue assigned to the looping author
