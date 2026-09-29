@@ -115,9 +115,19 @@ const LARGE_PROMPT_THRESHOLD_BYTES = MAX_ARG_STRLEN_BYTES - PROMPT_ENV_NAME.leng
 /** Linux caps one `NAME=value` string at MAX_ARG_STRLEN, including its NUL. */
 const MAX_ENV_STRING_BYTES = MAX_ARG_STRLEN_BYTES - 1;
 
+/** Budget for one variable's VALUE alone. The kernel bounds the whole
+ *  `NAME=value` string, so the name and the `=` are spent from the same
+ *  131_071 B — a long name buys a smaller value, not a bigger string. */
+const literalEnvValueBudget = (name: string) => MAX_ENV_STRING_BYTES - (name.length + 1);
+
 const WAKE_PAYLOAD_ENV_NAME = "PAPERCLIP_WAKE_PAYLOAD_JSON";
-/** Budget for the value alone — the kernel bounds the whole `NAME=value`. */
-const WAKE_PAYLOAD_MAX_VALUE_BYTES = MAX_ENV_STRING_BYTES - (WAKE_PAYLOAD_ENV_NAME.length + 1);
+const WAKE_PAYLOAD_MAX_VALUE_BYTES = literalEnvValueBudget(WAKE_PAYLOAD_ENV_NAME);
+
+/** Names the variables the choke-point guard below had to reduce, with the
+ *  byte length each one had before reduction. Present only when something was
+ *  actually shed, so its absence is itself the "nothing was dropped" signal. */
+const ENV_SHED_MARKER_NAME = "PAPERCLIP_ENV_SHED_JSON";
+
 const RUNTIME_CACHE_VOLUME_NAME = "runtime-cache";
 const RUNTIME_CACHE_MOUNT_PATH = "/runtime-cache";
 const RUNTIME_CACHE_SIZE_LIMIT = "20Gi";
@@ -484,6 +494,77 @@ function shedOversizeWakePayload(wake: Record<string, unknown>): string {
   });
 }
 
+/** Reduce one oversize literal env value to something `execve` will accept,
+ *  or null when this function cannot do it safely.
+ *
+ *  Every value here is a `NAME=value` string the kernel caps at
+ *  MAX_ARG_STRLEN; over it, `execve` fails E2BIG and the pod dies before any
+ *  model turn, so the run cannot report its own breakage and mislabels as
+ *  `k8s_pod_schedule_failed` (BLO-33503). BLO-36854 fixed that for the prompt
+ *  and BLO-37287 for the wake payload, one variable at a time — BLO-37868 is
+ *  the third instance, so this is placed at the shared choke point instead
+ *  (`buildEnvVars`), where it covers the unbounded literal nobody has noticed
+ *  yet as well as the three that are known.
+ *
+ *  Byte-truncation is not an option: a sliced JSON string is unparseable, so
+ *  it would lose the whole value rather than the largest part of it. But the
+ *  oversize literals in practice — PAPERCLIP_WORKSPACES_JSON,
+ *  _RUNTIME_SERVICE_INTENTS_JSON, _RUNTIME_SERVICES_JSON — are all
+ *  JSON.stringify of an array, and the longest array PREFIX that fits is
+ *  valid, same-shaped and parseable by a consumer that never learns it was
+ *  reduced. Anything not a JSON array returns null and is handled by the
+ *  caller; the caller marks either outcome. */
+function shedOversizeLiteralEnvValue(value: string, budget: number): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed)) return null;
+  // ponytail: re-stringifies per pop — O(n^2) in element count. These arrays
+  // are a handful of elements whose SIZE is what overflows, not their count;
+  // switch to a binary search over the prefix length if that ever inverts.
+  const items = [...parsed];
+  while (items.length > 0) {
+    const json = JSON.stringify(items);
+    if (Buffer.byteLength(json, "utf8") <= budget) return json;
+    items.pop();
+  }
+  // Even one element overflows the budget (a single 200 KiB `cwd` does it).
+  // `[]` keeps consumers that iterate from throwing; the marker carries why.
+  return "[]";
+}
+
+/** The choke-point guard. Returns a value whose `NAME=value` string is under
+ *  the kernel ceiling, recording in `shedBytes` when it had to reduce one.
+ *
+ *  A no-op for every normally-sized variable, which is all of them today:
+ *  the largest observed on a live pod is ~1 KB against a ~131 KB budget
+ *  (BLO-37868 AC1). It exists because the UPSTREAM is unbounded, not because
+ *  the measurement is close — `project_workspaces.cwd/repo_url/repo_ref` are
+ *  unbounded `text` columns and the row count per project has no cap, so the
+ *  emitted length is bounded by nothing. Same disposition as BLO-37287.
+ *
+ *  Note this deliberately does NOT guard the secretKeyRef branch. A
+ *  Secret-backed env var is still resolved into the container environment and
+ *  still becomes an execve `NAME=value` string, so it is capped identically —
+ *  but shedding a credential would break auth silently, which is worse than
+ *  the crash. Sensitive values are credentials, which are bounded in practice.
+ *  The prompt path dodges the ceiling by being a Secret-backed FILE, not env. */
+function boundLiteralEnvValue(name: string, value: string, shedBytes: Record<string, number>): string | null {
+  const budget = literalEnvValueBudget(name);
+  const bytes = Buffer.byteLength(value ?? "", "utf8");
+  if (bytes <= budget) return value;
+  shedBytes[name] = bytes;
+  // The NAME alone spends the whole budget: no value, not even "", can make
+  // this string fit, so the variable cannot be emitted at all. Returning null
+  // drops it — the only case where the invariant costs the variable itself,
+  // and the marker still records it.
+  if (budget <= 0) return null;
+  return shedOversizeLiteralEnvValue(value, budget) ?? "";
+}
+
 function stringifyPaperclipWakePayload(wake: unknown): string | null {
   if (!wake || typeof wake !== "object") return null;
   try {
@@ -829,6 +910,12 @@ export const ENV_NAME_CLASSIFICATION: readonly EnvNameClassification[] = [
     name: "PAPERCLIP_WORKSPACES_JSON",
     classification: "SAFE_LITERAL",
     reason: "Serialized list of the same workspace coordinates for multi-workspace projects.",
+  },
+  {
+    name: "PAPERCLIP_ENV_SHED_JSON",
+    classification: "SAFE_LITERAL",
+    reason:
+      "Names of env vars this file had to shorten to stay under the kernel's per-string execve ceiling, with their original byte lengths. Env var NAMES and integers only — never any part of a shed VALUE — so it cannot carry credential material even when the variable it reports on did.",
   },
   {
     name: "AGENT_HOME",
@@ -1449,13 +1536,37 @@ function buildEnvVars(
   // for exactly the transformed values that still carry operator material.
   const sensitiveEnvData: Record<string, string> = {};
   const envVars: k8s.V1EnvVar[] = [];
+  // Byte length each shed variable had BEFORE reduction, keyed by name.
+  const shedBytes: Record<string, number> = {};
   for (const [name, value] of Object.entries(merged)) {
     if ((userEnvKeys.has(name) || isSensitiveEnvName(name)) && value) {
       sensitiveEnvData[name] = value;
       envVars.push({ name, valueFrom: { secretKeyRef: { name: envSecretName, key: name } } });
     } else {
-      envVars.push({ name, value });
+      const bounded = boundLiteralEnvValue(name, value, shedBytes);
+      if (bounded !== null) envVars.push({ name, value: bounded });
     }
+  }
+  // AC3: reduction must never be silent. Consumers of a shed variable see a
+  // well-formed shorter value and cannot tell it was cut, so the fact lives
+  // here instead — same `truncated`/`fallbackFetchNeeded` vocabulary the wake
+  // payload already uses and the agent skill already documents as "refetch
+  // from the API". Emitted only when something was shed.
+  const shedNames = Object.keys(shedBytes);
+  if (shedNames.length > 0) {
+    // Bounded by construction: the marker must never itself overflow the
+    // ceiling it exists to report on. Env names are attacker-shaped only via
+    // adapterConfig.env, so cap the list rather than trusting it to be short.
+    const listed = shedNames.slice(0, 20);
+    envVars.push({
+      name: ENV_SHED_MARKER_NAME,
+      value: JSON.stringify({
+        truncated: true,
+        fallbackFetchNeeded: true,
+        shedCount: shedNames.length,
+        shed: Object.fromEntries(listed.map((n) => [n.slice(0, 128), shedBytes[n]])),
+      }),
+    });
   }
 
   // Append valueFrom entries from the Deployment container (secretKeyRef,
