@@ -625,6 +625,85 @@ test("a declared step colliding with a synthetic name stays in the body", async 
   );
 });
 
+test("the body is bounded by step `number`, not by array position", async () => {
+  const { classifyJobFailure } = await import("../classify-lane-failures.mjs");
+
+  // The PEN-3583 shape with the array scrambled and `number` left truthful.
+  // Reading the preamble positionally made array order load-bearing for the
+  // first time, so the ordering key is asserted rather than assumed: nothing
+  // in the API contract promises the array arrives sorted, and the failure is
+  // silent if it ever does not.
+  //
+  // Unsorted, the leading run breaks at `Checkout repository` in position 0,
+  // so `Set up job` (`success`) falls inside the body and the all-skipped test
+  // declines — this returns "reported" without the sort.
+  assert.equal(
+    classifyJobFailure(
+      {
+        ...PRE_BODY_KILLED_JOB,
+        steps: [
+          { number: 3, name: "Checkout repository", conclusion: "skipped" },
+          { number: 1, name: "Set up job", conclusion: "success" },
+          { number: 2, name: "Set up runner", conclusion: "failure" },
+          { number: 4, name: "Run grouped general test suites", conclusion: "skipped" },
+          { number: 5, name: "Complete job", conclusion: "success" },
+        ],
+      },
+      PRE_BODY_KILLED_ANNOTATIONS,
+    ),
+    "infrastructure",
+    "classification must follow step `number` — a reordered array is the same job",
+  );
+});
+
+// A lane declaring `container:` / `services:` gets an `Initialize containers`
+// step, which is in NEITHER name set. Both consequences are asserted here
+// because the module's scope note claims them and an earlier revision of that
+// note claimed the opposite (it had `Set up runner` consuming the block).
+test("a container lane classifies on the container step, with no special-casing", async () => {
+  const { classifyJobFailure } = await import("../classify-lane-failures.mjs");
+
+  // Step shape measured on `postgres-tests (heavy 3/4)` in
+  // `Blockcast/penstock-llm-proxy-core` (job 104214352274): the preamble is
+  // three steps, not two.
+  const containerLaneSteps = (containerConclusion, runnerConclusion) => [
+    { number: 1, name: "Set up job", conclusion: "success" },
+    { number: 2, name: "Set up runner", conclusion: runnerConclusion },
+    { number: 3, name: "Initialize containers", conclusion: containerConclusion },
+    { number: 4, name: "Checkout repository", conclusion: "skipped" },
+    { number: 5, name: "Run grouped general test suites", conclusion: "skipped" },
+    { number: 6, name: "Complete job", conclusion: "success" },
+  ];
+
+  // A real pre-body kill: the container step is skipped alongside the declared
+  // steps, so it does not defeat the all-skipped test and the signal still
+  // fires. This is the inferred half of the scope note — if GitHub ever
+  // renders a killed container step as something other than `skipped`, this
+  // assertion is where that shows up.
+  assert.equal(
+    classifyJobFailure(
+      { ...PRE_BODY_KILLED_JOB, steps: containerLaneSteps("skipped", "failure") },
+      PRE_BODY_KILLED_ANNOTATIONS,
+    ),
+    "infrastructure",
+    "a container lane killed in the preamble observed no more of the diff than any other lane",
+  );
+
+  // The diff-controlled half: a bad image named by the PR fails at
+  // `Initialize containers`, which is in the body and is not excusable. It
+  // must keep the ordinary failure wording with no name added to either set —
+  // excusing it would announce a defect the PR really did introduce as a pool
+  // kill.
+  assert.equal(
+    classifyJobFailure(
+      { ...PRE_BODY_KILLED_JOB, steps: containerLaneSteps("failure", "success") },
+      [{ annotation_level: "failure", message: "Failed to pull image: manifest unknown" }],
+    ),
+    "reported",
+    "a `container:` image the diff chose is the diff's own failure, not infrastructure",
+  );
+});
+
 test("the timeout override still beats the pre-body signal", async () => {
   const { classifyJobFailure } = await import("../classify-lane-failures.mjs");
 

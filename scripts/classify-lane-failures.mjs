@@ -113,9 +113,16 @@ const JOB_TIMEOUT_PATTERNS = [/has exceeded the maximum execution time/i];
 // all-skipped test on its own.
 //
 // Names are still needed because indices alone will not do: a step's position
-// moves whenever `pr.yml` gains or loses a step, and the preamble is itself one
-// or two steps long depending on whether the job declares `container:` /
-// `services:`. These three names are GitHub's own and stable across lanes.
+// moves whenever `pr.yml` gains or loses a step. These three names are
+// GitHub's own and stable across lanes.
+//
+// The pre-body preamble is NOT always these two steps, and this set
+// deliberately does not chase the third. A job declaring `container:` / `services:` gets an
+// `Initialize containers` step of its own — measured, not inferred:
+// `postgres-tests (heavy 3/4)` in `Blockcast/penstock-llm-proxy-core` (job
+// 104214352274) renders `Set up job`, `Set up runner`, `Initialize
+// containers`, then its own declared steps. That name is absent here on
+// purpose; what it costs is worked through in the scope note on signal 3.
 //
 // The residual collision is narrow but real, and it runs in the UNSAFE
 // direction. A workflow whose FIRST declared step is named `Set up runner` is
@@ -184,15 +191,33 @@ const normalizedStepName = (step) =>
  * @param {Array<{name?: string, conclusion?: string}>} steps
  */
 function jobBodySteps(steps) {
+  // Reading position rather than name makes ARRAY ORDER load-bearing, where the
+  // previous whole-list name filter was order-independent. The API returns
+  // steps in `number` order and every step carries the field, so this sort is a
+  // no-op against real input — it retires the assumption instead of relying on
+  // it, and pins it by test.
+  //
+  // Guarded on the key being present throughout rather than sorted
+  // unconditionally: a comparator returning NaN is specified to compare EQUAL
+  // (`SortCompare`), so a partially-numbered list would not throw, it would
+  // interleave silently. With the key absent we keep declaration order, which
+  // is exactly the behaviour this replaces.
+  const ordered = steps.every((step) => Number.isFinite(step?.number))
+    ? steps.slice().sort((a, b) => a.number - b.number)
+    : steps;
+
   let start = 0;
-  while (start < steps.length && PRE_BODY_SETUP_STEP_NAMES.has(normalizedStepName(steps[start]))) {
+  while (
+    start < ordered.length &&
+    PRE_BODY_SETUP_STEP_NAMES.has(normalizedStepName(ordered[start]))
+  ) {
     start += 1;
   }
-  let end = steps.length;
-  while (end > start && RUNNER_POSTAMBLE_STEP_NAMES.has(normalizedStepName(steps[end - 1]))) {
+  let end = ordered.length;
+  while (end > start && RUNNER_POSTAMBLE_STEP_NAMES.has(normalizedStepName(ordered[end - 1]))) {
     end -= 1;
   }
-  return steps.slice(start, end);
+  return ordered.slice(start, end);
 }
 
 /**
@@ -288,12 +313,29 @@ export function classifyJobFailure(job, annotations = null) {
   // Scope caveat, in the spirit of the step-level-timeout note above: this
   // excuses a lane only for a diff that cannot reach the failing setup step.
   // `Set up job` resolves diff-controlled action refs and is excluded from the
-  // excusable set for exactly that reason (see above). The remaining exposure is
-  // `Set up runner`, which consumes a workflow's `container:` or `services:`
-  // block — also diff-controlled, so a PR that pointed one at a bad image would
-  // fail here for a reason genuinely its own. No lane in `pr.yml` declares
-  // either today (checked at this commit), so nothing is currently mislabelled —
-  // but a lane that gains one would need that case excluded here.
+  // excusable set for exactly that reason (see above), which leaves `Set up
+  // runner` as the only excusable failure.
+  //
+  // An earlier revision of this note claimed `Set up runner` consumes a
+  // workflow's `container:` / `services:` block, and that a lane gaining one
+  // would need excluding here. Both are wrong, and in the direction that
+  // invents work rather than hides exposure. GitHub gives that block a step of
+  // its own, `Initialize containers`, AFTER the preamble — measured on
+  // `postgres-tests (heavy 3/4)` in `Blockcast/penstock-llm-proxy-core` (job
+  // 104214352274). It is in neither name set, so it lands in `bodySteps` and
+  // needs no exclusion: a bad image fails THERE, at a non-`skipped`
+  // conclusion, which defeats the all-skipped test, and `Initialize
+  // containers` is not in EXCUSABLE_SETUP_FAILURE_STEP_NAMES either. Two
+  // independent grounds to decline, both automatic.
+  //
+  // The converse is worth stating because it is inferred where the above is
+  // measured: on a genuine pre-body kill the container step should be
+  // `skipped` alongside the declared steps, leaving this signal firing
+  // correctly. Should GitHub render it some other way the signal merely
+  // declines for that lane and the failure keeps today's wording. Safe in both
+  // directions, which is why no lane-specific handling is warranted ahead of a
+  // real instance. No lane in `pr.yml` declares `container:` or `services:`
+  // today (checked at this commit), so none of this is live.
   const bodySteps = jobBodySteps(steps);
   const everyFailureIsExcusableSetup = steps
     .filter((step) => step?.conclusion === "failure")
