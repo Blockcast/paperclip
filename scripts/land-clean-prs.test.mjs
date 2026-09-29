@@ -307,6 +307,9 @@ describe("per-fire cap", () => {
       ["a/one", true, 7, 0, rotted],
       ["a/two", true, 7, 3, rotted],
     ]);
+    // deepEqual is structural, so an empty `rotted` above matches any empty
+    // array. Identity is what main's `finally` relies on to report the cohort.
+    for (const call of calls) assert.equal(call[4], rotted);
   });
 });
 
