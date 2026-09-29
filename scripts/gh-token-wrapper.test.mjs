@@ -16,6 +16,13 @@ echo "GITHUB_TOKEN=\${GITHUB_TOKEN:-}"
 echo "ARGS=$*"
 `;
 
+// The wrapper's compiled-in default, used only when PAPERCLIP_GITHUB_TOKEN_FILE
+// is unset. Tests that exercise that branch MUST skip when this file exists:
+// inside an agent pod it holds the live bot token, and the stub gh below prints
+// GH_TOKEN to stdout, so running there would both break hermeticity and print a
+// live credential into the test log.
+const COMPILED_IN_DEFAULT_TOKEN_FILE = "/paperclip/.secrets/github-token/token";
+
 function withTempDir(fn) {
   const dir = mkdtempSync(path.join(os.tmpdir(), "gh-token-wrapper-test-"));
   try {
@@ -81,6 +88,31 @@ function runWrapper(dir, { tokenFileContent, tokenValue, args = ["api", "user"] 
   );
 }
 
+// Same premise-building as runWrapper, but hands back the raw process so a test
+// can assert on a non-zero exit. execFileSync throws on non-zero, which suits
+// the happy paths above and is useless for the exit-64 refusals below.
+// setTokenFileVar: false leaves PAPERCLIP_GITHUB_TOKEN_FILE unset, exercising
+// the compiled-in-default branch that must stay lenient for non-agent callers.
+function spawnWrapper(dir, { tokenFileContent, args = ["api", "user"], setTokenFileVar = true } = {}) {
+  const stubGhPath = path.join(dir, "gh.real");
+  writeFileSync(stubGhPath, STUB_GH_SOURCE);
+  chmodSync(stubGhPath, 0o755);
+
+  const env = sanitizedEnv({ GH_TOKEN_WRAPPER_REAL_GH: stubGhPath });
+
+  if (setTokenFileVar) {
+    if (tokenFileContent !== undefined) {
+      const tokenFilePath = path.join(dir, "token");
+      writeFileSync(tokenFilePath, tokenFileContent);
+      env.PAPERCLIP_GITHUB_TOKEN_FILE = tokenFilePath;
+    } else {
+      env.PAPERCLIP_GITHUB_TOKEN_FILE = path.join(dir, "does-not-exist");
+    }
+  }
+
+  return spawnSync("sh", [WRAPPER, ...args], { env, encoding: "utf8" });
+}
+
 test("exports GH_TOKEN/GITHUB_TOKEN from a fresh token file and execs through", () => {
   withTempDir((dir) => {
     const result = runWrapper(dir, { tokenFileContent: "ghs_freshtoken123\n" });
@@ -97,20 +129,55 @@ test("strips trailing newline/CR from the token file", () => {
   });
 });
 
-test("falls back to the real binary unmodified when the token file is absent", () => {
+// BLO-37977: the three tests that follow used to assert the opposite — that an
+// absent/empty/unreadable token file fell through to the real binary under
+// ambient auth. That is what turned a fleet credential fault into `gh` silently
+// doing nothing on a pod reporting healthy. With PAPERCLIP_GITHUB_TOKEN_FILE
+// set, the caller has named a credential and these are now refusals.
+test("refuses when PAPERCLIP_GITHUB_TOKEN_FILE names an absent file (BLO-37977)", () => {
   withTempDir((dir) => {
-    const result = runWrapper(dir, { args: ["auth", "status"] });
-    assert.equal(result.GH_TOKEN, "");
-    assert.equal(result.GITHUB_TOKEN, "");
-    assert.equal(result.ARGS, "auth status");
+    const proc = spawnWrapper(dir, { args: ["auth", "status"] });
+    assert.equal(proc.status, 64);
+    assert.match(proc.stderr, /is absent; refusing to run with ambient auth/);
+    // Must not have reached the real binary at all.
+    assert.equal(proc.stdout, "");
   });
 });
 
-test("falls back when the token file exists but is empty", () => {
+test("refuses when the token file exists but is empty (BLO-37977)", () => {
   withTempDir((dir) => {
-    const result = runWrapper(dir, { tokenFileContent: "" });
-    assert.equal(result.GH_TOKEN, "");
-    assert.equal(result.GITHUB_TOKEN, "");
+    const proc = spawnWrapper(dir, { tokenFileContent: "" });
+    assert.equal(proc.status, 64);
+    assert.match(proc.stderr, /is empty; refusing to run with ambient auth/);
+    assert.equal(proc.stdout, "");
+  });
+});
+
+test("refuses a whitespace-only token file rather than exporting a blank token (BLO-37977)", () => {
+  // `tr -d '\r\n'` leaves spaces and tabs behind, so without the whitespace
+  // fold this exported GH_TOKEN="  \t " and authenticated as nobody.
+  withTempDir((dir) => {
+    const proc = spawnWrapper(dir, { tokenFileContent: "  \t \n" });
+    assert.equal(proc.status, 64);
+    assert.match(proc.stderr, /is empty; refusing to run with ambient auth/);
+    assert.equal(proc.stdout, "");
+  });
+});
+
+test("still falls back to the real binary when PAPERCLIP_GITHUB_TOKEN_FILE is unset (non-agent image use)", (t) => {
+  // The refusals above must not reach a caller that never named a credential —
+  // that is the whole non-agent case the wrapper header promises. Skipped
+  // inside an agent pod, where the compiled-in default holds the live token and
+  // the stub gh would print it to stdout.
+  if (existsSync(COMPILED_IN_DEFAULT_TOKEN_FILE)) {
+    t.skip(`${COMPILED_IN_DEFAULT_TOKEN_FILE} exists; refusing to read a live credential`);
+    return;
+  }
+  withTempDir((dir) => {
+    const proc = spawnWrapper(dir, { args: ["auth", "status"], setTokenFileVar: false });
+    assert.equal(proc.status, 0);
+    assert.match(proc.stdout, /GH_TOKEN=\n/);
+    assert.match(proc.stdout, /ARGS=auth status/);
   });
 });
 
@@ -145,7 +212,7 @@ test("overrides a pre-existing GH_TOKEN/GITHUB_TOKEN in the caller's env (BLO-13
   });
 });
 
-test("logs a diagnostic to stderr and falls back when the token file exists but isn't readable (BLO-13241 review S2)", (t) => {
+test("refuses when the token file exists but isn't readable (BLO-13241 review S2; refusal per BLO-37977)", (t) => {
   // chmod-based unreadability is meaningless for root (root bypasses
   // permission bits entirely), which is how this repo's Docker build and
   // some CI runners execute. Skip rather than false-fail there.
@@ -167,19 +234,9 @@ test("logs a diagnostic to stderr and falls back when the token file exists but 
     });
 
     const proc = spawnSync("sh", [WRAPPER, "auth", "status"], { env, encoding: "utf8" });
-    assert.equal(proc.status, 0);
-    assert.match(proc.stderr, /exists but is not readable/);
-    const result = Object.fromEntries(
-      proc.stdout
-        .trim()
-        .split("\n")
-        .map((line) => {
-          const idx = line.indexOf("=");
-          return [line.slice(0, idx), line.slice(idx + 1)];
-        }),
-    );
-    assert.equal(result.GH_TOKEN, "");
-    assert.equal(result.GITHUB_TOKEN, "");
+    assert.equal(proc.status, 64);
+    assert.match(proc.stderr, /exists but is not readable; refusing to run with ambient auth/);
+    assert.equal(proc.stdout, "");
   });
 });
 
