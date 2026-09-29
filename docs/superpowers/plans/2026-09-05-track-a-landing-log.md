@@ -788,26 +788,28 @@ receipts.
 The remaining rows are open as of writing — #1985, #1976, #2020, #1774 all `state: OPEN`,
 `mergedAt: null` — so `still-queued` remains the accurate classification for the three of them that
 armed. For #2020 it is accurate only about the PR's state, not about the routine's: it never entered
-the queue. **No receipt printed a literal `confirmed-merged` row through `85529fad`**, because each
-merge fell outside the one-receipt confirmation window that had already resolved its row. (A later
-receipt did — to #2020, the row that never armed; see below.) Resolution-to-merge
-was 1d23h12m for #1990 (`aec91d73`, `2026-09-23T03:22:09Z`), 1d22h43m for #1804 (`aa6a0a70`,
-`2026-09-23T16:44:08Z`) and 1d07h58m for #2001 (`933af750`, `2026-09-25T07:18:04Z`) — #2001 is the
-sharpest of the three and still misses its window by more than a day. Every later receipt that names
+the queue. **No receipt printed a literal `confirmed-merged` row through `ff4e032e`
+(`2026-09-26T20:14:55Z`)**, because each merge fell outside the one-receipt confirmation window that
+had already resolved its row. (The next receipt did — to #2020, the row that never armed; see
+below.) Resolution-to-merge was 1d23h12m for #1990 (`aec91d73`, `2026-09-23T03:22:09Z`), 1d22h43m
+for #1804 (`aa6a0a70`, `2026-09-23T16:44:08Z`) and 1d07h58m for #2001 (`933af750`,
+`2026-09-25T07:18:04Z`) — #2001 is the sharpest of the three and still misses its window by more
+than a day. Every later receipt that names
 #2001 at all carries it only as a `skip` / `mergestate:UNKNOWN` classifier row, not a confirmation;
 the last of those is `8ae54c04` (`2026-09-26T08:17:49Z`), 6h59m before the merge.
 
 #### The first literal `confirmed-merged` row went to the PR that never armed
 
 Recorded 2026-09-29, from receipts that postdate the table above. The scoped claim in the previous
-section held only through `85529fad`; receipt `cd9d77f9` (`2026-09-27T02:47:42Z`) printed the first
-literal `confirmed-merged` row this ledger has produced, and it went to **#2020** — the one row that
-has never armed:
+section held through `ff4e032e`, the last receipt before this one, and no further: `cd9d77f9`
+(`2026-09-27T02:47:42Z`) printed the first literal `confirmed-merged` row this ledger has produced,
+and it went to **#2020** — the one row that has never armed. Read across all 37 ledger comments on
+2026-09-29, `cd9d77f9` is still the only one containing the token at all:
 
     ff4e032e-2d91-4052-aceb-a0278738a713  (2026-09-26T20:14:55Z)
-    | #2020 | `enqueue` | `mergestate:CLEAN` | failed: --merge, --rebase, or --squash required when not running interactively |
     | #2046 | `enqueue` | `mergestate:CLEAN` | auto-merge armed |
     | #2044 | `enqueue` | `mergestate:CLEAN` | auto-merge armed |
+    | #2020 | `enqueue` | `mergestate:CLEAN` | failed: --merge, --rebase, or --squash required when not running interactively |
     | #1976 | `enqueue` | `mergestate:CLEAN` | auto-merge armed |
     | #1140 | `enqueue` | `mergestate:CLEAN` | auto-merge armed |
 
@@ -847,10 +849,13 @@ armed, tracked, and verified — not because a confirmation row said `confirmed-
 **This also settles the open question in the section above**, in the negative. That section recorded
 a clean correlation between the arm failure and `mergestate:BLOCKED`, while flagging that with one
 distinct failing PR *"whether `BLOCKED` is the discriminator is not established"*. It is not: #2020
-fails at `mergestate:CLEAN` in `ff4e032e`, and #2047 carries the identical failure across six
-receipts — five `mergestate:BLOCKED` and one `mergestate:CLEAN`. The failure is independent of
-mergestate, which is what the missing-merge-method diagnosis predicts: `gh` refuses for want of a
-flag, before mergeability is relevant. The earlier correlation was an artifact of a single-PR sample.
+fails at `mergestate:CLEAN` in `ff4e032e`, and #2047 carries the identical failure at both
+mergestates — `mergestate:CLEAN` in `dad3bb36` (`2026-09-28T12:39:53Z`) and `mergestate:BLOCKED` in
+`c26e7d0a` (`2026-09-29T02:37:37Z`). No count of the failing receipts is recorded here, for the
+reason given above: #2047 keeps firing, so any number is stale at the next fire, and the two receipt
+ids are what carry the argument. The failure is independent of mergestate, which is what the
+missing-merge-method diagnosis predicts: `gh` refuses for want of a flag, before mergeability is
+relevant. The earlier correlation was an artifact of a single-PR sample.
 
 The arm failure itself is [BLO-36804](https://paperclip.blockcast.net/BLO/issues/BLO-36804); it
 remains live and is now visible on #2047 as well as #2020.
