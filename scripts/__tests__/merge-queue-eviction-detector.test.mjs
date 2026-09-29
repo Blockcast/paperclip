@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
+  MERGE_QUEUE_EVICTION_MARKER,
+  buildEvictionCommentBody,
   buildRunSearchWindow,
   classifyMergeQueueEviction,
   extractPaperclipIdentifiers,
@@ -237,4 +240,67 @@ test("extractPaperclipIdentifiers dedupes across sources and expands compact ref
 
 test("extractPaperclipIdentifiers returns empty for a branch/title/body with no ticket ref", () => {
   assert.deepEqual(extractPaperclipIdentifiers("chore/tidy-up", "Tidy up", null), []);
+});
+
+// --- producer/consumer marker coupling (Ally review #1220, 5th pass) ---
+//
+// The detector PRODUCES the eviction comment and the webhook CONSUMES it via
+// `body.startsWith(MERGE_QUEUE_EVICTION_MARKER)`. Before these tests the
+// producer side was asserted nowhere at all, and the two literals were
+// hand-maintained in separate files with no test spanning them. Drift in
+// either one silently disables the entire feature -- startsWith returns
+// false, no wake ever fires -- with both suites green and no red workflow
+// run, because a dequeued PR is not a surface anyone watches. That is the
+// same silent-loss class BLO-23395 exists to close, one layer up.
+//
+// Asserted textually against the TypeScript source rather than by importing
+// it: a plain `node --test` .mjs script cannot import from the server's TS
+// build, and a shared runtime module spanning both would be a far larger
+// change than the coupling warrants.
+
+const WEBHOOK_SOURCE_PATH = new URL("../../server/src/routes/github-webhook.ts", import.meta.url);
+
+test("buildEvictionCommentBody emits the shared marker at byte 0", () => {
+  const body = buildEvictionCommentBody({
+    repo: "Blockcast/paperclip",
+    prNumber: 1092,
+    classification: "conflict_unstageable",
+    mergeGroupRunCount: 0,
+    base: "master",
+    identifiers: ["BLO-23395"],
+  });
+
+  // Byte 0 exactly: the consumer anchors with startsWith, so a leading
+  // newline or indent would be accepted here and dropped there.
+  assert.ok(
+    body.startsWith(MERGE_QUEUE_EVICTION_MARKER),
+    `eviction comment body must start with ${MERGE_QUEUE_EVICTION_MARKER}, got: ${body.slice(0, 80)}`,
+  );
+});
+
+test("webhook's MERGE_QUEUE_EVICTION_MARKER is byte-identical to the detector's", () => {
+  const source = readFileSync(WEBHOOK_SOURCE_PATH, "utf8");
+  const match = source.match(/const\s+MERGE_QUEUE_EVICTION_MARKER\s*=\s*"([^"]*)"/);
+
+  assert.ok(
+    match,
+    `could not find a MERGE_QUEUE_EVICTION_MARKER string literal in ${WEBHOOK_SOURCE_PATH.pathname}. ` +
+      "If it was renamed or restructured, update this test in the same change -- do NOT delete it: " +
+      "it is the only thing keeping the producer and consumer literals in sync.",
+  );
+  assert.equal(
+    match[1],
+    MERGE_QUEUE_EVICTION_MARKER,
+    "webhook and detector eviction markers have drifted; the webhook's startsWith gate will never match, " +
+      "silently disabling every merge-queue eviction wake.",
+  );
+});
+
+test("webhook gates the eviction marker with startsWith, not a substring test", () => {
+  const source = readFileSync(WEBHOOK_SOURCE_PATH, "utf8");
+
+  // Pins the byte-0 contract the producer test above relies on. A move to
+  // `.includes(...)` would let a quoted marker inside an unrelated comment
+  // spoof an eviction notice.
+  assert.match(source, /\.startsWith\(MERGE_QUEUE_EVICTION_MARKER\)/);
 });
