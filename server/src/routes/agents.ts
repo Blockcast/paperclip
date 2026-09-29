@@ -5,7 +5,7 @@ import type { Db } from "@paperclipai/db";
 import { REDACTED_EVENT_VALUE, isPlainObject, maskWorkspaceRuntimeTextForRead, redactAgentConfigPayload, redactEventPayload } from "../redaction.js";
 import { diffAgentAdapterSecretBindings } from "../services/agent-secret-bindings.js";
 import { agentRuntimeState, agents as agentsTable, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
-import { and, asc, desc, eq, gte, inArray, not, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, lte, not, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   agentSkillSyncSchema,
@@ -4795,6 +4795,11 @@ export function agentRoutes(
         scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
         scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
         scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+        // PEN-3607: needed to tell a still-parked row from a promoted-but-
+        // unclaimed one. Both answer "cannot run", but only the second is a
+        // dispatch fault, and before this the two were indistinguishable
+        // because only one of them was selected at all.
+        runStatus: heartbeatRuns.status,
         errorCode: heartbeatRuns.errorCode,
         createdAt: heartbeatRuns.createdAt,
         // The park metadata (advertised reset, clamped-from horizon) lives only
@@ -4806,7 +4811,37 @@ export function agentRoutes(
       .where(
         and(
           eq(heartbeatRuns.companyId, companyId),
-          eq(heartbeatRuns.status, "scheduled_retry"),
+          // PEN-3607: `scheduled_retry` alone was a census of the wrong
+          // population. `promoteScheduledRetryRun` flips a due park to
+          // `queued` and deliberately does NOT clear `scheduledRetryAt` /
+          // `scheduledRetryReason` / `scheduledRetryAttempt`
+          // (`heartbeat.ts:20203-20225`), so from the instant a park is
+          // promoted it leaves this endpoint entirely — and if dispatch then
+          // never claims it, the seat is dark and the census reads clean.
+          //
+          // Measured on UX Designer `bcba1cc7` (2026-09-29): four runs
+          // `queued`, two carrying `ccrotate_capacity` parks ~29 h past due,
+          // seat dark 33 h, and this endpoint returned `parkedCount: 2 ·
+          // overdueCount: 0` with the agent absent. The one surface whose
+          // stated job is "which agents cannot run right now, and until when"
+          // was structurally unable to answer for the failure mode that had
+          // actually taken a seat out.
+          //
+          // A promoted park is only counted once it is genuinely overdue
+          // (`scheduledRetryAt <= now`), which is the same instant that made
+          // it eligible for promotion. So the ordinary promote→claim transit
+          // can appear here, but only for as long as it is actually waiting,
+          // and `overdueMs` states exactly how long. A row whose due time is
+          // still in the future is not overdue and is not admitted by this
+          // arm at all. `runStatus` keeps the two populations separable.
+          or(
+            eq(heartbeatRuns.status, "scheduled_retry"),
+            and(
+              eq(heartbeatRuns.status, "queued"),
+              isNotNull(heartbeatRuns.scheduledRetryAt),
+              lte(heartbeatRuns.scheduledRetryAt, now),
+            ),
+          ),
           ...(reason ? [eq(heartbeatRuns.scheduledRetryReason, reason)] : []),
         ),
       )
@@ -4831,6 +4866,12 @@ export function agentRoutes(
         agentStatus: row.agentStatus,
         adapterType: row.adapterType,
         runId: row.runId,
+        // `scheduled_retry` = still parked, waiting out its own horizon.
+        // `queued` = the park already fired and promotion succeeded; what has
+        // not happened is the dispatch claim. Callers triaging a dark seat
+        // need that split, because the remedies are unrelated: the first is
+        // provider capacity, the second is the dispatcher.
+        runStatus: row.runStatus,
         reason: row.scheduledRetryReason,
         attempt: row.scheduledRetryAttempt,
         errorCode: row.errorCode,
