@@ -419,15 +419,48 @@ spec:
         # and raising the threshold does not help because benign
         # cancellations scale with agent push rate — the noise floor rises
         # with the signal.
+        #
+        # THIS IS A RATIO, NOT A COUNT, and that is the whole point. The
+        # comment above called it: the noise floor rises with the signal.
+        # That is true of the non-superseded stream too, so the supersession
+        # selector bought a 92.8% reduction and still left a count threshold
+        # unusable. Measured against the live counters 2026-09-29 over 7d,
+        # the ORIGINAL `>= 3` count expression is true for 67.9% of
+        # wall-clock (p50 5.17, p99 71.1, max 132.4 per 15m) — it would have
+        # paged continuously from the moment it deployed. Decisively: the
+        # BLO-21078 incident this rule exists to catch was 4 cancellations
+        # in 18 minutes, which is BELOW today's median. No count threshold
+        # can both catch that incident and stay quiet; the instrument was
+        # wrong, not the number.
+        #
+        # The incident's real signature was BREADTH — 4 consecutive runs on
+        # unrelated branches, i.e. essentially every run in the window dying
+        # — so the discriminating quantity is the cancelled SHARE of
+        # completions, which is scale-free and does not drift with push
+        # rate. Same 7d window: p50 1.18%, p99 6.98%, max 13.6%. The 0.35
+        # threshold sits 2.6x above the observed 7d maximum and ~5x above
+        # p99, while the incident window sits near 0.8-1.0 — about an order
+        # of magnitude of headroom on both sides.
+        #
+        # The `>= 8` volume floor is required, not belt-and-braces: without
+        # it a single cancelled run out of two completions reads as 50% and
+        # pages on an idle repo, which is precisely when the ratio is least
+        # meaningful. clamp_min guards division by zero at true idle.
         - alert: PaperclipGithubWorkflowRunMassCancellation
           expr: |
-            sum(increase(paperclip_github_workflow_run_conclusion_total{conclusion="cancelled",supersession="none"}[15m])) >= 3
+            (
+              sum(increase(paperclip_github_workflow_run_conclusion_total{conclusion="cancelled",supersession="none"}[15m]))
+              /
+              clamp_min(sum(increase(paperclip_github_workflow_run_conclusion_total[15m])), 1)
+            ) >= 0.35
+            and
+            sum(increase(paperclip_github_workflow_run_conclusion_total[15m])) >= 8
           for: 2m
           labels:
             severity: warning
           annotations:
-            summary: "GitHub Actions is mass-cancelling workflow runs (3+ non-superseded cancellations in 15m)"
-            description: "At least 3 workflow_run webhook deliveries concluded `cancelled` without being superseded by a newer run on the same branch in the last 15m (BLO-21078) — i.e. not explained by concurrency cancel-in-progress. See the onprem-k8s authoritative copy of this rule for the full runbook."
+            summary: "GitHub Actions is mass-cancelling workflow runs (35%+ of completions cancelled, non-superseded, in 15m)"
+            description: "Over the last 15m, at least 35% of completed workflow_run deliveries concluded `cancelled` without being superseded by a newer run on the same branch (BLO-21078) — i.e. not explained by concurrency cancel-in-progress — across at least 8 completions. Normal operation runs at ~1.2% (p99 7.0%, 7d max 13.6%), so this is a runner-side or GitHub-side kill affecting runs indiscriminately, not one branch's CI failing. Check ARC runner pool health in `arc-runners` first: a scale-set spec change under `--update-strategy=immediate` deletes in-flight ephemeral runners, which GitHub records as `cancelled`. See the onprem-k8s authoritative copy of this rule for the full runbook."
             runbook_url: "/BLO/issues/BLO-21078"
     - name: paperclip-wake-terminal-failed
       rules:
