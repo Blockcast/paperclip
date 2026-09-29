@@ -390,13 +390,18 @@ async function probeOne(
     // artifact of record is a formal review, reads `review:ally-clean` for a
     // head with a live accepted residual (BLO-36903).
     //
+    // Hoisted out of `formalClean` because it is also a cross-surface VETO
+    // below, and deliberately NOT keyed on the head attestation the way
+    // `formalClean` is: as a veto its fail direction is inverted, so a body
+    // that accepts a residual without attesting a head should still suppress
+    // the other surface's clean rather than be ignored (BLO-38032 tracks the
+    // asymmetry).
+    const formalDeferred = newest !== undefined && countAllyDeferredPriorFindings(newest.body) > 0;
+    //
     // Tested before the author read, not after: a deferral settles `formalClean`
     // as false on its own, so `readPrAuthor` — a network fetch that also sets
     // `failed` on error — must not run to reach a conclusion already reached.
-    if (
-      formalAttestingReview !== undefined &&
-      countAllyDeferredPriorFindings(formalAttestingReview.body) === 0
-    ) {
+    if (formalAttestingReview !== undefined && !formalDeferred) {
       const prAuthorLogin = await readPrAuthor();
       // An unread author leaves this false: it cannot establish independence,
       // and `readPrAuthor` has already set `failed` and reported it.
@@ -437,7 +442,18 @@ async function probeOne(
     // The VETO keeps its independent justification either way: `formalBlocking`
     // reads `newest.state`, so a bodyless CHANGES_REQUESTED is reachable only
     // through Surface 2.
-    out.clean = !commentBlocking && !formalBlocking && (commentClean || formalClean);
+    //
+    // A deferral gets the same veto, for the same reason: it is the more
+    // conservative reading, and without it a clean comment beside a formal
+    // review that accepts a residual (or the mirror) still reads
+    // `review:ally-clean` for a head with a live accepted residual (BLO-36903).
+    const commentDeferred = commentVerdict.outcome === "deferred_finding";
+    out.clean =
+      !commentBlocking &&
+      !formalBlocking &&
+      !commentDeferred &&
+      !formalDeferred &&
+      (commentClean || formalClean);
   } catch {
     // A throw is an inability to ask, which is exactly `probeFailed` — never
     // let it escape and turn one bad socket into a failed PATCH.

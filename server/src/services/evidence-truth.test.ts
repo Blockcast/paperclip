@@ -641,6 +641,37 @@ describe("buildGithubTruthProbe", () => {
     expect(r.probeFailed).toBe(true);
   });
 
+  // Mirrors the blocking veto: a deferral on one surface must not be laundered
+  // into `review:ally-clean` by a clean verdict on the other.
+  it("a tracked deferral on either surface beats a clean one on the other", async () => {
+    const tracked = clean.replace(
+      "### Recommended Action",
+      "### Prior Findings Dispositioned (1)\n- **prior:abcdef0 important 1** - tracked - accepted onto BLO-36822.\n\n### Recommended Action",
+    );
+    // Comment surface deferred, formal surface clean at the same head.
+    const a = await buildGithubTruthProbe(
+      deps({
+        listReviewerSurfaces: async () => ({
+          reviews: [{ login: ALLY, body: clean, state: "COMMENTED", commitId: HEAD, submittedAt: null }],
+          comments: [{ login: ALLY, body: tracked, createdAt: "2026-09-06T00:00:00Z" }],
+        }),
+      }),
+    )({ workProducts: [wp()] });
+    expect(a.detections["review:ally-clean"]).toBeUndefined();
+    expect(a.probeFailed).toBe(false);
+
+    // And the mirror: formal review deferred, comment clean.
+    const b = await buildGithubTruthProbe(
+      deps({
+        listReviewerSurfaces: async () => ({
+          reviews: [{ login: ALLY, body: tracked, state: "COMMENTED", commitId: HEAD, submittedAt: null }],
+          comments: [{ login: ALLY, body: clean, createdAt: "2026-09-06T00:00:00Z" }],
+        }),
+      }),
+    )({ workProducts: [wp()] });
+    expect(b.detections["review:ally-clean"]).toBeUndefined();
+  });
+
   it("a blocking verdict on either surface beats a clean one on the other", async () => {
     // Comment surface red, formal surface clean at the same head. The merge
     // gate publishes from the comment surface, so reading this clean would put
