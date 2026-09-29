@@ -599,10 +599,17 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
             ),
           )
           .then((rows) => rows[0] ?? null);
+        // Unreachable under READ COMMITTED, which is what this branch depends on:
+        // `ON CONFLICT DO NOTHING` blocks on the concurrent inserter, so by the time
+        // it returns zero rows the winner has committed, and this statement takes a
+        // fresh snapshot that sees it. Under REPEATABLE READ the select would read
+        // this transaction's original snapshot, miss the winner, and return null --
+        // no card and no `budget.soft_threshold_crossed` log, indistinguishable from
+        // "nothing to do". Raising the isolation level needs this branch reworked.
         return winner ? { incident: winner, created: false } : null;
       }
 
-      const approval = await insertApproval(tx as unknown as Db, {
+      const approval = await insertApproval(tx, {
         companyId: policy.companyId,
         type: "budget_override_required",
         requestedByUserId: null,
