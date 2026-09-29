@@ -2949,7 +2949,7 @@ function ensureRegistry(): {
       help:
         "Booked scheduled_retry park horizon in seconds, by agent and park reason (BLO-31174). "
         + "`reason` is load-bearing, not decoration: legitimate ceilings differ by class and span "
-        + "288x (max_turns_continuation 300s, ccrotate_capacity 900s, dependency_blocked 3600s, "
+        + "30x (max_turns_continuation 300s, ccrotate_capacity 900s, dependency_blocked 3600s, "
         + "transient_failure 9000s), so any single threshold across all of them fires on designed "
         + "backoff in one class while missing a 6x clamp breach in another. Bound each reason "
         + "against its own constant. reason='none' is a per-agent zero floor emitted for every "
@@ -4405,7 +4405,7 @@ export function setQueuedRunAgeMetricsRefreshSuccess(success: boolean): void {
  * Publish the maximum booked park horizon for each live scheduled retry, keyed
  * by agent AND park reason (BLO-31174). Aggregating across reasons was the
  * second defect on this gauge: `max by (agent_id)` over classes whose ceilings
- * span 288x can only be thresholded at a value that is simultaneously below one
+ * span 30x can only be thresholded at a value that is simultaneously below one
  * class's designed backoff and above another's clamp.
  */
 export function setScheduledRetryParkHorizonMetrics(

@@ -264,7 +264,7 @@ export async function refreshOverdueScheduledRetryAgeMetrics(db: Db, now = new D
  *
  * The result is grouped by `scheduled_retry_reason` as well as agent, and the
  * reason is published as a gauge label (BLO-31174, second defect). The classes
- * this column selects among have legitimate maxima that differ by 288x -- 300s
+ * this column selects among have legitimate maxima that differ by 30x -- 300s
  * for `max_turns_continuation` and k8s isolation, 900s for `ccrotate_capacity`,
  * 3,600s for `dependency_blocked` (`Math.min(..., 3_600_000)`), 9,000s for the
  * `transient_failure` ladder's final 2h hop plus 25% jitter -- so a single

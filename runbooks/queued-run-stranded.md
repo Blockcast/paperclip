@@ -41,8 +41,9 @@ gated off and its last snapshot is not trustworthy.
 > **Read the `reason` label** ([BLO-31174](/BLO/issues/BLO-31174), second
 > defect). The gauge is keyed by `agent_id` **and** `reason` (the row's
 > `scheduled_retry_reason`, coerced to the bounded allow-list, anything else
-> reads `other`). Legitimate ceilings differ by class and span 288x, so judge a
-> value against its own class's constant, not the flat 5,400s rule:
+> reads `other`). Legitimate ceilings differ by class and span 30x (300s to
+> 9,000s), so for a class listed below, judge a value against its own constant,
+> not the flat 5,400s rule:
 >
 > | `reason` | designed ceiling | source |
 > |---|---:|---|
@@ -50,6 +51,19 @@ gated off and its last snapshot is not trustworthy.
 > | `ccrotate_capacity` | 900s | `CCROTATE_CAPACITY_MAX_PARK_MS` |
 > | `dependency_blocked` | 3,600s | `DEP_BLOCKED_MAX_DELAY_MS` |
 > | `transient_failure` | 9,000s | final 2h hop of `BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS` x (1 + 0.25 jitter) |
+>
+> The table is the subset of classes whose designed ceiling is known, not the
+> whole allow-list (`KNOWN_RETRY_SCHEDULE_REASONS` in
+> `server/src/services/metrics.ts`). `capacity_blocked` is a separate class from
+> `ccrotate_capacity` and is not covered by its 900s row. For a reason that is
+> not in the table, no per-class constant is documented yet, so the flat 5,400s
+> rule is still the only bound in force for it: treat the page as a candidate
+> fault, and read that reason's delay at its writer (grep the reason string under
+> `server/src/services/`) before calling it designed backoff. `other` can never
+> have a row: it is the catch-all that NULL and every unrecognised
+> `scheduled_retry_reason` coerce to, so it mixes classes. On an `other` page,
+> read the raw `heartbeat_runs.scheduled_retry_reason` of the agent's
+> `status='scheduled_retry'` rows first, then judge it as that class.
 >
 > Every known agent also carries a `reason="none"` series pinned at 0. It is a
 > per-agent zero floor emitted for **every** agent, including ones with live

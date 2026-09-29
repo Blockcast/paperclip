@@ -601,3 +601,19 @@ describeEmbeddedPostgres("refreshOverdueScheduledRetryAgeMetrics (BLO-22094)", (
     );
   });
 });
+
+// Not DB-gated: the help text is the first thing an operator reads out of
+// `# HELP`, so its load-bearing ratio must follow from the ceilings it lists.
+describe("scheduled-retry park horizon help text (BLO-31174)", () => {
+  afterEach(() => __resetMetricsForTest());
+
+  it("states the ceiling spread its own listed ceilings produce", async () => {
+    const { body } = await renderMetrics();
+    const help = body.split("\n").find((line) => line.startsWith(`# HELP ${SCHEDULED_RETRY_PARK_HORIZON_METRIC} `));
+    expect(help).toBeDefined();
+    const ceilings = [...help!.matchAll(/ (\d+)s\b/g)].map((match) => Number(match[1]));
+    expect(ceilings).toEqual([300, 900, 3600, 9000]);
+    const spread = help!.match(/span (\d+)x/)?.[1];
+    expect(Number(spread)).toBe(Math.max(...ceilings) / Math.min(...ceilings));
+  });
+});
