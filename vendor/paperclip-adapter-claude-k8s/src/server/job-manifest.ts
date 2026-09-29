@@ -102,6 +102,59 @@ const GITHUB_WRAPPER_BIN_DIR = "/usr/local/libexec/paperclip/bin";
 // Only used when the merged env carries no PATH at all; see the prepend below.
 const GITHUB_WRAPPER_FALLBACK_PATH =
   "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/**
+ * Cargo cache paths pinned onto the ephemeral cache root (BLO-15567). The two
+ * keys are here for DIFFERENT reasons — do not collapse them into one premise.
+ *
+ * `CARGO_TARGET_DIR` is the one that moves bytes. It is genuinely unset in the
+ * agent image, so it defaults to `<pkg>/target` INSIDE the checkout — which is
+ * on the PVC under `workspace` isolation. Naming it here is the actual fix.
+ *
+ * `CARGO_HOME` is NOT $HOME-derived on the current image: `ENV
+ * CARGO_HOME=/home/node/.cargo` is baked in at `Dockerfile.agent-toolchain`
+ * (a7d4db965, 2026-08-30), and `/home/node` is the container overlay, never a
+ * mount. So on a pod running that image or newer this redirect moves an
+ * already-ephemeral cache, and does not by itself reclaim PVC space. It is
+ * still worth setting, for two reasons: an explicit manifest env is
+ * independent of image-ROLLOUT state, so it also covers pods still running an
+ * image older than a7d4db965; and it bounds the cache under the volume's
+ * `sizeLimit` instead of node ephemeral-storage.
+ *
+ * That second reason is not hypothetical. 1.75 GiB of `.cargo` sits across 8
+ * isolation workspace homes on the PVC, and 5 of them carry real registry
+ * writes (`registry/src/**`, `.cargo-ok`) dated 2026-09-03 → 09-10 — i.e.
+ * AFTER the image ENV landed. Whether that is rollout lag or a non-claude
+ * adapter (the `opencode_k8s` path in BLO-15567 AC3, gated on BLO-15643) is
+ * NOT established; it is recorded here as an observation, not a diagnosis.
+ * Either way those bytes are pre-existing and this change does not reclaim
+ * them — that needs a separate pass.
+ *
+ * ⚠ TRADEOFF: `target/` now lands on the `runtime-cache` emptyDir, which
+ * carries `RUNTIME_CACHE_SIZE_LIMIT` (20Gi) and is shared with the eight other
+ * caches above, Playwright browsers included. Exceeding an emptyDir sizeLimit
+ * EVICTS the pod mid-run — abrupt, where PVC overflow was slow and visible.
+ * Low probability at current Rust volume; revisit if that grows.
+ *
+ * ⚠ RUSTUP_HOME is deliberately ABSENT. The agent image installs the Rust
+ * toolchains into `/usr/local/rustup`; pointing RUSTUP_HOME at an empty
+ * ephemeral dir removes every installed toolchain and breaks `cargo`/`rustc`
+ * outright. CARGO_HOME is safe to move by contrast — verified empty in the
+ * image, with the `cargo` binary on PATH at `/usr/local/bin` — so it only ever
+ * accumulates a regenerable registry cache.
+ *
+ * pnpm is NOT handled here, and must not be added: its store is hardlinked
+ * into `node_modules`, so pnpm silently ignores any configured store path on a
+ * different device and falls back to `<mount>/.pnpm-store`. Pointing it at the
+ * ephemeral cache root therefore does nothing. `PNPM_HOME` is set to a shared
+ * same-device path instead — see PR #2036 / BLO-36583.
+ */
+function CARGO_CACHE_ENV(root: string): Record<string, string> {
+  return {
+    CARGO_HOME: `${root}/cargo`,
+    CARGO_TARGET_DIR: `${root}/cargo-target`,
+  };
+}
 const RUNTIME_CACHE_ENV: Record<string, string> = {
   XDG_CACHE_HOME: `${RUNTIME_CACHE_MOUNT_PATH}/xdg`,
   GOCACHE: `${RUNTIME_CACHE_MOUNT_PATH}/go-build`,
@@ -110,6 +163,7 @@ const RUNTIME_CACHE_ENV: Record<string, string> = {
   BUN_INSTALL_CACHE: `${RUNTIME_CACHE_MOUNT_PATH}/bun`,
   PIP_CACHE_DIR: `${RUNTIME_CACHE_MOUNT_PATH}/pip`,
   PLAYWRIGHT_BROWSERS_PATH: `${RUNTIME_CACHE_MOUNT_PATH}/ms-playwright`,
+  ...CARGO_CACHE_ENV(RUNTIME_CACHE_MOUNT_PATH),
 };
 
 /**
@@ -818,6 +872,16 @@ export const ENV_NAME_CLASSIFICATION: readonly EnvNameClassification[] = [
       "pnpm store path. Shared across a company's persistent workspaces so the content-addressed store is not duplicated per workspace (BLO-36583).",
   },
   {
+    name: "CARGO_HOME",
+    classification: "SAFE_LITERAL",
+    reason: "Cargo registry cache path (BLO-15567). Not RUSTUP_HOME — the image toolchains live there.",
+  },
+  {
+    name: "CARGO_TARGET_DIR",
+    classification: "SAFE_LITERAL",
+    reason: "Rust build output path (BLO-15567).",
+  },
+  {
     name: "TMPDIR",
     classification: "SAFE_LITERAL",
     reason: "Run-scoped temp dir (BLO-16219). Load-bearing for triaging concurrent-run collisions.",
@@ -1216,6 +1280,7 @@ function buildEnvVars(
           isolation.storage.workspace === "persistent"
             ? sharedPnpmStorePath(agent.companyId)
             : `${isolation.cacheRoot}/pnpm`,
+        ...CARGO_CACHE_ENV(isolation.cacheRoot),
         // Run-scoped so concurrent stateless Jobs never share a writable temp
         // directory (BLO-16219) — previously unset here, defaulting to the
         // image's shared /tmp and colliding across concurrent runs.
