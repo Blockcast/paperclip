@@ -742,7 +742,20 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
     // this is the one path where the two copies drifting apart would show up: a
     // predicate that dropped the `<> 'dismissed'` term would match the dismissed row,
     // swallow the insert, and leave the re-crossing permanently uncarded.
-    await db.update(budgetIncidents).set({ status: "dismissed" }).where(eq(budgetIncidents.companyId, companyId));
+    //
+    // Driven through `resolveIncident` rather than a raw status write: the handler
+    // also rejects the card, and that coupling is the point -- a raw write reaches a
+    // state production cannot (see the card-status assertion below).
+    const [dismissed] = await db
+      .select()
+      .from(budgetIncidents)
+      .where(eq(budgetIncidents.companyId, companyId));
+    await service.resolveIncident(
+      companyId,
+      dismissed!.id,
+      { action: "keep_paused", decisionNote: "not this one" },
+      "user-board",
+    );
     await service.evaluateCostEvent(softEvent);
 
     const incidentRows = await db
@@ -755,6 +768,13 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
     // this one", not "stop telling me about this policy for the rest of the window".
     const cards = await db.select().from(approvals).where(eq(approvals.companyId, companyId));
     expect(cards).toHaveLength(2);
+    // Count alone does not say the two cards are *safe*. Both carry the same
+    // idempotencyKey and both have a null requester, so if both were pending the
+    // board would hold two identical, agent-unwithdrawable cards for one
+    // policy-window -- the BLO-37275 defect re-entering through the dismissal path.
+    // What makes two rows correct here is that exactly one is outstanding.
+    expect(new Set(cards.map((card) => card.idempotencyKey)).size).toBe(1);
+    expect(cards.map((card) => card.status).sort()).toEqual(["pending", "rejected"]);
     const reopened = incidentRows.find((row) => row.status === "open");
     expect(cards.map((card) => card.id)).toContain(reopened!.approvalId);
   });
