@@ -532,7 +532,9 @@ function shedOversizeLiteralEnvValue(value: string, budget: number): string | nu
   }
   // Even one element overflows the budget (a single 200 KiB `cwd` does it).
   // `[]` keeps consumers that iterate from throwing; the marker carries why.
-  return "[]";
+  // Checked like every other value here: at budget 1 (a 131_069-char name)
+  // even `[]` overflows, and null hands it to the caller's `""`, which fits.
+  return Buffer.byteLength("[]", "utf8") <= budget ? "[]" : null;
 }
 
 /** The choke-point guard. Returns a value whose `NAME=value` string is under
