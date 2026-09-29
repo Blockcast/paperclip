@@ -535,6 +535,12 @@ test("a Set up job failure is not excused — action refs are diff-controlled", 
   // Falsification: the identical shape with the failure moved to `Set up runner`
   // MUST flip. Without this the assertion above would pass on a classifier that
   // had simply stopped detecting the pre-body shape at all.
+  //
+  // Varies the step NAME only — the bad-action-ref annotation above is retained
+  // rather than swapped for PRE_BODY_KILLED_ANNOTATIONS, so the single
+  // difference between the two calls is the thing the message claims is
+  // responsible. Swapping both passed for the same reason, but did not isolate
+  // it.
   assert.equal(
     classifyJobFailure(
       {
@@ -543,10 +549,79 @@ test("a Set up job failure is not excused — action refs are diff-controlled", 
           step.name === "Set up job" ? { ...step, name: "Set up runner" } : step,
         ),
       },
-      PRE_BODY_KILLED_ANNOTATIONS,
+      [
+        {
+          annotation_level: "failure",
+          message:
+            "Unable to resolve action `actions/checkout@v99`, repository or version not found",
+        },
+      ],
     ),
     "infrastructure",
     "fixture no longer isolates the step name — it must be the failing step that flips this",
+  );
+});
+
+// The synthetic-step names are matched POSITIONALLY: the preamble is the
+// leading run of steps carrying them, not every step that happens to be named
+// one. A declared step colliding with the name after the body has started must
+// therefore stay in the body, where a `failure` conclusion defeats the
+// all-skipped test on its own.
+//
+// This is the unsafe direction, so it is pinned rather than left to the
+// comment: under the previous whole-list name filter the collision was pulled
+// out of the body AND landed in the excusable set, so the step name alone
+// converted a real diff failure into an excused pool kill.
+test("a declared step colliding with a synthetic name stays in the body", async () => {
+  const { classifyJobFailure } = await import("../classify-lane-failures.mjs");
+
+  // `Checkout repository` was skipped by an `if:` condition, so the body has
+  // started before the colliding step runs.
+  const collidingBodyStep = {
+    id: 4,
+    name: "General tests (workspaces-b)",
+    conclusion: "failure",
+    steps: [
+      { number: 1, name: "Set up job", conclusion: "success" },
+      { number: 2, name: "Checkout repository", conclusion: "skipped" },
+      { number: 3, name: "Set up runner", conclusion: "failure" },
+      { number: 4, name: "Run grouped general test suites", conclusion: "skipped" },
+      { number: 5, name: "Complete job", conclusion: "success" },
+    ],
+  };
+  const diffCausedAnnotations = [
+    { annotation_level: "failure", message: "docker: image not found" },
+  ];
+
+  assert.equal(
+    classifyJobFailure(collidingBodyStep, diffCausedAnnotations),
+    "reported",
+    "a step the workflow declared is part of the body however it is named — excusing it " +
+      "would let a step name convert a real diff failure into a pool kill",
+  );
+
+  // The documented residual, asserted so the caveat in the module cannot drift
+  // from the behaviour. A collision in the FIRST declared position is absorbed
+  // into the leading run and IS excused: GitHub's jobs API exposes nothing that
+  // distinguishes it from the synthetic step of the same name. If a future
+  // change closes this, update the comment above PRE_BODY_SETUP_STEP_NAMES —
+  // do not simply delete this assertion.
+  assert.equal(
+    classifyJobFailure(
+      {
+        ...collidingBodyStep,
+        steps: [
+          { number: 1, name: "Set up job", conclusion: "success" },
+          { number: 2, name: "Set up runner", conclusion: "failure" },
+          { number: 3, name: "Checkout repository", conclusion: "skipped" },
+          { number: 4, name: "Run grouped general test suites", conclusion: "skipped" },
+          { number: 5, name: "Complete job", conclusion: "success" },
+        ],
+      },
+      diffCausedAnnotations,
+    ),
+    "infrastructure",
+    "residual collision changed shape — the module comment describes it as first-declared-only",
   );
 });
 
