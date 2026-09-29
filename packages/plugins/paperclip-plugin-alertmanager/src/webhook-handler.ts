@@ -2802,27 +2802,6 @@ function buildRecoveredStateRecord(
 }
 
 /**
- * Top-level webhook handler. Pure-ish: takes ctx + config + an authentication
- * verdict + input, returns void. Throws `WebhookUnauthorizedError` when that
- * verdict is `false` — the worker's onWebhook re-throws this so the host
- * can surface a 401 / drop the delivery. Throws `AlertDeliveryIncompleteError`
- * when any alert in the batch failed to process, so the host records the
- * delivery `failed` and Alertmanager retries it.
- *
- * `authenticated` is a verdict, never a credential. `authenticateWebhook`
- * (config-scope.ts) owns every way a request can authenticate — inline token
- * and `webhookTokenRef` alike — so this function does no comparison and never
- * sees a secret. It also records no credential health: given only a verdict it
- * could not tell "no credential configured" from "wrong bearer presented", and
- * conflating those is exactly what credential-health.ts exists to prevent
- * (BLO-20572). `resolveCompanyScope` is the sole recorder.
- *
- * Returning normally is an acknowledgement: it makes the host answer HTTP 200
- * and ends Alertmanager's retries. Only do that when the delivery needs no
- * retry — a malformed or unsupported-version payload, or a filtered alert —
- * never when something that could succeed later has failed.
- */
-/**
  * The API tier's worker-proxy deadline, mirrored here for reporting only.
  *
  * Deliberately a mirrored literal and not an import: it lives in
@@ -2857,6 +2836,27 @@ const SLOW_DELIVERY_WARN_MS = WORKER_PROXY_DEADLINE_MS / 2;
  */
 const SLOW_DELIVERY_MARKS_MS = [SLOW_DELIVERY_WARN_MS, WORKER_PROXY_DEADLINE_MS];
 
+/**
+ * Top-level webhook handler. Pure-ish: takes ctx + config + an authentication
+ * verdict + input, returns void. Throws `WebhookUnauthorizedError` when that
+ * verdict is `false` — the worker's onWebhook re-throws this so the host
+ * can surface a 401 / drop the delivery. Throws `AlertDeliveryIncompleteError`
+ * when any alert in the batch failed to process, so the host records the
+ * delivery `failed` and Alertmanager retries it.
+ *
+ * `authenticated` is a verdict, never a credential. `authenticateWebhook`
+ * (config-scope.ts) owns every way a request can authenticate — inline token
+ * and `webhookTokenRef` alike — so this function does no comparison and never
+ * sees a secret. It also records no credential health: given only a verdict it
+ * could not tell "no credential configured" from "wrong bearer presented", and
+ * conflating those is exactly what credential-health.ts exists to prevent
+ * (BLO-20572). `resolveCompanyScope` is the sole recorder.
+ *
+ * Returning normally is an acknowledgement: it makes the host answer HTTP 200
+ * and ends Alertmanager's retries. Only do that when the delivery needs no
+ * retry — a malformed or unsupported-version payload, or a filtered alert —
+ * never when something that could succeed later has failed.
+ */
 export async function handleWebhook(
   ctx: PluginContext,
   config: AlertmanagerPluginConfig,
@@ -3143,9 +3143,18 @@ export async function handleWebhook(
     ["alertmanager.webhook.alerts_received", body.alerts.length],
   ];
   if (deliveryMs > WORKER_PROXY_DEADLINE_MS) {
-    // The worker-side count of destroyed batches. The Alertmanager-side grep
-    // this issue shipped with conflates retry attempts with terminal
-    // give-ups; this one counts deliveries that actually outran the deadline.
+    // A worker-side LOWER BOUND on destroyed batches, not a count of them.
+    // `deliveryStartedAt` is handler entry, but the 120s deadline runs from
+    // request arrival at the API tier: transport, worker-tier dispatch and
+    // queueing, and host-side body parsing all happen first and are outside
+    // this measurement. `PluginWebhookInput` carries no arrival time, so the
+    // worker cannot see them. A batch destroyed after 25s of queueing plus 100s
+    // of handler work records `duration_ms: 100000` and no breach, and queueing
+    // shares its causes with slow deliveries, so the undercount is worst under
+    // load. Read 0 as "no delivery spent the whole deadline inside the
+    // handler", never as "no batch was destroyed". The Alertmanager-side grep
+    // this issue shipped with errs the other way, counting retry attempts as
+    // terminal give-ups.
     timingMetrics.push(["alertmanager.webhook.deadline_exceeded", 1]);
   }
   // One `catch` per write, not one around all of them: a shared `try` lets the
