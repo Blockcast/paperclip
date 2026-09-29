@@ -330,6 +330,23 @@ export type IssueRecoveryActionKind = (typeof ISSUE_RECOVERY_ACTION_KINDS)[numbe
  *
  * This is a `Record`, not a lookup with a default, so adding a kind above is a compile error
  * here rather than a silent inheritance of either behaviour.
+ *
+ * Marking a kind `false` removes its write-time retirement path short of the source issue
+ * reaching `done`/`cancelled`/`backlog`. For the agent-owned shape that is covered: the action
+ * is bounded at creation (`maxAttempts` + `timeoutAt`) and `escalateExpiredWakeHorizons`
+ * retires it. The board-escalation shape (`ownerAgentId === null`) is deliberately unbounded —
+ * both fields null, which that sweep requires — so it now retires only on a terminal source
+ * status or an out-of-band discharge such as the PR-close path. That is the intended semantics
+ * for a board escalation, but it is a real new state: a kind marked `false` AND minted
+ * board-shaped needs some other discharge or it never retires.
+ *
+ * `active_run_watchdog` and `issue_graph_liveness` have NO producer in non-test source today —
+ * the only `kind:` literal in the repo is `pr_review_non_convergence`
+ * (`recovery/service.ts`); every other kind is written through `strandedRecoveryActionKind`,
+ * which cannot emit either of them. Their `true` here is the status-quo value and is therefore
+ * inert, not a verified classification. Whoever adds the first producer owns that decision:
+ * ask whether the action RESTORES a wake path (`true`) or escalates a condition to a different
+ * owner while leaving the source issue driveable (`false`), and do not inherit this default.
  */
 export const ISSUE_RECOVERY_ACTION_KIND_IS_WAKE_PATH_RESTORATION: Record<IssueRecoveryActionKind, boolean> = {
   missing_disposition: true,

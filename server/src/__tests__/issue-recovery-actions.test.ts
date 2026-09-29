@@ -6797,6 +6797,87 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       });
       expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
     });
+
+    // Third negative control, and the one that pins the guard's POSITION rather than its
+    // existence. `backlog` is not a sibling of the wake-path-existence family — it cancels
+    // because the issue CANNOT be driven, the exact inverse test — so it sits above the kind
+    // guard and stays kind-blind. Move the guard above that branch and this goes red while
+    // the primary case still passes.
+    it("still cancels a pr_review_non_convergence action when the source issue is parked in backlog", async () => {
+      const { companyId, sourceIssueId, recoveryActionSvc, action } =
+        await seedPrNonConvergence("pr_review_non_convergence");
+
+      await request(createApp())
+        .patch(`/api/issues/${sourceIssueId}`)
+        .send({ status: "backlog" })
+        .expect(200);
+
+      const [actionRow] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      expect(actionRow).toMatchObject({
+        status: "cancelled",
+        outcome: "cancelled",
+        resolutionNote:
+          "Recovery action became stale because the source issue was parked in backlog, which is not dispatchable.",
+      });
+      expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+    });
+
+    // The carve-out keys on `kind`, which is MUTABLE: `upsertSourceScoped` holds one active
+    // action per (companyId, sourceIssueId) and its existing-row UPDATE sets `kind:
+    // input.kind` unconditionally. `shouldReuseStrandedRecoveryAction` gates reuse on
+    // status/owner/`isUnchangedAction` and not on kind, and `isUnchangedAction` compares a
+    // `self_review_pr_non_convergence` cause + fingerprint against a stranded one, so it is
+    // always false here and a stranded sweep falls through to the upsert.
+    //
+    // This case asserts what actually happens rather than what should: a second recovery
+    // producer REWRITES the beacon's kind in place, after which the carve-out stops applying
+    // and the next durable source update cancels it exactly as it did before this fix.
+    // Nothing in this PR prevents that. Whether a specific escalation beacon should outrank
+    // the generic stranded sweep for the single active-action slot is a design call with its
+    // own blast radius — the obvious guard (refuse the clobber) can deadlock the board-shaped
+    // beacon, which is unbounded by design (`maxAttempts: null`, no `timeoutAt`). Tracked
+    // separately; this exists so the hazard is visible and so that changing it is a
+    // deliberate act that turns this assertion red.
+    it("records that a stranded upsert rewrites a live pr_review_non_convergence kind in place", async () => {
+      const { companyId, sourceIssueId, recoveryActionSvc, action, managerId, coderId } =
+        await seedPrNonConvergence("pr_review_non_convergence");
+
+      const clobbered = await recoveryActionSvc.upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        previousOwnerAgentId: coderId,
+        returnOwnerAgentId: coderId,
+        cause: "stranded_assigned_issue",
+        fingerprint: "source_scoped_recovery:blo-37677:stranded",
+        evidence: {},
+        nextAction: "Re-drive the stranded issue.",
+        wakePolicy: { type: "wake_owner", reason: "stranded_assigned_issue" },
+      });
+
+      // Same row, not a second action: the slot is unique per (companyId, sourceIssueId).
+      expect(clobbered.id).toBe(action.id);
+      expect(clobbered.kind).toBe("stranded_assigned_issue");
+      expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({
+        id: action.id,
+        kind: "stranded_assigned_issue",
+        status: "active",
+      });
+
+      // With the kind rewritten, the carve-out no longer covers the row: the same PATCH the
+      // primary case survives now cancels it. Pre-fix behaviour, reachable with no write to
+      // the classifier.
+      await request(createApp())
+        .patch(`/api/issues/${sourceIssueId}`)
+        .send(MONITOR_ARM)
+        .expect(200);
+      expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+    });
   });
 
   it("keeps active recovery visible when a plain comment does not create a live path", async () => {
