@@ -19,6 +19,7 @@ import {
   latestCheckStates,
   renderReceipt,
   settleMinutesFrom,
+  sweepRepos,
   targetRepos,
   unsatisfiedOwners,
 } from "./land-clean-prs.mjs";
@@ -258,22 +259,36 @@ describe("per-fire cap", () => {
     assert.equal(rows[1].action, "enqueue");
   });
 
+  const clean = () => Array.from({ length: 3 }, (_, i) => pr({ number: 200 + i }));
+
   it("carries spend across repos, so the cap is per FIRE and not per repo", () => {
     // `runRepo` calls `classifyAll` once per swept repo. Without `spent` the
     // counter restarts each call and the real ceiling is `cap x repos` — the
     // blast radius scaling with the multi-repo knob that makes a classifier
     // bug reach further in the first place.
-    const clean = () => Array.from({ length: 3 }, (_, i) => pr({ number: 200 + i }));
-    let spent = 0;
     const perRepo = [];
-    for (const _repo of ["a/one", "a/two", "a/three"]) {
-      const rows = classifyAll(clean(), { now: NOW, maxEnqueues: 4, spent });
-      const armed = rows.filter((r) => r.action === "enqueue").length;
-      spent += armed;
-      perRepo.push(armed);
-    }
+    const spent = sweepRepos(["a/one", "a/two", "a/three"], (_repo, carried) => {
+      const rows = classifyAll(clean(), { now: NOW, maxEnqueues: 4, spent: carried });
+      perRepo.push(rows.filter((r) => r.action === "enqueue").length);
+      return rows;
+    });
     assert.deepEqual(perRepo, [3, 1, 0], "repo 2 gets the remainder, repo 3 gets nothing");
     assert.equal(spent, 4, "total armed never exceeds the cap");
+  });
+
+  it("does not spend budget on an enqueue that failed to apply", () => {
+    // A failed enqueue merged nothing, so it must not starve later repos. The
+    // opposite reading (counting `enqueue-failed` as spent) lets a repo full of
+    // doomed enqueues eat the fire's budget before the sweep reaches the rest.
+    const seen = [];
+    const spent = sweepRepos(["a/one", "a/two", "a/three"], (repo, carried) => {
+      seen.push(carried);
+      const rows = classifyAll(clean(), { now: NOW, maxEnqueues: 4, spent: carried });
+      if (repo === "a/one") markFailure(rows[0], "boom");
+      return rows;
+    });
+    assert.deepEqual(seen, [0, 2, 4], "repo 1 spends 2 of its 3, not 3");
+    assert.equal(spent, 4);
   });
 });
 
