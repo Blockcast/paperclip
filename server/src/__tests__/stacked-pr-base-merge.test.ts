@@ -19,6 +19,7 @@
  */
 import { describe, expect, it } from "vitest";
 import {
+  parseMergedPullRequestForHeadRef,
   parseMergeHistoryShape,
   parseOpenPullRequestsOnBasePayload,
 } from "../services/github-app-auth.js";
@@ -115,5 +116,71 @@ describe("stackedChildDirective", () => {
     expect(__test_stackedChildDirective("rewritten")).not.toBe(
       __test_stackedChildDirective("merge_commit"),
     );
+  });
+});
+
+/**
+ * Old-base resolution for the auto-retarget wake (BLO-36775).
+ *
+ * `pull_request.edited` names the CHILD, so the merge whose shape decides
+ * retarget-vs-rebase is not in the delivery. This is how it is recovered, and
+ * its three outcomes are not interchangeable: `none` is the precision gate that
+ * keeps a hand-retarget from paging anyone, and `error` must stay distinct from
+ * it for the same reason the enumeration keeps them apart.
+ */
+describe("parseMergedPullRequestForHeadRef", () => {
+  it("returns the merged PR and its merge commit", () => {
+    expect(parseMergedPullRequestForHeadRef([
+      { number: 2027, merged_at: "2026-09-26T09:00:00Z", merge_commit_sha: "cafebabe" },
+    ])).toEqual({ outcome: "found", prNumber: 2027, mergeCommitSha: "cafebabe" });
+  });
+
+  it("ignores closed-but-unmerged PRs — an abandoned base orphaned nothing", () => {
+    expect(parseMergedPullRequestForHeadRef([
+      { number: 2027, merged_at: null, merge_commit_sha: null },
+    ])).toEqual({ outcome: "none" });
+  });
+
+  it("takes the most recently merged PR, not the response order", () => {
+    // GitHub sorts this list by `updated_at`, so a later comment on an older PR
+    // is enough to put it first. Ordering on `merged_at` is the fix.
+    expect(parseMergedPullRequestForHeadRef([
+      { number: 10, merged_at: "2026-01-01T00:00:00Z", merge_commit_sha: "old" },
+      { number: 20, merged_at: "2026-09-01T00:00:00Z", merge_commit_sha: "new" },
+      { number: 15, merged_at: "2026-05-01T00:00:00Z", merge_commit_sha: "mid" },
+    ])).toEqual({ outcome: "found", prNumber: 20, mergeCommitSha: "new" });
+  });
+
+  it("reports an empty list as none, not as an error", () => {
+    // A branch can be deleted, or retargeted by hand, without ever merging.
+    // Both fire the same event and neither is a stacked orphaning.
+    expect(parseMergedPullRequestForHeadRef([])).toEqual({ outcome: "none" });
+  });
+
+  it("fails closed on an unreadable body instead of reporting none", () => {
+    // The dangerous collapse: `none` means "nothing merged this branch", which
+    // suppresses the wake. An unreadable answer must never say that.
+    for (const body of [null, undefined, {}, "[]", 0]) {
+      expect(parseMergedPullRequestForHeadRef(body)).toEqual({
+        outcome: "error",
+        reason: "merged_pull_request_malformed",
+      });
+    }
+  });
+
+  it("skips entries with an unusable number or timestamp without dropping the rest", () => {
+    expect(parseMergedPullRequestForHeadRef([
+      { number: "nope", merged_at: "2026-09-26T09:00:00Z" },
+      { number: 31, merged_at: "not-a-date" },
+      { number: 42, merged_at: "2026-09-26T09:00:00Z", merge_commit_sha: "keep" },
+    ])).toEqual({ outcome: "found", prNumber: 42, mergeCommitSha: "keep" });
+  });
+
+  it("returns found with a null merge commit rather than dropping the PR", () => {
+    // The caller turns this into `unknown`, which refuses to recommend a bare
+    // retarget. Dropping the PR instead would suppress the wake entirely.
+    expect(parseMergedPullRequestForHeadRef([
+      { number: 2027, merged_at: "2026-09-26T09:00:00Z", merge_commit_sha: 42 },
+    ])).toEqual({ outcome: "found", prNumber: 2027, mergeCommitSha: null });
   });
 });

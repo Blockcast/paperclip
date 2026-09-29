@@ -70,6 +70,7 @@ import {
   githubListOpenPullRequestsByBase,
   githubResolveBranchState,
   githubResolveMergeHistoryShape,
+  githubResolveMergedPullRequestForHeadRef,
   githubReviewerIdentityMatches,
   githubListIssueCommentBodies,
   githubPostIssueComment,
@@ -793,6 +794,21 @@ function verifyGithubSignature(
 function readStringField(record: Record<string, unknown> | undefined, key: string): string | null {
   const value = record?.[key];
   return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+/** Walk a plain-object path, yielding undefined the moment any hop is not an object. */
+function readNestedRecord(
+  root: Record<string, unknown> | undefined,
+  path: string[],
+): Record<string, unknown> | undefined {
+  let cursor: unknown = root;
+  for (const key of path) {
+    if (typeof cursor !== "object" || cursor === null || Array.isArray(cursor)) return undefined;
+    cursor = (cursor as Record<string, unknown>)[key];
+  }
+  return typeof cursor === "object" && cursor !== null && !Array.isArray(cursor)
+    ? (cursor as Record<string, unknown>)
+    : undefined;
 }
 
 function githubPrUrl(repoFullName: string | null, prNumber: number | null, explicitUrl?: string | null): string | null {
@@ -5025,6 +5041,112 @@ function stackedChildDirective(shape: MergeHistoryShape): string {
   }
 }
 
+/**
+ * Wake every live Paperclip issue linked to one stacked child PR (BLO-29856,
+ * BLO-36775).
+ *
+ * Shared by the two paths that can discover the same orphaning, and that is the
+ * whole reason it is a function: the `pull_request.closed` fan-out finds the
+ * child by enumerating `?base=<merged head>`, while the `pull_request.edited`
+ * path finds it from GitHub's own auto-retarget. On a repo without
+ * `delete_branch_on_merge` only the first fires; on one with it, only the second
+ * can (the branch is gone before the enumeration runs) — but the two are not
+ * provably exclusive, and a redelivery of either is always possible.
+ *
+ * So the idempotency key lives HERE and nowhere else. It is keyed on
+ * (child issue, child PR, merged base ref) and deliberately carries nothing
+ * about which path observed it: the same base merge reaching the same child
+ * twice is one wake, while a DIFFERENT base merging later still wakes it again.
+ * Two copies of this key would make that dedup a coincidence of wording rather
+ * than a property of the code.
+ *
+ * Prechecked rather than left to the insert, because `enqueueWakeup` stores the
+ * key without enforcing it (BLO-13247).
+ */
+async function wakeStackedChildIssues(input: {
+  db: Db;
+  heartbeat: ReturnType<typeof heartbeatService>;
+  repoFullName: string;
+  childPrNumber: number;
+  childPrUrl: string | null;
+  mergedBaseRef: string;
+  mergedBasePrNumber: number | null;
+  mergeShape: MergeHistoryShape;
+  directive: string;
+  eventName: string;
+  deliveryId: string | null;
+  /** Diagnostic only — never part of the idempotency key. */
+  detectedVia: "base_merge_fan_out" | "auto_retarget";
+}): Promise<number> {
+  const childIssues = await selectIssuesLinkedToPullRequest(
+    input.db,
+    pullRequestExternalId(input.repoFullName, input.childPrNumber),
+  );
+  let woken = 0;
+  for (const childIssue of childIssues) {
+    // An unassigned or terminal row has nobody to wake; the orphaned PR is
+    // still real, which is what the field check is for.
+    if (!childIssue.assigneeAgentId) continue;
+    if (childIssue.status === "done" || childIssue.status === "cancelled") continue;
+
+    const stackedIdempotencyKey =
+      `stacked_pr_base_merged:${childIssue.id}:${input.repoFullName}:${input.childPrNumber}:${input.mergedBaseRef}`;
+    const alreadyWoken = await input.db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.agentId, childIssue.assigneeAgentId),
+          eq(agentWakeupRequests.idempotencyKey, stackedIdempotencyKey),
+          inArray(agentWakeupRequests.status, idempotentWakeStatuses("stable")),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (alreadyWoken) continue;
+
+    await input.heartbeat.wakeup(childIssue.assigneeAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "github_stacked_pr_base_merged",
+      idempotencyKey: stackedIdempotencyKey,
+      payload: {
+        issueId: childIssue.id,
+        source: "github",
+        event: input.eventName,
+        deliveryId: input.deliveryId,
+        repoFullName: input.repoFullName,
+        prNumber: input.childPrNumber,
+        prUrl: input.childPrUrl,
+        mergedBasePrNumber: input.mergedBasePrNumber,
+        mergedBaseRef: input.mergedBaseRef,
+        mergeHistoryShape: input.mergeShape,
+        directive: input.directive,
+        detectedVia: input.detectedVia,
+      },
+      contextSnapshot: {
+        issueId: childIssue.id,
+        taskId: childIssue.id,
+        wakeReason: "github_stacked_pr_base_merged",
+        wakeSource: "automation",
+        wakeTriggerDetail: "system",
+        commentSource: "github",
+        githubEvent: input.eventName,
+        githubDeliveryId: input.deliveryId,
+        githubRepoFullName: input.repoFullName,
+        githubPrNumber: input.childPrNumber,
+        githubMergedBasePrNumber: input.mergedBasePrNumber,
+        githubMergedBaseRef: input.mergedBaseRef,
+        githubMergeHistoryShape: input.mergeShape,
+        githubStackedChildDirective: input.directive,
+        githubStackedChildDetectedVia: input.detectedVia,
+      },
+    });
+    woken += 1;
+  }
+  return woken;
+}
+
 export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
   const router = Router();
 
@@ -6025,6 +6147,123 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       }
     })();
 
+    // Auto-retarget wake (BLO-36775). The companion to the fan-out above, and on
+    // a `delete_branch_on_merge` repo it is the ONLY one that can fire.
+    //
+    // When the merged PR's head branch is deleted, GitHub auto-retargets every
+    // child onto the merged base's target BEFORE the `closed` delivery's
+    // enumeration runs — so `?base=<merged head>` matches nothing, the fan-out
+    // above finds zero children, and the only thing left is a warn that cannot
+    // name anyone. Measured on `Blockcast/hang-mmt-fec` (the one repo here with
+    // the setting on): 95 merges in 27 days, so that warn fires ~3.5×/day at
+    // near-100% false positive, which is a warn people learn to scroll past.
+    //
+    // `pull_request.edited` + `changes.base.ref.from` names the child directly
+    // and is immune to that race. The retarget it reports is BARE — no rebase —
+    // which after a squash- or rebase-merge leaves the child replaying the base
+    // PR's entire diff: exactly the state `stackedChildDirective("rewritten")`
+    // exists to warn about.
+    //
+    // Same best-effort posture as the fan-out: it swallows its own failures so a
+    // GitHub read cannot break the delivery.
+    //
+    // Read straight off the payload rather than off ResolvedEventContext, and
+    // placed ABOVE the `if (!context)` gate, because `pull_request.edited` is
+    // deliberately not in that resolver's action allowlist. Admitting it there
+    // would give every title/body edit in every repo a `github_pr_*` wakeReason,
+    // which `isPrWake` turns into an author-directed wake and the work-product
+    // upsert turns into a write — a large blast radius for three fields this
+    // block can read itself. The retargeted child also carries no Paperclip
+    // identifier of its own, so it would be dropped by the identifier gate
+    // regardless; the link comes from its PR work product, which
+    // `wakeStackedChildIssues` resolves.
+    const retargetedPr = payload.pull_request as Record<string, unknown> | undefined;
+    const retargetedFromRef = readStringField(
+      readNestedRecord(payload, ["changes", "base", "ref"]),
+      "from",
+    );
+    const retargetRepoFullName = readStringField(
+      payload.repository as Record<string, unknown> | undefined,
+      "full_name",
+    );
+    const retargetChildPrNumber =
+      typeof retargetedPr?.number === "number" ? retargetedPr.number : null;
+    if (
+      eventName === "pull_request" &&
+      payload.action === "edited" &&
+      retargetedFromRef &&
+      retargetRepoFullName &&
+      retargetChildPrNumber !== null
+    ) {
+      try {
+        // The PR in this payload is the CHILD, so the merge whose shape decides
+        // retarget-vs-rebase is not in the delivery. Resolve it from the old
+        // base ref.
+        //
+        // This lookup is also the precision gate, and that is its more important
+        // job: a human retargeting a PR by hand, and a base branch deleted
+        // without ever merging, both fire this same event. Only `found` means a
+        // merge put the old base's work somewhere, so only `found` is a stacked
+        // orphaning. Without this the path would inherit the false-positive rate
+        // it exists to replace.
+        const mergedBase = await githubResolveMergedPullRequestForHeadRef({
+          repoFullName: retargetRepoFullName,
+          headRef: retargetedFromRef,
+        });
+        if (mergedBase.outcome === "error") {
+          // NOT "nothing merged this branch" — we could not find out. Same
+          // fail-loud reasoning as the enumeration: coercing an unreadable read
+          // to "no merge" restores the silence this path exists to break.
+          logger.warn(
+            {
+              repoFullName: retargetRepoFullName,
+              prNumber: retargetChildPrNumber,
+              retargetedFromRef,
+              reason: mergedBase.reason,
+            },
+            "stacked-PR auto-retarget wake could not resolve what merged the old base; child not woken",
+          );
+        } else if (mergedBase.outcome === "found") {
+          const mergeShape: MergeHistoryShape = mergedBase.mergeCommitSha
+            ? await githubResolveMergeHistoryShape({
+              repoFullName: retargetRepoFullName,
+              mergeCommitSha: mergedBase.mergeCommitSha,
+            })
+            : "unknown";
+          await wakeStackedChildIssues({
+            db,
+            heartbeat: heartbeatService(db, {
+              pluginWorkerManager: config.pluginWorkerManager,
+              ...config.heartbeatOptions,
+            }),
+            repoFullName: retargetRepoFullName,
+            childPrNumber: retargetChildPrNumber,
+            childPrUrl: readStringField(retargetedPr, "html_url"),
+            // The key the fan-out would have used for this same merge, so a
+            // child reachable by both paths is woken once. See
+            // `wakeStackedChildIssues`.
+            mergedBaseRef: retargetedFromRef,
+            mergedBasePrNumber: mergedBase.prNumber,
+            mergeShape,
+            directive: stackedChildDirective(mergeShape),
+            eventName,
+            deliveryId,
+            detectedVia: "auto_retarget",
+          });
+        }
+      } catch (err) {
+        logger.error(
+          {
+            err,
+            prNumber: retargetChildPrNumber,
+            repoFullName: retargetRepoFullName,
+            retargetedFromRef,
+          },
+          "stacked-PR auto-retarget wake failed",
+        );
+      }
+    }
+
     if (!context) {
       respond(200, {
         ok: true,
@@ -6178,7 +6417,19 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
           });
           if (headBranchState !== "exists") {
-            logger.warn(
+            // Downgraded from `warn` (BLO-36775 AC4). This fires on EVERY merge
+            // on a `delete_branch_on_merge` repo — 95 merges in 27 days on
+            // `Blockcast/hang-mmt-fec`, ~3.5/day — and genuinely-stacked
+            // children are a small minority of those, so as a warn it was at
+            // near-100% false positive. A warn nobody can act on costs the true
+            // positive too, because it trains people to scroll past the line.
+            //
+            // It is not deleted, because it is still the only record that this
+            // delivery could not enumerate the children it was looking for. It
+            // is no longer an alert, because the auto-retarget wake below now
+            // names each of those children directly and wakes them, which is the
+            // action this line used to be asking someone to go take by hand.
+            logger.info(
               {
                 repoFullName: stackedRepoFullName,
                 mergedBaseRef,
@@ -6186,7 +6437,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
                 headBranchState,
               },
               "stacked-PR base-merge fan-out found no open PRs on a head branch that no longer provably exists; " +
-                "GitHub may have auto-retargeted stacked children without a rebase, and none were woken",
+                "any auto-retargeted children are woken by the pull_request.edited path instead",
             );
           }
         } else {
@@ -6212,73 +6463,20 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           });
 
           for (const child of stacked.pullRequests) {
-            const childIssues = await selectIssuesLinkedToPullRequest(
+            await wakeStackedChildIssues({
               db,
-              pullRequestExternalId(stackedRepoFullName, child.number),
-            );
-            for (const childIssue of childIssues) {
-              // An unassigned or terminal row has nobody to wake; the orphaned
-              // PR is still real, which is what the field check is for.
-              if (!childIssue.assigneeAgentId) continue;
-              if (childIssue.status === "done" || childIssue.status === "cancelled") continue;
-
-              // Keyed on (child issue, child PR, merged base) so a GitHub
-              // redelivery of the same merge is one wake, while a DIFFERENT base
-              // merging later legitimately wakes the child again. Prechecked
-              // because enqueueWakeup stores the key without enforcing it
-              // (BLO-13247).
-              const stackedIdempotencyKey =
-                `stacked_pr_base_merged:${childIssue.id}:${stackedRepoFullName}:${child.number}:${mergedBaseRef}`;
-              const alreadyWoken = await db
-                .select({ id: agentWakeupRequests.id })
-                .from(agentWakeupRequests)
-                .where(
-                  and(
-                    eq(agentWakeupRequests.agentId, childIssue.assigneeAgentId),
-                    eq(agentWakeupRequests.idempotencyKey, stackedIdempotencyKey),
-                    inArray(agentWakeupRequests.status, idempotentWakeStatuses("stable")),
-                  ),
-                )
-                .limit(1)
-                .then((rows) => rows[0] ?? null);
-              if (alreadyWoken) continue;
-
-              await stackedHeartbeat.wakeup(childIssue.assigneeAgentId, {
-                source: "automation",
-                triggerDetail: "system",
-                reason: "github_stacked_pr_base_merged",
-                idempotencyKey: stackedIdempotencyKey,
-                payload: {
-                  issueId: childIssue.id,
-                  source: "github",
-                  event: eventName,
-                  deliveryId,
-                  repoFullName: stackedRepoFullName,
-                  prNumber: child.number,
-                  prUrl: child.url,
-                  mergedBasePrNumber: context.prNumber,
-                  mergedBaseRef,
-                  mergeHistoryShape: mergeShape,
-                  directive,
-                },
-                contextSnapshot: {
-                  issueId: childIssue.id,
-                  taskId: childIssue.id,
-                  wakeReason: "github_stacked_pr_base_merged",
-                  wakeSource: "automation",
-                  wakeTriggerDetail: "system",
-                  commentSource: "github",
-                  githubEvent: eventName,
-                  githubDeliveryId: deliveryId,
-                  githubRepoFullName: stackedRepoFullName,
-                  githubPrNumber: child.number,
-                  githubMergedBasePrNumber: context.prNumber,
-                  githubMergedBaseRef: mergedBaseRef,
-                  githubMergeHistoryShape: mergeShape,
-                  githubStackedChildDirective: directive,
-                },
-              });
-            }
+              heartbeat: stackedHeartbeat,
+              repoFullName: stackedRepoFullName,
+              childPrNumber: child.number,
+              childPrUrl: child.url,
+              mergedBaseRef,
+              mergedBasePrNumber: context.prNumber,
+              mergeShape,
+              directive,
+              eventName,
+              deliveryId,
+              detectedVia: "base_merge_fan_out",
+            });
           }
         }
       } catch (err) {
@@ -6288,6 +6486,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         );
       }
     }
+
 
     // PR work-product upsert (BLO-19566 AC4). Liveness/productivity accounting
     // is blind to PR progress unless the issue carries a first-class
