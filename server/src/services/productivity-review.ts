@@ -2644,6 +2644,23 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .then((rows) => Number(rows[0]?.count ?? 0));
   }
 
+  /**
+   * BLO-37071: `isNotNull(identifier)` here for the same reason it is on
+   * `findLatestTerminalProductivityReviewCreatedAt`, and this site is the
+   * *unbounded* one of the pair.
+   *
+   * `retireStaleProductivityReviewReservation` parks a stale reservation at
+   * `status: "done"` with NULL identifier/issueNumber and no `hiddenAt`, so it
+   * satisfies every other arm here. This walk is capped by row count
+   * (`maxConsecutiveNoActionReviews`), not by a time window, so — unlike
+   * `findRecentResolvedProductivityReview`, whose identical exposure is bounded
+   * to `resolvedSnoozeMs` and is deliberately left alone — nothing ages the row
+   * out. Worse, the retirement logs its activity row against
+   * `entityId: input.review.id`, the *review* issue rather than the source, so
+   * nothing in that path breaks the streak either. The reservation therefore
+   * occupies a slot as a review nobody ever saw and the cap fires one real
+   * review early, which is the silencing direction.
+   */
   async function countConsecutiveNoActionProductivityReviews(
     companyId: string,
     sourceIssueId: string,
@@ -2660,6 +2677,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
           eq(issues.originId, sourceIssueId),
           eq(issues.status, "done"),
+          isNotNull(issues.identifier),
           visibleIssueCondition(),
         ),
       )
@@ -3289,9 +3307,20 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     ].join("|");
   }
 
-  async function latestMonitorScheduledSuppressionKey(
+  const suppressionDetailString = (value: unknown) => (typeof value === "string" ? value : null);
+
+  /**
+   * The `details` of the newest suppression row on this issue, but only when it
+   * reports `suppressedBy`. Shared by every deduped recorder (BLO-24022,
+   * BLO-37071) so there is one readback query and one filter constant.
+   *
+   * The `suppressedBy` arm is load-bearing: a different suppression reason
+   * (approval_pending, terminal gate, unchanged sample) is a real state change,
+   * so it must not be mistaken for a repeat of the one about to be recorded.
+   */
+  async function latestSuppressionDetails(
     executor: DbOrTx,
-    input: { companyId: string; issueId: string },
+    input: { companyId: string; issueId: string; suppressedBy: string },
   ) {
     const row = await executor
       .select({ details: activityLog.details })
@@ -3309,14 +3338,23 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .then((rows) => rows[0] ?? null);
     if (!row) return null;
     const details = activityDetails(row.details);
-    // A different suppression reason (approval_pending, terminal source) is a real state change,
-    // so it must not be mistaken for an already-reported monitor wait.
-    if (details.suppressedBy !== "monitor_scheduled") return null;
-    const str = (value: unknown) => (typeof value === "string" ? value : null);
+    if (details.suppressedBy !== input.suppressedBy) return null;
+    return details;
+  }
+
+  async function latestMonitorScheduledSuppressionKey(
+    executor: DbOrTx,
+    input: { companyId: string; issueId: string },
+  ) {
+    const details = await latestSuppressionDetails(executor, {
+      ...input,
+      suppressedBy: "monitor_scheduled",
+    });
+    if (!details) return null;
     return monitorSuppressionWindowKey({
-      monitorNextCheckAt: str(details.monitorNextCheckAt),
-      monitorScheduledBy: str(details.monitorScheduledBy),
-      monitorLastTriggeredAt: str(details.monitorLastTriggeredAt),
+      monitorNextCheckAt: suppressionDetailString(details.monitorNextCheckAt),
+      monitorScheduledBy: suppressionDetailString(details.monitorScheduledBy),
+      monitorLastTriggeredAt: suppressionDetailString(details.monitorLastTriggeredAt),
     });
   }
 
@@ -3389,7 +3427,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       actorType: "system",
       actorId: "system",
       agentId: sourceIssue.assigneeAgentId,
-      action: "issue.productivity_review_suppressed",
+      action: PRODUCTIVITY_REVIEW_SUPPRESSED_ACTION,
       entityType: "issue",
       entityId: sourceIssue.id,
       details,
@@ -3398,6 +3436,26 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       details,
       "productivity review long_active_duration suppressed by an already-resolved terminal gate (BLO-27515)",
     );
+  }
+
+  /**
+   * BLO-37071: identity of the frozen-sample wait a suppression is reporting.
+   *
+   * The pair is constant for exactly as long as the sample is frozen and moves
+   * the instant either side does, so keying on it writes one row per distinct
+   * suppression state — which is also the honest audit record.
+   *
+   * `runtimeFailureStreak` is deliberately excluded. It is derivable from the
+   * pair (a run that would change it also moves `newestSampledRunCreatedAt`,
+   * `heartbeat_runs` being append-only), and BLO-24022's `elapsedMs` is the
+   * standing lesson that putting a field which can drift into the key makes
+   * every key unique and defeats the dedupe entirely.
+   */
+  function unchangedSampleSuppressionWindowKey(details: {
+    priorTerminalReviewCreatedAt: string | null;
+    newestSampledRunCreatedAt: string | null;
+  }) {
+    return [details.priorTerminalReviewCreatedAt ?? "none", details.newestSampledRunCreatedAt ?? "none"].join("|");
   }
 
   /**
@@ -3422,12 +3480,52 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       newestSampledRunCreatedAt: newestRunCreatedAt.toISOString(),
       runtimeFailureStreak: evidence.runtimeFailureStreak,
     };
+    // BLO-24022, and this gate needs it more than any sibling did. The reconcile
+    // re-evaluates every ~30s (`heartbeatSchedulerIntervalMs`) and every other
+    // suppression terminates on its own — the approval gate ends when the
+    // approval is decided, the monitor gate when the monitor fires,
+    // `recordTerminalGateResolvedSuppression` is bounded by `longActiveMs`.
+    // This one is deliberately unbounded in time (see
+    // `findLatestTerminalProductivityReviewCreatedAt`) because a frozen sample
+    // stays frozen until a run happens, so without a dedupe a single such source
+    // emits a row per pass forever — the 46%-of-all-company-activity flood that
+    // broke agent-health triage.
+    //
+    // It is also not merely noise here. `countConsecutiveNoActionProductivityReviews`
+    // breaks its streak on ANY `activityLog` row on the source, and these rows
+    // are written against `entityId: sourceIssue.id` — so an undeduped recorder
+    // resets `maxConsecutiveNoActionReviews` to 0 on exactly the sources this
+    // gate touches. That does not bite while the gate suppresses (the caller
+    // `continue`s past `createOrUpdateReview`), it bites the moment one run
+    // lands and the gate stops applying, which is precisely when that cap is
+    // the remaining bound. The gate would have become a producer of the defect
+    // documented at its own call site.
+    //
+    // Best-effort by design, as in `recordMonitorScheduledSuppression`: a
+    // read-then-write without a lock, so overlapping reconciles can both miss
+    // the row and write. That degrades to a few rows per frozen window rather
+    // than one per pass, which is the whole point.
+    const previous = await latestSuppressionDetails(db, {
+      companyId: sourceIssue.companyId,
+      issueId: sourceIssue.id,
+      suppressedBy: "unchanged_run_sample",
+    });
+    if (
+      previous &&
+      unchangedSampleSuppressionWindowKey({
+        priorTerminalReviewCreatedAt: suppressionDetailString(previous.priorTerminalReviewCreatedAt),
+        newestSampledRunCreatedAt: suppressionDetailString(previous.newestSampledRunCreatedAt),
+      }) === unchangedSampleSuppressionWindowKey(details)
+    ) {
+      logger.debug(details, "productivity review runtime_failure_streak suppression already recorded for this sample");
+      return false;
+    }
     await logActivity(db, {
       companyId: sourceIssue.companyId,
       actorType: "system",
       actorId: "system",
       agentId: sourceIssue.assigneeAgentId,
-      action: "issue.productivity_review_suppressed",
+      action: PRODUCTIVITY_REVIEW_SUPPRESSED_ACTION,
       entityType: "issue",
       entityId: sourceIssue.id,
       details,
@@ -3436,6 +3534,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       details,
       "productivity review runtime_failure_streak suppressed: run sample unchanged since the last resolved review (BLO-37071)",
     );
+    return true;
   }
 
   /**
@@ -6316,6 +6415,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       // That ordering is deliberate — it keeps the extra query off candidates
       // a cadence cap already stopped — but it means a low reading early in a
       // loop is under-reporting, not absence.
+      //
+      // It counts suppression *decisions*, one per pass. The audit row is
+      // deduped per frozen window (BLO-24022), so this counter and a count of
+      // `unchanged_run_sample` activityLog rows are deliberately different
+      // numbers — do not reconcile one against the other.
       unchangedSampleSuppressed: 0,
       closedSuppressedMonitorReviews: 0,
       closedTerminalSourceReviews: 0,
