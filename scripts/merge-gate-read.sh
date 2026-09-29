@@ -309,21 +309,46 @@ verdicts() { # $1 = DEAD alternation, $2 = PENDING rows (both may be empty)
   grep -vE "	(${dead})$" \
     | sort -t$'\t' -k1,1 -k4,4 -k3,3r \
     | awk -F'\t' '!seen[$1 FS $4]++' \
-    | awk -F'\t' -v dead="$dead" -v pend="${2:-}" '
+    | PEND="${2:-}" awk -F'\t' -v dead="$dead" '
+        # NO APOSTROPHES anywhere below: this awk program is single-quoted in the
+        # surrounding shell, so one inside a comment ends the script mid-word and
+        # bash reports a syntax error on an unrelated line further down.
+        #
         # BLO-37887. Pend rows are carried as an ORDERED list, not an
         # associative array: awk for-in order is unspecified, so iterating the
         # map directly makes multi-run output nondeterministic and its fixture
         # flaky. Keyed lookup still uses `contributed`, which is a map.
-        BEGIN{ np = split(pend, pl, "\n"); k = 0
+        #
+        # Read from ENVIRON, NOT `-v pend=`: awk un-escapes a `-v` value, and a
+        # workflow name carrying a real tab or newline reaches us from `@tsv` as
+        # the two-character `\t`/`\n`. Round-tripping through `-v` turns those
+        # back into real separators, so a tab truncates the displayed name and a
+        # newline splits one run into two, emitting a spurious extra NO-VERDICT.
+        # Direction is RED — `prid` is field 1, so a real stop can never be
+        # suppressed — but the line then names a workflow that does not exist.
+        BEGIN{ np = split(ENVIRON["PEND"], pl, "\n"); k = 0
                for (i = 1; i <= np; i++) if (pl[i] != "") {
-                 split(pl[i], f, "\t"); k++
+                 split(pl[i], f, "\t")
+                 # `--paginate` can repeat a run id when a run is created mid-walk
+                 # and shifts the page boundary. Idempotent, so one line per run.
+                 if (f[1] in pseen) continue
+                 pseen[f[1]] = 1; k++
                  prid[k] = f[1]; pstat[k] = f[2]; pname[k] = f[3] } }
         NF==0{next}
         # Set on SURVIVING rows only — after DEAD, after dedup — so "contributed"
         # means "this run published a check-run that is still standing", which is
         # the question. Set BEFORE the label rules below so a row that is itself a
         # STOP still counts as its run having spoken.
-        {contributed[$4] = 1}
+        #
+        # The two exclusions are the SAME predicate the survivor count `n` uses,
+        # and they must stay aligned: `neutral` and a `${{`-bearing name are the
+        # two declared NON-verdicts here, both explicitly non-blocking. Crediting
+        # one as "this run spoke" suppresses NO-VERDICT for a run that has said
+        # nothing — the fail-GREEN class this guard exists to close, one row away
+        # from itself. `status`/`app:` rows need no exclusion: `$4` there is
+        # literal `status` or `app:<slug>`, never a numeric `actions/runs[].id`,
+        # so they cannot collide with a pend key.
+        $2!="neutral"&&$1!~/\$\{\{/{contributed[$4] = 1}
         # Survivors are check-run verdicts only. On a repo that publishes ONLY
         # legacy statuses this fires ABSENT on every head — the documented
         # single-surface false RED. Control: run the same read against 3-8
@@ -354,7 +379,7 @@ verdicts() { # $1 = DEAD alternation, $2 = PENDING rows (both may be empty)
             # covers the neighbouring case.
             for (i = 1; i <= k; i++) if (!(prid[i] in contributed))
               printf "STOP\t<%s: run %s, no check-run published>\tNO-VERDICT\trun=%s\n", \
-                     pname[i], pstat[i], prid[i]}'
+                     (pname[i] == "" ? "?" : pname[i]), pstat[i], prid[i]}'
 }
 
 # `--rows` propagates the pipeline status rather than swallowing it. Hardcoding
