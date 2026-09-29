@@ -93,12 +93,14 @@ function runWrapper(dir, { tokenFileContent, tokenValue, args = ["api", "user"] 
 // the happy paths above and is useless for the exit-64 refusals below.
 // setTokenFileVar: false leaves PAPERCLIP_GITHUB_TOKEN_FILE unset, exercising
 // the compiled-in-default branch that must stay lenient for non-agent callers.
-function spawnWrapper(dir, { tokenFileContent, args = ["api", "user"], setTokenFileVar = true } = {}) {
+// extraEnv is applied after sanitizing, for tests whose premise includes a
+// caller-supplied credential.
+function spawnWrapper(dir, { tokenFileContent, args = ["api", "user"], setTokenFileVar = true, extraEnv = {} } = {}) {
   const stubGhPath = path.join(dir, "gh.real");
   writeFileSync(stubGhPath, STUB_GH_SOURCE);
   chmodSync(stubGhPath, 0o755);
 
-  const env = sanitizedEnv({ GH_TOKEN_WRAPPER_REAL_GH: stubGhPath });
+  const env = sanitizedEnv({ GH_TOKEN_WRAPPER_REAL_GH: stubGhPath, ...extraEnv });
 
   if (setTokenFileVar) {
     if (tokenFileContent !== undefined) {
@@ -161,6 +163,47 @@ test("refuses a whitespace-only token file rather than exporting a blank token (
     assert.equal(proc.status, 64);
     assert.match(proc.stderr, /is empty; refusing to run with ambient auth/);
     assert.equal(proc.stdout, "");
+  });
+});
+
+// Ally review on PR #2111: local-only commands never contact GitHub, so a
+// missing named credential cannot make their answer wrong. Refusing them hides
+// whether the binary works at all, during the very outage the refusal is for.
+for (const args of [["--version"], ["version"], ["--help"], ["-h"], ["help", "api"], [], ["completion", "-s", "bash"]]) {
+  test(`does not refuse local-only \`gh ${args.join(" ")}\` when the named token file is absent (BLO-37977)`, () => {
+    withTempDir((dir) => {
+      const proc = spawnWrapper(dir, { args });
+      assert.equal(proc.status, 0, proc.stderr);
+      assert.match(proc.stdout, new RegExp(`\\nARGS=${args.join(" ")}\\n`));
+    });
+  });
+}
+
+test("still refuses `auth git-credential` when the named token file is absent (BLO-37977)", () => {
+  // The boundary the local-only exemption above must not widen past: git
+  // resolving a remote is a real query.
+  withTempDir((dir) => {
+    const proc = spawnWrapper(dir, { args: ["auth", "git-credential", "get"] });
+    assert.equal(proc.status, 64);
+    assert.match(proc.stderr, /is absent; refusing to run with ambient auth/);
+    assert.equal(proc.stdout, "");
+  });
+});
+
+test("refusal ignores a caller's GH_TOKEN and names GH_SEAT_TOKEN_VALUE, which does work (BLO-37977)", () => {
+  // A caller-supplied GH_TOKEN used to be honoured when the named file was
+  // missing; it no longer is, so the error must say how to get a working gh.
+  withTempDir((dir) => {
+    const callerToken = { GH_TOKEN: "user_supplied_override", GITHUB_TOKEN: "user_supplied_override" };
+    const refused = spawnWrapper(dir, { extraEnv: callerToken });
+    assert.equal(refused.status, 64);
+    assert.equal(refused.stdout, "");
+    assert.match(refused.stderr, /to run under a specific token, set GH_SEAT_TOKEN_VALUE/);
+    assert.doesNotMatch(refused.stderr, /user_supplied_override/);
+
+    const overridden = spawnWrapper(dir, { extraEnv: { ...callerToken, GH_SEAT_TOKEN_VALUE: "ghu_operator" } });
+    assert.equal(overridden.status, 0, overridden.stderr);
+    assert.match(overridden.stdout, /^GH_TOKEN=ghu_operator$/m);
   });
 });
 
