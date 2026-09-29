@@ -142,8 +142,8 @@ describe("parseMergedPullRequestForHeadRef", () => {
   });
 
   it("takes the most recently merged PR, not the response order", () => {
-    // GitHub sorts this list by `updated_at`, so a later comment on an older PR
-    // is enough to put it first. Ordering on `merged_at` is the fix.
+    // GitHub sorts this list by `created` descending, and a PR opened earlier
+    // can merge later. Ordering on `merged_at` is the fix.
     expect(parseMergedPullRequestForHeadRef([
       { number: 10, merged_at: "2026-01-01T00:00:00Z", merge_commit_sha: "old" },
       { number: 20, merged_at: "2026-09-01T00:00:00Z", merge_commit_sha: "new" },
@@ -155,6 +155,21 @@ describe("parseMergedPullRequestForHeadRef", () => {
     // A branch can be deleted, or retargeted by hand, without ever merging.
     // Both fire the same event and neither is a stacked orphaning.
     expect(parseMergedPullRequestForHeadRef([])).toEqual({ outcome: "none" });
+  });
+
+  it("treats a full page as unreadable, never as none or as a prefix's merge", () => {
+    // Only one page is fetched, so the merge that triggered the retarget may be
+    // on page 2. Neither `none` (suppresses the wake) nor the prefix's newest
+    // merge (possibly the wrong base, so the wrong directive) is a safe answer.
+    const closedUnmerged = Array.from({ length: 29 }, (_, i) => ({ number: i + 1, merged_at: null }));
+    expect(parseMergedPullRequestForHeadRef([...closedUnmerged, { number: 99, merged_at: null }]))
+      .toEqual({ outcome: "error", reason: "merged_pull_request_truncated" });
+    expect(parseMergedPullRequestForHeadRef([
+      ...closedUnmerged,
+      { number: 99, merged_at: "2026-09-26T09:00:00Z", merge_commit_sha: "prefix" },
+    ])).toEqual({ outcome: "error", reason: "merged_pull_request_truncated" });
+    // One short of the page is still the whole answer.
+    expect(parseMergedPullRequestForHeadRef(closedUnmerged)).toEqual({ outcome: "none" });
   });
 
   it("fails closed on an unreadable body instead of reporting none", () => {
