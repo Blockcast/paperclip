@@ -16,8 +16,8 @@
 //      shutdown signal.", "lost communication with the server").
 //   2. The job concluded `failure` but NO step concluded `failure`.
 //   3. The job never reached its own body: every step the workflow declares is
-//      `skipped`, and the only steps that failed are the runner's pre-body
-//      setup. See PRE_BODY_SETUP_STEP_NAMES below.
+//      `skipped`, and the only steps that failed are runner setup whose failure
+//      the diff cannot have caused. See EXCUSABLE_SETUP_FAILURE_STEP_NAMES.
 //
 // Signal 2 alone is not enough, and the asymmetry matters: an empty failing-step
 // set reliably means an abort, but a NON-empty one means nothing. On runner loss
@@ -48,7 +48,13 @@
 // outcome; it does not change the gate. `verify` still exits non-zero either
 // way — a PR is never merged on the strength of an infrastructure kill.
 
-const RUNNER_LOSS_PATTERNS = [
+// Exported so the tests can assert against THIS set rather than a hand-copied
+// transcription of it. A falsification guard that proves "signal 1 declines on
+// this fixture" is only worth the line it occupies if it is checking the
+// patterns the module actually uses; a copy silently stops being that set the
+// first time one is added here, and would then assert the opposite of the truth
+// while still passing.
+export const RUNNER_LOSS_PATTERNS = [
   /the operation was canceled\./i,
   /the runner has received a shutdown signal/i,
   /lost communication with the server/i,
@@ -100,8 +106,40 @@ const JOB_TIMEOUT_PATTERNS = [/has exceeded the maximum execution time/i];
 //
 // Names, not indices: a step's position moves whenever `pr.yml` gains or loses
 // a step, and these three names are GitHub's own and stable across lanes.
+//
+// The cost of matching on name is a latent collision: a step the workflow
+// DECLARES as `Set up runner` would be read as synthetic and pulled out of the
+// body. No workflow in `.github/workflows/` declares either name today (checked
+// at this commit), and the collision is self-limiting — a declared step under
+// one of these names would have to be `skipped` along with the whole body for
+// the signal to fire at all. Rename rather than reintroduce one.
 const PRE_BODY_SETUP_STEP_NAMES = new Set(["set up job", "set up runner"]);
 const RUNNER_POSTAMBLE_STEP_NAMES = new Set(["complete job"]);
+
+// Which pre-body FAILURE is excusable — a strictly narrower question than which
+// steps are synthetic, and the two must not share a set.
+//
+// `Set up job` is synthetic (so it belongs in the body exclusion above) but its
+// failure is NOT excusable, because it is where GitHub resolves remote action
+// references — and those are diff-controlled. `pr.yml` carries eight distinct
+// ones at this commit (`actions/checkout@v6`, `actions/setup-node@v6`,
+// `actions/setup-python@v5`, `actions/cache@v4`, `actions/upload-artifact@v4`
+// and `@v7`, `actions/download-artifact@v4`, `azure/setup-helm@v4` — a count
+// that will rot, so re-grep rather than trusting it), so a PR that bumps one to
+// a ref that does not exist fails in setup for a reason entirely its own.
+// Excusing that would announce a defect the PR really did introduce as a pool
+// kill — this script's purpose inverted, which is the same failure mode the
+// `timeout-minutes` override exists to prevent. Same class as the `container:` /
+// `services:` caveat below; action resolution is simply the instance that is
+// live today rather than hypothetical.
+//
+// `Set up runner` is what the measured instance needed and all it needed: in
+// run 36303595922 attempt 2, `Set up job` was `success`. So this narrowing
+// preserves that instance exactly while removing the wider reading. It also
+// errs in the safe direction — an unexcused infrastructure failure merely keeps
+// today's wording, whereas an excused diff defect is a red turned into an
+// invitation to re-run forever.
+const EXCUSABLE_SETUP_FAILURE_STEP_NAMES = new Set(["set up runner"]);
 
 const normalizedStepName = (step) =>
   typeof step?.name === "string" ? step.name.trim().toLowerCase() : "";
@@ -197,26 +235,28 @@ export function classifyJobFailure(job, annotations = null) {
   // first is what keeps it true if GitHub ever renders a timeout differently.
   //
   // Scope caveat, in the spirit of the step-level-timeout note above: this
-  // excuses a lane for a diff that cannot reach runner setup. A workflow's
-  // `container:` or `services:` block IS diff-controlled and IS consumed by
-  // `Set up runner`, so a PR that pointed one at a bad image would fail here for
-  // a reason genuinely its own. No lane in `pr.yml` declares either today
-  // (checked at this commit), so nothing is currently mislabelled — but a lane
-  // that gains one would need that case excluded here.
+  // excuses a lane only for a diff that cannot reach the failing setup step.
+  // `Set up job` resolves diff-controlled action refs and is excluded from the
+  // excusable set for exactly that reason (see above). The remaining exposure is
+  // `Set up runner`, which consumes a workflow's `container:` or `services:`
+  // block — also diff-controlled, so a PR that pointed one at a bad image would
+  // fail here for a reason genuinely its own. No lane in `pr.yml` declares
+  // either today (checked at this commit), so nothing is currently mislabelled —
+  // but a lane that gains one would need that case excluded here.
   const bodySteps = steps.filter((step) => {
     const name = normalizedStepName(step);
     return !PRE_BODY_SETUP_STEP_NAMES.has(name) && !RUNNER_POSTAMBLE_STEP_NAMES.has(name);
   });
-  const everyFailureIsPreBodySetup = steps
+  const everyFailureIsExcusableSetup = steps
     .filter((step) => step?.conclusion === "failure")
-    .every((step) => PRE_BODY_SETUP_STEP_NAMES.has(normalizedStepName(step)));
+    .every((step) => EXCUSABLE_SETUP_FAILURE_STEP_NAMES.has(normalizedStepName(step)));
   // `bodySteps.length > 0` guards against the vacuous read: a job we cannot see
   // any declared step for has not been SHOWN to have skipped its body, and
   // `every` on an empty array would answer `true` and excuse it anyway.
   if (
     bodySteps.length > 0 &&
     bodySteps.every((step) => step?.conclusion === "skipped") &&
-    everyFailureIsPreBodySetup
+    everyFailureIsExcusableSetup
   ) {
     return "infrastructure";
   }

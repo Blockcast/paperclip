@@ -464,7 +464,9 @@ const PRE_BODY_KILLED_ANNOTATIONS = [
 ];
 
 test("classifier detects a runner that failed before the job body started", async () => {
-  const { classifyJobFailure } = await import("../classify-lane-failures.mjs");
+  const { classifyJobFailure, RUNNER_LOSS_PATTERNS } = await import(
+    "../classify-lane-failures.mjs"
+  );
 
   assert.equal(
     classifyJobFailure(PRE_BODY_KILLED_JOB, PRE_BODY_KILLED_ANNOTATIONS),
@@ -476,19 +478,75 @@ test("classifier detects a runner that failed before the job body started", asyn
   // Falsification guards for the two pre-existing signals, so this test cannot
   // pass because one of THEM happened to fire. Both must be shown to decline on
   // this fixture, or the new signal is untested.
+  //
+  // Signal 1 is checked against the module's OWN exported patterns rather than a
+  // copy of them: a transcription is stale the moment a pattern is added, and a
+  // guard checking a set the classifier does not use would assert the opposite
+  // of the truth while still passing.
+  assert.ok(
+    Array.isArray(RUNNER_LOSS_PATTERNS) && RUNNER_LOSS_PATTERNS.length > 0,
+    "signal 1's guard is vacuous against an empty pattern set — `!some` on [] answers true",
+  );
   assert.ok(
     !PRE_BODY_KILLED_ANNOTATIONS.some((annotation) =>
-      [
-        /the operation was canceled\./i,
-        /the runner has received a shutdown signal/i,
-        /lost communication with the server/i,
-      ].some((pattern) => pattern.test(annotation.message)),
+      RUNNER_LOSS_PATTERNS.some((pattern) => pattern.test(annotation.message)),
     ),
     "signal 1 must not fire on this fixture — otherwise the new signal is not what is under test",
   );
   assert.ok(
     PRE_BODY_KILLED_JOB.steps.some((step) => step.conclusion === "failure"),
     "signal 2 must not fire on this fixture — the failing-step set has to be non-empty",
+  );
+});
+
+// A `Set up job` failure is a DIFFERENT thing from a `Set up runner` failure,
+// even though both are synthetic steps that precede the body and both leave the
+// declared steps `skipped`. `Set up job` is where GitHub resolves remote action
+// references, and those come from the PR's own `pr.yml` — so this shape can be a
+// defect the diff really did introduce, and excusing it would invert the
+// script's purpose exactly as a mislabelled `timeout-minutes` expiry would.
+test("a Set up job failure is not excused — action refs are diff-controlled", async () => {
+  const { classifyJobFailure } = await import("../classify-lane-failures.mjs");
+
+  const badActionRef = {
+    id: 3,
+    name: "General tests (workspaces-b)",
+    conclusion: "failure",
+    steps: [
+      { number: 1, name: "Set up job", conclusion: "failure" },
+      { number: 2, name: "Checkout repository", conclusion: "skipped" },
+      { number: 3, name: "Install dependencies", conclusion: "skipped" },
+      { number: 4, name: "Run grouped general test suites", conclusion: "skipped" },
+      { number: 5, name: "Complete job", conclusion: "success" },
+    ],
+  };
+  assert.equal(
+    classifyJobFailure(badActionRef, [
+      {
+        annotation_level: "failure",
+        message:
+          "Unable to resolve action `actions/checkout@v99`, repository or version not found",
+      },
+    ]),
+    "reported",
+    "a PR that bumps an action to a ref that does not exist must keep the failure wording",
+  );
+
+  // Falsification: the identical shape with the failure moved to `Set up runner`
+  // MUST flip. Without this the assertion above would pass on a classifier that
+  // had simply stopped detecting the pre-body shape at all.
+  assert.equal(
+    classifyJobFailure(
+      {
+        ...badActionRef,
+        steps: badActionRef.steps.map((step) =>
+          step.name === "Set up job" ? { ...step, name: "Set up runner" } : step,
+        ),
+      },
+      PRE_BODY_KILLED_ANNOTATIONS,
+    ),
+    "infrastructure",
+    "fixture no longer isolates the step name — it must be the failing step that flips this",
   );
 });
 
