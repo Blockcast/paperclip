@@ -102,6 +102,13 @@ describeEmbeddedPostgres("issue list stable enumeration and exact counts", () =>
    * Seeds `count` issues with strictly decreasing updatedAt, so the default
    * activity-ordered listing has a well-defined, reproducible order.
    *
+   * Ids are assigned in the REVERSE of that order — index 0 is newest but sorts last —
+   * rather than left random. The keyset walk reads id order and the activity order is what
+   * mutation perturbs, so with random ids the two orders correlate by luck and a test that
+   * touches an "already-returned" row may touch one already at the front of the activity
+   * order, where re-ranking moves nothing. Anti-correlating them makes every already-
+   * returned row a late one in activity order, so offset paging demonstrably loses it.
+   *
    * `status: "blocked"` additionally puts every row in the blocked inbox: a blocked row
    * with no blocker edge, no assigneeUserId and no monitor is a dead end, which is the
    * cheapest shape that earns a blockedInboxAttention entry (no companion rows needed).
@@ -109,7 +116,7 @@ describeEmbeddedPostgres("issue list stable enumeration and exact counts", () =>
   async function seedIssues(companyId: string, count: number, status: "todo" | "blocked" = "todo") {
     const base = Date.UTC(2026, 0, 1, 0, 0, 0);
     const rows = Array.from({ length: count }, (_, index) => ({
-      id: randomUUID(),
+      id: `${(count - 1 - index).toString(16).padStart(8, "0")}-0000-4000-8000-000000000000`,
       companyId,
       title: `Issue ${index}`,
       status,
@@ -294,9 +301,11 @@ describeEmbeddedPostgres("issue list stable enumeration and exact counts", () =>
     // lets this run at ordinary speed.
     const ids = await seedIssues(companyId, 5);
     const byId = [...ids].sort();
-    // The only issue the restricted actor may read is the highest id, which sortField=id
-    // places on the last page: the walk has to reach the end to find it at all.
-    const scopedIssueId = byId.at(-1)!;
+    // The one readable issue is the LOWEST id, i.e. the oldest by activity. Under the
+    // keyset order the walk meets it on page one and counts it; under offset paging over
+    // the activity order the touches below carry it to the front, behind the advancing
+    // cursor, and it is never counted at all. That is the difference this asserts.
+    const scopedIssueId = byId[0]!;
 
     // Bump an ALREADY-RETURNED row to the newest activity after each page. The walk reads
     // the immutable id order, so this must not move a row across the cursor. The offset

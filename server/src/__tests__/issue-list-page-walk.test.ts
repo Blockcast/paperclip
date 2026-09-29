@@ -43,22 +43,35 @@ describe("walkIssueListPages", () => {
   // file boundary, with no conflict and no type error. Both must surface as a rejection:
   // the walk feeds a count endpoint, so the untended failure is a request that never
   // returns and a connection held open, not a wrong number.
+  //
+  // Each fetcher caps its own calls, and that cap is load-bearing rather than defensive.
+  // Without the guard these walks do not merely run long: every iteration awaits an
+  // already-resolved promise, so the loop never yields to the event loop and vitest's
+  // timeout — a timer — can never fire. The suite hangs instead of failing. The cap makes
+  // the unguarded case raise a DIFFERENT error, so the assertions below are on the guard's
+  // own message and stay red-in-bounded-time when the guard is reverted.
+  const capped = (serve: (page: { offset?: number; afterId?: string }) => Array<{ id: string }>) => {
+    let calls = 0;
+    return async (page: { offset?: number; afterId?: string }) => {
+      calls += 1;
+      if (calls > rows.length + 2) throw new Error("walk did not advance");
+      return serve(page);
+    };
+  };
 
   it("throws rather than spinning when the general path's afterId never reaches list()", async () => {
     // An early return added to list() above its afterId predicate looks exactly like this:
     // the cursor is accepted and ignored, so page one comes back forever.
-    const ignoresAfterId = async () => rows.slice(0, 2);
     await expect(
-      walkIssueListPages(ignoresAfterId, { blocked: false, pageSize: 2 }, async () => {}),
+      walkIssueListPages(capped(() => rows.slice(0, 2)), { blocked: false, pageSize: 2 }, async () => {}),
     ).rejects.toThrow(/keyset cursor did not advance/);
   });
 
   it("throws rather than spinning when the blocked path's offset never reaches list()", async () => {
     // The route builds the blocked page args separately from the walk's `blocked` flag;
     // dropping `offset` there strands the walk on page one just as completely.
-    const ignoresOffset = async () => rows.slice(0, 2);
     await expect(
-      walkIssueListPages(ignoresOffset, { blocked: true, pageSize: 2 }, async () => {}),
+      walkIssueListPages(capped(() => rows.slice(0, 2)), { blocked: true, pageSize: 2 }, async () => {}),
     ).rejects.toThrow(/blocked page repeated/);
   });
 
