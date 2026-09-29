@@ -574,13 +574,26 @@ describe("handleWebhook — delivery timing (BLO-37485)", () => {
       .map((call) => String(call[0]))
       .filter((line) => line.includes("slow delivery"));
 
+  /**
+   * Both clocks advance together by default, so a test that only cares about
+   * elapsed time reads the same whichever the handler uses. `stepWallClock`
+   * moves `Date.now` alone — an NTP step — which the monotonic clock the
+   * handler times with must not follow.
+   */
   const stubClock = (startMs: number) => {
-    let nowMs = startMs;
-    const spy = vi.spyOn(Date, "now").mockImplementation(() => nowMs);
+    let monotonicMs = startMs;
+    let wallSkewMs = 0;
+    const spies = [
+      vi.spyOn(performance, "now").mockImplementation(() => monotonicMs),
+      vi.spyOn(Date, "now").mockImplementation(() => monotonicMs + wallSkewMs),
+    ];
     return {
-      spy,
+      restore: () => spies.forEach((spy) => spy.mockRestore()),
       advance: (byMs: number) => {
-        nowMs += byMs;
+        monotonicMs += byMs;
+      },
+      stepWallClock: (byMs: number) => {
+        wallSkewMs += byMs;
       },
     };
   };
@@ -596,7 +609,7 @@ describe("handleWebhook — delivery timing (BLO-37485)", () => {
     try {
       await handleWebhook(ctx, baseConfig(), true, baseInput());
     } finally {
-      clock.spy.mockRestore();
+      clock.restore();
     }
 
     expect(mocks.metrics.write).toHaveBeenCalledWith(
@@ -630,7 +643,7 @@ describe("handleWebhook — delivery timing (BLO-37485)", () => {
     try {
       await handleWebhook(ctx, baseConfig(), true, baseInput());
     } finally {
-      clock.spy.mockRestore();
+      clock.restore();
     }
 
     expect(mocks.metrics.write).toHaveBeenCalledWith(
@@ -683,7 +696,7 @@ describe("handleWebhook — delivery timing (BLO-37485)", () => {
         baseInput({ parsedBody: envelope, rawBody: JSON.stringify(envelope) }),
       );
     } finally {
-      clock.spy.mockRestore();
+      clock.restore();
     }
 
     const slow = slowDeliveryLines(mocks);
@@ -729,7 +742,7 @@ describe("handleWebhook — delivery timing (BLO-37485)", () => {
         baseInput({ parsedBody: envelope, rawBody: JSON.stringify(envelope) }),
       );
     } finally {
-      clock.spy.mockRestore();
+      clock.restore();
     }
 
     const slow = slowDeliveryLines(mocks);
@@ -749,6 +762,64 @@ describe("handleWebhook — delivery timing (BLO-37485)", () => {
     const { ctx, mocks } = mkCtx();
     await handleWebhook(ctx, baseConfig(), true, baseInput());
     expect(slowDeliveryLines(mocks)).toHaveLength(0);
+  });
+
+  it("ignores a wall-clock step forward and does not fabricate a breach", async () => {
+    const { ctx, mocks } = mkCtx();
+    const clock = stubClock(1_000_000);
+    mocks.issues.create.mockImplementation(async () => {
+      clock.advance(250);
+      // An NTP step, not slew: the delivery really took 250ms. Timed off
+      // `Date.now()` this reads as 10 minutes and writes a `deadline_exceeded`
+      // for a delivery that was never anywhere near the deadline — poisoning
+      // the one counter AC3 is judged on.
+      clock.stepWallClock(600_000);
+      return { id: "issue-1" };
+    });
+
+    try {
+      await handleWebhook(ctx, baseConfig(), true, baseInput());
+    } finally {
+      clock.restore();
+    }
+
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.webhook.duration_ms",
+      250,
+    );
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.webhook.deadline_exceeded",
+      1,
+    );
+    expect(slowDeliveryLines(mocks)).toHaveLength(0);
+  });
+
+  it("ignores a wall-clock step backward and never writes a negative duration", async () => {
+    const { ctx, mocks } = mkCtx();
+    const clock = stubClock(1_000_000);
+    mocks.issues.create.mockImplementation(async () => {
+      clock.advance(250);
+      // The other half of the class. A negative counter value is worse than a
+      // wrong one: `increase()` reads the drop as a counter reset, so it
+      // corrupts the window rather than one sample.
+      clock.stepWallClock(-600_000);
+      return { id: "issue-1" };
+    });
+
+    try {
+      await handleWebhook(ctx, baseConfig(), true, baseInput());
+    } finally {
+      clock.restore();
+    }
+
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.webhook.duration_ms",
+      250,
+    );
+    const durations = mocks.metrics.write.mock.calls
+      .filter((call) => call[0] === "alertmanager.webhook.duration_ms")
+      .map((call) => call[1] as number);
+    expect(durations.every((ms) => ms >= 0)).toBe(true);
   });
 
   it("still completes the delivery when the timing metric write fails", async () => {
@@ -788,7 +859,7 @@ describe("handleWebhook — delivery timing (BLO-37485)", () => {
     try {
       await handleWebhook(ctx, baseConfig(), true, baseInput());
     } finally {
-      clock.spy.mockRestore();
+      clock.restore();
     }
 
     // The first write failing must not cost the denominator or the breach
