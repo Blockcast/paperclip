@@ -10,6 +10,7 @@ import {
   CCROTATE_CAPACITY_MAX_PARK_MS,
   jitterTransientRetryFloor,
   MAX_TRANSIENT_RETRY_HORIZON_MS,
+  resolveCcrotateCapacityRetry,
 } from "../services/ccrotate-capacity-retry.js";
 import {
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS,
@@ -581,7 +582,8 @@ describeEmbeddedPostgres("refreshOverdueScheduledRetryAgeMetrics (BLO-22094)", (
       },
       {
         ...base,
-        // 4x past CCROTATE_CAPACITY_MAX_PARK_MS (900s). This is the writer bug
+        // 3.3x past the 1,080s ccrotate_capacity ceiling (CCROTATE_CAPACITY_MAX_PARK_MS
+        // plus 20% jitter on the clamped value). This is the writer bug
         // class BLO-28919 fixed, and it is what the detector exists to catch.
         scheduledRetryAt: new Date(now.getTime() + 3_600_000),
         scheduledRetryAttempt: 2,
@@ -641,9 +643,17 @@ describe("scheduled-retry park horizon help text (BLO-31174)", () => {
       now,
       random: () => 1,
     }).dueAt.getTime() / 1000;
+    // Jitter is added AFTER the clamp, so the constant alone understates the
+    // ceiling: a reset advertised at the clamp, at the top of the jitter band.
+    const capacityCeilingS = resolveCcrotateCapacityRetry({
+      resumeAt: new Date(now.getTime() + CCROTATE_CAPACITY_MAX_PARK_MS),
+      now,
+      defaultRetryDelayMs: CCROTATE_CAPACITY_MAX_PARK_MS,
+      random: () => 1,
+    }).retryAt.getTime() / 1000;
     const ceilings: Array<[string, number]> = [
       ["max_turns_continuation", MAX_TURN_CONTINUATION_MAX_DELAY_MS / 1000],
-      ["ccrotate_capacity", CCROTATE_CAPACITY_MAX_PARK_MS / 1000],
+      ["ccrotate_capacity", capacityCeilingS],
       ["dependency_blocked", DEP_BLOCKED_MAX_DELAY_MS / 1000],
       ["transient_failure", ladderCeilingS],
     ];
@@ -655,5 +665,10 @@ describe("scheduled-retry park horizon help text (BLO-31174)", () => {
     // No stale ceiling may survive alongside the derived ones.
     expect([...help!.matchAll(/ (\d+)s\b/g)].map((match) => Number(match[1]))).toEqual(finite);
     expect(help).toContain(`span at least ${Math.max(...finite) / Math.min(...finite)}x`);
+    // The flat bound the alert shipped with (runbooks/queued-run-stranded.md),
+    // over the capacity ceiling: how far past its own ceiling a capacity park
+    // can sit before that single threshold notices.
+    const flatAlertBoundS = 5400;
+    expect(help).toContain(`missing a ${flatAlertBoundS / capacityCeilingS}x clamp breach`);
   });
 });
