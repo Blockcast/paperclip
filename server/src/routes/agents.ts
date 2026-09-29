@@ -4855,6 +4855,11 @@ export function agentRoutes(
    * attention, and `overdueMs` is computed server-side because a park whose due
    * time has passed without the sweep promoting it is a different failure from
    * a park that is simply long.
+   *
+   * Two units in the response, and they are not interchangeable (PEN-3607):
+   * `agents[]` / `*RunCount` are per PARKED RUN, `*AgentCount` is per SEAT. One
+   * seat can hold several overdue parks at once, which is what the production
+   * measurement behind PEN-3607 actually looked like.
    */
   router.get("/companies/:companyId/parked-agents", async (req, res) => {
     const companyId = req.params.companyId as string;
@@ -4881,6 +4886,14 @@ export function agentRoutes(
         // dispatch fault, and before this the two were indistinguishable
         // because only one of them was selected at all.
         runStatus: heartbeatRuns.status,
+        // PEN-3607 (Ally review): the instant promotion moved this row into
+        // `queued`. It is the ONLY field that separates "the promotion sweep
+        // was slow" from "the dispatcher has not claimed it" — see the
+        // `queuedForMs` comment below, and the column's own docblock in
+        // `packages/db/src/schema/heartbeat_runs.ts`, which exists because
+        // reading a promoted retry's backoff as dispatch wait is "the exact
+        // false-stranded-run signal BLO-21116 exists to kill".
+        queuedAt: heartbeatRuns.queuedAt,
         errorCode: heartbeatRuns.errorCode,
         createdAt: heartbeatRuns.createdAt,
         // The park metadata (advertised reset, clamped-from horizon) lives only
@@ -4945,6 +4958,7 @@ export function agentRoutes(
       // rename would silently null this field (BLO-35263).
       const advertisedResumeAt = result[CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY];
       const dueMs = row.scheduledRetryAt?.getTime() ?? null;
+      const queuedAtMs = row.queuedAt?.getTime() ?? null;
       return {
         agentId: row.agentId,
         agentName: row.agentName,
@@ -4956,6 +4970,10 @@ export function agentRoutes(
         // not happened is the dispatch claim. Callers triaging a dark seat
         // need that split, because the remedies are unrelated: the first is
         // provider capacity, the second is the dispatcher.
+        //
+        // For how long the dispatch claim has been outstanding read
+        // `queuedForMs`, not `overdueMs` — on a `queued` row those are
+        // different numbers, and only the first is the dispatcher's.
         runStatus: row.runStatus,
         reason: row.scheduledRetryReason,
         attempt: row.scheduledRetryAttempt,
@@ -4963,9 +4981,35 @@ export function agentRoutes(
         parkedSince: row.createdAt,
         scheduledRetryAt: row.scheduledRetryAt,
         retryInMs: dueMs === null ? null : Math.max(0, dueMs - now.getTime()),
-        // A park that is already due but still sitting here means the promotion
-        // sweep is not draining it — the freeze mode this endpoint exists for.
+        // How long past its OWN due time this park is — nothing more.
+        //
+        // On a `scheduled_retry` row that is the whole story: the sweep has
+        // not promoted it, so due→now is the entire delay.
+        //
+        // On a `queued` row it spans park-due → promotion → now, so it is the
+        // SUM of promotion lag and dispatch wait, and attributing all of it to
+        // the dispatcher is wrong. A sweep wedged 28 h that promotes a due
+        // park 10 min ago yields `overdueMs ≈ 29 h` on a run whose dispatch
+        // wait is 10 min — the opposite triage conclusion. Use `queuedForMs`
+        // to attribute the second span, and the difference for the first.
         overdueMs: dueMs === null ? null : Math.max(0, now.getTime() - dueMs),
+        // Promotion instant (`heartbeat_runs.queued_at`), stamped by the exact
+        // transition that moves a due park into `queued`. Null on a
+        // `scheduled_retry` row, which has not been queued.
+        queuedAt: row.runStatus === "queued" ? row.queuedAt : null,
+        // Time this run has actually been waiting for a dispatch slot.
+        //
+        // Deliberately NOT `coalesce(queuedAt, scheduledRetryAt)`: that
+        // fallback is precisely the park-due→now conflation above, so it would
+        // reintroduce the overstatement on exactly the rows where the true
+        // value is unknown. A `queued` row predating the `queued_at` stamp
+        // therefore reports null — "dispatch wait unmeasurable on this row" —
+        // rather than a number an operator would act on. `overdueMs` still
+        // carries the honest upper bound there.
+        queuedForMs:
+          row.runStatus === "queued" && queuedAtMs !== null
+            ? Math.max(0, now.getTime() - queuedAtMs)
+            : null,
         // What the provider asked for, beside what we actually booked, so the
         // two can be compared without opening the run.
         penstockProvider: typeof result.penstockProvider === "string" ? result.penstockProvider : null,
@@ -4992,13 +5036,36 @@ export function agentRoutes(
       };
     });
 
+    // PEN-3607 (Ally review): `agents[]` is one entry per parked RUN, and since
+    // the `queued` arm landed, several rows for one seat is the normal case
+    // rather than a curiosity — the motivating production measurement was a
+    // single dark seat (UX Designer `bcba1cc7`) holding TWO overdue
+    // `ccrotate_capacity` rows. Nothing here dedupes, so the old
+    // `parkedCount` / `overdueCount` counted runs while being read, on an
+    // endpoint called `parked-agents`, as a count of seats.
+    //
+    // Both units are now published under names that say which they are. The
+    // rename is deliberate over a silent redefinition: a stale caller reading
+    // `overdueCount` gets `undefined` and fails loudly, where leaving the name
+    // in place would have kept returning a plausible, wrong seat count.
+    const overdueRuns = parked.filter((entry) => (entry.overdueMs ?? 0) > 0);
     res.json({
       generatedAt: now,
       reason: reason ?? null,
       limit,
+      // NB: `limit` bounds ROWS, not seats, so a truncated response under-counts
+      // agents as well as runs — treat both agent counts as lower bounds when
+      // this is true.
       truncated,
-      parkedCount: parked.length,
-      overdueCount: parked.filter((entry) => (entry.overdueMs ?? 0) > 0).length,
+      parkedRunCount: parked.length,
+      overdueRunCount: overdueRuns.length,
+      // The seat-level answer to the question this endpoint is named for. These
+      // are what "how many agents cannot run right now" means; the run counts
+      // above are how many parks those seats are holding between them.
+      parkedAgentCount: new Set(parked.map((entry) => entry.agentId)).size,
+      overdueAgentCount: new Set(overdueRuns.map((entry) => entry.agentId)).size,
+      // One entry per parked RUN. A seat holding several parks appears once per
+      // park; dedupe on `agentId` if you need seats.
       agents: parked,
     });
   });

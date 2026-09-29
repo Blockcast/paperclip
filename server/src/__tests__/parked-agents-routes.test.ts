@@ -131,6 +131,9 @@ describeEmbeddedPostgres("parked agents route", () => {
     scheduledRetryAt?: Date | null;
     scheduledRetryReason?: string | null;
     scheduledRetryAttempt?: number;
+    // Stamped by `promoteScheduledRetryRun` at the instant a due park becomes
+    // `queued`, so it is what separates promotion lag from dispatch wait.
+    queuedAt?: Date | null;
     resultJson?: Record<string, unknown>;
   }) {
     await db.insert(heartbeatRuns).values({
@@ -143,6 +146,7 @@ describeEmbeddedPostgres("parked agents route", () => {
       scheduledRetryAt: input.scheduledRetryAt ?? null,
       scheduledRetryReason: input.scheduledRetryReason ?? null,
       scheduledRetryAttempt: input.scheduledRetryAttempt ?? 0,
+      queuedAt: input.queuedAt ?? null,
       errorCode: input.status === "scheduled_retry" ? "rate_limit_exhausted" : null,
       resultJson: input.resultJson ?? {},
     });
@@ -185,7 +189,7 @@ describeEmbeddedPostgres("parked agents route", () => {
       .get(`/api/companies/${companyId}/parked-agents`)
       .expect(200);
 
-    expect(res.body.parkedCount).toBe(2);
+    expect(res.body.parkedRunCount).toBe(2);
     expect(res.body.agents.map((entry: { agentName: string }) => entry.agentName)).toEqual([
       "PlatformSREEngineer",
       "BackendEngineer",
@@ -248,7 +252,7 @@ describeEmbeddedPostgres("parked agents route", () => {
       .expect(200);
 
     const [exhausted, outage, unlabelled] = res.body.agents;
-    expect(res.body.parkedCount).toBe(3);
+    expect(res.body.parkedRunCount).toBe(3);
 
     // The control: `reason` is the same on all three, so it cannot separate them.
     expect(
@@ -303,7 +307,7 @@ describeEmbeddedPostgres("parked agents route", () => {
 
     // Due-but-still-parked is a different failure from a long park: the sweep is
     // not draining it. Distinguishing the two is the point of overdueMs.
-    expect(res.body.overdueCount).toBe(1);
+    expect(res.body.overdueRunCount).toBe(1);
     expect(res.body.agents[0].overdueMs).toBeGreaterThan(60 * 60_000);
     expect(res.body.agents[0].retryInMs).toBe(0);
   });
@@ -331,7 +335,7 @@ describeEmbeddedPostgres("parked agents route", () => {
       .get(`/api/companies/${companyId}/parked-agents?reason=ccrotate_capacity`)
       .expect(200);
 
-    expect(res.body.parkedCount).toBe(1);
+    expect(res.body.parkedRunCount).toBe(1);
     expect(res.body.agents[0].agentName).toBe("PlatformSREEngineer");
     expect(res.body.reason).toBe("ccrotate_capacity");
   });
@@ -354,7 +358,7 @@ describeEmbeddedPostgres("parked agents route", () => {
       .get(`/api/companies/${companyId}/parked-agents`)
       .expect(200);
 
-    expect(res.body.parkedCount).toBe(1);
+    expect(res.body.parkedRunCount).toBe(1);
     expect(res.body.agents[0].agentName).toBe("PlatformSREEngineer");
   });
 
@@ -374,7 +378,7 @@ describeEmbeddedPostgres("parked agents route", () => {
       .get(`/api/companies/${companyId}/parked-agents`)
       .expect(200);
 
-    expect(res.body.parkedCount).toBe(0);
+    expect(res.body.parkedRunCount).toBe(0);
     expect(res.body.agents).toEqual([]);
   });
 
@@ -407,15 +411,21 @@ describeEmbeddedPostgres("parked agents route", () => {
       scheduledRetryReason: "ccrotate_capacity",
       // Never re-deferred: promoted on its first due-time hit.
       scheduledRetryAttempt: 0,
+      // Promotion fired promptly (1 min after due), so essentially all of the
+      // 29 h is dispatch wait. The test below separates the other case.
+      queuedAt: new Date(Date.now() - (29 * 60 - 1) * 60_000),
     });
 
     const res = await request(createApp(boardActor(companyId)))
       .get(`/api/companies/${companyId}/parked-agents`)
       .expect(200);
 
-    expect(res.body.parkedCount).toBe(1);
+    expect(res.body.parkedRunCount).toBe(1);
     // The assertion this ticket exists for.
-    expect(res.body.overdueCount).toBe(1);
+    expect(res.body.overdueRunCount).toBe(1);
+    // One run, one seat — the two units agree here, which is what makes the
+    // stacked-park test below the one that can tell them apart.
+    expect(res.body.overdueAgentCount).toBe(1);
 
     const [dark] = res.body.agents;
     expect(dark.agentName).toBe("UXDesigner");
@@ -427,6 +437,147 @@ describeEmbeddedPostgres("parked agents route", () => {
     expect(dark.runStatus).toBe("queued");
     expect(dark.overdueMs).toBeGreaterThan(28 * 60 * 60_000);
     expect(dark.retryInMs).toBe(0);
+    // Promotion was prompt, so the dispatch wait really is ~the whole overdue
+    // span — this is the case where blaming the dispatcher is correct.
+    expect(dark.queuedForMs).toBeGreaterThan(28 * 60 * 60_000);
+  });
+
+  /**
+   * PEN-3607 (Ally review). `overdueMs` on a `queued` row spans park-due →
+   * promotion → now, so it is promotion lag PLUS dispatch wait. Attributing all
+   * of it to the dispatcher inverts the triage when the promotion sweep is the
+   * thing that stalled — and that is the precise conflation `queued_at` was
+   * added for: its schema docblock calls reading a promoted retry's backoff as
+   * dispatch wait "the exact false-stranded-run signal BLO-21116 exists to
+   * kill".
+   *
+   * This fixture is the adversarial case: a park due 29 h ago that promotion
+   * only picked up 10 minutes ago. `overdueMs` must stay large (the park IS
+   * that overdue) while `queuedForMs` stays small (dispatch has had it for 10
+   * minutes and is not at fault). A single field cannot carry both.
+   */
+  it("separates promotion lag from dispatch wait on a late-promoted park", async () => {
+    const companyId = await seedCompany();
+    const lateAgent = await seedAgent(companyId, "LatePromotionEngineer");
+
+    await seedRun({
+      companyId,
+      agentId: lateAgent,
+      status: "queued",
+      scheduledRetryAt: new Date(Date.now() - 29 * 60 * 60_000),
+      scheduledRetryReason: "ccrotate_capacity",
+      // The sweep was wedged ~29 h and only promoted this row 10 min ago.
+      queuedAt: new Date(Date.now() - 10 * 60_000),
+    });
+
+    const res = await request(createApp(boardActor(companyId)))
+      .get(`/api/companies/${companyId}/parked-agents`)
+      .expect(200);
+
+    const [late] = res.body.agents;
+    // Unchanged meaning: this park really is 29 h past its own due time.
+    expect(late.overdueMs).toBeGreaterThan(28 * 60 * 60_000);
+    // ...but dispatch has only held it for 10 minutes. Reporting overdueMs as
+    // the dispatch wait here would blame the dispatcher for a sweep stall.
+    expect(late.queuedForMs).toBeLessThan(30 * 60_000);
+    expect(late.queuedForMs).toBeGreaterThanOrEqual(10 * 60_000 - 5_000);
+    // The gap between the two IS the promotion lag, and it must be visible.
+    expect(late.overdueMs - late.queuedForMs).toBeGreaterThan(28 * 60 * 60_000);
+  });
+
+  /**
+   * PEN-3607 (Ally review). A `queued` row promoted before `queued_at` existed
+   * has no measurable dispatch wait. It must report null — "unmeasurable" —
+   * rather than falling back to `scheduledRetryAt`, because that fallback is
+   * exactly the park-due→now conflation above and would overstate the dispatch
+   * wait on precisely the rows where the true value is unknown.
+   */
+  it("reports a null dispatch wait rather than guessing one from the park due time", async () => {
+    const companyId = await seedCompany();
+    const legacyAgent = await seedAgent(companyId, "LegacyPromotionEngineer");
+
+    await seedRun({
+      companyId,
+      agentId: legacyAgent,
+      status: "queued",
+      scheduledRetryAt: new Date(Date.now() - 29 * 60 * 60_000),
+      scheduledRetryReason: "ccrotate_capacity",
+      queuedAt: null,
+    });
+
+    const res = await request(createApp(boardActor(companyId)))
+      .get(`/api/companies/${companyId}/parked-agents`)
+      .expect(200);
+
+    const [legacy] = res.body.agents;
+    expect(legacy.queuedForMs).toBeNull();
+    expect(legacy.queuedAt).toBeNull();
+    // The honest upper bound is still published, so the row is not silent.
+    expect(legacy.overdueMs).toBeGreaterThan(28 * 60 * 60_000);
+  });
+
+  /**
+   * PEN-3607 (Ally review). The production shape that motivated this change was
+   * ONE dark seat holding TWO overdue `ccrotate_capacity` parks — UX Designer
+   * `bcba1cc7`, 2026-09-29. Since the `queued` arm landed, several rows per seat
+   * is the normal case, so run counts and seat counts diverge routinely and an
+   * operator reading a run count as "how many agents are down" over-counts.
+   *
+   * This pins which field carries which unit. Without it, a future dedupe (or a
+   * future failure to dedupe) would flip the answer silently in either
+   * direction.
+   */
+  it("counts runs and seats separately when one agent holds several overdue parks", async () => {
+    const companyId = await seedCompany();
+    const darkAgent = await seedAgent(companyId, "UXDesigner");
+    const otherAgent = await seedAgent(companyId, "BackendEngineer");
+
+    // Two stacked parks on ONE seat, as measured in production.
+    await seedRun({
+      companyId,
+      agentId: darkAgent,
+      status: "queued",
+      scheduledRetryAt: new Date(Date.now() - 29 * 60 * 60_000),
+      scheduledRetryReason: "ccrotate_capacity",
+      queuedAt: new Date(Date.now() - 29 * 60 * 60_000),
+    });
+    await seedRun({
+      companyId,
+      agentId: darkAgent,
+      status: "queued",
+      scheduledRetryAt: new Date(Date.now() - 28 * 60 * 60_000),
+      scheduledRetryReason: "ccrotate_capacity",
+      queuedAt: new Date(Date.now() - 28 * 60 * 60_000),
+    });
+    // A second seat, still parked rather than promoted, so the mix of the two
+    // populations is covered too.
+    await seedRun({
+      companyId,
+      agentId: otherAgent,
+      status: "scheduled_retry",
+      scheduledRetryAt: new Date(Date.now() - 2 * 60 * 60_000),
+      scheduledRetryReason: "ccrotate_capacity",
+    });
+
+    const res = await request(createApp(boardActor(companyId)))
+      .get(`/api/companies/${companyId}/parked-agents`)
+      .expect(200);
+
+    // Three parked RUNS...
+    expect(res.body.parkedRunCount).toBe(3);
+    expect(res.body.overdueRunCount).toBe(3);
+    expect(res.body.agents).toHaveLength(3);
+    // ...held between TWO seats. This is the number that answers "how many
+    // agents cannot run right now", and it is not the number above.
+    expect(res.body.parkedAgentCount).toBe(2);
+    expect(res.body.overdueAgentCount).toBe(2);
+    // The dark seat legitimately appears twice; `agents[]` is per run.
+    expect(res.body.agents.filter((entry: { agentName: string }) => entry.agentName === "UXDesigner"))
+      .toHaveLength(2);
+    // The superseded names must be gone, not silently redefined — a stale
+    // caller has to break rather than read a run count as a seat count.
+    expect(res.body.parkedCount).toBeUndefined();
+    expect(res.body.overdueCount).toBeUndefined();
   });
 
   /**
@@ -457,8 +608,8 @@ describeEmbeddedPostgres("parked agents route", () => {
       .get(`/api/companies/${companyId}/parked-agents`)
       .expect(200);
 
-    expect(res.body.parkedCount).toBe(0);
-    expect(res.body.overdueCount).toBe(0);
+    expect(res.body.parkedRunCount).toBe(0);
+    expect(res.body.overdueRunCount).toBe(0);
     expect(res.body.agents).toEqual([]);
   });
 });
