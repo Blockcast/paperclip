@@ -6925,15 +6925,19 @@ export function buildK8sRunIsolationDescriptor(input: {
   // control falls through to `return claimed`. That is deliberate — an
   // issue-interaction wake carrying a comment id is allowed to run while
   // another run holds the issue, so a human can talk to the assignee
-  // mid-flight.
+  // mid-flight. BLO-38064 added a SECOND population to `issueLockRequired`:
+  // `isNonOwnershipRetryLineage`, the promoted retry of such a wake. It reads
+  // the pinned `originWakeReason` and does NOT require a comment id, so
+  // "carrying a comment id" no longer describes the whole lock-less set.
   //
   // The second run therefore never acquires `issues.executionRunId` at all. It
   // is a deliberately lock-less run, not a competing lock holder, so there is
   // no lock-ordering or retry fix available and no configuration in which the
   // race closes.
   //
-  // Grep `executionRunClaimCondition`, `allowsIssueInteractionWake` and
-  // `issueLockRequired` rather than trusting line numbers. Each resolves to
+  // Grep `executionRunClaimCondition`, `allowsIssueInteractionWake`,
+  // `isNonOwnershipRetryLineage` and `issueLockRequired` rather than trusting
+  // line numbers. Each resolves to
   // exactly one definition site, and a line number cited from inside the file
   // it points into goes stale on the next edit to that same file.
   //
@@ -9086,16 +9090,36 @@ function isAutoCheckoutWakeReason(wakeReason: string | null | undefined) {
  *
  * An ALLOW-list, not the inverse of {@link isAutoCheckoutWakeReason}, even
  * though that predicate answers the closely-related "does this wake confer
- * ownership". It also excludes `execution_*`, whose stage participant is
- * likewise routinely not the assignee — but the gate that protects those, the
+ * ownership". That predicate denies exactly three shapes and this list takes
+ * only the first. Both exclusions below are decided, not missed.
+ *
+ * `execution_*` — whose stage participant is likewise routinely not the
+ * assignee — but the gate that protects those, the
  * `issue_review_participant_changed` check, exists only in
  * `evaluateScheduledRetryGate`. Promotion calls that helper unconditionally, so
  * it is covered; the MINT site runs it only under `requiresIssueGate`, which a
  * bounded transient retry does not satisfy. Exempting `execution_*` here would
  * therefore clear the assignee check at mint with no participant check behind
- * it. Add them once that check is replicated there; until then their retries
- * stay suppressed, and say so via the honest error code below rather than by
- * mislabelling them a reassignment.
+ * it. Add them once that check is replicated there.
+ *
+ * `source_scoped_recovery_action` — a recovery owner is the failed assignee's
+ * chain-of-command parent, so `assigneeAgentId !== run.agentId` is that wake's
+ * steady state too, and `claimQueuedRun` already exempts it unconditionally
+ * (`isRecoveryOwnerWake`). It stays out because the harm motivating this list
+ * does not apply to it: a mention has no other wake path, so losing its retry
+ * loses the message permanently, whereas a recovery action carries its own
+ * `attemptCount`/`maxAttempts` budget and the stranded sweep re-upserts it —
+ * incrementing that count and re-arming the wake — so its owner is re-driven
+ * without this retry. Adding it would widen the exemption to a family with no
+ * measured loss; that is the whole reason, and one measured loss is enough to
+ * change it. This does leave the gate STRICTER than the claim screen here,
+ * which is safe in that direction only: the retry is never armed, so the claim
+ * exemption is unreachable rather than contradicted. Pinned by the
+ * `source_scoped_recovery_action` gate-leg case in
+ * heartbeat-retry-scheduling.test.ts, so this decision survives the next read.
+ *
+ * Until either joins, their retries stay suppressed, and say so via the honest
+ * error code below rather than by mislabelling them a reassignment.
  */
 const NON_OWNERSHIP_RETRY_WAKE_REASONS = new Set(["issue_comment_mentioned"]);
 
@@ -9227,10 +9251,26 @@ type ScheduledRetryAssigneeMismatch = {
  * pre-start claim screen, which now honours this same exemption — deliberately,
  * since a screen that cancelled what the gate promoted is the very defect the
  * shared predicate exists to prevent, but it does mean the residual now reaches
- * the agent instead of dying one frame later. What bounds it is that promotion
- * writes no lock, so there is no concurrent execution, and the retry is
- * attempt-capped — the cost is a bounded number of wakes to an agent that will
- * read the issue and find it reassigned.
+ * the agent instead of dying one frame later.
+ *
+ * What bounds it is NOT "promotion writes no lock, so there is no concurrent
+ * execution": writing no lock is the mechanism that PRODUCES the concurrent
+ * run, not the one that prevents it. A promoted mention retry lands in exactly
+ * the state the `Same-issue concurrency is REACHABLE` block already maps (grep
+ * that phrase, above `resolveK8sRunIsolationIdentity`) — the claim UPDATE
+ * matches zero rows against the new owner's `executionRunId`, but
+ * `issueLockRequired` is false for this lineage, so the lock-not-acquired
+ * cancel is skipped and the run executes lock-lessly beside the owner's. That
+ * block asks not to have this re-derived as a live defect; it is the known
+ * shape, now reachable by one more population.
+ *
+ * The bounds that do hold, named exactly: there is no lock CONTENTION and no
+ * double acquisition, because this lineage never takes the lock at all; where
+ * the run is worktree-isolated under the default `per_issue` runScope,
+ * BLO-31443's tree-scoped writer key serialises the two against the shared
+ * tree, deferring the contender back to `queued` rather than dispatching it;
+ * and the retry is attempt-capped. The cost is a bounded number of wakes to an
+ * agent that will read the issue and find it reassigned.
  *
  * `issue_reassigned` now means what it says. It is kept for a wake that DID
  * confer ownership — the assignee episode BLO-29729 wrote the guard for, where

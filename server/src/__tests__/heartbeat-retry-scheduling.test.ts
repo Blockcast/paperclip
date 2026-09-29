@@ -4516,6 +4516,115 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     });
   });
 
+  // BLO-38064 review (Ally, Important 2). Pins the DECISION to keep
+  // `source_scoped_recovery_action` off `NON_OWNERSHIP_RETRY_WAKE_REASONS`, so
+  // that choice survives the next read of the allow-list doc instead of being
+  // re-derived.
+  //
+  // A recovery owner is the failed assignee's chain-of-command parent, so
+  // `assigneeAgentId !== run.agentId` is this wake's steady state too — the
+  // same shape as a mention. It is excluded anyway because the harm differs: a
+  // mention has no other wake path, whereas a recovery action carries its own
+  // `attemptCount`/`maxAttempts` budget and the stranded sweep re-upserts it,
+  // re-arming the owner without this retry.
+  //
+  // Note this leaves the GATE stricter than `claimQueuedRun`, which exempts
+  // recovery-owner wakes unconditionally (`isRecoveryOwnerWake`). Safe in that
+  // direction only: the retry is never armed, so the claim exemption is
+  // unreachable rather than contradicted. If this ever flips to `scheduled`,
+  // the two screens have started disagreeing and the claim leg needs a mirror.
+  it("keeps a source_scoped_recovery_action retry suppressed as issue_not_assigned_to_agent", async () => {
+    const companyId = randomUUID();
+    const recoveryOwnerAgentId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const issueId = randomUUID();
+    const sourceRunId = randomUUID();
+    const now = new Date("2026-04-20T14:15:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values([
+      {
+        id: recoveryOwnerAgentId,
+        companyId,
+        name: "ClaudeCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "claude_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+      {
+        id: assigneeAgentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+    ]);
+
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId,
+      agentId: recoveryOwnerAgentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      error: "upstream overload",
+      errorCode: "adapter_failed",
+      finishedAt: now,
+      contextSnapshot: {
+        issueId,
+        wakeReason: "source_scoped_recovery_action",
+      },
+      updatedAt: now,
+      createdAt: now,
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Retry after a recovery-owner wake",
+      status: "todo",
+      priority: "medium",
+      responsibleUserId: "responsible-user",
+      assigneeAgentId,
+      issueNumber: 1,
+      identifier: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}-1`,
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(sourceRunId, {
+      now,
+      random: () => 0.5,
+    });
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+
+    const promotion = await heartbeat.promoteDueScheduledRetries(scheduled.dueAt);
+    expect(promotion).toEqual({ promoted: 0, runIds: [] });
+
+    const retry = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+    expect(retry).toEqual({
+      status: "cancelled",
+      errorCode: "issue_not_assigned_to_agent",
+    });
+  });
+
   it("does not promote a scheduled retry after the issue is handed to a human owner", async () => {
     const companyId = randomUUID();
     const oldAgentId = randomUUID();
