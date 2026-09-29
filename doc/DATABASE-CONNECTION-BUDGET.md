@@ -56,6 +56,12 @@ namespace.
 | `createUtilitySql` (`client.ts`, `max: 1`, transient at startup) | ≤4 | 1 | ~4 |
 | operator / ad-hoc `psql` headroom | — | — | ~4 |
 
+The tilde-prefixed `peak` column is a reading aid. **The arithmetic block below
+is the authoritative copy of those four reserves** — it is what the budget test
+parses, so a re-measurement carried into this table but not into the block
+changes nothing and is not caught. Edit the block, then update this column to
+match.
+
 **Peak application process count is 4**, not 3: the API Deployment is
 `maxSurge: 1` / `maxUnavailable: 0`, so a rollout runs 3 API pods at once, and
 `terminationGracePeriodSeconds` is 120 so a draining pod holds its pool for up

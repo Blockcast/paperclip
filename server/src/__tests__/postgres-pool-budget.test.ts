@@ -56,9 +56,13 @@ describe("postgres connection budget", () => {
       /\| `superuser_reserved_connections` \| \*\*(\d+)\*\*/,
       "superuser_reserved_connections",
     );
+    // The arithmetic block is written with U+2212 MINUS and U+00F7 DIVISION, so
+    // every anchor below accepts the ASCII lookalike too. Retyping a reserve
+    // line with `-` would otherwise fail as "budget doc does not state <x>",
+    // pointing at the doc's content when the cause is an invisible character.
     const appPoolBudget = readNumber(doc, /^= *(\d+) +for application pools$/m, "application pool budget");
-    const margin = readNumber(doc, /^− *(\d+) +estimation margin$/m, "estimation margin");
-    const peakAppProcesses = readNumber(doc, /^÷ *(\d+) +peak processes/m, "peak processes");
+    const margin = readNumber(doc, /^[−-] *(\d+) +estimation margin$/m, "estimation margin");
+    const peakAppProcesses = readNumber(doc, /^[÷/] *(\d+) +peak processes/m, "peak processes");
 
     const availableToPaperclip = maxConnections - superuserReserved;
     // Summed from the reserve lines, not derived by subtraction. An earlier
@@ -68,14 +72,23 @@ describe("postgres connection budget", () => {
     // measured `max_connections` change that left the arithmetic block alone
     // still passed while the budget overflowed.
     const nonAppReserved =
-      readNumber(doc, /^− *(\d+) +postgres-exporter$/m, "postgres-exporter reserve") +
-      readNumber(doc, /^− *(\d+) +overlapping cronjob one-shots$/m, "cronjob reserve") +
-      readNumber(doc, /^− *(\d+) +transient createUtilitySql pools$/m, "createUtilitySql reserve") +
-      readNumber(doc, /^− *(\d+) +operator headroom$/m, "operator headroom reserve");
+      readNumber(doc, /^[−-] *(\d+) +postgres-exporter$/m, "postgres-exporter reserve") +
+      readNumber(doc, /^[−-] *(\d+) +overlapping cronjob one-shots$/m, "cronjob reserve") +
+      readNumber(doc, /^[−-] *(\d+) +transient createUtilitySql pools$/m, "createUtilitySql reserve") +
+      readNumber(doc, /^[−-] *(\d+) +operator headroom$/m, "operator headroom reserve");
     // The block's own subtotal must follow from the table and the reserves, so
     // a ceiling re-measured in the table but not carried into the arithmetic
     // fails here even in the direction that would otherwise pass (more room).
     expect(availableToPaperclip - nonAppReserved).toBe(appPoolBudget);
+    // `= 72 budgeted` and `= 18 per pool` close the block and were the only two
+    // lines nothing parsed — pure display, free to drift out of step with the
+    // values actually checked while every input around them stayed pinned. With
+    // these, each line of the arithmetic follows from the one above it, so a
+    // reader cannot be handed a chain that no longer adds up.
+    expect(
+      readNumber(doc, /^= *(\d+) +budgeted to application pools$/m, "budgeted application pool total"),
+    ).toBe(appPoolBudget - margin);
+    expect(readNumber(doc, /^= *(\d+) +per pool$/m, "per-pool allocation")).toBe(POSTGRES_POOL_MAX);
     const peakDemand = peakAppProcesses * POSTGRES_POOL_MAX + nonAppReserved;
 
     // The failure this guards is asymmetric: too small is a client-side queue,
