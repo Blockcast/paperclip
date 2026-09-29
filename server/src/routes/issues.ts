@@ -3056,7 +3056,8 @@ function logIssueListRequest(input: {
  * BEFORE the afterId predicate, so a new early return added above it would silently make
  * afterId a no-op here — no conflict, no type error, an unbounded loop. Each branch below
  * therefore asserts its own cursor actually moved, so that mistake surfaces on page two as
- * an error rather than as a request that never returns.
+ * an error rather than as a request that never returns. A page cap backstops both, since
+ * the blocked assertion compares consecutive pages and churn can differ them indefinitely.
  */
 export async function walkIssueListPages<Row extends { id: string }>(
   fetchPage: (page: { offset?: number; afterId?: string }) => Promise<Row[]>,
@@ -3066,7 +3067,17 @@ export async function walkIssueListPages<Row extends { id: string }>(
   let offset = 0;
   let afterId: string | undefined;
   let previousPageIds: string | undefined;
-  while (true) {
+  // Backstop for both branches. The per-branch assertions below catch the mirror breaking
+  // on page two, but the blocked one compares only the immediately previous page: a dropped
+  // `offset` combined with churn at the head of the mutable activity order can serve
+  // differing pages forever and slip past it. This cap cannot, and cannot false-positive
+  // either — at the production pageSize it admits a million rows before firing, and the
+  // walk's own caller caps a page at ISSUE_LIST_MAX_LIMIT.
+  const maxPages = ISSUE_LIST_MAX_LIMIT;
+  for (let page = 0; ; page += 1) {
+    if (page >= maxPages) {
+      throw new Error(`walkIssueListPages: exceeded ${maxPages} pages, so the walk is not terminating`);
+    }
     const rows = await fetchPage(opts.blocked ? { offset } : { afterId });
     await visit(rows);
     if (rows.length < opts.pageSize) return;
