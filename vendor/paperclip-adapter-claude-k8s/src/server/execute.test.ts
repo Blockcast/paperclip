@@ -2334,6 +2334,43 @@ describe("execute: run Secrets outlive the pod that mounts them (BLO-35486)", ()
     }
   });
 
+  it("logs once when it cannot list pods to confirm teardown", async () => {
+    vi.useFakeTimers();
+    try {
+      // deleteCollection succeeds, then the list API starts refusing. The
+      // teardown poll can no longer prove the pods are gone, so it retries to
+      // the deadline and fails closed — on exactly the same path as a genuinely
+      // wedged pod. The log line is the only thing that tells them apart.
+      mockCoreDeleteCollectionPods.mockImplementation(async () => {
+        mockCoreListPods.mockRejectedValue(
+          Object.assign(new Error("pods is forbidden"), { code: 403 }),
+        );
+        return {};
+      });
+
+      const ctx = makeCtx({
+        config: { podStartTimeoutSec: 0, env: { MY_API_KEY: "s3cret" } },
+      } as Partial<AdapterExecutionContext>);
+      const promise = execute(ctx);
+      await vi.advanceTimersByTimeAsync(90_000);
+      await promise;
+
+      const warnings = (ctx.onLog as ReturnType<typeof vi.fn>).mock.calls.filter(
+        ([, message]: [string, string]) => message.includes("cannot list pods for job"),
+      );
+      // Exactly once, not once per 2s poll: asserting the count guards the
+      // one-shot flag, not just the log's existence.
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0][1]).toContain("pods is forbidden");
+      // Guard against a vacuous pass: there must be a Secret that was retained
+      // because the poll never confirmed teardown.
+      expect(mockCoreCreateSecret).toHaveBeenCalled();
+      expect(mockCoreDeleteSecret).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   // The two launch-ack abort paths run before the Job is acknowledged. When a
   // pod outlives teardown there, cleanupJob() keeps the Secrets and says K8s
   // GC will collect them, which is only true if the ownerReference to the Job

@@ -40,6 +40,13 @@ const POLL_INTERVAL_MS = 2000;
 const KEEPALIVE_INTERVAL_MS = 15_000;
 // How long cleanup waits for a Job's pods to actually disappear before giving
 // up and leaving the Job + Secrets to K8s GC (BLO-35486).
+//
+// INVARIANT: this must exceed the pod's terminationGracePeriodSeconds, which is
+// what the wait is actually waiting on. `buildJobManifest` (job-manifest.ts) sets
+// none, so pods ride the K8s 30s default — 2x headroom. The two values live in
+// different files: raising the grace period past this makes *every* teardown hit
+// the timeout and fail closed, retaining Job + Secrets with no reaper to collect
+// them.
 const POD_TEARDOWN_TIMEOUT_MS = 60_000;
 const K8S_CONCURRENCY_GUARD_TIMEOUT_MS = 15_000;
 const RUN_ID_LABEL = "paperclip.io/run-id";
@@ -1647,6 +1654,7 @@ async function deleteJobPodsAndWait(
     }
   }
   const deadline = Date.now() + POD_TEARDOWN_TIMEOUT_MS;
+  let listErrorLogged = false;
   while (true) {
     let observed: number | null = null;
     try {
@@ -1656,6 +1664,18 @@ async function deleteJobPodsAndWait(
       // Can't observe the pods, so we can't prove they are gone — unless the
       // namespace itself is gone, in which case they are.
       if (isK8s404(err)) return true;
+      // Log the first non-404 once. A persistent RBAC/5xx failure retries
+      // silently to the deadline and then fails closed on the same path as a
+      // genuinely wedged pod, so without this the two are indistinguishable in
+      // a postmortem — and both leave the Job + Secrets behind.
+      if (!listErrorLogged) {
+        listErrorLogged = true;
+        const msg = err instanceof Error ? err.message : String(err);
+        await onLog(
+          "stderr",
+          `[paperclip] Warning: cannot list pods for job ${jobName} to confirm teardown: ${msg}\n`,
+        );
+      }
     }
     if (observed === 0) return true;
     if (Date.now() >= deadline) return false;
