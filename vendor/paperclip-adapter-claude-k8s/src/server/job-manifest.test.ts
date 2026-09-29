@@ -2265,9 +2265,14 @@ describe("buildJobManifest", () => {
       const parsed = JSON.parse(wakeValue!);
       expect(parsed.fallbackFetchNeeded).toBe(true);
       expect(parsed.truncated).toBe(true);
-      // Tier 1 sheds only metadata/presentation, so routing context survives.
+      expect(parsed.payloadShed).toBe(true);
       expect(parsed.issue?.identifier).toBe("BLO-37287");
       expect(parsed.latestCommentId).toBe("c1");
+      // Tier 1 is what keeps the comment bodies: tier 2 emits no `comments` key,
+      // so this is the only assertion that reds if tier 1 stops firing and every
+      // oversize payload falls through to routing-only.
+      expect(parsed.comments?.[0]?.body).toBe("hello");
+      expect(parsed.comments?.[0]?.metadata).toBeNull();
     });
 
     it("sheds to routing-only when the oversize field is not a comment field", () => {
