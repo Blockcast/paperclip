@@ -2196,11 +2196,15 @@ describe("buildJobManifest", () => {
       expect(sawEnvPath, "no case took the env path — the assertions above never ran").toBe(true);
     });
 
-    // BLO-37287: generalised from the PROMPT_CONTENT-only invariant above to
-    // EVERY literal env string on EVERY container. That is the shape that
-    // catches this class rather than one instance of it — the prompt path
-    // (BLO-36854) and the wake payload are the two found so far, and a third
-    // unbounded SAFE_LITERAL would be caught here on the day it is added.
+    // BLO-37287: the PROMPT_CONTENT-only invariant above, widened to scan EVERY
+    // literal env string on EVERY container of the manifests built below. What
+    // that proves, and no more: an oversize wake payload cannot land an
+    // over-ceiling string in any var on any container, not only in
+    // PAPERCLIP_WAKE_PAYLOAD_JSON on the main one. It is NOT a guard for
+    // the class: only the wake payload is stuffed here, so a newly added
+    // unbounded SAFE_LITERAL would be normal-sized in every fixture and pass.
+    // Guarding the class needs an oversize input driven through each
+    // SAFE_LITERAL in ENV_NAME_CLASSIFICATION, which is out of scope here.
     const oversizeEnvStrings = (job: k8s.V1Job) => {
       const spec = job.spec?.template?.spec;
       return [...(spec?.containers ?? []), ...(spec?.initContainers ?? [])].flatMap((c) =>
@@ -2224,7 +2228,7 @@ describe("buildJobManifest", () => {
       ).toEqual([]);
     };
 
-    it("never puts any NAME=value env string over MAX_ARG_STRLEN on any container", () => {
+    it("never puts any NAME=value env string over MAX_ARG_STRLEN on any container for a worst-case wake payload", () => {
       // The reachable worst case, not the observed one: the server passes each
       // comment's `metadata` through raw and the schema permits ~4 MB of it.
       // Revert the shed in stringifyPaperclipWakePayload and this reds naming
