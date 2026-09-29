@@ -36,6 +36,16 @@ import type * as k8s from "@kubernetes/client-node";
 
 const POLL_INTERVAL_MS = 2000;
 const KEEPALIVE_INTERVAL_MS = 15_000;
+// How long cleanup waits for a Job's pods to actually disappear before giving
+// up and leaving the Job + Secrets to K8s GC (BLO-35486).
+//
+// INVARIANT: this must exceed the pod's terminationGracePeriodSeconds, which is
+// what the wait is actually waiting on. `buildJobManifest` (job-manifest.ts) sets
+// none, so pods ride the K8s 30s default — 2x headroom. The two values live in
+// different files: raising the grace period past this makes *every* teardown hit
+// the timeout and fail closed, retaining Job + Secrets with no reaper to collect
+// them.
+const POD_TEARDOWN_TIMEOUT_MS = 60_000;
 const K8S_CONCURRENCY_GUARD_TIMEOUT_MS = 15_000;
 const RUN_ID_LABEL = "paperclip.io/run-id";
 const MANAGED_BY_LABEL = "app.kubernetes.io/managed-by";
@@ -1463,9 +1473,105 @@ export function describeTruncationCause(
 }
 
 /**
+ * Delete the Job's pods and wait for them to actually be gone.  Returns false
+ * if any pod outlived `POD_TEARDOWN_TIMEOUT_MS`.
+ *
+ * A Pod object is only removed from the API after the kubelet has confirmed
+ * teardown, so "no pods match `job-name=<jobName>`" is a sound signal that no
+ * container can still be started for this run.
+ */
+async function deleteJobPodsAndWait(
+  namespace: string,
+  jobName: string,
+  onLog: AdapterExecutionContext["onLog"],
+  kubeconfigPath?: string,
+): Promise<boolean> {
+  const coreApi = getCoreApi(kubeconfigPath);
+  const labelSelector = `job-name=${jobName}`;
+  try {
+    await coreApi.deleteCollectionNamespacedPod({ namespace, labelSelector });
+  } catch (err) {
+    // Non-fatal: the Job delete below still cascades.  Fall through to the
+    // poll, which is what actually decides whether the Secrets are safe.
+    if (!isK8s404(err)) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await onLog("stderr", `[paperclip] Warning: failed to delete pods for job ${jobName}: ${msg}\n`);
+    }
+  }
+  const deadline = Date.now() + POD_TEARDOWN_TIMEOUT_MS;
+  let listErrorLogged = false;
+  while (true) {
+    let observed: number | null = null;
+    try {
+      const podList = await coreApi.listNamespacedPod({ namespace, labelSelector });
+      observed = (podList?.items ?? []).length;
+    } catch (err) {
+      // Can't observe the pods, so we can't prove they are gone — unless the
+      // namespace itself is gone, in which case they are.
+      if (isK8s404(err)) return true;
+      // Log the first non-404 once. A persistent RBAC/5xx failure retries
+      // silently to the deadline and then fails closed on the same path as a
+      // genuinely wedged pod, so without this the two are indistinguishable in
+      // a postmortem — and both leave the Job + Secrets behind.
+      if (!listErrorLogged) {
+        listErrorLogged = true;
+        const msg = err instanceof Error ? err.message : String(err);
+        await onLog(
+          "stderr",
+          `[paperclip] Warning: cannot list pods for job ${jobName} to confirm teardown: ${msg}\n`,
+        );
+      }
+    }
+    if (observed === 0) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+  }
+}
+
+/**
  * Delete Job and its pods. Best-effort — failures are logged but not thrown.
+ *
+ * Returns true only when every pod for the Job is confirmed gone, which is the
+ * caller's licence to delete the run's mounted Secrets.
+ *
+ * BLO-35486: ordering here is load-bearing.  This used to delete the Job with
+ * `propagationPolicy: Background` — which returns before the GC has removed the
+ * pod — and every caller deleted the per-run Secrets immediately after.  A pod
+ * still mid-image-pull (a cold 3.3 GB agent image took ~12 min under 8-way
+ * contention, well past the pod-start timeout) would then finish pulling and
+ * start its container into `Error: secret "ac-…-env" not found`.  Pods first,
+ * confirmed gone, then the Job, then the Secrets.
  */
 async function cleanupJob(
+  namespace: string,
+  jobName: string,
+  onLog: AdapterExecutionContext["onLog"],
+  kubeconfigPath?: string,
+  podLogPath?: string,
+  opts?: { waitForPods?: boolean },
+): Promise<boolean> {
+  // The concurrency guard reaps *other* runs' stale Jobs under its own 15s
+  // budget, and never deletes this run's Secrets, so it opts out of the wait.
+  if (opts?.waitForPods === false) {
+    await deleteJobOnly(namespace, jobName, onLog, kubeconfigPath, podLogPath);
+    return true;
+  }
+  const podsGone = await deleteJobPodsAndWait(namespace, jobName, onLog, kubeconfigPath);
+  if (!podsGone) {
+    await onLog(
+      "stderr",
+      `[paperclip] Warning: pod(s) for job ${jobName} still present after ` +
+        `${Math.round(POD_TEARDOWN_TIMEOUT_MS / 1000)}s; leaving Job and run Secrets for K8s GC ` +
+        `rather than deleting a Secret a live pod mounts\n`,
+    );
+    return false;
+  }
+  await deleteJobOnly(namespace, jobName, onLog, kubeconfigPath, podLogPath);
+  return true;
+}
+
+/** Delete the Job itself, cascading to any pods. Best-effort. */
+async function deleteJobOnly(
   namespace: string,
   jobName: string,
   onLog: AdapterExecutionContext["onLog"],
@@ -1485,6 +1591,59 @@ async function cleanupJob(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     await onLog("stderr", `[paperclip] Warning: failed to cleanup job ${jobName}: ${msg}\n`);
+  }
+}
+
+/**
+ * Tear down a Job whose Paperclip run was cancelled externally.
+ *
+ * BLO-35486: deletes the pods and waits for them to go *before* deleting the
+ * Job.  Deleting the Job reaps this run's Secrets through their
+ * `ownerReference`, so doing it while a pod is still mid-image-pull starts
+ * that container into `secret "ac-…-env" not found` — the same defect
+ * `cleanupJob` fixes, reached by a path that used to bypass `cleanupJob`
+ * entirely and call `deleteNamespacedJob` directly.
+ *
+ * Unlike `cleanupJob` this deliberately does NOT fail closed: a cancelled run
+ * only settles once `waitForJobCompletion` sees the Job 404, and
+ * `completionTimeoutMs` may be 0 (run indefinitely), so refusing to delete the
+ * Job would hang the run forever.  The pod delete has already been issued by
+ * that point, so the kubelet will not start a container for it either way.
+ */
+export async function teardownCancelledJob(
+  namespace: string,
+  jobName: string,
+  onLog: AdapterExecutionContext["onLog"],
+  kubeconfigPath?: string,
+): Promise<void> {
+  const podsGone = await deleteJobPodsAndWait(namespace, jobName, onLog, kubeconfigPath);
+  if (!podsGone) {
+    await onLog(
+      "stderr",
+      `[paperclip] Warning: pod(s) for cancelled job ${jobName} still present after ` +
+        `${Math.round(POD_TEARDOWN_TIMEOUT_MS / 1000)}s; deleting the Job anyway so the run can settle\n`,
+    ).catch(() => undefined);
+  }
+  await deleteJobOnly(namespace, jobName, onLog, kubeconfigPath);
+}
+
+/**
+ * Best-effort delete of the per-run Secrets.  Only safe to call once the pod
+ * that mounts them is confirmed gone — see `cleanupJob` (BLO-35486).
+ * Failures are swallowed: TTL and the ownerReference-driven Job GC catch
+ * stragglers.
+ */
+async function deleteRunSecrets(
+  coreApi: k8s.CoreV1Api,
+  secrets: ({ name: string; namespace: string } | null)[],
+): Promise<void> {
+  for (const secret of secrets) {
+    if (!secret) continue;
+    try {
+      await coreApi.deleteNamespacedSecret({ name: secret.name, namespace: secret.namespace });
+    } catch {
+      // Best-effort cleanup — TTL or manual deletion will catch stragglers
+    }
   }
 }
 
@@ -1658,7 +1817,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
         const priorRun = await fetchHeartbeatRunSnapshot(ctx, jobRunId);
         if (!priorRun || !isActiveHeartbeatRun(priorRun)) {
-          await cleanupJob(jobNamespace, jobName, onLog, kubeconfigPath);
+          await cleanupJob(jobNamespace, jobName, onLog, kubeconfigPath, undefined, { waitForPods: false });
           await onLog("stdout", `[paperclip] Ignoring stale Job ${jobName}: run ${jobRunId} is terminal or missing in Paperclip.\n`);
           continue;
         }
@@ -2008,89 +2167,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         };
       }
     }
-    if (!createdJobUid || !onExternalRuntimeLaunched) {
-      // Only tear down what this execution actually created.  An adopted Job is
-      // live and its Secrets are mounted into a running pod; deleting either
-      // here would destroy work that is still progressing, which is the failure
-      // this whole change exists to stop.  Leaking a Job is recoverable by the
-      // existing reapers — deleting a live one is not.
-      if (!adoptedExistingJob) {
-        await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath);
-        if (promptSecret) {
-          await coreApi.deleteNamespacedSecret({
-            name: promptSecret.name,
-            namespace: promptSecret.namespace,
-          }).catch(() => undefined);
-        }
-        if (envSecret) {
-          await coreApi.deleteNamespacedSecret({
-            name: envSecret.name,
-            namespace: envSecret.namespace,
-          }).catch(() => undefined);
-        }
-        if (mcpConfigSecret) {
-          await coreApi.deleteNamespacedSecret({
-            name: mcpConfigSecret.name,
-            namespace: mcpConfigSecret.namespace,
-          }).catch(() => undefined);
-        }
-      }
-      return {
-        exitCode: null,
-        signal: null,
-        timedOut: false,
-        errorMessage: !createdJobUid
-          ? "Created Kubernetes Job did not return a UID"
-          : "Paperclip did not provide an external-runtime launch acknowledgment",
-        errorCode: "k8s_job_identity_unacknowledged",
-      };
-    }
-    // From here on every pod read is scoped to this exact Job object. The
-    // deterministic name alone cannot identify it (BLO-34577).
-    jobUid = createdJobUid;
-    try {
-      await onExternalRuntimeLaunched({ jobName, jobUid });
-    } catch (err) {
-      // Same reasoning as above.  Re-acking an adopted Job re-asserts an
-      // identity the server already persisted, so a throw here means we could
-      // not confirm ownership — which is the least safe moment to delete a
-      // live in-cluster object, not the most.
-      if (!adoptedExistingJob) {
-        await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath);
-        if (promptSecret) {
-          await coreApi.deleteNamespacedSecret({
-            name: promptSecret.name,
-            namespace: promptSecret.namespace,
-          }).catch(() => undefined);
-        }
-        if (envSecret) {
-          await coreApi.deleteNamespacedSecret({
-            name: envSecret.name,
-            namespace: envSecret.namespace,
-          }).catch(() => undefined);
-        }
-        if (mcpConfigSecret) {
-          await coreApi.deleteNamespacedSecret({
-            name: mcpConfigSecret.name,
-            namespace: mcpConfigSecret.namespace,
-          }).catch(() => undefined);
-        }
-      }
-      return {
-        exitCode: null,
-        signal: null,
-        timedOut: false,
-        errorMessage: `External runtime launch acknowledgment failed: ${err instanceof Error ? err.message : String(err)}`,
-        errorCode: "k8s_job_identity_unacknowledged",
-      };
-    }
-
-    if (jobIsolation.enabled) {
-      await reportIsolatedRunStarted(effectiveCtx, currentGuardIdentity);
-    }
-
     // Attach ownerReference so K8s GC cleans up the Secret(s) if the process
-    // crashes before the finally block runs.
+    // crashes before the finally block runs.  It must land before the two
+    // abort paths below: when cleanupJob() refuses to delete the Secrets
+    // because a pod outlived teardown (BLO-35486), this ownerReference is the
+    // only thing that will ever collect them; the adapter has no Secret reaper.
     if (promptSecret && createdJobUid) {
       try {
         await coreApi.patchNamespacedSecret({
@@ -2169,6 +2250,54 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         await onLog("stderr", `[paperclip] Warning: failed to set ownerReference on mcp-config Secret: ${msg}\n`);
       }
     }
+    if (!createdJobUid || !onExternalRuntimeLaunched) {
+      // Only tear down what this execution actually created.  An adopted Job is
+      // live and its Secrets are mounted into a running pod; deleting either
+      // here would destroy work that is still progressing, which is the failure
+      // this whole change exists to stop.  Leaking a Job is recoverable by the
+      // existing reapers — deleting a live one is not.
+      if (!adoptedExistingJob) {
+        if (await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath)) {
+          await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret]);
+        }
+      }
+      return {
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        errorMessage: !createdJobUid
+          ? "Created Kubernetes Job did not return a UID"
+          : "Paperclip did not provide an external-runtime launch acknowledgment",
+        errorCode: "k8s_job_identity_unacknowledged",
+      };
+    }
+    // From here on every pod read is scoped to this exact Job object. The
+    // deterministic name alone cannot identify it (BLO-34577).
+    jobUid = createdJobUid;
+    try {
+      await onExternalRuntimeLaunched({ jobName, jobUid });
+    } catch (err) {
+      // Same reasoning as above.  Re-acking an adopted Job re-asserts an
+      // identity the server already persisted, so a throw here means we could
+      // not confirm ownership — which is the least safe moment to delete a
+      // live in-cluster object, not the most.
+      if (!adoptedExistingJob) {
+        if (await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath)) {
+          await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret]);
+        }
+      }
+      return {
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        errorMessage: `External runtime launch acknowledgment failed: ${err instanceof Error ? err.message : String(err)}`,
+        errorCode: "k8s_job_identity_unacknowledged",
+      };
+    }
+
+    if (jobIsolation.enabled) {
+      await reportIsolatedRunStarted(effectiveCtx, currentGuardIdentity);
+    }
 
     await onLog("stdout", `[paperclip] Created K8s Job: ${jobName} in namespace ${namespace} (deadline: ${timeoutSec > 0 ? `${timeoutSec}s` : "none"})\n`);
   } finally {
@@ -2217,7 +2346,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   try {
     // Wait for pod to be ready for log streaming
     const scheduleTimeoutMs = Math.max(0, asNumber(config.podScheduleTimeoutSec, 120)) * 1000;
-    const startTimeoutMs = Math.max(0, asNumber(config.podStartTimeoutSec, 600)) * 1000;
+    // BLO-35486: 600s was shorter than a cold pull of the agent image under
+    // contention — 8 concurrent pods on one node measured 11m12s–12m36s from
+    // schedule to container start, of which the transfer itself was 2–33s and
+    // the rest was queueing behind one uncached 3.3 GB layer set.  Every real
+    // failure mode (ErrImagePull/ImagePullBackOff/CrashLoopBackOff/
+    // Unschedulable/init-container exit) is detected and thrown above without
+    // waiting for this deadline, so this is only the backstop for a pod that is
+    // still legitimately working — and it must outlast a cold-image wave.
+    const startTimeoutMs = Math.max(0, asNumber(config.podStartTimeoutSec, 1800)) * 1000;
     try {
       podName = await waitForPod(namespace, jobName, jobUid, scheduleTimeoutMs, startTimeoutMs, onLog, kubeconfigPath);
       await onLog("stdout", `[paperclip] Pod running: ${podName}\n`);
@@ -2308,13 +2445,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 void onLog("stdout", `[paperclip] Run cancelled externally — deleting Job ${jobName}\n`).catch(() => {});
                 cancelled = true;
                 logStopSignal.stopped = true;
-                try {
-                  await batchApi.deleteNamespacedJob({
-                    name: jobName,
-                    namespace,
-                    body: { propagationPolicy: "Background" },
-                  });
-                } catch { /* best-effort — completion watcher will see 404 and settle */ }
+                await teardownCancelledJob(namespace, jobName, onLog, kubeconfigPath);
                 return;
               }
             } else if (resp.status >= 500) {
@@ -2420,36 +2551,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   } finally {
     if (keepaliveTimer) clearInterval(keepaliveTimer);
     activeJobs.delete(activeJobRef);
+    let podsGone = false;
     if (skipCleanup) {
       await onLog("stdout", `[paperclip] Retaining job ${jobName} (state mismatch — UI is waiting on it)\n`);
     } else if (!retainJobs) {
-      await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath);
+      podsGone = await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath);
     } else {
       await onLog("stdout", `[paperclip] Retaining job ${jobName} for debugging (retainJobs=true)\n`);
     }
-    // Clean up prompt Secret if one was created
-    if (promptSecret) {
-      try {
-        await coreApi.deleteNamespacedSecret({ name: promptSecret.name, namespace: promptSecret.namespace });
-      } catch {
-        // Best-effort cleanup — TTL or manual deletion will catch stragglers
-      }
-    }
-    // Clean up env Secret if one was created (BLO-17980/BLO-17973)
-    if (envSecret) {
-      try {
-        await coreApi.deleteNamespacedSecret({ name: envSecret.name, namespace: envSecret.namespace });
-      } catch {
-        // Best-effort cleanup — TTL or manual deletion will catch stragglers
-      }
-    }
-    // Clean up mcp-config Secret if one was created (BLO-17980/BLO-17973)
-    if (mcpConfigSecret) {
-      try {
-        await coreApi.deleteNamespacedSecret({ name: mcpConfigSecret.name, namespace: mcpConfigSecret.namespace });
-      } catch {
-        // Best-effort cleanup — TTL or manual deletion will catch stragglers
-      }
+    // Clean up prompt/env/mcp-config Secrets — but only once the pod that
+    // mounts them is confirmed gone (BLO-35486).  When the Job is retained, or
+    // a pod outlived teardown, the Secrets stay too: the ownerReference-driven
+    // Job GC collects them, and a retained Job's pod must keep its mounts.
+    if (podsGone) {
+      await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret]);
     }
   }
 
