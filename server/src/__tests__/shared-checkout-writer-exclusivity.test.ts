@@ -1,9 +1,15 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  isNonPrimaryWorkspaceTarget,
   resolveK8sRunIsolationIdentity,
+  resolveProjectPrimaryWorkspaceId,
+  selectBindTimeProjectWorkspaceFallbackId,
 } from "../services/heartbeat.js";
-import { resolveWorkspaceWriterTreeKey } from "../services/workspace-writer-key.js";
+import {
+  resolveProjectIdNeedingWorkspaceFallback,
+  resolveWorkspaceWriterTreeKey,
+} from "../services/workspace-writer-key.js";
 
 /**
  * BLO-19422: two concurrent runs that resolve to the SAME on-disk checkout must
@@ -236,6 +242,60 @@ describe("resolveWorkspaceWriterTreeKey", () => {
     });
   });
 
+  describe("the caller's side of BLO-37188: which runs get a fallback, and which row", () => {
+    // Everything above hand-passes `projectWorkspaceFallbackId`. These pin the
+    // two halves the dispatch path computes it from, because a fallback that
+    // names the wrong row keys a tree the run never lands in -- worse than none.
+    const firstRunOfFreshIssue = {
+      statelessPrReview: false,
+      issueProjectWorkspaceId: null,
+      useProjectWorkspace: true,
+      executionProjectId: "project-1",
+    };
+
+    it("asks for a fallback only for an un-backfilled, non-review, project-workspace run", () => {
+      expect(resolveProjectIdNeedingWorkspaceFallback(firstRunOfFreshIssue)).toBe("project-1");
+      // Stateless PR review keys null on both branches anyway: no query.
+      expect(resolveProjectIdNeedingWorkspaceFallback({
+        ...firstRunOfFreshIssue,
+        statelessPrReview: true,
+      })).toBeNull();
+      // Backfilled: the issue's own id is authoritative, a fallback must not move it.
+      expect(resolveProjectIdNeedingWorkspaceFallback({
+        ...firstRunOfFreshIssue,
+        issueProjectWorkspaceId: PW,
+      })).toBeNull();
+      // `agent_default`: `resolveWorkspaceForRun` gets `useProjectWorkspace:
+      // false`, considers no rows, and lands in the agent home.
+      expect(resolveProjectIdNeedingWorkspaceFallback({
+        ...firstRunOfFreshIssue,
+        useProjectWorkspace: false,
+      })).toBeNull();
+      expect(resolveProjectIdNeedingWorkspaceFallback({
+        ...firstRunOfFreshIssue,
+        executionProjectId: null,
+      })).toBeNull();
+    });
+
+    it("names the row the late path tries first, NOT the isPrimary row", () => {
+      // The fixture where the two helpers disagree: the earliest row is not the
+      // flagged primary. With no preferred id the late path keeps every row a
+      // candidate and tries them in creation order, so it lands in the earliest
+      // -- and the bind-time key has to name that one.
+      const rowsInCreationOrder = [
+        { id: "ws-earliest", isPrimary: false },
+        { id: "ws-flagged-primary", isPrimary: true },
+      ];
+      expect(isNonPrimaryWorkspaceTarget({
+        preferredProjectWorkspaceId: null,
+        rowsInCreationOrder,
+      })).toBe(false);
+      expect(selectBindTimeProjectWorkspaceFallbackId(rowsInCreationOrder)).toBe("ws-earliest");
+      expect(resolveProjectPrimaryWorkspaceId(rowsInCreationOrder)).toBe("ws-flagged-primary");
+      expect(selectBindTimeProjectWorkspaceFallbackId([])).toBeNull();
+    });
+  });
+
   it("returns null when there is nothing identifying the shared tree", () => {
     // What is LEFT after BLO-37188, and it is a safe case rather than a gap: a
     // run the caller resolved to NO project checkout, so it passes no fallback.
@@ -390,8 +450,11 @@ describe("the key reaches the reservation (end-to-end through the resolver)", ()
         // This asserts on the RESOLVER given a null key, and stays true after
         // BLO-37188: what that changed is which runs still PRODUCE a null key.
         // It is no longer the un-backfilled issue (see the test above) but a
-        // run that resolves to no project checkout at all -- for which
-        // `agent-shared:<agentId>` is the correct class, not a miss.
+        // run the caller resolves to no project checkout BEFORE realization
+        // (chiefly `agent_default`) -- for which `agent-shared:<agentId>` is the
+        // correct class, not a miss. A run whose project rows all fail to
+        // realize also lands in the agent home but is NOT null-keyed; see the
+        // residuals on `resolveWorkspaceWriterTreeKey`.
         const first = identityFor("run-1", null, {
           agentId: "agent-1",
           effectiveMaxConcurrentRuns,
