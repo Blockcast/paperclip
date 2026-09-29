@@ -375,15 +375,27 @@ async function ensureReadableFile(targetPath: string, contents: string): Promise
  *    with no pod counterpart at all, so rewriting it would relocate an
  *    already-server-side default to somewhere it has never been.
  *
+ * That second case leaves the WRITE correct but not the READ: the container is
+ * still handed `podPath`, which is not on its data mount, so it gets an absent
+ * or empty bundle. It is also the shape an operator-set `promptCacheRoot`
+ * takes when it is not under a custom `workspaceMountPath`. Neither is
+ * derivable here, so `prepareClaudePromptBundle` reports it
+ * (`claude_k8s.prompt_bundle_off_volume`) rather than letting this branch be
+ * silent.
+ *
  * There is deliberately NO `podMount === serverMount` fast path: the arithmetic
  * below already yields the identity in that case, so such a branch would have
  * no failing mutation — documentation wearing a guard's clothes.
  */
 function toServerAddress(podPath: string, podMount?: string, serverMount?: string): string {
   if (!podMount || !serverMount) return podPath;
-  const prefix = podMount.endsWith("/") ? podMount : `${podMount}/`;
+  const prefix = mountPrefix(podMount);
   if (!podPath.startsWith(prefix)) return podPath;
   return path.posix.join(serverMount, podPath.slice(prefix.length));
+}
+
+function mountPrefix(mount: string): string {
+  return mount.endsWith("/") ? mount : `${mount}/`;
 }
 
 export async function prepareClaudePromptBundle(input: {
@@ -427,6 +439,26 @@ export async function prepareClaudePromptBundle(input: {
   // `bundleKey` is joined FIRST, so both addresses carry the identical
   // volume-relative subpath and cannot drift by construction.
   const rootDir = path.join(input.rootDir?.trim() || resolveManagedClaudePromptCacheRoot(companyId), bundleKey);
+  // The server's writes reach the pod ONLY through the shared data volume, so a
+  // bundle root the container is handed off its data mount is one it cannot
+  // read. Not gated on the two mounts differing: with them equal, a root off
+  // the mount is equally unreachable. Not gated on `storage` either, unlike
+  // `warnIfPersistentTreeIsOffVolume`: the container is handed this path
+  // (`--add-dir`) unconditionally, so there is no off-volume-by-design case.
+  // Warned, not thrown, on that function's precedent: the run still completes,
+  // it just loads no skills, which is unreadable without this (BLO-37760).
+  if (podDataMountPath && !rootDir.startsWith(mountPrefix(podDataMountPath))) {
+    console.warn(
+      JSON.stringify({
+        level: "warn",
+        event: "claude_k8s.prompt_bundle_off_volume",
+        msg: "prompt bundle root is outside the pod's data mount; the container is handed --add-dir it cannot read, so no skill will load",
+        rootDir,
+        podDataMountPath,
+        serverDataMountPath: serverDataMountPath ?? "",
+      }),
+    );
+  }
   const serverRootDir = toServerAddress(rootDir, podDataMountPath, serverDataMountPath);
   const skillsHome = path.join(serverRootDir, ".claude", "skills");
   await fs.mkdir(skillsHome, { recursive: true });
