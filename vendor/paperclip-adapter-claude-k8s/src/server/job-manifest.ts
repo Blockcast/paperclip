@@ -54,7 +54,7 @@ function assertSafePathComponent(field: string, value: string): void {
   }
 }
 
-function sanitizeForK8sPath(value: string): string {
+export function sanitizeForK8sPath(value: string): string {
   return value.replace(/[^a-zA-Z0-9-]/g, "");
 }
 
