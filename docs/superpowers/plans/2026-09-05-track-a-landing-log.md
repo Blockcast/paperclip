@@ -788,13 +788,72 @@ receipts.
 The remaining rows are open as of writing — #1985, #1976, #2020, #1774 all `state: OPEN`,
 `mergedAt: null` — so `still-queued` remains the accurate classification for the three of them that
 armed. For #2020 it is accurate only about the PR's state, not about the routine's: it never entered
-the queue. **No receipt has yet printed a literal `confirmed-merged` row**, because each merge fell
-outside the one-receipt confirmation window that had already resolved its row. Resolution-to-merge
+the queue. **No receipt printed a literal `confirmed-merged` row through `85529fad`**, because each
+merge fell outside the one-receipt confirmation window that had already resolved its row. (A later
+receipt did — to #2020, the row that never armed; see below.) Resolution-to-merge
 was 1d23h12m for #1990 (`aec91d73`, `2026-09-23T03:22:09Z`), 1d22h43m for #1804 (`aa6a0a70`,
 `2026-09-23T16:44:08Z`) and 1d07h58m for #2001 (`933af750`, `2026-09-25T07:18:04Z`) — #2001 is the
 sharpest of the three and still misses its window by more than a day. Every later receipt that names
 #2001 at all carries it only as a `skip` / `mergestate:UNKNOWN` classifier row, not a confirmation;
 the last of those is `8ae54c04` (`2026-09-26T08:17:49Z`), 6h59m before the merge.
+
+#### The first literal `confirmed-merged` row went to the PR that never armed
+
+Recorded 2026-09-29, from receipts that postdate the table above. The scoped claim in the previous
+section held only through `85529fad`; receipt `cd9d77f9` (`2026-09-27T02:47:42Z`) printed the first
+literal `confirmed-merged` row this ledger has produced, and it went to **#2020** — the one row that
+has never armed:
+
+    ff4e032e-2d91-4052-aceb-a0278738a713  (2026-09-26T20:14:55Z)
+    | #2020 | `enqueue` | `mergestate:CLEAN` | failed: --merge, --rebase, or --squash required when not running interactively |
+    | #2046 | `enqueue` | `mergestate:CLEAN` | auto-merge armed |
+    | #2044 | `enqueue` | `mergestate:CLEAN` | auto-merge armed |
+    | #1976 | `enqueue` | `mergestate:CLEAN` | auto-merge armed |
+    | #1140 | `enqueue` | `mergestate:CLEAN` | auto-merge armed |
+
+    cd9d77f9-82fd-4f64-900c-8034f8d7192f  (2026-09-27T02:47:42Z)
+    | #2020 | `confirmed-merged` | 2026-09-26T23:17:54Z |
+    | #2046 | `still-queued` | OPEN |
+    | #2044 | `still-queued` | OPEN |
+    | #1976 | `still-queued` | OPEN |
+    | #1140 | `still-queued` | OPEN |
+
+**The split is clean and it runs the wrong way.** All four rows that genuinely armed resolved
+`still-queued`; the only row reaching `confirmed-merged` is the one whose arm failed. #2020 merged
+at `2026-09-26T23:17:54Z` by some route that was not this routine — the confirmation step merely
+observed a merged PR and reported it.
+
+Two consequences for anyone reading this ledger:
+
+1. **A `confirmed-merged` row does not attest that the routine landed the PR.** The confirmation
+   step re-reads state; it does not check that the preceding `enqueue` actually armed. So the row is
+   evidence about GitHub, not about C2. To claim a round trip, pair a `confirmed-merged` row with an
+   `auto-merge armed` detail on its originating `enqueue` — the fourth column, not the second.
+2. **`gh pr view <n> --json state,mergedAt` → `MERGED` cannot close that gap either.** A terminal
+   state does not name the mechanism that produced it, so it corroborates the merge and says nothing
+   about the cause.
+
+This is not hypothetical. A draft of this record ([#2103](https://github.com/Blockcast/paperclip/pull/2103),
+closed unmerged) cited exactly this receipt pair as proof of a working end-to-end loop, quoting the
+`ff4e032e` row at two columns — `#2020 | enqueue` — which drops the `failed:` detail that is the
+whole story. The mechanism was a truncated quotation, which is why the rule in the section above is
+to reproduce all four columns of a receipt row or none.
+
+On the evidence to date, a completed `enqueue` → `confirmed-merged` round trip **attributable to
+this routine** is still not demonstrated by any single receipt pair. The three landings recorded
+under "Landed end to end" remain the routine's proof, and they are proof precisely because each was
+armed, tracked, and verified — not because a confirmation row said `confirmed-merged`.
+
+**This also settles the open question in the section above**, in the negative. That section recorded
+a clean correlation between the arm failure and `mergestate:BLOCKED`, while flagging that with one
+distinct failing PR *"whether `BLOCKED` is the discriminator is not established"*. It is not: #2020
+fails at `mergestate:CLEAN` in `ff4e032e`, and #2047 carries the identical failure across six
+receipts — five `mergestate:BLOCKED` and one `mergestate:CLEAN`. The failure is independent of
+mergestate, which is what the missing-merge-method diagnosis predicts: `gh` refuses for want of a
+flag, before mergeability is relevant. The earlier correlation was an artifact of a single-PR sample.
+
+The arm failure itself is [BLO-36804](https://paperclip.blockcast.net/BLO/issues/BLO-36804); it
+remains live and is now visible on #2047 as well as #2020.
 
 #### AC 3 names a field this repo does not use — fifth plan-vs-reality drift
 
