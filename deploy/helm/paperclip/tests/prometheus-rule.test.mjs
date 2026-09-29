@@ -144,19 +144,29 @@ test("PaperclipGithubWorkflowRunMassCancellation is a scale-free ratio with a vo
   // rate. A ratio is scale-free; reverting to a count re-breaks the alert
   // in the always-firing direction, which is indistinguishable from the
   // alert being deleted.
+  //
+  // The denominator carries supersession="none" too. Superseded
+  // cancellations outnumber the rest ~13:1 and move with force-push rate, so
+  // counting them in the denominator masks a real kill: 8 non-superseded
+  // cancellations beside 20 superseded and 2 successes reads 8/30 = 0.27
+  // (quiet) instead of 8/10 = 0.8. Measured live on 2026-09-24T17:46-17:59Z
+  // (BLO-36178 ARC outage): 0.04-0.09 unfiltered vs 0.36-0.42 filtered.
   assert.match(
     expr,
-    /\/\s*\n?\s*clamp_min\(sum\(increase\(paperclip_github_workflow_run_conclusion_total\[15m\]\)\), 1\)/,
-    "mass-cancellation alert must divide by total completions (scale-free ratio), clamped against divide-by-zero at idle",
+    /\/\s*\n?\s*clamp_min\(sum\(increase\(paperclip_github_workflow_run_conclusion_total\{supersession="none"\}\[15m\]\)\), 1\)/,
+    "mass-cancellation alert must divide by non-superseded completions (scale-free ratio that superseded force-push churn cannot dilute), clamped against divide-by-zero at idle",
   );
-  assert.match(expr, />=\s*0\.35/, "ratio threshold must be 0.35 (2.6x the observed 7d max of 13.6%)");
+  assert.match(expr, />=\s*0\.35/, "ratio threshold must be 0.35 (2x the observed 7d p99 of 17.7% on the non-superseded basis)");
 
   // Without the floor, 1 cancelled of 2 completions reads as 50% and pages
-  // on an idle repo — exactly when the ratio carries least information.
+  // on an idle repo, exactly when the ratio carries least information. The
+  // floor must count the same non-superseded completions as the
+  // denominator: counted over all completions, 1 cancelled + 1 success
+  // beside a 20-run force-push burst clears it and reads as 50%.
   assert.match(
     expr,
-    /and\s*\n?\s*sum\(increase\(paperclip_github_workflow_run_conclusion_total\[15m\]\)\) >= 8/,
-    "mass-cancellation alert must carry a minimum-volume floor so a near-idle repo cannot trip the ratio",
+    /and\s*\n?\s*sum\(increase\(paperclip_github_workflow_run_conclusion_total\{supersession="none"\}\[15m\]\)\) >= 8/,
+    "mass-cancellation alert must carry a minimum-volume floor, over the same non-superseded completions as the denominator, so a near-idle repo cannot trip the ratio",
   );
 });
 
