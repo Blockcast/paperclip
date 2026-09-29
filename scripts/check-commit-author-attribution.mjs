@@ -159,12 +159,19 @@
  * name alone would hand every agent a one-line bypass of this entire gate:
  * set `user.name` to the bot's name, keep the bare email, done. The exemption
  * in `NON_AGENT_PROCESS_EXEMPTIONS` therefore also pins the PATHS the process
- * is allowed to touch — every file in the commit must be inside a
- * `graphify-out/` directory (measured: both graphify-authored commits in this
- * repo's history, `514aefa72` and `206d6edaf`, touch only
- * `server/src/graphify-out/`). A commit wearing the bot's name that changes
- * anything else is still an offense, which is what makes the forgery useless:
- * it can only smuggle in generated graph data, never work.
+ * is allowed to touch: every file in the commit must be under
+ * `server/src/graphify-out/`, anchored at the repo root (measured: both
+ * graphify-authored commits in this repo's history, `514aefa72` and
+ * `206d6edaf`, touch only that directory). The anchor matters: a forger can
+ * create a NEW `graphify-out/` directory anywhere, so an unanchored
+ * `graphify-out/` match would let `server/src/services/graphify-out/x.ts`
+ * through. A commit wearing the bot's name that changes anything else is still
+ * an offense, which is what makes the forgery useless: it can only smuggle in
+ * generated graph data, never work.
+ *
+ * The anchor also depends on `pathsForCommit` passing `core.quotePath=false`:
+ * git's default quotes non-ASCII paths (`"server/src/graphify-out/\303\251.json"`),
+ * and the leading `"` would false-reject a real graphify commit.
  *
  * The path set is fail-closed — a caller that supplies no `paths` gets no
  * exemption. So `--audit-merged` (which has no cheap path source) reports
@@ -211,8 +218,9 @@ export const APP_NOREPLY_EMAIL_PATTERN =
 export const NON_AGENT_PROCESS_EXEMPTIONS = new Map([
   // origin/bot/graphify-reindex — scheduled knowledge-graph refresh.
   // Both graphify-authored commits in this repo's history (514aefa72,
-  // 206d6edaf) touch only server/src/graphify-out/.
-  ["graphify-reindex (allyblockcast)", /(^|\/)graphify-out\//],
+  // 206d6edaf) touch only server/src/graphify-out/. Anchored at the repo
+  // root: an unanchored `graphify-out/` is a directory the forger can create.
+  ["graphify-reindex (allyblockcast)", /^server\/src\/graphify-out\//],
 ]);
 
 /**
@@ -407,7 +415,9 @@ function patchIdForCommit(repoRoot, sha, execFile = execFileSync) {
 }
 
 function pathsForCommit(repoRoot, sha, execFile = execFileSync) {
-  const raw = execFile("git", ["show", "--format=", "--name-only", "--no-renames", sha], {
+  // core.quotePath=false: the exemption scope is `^`-anchored, and git's
+  // default quoting of non-ASCII paths would prefix them with `"`.
+  const raw = execFile("git", ["-c", "core.quotePath=false", "show", "--format=", "--name-only", "--no-renames", sha], {
     cwd: repoRoot,
     encoding: "utf8",
     maxBuffer: 32 * 1024 * 1024,

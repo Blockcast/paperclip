@@ -83,6 +83,13 @@ test("findAttributionOffenses still flags a commit wearing the graphify name out
     paths: ["server/src/graphify-out/graph.json", ".github/workflows/pr.yml"],
   };
   assert.equal(findAttributionOffenses([mixed]).length, 1);
+
+  // A forger can create a NEW `graphify-out/` directory anywhere, so the scope
+  // must be anchored to the real output dir, not match the name at any depth.
+  for (const forgedPath of ["server/src/services/graphify-out/pwn.ts", "docs/x/graphify-out/deploy.sh", "graphify-out/x.json"]) {
+    const nested = { ...GRAPHIFY_COMMIT, sha: "forged3", paths: [forgedPath] };
+    assert.equal(findAttributionOffenses([nested]).length, 1, forgedPath);
+  }
 });
 
 test("findAttributionOffenses fails closed on the graphify name when no paths are known", () => {
@@ -556,12 +563,24 @@ test("findLocalRangeOffenses reads real paths, so the graphify exemption holds i
     const inScope = commitFile("server/src/graphify-out/graph.json", '{"nodes":[]}\n', bot);
     assert.deepEqual(findLocalRangeOffenses({ repoRoot, base, head: inScope }), []);
 
+    // In scope with a non-ASCII name: git quotes these by default
+    // ("server/src/graphify-out/\303\251.json"), which the anchored scope
+    // would reject. Proves `pathsForCommit` reads them unquoted.
+    const nonAscii = commitFile("server/src/graphify-out/\u00e9.json", "{}\n", bot);
+    assert.deepEqual(findLocalRangeOffenses({ repoRoot, base: inScope, head: nonAscii }), []);
+
     // Out of scope: same name, same email, real source file. Still an offense.
     const outOfScope = commitFile("server/src/services/issues.ts", "export const x = 1;\n", bot);
-    const offenses = findLocalRangeOffenses({ repoRoot, base: inScope, head: outOfScope });
+    const offenses = findLocalRangeOffenses({ repoRoot, base: nonAscii, head: outOfScope });
     assert.equal(offenses.length, 1);
     assert.equal(offenses[0].sha, outOfScope);
     assert.deepEqual(offenses[0].paths, ["server/src/services/issues.ts"]);
+
+    // Out of scope: a forger-created `graphify-out/` below a source dir.
+    const nested = commitFile("server/src/services/graphify-out/pwn.ts", "export const y = 1;\n", bot);
+    const nestedOffenses = findLocalRangeOffenses({ repoRoot, base: outOfScope, head: nested });
+    assert.equal(nestedOffenses.length, 1);
+    assert.deepEqual(nestedOffenses[0].paths, ["server/src/services/graphify-out/pwn.ts"]);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
