@@ -95,22 +95,36 @@
  * whose cwd resolves. `resolveProjectPrimaryWorkspaceId` is the wrong helper
  * here and would key a different workspace than the run lands in.
  *
- * It is still a proxy, with one residual: if the first row fails to realize and
- * a later one wins, the run lands in that later tree while holding the first
- * row's key. That mis-keys in the SAFE direction -- it over-serializes against
- * other runs on row 0 (costs latency) and under-serializes against runs on the
- * row that won (exactly the pre-BLO-37188 state, so no regression). Fully
- * closing it needs the realized path itself, i.e. hoisting workspace-base
- * resolution above the bind; the reservation MUST bind first, because binding
- * after realization means the loser has already mutated the tree it was
- * supposed to be excluded from.
+ * It is still a proxy, because which row realizes is not knowable at bind time,
+ * and it has two residuals:
+ *
+ * - SOME rows fail and a later one wins: the run lands in that later tree while
+ *   holding row 0's key. It over-serializes against other runs on row 0 (costs
+ *   latency) and under-serializes against runs on the row that won -- exactly
+ *   the pre-BLO-37188 state, so no regression.
+ * - NO row realizes: `resolveWorkspaceForRun` does not fail, it falls back to
+ *   `resolveDefaultAgentWorkspaceDir(agent.id)`, the agent home. Pre-BLO-37188
+ *   that run keyed null and fell to `agent-shared:<agentId>`, the class that
+ *   names the agent home exactly. Now it keys `project-primary:<row0>`: it is
+ *   serialized against a project tree it never touches, and is NO LONGER
+ *   excluded against the same agent's null-keyed runs in that same agent home.
+ *   That mis-keys OFF `agent-shared`, in the UNSAFE direction (under-
+ *   serialization on a shared directory). It needs every candidate cwd to be
+ *   absent (the `missingProjectCwds` path), and is accepted because what it
+ *   trades against -- run 1 of every fresh issue going unexcluded -- is the
+ *   common case.
+ *
+ * Fully closing both needs the realized path itself, i.e. hoisting
+ * workspace-base resolution above the bind; the reservation MUST bind first,
+ * because binding after realization means the loser has already mutated the
+ * tree it was supposed to be excluded from.
  *
  * The caller must NOT pass a fallback for a run that resolves to the agent home
  * rather than a project checkout (`agent_default` mode, where
  * `resolveWorkspaceForRun` is called with `useProjectWorkspace: false` and
  * considers no project workspace rows at all). Such a run shares no project
  * tree, and keying it on one would serialize unrelated agents against each
- * other for nothing.
+ * other for nothing. `resolveProjectIdNeedingWorkspaceFallback` is that gate.
  */
 export function resolveWorkspaceWriterTreeKey(input: {
   statelessPrReview: boolean;
@@ -132,4 +146,28 @@ export function resolveWorkspaceWriterTreeKey(input: {
   }
   if (!projectWorkspaceId) return null;
   return `project-primary:${projectWorkspaceId}`;
+}
+
+/**
+ * Which project, if any, the caller must resolve a `projectWorkspaceFallbackId`
+ * for (BLO-37188). Null means "pass no fallback, and do not query for one":
+ *
+ * - a stateless PR review keys null on both branches regardless;
+ * - an issue that already names a workspace is authoritative;
+ * - `useProjectWorkspace` false (`agent_default`) means `resolveWorkspaceForRun`
+ *   considers no project workspace rows and lands in the agent home, so a
+ *   fallback would key the run on a project tree it never touches.
+ *
+ * `useProjectWorkspace` must be the SAME value the caller passes to
+ * `resolveWorkspaceForRun`, or the two can disagree about whether the run
+ * consults project workspaces at all.
+ */
+export function resolveProjectIdNeedingWorkspaceFallback(input: {
+  statelessPrReview: boolean;
+  issueProjectWorkspaceId: string | null;
+  useProjectWorkspace: boolean;
+  executionProjectId: string | null;
+}): string | null {
+  if (input.statelessPrReview || input.issueProjectWorkspaceId || !input.useProjectWorkspace) return null;
+  return input.executionProjectId;
 }

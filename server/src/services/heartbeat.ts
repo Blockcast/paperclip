@@ -364,7 +364,7 @@ import {
 } from "./issue-tree-control.js";
 import { RUN_STALE_SILENCE_MS } from "./issue-run-holding.js";
 import { describeSharedCheckoutOccupancy } from "./shared-checkout-occupancy.js";
-import { resolveWorkspaceWriterTreeKey } from "./workspace-writer-key.js";
+import { resolveProjectIdNeedingWorkspaceFallback, resolveWorkspaceWriterTreeKey } from "./workspace-writer-key.js";
 import {
   countRunsOccupyingSlots,
   resolveAgentConcurrencyPolicy,
@@ -4909,6 +4909,34 @@ export function prioritizeProjectWorkspaceCandidatesForRun<T extends ProjectWork
   return [rows[preferredIndex]!, ...rows.slice(0, preferredIndex), ...rows.slice(preferredIndex + 1)];
 }
 
+/**
+ * A project's workspace rows in the order `resolveWorkspaceForRun` tries to
+ * realize them. The bind-time writer-key fallback (BLO-37188) reads this SAME
+ * list, so the row the reservation keys on and the row the run lands in cannot
+ * drift apart onto two independently written orderings.
+ */
+export function listProjectWorkspacesInRealizationOrder(db: Db, companyId: string, projectId: string) {
+  return db
+    .select()
+    .from(projectWorkspaces)
+    .where(and(eq(projectWorkspaces.companyId, companyId), eq(projectWorkspaces.projectId, projectId)))
+    .orderBy(asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id));
+}
+
+/**
+ * The row `resolveWorkspaceForRun` tries FIRST when the run names no preferred
+ * workspace (BLO-37188): `prioritizeProjectWorkspaceCandidatesForRun(rows,
+ * null)` keeps creation order, and `isNonPrimaryWorkspaceTarget` is false with
+ * no preferred id so every row stays a candidate. Deliberately NOT
+ * `resolveProjectPrimaryWorkspaceId`, which consults `isPrimary` and names a
+ * different row whenever a project flags a primary that is not its earliest.
+ */
+export function selectBindTimeProjectWorkspaceFallbackId(
+  rowsInRealizationOrder: ProjectWorkspaceCandidate[],
+): string | null {
+  return prioritizeProjectWorkspaceCandidatesForRun(rowsInRealizationOrder, null)[0]?.id ?? null;
+}
+
 // [PRACTICO-PATCH] Detect empty agent results (#1117)
 export function isEmptyResult(
   resultJson: Record<string, unknown> | null | undefined,
@@ -7135,10 +7163,14 @@ export function resolveK8sRunIsolationIdentity(input: {
  * widening the key gives it up. That loss was originally stated as a KNOWN GAP
  * on `resolveWorkspaceWriterTreeKey` needing a silent run AND an un-backfilled
  * issue; BLO-37188 closed the second half by resolving a bind-time fallback
- * workspace, so what is left keys null only when the run resolves to no project
- * checkout at all -- and for the main such shape, `agent_default`, the run
- * lands in the agent home, which is precisely the class `agent-shared:<agentId>`
- * already names correctly. The trade is deliberate, not an oversight.
+ * workspace. What still keys null is a run the caller resolves to no project
+ * checkout BEFORE realization -- chiefly `agent_default`, which lands in the
+ * agent home, precisely the class `agent-shared:<agentId>` names. That is not
+ * every run that ends up in the agent home: one whose project candidates ALL
+ * fail to realize lands there too, but was keyed at bind time on its first
+ * project row, so it is serialized against that row instead of against
+ * `agent-shared` (the unsafe-direction residual stated on
+ * `resolveWorkspaceWriterTreeKey`). The trade is deliberate, not an oversight.
  *
  * The cost is real and deliberate: this serializes ALL issues of one project
  * workspace across ALL agents, because they are one mutable directory. That is
@@ -15679,16 +15711,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const workspaceProjectId = useProjectWorkspace ? resolvedProjectId : null;
 
     const unorderedProjectWorkspaceRows = workspaceProjectId
-      ? await db
-          .select()
-          .from(projectWorkspaces)
-          .where(
-            and(
-              eq(projectWorkspaces.companyId, agent.companyId),
-              eq(projectWorkspaces.projectId, workspaceProjectId),
-            ),
-          )
-          .orderBy(asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id))
+      ? await listProjectWorkspacesInRealizationOrder(db, agent.companyId, workspaceProjectId)
       : [];
     const projectWorkspaceRows = prioritizeProjectWorkspaceCandidatesForRun(
       unorderedProjectWorkspaceRows,
@@ -29627,40 +29650,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // BLO-37188: on an issue's FIRST run `issueRef.projectWorkspaceId` is still
     // null -- it is backfilled from the realized workspace far below -- so the
     // key above had nothing to bind to and the run went unexcluded. Reproduce
-    // here the selection `resolveWorkspaceForRun` will make with no preferred
-    // workspace: it passes the rows through
-    // `prioritizeProjectWorkspaceCandidatesForRun(rows, null)` unchanged, keeps
-    // every row a candidate (`isNonPrimaryWorkspaceTarget` is false without a
-    // preferred id), and takes the first that realizes. So this is the earliest
-    // row in creation order -- deliberately NOT
-    // `resolveProjectPrimaryWorkspaceId`, which consults `isPrimary` and would
-    // name a different workspace than the run lands in whenever a project flags
-    // a primary that is not its earliest row.
+    // here the row `resolveWorkspaceForRun` will try first with no preferred
+    // workspace: the same `listProjectWorkspacesInRealizationOrder` list, through
+    // `selectBindTimeProjectWorkspaceFallbackId` (see both for why that is the
+    // earliest row, not the `isPrimary` one).
     //
-    // Skipped for `agent_default`, which is the same condition the late path
-    // gates on (`useProjectWorkspace: requestedExecutionWorkspaceMode !==
-    // "agent_default"`): those runs consider no project workspace at all and
-    // resolve to the agent home, so keying them on a project tree they never
-    // touch would serialize unrelated agents for nothing.
-    const projectIdNeedingWorkspaceFallback =
-      paperclipPrReview === null &&
-      !issueRef?.projectWorkspaceId &&
-      requestedExecutionWorkspaceMode !== "agent_default"
-        ? executionProjectId ?? null
-        : null;
+    // `useProjectWorkspace` is ONE value, passed both to the gate here and to
+    // `resolveWorkspaceForRun` below, so the two cannot disagree about whether
+    // this run consults project workspaces at all. When it is false
+    // (`agent_default`) the run lands in the agent home, and keying it on a
+    // project tree it never touches would serialize unrelated agents for nothing.
+    const useProjectWorkspace = requestedExecutionWorkspaceMode !== "agent_default";
+    const projectIdNeedingWorkspaceFallback = resolveProjectIdNeedingWorkspaceFallback({
+      statelessPrReview: paperclipPrReview !== null,
+      issueProjectWorkspaceId: issueRef?.projectWorkspaceId ?? null,
+      useProjectWorkspace,
+      executionProjectId,
+    });
     const projectWorkspaceFallbackId = projectIdNeedingWorkspaceFallback
-      ? await db
-          .select({ id: projectWorkspaces.id })
-          .from(projectWorkspaces)
-          .where(
-            and(
-              eq(projectWorkspaces.companyId, agent.companyId),
-              eq(projectWorkspaces.projectId, projectIdNeedingWorkspaceFallback),
-            ),
-          )
-          .orderBy(asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id))
-          .limit(1)
-          .then((rows) => rows[0]?.id ?? null)
+      ? selectBindTimeProjectWorkspaceFallbackId(
+          await listProjectWorkspacesInRealizationOrder(db, agent.companyId, projectIdNeedingWorkspaceFallback),
+        )
       : null;
     const perIssueWorkspaceTreeKey = resolveWorkspaceWriterTreeKey({
       statelessPrReview: paperclipPrReview !== null,
@@ -30072,7 +30082,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           context,
           previousSessionParams,
           {
-            useProjectWorkspace: requestedExecutionWorkspaceMode !== "agent_default",
+            useProjectWorkspace,
             k8sIsolationMode: k8sIsolationIdentity?.isolationMode ?? null,
           },
         ),
