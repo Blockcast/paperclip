@@ -109,6 +109,9 @@ describeEmbeddedPostgres("issue list stable enumeration and exact counts", () =>
    * order, where re-ranking moves nothing. Anti-correlating them makes every already-
    * returned row a late one in activity order, so offset paging demonstrably loses it.
    *
+   * Ids are therefore a function of `count` and the index alone, not of the company: two
+   * calls with the same `count` in one test collide on the primary key. Seed once per test.
+   *
    * `status: "blocked"` additionally puts every row in the blocked inbox: a blocked row
    * with no blocker edge, no assigneeUserId and no monitor is a dead end, which is the
    * cheapest shape that earns a blockedInboxAttention entry (no companion rows needed).
@@ -348,15 +351,25 @@ describeEmbeddedPostgres("issue list stable enumeration and exact counts", () =>
     // further, so the last-seeded row sorts last — reachable only after offset advances.
     const scopedIssueId = ids.at(-1)!;
 
+    let pages = 0;
+    const onPage = async () => {
+      pages += 1;
+    };
+
     const res = await request(
       createApp(companyId, skillTestActor(companyId, agentId, scopedIssueId), {
-        issueCountWalk: { pageSize: 2 },
+        issueCountWalk: { pageSize: 2, onPage },
       }),
     )
       .get(`/api/companies/${companyId}/issues/count`)
       .query({ attention: "blocked" });
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.count).toBe(1);
+    // Guards the guard, as the keyset sibling above does: this whole test rests on the
+    // page size seam being honored. If `pageSize` stops reaching list() all 5 rows arrive
+    // on page one, the walk returns before advancing any offset, and every assertion above
+    // still passes while the title stops being true.
+    expect(pages).toBeGreaterThan(1);
 
     const boardRes = await request(createApp(companyId))
       .get(`/api/companies/${companyId}/issues/count`)
