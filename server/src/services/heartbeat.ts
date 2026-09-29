@@ -13120,9 +13120,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // withhold a progress signal, this notifier's failure mode is the silence
     // BLO-33589 exists to remove. Over-notifying a legacy row is the status quo;
     // under-notifying one is a regression.
+    //
+    // An EMPTY recorded set is the opposite case, and the one arm where this
+    // notifier deliberately chooses silence. `[]` is authoritative: no tier of
+    // resolveOwningPaperclipIdentifiers named an owner, so the webhook dropped
+    // the author wake for this PR (`no_owning_reference`) and no lane is waiting
+    // on its review gate. Keeping the rows here would notify exactly the mention
+    // set this filter exists to exclude.
     const linked = linkedRows.filter((row) => {
       const owners = recordedPullRequestOwners(row.owningIdentifiers);
-      return !owners || (row.identifier !== null && owners.includes(row.identifier));
+      if (!owners) return true;
+      if (owners.length === 0) return false;
+      return row.identifier !== null && owners.includes(row.identifier);
     });
     if (linked.length === 0) {
       logger.info(
