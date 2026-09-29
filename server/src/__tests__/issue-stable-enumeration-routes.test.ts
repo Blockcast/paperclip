@@ -385,11 +385,23 @@ describeEmbeddedPostgres("issue list stable enumeration and exact counts", () =>
     // request while being read by no test, so pass no routeOpts at all here.
     //
     // Two rows is enough, and deliberately fewer than one page: with the fallback they are a
-    // short first page and the walk returns on it. Without it `pageSize` is undefined,
-    // `rows.length < undefined` is false so the walk never short-returns, and the keyset
-    // branch dereferences `rows[rows.length - 1]!.id` on the empty second page — a 500 on
-    // every restricted-actor count. The broken default fails before it can return, so a
-    // single page discriminates and no multi-page fixture is needed.
+    // short first page and the walk returns on it.
+    //
+    // Scope, so the next reader does not over-read this: it pins the fallback's PRESENCE, not
+    // its value. Every `pageSize >= 1` passes here — the walk's `rows.length < opts.pageSize`
+    // short-return fires on the empty page BEFORE the keyset branch can dereference it — so
+    // `?? 1` and `?? ISSUE_LIST_MAX_LIMIT` are indistinguishable to this assertion. Pinning
+    // the value needs the ISSUE_LIST_MAX_LIMIT + 1 fixture this file deliberately does not
+    // seed — that fixture is what forced the `120_000` timeout this PR removed, so the trade
+    // is deliberate.
+    //
+    // Deleting the `??` outright is caught by the type checker rather than by this test:
+    // walkIssueListPages takes `pageSize: number` while `opts.issueCountWalk?.pageSize` is
+    // `number | undefined`, so the bare expression is a TS2322 under strict. Only a cast past
+    // that reaches the runtime failure this asserts — `rows.length < undefined` is false, so
+    // the walk never short-returns and the keyset branch dereferences
+    // `rows[rows.length - 1]!.id` on the empty second page, a 500 on every restricted-actor
+    // count. That cast is the mutation this test was checked against.
     const companyId = await seedCompany();
     const agentId = await seedAgent(companyId);
     const ids = await seedIssues(companyId, 2);
