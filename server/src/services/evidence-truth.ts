@@ -239,11 +239,12 @@ async function probeOne(
     // surface must refuse it by the same helper, or an App-authored PR, whose
     // artifact of record is a formal review, reads `review:ally-clean` for a
     // head with a live accepted residual (BLO-36903).
+    const formalDeferred = newest !== undefined && countAllyDeferredPriorFindings(newest.body) > 0;
     const formalClean =
       newest !== undefined &&
       !formalBlocking &&
       extractAllyReviewedHeadSha(newest.body) === normalizedHead &&
-      countAllyDeferredPriorFindings(newest.body) === 0;
+      !formalDeferred;
 
     // Each surface is individually blind to the other — Ally files a formal
     // review on some PRs and only a comment on others — so SILENCE on one is
@@ -254,7 +255,18 @@ async function probeOne(
     // this shape read `review:ally-clean` at the same head the merge gate is
     // publishing red from — the two-verdicts-for-one-grammar divergence this
     // module exists to avoid, arriving through the OR instead of a parser.
-    out.clean = !commentBlocking && !formalBlocking && (commentClean || formalClean);
+    //
+    // A deferral gets the same veto, for the same reason: it is the more
+    // conservative reading, and without it a clean comment beside a formal
+    // review that accepts a residual (or the mirror) still reads
+    // `review:ally-clean` for a head with a live accepted residual (BLO-36903).
+    const commentDeferred = commentVerdict.outcome === "deferred_finding";
+    out.clean =
+      !commentBlocking &&
+      !formalBlocking &&
+      !commentDeferred &&
+      !formalDeferred &&
+      (commentClean || formalClean);
   } catch {
     // A throw is an inability to ask, which is exactly `probeFailed` — never
     // let it escape and turn one bad socket into a failed PATCH.
