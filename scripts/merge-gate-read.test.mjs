@@ -825,13 +825,98 @@ describe("merge-gate reader", () => {
       });
     }
 
-    // The other side of that negation: `completed` is the ONE status that owes
-    // nothing further. A completed run with no surviving rows is DEAD/ABSENT
-    // territory and must not also print NO-VERDICT.
-    it("does not treat a completed run as owing a verdict", () => {
+    // `completed` is NOT the settling signal, and reading it as one was the
+    // first cut of this guard. Measured at onprem-k8s @ b763c490: 28 runs, 23
+    // published 57 check-runs and 5 concluded `startup_failure` publishing ZERO
+    // — one of them `review-gate`. The reader printed two lines there, both
+    // unrelated legacy statuses, so in the window where those clear the head
+    // reads merge-clean over five workflows that produced no verdict at all.
+    // Direction GREEN. Raised by @ally on #2112 and reproduced as reported.
+    for (const conclusion of [
+      "startup_failure",
+      "action_required",
+      "timed_out",
+      "stale",
+      "cancelled",
+      "failure",
+      "neutral",
+    ]) {
+      it(`keeps a completed \`${conclusion}\` run, which owes a verdict it never published`, () => {
+        assert.deepEqual(
+          pending([["10", "pull_request", "77", conclusion, "t", "completed", "wf"]]),
+          [`77\t${conclusion}\twf`],
+        );
+      });
+    }
+
+    // The other half of that negation, and the load-bearing one: `success` and
+    // `skipped` are the two conclusions that settle a run. Without them every
+    // green run on every head prints NO-VERDICT unless it happened to publish,
+    // which is a false RED on the whole fleet.
+    for (const conclusion of ["success", "skipped"]) {
+      it(`does not treat a completed \`${conclusion}\` run as owing a verdict`, () => {
+        assert.deepEqual(
+          pending([["10", "pull_request", "77", conclusion, "t", "completed", "wf"]]),
+          [],
+        );
+      });
+    }
+
+    // Once a run is completed the STATUS carries no information — every one of
+    // them reads `completed`. "run completed, no check-run published" sends a
+    // reader off to wait for something that will never arrive; the conclusion
+    // names the actual remedy, which is to fix the workflow file and re-run.
+    it("names the conclusion, not the status, once a run is completed", () => {
       assert.deepEqual(
-        pending([["10", "pull_request", "77", "cancelled", "t", "completed", "wf"]]),
+        read([["verify", "success", "t1", "66"]], "__none__", pend(["77", "startup_failure", "review-gate"])),
+        ["STOP\t<review-gate: run startup_failure, no check-run published>\tNO-VERDICT\trun=77"],
+      );
+    });
+
+    // A superseded run is completed and non-success, so pending_runs() emits it
+    // — and the DEAD grep strips its rows before `contributed` can be set, so
+    // without the END-loop exemption it prints NO-VERDICT for a run whose lane
+    // demonstrably spoke. BLO-34114s own control is this shape: penstock
+    // fbdb3477, run 34542908750, cancelled with 6 dead `failure` rows superseded
+    // by a success 16s later. Direction RED, but it breaks a pinned control.
+    it("does not print NO-VERDICT for a run that DEAD already dropped", () => {
+      assert.deepEqual(
+        read(
+          [
+            ["verify", "failure", "t1", "111"],
+            ["verify", "success", "t2", "222"],
+          ],
+          "111",
+          pend(["111", "cancelled", "wf"]),
+        ),
         [],
+      );
+    });
+
+    // The exemption is scoped to DEAD and must not leak: a completed non-success
+    // run that nothing superseded is exactly the onprem-k8s shape and still stops.
+    // Run id `1113` is chosen, not arbitrary — it CONTAINS the DEAD id `111`, so
+    // this also pins the `^(...)$` anchors on that dynamic regex. Unanchored, it
+    // matches as a substring and exempts a run nothing superseded. Direction GREEN.
+    it("still stops on a completed run that DEAD did not drop", () => {
+      const lines = read(
+        [
+          ["verify", "failure", "t1", "111"],
+          ["verify", "success", "t2", "222"],
+        ],
+        "111",
+        pend(["111", "cancelled", "wf"], ["1113", "startup_failure", "review-gate"]),
+      );
+      assert.deepEqual(lines.map((l) => l.split("\t")[3]), ["run=1113"]);
+    });
+
+    // `dead` is `__none__` whenever nothing was dropped, and run ids are numeric,
+    // so the regex can never match — but an inverted test (`~` for `!~`) exempts
+    // every run on every nothing-dropped head, which is most heads.
+    it("exempts nothing when DEAD is empty", () => {
+      assert.match(
+        read([["verify", "success", "t1", "66"]], "__none__", pend(["77", "cancelled", "wf"])).join("\n"),
+        /NO-VERDICT\trun=77$/m,
       );
     });
 
