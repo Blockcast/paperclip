@@ -112,6 +112,20 @@ function spawnWrapper(dir, { tokenFileContent, args = ["api", "user"], setTokenF
     }
   }
 
+  // The wrapper resolves its path with `${VAR:-default}`, so an unset *or
+  // empty* var both land on the compiled-in default — which holds the live bot
+  // token in an agent pod, and STUB_GH_SOURCE echoes GH_TOKEN to stdout. The
+  // `setTokenFileVar: false` test guards itself with t.skip; `extraEnv: {
+  // PAPERCLIP_GITHUB_TOKEN_FILE: "" }` reaches the same branch and does not —
+  // Ally hit exactly that while probing 396e913f and printed a live token.
+  // One guard here, at the only place that can reach the default (runWrapper
+  // always assigns the var), instead of trusting every future caller.
+  if (!env.PAPERCLIP_GITHUB_TOKEN_FILE && existsSync(COMPILED_IN_DEFAULT_TOKEN_FILE)) {
+    throw new Error(
+      `refusing to spawn: PAPERCLIP_GITHUB_TOKEN_FILE is unset/empty and ${COMPILED_IN_DEFAULT_TOKEN_FILE} exists, so the wrapper would read the live credential and the stub gh would print it. Point the var at a temp file, or skip this test as the non-agent-fallback one does.`,
+    );
+  }
+
   return spawnSync("sh", [WRAPPER, ...args], { env, encoding: "utf8" });
 }
 
@@ -169,7 +183,7 @@ test("refuses a whitespace-only token file rather than exporting a blank token (
 // Ally review on PR #2111: local-only commands never contact GitHub, so a
 // missing named credential cannot make their answer wrong. Refusing them hides
 // whether the binary works at all, during the very outage the refusal is for.
-for (const args of [["--version"], ["version"], ["--help"], ["-h"], ["help", "api"], [], ["completion", "-s", "bash"]]) {
+for (const args of [["--version"], ["version"], ["--help"], ["-h"], ["help", "api"], [], ["completion", "-s", "bash"], ["config", "get", "editor"]]) {
   test(`does not refuse local-only \`gh ${args.join(" ")}\` when the named token file is absent (BLO-37977)`, () => {
     withTempDir((dir) => {
       const proc = spawnWrapper(dir, { args });
@@ -221,6 +235,24 @@ test("still falls back to the real binary when PAPERCLIP_GITHUB_TOKEN_FILE is un
     assert.equal(proc.status, 0);
     assert.match(proc.stdout, /GH_TOKEN=\n/);
     assert.match(proc.stdout, /ARGS=auth status/);
+  });
+});
+
+test("refuses to spawn against the live compiled-in default token file (Ally review of 396e913f)", (t) => {
+  // The mirror of the skip above, which protects only itself: any *new* test
+  // taking `setTokenFileVar: false` reaches the same live credential, and the
+  // wrapper's `${VAR:-default}` treats unset and empty alike — so assert both
+  // shapes. Runs only in the environment that ships, where the hazard exists.
+  if (!existsSync(COMPILED_IN_DEFAULT_TOKEN_FILE)) {
+    t.skip(`${COMPILED_IN_DEFAULT_TOKEN_FILE} absent; the hazard this guards against is unreachable here`);
+    return;
+  }
+  withTempDir((dir) => {
+    assert.throws(() => spawnWrapper(dir, { setTokenFileVar: false }), /refusing to spawn/);
+    assert.throws(
+      () => spawnWrapper(dir, { setTokenFileVar: false, extraEnv: { PAPERCLIP_GITHUB_TOKEN_FILE: "" } }),
+      /refusing to spawn/,
+    );
   });
 });
 
