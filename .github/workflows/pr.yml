@@ -765,6 +765,16 @@ jobs:
         run: node --test ./.github/scripts/tests/report-merge-queue-ejection.test.mjs
         timeout-minutes: 1
 
+      # BLO-28886 AC3. Same silence-shaped failure mode one step earlier: the
+      # flake ledger is fed by an artifact, and every way of breaking it
+      # (dropping `if: always()`, dropping the env var, colliding the report
+      # filenames) produces NO artifact rather than a red run. Every assertion
+      # in here has been mutation-tested -- revert any one guard and this fails.
+      - name: Test vitest flake-report wiring (BLO-28886)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/vitest-flake-report.test.mjs
+        timeout-minutes: 1
+
       - name: Validate dependency resolution when manifests change
         id: regen_lockfile
         if: ${{ !cancelled() }}
@@ -1262,6 +1272,12 @@ jobs:
     # is deliberately NOT blocked on it: that row is unowned backlog, and these
     # caps bite today. Bring 110 back down when it lands.
     timeout-minutes: ${{ matrix.timeout_minutes }}
+    # BLO-28886 AC3. Read by vitest.config.ts, which only registers the JSON
+    # reporter when this is set -- so a local `pnpm test` is unchanged. A
+    # literal /tmp path, not `${{ runner.temp }}`: the `runner` context is not
+    # available in a job-level `env:` block. Matches refresh-shard-manifest.yml.
+    env:
+      PAPERCLIP_VITEST_REPORT_DIR: /tmp/vitest-reports
     strategy:
       # BLO-33021: fail-fast is right for `pull_request` (one push, show the
       # author every red at once) and wrong for `merge_group`, where there is
@@ -1346,6 +1362,7 @@ jobs:
 
       - name: Run grouped general test suites
         run: |
+          mkdir -p "$PAPERCLIP_VITEST_REPORT_DIR"
           args=(--group '${{ matrix.group }}')
           if [ -n '${{ matrix.shard_count }}' ]; then
             args+=(--shard-index '${{ matrix.shard_index }}' --shard-count '${{ matrix.shard_count }}')
@@ -1358,6 +1375,26 @@ jobs:
       - name: Run serialized server test shard
         if: matrix.group == 'general-server'
         run: pnpm test:run:serialized -- --shard-index ${{ matrix.shard_index }} --shard-count ${{ matrix.shard_count }}
+
+      # BLO-28886 AC3. `if: always()` is the whole point and is guarded by
+      # scripts/__tests__/vitest-flake-report.test.mjs: a flake ledger is built
+      # from the runs that FAILED, so an upload that only fires on success
+      # collects exactly the reports nobody needs. This lane is ~29% red on
+      # `merge_group`, and which shard goes red moves run to run.
+      #
+      # `if-no-files-found: ignore`, deliberately, NOT `error`: a shard killed
+      # at its timeout cap or evicted mid-run writes no report, and this step
+      # must never be able to turn an otherwise-green run red. Losing a report
+      # costs one row in the ledger; failing the job re-creates the blameless
+      # ejection this issue exists to stop.
+      - name: Upload vitest JSON reports (flake ledger)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vitest-report-${{ matrix.group }}-${{ matrix.shard_count == '' && 'all' || matrix.shard_index }}
+          path: /tmp/vitest-reports/*.json
+          retention-days: 14
+          if-no-files-found: ignore
 
   vendor_claude_k8s:
     # BLO-17980 / BLO-22506: the claude_k8s adapter templates every agent Job
