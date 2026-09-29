@@ -1536,8 +1536,15 @@ function buildEnvVars(
   // AC3: reduction must never be silent. Consumers of a shed variable see a
   // well-formed shorter value and cannot tell it was cut, so the fact lives
   // here instead — same `truncated`/`fallbackFetchNeeded` vocabulary the wake
-  // payload already uses and the agent skill already documents as "refetch
-  // from the API". Emitted only when something was shed.
+  // payload already uses and SKILL.md already documents as "refetch from the
+  // API". Emitted only when something was shed.
+  //
+  // Both flags are constant-true INSIDE this object, and that is deliberate
+  // rather than an oversight: the marker's *presence* is the signal and the
+  // `shed` map is the payload. Do not read either flag as discriminating
+  // anything here — the sibling defect fixed in c819915b3 was exactly a flag
+  // that stayed true under all shed paths while being documented as telling
+  // you which layer lost context.
   const shedNames = Object.keys(shedBytes);
   if (shedNames.length > 0) {
     // Bounded by construction: the marker must never itself overflow the
