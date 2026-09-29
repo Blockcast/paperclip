@@ -5829,7 +5829,16 @@ export function recoveryService(
   // could never fire on any of them: adding a *cause* changed no *kind*. Adding a cause is
   // now a compile error here instead. Their mapping is deliberately unchanged — this makes
   // the collapse explicit, it does not re-kind anything.
-  const STRANDED_RECOVERY_ACTION_KIND_BY_CAUSE: Record<StrandedRecoveryCause, IssueRecoveryActionKind> = {
+  // `Exclude<…, "pr_review_non_convergence">` rather than the bare kind union: the old `as const`
+  // ternary returned a 4-literal type, and widening it to all seven would have let the stranded
+  // path start minting the one kind this file makes semantically special. It provably never does —
+  // the only `kind: "pr_review_non_convergence"` literal in the repo is `escalateStalledSelfReviewPr`
+  // — so the invariant is encoded here instead of asserted. (This does NOT address the BLO-37934
+  // clobber, which overwrites *to* `stranded_assigned_issue` on an existing row.)
+  const STRANDED_RECOVERY_ACTION_KIND_BY_CAUSE: Record<
+    StrandedRecoveryCause,
+    Exclude<IssueRecoveryActionKind, "pr_review_non_convergence">
+  > = {
     [SUCCESSFUL_RUN_MISSING_STATE_REASON]: "missing_disposition",
     workspace_validation_failed: "workspace_validation",
     configuration_incomplete: "configuration_validation",

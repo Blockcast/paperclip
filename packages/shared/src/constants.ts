@@ -338,9 +338,12 @@ export type IssueRecoveryActionKind = (typeof ISSUE_RECOVERY_ACTION_KINDS)[numbe
  * is bounded at creation (`maxAttempts` + `timeoutAt`) and `escalateExpiredWakeHorizons`
  * retires it. The board-escalation shape (`ownerAgentId === null`) is deliberately unbounded —
  * both fields null, which that sweep requires — so it now retires only on a terminal source
- * status or an out-of-band discharge such as the PR-close path. That is the intended semantics
- * for a board escalation, but it is a real new state: a kind marked `false` AND minted
- * board-shaped needs some other discharge or it never retires.
+ * status. There is no PR-close discharge in this tree: `github_pr_closed` is a wake reason
+ * (`recovery/service.ts`), not a resolver, and the webhook's only recovery call is
+ * `escalateStalledSelfReviewPr` — the minting path. #1967 (PEN-3397) proposes one and is
+ * unmerged, so do not count on it. That is the intended semantics for a board escalation, but
+ * it is a real new state: a kind marked `false` AND minted board-shaped has no discharge short
+ * of a terminal source status, and never retires without one.
  *
  * `active_run_watchdog` and `issue_graph_liveness` have NO producer in non-test source today —
  * the only `kind:` literal in the repo is `pr_review_non_convergence`
