@@ -2512,6 +2512,21 @@ describe("buildJobManifest", () => {
         expect(marker, "variable dropped with no marker — silent loss").toBeDefined();
         expect(JSON.parse(marker!).shedCount).toBeGreaterThan(0);
       });
+
+      it("checks the `[]` last resort against the budget too (budget of 1 byte)", () => {
+        // The neighbour of the case above: a name of exactly 131_069 chars
+        // leaves a 1-byte value budget, so `NAME=[]` is 131_072 B -- over the
+        // ceiling. The last resort must fall through to "", which fits.
+        const edgeName = `PAPERCLIP_${"N".repeat(131_069 - "PAPERCLIP_".length)}`;
+        const { job } = buildJobManifest({
+          ctx: makeCtx({ config: { env: { [edgeName]: JSON.stringify([{ cwd: "/x" }]) } } }),
+          selfPod: makeSelfPod(),
+        });
+        expectNoOversizeEnv(job);
+        const env = job.spec?.template?.spec?.containers?.[0]?.env ?? [];
+        expect(env.find((e) => e.name === edgeName)?.value).toBe("");
+        expect(env.find((e) => e.name === "PAPERCLIP_ENV_SHED_JSON")).toBeDefined();
+      });
     });
 
     // The boundary pair, mirroring the PROMPT_CONTENT pair above. The fixtures
