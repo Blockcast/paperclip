@@ -406,6 +406,15 @@ export async function readInheritedTimeoutSettings(
  * `null` (Postgres' `0`, disabled) is not a loosening — there is no bound to
  * loosen, and shipping one is strictly an improvement. That is the case the
  * pool's startup parameter exists for.
+ *
+ * Out of scope: the `?idle_in_transaction_session_timeout=` URL escape hatch
+ * documented on {@link POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS}. This compares
+ * the *constant*, not the pool's effective value, so an operator override in
+ * the connection URL is invisible here — and doubly so, because
+ * {@link readInheritedTimeoutSettings} builds its probe from that same URL and
+ * would report the override back as the inherited value, comparing it against
+ * itself. That hatch is deliberate and operator-initiated; this guard is aimed
+ * at the role bound moving underneath a constant nobody re-read.
  */
 export function poolIdleInTransactionTimeoutLoosens(
   settings: InheritedTimeoutSettings,
@@ -443,6 +452,36 @@ export function formatInheritedTimeoutSettings(settings: InheritedTimeoutSetting
     `imposes (startup-packet parameters outrank ALTER ROLE / ALTER DATABASE). Lower ` +
     `POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS to at most the inherited value (PEN-3365)`
   );
+}
+
+/**
+ * The log level {@link formatInheritedTimeoutSettings} should be emitted at.
+ *
+ * Lives here, next to the verdict it reflects, rather than at the call site.
+ * Severity and wording were split across packages for one release, and the
+ * result was that the `LOOSENED:` marker — added precisely because printing the
+ * two numbers had not been enough — was itself emitted at `info`, because the
+ * caller keyed the level solely on `statement_timeout`. A verdict announced at
+ * the same severity as the healthy line is greppable-but-unread, which is the
+ * failure mode the marker exists to close. Keeping both on one function makes
+ * them unable to diverge again.
+ *
+ * Two independent conditions warrant `warn`, and neither implies the other:
+ *
+ * - `statement_timeout` disabled — nothing server-side bounds a blocked query,
+ *   so a recovery pass can hang indefinitely (PEN-3365).
+ * - {@link poolIdleInTransactionTimeoutLoosens} — we are actively *raising* the
+ *   server's own bound. Latent today (pool 60s vs role 60s is equal, not
+ *   looser), and latent on exactly the path the guard exists for: a role
+ *   tightened below our constant, which CI provably cannot see.
+ */
+export function inheritedTimeoutLogLevel(
+  settings: InheritedTimeoutSettings,
+): "warn" | "info" {
+  const statementTimeoutDisabled = settings.statementTimeout.valueMs === null;
+  return statementTimeoutDisabled || poolIdleInTransactionTimeoutLoosens(settings)
+    ? "warn"
+    : "info";
 }
 
 export function createDbFromPostgresClient(sql: Sql) {

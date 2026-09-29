@@ -29,6 +29,7 @@ import {
   reconcilePendingMigrationHistory,
   readInheritedTimeoutSettings,
   formatInheritedTimeoutSettings,
+  inheritedTimeoutLogLevel,
   formatDatabaseBackupResult,
   runDatabaseBackup,
   authUsers,
@@ -744,12 +745,13 @@ export async function startServer(): Promise<StartedServer> {
 
   // Report the timeout environment the application pool inherits from the
   // server. `createDb` bounds idle-in-transaction itself, but leaves
-  // `statement_timeout` to whatever the server imposes — and nothing in this
-  // repo or in `Blockcast/onprem-k8s` provably sets it, despite two places
-  // asserting a role-level 30s bound. A `statement_timeout` of `disabled` here
-  // means one blocked query can hang a recovery pass indefinitely (PEN-3365);
-  // that is the reading the explicit-timeout decision is gated on. Probing is
-  // strictly diagnostic, so it must never prevent the server from starting.
+  // `statement_timeout` to whatever the server imposes — a hand-applied `ALTER
+  // ROLE` that lives only as prose in `Blockcast/onprem-k8s` and is re-created
+  // by no manifest or migration (PEN-3598), so it would vanish silently on a
+  // role rebuild. A `statement_timeout` of `disabled` here means one blocked
+  // query can hang a recovery pass indefinitely (PEN-3365); that is the reading
+  // the explicit-timeout decision is gated on. Probing is strictly diagnostic,
+  // so it must never prevent the server from starting.
   //
   // The reading is published as a gauge as well as logged. The log line alone
   // proved unreadable: it is emitted once at startup, and by 2026-09-26 no pod
@@ -757,10 +759,15 @@ export async function startServer(): Promise<StartedServer> {
   // log reader with `kubectl logs` 403 from an agent seat. The gauge makes the
   // gating reading answerable by query at any time instead of only in the
   // minutes after a restart nobody controls.
+  //
+  // The level comes from `inheritedTimeoutLogLevel` rather than being decided
+  // here, so that the severity cannot drift away from the verdict the message
+  // states — see its TSDoc. It warns on a *loosening* as well as on a disabled
+  // `statement_timeout`; the two are orthogonal.
   try {
     const inheritedTimeouts = await readInheritedTimeoutSettings(activeDatabaseConnectionString);
     const unbounded = inheritedTimeouts.statementTimeout.valueMs === null;
-    logger[unbounded ? "warn" : "info"](
+    logger[inheritedTimeoutLogLevel(inheritedTimeouts)](
       `Database timeout environment: ${formatInheritedTimeoutSettings(inheritedTimeouts)}` +
         (unbounded
           ? " — statement_timeout is disabled, so a blocked query is bounded by nothing server-side (PEN-3365)"

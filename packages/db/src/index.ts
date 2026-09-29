@@ -6,6 +6,7 @@ export {
   POSTGRES_ROLE_IDLE_IN_TRANSACTION_TIMEOUT_MS,
   readInheritedTimeoutSettings,
   formatInheritedTimeoutSettings,
+  inheritedTimeoutLogLevel,
   poolIdleInTransactionTimeoutLoosens,
   type InheritedTimeoutSetting,
   type InheritedTimeoutSettings,
