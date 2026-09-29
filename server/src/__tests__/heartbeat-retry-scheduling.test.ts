@@ -4304,6 +4304,218 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(issue?.executionRunId).toBeNull();
   });
 
+  // BLO-38064. You @-mention an agent precisely BECAUSE it does not own the
+  // issue, so `assigneeAgentId !== run.agentId` is this wake's steady state, not
+  // a reassignment. The guard read it as one and cancelled the retry
+  // `issue_reassigned`, which made the loss unconditional for this shape: a
+  // mention whose first run hit any transient failure was never re-armed and the
+  // mentioned agent was never told. Measured on BLO-3202.
+  //
+  // Paired with "does not promote a scheduled retry after issue ownership
+  // changes" directly above: same reassignment-shaped inequality, opposite
+  // verdict, and the origin wake reason is the only thing that differs. Revert
+  // the NON_OWNERSHIP_RETRY_WAKE_REASONS arm on its own and this test fails
+  // while that one still passes.
+  it("promotes a mention-wake retry for an agent that was never the issue assignee", async () => {
+    const companyId = randomUUID();
+    const mentionedAgentId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const issueId = randomUUID();
+    const sourceRunId = randomUUID();
+    const now = new Date("2026-04-20T14:00:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values([
+      {
+        id: mentionedAgentId,
+        companyId,
+        name: "ClaudeCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "claude_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+      {
+        id: assigneeAgentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+    ]);
+
+    // The measured shape: a provider throttle that burned zero tokens, so the
+    // mentioned agent never even saw the comment it was woken for.
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId,
+      agentId: mentionedAgentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "failed",
+      error: "hit provider throttle/deadline before any token usage",
+      errorCode: "provider_throttled_no_progress",
+      finishedAt: now,
+      contextSnapshot: {
+        issueId,
+        wakeReason: "issue_comment_mentioned",
+      },
+      updatedAt: now,
+      createdAt: now,
+    });
+
+    // A mention wake never takes the execution lock (isAutoCheckoutWakeReason
+    // excludes it), so the mentioned agent is not and never was the assignee.
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Retry after a mention wake",
+      status: "todo",
+      priority: "medium",
+      responsibleUserId: "responsible-user",
+      assigneeAgentId,
+      issueNumber: 1,
+      identifier: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}-1`,
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(sourceRunId, {
+      now,
+      random: () => 0.5,
+    });
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+
+    // Every retry mint overwrites `wakeReason` with its own, so the origin has
+    // to be pinned at mint or the gate has nothing left to branch on.
+    const retrySnapshot = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0]?.contextSnapshot as Record<string, unknown> | undefined);
+    expect(retrySnapshot?.wakeReason).toBe("transient_failure_retry");
+    expect(retrySnapshot?.originWakeReason).toBe("issue_comment_mentioned");
+
+    const promotion = await heartbeat.promoteDueScheduledRetries(scheduled.dueAt);
+    expect(promotion).toEqual({ promoted: 1, runIds: [scheduled.run.id] });
+
+    const retry = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+    expect(retry).toEqual({ status: "queued", errorCode: null });
+  });
+
+  // BLO-38064 AC2. The exemption is an allow-list, so a non-ownership wake that
+  // is NOT on it stays suppressed — but under a code that says what happened.
+  // `execution_review_requested` wakes a stage participant who is routinely not
+  // the assignee, so reporting it as `issue_reassigned` sent operators looking
+  // for a reassignment that had never happened.
+  it("suppresses a non-exempt non-ownership wake retry as issue_not_assigned_to_agent", async () => {
+    const companyId = randomUUID();
+    const reviewerAgentId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const issueId = randomUUID();
+    const sourceRunId = randomUUID();
+    const now = new Date("2026-04-20T14:00:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values([
+      {
+        id: reviewerAgentId,
+        companyId,
+        name: "ClaudeCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "claude_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+      {
+        id: assigneeAgentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+    ]);
+
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId,
+      agentId: reviewerAgentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      error: "upstream overload",
+      errorCode: "adapter_failed",
+      finishedAt: now,
+      contextSnapshot: {
+        issueId,
+        wakeReason: "execution_review_requested",
+      },
+      updatedAt: now,
+      createdAt: now,
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Retry after a review-stage wake",
+      status: "todo",
+      priority: "medium",
+      responsibleUserId: "responsible-user",
+      assigneeAgentId,
+      issueNumber: 1,
+      identifier: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}-1`,
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(sourceRunId, {
+      now,
+      random: () => 0.5,
+    });
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+
+    const promotion = await heartbeat.promoteDueScheduledRetries(scheduled.dueAt);
+    expect(promotion).toEqual({ promoted: 0, runIds: [] });
+
+    const retry = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+    expect(retry).toEqual({
+      status: "cancelled",
+      errorCode: "issue_not_assigned_to_agent",
+    });
+  });
+
   it("does not promote a scheduled retry after the issue is handed to a human owner", async () => {
     const companyId = randomUUID();
     const oldAgentId = randomUUID();

@@ -9071,6 +9071,122 @@ function isAutoCheckoutWakeReason(wakeReason: string | null | undefined) {
   return true;
 }
 
+/**
+ * Wake reasons that address an agent PERSONALLY rather than as the issue's
+ * owner, and whose retry must therefore survive `assigneeAgentId !==
+ * run.agentId` (BLO-38064).
+ *
+ * You @-mention an agent precisely BECAUSE it does not own the issue, so for a
+ * mention wake that inequality is the steady state, not a reassignment. The
+ * retry guard read it as one, which made the loss unconditional for this shape:
+ * a mention whose first run hit any transient failure (a provider throttle, a
+ * `process_lost`) was cancelled `issue_reassigned` and never re-armed. Measured
+ * on BLO-3202 — run `5e54f30a` throttled at zero tokens, retry `ef0bd21e`
+ * cancelled 3 minutes later, and the mentioned agent was never told.
+ *
+ * An ALLOW-list, not the inverse of {@link isAutoCheckoutWakeReason}, even
+ * though that predicate answers the closely-related "does this wake confer
+ * ownership". It also excludes `execution_*`, whose stage participant is
+ * likewise routinely not the assignee — but the gate that protects those, the
+ * `issue_review_participant_changed` check, exists only in
+ * `evaluateScheduledRetryGate`. Exempting them here would clear the assignee
+ * check at the promotion and mint sites too, which have no participant check to
+ * fall back on. Add them once that check is replicated at those sites; until
+ * then their retries stay suppressed, and say so via the honest error code
+ * below rather than by mislabelling them a reassignment.
+ */
+const NON_OWNERSHIP_RETRY_WAKE_REASONS = new Set(["issue_comment_mentioned"]);
+
+/**
+ * The wake reason of the run that STARTED this retry lineage.
+ *
+ * Every retry mint overwrites `wakeReason` with its own (`transient_failure_retry`,
+ * `process_lost_retry`, `missing_issue_comment`), so by the time a parked retry is
+ * gated the reason that justified it is gone. {@link carryRetryContextSnapshot}
+ * stamps `originWakeReason` at mint so it survives; the `wakeReason` fallback
+ * covers the pre-stamp rows already parked when this shipped, and the
+ * originating run itself, which is what the mint-time site gates on.
+ */
+function originWakeReasonFromSnapshot(snapshot: Record<string, unknown> | null | undefined) {
+  return readNonEmptyString(snapshot?.originWakeReason) ?? readNonEmptyString(snapshot?.wakeReason) ?? null;
+}
+
+function originWakeReasonFromRun(run: { contextSnapshot: unknown }) {
+  return originWakeReasonFromSnapshot(parseObject(run.contextSnapshot));
+}
+
+/**
+ * Copy a run's snapshot onto its retry, dropping run-scoped markers and pinning
+ * the lineage's origin wake reason before the caller overwrites `wakeReason`.
+ *
+ * Idempotent across a chain of retries: `originWakeReasonFromSnapshot` prefers
+ * an already-stamped `originWakeReason`, so attempt 3 still reports the mention
+ * that started it rather than attempt 2's retry wake.
+ */
+function carryRetryContextSnapshot(contextSnapshot: Record<string, unknown>): Record<string, unknown> {
+  const originWakeReason = originWakeReasonFromSnapshot(contextSnapshot);
+  return {
+    ...stripRunScopedSnapshotMarkers(contextSnapshot),
+    ...(originWakeReason ? { originWakeReason } : {}),
+  };
+}
+
+type ScheduledRetryAssigneeMismatch = {
+  reason: string;
+  errorCode: "issue_reassigned" | "issue_not_assigned_to_agent";
+  details: Record<string, unknown>;
+};
+
+/**
+ * Decide whether `assigneeAgentId !== run.agentId` should suppress a scheduled
+ * retry, and under which of the two distinct facts it hides (BLO-38064).
+ *
+ * Returns `null` — retry allowed — when the run holds the issue, or when the
+ * lineage started from a wake in {@link NON_OWNERSHIP_RETRY_WAKE_REASONS}. Every
+ * other gate (terminal status, execution lock, review participant, pause hold,
+ * dependencies) is unchanged and still applies to an exempt retry; this clears
+ * only the ownership test, which such a wake was never subject to.
+ *
+ * `issue_reassigned` now means what it says. It is kept for a wake that DID
+ * confer ownership — the assignee episode BLO-29729 wrote the guard for, where
+ * the issue genuinely moved — and for an unknown wake reason, which preserves
+ * the prior behaviour rather than guessing. A wake that never conferred
+ * ownership gets `issue_not_assigned_to_agent` instead, because an operator
+ * reading `issue_reassigned` on the measured trace went looking for a
+ * reassignment that had never happened.
+ */
+function evaluateScheduledRetryAssigneeMismatch(input: {
+  runAgentId: string;
+  currentAssigneeAgentId: string | null;
+  originWakeReason: string | null;
+  issueId: string;
+}): ScheduledRetryAssigneeMismatch | null {
+  if (input.currentAssigneeAgentId === input.runAgentId) return null;
+  if (input.originWakeReason && NON_OWNERSHIP_RETRY_WAKE_REASONS.has(input.originWakeReason)) return null;
+
+  const details = {
+    issueId: input.issueId,
+    previousAssigneeAgentId: input.runAgentId,
+    currentAssigneeAgentId: input.currentAssigneeAgentId,
+    originWakeReason: input.originWakeReason,
+  };
+  // Unknown reason -> treat as an ownership wake: same verdict and same code as
+  // before this split, so a row minted without an origin cannot change meaning.
+  if (input.originWakeReason === null || isAutoCheckoutWakeReason(input.originWakeReason)) {
+    return {
+      reason: "Scheduled retry suppressed because issue ownership changed",
+      errorCode: "issue_reassigned",
+      details,
+    };
+  }
+  return {
+    reason:
+      "Scheduled retry suppressed because the agent is not the issue assignee and its wake never conferred ownership",
+    errorCode: "issue_not_assigned_to_agent",
+    details,
+  };
+}
+
 function shouldQueueFollowupForRunningIssueWake(input: {
   contextSnapshot: Record<string, unknown> | null | undefined;
   wakeCommentId: string | null;
@@ -17734,7 +17850,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
     const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
     const retryContextSnapshot = withRecoveryModelProfileHint({
-      ...stripRunScopedSnapshotMarkers(contextSnapshot),
+      ...carryRetryContextSnapshot(contextSnapshot),
       retryOfRunId: run.id,
       wakeReason: "missing_issue_comment",
       retryReason: "missing_issue_comment",
@@ -18064,7 +18180,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
     const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
     const retryContextSnapshot = withRecoveryModelProfileHint({
-      ...stripRunScopedSnapshotMarkers(contextSnapshot),
+      ...carryRetryContextSnapshot(contextSnapshot),
       retryOfRunId: run.id,
       wakeReason: "process_lost_retry",
       retryReason,
@@ -19623,6 +19739,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           | "budget_blocked"
           | "issue_not_found"
           | "issue_reassigned"
+          | "issue_not_assigned_to_agent"
           | "issue_cancelled"
           | "issue_terminal_status"
           | "issue_not_in_progress"
@@ -19704,17 +19821,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
-    if (issue.assigneeAgentId !== run.agentId) {
+    const assigneeMismatch = evaluateScheduledRetryAssigneeMismatch({
+      runAgentId: run.agentId,
+      currentAssigneeAgentId: issue.assigneeAgentId,
+      originWakeReason: originWakeReasonFromSnapshot(contextSnapshot),
+      issueId,
+    });
+    if (assigneeMismatch) {
       return {
         allowed: false,
-        reason: "Scheduled retry suppressed because issue ownership changed",
-        errorCode: "issue_reassigned",
+        reason: assigneeMismatch.reason,
+        errorCode: assigneeMismatch.errorCode,
         issueId,
-        details: {
-          issueId,
-          previousAssigneeAgentId: run.agentId,
-          currentAssigneeAgentId: issue.assigneeAgentId,
-        },
+        details: assigneeMismatch.details,
       };
     }
 
@@ -20536,6 +20655,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .for("update")
           .then((rows) => rows[0] ?? null);
 
+        const promotionAssigneeMismatch = lockedIssue
+          ? evaluateScheduledRetryAssigneeMismatch({
+              runAgentId: dueRun.agentId,
+              currentAssigneeAgentId: lockedIssue.assigneeAgentId,
+              originWakeReason: originWakeReasonFromSnapshot(contextSnapshot),
+              issueId: promotionIssueId,
+            })
+          : null;
+
         if (!lockedIssue) {
           promotionGate = {
             allowed: false,
@@ -20544,17 +20672,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             issueId: promotionIssueId,
             details: { issueId: promotionIssueId },
           };
-        } else if (lockedIssue.assigneeAgentId !== dueRun.agentId) {
+        } else if (promotionAssigneeMismatch) {
           promotionGate = {
             allowed: false,
-            reason: "Scheduled retry suppressed because issue ownership changed",
-            errorCode: "issue_reassigned",
+            reason: promotionAssigneeMismatch.reason,
+            errorCode: promotionAssigneeMismatch.errorCode,
             issueId: promotionIssueId,
-            details: {
-              issueId: promotionIssueId,
-              previousAssigneeAgentId: dueRun.agentId,
-              currentAssigneeAgentId: lockedIssue.assigneeAgentId,
-            },
+            details: promotionAssigneeMismatch.details,
           };
         } else if (lockedIssue.status === "cancelled" || lockedIssue.status === "done") {
           promotionGate = {
@@ -21088,7 +21212,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       workspaceValidationRetryPayload !== null &&
       Object.keys(workspaceValidationRetryPayload).length > 0;
     const retryContextSnapshot: Record<string, unknown> = withRecoveryModelProfileHint({
-      ...stripRunScopedSnapshotMarkers(contextSnapshot),
+      ...carryRetryContextSnapshot(contextSnapshot),
       retryOfRunId: run.id,
       wakeReason,
       retryReason,
@@ -21148,6 +21272,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           errorCode:
             | "issue_not_found"
             | "issue_reassigned"
+            | "issue_not_assigned_to_agent"
             | "issue_cancelled"
             | "issue_terminal_status"
             | "issue_not_in_progress"
@@ -21341,17 +21466,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             };
           }
 
-          if (lockedIssue.assigneeAgentId !== run.agentId) {
+          const mintAssigneeMismatch = evaluateScheduledRetryAssigneeMismatch({
+            runAgentId: run.agentId,
+            currentAssigneeAgentId: lockedIssue.assigneeAgentId,
+            originWakeReason: originWakeReasonFromSnapshot(contextSnapshot),
+            issueId,
+          });
+          if (mintAssigneeMismatch) {
             return {
               outcome: "not_scheduled",
-              reason: "Scheduled retry suppressed because issue ownership changed",
-              errorCode: "issue_reassigned",
+              reason: mintAssigneeMismatch.reason,
+              errorCode: mintAssigneeMismatch.errorCode,
               issueId,
-              details: {
-                issueId,
-                previousAssigneeAgentId: run.agentId,
-                currentAssigneeAgentId: lockedIssue.assigneeAgentId,
-              },
+              details: mintAssigneeMismatch.details,
             };
           }
 
@@ -36080,29 +36207,41 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // belonged to the previous assignee, and charging the new one for time they never
         // waited would age-expire their first park on contact. Issue cancellation ends it
         // outright. Note the reset needs no code to enforce: this sets errorCode to
-        // `issue_reassigned` / `issue_cancelled`, so the most-recent-terminal-park rule in
-        // recoverDepBlockedParkOriginAcrossInteractionWake declines the lineage on its
-        // own. If you ever change that errorCode, re-check the recovery guard.
+        // `issue_reassigned` / `issue_cancelled` / `issue_not_assigned_to_agent`, none of
+        // which is the code the most-recent-terminal-park rule in
+        // recoverDepBlockedParkOriginAcrossInteractionWake allow-lists, so it declines the
+        // lineage on its own. If you ever change that errorCode, re-check the recovery guard.
+        //
+        // BLO-38064: "reassignment" is now decided by evaluateScheduledRetryAssigneeMismatch
+        // rather than by a bare `agentId !== assigneeAgentId`. This is the site the measured
+        // mention loss ran through — a bounded transient retry skips the other three gates
+        // entirely — so a mention-wake lineage no longer ends here at all. An exempt retry
+        // is still cancelled when the ISSUE is cancelled; only the ownership arm is cleared.
         const cancelStaleScheduledRetry = async (scheduledRun: typeof heartbeatRuns.$inferSelect) => {
           const issueCancelled = issue.status === "cancelled";
-          if (
-            scheduledRun.status !== "scheduled_retry" ||
-            (scheduledRun.agentId === issue.assigneeAgentId && !issueCancelled)
-          ) {
+          const assigneeMismatch = evaluateScheduledRetryAssigneeMismatch({
+            runAgentId: scheduledRun.agentId,
+            currentAssigneeAgentId: issue.assigneeAgentId,
+            originWakeReason: originWakeReasonFromRun(scheduledRun),
+            issueId: issue.id,
+          });
+          if (scheduledRun.status !== "scheduled_retry" || (!assigneeMismatch && !issueCancelled)) {
             return false;
           }
 
           const now = new Date();
           const reason = issueCancelled
             ? "Cancelled because the issue was cancelled before the scheduled retry became due"
-            : "Cancelled because the issue was reassigned before the scheduled retry became due";
+            : assigneeMismatch?.errorCode === "issue_not_assigned_to_agent"
+              ? "Cancelled because the agent is not the issue assignee and its wake never conferred ownership"
+              : "Cancelled because the issue was reassigned before the scheduled retry became due";
           const cancelled = await tx
             .update(heartbeatRuns)
             .set({
               status: "cancelled",
               finishedAt: now,
               error: sanitizeRunErrorForStorage(reason),
-              errorCode: issueCancelled ? "issue_cancelled" : "issue_reassigned",
+              errorCode: issueCancelled ? "issue_cancelled" : (assigneeMismatch?.errorCode ?? "issue_reassigned"),
               updatedAt: now,
             })
             .where(and(eq(heartbeatRuns.id, scheduledRun.id), eq(heartbeatRuns.status, "scheduled_retry")))

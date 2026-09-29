@@ -683,6 +683,12 @@ export const KNOWN_RETRY_SCHEDULE_OUTCOMES = [
   "issue_not_in_progress",
   "issue_paused",
   "issue_reassigned",
+  // BLO-38064: split out of `issue_reassigned`. The agent is not the assignee
+  // AND its wake never conferred ownership, so nothing was reassigned — keeping
+  // the two under one label is what sent operators looking for a reassignment
+  // that had not happened, and is exactly the distinction this metric exists to
+  // make.
+  "issue_not_assigned_to_agent",
   "issue_review_participant_changed",
   "issue_cancelled",
   "issue_terminal_status",
