@@ -803,8 +803,12 @@ the last of those is `8ae54c04` (`2026-09-26T08:17:49Z`), 6h59m before the merge
 Recorded 2026-09-29, from receipts that postdate the table above. The scoped claim in the previous
 section held through `ff4e032e`, the last receipt before this one, and no further: `cd9d77f9`
 (`2026-09-27T02:47:42Z`) printed the first literal `confirmed-merged` row this ledger has produced,
-and it went to **#2020** — the one row that has never armed. Read across all 37 ledger comments on
-2026-09-29, `cd9d77f9` is still the only one containing the token at all:
+and it went to **#2020** — the one row that has never armed. Across every ledger comment through
+`d121863e` (`2026-09-29T08:16:39Z`), `cd9d77f9` is still the only one containing the token at all.
+
+Both blocks below are filtered to the rows under discussion: `ff4e032e`'s five `enqueue` rows in
+source order, and `cd9d77f9`'s five confirmation rows reordered to lead with `#2020`. Each
+receipt's other rows — the classifier table, and `ff4e032e`'s own `#2047` `skip` row — are omitted.
 
     ff4e032e-2d91-4052-aceb-a0278738a713  (2026-09-26T20:14:55Z)
     | #2046 | `enqueue` | `mergestate:CLEAN` | auto-merge armed |
