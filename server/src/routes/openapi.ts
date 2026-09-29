@@ -3819,7 +3819,7 @@ registry.registerPath({
   method: "get",
   path: "/api/companies/{companyId}/parked-agents",
   tags: ["runs"],
-  summary: "List agents parked on a scheduled retry, and when each is due to run again",
+  summary: "List agents that cannot run now — parked on a scheduled retry, or holding an overdue park dispatch has not claimed",
   request: {
     params: z.object({ companyId: z.string() }),
     query: z.object({

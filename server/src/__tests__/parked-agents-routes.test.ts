@@ -377,4 +377,88 @@ describeEmbeddedPostgres("parked agents route", () => {
     expect(res.body.parkedCount).toBe(0);
     expect(res.body.agents).toEqual([]);
   });
+
+  /**
+   * PEN-3607. `promoteScheduledRetryRun` flips a due park to `queued` and
+   * leaves `scheduledRetryAt` / `scheduledRetryReason` / `scheduledRetryAttempt`
+   * set on the row. So a park that fired but was never claimed by dispatch is
+   * a `queued` row with a past due time — and the old `status = 'scheduled_retry'`
+   * predicate could not see it.
+   *
+   * Measured in production on UX Designer `bcba1cc7` (2026-09-29): seat dark
+   * 33 h behind exactly this shape, and the census reported `overdueCount: 0`.
+   *
+   * The NEGATIVE CONTROL is the fixture itself: it contains **no**
+   * `scheduled_retry` row at all. Under the pre-fix predicate this response is
+   * necessarily empty, so every row asserted below is attributable solely to
+   * the new arm. No mocking of the old code path is required for that to hold.
+   */
+  it("counts a promoted-but-unclaimed park — the shape the old `scheduled_retry` filter could not see", async () => {
+    const companyId = await seedCompany();
+    const darkAgent = await seedAgent(companyId, "UXDesigner");
+
+    const dueAt = new Date(Date.now() - 29 * 60 * 60_000);
+    await seedRun({
+      companyId,
+      agentId: darkAgent,
+      // Promoted out of `scheduled_retry` 29 h ago and never claimed.
+      status: "queued",
+      scheduledRetryAt: dueAt,
+      scheduledRetryReason: "ccrotate_capacity",
+      // Never re-deferred: promoted on its first due-time hit.
+      scheduledRetryAttempt: 0,
+    });
+
+    const res = await request(createApp(boardActor(companyId)))
+      .get(`/api/companies/${companyId}/parked-agents`)
+      .expect(200);
+
+    expect(res.body.parkedCount).toBe(1);
+    // The assertion this ticket exists for.
+    expect(res.body.overdueCount).toBe(1);
+
+    const [dark] = res.body.agents;
+    expect(dark.agentName).toBe("UXDesigner");
+    expect(dark.reason).toBe("ccrotate_capacity");
+    expect(dark.attempt).toBe(0);
+    // `queued`, not `scheduled_retry` — the park already fired; it is dispatch
+    // that has not happened. Without this field the caller cannot tell the two
+    // apart, and they have unrelated remedies.
+    expect(dark.runStatus).toBe("queued");
+    expect(dark.overdueMs).toBeGreaterThan(28 * 60 * 60_000);
+    expect(dark.retryInMs).toBe(0);
+  });
+
+  /**
+   * Bounds the widening above. A census that admitted every `queued` run would
+   * report the whole dispatch queue as "cannot run" and be useless — and a test
+   * that only asserted the positive case would pass just as happily against
+   * that much looser predicate. These two rows are the ones that must STAY out.
+   */
+  it("does not admit a queued run that is not actually overdue", async () => {
+    const companyId = await seedCompany();
+    const futureParkAgent = await seedAgent(companyId, "FutureParkEngineer");
+    const plainQueuedAgent = await seedAgent(companyId, "PlainQueuedEngineer");
+
+    // A park promoted early, or re-parked forward: due time still ahead, so it
+    // is waiting as designed and is not a dispatch fault.
+    await seedRun({
+      companyId,
+      agentId: futureParkAgent,
+      status: "queued",
+      scheduledRetryAt: new Date(Date.now() + 30 * 60_000),
+      scheduledRetryReason: "ccrotate_capacity",
+    });
+    // An ordinary queued run that was never parked at all. `scheduledRetryAt`
+    // is NULL, so it must not be swept in by the new arm.
+    await seedRun({ companyId, agentId: plainQueuedAgent, status: "queued" });
+
+    const res = await request(createApp(boardActor(companyId)))
+      .get(`/api/companies/${companyId}/parked-agents`)
+      .expect(200);
+
+    expect(res.body.parkedCount).toBe(0);
+    expect(res.body.overdueCount).toBe(0);
+    expect(res.body.agents).toEqual([]);
+  });
 });
