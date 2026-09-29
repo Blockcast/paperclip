@@ -749,6 +749,25 @@ describe("execute: concurrency guard", () => {
     expect(result.errorMessage).toContain("create reached");
   });
 
+  it("reaps a stale orphan without the pod-teardown wait", async () => {
+    // BLO-35486: only listNamespacedJob is inside the 15s guard timeout; the
+    // reap loop is not. Waiting for pods here would add up to 60s per stale
+    // Job, serially, at every run start, with nothing bounding it.
+    process.env.PAPERCLIP_API_URL = "https://paperclip.test";
+    const orphan = makeJob({ runId: "prior-run", agentId: "agent-abc", taskId: "task-current" });
+    mockBatchListJobs.mockResolvedValue({ items: [orphan] });
+    mockBatchDeleteJob.mockResolvedValue({});
+    mockBatchCreateJob.mockRejectedValue(new Error("create reached"));
+    mockPrepareBundle.mockResolvedValue(makeBundle());
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 404 }));
+
+    const result = await execute(makeCtx({ context: { taskId: "task-current" } } as Partial<AdapterExecutionContext>));
+
+    expect(result.errorCode).toBe("k8s_job_create_failed");
+    expect(mockBatchDeleteJob).toHaveBeenCalledWith(expect.objectContaining({ name: "ac-job" }));
+    expect(mockCoreDeleteCollectionPods).not.toHaveBeenCalled();
+  });
+
   it("deletes stale orphan and proceeds when the run-id lookup is missing", async () => {
     process.env.PAPERCLIP_API_URL = "https://paperclip.test";
     const orphan = makeJob({ runId: "missing-run", agentId: "agent-abc", taskId: "task-current" });
@@ -2310,6 +2329,47 @@ describe("execute: run Secrets outlive the pod that mounts them (BLO-35486)", ()
       // The Job is left behind too — deleting it would let ownerReference GC
       // reap the Secrets, which is the same hazard by another route.
       expect(mockBatchDeleteJob).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The two launch-ack abort paths run before the Job is acknowledged. When a
+  // pod outlives teardown there, cleanupJob() keeps the Secrets and says K8s
+  // GC will collect them, which is only true if the ownerReference to the Job
+  // is already on each Secret. Without it, the credential-bearing `<job>-env`
+  // Secret is orphaned for good: the adapter has no Secret reaper.
+  it.each([
+    ["the launch ack throws", () => vi.fn().mockRejectedValue(new Error("reservation ack failed"))],
+    ["no launch ack is wired", () => undefined],
+  ])("leaves retained Secrets owned by the Job when %s and a pod outlives teardown", async (_label, ack) => {
+    vi.useFakeTimers();
+    try {
+      mockCoreDeleteCollectionPods.mockResolvedValue({});
+
+      const promise = execute(
+        makeCtx({
+          config: { env: { MY_API_KEY: "s3cret" } },
+          onExternalRuntimeLaunched: ack(),
+        } as Partial<AdapterExecutionContext>),
+      );
+      await vi.advanceTimersByTimeAsync(90_000);
+      const result = await promise;
+
+      expect(result.errorCode).toBe("k8s_job_identity_unacknowledged");
+      expect(mockCoreDeleteSecret).not.toHaveBeenCalled();
+      const created = mockCoreCreateSecret.mock.calls.map(([req]) => req.body.metadata.name as string);
+      // Guard against a vacuous pass: the env Secret must exist to be retained.
+      expect(created.some((name) => name.endsWith("-env"))).toBe(true);
+      for (const name of created) {
+        expect(mockCorePatchSecret).toHaveBeenCalledWith(expect.objectContaining({
+          name,
+          body: [expect.objectContaining({
+            path: "/metadata/ownerReferences",
+            value: [expect.objectContaining({ kind: "Job", uid: "uid-1" })],
+          })],
+        }));
+      }
     } finally {
       vi.useRealTimers();
     }

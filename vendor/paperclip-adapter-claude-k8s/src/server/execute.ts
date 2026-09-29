@@ -2331,57 +2331,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         };
       }
     }
-    if (!createdJobUid || !onExternalRuntimeLaunched) {
-      // Only tear down what this execution actually created.  An adopted Job is
-      // live and its Secrets are mounted into a running pod; deleting either
-      // here would destroy work that is still progressing, which is the failure
-      // this whole change exists to stop.  Leaking a Job is recoverable by the
-      // existing reapers — deleting a live one is not.
-      if (!adoptedExistingJob) {
-        if (await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath)) {
-          await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret]);
-        }
-      }
-      return {
-        exitCode: null,
-        signal: null,
-        timedOut: false,
-        errorMessage: !createdJobUid
-          ? "Created Kubernetes Job did not return a UID"
-          : "Paperclip did not provide an external-runtime launch acknowledgment",
-        errorCode: "k8s_job_identity_unacknowledged",
-      };
-    }
-    // From here on every pod read is scoped to this exact Job object. The
-    // deterministic name alone cannot identify it (BLO-34577).
-    jobUid = createdJobUid;
-    try {
-      await onExternalRuntimeLaunched({ jobName, jobUid });
-    } catch (err) {
-      // Same reasoning as above.  Re-acking an adopted Job re-asserts an
-      // identity the server already persisted, so a throw here means we could
-      // not confirm ownership — which is the least safe moment to delete a
-      // live in-cluster object, not the most.
-      if (!adoptedExistingJob) {
-        if (await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath)) {
-          await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret]);
-        }
-      }
-      return {
-        exitCode: null,
-        signal: null,
-        timedOut: false,
-        errorMessage: `External runtime launch acknowledgment failed: ${err instanceof Error ? err.message : String(err)}`,
-        errorCode: "k8s_job_identity_unacknowledged",
-      };
-    }
-
-    if (jobIsolation.enabled) {
-      await reportIsolatedRunStarted(effectiveCtx, currentGuardIdentity);
-    }
-
     // Attach ownerReference so K8s GC cleans up the Secret(s) if the process
-    // crashes before the finally block runs.
+    // crashes before the finally block runs.  It must land before the two
+    // abort paths below: when cleanupJob() refuses to delete the Secrets
+    // because a pod outlived teardown (BLO-35486), this ownerReference is the
+    // only thing that will ever collect them; the adapter has no Secret reaper.
     //
     // These three bodies are JSON Patch arrays, and their Content-Type is
     // stated explicitly rather than inherited.  The generated client picks the
@@ -2469,6 +2423,54 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         const msg = err instanceof Error ? err.message : String(err);
         await onLog("stderr", `[paperclip] Warning: failed to set ownerReference on mcp-config Secret: ${msg}\n`);
       }
+    }
+    if (!createdJobUid || !onExternalRuntimeLaunched) {
+      // Only tear down what this execution actually created.  An adopted Job is
+      // live and its Secrets are mounted into a running pod; deleting either
+      // here would destroy work that is still progressing, which is the failure
+      // this whole change exists to stop.  Leaking a Job is recoverable by the
+      // existing reapers — deleting a live one is not.
+      if (!adoptedExistingJob) {
+        if (await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath)) {
+          await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret]);
+        }
+      }
+      return {
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        errorMessage: !createdJobUid
+          ? "Created Kubernetes Job did not return a UID"
+          : "Paperclip did not provide an external-runtime launch acknowledgment",
+        errorCode: "k8s_job_identity_unacknowledged",
+      };
+    }
+    // From here on every pod read is scoped to this exact Job object. The
+    // deterministic name alone cannot identify it (BLO-34577).
+    jobUid = createdJobUid;
+    try {
+      await onExternalRuntimeLaunched({ jobName, jobUid });
+    } catch (err) {
+      // Same reasoning as above.  Re-acking an adopted Job re-asserts an
+      // identity the server already persisted, so a throw here means we could
+      // not confirm ownership — which is the least safe moment to delete a
+      // live in-cluster object, not the most.
+      if (!adoptedExistingJob) {
+        if (await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath)) {
+          await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret]);
+        }
+      }
+      return {
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        errorMessage: `External runtime launch acknowledgment failed: ${err instanceof Error ? err.message : String(err)}`,
+        errorCode: "k8s_job_identity_unacknowledged",
+      };
+    }
+
+    if (jobIsolation.enabled) {
+      await reportIsolatedRunStarted(effectiveCtx, currentGuardIdentity);
     }
 
     await onLog("stdout", `[paperclip] Created K8s Job: ${jobName} in namespace ${namespace} (deadline: ${timeoutSec > 0 ? `${timeoutSec}s` : "none"})\n`);
