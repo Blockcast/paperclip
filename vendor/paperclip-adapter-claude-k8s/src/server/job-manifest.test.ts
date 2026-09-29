@@ -2302,7 +2302,8 @@ describe("buildJobManifest", () => {
       expect(parsed.executionStage).toBeUndefined();
     });
 
-    it("leaves a normal-sized wake payload untouched", () => {      // The other half of the mutation guard: shedding must not fire on the
+    it("leaves a normal-sized wake payload untouched", () => {
+      // The other half of the mutation guard: shedding must not fire on the
       // ~10 KB payloads actually measured in production (BLO-37287 AC1), or
       // every wake would silently degrade to an API refetch.
       const ctxNormal = makeCtx({
