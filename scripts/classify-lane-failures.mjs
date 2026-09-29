@@ -124,6 +124,31 @@ const JOB_TIMEOUT_PATTERNS = [/has exceeded the maximum execution time/i];
 // containers`, then its own declared steps. That name is absent here on
 // purpose; what it costs is worked through in the scope note on signal 3.
 //
+// A container lane's POSTAMBLE is likewise two steps, and that one IS chased.
+// The same measured job renders `24:Stop containers` before `25:Complete job`,
+// and on cancelled container jobs 100900589400 / 100896100309 in that repo
+// `98:Stop containers` concludes `success` while the declared steps around it
+// are `skipped` — it runs regardless of how the job ended, exactly like
+// `Complete job`. Left out of this set it would land in `bodySteps` at a
+// non-`skipped` conclusion and defeat the all-skipped test on its own: the
+// `Complete job` trap described above, reproduced one step over, and it would
+// make the verdict for every container lane hinge on how GitHub renders that
+// step for a pre-body kill — which nobody has measured, because a container
+// lane killed before `Initialize containers` has not been observed. Naming it
+// here makes the answer the same under BOTH renderings, so the unmeasured
+// branch stops deciding anything.
+//
+// The two container steps are treated oppositely on purpose, and the asymmetry
+// is the same one that splits the sets above. `Initialize containers` stays in
+// the body because a bad image is diff-controlled and MUST defeat the signal;
+// `Stop containers` is postamble because it is GitHub's own teardown, carries
+// nothing the diff can influence, and is only ever excluded from the
+// all-skipped test — never from the failing-step test, which reads the raw
+// step list. So a declared step colliding with `Stop containers` in the
+// TRAILING position is not the unsafe residual the preamble has: the name is
+// absent from EXCUSABLE_SETUP_FAILURE_STEP_NAMES, so its failure still forces
+// `reported`.
+//
 // The residual collision is narrow but real, and it runs in the UNSAFE
 // direction. A workflow whose FIRST declared step is named `Set up runner` is
 // absorbed into the leading run, and — because that name is also in
@@ -140,12 +165,12 @@ const JOB_TIMEOUT_PATTERNS = [/has exceeded the maximum execution time/i];
 // reintroduce one — the reason being that the FAILING case is the dangerous
 // one, not the skipped one.
 //
-// Nothing declares either name today, checked at this commit across
+// Nothing declares any of these names today, checked at this commit across
 // `.github/workflows/` AND `.github/actions/**`: a composite action's steps
 // render into the calling job's step list too, so both directories are the same
 // surface and a check that looks at only one of them is incomplete.
 const PRE_BODY_SETUP_STEP_NAMES = new Set(["set up job", "set up runner"]);
-const RUNNER_POSTAMBLE_STEP_NAMES = new Set(["complete job"]);
+const RUNNER_POSTAMBLE_STEP_NAMES = new Set(["stop containers", "complete job"]);
 
 // Which pre-body FAILURE is excusable — a strictly narrower question than which
 // steps are synthetic, and the two must not share a set.
@@ -328,14 +353,28 @@ export function classifyJobFailure(job, annotations = null) {
   // containers` is not in EXCUSABLE_SETUP_FAILURE_STEP_NAMES either. Two
   // independent grounds to decline, both automatic.
   //
-  // The converse is worth stating because it is inferred where the above is
-  // measured: on a genuine pre-body kill the container step should be
+  // A previous revision then stopped one step short, and asserted the rest.
+  // It said that on a genuine pre-body kill the container step "should be
   // `skipped` alongside the declared steps, leaving this signal firing
-  // correctly. Should GitHub render it some other way the signal merely
-  // declines for that lane and the failure keeps today's wording. Safe in both
-  // directions, which is why no lane-specific handling is warranted ahead of a
-  // real instance. No lane in `pr.yml` declares `container:` or `services:`
-  // today (checked at this commit), so none of this is live.
+  // correctly" — inferred, and inferred about the wrong step. The lane's
+  // teardown step `Stop containers` decided the verdict, not `Initialize
+  // containers`: it was in neither name set, so it landed in `bodySteps`, and
+  // it concludes `success` on a job that ended without running its body
+  // (measured on cancelled jobs 100900589400 / 100896100309 in that repo). A
+  // container lane therefore classified as `reported` under that rendering and
+  // `infrastructure` under the other, with nobody having measured which one a
+  // pre-body kill produces — the whole verdict resting on the unmeasured half.
+  //
+  // That conditional is now removed rather than documented, which is the same
+  // move `jobBodySteps` makes on the preamble: `Stop containers` is named in
+  // RUNNER_POSTAMBLE_STEP_NAMES, so it is excluded from the all-skipped test
+  // whichever way it renders and the signal fires identically under both
+  // (asserted by test, over both renderings). The residual inference is now
+  // confined to `Initialize containers` alone, where it is safe in the sense
+  // that matters: if GitHub renders a killed container step as anything but
+  // `skipped`, this signal merely DECLINES and the failure keeps today's
+  // wording. No lane in `pr.yml` declares `container:` or `services:` today
+  // (checked at this commit), so none of this is live.
   const bodySteps = jobBodySteps(steps);
   const everyFailureIsExcusableSetup = steps
     .filter((step) => step?.conclusion === "failure")
