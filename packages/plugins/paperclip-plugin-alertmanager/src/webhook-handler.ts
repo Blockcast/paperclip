@@ -2908,7 +2908,16 @@ export async function handleWebhook(
   // so a wedged fence stays O(1) in batch size on the failure path.
   const fenceWedgedMemo: AggregateFenceWedgedMemo = new Set();
 
-  const deliveryStartedAt = Date.now();
+  // `performance.now()`, not `Date.now()`: every value derived from these
+  // timestamps is a duration, and a wall-clock *step* mid-delivery corrupts
+  // exactly the two numbers this instrumentation exists to produce. A backward
+  // step writes a negative `duration_ms`, which `increase()` reads as a counter
+  // reset rather than as a small value; a forward step fabricates a
+  // `deadline_exceeded`, the counter AC3 is judged on. Slew over a 120s window
+  // is immaterial either way, but a step is not, and NTP steps correlate with
+  // the host pressure that makes deliveries slow in the first place. Clamping
+  // at 0 would only cover the backward half.
+  const deliveryStartedAt = performance.now();
   let slowMarksReported = 0;
   let inFlight:
     | { alertIndex: number; alert: AlertmanagerAlert; startedAt: number }
@@ -2919,8 +2928,10 @@ export async function handleWebhook(
   // mark passed. Sampling before an alert instead names whichever alert starts
   // next, and never sees the last alert's work at all.
   const reportIfSlow = (finished: NonNullable<typeof inFlight>): void => {
-    const finishedAt = Date.now();
-    const elapsedMs = finishedAt - deliveryStartedAt;
+    const finishedAt = performance.now();
+    // Rounded once here: `performance.now()` is fractional, and both values
+    // below are printed for an operator.
+    const elapsedMs = Math.round(finishedAt - deliveryStartedAt);
     const crossed = SLOW_DELIVERY_MARKS_MS.filter((mark) => elapsedMs > mark).length;
     if (crossed <= slowMarksReported) return;
     slowMarksReported = crossed;
@@ -2932,7 +2943,7 @@ export async function handleWebhook(
     ctx.logger.warn(
       `paperclip-plugin-alertmanager: slow delivery: ${elapsedMs}ms elapsed after ${alertIndex + 1} of ${body.alerts.length} alerts; ${
         alert.labels.alertname ?? "unknown"
-      } (${alert.fingerprint}) took ${finishedAt - startedAt}ms. ${deadline}`,
+      } (${alert.fingerprint}) took ${Math.round(finishedAt - startedAt)}ms. ${deadline}`,
     );
   };
 
@@ -2942,7 +2953,7 @@ export async function handleWebhook(
     // alert: a batch can be slow and then spend its last seconds on filtered
     // alerts, and that is still the delivery that gets abandoned.
     if (inFlight) reportIfSlow(inFlight);
-    inFlight = { alertIndex, alert, startedAt: Date.now() };
+    inFlight = { alertIndex, alert, startedAt: performance.now() };
 
     if (!alertMatchesLabelFilter(alert, config.acceptOnlyLabels)) {
       await ctx.metrics.write("alertmanager.webhook.filtered", 1, {
@@ -3125,7 +3136,7 @@ export async function handleWebhook(
   // budget (see manifest `metricLabels`), and an `alertname` tag here would
   // spend it for an aggregate that is only ever read summed. The per-delivery
   // attribution lives in the log line above, where cardinality is free.
-  const deliveryMs = Date.now() - deliveryStartedAt;
+  const deliveryMs = Math.round(performance.now() - deliveryStartedAt);
   const timingMetrics: Array<[name: string, value: number]> = [
     ["alertmanager.webhook.duration_ms", deliveryMs],
     ["alertmanager.webhook.completed", 1],
