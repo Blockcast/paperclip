@@ -57,6 +57,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { runningProcesses } from "../adapters/index.js";
+import { logger } from "../middleware/logger.js";
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 const mockTrackAgentFirstHeartbeat = vi.hoisted(() => vi.fn());
@@ -2981,6 +2982,110 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(
       after.filter((comment) => comment.body.includes("Ally review did not land on")),
     ).toHaveLength(1);
+  });
+
+  it("notifies nobody when the PR's recorded owning set is empty (BLO-37225)", async () => {
+    // `owningIdentifiers: []` is authoritative -- no tier named an owner, so the
+    // webhook already dropped the author wake (`no_owning_reference`) while still
+    // writing a row per mentioned issue. Every row here is a mention; the
+    // notifier chooses silence rather than falling back to the mention set.
+    const jobName = "agent-opencode-ambiguous-review-empty-owners";
+    const headSha = "5d02e9b7c1a84f36e0b9d2c7a5f18e4b3c6d9a01";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      externalRunId: jobName,
+      includeIssue: false,
+      contextSnapshot: {
+        reviewKind: "pr_review",
+        taskKey: `pr_review:Blockcast/libmmt:451:${headSha}`,
+        githubRepoFullName: "Blockcast/libmmt",
+        githubPrNumber: 451,
+        githubHeadSha: headSha,
+      },
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName });
+
+    const ownerAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: ownerAgentId,
+      companyId,
+      name: "PlayersEngineerEmptyOwners",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    // Assigned and live, so an empty result cannot come from nowhere to land.
+    const seeded = [
+      { identifier: "TEMPTY-452", issueNumber: 452 },
+      { identifier: "TEMPTY-453", issueNumber: 453 },
+    ].map((row) => ({ ...row, id: randomUUID() }));
+    for (const row of seeded) {
+      await db.insert(issues).values({
+        id: row.id,
+        companyId,
+        title: `${row.identifier} review-gate empty owners`,
+        status: "in_review",
+        priority: "high",
+        assigneeAgentId: ownerAgentId,
+        responsibleUserId: "responsible-user",
+        issueNumber: row.issueNumber,
+        identifier: row.identifier,
+      });
+      await db.insert(issueWorkProducts).values({
+        companyId,
+        issueId: row.id,
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/libmmt#451",
+        title: "review-gate empty owners",
+        url: "https://github.com/Blockcast/libmmt/pull/451",
+        status: "ready_for_review",
+        metadata: { owningIdentifiers: [] },
+      });
+    }
+
+    mockGithubHasReviewerEvidenceForPr.mockResolvedValueOnce({ found: false });
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: jobName,
+    });
+    const infoSpy = vi.spyOn(logger, "info");
+    let infoCalls: unknown[][] = [];
+    const previousGateContext = process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT;
+    process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT = "review/ally-complete";
+    try {
+      await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+    } finally {
+      infoCalls = infoSpy.mock.calls.slice();
+      infoSpy.mockRestore();
+      if (previousGateContext === undefined) {
+        delete process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT;
+      } else {
+        process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT = previousGateContext;
+      }
+    }
+
+    // Positive control: the notifier ran and filtered both rows out, rather than
+    // never being reached or throwing (its caller swallows errors).
+    expect(infoCalls).toContainEqual([
+      expect.objectContaining({ runId, prNumber: 451, mentionRowCount: 2 }),
+      "failed PR-review gate has no linked Paperclip issue in the reviewer run's company to notify",
+    ]);
+    const [comments, wakeups] = await Promise.all([
+      db.select().from(issueComments).where(
+        inArray(issueComments.issueId, seeded.map((row) => row.id)),
+      ),
+      db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, ownerAgentId)),
+    ]);
+    expect(comments.filter((comment) => comment.body.includes("Ally review did not land on"))).toEqual([]);
+    expect(wakeups.filter((wakeup) => wakeup.reason === "github_pr_review_gate_failed")).toEqual([]);
   });
 
   it("does not enqueue a second wake when another finalizer already claimed the notice (BLO-33589)", async () => {

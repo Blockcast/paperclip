@@ -195,7 +195,9 @@ export function pullRequestWorkProductSourceEventActionOrder(
  * to do with `null`, and deliberately so: productivity-review re-derives
  * ownership from the row's surviving tiers and withholds a progress signal when
  * that fails, while the PR-review-gate notifier keeps the row, because its
- * failure direction is silence. Only the read is shared.
+ * failure direction is silence. Both treat an empty array the same way: the PR
+ * owns nothing, so it is attributable to (and notifies) no issue. Only the read
+ * is shared.
  */
 export function recordedPullRequestOwners(value: unknown): string[] | null {
   if (!Array.isArray(value)) return null;
