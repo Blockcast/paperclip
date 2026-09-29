@@ -9118,6 +9118,37 @@ function originWakeReasonFromRun(run: { contextSnapshot: unknown }) {
 }
 
 /**
+ * Did this lineage start from a wake that never conferred ownership?
+ *
+ * THE single definition, deliberately. Two independent screens ask the
+ * `assigneeAgentId !== run.agentId` question about the same row — the retry
+ * gate ({@link evaluateScheduledRetryAssigneeMismatch}) and, one step later,
+ * the pre-start claim screen (`evaluateQueuedRunStaleness`). Both call this, so
+ * they agree by construction rather than by convention.
+ *
+ * That is not a stylistic preference; it is the defect this function was added
+ * to fix. The first cut of BLO-38064 exempted the gate only, and the claim
+ * screen — which reads raw `wakeReason`, by then overwritten to
+ * `transient_failure_retry` — cancelled the promoted retry three frames later
+ * as `issue_assignee_changed`. Net effect was a relabelling: same silent loss,
+ * new error code. Found in review at `1bc3502f`; see the note at
+ * `evaluateQueuedRunStaleness`'s assignee branch, and the same warning in its
+ * own words at the `claimQueuedRun` dependency screen.
+ *
+ * Note this is marginally wider than `allowsIssueInteractionWake` at the claim
+ * screen, which additionally requires a wake comment id: a mention wake that
+ * somehow carries none is exempt here and was not before. Accepted knowingly —
+ * routing a mention to a non-assignee is what that wake is FOR, and the comment
+ * id governs whether the agent has something to read, not whether it may run.
+ * Requiring it here would reintroduce exactly the gate/claim disagreement above
+ * for any mention lacking one.
+ */
+function isNonOwnershipRetryLineage(snapshot: Record<string, unknown> | null | undefined) {
+  const originWakeReason = originWakeReasonFromSnapshot(snapshot);
+  return originWakeReason !== null && NON_OWNERSHIP_RETRY_WAKE_REASONS.has(originWakeReason);
+}
+
+/**
  * Copy a run's snapshot onto its retry, dropping run-scoped markers and pinning
  * the lineage's origin wake reason before the caller overwrites `wakeReason`.
  *
@@ -9150,8 +9181,11 @@ type ScheduledRetryAssigneeMismatch = {
  * `evaluateScheduledRetryGate` — which carries the terminal-status,
  * review-participant, pause-hold and dependency checks — runs UNCONDITIONALLY at
  * promotion and only under `requiresIssueGate` at mint. A bounded transient
- * retry does not satisfy `requiresIssueGate`, so at mint none of those four run;
- * at promotion all four do.
+ * retry does not satisfy `requiresIssueGate`, so at mint only terminal-status
+ * runs, via the mint block's own inline check rather than the shared gate; at
+ * promotion all four do. Review-participant, pause-hold and dependency exist
+ * only inside the shared gate and genuinely do not run at mint — which is what
+ * the `execution_*` exclusion above turns on.
  *
  * Two gates that do NOT cover an exempt retry, so do not lean on them here:
  *
@@ -9164,8 +9198,16 @@ type ScheduledRetryAssigneeMismatch = {
  *   is opt-in via `enforceIssueExecutionLock`, and promotion's own inline check
  *   sits inside a block gated on `requiresIssueExecutionRetryLock` — which a
  *   bounded transient retry fails — so neither fires for this family at all.
- *   Only the mint-site check runs unconditionally, and there the lock is still
- *   this run's own.
+ *   The claim screen's pre-start availability check is gated the same way and
+ *   so is also dead here. Only the mint-site check runs unconditionally, and
+ *   there the lock is still this run's own.
+ *
+ *   Separately from availability, `claimQueuedRun` decides whether the lock is
+ *   REQUIRED at all (`issueLockRequired`). That is the fourth screen this
+ *   exemption has to reach, and it is not a gate you can lean on either: it
+ *   now honours this same lineage, because a mention wake does not require the
+ *   lock and its retry must not either. Left alone it cancelled the promoted
+ *   retry as `issue_execution_lock_not_acquired`.
  * - **`in_progress`.** `requiresInProgressIssueRetry` is gated on
  *   `requiresIssueExecutionRetryLock`, so a bounded transient retry never
  *   reaches it (and within the reasons that do, it excludes
@@ -9181,10 +9223,14 @@ type ScheduledRetryAssigneeMismatch = {
  * stamping that fact at mint, the way `originWakeReason` is stamped. Judged not
  * worth the plumbing for now, but note the bound is narrower than the lock gate
  * would suggest: for this family no lock check fires at promotion (see above),
- * so the new owner taking the lock does NOT stop the lineage. What bounds it is
- * that promotion writes no lock, so there is no concurrent execution, and the
- * retry is attempt-capped — the cost is a bounded number of wakes to an agent
- * that will read the issue and find it reassigned.
+ * so the new owner taking the lock does NOT stop the lineage. Nor does the
+ * pre-start claim screen, which now honours this same exemption — deliberately,
+ * since a screen that cancelled what the gate promoted is the very defect the
+ * shared predicate exists to prevent, but it does mean the residual now reaches
+ * the agent instead of dying one frame later. What bounds it is that promotion
+ * writes no lock, so there is no concurrent execution, and the retry is
+ * attempt-capped — the cost is a bounded number of wakes to an agent that will
+ * read the issue and find it reassigned.
  *
  * `issue_reassigned` now means what it says. It is kept for a wake that DID
  * confer ownership — the assignee episode BLO-29729 wrote the guard for, where
@@ -9201,7 +9247,7 @@ function evaluateScheduledRetryAssigneeMismatch(input: {
   issueId: string;
 }): ScheduledRetryAssigneeMismatch | null {
   if (input.currentAssigneeAgentId === input.runAgentId) return null;
-  if (input.originWakeReason && NON_OWNERSHIP_RETRY_WAKE_REASONS.has(input.originWakeReason)) return null;
+  if (isNonOwnershipRetryLineage({ originWakeReason: input.originWakeReason })) return null;
 
   const details = {
     issueId: input.issueId,
@@ -22686,7 +22732,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const claimedAgent = await getAgent(claimed.agentId);
-      const issueLockRequired = !allowsIssueInteractionWake(claimedContext);
+      // BLO-38064: a retry lineage inherits its ORIGIN wake's lock posture. A
+      // mention wake never requires the issue execution lock (that is what lets
+      // a non-assignee run at all), and `allowsIssueInteractionWake` reads the
+      // raw `wakeReason` — which the retry mint has overwritten to
+      // `transient_failure_retry`. Without the second clause a promoted mention
+      // retry clears the two assignee screens and is then cancelled here as
+      // `issue_execution_lock_not_acquired`: the same silent loss again, a
+      // third error code. Found by the claim-leg regression test in
+      // `heartbeat-stale-queue-invalidation.test.ts`, which is why that test
+      // drives `resumeQueuedRuns` to completion rather than asserting on
+      // promotion.
+      const issueLockRequired =
+        !allowsIssueInteractionWake(claimedContext) && !isNonOwnershipRetryLineage(claimedContext);
       const claimedRetryReason = readNonEmptyString(claimedContext.retryReason) ?? claimed.scheduledRetryReason;
       const executionRunClaimCondition =
         requiresIssueExecutionRetryLock(claimedRetryReason) && claimed.retryOfRunId
@@ -23062,6 +23120,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // issue-lock block (skips lock stamping for source_scoped_recovery_action).
     // Without this pre-claim exemption those later exemptions are unreachable.
     const isRecoveryOwnerWake = wakeReason === "source_scoped_recovery_action";
+    // BLO-38064: the same exemption the retry gate applied at promotion, read
+    // from the same predicate. A promoted mention retry arrives here with
+    // `wakeReason` rewritten to `transient_failure_retry`, so `isInteractionWake`
+    // above is false and this screen would cancel it as `issue_assignee_changed`
+    // — undoing the promotion three frames earlier and turning the fix into a
+    // relabelling. `isNonOwnershipRetryLineage` reads the pinned
+    // `originWakeReason` instead, which survives the rewrite.
+    const isNonOwnershipRetryWake = isNonOwnershipRetryLineage(context);
     const interactionResolvedAt = readNonEmptyString(context.interactionResolvedAt);
     const hasResolvedInteractionEvidence = interactionResolvedAt !== null && !Number.isNaN(Date.parse(interactionResolvedAt));
 
@@ -23148,6 +23214,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issue.assigneeAgentId !== run.agentId &&
       !isInteractionWake &&
       !isRecoveryOwnerWake &&
+      !isNonOwnershipRetryWake &&
       !isCurrentReviewParticipant
     ) {
       return {
