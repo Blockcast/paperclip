@@ -103,6 +103,73 @@ describe("selectDuplicateDismissals", () => {
     assert.equal(decision.retain, null);
   });
 
+  // App-authored PRs: GitHub bars the author from APPROVE, so a clean and a
+  // blocking self-review are BOTH COMMENTED and a state-only comparison sees
+  // one verdict. The dismissal target was the review carrying the blockers.
+  it("refuses when two COMMENTED reviews disagree on blocking findings", () => {
+    const blocking = review({
+      id: 111,
+      state: "COMMENTED",
+      submitted_at: "2026-09-08T20:10:12Z",
+      body: body(HEAD, 2, 0),
+    });
+    const clean = review({ id: 222, state: "COMMENTED", submitted_at: "2026-09-08T20:10:36Z" });
+
+    for (const order of [
+      [blocking, clean],
+      [clean, blocking],
+    ]) {
+      const decision = selectDuplicateDismissals(order, HEAD);
+      assert.equal(decision.reason, "conflicting-verdicts");
+      assert.deepEqual(decision.dismiss, [], "the review carrying the blockers must survive");
+      assert.equal(decision.retain, null);
+    }
+  });
+
+  it("treats a still-present prior disposition as a blocking verdict", () => {
+    const stillPresent = review({
+      id: 111,
+      state: "COMMENTED",
+      submitted_at: "2026-09-08T20:10:12Z",
+      body: `${body()}\n\n- **prior: guard keys on state** - still-present - not fixed at this head`,
+    });
+    const clean = review({ id: 222, state: "COMMENTED", submitted_at: "2026-09-08T20:10:36Z" });
+
+    assert.equal(selectDuplicateDismissals([stillPresent, clean], HEAD).reason, "conflicting-verdicts");
+  });
+
+  it("emits no dismissal for an all-COMMENTED duplicate pair", () => {
+    // A COMMENTED review carries no reviewDecision weight, so dismissing one
+    // repairs nothing; the documented procedure dismisses whatever `dismiss`
+    // lists, so it must stay empty rather than rely on the API refusing it.
+    const older = review({ id: 111, state: "COMMENTED", submitted_at: "2026-09-08T20:10:12Z" });
+    const newer = review({ id: 222, state: "COMMENTED", submitted_at: "2026-09-08T20:10:36Z" });
+
+    for (const order of [
+      [older, newer],
+      [newer, older],
+    ]) {
+      const decision = selectDuplicateDismissals(order, HEAD);
+      assert.equal(decision.reason, "commented-only");
+      assert.deepEqual(decision.dismiss, []);
+      assert.equal(decision.retain, null);
+    }
+  });
+
+  it("never dismisses a canonical review in favour of a newer non-canonical one", () => {
+    const genuine = review({ id: 555, submitted_at: "2026-09-08T20:10:12Z" });
+    const doubleAttested = review({
+      id: 444,
+      submitted_at: "2026-09-08T20:10:36Z",
+      body: `${body()}\n\n\`\`\`\nReviewed head: ${HEAD}\n\`\`\``,
+    });
+    const decision = selectDuplicateDismissals([genuine, doubleAttested], HEAD);
+
+    assert.equal(decision.reason, "no-duplicate");
+    assert.equal(decision.retain.id, genuine.id);
+    assert.deepEqual(decision.dismiss, []);
+  });
+
   it("refuses when a candidate cannot be ordered", () => {
     const undated = review({ id: 2, submitted_at: null });
     const decision = selectDuplicateDismissals([OLDER, undated], HEAD);
@@ -199,6 +266,16 @@ describe("exactHeadAppReviews", () => {
       user: { login: ALLY_APP_REVIEWER_LOGIN, id: 1, type: "Bot" },
     });
     assert.deepEqual(exactHeadAppReviews([lookalike], HEAD), []);
+  });
+
+  it("excludes a body that I3 would report as not canonical", () => {
+    const twoAttestations = review({
+      id: 2,
+      body: `${body()}\n\n\`\`\`\nReviewed head: ${HEAD}\n\`\`\``,
+    });
+    const noHeading = review({ id: 3, body: `Reviewed head: ${HEAD}\n\n### Critical Issues (0)` });
+
+    assert.deepEqual(exactHeadAppReviews([twoAttestations, noHeading, review({ id: 4 })], HEAD).map((r) => r.id), [4]);
   });
 
   it("ignores a body with no attestation at all", () => {

@@ -262,22 +262,24 @@ PAPERCLIP_GITHUB_TOKEN_FILE=/paperclip/.secrets/github-merge-token/token \
     -f message="Duplicate exact-head Ally submission superseded by the newer verdict at $HEAD_SHA."
 ```
 
-Three of its answers mean **stop and dismiss nothing**. `conflicting-verdicts`
-is two runs disagreeing at one head (BLO-19778, #876) — that is a supersession
-decision driven by a blocker, not a duplicate, and picking a winner by clock
-order would discard a real finding. `unorderable` means "newest" could not be
+Four of its answers mean **stop and dismiss nothing**. `conflicting-verdicts`
+is two runs disagreeing at one head (BLO-19778, #876) -- on `state` or on
+whether the body carries a blocking finding. That is a supersession decision
+driven by a blocker, not a duplicate, and picking a winner by clock order would
+discard a real finding. The body comparison matters on App-authored PRs, where
+GitHub bars the author from `APPROVE` and a clean and a blocking self-review are
+both `COMMENTED`. `commented-only` means every candidate is `COMMENTED`: such a
+review carries no `reviewDecision` weight, so dismissing one repairs nothing --
+leave them and let I1 report it. `unorderable` means "newest" could not be
 established, which is precisely the condition that produced #3281. `none` means
 no operative exact-head App review was found at all.
 
-It matches candidates on the body's `Reviewed head:` attestation, never
-`commit_id`. GitHub re-anchors `commit_id` forward on APPROVED reviews when the
+It matches candidates on the body's canonical `Reviewed head:` attestation
+(`canonicalReviewHead`: exactly one heading and exactly one attestation, the
+same reading I3 applies), never `commit_id`. GitHub re-anchors `commit_id` forward on APPROVED reviews when the
 branch is updated (BLO-34581), and APPROVED is the state being de-duplicated, so
 `commit_id` both admits reviews that never read this head and hides ones that
 did.
-
-A `COMMENTED` review cannot be dismissed through the API at all. If the
-duplicate pair is two `COMMENTED` reviews, there is no cleanup — leave them and
-let I1 report it.
 
 ### Step 7 — Self-cleanup
 
