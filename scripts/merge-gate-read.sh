@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Canonical fleet merge-gate reader
-# (BLO-26572 → BLO-34035 → BLO-34114 → BLO-34263 → BLO-34367).
+# (BLO-26572 → BLO-34035 → BLO-34114 → BLO-34263 → BLO-34367 → BLO-37887).
 #
 # Reads BOTH check surfaces at a head and prints one line per row that is not a
 # pass. Empty output means "nothing to stop on", and is trustworthy only because
@@ -20,6 +20,14 @@
 # in the CONCLUSION column ($3) under a $1 of STOP. A consumer filtering $1
 # for blocking labels must match STOP and will never see it; listing it here
 # as a label was wrong.
+# NO-VERDICT (BLO-37887) is blocking and is likewise NOT a label, for exactly
+# that reason: a run that has published nothing is ABSENT, and ABSENT is a stop
+# under BLO-26572, so it MUST be caught by a `$1 == "STOP"` filter. It carries
+# NO-VERDICT in the CONCLUSION column ($3) and names the workflow and the run
+# status in $2, which is the distinguishability the remedy needs — you WAIT for
+# that run, you do not re-run or re-request anything. Promoting it to a $1 label
+# would hide a real stop from every consumer following the mandated "any STOP
+# line blocks the merge" reading. Direction of that mistake: GREEN.
 #
 # The VERDICT IS THE LINES, never $?. rc 1 IMPLIES the ABSENT line, but NOT the
 # converse: `grep -v` returns 0 whenever any row survives, while the survivor
@@ -29,15 +37,18 @@
 # one-way signal at best. Never write `merge-gate-read.sh … && merge`.
 #
 #   merge-gate-read.sh <owner/repo> <sha|pr-head>     # live
-#   merge-gate-read.sh --rows <DEAD-alternation>      # fixture mode, rows on stdin
+#   merge-gate-read.sh --rows <DEAD> [PENDING]        # fixture mode, rows on stdin
 #   merge-gate-read.sh --dead                         # fixture mode, runs on stdin
+#   merge-gate-read.sh --pending                      # fixture mode, runs on stdin
 #   merge-gate-read.sh --extract                      # fixture mode, check-run JSON on stdin
 #   merge-gate-read.sh --status-extract               # fixture mode, status JSON on stdin
 #   merge-gate-read.sh --runs-extract                 # fixture mode, runs JSON on stdin
 #   merge-gate-read.sh --sha-guard <sha>              # fixture mode, validates one sha
 #
 # Row shape  (TSV): name <TAB> conclusion <TAB> timestamp <TAB> run-id|app:<slug>|status
-# Run shape  (TSV): workflow-id <TAB> event <TAB> run-id <TAB> conclusion <TAB> run-started-at
+# Run shape  (TSV): workflow-id <TAB> event <TAB> run-id <TAB> conclusion <TAB>
+#                   run-started-at <TAB> status <TAB> workflow-name
+# Pend shape (TSV): run-id <TAB> status <TAB> workflow-name
 set -uo pipefail
 
 extract() { # stdin: check-runs API body (one object per page) -> stdout: rows
@@ -63,7 +74,61 @@ run_extract() { # stdin: actions/runs API body (one object per page) -> run rows
   # Field ORDER is the contract with dead_runs(); a transposition here is
   # invisible at runtime and silently empties DEAD. @tsv renders a null as the
   # empty string, which dead_runs() treats as "no timestamp" and fails CLOSED.
-  jq -r '.workflow_runs[]|[.workflow_id,.event,.id,.conclusion,.run_started_at]|@tsv'
+  # status/name are APPENDED, never interleaved: dead_runs() reads $1..$5 and a
+  # 5-field fixture row must keep meaning what it meant.
+  jq -r '.workflow_runs[]|[.workflow_id,.event,.id,.conclusion,.run_started_at,
+                           .status,.name]|@tsv'
+}
+
+pending_runs() { # stdin: run rows -> stdout: pend rows for runs owing a verdict
+  # BLO-37887. A workflow run that has dispatched ZERO JOBS publishes ZERO
+  # check-runs, so it is invisible on BOTH surfaces this reader fetches — there
+  # is no row to keep, drop, or label. Measured at Network-Operator-Portal#1105
+  # @ 0897b91d: run 36563730733 (Go Unit Tests) sat `status: pending` with
+  # `jobs: 0` and appeared in NONE of the ~10 check-run rows at that head, while
+  # every other run there had >=1 job and did appear.
+  #
+  # DEAD does not cover it and cannot: DEAD only ever holds `completed` runs
+  # (`cancelled`/`failure` are terminal conclusions), so the two sets are
+  # disjoint by construction. The BLO-34263 survivor guard does not fire either
+  # — it is written for "DEAD matched everything" and stays quiet while ~10
+  # unrelated rows survive. Neither existing guard can express "a run here has
+  # published nothing yet".
+  #
+  # The hazard is the WINDOW, not a steady state: while other runs are still red
+  # the reader correctly stops. It fails GREEN in the interval where every
+  # VISIBLE stop clears and a zero-job run is still outstanding — the reader
+  # prints nothing, which BLO-26572 reads as "no stop", over a workflow that has
+  # produced no verdict at all. Self-closing (that run dispatched jobs minutes
+  # later and became visible), which is exactly why it has never been caught on
+  # a settled head and why its fixtures must be synthetic.
+  #
+  # How the state is MANUFACTURED, and why this is worth a guard rather than a
+  # note: the sanctioned draft->ready toggle creates it. The 11:45:30Z toggle on
+  # that PR cancelled run 36556420221 under `cancel-in-progress`, and the
+  # replacement was created 3s later and sat pre-dispatch. The mandated
+  # per-workflow in-flight check ran first and predicted the cancellation
+  # exactly. Two correct procedures composing into a blind spot neither has
+  # alone.
+  #
+  # NEGATE on status; never match the literal `pending`. The documented domain is
+  # queued / in_progress / completed / requested / waiting / pending, and only
+  # `completed` means "this run owes nothing further". Matching `pending` alone
+  # passes the measured fixture and silently admits every other pre-dispatch
+  # state plus any GitHub adds later. That is this file's own recurring defect —
+  # BLO-34367 exists because `cancelled` was keyed on without asking what the
+  # whole enum could mean.
+  #
+  # A missing status ("" via @tsv on a null, or a short fixture row) is NOT
+  # `completed`, so it is kept and STOPs. Fails CLOSED, on the same grounds as
+  # the missing-timestamp rule in dead_runs(): an absent field must never be
+  # read as evidence that a verdict exists.
+  #
+  # `$3 != ""` is the blank-line fence and is load-bearing on the live path: the
+  # reader pipes a shell variable in, and an empty variable arrives as one blank
+  # line whose $6 is "" — i.e. not `completed` — which would print a NO-VERDICT
+  # naming no workflow at all on every head that has no runs.
+  awk -F'\t' '$3 != "" && $6 != "completed" { print $3 "\t" ($6 == "" ? "?" : $6) "\t" $7 }'
 }
 
 require_sha() { # $1 = candidate -> stdout: a STOP line + rc 1 when not 40-hex
@@ -231,7 +296,7 @@ dead_runs() { # stdin: run rows -> stdout: alternation of stale run ids
     | sort -n | paste -sd'|' -
 }
 
-verdicts() { # $1 = DEAD alternation (empty or '__none__' when nothing is stale)
+verdicts() { # $1 = DEAD alternation, $2 = PENDING rows (both may be empty)
   # Normalised HERE and nowhere else — the live path pipes dead_runs() straight
   # in, and it prints nothing when no run is stale. An empty alternation is not
   # inert: `()` is an empty sub-expression, which GNU grep reads as "matches
@@ -244,7 +309,21 @@ verdicts() { # $1 = DEAD alternation (empty or '__none__' when nothing is stale)
   grep -vE "	(${dead})$" \
     | sort -t$'\t' -k1,1 -k4,4 -k3,3r \
     | awk -F'\t' '!seen[$1 FS $4]++' \
-    | awk -F'\t' -v dead="$dead" 'NF==0{next}
+    | awk -F'\t' -v dead="$dead" -v pend="${2:-}" '
+        # BLO-37887. Pend rows are carried as an ORDERED list, not an
+        # associative array: awk for-in order is unspecified, so iterating the
+        # map directly makes multi-run output nondeterministic and its fixture
+        # flaky. Keyed lookup still uses `contributed`, which is a map.
+        BEGIN{ np = split(pend, pl, "\n"); k = 0
+               for (i = 1; i <= np; i++) if (pl[i] != "") {
+                 split(pl[i], f, "\t"); k++
+                 prid[k] = f[1]; pstat[k] = f[2]; pname[k] = f[3] } }
+        NF==0{next}
+        # Set on SURVIVING rows only — after DEAD, after dedup — so "contributed"
+        # means "this run published a check-run that is still standing", which is
+        # the question. Set BEFORE the label rules below so a row that is itself a
+        # STOP still counts as its run having spoken.
+        {contributed[$4] = 1}
         # Survivors are check-run verdicts only. On a repo that publishes ONLY
         # legacy statuses this fires ABSENT on every head — the documented
         # single-surface false RED. Control: run the same read against 3-8
@@ -268,14 +347,22 @@ verdicts() { # $1 = DEAD alternation (empty or '__none__' when nothing is stale)
         $2!="success"&&$2!="skipped"{print ($1~/\$\{\{/?"MALFORMED":($2=="neutral"?"NOT-EVALUATED":"STOP"))"\t"$1"\t"$2"\trun="$4}
         END{if(!n) print "STOP\t<" (dead!="__none__" \
               ? "every check-run at this head dropped as superseded-run" \
-              : "no check-run verdict at this head") ">\tABSENT\trun=-"}'
+              : "no check-run verdict at this head") ">\tABSENT\trun=-"
+            # A non-completed run that contributed NOTHING is owed a verdict this
+            # reader cannot see. It does NOT count toward n: it is the absence of
+            # a verdict, so counting it would suppress the very ABSENT guard that
+            # covers the neighbouring case.
+            for (i = 1; i <= k; i++) if (!(prid[i] in contributed))
+              printf "STOP\t<%s: run %s, no check-run published>\tNO-VERDICT\trun=%s\n", \
+                     pname[i], pstat[i], prid[i]}'
 }
 
 # `--rows` propagates the pipeline status rather than swallowing it. Hardcoding
 # `exit 0` here made the exit contract unobservable by construction, so no
 # fixture could catch the header claiming an exactness it did not have.
-if [ "${1:-}" = "--rows" ]; then verdicts "${2:-}"; exit $?; fi
+if [ "${1:-}" = "--rows" ]; then verdicts "${2:-}" "${3:-}"; exit $?; fi
 if [ "${1:-}" = "--dead" ]; then dead_runs; exit 0; fi
+if [ "${1:-}" = "--pending" ]; then pending_runs; exit 0; fi
 if [ "${1:-}" = "--extract" ]; then extract; exit 0; fi
 if [ "${1:-}" = "--status-extract" ]; then status_extract; exit 0; fi
 if [ "${1:-}" = "--runs-extract" ]; then run_extract; exit 0; fi
@@ -287,8 +374,16 @@ R="$1"
 H=$(gh api "repos/$R/commits/$2" --jq .sha 2>/dev/null)
 require_sha "$H" || exit 1
 
-DEAD=$(gh api "repos/$R/actions/runs?head_sha=$H&per_page=100" --paginate \
-        | run_extract | dead_runs)
+RUNS=$(gh api "repos/$R/actions/runs?head_sha=$H&per_page=100" --paginate \
+        | run_extract)
+# ZERO new API calls for BLO-37887: the runs body is already fetched, so the
+# pending set is a second pass over rows in hand. Extract ONCE into RUNS and fan
+# out; a second `gh api` here would double this reader's rate-limit cost on every
+# invocation, and `gh` shares one installation token fleet-wide.
+# An empty RUNS arrives as one blank line: dead_runs() matches nothing on it, and
+# pending_runs()'s `$3 != ""` fence drops it.
+DEAD=$(printf '%s\n' "$RUNS" | dead_runs)
+PENDING=$(printf '%s\n' "$RUNS" | pending_runs)
 
 # BOTH surfaces paginate. GitHub's default page size is 30, so an unpaginated
 # status fetch silently drops the 31st context onward — and a dropped `failure`
@@ -296,4 +391,4 @@ DEAD=$(gh api "repos/$R/actions/runs?head_sha=$H&per_page=100" --paginate \
 # status rows from the survivor count, so one surviving check-run keeps the guard quiet.
 { gh api "repos/$R/commits/$H/status?per_page=100" --paginate | status_extract
   gh api "repos/$R/commits/$H/check-runs?per_page=100" --paginate | extract
-} | verdicts "$DEAD"
+} | verdicts "$DEAD" "$PENDING"
