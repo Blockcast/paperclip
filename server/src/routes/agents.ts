@@ -4825,12 +4825,12 @@ export function agentRoutes(
         and(
           eq(heartbeatRuns.companyId, companyId),
           // PEN-3607: `scheduled_retry` alone was a census of the wrong
-          // population. `promoteScheduledRetryRun` flips a due park to
-          // `queued` and deliberately does NOT clear `scheduledRetryAt` /
-          // `scheduledRetryReason` / `scheduledRetryAttempt`
-          // (`heartbeat.ts:20203-20225`), so from the instant a park is
-          // promoted it leaves this endpoint entirely — and if dispatch then
-          // never claims it, the seat is dark and the census reads clean.
+          // population. `promoteScheduledRetryRun` (`heartbeat.ts`) flips a
+          // due park to `queued` and deliberately does NOT clear
+          // `scheduledRetryAt` / `scheduledRetryReason` /
+          // `scheduledRetryAttempt`, so from the instant a park is promoted
+          // it leaves this endpoint entirely — and if dispatch then never
+          // claims it, the seat is dark and the census reads clean.
           //
           // Measured on UX Designer `bcba1cc7` (2026-09-29): four runs
           // `queued`, two carrying `ccrotate_capacity` parks ~29 h past due,
