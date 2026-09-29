@@ -147,15 +147,102 @@ describe("resolveWorkspaceWriterTreeKey", () => {
     }
   });
 
+  describe("first run of an un-backfilled issue (BLO-37188)", () => {
+    // `issue.projectWorkspaceId` is a RESULT of an issue's first run -- it is
+    // backfilled from the realized workspace long after the reservation binds.
+    // Keying on it alone therefore returned null on run 1 and left it
+    // unexcluded on BOTH branches. The caller now resolves the workspace the
+    // late path would pick and passes it as `projectWorkspaceFallbackId`.
+    //
+    // The property under test is not "run 1 gets a key" -- it is that run 1
+    // gets THE SAME key as run 2, since a key that does not match the
+    // backfilled run's excludes nothing.
+    it("keys run 1 of a shared checkout identically to the backfilled run 2", () => {
+      const runOne = resolveWorkspaceWriterTreeKey({
+        statelessPrReview: false,
+        runResolvesToOwnTree: false,
+        usesPerRunScope: false,
+        issue: { id: "issue-a", projectWorkspaceId: null },
+        projectWorkspaceFallbackId: PW,
+      });
+      const runTwo = resolveWorkspaceWriterTreeKey({
+        statelessPrReview: false,
+        runResolvesToOwnTree: false,
+        usesPerRunScope: false,
+        issue: { id: "issue-a", projectWorkspaceId: PW },
+      });
+
+      expect(runOne).toBe(`project-primary:${PW}`);
+      expect(runOne).toBe(runTwo);
+    });
+
+    it("also closes it on the own-tree branch, restoring BLO-31443 for run 1", () => {
+      // The own-tree branch scopes the issue key by workspace, so an
+      // un-backfilled run 1 keyed `no-project-workspace:issue-a` while run 2
+      // keyed `pw-1:issue-a` -- two runs of ONE issue, one worktree, no
+      // exclusion. Same root cause, same fallback fixes it.
+      const runOne = resolveWorkspaceWriterTreeKey({
+        statelessPrReview: false,
+        runResolvesToOwnTree: true,
+        usesPerRunScope: false,
+        issue: { id: "issue-a", projectWorkspaceId: null },
+        projectWorkspaceFallbackId: PW,
+      });
+      const runTwo = resolveWorkspaceWriterTreeKey({
+        statelessPrReview: false,
+        runResolvesToOwnTree: true,
+        usesPerRunScope: false,
+        issue: { id: "issue-a", projectWorkspaceId: PW },
+      });
+
+      expect(runOne).toBe(`${PW}:issue-a`);
+      expect(runOne).toBe(runTwo);
+    });
+
+    it("never lets the fallback override an issue that HAS a workspace", () => {
+      // The fallback is creation-order-first, which is only what the late path
+      // picks when the issue names nothing. Once the issue names a workspace
+      // that is authoritative, so a wrong fallback must not move the key off it.
+      for (const runResolvesToOwnTree of [true, false]) {
+        expect(resolveWorkspaceWriterTreeKey({
+          statelessPrReview: false,
+          runResolvesToOwnTree,
+          usesPerRunScope: false,
+          issue: { id: "issue-a", projectWorkspaceId: OTHER_PW },
+          projectWorkspaceFallbackId: PW,
+        })).toBe(runResolvesToOwnTree ? `${OTHER_PW}:issue-a` : `project-primary:${OTHER_PW}`);
+      }
+    });
+
+    it("keeps the two exclusions intact under a fallback", () => {
+      // A fallback must not resurrect a key for the two shapes that are
+      // tree-unique by construction.
+      for (const runResolvesToOwnTree of [true, false]) {
+        expect(resolveWorkspaceWriterTreeKey({
+          statelessPrReview: true,
+          runResolvesToOwnTree,
+          usesPerRunScope: false,
+          issue: { id: "issue-a", projectWorkspaceId: null },
+          projectWorkspaceFallbackId: PW,
+        })).toBeNull();
+      }
+      expect(resolveWorkspaceWriterTreeKey({
+        statelessPrReview: false,
+        runResolvesToOwnTree: true,
+        usesPerRunScope: true,
+        issue: { id: "issue-a", projectWorkspaceId: null },
+        projectWorkspaceFallbackId: PW,
+      })).toBeNull();
+    });
+  });
+
   it("returns null when there is nothing identifying the shared tree", () => {
-    // NOT "there is no shared checkout to exclude on" -- there usually is one,
-    // and this is a known gap rather than a safe case. `projectWorkspaceId` is
-    // only backfilled onto the issue AFTER the first run realizes a workspace
-    // (`issueRef?.projectWorkspaceId ?? resolvedWorkspace.workspaceId`), so the
-    // first run of a fresh issue into a shared checkout keys null and is not
-    // excluded. Accepted deliberately: the reservation must bind before the
-    // workspace is realized, so no sound key exists at this point. See the
-    // KNOWN GAP note on `resolveWorkspaceWriterTreeKey`.
+    // What is LEFT after BLO-37188, and it is a safe case rather than a gap: a
+    // run the caller resolved to NO project checkout, so it passes no fallback.
+    // The main such shape is `agent_default`, which lands in the agent home
+    // rather than any project tree -- and a null key there is correct, because
+    // the resolver's `agent-shared:<agentId>` exit already names exactly that
+    // equivalence class. A project with zero workspace rows lands here too.
     expect(resolveWorkspaceWriterTreeKey({
       statelessPrReview: false,
       runResolvesToOwnTree: false,
@@ -167,6 +254,7 @@ describe("resolveWorkspaceWriterTreeKey", () => {
       runResolvesToOwnTree: false,
       usesPerRunScope: false,
       issue: { id: "issue-a", projectWorkspaceId: null },
+      projectWorkspaceFallbackId: null,
     })).toBeNull();
   });
 });
@@ -263,6 +351,33 @@ describe("the key reaches the reservation (end-to-end through the resolver)", ()
         expect(first?.reservationKey).not.toBe(second?.reservationKey);
       });
 
+      it("excludes an un-backfilled FIRST run against a backfilled one (BLO-37188)", () => {
+        // The end-to-end shape of the residual gap: two agents, one shared
+        // checkout, and the issue driving run 1 has never resolved a workspace
+        // so it carries no `projectWorkspaceId` yet. Run 1 keys off the
+        // bind-time fallback, run 2 off the backfilled id, and the reservation
+        // must see ONE key -- that is what makes the second run defer instead
+        // of writing the tree the first is already in.
+        const firstRunOfFreshIssue = resolveWorkspaceWriterTreeKey({
+          statelessPrReview: false,
+          runResolvesToOwnTree: false,
+          usesPerRunScope: false,
+          issue: { id: "issue-fresh", projectWorkspaceId: null },
+          projectWorkspaceFallbackId: PW,
+        });
+        const first = identityFor("run-1", firstRunOfFreshIssue, {
+          agentId: "agent-1",
+          effectiveMaxConcurrentRuns,
+        });
+        const second = identityFor("run-2", sharedCheckoutKey("issue-b"), {
+          agentId: "agent-2",
+          effectiveMaxConcurrentRuns,
+        });
+
+        expect(first?.reservationKey).toBe(`workspace-tree:project-primary:${PW}`);
+        expect(first?.reservationKey).toBe(second?.reservationKey);
+      });
+
       it("regression: a null key leaves both runs writing one tree unexcluded", () => {
         // Pins the pre-fix behaviour as the thing being prevented. If a future
         // change makes resolveWorkspaceWriterTreeKey return null for the shared
@@ -270,9 +385,13 @@ describe("the key reaches the reservation (end-to-end through the resolver)", ()
         //
         // At concurrency 1 both runs fall back to `agent-shared:<agentId>`, so
         // two runs of ONE agent still collide -- assert across agents, which is
-        // the pairing that genuinely goes unexcluded on a null key. That is the
-        // known un-backfilled-issue gap documented on `resolveWorkspaceWriter
-        // TreeKey`, not an oversight.
+        // the pairing that genuinely goes unexcluded on a null key.
+        //
+        // This asserts on the RESOLVER given a null key, and stays true after
+        // BLO-37188: what that changed is which runs still PRODUCE a null key.
+        // It is no longer the un-backfilled issue (see the test above) but a
+        // run that resolves to no project checkout at all -- for which
+        // `agent-shared:<agentId>` is the correct class, not a miss.
         const first = identityFor("run-1", null, {
           agentId: "agent-1",
           effectiveMaxConcurrentRuns,
