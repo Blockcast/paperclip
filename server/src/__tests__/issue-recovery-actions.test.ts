@@ -6827,6 +6827,89 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
     });
 
+    // The sixth branch below the kind guard, and the only carve-out member that had no
+    // coverage: an unresolved first-class blocker edge is a genuine wake path (the issue
+    // drains via `issue_blockers_resolved_sweep`), so it belongs with its siblings and the
+    // carve-out must cover it. This is a real behaviour change for this kind — before the
+    // fix a `blocked` source issue with unresolved blockers cancelled the action.
+    //
+    // Seeded by writing the `blocked` status and the blocker edge STRAIGHT TO THE DB, then
+    // triggering revalidation with the same MONITOR_ARM the primary case uses. Deliberately
+    // not a `PATCH {status:"blocked", blockedByIssueIds:[...]}`: that shape also drives the
+    // blocked-transition machinery at `routes/issues.ts:13279`, whose detached
+    // `getDependencyReadiness` continuation outlives the request and rejects unhandled once
+    // the fixture is truncated. That is a real pre-existing hazard in code this PR does not
+    // touch (reported separately) — seeding directly keeps this case a test of the
+    // classifier branch and nothing else.
+    async function blockSourceOnFreshIssue(fixture: Awaited<ReturnType<typeof seedPrNonConvergence>>) {
+      const blockerId = randomUUID();
+      await db.insert(issues).values({
+        id: blockerId,
+        companyId: fixture.companyId,
+        title: "Upstream blocker",
+        status: "todo",
+        priority: "medium",
+        issueNumber: 2,
+        identifier: `${fixture.prefix}-2`,
+      });
+      await db.insert(issueRelations).values({
+        companyId: fixture.companyId,
+        issueId: blockerId,
+        relatedIssueId: fixture.sourceIssueId,
+        type: "blocks",
+      });
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, fixture.sourceIssueId));
+      // An execution-policy write rather than MONITOR_ARM: a monitor cannot be armed on a
+      // `blocked` issue (422), and `executionPolicyChanged` is a durable source change in the
+      // same 9-flag OR, so it reaches the classifier identically.
+      return request(createApp())
+        .patch(`/api/issues/${fixture.sourceIssueId}`)
+        .send({ executionPolicy: { commentRequired: false } })
+        .expect(200);
+    }
+
+    it("keeps a pr_review_non_convergence action active when the source issue gains unresolved blockers", async () => {
+      const fixture = await seedPrNonConvergence("pr_review_non_convergence");
+      const { companyId, sourceIssueId, recoveryActionSvc, action } = fixture;
+
+      await blockSourceOnFreshIssue(fixture);
+
+      const [actionRow] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      expect(actionRow).toMatchObject({ status: "active", resolutionNote: null, resolvedAt: null });
+      expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({
+        id: action.id,
+        status: "active",
+      });
+    });
+
+    // Instrument check for the case above, and it is not optional. Both cases assert on a
+    // branch that only fires when `getDependencyReadiness` reports a live blocker, so if the
+    // seeded edge were malformed or invisible to that query the branch would never run and
+    // the case above would pass vacuously — green for the wrong reason. This arm proves the
+    // branch is reached, by pinning the note only it can write, and that `kind` is the sole
+    // thing that decides the outcome between the two.
+    it("still cancels a stranded_assigned_issue action when the source issue gains unresolved blockers", async () => {
+      const fixture = await seedPrNonConvergence("stranded_assigned_issue");
+      const { companyId, sourceIssueId, recoveryActionSvc, action } = fixture;
+
+      await blockSourceOnFreshIssue(fixture);
+
+      const [actionRow] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      expect(actionRow).toMatchObject({
+        status: "cancelled",
+        outcome: "cancelled",
+        resolutionNote:
+          "Recovery action became stale because the source issue now has unresolved first-class blockers.",
+      });
+      expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+    });
+
     // The carve-out keys on `kind`, which is MUTABLE: `upsertSourceScoped` holds one active
     // action per (companyId, sourceIssueId) and its existing-row UPDATE sets `kind:
     // input.kind` unconditionally. `shouldReuseStrandedRecoveryAction` gates reuse on
