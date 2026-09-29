@@ -103,6 +103,63 @@ test("PaperclipAgentPodUnschedulable keys on kube_pod_status_scheduled, not the 
   );
 });
 
+test("PaperclipGithubWorkflowRunMassCancellation is a scale-free ratio with a volume floor, not a count (BLO-21078)", () => {
+  const rendered = execFileSync(
+    "helm",
+    [
+      "template",
+      "paperclip",
+      "deploy/helm/paperclip",
+      "--namespace",
+      "paperclip",
+      "-f",
+      "deploy/helm/paperclip/values.blockcast.yaml",
+      "--show-only",
+      "templates/prometheusrule.yaml",
+      "--set",
+      "prometheusRule.enabled=true",
+    ],
+    { cwd: repoRoot, encoding: "utf8" },
+  );
+
+  assert.match(rendered, /alert: PaperclipGithubWorkflowRunMassCancellation/);
+
+  const expr = rendered.match(
+    /alert: PaperclipGithubWorkflowRunMassCancellation[\s\S]*?\n\s+expr: \|\n([\s\S]*?)\n\s+for:/,
+  )?.[1];
+  assert.ok(expr, "mass-cancellation alert must render an expr");
+
+  // The supersession selector carries ~92.8% of the noise reduction
+  // (measured 5,657 non-superseded vs 73,322 superseded on the live
+  // counters, 2026-09-29). Dropping it makes every force-push a page.
+  assert.match(
+    expr,
+    /conclusion="cancelled",supersession="none"/,
+    "mass-cancellation alert must exclude concurrency cancel-in-progress supersedes",
+  );
+
+  // A bare count cannot work here and this is the regression that matters.
+  // The `>= 3` count expression this replaced was true for 67.9% of a 7d
+  // window, because non-superseded cancellations scale with agent push
+  // rate. A ratio is scale-free; reverting to a count re-breaks the alert
+  // in the always-firing direction, which is indistinguishable from the
+  // alert being deleted.
+  assert.match(
+    expr,
+    /\/\s*\n?\s*clamp_min\(sum\(increase\(paperclip_github_workflow_run_conclusion_total\[15m\]\)\), 1\)/,
+    "mass-cancellation alert must divide by total completions (scale-free ratio), clamped against divide-by-zero at idle",
+  );
+  assert.match(expr, />=\s*0\.35/, "ratio threshold must be 0.35 (2.6x the observed 7d max of 13.6%)");
+
+  // Without the floor, 1 cancelled of 2 completions reads as 50% and pages
+  // on an idle repo — exactly when the ratio carries least information.
+  assert.match(
+    expr,
+    /and\s*\n?\s*sum\(increase\(paperclip_github_workflow_run_conclusion_total\[15m\]\)\) >= 8/,
+    "mass-cancellation alert must carry a minimum-volume floor so a near-idle repo cannot trip the ratio",
+  );
+});
+
 test("PaperclipGithubReviewRequestDeadLettered fires on any dead-lettered delivery and is silent at zero (BLO-18859)", () => {
   const rendered = execFileSync(
     "helm",
