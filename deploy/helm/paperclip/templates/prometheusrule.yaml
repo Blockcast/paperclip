@@ -499,7 +499,25 @@ spec:
         # meaningful. It counts the same non-superseded completions as the
         # denominator: counting all completions would let 1 cancelled + 1
         # success beside a 20-run force-push burst clear the floor and read
-        # as 50%. clamp_min guards division by zero at true idle.
+        # as 50%.
+        #
+        # clamp_min is defence in depth and is NOT load-bearing, so do not
+        # read it as the idle guard: the numerator is a label subset of the
+        # denominator, so x/0 with x>0 is unreachable, and at 0/0 the
+        # comparison yields NaN and filters out. The expression returns
+        # empty with and without it (both forms checked under promtool).
+        # `>= 8` is the operative guard.
+        #
+        # `for: 2m` is close to no debouncing here, and RAISING IT IS NOT AN
+        # AVAILABLE LEVER -- noted because it is the obvious knob to reach
+        # for if the margin above proves too thin. An increase() over [15m]
+        # holds a burst for the full width of the window, so a crossing
+        # cannot clear in 2m by construction: a single 1m burst of 25
+        # cancellations on steady 4/min traffic pins the ratio flat at 0.294
+        # for ~14m, then drops to 0 only when the burst leaves the window.
+        # Any `for:` shorter than the window is therefore equivalent. The
+        # sole defence against a transient non-incident spike is the
+        # threshold margin itself -- the 0.35-vs-0.317 gap disclosed above.
         - alert: PaperclipGithubWorkflowRunMassCancellation
           expr: |
             (
