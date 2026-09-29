@@ -7183,10 +7183,13 @@ export function resolveK8sRunIsolationIdentity(input: {
  * while `runningCount` collapses to 0, so `availableSlots = 1 - 0 = 1` and a
  * second run IS admitted at effective concurrency 1. In exactly that case
  * `agent-shared` was not a belt over braces -- it was the sole restraint, and
- * widening the key gives it up. That narrow loss is stated as a KNOWN GAP on
- * `resolveWorkspaceWriterTreeKey`; it needs a silent run AND an un-backfilled
- * issue, where the cross-agent case this buys needs no loophole at all and is
- * the measured default defect. The trade is deliberate, not an oversight.
+ * widening the key gives it up. That loss was originally stated as a KNOWN GAP
+ * on `resolveWorkspaceWriterTreeKey` needing a silent run AND an un-backfilled
+ * issue; BLO-37188 closed the second half by resolving a bind-time fallback
+ * workspace, so what is left keys null only when the run resolves to no project
+ * checkout at all -- and for the main such shape, `agent_default`, the run
+ * lands in the agent home, which is precisely the class `agent-shared:<agentId>`
+ * already names correctly. The trade is deliberate, not an oversight.
  *
  * The cost is real and deliberate: this serializes ALL issues of one project
  * workspace across ALL agents, because they are one mutable directory. That is
@@ -29989,6 +29992,44 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         legacyUseProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null,
         issueAdapterConfig: issueAssigneeOverrides?.adapterConfig ?? null,
       });
+    // BLO-37188: on an issue's FIRST run `issueRef.projectWorkspaceId` is still
+    // null -- it is backfilled from the realized workspace far below -- so the
+    // key above had nothing to bind to and the run went unexcluded. Reproduce
+    // here the selection `resolveWorkspaceForRun` will make with no preferred
+    // workspace: it passes the rows through
+    // `prioritizeProjectWorkspaceCandidatesForRun(rows, null)` unchanged, keeps
+    // every row a candidate (`isNonPrimaryWorkspaceTarget` is false without a
+    // preferred id), and takes the first that realizes. So this is the earliest
+    // row in creation order -- deliberately NOT
+    // `resolveProjectPrimaryWorkspaceId`, which consults `isPrimary` and would
+    // name a different workspace than the run lands in whenever a project flags
+    // a primary that is not its earliest row.
+    //
+    // Skipped for `agent_default`, which is the same condition the late path
+    // gates on (`useProjectWorkspace: requestedExecutionWorkspaceMode !==
+    // "agent_default"`): those runs consider no project workspace at all and
+    // resolve to the agent home, so keying them on a project tree they never
+    // touch would serialize unrelated agents for nothing.
+    const projectIdNeedingWorkspaceFallback =
+      paperclipPrReview === null &&
+      !issueRef?.projectWorkspaceId &&
+      requestedExecutionWorkspaceMode !== "agent_default"
+        ? executionProjectId ?? null
+        : null;
+    const projectWorkspaceFallbackId = projectIdNeedingWorkspaceFallback
+      ? await db
+          .select({ id: projectWorkspaces.id })
+          .from(projectWorkspaces)
+          .where(
+            and(
+              eq(projectWorkspaces.companyId, agent.companyId),
+              eq(projectWorkspaces.projectId, projectIdNeedingWorkspaceFallback),
+            ),
+          )
+          .orderBy(asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id))
+          .limit(1)
+          .then((rows) => rows[0]?.id ?? null)
+      : null;
     const perIssueWorkspaceTreeKey = resolveWorkspaceWriterTreeKey({
       statelessPrReview: paperclipPrReview !== null,
       runResolvesToOwnTree,
@@ -29996,6 +30037,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issue: issueRef
         ? { id: issueRef.id ?? null, projectWorkspaceId: issueRef.projectWorkspaceId ?? null }
         : null,
+      projectWorkspaceFallbackId,
     });
     const k8sIsolationIdentity = resolveK8sRunIsolationIdentity({
       adapterType: agent.adapterType,
