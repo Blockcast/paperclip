@@ -729,11 +729,21 @@ const MERGED_PR_FOR_HEAD_REF_PAGE_SIZE = 30;
 export function parseMergedPullRequestForHeadRef(body: unknown): MergedPullRequestForHeadRef {
   if (!Array.isArray(body)) return { outcome: "error", reason: "merged_pull_request_malformed" };
 
+  // One page is fetched, so a full page is not provably the whole answer: the
+  // merge that triggered this retarget can be on page 2 (a recycled branch name
+  // like `dev` reaches 30 closed PRs easily). Scanning the prefix would report
+  // `none`, or an older merge, for a read we could not complete, and `none`
+  // suppresses the wake. So a full page is unreadable, exactly as the invariant
+  // on `MergedPullRequestForHeadRef` requires.
+  if (body.length >= MERGED_PR_FOR_HEAD_REF_PAGE_SIZE) {
+    return { outcome: "error", reason: "merged_pull_request_truncated" };
+  }
+
   // A branch name can be reused, so `?head=` can legitimately return several
   // closed PRs. The most recently merged one is the one whose merge triggered
   // this retarget; ordering is taken from `merged_at` rather than from the
-  // response order, which GitHub sorts by `updated_at` (a later comment on an
-  // older PR is enough to reorder it).
+  // response order, which GitHub sorts by `created` descending (a PR opened
+  // earlier can merge later).
   let best: { prNumber: number; mergeCommitSha: string | null; mergedAtMs: number } | null = null;
   for (const entry of body as Array<Record<string, unknown>>) {
     const number = entry?.number;
