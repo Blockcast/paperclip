@@ -3102,6 +3102,15 @@ describeEmbeddedPostgres("productivity review service", () => {
     const refreshComments = await listRefreshComments(review!.id);
     expect(refreshComments.length).toBeGreaterThan(0);
     expect(refreshComments.at(-1)?.body).toContain(DEPENDENCY_LINE_ONE_BLOCKER);
+    // BLO-37560 (Ally suggestion on c69c6cdd): the compact comment was the one
+    // render site with no assertion at all, so its exempt-executed line could
+    // drift back to gap-sounding phrasing while the description's pin stayed
+    // green. Pin the property here too — the comment must tell the same story
+    // as the description it summarises.
+    expect(refreshComments.at(-1)?.body).toContain(
+      "Comment-policy-exempt runs that DID execute (eligible for the streak walk by design, not a gap):",
+    );
+    expect(refreshComments.at(-1)?.body).not.toContain("not excluded from the streak walk");
   });
 
   // BLO-22436: once the blocker resolves (or the edge is removed), the same
