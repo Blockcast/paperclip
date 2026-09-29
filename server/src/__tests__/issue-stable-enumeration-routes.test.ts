@@ -378,6 +378,31 @@ describeEmbeddedPostgres("issue list stable enumeration and exact counts", () =>
     expect(boardRes.body.count).toBe(5);
   });
 
+  it("counts through the walk's default page size when no test seam is injected", async () => {
+    // Both walk tests above inject `issueCountWalk.pageSize`, and every other actor in this
+    // file is a board actor that takes the single COUNT(*) without entering the walk. That
+    // leaves the `?? ISSUE_LIST_MAX_LIMIT` fallback serving every real restricted-actor
+    // request while being read by no test, so pass no routeOpts at all here.
+    //
+    // Two rows is enough, and deliberately fewer than one page: with the fallback they are a
+    // short first page and the walk returns on it. Without it `pageSize` is undefined,
+    // `rows.length < undefined` is false so the walk never short-returns, and the keyset
+    // branch dereferences `rows[rows.length - 1]!.id` on the empty second page — a 500 on
+    // every restricted-actor count. The broken default fails before it can return, so a
+    // single page discriminates and no multi-page fixture is needed.
+    const companyId = await seedCompany();
+    const agentId = await seedAgent(companyId);
+    const ids = await seedIssues(companyId, 2);
+    const scopedIssueId = ids[0]!;
+
+    const res = await request(createApp(companyId, skillTestActor(companyId, agentId, scopedIssueId)))
+      .get(`/api/companies/${companyId}/issues/count`)
+      .query({ status: "todo" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.count).toBe(1);
+  });
+
   it("rejects filters the general count cannot honor rather than counting a wider set", async () => {
     const companyId = await seedCompany();
     const res = await request(createApp(companyId))
