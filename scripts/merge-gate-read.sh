@@ -319,6 +319,27 @@ dead_runs() { # stdin: run rows -> stdout: alternation of stale run ids
   # victim decision into verdicts(). How often a later same-lane run drops a
   # name at one head is unmeasured; the mechanism is proven, the frequency is
   # not.
+  # Third residual, accepted: THE VICTIM TEST BELOW IS NARROWER THAN THE SET
+  # verdicts() EXEMPTS WITH IT, and the reuse is deliberately partial. This
+  # admits a victim only on `cancelled`/`failure`, while pending_runs() emits
+  # every conclusion outside `success`/`skipped`. So a run superseded by a later
+  # same-lane success whose conclusion is `startup_failure` / `timed_out` /
+  # `stale` / `action_required` / `neutral`, and which published nothing, is in
+  # the pend set, is NOT in DEAD, and prints a spurious NO-VERDICT for a lane
+  # that demonstrably spoke. Measured: runs 111 <conclusion> / 222 success in one
+  # pull_request lane -> `cancelled`/`failure` give DEAD=111 and print nothing;
+  # the other five give DEAD='' and print NO-VERDICT run=111.
+  # These two sets were disjoint by construction until BLO-37887 widened
+  # pending_runs() off `$6 != "completed"` onto the conclusion, so this is new
+  # surface, not a pre-existing residual. Direction is RED — it costs a wait,
+  # never a merge — and it was not found in the wild: 0 occurrences across 24
+  # heads (12 merged + 12 open, paperclip / onprem-k8s / Network-Operator-Portal).
+  # Mechanism proven, frequency not established, same footing as the two above.
+  # The fix is NOT to widen the victim test to match: every conclusion added here
+  # deletes more runs, which is the merge-authorizing direction, and would buy a
+  # measured-zero false RED with an unmeasured false GREEN. If it is ever seen in
+  # the wild, narrow verdicts() instead — recompute the exemption from the pend
+  # set rather than widening what dead_runs() deletes.
   awk -F'\t' 'BEGIN { n = 0 }   # n MUST be seeded: implicit is "" , not 0
               { key = $1 FS $2
                 if ($4 == "success" && $5 > newest_pass[key]) newest_pass[key] = $5
@@ -420,6 +441,10 @@ verdicts() { # $1 = DEAD alternation, $2 = PENDING rows (both may be empty)
             # alternation is reused verbatim rather than restated, on the same
             # grounds as the `contributed` predicate above: two encodings of one
             # question drift, and the drift reads correctly on each side alone.
+            # The reuse is only PARTIAL, and deliberately so: dead_runs() admits
+            # a victim on a narrower conclusion set than pending_runs() emits, so
+            # five conclusions fall through this exemption. Third residual in
+            # dead_runs() has the measurement and why widening it is refused.
             for (i = 1; i <= k; i++) if (!(prid[i] in contributed) \
                                          && prid[i] !~ ("^(" dead ")$"))
               printf "STOP\t<%s: run %s, no check-run published>\tNO-VERDICT\trun=%s\n", \
