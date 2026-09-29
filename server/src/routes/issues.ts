@@ -3059,6 +3059,16 @@ function logIssueListRequest(input: {
  * an error rather than as a request that never returns. A page cap backstops both, since
  * the blocked assertion compares consecutive pages and churn can differ them indefinitely.
  */
+/**
+ * Page-count ceiling for walkIssueListPages.
+ *
+ * Deliberately its own constant rather than a reuse of ISSUE_LIST_MAX_LIMIT, which is a
+ * rows-per-PAGE request limit: the two are unrelated dimensions that merely happen to share
+ * a value today. Tying them together would make the walk's row ceiling — their product —
+ * shrink quadratically if that request-facing limit were ever tuned down.
+ */
+export const WALK_MAX_PAGES = 1000;
+
 export async function walkIssueListPages<Row extends { id: string }>(
   fetchPage: (page: { offset?: number; afterId?: string }) => Promise<Row[]>,
   opts: { blocked: boolean; pageSize: number },
@@ -3071,12 +3081,13 @@ export async function walkIssueListPages<Row extends { id: string }>(
   // on page two, but the blocked one compares only the immediately previous page: a dropped
   // `offset` combined with churn at the head of the mutable activity order can serve
   // differing pages forever and slip past it. This cap cannot, and cannot false-positive
-  // either — at the production pageSize it admits a million rows before firing, and the
-  // walk's own caller caps a page at ISSUE_LIST_MAX_LIMIT.
-  const maxPages = ISSUE_LIST_MAX_LIMIT;
+  // either — the walk's own caller caps a page at ISSUE_LIST_MAX_LIMIT, so at that page size
+  // the ceiling is WALK_MAX_PAGES * ISSUE_LIST_MAX_LIMIT rows before firing.
   for (let page = 0; ; page += 1) {
-    if (page >= maxPages) {
-      throw new Error(`walkIssueListPages: exceeded ${maxPages} pages, so the walk is not terminating`);
+    if (page >= WALK_MAX_PAGES) {
+      throw new Error(
+        `walkIssueListPages: exceeded ${WALK_MAX_PAGES} pages, so the walk is not terminating`,
+      );
     }
     const rows = await fetchPage(opts.blocked ? { offset } : { afterId });
     await visit(rows);
