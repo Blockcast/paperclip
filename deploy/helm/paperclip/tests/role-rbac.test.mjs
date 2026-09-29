@@ -76,22 +76,29 @@ test("paperclip-k8s-adapters Role retains pods:get + pods:list (adapter log pref
   );
 });
 
-test("paperclip-k8s-adapters Role grants secrets:update for createOrAdoptRunSecret (BLO-31665 / PEN-3041)", () => {
-  // createOrAdoptRunSecret (vendor/paperclip-adapter-claude-k8s/src/server/
-  // execute.ts) recovers from a create 409 by calling replaceNamespacedSecret.
-  // That is a PUT, which the RBAC authorizer maps to `update` — NOT to the
-  // `patch` this Role already grants. Without `update` the adopt path 403s and
-  // the run dies exactly as it did before the fix, so #1678 ships but is inert.
-  // Measured in prod 2026-09-13: 7 runs, 4 agents, one 7h window, all failing
-  // on `cannot update resource "secrets"`.
+test("paperclip-k8s-adapters Role still grants secrets:update pending the BLO-34510 decision", () => {
+  // ORIGINAL REASON, NOW STALE — kept because it is the measurement, not the
+  // rationale: createOrAdoptRunSecret recovered from a create 409 by calling
+  // replaceNamespacedSecret, a PUT, which the RBAC authorizer maps to `update`
+  // and NOT to the `patch` this Role already grants. Measured in prod
+  // 2026-09-13: 7 runs, 4 agents, one 7h window, all failing on
+  // `cannot update resource "secrets"`.
   //
-  // Pin it so a future "tidy the verb list" edit cannot silently re-break the
-  // adoption path — the regression is invisible at install time (the SSAR
-  // self-test does not probe it) and only shows up on the ~1-in-40 collision.
+  // BLO-32424 converted that call site to a merge PATCH, so it no longer needs
+  // `update` and this test no longer pins what its name used to say. Do NOT
+  // read it as asserting that some caller still requires the verb — as of that
+  // change no in-release-namespace consumer of `update` is known to remain (see
+  // the justification block in templates/role.yaml for what was checked).
+  //
+  // What it pins now is narrower and still worth pinning: the verb set does not
+  // drift as a side effect of an unrelated edit. Retiring `update` is a stated
+  // decision tracked as BLO-34510, and that decision updates THIS test in the
+  // same change. Until then, an incidental "tidy the verb list" edit should
+  // still fail here rather than land unreviewed.
   const verbs = secretsVerbs(renderRole());
   assert.ok(
     verbs.includes("update"),
-    `secrets verbs must include "update" for createOrAdoptRunSecret's replaceNamespacedSecret (got: [${verbs.join(", ")}])`,
+    `secrets verbs must include "update" until BLO-34510 records the retirement decision (got: [${verbs.join(", ")}])`,
   );
 });
 
