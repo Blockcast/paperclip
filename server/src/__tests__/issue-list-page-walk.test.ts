@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { walkIssueListPages } from "../routes/issues.js";
+import { WALK_MAX_PAGES, walkIssueListPages } from "../routes/issues.js";
 
 const rows = Array.from({ length: 5 }, (_, index) => ({ id: `issue-${index}` }));
 
@@ -103,14 +103,20 @@ describe("walkIssueListPages", () => {
     // it. Every iteration awaits an already-resolved promise, so the loop never yields and
     // vitest's timer-based timeout cannot fire. Verified: uncapped, the mutation ran past
     // 90s with no output; capped, it fails on the wrong error in milliseconds.
+    //
+    // Both this bound and the expected message derive from WALK_MAX_PAGES so that tuning it
+    // cannot silently invert what a red run means. The guard checks `page >= WALK_MAX_PAGES`
+    // BEFORE fetching, so page indices 0..WALK_MAX_PAGES-1 issue exactly WALK_MAX_PAGES
+    // calls and the throw lands on the next iteration with no further call; +2 clears that.
+    const selfCap = WALK_MAX_PAGES + 2;
     let calls = 0;
     const neverEnding = async () => {
       calls += 1;
-      if (calls > 1002) throw new Error("walk ran past the page cap");
+      if (calls > selfCap) throw new Error("walk ran past the page cap");
       return [{ id: `row-${calls}-a` }, { id: `row-${calls}-b` }];
     };
     await expect(
       walkIssueListPages(neverEnding, { blocked: true, pageSize: 2 }, async () => {}),
-    ).rejects.toThrow(/exceeded 1000 pages/);
+    ).rejects.toThrow(new RegExp(`exceeded ${WALK_MAX_PAGES} pages`));
   });
 });
