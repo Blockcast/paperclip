@@ -59,7 +59,22 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     db = createDb(tempDb.connectionString);
   });
 
-  async function waitForHeartbeatIdle(timeoutMs = 3_000) {
+  // CI-load margin (PEN-3508), the same remedy #1792 applied under BLO-22985 —
+  // which widened a same-named `waitForHeartbeatIdle` from 5s to 15s in the
+  // heartbeat-workspace suites. This copy was missed and sits tighter still.
+  //
+  // The wait guards REAL agent runs against embedded Postgres. Timed from this
+  // suite's own agent.run.started/finished lines on a loaded host: 2s / 5s / 6s
+  // for the three runs it spawns — two of three already past a 3s budget, so it
+  // failed on load rather than on any defect in the code under test. Confirmed
+  // pre-existing by a matched two-arm run (master alone, and master + #1910:
+  // same test, same error, both arms).
+  //
+  // 30s is ~5x the observed 6s worst case, above #1792's ~2x rule because the
+  // costs are asymmetric: too long only makes a true hang surface slower (and
+  // the 60s testTimeout still bounds it), while too short produces false reds —
+  // the failure vitest.config.ts blames for ~21h of skipped deploys.
+  async function waitForHeartbeatIdle(timeoutMs = 30_000) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       const active = await db

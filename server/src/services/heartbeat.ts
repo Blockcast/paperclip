@@ -295,9 +295,11 @@ import {
 } from "./activity-log.js";
 import {
   githubFetchPrAuthorLogin,
+  githubGetPrRequiredStatusContext,
   githubGetPullRequestGate,
   githubHasReviewerEvidenceForPr,
   githubReviewerIdentityMatches,
+  type PrRequiredStatusContextLookup,
 } from "./github-app-auth.js";
 import { loadConfig } from "../config.js";
 import { enqueueGithubCommitStatusDelivery } from "./github-status-delivery-outbox.js";
@@ -510,7 +512,7 @@ import { PROVIDER_CAPACITY_MAX_HORIZON_MS } from "./provider-capacity-horizon-bo
 import { productivityReviewService } from "./productivity-review.js";
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run-handoff-state.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
-import { runDetachedFromAgentStartLock, withAgentStartLock } from "./agent-start-lock.js";
+import { LOCK_HELD_WARN_MS, runDetachedFromAgentStartLock, withAgentStartLock } from "./agent-start-lock.js";
 import {
   evaluateAgentInvokability,
   evaluateAgentInvokabilityFromDb,
@@ -10389,6 +10391,50 @@ export function resolvePrReviewGateStatusTarget(
 
 const PR_REVIEW_OUTPUT_EVIDENCE_MAX_CHARS = 240_000;
 
+/**
+ * One sentence saying whether the red gate this notice is about actually blocks
+ * the merge (PEN-3487).
+ *
+ * The notice already says a review did not land. What it never said is the fact
+ * that decides whether anyone should care, and that fact is **per repository**:
+ * measured 2026-09-24, `review/ally-complete` is required on
+ * `Blockcast/penstock-llm-proxy-core` (one of ten), required on nothing in
+ * `Blockcast/paperclip` (whose `master` requires exactly `verify`), and
+ * `Blockcast/onprem-k8s` requires no contexts at all. Same context name, opposite
+ * consequence, and nothing at the point of reading disambiguated them — which is
+ * how PEN-3487 came to be filed and escalated as a stuck merge pipeline on a PR
+ * that read `mergeable: true` the whole time.
+ *
+ * `unknown` is phrased as a refusal, not a reassurance. An unread gate is not a
+ * cleared gate, and the reader has to be able to tell those apart.
+ */
+export function describePrReviewGateMergeImpact(input: {
+  lookup: PrRequiredStatusContextLookup;
+  context: string;
+  repoFullName: string;
+}): string {
+  const { lookup, context, repoFullName } = input;
+  if (lookup.outcome === "required") {
+    const via = lookup.source === "ruleset"
+      ? " It is required by a repository or organization ruleset, which `branches/{branch}` does not report."
+      : "";
+    return `- Merge impact: \`${context}\` **is a required status check** on \`${repoFullName}\`'s \`${lookup.baseRef}\`, so this red gate does block merge there.${via}`;
+  }
+  if (lookup.outcome === "not_required") {
+    // Name the surfaces actually read. "Requires no status checks" is the most
+    // load-bearing sentence in this notice, and it is only honest because both
+    // classic protection and the rulesets in effect were read (PEN-3487).
+    const others = lookup.requiredContexts.length > 0
+      ? ` Required there: ${lookup.requiredContexts.map((name) => `\`${name}\``).join(", ")}.`
+      : lookup.branchProtected
+      ? " That branch is protected but requires no status checks, in either classic branch protection or any ruleset in effect."
+      : " That branch has no branch protection and no ruleset requires a status check on it.";
+    return `- Merge impact: \`${context}\` is **not a required status check** on \`${repoFullName}\`'s \`${lookup.baseRef}\`, so this red gate does not block merge there.${others}`;
+  }
+  const where = lookup.baseRef ? ` (\`${lookup.baseRef}\`)` : "";
+  return `- Merge impact: **unread** — Paperclip could not read branch protection for this PR's base${where} (\`${lookup.reason}\`), so whether \`${context}\` blocks merge on \`${repoFullName}\` is unknown here. Read it before assuming either way; the required set differs per repository.`;
+}
+
 function appendReviewOutputEvidenceText(parts: string[], value: unknown, budget: { remaining: number }) {
   if (budget.remaining <= 0 || value == null) return;
   if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
@@ -13006,6 +13052,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * reports a fact this server itself just derived, and agent-registered PR work
    * products are the common case (the Paperclip skill tells agents to create
    * one). Narrowing it here would drop most real links.
+   *
+   * The company filter IS intentional and stays (PEN-3487 asked). Both things
+   * this function does — posting an issue comment and waking an assignee — are
+   * tenancy-bound writes, and `run.companyId` is the only company this reviewer
+   * run is authorized to act in. Matching a work product across companies would
+   * mean writing into another tenant's issue on the strength of a PR number, and
+   * would leak the existence and head SHA of that tenant's PR to whoever reads
+   * this run. Neither is worth the reach.
+   *
+   * The consequence is real and worth naming rather than hiding: a PR whose
+   * reviewer run lives in company A but whose tracking issue lives in company B
+   * gets NO in-Paperclip notice — the GitHub commit status is the only signal
+   * there. That silence is now attributable: the no-linked-issue log below says
+   * the lookup was company-scoped and names the company it searched, so the case
+   * is greppable instead of indistinguishable from "this PR has no issue".
    */
   async function notifyLinkedIssuesOfFailedPrReviewGate(
     run: typeof heartbeatRuns.$inferSelect,
@@ -13040,8 +13101,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
     if (linked.length === 0) {
       logger.info(
-        { runId: run.id, repoFullName: target.repoFullName, prNumber: target.prNumber },
-        "failed PR-review gate has no linked Paperclip issue to notify",
+        {
+          runId: run.id,
+          companyId: run.companyId,
+          companyScoped: true,
+          repoFullName: target.repoFullName,
+          prNumber: target.prNumber,
+        },
+        "failed PR-review gate has no linked Paperclip issue in the reviewer run's company to notify",
       );
       return;
     }
@@ -13050,6 +13117,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const cause = reason === "retry_exhausted"
       ? "exhausted its automatic retries"
       : "ended ambiguously and was not replayed";
+    // PEN-3487: read whether this context actually gates merge on THIS repo's
+    // base branch. Deliberately after the linked-issue lookup, so a notice with
+    // nobody to tell costs no GitHub calls. Fail-soft by construction — the
+    // lookup returns `unknown` rather than throwing, and an unknown prints as a
+    // refusal to say, never as an all-clear.
+    const mergeImpact = describePrReviewGateMergeImpact({
+      lookup: await githubGetPrRequiredStatusContext({
+        repoFullName: target.repoFullName,
+        prNumber: target.prNumber,
+        context: target.context,
+      }).catch((error): PrRequiredStatusContextLookup => {
+        logger.warn(
+          { err: error, repoFullName: target.repoFullName, prNumber: target.prNumber },
+          "failed to read required-status-check configuration for a failed PR-review gate",
+        );
+        return { outcome: "unknown", reason: "required_context_lookup_threw" };
+      }),
+      context: target.context,
+      repoFullName: target.repoFullName,
+    });
     const body = [
       `## Ally review did not land on \`${target.repoFullName}#${target.prNumber}\``,
       "",
@@ -13067,6 +13154,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       "",
       `- Head: \`${target.sha}\``,
       `- Gate status: \`${target.context}\` set to \`failure\` on that commit`,
+      mergeImpact,
       ...(target.prUrl ? [`- PR: ${target.prUrl}`] : []),
       `- Reviewer run: \`${run.id}\``,
       "",
@@ -18872,12 +18960,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logger.warn(
           {
             index: "heartbeat_runs_crash_recovery_pending_idx",
-            // Which caller probed. The two run concurrently within a tick —
-            // the gauge publisher is tracked without `await` and the gate
-            // probes later in the same tick — and the latch above can be read
-            // as `false` by both before either sets it, so the absent
-            // TRANSITION can legitimately emit two lines. Tagging them is
-            // what stops an operator reading that as two distinct failures.
+            // Which caller probed. NOT a double-warn tag on THIS branch: the
+            // latch read and write above sit in one synchronous block with no
+            // `await` between them, and setCrashRecoveryCandidateIndexPresent
+            // is synchronous (metrics.ts), so on a single-threaded event loop
+            // the latch is atomic and the absent TRANSITION emits exactly one
+            // line per episode no matter which caller wins. Where the tag
+            // earns its place is the `catch` path below: that has no latch at
+            // all, so an unreadable catalog genuinely warns once per caller
+            // per tick, and `source` is what stops an operator reading those
+            // two lines as two distinct failures.
             source,
             remediation:
               "CREATE INDEX CONCURRENTLY heartbeat_runs_crash_recovery_pending_idx ON heartbeat_runs USING btree (finished_at, id) WHERE error_code = 'worker_crashed' AND crash_recovery_completed_at IS NULL",
@@ -21683,11 +21775,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * including another run of this same agent or a future persisted status — is a
    * run this wake would lose to.
    *
-   * Deliberately still counted as actionable: an issue whose blockers are
-   * unresolved. `checkout()` 422s on those, so they are not workable either, but
-   * suppressing their wakes would remove the only path by which an agent notices
-   * and escalates an ageing blocker. Unavailable-because-busy is transient;
-   * unavailable-because-blocked needs someone to look.
+   * BLO-36317: a `todo` issue with unresolved blockers is likewise not
+   * actionable. BLO-19749 deliberately kept those counted, on the reasoning that
+   * suppressing their wakes "would remove the only path by which an agent
+   * notices and escalates an ageing blocker". That premise was wrong in two
+   * ways. It is not the only path — `issue-graph-liveness` raises an ageing
+   * blocker against `stalled_blocker_assignee`, which routes to the *blocker's*
+   * owner, the one party that can move it; waking the blocked lane cannot.
+   * And it overrode an explicit opt-in: `skipTimerWhenNoActionableWork` is
+   * default-off, so an agent that sets it has already asked not to be woken for
+   * work it cannot pick up. Measured cost of the override on one lane: 9 Opus
+   * runs in a day, each exiting with a restatement of an unchanged blocker
+   * signature, 16 consecutive such wakes in total.
+   *
+   * Scoped to `todo` only. A blocked `in_progress` issue stays actionable: it
+   * may still need its assignee awake to hand off, finish a partial, or unpark
+   * itself, and over-suppression is the direction BLO-19749's guards exist to
+   * prevent.
+   *
+   * Readiness comes from `listDependencyReadiness()` rather than a hand-rolled
+   * blocker join so the predicate agrees with `checkout()` exactly — including
+   * a `cancelled` blocker (unresolved until the edge is removed) and the
+   * workspace-finalize barrier, where a blocker that IS `done` still gates.
    */
   async function hasActionableTimerWork(agent: typeof agents.$inferSelect) {
     const heldByNonReapableRun = exists(
@@ -21716,8 +21825,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ),
         ),
     );
-    const row = await db
-      .select({ id: issues.id })
+    const candidates = await db
+      .select({ id: issues.id, status: issues.status })
       .from(issues)
       .where(
         and(
@@ -21728,10 +21837,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           inArray(issues.status, [...TIMER_ACTIONABLE_ISSUE_STATUSES]),
           not(heldByNonReapableRun),
         ),
-      )
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
-    return Boolean(row);
+      );
+    if (candidates.length === 0) return false;
+    // `in_progress` is status-only by design — see the docblock.
+    if (candidates.some((row) => row.status !== "todo")) return true;
+
+    const todoIssueIds = candidates.map((row) => row.id);
+    const readiness = await issuesSvc.listDependencyReadiness(agent.companyId, todoIssueIds);
+    return todoIssueIds.some(
+      (issueId) => (readiness.get(issueId)?.unresolvedBlockerIssueIds ?? []).length === 0,
+    );
   }
 
   async function markTimerHeartbeatChecked(agentId: string, source: WakeupOptions["source"]) {
@@ -27699,7 +27814,43 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       const policy = parseHeartbeatPolicy(agent);
       if (hasExternalLifecycle(agent.adapterType)) {
-        await reapOrphanedRuns({ suppressDispatchAfterReap: true });
+        // BLO-35878: time this. This is the only `reapOrphanedRuns` call site
+        // inside the agent start lock, and the sweep is NOT agent-scoped: it
+        // sweeps every `running` run in the instance, issuing per-run k8s reads
+        // and writes. So every external-lifecycle agent's dispatch pass pays a
+        // full cluster-wide sweep, and N concurrently-dispatching agents run N
+        // redundant copies of it against one API server and one DB pool.
+        //
+        // Not covered here: the startup reap and the periodic scheduler tick's
+        // reap (both in `index.ts`) run outside the lock and are not timed.
+        // `reapOrphanedRuns` has no in-flight latch, so the tick's sweep can run
+        // concurrently with this one, and a large `reapMs` below can mean this
+        // sweep was contending with it for the same k8s API and DB pool rather
+        // than being slow on its own. This line cannot separate those two.
+        //
+        // The hold gauge (`paperclip_agent_start_lock_held_seconds`) reports the
+        // section's total duration with no breakdown, which is why a 245–1586 s
+        // regression was attributed to hindsight recall — recall runs in the
+        // out-of-process plugin worker off the `plugin_event_outbox`, and
+        // nothing on this path awaits it. This line is the discriminator: a reap
+        // that alone exceeds the lock's warn budget names itself in the log next
+        // to the hold it caused.
+        //
+        // Timed in `finally` so a sweep that stalls and then throws (its first
+        // `running` select sits outside its per-stage catches, so a slow pool
+        // acquire that rejects propagates) still logs its duration.
+        const reapStartedAtMs = Date.now();
+        try {
+          await reapOrphanedRuns({ suppressDispatchAfterReap: true });
+        } finally {
+          const reapMs = Date.now() - reapStartedAtMs;
+          if (reapMs >= LOCK_HELD_WARN_MS) {
+            logger.warn(
+              { agentId, reapMs, warnAfterMs: LOCK_HELD_WARN_MS },
+              "orphan reap alone exceeded the agent start lock budget; it is holding dispatch for this agent",
+            );
+          }
+        }
       }
       // BLO-12990 Fix #1 / BLO-20775: stale/silent running runs must not block new
       // high-priority work. Fetch full run rows so `isRunOccupyingSlot` can partition
@@ -35136,7 +35287,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // did: the park outlives the reason it was created.
     if (policy.skipTimerWhenNoActionableWork && genericTimerWake && !(await hasActionableTimerWork(agent))) {
       await writeSkippedHeartbeatRequest("heartbeat.timer.no_actionable_work", {
-        reason: "No assigned todo or in_progress issue requires this agent before timer adapter invocation.",
+        reason: "No assigned todo or in_progress issue is available to this agent before timer adapter invocation.",
       });
       await markTimerHeartbeatChecked(agentId, source);
       return null;
