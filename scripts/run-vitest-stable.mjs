@@ -62,6 +62,14 @@ const generalWorkspacesBGroupName = "general-workspaces-b";
 const generalWorkspacesAProjects = ["@paperclipai/ui", "paperclipai"];
 const generalWorkspacesBProjects = nonServerProjects.filter((project) => !generalWorkspacesAProjects.includes(project));
 const generalGroupNames = [generalServerGroupName, generalWorkspacesAGroupName, generalWorkspacesBGroupName];
+// Unlike the timeout budgets below, these two ARE effective from the root CLI.
+// Measured on Vitest 4.1.11 against a `projects: [...]` root config, two 2s test
+// files in one project, invoked as `vitest run --project p1`: without flags the
+// files overlap 1906ms (parallel), with these flags they do not overlap at all
+// (serial). The same probe reproduced `--hookTimeout=60000` being ignored, so
+// the difference is real and not a broken harness -- Vitest scopes worker/pool
+// options to the run and timeout budgets to the project. Do not "fix" this
+// array by copying it into cli/vitest.config.ts (BLO-37369 review).
 const serializedServerVitestArgs = [
   "--no-file-parallelism",
   "--maxWorkers=1",

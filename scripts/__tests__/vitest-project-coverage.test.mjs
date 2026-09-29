@@ -340,6 +340,12 @@ test("UNEXECUTED_WITH_TESTS has no stale entries", () => {
 // workspaces-b package config fails the second. Note that asserting the flags
 // are PRESENT in the driver args is not a guard -- that assertion passed for
 // the entire period the flags were inert.
+//
+// Both assert DECLARATION, not EFFECT: they would stay green if Vitest's
+// precedence changed under us. That is a deliberate trade -- the effect test is
+// the 12s-`beforeEach` probe in BLO-37369, and paying 12s of ARC wall-clock on
+// every run to re-derive a fixed upstream behaviour costs more than the failure
+// mode it covers. Re-run the probe by hand when bumping Vitest's minor.
 // ---------------------------------------------------------------------------
 
 const ARC_TEST_TIMEOUT_MS = 30_000;
