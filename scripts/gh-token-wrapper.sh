@@ -8,10 +8,12 @@
 # so it has one source of truth and can be exercised directly by
 # scripts/gh-token-wrapper.test.mjs without reimplementing the logic in JS.
 #
-# Falls back to the unmodified binary when the token file is absent/empty,
-# so non-agent uses of the image (or a build where the secret was never
-# mounted) are unaffected — this is not a hard dependency on the file
-# existing.
+# Falls back to the unmodified binary when the token file is absent/empty *and*
+# PAPERCLIP_GITHUB_TOKEN_FILE is unset, so non-agent uses of the image (or a
+# build where the secret was never mounted) are unaffected — this is not a hard
+# dependency on the file existing. When that variable IS set the caller has
+# named a credential, so the same conditions are refused with exit 64 instead
+# of being silently downgraded to ambient auth (BLO-37977).
 #
 # A second, volume-free delivery path exists for credentials bound per-agent
 # rather than mounted fleet-wide: see GH_SEAT_TOKEN_VALUE below.
@@ -172,8 +174,50 @@ if [ "${GH_SEAT_TOKEN_VALUE+x}" = x ]; then
   exec_real_gh "$@"
 fi
 
+# BLO-37977: every branch below other than the happy path used to fall through
+# to `gh` under whatever ambient auth the caller inherited — which inside an
+# agent pod is none — and two of them did so printing nothing at all. A
+# fleet-wide credential fault therefore presented as `gh` quietly doing nothing
+# on a pod that reported healthy, and cost a PR review that was never performed.
+#
+# When PAPERCLIP_GITHUB_TOKEN_FILE is set, the caller has *named* the credential
+# it wants, so a missing/unreadable/empty file is a misconfiguration: refuse,
+# exactly as the GH_SEAT_TOKEN_VALUE branch above already does. When it is unset
+# we are on the compiled-in default and the historical fallback stands, so
+# non-agent uses of the image (the case the header comment describes) keep
+# working unchanged.
+require_token_file() { [ "${TOKEN_FILE_REQUIRED}" = yes ]; }
+
+TOKEN_FILE_REQUIRED=no
+if [ "${PAPERCLIP_GITHUB_TOKEN_FILE+x}" = x ]; then
+  TOKEN_FILE_REQUIRED=yes
+  case "${1:-} ${2:-}" in
+    # The two commands that REPAIR a broken credential state. Refusing them for
+    # want of a credential would be circular, and they configure auth rather
+    # than querying GitHub, so the wrong-answer harm this refusal exists to
+    # prevent does not apply to them. Note `auth git-credential` is deliberately
+    # NOT exempt: git resolving a remote is a real query, and a silent anonymous
+    # fallback there is half of what BLO-37977 was.
+    "auth setup-git" | "auth login") TOKEN_FILE_REQUIRED=no ;;
+  esac
+fi
+
+# Never echoes the token, only the path — which is not itself secret.
+reject_token_file() {
+  echo "gh-token-wrapper: PAPERCLIP_GITHUB_TOKEN_FILE is set but ${TOKEN_FILE} ${1}; refusing to run with ambient auth" >&2
+  exit 64
+}
+
 if [ -r "${TOKEN_FILE}" ]; then
   TOKEN="$(tr -d '\r\n' < "${TOKEN_FILE}" 2>/dev/null || true)"
+  # `tr -d '\r\n'` strips line terminators but leaves spaces/tabs, so a
+  # whitespace-only file would otherwise export a whitespace GH_TOKEN and
+  # authenticate as nobody-in-particular. Fold it into the empty case rather
+  # than adding a branch — same refusal the GH_SEAT_TOKEN_VALUE arm makes.
+  case "${TOKEN}" in
+    *[![:space:]]*) ;;
+    *) TOKEN="" ;;
+  esac
   if [ -n "${TOKEN}" ]; then
     # Deliberately overrides any GH_TOKEN/GITHUB_TOKEN the caller already
     # set, not just supplements an unset one. Plain `gh` prefers an
@@ -186,6 +230,8 @@ if [ -r "${TOKEN_FILE}" ]; then
     # from stock `gh`, worth this comment so it isn't a surprise.
     export GH_TOKEN="${TOKEN}"
     export GITHUB_TOKEN="${TOKEN}"
+  elif require_token_file; then
+    reject_token_file "is empty"
   fi
 elif [ -e "${TOKEN_FILE}" ]; then
   # Distinguish "file exists but isn't readable" (a permissions
@@ -194,7 +240,12 @@ elif [ -e "${TOKEN_FILE}" ]; then
   # is exactly the class of silent failure BLO-13241 itself was: it's
   # worth a signal at the point of failure rather than waiting on the
   # external github-cli-probe alert (onprem-k8s#1077) to notice.
+  if require_token_file; then
+    reject_token_file "exists but is not readable"
+  fi
   echo "gh-token-wrapper: ${TOKEN_FILE} exists but is not readable; falling back to unwrapped auth" >&2
+elif require_token_file; then
+  reject_token_file "is absent"
 fi
 
 exec_real_gh "$@"
