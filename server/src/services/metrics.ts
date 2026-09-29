@@ -129,6 +129,13 @@ export const HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC = "paperclip_heartbeat_rec
  * tick got far enough to say so, rather than "no pass outstanding as of the last
  * tick that got far enough to say".
  *
+ * That timer samples at a FRACTION of `heartbeatSchedulerIntervalMs`
+ * (`max(1s, interval / 3)`), deliberately finer than the threshold above:
+ * sampling at the same period as the quantity being thresholded would let this
+ * gauge lag the actual overlap crossing by up to a full interval. Treat that
+ * fraction as the resolution of the alert — a crossing is visible within one
+ * sample, not within one scheduler tick.
+ *
  * Scope, so that `0` is not read more broadly than it holds: this covers the
  * *periodic* chain only, which is what the metric name says. The startup
  * recovery sequence runs several of the same reconcilers outside the latch, and
@@ -150,6 +157,13 @@ export const HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC = "paperclip_heartbeat_rec
  * this state persists until the chain returns or the process restarts.
  *
  * **Page on this.** It is rare by design and it does not resolve itself.
+ *
+ * The companion `error` log ("periodic heartbeat recovery chain still in flight
+ * across many ticks") reports the first crossing immediately and then re-reports
+ * at most once per stall threshold while the halt lasts. So log-line count is a
+ * measure of DURATION, not of severity or of how many passes stalled — read the
+ * count off this counter, and read "how long" off `inFlightMs` on the newest
+ * line.
  */
 export const HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC = "paperclip_heartbeat_recovery_chain_stalled_total";
 
