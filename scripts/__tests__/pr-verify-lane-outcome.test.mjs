@@ -656,6 +656,54 @@ test("the body is bounded by step `number`, not by array position", async () => 
   );
 });
 
+// The guard on that sort, pinned separately. Reverting the sort itself fails
+// the test above, but REMOVING the `Number.isFinite` guard — sorting
+// unconditionally — left the whole suite green, so nothing held it. It is not
+// decorative: a comparator returning `NaN` is specified to compare EQUAL
+// (`SortCompare`), so a partially-numbered list does not throw, it interleaves
+// silently.
+test("a partially-numbered step list keeps declaration order rather than interleaving", async () => {
+  const { classifyJobFailure } = await import("../classify-lane-failures.mjs");
+
+  // The hazard shape: the array is NOT in `number` order (the postamble is
+  // rendered before the last declared step) AND one step carries no `number`
+  // at all. Both halves are needed — a partially-numbered list that already
+  // happens to be in order is unaffected, because `Array.prototype.sort` is
+  // stable and every NaN comparison reads as "equal", so it moves nothing.
+  //
+  // With the guard, the key is not present throughout, so declaration order is
+  // kept: `Complete job` is not in the trailing run, lands in the body at
+  // `success`, and the all-skipped test declines — "reported", which is the
+  // pre-sort behaviour this replaced.
+  //
+  // Without it, the partial sort displaces `Complete job` to the end where it
+  // IS stripped as postamble, the remaining body reads all-skipped, and the job
+  // is excused as an infrastructure kill. That is the unsafe direction, and it
+  // is the only direction this guard runs in: over all 120 orderings of this
+  // five-step shape crossed with each choice of missing `number`, the 109
+  // inputs whose verdict the guard changes ALL move guarded-"reported" →
+  // unguarded-"infrastructure". The guard never excuses something the sort
+  // would have reported; it only declines to excuse on evidence it cannot
+  // order.
+  assert.equal(
+    classifyJobFailure(
+      {
+        ...PRE_BODY_KILLED_JOB,
+        steps: [
+          { name: "Set up job", conclusion: "success" },
+          { number: 2, name: "Set up runner", conclusion: "failure" },
+          { number: 3, name: "Checkout repository", conclusion: "skipped" },
+          { number: 5, name: "Complete job", conclusion: "success" },
+          { number: 4, name: "Run grouped general test suites", conclusion: "skipped" },
+        ],
+      },
+      PRE_BODY_KILLED_ANNOTATIONS,
+    ),
+    "reported",
+    "a step list that cannot be ordered must not be excused on a silently interleaved body",
+  );
+});
+
 // A lane declaring `container:` / `services:` gets an `Initialize containers`
 // step, which is in NEITHER name set. Both consequences are asserted here
 // because the module's scope note claims them and an earlier revision of that
@@ -665,42 +713,86 @@ test("a container lane classifies on the container step, with no special-casing"
 
   // Step shape measured on `postgres-tests (heavy 3/4)` in
   // `Blockcast/penstock-llm-proxy-core` (job 104214352274): the preamble is
-  // three steps, not two.
-  const containerLaneSteps = (containerConclusion, runnerConclusion) => [
+  // three steps, not two, AND the postamble is two, not one — that job renders
+  // `24:Stop containers` before `25:Complete job`. An earlier revision of this
+  // fixture omitted the teardown step while citing this same job as its
+  // measured shape, so it asserted over a step list that does not occur and
+  // passed for a reason it did not test.
+  //
+  // `stopConclusion` is a parameter rather than a constant because it is the
+  // half nobody has measured: a container lane killed BEFORE `Initialize
+  // containers` has not been observed, so whether its teardown step renders
+  // `skipped` or `success` is unknown. On the cancelled container jobs that
+  // HAVE been measured (100900589400 / 100896100309 in that repo) it is
+  // `success` even with the declared steps around it `skipped`. Asserting over
+  // both renderings is what keeps the verdict from depending on that unknown.
+  const containerLaneSteps = (containerConclusion, runnerConclusion, stopConclusion) => [
     { number: 1, name: "Set up job", conclusion: "success" },
     { number: 2, name: "Set up runner", conclusion: runnerConclusion },
     { number: 3, name: "Initialize containers", conclusion: containerConclusion },
     { number: 4, name: "Checkout repository", conclusion: "skipped" },
     { number: 5, name: "Run grouped general test suites", conclusion: "skipped" },
-    { number: 6, name: "Complete job", conclusion: "success" },
+    { number: 98, name: "Stop containers", conclusion: stopConclusion },
+    { number: 99, name: "Complete job", conclusion: "success" },
   ];
 
   // A real pre-body kill: the container step is skipped alongside the declared
   // steps, so it does not defeat the all-skipped test and the signal still
-  // fires. This is the inferred half of the scope note — if GitHub ever
-  // renders a killed container step as something other than `skipped`, this
-  // assertion is where that shows up.
-  assert.equal(
-    classifyJobFailure(
-      { ...PRE_BODY_KILLED_JOB, steps: containerLaneSteps("skipped", "failure") },
-      PRE_BODY_KILLED_ANNOTATIONS,
-    ),
-    "infrastructure",
-    "a container lane killed in the preamble observed no more of the diff than any other lane",
-  );
+  // fires — under EITHER teardown rendering. Without `Stop containers` in
+  // RUNNER_POSTAMBLE_STEP_NAMES the `success` case returns "reported", so this
+  // loop is what pins that name into the set; drop it and the `success`
+  // iteration fails.
+  for (const stopConclusion of ["success", "skipped"]) {
+    assert.equal(
+      classifyJobFailure(
+        { ...PRE_BODY_KILLED_JOB, steps: containerLaneSteps("skipped", "failure", stopConclusion) },
+        PRE_BODY_KILLED_ANNOTATIONS,
+      ),
+      "infrastructure",
+      `a container lane killed in the preamble observed no more of the diff than any other lane (Stop containers: ${stopConclusion})`,
+    );
+  }
 
   // The diff-controlled half: a bad image named by the PR fails at
   // `Initialize containers`, which is in the body and is not excusable. It
   // must keep the ordinary failure wording with no name added to either set —
   // excusing it would announce a defect the PR really did introduce as a pool
-  // kill.
+  // kill. Asserted under both teardown renderings for the same reason: naming
+  // `Stop containers` as postamble must not have widened what gets excused.
+  for (const stopConclusion of ["success", "skipped"]) {
+    assert.equal(
+      classifyJobFailure(
+        { ...PRE_BODY_KILLED_JOB, steps: containerLaneSteps("failure", "success", stopConclusion) },
+        [{ annotation_level: "failure", message: "Failed to pull image: manifest unknown" }],
+      ),
+      "reported",
+      `a \`container:\` image the diff chose is the diff's own failure, not infrastructure (Stop containers: ${stopConclusion})`,
+    );
+  }
+
+  // The postamble collision, asserted so the asymmetry in the module comment
+  // cannot drift: a DECLARED trailing step named `Stop containers` is absorbed
+  // into the postamble by name, exactly like the preamble residual — but it is
+  // NOT excused, because the name is absent from
+  // EXCUSABLE_SETUP_FAILURE_STEP_NAMES and its `failure` conclusion is read off
+  // the raw step list, which the postamble exclusion never touches. This is the
+  // one direction in which naming a step is safe.
   assert.equal(
     classifyJobFailure(
-      { ...PRE_BODY_KILLED_JOB, steps: containerLaneSteps("failure", "success") },
-      [{ annotation_level: "failure", message: "Failed to pull image: manifest unknown" }],
+      {
+        ...PRE_BODY_KILLED_JOB,
+        steps: [
+          { number: 1, name: "Set up job", conclusion: "success" },
+          { number: 2, name: "Set up runner", conclusion: "success" },
+          { number: 3, name: "Checkout repository", conclusion: "skipped" },
+          { number: 4, name: "Stop containers", conclusion: "failure" },
+          { number: 5, name: "Complete job", conclusion: "success" },
+        ],
+      },
+      [{ annotation_level: "failure", message: "Process completed with exit code 1." }],
     ),
     "reported",
-    "a `container:` image the diff chose is the diff's own failure, not infrastructure",
+    "a postamble name collision must not become excusable — only the preamble set feeds the excuse",
   );
 });
 
