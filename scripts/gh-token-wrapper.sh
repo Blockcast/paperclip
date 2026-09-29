@@ -195,16 +195,27 @@ if [ "${PAPERCLIP_GITHUB_TOKEN_FILE+x}" = x ]; then
     # The two commands that REPAIR a broken credential state. Refusing them for
     # want of a credential would be circular, and they configure auth rather
     # than querying GitHub, so the wrong-answer harm this refusal exists to
-    # prevent does not apply to them. Note `auth git-credential` is deliberately
-    # NOT exempt: git resolving a remote is a real query, and a silent anonymous
-    # fallback there is half of what BLO-37977 was.
+    # prevent does not apply to them.
     "auth setup-git" | "auth login") TOKEN_FILE_REQUIRED=no ;;
+    # Local-only commands (bare `gh` prints usage) never contact GitHub, so no
+    # credential can make their answer wrong. `gh --version` is also the first
+    # thing a human or a probe runs to decide whether the binary works at all,
+    # which is exactly when refusing it would mislead.
+    "--version "* | "version "* | "--help "* | "-h "* | "help "* | "completion "* | " ") TOKEN_FILE_REQUIRED=no ;;
+    # `auth git-credential` is deliberately NOT exempt: git resolving a remote
+    # is a real query, so it gets the stderr diagnostic at the point of failure.
+    # That is all it gets. git ignores a credential helper's non-zero exit and
+    # carries on with no credentials, so an anonymous fetch/clone of a public
+    # repo still succeeds silently; this refusal does not prevent that.
   esac
 fi
 
 # Never echoes the token, only the path — which is not itself secret.
+# A caller's own GH_TOKEN/GITHUB_TOKEN is refused here too (the file branch
+# never honours them, see the override below), so the message names the
+# override that does work: the value branch above runs before this one.
 reject_token_file() {
-  echo "gh-token-wrapper: PAPERCLIP_GITHUB_TOKEN_FILE is set but ${TOKEN_FILE} ${1}; refusing to run with ambient auth" >&2
+  echo "gh-token-wrapper: PAPERCLIP_GITHUB_TOKEN_FILE is set but ${TOKEN_FILE} ${1}; refusing to run with ambient auth. GH_TOKEN/GITHUB_TOKEN are not used as a fallback; to run under a specific token, set GH_SEAT_TOKEN_VALUE" >&2
   exit 64
 }
 
