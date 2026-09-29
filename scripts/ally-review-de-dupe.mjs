@@ -30,7 +30,10 @@
  *      opposite conclusions at one head (BLO-19778, #876) is a supersession
  *      decision with a blocker behind it — see the merge-token dismissal step
  *      in the Ally bundle — not a duplicate. Silently dismissing one side
- *      would pick a winner by clock order.
+ *      would pick a winner by clock order. "Verdict" is the review `state`
+ *      AND whether the body carries a blocking finding: on an App-authored PR
+ *      GitHub bars the author from APPROVE, so a clean and a blocking
+ *      self-review are both COMMENTED and only the body tells them apart.
  *
  *   3. Unorderable input is refused. If "newest" cannot be established the
  *      failure mode is precisely the defect above, so this fails closed and
@@ -41,7 +44,13 @@
  * not a duplicate to tidy away.
  */
 
-import { allyReviewLane, attestedHead, isMainModule } from "./check-ally-review-consistency.mjs";
+import {
+  allyReviewLane,
+  canonicalReviewHead,
+  hasBlockingFindings,
+  hasStillPresentDisposition,
+  isMainModule,
+} from "./check-ally-review-consistency.mjs";
 
 const OPERATIVE_EXCLUDED_STATES = new Set(["DISMISSED", "PENDING"]);
 
@@ -49,20 +58,30 @@ function reviewState(review) {
   return String(review?.state ?? "UNKNOWN").toUpperCase();
 }
 
+/** The guard's blocking-verdict test (I1/I2), composed from its exported parts. */
+function isBlocking(review) {
+  return hasBlockingFindings(review?.body) || hasStillPresentDisposition(review?.body);
+}
+
 function submittedAt(review) {
   return Date.parse(review?.submitted_at ?? "");
 }
 
 /**
- * Operative App-lane Ally reviews whose body attests `headSha`.
+ * Operative App-lane Ally reviews whose canonical body attests `headSha`.
  *
  * Mirrors `operativeAllyReviews` except for the matching key: that one groups
  * by `commit_id` because I3 separately asserts the two agree, and a
  * disagreement there is the violation it wants to report. Here a disagreement
  * must not be reported, it must be survived — so the immutable field wins.
+ *
+ * The body is read through `canonicalReviewHead`, not `attestedHead`: a body
+ * with two attestations or no consolidated-review heading is what I3 reports
+ * as "not canonical", and admitting one here would let it be retained as the
+ * newest while the genuine review is dismissed.
  */
 export function exactHeadAppReviews(reviews, headSha) {
-  // No shape check on `headSha`: `attestedHead` only ever yields a 40-hex
+  // No shape check on `headSha`: `canonicalReviewHead` only ever yields a 40-hex
   // string or null, so comparing against it already rejects an abbreviated,
   // empty, or over-long head by returning no candidates. A regex here looked
   // like a guard but could not change any outcome — mutation-testing it
@@ -72,7 +91,7 @@ export function exactHeadAppReviews(reviews, headSha) {
     (review) =>
       allyReviewLane(review?.user) === "app" &&
       !OPERATIVE_EXCLUDED_STATES.has(reviewState(review)) &&
-      attestedHead(review?.body) === head,
+      canonicalReviewHead(review?.body) === head,
   );
 }
 
@@ -85,6 +104,13 @@ export function exactHeadAppReviews(reviews, headSha) {
  *   none                  — no operative exact-head App review.
  *   no-duplicate          — exactly one; nothing to clean up.
  *   conflicting-verdicts  — candidates disagree; a supersession decision.
+ *                           (State, or whether the body carries a blocking
+ *                           finding.)
+ *   commented-only        -- every candidate is COMMENTED. Not actionable: a
+ *                           COMMENTED review carries no `reviewDecision`
+ *                           weight, so dismissing one repairs nothing, and this
+ *                           must not emit a list the procedure feeds to the
+ *                           dismissals API. Left for I1 to report.
  *   unorderable           — a candidate carries no parseable `submitted_at`.
  *   duplicate             — same verdict twice or more; retain newest.
  */
@@ -95,9 +121,12 @@ export function selectDuplicateDismissals(reviews, headSha) {
     return { reason: "no-duplicate", retain: candidates[0], dismiss: [] };
   }
 
-  const states = new Set(candidates.map(reviewState));
-  if (states.size > 1) {
+  const verdicts = new Set(candidates.map((review) => `${reviewState(review)}/${isBlocking(review)}`));
+  if (verdicts.size > 1) {
     return { reason: "conflicting-verdicts", retain: null, dismiss: [] };
+  }
+  if (reviewState(candidates[0]) === "COMMENTED") {
+    return { reason: "commented-only", retain: null, dismiss: [] };
   }
   if (candidates.some((review) => Number.isNaN(submittedAt(review)))) {
     return { reason: "unorderable", retain: null, dismiss: [] };
