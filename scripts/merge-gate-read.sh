@@ -146,6 +146,11 @@ pending_runs() { # stdin: run rows -> stdout: pend rows for runs owing a verdict
   # caller would put the guard outside `--rows` fixture reach. Direction of
   # missing it is RED, but it breaks BLO-34114s own pinned control.
   #
+  # That exclusion covers only the two conclusions dead_runs() admits as a
+  # victim, `cancelled`/`failure` — the other five emitted here fall through it
+  # and still print. See the third accepted residual in dead_runs() for the
+  # measurement and for why widening the victim test is refused.
+  #
   # A missing status or conclusion ("" via @tsv on a null, or a short fixture
   # row) is not `completed`/`success`, so it is kept and STOPs. Fails CLOSED, on
   # the same grounds as the missing-timestamp rule in dead_runs(): an absent
@@ -338,8 +343,9 @@ dead_runs() { # stdin: run rows -> stdout: alternation of stale run ids
   # The fix is NOT to widen the victim test to match: every conclusion added here
   # deletes more runs, which is the merge-authorizing direction, and would buy a
   # measured-zero false RED with an unmeasured false GREEN. If it is ever seen in
-  # the wild, narrow verdicts() instead — recompute the exemption from the pend
-  # set rather than widening what dead_runs() deletes.
+  # the wild, widen the exemption in verdicts() instead — recompute it from the
+  # pend set so verdicts() prints FEWER spurious lines, rather than widening what
+  # dead_runs() deletes.
   awk -F'\t' 'BEGIN { n = 0 }   # n MUST be seeded: implicit is "" , not 0
               { key = $1 FS $2
                 if ($4 == "success" && $5 > newest_pass[key]) newest_pass[key] = $5
