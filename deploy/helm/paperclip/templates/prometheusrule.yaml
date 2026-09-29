@@ -508,16 +508,27 @@ spec:
         # empty with and without it (both forms checked under promtool).
         # `>= 8` is the operative guard.
         #
-        # `for: 2m` is close to no debouncing here, and RAISING IT IS NOT AN
-        # AVAILABLE LEVER -- noted because it is the obvious knob to reach
-        # for if the margin above proves too thin. An increase() over [15m]
-        # holds a burst for the full width of the window, so a crossing
-        # cannot clear in 2m by construction: a single 1m burst of 25
-        # cancellations on steady 4/min traffic pins the ratio flat at 0.294
-        # for ~14m, then drops to 0 only when the burst leaves the window.
-        # Any `for:` shorter than the window is therefore equivalent. The
-        # sole defence against a transient non-incident spike is the
-        # threshold margin itself -- the 0.35-vs-0.317 gap disclosed above.
+        # `for: 2m` is close to no debouncing for a single burst against
+        # otherwise steady traffic, noted because it is the obvious knob to
+        # reach for if the margin above proves too thin. An increase() over
+        # [15m] holds the burst for the full width of the window: a single
+        # 1m burst of 25 cancellations on steady 4/min traffic pins the
+        # ratio flat at 0.294 for ~14m, then drops to 0 only when the burst
+        # leaves the window. With a steady denominator, any `for:` shorter
+        # than the window behaves the same.
+        #
+        # That does NOT hold when the denominator moves. The ratio also
+        # un-crosses when completions grow while the burst is still inside
+        # the window, so `for:` does change outcomes there (promtool, this
+        # expr, 25 cancellations at t=21m on 1 success/min): a 60-run
+        # backlog draining at t=26m (0.625 -> 0.240) fires under `for: 2m`
+        # and stays silent under `for: 6m`; a 300-run drain at t=22m clears
+        # the crossing after one evaluation, so even `for: 2m` stays silent.
+        # "Mass cancel, then the pool recovers and the backlog completes" is
+        # plausibly benign, and raising `for:` does suppress that shape, at
+        # the cost of equally suppressing a real kill whose backlog drains
+        # fast. Against a transient spike on steady traffic the defence is
+        # the threshold margin -- the 0.35-vs-0.317 gap disclosed above.
         - alert: PaperclipGithubWorkflowRunMassCancellation
           expr: |
             (
