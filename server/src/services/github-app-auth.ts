@@ -700,6 +700,94 @@ export async function githubGetPrRequiredStatusContext(input: {
 }
 
 /**
+ * Which merged PR put `headRef`'s work on the target branch? (BLO-36775)
+ *
+ * When GitHub auto-retargets a stacked child after its base branch is deleted,
+ * it fires `pull_request.edited` with `changes.base.ref.from`. That names the
+ * child directly — but the PR in the payload is the CHILD, so the merge whose
+ * shape decides retarget-vs-rebase is no longer in the delivery. This looks it
+ * up from the old base ref.
+ *
+ * `none` is load-bearing and is NOT a failure: a base branch can be deleted
+ * without ever being merged, and a human can retarget a PR by hand. Both fire
+ * the same `edited` event, and neither is a stacked-child orphaning. Treating
+ * `none` as a wake would put this path's false-positive rate back where the
+ * `?base=` enumeration's warn already is.
+ *
+ * `error` is kept distinct from `none` for the same reason the enumeration
+ * does: an unreadable answer is not "nothing merged this branch", and coercing
+ * it to `none` would restore the silence this whole path exists to break.
+ */
+export type MergedPullRequestForHeadRef =
+  | { outcome: "found"; prNumber: number; mergeCommitSha: string | null }
+  | { outcome: "none" }
+  | { outcome: "error"; reason: string };
+
+const MERGED_PR_FOR_HEAD_REF_PAGE_SIZE = 30;
+
+/** Pure half of {@link githubResolveMergedPullRequestForHeadRef}, testable without network. */
+export function parseMergedPullRequestForHeadRef(body: unknown): MergedPullRequestForHeadRef {
+  if (!Array.isArray(body)) return { outcome: "error", reason: "merged_pull_request_malformed" };
+
+  // A branch name can be reused, so `?head=` can legitimately return several
+  // closed PRs. The most recently merged one is the one whose merge triggered
+  // this retarget; ordering is taken from `merged_at` rather than from the
+  // response order, which GitHub sorts by `updated_at` (a later comment on an
+  // older PR is enough to reorder it).
+  let best: { prNumber: number; mergeCommitSha: string | null; mergedAtMs: number } | null = null;
+  for (const entry of body as Array<Record<string, unknown>>) {
+    const number = entry?.number;
+    // Closed-but-not-merged PRs share this filter and must not count: an
+    // abandoned base is not a base whose work landed anywhere.
+    if (!Number.isInteger(number) || typeof entry?.merged_at !== "string") continue;
+    const mergedAtMs = Date.parse(entry.merged_at);
+    if (Number.isNaN(mergedAtMs)) continue;
+    if (best && mergedAtMs <= best.mergedAtMs) continue;
+    best = {
+      prNumber: number as number,
+      mergeCommitSha:
+        typeof entry?.merge_commit_sha === "string" ? entry.merge_commit_sha : null,
+      mergedAtMs,
+    };
+  }
+  return best
+    ? { outcome: "found", prNumber: best.prNumber, mergeCommitSha: best.mergeCommitSha }
+    : { outcome: "none" };
+}
+
+export async function githubResolveMergedPullRequestForHeadRef(input: {
+  repoFullName: string;
+  headRef: string;
+  signal?: AbortSignal;
+}): Promise<MergedPullRequestForHeadRef> {
+  const tokenResult = await getInstallationTokenResult();
+  if (!tokenResult.ok) return { outcome: "error", reason: tokenResult.reason };
+
+  // `?head=` wants `owner:ref`. The owner is this repository's, not a fork's:
+  // GitHub only lets a PR target a branch in the base repository, so a stacked
+  // child's old base always lived here.
+  const owner = input.repoFullName.split("/")[0] ?? "";
+  const url =
+    `${gitHubApiBase(GITHUB_HOST)}/repos/${input.repoFullName}/pulls` +
+    `?state=closed&per_page=${MERGED_PR_FOR_HEAD_REF_PAGE_SIZE}` +
+    `&head=${encodeURIComponent(`${owner}:${input.headRef}`)}`;
+  let res: Response;
+  try {
+    res = await ghFetch(url, {
+      headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` },
+      signal: input.signal,
+    });
+  } catch {
+    return { outcome: "error", reason: "merged_pull_request_fetch_failed" };
+  }
+  if (!res.ok) {
+    const classified = await classifyGithubHttpFailure("pull_request", res);
+    return { outcome: "error", reason: classified.reason };
+  }
+  return parseMergedPullRequestForHeadRef(await res.json().catch(() => null));
+}
+
+/**
  * Terminal-state lookup for a single Actions run, used to decide whether a board
  * approval card that points at that run is still worth a human's attention.
  *
