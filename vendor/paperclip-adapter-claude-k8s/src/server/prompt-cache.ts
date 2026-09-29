@@ -360,9 +360,9 @@ async function ensureReadableFile(targetPath: string, contents: string): Promise
 
 /**
  * Translates a POD address on the shared data volume into the SERVER address
- * for the same bytes. The inverse of nothing — it is only ever needed in this
- * direction, because the roots are computed in pod space (they are what the
- * container is handed) while the writes happen here.
+ * for the same bytes. Used for the roots, which are computed in pod space (they
+ * are what the container is handed) while the writes happen here. `toPodAddress`
+ * below is the inverse, needed for symlink *contents* (BLO-37961).
  *
  * Same arithmetic as `resolveLinkedWorktreeCommonDir`'s reader in
  * `job-manifest.ts`, which translates pod->server for exactly the same reason.
@@ -396,6 +396,38 @@ function toServerAddress(podPath: string, podMount?: string, serverMount?: strin
 
 function mountPrefix(mount: string): string {
   return mount.endsWith("/") ? mount : `${mount}/`;
+}
+
+/**
+ * Translates a SERVER address on the shared data volume into the POD address
+ * for the same bytes. Inverse of `toServerAddress`.
+ *
+ * Needed for one thing only: the CONTENT of a symlink. `toServerAddress` gets
+ * the bundle written to the right place, but a symlink's target is resolved by
+ * whoever follows it — and that is the agent pod, in the pod's mount namespace.
+ * A skill entry's `source` arrives here as a SERVER address
+ * (`resolveManagedSkillsRoot` is a server service), so writing it verbatim
+ * publishes a link the pod cannot follow: present, correctly named, and
+ * dangling, with nothing in the bundle saying so (BLO-37961).
+ *
+ * Returns `serverPath` unchanged in two cases, and the SECOND ONE IS LOAD-BEARING:
+ *  - either mount is unknown — no translation is derivable, same shape as
+ *    `toServerAddress`;
+ *  - `serverPath` is not under the server mount. This is the adapter's own
+ *    bundled on-disk skills (`/app/skills/...`), which are an IMAGE path: the
+ *    same absolute path in both namespaces because both come from the same
+ *    image layer, not from the shared volume. Rewriting those would relocate a
+ *    correct link onto the data volume, where nothing exists — turning the one
+ *    set of links that works today into the broken set.
+ *
+ * With `podMount === serverMount` (every deployment today) the arithmetic is the
+ * identity, so every emitted target is byte-identical to the pre-BLO-37961 value.
+ */
+function toPodAddress(serverPath: string, podMount?: string, serverMount?: string): string {
+  if (!podMount || !serverMount) return serverPath;
+  const prefix = mountPrefix(serverMount);
+  if (!serverPath.startsWith(prefix)) return serverPath;
+  return path.posix.join(podMount, serverPath.slice(prefix.length));
 }
 
 export async function prepareClaudePromptBundle(input: {
@@ -466,7 +498,28 @@ export async function prepareClaudePromptBundle(input: {
   for (const entry of skills) {
     const target = path.join(skillsHome, entry.runtimeName);
     try {
-      await ensurePaperclipSkillSymlink(entry.source, target);
+      // `target` is a SERVER path (that is where this process writes), but the
+      // link's CONTENT is resolved by the pod, so it must be a POD path.
+      // `entry.source` arrives as a SERVER address — see `toPodAddress`.
+      const desired = toPodAddress(entry.source, podDataMountPath, serverDataMountPath);
+      // `ensurePaperclipSkillSymlink` keeps an existing link whose target still
+      // stat()s — but it stats HERE, in server space, so a stale pre-fix link
+      // carrying the old SERVER address resolves and is kept, leaving the pod
+      // one it cannot follow. That is not hypothetical: `bundleKey` is derived
+      // from skill CONTENT, and `serverRootDir` maps a moved pod mount back to
+      // the same server directory, so the first run after an operator adopts a
+      // custom `workspaceMountPath` lands on the existing bundle. Measured: the
+      // stale link survived and the skill stayed dangling. Drop a mismatched
+      // link first so the helper rewrites it (BLO-37961).
+      //
+      // `readlink` yields null on a non-symlink (EINVAL), so a real directory
+      // parked at this path is left alone — the helper's own "skipped" branch
+      // still owns that case.
+      const current = await fs.readlink(target).catch(() => null);
+      if (current !== null && current !== desired) {
+        await fs.unlink(target).catch(() => {});
+      }
+      await ensurePaperclipSkillSymlink(desired, target);
     } catch (err) {
       await onLog(
         "stderr",
