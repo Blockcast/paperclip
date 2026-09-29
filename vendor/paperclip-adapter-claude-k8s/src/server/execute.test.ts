@@ -987,6 +987,74 @@ describe("execute: concurrency guard", () => {
     expectScopedDirsPreCreatedThroughMock();
   });
 
+  // BLO-37760. `rootDir` is a POD address, but the bundle is written by THIS
+  // process, which reaches the volume at SELF_POD_DATA_MOUNT_PATH. Under a
+  // custom workspaceMountPath the two diverge, so execute() must hand over both
+  // mounts — and the config-source root must be derived from the pod's mount
+  // rather than from a literal /paperclip.
+  it("hands the prompt bundle both address spaces under a custom workspaceMountPath", async () => {
+    mockBatchListJobs.mockResolvedValue({ items: [] });
+    mockBatchCreateJob.mockRejectedValue(new Error("create reached"));
+    mockPrepareBundle.mockResolvedValue(makeBundle());
+
+    const result = await execute(makeCtx({
+      config: {
+        isolationMode: "isolated",
+        isolationKey: "key-1",
+        workspaceMountPath: "/srv/agent-data",
+      },
+    }));
+
+    expect(result.errorCode).toBe("k8s_job_create_failed");
+    const args = mockPrepareBundle.mock.calls.at(-1)?.[0];
+    // The root the container will be handed lives under the POD's mount.
+    expect(args.rootDir.startsWith("/srv/agent-data/")).toBe(true);
+    expect(args.rootDir.endsWith("/prompt-cache")).toBe(true);
+    expect(args.rootDir.startsWith("/paperclip/")).toBe(false);
+    // ...and both mounts are supplied, so the writer can translate it.
+    const { SELF_POD_DATA_MOUNT_PATH } = await import("./k8s-client.js");
+    expect(args.podDataMountPath).toBe("/srv/agent-data");
+    expect(args.serverDataMountPath).toBe(SELF_POD_DATA_MOUNT_PATH);
+    expect(args.podDataMountPath).not.toBe(args.serverDataMountPath);
+  });
+
+  // A RUNTIME isolation descriptor leaves `promptCacheRoot` empty, so
+  // `resolvePromptCacheRoot` falls through to its own derived root — a
+  // different branch from the config-source case above, and the one that used
+  // to hardcode `/paperclip`. Reverting that derivation must turn this red.
+  it("derives the runtime-descriptor prompt-cache fallback from the pod mount, not a literal /paperclip", async () => {
+    mockBatchListJobs.mockResolvedValue({ items: [] });
+    mockBatchCreateJob.mockRejectedValue(new Error("create reached"));
+    mockPrepareBundle.mockResolvedValue(makeBundle());
+
+    await execute(makeCtx({
+      config: { workspaceMountPath: "/srv/agent-data" },
+      runtime: makeIsolatedRuntime("key-1"),
+    }));
+
+    const args = mockPrepareBundle.mock.calls.at(-1)?.[0];
+    expect(args.rootDir).toBe(
+      "/srv/agent-data/instances/default/data/k8s-isolation/co1/agent-abc/key-1/prompt-cache",
+    );
+    expect(args.rootDir.startsWith("/paperclip/")).toBe(false);
+  });
+
+  // The no-op control for the same path: the default mount is the only
+  // configuration in production use.
+  it("keeps the default-mount prompt-cache root and mounts byte-identical", async () => {
+    mockBatchListJobs.mockResolvedValue({ items: [] });
+    mockBatchCreateJob.mockRejectedValue(new Error("create reached"));
+    mockPrepareBundle.mockResolvedValue(makeBundle());
+
+    await execute(makeCtx({ config: { isolationMode: "isolated", isolationKey: "key-1" } }));
+
+    const args = mockPrepareBundle.mock.calls.at(-1)?.[0];
+    const { SELF_POD_DATA_MOUNT_PATH } = await import("./k8s-client.js");
+    expect(args.rootDir.startsWith(`${SELF_POD_DATA_MOUNT_PATH}/`)).toBe(true);
+    expect(args.podDataMountPath).toBe(SELF_POD_DATA_MOUNT_PATH);
+    expect(args.serverDataMountPath).toBe(SELF_POD_DATA_MOUNT_PATH);
+  });
+
   it("recognizes legacy isolated labels when allowing a different isolation key", async () => {
     const other = makeJob({
       runId: "active-run",

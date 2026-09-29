@@ -11,14 +11,29 @@ import {
   parseObject,
 } from "@paperclipai/adapter-utils/server-utils";
 
+/**
+ * The bundle is the one prompt-cache artifact with a writer in THIS process and
+ * a reader in the agent pod, and the two reach the shared volume at DIFFERENT
+ * absolute paths (`SELF_POD_DATA_MOUNT_PATH` here, `config.workspaceMountPath`
+ * there). Every field below is therefore explicitly one address space or the
+ * other; `serverRootDir` exists so that distinction is visible in the type
+ * rather than being a property a reader has to know (BLO-37760).
+ */
 export interface ClaudePromptBundle {
   bundleKey: string;
-  /** Absolute path to the bundle root directory (contains .claude/skills/ and agent-instructions.md). */
+  /** POD address of the bundle root (contains .claude/skills/ and agent-instructions.md). */
   rootDir: string;
-  /** Value to pass as --add-dir to the Claude CLI. */
+  /** POD address. Value to pass as --add-dir to the Claude CLI. */
   addDir: string;
-  /** Path to the materialized instructions file, or null if no instructions were provided. */
+  /** POD address of the materialized instructions file, or null if no instructions were provided. */
   instructionsFilePath: string | null;
+  /**
+   * SERVER address of the same bytes as `rootDir` — where this process actually
+   * wrote them. Equal to `rootDir` whenever the two mounts coincide, which is
+   * every deployment today. Anything server-side that touches the bundle must
+   * use this; reaching for `rootDir` is the defect this field exists to prevent.
+   */
+  serverRootDir: string;
 }
 
 const DEFAULT_PAPERCLIP_INSTANCE_ID = "default";
@@ -343,11 +358,49 @@ async function ensureReadableFile(targetPath: string, contents: string): Promise
   }
 }
 
+/**
+ * Translates a POD address on the shared data volume into the SERVER address
+ * for the same bytes. The inverse of nothing — it is only ever needed in this
+ * direction, because the roots are computed in pod space (they are what the
+ * container is handed) while the writes happen here.
+ *
+ * Same arithmetic as `resolveLinkedWorktreeCommonDir`'s reader in
+ * `job-manifest.ts`, which translates pod->server for exactly the same reason.
+ *
+ * Returns `podPath` unchanged in two cases, both deliberate:
+ *  - either mount is unknown — no translation is derivable, and this is the
+ *    shape every caller that omits the two params takes;
+ *  - `podPath` is not under the pod mount. The
+ *    `resolveManagedClaudePromptCacheRoot` fallback is a PAPERCLIP_HOME path
+ *    with no pod counterpart at all, so rewriting it would relocate an
+ *    already-server-side default to somewhere it has never been.
+ *
+ * There is deliberately NO `podMount === serverMount` fast path: the arithmetic
+ * below already yields the identity in that case, so such a branch would have
+ * no failing mutation — documentation wearing a guard's clothes.
+ */
+function toServerAddress(podPath: string, podMount?: string, serverMount?: string): string {
+  if (!podMount || !serverMount) return podPath;
+  const prefix = podMount.endsWith("/") ? podMount : `${podMount}/`;
+  if (!podPath.startsWith(prefix)) return podPath;
+  return path.posix.join(serverMount, podPath.slice(prefix.length));
+}
+
 export async function prepareClaudePromptBundle(input: {
   companyId: string;
   skills: PaperclipSkillEntry[];
   instructionsContents: string | null;
+  /**
+   * POD address of the prompt-cache root. The container is handed paths derived
+   * from this, so it is expressed in the pod's address space; the writes below
+   * go through `serverDataMountPath` instead. Omitted => the managed
+   * PAPERCLIP_HOME default, which is server-side and is left untranslated.
+   */
   rootDir?: string | null;
+  /** Where the agent POD reaches the shared data volume (`resolveDataMountPath`). */
+  podDataMountPath?: string;
+  /** Where THIS process reaches it (`SELF_POD_DATA_MOUNT_PATH`). */
+  serverDataMountPath?: string;
   /**
    * Skill keys the caller resolved from the company-skill catalog — the
    * discriminator between a transient materialization race and a permanent
@@ -365,14 +418,17 @@ export async function prepareClaudePromptBundle(input: {
   catalogBackedSkillKeys?: ReadonlySet<string>;
   onLog: AdapterExecutionContext["onLog"];
 }): Promise<ClaudePromptBundle> {
-  const { companyId, skills, instructionsContents, onLog } = input;
+  const { companyId, skills, instructionsContents, onLog, podDataMountPath, serverDataMountPath } = input;
   const bundleKey = await buildClaudePromptBundleKey({
     skills,
     instructionsContents,
     catalogBackedSkillKeys: input.catalogBackedSkillKeys,
   });
+  // `bundleKey` is joined FIRST, so both addresses carry the identical
+  // volume-relative subpath and cannot drift by construction.
   const rootDir = path.join(input.rootDir?.trim() || resolveManagedClaudePromptCacheRoot(companyId), bundleKey);
-  const skillsHome = path.join(rootDir, ".claude", "skills");
+  const serverRootDir = toServerAddress(rootDir, podDataMountPath, serverDataMountPath);
+  const skillsHome = path.join(serverRootDir, ".claude", "skills");
   await fs.mkdir(skillsHome, { recursive: true });
 
   for (const entry of skills) {
@@ -387,10 +443,16 @@ export async function prepareClaudePromptBundle(input: {
     }
   }
 
+  // Constructed once in POD space and translated, rather than joined twice
+  // against two roots: two join sites are two things to keep in agreement, and
+  // keeping them in agreement is the whole defect.
   const instructionsFilePath = instructionsContents ? path.join(rootDir, "agent-instructions.md") : null;
   if (instructionsFilePath && instructionsContents) {
-    await ensureReadableFile(instructionsFilePath, instructionsContents);
+    await ensureReadableFile(
+      toServerAddress(instructionsFilePath, podDataMountPath, serverDataMountPath),
+      instructionsContents,
+    );
   }
 
-  return { bundleKey, rootDir, addDir: rootDir, instructionsFilePath };
+  return { bundleKey, rootDir, addDir: rootDir, instructionsFilePath, serverRootDir };
 }
