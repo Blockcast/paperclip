@@ -427,7 +427,7 @@ describe("reclassifyK8sReplacementLaunchFailureAfterThrottle (BLO-34577)", () =>
     signal: null,
     timedOut: false,
     errorMessage:
-      "Pod scheduling failed: Pod ac-ally-96fa0c75-3f2a1b-x9k2q reached phase=Failed: claude exited 1",
+      "Pod terminated before startup: Pod ac-ally-96fa0c75-3f2a1b-x9k2q reached phase=Failed: claude exited 1 (Error)",
     errorCode: "k8s_pod_schedule_failed",
   };
 

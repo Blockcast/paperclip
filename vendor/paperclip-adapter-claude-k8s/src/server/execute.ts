@@ -2401,13 +2401,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // Anything that is not a PodWaitError (k8s API error, auth, network) is
       // genuinely unclassified - say so rather than inheriting "scheduling",
       // which sends the reader to cluster capacity for a non-capacity fault.
-      // errorCode deliberately stays `k8s_pod_schedule_failed` for every kind:
-      // four server-side sites (heartbeat.ts shouldScheduleAutomaticRunRetry /
-      // isNonRetryablePrReviewTerminalOutcome, recovery service's
-      // ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES and its no-continuation-replay set)
-      // key on it to mean "cannot prove external work never began, so do not
-      // auto-retry". Splitting the code would silently drop these failures out
-      // of all four conservative sets. See BLO-33503.
+      // errorCode deliberately stays `k8s_pod_schedule_failed` for every kind.
+      // Server-side consumers key on it to mean "cannot prove external work
+      // never began, so do not auto-retry"; splitting the code would silently
+      // drop these failures out of every set below. AT LEAST SIX behavioural
+      // sites as of 2026-09-29 - this enumeration is a floor, not a closed
+      // list: it read "four" when this PR opened and master grew two more
+      // while it was in review. Re-grep before splitting, do not audit off it:
+      //   heartbeat.ts shouldScheduleAutomaticRunRetry
+      //   heartbeat.ts isNonRetryablePrReviewTerminalOutcome
+      //   heartbeat.ts reclassifyK8sReplacementLaunchFailureAfterThrottle
+      //   metrics.ts   retainSourceIds (whether agent_id survives into labels)
+      //   recovery/service.ts  no-continuation-replay set
+      //   recovery/zero-token-startup-failure.ts ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES
+      // `git grep -n k8s_pod_schedule_failed -- server/src` regenerates it.
+      // See BLO-33503.
       const failureLabel =
         err instanceof PodWaitError ? POD_FAILURE_LABELS[err.kind] : "Pod failure (unclassified)";
       await onLog("stderr", `[paperclip] ${failureLabel}: ${msg}\n`);
