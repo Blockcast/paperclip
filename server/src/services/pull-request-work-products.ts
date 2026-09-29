@@ -190,9 +190,11 @@ export function pullRequestWorkProductSourceEventActionOrder(
  * Read `metadata.owningIdentifiers` back off a stored row, preserving the
  * null-vs-empty distinction the writer above encodes.
  *
- * Returns `null` for "not recorded" (row predates the field) and an array —
- * possibly empty, which IS authoritative — otherwise. Consumers differ on what
- * to do with `null`, and deliberately so: productivity-review re-derives
+ * Returns `null` for "not recorded" — the row predates the field, or it holds
+ * a non-empty value no entry of which is readable as a string. An array is
+ * returned otherwise, and an empty one IS authoritative: the guard below means
+ * `[]` out implies `[]` in. Consumers differ on what to do with `null`, and
+ * deliberately so: productivity-review re-derives
  * ownership from the row's surviving tiers and withholds a progress signal when
  * that fails, while the PR-review-gate notifier keeps the row, because its
  * failure direction is silence. Both treat an empty array the same way: the PR
@@ -201,7 +203,16 @@ export function pullRequestWorkProductSourceEventActionOrder(
  */
 export function recordedPullRequestOwners(value: unknown): string[] | null {
   if (!Array.isArray(value)) return null;
-  return value.filter((entry): entry is string => typeof entry === "string");
+  const strings = value.filter((entry): entry is string => typeof entry === "string");
+  // A non-empty recording this reader cannot parse is NOT the authoritative
+  // empty set — it is a recording we failed to read, so it belongs in the
+  // "not recorded" arm where each consumer takes its own safe direction.
+  // `metadata` is `Record<string, unknown>` read back from the DB, so the
+  // writer above is not the only way rows get here. Without this, `[42]`
+  // reaches the notifier as "the PR owns nothing" and it answers with the
+  // silence BLO-33589 exists to remove.
+  if (strings.length === 0 && value.length > 0) return null;
+  return strings;
 }
 
 export function buildPullRequestWorkProductFields(

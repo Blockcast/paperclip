@@ -12,6 +12,7 @@ import {
   pullRequestMergeQueueState,
   pullRequestWorkProductSourceEventActionOrder,
   pullRequestWorkProductStatus,
+  recordedPullRequestOwners,
   TERMINAL_PULL_REQUEST_WORK_PRODUCT_STATUSES,
 } from "../services/pull-request-work-products.js";
 
@@ -228,5 +229,37 @@ describe("buildPullRequestWorkProductFields", () => {
         expect(open.has(pullRequestWorkProductStatus({ action, prDraft: false, prMerged: false }))).toBe(true);
       }
     });
+  });
+});
+
+// BLO-37225: both the PR-review-gate notifier and productivity-review branch on
+// null-vs-empty out of this one reader, and they take OPPOSITE directions on an
+// empty array. So the reader must not be a second way to produce one.
+describe("recordedPullRequestOwners", () => {
+  it("returns null for a value that was never recorded", () => {
+    expect(recordedPullRequestOwners(undefined)).toBeNull();
+    expect(recordedPullRequestOwners(null)).toBeNull();
+    expect(recordedPullRequestOwners("BLO-1")).toBeNull();
+  });
+
+  it("returns the authoritative empty set only when the recorded array was empty", () => {
+    expect(recordedPullRequestOwners([])).toEqual([]);
+  });
+
+  it("does not manufacture the authoritative empty set from an unreadable recording", () => {
+    // The writer recorded a non-empty set; this reader could not parse any of
+    // it. That is "not recorded", not "owns nothing" -- the notifier reads the
+    // latter as licence to stay silent, which is the failure direction it
+    // exists to remove. Reachable because `metadata` is Record<string, unknown>
+    // read back from the DB, not only via buildPullRequestWorkProductFields.
+    expect(recordedPullRequestOwners([42])).toBeNull();
+    expect(recordedPullRequestOwners([{ id: "BLO-1" }])).toBeNull();
+  });
+
+  it("keeps a partially readable recording rather than discarding it", () => {
+    // A surviving owner still routes the notice to a real owner, so the safe
+    // direction here is to keep what parsed -- unlike the all-unreadable case,
+    // where keeping it would flip the meaning from "notify" to "stay silent".
+    expect(recordedPullRequestOwners(["BLO-1", 42])).toEqual(["BLO-1"]);
   });
 });
