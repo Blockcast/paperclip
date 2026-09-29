@@ -5041,6 +5041,33 @@ function stackedChildDirective(shape: MergeHistoryShape): string {
   }
 }
 
+type WakeableStackedChildIssue = Awaited<ReturnType<typeof selectIssuesLinkedToPullRequest>>[number] & {
+  assigneeAgentId: string;
+};
+
+/**
+ * The live, assigned Paperclip issues linked to one stacked child PR: the only
+ * rows {@link wakeStackedChildIssues} can wake.
+ *
+ * Split out so a caller can ask "is this PR tracked at all?" BEFORE spending
+ * installation-token GitHub reads on it (BLO-36775): this is a local query, and
+ * on the `pull_request.edited` path most deliveries are for PRs nobody here
+ * owns.
+ */
+async function selectWakeableStackedChildIssues(
+  db: Db,
+  repoFullName: string,
+  childPrNumber: number,
+): Promise<WakeableStackedChildIssue[]> {
+  const rows = await selectIssuesLinkedToPullRequest(db, pullRequestExternalId(repoFullName, childPrNumber));
+  // An unassigned or terminal row has nobody to wake; the orphaned PR is still
+  // real, which is what the field check is for.
+  return rows.filter(
+    (row): row is WakeableStackedChildIssue =>
+      Boolean(row.assigneeAgentId) && row.status !== "done" && row.status !== "cancelled",
+  );
+}
+
 /**
  * Wake every live Paperclip issue linked to one stacked child PR (BLO-29856,
  * BLO-36775).
@@ -5066,6 +5093,8 @@ function stackedChildDirective(shape: MergeHistoryShape): string {
 async function wakeStackedChildIssues(input: {
   db: Db;
   heartbeat: ReturnType<typeof heartbeatService>;
+  /** From {@link selectWakeableStackedChildIssues}. */
+  childIssues: WakeableStackedChildIssue[];
   repoFullName: string;
   childPrNumber: number;
   childPrUrl: string | null;
@@ -5078,17 +5107,8 @@ async function wakeStackedChildIssues(input: {
   /** Diagnostic only — never part of the idempotency key. */
   detectedVia: "base_merge_fan_out" | "auto_retarget";
 }): Promise<number> {
-  const childIssues = await selectIssuesLinkedToPullRequest(
-    input.db,
-    pullRequestExternalId(input.repoFullName, input.childPrNumber),
-  );
   let woken = 0;
-  for (const childIssue of childIssues) {
-    // An unassigned or terminal row has nobody to wake; the orphaned PR is
-    // still real, which is what the field check is for.
-    if (!childIssue.assigneeAgentId) continue;
-    if (childIssue.status === "done" || childIssue.status === "cancelled") continue;
-
+  for (const childIssue of input.childIssues) {
     const stackedIdempotencyKey =
       `stacked_pr_base_merged:${childIssue.id}:${input.repoFullName}:${input.childPrNumber}:${input.mergedBaseRef}`;
     const alreadyWoken = await input.db
@@ -6176,7 +6196,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     // block can read itself. The retargeted child also carries no Paperclip
     // identifier of its own, so it would be dropped by the identifier gate
     // regardless; the link comes from its PR work product, which
-    // `wakeStackedChildIssues` resolves.
+    // `selectWakeableStackedChildIssues` resolves.
     const retargetedPr = payload.pull_request as Record<string, unknown> | undefined;
     const retargetedFromRef = readStringField(
       readNestedRecord(payload, ["changes", "base", "ref"]),
@@ -6196,21 +6216,34 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       retargetChildPrNumber !== null
     ) {
       try {
+        // The free, local gate runs first: is this PR tracked by any live,
+        // assigned issue? Every base-ref edit in every installed repo arrives
+        // here, most for PRs nobody here owns, and the GitHub reads below spend
+        // the shared (and contended) installation token. An untracked PR costs
+        // one local query and no warn.
+        const childIssues = await selectWakeableStackedChildIssues(
+          db,
+          retargetRepoFullName,
+          retargetChildPrNumber,
+        );
         // The PR in this payload is the CHILD, so the merge whose shape decides
         // retarget-vs-rebase is not in the delivery. Resolve it from the old
         // base ref.
         //
-        // This lookup is also the precision gate, and that is its more important
-        // job: a human retargeting a PR by hand, and a base branch deleted
-        // without ever merging, both fire this same event. Only `found` means a
-        // merge put the old base's work somewhere, so only `found` is a stacked
-        // orphaning. Without this the path would inherit the false-positive rate
-        // it exists to replace.
-        const mergedBase = await githubResolveMergedPullRequestForHeadRef({
-          repoFullName: retargetRepoFullName,
-          headRef: retargetedFromRef,
-        });
-        if (mergedBase.outcome === "error") {
+        // This lookup is also the merge precision gate, and that is its more
+        // important job: a human retargeting a PR by hand, and a base branch
+        // deleted without ever merging, both fire this same event. Only `found`
+        // means a merge put the old base's work somewhere, so only `found` is a
+        // stacked orphaning. Without this the path would inherit the
+        // false-positive rate it exists to replace. `null` means the local gate
+        // already found nobody to wake.
+        const mergedBase = childIssues.length === 0
+          ? null
+          : await githubResolveMergedPullRequestForHeadRef({
+            repoFullName: retargetRepoFullName,
+            headRef: retargetedFromRef,
+          });
+        if (mergedBase?.outcome === "error") {
           // NOT "nothing merged this branch" — we could not find out. Same
           // fail-loud reasoning as the enumeration: coercing an unreadable read
           // to "no merge" restores the silence this path exists to break.
@@ -6223,7 +6256,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             },
             "stacked-PR auto-retarget wake could not resolve what merged the old base; child not woken",
           );
-        } else if (mergedBase.outcome === "found") {
+        } else if (mergedBase?.outcome === "found") {
           const mergeShape: MergeHistoryShape = mergedBase.mergeCommitSha
             ? await githubResolveMergeHistoryShape({
               repoFullName: retargetRepoFullName,
@@ -6236,6 +6269,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
               pluginWorkerManager: config.pluginWorkerManager,
               ...config.heartbeatOptions,
             }),
+            childIssues,
             repoFullName: retargetRepoFullName,
             childPrNumber: retargetChildPrNumber,
             childPrUrl: readStringField(retargetedPr, "html_url"),
@@ -6466,6 +6500,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             await wakeStackedChildIssues({
               db,
               heartbeat: stackedHeartbeat,
+              childIssues: await selectWakeableStackedChildIssues(db, stackedRepoFullName, child.number),
               repoFullName: stackedRepoFullName,
               childPrNumber: child.number,
               childPrUrl: child.url,

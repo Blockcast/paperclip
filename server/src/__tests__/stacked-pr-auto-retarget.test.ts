@@ -411,15 +411,23 @@ describeEmbeddedPostgres("stacked-PR auto-retarget wake", () => {
     const res = await post(buildApp(), retargetPayload(), "retarget-done");
     expect(res.status).toBe(200);
     expect(await stackedWakes()).toHaveLength(0);
+    // Nobody to wake is decided locally, before any installation-token read.
+    expect(mockResolveMergedBase).not.toHaveBeenCalled();
+    expect(mockResolveMergeShape).not.toHaveBeenCalled();
   });
 
-  it("ignores a child PR that is not linked to any issue", async () => {
+  it("ignores a child PR that is not linked to any issue, without calling GitHub", async () => {
+    // Every base-ref edit in every installed repo reaches this path, and the
+    // two GitHub reads spend the shared installation token. An untracked PR
+    // must cost only the local link query.
     const { companyId, agentId } = await seedCompany();
     await seedIssue(companyId, agentId, "BLO-36784");
 
     const res = await post(buildApp(), retargetPayload(), "retarget-unlinked");
     expect(res.status).toBe(200);
     expect(await stackedWakes()).toHaveLength(0);
+    expect(mockResolveMergedBase).not.toHaveBeenCalled();
+    expect(mockResolveMergeShape).not.toHaveBeenCalled();
   });
 
   /**
