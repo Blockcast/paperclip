@@ -571,4 +571,102 @@ describe("prepareClaudePromptBundle two address spaces (BLO-37760)", () => {
       expect(omitted.bundleKey).toBe(coinciding.bundleKey);
     });
   });
+
+  // Ally review of #2107 (Important): `toServerAddress`'s "not under the pod
+  // mount" early return keeps the WRITE correct but hands the container a path
+  // that is not on its data mount, and nothing said so. Each case below is a
+  // path the container is handed via `--add-dir`, so the report is keyed on the
+  // pod mount alone.
+  async function offVolumeWarnings(run: () => Promise<unknown>): Promise<Array<Record<string, unknown>>> {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await run();
+      return warn.mock.calls
+        .map(([line]) => JSON.parse(String(line)) as Record<string, unknown>)
+        .filter((entry) => entry.event === "claude_k8s.prompt_bundle_off_volume");
+    } finally {
+      warn.mockRestore();
+    }
+  }
+
+  it("reports an operator-set root on the SERVER mount but off a custom pod mount", async () => {
+    await withMounts(async ({ podMount, serverMount }) => {
+      // The shape `resolvePromptCacheRoot` returns verbatim for
+      // `config.promptCacheRoot`: a `/paperclip/...` path while the pod mounts
+      // the volume elsewhere. The write lands on the volume; the read cannot.
+      const configuredRoot = path.posix.join(serverMount, "operator/prompt-cache");
+      let rootDir = "";
+      const warnings = await offVolumeWarnings(async () => {
+        ({ rootDir } = await prepareClaudePromptBundle({
+          companyId,
+          skills: [],
+          instructionsContents: null,
+          rootDir: configuredRoot,
+          podDataMountPath: podMount,
+          serverDataMountPath: serverMount,
+          onLog,
+        }));
+      });
+      expect(warnings).toEqual([
+        expect.objectContaining({ rootDir, podDataMountPath: podMount, serverDataMountPath: serverMount }),
+      ]);
+    });
+  });
+
+  it("reports the managed PAPERCLIP_HOME default when it is off the pod mount", async () => {
+    await withMounts(async ({ podMount, serverMount }) => {
+      const warnings = await offVolumeWarnings(() =>
+        prepareClaudePromptBundle({
+          companyId,
+          skills: [],
+          instructionsContents: null,
+          podDataMountPath: podMount,
+          serverDataMountPath: serverMount,
+          onLog,
+        }),
+      );
+      expect(warnings).toHaveLength(1);
+    });
+  });
+
+  it("reports a root off the mount even when the two mounts coincide", async () => {
+    await withMounts(async ({ podMount, serverMount }) => {
+      // Equal mounts do not make an off-mount root readable: the server still
+      // writes to its own filesystem. Guards against gating on `pod !== server`.
+      const warnings = await offVolumeWarnings(() =>
+        prepareClaudePromptBundle({
+          companyId,
+          skills: [],
+          instructionsContents: null,
+          rootDir: path.posix.join(serverMount, "prompt-cache"),
+          podDataMountPath: podMount,
+          serverDataMountPath: podMount,
+          onLog,
+        }),
+      );
+      expect(warnings).toHaveLength(1);
+    });
+  });
+
+  it("does not report a root on the pod mount, nor when the mounts are unknown", async () => {
+    await withMounts(async ({ podMount, serverMount, podRootDir }) => {
+      const warnings = await offVolumeWarnings(async () => {
+        for (const mounts of [
+          { podDataMountPath: podMount, serverDataMountPath: serverMount },
+          { podDataMountPath: podMount, serverDataMountPath: podMount },
+          {},
+        ]) {
+          await prepareClaudePromptBundle({
+            companyId,
+            skills: [],
+            instructionsContents: null,
+            rootDir: podRootDir,
+            ...mounts,
+            onLog,
+          });
+        }
+      });
+      expect(warnings).toEqual([]);
+    });
+  });
 });
