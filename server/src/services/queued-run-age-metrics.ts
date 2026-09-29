@@ -264,15 +264,19 @@ export async function refreshOverdueScheduledRetryAgeMetrics(db: Db, now = new D
  *
  * The result is grouped by `scheduled_retry_reason` as well as agent, and the
  * reason is published as a gauge label (BLO-31174, second defect). The classes
- * this column selects among have legitimate maxima that differ by 30x -- 300s
- * for `max_turns_continuation` and k8s isolation, 900s for `ccrotate_capacity`,
- * 3,600s for `dependency_blocked` (`Math.min(..., 3_600_000)`), 9,000s for the
- * `transient_failure` ladder's final 2h hop plus 25% jitter -- so a single
- * threshold aggregated over all of them is wrong in both directions at once. At
+ * this column selects among have legitimate maxima that differ by at least
+ * 289x -- 300s for `max_turns_continuation` and k8s isolation, 900s for
+ * `ccrotate_capacity`, 3,600s for `dependency_blocked`
+ * (`Math.min(..., 3_600_000)`), 9,000s for the `transient_failure` ladder's
+ * final 2h hop plus 25% jitter, and 86,700s for a `transient_failure` park that
+ * adopts an upstream `retryNotBefore` floor (`MAX_TRANSIENT_RETRY_HORIZON_MS`
+ * plus `TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS`; a `provider_quota` floor is never
+ * clamped, so it has no ceiling) -- so a single threshold aggregated over all
+ * of them is wrong in both directions at once. At
  * the 5,400s bound the alert shipped with, every run reaching transient attempt
  * 4 breaches BY DESIGN (1,016 breaching samples across 12 agents in the 7 days
  * to 2026-09-28, every one inside [5590, 8978], i.e. below the transient
- * ceiling), while a capacity park sitting at 4x its own 900s clamp -- the writer
+ * ladder ceiling), while a capacity park sitting at 4x its own 900s clamp -- the writer
  * bug BLO-28919 fixed -- stays invisible. Bound each reason against its own
  * constant instead of retuning one number.
  */

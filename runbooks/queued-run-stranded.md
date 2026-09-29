@@ -41,16 +41,27 @@ gated off and its last snapshot is not trustworthy.
 > **Read the `reason` label** ([BLO-31174](/BLO/issues/BLO-31174), second
 > defect). The gauge is keyed by `agent_id` **and** `reason` (the row's
 > `scheduled_retry_reason`, coerced to the bounded allow-list, anything else
-> reads `other`). Legitimate ceilings differ by class and span 30x (300s to
-> 9,000s), so for a class listed below, judge a value against its own constant,
-> not the flat 5,400s rule:
+> reads `other`). Legitimate ceilings differ by class and span at least 289x
+> (300s to 86,700s, and a `provider_quota` floor has none), so for a class
+> listed below, judge a value against its own ceiling, not the flat 5,400s rule:
 >
 > | `reason` | designed ceiling | source |
 > |---|---:|---|
 > | `max_turns_continuation` | 300s | `MAX_TURN_CONTINUATION_MAX_DELAY_MS` |
 > | `ccrotate_capacity` | 900s | `CCROTATE_CAPACITY_MAX_PARK_MS` |
 > | `dependency_blocked` | 3,600s | `DEP_BLOCKED_MAX_DELAY_MS` |
-> | `transient_failure` | 9,000s | final 2h hop of `BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS` x (1 + 0.25 jitter) |
+> | `transient_failure`, backoff ladder | 9,000s | final 2h hop of `BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS` x (1 + 0.25 jitter) |
+> | `transient_failure`, upstream `retryNotBefore` floor | 86,700s | `MAX_TRANSIENT_RETRY_HORIZON_MS` (24h) + `TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS` (5min forward jitter on a floor just under the clamp) |
+> | `transient_failure`, `provider_quota` floor | none | adopted verbatim, never clamped (`clampTransientHorizon` in `scheduleBoundedRetryForRun`) |
+>
+> `transient_failure` is one label over three mechanisms, and the gauge cannot
+> tell them apart: a value in (9,000s, 86,700s] is a floored park, not a fault,
+> and one above 86,700s is either a `provider_quota` floor or a fault. Before
+> calling it either, read the run's error family (`readHeartbeatRunErrorFamily`:
+> `result_json.errorFamily`, else derived from `error_code`, where
+> `provider_quota` and `provider_quota_exhausted` both map to `provider_quota`);
+> only a non-`provider_quota` family above 86,700s is a writer bug. A per-reason
+> alert on `transient_failure` therefore cannot bound it at 9,000s.
 >
 > The table is the subset of classes whose designed ceiling is known, not the
 > whole allow-list (`KNOWN_RETRY_SCHEDULE_REASONS` in
