@@ -49,7 +49,7 @@ test("server shards run general and serialized suites in the same jobs", () => {
 // the critical path lengthens it instead -- silently, with every job green.
 test("max-parallel covers the whole general_tests matrix", () => {
   const general = jobBlock("general_tests", "verify");
-  const entries = general.match(/\n          - group: general-[a-z-]+\n/g) ?? [];
+  const entries = general.match(/\n          - group: general-[a-z0-9-]+\n/g) ?? [];
   const maxParallel = Number(general.match(/\n      max-parallel: (\d+)\n/)?.[1]);
   assert.ok(Number.isInteger(maxParallel), "general_tests must declare max-parallel");
   assert.ok(
