@@ -3713,10 +3713,13 @@ export function issueRoutes(
     // only true for kinds whose action IS a wake-path restoration. `pr_review_non_convergence`
     // escalates a quality condition to a *different* owner and deliberately leaves the source
     // issue `in_progress` with its agent owner, so it is born matching the agent-owner branch
-    // below and can never stop matching it. The branches ABOVE stay kind-blind on purpose:
-    // two are genuinely terminal (`done`/`cancelled`, the manual blocked→todo recovery) and
-    // one is the `backlog` non-deliverability fold. A new branch that cancels because the
-    // issue CANNOT be driven belongs above this line, not below it.
+    // below and can never stop matching it. The branches ABOVE stay kind-blind on purpose,
+    // and they are three different reasons, not one: `done`/`cancelled` is genuinely terminal;
+    // the manual blocked→todo recovery is an OUT-OF-BAND signal that the recovery this action
+    // exists to perform has already happened; `backlog` is a NON-DELIVERABILITY fold. A new
+    // branch belongs above this line if it cancels because the issue is finished, because it
+    // CANNOT be driven, or because the action's work was already done by someone else — and
+    // below it only if it cancels because the issue now has its own wake path.
     //
     // `=== false` rather than a truthiness read: an off-enum `kind` from the DB keeps today's
     // cancelling behaviour instead of silently becoming a new zombie-row class (BLO-16074).
