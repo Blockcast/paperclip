@@ -91,4 +91,26 @@ describe("walkIssueListPages", () => {
     });
     expect(seen).toEqual(["a", "b", "b", "c", "d"]);
   });
+
+  it("caps the walk when differing blocked pages never run out", async () => {
+    // The blocked assertion only compares CONSECUTIVE pages, so a dropped `offset` plus
+    // churn at the head of the mutable activity order serves a different full page every
+    // time and slips past it. Nothing about the cursor is wrong here — the sequence simply
+    // never ends — which is why the per-branch guards cannot catch this and a cap must.
+    //
+    // The fetcher caps itself for the same reason the two above do, just at a bound above
+    // the cap under test: without it, reverting the cap does not fail this test, it HANGS
+    // it. Every iteration awaits an already-resolved promise, so the loop never yields and
+    // vitest's timer-based timeout cannot fire. Verified: uncapped, the mutation ran past
+    // 90s with no output; capped, it fails on the wrong error in milliseconds.
+    let calls = 0;
+    const neverEnding = async () => {
+      calls += 1;
+      if (calls > 1002) throw new Error("walk ran past the page cap");
+      return [{ id: `row-${calls}-a` }, { id: `row-${calls}-b` }];
+    };
+    await expect(
+      walkIssueListPages(neverEnding, { blocked: true, pageSize: 2 }, async () => {}),
+    ).rejects.toThrow(/exceeded 1000 pages/);
+  });
 });
