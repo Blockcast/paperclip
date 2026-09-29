@@ -2247,6 +2247,10 @@ describe("buildJobManifest", () => {
             issue: { id: "i1", identifier: "BLO-37287", title: "t" },
             commentIds: ["c1"],
             latestCommentId: "c1",
+            // The server's own verdict. SKILL.md tells agents the adapter
+            // overrides it when shedding, so `truncated` cannot identify which
+            // layer lost context; this pins that override.
+            truncated: false,
             comments: [{ id: "c1", body: "hello", metadata: hugeMetadata, presentation: null }],
           },
         },
@@ -2299,6 +2303,8 @@ describe("buildJobManifest", () => {
       );
       expect(parsed.fallbackFetchNeeded).toBe(true);
       expect(parsed.issue?.identifier).toBe("BLO-37287");
+      // A present field can still be cut short (SKILL.md cites this cap).
+      expect(parsed.issue?.title).toHaveLength(240);
       expect(parsed.executionStage).toBeUndefined();
     });
 
