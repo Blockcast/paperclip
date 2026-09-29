@@ -848,6 +848,19 @@ export function sweepRepos(repos, runOne) {
   return spent;
 }
 
+/**
+ * `main`'s per-repo step for `sweepRepos`: hands the carried spend to
+ * `runRepo`. Hoisted so a test can pin that carry (a literal `0` here makes
+ * the cap per repo again) without running `main`. `run` is a test seam.
+ */
+export const repoRunner =
+  (apply, settleMinutes, rotted, run = runRepo) =>
+  (repo, spent) => {
+    const rows = run(repo, apply, settleMinutes, spent, rotted);
+    console.log("");
+    return rows;
+  };
+
 function reportRotted(rotted) {
   if (rotted.length === 0) return;
   // Reported, never acted on. A deliberate hold is invisible on every API
@@ -873,11 +886,7 @@ function main() {
   // run the only `gh` traffic there is. The explicit call before `process.exit`
   // in `runRepo` stays: `exit` does not unwind, so this block never runs there.
   try {
-    sweepRepos(targetRepos(), (repo, spent) => {
-      const rows = runRepo(repo, apply, settleMinutes, spent, rotted);
-      console.log("");
-      return rows;
-    });
+    sweepRepos(targetRepos(), repoRunner(apply, settleMinutes, rotted));
   } finally {
     reportRotted(rotted);
   }
