@@ -431,3 +431,144 @@ describe("readCatalogBackedSkillKeys (BLO-32055)", () => {
     })).toEqual(new Set());
   });
 });
+
+// BLO-37760. The bundle is the one prompt-cache artifact with a writer in the
+// paperclip process and a reader in the agent pod, and under a custom
+// `config.workspaceMountPath` those two reach the shared volume at DIFFERENT
+// absolute paths. Every fixture below uses two REAL directories — one standing
+// in for the pod's mount, one for the server's — so "the server wrote at the
+// pod's address" is caught on CONTENT rather than on a permission error, which
+// is what makes the mutation tests below fail for the right reason.
+describe("prepareClaudePromptBundle two address spaces (BLO-37760)", () => {
+  const companyId = "acme-co";
+  const instructionsContents = "# charter\n";
+
+  async function withMounts<T>(
+    body: (mounts: { podMount: string; serverMount: string; podRootDir: string }) => Promise<T>,
+  ): Promise<T> {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "blo37760-"));
+    vi.stubEnv("PAPERCLIP_HOME", path.join(root, "home"));
+    try {
+      const podMount = path.join(root, "pod-mnt");
+      const serverMount = path.join(root, "srv-mnt");
+      // Both exist and are writable: a reverted guard genuinely succeeds in
+      // writing to the wrong one, which is the state this must detect.
+      await fs.mkdir(podMount, { recursive: true });
+      await fs.mkdir(serverMount, { recursive: true });
+      return await body({
+        podMount,
+        serverMount,
+        podRootDir: path.posix.join(podMount, "instances/default/data/k8s-isolation/acme-co/agent-1/key-1/prompt-cache"),
+      });
+    } finally {
+      vi.unstubAllEnvs();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }
+
+  const exists = (target: string) => fs.stat(target).then(() => true).catch(() => false);
+
+  it("writes the skills bundle at the SERVER address while reporting the POD address to the container", async () => {
+    await withMounts(async ({ podMount, serverMount, podRootDir }) => {
+      const bundle = await prepareClaudePromptBundle({
+        companyId,
+        skills: [],
+        instructionsContents: null,
+        rootDir: podRootDir,
+        podDataMountPath: podMount,
+        serverDataMountPath: serverMount,
+        onLog,
+      });
+
+      // What the CONTAINER is handed (--add-dir) is a pod address.
+      expect(bundle.addDir.startsWith(`${podMount}/`)).toBe(true);
+      expect(bundle.rootDir).toBe(bundle.addDir);
+
+      // AC: the server path is the server mount joined to the SAME
+      // volume-relative subpath the pod path carries — derived from the pod
+      // path, never asserted as a second string literal.
+      const volumeRelative = bundle.addDir.slice(`${podMount}/`.length);
+      expect(bundle.serverRootDir).toBe(path.posix.join(serverMount, volumeRelative));
+
+      // ...and the bytes are really there, not merely named there.
+      expect(await exists(path.join(bundle.serverRootDir, ".claude", "skills"))).toBe(true);
+
+      // The defect itself: nothing may be created at the pod address, which on
+      // this process's filesystem is a different directory entirely.
+      expect(await exists(bundle.addDir)).toBe(false);
+    });
+  });
+
+  it("applies the same translation to instructionsFilePath / --append-system-prompt-file", async () => {
+    await withMounts(async ({ podMount, serverMount, podRootDir }) => {
+      const bundle = await prepareClaudePromptBundle({
+        companyId,
+        skills: [],
+        instructionsContents,
+        rootDir: podRootDir,
+        podDataMountPath: podMount,
+        serverDataMountPath: serverMount,
+        onLog,
+      });
+
+      expect(bundle.instructionsFilePath).not.toBeNull();
+      const podInstructions = bundle.instructionsFilePath as string;
+      expect(podInstructions.startsWith(`${podMount}/`)).toBe(true);
+
+      const volumeRelative = podInstructions.slice(`${podMount}/`.length);
+      const serverInstructions = path.posix.join(serverMount, volumeRelative);
+      expect(await fs.readFile(serverInstructions, "utf8")).toBe(instructionsContents);
+      expect(await exists(podInstructions)).toBe(false);
+    });
+  });
+
+  it("leaves an off-volume root untranslated (the managed PAPERCLIP_HOME default has no pod counterpart)", async () => {
+    await withMounts(async ({ podMount, serverMount }) => {
+      const bundle = await prepareClaudePromptBundle({
+        companyId,
+        skills: [],
+        instructionsContents: null,
+        // No rootDir => the managed PAPERCLIP_HOME default, which is already a
+        // server path. Rewriting it would relocate it somewhere it never was.
+        podDataMountPath: podMount,
+        serverDataMountPath: serverMount,
+        onLog,
+      });
+      expect(bundle.serverRootDir).toBe(bundle.rootDir);
+      expect(bundle.serverRootDir.startsWith(`${serverMount}/`)).toBe(false);
+      expect(await exists(path.join(bundle.serverRootDir, ".claude", "skills"))).toBe(true);
+    });
+  });
+
+  // AC 3, the required no-op control: the default mount is the only
+  // configuration in production use, so every emitted path must be
+  // byte-identical to what today's code produces.
+  it("is a byte-for-byte no-op when the two mounts coincide, and when they are omitted", async () => {
+    await withMounts(async ({ podMount, podRootDir }) => {
+      const args = {
+        companyId,
+        skills: [],
+        instructionsContents,
+        rootDir: podRootDir,
+        onLog,
+      };
+      const coinciding = await prepareClaudePromptBundle({
+        ...args,
+        podDataMountPath: podMount,
+        serverDataMountPath: podMount,
+      });
+      const omitted = await prepareClaudePromptBundle(args);
+
+      for (const bundle of [coinciding, omitted]) {
+        expect(bundle.rootDir).toBe(bundle.addDir);
+        expect(bundle.serverRootDir).toBe(bundle.rootDir);
+        expect(bundle.rootDir.startsWith(`${podRootDir}/`)).toBe(true);
+        expect(await exists(path.join(bundle.rootDir, ".claude", "skills"))).toBe(true);
+        expect(await fs.readFile(bundle.instructionsFilePath as string, "utf8")).toBe(instructionsContents);
+      }
+      expect(omitted.rootDir).toBe(coinciding.rootDir);
+      expect(omitted.instructionsFilePath).toBe(coinciding.instructionsFilePath);
+      expect(omitted.bundleKey).toBe(coinciding.bundleKey);
+    });
+  });
+});

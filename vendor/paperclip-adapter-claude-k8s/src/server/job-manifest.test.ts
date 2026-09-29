@@ -4662,3 +4662,84 @@ describe("scoped writable mounts (BLO-32734)", () => {
     });
   });
 });
+
+// BLO-37760 AC4. The prompt bundle now reports POD addresses while the server
+// writes through its own mount. `resolveScopedWritableMounts` partitions on
+// `dataMountPath` — the POD's mount — so the bundle's paths must stay on the
+// pod side of that partition or they are silently dropped as off-volume and the
+// container gets a read-only prompt-cache under the BLO-32734 ro data mount.
+describe("prompt-cache stays covered by a writable scoped mount (BLO-37760)", () => {
+  const POD_MOUNT = "/srv/agent-data";
+  const SERVER_MOUNT = "/paperclip";
+  const isolationRoot = `${POD_MOUNT}/instances/default/data/k8s-isolation/co1/agent-abc/key-1`;
+  const promptCacheRoot = `${isolationRoot}/prompt-cache`;
+  const addDir = `${promptCacheRoot}/bundlekey`;
+
+  const mountsFor = (
+    overrides: { addDir: string | null; instructionsFilePath: string | null },
+    // A RUNTIME descriptor leaves this "", so `addDir` becomes the ONLY
+    // candidate covering the bundle. With a config-source root present,
+    // `addDir` is its descendant and the minimal-set filter drops it.
+    isolationPromptCacheRoot: string = promptCacheRoot,
+  ) =>
+    resolveScopedWritableMounts({
+      dataMountPath: POD_MOUNT,
+      serverDataMountPath: SERVER_MOUNT,
+      isolation: {
+        enabled: true,
+        mode: "workspace",
+        source: "config",
+        key: "key-1",
+        root: isolationRoot,
+        homeRoot: `${isolationRoot}/home`,
+        sessionRoot: `${isolationRoot}/session`,
+        workspaceRoot: `${isolationRoot}/workspace`,
+        cacheRoot: "/runtime-cache/key-1/cache",
+        tmpRoot: "/runtime-cache/key-1/tmp",
+        promptCacheRoot: isolationPromptCacheRoot,
+        storage: isolatedStorage() as JobIsolation["storage"],
+      },
+      podLogPath: `${POD_MOUNT}/instances/default/data/run-logs/co1/agent-abc/run-abc12345.pod.ndjson`,
+      companyId: "co1",
+      ...overrides,
+    });
+
+  const covers = (mounts: { mountPath: string }[], target: string) =>
+    mounts.some((m) => target === m.mountPath || target.startsWith(`${m.mountPath}/`));
+
+  it("covers the pod-side bundle dir and its instructions file under a custom mount", () => {
+    const mounts = mountsFor({ addDir, instructionsFilePath: `${addDir}/agent-instructions.md` });
+    expect(covers(mounts, addDir), JSON.stringify(mounts)).toBe(true);
+    expect(covers(mounts, `${addDir}/agent-instructions.md`), JSON.stringify(mounts)).toBe(true);
+    expect(covers(mounts, `${addDir}/.claude/skills`), JSON.stringify(mounts)).toBe(true);
+  });
+
+  it("emits a volume-relative subPath, not one carrying the pod mount prefix", () => {
+    const mount = mountsFor({ addDir, instructionsFilePath: null })
+      .find((m) => addDir === m.mountPath || addDir.startsWith(`${m.mountPath}/`));
+    expect(mount).toBeDefined();
+    // `subPath` indexes into the PVC, so the pod mount must already be stripped.
+    expect(mount?.subPath.startsWith("/")).toBe(false);
+    expect(mount?.subPath).not.toContain(POD_MOUNT);
+    expect(`${POD_MOUNT}/${mount?.subPath}`).toBe(mount?.mountPath);
+  });
+
+  // The negative control, and the reason this suite exists: had the bundle kept
+  // reporting the SERVER address, the partition would drop it and emit nothing.
+  it("drops a SERVER-addressed bundle dir as off-volume — the state this change prevents", () => {
+    const serverAddr = addDir.replace(POD_MOUNT, SERVER_MOUNT);
+    const mounts = mountsFor({ addDir: serverAddr, instructionsFilePath: null });
+    expect(covers(mounts, serverAddr), JSON.stringify(mounts)).toBe(false);
+  });
+
+  // On a runtime descriptor `isolation.promptCacheRoot` is "", so the
+  // `promptBundle.addDir` candidate is the only thing keeping the bundle
+  // writable. Pinned separately because with a config-source root present it is
+  // a redundant descendant, and a fixture that only covers that shape passes
+  // with the candidate deleted.
+  it("covers the bundle via the addDir candidate when the descriptor supplies no promptCacheRoot", () => {
+    const mounts = mountsFor({ addDir, instructionsFilePath: null }, "");
+    expect(covers(mounts, addDir), JSON.stringify(mounts)).toBe(true);
+    expect(covers(mounts, `${addDir}/.claude/skills`), JSON.stringify(mounts)).toBe(true);
+  });
+});
