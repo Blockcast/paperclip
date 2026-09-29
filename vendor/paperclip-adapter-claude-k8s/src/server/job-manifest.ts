@@ -183,6 +183,47 @@ export function resolveLinkedWorktreeCommonDir(
 }
 
 /**
+ * Which `storage` flag governs each root that must live on the persistent
+ * volume. `cacheRoot`/`tmpRoot` are absent deliberately: a runtime descriptor
+ * puts those on the `/runtime-cache` emptyDir by design, so off-volume there is
+ * the intended shape, not a defect.
+ */
+const PERSISTENT_TREE_STORAGE: Record<string, keyof JobIsolation["storage"]> = {
+  "isolation.homeRoot": "home",
+  "isolation.sessionRoot": "session",
+  "isolation.workspaceRoot": "workspace",
+};
+
+/** A tree the descriptor declares `persistent` but places off the persistent
+ *  volume is not a scoping decision — it is data loss. The path resolves to the
+ *  container filesystem and vanishes with the pod, and the `continue` at the
+ *  call site means no rw mount is emitted for it either. Named for the same
+ *  reason `resolveLinkedWorktreeCommonDir` names its rejection: the run proceeds
+ *  narrowed and fails later somewhere unrelated, which is unreadable without
+ *  this. Not thrown — a descriptor is server-supplied and an operator may have
+ *  a reason; the run still works, it just does not persist. */
+function warnIfPersistentTreeIsOffVolume(
+  field: string,
+  raw: string,
+  isolation: JobIsolation,
+  dataMountPath: string,
+): void {
+  const storageKey = PERSISTENT_TREE_STORAGE[field];
+  if (!storageKey || isolation.storage[storageKey] !== "persistent") return;
+  console.warn(
+    JSON.stringify({
+      level: "warn",
+      event: "claude_k8s.isolation_root_off_volume",
+      msg: "isolation root declared persistent but is outside the data mount; it will not be writable or persisted",
+      field,
+      path: raw,
+      dataMountPath,
+      isolationSource: isolation.source,
+    }),
+  );
+}
+
+/**
  * Derives the set of trees an agent pod must be able to WRITE, so the rest of
  * the shared `data` PVC can be mounted read-only (BLO-32734).
  *
@@ -235,8 +276,12 @@ export function resolveScopedWritableMounts(input: {
     // The shared pnpm store (BLO-36583) is a SIBLING of the isolation root, not
     // a descendant, so no root above covers it. It is company-scoped, which is
     // exactly the boundary the `work/<companyId>` scratch remap below holds.
-    // Only on a persistent workspace — otherwise `PNPM_HOME` is under
-    // `cacheRoot`, which is off-volume and already writable.
+    // Only on a persistent workspace — otherwise `PNPM_HOME` is `${cacheRoot}/pnpm`
+    // (`:1391-1394`), and `cacheRoot` is already a candidate two entries up, so it
+    // is covered wherever it lives. The earlier justification here — "cacheRoot is
+    // off-volume" — held for these fixtures and for the config-source default but
+    // is not a property of the type: nothing stops a runtime descriptor putting
+    // `cacheRoot` on the PVC. Its own entry is what makes that case safe.
     [
       "sharedPnpmStore",
       isolation.storage.workspace === "persistent" ? sharedPnpmStorePath(companyId, dataMountPath) : "",
@@ -255,7 +300,10 @@ export function resolveScopedWritableMounts(input: {
     assertNormalizedPath(field, raw);
     // Off-volume roots (the `/runtime-cache` emptyDir, `/tmp`) are already
     // writable and are not ours to scope.
-    if (raw !== dataMountPath && !raw.startsWith(prefix)) continue;
+    if (raw !== dataMountPath && !raw.startsWith(prefix)) {
+      warnIfPersistentTreeIsOffVolume(field, raw, isolation, dataMountPath);
+      continue;
+    }
     if (raw === dataMountPath) {
       throw new Error(`${field} must not be the data mount root itself (${dataMountPath}); that would re-open the whole volume for writing`);
     }
@@ -509,7 +557,18 @@ export function resolveJobIsolation(
   const agentId = sanitizeForK8sPath(ctx.agent.id);
   assertSafePathComponent("companyId", companyId);
   assertSafePathComponent("agentId", agentId);
-  const root = asString(config.isolationRoot, "").trim() || `/paperclip/instances/default/data/k8s-isolation/${companyId}/${agentId}/${key}`;
+  // Rooted at the data mount, not at a hardcoded `/paperclip`. Every one of the
+  // roots below is a POD address: the init container `mkdir -p`s them, `HOME`
+  // and `workingDir` point at them, and `resolveLinkedWorktreeCommonDir`
+  // translates `workspaceRoot` pod->server to read through it. Under a custom
+  // `config.workspaceMountPath`, `/paperclip` is not a mount in that pod at all,
+  // so a hardcoded default puts the agent's home and checkout on the container
+  // filesystem — they vanish at pod exit, and `resolveScopedWritableMounts`
+  // drops them as off-volume. Same two-address-space defect as `buildPodLogPath`
+  // and `sharedPnpmStorePath`. An operator who sets `isolationRoot` explicitly
+  // owns the result; the off-volume warning below is what surfaces a bad one.
+  const dataMountPath = resolveDataMountPath(config);
+  const root = asString(config.isolationRoot, "").trim() || `${dataMountPath}/instances/default/data/k8s-isolation/${companyId}/${agentId}/${key}`;
   const homeRoot = asString(config.homeRoot, "").trim() || `${root}/home`;
   const sessionRoot = asString(config.sessionRoot, "").trim() || homeRoot;
   const workspaceRoot = asString(config.workspaceRoot, "").trim() || `${root}/workspace`;
