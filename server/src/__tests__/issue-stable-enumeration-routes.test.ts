@@ -389,8 +389,10 @@ describeEmbeddedPostgres("issue list stable enumeration and exact counts", () =>
     //
     // Scope, so the next reader does not over-read this: it pins the fallback's PRESENCE, not
     // its value. Every `pageSize >= 1` passes here — the walk's `rows.length < opts.pageSize`
-    // short-return fires on the empty page BEFORE the keyset branch can dereference it — so
-    // `?? 1` and `?? ISSUE_LIST_MAX_LIMIT` are indistinguishable to this assertion. Pinning
+    // short-return fires BEFORE the keyset branch can dereference, on the first page at the
+    // default size (2 < 1000, so no empty page is ever fetched) and on the empty page at
+    // `pageSize <= 2` — so `?? 1` and `?? ISSUE_LIST_MAX_LIMIT` are indistinguishable to this
+    // assertion. Pinning
     // the value needs the ISSUE_LIST_MAX_LIMIT + 1 fixture this file deliberately does not
     // seed — that fixture is what forced the `120_000` timeout this PR removed, so the trade
     // is deliberate.
