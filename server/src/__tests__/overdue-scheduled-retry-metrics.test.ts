@@ -648,6 +648,8 @@ describe("scheduled-retry park horizon help text (BLO-31174)", () => {
     const capacityCeilingS = resolveCcrotateCapacityRetry({
       resumeAt: new Date(now.getTime() + CCROTATE_CAPACITY_MAX_PARK_MS),
       now,
+      // Required by the input type but never consulted here: `resumeAt` is in
+      // the future, so `baseMs` takes it. The ceiling does not depend on this.
       defaultRetryDelayMs: CCROTATE_CAPACITY_MAX_PARK_MS,
       random: () => 1,
     }).retryAt.getTime() / 1000;
