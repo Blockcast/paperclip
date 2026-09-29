@@ -104,15 +104,39 @@ const JOB_TIMEOUT_PATTERNS = [/has exceeded the maximum execution time/i];
 // step from checkout onward is skipped" matches nothing and the signal is born
 // inert. Matching on the declared body only is what makes it fire.
 //
-// Names, not indices: a step's position moves whenever `pr.yml` gains or loses
-// a step, and these three names are GitHub's own and stable across lanes.
+// Names identify these steps, but POSITION decides which ones are synthetic.
+// GitHub runs its preamble before the first declared step and its postamble
+// after the last one, so the preamble is the LEADING run of steps carrying
+// these names and the postamble the TRAILING run — see `jobBodySteps` below. A
+// step the workflow declares under one of these names anywhere after the body
+// has started therefore stays IN the body, where its failure defeats the
+// all-skipped test on its own.
 //
-// The cost of matching on name is a latent collision: a step the workflow
-// DECLARES as `Set up runner` would be read as synthetic and pulled out of the
-// body. No workflow in `.github/workflows/` declares either name today (checked
-// at this commit), and the collision is self-limiting — a declared step under
-// one of these names would have to be `skipped` along with the whole body for
-// the signal to fire at all. Rename rather than reintroduce one.
+// Names are still needed because indices alone will not do: a step's position
+// moves whenever `pr.yml` gains or loses a step, and the preamble is itself one
+// or two steps long depending on whether the job declares `container:` /
+// `services:`. These three names are GitHub's own and stable across lanes.
+//
+// The residual collision is narrow but real, and it runs in the UNSAFE
+// direction. A workflow whose FIRST declared step is named `Set up runner` is
+// absorbed into the leading run, and — because that name is also in
+// EXCUSABLE_SETUP_FAILURE_STEP_NAMES below — a failure there with the rest of
+// the body skipped is excused as a pool kill: a defect the diff really did
+// introduce, announced as infrastructure. That is this script's purpose
+// inverted, the same failure mode the `timeout-minutes` override exists to
+// prevent.
+//
+// It is NOT self-limiting, and an earlier revision of this comment claimed it
+// was — wrongly, and in the unsafe direction. The colliding step is excused
+// precisely WHEN IT FAILS: it is absorbed into the preamble by name and lands
+// in the excusable set, so it never has to be `skipped`. Rename rather than
+// reintroduce one — the reason being that the FAILING case is the dangerous
+// one, not the skipped one.
+//
+// Nothing declares either name today, checked at this commit across
+// `.github/workflows/` AND `.github/actions/**`: a composite action's steps
+// render into the calling job's step list too, so both directories are the same
+// surface and a check that looks at only one of them is incomplete.
 const PRE_BODY_SETUP_STEP_NAMES = new Set(["set up job", "set up runner"]);
 const RUNNER_POSTAMBLE_STEP_NAMES = new Set(["complete job"]);
 
@@ -143,6 +167,33 @@ const EXCUSABLE_SETUP_FAILURE_STEP_NAMES = new Set(["set up runner"]);
 
 const normalizedStepName = (step) =>
   typeof step?.name === "string" ? step.name.trim().toLowerCase() : "";
+
+/**
+ * The steps a job's workflow actually DECLARED — everything between GitHub's
+ * synthetic preamble and its synthetic postamble.
+ *
+ * Positional rather than by set membership, because "synthetic" is a fact about
+ * WHERE a step runs, not what it is called. Filtering the whole step list by
+ * name pulled a DECLARED step named `Set up runner` out of the body from any
+ * position, so its failure both vanished from the all-skipped test below and
+ * satisfied `EXCUSABLE_SETUP_FAILURE_STEP_NAMES` — the step name alone flipped a
+ * real diff failure to `infrastructure`. Bounding the match to the leading and
+ * trailing runs keeps a later collision inside the body, where a `failure`
+ * conclusion defeats the signal on its own with no name-matching involved.
+ *
+ * @param {Array<{name?: string, conclusion?: string}>} steps
+ */
+function jobBodySteps(steps) {
+  let start = 0;
+  while (start < steps.length && PRE_BODY_SETUP_STEP_NAMES.has(normalizedStepName(steps[start]))) {
+    start += 1;
+  }
+  let end = steps.length;
+  while (end > start && RUNNER_POSTAMBLE_STEP_NAMES.has(normalizedStepName(steps[end - 1]))) {
+    end -= 1;
+  }
+  return steps.slice(start, end);
+}
 
 /**
  * Classify a single Actions job as an infrastructure kill or a real failure.
@@ -243,10 +294,7 @@ export function classifyJobFailure(job, annotations = null) {
   // fail here for a reason genuinely its own. No lane in `pr.yml` declares
   // either today (checked at this commit), so nothing is currently mislabelled —
   // but a lane that gains one would need that case excluded here.
-  const bodySteps = steps.filter((step) => {
-    const name = normalizedStepName(step);
-    return !PRE_BODY_SETUP_STEP_NAMES.has(name) && !RUNNER_POSTAMBLE_STEP_NAMES.has(name);
-  });
+  const bodySteps = jobBodySteps(steps);
   const everyFailureIsExcusableSetup = steps
     .filter((step) => step?.conclusion === "failure")
     .every((step) => EXCUSABLE_SETUP_FAILURE_STEP_NAMES.has(normalizedStepName(step)));
