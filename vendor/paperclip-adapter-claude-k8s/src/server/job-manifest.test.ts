@@ -3798,6 +3798,100 @@ describe("scoped writable mounts (BLO-32734)", () => {
     }
   });
 
+  // This leg deliberately asserts only the pnpm path, NOT `workspaceRoot`/
+  // `homeRoot`: its descriptor is runtime-supplied with literal `/paperclip`
+  // roots, so under `/srv/agent-data` those are genuinely off-volume and cannot
+  // be covered by any mount. That mismatch is reported instead — see
+  // "names a persistent descriptor root that falls outside the data mount".
+  // The config-source half, where the adapter DOES own the roots, is next.
+  it("roots config-source isolation at the mount the pod actually has", () => {
+    const ctx = makeCtx();
+    ctx.config = { isolationMode: "isolated", isolationKey: "cm-1", workspaceMountPath: "/srv/agent-data" };
+    const { job, scopedWritableDirs } = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+    const containers = [job.spec?.template?.spec?.containers[0], job.spec?.template?.spec?.initContainers?.[0]];
+    const root = "/srv/agent-data/instances/default/data/k8s-isolation/co1/agent-abc/cm-1";
+
+    // The roots the pod addresses follow the mount the pod actually has. Pinned
+    // off HOME and workingDir, not off the resolver, because those are what the
+    // container uses: a hardcoded `/paperclip` here is not a mount in this pod.
+    const env = new Map(containers[0]?.env?.map((e) => [e.name, e.value]));
+    expect(env.get("HOME")).toBe(`${root}/home`);
+    expect(containers[0]?.workingDir).toBe(`${root}/workspace`);
+
+    // ...and both are WRITABLE under the narrowed mount. Asserting the paths
+    // alone would pass while the off-volume filter silently dropped them.
+    for (const container of containers) {
+      const mounts = container?.volumeMounts ?? [];
+      expect(mounts.find((m) => m.mountPath === "/srv/agent-data" && !m.subPath)?.readOnly).toBe(true);
+      for (const tree of [`${root}/home`, `${root}/workspace`]) {
+        const covering = mounts.filter(
+          (m) => m.subPath && !m.readOnly && (tree === m.mountPath || tree.startsWith(`${m.mountPath}/`)),
+        );
+        expect(covering, `no writable mount covers ${tree}`).not.toEqual([]);
+      }
+    }
+    // Pre-creation still happens through the SERVER's root, which the pod's
+    // mount path does not move.
+    expect(scopedWritableDirs).toContain(
+      "/paperclip/instances/default/data/k8s-isolation/co1/agent-abc/cm-1/home",
+    );
+  });
+
+  // The other half: a runtime descriptor's roots are server-supplied, so the
+  // adapter cannot derive them and a mismatch can only be REPORTED. Dropping it
+  // silently is indistinguishable from "correctly scoped off-volume".
+  it("names a persistent descriptor root that falls outside the data mount", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const ctx = makeCtx();
+      ctx.config = { ...(ctx.config ?? {}), workspaceMountPath: "/srv/agent-data" };
+      setRuntimeIsolation(ctx, { ...WORKSPACE_DESCRIPTOR, storage: isolatedStorage("persistent") });
+      mountsFor(ctx);
+      const events = warn.mock.calls
+        .map(([line]) => {
+          try {
+            return JSON.parse(String(line));
+          } catch {
+            return null;
+          }
+        })
+        .filter((e) => e?.event === "claude_k8s.isolation_root_off_volume");
+      expect(events.map((e) => e.field).sort()).toEqual([
+        "isolation.homeRoot",
+        "isolation.sessionRoot",
+        "isolation.workspaceRoot",
+      ]);
+      expect(events[0].dataMountPath).toBe("/srv/agent-data");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  // ...and silent on the shape that is off-volume BY DESIGN. A warning that
+  // fires on the normal path is one everybody learns to skip.
+  it("stays quiet when an off-volume root is declared ephemeral", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const ctx = makeCtx();
+      setRuntimeIsolation(ctx, {
+        isolationMode: "run",
+        isolationKey: "run:run-abc12345",
+        workspaceRoot: "/runtime-cache/paperclip-runs/run-abc12345/workspace",
+        homeRoot: "/runtime-cache/paperclip-runs/run-abc12345/home",
+        sessionRoot: "/runtime-cache/paperclip-runs/run-abc12345/session",
+        cacheRoot: "/runtime-cache/paperclip-runs/run-abc12345/cache",
+        tmpRoot: "/runtime-cache/paperclip-runs/run-abc12345/tmp",
+        storage: isolatedStorage("ephemeral"),
+      });
+      mountsFor(ctx);
+      expect(
+        warn.mock.calls.filter(([line]) => String(line).includes("isolation_root_off_volume")),
+      ).toEqual([]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   // The ephemeral half: PNPM_HOME moves under cacheRoot, which is the
   // off-volume runtime-cache emptyDir, so it must NOT mint a mount here.
   it("emits no pnpm store mount for an ephemeral workspace", () => {
