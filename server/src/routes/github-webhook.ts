@@ -2808,7 +2808,16 @@ function wakeIdempotencySuffix(
 ): { suffix: string; scope: WakeIdempotencyScope } {
   const scopeFor = (identity: string | number | null): WakeIdempotencyScope =>
     identity === null || identity === "" ? "stable" : "request";
-  if (context.wakeReason === "github_pr_review_requested") {
+  // BLO-23395: a merge-queue eviction is comment-scoped for the same reason.
+  // The detector posts a NEW comment per eviction, so the comment id is the
+  // per-event identity. The default repo+pr+reason `stable` key would collide
+  // a second eviction with the first one's still-running author wake (the
+  // evict -> rebase -> re-enqueue -> evict loop) and drop it as a duplicate.
+  // Head-scoping would be wrong: an eviction can recur on an unchanged head.
+  if (
+    context.wakeReason === "github_pr_review_requested" ||
+    context.wakeReason === "github_pr_merge_queue_evicted"
+  ) {
     const identity = context.commentId ?? deliveryId ?? null;
     return {
       suffix: `${context.wakeReason}:comment:${identity ?? "unknown"}`,
@@ -2912,7 +2921,8 @@ const REVIEWER_HEAD_SCOPED_WAKE_REASONS: ReadonlySet<string> = new Set([
 ]);
 
 // The PR-author wake keeps repo+pr+reason keys for everything except the
-// comment-scoped @ally request; widening it is a separate behavior change.
+// comment-scoped @ally request and merge-queue eviction; widening it is a
+// separate behavior change.
 const AUTHOR_DELIVERY_SCOPED_WAKE_REASONS: ReadonlySet<string> = new Set();
 
 function prReviewerWakeIdempotencyScope(
