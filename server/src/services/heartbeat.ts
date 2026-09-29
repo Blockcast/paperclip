@@ -25211,7 +25211,44 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
   }
 
+  // BLO-35878: this sweep is instance-wide and takes no agent argument — the
+  // `activeRuns` select below reads EVERY `running` row. But the call site in
+  // `startNextQueuedRunForAgent` runs it inside that agent's OWN start lock, so
+  // N external-lifecycle agents dispatching concurrently ran N redundant copies
+  // of the identical sweep against one DB pool and one k8s API. Each extra copy
+  // lengthened every other agent's hold, which queued more agents, which
+  // produced more concurrent copies on release: a self-reinforcing loop that
+  // took the ex-Ally hourly max hold from <=155 s to 2148 s over 2026-09-23..29.
+  //
+  // Coalescing identical in-flight sweeps onto one promise breaks the loop
+  // without changing what any caller observes: a joiner still waits for a
+  // completed sweep before proceeding, exactly as if it had run its own.
+  //
+  // The key includes the options deliberately. The periodic tick in index.ts
+  // passes `staleThresholdMs: 5 * 60 * 1000` while this lock's caller takes the
+  // default 0, and 0 is the more aggressive reap. Keying on the options stops a
+  // caller that asked to reap everything stale from being silently handed the
+  // tick's narrower result and dispatching against a slot count that still
+  // counts an orphan.
+  const inFlightReaps = new Map<string, Promise<{ reaped: number; runIds: string[] }>>();
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; suppressDispatchAfterReap?: boolean }) {
+    const coalesceKey = `${opts?.staleThresholdMs ?? 0}:${opts?.suppressDispatchAfterReap === true}`;
+    const alreadySweeping = inFlightReaps.get(coalesceKey);
+    if (alreadySweeping) return alreadySweeping;
+
+    const sweep = reapOrphanedRunsUncoalesced(opts);
+    inFlightReaps.set(coalesceKey, sweep);
+    try {
+      return await sweep;
+    } finally {
+      // Clear before the next caller can observe a settled promise, so a sweep
+      // that threw is never handed to a joiner as a completed one.
+      inFlightReaps.delete(coalesceKey);
+    }
+  }
+
+  async function reapOrphanedRunsUncoalesced(opts?: { staleThresholdMs?: number; suppressDispatchAfterReap?: boolean }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
 

@@ -1736,6 +1736,37 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(handoffWakeups).toHaveLength(0);
   });
 
+  it("coalesces concurrent identical orphan sweeps onto a single in-flight pass (BLO-35878)", async () => {
+    // `reapOrphanedRuns` is instance-wide but runs inside each agent's OWN
+    // start lock, so N concurrent dispatchers used to run N redundant copies of
+    // the same sweep against one DB pool — the amplifier behind the 2148 s
+    // start-lock holds. Identity is the assertion that matters: a joiner that
+    // receives the SAME result object was handed the first sweep's promise
+    // rather than starting a second pass, because each pass builds a fresh
+    // `{ reaped, runIds }`.
+    const [first, joiner] = await Promise.all([
+      heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true }),
+      heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true }),
+    ]);
+    expect(joiner).toBe(first);
+
+    // Negative control — different options must NOT share a sweep. The in-lock
+    // caller takes the default threshold 0 (reap everything stale) while the
+    // periodic tick passes 5 min; silently handing the former the latter's
+    // narrower result would let it dispatch against a slot count that still
+    // counts an orphan.
+    const [aggressive, narrow] = await Promise.all([
+      heartbeat.reapOrphanedRuns({ staleThresholdMs: 0 }),
+      heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 }),
+    ]);
+    expect(narrow).not.toBe(aggressive);
+
+    // A settled sweep is not reused: the latch must be released on completion,
+    // or every later caller would be served a permanently stale reap.
+    const afterSettled = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+    expect(afterSettled).not.toBe(first);
+  });
+
   it("keeps a local run active when the recorded pid is still alive", async () => {
     const child = spawnAliveProcess();
     childProcesses.add(child);
