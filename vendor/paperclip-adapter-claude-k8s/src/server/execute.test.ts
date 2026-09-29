@@ -1651,7 +1651,7 @@ describe("execute: waitForPod edge cases", () => {
     expect(result.errorMessage).toContain("write-prompt");
     expect(result.errorMessage).toContain("exit code 255");
     expect(result.errorMessage).not.toContain("Pod scheduling failed");
-    expect(result.errorMessage).not.toContain("Pod terminated before startup");
+    expect(result.errorMessage).not.toContain("Pod terminated before log streaming");
   });
 
   // A phase=Failed pod whose MAIN container died is unaffected by that
@@ -1678,7 +1678,7 @@ describe("execute: waitForPod edge cases", () => {
     const result = await execute(makeCtx());
 
     expect(result.errorCode).toBe("k8s_pod_schedule_failed");
-    expect(result.errorMessage).toContain("Pod terminated before startup");
+    expect(result.errorMessage).toContain("Pod terminated before log streaming");
     expect(result.errorMessage).toContain("OOMKilled");
     expect(result.errorMessage).not.toContain("Init container failed");
   });
@@ -1715,7 +1715,7 @@ describe("execute: waitForPod edge cases", () => {
 
     const result = await execute(makeCtx());
 
-    expect(result.errorMessage).toContain("Pod terminated before startup");
+    expect(result.errorMessage).toContain("Pod terminated before log streaming");
     expect(result.errorMessage).toContain("OOMKilled");
     expect(result.errorMessage).not.toContain("dind");
     expect(result.errorMessage).not.toContain("Init container failed");

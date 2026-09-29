@@ -1213,11 +1213,10 @@ function buildDindSidecar(opts: {
   memoryLimit: string;
 }): k8s.V1Container {
   // restartPolicy: "Always" on an init container is the native sidecar
-  // pattern (k8s 1.29 GA, 1.28 beta). The @kubernetes/client-node
-  // V1Container type predates this addition, so we declare an intersection
-  // type that adds the field instead of any-casting the whole container.
-  type SidecarContainer = k8s.V1Container & { restartPolicy?: string };
-  const sidecar: SidecarContainer = {
+  // pattern (k8s 1.29 GA, 1.28 beta). @kubernetes/client-node declares the
+  // field on V1Container (1.4.0, V1Container.d.ts:70), so no cast or
+  // intersection type is needed — tsc checks the field name here.
+  const sidecar: k8s.V1Container = {
     name: "dind",
     image: opts.image,
     imagePullPolicy: "IfNotPresent",
