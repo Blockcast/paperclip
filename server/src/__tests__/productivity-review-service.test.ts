@@ -10634,5 +10634,144 @@ describeEmbeddedPostgres("productivity review service", () => {
       expect(result.noActionSuppressed).toBe(1);
       expect(result.created).toBe(0);
     });
+
+    async function unchangedSampleSuppressionRows(companyId: string) {
+      const rows = await db
+        .select({ details: activityLog.details })
+        .from(activityLog)
+        .where(
+          and(eq(activityLog.companyId, companyId), eq(activityLog.action, "issue.productivity_review_suppressed")),
+        );
+      return rows.filter((row) => (row.details as { suppressedBy?: string })?.suppressedBy === "unchanged_run_sample");
+    }
+
+    // BLO-24022 applied to this gate. Every sibling suppression terminates on
+    // its own; this one is deliberately unbounded, so an undeduped recorder
+    // emits a row per ~30s pass forever. It is not only noise: these rows land
+    // on `entityId: sourceIssue.id`, and
+    // `countConsecutiveNoActionProductivityReviews` breaks its streak on ANY
+    // activityLog row on the source — so the gate would reset the very cap its
+    // own call site documents as the supplement it relies on.
+    it("writes one suppression audit row per frozen window, not one per reconcile pass", async () => {
+      const seeded = await seedFrozenRuntimeFailureSample();
+      await insertResolvedReview(seeded, hoursAgo(30));
+
+      const first = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+      const second = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      // The decision is still reached on every pass — the counter measures
+      // suppressions, not audit rows, so the 14-day field measurement is
+      // unaffected by the dedupe.
+      expect(first.unchangedSampleSuppressed).toBe(1);
+      expect(second.unchangedSampleSuppressed).toBe(1);
+      expect(first.created).toBe(0);
+      expect(second.created).toBe(0);
+      expect(await unchangedSampleSuppressionRows(seeded.companyId)).toHaveLength(1);
+    });
+
+    // Dedupe control — without this the key could be constant for every input
+    // and the test above would still pass, which would silently stop recording
+    // genuine state changes.
+    it("writes a second row once the sample moves, even while still suppressing", async () => {
+      const seeded = await seedFrozenRuntimeFailureSample();
+      await insertResolvedReview(seeded, hoursAgo(30));
+
+      await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: seeded.companyId });
+      // Still older than the resolved review, so the gate keeps suppressing —
+      // but `newestSampledRunCreatedAt` has moved, which is a real state change.
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: 1,
+        now: hoursAgo(40),
+        status: "failed",
+        livenessState: "failed",
+        usageJson: null,
+      });
+      const second = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(second.unchangedSampleSuppressed).toBe(1);
+      expect(second.created).toBe(0);
+      expect(await unchangedSampleSuppressionRows(seeded.companyId)).toHaveLength(2);
+    });
+
+    // The retired-reservation exposure closed on
+    // `findLatestTerminalProductivityReviewCreatedAt` exists identically on
+    // `countConsecutiveNoActionProductivityReviews`, and that site is the
+    // unbounded one: it is capped by row count, not by a time window, so
+    // nothing ages the row out. Runs sit newer than every review so the
+    // unchanged-sample gate does not apply and the no-action cap is what is
+    // under test.
+    it("does not let a retired reservation occupy a slot in the no-action streak", async () => {
+      const seeded = await seedAssignedIssue({ status: "todo" });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now: hoursAgo(7),
+        spacingMs: 10 * 60 * 1000,
+        status: "failed",
+        livenessState: "failed",
+        usageJson: null,
+      });
+      await db.insert(issues).values(
+        [96, 72].map((hours, index) => {
+          const createdAt = hoursAgo(hours);
+          return {
+            id: randomUUID(),
+            companyId: seeded.companyId,
+            title: `No-action productivity review ${index + 1}`,
+            status: "done" as const,
+            priority: "high" as const,
+            originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+            originId: seeded.issueId,
+            originFingerprint: `productivity-review:${seeded.issueId}`,
+            parentId: seeded.issueId,
+            issueNumber: index + 2,
+            identifier: `${seeded.issuePrefix}-${index + 2}`,
+            createdAt,
+            updatedAt: new Date(createdAt.getTime() + 60 * 60 * 1000),
+          };
+        }),
+      );
+      // Third "done" row, but a reservation nobody ever saw: NULL identifier,
+      // NULL issueNumber, no `hiddenAt`. Its retirement logs against the review
+      // issue, not the source, so nothing breaks the streak on its account.
+      await db.insert(issues).values({
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        title: "Stale productivity-review reservation retired by the recovery pass",
+        status: "done",
+        priority: "high",
+        originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+        originId: seeded.issueId,
+        originFingerprint: `productivity-review:${seeded.issueId}`,
+        parentId: seeded.issueId,
+        issueNumber: null,
+        identifier: null,
+        createdAt: hoursAgo(48),
+        updatedAt: hoursAgo(47),
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.noActionSuppressed).toBe(0);
+      expect(result.unchangedSampleSuppressed).toBe(0);
+      expect(result.created).toBe(1);
+    });
   });
 });
