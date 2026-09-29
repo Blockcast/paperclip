@@ -9089,11 +9089,13 @@ function isAutoCheckoutWakeReason(wakeReason: string | null | undefined) {
  * ownership". It also excludes `execution_*`, whose stage participant is
  * likewise routinely not the assignee — but the gate that protects those, the
  * `issue_review_participant_changed` check, exists only in
- * `evaluateScheduledRetryGate`. Exempting them here would clear the assignee
- * check at the promotion and mint sites too, which have no participant check to
- * fall back on. Add them once that check is replicated at those sites; until
- * then their retries stay suppressed, and say so via the honest error code
- * below rather than by mislabelling them a reassignment.
+ * `evaluateScheduledRetryGate`. Promotion calls that helper unconditionally, so
+ * it is covered; the MINT site runs it only under `requiresIssueGate`, which a
+ * bounded transient retry does not satisfy. Exempting `execution_*` here would
+ * therefore clear the assignee check at mint with no participant check behind
+ * it. Add them once that check is replicated there; until then their retries
+ * stay suppressed, and say so via the honest error code below rather than by
+ * mislabelling them a reassignment.
  */
 const NON_OWNERSHIP_RETRY_WAKE_REASONS = new Set(["issue_comment_mentioned"]);
 
@@ -9142,10 +9144,14 @@ type ScheduledRetryAssigneeMismatch = {
  * retry, and under which of the two distinct facts it hides (BLO-38064).
  *
  * Returns `null` — retry allowed — when the run holds the issue, or when the
- * lineage started from a wake in {@link NON_OWNERSHIP_RETRY_WAKE_REASONS}. The
- * terminal-status, review-participant, pause-hold and dependency gates are
- * unchanged and still apply to an exempt retry; this clears only the ownership
- * test, which such a wake was never subject to.
+ * lineage started from a wake in {@link NON_OWNERSHIP_RETRY_WAKE_REASONS}. This
+ * clears only the ownership test, which such a wake was never subject to. What
+ * else still gates the retry depends on the site, because
+ * `evaluateScheduledRetryGate` — which carries the terminal-status,
+ * review-participant, pause-hold and dependency checks — runs UNCONDITIONALLY at
+ * promotion and only under `requiresIssueGate` at mint. A bounded transient
+ * retry does not satisfy `requiresIssueGate`, so at mint none of those four run;
+ * at promotion all four do.
  *
  * Two gates that do NOT cover an exempt retry, so do not lean on them here:
  *
@@ -9154,12 +9160,16 @@ type ScheduledRetryAssigneeMismatch = {
  *   `scheduleBoundedRetryForRun` always clears `issues.executionRunId` before
  *   parking, and it stays null for the whole parked window. So at every gate
  *   site reached from a parked retry, `issueExecutionRetryLockAvailable` passes
- *   on its `== null` arm. It is also opt-in per retry reason, and the bounded
- *   transient retry this exemption is about is not one of the reasons that opts
- *   in.
- * - **`in_progress`.** `requiresInProgressIssueRetry` excludes
- *   `session_unavailable` and `zero_token_session_reset`, and is likewise gated
- *   on `requiresIssueExecutionRetryLock`.
+ *   on its `== null` arm. Reachability compounds that: the shared gate's check
+ *   is opt-in via `enforceIssueExecutionLock`, and promotion's own inline check
+ *   sits inside a block gated on `requiresIssueExecutionRetryLock` — which a
+ *   bounded transient retry fails — so neither fires for this family at all.
+ *   Only the mint-site check runs unconditionally, and there the lock is still
+ *   this run's own.
+ * - **`in_progress`.** `requiresInProgressIssueRetry` is gated on
+ *   `requiresIssueExecutionRetryLock`, so a bounded transient retry never
+ *   reaches it (and within the reasons that do, it excludes
+ *   `session_unavailable` and `zero_token_session_reset`).
  *
  * RESIDUAL (accepted, BLO-38064 review): a mention-woken agent can still check
  * out manually, which assigns it the issue and takes the lock. If its run then
@@ -9169,10 +9179,12 @@ type ScheduledRetryAssigneeMismatch = {
  * verdict. Nothing above catches it, because the lock was released at mint and
  * the fact that this lineage once held it is gone by gate time. Closing it means
  * stamping that fact at mint, the way `originWakeReason` is stamped. Judged not
- * worth the plumbing for now: promotion writes no lock (so there is no
- * concurrent execution), once the new owner takes the lock
- * `issue_execution_lock_changed` blocks the lineage anyway, and the residual
- * costs one wake to an agent that will read the issue and find it reassigned.
+ * worth the plumbing for now, but note the bound is narrower than the lock gate
+ * would suggest: for this family no lock check fires at promotion (see above),
+ * so the new owner taking the lock does NOT stop the lineage. What bounds it is
+ * that promotion writes no lock, so there is no concurrent execution, and the
+ * retry is attempt-capped — the cost is a bounded number of wakes to an agent
+ * that will read the issue and find it reassigned.
  *
  * `issue_reassigned` now means what it says. It is kept for a wake that DID
  * confer ownership — the assignee episode BLO-29729 wrote the guard for, where
