@@ -200,8 +200,9 @@ if [ "${PAPERCLIP_GITHUB_TOKEN_FILE+x}" = x ]; then
     # Local-only commands (bare `gh` prints usage) never contact GitHub, so no
     # credential can make their answer wrong. `gh --version` is also the first
     # thing a human or a probe runs to decide whether the binary works at all,
-    # which is exactly when refusing it would mislead.
-    "--version "* | "version "* | "--help "* | "-h "* | "help "* | "completion "* | " ") TOKEN_FILE_REQUIRED=no ;;
+    # which is exactly when refusing it would mislead. `config` reads and writes
+    # only ~/.config/gh, so it belongs to the same rule.
+    "--version "* | "version "* | "--help "* | "-h "* | "help "* | "completion "* | "config "* | " ") TOKEN_FILE_REQUIRED=no ;;
     # `auth git-credential` is deliberately NOT exempt: git resolving a remote
     # is a real query, so it gets the stderr diagnostic at the point of failure.
     # That is all it gets. git ignores a credential helper's non-zero exit and
