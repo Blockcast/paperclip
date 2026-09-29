@@ -752,6 +752,66 @@ describe("merge-gate reader", () => {
       );
     });
 
+    // A `neutral` row and a `${{`-bearing one are this reader's two declared
+    // NON-verdicts, both explicitly non-blocking. Crediting either as "this run
+    // spoke" suppresses NO-VERDICT for a run that has said nothing — the same
+    // fail-GREEN class this guard exists to close, one row away from itself.
+    // `contributed` must therefore use the SAME predicate as the survivor count
+    // `n`; the naive `{contributed[$4]=1}` survives every other fixture here.
+    // Raised by @ally on #2112 and reproduced exactly as reported.
+    for (const [label, row] of [
+      ["NOT-EVALUATED", ["somegate", "neutral", "t1", "77"]],
+      ["MALFORMED", ["${{ matrix.name }}", "queued", "t1", "77"]],
+    ]) {
+      it(`does not credit a ${label} row as its run having spoken`, () => {
+        // A second, green run keeps the BLO-34263 ABSENT guard quiet, so
+        // NO-VERDICT is the only thing that can report run 77 here.
+        const lines = read(
+          [["verify", "success", "t1", "66"], row],
+          "__none__",
+          pend(["77", "queued", "Go Unit Tests"]),
+        );
+        assert.equal(stops(lines).length, 1);
+        assert.match(lines.join("\n"), /NO-VERDICT\trun=77$/m);
+      });
+    }
+
+    // `@tsv` renders a real tab or newline inside a workflow name as the two
+    // characters `\t`/`\n`. awk un-escapes a `-v` value, so round-tripping pend
+    // through `-v` turns those back into separators: a tab truncates the name
+    // and a newline splits ONE run into two, emitting a spurious extra line
+    // naming a workflow that does not exist. Read from ENVIRON instead, which
+    // does not un-escape. Direction is RED — `prid` is field 1, so a real stop
+    // can never be suppressed — which is why it rides here rather than above.
+    it("does not re-split a workflow name carrying escaped separators", () => {
+      const lines = read(
+        [["verify", "success", "t1", "66"]],
+        "__none__",
+        pend(["77", "queued", "Go\\tUnit\\nTests"]),
+      );
+      assert.deepEqual(lines, [
+        "STOP\t<Go\\tUnit\\nTests: run queued, no check-run published>\tNO-VERDICT\trun=77",
+      ]);
+    });
+
+    // pending_runs() already falls back to `?` on a missing status; the name had
+    // no such fallback, so a null `.name` printed `<: run queued, …>` — a stop
+    // that names nothing to wait for.
+    it("names a run whose workflow name is missing", () => {
+      assert.deepEqual(read([["verify", "success", "t1", "66"]], "__none__", pend(["77", "queued", ""])), [
+        "STOP\t<?: run queued, no check-run published>\tNO-VERDICT\trun=77",
+      ]);
+    });
+
+    // `--paginate` can repeat a run id when a run is created mid-walk and shifts
+    // the page boundary. Cosmetic and fail-RED, but one run owes one verdict.
+    it("emits one line per run id even when the pend list repeats it", () => {
+      assert.deepEqual(
+        read([["verify", "success", "t1", "66"]], "__none__", pend(["77", "queued", "wf"], ["77", "queued", "wf"])),
+        ["STOP\t<wf: run queued, no check-run published>\tNO-VERDICT\trun=77"],
+      );
+    });
+
     // NEGATE on status; never match the literal `pending`. Keying on `pending`
     // passes the measured fixture above and silently admits every other
     // pre-dispatch state — and any state GitHub adds later. This is the same
