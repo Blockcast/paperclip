@@ -568,6 +568,17 @@ jobs:
         run: node --test ./scripts/check-ally-review-consistency.test.mjs
         timeout-minutes: 1
 
+      # BLO-32837: the consistency guard's I1 caps operative reviews per head
+      # but says nothing about how a violation is remedied, and the obvious
+      # remedy is wrong. onprem-k8s#3281 dismissed the NEWER of two duplicate
+      # approvals, which satisfied I1 and left the PR at
+      # reviewDecision=REVIEW_REQUIRED — GitHub reads the reviewer's latest
+      # review, and that was now DISMISSED. It needed --admin to merge.
+      - name: Test Ally duplicate-review selection (BLO-32837)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/ally-review-de-dupe.test.mjs
+        timeout-minutes: 1
+
       - name: Test landing classifier
         if: ${{ !cancelled() }}
         # The classifier itself is not run here. It only ever reports in CI
