@@ -488,7 +488,12 @@ Owned by [BLO-32240](https://paperclip.blockcast.net/BLO/issues/BLO-32240) (Ally
 
 ## C2 — landing routine that runs the classifier
 
-Owned by [BLO-32511](https://paperclip.blockcast.net/BLO/issues/BLO-32511) (CTO), blocked by C1.
+Owned by [BLO-32511](https://paperclip.blockcast.net/BLO/issues/BLO-32511) — reassigned CTO → Ally
+on 2026-09-20, because `POST /companies/:id/routines` refuses an `assigneeAgentId` that is not the
+caller (`routines.ts:100-106`) and `POST /agents/:id/heartbeat/invoke` refuses an id that is not the
+caller (`agents.ts:4377-4381`). Capability, not approval, so no board card (BLO-33624). C1 unblocked
+when [BLO-32240](https://paperclip.blockcast.net/BLO/issues/BLO-32240) landed
+`scripts/land-clean-prs.mjs` on master. **Delivered — see "C2 as shipped" below.**
 
 The *original* C2 — adding a `human_gate_aged` rule to the `Agent health & stalled-issue check`
 routine — was **dropped** by engineering-review decision D2. The governance sweep already carries
@@ -497,6 +502,87 @@ the ratified priority-weighted human-gated ageing rule
 *"Do **not** stand up a second routine."* Routine `a03b2236-a1f8-4014-806f-aeccf2374da8` was
 therefore left untouched, verified this run: `human_gate_aged` occurs **0** times in its
 description and it remains at **revision 50**. Nothing needed reverting.
+
+### C2 as shipped (2026-09-20) — `Land clean-reviewed PRs`
+
+| thing | value |
+| --- | --- |
+| routine id | `022cdf7f-e719-4992-b9c6-5bb36801995c` |
+| title | `Land clean-reviewed PRs` |
+| assignee | Ally `e0a5011d-5c94-4801-be52-64c14f98ac26` |
+| status / priority / concurrency | `active` / `high` / `skip_if_active` |
+| catch-up | `skip_missed` |
+| description revision | 2 (`fdbc117d-f7ea-4b3c-9514-864d9dfc446c`) |
+| trigger id | `50cb6f35-fd8c-46ad-aa24-6b6a4bf13e36` |
+| schedule | `45 */6 * * *`, `America/Los_Angeles`, `enabled: true` — exactly one trigger |
+| audit issue | `ad731b30-0579-4f2c-b5de-2190967bec50` = [BLO-34818](https://paperclip.blockcast.net/BLO/issues/BLO-34818) |
+| created | 2026-09-20T10:40:47Z, by Ally |
+
+Every fire posts one comment on BLO-34818 whose first line is exactly
+`<!-- landing-routine-receipt -->`. The routine never merges by hand: it runs
+`node scripts/land-clean-prs.mjs --apply` once, transcribes stdout verbatim, and executes nothing
+the script did not list.
+
+**Receipt 1** — comment `e5b20c74-7476-434b-b470-745fb2808ebe`, 2026-09-20T13:10:13Z, run
+`230a8b6d-3736-4cfb-a661-2ab392371513`. Tally
+`already-enqueued: 1 · codeowner-review-requested: 13 · skip: 107 · stale-enqueue: 2`.
+Confirmations section: `first fire — no previous receipt`.
+
+**Receipt 2** — comment `31344cc1-387f-4059-8462-d44c32400443`, 2026-09-20T20:50:12Z, run
+`fc878f8c-d6f4-49cc-95a2-1a97da6b1abb`, from the 19:45Z scheduled fire. Tally
+`already-enqueued: 1 · codeowner-review-requested: 20 · skip: 106`. Confirmations section: `none`.
+
+#### The D4 prediction did not hold on fire 1, and the acceptance criterion passed vacuously
+
+The plan predicted receipt 1 would carry `enqueue` rows with `autoMergeRequest` set but not yet
+`MERGED`, and receipt 2 would resolve them to `confirmed-merged`. **Receipt 1 contained zero
+`enqueue` rows**, so AC 3 ("every `enqueue` row has `autoMergeRequest` set") and AC 4 ("resolving
+each of those rows") were both satisfied over the empty set, and receipt 2's `none` is the correct
+— not a missing — confirmation. Nothing was broken: the classifier declined all 123 open PRs with a
+named reason apiece (107 `skip`, 13 `codeowner-review-requested`, 1 `already-enqueued`, 2
+`stale-enqueue`), which is the script working, not failing to run. Recorded because a vacuous pass
+and a real one are not the same evidence, and the ACs as written cannot tell them apart.
+
+#### The loop was demonstrated for real on 2026-09-26/27
+
+A genuine `enqueue` → `confirmed-merged` round trip, recorded because receipts 1 and 2 could not
+show one. Found by scanning the 10 most recent receipts (2026-09-26 → 09-29); the 09-20 → 09-26
+receipts were not scanned, so this is **an** instance, not provably the first:
+
+| receipt | fired | row |
+| --- | --- | --- |
+| `ff4e032e-2d91-4052-aceb-a0278738a713` | 2026-09-26T20:14:55Z | `#2020 \| enqueue` (with `#2044`, `#2046`, `#1976`, `#1140`; tally `enqueue: 5`) |
+| `cd9d77f9-82fd-4f64-900c-8034f8d7192f` | 2026-09-27T02:47:42Z | `#2020 \| confirmed-merged \| 2026-09-26T23:17:54Z` |
+
+Verified independently of the receipt, per this task's verifying signal:
+
+```
+$ gh pr view 2020 -R Blockcast/paperclip --json state,mergedAt
+state=MERGED mergedAt=2026-09-26T23:17:54Z
+```
+
+The other four rows of that fire resolved `still-queued` and were re-reported on later fires, which
+is the designed behaviour — the confirmations table is a ledger, not a success assertion.
+
+#### Operational notes worth carrying
+
+- **`skip_if_active` bites in normal operation.** Of the 25 runs returned by
+  `GET /api/routines/022cdf7f-…` on 2026-09-29 (2026-09-22 → 09-28), **10 are `skipped`** with a
+  `coalescedIntoRunId`, 14 `completed`, and 1 `failed` (`Execution issue moved to cancelled`),
+  because a fire's execution issue was still open six hours later. Receipts are therefore posted per
+  *execution*, not per cron slot, and a missing slot is not by itself a missing receipt.
+- **One fire produced no reproducible table.** Receipt `517622da-166a-41c8-856d-c4ec0e83e79e`
+  (2026-09-26T14:37:43Z) records `Script stdout unrecoverable for this fire — table cannot be
+  reproduced`. It still posted a receipt, which is the contract: a fire without a receipt is
+  indistinguishable from a fire that never ran.
+- **The audit issue carries `checkoutRestoreStatus: "todo"`**, so each checkout/release cycle flips
+  it `in_progress` → `todo`. The routine does not touch its status; the flip is the harness. Left
+  as-is, flagged on BLO-32511.
+- **The classifier gained an `approval-rotted` reporting action** in
+  [BLO-33208](https://paperclip.blockcast.net/BLO/issues/BLO-33208)
+  ([#1957](https://github.com/Blockcast/paperclip/pull/1957), merged `684134ff` 2026-09-29), plus a
+  multi-repo sweep, a settling floor, and DIRTY-before-checks ordering. The routine picks these up
+  automatically — it pins no script revision.
 
 ## C3 — governance sweep un-paused (2026-09-07)
 
