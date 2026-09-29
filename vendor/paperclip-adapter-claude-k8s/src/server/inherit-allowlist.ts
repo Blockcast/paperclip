@@ -162,6 +162,8 @@ export const AGENT_ENV_ALLOWLIST: ReadonlySet<string> = new Set([
   "PLAYWRIGHT_BROWSERS_PATH",
   "XDG_CACHE_HOME",
   "npm_config_cache",
+  "CARGO_HOME",
+  "CARGO_TARGET_DIR",
 ]);
 
 /**
