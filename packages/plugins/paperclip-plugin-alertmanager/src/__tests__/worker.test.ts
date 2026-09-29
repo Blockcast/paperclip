@@ -569,6 +569,11 @@ describe("credential health (BLO-20572)", () => {
  * changes.
  */
 describe("handleWebhook — delivery timing (BLO-37485)", () => {
+  const slowDeliveryLines = (mocks: MockClients) =>
+    mocks.logger.warn.mock.calls
+      .map((call) => String(call[0]))
+      .filter((line) => line.includes("slow delivery"));
+
   const stubClock = (startMs: number) => {
     let nowMs = startMs;
     const spy = vi.spyOn(Date, "now").mockImplementation(() => nowMs);
@@ -636,9 +641,62 @@ describe("handleWebhook — delivery timing (BLO-37485)", () => {
       "alertmanager.webhook.deadline_exceeded",
       1,
     );
+    // A one-alert batch that wedges is AC1's own case: it has no "next" alert,
+    // so the check has to run after the alert's work or it never runs at all.
+    const slow = slowDeliveryLines(mocks);
+    expect(slow).toHaveLength(1);
+    expect(slow[0]).toContain("CiliumPolicyDropsHigh (9a3b1e4c5f6d7890) took 130000ms");
+    expect(slow[0]).toContain("1 of 1 alerts");
+    expect(slow[0]).toContain("while this alert was in flight");
   });
 
-  it("names the alert in flight once a delivery passes the halfway mark", async () => {
+  it("names the alert that was in flight at the deadline, not the one that started next", async () => {
+    const { ctx, mocks } = mkCtx();
+    // The shape that misattributes a start-of-alert sample: the first alert
+    // carries the delivery past halfway, the next is quick, and a later one
+    // wedges across the deadline. The operator must be sent to the wedge.
+    const envelope = baseEnvelope({
+      alerts: [
+        baseAlert(),
+        baseAlert({
+          labels: { alertname: "ArcRunnerPoolSaturated", severity: "warning" },
+          fingerprint: "ffff0000ffff0000",
+        }),
+        baseAlert({
+          labels: { alertname: "CiliumAgentRestarting", severity: "warning" },
+          fingerprint: "aaaa1111aaaa1111",
+        }),
+      ],
+    });
+    const perAlertMs = [61_000, 200, 90_000];
+    const clock = stubClock(1_000_000);
+    mocks.issues.create.mockImplementation(async () => {
+      clock.advance(perAlertMs.shift() ?? 0);
+      return { id: "issue-1" };
+    });
+
+    try {
+      await handleWebhook(
+        ctx,
+        baseConfig(),
+        true,
+        baseInput({ parsedBody: envelope, rawBody: JSON.stringify(envelope) }),
+      );
+    } finally {
+      clock.spy.mockRestore();
+    }
+
+    const slow = slowDeliveryLines(mocks);
+    expect(slow).toHaveLength(2);
+    expect(slow[0]).toContain("CiliumPolicyDropsHigh (9a3b1e4c5f6d7890) took 61000ms");
+    expect(slow[0]).not.toContain("while this alert was in flight");
+    expect(slow[1]).toContain("CiliumAgentRestarting (aaaa1111aaaa1111) took 90000ms");
+    expect(slow[1]).toContain("3 of 3 alerts");
+    expect(slow[1]).toContain("while this alert was in flight");
+    expect(slow.join("\n")).not.toContain("ArcRunnerPoolSaturated");
+  });
+
+  it("reports each mark once, naming the alert whose work crossed it", async () => {
     const { ctx, mocks } = mkCtx();
     const envelope = baseEnvelope({
       // Three, not two: the latch only has anything to latch against from the
@@ -674,28 +732,23 @@ describe("handleWebhook — delivery timing (BLO-37485)", () => {
       clock.spy.mockRestore();
     }
 
-    const slow = mocks.logger.warn.mock.calls
-      .map((call) => String(call[0]))
-      .filter((line) => line.includes("slow delivery"));
+    const slow = slowDeliveryLines(mocks);
 
-    // Exactly one: the warning latches, so a 29-alert batch cannot emit 29
-    // near-identical lines and bury the delivery that matters. Alerts 2 and 3
-    // are both past the threshold here, so this genuinely pins the latch.
-    expect(slow).toHaveLength(1);
-    // The attribution AC1 asks for — which alert, and how far in.
-    expect(slow[0]).toContain("ArcRunnerPoolSaturated");
-    expect(slow[0]).toContain("ffff0000ffff0000");
+    // One line per mark, not per alert: a 29-alert batch cannot emit 29
+    // near-identical lines and bury the delivery that matters. The third alert
+    // finishes past both marks here, so this genuinely pins the latch.
+    expect(slow).toHaveLength(2);
+    // The attribution AC1 asks for: which alert, and how far in.
+    expect(slow[0]).toContain("CiliumPolicyDropsHigh (9a3b1e4c5f6d7890) took 70000ms");
     expect(slow[0]).toContain("1 of 3 alerts");
+    expect(slow[1]).toContain("ArcRunnerPoolSaturated (ffff0000ffff0000) took 70000ms");
+    expect(slow[1]).toContain("2 of 3 alerts");
   });
 
   it("stays silent on a delivery that never approaches the deadline", async () => {
     const { ctx, mocks } = mkCtx();
     await handleWebhook(ctx, baseConfig(), true, baseInput());
-    expect(
-      mocks.logger.warn.mock.calls
-        .map((call) => String(call[0]))
-        .filter((line) => line.includes("slow delivery")),
-    ).toHaveLength(0);
+    expect(slowDeliveryLines(mocks)).toHaveLength(0);
   });
 
   it("still completes the delivery when the timing metric write fails", async () => {
@@ -717,6 +770,45 @@ describe("handleWebhook — delivery timing (BLO-37485)", () => {
         .map((call) => String(call[0]))
         .some((line) => line.includes("failed to record delivery timing")),
     ).toBe(true);
+  });
+
+  it("keeps the remaining timing metrics when an earlier write fails", async () => {
+    const { ctx, mocks } = mkCtx();
+    const clock = stubClock(1_000_000);
+    mocks.issues.create.mockImplementation(async () => {
+      clock.advance(130_000);
+      return { id: "issue-1" };
+    });
+    mocks.metrics.write.mockImplementation(async (name: string) => {
+      if (name === "alertmanager.webhook.duration_ms") {
+        throw new Error("metrics backend unavailable");
+      }
+    });
+
+    try {
+      await handleWebhook(ctx, baseConfig(), true, baseInput());
+    } finally {
+      clock.spy.mockRestore();
+    }
+
+    // The first write failing must not cost the denominator or the breach
+    // counter, the one series this instrumentation exists to produce.
+    expect(mocks.metrics.write).toHaveBeenCalledWith("alertmanager.webhook.completed", 1);
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.webhook.alerts_received",
+      1,
+    );
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.webhook.deadline_exceeded",
+      1,
+    );
+    expect(
+      mocks.logger.error.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.includes("failed to record delivery timing")),
+    ).toEqual([
+      expect.stringContaining("metric alertmanager.webhook.duration_ms:"),
+    ]);
   });
 });
 
