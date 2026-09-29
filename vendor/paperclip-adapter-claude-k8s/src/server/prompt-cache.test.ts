@@ -491,3 +491,215 @@ describe("prepareClaudePromptBundle two address spaces (BLO-37760)", () => {
     });
   });
 });
+
+// BLO-37961. BLO-37760 above makes the bundle DIRECTORY resolve from both
+// address spaces. It does not fix what the directory CONTAINS: each entry in
+// `.claude/skills/` is an absolute symlink, and a catalog-backed skill's
+// `source` arrives from a server service (`resolveManagedSkillsRoot`) as a
+// SERVER address. Written verbatim it is a link the pod cannot follow —
+// present, correctly named, and dangling.
+//
+// Every fixture materializes the skill tree under BOTH mounts at the same
+// volume-relative subpath, because that is what ONE shared volume mounted twice
+// actually looks like. That is also why `exists()` alone cannot discriminate
+// here: in a single test process both mounts are real directories, so a link
+// carrying the WRONG address still stats fine. The pod-namespace predicate is
+// therefore two clauses, and the `startsWith` clause is the load-bearing one —
+// it is what "resolves in the POD's mount namespace" means when you cannot
+// actually enter that namespace. Do not "simplify" it to a bare stat.
+describe("prompt-bundle skill symlinks carry POD addresses (BLO-37961)", () => {
+  const companyId = "acme-co";
+  const runtimeName = "investigate--9debdeaf08";
+  // The volume-relative location of a catalog-backed skill, i.e. what
+  // `resolveManagedSkillsRoot(companyId)/__runtime__/<name>` reduces to once
+  // the mount prefix is removed. Declared once so neither leg can drift.
+  const volumeRelativeSkill = `instances/default/skills/${companyId}/__runtime__/${runtimeName}`;
+
+  async function withVolume<T>(
+    body: (ctx: {
+      podMount: string;
+      serverMount: string;
+      podRootDir: string;
+      serverSkillSource: string;
+      podSkillSource: string;
+    }) => Promise<T>,
+  ): Promise<T> {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "blo37961-"));
+    vi.stubEnv("PAPERCLIP_HOME", path.join(root, "home"));
+    try {
+      const podMount = path.join(root, "pod-mnt");
+      const serverMount = path.join(root, "srv-mnt");
+      const serverSkillSource = path.posix.join(serverMount, volumeRelativeSkill);
+      const podSkillSource = path.posix.join(podMount, volumeRelativeSkill);
+      // Same bytes, two mount points. Both carry a real SKILL.md because the
+      // server hashes the source tree to derive the bundle key, so a source
+      // that does not exist server-side never reaches the symlink code at all.
+      for (const dir of [serverSkillSource, podSkillSource]) {
+        await fs.mkdir(dir, { recursive: true });
+        await fs.writeFile(path.join(dir, "SKILL.md"), "---\nname: probe\n---\n", "utf8");
+      }
+      return await body({
+        podMount,
+        serverMount,
+        podRootDir: path.posix.join(podMount, "instances/default/data/k8s-isolation/acme-co/agent-1/prompt-cache"),
+        serverSkillSource,
+        podSkillSource,
+      });
+    } finally {
+      vi.unstubAllEnvs();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }
+
+  const skillEntry = (source: string, name = runtimeName) => ({
+    key: "garrytan/gstack/investigate",
+    runtimeName: name,
+    source,
+    required: false,
+    requiredReason: null,
+  });
+
+  /** The link target the pod would actually follow, read off the emitted bundle. */
+  const linkTarget = (bundle: { serverRootDir: string }, name = runtimeName) =>
+    fs.readlink(path.join(bundle.serverRootDir, ".claude", "skills", name));
+
+  it("rewrites a catalog-backed SERVER source to the POD address for the same bytes", async () => {
+    await withVolume(async ({ podMount, serverMount, podRootDir, serverSkillSource, podSkillSource }) => {
+      const bundle = await prepareClaudePromptBundle({
+        companyId,
+        skills: [skillEntry(serverSkillSource)],
+        instructionsContents: null,
+        rootDir: podRootDir,
+        podDataMountPath: podMount,
+        serverDataMountPath: serverMount,
+        onLog,
+      });
+
+      const target = await linkTarget(bundle);
+
+      // (1) It is a POD address — the clause that fails when the rewrite is
+      //     reverted, since the raw source is under serverMount.
+      expect(target.startsWith(`${podMount}/`)).toBe(true);
+      // (2) ...and the bytes are really at that address, so this is resolution
+      //     and not string manipulation that happens to look right.
+      expect(await fs.stat(path.join(target, "SKILL.md")).then(() => true, () => false)).toBe(true);
+      // Derived from the input rather than restated, so the two cannot drift.
+      expect(target).toBe(podSkillSource);
+      expect(target).not.toBe(serverSkillSource);
+    });
+  });
+
+  it("leaves an IMAGE path (/app/skills/...) byte-identical — rewriting it would break it", async () => {
+    await withVolume(async ({ podMount, serverMount, podRootDir }) => {
+      // The adapter's own bundled on-disk skills. Same absolute path in both
+      // namespaces because both come from the image layer, not the volume — so
+      // this is the set that works TODAY, and the rewrite must not touch it.
+      const imageSource = "/app/skills/paperclip";
+      const bundle = await prepareClaudePromptBundle({
+        companyId,
+        skills: [skillEntry(imageSource, "paperclip")],
+        instructionsContents: null,
+        rootDir: podRootDir,
+        podDataMountPath: podMount,
+        serverDataMountPath: serverMount,
+        onLog,
+      });
+
+      expect(await linkTarget(bundle, "paperclip")).toBe(imageSource);
+    });
+  });
+
+  it("is a byte-for-byte no-op when the mounts coincide, and when they are omitted", async () => {
+    // The default deployment (41/41 live agent Jobs measured 2026-09-29) and the
+    // claude-local shape. Both must emit exactly the pre-BLO-37961 target.
+    //
+    // Each leg gets its OWN volume, and that is load-bearing rather than tidy.
+    // Both legs derive the same content-hashed `bundleKey` from the same root,
+    // so sharing a volume shares ONE bundle directory: the first leg's symlink
+    // is still sitting there when the second runs, and since the symlink write
+    // is inside a try/catch that only logs, a leg that fails outright still
+    // reads the previous leg's link back and passes. That is how this test
+    // first passed with the unknown-mount guard deleted (BLO-34263: a guard
+    // with no failing mutation is a comment).
+    for (const mounts of [
+      (podMount: string) => ({ podDataMountPath: podMount, serverDataMountPath: podMount }),
+      () => ({}),
+    ]) {
+      await withVolume(async ({ podMount, podRootDir, serverSkillSource }) => {
+        const bundle = await prepareClaudePromptBundle({
+          companyId,
+          skills: [skillEntry(serverSkillSource)],
+          instructionsContents: null,
+          rootDir: podRootDir,
+          ...mounts(podMount),
+          onLog,
+        });
+        expect(await linkTarget(bundle)).toBe(serverSkillSource);
+      });
+    }
+  });
+
+  it("repairs a STALE pre-fix link when an operator adopts a custom pod mount", async () => {
+    // The migration this row exists for, and the one shape a fresh-bundle test
+    // cannot reach. `bundleKey` is derived from skill CONTENT and the server's
+    // own mount does not move, so `serverRootDir` resolves to the SAME server
+    // directory before and after the pod mount changes: run two lands on run
+    // one's bundle, stale links included.
+    await withVolume(async ({ podMount, serverMount, serverSkillSource, podSkillSource }) => {
+      const volumeRelativeRoot = "instances/default/data/k8s-isolation/acme-co/agent-1/prompt-cache";
+      const skills = [skillEntry(serverSkillSource)];
+
+      // Run 1 — today's deployment: the pod reaches the volume where the server
+      // does, so the root is a server-mount address and the link is written
+      // absolute-to-server. This is the pre-BLO-37961 artifact, produced by the
+      // real code path rather than hand-planted.
+      const before = await prepareClaudePromptBundle({
+        companyId,
+        skills,
+        instructionsContents: null,
+        rootDir: path.posix.join(serverMount, volumeRelativeRoot),
+        podDataMountPath: serverMount,
+        serverDataMountPath: serverMount,
+        onLog,
+      });
+      expect(await linkTarget(before)).toBe(serverSkillSource);
+
+      // Run 2 — `workspaceMountPath` now points elsewhere. Only the POD mount
+      // moves; the server still reaches the volume exactly where it did.
+      const after = await prepareClaudePromptBundle({
+        companyId,
+        skills,
+        instructionsContents: null,
+        rootDir: path.posix.join(podMount, volumeRelativeRoot),
+        podDataMountPath: podMount,
+        serverDataMountPath: serverMount,
+        onLog,
+      });
+
+      // Same bundle directory — the premise. If this ever goes false the test
+      // below is vacuous, so assert it rather than assuming it.
+      expect(after.serverRootDir).toBe(before.serverRootDir);
+      expect(await linkTarget(after)).toBe(podSkillSource);
+    });
+  });
+
+  it("rewrites the catalog entry and spares the image entry in the SAME bundle", async () => {
+    // The live set is MIXED, which is why the defect was not obvious: a bundle
+    // whose image-path links all resolve looks healthy. One leg per shape in one
+    // call, so a rewrite that is unconditional in either direction fails here.
+    await withVolume(async ({ podMount, serverMount, podRootDir, serverSkillSource, podSkillSource }) => {
+      const bundle = await prepareClaudePromptBundle({
+        companyId,
+        skills: [skillEntry(serverSkillSource), skillEntry("/app/skills/paperclip", "paperclip")],
+        instructionsContents: null,
+        rootDir: podRootDir,
+        podDataMountPath: podMount,
+        serverDataMountPath: serverMount,
+        onLog,
+      });
+
+      expect(await linkTarget(bundle)).toBe(podSkillSource);
+      expect(await linkTarget(bundle, "paperclip")).toBe("/app/skills/paperclip");
+    });
+  });
+});
