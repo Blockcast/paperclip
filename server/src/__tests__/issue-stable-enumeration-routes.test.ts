@@ -10,7 +10,6 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
-import { ISSUE_LIST_MAX_LIMIT } from "../services/index.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -29,7 +28,11 @@ describeEmbeddedPostgres("issue list stable enumeration and exact counts", () =>
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-stable-enumeration-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+    // No per-hook override: embedded Postgres takes ~40s to start on a contended runner,
+    // so the 20s this file used to pin here timed the hook out and skipped all 12 tests
+    // while reporting a failed suite. vitest.config.ts already sets hookTimeout to 120s
+    // for exactly this reason; inherit it rather than re-pinning a tighter one.
+  });
 
   afterEach(async () => {
     await db.delete(issues);
@@ -43,7 +46,11 @@ describeEmbeddedPostgres("issue list stable enumeration and exact counts", () =>
     await tempDb?.cleanup();
   });
 
-  function createApp(companyId: string, actor?: Record<string, unknown>) {
+  function createApp(
+    companyId: string,
+    actor?: Record<string, unknown>,
+    routeOpts?: Parameters<typeof issueRoutes>[2],
+  ) {
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {
@@ -57,7 +64,7 @@ describeEmbeddedPostgres("issue list stable enumeration and exact counts", () =>
       };
       next();
     });
-    app.use("/api", issueRoutes(db, {} as any));
+    app.use("/api", issueRoutes(db, {} as any, routeOpts));
     app.use(errorHandler);
     return app;
   }
@@ -92,16 +99,20 @@ describeEmbeddedPostgres("issue list stable enumeration and exact counts", () =>
   }
 
   /**
-   * Seeds `count` todo issues with strictly decreasing updatedAt, so the default
+   * Seeds `count` issues with strictly decreasing updatedAt, so the default
    * activity-ordered listing has a well-defined, reproducible order.
+   *
+   * `status: "blocked"` additionally puts every row in the blocked inbox: a blocked row
+   * with no blocker edge, no assigneeUserId and no monitor is a dead end, which is the
+   * cheapest shape that earns a blockedInboxAttention entry (no companion rows needed).
    */
-  async function seedIssues(companyId: string, count: number) {
+  async function seedIssues(companyId: string, count: number, status: "todo" | "blocked" = "todo") {
     const base = Date.UTC(2026, 0, 1, 0, 0, 0);
     const rows = Array.from({ length: count }, (_, index) => ({
       id: randomUUID(),
       companyId,
       title: `Issue ${index}`,
-      status: "todo" as const,
+      status,
       priority: "medium" as const,
       updatedAt: new Date(base - index * 60_000),
     }));
@@ -254,8 +265,12 @@ describeEmbeddedPostgres("issue list stable enumeration and exact counts", () =>
     expect(res.body.count).toBe(2);
   });
 
-  it("walks every keyset page of the restricted-actor count", async () => {
-    const companyId = await seedCompany();
+  /** A key scoped to a single issue: denied company_scope:read, so the count route walks. */
+  function skillTestActor(companyId: string, agentId: string, issueId: string) {
+    return { type: "agent", agentId, companyId, source: "agent_key", keyScope: { kind: "skill_test", issueId } };
+  }
+
+  async function seedAgent(companyId: string) {
     const agentId = randomUUID();
     await db.insert(agents).values({
       id: agentId,
@@ -268,32 +283,78 @@ describeEmbeddedPostgres("issue list stable enumeration and exact counts", () =>
       runtimeConfig: {},
       permissions: {},
     });
-    // One row past a full page forces a second keyset page. The only issue the
-    // restricted actor can read is the highest id, which sortField=id places on page 2.
-    const ids = await seedIssues(companyId, ISSUE_LIST_MAX_LIMIT + 1);
-    const scopedIssueId = [...ids].sort().at(-1)!;
-    // A skill-test key is denied company_scope:read, so the route takes the walk
-    // instead of the single COUNT(*), and may read only its own issue.
-    const skillTestActor = {
-      type: "agent",
-      agentId,
-      companyId,
-      source: "agent_key",
-      keyScope: { kind: "skill_test", issueId: scopedIssueId },
+    return agentId;
+  }
+
+  it("keeps the restricted-actor count exact while rows are touched between its pages", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent(companyId);
+    // Five rows over an injected page size of two: three pages, so the cursor is carried
+    // twice. Shrinking the page rather than seeding ISSUE_LIST_MAX_LIMIT + 1 rows is what
+    // lets this run at ordinary speed.
+    const ids = await seedIssues(companyId, 5);
+    const byId = [...ids].sort();
+    // The only issue the restricted actor may read is the highest id, which sortField=id
+    // places on the last page: the walk has to reach the end to find it at all.
+    const scopedIssueId = byId.at(-1)!;
+
+    // Bump an ALREADY-RETURNED row to the newest activity after each page. The walk reads
+    // the immutable id order, so this must not move a row across the cursor. The offset
+    // canary above proves the same mutation genuinely re-ranks the activity order, so a
+    // pass here is stability under concurrent writes, not an inert assertion.
+    let pages = 0;
+    const onPage = async () => {
+      await touchIssue(byId[pages]!);
+      pages += 1;
     };
 
-    const res = await request(createApp(companyId, skillTestActor))
+    const res = await request(
+      createApp(companyId, skillTestActor(companyId, agentId, scopedIssueId), {
+        issueCountWalk: { pageSize: 2, onPage },
+      }),
+    )
       .get(`/api/companies/${companyId}/issues/count`)
       .query({ status: "todo" });
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.count).toBe(1);
+    // Guards the guard: a single-page walk would assert nothing about the cursor.
+    expect(pages).toBeGreaterThan(1);
 
     const boardRes = await request(createApp(companyId))
       .get(`/api/companies/${companyId}/issues/count`)
       .query({ status: "todo" });
     expect(boardRes.status, JSON.stringify(boardRes.body)).toBe(200);
-    expect(boardRes.body.count).toBe(ISSUE_LIST_MAX_LIMIT + 1);
-  }, 120_000);
+    expect(boardRes.body.count).toBe(5);
+  });
+
+  it("walks every offset page of the restricted-actor attention=blocked count", async () => {
+    // The route computes the blocked flag from its own query and forwards `offset` to the
+    // blocked listing; passing `blocked` to the walk by hand would exercise neither. If the
+    // flag or the offset is wrong, the walk re-serves page one and now throws rather than
+    // hanging, so this fails loudly either way.
+    const companyId = await seedCompany();
+    const agentId = await seedAgent(companyId);
+    const ids = await seedIssues(companyId, 5, "blocked");
+    // The blocked listing orders by activity descending and seedIssues ages each row
+    // further, so the last-seeded row sorts last — reachable only after offset advances.
+    const scopedIssueId = ids.at(-1)!;
+
+    const res = await request(
+      createApp(companyId, skillTestActor(companyId, agentId, scopedIssueId), {
+        issueCountWalk: { pageSize: 2 },
+      }),
+    )
+      .get(`/api/companies/${companyId}/issues/count`)
+      .query({ attention: "blocked" });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.count).toBe(1);
+
+    const boardRes = await request(createApp(companyId))
+      .get(`/api/companies/${companyId}/issues/count`)
+      .query({ attention: "blocked" });
+    expect(boardRes.status, JSON.stringify(boardRes.body)).toBe(200);
+    expect(boardRes.body.count).toBe(5);
+  });
 
   it("rejects filters the general count cannot honor rather than counting a wider set", async () => {
     const companyId = await seedCompany();
