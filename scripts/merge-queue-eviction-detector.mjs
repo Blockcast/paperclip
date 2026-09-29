@@ -285,7 +285,16 @@ function parseArgs(argv) {
   return args;
 }
 
-function buildEvictionCommentBody({ repo, prNumber, classification, mergeGroupRunCount, base, identifiers }) {
+// Must stay byte-identical to MERGE_QUEUE_EVICTION_MARKER in
+// server/src/routes/github-webhook.ts, which gates the whole feature on
+// `body.startsWith(...)` at byte 0. Drift on either side silently disables
+// eviction wakes with both suites green -- the same silent-loss class
+// BLO-23395 exists to close -- so the coupling is asserted in
+// scripts/__tests__/merge-queue-eviction-detector.test.mjs rather than left
+// to two hand-maintained literals.
+export const MERGE_QUEUE_EVICTION_MARKER = "<!-- paperclip:merge-queue-eviction -->";
+
+export function buildEvictionCommentBody({ repo, prNumber, classification, mergeGroupRunCount, base, identifiers }) {
   const causeLine = {
     conflict_unstageable:
       "**conflict / un-stageable rebase** -- the queue never created a `merge_group` run for this PR's head " +
@@ -304,7 +313,7 @@ function buildEvictionCommentBody({ repo, prNumber, classification, mergeGroupRu
       "`runbooks/merge-queue-stalled-head.md` before assuming a conflict.",
   }[classification];
   return [
-    "<!-- paperclip:merge-queue-eviction -->",
+    MERGE_QUEUE_EVICTION_MARKER,
     `PR #${prNumber} was removed from the \`${base}\` merge queue and is **not merged**.`,
     "",
     `Cause: ${causeLine}`,
