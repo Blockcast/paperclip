@@ -1216,6 +1216,11 @@ function describeStalePods(stale: readonly k8s.V1Pod[]): string {
  * (BLO-33503: an init container that ran and exited non-zero used to fall
  * through a single `includes("pod containers to start")` test and get reported
  * as "Pod scheduling failed", pointing diagnosis at cluster capacity).
+ *
+ * `image_pull` and `crash_loop` are main-container-only: the init loop records
+ * its image-pull and crash-loop failures as `init_container` so the label names
+ * the phase the reader has to go look at, and the inline message still says
+ * which of the two it was.  So these six do not partition the throw sites 1:1.
  */
 export type PodFailureKind =
   | "scheduling"
@@ -1238,7 +1243,11 @@ const POD_FAILURE_LABELS: Record<PodFailureKind, string> = {
   init_container: "Init container failed",
   image_pull: "Image pull failed",
   crash_loop: "Container crash loop",
-  terminated: "Pod terminated before startup",
+  // "before log streaming", not "before startup": describePodTerminatedError
+  // emits `claude exited 1 (Error)` when the main container started and exited,
+  // so "before startup" would contradict the evidence beside it.  waitForPod
+  // returns when logs can be streamed; that is the boundary this label names.
+  terminated: "Pod terminated before log streaming",
 };
 
 /**
@@ -1343,9 +1352,14 @@ async function waitForPod(
     // must not outrank describePodTerminatedError below.  Only its *terminated*
     // state is collateral — a sidecar stuck waiting still blocks startup, so the
     // waiting branches below apply to it as they do to any init container.
+    // No cast: @kubernetes/client-node declares V1Container.restartPolicy
+    // (1.4.0, V1Container.d.ts:70), so tsc checks this field name.  A cast to a
+    // bare structural type would make a rename or a downgrade inside the
+    // declared ^1.0.0 range evaluate to undefined silently — sidecarNames goes
+    // empty and the DinD mislabel below returns with no compile error.
     const sidecarNames = new Set(
       (pod.spec?.initContainers ?? [])
-        .filter((c) => (c as { restartPolicy?: string }).restartPolicy === "Always")
+        .filter((c) => c.restartPolicy === "Always")
         .map((c) => c.name),
     );
     for (const init of initStatuses) {
