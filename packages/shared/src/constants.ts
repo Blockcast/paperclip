@@ -313,6 +313,34 @@ export const ISSUE_RECOVERY_ACTION_KINDS = [
 ] as const;
 export type IssueRecoveryActionKind = (typeof ISSUE_RECOVERY_ACTION_KINDS)[number];
 
+/**
+ * BLO-37677: does this kind's action exist to RESTORE a wake path to the source issue?
+ *
+ * `classifySourceRecoveryRevalidation` cancels an active action once the source issue is
+ * observed to have a wake path of its own (human owner, agent owner on a dispatchable
+ * status, typed review participant, pending interaction/approval, scheduled monitor). That
+ * theory holds only for the kinds below marked `true`, whose whole job is to put a wake path
+ * back — once the issue has one, the action genuinely is redundant.
+ *
+ * It is wrong for `pr_review_non_convergence`, which escalates a *quality* condition to a
+ * *different* owner and deliberately leaves the source issue assigned to the looping author
+ * (`escalateStalledSelfReviewPr`). That kind is therefore born matching the agent-owner
+ * cancellation predicate and has no reachable state in which it stops matching: measured
+ * 0 escalations and 0 owner-completions across 118 actions in 8 weeks.
+ *
+ * This is a `Record`, not a lookup with a default, so adding a kind above is a compile error
+ * here rather than a silent inheritance of either behaviour.
+ */
+export const ISSUE_RECOVERY_ACTION_KIND_IS_WAKE_PATH_RESTORATION: Record<IssueRecoveryActionKind, boolean> = {
+  missing_disposition: true,
+  stranded_assigned_issue: true,
+  workspace_validation: true,
+  configuration_validation: true,
+  active_run_watchdog: true,
+  issue_graph_liveness: true,
+  pr_review_non_convergence: false,
+};
+
 export const ISSUE_RECOVERY_ACTION_STATUSES = [
   "active",
   "escalated",

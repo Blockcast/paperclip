@@ -5241,7 +5241,15 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .select()
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
-    expect(action).toMatchObject({ cause: "provider_quota", ownerAgentId: managerId });
+    // BLO-37677 AC4: `provider_quota` is one of the four causes that reach the
+    // `stranded_assigned_issue` kind. It used to reach it through a bare ternary
+    // fallthrough and now reaches it through an explicit `Record` arm; pinning the kind
+    // here is what makes that refactor a no-op rather than a trusted reading.
+    expect(action).toMatchObject({
+      cause: "provider_quota",
+      kind: "stranded_assigned_issue",
+      ownerAgentId: managerId,
+    });
     expect(action!.wakePolicy).toMatchObject({ type: "wake_owner" });
 
     // The fix, asserted as behaviour first: the owner is woken a bounded number of times
@@ -6659,6 +6667,135 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       source: "source_revalidation",
       trigger: "read_projection",
       recoveryActionId: action.id,
+    });
+  });
+
+  // BLO-37677. `classifySourceRecoveryRevalidation`'s lower half is a family of
+  // wake-path-EXISTENCE tests: "the source issue now has its own way of being re-driven, so
+  // this action is redundant". True for the kinds whose action IS a wake-path restoration;
+  // false for `pr_review_non_convergence`, which escalates a quality condition to a
+  // *different* owner and deliberately leaves the source issue `in_progress` with the
+  // looping author still assigned (`escalateStalledSelfReviewPr`). That kind was therefore
+  // born matching the agent-owner predicate with no reachable state in which it stops
+  // matching — measured 0 escalations and 0 owner-completions across 118 actions in 8 weeks.
+  //
+  // The negative controls are the point of this block. Without them the primary case passes
+  // on a "fix" that simply stops cancelling everything, which reinstates BLO-16074.
+  describe("BLO-37677 source revalidation is kind-aware", () => {
+    const MONITOR_ARM = {
+      executionPolicy: {
+        monitor: { nextCheckAt: "2099-12-01T12:30:00.000Z", scheduledBy: "assignee" as const },
+      },
+    };
+
+    async function seedPrNonConvergence(kind: "pr_review_non_convergence" | "stranded_assigned_issue") {
+      const fixture = await seedCompany();
+      const recoveryActionSvc = issueRecoveryActionService(db);
+      const action = await recoveryActionSvc.upsertSourceScoped({
+        companyId: fixture.companyId,
+        sourceIssueId: fixture.sourceIssueId,
+        kind,
+        ownerType: "agent",
+        // The escalation deliberately goes to the manager, NOT back to the assignee, and
+        // does not reassign the issue — which is why the source issue stays `in_progress`
+        // with an agent owner as a structural property of this kind.
+        ownerAgentId: fixture.managerId,
+        previousOwnerAgentId: fixture.coderId,
+        returnOwnerAgentId: fixture.coderId,
+        cause: kind === "pr_review_non_convergence" ? "self_review_pr_non_convergence" : "stranded_assigned_issue",
+        fingerprint: `${kind}:blo-37677`,
+        evidence: { prNumber: 2065, cycleCount: 10 },
+        nextAction: "Take over the PR or record a disposition.",
+        wakePolicy: { type: "wake_owner", reason: "self_review_pr_non_convergence" },
+      });
+      return { ...fixture, recoveryActionSvc, action };
+    }
+
+    // The exact BLO-37010 shape: a monitor arm carrying no `status` key, on an issue that is
+    // `in_progress` with an agent owner. Before the fix this cancelled the action 2h20m
+    // after it was minted, without the owner ever acting on it.
+    it("keeps a pr_review_non_convergence action active across a monitor-arm PATCH with no status key", async () => {
+      const { companyId, sourceIssueId, recoveryActionSvc, action } =
+        await seedPrNonConvergence("pr_review_non_convergence");
+
+      const app = createApp();
+      const patched = await request(app)
+        .patch(`/api/issues/${sourceIssueId}`)
+        .send(MONITOR_ARM)
+        .expect(200);
+
+      // The monitor really was armed — otherwise this asserts nothing about the trigger.
+      // (The PATCH projection only injects `activeRecoveryAction` when it CANCELS one, so
+      // the surviving action is read back off the detail projection below.)
+      expect(patched.body).toMatchObject({ status: "in_progress", monitorNextCheckAt: expect.any(String) });
+
+      const [actionRow] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      expect(actionRow).toMatchObject({ status: "active", resolutionNote: null, resolvedAt: null });
+      expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({
+        id: action.id,
+        status: "active",
+      });
+
+      // Still eligible to wake its owner: the detail projection re-runs the classifier on
+      // the `read_projection` trigger and must not retire it there either.
+      const detail = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
+      expect(detail.body.activeRecoveryAction).toMatchObject({ id: action.id, status: "active" });
+
+      const activityRows = await db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.entityId, sourceIssueId));
+      expect(activityRows.map((row) => row.action)).not.toContain("issue.recovery_action_resolved");
+    });
+
+    // Negative control. Same issue shape, same PATCH, different kind — still cancels, with
+    // the agent-owner note. A fix that widened into "stop cancelling" fails here.
+    it("still cancels a stranded_assigned_issue action on the same monitor-arm PATCH", async () => {
+      const { companyId, sourceIssueId, recoveryActionSvc, action } =
+        await seedPrNonConvergence("stranded_assigned_issue");
+
+      const patched = await request(createApp())
+        .patch(`/api/issues/${sourceIssueId}`)
+        .send(MONITOR_ARM)
+        .expect(200);
+
+      expect(patched.body).toMatchObject({ status: "in_progress", activeRecoveryAction: null });
+      const [actionRow] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      expect(actionRow).toMatchObject({
+        status: "cancelled",
+        outcome: "cancelled",
+        resolutionNote: "Recovery action became stale because the source issue is in_progress with an agent owner.",
+      });
+      expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+    });
+
+    // Second negative control. The carve-out sits BELOW the terminal branches, so a source
+    // issue that reaches `done` still retires the action — no kind is exempt from that.
+    it("still cancels a pr_review_non_convergence action once the source issue reaches done", async () => {
+      const { companyId, sourceIssueId, recoveryActionSvc, action } =
+        await seedPrNonConvergence("pr_review_non_convergence");
+
+      await request(createApp())
+        .patch(`/api/issues/${sourceIssueId}`)
+        .send({ status: "done" })
+        .expect(200);
+
+      const [actionRow] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      expect(actionRow).toMatchObject({
+        status: "cancelled",
+        outcome: "cancelled",
+        resolutionNote: "Recovery action became stale because the source issue reached done.",
+      });
+      expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
     });
   });
 

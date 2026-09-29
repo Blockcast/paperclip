@@ -51,6 +51,7 @@ import {
   linkIssueApprovalSchema,
   issueDocumentKeySchema,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
+  ISSUE_RECOVERY_ACTION_KIND_IS_WAKE_PATH_RESTORATION,
   ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
   ISSUE_WATCHDOG_DISCOVERY_KINDS,
   TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND,
@@ -87,6 +88,7 @@ import {
   type IssueWakeDiagnosticWakeRequest,
   type IssueWakeDiagnosticsResponse,
   type IssueRelationIssueSummary,
+  type IssueRecoveryActionKind,
   type IssueWatchdogDiscoveryKind,
   type ProjectWorkspace,
   type SourceTrustMetadata,
@@ -3646,6 +3648,7 @@ export function issueRoutes(
 
   async function classifySourceRecoveryRevalidation(input: {
     issue: IssueRouteSnapshot;
+    kind: IssueRecoveryActionKind;
     trigger: RecoveryRevalidationTrigger;
     statusChanged?: boolean;
     assigneeChanged?: boolean;
@@ -3687,6 +3690,18 @@ export function issueRoutes(
       input.resumeRequested === true ||
       input.reopened === true;
     if (!durableSourceChange) return null;
+
+    // BLO-37677: everything below this line is a wake-path-EXISTENCE test — "the source
+    // issue now has its own way of being re-driven, so this action is redundant". That is
+    // only true for kinds whose action IS a wake-path restoration. `pr_review_non_convergence`
+    // escalates a quality condition to a *different* owner and deliberately leaves the source
+    // issue `in_progress` with its agent owner, so it is born matching the agent-owner branch
+    // below and can never stop matching it. The two genuinely-terminal branches above
+    // (`done`/`cancelled` and the manual blocked→todo recovery) stay kind-blind on purpose.
+    //
+    // `=== false` rather than a truthiness read: an off-enum `kind` from the DB keeps today's
+    // cancelling behaviour instead of silently becoming a new zombie-row class (BLO-16074).
+    if (ISSUE_RECOVERY_ACTION_KIND_IS_WAKE_PATH_RESTORATION[input.kind] === false) return null;
 
     if (issue.status === "blocked") {
       const readiness = await svc.getDependencyReadiness(issue.id);
@@ -3765,7 +3780,10 @@ export function issueRoutes(
         : input.activeRecoveryAction;
     if (!activeRecoveryAction) return null;
 
-    const resolutionNote = await classifySourceRecoveryRevalidation(input);
+    const resolutionNote = await classifySourceRecoveryRevalidation({
+      ...input,
+      kind: activeRecoveryAction.kind,
+    });
     if (!resolutionNote) return activeRecoveryAction;
 
     const resolved = await recoveryActionsSvc.resolveActiveForIssue({

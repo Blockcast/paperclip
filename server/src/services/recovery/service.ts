@@ -8,6 +8,7 @@ import {
   getAgentWorkEligibility,
   type IssueGraphLivenessAutoRecoveryPreview,
   type IssueGraphLivenessAutoRecoveryPreviewItem,
+  type IssueRecoveryActionKind,
   type IssueStatus,
 } from "@paperclipai/shared";
 import {
@@ -5820,14 +5821,27 @@ export function recoveryService(
     throw lastError ?? new Error("ensureStrandedIssueRecoveryIssue: exhausted retries with no winner");
   }
 
+  // BLO-37677 AC3.2: a `Record` over the full cause union, not a ternary chain ending in a
+  // bare `stranded_assigned_issue` fallthrough. Four causes — `process_lost`,
+  // `provider_quota`, `codex_output_inactivity_monitor`,
+  // `execution_review_participant_recovery` — reach that literal today, and did so by
+  // omission rather than by decision, so a guard that enumerates `IssueRecoveryActionKind`
+  // could never fire on any of them: adding a *cause* changed no *kind*. Adding a cause is
+  // now a compile error here instead. Their mapping is deliberately unchanged — this makes
+  // the collapse explicit, it does not re-kind anything.
+  const STRANDED_RECOVERY_ACTION_KIND_BY_CAUSE: Record<StrandedRecoveryCause, IssueRecoveryActionKind> = {
+    [SUCCESSFUL_RUN_MISSING_STATE_REASON]: "missing_disposition",
+    workspace_validation_failed: "workspace_validation",
+    configuration_incomplete: "configuration_validation",
+    stranded_assigned_issue: "stranded_assigned_issue",
+    process_lost: "stranded_assigned_issue",
+    provider_quota: "stranded_assigned_issue",
+    codex_output_inactivity_monitor: "stranded_assigned_issue",
+    execution_review_participant_recovery: "stranded_assigned_issue",
+  };
+
   function strandedRecoveryActionKind(cause: StrandedRecoveryCause) {
-    return cause === SUCCESSFUL_RUN_MISSING_STATE_REASON
-      ? "missing_disposition" as const
-      : cause === "workspace_validation_failed"
-        ? "workspace_validation" as const
-      : cause === "configuration_incomplete"
-        ? "configuration_validation" as const
-      : "stranded_assigned_issue" as const;
+    return STRANDED_RECOVERY_ACTION_KIND_BY_CAUSE[cause];
   }
 
   function strandedRecoveryActionFingerprint(input: {
