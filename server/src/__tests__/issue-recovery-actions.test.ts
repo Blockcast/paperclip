@@ -6834,12 +6834,13 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // fix a `blocked` source issue with unresolved blockers cancelled the action.
     //
     // Seeded by writing the `blocked` status and the blocker edge STRAIGHT TO THE DB, then
-    // triggering revalidation with the same MONITOR_ARM the primary case uses. Deliberately
+    // triggering revalidation with an execution-policy write (see the note at the PATCH
+    // below for why this case cannot use the primary case's MONITOR_ARM). Deliberately
     // not a `PATCH {status:"blocked", blockedByIssueIds:[...]}`: that shape also drives the
     // blocked-transition machinery at `routes/issues.ts:13279`, whose detached
     // `getDependencyReadiness` continuation outlives the request and rejects unhandled once
     // the fixture is truncated. That is a real pre-existing hazard in code this PR does not
-    // touch (reported separately) — seeding directly keeps this case a test of the
+    // touch (BLO-38008) — seeding directly keeps this case a test of the
     // classifier branch and nothing else.
     async function blockSourceOnFreshIssue(fixture: Awaited<ReturnType<typeof seedPrNonConvergence>>) {
       const blockerId = randomUUID();
