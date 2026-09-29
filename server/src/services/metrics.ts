@@ -728,11 +728,14 @@ export function coerceRetryScheduleReason(reason: string | null | undefined): Re
     : "other";
 }
 /**
- * Placeholder `reason` for an agent with no live parked run. Keeps the
- * BLO-25036 invariant that every known agent always carries a series, without
- * zero-filling the agent x reason cross product. Deliberately outside
- * {@link KNOWN_RETRY_SCHEDULE_REASONS}: it is not a park class, it is always 0,
- * and an alert rule that bounded it would be bounding nothing.
+ * Per-agent zero-floor `reason`, emitted for EVERY known agent, including an
+ * agent that also carries live park series. It does not mean "no live park":
+ * `{reason="none"}` selects the whole fleet, so counting it yields fleet size,
+ * not drained agents. Keeps the BLO-25036 invariant that every known agent
+ * always carries a series, without zero-filling the agent x reason cross
+ * product. Deliberately outside {@link KNOWN_RETRY_SCHEDULE_REASONS}: it is not
+ * a park class, it is always 0, and an alert rule that bounded it would be
+ * bounding nothing.
  */
 export const NO_SCHEDULED_RETRY_PARK_REASON = "none";
 /**
@@ -2949,8 +2952,10 @@ function ensureRegistry(): {
         + "288x (max_turns_continuation 300s, ccrotate_capacity 900s, dependency_blocked 3600s, "
         + "transient_failure 9000s), so any single threshold across all of them fires on designed "
         + "backoff in one class while missing a 6x clamp breach in another. Bound each reason "
-        + "against its own constant. reason='none' is a zero-filled placeholder meaning the agent "
-        + "has no live park at all -- it is not a park class and must never carry a bound.",
+        + "against its own constant. reason='none' is a per-agent zero floor emitted for every "
+        + "known agent, including agents with live parks, so it selects the whole fleet and does "
+        + "not mean the agent is drained; it is not a park class, is always 0, and must never "
+        + "carry a bound.",
       labelNames: ["agent_id", "reason"],
       registers: [registry],
     });

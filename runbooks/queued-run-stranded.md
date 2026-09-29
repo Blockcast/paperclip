@@ -25,12 +25,37 @@ Owner: Platform / SRE (BLO-21116)
 `paperclip_scheduled_retry_park_horizon_seconds` measures the booked interval
 from `heartbeat_runs.updated_at` to `scheduled_retry_at` for live
 `status='scheduled_retry'` rows — i.e. how far out the most recent park decision
-booked. `PaperclipScheduledRetryParkHorizonImplausible`
-fires when that future-due horizon exceeds 5,400 seconds, based on the
-observed seven-day population (n=5,253, p99=1,594.8s, maximum 3,567.5s).
+booked. `PaperclipScheduledRetryParkHorizonImplausible` fires when that future-due
+horizon exceeds 5,400 seconds. That bound was set from an earlier seven-day
+population (n=5,253, p99=1,594.8s, maximum 3,567.5s) which is now
+**superseded**: in the seven days to 2026-09-28 there were 1,016 breaching
+samples across 12 agents, every one inside [5,590.1s, 8,977.8s], i.e. below the
+`transient_failure` ladder's designed 9,000s ceiling. That ladder's final hop is
+7,200s with +/-25% jitter, i.e. [5,400s, 9,000s], so a `transient_failure` page
+anywhere in that band is designed backoff, not an implausible booking -- check
+the `reason` label before treating a page as a fault.
 `PaperclipScheduledRetryParkHorizonMetricsRefreshFailed` is the companion
 alert for a failed gauge refresh; while it is firing, the horizon alert is
 gated off and its last snapshot is not trustworthy.
+
+> **Read the `reason` label** ([BLO-31174](/BLO/issues/BLO-31174), second
+> defect). The gauge is keyed by `agent_id` **and** `reason` (the row's
+> `scheduled_retry_reason`, coerced to the bounded allow-list, anything else
+> reads `other`). Legitimate ceilings differ by class and span 288x, so judge a
+> value against its own class's constant, not the flat 5,400s rule:
+>
+> | `reason` | designed ceiling | source |
+> |---|---:|---|
+> | `max_turns_continuation` | 300s | `MAX_TURN_CONTINUATION_MAX_DELAY_MS` |
+> | `ccrotate_capacity` | 900s | `CCROTATE_CAPACITY_MAX_PARK_MS` |
+> | `dependency_blocked` | 3,600s | `DEP_BLOCKED_MAX_DELAY_MS` |
+> | `transient_failure` | 9,000s | final 2h hop of `BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS` x (1 + 0.25 jitter) |
+>
+> Every known agent also carries a `reason="none"` series pinned at 0. It is a
+> per-agent zero floor emitted for **every** agent, including ones with live
+> parks, so `count(...{reason="none"})` is fleet size, not the number of drained
+> agents. It is not a park class and never carries a bound; `max by (agent_id)`
+> aggregates it away, which is why the flat rule reads exactly as before.
 
 > **Do not measure this from `created_at`** ([BLO-31174](/BLO/issues/BLO-31174)).
 > A park is re-decided in place: each re-check UPDATEs the same row with a new
