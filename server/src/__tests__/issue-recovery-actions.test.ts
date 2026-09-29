@@ -6739,8 +6739,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         status: "active",
       });
 
-      // Still eligible to wake its owner: the detail projection re-runs the classifier on
-      // the `read_projection` trigger and must not retire it there either.
+      // Still eligible to wake its owner on the detail projection. Note what does NOT protect
+      // this path: `classifySourceRecoveryRevalidation` returns null for `read_projection` at
+      // the trigger gate, before either the backlog fold or the kind guard runs, so this holds
+      // for every kind with or without the carve-out. It pins the trigger gate, not the guard.
       const detail = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
       expect(detail.body.activeRecoveryAction).toMatchObject({ id: action.id, status: "active" });
 
@@ -6838,8 +6840,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // Nothing in this PR prevents that. Whether a specific escalation beacon should outrank
     // the generic stranded sweep for the single active-action slot is a design call with its
     // own blast radius — the obvious guard (refuse the clobber) can deadlock the board-shaped
-    // beacon, which is unbounded by design (`maxAttempts: null`, no `timeoutAt`). Tracked
-    // separately; this exists so the hazard is visible and so that changing it is a
+    // beacon, which is unbounded by design (`maxAttempts: null`, no `timeoutAt`). Tracked as
+    // BLO-37934; this exists so the hazard is visible and so that changing it is a
     // deliberate act that turns this assertion red.
     it("records that a stranded upsert rewrites a live pr_review_non_convergence kind in place", async () => {
       const { companyId, sourceIssueId, recoveryActionSvc, action, managerId, coderId } =
@@ -6876,6 +6878,20 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         .patch(`/api/issues/${sourceIssueId}`)
         .send(MONITOR_ARM)
         .expect(200);
+
+      // Pin the note, not just the absence of an active row: the claim is specifically that
+      // the AGENT-OWNER branch reclaims the row once the kind is rewritten. Without this a
+      // future unrelated cancellation path would satisfy the case while the demotion it
+      // exists to characterize had stopped happening.
+      const [clobberedRow] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      expect(clobberedRow).toMatchObject({
+        status: "cancelled",
+        outcome: "cancelled",
+        resolutionNote: "Recovery action became stale because the source issue is in_progress with an agent owner.",
+      });
       expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
     });
   });
