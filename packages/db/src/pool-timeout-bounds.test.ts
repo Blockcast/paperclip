@@ -6,6 +6,7 @@ import {
   POSTGRES_ROLE_IDLE_IN_TRANSACTION_TIMEOUT_MS,
   createDb,
   formatInheritedTimeoutSettings,
+  inheritedTimeoutLogLevel,
   poolIdleInTransactionTimeoutLoosens,
   readInheritedTimeoutSettings,
 } from "./client.js";
@@ -74,12 +75,24 @@ describe("createDb idle-in-transaction bound never loosens the server's (PEN-336
     );
   });
 
-  it("keeps the two figures independent so the bound above can actually fail", () => {
-    // If `POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS` were an alias of the role
-    // constant the assertion above would hold by construction and catch
-    // nothing. Pinning the literal is what keeps it load-bearing.
+  it("keeps the role figure pinned so the bound above can actually fail", () => {
+    // `POSTGRES_ROLE_IDLE_IN_TRANSACTION_TIMEOUT_MS` is a transcription of an
+    // `ALTER ROLE` that lives only as prose in another repository (PEN-3598).
+    // Nothing in this repo can re-derive it, so it must not drift silently:
+    // editing it changes what the assertion above *means*, and this pin forces
+    // that edit to be deliberate.
+    //
+    // Only the role figure is pinned. Pinning the pool constant too would make
+    // the `<=` above unable to fail independently — any edit breaking the bound
+    // breaks the pin as well — and would turn a legitimate *tightening* (say,
+    // dropping the pool to 30s to follow a tightened role) into a red test
+    // whose message reads like the regression it guards against. The pool
+    // constant is free to move downward under the role figure.
+    //
+    // Neither pin can detect the pool constant being made an *alias* of the
+    // role constant, which would render the `<=` tautological — that is
+    // guarded by the reasoning recorded on the constant itself, not from here.
     expect(POSTGRES_ROLE_IDLE_IN_TRANSACTION_TIMEOUT_MS).toBe(60_000);
-    expect(POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS).toBe(60_000);
   });
 
   it("reports a tighter inherited bound as a loosening, and an absent one as not", () => {
@@ -112,6 +125,40 @@ describe("createDb idle-in-transaction bound never loosens the server's (PEN-336
     // marker above is attributable to the comparison and not to the format
     // function simply always appending it.
     expect(formatInheritedTimeoutSettings(at(60_000))).not.toContain("LOOSENED");
+  });
+
+  it("warns on a loosening even when statement_timeout is bounded", () => {
+    const at = (idleMs: number | null, statementMs: number | null) => ({
+      statementTimeout: {
+        name: "statement_timeout",
+        valueMs: statementMs,
+        source: statementMs === null ? "default" : "user",
+      },
+      idleInTransactionSessionTimeout: {
+        name: "idle_in_transaction_session_timeout",
+        valueMs: idleMs,
+        source: idleMs === null ? "default" : "user",
+      },
+      lockTimeout: { name: "lock_timeout", valueMs: 15_000, source: "user" },
+    });
+
+    // The regression this exists for. Before PEN-3365's follow-up the caller
+    // keyed the level solely on `statement_timeout`, so under this deployment's
+    // own premise — the role sets `statement_timeout = '30000'` — a loosening
+    // was announced at `info`, the same severity as the healthy line. The
+    // `LOOSENED:` marker was added because printing the two numbers had not
+    // been enough; stating the verdict at `info` left it just as unread.
+    expect(inheritedTimeoutLogLevel(at(30_000, 30_000))).toBe("warn");
+    expect(formatInheritedTimeoutSettings(at(30_000, 30_000))).toContain("LOOSENED");
+
+    // The two conditions are orthogonal, so each must raise the level alone.
+    expect(inheritedTimeoutLogLevel(at(60_000, null))).toBe("warn");
+
+    // ...and the healthy state — bounded statement_timeout, no loosening —
+    // stays at `info`, so the two above are attributable to the conditions
+    // rather than to the level simply always being `warn`.
+    expect(inheritedTimeoutLogLevel(at(60_000, 30_000))).toBe("info");
+    expect(inheritedTimeoutLogLevel(at(null, 30_000))).toBe("info");
   });
 });
 
