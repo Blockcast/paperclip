@@ -582,6 +582,9 @@ describeEmbeddedPostgres("refreshOverdueScheduledRetryAgeMetrics (BLO-22094)", (
     const { body } = await renderMetrics();
     expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}",reason="transient_failure"} 8630`);
     expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}",reason="ccrotate_capacity"} 3600`);
+    // `none` is a per-agent zero floor, not a "drained" marker: a parked agent
+    // carries it too, so `{reason="none"}` selects the whole fleet.
+    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}",reason="none"} 0`);
   });
 
   it("zero-fills an agent with no live park without inventing a park class", async () => {
