@@ -9142,10 +9142,37 @@ type ScheduledRetryAssigneeMismatch = {
  * retry, and under which of the two distinct facts it hides (BLO-38064).
  *
  * Returns `null` — retry allowed — when the run holds the issue, or when the
- * lineage started from a wake in {@link NON_OWNERSHIP_RETRY_WAKE_REASONS}. Every
- * other gate (terminal status, execution lock, review participant, pause hold,
- * dependencies) is unchanged and still applies to an exempt retry; this clears
- * only the ownership test, which such a wake was never subject to.
+ * lineage started from a wake in {@link NON_OWNERSHIP_RETRY_WAKE_REASONS}. The
+ * terminal-status, review-participant, pause-hold and dependency gates are
+ * unchanged and still apply to an exempt retry; this clears only the ownership
+ * test, which such a wake was never subject to.
+ *
+ * Two gates that do NOT cover an exempt retry, so do not lean on them here:
+ *
+ * - **The execution lock.** Not because the lock check is weak, but because
+ *   there is no lock to check: per BLO-25517 (see `requiresIssueExecutionRetryLock`)
+ *   `scheduleBoundedRetryForRun` always clears `issues.executionRunId` before
+ *   parking, and it stays null for the whole parked window. So at every gate
+ *   site reached from a parked retry, `issueExecutionRetryLockAvailable` passes
+ *   on its `== null` arm. It is also opt-in per retry reason, and the bounded
+ *   transient retry this exemption is about is not one of the reasons that opts
+ *   in.
+ * - **`in_progress`.** `requiresInProgressIssueRetry` excludes
+ *   `session_unavailable` and `zero_token_session_reset`, and is likewise gated
+ *   on `requiresIssueExecutionRetryLock`.
+ *
+ * RESIDUAL (accepted, BLO-38064 review): a mention-woken agent can still check
+ * out manually, which assigns it the issue and takes the lock. If its run then
+ * fails transiently and the issue is reassigned while the retry is parked, this
+ * exemption lets the retry promote and wake an agent that has genuinely lost
+ * ownership — the one case where `issue_reassigned` would have been the honest
+ * verdict. Nothing above catches it, because the lock was released at mint and
+ * the fact that this lineage once held it is gone by gate time. Closing it means
+ * stamping that fact at mint, the way `originWakeReason` is stamped. Judged not
+ * worth the plumbing for now: promotion writes no lock (so there is no
+ * concurrent execution), once the new owner takes the lock
+ * `issue_execution_lock_changed` blocks the lineage anyway, and the residual
+ * costs one wake to an agent that will read the issue and find it reassigned.
  *
  * `issue_reassigned` now means what it says. It is kept for a wake that DID
  * confer ownership — the assignee episode BLO-29729 wrote the guard for, where
@@ -36213,10 +36240,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // lineage on its own. If you ever change that errorCode, re-check the recovery guard.
         //
         // BLO-38064: "reassignment" is now decided by evaluateScheduledRetryAssigneeMismatch
-        // rather than by a bare `agentId !== assigneeAgentId`. This is the site the measured
-        // mention loss ran through — a bounded transient retry skips the other three gates
-        // entirely — so a mention-wake lineage no longer ends here at all. An exempt retry
-        // is still cancelled when the ISSUE is cancelled; only the ownership arm is cleared.
+        // rather than by a bare `agentId !== assigneeAgentId`, so a mention-wake lineage no
+        // longer ends here on ownership alone. This is the site the measured mention loss ran
+        // through, but the exemption reaches past that bounded transient retry: the
+        // `wakeReason` fallback in originWakeReasonFromSnapshot means a dep-blocked park
+        // (`depBlockedSnapshot`) or a ccrotate capacity park that carries a mention wake is
+        // exempt here too. That is intended — such a park was never the assignee's either, so
+        // the "charging the new one for time they never waited" rationale above does not apply
+        // to it. An exempt retry is still cancelled when the ISSUE is cancelled; only the
+        // ownership arm is cleared.
         const cancelStaleScheduledRetry = async (scheduledRun: typeof heartbeatRuns.$inferSelect) => {
           const issueCancelled = issue.status === "cancelled";
           const assigneeMismatch = evaluateScheduledRetryAssigneeMismatch({
