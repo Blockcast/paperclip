@@ -410,20 +410,23 @@ jobs:
         # `git push` is not a guaranteed fix. See AGENTS.md §9. Uses the
         # already-checked-out history (fetch-depth: 0 above), no new token.
         #
-        # There is deliberately NO branch exemption. The graphify-reindex bot
-        # commits via `git push` under its own git identity
-        # (`allyblockcast[bot]@users.noreply.github.com`), which is not the
-        # REST-path stamp this gate matches
-        # (`290875700+allyblockcast[bot]@users.noreply.github.com`) — measured
-        # by running this script over the real graphify PRs #789 and #944:
-        # both pass. A `github.head_ref`-keyed exemption was therefore
-        # protecting against a rejection that never happens, while being both
-        # a fork bypass (any fork can name its branch `bot/graphify-reindex`,
-        # and `head_ref` carries no repository identity) and a merge-queue
-        # false-reject (`head_ref` is empty in `merge_group`). Pinned by the
-        # graphify-identity case in check-commit-author-attribution.test.mjs —
-        # if that test starts failing, the bot moved onto the REST write path
-        # and the right fix is to move it back, not to re-add an exemption.
+        # The App stamps this identity under several email spellings —
+        # id-prefixed, bare, wrong-prefix, any casing (BLO-26647) — and the
+        # matcher covers all of them, so which write path produced the commit
+        # no longer changes the verdict.
+        #
+        # There is still deliberately NO BRANCH exemption. The graphify-reindex
+        # bot shares the bare spelling, and it IS exempt, but by author name
+        # PLUS the paths it is allowed to touch (NON_AGENT_PROCESS_EXEMPTIONS in
+        # the script — email alone cannot tell it from a genuine agent commit,
+        # and a name alone is caller-controlled and so forgeable). Keying on
+        # `github.head_ref` here instead would be a fork bypass (any fork can
+        # name its branch `bot/graphify-reindex`, and `head_ref` carries no
+        # repository identity) and a merge-queue false-reject (`head_ref` is
+        # empty in `merge_group`). Pinned by the graphify cases in
+        # check-commit-author-attribution.test.mjs — if those start failing the
+        # bot's author name or output paths changed: update the exemption to
+        # match, do not re-add a branch exemption.
         run: node ./scripts/check-commit-author-attribution.mjs --base "$PR_BASE_SHA" --head "$PR_HEAD_SHA"
 
       - name: Test commit-author-attribution check
