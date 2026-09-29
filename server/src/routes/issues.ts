@@ -3043,6 +3043,16 @@ function logIssueListRequest(input: {
 }
 
 /**
+ * Page-count ceiling for walkIssueListPages.
+ *
+ * Deliberately its own constant rather than a reuse of ISSUE_LIST_MAX_LIMIT, which is a
+ * rows-per-PAGE request limit: the two are unrelated dimensions that merely happen to share
+ * a value today. Tying them together would make the walk's row ceiling — their product —
+ * shrink quadratically if that request-facing limit were ever tuned down.
+ */
+export const WALK_MAX_PAGES = 1000;
+
+/**
  * Pages through `fetchPage` until it returns a short page, handing each page to `visit`.
  *
  * attention=blocked is served by listBlockedInboxIssues, which pages by offset only and
@@ -3059,16 +3069,6 @@ function logIssueListRequest(input: {
  * an error rather than as a request that never returns. A page cap backstops both, since
  * the blocked assertion compares consecutive pages and churn can differ them indefinitely.
  */
-/**
- * Page-count ceiling for walkIssueListPages.
- *
- * Deliberately its own constant rather than a reuse of ISSUE_LIST_MAX_LIMIT, which is a
- * rows-per-PAGE request limit: the two are unrelated dimensions that merely happen to share
- * a value today. Tying them together would make the walk's row ceiling — their product —
- * shrink quadratically if that request-facing limit were ever tuned down.
- */
-export const WALK_MAX_PAGES = 1000;
-
 export async function walkIssueListPages<Row extends { id: string }>(
   fetchPage: (page: { offset?: number; afterId?: string }) => Promise<Row[]>,
   opts: { blocked: boolean; pageSize: number },
