@@ -37,4 +37,45 @@ describe("walkIssueListPages", () => {
     });
     expect(seen).toEqual(rows.map((row) => row.id));
   });
+
+  // The two below drive the blocked/general mapping out of agreement with the listing it
+  // mirrors — the failure a change to list()'s routing would introduce silently, across a
+  // file boundary, with no conflict and no type error. Both must surface as a rejection:
+  // the walk feeds a count endpoint, so the untended failure is a request that never
+  // returns and a connection held open, not a wrong number.
+
+  it("throws rather than spinning when the general path's afterId never reaches list()", async () => {
+    // An early return added to list() above its afterId predicate looks exactly like this:
+    // the cursor is accepted and ignored, so page one comes back forever.
+    const ignoresAfterId = async () => rows.slice(0, 2);
+    await expect(
+      walkIssueListPages(ignoresAfterId, { blocked: false, pageSize: 2 }, async () => {}),
+    ).rejects.toThrow(/keyset cursor did not advance/);
+  });
+
+  it("throws rather than spinning when the blocked path's offset never reaches list()", async () => {
+    // The route builds the blocked page args separately from the walk's `blocked` flag;
+    // dropping `offset` there strands the walk on page one just as completely.
+    const ignoresOffset = async () => rows.slice(0, 2);
+    await expect(
+      walkIssueListPages(ignoresOffset, { blocked: true, pageSize: 2 }, async () => {}),
+    ).rejects.toThrow(/blocked page repeated/);
+  });
+
+  it("does not mistake a re-ranked repeat row on the blocked path for a stalled walk", async () => {
+    // The blocked listing orders by mutable activity, so a row touched mid-walk can
+    // legitimately reappear on the next page. Only a wholly identical page is a stall,
+    // which is why the guard compares the page rather than its last id.
+    const pages = [
+      [{ id: "a" }, { id: "b" }],
+      [{ id: "b" }, { id: "c" }],
+      [{ id: "d" }],
+    ];
+    const seen: string[] = [];
+    let call = 0;
+    await walkIssueListPages(async () => pages[call++] ?? [], { blocked: true, pageSize: 2 }, async (page) => {
+      seen.push(...page.map((row) => row.id));
+    });
+    expect(seen).toEqual(["a", "b", "b", "c", "d"]);
+  });
 });
