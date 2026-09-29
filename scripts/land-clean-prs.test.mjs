@@ -18,6 +18,7 @@ import {
   markFailure,
   latestCheckStates,
   renderReceipt,
+  repoRunner,
   settleMinutesFrom,
   sweepRepos,
   targetRepos,
@@ -289,6 +290,23 @@ describe("per-fire cap", () => {
     });
     assert.deepEqual(seen, [0, 2, 4], "repo 1 spends 2 of its 3, not 3");
     assert.equal(spent, 4);
+  });
+
+  it("main's per-repo step hands the carried spend to runRepo", () => {
+    // The two tests above stub the step, so they cannot see `main` drop the
+    // carry. This one composes the real `repoRunner` with a spy in place of
+    // `runRepo`: passing a literal 0 would make the cap per repo again.
+    const rotted = [];
+    const calls = [];
+    const spy = (...args) => {
+      calls.push(args);
+      return classifyAll(clean(), { now: NOW, maxEnqueues: 4, spent: args[3] });
+    };
+    sweepRepos(["a/one", "a/two"], repoRunner(true, 7, rotted, spy));
+    assert.deepEqual(calls, [
+      ["a/one", true, 7, 0, rotted],
+      ["a/two", true, 7, 3, rotted],
+    ]);
   });
 });
 
