@@ -217,6 +217,48 @@ describe("CLI", () => {
     assert.deepEqual(decision.dismiss.map((r) => r.id), [OLDER.id]);
   });
 
+  it("decodes stdin as one UTF-8 stream, not per chunk", () => {
+    // Node reads a stdin pipe in 64 KiB chunks. Decoding each chunk on its own
+    // turns a multi-byte character split across a boundary into U+FFFD, and
+    // every Ally body carries em-dashes in its heading and disposition markers.
+    // Each case starts a 3-byte em-dash 2 bytes before the first boundary.
+    const boundary = 64 * 1024;
+    const stillPresent = review({
+      id: 111,
+      body: `${body()}\n\n- **prior: guard keys on state** \u2014 still-present \u2014 not fixed at this head`,
+    });
+    const clean = review({ id: 222, submitted_at: "2026-09-08T20:10:36Z" });
+    const cases = [
+      // Fails open: the corrupted marker merges two verdicts and dismisses the blocker.
+      { reviews: [stillPresent, clean], needle: "\u2014 still-present", reason: "conflicting-verdicts", dismiss: [] },
+      // Fails closed: the corrupted heading drops the newer review from the candidates.
+      { reviews: [OLDER, NEWER], needle: "\u2014 Consolidated", occurrence: 1, reason: "duplicate", dismiss: [OLDER.id] },
+    ];
+
+    for (const { reviews, needle, occurrence = 0, reason, dismiss } of cases) {
+      // A non-Ally review ahead of the fixture pads the needle onto the boundary.
+      const filler = (length) => ({ id: 1, state: "COMMENTED", user: { login: "octocat", id: 583231 }, body: "x".repeat(length) });
+      const offsetOf = (json) => {
+        let at = -1;
+        for (let i = 0; i <= occurrence; i += 1) at = Buffer.from(json).indexOf(needle, at + 1);
+        return at;
+      };
+      const input = JSON.stringify([filler(boundary - 2 - offsetOf(JSON.stringify([filler(0), ...reviews]))), ...reviews]);
+      assert.equal(offsetOf(input), boundary - 2);
+
+      const run = spawnSync(
+        process.execPath,
+        [fileURLToPath(new URL("./ally-review-de-dupe.mjs", import.meta.url)), HEAD],
+        { input, encoding: "utf8" },
+      );
+
+      assert.equal(run.status, 0, run.stderr);
+      const decision = JSON.parse(run.stdout);
+      assert.equal(decision.reason, reason, needle);
+      assert.deepEqual(decision.dismiss.map((r) => r.id), dismiss, needle);
+    }
+  });
+
   it("refuses without a head argument", () => {
     const run = spawnSync(
       process.execPath,

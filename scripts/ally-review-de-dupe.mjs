@@ -149,7 +149,10 @@ async function main() {
   }
   const chunks = [];
   for await (const chunk of process.stdin) chunks.push(chunk);
-  const decision = selectDuplicateDismissals(JSON.parse(chunks.join("") || "[]"), head);
+  // Decode once, after concatenating: joining per-chunk Buffers decodes each
+  // alone, so an em-dash split across a 64 KiB boundary becomes U+FFFD and
+  // breaks the heading and still-present markers the verdict is read from.
+  const decision = selectDuplicateDismissals(JSON.parse(Buffer.concat(chunks).toString("utf8") || "[]"), head);
   const brief = ({ id, state, submitted_at: at }) => ({ id, state, submitted_at: at });
   process.stdout.write(
     `${JSON.stringify(
