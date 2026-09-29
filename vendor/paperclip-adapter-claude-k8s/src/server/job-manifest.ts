@@ -581,10 +581,12 @@ function sharedPnpmStorePath(rawCompanyId: string, dataMountPath: string): strin
 
 /** Where the agent POD reaches the shared data volume. Operator-configurable,
  *  so every path the container addresses on that volume must be built from it
- *  rather than from the `/paperclip` default. Resolved in one place because two
- *  callers need it at different points in the build (`buildEnvVars`, which runs
- *  before the mount is declared, and the mount itself). */
-function resolveDataMountPath(config: Record<string, unknown>): string {
+ *  rather than from the `/paperclip` default. Resolved in one place because
+ *  several callers need it at different points in the build (`buildEnvVars`,
+ *  which runs before the mount is declared; the mount itself; and `execute.ts`,
+ *  which needs it to translate the prompt bundle's pod address into the server
+ *  address it writes through — BLO-37760). */
+export function resolveDataMountPath(config: Record<string, unknown>): string {
   const configured = asString(config.workspaceMountPath, "").trim();
   if (!configured) return "/paperclip";
   assertSafeAbsolutePath("config.workspaceMountPath", configured);
