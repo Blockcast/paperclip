@@ -110,6 +110,14 @@ export const SKIP_LABELS = ["do-not-merge", "review-gate-override"];
  * counter has to carry across those calls via `spent` or the real ceiling is
  * `10 x repos` — the cap quietly scaling with the very knob that makes a
  * classifier bug reach further.
+ *
+ * What carries is SUCCESSFUL enqueues only (see `sweepRepos`): a row that
+ * `markFailure` renamed to `enqueue-failed` costs nothing, because a failed
+ * enqueue merged no PR. So the cap bounds PRs landed per fire, which is the
+ * guarantee above, and does not bound attempts: a repo whose enqueues all fail
+ * leaves the next repo a full budget, up to `10 x repos` doomed calls. Those
+ * are no-ops, so that is accepted rather than spending budget on them and
+ * starving later repos in the sweep.
  */
 export const MAX_ENQUEUES_PER_FIRE = 10;
 
@@ -781,9 +789,9 @@ export function settleMinutesFrom(value = process.env.LAND_CLEAN_PRS_SETTLE_MINU
  * invisible to the summary line — which is how #2020 reported `enqueue` for 25
  * hours while arming nothing.
  *
- * Renaming the action also drops the row out of `main`'s `spent` tally, which
- * counts `enqueue` rows against the per-fire cap. That is the wanted reading: a
- * failed enqueue consumed no queue slot.
+ * Renaming the action also drops the row out of `sweepRepos`'s `spent` tally,
+ * which counts `enqueue` rows against the per-fire cap. That is the wanted
+ * reading: a failed enqueue consumed no queue slot.
  */
 export function markFailure(row, message) {
   row.action = `${row.action}-failed`;
@@ -825,6 +833,21 @@ function runRepo(repo, apply, settleMinutes, spent, rotted) {
   return rows;
 }
 
+/**
+ * Runs each repo with the enqueues already spent this fire, so the cap is per
+ * fire (see MAX_ENQUEUES_PER_FIRE). Only rows still reading `enqueue` after
+ * apply are spent; `enqueue-failed` is not. Extracted from `main` so the carry
+ * and that reading are tested directly rather than by a copy of the loop.
+ */
+export function sweepRepos(repos, runOne) {
+  let spent = 0;
+  for (const repo of repos) {
+    const rows = runOne(repo, spent);
+    spent += rows.filter((row) => row.action === "enqueue").length;
+  }
+  return spent;
+}
+
 function reportRotted(rotted) {
   if (rotted.length === 0) return;
   // Reported, never acted on. A deliberate hold is invisible on every API
@@ -843,7 +866,6 @@ function main() {
   const apply = process.argv.includes("--apply");
   const settleMinutes = settleMinutesFrom();
   const rotted = [];
-  let spent = 0;
 
   // `finally`, because the cohort is the expensive half of the output and the
   // likeliest thrower is `fetchOpenPrs` — outside `runRepo`'s try, one list
@@ -851,11 +873,11 @@ function main() {
   // run the only `gh` traffic there is. The explicit call before `process.exit`
   // in `runRepo` stays: `exit` does not unwind, so this block never runs there.
   try {
-    for (const repo of targetRepos()) {
+    sweepRepos(targetRepos(), (repo, spent) => {
       const rows = runRepo(repo, apply, settleMinutes, spent, rotted);
-      spent += rows.filter((row) => row.action === "enqueue").length;
       console.log("");
-    }
+      return rows;
+    });
   } finally {
     reportRotted(rotted);
   }
