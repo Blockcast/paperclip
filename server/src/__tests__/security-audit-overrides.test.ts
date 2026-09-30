@@ -57,7 +57,7 @@ describe("PEN-1198 audit dependency remediation", () => {
     const overrides = rootPackageJson.pnpm.overrides;
 
     expect(overrides["@connectrpc/connect-node>undici"]).toBe(
-      ">=6.27.0 <7",
+      ">=6.28.1 <7",
     );
     expect(overrides["jsdom>undici"]).toBe(">=7.29.1 <8");
     expect(overrides["js-yaml"]).toBe(">=4.3.2 <5");
@@ -69,8 +69,11 @@ describe("PEN-1198 audit dependency remediation", () => {
     const remediations = rootPackageJson.securityAuditRemediations["PEN-1198"];
 
     expect(remediations["@connectrpc/connect-node>undici"]).toMatchObject({
-      patchedRange: ">=6.27.0 <7",
+      patchedRange: ">=6.28.1 <7",
       advisories: expect.arrayContaining([
+        // BLO-38291: GHSA-rfgv-xxqx-mfg5 (CVE-2026-19534) raised the floor
+        // from 6.27.0 to 6.28.1. The advisories below are still addressed.
+        "GHSA-rfgv-xxqx-mfg5",
         "GHSA-vrm6-8vpv-qv8q",
         "GHSA-vxpw-j846-p89q",
       ]),

@@ -29,7 +29,7 @@ overrides:
   '@babel/core': '>=7.29.7 <8'
   js-yaml: '>=4.3.2 <5'
   esbuild: '>=0.28.1 <0.29'
-  '@connectrpc/connect-node>undici': '>=6.27.0 <7'
+  '@connectrpc/connect-node>undici': '>=6.28.1 <7'
   jsdom>undici: '>=7.29.1 <8'
   multer: '>=2.3.0 <3'
   browserslist: '>=4.28.7 <5'
@@ -8156,8 +8156,8 @@ packages:
   undici-types@7.24.4:
     resolution: {integrity: sha512-cRaY9PagdEZoRmcwzk3tUV3SVGrVQkR6bcSilav/A0vXsfpW4Lvd0BvgRMwTEDTLLGN+QdyBTG+nnvTgJhdt6w==}
 
-  undici@6.27.0:
-    resolution: {integrity: sha512-YmfV3YnEDzXRC5lZ2jWtWWHKGUm1zIt8AhesR1tens+HTNv+YZlN/dp6G727LOvMJ8xjP9Be7Y2Sdr96LDm+pg==}
+  undici@6.29.0:
+    resolution: {integrity: sha512-R+RODBqp6i2pPflGdq+xIOUkl+RNfGgHwoinecKu/JCuf2uO06cOKoDbI2P7Dn6KcswdKwrczbU6IYJ6K8X+wg==}
     engines: {node: '>=18.17'}
 
   undici@7.30.0:
@@ -9557,7 +9557,7 @@ snapshots:
     dependencies:
       '@bufbuild/protobuf': 1.10.0
       '@connectrpc/connect': 1.7.0(@bufbuild/protobuf@1.10.0)
-      undici: 6.27.0
+      undici: 6.29.0
 
   '@connectrpc/connect-web@1.7.0(@bufbuild/protobuf@1.10.0)(@connectrpc/connect@1.7.0(@bufbuild/protobuf@1.10.0))':
     dependencies:
@@ -16523,7 +16523,7 @@ snapshots:
 
   undici-types@7.24.4: {}
 
-  undici@6.27.0: {}
+  undici@6.29.0: {}
 
   undici@7.30.0: {}
 
