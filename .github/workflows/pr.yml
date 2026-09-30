@@ -1423,14 +1423,15 @@ jobs:
       # the diff by the `Require vendored-adapter source changes to be logged`
       # step in the `policy` job, which stores nothing and so cannot conflict.
 
-      # Guards the "Current version" row against the same drift, which the hash
-      # above structurally cannot catch: PROVENANCE.md is excluded from it, so a
-      # version bump updates package.json + package-lock.json, changes the hash,
-      # and still leaves the recorded identity stale with CI green. That is
-      # exactly what happened on #1459 (doc said -blockcast.2, package said .3),
-      # caught by a reviewer rather than by this job. PROVENANCE.md is the stated
-      # source of truth for which release is in the tree, so a wrong value here
-      # misdirects the next audit or incident response.
+      # Guards the "Current version" row against drift. Nothing else compares it
+      # to the manifests: the provenance-log step above asserts that a vendored
+      # source change is recorded, not that the recorded version is right, so a
+      # bump can land in package.json + package-lock.json and leave the row stale
+      # with CI green. That is exactly what happened on #1459 (doc said
+      # -blockcast.2, package said .3), caught by a reviewer rather than by this
+      # job. PROVENANCE.md is the stated source of truth for which release is in
+      # the tree, so a wrong value here misdirects the next audit or incident
+      # response.
       - name: Verify provenance version
         run: |
           set -euo pipefail
