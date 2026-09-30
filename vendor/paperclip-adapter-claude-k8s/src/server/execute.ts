@@ -1628,8 +1628,36 @@ export function describeTruncationCause(
 }
 
 /**
- * Delete the Job's pods and wait for them to actually be gone.  Returns false
- * if any pod outlived `POD_TEARDOWN_TIMEOUT_MS`.
+ * Outcome of `deleteJobPodsAndWait` (BLO-38096).
+ *
+ * `alive` and `unobserved` are both "not confirmed gone", but they are
+ * different facts and collapsing them into one `false` cost two things: the
+ * retention warnings claimed pods were seen when nothing had been seen, and
+ * `teardownCancelledJob` could not tell a wedged pod from an apiserver it
+ * could not reach at all.
+ *
+ * - `gone`       — the pod list came back empty, or the namespace itself 404s.
+ * - `alive`      — the list succeeded and still showed pods at the deadline.
+ * - `unobserved` — no list call ever succeeded, so nothing was observed either
+ *                  way.  Notably this is also the branch where the pod delete
+ *                  itself may never have been issued.
+ */
+type PodTeardownOutcome = "gone" | "alive" | "unobserved";
+
+/**
+ * The clause describing a non-`gone` teardown outcome.  Split because
+ * `unobserved` must not claim pods were "still present": nothing was seen —
+ * the poll failed to look.
+ */
+function podTeardownFailureClause(outcome: "alive" | "unobserved", subject: string): string {
+  const secs = Math.round(POD_TEARDOWN_TIMEOUT_MS / 1000);
+  return outcome === "alive"
+    ? `pod(s) for ${subject} still present after ${secs}s`
+    : `could not confirm pods for ${subject} are gone after ${secs}s (no pod list succeeded)`;
+}
+
+/**
+ * Delete the Job's pods and wait for them to actually be gone.
  *
  * A Pod object is only removed from the API after the kubelet has confirmed
  * teardown, so "no pods match `job-name=<jobName>`" is a sound signal that no
@@ -1640,7 +1668,7 @@ async function deleteJobPodsAndWait(
   jobName: string,
   onLog: AdapterExecutionContext["onLog"],
   kubeconfigPath?: string,
-): Promise<boolean> {
+): Promise<PodTeardownOutcome> {
   const coreApi = getCoreApi(kubeconfigPath);
   const labelSelector = `job-name=${jobName}`;
   try {
@@ -1655,15 +1683,18 @@ async function deleteJobPodsAndWait(
   }
   const deadline = Date.now() + POD_TEARDOWN_TIMEOUT_MS;
   let listErrorLogged = false;
+  // Survives across polls: one late list failure after several good reads
+  // still leaves us knowing pods were there, which is `alive`, not
+  // `unobserved`.  Only a poll that never once succeeded is `unobserved`.
+  let lastObserved: number | null = null;
   while (true) {
-    let observed: number | null = null;
     try {
       const podList = await coreApi.listNamespacedPod({ namespace, labelSelector });
-      observed = (podList?.items ?? []).length;
+      lastObserved = (podList?.items ?? []).length;
     } catch (err) {
       // Can't observe the pods, so we can't prove they are gone — unless the
       // namespace itself is gone, in which case they are.
-      if (isK8s404(err)) return true;
+      if (isK8s404(err)) return "gone";
       // Log the first non-404 once. A persistent RBAC/5xx failure retries
       // silently to the deadline and then fails closed on the same path as a
       // genuinely wedged pod, so without this the two are indistinguishable in
@@ -1677,8 +1708,8 @@ async function deleteJobPodsAndWait(
         );
       }
     }
-    if (observed === 0) return true;
-    if (Date.now() >= deadline) return false;
+    if (lastObserved === 0) return "gone";
+    if (Date.now() >= deadline) return lastObserved === null ? "unobserved" : "alive";
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
   }
 }
@@ -1711,12 +1742,12 @@ async function cleanupJob(
     await deleteJobOnly(namespace, jobName, onLog, kubeconfigPath, podLogPath);
     return true;
   }
-  const podsGone = await deleteJobPodsAndWait(namespace, jobName, onLog, kubeconfigPath);
-  if (!podsGone) {
+  const outcome = await deleteJobPodsAndWait(namespace, jobName, onLog, kubeconfigPath);
+  if (outcome !== "gone") {
     await onLog(
       "stderr",
-      `[paperclip] Warning: pod(s) for job ${jobName} still present after ` +
-        `${Math.round(POD_TEARDOWN_TIMEOUT_MS / 1000)}s; leaving Job and run Secrets for K8s GC ` +
+      `[paperclip] Warning: ${podTeardownFailureClause(outcome, `job ${jobName}`)}; ` +
+        `leaving Job and run Secrets for K8s GC ` +
         `rather than deleting a Secret a live pod mounts\n`,
     );
     return false;
@@ -1759,11 +1790,20 @@ async function deleteJobOnly(
  * `cleanupJob` fixes, reached by a path that used to bypass `cleanupJob`
  * entirely and call `deleteNamespacedJob` directly.
  *
- * Unlike `cleanupJob` this deliberately does NOT fail closed: a cancelled run
- * only settles once `waitForJobCompletion` sees the Job 404, and
+ * Unlike `cleanupJob` this fails *open* when a pod is still there: a cancelled
+ * run only settles once `waitForJobCompletion` sees the Job 404, and
  * `completionTimeoutMs` may be 0 (run indefinitely), so refusing to delete the
- * Job would hang the run forever.  The pod delete has already been issued by
- * that point, so the kubelet will not start a container for it either way.
+ * Job would hang the run forever.  That trade is only sound when the pod delete
+ * actually landed — and it is `alive` that evidences it, because the apiserver
+ * answered a list for the same Job.
+ *
+ * BLO-38096: it does NOT fail open on `unobserved`.  A non-404
+ * `deleteCollection` failure is swallowed above and falls through to the poll,
+ * so a fault denying both verbs (RBAC, 5xx) leaves the pod delete never issued
+ * *and* nothing observed.  Deleting the Job there reaps the Secrets through
+ * their `ownerReference` under a pod that can still start — BLO-35486's exact
+ * failure on the cancel path.  So `unobserved` retains the Job and accepts the
+ * hang; it needs a total read outage, where the run is already not settling.
  */
 export async function teardownCancelledJob(
   namespace: string,
@@ -1771,12 +1811,21 @@ export async function teardownCancelledJob(
   onLog: AdapterExecutionContext["onLog"],
   kubeconfigPath?: string,
 ): Promise<void> {
-  const podsGone = await deleteJobPodsAndWait(namespace, jobName, onLog, kubeconfigPath);
-  if (!podsGone) {
+  const outcome = await deleteJobPodsAndWait(namespace, jobName, onLog, kubeconfigPath);
+  if (outcome === "unobserved") {
     await onLog(
       "stderr",
-      `[paperclip] Warning: pod(s) for cancelled job ${jobName} still present after ` +
-        `${Math.round(POD_TEARDOWN_TIMEOUT_MS / 1000)}s; deleting the Job anyway so the run can settle\n`,
+      `[paperclip] Warning: ${podTeardownFailureClause(outcome, `cancelled job ${jobName}`)}; ` +
+        `the pod delete may never have been issued, so leaving the Job rather than letting ` +
+        `ownerReference GC reap the run Secrets under a pod that can still start\n`,
+    ).catch(() => undefined);
+    return;
+  }
+  if (outcome === "alive") {
+    await onLog(
+      "stderr",
+      `[paperclip] Warning: ${podTeardownFailureClause(outcome, `cancelled job ${jobName}`)}; ` +
+        `deleting the Job anyway so the run can settle\n`,
     ).catch(() => undefined);
   }
   await deleteJobOnly(namespace, jobName, onLog, kubeconfigPath);

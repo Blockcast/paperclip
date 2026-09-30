@@ -2449,14 +2449,120 @@ describe("teardownCancelledJob: external-cancel path (BLO-35486)", () => {
       // The pod never goes away — deleting the Job anyway is deliberate here
       // (unlike cleanupJob): waitForJobCompletion only settles on a Job 404,
       // and completionTimeoutMs may be 0, so failing closed would hang forever.
+      // BLO-38096: this is the `alive` branch specifically. The delete landed
+      // and the list API answers, so the pod is Terminating; that is what makes
+      // the fail-open sound. Keep it green — over-correcting the `unobserved`
+      // fix into a blanket fail-closed reintroduces the hang.
       mockCoreListPods.mockResolvedValue({ items: [{ metadata: { name: "pod-wedged" } }] });
       mockCoreDeleteCollectionPods.mockResolvedValue({});
+      const onLog = vi.fn().mockResolvedValue(undefined);
 
-      const promise = teardownCancelledJob("paperclip", "ac-job", vi.fn().mockResolvedValue(undefined));
+      const promise = teardownCancelledJob("paperclip", "ac-job", onLog);
       await vi.advanceTimersByTimeAsync(90_000);
       await promise;
 
+      expect(mockCoreDeleteCollectionPods).toHaveBeenCalled();
       expect(mockBatchDeleteJob).toHaveBeenCalled();
+      const warning = onLog.mock.calls.map(([, m]: [string, string]) => m).join("");
+      expect(warning).toContain("still present after 60s");
+      expect(warning).toContain("deleting the Job anyway");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // BLO-38096: deleteJobPodsAndWait used to return a bare boolean, so "pods are
+  // still there" and "I could not look" arrived as the same `false`. The
+  // fail-open above then applied to both — but in the could-not-observe branch
+  // the pod delete may never have been issued at all (a non-404
+  // deleteCollection failure is swallowed and falls through to the poll), so
+  // deleting the Job reaps the run Secrets via ownerReference GC under a pod
+  // that can still start. That is BLO-35486's defect on the cancel path.
+  it("retains the Job when it cannot observe the pods and the pod delete never landed", async () => {
+    vi.useFakeTimers();
+    try {
+      // One apiserver fault denying both verbs: RBAC on pods, or a 5xx.
+      const forbidden = () => Object.assign(new Error("pods is forbidden"), { code: 403 });
+      mockCoreDeleteCollectionPods.mockRejectedValue(forbidden());
+      mockCoreListPods.mockRejectedValue(forbidden());
+      const onLog = vi.fn().mockResolvedValue(undefined);
+
+      const promise = teardownCancelledJob("paperclip", "ac-job", onLog);
+      await vi.advanceTimersByTimeAsync(90_000);
+      await promise;
+
+      // Guard against a vacuous pass: the teardown must actually have tried.
+      expect(mockCoreDeleteCollectionPods).toHaveBeenCalled();
+      expect(mockBatchDeleteJob).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The `unobserved` verdict means *no* list ever succeeded — not "the last one
+  // failed". Deciding it per-poll instead would let a single blip at the
+  // deadline, after minutes of clean reads showing a Terminating pod, flip a
+  // sound fail-open into the hang the fail-open exists to prevent.
+  it("treats a late list failure after a good read as observed-alive, not could-not-observe", async () => {
+    vi.useFakeTimers();
+    try {
+      mockCoreDeleteCollectionPods.mockResolvedValue({});
+      let listCalls = 0;
+      mockCoreListPods.mockImplementation(async () => {
+        if (++listCalls > 3) throw Object.assign(new Error("pods is forbidden"), { code: 403 });
+        return { items: [{ metadata: { name: "pod-wedged" } }] };
+      });
+      const onLog = vi.fn().mockResolvedValue(undefined);
+
+      const promise = teardownCancelledJob("paperclip", "ac-job", onLog);
+      await vi.advanceTimersByTimeAsync(90_000);
+      await promise;
+
+      // Guard against a vacuous pass: the blip must actually have happened.
+      expect(listCalls).toBeGreaterThan(3);
+      expect(mockBatchDeleteJob).toHaveBeenCalled();
+      expect(onLog.mock.calls.map(([, m]: [string, string]) => m).join("")).toContain(
+        "still present after 60s",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // AC 2: the retention warning must not claim pods were seen when the poll
+  // never managed to look. Asserting the two texts *differ* is the guard —
+  // sourcing both from one collapsed boolean makes them identical again.
+  it("words the retention warning differently for observed-alive and could-not-observe", async () => {
+    vi.useFakeTimers();
+    const warningsFor = async (setup: () => void): Promise<string> => {
+      vi.resetAllMocks();
+      mockBatchDeleteJob.mockResolvedValue({});
+      setup();
+      const onLog = vi.fn().mockResolvedValue(undefined);
+      const promise = teardownCancelledJob("paperclip", "ac-job", onLog);
+      await vi.advanceTimersByTimeAsync(90_000);
+      await promise;
+      return onLog.mock.calls
+        .map(([, m]: [string, string]) => m)
+        .filter((m) => m.includes("cancelled job"))
+        .join("");
+    };
+    try {
+      const alive = await warningsFor(() => {
+        mockCoreDeleteCollectionPods.mockResolvedValue({});
+        mockCoreListPods.mockResolvedValue({ items: [{ metadata: { name: "pod-wedged" } }] });
+      });
+      const unobserved = await warningsFor(() => {
+        mockCoreDeleteCollectionPods.mockResolvedValue({});
+        mockCoreListPods.mockRejectedValue(
+          Object.assign(new Error("pods is forbidden"), { code: 403 }),
+        );
+      });
+
+      expect(alive).toContain("still present after 60s");
+      expect(unobserved).toContain("could not confirm pods");
+      expect(unobserved).not.toContain("still present");
+      expect(alive).not.toBe(unobserved);
     } finally {
       vi.useRealTimers();
     }
