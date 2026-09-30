@@ -8885,6 +8885,77 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(metrics.body).toMatch(/paperclip_environment_leases_orphaned_active 0\b/);
     });
 
+    // PEN-3640: `activeRunExecutions` is an in-memory Set on the worker. An
+    // external-lifecycle run whose adapter hung mid-dispatch stays in it for
+    // the life of the process, and the reclaim sweep used to skip such a
+    // reservation unconditionally -- so `released_at` stayed NULL, the partial
+    // unique index on (agent_id, slot_id) held the slot, and the agent's
+    // effective concurrency was ratcheted down until the worker restarted.
+    // Measured in production: 64.6 h and 36.3 h strands on two seats across a
+    // 144.8 h worker uptime with no backing Job for either.
+    //
+    // `reapOrphanedRuns` already carried the external-lifecycle exemption; this
+    // sweep did not. The pair below pins the CONDITION, not just the exemption:
+    // the second case is the reason the guard still exists at all, and a fix
+    // that simply deleted the skip would pass the first and fail the second.
+    it("releases a reservation for an external-lifecycle run still stuck in activeRunExecutions (PEN-3640)", async () => {
+      const { companyId, agentId, runId } = await seedRunFixture({
+        adapterType: "claude_k8s",
+        runStatus: "failed",
+        processPid: null,
+        processGroupId: null,
+        includeIssue: false,
+      });
+      const reservation = await seedLaunchedReservation({ companyId, agentId, runId });
+      // The Job is gone -- the only thing still claiming this run is alive is
+      // the stale in-memory Set entry.
+      mockReadAgentJobRunStatusByName.mockImplementation(async (name) =>
+        name === reservation.jobName
+          ? { phase: "missing" as const, reason: "NotFound" as const, name }
+          : null,
+      );
+      heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
+
+      await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+      const persisted = await db
+        .select()
+        .from(externalRuntimeReservations)
+        .where(eq(externalRuntimeReservations.id, reservation.id))
+        .then((rows) => rows[0]);
+      expect(persisted?.releasedAt).not.toBeNull();
+    });
+
+    it("still withholds release for a NON-external run in activeRunExecutions (PEN-3640 control)", async () => {
+      // For an in-process adapter the await is authoritative: `executeRun` is
+      // driving this run in this very pod, so the sweep must not race it even
+      // though the Job lookup reports missing. This is the half of the guard
+      // that must survive the fix above.
+      const { companyId, agentId, runId } = await seedRunFixture({
+        adapterType: "codex_local",
+        runStatus: "failed",
+        processPid: null,
+        processGroupId: null,
+        includeIssue: false,
+      });
+      const reservation = await seedLaunchedReservation({ companyId, agentId, runId });
+      mockReadAgentJobRunStatusByName.mockImplementation(async (name) =>
+        name === reservation.jobName
+          ? { phase: "missing" as const, reason: "NotFound" as const, name }
+          : null,
+      );
+      heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
+
+      await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+      const persisted = await db
+        .select()
+        .from(externalRuntimeReservations)
+        .where(eq(externalRuntimeReservations.id, reservation.id))
+        .then((rows) => rows[0]);
+      expect(persisted?.releasedAt).toBeNull();
+    });
+
     // BLO-21460 (Ally important 2): the three contracts this PR introduces that
     // no resource-release assertion can observe. Each is an argument-level or
     // control-flow property, so a refactor can drop any of them while every
