@@ -753,7 +753,7 @@ just the same. Read the worker log rather than the directory to tell them apart:
 | --- | --- | --- |
 | `Heap snapshot written` (warn) | honoured | retrieve it; it holds secrets in plaintext |
 | `Heap snapshot request declined` (info) | claimed, rate-limited | wait out `SENTINEL_MIN_INTERVAL_MINUTES`, touch again |
-| `Heap snapshot request seen but not claimed` (warn) | delete failed, **file still there** | if it repeats, the worker cannot delete the file — remove it by hand |
+| `Heap snapshot request seen but not claimed` (warn) | delete failed, **file still there** | if it repeats, the worker cannot delete the file — remove it by hand. Only the request path is affected; threshold capture keeps running |
 | `Heap snapshot skipped` (error) | honoured, then refused | read `skipped` (e.g. `insufficient-free-space`) |
 
 Environment overrides:
