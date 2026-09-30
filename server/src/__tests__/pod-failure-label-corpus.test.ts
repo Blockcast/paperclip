@@ -8,7 +8,9 @@ import { describe, expect, it } from "vitest";
  * labels as string literals, and nothing links the two.
  *
  * `POD_FAILURE_LABELS` in `vendor/paperclip-adapter-claude-k8s/src/server/execute.ts`
- * is the sole source of these strings; the adapter emits `` `${label}: ${msg}` ``.
+ * holds six of these strings, and the call site adds a seventh, the
+ * `"Pod failure (unclassified)"` fallback for an error that is not a `PodWaitError`.
+ * Both go through the same `` `${label}: ${msg}` `` template, so both are emittable.
  * Server fixtures that stand in for an adapter failure hand-write that whole wire
  * string, across a package boundary — vendor/ sits outside the pnpm workspace and
  * ships as a packed tarball, so a direct import is unavailable. This file reads
@@ -56,27 +58,45 @@ function readAdapterLabels(): Set<string> {
   const labels = [...block[1].matchAll(/^\s*\w+:\s*"([^"]+)"/gm)].map(
     (m) => m[1],
   );
-  // The declared union has six members; a regex that silently matched fewer would
-  // shrink the oracle and let a stale fixture pass.
-  expect(labels.length).toBe(6);
+  // The fallback label is read from source like the other six, so renaming it is
+  // caught too. Anchored on the `: "` of the ternary's else-arm.
+  const fallback = /: "(Pod failure \([^"]+\))"/.exec(src);
+  if (!fallback) {
+    throw new Error(
+      `Could not find the "Pod failure (...)" fallback label in ${executePath}. ` +
+        `If it was renamed or restructured, update this test -- do not delete it.`,
+    );
+  }
+  labels.push(fallback[1]);
+  // Six `PodFailureKind` members plus the non-`PodWaitError` fallback. A regex that
+  // silently matched fewer would shrink the oracle and let a stale fixture pass.
+  expect(labels.length).toBe(7);
   return new Set(labels);
 }
 
 /**
- * Fixture wire strings: `"<label>: Pod <name> reached phase=..."`. The
- * `reached phase=` tail is `describePodTerminatedError`'s own output, which is
- * what makes this specific enough not to match unrelated prose.
+ * Fixture wire strings, one pattern per adapter message shape. Each tail is the
+ * adapter's own label-independent text, which is what makes it specific enough
+ * not to match unrelated prose:
+ * - `"<label>: Pod <name> reached phase=..."`, `describePodTerminatedError`'s output;
+ * - `"<label>: Timed out waiting for pod containers to start (..."`, the
+ *   `startup` throw in `waitForPod`.
  */
-function findFixtureLabels(): { file: string; label: string }[] {
-  const found: { file: string; label: string }[] = [];
+const FIXTURE_PATTERNS = [
+  /"([A-Z][^":]{3,60}): Pod [^"]*reached phase=[^"]*"/g,
+  /"([A-Z][^":]{3,60}): Timed out waiting for pod containers to start \([^"]*"/g,
+];
+
+function findFixtureLabels(): { file: string; label: string; pattern: number }[] {
+  const found: { file: string; label: string; pattern: number }[] = [];
   for (const entry of readdirSync(testsDir)) {
     if (!entry.endsWith(".ts")) continue;
     const src = readFileSync(path.join(testsDir, entry), "utf8");
-    for (const m of src.matchAll(
-      /"([A-Z][^":]{3,60}): Pod [^"]*reached phase=[^"]*"/g,
-    )) {
-      found.push({ file: entry, label: m[1] });
-    }
+    FIXTURE_PATTERNS.forEach((re, pattern) => {
+      for (const m of src.matchAll(re)) {
+        found.push({ file: entry, label: m[1], pattern });
+      }
+    });
   }
   return found;
 }
@@ -88,8 +108,15 @@ describe("pod-failure label corpus (BLO-33503)", () => {
 
     // Negative control. An empty scan would pass vacuously and this guard would
     // be decoration — the same failure shape as a filter that matches nothing.
-    // If the fixtures are legitimately removed, delete this file with them.
-    expect(fixtures.length).toBeGreaterThan(0);
+    // Checked per pattern, so a shape whose pattern stops matching is loud too,
+    // not hidden behind another shape's hits. If a shape's fixtures are
+    // legitimately removed, drop its pattern with them.
+    FIXTURE_PATTERNS.forEach((re, pattern) => {
+      expect(
+        fixtures.filter((f) => f.pattern === pattern).length,
+        `no fixture matched ${re}`,
+      ).toBeGreaterThan(0);
+    });
 
     const stale = fixtures.filter((f) => !labels.has(f.label));
     expect(
