@@ -74,8 +74,17 @@ import { logger } from "../middleware/logger.js";
  * still happens exactly once.
  */
 
-/** Warn (do not bypass) when one critical section runs longer than this. */
-const LOCK_HELD_WARN_MS = 30_000;
+/**
+ * Warn (do not bypass) when one critical section runs longer than this.
+ *
+ * Exported (BLO-35878) so the section's own phases can be judged against the
+ * same budget they consume. The hold gauge says an agent's lock was held for N
+ * seconds; it cannot say by what, which is why a 1586 s hold was attributed to
+ * a plugin that never runs on this path. A phase that on its own exceeds the
+ * lock's warn budget is by definition the hold, so it logs under the same
+ * threshold rather than a second one invented next to it.
+ */
+export const LOCK_HELD_WARN_MS = 30_000;
 
 /**
  * Escalate the overrun log from `warn` to `error` past this (PEN-3305).

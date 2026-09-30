@@ -931,6 +931,157 @@ export function maskWorkspaceRuntimeTextForRead(value: string | null): string | 
 }
 
 /**
+ * PEN-3266. The write-side counterpart to `publicPipelineStageConfig`
+ * (`routes/workspace-response.ts`), without which that read projection would be a
+ * regression rather than a partial fix.
+ *
+ * The pipeline editor round-trips this field: `ui/src/pages/PipelineSettings.tsx`
+ * seeds its form state from the GET response and writes the whole automation
+ * block back on save. So an editor holding `pipelines:write` but NOT
+ * `workspace_runtime:read` holds the masked sentinel where the operator-authored
+ * command is, and saving any unrelated field — the stage name — would persist
+ * that sentinel over the real command and destroy it.
+ *
+ * That shape has reached production here before: the `restoreRedactedAdapterValue`
+ * guard in `routes/agents.ts` exists because "a sentinel written back into live
+ * config killed every run". This is the same guard for the stage-config carrier.
+ *
+ * The check is viewer-INDEPENDENT by design — it asks what the incoming bytes
+ * say, not who sent them — because an entitled caller has no cause to send the
+ * sentinel and no legitimate configured value contains it. That keeps it correct
+ * even if the read projection and the write path ever disagree about entitlement.
+ *
+ * Substring rather than equality, matching the precedent: a masked value can sit
+ * inside a longer string, and an equality test would miss it and persist a broken
+ * value. `onEnter` and `automation` are enumerated rather than walked whole
+ * because the rest of `config` is unrelated operator prose that must round-trip
+ * byte-for-byte.
+ */
+export function restoreWithheldPipelineStageConfig(incoming: unknown, existing: unknown): unknown {
+  if (!isPlainObject(incoming)) return incoming;
+  const existingRecord = isPlainObject(existing) ? existing : {};
+
+  // BOTH incoming keys restore from the SAME stored block, and that asymmetry is the whole
+  // point: `persistedStageConfig` (`services/pipelines.ts`) destructures `automation` out
+  // before every write, so no stored row can carry one. Keying the `automation` branch on
+  // `existing.automation` therefore always found `undefined` and stripped the command instead
+  // of restoring it — and `syncPipelineStageAutomation` (`services/pipelines.ts:2818`) then
+  // rebuilds `onEnter` from that stripped context (`:2886`, `:2924`:
+  // `onEnter: { type, routineId, ...input.executionContext }`), overwriting
+  // the copy the `onEnter` branch had just restored correctly. `onEnter` is the only persisted
+  // copy of this carrier; `automation` is derived from it on read.
+  const storedBlock = isPlainObject(existingRecord.onEnter) ? existingRecord.onEnter : {};
+  const storedSettings = storedBlock.executionWorkspaceSettings;
+
+  const restored: Record<string, unknown> = { ...incoming };
+  for (const key of ["onEnter", "automation"]) {
+    const block = restored[key];
+    if (!isPlainObject(block)) continue;
+    if (!("executionWorkspaceSettings" in block)) continue;
+    restored[key] = {
+      ...block,
+      executionWorkspaceSettings: restoreWithheldValue(block.executionWorkspaceSettings, storedSettings),
+    };
+  }
+  return restored;
+}
+
+function readArrayElementIdentity(value: unknown): { key: string; value: string } | null {
+  if (!isPlainObject(value)) return null;
+  // The mask's OWN set, not a copy: an identity key added there must start being honoured here in
+  // the same commit, or the restore silently loses the ability to align on it.
+  for (const key of WORKSPACE_RUNTIME_IDENTITY_KEYS) {
+    const candidate = value[key];
+    if (typeof candidate !== "string" || candidate.length === 0) continue;
+    // A MASKED identity is not an identity. `maskWorkspaceRuntimeForRead` honours these keys only
+    // on an entry sitting directly inside a top-level `commands`/`services`/`jobs` array
+    // (`identityScope`), and only when the value is already a string. Everywhere else — a nested
+    // `env` array inside a service, a top-level array the parser does not bless (`containers`,
+    // `volumes`, …), or a blessed entry whose `id` is a NUMBER — the identity key comes back as the
+    // sentinel. Accepting that sentinel as an identity made this function match zero stored
+    // elements, which `matchExistingArrayElement` reads as "ambiguous" and fails closed on, so the
+    // caller persisted the sentinel OVER the operator's real value on an UNMODIFIED round-trip —
+    // the exact destructive write this guard exists to prevent, one nesting level down.
+    // Treating it as absent instead falls through to the length-guarded index alignment below,
+    // which is correct whenever the editor did not add or remove elements.
+    if (candidate.includes(REDACTED_EVENT_VALUE)) continue;
+    return { key, value: candidate };
+  }
+  return null;
+}
+
+/**
+ * PEN-3266. Which stored element an incoming array element should restore from.
+ *
+ * Aligning by index alone is wrong for a read-modify-write that removes or reorders an
+ * element: the sentinel at index *i* would be restored from the stored element at index *i*,
+ * silently writing one service's real command onto another. `workspaceRuntime` holds exactly
+ * such arrays (`services`, and the `commands`/`jobs` siblings `maskWorkspaceRuntimeForRead`
+ * walks), and that mask deliberately lets identity keys through on those entries — so an
+ * unentitled round-tripper still holds a real `id`/`name` to key on.
+ *
+ * Ambiguity fails closed: an identity matching zero or several stored elements yields
+ * `undefined`, and the caller then leaves the incoming value untouched rather than guessing a
+ * neighbour. ⚠️ Be precise about what that costs — "fails closed" here is NOT a no-op. The
+ * incoming value under a sentinel IS the sentinel, so leaving it untouched persists
+ * `***REDACTED***` and the operator's stored value is lost. It is a *visible* loss rather than a
+ * silent one (a literal sentinel in the config is obviously wrong, whereas a neighbour's real
+ * command is not), and that is the only sense in which it is the safer branch.
+ *
+ * The one case that genuinely reaches it is a DUPLICATE identity in the stored array — two
+ * services both named `web`. That is left fail-closed deliberately: with the identity ambiguous
+ * there is no way to tell a reorder from a no-op, and silently writing one service's command onto
+ * another is the failure this alignment was introduced to stop. It is pinned by a test so the
+ * cost is a recorded choice rather than an accident.
+ *
+ * Index alignment survives as the fallback for elements with no USABLE identity — including one
+ * whose identity the mask replaced with a sentinel — in an array that demonstrably did not change
+ * length.
+ */
+function matchExistingArrayElement(
+  incoming: unknown,
+  index: number,
+  incomingLength: number,
+  existingArray: readonly unknown[],
+): unknown {
+  const identity = readArrayElementIdentity(incoming);
+  if (identity) {
+    const matches = existingArray.filter((candidate) => {
+      const candidateIdentity = readArrayElementIdentity(candidate);
+      return candidateIdentity?.key === identity.key && candidateIdentity?.value === identity.value;
+    });
+    return matches.length === 1 ? matches[0] : undefined;
+  }
+  return existingArray.length === incomingLength ? existingArray[index] : undefined;
+}
+
+function restoreWithheldValue(incoming: unknown, existing: unknown): unknown {
+  if (typeof incoming === "string") {
+    if (!incoming.includes(REDACTED_EVENT_VALUE)) return incoming;
+    // Nothing stored to put back. Leave the sentinel rather than returning `undefined`, which
+    // would strip the key entirely — that is the destructive write this guard exists to stop,
+    // and a literal sentinel in the config is at least visibly wrong instead of silently gone.
+    // `null` is a real stored value ("no command configured") and is restored normally.
+    return existing === undefined ? incoming : existing;
+  }
+  if (Array.isArray(incoming)) {
+    const existingArray = Array.isArray(existing) ? existing : [];
+    return incoming.map((value, index) => restoreWithheldValue(
+      value,
+      matchExistingArrayElement(value, index, incoming.length, existingArray),
+    ));
+  }
+  if (!isPlainObject(incoming)) return incoming;
+
+  const existingRecord = isPlainObject(existing) ? existing : {};
+  const restored: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(incoming)) {
+    restored[key] = restoreWithheldValue(value, existingRecord[key]);
+  }
+  return restored;
+}
+
+/**
  * Approval payloads are a human-facing escalation channel (BLO-20810), so a
  * field the scanner actually blanked must read differently from one the
  * filer simply left empty — a bare `***REDACTED***` is ambiguous on its own.

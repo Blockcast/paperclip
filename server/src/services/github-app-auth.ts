@@ -449,6 +449,257 @@ export async function githubResolveMergeHistoryShape(input: {
 }
 
 /**
+ * Is a named status context actually **required to merge** on the branch this
+ * PR targets? (PEN-3487)
+ *
+ * The same context name carries opposite consequences across our repos —
+ * measured 2026-09-24, `review/ally-complete` is one of ten required contexts on
+ * `Blockcast/penstock-llm-proxy-core`, is not required at all on
+ * `Blockcast/paperclip` (whose `master` requires exactly `verify`), and
+ * `Blockcast/onprem-k8s` requires none. A reader who sees that context red has
+ * no way to tell which of those they are looking at, and the cost is not
+ * hypothetical: PEN-3487 was filed as a merge-pipeline blocker, escalated, and
+ * absorbed hours of investigation across three agents before anyone read
+ * `branches/master` and found the gate blocks nothing there.
+ *
+ * Three outcomes, kept distinct on purpose. `unknown` must never collapse into
+ * `not_required`: "we could not read branch protection" and "we read it and the
+ * context is absent" are opposite facts, and flattening them would put a
+ * confident all-clear on an unread gate.
+ *
+ * **Two surfaces, and reading only one is how this function tells the exact lie
+ * it exists to remove.** Classic branch protection and repository/organization
+ * rulesets can each require a status check independently, and
+ * `GET /branches/{branch}` reports only the first. `Blockcast/hang-mmt-fec` is
+ * the worked case, measured 2026-09-26: `main` returns
+ * `protected: true` with `required_status_checks: {checks: [], contexts: [],
+ * enforcement_level: "off"}` — an empty classic set — while org ruleset
+ * `19274071` requires `review/ally-complete`, `Check` and `Runner policy` there.
+ * Reading classic alone would answer `not_required` about a gate that genuinely
+ * blocks the merge, and the empty-union case is a `200`, so no `unknown` guard
+ * catches it. `GET /repos/{repo}/rules/branches/{ref}` returns the rules *in
+ * effect* — including org-level rulesets — and is readable by this token.
+ *
+ * Absence is therefore only asserted from BOTH surfaces. If the ruleset read
+ * fails, a context missing from classic protection is `unknown`, never
+ * `not_required`. Presence needs only one: a ruleset cannot un-require what
+ * classic protection requires, so a hit in classic short-circuits and skips the
+ * second call.
+ *
+ * Readability note: this uses `GET /repos/{repo}/branches/{branch}`, whose
+ * `.protection` summary an ordinary installation token CAN read. The narrower
+ * `branches/{branch}/protection` endpoint 403s for a non-admin App, which is the
+ * read that has repeatedly been mistaken for "the required set is unknowable
+ * from an agent seat". `rules/branches/{ref}` is readable from that same seat.
+ */
+export type PrRequiredStatusContextLookup =
+  | {
+    outcome: "required";
+    baseRef: string;
+    requiredContexts: string[];
+    /** Which surface required it — a ruleset is the one readers cannot see. */
+    source: "branch_protection" | "ruleset";
+  }
+  | { outcome: "not_required"; baseRef: string; branchProtected: boolean; requiredContexts: string[] }
+  // `baseRef` is present whenever the base ref resolved and only a later read
+  // failed, so the notice can name the branch it could not read.
+  | { outcome: "unknown"; reason: string; baseRef?: string };
+
+function encodeGitRefPath(ref: string): string {
+  // Branch names legitimately contain `/`, which must stay a path separator;
+  // everything else gets encoded so a ref cannot escape the path.
+  return ref.split("/").map((segment) => encodeURIComponent(segment)).join("/");
+}
+
+type RequiredContextsRead =
+  | { ok: true; contexts: string[]; branchProtected: boolean }
+  | { ok: false; reason: string };
+
+/** Classic branch protection, via the `.protection` summary on `branches/{b}`. */
+async function readClassicRequiredContexts(
+  apiBase: string,
+  repoFullName: string,
+  baseRef: string,
+  headers: Record<string, string>,
+  signal?: AbortSignal,
+): Promise<RequiredContextsRead> {
+  try {
+    const res = await ghFetch(
+      `${apiBase}/repos/${repoFullName}/branches/${encodeGitRefPath(baseRef)}`,
+      { headers, signal },
+    );
+    if (!res.ok) {
+      const classified = await classifyGithubHttpFailure("required_context_branch", res);
+      return { ok: false, reason: classified.reason };
+    }
+    const body = (await res.json().catch(() => null)) as {
+      protected?: boolean;
+      protection?: {
+        enabled?: boolean;
+        required_status_checks?: {
+          contexts?: unknown;
+          checks?: unknown;
+        };
+      };
+    } | null;
+    if (!body) return { ok: false, reason: "required_context_branch_body_missing" };
+
+    const required = body.protection?.required_status_checks;
+    // `contexts` is the legacy shape and `checks[].context` the current one;
+    // GitHub still returns both, but a repo configured only through the newer
+    // API can come back with an empty `contexts`. Union them rather than
+    // trusting either alone — reading only `contexts` would report a genuinely
+    // required check as unrequired, which is the one error direction that
+    // matters here.
+    //
+    // `enforcement_level` is deliberately NOT consulted. Every repo measured
+    // with checks disabled returned `"off"` alongside an empty `contexts`, so
+    // the disagreeing case is unobserved; if it ever occurs, reporting a listed
+    // context as `required` merely tells a reader to look, whereas honouring
+    // `"off"` would print an all-clear over a gate we cannot prove is inert.
+    const fromContexts = Array.isArray(required?.contexts)
+      ? required.contexts.filter((value): value is string => typeof value === "string")
+      : [];
+    const fromChecks = Array.isArray(required?.checks)
+      ? required.checks
+        .map((check) =>
+          check && typeof check === "object" && typeof (check as { context?: unknown }).context === "string"
+            ? (check as { context: string }).context
+            : null
+        )
+        .filter((value): value is string => value !== null)
+      : [];
+    return {
+      ok: true,
+      contexts: [...new Set([...fromContexts, ...fromChecks])],
+      branchProtected: body.protected === true || body.protection?.enabled === true,
+    };
+  } catch {
+    return { ok: false, reason: "required_context_branch_fetch_failed" };
+  }
+}
+
+/**
+ * Repository- and organization-level rulesets in effect for this ref, via
+ * `rules/branches/{ref}`. Invisible to `branches/{b}` — see the type doc.
+ */
+async function readRulesetRequiredContexts(
+  apiBase: string,
+  repoFullName: string,
+  baseRef: string,
+  headers: Record<string, string>,
+  signal?: AbortSignal,
+): Promise<{ ok: true; contexts: string[] } | { ok: false; reason: string }> {
+  try {
+    const res = await ghFetch(
+      `${apiBase}/repos/${repoFullName}/rules/branches/${encodeGitRefPath(baseRef)}`,
+      { headers, signal },
+    );
+    if (!res.ok) {
+      const classified = await classifyGithubHttpFailure("required_context_rules", res);
+      return { ok: false, reason: classified.reason };
+    }
+    const body = await res.json().catch(() => null);
+    // An empty array is the normal answer for a repo with no rulesets, so the
+    // shape check must not treat `[]` as unreadable. A non-array body is.
+    if (!Array.isArray(body)) return { ok: false, reason: "required_context_rules_body_missing" };
+
+    const contexts: string[] = [];
+    for (const rule of body) {
+      if (!rule || typeof rule !== "object") continue;
+      if ((rule as { type?: unknown }).type !== "required_status_checks") continue;
+      const checks = (rule as { parameters?: { required_status_checks?: unknown } })
+        .parameters?.required_status_checks;
+      if (!Array.isArray(checks)) continue;
+      for (const check of checks) {
+        if (check && typeof check === "object" && typeof (check as { context?: unknown }).context === "string") {
+          contexts.push((check as { context: string }).context);
+        }
+      }
+    }
+    return { ok: true, contexts: [...new Set(contexts)] };
+  } catch {
+    return { ok: false, reason: "required_context_rules_fetch_failed" };
+  }
+}
+
+export async function githubGetPrRequiredStatusContext(input: {
+  repoFullName: string;
+  prNumber: number;
+  context: string;
+  signal?: AbortSignal;
+}): Promise<PrRequiredStatusContextLookup> {
+  const context = input.context.trim();
+  if (!context) return { outcome: "unknown", reason: "status_context_empty" };
+
+  const tokenResult = await getInstallationTokenResult();
+  if (!tokenResult.ok) return { outcome: "unknown", reason: tokenResult.reason };
+  const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` };
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+
+  let baseRef: string;
+  try {
+    const res = await ghFetch(`${apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}`, {
+      headers,
+      signal: input.signal,
+    });
+    if (!res.ok) {
+      const classified = await classifyGithubHttpFailure("required_context_pull_request", res);
+      return { outcome: "unknown", reason: classified.reason };
+    }
+    const body = (await res.json().catch(() => null)) as { base?: { ref?: string } } | null;
+    const ref = typeof body?.base?.ref === "string" ? body.base.ref.trim() : "";
+    if (!ref) return { outcome: "unknown", reason: "required_context_base_ref_missing" };
+    baseRef = ref;
+  } catch {
+    return { outcome: "unknown", reason: "required_context_pull_request_fetch_failed" };
+  }
+
+  const classic = await readClassicRequiredContexts(
+    apiBase,
+    input.repoFullName,
+    baseRef,
+    headers,
+    input.signal,
+  );
+  if (!classic.ok) return { outcome: "unknown", reason: classic.reason, baseRef };
+
+  // Presence needs one surface; absence needs both. A hit here is final, so the
+  // ruleset call is skipped.
+  if (classic.contexts.includes(context)) {
+    return {
+      outcome: "required",
+      baseRef,
+      requiredContexts: [...classic.contexts].sort(),
+      source: "branch_protection",
+    };
+  }
+
+  const ruleset = await readRulesetRequiredContexts(
+    apiBase,
+    input.repoFullName,
+    baseRef,
+    headers,
+    input.signal,
+  );
+  // Classic said no and the second surface is unreadable, so "absent" is
+  // unproven. Asserting `not_required` from here is the Blockcast/hang-mmt-fec
+  // failure: a confident "does not block merge" over a gate that does.
+  if (!ruleset.ok) return { outcome: "unknown", reason: ruleset.reason, baseRef };
+
+  const requiredContexts = [...new Set([...classic.contexts, ...ruleset.contexts])].sort();
+  if (ruleset.contexts.includes(context)) {
+    return { outcome: "required", baseRef, requiredContexts, source: "ruleset" };
+  }
+  return {
+    outcome: "not_required",
+    baseRef,
+    branchProtected: classic.branchProtected || ruleset.contexts.length > 0,
+    requiredContexts,
+  };
+}
+
+/**
  * Terminal-state lookup for a single Actions run, used to decide whether a board
  * approval card that points at that run is still worth a human's attention.
  *

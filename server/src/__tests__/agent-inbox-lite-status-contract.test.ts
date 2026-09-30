@@ -30,10 +30,9 @@ const inactiveWorktreeActivation: LoadInboxInput["worktreeActivation"] = {
 };
 
 function loadInbox(
-  options: Pick<LoadInboxInput, "isWorktreeRuntime" | "worktreeActivation"> = {
-    isWorktreeRuntime: false,
-    worktreeActivation: inactiveWorktreeActivation,
-  },
+  options: Partial<
+    Pick<LoadInboxInput, "isWorktreeRuntime" | "worktreeActivation" | "callerRunId" | "nowMs">
+  > = {},
 ) {
   return loadAgentInboxLite({
     issuesSvc: mockIssueService as unknown as LoadInboxInput["issuesSvc"],
@@ -42,6 +41,8 @@ function loadInbox(
     agentId: "agent-1",
     callerRunId: "run-1",
     limit: 100,
+    isWorktreeRuntime: false,
+    worktreeActivation: inactiveWorktreeActivation,
     ...options,
   });
 }
@@ -89,6 +90,7 @@ describe("agent inbox-lite status contract", () => {
         createdAt: "2026-07-30T01:41:56.125Z",
         updatedAt: "2026-07-30T01:41:56.125Z",
         activeRun: { id: "run-other", status: "running" },
+        scheduledRetryParkedRuns: [],
       },
       {
         id: "issue-2",
@@ -102,6 +104,7 @@ describe("agent inbox-lite status contract", () => {
         createdAt: "2026-07-30T01:42:56.125Z",
         updatedAt: "2026-07-30T01:42:56.125Z",
         activeRun: null,
+        scheduledRetryParkedRuns: [],
       },
     ]);
     mockIssueService.listDependencyReadiness.mockResolvedValue(
@@ -137,6 +140,7 @@ describe("agent inbox-lite status contract", () => {
         createdAt: "2026-07-30T01:41:56.125Z",
         updatedAt: "2026-07-30T01:41:56.125Z",
         activeRun: null,
+        scheduledRetryParkedRuns: [],
       },
       {
         id: "after-cutoff",
@@ -150,6 +154,7 @@ describe("agent inbox-lite status contract", () => {
         createdAt: "2026-07-30T01:43:56.125Z",
         updatedAt: "2026-07-30T01:43:56.125Z",
         activeRun: null,
+        scheduledRetryParkedRuns: [],
       },
     ]);
 
@@ -201,6 +206,7 @@ describe("agent inbox-lite wake-path projection", () => {
       scheduledRetryAt: null,
       scheduledRetryReason: null,
       scheduledRetryAttempt: null,
+      scheduledRetryParkedRuns: [],
       ...overrides,
     };
   }
@@ -272,5 +278,216 @@ describe("agent inbox-lite wake-path projection", () => {
 
     expect(parked.scheduledRetryReason).toBe("ccrotate_capacity");
     expect(parked.scheduledRetryAttempt).toBe(2);
+  });
+});
+
+// BLO-29965: two concurrent runs of ONE agent both reached "open a PR" on the
+// same issue, twice, measured. The self-selection guard only withheld rows whose
+// `activeRun.status === "running"`, but the sibling that already owned the work
+// was parked in `scheduled_retry` — a status that HOLDS the issue execution lock
+// (checkout() 409s naming it) and that is absent from `activeRun` entirely,
+// because that projection is hydrated from `issues.executionRunId` and an
+// autonomous retry chain never sets it. So the row read as unattended and was
+// handed to a second run.
+//
+// Reproduces the 2026-09-03 timeline on BLO-31354 / paperclip#1612 exactly:
+// run A parked 01:52Z with scheduledRetryAt 02:22:54Z; run B woke 02:18Z, was
+// offered the row, did the same fix, and had its push rejected
+// non-fast-forward when A's retry pushed at 02:33Z.
+describe("agent inbox-lite concurrent-claim guard (BLO-29965)", () => {
+  const RETRY_AT = "2026-09-03T02:22:54.000Z";
+  const RUN_B_WOKE = Date.parse("2026-09-03T02:18:00.000Z");
+
+  function parkedRetryRow(overrides: Record<string, unknown> = {}) {
+    const row = {
+      id: "issue-1",
+      identifier: "BLO-31354",
+      title: "Flaky merge-queue gate",
+      status: "in_progress",
+      priority: "high",
+      projectId: null,
+      goalId: null,
+      parentId: null,
+      createdAt: "2026-09-02T22:32:10.675Z",
+      updatedAt: "2026-09-03T01:52:00.000Z",
+      // The reading that looked like "nobody is on this".
+      activeRun: null,
+      scheduledRetryAt: RETRY_AT,
+      scheduledRetryReason: "ccrotate_capacity",
+      scheduledRetryAttempt: 1,
+      scheduledRetryRunId: "run-a",
+      // run-a belongs to the SAME agent as the caller: the sibling case.
+      scheduledRetryAgentId: "agent-1",
+      ...overrides,
+    };
+    // By default the parked set is just the displayed row, as the projection
+    // builds it for an issue with one parked run.
+    return {
+      scheduledRetryParkedRuns: row.scheduledRetryRunId
+        ? [
+            {
+              runId: row.scheduledRetryRunId,
+              agentId: row.scheduledRetryAgentId,
+              scheduledRetryAt: row.scheduledRetryAt,
+              scheduledRetryReason: row.scheduledRetryReason,
+            },
+          ]
+        : [],
+      ...row,
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockIssueService.listDependencyReadiness.mockResolvedValue(new Map());
+    mockRecoveryActionService.listActiveForIssues.mockResolvedValue(new Map());
+  });
+
+  it("withholds a row a sibling run is parked on via scheduled retry", async () => {
+    mockIssueService.list.mockResolvedValue([parkedRetryRow()]);
+    const onWithheldForeignScheduledRetry = vi.fn();
+
+    const items = await loadAgentInboxLite({
+      issuesSvc: mockIssueService as unknown as LoadInboxInput["issuesSvc"],
+      recoveryActionsSvc:
+        mockRecoveryActionService as unknown as LoadInboxInput["recoveryActionsSvc"],
+      companyId: "company-1",
+      agentId: "agent-1",
+      callerRunId: "run-b",
+      limit: 100,
+      isWorktreeRuntime: false,
+      worktreeActivation: inactiveWorktreeActivation,
+      nowMs: RUN_B_WOKE,
+      onWithheldForeignScheduledRetry,
+    });
+
+    // Exactly one run reaches the side-effect path; this one gets nothing.
+    expect(items).toEqual([]);
+    // And the withholding is distinguishable from the running-run case, so a
+    // lost claim is auditable rather than looking like an empty inbox.
+    expect(onWithheldForeignScheduledRetry).toHaveBeenCalledTimes(1);
+    expect(onWithheldForeignScheduledRetry.mock.calls[0]![0]).toMatchObject({
+      id: "issue-1",
+      scheduledRetryRunId: "run-a",
+    });
+    expect(onWithheldForeignScheduledRetry.mock.calls[0]![1]).toMatchObject({ runId: "run-a" });
+  });
+
+  it("still offers the row to the run that OWNS the parked retry", async () => {
+    // The mirror failure: deferring to your own retry hides your work from your
+    // own inbox, which reads as "no work" and exits — a silent strand.
+    mockIssueService.list.mockResolvedValue([parkedRetryRow()]);
+
+    const items = await loadInbox({ callerRunId: "run-a", nowMs: RUN_B_WOKE });
+
+    expect(items.map((issue) => issue.id)).toEqual(["issue-1"]);
+  });
+
+  it("offers the row again once the retry has lapsed well past its horizon", async () => {
+    // A retry that never fires must not make the row permanently unpickable.
+    mockIssueService.list.mockResolvedValue([parkedRetryRow()]);
+
+    const items = await loadInbox({
+      callerRunId: "run-b",
+      nowMs: Date.parse(RETRY_AT) + 3 * 60 * 60 * 1000,
+    });
+
+    expect(items.map((issue) => issue.id)).toEqual(["issue-1"]);
+  });
+
+  it("offers rows with no armed retry — the ordinary case is untouched", async () => {
+    mockIssueService.list.mockResolvedValue([
+      parkedRetryRow({
+        scheduledRetryAt: null,
+        scheduledRetryReason: null,
+        scheduledRetryAttempt: null,
+        scheduledRetryRunId: null,
+        scheduledRetryAgentId: null,
+      }),
+    ]);
+
+    const items = await loadInbox({ callerRunId: "run-b", nowMs: RUN_B_WOKE });
+
+    expect(items.map((issue) => issue.id)).toEqual(["issue-1"]);
+  });
+
+  // BLO-29965 review round 3. Reassigning an issue leaves the previous
+  // assignee's `scheduled_retry` row alive — `issues.update` nulls only the
+  // issue-side lock columns and never writes `heartbeat_runs`. The new assignee
+  // then saw a retry run id that was simply not its own and hid its own row.
+  //
+  // Self-sustaining, which is what made it worth fixing rather than tolerating:
+  // the sweep that clears the stale retry runs from `enqueueWakeup`, and an
+  // agent whose inbox reads empty exits without enqueuing anything.
+  it("offers a reassigned row whose stale retry belongs to the PREVIOUS assignee", async () => {
+    mockIssueService.list.mockResolvedValue([
+      parkedRetryRow({ scheduledRetryAgentId: "agent-previous" }),
+    ]);
+    const onWithheldForeignScheduledRetry = vi.fn();
+
+    const items = await loadAgentInboxLite({
+      issuesSvc: mockIssueService as unknown as LoadInboxInput["issuesSvc"],
+      recoveryActionsSvc:
+        mockRecoveryActionService as unknown as LoadInboxInput["recoveryActionsSvc"],
+      companyId: "company-1",
+      agentId: "agent-1",
+      callerRunId: "run-b",
+      limit: 100,
+      isWorktreeRuntime: false,
+      worktreeActivation: inactiveWorktreeActivation,
+      nowMs: RUN_B_WOKE,
+      onWithheldForeignScheduledRetry,
+    });
+
+    expect(items.map((issue) => issue.id)).toEqual(["issue-1"]);
+    expect(onWithheldForeignScheduledRetry).not.toHaveBeenCalled();
+  });
+
+  // BLO-29965 review round 4. The row displays ONE retry, the earliest-due, and
+  // the previous assignee's stale retry is older, so it is the one displayed.
+  // Reading only that row failed open on "another agent's retry" and offered the
+  // issue to a second run while this agent's own sibling was parked on it.
+  it("withholds the row when the earliest-due retry is stale but a sibling is parked behind it", async () => {
+    const staleRetry = {
+      runId: "run-previous",
+      agentId: "agent-previous",
+      scheduledRetryAt: "2026-09-03T01:00:00.000Z",
+      scheduledRetryReason: "transient_failure",
+    };
+    const siblingRetry = {
+      runId: "run-a",
+      agentId: "agent-1",
+      scheduledRetryAt: RETRY_AT,
+      scheduledRetryReason: "ccrotate_capacity",
+    };
+    mockIssueService.list.mockResolvedValue([
+      parkedRetryRow({
+        scheduledRetryAt: staleRetry.scheduledRetryAt,
+        scheduledRetryReason: staleRetry.scheduledRetryReason,
+        scheduledRetryRunId: staleRetry.runId,
+        scheduledRetryAgentId: staleRetry.agentId,
+        scheduledRetryParkedRuns: [staleRetry, siblingRetry],
+      }),
+    ]);
+    const onWithheldForeignScheduledRetry = vi.fn();
+
+    const items = await loadAgentInboxLite({
+      issuesSvc: mockIssueService as unknown as LoadInboxInput["issuesSvc"],
+      recoveryActionsSvc:
+        mockRecoveryActionService as unknown as LoadInboxInput["recoveryActionsSvc"],
+      companyId: "company-1",
+      agentId: "agent-1",
+      callerRunId: "run-b",
+      limit: 100,
+      isWorktreeRuntime: false,
+      worktreeActivation: inactiveWorktreeActivation,
+      nowMs: RUN_B_WOKE,
+      onWithheldForeignScheduledRetry,
+    });
+
+    expect(items).toEqual([]);
+    expect(onWithheldForeignScheduledRetry).toHaveBeenCalledTimes(1);
+    // The audit names the run that actually holds it, not the displayed row.
+    expect(onWithheldForeignScheduledRetry.mock.calls[0]![1]).toEqual(siblingRetry);
   });
 });
