@@ -63,9 +63,10 @@ const jobManifestPath = path.join(
 
 /**
  * Hosts that terminate inside `paperclip-mcp-gateway`, where `scrubResponseBody`
- * runs. Empty today and that is the finding, not an oversight: keeping the list
- * explicit means the day an upstream is moved behind the gateway, flipping it to
- * `gateway-scrubbed` is a one-line change that this file forces to be deliberate.
+ * runs. This list was empty when the audit was written, and each entry since is a
+ * completed migration rather than a default: keeping it explicit means the day an
+ * upstream is moved behind a gateway, flipping it to `gateway-scrubbed` is a
+ * one-line change that this file forces to be deliberate.
  *
  * ⚠️ This list is the audit's *oracle*, and it is hand-maintained — which host
  * names actually terminate in the gateway is deployment topology that lives in
@@ -88,6 +89,7 @@ const jobManifestPath = path.join(
  */
 const SCRUBBING_GATEWAY_HOSTS: readonly string[] = [
   "paperclip-mcp-gateway-k8s-ro.paperclip.svc.cluster.local",
+  "paperclip-mcp-gateway-prometheus.paperclip.svc.cluster.local",
 ];
 
 type Coverage =
@@ -141,9 +143,19 @@ const SEED_COVERAGE: Readonly<Record<string, Coverage>> = {
     why: "github-mcp-server runs as a local stdio child process",
   },
   prometheus: {
-    kind: "unscrubbed",
-    ticket: "PEN-2735",
-    why: "direct to prometheus-mcp-server; ASSESSED disclosure (PEN-2630) — get_targets returns Prometheus's activeTargets/droppedTargets verbatim, and those carry discoveredLabels, which is pre-relabel and so includes __meta_kubernetes_*_annotation_* for every annotation on every scraped object across 12 namespaces incl. penstock and paperclip; kubectl.kubernetes.io/last-applied-configuration embeds inline env values, i.e. PEN-2370's material by a route no scrubber sits on",
+    // PEN-2830 moved this behind `paperclip-mcp-gateway-prometheus`, a
+    // single-upstream gateway, so responses now traverse `scrubResponseBody`.
+    //
+    // Note *which* control closes PEN-2735's door, because it is not the
+    // scrubber: the gateway's upstream map carries a five-tool allowlist
+    // (execute_query, execute_range_query, list_metrics, get_metric_metadata,
+    // health_check) and `get_targets` is absent from it, so the tool that
+    // returns `discoveredLabels` is never exposed to enumerate or call. The
+    // scrubber is defence in depth over the five that remain. Re-adding
+    // `get_targets` to that map would reopen the door with this entry still
+    // reading `gateway-scrubbed` and this file none the wiser — the allowlist
+    // lives in `Blockcast/onprem-k8s`, which no test here can read.
+    kind: "gateway-scrubbed",
   },
   tempo: {
     kind: "unscrubbed",
@@ -664,6 +676,28 @@ describe("agent-facing MCP seed is audited for scrub coverage (PEN-2370 b1/b2)",
     const k8sRo = SEED_COVERAGE["k8s-ro"];
     expect(k8sRo.kind).toBe("gateway-scrubbed");
     expect(hostOf(seeded["k8s-ro"]!)).toBe("paperclip-mcp-gateway-k8s-ro.paperclip.svc.cluster.local");
+  });
+
+  it("records that the prometheus seed now traverses the scrubbing gateway", () => {
+    // Pins the instance PEN-2735 was filed for, the same way the k8s-ro case
+    // above pins PEN-2370's.
+    //
+    // The URL is pinned whole, not just its host, because `hostOf` reads only
+    // the hostname — so the assertion above would keep passing if the path were
+    // dropped. That is not a security hole: `isToolAllowed` is asked at all four
+    // enforcement points, the gateway's aggregate `/mcp` route included. It is an
+    // availability one. Measured 2026-09-30, the aggregate route answered
+    // `tools/list` with zero tools where `/prometheus/mcp` returned the expected
+    // five, so a seed that kept the host and lost the prefix would silently hand
+    // every agent an empty prometheus toolset.
+    const prometheus = SEED_COVERAGE["prometheus"];
+    expect(prometheus.kind).toBe("gateway-scrubbed");
+
+    const entry = seeded["prometheus"]!;
+    expect(hostOf(entry)).toBe("paperclip-mcp-gateway-prometheus.paperclip.svc.cluster.local");
+    expect(typeof entry === "string" ? undefined : entry.url).toBe(
+      "http://paperclip-mcp-gateway-prometheus.paperclip.svc.cluster.local:8080/prometheus/mcp",
+    );
   });
 
   it("the per-agent override axis this audit does NOT cover is still shaped as documented", () => {
