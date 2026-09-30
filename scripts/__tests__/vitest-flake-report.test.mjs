@@ -90,6 +90,16 @@ test("the General tests job exports the report dir and uploads the reports on fa
     `general_tests must export ${ENV_VAR}=${REPORT_DIR}`,
   );
 
+  // The only other half of the wiring, and the one with no failure signal at
+  // all: the run step creates the directory. It covers all six legs today only
+  // because "Run grouped general test suites" carries no `if:` -- a future leg
+  // that skips that step loses the directory with nothing going red.
+  assert.match(
+    job,
+    new RegExp(`mkdir -p "\\$${ENV_VAR}"`),
+    `the test step must create ${ENV_VAR} before vitest writes into it`,
+  );
+
   const upload =
     /\n {6}- name: Upload vitest JSON reports[^\n]*\n((?: {8}[^\n]*\n| *\n)*)/.exec(job);
   assert.ok(upload, "general_tests must upload the vitest JSON reports");
@@ -120,15 +130,27 @@ test("the General tests job exports the report dir and uploads the reports on fa
     /name:\s*vitest-report-\$\{\{ matrix\.group \}\}-\$\{\{ matrix\.shard_count == '' && 'all' \|\| matrix\.shard_index \}\}/,
     "artifact name must be unique per matrix leg and must not collapse shard 0 into 'all'",
   );
-  // Uniqueness across legs is not enough: a re-run of a failed job is a new
-  // ATTEMPT of the same run, so the same leg re-uploads a name that already
-  // exists and upload-artifact@v4 409s. On a ~29%-red lane "Re-run failed
-  // jobs" is the common path, so without this the step turns a retried job
-  // red -- exactly the blameless failure this issue exists to stop.
+  // Unique across legs is not unique across ATTEMPTS. A re-run of a failed job
+  // is a new attempt of the same run, so the same leg re-submits the same name
+  // and collides. `continue-on-error` below stops that reddening the job but
+  // DROPS the report -- and fail->pass across attempts is the flake signature
+  // this ledger exists to read, so the discriminator is what gets lost. Silent
+  // by construction: the artifact just does not appear.
+  assert.match(
+    step,
+    /name:[^\n]*\$\{\{ github\.run_attempt \}\}/,
+    "artifact name must include github.run_attempt, or every re-run's reports are " +
+      "silently dropped -- and the re-run is the most informative event for a flake ledger",
+  );
+  // With run_attempt in the name the collision is gone, so this is now the
+  // backstop for what a name cannot cover: a transient failure in the artifact
+  // service itself. This step must never be able to fail a job -- losing a
+  // ledger row costs one row; failing the job re-creates the blameless
+  // ejection this issue exists to stop.
   assert.match(
     step,
     /continue-on-error:\s*true/,
-    "the upload must be `continue-on-error: true`: a re-run 409s on the existing " +
-      "artifact name, and this step must never be able to fail a job",
+    "the upload must be `continue-on-error: true`: a transient artifact-service " +
+      "failure must never turn an otherwise-green run red",
   );
 });
