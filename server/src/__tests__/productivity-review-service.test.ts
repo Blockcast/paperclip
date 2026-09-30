@@ -1782,6 +1782,11 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 10");
     expect(reviews[0]?.description).toContain("Route to platform/SRE");
     expect(reviews[0]?.description).not.toContain("Request decomposition");
+    // BLO-37265: the rolling-window counts exclude pre-dispatch cancellations
+    // (BLO-36927), and this evidence line renders on EVERY trigger — not just
+    // `high_churn`. Pin the label here too so a rename cannot reintroduce the
+    // label/number mismatch on a non-churn review.
+    expect(reviews[0]?.description).toContain("Dispatched runs in rolling windows:");
   });
 
   it("excludes never-executed runs from the no-comment streak without breaking it — real silent completions still trip it (BLO-21769)", async () => {
@@ -3071,6 +3076,10 @@ describeEmbeddedPostgres("productivity review service", () => {
     const refreshComments = await listRefreshComments(review!.id);
     expect(refreshComments.length).toBeGreaterThan(0);
     expect(refreshComments.at(-1)?.body).toContain(DEPENDENCY_LINE_ONE_BLOCKER);
+    // BLO-37265: the refresh comment renders its own copy of the rolling-window
+    // counts, from the same pre-dispatch-filtered numbers. Pinned separately
+    // from the review-markdown label so the two cannot drift apart silently.
+    expect(refreshComments.at(-1)?.body).toContain("Dispatched runs/assignee comments:");
   });
 
   // BLO-22436: once the blocker resolves (or the edge is removed), the same
@@ -10068,7 +10077,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.monitorScheduledSuppressed).toBe(0);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain("Primary trigger: `high_churn`");
-    expect(review?.description).toContain("Runs in rolling windows: 10/1h");
+    expect(review?.description).toContain("Dispatched runs in rolling windows: 10/1h");
   });
 
   it("ignores non-assignee comments when evaluating high-churn productivity reviews", async () => {

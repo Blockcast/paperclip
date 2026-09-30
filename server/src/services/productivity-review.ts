@@ -2065,16 +2065,27 @@ function isNeverExecutedRun(
 }
 
 // BLO-36927: the two gates that cancel a run *before* it is ever dispatched.
-// Both CAS a still-undispatched row (`queued`, or `scheduled_retry` for the
-// dependency gate's park-expiry/attempt-exhaustion branches) straight to
-// `cancelled`, and neither writes `startedAt` — no adapter, no model turn, no
-// cost:
+// Neither writes `startedAt` — no adapter, no model turn, no cost. Their write
+// shapes differ, and the difference is not cosmetic:
+// BLO-36927: the two gates that cancel a run *before* it is ever dispatched.
+// Neither writes `startedAt` — no adapter, no model turn, no cost. Their write
+// shapes differ, and the difference is not cosmetic:
 //   - `duplicate_dispatch_suppressed` — `cancelQueuedRunForDuplicateDispatch`
 //     (heartbeat.ts), the dispatcher's own redundancy dedupe when two wakeup
-//     paths queue the same (agentId, issueId) on one tick.
+//     paths queue the same (agentId, issueId) on one tick. CASes on `queued`
+//     (`setRunStatusIfQueued`), so it cannot land on a row another pass has
+//     already claimed.
 //   - `issue_dependencies_blocked` — `cancelQueuedRunForBlockedDependencies`
 //     and the dependency-blocked park expiry/exhaustion writers, already
-//     recognised as never-executed by `isDependencyBlockedRun` above.
+//     recognised as never-executed by `isDependencyBlockedRun` above. This one
+//     writes **by id** (`setRunStatus`, whose UPDATE is
+//     `where(eq(heartbeatRuns.id, runId))` — no status predicate), so the write
+//     always succeeds. BLO-20396 moved the duplicate gate off exactly that
+//     shape, because a by-id write could stomp a row a concurrent pass had
+//     already claimed to `running`. The dependency gate is safe today only by
+//     in-process ordering — it runs before the claim write, not because the
+//     write is guarded. That race is pre-existing and out of scope here: this
+//     predicate only has to recognise the rows, not fix the writer.
 //
 // `countIssueRunsSince` (the `high_churn` run-count denominator) has no status
 // filter, and its `coalesce(startedAt, createdAt)` fallback is exactly what
@@ -2093,9 +2104,18 @@ function isNeverExecutedRun(
 // the in-flight `queued`/`running` rows the churn bar most wants to count
 // (`usageJson` is the completion summary and is null by construction until a
 // run finishes). A filter that quietly matches too much is indistinguishable
-// from a fixed one. `errorCode` is only ever written on a terminal row, so the
-// status guard is belt-and-braces — kept because it is one line and it makes
-// the "pre-dispatch, terminal" intent legible at the call site.
+// from a fixed one.
+//
+// The `status = 'cancelled'` guard is load-bearing, not decoration — do not
+// drop it. "`errorCode` is only ever written on a terminal row" is false:
+// `enqueueWakeup` (heartbeat.ts) INSERTs a **`scheduled_retry`** row carrying
+// `errorCode: "rate_limit_exhausted"` when the provider-capacity gate parks a
+// wake. That row is live, not terminal, and it is exactly the kind of run the
+// churn bar wants to keep counting. It survives today only because
+// `rate_limit_exhausted` is not in the list below — i.e. by coincidence of
+// membership, not by construction. Add any non-terminal code to that list with
+// the status guard removed and capacity-parked runs silently stop being
+// countable.
 const PRE_DISPATCH_CANCELLED_RUN_ERROR_CODES = [
   "duplicate_dispatch_suppressed",
   "issue_dependencies_blocked",
@@ -5225,7 +5245,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       ...(evidence.dependencyGating
         ? [`- Dependency accounting: ${formatDependencyGating(evidence.dependencyGating, evidence.monitorGating !== null)}`]
         : []),
-      `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
+      `- Dispatched runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
       `- Assignee run-linked comments total/window: ${evidence.commentCount} total, ${evidence.commentCountLastHour}/1h, ${evidence.commentCountLastSixHours}/6h`,
       `- Cost events total: ${evidence.costCents} cents`,
       `- Linked pull request: ${formatPullRequestEvidence(evidence.latestPullRequest)}`,
@@ -5350,7 +5370,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
             }`,
           ]
         : []),
-      `- Runs/assignee comments: ${evidence.runCountLastHour}/${evidence.commentCountLastHour} in 1h, ${evidence.runCountLastSixHours}/${evidence.commentCountLastSixHours} in 6h`,
+      `- Dispatched runs/assignee comments: ${evidence.runCountLastHour}/${evidence.commentCountLastHour} in 1h, ${evidence.runCountLastSixHours}/${evidence.commentCountLastSixHours} in 6h`,
       ...(evidence.monitorGating
         ? [`- Elapsed accounting: ${formatMonitorGating(evidence.monitorGating)}`]
         : []),
