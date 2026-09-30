@@ -6672,6 +6672,20 @@ export function parseSessionCompactionPolicy(agent: typeof agents.$inferSelect):
   return resolveSessionCompactionPolicy(agent.adapterType, agent.runtimeConfig).policy;
 }
 
+// BLO-29842: the rotation trigger's input basis, as one named unit so it can be
+// pinned. Cache creation used to be summed into `inputTokens` upstream; reading
+// `inputTokens` alone here would quietly shrink the trigger by the whole
+// cache-write volume — most of the prompt on this fleet — and rotate far later
+// than the policy asks. The threshold is unchanged; only what feeds it is.
+// Deliberately the shared `promptTokens` rather than a heartbeat-local twin:
+// two names for one concept is how a third spelling arrives. Kept exported and
+// separate from evaluateSessionCompaction (which needs a DB harness) so that
+// reverting this to `.inputTokens` fails a test instead of passing silently.
+export function sessionRotationInputTokens(usageJson: unknown): number | null {
+  const usage = readRawUsageTotals(usageJson);
+  return usage ? promptTokens(usage) : null;
+}
+
 // Pure rotation-trigger decision, factored out of evaluateSessionCompaction so the
 // boundary semantics are unit-testable without a DB harness (BLO-8827). Returns the
 // human-readable rotation reason, or null to keep the current session. Trigger
@@ -16789,7 +16803,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       policy.maxSessionAgeHours > 0
         ? await getOldestRunForSession(agent.id, sessionId)
         : runs[runs.length - 1] ?? latestRun;
-    const latestRawUsage = readRawUsageTotals(latestRun?.usageJson);
     const sessionAgeHours =
       latestRun && oldestRun
         ? Math.max(
@@ -16802,13 +16815,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const reason = computeSessionCompactionReason({
       policy,
       runsCount: runs.length,
-      // BLO-29842: fresh input + cache creation. Cache creation used to be summed
-      // into inputTokens upstream, so reading inputTokens alone here would quietly
-      // shrink the rotation trigger's input by the whole cache-write volume and
-      // rotate far later than the policy asks for. The threshold is unchanged.
-      // Deliberately the shared `promptTokens` rather than a heartbeat-local
-      // twin: two names for one concept is how a third spelling arrives.
-      latestRawInputTokens: latestRawUsage ? promptTokens(latestRawUsage) : null,
+      // BLO-29842: fresh input + cache creation. See sessionRotationInputTokens.
+      latestRawInputTokens: sessionRotationInputTokens(latestRun?.usageJson),
       sessionAgeHours,
       consecutiveFailedOrZeroTokenResumes,
     });
