@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
-import type { CompanySecret, UserSecretDefinition } from "@paperclipai/shared";
+import { REDACTED_SENTINEL, type CompanySecret, type UserSecretDefinition } from "@paperclipai/shared";
 import {
+  canStoreValueAsSecret,
   computeDuplicateNames,
   computeRowHealth,
   computeUserSecretRowHealth,
   emptyRow,
   envKeyFromSecretName,
+  maskedRenameBlockers,
+  maskedRenameIssue,
   planSourceSwitch,
   rowsFromValue,
   secretNameFromKey,
@@ -181,6 +184,62 @@ describe("validateName", () => {
   });
 });
 
+describe("maskedRenameIssue (PEN-3033)", () => {
+  const masked = () => rowsFromValue({ GH_TOKEN: REDACTED_SENTINEL })[0]!;
+
+  it("is silent while the row keeps the key its mask was issued under", () => {
+    expect(maskedRenameIssue(masked())).toBeNull();
+    // Whitespace is how the name input delivers a name mid-edit; it must not read as a rename.
+    expect(maskedRenameIssue({ ...masked(), name: " GH_TOKEN " })).toBeNull();
+  });
+
+  it("errors once a withheld row is renamed, and names the key to get back to", () => {
+    const issue = maskedRenameIssue({ ...masked(), name: "GITHUB_TOKEN" });
+    expect(issue?.level).toBe("error");
+    expect(issue?.message).toContain("GH_TOKEN");
+  });
+
+  it("clears when the user renames back", () => {
+    const renamed = { ...masked(), name: "GITHUB_TOKEN" };
+    expect(maskedRenameIssue(renamed)).not.toBeNull();
+    expect(maskedRenameIssue({ ...renamed, name: "GH_TOKEN" })).toBeNull();
+  });
+
+  it("clears when the user supplies a value, because the row is no longer withheld", () => {
+    // Exactly what the value input's onChange emits: `{ textValue, masked: false }`. After it the
+    // client holds a real value for the new key, so the rename is legitimate and must go through.
+    const renamed = { ...masked(), name: "GITHUB_TOKEN", textValue: "real", masked: false };
+    expect(maskedRenameIssue(renamed)).toBeNull();
+  });
+
+  it("is inert on rows that were never masked", () => {
+    expect(maskedRenameIssue({ ...emptyRow(), name: "ANYTHING" })).toBeNull();
+    expect(maskedRenameIssue(rowsFromValue({ GH_TOKEN: "real" })[0]!)).toBeNull();
+  });
+
+  it("clears when a renamed row is rebound to a secret, which emits no sentinel", () => {
+    // `Row.tsx`'s "to-secret" patches `{ source: "secret", ... }` and leaves `masked` set, so a
+    // predicate keyed on the flag alone would block this — and it saves perfectly well, because
+    // `valueFromRows` emits a `secret_ref` for it and the placeholder never reaches the server.
+    const rebound = { ...masked(), name: "GITHUB_TOKEN", source: "secret" as const, secretId: "sec_1" };
+    expect(maskedRenameIssue(rebound)).toBeNull();
+    expect(valueFromRows([rebound])).toEqual({
+      GITHUB_TOKEN: { type: "secret_ref", secretId: "sec_1", version: "latest" },
+    });
+
+    const reboundUserSecret = { ...masked(), name: "GITHUB_TOKEN", source: "user_secret" as const, userSecretKey: "gh" };
+    expect(maskedRenameIssue(reboundUserSecret)).toBeNull();
+  });
+
+  it("blocks exactly the rows whose save would carry the sentinel", () => {
+    const blocked = { ...masked(), name: "GITHUB_TOKEN" };
+    const allowed = { ...masked(), name: "GITHUB_TOKEN", source: "secret" as const, secretId: "sec_1" };
+    expect(maskedRenameBlockers([masked(), blocked, allowed])).toEqual([blocked]);
+    // The predicate and the emit must agree: only the blocked row's payload carries the placeholder.
+    expect(valueFromRows([blocked])).toEqual({ GITHUB_TOKEN: { type: "plain", value: REDACTED_SENTINEL } });
+  });
+});
+
 describe("computeDuplicateNames", () => {
   it("collects names appearing more than once", () => {
     const rows = [
@@ -253,6 +312,67 @@ describe("planSourceSwitch (§6.3)", () => {
   it("does not offer undo on Secret→Text when no secret was bound", () => {
     const plan = planSourceSwitch({ ...emptyRow(), source: "secret" }, "text");
     expect(plan).toEqual({ kind: "to-text", undoFrom: null });
+  });
+
+  it("routes a withheld row to the picker instead of storing the placeholder (PEN-3033)", () => {
+    // The mask is non-empty, so the ordinary `textValue.trim()` test would send this down
+    // `open-store` and create a company secret holding `***REDACTED***`.
+    const row = { ...emptyRow(), name: "GH_TOKEN", source: "text" as const, textValue: REDACTED_SENTINEL, masked: true };
+    expect(planSourceSwitch(row, "secret")).toEqual({ kind: "to-secret" });
+  });
+
+  it("still stores a value the user typed over the mask", () => {
+    // `masked` is cleared on edit, so this is an ordinary non-empty value again.
+    const row = { ...emptyRow(), name: "GH_TOKEN", source: "text" as const, textValue: "real", masked: false };
+    expect(planSourceSwitch(row, "secret")).toEqual({ kind: "open-store", name: "gh_token", value: "real" });
+  });
+});
+
+describe("withheld-value handling (PEN-3033)", () => {
+  it("flags a masked plain-string binding", () => {
+    const [row] = rowsFromValue({ GH_TOKEN: REDACTED_SENTINEL });
+    expect(row.masked).toBe(true);
+    expect(row.textValue).toBe(REDACTED_SENTINEL);
+  });
+
+  it("flags a masked plain-object binding", () => {
+    const [row] = rowsFromValue({ GH_TOKEN: { type: "plain", value: REDACTED_SENTINEL } });
+    expect(row.masked).toBe(true);
+  });
+
+  it("records the key each mask was issued under, on both binding spellings", () => {
+    // `maskedKey` is what lets the rename check tell "moved" from "moved back". Asserted on BOTH
+    // masked branches of `rowsFromValue`: they are separate code paths, and a mask arriving
+    // without its key silently disables the check rather than failing it.
+    expect(rowsFromValue({ GH_TOKEN: REDACTED_SENTINEL })[0]!.maskedKey).toBe("GH_TOKEN");
+    expect(rowsFromValue({ GH_TOKEN: { type: "plain", value: REDACTED_SENTINEL } })[0]!.maskedKey).toBe("GH_TOKEN");
+    // And only alongside a mask: a `maskedKey` on an unmasked row would read as a general
+    // "original name" and invite a rename check that fires on ordinary edits.
+    expect(rowsFromValue({ GH_TOKEN: "real" })[0]!.maskedKey).toBeUndefined();
+    expect(rowsFromValue({ GH_TOKEN: { type: "plain", value: "real" } })[0]!.maskedKey).toBeUndefined();
+  });
+
+  it("does not flag an ordinary value", () => {
+    const [row] = rowsFromValue({ GH_TOKEN: "real" });
+    expect(row.masked).toBe(false);
+  });
+
+  it("re-emits the sentinel on save so the server can merge the stored value back", () => {
+    // `valueFromRows` must NOT drop or blank a withheld row: `restoreMaskedEnvBindings` matches on
+    // this exact string to restore the real binding. Emitting anything else destroys it.
+    const rows = rowsFromValue({ GH_TOKEN: REDACTED_SENTINEL });
+    expect(valueFromRows(rows)).toEqual({ GH_TOKEN: { type: "plain", value: REDACTED_SENTINEL } });
+  });
+
+  it("refuses to store a withheld value as a secret, and allows it once edited", () => {
+    const masked = { ...emptyRow(), source: "text" as const, textValue: REDACTED_SENTINEL, masked: true };
+    expect(canStoreValueAsSecret(masked)).toBe(false);
+    // What the value input's onChange produces once the user types over the mask.
+    expect(canStoreValueAsSecret({ ...masked, textValue: "real", masked: false })).toBe(true);
+  });
+
+  it("refuses on an empty row, so the predicate is not merely a mask test", () => {
+    expect(canStoreValueAsSecret({ ...emptyRow(), source: "text", textValue: "  " })).toBe(false);
   });
 });
 

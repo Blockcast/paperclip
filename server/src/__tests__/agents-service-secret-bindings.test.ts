@@ -33,6 +33,58 @@ vi.mock("../services/hire-hook.js", () => ({
   notifyHireApproved: mockNotifyHireApproved,
 }));
 
+/**
+ * Un-awaited service calls in this file, and how the two helpers below cover them.
+ *
+ * The tests below deliberately leave a service call un-awaited so it blocks on a
+ * `for update` lock the test transaction holds, then assert its outcome once the
+ * transaction has committed. Between those two points the promise is live but
+ * unasserted, so on a rejecting path it can sit rejected with no handler: Node
+ * reports an unhandled rejection and vitest exits 1 with every test still passing
+ * (BLO-32352, CI run 34028692473).
+ *
+ * Both helpers close that window by attaching a no-op catch in the same tick as the
+ * promise they guard, which makes the same-tick requirement structural rather than
+ * conventional -- the handler cannot drift below a later `await` because it is bound
+ * to the call site. Every un-awaited site in this file goes through one of them, with
+ * one exception that needs no helper: the site that consumes its call with a two-arg
+ * `.then(onFulfilled, onRejected)` is already safe, because the rejection handler is
+ * part of the chain rather than attached after it. A bare `void somePromise`, or a
+ * bare assignment asserted only after an `await`, would reopen the hole.
+ */
+
+/**
+ * Marks a promise whose outcome is asserted later, after an intervening `await`.
+ *
+ * Applies whether the caller goes on to assert `.resolves` or `.rejects`: what makes
+ * the site leak is the gap between creation and assertion, not which way it settles.
+ *
+ * `.catch` and not `.finally`: finally re-raises on the promise it returns, which
+ * would move the leak one link down the chain instead of closing it. The returned
+ * promise is the original, so the outcome is still fully asserted by the caller.
+ */
+const assertedLater = <T,>(promise: Promise<T>): Promise<T> => {
+  promise.catch(() => {});
+  return promise;
+};
+
+/**
+ * Runs `onSettled` when `promise` settles, without leaving the derived promise afloat.
+ *
+ * `.finally` is load-bearing at these call sites -- it has to fire on either outcome,
+ * because it sets the flag the `expect(settled).toBe(false)` assertions read to prove
+ * the call is genuinely blocked on the lock. So the `assertedLater` shape does not fit
+ * here. But `.finally` re-raises on the promise it returns, so a bare
+ * `void promise.finally(cb)` leaks that *derived* promise the moment the service call
+ * acquires a rejecting path -- the BLO-32352 failure mode one link down the chain.
+ *
+ * The terminating `.catch` therefore sits on the derived promise only. `promise`
+ * itself is untouched and still fully asserted by the caller (BLO-32399).
+ */
+const notifyWhenSettled = <T,>(promise: Promise<T>, onSettled: () => void): void => {
+  void promise.finally(onSettled).catch(() => {});
+};
+
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -312,9 +364,11 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     let pendingUpdate!: ReturnType<typeof service.update>;
     await db.transaction(async (tx) => {
       await tx.execute(sql`select ${agents.id} from ${agents} where ${agents.id} = ${agentId} for update`);
-      pendingUpdate = service.update(agentId, {
-        runtimeConfig: { heartbeat: { wakeOnDemand: true } },
-      });
+      pendingUpdate = assertedLater(
+        service.update(agentId, {
+          runtimeConfig: { heartbeat: { wakeOnDemand: true } },
+        }),
+      );
       await new Promise((resolve) => setTimeout(resolve, 100));
       await tx.update(agents).set({
         runtimeConfig: { heartbeat: { maxConcurrentRuns: 12, wakeOnDemand: false } },
@@ -340,7 +394,7 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     await db.transaction(async (tx) => {
       await tx.execute(sql`select ${agents.id} from ${agents} where ${agents.id} = ${agentId} for update`);
       pendingUpdate = service.update(agentId, { adapterType: "opencode_k8s" });
-      void pendingUpdate.finally(() => {
+      notifyWhenSettled(pendingUpdate, () => {
         settled = true;
       });
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -371,7 +425,7 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     await db.transaction(async (tx) => {
       await tx.execute(sql`select ${agents.id} from ${agents} where ${agents.id} = ${agentId} for update`);
       pendingActivation = service.activatePendingApproval(agentId, { role: "reviewer" });
-      void pendingActivation.finally(() => {
+      notifyWhenSettled(pendingActivation, () => {
         settled = true;
       });
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -431,7 +485,7 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     await db.transaction(async (tx) => {
       await tx.execute(sql`select ${agents.id} from ${agents} where ${agents.id} = ${agentId} for update`);
       pendingApproval = approvalService(db).approve(approvalId, "board-user", "Approved");
-      void pendingApproval.finally(() => {
+      notifyWhenSettled(pendingApproval, () => {
         settled = true;
       });
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -478,7 +532,9 @@ describeEmbeddedPostgres("agent service secret binding sync", () => {
     let pendingApproval!: ReturnType<ReturnType<typeof approvalService>["approve"]>;
     await db.transaction(async (tx) => {
       await tx.execute(sql`select ${agents.id} from ${agents} where ${agents.id} = ${agentId} for update`);
-      pendingApproval = approvalService(db).approve(approvalId, "board-user", "Approved");
+      pendingApproval = assertedLater(
+        approvalService(db).approve(approvalId, "board-user", "Approved"),
+      );
       await new Promise((resolve) => setTimeout(resolve, 100));
       await tx.update(agents).set({ status: "terminated" }).where(eq(agents.id, agentId));
     });

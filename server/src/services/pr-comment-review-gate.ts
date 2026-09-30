@@ -12,21 +12,37 @@
  * gate unable to observe any real review (BLO-29711).
  */
 import { loadConfig } from "../config.js";
+import type { Db } from "@paperclipai/db";
+import { withGithubStatusDeliveryLock } from "./github-status-delivery-outbox.js";
 import {
+  extractAllyPriorFindingDispositions,
+  extractAllyReportedFindingRefs,
   extractAllyReviewedHeadSha,
   hasActionablePrReviewFeedback,
   hasAllyConsolidatedReviewHeading,
+  type AllyFindingRef,
+  type AllyPriorFindingDisposition,
 } from "./ally-review-detection.js";
 import {
+  githubFetchPrAuthorLogin,
   githubFetchPrHeadSha,
   githubListIssueCommentsWithTimestamps,
   githubListPrReviewsWithTimestamps,
+  githubPostCheckRun,
   githubPostCommitStatusDetailed,
   githubReviewerIdentityMatches,
+  githubSharesReviewerIdentity,
+  type GitHubCheckRunConclusion,
   type GitHubCommitStatusPostResult,
 } from "./github-app-auth.js";
 
 const DEFAULT_PR_REVIEWER_BOT_LOGIN = "allyblockcast[bot]";
+
+// Characters of the unrecognized-verb list a carried-finding reason may spend.
+// Sized so the message stays inside GitHub's 140-character commit-status cap
+// with the head and the explanatory phrase intact, since those are what make
+// the red actionable.
+const UNRECOGNIZED_VERB_BUDGET = 48;
 
 export interface CommentReviewGateComment {
   authorLogin: string | null | undefined;
@@ -58,12 +74,27 @@ export type CommentReviewGateOutcome =
   | "blocking_finding"
   /** No comment attests this head, but a finding from an earlier head stands undispositioned. */
   | "carried_finding"
-  /** Nothing established a comment-shaped review of this head. Not evidence of review. */
+  /**
+   * Nothing established an *independent* comment-shaped review of this head.
+   * Not evidence of review. Covers both "no comment attests it" and "the only
+   * one that does is the PR author's own" (BLO-34316).
+   */
   | "not_evaluated";
 
 export type CommentReviewGateVerdict =
   | { state: "success"; outcome: "clean"; reason: string }
-  | { state: "success"; outcome: "not_evaluated"; reason: string }
+  | {
+      state: "success";
+      outcome: "not_evaluated";
+      reason: string;
+      /**
+       * Set only on the branch that would have been `clean` had the author been
+       * known. It is what lets the caller fetch the author on the one path that
+       * reads it, instead of making that fetch a precondition for publishing
+       * anything — see executeCommentReviewGateCheck.
+       */
+      authorUnknown?: true;
+    }
   | { state: "failure"; outcome: "blocking_finding"; reason: string; commentCreatedAt: string }
   | {
       state: "failure";
@@ -71,6 +102,15 @@ export type CommentReviewGateVerdict =
       reason: string;
       commentCreatedAt: string;
       carriedFromHeadSha: string;
+      /**
+       * Same meaning as on `not_evaluated`, and it has to exist here too: a
+       * carried finding CONSUMES the withheld positive rather than returning
+       * it, so without this flag the author-blind first pass pins the verdict
+       * and the caller never fetches the author — making `clean` unreachable
+       * for a distinct author whose at-head attestation should have cleared
+       * the carry, and leaving the self-attested tail below unrenderable.
+       */
+      authorUnknown?: true;
     };
 
 function toEpochMs(value: string | Date): number {
@@ -92,6 +132,15 @@ function isAllyConsolidatedReviewComment(
 interface AttestingComment {
   comment: CommentReviewGateComment;
   attestedHeadSha: string;
+}
+
+interface CarriedFinding extends AttestingComment {
+  /**
+   * Ledger verbs that named a still-unretired finding on this head but that
+   * the parser does not recognize. Empty in the ordinary case; non-empty means
+   * the red is explainable by vocabulary drift rather than by an open finding.
+   */
+  unrecognizedVerbs: string[];
 }
 
 /**
@@ -130,12 +179,25 @@ function latestAttestingAllyComment(
  * Heads whose own newest attestation still carries an unresolved finding,
  * newest attestation first.
  *
- * Disposition is tracked per attested head, not by global comment recency. A
- * later clean attestation of head H disposes a finding raised against H: Ally
- * re-examined that exact tree and found nothing. A clean attestation of some
- * *other* head does not, because nothing available here establishes that the
- * other head contains the fix — comment chronology is not commit ancestry, and
- * reviews can land out of order relative to pushes.
+ * Disposition is tracked per attested head, not by global comment recency.
+ * Two things dispose a finding raised against head H:
+ *
+ *   - A later clean attestation of H itself: Ally re-examined that exact tree
+ *     and found nothing.
+ *   - A later review retiring *every* finding H raised, by name, under "Prior
+ *     Findings Dispositioned": Ally asserting directly that it re-checked those
+ *     specific findings and they are gone. Retiring only some of them leaves H
+ *     carried — one `fixed` entry must not clear a review that reported several
+ *     findings.
+ *
+ * A clean attestation of some *other* head disposes nothing by itself, because
+ * nothing in that alone establishes that the other head contains the fix —
+ * comment chronology is not commit ancestry, and reviews can land out of order
+ * relative to pushes. The ledger is what supplies that missing link, and
+ * reading only the first rule wedged PRs whose finding Ally had already marked
+ * resolved: on Blockcast/libmmt#362 the review of c9a1765 recorded
+ * `prior:731ced5 critical 1 — fixed`, and this gate still reported 731ced5
+ * undispositioned once the head moved on again.
  *
  * Reading only the globally newest attestation instead let A(blocking) ->
  * B(clean) -> C(unattested) drop A's finding silently (BLO-29711, Ally review
@@ -144,8 +206,9 @@ function latestAttestingAllyComment(
 function headsWithUndispositionedFinding(
   comments: CommentReviewGateComment[],
   reviewerBotLogin: string,
-): AttestingComment[] {
+): CarriedFinding[] {
   const newestPerHead = new Map<string, { attesting: AttestingComment; timeMs: number }>();
+  const ledger: { entry: AllyPriorFindingDisposition; timeMs: number; attestedHeadSha: string }[] = [];
 
   for (const comment of comments) {
     if (!isAllyConsolidatedReviewComment(comment, reviewerBotLogin)) continue;
@@ -153,6 +216,10 @@ function headsWithUndispositionedFinding(
     if (!attestedHeadSha) continue;
     const commentTime = toEpochMs(comment.createdAt);
     if (!Number.isFinite(commentTime)) continue;
+
+    for (const entry of extractAllyPriorFindingDispositions(comment.body)) {
+      ledger.push({ entry, timeMs: commentTime, attestedHeadSha });
+    }
 
     const existing = newestPerHead.get(attestedHeadSha);
     // Ties prefer the later item, matching latestAttestingAllyComment: the
@@ -162,10 +229,99 @@ function headsWithUndispositionedFinding(
     }
   }
 
+  // A ledger entry speaks only to findings that already existed when it was
+  // written, so it must be at least as new as the attestation it names, and it
+  // must come from a review of a different head — a review cannot disposition
+  // its own finding. That second condition is what makes `>=` safe against the
+  // second-resolution timestamps.
+  //
+  // Shared by the retirement check and the unrecognized-verb diagnostic so the
+  // explanation can only ever name an entry that would otherwise have retired
+  // the finding.
+  const namesFinding = (
+    prior: { entry: AllyPriorFindingDisposition; timeMs: number; attestedHeadSha: string },
+    headSha: string,
+    attestedAtMs: number,
+    finding: AllyFindingRef,
+  ): boolean =>
+    prior.attestedHeadSha !== headSha &&
+    prior.timeMs >= attestedAtMs &&
+    headSha.startsWith(prior.entry.shortSha) &&
+    prior.entry.severity === finding.severity &&
+    prior.entry.index === finding.index;
+
+  const isRetired = (headSha: string, attestedAtMs: number, finding: AllyFindingRef): boolean =>
+    ledger.some(
+      (prior) => prior.entry.kind === "retires" && namesFinding(prior, headSha, attestedAtMs, finding),
+    );
+
+  // Ally saying a finding still stands is an explicit answer, not a gap in this
+  // parser's vocabulary. When both dispositions name one finding, the known one
+  // is the true reason it is still blocking.
+  const isExplicitlyBlocked = (
+    headSha: string,
+    attestedAtMs: number,
+    finding: AllyFindingRef,
+  ): boolean =>
+    ledger.some(
+      (prior) => prior.entry.kind === "blocks" && namesFinding(prior, headSha, attestedAtMs, finding),
+    );
+
+  // A head is dispositioned only once *every* finding it raised has been
+  // retired by name. Matching on the head alone would let one `fixed` entry
+  // clear a review that reported several findings, dropping the ones the ledger
+  // never mentioned. `null` means the blocking feedback came from prose or an
+  // uncounted heading, so no finding identities exist to match against and the
+  // head stays carried.
+  const isFullyDispositioned = (entry: { attesting: AttestingComment; timeMs: number }): boolean => {
+    const reported = extractAllyReportedFindingRefs(entry.attesting.comment.body);
+    if (!reported || reported.length === 0) return false;
+    return reported.every((finding) =>
+      isRetired(entry.attesting.attestedHeadSha, entry.timeMs, finding),
+    );
+  };
+
+  // Verbs that named a still-unretired finding on this head but that this
+  // parser does not know. Failing closed on those is correct, but leaving the
+  // red unexplained is not: without this the status says a finding is
+  // undispositioned while Ally's ledger visibly dispositions it, and nothing
+  // tells a reader that the verb is the reason. A finding Ally has explicitly
+  // marked `still-present` is excluded — reporting drift there would name the
+  // wrong cause, which is worse than saying nothing.
+  const unrecognizedVerbsBlocking = (entry: {
+    attesting: AttestingComment;
+    timeMs: number;
+  }): string[] => {
+    const headSha = entry.attesting.attestedHeadSha;
+    const reported = extractAllyReportedFindingRefs(entry.attesting.comment.body);
+    if (!reported) return [];
+    const verbs = new Set<string>();
+    for (const finding of reported) {
+      if (isRetired(headSha, entry.timeMs, finding)) continue;
+      if (isExplicitlyBlocked(headSha, entry.timeMs, finding)) continue;
+      for (const prior of ledger) {
+        if (prior.entry.kind !== "unrecognized") continue;
+        if (namesFinding(prior, headSha, entry.timeMs, finding)) verbs.add(prior.entry.disposition);
+      }
+    }
+    return [...verbs];
+  };
+
+  // `countInheritedLedgerAssertion: false` keeps this enumeration answering
+  // "which findings did *this head* raise?". A `still-present` entry names an
+  // earlier head's finding, and that head is enumerated in its own right, so
+  // counting it here would name a review whose own buckets are empty — and
+  // permanently, since a 0/0 body reports no identities for any later ledger
+  // entry to retire. The current-head branch below deliberately does count it.
   return [...newestPerHead.values()]
-    .filter((entry) => hasActionablePrReviewFeedback(entry.attesting.comment.body))
+    .filter(
+      (entry) =>
+        hasActionablePrReviewFeedback(entry.attesting.comment.body, undefined, {
+          countInheritedLedgerAssertion: false,
+        }) && !isFullyDispositioned(entry),
+    )
     .sort((a, b) => b.timeMs - a.timeMs)
-    .map((entry) => entry.attesting);
+    .map((entry) => ({ ...entry.attesting, unrecognizedVerbs: unrecognizedVerbsBlocking(entry) }));
 }
 
 /**
@@ -176,6 +332,19 @@ export function evaluateCommentReviewGate(input: {
   comments: CommentReviewGateComment[];
   headSha: string;
   reviewerBotLogin?: string | null;
+  /**
+   * The login that opened the PR. Required to reach `clean` (BLO-34316).
+   *
+   * Every attesting comment has already been established to come from the
+   * reviewer identity, so "this attestation is the author's own" reduces to
+   * "the PR author IS that identity" — which is the case on every agent PR
+   * here, where both sides are `allyblockcast[bot]`. Null is treated the same
+   * as self-attested: the positive claim is that someone other than the author
+   * examined this head, and an absent author cannot establish it. Required and
+   * explicitly nullable rather than optional, so a new call site has to state
+   * which it means instead of silently downgrading every `clean` to `neutral`.
+   */
+  prAuthorLogin: string | null;
 }): CommentReviewGateVerdict {
   const reviewerBotLogin = input.reviewerBotLogin?.trim() || DEFAULT_PR_REVIEWER_BOT_LOGIN;
   const headSha = input.headSha?.trim();
@@ -191,6 +360,28 @@ export function evaluateCommentReviewGate(input: {
   const normalizedHead = headSha.toLowerCase();
   const forHead = latestAttestingAllyComment(comments, reviewerBotLogin, normalizedHead);
 
+  // Set when an attestation for this head exists but its positive claim is
+  // withheld. HELD rather than returned: withholding a positive is not an
+  // all-clear, so the carried-finding check below still has to run. Returning
+  // here made the author better off posting a self-attestation that carries NO
+  // disposition ledger than posting nothing — either withheld positive silently
+  // converted a red carried from an earlier head into `neutral`, because
+  // `headsWithUndispositionedFinding` is only reached when NOTHING attests the
+  // current head. The `clean` return below is deliberately not held: an
+  // independent attestation of the current head does disposition an earlier
+  // head's finding, which is the pre-existing BLO-29711 behaviour.
+  //
+  // The LEDGER route is deliberately still author-blind and is not closed here:
+  // `headsWithUndispositionedFinding` credits a `prior:<A> critical 1 — fixed`
+  // entry from any comment passing `isAllyConsolidatedReviewComment`, so on an
+  // agent PR — where the reviewer identity IS the author — a self-authored
+  // ledger still retires a carried finding. Requiring independence there would
+  // make an agent PR permanently red once any finding is raised, because only
+  // the reviewer ever writes ledgers: the BLO-29711 deadlock this module exists
+  // to avoid. What this branch closes is the malformed-ledger shape, where the
+  // section parses as absent and the bare attestation was the whole claim.
+  let withheldPositive: Extract<CommentReviewGateVerdict, { outcome: "not_evaluated" }> | null = null;
+
   if (forHead) {
     if (hasActionablePrReviewFeedback(forHead.comment.body)) {
       return {
@@ -201,49 +392,179 @@ export function evaluateCommentReviewGate(input: {
         commentCreatedAt: new Date(toEpochMs(forHead.comment.createdAt)).toISOString(),
       };
     }
-    return {
-      state: "success",
-      outcome: "clean",
-      reason:
-        "Ally's most recent consolidated-review comment for this head reports no unresolved findings.",
-    };
+    // Only the POSITIVE claim is withheld for a self-attestation. The blocking
+    // branch above stays author-blind on purpose: a finding is a finding
+    // whoever wrote it, and failing closed there is the direction this module
+    // must not get wrong.
+    const prAuthorLogin = input.prAuthorLogin?.trim();
+    if (!prAuthorLogin) {
+      withheldPositive = {
+        state: "success",
+        outcome: "not_evaluated",
+        authorUnknown: true,
+        reason: "The PR author is unknown, so this head's attestation cannot be shown to be independent.",
+      };
+      // `githubSharesReviewerIdentity`, not `githubReviewerIdentityMatches`: the
+      // strict predicate exists to keep the bare `<slug>` user seat from being
+      // CREDITED as the reviewer, and that fail direction is inverted here. The
+      // seat and the App are one agent wearing two hats, so a PR opened by the
+      // seat and attested by the App is still a self-attestation.
+    } else if (githubSharesReviewerIdentity(prAuthorLogin, reviewerBotLogin)) {
+      withheldPositive = {
+        state: "success",
+        outcome: "not_evaluated",
+        reason: "The only comment attesting this head is the PR author's own; nothing independent reviewed it.",
+      };
+    } else {
+      return {
+        state: "success",
+        outcome: "clean",
+        reason:
+          "Ally's most recent consolidated-review comment for this head reports no unresolved findings.",
+      };
+    }
   }
 
-  // Nothing attests this head. A finding raised against an earlier head is not
-  // dispositioned by replacing that head, so it carries forward rather than
-  // going green (BLO-29711). Only a later clean review of that same earlier
-  // head disposes it — see headsWithUndispositionedFinding. It clears the
-  // moment Ally attests the current head, which the push that produced this
-  // head already triggers, so this cannot wedge a PR that keeps being reviewed
-  // on the same surface.
+  // Nothing attests this head, or what does cannot make the positive claim. A
+  // finding raised against an earlier head is not dispositioned by replacing
+  // that head, so it carries forward rather than going green (BLO-29711). It is
+  // disposed by a later clean review of that same earlier head, or by a later
+  // review that names it as resolved in its prior-findings ledger — see
+  // headsWithUndispositionedFinding. It also clears the moment an INDEPENDENT
+  // review attests the current head; the author's own attestation does not,
+  // which is why `withheldPositive` falls through to here rather than returning.
+  // Note that none of those routes exists while the reviewer itself is failing
+  // to run, which is the state that strands a PR here.
   const [carried] = headsWithUndispositionedFinding(comments, reviewerBotLogin);
   if (carried) {
+    const shortHead = carried.attestedHeadSha.slice(0, 7);
+    // GitHub caps a commit-status description at 140 characters, so this is a
+    // replacement message rather than a suffix on the ordinary one: appending
+    // would push the part that explains the red past the cap and lose exactly
+    // the detail this branch exists to surface. The verb list is budgeted for
+    // the same reason — the regex accepts an arbitrarily long verb, and the
+    // head plus the "unrecognized ledger verb" phrase must survive intact.
+    //
+    // PEN-3157 asked whether this republishes model-authored text to a public
+    // commit status without a scrub, since the verb is lifted verbatim out of
+    // an Ally review comment body. It does not, and the reason is worth having
+    // in writing because the interpolation looks unbounded here: the verb is
+    // unbounded in LENGTH but not in ALPHABET. It reaches this line through the
+    // single capture group `([a-z][a-z-]*)` in
+    // `PRIOR_FINDING_DISPOSITION_PATTERN` (ally-review-detection.ts), the only
+    // writer of `disposition`, so it is lowercase letters and hyphens and
+    // nothing else. That admits no credential this codebase is exposed to — an
+    // AWS key id, a bearer token, a JWT and a PEM all carry uppercase, digits,
+    // or punctuation outside that class. See the invariant test in
+    // `github-write-egress-scrub.test.ts`, which fails if the class widens.
+    // Defence in depth still applies: `githubPostCommitStatusDetailed` scrubs
+    // every description on the way out, so widening the class would be caught
+    // by the boundary even if that test were deleted.
+    const verbList = carried.unrecognizedVerbs
+      .map((verb) => `"${verb}"`)
+      .join(", ")
+      .slice(0, UNRECOGNIZED_VERB_BUDGET);
+    // The tail is conditional because `withheldPositive` is exactly the state
+    // in which a comment DOES attest the current head. Saying "no comment
+    // attests the current head" there invites the author to post one — which
+    // they just did, and which cannot clear a carried finding. Naming why the
+    // attestation did not count is the difference between a red that routes
+    // the author to the reviewer and a red that routes them into a loop.
+    // Longest rendering is 131 characters, inside the 140 cap.
+    const carriedTail = !withheldPositive
+      ? "; no comment attests the current head."
+      : withheldPositive.authorUnknown
+        ? "; its only attestation is not known to be independent."
+        : "; the only comment attesting it is the PR author's own.";
+    const reason = carried.unrecognizedVerbs.length
+      ? `A finding from Ally's review of ${shortHead} is undispositioned: unrecognized ledger ` +
+        `${carried.unrecognizedVerbs.length === 1 ? "verb" : "verbs"} ${verbList}.`
+      : `An unresolved finding from Ally's review of ${shortHead} is still undispositioned` +
+        carriedTail;
     return {
       state: "failure",
       outcome: "carried_finding",
-      reason:
-        `An unresolved finding from Ally's review of ${carried.attestedHeadSha.slice(0, 7)} ` +
-        "is still undispositioned; no comment attests the current head.",
+      reason,
       commentCreatedAt: new Date(toEpochMs(carried.comment.createdAt)).toISOString(),
       carriedFromHeadSha: carried.attestedHeadSha,
+      // Carried forward so the caller still fetches the author on this route.
+      // A distinct author's at-head attestation clears the carry outright (the
+      // `clean` return above), so pinning this red on the author-blind pass
+      // would publish a red the evidence does not support.
+      ...(withheldPositive?.authorUnknown ? { authorUnknown: true as const } : {}),
     };
   }
 
-  return {
-    state: "success",
-    outcome: "not_evaluated",
-    reason: "No Ally consolidated-review comment attests to reviewing this head.",
-  };
+  // The withheld positive is the accurate verdict only once no red carries: a
+  // comment DOES attest this head, so the generic "no comment attests" reason
+  // below would be false, and `authorUnknown` has to survive for the caller to
+  // know this is the one outcome worth a PR-author fetch.
+  return (
+    withheldPositive ?? {
+      state: "success",
+      outcome: "not_evaluated",
+      reason: "No Ally consolidated-review comment attests to reviewing this head.",
+    }
+  );
+}
+
+/**
+ * Check-run conclusion for a verdict.
+ *
+ * This is the whole point of publishing a check-run alongside the commit
+ * status (BLO-33657). The status surface collapses `clean` and `not_evaluated`
+ * into one green `success`, because a legacy status has only four states and
+ * none of the other three is both honest and non-blocking: `pending` deadlocks
+ * every formally-reviewed PR (the constraint BLO-29711 pinned), and
+ * `failure`/`error` assert a finding that does not exist.
+ *
+ * `neutral` is the state that was missing. It renders distinctly from green in
+ * the UI and in `check-runs` API reads, and it does not block merge — so a
+ * reader can tell "reviewed and clean" from "nothing reviewed this head" by the
+ * conclusion alone, without parsing the human-readable description.
+ */
+export function commentReviewGateCheckConclusion(
+  verdict: Pick<CommentReviewGateVerdict, "state" | "outcome">,
+): GitHubCheckRunConclusion {
+  if (verdict.state === "failure") return "failure";
+  return verdict.outcome === "clean" ? "success" : "neutral";
+}
+
+/** Short check-run title, so the conclusion is legible without opening it. */
+export function commentReviewGateCheckTitle(
+  verdict: Pick<CommentReviewGateVerdict, "state" | "outcome">,
+): string {
+  switch (verdict.outcome) {
+    case "clean":
+      return "Reviewed at this head — no unresolved findings";
+    case "blocking_finding":
+      return "Unresolved finding at this head";
+    case "carried_finding":
+      return "Unresolved finding carried from an earlier head";
+    case "not_evaluated":
+      // "independent" carries the self-attested case (BLO-34316), where a
+      // comment DOES attest this head — the author's own. Saying "no
+      // comment-shaped review attests this head" there would be false, which is
+      // the same laundering one level down from the green it replaces. The
+      // summary (`verdict.reason`) names which of the two it was.
+      return "Not evaluated — no independent comment-shaped review attests this head";
+  }
 }
 
 /**
  * A green status published under a `review/`-prefixed context reads as "this
  * head was reviewed and was clean". For the `not_evaluated` outcome that
  * reading is false, and no state can fix it: `pending`/`failure` on absence
- * would deadlock every formally-reviewed PR. The only remedy is to publish
- * outside the `review/` namespace, which is a branch-protection-coupled
- * change. Until then this predicate names the condition so it can be asserted
- * against and logged rather than silently shipped (BLO-29711).
+ * would deadlock every formally-reviewed PR. The remedy is to publish outside
+ * the `review/` namespace — done for the Blockcast deployment, whose live
+ * context is now `gate/ally-comment-findings`. This predicate stays as the
+ * assertion point so a future config change cannot silently move the gate back
+ * under `review/` (BLO-29711).
+ *
+ * Note this only ever described the *status* surface. Renaming stopped the
+ * misreading for a reader who inspects the namespace, not for one who reads the
+ * colour; the check-run's `neutral` conclusion is what addresses the colour
+ * (BLO-33657).
  */
 export function commentReviewGateVerdictIsMisreadable(
   verdict: CommentReviewGateVerdict,
@@ -256,15 +577,120 @@ export function commentReviewGateVerdictIsMisreadable(
   );
 }
 
+/**
+ * Contexts to supersede with a retirement pointer, given the live context.
+ *
+ * The live context is excluded even if an operator also lists it as retired:
+ * writing a retirement pointer over the verdict we just published would
+ * replace a real `failure` with a green, which is the exact fail-open this
+ * issue exists to remove.
+ */
+export function retiredCommentReviewGateContexts(
+  retired: readonly string[] | null | undefined,
+  liveContext: string,
+): string[] {
+  const live = liveContext.trim().toLowerCase();
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const raw of retired ?? []) {
+    const context = raw?.trim();
+    if (!context) continue;
+    const key = context.toLowerCase();
+    if (key === live || seen.has(key)) continue;
+    seen.add(key);
+    result.push(context);
+  }
+  return result;
+}
+
+// GitHub truncates commit-status descriptions at 140 characters. The pointer to
+// the live context is the entire value of a retirement write, so fall back to a
+// shorter phrasing rather than letting the context name be cut in half.
+const MAX_COMMIT_STATUS_DESCRIPTION = 140;
+
+/**
+ * Description for a superseded context. Deliberately carries no claim about
+ * whether anything reviewed the head — that claim under a `review/`-prefixed
+ * green is the defect (BLO-29711) — only a pointer to where the verdict now
+ * lives. `scripts/check-comment-review-gate-census.mjs` flags a green `review/`
+ * status whose description admits nothing was evaluated; this text must not
+ * match that pattern.
+ *
+ * The blocking phrasing exists because the retirement write mirrors the live
+ * state (see `supersedeRetiredContexts`). A red row whose description only said
+ * "retired" would read as the retirement itself having failed.
+ */
+export function commentReviewGateRetirementDescription(
+  liveContext: string,
+  state: CommentReviewGateVerdict["state"] = "success",
+): string {
+  const target = liveContext.trim();
+  const renderShort = (name: string) =>
+    state === "failure"
+      ? `Retired. Unresolved finding; see "${name}".`
+      : `Retired. Findings now publish to "${name}".`;
+  const full =
+    state === "failure"
+      ? `Retired. Unresolved finding stands; "${target}" carries the verdict.`
+      : `Retired. Comment-shaped review findings now publish to "${target}".`;
+  if (full.length <= MAX_COMMIT_STATUS_DESCRIPTION) return full;
+  const short = renderShort(target);
+  if (short.length <= MAX_COMMIT_STATUS_DESCRIPTION) return short;
+  // Both phrasings overflow, so the context name itself is what is long.
+  // Elide the NAME rather than slicing the rendered sentence: a blind slice
+  // cuts the name mid-token and drops the closing quote, which is exactly the
+  // "cut in half" outcome the fallback exists to avoid. Unreachable with
+  // today's names; pinned by test so it stays true if a name grows.
+  const budget = MAX_COMMIT_STATUS_DESCRIPTION - renderShort("").length - 1;
+  if (budget <= 0) return short.slice(0, MAX_COMMIT_STATUS_DESCRIPTION);
+  return renderShort(`${target.slice(0, budget)}…`);
+}
+
+/**
+ * The status row to write over a retired context, given the live verdict.
+ *
+ * Split out as a pure function so the mirroring invariant is testable without
+ * standing up the GitHub client: "a blocking live verdict never produces a
+ * green retirement row" is the property that keeps a still-required legacy
+ * context from being satisfied while the live one blocks. See
+ * `supersedeRetiredContexts` for why that case is reachable.
+ */
+export function commentReviewGateRetirementStatus(
+  liveContext: string,
+  verdict: Pick<CommentReviewGateVerdict, "state">,
+): { state: CommentReviewGateVerdict["state"]; description: string } {
+  return {
+    state: verdict.state,
+    description: commentReviewGateRetirementDescription(liveContext, verdict.state),
+  };
+}
+
 export type PrCommentReviewGateCheckResult =
   | { posted: true; verdict: CommentReviewGateVerdict }
-  | { posted: false; reason: "not_configured" | "fetch_failed" | "post_failed"; postFailure?: string };
+  | {
+      posted: false;
+      reason: "not_configured" | "fetch_failed" | "post_failed" | "retirement_failed";
+      postFailure?: string;
+      retirementDeliveries?: Array<{
+        sha: string;
+        context: string;
+        state: CommentReviewGateVerdict["state"];
+        description: string;
+        targetUrl: string | null;
+      }>;
+    };
 
 export interface PrCommentReviewGateCheckInput {
   repoFullName: string;
   prNumber: number;
   headSha?: string | null;
   prUrl?: string | null;
+  // Required, not optional. This handle is the only cross-process boundary
+  // serializing evaluations of one head: the in-process `gateEvaluationChains`
+  // map below does not span API pods. When it was optional, any caller that
+  // forgot it silently got the unsynchronized path and re-opened the
+  // out-of-order-verdict race. Test injection passes a stub.
+  db: Db;
 }
 
 const TRANSIENT_RETRY_DELAYS_MS = [250, 1000];
@@ -315,6 +741,19 @@ export async function runPrCommentReviewGateCheck(
   const context = config.prCommentReviewGateStatusContext.trim();
   if (!context) return { posted: false, reason: "not_configured" };
 
+  // Fail closed rather than evaluating unsynchronized. `db` is required by the
+  // type, but this module is reachable from JS callers and from tests that are
+  // excluded from `tsc`, so the invariant needs a runtime edge too. Publishing
+  // a verdict without the cross-process lock is the out-of-order-write bug this
+  // gate already had once; refusing to publish is the recoverable direction,
+  // because the next webhook for this head re-evaluates.
+  if (!input.db) {
+    throw new Error(
+      "runPrCommentReviewGateCheck requires `db`: it is the cross-process lock that keeps a " +
+        "stale verdict from overwriting a newer one. Pass the request's database handle.",
+    );
+  }
+
   const key = `${input.repoFullName}#${input.prNumber}#${context}`;
   return serializeGateEvaluation(key, () => executeCommentReviewGateCheck(input, context, config));
 }
@@ -346,51 +785,245 @@ async function executeCommentReviewGateCheck(
     ));
   if (!headSha) return { posted: false, reason: "fetch_failed" };
 
-  // Both surfaces, because Ally uses whichever is available to it: a
-  // `COMMENTED` pull_request_review on `/pulls/{n}/reviews`, or a plain issue
-  // comment. Measured over the 25 most recent PRs in this repo, 33 of 33
-  // consolidated reviews were reviews-API objects and none were issue
-  // comments, so reading only the latter made this gate structurally unable to
-  // observe a review (BLO-29711). Either surface failing to read leaves the
-  // prior status untouched rather than publishing a verdict from half the
-  // history.
-  const [issueComments, prReviews] = await Promise.all([
-    withBoundedRetry(
-      () => githubListIssueCommentsWithTimestamps({ repoFullName: input.repoFullName, prNumber: input.prNumber }),
-      (result) => result == null,
-    ),
-    withBoundedRetry(
-      () => githubListPrReviewsWithTimestamps({ repoFullName: input.repoFullName, prNumber: input.prNumber }),
-      (result) => result == null,
-    ),
-  ]);
-  if (issueComments == null || prReviews == null) return { posted: false, reason: "fetch_failed" };
+  const publish = async (): Promise<PrCommentReviewGateCheckResult> => {
+    // Both surfaces, because Ally uses whichever is available to it: a
+    // `COMMENTED` pull_request_review on `/pulls/{n}/reviews`, or a plain issue
+    // comment. Read and evaluate them inside the shared lock. Otherwise two
+    // API pods can compute against different snapshots and publish an older
+    // verdict after a newer one (BLO-29711).
+    const [issueComments, prReviews] = await Promise.all([
+      withBoundedRetry(
+        () => githubListIssueCommentsWithTimestamps({ repoFullName: input.repoFullName, prNumber: input.prNumber }),
+        (result) => result == null,
+      ),
+      withBoundedRetry(
+        () => githubListPrReviewsWithTimestamps({ repoFullName: input.repoFullName, prNumber: input.prNumber }),
+        (result) => result == null,
+      ),
+    ]);
+    if (issueComments == null || prReviews == null) return { posted: false, reason: "fetch_failed" };
 
-  const verdict = evaluateCommentReviewGate({
-    comments: [...issueComments, ...prReviews].map((comment) => ({
+    const comments = [...issueComments, ...prReviews].map((comment) => ({
       authorLogin: comment.login,
       body: comment.body,
       createdAt: comment.createdAt,
-    })),
-    headSha,
-    reviewerBotLogin,
-  });
+    }));
 
-  warnOnceIfMisreadableContext(verdict, context);
+    // Evaluate author-blind FIRST. Only `clean` reads the author, and both red
+    // outcomes stand on the comment surfaces alone — so fetching the author up
+    // front made an unreadable `GET /pulls/{n}` suppress a `blocking_finding`
+    // or `carried_finding` that was already fully justified, leaving the merge
+    // surface showing that finding as absent rather than red. A red going
+    // silent is the direction this module must not get wrong.
+    let verdict = evaluateCommentReviewGate({ comments, headSha, reviewerBotLogin, prAuthorLogin: null });
 
-  const posted = await withBoundedRetry<GitHubCommitStatusPostResult>(
-    () =>
-      githubPostCommitStatusDetailed({
-        repoFullName: input.repoFullName,
-        sha: headSha,
-        context,
-        state: verdict.state,
-        description: verdict.reason,
-        targetUrl: input.prUrl ?? null,
-      }),
-    (result) => !result.ok && result.retryable,
+    // `authorUnknown` marks every outcome the author could still change, which
+    // is both the withheld positive and the carried finding that consumed it —
+    // gating on the OUTCOME instead would never fetch on the carried route, and
+    // `clean` is unreachable on the author-blind pass by construction.
+    if ("authorUnknown" in verdict && verdict.authorUnknown) {
+      const prAuthorLogin = await withBoundedRetry(
+        () => githubFetchPrAuthorLogin({ repoFullName: input.repoFullName, prNumber: input.prNumber }),
+        (login) => login == null,
+      );
+      if (prAuthorLogin) {
+        verdict = evaluateCommentReviewGate({ comments, headSha, reviewerBotLogin, prAuthorLogin });
+      } else if (verdict.state === "success") {
+        // Publishing `neutral` on incomplete evidence would overwrite a correct
+        // earlier verdict with a weaker one on a transient 5xx. Not publishing
+        // leaves it standing, and the next webhook re-evaluates.
+        return { posted: false, reason: "fetch_failed" };
+      }
+      // A `failure` stands on the comment surfaces alone — the author can only
+      // ever soften it — so it publishes even with the author unread. Going
+      // silent there is the direction this module must not get wrong.
+    }
+
+    warnOnceIfMisreadableContext(verdict, context);
+    const posted = await withBoundedRetry<GitHubCommitStatusPostResult>(
+      () =>
+        githubPostCommitStatusDetailed({
+          repoFullName: input.repoFullName,
+          sha: headSha,
+          context,
+          state: verdict.state,
+          description: verdict.reason,
+          targetUrl: input.prUrl ?? null,
+        }),
+      (result) => !result.ok && result.retryable,
+    );
+    if (!posted.ok) return { posted: false, reason: "post_failed", postFailure: posted.reason };
+
+    await publishCheckRunMirror(input, headSha, context, verdict);
+
+    const retirementFailures = await supersedeRetiredContexts(input, headSha, context, config, verdict);
+    if (retirementFailures.length > 0) {
+      // NOT "post_failed": the live status published successfully at line 643
+      // above, and only the retired-context cleanup did not. Reporting this as
+      // a post failure states the opposite of what happened for the field that
+      // matters most. `retirementDeliveries` used to be the sole discriminator
+      // between the two, which is easy to get wrong from outside — a distinct
+      // reason makes both states self-describing.
+      return {
+        posted: false,
+        reason: "retirement_failed",
+        postFailure: retirementFailures.map((failure) => `${failure.context}: ${failure.reason}`).join(", "),
+        retirementDeliveries: retirementFailures.map((failure) => ({
+          sha: headSha,
+          context: failure.context,
+          state: failure.state,
+          description: failure.description,
+          targetUrl: input.prUrl ?? null,
+        })),
+      };
+    }
+
+    return { posted: true, verdict };
+  };
+
+  // Serialize evidence reads, verdict computation, and all status writes with
+  // forced retries. The transaction-scoped lock is the cross-process boundary,
+  // and it is unconditional: `db` is required precisely so there is no
+  // unsynchronized fall-through for a caller to reach by omission.
+  return withGithubStatusDeliveryLock(input.db, `${input.repoFullName}#${headSha}`, publish);
+}
+
+/**
+ * Publish the same verdict as a check-run, alongside the commit status.
+ *
+ * Dual-emit, not a replacement. The status context may still be a required
+ * check somewhere, and this code cannot read branch protection to find out —
+ * the App gets 403 on that endpoint — so dropping it could strand every PR in a
+ * repo that requires it. The status keeps its existing states; the check-run
+ * adds the `neutral` conclusion that the status surface cannot express.
+ *
+ * Best-effort, and deliberately so: the verdict is already published on the
+ * status surface by the time this runs, and the added value here is legibility,
+ * not enforcement. Failing the whole check because the check-run write was
+ * refused would turn a *better* signal into an outage of the working one — most
+ * likely on exactly the deployments whose installation lacks `checks: write`,
+ * since that permission is independent of `statuses: write`. Logged once per
+ * repo so a missing grant is diagnosable without a log flood.
+ */
+const checkRunWriteWarnings = new Set<string>();
+
+async function publishCheckRunMirror(
+  input: PrCommentReviewGateCheckInput,
+  headSha: string,
+  context: string,
+  verdict: CommentReviewGateVerdict,
+): Promise<void> {
+  let reason: string;
+  try {
+    const result = await withBoundedRetry<GitHubCommitStatusPostResult>(
+      () =>
+        githubPostCheckRun({
+          repoFullName: input.repoFullName,
+          sha: headSha,
+          name: context,
+          conclusion: commentReviewGateCheckConclusion(verdict),
+          title: commentReviewGateCheckTitle(verdict),
+          summary: verdict.reason,
+          detailsUrl: input.prUrl ?? null,
+        }),
+      (attempt) => !attempt.ok && attempt.retryable,
+    );
+    if (result.ok) return;
+    reason = result.reason;
+  } catch (error) {
+    // "Best-effort" has to mean it too. `githubPostCheckRun` returns a
+    // classified result rather than throwing, but it can still throw for
+    // reasons outside its own error handling — an unmocked export under test,
+    // a module that failed to load. Letting that escape would reject the whole
+    // publish and lose the commit status that was already written, which is the
+    // exact "a better signal takes out the working one" outcome this function
+    // is structured to avoid.
+    reason = error instanceof Error ? error.message : String(error);
+  }
+  if (checkRunWriteWarnings.has(input.repoFullName)) return;
+  checkRunWriteWarnings.add(input.repoFullName);
+  console.warn(
+    `[pr-comment-review-gate] Could not publish the "${context}" check-run on ${input.repoFullName}: ` +
+      `${reason}. The commit status is still authoritative, but "not evaluated" and ` +
+      `"reviewed clean" both render green there — the check-run is what separates them. ` +
+      "A 403 here means the installation is missing `checks: write` (BLO-33657).",
   );
-  if (!posted.ok) return { posted: false, reason: "post_failed", postFailure: posted.reason };
+}
 
-  return { posted: true, verdict };
+/**
+ * Overwrite each retired context with a pointer to the live one.
+ *
+ * Why this is code in the gate rather than a one-shot sweep. GitHub's Commit
+ * Statuses API has create and list but no delete, so renaming the context
+ * cannot retract what was already written under the old name: every head that
+ * carries the old fail-open green keeps carrying it. Measured 2026-08-22, 42 of
+ * 43 open PRs in Blockcast/penstock-llm-proxy-core were in exactly that state.
+ * Only the credential that wrote those rows can overwrite them — the App's own
+ * installation token, the one used here — so an operator script cannot do it.
+ * Riding the gate's existing evaluations reaches each PR the next time it is
+ * evaluated, with no sweep and no human chore.
+ *
+ * State mirrors the live verdict rather than being a fixed `success`. A retired
+ * context is not necessarily a powerless one: an operator may still have it in
+ * required checks while the new context is not yet required (BLO-26602 is
+ * exactly that migration), and this code cannot see branch protection to find
+ * out — the App gets 403 on that endpoint. An unconditional green would then
+ * satisfy the still-required legacy check while the live context reports a
+ * blocking finding, letting a PR with unresolved Critical/Important findings
+ * merge: the same fail-open this issue exists to remove, reintroduced through
+ * the cleanup path. Mirroring costs nothing where the context is already
+ * non-required (the row is informational either way) and preserves the block
+ * where it is not. It also never paints a PR red that the live context is not
+ * already painting red, which was the original argument for a fixed `success`.
+ *
+ * Best-effort by construction: the live verdict is already published, and
+ * failing the check over cleanup of a superseded row would let a retired
+ * context break the live one.
+ */
+async function supersedeRetiredContexts(
+  input: PrCommentReviewGateCheckInput,
+  headSha: string,
+  liveContext: string,
+  config: ReturnType<typeof loadConfig>,
+  verdict: CommentReviewGateVerdict,
+): Promise<Array<{ context: string; reason: string; state: CommentReviewGateVerdict["state"]; description: string }>> {
+  const retiredContexts = retiredCommentReviewGateContexts(
+    config.prCommentReviewGateRetiredStatusContexts,
+    liveContext,
+  );
+  if (retiredContexts.length === 0) return [];
+
+  const retirement = commentReviewGateRetirementStatus(liveContext, verdict);
+  const failures = await Promise.all(
+    retiredContexts.map(async (retiredContext) => {
+      const post = () =>
+        withBoundedRetry<GitHubCommitStatusPostResult>(
+          () =>
+            githubPostCommitStatusDetailed({
+              repoFullName: input.repoFullName,
+              sha: headSha,
+              context: retiredContext,
+              state: retirement.state,
+              description: retirement.description,
+              targetUrl: input.prUrl ?? null,
+            }),
+          (attempt) => !attempt.ok && attempt.retryable,
+        );
+      const result = await post();
+      if (!result.ok) {
+        console.warn(
+          `[pr-comment-review-gate] Could not supersede retired context "${retiredContext}" on ` +
+            `${input.repoFullName}@${headSha.slice(0, 7)}: ${result.reason}. Queuing a durable retry.`,
+        );
+        return {
+          context: retiredContext,
+          reason: result.reason,
+          state: retirement.state,
+          description: retirement.description,
+        };
+      }
+      return null;
+    }),
+  );
+  return failures.filter((failure): failure is NonNullable<typeof failure> => failure !== null);
 }

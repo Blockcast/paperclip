@@ -26,6 +26,7 @@ import {
 } from "../services/heartbeat.js";
 import {
   recoveryService,
+  STALE_ACTIVE_RUN_EVALUATION_ESCALATION_MIN_SPAN_MS,
   STALE_ACTIVE_RUN_EVALUATION_ESCALATION_THRESHOLD,
   STALE_ACTIVE_RUN_EVALUATION_REFIRE_COMMENT_MARKER,
   STALE_ACTIVE_RUN_EVALUATION_REFIRE_COOLDOWN_MS,
@@ -1355,6 +1356,179 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     expect(followup.existing).toBe(1);
     expect(followup.reopened).toBe(0);
     expect(followup.created).toBe(0);
+  });
+
+  // PEN-2432: the escalation window is a LOOKBACK BOUND, not a required span,
+  // so a raw count let a burst satisfy "N fires in 6h". Production burst on
+  // PEN-2392: four fires at 03:43:56 / 03:44:04 / 03:44:07 / 03:44:51 — all
+  // inside 55s. The escalation text then claimed the run was "NOT draining on
+  // its own", which is a persistence claim a count cannot evidence.
+  it("does not escalate on a burst of re-fires seconds apart (PEN-2432)", async () => {
+    const t0 = new Date("2026-05-24T12:00:00.000Z");
+    const { companyId } = await seedRunningRun({
+      now: t0,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+
+    await heartbeat.scanSilentActiveRuns({ now: t0, companyId });
+    const [wrapper] = await getStaleRunWrappers(companyId);
+    const closedAt = new Date(t0.getTime() + 60_000);
+    await db
+      .update(issues)
+      .set({ status: "done", completedAt: closedAt, updatedAt: closedAt })
+      .where(eq(issues.id, wrapper!.id));
+
+    // Reproduce the PEN-2392 shape: one more fire than the threshold, all of
+    // them inside a minute. The COUNT alone is past the threshold.
+    const burstOffsetsMs = [1_000, 9_000, 12_000, 56_000];
+    let escalated = 0;
+    let suppressed = 0;
+    for (const offset of burstOffsetsMs) {
+      const r = await heartbeat.scanSilentActiveRuns({
+        now: new Date(closedAt.getTime() + offset),
+        companyId,
+      });
+      escalated += r.reopened;
+      suppressed += r.suppressed;
+    }
+    expect(suppressed).toBe(burstOffsetsMs.length);
+    expect(escalated).toBe(0);
+
+    // The count precondition really was satisfied — so it is the SPACING, not a
+    // short count, that held the escalation back. Without this the assertion
+    // above would also pass if the fires had simply never been tallied.
+    const tallies = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, wrapper!.id))
+      .then((rows) =>
+        rows.filter((c) => c.body.startsWith(STALE_ACTIVE_RUN_EVALUATION_REFIRE_COMMENT_MARKER)),
+      );
+    expect(tallies.length).toBeGreaterThanOrEqual(
+      STALE_ACTIVE_RUN_EVALUATION_ESCALATION_THRESHOLD,
+    );
+    // Suppression must also not have spawned wrapper #N+1 behind our backs.
+    const duringBurst = await getStaleRunWrappers(companyId);
+    expect(duringBurst).toHaveLength(1);
+    expect(duringBurst[0]?.status).toBe("done");
+
+    // Control: hold the count fixed and let only wall clock advance past the
+    // minimum span. The same wedge now escalates, proving the gate is spacing
+    // and not a permanent block.
+    const afterSpan = new Date(
+      closedAt.getTime() + burstOffsetsMs[0]! + STALE_ACTIVE_RUN_EVALUATION_ESCALATION_MIN_SPAN_MS + 60_000,
+    );
+    const escalation = await heartbeat.scanSilentActiveRuns({ now: afterSpan, companyId });
+    expect(escalation.reopened).toBe(1);
+  });
+
+  it("reports the measured span, not the window constant, when it escalates (PEN-2432)", async () => {
+    const t0 = new Date("2026-05-24T12:00:00.000Z");
+    const { companyId } = await seedRunningRun({
+      now: t0,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    await heartbeat.scanSilentActiveRuns({ now: t0, companyId });
+    const [wrapper] = await getStaleRunWrappers(companyId);
+
+    const body = await driveToReopen(companyId, wrapper!.id, t0);
+
+    // driveToReopen spaces fires 10 min apart, so the first tally lands at
+    // closedAt+10m and the escalating fire at closedAt+40m: a 30m span.
+    expect(body).toContain("spanning 30m");
+    // The old text asserted the 6h CONSTANT as though it were measured.
+    expect(body).not.toContain("all inside a 6h window");
+    expect(body).not.toMatch(/spanning\s+6h/);
+  });
+
+
+  // PEN-2432: paperclip records pid/process-group only when IT spawned the
+  // process. Adapters that spawn their own client never populate them — null on
+  // 12/12 recent Summarizer runs INCLUDING all 9 that succeeded — so rendering
+  // "pid `unknown` … in-memory handle `no`" reads as evidence the process died
+  // while carrying none.
+  it("labels the process-metadata block non-diagnostic when none was recorded (PEN-2432)", async () => {
+    const t0 = new Date("2026-05-24T12:00:00.000Z");
+    const { companyId, runId } = await seedRunningRun({
+      now: t0,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      agentAdapterType: "claude_local",
+    });
+    // Reproduce the real claude_local shape. persistRunProcessMetadata writes
+    // pid/group/startedAt together and never runs on this path, so all three are
+    // null in production; the shared fixture backfills processStartedAt, which
+    // no acpx-spawned run ever has.
+    await db
+      .update(heartbeatRuns)
+      .set({ processPid: null, processGroupId: null, processStartedAt: null })
+      .where(eq(heartbeatRuns.id, runId));
+
+    await heartbeat.scanSilentActiveRuns({ now: t0, companyId });
+    const [wrapper] = await getStaleRunWrappers(companyId);
+
+    expect(wrapper!.description).toContain("Process metadata: none recorded");
+    expect(wrapper!.description).toContain("NOT DIAGNOSTIC");
+    // The specific phrasing that read as evidence of a dead process.
+    expect(wrapper!.description).not.toContain("pid `unknown`");
+    expect(wrapper!.description).not.toContain("in-memory handle `no`");
+    // Ally review on #1739: the branch is keyed on the VALUES, so a failed
+    // metadata write and an uninstrumented new adapter land here too. It must
+    // therefore not assert an adapter capability it has not established, and
+    // must say out loud that it cannot separate the two causes — otherwise an
+    // instrumentation regression reads as expected behaviour.
+    expect(wrapper!.description).toContain(
+      "cannot tell that expected case apart from an instrumentation gap",
+    );
+    expect(wrapper!.description).not.toContain("this adapter never reports");
+    expect(wrapper!.description).not.toContain("absence is structural");
+  });
+
+  // Ally review on #1739: a PARTIALLY instrumented run must not be laundered
+  // into the "nothing was recorded" branch. persistRunProcessMetadata writes
+  // pid/group/startedAt together, so any one of them present proves the hook
+  // ran — printing the non-diagnostic label over a real recorded value would
+  // hide exactly the instrumentation defect this wording exists to preserve.
+  it("treats a partially recorded process row as real evidence (PEN-2432)", async () => {
+    const t0 = new Date("2026-05-24T12:00:00.000Z");
+    const { companyId, runId } = await seedRunningRun({
+      now: t0,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      agentAdapterType: "claude_local",
+    });
+    // Only the process group survived the write. Same adapter as the all-null
+    // test above, so this pins the VALUE keying rather than the adapter type.
+    await db
+      .update(heartbeatRuns)
+      .set({ processPid: null, processGroupId: 4200, processStartedAt: null })
+      .where(eq(heartbeatRuns.id, runId));
+
+    await heartbeat.scanSilentActiveRuns({ now: t0, companyId });
+    const [wrapper] = await getStaleRunWrappers(companyId);
+
+    expect(wrapper!.description).toContain("process group `4200`");
+    expect(wrapper!.description).not.toContain("Process metadata: none recorded");
+    expect(wrapper!.description).not.toContain("NOT DIAGNOSTIC");
+  });
+
+  it("still renders real process metadata when the adapter recorded it (PEN-2432)", async () => {
+    const t0 = new Date("2026-05-24T12:00:00.000Z");
+    const { companyId, runId } = await seedRunningRun({
+      now: t0,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    // Positive control: the branch must not blank BOTH sides. Where paperclip
+    // did spawn the process, the values are real evidence and must survive.
+    await db
+      .update(heartbeatRuns)
+      .set({ processPid: 4242, processGroupId: 4200 })
+      .where(eq(heartbeatRuns.id, runId));
+
+    await heartbeat.scanSilentActiveRuns({ now: t0, companyId });
+    const [wrapper] = await getStaleRunWrappers(companyId);
+
+    expect(wrapper!.description).toContain("pid `4242`");
+    expect(wrapper!.description).toContain("process group `4200`");
+    expect(wrapper!.description).not.toContain("NOT DIAGNOSTIC");
   });
 
   // PEN-2106: the BLO-4467 wedge is an EXTERNAL-LIFECYCLE story. These four

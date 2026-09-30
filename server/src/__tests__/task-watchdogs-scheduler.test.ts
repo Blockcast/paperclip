@@ -86,6 +86,8 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     return id;
   }
 
+  let seededIssueNumber = 0;
+
   async function seedIssue(companyId: string, overrides: Partial<typeof issues.$inferInsert> = {}) {
     const id = overrides.id ?? randomUUID();
     await db.insert(issues).values({
@@ -94,8 +96,14 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
       title: overrides.title ?? "Watched issue",
       status: overrides.status ?? "done",
       priority: overrides.priority ?? "medium",
-      identifier: overrides.identifier ?? `WDOG-${Math.floor(Math.random() * 10_000)}`,
-      issueNumber: overrides.issueNumber ?? Math.floor(Math.random() * 10_000),
+      // `issues.identifier` carries a globally unique index (`issues_identifier_idx`),
+      // so a bounded random draw collides across seeds and aborts the test with a
+      // duplicate-key error instead of a meaningful assertion failure (BLO-21802).
+      identifier: overrides.identifier ?? `WDOG-${randomUUID()}`,
+      // `issue_number` is unindexed today, so its identical 10,000-wide draw is a
+      // latent repeat of the same bug rather than a live one. Counter, not random:
+      // each test file gets its own database and `afterEach` truncates `issues`.
+      issueNumber: overrides.issueNumber ?? ++seededIssueNumber,
       parentId: overrides.parentId,
       assigneeAgentId: overrides.assigneeAgentId,
       originKind: overrides.originKind,

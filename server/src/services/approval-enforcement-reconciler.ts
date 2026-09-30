@@ -1,0 +1,1143 @@
+/**
+ * Approval-enforcement reconciler (BLO-24631).
+ *
+ * An approval records a *decision*. Nothing previously verified that the
+ * decision was ever executed against the object that actually enforces it, so
+ * a decision could be approved, read as resolved by everyone involved, and
+ * never reach the enforcing row — indefinitely, with no alert. Three confirmed
+ * instances; the expensive one (`304ea443`, a net-zero budget reallocation
+ * across 8 agents) had **zero of eight** changes applied five days after it was
+ * decided, while the agent it was meant to un-throttle climbed to 82.83% of the
+ * cap the decision would have raised.
+ *
+ * This sweep closes the loop for the machine-checkable subset: approvals whose
+ * payload carries an explicit, structured assertion about enforced state. It
+ * re-reads the enforcing object and raises a deduped issue when they disagree.
+ *
+ * Three design constraints, each of which is a recorded failure:
+ *
+ * 1. **Read the enforcing object, never a display mirror.** For budgets that is
+ *    `budget_policies.amount` — the row `budgetService`'s hard-stop gate reads
+ *    (services/budgets.ts, the `agentPolicy.hardStopEnabled && amount > 0`
+ *    check). It is emphatically NOT `agents.budget_monthly_cents`, which read
+ *    $36,800 for an agent whose enforced cap was $19,000. That column is a
+ *    mirror and is never consulted here.
+ *
+ * 2. **Parse bodies, never trust status codes.** The Paperclip API root is an
+ *    SPA catch-all that answers HTTP 200 with ~2.7 KB of HTML for *any* path,
+ *    so an unprefixed probe "succeeds" while returning no data and a real
+ *    endpoint can look identical to a typo. This reconciler sidesteps the
+ *    hazard entirely by reading the table in-process rather than over HTTP —
+ *    strictly stronger than parsing. `parseJsonBodyStrict` below exists for the
+ *    next resolver class (repo/branch settings), which will be HTTP-backed and
+ *    must not regress into status-code probing.
+ *
+ * 3. **Never throw on a malformed payload.** `approvals.payload` is free-form
+ *    jsonb — `approvalPayloadSchema` requires only `title`. Every field read
+ *    here is defensive: an unparseable assertion is skipped, not fatal, so one
+ *    bad card cannot wedge the sweep for every other card.
+ *
+ * 4. **Scope every enforcing read to the approval's company.** Following from
+ *    (3): because the payload is free-form and agent-authored, the policy ids
+ *    in it are untrusted input. An id naming a row owned by another company
+ *    must resolve to "missing", not to that company's amount — otherwise the
+ *    sweep both leaks a cross-tenant figure and raises false drift from it.
+ */
+import { createHash } from "node:crypto";
+import { and, asc, eq, inArray, isNull, lte, notInArray, sql } from "drizzle-orm";
+import type { Db } from "@paperclipai/db";
+import { agents, approvals, budgetPolicies, issues } from "@paperclipai/db";
+import { logger as defaultLogger } from "../middleware/logger.js";
+import { issueService } from "./issues.js";
+import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
+
+/** Origin kind for the issues this sweep raises; also the dedup key. */
+export const APPROVAL_ENFORCEMENT_DRIFT_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.approvalEnforcementDrift;
+
+/** Backstop index for the check-then-insert race between worker replicas. */
+const APPROVAL_ENFORCEMENT_DRIFT_UNIQUE_INDEX = "issues_active_approval_enforcement_drift_uq";
+
+export function isApprovalEnforcementDriftConflict(error: unknown): boolean {
+  const seen = new Set<object>();
+  let current: unknown = error;
+  while (current && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    const maybe = current as {
+      code?: string;
+      constraint?: string;
+      constraint_name?: string;
+      message?: string;
+      cause?: unknown;
+    };
+    if (
+      maybe.code === "23505" &&
+      (maybe.constraint === APPROVAL_ENFORCEMENT_DRIFT_UNIQUE_INDEX ||
+        maybe.constraint_name === APPROVAL_ENFORCEMENT_DRIFT_UNIQUE_INDEX ||
+        (typeof maybe.message === "string" &&
+          maybe.message.includes(APPROVAL_ENFORCEMENT_DRIFT_UNIQUE_INDEX)))
+    ) {
+      return true;
+    }
+    current = maybe.cause;
+  }
+  return false;
+}
+
+/** Approvals scanned per batch. */
+const RECONCILE_BATCH_SIZE = 200;
+
+/**
+ * How long after `decidedAt` a decision is expected to have reached the
+ * enforcing object. Below this, disagreement is "not applied *yet*" rather than
+ * drift, and raising would be noise on every freshly-approved card.
+ */
+const DEFAULT_GRACE_HOURS = 6;
+
+/**
+ * The only assertion kind implemented today. Budget policies, permission
+ * grants and repo/branch settings are the three classes worth checking; all
+ * three known incidents fall in them. Budgets are first because that is where
+ * the measured damage was.
+ */
+export const BUDGET_POLICY_AMOUNT_ASSERTION = "budget_policy_amount";
+
+export interface BudgetPolicyAmountAssertion {
+  kind: typeof BUDGET_POLICY_AMOUNT_ASSERTION;
+  policyId: string;
+  expectedAmountCents: number;
+  /**
+   * The amount the card recorded as the *starting* figure (`from_usd`), in
+   * cents, or null when the payload recorded none.
+   *
+   * Load-bearing, not decoration: it is the only thing that separates "this
+   * decision was never applied" from "it was applied and a later decision moved
+   * the figure again". See `classifyEnforcementAssertion`.
+   */
+  priorAmountCents: number | null;
+  /** Human label for the drift message (agent name); never used for matching. */
+  label: string | null;
+  /** Which payload shape this came from — surfaced in the raised issue. */
+  source: "declared" | "legacy_exact_changes";
+}
+
+export type EnforcementAssertion = BudgetPolicyAmountAssertion;
+
+export interface EnforcementDrift {
+  assertion: EnforcementAssertion;
+  /** `null` when the enforcing row is absent or inactive. */
+  actualAmountCents: number | null;
+  reason: "missing_policy" | "inactive_policy" | "amount_mismatch";
+}
+
+export interface EnforcedBudgetPolicy {
+  policyId: string;
+  amount: number;
+  isActive: boolean;
+  /**
+   * When the enforced *amount* last changed — `budget_policies.amount_updated_at`,
+   * not `updated_at`. `null` means "unknown", which is not the same as "never"
+   * — see `classifyEnforcementAssertion`, where an unknown change time
+   * downgrades to `unverifiable_mismatch` rather than guessing in either
+   * direction.
+   *
+   * It must be the amount-specific column. `updated_at` also moves for warn
+   * percent, hard stop, notify and active-state edits, so reading it here let
+   * an unrelated metadata toggle read as "a later decision moved the cap" and
+   * suppress a real enforcement gap (BLO-32796).
+   */
+  amountUpdatedAt: Date | null;
+}
+
+export interface ApprovalEnforcementReconcileResult {
+  scanned: number;
+  withAssertions: number;
+  drifted: number;
+  raised: number;
+  iterations: number;
+}
+
+export type ApprovalEnforcementReconcilerScheduler = {
+  setInterval: (callback: () => void, intervalMs: number) => ReturnType<typeof setInterval>;
+  clearInterval: (timer: ReturnType<typeof setInterval>) => void;
+};
+
+const defaultScheduler: ApprovalEnforcementReconcilerScheduler = {
+  setInterval,
+  clearInterval,
+};
+
+// ---------------------------------------------------------------------------
+// Pure layer: payload -> assertions -> drift.
+//
+// Deliberately free of DB and network access so the historical cards can be
+// replayed as fixtures (see the BLO-24631 regression test) without standing up
+// Postgres or reconstructing five-day-old enforced state.
+// ---------------------------------------------------------------------------
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function asArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+/** Non-empty trimmed string, else null. Payload fields are agent-authored. */
+function asNonEmptyString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/**
+ * Finite number from a raw payload field, accepting the numeric strings agents
+ * routinely emit ("32000", "32000.00"). Rejects NaN/Infinity so a garbage
+ * figure can never become an assertion that fires forever.
+ */
+function asFiniteNumber(value: unknown): number | null {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string") {
+    const trimmed = value.trim().replace(/^\+/, "").replace(/,/g, "");
+    if (trimmed.length === 0) return null;
+    const parsed = Number(trimmed);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+/**
+ * USD -> integer cents. `budget_policies.amount` is an integer cent count and
+ * decided figures are quoted in dollars, sometimes fractional (one historical
+ * donor figure was 30011.4). Round rather than truncate so 30011.4 -> 3001140
+ * and not 3001139.
+ */
+function usdToCents(usd: number): number {
+  return Math.round(usd * 100);
+}
+
+/** Loose uuid check — keeps obviously-nonsense policy ids out of the sweep. */
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function readAmountCents(entry: Record<string, unknown>): number | null {
+  const cents = asFiniteNumber(entry.expected_amount_cents ?? entry.expectedAmountCents);
+  if (cents !== null) return Math.round(cents);
+  const usd = asFiniteNumber(entry.expected_usd ?? entry.expectedUsd ?? entry.to_usd ?? entry.toUsd);
+  return usd === null ? null : usdToCents(usd);
+}
+
+/**
+ * The pre-decision figure, when the card recorded one.
+ *
+ * Optional by design: a payload that omits it is not malformed, it is merely
+ * unclassifiable, and `classifyEnforcementAssertion` degrades to the old
+ * two-way comparison for it rather than guessing.
+ */
+function readPriorAmountCents(entry: Record<string, unknown>): number | null {
+  const cents = asFiniteNumber(entry.from_amount_cents ?? entry.fromAmountCents);
+  if (cents !== null) return cents < 0 ? null : Math.round(cents);
+  const usd = asFiniteNumber(entry.from_usd ?? entry.fromUsd);
+  if (usd === null || usd < 0) return null;
+  return usdToCents(usd);
+}
+
+/**
+ * Extract machine-checkable assertions from an approval payload.
+ *
+ * Two accepted shapes:
+ *
+ * - **Canonical** (`payload.enforcement_assertions`) — what requesters should
+ *   emit going forward. Explicit `kind`, so new classes can be added without
+ *   guessing at prose.
+ *
+ * - **Legacy** (`payload.exact_changes`) — the ad-hoc shape the CEO agent
+ *   actually used on card `6f45844e` (`{agent, policyId, from_usd, to_usd}`).
+ *   Supported because it is what the historical cards carry, which is what
+ *   makes them usable as a regression fixture rather than a rewrite.
+ *
+ * Anything without a resolvable `policyId` + target amount is skipped. Returns
+ * `[]` for the overwhelming majority of approvals, which carry only prose —
+ * that is expected and is not an error. Duplicate policyIds are collapsed
+ * last-write-wins so a card that restates a figure cannot double-raise.
+ */
+export function extractEnforcementAssertions(payload: unknown): EnforcementAssertion[] {
+  const root = asRecord(payload);
+  if (!root) return [];
+
+  const byPolicyId = new Map<string, EnforcementAssertion>();
+
+  const push = (assertion: EnforcementAssertion) => {
+    byPolicyId.set(assertion.policyId, assertion);
+  };
+
+  for (const raw of asArray(root.enforcement_assertions ?? root.enforcementAssertions)) {
+    const entry = asRecord(raw);
+    if (!entry) continue;
+    const kind = asNonEmptyString(entry.kind);
+    if (kind !== BUDGET_POLICY_AMOUNT_ASSERTION) continue;
+    const policyId = asNonEmptyString(entry.policyId ?? entry.policy_id);
+    if (!policyId || !UUID_PATTERN.test(policyId)) continue;
+    const expectedAmountCents = readAmountCents(entry);
+    if (expectedAmountCents === null || expectedAmountCents < 0) continue;
+    push({
+      kind: BUDGET_POLICY_AMOUNT_ASSERTION,
+      policyId,
+      expectedAmountCents,
+      priorAmountCents: readPriorAmountCents(entry),
+      label: asNonEmptyString(entry.label ?? entry.agent ?? entry.scopeName),
+      source: "declared",
+    });
+  }
+
+  for (const raw of asArray(root.exact_changes ?? root.exactChanges)) {
+    const entry = asRecord(raw);
+    if (!entry) continue;
+    const policyId = asNonEmptyString(entry.policyId ?? entry.policy_id);
+    if (!policyId || !UUID_PATTERN.test(policyId)) continue;
+    const expectedAmountCents = readAmountCents(entry);
+    if (expectedAmountCents === null || expectedAmountCents < 0) continue;
+    // A declared assertion for the same policy wins: it is the explicit form.
+    if (byPolicyId.get(policyId)?.source === "declared") continue;
+    push({
+      kind: BUDGET_POLICY_AMOUNT_ASSERTION,
+      policyId,
+      expectedAmountCents,
+      priorAmountCents: readPriorAmountCents(entry),
+      label: asNonEmptyString(entry.agent ?? entry.label ?? entry.scopeName),
+      source: "legacy_exact_changes",
+    });
+  }
+
+  return [...byPolicyId.values()];
+}
+
+/** Marks a prior the server read from `budget_policies`, not one the caller stated. */
+export const SERVER_POLICY_READ_PRIOR = "server_policy_read";
+
+/**
+ * Fill in the starting figure on canonical assertions that omit one, reading it
+ * from the enforcing policy row (BLO-34008).
+ *
+ * Without a prior, `classifyEnforcementAssertion` cannot run its three-way split
+ * and answers `unverifiable_mismatch` for every disagreement — so a never-applied
+ * decision and a legitimately superseded one look identical. Both get reported,
+ * which is the safe direction, but the second is the false-positive class that
+ * filed BLO-33160, BLO-33397, BLO-33416 and BLO-33772, and the first is not
+ * auto-appliable. Recording the prior is what separates them.
+ *
+ * The obvious alternative — require the caller to state `from_usd` — is the one
+ * thing the refusal's own remediation forbids ("never invent one"), and the
+ * example payload deliberately ships without it. So callers will keep omitting
+ * it, correctly. The server does not have to guess: it holds the authoritative
+ * number already, because the assertion names the `policyId`.
+ *
+ * Deliberately narrow:
+ *   - **Only fills what is absent.** A caller who stated a prior has stated
+ *     something we should not silently overwrite; `readPriorAmountCents` already
+ *     treats a wrong one as suspect and splits on `amountUpdatedAt` instead.
+ *   - **Canonical shape only.** `exact_changes` is the legacy shape on card
+ *     `6f45844e`, which already carries `from_usd`. Rewriting a shape we are not
+ *     encouraging buys nothing.
+ *   - **Unresolvable policy is left alone.** A missing or cross-company id stays
+ *     unstamped so the reconciler still reports it as `missing_policy`, rather
+ *     than the stamp quietly making a bad id look serviceable.
+ *
+ * `from_source` records that the figure is a database read, so a later reader can
+ * tell an authoritative prior from an agent-authored one on a path that writes money.
+ */
+export function stampAssertionPriors(
+  payload: unknown,
+  policies: ReadonlyMap<string, EnforcedBudgetPolicy | null>,
+): unknown {
+  const root = asRecord(payload);
+  if (!root) return payload;
+  // Read and write the same key. Deriving the write key with `in` diverges from
+  // this read: `??` falls through a present-but-`null` `enforcement_assertions`
+  // to the camelCase array, but `in` would then pick the snake_case key — so the
+  // stamped array lands under snake_case while the camelCase one this actually
+  // read stays in place unstamped. Two arrays, one payload, on a money path.
+  const snake = root.enforcement_assertions;
+  const usesSnake = snake !== undefined && snake !== null;
+  const entries = usesSnake ? snake : root.enforcementAssertions;
+  if (!Array.isArray(entries)) return payload;
+
+  let changed = false;
+  const stamped = entries.map((raw) => {
+    const entry = asRecord(raw);
+    if (!entry) return raw;
+    if (asNonEmptyString(entry.kind) !== BUDGET_POLICY_AMOUNT_ASSERTION) return raw;
+    if (readPriorAmountCents(entry) !== null) return raw;
+    const policyId = asNonEmptyString(entry.policyId ?? entry.policy_id);
+    if (!policyId) return raw;
+    const amount = policies.get(policyId)?.amount;
+    if (typeof amount !== "number") return raw;
+    changed = true;
+    return { ...entry, from_amount_cents: amount, from_source: SERVER_POLICY_READ_PRIOR };
+  });
+
+  if (!changed) return payload;
+  const key = usesSnake ? "enforcement_assertions" : "enforcementAssertions";
+  return { ...root, [key]: stamped };
+}
+
+/**
+ * What the enforcing row says happened to one decided assertion.
+ *
+ * `superseded` is the state this enum exists for. Comparing only *decided* to
+ * *enforced* yields a boolean — agree or disagree — and "never applied" and
+ * "applied, then moved again by a later decision" both land in `disagree`.
+ * Those need opposite handling: the first is the failure BLO-24631 detects, the
+ * second is the system working, and treating the second as the first is what
+ * filed BLO-33160, BLO-33397, BLO-33416 and BLO-33772 — four issues on approval
+ * `6f45844e` in four days, each costing an adjudication run to close as "yes,
+ * superseded, do not apply".
+ *
+ * The card already records the third number needed to tell them apart: the
+ * figure the change started from. Three-way:
+ *
+ * - `enforced == decided` → **applied**.
+ * - `enforced == prior`   → **never_applied**. Nobody moved it; the decision
+ *   never landed. Real drift. (A deliberate revert back to the starting figure
+ *   reads as this too — correctly: the decision is once again unapplied.)
+ * - otherwise             → the enforced figure is neither where the decision
+ *   started nor where it said to land. `from_usd` is free-form payload text
+ *   that nothing validated when the card was written, so a *wrong* prior lands
+ *   here too — and calling that `superseded` would let a bad figure in an
+ *   untrusted field make a real enforcement gap disappear. Split it on a fact
+ *   the database owns instead of on the field under suspicion:
+ *   - `policy.amountUpdatedAt > decidedAt` → **superseded**. Something moved the
+ *     enforced figure after the decision, so a later decision put it where it
+ *     is. Re-asserting a stale figure over that is exactly the "silently
+ *     applying a five-day-old figure over whatever a human since set" hazard
+ *     this reconciler refuses.
+ *   - `policy.amountUpdatedAt <= decidedAt` → **never_applied**. The amount has
+ *     not moved since the decision, so there is no later decision to be
+ *     superseded by; the card's recorded prior was simply wrong, and the gap is
+ *     real.
+ *   - either timestamp unknown → `unverifiable_mismatch`. Reported, never
+ *     written.
+ *
+ *   Reading the *amount-specific* column is load-bearing, not a nicety. This
+ *   split first shipped against `updated_at`, and `budgetService.upsertPolicy`
+ *   is the single edit path for warn percent, hard stop, notify and active
+ *   state as well as the amount — so an operator toggling warn percent on a
+ *   policy whose approved raise never landed pushed `updated_at` past
+ *   `decidedAt`, and a real enforcement gap read as a supersession: unreported
+ *   here, and unrepairable through the apply route. The suppressing edit need
+ *   not be related to the decision at all, which is what made that inference
+ *   unsound rather than merely imprecise (BLO-32796).
+ *
+ * With no recorded prior, the three-way collapses back to the two-way and the
+ * answer is `unverifiable_mismatch` — reported as drift, because failing to
+ * report a real gap is worse than reporting a supersession we cannot rule out.
+ */
+export type AssertionEnforcementState =
+  | "applied"
+  | "never_applied"
+  | "superseded"
+  | "unverifiable_mismatch"
+  | "missing_policy"
+  | "inactive_policy";
+
+/**
+ * Was the enforced *amount* changed after the decision was made?
+ *
+ * `null` when either side is unknown or unparseable — the caller must not
+ * collapse that into `false`, which would read "we have no idea" as "the amount
+ * has not moved".
+ */
+export function policyAmountChangedAfterDecision(
+  amountUpdatedAt: Date | null,
+  decidedAt: Date | string | null,
+): boolean | null {
+  const changed = toEpochMs(amountUpdatedAt);
+  const decided = toEpochMs(decidedAt);
+  if (changed === null || decided === null) return null;
+  return changed > decided;
+}
+
+function toEpochMs(value: Date | string | null): number | null {
+  if (value === null) return null;
+  const ms = value instanceof Date ? value.getTime() : new Date(value).getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
+export function classifyEnforcementAssertion(
+  assertion: EnforcementAssertion,
+  policy: EnforcedBudgetPolicy | null,
+  decidedAt: Date | string | null,
+): AssertionEnforcementState {
+  if (!policy) return "missing_policy";
+  if (!policy.isActive) return "inactive_policy";
+  if (policy.amount === assertion.expectedAmountCents) return "applied";
+  if (assertion.priorAmountCents === null) return "unverifiable_mismatch";
+  if (policy.amount === assertion.priorAmountCents) return "never_applied";
+  const movedAfter = policyAmountChangedAfterDecision(policy.amountUpdatedAt, decidedAt);
+  if (movedAfter === null) return "unverifiable_mismatch";
+  return movedAfter ? "superseded" : "never_applied";
+}
+
+/**
+ * Compare decided assertions against enforced state.
+ *
+ * `enforced` maps policyId -> the enforcing row, or `null`/absent when no such
+ * row exists. An absent row is drift, not a skip: "the policy this decision
+ * names does not exist" is exactly as broken as a wrong figure, and silently
+ * ignoring it would reproduce the original failure mode one level down.
+ *
+ * A `superseded` assertion is deliberately NOT drift — see
+ * `classifyEnforcementAssertion`. It is the one state where the enforcing
+ * object is right and the decision is stale.
+ */
+export function diffEnforcementAssertions(
+  assertions: readonly EnforcementAssertion[],
+  enforced: ReadonlyMap<string, EnforcedBudgetPolicy | null>,
+  decidedAt: Date | string | null,
+): EnforcementDrift[] {
+  const drifts: EnforcementDrift[] = [];
+  for (const assertion of assertions) {
+    const policy = enforced.get(assertion.policyId) ?? null;
+    switch (classifyEnforcementAssertion(assertion, policy, decidedAt)) {
+      case "applied":
+      case "superseded":
+        continue;
+      case "missing_policy":
+        drifts.push({ assertion, actualAmountCents: null, reason: "missing_policy" });
+        continue;
+      case "inactive_policy":
+        drifts.push({
+          assertion,
+          actualAmountCents: policy?.amount ?? null,
+          reason: "inactive_policy",
+        });
+        continue;
+      case "never_applied":
+      case "unverifiable_mismatch":
+        drifts.push({
+          assertion,
+          actualAmountCents: policy?.amount ?? null,
+          reason: "amount_mismatch",
+        });
+        continue;
+    }
+  }
+  return drifts;
+}
+
+/**
+ * Stable identity of a *drift state* — which policies disagree, and how.
+ *
+ * Distinct from `originId` (the approval) because those two answer different
+ * questions, and conflating them is what produced the re-file loop below.
+ *
+ * A decision is a statement about one moment; this sweep re-asserts it forever.
+ * When the owner's correct disposition is "superseded, do not apply" — the AC's
+ * own first bullet — the disagreement never goes away, so every later pass sees
+ * drift, finds no *open* issue, and files a fresh one. Measured on approval
+ * `6f45844e`: BLO-33160 was closed `done` at 2026-09-11T21:34:36Z after a full
+ * adjudication and BLO-33397 was raised from the identical state **44 minutes
+ * later**, costing a CEO run and a CTO run per cycle to re-derive the same
+ * answer.
+ *
+ * Suppressing on *any* closed issue would be the wrong repair: the partial
+ * unique index (migrations/0240) is scoped to the open population precisely so a
+ * genuine later recurrence can file fresh, and that is worth keeping. The
+ * missing distinction is not open-vs-closed but **changed-vs-unchanged**, and
+ * only the enforced state can tell those apart. So: adjudicating a drift state
+ * silences that state, and any movement in it — a different amount, a policy
+ * going missing or inactive — is a new state that files again.
+ *
+ * Sorted so map iteration order cannot change the digest, and keyed on the
+ * enforced side as well as the decided side so reverting an applied figure back
+ * to an already-adjudicated one is still recognised as that same state.
+ */
+export function computeDriftFingerprint(
+  approvalId: string,
+  drifts: readonly EnforcementDrift[],
+): string {
+  const canonical = drifts
+    .map(
+      (drift) =>
+        `${drift.assertion.policyId}:${drift.reason}:${drift.assertion.expectedAmountCents}:${
+          drift.actualAmountCents ?? "none"
+        }`,
+    )
+    .sort()
+    .join("|");
+  return `${approvalId}:${createHash("sha256").update(canonical).digest("hex").slice(0, 16)}`;
+}
+
+/**
+ * Guard for HTTP-backed resolvers (none today; repo/branch settings next).
+ *
+ * The API root answers 200-with-HTML for any path, so `res.ok` proves nothing
+ * about whether the route exists. Requires a JSON content-type AND a body that
+ * parses to an object/array. Never call `res.json()` behind a bare status check.
+ */
+export function parseJsonBodyStrict(
+  status: number,
+  contentType: string | null,
+  body: string,
+): { ok: true; value: unknown } | { ok: false; reason: string } {
+  if (status < 200 || status >= 300) return { ok: false, reason: `http_${status}` };
+  if (!contentType || !/^application\/(?:[\w.+-]+\+)?json\b/i.test(contentType)) {
+    return { ok: false, reason: `non_json_content_type:${contentType ?? "none"}` };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return { ok: false, reason: "unparseable_json_body" };
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    return { ok: false, reason: "json_body_not_object" };
+  }
+  return { ok: true, value: parsed };
+}
+
+// ---------------------------------------------------------------------------
+// DB layer.
+// ---------------------------------------------------------------------------
+
+type ApprovalCandidate = {
+  id: string;
+  companyId: string;
+  type: string;
+  payload: unknown;
+  requestedByAgentId: string | null;
+  requestedByUserId: string | null;
+  decidedAt: Date | string | null;
+};
+
+/**
+ * Read the enforcing rows for one company. Selects `budget_policies` by
+ * primary key *and* `company_id` — see constraint (1) in the file header on why
+ * the agents-table mirror must not be substituted here, and constraint (4) on
+ * why the company filter is load-bearing rather than redundant.
+ *
+ * A policy id naming a row owned by another company resolves to `null` (i.e.
+ * `missing_policy`), which is the correct reading: from this approval's
+ * company, the policy it names does not exist.
+ */
+export async function loadEnforcedBudgetPolicies(
+  db: Pick<Db, "select">,
+  companyId: string,
+  policyIds: readonly string[],
+): Promise<Map<string, EnforcedBudgetPolicy | null>> {
+  const unique = [...new Set(policyIds)];
+  const result = new Map<string, EnforcedBudgetPolicy | null>();
+  for (const policyId of unique) result.set(policyId, null);
+  if (unique.length === 0) return result;
+
+  const rows = await db
+    .select({
+      policyId: budgetPolicies.id,
+      amount: budgetPolicies.amount,
+      isActive: budgetPolicies.isActive,
+      amountUpdatedAt: budgetPolicies.amountUpdatedAt,
+    })
+    .from(budgetPolicies)
+    .where(and(eq(budgetPolicies.companyId, companyId), inArray(budgetPolicies.id, unique)));
+
+  for (const row of rows) {
+    result.set(row.policyId, {
+      policyId: row.policyId,
+      amount: row.amount,
+      isActive: row.isActive,
+      amountUpdatedAt: row.amountUpdatedAt,
+    });
+  }
+  return result;
+}
+
+function formatUsd(cents: number): string {
+  return `$${(cents / 100).toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
+}
+
+function describeDrift(drift: EnforcementDrift): string {
+  const { assertion } = drift;
+  const who = assertion.label ? `${assertion.label} ` : "";
+  const decided = formatUsd(assertion.expectedAmountCents);
+  switch (drift.reason) {
+    case "missing_policy":
+      return `- ${who}\`${assertion.policyId}\` — decided **${decided}**, but no budget policy with that id exists.`;
+    case "inactive_policy":
+      return `- ${who}\`${assertion.policyId}\` — decided **${decided}**, but the policy is **inactive** (enforced amount ${formatUsd(drift.actualAmountCents ?? 0)}); an inactive policy enforces nothing.`;
+    case "amount_mismatch":
+      return `- ${who}\`${assertion.policyId}\` — decided **${decided}**, enforced **${formatUsd(drift.actualAmountCents ?? 0)}**.`;
+  }
+}
+
+function buildDriftIssueBody(input: {
+  approvalId: string;
+  approvalTitle: string | null;
+  decidedAt: Date | string | null;
+  drifts: EnforcementDrift[];
+  assertionCount: number;
+}): string {
+  const decidedAtIso =
+    input.decidedAt instanceof Date
+      ? input.decidedAt.toISOString()
+      : (input.decidedAt ?? "unknown");
+  return [
+    `Approval \`${input.approvalId}\` was **approved**, but ${input.drifts.length} of ${input.assertionCount} machine-checkable assertion(s) it carries do not match the object that enforces them.`,
+    "",
+    input.approvalTitle
+      ? `> ${input.approvalTitle}\n>\n> ⚠ Quoted verbatim from the card as filed. It states the situation at **decision time** and may be months stale — re-measure any urgency it claims before acting on it.`
+      : "",
+    "",
+    `- Decided at: \`${decidedAtIso}\``,
+    `- Enforcing object: \`budget_policies.amount\` (the row the budget hard-stop gate reads)`,
+    "",
+    "## Drift",
+    ...input.drifts.map(describeDrift),
+    "",
+    "## Acceptance criteria",
+    "- Every assertion above either matches the enforcing object, or is explicitly superseded by a newer decision recorded on this issue.",
+    "",
+    "## Verifying signal",
+    "- **Either** the reconciler's next pass reports zero drift for approval " +
+      `\`${input.approvalId}\` after re-reading \`budget_policies\` — editing a mirror column will not satisfy this;`,
+    "- **or** the supersession is recorded on this issue and the issue is closed. A decision is a statement about one moment, so a drift the owner has ruled should **not** be applied will never converge to zero, and that is a legitimate close rather than a failure to finish.",
+    "",
+    "Closing on the second branch suppresses only this exact drift state. If the enforced amount later moves, that is a new state and it will be raised again.",
+    "",
+    "---",
+    "Raised automatically by the approval-enforcement reconciler (BLO-24631). An approved decision that never reaches its enforcing object is invisible to everyone: the board reads it as approved and the requester reads it as resolved.",
+  ]
+    .filter((line, index, all) => !(line === "" && all[index - 1] === ""))
+    .join("\n");
+}
+
+/**
+ * Resolve the agent that owns a drift issue whose approval has no requesting
+ * agent (BLO-24631, CEO ruling 2026-09-07).
+ *
+ * `approvals.requested_by_agent_id` is nullable — board- and system-filed cards
+ * are exactly the null case, and they are not rare: measured over 380 approved
+ * cards in the origin company, 26 (6.8%) have no requesting agent. Passing that
+ * null through to `assigneeAgentId` created an **unassigned** `todo` row, and
+ * heartbeat work selection is by assignee, so the issue had no wake path: it was
+ * raised, counted, and never worked. Worse, it then matched the dedupe path
+ * forever, so every later pass logged "drift persists, open issue already tracks
+ * it" and re-raised nothing — the reconciler reporting a drift as tracked while
+ * the enforcement gap stayed open, which is the exact silent-failure shape this
+ * file exists to detect, reproduced in its own output.
+ *
+ * `requested_by_user_id` is NOT a usable fallback: it is nullable too
+ * (schema/approvals.ts:14, and the two *separate* partial unique indexes at
+ * :38-45 each guarded on one column `IS NOT NULL` exist precisely because either
+ * may be null). Of the 380 cards above, 4 have BOTH null — and all 4 are
+ * `budget_override_required`, i.e. the budget class this reconciler checks
+ * first. Routing to the user column moves the null one column right and still
+ * strands the bullseye case. A human-only owner would also be visible but not
+ * actionable: that queue measures ~100 days deep at ~2.4 closes/day.
+ *
+ * The terminus is the CEO on remit grounds rather than convenience: a
+ * board-filed card has no owner inside the agent org, and the CEO is the org's
+ * interface to the board.
+ *
+ * The `(createdAt, id)` tie-break mirrors the established escalation-owner
+ * lookups in `recovery/service.ts` and `productivity-review.ts`, so the pick is
+ * stable across replicas when a company has more than one CEO-role row. Only
+ * the ordering is shared: those call sites select `inArray(role, ["cto","ceo"])`
+ * and this one matches `role = "ceo"` alone, because the CEO is the terminus on
+ * remit grounds — widening it to the engineering lane would re-point a
+ * board-filed card at an owner the ruling deliberately excluded. Read "mirrors"
+ * as covering the tie-break and not the role set.
+ *
+ * Deliberately NOT gated on invokability or budget: unlike those call sites,
+ * which wake an agent immediately, this only needs an assignee the heartbeat can
+ * select later — and failing the lookup suppresses the issue entirely (see the
+ * caller), so a transiently over-budget CEO must not silence drift reporting.
+ */
+async function resolveDriftIssueOwnerAgentId(db: Db, companyId: string): Promise<string | null> {
+  const [owner] = await db
+    .select({ id: agents.id })
+    .from(agents)
+    .where(and(eq(agents.companyId, companyId), eq(agents.role, "ceo")))
+    .orderBy(asc(agents.createdAt), asc(agents.id))
+    .limit(1);
+  return owner?.id ?? null;
+}
+
+async function findOpenDriftIssue(db: Db, companyId: string, approvalId: string) {
+  return db
+    .select({ id: issues.id, identifier: issues.identifier })
+    .from(issues)
+    .where(
+      and(
+        eq(issues.companyId, companyId),
+        eq(issues.originKind, APPROVAL_ENFORCEMENT_DRIFT_ORIGIN_KIND),
+        eq(issues.originId, approvalId),
+        isNull(issues.hiddenAt),
+        notInArray(issues.status, ["done", "cancelled"]),
+      ),
+    )
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+}
+
+/**
+ * A terminal drift issue recording that the owner already adjudicated *this
+ * exact* drift state.
+ *
+ * Matched on `originFingerprint`, not merely on the approval, so this suppresses
+ * only the state that was actually dispositioned. If the enforced side moves
+ * afterwards the fingerprint changes, nothing matches here, and the recurrence
+ * files a fresh issue exactly as migrations/0240 intends.
+ *
+ * `hiddenAt` is excluded for the same reason as in the open lookup: a
+ * soft-deleted row has been withdrawn from the record, so it should not go on
+ * silencing a live disagreement.
+ */
+async function findAdjudicatedDriftIssue(
+  db: Db,
+  companyId: string,
+  approvalId: string,
+  fingerprint: string,
+) {
+  return db
+    .select({ id: issues.id, identifier: issues.identifier, status: issues.status })
+    .from(issues)
+    .where(
+      and(
+        eq(issues.companyId, companyId),
+        eq(issues.originKind, APPROVAL_ENFORCEMENT_DRIFT_ORIGIN_KIND),
+        eq(issues.originId, approvalId),
+        eq(issues.originFingerprint, fingerprint),
+        isNull(issues.hiddenAt),
+        inArray(issues.status, ["done", "cancelled"]),
+      ),
+    )
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+}
+
+/**
+ * Where the previous batch stopped. Ordering is `(decidedAt, id)` descending,
+ * so the next batch wants rows strictly less than this pair.
+ *
+ * The `string` arm is defensive and unreachable today: `approvals.decidedAt` is
+ * declared in drizzle's default `date` mode (no `mode: "string"`), so the driver
+ * always hands back a `Date` and `toTimestampParam` always re-serializes at
+ * millisecond precision. The keyset is still exact, but for a narrower reason
+ * than "the round-trip is avoided" — every write to `decided_at` is a JS `Date`
+ * every `decidedAt:` write in `approvals.ts` binds a JS `Date`, and the column
+ * carries no `now()` default,
+ * so the stored values have no sub-millisecond component for that round-trip to
+ * lose.
+ *
+ * That invariant is load-bearing and sits one line away from breaking:
+ * `createdAt`/`updatedAt` on the same table both carry `.defaultNow()` and
+ * `decidedAt` is the only column there without one, so adding a SQL-side default
+ * — or backfilling with `now()` — is the natural next edit. After it, a row at
+ * `.123456` compares greater than a cursor truncated to `.123`, so it is
+ * excluded from that batch and from every later one: an approved decision
+ * silently never scanned, which is the exact failure this reconciler exists to
+ * detect. Give the column `mode: "string"` (making the string arm live) before
+ * giving it a SQL-side default.
+ */
+type ApprovalCursor = { decidedAt: Date | string; id: string };
+
+/**
+ * Cursor for the row a batch stopped on. Returns null for a null `decidedAt`,
+ * which the `lte` predicate makes unreachable but the nullable column allows.
+ */
+export function approvalCursorFrom(row: {
+  decidedAt: Date | string | null;
+  id: string;
+}): ApprovalCursor | null {
+  return row.decidedAt ? { decidedAt: row.decidedAt, id: row.id } : null;
+}
+
+/**
+ * A `Date` cannot be bound inside a raw `sql` template — that path goes to the
+ * driver directly rather than through the column's serializer, and postgres.js
+ * throws on a Date. ISO is lossless for a JS Date (both are millisecond
+ * precision); a string is already a timestamp literal and is left alone.
+ */
+function toTimestampParam(value: Date | string): string {
+  return typeof value === "string" ? value : value.toISOString();
+}
+
+/**
+ * Paginated by keyset, deliberately not by OFFSET.
+ *
+ * `decidedAt` is not unique — a card list decided in one board sitting shares a
+ * timestamp to the millisecond, and the eight-agent reallocation that motivated
+ * this whole reconciler was exactly that shape. Ordering by a non-unique column
+ * alone leaves the relative order of tied rows unspecified *per query*, so
+ * across two OFFSET-paginated queries Postgres may legally return a tied row in
+ * both batches or in neither. Neither is acceptable here: a skipped row is an
+ * approved decision that silently never gets checked, which reproduces the exact
+ * failure mode this sweep exists to detect, inside the detector.
+ *
+ * Appending the primary key makes the sort total, and seeking on the resulting
+ * `(decidedAt, id)` tuple rather than counting rows also makes the sweep immune
+ * to the set shifting underneath it: a card crossing the grace cutoff mid-sweep
+ * shifts every subsequent OFFSET by one, but moves no keyset boundary.
+ */
+export async function listCandidateApprovals(
+  db: Pick<Db, "select">,
+  cutoff: Date,
+  batchSize: number,
+  cursor: ApprovalCursor | null,
+): Promise<ApprovalCandidate[]> {
+  return db
+    .select({
+      id: approvals.id,
+      companyId: approvals.companyId,
+      type: approvals.type,
+      payload: approvals.payload,
+      requestedByAgentId: approvals.requestedByAgentId,
+      requestedByUserId: approvals.requestedByUserId,
+      decidedAt: approvals.decidedAt,
+    })
+    .from(approvals)
+    .where(
+      and(
+        eq(approvals.status, "approved"),
+        lte(approvals.decidedAt, cutoff),
+        // Row-wise comparison, so a tie on decided_at falls through to the id.
+        // Both sides are cast explicitly: the parameters are otherwise untyped
+        // inside a row constructor and Postgres will not infer them. The
+        // timestamp is serialized to ISO here because a raw `sql` template
+        // binds through the driver directly, bypassing the column serializer
+        // that would otherwise handle a Date (postgres.js rejects one outright).
+        cursor
+          ? sql`(${approvals.decidedAt}, ${approvals.id}) < (${toTimestampParam(cursor.decidedAt)}::timestamptz, ${cursor.id}::uuid)`
+          : undefined,
+      ),
+    )
+    .orderBy(sql`${approvals.decidedAt} DESC, ${approvals.id} DESC`)
+    .limit(batchSize);
+}
+
+/**
+ * One sweep: scan decided approvals, compare their assertions against the
+ * enforcing rows, and raise one deduped issue per drifted approval.
+ *
+ * Idempotent and safe from any number of replicas — the raise path re-checks
+ * for an existing open issue keyed on (companyId, originKind, originId), so a
+ * concurrent pass reuses rather than duplicates. Read-only with respect to
+ * approvals and budget policies: it never "fixes" enforced state, because
+ * silently applying a five-day-old figure over whatever a human since set is a
+ * worse failure than the one being detected.
+ */
+export async function reconcileApprovalEnforcement(
+  db: Db,
+  options: {
+    batchSize?: number;
+    graceHours?: number;
+    now?: Date;
+    logger?: typeof defaultLogger;
+  } = {},
+): Promise<ApprovalEnforcementReconcileResult> {
+  const batchSize = Math.max(1, options.batchSize ?? RECONCILE_BATCH_SIZE);
+  const graceHours = Math.max(0, options.graceHours ?? DEFAULT_GRACE_HOURS);
+  const now = options.now ?? new Date();
+  const log = options.logger ?? defaultLogger;
+  const cutoff = new Date(now.getTime() - graceHours * 60 * 60 * 1000);
+
+  let scanned = 0;
+  let withAssertions = 0;
+  let drifted = 0;
+  let raised = 0;
+  let iterations = 0;
+  let cursor: ApprovalCursor | null = null;
+
+  while (true) {
+    const candidates = await listCandidateApprovals(db, cutoff, batchSize, cursor);
+    iterations += 1;
+    if (candidates.length === 0) break;
+    scanned += candidates.length;
+
+    // Advance past the last row of this batch. `decidedAt` cannot be null here
+    // — the `lte` predicate excludes nulls — but the column is nullable, so
+    // fall back to stopping rather than seeking from a null and rescanning.
+    const last = candidates[candidates.length - 1];
+    cursor = approvalCursorFrom(last);
+    const exhausted = candidates.length < batchSize || cursor === null;
+
+    const parsed = candidates
+      .map((approval) => ({
+        approval,
+        assertions: extractEnforcementAssertions(approval.payload),
+      }))
+      .filter((entry) => entry.assertions.length > 0);
+
+    if (parsed.length > 0) {
+      withAssertions += parsed.length;
+      // Group by company before reading. A batch spans approvals from many
+      // companies, and each lookup is scoped to the owning company so a payload
+      // naming a foreign policy id cannot read another tenant's amount.
+      const byCompany = new Map<string, string[]>();
+      for (const { approval, assertions } of parsed) {
+        const ids = byCompany.get(approval.companyId) ?? [];
+        for (const assertion of assertions) ids.push(assertion.policyId);
+        byCompany.set(approval.companyId, ids);
+      }
+      const enforcedByCompany = new Map<string, Map<string, EnforcedBudgetPolicy | null>>();
+      for (const [companyId, policyIds] of byCompany) {
+        enforcedByCompany.set(companyId, await loadEnforcedBudgetPolicies(db, companyId, policyIds));
+      }
+
+      for (const { approval, assertions } of parsed) {
+        const enforced =
+          enforcedByCompany.get(approval.companyId) ??
+          new Map<string, EnforcedBudgetPolicy | null>();
+        const drifts = diffEnforcementAssertions(assertions, enforced, approval.decidedAt);
+        if (drifts.length === 0) continue;
+        drifted += 1;
+
+        const existing = await findOpenDriftIssue(db, approval.companyId, approval.id);
+        if (existing) {
+          log.info(
+            { approvalId: approval.id, issueId: existing.id, driftCount: drifts.length },
+            "approval-enforcement reconciler: drift persists, open issue already tracks it (BLO-24631)",
+          );
+          continue;
+        }
+
+        // The owner may already have adjudicated exactly this state and closed
+        // the row — "superseded by a newer decision", the AC's own first bullet.
+        // That disposition does not make the disagreement go away, so without
+        // this check the next pass re-files it indefinitely. Keyed on the drift
+        // state, so a genuine recurrence still files (see the fingerprint doc).
+        const fingerprint = computeDriftFingerprint(approval.id, drifts);
+        const adjudicated = await findAdjudicatedDriftIssue(
+          db,
+          approval.companyId,
+          approval.id,
+          fingerprint,
+        );
+        if (adjudicated) {
+          log.info(
+            {
+              approvalId: approval.id,
+              issueId: adjudicated.id,
+              issueStatus: adjudicated.status,
+              driftCount: drifts.length,
+            },
+            "approval-enforcement reconciler: drift state unchanged since the owner closed it; not re-raising (BLO-24631)",
+          );
+          continue;
+        }
+
+        const payloadRecord = asRecord(approval.payload);
+        const approvalTitle = payloadRecord ? asNonEmptyString(payloadRecord.title) : null;
+
+        // The raised issue must be *reachable*. Heartbeat work selection is by
+        // assignee, so an unassigned row is created and then never worked while
+        // the dedupe path reports it as tracked forever. See
+        // `resolveDriftIssueOwnerAgentId` for why the user column is not a
+        // usable fallback.
+        const ownerAgentId =
+          approval.requestedByAgentId ??
+          (await resolveDriftIssueOwnerAgentId(db, approval.companyId));
+        if (!ownerAgentId) {
+          // Loud failure beats a silent unreachable row: skipping leaves the
+          // drift un-deduped, so the next pass retries it once an owner exists.
+          log.error(
+            { approvalId: approval.id, companyId: approval.companyId, driftCount: drifts.length },
+            "approval-enforcement reconciler: drift detected but no owner agent could be resolved (no requesting agent and no ceo-role agent in company); issue NOT raised (BLO-24631)",
+          );
+          continue;
+        }
+
+        try {
+          const created = await issueService(db).create(approval.companyId, {
+            title: `Approved decision never reached enforcement: ${approvalTitle ?? approval.id}`,
+            description: buildDriftIssueBody({
+              approvalId: approval.id,
+              approvalTitle,
+              decidedAt: approval.decidedAt,
+              drifts,
+              assertionCount: assertions.length,
+            }),
+            status: "todo",
+            priority: "high",
+            assigneeAgentId: ownerAgentId,
+            // Provenance only. A human-filed card records its filer here and
+            // never as the sole assignee, which would be visible but not
+            // actionable. The trust flag is required: `create` otherwise
+            // discards an explicit `responsibleUserId` (issues.ts:561) so a
+            // client cannot assert an arbitrary responsible user. This sweep is
+            // the trusted server-side class — the value is read from
+            // `approvals.requested_by_user_id` in-process, never from a request
+            // body — matching `routines.ts` and `plugin-host-services.ts`.
+            responsibleUserId: approval.requestedByUserId ?? undefined,
+            trustExplicitResponsibleUserId: approval.requestedByUserId !== null,
+            originKind: APPROVAL_ENFORCEMENT_DRIFT_ORIGIN_KIND,
+            originId: approval.id,
+            originFingerprint: fingerprint,
+          });
+          raised += 1;
+          log.warn(
+            {
+              approvalId: approval.id,
+              issueId: created.id,
+              assigneeAgentId: ownerAgentId,
+              ownerFallback: approval.requestedByAgentId === null,
+              driftCount: drifts.length,
+              assertionCount: assertions.length,
+            },
+            "approval-enforcement reconciler raised drift issue: approved decision never reached its enforcing object (BLO-24631)",
+          );
+        } catch (err) {
+          if (isApprovalEnforcementDriftConflict(err)) {
+            // A concurrent replica won the race and filed the same issue.
+            // Coalesce onto it rather than retrying: the drift is now tracked.
+            log.info(
+              { approvalId: approval.id },
+              "approval-enforcement reconciler: concurrent replica already raised this drift issue (BLO-24631)",
+            );
+            continue;
+          }
+          log.error(
+            { err, approvalId: approval.id },
+            "approval-enforcement reconciler failed to raise drift issue (BLO-24631)",
+          );
+        }
+      }
+    }
+
+    if (exhausted) break;
+  }
+
+  return { scanned, withAssertions, drifted, raised, iterations };
+}
+
+/**
+ * Start the periodic sweep. Mirrors `startStrandedBlockedIssueReconciler`: run
+ * once immediately so drift surfaces without waiting a full interval, then on
+ * the configured cadence. Returns a stop function.
+ */
+export function startApprovalEnforcementReconciler(
+  db: Db,
+  intervalMs: number,
+  options: { batchSize?: number; graceHours?: number } = {},
+  scheduler: ApprovalEnforcementReconcilerScheduler = defaultScheduler,
+): () => void {
+  let inFlight: Promise<void> | null = null;
+  const runTick = () => {
+    if (inFlight) return;
+    inFlight = reconcileApprovalEnforcement(db, options)
+      .catch((err) => {
+        defaultLogger.error({ err }, "approval-enforcement reconciler sweep failed (BLO-24631)");
+      })
+      .then(() => undefined)
+      .finally(() => {
+        inFlight = null;
+      });
+  };
+
+  runTick();
+  const timer = scheduler.setInterval(runTick, intervalMs);
+  return () => scheduler.clearInterval(timer);
+}

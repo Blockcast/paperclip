@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
 import {
   agents,
   companies,
@@ -19,6 +20,7 @@ import {
   recoveryObservabilityService,
   type WeeklyRecoveryRate,
 } from "../services/recovery-observability.ts";
+import { issueRecoveryActionService } from "../services/issue-recovery-actions.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -75,24 +77,34 @@ describe("classifyRecoveryHandoff", () => {
     outcome: "restored",
     ownerAgentId: "manager",
     returnOwnerAgentId: "coder",
-    finalAssigneeAgentId: "coder",
-    finalIssueStatus: "done",
+    resolutionSnapshot: { assigneeAgentId: "coder", issueStatus: "done" },
   };
 
   it("marks a manager who kept and completed the work as owner_completed", () => {
     expect(
-      classifyRecoveryHandoff({ ...base, finalAssigneeAgentId: "manager", finalIssueStatus: "done" }),
+      classifyRecoveryHandoff({
+        ...base,
+        resolutionSnapshot: { assigneeAgentId: "manager", issueStatus: "done" },
+      }),
     ).toBe("owner_completed");
   });
 
   it("marks work returned to the original assignee as handed_back", () => {
-    expect(classifyRecoveryHandoff({ ...base, finalAssigneeAgentId: "coder" })).toBe("handed_back");
+    expect(
+      classifyRecoveryHandoff({
+        ...base,
+        resolutionSnapshot: { assigneeAgentId: "coder", issueStatus: "done" },
+      }),
+    ).toBe("handed_back");
   });
 
   it("marks work delegated to a different specialist as handed_back", () => {
-    expect(classifyRecoveryHandoff({ ...base, finalAssigneeAgentId: "other-agent" })).toBe(
-      "handed_back",
-    );
+    expect(
+      classifyRecoveryHandoff({
+        ...base,
+        resolutionSnapshot: { assigneeAgentId: "other-agent", issueStatus: "done" },
+      }),
+    ).toBe("handed_back");
   });
 
   it("marks the original agent recovering its own issue as self_recovery", () => {
@@ -103,6 +115,30 @@ describe("classifyRecoveryHandoff", () => {
 
   it("treats still-active actions as active regardless of assignee", () => {
     expect(classifyRecoveryHandoff({ ...base, status: "active" })).toBe("active");
+  });
+
+  // BLO-33600: a row resolved before the snapshot shipped has nothing durable to
+  // classify from. It must say so rather than fall through to `handed_back`,
+  // which is what an absent `finalAssigneeAgentId` used to be read as.
+  it("reports a resolved takeover with no captured snapshot as unknown", () => {
+    expect(classifyRecoveryHandoff({ ...base, resolutionSnapshot: null })).toBe("unknown");
+  });
+
+  it("still classifies the three action-row-only classes without a snapshot", () => {
+    expect(classifyRecoveryHandoff({ ...base, status: "active", resolutionSnapshot: null })).toBe(
+      "active",
+    );
+    expect(
+      classifyRecoveryHandoff({ ...base, ownerAgentId: null, resolutionSnapshot: null }),
+    ).toBe("board_owned");
+    expect(
+      classifyRecoveryHandoff({
+        ...base,
+        ownerAgentId: "coder",
+        returnOwnerAgentId: "coder",
+        resolutionSnapshot: null,
+      }),
+    ).toBe("self_recovery");
   });
 });
 
@@ -118,7 +154,7 @@ describeEmbeddedPostgres("recovery observability report", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-recovery-observability-");
     db = createDb(tempDb.connectionString);
-  }, 60_000);
+  });
 
   afterEach(async () => {
     await db.delete(issueRecoveryActions);
@@ -194,6 +230,9 @@ describeEmbeddedPostgres("recovery observability report", () => {
     returnOwnerAgentId: string | null;
     finalAssigneeAgentId: string | null;
     finalIssueStatus: string;
+    id?: string;
+    /** Omit the snapshot to simulate a row resolved before BLO-33600 shipped. */
+    captureResolutionSnapshot?: boolean;
   }) {
     const sourceIssueId = randomUUID();
     await db.insert(issues).values({
@@ -207,7 +246,7 @@ describeEmbeddedPostgres("recovery observability report", () => {
       identifier: `SRC-${input.n}`,
     });
     await db.insert(issueRecoveryActions).values({
-      id: randomUUID(),
+      id: input.id ?? randomUUID(),
       companyId: input.companyId,
       sourceIssueId,
       kind: "stranded_assigned_issue",
@@ -218,7 +257,18 @@ describeEmbeddedPostgres("recovery observability report", () => {
       previousOwnerAgentId: input.returnOwnerAgentId,
       cause: input.cause,
       fingerprint: `fp-${input.n}`,
-      evidence: { latestRunErrorCode: input.errorCode },
+      evidence: {
+        latestRunErrorCode: input.errorCode,
+        // Where the issue stood when the action resolved. `resolveActiveForIssue`
+        // writes these for real; seeded rows state them directly so the fixture
+        // is not silently classified as `unknown` (BLO-33600).
+        ...(input.captureResolutionSnapshot === false
+          ? {}
+          : {
+              resolvedAssigneeAgentId: input.finalAssigneeAgentId,
+              resolvedIssueStatus: input.finalIssueStatus,
+            }),
+      },
       nextAction: "recover",
       outcome: input.outcome,
       createdAt: input.createdAt,
@@ -376,6 +426,102 @@ describeEmbeddedPostgres("recovery observability report", () => {
     expect(strandedRouting?.escalated).toBe(1);
   });
 
+  // BLO-33600. The defect this pins: `finalAssigneeAgentId`/`finalIssueStatus`
+  // were read live off `issues`, so a resolved action's class flipped whenever
+  // the source issue moved — and because `landedElsewhere` is tested first, a
+  // later hand-back permanently masked a real `owner_completed`, deflating the
+  // very number the report exists to measure. Against the pre-fix code this test
+  // passes the first assertion and FAILS the second.
+  it("keeps a resolved action's class stable when only the source issue moves", async () => {
+    const { companyId, managerId, coderId, otherId } = await seedBaseline();
+    const sourceIssueId = randomUUID();
+
+    // The manager took the issue over and finished it: assignee == recovery owner,
+    // terminal status. That is `owner_completed`.
+    await db.insert(issues).values({
+      id: sourceIssueId,
+      companyId,
+      title: "Drift source",
+      status: "done",
+      priority: "medium",
+      assigneeAgentId: managerId,
+      issueNumber: 900,
+      identifier: "SRC-900",
+    });
+    await db.insert(issueRecoveryActions).values({
+      id: randomUUID(),
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      returnOwnerAgentId: coderId,
+      previousOwnerAgentId: coderId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "fp-900",
+      evidence: { latestRunErrorCode: "adapter_failed" },
+      nextAction: "recover",
+      outcome: null,
+      createdAt: regressionWeek,
+      updatedAt: regressionWeek,
+    });
+
+    // Resolve through the real path — this is what captures the snapshot.
+    const resolved = await issueRecoveryActionService(db).resolveActiveForIssue({
+      companyId,
+      sourceIssueId,
+      status: "resolved",
+      outcome: "restored",
+    });
+    expect(resolved).not.toBeNull();
+
+    const svc = recoveryObservabilityService(db);
+    const before = await svc.report(companyId, { now, weeks: 8 });
+    expect(before.handoff.ownerCompleted).toBe(1);
+    expect(before.handoff.handedBack).toBe(0);
+
+    // Mutate ONLY the source issue. The action row is untouched.
+    await db
+      .update(issues)
+      .set({ assigneeAgentId: otherId, status: "in_progress" })
+      .where(eq(issues.id, sourceIssueId));
+
+    const after = await svc.report(companyId, { now, weeks: 8 });
+    expect(after.handoff).toEqual(before.handoff);
+    expect(after.perCauseRouting).toEqual(before.perCauseRouting);
+  });
+
+  it("reports a pre-snapshot row as unknown rather than bucketing it as handed_back", async () => {
+    const { companyId, managerId, coderId } = await seedBaseline();
+
+    await seedRecoveryAction({
+      companyId,
+      n: 901,
+      createdAt: regressionWeek,
+      cause: "stranded_assigned_issue",
+      errorCode: "adapter_failed",
+      status: "resolved",
+      outcome: "restored",
+      ownerAgentId: managerId,
+      returnOwnerAgentId: coderId,
+      finalAssigneeAgentId: coderId,
+      finalIssueStatus: "in_progress",
+      captureResolutionSnapshot: false,
+    });
+
+    const report = await recoveryObservabilityService(db).report(companyId, { now, weeks: 8 });
+
+    expect(report.handoff.unknownTakeover).toBe(1);
+    expect(report.handoff.handedBack).toBe(0);
+    expect(report.handoff.ownerCompleted).toBe(0);
+    expect(report.handoff.otherTakeover).toBe(0);
+    // Ratios stay null: nothing was decided, so there is no denominator to report.
+    expect(report.handoff.handedBackRatio).toBeNull();
+    const routing = report.perCauseRouting.find((r) => r.cause === "stranded_assigned_issue");
+    expect(routing?.unknown).toBe(1);
+  });
+
   it("caps the reporting window so a huge `weeks` value can't over-allocate", async () => {
     const { companyId } = await seedBaseline();
 
@@ -432,10 +578,229 @@ describeEmbeddedPostgres("recovery observability report", () => {
       status: "escalated",
       ownerAgentId: managerId,
       sourceIssueIdentifier: "SRC-1",
+      nonDeliverySweepCount: 0,
+      retiringBound: null,
     });
 
     const resolved = await service.listActions(companyId, { status: "resolved" });
     expect(resolved).toHaveLength(1);
     expect(resolved[0]?.outcome).toBe("restored");
+  });
+
+  // BLO-19124: the list shipped projecting `status` and no routing class, so its
+  // consumers had to read `status` AS the outcome — the exact misread that
+  // produced "resolves 1 action in 200" company-wide, reproduced per-owner.
+  //
+  // Both rows below are `cancelled`. If `handoffClass` were an alias of `status`
+  // (or of `outcome`, also identical here) the two would be indistinguishable and
+  // this fails. The halves of the predicate have to disagree for the assertion to
+  // mean anything, so the fixture forces them to.
+  it("projects a routing class that two same-status rows can disagree on", async () => {
+    const { companyId, managerId, coderId } = await seedBaseline();
+
+    // Owner recovered its own issue: owner === returnOwner -> self_recovery.
+    await seedRecoveryAction({
+      companyId,
+      n: 1,
+      createdAt: regressionWeek,
+      cause: "stranded_assigned_issue",
+      errorCode: "adapter_failed",
+      status: "cancelled",
+      outcome: "cancelled",
+      ownerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+      finalAssigneeAgentId: coderId,
+      finalIssueStatus: "in_progress",
+    });
+    // Genuine takeover that landed back with the original agent -> handed_back.
+    await seedRecoveryAction({
+      companyId,
+      n: 2,
+      createdAt: latestWeek,
+      cause: "stranded_assigned_issue",
+      errorCode: "adapter_failed",
+      status: "cancelled",
+      outcome: "cancelled",
+      ownerAgentId: managerId,
+      returnOwnerAgentId: coderId,
+      finalAssigneeAgentId: coderId,
+      finalIssueStatus: "in_progress",
+    });
+
+    const actions = await recoveryObservabilityService(db).listActions(companyId, {
+      kind: "stranded_assigned_issue",
+      order: "asc",
+    });
+
+    expect(actions.map((a) => a.status)).toEqual(["cancelled", "cancelled"]);
+    expect(actions.map((a) => a.handoffClass)).toEqual(["self_recovery", "handed_back"]);
+    // The classifier's input comes back with its verdict, so a caller can audit
+    // the class without a second query.
+    expect(actions[1]?.resolutionSnapshot).toEqual({
+      assigneeAgentId: coderId,
+      issueStatus: "in_progress",
+    });
+  });
+
+  // BLO-33600: the class must come from the action's own evidence snapshot, never
+  // from a live read of the source issue. This row has no snapshot, so the only
+  // way to classify it non-`unknown` is to read the issue live — which is what
+  // this pins shut. The issue row it seeds is a genuine `handed_back` shape.
+  it("classifies a pre-snapshot row unknown rather than reading the issue live", async () => {
+    const { companyId, managerId, coderId } = await seedBaseline();
+
+    await seedRecoveryAction({
+      companyId,
+      n: 1,
+      createdAt: latestWeek,
+      cause: "stranded_assigned_issue",
+      errorCode: "adapter_failed",
+      status: "cancelled",
+      outcome: "cancelled",
+      ownerAgentId: managerId,
+      returnOwnerAgentId: coderId,
+      finalAssigneeAgentId: coderId,
+      finalIssueStatus: "in_progress",
+      captureResolutionSnapshot: false,
+    });
+
+    const [action] = await recoveryObservabilityService(db).listActions(companyId, {
+      kind: "stranded_assigned_issue",
+    });
+
+    expect(action?.resolutionSnapshot).toBeNull();
+    expect(action?.handoffClass).toBe("unknown");
+  });
+
+  it("agrees with the company-wide report on how a row is routed", async () => {
+    const { companyId, managerId, coderId } = await seedBaseline();
+
+    await seedRecoveryAction({
+      companyId,
+      n: 1,
+      createdAt: latestWeek,
+      cause: "stranded_assigned_issue",
+      errorCode: "adapter_failed",
+      status: "resolved",
+      outcome: "restored",
+      ownerAgentId: managerId,
+      returnOwnerAgentId: coderId,
+      finalAssigneeAgentId: managerId,
+      finalIssueStatus: "done",
+    });
+
+    const service = recoveryObservabilityService(db);
+    const [action] = await service.listActions(companyId, { kind: "stranded_assigned_issue" });
+    const report = await service.report(companyId, { now });
+    const routing = report.perCauseRouting.find((r) => r.cause === "stranded_assigned_issue");
+
+    expect(action?.handoffClass).toBe("owner_completed");
+    expect(routing?.ownerCompleted).toBe(1);
+  });
+
+  // BLO-19124: `listActions` was newest-first with `limit` hard-capped at 500 and
+  // no offset, so against a population larger than the cap the OLDEST actions
+  // were unreachable through the API by construction — the surface built to make
+  // the drain measurable could not see the legacy stock the drain is about. The
+  // cap is simulated here with `limit: 2` over 3 rows; what is asserted is the
+  // reachability of the tail, not the ordering cosmetics.
+  it("reaches the oldest actions past the limit via `offset` and `order: asc`", async () => {
+    const { companyId, managerId, coderId } = await seedBaseline();
+
+    const seedAt = async (n: number, createdAt: Date) =>
+      seedRecoveryAction({
+        companyId,
+        n,
+        createdAt,
+        cause: "stranded_assigned_issue",
+        errorCode: "adapter_failed",
+        status: "escalated",
+        outcome: null,
+        ownerAgentId: managerId,
+        returnOwnerAgentId: coderId,
+        finalAssigneeAgentId: managerId,
+        finalIssueStatus: "in_progress",
+      });
+
+    await seedAt(1, new Date("2026-06-10T00:00:00.000Z")); // oldest — the legacy tail
+    await seedAt(2, regressionWeek);
+    await seedAt(3, latestWeek); // newest
+
+    const service = recoveryObservabilityService(db);
+
+    // Default page is newest-first and stops short of the tail: this is the
+    // blindness. SRC-1 exists and is simply not reachable on this page.
+    const firstPage = await service.listActions(companyId, { limit: 2 });
+    expect(firstPage.map((a) => a.sourceIssueIdentifier)).toEqual(["SRC-3", "SRC-2"]);
+
+    // `offset` pages past the cap and reaches it.
+    const secondPage = await service.listActions(companyId, { limit: 2, offset: 2 });
+    expect(secondPage.map((a) => a.sourceIssueIdentifier)).toEqual(["SRC-1"]);
+
+    // `order: "asc"` reaches it directly, and is stable against inserts: they
+    // land at the tail of an ascending list, so paging cannot skip an old row.
+    // (Stable against inserts only — see `RecoveryActionListOptions.order` for
+    // why a status-filtered walk is still not an exact census.)
+    const oldestFirst = await service.listActions(companyId, { order: "asc", limit: 2 });
+    expect(oldestFirst.map((a) => a.sourceIssueIdentifier)).toEqual(["SRC-1", "SRC-2"]);
+
+    // `desc` stays the default for callers that pass no `order`.
+    const defaultOrder = await service.listActions(companyId, {});
+    expect(defaultOrder[0]?.sourceIssueIdentifier).toBe("SRC-3");
+  });
+
+  // BLO-19124 (Ally review on #1762): `createdAt` alone is not a total order.
+  // These sweeps touch tens of rows at a time, so ties are the normal case inside
+  // a burst, and an untied group orders database-defined — a page boundary landing
+  // inside one can repeat or drop a row between calls. The three rows below share
+  // a `createdAt` to the millisecond and are inserted in the REVERSE of their id
+  // order, so a walk that forgot the `id` tiebreaker returns insertion order and
+  // fails these assertions rather than passing by luck.
+  it("breaks `createdAt` ties by id so paging a burst cannot repeat or drop a row", async () => {
+    const { companyId, managerId, coderId } = await seedBaseline();
+    const burstAt = new Date("2026-07-14T09:00:00.000Z");
+
+    // n -> id, ascending by id. SRC-1 < SRC-2 < SRC-3 as ids.
+    const ids: Record<number, string> = {
+      1: "00000000-0000-4000-8000-0000000000a1",
+      2: "00000000-0000-4000-8000-0000000000a2",
+      3: "00000000-0000-4000-8000-0000000000a3",
+    };
+
+    for (const n of [3, 2, 1]) {
+      await seedRecoveryAction({
+        companyId,
+        n,
+        id: ids[n],
+        createdAt: burstAt,
+        cause: "stranded_assigned_issue",
+        errorCode: "adapter_failed",
+        status: "escalated",
+        outcome: null,
+        ownerAgentId: managerId,
+        returnOwnerAgentId: coderId,
+        finalAssigneeAgentId: managerId,
+        finalIssueStatus: "in_progress",
+      });
+    }
+
+    const service = recoveryObservabilityService(db);
+
+    expect(
+      (await service.listActions(companyId, { order: "asc" })).map((a) => a.sourceIssueIdentifier),
+    ).toEqual(["SRC-1", "SRC-2", "SRC-3"]);
+    expect(
+      (await service.listActions(companyId, { order: "desc" })).map((a) => a.sourceIssueIdentifier),
+    ).toEqual(["SRC-3", "SRC-2", "SRC-1"]);
+
+    // The point of the tiebreaker: paging across a boundary inside the tie covers
+    // the burst exactly once — no repeat, no drop.
+    const page1 = await service.listActions(companyId, { order: "asc", limit: 2 });
+    const page2 = await service.listActions(companyId, { order: "asc", limit: 2, offset: 2 });
+    expect([...page1, ...page2].map((a) => a.sourceIssueIdentifier)).toEqual([
+      "SRC-1",
+      "SRC-2",
+      "SRC-3",
+    ]);
   });
 });

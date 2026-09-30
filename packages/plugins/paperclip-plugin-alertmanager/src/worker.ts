@@ -21,10 +21,11 @@ import {
   type PluginJobContext,
   type PluginWebhookInput,
 } from "@paperclipai/plugin-sdk";
-import { handleWebhook } from "./webhook-handler.js";
+import { handleWebhook, reconcileAbandonedAggregateFences } from "./webhook-handler.js";
 import { runAlertEscalationSweep } from "./escalation.js";
 import {
   authenticateWebhook,
+  CompanyScopeUnavailableError,
   resolveCompanyScope,
   resolveEscalationSweepConfig,
 } from "./config-scope.js";
@@ -40,28 +41,33 @@ export const plugin = definePlugin({
   async setup(ctx) {
     pluginCtx = ctx;
     registerRecoveryAction(ctx);
+    // Release aggregate lifecycle fences abandoned by a previous occupant of
+    // this slot (BLO-31036). A firing delivery claims the fence and releases it
+    // in a `finally`, so only death of the owning process between the two can
+    // leave it held — which is what every rollout does. Those fences then
+    // refuse each subsequent firing delivery for their aggregate indefinitely,
+    // and before this sweep the only drain was an operator-only recovery route
+    // that needs the dead process's token.
+    //
+    // Awaited before the escalation job registers so the sweep cannot interleave
+    // with a resolve that claims finalization. It cannot disturb a live delivery
+    // regardless: it only releases fences whose owner is not this process.
+    await reconcileAbandonedAggregateFences(ctx);
     ctx.jobs.register("check-alert-escalations", async (job: PluginJobContext) => {
       const companyId = job.companyId;
       if (!companyId) {
-        // The host dispatches once per company configured for this plugin
-        // (BLO-20957) — on the scheduled path *and* on manual/retry "run
-        // now" triggers, both of which fan out per company and stamp
-        // `job.companyId`. So this branch no longer fires for a normal
-        // trigger; it means the plugin has zero configured companies (a
-        // successful empty enumeration), which for an escalation sweep is
-        // genuinely nothing to do. Warn rather than no-op silently so the
-        // "configured nowhere" case is still visible.
-        ctx.logger.warn(
-          "paperclip-plugin-alertmanager: escalation sweep skipped — dispatch carried no company scope (plugin has no configured companies)",
+        // The scheduler dispatches once per configured company. An
+        // instance-scoped dispatch therefore means the registry returned an
+        // empty set, which cannot run this company-scoped sweep safely.
+        throw new CompanyScopeUnavailableError(
+          "paperclip-plugin-alertmanager: escalation sweep cannot run without a company scope",
         );
-        return;
       }
       const config = await resolveEscalationSweepConfig(ctx, companyId);
       if (!config) {
-        ctx.logger.warn(
-          `paperclip-plugin-alertmanager: escalation sweep skipped for company ${companyId} — no stored config`,
+        throw new CompanyScopeUnavailableError(
+          `paperclip-plugin-alertmanager: escalation sweep cannot run for company ${companyId} — no matching stored config`,
         );
-        return;
       }
       await runAlertEscalationSweep(ctx, config);
     });

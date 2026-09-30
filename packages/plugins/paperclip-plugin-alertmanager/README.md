@@ -41,20 +41,82 @@ See `docs/specs/2026-04-29-alertmanager-plugin-spec.md` for the full design.
   `plugin.alertmanager.alert.resolved` so sibling plugins (status pages,
   paging integrations) can subscribe.
 
-## Recovering an interrupted aggregate firing
+## Recovering an interrupted aggregate delivery
 
 The aggregate lifecycle fence intentionally fails closed: if the worker stops
-after it claims a firing fence but before it finishes the delivery, later
-firings and final resolution wait until an operator releases that exact fence.
-The recovery API is board-authenticated and company-scoped:
+after it claims a fence but before it finishes the delivery, later firings and
+final resolution wait until an operator releases that exact fence.
 
-The examples below use a Paperclip board token in
-`PAPERCLIP_BOARD_TOKEN` (a browser session cookie can be used instead). Keep
-that token in the environment, never in the command itself.
+Two phases hold a fence this way, and both are recoverable here:
 
-1. List the currently held firing fences. The response is sensitive and is
-   marked `Cache-Control: no-store`; only an authorized board user for the
-   requested company can read it.
+| held phase | left behind by | token to release it |
+| --- | --- | --- |
+| `firing` | an interrupted firing delivery | `firing_token` |
+| `cancelling` | an interrupted terminal transition | `resolution_token` |
+
+Both are reported by the listing route as `phase`, with the token to use in
+`firingToken` regardless of which column it came from. `active` and `finalizing`
+never block a firing claim, so neither ever needs recovery.
+
+### Recognising the wedge
+
+A firing claim refused by a live holder is **not** a wedge, and is no longer
+reported as a failure. Contention is routine: the fence is keyed on the creation
+identity, so every alert sharing an alertname contends for one fence by design.
+A refused claim is retried in-process with jittered backoff for a few seconds
+(PEN-3013), and the common case is absorbed silently. A delivery that had to
+wait says so, at info:
+
+```
+Alertmanager aggregate <key> was held by a concurrent delivery; claimed it
+after <n> attempt(s) over <ms>ms instead of failing the delivery.
+```
+
+Only once that budget is spent does the delivery fail, with:
+
+```
+Alertmanager aggregate <key> is held in phase '<firing|cancelling>' by a
+delivery in progress; retrying firing delivery. A fence abandoned by a dead
+process is released automatically by its slot's next worker; if this persists,
+the holder is either live or in another slot, and an operator can release it via
+the plugin's recover-aggregate-firing route.
+```
+
+The failure is per-alert, but one held aggregate fails the whole delivery batch
+so Alertmanager retries it — which is why a single wedged key can stall all
+webhook alert delivery. The wait budget is spent at most once per aggregate key
+per delivery, not once per alert: the first alert to exhaust it marks that key,
+and the rest of the batch fails fast rather than each waiting in turn. So a
+wedged fence delays a delivery by roughly one budget, not by one per alert — a
+batch of 10 costs seconds, not tens of seconds. A fence abandoned by a dead
+process now self-clears via its slot's next worker (BLO-31036), so a *sustained*
+failure means the holder is live or in another slot.
+
+**Do not diagnose this from
+`alertmanager_notifications_failed_total{integration="webhook"}`.** It undercounts
+and cannot witness the fault: Alertmanager increments it only when a
+notification's retry budget is *exhausted*, not per failed request, so a request
+that fails and is later retried successfully leaves no trace at all. Measured on
+PEN-2988, 14 HTTP 502s inside 40 seconds produced **zero** counter movement — a
+flat counter is fully compatible with a continuously-failing handler. Diagnose at
+the HTTP layer (502s at the webhook route) and from the handler logs above. Note
+that `paperclip_plugin_error` also stays `0` throughout: the plugin is running and
+healthy at the lifecycle level, and is failing per alert.
+
+The fence listing
+(`GET /api/plugins/$PLUGIN_ID/api/aggregate-firing-fences?companyId=...`) is
+`board-or-agent` and company-scoped. Recovery
+(`POST /api/plugins/$PLUGIN_ID/api/aggregate-firing-fences/recover`) stays
+board-only. The board examples below use a Paperclip board token in
+`PAPERCLIP_BOARD_TOKEN` (a browser session cookie can be used instead). Keep that
+token in the environment, never in the command itself.
+
+1. List the currently held fences. The response is sensitive and is
+   marked `Cache-Control: no-store`; only an authenticated board user or agent
+   of the requested company can read it. A board caller gets each fence with
+   `aggregateKey`, `phase`, `updatedAt`, `ownerInstanceId`, `ownerSlot` and
+   `firingToken`. An agent caller gets the same fields, but the handler omits
+   `firingToken`, so an agent can diagnose a fence but cannot recover it.
 
    ```sh
    curl --fail --silent --show-error \
@@ -62,11 +124,22 @@ that token in the environment, never in the command itself.
      "$PAPERCLIP_URL/api/plugins/$PLUGIN_ID/api/aggregate-firing-fences?companyId=$COMPANY_ID"
    ```
 
-   Copy the `aggregateKey` and its matching `firingToken` from the response.
-   The token is bearer-equivalent; do not put it in tickets, chat, shell
-   history, or logs.
+   An agent reads the same route with its own run credentials:
 
-2. Release that exact token through the board-authenticated recovery route.
+   ```sh
+   curl --fail --silent --show-error \
+     -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+     "$PAPERCLIP_API_URL/api/plugins/$PLUGIN_ID/api/aggregate-firing-fences?companyId=$PAPERCLIP_COMPANY_ID"
+   ```
+
+   An agent that finds a wedged fence escalates to a board operator for step 2,
+   because it never receives `firingToken`.
+
+   Board only: copy the `aggregateKey` and its matching `firingToken` from the
+   response. The token is bearer-equivalent; do not put it in tickets, chat,
+   shell history, or logs.
+
+2. Release that exact token through the board-only recovery route.
    The response contains only whether the compare-and-set matched; it never
    returns the token.
 
@@ -241,7 +314,7 @@ cached too (empty string) so a missing user doesn't cause repeated lookups.
 
 ### Issue creation floor and rule-level opt-out
 
-Two gates keep low-value alerts from becoming issues:
+Two gates keep low-value alerts from becoming issues at all:
 
 - **`severity: info` creates no issue.** The gate is *creation-only* and runs
   after the re-fire branch, so an `info` issue that already exists (filed
@@ -253,6 +326,40 @@ Two gates keep low-value alerts from becoming issues:
   refreshed, no state written, no suppression anchor banked) but deliberately
   lets the **resolved** path through. Emits
   `alertmanager.webhook.issue_opt_out`.
+
+A third gate suppresses *actionability* rather than creation:
+
+- **`severity: none` is filed terminal and unowned.** This is the heartbeat
+  band — Prometheus' `Watchdog` (`vector(1)`) is its only member and fires
+  forever by design. The row is kept because it is the only live evidence the
+  in-cluster delivery leg accepts POSTs, but an alert that can never resolve
+  must not carry an owner: an assigned row that can never legitimately close
+  recirculates through agent assignment and `stranded_assigned_issue` recovery
+  forever. So the issue is created — and on every re-fire kept — `done` with no
+  assignee, and owner-map / `issueRouteMap` resolution is skipped entirely. No
+  escalation-ladder exemption is needed: `none` maps to no
+  `escalationDeadlineMinutes`, so `nextEscalationAt` is already `null`.
+
+  `done` rather than unowned-`todo` on purpose. Heartbeat selection is by
+  assignee, so both are inert — but an ownerless `todo` row is
+  indistinguishable from a stranded issue on every triage surface, and this one
+  would be re-minted on every fire, forever. A terminal row is honestly
+  terminal.
+
+  Unlike the two gates above, this one is **not** creation-only: every re-fire
+  re-clears the assignee on the issue, the state record, *and* the emitted
+  firing event. A creation-only guard would leave rows filed before the policy
+  — and any row something later assigns — stuck in the loop, which is the same
+  one-shot patch as unassigning by hand. The re-fire also bypasses
+  `decideRefire`: that helper reads any `done` row as an *operator* close
+  (BLO-24234) and would mute the fingerprint for the suppression window, then
+  re-open it as `todo` when the window expired — re-manufacturing exactly the
+  actionable row this gate exists to prevent. A terminal close is the plugin's
+  own doing, so there is no operator intent to honour.
+
+  The terminal set is a constant (`TERMINAL_SEVERITIES`), deliberately not a
+  config key: a configurable list is what would make a plugin-closed `done` row
+  ambiguous with an operator close, and `none` has exactly one member here.
 
 Letting resolve through is what keeps the opt-out from wedging the issues it was
 added to silence. Gating it too would mean `handleResolved` never runs for an
@@ -337,13 +444,48 @@ branch is decided by `decideRefire()` in `webhook-handler.ts` and each one emits
 a distinct metric, so "the alert delivered but I see no issue" is answerable
 from telemetry rather than by reading the issue body's `Started:` timestamp.
 
-| Issue status at re-fire | `resolvedAt` in state | Outcome | Metric |
+| Issue status at re-fire | Closed by the plugin? | Outcome | Metric |
 |---|---|---|---|
 | open (any non-terminal) | — | refresh description | `alertmanager.firing.deduped` |
-| `done` / `cancelled` | set (plugin closed it on resolve) | re-open → `todo` | `alertmanager.firing.reopened` |
-| `done` / `cancelled` | null (**operator** closed it) — inside window | stay closed, stay quiet | `alertmanager.firing.suppressed` |
-| `done` / `cancelled` | null — window expired | re-open → `todo` + comment | `alertmanager.firing.suppression_expired` |
+| `cancelled` | yes — `pluginClosedAt` set | re-open → `todo` | `alertmanager.firing.reopened` |
+| `cancelled` with `pluginClosedAt` **absent** | unknown — legacy row, or an aggregate member whose close a sibling landed; falls back to `resolvedAt` | re-open → `todo` | `alertmanager.firing.reopened` |
+| `done`, or `cancelled` with `pluginClosedAt: null` | no (**operator** closed it) — inside window | stay closed, stay quiet | `alertmanager.firing.suppressed` |
+| as above — window expired | no | re-open → `todo` + comment | `alertmanager.firing.suppression_expired` |
 | issue unreadable / deleted | — | leave state intact | `alertmanager.firing.issue_missing` |
+
+**Authorship is recorded, not inferred (BLO-31736).** That middle column used to
+read `resolvedAt in state`, and the code matched it. It was wrong: `resolvedAt`
+says only *"the alert last cleared"*, which is also true when the resolve path's
+terminal guard **declined** to close an issue an agent had already closed by
+hand. So a deliberate `done` was read as "the plugin closed this", re-opened to
+`todo` on the next re-fire, and cancelled by the resolve after it — once per
+fire/clear cycle, indefinitely, ending in a plugin-authored `cancelled` that
+looks like a normal auto-close on every triage surface. It also made the
+suppression row above unreachable for any alert that had *ever* resolved, i.e.
+every flapping alert — precisely the ones operators close by hand.
+
+`pluginClosedAt` is now written only on the branch where the plugin's own
+`cancelled` patch actually landed, and cleared by any firing delivery that
+observed the issue's status. Two details worth knowing when reading the table:
+
+- **`done` is never a close of ours.** The plugin's only status writes are
+  `todo` and `cancelled`, so a `done` row was always dispositioned by someone
+  else — true even for state rows written before this field existed.
+- **An absent `pluginClosedAt` means authorship is unknown**, and falls back to
+  `resolvedAt`. Two rows land there: one written before the field existed, and
+  one belonging to an **aggregate** whose close this member deferred to a
+  sibling. The second case is why the record cannot simply be `null` when our
+  own cancel did not land here: `pluginClosedAt` is per-fingerprint, but the
+  close it records happens to the aggregate's *shared* issue, and only the last
+  member to resolve lands it. A non-last member that kept asserting `null` read
+  its own aggregate's close as an operator close and muted the next genuine
+  recurrence.
+  The fallback is asymmetric on purpose: reading our close as an operator's
+  would *mute a live recurring alert* for a whole window, while the reverse
+  costs one unwanted re-open. Legacy rows drain on their first firing — even
+  one whose issue read fails: that write records what the fallback would have
+  concluded and still clears `resolvedAt`, which is also the escalation sweep's
+  bail-out and must not stay set against a firing alert.
 
 `alertmanager.firing.deduped` is still emitted on **every** re-fire, so existing
 dashboards keep working; the metrics above narrate what the re-fire actually did.
@@ -480,6 +622,100 @@ logged when they happen rather than failing silently. Fixing it properly needs a
 host API to enumerate a plugin's configured companies, which `PluginConfigClient`
 does not expose today (BLO-20595). Delivery is unaffected.
 
+
+### Concurrent writers of one alert-state record (BLO-20650)
+
+Two independent paths mutate the same `alert:<fingerprint>` row, and both are
+read-modify-writes: the **inbound webhook** (firing, re-fire, resolve) and the
+**`check-alert-escalations` sweep** (hold, rung advance, chain exhausted).
+
+They are not symmetric, and the fix follows that asymmetry:
+
+- The **webhook is authoritative.** It is reporting what Alertmanager says is
+  true right now, so it writes unconditionally and always wins.
+- The **sweep is speculative.** It reads the record, then spends several awaits
+  — `listComments`, `agents.get`, and on the cover rung an entire issue
+  creation — before writing `{ ...state, ... }` back. Every field it did not
+  intend to change rides along stale.
+
+The field that made this expensive is `resolvedAt`. A resolve landing inside
+the sweep's window was silently reverted to `null`, so the ladder advanced a
+rung on an alert that had already cleared — and *stayed* wrong, because nothing
+re-derives a resolution once it has been overwritten. The observable cost is a
+page, a reassignment, and eventually a `[user-cover]` row for an incident that
+is over.
+
+Every sweep-side write now passes `ifMatch` to `ctx.state.set`, a
+compare-and-swap added to the plugin SDK for this
+(`PluginStateClient.set(..., { ifMatch })`). The host applies the write only
+while the stored value is still exactly the one the sweep read, and performs
+the comparison and the write in **one** `UPDATE` statement — so unlike a
+re-read immediately before the write, there is no window left for the webhook
+to land in. `value_json` is `jsonb`, so the comparison is structural equality
+on the normalized document and needed no schema change.
+
+A refused swap is a **normal outcome, not an error**: the webhook won, and the
+sweep abandons the rung and re-decides on the next tick against fresh state.
+Rejection is raised with `code: "state_precondition_failed"` (distinct from
+`fencing_generation_lost`, which answers "am I still the owner?" rather than
+"is my read still current?"), and the sweep logs it at `info`. Crucially the
+swap sits **ahead of** the rung's user-visible effects, so losing it aborts
+before anyone is paged rather than after.
+
+The chain-exhausted rung is the one exception to that ordering, and it is
+compensated rather than reordered. Its cover issue is deliberately created
+*before* the swap: claiming the state first would write
+`escalationComplete: true`, which the guard at the top of every later sweep
+short-circuits — so a `createCover` that then failed would leave the alert
+never covered at all, silence exactly where a board escalation belongs. A
+resolve winning the swap at that point would otherwise leave the cover open
+with an unresolved member, since the resolve's own cascade ran before the cover
+existed. The sweep therefore re-reads the winning record and, if it resolved
+the alert, runs the cover cascade itself
+(`recordSourceResolvedAndCloseCovers`). That is idempotent by construction and
+only cancels a cover whose every member has resolved, so a storm-batched
+sibling that is still firing keeps the cover open. The "chain exhausted"
+comment sits behind the swap, so a **refused** swap posts no announcement for
+an alert that has already cleared. A swap that **succeeds** in that same window
+still can: the resolve is mid-delivery and has not stored `resolvedAt` yet, so
+the rung reads the alert as firing and posts "while alert remains firing" on
+the source issue. The cover is still closed by the resolve's post-commit
+cascade below, so the announcement is the only residue.
+
+That compensation only fires when the swap is **refused**, which left one more
+interleaving open (BLO-33497). The webhook's cover cascade ran *before* it
+stored `resolvedAt`, so a resolve could cascade while the cover did not yet
+exist — nothing to mark — and then store `resolvedAt` only *after* the sweep's
+swap had already succeeded. The swap succeeding means no compensation runs, and
+no later resolve will ever cascade into that cover again: an open
+`[user-cover]` with an unresolved member, for an alert that has cleared,
+permanently.
+
+The obvious repair — move the cascade behind the state write — is wrong, and
+the existing tests say so. `ctx.state.set` is the delivery's **commit point**,
+and every side effect is deliberately sequenced ahead of it so that a failure
+leaves `resolvedAt` unwritten and the retry redoes the lot. Moving the cascade
+past it swaps a concurrency orphan for a failure orphan: a cascade that throws
+would leave a record asserting the alert is over with its cover uncleaned.
+
+So `handleResolved` cascades **twice**, and the two calls answer different
+failures:
+
+- **ahead of the commit point** — makes cover cleanup a precondition of
+  recording the resolution. A throwing cascade aborts the delivery with nothing
+  recorded.
+- **behind the commit point** — catches a cover that did not exist yet when the
+  first call ran. A swap that *succeeds* means the sweep read, created its cover
+  and claimed all before the commit, so by the time the second call runs the
+  cover is there to be closed.
+
+Between them there is no window: the sweep compensates the refused-swap half,
+and the post-commit cascade covers the succeeded-swap half. The second call is
+close to free — `recordSourceResolvedAndCloseCovers` early-returns when the
+alert never joined a cover (the common case), re-marking is
+`COALESCE(resolved_at, now())`, and the close is a single-UPDATE claim only one
+caller can win. If it throws, the delivery still fails and the retry's
+pre-commit cascade closes the cover, which by then exists.
 
 ### Bearer rotation in a Kubernetes deployment
 

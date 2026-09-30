@@ -22,6 +22,8 @@ import {
   computeUserSecretRowHealth,
   emptyRow,
   envKeyFromSecretName,
+  maskedRenameBlockers,
+  maskedRenameIssue,
   rowsFromValue,
   validateName,
   valueFromRows,
@@ -234,6 +236,9 @@ export const EnvironmentVariablesEditor = forwardRef<EnvironmentVariablesEditorH
   const draftValue = useMemo(() => valueFromRows(rows), [rows]);
   const draftValueKey = useMemo(() => normalizedEnvKey(draftValue), [draftValue]);
   const hasUnsavedChanges = draftValueKey !== committedValueKey;
+  // Declared up here, above `flushPendingDraft`, because that callback's dependency array is
+  // evaluated during render — a `const` declared further down would be in its TDZ.
+  const renameBlockers = useMemo(() => maskedRenameBlockers(rows), [rows]);
 
   useEffect(() => {
     onDirtyChange?.(!disabled && hasUnsavedChanges);
@@ -281,12 +286,16 @@ export const EnvironmentVariablesEditor = forwardRef<EnvironmentVariablesEditorH
 
   const flushPendingDraft = useCallback(() => {
     if (disabled || !hasUnsavedChanges) return null;
+    // Same refusal as `saveDraft`, and it has to be repeated here rather than left to the button:
+    // this is the path an *outer* Save/submit takes, so without it the very edit the row is
+    // flagging would be promoted past the block the row is displaying.
+    if (renameBlockers.length > 0) return null;
     pendingSaveValueKeyRef.current = draftValueKey;
     flushSync(() => {
       onChange(draftValue);
     });
     return draftValue ?? {};
-  }, [disabled, draftValue, draftValueKey, hasUnsavedChanges, onChange]);
+  }, [disabled, draftValue, draftValueKey, hasUnsavedChanges, onChange, renameBlockers]);
 
   useImperativeHandle(ref, () => ({ flushPendingDraft }), [flushPendingDraft]);
 
@@ -362,6 +371,7 @@ export const EnvironmentVariablesEditor = forwardRef<EnvironmentVariablesEditorH
         existing.name = key;
         existing.source = "text";
         existing.textValue = pairValue;
+        existing.masked = false;
         existing.secretId = "";
         existing.sensitiveDismissed = false;
         existing.userSecretKey = "";
@@ -394,6 +404,12 @@ export const EnvironmentVariablesEditor = forwardRef<EnvironmentVariablesEditorH
 
   function saveDraft() {
     if (!hasUnsavedChanges) return;
+    // Refuse rather than annotate. The row already renders why; sending anyway would 422 the whole
+    // PATCH server-side and lose every other edit in this save along with it.
+    if (renameBlockers.length > 0) {
+      setPendingFocus({ rowId: renameBlockers[0]!.id, field: "name" });
+      return;
+    }
     pendingSaveValueKeyRef.current = draftValueKey;
     onChange(draftValue);
   }
@@ -453,8 +469,16 @@ export const EnvironmentVariablesEditor = forwardRef<EnvironmentVariablesEditorH
           </div>
 
           {rows.map((row, index) => {
-            const issue = validateName(row.name, duplicateNames, reservedPrefixes);
-            const touched = touchedNames.has(row.name.trim());
+            const nameIssue = validateName(row.name, duplicateNames, reservedPrefixes);
+            // A renamed mask cannot be fixed by fixing the name, so a hard name error (unusable
+            // name) still wins — that one is a precondition for everything else.
+            const renameIssue = nameIssue?.level === "error" ? null : maskedRenameIssue(row);
+            const issue = renameIssue ?? nameIssue;
+            // `touchedNames` is seeded with the names the editor LOADED with and probed by the
+            // row's CURRENT name, so a rename is never "touched" by construction — the gate would
+            // hide this error exactly when it fires. Blur-gating is right for a name the user is
+            // still typing; it is wrong for a condition that is already true.
+            const touched = renameIssue !== null || touchedNames.has(row.name.trim());
             return (
               <EnvironmentVariableRow
                 key={row.id}
@@ -533,6 +557,13 @@ export const EnvironmentVariablesEditor = forwardRef<EnvironmentVariablesEditorH
                 {changeSummaryText}
               </p>
             ) : null}
+            {renameBlockers.length > 0 ? (
+              <p className="min-w-0 pl-4 text-xs font-medium text-destructive">
+                {renameBlockers.length === 1
+                  ? `Can't save: ${renameBlockers[0]!.maskedKey} has a hidden value and can't be renamed to ${renameBlockers[0]!.name.trim() || "an empty name"}.`
+                  : `Can't save: ${renameBlockers.map((row) => row.maskedKey).join(", ")} have hidden values and can't be renamed.`}
+              </p>
+            ) : null}
           </div>
           <div className="flex items-center gap-2">
             <button
@@ -546,7 +577,8 @@ export const EnvironmentVariablesEditor = forwardRef<EnvironmentVariablesEditorH
             <button
               type="button"
               onClick={saveDraft}
-              className="inline-flex h-9 items-center gap-1.5 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+              disabled={renameBlockers.length > 0}
+              className="inline-flex h-9 items-center gap-1.5 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-primary"
             >
               <Save className="size-4" />
               Save

@@ -116,7 +116,13 @@ async function createPodUpstream(format: "json" | "sse"): Promise<string> {
   return listen(server);
 }
 
-async function createGateway(upstreamUrl: string): Promise<string> {
+/**
+ * The gateway exposes two agent-facing endpoints, and they are different code
+ * paths: `/<prefix>/mcp` proxies one upstream, `/mcp` aggregates all of them.
+ * Returning both keeps a test from silently covering only the one an observer
+ * happened to look at first.
+ */
+async function createGatewayEndpoints(upstreamUrl: string): Promise<{ prefixed: string; aggregate: string }> {
   const state: GatewayState = {
     upstreams: { "k8s-ro": { url: upstreamUrl, credentialHeaders: [] } },
     sessions: new Map(),
@@ -124,8 +130,12 @@ async function createGateway(upstreamUrl: string): Promise<string> {
     upstreamTimeoutMs: 60_000,
     breaker: new CircuitBreaker({ failureThreshold: 5, openCooldownMs: 30_000, halfOpenMaxProbes: 1 }),
   };
-  const url = await listen(createGatewayServer(state));
-  return url.replace(/\/mcp$/, "/k8s-ro/mcp");
+  const aggregate = await listen(createGatewayServer(state));
+  return { aggregate, prefixed: aggregate.replace(/\/mcp$/, "/k8s-ro/mcp") };
+}
+
+async function createGateway(upstreamUrl: string): Promise<string> {
+  return (await createGatewayEndpoints(upstreamUrl)).prefixed;
 }
 
 async function callPodsGet(gatewayUrl: string): Promise<{ status: number; text: string }> {
@@ -176,5 +186,96 @@ describe("PEN-2370 end-to-end: pods_get through the gateway", () => {
     expect(podText).toContain("kind: Pod");
     expect(podText).toContain("phase: Running");
     expect(podText).not.toContain(LEAK);
+  });
+});
+
+/**
+ * A tool record as an upstream returns it from `tools/list`. The gateway
+ * spreads the whole record into its aggregate reply, so every field here is
+ * upstream-controlled text that reaches the agent.
+ *
+ * The env block is deliberately the *same shape* the scrubber is proven to
+ * redact on the `tools/call` path above. That makes path coverage the only
+ * variable: if this survives, it survived because nothing scrubbed it, not
+ * because the scrubber cannot recognise it.
+ */
+const TOOL_LIST_PAYLOAD = {
+  jsonrpc: "2.0",
+  id: 1,
+  result: {
+    tools: [
+      {
+        name: "pods_get",
+        description: [
+          "Get a Pod. Example response:",
+          "spec:",
+          "  containers:",
+          "  - name: agent",
+          "    env:",
+          "    - name: OPENAI_API_KEY",
+          `      value: ${LEAK}`,
+        ].join("\n"),
+        inputSchema: { type: "object", properties: { name: { type: "string" } } },
+      },
+    ],
+  },
+};
+
+async function createToolsListUpstream(): Promise<string> {
+  const server = http.createServer(async (req, res) => {
+    const message = JSON.parse(await readBody(req)) as { id?: number; method?: string };
+
+    if (message.method === "initialize") {
+      res.statusCode = 200;
+      res.setHeader(MCP_SESSION_HEADER, "upstream-session-1");
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: message.id ?? 1,
+          result: { protocolVersion: "2025-03-26", capabilities: {}, serverInfo: { name: "k8s", version: "1" } },
+        }),
+      );
+      return;
+    }
+
+    if (message.method?.startsWith("notifications/")) {
+      res.statusCode = 202;
+      res.end();
+      return;
+    }
+
+    res.statusCode = 200;
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ ...TOOL_LIST_PAYLOAD, id: message.id ?? 1 }));
+  });
+  return listen(server);
+}
+
+describe("PEN-2370 end-to-end: the aggregate endpoint", () => {
+  it("scrubs upstream-derived tool metadata on tools/list", async () => {
+    // `writeResponse` documents itself as "the one place a scrubbing pass
+    // covers all of them". The aggregate `tools/list` reply is built from
+    // upstream bodies and written directly, so that claim is only true if
+    // this path scrubs too.
+    const { aggregate } = await createGatewayEndpoints(await createToolsListUpstream());
+
+    const response = await fetch(aggregate, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    });
+    const text = await response.text();
+
+    expect(response.status).toBe(200);
+    expect(text).not.toContain(LEAK);
+
+    // The aggregate reply must still be a usable tool list: the prefixed name
+    // and the schema are what the client dispatches on.
+    const parsed = JSON.parse(text) as { result?: { tools?: Array<Record<string, unknown>> } };
+    const tool = parsed.result?.tools?.[0];
+    expect(tool?.name).toBe("k8s-ro__pods_get");
+    expect(tool?.inputSchema).toEqual(TOOL_LIST_PAYLOAD.result.tools[0].inputSchema);
+    expect(String(tool?.description)).toContain("OPENAI_API_KEY");
   });
 });

@@ -13,8 +13,10 @@ import {
   countConsecutiveZeroTokenCompletedRuns,
   isRateLimitExhausted,
   isRetryableK8sCcrotateThrottleResult,
+  K8S_REPLACEMENT_LAUNCH_FAILURE_AFTER_THROTTLE_KEY,
   k8sCcrotateRetryDelayMs,
   listRecentTerminalRunsForZeroTokenStreak,
+  reclassifyK8sReplacementLaunchFailureAfterThrottle,
 } from "../services/heartbeat.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -398,6 +400,118 @@ describe("k8s ccrotate no-progress throttle detection", () => {
   it("honors ccrotate retry_after duration fields when choosing the in-run retry delay", () => {
     expect(k8sCcrotateRetryDelayMs({ resultJson: { retry_after: 123 } })).toBe(123_000);
     expect(k8sCcrotateRetryDelayMs({ resultJson: { retry_after_seconds: "45" } })).toBe(45_000);
+  });
+});
+
+// BLO-34577: the in-run throttle loop relaunches the Job for the same run. On
+// 2026-09-18 the relaunch read the previous attempt's Failed pod and returned
+// `k8s_pod_schedule_failed` ~100 ms after create; the finalizer recorded that
+// code and the pr_review run was dropped without a retry, while the identical
+// 429 seen through the throttle path retried. These pin the server-side verdict.
+describe("reclassifyK8sReplacementLaunchFailureAfterThrottle (BLO-34577)", () => {
+  const TENANT_429 =
+    'API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"All Claude subscription capacity for this tenant is rate-limited"}}';
+  const zeroUsage = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
+  const throttleResult = {
+    exitCode: 1,
+    signal: null,
+    timedOut: false,
+    errorMessage: TENANT_429,
+    errorCode: null,
+    retryNotBefore: "2026-09-18T12:40:00.000Z",
+    resultJson: { api_error_status: 429, is_error: true },
+    usage: zeroUsage,
+  };
+  const launchFailure = {
+    exitCode: null,
+    signal: null,
+    timedOut: false,
+    errorMessage:
+      "Pod scheduling failed: Pod ac-ally-96fa0c75-3f2a1b-x9k2q reached phase=Failed: claude exited 1",
+    errorCode: "k8s_pod_schedule_failed",
+  };
+
+  it("finalizes a replacement-launch failure after an in-run throttle with the throttle verdict", () => {
+    const reclassified = reclassifyK8sReplacementLaunchFailureAfterThrottle({
+      launchResult: launchFailure,
+      throttleResult,
+      throttleAttempts: 2,
+    });
+    expect(reclassified).not.toBeNull();
+    // The verdict is the throttle's: the code the finalizer treats as terminal is gone...
+    expect(reclassified!.errorCode).not.toBe("k8s_pod_schedule_failed");
+    // ...and the result still classifies as the in-run throttle the loop was retrying,
+    // so the finalizer takes the provider_throttled_no_progress / rate_limit_exhausted arm.
+    expect(isRetryableK8sCcrotateThrottleResult(reclassified!)).toBe(true);
+    expect(reclassified!.resultJson).toMatchObject({ api_error_status: 429, is_error: true });
+    expect(reclassified!.retryNotBefore).toBe("2026-09-18T12:40:00.000Z");
+    // The launch failure is kept as an annotation, not lost.
+    expect(reclassified!.resultJson?.[K8S_REPLACEMENT_LAUNCH_FAILURE_AFTER_THROTTLE_KEY]).toEqual({
+      errorCode: "k8s_pod_schedule_failed",
+      errorMessage: launchFailure.errorMessage,
+      throttleAttempts: 2,
+      throttleErrorCode: null,
+    });
+    expect(reclassified!.errorMessage).toContain("rate-limited");
+    expect(reclassified!.errorMessage).toContain("after 2 in-run throttle retries");
+    expect(reclassified!.errorMessage).toContain("phase=Failed: claude exited 1");
+  });
+
+  it("leaves an ambiguous k8s_pod_schedule_failed alone when no throttle preceded it", () => {
+    // Negative control: with no observed throttle the launch failure means what it
+    // says, and the existing "does not retry ambiguous k8s_pod_schedule_failed"
+    // contract must keep applying to it.
+    expect(
+      reclassifyK8sReplacementLaunchFailureAfterThrottle({
+        launchResult: launchFailure,
+        throttleResult: null,
+        throttleAttempts: 0,
+      }),
+    ).toBeNull();
+    expect(
+      reclassifyK8sReplacementLaunchFailureAfterThrottle({
+        launchResult: launchFailure,
+        throttleResult,
+        throttleAttempts: 0,
+      }),
+    ).toBeNull();
+  });
+
+  it("only reclassifies a launch failure, never another terminal result", () => {
+    for (const launchResult of [
+      { exitCode: 0, signal: null, timedOut: false, usage: { inputTokens: 40, outputTokens: 12 } },
+      { exitCode: 1, signal: null, timedOut: false, errorCode: "adapter_failed", errorMessage: "boom" },
+      { exitCode: null, signal: null, timedOut: false, errorCode: "k8s_concurrent_run_blocked" },
+    ]) {
+      expect(
+        reclassifyK8sReplacementLaunchFailureAfterThrottle({
+          launchResult,
+          throttleResult,
+          throttleAttempts: 1,
+        }),
+      ).toBeNull();
+    }
+  });
+
+  it("does not let a non-throttle prior result stand in as the verdict", () => {
+    // The loop never retries a result with token usage, so a prior result that
+    // made progress is not a throttle chain; do not manufacture one.
+    expect(
+      reclassifyK8sReplacementLaunchFailureAfterThrottle({
+        launchResult: launchFailure,
+        throttleResult: { ...throttleResult, usage: { inputTokens: 12, outputTokens: 3 } },
+        throttleAttempts: 1,
+      }),
+    ).toBeNull();
+    // Nor a launch failure that somehow reports usage: the pod is claimed to
+    // have never run, so this is not the shape the reclassifier understands.
+    expect(
+      reclassifyK8sReplacementLaunchFailureAfterThrottle({
+        launchResult: { ...launchFailure, usage: { inputTokens: 1, outputTokens: 0 } },
+        throttleResult,
+        throttleAttempts: 1,
+      }),
+    ).toBeNull();
   });
 });
 

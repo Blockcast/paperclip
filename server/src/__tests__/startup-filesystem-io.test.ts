@@ -24,34 +24,33 @@ describe("startup filesystem I/O", () => {
     );
 
     expect(postListen).not.toMatch(/fs\.(?:access|cp|exists|lstat|mkdir|unlink)Sync\(/);
-    expect(postListen).not.toContain("copyWorkspacePluginSdk(");
-    expect(postListen).not.toContain("copyWorkspaceSharedDist(");
   });
 
-  it("keeps API pods away from the shared plugin package tree", () => {
-    const guard = serverSource.slice(
-      serverSource.indexOf('if (config.paperclipNodeRole !== "api") {'),
-      serverSource.indexOf("const uiMode"),
-    );
-
-    expect(guard).toContain("await copyWorkspacePluginSdk();");
-    expect(guard).toContain("await copyWorkspaceSharedDist();");
-  });
-
-  it("preserves the installed SDK version when vendoring the workspace fork", () => {
-    const fn = serverSource.slice(
-      serverSource.indexOf("async function copyWorkspacePluginSdk()"),
-      serverSource.indexOf("async function copyWorkspaceSharedDist()"),
-    );
-
-    // The workspace manifest is unstamped (1.0.0) while the plugin store's
-    // package-lock.json records the installed registry version. Copying the
-    // manifest verbatim makes installed !== locked, which trips
-    // plugin-lifecycle's torn-store guard and fails EVERY plugin activation
-    // closed. Reinstalling does not recover it — this function re-tears the
-    // store on the next boot. So the version must be carried over.
-    expect(fn).not.toMatch(/cp\(\s*workspaceSdkPkg/);
-    expect(fn).toContain("merged.version = installedVersion");
+  // The plugin store used to be patched at boot: the workspace `dist` for
+  // @paperclipai/{plugin-sdk,shared} was copied over the npm-installed copies so
+  // plugin workers saw the fork's symbols instead of upstream's. That gap was
+  // one of *lineage*, not staleness — registry @paperclipai never carries
+  // `costs.write` or `costs.finance.create`, at any version.
+  //
+  // The store now resolves those packages to the fork's own publish through an
+  // npm alias ("@paperclipai/plugin-sdk": "npm:@penstock/plugin-sdk@<ver>"), so
+  // the installed package IS the fork build and there is nothing to vendor.
+  // Three distinct failures came from the copy and must not return:
+  //   - `fs.cp(..., { recursive: true })` merges rather than replaces, so files
+  //     upstream shipped and the fork had deleted survived indefinitely; the
+  //     store ran a 64-file union of a 60-file package.
+  //   - copying the workspace manifest verbatim wrote its unstamped 1.0.0 over
+  //     the locked CalVer, so `installed !== locked` tripped plugin-lifecycle's
+  //     torn-store guard closed on every activation.
+  //   - the shared copy silently DOWNGRADED the store whenever the running image
+  //     lagged master, while leaving the advertised version untouched — the
+  //     store reported a version whose content it did not have.
+  it("does not vendor workspace packages over the plugin store", () => {
+    for (const fn of ["copyWorkspaceSdkFiles", "copyWorkspacePluginSdk", "copyWorkspaceSharedDist"]) {
+      expect(serverSource).not.toContain(fn);
+    }
+    // Nothing may reach into the shared plugin store's package tree at all.
+    expect(serverSource).not.toMatch(/["'`]plugins["'`],\s*\n?\s*["'`]node_modules["'`]/);
   });
 
   it("does not recursively chown the shared Claude directory", () => {

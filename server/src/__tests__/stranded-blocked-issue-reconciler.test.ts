@@ -29,6 +29,7 @@ import {
   type StrandedBlockedIssueReconcilerScheduler,
 } from "../services/stranded-blocked-issue-reconciler.js";
 import { listBlockedIssueAutoResumeSuppressions } from "../services/issues.js";
+import { resolveStrandedEscalationStatus } from "../services/recovery/stranded-escalation-status.js";
 import {
   WORKSPACE_PREFLIGHT_BLOCKED_ACTIVITY_ACTION,
   WORKSPACE_PREFLIGHT_CLEARED_ACTIVITY_ACTION,
@@ -103,7 +104,11 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
     identifier: string;
     status: string;
     assigneeAgentId?: string | null;
+    description?: string | null;
     executionState?: Record<string, unknown> | null;
+    monitorNextCheckAt?: Date | null;
+    monitorAttemptCount?: number;
+    executionPolicy?: Record<string, unknown> | null;
   }) {
     const id = randomUUID();
     await db.insert(issues).values({
@@ -113,10 +118,14 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
       title: input.identifier,
       status: input.status,
       priority: "medium",
+      description: input.description ?? null,
       assigneeAgentId: input.assigneeAgentId ?? null,
       originKind: "manual",
       originFingerprint: "default",
       executionState: input.executionState ?? null,
+      monitorNextCheckAt: input.monitorNextCheckAt ?? null,
+      monitorAttemptCount: input.monitorAttemptCount ?? 0,
+      executionPolicy: input.executionPolicy ?? null,
     });
     return id;
   }
@@ -382,9 +391,13 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
       companyId,
       identifier: "SB6-1",
       status: "blocked",
+      // BLO-27553: the live `nextCheckAt` is what makes this fixture match its own name.
+      // Without it the row is not gated by anything — it just carries the residue of a
+      // monitor that has already stopped firing, which is the strand shape below.
+      monitorNextCheckAt: new Date(Date.now() + 60_000),
       executionState: {
         monitor: {
-          status: "triggered",
+          status: "scheduled",
           gateSignals: ["pr:example/repo#1:review"],
         },
       },
@@ -394,6 +407,181 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
 
     expect(result.reconciled).toBe(0);
     expect(await statusOf(gated)).toBe("blocked");
+  });
+
+  // BLO-27553. The matched pair is the point: asserting only that the cleared-monitor row
+  // drains cannot distinguish "the liveness clause works" from "the reconciler swept
+  // everything", so the live-monitor control must survive the SAME sweep.
+  //
+  // `gateSignals` is written when a monitor is armed and is never erased when that monitor
+  // is cleared, so testing the array's presence answered "did this row EVER have a monitor".
+  // That pinned every such row `blocked` permanently — measured 2026-09-26 on 19 of 23
+  // estate-wide strands, all carrying `clearReason` `trigger_stalled` / `timeout_exceeded`.
+  it("sweeps a row whose monitor was cleared but still carries gateSignals, and not its live twin", async () => {
+    const { companyId } = await createCompany("SB7");
+    const cleared = await insertIssue({
+      companyId,
+      identifier: "SB7-1",
+      status: "blocked",
+      monitorNextCheckAt: null,
+      executionState: {
+        monitor: {
+          status: "cleared",
+          clearReason: "trigger_stalled",
+          clearedAt: new Date(Date.now() - 3_600_000).toISOString(),
+          gateSignals: ["mergequeue:example/repo#1:pos=10"],
+        },
+      },
+    });
+    const live = await insertIssue({
+      companyId,
+      identifier: "SB7-2",
+      status: "blocked",
+      monitorNextCheckAt: new Date(Date.now() + 60_000),
+      executionState: {
+        monitor: {
+          status: "scheduled",
+          gateSignals: ["mergequeue:example/repo#1:pos=10"],
+        },
+      },
+    });
+
+    const result = await reconcileStrandedBlockedIssues(db);
+
+    expect(await statusOf(cleared)).toBe("todo");
+    expect(await statusOf(live)).toBe("blocked");
+    expect(result.reconciled).toBeGreaterThanOrEqual(1);
+  });
+
+  // An OVERDUE `nextCheckAt` is a wake that did not happen, so it is not a gate either.
+  // Split from the `null` case above because only this one exercises the `> now()` half of
+  // the clause: drop that comparison and this row stays `blocked` while SB7-1 still drains.
+  it("sweeps a row whose monitor nextCheckAt is overdue", async () => {
+    const { companyId } = await createCompany("SB8");
+    const overdue = await insertIssue({
+      companyId,
+      identifier: "SB8-1",
+      status: "blocked",
+      monitorNextCheckAt: new Date(Date.now() - 3_600_000),
+      executionState: {
+        monitor: {
+          status: "scheduled",
+          gateSignals: ["pr:example/repo#2:review"],
+        },
+      },
+    });
+
+    await reconcileStrandedBlockedIssues(db);
+
+    expect(await statusOf(overdue)).toBe("todo");
+  });
+
+  // Called directly because `reconcileStrandedBlockedIssues` cannot reach this: its candidate
+  // predicate drops every future `nextCheckAt` before `monitor_gate` runs, so a constant
+  // `false` suppression passes every sweep-level test above. The three eager trigger paths
+  // have no such filter, so the liveness test here is their whole behaviour. It must match
+  // `hasValidBlockerMonitor` on all three conditions: a future `nextCheckAt` is not enough
+  // once the policy `timeoutAt` has passed or the attempts are spent.
+  it("suppresses as monitor_gate only while the gateSignals monitor is still a valid wake", async () => {
+    const { companyId } = await createCompany("SBMG");
+    const gateState = { monitor: { status: "scheduled", gateSignals: ["pr:example/repo#3:review"] } };
+    const hourMs = 3_600_000;
+    const insertGated = (identifier: string, fields: Partial<Parameters<typeof insertIssue>[0]>) =>
+      insertIssue({ companyId, identifier, status: "blocked", executionState: gateState, ...fields });
+
+    const live = await insertGated("SBMG-1", {
+      monitorNextCheckAt: new Date(Date.now() + hourMs),
+      monitorAttemptCount: 1,
+      executionPolicy: { monitor: { timeoutAt: new Date(Date.now() + 24 * hourMs).toISOString(), maxAttempts: 3 } },
+    });
+    const cleared = await insertGated("SBMG-2", {
+      monitorNextCheckAt: null,
+      executionState: {
+        monitor: { status: "cleared", clearReason: "trigger_stalled", gateSignals: ["pr:example/repo#3:review"] },
+      },
+    });
+    const overdue = await insertGated("SBMG-3", { monitorNextCheckAt: new Date(Date.now() - hourMs) });
+    const timedOut = await insertGated("SBMG-4", {
+      monitorNextCheckAt: new Date(Date.now() + 24 * hourMs),
+      executionPolicy: { monitor: { timeoutAt: new Date(Date.now() - hourMs).toISOString() } },
+    });
+    const exhausted = await insertGated("SBMG-5", {
+      monitorNextCheckAt: new Date(Date.now() + hourMs),
+      monitorAttemptCount: 3,
+      executionPolicy: { monitor: { maxAttempts: 3 } },
+    });
+
+    const suppressed = await listBlockedIssueAutoResumeSuppressions(
+      db,
+      companyId,
+      [live, cleared, overdue, timedOut, exhausted],
+      { triggerPath: "eager_status_recompute" },
+    );
+
+    expect(suppressed.get(live)).toMatchObject({ reason: "monitor_gate" });
+    const deadWakes = { cleared, overdue, timedOut, exhausted };
+    expect(Object.entries(deadWakes).filter(([, id]) => suppressed.has(id)).map(([name]) => name)).toEqual([]);
+  });
+
+  // BLO-30445: the matched pair is the whole point. Asserting only that the declared row
+  // survives cannot distinguish "the exemption works" from "the reconciler stopped running",
+  // and the QA fixture pair this replicates (BLO-30442 / BLO-30443) drained in the SAME
+  // transaction — so the control has to be reconciled in the same sweep, not a later one.
+  it("does not sweep an issue with a declared external wait, but still sweeps its undeclared twin", async () => {
+    const { companyId } = await createCompany("SBXW");
+    const declared = await insertIssue({
+      companyId,
+      identifier: "SBXW-1",
+      status: "blocked",
+      description: [
+        "Waiting on the ruleset change.",
+        "external owner: kkroo",
+        "external action: approve the onprem-k8s ruleset change",
+      ].join("\n"),
+    });
+    // Same gate, named in prose only — the documented non-match.
+    const control = await insertIssue({
+      companyId,
+      identifier: "SBXW-2",
+      status: "blocked",
+      description: "Waiting on kkroo to approve the onprem-k8s ruleset change.",
+    });
+
+    const result = await reconcileStrandedBlockedIssues(db);
+
+    expect(result.reconciled).toBe(1);
+    expect(await statusOf(declared)).toBe("blocked");
+    expect(await statusOf(control)).toBe("todo");
+
+    const suppressed = await listBlockedIssueAutoResumeSuppressions(db, companyId, [declared, control]);
+    expect(suppressed.get(declared)).toMatchObject({ reason: "external_wait" });
+    expect(suppressed.has(control)).toBe(false);
+
+    // Idempotent across ticks: AC1 wants the park to hold past more than one sweep.
+    expect((await reconcileStrandedBlockedIssues(db)).reconciled).toBe(0);
+    expect(await statusOf(declared)).toBe("blocked");
+  });
+
+  // The suppression reads the full `description` column. Callers that project a
+  // `substring(...)` preview parse a past-the-cutoff declaration as `null` (BLO-31839); if
+  // this one ever did, a long-description park would drain silently.
+  it("honours a declaration that sits past the description preview cutoff", async () => {
+    const { companyId } = await createCompany("SBXWL");
+    const declared = await insertIssue({
+      companyId,
+      identifier: "SBXWL-1",
+      status: "blocked",
+      description: [
+        "x".repeat(4000),
+        "external owner: kkroo",
+        "external action: approve the ruleset change",
+      ].join("\n"),
+    });
+
+    const result = await reconcileStrandedBlockedIssues(db);
+
+    expect(result.reconciled).toBe(0);
+    expect(await statusOf(declared)).toBe("blocked");
   });
 
   it("does not sweep an issue with an active stranded-run recovery action pointing at itself", async () => {
@@ -818,6 +1006,129 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
     expect(result.reconciled).toBe(0);
     expect(await statusOf(issueId)).toBe("blocked");
   });
+
+  /**
+   * BLO-30743: the two drains must reach a FIXED POINT on a row, not trade it.
+   *
+   * Production shape: a `stranded_assigned_issue` recovery action that has burned its wake
+   * horizon and gone `escalated`, on an issue with an empty blocker set. The reconciler
+   * sweeps it (its suppression set is `["active"]`, so `escalated` pins nothing — asserted
+   * directly by the SB7E case above). The producer, `resolveStrandedEscalationStatus`, is
+   * the other half: it used to test only whether an owner was NAMED, and an escalated
+   * action keeps `ownerAgentId` populated, so it wrote `blocked` straight back onto the row
+   * the reconciler had just drained.
+   *
+   * Measured on BLO-27999 before the fix: 458 activity events in 10.3h — 208
+   * `issue.escalation.needs_human_decision` (each one a Slack forward), 208 `issue.updated`,
+   * 42 `issue.stranded_blocked_reconciled` — and the same entity in 20 of 20 consecutive
+   * reconciler ticks.
+   */
+  describe("two-drain fixed point with a wake-exhausted escalation (BLO-30743)", () => {
+    async function seedOscillationCandidate(prefix: string) {
+      const { companyId, agentId } = await createCompany(prefix);
+      const stranded = await insertIssue({
+        companyId,
+        identifier: `${prefix}-1`,
+        status: "blocked",
+        assigneeAgentId: agentId,
+      });
+      await db.insert(issueRecoveryActions).values({
+        companyId,
+        sourceIssueId: stranded,
+        kind: "stranded_assigned_issue",
+        status: "escalated",
+        ownerAgentId: agentId,
+        cause: "stranded_assigned_issue",
+        fingerprint: `source_scoped_recovery:${companyId}:${stranded}:stranded_assigned_issue:${agentId}`,
+        nextAction: "Restore a live execution path.",
+        attemptCount: 748,
+        maxAttempts: 5,
+      });
+      return { companyId, agentId, stranded };
+    }
+
+    // The producer's decision for the row as the reconciler leaves it. Mirrors the call in
+    // `escalateStrandedAssignedIssue`, which passes `action.status === "escalated"`.
+    function producerDecisionFor(input: { currentStatus: string; ownerAgentId: string }) {
+      return resolveStrandedEscalationStatus({
+        currentStatus: input.currentStatus,
+        recoveryOwnerAgentId: input.ownerAgentId,
+        isWakeExhaustedEscalation: true,
+        isProviderQuotaWait: false,
+        blockerIssueIds: [],
+        recoveryCause: "stranded_assigned_issue",
+      });
+    }
+
+    it("converges after one flip and holds across three consecutive ticks", async () => {
+      const { agentId, stranded } = await seedOscillationCandidate("SBFP");
+
+      // Tick 1 — the reconciler drains the strand, exactly as it does in production.
+      const first = await reconcileStrandedBlockedIssues(db);
+      expect(first.reconciled).toBe(1);
+      expect(await statusOf(stranded)).toBe("todo");
+
+      // The producer now re-picks the row (`todo` is inside
+      // STRANDED_ASSIGNED_ISSUE_STATUSES) and decides what to write back. Before the fix
+      // this returned `blocked`, restarting the cycle; it must agree with the reconciler.
+      const decision = producerDecisionFor({ currentStatus: "todo", ownerAgentId: agentId });
+      expect(decision).toEqual({ status: "todo", hasNoRecoveryPath: true });
+      await db.update(issues).set({ status: decision.status }).where(eq(issues.id, stranded));
+
+      // Ticks 2 and 3 — nothing left to reconcile, and the row never returns to `blocked`.
+      for (const _tick of [2, 3]) {
+        const sweep = await reconcileStrandedBlockedIssues(db);
+        expect(sweep.reconciled).toBe(0);
+        const status = await statusOf(stranded);
+        expect(status).toBe("todo");
+        const again = producerDecisionFor({ currentStatus: status!, ownerAgentId: agentId });
+        expect(again.status).toBe("todo");
+        await db.update(issues).set({ status: again.status }).where(eq(issues.id, stranded));
+      }
+
+      expect(await statusOf(stranded)).toBe("todo");
+    });
+
+    it("logs exactly one reconciliation for the row across the three ticks", async () => {
+      // The measured signal in the issue's verifying section: today the same entityId
+      // repeats in 20 of 20 consecutive ticks. One flip total is the target.
+      const { stranded, agentId } = await seedOscillationCandidate("SBFPA");
+
+      await reconcileStrandedBlockedIssues(db);
+      const decision = producerDecisionFor({ currentStatus: "todo", ownerAgentId: agentId });
+      await db.update(issues).set({ status: decision.status }).where(eq(issues.id, stranded));
+      await reconcileStrandedBlockedIssues(db);
+      await reconcileStrandedBlockedIssues(db);
+
+      const reconciliations = await db
+        .select({ action: activityLog.action })
+        .from(activityLog)
+        .where(eq(activityLog.entityId, stranded));
+      expect(reconciliations).toEqual([{ action: "issue.stranded_blocked_reconciled" }]);
+    });
+
+    it("still parks — and stays parked — when the same row has a real blocker edge", async () => {
+      // The fixed point must not be reached by making every row dispatchable. With an
+      // unresolved dependency the reconciler declines and the producer writes `blocked`;
+      // both agree on the opposite answer, which is equally a fixed point.
+      const { companyId, agentId, stranded } = await seedOscillationCandidate("SBFPB");
+      const blocker = await insertIssue({ companyId, identifier: "SBFPB-2", status: "todo" });
+      await block({ companyId, blockerIssueId: blocker, blockedIssueId: stranded });
+
+      const sweep = await reconcileStrandedBlockedIssues(db);
+
+      expect(sweep.reconciled).toBe(0);
+      expect(await statusOf(stranded)).toBe("blocked");
+      expect(resolveStrandedEscalationStatus({
+        currentStatus: "blocked",
+        recoveryOwnerAgentId: agentId,
+        isWakeExhaustedEscalation: true,
+        isProviderQuotaWait: false,
+        blockerIssueIds: [blocker],
+        recoveryCause: "stranded_assigned_issue",
+      })).toEqual({ status: "blocked", hasNoRecoveryPath: false });
+    });
+  });
 });
 
 describe("startStrandedBlockedIssueReconciler", () => {
@@ -864,4 +1175,5 @@ describe("startStrandedBlockedIssueReconciler", () => {
     expect(transactionCount).toBe(2);
     stop();
   });
+
 });

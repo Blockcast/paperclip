@@ -7,7 +7,7 @@
  * `unknownCast` helper to keep us inside strict TS.
  */
 
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import {
   AlertDeliveryIncompleteError,
   WebhookUnauthorizedError,
@@ -19,11 +19,13 @@ import {
 } from "../webhook-handler.js";
 import {
   handleRecoveryApiRequest,
+  listAggregateFiringFences,
   LIST_AGGREGATE_FIRING_FENCES_ROUTE,
   RECOVER_AGGREGATE_FIRING_ROUTE,
   RECOVER_AGGREGATE_FIRING_ACTION,
   registerRecoveryAction,
 } from "../recovery-action.js";
+import manifest from "../manifest.js";
 import {
   CompanyScopeUnavailableError,
   authenticateWebhook,
@@ -51,6 +53,39 @@ import type {
   PluginWebhookInput,
 } from "@paperclipai/plugin-sdk";
 
+/**
+ * BLO-31036 — the firing tail is guarded, so `ctx.state.set` and
+ * `ctx.events.emit` take one more argument on that path: the generation the
+ * host checks.
+ *
+ * The two are pinned separately and under different option names on purpose,
+ * because the guarantees differ. `state.set`'s `fencing` is a true fence — the
+ * host takes the generation lock inside the write's own transaction and holds
+ * it to commit. `events.emit`'s `ownershipCheck` is a best-effort pre-dispatch
+ * check on an in-memory fan-out that has no transaction to join; a steal in the
+ * check -> dispatch window still delivers. Both halves are pinned at the host in
+ * `server/src/__tests__/plugin-events-ownership-check.test.ts`.
+ *
+ * Pinned, not ignored. Relaxing these to `expect.anything()` — or dropping the
+ * trailing argument so vitest only checks a prefix — would leave them green
+ * with the guard removed, which is the exact regression they now catch. The
+ * token itself is a per-claim UUID, so its presence and the phase holding it
+ * are the strongest things assertable without reaching into the fence table.
+ */
+const FIRING_GENERATION_MATCH = {
+  table: "alertmanager_aggregate_lifecycle_fences",
+  match: expect.objectContaining({
+    phase: "firing",
+    firing_token: expect.any(String),
+  }),
+};
+
+/** `ctx.state.set(..., { fencing })` — a true transactional fence. */
+const FIRING_FENCE_ARG = { fencing: FIRING_GENERATION_MATCH };
+
+/** `ctx.events.emit(..., { ownershipCheck })` — best-effort, not a fence. */
+const FIRING_EMIT_OWNERSHIP_ARG = { ownershipCheck: FIRING_GENERATION_MATCH };
+
 // ---------------------------------------------------------------------------
 // Test fixtures
 // ---------------------------------------------------------------------------
@@ -63,6 +98,21 @@ const TOKEN = "super-secret-token";
 // would otherwise be exercising the misconfiguration path.
 const FALLBACK_AGENT_NAME = "Ops Triage";
 const FALLBACK_AGENT_ID = "agent-fallback-1";
+
+/**
+ * The firing-generation barrier's read (BLO-31036): "do I still hold the fence
+ * I claimed?", issued before the delivery's first aggregate side effect.
+ *
+ * Every firing scenario in this file is a single uncontended delivery, so the
+ * truthful answer is yes. A mock that answered `[]` would be asserting that
+ * each of them was displaced mid-flight, which is not what they are about.
+ * Fence *contention* is exercised against a real PostgreSQL in
+ * aggregate-fence-restart-safety.test.ts — reproducing it here would only
+ * re-assert the mock, the trap that file's header documents.
+ */
+const FENCE_GENERATION_SELECT =
+  /SELECT 1[\s\S]*alertmanager_aggregate_lifecycle_fences[\s\S]*firing_token/i;
+const HELD_FENCE = [{ "?column?": 1 }];
 
 const baseAlert = (overrides: Partial<AlertmanagerAlert> = {}): AlertmanagerAlert => ({
   status: "firing",
@@ -197,7 +247,10 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
         }
         return { rowCount: 0 };
       }),
-      query: vi.fn(async () => []),
+      query: vi.fn(async (sql: string) => {
+        if (FENCE_GENERATION_SELECT.test(sql)) return HELD_FENCE;
+        return [];
+      }),
     },
     events: { emit: vi.fn(async () => {}) },
     metrics: { write: vi.fn(async () => {}) },
@@ -226,12 +279,47 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
   // The cast is contained to test code where it's documented and the
   // mocks satisfy the subset of the surface the handler actually touches.
   const ctx = mocks as unknown as PluginContext;
+  issuedContexts.push(mocks);
   return { ctx, mocks };
 };
 
+// Every `ctx.db.query` the plugin issues has to satisfy the host's SELECT-only
+// contract (`validatePluginRuntimeQuery`, server/src/services/plugin-database.ts).
+// This mock used to accept any SQL, so an `UPDATE ... RETURNING` routed through
+// `ctx.db.query` passed every test in this file and then threw
+// "ctx.db.query only allows SELECT statements" against the real host, 502-ing
+// every resolve delivery for an aggregate-tracked fingerprint for ~26.5h
+// (BLO-31035). Asserting the rule over the recorded calls — rather than inside
+// the mock implementation — keeps the guard in force for the tests that install
+// their own `db.query` implementation, so each of them covers the bug class too.
+const issuedContexts: MockClients[] = [];
+
+const assertQueryIsSelectOnly = (sql: string) => {
+  const normalized = sql.trim().toLowerCase().replace(/\s+/g, " ");
+  const preview = sql.trim().slice(0, 140);
+  expect(
+    normalized.startsWith("select ") || normalized.startsWith("with "),
+    `ctx.db.query only allows SELECT statements, got: ${preview}`,
+  ).toBe(true);
+  expect(
+    /\b(insert|update|delete|alter|create|drop|truncate)\b/.test(normalized),
+    `ctx.db.query cannot contain mutation or DDL keywords, got: ${preview}`,
+  ).toBe(false);
+};
+
 beforeEach(() => {
+  issuedContexts.length = 0;
   vi.clearAllMocks();
   resetCredentialHealth();
+});
+
+afterEach(() => {
+  for (const mocks of issuedContexts) {
+    for (const call of mocks.db.query.mock.calls) {
+      const sql = call[0];
+      if (typeof sql === "string") assertQueryIsSelectOnly(sql);
+    }
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -545,6 +633,7 @@ describe("handleWebhook — firing first time", () => {
         severity: "critical",
         resolvedAt: null,
       }),
+      FIRING_FENCE_ARG,
     );
 
     // Firing event emitted
@@ -557,6 +646,7 @@ describe("handleWebhook — firing first time", () => {
         assigneeUserId: "user-42",
         reFired: false,
       }),
+      FIRING_EMIT_OWNERSHIP_ARG,
     );
     // Activity + metric
     expect(mocks.activity.log).toHaveBeenCalled();
@@ -580,15 +670,303 @@ describe("handleWebhook — firing first time", () => {
   it("fails closed when the fallback agent configuration is missing", async () => {
     const { ctx, mocks } = mkCtx();
     const config = baseConfig({ ownerMap: {}, fallbackAgentName: undefined });
+    // The fail-closed guarantee (BLO-26613) is unchanged and still asserted
+    // below: no ownerless issue, no state row. PEN-2581 changed only how the
+    // drop is *reported* — an unresolvable owner is a config/roster fact no
+    // retry can fix, so the delivery acknowledges it instead of failing.
     await expect(
       handleWebhook(ctx, config, true, baseInput()),
-    ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+    ).resolves.toBeUndefined();
     expect(mocks.issues.create).not.toHaveBeenCalled();
     expect(mocks.state.set).not.toHaveBeenCalled();
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.owner.fallback_failed",
       1,
+      {
+        alertname: "CiliumPolicyDropsHigh",
+        severity: "critical",
+        refusal: "permanent",
+      },
+    );
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.alert.permanent_error",
+      1,
       { alertname: "CiliumPolicyDropsHigh", severity: "critical" },
+    );
+  });
+
+  it("drops one ownerless alert without aborting the loop or failing the delivery", async () => {
+    // What this pins, stated precisely, because the obvious reading is wrong:
+    // the per-alert catch in `handleWebhook` ALREADY kept the rest of the batch
+    // processing before PEN-2581. The catch is inside the loop and
+    // `AlertDeliveryIncompleteError` is thrown only after it completes, so a
+    // sibling alert's issue was created on the first attempt even when the
+    // delivery reported 502. Verified by running it, not assumed, and
+    // reproducible as written: neutralise the carve-out (`const permanent =
+    // false` at the per-alert catch in `webhook-handler.ts`), then comment out
+    // BOTH the outcome assertion below and the `permanent_error` assertion at
+    // the end — on the pre-change source that alert reports through
+    // `alertmanager.alert.error`. The `issues.create` and `alert:` state
+    // assertions still pass. Both have to be neutralised first because Vitest
+    // aborts a test at its first failing assertion, so a run that trips the
+    // outcome assertion never reaches the ones that carry the point.
+    //
+    // What PEN-2581 actually changed is the delivery's reported *outcome*: the
+    // ownerless fingerprint is no longer accumulated, so Alertmanager is no
+    // longer told to retry a batch 15-17× for a fault no retry can fix, and the
+    // resulting failure storm no longer masks genuinely-transient failures that
+    // retrying would have fixed.
+    //
+    // The production incident did dark-tier every alert, but for an
+    // incident-specific reason rather than a structural one: with
+    // `fallbackAgentName` unset, *every* unmapped alert in the batch took this
+    // same throw, so there were no healthy siblings left to survive. That case
+    // is real and reachable — it is just not what "one ownerless alert" does to
+    // a mixed batch, which is what this test covers.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ fallbackAgentName: undefined });
+    // team=platform resolves through ownerMap; team=storage is unmapped, and
+    // with no fallbackAgentName it is permanently ownerless.
+    mocks.users.findByEmail.mockResolvedValue({
+      id: "user-42",
+      email: "alice@example.com",
+      name: "Alice",
+    });
+    const owned = baseAlert({
+      labels: {
+        alertname: "CiliumPolicyDropsHigh",
+        severity: "critical",
+        team: "platform",
+        node: "pve-3",
+      },
+      fingerprint: "aaaa1111",
+    });
+    const ownerless = baseAlert({
+      labels: {
+        alertname: "CephOsdNearFull",
+        severity: "critical",
+        team: "storage",
+        node: "pve-4",
+      },
+      fingerprint: "bbbb2222",
+    });
+
+    await expect(
+      handleWebhook(
+        ctx,
+        config,
+        true,
+        baseInput({
+          parsedBody: baseEnvelope({ alerts: [ownerless, owned] }),
+        }),
+      ),
+    ).resolves.toBeUndefined();
+
+    // The healthy alert still became tracked work — and it is ordered SECOND in
+    // the payload, behind the ownerless one, so this pins that the permanent
+    // drop does not abort the remainder of the loop.
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+    expect(mocks.issues.create.mock.calls[0][0].title).toBe(
+      "[critical] CiliumPolicyDropsHigh · platform",
+    );
+    // The other half of the BLO-26613 fail-closed guarantee, asserted here and
+    // not only in the single-alert tests: the ownerless alert must leave no
+    // state row behind, and a multi-alert batch is where that is easiest to
+    // regress.
+    //
+    // Filtered to `alert:` keys rather than counting `state.set` calls
+    // outright: the healthy alert's owner lookup also memoises
+    // `owner-by-email:…` on the instance scope, so a raw count would be 2 and
+    // would couple this fail-closed assertion to an unrelated cache. Keying on
+    // the fingerprint says the thing we actually mean — one alert row, and it
+    // belongs to the alert that got an issue.
+    const alertStateWrites = mocks.state.set.mock.calls.filter((call) =>
+      String(call[0].stateKey).startsWith("alert:"),
+    );
+    expect(alertStateWrites).toHaveLength(1);
+    expect(alertStateWrites[0][0].stateKey).toBe(`alert:${owned.fingerprint}`);
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.alert.permanent_error",
+      1,
+      { alertname: "CephOsdNearFull", severity: "critical" },
+    );
+  });
+
+  // The permanent drop above is driven by *unset config*, which returns before
+  // `agents.list` is ever called. This one is driven by roster contents: the
+  // name is configured and correct-looking, and the refusal is decided by what
+  // the list came back with. That is the branch every roster-derived permanent
+  // refusal actually takes in production — `agents.list` filters terminated
+  // agents out, so a terminated fallback owner never reaches the eligibility
+  // ladder and lands here as an unmatched name instead.
+  it("permanently drops when the configured name is absent from the roster", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ ownerMap: {} });
+    // A non-empty roster that simply does not contain the configured name —
+    // indistinguishable from a typo, and correctly permanent.
+    mocks.agents.list.mockResolvedValue([
+      { id: "agent-other", name: "Someone Else", status: "idle" },
+    ]);
+
+    await expect(
+      handleWebhook(ctx, config, true, baseInput()),
+    ).resolves.toBeUndefined();
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.state.set).not.toHaveBeenCalled();
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.owner.fallback_failed",
+      1,
+      {
+        alertname: "CiliumPolicyDropsHigh",
+        severity: "critical",
+        refusal: "permanent",
+      },
+    );
+  });
+
+  // The guard that separates a degraded host from a wrong name. Same "no
+  // match" outcome as the test directly above, opposite refusal class, and the
+  // only difference in the input is that the roster is empty rather than merely
+  // lacking the name. An `agents.list` that fails by *returning* `[]` instead
+  // of throwing would otherwise be dropped at 200 and never retried, while the
+  // throwing variant of the identical fault keeps its retry window.
+  it("keeps the retry window when the roster comes back empty", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ ownerMap: {} });
+    mocks.agents.list.mockResolvedValue([]);
+
+    await expect(
+      handleWebhook(ctx, config, true, baseInput()),
+    ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+
+    // Fail-closed is intact either way — the class change is about the
+    // reporting channel, never about creating an ownerless issue.
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.state.set).not.toHaveBeenCalled();
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.owner.fallback_failed",
+      1,
+      {
+        alertname: "CiliumPolicyDropsHigh",
+        severity: "critical",
+        refusal: "transient",
+      },
+    );
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.alert.permanent_error",
+      1,
+      expect.anything(),
+    );
+  });
+
+  it("keeps the retry window when the fallback agent is only paused", async () => {
+    // The counterpart to the permanent drop above, and the case that makes the
+    // refusal *class* load-bearing rather than cosmetic. A paused fallback owner
+    // becomes invokable again with nobody editing config, so Alertmanager's
+    // 15-17 retries are the only thing that lets the alert land within minutes
+    // of the unpause instead of waiting out a whole `repeat_interval`. Dropping
+    // it at 200 here would be a time-to-detect regression for a critical alert.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ ownerMap: {} });
+    mocks.agents.list.mockResolvedValue([
+      { id: "agent-fallback", name: "Alert Fallback", status: "paused" },
+    ]);
+
+    await expect(
+      handleWebhook(ctx, config, true, baseInput()),
+    ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+
+    // Fail-closed is still intact — a paused owner is no more assignable than a
+    // terminated one; only the reporting channel differs.
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.state.set).not.toHaveBeenCalled();
+    // Reported as transient, NOT permanent.
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.alert.error",
+      1,
+      { alertname: "CiliumPolicyDropsHigh", severity: "critical" },
+    );
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.alert.permanent_error",
+      1,
+      expect.anything(),
+    );
+    // The `refusal` label's other value, pinned here because the permanent test
+    // above pins only `"permanent"`. Splitting drop-from-retry within this one
+    // series is the label's entire purpose, so a regression that hardcoded
+    // `"permanent"` at the write site would otherwise pass the whole suite —
+    // the alert-level metric split asserted just above would still be correct.
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.owner.fallback_failed",
+      1,
+      {
+        alertname: "CiliumPolicyDropsHigh",
+        severity: "critical",
+        refusal: "transient",
+      },
+    );
+    // The operator-facing warning names the blocking reason, so the next
+    // occurrence is diagnosable from the log alone (PEN-2581).
+    expect(mocks.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("agent-fallback=paused"),
+    );
+  });
+
+  it("still acknowledges a permanent drop when the metrics write fails", async () => {
+    // The permanent drop's own invariant must not depend on telemetry being up.
+    // If the `fallback_failed` write threw, handleFiring would surface a
+    // *metrics* error instead of PermanentAlertError, the per-alert catch would
+    // treat it as transient and push the fingerprint, and the delivery would
+    // 502 — reinstating the doomed retry burst this path exists to remove, and
+    // taking the rest of the batch down with it.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ ownerMap: {}, fallbackAgentName: undefined });
+    mocks.metrics.write.mockImplementation(async (name: string) => {
+      if (name === "alertmanager.owner.fallback_failed") {
+        throw new Error("metrics backend unavailable");
+      }
+    });
+
+    await expect(
+      handleWebhook(ctx, config, true, baseInput()),
+    ).resolves.toBeUndefined();
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.state.set).not.toHaveBeenCalled();
+    // The permanent classification survived the telemetry outage.
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.alert.permanent_error",
+      1,
+      { alertname: "CiliumPolicyDropsHigh", severity: "critical" },
+    );
+    // And the swallowed metrics failure is still audible in the log.
+    expect(mocks.logger.error).toHaveBeenCalledWith(
+      expect.stringContaining("failed to record fallback owner metric"),
+    );
+  });
+
+  it("still fails the delivery for a transient per-alert fault", async () => {
+    // Control for the two tests above: the permanent carve-out must not have
+    // widened into "swallow every per-alert failure". A transient fault still
+    // owes Alertmanager a retry, so it still fails the delivery and still
+    // reports through the transient metric (BLO-20467's silent-loss guard).
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig();
+    mocks.issues.create.mockRejectedValueOnce(new Error("issue RPC timed out"));
+
+    await expect(
+      handleWebhook(ctx, config, true, baseInput()),
+    ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.alert.error",
+      1,
+      { alertname: "CiliumPolicyDropsHigh", severity: "critical" },
+    );
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.alert.permanent_error",
+      1,
+      expect.anything(),
     );
   });
 
@@ -611,6 +989,7 @@ describe("handleWebhook — firing first time", () => {
         paperclipIssueId: "issue-winner",
         assigneeAgentId: "agent-owner",
       }),
+      FIRING_FENCE_ARG,
     );
   });
 
@@ -675,6 +1054,7 @@ describe("handleWebhook — firing first time", () => {
         assigneeAgentId: BLOCKCAST_PHYSICAL_INFRA_AGENT_ID,
         assigneeUserId: null,
       }),
+      FIRING_FENCE_ARG,
     );
   });
 
@@ -830,6 +1210,17 @@ describe("handleWebhook — dedup on re-fire", () => {
       "issue-existing",
       expect.objectContaining({ description: expect.any(String) }),
       "company-1",
+      undefined,
+      expect.objectContaining({
+        fencing: {
+          table: "alertmanager_aggregate_lifecycle_fences",
+          match: expect.objectContaining({
+            company_id: "company-1",
+            phase: "firing",
+            firing_token: expect.any(String),
+          }),
+        },
+      }),
     );
     const updatePatch = mocks.issues.update.mock.calls[0][1];
     expect(updatePatch.status).toBeUndefined();
@@ -875,15 +1266,28 @@ describe("handleWebhook — dedup on re-fire", () => {
       "issue-existing",
       expect.objectContaining({ description: expect.any(String) }),
       "company-1",
+      undefined,
+      expect.objectContaining({
+        fencing: {
+          table: "alertmanager_aggregate_lifecycle_fences",
+          match: expect.objectContaining({
+            company_id: "company-1",
+            phase: "firing",
+            firing_token: expect.any(String),
+          }),
+        },
+      }),
     );
     expect(mocks.state.set).toHaveBeenCalledWith(
       expect.any(Object),
       expect.objectContaining({ lastFiredAt: expect.any(String), resolvedAt: null }),
+      FIRING_FENCE_ARG,
     );
     expect(mocks.events.emit).toHaveBeenCalledWith(
       "alertmanager.alert.firing",
       "company-1",
       expect.objectContaining({ fingerprint: "legacy-info-1", reFired: true }),
+      FIRING_EMIT_OWNERSHIP_ARG,
     );
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.firing.deduped",
@@ -910,9 +1314,16 @@ describe("handleWebhook — dedup on re-fire", () => {
       firstSeenAt: "2026-04-29T08:00:00Z",
       lastFiredAt: "2026-04-29T08:00:00Z",
       resolvedAt: "2026-04-29T09:00:00Z",
+      // BLO-31736: the recurrence contract is keyed on *our* close, recorded
+      // here, not on `resolvedAt`. `cancelled` (not `done`) is what the plugin
+      // actually writes on resolve — it has no code path that writes `done`.
+      pluginClosedAt: "2026-04-29T09:00:00Z",
     };
     mocks.state.get.mockResolvedValueOnce(existing);
-    mocks.issues.get.mockResolvedValueOnce({ id: "issue-existing", status: "done" });
+    mocks.issues.get.mockResolvedValueOnce({
+      id: "issue-existing",
+      status: "cancelled",
+    });
 
     await handleWebhook(ctx, config, true, baseInput());
 
@@ -920,6 +1331,17 @@ describe("handleWebhook — dedup on re-fire", () => {
       "issue-existing",
       expect.objectContaining({ status: "todo" }),
       "company-1",
+      undefined,
+      expect.objectContaining({
+        fencing: {
+          table: "alertmanager_aggregate_lifecycle_fences",
+          match: expect.objectContaining({
+            company_id: "company-1",
+            phase: "firing",
+            firing_token: expect.any(String),
+          }),
+        },
+      }),
     );
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.firing.reopened",
@@ -970,6 +1392,17 @@ describe("handleWebhook — dedup on re-fire", () => {
       "issue-winner",
       expect.objectContaining({ description: expect.any(String) }),
       "company-1",
+      undefined,
+      expect.objectContaining({
+        fencing: {
+          table: "alertmanager_aggregate_lifecycle_fences",
+          match: expect.objectContaining({
+            company_id: "company-1",
+            phase: "firing",
+            firing_token: expect.any(String),
+          }),
+        },
+      }),
     );
     expect(mocks.state.set).toHaveBeenCalledWith(
       expect.any(Object),
@@ -978,6 +1411,7 @@ describe("handleWebhook — dedup on re-fire", () => {
         assigneeAgentId: "agent-owner",
         resolvedAt: null,
       }),
+      FIRING_FENCE_ARG,
     );
     expect(mocks.events.emit).toHaveBeenCalledWith(
       "alertmanager.alert.firing",
@@ -986,6 +1420,7 @@ describe("handleWebhook — dedup on re-fire", () => {
         paperclipIssueId: "issue-winner",
         reFired: true,
       }),
+      FIRING_EMIT_OWNERSHIP_ARG,
     );
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.aggregate.rebound",
@@ -1016,6 +1451,362 @@ describe("handleWebhook — dedup on re-fire", () => {
     expect(mocks.issues.update).not.toHaveBeenCalled();
     expect(mocks.metrics.write).not.toHaveBeenCalledWith(
       "alertmanager.firing.reopened",
+      expect.any(Number),
+      expect.any(Object),
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BLO-31736 — multi-cycle: a deliberate close must survive fire/clear churn
+//
+// Every re-fire test above is single-shot: one delivery against a hand-written
+// state row. That is why this defect shipped. The terminal guard in
+// `handleResolved` refuses to overwrite an agent's `done`, so the *first*
+// cycle looks correct — and the same delivery writes `resolvedAt`, which the
+// next re-fire read as "the plugin closed this" and acted on. The failure is
+// only observable across two cycles, so these tests carry both the state row
+// and the issue's status forward between deliveries the way production does.
+//
+// Deliberately NOT stubbed per-call: `issues.update` mutates the live issue, so
+// if a delivery does resurrect the row, the following delivery sees a
+// non-terminal issue and the cancel genuinely lands. The second-stage
+// assertion therefore observes the real cascade rather than assuming it.
+// ---------------------------------------------------------------------------
+
+describe("handleWebhook — closure authorship across cycles (BLO-31736)", () => {
+  /**
+   * Wire the mocks into a small live world: one alert state row and one issue,
+   * both read back on every delivery and mutated by the handler's own writes.
+   */
+  const mkCycleWorld = (
+    mocks: MockClients,
+    opts: { issueStatus: string; state: AlertStateRecord },
+  ) => {
+    const world = {
+      issue: { id: "issue-existing", status: opts.issueStatus },
+      state: { ...opts.state } as AlertStateRecord,
+    };
+    mocks.state.get.mockImplementation(async () => world.state);
+    mocks.state.set.mockImplementation(async (_ref: unknown, record: AlertStateRecord) => {
+      world.state = { ...record };
+    });
+    mocks.issues.get.mockImplementation(async () => ({ ...world.issue }));
+    mocks.issues.update.mockImplementation(
+      async (_id: string, patch: { status?: string }) => {
+        if (patch.status) world.issue.status = patch.status;
+        return { id: world.issue.id };
+      },
+    );
+    return world;
+  };
+
+  const firingDelivery = () => baseInput();
+  const resolvedDelivery = (endsAt: string) =>
+    baseInput({
+      parsedBody: baseEnvelope({
+        status: "resolved",
+        alerts: [baseAlert({ status: "resolved", endsAt })],
+      }),
+    });
+
+  /** State as it stands right after a fresh firing created the issue. */
+  const freshlyFiredState = (): AlertStateRecord => ({
+    paperclipIssueId: "issue-existing",
+    paperclipCompanyId: "company-1",
+    assigneeUserId: null,
+    assigneeAgentId: "agent-1",
+    alertname: "CiliumPolicyDropsHigh",
+    severity: "critical",
+    firstSeenAt: "2026-04-29T08:00:00Z",
+    lastFiredAt: "2026-04-29T08:00:00Z",
+    resolvedAt: null,
+    pluginClosedAt: null,
+  });
+
+  const statusPatches = (mocks: MockClients) =>
+    mocks.issues.update.mock.calls
+      .map(([, patch]) => (patch as { status?: string }).status)
+      .filter((s): s is string => typeof s === "string");
+
+  it("never resurrects an agent's `done` across resolve → re-fire → resolve", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ autoCloseOnResolve: true });
+    // An agent investigated this alert and closed it `done` — the deliberate
+    // terminal disposition this whole ticket is about protecting.
+    const world = mkCycleWorld(mocks, {
+      issueStatus: "done",
+      state: freshlyFiredState(),
+    });
+
+    // Cycle 1 — the alert clears. The terminal guard holds (this already
+    // worked), but the state write is what used to plant the defect.
+    await handleWebhook(ctx, config, true, resolvedDelivery("2026-04-29T10:00:00Z"));
+    expect(statusPatches(mocks)).toEqual([]);
+    expect(world.state.resolvedAt).toBe("2026-04-29T10:00:00Z");
+    // The load-bearing line: the alert resolved, but WE did not close it.
+    expect(world.state.pluginClosedAt).toBeNull();
+
+    // Cycle 2 — the alert re-fires. This is the delivery that used to patch
+    // the row back to `todo` (AC 1).
+    await handleWebhook(ctx, config, true, firingDelivery());
+    expect(statusPatches(mocks)).not.toContain("todo");
+    expect(world.issue.status).toBe("done");
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.firing.suppressed",
+      1,
+      expect.objectContaining({ alertname: "CiliumPolicyDropsHigh" }),
+    );
+
+    // Cycle 2 clears — the step that used to convert the `done` into a
+    // plugin-authored `cancelled`, because the row was no longer terminal.
+    await handleWebhook(ctx, config, true, resolvedDelivery("2026-04-30T10:00:00Z"));
+    expect(statusPatches(mocks)).not.toContain("cancelled");
+    expect(world.issue.status).toBe("done");
+
+    // And it stays fixed on the next day's fire, not just the first one.
+    await handleWebhook(ctx, config, true, firingDelivery());
+    expect(statusPatches(mocks)).toEqual([]);
+    expect(world.issue.status).toBe("done");
+  });
+
+  it("reaches operator suppression for a hand-cancelled row whose alert resolved before", async () => {
+    // AC 2. Suppression used to require `resolvedAt` to be null — i.e. an
+    // alert that had never once cleared — which made it dead code for every
+    // flapping alert, precisely the ones operators close by hand.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ autoCloseOnResolve: true });
+    const world = mkCycleWorld(mocks, {
+      issueStatus: "todo",
+      state: freshlyFiredState(),
+    });
+
+    // The plugin's own close, on a genuine resolve.
+    await handleWebhook(ctx, config, true, resolvedDelivery("2026-04-29T10:00:00Z"));
+    expect(world.issue.status).toBe("cancelled");
+    expect(world.state.pluginClosedAt).toBe("2026-04-29T10:00:00Z");
+
+    // Re-fire: our close, so this correctly re-opens (AC 3).
+    await handleWebhook(ctx, config, true, firingDelivery());
+    expect(world.issue.status).toBe("todo");
+    expect(world.state.pluginClosedAt).toBeNull();
+
+    // Now an operator cancels it by hand while the alert is still firing.
+    world.issue.status = "cancelled";
+
+    // The alert clears. The guard declines to re-close it; authorship must
+    // stay "not ours" rather than being inferred from the new `resolvedAt`.
+    await handleWebhook(ctx, config, true, resolvedDelivery("2026-04-30T10:00:00Z"));
+    expect(world.state.resolvedAt).toBe("2026-04-30T10:00:00Z");
+    expect(world.state.pluginClosedAt).toBeNull();
+
+    // ...so the next re-fire honours the operator instead of re-opening.
+    mocks.issues.update.mockClear();
+    await handleWebhook(ctx, config, true, firingDelivery());
+    expect(statusPatches(mocks)).not.toContain("todo");
+    expect(world.issue.status).toBe("cancelled");
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.firing.suppressed",
+      1,
+      expect.objectContaining({ alertname: "CiliumPolicyDropsHigh" }),
+    );
+  });
+
+  it("keeps re-opening its own close when a resolved notification is redelivered", async () => {
+    // AC 3, and the regression the conditional write exists for. Alertmanager
+    // can redeliver a `resolved` notification. The second one finds the issue
+    // already `cancelled`, so the guard holds and no cancel of ours lands on
+    // THAT delivery — but our earlier close still stands, so clearing the
+    // authorship record here would mute the next genuine recurrence.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ autoCloseOnResolve: true });
+    const world = mkCycleWorld(mocks, {
+      issueStatus: "todo",
+      state: freshlyFiredState(),
+    });
+
+    await handleWebhook(ctx, config, true, resolvedDelivery("2026-04-29T10:00:00Z"));
+    expect(world.issue.status).toBe("cancelled");
+    await handleWebhook(ctx, config, true, resolvedDelivery("2026-04-29T10:00:00Z"));
+    expect(world.state.pluginClosedAt).toBe("2026-04-29T10:00:00Z");
+
+    await handleWebhook(ctx, config, true, firingDelivery());
+    expect(world.issue.status).toBe("todo");
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.firing.reopened",
+      1,
+      expect.objectContaining({ alertname: "CiliumPolicyDropsHigh" }),
+    );
+  });
+
+  it("clears resolvedAt on a re-fire whose issue read failed, so escalation still runs", async () => {
+    // `resolvedAt` is also the escalation sweep's kill-switch —
+    // `advanceIssueLadder` bails on it before any rung. Freezing it to protect
+    // the authorship fallback left an open, firing issue un-escalatable until a
+    // later delivery happened to apply a decision: one `repeat_interval` of
+    // paging nobody. A failed read must leave our recorded authorship alone AND
+    // must not leave the alert reading as "cleared".
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ autoCloseOnResolve: true });
+    const world = mkCycleWorld(mocks, { issueStatus: "todo", state: freshlyFiredState() });
+
+    await handleWebhook(ctx, config, true, resolvedDelivery("2026-04-29T10:00:00Z"));
+    expect(world.issue.status).toBe("cancelled");
+
+    mocks.issues.get.mockRejectedValueOnce(new Error("issues.get exploded"));
+    await handleWebhook(ctx, config, true, firingDelivery());
+    expect(world.state.resolvedAt).toBeNull();
+    expect(world.state.escalationComplete).toBe(false);
+    expect(Date.parse(world.state.nextEscalationAt as string)).toBeGreaterThan(Date.now());
+    expect(world.state.pluginClosedAt).toBe("2026-04-29T10:00:00Z");
+
+    // The next readable re-fire still knows the close was ours.
+    await handleWebhook(ctx, config, true, firingDelivery());
+    expect(world.issue.status).toBe("todo");
+  });
+
+  it("carries a legacy row's inferred authorship across a failed issue read", async () => {
+    // A row from before `pluginClosedAt` existed has only `resolvedAt` to say
+    // who closed it. Clearing that on a delivery that applied nothing would turn
+    // our own close into an apparent operator close and mute the next re-fire;
+    // freezing it mutes escalation instead (test above). So the write records
+    // what the fallback would have concluded, and clears `resolvedAt` anyway.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ autoCloseOnResolve: true });
+    const world = mkCycleWorld(mocks, {
+      issueStatus: "cancelled",
+      state: {
+        ...freshlyFiredState(),
+        resolvedAt: "2026-04-29T10:00:00Z",
+        pluginClosedAt: undefined,
+      },
+    });
+
+    mocks.issues.get.mockRejectedValueOnce(new Error("issues.get exploded"));
+    await handleWebhook(ctx, config, true, firingDelivery());
+    expect(world.state.resolvedAt).toBeNull();
+    expect(world.state.pluginClosedAt).toBe("2026-04-29T10:00:00Z");
+
+    await handleWebhook(ctx, config, true, firingDelivery());
+    expect(world.issue.status).toBe("todo");
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.firing.suppressed",
+      expect.any(Number),
+      expect.any(Object),
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // The tests above are single-*fingerprint*, which is the same blind spot one
+  // level up from the single-*shot* tests that let the original defect ship.
+  // `pluginClosedAt` lives on the per-fingerprint state row, but the close it
+  // records happens to a shared issue, and only the last member to resolve
+  // actually lands it. So the record and the fact it records sit at different
+  // scopes, and the gap is invisible until an aggregate has two members.
+  // -------------------------------------------------------------------------
+  it("re-opens for a non-last aggregate member whose sibling landed the cancel", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ autoCloseOnResolve: true });
+    const AGG = "CiliumPolicyDropsHigh|critical";
+    const memberState = (): AlertStateRecord => ({
+      ...freshlyFiredState(),
+      paperclipIssueId: "issue-shared",
+      aggregateKey: AGG,
+      // Both members fired, so both rows carry the firing write's "no close of
+      // ours on record" — the value that used to persist into the shared
+      // issue's cancellation and mute the non-last member.
+      pluginClosedAt: null,
+      lastFiredAt: "2026-04-29T08:00:00Z",
+    });
+
+    // One shared issue, one state row per member fingerprint, and a members
+    // table that reports a sibling unresolved until both have cleared.
+    const rows: Record<string, AlertStateRecord> = {
+      "alert-a": memberState(),
+      "alert-b": memberState(),
+    };
+    const resolvedMembers = new Set<string>();
+    const issue = { id: "issue-shared", status: "todo" };
+    const fpOf = (ref: { stateKey: string }) => ref.stateKey.replace(/^alert:/, "");
+
+    mocks.state.get.mockImplementation(async (ref: { stateKey: string }) => rows[fpOf(ref)] ?? null);
+    mocks.state.set.mockImplementation(
+      async (ref: { stateKey: string }, record: AlertStateRecord) => {
+        rows[fpOf(ref)] = { ...record };
+      },
+    );
+    mocks.issues.get.mockImplementation(async () => ({ ...issue }));
+    mocks.issues.update.mockImplementation(async (_id: string, patch: { status?: string }) => {
+      if (patch.status) issue.status = patch.status;
+      return { id: issue.id };
+    });
+    mocks.db.execute.mockImplementation(async (sql: string, params: unknown[]) => {
+      if (/UPDATE alertmanager\.alertmanager_aggregate_members/i.test(sql)) {
+        resolvedMembers.add(String(params[2]));
+        return { rowCount: 1 };
+      }
+      if (/INSERT INTO alertmanager\.alertmanager_aggregate_members/i.test(sql)) {
+        resolvedMembers.delete(String(params[2]));
+        return { rowCount: 1 };
+      }
+      return { rowCount: 1 };
+    });
+    mocks.db.query.mockImplementation(async (sql: string) => {
+      if (FENCE_GENERATION_SELECT.test(sql)) return HELD_FENCE;
+      if (/SELECT issue_id\s+FROM alertmanager\.alertmanager_aggregate_members/i.test(sql)) {
+        return [{ issue_id: "issue-shared" }];
+      }
+      // The unresolved-sibling probe: true until every member has cleared.
+      if (/SELECT 1 AS one/i.test(sql)) {
+        return Object.keys(rows).some((fp) => !resolvedMembers.has(fp)) ? [{ one: 1 }] : [];
+      }
+      return [];
+    });
+
+    const deliver = (fingerprint: string, endsAt?: string) =>
+      handleWebhook(
+        ctx,
+        config,
+        true,
+        baseInput({
+          parsedBody: baseEnvelope({
+            status: endsAt ? "resolved" : "firing",
+            alerts: [
+              baseAlert({
+                fingerprint,
+                ...(endsAt ? { status: "resolved" as const, endsAt } : {}),
+              }),
+            ],
+          }),
+        }),
+      );
+
+    // Member A clears first. Its cancel is deferred to the sibling, so this
+    // delivery decided nothing about authorship — and must not keep asserting
+    // the firing write's `null`, which is now a claim it cannot back.
+    await deliver("alert-a", "2026-04-29T10:00:00Z");
+    expect(issue.status).toBe("todo");
+    expect(rows["alert-a"].resolvedAt).toBe("2026-04-29T10:00:00Z");
+    expect(rows["alert-a"].pluginClosedAt).toBeUndefined();
+
+    // Member B clears last, so the aggregate's cancel lands here. B records the
+    // close it authored; A cannot be reached to record anything.
+    await deliver("alert-b", "2026-04-29T10:05:00Z");
+    expect(issue.status).toBe("cancelled");
+    expect(rows["alert-b"].pluginClosedAt).toBe("2026-04-29T10:05:00Z");
+
+    // A re-fires against an issue the plugin itself cancelled. This is a
+    // genuine recurrence: before the fix A's `null` read as an operator close
+    // and muted it for the whole suppression window.
+    await deliver("alert-a");
+    expect(issue.status).toBe("todo");
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.firing.reopened",
+      1,
+      expect.objectContaining({ alertname: "CiliumPolicyDropsHigh" }),
+    );
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.firing.suppressed",
       expect.any(Number),
       expect.any(Object),
     );
@@ -1109,6 +1900,17 @@ describe("handleWebhook — operator suppression (BLO-24234)", () => {
       "issue-existing",
       expect.objectContaining({ status: "todo" }),
       "company-1",
+      undefined,
+      expect.objectContaining({
+        fencing: {
+          table: "alertmanager_aggregate_lifecycle_fences",
+          match: expect.objectContaining({
+            company_id: "company-1",
+            phase: "firing",
+            firing_token: expect.any(String),
+          }),
+        },
+      }),
     );
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.firing.suppression_expired",
@@ -1119,6 +1921,16 @@ describe("handleWebhook — operator suppression (BLO-24234)", () => {
       "issue-existing",
       expect.stringContaining("kept firing past"),
       "company-1",
+      expect.objectContaining({
+        fencing: {
+          table: "alertmanager_aggregate_lifecycle_fences",
+          match: expect.objectContaining({
+            company_id: "company-1",
+            phase: "firing",
+            firing_token: expect.any(String),
+          }),
+        },
+      }),
     );
     const written = mocks.state.set.mock.calls.at(-1)?.[1] as AlertStateRecord;
     expect(written.operatorSuppressedAt).toBeNull();
@@ -1520,12 +2332,13 @@ describe("aggregate firing fence recovery", () => {
     expect(JSON.stringify(mocks.activity.log.mock.calls)).not.toContain(token);
   });
 
-  it("lists only firing fences through the board operator API and marks the token response non-cacheable", async () => {
+  it("returns a held fence with its phase through the board operator API and marks the token response non-cacheable", async () => {
     const { ctx, mocks } = mkCtx();
     const token = "firing-token-for-operator";
     mocks.db.query.mockResolvedValueOnce([
       {
         aggregate_key: aggregateKey,
+        phase: "firing",
         firing_token: token,
         updated_at: "2026-08-11T19:10:00.000Z",
       },
@@ -1554,8 +2367,11 @@ describe("aggregate firing fence recovery", () => {
       body: {
         fences: [{
           aggregateKey,
+          phase: "firing",
           firingToken: token,
           updatedAt: "2026-08-11T19:10:00.000Z",
+          ownerInstanceId: null,
+          ownerSlot: null,
         }],
       },
     });
@@ -1563,6 +2379,137 @@ describe("aggregate firing fence recovery", () => {
       expect.stringContaining("phase = 'firing'"),
       ["company-1"],
     );
+  });
+
+  // BLO-35053 — an agent can diagnose a wedged fence but cannot act on it.
+  // `aggregate_key`/`phase` never reach Prometheus (the host promotes only
+  // manifest-declared promotable tags), so without this the only agent-readable
+  // signal is a mean hold age dimensioned by alertname.
+  describe("BLO-35053 — agent-readable diagnostic listing", () => {
+    const agentActor = {
+      actorType: "agent",
+      actorId: "agent-1",
+      userId: null,
+      agentId: "agent-1",
+      runId: "run-1",
+    } as const;
+
+    const listInput = {
+      routeKey: LIST_AGGREGATE_FIRING_FENCES_ROUTE,
+      method: "GET",
+      path: "/aggregate-firing-fences",
+      params: {},
+      query: { companyId: "company-1" },
+      body: null,
+      actor: agentActor,
+      companyId: "company-1",
+      headers: {},
+    } satisfies PluginApiRequestInput;
+
+    it("returns phase, age and owner fields to an agent with the bearer token OMITTED", async () => {
+      const { ctx, mocks } = mkCtx();
+      const token = "firing-token-must-not-leak-to-agent";
+      mocks.db.query.mockResolvedValueOnce([
+        {
+          aggregate_key: aggregateKey,
+          phase: "firing",
+          firing_token: token,
+          updated_at: "2026-09-21T06:00:00.000Z",
+          owner_instance_id: "paperclip-0",
+          owner_slot: "slot-3",
+        },
+      ]);
+
+      const result = await handleRecoveryApiRequest(ctx, listInput);
+
+      expect(result).toEqual({
+        headers: { "cache-control": "no-store" },
+        body: {
+          fences: [{
+            aggregateKey,
+            phase: "firing",
+            updatedAt: "2026-09-21T06:00:00.000Z",
+            ownerInstanceId: "paperclip-0",
+            ownerSlot: "slot-3",
+          }],
+        },
+      });
+      // Absent, not nulled: the token is the whole capability `recover` accepts.
+      const [fence] = (result.body as { fences: Record<string, unknown>[] }).fences;
+      expect(Object.hasOwn(fence, "firingToken")).toBe(false);
+      expect(JSON.stringify(result)).not.toContain(token);
+      // Assert the SQL, not just the mapping: the mock ignores the query text,
+      // so mapper-only assertions pass even if the columns are never selected.
+      const [sql] = mocks.db.query.mock.calls[0];
+      expect(sql).toContain("owner_instance_id");
+      expect(sql).toContain("owner_slot");
+
+      // The read is deliberately not activity-logged (an activity row per
+      // diagnostic poll is noise), so this debug line is the only thing that
+      // attributes it. Assert the token does not ride along: the fence rows
+      // that carry it are in scope at the call site.
+      const [logLine] = mocks.logger.debug.mock.calls.at(-1) as [string];
+      expect(logLine).toContain("agent");
+      expect(logLine).toContain("agent-1");
+      expect(logLine).toContain("company-1");
+      expect(logLine).toContain("1 fence(s)");
+      expect(logLine).not.toContain(token);
+    });
+
+    it("still refuses `recover` to that same agent identity", async () => {
+      const { ctx, mocks } = mkCtx();
+
+      await expect(handleRecoveryApiRequest(ctx, {
+        ...listInput,
+        routeKey: RECOVER_AGGREGATE_FIRING_ROUTE,
+        method: "POST",
+        path: "/aggregate-firing-fences/recover",
+        query: {},
+        // Same company, well-formed body: the ONLY thing refusing this is the
+        // actor check, so the 403 cannot be a company-mismatch false pass.
+        body: {
+          companyId: "company-1",
+          aggregateKey,
+          firingToken: "firing-token-for-operator",
+        },
+      } satisfies PluginApiRequestInput)).resolves.toEqual({
+        status: 403,
+        body: { error: "Alertmanager aggregate firing recovery failed" },
+      });
+      expect(mocks.db.execute).not.toHaveBeenCalled();
+    });
+
+    it("never returns another company's fences to an agent", async () => {
+      const { ctx, mocks } = mkCtx();
+
+      // A mismatched query param is refused outright...
+      await expect(handleRecoveryApiRequest(ctx, {
+        ...listInput,
+        query: { companyId: "company-2" },
+      } satisfies PluginApiRequestInput)).resolves.toEqual({
+        status: 400,
+        body: { error: "Alertmanager aggregate firing recovery failed" },
+      });
+      expect(mocks.db.query).not.toHaveBeenCalled();
+
+      // ...and the read is parameterized by the HOST-resolved company, so a
+      // matching param can still only ever read the caller's own company.
+      mocks.db.query.mockResolvedValueOnce([]);
+      await handleRecoveryApiRequest(ctx, listInput);
+      expect(mocks.db.query).toHaveBeenCalledWith(
+        expect.stringContaining("company_id = $1"),
+        ["company-1"],
+      );
+    });
+
+    it("pins the declared route auth: listing board-or-agent, recover board-only", () => {
+      const routes = manifest.apiRoutes ?? [];
+      expect(routes.find((r) => r.routeKey === LIST_AGGREGATE_FIRING_FENCES_ROUTE)?.auth)
+        .toBe("board-or-agent");
+      // AC3: widening the listing must not widen the mutation.
+      expect(routes.find((r) => r.routeKey === RECOVER_AGGREGATE_FIRING_ROUTE)?.auth)
+        .toBe("board");
+    });
   });
 
   it("recovers an exact token through the board operator API without returning or auditing it", async () => {
@@ -1683,6 +2630,531 @@ describe("aggregate firing fence recovery", () => {
       body: { error: "Alertmanager aggregate firing recovery failed" },
     });
     expect(mocks.db.execute).not.toHaveBeenCalled();
+  });
+});
+
+describe("PEN-2581 — a wedged aggregate fence names the phase that actually blocked it", () => {
+  const aggregateKey = 'alert-aggregate:v1:["CiliumPolicyDropsHigh",null]';
+
+  /**
+   * Refuse the firing-fence upsert and report `heldPhase` on read-back, which is
+   * exactly what production looked like: the conditional upsert matched no row,
+   * so the delivery threw and Alertmanager retried the whole batch forever.
+   */
+  const wedgeFenceAt = (mocks: MockClients, heldPhase: string) => {
+    mocks.db.execute.mockImplementation(async (sql: string) => {
+      if (/INSERT INTO alertmanager\.alertmanager_aggregate_lifecycle_fences/i.test(sql)) {
+        return { rowCount: 0 };
+      }
+      if (
+        /INSERT INTO alertmanager\.alertmanager_aggregate_creation_claims/i.test(sql) ||
+        /INSERT INTO alertmanager\.alertmanager_aggregate_members/i.test(sql) ||
+        /DELETE FROM alertmanager\.alertmanager_aggregate_creation_claims/i.test(sql) ||
+        /UPDATE alertmanager\.alertmanager_aggregate_lifecycle_fences/i.test(sql)
+      ) {
+        return { rowCount: 1 };
+      }
+      return { rowCount: 0 };
+    });
+    mocks.db.query.mockImplementation(async (sql: string) =>
+      /SELECT phase/i.test(sql) ? [{ phase: heldPhase }] : [],
+    );
+  };
+
+  // The regression that cost six days of fleet-wide alert loss. The upsert
+  // admits 'active' and 'finalizing', so 'finalizing' is the one phase that
+  // CANNOT refuse a firing claim — yet the old message named it unconditionally.
+  // Operators diagnosed against a condition that was never occurring.
+  it.each(["firing", "cancelling"])(
+    "reports the real holding phase %s, and never claims 'finalizing'",
+    async (heldPhase) => {
+      const { ctx, mocks } = mkCtx();
+      wedgeFenceAt(mocks, heldPhase);
+
+      await expect(
+        handleWebhook(ctx, baseConfig(), true, baseInput()),
+      ).rejects.toThrow(AlertDeliveryIncompleteError);
+
+      const logged = mocks.logger.error.mock.calls
+        .map((call) => String(call[0]))
+        .join("\n");
+      expect(logged).toContain(`is held in phase '${heldPhase}'`);
+      expect(logged).toContain(aggregateKey);
+      // The precise false statement that misdirected the investigation.
+      expect(logged).not.toContain("is finalizing");
+      // A fence abandoned by a dead process now self-clears via its slot's next
+      // worker (BLO-31036), so a *persistent* refusal means the holder is live
+      // or in another slot. The error must still name the operator escape hatch
+      // for that case.
+      expect(logged).toContain("recover-aggregate-firing");
+    },
+  );
+
+  it("reports 'unknown' rather than a phase it did not read when the fence row is gone", async () => {
+    const { ctx, mocks } = mkCtx();
+    wedgeFenceAt(mocks, "firing");
+    mocks.db.query.mockImplementation(async () => []);
+
+    await expect(
+      handleWebhook(ctx, baseConfig(), true, baseInput()),
+    ).rejects.toThrow(AlertDeliveryIncompleteError);
+
+    const logged = mocks.logger.error.mock.calls
+      .map((call) => String(call[0]))
+      .join("\n");
+    expect(logged).toContain("is held in phase 'unknown'");
+  });
+});
+
+describe("PEN-2581 — an interrupted cancellation is listable and recoverable", () => {
+  const aggregateKey = 'alert-aggregate:v1:["CdnEdgePublicPrDown",null]';
+  const resolutionToken = "resolution-token-interrupted";
+
+  // A resolver that dies between beginAggregateCancellation and
+  // releaseAggregateFinalization leaves phase='cancelling' held by a token no
+  // live process has. That refuses every later firing claim, so without these
+  // two paths the aggregate is wedged permanently: previously it was neither
+  // listed (the query filtered phase='firing') nor releasable.
+  it("lists a stuck cancelling fence so the operator can find its token", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.db.query.mockResolvedValueOnce([
+      {
+        aggregate_key: aggregateKey,
+        phase: "cancelling",
+        firing_token: resolutionToken,
+        updated_at: "2026-08-25T21:20:24.000Z",
+      },
+    ]);
+
+    await expect(listAggregateFiringFences(ctx, "company-1")).resolves.toEqual([
+      {
+        aggregateKey,
+        phase: "cancelling",
+        firingToken: resolutionToken,
+        updatedAt: "2026-08-25T21:20:24.000Z",
+        ownerInstanceId: null,
+        ownerSlot: null,
+      },
+    ]);
+
+    const [sql] = mocks.db.query.mock.calls[0];
+    expect(sql).toContain("phase = 'cancelling'");
+    expect(sql).toContain("resolution_token IS NOT NULL");
+  });
+
+  it("releases a cancelling fence on its resolution token, and only that token", async () => {
+    const { ctx, mocks } = mkCtx();
+    let phase: "cancelling" | "active" = "cancelling";
+    mocks.db.execute.mockImplementation(async (sql: string, params?: unknown[]) => {
+      const [companyId, requestedKey, requestedToken] = params ?? [];
+      const matches =
+        companyId === "company-1" &&
+        requestedKey === aggregateKey &&
+        requestedToken === resolutionToken;
+      if (/AND phase = 'cancelling'/i.test(sql) && phase === "cancelling" && matches) {
+        phase = "active";
+        return { rowCount: 1 };
+      }
+      return { rowCount: 0 };
+    });
+
+    // Wrong token releases nothing — the same CAS discipline as the firing path.
+    await expect(
+      recoverAggregateFiring(ctx, "company-1", aggregateKey, "wrong-token"),
+    ).resolves.toBe(false);
+    expect(phase).toBe("cancelling");
+
+    await expect(
+      recoverAggregateFiring(ctx, "company-1", aggregateKey, resolutionToken),
+    ).resolves.toBe(true);
+    expect(phase).toBe("active");
+    expect(mocks.db.execute).toHaveBeenLastCalledWith(
+      expect.stringContaining("AND resolution_token = $3"),
+      ["company-1", aggregateKey, resolutionToken],
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BLO-24177 — a terminal severity never becomes agent-actionable work
+// ---------------------------------------------------------------------------
+
+describe("handleWebhook — terminal severities (BLO-24177)", () => {
+  it("creates a severity=none alert already `done` and unassigned, bypassing owner/route resolution", async () => {
+    const { ctx, mocks } = mkCtx();
+    // ownerMap and issueRouteMap both have matching entries — proving the
+    // terminal path skips resolution entirely rather than resolving and
+    // then discarding the result.
+    const config = baseConfig({
+      ownerMap: { alertname: { Watchdog: "agent:c0bccc75-a449-4ece-a789-ce40bdd8e785" } },
+      issueRouteMap: DEFAULT_ISSUE_ROUTE_MAP,
+    });
+    const alert = baseAlert({
+      labels: { alertname: "Watchdog", severity: "none" },
+      annotations: {},
+      fingerprint: "watchdog-1",
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+    const createArgs = mocks.issues.create.mock.calls[0][0];
+    expect(createArgs.status).toBe("done");
+    expect(createArgs.assigneeAgentId).toBeUndefined();
+    expect(createArgs.assigneeUserId).toBeUndefined();
+    expect(createArgs.projectId).toBeUndefined();
+    expect(createArgs.goalId).toBeUndefined();
+    expect(mocks.users.findByEmail).not.toHaveBeenCalled();
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.objectContaining({ stateKey: "alert:watchdog-1" }),
+      expect.objectContaining({ assigneeUserId: null, assigneeAgentId: null }),
+      FIRING_FENCE_ARG,
+    );
+  });
+
+  it("re-fire on an already-done terminal issue only refreshes the description (no reopen)", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig();
+    const existing: AlertStateRecord = {
+      paperclipIssueId: "issue-watchdog",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      alertname: "Watchdog",
+      severity: "none",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+    };
+    mocks.state.get.mockResolvedValueOnce(existing);
+    mocks.issues.get.mockResolvedValueOnce({ id: "issue-watchdog", status: "done" });
+    const alert = baseAlert({
+      labels: { alertname: "Watchdog", severity: "none" },
+      fingerprint: "watchdog-1",
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      "issue-watchdog",
+      expect.objectContaining({ description: expect.any(String) }),
+      "company-1",
+      undefined,
+      FIRING_FENCE_ARG,
+    );
+    const updatePatch = mocks.issues.update.mock.calls[0][1];
+    expect(updatePatch.status).toBeUndefined();
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.firing.reopened",
+      expect.any(Number),
+      expect.any(Object),
+    );
+  });
+
+  it("never re-opens a terminal row when the BLO-24234 suppression window expires", async () => {
+    // Regression guard for the BLO-24177 × BLO-24234 interaction. `decideRefire`
+    // reads any done/cancelled row as an *operator* close, so a terminal row that
+    // had banked a suppression anchor would, once the window lapsed, be re-opened
+    // as `todo` with an "you closed this but it kept firing" comment — silently
+    // re-manufacturing the agent-actionable Watchdog row this feature removes,
+    // ~24h after deploy. The terminal path must bypass that helper entirely.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig();
+    const existing: AlertStateRecord = {
+      paperclipIssueId: "issue-watchdog",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      alertname: "Watchdog",
+      severity: "none",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+      // Well past DEFAULT_OPERATOR_SUPPRESSION_HOURS (24).
+      operatorSuppressedAt: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(),
+    };
+    mocks.state.get.mockResolvedValueOnce(existing);
+    mocks.issues.get.mockResolvedValueOnce({ id: "issue-watchdog", status: "done" });
+    const alert = baseAlert({
+      labels: { alertname: "Watchdog", severity: "none" },
+      fingerprint: "watchdog-1",
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+
+    // Refreshed as evidence, never re-opened as work.
+    const updatePatch = mocks.issues.update.mock.calls[0][1];
+    expect(updatePatch.status).toBeUndefined();
+    expect(updatePatch.description).toEqual(expect.any(String));
+    expect(mocks.issues.update).not.toHaveBeenCalledWith(
+      "issue-watchdog",
+      expect.objectContaining({ status: "todo" }),
+      "company-1",
+    );
+    // No operator-close narrative applies: the plugin closed this row itself.
+    expect(mocks.issues.createComment).not.toHaveBeenCalled();
+    for (const suppressionMetric of [
+      "alertmanager.firing.reopened",
+      "alertmanager.firing.suppression_expired",
+      "alertmanager.firing.suppressed",
+    ]) {
+      expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+        suppressionMetric,
+        expect.any(Number),
+        expect.any(Object),
+      );
+    }
+    // The anchor is dropped rather than carried: a terminal row can never be
+    // operator-suppressed, so leaving it set would re-arm this every window.
+    const written = mocks.state.set.mock.calls.at(-1)?.[1] as AlertStateRecord;
+    expect(written.operatorSuppressedAt).toBeNull();
+  });
+
+  it("never banks a suppression anchor on a terminal row inside the window", async () => {
+    // Second, independent guard on the same interaction. Even before the window
+    // lapses, routing a terminal row through `decideRefire` would persist an
+    // `operatorSuppressedAt` anchor onto its state record — state that is
+    // meaningless for a row the plugin closes itself, and that is precisely
+    // what the expiry branch later reads to justify a re-open. Pinning it here
+    // means the row never accumulates the input to that decision in the first
+    // place, not merely that the decision is overridden downstream.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig();
+    const existing: AlertStateRecord = {
+      paperclipIssueId: "issue-watchdog",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      alertname: "Watchdog",
+      severity: "none",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+      // Well inside DEFAULT_OPERATOR_SUPPRESSION_HOURS (24).
+      operatorSuppressedAt: new Date(Date.now() - 1 * 60 * 60 * 1000).toISOString(),
+    };
+    mocks.state.get.mockResolvedValueOnce(existing);
+    mocks.issues.get.mockResolvedValueOnce({ id: "issue-watchdog", status: "done" });
+    const alert = baseAlert({
+      labels: { alertname: "Watchdog", severity: "none" },
+      fingerprint: "watchdog-1",
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+
+    const written = mocks.state.set.mock.calls.at(-1)?.[1] as AlertStateRecord;
+    expect(written.operatorSuppressedAt).toBeNull();
+    // The delivery is still recorded as evidence, not swallowed as "suppressed".
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      "issue-watchdog",
+      expect.objectContaining({ description: expect.any(String) }),
+      "company-1",
+      undefined,
+      FIRING_FENCE_ARG,
+    );
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.firing.suppressed",
+      expect.any(Number),
+      expect.any(Object),
+    );
+  });
+
+  it("converges an assigned non-terminal severity=none row to unassigned `done`", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig();
+    const existing: AlertStateRecord = {
+      paperclipIssueId: "issue-watchdog",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: "user-watchdog",
+      assigneeAgentId: "agent-watchdog",
+      alertname: "Watchdog",
+      severity: "none",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+    };
+    mocks.state.get.mockResolvedValueOnce(existing);
+    mocks.issues.get.mockResolvedValueOnce({
+      id: "issue-watchdog",
+      status: "todo",
+      assigneeUserId: "user-watchdog",
+      assigneeAgentId: "agent-watchdog",
+    });
+    const alert = baseAlert({
+      labels: { alertname: "Watchdog", severity: "none" },
+      fingerprint: "watchdog-1",
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      "issue-watchdog",
+      expect.objectContaining({
+        status: "done",
+        description: expect.any(String),
+        assigneeAgentId: null,
+        assigneeUserId: null,
+      }),
+      "company-1",
+      undefined,
+      FIRING_FENCE_ARG,
+    );
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.objectContaining({ stateKey: "alert:watchdog-1" }),
+      expect.objectContaining({ assigneeUserId: null, assigneeAgentId: null }),
+      FIRING_FENCE_ARG,
+    );
+    // Not the reopen path — that metric is reserved for the resolvedAt=>done=>todo flow.
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.firing.reopened",
+      expect.any(Number),
+      expect.any(Object),
+    );
+  });
+
+  it("returns an auto-cancelled terminal issue to `done` on re-fire", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig();
+    const existing: AlertStateRecord = {
+      paperclipIssueId: "issue-watchdog",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: null,
+      alertname: "Watchdog",
+      severity: "none",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: "2026-04-29T09:00:00Z",
+    };
+    mocks.state.get.mockResolvedValueOnce(existing);
+    mocks.issues.get.mockResolvedValueOnce({
+      id: "issue-watchdog",
+      status: "cancelled",
+    });
+    const alert = baseAlert({
+      labels: { alertname: "Watchdog", severity: "none" },
+      fingerprint: "watchdog-1",
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      "issue-watchdog",
+      expect.objectContaining({
+        status: "done",
+        description: expect.any(String),
+        assigneeAgentId: null,
+        assigneeUserId: null,
+      }),
+      "company-1",
+      undefined,
+      FIRING_FENCE_ARG,
+    );
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.objectContaining({ stateKey: "alert:watchdog-1" }),
+      expect.objectContaining({ resolvedAt: null }),
+      FIRING_FENCE_ARG,
+    );
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.firing.reopened",
+      expect.any(Number),
+      expect.any(Object),
+    );
+  });
+
+  it("recovers a done terminal issue after state loss instead of creating a duplicate", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig();
+    mocks.state.get.mockResolvedValueOnce(null);
+    mocks.issues.list.mockResolvedValueOnce([
+      {
+        id: "issue-watchdog",
+        status: "done",
+        assigneeUserId: "user-watchdog",
+        assigneeAgentId: "agent-watchdog",
+      },
+    ]);
+    mocks.issues.get.mockResolvedValueOnce({
+      id: "issue-watchdog",
+      status: "done",
+      assigneeUserId: "user-watchdog",
+      assigneeAgentId: "agent-watchdog",
+    });
+    const alert = baseAlert({
+      labels: { alertname: "Watchdog", severity: "none" },
+      fingerprint: "watchdog-1",
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+
+    expect(mocks.issues.list).toHaveBeenCalledWith({
+      companyId: "company-1",
+      originKind: ORIGIN_KIND,
+      originId: "watchdog-1",
+      limit: 1,
+    });
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      "issue-watchdog",
+      expect.objectContaining({
+        description: expect.any(String),
+        assigneeAgentId: null,
+        assigneeUserId: null,
+      }),
+      "company-1",
+      undefined,
+      FIRING_FENCE_ARG,
+    );
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.objectContaining({ stateKey: "alert:watchdog-1" }),
+      expect.objectContaining({
+        paperclipIssueId: "issue-watchdog",
+        assigneeUserId: null,
+        assigneeAgentId: null,
+      }),
+      FIRING_FENCE_ARG,
+    );
+  });
+
+  it("fails the delivery when terminal convergence cannot clear the assignee", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig();
+    const existing: AlertStateRecord = {
+      paperclipIssueId: "issue-watchdog",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: "agent-watchdog",
+      alertname: "Watchdog",
+      severity: "none",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: null,
+    };
+    mocks.state.get.mockResolvedValueOnce(existing);
+    mocks.issues.get.mockResolvedValueOnce({
+      id: "issue-watchdog",
+      status: "todo",
+      assigneeAgentId: "agent-watchdog",
+    });
+    mocks.issues.update.mockRejectedValueOnce(new Error("issues.update unavailable"));
+    const alert = baseAlert({
+      labels: { alertname: "Watchdog", severity: "none" },
+      fingerprint: "watchdog-1",
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await expect(
+      handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope })),
+    ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+    expect(mocks.state.set).not.toHaveBeenCalled();
   });
 });
 
@@ -1834,7 +3306,7 @@ describe("handleWebhook — resolved", () => {
     };
     mocks.state.get.mockResolvedValueOnce(existing);
     mocks.db.query.mockImplementation(async (sql: string) => {
-      if (/UPDATE alertmanager\.alertmanager_aggregate_members/i.test(sql)) {
+      if (/SELECT issue_id\s+FROM alertmanager\.alertmanager_aggregate_members/i.test(sql)) {
         return [{ issue_id: "issue-winner" }];
       }
       if (/SELECT 1 AS one/i.test(sql)) return [{ one: 1 }];
@@ -1883,7 +3355,7 @@ describe("handleWebhook — resolved", () => {
     };
     mocks.state.get.mockResolvedValueOnce(existing);
     mocks.db.query.mockImplementation(async (sql: string) => {
-      if (/UPDATE alertmanager\.alertmanager_aggregate_members/i.test(sql)) {
+      if (/SELECT issue_id\s+FROM alertmanager\.alertmanager_aggregate_members/i.test(sql)) {
         return [{ issue_id: "issue-winner" }];
       }
       if (/SELECT 1 AS one/i.test(sql)) return [];
@@ -1932,7 +3404,7 @@ describe("handleWebhook — resolved", () => {
     };
     mocks.state.get.mockResolvedValueOnce(existing);
     mocks.db.query.mockImplementation(async (sql: string, params?: unknown[]) => {
-      if (/UPDATE alertmanager\.alertmanager_aggregate_members/i.test(sql)) {
+      if (/SELECT issue_id\s+FROM alertmanager\.alertmanager_aggregate_members/i.test(sql)) {
         expect(params).toEqual([
           "company-1",
           firingAggregateKey,
@@ -2056,7 +3528,8 @@ describe("handleWebhook — resolved", () => {
       return { rowCount: 0 };
     });
     mocks.db.query.mockImplementation(async (sql: string) => {
-      if (/UPDATE alertmanager\.alertmanager_aggregate_members/i.test(sql)) {
+      if (FENCE_GENERATION_SELECT.test(sql)) return HELD_FENCE;
+      if (/SELECT issue_id\s+FROM alertmanager\.alertmanager_aggregate_members/i.test(sql)) {
         return [{ issue_id: "issue-winner" }];
       }
       if (/SELECT 1 AS one/i.test(sql)) return hasConcurrentMember ? [{ one: 1 }] : [];
@@ -2097,6 +3570,7 @@ describe("handleWebhook — resolved", () => {
     expect(mocks.state.set).toHaveBeenCalledWith(
       expect.objectContaining({ stateKey: "alert:concurrent-firing" }),
       expect.objectContaining({ paperclipIssueId: "issue-winner", resolvedAt: null }),
+      FIRING_FENCE_ARG,
     );
   });
 
@@ -2119,9 +3593,18 @@ describe("handleWebhook — resolved", () => {
         /INSERT INTO alertmanager\.alertmanager_aggregate_lifecycle_fences/i.test(sql) &&
         /phase, firing_token/i.test(sql)
       ) {
-        // A cancellation fence is never leaseable: a delayed canceller could
+        // Refuse the claim: the fence is held by a canceller that could still
+        // act — either a live delivery in this same process, or a holder in
+        // another slot. Neither is stealable, because a delayed canceller could
         // otherwise close the issue after this firing attached a live member.
-        return { rowCount: /'cancelling'/i.test(sql) ? 1 : 0 };
+        //
+        // Refused unconditionally rather than by sniffing the SQL for
+        // `'cancelling'`: since BLO-31036 the claim statement names that phase
+        // in its own steal predicate, so the literal is no longer a proxy for
+        // the stored phase. Which owners are and are not stealable is asserted
+        // against a modelled fence table in
+        // `aggregate-fence-restart-safety.test.ts`.
+        return { rowCount: 0 };
       }
       return { rowCount: 1 };
     });
@@ -2414,6 +3897,7 @@ describe("handleWebhook — resolved", () => {
       },
     ]);
     mocks.db.query.mockImplementation(async (sql: string) => {
+      if (FENCE_GENERATION_SELECT.test(sql)) return HELD_FENCE;
       if (/SELECT issue_id, aggregate_key/i.test(sql)) return [resolvedMember];
       return [];
     });
@@ -2447,6 +3931,17 @@ describe("handleWebhook — resolved", () => {
       "issue-aggregate-winner",
       expect.objectContaining({ description: expect.any(String) }),
       "company-1",
+      undefined,
+      expect.objectContaining({
+        fencing: {
+          table: "alertmanager_aggregate_lifecycle_fences",
+          match: expect.objectContaining({
+            company_id: "company-1",
+            phase: "firing",
+            firing_token: expect.any(String),
+          }),
+        },
+      }),
     );
     expect(mocks.state.set).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -2460,6 +3955,7 @@ describe("handleWebhook — resolved", () => {
         assigneeAgentId: "agent-winner",
         resolvedAt: null,
       }),
+      FIRING_FENCE_ARG,
     );
     expect(mocks.db.query).toHaveBeenCalledWith(
       expect.stringContaining("resolved_at IS NULL"),
@@ -2602,12 +4098,27 @@ describe("handleWebhook — severity → priority", () => {
     const { ctx, mocks } = mkCtx();
     const config = baseConfig();
     const alert = baseAlert({
-      labels: { alertname: "X", severity: "page" },
+      labels: { alertname: "X", severity: "nonsense" },
     });
     const envelope = baseEnvelope({ alerts: [alert] });
     await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
     const createArgs = mocks.issues.create.mock.calls[0][0];
     expect(createArgs.priority).toBe("medium");
+  });
+
+  // BLO-27018: `page` is a real emitted severity, not an unknown one. It used
+  // to be this suite's example of an unknown value, which pinned the defect
+  // end-to-end: a page alert was created at `medium`.
+  it("files severity=page at critical priority", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig();
+    const alert = baseAlert({
+      labels: { alertname: "LLMProxyHighErrorRate", severity: "page", team: "devops" },
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+    const createArgs = mocks.issues.create.mock.calls[0][0];
+    expect(createArgs.priority).toBe("critical");
   });
 });
 
@@ -2933,6 +4444,7 @@ describe("handleWebhook — creation policy", () => {
     expect(mocks.state.set).toHaveBeenCalledWith(
       expect.objectContaining({ stateKey: "alert:series-loser" }),
       expect.objectContaining({ paperclipIssueId: "issue-winner" }),
+      FIRING_FENCE_ARG,
     );
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.aggregate.joined",
@@ -2964,6 +4476,7 @@ describe("handleWebhook — creation policy", () => {
     expect(mocks.state.set).toHaveBeenCalledWith(
       expect.any(Object),
       expect.objectContaining({ paperclipIssueId: "issue-winner" }),
+      FIRING_FENCE_ARG,
     );
     expect(mocks.issues.list).toHaveBeenCalledWith(
       expect.objectContaining({ status: "blocked", limit: 1 }),
@@ -3031,10 +4544,12 @@ describe("BLO-20467 — alert state is namespaced per company", () => {
     expect(mocks.state.set).toHaveBeenCalledWith(
       { scopeKind: "company", scopeId: "company-A", stateKey: `alert:${alert.fingerprint}` },
       expect.objectContaining({ paperclipIssueId: "issue-A", paperclipCompanyId: "company-A" }),
+      FIRING_FENCE_ARG,
     );
     expect(mocks.state.set).toHaveBeenCalledWith(
       { scopeKind: "company", scopeId: "company-B", stateKey: `alert:${alert.fingerprint}` },
       expect.objectContaining({ paperclipIssueId: "issue-B", paperclipCompanyId: "company-B" }),
+      FIRING_FENCE_ARG,
     );
   });
 
@@ -3291,6 +4806,7 @@ describe("BLO-20467 — firing retries are idempotent across create/state-write"
     expect(mocks.state.set).toHaveBeenLastCalledWith(
       expect.objectContaining({ scopeKind: "company", stateKey: "alert:9a3b1e4c5f6d7890" }),
       expect.objectContaining({ paperclipIssueId: "issue-from-attempt-1", resolvedAt: null }),
+      FIRING_FENCE_ARG,
     );
   });
 
@@ -3346,11 +4862,83 @@ describe("decideRefire", () => {
   });
 
   it("re-opens a terminal issue the plugin closed on resolve", () => {
-    for (const status of ["done", "cancelled"]) {
-      expect(
-        decideRefire({ status }, { resolvedAt: ago(1), operatorSuppressedAt: null }, cfg(), NOW),
-      ).toEqual({ kind: "reopen", reason: "plugin_resolved" });
-    }
+    expect(
+      decideRefire(
+        { status: "cancelled" },
+        { resolvedAt: ago(1), operatorSuppressedAt: null, pluginClosedAt: ago(1) },
+        cfg(),
+        NOW,
+      ),
+    ).toEqual({ kind: "reopen", reason: "plugin_resolved" });
+  });
+
+  // -------------------------------------------------------------------------
+  // BLO-31736 — authorship is a recorded fact, not an inference from
+  // `resolvedAt`. `resolvedAt` means "the alert cleared", which is also true
+  // when the terminal guard *declined* to overwrite someone else's close.
+  // -------------------------------------------------------------------------
+
+  it("suppresses a `done` row even when the alert has resolved since", () => {
+    // The reported defect. The plugin has no code path that writes `done`, so
+    // `done` is always agent- or human-authored however the row reads. This is
+    // the branch that used to return reopen/plugin_resolved and resurrect a
+    // deliberate close.
+    expect(
+      decideRefire(
+        { status: "done" },
+        { resolvedAt: ago(1), operatorSuppressedAt: null },
+        cfg(),
+        NOW,
+      ),
+    ).toEqual({
+      kind: "suppressed",
+      suppressedAt: new Date(NOW).toISOString(),
+      firstObservation: true,
+    });
+  });
+
+  it("suppresses a hand-cancelled row whose alert has resolved before", () => {
+    // AC 2: BLO-24234's suppression must be reachable for an alert that has
+    // resolved at some point, which is every flapping alert — i.e. precisely
+    // the ones operators close by hand. `pluginClosedAt: null` is the positive
+    // record that the close was not ours.
+    expect(
+      decideRefire(
+        { status: "cancelled" },
+        { resolvedAt: ago(1), operatorSuppressedAt: null, pluginClosedAt: null },
+        cfg(),
+        NOW,
+      ),
+    ).toEqual({
+      kind: "suppressed",
+      suppressedAt: new Date(NOW).toISOString(),
+      firstObservation: true,
+    });
+  });
+
+  it("falls back to resolvedAt for a legacy row with no authorship recorded", () => {
+    // Rows written before `pluginClosedAt` existed. The fallback is deliberate
+    // and asymmetric: reading our close as an operator's would MUTE a live
+    // recurring alert for the whole suppression window, while reading an
+    // operator's close as ours costs one unwanted re-open that the next firing
+    // state-write corrects. Legacy rows drain on their first post-deploy fire.
+    expect(
+      decideRefire(
+        { status: "cancelled" },
+        { resolvedAt: ago(1), operatorSuppressedAt: null },
+        cfg(),
+        NOW,
+      ),
+    ).toEqual({ kind: "reopen", reason: "plugin_resolved" });
+    // ...but a legacy `done` row is still never ours, so signal 1 wins.
+    expect(
+      decideRefire(
+        { status: "done" },
+        { resolvedAt: ago(1), operatorSuppressedAt: null },
+        cfg(),
+        NOW,
+      ).kind,
+    ).toBe("suppressed");
   });
 
   it("suppresses an operator close, anchoring on first observation", () => {

@@ -10,7 +10,7 @@ import {
  * BLO-28865. Terminal heartbeat-run statuses, mirroring
  * `TERMINAL_RUN_STATUSES` in `heartbeat.ts`. Duplicated rather than imported
  * because `heartbeat.ts` is a ~30k-line module that pulls in the kube client;
- * a metrics refresh that runs on every /metrics scrape must not drag that in.
+ * a metrics refresh on the collector's 15 s tick must not drag that in.
  */
 const TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
 
@@ -27,8 +27,8 @@ export const EXTERNAL_RUNTIME_RESERVATION_STRAND_SILENCE_MS = 45 * 60 * 1000;
 /**
  * Refresh the per-agent oldest-STRANDED-reservation-age gauge (BLO-28865),
  * following the `refreshQueuedRunAgeMetrics` shape (BLO-21116) exactly:
- * recomputed live on every scrape, reset-then-set, with a companion freshness
- * gauge so a failed refresh cannot be read as "nothing stuck".
+ * recomputed on every collector tick, reset-then-set, with a companion
+ * freshness gauge so a failed refresh cannot be read as "nothing stuck".
  *
  * The strand predicate is the entire point of this gauge, and it is why this
  * is not simply an alert threshold over the pre-existing

@@ -14,6 +14,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { waitForRunToFinish } from "./helpers/wait-for-run-to-finish.js";
 
 vi.mock("../telemetry.ts", () => ({
   getTelemetryClient: () => ({ track: vi.fn() }),
@@ -32,20 +33,6 @@ const EMPTY_RESULT_ADAPTER = "empty_result_persistence_test";
 const EMPTY_RESULT_MESSAGE = "Agent exited successfully but produced no result";
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
-
-async function waitForRunToFinish(
-  heartbeat: ReturnType<typeof heartbeatService>,
-  runId: string,
-  timeoutMs = 5_000,
-) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const run = await heartbeat.getRun(runId);
-    if (run && !["queued", "running"].includes(run.status)) return run;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  return await heartbeat.getRun(runId);
-}
 
 describeEmbeddedPostgres("heartbeat timeout outcome persistence", () => {
   let db!: ReturnType<typeof createDb>;

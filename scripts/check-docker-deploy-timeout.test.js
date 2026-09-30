@@ -7,6 +7,36 @@ const imageHelper = readFileSync(
   new URL("../deploy/helm/paperclip/templates/_helpers.tpl", import.meta.url),
   "utf8",
 );
+const preflightScript = readFileSync(
+  new URL("../.github/scripts/check-pending-migrations.sh", import.meta.url),
+  "utf8",
+);
+
+// The pre-flight step as executed, not merely mentioned. Shared with the
+// negative control below so the two cannot drift apart.
+const PREFLIGHT_STEP_PATTERN = /^\s*run:\s*\.github\/scripts\/check-pending-migrations\.sh\s*$/m;
+
+// BLO-31254 split the pre-flight into a startup budget (scheduling + image
+// transfer) and a run budget (the migration check), and the two are serial
+// ahead of Helm. Read both defaults out of the script rather than restating
+// them here, so raising either one has to be paid for in timeout-minutes
+// instead of silently eating the margin.
+//
+// Anchor on the assignment at start-of-line, not on the `${...}` expansion
+// anywhere in the file: a comment mentioning a budget in `${...}` form ahead of
+// the real assignment would otherwise feed the wrong number into the sum, and
+// an under-count is the unsafe direction here.
+function getPreflightBudgetMinutes() {
+  const startup = preflightScript.match(
+    /^STARTUP_TIMEOUT_SECONDS="\$\{PREFLIGHT_STARTUP_TIMEOUT_SECONDS:-(\d+)\}"/m,
+  );
+  const run = preflightScript.match(/^TIMEOUT_SECONDS="\$\{PREFLIGHT_TIMEOUT_SECONDS:-(\d+)\}"/m);
+
+  assert.ok(startup, "pre-flight must declare a default PREFLIGHT_STARTUP_TIMEOUT_SECONDS");
+  assert.ok(run, "pre-flight must declare a default PREFLIGHT_TIMEOUT_SECONDS");
+
+  return Math.ceil((Number(startup[1]) + Number(run[1])) / 60);
+}
 
 function getDeployJobBlock(source = workflow) {
   const marker = "\n  deploy:\n";
@@ -48,13 +78,56 @@ test("Docker deploy job timeout covers every sequential rollout wait", () => {
     "deploy job must wait on BOTH tiers (api Deployment and worker StatefulSet) — BLO-29008",
   );
 
+  // The same drift class as BLO-29008, arriving through a door this test did
+  // not watch: the pre-flight's budgets are serial with Helm but live in a
+  // shell script, so a budget raise there used to consume the margin silently.
+  // The worst case that still proceeds to Helm is a slow-but-successful pull
+  // (full startup budget) followed by the full run budget; the abort path exits
+  // non-zero and Helm never runs, so it cannot overrun the job.
+  //
+  // Anchor on the `run:` step, not the bare script path: the path also appears
+  // in the margin comment at docker.yml:409, so an unanchored match was
+  // satisfied by the documentation of this guard rather than by the step it
+  // guards — the fold could go vacuous with this assertion still green. The
+  // step-is-load-bearing test below pins that anchoring.
+  assert.match(
+    deployJob,
+    PREFLIGHT_STEP_PATTERN,
+    "deploy job must run the pending-migration pre-flight — otherwise folding its budget in is vacuous",
+  );
+  const preflightMinutes = getPreflightBudgetMinutes();
+
   const jobTimeoutMinutes = Number(jobTimeoutMatch[1]);
   const helmTimeoutMinutes = Number(helmTimeoutMatch[1]);
   const rolloutTimeoutMinutes = rolloutTimeouts.reduce((sum, minutes) => sum + minutes, 0);
 
   assert.ok(
-    jobTimeoutMinutes >= helmTimeoutMinutes + rolloutTimeoutMinutes + 10,
-    `job timeout (${jobTimeoutMinutes}m) must cover Helm (${helmTimeoutMinutes}m) + rollouts (${rolloutTimeouts.join("m + ")}m = ${rolloutTimeoutMinutes}m) + 10m margin`,
+    jobTimeoutMinutes >= helmTimeoutMinutes + rolloutTimeoutMinutes + preflightMinutes + 10,
+    `job timeout (${jobTimeoutMinutes}m) must cover Helm (${helmTimeoutMinutes}m) + rollouts (${rolloutTimeouts.join("m + ")}m = ${rolloutTimeoutMinutes}m) + pre-flight (${preflightMinutes}m) + 10m margin`,
+  );
+});
+
+test("the pre-flight step is load-bearing for the budget fold, not merely mentioned", () => {
+  // Pins the anchoring of PREFLIGHT_STEP_PATTERN. The assertion above exists to
+  // stop the budget fold going vacuous if the pre-flight ever leaves the deploy
+  // job; an unanchored /check-pending-migrations\.sh/ could not do that, because
+  // the margin comment names the script too. Synthesise the step's absence and
+  // require the pattern to notice — otherwise the guard guards nothing.
+  const deployJob = getDeployJobBlock();
+  assert.match(deployJob, PREFLIGHT_STEP_PATTERN, "fixture check: the step is present today");
+
+  const withoutStep = deployJob.replace(PREFLIGHT_STEP_PATTERN, "        run: echo skip");
+
+  assert.doesNotMatch(
+    withoutStep,
+    PREFLIGHT_STEP_PATTERN,
+    "removing the pre-flight step must falsify the pattern — one that still matches is satisfied " +
+      "by prose, so the budget fold could go vacuous while this suite stays green",
+  );
+  assert.ok(
+    withoutStep.includes("check-pending-migrations.sh"),
+    "control precondition: the script is still named in the margin comment, which is exactly " +
+      "why the bare path is not a safe anchor",
   );
 });
 

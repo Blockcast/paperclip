@@ -1090,10 +1090,19 @@ describe("scrubJsonValue — env entries that are not objects", () => {
 
       for (const [label, scalar] of NAME_SHAPED_MATERIAL) {
         it(`redacts ${label} whole on every path that preserves names`, () => {
-          // JSON string-valued `env`, and the OCI/Docker `Config.Env` sequence
-          // entry — the two paths that print a name. Asserted together so they
-          // cannot drift apart again.
+          // THREE paths print a name, not two: the JSON string-valued `env`,
+          // the JSON `env` ARRAY entry (the OCI/Docker `Config.Env` shape as it
+          // actually arrives over JSON), and the YAML sequence entry. The first
+          // draft of this list named two of the three and called itself "every
+          // path" — so the array entry kept `indexOf("=")` while its siblings
+          // moved to the shared guard, and a padded base64 body printed in the
+          // name position beside its own redaction marker for four days.
+          //
+          // That is this ticket's own finding reproduced inside the test written
+          // to prevent it: an enumeration closes the paths someone listed, not
+          // the class. Asserted together so they cannot drift apart again.
           expectNoLeak(JSON.stringify(scrubJsonValue({ env: scalar })));
+          expectNoLeak(JSON.stringify(scrubJsonValue({ env: [scalar] })));
           for (const suffix of NON_VALUE_SUFFIXES) {
             expectNoLeak(scrubYamlText(`Env:\n  - ${scalar}${suffix}`));
             expectNoLeak(scrubYamlText(`Env:\n  - "${scalar}"${suffix}`));
@@ -1115,17 +1124,29 @@ describe("scrubJsonValue — env entries that are not objects", () => {
         // has never heard of it.
         const NAME_ONLY = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
 
-        for (const [, scalar] of NAME_SHAPED_MATERIAL) {
-          const out = scrubJsonValue({ env: scalar }) as { env: string };
-          const kept = out.env.endsWith(REDACTED)
-            ? out.env.slice(0, -REDACTED.length).replace(/=$/, "")
-            : "";
+        // Driven over every name-preserving path rather than one of them. The
+        // structural check is the strongest assertion in this file, and running
+        // it on a single path made it as narrow as the fixture lists it exists
+        // to replace — the array path failed this property while the scalar
+        // path passed it.
+        const namePreservingPaths: readonly ((s: string) => string)[] = [
+          (s) => (scrubJsonValue({ env: s }) as { env: string }).env,
+          (s) => (scrubJsonValue({ env: [s] }) as { env: string[] }).env[0]!,
+        ];
 
-          // Either nothing was kept, or what was kept is a plausible variable
-          // name AND is not simply the input with its padding shaved off.
-          if (kept !== "") {
-            expect(kept).toMatch(NAME_ONLY);
-            expect(scalar.startsWith(kept)).toBe(false);
+        for (const [, scalar] of NAME_SHAPED_MATERIAL) {
+          for (const path of namePreservingPaths) {
+            const out = path(scalar);
+            const kept = out.endsWith(REDACTED)
+              ? out.slice(0, -REDACTED.length).replace(/=$/, "")
+              : "";
+
+            // Either nothing was kept, or what was kept is a plausible variable
+            // name AND is not simply the input with its padding shaved off.
+            if (kept !== "") {
+              expect(kept).toMatch(NAME_ONLY);
+              expect(scalar.startsWith(kept)).toBe(false);
+            }
           }
         }
       });
@@ -1137,6 +1158,12 @@ describe("scrubJsonValue — env entries that are not objects", () => {
         // whole — which passes them all and destroys design note 2.
         expect(scrubJsonValue({ env: `TOKEN=${LEAK}==` })).toEqual({
           env: `TOKEN=${REDACTED}`,
+        });
+        // Same counterweight on the array path. It must pass BOTH before and
+        // after the guard moves there, which is what distinguishes tightening
+        // the array entry from simply redacting it whole.
+        expect(scrubJsonValue({ env: [`TOKEN=${LEAK}==`] })).toEqual({
+          env: [`TOKEN=${REDACTED}`],
         });
         expect(scrubYamlText(`Env:\n  - TOKEN=${LEAK}==`)).toContain(
           `TOKEN=${REDACTED}`,
@@ -1179,31 +1206,91 @@ describe("scrubJsonValue — env entries that are not objects", () => {
   });
 });
 
-describe("scrubResponseBody — SSE sniff skips leading bytes", () => {
-  // The sniff is the fallback for an upstream that omits content-type. It was
-  // anchored on a 6-byte window with no allowance for leading bytes, while the
-  // JSON sniff already skipped whitespace — and that asymmetry meant a stream
-  // opening on a blank line or a BOM was classified as neither, so the whole
-  // stream including its data: payloads came back unscrubbed.
-  const frame = `data: {"env":[{"name":"OPENAI_API_KEY","value":"${LEAK}"}]}\n\n`;
+describe("scrubResponseBody — every entry point skips the same leading bytes", () => {
+  // The sniffs are the fallback for an upstream that omits content-type. This
+  // matrix used to run against the SSE entry point only, because that is the one
+  // an observer had seen fail — and while it was green, a BOM-prefixed JSON-RPC
+  // body was returned with its env values in the clear. Three classifiers each
+  // held a private idea of where a body begins (SSE skipped BOM + whitespace,
+  // the JSON sniff skipped whitespace, `JSON.parse` skipped neither), so
+  // widening one of them left the others behind.
+  //
+  // Running every prefix against every entry point is the assertion that matters:
+  // it fails on the next classifier that does not derive its offset from
+  // `significantByteOffset`, rather than on the one spelling someone happened to
+  // probe. Enumerating the cases we know is what let this reach production twice.
+  //
+  // The nested `content[].text` row is that prediction coming true. The matrix
+  // above shipped green while a *fourth* classifier — the JSON sniff inside
+  // `scrubTextTracked` — still disagreed with its own parse: `trimStart` counts
+  // U+FEFF as whitespace, `JSON.parse` rejects it, so a BOM-prefixed resource
+  // nested in `content[].text` classified as JSON, threw, fell through to the
+  // YAML scanner (which does not match compact single-line JSON) and passed
+  // through in the clear. Every entry point means every entry point, including
+  // the ones reached by recursion rather than by dispatch.
+  const payload = `{"env":[{"name":"OPENAI_API_KEY","value":"${LEAK}"}]}`;
 
-  for (const [label, prefix] of [
+  // Each entry point places the prefix where that shape actually begins — for
+  // the nested row that is the *inner* document, which is the byte offset the
+  // recursive classifier sees.
+  const ENTRY_POINTS = [
+    ["an SSE stream", (prefix: string) => `${prefix}data: ${payload}\n\n`],
+    ["a JSON-RPC body", (prefix: string) => `${prefix}${payload}`],
+    [
+      "a resource nested in content[].text",
+      (prefix: string) =>
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: { content: [{ type: "text", text: `${prefix}${payload}` }] },
+        }),
+    ],
+  ] as const;
+
+  const PREFIXES = [
+    ["nothing", ""],
     ["a blank line", "\n"],
     ["CRLF", "\r\n"],
     ["a BOM", "﻿"],
     ["indentation", "  "],
     ["a BOM then a blank line", "﻿\n"],
-  ] as const) {
-    it(`scrubs a stream that opens on ${label}`, () => {
-      const out = scrubResponseBody(Buffer.from(prefix + frame, "utf8"), null).toString("utf8");
+  ] as const;
 
-      expectNoLeak(out);
-      expect(out).toContain(REDACTED);
-    });
+  for (const [entryLabel, build] of ENTRY_POINTS) {
+    for (const [prefixLabel, prefix] of PREFIXES) {
+      it(`scrubs ${entryLabel} that opens on ${prefixLabel}`, () => {
+        const out = scrubResponseBody(Buffer.from(build(prefix), "utf8"), null).toString("utf8");
+
+        expectNoLeak(out);
+        expect(out).toContain(REDACTED);
+      });
+    }
   }
 
   it("still leaves a leading-whitespace body that is not a stream byte-exact", () => {
     const body = Buffer.from("  this is plain prose, not an event stream\n", "utf8");
+
+    expect(scrubResponseBody(body, null)).toBe(body);
+  });
+
+  it("still leaves a BOM-prefixed body that carries no resource byte-exact", () => {
+    const body = Buffer.from(`﻿{"issues":[{"title":"env: notes"}]}`, "utf8");
+
+    expect(scrubResponseBody(body, null)).toBe(body);
+  });
+
+  it("still leaves a BOM-prefixed nested text that carries no resource byte-exact", () => {
+    // The BOM strip feeds `JSON.parse` only. A nested document we did not redact
+    // must come back as the original Buffer, BOM included, rather than a
+    // re-serialized copy that happens to look equal.
+    const body = Buffer.from(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        result: { content: [{ type: "text", text: `﻿{"issues":[{"title":"env: notes"}]}` }] },
+      }),
+      "utf8",
+    );
 
     expect(scrubResponseBody(body, null)).toBe(body);
   });

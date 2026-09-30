@@ -27,6 +27,8 @@ import {
   createEmbeddedPostgresLogBuffer,
   prepareEmbeddedPostgresNativeRuntime,
   reconcilePendingMigrationHistory,
+  readInheritedTimeoutSettings,
+  formatInheritedTimeoutSettings,
   formatDatabaseBackupResult,
   runDatabaseBackup,
   authUsers,
@@ -37,6 +39,7 @@ import {
 import detectPort from "detect-port";
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
+import { startEventLoopStallLogging } from "./event-loop-stall-log.js";
 import { logger } from "./middleware/logger.js";
 import { setupEnvironmentCustomImageTerminalWebSocketServer } from "./realtime/environment-custom-image-terminal-ws.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
@@ -47,6 +50,7 @@ import {
   bootstrapExecutionPolicyFromEnv,
   EXTERNAL_LIFECYCLE_COLD_BOOT_REATTACH_GRACE_MS,
   environmentCustomImageService,
+  executionWorkspaceCleanupService,
   heartbeatService,
   instanceSettingsService,
   reconcileBuiltInAgentsOnStartup,
@@ -63,6 +67,7 @@ import {
   reconcileAdapterAvailability,
 } from "./services/adapter-registry-bootstrap.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
+import { summarizeStrandedRecoveryHandBackPass } from "./services/recovery/service.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { createApiTierPluginWorkerManagerStub } from "./services/plugin-worker-manager-stub.js";
@@ -268,6 +273,10 @@ export async function startServer(): Promise<StartedServer> {
   // Tracing must be active (or have failed and logged) before the first DB
   // connection or the HTTP server exists — see instrumentation.ts.
   await instrumentationReady;
+  // Scrape-independent stall evidence (BLO-32668). The disposer is discarded
+  // deliberately: the sampler is idempotent and unref'd, so repeated in-process
+  // `startServer()` calls start exactly one, and it cannot outlive the process.
+  startEventLoopStallLogging();
   let config = loadConfig();
   if (config.githubPrReviewerAgentIds.length > 0) {
     if (!githubReviewerAppSlug(config.prReviewerBotLogin)) {
@@ -348,11 +357,19 @@ export async function startServer(): Promise<StartedServer> {
     // index (BLO-21526 — migration 0226), so an unchanged migration state is
     // not evidence the index exists. Failure here fails startup, so a deploy
     // that skips the online build fails visibly instead of silently.
+    // Logged unconditionally, including "already-valid" (BLO-21526): logging
+    // only when the guard *changed* something reproduces the very defect this
+    // guard replaced — a healthy verified index and a step that never ran both
+    // emit nothing, so the deployed index state is unreadable. One line per
+    // startup per listed index makes `kubectl logs` a standing index-presence
+    // receipt, which is the only runtime check available to an identity with no
+    // database query channel.
     const indexResults = await ensurePendingConcurrentIndexes(connectionString);
     for (const result of indexResults) {
-      if (result.action !== "already-valid") {
-        logger.info({ index: result.name, table: result.table, action: result.action }, `${label}: built deferred index`);
-      }
+      logger.info(
+        { index: result.name, table: result.table, action: result.action },
+        `${label}: deferred index ${result.name} is ${result.action}`,
+      );
     }
 
     return summary;
@@ -391,7 +408,10 @@ export async function startServer(): Promise<StartedServer> {
       }
 
       logger.info({ pendingMigrations: state.pendingMigrations }, `Applying ${state.pendingMigrations.length} pending migrations for ${label}`);
-      await applyPendingMigrations(connectionString);
+      await applyPendingMigrations(connectionString, {
+        prepareOnlineIndexes: true,
+        log: (message) => logger.info({ migration: label }, message),
+      });
       return "applied (pending migrations)";
     }
 
@@ -404,7 +424,10 @@ export async function startServer(): Promise<StartedServer> {
     }
 
     logger.info({ pendingMigrations: state.pendingMigrations }, `Applying ${state.pendingMigrations.length} pending migrations for ${label}`);
-    await applyPendingMigrations(connectionString);
+    await applyPendingMigrations(connectionString, {
+      prepareOnlineIndexes: true,
+      log: (message) => logger.info({ migration: label }, message),
+    });
     return "applied (pending migrations)";
   }
   
@@ -696,6 +719,29 @@ export async function startServer(): Promise<StartedServer> {
     resolvedEmbeddedPostgresPort = port;
     startupDbInfo = { mode: "embedded-postgres", dataDir, port };
   }
+
+  // Report the timeout environment the application pool inherits from the
+  // server. `createDb` bounds idle-in-transaction itself, but leaves
+  // `statement_timeout` to whatever the server imposes — and nothing in this
+  // repo or in `Blockcast/onprem-k8s` provably sets it, despite two places
+  // asserting a role-level 30s bound. A `statement_timeout` of `disabled` here
+  // means one blocked query can hang a recovery pass indefinitely (PEN-3365);
+  // that is the reading the explicit-timeout decision is gated on. Probing is
+  // strictly diagnostic, so it must never prevent the server from starting.
+  try {
+    const inheritedTimeouts = await readInheritedTimeoutSettings(activeDatabaseConnectionString);
+    const unbounded = inheritedTimeouts.statementTimeout.valueMs === null;
+    logger[unbounded ? "warn" : "info"](
+      `Database timeout environment: ${formatInheritedTimeoutSettings(inheritedTimeouts)}` +
+        (unbounded
+          ? " — statement_timeout is disabled, so a blocked query is bounded by nothing server-side (PEN-3365)"
+          : ""),
+    );
+  } catch (error) {
+    logger.warn(
+      `Could not read the database timeout environment: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
   
   if (config.deploymentMode === "local_trusted" && !isLoopbackHost(config.host)) {
     throw new Error(
@@ -794,160 +840,6 @@ export async function startServer(): Promise<StartedServer> {
     serverPort: listenPort,
     databasePort: resolvedEmbeddedPostgresPort,
   });
-  // Overwrite only the SDK JS files that contain our fork extensions.
-  // We must NOT delete the whole SDK dir or its package.json — the npm-installed
-  // SDK has proper dependency resolution for @paperclipai/shared that we need.
-  async function pathExists(target: string): Promise<boolean> {
-    try {
-      await fs.promises.access(target);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  async function copyWorkspaceSdkFiles() {
-    try {
-      const pluginsSdkDist = path.join(os.homedir(), ".paperclip", "plugins", "node_modules", "@paperclipai", "plugin-sdk", "dist");
-      const thisDir = path.dirname(new URL(import.meta.url).pathname);
-      const workspaceSdkDist = path.resolve(thisDir, "../../packages/plugins/sdk/dist");
-      if (!(await pathExists(workspaceSdkDist)) || !(await pathExists(pluginsSdkDist))) return;
-
-      // Only overwrite the specific files we changed (fork extensions)
-      const filesToCopy = [
-        "worker-rpc-host.js",
-        "worker-rpc-host.js.map",
-        "worker-rpc-host.d.ts",
-        "worker-rpc-host.d.ts.map",
-        "host-client-factory.js",
-        "host-client-factory.js.map",
-        "host-client-factory.d.ts",
-        "host-client-factory.d.ts.map",
-        "protocol.js",
-        "protocol.js.map",
-        "protocol.d.ts",
-        "protocol.d.ts.map",
-        "types.js",
-        "types.js.map",
-        "types.d.ts",
-        "types.d.ts.map",
-        "testing.js",
-        "testing.js.map",
-        "testing.d.ts",
-        "testing.d.ts.map",
-      ];
-      let copied = 0;
-      for (const file of filesToCopy) {
-        const src = path.join(workspaceSdkDist, file);
-        const dest = path.join(pluginsSdkDist, file);
-        if (await pathExists(src)) {
-          await fs.promises.cp(src, dest, { force: true });
-          copied++;
-        }
-      }
-      if (copied > 0) {
-        logger.info(`Patched ${copied} workspace SDK files into local plugins directory`);
-      }
-    } catch (err) {
-      logger.warn({ err }, "Failed to patch workspace SDK files (non-fatal)");
-    }
-  }
-
-  async function copyWorkspacePluginSdk() {
-    try {
-      const pluginsSdkDir = path.join(
-        os.homedir(),
-        ".paperclip",
-        "plugins",
-        "node_modules",
-        "@paperclipai",
-        "plugin-sdk",
-      );
-      const thisDir = path.dirname(new URL(import.meta.url).pathname);
-      const workspaceSdkDist = path.resolve(thisDir, "../../packages/plugins/sdk/dist");
-      const workspaceSdkPkg = path.resolve(thisDir, "../../packages/plugins/sdk/package.json");
-      if (!(await pathExists(workspaceSdkDist)) || !(await pathExists(pluginsSdkDir))) return;
-
-      if ((await fs.promises.lstat(pluginsSdkDir)).isSymbolicLink()) {
-        await fs.promises.unlink(pluginsSdkDir);
-        await fs.promises.mkdir(pluginsSdkDir, { recursive: true });
-      }
-      await fs.promises.cp(workspaceSdkDist, path.join(pluginsSdkDir, "dist"), {
-        recursive: true,
-      });
-      if (await pathExists(workspaceSdkPkg)) {
-        // Merge, do NOT overwrite. We want the workspace `exports` map (the
-        // registry copy's points at different paths), but we must NOT adopt the
-        // workspace `version`: the workspace manifest is unstamped (1.0.0) while
-        // the plugin store's package-lock.json records the installed registry
-        // version. Copying it verbatim makes installed !== locked, and
-        // plugin-lifecycle's torn-store guard then fails closed on EVERY
-        // activation with "Torn plugin store detected", taking the whole plugin
-        // fleet down until someone reconciles the store by hand.
-        //
-        // Reinstalling the store does not fix that: this function re-vendors on
-        // the next boot and re-tears it. That is why `npm install
-        // @paperclipai/plugin-sdk@<version>` against the shared store carries a
-        // DO-NOT-RUN banner. Preserving the version here is what makes the
-        // deliberate fork vendoring and the torn-store guard coexist.
-        const installedSdkPkg = path.join(pluginsSdkDir, "package.json");
-        const merged = JSON.parse(await fs.promises.readFile(workspaceSdkPkg, "utf8"));
-        let installedVersion: unknown;
-        try {
-          installedVersion = JSON.parse(await fs.promises.readFile(installedSdkPkg, "utf8"))?.version;
-        } catch {
-          // No readable installed manifest — nothing to preserve; fall through
-          // and write the workspace version rather than failing the boot.
-        }
-        if (typeof installedVersion === "string" && installedVersion.length > 0) {
-          merged.version = installedVersion;
-        }
-        await fs.promises.writeFile(installedSdkPkg, `${JSON.stringify(merged, null, 2)}\n`);
-      }
-      logger.info("Copied workspace plugin SDK dist to local plugins directory");
-    } catch (err) {
-      logger.warn({ err }, "Failed to copy workspace SDK (non-fatal)");
-    }
-  }
-
-  // The npm-installed @paperclipai/shared on the plugins side can lag the
-  // workspace fork (its registry publish is date-versioned and is not
-  // refreshed on every deploy). When it does, the fork plugin-SDK we vendor
-  // above re-exports symbols (e.g. PLUGIN_RESERVED_COMPANY_SETTINGS_ROUTE_SEGMENTS)
-  // that the stale registry shared does not provide, and plugin workers crash
-  // with "does not provide an export named ...". Vendor the workspace shared
-  // *dist* over the stale one so the SDK and shared are a matched fork pair.
-  //
-  // dist ONLY — do NOT copy the workspace shared package.json: its top-level
-  // `exports` map points at ./src/*.ts (raw TS), whereas the registry copy's
-  // `exports` already points at ./dist/*.js. Overwriting it would swap the
-  // missing-export crash for ERR_MODULE_NOT_FOUND on the same plugins.
-  async function copyWorkspaceSharedDist() {
-    try {
-      const pluginsSharedDir = path.join(os.homedir(), ".paperclip", "plugins", "node_modules", "@paperclipai", "shared");
-      const thisDir = path.dirname(new URL(import.meta.url).pathname);
-      const workspaceSharedDist = path.resolve(thisDir, "../../packages/shared/dist");
-      // Only act when both the workspace source and the installed target exist;
-      // never create the package from nothing (mirrors the SDK copy guard).
-      if (!(await pathExists(workspaceSharedDist)) || !(await pathExists(pluginsSharedDir))) return;
-      if ((await fs.promises.lstat(pluginsSharedDir)).isSymbolicLink()) {
-        await fs.promises.unlink(pluginsSharedDir);
-        await fs.promises.mkdir(pluginsSharedDir, { recursive: true });
-      }
-      await fs.promises.cp(workspaceSharedDist, path.join(pluginsSharedDir, "dist"), { recursive: true });
-      logger.info("Copied workspace @paperclipai/shared dist to local plugins directory");
-    } catch (err) {
-      logger.warn({ err }, "Failed to copy workspace shared dist (non-fatal)");
-    }
-  }
-
-  // API pods use a stub plugin manager and never load plugin workers. Avoid
-  // touching their shared CephFS package tree entirely; worker-tier patching
-  // completes before createApp can start plugin loading.
-  if (config.paperclipNodeRole !== "api") {
-    await copyWorkspacePluginSdk();
-    await copyWorkspaceSharedDist();
-  }
 
   const uiMode = config.uiDevMiddleware ? "vite-dev" : config.serveUi ? "static" : "none";
   const storageService = createStorageServiceFromConfig(config);
@@ -1204,6 +1096,20 @@ export async function startServer(): Promise<StartedServer> {
   let heartbeatSchedulerStopped = false;
   let heartbeatStartupRecoveryPending = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
+  /**
+   * BLO-19123. Last time the hand-back drain actually ran, so its cadence is decoupled from
+   * the scheduler's.
+   *
+   * The drain rides the heartbeat tick, which is 30s by default. A per-pass *count* alone is
+   * therefore not a rate: at 10 rows per 30s a ~90-row backlog returns in under five minutes,
+   * which is a bulk move with extra steps. The count bounds the blast radius of a single pass;
+   * this bounds how often that pass happens, and only the two together make the drain
+   * something an operator can watch the destination queue against and stop mid-way.
+   *
+   * Deliberately in-memory and not persisted: on restart the drain runs one pass early, which
+   * costs at most one extra bounded batch and keeps the mechanism free of schema.
+   */
+  let lastStrandedRecoveryHandBackAt = 0;
   // Single-flight latch for the crash-reconciliation → stale-lock-sweep pair
   // (BLO-20822). Awaiting one before the other inside a single tick does NOT
   // serialize them across ticks: `setInterval` starts the next callback on
@@ -1214,6 +1120,45 @@ export async function startServer(): Promise<StartedServer> {
   // crashed run and handing that lock to the retry — exactly the interleaving
   // the in-tick `await` was added to remove.
   let crashReconcileSweepInFlight = false;
+  // BLO-34207: the same latch, for the reap → retry-promotion → queued-resume →
+  // stranded-reconcile → … chain below. That chain is sequential over every
+  // stranded candidate in the estate (147 distinct issues per pass, measured
+  // 2026-09-16) and each candidate takes the company-wide issue-graph advisory
+  // lock. One slow candidate makes the pass outlive the 30 s interval, the next
+  // tick starts a second pass, and the passes then contend with EACH OTHER on
+  // that lock: 8 waiters against `POSTGRES_POOL_MAX=10` starved the pool, so
+  // the holder could not get the second connection it needed to finish and only
+  // a waiter's 15 s `lock_timeout` broke the cycle. Every pass in the chain is
+  // idempotent, so a tick that finds one still running skips it.
+  //
+  // The latch inherits `crashReconcileSweepInFlight`'s failure mode: a pass that
+  // HANGS rather than rejects never clears it, and periodic recovery then stops
+  // estate-wide until restart with no output at all — the symptom is an absence.
+  // `heartbeatRecoveryChainStartedAt` makes that absence visible. It is not a
+  // timeout: clearing the latch without cancelling the work would re-admit the
+  // overlap the latch exists to remove, so this reports and does not act.
+  let heartbeatRecoveryChainInFlight = false;
+  let heartbeatRecoveryChainStartedAt = 0;
+  // BLO-22984: the same latch, for the execution-workspace collector. It is
+  // its own tracked pass (below), and `setInterval` fires the next callback on
+  // schedule whether or not the previous one settled, so without this a slow
+  // pass (50 candidates, up to three `runGit` calls at 30 s each) overlaps the
+  // next tick's and the trailing pass's `deferCandidate` can land on a row the
+  // leading pass already archived. Every collector pass is idempotent, so a
+  // tick that finds one running skips it. The startup pass sets it too.
+  //
+  // It inherits the hang-not-reject failure mode described on
+  // `heartbeatRecoveryChainInFlight` above, and the collector is where a hang
+  // is reachable: its `fs.stat` on a candidate path has no timeout, and one
+  // wedged mount stops collection for the life of the process with no output.
+  // `executionWorkspaceCollectorStartedAt` makes that absence visible. Like
+  // the chain's stamp it reports and does not act.
+  let executionWorkspaceCollectorInFlight = false;
+  let executionWorkspaceCollectorStartedAt = 0;
+  // 10 ticks. Above the normal case (a sweep routinely outlives one interval —
+  // that is what the latch is for) and far below the hours a wedged chain would
+  // otherwise sit silent.
+  const HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS = 10 * config.heartbeatSchedulerIntervalMs;
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
     let tracked: Promise<void>;
@@ -1246,6 +1191,7 @@ export async function startServer(): Promise<StartedServer> {
     drainHeartbeatRunsForShutdown = heartbeat.drainRunningRunsForShutdown;
     prepareHotRestartShutdown = heartbeat.prepareHotRestartShutdown;
     const environmentCustomImages = environmentCustomImageService(db as any, { pluginWorkerManager });
+    const executionWorkspaceCleanup = executionWorkspaceCleanupService(db as any);
     const routines = routineService(db as any, { pluginWorkerManager });
     const tools = toolAccessService(db as any, {
       deploymentMode: config.deploymentMode,
@@ -1418,6 +1364,12 @@ export async function startServer(): Promise<StartedServer> {
         }
 
         const reviewed = await heartbeat.reconcileProductivityReviews();
+        // BLO-30303 AC4: log the funnel counters unconditionally. Gating this
+        // on `created|updated|failed > 0` discarded the one record that
+        // explains a zero — which is how a fleet-wide hard zero looked
+        // identical to a healthy fleet for 23 days. `scanned` plus the
+        // suppression breakdown is what tells those two apart.
+        logger.info({ ...reviewed }, "startup productivity reconciliation funnel");
         if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
           logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
         }
@@ -1427,6 +1379,14 @@ export async function startServer(): Promise<StartedServer> {
           logger.warn({ ...blockerDependentsSwept }, "startup resolved-blocker-dependents sweep enqueued wakes");
         }
 
+        const deadMonitors = await heartbeat.reconcileUndeliverableIssueMonitors();
+        if (deadMonitors.cleared > 0 || deadMonitors.failed > 0) {
+          logger.warn(
+            { ...deadMonitors },
+            "startup undeliverable-monitor reconciliation cleared monitors armed on ineligible issues (BLO-33539)",
+          );
+        }
+
         const failedWakeDispatches = await heartbeat.reconcileFailedWakeDispatches();
         if (failedWakeDispatches.recovered > 0 || failedWakeDispatches.exhausted > 0) {
           logger.warn(
@@ -1434,6 +1394,32 @@ export async function startServer(): Promise<StartedServer> {
             "startup failed-wake-dispatch reconciliation retried durable wake failures (BLO-14395)",
           );
         }
+
+        // BLO-22984: the only consumer of `execution_workspaces.cleanup_eligible_at`.
+        // Logged unconditionally — a collector that never runs is indistinguishable
+        // from one that runs and finds nothing, and the previous code was believed
+        // to collect for weeks while reclaiming zero bytes.
+        // Not awaited: this must not hold `heartbeatStartupRecoveryPending` and
+        // starve every periodic pass on a slow git/fs (prior:19b276c important 2
+        // principle). It gates nothing below it; it is tracked for the shutdown
+        // drain and holds the collector latch so the first tick does not double it.
+        // It may take the latch without testing it only because
+        // `heartbeatStartupRecoveryPending` is still true here and the tick
+        // early-returns on it, so no periodic pass can be holding it yet.
+        executionWorkspaceCollectorInFlight = true;
+        executionWorkspaceCollectorStartedAt = Date.now();
+        trackHeartbeatSchedulerWork(executionWorkspaceCleanup
+          .reconcileExecutionWorkspaceCleanup()
+          .then((workspacesCollected) => {
+            logger.info({ ...workspacesCollected }, "startup execution-workspace collector");
+          })
+          .catch((err) => {
+            logger.error({ err }, "startup execution-workspace collector failed");
+          })
+          .finally(() => {
+            executionWorkspaceCollectorInFlight = false;
+            executionWorkspaceCollectorStartedAt = 0;
+          }));
       })().catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
       }).finally(() => {
@@ -1457,7 +1443,101 @@ export async function startServer(): Promise<StartedServer> {
       // resolver (e.g. worktree run-execution opt-in). The gated work is still
       // wrapped in trackHeartbeatSchedulerWork with its own error handling.
       void (async () => {
-        if (heartbeatSchedulerStopped || heartbeatStartupRecoveryPending) return;
+        if (heartbeatSchedulerStopped) return;
+
+        // All four gauge publishers are registered above BOTH gates — the
+        // startup-recovery gate immediately below and the scheduling-suppression
+        // gate further down (BLO-31335, extended by BLO-21526).
+        //
+        // The startup-recovery gate matters as much as the suppression one, and
+        // for the same reason. The three BLO-31335 gauges are zero-initialized
+        // at registration, so a replica that early-returned here would not
+        // render "No data" while recovery ran — it would export a confident
+        // `0`. That chain (crash reconciliation, orphan reaping, reattach,
+        // issue-graph liveness, watchdogs, silent-run scan, productivity,
+        // blocker dependents, wake dispatches) is long and serial, so the
+        // exposure is "recovery duration + one tick", not "one tick", and it
+        // lands hardest on a replica crash-looping through startup. Fabricated
+        // health is the defect this issue exists to remove; time-boxing it to
+        // boot does not make it a different defect.
+        //
+        // The candidate-index gauge fails the other way — it is labeled, so it
+        // renders nothing until probed — and it still belongs above this gate:
+        // an unpublished series makes its `== 0` alert structurally silent, and
+        // recovery is exactly when a database that just came back without the
+        // index is being reconciled against.
+        //
+        // Publishing during recovery is safe: all four are read-only queries
+        // plus a full-rewrite metric set, so a value observed mid-recovery is
+        // self-correcting on the next tick rather than sticky.
+        //
+        // All four registrations are synchronous and precede this callback's
+        // first `await`, so hoisting them above the recovery gate does not open
+        // a BLO-20822 shutdown-drain window: `heartbeatSchedulerStopped` is
+        // still checked first, and the work is registered with
+        // `trackHeartbeatSchedulerWork` before anything can suspend.
+        trackHeartbeatSchedulerWork(heartbeat
+          .publishAgentLivenessGauges(new Date())
+          .catch((err) => {
+            // Defensive only. The publisher wraps its whole body in try/catch
+            // and logs there, so this handler is currently unreachable; it is
+            // kept so a future refactor that lets the body throw still lands in
+            // the scheduler's error path rather than as an unhandled rejection.
+            logger.error({ err }, "periodic agent-liveness gauge publication failed");
+          }));
+
+        // Same decoupling for the two wake-dispatch gauges (BLO-31335). They
+        // used to publish from the tail of `reconcileFailedWakeDispatches`,
+        // which made them fragile twice over: that pass's periodic call site
+        // sits *below* the suppression gate, so a suppressed replica emitted
+        // neither gauge, and it is a late link of a long sequential `.then`
+        // chain, so any earlier reconciliation rejection skipped both silently.
+        // A stale gauge and a healthy-but-unchanged gauge render identically,
+        // so neither failure was visible on the dashboard.
+        //
+        // Registered as two independent units, not one, mirroring the liveness
+        // registration above: each publisher gets its own scheduler-tracked
+        // unit so neither one's lifecycle is coupled to the other's.
+        //
+        // One timestamp for both, preserving the shared `now` they had as
+        // consecutive statements — both derive age windows from it.
+        const wakeDispatchGaugeNow = new Date();
+        trackHeartbeatSchedulerWork(heartbeat
+          .publishGithubReviewDeadLetterGauge(wakeDispatchGaugeNow)
+          .catch((err) => {
+            // Defensive only, as above.
+            logger.error({ err }, "periodic github-review dead-letter gauge publication failed");
+          }));
+        trackHeartbeatSchedulerWork(heartbeat
+          .publishAgentWakeupTerminalFailedGauge(wakeDispatchGaugeNow)
+          .catch((err) => {
+            // Defensive only, as above.
+            logger.error({ err }, "periodic wake-terminal-failed gauge publication failed");
+          }));
+
+        // BLO-21526: the crash-recovery candidate-index gauge, for the same
+        // reason and in the same place. Its only publisher used to be the
+        // gate read inside the periodic reconciliation below, which sits under
+        // the suppression gate AND the `crashReconcileSweepInFlight` latch, so
+        // the series went dark on a suppressed replica and was never published
+        // at all during startup recovery. `database_restore_in_progress`
+        // suppresses the scheduler and is a leading way to end up WITHOUT the
+        // index, so that was blindness precisely where the risk concentrates —
+        // and a cleared series makes the `== 0` Missing alert structurally
+        // silent, leaving only Unobservable, whose remediation then names
+        // three things that all look healthy under a restore.
+        //
+        // The gate below keeps its own read: it must act on the value it
+        // publishes, not on a value this unit read at some other moment.
+        trackHeartbeatSchedulerWork(heartbeat
+          .publishCrashRecoveryCandidateIndexGauge()
+          .catch((err) => {
+            // Defensive only: the probe wraps its own body in try/catch, clears
+            // the gauge and returns false rather than throwing.
+            logger.error({ err }, "periodic crash-recovery candidate-index gauge publication failed");
+          }));
+
+        if (heartbeatStartupRecoveryPending) return;
         const sweptRuntimeStatuses = heartbeat.sweepExpiredRuntimeStatuses();
         if (sweptRuntimeStatuses > 0) {
           logger.info(
@@ -1500,6 +1580,48 @@ export async function startServer(): Promise<StartedServer> {
           .catch((err) => {
             logger.error({ err }, "routine scheduler tick failed");
           }));
+
+        if (heartbeatSchedulerStopped) return;
+        // BLO-19123. Deliberately its own tracked pass rather than a link in the long serial
+        // recovery chain below: that chain begins with provider-facing work, and an outage
+        // there must not starve the drain that returns mis-owned rows to their real owners.
+        // The pass is internally serialized, so a slow tick cannot overlap itself. Opt-in —
+        // see the flag's rationale in config.ts.
+        //
+        // The limit is passed explicitly rather than left to the service-side default: that
+        // default (500) bounds the candidates a pass *works*, which was never a rate. It let
+        // the first tick after the flag flipped return the whole backlog in one sweep, moving
+        // hundreds of rows onto a destination queue in a single irreversible step. Metering
+        // here keeps the return observable and reversible, and defers — not drops — the rest.
+        //
+        // Count and cadence are both required, and neither substitutes for the other. This
+        // block runs on the heartbeat tick (30s by default), so a count alone would still
+        // drain ~90 rows in under five minutes. The elapsed-time gate is what turns "10 rows"
+        // into "10 rows per hour" — slow enough that an operator who sees the destination
+        // queue degrade can unset the flag having lost one batch rather than the backlog.
+        if (
+          config.strandedRecoveryHandBackDrainEnabled &&
+          Date.now() - lastStrandedRecoveryHandBackAt >=
+            config.strandedRecoveryHandBackIntervalMinutes * 60_000
+        ) {
+          // Stamped before the await, not after: the pass is async and the next tick fires in
+          // 30s, so stamping on completion would let several passes start inside one interval.
+          lastStrandedRecoveryHandBackAt = Date.now();
+          trackHeartbeatSchedulerWork(heartbeat
+            .reconcileStrandedRecoveryHandBacks({ limit: config.strandedRecoveryHandBackMaxPerPass })
+            .then((result) => {
+              // The all-skipped pass is reported too: its residual is the repair list, and
+              // dropping it left operators no way to recover what stayed mis-owned or why.
+              // This line carries a bounded sample; the complete per-row inventory is written
+              // durably by the pass onto `issue_recovery_actions.hand_back_residual_reason`,
+              // so nothing here depends on the return value surviving the promise.
+              const summary = summarizeStrandedRecoveryHandBackPass(result);
+              if (summary) logger[summary.level](summary.payload, summary.message);
+            })
+            .catch((err) => {
+              logger.error({ err }, "stranded-recovery hand-back pass failed");
+            }));
+        }
 
         if (heartbeatSchedulerStopped) return;
         trackHeartbeatSchedulerWork(environmentCustomImages
@@ -1622,102 +1744,253 @@ export async function startServer(): Promise<StartedServer> {
               logger.error({ err }, "periodic detached-queued-run sweeper failed");
             }));
 
+          if (heartbeatSchedulerStopped) return;
+
+          // BLO-22984: the only consumer of `execution_workspaces.cleanup_eligible_at`.
+          // Deliberately its own tracked pass rather than a link in the recovery
+          // chain below: that chain has a single trailing `.catch`, so one
+          // unrelated reconciler rejecting would silently skip every pass after
+          // it. A collector that never runs is indistinguishable from one that
+          // runs and finds nothing — which is how the previous worktree
+          // reclamation was believed to work for weeks while freeing zero bytes.
+          // It depends on no upstream pass; the stamps it selects on are written
+          // at run end and by its own backfill.
+          //
+          // Single-flighted by `executionWorkspaceCollectorInFlight`, for the
+          // reason given on `crashReconcileSweepInFlight` above: a pass can
+          // outlive the interval and the next tick must skip it, not double it.
+          if (!executionWorkspaceCollectorInFlight) {
+            executionWorkspaceCollectorInFlight = true;
+            executionWorkspaceCollectorStartedAt = Date.now();
+            trackHeartbeatSchedulerWork(executionWorkspaceCleanup
+              .reconcileExecutionWorkspaceCleanup()
+              .then((workspacesCollected) => {
+                // Unconditional: the zero row is the evidence that it ran at all.
+                logger.info({ ...workspacesCollected }, "periodic execution-workspace collector");
+              })
+              .catch((err) => {
+                logger.error({ err }, "periodic execution-workspace collector failed");
+              })
+              .finally(() => {
+                executionWorkspaceCollectorInFlight = false;
+                executionWorkspaceCollectorStartedAt = 0;
+              }));
+          } else if (
+            Date.now() - executionWorkspaceCollectorStartedAt >
+            HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS
+          ) {
+            // Skipping is normal and silent; a pass in flight for many ticks is
+            // not. Reported, not acted on: see the latch declaration.
+            logger.warn(
+              {
+                inFlightMs: Date.now() - executionWorkspaceCollectorStartedAt,
+                warnAfterMs: HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS,
+              },
+              "periodic execution-workspace collector still in flight across many ticks; workspaces are not being collected",
+            );
+          }
+
+          if (heartbeatSchedulerStopped) return;
+
+          // BLO-33539: producer-agnostic backstop for a monitor armed on an
+          // issue the scheduler can never select. Transition-time guards each
+          // cover one demotion path; this pass covers the rest, including
+          // recovery parks that have no guard of their own.
+          //
+          // Deliberately NOT a link in the long recovery chain below. That
+          // chain is serial with a single terminal catch, so a rejection in any
+          // earlier pass silently skips every later one — and the conditions
+          // that make an unrelated recovery pass throw are exactly the
+          // conditions that strand monitors. A backstop that only runs when
+          // nothing else is broken is not a backstop. It needs no ordering
+          // against those passes either: the clear is a CAS on the eligibility
+          // tuple, so a concurrent status or assignee change loses the race and
+          // is skipped rather than clobbered.
+          trackHeartbeatSchedulerWork(heartbeat
+            .reconcileUndeliverableIssueMonitors()
+            .then((deadMonitors) => {
+              if (deadMonitors.cleared > 0 || deadMonitors.failed > 0) {
+                logger.warn(
+                  { ...deadMonitors },
+                  "periodic undeliverable-monitor reconciliation cleared monitors armed on ineligible issues",
+                );
+              }
+            })
+            .catch((err) => {
+              logger.error({ err }, "periodic undeliverable-monitor reconciliation failed");
+            }));
+
           // Periodically reap orphaned runs (5-min staleness threshold) and make sure
           // persisted queued work is still being driven forward.
+          //
+          // Deliberately NOT under `heartbeatRecoveryChainInFlight`. These four
+          // passes are the dispatch path — `resumeQueuedRuns` is what actually
+          // starts a queued run — and they do not iterate the stranded
+          // candidate set under `lockIssueParentMutationCompany`, which is the
+          // contention the latch exists to remove.
+          //
+          // They are NOT lock-free, and an earlier wording of this comment
+          // claimed they were (BLO-34471). `reapOrphanedRuns` ->
+          // `releaseIssueExecutionAndPromote` takes that lock whenever a
+          // promotion comes back `blocked`, via
+          // `recovery.escalateStrandedAssignedIssue` /
+          // `escalateStrandedRecoveryIssueInPlace`; `startNextQueuedRunForAgent`
+          // reaches the same helper on the cancel paths. What makes them safe
+          // to leave unlatched is the BOUND, not the absence: that exposure is
+          // one escalation per reaped or cancelled run, against the 147
+          // candidates a single tail pass walks sequentially (measured
+          // 2026-09-16). It cannot build the convoy the latch removes.
+          //
+          // The split does admit one race: `reapOrphanedRuns` can finalize a
+          // run after an in-flight tail pass has already sampled its candidate
+          // set, so a newly-eligible issue waits for the next tick. That is
+          // bounded latency, not a correctness defect — every pass in the tail
+          // is idempotent and repeating — and the pre-latch code already let
+          // tick N's tail overlap tick N+1's dispatch, so it is not a new
+          // concurrency class.
+          //
+          // Gating them on the latched tail would couple
+          // dispatch to that tail's slowest pass: it ends in
+          // `reconcileContendedPrReviewerWakes`, which crosses the
+          // plugin-worker RPC bridge that logged ~976 x 30 s timeouts in the
+          // BLO-34207 incident. Resumption would then run once per whole chain
+          // instead of once per 30 s tick, reproducing the very symptom the
+          // latch is deployed against ("runs sat in `running` 15-20 min before
+          // their k8s Job was created").
           trackHeartbeatSchedulerWork(heartbeat
             .resumeRunningExternalRuntimeRuns()
             .then(() => heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 }))
             .then(() => heartbeat.promoteDueScheduledRetries())
             .then(async (promotion) => {
               await heartbeat.resumeQueuedRuns();
-              const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
-              if (
-                promotion.promoted > 0 ||
-                reconciled.assignmentDispatched > 0 ||
-                reconciled.dispatchRequeued > 0 ||
-                reconciled.continuationRequeued > 0 ||
-                reconciled.successfulRunHandoffEscalated > 0 ||
-                reconciled.reviewWaitingParked > 0 ||
-                reconciled.waitingOnReviewResolved > 0 ||
-                reconciled.escalated > 0
-              ) {
+              if (promotion.promoted > 0) {
                 logger.warn(
-                  { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
-                  "periodic heartbeat recovery changed assigned issue state",
-                );
-              }
-            })
-            .then(async () => {
-              const reconciled = await heartbeat.reconcileIssueGraphLiveness();
-              // BLO-29601: auto-resolving a dead escalation is a change to the issue
-              // graph too. Without it in this gate the drain runs silently and the only
-              // evidence it happened at all is the cancelled rows themselves.
-              if (
-                reconciled.escalationsCreated > 0 ||
-                reconciled.dependencyWakesHealed > 0 ||
-                reconciled.staleEscalationsAutoResolved > 0
-              ) {
-                logger.warn({ ...reconciled }, "periodic issue-graph liveness reconciliation changed issue graph state");
-              }
-            })
-            .then(async () => {
-              const reconciled = await heartbeat.reconcileTaskWatchdogs();
-              if (reconciled.triggered > 0) {
-                logger.warn({ ...reconciled }, "periodic task-watchdog reconciliation triggered watchdog work");
-              }
-            })
-            .then(async () => {
-              const scanned = await heartbeat.scanSilentActiveRuns();
-              if (scanned.created > 0 || scanned.escalated > 0) {
-                logger.warn({ ...scanned }, "periodic active-run output watchdog created review work");
-              }
-            })
-            .then(async () => {
-              const reviewed = await heartbeat.reconcileProductivityReviews();
-              if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
-                logger.warn({ ...reviewed }, "periodic productivity reconciliation created or updated review work");
-              }
-            })
-            .then(async () => {
-              const swept = await heartbeat.reconcileResolvedBlockerDependents();
-              if (swept.woken > 0 || swept.failed > 0) {
-                logger.warn({ ...swept }, "periodic resolved-blocker-dependents sweep enqueued wakes");
-              }
-            })
-            .then(async () => {
-              const failedWakeDispatches = await heartbeat.reconcileFailedWakeDispatches();
-              if (failedWakeDispatches.recovered > 0 || failedWakeDispatches.exhausted > 0) {
-                logger.warn(
-                  { ...failedWakeDispatches },
-                  "periodic failed-wake-dispatch reconciliation retried durable wake failures (BLO-14395)",
-                );
-              }
-            })
-            .then(async () => {
-              // BLO-21995: replay PR-reviewer wakes that lost their PR-scope
-              // advisory lock at webhook time. GitHub never redelivers a 200,
-              // so this pass is the only path back for a sanctioned review
-              // request that lost that race.
-              const contendedReviewerWakes = await reconcileContendedPrReviewerWakes(db as any, {
-                webhookSecret: config.githubWebhookSecret || null,
-                pluginWorkerManager,
-                heartbeatOptions: { paperclipNodeRole: config.paperclipNodeRole },
-                prReviewerAgentIds: config.githubPrReviewerAgentIds,
-                prReviewerBotLogin: config.prReviewerBotLogin || null,
-              });
-              if (
-                contendedReviewerWakes.recovered > 0 ||
-                contendedReviewerWakes.exhausted > 0
-              ) {
-                logger.warn(
-                  { ...contendedReviewerWakes },
-                  "periodic contended PR-reviewer wake reconciliation replayed lock-contended review requests (BLO-21995)",
+                  { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds },
+                  "periodic heartbeat dispatch promoted due scheduled retries",
                 );
               }
             })
             .catch((err) => {
-              logger.error({ err }, "periodic heartbeat recovery failed");
+              logger.error({ err }, "periodic heartbeat dispatch resumption failed");
             }));
+
+          if (heartbeatSchedulerStopped) return;
+
+          // The lock-taking tail, single-flighted across ticks. Block form (not
+          // an early `return`) so a pass appended after it still runs while a
+          // chain is in flight — at 147 sequential candidates against a 30 s
+          // tick, "in flight" is the steady state, so an early return would
+          // make any later sibling silently dead. Matches
+          // `crashReconcileSweepInFlight` above.
+          if (!heartbeatRecoveryChainInFlight) {
+            heartbeatRecoveryChainInFlight = true;
+            heartbeatRecoveryChainStartedAt = Date.now();
+            trackHeartbeatSchedulerWork(heartbeat
+              .reconcileStrandedAssignedIssues()
+              .then(async (reconciled) => {
+                if (
+                  reconciled.assignmentDispatched > 0 ||
+                  reconciled.dispatchRequeued > 0 ||
+                  reconciled.continuationRequeued > 0 ||
+                  reconciled.successfulRunHandoffEscalated > 0 ||
+                  reconciled.reviewWaitingParked > 0 ||
+                  reconciled.waitingOnReviewResolved > 0 ||
+                  reconciled.escalated > 0
+                ) {
+                  logger.warn({ ...reconciled }, "periodic heartbeat recovery changed assigned issue state");
+                }
+              })
+              .then(async () => {
+                const reconciled = await heartbeat.reconcileIssueGraphLiveness();
+                // BLO-29601: auto-resolving a dead escalation is a change to the issue
+                // graph too. Without it in this gate the drain runs silently and the only
+                // evidence it happened at all is the cancelled rows themselves.
+                if (
+                  reconciled.escalationsCreated > 0 ||
+                  reconciled.dependencyWakesHealed > 0 ||
+                  reconciled.staleEscalationsAutoResolved > 0
+                ) {
+                  logger.warn({ ...reconciled }, "periodic issue-graph liveness reconciliation changed issue graph state");
+                }
+              })
+              .then(async () => {
+                const reconciled = await heartbeat.reconcileTaskWatchdogs();
+                if (reconciled.triggered > 0) {
+                  logger.warn({ ...reconciled }, "periodic task-watchdog reconciliation triggered watchdog work");
+                }
+              })
+              .then(async () => {
+                const scanned = await heartbeat.scanSilentActiveRuns();
+                if (scanned.created > 0 || scanned.escalated > 0) {
+                  logger.warn({ ...scanned }, "periodic active-run output watchdog created review work");
+                }
+              })
+              .then(async () => {
+                const reviewed = await heartbeat.reconcileProductivityReviews();
+                // BLO-30303 AC4: unconditional — see the startup pass above.
+                logger.info({ ...reviewed }, "periodic productivity reconciliation funnel");
+                if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
+                  logger.warn({ ...reviewed }, "periodic productivity reconciliation created or updated review work");
+                }
+              })
+              .then(async () => {
+                const swept = await heartbeat.reconcileResolvedBlockerDependents();
+                if (swept.woken > 0 || swept.failed > 0) {
+                  logger.warn({ ...swept }, "periodic resolved-blocker-dependents sweep enqueued wakes");
+                }
+              })
+              .then(async () => {
+                const failedWakeDispatches = await heartbeat.reconcileFailedWakeDispatches();
+                if (failedWakeDispatches.recovered > 0 || failedWakeDispatches.exhausted > 0) {
+                  logger.warn(
+                    { ...failedWakeDispatches },
+                    "periodic failed-wake-dispatch reconciliation retried durable wake failures (BLO-14395)",
+                  );
+                }
+              })
+              .then(async () => {
+                // BLO-21995: replay PR-reviewer wakes that lost their PR-scope
+                // advisory lock at webhook time. GitHub never redelivers a 200,
+                // so this pass is the only path back for a sanctioned review
+                // request that lost that race.
+                const contendedReviewerWakes = await reconcileContendedPrReviewerWakes(db as any, {
+                  webhookSecret: config.githubWebhookSecret || null,
+                  pluginWorkerManager,
+                  heartbeatOptions: { paperclipNodeRole: config.paperclipNodeRole },
+                  prReviewerAgentIds: config.githubPrReviewerAgentIds,
+                  prReviewerBotLogin: config.prReviewerBotLogin || null,
+                });
+                if (
+                  contendedReviewerWakes.recovered > 0 ||
+                  contendedReviewerWakes.exhausted > 0
+                ) {
+                  logger.warn(
+                    { ...contendedReviewerWakes },
+                    "periodic contended PR-reviewer wake reconciliation replayed lock-contended review requests (BLO-21995)",
+                  );
+                }
+              })
+              .catch((err) => {
+                logger.error({ err }, "periodic heartbeat recovery failed");
+              })
+              .finally(() => {
+                heartbeatRecoveryChainInFlight = false;
+                heartbeatRecoveryChainStartedAt = 0;
+              }));
+          } else if (
+            Date.now() - heartbeatRecoveryChainStartedAt >
+            HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS
+          ) {
+            // Skipping is normal and silent; a chain that has been in flight for
+            // many ticks is not. Reported, not acted on — see the latch decl.
+            logger.warn(
+              {
+                inFlightMs: Date.now() - heartbeatRecoveryChainStartedAt,
+                warnAfterMs: HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS,
+              },
+              "periodic heartbeat recovery chain still in flight across many ticks; recovery passes are not running",
+            );
+          }
         }
       })();
     }, config.heartbeatSchedulerIntervalMs);
@@ -1799,6 +2072,64 @@ export async function startServer(): Promise<StartedServer> {
     );
   }
 
+  // Approval-enforcement reconciler (BLO-24631). Worker-tier singleton, same
+  // rationale as the reconcilers above: an approved decision that never
+  // reaches the object enforcing it is invisible — the board reads it as
+  // approved and the requester reads it as resolved, indefinitely. Read-only
+  // with respect to approvals and budget policies; it raises a deduped issue
+  // rather than silently re-applying a stale decided figure. Kicks off once on
+  // startup, then on interval.
+  if (config.approvalEnforcementReconcilerEnabled && config.paperclipNodeRole !== "api") {
+    const { startApprovalEnforcementReconciler } = await import(
+      "./services/approval-enforcement-reconciler.js"
+    );
+    logger.info(
+      {
+        intervalMinutes: config.approvalEnforcementReconcilerIntervalMinutes,
+        graceHours: config.approvalEnforcementReconcilerGraceHours,
+      },
+      "Approval-enforcement reconciler enabled (BLO-24631)",
+    );
+    startApprovalEnforcementReconciler(
+      db,
+      config.approvalEnforcementReconcilerIntervalMinutes * 60 * 1000,
+      { graceHours: config.approvalEnforcementReconcilerGraceHours },
+    );
+  }
+
+  // Isolation-workspace reaper (BLO-31222). Worker-tier singleton, opt-IN.
+  //
+  // `buildK8sRunIsolationDescriptor` mounts every workspace-isolated run under
+  // `data/k8s-isolation/workspaces/<executionWorkspaceId>` and nothing has ever
+  // removed one. That tree reached 406.7 GiB on the CephFS volume whose pool
+  // produced BLO-31222's write-block incident. Opt-in rather than default-on
+  // for the same reason as `strandedRecoveryHandBack`: this deletes files
+  // irreversibly, so "deploy the code" and "perform the deletion" must not be
+  // the same act. Enable with `dryRun` first if the tree has not been audited.
+  if (config.isolationWorkspaceReaperEnabled && config.paperclipNodeRole !== "api") {
+    const { startIsolationWorkspaceReaper } = await import(
+      "./services/isolation-workspace-reaper.js"
+    );
+    logger.info(
+      {
+        intervalMinutes: config.isolationWorkspaceReaperIntervalMinutes,
+        maxAgeDays: config.isolationWorkspaceReaperMaxAgeDays,
+        maxDeletesPerTick: config.isolationWorkspaceReaperMaxDeletesPerTick,
+        dryRun: config.isolationWorkspaceReaperDryRun,
+      },
+      "Isolation-workspace reaper enabled (BLO-31222)",
+    );
+    startIsolationWorkspaceReaper(
+      db,
+      config.isolationWorkspaceReaperIntervalMinutes * 60 * 1000,
+      {
+        maxAgeDays: config.isolationWorkspaceReaperMaxAgeDays,
+        maxDeletesPerTick: config.isolationWorkspaceReaperMaxDeletesPerTick,
+        dryRun: config.isolationWorkspaceReaperDryRun,
+      },
+    );
+  }
+
   // Human-gated ageing digest (BLO-29420). Worker-tier singleton. BLO-19130's
   // ageing module shipped as 683 lines of tested pure functions with zero
   // production importers, so the escalation it describes had never fired once;
@@ -1876,6 +2207,39 @@ export async function startServer(): Promise<StartedServer> {
         "Approval-gate reconciler enabled (BLO-29359)",
       );
       startApprovalGateReconciler(db, config.approvalGateReconcilerIntervalMinutes * 60 * 1000);
+    }
+  }
+  // Terminal-gate reconciler (BLO-27515). Worker-tier singleton. Re-reads the
+  // pull-request gates a *terminated* monitor declared (`gateSignals`), so a
+  // gate that resolves after the monitor's last poll — because the convergence
+  // guard stopped re-arming, or because an outage killed the run that would
+  // have — is observed board-side instead of waiting for an assignee run that
+  // may never be dispatched. Records the outcome as a comment; deliberately
+  // dispatches nothing and closes nothing.
+  //
+  // Gated on GitHub App credentials for the same reason as the two reconcilers
+  // above: without them every gate read fails closed as `gate_read_failed` and
+  // nothing can ever resolve, while the candidate scan still runs every pass —
+  // and unlike the siblings it logs nothing on the unresolved path, so an inert
+  // sweep would be silent.
+  if (config.terminalGateReconcilerEnabled && config.paperclipNodeRole !== "api") {
+    const { githubAppCredentialsConfigured } = await import("./services/github-app-auth.js");
+    if (!githubAppCredentialsConfigured()) {
+      logger.warn(
+        "Terminal-gate reconciler disabled: GitHub App credentials are not configured (BLO-27515)",
+      );
+    } else {
+      const { startTerminalGateReconciler } = await import(
+        "./services/terminal-gate-reconciler.js"
+      );
+      logger.info(
+        { intervalMinutes: config.terminalGateReconcilerIntervalMinutes },
+        "Terminal-gate reconciler enabled (BLO-27515)",
+      );
+      startTerminalGateReconciler(
+        db,
+        config.terminalGateReconcilerIntervalMinutes * 60 * 1000,
+      );
     }
   }
 
@@ -1985,12 +2349,7 @@ export async function startServer(): Promise<StartedServer> {
   // Skipped on the API tier: /api/plugins/install hits pluginWorkerManager
   // which is stubbed; the workers tier owns plugin installs.
   if (config.paperclipNodeRole !== "api") {
-    void autoInstallBundledPlugins(db as any, internalBootstrapToken).then(async () => {
-      // Re-patch workspace SDK after plugin installs — npm install pulls the upstream SDK.
-      await copyWorkspaceSdkFiles();
-      // …and the upstream shared it dragged in, so the matched fork pair survives.
-      await copyWorkspaceSharedDist();
-    }).catch((err) => {
+    void autoInstallBundledPlugins(db as any, internalBootstrapToken).catch((err) => {
       logger.warn({ err }, "auto-install of bundled plugins failed (non-fatal)");
     });
   } else {

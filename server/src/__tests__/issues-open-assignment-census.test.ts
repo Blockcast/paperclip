@@ -105,7 +105,7 @@ describeEmbeddedPostgres("issueService.openAssignmentCensus", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-open-assignment-census-");
     db = createDb(tempDb.connectionString);
     svc = issueService(db);
-  }, 60_000);
+  });
 
   afterEach(async () => {
     await db.delete(issues);
@@ -239,12 +239,13 @@ describeEmbeddedPostgres("issueService.openAssignmentCensus", () => {
     ];
     await seedLargePopulation(companyId, agentIds);
 
-    // The defect, reproduced. The route clamps an oversized limit rather than
-    // rejecting it...
+    // The route clamps an oversized limit rather than rejecting it...
     expect(clampIssueListLimit(10_000)).toBe(ISSUE_LIST_MAX_LIMIT);
-    // ...and the clamped page is a bare array: 1,000 rows out of a larger
-    // population, carrying no total and no cursor with which a caller could
-    // detect that it was truncated.
+    // ...and the clamped page is a bare array of 1,000 rows out of a larger
+    // population. BLO-33741 made that clamp detectable at the ROUTE, via the
+    // X-Result-Truncated/X-Applied-Limit headers — but the service call below
+    // is the raw page, which still carries no total and no cursor. Detection
+    // is not a count, which is what this census exists to provide.
     const page = await svc.list(companyId, {
       status: [...OPEN_ISSUE_STATUSES],
       limit: clampIssueListLimit(10_000),
@@ -562,7 +563,7 @@ describeEmbeddedPostgres("GET /companies/:companyId/issues/open-assignment-censu
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-census-routes-");
     db = createDb(tempDb.connectionString);
-  }, 60_000);
+  });
 
   beforeEach(async () => {
     companyId = randomUUID();

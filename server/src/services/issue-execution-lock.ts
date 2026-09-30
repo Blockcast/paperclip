@@ -111,3 +111,34 @@ export function runStatusHoldsIssueExecutionLock(status: string | null | undefin
   if (!status) return false;
   return !TERMINAL_HEARTBEAT_RUN_STATUSES.has(status);
 }
+
+/**
+ * Run-IDENTITY half of the lock question: is `runId` the run this issue's lock
+ * columns name? Orthogonal to {@link runStatusHoldsIssueExecutionLock}, which
+ * answers the run-STATUS half.
+ *
+ * Deliberately requires the actor to own EVERY lock column that is set, not
+ * merely one of them. The columns can diverge — a process-loss retry moves
+ * `executionRunId` to the retry run while leaving `checkoutRunId` pinned at the
+ * original (see the two-statement clear in `releaseIssueExecutionAndPromote`) —
+ * and a run owning only one side of a divergent pair is NOT the owner. Reading
+ * it as ownership would let one of two runs relinquish a lock the other still
+ * holds.
+ *
+ * Mirrors `isCurrentIssueExecutionRun` in `routes/issues.ts`, which applies the
+ * same test to an authenticated request. Kept as a pure function over the two
+ * columns so both layers can share one definition of the predicate.
+ */
+export function runOwnsIssueExecutionLock(
+  issue: { checkoutRunId?: string | null; executionRunId?: string | null },
+  runId: string | null | undefined,
+): boolean {
+  if (!runId) return false;
+  const ownsCheckout = issue.checkoutRunId === runId;
+  const ownsExecution = issue.executionRunId === runId;
+  return (
+    (ownsCheckout || ownsExecution) &&
+    (issue.checkoutRunId == null || ownsCheckout) &&
+    (issue.executionRunId == null || ownsExecution)
+  );
+}

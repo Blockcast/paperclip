@@ -3,6 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { documents, issueDocuments, issues } from "@paperclipai/db";
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY, type SourceTrustMetadata } from "@paperclipai/shared";
 import { documentService } from "./documents.js";
+import { truncateText } from "./truncate-text.js";
 
 export { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY };
 export const ISSUE_CONTINUATION_SUMMARY_TITLE = "Continuation Summary";
@@ -47,12 +48,6 @@ export type IssueContinuationSummaryDocument = {
   sourceTrust: SourceTrustMetadata | null;
   updatedAt: Date;
 };
-
-function truncateText(value: string, maxChars: number) {
-  const trimmed = value.trim();
-  if (trimmed.length <= maxChars) return trimmed;
-  return `${trimmed.slice(0, Math.max(0, maxChars - 20)).trimEnd()}\n[truncated]`;
-}
 
 function asNonEmptyString(value: unknown) {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
@@ -146,7 +141,9 @@ export function buildContinuationSummaryMarkdown(input: {
     resultSummary ? truncateText(resultSummary, SUMMARY_SECTION_MAX_CHARS) : "No adapter-provided result summary was captured for this run.",
   ];
   if (run.error) {
-    recentActions.push(`Latest run error${run.errorCode ? ` (${run.errorCode})` : ""}: ${truncateText(run.error, 500)}`);
+    recentActions.push(
+      `Latest run error${run.errorCode ? ` (${run.errorCode})` : ""}: ${truncateText(run.error, 500, "[truncated]", "\n")}`,
+    );
   }
 
   const paths = extractPathCandidates(resultSummary, run.stdoutExcerpt, run.stderrExcerpt, input.previousSummaryBody);

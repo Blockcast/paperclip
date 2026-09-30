@@ -97,6 +97,7 @@ import { issueDocumentSelect, mapIssueDocumentRow } from "./documents.js";
 import { toIssueWorkProduct } from "./work-products.js";
 import { projectService } from "./projects.js";
 import { normalizePortablePath } from "./portable-path.js";
+import { redactAgentConfigPayload, withholdAgentConfigKeys } from "../redaction.js";
 import { folderService } from "./folders.js";
 import {
   copyCatalogSkillFile,
@@ -1915,6 +1916,27 @@ function emptyTestRunCost() {
   };
 }
 
+/**
+ * Read projection for `agent_config_snapshot` (PEN-2839, door #10 on the
+ * PEN-2370 series).
+ *
+ * The column holds a point-in-time copy of the *subject* agent's config, and
+ * `GET /companies/:companyId/skills/:skillId/test-runs[/:runId]` is gated by
+ * `assertCompanyAccess` alone — which admits any same-company agent actor.
+ * That is a weaker entitlement than `GET /agents/:id`, which hands the same
+ * material only to a caller holding `agent_config:read`. Same asymmetry the
+ * `hire_agent` approval card had in PEN-2777, so it takes the same control
+ * rather than a second one.
+ *
+ * Applied on read, not only on write, because rows persisted before the write
+ * path was fixed still hold the pair in the clear. A write-only fix would leave
+ * every existing test run disclosing.
+ */
+function withheldAgentConfigSnapshot(value: unknown): Record<string, unknown> {
+  if (!isPlainRecord(value)) return {};
+  return withholdAgentConfigKeys(value).payload;
+}
+
 function toCompanySkillTestRun(
   row: CompanySkillTestRunRow,
   cost = emptyTestRunCost(),
@@ -1923,7 +1945,7 @@ function toCompanySkillTestRun(
   return {
     ...row,
     inputId: row.inputId ?? null,
-    agentConfigSnapshot: isPlainRecord(row.agentConfigSnapshot) ? row.agentConfigSnapshot : {},
+    agentConfigSnapshot: withheldAgentConfigSnapshot(row.agentConfigSnapshot),
     templateId: row.templateId ?? null,
     templateName: row.templateName ?? null,
     templateBody: row.templateBody ?? null,
@@ -5375,6 +5397,47 @@ export function companySkillService(db: Db) {
     return materializedSource ? { status: "available", source: materializedSource } : null;
   }
 
+  /**
+   * BLO-31993 — the catalog half of the AC2 delta, and *only* the catalog half.
+   *
+   * "Which declared keys are materialized on the runtime volume" and "which
+   * declared keys exist in this company's library" are different questions, and
+   * `listRuntimeSkillEntries` only answers the first. Conflating them is the
+   * defect this exists to fix: a skill whose `companySkills` row is present but
+   * whose files a rolling materialization sweep has not yet republished is
+   * dropped by that function's bare `continue`, so it looked identical to a key
+   * with no row at all and was reported to the agent as "not in the company
+   * skill library" — advising it to import a skill that was already imported.
+   *
+   * Deliberately a bare key projection: no `resolveRuntimeSkillSource`, no
+   * `ensureSkillInventoryCurrent`, no filesystem access of any kind. The AC2
+   * hot path must stay `reconcileInventory: false`, so classification may read
+   * the catalog table but may never trigger a reconcile.
+   */
+  async function listCatalogSkillKeys(
+    companyId: string,
+    skillKeys?: readonly string[],
+  ): Promise<string[]> {
+    const requestedKeys = skillKeys
+      ? Array.from(new Set(skillKeys.map((key) => key.trim()).filter(Boolean)))
+      : null;
+    // An explicit empty request means "no keys asked about", not "all keys" —
+    // without this an `inArray(..., [])` would widen to the whole company.
+    if (requestedKeys && requestedKeys.length === 0) return [];
+    const rows = await db
+      .select({ key: companySkills.key })
+      .from(companySkills)
+      .where(
+        requestedKeys
+          ? and(
+              eq(companySkills.companyId, companyId),
+              inArray(companySkills.key, requestedKeys),
+            )
+          : eq(companySkills.companyId, companyId),
+      );
+    return rows.map((row) => row.key);
+  }
+
   async function listRuntimeSkillEntries(
     companyId: string,
     options: RuntimeSkillEntryOptions = {},
@@ -5892,8 +5955,18 @@ export function companySkillService(db: Db) {
 
   function snapshotAgentConfig(agent: Awaited<ReturnType<typeof agents.getById>>) {
     if (!agent) return {};
-    const adapterConfig = isPlainRecord(agent.adapterConfig) ? agent.adapterConfig : {};
-    const runtimeConfig = isPlainRecord(agent.runtimeConfig) ? agent.runtimeConfig : {};
+    // `agents.getById` returns the raw row — redaction of this material lives at
+    // the route layer (`routes/agents.ts`), so a service-layer caller receives
+    // `adapterConfig.env` in plaintext. Redact before persisting so the column
+    // is not credential material at rest (PEN-2839). The read projection in
+    // `withheldAgentConfigSnapshot` withholds the pair independently; neither
+    // end is load-bearing for the other.
+    const adapterConfig = redactAgentConfigPayload(
+      isPlainRecord(agent.adapterConfig) ? agent.adapterConfig : {},
+    ) ?? {};
+    const runtimeConfig = redactAgentConfigPayload(
+      isPlainRecord(agent.runtimeConfig) ? agent.runtimeConfig : {},
+    ) ?? {};
     return {
       agentId: agent.id,
       name: agent.name,
@@ -6535,5 +6608,6 @@ export function companySkillService(db: Db) {
     installUpdate,
     resetSkill,
     listRuntimeSkillEntries,
+    listCatalogSkillKeys,
   };
 }

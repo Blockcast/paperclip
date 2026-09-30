@@ -683,4 +683,366 @@ describe.sequential("issue goal context routes", () => {
       ],
     }));
   });
+
+  // PEN-2846, door #12 of the PEN-2370 series. `compactIssueExecutionWorkspace`
+  // withholds `metadata` but passed `config.workspaceRuntime` through verbatim, and
+  // that field is an open `Record<string, unknown>` an operator authors by hand.
+  // Three tools in every agent's MCP grant read this projection —
+  // `paperclipGetHeartbeatContext` and `paperclipGetIssueWorkspaceRuntime` off
+  // `/heartbeat-context`, `paperclipGetIssue` off `GET /issues/:id` — all under
+  // `assertIssueReadAllowed`, which admits same-company agents. Both routes are
+  // asserted because they share the projection but not the test, so a future
+  // refactor that only rewires one is caught here.
+  //
+  // The fixture value is invented. The real endpoint was never called: reading it
+  // is the exposure.
+  //
+  // PEN-2852 (BLO-33407) STRENGTHENED this contract, and these cases now pin the
+  // stronger one. The threat actor named above — a same-company agent holding only
+  // `company_scope:read` — no longer gets a name-preserving *mask*; it gets
+  // `workspaceRuntime: null`, and `metadata` closes with it. `null` is strictly
+  // stronger than `***REDACTED***`: the mask kept keys, enum values and identity
+  // strings crossing, and closed nothing on `metadata` at all.
+  //
+  // Two things about the fixture matter, and getting either wrong silently inverts
+  // what is measured:
+  //
+  //   1. The outer `beforeEach` mocks `accessService.decide` to allow EVERY action,
+  //      which makes this block's caller *entitled* under PEN-2852 — the one class
+  //      that is supposed to see raw values. Measured at `c1127276f`: with that
+  //      blanket allow the secret crosses and `not.toContain` fires. The local
+  //      `beforeEach` below denies `workspace_runtime:read` so the caller models the
+  //      agent this block is actually about.
+  //   2. Narrowing `services/authorization.ts` cannot affect this file. The whole
+  //      service index is `vi.mock`ed above (`accessService: () => mockAccessService`),
+  //      so no production authorization code runs here. The entitlement under test is
+  //      the one this mock states, and nothing else.
+  describe("workspaceRuntime withholding (PEN-2846 mask → PEN-2852 null)", () => {
+    // The unentitled same-company agent of the comment above. Scoped to this block so
+    // the rest of the file keeps the blanket allow it was written against.
+    beforeEach(() => {
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: input.action !== "workspace_runtime:read",
+        action: input.action,
+        reason: "allow_test",
+        explanation: "Allowed by test mock.",
+      }));
+    });
+
+    const CONFIGURED_SECRET = "invented-fixture-value-not-a-real-credential";
+    const workspaceWithRuntime = {
+      id: "55555555-5555-4555-8555-555555555555",
+      name: "PAP-581 workspace",
+      mode: "isolated_workspace",
+      status: "active",
+      config: {
+        environmentId: null,
+        provisionCommand: null,
+        teardownCommand: null,
+        cleanupCommand: null,
+        desiredState: null,
+        workspaceRuntime: {
+          services: [
+            { name: "api", command: "pnpm dev", GRAFANA_API_TOKEN: CONFIGURED_SECRET },
+          ],
+        },
+      },
+      runtimeServices: [],
+      // Set by `services/execution-workspaces.ts` on every real row; the mock has to
+      // carry it or the compensating-flag assertion below measures the fixture.
+      hasWorkspaceRuntimeConfig: true,
+    };
+
+    for (const path of ["heartbeat-context", ""] as const) {
+      const route = `/api/issues/11111111-1111-4111-8111-111111111111${path ? `/${path}` : ""}`;
+
+      it(`withholds configured workspaceRuntime on GET ${route || "/issues/:id"}`, async () => {
+        mockIssueService.getById.mockResolvedValue({
+          ...legacyProjectLinkedIssue,
+          executionWorkspaceId: "55555555-5555-4555-8555-555555555555",
+        });
+        mockExecutionWorkspaceService.getById.mockResolvedValue(structuredClone(workspaceWithRuntime));
+
+        const res = await request(createApp()).get(route);
+
+        expect(res.status).toBe(200);
+        expect(JSON.stringify(res.body)).not.toContain(CONFIGURED_SECRET);
+        // PEN-2852: withheld outright rather than masked. Nothing of the operator's
+        // blob crosses — not values, and not the key names the mask used to keep.
+        expect(res.body.currentExecutionWorkspace.config.workspaceRuntime).toBeNull();
+        expect(res.body.currentExecutionWorkspace.metadata).toBeNull();
+        // The compensating existence flag: a withheld caller can still tell "no
+        // runtime config" from "withheld", which the bare null alone cannot say.
+        expect(res.body.currentExecutionWorkspace.hasWorkspaceRuntimeConfig).toBe(true);
+      });
+    }
+
+    // PEN-2846 door #12b. The same `res.json` carries a *second* workspaceRuntime
+    // exit: `compactIssueProjectWorkspace` emitted `runtimeConfig` verbatim. That
+    // projection is a withholding boundary too — it omits `metadata` and
+    // `runtimeServices` — but `runtimeConfig` is a *view onto that omitted
+    // `metadata`* (`services/projects.ts` →
+    // `readProjectWorkspaceRuntimeConfig(row.metadata)`), so a slice of the
+    // dropped column crossed anyway. Same open `Record<string, unknown>` type,
+    // same `assertIssueReadAllowed` gate, same `paperclipGetIssue` reader.
+    //
+    // The secret is DELIBERATELY a different value from CONFIGURED_SECRET above,
+    // and no execution workspace is mocked into this test. Reusing that constant
+    // would let the already-merged execution-workspace mask satisfy the
+    // `not.toContain` assertion and the test would pass against the unfixed
+    // projection — the neighbouring-control trap this ticket flagged four times.
+    //
+    // Fixture values are invented; the real endpoint was never called.
+    it("withholds configured workspaceRuntime on project workspaces from GET /issues/:id", async () => {
+      const PROJECT_WORKSPACE_SECRET = "invented-project-workspace-fixture-value";
+      const runtimeConfig = {
+        workspaceRuntime: {
+          services: [
+            { name: "web", command: "pnpm dev", DEPLOY_TOKEN: PROJECT_WORKSPACE_SECRET },
+          ],
+        },
+        desiredState: "running",
+        serviceStates: null,
+      };
+      const projectWorkspace = {
+        id: "workspace-primary",
+        companyId: "company-1",
+        projectId: legacyProjectLinkedIssue.projectId,
+        name: "Main",
+        sourceType: "local_path",
+        cwd: "/tmp/company-1/project-1",
+        visibility: "default",
+        metadata: { runtimeConfig },
+        runtimeConfig,
+        // As above: `services/projects.ts` derives this on every real row.
+        hasWorkspaceRuntimeConfig: true,
+        isPrimary: true,
+        createdAt: new Date("2026-03-20T00:00:00Z"),
+        updatedAt: new Date("2026-03-20T00:00:00Z"),
+      };
+
+      mockIssueService.getById.mockResolvedValue({ ...legacyProjectLinkedIssue });
+      mockProjectService.getById.mockResolvedValueOnce({
+        ...(await mockProjectService.getById()),
+        workspaces: [structuredClone(projectWorkspace)],
+        primaryWorkspace: structuredClone(projectWorkspace),
+      });
+
+      const res = await request(createApp()).get("/api/issues/11111111-1111-4111-8111-111111111111");
+
+      expect(res.status).toBe(200);
+      expect(JSON.stringify(res.body)).not.toContain(PROJECT_WORKSPACE_SECRET);
+
+      // Both exits off this projection: the array and the primary alias.
+      for (const emitted of [res.body.project.workspaces[0], res.body.project.primaryWorkspace]) {
+        // PEN-2852: withheld outright rather than masked, same as the execution exit.
+        expect(emitted.runtimeConfig.workspaceRuntime).toBeNull();
+        expect(emitted.hasWorkspaceRuntimeConfig).toBe(true);
+        // `desiredState` is enum-validated by the reader, so it must NOT be
+        // withheld — this pins the fix to the open field instead of the whole object.
+        expect(emitted.runtimeConfig.desiredState).toBe("running");
+      }
+    });
+  });
+
+  // PEN-3114 door #15. Deliberately a SIBLING of the block above rather than a case
+  // inside it, because that block's local `beforeEach` denies `workspace_runtime:read`
+  // and this control is not gated on it.
+  //
+  // `defaultsJson` is masked unconditionally, so running it under the file's default
+  // blanket-allow models the *maximally entitled* caller — the hardest case for an
+  // unconditional mask to pass. Inside the block above it would have run as a denied
+  // viewer, where a future entitlement-gated implementation would also return nothing
+  // and the test would stay green without measuring the entitled path. That is the
+  // "test passes on unfixed code" shape this series keeps hitting, so the placement is
+  // load-bearing, not cosmetic.
+  //
+  // Why unconditional and not gated like the workspace runtime above: PEN-2852's
+  // `workspace_runtime:read` entitlement is scoped to workspace runtime config, and
+  // `defaultsJson` is plugin-manifest material — a different disclosure decision with a
+  // different audience. Gating it on that flag would hand plugin defaults to every
+  // holder of an unrelated entitlement. There is also no entitled consumer to serve:
+  // no UI reads `defaultsJson` off this projection at all.
+  describe("plugin defaultsJson masking (PEN-3114)", () => {
+    // The third open `Record<string, unknown>` off this same
+    // response, and the one furthest from an operator's hands:
+    // `managedByPlugin.defaultsJson.settings` is copied verbatim out of a plugin
+    // manifest's `PluginManagedProjectDeclaration.settings` by
+    // `buildManagedProjectDefaults`. Same `assertIssueReadAllowed` gate, same
+    // `paperclipGetIssue` reader, one line below the `env: null` that proves this
+    // projection is a withholding boundary.
+    //
+    // The secret is again a DISTINCT invented value: reusing either constant above
+    // would let the PEN-2852 withholding on those exits satisfy the `not.toContain`
+    // assertion, and this test would pass against the unfixed projection. No workspace
+    // or execution workspace is mocked here either.
+    //
+    // Fixture values are invented; no real endpoint was called to produce them.
+    it("masks plugin-authored defaultsJson on the project from GET /issues/:id", async () => {
+      const PLUGIN_SETTINGS_SECRET = "invented-plugin-defaults-fixture-value";
+      const managedByPlugin = {
+        id: "plugin-binding-1",
+        pluginId: "plugin-1",
+        pluginKey: "acme-tracker",
+        pluginDisplayName: "Acme Tracker",
+        resourceKind: "project",
+        resourceKey: "onboarding",
+        defaultsJson: {
+          projectKey: "onboarding",
+          displayName: "Onboarding",
+          description: null,
+          status: "in_progress",
+          color: null,
+          settings: { INTEGRATION_API_TOKEN: PLUGIN_SETTINGS_SECRET, region: "us-east-1" },
+        },
+        createdAt: new Date("2026-03-20T00:00:00Z"),
+        updatedAt: new Date("2026-03-20T00:00:00Z"),
+      };
+
+      mockIssueService.getById.mockResolvedValue({ ...legacyProjectLinkedIssue });
+      mockProjectService.getById.mockResolvedValueOnce({
+        ...(await mockProjectService.getById()),
+        managedByPlugin: structuredClone(managedByPlugin),
+      });
+
+      const res = await request(createApp()).get("/api/issues/11111111-1111-4111-8111-111111111111");
+
+      expect(res.status).toBe(200);
+      expect(JSON.stringify(res.body)).not.toContain(PLUGIN_SETTINGS_SECRET);
+
+      const emitted = res.body.project.managedByPlugin;
+      // The closed, typed scalars survive — these are what addresses the binding, and
+      // `pluginDisplayName` / `pluginKey` / `resourceKey` are the three fields the UI
+      // actually reads off `managedByPlugin`.
+      expect(emitted.pluginKey).toBe("acme-tracker");
+      expect(emitted.pluginDisplayName).toBe("Acme Tracker");
+      expect(emitted.resourceKey).toBe("onboarding");
+
+      // Structure and every key name survive so the binding stays legible.
+      expect(Object.keys(emitted.defaultsJson)).toEqual([
+        "projectKey",
+        "displayName",
+        "description",
+        "status",
+        "color",
+        "settings",
+      ]);
+      expect(Object.keys(emitted.defaultsJson.settings)).toEqual(["INTEGRATION_API_TOKEN", "region"]);
+
+      // Values do not. Assert the credential leaf BY VALUE rather than by key
+      // presence — a regression passing `settings` through verbatim keeps the key set
+      // byte-identical, so a key-set assertion alone would stay green against it.
+      expect(emitted.defaultsJson.settings.INTEGRATION_API_TOKEN).toBe("***REDACTED***");
+      // `region` is not credential-named and is masked anyway: this walk is
+      // mask-by-default, not a key-name denylist, and that is the property that makes
+      // it cover a manifest key nobody enumerated in advance.
+      expect(emitted.defaultsJson.settings.region).toBe("***REDACTED***");
+      expect(emitted.defaultsJson.displayName).toBe("***REDACTED***");
+      // `null` carries nothing and stays `null` rather than becoming the sentinel.
+      expect(emitted.defaultsJson.color).toBeNull();
+    });
+
+    // PEN-3210 door #19. The block above pins `project.managedByPlugin`; this pins
+    // `mentionedProjects[].managedByPlugin` — TWO KEYS DOWN THE SAME `res.json({…})`
+    // LITERAL, reached through `publicProjects` instead of `compactIssueProject`. The
+    // finding was exactly that: the mask landed on one key and the same material went
+    // out on its neighbour. Cases are parameterised over the entitlement because the
+    // two keys reach the field by different routes and a plausible fix closes only one
+    // of them.
+    //
+    // ⚠️ The `revealRuntimeConfig: true` case is the load-bearing one and it is NOT
+    // redundant with the block above. `publicProject` early-returns the whole row for an
+    // entitled viewer:
+    //
+    //     const masked = maskProjectManagedByPluginDefaults(maskProjectEnv(project));
+    //     if (viewer.revealRuntimeConfig) return masked;   // ← everything below is skipped
+    //
+    // so a mask written into the object literal BELOW that line — the obvious place, next
+    // to `workspaces` and `primaryWorkspace` — masks nothing for the caller most likely to
+    // be an entitled human operator, while passing an unentitled-only test. `defaultsJson`
+    // is plugin-manifest material and `workspace_runtime:read` is scoped to workspace
+    // runtime config, so no viewer is entitled to it and the mask must sit ABOVE the
+    // return. That is what the `true` case measures and nothing else in the suite does.
+    //
+    // Fixture values are invented; no real endpoint was called to produce them. The
+    // secret is distinct from every sibling door's constant — reusing one would let an
+    // already-merged mask elsewhere in the response satisfy `not.toContain` and the test
+    // would pass against unfixed code (the PEN-3130 lesson).
+    describe("plugin defaultsJson masking on mentionedProjects (PEN-3210)", () => {
+      const MENTIONED_PLUGIN_SECRET = "invented-mentioned-project-defaults-fixture";
+
+      for (const revealRuntimeConfig of [true, false]) {
+        it(`masks plugin-authored defaultsJson on mentionedProjects[] from GET /issues/:id (workspace_runtime:read ${
+          revealRuntimeConfig ? "granted" : "denied"
+        })`, async () => {
+          mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+            allowed: revealRuntimeConfig || input.action !== "workspace_runtime:read",
+            action: input.action,
+            reason: "allow_test",
+            explanation: "Allowed by test mock.",
+          }));
+
+          const mentionedProject = {
+            ...(await mockProjectService.getById()),
+            id: "22222222-2222-4222-8222-222222222222",
+            urlKey: "billing",
+            name: "Billing",
+            managedByPlugin: {
+              id: "plugin-binding-2",
+              pluginId: "plugin-2",
+              pluginKey: "acme-billing",
+              pluginDisplayName: "Acme Billing",
+              resourceKind: "project",
+              resourceKey: "billing",
+              defaultsJson: {
+                projectKey: "billing",
+                displayName: "Billing",
+                color: null,
+                settings: { BILLING_WEBHOOK_SECRET: MENTIONED_PLUGIN_SECRET, region: "eu-west-1" },
+              },
+              createdAt: new Date("2026-03-20T00:00:00Z"),
+              updatedAt: new Date("2026-03-20T00:00:00Z"),
+            },
+          };
+
+          mockIssueService.getById.mockResolvedValue({ ...legacyProjectLinkedIssue });
+          mockIssueService.findMentionedProjectIds.mockResolvedValue([mentionedProject.id]);
+          mockProjectService.listByIds.mockResolvedValue([structuredClone(mentionedProject)]);
+
+          const res = await request(createApp()).get(
+            "/api/issues/11111111-1111-4111-8111-111111111111",
+          );
+
+          expect(res.status).toBe(200);
+          expect(JSON.stringify(res.body)).not.toContain(MENTIONED_PLUGIN_SECRET);
+
+          const emitted = res.body.mentionedProjects[0].managedByPlugin;
+          // The binding stays addressable: these three are what the UI reads.
+          expect(emitted.pluginKey).toBe("acme-billing");
+          expect(emitted.pluginDisplayName).toBe("Acme Billing");
+          expect(emitted.resourceKey).toBe("billing");
+
+          // Structure and key names survive (ask 1).
+          expect(Object.keys(emitted.defaultsJson)).toEqual([
+            "projectKey",
+            "displayName",
+            "color",
+            "settings",
+          ]);
+          expect(Object.keys(emitted.defaultsJson.settings)).toEqual([
+            "BILLING_WEBHOOK_SECRET",
+            "region",
+          ]);
+
+          // Values do not — asserted BY VALUE. A verbatim passthrough keeps the key set
+          // byte-identical, so the two `Object.keys` assertions above stay green against
+          // the unfixed code and cannot carry this on their own.
+          expect(emitted.defaultsJson.settings.BILLING_WEBHOOK_SECRET).toBe("***REDACTED***");
+          expect(emitted.defaultsJson.settings.region).toBe("***REDACTED***");
+          expect(emitted.defaultsJson.displayName).toBe("***REDACTED***");
+          expect(emitted.defaultsJson.color).toBeNull();
+        });
+      }
+    });
+  });
 });

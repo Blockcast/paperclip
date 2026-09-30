@@ -143,7 +143,7 @@ interface IssueLabelCreateOptions extends BaseClientOptions {
 interface IssueRecoveryResolveOptions extends BaseClientOptions {
   actionId?: string;
   outcome: string;
-  sourceIssueStatus: string;
+  sourceIssueStatus?: string;
   resolutionNote?: string;
 }
 
@@ -517,7 +517,7 @@ export function registerIssueCommands(program: Command): void {
       .description("Resolve an issue recovery action")
       .argument("<issueId>", "Issue ID")
       .requiredOption("--outcome <outcome>", "restored, false_positive, blocked, or cancelled")
-      .requiredOption("--source-issue-status <status>", "todo, done, or in_review for restored outcomes; blocked is only valid for blocked outcomes")
+      .option("--source-issue-status <status>", "todo, done, or in_review for restored outcomes; blocked is only valid for blocked outcomes; omit on a restored outcome to leave the source issue's status unchanged")
       .option("--action-id <id>", "Specific recovery action ID")
       .option("--resolution-note <text>", "Resolution note")
       .action(async (issueId: string, opts: IssueRecoveryResolveOptions) => {

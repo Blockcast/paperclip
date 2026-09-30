@@ -341,6 +341,14 @@ export const ISSUE_RECOVERY_ACTION_OUTCOMES = [
 ] as const;
 export type IssueRecoveryActionOutcome = (typeof ISSUE_RECOVERY_ACTION_OUTCOMES)[number];
 
+export const ISSUE_RECOVERY_ACTION_RETIRING_BOUNDS = [
+  "timeout_horizon",
+  "attempt_budget",
+  "discharged",
+  "cancelled",
+] as const;
+export type IssueRecoveryActionRetiringBound = (typeof ISSUE_RECOVERY_ACTION_RETIRING_BOUNDS)[number];
+
 export function pluginOperationIssueOriginKind(pluginKey: string): PluginIssueOriginKind {
   return `plugin:${pluginKey}:operation`;
 }
@@ -680,6 +688,15 @@ export type ApprovalStatus = (typeof APPROVAL_STATUSES)[number];
  */
 export const APPROVAL_UNDECIDED_STATUSES = ["pending", "revision_requested"] as const;
 export type ApprovalUndecidedStatus = (typeof APPROVAL_UNDECIDED_STATUSES)[number];
+
+/**
+ * Most issues one approval may link at creation (`issueIds` on approval create,
+ * `sourceIssueIds` on agent hire). Each id is authorized on its own, sequentially,
+ * before anything is written, so an uncapped array let one request queue one issue
+ * read plus an authorization decision per element, bounded only by the JSON body
+ * limit (PR #1271). Matches the issue-id arrays on task-bridge key scopes.
+ */
+export const APPROVAL_LINKED_ISSUE_IDS_MAX = 50;
 
 export const SECRET_PROVIDERS = [
   "local_encrypted",
@@ -1323,6 +1340,7 @@ export const PLUGIN_CAPABILITIES = [
   "issues.checkout",
   "issues.wakeup",
   "issue.comments.create",
+  "issue.comments.update",
   "issue.interactions.create",
   "issue.documents.write",
   "projects.managed",

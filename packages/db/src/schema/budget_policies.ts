@@ -19,6 +19,20 @@ export const budgetPolicies = pgTable(
     updatedByUserId: text("updated_by_user_id"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+    /**
+     * When `amount` last changed — NOT when the row was last written (BLO-32796).
+     *
+     * `updated_at` moves for warn percent, hard stop, notification and active
+     * state too, because `budgetService.upsertPolicy` is the single edit path
+     * for all of them. `approval-enforcement-reconciler.ts` needs "did anything
+     * move the enforced figure after this decision?", and reading `updated_at`
+     * for that made an unrelated metadata edit hide a real enforcement gap.
+     *
+     * Every writer of `amount` must stamp this; leaving it at its `defaultNow()`
+     * on an update that did not change the amount is the bug this exists to
+     * prevent.
+     */
+    amountUpdatedAt: timestamp("amount_updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
     companyScopeActiveIdx: index("budget_policies_company_scope_active_idx").on(

@@ -15,6 +15,9 @@ import {
   findLiteralSensitiveEnvVars,
   findLiteralSensitiveEnvVarsInPodSpec,
   findServerOnlyEnvVarsInPodSpec,
+  validateAgentCommand,
+  validatePonytailPluginPath,
+  validatePonytailDefaultMode,
 } from "./job-manifest.js";
 import type { SelfPodInfo } from "./k8s-client.js";
 
@@ -477,6 +480,36 @@ describe("buildJobManifest", () => {
       expect(mounts).toContainEqual({ name: "data", mountPath: "/runtime-cache/workspace" });
     });
 
+    it("uses the validated external launcher and preserves native Claude args", () => {
+      ctx.config = { agentCommand: "/opt/penstock/bin/penstock-agent-runtime.mjs" };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const command = job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      const env = job.spec?.template?.spec?.containers?.[0]?.env ?? [];
+      expect(command).toContain("'/opt/penstock/bin/penstock-agent-runtime.mjs' '--print'");
+      expect(command).not.toContain("ccrotate next");
+      expect(env.find((entry) => entry.name === "PENSTOCK_AGENT_COMMAND")?.value).toBe("claude");
+      expect(env.find((entry) => entry.name === "PENSTOCK_PROVIDER")?.value).toBe("anthropic");
+    });
+
+    it("preserves explicit launcher provider and Ponytail environment mode", () => {
+      ctx.config = {
+        agentCommand: "/opt/penstock/bin/penstock-agent-runtime.mjs",
+        ponytailDefaultMode: "lite",
+        env: { PENSTOCK_PROVIDER: "openai", PONYTAIL_DEFAULT_MODE: "ultra" },
+      };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const env = job.spec?.template?.spec?.containers?.[0]?.env ?? [];
+      expect(env.find((entry) => entry.name === "PENSTOCK_PROVIDER")?.value).toBe("openai");
+      expect(env.find((entry) => entry.name === "PONYTAIL_DEFAULT_MODE")?.value).toBe("ultra");
+    });
+
+    it("adds the Ponytail plugin directory to Claude args", () => {
+      ctx.config = { ponytailPluginPath: "/opt/penstock/ponytail" };
+      const { claudeArgs } = buildJobManifest({ ctx, selfPod });
+      expect(claudeArgs).toContain("--plugin-dir");
+      expect(claudeArgs).toContain("/opt/penstock/ponytail");
+    });
+
     it("emits no duplicate mountPath in either container across the manifest matrix", () => {
       // The invariant itself, asserted over the combinations that vary the
       // mount set, rather than one case per bug.
@@ -816,14 +849,283 @@ describe("buildJobManifest", () => {
       expect(env.get("TEMP")).toBe("/runtime-cache/paperclip-runs/run-abc12345/tmp");
       expect(env.get("PAPERCLIP_WORKSPACE_CWD")).toBe("/runtime-cache/paperclip-runs/run-abc12345/workspace");
       expect(command).toContain("if git -C '/paperclip/source-worktree' rev-parse --verify HEAD");
-      expect(command).toContain("git clone --shared --no-checkout -- '/paperclip/source-worktree' '/runtime-cache/paperclip-runs/run-abc12345/workspace'");
+      expect(command).toContain("git clone --shared --no-checkout --origin origin -- '/paperclip/source-worktree' '/runtime-cache/paperclip-runs/run-abc12345/workspace'");
       expect(command).toContain("checkout --detach \"$source_head\"");
+      // BLO-31359: no recorded upstream, so the clone is left with no remote at
+      // all rather than one aimed back at the clone source — plus a breadcrumb,
+      // so the resulting "'origin' does not appear to be a git repository" is
+      // self-explaining.
+      expect(command).toContain("git -C '/runtime-cache/paperclip-runs/run-abc12345/workspace' remote remove origin");
+      expect(command).not.toContain("remote add origin");
+      expect(command).not.toContain("fetch --no-tags");
+      // Nothing that presumes a remote may leak onto the no-upstream path.
+      expect(command).not.toContain("remote set-head");
+      expect(command).toContain("config paperclip.originRemoved");
       expect(command).toContain("else rm -rf '/runtime-cache/paperclip-runs/run-abc12345/workspace' && mkdir -p '/runtime-cache/paperclip-runs/run-abc12345/workspace'");
       expect(command).toContain("fi && cd '/runtime-cache/paperclip-runs/run-abc12345/workspace' || exit $?");
       const syntaxCheck = spawnSync("/bin/sh", ["-n", "-c", command], { encoding: "utf8" });
       expect(syntaxCheck.stderr).toBe("");
       expect(syntaxCheck.status).toBe(0);
       expect(command).not.toContain("/paperclip/config-workspace");
+    });
+
+    // BLO-31359: `git clone` aims the clone's `origin` at its source, so cloning
+    // the project base checkout makes that shared base a push target — git only
+    // refuses a push to the base's *currently checked out* branch, so any other
+    // refname lands inside it. Repointing `origin` at the real upstream is what
+    // keeps an ephemeral run's push traffic leaving the cluster.
+    it("repoints the ephemeral clone's origin at the real upstream, never the clone source", () => {
+      ctx.context = {
+        paperclipWorkspace: {
+          cwd: "/paperclip/instances/default/projects/co1/proj-1/paperclip",
+          repoUrl: "https://github.com/Blockcast/paperclip.git",
+        },
+      };
+      setRuntimeIsolation(ctx, {
+        isolationMode: "run",
+        isolationKey: "run:run-abc12345",
+        workspaceRoot: "/runtime-cache/paperclip-runs/run-abc12345/workspace",
+        homeRoot: "/runtime-cache/paperclip-runs/run-abc12345/home",
+        sessionRoot: "/runtime-cache/paperclip-runs/run-abc12345/session",
+        cacheRoot: "/runtime-cache/paperclip-runs/run-abc12345/cache",
+        tmpRoot: "/runtime-cache/paperclip-runs/run-abc12345/tmp",
+        storage: isolatedStorage("ephemeral"),
+      });
+
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const command = job.spec?.template?.spec?.containers[0]?.command?.join(" ") ?? "";
+      const workspaceRoot = "/runtime-cache/paperclip-runs/run-abc12345/workspace";
+
+      // The clone still comes off local disk — that is what makes provisioning
+      // cheap — but the base must not survive as a remote.
+      expect(command).toContain(
+        `git clone --shared --no-checkout --origin origin -- '/paperclip/instances/default/projects/co1/proj-1/paperclip' '${workspaceRoot}'`,
+      );
+      expect(command).toContain(`git -C '${workspaceRoot}' remote remove origin`);
+      expect(command).toContain(
+        `git -C '${workspaceRoot}' remote add origin -- 'https://github.com/Blockcast/paperclip.git'`,
+      );
+      // Remove must precede add, or the add fails and the base stays wired up.
+      expect(command.indexOf("remote remove origin")).toBeLessThan(command.indexOf("remote add origin"));
+      // Fail-closed: the two commands that establish the security property sit
+      // in the `&&` chain unguarded, so a failure aborts the run rather than
+      // handing back a base-writable workspace.
+      expect(command).not.toMatch(/remote (remove|add) origin[^&|]*\|\|/);
+
+      const syntaxCheck = spawnSync("/bin/sh", ["-n", "-c", command], { encoding: "utf8" });
+      expect(syntaxCheck.stderr).toBe("");
+      expect(syntaxCheck.status).toBe(0);
+    });
+
+    // `git remote remove` also deletes every refs/remotes/origin/*, so without
+    // this the workspace has no remote-tracking refs and `git rebase
+    // origin/master` fails with `unknown revision`. The refetch is ergonomics,
+    // not security, so unlike the remove/add pair it is guarded — an offline pod
+    // must degrade to "fetch first", never to a failed run.
+    it("refetches remote-tracking refs and origin/HEAD after repointing origin, without letting a fetch failure fail the run", () => {
+      // Each path is read twice — once to build the fixture, once to spell the
+      // `git -C` prefixes the assertions match on — so bind them rather than
+      // re-typing the literals. The desync fails closed but points the wrong
+      // way: editing a fixture literal alone leaves both calls unrecognised, so
+      // the suite reports "unclassified git call" and sends the reader to the
+      // run-workspace git block they did not touch instead of the path they did.
+      const sourceCheckout = "/paperclip/instances/default/projects/co1/proj-1/paperclip";
+      const workspaceRoot = "/runtime-cache/paperclip-runs/run-abc12345/workspace";
+      ctx.context = {
+        paperclipWorkspace: {
+          cwd: sourceCheckout,
+          repoUrl: "https://github.com/Blockcast/paperclip.git",
+        },
+      };
+      setRuntimeIsolation(ctx, {
+        isolationMode: "run",
+        isolationKey: "run:run-abc12345",
+        workspaceRoot,
+        homeRoot: "/runtime-cache/paperclip-runs/run-abc12345/home",
+        sessionRoot: "/runtime-cache/paperclip-runs/run-abc12345/session",
+        cacheRoot: "/runtime-cache/paperclip-runs/run-abc12345/cache",
+        tmpRoot: "/runtime-cache/paperclip-runs/run-abc12345/tmp",
+        storage: isolatedStorage("ephemeral"),
+      });
+
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const command = job.spec?.template?.spec?.containers[0]?.command?.join(" ") ?? "";
+      const wallClockSeconds = 60;
+      const boundedGit = `timeout ${wallClockSeconds} git -C '${workspaceRoot}' -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15`;
+
+      expect(command).toContain(`fetch --no-tags --quiet origin`);
+      // Fetch only after origin points at upstream — fetching earlier would pull
+      // the base's refs back in under the name `origin`.
+      expect(command.indexOf("remote add origin")).toBeLessThan(command.indexOf("fetch --no-tags"));
+      // Guarded, and in a subshell: `a && b || true` would parse as
+      // `(a && b) || true` and swallow failures of the unguarded security
+      // commands earlier in the chain.
+      expect(command).toContain(`(timeout ${wallClockSeconds} git -C '${workspaceRoot}' -c http.lowSpeedLimit=1000`);
+      expect(command).toContain("config paperclip.originFetchFailed");
+
+      // `fetch` restores refs/remotes/origin/<branch> but not the symbolic
+      // refs/remotes/origin/HEAD, so `set-head` is paired with it — otherwise
+      // `git symbolic-ref refs/remotes/origin/HEAD` stays broken in every
+      // run-isolated workspace.
+      expect(command).toContain("remote set-head origin -a");
+      expect(command.indexOf("fetch --no-tags")).toBeLessThan(command.indexOf("remote set-head"));
+      // set-head carries its own nested guard, so a set-head failure after a
+      // successful fetch cannot fall through to the "fetch failed" breadcrumb.
+      // It records its own breadcrumb instead of failing silently, so every
+      // failure path in this block explains itself on the workspace.
+      expect(command).toContain(
+        `(${boundedGit} remote set-head origin -a >/dev/null 2>&1 || git -C '${workspaceRoot}' config paperclip.originHeadUnset`,
+      );
+
+      // Both calls in this block reach the network — `set-head -a` queries the
+      // remote for its default branch even when the tracking refs are already
+      // local — so the bounds must be on both, not just the fetch.
+      expect(command).toContain(`${boundedGit} fetch --no-tags --quiet origin`);
+      expect(command).toContain(`${boundedGit} remote set-head origin -a`);
+
+      // Each breadcrumb reports the failed call's exit code, so the two bounds
+      // are distinguishable after the fact rather than both being described as
+      // a stalled transfer. The splice is `'…'"$?"'…'`: closing the single
+      // quotes is what makes `$?` expand at all, and re-opening them is what
+      // keeps the backticks in the remedy text from becoming command
+      // substitution.
+      expect(command).toContain(`config paperclip.originFetchFailed 'best-effort fetch failed (exit '"$?"'; 124`);
+      expect(command).toContain(`config paperclip.originHeadUnset 'origin/HEAD could not be resolved (exit '"$?"'; 124`);
+
+      // The guard against future drift is the *invariant* "every
+      // network-reaching git call carries both bounds", not a count of how
+      // often either bound appears. Counting asserts the inverse of what it
+      // looks like it asserts: a third call added WITHOUT a bound leaves the
+      // count at 2 and passes silently — exactly the regression worth catching
+      // — while a correctly bounded one pushes it to 3 and fails, training the
+      // next reader to bump the literal instead of reading the block.
+      //
+      // The two bounds are tracked separately rather than folded into one
+      // boolean because they fail independently and the remedies differ: the
+      // rate bound is curl-only and catches a stalled transfer, the wall-clock
+      // bound is transport-agnostic and catches a hanging connect. A call
+      // carrying one and not the other is a real gap, and the assertion that
+      // fires should say which one is missing.
+      const boundFlags = ["-c http.lowSpeedLimit=1000", "-c http.lowSpeedTime=15"];
+      const gitPrefix = `git -C '${workspaceRoot}'`;
+      const wallClockPrefix = `timeout ${wallClockSeconds} `;
+      // Deny-list, deliberately, because the two sets are not symmetric: the
+      // verbs this block uses that stay local are enumerable, the ones that can
+      // reach a remote are not. An allowlist of network verbs fails OPEN — an
+      // unnamed verb is classified local, so an unbounded call using it passes
+      // every assertion below. `remote prune` and `remote show` are two that
+      // exist today: both block on an unreachable remote exactly as
+      // `set-head -a` does. Treating anything unrecognised as network-reaching
+      // fails CLOSED instead, so a new verb reddens this suite until a human
+      // classifies it — which is the whole point of a drift guard.
+      const staysLocal = (args: string) =>
+        /^\s*(config|checkout|rev-parse|symbolic-ref)\b/.test(args) ||
+        /^\s*remote\s+(add|remove|rename|set-url)\b/.test(args);
+      const reachesNetwork = (args: string) => !staysLocal(args);
+
+      const segments = command.split(gitPrefix);
+      const invocations = segments
+        .slice(1)
+        .map((tail, index) => {
+          // The wall-clock bound is a WRAPPER, so it sits before the `git`
+          // token and never appears in `tail`. Splitting on the prefix makes
+          // `segments[index]` exactly the text that ran up to this call, so its
+          // last characters are where the wrapper would be if present.
+          const wallClockBounded = segments[index].endsWith(wallClockPrefix);
+          // One invocation ends at the next shell separator.
+          const raw = tail.split(/&&|\|\||[;|)]/, 1)[0] ?? "";
+          // Peel every leading `-c <key>=<value>` so boundedness is a question
+          // of which flags are present, not of them being adjacent and in this
+          // exact order — and so the verb match sees the subcommand either way.
+          let rest = raw.trimStart();
+          const flags: string[] = [];
+          for (let m = rest.match(/^-c\s+(\S+)\s+/); m; m = rest.match(/^-c\s+(\S+)\s+/)) {
+            flags.push(`-c ${m[1]}`);
+            rest = rest.slice(m[0].length);
+          }
+          return { args: rest, rateBounded: boundFlags.every((flag) => flags.includes(flag)), wallClockBounded };
+        });
+
+      const networkCalls = invocations.filter((i) => reachesNetwork(i.args));
+      // Scope, closed rather than described. The parser above only sees calls
+      // spelled exactly `git -C '<workspaceRoot>'`. Enumerating the forms that
+      // evade it would read as exhaustive without being so: `git -c k=v -C
+      // '<root>'` and `git --git-dir '<root>/.git'` both slip the prefix match,
+      // and this block ENDS with a literal `cd '<workspaceRoot>'`, so a call
+      // appended after that needs no path argument at all to act on this repo
+      // and would mention neither `-C` nor the root. Classify every git call
+      // instead and let anything unrecognised fail here — that is what makes
+      // the boundedness assertions below load-bearing rather than merely
+      // well-labelled.
+      //
+      // Command position excludes three non-calls: the `.git` suffix inside a
+      // repo URL, the `git ...` spelled inside the breadcrumb prose (always
+      // preceded by a backtick), and the tail of a flag such as `--git-dir`,
+      // which is reported by the flag's own call rather than twice.
+      //
+      // Scope is deliberately the WHOLE container command, not just this block:
+      // the command also carries buildEnvGuardSetupShell(), ccrotateRefresh,
+      // DIND_WAIT_PREAMBLE, claudeArgsEscaped and failFastFilter. That is the
+      // fail-closed choice — a git call added to any of them still lands here —
+      // but the coupling runs the other way too, so an unrelated file can redden
+      // this assertion. If that happens the fix is to classify the new call, not
+      // to narrow this match back to the block.
+      const unclassifiedGitCalls = [...command.matchAll(/(?<![-.`\w])git\b/g)]
+        .map((m) => command.slice(m.index))
+        .filter(
+          (call) =>
+            // The three shapes this block is allowed to use.
+            !call.startsWith(`git -C '${workspaceRoot}'`) &&
+            !call.startsWith(`git -C '${sourceCheckout}'`) &&
+            !call.startsWith("git clone "),
+        )
+        .map((call) => call.slice(0, 60));
+      expect(unclassifiedGitCalls).toEqual([]);
+      // Same treatment for the wall-clock wrapper, and for the same reason: the
+      // boundedness check below reads the wrapper off the text preceding a
+      // `git -C '<root>'` call, so a `timeout` spelled any other way — a
+      // different duration, `timeout -k`, or a wrapper around something that is
+      // not a run-workspace git call — would be admitted here while satisfying
+      // nothing. Classify every one and let anything unrecognised fail, so that
+      // adding a wrapper is a decision a human makes rather than one the parser
+      // makes silently by not matching.
+      const unclassifiedWallClockWrappers = [...command.matchAll(/(?<![-.`\w])timeout\b/g)]
+        .map((m) => command.slice(m.index))
+        .filter((call) => !call.startsWith(`${wallClockPrefix}${gitPrefix} `))
+        .map((call) => call.slice(0, 60));
+      expect(unclassifiedWallClockWrappers).toEqual([]);
+      // The real guard: no unbounded network call, however this block grows.
+      // Needs no edit when a third bounded call is legitimately added, and the
+      // scope check above is what guarantees "every call" really means every
+      // call rather than every call written in one particular style. Asserted
+      // per bound so a failure names which one is missing — the two catch
+      // different failures and are not substitutes.
+      expect(networkCalls.filter((i) => !i.rateBounded).map((i) => i.args.trim())).toEqual([]);
+      expect(networkCalls.filter((i) => !i.wallClockBounded).map((i) => i.args.trim())).toEqual([]);
+      // ...and nothing that stays local pays either bound, so both track the
+      // set of network calls in both directions.
+      expect(
+        invocations
+          .filter((i) => (i.rateBounded || i.wallClockBounded) && !reachesNetwork(i.args))
+          .map((i) => i.args.trim()),
+      ).toEqual([]);
+      // Deliberate change-tripwire, NOT a boundedness check: the two calls above
+      // are the whole network surface of run-workspace setup today. A third one
+      // is a decision worth a human reading this block. Which edit is correct
+      // depends on what was added, and the count alone will not tell you:
+      //   - a genuinely NEW network call — bump this literal, and the
+      //     boundedness invariant above keeps the addition honest.
+      //   - a new LOCAL call whose verb `staysLocal` does not yet name — the
+      //     deny-list classifies it as network-reaching (that is the fail-closed
+      //     design, not a bug), so it inflates this count too. Add its verb to
+      //     `staysLocal`; bumping the literal here would paper over the
+      //     misclassification and leave a local call asserted to carry a bound
+      //     it has no reason to carry.
+      expect(networkCalls).toHaveLength(2);
+
+      const syntaxCheck = spawnSync("/bin/sh", ["-n", "-c", command], { encoding: "utf8" });
+      expect(syntaxCheck.stderr).toBe("");
+      expect(syntaxCheck.status).toBe(0);
     });
 
     it("gives two concurrent stateless runs distinct, non-colliding TMPDIR/TMP/TEMP values", () => {
@@ -878,6 +1180,53 @@ describe("buildJobManifest", () => {
       expect(env.get("TMPDIR")).toBe("/runtime-cache/paperclip-workspaces/workspace-1/tmp");
       expect(env.get("XDG_CACHE_HOME")).toBe("/runtime-cache/paperclip-workspaces/workspace-1/cache/xdg");
       expect(container?.command?.join(" ")).not.toContain("git clone --shared");
+    });
+
+    // BLO-36583: pnpm's store is data, not cache, so it was reached by none of
+    // the cache vars and followed HOME onto the PVC once per workspace —
+    // 259.87 GiB across 128 near-identical stores. It must land on a shared
+    // path that is on the same filesystem as the persistent workspace, because
+    // pnpm hardlinks store objects into node_modules and silently ignores a
+    // store configured on another device. Shared per COMPANY, not fleet-wide:
+    // the store is a writable hardlink source, so one root across companies
+    // would hardlink one tenant's objects into another's node_modules.
+    it("shares one pnpm store per company across persistent workspaces, and keeps it per-run when ephemeral", () => {
+      const roots = {
+        isolationMode: "workspace" as const,
+        isolationKey: "workspace:workspace-1",
+        workspaceRoot: "/paperclip/workspaces/workspace-1",
+        homeRoot: "/paperclip/k8s-isolation/workspace-1/home",
+        sessionRoot: "/paperclip/k8s-isolation/workspace-1/session",
+        cacheRoot: "/runtime-cache/paperclip-workspaces/workspace-1/cache",
+        tmpRoot: "/runtime-cache/paperclip-workspaces/workspace-1/tmp",
+      };
+      const pnpmHomeFor = (workspace: "ephemeral" | "persistent", companyId = "co1") => {
+        ctx.agent = { ...ctx.agent, companyId };
+        ctx.context = { paperclipWorkspace: { cwd: roots.workspaceRoot } };
+        setRuntimeIsolation(ctx, { ...roots, storage: isolatedStorage(workspace) });
+        const { job } = buildJobManifest({ ctx, selfPod });
+        const env = new Map(job.spec?.template?.spec?.containers[0]?.env?.map((e) => [e.name, e.value]));
+        return env.get("PNPM_HOME");
+      };
+
+      // Persistent workspace: shared, and on the PVC alongside the checkout —
+      // not under the ephemeral cacheRoot, which is a different filesystem.
+      expect(pnpmHomeFor("persistent")).toBe(
+        "/paperclip/instances/default/data/k8s-isolation/pnpm/co1",
+      );
+      // A second company gets its own store: no cross-tenant hardlink source.
+      expect(pnpmHomeFor("persistent", "co2")).toBe(
+        "/paperclip/instances/default/data/k8s-isolation/pnpm/co2",
+      );
+      // companyId is a path component, so it is sanitized like every other one
+      // (stripped, matching the isolation-root treatment) and cannot escape.
+      expect(pnpmHomeFor("persistent", "../co3")).toBe(
+        "/paperclip/instances/default/data/k8s-isolation/pnpm/co3",
+      );
+      // Ephemeral workspace: nothing outlives the run, so keep it run-scoped.
+      expect(pnpmHomeFor("ephemeral")).toBe(
+        "/runtime-cache/paperclip-workspaces/workspace-1/cache/pnpm",
+      );
     });
 
     it("lets a runtime shared descriptor override legacy isolated config", () => {
@@ -1071,7 +1420,28 @@ describe("buildJobManifest", () => {
     it("sets default resource requests and limits", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
       const resources = job.spec?.template?.spec?.containers[0]?.resources;
-      expect(resources?.requests).toEqual({ cpu: "1000m", memory: "2Gi" });
+      expect(resources?.requests).toEqual({ cpu: "1000m", memory: "1536Mi" });
+      expect(resources?.limits).toEqual({ cpu: "4000m", memory: "8Gi" });
+    });
+
+    // Characterises the lookup this default depends on, so the reclamation
+    // above cannot be silently undone. mergeEnvironmentConfig is a top-level
+    // merge, so an environment row nesting {resources:{requests:{memory}}}
+    // never satisfies the dotted lookup and the default stays in force —
+    // confirmed live: an agent whose environment row carries that nested block
+    // still runs at the default. Only the flat dotted key overrides.
+    //
+    // This pins current behaviour, not desired behaviour: the nested shape is
+    // dead config that its author meant to take effect. If that is ever fixed
+    // by deep-merging, this test SHOULD fail — update it deliberately rather
+    // than assuming it is stale.
+    it("ignores a nested resources block and keeps the default", () => {
+      ctx.config = {
+        resources: { requests: { cpu: "500m", memory: "1Gi" }, limits: { cpu: "4", memory: "16Gi" } },
+      };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const resources = job.spec?.template?.spec?.containers[0]?.resources;
+      expect(resources?.requests).toEqual({ cpu: "1000m", memory: "1536Mi" });
       expect(resources?.limits).toEqual({ cpu: "4000m", memory: "8Gi" });
     });
 
@@ -1694,6 +2064,31 @@ describe("buildJobManifest", () => {
       const cmd = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
       expect(cmd).toContain("| tee");
       expect(cmd).toContain("/paperclip/instances/default/data/run-logs/");
+    });
+
+    // BLO-31955 / BLO-33894. `claudeLineIsHarnessAuthored` in parse.ts trusts
+    // any pod-log line that matches no operator/MCP event shape
+    // (`if (!match) return true`). That trust is STRUCTURAL, not empirical: this
+    // `tee` is the pod log's only writer, and its pipeline carries no `2>&1`, so
+    // only Claude's stdout can reach the parse surface. Adding `2>&1` before the
+    // `tee` — a reasonable-looking edit, e.g. to capture CLI diagnostics in the
+    // pod log — would route operator- and MCP-authored stderr onto that surface
+    // as bare, trusted lines, with no diff on the guard itself. That invisible
+    // widening from a change elsewhere is what BLO-7991 -> #1525 -> BLO-31794
+    // produced four times over. If this assertion goes red, fix the pipeline;
+    // deleting it to get green re-opens the hole it exists to hold shut.
+    it("routes no stderr into the tee that writes the pod log (BLO-31955)", () => {
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const command = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
+      const launcher = command.indexOf("cat /tmp/prompt/prompt.txt");
+      const tee = command.indexOf("| tee ");
+      expect(launcher).toBeGreaterThanOrEqual(0);
+      expect(tee).toBeGreaterThan(launcher);
+      expect(command.slice(launcher, tee)).not.toContain("2>&1");
+      // Negative control: the scope above is load-bearing, not vacuous. The
+      // ccrotate/git plumbing upstream of the launcher legitimately redirects
+      // with `>/dev/null 2>&1`, so a whole-command assertion would be red today.
+      expect(command.slice(0, launcher)).toContain("2>&1");
     });
 
     it("podLogPath is returned from buildJobManifest", () => {

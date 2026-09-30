@@ -4,6 +4,12 @@ import { expect, test } from "@playwright/test";
 // table now redirects into Apps, so capture the current app removal
 // confirmation on the app Advanced tab instead.
 test("captures the current app removal confirmations", async ({ page }) => {
+  // Two cold route navigations (app advanced, then connection advanced) each pay
+  // vite-dev bundling on first hit; a traced failure spent 15.3s + 26.7s in goto
+  // alone and blew the 60s default mid-assert (BLO-33320). Same budget the other
+  // multi-navigation specs in this suite already take.
+  test.setTimeout(180_000);
+
   const flags = await page.request.patch("/api/instance/settings/experimental", { data: { enableApps: true } });
   expect(flags.ok(), `enable apps failed ${flags.status()}: ${await flags.text()}`).toBe(true);
 

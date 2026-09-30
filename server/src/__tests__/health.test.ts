@@ -332,6 +332,40 @@ describe("GET /health", () => {
     });
   });
 
+  it("returns 503, not 500, when an authenticated-mode bootstrap count fails", async () => {
+    // The worker's readiness probe (chart values.yaml, BLO-35948) runs every
+    // query below, so each must land on the same 503 as the SELECT 1 probe.
+    const db = {
+      execute: vi.fn().mockResolvedValue([{ "?column?": 1 }]),
+      select: vi.fn(() => ({
+        from: vi.fn(() => ({
+          where: vi.fn().mockRejectedValue(new Error("Connect Timeout Error")),
+        })),
+      })),
+    } as unknown as Db;
+    const app = express();
+    app.use((req, _res, next) => {
+      (req as any).actor = { type: "none", source: "none" };
+      next();
+    });
+    app.use(
+      "/health",
+      healthRoutes(db, {
+        deploymentMode: "authenticated",
+        deploymentExposure: "private",
+        authReady: true,
+        companyDeletionEnabled: false,
+        serverInfo: testServerInfo,
+      }),
+    );
+
+    const res = await request(app).get("/health");
+
+    expect(res.status).toBe(503);
+    expect(res.body).toMatchObject({ status: "unhealthy", error: "database_unreachable" });
+    expect(db.select).toHaveBeenCalledTimes(1);
+  });
+
   it("redacts detailed metadata for anonymous requests in authenticated mode", async () => {
     const devServerStatus = await import("../dev-server-status.js");
     vi.spyOn(devServerStatus, "readPersistedDevServerStatus").mockReturnValue(null);

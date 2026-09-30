@@ -21,15 +21,19 @@ import {
   projectWorkspaces,
   projects,
   workspaceRuntimeServices,
+  type Db,
 } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import {
   buildWorkspaceRuntimeDesiredStatePatch,
+  buildWorkspaceTemplateData,
   cleanupExecutionWorkspaceArtifacts,
+  ensureGitWorktreeBranchCoherent,
   ensurePersistedExecutionWorkspaceAvailable,
   ensureServerWorkspaceLinksCurrent,
   ensureRuntimeServicesForRun,
   executeProcessForTests,
+  GIT_INDEX_LOCK_STALE_MS,
   isProcessGroupAliveForTests,
   listConfiguredRuntimeServiceEntries,
   normalizeAdapterManagedRuntimeServices,
@@ -40,11 +44,13 @@ import {
   resolveWorkspaceRuntimeReadinessTimeoutSec,
   resolveShell,
   sanitizeRuntimeServiceBaseEnv,
+  setLockHolderScanForTests,
   setProcessGroupLivenessProbeForTests,
   setSubmoduleInspectSettingsForTests,
   startRuntimeServicesForWorkspaceControl,
   stopRuntimeServicesForExecutionWorkspace,
   type RealizedExecutionWorkspace,
+  type LockHolderScan,
   WorkspaceGitSubmoduleError,
   WorkspaceRepoMismatchError,
 } from "../services/workspace-runtime.ts";
@@ -56,7 +62,9 @@ import {
   writeLocalServiceRegistryRecord,
 } from "../services/local-service-supervisor.ts";
 import { resolvePaperclipConfigPath } from "../paths.ts";
+import { executionWorkspaceService } from "../services/execution-workspaces.ts";
 import type { WorkspaceOperation } from "@paperclipai/shared";
+import { EXECUTION_WORKSPACE_BRANCH_TEMPLATE_KEYS } from "@paperclipai/shared";
 import type { WorkspaceOperationRecorder } from "../services/workspace-operations.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -73,6 +81,10 @@ vi.mock("node:child_process", async (importOriginal) => {
 });
 
 const execFileAsync = promisify(execFile);
+
+// Captured before any test can prepend a `git` shim directory. See the PATH
+// backstop in the global `afterEach`.
+const BASELINE_PATH = process.env.PATH;
 
 function stableStringifyForTest(value: unknown): string {
   if (Array.isArray(value)) {
@@ -185,6 +197,9 @@ async function expectPersistedBranchMismatchRejected(input: {
   executionWorkspaceId: string;
   expectedAncestryVerdict: "diverged" | "unknown";
   expectedReason?: string;
+  // For refusals whose reason embeds a path or a claimant list, so an exact
+  // match is not stable across fixtures.
+  expectedReasonContains?: string;
 }) {
   let error: unknown = null;
   try {
@@ -242,10 +257,200 @@ async function expectPersistedBranchMismatchRejected(input: {
           attempted: false,
           succeeded: false,
           ...(input.expectedReason ? { reason: input.expectedReason } : {}),
+          ...(input.expectedReasonContains
+            ? { reason: expect.stringContaining(input.expectedReasonContains) }
+            : {}),
         }),
       }),
     },
   });
+}
+
+// Companion to `expectPersistedBranchMismatchRejected` for the clean/diverged
+// shape (BLO-32628). The recorded branch is restored rather than adopted, so
+// forward reconciliation stays fail-closed here: the assertions below prove the
+// diverged branch was NOT adopted and its ref still points at the same commit.
+async function expectPersistedBranchMismatchRepaired(input: {
+  repoRoot: string;
+  worktreePath: string;
+  expectedBranch: string;
+  actualBranch: string;
+  issueId: string;
+  executionWorkspaceId: string;
+  expectedAncestryVerdict?: "diverged" | "unknown";
+}) {
+  const actualBranchShaBefore = await readGit(input.repoRoot, [
+    "rev-parse",
+    `refs/heads/${input.actualBranch}`,
+  ]);
+
+  const realized = await ensurePersistedExecutionWorkspaceAvailable({
+    base: {
+      baseCwd: input.repoRoot,
+      source: "project_primary",
+      projectId: "project-1",
+      workspaceId: "workspace-1",
+      repoUrl: null,
+      repoRef: "HEAD",
+    },
+    workspace: {
+      id: input.executionWorkspaceId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      cwd: input.worktreePath,
+      providerRef: input.worktreePath,
+      projectId: "project-1",
+      projectWorkspaceId: "workspace-1",
+      repoUrl: null,
+      baseRef: "HEAD",
+      branchName: input.expectedBranch,
+    },
+    issue: {
+      id: input.issueId,
+      identifier: "PAP-459",
+      title: "Restore the recorded branch over a diverged sibling",
+    },
+    agent: {
+      id: "agent-1",
+      name: "Codex Coder",
+      companyId: "company-1",
+    },
+    enableWorkspaceBranchReconcileForward: true,
+  });
+
+  // The recorded branch is restored, not replaced by the diverged branch.
+  expect(realized?.branchName).toBe(input.expectedBranch);
+  await expect(readGit(input.worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+    .resolves.toBe(input.expectedBranch);
+
+  // The no-loss guarantee: the diverged commits are still reachable.
+  await expect(readGit(input.repoRoot, ["rev-parse", `refs/heads/${input.actualBranch}`]))
+    .resolves.toBe(actualBranchShaBefore);
+
+  expect(realized?.warnings.join("\n")).toContain(input.actualBranch);
+  return { realized, actualBranchShaBefore };
+}
+
+// BLO-32628: the ordinary stacked-work shape — a clean worktree on a named
+// sibling branch that has genuinely diverged from the recorded branch. The
+// divergence is real git history rather than a stubbed ancestry verdict, so the
+// eligibility path under test runs the same `merge-base` checks production does;
+// stubbing the verdict would let these pass while the real check still refused.
+async function createCleanDivergedSiblingRepo(input: {
+  expectedBranch: string;
+  actualBranch: string;
+  // Leave the recorded branch checked out in the main worktree, so the
+  // held-elsewhere fact is true alongside whatever else the test is exercising.
+  holdRecordedBranchInMainWorktree?: boolean;
+}) {
+  const repoRoot = await createTempRepo();
+  const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", input.expectedBranch);
+
+  await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+  await runGit(repoRoot, ["branch", input.expectedBranch]);
+  await runGit(repoRoot, ["worktree", "add", "-b", input.actualBranch, worktreePath, "HEAD"]);
+
+  await runGit(repoRoot, ["checkout", input.expectedBranch]);
+  await fs.writeFile(path.join(repoRoot, "recorded.txt"), "recorded branch work\n", "utf8");
+  await runGit(repoRoot, ["add", "recorded.txt"]);
+  await runGit(repoRoot, ["commit", "-m", "Add recorded branch work"]);
+  if (input.holdRecordedBranchInMainWorktree !== true) {
+    await runGit(repoRoot, ["checkout", "main"]);
+  }
+
+  await fs.writeFile(path.join(worktreePath, "actual.txt"), "actual branch work\n", "utf8");
+  await runGit(worktreePath, ["add", "actual.txt"]);
+  await runGit(worktreePath, ["commit", "-m", "Add actual branch work"]);
+
+  await expect(execFileAsync(
+    "git",
+    ["merge-base", "--is-ancestor", input.expectedBranch, input.actualBranch],
+    { cwd: repoRoot },
+  )).rejects.toMatchObject({ code: 1 });
+  await expect(execFileAsync(
+    "git",
+    ["merge-base", "--is-ancestor", input.actualBranch, input.expectedBranch],
+    { cwd: repoRoot },
+  )).rejects.toMatchObject({ code: 1 });
+
+  return { repoRoot, worktreePath };
+}
+
+type ClaimantRow = { id: string; identifier: string | null; status: string };
+
+interface ClaimantQueryChain {
+  from: () => ClaimantQueryChain;
+  where: () => ClaimantQueryChain;
+  orderBy: () => ClaimantQueryChain;
+  limit: (count: number) => Promise<ClaimantRow[]>;
+  then: (
+    resolve: (rows: { companyId: string | null }[]) => unknown,
+    reject?: (error: unknown) => unknown,
+  ) => Promise<unknown>;
+}
+
+// Drizzle-shaped stub for the claimant lookup in
+// `inspectGitWorktreeBranchIncoherence`. Only the database is faked; the git
+// state in every caller below is real. A rejecting lookup cannot be produced
+// against a live Postgres without breaking every other query in the path, and
+// the fail-closed posture is precisely what needs proving.
+//
+// The claimant query is the only one that calls `.limit()`; `readIssueCompanyId`
+// awaits the builder directly, so `then` resolves empty and branch contention
+// short-circuits to null. That keeps the claimant lookup the only database fact
+// these tests depend on.
+//
+// `limit` honours its argument rather than returning the whole fixture. Postgres
+// would, and a stub that ignores it makes the production limit unobservable:
+// the saturation assertion below then passes whether or not the query reads the
+// extra row it needs to tell "exactly N" from "at least N".
+function createClaimantLookupDb(
+  outcome: { kind: "reject" } | { kind: "rows"; rows: ClaimantRow[] },
+): Db {
+  const chain: ClaimantQueryChain = {
+    from: () => chain,
+    where: () => chain,
+    orderBy: () => chain,
+    limit: (count: number) => (outcome.kind === "reject"
+      ? Promise.reject(new Error("claimant lookup unavailable"))
+      : Promise.resolve(outcome.rows.slice(0, count))),
+    then: (resolve, reject) => Promise.resolve([]).then(resolve, reject),
+  };
+  return { select: () => chain } as unknown as Db;
+}
+
+function claimantRow(identifier: string): ClaimantRow {
+  return { id: randomUUID(), identifier, status: "in_progress" };
+}
+
+// Drives the real eligibility computation and returns the thrown validation
+// failure, whose `resultJson.workspaceValidation` is the evidence payload the
+// stranded row would carry.
+async function captureBranchCoherenceRefusal(input: {
+  db: Db | null;
+  repoRoot: string;
+  worktreePath: string;
+  expectedBranch: string;
+}) {
+  let error: unknown = null;
+  try {
+    await ensureGitWorktreeBranchCoherent({
+      db: input.db,
+      repoRoot: input.repoRoot,
+      worktreePath: input.worktreePath,
+      expectedBranchName: input.expectedBranch,
+      sourceIssue: {
+        id: "issue-branch-coherence",
+        identifier: "PAP-462",
+        title: "Refuse an unprovable safe repair",
+      },
+      executionWorkspaceId: "execution-workspace-branch-coherence",
+      enableWorkspaceBranchReconcileForward: true,
+    });
+  } catch (err) {
+    error = err;
+  }
+  return error;
 }
 
 async function createClonedRepoWithRemote() {
@@ -393,6 +598,15 @@ afterEach(async () => {
   // cases. Clearing unconditionally is idempotent.
   setSubmoduleInspectSettingsForTests(null);
   setProcessGroupLivenessProbeForTests(null);
+  setLockHolderScanForTests(null);
+  // Same backstop, for the `git` shim tests. They prepend a temp dir to PATH and
+  // restore it in their own `finally`, so this is normally a no-op -- but a test
+  // killed by the suite timeout runs that block late, and a leaked PATH whose
+  // shim dir still exists makes every later `git submodule status --recursive`
+  // in this file hang for the shim's full sleep. That would surface as an
+  // unrelated timeout in a downstream test rather than as a failure here.
+  if (BASELINE_PATH === undefined) delete process.env.PATH;
+  else if (process.env.PATH !== BASELINE_PATH) process.env.PATH = BASELINE_PATH;
   delete process.env.PAPERCLIP_CONFIG;
   delete process.env.PAPERCLIP_HOME;
   delete process.env.PAPERCLIP_INSTANCE_ID;
@@ -719,6 +933,73 @@ describe("realizeExecutionWorkspace", () => {
     expect(reused.warnings).toEqual([
       expect.stringContaining("is behind main by 1 commit"),
     ]);
+  });
+
+  // BLO-31281: write-time validation only guards NEW config, so the render-time
+  // warning is the only thing that surfaces a template persisted BEFORE that
+  // validation existed — i.e. the 36-worktree case this ticket was filed for.
+  // Both return shapes are asserted separately: they compose their warning
+  // lists at different call sites, so one test could pass while the other path
+  // silently dropped the warning, which is the exact failure mode of the bug.
+  it("warns on both the create and reuse paths when branchTemplate cannot render", async () => {
+    const repoRoot = await createTempRepo();
+    // The production value from the ticket: single braces are never substituted
+    // AND `issueNumber` is not a known key, so this trips both problems.
+    const realizeWithBadTemplate = () => realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "blo-{issueNumber}",
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-447",
+        title: "Add Worktree Support",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    const created = await realizeWithBadTemplate();
+    expect(created.created).toBe(true);
+    expect(created.warnings).toEqual(expect.arrayContaining([
+      expect.stringContaining("never substituted"),
+    ]));
+
+    // Warn, do NOT repair: the identifier prefix still lands, and the literal
+    // token survives into the branch name exactly as observed in production.
+    expect(created.branchName).toBe("PAP-447-blo-issueNumber");
+
+    const reused = await realizeWithBadTemplate();
+    expect(reused.created).toBe(false);
+    expect(reused.cwd).toBe(created.cwd);
+    expect(reused.warnings).toEqual(expect.arrayContaining([
+      expect.stringContaining("never substituted"),
+    ]));
+  });
+
+  it("adds no branchTemplate warning when the template renders cleanly", async () => {
+    // Control for the test above: proves the warning is driven by the template
+    // being unrenderable, not merely by having reached the worktree path.
+    const repoRoot = await createTempRepo();
+    const realized = await realizeWorktreeForTest(repoRoot, "HEAD");
+
+    expect(realized.branchName).toBe("PAP-447-add-worktree-support");
+    expect(
+      realized.warnings.filter((warning) => warning.includes("branchTemplate")),
+    ).toEqual([]);
   });
 
   it("stamps the agent git identity on the default project_primary strategy, which has no worktree funnel", async () => {
@@ -2745,7 +3026,7 @@ describe("realizeExecutionWorkspace", () => {
       .resolves.toBe("allyblockcast[bot]");
   }, 15_000);
 
-  it("classifies persisted git worktree branch incoherence as diverged when the checked-out branch is not forward", async () => {
+  it("restores the recorded branch when a clean worktree sits on a diverged named sibling branch", async () => {
     const repoRoot = await createTempRepo();
     const expectedBranch = "PAP-457-recorded-work";
     const actualBranch = "PAP-457-sibling-work";
@@ -2759,10 +3040,115 @@ describe("realizeExecutionWorkspace", () => {
     await fs.writeFile(path.join(repoRoot, "recorded.txt"), "recorded branch work\n", "utf8");
     await runGit(repoRoot, ["add", "recorded.txt"]);
     await runGit(repoRoot, ["commit", "-m", "Add recorded branch work"]);
+    // Release the recorded branch from the main checkout: git refuses to check
+    // out a branch held by another worktree, and in production the main
+    // checkout sits on master while the task branch lives in the worktree.
+    await runGit(repoRoot, ["checkout", "main"]);
 
     await fs.writeFile(path.join(worktreePath, "actual.txt"), "actual branch work\n", "utf8");
     await runGit(worktreePath, ["add", "actual.txt"]);
     await runGit(worktreePath, ["commit", "-m", "Add actual branch work"]);
+
+    // Guard the fixture: the divergence must be genuine, not an artefact of a
+    // stubbed ancestry verdict. Neither branch may contain the other.
+    await expect(execFileAsync("git", ["merge-base", "--is-ancestor", expectedBranch, actualBranch], { cwd: repoRoot }))
+      .rejects.toMatchObject({ code: 1 });
+    await expect(execFileAsync("git", ["merge-base", "--is-ancestor", actualBranch, expectedBranch], { cwd: repoRoot }))
+      .rejects.toMatchObject({ code: 1 });
+
+    // Read the sibling tip BEFORE the repair. The no-loss guarantee is that this
+    // exact commit still resolves afterwards, so it has to be captured here —
+    // comparing the ref to itself after the fact would assert nothing.
+    const actualHeadBefore = await readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]);
+
+    const { realized } = await expectPersistedBranchMismatchRepaired({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      issueId: "issue-diverged",
+      executionWorkspaceId: "execution-workspace-diverged",
+    });
+
+    // The sibling's commit is still on its own branch, and the file it added is
+    // gone from the restored worktree — proof the checkout really moved HEAD.
+    await expect(readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]))
+      .resolves.toBe(actualHeadBefore);
+    await expect(readGit(repoRoot, ["log", "-1", "--format=%s", actualBranch]))
+      .resolves.toBe("Add actual branch work");
+    expect(existsSync(path.join(worktreePath, "actual.txt"))).toBe(false);
+    expect(existsSync(path.join(worktreePath, "recorded.txt"))).toBe(true);
+    expect(realized?.warnings.join("\n")).toContain("can be checked out again");
+  }, 15_000);
+
+  it("keeps a diverged worktree ineligible when the recorded branch is checked out in another worktree", async () => {
+    const repoRoot = await createTempRepo();
+    const expectedBranch = "PAP-457-held-recorded";
+    const actualBranch = "PAP-457-held-sibling";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
+
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["branch", expectedBranch]);
+    await runGit(repoRoot, ["worktree", "add", "-b", actualBranch, worktreePath, "HEAD"]);
+
+    // The main checkout keeps the recorded branch, so `git checkout` inside the
+    // linked worktree cannot succeed. Eligibility must say so up front rather
+    // than promising a repair that git will refuse.
+    await runGit(repoRoot, ["checkout", expectedBranch]);
+    await fs.writeFile(path.join(repoRoot, "recorded.txt"), "recorded branch work\n", "utf8");
+    await runGit(repoRoot, ["add", "recorded.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Add recorded branch work"]);
+
+    await fs.writeFile(path.join(worktreePath, "actual.txt"), "actual branch work\n", "utf8");
+    await runGit(worktreePath, ["add", "actual.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Add actual branch work"]);
+
+    await expectPersistedBranchMismatchRejected({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      issueId: "issue-held-elsewhere",
+      executionWorkspaceId: "execution-workspace-held-elsewhere",
+      expectedAncestryVerdict: "diverged",
+      // Name this refusal specifically. Asserting only `eligible: false` would
+      // also hold for the pre-fix "expected branch and current HEAD differ"
+      // fall-through, so the assertion would not distinguish this guard from
+      // the gap it was added to close.
+      expectedReasonContains: "recorded branch is already checked out in another worktree at ",
+    });
+
+    // Nothing moved: both worktrees keep the branch they had.
+    await expect(readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(actualBranch);
+    await expect(readGit(repoRoot, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(expectedBranch);
+  }, 15_000);
+
+  it("keeps a clean detached worktree HEAD ineligible when it diverged from the recorded branch", async () => {
+    const repoRoot = await createTempRepo();
+    const expectedBranch = "PAP-457-detached-recorded";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
+
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["branch", expectedBranch]);
+    await runGit(repoRoot, ["worktree", "add", "--detach", worktreePath, "HEAD"]);
+
+    // Move the recorded branch forward so the detached HEAD is not an ancestor.
+    await runGit(repoRoot, ["checkout", expectedBranch]);
+    await fs.writeFile(path.join(repoRoot, "recorded.txt"), "recorded branch work\n", "utf8");
+    await runGit(repoRoot, ["add", "recorded.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Add recorded branch work"]);
+    // Release the recorded branch so the git-level "already checked out
+    // elsewhere" refusal cannot fire: the detached-HEAD refusal must be the only
+    // thing keeping this ineligible, or the test proves nothing about ancestry.
+    await runGit(repoRoot, ["checkout", "main"]);
+
+    // Commit on the detached HEAD: no ref keeps these commits reachable, which
+    // is exactly why ancestry stays load-bearing for this shape.
+    await fs.writeFile(path.join(worktreePath, "detached.txt"), "detached work\n", "utf8");
+    await runGit(worktreePath, ["add", "detached.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Add detached work"]);
 
     let error: unknown = null;
     try {
@@ -2776,7 +3162,7 @@ describe("realizeExecutionWorkspace", () => {
           repoRef: "HEAD",
         },
         workspace: {
-          id: "execution-workspace-diverged",
+          id: "execution-workspace-detached-diverged",
           mode: "isolated_workspace",
           strategyType: "git_worktree",
           cwd: worktreePath,
@@ -2788,9 +3174,9 @@ describe("realizeExecutionWorkspace", () => {
           branchName: expectedBranch,
         },
         issue: {
-          id: "issue-diverged",
+          id: "issue-detached-diverged",
           identifier: "PAP-457",
-          title: "Classify diverged branch incoherence",
+          title: "Keep detached diverged HEAD fail-closed",
         },
         agent: {
           id: "agent-1",
@@ -2808,23 +3194,258 @@ describe("realizeExecutionWorkspace", () => {
       resultJson: {
         workspaceValidation: expect.objectContaining({
           reason: "git_worktree_branch_incoherence",
-          sourceIssueId: "issue-diverged",
-          sourceIdentifier: "PAP-457",
-          executionWorkspaceId: "execution-workspace-diverged",
-          expectedBranch,
-          actualBranch,
+          actualBranch: null,
           cleanliness: "clean",
           provenance: expect.objectContaining({
             expectedBranchExists: true,
-            actualBranchExists: true,
-            sameHead: false,
+            actualBranchExists: null,
             ancestryVerdict: "diverged",
-            plainLanguageReason: expect.stringContaining("cannot prove a forward-only reconciliation"),
+          }),
+          safeRepair: expect.objectContaining({
+            eligible: false,
+            attempted: false,
+            succeeded: false,
+            reason: "detached worktree HEAD is not provably forward of the recorded branch",
           }),
         }),
       },
     });
   }, 15_000);
+
+  it("keeps a dirty worktree on a diverged named sibling branch ineligible for safe repair", async () => {
+    const repoRoot = await createTempRepo();
+    const expectedBranch = "PAP-457-dirty-recorded";
+    const actualBranch = "PAP-457-dirty-sibling";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
+
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["branch", expectedBranch]);
+    await runGit(repoRoot, ["worktree", "add", "-b", actualBranch, worktreePath, "HEAD"]);
+
+    await runGit(repoRoot, ["checkout", expectedBranch]);
+    await fs.writeFile(path.join(repoRoot, "recorded.txt"), "recorded branch work\n", "utf8");
+    await runGit(repoRoot, ["add", "recorded.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Add recorded branch work"]);
+    // Release the recorded branch so the git-level "already checked out
+    // elsewhere" refusal cannot fire. Without this the worktree would be
+    // ineligible for two independent reasons and the test could not show that
+    // the cleanliness guard is the one doing the work.
+    await runGit(repoRoot, ["checkout", "main"]);
+
+    await fs.writeFile(path.join(worktreePath, "actual.txt"), "actual branch work\n", "utf8");
+    await runGit(worktreePath, ["add", "actual.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Add actual branch work"]);
+
+    // Uncommitted work is the one thing a checkout could destroy.
+    await fs.writeFile(path.join(worktreePath, "uncommitted.txt"), "not safe to switch\n", "utf8");
+
+    await expectPersistedBranchMismatchRejected({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      issueId: "issue-dirty-diverged",
+      executionWorkspaceId: "execution-workspace-dirty-diverged",
+      expectedAncestryVerdict: "diverged",
+      expectedReason: "worktree is not clean",
+    });
+
+    // The dirty file survives the refusal.
+    expect(existsSync(path.join(worktreePath, "uncommitted.txt"))).toBe(true);
+  }, 15_000);
+
+  // BLO-32628: `git bisect start` is the one interrupted operation that reads
+  // clean AND stays on a named branch, so neither `cleanliness` nor
+  // `actualBranchExists` screens it out — every conjunct of the new eligibility
+  // branch holds. The checkout would succeed and orphan nothing, so this is not
+  // a no-loss problem; it would leave live bisect state pointing at a branch the
+  // worktree is no longer on, for the next run to inherit silently.
+  it("keeps a clean diverged worktree ineligible while a git bisect is in progress", async () => {
+    const expectedBranch = "PAP-463-bisect-recorded";
+    const actualBranch = "PAP-463-bisect-sibling";
+    const { repoRoot, worktreePath } = await createCleanDivergedSiblingRepo({
+      expectedBranch,
+      actualBranch,
+    });
+
+    // Start a bisect and mark nothing, which is the state that reads clean.
+    await runGit(worktreePath, ["bisect", "start"]);
+
+    // Guard the fixture: without all three of these the test would be proving
+    // something other than the conjunct it was added for.
+    expect(existsSync(path.join(repoRoot, ".git", "worktrees", expectedBranch, "BISECT_LOG")))
+      .toBe(true);
+    await expect(readGit(worktreePath, ["status", "--porcelain", "--untracked-files=all"]))
+      .resolves.toBe("");
+    await expect(readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(actualBranch);
+
+    await expectPersistedBranchMismatchRejected({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      issueId: "issue-bisect-diverged",
+      executionWorkspaceId: "execution-workspace-bisect-diverged",
+      expectedAncestryVerdict: "diverged",
+      expectedReason: "a git bisect is in progress in this worktree",
+    });
+
+    // The worktree keeps both its branch and its bisect state.
+    await expect(readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(actualBranch);
+    expect(existsSync(path.join(repoRoot, ".git", "worktrees", expectedBranch, "BISECT_LOG")))
+      .toBe(true);
+  }, 20_000);
+
+  // BLO-32628: the claimant lookup used to swallow query errors and return `[]`,
+  // so `workspaceIsContended` computed `(0 > 1) === false` and the contention
+  // conjunct PASSED — a database error enabled exactly the repair the guard
+  // exists to prevent. `cleanliness` forty lines up resolves to "unknown" when
+  // `git status` fails and then refuses; this now takes the same posture.
+  it("refuses safe repair on a clean diverged worktree when the claimant lookup fails", async () => {
+    const expectedBranch = "PAP-464-lookup-recorded";
+    const actualBranch = "PAP-464-lookup-sibling";
+    const { repoRoot, worktreePath } = await createCleanDivergedSiblingRepo({
+      expectedBranch,
+      actualBranch,
+    });
+    const actualHeadBefore = await readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]);
+
+    const error = await captureBranchCoherenceRefusal({
+      db: createClaimantLookupDb({ kind: "reject" }),
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+    });
+
+    expect(error).toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          cleanliness: "clean",
+          workspaceClaimantLookup: "failed",
+          workspaceClaimants: null,
+          safeRepair: expect.objectContaining({
+            eligible: false,
+            attempted: false,
+            succeeded: false,
+            reason: "execution workspace claimant lookup failed, so contention could not be ruled out",
+          }),
+        }),
+      },
+    });
+    // Nothing moved, so the refusal is a refusal and not a failed attempt.
+    await expect(readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(actualBranch);
+    await expect(readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]))
+      .resolves.toBe(actualHeadBefore);
+
+    // The control that makes the assertion load-bearing: the SAME git state with
+    // a lookup that answers instead of failing repairs successfully. So the
+    // lookup outcome is the only thing refusing above — not the git state.
+    await expect(captureBranchCoherenceRefusal({
+      db: createClaimantLookupDb({ kind: "rows", rows: [claimantRow("PAP-464")] }),
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+    })).resolves.toBeNull();
+    await expect(readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(expectedBranch);
+    await expect(readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]))
+      .resolves.toBe(actualHeadBefore);
+  }, 20_000);
+
+  // BLO-32628: the claimant query takes one row past its sample limit so a
+  // saturated result reads as "at least N" rather than rendering the cap as an
+  // exact count. A refusal message that looks precise and is wrong at scale is
+  // the same diagnosability defect as omitting the fact altogether.
+  it("reports a saturated claimant sample as a lower bound rather than an exact count", async () => {
+    const expectedBranch = "PAP-465-saturated-recorded";
+    const actualBranch = "PAP-465-saturated-sibling";
+    const { repoRoot, worktreePath } = await createCleanDivergedSiblingRepo({
+      expectedBranch,
+      actualBranch,
+    });
+
+    const error = await captureBranchCoherenceRefusal({
+      db: createClaimantLookupDb({
+        kind: "rows",
+        // One more than the sample limit, which is what the extra selected row
+        // detects. Twelve would read identically, and that is the point.
+        rows: Array.from({ length: 11 }, (_unused, index) => claimantRow(`PAP-5${index}`)),
+      }),
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+    });
+
+    expect(error).toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          workspaceClaimantLookup: "ok",
+          safeRepair: expect.objectContaining({
+            eligible: false,
+            reason: expect.stringContaining("claimed by at least 10 non-terminal issues"),
+          }),
+        }),
+      },
+    });
+    // The sample is capped even though the query read one row past the cap.
+    const validation = (error as { resultJson: { workspaceValidation: { workspaceClaimants: unknown[] } } })
+      .resultJson.workspaceValidation;
+    expect(validation.workspaceClaimants).toHaveLength(10);
+  }, 20_000);
+
+  // BLO-32628 / AC 4: eligibility checks several independent facts but only the
+  // first failing one reaches `safeRepair.reason`. Here contention and
+  // held-elsewhere are BOTH true and contention wins, so before
+  // `expectedBranchWorktreePath` was recorded unconditionally the held-elsewhere
+  // fact was absent from the payload entirely and that combination was not
+  // diagnosable from the evidence alone.
+  it("records the worktree holding the recorded branch even when contention refuses first", async () => {
+    const expectedBranch = "PAP-466-both-recorded";
+    const actualBranch = "PAP-466-both-sibling";
+    const { repoRoot, worktreePath } = await createCleanDivergedSiblingRepo({
+      expectedBranch,
+      actualBranch,
+      holdRecordedBranchInMainWorktree: true,
+    });
+
+    const error = await captureBranchCoherenceRefusal({
+      db: createClaimantLookupDb({
+        kind: "rows",
+        rows: [claimantRow("PAP-466"), claimantRow("PAP-467")],
+      }),
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+    });
+
+    expect(error).toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          // Contention wins the ordering...
+          safeRepair: expect.objectContaining({
+            eligible: false,
+            reason: expect.stringContaining("claimed by 2 non-terminal issues"),
+          }),
+          // ...and the losing precondition is still on the payload.
+          expectedBranchWorktreePath: expect.any(String),
+        }),
+      },
+    });
+
+    // The recorded path really is the main checkout holding the branch. Compare
+    // through realpath: the payload keeps git's own path and the fixture root
+    // can reach the same directory through a symlinked temp dir.
+    const heldPath = (error as {
+      resultJson: { workspaceValidation: { expectedBranchWorktreePath: string } };
+    }).resultJson.workspaceValidation.expectedBranchWorktreePath;
+    expect(await fs.realpath(heldPath)).toBe(await fs.realpath(repoRoot));
+  }, 20_000);
 
   it("classifies persisted git worktree branch incoherence as unknown when the recorded branch was deleted", async () => {
     const repoRoot = await createTempRepo();
@@ -2906,7 +3527,7 @@ describe("realizeExecutionWorkspace", () => {
     });
   }, 15_000);
 
-  it("keeps forward reconciliation fail-closed for same-content rewritten history", async () => {
+  it("restores the recorded branch instead of adopting same-content rewritten history", async () => {
     const repoRoot = await createTempRepo();
     const expectedBranch = "PAP-459-recorded-content";
     const actualBranch = "PAP-459-rewritten-content";
@@ -2924,19 +3545,17 @@ describe("realizeExecutionWorkspace", () => {
     await runGit(worktreePath, ["add", "same-content.txt"]);
     await runGit(worktreePath, ["commit", "-m", "Add content on rewritten branch"]);
 
-    await expectPersistedBranchMismatchRejected({
+    await expectPersistedBranchMismatchRepaired({
       repoRoot,
       worktreePath,
       expectedBranch,
       actualBranch,
       issueId: "issue-rewritten-history",
       executionWorkspaceId: "execution-workspace-rewritten-history",
-      expectedAncestryVerdict: "diverged",
-      expectedReason: "expected branch and current HEAD differ",
     });
   }, 15_000);
 
-  it("keeps forward reconciliation fail-closed for an unrelated task branch", async () => {
+  it("restores the recorded branch instead of adopting an unrelated task branch", async () => {
     const repoRoot = await createTempRepo();
     const expectedBranch = "PAP-459-recorded-task";
     const actualBranch = "PAP-999-unrelated-task";
@@ -2954,19 +3573,17 @@ describe("realizeExecutionWorkspace", () => {
     await runGit(worktreePath, ["add", "unrelated-task.txt"]);
     await runGit(worktreePath, ["commit", "-m", "Add unrelated task work"]);
 
-    await expectPersistedBranchMismatchRejected({
+    await expectPersistedBranchMismatchRepaired({
       repoRoot,
       worktreePath,
       expectedBranch,
       actualBranch,
       issueId: "issue-unrelated-task",
       executionWorkspaceId: "execution-workspace-unrelated-task",
-      expectedAncestryVerdict: "diverged",
-      expectedReason: "expected branch and current HEAD differ",
     });
   }, 15_000);
 
-  it("keeps forward reconciliation fail-closed when the live branch is behind the recorded branch", async () => {
+  it("restores the recorded branch instead of adopting a live branch that is behind it", async () => {
     const repoRoot = await createTempRepo();
     const expectedBranch = "PAP-459-recorded-ahead";
     const actualBranch = "PAP-459-live-behind";
@@ -2980,16 +3597,15 @@ describe("realizeExecutionWorkspace", () => {
     await fs.writeFile(path.join(repoRoot, "recorded-ahead.txt"), "recorded branch moved ahead\n", "utf8");
     await runGit(repoRoot, ["add", "recorded-ahead.txt"]);
     await runGit(repoRoot, ["commit", "-m", "Move recorded branch ahead"]);
+    await runGit(repoRoot, ["checkout", "main"]);
 
-    await expectPersistedBranchMismatchRejected({
+    await expectPersistedBranchMismatchRepaired({
       repoRoot,
       worktreePath,
       expectedBranch,
       actualBranch,
       issueId: "issue-live-behind",
       executionWorkspaceId: "execution-workspace-live-behind",
-      expectedAncestryVerdict: "diverged",
-      expectedReason: "expected branch and current HEAD differ",
     });
   }, 15_000);
 
@@ -3138,6 +3754,7 @@ describe("realizeExecutionWorkspace", () => {
       );
       await fs.mkdir(managedCwd, { recursive: true });
       await runGit(managedCwd, ["init"]);
+      await runGit(managedCwd, ["remote", "add", "origin", repoUrl]);
       await runGit(managedCwd, ["config", "user.email", "paperclip@example.com"]);
       await runGit(managedCwd, ["config", "user.name", "Paperclip Test"]);
       await fs.writeFile(path.join(managedCwd, "README.md"), "managed\n", "utf8");
@@ -3201,7 +3818,7 @@ describe("realizeExecutionWorkspace", () => {
     }
   }, 120_000);
 
-  it("leaves a shared project_primary cwd alone when it already contains a git checkout", async () => {
+  it("leaves a shared project_primary cwd alone when it already contains the expected git checkout", async () => {
     const repoRoot = await createTempRepo();
     const realized = await ensurePersistedExecutionWorkspaceAvailable({
       base: {
@@ -3235,47 +3852,196 @@ describe("realizeExecutionWorkspace", () => {
     expect(realized?.warnings).toEqual([]);
   });
 
-  it("rejects a reused shared project_primary cwd when its git origin is for a different repo", async () => {
+  it("rebinds a reused shared project_primary cwd when its git origin is wrong and the managed checkout is verified", async () => {
     const repoRoot = await createTempRepo();
     await runGit(repoRoot, ["remote", "add", "origin", "https://example.test/Blockcast/Network-Operator-Portal.git"]);
+    const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-rebind-existing-home-"));
+    const previousHome = process.env.PAPERCLIP_HOME;
+    const previousInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = "default";
+    const managedCwd = path.resolve(paperclipHome, "instances", "default", "projects", "company-repo-mismatch", "project-repo-mismatch", "paperclip");
+    await fs.mkdir(path.dirname(managedCwd), { recursive: true });
+    const managedFixture = await createTempRepoWithSubmodule();
+    await fs.rename(managedFixture.repoRoot, managedCwd);
+    // The rebind only accepts an origin-verified managed checkout, so the
+    // fixture needs the expected remote or findVerified...Checkout returns null.
+    await runGit(managedCwd, ["remote", "add", "origin", "https://example.test/Blockcast/paperclip.git"]);
 
-    await expect(ensurePersistedExecutionWorkspaceAvailable({
-      base: {
-        baseCwd: repoRoot,
-        source: "project_primary",
-        projectId: "project-repo-mismatch",
-        workspaceId: "workspace-repo-mismatch",
-        repoUrl: "https://example.test/Blockcast/paperclip.git",
-        repoRef: "master",
-      },
-      workspace: {
-        mode: "shared_workspace",
-        strategyType: "project_primary",
-        cwd: repoRoot,
-        providerRef: null,
-        projectId: "project-repo-mismatch",
-        projectWorkspaceId: "workspace-repo-mismatch",
-        repoUrl: "https://example.test/Blockcast/paperclip.git",
-        baseRef: "master",
-        branchName: null,
-      },
-      issue: {
-        id: "issue-repo-mismatch",
-        identifier: "PAP-REPO-MISMATCH",
-        title: "Wrong repo workspace",
-      },
-      agent: {
-        id: "agent-repo-mismatch",
-        name: "Codex Coder",
-        companyId: "company-repo-mismatch",
-      },
-    })).rejects.toMatchObject({
-      code: "workspace_repo_mismatch",
-      name: WorkspaceRepoMismatchError.name,
-    });
+    const previousGitAllowProtocol = process.env.GIT_ALLOW_PROTOCOL;
+    try {
+      const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+      process.env.GIT_ALLOW_PROTOCOL = "file";
+      const realized = await ensurePersistedExecutionWorkspaceAvailable({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-repo-mismatch",
+          workspaceId: "workspace-repo-mismatch",
+          repoUrl: "https://example.test/Blockcast/paperclip.git",
+          repoRef: "master",
+        },
+        workspace: {
+          mode: "shared_workspace",
+          strategyType: "project_primary",
+          cwd: repoRoot,
+          providerRef: null,
+          projectId: "project-repo-mismatch",
+          projectWorkspaceId: "workspace-repo-mismatch",
+          repoUrl: "https://example.test/Blockcast/paperclip.git",
+          baseRef: "master",
+          branchName: null,
+        },
+        issue: {
+          id: "issue-repo-mismatch",
+          identifier: "PAP-REPO-MISMATCH",
+          title: "Wrong repo workspace",
+        },
+        agent: {
+          id: "agent-repo-mismatch",
+          name: "Codex Coder",
+          companyId: "company-repo-mismatch",
+        },
+        recorder,
+      });
+      expect(realized?.cwd).toBe(managedCwd);
+      expect(realized?.warnings.some((warning) => warning.includes(repoRoot) && warning.includes(managedCwd))).toBe(true);
+      expect(realized?.warnings).toContain(`Initialized git submodules before starting: ${managedFixture.submodulePath}`);
+      expect(operations.some((operation) => operation.metadata?.action === "repair_uninitialized_submodules")).toBe(true);
+    } finally {
+      if (previousGitAllowProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL;
+      else process.env.GIT_ALLOW_PROTOCOL = previousGitAllowProtocol;
+      if (previousHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousHome;
+      if (previousInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previousInstanceId;
+      await fs.rm(paperclipHome, { recursive: true, force: true });
+    }
   });
 
-  it("rejects a freshly realized project_primary cwd when its git origin is for a different repo", async () => {
+  it("rebinds a freshly realized project_primary cwd to a verified managed checkout", async () => {
+    const repoRoot = await createTempRepo();
+    await runGit(repoRoot, ["remote", "add", "origin", "https://example.test/Blockcast/Network-Operator-Portal.git"]);
+    const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-rebind-fresh-home-"));
+    const previousHome = process.env.PAPERCLIP_HOME;
+    const previousInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = "default";
+    const managedCwd = path.resolve(paperclipHome, "instances", "default", "projects", "company-fresh-repo-mismatch", "project-fresh-repo-mismatch", "paperclip");
+    await fs.mkdir(path.dirname(managedCwd), { recursive: true });
+    const managedFixture = await createTempRepoWithSubmodule();
+    await fs.rename(managedFixture.repoRoot, managedCwd);
+    // The rebind only accepts an origin-verified managed checkout, so the
+    // fixture needs the expected remote or findVerified...Checkout returns null.
+    await runGit(managedCwd, ["remote", "add", "origin", "https://example.test/Blockcast/paperclip.git"]);
+
+    const previousGitAllowProtocol = process.env.GIT_ALLOW_PROTOCOL;
+    try {
+      process.env.GIT_ALLOW_PROTOCOL = "file";
+      const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+      const realized = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-fresh-repo-mismatch",
+          workspaceId: "workspace-fresh-repo-mismatch",
+          repoUrl: "https://example.test/Blockcast/paperclip.git",
+          repoRef: "master",
+        },
+        config: {},
+        issue: {
+          id: "issue-fresh-repo-mismatch",
+          identifier: "PAP-FRESH-REPO-MISMATCH",
+          title: "Wrong fresh repo workspace",
+        },
+        agent: {
+          id: "agent-fresh-repo-mismatch",
+          name: "Codex Coder",
+          companyId: "company-fresh-repo-mismatch",
+        },
+        recorder,
+      });
+      expect(realized.cwd).toBe(managedCwd);
+      expect(realized.warnings.some((warning) => warning.includes(repoRoot) && warning.includes(managedCwd))).toBe(true);
+      expect(realized.warnings).toContain(`Initialized git submodules before starting: ${managedFixture.submodulePath}`);
+      expect(operations.some((operation) => operation.metadata?.action === "repair_uninitialized_submodules")).toBe(true);
+    } finally {
+      if (previousGitAllowProtocol === undefined) delete process.env.GIT_ALLOW_PROTOCOL;
+      else process.env.GIT_ALLOW_PROTOCOL = previousGitAllowProtocol;
+      if (previousHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousHome;
+      if (previousInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previousInstanceId;
+      await fs.rm(paperclipHome, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a reused shared project_primary cwd when the managed checkout has the wrong origin", async () => {
+    const repoRoot = await createTempRepo();
+    await runGit(repoRoot, ["remote", "add", "origin", "https://example.test/Blockcast/Network-Operator-Portal.git"]);
+    const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-rebind-wrong-managed-home-"));
+    const previousHome = process.env.PAPERCLIP_HOME;
+    const previousInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = "default";
+    const managedCwd = path.resolve(
+      paperclipHome,
+      "instances",
+      "default",
+      "projects",
+      "company-wrong-managed-repo",
+      "project-wrong-managed-repo",
+      "paperclip",
+    );
+    await fs.mkdir(managedCwd, { recursive: true });
+    await runGit(managedCwd, ["init"]);
+    await runGit(managedCwd, ["remote", "add", "origin", "https://example.test/Blockcast/trafficcontrol.git"]);
+
+    try {
+      await expect(ensurePersistedExecutionWorkspaceAvailable({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-wrong-managed-repo",
+          workspaceId: "workspace-wrong-managed-repo",
+          repoUrl: "https://example.test/Blockcast/paperclip.git",
+          repoRef: "master",
+        },
+        workspace: {
+          mode: "shared_workspace",
+          strategyType: "project_primary",
+          cwd: repoRoot,
+          providerRef: null,
+          projectId: "project-wrong-managed-repo",
+          projectWorkspaceId: "workspace-wrong-managed-repo",
+          repoUrl: "https://example.test/Blockcast/paperclip.git",
+          baseRef: "master",
+          branchName: null,
+        },
+        issue: {
+          id: "issue-wrong-managed-repo",
+          identifier: "PAP-WRONG-MANAGED-REPO",
+          title: "Wrong managed repo workspace",
+        },
+        agent: {
+          id: "agent-wrong-managed-repo",
+          name: "Codex Coder",
+          companyId: "company-wrong-managed-repo",
+        },
+      })).rejects.toMatchObject({
+        code: "workspace_repo_mismatch",
+        name: WorkspaceRepoMismatchError.name,
+      });
+    } finally {
+      if (previousHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousHome;
+      if (previousInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previousInstanceId;
+      await fs.rm(paperclipHome, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a freshly realized project_primary cwd when no verified managed checkout exists", async () => {
     const repoRoot = await createTempRepo();
     await runGit(repoRoot, ["remote", "add", "origin", "https://example.test/Blockcast/Network-Operator-Portal.git"]);
 
@@ -3283,21 +4049,21 @@ describe("realizeExecutionWorkspace", () => {
       base: {
         baseCwd: repoRoot,
         source: "project_primary",
-        projectId: "project-fresh-repo-mismatch",
-        workspaceId: "workspace-fresh-repo-mismatch",
+        projectId: "project-fresh-repo-mismatch-no-managed",
+        workspaceId: "workspace-fresh-repo-mismatch-no-managed",
         repoUrl: "https://example.test/Blockcast/paperclip.git",
         repoRef: "master",
       },
       config: {},
       issue: {
-        id: "issue-fresh-repo-mismatch",
-        identifier: "PAP-FRESH-REPO-MISMATCH",
-        title: "Wrong fresh repo workspace",
+        id: "issue-fresh-repo-mismatch-no-managed",
+        identifier: "PAP-FRESH-REPO-MISMATCH-NO-MANAGED",
+        title: "Wrong fresh repo workspace without managed checkout",
       },
       agent: {
-        id: "agent-fresh-repo-mismatch",
+        id: "agent-fresh-repo-mismatch-no-managed",
         name: "Codex Coder",
-        companyId: "company-fresh-repo-mismatch",
+        companyId: "company-fresh-repo-mismatch-no-managed",
       },
     })).rejects.toMatchObject({
       code: "workspace_repo_mismatch",
@@ -3305,842 +4071,1085 @@ describe("realizeExecutionWorkspace", () => {
     });
   });
 
-  it("repairs missing project_primary submodules before returning the workspace", async () => {
-    const { repoRoot, submodulePath } = await createTempRepoWithSubmodule();
-    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+  // BLO-31487: these submodule-inspection cases share one git-shim fixture, but
+  // they used to sit here as a bare run of sibling `it()`s. Membership was
+  // therefore carried by prose -- `-t submodule` selected them only because each
+  // title happened to contain the word -- so a rename silently dropped a case,
+  // and the count guard stayed green anyway because a submodule-titled test
+  // outside the cluster made up the difference. The block name carries membership
+  // now: `-t "submodule inspection"` selects exactly these, whatever the
+  // individual cases are called.
+  //
+  // "repairs worktree submodules before running provision commands" is
+  // deliberately left outside: it exercises provision-command ordering, not the
+  // inspection path, and shares none of this fixture.
+  describe("submodule inspection", () => {
+    // Budget rationale for this whole block (BLO-22985).
+    //
+    // The stall cases drive a `git` shim that records its invocation in a
+    // counter file and *then* blocks on `sleep 30`. The probe times out and
+    // SIGKILLs the process group, so every counted invocation is racing its own
+    // kill: if a loaded host has not scheduled the shim as far as the counter
+    // write within `timeoutMs`, the call happens but is never recorded and the
+    // count assertion is short by one. At `timeoutMs: 300` that window is a few
+    // process spawns wide, and merge-queue CI closed it -- run 34841655169
+    // ejected an innocent PR on `expected '2' to be '3'` at the salvaged-stall
+    // case. `2_000` gives the shim ~6.7x more room while leaving the probe 15x
+    // clear of the 30s stall, so the timeout being tested still fires decisively
+    // rather than racing the stall it is supposed to outlive.
+    //
+    // The stall cases carry `120_000`, matching the sibling repair case below.
+    // Vitest honors a per-test timeout over the global in both directions (see
+    // `server/vitest.config.ts`), so the 60_000 global is a default, not a
+    // ceiling. Measured unloaded on a 64-core host, the slowest of these is the
+    // salvaged-stall case at ~7.2s -- of which ~6s is the three 2_000ms probe
+    // timeouts and only ~1.2s is real `git` work -- so 120_000 is ~16x clear
+    // unloaded, and still ~5.8x clear of the 20.8s that case took under
+    // merge-queue contention. A cap is a runtime bound, not the invariant:
+    // every case here fails on its assertions when the behaviour regresses --
+    // a fail-open override degrades a healthy checkout immediately, long before
+    // any cap -- so a generous cap removes flake without removing coverage.
+    //
+    // The cases that do not touch the probe knobs run in under ~1.1s and carry
+    // no explicit cap at all: the global already gives them ~55x.
+    it("repairs missing project_primary submodules before returning the workspace", async () => {
+      const { repoRoot, submodulePath } = await createTempRepoWithSubmodule();
+      const { recorder, operations } = createWorkspaceOperationRecorderDouble();
 
-    const beforeStatus = await readGit(repoRoot, ["submodule", "status", "--recursive"]);
-    expect(beforeStatus.startsWith("-")).toBe(true);
+      const beforeStatus = await readGit(repoRoot, ["submodule", "status", "--recursive"]);
+      expect(beforeStatus.startsWith("-")).toBe(true);
 
-    const realized = await realizeExecutionWorkspace({
-      base: {
-        baseCwd: repoRoot,
-        source: "project_primary",
-        projectId: "project-submodule-repair",
-        workspaceId: "workspace-submodule-repair",
-        repoUrl: null,
-        repoRef: "main",
-      },
-      config: {},
-      issue: {
-        id: "issue-submodule-repair",
-        identifier: "PAP-SUBMODULE-REPAIR",
-        title: "Repair submodules",
-      },
-      agent: {
-        id: "agent-submodule-repair",
-        name: "Codex Coder",
-        companyId: "company-submodule-repair",
-      },
-      recorder,
-    });
-
-    expect(realized.strategy).toBe("project_primary");
-    expect(realized.warnings).toEqual([
-      `Initialized git submodules before starting: ${submodulePath}`,
-    ]);
-    await expect(fs.stat(path.join(repoRoot, submodulePath, "codec.txt"))).resolves.toBeTruthy();
-    const afterStatus = await readGit(repoRoot, ["submodule", "status", "--recursive"]);
-    expect(afterStatus.startsWith("-")).toBe(false);
-    expect(operations.some((operation) => {
-      const submodulePaths = operation.metadata?.submodulePaths;
-      return operation.phase === "worktree_prepare" &&
-        operation.metadata?.action === "repair_uninitialized_submodules" &&
-        Array.isArray(submodulePaths) &&
-        submodulePaths.includes(submodulePath);
-    })).toBe(true);
-  }, 120_000);
-
-  it("degrades to a warning instead of failing the run when submodule inspection times out", async () => {
-    // BLO-18784: `git submodule status --recursive` is ~96% filesystem latency on
-    // a shared CephFS checkout, so a single slow probe used to raise a fatal
-    // WorkspaceGitSubmoduleError and strand a healthy in_progress issue at
-    // `blocked`. A timeout means the inspection was inconclusive, not that the
-    // submodules are broken, so the run must survive it.
-    const { repoRoot, submodulePath } = await createTempRepoWithSubmodule();
-    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
-    // 1ms budget guarantees every attempt times out; short backoff keeps the test
-    // fast. Driven through the test-only seam, not the env overrides: a 1ms
-    // timeout is deliberately below what an operator can configure
-    // (WORKSPACE_SUBMODULE_INSPECT_MIN_TIMEOUT_MS), because a budget that small
-    // disables the check on every workspace rather than tuning it.
-    setSubmoduleInspectSettingsForTests({ timeoutMs: 1, attempts: 2, retryDelayMs: 1 });
-
-    try {
       const realized = await realizeExecutionWorkspace({
         base: {
           baseCwd: repoRoot,
           source: "project_primary",
-          projectId: "project-submodule-inspect-timeout",
-          workspaceId: "workspace-submodule-inspect-timeout",
+          projectId: "project-submodule-repair",
+          workspaceId: "workspace-submodule-repair",
           repoUrl: null,
           repoRef: "main",
         },
         config: {},
         issue: {
-          id: "issue-submodule-inspect-timeout",
-          identifier: "PAP-SUBMODULE-INSPECT-TIMEOUT",
-          title: "Survive submodule inspection timeout",
+          id: "issue-submodule-repair",
+          identifier: "PAP-SUBMODULE-REPAIR",
+          title: "Repair submodules",
         },
         agent: {
-          id: "agent-submodule-inspect-timeout",
+          id: "agent-submodule-repair",
           name: "Codex Coder",
-          companyId: "company-submodule-inspect-timeout",
+          companyId: "company-submodule-repair",
         },
         recorder,
       });
 
-      // The run is realized, not aborted.
       expect(realized.strategy).toBe("project_primary");
-      expect(realized.cwd).toBe(repoRoot);
-
-      const degraded = realized.warnings.find((warning) => warning.includes("Could not inspect git submodules"));
-      expect(degraded).toBeDefined();
-      expect(degraded).toContain("after 2 attempt(s)");
-      expect(degraded).toContain("timed out after 1ms");
-      expect(degraded).toContain("inconclusive");
-      // It must not have silently claimed the submodule was repaired.
-      expect(realized.warnings).not.toContain(
+      expect(realized.warnings).toEqual([
         `Initialized git submodules before starting: ${submodulePath}`,
+      ]);
+      await expect(fs.stat(path.join(repoRoot, submodulePath, "codec.txt"))).resolves.toBeTruthy();
+      const afterStatus = await readGit(repoRoot, ["submodule", "status", "--recursive"]);
+      expect(afterStatus.startsWith("-")).toBe(false);
+      expect(operations.some((operation) => {
+        const submodulePaths = operation.metadata?.submodulePaths;
+        return operation.phase === "worktree_prepare" &&
+          operation.metadata?.action === "repair_uninitialized_submodules" &&
+          Array.isArray(submodulePaths) &&
+          submodulePaths.includes(submodulePath);
+      })).toBe(true);
+    }, 120_000);
+
+    it("degrades to a warning instead of failing the run when submodule inspection times out", async () => {
+      // BLO-18784: `git submodule status --recursive` is ~96% filesystem latency on
+      // a shared CephFS checkout, so a single slow probe used to raise a fatal
+      // WorkspaceGitSubmoduleError and strand a healthy in_progress issue at
+      // `blocked`. A timeout means the inspection was inconclusive, not that the
+      // submodules are broken, so the run must survive it.
+      //
+      // BLO-30301: this used to lean on a 1ms budget with no git shim -- the only
+      // one of the six timeout tests to do so. A 1ms timer does not *guarantee* a
+      // stall with no output; it only makes one likely, and on a loaded runner the
+      // timer can slip past git's first stdout flush. The probe then times out
+      // holding a real `-<sha> <path>` record, `salvageGitSubmoduleFaults` recovers
+      // it, and the run legitimately proceeds down the repair + post-repair path --
+      // producing a `post_repair` degradation that this test then misread as a
+      // violated invariant. Drive the stall through the same shim seam the sibling
+      // tests use, so "inconclusive at `stage: initial`" is structural: the probe
+      // emits nothing, so there is nothing to salvage, at any scheduler latency.
+      const { repoRoot, submodulePath } = await createTempRepoWithSubmodule();
+      const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+      const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+      const counterPath = path.join(shimDir, "status-calls");
+      const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
+      const shimPath = path.join(shimDir, "git");
+      // Emit nothing, then hang. `exec sleep` replaces the shell so the SIGTERM
+      // from executeProcess lands on the stalling process directly. Every other
+      // git invocation (including a repair, if the guard ever regressed) passes
+      // through to the real binary, so a wrongly-emitted repair claim is still
+      // observable rather than being shimmed away.
+      await fs.writeFile(
+        shimPath,
+        [
+          "#!/bin/sh",
+          `if [ "$1" = "submodule" ] && [ "$2" = "status" ] && [ "$3" = "--recursive" ]; then`,
+          `  calls=$(cat ${JSON.stringify(counterPath)} 2>/dev/null || echo 0)`,
+          "  calls=$((calls + 1))",
+          `  printf '%s' "$calls" > ${JSON.stringify(counterPath)}`,
+          "  exec sleep 30",
+          "fi",
+          `exec ${JSON.stringify(realGit)} "$@"`,
+          "",
+        ].join("\n"),
+        "utf8",
       );
+      await fs.chmod(shimPath, 0o755);
+      const previousPath = process.env.PATH;
+      process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
+      // Matches the sibling shim tests; see this block's budget rationale for why
+      // the probe is 2_000 rather than a number that just clears process startup.
+      setSubmoduleInspectSettingsForTests({ timeoutMs: 2_000, attempts: 2, retryDelayMs: 1 });
+      // Pin the last scheduler-dependent branch. Four assertions below require the
+      // *retry* path -- `attempts: 2`, "after 2 attempt(s)", and the exact probe
+      // count -- and that path is only taken when the timed-out group is already
+      // reaped. If a loaded host has not reaped `sleep` within
+      // PROCESS_TIMEOUT_GROUP_LIVENESS_GRACE_MS (750ms), inspectGitSubmoduleReadiness
+      // returns early at workspace-runtime.ts:2882 with `attempts: 1` and a
+      // different reason, and all four fail. 750ms is generous next to the 1ms
+      // timer that actually flaked, but leaving it unpinned would keep a race in
+      // the one test whose entire purpose is now determinism.
+      setProcessGroupLivenessProbeForTests(() => false);
 
-      // The degradation must leave a structured, countable record -- not just a
-      // run-log line. This change removes the recovery action that used to make
-      // these stalls visible, so without this row "no recovery actions" could
-      // not be distinguished from "we stopped reporting".
-      const degradedOp = operations.find(
-        (operation) => operation.metadata?.action === "submodule_inspection_degraded",
-      );
-      expect(degradedOp).toBeDefined();
-      expect(degradedOp?.phase).toBe("worktree_prepare");
-      expect(degradedOp?.result.status).toBe("skipped");
-      expect(degradedOp?.metadata).toMatchObject({
-        stage: "initial",
-        // BLO-20047: distinguishes this from the withheld-repair degrade by a
-        // stable field rather than by matching `reason` prose.
-        cause: "inconclusive_probe",
-        attempts: 2,
-        timeoutMs: 1,
-      });
-      expect(String(degradedOp?.metadata?.reason)).toContain("timed out after 1ms");
-    } finally {
-      setSubmoduleInspectSettingsForTests(null);
-    }
-  }, 20_000);
-
-  it("still fails the run when the initial submodule inspection exits non-zero", async () => {
-    // BLO-18784 follow-up: the timeout degrade must not widen into a general
-    // fail-open. A malformed `.gitmodules` is a deterministic failure -- the
-    // checkout really is unusable -- so it must stay fatal rather than starting
-    // an agent with no valid preflight.
-    const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
-    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
-    // `git submodule status --recursive` exits 128 ("bad config line") on this.
-    await fs.writeFile(path.join(repoRoot, ".gitmodules"), "this is not valid config [[[\n", "utf8");
-
-    await expect(
-      realizeExecutionWorkspace({
-        base: {
-          baseCwd: repoRoot,
-          source: "project_primary",
-          projectId: "project-submodule-inspect-broken",
-          workspaceId: "workspace-submodule-inspect-broken",
-          repoUrl: null,
-          repoRef: "main",
-        },
-        config: {},
-        issue: {
-          id: "issue-submodule-inspect-broken",
-          identifier: "PAP-SUBMODULE-INSPECT-BROKEN",
-          title: "Fail loudly on a corrupt .gitmodules",
-        },
-        agent: {
-          id: "agent-submodule-inspect-broken",
-          name: "Codex Coder",
-          companyId: "company-submodule-inspect-broken",
-        },
-        recorder,
-      }),
-    ).rejects.toThrow(WorkspaceGitSubmoduleError);
-
-    // It must not have been reported as an inconclusive stall.
-    expect(
-      operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
-    ).toBe(false);
-  }, 20_000);
-
-  it("still fails the run when the post-repair submodule verification exits non-zero", async () => {
-    // The post-repair re-check has its own consumer, so it needs its own guard:
-    // otherwise a definitive verification failure could be reported as
-    // "Initialized git submodules before starting" -- claiming success over a
-    // workspace we know is broken.
-    //
-    // A fixture alone cannot isolate this branch: any corruption that breaks
-    // `submodule status --recursive` also breaks the `submodule update
-    // --recursive` repair, which throws earlier. So shim `git` on PATH and fail
-    // only the *second* `submodule status --recursive` -- the verification call.
-    const { repoRoot, submodulePath } = await createTempRepoWithSubmodule();
-    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
-    const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
-    const counterPath = path.join(shimDir, "status-calls");
-    const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
-    const shimPath = path.join(shimDir, "git");
-    await fs.writeFile(
-      shimPath,
-      [
-        "#!/bin/sh",
-        `if [ "$1" = "submodule" ] && [ "$2" = "status" ] && [ "$3" = "--recursive" ]; then`,
-        `  calls=$(cat ${JSON.stringify(counterPath)} 2>/dev/null || echo 0)`,
-        "  calls=$((calls + 1))",
-        `  printf '%s' "$calls" > ${JSON.stringify(counterPath)}`,
-        '  if [ "$calls" -ge 2 ]; then',
-        "    echo 'fatal: simulated deterministic submodule status failure' >&2",
-        "    exit 128",
-        "  fi",
-        "fi",
-        `exec ${JSON.stringify(realGit)} "$@"`,
-        "",
-      ].join("\n"),
-      "utf8",
-    );
-    await fs.chmod(shimPath, 0o755);
-    const previousPath = process.env.PATH;
-    process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
-
-    try {
-      await expect(
-        realizeExecutionWorkspace({
+      try {
+        const realized = await realizeExecutionWorkspace({
           base: {
             baseCwd: repoRoot,
             source: "project_primary",
-            projectId: "project-submodule-verify-broken",
-            workspaceId: "workspace-submodule-verify-broken",
+            projectId: "project-submodule-inspect-timeout",
+            workspaceId: "workspace-submodule-inspect-timeout",
             repoUrl: null,
             repoRef: "main",
           },
           config: {},
           issue: {
-            id: "issue-submodule-verify-broken",
-            identifier: "PAP-SUBMODULE-VERIFY-BROKEN",
-            title: "Fail loudly when post-repair verification is definitive",
+            id: "issue-submodule-inspect-timeout",
+            identifier: "PAP-SUBMODULE-INSPECT-TIMEOUT",
+            title: "Survive submodule inspection timeout",
           },
           agent: {
-            id: "agent-submodule-verify-broken",
+            id: "agent-submodule-inspect-timeout",
             name: "Codex Coder",
-            companyId: "company-submodule-verify-broken",
+            companyId: "company-submodule-inspect-timeout",
+          },
+          recorder,
+        });
+
+        // The run is realized, not aborted.
+        expect(realized.strategy).toBe("project_primary");
+        expect(realized.cwd).toBe(repoRoot);
+
+        // The degradation must leave a structured, countable record -- not just a
+        // run-log line. This change removes the recovery action that used to make
+        // these stalls visible, so without this row "no recovery actions" could
+        // not be distinguished from "we stopped reporting".
+        //
+        // BLO-30301: look the degradation up by its recorded `stage`, and assert
+        // the stage BEFORE any prose. `describeSubmoduleInspectionDegradation` is
+        // a single shared builder for both inspection sites, so every string this
+        // test matches ("Could not inspect git submodules", "inconclusive",
+        // "after N attempt(s)") is emitted verbatim for a `post_repair`
+        // degradation too. A prose-first lookup therefore cannot tell which
+        // inspection it found: if the run ever drifts into the repair path those
+        // assertions all pass vacuously, and only the pairing check below fails --
+        // reporting a violated invariant when production did exactly what it
+        // specifies. `metadata.stage` is the sole field that distinguishes them.
+        const degradedOps = operations.filter(
+          (operation) => operation.metadata?.action === "submodule_inspection_degraded",
+        );
+        expect(degradedOps).toHaveLength(1);
+        const degradedOp = degradedOps[0];
+        expect(degradedOp?.metadata?.stage).toBe("initial");
+        expect(degradedOp?.phase).toBe("worktree_prepare");
+        expect(degradedOp?.result.status).toBe("skipped");
+        expect(degradedOp?.metadata).toMatchObject({
+          stage: "initial",
+          // BLO-20047: distinguishes this from the withheld-repair degrade by a
+          // stable field rather than by matching `reason` prose.
+          cause: "inconclusive_probe",
+          attempts: 2,
+          timeoutMs: 2_000,
+        });
+        expect(String(degradedOp?.metadata?.reason)).toContain("timed out after 2000ms");
+
+        // Both attempts stalled and no third probe ran: an `initial` degradation
+        // returns before the repair path, so the post-repair verification site is
+        // never reached.
+        expect(await fs.readFile(counterPath, "utf8")).toBe("2");
+
+        const degraded = realized.warnings.find((warning) => warning.includes("Could not inspect git submodules"));
+        expect(degraded).toBeDefined();
+        expect(degraded).toContain("after 2 attempt(s)");
+        expect(degraded).toContain("timed out after 2000ms");
+        expect(degraded).toContain("inconclusive");
+
+        // The invariant, now scoped to the stage the degradation was attributed
+        // to: an inconclusive *initial* probe found no fault to act on, so it must
+        // not have run a repair, nor claimed one. (Pairing a repair claim with an
+        // inconclusive *post-repair* verification is a different, specified case
+        // -- see "reports both the submodule repair and the degradation when the
+        // post-repair re-check stalls" -- so this assertion is only sound once the
+        // stage above is pinned.)
+        expect(
+          operations.some(
+            (operation) => operation.metadata?.action === "repair_uninitialized_submodules",
+          ),
+        ).toBe(false);
+        expect(realized.warnings).not.toContain(
+          `Initialized git submodules before starting: ${submodulePath}`,
+        );
+      } finally {
+        setSubmoduleInspectSettingsForTests(null);
+        if (previousPath === undefined) delete process.env.PATH;
+        else process.env.PATH = previousPath;
+        await fs.rm(shimDir, { recursive: true, force: true });
+      }
+    }, 120_000);
+
+    it("still fails the run when the initial submodule inspection exits non-zero", async () => {
+      // BLO-18784 follow-up: the timeout degrade must not widen into a general
+      // fail-open. A malformed `.gitmodules` is a deterministic failure -- the
+      // checkout really is unusable -- so it must stay fatal rather than starting
+      // an agent with no valid preflight.
+      const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
+      const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+      // `git submodule status --recursive` exits 128 ("bad config line") on this.
+      await fs.writeFile(path.join(repoRoot, ".gitmodules"), "this is not valid config [[[\n", "utf8");
+
+      await expect(
+        realizeExecutionWorkspace({
+          base: {
+            baseCwd: repoRoot,
+            source: "project_primary",
+            projectId: "project-submodule-inspect-broken",
+            workspaceId: "workspace-submodule-inspect-broken",
+            repoUrl: null,
+            repoRef: "main",
+          },
+          config: {},
+          issue: {
+            id: "issue-submodule-inspect-broken",
+            identifier: "PAP-SUBMODULE-INSPECT-BROKEN",
+            title: "Fail loudly on a corrupt .gitmodules",
+          },
+          agent: {
+            id: "agent-submodule-inspect-broken",
+            name: "Codex Coder",
+            companyId: "company-submodule-inspect-broken",
           },
           recorder,
         }),
       ).rejects.toThrow(WorkspaceGitSubmoduleError);
 
-      // Prove the failure came from the verification call, not the initial one:
-      // the repair must have run, and the shim must have seen two status calls.
-      expect(
-        operations.some(
-          (operation) => operation.metadata?.action === "repair_uninitialized_submodules",
-        ),
-      ).toBe(true);
-      expect(await fs.readFile(counterPath, "utf8")).toBe("2");
+      // It must not have been reported as an inconclusive stall.
       expect(
         operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
       ).toBe(false);
-      expect(await fs.stat(path.join(repoRoot, submodulePath, "codec.txt"))).toBeTruthy();
-    } finally {
-      if (previousPath === undefined) delete process.env.PATH;
-      else process.env.PATH = previousPath;
-      await fs.rm(shimDir, { recursive: true, force: true });
-    }
-  }, 30_000);
+    });
 
-  it("still fails the run when a stalled probe already reported a conflicted submodule", async () => {
-    // BLO-18784 follow-up: `git submodule status --recursive` flushes each entry
-    // as it walks, so a stall can arrive with a definitive fault already in hand
-    // -- a `U` record for an earlier submodule, then a hang on a later one.
-    // `runGit` used to discard the partial stdout when it threw
-    // GitCommandTimeoutError, so that evidence was lost and the run degraded as
-    // though the probe had produced nothing. Measured against a real
-    // 120-submodule checkout: the `-`/`U` lines land ~130ms into a multi-second
-    // walk, well before the budget expires, so this is reachable in production.
-    const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
-    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
-    const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
-    const counterPath = path.join(shimDir, "status-calls");
-    const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
-    const shimPath = path.join(shimDir, "git");
-    // Emit a conflicted record, then hang. `exec sleep` replaces the shell so the
-    // SIGTERM from executeProcess lands on the stalling process directly.
-    await fs.writeFile(
-      shimPath,
-      [
-        "#!/bin/sh",
-        `if [ "$1" = "submodule" ] && [ "$2" = "status" ] && [ "$3" = "--recursive" ]; then`,
-        `  calls=$(cat ${JSON.stringify(counterPath)} 2>/dev/null || echo 0)`,
-        "  calls=$((calls + 1))",
-        `  printf '%s' "$calls" > ${JSON.stringify(counterPath)}`,
-        "  echo 'U1111111111111111111111111111111111111111 vendor/conflicted-dep'",
-        "  exec sleep 30",
-        "fi",
-        `exec ${JSON.stringify(realGit)} "$@"`,
-        "",
-      ].join("\n"),
-      "utf8",
-    );
-    await fs.chmod(shimPath, 0o755);
-    const previousPath = process.env.PATH;
-    process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
-    // attempts: 3 so that acting on the salvaged evidence is observable -- a
-    // correct implementation stops after the first stall because it already has
-    // a conclusive answer, rather than spending two more budgets on it.
-    setSubmoduleInspectSettingsForTests({ timeoutMs: 500, attempts: 3, retryDelayMs: 1 });
+    it("still fails the run when the post-repair submodule verification exits non-zero", async () => {
+      // The post-repair re-check has its own consumer, so it needs its own guard:
+      // otherwise a definitive verification failure could be reported as
+      // "Initialized git submodules before starting" -- claiming success over a
+      // workspace we know is broken.
+      //
+      // A fixture alone cannot isolate this branch: any corruption that breaks
+      // `submodule status --recursive` also breaks the `submodule update
+      // --recursive` repair, which throws earlier. So shim `git` on PATH and fail
+      // only the *second* `submodule status --recursive` -- the verification call.
+      const { repoRoot, submodulePath } = await createTempRepoWithSubmodule();
+      const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+      const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+      const counterPath = path.join(shimDir, "status-calls");
+      const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
+      const shimPath = path.join(shimDir, "git");
+      await fs.writeFile(
+        shimPath,
+        [
+          "#!/bin/sh",
+          `if [ "$1" = "submodule" ] && [ "$2" = "status" ] && [ "$3" = "--recursive" ]; then`,
+          `  calls=$(cat ${JSON.stringify(counterPath)} 2>/dev/null || echo 0)`,
+          "  calls=$((calls + 1))",
+          `  printf '%s' "$calls" > ${JSON.stringify(counterPath)}`,
+          '  if [ "$calls" -ge 2 ]; then',
+          "    echo 'fatal: simulated deterministic submodule status failure' >&2",
+          "    exit 128",
+          "  fi",
+          "fi",
+          `exec ${JSON.stringify(realGit)} "$@"`,
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      await fs.chmod(shimPath, 0o755);
+      const previousPath = process.env.PATH;
+      process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
 
-    try {
-      await expect(
-        realizeExecutionWorkspace({
+      try {
+        await expect(
+          realizeExecutionWorkspace({
+            base: {
+              baseCwd: repoRoot,
+              source: "project_primary",
+              projectId: "project-submodule-verify-broken",
+              workspaceId: "workspace-submodule-verify-broken",
+              repoUrl: null,
+              repoRef: "main",
+            },
+            config: {},
+            issue: {
+              id: "issue-submodule-verify-broken",
+              identifier: "PAP-SUBMODULE-VERIFY-BROKEN",
+              title: "Fail loudly when post-repair verification is definitive",
+            },
+            agent: {
+              id: "agent-submodule-verify-broken",
+              name: "Codex Coder",
+              companyId: "company-submodule-verify-broken",
+            },
+            recorder,
+          }),
+        ).rejects.toThrow(WorkspaceGitSubmoduleError);
+
+        // Prove the failure came from the verification call, not the initial one:
+        // the repair must have run, and the shim must have seen two status calls.
+        expect(
+          operations.some(
+            (operation) => operation.metadata?.action === "repair_uninitialized_submodules",
+          ),
+        ).toBe(true);
+        expect(await fs.readFile(counterPath, "utf8")).toBe("2");
+        expect(
+          operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
+        ).toBe(false);
+        expect(await fs.stat(path.join(repoRoot, submodulePath, "codec.txt"))).toBeTruthy();
+      } finally {
+        if (previousPath === undefined) delete process.env.PATH;
+        else process.env.PATH = previousPath;
+        await fs.rm(shimDir, { recursive: true, force: true });
+      }
+    });
+
+    it("still fails the run when a stalled probe already reported a conflicted submodule", async () => {
+      // BLO-18784 follow-up: `git submodule status --recursive` flushes each entry
+      // as it walks, so a stall can arrive with a definitive fault already in hand
+      // -- a `U` record for an earlier submodule, then a hang on a later one.
+      // `runGit` used to discard the partial stdout when it threw
+      // GitCommandTimeoutError, so that evidence was lost and the run degraded as
+      // though the probe had produced nothing. Measured against a real
+      // 120-submodule checkout: the `-`/`U` lines land ~130ms into a multi-second
+      // walk, well before the budget expires, so this is reachable in production.
+      const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
+      const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+      const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+      const counterPath = path.join(shimDir, "status-calls");
+      const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
+      const shimPath = path.join(shimDir, "git");
+      // Emit a conflicted record, then hang. `exec sleep` replaces the shell so the
+      // SIGTERM from executeProcess lands on the stalling process directly.
+      await fs.writeFile(
+        shimPath,
+        [
+          "#!/bin/sh",
+          `if [ "$1" = "submodule" ] && [ "$2" = "status" ] && [ "$3" = "--recursive" ]; then`,
+          `  calls=$(cat ${JSON.stringify(counterPath)} 2>/dev/null || echo 0)`,
+          "  calls=$((calls + 1))",
+          `  printf '%s' "$calls" > ${JSON.stringify(counterPath)}`,
+          "  echo 'U1111111111111111111111111111111111111111 vendor/conflicted-dep'",
+          "  exec sleep 30",
+          "fi",
+          `exec ${JSON.stringify(realGit)} "$@"`,
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      await fs.chmod(shimPath, 0o755);
+      const previousPath = process.env.PATH;
+      process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
+      // attempts: 3 so that acting on the salvaged evidence is observable -- a
+      // correct implementation stops after the first stall because it already has
+      // a conclusive answer, rather than spending two more budgets on it.
+      setSubmoduleInspectSettingsForTests({ timeoutMs: 2_000, attempts: 3, retryDelayMs: 1 });
+
+      try {
+        await expect(
+          realizeExecutionWorkspace({
+            base: {
+              baseCwd: repoRoot,
+              source: "project_primary",
+              projectId: "project-submodule-partial-fault",
+              workspaceId: "workspace-submodule-partial-fault",
+              repoUrl: null,
+              repoRef: "main",
+            },
+            config: {},
+            issue: {
+              id: "issue-submodule-partial-fault",
+              identifier: "PAP-SUBMODULE-PARTIAL-FAULT",
+              title: "Do not discard a fault a stalled probe already found",
+            },
+            agent: {
+              id: "agent-submodule-partial-fault",
+              name: "Codex Coder",
+              companyId: "company-submodule-partial-fault",
+            },
+            recorder,
+          }),
+        ).rejects.toThrow(/vendor\/conflicted-dep/);
+
+        // The fault must be fatal, not degraded away.
+        expect(
+          operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
+        ).toBe(false);
+        // Evidence was conclusive on the first stall, so it must not have retried.
+        expect(await fs.readFile(counterPath, "utf8")).toBe("1");
+      } finally {
+        setSubmoduleInspectSettingsForTests(null);
+        if (previousPath === undefined) delete process.env.PATH;
+        else process.env.PATH = previousPath;
+        await fs.rm(shimDir, { recursive: true, force: true });
+      }
+    }, 120_000);
+
+    it("still degrades when a stalled submodule probe produced no fault record", async () => {
+      // The converse of the test above, and the property that keeps this from
+      // becoming a fail-*closed* regression: an empty or fault-free partial output
+      // is NOT evidence of health (an early kill or stdio buffering can yield zero
+      // bytes for a checkout that is in fact broken), so absence of a fault record
+      // must still degrade rather than being read as "clean" or as a fault.
+      //
+      // The shim also emits the three shapes that must NOT be mistaken for faults,
+      // because the captured stream is unreliable at both ends -- it keeps only the
+      // last N bytes (chopping the head and prepending a banner) and a kill can cut
+      // the tail mid-line:
+      //   1. the capture layer's `[output truncated ...]` banner,
+      //   2. a head-chopped line that lost its status character and sha prefix,
+      //   3. a tail fragment whose path is truncated (would name the wrong module).
+      const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
+      const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+      const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+      const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
+      const shimPath = path.join(shimDir, "git");
+      await fs.writeFile(
+        shimPath,
+        [
+          "#!/bin/sh",
+          `if [ "$1" = "submodule" ] && [ "$2" = "status" ] && [ "$3" = "--recursive" ]; then`,
+          "  echo '[output truncated to last 512 bytes; total 9000 bytes]'",
+          "  echo '9cd3ad27f42c565e05964ab4 vendor/head-fragment'",
+          "  echo ' 2222222222222222222222222222222222222222 vendor/healthy-dep (heads/main)'",
+          "  printf -- '-3333333333333333333333333333333333333333 vendor/trunc'",
+          "  exec sleep 30",
+          "fi",
+          `exec ${JSON.stringify(realGit)} "$@"`,
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      await fs.chmod(shimPath, 0o755);
+      const previousPath = process.env.PATH;
+      process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
+      setSubmoduleInspectSettingsForTests({ timeoutMs: 2_000, attempts: 2, retryDelayMs: 1 });
+
+      try {
+        const realized = await realizeExecutionWorkspace({
           base: {
             baseCwd: repoRoot,
             source: "project_primary",
-            projectId: "project-submodule-partial-fault",
-            workspaceId: "workspace-submodule-partial-fault",
+            projectId: "project-submodule-partial-clean",
+            workspaceId: "workspace-submodule-partial-clean",
             repoUrl: null,
             repoRef: "main",
           },
           config: {},
           issue: {
-            id: "issue-submodule-partial-fault",
-            identifier: "PAP-SUBMODULE-PARTIAL-FAULT",
-            title: "Do not discard a fault a stalled probe already found",
+            id: "issue-submodule-partial-clean",
+            identifier: "PAP-SUBMODULE-PARTIAL-CLEAN",
+            title: "Degrade when a stall carries no fault record",
           },
           agent: {
-            id: "agent-submodule-partial-fault",
+            id: "agent-submodule-partial-clean",
             name: "Codex Coder",
-            companyId: "company-submodule-partial-fault",
+            companyId: "company-submodule-partial-clean",
           },
           recorder,
-        }),
-      ).rejects.toThrow(/vendor\/conflicted-dep/);
+        });
 
-      // The fault must be fatal, not degraded away.
-      expect(
-        operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
-      ).toBe(false);
-      // Evidence was conclusive on the first stall, so it must not have retried.
-      expect(await fs.readFile(counterPath, "utf8")).toBe("1");
-    } finally {
-      setSubmoduleInspectSettingsForTests(null);
-      if (previousPath === undefined) delete process.env.PATH;
-      else process.env.PATH = previousPath;
-      await fs.rm(shimDir, { recursive: true, force: true });
-    }
-  }, 30_000);
+        expect(realized.cwd).toBe(repoRoot);
+        expect(
+          realized.warnings.some((warning) => warning.includes("Could not inspect git submodules")),
+        ).toBe(true);
+        expect(
+          operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
+        ).toBe(true);
+        // None of the three non-fault shapes may have been read as a broken module.
+        const allText = realized.warnings.join("\n");
+        expect(allText).not.toContain("vendor/trunc");
+        expect(allText).not.toContain("vendor/head-fragment");
+        expect(allText).not.toContain("vendor/healthy-dep");
+      } finally {
+        setSubmoduleInspectSettingsForTests(null);
+        if (previousPath === undefined) delete process.env.PATH;
+        else process.env.PATH = previousPath;
+        await fs.rm(shimDir, { recursive: true, force: true });
+      }
+    }, 120_000);
 
-  it("still degrades when a stalled probe produced no fault record", async () => {
-    // The converse of the test above, and the property that keeps this from
-    // becoming a fail-*closed* regression: an empty or fault-free partial output
-    // is NOT evidence of health (an early kill or stdio buffering can yield zero
-    // bytes for a checkout that is in fact broken), so absence of a fault record
-    // must still degrade rather than being read as "clean" or as a fault.
-    //
-    // The shim also emits the three shapes that must NOT be mistaken for faults,
-    // because the captured stream is unreliable at both ends -- it keeps only the
-    // last N bytes (chopping the head and prepending a banner) and a kill can cut
-    // the tail mid-line:
-    //   1. the capture layer's `[output truncated ...]` banner,
-    //   2. a head-chopped line that lost its status character and sha prefix,
-    //   3. a tail fragment whose path is truncated (would name the wrong module).
-    const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
-    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
-    const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
-    const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
-    const shimPath = path.join(shimDir, "git");
-    await fs.writeFile(
-      shimPath,
-      [
-        "#!/bin/sh",
-        `if [ "$1" = "submodule" ] && [ "$2" = "status" ] && [ "$3" = "--recursive" ]; then`,
-        "  echo '[output truncated to last 512 bytes; total 9000 bytes]'",
-        "  echo '9cd3ad27f42c565e05964ab4 vendor/head-fragment'",
-        "  echo ' 2222222222222222222222222222222222222222 vendor/healthy-dep (heads/main)'",
-        "  printf -- '-3333333333333333333333333333333333333333 vendor/trunc'",
-        "  exec sleep 30",
-        "fi",
-        `exec ${JSON.stringify(realGit)} "$@"`,
-        "",
-      ].join("\n"),
-      "utf8",
-    );
-    await fs.chmod(shimPath, 0o755);
-    const previousPath = process.env.PATH;
-    process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
-    setSubmoduleInspectSettingsForTests({ timeoutMs: 300, attempts: 2, retryDelayMs: 1 });
-
-    try {
-      const realized = await realizeExecutionWorkspace({
-        base: {
-          baseCwd: repoRoot,
-          source: "project_primary",
-          projectId: "project-submodule-partial-clean",
-          workspaceId: "workspace-submodule-partial-clean",
-          repoUrl: null,
-          repoRef: "main",
-        },
-        config: {},
-        issue: {
-          id: "issue-submodule-partial-clean",
-          identifier: "PAP-SUBMODULE-PARTIAL-CLEAN",
-          title: "Degrade when a stall carries no fault record",
-        },
-        agent: {
-          id: "agent-submodule-partial-clean",
-          name: "Codex Coder",
-          companyId: "company-submodule-partial-clean",
-        },
-        recorder,
-      });
-
-      expect(realized.cwd).toBe(repoRoot);
-      expect(
-        realized.warnings.some((warning) => warning.includes("Could not inspect git submodules")),
-      ).toBe(true);
-      expect(
-        operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
-      ).toBe(true);
-      // None of the three non-fault shapes may have been read as a broken module.
-      const allText = realized.warnings.join("\n");
-      expect(allText).not.toContain("vendor/trunc");
-      expect(allText).not.toContain("vendor/head-fragment");
-      expect(allText).not.toContain("vendor/healthy-dep");
-    } finally {
-      setSubmoduleInspectSettingsForTests(null);
-      if (previousPath === undefined) delete process.env.PATH;
-      else process.env.PATH = previousPath;
-      await fs.rm(shimDir, { recursive: true, force: true });
-    }
-  }, 30_000);
-
-  it("does not start a retry while the previous timed-out process group remains alive", async () => {
-    // In the CephFS-stall case this change exists for, SIGKILL can be issued
-    // while the task remains stuck in uninterruptible IO. Retrying immediately
-    // would overlap the next Git tree with the old one against the same checkout,
-    // amplifying the metadata pressure. Simulate that liveness result directly:
-    // the subprocess is killable in the test environment, but the retry policy
-    // must key off the bounded liveness probe result, not off a best-effort
-    // signal send.
-    const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
-    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
-    const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
-    const counterPath = path.join(shimDir, "status-calls");
-    const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
-    const shimPath = path.join(shimDir, "git");
-    await fs.writeFile(
-      shimPath,
-      [
-        "#!/bin/sh",
-        `if [ "$1" = "submodule" ] && [ "$2" = "status" ] && [ "$3" = "--recursive" ]; then`,
-        `  calls=$(cat ${JSON.stringify(counterPath)} 2>/dev/null || echo 0)`,
-        "  calls=$((calls + 1))",
-        `  printf '%s' "$calls" > ${JSON.stringify(counterPath)}`,
-        "  exec sleep 30",
-        "fi",
-        `exec ${JSON.stringify(realGit)} "$@"`,
-        "",
-      ].join("\n"),
-      "utf8",
-    );
-    await fs.chmod(shimPath, 0o755);
-    const previousPath = process.env.PATH;
-    process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
-    setSubmoduleInspectSettingsForTests({ timeoutMs: 300, attempts: 3, retryDelayMs: 1 });
-    setProcessGroupLivenessProbeForTests(() => true);
-
-    try {
-      const realized = await realizeExecutionWorkspace({
-        base: {
-          baseCwd: repoRoot,
-          source: "project_primary",
-          projectId: "project-submodule-timeout-live-group",
-          workspaceId: "workspace-submodule-timeout-live-group",
-          repoUrl: null,
-          repoRef: "main",
-        },
-        config: {},
-        issue: {
-          id: "issue-submodule-timeout-live-group",
-          identifier: "PAP-SUBMODULE-TIMEOUT-LIVE-GROUP",
-          title: "Do not retry over a live timed-out process group",
-        },
-        agent: {
-          id: "agent-submodule-timeout-live-group",
-          name: "Codex Coder",
-          companyId: "company-submodule-timeout-live-group",
-        },
-        recorder,
-      });
-
-      expect(realized.cwd).toBe(repoRoot);
-      const warning = realized.warnings.find((candidate) => candidate.includes("Could not inspect git submodules"));
-      expect(warning).toBeDefined();
-      expect(warning).toContain("after 1 attempt(s)");
-      expect(warning).toContain("process group remained alive after SIGKILL");
-      expect(warning).toContain("retry was skipped");
-      expect(await fs.readFile(counterPath, "utf8")).toBe("1");
-
-      const degraded = operations.find(
-        (operation) => operation.metadata?.action === "submodule_inspection_degraded",
+    it("does not start a submodule inspection retry while the previous timed-out process group remains alive", async () => {
+      // In the CephFS-stall case this change exists for, SIGKILL can be issued
+      // while the task remains stuck in uninterruptible IO. Retrying immediately
+      // would overlap the next Git tree with the old one against the same checkout,
+      // amplifying the metadata pressure. Simulate that liveness result directly:
+      // the subprocess is killable in the test environment, but the retry policy
+      // must key off the bounded liveness probe result, not off a best-effort
+      // signal send.
+      const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
+      const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+      const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+      const counterPath = path.join(shimDir, "status-calls");
+      const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
+      const shimPath = path.join(shimDir, "git");
+      await fs.writeFile(
+        shimPath,
+        [
+          "#!/bin/sh",
+          `if [ "$1" = "submodule" ] && [ "$2" = "status" ] && [ "$3" = "--recursive" ]; then`,
+          `  calls=$(cat ${JSON.stringify(counterPath)} 2>/dev/null || echo 0)`,
+          "  calls=$((calls + 1))",
+          `  printf '%s' "$calls" > ${JSON.stringify(counterPath)}`,
+          "  exec sleep 30",
+          "fi",
+          `exec ${JSON.stringify(realGit)} "$@"`,
+          "",
+        ].join("\n"),
+        "utf8",
       );
-      expect(degraded?.metadata).toMatchObject({
-        // BLO-20047: the probe reached no conclusion (retry skipped, not "found
-        // a fault") -- inconclusive_probe, not repair_withheld.
-        cause: "inconclusive_probe",
-        attempts: 1,
-        reason: expect.stringContaining("retry was skipped"),
-      });
-    } finally {
-      setSubmoduleInspectSettingsForTests(null);
-      setProcessGroupLivenessProbeForTests(null);
-      if (previousPath === undefined) delete process.env.PATH;
-      else process.env.PATH = previousPath;
-      await fs.rm(shimDir, { recursive: true, force: true });
-    }
-  }, 30_000);
+      await fs.chmod(shimPath, 0o755);
+      const previousPath = process.env.PATH;
+      process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
+      setSubmoduleInspectSettingsForTests({ timeoutMs: 2_000, attempts: 3, retryDelayMs: 1 });
+      setProcessGroupLivenessProbeForTests(() => true);
 
-  it("does not repair salvaged missing submodules while the timed-out process group remains alive", async () => {
-    const { repoRoot, submodulePath } = await createTempRepoWithSubmodule({ removeCheckout: false });
-    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
-    const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
-    const statusCounterPath = path.join(shimDir, "status-calls");
-    const repairCounterPath = path.join(shimDir, "repair-calls");
-    const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
-    const shimPath = path.join(shimDir, "git");
-    await fs.writeFile(
-      shimPath,
-      [
-        "#!/bin/sh",
-        `if [ "$1" = "submodule" ] && [ "$2" = "status" ] && [ "$3" = "--recursive" ]; then`,
-        `  calls=$(cat ${JSON.stringify(statusCounterPath)} 2>/dev/null || echo 0)`,
-        "  calls=$((calls + 1))",
-        `  printf '%s' "$calls" > ${JSON.stringify(statusCounterPath)}`,
-        `  echo '-1111111111111111111111111111111111111111 ${submodulePath}'`,
-        "  exec sleep 30",
-        "fi",
-        `if [ "$1" = "submodule" ] && [ "$2" = "sync" ]; then`,
-        `  calls=$(cat ${JSON.stringify(repairCounterPath)} 2>/dev/null || echo 0)`,
-        "  calls=$((calls + 1))",
-        `  printf '%s' "$calls" > ${JSON.stringify(repairCounterPath)}`,
-        "fi",
-        `if [ "$1" = "-c" ] && [ "$3" = "submodule" ] && [ "$4" = "update" ]; then`,
-        `  calls=$(cat ${JSON.stringify(repairCounterPath)} 2>/dev/null || echo 0)`,
-        "  calls=$((calls + 1))",
-        `  printf '%s' "$calls" > ${JSON.stringify(repairCounterPath)}`,
-        "fi",
-        `exec ${JSON.stringify(realGit)} "$@"`,
-        "",
-      ].join("\n"),
-      "utf8",
-    );
-    await fs.chmod(shimPath, 0o755);
-    const previousPath = process.env.PATH;
-    process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
-    setSubmoduleInspectSettingsForTests({ timeoutMs: 300, attempts: 3, retryDelayMs: 1 });
-    setProcessGroupLivenessProbeForTests(() => true);
+      try {
+        const realized = await realizeExecutionWorkspace({
+          base: {
+            baseCwd: repoRoot,
+            source: "project_primary",
+            projectId: "project-submodule-timeout-live-group",
+            workspaceId: "workspace-submodule-timeout-live-group",
+            repoUrl: null,
+            repoRef: "main",
+          },
+          config: {},
+          issue: {
+            id: "issue-submodule-timeout-live-group",
+            identifier: "PAP-SUBMODULE-TIMEOUT-LIVE-GROUP",
+            title: "Do not retry over a live timed-out process group",
+          },
+          agent: {
+            id: "agent-submodule-timeout-live-group",
+            name: "Codex Coder",
+            companyId: "company-submodule-timeout-live-group",
+          },
+          recorder,
+        });
 
-    try {
-      const realized = await realizeExecutionWorkspace({
-        base: {
-          baseCwd: repoRoot,
-          source: "project_primary",
-          projectId: "project-submodule-partial-fault-live-group",
-          workspaceId: "workspace-submodule-partial-fault-live-group",
-          repoUrl: null,
-          repoRef: "main",
-        },
-        config: {},
-        issue: {
-          id: "issue-submodule-partial-fault-live-group",
-          identifier: "PAP-SUBMODULE-PARTIAL-FAULT-LIVE-GROUP",
-          title: "Do not repair over a live timed-out process group",
-        },
-        agent: {
-          id: "agent-submodule-partial-fault-live-group",
-          name: "Codex Coder",
-          companyId: "company-submodule-partial-fault-live-group",
-        },
-        recorder,
-      });
+        expect(realized.cwd).toBe(repoRoot);
+        const warning = realized.warnings.find((candidate) => candidate.includes("Could not inspect git submodules"));
+        expect(warning).toBeDefined();
+        expect(warning).toContain("after 1 attempt(s)");
+        expect(warning).toContain("process group remained alive after SIGKILL");
+        expect(warning).toContain("retry was skipped");
+        expect(await fs.readFile(counterPath, "utf8")).toBe("1");
 
-      expect(realized.cwd).toBe(repoRoot);
-      const warning = realized.warnings.find((candidate) =>
-        candidate.includes("automatic submodule repair was skipped"),
+        const degraded = operations.find(
+          (operation) => operation.metadata?.action === "submodule_inspection_degraded",
+        );
+        expect(degraded?.metadata).toMatchObject({
+          // BLO-20047: the probe reached no conclusion (retry skipped, not "found
+          // a fault") -- inconclusive_probe, not repair_withheld.
+          cause: "inconclusive_probe",
+          attempts: 1,
+          reason: expect.stringContaining("retry was skipped"),
+        });
+      } finally {
+        setSubmoduleInspectSettingsForTests(null);
+        setProcessGroupLivenessProbeForTests(null);
+        if (previousPath === undefined) delete process.env.PATH;
+        else process.env.PATH = previousPath;
+        await fs.rm(shimDir, { recursive: true, force: true });
+      }
+    }, 120_000);
+
+    it("does not repair salvaged missing submodules while the timed-out process group remains alive", async () => {
+      const { repoRoot, submodulePath } = await createTempRepoWithSubmodule({ removeCheckout: false });
+      const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+      const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+      const statusCounterPath = path.join(shimDir, "status-calls");
+      const repairCounterPath = path.join(shimDir, "repair-calls");
+      const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
+      const shimPath = path.join(shimDir, "git");
+      await fs.writeFile(
+        shimPath,
+        [
+          "#!/bin/sh",
+          `if [ "$1" = "submodule" ] && [ "$2" = "status" ] && [ "$3" = "--recursive" ]; then`,
+          `  calls=$(cat ${JSON.stringify(statusCounterPath)} 2>/dev/null || echo 0)`,
+          "  calls=$((calls + 1))",
+          `  printf '%s' "$calls" > ${JSON.stringify(statusCounterPath)}`,
+          `  echo '-1111111111111111111111111111111111111111 ${submodulePath}'`,
+          "  exec sleep 30",
+          "fi",
+          `if [ "$1" = "submodule" ] && [ "$2" = "sync" ]; then`,
+          `  calls=$(cat ${JSON.stringify(repairCounterPath)} 2>/dev/null || echo 0)`,
+          "  calls=$((calls + 1))",
+          `  printf '%s' "$calls" > ${JSON.stringify(repairCounterPath)}`,
+          "fi",
+          `if [ "$1" = "-c" ] && [ "$3" = "submodule" ] && [ "$4" = "update" ]; then`,
+          `  calls=$(cat ${JSON.stringify(repairCounterPath)} 2>/dev/null || echo 0)`,
+          "  calls=$((calls + 1))",
+          `  printf '%s' "$calls" > ${JSON.stringify(repairCounterPath)}`,
+          "fi",
+          `exec ${JSON.stringify(realGit)} "$@"`,
+          "",
+        ].join("\n"),
+        "utf8",
       );
-      expect(warning).toBeDefined();
-      expect(warning).toContain(submodulePath);
-      expect(warning).toContain("process group remained alive after SIGKILL");
-      expect(await fs.readFile(statusCounterPath, "utf8")).toBe("1");
-      expect(await fs.readFile(repairCounterPath, "utf8").catch(() => "0")).toBe("0");
+      await fs.chmod(shimPath, 0o755);
+      const previousPath = process.env.PATH;
+      process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
+      setSubmoduleInspectSettingsForTests({ timeoutMs: 2_000, attempts: 3, retryDelayMs: 1 });
+      setProcessGroupLivenessProbeForTests(() => true);
 
-      const degraded = operations.find(
-        (operation) => operation.metadata?.action === "submodule_inspection_degraded",
+      try {
+        const realized = await realizeExecutionWorkspace({
+          base: {
+            baseCwd: repoRoot,
+            source: "project_primary",
+            projectId: "project-submodule-partial-fault-live-group",
+            workspaceId: "workspace-submodule-partial-fault-live-group",
+            repoUrl: null,
+            repoRef: "main",
+          },
+          config: {},
+          issue: {
+            id: "issue-submodule-partial-fault-live-group",
+            identifier: "PAP-SUBMODULE-PARTIAL-FAULT-LIVE-GROUP",
+            title: "Do not repair over a live timed-out process group",
+          },
+          agent: {
+            id: "agent-submodule-partial-fault-live-group",
+            name: "Codex Coder",
+            companyId: "company-submodule-partial-fault-live-group",
+          },
+          recorder,
+        });
+
+        expect(realized.cwd).toBe(repoRoot);
+        const warning = realized.warnings.find((candidate) =>
+          candidate.includes("automatic submodule repair was skipped"),
+        );
+        expect(warning).toBeDefined();
+        expect(warning).toContain(submodulePath);
+        expect(warning).toContain("process group remained alive after SIGKILL");
+        expect(await fs.readFile(statusCounterPath, "utf8")).toBe("1");
+        expect(await fs.readFile(repairCounterPath, "utf8").catch(() => "0")).toBe("0");
+
+        const degraded = operations.find(
+          (operation) => operation.metadata?.action === "submodule_inspection_degraded",
+        );
+        expect(degraded?.metadata).toMatchObject({
+          // BLO-20047: the probe found a real fault (salvaged partial output)
+          // but repair was withheld -- repair_withheld, not inconclusive_probe.
+          cause: "repair_withheld",
+          attempts: 1,
+          reason: expect.stringContaining("automatic submodule repair was skipped"),
+        });
+      } finally {
+        setSubmoduleInspectSettingsForTests(null);
+        setProcessGroupLivenessProbeForTests(null);
+        if (previousPath === undefined) delete process.env.PATH;
+        else process.env.PATH = previousPath;
+        await fs.rm(shimDir, { recursive: true, force: true });
+      }
+    }, 120_000);
+
+    it("reports both the submodule repair and the degradation when the post-repair re-check stalls", async () => {
+      // The other timeout tests all stall the *initial* probe. This covers the
+      // second inspection site, which has a different obligation: the repair
+      // commands really did succeed, so the run must report that alongside the
+      // inconclusive verification rather than discarding either -- and the
+      // degradation operation has to be attributed to `post_repair`, otherwise an
+      // operator reading it goes looking for a stall that never happened at the
+      // start of the run.
+      const { repoRoot, submodulePath } = await createTempRepoWithSubmodule({ removeCheckout: true });
+      const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+      const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+      const counterPath = path.join(shimDir, "status-calls");
+      const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
+      const shimPath = path.join(shimDir, "git");
+      // Call 1 (initial probe) reports the submodule uninitialized so the repair
+      // path runs for real; call 2 (the post-repair verification) hangs. `exec`
+      // replaces the shell so the SIGTERM lands on the stalling process directly.
+      await fs.writeFile(
+        shimPath,
+        [
+          "#!/bin/sh",
+          `if [ "$1" = "submodule" ] && [ "$2" = "status" ] && [ "$3" = "--recursive" ]; then`,
+          `  calls=$(cat ${JSON.stringify(counterPath)} 2>/dev/null || echo 0)`,
+          "  calls=$((calls + 1))",
+          `  printf '%s' "$calls" > ${JSON.stringify(counterPath)}`,
+          '  if [ "$calls" = "1" ]; then',
+          `    echo '-1111111111111111111111111111111111111111 ${submodulePath}'`,
+          "    exit 0",
+          "  fi",
+          "  exec sleep 30",
+          "fi",
+          `exec ${JSON.stringify(realGit)} "$@"`,
+          "",
+        ].join("\n"),
+        "utf8",
       );
-      expect(degraded?.metadata).toMatchObject({
-        // BLO-20047: the probe found a real fault (salvaged partial output)
-        // but repair was withheld -- repair_withheld, not inconclusive_probe.
-        cause: "repair_withheld",
-        attempts: 1,
-        reason: expect.stringContaining("automatic submodule repair was skipped"),
-      });
-    } finally {
-      setSubmoduleInspectSettingsForTests(null);
-      setProcessGroupLivenessProbeForTests(null);
-      if (previousPath === undefined) delete process.env.PATH;
-      else process.env.PATH = previousPath;
-      await fs.rm(shimDir, { recursive: true, force: true });
-    }
-  }, 30_000);
+      await fs.chmod(shimPath, 0o755);
+      const previousPath = process.env.PATH;
+      process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
+      setSubmoduleInspectSettingsForTests({ timeoutMs: 2_000, attempts: 2, retryDelayMs: 1 });
+      // This test asserts "2 attempt(s)" and `attempts: 2` on the post-repair
+      // probe, so it needs the retry branch for the same reason as above.
+      setProcessGroupLivenessProbeForTests(() => false);
 
-  it("reports both the repair and the degradation when the post-repair re-check stalls", async () => {
-    // The other timeout tests all stall the *initial* probe. This covers the
-    // second inspection site, which has a different obligation: the repair
-    // commands really did succeed, so the run must report that alongside the
-    // inconclusive verification rather than discarding either -- and the
-    // degradation operation has to be attributed to `post_repair`, otherwise an
-    // operator reading it goes looking for a stall that never happened at the
-    // start of the run.
-    const { repoRoot, submodulePath } = await createTempRepoWithSubmodule({ removeCheckout: true });
-    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
-    const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
-    const counterPath = path.join(shimDir, "status-calls");
-    const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
-    const shimPath = path.join(shimDir, "git");
-    // Call 1 (initial probe) reports the submodule uninitialized so the repair
-    // path runs for real; call 2 (the post-repair verification) hangs. `exec`
-    // replaces the shell so the SIGTERM lands on the stalling process directly.
-    await fs.writeFile(
-      shimPath,
-      [
-        "#!/bin/sh",
-        `if [ "$1" = "submodule" ] && [ "$2" = "status" ] && [ "$3" = "--recursive" ]; then`,
-        `  calls=$(cat ${JSON.stringify(counterPath)} 2>/dev/null || echo 0)`,
-        "  calls=$((calls + 1))",
-        `  printf '%s' "$calls" > ${JSON.stringify(counterPath)}`,
-        '  if [ "$calls" = "1" ]; then',
-        `    echo '-1111111111111111111111111111111111111111 ${submodulePath}'`,
-        "    exit 0",
-        "  fi",
-        "  exec sleep 30",
-        "fi",
-        `exec ${JSON.stringify(realGit)} "$@"`,
-        "",
-      ].join("\n"),
-      "utf8",
-    );
-    await fs.chmod(shimPath, 0o755);
-    const previousPath = process.env.PATH;
-    process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
-    setSubmoduleInspectSettingsForTests({ timeoutMs: 300, attempts: 2, retryDelayMs: 1 });
+      try {
+        const realized = await realizeExecutionWorkspace({
+          base: {
+            baseCwd: repoRoot,
+            source: "project_primary",
+            projectId: "project-submodule-post-repair-timeout",
+            workspaceId: "workspace-submodule-post-repair-timeout",
+            repoUrl: null,
+            repoRef: "main",
+          },
+          config: {},
+          issue: {
+            id: "issue-submodule-post-repair-timeout",
+            identifier: "PAP-SUBMODULE-POST-REPAIR-TIMEOUT",
+            title: "Survive a stalled post-repair verification",
+          },
+          agent: {
+            id: "agent-submodule-post-repair-timeout",
+            name: "Codex Coder",
+            companyId: "company-submodule-post-repair-timeout",
+          },
+          recorder,
+        });
 
-    try {
-      const realized = await realizeExecutionWorkspace({
-        base: {
-          baseCwd: repoRoot,
-          source: "project_primary",
-          projectId: "project-submodule-post-repair-timeout",
-          workspaceId: "workspace-submodule-post-repair-timeout",
-          repoUrl: null,
-          repoRef: "main",
-        },
-        config: {},
-        issue: {
-          id: "issue-submodule-post-repair-timeout",
-          identifier: "PAP-SUBMODULE-POST-REPAIR-TIMEOUT",
-          title: "Survive a stalled post-repair verification",
-        },
-        agent: {
-          id: "agent-submodule-post-repair-timeout",
-          name: "Codex Coder",
-          companyId: "company-submodule-post-repair-timeout",
-        },
-        recorder,
-      });
+        // The run survives, and neither half of the story is dropped.
+        expect(realized.strategy).toBe("project_primary");
+        expect(realized.warnings).toHaveLength(2);
+        expect(realized.warnings[0]).toBe(
+          `Initialized git submodules before starting: ${submodulePath}`,
+        );
+        expect(realized.warnings[1]).toContain("Continuing without the submodule readiness check");
+        expect(realized.warnings[1]).toContain("2 attempt(s)");
 
-      // The run survives, and neither half of the story is dropped.
-      expect(realized.strategy).toBe("project_primary");
-      expect(realized.warnings).toHaveLength(2);
-      expect(realized.warnings[0]).toBe(
-        `Initialized git submodules before starting: ${submodulePath}`,
+        // The repair actually ran, and the verification stalled after it.
+        expect(
+          operations.some(
+            (operation) => operation.metadata?.action === "repair_uninitialized_submodules",
+          ),
+        ).toBe(true);
+        const degraded = operations.filter(
+          (operation) => operation.metadata?.action === "submodule_inspection_degraded",
+        );
+        expect(degraded).toHaveLength(1);
+        expect(degraded[0]?.metadata?.stage).toBe("post_repair");
+        // BLO-20047: post-repair verification stalling is inconclusive, not a
+        // withheld repair (the repair already ran and is reported separately
+        // above) -- pin the stable field, not the shared `stage`.
+        expect(degraded[0]?.metadata?.cause).toBe("inconclusive_probe");
+        expect(degraded[0]?.metadata?.attempts).toBe(2);
+      } finally {
+        setSubmoduleInspectSettingsForTests(null);
+        if (previousPath === undefined) delete process.env.PATH;
+        else process.env.PATH = previousPath;
+        await fs.rm(shimDir, { recursive: true, force: true });
+      }
+    }, 120_000);
+
+    it("reports both the submodule repair and the degradation when a salvaged initial stall is followed by a stalled re-check", async () => {
+      // BLO-30301: this is the exact path CI drifted into when the sibling
+      // "degrades to a warning ..." test ran on a 1ms budget with no shim, and it
+      // is a distinct path from the test above -- there the initial probe *exits*
+      // with the fault; here it stalls and the fault is recovered from partial
+      // output. That difference is the whole point: it chains
+      // salvageGitSubmoduleFaults (`ok: true, partial: true`) into the repair, and
+      // then into a second stall at the verification site. Every one of those
+      // steps is specified behaviour, so the run must end with both warnings --
+      // the repair really did happen and only the re-check was inconclusive.
+      //
+      // CI reported `after 2 attempt(s)` while the initial probe had salvaged on
+      // attempt 1; that count comes from the post-repair probe exhausting its own
+      // budget, which is what pins this path rather than any other.
+      const { repoRoot, submodulePath } = await createTempRepoWithSubmodule({ removeCheckout: true });
+      const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+      const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+      const counterPath = path.join(shimDir, "status-calls");
+      const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
+      const shimPath = path.join(shimDir, "git");
+      // Call 1 (initial probe): flush a real `-` fault record, *then* hang, so the
+      // probe times out holding salvageable evidence. Calls 2+ (the post-repair
+      // verification and its retry): the submodule is genuinely healthy by then,
+      // so emit the leading-space record git would print -- which is not a fault,
+      // leaves salvage empty, and exhausts the budget.
+      await fs.writeFile(
+        shimPath,
+        [
+          "#!/bin/sh",
+          `if [ "$1" = "submodule" ] && [ "$2" = "status" ] && [ "$3" = "--recursive" ]; then`,
+          `  calls=$(cat ${JSON.stringify(counterPath)} 2>/dev/null || echo 0)`,
+          "  calls=$((calls + 1))",
+          `  printf '%s' "$calls" > ${JSON.stringify(counterPath)}`,
+          '  if [ "$calls" = "1" ]; then',
+          `    echo '-1111111111111111111111111111111111111111 ${submodulePath}'`,
+          "  else",
+          `    echo ' 2222222222222222222222222222222222222222 ${submodulePath} (heads/main)'`,
+          "  fi",
+          "  exec sleep 30",
+          "fi",
+          `exec ${JSON.stringify(realGit)} "$@"`,
+          "",
+        ].join("\n"),
+        "utf8",
       );
-      expect(realized.warnings[1]).toContain("Continuing without the submodule readiness check");
-      expect(realized.warnings[1]).toContain("2 attempt(s)");
+      await fs.chmod(shimPath, 0o755);
+      const previousPath = process.env.PATH;
+      process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
+      setSubmoduleInspectSettingsForTests({ timeoutMs: 2_000, attempts: 2, retryDelayMs: 1 });
+      // The `repair_withheld` guard keys off whether the timed-out process group
+      // survived SIGKILL. In the CI occurrence it had not, so the repair ran; pin
+      // that rather than leaving it to how promptly a loaded host reaps `sleep`.
+      // Without this the test would race the very same way the original did.
+      setProcessGroupLivenessProbeForTests(() => false);
 
-      // The repair actually ran, and the verification stalled after it.
-      expect(
-        operations.some(
-          (operation) => operation.metadata?.action === "repair_uninitialized_submodules",
-        ),
-      ).toBe(true);
-      const degraded = operations.filter(
-        (operation) => operation.metadata?.action === "submodule_inspection_degraded",
-      );
-      expect(degraded).toHaveLength(1);
-      expect(degraded[0]?.metadata?.stage).toBe("post_repair");
-      // BLO-20047: post-repair verification stalling is inconclusive, not a
-      // withheld repair (the repair already ran and is reported separately
-      // above) -- pin the stable field, not the shared `stage`.
-      expect(degraded[0]?.metadata?.cause).toBe("inconclusive_probe");
-      expect(degraded[0]?.metadata?.attempts).toBe(2);
-    } finally {
-      setSubmoduleInspectSettingsForTests(null);
-      if (previousPath === undefined) delete process.env.PATH;
-      else process.env.PATH = previousPath;
-      await fs.rm(shimDir, { recursive: true, force: true });
-    }
-  }, 30_000);
+      try {
+        const realized = await realizeExecutionWorkspace({
+          base: {
+            baseCwd: repoRoot,
+            source: "project_primary",
+            projectId: "project-submodule-salvaged-then-stalled",
+            workspaceId: "workspace-submodule-salvaged-then-stalled",
+            repoUrl: null,
+            repoRef: "main",
+          },
+          config: {},
+          issue: {
+            id: "issue-submodule-salvaged-then-stalled",
+            identifier: "PAP-SUBMODULE-SALVAGED-THEN-STALLED",
+            title: "Repair off a salvaged stall, then survive a stalled re-check",
+          },
+          agent: {
+            id: "agent-submodule-salvaged-then-stalled",
+            name: "Codex Coder",
+            companyId: "company-submodule-salvaged-then-stalled",
+          },
+          recorder,
+        });
 
-  it("ignores a non-integer submodule inspection override instead of truncating it to zero", async () => {
-    // `Math.trunc(0.5)` is 0, which does not fall back: 0 attempts skips the
-    // retry loop (degrading a healthy workspace) and a 0ms timeout disables
-    // `executeProcess`'s timer entirely. Both fail open silently, so a
-    // non-integer override must be rejected outright.
-    const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
-    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
-    const previousAttempts = process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS;
-    process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS = "0.5";
+        expect(realized.strategy).toBe("project_primary");
+        expect(realized.cwd).toBe(repoRoot);
 
-    try {
-      const realized = await realizeExecutionWorkspace({
-        base: {
-          baseCwd: repoRoot,
-          source: "project_primary",
-          projectId: "project-submodule-bad-override",
-          workspaceId: "workspace-submodule-bad-override",
-          repoUrl: null,
-          repoRef: "main",
-        },
-        config: {},
-        issue: {
-          id: "issue-submodule-bad-override",
-          identifier: "PAP-SUBMODULE-BAD-OVERRIDE",
-          title: "Reject a fractional attempts override",
-        },
-        agent: {
-          id: "agent-submodule-bad-override",
-          name: "Codex Coder",
-          companyId: "company-submodule-bad-override",
-        },
-        recorder,
-      });
+        // Both halves are reported, in order, and neither is discarded.
+        expect(realized.warnings).toHaveLength(2);
+        expect(realized.warnings[0]).toBe(
+          `Initialized git submodules before starting: ${submodulePath}`,
+        );
+        expect(realized.warnings[1]).toContain("Could not inspect git submodules");
+        expect(realized.warnings[1]).toContain("inconclusive");
 
-      // The healthy checkout is inspected normally: no degradation at all.
-      expect(
-        realized.warnings.filter((warning) => warning.includes("Could not inspect git submodules")),
-      ).toEqual([]);
-      expect(
-        operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
-      ).toBe(false);
-    } finally {
-      if (previousAttempts === undefined) delete process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS;
-      else process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS = previousAttempts;
-    }
-  }, 20_000);
+        // The initial probe salvaged its fault on the first stall rather than
+        // retrying, so the two remaining calls are the post-repair budget.
+        expect(await fs.readFile(counterPath, "utf8")).toBe("3");
+        expect(
+          operations.some(
+            (operation) => operation.metadata?.action === "repair_uninitialized_submodules",
+          ),
+        ).toBe(true);
 
-  it("ignores an oversized submodule inspection timeout instead of letting Node clamp it to 1ms", async () => {
-    // Node clamps any `setTimeout` delay above `2^31 - 1` ms to *1ms* with a
-    // `TimeoutOverflowWarning`. A plausible-looking large override (an extra
-    // digit, or seconds/ms confusion) would therefore make every probe time out
-    // immediately and degrade a perfectly healthy checkout -- the same
-    // silent-fail-open class as the fractional-value bug above, arrived at from
-    // the opposite end of the range.
-    const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
-    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
-    const previousTimeout = process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS;
-    // 2^31, the first value Node cannot represent.
-    process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS = "2147483648";
+        // And the single degradation is attributed to `post_repair` -- the field
+        // the sibling test now keys on. If this were ever recorded as `initial`,
+        // the pairing above would be a real defect rather than the contract.
+        const degradedOps = operations.filter(
+          (operation) => operation.metadata?.action === "submodule_inspection_degraded",
+        );
+        expect(degradedOps).toHaveLength(1);
+        expect(degradedOps[0]?.metadata).toMatchObject({
+          stage: "post_repair",
+          cause: "inconclusive_probe",
+          attempts: 2,
+        });
+      } finally {
+        setSubmoduleInspectSettingsForTests(null);
+        setProcessGroupLivenessProbeForTests(null);
+        if (previousPath === undefined) delete process.env.PATH;
+        else process.env.PATH = previousPath;
+        await fs.rm(shimDir, { recursive: true, force: true });
+      }
+    }, 120_000);
 
-    try {
-      const realized = await realizeExecutionWorkspace({
-        base: {
-          baseCwd: repoRoot,
-          source: "project_primary",
-          projectId: "project-submodule-huge-override",
-          workspaceId: "workspace-submodule-huge-override",
-          repoUrl: null,
-          repoRef: "main",
-        },
-        config: {},
-        issue: {
-          id: "issue-submodule-huge-override",
-          identifier: "PAP-SUBMODULE-HUGE-OVERRIDE",
-          title: "Reject an oversized timeout override",
-        },
-        agent: {
-          id: "agent-submodule-huge-override",
-          name: "Codex Coder",
-          companyId: "company-submodule-huge-override",
-        },
-        recorder,
-      });
+    it("ignores a non-integer submodule inspection override instead of truncating it to zero", async () => {
+      // `Math.trunc(0.5)` is 0, which does not fall back: 0 attempts skips the
+      // retry loop (degrading a healthy workspace) and a 0ms timeout disables
+      // `executeProcess`'s timer entirely. Both fail open silently, so a
+      // non-integer override must be rejected outright.
+      const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
+      const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+      const previousAttempts = process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS;
+      process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS = "0.5";
 
-      // Falls back to the 60s default, so the healthy checkout is inspected
-      // normally rather than degrading on a 1ms timer.
-      expect(
-        realized.warnings.filter((warning) => warning.includes("Could not inspect git submodules")),
-      ).toEqual([]);
-      expect(
-        operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
-      ).toBe(false);
-    } finally {
-      if (previousTimeout === undefined) delete process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS;
-      else process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS = previousTimeout;
-    }
-  }, 20_000);
+      try {
+        const realized = await realizeExecutionWorkspace({
+          base: {
+            baseCwd: repoRoot,
+            source: "project_primary",
+            projectId: "project-submodule-bad-override",
+            workspaceId: "workspace-submodule-bad-override",
+            repoUrl: null,
+            repoRef: "main",
+          },
+          config: {},
+          issue: {
+            id: "issue-submodule-bad-override",
+            identifier: "PAP-SUBMODULE-BAD-OVERRIDE",
+            title: "Reject a fractional attempts override",
+          },
+          agent: {
+            id: "agent-submodule-bad-override",
+            name: "Codex Coder",
+            companyId: "company-submodule-bad-override",
+          },
+          recorder,
+        });
 
-  it("ignores an undersized submodule inspection timeout instead of turning the knob into a fail-open switch", async () => {
-    // A budget too small to ever complete fails open exactly like the oversized
-    // case above: every probe times out, so every workspace takes the degrade
-    // path and the submodule check stops running at all. `=60` -- meaning the
-    // documented 60s, in a field that takes milliseconds -- is the likeliest way
-    // to reach that state, so it must fall back rather than be honoured.
-    const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
-    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
-    const previousTimeout = process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS;
-    // Seconds-vs-milliseconds slip: the operator means 60s, the field takes ms.
-    process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS = "60";
+        // The healthy checkout is inspected normally: no degradation at all.
+        expect(
+          realized.warnings.filter((warning) => warning.includes("Could not inspect git submodules")),
+        ).toEqual([]);
+        expect(
+          operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
+        ).toBe(false);
+      } finally {
+        if (previousAttempts === undefined) delete process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS;
+        else process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_ATTEMPTS = previousAttempts;
+      }
+    });
 
-    try {
-      const realized = await realizeExecutionWorkspace({
-        base: {
-          baseCwd: repoRoot,
-          source: "project_primary",
-          projectId: "project-submodule-tiny-override",
-          workspaceId: "workspace-submodule-tiny-override",
-          repoUrl: null,
-          repoRef: "main",
-        },
-        config: {},
-        issue: {
-          id: "issue-submodule-tiny-override",
-          identifier: "PAP-SUBMODULE-TINY-OVERRIDE",
-          title: "Reject an undersized timeout override",
-        },
-        agent: {
-          id: "agent-submodule-tiny-override",
-          name: "Codex Coder",
-          companyId: "company-submodule-tiny-override",
-        },
-        recorder,
-      });
+    it("ignores an oversized submodule inspection timeout instead of letting Node clamp it to 1ms", async () => {
+      // Node clamps any `setTimeout` delay above `2^31 - 1` ms to *1ms* with a
+      // `TimeoutOverflowWarning`. A plausible-looking large override (an extra
+      // digit, or seconds/ms confusion) would therefore make every probe time out
+      // immediately and degrade a perfectly healthy checkout -- the same
+      // silent-fail-open class as the fractional-value bug above, arrived at from
+      // the opposite end of the range.
+      const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
+      const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+      const previousTimeout = process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS;
+      // 2^31, the first value Node cannot represent.
+      process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS = "2147483648";
 
-      // Falls back to the 60s default, so the healthy checkout is inspected
-      // normally rather than degrading on a 60ms timer.
-      expect(
-        realized.warnings.filter((warning) => warning.includes("Could not inspect git submodules")),
-      ).toEqual([]);
-      expect(
-        operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
-      ).toBe(false);
-    } finally {
-      if (previousTimeout === undefined) delete process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS;
-      else process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS = previousTimeout;
-    }
-  }, 20_000);
+      try {
+        const realized = await realizeExecutionWorkspace({
+          base: {
+            baseCwd: repoRoot,
+            source: "project_primary",
+            projectId: "project-submodule-huge-override",
+            workspaceId: "workspace-submodule-huge-override",
+            repoUrl: null,
+            repoRef: "main",
+          },
+          config: {},
+          issue: {
+            id: "issue-submodule-huge-override",
+            identifier: "PAP-SUBMODULE-HUGE-OVERRIDE",
+            title: "Reject an oversized timeout override",
+          },
+          agent: {
+            id: "agent-submodule-huge-override",
+            name: "Codex Coder",
+            companyId: "company-submodule-huge-override",
+          },
+          recorder,
+        });
+
+        // Falls back to the 60s default, so the healthy checkout is inspected
+        // normally rather than degrading on a 1ms timer.
+        expect(
+          realized.warnings.filter((warning) => warning.includes("Could not inspect git submodules")),
+        ).toEqual([]);
+        expect(
+          operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
+        ).toBe(false);
+      } finally {
+        if (previousTimeout === undefined) delete process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS;
+        else process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS = previousTimeout;
+      }
+    });
+
+    it("ignores an undersized submodule inspection timeout instead of turning the knob into a fail-open switch", async () => {
+      // A budget too small to ever complete fails open exactly like the oversized
+      // case above: every probe times out, so every workspace takes the degrade
+      // path and the submodule check stops running at all. `=60` -- meaning the
+      // documented 60s, in a field that takes milliseconds -- is the likeliest way
+      // to reach that state, so it must fall back rather than be honoured.
+      const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
+      const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+      const previousTimeout = process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS;
+      // Seconds-vs-milliseconds slip: the operator means 60s, the field takes ms.
+      process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS = "60";
+
+      try {
+        const realized = await realizeExecutionWorkspace({
+          base: {
+            baseCwd: repoRoot,
+            source: "project_primary",
+            projectId: "project-submodule-tiny-override",
+            workspaceId: "workspace-submodule-tiny-override",
+            repoUrl: null,
+            repoRef: "main",
+          },
+          config: {},
+          issue: {
+            id: "issue-submodule-tiny-override",
+            identifier: "PAP-SUBMODULE-TINY-OVERRIDE",
+            title: "Reject an undersized timeout override",
+          },
+          agent: {
+            id: "agent-submodule-tiny-override",
+            name: "Codex Coder",
+            companyId: "company-submodule-tiny-override",
+          },
+          recorder,
+        });
+
+        // Falls back to the 60s default, so the healthy checkout is inspected
+        // normally rather than degrading on a 60ms timer.
+        expect(
+          realized.warnings.filter((warning) => warning.includes("Could not inspect git submodules")),
+        ).toEqual([]);
+        expect(
+          operations.some((operation) => operation.metadata?.action === "submodule_inspection_degraded"),
+        ).toBe(false);
+      } finally {
+        if (previousTimeout === undefined) delete process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS;
+        else process.env.PAPERCLIP_WORKSPACE_SUBMODULE_INSPECT_TIMEOUT_MS = previousTimeout;
+      }
+    });
+  });
 
   it("repairs worktree submodules before running provision commands", async () => {
     const { repoRoot, submodulePath } = await createTempRepoWithSubmodule({ removeCheckout: false });
@@ -5419,7 +6428,13 @@ describe("executeProcess (timeout classification)", () => {
     } finally {
       await fs.rm(markerDir, { recursive: true, force: true });
     }
-  }, 15_000);
+    // 40_000, matching the sibling drain-grace case below. This body sleeps a
+    // deliberate 7_500 to prove the descendant stays reaped, so its floor is
+    // ~9.8s (measured 9857ms on a quiet 64-core host, load1 ~11) and the old
+    // 15_000 left only 1.5x -- too thin for a merge-queue shard (BLO-22985).
+    // The `< 5_000` assertion above still enforces reap promptness; this only
+    // bounds a hang.
+  }, 40_000);
 
   it("destroys captured stdio when drain grace expires after a clean exit", async () => {
     // A command can exit 0 while a descendant still owns the inherited pipes.
@@ -5428,12 +6443,27 @@ describe("executeProcess (timeout classification)", () => {
     // until the descendant eventually exits.
     const markerDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-stdio-drain-"));
     const markerPath = path.join(markerDir, "write-after-drain");
+    // The invariant is an ordering one: the call must return on the 2s
+    // PROCESS_STDIO_DRAIN_GRACE_MS rather than waiting for the descendant. The
+    // return budget is therefore derived from that 2s contract and kept
+    // INDEPENDENT of the descendant delay — tying the two together would let any
+    // implementation that returns before the descendant writes pass, however long
+    // its grace had silently grown.
+    //
+    // 7s is 3.5x the contract and 1.5x the 4.65s worst case observed under
+    // merge-queue load (BLO-22985); it fails a grace inflated past ~5s. A tighter
+    // bound is not available: 5s is only 1.07x that observed worst case and would
+    // have failed on the very occurrence this issue was opened for.
+    const DRAIN_GRACE_RETURN_BUDGET_MS = 7_000;
+    // Comfortably above the budget so the two stay decoupled, and above the call's
+    // own timeoutMs so a call that really waits for the descendant trips that too.
+    const DESCENDANT_WRITE_DELAY_MS = 12_000;
     const writerScript = `
       const fs = require("node:fs");
       setTimeout(() => {
         fs.writeSync(1, "late output after drain\\n");
         fs.writeFileSync(${JSON.stringify(markerPath)}, "survived");
-      }, 3500);
+      }, ${DESCENDANT_WRITE_DELAY_MS});
     `;
     const launcherScript = `
       const { spawn } = require("node:child_process");
@@ -5455,16 +6485,25 @@ describe("executeProcess (timeout classification)", () => {
 
       expect(result.code).toBe(0);
       expect(result.timedOut).toBe(false);
-      expect(Date.now() - started).toBeLessThan(3_500);
+      const elapsedMs = Date.now() - started;
+      expect(elapsedMs).toBeLessThan(DRAIN_GRACE_RETURN_BUDGET_MS);
+
+      // Load-independent half of the same ordering invariant: the descendant has
+      // not written yet, so a call that returned only after the descendant's write
+      // fails here regardless of how contended the shard is.
+      await expect(fs.stat(markerPath)).rejects.toMatchObject({ code: "ENOENT" });
 
       // Without destroying the captured streams, the descendant keeps stdout open,
       // writes successfully, and leaves the marker after this call has returned.
-      await new Promise((resolve) => setTimeout(resolve, 2_500));
+      // Wait past the descendant's own write deadline before asserting absence.
+      await new Promise((resolve) =>
+        setTimeout(resolve, DESCENDANT_WRITE_DELAY_MS - elapsedMs + 2_500),
+      );
       await expect(fs.stat(markerPath)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       await fs.rm(markerDir, { recursive: true, force: true });
     }
-  }, 15_000);
+  }, 40_000);
 
   it("reports a clean exit unchanged", async () => {
     const result = await executeProcessForTests({
@@ -5528,9 +6567,18 @@ describe("executeProcess (timeout classification)", () => {
       // child as a clean success once they gain a timeout budget.
       expect(result.code).toBeNull();
       expect(result.processGroupAliveAfterTimeout).toBe(true);
-      // Budget: timeoutMs (50) + SIGTERM->SIGKILL grace (5_000) + the bounded
-      // post-kill liveness wait (750, PROCESS_TIMEOUT_GROUP_LIVENESS_GRACE_MS).
-      expect(elapsed).toBeLessThan(6_500);
+      // Floor: timeoutMs (50) + SIGTERM->SIGKILL grace (5_000) + the bounded
+      // post-kill liveness wait (750, PROCESS_TIMEOUT_GROUP_LIVENESS_GRACE_MS)
+      // = 5_800, all timers -- the child is a stub, so there is no real work in
+      // the span. Measured 5819/5822/5821ms on a quiet 64-core host (load1
+      // ~10-11), i.e. ~20ms of non-timer overhead. The old 6_500 left 679ms of
+      // slack (1.12x): three chained timers only have to fire ~230ms late each
+      // to trip it, and this file's original BLO-22985 ejection was a 33%
+      // overrun on a comparable timer-dominated span. 12_000 is 2.06x the
+      // measured floor and still well inside the 15_000 per-test cap, so a
+      // genuine regression fails here with this message rather than on the
+      // harness timeout.
+      expect(elapsed).toBeLessThan(12_000);
       // Confirms the promise settled purely off the timeout timers: `exit`
       // and `close` handlers were armed but this stub never invoked them.
       expect(listeners.has("exit")).toBe(true);
@@ -6327,6 +7375,163 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     await expect(readGit(worktreePath, ["status", "--porcelain", "--untracked-files=all"])).resolves.not.toBe("");
   }, 20_000);
 
+  it("does not treat the validating issue's own workspace as a rival claimant (BLO-33610)", async () => {
+    const expectedBranch = "PAP-461-recorded";
+    const actualBranch = "PAP-461-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-461",
+      claimant: "none",
+    });
+    // The operator remedy for a poisoned worktree: rebind executionWorkspaceId -> null. That is
+    // exactly the input that used to disable the self-exclusion.
+    await db
+      .update(issues)
+      .set({ executionWorkspaceId: null })
+      .where(eq(issues.id, ids.sourceIssueId));
+
+    const contention = await executionWorkspaceService(db).findGitWorktreeContention({
+      companyId: ids.companyId,
+      worktreePath,
+      liveBranchName: actualBranch,
+      excludingExecutionWorkspaceId: null,
+      excludingSourceIssueId: ids.sourceIssueId,
+    });
+
+    expect(contention).toBeNull();
+  }, 20_000);
+
+  it("still reports a different issue's workspace on the same path as a rival claimant", async () => {
+    const expectedBranch = "PAP-462-recorded";
+    const actualBranch = "PAP-462-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-462",
+      claimant: "none",
+    });
+    await db
+      .update(issues)
+      .set({ executionWorkspaceId: null })
+      .where(eq(issues.id, ids.sourceIssueId));
+
+    // A genuine rival: a different issue, squatting the same worktree path, with a live run.
+    const rivalIssueId = randomUUID();
+    const rivalWorkspaceId = randomUUID();
+    const rivalRunId = randomUUID();
+    const later = new Date(Date.now() + 5_000);
+    await db.insert(heartbeatRuns).values({
+      id: rivalRunId,
+      companyId: ids.companyId,
+      agentId: ids.agentId,
+      invocationSource: "manual",
+      status: "running",
+      startedAt: later,
+      updatedAt: later,
+    });
+    await db.insert(issues).values({
+      id: rivalIssueId,
+      companyId: ids.companyId,
+      projectId: ids.projectId,
+      projectWorkspaceId: ids.projectWorkspaceId,
+      title: "Rival on the same path",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: ids.agentId,
+      identifier: "PAP-998",
+      executionRunId: rivalRunId,
+    });
+    await db.insert(executionWorkspaces).values({
+      id: rivalWorkspaceId,
+      companyId: ids.companyId,
+      projectId: ids.projectId,
+      projectWorkspaceId: ids.projectWorkspaceId,
+      sourceIssueId: rivalIssueId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: expectedBranch,
+      status: "active",
+      cwd: worktreePath,
+      providerRef: worktreePath,
+      baseRef: "HEAD",
+      branchName: expectedBranch,
+      providerType: "git_worktree",
+      lastUsedAt: later,
+      updatedAt: later,
+    });
+
+    const contention = await executionWorkspaceService(db).findGitWorktreeContention({
+      companyId: ids.companyId,
+      worktreePath,
+      liveBranchName: actualBranch,
+      excludingExecutionWorkspaceId: null,
+      excludingSourceIssueId: ids.sourceIssueId,
+    });
+
+    expect(contention).toMatchObject({
+      claimedByWorkspaceId: rivalWorkspaceId,
+      claimedByIssueIdentifier: "PAP-998",
+      activeRun: expect.objectContaining({ id: rivalRunId, status: "running" }),
+    });
+    // A run never contends with itself, on any path.
+    expect(contention?.activeRun?.id).not.toBe(ids.runId);
+  }, 20_000);
+
+  it("lets a self-contending dirty worktree reach the remaining quarantine preconditions", async () => {
+    const expectedBranch = "PAP-463-recorded";
+    const actualBranch = "PAP-463-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-463",
+      claimant: "none",
+    });
+    await db
+      .update(issues)
+      .set({ executionWorkspaceId: null })
+      .where(eq(issues.id, ids.sourceIssueId));
+
+    // The self-contention gate no longer fires, so validation advances to the runtime-service
+    // precondition, which fail-closes on a null workspace id on its own merits. The operator-visible
+    // reason must name that gate, not a claim the issue made against itself.
+    await expect(ensureGitWorktreeBranchCoherent({
+      db,
+      repoRoot,
+      worktreePath,
+      expectedBranchName: expectedBranch,
+      sourceIssue: {
+        id: ids.sourceIssueId,
+        identifier: ids.sourceIdentifier,
+        title: "Repair dirty branch mismatch",
+      },
+      executionWorkspaceId: null,
+      heartbeatRunId: ids.runId,
+      enableWorkspaceDirtyQuarantineRepair: true,
+    })).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          cleanliness: "dirty",
+          contention: null,
+          safeRepair: expect.objectContaining({
+            eligible: false,
+            reason: "dirty quarantine repair requires an execution workspace id for runtime-service checks",
+          }),
+        }),
+      },
+    });
+  }, 20_000);
+
   it("refuses dirty quarantine repair while the execution workspace has an active runtime service", async () => {
     const expectedBranch = "PAP-458-recorded";
     const actualBranch = "PAP-458-live";
@@ -6437,6 +7642,489 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
   }, 20_000);
 
+  // The `/proc` walk exists only on Linux, and the platform gate refuses ahead
+  // of the liveness and age gates -- so without a seam every test of the gates
+  // *around* the scan would assert `unavailable on darwin` rather than what it
+  // means to assert, and a developer on macOS would see reds on a path they did
+  // not touch. Stating the verdict here makes these tests portable and keeps
+  // them about the gate under test. The real walk is not thereby untested: the
+  // live-holder case below runs it for real, on Linux, against a real open fd.
+  function stubLockHolderScan(verdict: LockHolderScan) {
+    setLockHolderScanForTests(async () => verdict);
+  }
+
+  const UNHELD: LockHolderScan = { holders: [] };
+
+  // A run killed mid-`git` leaves a 0-byte index.lock that git never reaps, which
+  // aborted the quarantine repair forever and parked the row on
+  // manual_repair_required (BLO-35981).
+  async function writeIndexLock(worktreePath: string, input: { body: string; ageMs: number }) {
+    const rawLockPath = await readGit(worktreePath, ["rev-parse", "--git-path", "index.lock"]);
+    const lockPath = path.isAbsolute(rawLockPath) ? rawLockPath : path.resolve(worktreePath, rawLockPath);
+    await fs.writeFile(lockPath, input.body, "utf8");
+    // Whole seconds: `utimes` converts a Date to float seconds, so a millisecond
+    // stamp can land as ...431.999 and fail to round-trip through `new Date()`,
+    // which flaked the replaced-lock fixture's own mtime check.
+    const stamp = new Date(Math.floor((Date.now() - input.ageMs) / 1000) * 1000);
+    await fs.utimes(lockPath, stamp, stamp);
+    return lockPath;
+  }
+
+  // Every refusal here reads as "index contention", so asserting only that
+  // cannot tell the gates apart: it stays green if the wrong gate fired, if all
+  // of them were collapsed into one unconditional throw, or if some pre-check
+  // refused before `ensureGitIndexIsUnlocked` was ever reached. Each refusal
+  // test therefore pins the tail that only *its* gate can produce.
+  async function expectIndexLockRefusal(call: Promise<unknown>, distinguishingTail: string) {
+    const caught = await call.then(
+      () => {
+        throw new Error("expected the dirty quarantine repair to be refused, but it resolved");
+      },
+      (error: unknown) => error as { code?: string; resultJson?: Record<string, any> },
+    );
+    expect(caught.code).toBe("workspace_validation_failed");
+    const safeRepair = caught.resultJson?.workspaceValidation?.safeRepair;
+    expect(safeRepair).toMatchObject({ attempted: true, succeeded: false });
+    expect(safeRepair.reason).toContain("index contention");
+    expect(safeRepair.reason).toContain(distinguishingTail);
+  }
+
+  function rescueBranchFromWarnings(warnings: string[] | undefined) {
+    const warning = warnings?.find((entry) => entry.includes("dirty worktree state was quarantined"));
+    return { warning, rescueBranch: warning?.match(/"([^"]+)"/)?.[1] ?? "" };
+  }
+
+  it("breaks a stale 0-byte index lock and completes the dirty quarantine repair", async () => {
+    const expectedBranch = "PAP-468-recorded";
+    const actualBranch = "PAP-468-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-468",
+      claimant: "none",
+    });
+    const lockPath = await writeIndexLock(worktreePath, { body: "", ageMs: 21.5 * 60 * 60 * 1000 });
+    stubLockHolderScan(UNHELD);
+
+    const restored = await restoreDirtyQuarantine({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      ids,
+    });
+
+    expect(restored?.branchName).toBe(expectedBranch);
+    expect(existsSync(lockPath)).toBe(false);
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(expectedBranch);
+    await expect(readGit(worktreePath, ["status", "--porcelain", "--untracked-files=all"])).resolves.toBe("");
+
+    // The lock is moved aside, not deleted: the verdict that it was abandoned is
+    // evidential, so the evidence has to survive being wrong about it.
+    const lockWarning = restored?.warnings.find((entry) => entry.includes("abandoned 0-byte git index lock"));
+    const quarantinedLock = lockWarning?.match(/preserved at "([^"]+)"/)?.[1] ?? "";
+    expect(quarantinedLock).toMatch(/index\.lock\.paperclip-broken-\d{8}T\d{6}Z$/);
+    expect(existsSync(quarantinedLock)).toBe(true);
+    await expect(fs.stat(quarantinedLock).then((entry) => entry.size)).resolves.toBe(0);
+
+    // AC3: assert on recovered file *content*, not on the rescue branch existing.
+    const { rescueBranch } = rescueBranchFromWarnings(restored?.warnings);
+    expect(rescueBranch).toMatch(/^paperclip\/rescue\/PAP-468\/\d{8}T\d{6}Z$/);
+    await expect(readGit(repoRoot, ["show", `${rescueBranch}:untracked.txt`])).resolves.toBe("dirty untracked work");
+    await expect(readGit(repoRoot, ["show", `${rescueBranch}:README.md`])).resolves.toContain("dirty tracked work");
+  }, 20_000);
+
+  it("refuses to break a non-empty index lock however stale it is", async () => {
+    const expectedBranch = "PAP-469-recorded";
+    const actualBranch = "PAP-469-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-469",
+      claimant: "none",
+    });
+    // Aged well past the floor and unheld, so the non-empty gate is the only one
+    // left that can refuse.
+    const lockPath = await writeIndexLock(worktreePath, {
+      body: "in-flight index\n",
+      ageMs: 21.5 * 60 * 60 * 1000,
+    });
+    try {
+      await expectIndexLockRefusal(
+        restoreDirtyQuarantine({ repoRoot, worktreePath, expectedBranch, actualBranch, ids }),
+        "bytes of serialised index state",
+      );
+      expect(existsSync(lockPath)).toBe(true);
+      await expect(fs.readFile(lockPath, "utf8")).resolves.toBe("in-flight index\n");
+    } finally {
+      await fs.rm(lockPath, { force: true });
+    }
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
+  }, 20_000);
+
+  // Straddles GIT_INDEX_LOCK_STALE_MS by 30s either side, so the constant is
+  // pinned rather than merely exercised: the earlier 60s-vs-21.5h pair left it
+  // free to be anything from ~2min to 21h, and `<` free to become `<=`.
+  it("refuses to break a 0-byte index lock 30s under the staleness floor", async () => {
+    const expectedBranch = "PAP-470-recorded";
+    const actualBranch = "PAP-470-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-470",
+      claimant: "none",
+    });
+    // The boundary cases below are written relative to the constant, so they
+    // pin *where the behaviour flips* rather than the number itself -- asserting
+    // the literal would be a change-detector that breaks on deliberate tuning.
+    // The number still has one real invariant worth holding: a floor small
+    // enough to clear a lock a live git only just took makes the whole guard
+    // reckless, and no age argument survives it.
+    expect(GIT_INDEX_LOCK_STALE_MS).toBeGreaterThanOrEqual(5 * 60 * 1000);
+    // Empty and unheld, so the age floor is the only gate left that can refuse.
+    const lockPath = await writeIndexLock(worktreePath, {
+      body: "",
+      ageMs: GIT_INDEX_LOCK_STALE_MS - 30_000,
+    });
+    stubLockHolderScan(UNHELD);
+    try {
+      await expectIndexLockRefusal(
+        restoreDirtyQuarantine({ repoRoot, worktreePath, expectedBranch, actualBranch, ids }),
+        "staleness floor",
+      );
+      expect(existsSync(lockPath)).toBe(true);
+    } finally {
+      await fs.rm(lockPath, { force: true });
+    }
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
+  }, 20_000);
+
+  it("breaks a 0-byte index lock 30s over the staleness floor", async () => {
+    const expectedBranch = "PAP-472-recorded";
+    const actualBranch = "PAP-472-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-472",
+      claimant: "none",
+    });
+    const lockPath = await writeIndexLock(worktreePath, {
+      body: "",
+      ageMs: GIT_INDEX_LOCK_STALE_MS + 30_000,
+    });
+    stubLockHolderScan(UNHELD);
+
+    const restored = await restoreDirtyQuarantine({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      ids,
+    });
+
+    expect(restored?.branchName).toBe(expectedBranch);
+    expect(existsSync(lockPath)).toBe(false);
+  }, 20_000);
+
+  // The Critical-1 guard. Size and mtime are provably *not* evidence of
+  // abandonment -- measured against a live `git add` and a live `git checkout`,
+  // index.lock stays 0 bytes with an mtime frozen at creation for the whole
+  // operation, which is exactly the signature the age floor would clear. An
+  // open descriptor is the signal that actually discriminates, so this fixture
+  // presents the "safe to break" size and age and holds the fd anyway.
+  //
+  // This is the one case that runs the *real* `/proc` walk rather than stubbing
+  // its verdict, so it is the coverage the seam would otherwise cost -- and it
+  // is inherently Linux-only for the same reason the seam exists. Skipped
+  // elsewhere rather than stubbed, because a stubbed `{holders: ["…"]}` would
+  // assert the refusal and prove nothing about the scan that produced it.
+  it.skipIf(process.platform !== "linux")(
+    "refuses to break a stale 0-byte index lock while a live process holds it open",
+    async () => {
+    const expectedBranch = "PAP-473-recorded";
+    const actualBranch = "PAP-473-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-473",
+      claimant: "none",
+    });
+    const lockPath = await writeIndexLock(worktreePath, { body: "", ageMs: 21.5 * 60 * 60 * 1000 });
+    // This test process becomes the live holder, which is the same fd the scan
+    // sees for a real `git` child.
+    const handle = await fs.open(lockPath, "r");
+    try {
+      await expectIndexLockRefusal(
+        restoreDirtyQuarantine({ repoRoot, worktreePath, expectedBranch, actualBranch, ids }),
+        `held open by live pid ${process.pid}`,
+      );
+      expect(existsSync(lockPath)).toBe(true);
+    } finally {
+      await handle.close();
+      await fs.rm(lockPath, { force: true });
+    }
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
+    },
+    20_000,
+  );
+
+  // The liveness scan is the safety argument, so "I could not run it" must not
+  // read as "nobody holds it" -- that would silently degrade the guard back to
+  // the bare size+age heuristic that a live writer also satisfies. This is the
+  // *environmental* way of not knowing: /proc exists and refused, which is a
+  // hardened container or a sandbox policy, and which re-running could resolve.
+  // The static way -- a platform with no /proc at all -- is the case below, and
+  // is much the larger of the two: it is every invocation on every non-Linux
+  // host, not a rare container configuration. Failing closed here parks the
+  // row, which is the defect this change removes, and is still the correct
+  // trade: an unverifiable lock is not one to break.
+  it.skipIf(process.platform !== "linux")(
+    "refuses to break a stale 0-byte index lock when /proc cannot be read",
+    async () => {
+    const expectedBranch = "PAP-475-recorded";
+    const actualBranch = "PAP-475-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-475",
+      claimant: "none",
+    });
+    const lockPath = await writeIndexLock(worktreePath, { body: "", ageMs: 21.5 * 60 * 60 * 1000 });
+
+    // Failing a real readdir rather than stating the verdict, so this covers
+    // the `readdir("/proc")` catch itself -- with the verdict stubbed, deleting
+    // that catch leaves this green. That makes it Linux-only: off Linux the
+    // platform gate refuses ahead of the readdir the spy intercepts, so the
+    // test would assert the wrong refusal. Skipped there rather than stubbed,
+    // which keeps the coverage where it can run instead of trading it away.
+    //
+    // Only /proc fails; every other readdir on the repair path must still work,
+    // or this would pass for the wrong reason.
+    const realReaddir = fs.readdir.bind(fs);
+    const spy = vi.spyOn(fs, "readdir").mockImplementation(((target: any, ...rest: any[]) => {
+      if (target === "/proc") {
+        return Promise.reject(Object.assign(new Error("EACCES: permission denied, scandir '/proc'"), {
+          code: "EACCES",
+        }));
+      }
+      return (realReaddir as any)(target, ...rest);
+    }) as typeof fs.readdir);
+    try {
+      await expectIndexLockRefusal(
+        restoreDirtyQuarantine({ repoRoot, worktreePath, expectedBranch, actualBranch, ids }),
+        "/proc is unreadable",
+      );
+      expect(existsSync(lockPath)).toBe(true);
+    } finally {
+      spy.mockRestore();
+      await fs.rm(lockPath, { force: true });
+    }
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
+    },
+    20_000,
+  );
+
+  // The scan is /proc-only, so on any non-Linux host it cannot run at all and
+  // the break never fires -- every stale lock there still parks the row. That
+  // is a real bound on this fix and this test is what stops it being silent:
+  // the refusal has to name the *platform* rather than blame an unreadable
+  // /proc, because the two differ in the only way an operator reading a parked
+  // row cares about -- whether re-running could ever answer differently.
+  //
+  // It deliberately does NOT fall back to the age floor on this branch. Doing
+  // so would break a lock having established nothing about who holds it, which
+  // is the argument-from-absence this guard was rewritten to stop making, and
+  // it would make that argument on the one platform where the scan that would
+  // have checked is unavailable.
+  it("refuses to break a stale 0-byte index lock on a platform with no /proc", async () => {
+    const expectedBranch = "PAP-476-recorded";
+    const actualBranch = "PAP-476-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-476",
+      claimant: "none",
+    });
+    // Empty, aged past the floor and unheld: every other gate would let this
+    // through, so the platform gate is the only one left that can refuse.
+    const lockPath = await writeIndexLock(worktreePath, { body: "", ageMs: 21.5 * 60 * 60 * 1000 });
+
+    // Deliberately NOT the scan seam. This case passes on every platform
+    // already -- the gate it asserts is reached the same way everywhere -- so
+    // stubbing the verdict would buy no portability and would cost the only
+    // coverage of the platform check inside `lockHolderPids` itself: with the
+    // verdict supplied, deleting that check leaves this test green. Mutating
+    // the global is safe because vitest runs tests within a file sequentially
+    // and nothing here opts into `concurrent`; if that ever changes, this is
+    // the test that has to move to the seam and accept the loss.
+    const realPlatform = process.platform;
+    Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
+    try {
+      await expectIndexLockRefusal(
+        restoreDirtyQuarantine({ repoRoot, worktreePath, expectedBranch, actualBranch, ids }),
+        "liveness scan is unavailable on darwin",
+      );
+      expect(existsSync(lockPath)).toBe(true);
+      await expect(fs.stat(lockPath).then((entry) => entry.size)).resolves.toBe(0);
+    } finally {
+      Object.defineProperty(process, "platform", { value: realPlatform, configurable: true });
+      await fs.rm(lockPath, { force: true });
+    }
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
+  }, 20_000);
+
+  // Every gate above vets an *inode*; the rename names a *path*. Between them
+  // sits the O(processes x fds) /proc walk, so the window is the scan's whole
+  // duration. If the holder releases inside it, a live `git` can take the path
+  // afresh with O_CREAT|O_EXCL -- and renaming then moves *that* live mutex
+  // aside, losing the victim's index write. The ENOENT branch does not cover
+  // it: that is the lock being gone, not replaced.
+  //
+  // The fixture keeps size and mtime identical to the vetted lock and changes
+  // only the inode, so this cannot pass on a size or mtime comparison alone --
+  // `ino` has to be the field doing the work. Replacing it from inside the scan
+  // seam puts the swap exactly where the real race happens.
+  it("refuses to move aside an index lock that was replaced while the scan ran", async () => {
+    const expectedBranch = "PAP-477-recorded";
+    const actualBranch = "PAP-477-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-477",
+      claimant: "none",
+    });
+    const lockPath = await writeIndexLock(worktreePath, { body: "", ageMs: 21.5 * 60 * 60 * 1000 });
+    const vetted = await fs.stat(lockPath);
+    setLockHolderScanForTests(async () => {
+      // Allocated while the original still exists, then renamed over it. An
+      // `rm` followed by a `writeFile` is not enough: ext4 handed back the very
+      // same inode, so the swap was invisible to the guard -- which the
+      // assertion below caught rather than passing vacuously. This is also the
+      // closer model of the race, where a live `git` creates its own lock file.
+      const usurperPath = `${lockPath}.usurper`;
+      await fs.writeFile(usurperPath, "", "utf8");
+      await fs.utimes(usurperPath, new Date(vetted.mtimeMs), new Date(vetted.mtimeMs));
+      await fs.rename(usurperPath, lockPath);
+      const replaced = await fs.stat(lockPath);
+      // Guards the fixture itself: with the inode unchanged the test would
+      // assert nothing, and a vacuous negative control is exactly what this
+      // suite's mutation sweep exists to catch.
+      expect(replaced.ino).not.toBe(vetted.ino);
+      expect(replaced.size).toBe(vetted.size);
+      expect(replaced.mtimeMs).toBe(vetted.mtimeMs);
+      return UNHELD;
+    });
+    try {
+      await expectIndexLockRefusal(
+        restoreDirtyQuarantine({ repoRoot, worktreePath, expectedBranch, actualBranch, ids }),
+        "was replaced while its holder was being determined",
+      );
+      // The replacement -- a live git's mutex, in the case this models -- is
+      // still where its owner left it.
+      expect(existsSync(lockPath)).toBe(true);
+    } finally {
+      await fs.rm(lockPath, { force: true });
+    }
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
+  }, 20_000);
+
+  // The lock's holder finishing inside the /proc walk is the common way it
+  // vanishes mid-repair, and it resolves at the pre-rename re-stat, not at the
+  // rename's ENOENT catch. Rethrowing there would reinstate the permanent park.
+  it("completes the repair when the lock is released while the scan runs", async () => {
+    const expectedBranch = "PAP-478-recorded";
+    const actualBranch = "PAP-478-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-478",
+      claimant: "none",
+    });
+    const lockPath = await writeIndexLock(worktreePath, { body: "", ageMs: 21.5 * 60 * 60 * 1000 });
+    setLockHolderScanForTests(async () => {
+      await fs.rm(lockPath, { force: true });
+      return UNHELD;
+    });
+
+    const restored = await restoreDirtyQuarantine({ repoRoot, worktreePath, expectedBranch, actualBranch, ids });
+
+    expect(restored?.branchName).toBe(expectedBranch);
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(expectedBranch);
+    // Nothing was moved aside, so the repair must not report breaking a lock.
+    expect(restored?.warnings.some((entry) => entry.includes("abandoned 0-byte git index lock"))).toBe(false);
+    const lockDir = await fs.readdir(path.dirname(lockPath));
+    expect(lockDir.filter((name) => name.includes("paperclip-broken"))).toEqual([]);
+  }, 20_000);
+
+  // `--git-path` answers relative (".git/index.lock") for a normal repo and
+  // absolute for a linked worktree. The old code handed the relative answer
+  // straight to `existsSync`, which resolved it against the *server process*
+  // cwd -- so on a project_primary workspace, where the worktree is the repo
+  // root, the guard silently never fired at all. This is the case that change
+  // newly reaches, and nothing else in the suite uses a non-linked repo.
+  it("breaks a stale index lock in a non-linked repo, where the path is relative", async () => {
+    const expectedBranch = "PAP-474-recorded";
+    const actualBranch = "PAP-474-live";
+    const repoRoot = await createTempRepo();
+    await runGit(repoRoot, ["branch", expectedBranch]);
+    await runGit(repoRoot, ["checkout", "-b", actualBranch]);
+    await fs.appendFile(path.join(repoRoot, "README.md"), "dirty tracked work\n", "utf8");
+    await fs.writeFile(path.join(repoRoot, "untracked.txt"), "dirty untracked work\n", "utf8");
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath: repoRoot,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-474",
+      claimant: "none",
+    });
+
+    const rawLockPath = await readGit(repoRoot, ["rev-parse", "--git-path", "index.lock"]);
+    expect(path.isAbsolute(rawLockPath)).toBe(false);
+    const lockPath = await writeIndexLock(repoRoot, { body: "", ageMs: 21.5 * 60 * 60 * 1000 });
+    stubLockHolderScan(UNHELD);
+
+    const restored = await restoreDirtyQuarantine({
+      repoRoot,
+      worktreePath: repoRoot,
+      expectedBranch,
+      actualBranch,
+      ids,
+    });
+
+    expect(restored?.branchName).toBe(expectedBranch);
+    expect(existsSync(lockPath)).toBe(false);
+    const { rescueBranch } = rescueBranchFromWarnings(restored?.warnings);
+    await expect(readGit(repoRoot, ["show", `${rescueBranch}:untracked.txt`])).resolves.toBe("dirty untracked work");
+  }, 20_000);
+
   it("best-effort restores the recorded branch when the rescue commit fails", async () => {
     const expectedBranch = "PAP-460-recorded";
     const actualBranch = "PAP-460-live";
@@ -6476,6 +8164,108 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(expectedBranch);
     await expect(readGit(worktreePath, ["status", "--porcelain", "--untracked-files=all"])).resolves.not.toBe("");
   }, 20_000);
+
+  // BLO-32628: isolates the claimant-contention guard. Every other contended
+  // fixture in the repo — the dirty-quarantine ones above and the
+  // branch-containment suite — ALSO leaves the recorded branch checked out in
+  // the main worktree, so the git-level refusal fires there too and neither can
+  // prove this guard bites. Here the recorded branch is free and the tree is
+  // clean, so contention is the only thing left that can refuse; dropping the
+  // second claimant must flip the very same git state to a successful repair.
+  it("refuses safe repair on a clean diverged worktree that two non-terminal issues claim", async () => {
+    const expectedBranch = "PAP-460-contended-recorded";
+    const actualBranch = "PAP-460-contended-sibling";
+    const repoRoot = await createTempRepo();
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["branch", expectedBranch]);
+    await runGit(repoRoot, ["worktree", "add", "-b", actualBranch, worktreePath, "HEAD"]);
+
+    await runGit(repoRoot, ["checkout", expectedBranch]);
+    await fs.writeFile(path.join(repoRoot, "recorded.txt"), "recorded branch work\n", "utf8");
+    await runGit(repoRoot, ["add", "recorded.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Add recorded branch work"]);
+    // Release the recorded branch: this is what makes the test load-bearing.
+    await runGit(repoRoot, ["checkout", "main"]);
+
+    await fs.writeFile(path.join(worktreePath, "actual.txt"), "actual branch work\n", "utf8");
+    await runGit(worktreePath, ["add", "actual.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Add actual branch work"]);
+
+    // Captured before either attempt: the no-loss guarantee is about this exact
+    // commit surviving, so it must be read while the sibling is still the tip.
+    const actualHeadBefore = await readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]);
+
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-460",
+      claimant: "none",
+    });
+
+    const siblingIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: siblingIssueId,
+      companyId: ids.companyId,
+      projectId: ids.projectId,
+      projectWorkspaceId: ids.projectWorkspaceId,
+      title: "Same-workspace sibling",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: ids.agentId,
+      identifier: "PAP-461",
+      executionWorkspaceId: ids.sourceWorkspaceId,
+    });
+
+    await expect(restoreDirtyQuarantine({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      ids,
+    })).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          cleanliness: "clean",
+          provenance: expect.objectContaining({
+            ancestryVerdict: "diverged",
+            actualBranchExists: true,
+          }),
+          workspaceClaimants: expect.arrayContaining([
+            expect.objectContaining({ issueIdentifier: "PAP-460", status: "in_progress" }),
+            expect.objectContaining({ issueIdentifier: "PAP-461", status: "in_progress" }),
+          ]),
+          safeRepair: expect.objectContaining({
+            eligible: false,
+            attempted: false,
+            succeeded: false,
+            reason: expect.stringContaining("execution workspace is claimed by 2 non-terminal issues"),
+          }),
+        }),
+      },
+    });
+    await expect(readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(actualBranch);
+
+    // Same git state, one claimant: the repair runs and restores the branch.
+    await db.delete(issues).where(eq(issues.id, siblingIssueId));
+    const realized = await restoreDirtyQuarantine({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      ids,
+    });
+    expect(realized?.branchName).toBe(expectedBranch);
+    await expect(readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(expectedBranch);
+    // The sibling ref still resolves to the commit captured before the repair.
+    await expect(readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]))
+      .resolves.toBe(actualHeadBefore);
+  }, 30_000);
 });
 
 describeEmbeddedPostgres("workspace runtime service control persistence", () => {
@@ -7706,5 +9496,47 @@ describe("normalizeAdapterManagedRuntimeServices", () => {
       scopeId: "execution-workspace-1",
       executionWorkspaceId: "execution-workspace-1",
     });
+  });
+});
+
+/**
+ * BLO-31281: `branchTemplate` write-time validation rejects any key outside
+ * EXECUTION_WORKSPACE_BRANCH_TEMPLATE_KEYS, but that list lives in
+ * @paperclipai/shared while the data it describes is built here. Nothing but
+ * this test keeps the two honest, and drift is silent in both directions:
+ * a key present in the data but undeclared gets wrongly rejected at write
+ * time, and a key declared but absent from the data passes validation and
+ * then renders as empty text — which is exactly the failure this ticket is
+ * about.
+ */
+describe("branch template key contract", () => {
+  function leafKeys(value: unknown, prefix = ""): string[] {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      return prefix ? [prefix] : [];
+    }
+    return Object.entries(value as Record<string, unknown>)
+      .flatMap(([key, child]) => leafKeys(child, prefix ? `${prefix}.${key}` : key));
+  }
+
+  const templateData = buildWorkspaceTemplateData({
+    issue: { id: "issue-uuid", identifier: "BLO-31281", title: "Some Title" },
+    agent: { id: "agent-uuid", name: "CTO" },
+    projectId: "project-uuid",
+    repoRef: "master",
+  });
+
+  it("exposes exactly the keys write-time validation accepts", () => {
+    expect(leafKeys(templateData).sort()).toEqual(
+      [...EXECUTION_WORKSPACE_BRANCH_TEMPLATE_KEYS].sort(),
+    );
+  });
+
+  it("resolves every declared key to a non-empty value", () => {
+    for (const key of EXECUTION_WORKSPACE_BRANCH_TEMPLATE_KEYS) {
+      const resolved = key
+        .split(".")
+        .reduce<unknown>((cursor, part) => (cursor as Record<string, unknown>)?.[part], templateData);
+      expect(resolved, `template key ${key} resolved empty`).toBeTruthy();
+    }
   });
 });

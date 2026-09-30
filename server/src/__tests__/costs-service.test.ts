@@ -31,6 +31,9 @@ function makeDb(overrides: Record<string, unknown> = {}) {
     groupBy: vi.fn().mockReturnThis(),
     orderBy: vi.fn().mockReturnThis(),
     limit: vi.fn().mockReturnThis(),
+    // `PATCH /agents/:id/budgets` takes a `SELECT … FOR UPDATE` on the agent's
+    // budget policies before it touches `agents` (BLO-32796 lock ordering).
+    for: vi.fn().mockReturnThis(),
     then: vi.fn().mockResolvedValue([]),
   };
 

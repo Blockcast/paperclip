@@ -23,6 +23,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { canClaimPrReviewTask } from "../services/pr-review-dispatch-lock.ts";
 
 /** What the producer wrote before normalization landed. */
 const LEGACY_TASK_KEY = "pr_review:Blockcast/PiM-Multicast-Gateway:1911";
@@ -169,6 +170,39 @@ describeEmbeddedPostgres("pr_review task key casing transition", () => {
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, existingRunId));
     expect(run?.status).toBe("cancelled");
     expect(run?.errorCode).toBe("task_scope_cancelled");
+  });
+
+  it("refuses the queued-to-running claim when the same PR is already running under the other spelling", async () => {
+    const { companyId, agentId, existingRunId } = await seedReviewerWithLegacyRun();
+    // The dispatch lock only consults *running* runs — this is the final
+    // serialization point before two reviewers work one PR concurrently.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "running" })
+      .where(eq(heartbeatRuns.id, existingRunId));
+
+    // Positive control: the legacy spelling must still see its own run, so a
+    // `false` below cannot be an artefact of the row being unreadable.
+    await expect(
+      db.transaction((tx) => canClaimPrReviewTask(tx, LEGACY_TASK_KEY)),
+    ).resolves.toBe(false);
+
+    // The assignment-wake producer emits the normalized spelling while the
+    // webhook still emits the legacy one. Byte-exact comparison here would let
+    // this claim through and dispatch a second concurrent review of one PR —
+    // the 43ms double dispatch in BLO-20074.
+    await expect(
+      db.transaction((tx) => canClaimPrReviewTask(tx, NORMALIZED_TASK_KEY)),
+    ).resolves.toBe(false);
+
+    // Guard the widening: an unrelated PR must still be claimable, or the fix
+    // would serialize every review against every other.
+    await expect(
+      db.transaction((tx) =>
+        canClaimPrReviewTask(tx, "pr_review:blockcast/pim-multicast-gateway:1912"),
+      ),
+    ).resolves.toBe(true);
+    void companyId;
   });
 
   it("does not treat unrelated non-PR task scopes as case-insensitive", async () => {

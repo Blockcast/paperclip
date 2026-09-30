@@ -15,7 +15,11 @@ import {
   issueComments,
   issueRelations,
   issues,
+  issueWorkProducts,
   projects,
+  routineRuns,
+  routineTriggers,
+  routines,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -30,11 +34,14 @@ import {
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
   JOB_FAILED_HEARTBEAT_RETRY_MAX_ATTEMPTS,
+  K8S_REPLACEMENT_LAUNCH_FAILURE_AFTER_THROTTLE_KEY,
   MAX_TURN_CONTINUATION_RETRY_REASON,
   MAX_TURN_CONTINUATION_WAKE_REASON,
+  describePrReviewGateMergeImpact,
   heartbeatService,
   isRetryableInteractionContinuationInfrastructureFailure,
   probeStaleKillReviewEvidence,
+  resolveAutomaticRunRetryOpts,
   SESSION_UNAVAILABLE_HEARTBEAT_RETRY_DELAY_MS,
   SESSION_UNAVAILABLE_HEARTBEAT_RETRY_MAX_ATTEMPTS,
   shouldScheduleAutomaticRunRetry,
@@ -44,6 +51,7 @@ import {
   TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS,
   TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS,
 } from "../services/ccrotate-capacity-retry.js";
+import { waitForRunToFinish } from "./helpers/wait-for-run-to-finish.js";
 
 /**
  * PEN-2509: a retry floor is no longer adopted verbatim as `dueAt`.
@@ -88,6 +96,25 @@ vi.mock("../telemetry.ts", () => ({
   getTelemetryClient: () => ({ track: vi.fn() }),
 }));
 
+// PEN-3487: the notifier now reads whether its gate context is required on the
+// PR's base branch. Mocked so the assertions below name a branch-protection
+// verdict rather than whatever a credential-less test host happens to return.
+const mockGithubGetPrRequiredStatusContext = vi.hoisted(() =>
+  vi.fn(async (): Promise<
+    import("../services/github-app-auth.ts").PrRequiredStatusContextLookup
+  > => ({ outcome: "unknown", reason: "test_default" })),
+);
+
+vi.mock("../services/github-app-auth.ts", async () => {
+  const actual = await vi.importActual<typeof import("../services/github-app-auth.ts")>(
+    "../services/github-app-auth.ts",
+  );
+  return {
+    ...actual,
+    githubGetPrRequiredStatusContext: mockGithubGetPrRequiredStatusContext,
+  };
+});
+
 vi.mock("@paperclipai/shared/telemetry", async () => {
   const actual = await vi.importActual<typeof import("@paperclipai/shared/telemetry")>(
     "@paperclipai/shared/telemetry",
@@ -126,20 +153,6 @@ if (!embeddedPostgresSupport.supported) {
   console.warn(
     `Skipping embedded Postgres heartbeat retry scheduling tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
   );
-}
-
-async function waitForRunToFinish(
-  heartbeat: ReturnType<typeof heartbeatService>,
-  runId: string,
-  timeoutMs = 5_000,
-) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const run = await heartbeat.getRun(runId);
-    if (run && !["queued", "running"].includes(run.status)) return run;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  return await heartbeat.getRun(runId);
 }
 
 describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
@@ -915,6 +928,133 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(promotedRun?.queuedAt?.toISOString()).toBe(expectedDueAt.toISOString());
   });
 
+  it("bounds a retry owned by a periodic routine and persists the pre-clamp instant", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const sourceRunId = randomUUID();
+    const routineId = randomUUID();
+    const routineRunId = randomUUID();
+    const triggerId = randomUUID();
+    const failedAt = new Date("2026-08-19T00:19:17.166Z");
+    const windowClosesAt = new Date("2026-08-19T06:00:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Routine Retry Test",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(routines).values({
+      id: routineId,
+      companyId,
+      title: "Six-hour routine",
+      assigneeAgentId: agentId,
+    });
+    await db.insert(routineTriggers).values({
+      id: triggerId,
+      companyId,
+      routineId,
+      kind: "schedule",
+      enabled: true,
+      cronExpression: "0 */6 * * *",
+      timezone: "UTC",
+      nextRunAt: windowClosesAt,
+    });
+    await db.insert(routineRuns).values({
+      id: routineRunId,
+      companyId,
+      routineId,
+      triggerId,
+      source: "schedule",
+      status: "issue_created",
+      triggeredAt: new Date("2026-08-19T00:00:00.000Z"),
+      triggerPayload: {
+        __paperclipRoutineWindowClosesAt: windowClosesAt.toISOString(),
+      },
+      linkedIssueId: null,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Routine retry fixture",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}-1`,
+      originKind: "routine_execution",
+      originId: routineId,
+      originRunId: routineRunId,
+    });
+    await db
+      .update(routineRuns)
+      .set({ linkedIssueId: issueId })
+      .where(eq(routineRuns.id, routineRunId));
+    // The trigger has already advanced by the time a delayed execution fails.
+    // Retry resolution must continue using the origin run's saved boundary.
+    await db
+      .update(routineTriggers)
+      .set({ nextRunAt: new Date("2026-08-19T12:00:00.000Z") })
+      .where(eq(routineTriggers.id, triggerId));
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "failed",
+      error: "upstream overload",
+      errorCode: "adapter_failed",
+      finishedAt: failedAt,
+      contextSnapshot: {
+        issueId,
+        wakeReason: "issue_assigned",
+        errorFamily: "transient_upstream",
+        retryNotBefore: "2026-08-20T00:19:17.166Z",
+      },
+      resultJson: {
+        errorFamily: "transient_upstream",
+        retryNotBefore: "2026-08-20T00:19:17.166Z",
+      },
+      updatedAt: failedAt,
+      createdAt: failedAt,
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(sourceRunId, {
+      now: failedAt,
+      random: () => 0,
+    });
+
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+    expect(scheduled.dueAt.toISOString()).toBe("2026-08-19T04:41:19.000Z");
+    expect(scheduled.dueAt.getTime() - failedAt.getTime()).toBeLessThanOrEqual(6 * 60 * 60 * 1000);
+
+    const retryRun = await db
+      .select({ scheduledRetryAt: heartbeatRuns.scheduledRetryAt, contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+    expect(retryRun?.scheduledRetryAt?.toISOString()).toBe("2026-08-19T04:41:19.000Z");
+    expect(retryRun?.contextSnapshot).toMatchObject({
+      routineRetryDecision: "clamp",
+      routineRetryPreClampAt: "2026-08-20T00:19:17.166Z",
+      routineRetryClampedFrom: "2026-08-20T00:19:17.166Z",
+    });
+  });
+
   // BLO-24166 (split from BLO-23699 AC3): a provider blip on 2026-08-08 burned
   // 606 zero-model-turn runs on one agent, and the open question was whether
   // each one kept holding its concurrency slot across its whole retry chain —
@@ -1226,6 +1366,69 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         },
       }),
     ).toBe(true);
+  });
+
+  it("treats explicitly transient adapter timeouts as retry-eligible", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "timeout",
+        resultJson: { errorFamily: "transient_upstream" },
+        contextSnapshot: { wakeReason: "timer" },
+      }),
+    ).toBe(true);
+
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "timeout",
+        resultJson: {},
+        contextSnapshot: { wakeReason: "timer" },
+      }),
+    ).toBe(false);
+  });
+
+  it("limits automatic timeout recovery to one scheduled retry", async () => {
+    const runId = randomUUID();
+    const now = new Date("2026-08-10T19:00:00.000Z");
+    await seedRetryFixture({
+      runId,
+      companyId: randomUUID(),
+      agentId: randomUUID(),
+      now,
+      errorCode: "timeout",
+      errorFamily: "transient_upstream",
+      adapterType: "claude_local",
+      contextSnapshot: { wakeReason: "timer" },
+    });
+
+    const retryOpts = resolveAutomaticRunRetryOpts({
+      errorCode: "timeout",
+      contextSnapshot: { wakeReason: "timer" },
+    });
+    expect(retryOpts).toEqual({ maxAttempts: 1 });
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      random: () => 0.5,
+      ...retryOpts,
+    });
+    expect(scheduled).toMatchObject({ outcome: "scheduled", attempt: 1, maxAttempts: 1 });
+    if (scheduled.outcome !== "scheduled") return;
+
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "timed_out",
+        errorCode: "timeout",
+        resultJson: { errorFamily: "transient_upstream" },
+      })
+      .where(eq(heartbeatRuns.id, scheduled.run.id));
+
+    await expect(
+      heartbeat.scheduleBoundedRetry(scheduled.run.id, {
+        now,
+        random: () => 0.5,
+        ...retryOpts,
+      }),
+    ).resolves.toMatchObject({ outcome: "retry_exhausted", maxAttempts: 1 });
   });
 
   it("schedules accepted interaction continuation infra retries while the issue is in_review", async () => {
@@ -2926,6 +3129,58 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     ).toBe(false);
   });
 
+  // BLO-17938: the concurrency guard's `catch` sibling. Raised before the prompt
+  // bundle is assembled and before any Job exists, so it is retryable on exactly
+  // the same terms as `k8s_concurrent_run_blocked` — and was previously retried
+  // on none, falling through to the adapter_failed/process_lost tail.
+  it("retries k8s_concurrency_guard_unreachable for issue-backed and pr_review runs", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "k8s_concurrency_guard_unreachable",
+        resultJson: {},
+        contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      }),
+    ).toBe(true);
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "k8s_concurrency_guard_unreachable",
+        resultJson: {},
+        contextSnapshot: { reviewKind: "pr_review" },
+      }),
+    ).toBe(true);
+  });
+
+  it("does not retry k8s_concurrency_guard_unreachable without an issue or PR-review context", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "k8s_concurrency_guard_unreachable",
+        resultJson: {},
+        contextSnapshot: {},
+      }),
+    ).toBe(false);
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "k8s_concurrency_guard_unreachable",
+        resultJson: {},
+        contextSnapshot: { wakeReason: "heartbeat_timer" },
+      }),
+    ).toBe(false);
+  });
+
+  // BLO-17938 guardrail pin: widening the guard-unreachable arm must not reach
+  // the job_failed family, whose retry still requires proof nothing began.
+  it("leaves the job_failed adapterInvocationStarted guardrail intact", () => {
+    for (const errorCode of ["job_failed", "oom_killed", "exit_137"]) {
+      expect(
+        shouldScheduleAutomaticRunRetry({
+          errorCode,
+          resultJson: { externalLifecycleRecovery: { adapterInvocationStarted: true } },
+          contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+        }),
+      ).toBe(false);
+    }
+  });
+
   it.each(["job_failed", "oom_killed", "exit_137"])(
     "retries %s only when durable evidence proves adapter invocation never began",
     (errorCode) => {
@@ -3012,6 +3267,51 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     }
   });
 
+  // BLO-34577: a replacement Job launch that failed before its pod ran, after
+  // this run already observed a zero-progress 429, is finalized with the throttle
+  // verdict (provider_throttled_no_progress / rate_limit_exhausted) carrying the
+  // launch failure as an annotation. That verdict is what re-queues the pr_review
+  // -- previously the run kept `k8s_pod_schedule_failed` and the review dropped.
+  describe("BLO-34577 replacement-launch failure after an in-run throttle", () => {
+    const annotation = {
+      [K8S_REPLACEMENT_LAUNCH_FAILURE_AFTER_THROTTLE_KEY]: {
+        errorCode: "k8s_pod_schedule_failed",
+        errorMessage: "Pod scheduling failed: Pod ac-ally-x reached phase=Failed: claude exited 1",
+        throttleAttempts: 2,
+        throttleErrorCode: null,
+      },
+    };
+
+    it("schedules the bounded retry for pr_review and issue contexts once finalized as the throttle", () => {
+      for (const contextSnapshot of [
+        { wakeReason: "github_pr_opened", reviewKind: "pr_review", githubPrNumber: 3212 },
+        { taskKey: "pr_review:Blockcast/pim-multicast-gateway:3212" },
+        { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      ]) {
+        expect(
+          shouldScheduleAutomaticRunRetry({
+            errorCode: "provider_throttled_no_progress",
+            resultJson: { errorFamily: "rate_limit_exhausted", api_error_status: 429, ...annotation },
+            contextSnapshot,
+          }),
+        ).toBe(true);
+      }
+    });
+
+    it("does not retry when the launch failure was recorded verbatim, annotation or not", () => {
+      // Negative control: the fix is the VERDICT, not the annotation. A run that
+      // kept `k8s_pod_schedule_failed` -- and a stale transient family in its
+      // merged resultJson -- still hits the ambiguous-outcome reject first.
+      expect(
+        shouldScheduleAutomaticRunRetry({
+          errorCode: "k8s_pod_schedule_failed",
+          resultJson: { errorFamily: "rate_limit_exhausted", ...annotation },
+          contextSnapshot: { wakeReason: "github_pr_opened", reviewKind: "pr_review", githubPrNumber: 3212 },
+        }),
+      ).toBe(false);
+    });
+  });
+
   // BLO-17456: when a PR-review chain exhausts, the reviewer never posts its
   // required status, so the PR sits on "Expected — waiting for status" forever.
   // These drive the real exhaustion path (no mocks): loadConfig() reads
@@ -3060,8 +3360,17 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       return { events, runId };
     }
 
+    // BLO-34699: `reviewKind`/`prRole` are load-bearing, not decoration. The
+    // seeded `pr_review_output_missing` errorCode is only reachable through
+    // evaluatePrReviewCompletionEvidence, which returns `not_applicable` unless
+    // reviewKind === "pr_review" and prRole is absent or "reviewer" — so a
+    // snapshot without them is a shape production cannot mint. Omitting them
+    // also made the three negative cases below pass vacuously, for the tag
+    // check rather than for the condition each one names.
     const prReviewSnapshot = {
       wakeReason: "github_pr_synchronized",
+      reviewKind: "pr_review",
+      prRole: "reviewer",
       githubPrNumber: 7,
       githubRepoFullName: "Blockcast/hang",
       githubHeadSha: HEAD_SHA,
@@ -3117,6 +3426,223 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
       expect(events.at(-1)?.message).toContain("Bounded retry exhausted");
       expect(events.some((e) => e.message.includes("gate status"))).toBe(false);
+    });
+
+    /**
+     * PEN-3487: the notice this exhaustion posts has to say whether its red gate
+     * actually blocks the merge, because that answer is per-repository and the
+     * reader cannot derive it.
+     *
+     * Measured 2026-09-24: `review/ally-complete` is one of ten required
+     * contexts on Blockcast/penstock-llm-proxy-core, is required on nothing in
+     * Blockcast/paperclip (whose `master` requires exactly `verify`), and
+     * Blockcast/onprem-k8s requires no contexts at all. PEN-3487 itself is the
+     * cost of that ambiguity — filed and escalated as a stranded merge pipeline
+     * on paperclip#1867, which read `mergeable: true` throughout, and paperclip
+     * #1960 merged carrying this exact failed status.
+     *
+     * Seeds an UNASSIGNED linked issue on purpose. The wake path is already
+     * covered in heartbeat-process-recovery.test.ts; what is under test here is
+     * the text of the comment, and an unassigned issue reaches it without
+     * dragging wake dispatch into a retry-scheduling suite.
+     */
+    async function seedIssueLinkedToExhaustedPr(companyId: string) {
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "PEN-3487 gate requiredness is unreadable at the point of reading",
+        status: "in_review",
+        priority: "high",
+        responsibleUserId: "responsible-user",
+        issueNumber: 7,
+        identifier: "TPR-7",
+      });
+      await db.insert(issueWorkProducts).values({
+        companyId,
+        issueId,
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/hang#7",
+        title: "PEN-3487 gate requiredness is unreadable at the point of reading",
+        url: "https://github.com/Blockcast/hang/pull/7",
+        status: "ready_for_review",
+      });
+      return issueId;
+    }
+
+    async function exhaustPrReviewRunWithLinkedIssue() {
+      const runId = randomUUID();
+      const companyId = randomUUID();
+      const now = new Date();
+      await seedRetryFixture({
+        runId,
+        companyId,
+        agentId: randomUUID(),
+        now,
+        errorCode: "pr_review_output_missing",
+        scheduledRetryAttempt: 2,
+        contextSnapshot: prReviewSnapshot,
+      });
+      const issueId = await seedIssueLinkedToExhaustedPr(companyId);
+      const outcome = await heartbeat.scheduleBoundedRetry(runId, {
+        now,
+        retryReason: "transient_failure",
+        wakeReason: "github_pr_synchronized",
+        maxAttempts: 2,
+        delayMs: 1_000,
+      });
+      expect(outcome).toMatchObject({ outcome: "retry_exhausted" });
+      const notices = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId));
+      expect(notices).toHaveLength(1);
+      return notices[0]!.body;
+    }
+
+    it("tells the linked issue the gate does NOT block merge where it is not required (PEN-3487)", async () => {
+      process.env[GATE_CONTEXT_ENV] = "review/ally-complete";
+      mockGithubGetPrRequiredStatusContext.mockResolvedValueOnce({
+        outcome: "not_required",
+        baseRef: "master",
+        branchProtected: true,
+        requiredContexts: ["verify"],
+      });
+
+      const body = await exhaustPrReviewRunWithLinkedIssue();
+
+      // The fact the reader needs, in words, naming the branch it was read on.
+      expect(body).toContain("**not a required status check**");
+      expect(body).toContain("does not block merge");
+      expect(body).toContain("`master`");
+      // ...and what IS required there, so "not this one" is not the whole answer.
+      expect(body).toContain("`verify`");
+      // Neither terminality nor blockage is claimed. Each of these was asserted
+      // by an earlier revision of this notice and each was measured false:
+      // "none is coming"/"terminal outcome"/"not reviewer latency" (BLO-34699),
+      // and a bare red gate reading as a merge block (PEN-3487).
+      expect(body).not.toContain("none is coming");
+      expect(body).not.toContain("terminal outcome");
+      expect(body).not.toContain("not reviewer latency");
+      expect(body).not.toContain("**is a required status check**");
+    });
+
+    it("refuses to say rather than reassuring when branch protection is unreadable (PEN-3487)", async () => {
+      // The one collapse that must never happen: an unread gate is not a
+      // cleared gate. If this degraded to the not_required wording, a throttled
+      // or unauthorized GitHub read would print a confident all-clear over a
+      // context that may well be blocking the merge.
+      process.env[GATE_CONTEXT_ENV] = "review/ally-complete";
+      mockGithubGetPrRequiredStatusContext.mockResolvedValueOnce({
+        outcome: "unknown",
+        reason: "required_context_branch_http_403",
+      });
+
+      const body = await exhaustPrReviewRunWithLinkedIssue();
+
+      expect(body).toContain("**unread**");
+      expect(body).toContain("required_context_branch_http_403");
+      expect(body).not.toContain("not a required status check");
+      expect(body).not.toContain("does not block merge");
+    });
+
+    /**
+     * The `required` branch is the one that asks the reader to ACT, and it was
+     * the only one of the three never positively asserted — the two notice
+     * tests above pin `not_required` and `unknown` exactly and reference the
+     * required wording only as a `.not.toContain`. `describePrReviewGateMergeImpact`
+     * is exported and pure, so all three branches are asserted directly here.
+     */
+    describe("describePrReviewGateMergeImpact", () => {
+      const render = (lookup: Parameters<typeof describePrReviewGateMergeImpact>[0]["lookup"]) =>
+        describePrReviewGateMergeImpact({
+          lookup,
+          context: "review/ally-complete",
+          repoFullName: "Blockcast/penstock-llm-proxy-core",
+        });
+
+      it("says the gate DOES block merge where the context is required", () => {
+        const line = render({
+          outcome: "required",
+          baseRef: "main",
+          requiredContexts: ["review/ally-complete", "verify"],
+          source: "branch_protection",
+        });
+
+        expect(line).toContain("**is a required status check**");
+        expect(line).toContain("does block merge");
+        expect(line).toContain("`main`");
+        // The reassuring reading must be unreachable from this branch.
+        expect(line).not.toContain("does not block merge");
+        expect(line).not.toContain("**unread**");
+      });
+
+      it("names the ruleset when that is the surface requiring it", () => {
+        // A ruleset is precisely the surface a reader cannot see from
+        // `branches/{b}`, so saying which one required it is the actionable
+        // part — it tells them where to look.
+        const line = render({
+          outcome: "required",
+          baseRef: "main",
+          requiredContexts: ["review/ally-complete"],
+          source: "ruleset",
+        });
+
+        expect(line).toContain("**is a required status check**");
+        expect(line).toContain("ruleset");
+      });
+
+      it("refuses to claim either way when the lookup is unknown", () => {
+        const line = render({ outcome: "unknown", reason: "required_context_rules_http_500", baseRef: "main" });
+
+        expect(line).toContain("**unread**");
+        expect(line).toContain("required_context_rules_http_500");
+        // `baseRef` survives onto the unknown variant so the notice can name
+        // the branch it failed to read.
+        expect(line).toContain("`main`");
+        expect(line).not.toContain("does not block merge");
+        expect(line).not.toContain("**is a required status check**");
+      });
+
+      it("states not_required only about a branch where both surfaces were read", () => {
+        const line = render({
+          outcome: "not_required",
+          baseRef: "master",
+          branchProtected: true,
+          requiredContexts: [],
+        });
+
+        expect(line).toContain("**not a required status check**");
+        expect(line).toContain("does not block merge");
+        // The load-bearing sentence names the surfaces actually read, so it
+        // cannot be mistaken for a classic-protection-only answer.
+        expect(line).toContain("any ruleset in effect");
+      });
+    });
+
+    // BLO-34699: the PR author's own agent is woken by its own review-request
+    // marker (BLO-19522) and carries the same repo/head/PR identity as the
+    // reviewer, so before the resolver read these tags a crashed author run was
+    // published as the reviewer's verdict on the head. Asserted at the call
+    // site, not only over the pure predicate: this is the case that must
+    // enqueue no `github_commit_status` delivery at all. One row per guard
+    // clause so neither can hide behind the other under mutation (BLO-34263) —
+    // `measured` is the shape seen on pim-multicast-gateway#3237.
+    it.each([
+      { label: "measured author shape (no reviewKind)", overrides: { reviewKind: undefined, prRole: "author" } },
+      { label: "author run that is tagged pr_review", overrides: { prRole: "author" } },
+    ])("writes no gate-status event for the PR author's own run — $label", async ({ overrides }) => {
+      process.env[GATE_CONTEXT_ENV] = "review/ally-complete";
+      const { events } = await exhaustPrReviewRun({ ...prReviewSnapshot, ...overrides });
+
+      expect(events.at(-1)?.message).toContain("Bounded retry exhausted");
+      expect(events.some((e) => e.message.includes("gate status"))).toBe(false);
+      const deliveries = await db
+        .select()
+        .from(githubCommitStatusDeliveries)
+        .where(eq(githubCommitStatusDeliveries.sha, HEAD_SHA));
+      expect(deliveries).toHaveLength(0);
     });
   });
 

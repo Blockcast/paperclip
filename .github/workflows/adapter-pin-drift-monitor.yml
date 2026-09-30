@@ -1,0 +1,54 @@
+name: Adapter Pin Drift Monitor
+
+on:
+  schedule:
+    # Hourly, off the :00/:09/:17/:23/:41/:43 marks the other scheduled guards
+    # already occupy, so this does not pile onto the same runner burst.
+    - cron: "31 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# BLO-33204. The PR-time guard in `pr.yml` catches someone PINNING an already
+# unreachable commit. It could not have caught the incident that motivated it,
+# and this workflow is the half that does.
+#
+# The pin rots RETROACTIVELY, from another repository, with no commit here:
+#
+#   2026-09-09        paperclip pins 87a865de — reachable, PR gate green, correct
+#   2026-09-10 08:15Z adapter PR #62 squash-merges as 2075ae1b, orphaning 87a865de
+#   2026-09-10 17:35Z a build finally misses the vendor cache and dies with
+#                     `fatal: unable to read tree (87a865de...)`, exit 128
+#
+# Nothing in this repo changed between those lines, so no push-, PR-, or
+# merge_group-triggered job existed to notice. `master-health.yml` does not
+# help either: it triggers on push to master, and the breaking event was a
+# merge in a repo it never looks at.
+#
+# The 9h15m gap is not latency, it is invisibility. The failure is CACHE-timed,
+# not commit-timed: builds reusing a `vendor` layer created before the squash
+# keep passing, so master reads healthy while every cache-missing build fails —
+# including a `workflow_dispatch` at an older SHA that had already built green.
+# By the time CI says anything, the whole deploy path is already broken.
+#
+# Same shape as `lockfile-drift-monitor.yml`, and the same reasoning as its
+# header: a pre-merge gate does not verify that master STAYS consistent
+# afterward. The difference here is that the drift originates outside the repo
+# entirely, so a schedule is not a backstop for the PR gate — it is the only
+# surface that can observe this class at all.
+jobs:
+  check-master-adapter-pin-reachable:
+    runs-on: default
+    timeout-minutes: 5
+    steps:
+      - name: Checkout master
+        uses: actions/checkout@v5
+        with:
+          ref: master
+
+      - name: Check opencode_k8s adapter pin is still reachable
+        # Fails closed on a definite orphan; emits a ::warning and passes when
+        # the probe itself cannot run, so a transient network fault does not
+        # page anyone. See the script header for that asymmetry.
+        run: node ./scripts/check-opencode-k8s-pin-reachable.mjs

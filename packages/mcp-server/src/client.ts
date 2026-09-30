@@ -162,6 +162,22 @@ export class PaperclipApiClient {
   }
 
   async requestJson<T>(method: string, path: string, options: JsonRequestOptions = {}): Promise<T> {
+    return (await this.requestJsonWithHeaders<T>(method, path, options)).data;
+  }
+
+  /**
+   * As {@link requestJson}, but also surfaces the response headers.
+   *
+   * BLO-33741: `GET /companies/:id/issues` reports truncation through
+   * `X-Result-Truncated`/`X-Applied-Limit` because its body is a bare array
+   * with nowhere to carry a flag. A tool that drops the headers cannot tell a
+   * full page from a capped one, which is the whole defect.
+   */
+  async requestJsonWithHeaders<T>(
+    method: string,
+    path: string,
+    options: JsonRequestOptions = {},
+  ): Promise<{ data: T; headers: Headers }> {
     if (!path.startsWith("/")) {
       throw new Error(`API path must start with "/": ${path}`);
     }
@@ -199,6 +215,9 @@ export class PaperclipApiClient {
       });
     }
 
-    return absolutizePaperclipLinksInJson(parsedBody, paperclipPublicBaseUrl(this.config)) as T;
+    return {
+      data: absolutizePaperclipLinksInJson(parsedBody, paperclipPublicBaseUrl(this.config)) as T,
+      headers: response.headers,
+    };
   }
 }

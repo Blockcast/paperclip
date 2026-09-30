@@ -31,33 +31,30 @@
  * publish. The workflow that calls this is `workflow_dispatch`-only, so nothing
  * publishes on push.
  *
- * PROVENANCE / WHY `--publish` DOES NOT WORK IN CI TODAY
+ * PROVENANCE / WHY THIS PUBLISHES WITHOUT AN ATTESTATION
  * ------------------------------------------------------
- * `--provenance` is not a switch for whether an attestation is minted. These
- * packages have a Trusted Publisher configured on npm, and trusted publishing
- * signs a sigstore provenance statement UNCONDITIONALLY once the CLI can reach an
- * OIDC token. Verified: run 32354111699 invoked `npm publish --access public`
- * with no provenance flag and npm still logged "Signed provenance statement with
- * source and build information from GitHub Actions", then failed:
+ * `--provenance` is not a switch for whether an attestation is minted. Trusted
+ * publishing signs one UNCONDITIONALLY once the CLI can reach an OIDC token —
+ * verified by run 32354111699, which passed no flag and still signed, then failed:
  *
  *   422 Unprocessable Entity - Error verifying sigstore provenance bundle:
  *   Unsupported GitHub Actions runner environment: "self-hosted".
- *   Only "github-hosted" runners are supported when publishing with provenance.
  *
- * And a GitHub-hosted runner is rejected by scripts/check-github-runner-labels.mjs
- * (ARC-only ALLOWED_RUNNERS, no exemption). So `--publish` from this repo's CI is
- * a dead end until either the Trusted Publisher is removed in favour of a token,
- * or a hosted label is added to that allowlist. Do not re-litigate this by
- * toggling flags — the flag was already removed and it changed nothing.
+ * The release workflow therefore does NOT request `id-token: write`. With no OIDC
+ * token reachable, npm cannot attempt trusted publishing, mints no attestation,
+ * and authenticates from NPM_TOKEN instead. The PERMISSION is the switch, not the
+ * flag — PR #1428 removed the flag and changed nothing; PR #1523 corrected that.
  *
- * `--bootstrap` is therefore the working release path: it publishes with a local
- * `npm login` + 2FA and no OIDC, so no attestation is minted and no runner is
- * involved. It is no longer "one-time"; it is how releases ship.
+ * Consequence: published @penstock/* tarballs carry no provenance. That is a real
+ * (accepted) tradeoff of publishing from self-hosted runners, not an oversight.
+ *
+ * `--bootstrap` remains the local path: `npm login` + 2FA, no OIDC, no runner. Use
+ * it for a package's FIRST publish (npm cannot create a new package from CI).
  *
  * Usage:
  *   node scripts/publish-penstock-scope.mjs --version 2026.614.0            # dry-run (default)
- *   node scripts/publish-penstock-scope.mjs --version 2026.614.0 --bootstrap # local 2FA publish — THE working path
- *   node scripts/publish-penstock-scope.mjs --version 2026.614.0 --publish   # CI/OIDC — currently 422s on ARC
+ *   node scripts/publish-penstock-scope.mjs --version 2026.614.0 --bootstrap # local 2FA (first publish of a new package)
+ *   node scripts/publish-penstock-scope.mjs --version 2026.614.0 --publish   # CI, token auth (the release workflow)
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";

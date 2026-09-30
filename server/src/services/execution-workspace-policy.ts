@@ -35,6 +35,15 @@ function cloneRecord(value: Record<string, unknown> | null | undefined): Record<
   return { ...value };
 }
 
+// Distinguishes "an object whose fields can be overlaid one by one" from a
+// scalar/array/null, which can only replace wholesale. parseObject is not usable
+// here: it maps every non-object to `{}`, which would make a `null` overlay
+// indistinguishable from an empty one and silently turn an explicit clear into
+// an inherit.
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function parseExecutionWorkspaceStrategy(raw: unknown): ExecutionWorkspaceStrategy | null {
   const parsed = parseObject(raw);
   const type = asString(parsed.type, "");
@@ -355,20 +364,59 @@ export function buildExecutionWorkspaceAdapterConfig(input: {
  * Returns `{ present: false }` when no layer supplies a strategy, which is
  * distinct from supplying an empty one: the caller must delete the key rather
  * than write `undefined`.
+ *
+ * BLO-23144 (1): the overlay is applied FIELD BY FIELD, not wholesale. This
+ * function used to mirror the outer shallow spread exactly — an overlay
+ * `workspaceStrategy` replaced the policy-resolved one entirely. But
+ * `workspaceStrategy` is an object, so an issue override that only meant to
+ * retarget one field (`{ type: "git_worktree", baseRef: "release" }`) also
+ * silently dropped every field it failed to mention — including `runScope`.
+ * An agent configured fleet-wide as `per_run` therefore reverted to `per_issue`
+ * for any issue carrying its own strategy, with nothing in the config or the
+ * logs saying so. That is the same silent-downgrade shape as the bug PR #1154
+ * fixed one level up: isolation that reads as configured and delivers none.
+ *
+ * Explicit still beats implicit — an overlay that names `runScope: "per_issue"`
+ * genuinely downgrades, because its own key wins the field-level spread. Only
+ * *omission* now inherits instead of clearing.
+ *
+ * A non-object overlay value (`null`, a string, an array) still replaces
+ * wholesale: that is an explicit clear/reset, and merging into it is not
+ * meaningful. So does an overlay that switches `type`: field-wise inheritance
+ * only makes sense between two descriptions of the same strategy type.
  */
 export function resolveOverlaidWorkspaceStrategy(input: {
   baseConfig: Record<string, unknown>;
   issueAdapterConfig: Record<string, unknown> | null | undefined;
 }): { present: boolean; value: unknown } {
-  // Mirror shallow-spread semantics exactly: an own key on the overlay wins even
-  // when its value is `undefined`, because `{...base, ...overlay}` would too.
-  if (input.issueAdapterConfig && Object.hasOwn(input.issueAdapterConfig, "workspaceStrategy")) {
-    return { present: true, value: input.issueAdapterConfig.workspaceStrategy };
+  // Presence is tracked with Object.hasOwn rather than a value check so an own
+  // key set to `undefined` still counts as supplied, exactly as `{...base,
+  // ...overlay}` would treat it.
+  const overlaySupplies = Boolean(input.issueAdapterConfig)
+    && Object.hasOwn(input.issueAdapterConfig as Record<string, unknown>, "workspaceStrategy");
+  const baseSupplies = Object.hasOwn(input.baseConfig, "workspaceStrategy");
+  if (!overlaySupplies && !baseSupplies) return { present: false, value: undefined };
+  if (!overlaySupplies) return { present: true, value: input.baseConfig.workspaceStrategy };
+  const overlayValue = (input.issueAdapterConfig as Record<string, unknown>).workspaceStrategy;
+  if (!baseSupplies) return { present: true, value: overlayValue };
+  const baseValue = input.baseConfig.workspaceStrategy;
+  if (!isPlainRecord(baseValue) || !isPlainRecord(overlayValue)) {
+    return { present: true, value: overlayValue };
   }
-  if (Object.hasOwn(input.baseConfig, "workspaceStrategy")) {
-    return { present: true, value: input.baseConfig.workspaceStrategy };
-  }
-  return { present: false, value: undefined };
+  // The field-wise merge is only meaningful while both layers describe the
+  // *same* strategy type. Each `type` has its own field set, so an overlay that
+  // switches type would otherwise inherit the previous type's leftovers — a
+  // `project_primary` strategy still carrying `worktreeParentDir` and
+  // `runScope`. `parseExecutionWorkspaceStrategy` whitelists fields without
+  // cross-checking them against `type`, so nothing downstream would reject it.
+  // A type switch is a fresh start, exactly as the pre-BLO-23144 wholesale
+  // replace gave it; only same-type overlays inherit by omission. An overlay
+  // that omits `type` is not a switch — it inherits the base type, which is the
+  // BLO-23144 case this whole function exists for.
+  const switchesType = Object.hasOwn(overlayValue, "type")
+    && overlayValue.type !== baseValue.type;
+  if (switchesType) return { present: true, value: overlayValue };
+  return { present: true, value: { ...baseValue, ...overlayValue } };
 }
 
 /**
@@ -406,4 +454,42 @@ export function executionWorkspaceUsesPerRunScope(input: {
     issueAdapterConfig: input.issueAdapterConfig,
   });
   return asString(parseObject(strategy.value).runScope, "") === "per_run";
+}
+
+/**
+ * BLO-31443: will this run work in a durable git worktree, resolved the same
+ * way realization resolves it?
+ *
+ * Deliberately mode-INDEPENDENT, because "a worktree exists" and "workspace
+ * isolation was requested" are different questions and the divergence is
+ * reachable three ways: `buildExecutionWorkspaceAdapterConfig` only strips
+ * `workspaceStrategy` for non-isolated modes when `hasWorkspaceControl` holds,
+ * the issue `adapterConfig` overlay can re-introduce it after that strip, and
+ * `realizeExecutionWorkspace` itself branches solely on
+ * `workspaceStrategy.type !== "git_worktree"` and never consults the mode. So
+ * an agent-level or issue-level strategy yields a real worktree while
+ * `workspaceIsolationRequested` (mode-derived) reads false.
+ *
+ * `buildK8sRunIsolationDescriptor` already follows that same principle for
+ * `workspaceRoot` — it keys `hasProvisionedWorktree` off the realized strategy
+ * and warns against trusting workspace *intent*. This predicate is the
+ * pre-realization half of it, needed because the writer reservation is bound
+ * long before a strategy is realized.
+ *
+ * The `=== "git_worktree"` comparison matches `realizeExecutionWorkspace`,
+ * which treats every other value as `project_primary`.
+ */
+export function executionWorkspaceUsesGitWorktree(input: {
+  agentConfig: Record<string, unknown>;
+  projectPolicy: ProjectExecutionWorkspacePolicy | null;
+  issueSettings: IssueExecutionWorkspaceSettings | null;
+  mode: ParsedExecutionWorkspaceMode;
+  legacyUseProjectWorkspace: boolean | null;
+  issueAdapterConfig?: Record<string, unknown> | null;
+}): boolean {
+  const strategy = resolveOverlaidWorkspaceStrategy({
+    baseConfig: buildExecutionWorkspaceAdapterConfig(input),
+    issueAdapterConfig: input.issueAdapterConfig,
+  });
+  return asString(parseObject(strategy.value).type, "") === "git_worktree";
 }

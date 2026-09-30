@@ -46,6 +46,9 @@ describe("issueApprovalService", () => {
   });
 
   it("structurally redacts hire approval payloads linked to issues", async () => {
+    // `includeAgentConfig` is the caller's `agent_config:read` verdict (PEN-2777);
+    // this case is about the credential redaction underneath it, so it asserts
+    // the granted branch.
     const result = await issueApprovalService(dbForLinkedApprovals([{
       id: "approval-2",
       companyId: "company-1",
@@ -62,7 +65,7 @@ describe("issueApprovalService", () => {
       status: "pending",
       createdAt: new Date("2026-07-30T00:00:00.000Z"),
       updatedAt: new Date("2026-07-30T00:00:00.000Z"),
-    }]) as any).listApprovalsForIssue("issue-1");
+    }]) as any).listApprovalsForIssue("issue-1", { includeAgentConfig: true });
 
     expect(result[0]?.payload).toEqual({
       name: "Worker",
@@ -73,5 +76,39 @@ describe("issueApprovalService", () => {
         },
       },
     });
+  });
+
+  it("withholds hire agent config by default, so a caller that never resolved the grant discloses no topology", async () => {
+    const result = await issueApprovalService(dbForLinkedApprovals([{
+      id: "approval-3",
+      companyId: "company-1",
+      type: "hire_agent",
+      payload: {
+        name: "Worker",
+        adapterConfig: {
+          mcpServers: { k8s: { url: "https://svc@k8s-mcp-admin.internal:8443/mcp" } },
+        },
+        requestedConfigurationSnapshot: {
+          adapterType: "claude_k8s",
+          adapterConfig: {
+            mcpServers: { k8s: { url: "https://svc@k8s-mcp-admin.internal:8443/mcp" } },
+          },
+        },
+      },
+      status: "pending",
+      createdAt: new Date("2026-08-31T00:00:00.000Z"),
+      updatedAt: new Date("2026-08-31T00:00:00.000Z"),
+    }]) as any).listApprovalsForIssue("issue-1");
+
+    expect(JSON.stringify(result[0]?.payload)).not.toContain("k8s-mcp-admin.internal");
+    expect(result[0]?.payload).toEqual({
+      name: "Worker",
+      adapterConfig: {},
+      requestedConfigurationSnapshot: { adapterType: "claude_k8s", adapterConfig: {} },
+    });
+    expect(result[0]?.withheldFields).toEqual([
+      "adapterConfig",
+      "requestedConfigurationSnapshot.adapterConfig",
+    ]);
   });
 });

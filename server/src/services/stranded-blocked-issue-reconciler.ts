@@ -13,7 +13,11 @@
  * their own wake/repair path: pending interactions or approvals, latest-agent
  * comments that are waiting on the user, executive hold comments, workspace
  * preflight failures, active source-scoped recovery actions, convergence-stall
- * guards, and monitor gate waits.
+ * guards, monitor gate waits, and — since BLO-30445 — a two-line external-wait
+ * declaration in the description. That last one has no wake path by design (a
+ * human-only gate does not move on a timer), so its path out is the blocked
+ * inbox, which surfaces it as `external_wait` with the declared owner and
+ * action rather than as a stalled row.
  *
  * `blocked` -> `todo` is the target status, per BLO-21523's accepted safe
  * default (not the issue's pre-block status).

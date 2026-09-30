@@ -1,4 +1,6 @@
 {{- include "paperclip.validateGithubReviewGate" . }}
+{{- include "paperclip.validateSharedEnvExtra" . }}
+{{- include "paperclip.validateWorkerExtraEnv" . }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -457,7 +459,17 @@ spec:
               EOF
               cat > "${LOCAL_BIN}/github-mcp-server" <<'EOF'
               #!/bin/sh
-              exec /paperclip/.local/bin/paperclip-github-token-env /usr/local/bin/github-mcp-server "$@"
+              # PEN-3152: the SECOND egress door. The `gh` wrapper above was the
+              # whole of PEN-2527's coverage, but github-mcp-server is an
+              # independent path to the same destination holding the same seat
+              # token, and it runs the complete (default) toolset — so
+              # add_issue_comment / pull_request_review_write / create_pull_request
+              # / create_or_update_file / push_files all published model-authored
+              # text unscrubbed. The scrub runtime goes INSIDE the token wrapper so
+              # the server still inherits GITHUB_PERSONAL_ACCESS_TOKEN, exactly as
+              # before; the only change to its environment is that its stdin now
+              # arrives scrubbed. Do not "simplify" this back to a direct exec.
+              exec /paperclip/.local/bin/paperclip-github-token-env /usr/local/bin/node /opt/paperclip-bundled-adapters/node_modules/@paperclipai/adapter-utils/dist/github-mcp-egress-runtime.js /usr/local/bin/github-mcp-server "$@"
               EOF
               cat > "${LOCAL_BIN}/git" <<'EOF'
               #!/bin/sh
@@ -473,7 +485,28 @@ spec:
                 "${LOCAL_BIN}/github-mcp-server" \
                 "${LOCAL_BIN}/git"
               chown 1000:1000 "${LOCAL_BIN}" "${LOCAL_BIN}"/* 2>/dev/null || true
+
+              # PEN-2527: ${LOCAL_BIN} is only prepended to PATH by ${BASE}/.profile
+              # and ${BASE}/.bashrc, which a *login* shell sources. Agent tool
+              # harnesses spawn non-login, non-interactive shells, so there `gh`
+              # resolves straight to /usr/bin/gh and the egress scrubber above is
+              # never reached — the choke point exists but sits off the traffic
+              # path. ${BASE}/bin is placed ahead of /usr/bin by the container
+              # PATH the chart sets ("paperclip.runtimePath"), for every shell,
+              # so publish `gh` there too. That PATH is chart-managed rather than
+              # image-supplied or set per-overlay on purpose: while it lived only
+              # in values.blockcast.yaml, every other deployment of this chart
+              # resolved `gh` to the unscrubbed image CLI.
+              #
+              # A symlink rather than a second copy: one canonical wrapper file
+              # stays the only thing to edit, so the two locations cannot drift
+              # into two different rules.
+              PATH_BIN="${BASE}/bin"
+              mkdir -p "${PATH_BIN}"
+              ln -sf "${LOCAL_BIN}/gh" "${PATH_BIN}/gh"
+              chown -h 1000:1000 "${PATH_BIN}/gh" 2>/dev/null || true
               echo "seed: installed fresh-read GitHub token wrappers in ${LOCAL_BIN}"
+              echo "seed: published egress-scrubbing gh on the default PATH at ${PATH_BIN}/gh"
 
               # Seed a project-scope .mcp.json at $HOME (CWD for k8s Job pods is
               # /paperclip by default — matches PAPERCLIP_HOME) so every claude
@@ -832,6 +865,10 @@ spec:
               value: {{ .Values.env.serveUi | quote }}
             - name: PAPERCLIP_HOME
               value: {{ .Values.persistence.mountPath | quote }}
+            # Keeps the seeded GitHub egress wrappers ahead of /usr/bin for every
+            # shell, login or not. See "paperclip.runtimePath" (PEN-2527).
+            - name: PATH
+              value: {{ include "paperclip.runtimePath" . | quote }}
             - name: PAPERCLIP_INSTANCE_ID
               value: {{ .Values.env.instanceId | quote }}
             {{- if .Values.runtimeCache.enabled }}
@@ -913,8 +950,17 @@ spec:
             - name: PAPERCLIP_PR_COMMENT_REVIEW_GATE_STATUS_CONTEXT
               value: {{ . | quote }}
             {{- end }}
+            {{- with ((.Values.githubApp).prCommentReviewGateRetiredStatusContexts) }}
+            - name: PAPERCLIP_PR_COMMENT_REVIEW_GATE_RETIRED_STATUS_CONTEXTS
+              value: {{ . | quote }}
             {{- end }}
+            {{- end }}
+            - name: PAPERCLIP_EVIDENCE_UNLABELED_BLOCK
+              value: {{ include "paperclip.evidenceGateUnlabeledTruthBlock" . }}
             {{- with .Values.env.extra }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- with .Values.worker.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           livenessProbe:

@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
-import type { Db } from "@paperclipai/db";
+import { restoreWithheldPipelineStageConfig } from "../redaction.js";
+import type { Db, DbTransaction } from "@paperclipai/db";
 import {
   agentWakeupRequests,
   agents,
@@ -53,6 +54,7 @@ import { logActivity } from "./activity-log.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { authorizationService } from "./authorization.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
+import { redactRunError } from "../redaction.js";
 import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
 import {
   formatPipelineCaseOutputContextMarkdown,
@@ -177,7 +179,7 @@ export type PipelineAutomationExecutionResult =
   | { status: "succeeded"; execution: typeof pipelineAutomationExecutions.$inferSelect }
   | { status: "failed"; execution: typeof pipelineAutomationExecutions.$inferSelect };
 
-type PipelineDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
+type PipelineDb = Db | DbTransaction;
 
 type PipelineRetryPlanInternal = PipelineAutomationRetryPlan & {
   targetStageRow: typeof pipelineStages.$inferSelect | null;
@@ -3149,7 +3151,7 @@ export function pipelineService(
       .set({
         status: "cancelled",
         finishedAt: now,
-        error: cancellationReason,
+        error: redactRunError(cancellationReason),
         errorCode: "pipeline_stage_exited",
         updatedAt: now,
       })
@@ -3162,6 +3164,15 @@ export function pipelineService(
     const runningRuns = await tx
       .update(heartbeatRuns)
       .set({
+        // pen3153-scrub-exempt: the written value is a server-generated ISO
+        // timestamp, and this is a drizzle `SQL` fragment rather than a JS
+        // value — `jsonb_set` merges the key in-database, so no adapter- or
+        // provider-derived text passes through this statement. Wrapping the
+        // fragment in the scrub would be a silent no-op (the entry point
+        // returns non-object input unchanged) that reads as coverage while
+        // guarding nothing. The pre-existing bytes this merges INTO were
+        // scrubbed by the write that persisted them; rows written before
+        // PEN-3153 are the forward-only gap tracked on PEN-3158.
         resultJson: sql`jsonb_set(
           coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb),
           '{pipelineStageExitCancellationRequestedAt}',
@@ -4345,13 +4356,20 @@ export function pipelineService(
     }) {
       await getPipelineOrThrow(db, input.companyId, input.pipelineId);
       const existing = await getStageOrThrow(db, input.pipelineId, input.stageId);
+      // PEN-3266: the pipeline editor round-trips the stage config, so a caller that read this stage
+      // WITHOUT `workspace_runtime:read` holds the masked sentinel where the operator-authored command
+      // is, and saving any unrelated field would otherwise persist that sentinel over the real command.
+      // Restore from the stored row before anything downstream reads the patch.
+      const patchConfig = input.patch.config === undefined
+        ? undefined
+        : restoreWithheldPipelineStageConfig(input.patch.config, stageConfig(existing)) as PipelineStageConfig;
       const kind = normalizeStageKind(input.patch.kind ?? existing.kind);
       const previousRoutineId = stageAutomationRoutineIdFromConfig(stageConfig(existing));
-      const automationRequest = input.patch.config !== undefined
-        ? readStageAutomationRequest(input.patch.config)
+      const automationRequest = patchConfig !== undefined
+        ? readStageAutomationRequest(patchConfig)
         : null;
       const stageName = input.patch.name ?? existing.name;
-      let config = normalizeStageConfig(kind, input.patch.config !== undefined ? input.patch.config : stageConfig(existing));
+      let config = normalizeStageConfig(kind, patchConfig !== undefined ? patchConfig : stageConfig(existing));
       if (automationRequest) {
         config = reconcilePipelineStageConfigVariables(config, [
           automationRequest.titleTemplate ?? PIPELINE_AUTOMATION_DEFAULT_TITLE_TEMPLATE,

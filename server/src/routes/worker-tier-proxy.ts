@@ -22,7 +22,9 @@ import { Readable } from "node:stream";
 import type { IncomingHttpHeaders } from "node:http";
 import type { Request, RequestHandler, Router } from "express";
 import { logger } from "../middleware/logger.js";
+import { urlForLog } from "../middleware/http-log-policy.js";
 import { assertBoardOrgAccess } from "./authz.js";
+import { recordWorkerTierProxyFailure } from "../services/metrics.js";
 
 /**
  * Plugin routes whose handlers reach pluginWorkerManager.{startWorker,
@@ -181,6 +183,13 @@ async function fetchWithStartupRetry(
   targetUrl: string,
   init: RequestInit,
   retry: boolean,
+  // Logged in place of `targetUrl`, which carries the caller-supplied query
+  // string. REQUIRED, and ordered ahead of the optional `retryBudgetMs` so it
+  // can be: the compiler is what stops a new caller from reintroducing the
+  // leak (PEN-2996), rather than a runtime placeholder nothing can test. It
+  // deliberately has no default — defaulting to `targetUrl` would make the
+  // leak silently reappear for any caller that forgot to pass it.
+  targetUrlForLog: string,
   retryBudgetMs?: number,
 ): Promise<Response> {
   let attempt = 0;
@@ -199,7 +208,7 @@ async function fetchWithStartupRetry(
       if (remainingBudgetMs <= 0) throw err;
       const nextRetryMs = Math.min(backoffMs, remainingBudgetMs);
       logger.warn(
-        { err, targetUrl, method: init.method, attempt, nextRetryMs },
+        { err, targetUrl: targetUrlForLog, method: init.method, attempt, nextRetryMs },
         "worker-tier proxy: worker tier fetch failed; retrying idempotent request",
       );
       await sleep(nextRetryMs, signal ?? new AbortController().signal);
@@ -219,6 +228,13 @@ function createWorkerProxyHandler(
 ): RequestHandler {
   return async (req, res) => {
     const targetUrl = `${workersInternalUrl}${req.originalUrl}`;
+    // The same URL with the query string dropped on untrusted webhook routes.
+    // `req.originalUrl` is sender-authored on those routes, so interpolating
+    // the raw one into a log payload re-opens the query half of the
+    // BLO-29716 guard (PEN-2996). Scrub the relative part, THEN prepend the
+    // origin — the route patterns are anchored at the path root and match
+    // nothing against an absolute URL.
+    const targetUrlForLog = `${workersInternalUrl}${urlForLog(req.originalUrl) ?? ""}`;
     const controller = new AbortController();
 
     // Set when the downstream client goes away before we finished
@@ -233,9 +249,27 @@ function createWorkerProxyHandler(
     // Non-streaming requests get a hard timeout. Streaming (SSE) requests get
     // only a bounded startup retry budget; after the worker responds, the
     // stream itself stays open until the client disconnects.
+    //
+    // ponytail: a streaming request that has started has NO deadline, so a
+    // worker that accepts the SSE connection and then goes silent produces no
+    // abort, no catch, and no counter increment — the request just hangs and
+    // the failure series stays quiet. Silence on this metric is therefore not
+    // proof of health for the streaming routes. Upgrade path if that gap
+    // matters: an idle-timeout on the piped stream (reset on each chunk),
+    // which is the only shape that does not also kill a healthy long-lived
+    // SSE connection.
+    //
+    // `timedOut` records WHY the abort fired. Without it every abort surfaces
+    // as "Worker tier unreachable", which is false whenever the connection
+    // succeeded and the worker was merely slow — and it sends the responder
+    // hunting for a missing Service endpoint that was there the whole time.
+    let timedOut = false;
     const timeout = streaming
       ? undefined
-      : setTimeout(() => controller.abort(), requestTimeoutMs);
+      : setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, requestTimeoutMs);
 
     try {
       const headers = forwardRequestHeaders(req.headers);
@@ -284,13 +318,13 @@ function createWorkerProxyHandler(
         body: body as BodyInit | undefined,
         redirect: "manual",
         signal: controller.signal,
-      }, retryStartupRace, retryBudgetMs);
+      }, retryStartupRace, targetUrlForLog, retryBudgetMs);
 
       if (upstream.status >= 500) {
         // The worker tier reached us but failed the operation. Forward it
         // verbatim, but log so the failure is visible from API-tier logs.
         logger.warn(
-          { targetUrl, method: req.method, status: upstream.status },
+          { targetUrl: targetUrlForLog, method: req.method, status: upstream.status },
           "worker-tier proxy: worker tier returned a server error",
         );
       }
@@ -317,14 +351,39 @@ function createWorkerProxyHandler(
     } catch (err) {
       // Client left before we finished — expected, nothing to report.
       if (clientDisconnected) return;
+      // `headersSent` is definitive proof the worker responded: those headers
+      // were read off the upstream response above and forwarded. Counting
+      // that as `unreachable` would send the responder hunting for a missing
+      // Service endpoint that demonstrably answered — the same wrong-cause
+      // chase this split exists to remove. It is reachable on the streaming
+      // routes in particular, where `timeout` is undefined and `timedOut` can
+      // never become true, so a worker that streams and then dies mid-body
+      // lands here with no other way to be labelled.
+      const failureReason = timedOut
+        ? "timeout"
+        : res.headersSent
+        ? "mid_stream"
+        : "unreachable";
+      recordWorkerTierProxyFailure(failureReason);
       logger.error(
-        { err, targetUrl, method: req.method },
-        "worker-tier proxy: failed to relay request to worker tier",
+        // `targetUrlForLog`, not `targetUrl`: the raw URL carries the
+        // caller-supplied query string (PEN-2996). The failure split and the
+        // requestTimeoutMs context from BLO-31945 are kept as-is.
+        { err, targetUrl: targetUrlForLog, method: req.method, reason: failureReason, requestTimeoutMs },
+        failureReason === "timeout"
+          ? "worker-tier proxy: worker tier did not respond before the proxy timeout"
+          : failureReason === "mid_stream"
+          ? "worker-tier proxy: worker tier response failed after headers were flushed"
+          : "worker-tier proxy: failed to relay request to worker tier",
       );
       if (!res.headersSent) {
         res
-          .status(502)
-          .json({ error: "Worker tier unreachable — plugin operation could not be completed." });
+          .status(timedOut ? 504 : 502)
+          .json({
+            error: timedOut
+              ? `Worker tier did not respond within ${requestTimeoutMs}ms — plugin operation could not be completed.`
+              : "Worker tier unreachable — plugin operation could not be completed.",
+          });
       } else {
         // Headers already flushed: the response is now a truncated stream.
         // Destroy the socket so the client sees a broken connection rather

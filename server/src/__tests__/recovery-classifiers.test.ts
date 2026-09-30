@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import { classifyIssueGraphLiveness as classifyIssueGraphLivenessCompat } from "../services/issue-liveness.js";
 import { decideRunLivenessContinuation as decideRunLivenessContinuationCompat } from "../services/run-continuations.js";
 import {
+  DETERMINISTIC_SKILL_FAILURE_ERROR_CODE,
   RECOVERY_KEY_PREFIXES,
   RECOVERY_ORIGIN_KINDS,
   RECOVERY_REASON_KINDS,
+  ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES,
   buildIssueGraphLivenessIncidentKey,
   buildIssueGraphLivenessLeafKey,
   buildRunLivenessContinuationIdempotencyKey,
@@ -79,6 +81,107 @@ describe("recovery classifier boundary", () => {
     };
 
     expect(classifyIssueGraphLiveness(input)).toEqual(classifyIssueGraphLivenessCompat(input));
+  });
+
+  // Ally flagged the original version of this test as non-discriminating, and
+  // that was correct: with errorCode "skill_not_found",
+  // isLegacySessionUnavailableAdapterFailure hard-requires "adapter_failed", so
+  // the explicit early return in isZeroTokenStartupFailureRun is unreachable and
+  // deleting it changes nothing. The exclusion holds in production by *set
+  // non-membership*, so that is what this asserts — it fails loudly if anyone
+  // adds the code to the set.
+  it("excludes a missing skill from the zero-token startup family by set non-membership", () => {
+    expect(ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES.has(DETERMINISTIC_SKILL_FAILURE_ERROR_CODE)).toBe(false);
+    expect(isZeroTokenStartupFailureRun({
+      status: "failed",
+      errorCode: DETERMINISTIC_SKILL_FAILURE_ERROR_CODE,
+      usageJson: { inputTokens: 0, outputTokens: 0 },
+    })).toBe(false);
+  });
+
+  // The early return is kept as a backstop for exactly the case the assertion
+  // above forbids. This is the only test in which it is load-bearing: with the
+  // code temporarily in the set, removing the guard flips this to true.
+  it("keeps excluding a missing skill even if it joins the zero-token set", () => {
+    ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES.add(DETERMINISTIC_SKILL_FAILURE_ERROR_CODE);
+    try {
+      expect(isZeroTokenStartupFailureRun({
+        status: "failed",
+        errorCode: DETERMINISTIC_SKILL_FAILURE_ERROR_CODE,
+        usageJson: { inputTokens: 0, outputTokens: 0 },
+      })).toBe(false);
+    } finally {
+      ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES.delete(DETERMINISTIC_SKILL_FAILURE_ERROR_CODE);
+    }
+    // Restored, so the production invariant above still holds for other tests.
+    expect(ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES.has(DETERMINISTIC_SKILL_FAILURE_ERROR_CODE)).toBe(false);
+  });
+
+  it("routes a missing skill to blocked escalation instead of retry", () => {
+    expect(classifyContinuationFailure({
+      status: "failed",
+      errorCode: "skill_not_found",
+      error: 'Skill "verification-before-completion" not found',
+      resultJson: null,
+    } as never)).toMatchObject({
+      kind: "non_retryable",
+      maxAttempts: 0,
+      errorCode: "skill_not_found",
+    });
+  });
+
+  // BLO-32055. A run killed while a declared skill's `__runtime__` tree was
+  // mid-refresh is the OPPOSITE of a missing-skill config fault: the sweep
+  // completes on its own (measured live at 43m36s), so the next attempt succeeds.
+  // This pair is the whole point of giving it a separate code — the two must not
+  // converge on one classification.
+  it("keeps a mid-materialization skill fault retryable, unlike a missing skill", () => {
+    const materializationPending = classifyContinuationFailure({
+      status: "failed",
+      errorCode: "skill_materialization_pending",
+      error: 'Skill "garrytan/gstack/investigate" source is incomplete',
+      resultJson: null,
+    } as never);
+    expect(materializationPending).toMatchObject({
+      kind: "transient_infra",
+      errorCode: "skill_materialization_pending",
+    });
+    expect(materializationPending.maxAttempts).toBeGreaterThan(0);
+
+    // It replaced `adapter_failed`, which is already transient_infra, so naming
+    // the fault must preserve retryability exactly rather than widen it.
+    expect(materializationPending.maxAttempts).toBe(
+      classifyContinuationFailure({
+        status: "failed",
+        errorCode: "adapter_failed",
+        error: "ENOENT: no such file or directory",
+        resultJson: null,
+      } as never).maxAttempts,
+    );
+  });
+
+  // The AC's second half. Stated precisely, because the intuitive reading is
+  // backwards and acting on it would undo this whole change: like the
+  // `adapter_failed` it replaces, this code is ABSENT from
+  // ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES, so `isZeroTokenStartupFailureRun`
+  // stays false and the run is NOT escalated as a structural startup wedge — it
+  // takes ordinary transient recovery instead. That set marks wedges the sweep
+  // escalates straight to `blocked` (service.ts, the `isZeroTokenStartupFailureRun`
+  // branch), and a self-healing materialization race is the opposite of one.
+  // It is separately not the DETERMINISTIC_SKILL_FAILURE_ERROR_CODE, so nothing
+  // else excludes it either — but that non-membership does NOT imply zero-token
+  // eligibility; the two tests are independent.
+  it("is not treated as a structural zero-token wedge", () => {
+    expect("skill_materialization_pending").not.toBe(DETERMINISTIC_SKILL_FAILURE_ERROR_CODE);
+    expect(ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES.has("skill_materialization_pending")).toBe(false);
+    // Parity with the code being replaced is the actual invariant: neither is a
+    // zero-token startup failure, so this change moves nothing.
+    expect(ZERO_TOKEN_STARTUP_FAILURE_ERROR_CODES.has("adapter_failed")).toBe(false);
+    expect(isZeroTokenStartupFailureRun({
+      status: "failed",
+      errorCode: "skill_materialization_pending",
+      usageJson: { inputTokens: 0, outputTokens: 0 },
+    })).toBe(false);
   });
 
   it("treats a scheduled monitor as an explicit review action path", () => {
@@ -173,6 +276,102 @@ describe("recovery classifier boundary", () => {
 
     expect(overdue[0]?.state).toBe("in_review_without_action_path");
     expect(exhausted[0]?.state).toBe("in_review_without_action_path");
+  });
+
+  describe("PEN-3198 open pull request as an in-review action path", () => {
+    const inReviewIssue = {
+      id: issueId,
+      companyId,
+      identifier: "PEN-3006",
+      title: "Awaiting review on a linked PR",
+      status: "in_review",
+      assigneeAgentId: agentId,
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionState: null,
+    };
+    const agents = [
+      {
+        id: agentId,
+        companyId,
+        name: "Coder",
+        role: "engineer",
+        status: "idle",
+        reportsTo: managerId,
+      },
+    ];
+
+    // Control. Without this the next test could pass against a row that was never
+    // escalating in the first place, which would make the suppression untested.
+    it("escalates an in-review row with no open pull request recorded", () => {
+      const findings = classifyIssueGraphLiveness({
+        issues: [inReviewIssue],
+        relations: [],
+        agents,
+      });
+
+      expect(findings[0]?.state).toBe("in_review_without_action_path");
+    });
+
+    it("treats a recent open pull request on the row as the action path", () => {
+      const findings = classifyIssueGraphLiveness({
+        issues: [inReviewIssue],
+        relations: [],
+        agents,
+        openPullRequestAttendance: [
+          { companyId, issueId, status: "ready_for_review" },
+        ],
+      });
+
+      expect(findings).toEqual([]);
+    });
+
+    // The attendance list is indexed by `(companyId, issueId)`. A PR on a DIFFERENT row
+    // must not silence this one -- a leak here would suppress the invariant graph-wide
+    // off a single open PR, which is the failure mode that would be hardest to notice
+    // precisely because it makes the alarm stop.
+    it("does not let a pull request on another issue silence this row", () => {
+      const findings = classifyIssueGraphLiveness({
+        issues: [inReviewIssue],
+        relations: [],
+        agents,
+        openPullRequestAttendance: [
+          { companyId, issueId: "some-other-issue", status: "ready_for_review" },
+        ],
+      });
+
+      expect(findings[0]?.state).toBe("in_review_without_action_path");
+    });
+
+    it("does not let a pull request in another company silence this row", () => {
+      const findings = classifyIssueGraphLiveness({
+        issues: [inReviewIssue],
+        relations: [],
+        agents,
+        openPullRequestAttendance: [
+          { companyId: "company-2", issueId, status: "ready_for_review" },
+        ],
+      });
+
+      expect(findings[0]?.state).toBe("in_review_without_action_path");
+    });
+
+    // The staleness bound lives in the caller's SQL, not here -- this classifier is pure
+    // and receives only rows that already passed `openPullRequestWakePathConditions`. An
+    // empty list is therefore how an EXPIRED PR arrives, and it must escalate: that is
+    // the bounded half of the ruling on PEN-3198, and the reason bare openness was
+    // rejected.
+    it("escalates when the attendance list is empty because the grace has expired", () => {
+      const findings = classifyIssueGraphLiveness({
+        issues: [inReviewIssue],
+        relations: [],
+        agents,
+        openPullRequestAttendance: [],
+      });
+
+      expect(findings[0]?.state).toBe("in_review_without_action_path");
+    });
   });
 
   it("keeps run liveness continuation decision parity with the compatibility export", () => {
@@ -460,5 +659,143 @@ describe("isContinuationAttemptRetryReason — combined process_lost attempt cap
     expect(isContinuationAttemptRetryReason(null, "process_lost")).toBe(false);
     expect(isContinuationAttemptRetryReason("assignment_recovery", "process_lost")).toBe(false);
     expect(isContinuationAttemptRetryReason("zero_token_session_reset", "process_lost")).toBe(false);
+  });
+});
+
+/**
+ * BLO-33225. The recovery backstop tick cost a fixed ~2.1-2.8 s synchronous event-loop
+ * stall on the worker, load-independent and only 2.2 s under the 5 s readiness timeout
+ * (BLO-31945). `reconcileIssueGraphLiveness` runs `classifyIssueGraphLiveness` twice per
+ * tick over EVERY visible issue, and a CPU profile at 40k issues attributed the stall to
+ * two per-candidate call sites in here: `isInvokableAgent` re-walking the org chain (and
+ * re-materializing the whole agent list) on every owner candidate, and
+ * `hasExplicitWaitingPath` linear-scanning five waiting-path arrays per issue.
+ *
+ * These assert ATTRIBUTION, not a wall-clock total — following #1715's precedent, and for
+ * the same reason: a duration assertion is flaky on shared CI runners and would not name
+ * which call site regressed. The shape asserted is "work per pass is a function of the
+ * agent/path input size, NOT of the issue count", so quadrupling the graph must not move
+ * the counters at all. On the pre-fix code both counters scale with the issue count.
+ */
+describe("issue graph liveness classifier does per-pass work, not per-candidate work", () => {
+  const perfCompany = "company-perf";
+
+  /**
+   * Counts reads of `props` only. For agents that is deliberately narrow: `id`,
+   * `companyId` and `reportsTo` are read by the per-finding owner-candidate assembly,
+   * which legitimately scales with findings, so counting them would measure the wrong
+   * thing. `status` is read by `getAgentWorkEligibility` — the org-chain walk this
+   * memoizes — and by nothing else on the hot path, so it isolates exactly the
+   * regression. Measured on the pre-fix code: `status` reads went 900 -> 3600 across
+   * these two graphs; post-fix they are 18 -> 18.
+   */
+  function countingProxy<T extends object>(
+    target: T,
+    counter: { reads: number },
+    props: readonly (string | symbol)[] | null = null,
+  ): T {
+    return new Proxy(target, {
+      get(obj, prop, receiver) {
+        if (!props || props.includes(prop)) counter.reads += 1;
+        return Reflect.get(obj, prop, receiver);
+      },
+    });
+  }
+
+  /** A graph of `issueCount` blocked issues, each behind its own unassigned blocker. */
+  function buildGraph(issueCount: number) {
+    const agentCounter = { reads: 0 };
+    const pathCounter = { reads: 0 };
+
+    const issues = [];
+    const relations = [];
+    for (let i = 0; i < issueCount; i++) {
+      issues.push({
+        id: `perf-blocked-${i}`,
+        companyId: perfCompany,
+        identifier: `PERF-${i}`,
+        title: `blocked ${i}`,
+        status: "blocked",
+        assigneeAgentId: "perf-agent-0",
+        assigneeUserId: null,
+        createdByAgentId: "perf-agent-0",
+        createdByUserId: null,
+        executionState: null,
+      });
+      issues.push({
+        id: `perf-blocker-${i}`,
+        companyId: perfCompany,
+        identifier: `PERF-B${i}`,
+        title: `blocker ${i}`,
+        status: "todo",
+        assigneeAgentId: null,
+        assigneeUserId: null,
+        createdByAgentId: "perf-agent-0",
+        createdByUserId: null,
+        executionState: null,
+      });
+      relations.push({
+        companyId: perfCompany,
+        blockerIssueId: `perf-blocker-${i}`,
+        blockedIssueId: `perf-blocked-${i}`,
+      });
+    }
+
+    // Fixed-size regardless of `issueCount`: these are the inputs the per-pass cost is
+    // allowed to scale with.
+    const agents = [0, 1, 2, 3].map((i) => countingProxy({
+      id: `perf-agent-${i}`,
+      companyId: perfCompany,
+      name: `agent ${i}`,
+      role: i === 0 ? "cto" : "engineer",
+      status: "idle",
+      reportsTo: i === 0 ? null : "perf-agent-0",
+    }, agentCounter, ["status"]));
+
+    const openRecoveryIssues = [0, 1, 2, 3, 4].map((i) => ({
+      companyId: perfCompany,
+      // Deliberately satisfies nothing in the graph, so the classifier must read every
+      // entry rather than short-circuiting on an early hit.
+      issueId: `perf-unrelated-${i}`,
+      status: "todo",
+    }));
+
+    return {
+      agentCounter,
+      pathCounter,
+      input: {
+        issues,
+        relations,
+        agents,
+        openRecoveryIssues: countingProxy(openRecoveryIssues, pathCounter),
+      },
+    };
+  }
+
+  function measure(issueCount: number) {
+    const graph = buildGraph(issueCount);
+    graph.agentCounter.reads = 0;
+    graph.pathCounter.reads = 0;
+    const findings = classifyIssueGraphLiveness(graph.input as never);
+    return {
+      findings: findings.length,
+      agentReads: graph.agentCounter.reads,
+      pathReads: graph.pathCounter.reads,
+    };
+  }
+
+  it("reads the agent set and the waiting-path set a fixed number of times per pass", () => {
+    const small = measure(25);
+    const large = measure(100);
+
+    // Control: the larger graph really does produce more findings, so the pass is doing
+    // strictly more classification work. Without this the counters below could be equal
+    // because nothing was classified at all.
+    expect(small.findings).toBe(25);
+    expect(large.findings).toBe(100);
+
+    // 4x the issues and 4x the findings, byte-identical cost on both hot inputs.
+    expect(large.agentReads).toBe(small.agentReads);
+    expect(large.pathReads).toBe(small.pathReads);
   });
 });

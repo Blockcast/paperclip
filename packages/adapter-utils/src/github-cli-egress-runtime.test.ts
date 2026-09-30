@@ -14,6 +14,7 @@ import {
   prepareGitHubCliInvocation,
   runGitHubCliEgressRuntime,
 } from "./github-cli-egress-runtime.js";
+import { redactionMarker } from "./github-egress-scrub.js";
 
 const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(sourceDirectory, "../../..");
@@ -137,6 +138,70 @@ describe("github-cli-egress-runtime", () => {
       });
     }).toThrow("stdin-backed GitHub text/request body is disabled");
     expect(() => readFileSync(fixture.record, "utf8")).toThrow();
+  });
+
+  it("refuses a credential-shaped repository blob before the target starts", () => {
+    // BLO-33171. Same fail-closed shape as the stdin rejection above: gh never
+    // runs, so no corrupted blob can reach GitHub.
+    const fixture = makeFixture();
+
+    const result = spawnSync(
+      process.execPath,
+      [
+        "--import", "tsx", runtimeEntryPoint, fixture.target,
+        "api", "repos/acme/widget/git/blobs",
+        "-f", `content=const FIXTURES = ["${syntheticCredential}"];`,
+      ],
+      { cwd: repositoryRoot, encoding: "utf8" },
+    );
+
+    expect(result.status).toBe(64);
+    expect(result.stderr).toContain("refusing to rewrite GitHub repository content");
+    expect(result.stderr).toContain("`content`");
+    expect(result.stderr).toContain("vendor-key");
+    expect(() => readFileSync(fixture.record, "utf8")).toThrow();
+  });
+
+  it("passes a clean repository blob through to the target byte-exact", () => {
+    const fixture = makeFixture();
+    const source = 'export const VERSION = "1.2.3";\n';
+
+    const result = spawnSync(
+      process.execPath,
+      [
+        "--import", "tsx", runtimeEntryPoint, fixture.target,
+        "api", "repos/acme/widget/git/blobs", "-f", `content=${source}`,
+      ],
+      { cwd: repositoryRoot, encoding: "utf8" },
+    );
+
+    expect(result.status).toBe(0);
+    const recorded = JSON.parse(readFileSync(fixture.record, "utf8")) as {
+      fieldArgs: string[];
+    };
+    expect(recorded.fieldArgs).toContain(`content=${source}`);
+  });
+
+  it("still scrubs a prose comment body reaching the same target", () => {
+    const fixture = makeFixture();
+
+    const result = spawnSync(
+      process.execPath,
+      [
+        "--import", "tsx", runtimeEntryPoint, fixture.target,
+        "api", "repos/acme/widget/issues/7/comments", "-f", `body=leak ${syntheticCredential}`,
+      ],
+      { cwd: repositoryRoot, encoding: "utf8" },
+    );
+
+    expect(result.status).toBe(0);
+    const recorded = JSON.parse(readFileSync(fixture.record, "utf8")) as {
+      fieldArgs: string[];
+    };
+    expect(recorded.fieldArgs.join("\n")).toContain(
+      redactionMarker("vendor-key"),
+    );
+    expect(recorded.fieldArgs.join("\n")).not.toContain(syntheticCredential);
   });
 
   it("scrubs a file-backed body before the target GitHub CLI reads it", () => {

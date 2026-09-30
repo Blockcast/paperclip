@@ -10,6 +10,9 @@ import contextlib
 import importlib.util
 import io
 import os
+import tempfile
+import time
+from datetime import datetime, timezone
 import unittest
 import urllib.error
 
@@ -22,6 +25,21 @@ _SPEC.loader.exec_module(sweep)
 
 CONTEXT = sweep.STATUS_CONTEXT
 HOUR = 3600.0
+
+# The instant the two pre-write guard suites anchor their fixtures on. Every
+# other instant they use is DERIVED from it and from the calibrated thresholds
+# (STALL_THRESHOLD_SECONDS, REFIRE_COOLDOWN_SECONDS), never typed as a
+# literal: the thresholds are recalibrated as the fleet changes (BLO-34521
+# moved the stall threshold from 8h to 18h), and a literal "now" that used to
+# sit past the threshold silently stops satisfying should_refire, at which
+# point the guard under test is never reached and every assertion about it
+# fails for a reason none of them name.
+PENDING_SINCE = "2026-09-01T00:00:00Z"
+
+
+def _iso(epoch):
+    """Inverse of sweep._parse_iso, for fixture instants derived from `now`."""
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def status(state, created_at):
@@ -188,6 +206,108 @@ class TestIsAlarming(unittest.TestCase):
         self.assertGreater(
             sweep.ALARM_THRESHOLD_SECONDS,
             sweep.STALL_THRESHOLD_SECONDS + sweep.REFIRE_COOLDOWN_SECONDS,
+        )
+
+
+class TestStallThresholdCalibration(unittest.TestCase):
+    """The threshold must clear the measured distribution OF THE QUANTITY IT
+    CLOCKS, with the margin its derivation claims.
+
+    This is the defect BLO-34521 fixed, and the second half is the defect the
+    first version of that fix walked into. At 90m the predicate was
+    effectively constant-true -- 96-99% of *healthy* dispatches breached it --
+    so "stranded" meant "dispatched normally". The replacement, 8h, was
+    derived from `startedAt - createdAt` and breached 0% of THAT. But the
+    threshold is compared against `unreviewed_since()`, so what it really
+    clocks is head-landed -> review, of which dispatch wait is one term of
+    four; measured directly, 8h breached 19.4%. At the 1.35 multiplier in
+    force when 8h shipped, a table carrying only `dispatch-wait` rows passed
+    it -- which is how 8h cleared its own guard.
+
+    So the `quantity` column is load-bearing, not documentation: at least one
+    row must measure end-to-end, or this guard cannot see the failure it
+    exists to catch. If you change STALL_THRESHOLD_SECONDS, re-run the
+    reproduction recorded in the comment block above it and update this table
+    in the same commit -- a constant whose derivation is not re-measured is
+    how this rotted twice.
+
+    Read the column as the structural protection and nothing else. At today's
+    1.41 the `n=725` dispatch-wait row happens to refuse 8h on its own
+    (30033s floor against 28800s), so the end-to-end row is not currently the
+    only thing standing between this guard and the regression -- but that is
+    an accident of how starved the queue is, not a property of the design.
+    The BLO-19881 paragraph in `sweep-stalled-ally-reviews.py` (grep it, do
+    not cite its line -- these shift) expects dispatch wait to come back DOWN
+    if that lands, which lowers both dispatch-wait floors and hands the
+    refusal back to the end-to-end row alone. The column is what holds
+    independently of the multiplier and of the queue.
+    """
+
+    END_TO_END = "unreviewed_since->review"
+
+    # Picked off p90, never off the max -- the end-to-end tail is heavy
+    # (p90 12.70h against max 30.81h), and chasing the max would mean a 32h
+    # threshold: a day and a half to notice a lost review, bought against the
+    # 11/232 (4.7%) above 18h. This is the multiplier the derivation actually
+    # claims, floored to 2dp: 1080/762 = 1.417. It was 1.35, which is not a
+    # claim anything makes
+    # -- a floor ~5% under the asserted margin, i.e. the guard relaxed until
+    # it admitted the chosen value. At 1.41 the slack is 0.5%, so the guard
+    # now refuses any constant that does not clear the margin in the prose.
+    P90_MULTIPLIER = 1.41
+
+    # (window label, quantity, p90 minutes)
+    OBSERVED_WINDOWS = [
+        ("2026-09-16T22:37Z->2026-09-18T05:50Z n=706", "dispatch-wait", 338),
+        ("2026-09-17T19:19Z->2026-09-18T21:54Z n=725", "dispatch-wait", 355),
+        ("2026-09-13T17:37Z->2026-09-19T05:25Z n=232", END_TO_END, 762),
+    ]
+
+    def test_threshold_clears_every_observed_p90_with_its_claimed_margin(self):
+        # subTest, not a bare loop: a regression must report EVERY row it
+        # breaks. Without it the first failure stops the loop, and since the
+        # dispatch-wait rows come first, a revert to 8h reports only those --
+        # hiding the end-to-end row, which is the one this class exists to
+        # make load-bearing.
+        for label, quantity, p90_minutes in self.OBSERVED_WINDOWS:
+            with self.subTest("%s (%s)" % (label, quantity)):
+                self.assertGreaterEqual(
+                    sweep.STALL_THRESHOLD_SECONDS,
+                    self.P90_MULTIPLIER * p90_minutes * 60,
+                    "%s (%s)" % (label, quantity),
+                )
+
+    def test_table_measures_the_quantity_the_predicate_clocks(self):
+        # Without this, the table degrades to dispatch-wait rows only. That is
+        # exactly what let 8h pass its own guard at the 1.35 multiplier then
+        # in force, while breaching 19.4% of real reviews. At today's 1.41 a
+        # dispatch-wait-only table would refuse 8h anyway, on the `n=725` row
+        # -- so this assertion is not what is stopping that regression right
+        # now. It is what stops it once the queue recovers and those floors
+        # drop back. `unreviewed_since()` is what STALL_THRESHOLD_SECONDS is
+        # compared against, so a row measuring it is the minimum evidence.
+        self.assertTrue(
+            any(q == self.END_TO_END for _, q, _ in self.OBSERVED_WINDOWS),
+            "no end-to-end window recorded; dispatch wait alone cannot calibrate this",
+        )
+
+    def test_old_ninety_minute_value_would_fail_this_calibration(self):
+        # Guard the guard: if this assertion ever passes at 90m, the table
+        # above has been emptied or the comparison inverted, and the test is
+        # no longer capable of catching a regression to the rotted value.
+        worst_p90 = max(p90 for _, _, p90 in self.OBSERVED_WINDOWS)
+        self.assertLess(90 * 60, self.P90_MULTIPLIER * worst_p90 * 60)
+
+    def test_superseded_eight_hour_value_would_fail_this_calibration(self):
+        # The same guard for the value this replaced. Asserted against the
+        # end-to-end row specifically: at 1.41 the dispatch-wait rows are
+        # split on 8h (it clears the 338m row at 28595s and fails the 355m one
+        # at 30033s), and that split moves with the queue. The end-to-end row
+        # refuses 8h by 35665s (~9.9h) and refuses it for the reason the
+        # threshold exists -- so it is the row worth pinning this to.
+        self.assertLess(
+            8 * 60 * 60,
+            self.P90_MULTIPLIER * max(p90 for _, q, p90 in self.OBSERVED_WINDOWS if q == self.END_TO_END) * 60,
         )
 
 
@@ -980,7 +1100,11 @@ class TestDryRun(unittest.TestCase):
 
         sweep._request = fake_request
         sweep._fetch_paginated = fake_fetch
-        now = sweep._parse_iso("2026-08-01T00:00:00Z") + 10 * HOUR
+        # Key off the constant, not a literal: a hardcoded age silently turns
+        # into a "not yet stalled" case the next time the threshold is
+        # recalibrated upward, and the test then fails for a reason that has
+        # nothing to do with dry-run behaviour.
+        now = sweep._parse_iso("2026-08-01T00:00:00Z") + sweep.STALL_THRESHOLD_SECONDS + HOUR
 
         results = sweep.sweep("o", "r", "tok", "https://api.github.com", now=now, dry_run=True)
 
@@ -1007,6 +1131,839 @@ class TestCommentBodyIsModeAware(unittest.TestCase):
         body = sweep.build_comment_body(7, "b" * 40, 3 * HOUR, requested_login="allyblockcast", mode="status-free")
         self.assertNotIn(sweep.STATUS_CONTEXT, body)
         self.assertIn("awaiting review", body)
+
+
+class TestCooldownArithmeticIsShared(unittest.TestCase):
+    """cooldown_blocks_refire is the single definition of the cooldown.
+
+    should_refire (scan) and refire_still_permitted (pre-write re-read) both
+    call it. A second copy would be free to drift, and a guard that disagreed
+    with the decision it guards would be worse than no guard at all.
+    """
+
+    def test_no_markers_never_blocks(self):
+        blocked, reason = sweep.cooldown_blocks_refire([], 0.0)
+        self.assertFalse(blocked)
+        self.assertIsNone(reason)
+
+    def test_marker_inside_the_cooldown_blocks_and_says_why(self):
+        now = 10 * HOUR
+        blocked, reason = sweep.cooldown_blocks_refire([now - 60.0], now)
+        self.assertTrue(blocked)
+        self.assertIn("cooldown", reason)
+
+    def test_marker_outside_the_cooldown_does_not_block(self):
+        now = 10 * HOUR
+        blocked, _ = sweep.cooldown_blocks_refire([now - (sweep.REFIRE_COOLDOWN_SECONDS + 1)], now)
+        self.assertFalse(blocked)
+
+    def test_the_newest_marker_wins_not_the_oldest(self):
+        """An old marker must not license a re-fire when a recent one exists."""
+        now = 10 * HOUR
+        epochs = [now - 5 * HOUR, now - 30.0, now - 4 * HOUR]
+        blocked, _ = sweep.cooldown_blocks_refire(epochs, now)
+        self.assertTrue(blocked)
+
+    def test_marker_epochs_are_extracted_by_prefix_only(self):
+        comments = [
+            {"body": sweep.MARKER + "\n@ally please re-review", "created_at": "2026-09-01T00:00:00Z"},
+            {"body": "an ordinary human comment", "created_at": "2026-09-01T01:00:00Z"},
+            {"body": None, "created_at": "2026-09-01T02:00:00Z"},
+            {"body": "prose that merely mentions " + sweep.MARKER, "created_at": "2026-09-01T03:00:00Z"},
+        ]
+        epochs = sweep.marker_epochs_from_comments(comments)
+        self.assertEqual(epochs, [sweep._parse_iso("2026-09-01T00:00:00Z")])
+
+
+class TestPreWriteRereadGuard(unittest.TestCase):
+    """BLO-31908: the re-fire cooldown was check-then-act.
+
+    The markers are read during the scan and the write happens later with no
+    re-read, so two sweeps executing concurrently both observed
+    `since_last >= REFIRE_COOLDOWN_SECONDS` and both fired. That is worse than
+    a duplicate comment: request_review DELETEs before it POSTs, so
+    `A-DELETE / A-POST / B-DELETE / B-POST` also leaves a window in which the
+    PR carries no pending review request at all.
+
+    The race is not reproducible against live GitHub on demand -- it needs a
+    runner-starvation backlog released together -- so these tests ARE the
+    acceptance evidence. They simulate the interleaving by returning different
+    comment pages to the scan read and to the pre-write re-read.
+    """
+
+    def setUp(self):
+        self._real_request = sweep._request
+        self._real_fetch = sweep._fetch_paginated
+        self.calls = []
+        self.comment_pages = []
+        self.comment_fetches = 0
+
+    def tearDown(self):
+        sweep._request = self._real_request
+        sweep._fetch_paginated = self._real_fetch
+
+    def _install(self, scan_comments, reread_comments, already_requested=True):
+        """Serve `scan_comments` to the scan read and `reread_comments` to the
+        pre-write re-read -- i.e. a marker that landed in between."""
+        self.comment_pages = [scan_comments, reread_comments]
+
+        def fake_fetch(api_base_url, path, token):
+            if "/statuses" in path:
+                return [status("pending", PENDING_SINCE)]
+            if "/comments" in path:
+                index = min(self.comment_fetches, len(self.comment_pages) - 1)
+                self.comment_fetches += 1
+                return self.comment_pages[index]
+            return []
+
+        def fake_request(url, token, method="GET", payload=None):
+            self.calls.append((method, url))
+            if method == "GET":
+                return {
+                    "requested_reviewers": [{"login": "allyblockcast"}] if already_requested else []
+                }
+            return {}
+
+        sweep._fetch_paginated = fake_fetch
+        sweep._request = fake_request
+
+    def _now(self):
+        # Past STALL_THRESHOLD_SECONDS by a margin whatever it is calibrated to
+        # today, so should_refire says yes on the scan and only the guard can
+        # stop the write.
+        return sweep._parse_iso(PENDING_SINCE) + sweep.STALL_THRESHOLD_SECONDS + HOUR
+
+    def _marker(self, at):
+        return [{"body": sweep.MARKER + "\nre-ask", "created_at": at}]
+
+    def _writes(self):
+        return [(method, url) for method, url in self.calls if method != "GET"]
+
+    def test_marker_landing_between_scan_and_write_withholds_the_refire(self):
+        """The headline case: a concurrent sweep posted a marker mid-run."""
+        now = self._now()
+        self._install(scan_comments=[], reread_comments=self._marker(_iso(self._now() - 60)))
+
+        pr, _head, _pending, refire, reason = sweep._consider_pr(
+            "o", "r", _pr(1), "tok", "https://api.github.com", now
+        )
+
+        self.assertFalse(refire, "the guard must decline once the cooldown no longer permits")
+        self.assertTrue(reason.startswith(sweep.REREAD_SKIP_REASON_PREFIX), reason)
+        self.assertEqual(self._writes(), [], "no DELETE and no POST may be issued")
+
+    def test_both_writes_are_withheld_not_just_the_review_request(self):
+        """Gating only request_review would leave half the defect in place.
+
+        The marker comment is what the cooldown is derived from, so posting it
+        alone would still double the re-ask trail and push the cooldown out for
+        the next run.
+        """
+        now = self._now()
+        self._install(scan_comments=[], reread_comments=self._marker(_iso(self._now() - 60)))
+
+        sweep._consider_pr("o", "r", _pr(1), "tok", "https://api.github.com", now)
+
+        self.assertEqual(
+            [url for _m, url in self.calls if "/issues/" in url and "comments" in url],
+            [],
+            "the marker comment POST must be withheld too",
+        )
+
+    def test_unchanged_markers_still_permit_the_write(self):
+        """Negative control.
+
+        Without this, the test above would pass just as happily if the guard
+        broke the write path outright and the sweep never re-fired anything.
+        """
+        now = self._now()
+        self._install(scan_comments=[], reread_comments=[])
+
+        _pr_payload, _head, _pending, refire, _reason = sweep._consider_pr(
+            "o", "r", _pr(1), "tok", "https://api.github.com", now
+        )
+
+        self.assertTrue(refire)
+        methods = [method for method, _url in self.calls]
+        self.assertIn("DELETE", methods)
+        self.assertIn("POST", methods)
+        self.assertLess(methods.index("DELETE"), methods.index("POST"))
+
+    def test_a_marker_older_than_the_cooldown_does_not_block(self):
+        """The guard re-applies the cooldown, it does not veto on any marker.
+
+        A stale marker is exactly the state a legitimate re-fire starts from,
+        so treating any marker as blocking would wedge the sweep permanently.
+        """
+        now = self._now()
+        stale = self._marker(_iso(self._now() - 3 * sweep.REFIRE_COOLDOWN_SECONDS))  # 3 cooldowns before now
+        self._install(scan_comments=stale, reread_comments=stale)
+
+        _pr_payload, _head, _pending, refire, _reason = sweep._consider_pr(
+            "o", "r", _pr(1), "tok", "https://api.github.com", now
+        )
+
+        self.assertTrue(refire)
+        self.assertNotEqual(self._writes(), [])
+
+    def test_the_guard_reads_comments_again_rather_than_trusting_the_scan(self):
+        """Pins the extra read itself.
+
+        If a later refactor were to reuse the scan's comment list, every test
+        above would still pass while the race was fully reopened -- the guard
+        would be re-checking the very data whose staleness is the defect.
+        """
+        now = self._now()
+        self._install(scan_comments=[], reread_comments=[])
+
+        sweep._consider_pr("o", "r", _pr(1), "tok", "https://api.github.com", now)
+
+        self.assertGreaterEqual(
+            self.comment_fetches, 2,
+            "the write path must issue a fresh comments read, not reuse the scan's",
+        )
+
+    def test_a_failed_reread_withholds_the_write_rather_than_writing_blind(self):
+        """Fail-closed, and loudly.
+
+        request_review swallows its own transport failures because the marker
+        comment is still a durable trail. The guard must NOT: if it cannot be
+        evaluated, the safe direction is to withhold the write and let sweep()
+        isolate and report the PR.
+        """
+        now = self._now()
+        self._install(scan_comments=[], reread_comments=[])
+        real_fetch = sweep._fetch_paginated
+
+        def fetch_then_die(api_base_url, path, token):
+            if "/comments" in path and self.comment_fetches >= 1:
+                raise urllib.error.URLError("connection reset")
+            return real_fetch(api_base_url, path, token)
+
+        sweep._fetch_paginated = fetch_then_die
+
+        with self.assertRaises(urllib.error.URLError):
+            sweep._consider_pr("o", "r", _pr(1), "tok", "https://api.github.com", now)
+
+        self.assertEqual(self._writes(), [], "a guard that cannot be evaluated must not write")
+
+    def test_a_guard_skip_does_not_consume_a_refire_budget_slot(self):
+        """MAX_REFIRES_PER_RUN counts writes, not candidates (BLO-31908 AC4).
+
+        sweep() decrements on the returned re-fire flag, so a PR the guard
+        withheld leaves the slot available for the next stranded PR -- the cap
+        keeps its existing meaning rather than quietly tightening.
+        """
+        now = self._now()
+        self._install(scan_comments=[], reread_comments=self._marker(_iso(self._now() - 60)))
+
+        outcome = sweep._consider_pr("o", "r", _pr(1), "tok", "https://api.github.com", now)
+
+        self.assertFalse(outcome[3], "a withheld write must not read as a re-fire")
+
+    def test_the_guard_is_not_consulted_when_the_budget_is_already_spent(self):
+        """Deferred PRs are not going to be written, so do not spend a request.
+
+        Call volume is the binding constraint on this job.
+        """
+        now = self._now()
+        self._install(scan_comments=[], reread_comments=[])
+
+        _pr_payload, _head, _pending, refire, reason = sweep._consider_pr(
+            "o", "r", _pr(1), "tok", "https://api.github.com", now, may_refire=False
+        )
+
+        self.assertFalse(refire)
+        self.assertTrue(reason.startswith(sweep.DEFERRED_REASON_PREFIX))
+        self.assertEqual(self.comment_fetches, 1, "only the scan read, no guard read")
+
+    def test_dry_run_issues_no_guard_read_and_no_writes(self):
+        now = self._now()
+        self._install(scan_comments=[], reread_comments=[])
+
+        _pr_payload, _head, _pending, refire, reason = sweep._consider_pr(
+            "o", "r", _pr(1), "tok", "https://api.github.com", now, dry_run=True
+        )
+
+        self.assertTrue(refire, "the plan still reports what a live run would do")
+        self.assertIn("DRY-RUN", reason)
+        self.assertEqual(self._writes(), [])
+        self.assertEqual(self.comment_fetches, 1, "only the scan read, no guard read")
+
+
+class TestPreWriteAllyReviewedGuard(unittest.TestCase):
+    """BLO-32044: the pre-write guard re-applied the cooldown but not
+    ally_has_reviewed_head, so it could re-ask for a review that just landed.
+
+    The scan has TWO preconditions -- the cooldown, and "Ally has not reviewed
+    this head". BLO-31908 re-read the first before the write and left the
+    second at its scan-time value. The uncovered interleaving needs no
+    concurrent sweep at all, just one run whose scan and write straddle Ally
+    answering:
+
+      1. scan reads the surfaces; Ally has not reviewed head -> candidate
+      2. Ally posts its consolidated report
+      3. the guard re-reads -- the report IS in the list, but only the
+         cooldown is re-applied, so nothing sees it
+      4. the sweep re-asks for a review that has already landed
+
+    Not reproducible on demand: it needs Ally to answer inside a ~2min window
+    against a measured 5m-74m response latency. So these tests ARE the
+    acceptance evidence. They simulate the interleaving the same way the
+    BLO-31908 class above does -- by serving the scan and the pre-write re-read
+    different pages of the SAME surface.
+    """
+
+    # _pr(1)'s head, spelled out because these tests turn on head-exactness.
+    PR_HEAD = "%040x" % 1
+
+    def setUp(self):
+        self._real_request = sweep._request
+        self._real_fetch = sweep._fetch_paginated
+        self.calls = []
+        self.comment_fetches = 0
+        self.review_fetches = 0
+        self.comment_pages = [[], []]
+        self.review_pages = [[], []]
+
+    def tearDown(self):
+        sweep._request = self._real_request
+        sweep._fetch_paginated = self._real_fetch
+
+    def _install(self, scan_comments=None, reread_comments=None,
+                 scan_reviews=None, reread_reviews=None):
+        """Serve the scan one view of both surfaces and the pre-write re-read a
+        later one. Defaults are empty everywhere, i.e. a genuinely stranded PR.
+
+        Serving the report to the *scan* would prove nothing: _consider_pr
+        already skips on ally_has_reviewed_head there, so the write would be
+        withheld with or without this guard. Only the re-read page isolates it.
+        """
+        self.comment_pages = [scan_comments or [], reread_comments or []]
+        self.review_pages = [scan_reviews or [], reread_reviews or []]
+
+        def fake_fetch(api_base_url, path, token):
+            if "/statuses" in path:
+                return [status("pending", PENDING_SINCE)]
+            if "/comments" in path:
+                index = min(self.comment_fetches, len(self.comment_pages) - 1)
+                self.comment_fetches += 1
+                return self.comment_pages[index]
+            if "/reviews" in path:
+                index = min(self.review_fetches, len(self.review_pages) - 1)
+                self.review_fetches += 1
+                return self.review_pages[index]
+            return []
+
+        def fake_request(url, token, method="GET", payload=None):
+            self.calls.append((method, url))
+            if method == "GET":
+                return {"requested_reviewers": [{"login": "allyblockcast"}]}
+            return {}
+
+        sweep._fetch_paginated = fake_fetch
+        sweep._request = fake_request
+
+    def _now(self):
+        # Past STALL_THRESHOLD_SECONDS by a margin whatever it is calibrated to
+        # today, so should_refire says yes on the scan and only the guard can
+        # stop the write.
+        return sweep._parse_iso(PENDING_SINCE) + sweep.STALL_THRESHOLD_SECONDS + HOUR
+
+    def _consider(self, **kwargs):
+        return sweep._consider_pr("o", "r", _pr(1), "tok", "https://api.github.com", self._now(), **kwargs)
+
+    def _writes(self):
+        return [(method, url) for method, url in self.calls if method != "GET"]
+
+    # -- (a) the comment surface ------------------------------------------
+
+    def test_a_report_landing_on_the_comment_surface_withholds_the_refire(self):
+        """Ally answered by comment between the scan and the write."""
+        self._install(reread_comments=[issue_comment(body=consolidated_body(self.PR_HEAD))])
+
+        _pr_payload, _head, _pending, refire, reason = self._consider()
+
+        self.assertFalse(refire, "the review we were about to ask for has already landed")
+        self.assertTrue(reason.startswith(sweep.REVIEWED_SKIP_REASON_PREFIX), reason)
+        self.assertEqual(self._writes(), [], "no DELETE and no POST may be issued")
+
+    # -- (b) the reviews surface ------------------------------------------
+
+    def test_a_report_landing_on_the_reviews_surface_withholds_the_refire(self):
+        """Ally answered with a formal review instead.
+
+        Neither surface is sufficient alone -- verified live 2026-08-04, #952
+        carried 4 comment-shaped reviews with an EMPTY pulls/952/reviews, while
+        #937 carried 4 formal review objects and no comment-shaped one. This
+        test and the one above are the two halves of that.
+        """
+        self._install(reread_reviews=[formal_review(commit_id=self.PR_HEAD)])
+
+        _pr_payload, _head, _pending, refire, reason = self._consider()
+
+        self.assertFalse(refire)
+        self.assertTrue(reason.startswith(sweep.REVIEWED_SKIP_REASON_PREFIX), reason)
+        self.assertEqual(self._writes(), [])
+
+    # -- (c) the load-bearing negative control -----------------------------
+
+    def test_a_report_against_a_stale_head_does_not_block_the_refire(self):
+        """THE control this whole change turns on.
+
+        A naive "any Ally review present -> skip" passes (a) and (b) while
+        disabling the reconciler outright: a PR whose head has moved past an
+        older review is EXACTLY the state this sweep exists to re-fire, and
+        such a PR carries an Ally report on both surfaces permanently. Getting
+        this wrong reinstates BLO-22892 silently -- no re-fire, no alarm.
+
+        Serve the stale report to the scan AND the re-read, on BOTH surfaces:
+        nothing changed mid-run, and the write must still happen.
+        """
+        stale_reviews = [formal_review(commit_id=OTHER_SHA)]
+        stale_comments = [issue_comment(body=consolidated_body(OTHER_SHA))]
+        self._install(
+            scan_comments=stale_comments, reread_comments=stale_comments,
+            scan_reviews=stale_reviews, reread_reviews=stale_reviews,
+        )
+
+        _pr_payload, _head, _pending, refire, _reason = self._consider()
+
+        self.assertTrue(refire, "a review of a superseded head must not suppress reconciliation")
+        methods = [method for method, _url in self.calls]
+        self.assertIn("DELETE", methods)
+        self.assertIn("POST", methods)
+
+    # -- (d) the extra read is only paid for on paths that will write -------
+
+    def test_the_reviews_surface_is_not_refetched_when_the_budget_is_spent(self):
+        """may_refire=False is not going to write, so it must not pay."""
+        self._install()
+
+        _pr_payload, _head, _pending, refire, reason = self._consider(may_refire=False)
+
+        self.assertFalse(refire)
+        self.assertTrue(reason.startswith(sweep.DEFERRED_REASON_PREFIX), reason)
+        self.assertEqual(self.review_fetches, 1, "only the scan read, no guard read")
+
+    def test_dry_run_does_not_refetch_the_reviews_surface(self):
+        self._install()
+
+        _pr_payload, _head, _pending, refire, reason = self._consider(dry_run=True)
+
+        self.assertTrue(refire, "the plan still reports what a live run would do")
+        self.assertIn("DRY-RUN", reason)
+        self.assertEqual(self.review_fetches, 1, "only the scan read, no guard read")
+        self.assertEqual(self._writes(), [])
+
+    # -- cost, distinguishability, and budget ------------------------------
+
+    def test_the_guard_reads_the_reviews_surface_again_rather_than_trusting_the_scan(self):
+        """Pins the extra read itself.
+
+        If a refactor reused the scan's reviews list, (b) would still pass on
+        the comment surface alone while the reviews half of the race was fully
+        reopened -- the guard would be re-checking the very data whose
+        staleness is the defect.
+        """
+        self._install()
+
+        self._consider()
+
+        self.assertGreaterEqual(
+            self.review_fetches, 2,
+            "the write path must issue a fresh reviews read, not reuse the scan's",
+        )
+
+    def test_the_free_comment_surface_short_circuits_the_paid_reviews_read(self):
+        """Cost discipline: the paid read is reached only if the free checks pass.
+
+        The comments are already in hand from the cooldown re-read, so a report
+        found there settles it without spending a request.
+        """
+        self._install(reread_comments=[issue_comment(body=consolidated_body(self.PR_HEAD))])
+
+        self._consider()
+
+        self.assertEqual(self.review_fetches, 1, "the scan's read only")
+
+    def test_a_cooldown_block_pays_for_the_reviews_read_first(self):
+        """The deliberate cost inversion: contended no longer skips the paid read.
+
+        This test previously asserted the opposite -- that a cooldown block
+        short-circuits the reviews read -- on the premise that the comment
+        surface was the one Ally most often answers on. Measured across the 45
+        most recent PRs on 2026-09-20, the split was 57 reviews-surface to 0
+        comment-surface, so that premise was backwards and the "saving" was
+        being taken on the only surface that matters. The read is now issued
+        before the cooldown so an answered-AND-contended PR is reported as
+        answered on either surface.
+
+        The cost is bounded and small for a reason worth stating: should_refire
+        already applied the cooldown at scan time, so for it to block again
+        here a marker must have landed in the scan->write gap. That is the rare
+        concurrent-write case, not the common path.
+
+        Doubles as the AC3 distinguishability control in the other direction:
+        a cooldown skip must keep reporting the cooldown prefix, not be
+        relabelled as an already-reviewed skip.
+        """
+        self._install(reread_comments=[{"body": sweep.MARKER + "\nre-ask", "created_at": _iso(self._now() - 60)}])
+
+        _pr_payload, _head, _pending, refire, reason = self._consider()
+
+        self.assertFalse(refire)
+        self.assertTrue(reason.startswith(sweep.REREAD_SKIP_REASON_PREFIX), reason)
+        self.assertFalse(reason.startswith(sweep.REVIEWED_SKIP_REASON_PREFIX), reason)
+        self.assertEqual(
+            self.review_fetches, 2,
+            "the guard must read the reviews surface before letting the cooldown decide",
+        )
+
+    def test_a_compound_skip_reports_answered_not_contended(self):
+        """THE ordering control: when BOTH free checks fire, answered wins.
+
+        Nothing else pins the order the two free checks run in. Both withhold
+        the write, so every write-suppression test above passes under either
+        order -- which is exactly how this shipped wrong: the cooldown ran
+        first, returned REREAD_SKIP_REASON_PREFIX, and _consider_pr took the
+        contended branch. That branch deliberately KEEPS pending_since, so a PR
+        Ally had answered at this exact head still alarmed and was filed in the
+        step summary as concurrency evidence -- pointing an operator at a
+        contention problem on a PR that was simply answered.
+
+        The two facts are not equally good. "Someone re-asked 60s ago" is true
+        and says nothing about whether the PR is stranded; "Ally reported on
+        THIS head" says it is not. Serve the re-read a page carrying both.
+        """
+        self._install(reread_comments=[
+            {"body": sweep.MARKER + "\nre-ask", "created_at": _iso(self._now() - 60)},
+            issue_comment(body=consolidated_body(self.PR_HEAD)),
+        ])
+
+        _pr_payload, _head, pending_since, refire, reason = self._consider()
+
+        self.assertFalse(refire, "the write is withheld under either order")
+        self.assertTrue(
+            reason.startswith(sweep.REVIEWED_SKIP_REASON_PREFIX),
+            "answered must win over contended, got: %s" % reason,
+        )
+        self.assertIsNone(
+            pending_since,
+            "an answered PR is not stranded, so it must not carry pending_since and alarm",
+        )
+        self.assertEqual(self._writes(), [])
+        self.assertEqual(self.review_fetches, 1, "still short-circuits the paid read")
+
+    def test_a_reviews_surface_compound_skip_reports_answered_not_contended(self):
+        """The same ordering control on the surface Ally actually uses.
+
+        Identical to the test above except Ally answered with a formal review
+        rather than a comment. That distinction is the whole point: across the
+        45 most recent PRs in this repo, ZERO Ally consolidated reports landed
+        on the comment surface -- every one was on the reviews surface. So the
+        test above pins the ordering on the surface responsible for none of
+        the observed answers, and this one pins it on the surface responsible
+        for all of them. (The matching numerator drifts and is deliberately
+        not quoted here; see the ORDERING docstring in refire_still_permitted.)
+
+        This case used to land on the contended branch -- is_alarming=True,
+        filed in the step summary as concurrency evidence -- because the
+        reviews read was short-circuited once the cooldown had declined.
+        """
+        self._install(
+            reread_comments=[{"body": sweep.MARKER + "\nre-ask", "created_at": _iso(self._now() - 60)}],
+            reread_reviews=[formal_review(commit_id=self.PR_HEAD)],
+        )
+
+        _pr_payload, _head, pending_since, refire, reason = self._consider()
+
+        self.assertFalse(refire, "the write is withheld under either order")
+        self.assertTrue(
+            reason.startswith(sweep.REVIEWED_SKIP_REASON_PREFIX),
+            "answered must win over contended on the reviews surface too, got: %s" % reason,
+        )
+        self.assertIsNone(
+            pending_since,
+            "an answered PR is not stranded, so it must not carry pending_since and alarm",
+        )
+        self.assertEqual(self._writes(), [])
+
+    def test_the_two_skip_reasons_are_distinguishable(self):
+        """AC3: an operator must be able to tell "Ally answered mid-run" from
+        "re-asked too recently" off the log line, without reading the diff.
+
+        Neither prefix may be a prefix of the other, or startswith() matching
+        -- which is how main() and these tests classify -- would conflate them.
+        """
+        self.assertNotEqual(sweep.REVIEWED_SKIP_REASON_PREFIX, sweep.REREAD_SKIP_REASON_PREFIX)
+        self.assertFalse(sweep.REVIEWED_SKIP_REASON_PREFIX.startswith(sweep.REREAD_SKIP_REASON_PREFIX))
+        self.assertFalse(sweep.REREAD_SKIP_REASON_PREFIX.startswith(sweep.REVIEWED_SKIP_REASON_PREFIX))
+
+    def test_an_already_reviewed_skip_does_not_consume_a_refire_budget_slot(self):
+        """AC4: MAX_REFIRES_PER_RUN counts writes, not candidates.
+
+        sweep() decrements on the returned re-fire flag, so a PR this guard
+        withheld must leave the slot available for the next stranded PR --
+        otherwise Ally answering one PR quietly tightens the cap for the rest.
+        """
+        self._install(reread_reviews=[formal_review(commit_id=self.PR_HEAD)])
+
+        outcome = self._consider()
+
+        self.assertFalse(outcome[3], "a withheld write must not read as a re-fire")
+
+    # -- (e) an answered skip is a healthy PR, not a stranded one ------------
+
+    def test_an_answered_skip_is_not_alarming(self):
+        """The guard's success case must not fail the run red.
+
+        The scan normalizes `pending_since = None` when ally_has_reviewed_head
+        is true. The guard discovers the SAME fact minutes later, so it must
+        do the same -- otherwise main()'s `alarming` list counts a PR the
+        guard just proved is not stranded, the step summary reports it twice
+        in contradictory terms, and the job exits EXIT_ALARM on the healthiest
+        outcome the guard can produce. The fixture is pending 10h against a
+        5.5h alarm threshold, so an un-normalized tuple alarms here.
+        """
+        self._install(reread_reviews=[formal_review(commit_id=self.PR_HEAD)])
+
+        _pr_payload, _head, pending, refire, reason = self._consider()
+
+        self.assertFalse(refire)
+        self.assertTrue(reason.startswith(sweep.REVIEWED_SKIP_REASON_PREFIX), reason)
+        self.assertIsNone(pending, "an answered head is not pending, exactly as on the scan path")
+        self.assertFalse(sweep.is_alarming({"is_draft": False, "pending_since": pending}, self._now()))
+
+    def test_a_contended_skip_still_carries_pending_since_so_it_can_alarm(self):
+        """Negative control for the test above: normalize the answered branch
+        ONLY. A contended PR is still genuinely waiting on Ally -- a concurrent
+        writer re-asked, nobody answered -- so silencing its alarm would hide a
+        stranded PR behind the guard.
+        """
+        self._install(reread_comments=[{"body": sweep.MARKER + "\nre-ask", "created_at": _iso(self._now() - 60)}])
+
+        _pr_payload, _head, pending, refire, reason = self._consider()
+
+        self.assertFalse(refire)
+        self.assertTrue(reason.startswith(sweep.REREAD_SKIP_REASON_PREFIX), reason)
+        self.assertIsNotNone(pending)
+        # The carried pending_since is what lets this PR alarm once the alarm
+        # threshold has elapsed; evaluate at that instant, not at the scan's
+        # "just past the stall threshold" now, which by construction is
+        # earlier than ALARM_THRESHOLD_SECONDS.
+        alarm_now = sweep._parse_iso(PENDING_SINCE) + sweep.ALARM_THRESHOLD_SECONDS + HOUR
+        self.assertTrue(sweep.is_alarming({"is_draft": False, "pending_since": pending}, alarm_now))
+
+    def test_a_failed_reviews_reread_withholds_the_write_rather_than_writing_blind(self):
+        """Fail-closed, matching the cooldown re-read's contract.
+
+        The guard's failures are not swallowed the way request_review's are:
+        when it cannot be evaluated the safe direction is to withhold and let
+        sweep() isolate and report the PR.
+        """
+        self._install()
+        real_fetch = sweep._fetch_paginated
+
+        def fetch_then_die(api_base_url, path, token):
+            if "/reviews" in path and self.review_fetches >= 1:
+                raise urllib.error.URLError("connection reset")
+            return real_fetch(api_base_url, path, token)
+
+        sweep._fetch_paginated = fetch_then_die
+
+        with self.assertRaises(urllib.error.URLError):
+            self._consider()
+
+        self.assertEqual(self._writes(), [], "a guard that cannot be evaluated must not write")
+
+
+class TestRereadGuardResidualIsStated(unittest.TestCase):
+    """AC2: the residual must be stated, not claimed away.
+
+    The guard narrows the window from the whole scan to the gap between the
+    re-read and the POST; it cannot close it, because the GitHub comment API
+    offers no compare-and-set. This repo's failure mode of record is asserting
+    a guarantee the code does not provide, so the honesty of that docstring is
+    itself worth pinning.
+    """
+
+    def test_the_docstring_says_the_race_is_narrowed_not_eliminated(self):
+        doc = sweep.refire_still_permitted.__doc__ or ""
+        self.assertIn("RESIDUAL", doc)
+        self.assertIn("does NOT close it", doc)
+
+
+class TestCooldownReasonWordingUnderClockSkew(unittest.TestCase):
+    """The cooldown reason rendered a NEGATIVE age in exactly the headline case.
+
+    `now` is sampled once at the top of the run and shared with should_refire,
+    so a marker posted by a concurrent sweep mid-run is genuinely newer than
+    this run's clock and `since_last` goes negative -- producing
+    "re-asked -3s ago < cooldown 7200s". The decision is correct, but the line
+    reads as an arithmetic bug, and that log line is the operator's only
+    evidence that sweeps are overlapping.
+    """
+
+    NOW = 1_000_000.0
+
+    def test_a_marker_in_the_past_still_reads_as_elapsed_time(self):
+        """Negative control: the ordinary case must not be reworded."""
+        blocked, reason = sweep.cooldown_blocks_refire([self.NOW - 60], self.NOW)
+
+        self.assertTrue(blocked)
+        self.assertIn("re-asked 60s ago", reason)
+
+    def test_a_marker_newer_than_the_scan_clock_renders_no_negative_age(self):
+        blocked, reason = sweep.cooldown_blocks_refire([self.NOW + 3], self.NOW)
+
+        self.assertTrue(blocked)
+        self.assertNotIn("-3s", reason)
+        self.assertIn("3s AFTER", reason)
+
+    def test_the_skew_is_named_rather_than_clamped_away(self):
+        """max(0, ...) would render "re-asked 0s ago", which is worse: it hides
+        that the marker POSTDATES this run, which is the informative part."""
+        _blocked, reason = sweep.cooldown_blocks_refire([self.NOW + 3], self.NOW)
+
+        self.assertIn("concurrent writer", reason)
+
+    def test_the_wording_change_does_not_touch_the_decision(self):
+        """The clamp must stay out of the comparison.
+
+        A marker newer than the clock is still inside the cooldown, and one
+        older than the cooldown still permits the write.
+        """
+        self.assertTrue(sweep.cooldown_blocks_refire([self.NOW + 3], self.NOW)[0])
+        self.assertTrue(sweep.cooldown_blocks_refire([self.NOW - 1], self.NOW)[0])
+        self.assertFalse(
+            sweep.cooldown_blocks_refire([self.NOW - sweep.REFIRE_COOLDOWN_SECONDS - 1], self.NOW)[0]
+        )
+
+
+class TestGuardSkipsAreVisibleInTheStepSummary(unittest.TestCase):
+    """The guard's outcomes were the least visible of the run's, inverting the
+    priority.
+
+    `failed`, `deferred` and `alarming` each get a GITHUB_STEP_SUMMARY section.
+    The two guard outcomes did not -- they reached an operator only through the
+    per-PR stdout line. The contended count is the ONLY direct evidence that
+    dropping the concurrency group (BLO-31818) has a live cost, i.e. that
+    sweeps genuinely overlap, so it was the one you had to grep logs to find.
+    """
+
+    def setUp(self):
+        self._real_sweep = sweep.sweep
+        self._env = {
+            key: os.environ.get(key)
+            for key in ("GITHUB_REPOSITORY", "GITHUB_TOKEN", "GITHUB_STEP_SUMMARY")
+        }
+        os.environ["GITHUB_REPOSITORY"] = "Blockcast/paperclip"
+        os.environ["GITHUB_TOKEN"] = "t"
+        handle = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False)
+        handle.close()
+        self.summary_path = handle.name
+        os.environ["GITHUB_STEP_SUMMARY"] = self.summary_path
+
+    def tearDown(self):
+        sweep.sweep = self._real_sweep
+        os.unlink(self.summary_path)
+        for key, value in self._env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def _summary_for(self, results):
+        sweep.sweep = lambda *a, **k: results
+        self.exit_code = 0
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                sweep.main([])
+        except SystemExit as exc:
+            self.exit_code = exc.code
+        with open(self.summary_path, encoding="utf-8") as handle:
+            return handle.read()
+
+    def _skip(self, number, prefix, detail, pending_since=None):
+        # `pending_since` defaults to None, which is what _consider_pr returns
+        # for an ANSWERED skip; pass a real epoch to model a CONTENDED one,
+        # which keeps the stale wait so it can still alarm.
+        return (_pr(number), "%040x" % number, pending_since, False, "%s -- %s" % (prefix, detail))
+
+    def test_a_contended_skip_past_the_alarm_threshold_still_alarms(self):
+        """The two guard outcomes carry different `pending_since`, and the
+        alarm follows it. A contended PR (a concurrent writer re-asked, nobody
+        answered) is still stranded, so it appears in BOTH the guard section
+        and the alarm section -- the same PR, consistently -- and the run exits
+        EXIT_ALARM. Contrast the answered case below.
+        """
+        stale = time.time() - sweep.ALARM_THRESHOLD_SECONDS - HOUR
+        summary = self._summary_for([
+            self._skip(1, sweep.REREAD_SKIP_REASON_PREFIX, "re-asked 3s ago", pending_since=stale),
+        ])
+
+        self.assertIn("1 contended", summary)
+        self.assertIn(":rotating_light:", summary)
+        self.assertEqual(self.exit_code, sweep.EXIT_ALARM)
+
+    def test_an_answered_skip_never_reaches_the_alarm_section(self):
+        """An answered skip arrives with `pending_since=None` (pinned on the
+        real tuple in TestPreWriteAllyReviewedGuard), so main() must not
+        report the same PR as both healthy and stranded, nor exit red on it.
+        """
+        summary = self._summary_for([
+            self._skip(1, sweep.REVIEWED_SKIP_REASON_PREFIX, "consolidated report on the comment surface"),
+        ])
+
+        self.assertIn("1 answered", summary)
+        self.assertNotIn(":rotating_light:", summary)
+        self.assertEqual(self.exit_code, 0)
+
+    def test_a_contended_skip_is_named_as_concurrency_evidence(self):
+        summary = self._summary_for([
+            self._skip(1, sweep.REREAD_SKIP_REASON_PREFIX, "re-asked 3s AFTER this run's scan clock"),
+        ])
+
+        self.assertIn("withheld by the pre-write guard", summary)
+        self.assertIn("1 contended", summary)
+        self.assertIn("BLO-31818", summary, "the summary must name the concurrency-group cost")
+        self.assertIn("#1", summary)
+
+    def test_an_answered_skip_is_reported_separately_from_a_contended_one(self):
+        """AC3 on the summary surface, not only on the per-PR log line.
+
+        Collapsing the two would make a healthy outcome (Ally answered
+        mid-run) read as evidence of contention, which is the specific
+        misreading the separate counts exist to prevent.
+        """
+        summary = self._summary_for([
+            self._skip(1, sweep.REVIEWED_SKIP_REASON_PREFIX, "consolidated report on the reviews surface"),
+        ])
+
+        self.assertIn("1 answered", summary)
+        self.assertNotIn("contended", summary)
+
+    def test_both_kinds_are_counted_separately_in_one_run(self):
+        summary = self._summary_for([
+            self._skip(1, sweep.REREAD_SKIP_REASON_PREFIX, "marker"),
+            self._skip(2, sweep.REVIEWED_SKIP_REASON_PREFIX, "comment surface"),
+            self._skip(3, sweep.REVIEWED_SKIP_REASON_PREFIX, "reviews surface"),
+        ])
+
+        self.assertIn("3 re-fire(s) withheld", summary)
+        self.assertIn("1 contended", summary)
+        self.assertIn("2 answered", summary)
+
+    def test_a_clean_run_writes_no_guard_section(self):
+        """Negative control: the section is conditional, not always-on.
+
+        An unconditional block would put a permanent "0 withheld" line on
+        every summary, which is how a signal stops being read.
+        """
+        summary = self._summary_for([(_pr(1), "%040x" % 1, None, False, "skip: not pending")])
+
+        self.assertNotIn("withheld by the pre-write guard", summary)
 
 
 if __name__ == "__main__":

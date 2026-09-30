@@ -81,6 +81,22 @@ export interface IssueLivenessWaitingPathInput {
   status: string;
 }
 
+/**
+ * BLO-22660: the one waiting path that ages out, so the only one carrying a timestamp.
+ *
+ * `createdAt` is a REQUIRED key whose value may be null/undefined, not an optional key. The
+ * fail-open is unchanged -- null, undefined and unparseable all still read as fresh -- but
+ * *omitting* the field is now a compile error. It was optional, and
+ * `listIssueBlockedInboxAttentionMap` duly selected the column, typed it, and then dropped it
+ * building this input, so every card read as fresh forever on the operator-facing surface
+ * while the recovery sweep aged it out. That pair of producers had already drifted once on
+ * `parkedUntil` (BLO-27912) and the comment asking the next author to keep them in step did
+ * not prevent this one; a required key does.
+ */
+export interface IssueLivenessPendingInteractionInput extends IssueLivenessWaitingPathInput {
+  createdAt: Date | string | null | undefined;
+}
+
 export interface IssueLivenessDependencyPathEntry {
   issueId: string;
   identifier: string | null;
@@ -123,9 +139,17 @@ export interface IssueGraphLivenessInput {
   agents: IssueLivenessAgentInput[];
   activeRuns?: IssueLivenessExecutionPathInput[];
   queuedWakeRequests?: IssueLivenessExecutionPathInput[];
-  pendingInteractions?: IssueLivenessWaitingPathInput[];
+  pendingInteractions?: IssueLivenessPendingInteractionInput[];
   pendingApprovals?: IssueLivenessWaitingPathInput[];
   openRecoveryIssues?: IssueLivenessWaitingPathInput[];
+  /**
+   * PEN-3198: rows carrying an open, webhook-written PR that is still inside the
+   * attendance grace. Supplied pre-indexed by the caller because this module is pure and
+   * the underlying evidence lives in `issue_work_products` — see
+   * `openPullRequestWakePathConditions` in `service.ts` for the single definition of
+   * which rows qualify.
+   */
+  openPullRequestAttendance?: IssueLivenessWaitingPathInput[];
   now?: Date | string;
 }
 
@@ -142,11 +166,42 @@ function pathEntry(issue: IssueLivenessIssueInput): IssueLivenessDependencyPathE
   };
 }
 
+/**
+ * BLO-33225: memoized per `agentsById` instance, and that is the whole point of the
+ * WeakMap rather than a plain call.
+ *
+ * `isAgentInvokable` walks the org chain, so it is not cheap, and this used to
+ * re-materialize the entire agent list (`[...agentsById.values()]`) on every call. The
+ * classifier calls it once per owner candidate over the full issue graph, so at ~40k
+ * issues the CPU profile attributed ~1.9 s of self time per classify pass to
+ * `getAgentOrgChainHealth` alone, plus the GC of one throwaway array per call. That is a
+ * synchronous stall on the worker event loop — `reconcileIssueGraphLiveness` classifies
+ * twice per tick — and it sat 2.2 s under the readiness timeout (BLO-31945).
+ *
+ * Sound because the result is a pure function of `(agent, agents)` and `agentsById` is
+ * built once per classify pass and never mutated, so agent id is a complete key. Keyed on
+ * the map instance so a later pass with a different agent set cannot read a stale answer.
+ */
+const invokableAgentMemo = new WeakMap<
+  Map<string, IssueLivenessAgentInput>,
+  { agents: IssueLivenessAgentInput[]; byAgentId: Map<string, boolean> }
+>();
+
 function isInvokableAgent(
   agent: IssueLivenessAgentInput | null | undefined,
   agentsById: Map<string, IssueLivenessAgentInput>,
 ) {
-  return Boolean(agent && isAgentInvokable({ agent, agents: [...agentsById.values()] }));
+  if (!agent) return false;
+  let memo = invokableAgentMemo.get(agentsById);
+  if (!memo) {
+    memo = { agents: [...agentsById.values()], byAgentId: new Map() };
+    invokableAgentMemo.set(agentsById, memo);
+  }
+  const cached = memo.byAgentId.get(agent.id);
+  if (cached !== undefined) return cached;
+  const invokable = isAgentInvokable({ agent, agents: memo.agents });
+  memo.byAgentId.set(agent.id, invokable);
+  return invokable;
 }
 
 function isNonExecutingAttributionAgent(agent: IssueLivenessAgentInput) {
@@ -154,24 +209,57 @@ function isNonExecutingAttributionAgent(agent: IssueLivenessAgentInput) {
   return agent.status === "paused" && agent.pauseReason === "manual" && heartbeat?.enabled === false;
 }
 
-function hasActiveExecutionPath(
-  companyId: string,
-  issueId: string,
-  activeRuns: IssueLivenessExecutionPathInput[],
-  queuedWakeRequests: IssueLivenessExecutionPathInput[],
-) {
-  return [...activeRuns, ...queuedWakeRequests].some(
-    (entry) => entry.companyId === companyId && entry.issueId === issueId,
-  );
+/**
+ * BLO-33225: index a waiting-path list by `(companyId, issueId)` once per classify pass.
+ *
+ * These lookups used to be `.some()` linear scans, and `hasActiveExecutionPath`
+ * additionally spread both of its lists into a fresh array on every call. Called from
+ * `hasExplicitWaitingPath` over the whole issue graph that is O(issues x paths) with one
+ * throwaway allocation per issue; the CPU profile attributed ~0.8 s of self time per
+ * classify pass to it at ~40k issues, and the term grows with the number of open
+ * runs/wakes/interactions/approvals/recovery rows rather than with anything bounded.
+ */
+const pathKey = (companyId: string, issueId: string) => `${companyId}\u0000${issueId}`;
+
+function pathKeySet(...lists: { companyId: string; issueId: string | null }[][]) {
+  const keys = new Set<string>();
+  for (const list of lists) {
+    for (const entry of list) {
+      // `!= null`, not truthiness: the lookup side keys `pathKey(issue.companyId, issue.id)`
+      // unconditionally, so dropping an empty-string id here would diverge from the
+      // `entry.issueId === issueId` scan this replaced.
+      if (entry.issueId != null) keys.add(pathKey(entry.companyId, entry.issueId));
+    }
+  }
+  return keys;
 }
 
-function hasWaitingPath(
-  companyId: string,
-  issueId: string,
-  waitingPaths: IssueLivenessWaitingPathInput[],
-) {
-  return waitingPaths.some((entry) => entry.companyId === companyId && entry.issueId === issueId);
-}
+/**
+ * BLO-22660: a pending interaction stops counting as a live waiting path after 24h.
+ *
+ * Measured instance: BLO-22464 sat `in_review` for 17 days with no monitor, run, retry or
+ * recovery action and was never classified as needing attention, because one
+ * `request_confirmation` card had been pending for 32 days. `continuationPolicy` fires when the
+ * card is *answered*, which has no relationship to whoever the card's prose names - so a card
+ * naming a decider routes to nobody while still reading as ownership. A missing `createdAt`
+ * counts as fresh: this only ever drops a path we can prove is stale.
+ *
+ * Exported so that detection and remediation cannot disagree about the same card: the other
+ * consumer is `hasPendingWakeInteraction` in `service.ts`, which gates the sweeps that act on
+ * the findings minted here. Bounding only one half means the classifier ages a card out and
+ * mints a finding while the sweep declines to act because the card still reads as live.
+ *
+ * NOT an exhaustive list of places that believe "a pending card is a live wake path". At
+ * least two others are deliberately left unbounded, because they gate WAKES rather than
+ * findings and so fail in the opposite direction:
+ * `listBlockedIssueAutoResumeSuppressions` (`issues.ts`, `pending_interaction` suppression)
+ * and `explicitlyWaitingIssueIds` in the resolved-blocker sweep. Ageing a card out here costs
+ * a finding on a row that may be genuinely waiting; ageing one out there spends agent runs
+ * re-waking an assignee who cannot move the row, every tick, for as long as the human queue
+ * is deep -- and it is measured in weeks. If you bound those, bound them on their own
+ * evidence, not on this constant's say-so.
+ */
+export const PENDING_INTERACTION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 function readRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -439,6 +527,21 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
   const pendingInteractions = input.pendingInteractions ?? [];
   const pendingApprovals = input.pendingApprovals ?? [];
   const openRecoveryIssues = input.openRecoveryIssues ?? [];
+  const openPullRequestAttendance = input.openPullRequestAttendance ?? [];
+  const livePendingInteractions: IssueLivenessPendingInteractionInput[] = [];
+  const stalePendingInteractions: IssueLivenessPendingInteractionInput[] = [];
+  for (const entry of pendingInteractions) {
+    const createdAtMs = readDateMs(entry.createdAt);
+    const stale = createdAtMs !== null && nowMs - createdAtMs >= PENDING_INTERACTION_MAX_AGE_MS;
+    (stale ? stalePendingInteractions : livePendingInteractions).push(entry);
+  }
+  // Indexed once per pass rather than scanned per issue — see `pathKeySet` (BLO-33225).
+  const executionPathKeys = pathKeySet(activeRuns, queuedWakeRequests);
+  const interactionPathKeys = pathKeySet(livePendingInteractions);
+  const staleInteractionPathKeys = pathKeySet(stalePendingInteractions);
+  const approvalPathKeys = pathKeySet(pendingApprovals);
+  const recoveryPathKeys = pathKeySet(openRecoveryIssues);
+  const openPullRequestPathKeys = pathKeySet(openPullRequestAttendance);
 
   for (const relation of input.relations) {
     const list = blockersByBlockedIssueId.get(relation.blockedIssueId) ?? [];
@@ -473,7 +576,7 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
   /**
    * Does somebody or something own the next action on this issue?
    *
-   * Six of the seven satisfiers are reachable only by the row's own assignee, which is what
+   * Six of the eight satisfiers are reachable only by the row's own assignee, which is what
    * BLO-27912 records as a defect rather than a design: a *deliberately parked* row is by
    * construction one its assignee is not working on, so an invariant whose only escape
    * hatch is the assignee is unsatisfiable exactly where it fires hardest. Three
@@ -498,15 +601,76 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
    * this predicate, so a park cannot make a cancelled blocker acceptable. Parking says
    * nobody should be working on this yet; it does not say a dependency on a cancelled row
    * is a coherent thing to wait for.
+   *
+   * Nor does a park reach `in_review`'s write-side gate — `assertAgentInReviewReviewPath`
+   * in routes/issues.ts, which answers this same question on the write path and accepts a
+   * strict SUBSET of the paths this module honours. Four of its five are arms of this
+   * predicate. The fifth, `typed_execution_state_current_participant`, is NOT: it is
+   * honoured by `reviewFinding` below instead, under a stricter test than the validator's
+   * (the participant must be an invokable agent of the same company, not merely a non-empty
+   * agentId). Do not migrate it here to "complete" the subset: `reviewFinding` early-returns
+   * on this predicate, so an arm for the participant would make its participant branch
+   * unreachable and silently delete `invalid_review_participant` detection, on every status
+   * and every rule. The reverse direction does not hold either and must not be "fixed":
+   * BLO-33572 records why the park in particular stays off the validator's list (a park
+   * asserts nobody is acting, `in_review` asserts someone is), and PEN-2853 records the same
+   * asymmetry for the monitor. Widening the validator is a semantic change; go read its
+   * comment first.
+   *
+   * `openPullRequestPathKeys` is the eighth (PEN-3198) and the only one no *person* sets
+   * at all: it is written by the GitHub webhook. That matters for the BLO-27912 defect
+   * above rather than merely lengthening the list. Every other satisfier is a claim by
+   * somebody inside Paperclip that attention exists; this one is the external event
+   * source itself saying a wake will arrive when the PR next moves.
+   *
+   * Why it was missing, and why that was not an oversight: the satisfier set was complete
+   * with respect to Paperclip's own objects, and became incomplete with respect to company
+   * policy the moment PEN-3167 moved a class of asks out to GitHub. Filed by @SecEng after
+   * withdrawing a merge-press card under that policy left PEN-3006 with its next action
+   * living entirely on a surface this classifier does not read — the withdrawn card had
+   * been the `approval` satisfier, so obeying the policy is what tripped the invariant.
+   * `service.ts`'s `hasOpenPullRequestWakePath` had already ruled that an open
+   * webhook-written PR is evidence of attendance (PEN-2791); it was simply never extended
+   * to this second gate.
+   *
+   * BOUNDED, and the bound is the load-bearing half. Openness alone would be a silent
+   * unbounded wait, which is a worse failure than the noisy bounded one being fixed here:
+   * a false alarm is visible and a missing alarm is not. The caller applies
+   * `openPullRequestAttendanceGraceMs` (7d) so a PR nobody ever touches stops counting.
+   * Measured counter-example behind that insistence: PEN-3048's PR has been open since
+   * 2026-09-10 with no human ever asked to review it — under bare openness that row would
+   * have gone quiet permanently.
+   *
+   * ⚠️ Deliberately keyed on the PR being OPEN AND RECENTLY MOVED, never on
+   * `requested_reviewers`. That field was measured and rejected for this purpose:
+   * `pr-review-request-ageing.ts` found 135 of 145 apparently-request-free PRs actually
+   * carried a pending request whose reviewer the App token cannot read, because a request
+   * against a *team* is invisible to it. A `requested_reviewers`-based rule would read
+   * most live requests as absent and be largely inert on the repository generating most of
+   * this traffic.
    */
   function hasExplicitWaitingPath(issue: IssueLivenessIssueInput) {
+    const key = pathKey(issue.companyId, issue.id);
     return Boolean(issue.assigneeUserId) ||
       hasScheduledMonitor(issue, nowMs) ||
       hasActiveParkedDisposition(issue, nowMs) ||
-      hasActiveExecutionPath(issue.companyId, issue.id, activeRuns, queuedWakeRequests) ||
-      hasWaitingPath(issue.companyId, issue.id, pendingInteractions) ||
-      hasWaitingPath(issue.companyId, issue.id, pendingApprovals) ||
-      hasWaitingPath(issue.companyId, issue.id, openRecoveryIssues);
+      executionPathKeys.has(key) ||
+      interactionPathKeys.has(key) ||
+      approvalPathKeys.has(key) ||
+      recoveryPathKeys.has(key) ||
+      openPullRequestPathKeys.has(key);
+  }
+
+  /**
+   * BLO-22660: did this issue lose its waiting path only because an interaction aged out?
+   *
+   * Every `hasExplicitWaitingPath` caller can now newly fire on such a row, so every finding
+   * reachable from one has to say so. The default prose asserts no interaction exists and
+   * recommends adding one — both false here, and the second recommends a second card of
+   * exactly the kind that caused the finding.
+   */
+  function hasStaleInteraction(issue: IssueLivenessIssueInput) {
+    return staleInteractionPathKeys.has(pathKey(issue.companyId, issue.id));
   }
 
   /**
@@ -578,20 +742,27 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
       includeStalledAssignee: true,
     });
     const isSelf = deadEnd.id === source.id;
+    const stale = hasStaleInteraction(deadEnd);
+    const pathClause = stale
+      ? "no unresolved blockers and no live action path — its issue-thread interaction has been pending over 24h"
+      : "no unresolved blockers and no wake, active run, human owner, interaction, approval, monitor, or recovery issue owning the next action";
 
     return finding({
       issue: source,
       state: "blocked_without_blockers",
       reason: isSelf
-        ? `${issueLabel(deadEnd)} is blocked with no unresolved blockers and no wake, active run, human owner, interaction, approval, monitor, or recovery issue owning the next action, so nothing can ever unblock it.`
-        : `${issueLabel(source)} is blocked by ${issueLabel(deadEnd)}, which is itself blocked with no unresolved blockers and no wake, active run, human owner, interaction, approval, monitor, or recovery issue owning the next action.`,
+        ? `${issueLabel(deadEnd)} is blocked with ${pathClause}, so nothing can ever unblock it.`
+        : `${issueLabel(source)} is blocked by ${issueLabel(deadEnd)}, which is itself blocked with ${pathClause}.`,
       dependencyPath,
       recoveryIssue: deadEnd,
       recommendedOwnerCandidateAgentIds: ownerCandidates.map((candidate) => candidate.agentId),
       recommendedOwnerCandidates: ownerCandidates,
       recommendedAction:
         `Review ${issueLabel(deadEnd)} and give it a next action: move it back to todo/in_progress so its assignee wakes, ` +
-        `add the blocker it is actually waiting on, assign a human owner or interaction if it is intentionally parked, ` +
+        `add the blocker it is actually waiting on, ` +
+        (stale
+          ? `resolve or withdraw its stale interaction and record the current owner, `
+          : `assign a human owner or interaction if it is intentionally parked, `) +
         `or close it if it is no longer required.`,
       blockerIssueId: deadEnd.id,
     });
@@ -656,11 +827,24 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     // ownerCandidates so unassigned issues don't sit silently forever.
     if (reviewIssue.assigneeUserId) return null;
 
+    // The assignee split stays the OUTER condition: an unassigned row needs the "no
+    // assignee" fact and the "assign an owner" instruction whether or not a stale card is
+    // what un-suppressed it. Leading on staleness told an unassigned row to "record the
+    // current owner" -- an owner that by construction does not exist.
+    const staleInteraction = hasStaleInteraction(reviewIssue);
     const reason = reviewIssue.assigneeAgentId
-      ? `${issueLabel(reviewIssue)} is in review with an agent assignee but no participant, interaction, approval, user owner, wake, active run, or recovery issue owning the next action.`
-      : `${issueLabel(reviewIssue)} is in review with no assignee and no participant, interaction, approval, user owner, wake, active run, or recovery issue owning the next action.`;
+      ? staleInteraction
+        ? `${issueLabel(reviewIssue)} is in review with an agent assignee but no live action path — its pending issue-thread interaction is older than 24h.`
+        : `${issueLabel(reviewIssue)} is in review with an agent assignee but no participant, interaction, approval, user owner, wake, active run, recent open pull request, or recovery issue owning the next action.`
+      : staleInteraction
+      ? `${issueLabel(reviewIssue)} is in review with no assignee and no live action path — its pending issue-thread interaction is older than 24h.`
+      : `${issueLabel(reviewIssue)} is in review with no assignee and no participant, interaction, approval, user owner, wake, active run, recent open pull request, or recovery issue owning the next action.`;
     const recommendedAction = reviewIssue.assigneeAgentId
-      ? `Review ${issueLabel(reviewIssue)} and make the next action explicit: add a reviewer/interaction, return it to active work with a change request, mark it done if accepted, or open a bounded recovery issue.`
+      ? staleInteraction
+        ? `Resolve or withdraw ${issueLabel(reviewIssue)}'s stale interaction, then record the current owner and the next action.`
+        : `Review ${issueLabel(reviewIssue)} and make the next action explicit: add a reviewer/interaction or request a review on its linked pull request, return it to active work with a change request, mark it done if accepted, or open a bounded recovery issue.`
+      : staleInteraction
+      ? `Assign ${issueLabel(reviewIssue)} to a clear owner from the project / chain-of-command, then resolve or withdraw its stale interaction, or move it back to an active status with a change request.`
       : `Assign ${issueLabel(reviewIssue)} to a clear owner from the project / chain-of-command, or move it back to an active status with a change request.`;
 
     return finding({
@@ -715,16 +899,23 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     }
 
     if (blocker.status === "backlog" && blocker.assigneeAgentId) {
+      const stale = hasStaleInteraction(blocker);
       return finding({
         issue: source,
         state: "blocked_by_assigned_backlog_issue",
-        reason: `${issueLabel(source)} is blocked by assigned backlog issue ${issueLabel(blocker)} with no wake, active run, human owner, interaction, approval, monitor, or recovery issue owning the next action.`,
+        reason: stale
+          ? `${issueLabel(source)} is blocked by assigned backlog issue ${issueLabel(blocker)} with no live action path — its issue-thread interaction has been pending over 24h.`
+          : `${issueLabel(source)} is blocked by assigned backlog issue ${issueLabel(blocker)} with no wake, active run, human owner, interaction, approval, monitor, or recovery issue owning the next action.`,
         dependencyPath,
         recoveryIssue: blocker,
         recommendedOwnerCandidateAgentIds: ownerCandidates.map((candidate) => candidate.agentId),
         recommendedOwnerCandidates: ownerCandidates,
         recommendedAction:
-          `Review ${issueLabel(blocker)} and either move it to todo so the assignee wakes, assign a human owner or interaction if it is intentionally parked, or remove it from ${issueLabel(source)}'s blockers if it is no longer required.`,
+          `Review ${issueLabel(blocker)} and either move it to todo so the assignee wakes, ` +
+          (stale
+            ? `resolve or withdraw its stale interaction and record the current owner, `
+            : `assign a human owner or interaction if it is intentionally parked, `) +
+          `or remove it from ${issueLabel(source)}'s blockers if it is no longer required.`,
         blockerIssueId: blocker.id,
       });
     }

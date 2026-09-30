@@ -175,9 +175,15 @@ function registerModuleMocks() {
     issueService: () => mockIssueService,
   }));
 
-  vi.doMock("../services/issue-recovery-actions.js", () => ({
-    issueRecoveryActionService: () => mockIssueRecoveryActionService,
-  }));
+  // Spread the real module: recovery-observability.ts imports value exports from here
+  // (RESOLVED_ASSIGNEE_AGENT_ID_EVIDENCE_KEY), and a total mock drops them.
+  vi.doMock("../services/issue-recovery-actions.js", async () => {
+    const actual = await vi.importActual<typeof import("../services/issue-recovery-actions.js")>("../services/issue-recovery-actions.js");
+    return {
+      ...actual,
+      issueRecoveryActionService: () => mockIssueRecoveryActionService,
+    };
+  });
 
   vi.doMock("../services/secrets.js", () => ({
     secretService: () => mockSecretService,

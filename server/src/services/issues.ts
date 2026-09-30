@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { and, asc, desc, eq, exists, gt, gte, inArray, isNotNull, isNull, like, lt, lte, ne, notInArray, or, sql, type SQL } from "drizzle-orm";
-import type { Db } from "@paperclipai/db";
+import type { Db, DbTransaction } from "@paperclipai/db";
 import {
   activityLog,
   agentWakeupRequests,
@@ -19,6 +19,7 @@ import {
   heartbeatRuns,
   routineRuns,
   executionWorkspaces,
+  externalRuntimeReservations,
   issueApprovals,
   issueAttachments,
   issueCreateIdempotencyKeys,
@@ -74,6 +75,10 @@ import {
   type ExecutionWorkspaceConfig,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
+import {
+  assertPluginFencingGeneration,
+  type ResolvedPluginFencingPrecondition,
+} from "./plugin-fencing.js";
 import { incrementBlockerResolvedWakeMetric } from "./blocker-resolved-wake-metrics.js";
 import {
   checkoutRestoreStatusExpression,
@@ -110,14 +115,16 @@ import {
   ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES,
   TERMINAL_HEARTBEAT_RUN_STATUS_VALUES,
   TERMINAL_HEARTBEAT_RUN_STATUSES,
+  runOwnsIssueExecutionLock,
 } from "./issue-execution-lock.js";
-import { instanceSettingsService } from "./instance-settings.js";
+import { instanceSettingsService, readInstanceSettingsOn } from "./instance-settings.js";
 import {
   assertNotDuplicatePrReviewIssue,
   lockPrReviewIssueScopes,
+  normalizePrReviewRepoFullName,
 } from "./pr-review-duplicate-issue-guard.js";
 import { redactCurrentUserText } from "../log-redaction.js";
-import { redactSensitiveText } from "../redaction.js";
+import { redactRunError, redactSensitiveText } from "../redaction.js";
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
 import {
   evaluateIssueRepoBinding,
@@ -142,6 +149,15 @@ import { runEvidenceGate, type EvidenceFetchResult } from "./evidence-gate-wirin
 import { countDoneWhenBullets } from "./evidence-gate.js";
 import { shouldBlockNarratedDone } from "./done-gate.js";
 import {
+  githubFetchPrHeadSha,
+  githubFetchPrAuthorLogin,
+  githubGetPullRequestGate,
+  githubHasCommitEvidence,
+  githubListReviewerSurfacesAtPr,
+} from "./github-app-auth.js";
+import { buildGithubTruthProbe, type TruthProbe } from "./evidence-truth.js";
+import { loadConfig } from "../config.js";
+import {
   parseIssueGraphLivenessIncidentKey,
   RECOVERY_ORIGIN_KINDS,
 } from "./recovery/origins.js";
@@ -151,7 +167,7 @@ import {
   type RoutineSchedulerHeartbeatIssue,
   type SchedulerHeartbeatAddComment,
 } from "./recovery/routine-scheduler-heartbeat.js";
-import { classifyIssueGraphLiveness, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
+import { classifyIssueGraphLiveness, PENDING_INTERACTION_MAX_AGE_MS, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
 import {
   ACTIVE_RECOVERY_ACTION_STATUSES,
   BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES,
@@ -944,11 +960,38 @@ type IssueScheduledRetryProjection = {
   scheduledRetryAt: Date | null;
   scheduledRetryReason: string | null;
   scheduledRetryAttempt: number | null;
+  // BLO-29965: WHICH run is parked on this retry. The single-issue read
+  // (`getCurrentScheduledRetryForIssue`) has always returned `runId`; the list
+  // projection dropped it, so a list consumer could see that *a* retry was
+  // armed but not whether it was its own. Self-selection has to tell those
+  // apart: deferring to your own parked retry strands the row.
+  scheduledRetryRunId: string | null;
+  // BLO-29965 review round 3. WHICH AGENT owns that retry. `scheduledRetryRunId`
+  // alone only answers "is this my run?", and a reassigned issue keeps the
+  // previous assignee's retry row alive, so the new assignee read "not my run"
+  // as "a sibling holds it" and hid its own work. Sibling means same agent.
+  scheduledRetryAgentId: string | null;
+  // BLO-29965 review round 4. EVERY run parked on this issue, in the same
+  // tie-break order. The fields above describe one row, the earliest-due, which
+  // is what list/detail parity needs; the self-selection guard needs more. A
+  // reassigned issue keeps the previous assignee's retry alive, and a stale row
+  // is older, so it wins earliest-due by construction and would hide a live
+  // sibling retry due later.
+  scheduledRetryParkedRuns: ReadonlyArray<IssueParkedScheduledRetry>;
+};
+type IssueParkedScheduledRetry = {
+  runId: string;
+  agentId: string;
+  scheduledRetryAt: Date | null;
+  scheduledRetryReason: string | null;
 };
 const EMPTY_SCHEDULED_RETRY_PROJECTION: IssueScheduledRetryProjection = {
   scheduledRetryAt: null,
   scheduledRetryReason: null,
   scheduledRetryAttempt: null,
+  scheduledRetryRunId: null,
+  scheduledRetryAgentId: null,
+  scheduledRetryParkedRuns: [],
 };
 type IssueWithLabelsAndRun = IssueWithLabels
   & { activeRun: IssueActiveRunRow | null }
@@ -999,7 +1042,6 @@ type IssueUserContextInput = {
 };
 type ProjectGoalReader = Pick<Db, "select">;
 type DbReader = Pick<Db, "select">;
-type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
 /**
  * Serialize mutations to the issue parent/blocker graph for one company.
@@ -1038,8 +1080,17 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   trustExplicitResponsibleUserId?: boolean;
   idempotencyKey?: string | null;
   allowDuplicate?: boolean;
-  onDeduplicated?: (reason: "idempotency_key" | "recent_open_title") => void;
+  prReviewTarget?: { repoFullName: string; prNumber: number } | null;
+  onDeduplicated?: (reason: "idempotency_key" | "recent_open_title" | "pr_review_target") => void;
   beforeSideEffects?: (tx: DbTransaction) => Promise<void> | void;
+  /**
+   * Fencing generation the caller must still hold for this create to run. Set
+   * only by the plugin RPC host, which resolves the namespace from the
+   * authenticated plugin. Checked under a share lock as the transaction's first
+   * statement, so a displaced caller is rejected before it takes the aggregate
+   * advisory lock or mints a provider-side issue. See `plugin-fencing.ts`.
+   */
+  fencingPrecondition?: ResolvedPluginFencingPrecondition | null;
 };
 type IssueChildCreateInput = IssueCreateInput & {
   acceptanceCriteria?: string[];
@@ -1137,7 +1188,9 @@ export type BlockedIssueAutoResumeSuppressionReason =
   | "workspace_preflight_blocked"
   | "active_recovery_action"
   | "monitor_gate"
-  | "convergence_stalled";
+  | "convergence_stalled"
+  /** A `doc/execution-semantics.md` two-line external-wait declaration (BLO-30445). */
+  | "external_wait";
 export type BlockedIssueAutoResumeSuppression = {
   issueId: string;
   reason: BlockedIssueAutoResumeSuppressionReason;
@@ -1490,6 +1543,7 @@ async function listPendingFinalizeBlockerIssueIds(
     .select({
       issueId: workspaceOperations.issueId,
       executionWorkspaceId: workspaceOperations.executionWorkspaceId,
+      heartbeatRunId: workspaceOperations.heartbeatRunId,
       phase: workspaceOperations.phase,
       status: workspaceOperations.status,
       startedAt: workspaceOperations.startedAt,
@@ -1503,8 +1557,14 @@ async function listPendingFinalizeBlockerIssueIds(
       ),
     );
 
-  const latestAttributedByBlockerWorkspace = new Map<string, { phase: string; status: string; startedAt: Date }>();
-  const latestUnattributedByWorkspace = new Map<string, { phase: string; status: string; startedAt: Date }>();
+  type LatestOperation = {
+    phase: string;
+    status: string;
+    startedAt: Date;
+    heartbeatRunId: string | null;
+  };
+  const latestAttributedByBlockerWorkspace = new Map<string, LatestOperation>();
+  const latestUnattributedByWorkspace = new Map<string, LatestOperation>();
   for (const row of rows) {
     if (!row.executionWorkspaceId) continue;
     if (row.issueId) {
@@ -1516,6 +1576,7 @@ async function listPendingFinalizeBlockerIssueIds(
           phase: row.phase,
           status: row.status,
           startedAt: row.startedAt,
+          heartbeatRunId: row.heartbeatRunId,
         });
       }
       continue;
@@ -1527,15 +1588,99 @@ async function listPendingFinalizeBlockerIssueIds(
         phase: row.phase,
         status: row.status,
         startedAt: row.startedAt,
+        heartbeatRunId: row.heartbeatRunId,
       });
     }
   }
 
-  for (const pair of blockerWorkspacePairs) {
+  // The barrier waits for a finalize that only a *run* can deliver. Resolve the
+  // status of the run that owes each unfinalized operation so a run that can no
+  // longer deliver one does not gate its dependents forever (see below).
+  //
+  // Resolved ONCE, deliberately. The run-id lookup below and the decision loop
+  // after it must agree on which op is the relevant one for a pair: the first
+  // decides which run ids get fetched, the second decides using those fetches.
+  // Written as two loops they agree only by convention, and an edit to the
+  // resolution rule landing in just one of them produces a silent miss — the
+  // decision asks `owingRunStatusById` for an id the lookup never fetched,
+  // `get()` returns `undefined`, and the barrier fails closed on a run that is
+  // in fact dead. That is the PEN-3255 strand restored, with both loops still
+  // individually self-consistent and no test able to see it. Sharing the array
+  // makes the coupling structural instead.
+  //
+  // Note on the `??` fallback below: on a `shared_workspace` it is keyed by
+  // workspace alone, so a blocker with no attributed op inherits whichever run
+  // last wrote an *unattributed* op there. Before the run-status check that
+  // fallback could only ever hold the gate SHUT; it can now also RELEASE it,
+  // off the death of a run that may never have worked on this blocker. Its
+  // precision is therefore load-bearing in both directions where it used to be
+  // load-bearing in one. Left as-is deliberately: reaching it needs a blocker
+  // with zero attributed ops on a workspace that has unattributed ones, and the
+  // direction it errs in is the one this module's "fail toward releasing"
+  // doctrine prefers to a permanent strand. If those unattributed rows turn out
+  // to be legacy-only, narrow this to an `issueId`-scoped lookup.
+  const unfinalized = blockerWorkspacePairs.flatMap((pair) => {
     const latest = latestAttributedByBlockerWorkspace.get(`${pair.blockerIssueId}:${pair.executionWorkspaceId}`)
       ?? latestUnattributedByWorkspace.get(pair.executionWorkspaceId);
-    if (!latest) continue; // no ops recorded -> nothing to finalize for this blocker
-    if (latest.phase === "workspace_finalize" && latest.status === "succeeded") continue;
+    // No ops recorded -> nothing to finalize for this blocker. An op that IS a
+    // succeeded finalize has already cleared the barrier.
+    if (!latest) return [];
+    if (latest.phase === "workspace_finalize" && latest.status === "succeeded") return [];
+    return [{ pair, latest }];
+  });
+
+  const owingRunIds = new Set<string>();
+  for (const { latest } of unfinalized) {
+    if (latest.heartbeatRunId) owingRunIds.add(latest.heartbeatRunId);
+  }
+
+  const owingRunStatusById = new Map<string, string>();
+  if (owingRunIds.size > 0) {
+    const runRows = await dbOrTx
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          inArray(heartbeatRuns.id, [...owingRunIds]),
+        ),
+      );
+    for (const row of runRows) owingRunStatusById.set(row.id, row.status);
+  }
+
+  for (const { pair, latest } of unfinalized) {
+    // PEN-3255: the barrier had no terminal condition. Only a run writes a
+    // `workspace_finalize` op, so once the run that owed one has reached a
+    // terminal status no finalize can ever arrive — the comment on the caller
+    // promising that "a subsequent finalize wake will re-evaluate readiness"
+    // is false for that case, and the dependent stays gated forever rather
+    // than transiently. Measured instance: PEN-2969's finalize failed at
+    // 2026-09-06T02:27:34Z ("External runtime reservation no longer owns
+    // execution for run 9c34deb7…") 96s AFTER that run itself ended `failed`,
+    // and the single stuck edge then refused checkout and every
+    // `status=in_progress` write on three dependents for 9 days.
+    //
+    // Release only on positive evidence that the owing run is over. An op with
+    // no `heartbeat_run_id`, or one naming a run we cannot read, leaves the
+    // gate closed: absence of a run row is not evidence the work is finished,
+    // and a live/resumable run (`queued`, `running`, `scheduled_retry`) may
+    // still deliver the finalize.
+    //
+    // "Over" is `TERMINAL_HEARTBEAT_RUN_STATUSES` — the set that decides a run
+    // has released the issue execution lock, and the one this file already
+    // uses for every other "has this run finished?" decision. It is
+    // deliberately a 7-element superset including `interrupted`, `error` and
+    // `adapter_failed`: those are dead runs that will never write another
+    // operation, and they are precisely the run-death paths that record no
+    // finalize row. Do not narrow this to a metrics list such as
+    // `agent-scorecards.ts`'s `TERMINAL_RUN_STATUSES` — that one answers "did
+    // the agent fail?" for a failure-rate denominator and excludes those three,
+    // which would leave this barrier permanently shut on exactly the cases it
+    // exists to release. `issue-execution-lock.ts` exists because this notion
+    // had already drifted across three open-coded arrays; a fourth definition
+    // site is the defect, not the fix. Fail toward releasing.
+    const owingRunStatus = latest.heartbeatRunId ? owingRunStatusById.get(latest.heartbeatRunId) : undefined;
+    if (owingRunStatus && TERMINAL_HEARTBEAT_RUN_STATUSES.has(owingRunStatus)) continue;
     pending.add(pair.blockerIssueId);
   }
 
@@ -2158,7 +2303,27 @@ async function withIssueLabels(dbOrTx: any, rows: IssueRow[]): Promise<IssueWith
  * Shapes that record a DURABLE fact ("a PR/commit was attached to this issue"),
  * as opposed to a fact about the current comment window.
  */
-const DURABLE_LANDING_SHAPES = ["pr-link", "landing-artifact"] as const;
+// `deploy:landed` joins these because a merge cannot be undone by a later
+// push: once true it stays true, so carrying it forward is honest.
+// `review:ally-clean` deliberately does NOT — the head can move, and a review
+// that was clean at an older head says nothing about what would ship now.
+// That is the whole defect BLO-19118 / BLO-21489 are about, and caching the
+// shape would reintroduce it inside the gate meant to catch it.
+const DURABLE_LANDING_SHAPES = ["pr-link", "landing-artifact", "deploy:landed"] as const;
+
+/**
+ * The live GitHub truth probe. Built once: it is stateless, and `loadConfig`
+ * is read per call inside the deps so a config reload is picked up.
+ */
+const githubTruthProbe: TruthProbe = buildGithubTruthProbe({
+  fetchHeadSha: (ref) => githubFetchPrHeadSha(ref),
+  listReviewerSurfaces: (ref) => githubListReviewerSurfacesAtPr(ref),
+  getPullRequestGate: (ref) => githubGetPullRequestGate(ref),
+  fetchPrAuthorLogin: (ref) => githubFetchPrAuthorLogin(ref),
+  get reviewerBotLogin() {
+    return loadConfig().prReviewerBotLogin;
+  },
+});
 
 /**
  * Carry forward durable landing evidence when re-evaluating an already-in_review
@@ -2464,6 +2629,11 @@ async function fetchEvidenceForIssue(
         type: issueWorkProducts.type,
         metadata: issueWorkProducts.metadata,
         status: issueWorkProducts.status,
+        // Required by the truth probe, which trusts a `merged` claim only from
+        // a webhook-stamped row. `dbOrTx` is `any` and the result is cast, so
+        // the compiler cannot catch a drop here — losing this column silently
+        // downgrades every PR to a confirm-with-GitHub round trip.
+        sourceTrust: issueWorkProducts.sourceTrust,
       })
       .from(issueWorkProducts)
       .where(eq(issueWorkProducts.issueId, issueId)),
@@ -2569,6 +2739,7 @@ const PRODUCTIVITY_REVIEW_TRIGGERS: readonly IssueProductivityReviewTrigger[] = 
   "long_active_duration",
   "high_churn",
   "runtime_failure_streak",
+  "runaway_execution",
 ];
 
 function lowTrustBoundaryIssueCondition(
@@ -2734,6 +2905,7 @@ async function scheduledRetryProjectionMapForIssues(
   issueIds: string[],
 ): Promise<Map<string, IssueScheduledRetryProjection>> {
   const map = new Map<string, IssueScheduledRetryProjection>();
+  const parkedByIssue = new Map<string, IssueParkedScheduledRetry[]>();
   const uniqueIssueIds = [...new Set(issueIds)];
   if (uniqueIssueIds.length === 0) return map;
 
@@ -2744,6 +2916,8 @@ async function scheduledRetryProjectionMapForIssues(
         scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
         scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
         scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+        scheduledRetryRunId: heartbeatRuns.id,
+        scheduledRetryAgentId: heartbeatRuns.agentId,
       })
       .from(heartbeatRuns)
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
@@ -2757,13 +2931,33 @@ async function scheduledRetryProjectionMapForIssues(
       .orderBy(asc(heartbeatRuns.scheduledRetryAt), asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
 
     // Rows arrive in the single-read tie-break order, so first-seen per issue is
-    // the same row `getCurrentScheduledRetryForIssue` would have returned.
-    for (const row of rows as Array<{ issueId: string | null } & IssueScheduledRetryProjection>) {
-      if (!row.issueId || map.has(row.issueId)) continue;
+    // the same row `getCurrentScheduledRetryForIssue` would have returned. Later
+    // rows only join the parked set.
+    for (const row of rows as Array<
+      { issueId: string | null; scheduledRetryRunId: string; scheduledRetryAgentId: string }
+        & Omit<IssueScheduledRetryProjection, "scheduledRetryRunId" | "scheduledRetryAgentId" | "scheduledRetryParkedRuns">
+    >) {
+      if (!row.issueId) continue;
+      const parked: IssueParkedScheduledRetry = {
+        runId: row.scheduledRetryRunId,
+        agentId: row.scheduledRetryAgentId,
+        scheduledRetryAt: row.scheduledRetryAt ?? null,
+        scheduledRetryReason: row.scheduledRetryReason ?? null,
+      };
+      const seen = parkedByIssue.get(row.issueId);
+      if (seen) {
+        seen.push(parked);
+        continue;
+      }
+      const parkedRuns = [parked];
+      parkedByIssue.set(row.issueId, parkedRuns);
       map.set(row.issueId, {
         scheduledRetryAt: row.scheduledRetryAt ?? null,
         scheduledRetryReason: row.scheduledRetryReason ?? null,
         scheduledRetryAttempt: row.scheduledRetryAttempt ?? null,
+        scheduledRetryRunId: row.scheduledRetryRunId ?? null,
+        scheduledRetryAgentId: row.scheduledRetryAgentId ?? null,
+        scheduledRetryParkedRuns: parkedRuns,
       });
     }
   }
@@ -3667,6 +3861,11 @@ const issueListSelect = {
   // recorded verdict.
   lastEvidenceVerdict: issues.lastEvidenceVerdict,
   lastEvidenceVerdictEvaluatedAt: issues.lastEvidenceVerdictEvaluatedAt,
+  // BLO-30303: internal scan watermark, carried here only because this
+  // projection is maintained as the full column set (the type flows into
+  // withIssueLabels/withActiveRuns, which require a complete row). No consumer
+  // reads it; same disposition as lastEvidenceVerdictEvaluatedAt above.
+  productivityScannedAt: issues.productivityScannedAt,
 };
 
 /**
@@ -4114,6 +4313,36 @@ export async function listBlockedIssueAutoResumeSuppressions(
   const monitorRows = await dbOrTx
     .select({
       id: issues.id,
+      // Read the FULL column, never a `substring(...)` preview. `listBlockedInboxIssues`
+      // projects the first ISSUE_LIST_DESCRIPTION_MAX_CHARS and that is exactly what made
+      // the blocked-inbox oracle disagree with its own list in BLO-31839 — a park declared
+      // past the cutoff parsed as `null`. Here that would silently drain it (BLO-30445).
+      description: issues.description,
+      // BLO-27553: the liveness clause is load-bearing, and its absence made this
+      // suppression PERMANENT. `gateSignals` is written into `executionState.monitor`
+      // when a monitor is armed and is NEVER erased when that monitor is cleared or
+      // expires — `clearReason` is set alongside it and the array stays. So the bare
+      // `jsonb_array_length(...) > 0` test answered "did this row ever have a monitor",
+      // not "is a monitor gating it now", and returned true forever for every row that
+      // had ever armed one. Measured 2026-09-26: 19 of 23 estate-wide strands carried
+      // `gateSignals` on a monitor already `cleared` (`trigger_stalled` /
+      // `timeout_exceeded`), while 0 of 14 sampled rows the reconciler DID drain carried
+      // a cleared monitor. The reconciler that exists to drain these rows was skipping
+      // exactly them, and agent instructions mandate declaring `gateSignals` (BLO-29716),
+      // so following the monitor guidance is what made a row undrainable.
+      //
+      // Liveness is `hasValidBlockerMonitor`, applied in the loop below: a future
+      // `nextCheckAt`, an unexpired policy `timeoutAt`, and attempts under `maxAttempts`.
+      // Delegated rather than restated in SQL: a SQL copy of only the `nextCheckAt` half
+      // would keep suppressing a monitor past its `timeoutAt` whose `nextCheckAt` is later,
+      // and a `::timestamptz` cast of a malformed `timeoutAt` would fail this whole query
+      // where the JS reader skips it. A NULL or OVERDUE `nextCheckAt` is a wake that will
+      // not happen. This is a no-op for `stranded_blocked_reconciler`, whose candidate
+      // predicate already excludes every future `nextCheckAt`; it narrows the other three
+      // trigger paths, which do not.
+      monitorNextCheckAt: issues.monitorNextCheckAt,
+      monitorAttemptCount: issues.monitorAttemptCount,
+      executionPolicy: issues.executionPolicy,
       hasGateSignals: sql<boolean>`
         COALESCE(
           CASE
@@ -4140,10 +4369,19 @@ export async function listBlockedIssueAutoResumeSuppressions(
     .from(issues)
     .where(and(eq(issues.companyId, companyId), inArray(issues.id, uniqueIssueIds)));
   for (const row of monitorRows) {
-    if (row.hasGateSignals) {
+    if (row.hasGateSignals && hasValidBlockerMonitor(row)) {
       addSuppression(row.id, "monitor_gate");
     } else if (row.isConvergenceStalled) {
       addSuppression(row.id, "convergence_stalled");
+    } else if (externalWaitFromDescription(row.description) !== null) {
+      // BLO-30445: the liveness classifier and the stranded-blocked reconciler held opposite
+      // views of the same row. `isDeadEndBlocked` declines to raise `blocked_without_blockers`
+      // against a declared external wait, but the reconciler had no matching exemption, so it
+      // flipped the park to `todo` within one 15m tick — and the reconciler wins, because it
+      // mutates `status`. Measured live on the BLO-30391 fixture pair: the declared row drained
+      // in the same transaction as the undeclared control, so the documented escape hatch in
+      // `doc/execution-semantics.md#declaring-an-external-wait` bought it nothing.
+      addSuppression(row.id, "external_wait");
     }
   }
 
@@ -4555,16 +4793,64 @@ function redactExternalWaitDescription(
   return redacted.length > 0 ? redacted : null;
 }
 
-function blockedInboxResponseDescription(attention: IssueBlockedInboxAttention, row: BlockedInboxIssueRow) {
-  if (!attention.redaction.externalDetailsRedacted) return row.description;
-  return redactExternalWaitDescription(row.description, externalWaitFromDescription(row.description));
+function blockedInboxResponseDescription(entry: BlockedInboxAttentionEntry, row: BlockedInboxIssueRow) {
+  if (!entry.attention.redaction.externalDetailsRedacted) return row.description;
+  // BLO-31839: redact with the needles the classifier actually parsed, never by re-parsing
+  // `row.description`. The classifier reads the full graph description; `row.description` is
+  // the `ISSUE_LIST_DESCRIPTION_MAX_CHARS` preview. For a park declared past that cutoff —
+  // exactly the population the parity fix newly surfaces — re-parsing returns `null` by
+  // construction, so the needle set was empty and this returned an unredacted preview while
+  // `externalDetailsRedacted: true` asserted otherwise. Carrying the parsed pair makes "what
+  // decided redaction" and "what performed it" the same string.
+  return redactExternalWaitDescription(row.description, entry.externalWait);
 }
 
-function blockedInboxSearchText(attention: IssueBlockedInboxAttention, row: BlockedInboxIssueRow) {
+/**
+ * The two response fields that have to move together whenever a caller asks for blocked-inbox
+ * attention.
+ *
+ * BLO-32045: `blockedInboxAttention.redaction.externalDetailsRedacted` is not a property of the
+ * issue, it is a claim about *this response's* `description`. Attaching the verdict without also
+ * overriding the description publishes a claim the caller has no way to check. Two paths serve
+ * this shape — `listBlockedInboxIssues` and `list({ includeBlockedInboxAttention })` — and only
+ * the first redacted, so the flag was false on the general path for every externally-parked row
+ * (a strictly wider population than the late-declared case BLO-31839 fixed, which additionally
+ * needed the declaration to sit past `ISSUE_LIST_DESCRIPTION_MAX_CHARS`). Emitting both fields
+ * from one place is what makes "asserted redacted" and "actually redacted" hard to separate
+ * again. `entry.externalWait` stays internal: it holds the very strings being removed.
+ *
+ * Two limits of this flag, recorded so a later reader does not over-read it:
+ *
+ * 1. It is a **response-consistency invariant, not a disclosure boundary.** Do not build an
+ *    access-control decision on it. `list()` matches `q` with `${issues.description} ILIKE …`
+ *    against the *full* column, so `?includeBlockedInboxAttention=true&q=<owner>` still returns
+ *    the row — body redacted, presence confirming the guess. The same string is also available
+ *    by simply omitting the flag. The blocked-inbox path does not have this property: its `q`
+ *    filters in JS over `blockedInboxSearchText`, which reads the redacted description.
+ * 2. The two paths agree on the returned description **only because `decodeDatabaseTextPreview`
+ *    is provably the identity here** — PG `substring(text, 1, n)` already counts code points, so
+ *    `truncateByCodePoint` is a no-op even for astral characters. `listBlockedInboxIssues`
+ *    applies it before redacting and `list()` does not. The cross-endpoint equality test couples
+ *    them, so if that step ever stops being an identity, `list()` becomes the wrong one and that
+ *    test fails some distance from the cause — mirror the decode into this helper at that point.
+ */
+function blockedInboxAttentionResponseFields(
+  entry: BlockedInboxAttentionEntry | undefined,
+  row: BlockedInboxIssueRow,
+) {
+  if (!entry) return { description: row.description, blockedInboxAttention: null };
+  return {
+    description: blockedInboxResponseDescription(entry, row),
+    blockedInboxAttention: entry.attention,
+  };
+}
+
+function blockedInboxSearchText(entry: BlockedInboxAttentionEntry, row: BlockedInboxIssueRow) {
+  const attention = entry.attention;
   return [
     row.identifier,
     row.title,
-    blockedInboxResponseDescription(attention, row),
+    blockedInboxResponseDescription(entry, row),
     attention.sourceIssue?.identifier,
     attention.sourceIssue?.title,
     attention.leafIssue?.identifier,
@@ -4635,13 +4921,34 @@ function compareBlockedInboxRows(
   return right.id.localeCompare(left.id);
 }
 
+/**
+ * The attention verdict plus the external-wait pair the classifier parsed to reach it.
+ *
+ * BLO-31839: these travel together deliberately. `redaction.externalDetailsRedacted` is a
+ * promise that the owner/action strings were removed from the response, and the only way to
+ * keep that promise is to redact with the same values that set the flag. Re-deriving them
+ * from the response projection silently breaks for any park declared past
+ * `ISSUE_LIST_DESCRIPTION_MAX_CHARS`, which is precisely the population the parity fix
+ * surfaces. `externalWait` is non-null iff the entry took the `external_wait` branch, and it
+ * is internal — it must never be serialized, since it holds the values being redacted.
+ */
+type BlockedInboxAttentionEntry = {
+  attention: IssueBlockedInboxAttention;
+  externalWait: { owner: string; action: string } | null;
+};
+
 async function listIssueBlockedInboxAttentionMap(
   dbOrTx: any,
   companyId: string,
   issueRows: BlockedInboxIssueRow[],
-): Promise<Map<string, IssueBlockedInboxAttention>> {
+): Promise<Map<string, BlockedInboxAttentionEntry>> {
   const rowIssueIds = [...new Set(issueRows.map((row) => row.id))];
-  const result = new Map<string, IssueBlockedInboxAttention>();
+  const result = new Map<string, BlockedInboxAttentionEntry>();
+  const setAttention = (
+    issueId: string,
+    attention: IssueBlockedInboxAttention,
+    externalWait: { owner: string; action: string } | null = null,
+  ) => result.set(issueId, { attention, externalWait });
   if (rowIssueIds.length === 0) return result;
 
   const [graphIssueRows, graphRelationRows, companyAgentRows] = await Promise.all([
@@ -4811,6 +5118,7 @@ async function listIssueBlockedInboxAttentionMap(
     companyId,
     issueId: row.issueId,
     status: "pending",
+    createdAt: row.createdAt,
   }));
   const pendingApprovals = (approvalRows as BlockedInboxApprovalRow[]).map((row) => ({
     companyId,
@@ -4838,6 +5146,13 @@ async function listIssueBlockedInboxAttentionMap(
       return entries;
     });
 
+  // BLO-22660: one clock for both staleness passes. The classifier below and the ladder's
+  // `interactionCutoffMs` judge the same cards against the same threshold, so reading the
+  // clock twice lets a card that crosses 24h between them be fresh to one and stale to the
+  // other. recovery/service.ts shares a single `now` through `sharedInput` for exactly this
+  // reason; this makes the same property hold here by construction rather than by the gap
+  // between the two reads being small.
+  const now = new Date();
   const findings = classifyIssueGraphLiveness({
     issues: graphIssues.map((issue) => ({
       id: issue.id,
@@ -4878,15 +5193,36 @@ async function listIssueBlockedInboxAttentionMap(
     pendingInteractions,
     pendingApprovals,
     openRecoveryIssues,
-    now: new Date(),
+    now,
   });
   const findingByIssueId = new Map<string, IssueLivenessFinding>();
   for (const finding of findings) {
     if (!findingByIssueId.has(finding.issueId)) findingByIssueId.set(finding.issueId, finding);
   }
 
+  // BLO-22660: live cards only. This map short-circuits the reason ladder below *ahead of*
+  // the classifier finding, so feeding `createdAt` to the classifier is necessary but not
+  // sufficient on this surface -- a stale card would still be reported as
+  // `awaiting_decision` / `pending_board_decision` / medium / owner "Board", i.e. the row
+  // reads as owned by someone who has not answered in weeks. That is the exact claim this
+  // issue exists to stop making, so a provably-stale card falls through to the finding
+  // branch and the operator gets `in_review_without_action_path` naming the stale card.
+  // The stale row is kept in `staleInteractionByIssueId` rather than dropped, because that
+  // finding's recommended action is "resolve or withdraw the card" -- an instruction that
+  // needs the card's id to be actionable. Both maps are built in one pass so a row can only
+  // ever land in exactly one of them.
+  // Pending approvals are deliberately NOT aged the same way: the classifier does not age
+  // them either, and bounding them is separate work with its own evidence.
+  const interactionCutoffMs = now.getTime() - PENDING_INTERACTION_MAX_AGE_MS;
   const interactionByIssueId = new Map<string, BlockedInboxInteractionRow>();
+  const staleInteractionByIssueId = new Map<string, BlockedInboxInteractionRow>();
   for (const row of interactionRows as BlockedInboxInteractionRow[]) {
+    // Fail open exactly as the classifier does: only a card we can prove is stale is dropped.
+    const createdAtMs = row.createdAt instanceof Date ? row.createdAt.getTime() : NaN;
+    if (Number.isFinite(createdAtMs) && createdAtMs <= interactionCutoffMs) {
+      if (!staleInteractionByIssueId.has(row.issueId)) staleInteractionByIssueId.set(row.issueId, row);
+      continue;
+    }
     if (!interactionByIssueId.has(row.issueId)) interactionByIssueId.set(row.issueId, row);
   }
   const approvalByIssueId = new Map<string, BlockedInboxApprovalRow>();
@@ -4912,7 +5248,7 @@ async function listIssueBlockedInboxAttentionMap(
       && (liveHandoffRunIssueIds.has(row.id) || liveHandoffWakeIssueIds.has(row.id))
     );
     if (handoff && !hasLiveHandoffContinuation && (handoff.required || handoff.state === "escalated")) {
-      result.set(row.id, attentionBase({
+      setAttention(row.id, attentionBase({
         state: "missing_disposition",
         reason: "missing_successful_run_disposition",
         severity: "high",
@@ -4947,7 +5283,7 @@ async function listIssueBlockedInboxAttentionMap(
       ) {
         sourceIssue = issueRef(issuesById.get(row.originId));
       }
-      result.set(row.id, attentionBase({
+      setAttention(row.id, attentionBase({
         state: "recovery_open",
         reason: "open_recovery_issue",
         severity: "high",
@@ -4972,7 +5308,7 @@ async function listIssueBlockedInboxAttentionMap(
     const interaction = interactionByIssueId.get(row.id);
     if (interaction) {
       const isUserQuestion = interaction.kind === "ask_user_questions" && Boolean(row.assigneeUserId);
-      result.set(row.id, attentionBase({
+      setAttention(row.id, attentionBase({
         state: "awaiting_decision",
         reason: isUserQuestion ? "pending_user_decision" : "pending_board_decision",
         severity: "medium",
@@ -4992,7 +5328,7 @@ async function listIssueBlockedInboxAttentionMap(
 
     const approval = approvalByIssueId.get(row.id);
     if (approval) {
-      result.set(row.id, attentionBase({
+      setAttention(row.id, attentionBase({
         state: "awaiting_decision",
         reason: "pending_board_decision",
         severity: "medium",
@@ -5016,7 +5352,7 @@ async function listIssueBlockedInboxAttentionMap(
       const ownerAgentId = finding.state === "blocked_by_unassigned_issue"
         ? null
         : finding.recommendedOwnerAgentId ?? row.assigneeAgentId ?? leaf?.assigneeAgentId ?? null;
-      result.set(row.id, attentionBase({
+      setAttention(row.id, attentionBase({
         state: "needs_attention",
         reason: finding.state as IssueBlockedInboxAttention["reason"],
         severity: finding.state === "blocked_by_assigned_backlog_issue"
@@ -5055,14 +5391,37 @@ async function listIssueBlockedInboxAttentionMap(
         leafIssue: issueRef(leaf),
         recoveryIssue: issueRef(issuesById.get(finding.recoveryIssueId)),
         sampleIssueIdentifier: leaf?.identifier ?? finding.identifier,
+        // BLO-22660: when this row fell through because its only waiting path was a stale
+        // card, `recommendedAction` tells the operator to resolve or withdraw that card.
+        // Name it. Key on `recoveryIssueId`, never on `row.id`: all three stale-aware states
+        // evaluate `hasStaleInteraction` on the recovery issue (`recoveryIssue: deadEnd` /
+        // `reviewIssue` / `blocker` in issue-graph-liveness.ts), which is a different row from
+        // the source in every dependency-path form -- and always different for
+        // `blocked_by_assigned_backlog_issue`, since a blocker is never its own blocked issue.
+        // Null on the finding states that have no stale card, which have no id to point at.
+        interactionId: staleInteractionByIssueId.get(finding.recoveryIssueId)?.id ?? null,
       }));
       continue;
     }
 
     const hasMonitor = Boolean(row.monitorNextCheckAt && row.monitorNextCheckAt.getTime() > Date.now());
-    const external = row.status === "blocked" && !hasMonitor ? externalWaitFromDescription(row.description) : null;
+    // BLO-31839: read the description from the graph projection, never from `row`. Callers hand
+    // this function two different row shapes — `listBlockedInboxIssues` projects
+    // `substring(description, 1, ISSUE_LIST_DESCRIPTION_MAX_CHARS)` to bound payload size, while
+    // `countBlockedInboxIssues` selected the full column — so reading `row.description` made the
+    // external-wait gate depend on the caller's projection. A park declared past the 1200-char
+    // cutoff was counted and not enumerable, which is what made the blocked-inbox oracle sit
+    // stably +1 against its own list. `graphIssues` is already fetched in full above, so this is
+    // the same string the liveness classifier's `hasExternalWaitOwner` reads — the two disagreeing
+    // is what let a genuinely parked row fall through to no attention at all and vanish from the
+    // inbox. Fall back to `row` only when the row is absent from the graph projection.
+    const graphRow = issuesById.get(row.id);
+    const externalWaitDescription = graphRow ? graphRow.description : row.description;
+    const external = row.status === "blocked" && !hasMonitor
+      ? externalWaitFromDescription(externalWaitDescription)
+      : null;
     if (external) {
-      result.set(row.id, attentionBase({
+      setAttention(row.id, attentionBase({
         state: "external_wait",
         reason: "external_owner_action",
         severity: "medium",
@@ -5074,13 +5433,13 @@ async function listIssueBlockedInboxAttentionMap(
         },
         sourceIssue: source,
         externalDetailsRedacted: true,
-      }));
+      }), external);
       continue;
     }
 
     const blockerState = blockerAttentionByIssueId.get(row.id);
     if (row.status === "blocked" && (blockerState?.state === "needs_attention" || blockerState?.state === "stalled")) {
-      result.set(row.id, attentionBase({
+      setAttention(row.id, attentionBase({
         state: "needs_attention",
         reason: "blocked_chain_stalled",
         severity: "high",
@@ -5283,11 +5642,11 @@ async function listBlockedInboxIssues(
   const lastActivityByIssueId = new Map(lastActivityRows.map((row) => [row.issueId, row]));
 
   const enriched = withRuns.flatMap((row) => {
-    const blockedInboxAttention = blockedInboxAttentionByIssueId.get(row.id);
-    if (!blockedInboxAttention) return [];
+    const blockedInboxEntry = blockedInboxAttentionByIssueId.get(row.id);
+    if (!blockedInboxEntry) return [];
     if (
       rawSearch
-      && !blockedInboxSearchText(blockedInboxAttention, row).includes(rawSearch)
+      && !blockedInboxSearchText(blockedInboxEntry, row).includes(rawSearch)
       && !commentSearchMatchIssueIds.has(row.id)
     ) return [];
 
@@ -5299,11 +5658,13 @@ async function listBlockedInboxIssues(
     ) ?? row.updatedAt;
     return [{
       ...row,
-      description: blockedInboxResponseDescription(blockedInboxAttention, row),
+      description: blockedInboxResponseDescription(blockedInboxEntry, row),
       blockedBy: blockedByMap.get(row.id) ?? [],
       lastActivityAt,
       ...(blockerAttentionByIssueId.has(row.id) ? { blockerAttention: blockerAttentionByIssueId.get(row.id) } : {}),
-      blockedInboxAttention,
+      // Only the verdict is serialized; `blockedInboxEntry.externalWait` stays internal because
+      // it holds the very owner/action strings the redaction above removes (BLO-31839).
+      blockedInboxAttention: blockedInboxEntry.attention,
       ...(productivityReviewByIssueId.has(row.id)
         ? { productivityReview: productivityReviewByIssueId.get(row.id) }
         : {}),
@@ -5329,10 +5690,23 @@ async function listBlockedInboxIssues(
 
 async function countBlockedInboxIssues(dbOrTx: any, companyId: string, filters?: IssueFilters): Promise<number> {
   const { conditions } = await blockedInboxIssueConditions(dbOrTx, companyId, filters);
+  // BLO-31839: project exactly what `listBlockedInboxIssues` projects, including its
+  // `decodeDatabaseTextPreview` post-step. This count is the oracle for that list, so it has to
+  // see the same row shape: `blockedInboxSearchText` reads `row.description`, and selecting the
+  // full column here made a `q` term past ISSUE_LIST_DESCRIPTION_MAX_CHARS countable but not
+  // enumerable — the mirror image of the external-wait divergence fixed above. The post-step is
+  // a no-op on this input today (PG `substring(text, 1, n)` already counts code points, so the
+  // truncation is the identity even for astral characters, and the column is never `undefined`),
+  // but it is mirrored rather than argued away: leaving the one unmirrored step in a projection
+  // whose whole contract is "same shape as the list" is how this divergence happens again.
   const rows = (await dbOrTx
-    .select()
+    .select(issueListSelect)
     .from(issues)
-    .where(and(...conditions))) as IssueRow[];
+    .where(and(...conditions)))
+    .map((row: any) => ({
+      ...row,
+      description: decodeDatabaseTextPreview(row.description, ISSUE_LIST_DESCRIPTION_MAX_CHARS),
+    })) as IssueRow[];
   if (rows.length === 0) return 0;
 
   const blockedInboxAttentionByIssueId = await listIssueBlockedInboxAttentionMap(dbOrTx, companyId, rows);
@@ -5357,11 +5731,11 @@ async function countBlockedInboxIssues(dbOrTx: any, companyId: string, filters?:
   }
 
   return rows.reduce((count: number, row: IssueRow) => {
-    const attention = blockedInboxAttentionByIssueId.get(row.id);
-    if (!attention) return count;
+    const entry = blockedInboxAttentionByIssueId.get(row.id);
+    if (!entry) return count;
     if (
       rawSearch
-      && !blockedInboxSearchText(attention, row).includes(rawSearch)
+      && !blockedInboxSearchText(entry, row).includes(rawSearch)
       && !commentSearchMatchIssueIds.has(row.id)
     ) return count;
     return count + 1;
@@ -5461,6 +5835,24 @@ function alertmanagerAggregateCreationFingerprint(
 
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
+  // BLO-34207: `update` and `addComment` are called from inside a transaction
+  // that already holds `lockIssueParentMutationCompany` (recovery's
+  // `escalateStrandedAssignedIssue`). Reading instance settings off the pooled
+  // handle there takes a SECOND pool connection while the lock is held, and
+  // with `POSTGRES_POOL_MAX=10` against 8-9 waiters on that same key the read
+  // only gets a connection when a waiter hits its `lock_timeout` — the convoy.
+  // So bind the settings reads to the caller's handle when there is one.
+  //
+  // `readInstanceSettingsOn` and not `instanceSettingsService(tx)`: the latter
+  // bootstraps the singleton row, which on a caller's tx is a row lock taken
+  // BEFORE the company graph lock and held to commit — a deadlock edge. These
+  // are pure reads, so they take the read-only view on either handle.
+  // Wrapper, not a bare alias: an alias dereferences the module binding when
+  // `issueService(db)` is constructed, so any test that partially mocks
+  // `instance-settings.js` fails just by building the service. Reading it
+  // inside the arrow keeps the dereference at call time.
+  const instanceSettingsOn = (dbOrTx: Parameters<typeof readInstanceSettingsOn>[0]) =>
+    readInstanceSettingsOn(dbOrTx);
   const treeControlSvc = issueTreeControlService(db);
 
   async function lockIssueBlockerRelations(
@@ -5510,7 +5902,7 @@ export function issueService(db: Db) {
     agentId: string,
     now: Date,
     operation: (
-      tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
+      tx: DbTransaction,
       checkoutExecutionPatch: NonNullable<Awaited<ReturnType<typeof runningCheckoutExecutionPatch>>>["patch"],
     ) => Promise<T>,
   ) {
@@ -6395,14 +6787,45 @@ export function issueService(db: Db) {
     );
   }
 
-  async function isTerminalOrMissingHeartbeatRun(runId: string, dbOrTx: DbReader = db) {
+  // PEN-2074: a run that still holds an unreleased external runtime reservation is
+  // parked on an external wait, not finished with its resources. Treating it as
+  // reapable would clear the issue locks out from under the reservation and let a
+  // competing run start against state the parked run still owns.
+  async function hasActiveExternalRuntimeReservation(
+    runId: string,
+    dbOrTx: DbReader = db,
+  ): Promise<boolean> {
+    const activeReservation = await dbOrTx
+      .select({ id: externalRuntimeReservations.id })
+      .from(externalRuntimeReservations)
+      .where(
+        and(
+          eq(externalRuntimeReservations.runId, runId),
+          isNull(externalRuntimeReservations.releasedAt),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    return activeReservation !== null;
+  }
+
+  /**
+   * PEN-2400 (Ally non-blocking 4): named for what it actually returns. Since
+   * PEN-2074 this is not a status predicate — a terminal run that still holds an
+   * unreleased `externalRuntimeReservations` row returns `false`, because the run
+   * is parked on an external wait and still owns its slot. The old name
+   * (`isTerminalOrMissingHeartbeatRun`) promised a pure status read, so a caller
+   * going by the signature would adopt a lock out from under a live reservation.
+   */
+  async function isReleasedTerminalOrMissingHeartbeatRun(runId: string, dbOrTx: DbReader = db) {
     const run = await dbOrTx
       .select({ status: heartbeatRuns.status })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
     if (!run) return true;
-    return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
+    if (!TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
+    return !(await hasActiveExternalRuntimeReservation(runId, dbOrTx));
   }
 
   async function cancelNeverStartedOwnerRun(
@@ -6424,7 +6847,7 @@ export function issueService(db: Db) {
       .set({
         status: "cancelled",
         finishedAt: now,
-        error: input.reason,
+        error: redactRunError(input.reason),
         errorCode: input.errorCode,
         updatedAt: now,
       })
@@ -6683,12 +7106,16 @@ export function issueService(db: Db) {
       // runs FIRST when checkoutRunId is set, so a divergence here would make the
       // fix unreachable for the common shape (checkout and execution locks both
       // pointing at one never-started run).
-      const stale = isReapableHeartbeatRunRow(existingRun);
+      const externalWaitHeld = await hasActiveExternalRuntimeReservation(
+        input.expectedCheckoutRunId,
+        tx,
+      );
+      const stale = isReapableHeartbeatRunRow(existingRun) && !externalWaitHeld;
       const actorLive = actorRun?.status === "running";
       const sameAgentRetry =
         actorRun?.agentId === input.actorAgentId &&
         actorRun.retryOfRunId === input.expectedCheckoutRunId;
-      if ((!stale && !sameAgentRetry) || !actorLive) {
+      if ((!stale && (!sameAgentRetry || externalWaitHeld)) || !actorLive) {
         return { adopted: null, latest: lockedIssue };
       }
 
@@ -7036,11 +7463,24 @@ export function issueService(db: Db) {
     const checkoutRun = issue.checkoutRunId
       ? runById.get(issue.checkoutRunId) ?? null
       : null;
+    // PEN-2074 conflict resolution: the original PR added a reservation-aware guard
+    // at each of the three former call sites (clearExecutionRunIfTerminal and both
+    // limbs of the checkout cleanup). `master` has since collapsed those sites into
+    // this helper, so the guard is applied once here instead. A missing run row is
+    // still terminal — matching both the pre-existing `!executionRun ||` shape and
+    // the PR's own `if (run && ...)` guard, which skipped the check when the row
+    // was absent.
     const executionTerminal = Boolean(issue.executionRunId) && (
-      !executionRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(executionRun.status)
+      !executionRun || (
+        TERMINAL_HEARTBEAT_RUN_STATUSES.has(executionRun.status) &&
+        !(await hasActiveExternalRuntimeReservation(executionRun.id, tx))
+      )
     );
     const checkoutTerminal = Boolean(issue.checkoutRunId) && (
-      !checkoutRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(checkoutRun.status)
+      !checkoutRun || (
+        TERMINAL_HEARTBEAT_RUN_STATUSES.has(checkoutRun.status) &&
+        !(await hasActiveExternalRuntimeReservation(checkoutRun.id, tx))
+      )
     );
 
     const clearExecution = (mode === "execution" || mode === "both") && executionTerminal;
@@ -7138,28 +7578,76 @@ export function issueService(db: Db) {
       input.checkoutRunId,
       input.executionRunId,
     ].filter((runId): runId is string => Boolean(runId)))].sort();
+
+    // BLO-28441: read the ACTOR's own run in the same round trip as the holders'.
+    // A run the server has already marked terminal keeps executing for ~10 more
+    // minutes, and every health signal available to it — `/agents/me`, its own
+    // pod, `lastHeartbeatAt` — reads clean, so it cannot discover why its writes
+    // are refused. Its comments still succeed, so it goes on publishing confident
+    // analysis derived from a state the server considers dead. Reporting the
+    // holder alone cannot explain that 409: the cause is the caller, not the row.
+    const lookupRunIds = [...new Set([...ownerRunIds, input.actorRunId]
+      .filter((runId): runId is string => Boolean(runId)))];
+
+    let runRows: {
+      id: string;
+      agentId: string | null;
+      status: string;
+      startedAt: Date | null;
+    }[] = [];
+    let lookupFailed = false;
+    if (lookupRunIds.length > 0) {
+      try {
+        runRows = await db
+          .select({
+            id: heartbeatRuns.id,
+            agentId: heartbeatRuns.agentId,
+            status: heartbeatRuns.status,
+            startedAt: heartbeatRuns.startedAt,
+          })
+          .from(heartbeatRuns)
+          .where(inArray(heartbeatRuns.id, lookupRunIds))
+          .orderBy(asc(heartbeatRuns.id));
+      } catch {
+        lookupFailed = true;
+      }
+    }
+    const runById = new Map(runRows.map((run) => [run.id, run]));
+
+    const actorRun = input.actorRunId ? runById.get(input.actorRunId) ?? null : null;
+    const actorRunStatus = actorRun?.status ?? null;
+    // Only claim the caller's own run is dead when a row was actually read and
+    // the gate this mirrors would refuse it: `runningCheckoutExecutionPatch`
+    // grants the lock only to a run whose status is exactly `running`, so
+    // anything else -- terminal, never-started, or parked in `scheduled_retry`
+    // with startedAt set by the retry ladder -- is refused on that path. This
+    // is NOT a universal rule for `assertCheckoutOwner`: `resolveSameRunOwnership`
+    // is consulted first and grants a run that is its own holder without
+    // reading its status, so a parked run whose lock columns point at itself
+    // never reaches this 409 at all (BLO-35402 tracks closing that; it is a
+    // behaviour change and out of scope here). Mirroring the `running` condition
+    // rather than `isReapableHeartbeatRunRow` matters for the parked case,
+    // which reapability treats as alive and which otherwise gets the "retry
+    // once" misdirection this remediation replaces. A missing row, or a failed
+    // lookup, is NOT evidence of death — telling a healthy run to stop working
+    // is the expensive direction to be wrong in, so this fails closed to the
+    // existing holder-shaped remediation.
+    const actorRunRemediation = actorRun != null && actorRunStatus !== "running"
+      ? `Your own run (${input.actorRunId}) is \`${actorRunStatus}\`, so the server will not grant it this lock however the holder resolves. Do NOT retry and do NOT re-file a platform bug — stop working this issue and let your successor run pick it up. Note your comments still succeed, so anything you publish from here is derived from a run the server considers dead.`
+      : null;
+
     if (ownerRunIds.length === 0) {
       return {
         lockHolders: [],
         holderLiveness: "no_holder" as const,
         concurrentSiblingRun: false,
-        remediation: "No lock holder was present in the conflict snapshot; retry once, then re-read the issue before escalating.",
+        actorRunStatus,
+        remediation: actorRunRemediation
+          ?? "No lock holder was present in the conflict snapshot; retry once, then re-read the issue before escalating.",
       };
     }
 
-    let ownerRuns;
-    try {
-      ownerRuns = await db
-        .select({
-          id: heartbeatRuns.id,
-          agentId: heartbeatRuns.agentId,
-          status: heartbeatRuns.status,
-          startedAt: heartbeatRuns.startedAt,
-        })
-        .from(heartbeatRuns)
-        .where(inArray(heartbeatRuns.id, ownerRunIds))
-        .orderBy(asc(heartbeatRuns.id));
-    } catch {
+    if (lookupFailed) {
       return {
         lockHolders: ownerRunIds.map((runId) => ({
           runId,
@@ -7170,10 +7658,11 @@ export function issueService(db: Db) {
         })),
         holderLiveness: "unknown" as const,
         concurrentSiblingRun: false,
+        actorRunStatus,
         remediation: "The lock-holder status could not be read; retry once, then re-read the issue before escalating.",
       };
     }
-    const ownerRunById = new Map(ownerRuns.map((run) => [run.id, run]));
+    const ownerRunById = runById;
 
     const holders = ownerRunIds.map((runId) => {
       const run = ownerRunById.get(runId) ?? null;
@@ -7197,14 +7686,18 @@ export function issueService(db: Db) {
       // 409 is a bug at all.
       holderLiveness: liveHolders.length > 0 ? ("live" as const) : ("not_live" as const),
       concurrentSiblingRun: liveSiblings.length > 0,
+      actorRunStatus,
       // `remediation` specifically: the error handler hoists a string under this
       // key to the top level of the response body, so the fix path is visible
       // without the caller having to dig into `details`.
-      remediation: liveHolders.length === 0
+      //
+      // A dead caller outranks every holder-shaped explanation: if the actor's
+      // own run cannot hold a lock, what the holder is doing is irrelevant.
+      remediation: actorRunRemediation ?? (liveHolders.length === 0
         ? "The lock holder was not live in this snapshot. Retry once so a terminal or queued holder can be reaped; escalate only if the conflict persists."
         : liveSiblings.length > 0
           ? `Expected: a concurrent run of your own agent (${liveSiblings.map((holder) => holder.runId).join(", ")}) is live and holds this issue. Do NOT retry or re-file a platform bug — yield this issue to the sibling run, or wait for it to finish and the lock releases automatically.`
-          : `Another agent's live run (${liveHolders.map((holder) => holder.runId).join(", ")}) holds this issue. Comment instead of mutating, or wait for that run to finish.`,
+          : `Another agent's live run (${liveHolders.map((holder) => holder.runId).join(", ")}) holds this issue. Comment instead of mutating, or wait for that run to finish.`),
     };
   }
 
@@ -7367,7 +7860,7 @@ export function issueService(db: Db) {
       .set({
         status: "cancelled",
         finishedAt: now,
-        error: input.reason,
+        error: redactRunError(input.reason),
         errorCode: input.errorCode,
         updatedAt: now,
       })
@@ -7626,7 +8119,7 @@ export function issueService(db: Db) {
         listIssueProductivityReviewMap(db, companyId, issueIds),
         includeBlockedInboxAttention
           ? listIssueBlockedInboxAttentionMap(db, companyId, withRuns)
-          : Promise.resolve(new Map<string, IssueBlockedInboxAttention>()),
+          : Promise.resolve(new Map<string, BlockedInboxAttentionEntry>()),
       ]);
 
       if (!contextUserId) {
@@ -7642,7 +8135,9 @@ export function issueService(db: Db) {
             ...(includeBlockedBy ? { blockedBy: blockedByMap.get(row.id) ?? [] } : {}),
             lastActivityAt,
             ...(blockerAttentionByIssueId.has(row.id) ? { blockerAttention: blockerAttentionByIssueId.get(row.id) } : {}),
-            ...(includeBlockedInboxAttention ? { blockedInboxAttention: blockedInboxAttentionByIssueId.get(row.id) ?? null } : {}),
+            ...(includeBlockedInboxAttention
+              ? blockedInboxAttentionResponseFields(blockedInboxAttentionByIssueId.get(row.id), row)
+              : {}),
             ...(includeLiveDescendantSummary ? { liveDescendantCount: liveDescendantCountByIssueId.get(row.id) ?? 0 } : {}),
             ...(productivityReviewByIssueId.has(row.id)
               ? { productivityReview: productivityReviewByIssueId.get(row.id) }
@@ -7666,7 +8161,9 @@ export function issueService(db: Db) {
           ...(includeBlockedBy ? { blockedBy: blockedByMap.get(row.id) ?? [] } : {}),
           lastActivityAt,
           ...(blockerAttentionByIssueId.has(row.id) ? { blockerAttention: blockerAttentionByIssueId.get(row.id) } : {}),
-          ...(includeBlockedInboxAttention ? { blockedInboxAttention: blockedInboxAttentionByIssueId.get(row.id) ?? null } : {}),
+          ...(includeBlockedInboxAttention
+            ? blockedInboxAttentionResponseFields(blockedInboxAttentionByIssueId.get(row.id), row)
+            : {}),
           ...(includeLiveDescendantSummary ? { liveDescendantCount: liveDescendantCountByIssueId.get(row.id) ?? 0 } : {}),
           ...(productivityReviewByIssueId.has(row.id)
             ? { productivityReview: productivityReviewByIssueId.get(row.id) }
@@ -7730,12 +8227,16 @@ export function issueService(db: Db) {
     /**
      * Authoritative per-agent open-assignment census for one company.
      *
-     * Why this exists: `GET /companies/:id/issues` silently clamps `limit` to
-     * {@link ISSUE_LIST_MAX_LIMIT} and returns a bare array — no total, no
-     * cursor — so a caller cannot distinguish "1000 rows is everything" from
-     * "1000 rows is a truncated prefix", and offset paging over a mutating
-     * collection duplicates and drops rows. Callers that need exact counts must
-     * not derive them from that population.
+     * Why this exists: `GET /companies/:id/issues` clamps `limit` to
+     * {@link ISSUE_LIST_MAX_LIMIT} and returns a bare array, and offset paging
+     * over a mutating collection duplicates and drops rows. Callers that need
+     * exact counts must not derive them from that population.
+     *
+     * BLO-33741 made the clamp visible — the route now reports it via the
+     * `X-Result-Truncated`/`X-Applied-Limit` response headers, so a caller can
+     * at least tell "1000 rows is everything" from "1000 rows is a prefix".
+     * That is a detection signal, NOT a substitute for this census: knowing a
+     * page was truncated still leaves you paging a moving collection.
      *
      * The completeness guarantee is structural, not advisory: the whole census
      * is computed by ONE SQL statement. Postgres evaluates a statement against
@@ -9535,10 +10036,26 @@ export function issueService(db: Db) {
         trustExplicitResponsibleUserId,
         idempotencyKey: rawIdempotencyKey,
         allowDuplicate,
+        prReviewTarget,
         onDeduplicated,
         beforeSideEffects,
+        fencingPrecondition,
         ...issueData
       } = data;
+      // GitHub owner/repo identity is case-insensitive, so the persisted
+      // fingerprint must be too: without this, `Blockcast/paperclip` and
+      // `blockcast/paperclip` are different fingerprints and the same PR
+      // dedupes to two issues. This column is introduced by this migration,
+      // so there are no mixed-case rows to stay compatible with — unlike the
+      // live `pr_review:` task keys, whose producers are still mid-rollout and
+      // are matched through `matchesAnyTaskKey`'s dual-read predicate instead.
+      const prReviewFingerprint = prReviewTarget
+        ? `pr_review:${normalizePrReviewRepoFullName(prReviewTarget.repoFullName)}:${prReviewTarget.prNumber}`
+        : null;
+      if (prReviewFingerprint) {
+        issueData.originKind = "pr_review";
+        issueData.originFingerprint = prReviewFingerprint;
+      }
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
         delete issueData.executionWorkspaceId;
@@ -9572,6 +10089,11 @@ export function issueService(db: Db) {
       let createdIssue;
       try {
         createdIssue = await db.transaction(async (tx) => {
+        // First statement in the transaction, deliberately. A caller that has
+        // already lost its fence must not reach the aggregate advisory lock or
+        // any provider-side create below; the share lock taken here also blocks
+        // a steal from committing while this create is in flight.
+        await assertPluginFencingGeneration(tx, fencingPrecondition);
         const idempotencyKey = rawIdempotencyKey?.trim() || null;
         const normalizedTitle = normalizeCreateIssueTitle(issueData.title);
         if (issueData.assigneeAgentId) {
@@ -9584,6 +10106,7 @@ export function issueService(db: Db) {
             assigneeAgentId: issueData.assigneeAgentId,
             title: issueData.title,
             description: issueData.description,
+            prReviewTarget,
           });
         }
         if (allowDuplicate === false) {
@@ -9595,9 +10118,13 @@ export function issueService(db: Db) {
           const idempotencyGuardKey = `issue-create:idempotency:${companyId}:${idempotencyKey}`;
           await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${idempotencyGuardKey}, 0))`);
         }
+        if (prReviewFingerprint) {
+          const prReviewGuardKey = `issue-create:${companyId}:${prReviewFingerprint}`;
+          await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${prReviewGuardKey}, 0))`);
+        }
 
         let existingIssue: typeof issues.$inferSelect | undefined;
-        let deduplicationReason: "idempotency_key" | "recent_open_title" | null = null;
+        let deduplicationReason: "idempotency_key" | "recent_open_title" | "pr_review_target" | null = null;
         if (idempotencyKey) {
           const idempotencyKeyRetentionCutoff = new Date(Date.now() - ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_MS);
           await tx.execute(sql`
@@ -9623,6 +10150,31 @@ export function issueService(db: Db) {
             .limit(1)
             .then((rows) => rows.map((row) => row.issues));
           if (existingIssue) deduplicationReason = "idempotency_key";
+        }
+        if (!existingIssue && prReviewFingerprint) {
+          [existingIssue] = await tx
+            .select()
+            .from(issues)
+            .where(and(
+              eq(issues.companyId, companyId),
+              eq(issues.originKind, "pr_review"),
+              eq(issues.originFingerprint, prReviewFingerprint),
+              isNull(issues.hiddenAt),
+              notInArray(issues.status, ["done", "cancelled"]),
+            ))
+            .limit(1);
+          if (existingIssue) {
+            [existingIssue] = await tx
+              .update(issues)
+              .set({
+                title: issueData.title,
+                description: issueData.description ?? existingIssue.description,
+                updatedAt: new Date(),
+              })
+              .where(eq(issues.id, existingIssue.id))
+              .returning();
+            deduplicationReason = "pr_review_target";
+          }
         }
         if (!existingIssue && allowDuplicate === false) {
           [existingIssue] = await tx
@@ -9687,6 +10239,7 @@ export function issueService(db: Db) {
             assigneeAgentId: issueData.assigneeAgentId,
             title: issueData.title,
             description: issueData.description,
+            prReviewTarget,
           });
         }
 
@@ -10264,6 +10817,16 @@ export function issueService(db: Db) {
          *   absent  -> leave the park exactly as it is
          */
         parkedDisposition?: IssueParkedDispositionInput | null;
+        /**
+         * Fencing generation the caller must still hold for this update to
+         * apply. Set only by the plugin RPC host, which resolves the namespace
+         * from the authenticated plugin. Unlike the `expectedCurrent*`
+         * preconditions above — which compare against a snapshot read before
+         * the transaction — this is checked under a share lock held to commit,
+         * so a steal cannot interleave between the check and the write. See
+         * `plugin-fencing.ts`.
+         */
+        fencingPrecondition?: ResolvedPluginFencingPrecondition | null;
       },
       dbOrTx: any = db,
     ) => {
@@ -10289,6 +10852,7 @@ export function issueService(db: Db) {
         expectedCurrentExecutionPolicy,
         suppressRoutineSchedulerFailureHeartbeat,
         parkedDisposition,
+        fencingPrecondition,
         ...issueData
       } = data;
 
@@ -10354,7 +10918,7 @@ export function issueService(db: Db) {
           issueId: id,
         });
       }
-      const experimental = await instanceSettings.getExperimental();
+      const experimental = (await instanceSettingsOn(dbOrTx)).experimental;
       const isolatedWorkspacesEnabled = experimental.enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
         delete issueData.executionWorkspaceId;
@@ -10394,6 +10958,7 @@ export function issueService(db: Db) {
       let doneTransitionEvidenceVerdict: Awaited<ReturnType<typeof runEvidenceGate>> | null = null;
       let doneGateEvidenceVerdict = existing.lastEvidenceVerdict;
       let doneGateNeedsDurableArtifactCheck = false;
+      let doneGateHasVerifiedCommitEvidence = false;
       const doneGateInput = {
         fromStatus: existing.status,
         toStatus: issueData.status,
@@ -10401,6 +10966,7 @@ export function issueService(db: Db) {
         lastEvidenceVerdict: doneGateEvidenceVerdict,
         isAgentActor: actorAgentId != null,
         hasDurableArtifactEvidence: false,
+        hasVerifiedCommitEvidence: false,
       };
       if (experimental.enableDoneExecutionGate && shouldBlockNarratedDone(doneGateInput)) {
         try {
@@ -10414,9 +10980,32 @@ export function issueService(db: Db) {
               effectiveLabelNames,
             ),
             id,
+            new Date(),
+            githubTruthProbe,
+            { unlabeledTruthBlock: loadConfig().evidenceGateUnlabeledTruthBlock },
           );
           doneGateEvidenceVerdict = doneTransitionEvidenceVerdict;
+          const commitEvidence = doneTransitionEvidenceVerdict.commitEvidence ?? [];
+          if (commitEvidence.length > 0) {
+            const commitResults = await Promise.all(
+              commitEvidence.map((ref) => githubHasCommitEvidence(ref)),
+            );
+            doneGateHasVerifiedCommitEvidence = commitResults.some(
+              (result) => "found" in result && result.found === true,
+            );
+            if (!doneGateHasVerifiedCommitEvidence) {
+              const unavailable = commitResults.find((result) => "error" in result);
+              if (unavailable && "error" in unavailable) {
+                throw new HttpError(503, "Done-gate commit evidence verification unavailable", {
+                  reason: unavailable.error,
+                  issueId: id,
+                  retryable: true,
+                });
+              }
+            }
+          }
         } catch (err) {
+          if (err instanceof HttpError) throw err;
           logger.warn(
             {
               issueId: id,
@@ -10432,6 +11021,7 @@ export function issueService(db: Db) {
           lastEvidenceVerdict: doneGateEvidenceVerdict,
           isAgentActor: actorAgentId != null,
           hasDurableArtifactEvidence: false,
+          hasVerifiedCommitEvidence: doneGateHasVerifiedCommitEvidence,
         });
       }
 
@@ -10538,6 +11128,9 @@ export function issueService(db: Db) {
               effectiveLabelNames,
             ),
             id,
+            new Date(),
+            githubTruthProbe,
+            { unlabeledTruthBlock: loadConfig().evidenceGateUnlabeledTruthBlock },
           );
           inReviewVerdict = verdict;
           patch.lastEvidenceVerdict = isInReviewTransition
@@ -10603,6 +11196,11 @@ export function issueService(db: Db) {
       }
 
       const runUpdate = async (tx: any) => {
+        // Before any row or advisory lock below: a caller that has already lost
+        // its fence is rejected without contending for them, and the share lock
+        // this takes is held to commit, so a steal cannot land between here and
+        // the UPDATE.
+        await assertPluginFencingGeneration(tx, fencingPrecondition);
         // Parent and blocker edges share issue rows. Take one company-scoped graph
         // lock before either path starts row-level locks, so combined parent/blocker
         // patches cannot invert against blocker-only patches.
@@ -10841,6 +11439,7 @@ export function issueService(db: Db) {
               lastEvidenceVerdict: doneGateEvidenceVerdict,
               isAgentActor: actorAgentId != null,
               hasDurableArtifactEvidence: doneGateHasDurableArtifact,
+              hasVerifiedCommitEvidence: doneGateHasVerifiedCommitEvidence,
             })
           ) {
             throw unprocessable(
@@ -11435,7 +12034,7 @@ export function issueService(db: Db) {
         (current.assigneeAgentId === agentId || current.assigneeAgentId == null)
       ) {
         const expectedExecutionRunId = current.executionRunId;
-        const stale = await isTerminalOrMissingHeartbeatRun(expectedExecutionRunId);
+        const stale = await isReleasedTerminalOrMissingHeartbeatRun(expectedExecutionRunId);
         if (stale) {
           const now = new Date();
           const adopted = await withLockedIssueCheckoutExecution(
@@ -11578,6 +12177,18 @@ export function issueService(db: Db) {
         assigneeAgentId: current.assigneeAgentId,
         checkoutRunId: current.checkoutRunId,
         executionRunId: current.executionRunId,
+        // BLO-28441: `POST /checkout` refused the lock without ever naming the
+        // caller, so a run the server had already marked terminal could not tell
+        // "the holder is busy" from "I am dead". Same helper as the PATCH-side
+        // ownership guard, so both routes report the conflict the same way.
+        actorAgentId: agentId,
+        actorRunId: checkoutRunId,
+        ...(await describeIssueLockConflict({
+          checkoutRunId: current.checkoutRunId,
+          executionRunId: current.executionRunId,
+          actorAgentId: agentId,
+          actorRunId: checkoutRunId,
+        })),
       });
     },
 
@@ -11911,14 +12522,9 @@ export function issueService(db: Db) {
       // Same run-identity test as isCurrentIssueExecutionRun: hold every lock
       // column that is set, so a run owning only one of a divergent pair does
       // not read as the owner.
-      const ownsCheckout = current.checkoutRunId === actorRunId;
-      const ownsExecution = current.executionRunId === actorRunId;
-      const owned =
-        actorRunId != null &&
-        (ownsCheckout || ownsExecution) &&
-        (current.checkoutRunId == null || ownsCheckout) &&
-        (current.executionRunId == null || ownsExecution);
-      if (owned) return { owned: true as const, fenced: true as const };
+      if (runOwnsIssueExecutionLock(current, actorRunId)) {
+        return { owned: true as const, fenced: true as const };
+      }
 
       throw conflict("Issue run ownership conflict", {
         issueId: current.id,
@@ -11951,6 +12557,45 @@ export function issueService(db: Db) {
 
         if (!existing) return null;
         if (actorAgentId && existing.assigneeAgentId && existing.assigneeAgentId !== actorAgentId) {
+          // BLO-27356: a run that owns this issue's lock but is no longer its
+          // assignee degrades to relinquishing ONLY the lock.
+          //
+          // The stale pair "A holds the lock, B is the assignee" is produced by
+          // ordinary operation, not abuse — the heartbeat's reassignment
+          // lock-release deliberately leaves a `running` holder alone, and an
+          // ordinary manager hand-back where the releasing run stays alive
+          // re-stamps the lock onto a row that now belongs to B. Refusing
+          // outright was directionally right and wrong in granularity: the full
+          // release below nulls `assigneeAgentId` and forces `todo`, which would
+          // clobber B, but A never needed to reassign the row — only to let go.
+          //
+          // Two things are deliberately NOT done here:
+          //   * `status` and `assigneeAgentId` are left untouched, so a recovery
+          //     takeover or manager reassignment still wins. No monitor
+          //     eligibility patch is needed for the same reason — the two fields
+          //     it reconciles against are exactly the two that do not change.
+          //   * `cancelStaleIssueContextRuns` is SKIPPED entirely rather than
+          //     threaded a `keepRunId`. That parameter is singular, so it cannot
+          //     both spare B's run and reap a third foreign run; and cancelling
+          //     anything at all is out of scope for an actor relinquishing its
+          //     own lock. Skipping needs no new parameter and no exception list.
+          if (runOwnsIssueExecutionLock(existing, actorRunId)) {
+            const relinquished = await tx
+              .update(issues)
+              .set({
+                checkoutRunId: null,
+                executionRunId: null,
+                executionAgentNameKey: null,
+                executionLockedAt: null,
+                updatedAt: new Date(),
+              })
+              .where(eq(issues.id, id))
+              .returning()
+              .then((rows) => rows[0] ?? null);
+            if (!relinquished) return null;
+            const [enrichedRelinquished] = await withIssueLabels(tx, [relinquished]);
+            return enrichedRelinquished;
+          }
           throw conflict("Only assignee can release issue");
         }
         if (existing.checkoutRunId || existing.executionRunId) {
@@ -12450,8 +13095,65 @@ export function issueService(db: Db) {
       if (!comment) return null;
 
       const currentUserRedactionOptions = {
-        enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
+        enabled: (await instanceSettingsOn(dbOrTx)).general.censorUsernameInLogs,
       };
+      return redactIssueComment(comment, currentUserRedactionOptions.enabled);
+    },
+
+    /**
+     * BLO-31634: rewrite the body of a comment located by its idempotency key.
+     *
+     * The key is the authorization, not just the lookup. Only a caller able to
+     * reproduce the exact `(issue, author, key)` tuple it wrote can reach the
+     * row — and the plugin host namespaces plugin keys with the install row's
+     * id — so a plugin can edit the comments it authored and nothing else.
+     * There is deliberately no update-by-comment-id sibling: that would let
+     * anything holding the permission rewrite a human's comment, and no caller
+     * needs it.
+     *
+     * Returns null when no live row matches — a keyless (pre-0206) row, a
+     * soft-deleted one, or another author's. Callers must treat null as "not
+     * mine to edit" rather than retrying without the key.
+     *
+     * Concurrent callers converge: this is a single UPDATE, so two deliveries
+     * carrying the same edit both write the same body and neither inserts.
+     */
+    updateCommentByIdempotencyKey: async (
+      issueId: string,
+      idempotencyKey: string,
+      body: string,
+      actor: { agentId?: string | null; userId?: string | null },
+      dbOrTx: any = db,
+    ) => {
+      const currentUserRedactionOptions = {
+        enabled: (await instanceSettingsOn(dbOrTx)).general.censorUsernameInLogs,
+      };
+      const now = new Date();
+      const [comment] = await dbOrTx
+        .update(issueComments)
+        .set({
+          body: redactCurrentUserText(body, currentUserRedactionOptions),
+          updatedAt: now,
+        })
+        .where(and(
+          eq(issueComments.issueId, issueId),
+          eq(issueComments.idempotencyKey, idempotencyKey),
+          issueCommentIdempotencyAuthorScope(actor),
+          isNull(issueComments.deletedAt),
+        ))
+        .returning();
+
+      if (!comment) return null;
+
+      // The `issue_comments` activity trigger (0076) is AFTER INSERT only, so an
+      // edit would otherwise leave the thread's recency untouched. Bump the
+      // issue the same way `addComment` does and let the BEFORE UPDATE trigger
+      // on `issues` mirror it into `last_activity_at`.
+      await dbOrTx
+        .update(issues)
+        .set({ updatedAt: now })
+        .where(eq(issues.id, issueId));
+
       return redactIssueComment(comment, currentUserRedactionOptions.enabled);
     },
 
@@ -12478,9 +13180,29 @@ export function issueService(db: Db) {
         idempotencyKey?: string | null;
         sourceTrust?: typeof issueComments.$inferInsert.sourceTrust;
         createdAt?: Date | string | null;
+        /**
+         * Fencing generation the caller must still hold for this comment to be
+         * written. Set only by the plugin RPC host. Unlike `update`/`create`,
+         * this function does not open its own transaction, so the caller must
+         * supply one via `dbOrTx` — enforced below rather than silently
+         * degraded. See `plugin-fencing.ts`.
+         */
+        fencingPrecondition?: ResolvedPluginFencingPrecondition | null;
       },
       dbOrTx: any = db,
     ) => {
+      if (options?.fencingPrecondition && dbOrTx === db) {
+        // A share lock is only a lock for as long as its transaction lives. On
+        // the default handle each statement autocommits, so the lock would be
+        // released before the insert and this would degrade back into the
+        // check-before-act barrier it exists to replace. Fail loudly instead of
+        // appearing to fence.
+        throw new Error(
+          "issues.addComment with a fencingPrecondition requires an explicit transaction",
+        );
+      }
+      await assertPluginFencingGeneration(dbOrTx, options?.fencingPrecondition);
+
       const issue = await dbOrTx
         .select({ companyId: issues.companyId })
         .from(issues)
@@ -12490,7 +13212,7 @@ export function issueService(db: Db) {
       if (!issue) throw notFound("Issue not found");
 
       const currentUserRedactionOptions = {
-        enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
+        enabled: (await instanceSettingsOn(dbOrTx)).general.censorUsernameInLogs,
       };
       const redactedBody = redactCurrentUserText(body, currentUserRedactionOptions);
       const authorType = issueCommentAuthorTypeSchema.parse(

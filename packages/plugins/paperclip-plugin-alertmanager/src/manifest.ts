@@ -49,6 +49,22 @@ const manifest: PaperclipPluginManifestV1 = {
     "database.namespace.read",
     "database.namespace.write",
   ],
+  // PEN-2799: promote these tag keys to Prometheus labels so this plugin's own
+  // failure counters are alertable per alert rather than only in aggregate.
+  // `alertname` is the load-bearing one — it is what distinguishes "one rule
+  // cannot be owned" from "delivery is broken", a distinction that cost 89h on
+  // PEN-2581. Bounded by the number of alert rules, not by traffic.
+  //
+  // BLO-32163 adds `aggregate_key`, which is what makes a wedged aggregate
+  // lifecycle fence nameable from the page alone. Without it the fence signal
+  // publishes but identifies nothing: two aggregates of the same rule differing
+  // only by dedupe-domain are distinct fences that wedge independently, so
+  // `alertname` cannot single out the one that is actually stuck.
+  //
+  // `phase` is deliberately absent — it would multiply the fence metrics'
+  // combination count 4× inside their own per-name label budget. See
+  // PLUGIN_METRIC_PROMOTABLE_TAG_KEYS in server/src/services/metrics.ts.
+  metricLabels: ["aggregate_key", "alertname", "severity", "version"],
   entrypoints: {
     worker: "./dist/worker.js",
   },
@@ -186,7 +202,27 @@ const manifest: PaperclipPluginManifestV1 = {
       routeKey: "list-aggregate-firing-fences",
       method: "GET",
       path: "/aggregate-firing-fences",
-      auth: "board",
+      // BLO-35053: readable by an agent as well as a board user, because a
+      // wedged fence is only diagnosable from the row.
+      //
+      // Prometheus cannot substitute, and this stays true after BLO-32163
+      // (#1695) promotes `aggregate_key` to `tag_aggregate_key`:
+      //   - `phase` is deliberately NOT promoted there — it would 4x the fence
+      //     metric's combination count and starve `aggregate_key` inside the
+      //     50-slot per-name label budget. That is a standing budget decision,
+      //     not a gap waiting to be filled.
+      //   - `owner_instance_id` / `owner_slot` are not in the metric's tag set
+      //     at all, and they are what separate the two documented failure
+      //     models (a displaced holder vs an abandoned one).
+      //   - The series is a COUNTER of blocked delivery attempts. Even with a
+      //     perfect label set it reports that an aggregate was blocked, never
+      //     the live row: which phase it is in now, how long it has been held,
+      //     which instance holds it.
+      //
+      // The widening is strictly non-authorizing: the handler omits
+      // `firingToken` for a non-board actor, and that token is the entire
+      // capability `recover` accepts. `recover` stays `auth: "board"`.
+      auth: "board-or-agent",
       capability: "api.routes.register",
       companyResolution: { from: "query", key: "companyId" },
     },

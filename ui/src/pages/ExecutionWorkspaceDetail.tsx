@@ -273,7 +273,10 @@ function formStateFromWorkspace(workspace: ExecutionWorkspace): WorkspaceFormSta
     provisionCommand: readText(workspace.config?.provisionCommand),
     teardownCommand: readText(workspace.config?.teardownCommand),
     cleanupCommand: readText(workspace.config?.cleanupCommand),
-    inheritRuntime: !workspace.config?.workspaceRuntime,
+    // PEN-2852: `config.workspaceRuntime` is withheld from readers without `workspace_runtime:read`, so
+    // its absence does not mean the workspace inherits. Use the presence flag, which is always
+    // computed from the stored row, or the form misreports an own-config workspace as inheriting.
+    inheritRuntime: !workspace.hasWorkspaceRuntimeConfig,
     workspaceRuntime: formatJson(workspace.config?.workspaceRuntime),
   };
 }
@@ -774,7 +777,7 @@ export function ExecutionWorkspaceDetail() {
   const inheritedRuntimeConfig = linkedProjectWorkspace?.runtimeConfig?.workspaceRuntime ?? null;
   const effectiveRuntimeConfig = workspace?.config?.workspaceRuntime ?? inheritedRuntimeConfig;
   const runtimeConfigSource =
-    workspace?.config?.workspaceRuntime
+    workspace?.hasWorkspaceRuntimeConfig
       ? "execution_workspace"
       : inheritedRuntimeConfig
         ? "project_workspace"

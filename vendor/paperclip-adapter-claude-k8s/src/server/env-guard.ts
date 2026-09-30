@@ -32,6 +32,8 @@
  * describe either as authoritative. Tracked for removal-or-resync as BLO-22840.
  */
 
+import { createHash } from "node:crypto";
+
 export type AgentShellCommandDecision =
   | { action: "allow"; reason: "safe_env_inspection" | "not_environment_dump" }
   | { action: "block"; reason: "full_environment_dump" };
@@ -861,7 +863,32 @@ for (const name of Object.keys(process.env).sort()) console.log(name);
  * entry is not already present, preserving any existing hooks (e.g. Claude
  * Code's installed Stop hook).
  */
-const SETTINGS_MERGE_SCRIPT = String.raw`const fs=require("fs"),p=require("path");const dir=process.env.CLAUDE_CONFIG_DIR||(process.env.HOME||"/paperclip")+"/.claude";const f=p.join(dir,"settings.json");let s={};try{s=JSON.parse(fs.readFileSync(f,"utf8"))||{}}catch(e){}if(typeof s!=="object"||s===null)s={};s.hooks=s.hooks||{};const list=Array.isArray(s.hooks.PreToolUse)?s.hooks.PreToolUse:[];const cmd="node "+p.join(dir,"paperclip-env-guard.mjs");const has=list.some(g=>g&&Array.isArray(g.hooks)&&g.hooks.some(h=>h&&h.command===cmd));if(!has)list.push({matcher:"Bash",hooks:[{type:"command",command:cmd}]});s.hooks.PreToolUse=list;fs.mkdirSync(dir,{recursive:true});fs.writeFileSync(f,JSON.stringify(s,null,2));`;
+const SETTINGS_MERGE_SCRIPT = String.raw`const fs=require("fs"),p=require("path");
+const dir=process.env.CLAUDE_CONFIG_DIR||(process.env.HOME||"/paperclip")+"/.claude";
+const f=p.join(dir,"settings.json");
+let s={};try{s=JSON.parse(fs.readFileSync(f,"utf8"))||{}}catch(e){}
+if(typeof s!=="object"||s===null)s={};
+s.hooks=s.hooks||{};
+const guard=process.env.PAPERCLIP_GUARD_FILE||p.join(dir,"paperclip-env-guard.mjs");
+const cmd="node "+guard;
+const GUARD_RE=/paperclip-env-guard[^\s"']*\.mjs$/;
+const list=(Array.isArray(s.hooks.PreToolUse)?s.hooks.PreToolUse:[])
+  .map(function(g){
+    if(!g||!Array.isArray(g.hooks))return g;
+    const hooks=g.hooks.filter(function(h){
+      return !(h&&typeof h.command==="string"&&h.command!==cmd&&GUARD_RE.test(h.command));
+    });
+    return Object.assign({},g,{hooks:hooks});
+  })
+  .filter(function(g){return !g||!Array.isArray(g.hooks)||g.hooks.length>0;});
+const has=list.some(function(g){return g&&Array.isArray(g.hooks)&&g.hooks.some(function(h){return h&&h.command===cmd;});});
+if(!has)list.push({matcher:"Bash",hooks:[{type:"command",command:cmd}]});
+s.hooks.PreToolUse=list;
+fs.mkdirSync(dir,{recursive:true});
+const t=f+"."+process.pid+".tmp";
+fs.writeFileSync(t,JSON.stringify(s,null,2));
+fs.renameSync(t,f);
+`;
 
 /**
  * Build a `;`-joinable shell fragment that installs the guard + safe helper and
@@ -870,15 +897,65 @@ const SETTINGS_MERGE_SCRIPT = String.raw`const fs=require("fs"),p=require("path"
  * container (which has `node`; the init container is busybox). Fails open on
  * merge error so it can never block a run from starting.
  */
+/**
+ * Short content digest backing the content-addressed on-disk guard filename.
+ */
+function scriptDigest(script: string): string {
+  return createHash("sha256").update(script, "utf8").digest("hex").slice(0, 12);
+}
+
+/**
+ * Shell fragment that materialises `name` from `b64` exactly once.
+ *
+ * `$GUARD_DIR` lives under the agent HOME, which is a ReadWriteMany CephFS
+ * volume mounted by EVERY agent pod in the fleet. A plain `> file` redirect is
+ * O_TRUNC, so every pod issued setattr(size=0) against the SAME inode. When one
+ * such truncate wedged in the MDS (truncate_pending stuck with nothing driving
+ * it), every later truncate queued behind it forever, open() on the file blocked
+ * in D-state, and the PreToolUse hook hung for the whole fleet. Neither an MDS
+ * failover nor a scrub clears that state, and the poisoned dentry cannot even be
+ * renamed over, because unlinking the target needs the locks the stuck truncate
+ * holds.
+ *
+ * So: never truncate a shared file. Write a pod-unique temp and rename() it into
+ * place, and only when the target is absent — `test -f` stats the dentry, it
+ * never opens it. Each inode is written exactly once and truncated never.
+ */
+function installOnce(name: string, b64: string): string {
+  const target = `\$GUARD_DIR/${name}`;
+  const tmp = `\$GUARD_DIR/.${name}.\$\$.tmp`;
+  return (
+    `[ -f "${target}" ] || ` +
+    `{ printf %s '${b64}' | base64 -d > "${tmp}" && mv -f "${tmp}" "${target}"; }`
+  );
+}
+
+/**
+ * Build a `;`-joinable shell fragment that installs the guard + safe helper and
+ * merges the PreToolUse hook into `settings.json`. Scripts are base64-embedded
+ * so arbitrary JS survives `sh -c` with no quoting hazard. Runs in the MAIN
+ * container (which has `node`; the init container is busybox). Fails open on
+ * merge error so it can never block a run from starting.
+ *
+ * The guard filename is content-addressed so a guard change lands as a NEW file
+ * rather than an in-place rewrite of the shared one, and so a previously
+ * poisoned inode is routed around instead of waited on.
+ */
 export function buildEnvGuardSetupShell(): string {
   const guardB64 = Buffer.from(ENV_GUARD_SCRIPT, "utf8").toString("base64");
   const helperB64 = Buffer.from(SAFE_ENV_INSPECT_SCRIPT, "utf8").toString("base64");
   const mergeB64 = Buffer.from(SETTINGS_MERGE_SCRIPT, "utf8").toString("base64");
+  const guardName = `paperclip-env-guard.${scriptDigest(ENV_GUARD_SCRIPT)}.mjs`;
   return [
     `GUARD_DIR="\${CLAUDE_CONFIG_DIR:-\$HOME/.claude}"`,
     `mkdir -p "\$GUARD_DIR"`,
-    `printf %s '${guardB64}' | base64 -d > "\$GUARD_DIR/paperclip-env-guard.mjs"`,
-    `printf %s '${helperB64}' | base64 -d > "\$GUARD_DIR/safe-env-inspect.mjs"`,
+    installOnce(guardName, guardB64),
+    // The helper keeps a stable name: ENV_GUARD_SCRIPT names it literally in the
+    // block message. It is install-once too, so it is never truncated either.
+    installOnce("safe-env-inspect.mjs", helperB64),
+    `PAPERCLIP_GUARD_FILE="\$GUARD_DIR/${guardName}"`,
+    `export PAPERCLIP_GUARD_FILE`,
     `printf %s '${mergeB64}' | base64 -d | node - 2>/dev/null || echo "[paperclip-env-guard] settings merge skipped" >&2`,
   ].join("; ");
 }
+

@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   acquireFromApi,
+  dbRoundTrips,
   renderReport,
 } from "../../../scripts/blo-30608-gate-revalidation-backfill.js";
 import { revalidateGates } from "../services/human-gated-gate-revalidation.js";
@@ -68,7 +69,12 @@ function excludedRows(): StubIssue[] {
 
 type Stub = { requests: string[]; restore: () => void };
 
-function stubApi(rowsByStatus: Record<string, StubIssue[]>): Stub {
+type StubInteraction = { id: string; kind: string; status: string };
+
+function stubApi(
+  rowsByStatus: Record<string, StubIssue[]>,
+  interactionsByIssue: Record<string, StubInteraction[]> = {},
+): Stub {
   const original = globalThis.fetch;
   const requests: string[] = [];
 
@@ -79,6 +85,17 @@ function stubApi(rowsByStatus: Record<string, StubIssue[]>): Stub {
     const approvals = url.pathname.match(/^\/api\/issues\/([^/]+)\/approvals$/);
     if (approvals) {
       return new Response(JSON.stringify([]), { status: 200 });
+    }
+
+    // Matched explicitly rather than left to fall through to the status branch
+    // below: that branch answers `[]` for any unrecognised path, so an
+    // interactions call that was never wired would still look like a row with
+    // no question cards — a silent false negative on the whole new gate kind.
+    const interactions = url.pathname.match(/^\/api\/issues\/([^/]+)\/interactions$/);
+    if (interactions) {
+      return new Response(JSON.stringify(interactionsByIssue[interactions[1]] ?? []), {
+        status: 200,
+      });
     }
 
     const status = url.searchParams.get("status") ?? "";
@@ -151,6 +168,35 @@ describe("BLO-30608 backfill — API acquisition", () => {
     expect(rendered).toContain("Probed                      : 2 (3 beyond the budget)");
   });
 
+  // The legend label for `approval-abandoned` must not claim "every". The kind
+  // is assigned on *at least one* abandoned card, ahead of the refusal branch,
+  // so a mixed row is counted under it with refused cards still on it. The
+  // service-file heading for this same kind is pinned in
+  // human-gated-gate-revalidation.test.ts; this is the second site carrying the
+  // claim, and it drifted out of step with the first once already (PEN-3089).
+  // Asserted with the padding, because the label sits in a fixed-width column
+  // that nothing else exercises.
+  it("does not claim every board card was withdrawn in the resolution legend", async () => {
+    stub = stubApi({ blocked: humanGatedRows() });
+
+    const acquisition = await acquireFromApi(COMPANY_ID, null, NOW);
+    const report = revalidateGates(acquisition.evidence, {});
+    const rendered = renderReport(report, {
+      population: acquisition.population,
+      calls: acquisition.calls,
+      elapsedMs: 1_000,
+      source: "api",
+      notProbed: 0,
+    });
+
+    expect(rendered).toContain("  a board card withdrawn/cancelled           : ");
+    expect(rendered).not.toContain("every board card");
+    // Deliberately asymmetric with the line above it: `interaction-abandoned`
+    // is its probe's fall-through and so is genuinely terminal, which is what
+    // entitles that one to "every".
+    expect(rendered).toContain("  every question card withdrawn/expired      : ");
+  });
+
   it("excludes agent-owned, hidden, and digest rows from the population", async () => {
     stub = stubApi({ blocked: [...humanGatedRows(), ...excludedRows()] });
 
@@ -177,14 +223,95 @@ describe("BLO-30608 backfill — API acquisition", () => {
     expect(acquisition.omitted).toBe(0);
   });
 
-  it("bounds the per-issue approvals cost by the budget, not the population", async () => {
+  it("bounds the per-issue evidence cost by the budget, not the population", async () => {
     stub = stubApi({ blocked: humanGatedRows() });
 
     const acquisition = await acquireFromApi(COMPANY_ID, 2, NOW);
 
     const approvalCalls = stub.requests.filter((path) => path.includes("/approvals"));
+    const interactionCalls = stub.requests.filter((path) => path.includes("/interactions"));
     expect(approvalCalls).toHaveLength(2);
-    // 5 status pages + 2 approvals. Reported as the AC5 cost figure.
-    expect(acquisition.calls).toBe(7);
+    // BLO-30627 added interaction evidence as a second per-issue call. It must
+    // obey the same budget as approvals — a gate kind that fetched for the
+    // whole population would make `--max-probes` cost the same as an uncapped
+    // run, which is the trap the budget-at-acquisition design exists to avoid.
+    expect(interactionCalls).toHaveLength(2);
+    // 5 status pages + 2 approvals + 2 interactions. Reported as the AC5 cost
+    // figure, and pinned so a third per-issue gate kind cannot be added without
+    // the doubling showing up here first.
+    expect(acquisition.calls).toBe(9);
+  });
+
+  it("threads interaction evidence and row status into the classifier (BLO-30627)", async () => {
+    // End-to-end for the new gate kind on the API path: a pending question card
+    // has to reach `classifyGate` as a live gate. Acquiring it but dropping it
+    // on the floor would leave the row `unverifiable` and look identical to the
+    // pre-BLO-30627 behaviour this change exists to move.
+    stub = stubApi({ blocked: humanGatedRows() }, {
+      "i-1": [{ id: "int-1", kind: "ask_user_questions", status: "pending" }],
+      "i-2": [{ id: "int-2", kind: "request_confirmation", status: "cancelled" }],
+    });
+
+    const acquisition = await acquireFromApi(COMPANY_ID, 3, NOW);
+    const report = revalidateGates(acquisition.evidence, { maxProbes: null });
+    const byIdentifier = new Map(report.classifications.map((c) => [c.identifier, c]));
+
+    expect(byIdentifier.get("BLO-1")?.verdict).toBe("still-gated");
+    expect(byIdentifier.get("BLO-2")?.verdict).toBe("resolved-but-open");
+    expect(byIdentifier.get("BLO-2")?.resolutionKind).toBe("interaction-abandoned");
+    // BLO-3 has no cards at all, so it stays unverifiable — but now with the
+    // named reason, which is only reachable because `status` was threaded too.
+    expect(byIdentifier.get("BLO-3")?.verdict).toBe("unverifiable");
+    expect(byIdentifier.get("BLO-3")?.unverifiableReason).toBe(
+      "blocked-status-without-blocker-edge",
+    );
+  });
+});
+
+/**
+ * The DB path's reported cost (AC5) is derived, not stated.
+ *
+ * `acquireFromDb` needs a live `DATABASE_URL`, so the round-trip arithmetic is
+ * factored into a pure function and pinned here across the chunk boundary. The
+ * regression this guards is a constant: the shipped `calls: 6` was right only
+ * for a single-chunk population and silently wrong on both sides of it.
+ */
+describe("dbRoundTrips", () => {
+  it("charges only the candidate query for an empty population", () => {
+    // `chunk([], 500)` yields no iterations, so none of the five batched
+    // families runs. The old constant reported 6 round trips for zero rows.
+    expect(dbRoundTrips(0, 500)).toBe(1);
+  });
+
+  it("charges one chunk of every batched family for a single row", () => {
+    expect(dbRoundTrips(1, 500)).toBe(6);
+  });
+
+  it("still charges one chunk at exactly the chunk size", () => {
+    // The upper edge of the range where the old constant happened to be right.
+    expect(dbRoundTrips(500, 500)).toBe(6);
+  });
+
+  it("charges a second chunk one row past the boundary", () => {
+    // The off-by-one the constant could not express: 501 rows costs 11, not 6.
+    expect(dbRoundTrips(501, 500)).toBe(11);
+  });
+
+  it("reports 11 round trips for the measured 746-row population", () => {
+    // The figure BLO-30627's verifying signal asks to be posted beside the
+    // 16 / 52 / 678 split. Pinned so the report cannot drift from the code.
+    expect(dbRoundTrips(746, 500)).toBe(11);
+  });
+
+  it("tracks the chunk size rather than the literal 500", () => {
+    // Derived from `AGGREGATE_CHUNK_SIZE`, so shrinking the chunk raises the
+    // reported cost automatically instead of leaving a stale constant behind.
+    expect(dbRoundTrips(746, 250)).toBe(16);
+  });
+
+  it("rejects inputs that cannot produce a meaningful count", () => {
+    expect(() => dbRoundTrips(-1, 500)).toThrow(/non-negative integer/);
+    expect(() => dbRoundTrips(1.5, 500)).toThrow(/non-negative integer/);
+    expect(() => dbRoundTrips(10, 0)).toThrow(/positive integer/);
   });
 });

@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { and, desc, eq, gte, inArray, lt, ne, or, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -43,6 +43,7 @@ import { conflict, notFound, unprocessable } from "../errors.js";
 import { syncAgentAdapterEnvBindings } from "./agent-secret-bindings.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
+import { buildIssueMonitorEligibilityPatch } from "./issue-execution-policy.js";
 import { secretService } from "./secrets.js";
 import {
   builtInAgentMarkersEqual,
@@ -963,10 +964,25 @@ export function agentService(db: Db) {
 
       return db.transaction(async (tx) => {
         await tx.update(agents).set({ reportsTo: null }).where(eq(agents.reportsTo, id));
-        await tx
+        const reassignedIssues = await tx
           .update(issues)
           .set({ assigneeAgentId: null, createdByAgentId: null })
-          .where(or(eq(issues.assigneeAgentId, id), eq(issues.createdByAgentId, id)));
+          .where(or(eq(issues.assigneeAgentId, id), eq(issues.createdByAgentId, id)))
+          .returning();
+        for (const issue of reassignedIssues) {
+          const monitorPatch = buildIssueMonitorEligibilityPatch(issue);
+          if (Object.keys(monitorPatch).length === 0) continue;
+          await tx
+            .update(issues)
+            .set({ ...monitorPatch, updatedAt: new Date() })
+            .where(and(
+              eq(issues.id, issue.id),
+              isNull(issues.assigneeAgentId),
+              issue.monitorNextCheckAt
+                ? eq(issues.monitorNextCheckAt, issue.monitorNextCheckAt)
+                : isNull(issues.monitorNextCheckAt),
+            ));
+        }
         await tx.delete(heartbeatRunEvents).where(
           or(
             eq(heartbeatRunEvents.agentId, id),

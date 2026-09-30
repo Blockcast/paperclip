@@ -20,6 +20,7 @@ import {
   ISSUE_RECOVERY_ACTION_OUTCOMES,
   ISSUE_RECOVERY_ACTION_OWNER_TYPES,
   ISSUE_RECOVERY_ACTION_STATUSES,
+  ISSUE_RECOVERY_ACTION_RETIRING_BOUNDS,
   ISSUE_WORK_MODES,
   clampIssueRequestDepth,
   ISSUE_STATUSES,
@@ -31,6 +32,7 @@ import {
   REQUEST_CHECKBOX_CONFIRMATION_OPTION_LIMIT,
   REQUEST_ITEM_VERDICTS_ITEM_LIMIT,
 } from "../constants.js";
+import { executionWorkspaceStrategySchema } from "./execution-workspace.js";
 import { multilineTextSchema } from "./text.js";
 import { lowTrustReviewPresetPolicySchema, trustAuthorizationPolicySchema } from "./trust-policy.js";
 
@@ -106,20 +108,6 @@ export const ISSUE_EXECUTION_WORKSPACE_PREFERENCES = [
   "reuse_existing",
   "agent_default",
 ] as const;
-
-const executionWorkspaceStrategySchema = z
-  .object({
-    type: z.enum(["project_primary", "git_worktree", "adapter_managed", "cloud_sandbox"]).optional(),
-    baseRef: z.string().optional().nullable(),
-    branchTemplate: z.string().optional().nullable(),
-    worktreeParentDir: z.string().optional().nullable(),
-    provisionCommand: z.string().optional().nullable(),
-    teardownCommand: z.string().optional().nullable(),
-    // BLO-19063: opt into a per-run working tree. Omitted => "per_issue", the
-    // historical behaviour.
-    runScope: z.enum(["per_issue", "per_run"]).optional().nullable(),
-  })
-  .strict();
 
 export const issueExecutionWorkspaceSettingsSchema = z
   .object({
@@ -200,8 +188,49 @@ export const issueExecutionMonitorPolicySchema = z.object({
     .optional()
     .nullable()
     .default(null)
+    // Schema-size note (BLO-32419): this description is ~3.6 KB (~915 tokens) and ships in BOTH
+    // the create-issue and update-issue MCP tool schemas, so every agent pays it roughly twice on
+    // every tool-schema load. Kept inline rather than reduced to a pointer at `github-app-auth.ts`:
+    // this is the only copy an agent is guaranteed to have in context at the moment it arms a
+    // monitor, and the failures it prevents — converging a review gate that was in fact satisfied,
+    // or recording a verdict off a truncated read — each cost whole runs. A pointer would be
+    // cheaper and would not be read. `issue.test.ts` guards the load-bearing phrases so a
+    // size-motivated trim fails loudly instead of silently reinstating the false negative.
+    //
+    // Evidence for the pagination clause, kept here rather than in the description because these
+    // counts decay and the mechanism does not (measured 2026-09-07): `paperclip#937` holds 60
+    // comments and returns only 30 unpaginated; `#952` holds 41. Both are far below the helper's
+    // 10-page/1000-comment cap, which is why the description leads with the 30-item default —
+    // that is the limit a hand-rolled fetch actually trips over.
+    //
+    // Evidence for the `commit_id` mutability warning (BLO-35277), same split: the mechanism is in
+    // the description because an agent reading this schema is about to act on it; the counts live
+    // here. BLO-27234, n=128 reviews: 8 confirmed forward re-anchorings, all 8 APPROVED, 6 of them
+    // not even the latest review; 0 of 94 COMMENTED re-anchored. That breakdown names only
+    // COMMENTED and APPROVED — 8 + 94 = 102, so ~26 of the 128 are unattributed — which is why the
+    // description calls CHANGES_REQUESTED / DISMISSED UNMEASURED rather than reading COMMENTED's
+    // result across them. That arithmetic is the sole support for the UNMEASURED label, so it is
+    // stated here rather than left as the reader's inference.
+    // Re-measured 2026-09-22 on `pim-multicast-gateway#1968`: four APPROVED reviews of two
+    // different older heads (`9b5e3a29…`, `11c80be5…`) all report one `commit_id=3168e6a2`, which
+    // is neither of them, while their `Reviewed head:` body markers keep the two heads correctly
+    // distinct. This is the fourth copy of the unsound recipe found (BLO-27234 `pim` CLAUDE.md,
+    // BLO-28737 `shaka-player/AGENTS.md`, BLO-34666 the agent bundle) and the only one no bundle
+    // write can reach, so `issue.test.ts` guards it.
+    //
+    // The `githubHasReviewerEvidenceForPr` pointer is SCOPED, not cleared: that predicate credits
+    // surface 1 on `commitId === headSha` alone in any SUBMITTED state, and APPROVED is reachable
+    // there — `Blockcast/trafficcontrol#1350` (author `kkroo`, human) carries an
+    // `allyblockcast[bot]` APPROVED review, and that repo measures
+    // `dismiss_stale_reviews_on_push: false` / `require_last_push_approval: false`, so nothing
+    // downstream catches a stale credit either. Tracked as BLO-35545; deliberately not fixed here,
+    // since widening a doc-string PR into the server predicate is how BLO-28920 happened.
     .describe(
-      "BLO-18294: the gates this monitor is actually waiting on, as short stable tokens (e.g. \"pr:Blockcast/paperclip#814:checks\", \"deploy:paperclip-api\"). Declaring them makes the convergence guard compare re-checks against THESE and ignore free-form `notes` churn, so an unrelated signal you happened to mention cannot read as progress and keep the loop alive. Unresolved `blockedBy` edges are folded in automatically — declare gateSignals for anything the issue graph does not already model.",
+      "BLO-18294: the gates this monitor is actually waiting on, as short stable tokens (e.g. \"pr:Blockcast/paperclip#814:checks\", \"deploy:paperclip-api\"). Declaring them makes the convergence guard compare re-checks against THESE and ignore free-form `notes` churn, so an unrelated signal you happened to mention cannot read as progress and keep the loop alive. Unresolved `blockedBy` edges are folded in automatically — declare gateSignals for anything the issue graph does not already model. " +
+        "BLO-22574: a `pr:<repo>#<n>:review` gate token is opaque to the server — nothing evaluates it against GitHub, so YOU perform the re-check and record the verdict. It has TWO satisfying surfaces, `pulls/{n}/reviews` shows only one of them, and BOTH require an explicit identity check before anything counts. " +
+        "SURFACE 1 — formal reviews (`pulls/{n}/reviews`): this is a LIVENESS check — it asks whether a review HAPPENED at this head, never whether this head is authorized to merge. A non-empty response is NOT by itself satisfaction. Credit an entry only when its author is the reviewer App identity (`<slug>[bot]` or `app/<slug>`) AND the entry itself attests to the PR's current head. Read that attestation from the immutable `Reviewed head: <40-hex>` marker in the review BODY — GitHub never rewrites a body — and treat `commit_id` as corroboration at most, never as the record of which head was read. ⚠ `commit_id` IS MUTABLE: GitHub RE-ANCHORS it FORWARD onto the new head when the branch is updated (`strict: true` forces that routinely), so `commit_id == head` fails OPEN — it does not reject a stale review, it ACCEPTS one that never saw this head. Re-anchoring has only ever been OBSERVED on APPROVED; on COMMENTED — the state Ally's reviews on agent-authored PRs necessarily take, and the only non-APPROVED state with a real sample behind it — none has been observed, so `commit_id` is treated as a usable anchor there when a review carries no body marker, which is what keeps this liveness check working. Treat that as the working assumption it is — absence of observation, not a documented GitHub guarantee — and prefer the body marker wherever one exists. CHANGES_REQUESTED / DISMISSED are UNMEASURED, not cleared: nobody has counted them, so require the body marker there rather than reading COMMENTED's result across. Any SUBMITTED state qualifies (COMMENTED / CHANGES_REQUESTED / APPROVED / DISMISSED — a dismissed review still happened), because this gate asks whether a review happened, not whether it approved; requiring APPROVED is structurally unsatisfiable, since GitHub bars a PR's author from approving its own PR and agent PRs are App-authored. `PENDING` does NOT qualify: it is an unsubmitted draft visible only to the App that created it, so crediting it would let a run that died mid-flow self-attest. The bare `<slug>` user seat is a DIFFERENT principal and is NEVER credited, on either surface, in any review state — including an `APPROVED` seat review at the exact head. Every other author, and every review at any other head, fails closed. `reviews` is not returned sorted, so scan every entry rather than taking the first or last printed. " +
+        "SURFACE 2 — issue comments (`issues/{n}/comments`): Ally frequently answers as a plain PR comment and files no formal review object at all, so `pulls/{n}/reviews` reads `reviews=0` forever on those PRs even though Ally has demonstrably reviewed (verified on Blockcast/magma#1655 and Blockcast/paperclip#929/#942/#948/#951/#952). `reviews=0` is therefore NOT evidence of no review: before re-arming on it, also read `issues/{n}/comments`. Credit a comment only when it is authored by the reviewer App identity (the same-slug user seat is not that identity and never counts here either), carries the canonical `## Ally — Consolidated PR Review` heading, and contains EXACTLY ONE standalone full-40-hex `Reviewed head:` attestation; zero or several means unproven, so fail closed rather than crediting it. " +
+        "On both surfaces judge staleness by comparing the attested `Reviewed head:` SHA against the PR's current head — never by `commit_id` alone (mutable; see the SURFACE 1 warning), and never by timestamp, which cannot tell \"read this head\" apart from \"raced the push\". PAGINATE BOTH surfaces, and note the trap is not the far end: GitHub's DEFAULT page size is 30, so a hand-rolled single-page fetch silently drops the rest of a longer thread and reproduces the very `reviews=0` false negative this block exists to kill. Pass `per_page=100` AND keep following pages until a short one. Whatever your cap, a TRUNCATED read is UNPROVEN, never absence: the helper stops at 10 pages and returns `reviews_pagination_exhausted`/`comments_pagination_exhausted`, a retryable outcome distinct from `{found:false}` — re-check, do not record a verdict off it. `githubHasReviewerEvidenceForPr` in `server/src/services/github-app-auth.ts` is the authoritative server-side implementation of this check: mirror its identity matching, its SUBMITTED-state handling, its pagination and its exhaustion codes rather than re-deriving weaker logic. But it PREDATES the body-marker rule above and still keys surface 1 on `commit_id` alone, in ANY submitted state. That is sound for the states Ally's reviews take on agent-authored PRs, which is its dominant case — but `APPROVED` IS a state it runs on (a human-authored PR can carry an App `APPROVED` review), so the server carries the same latent fail-open and is NOT cleared by this block. Do NOT carry its `commit_id` keying over to `APPROVED`, where re-anchoring makes it the fail-open recipe this block exists to remove.",
     ),
   kind: z.enum(ISSUE_EXECUTION_MONITOR_KINDS).optional().nullable().default(null),
   serviceName: z.string().trim().min(1).max(120).optional().nullable().default(null),
@@ -287,8 +316,10 @@ export const issueRecoveryActionReadModelSchema = z.object({
   wakePolicy: z.record(z.string(), z.unknown()).nullable(),
   monitorPolicy: z.record(z.string(), z.unknown()).nullable(),
   attemptCount: z.number().int().nonnegative(),
+  nonDeliverySweepCount: z.number().int().nonnegative(),
   maxAttempts: z.number().int().positive().nullable(),
   timeoutAt: z.union([z.date(), z.string().datetime()]).nullable(),
+  retiringBound: z.enum(ISSUE_RECOVERY_ACTION_RETIRING_BOUNDS).nullable(),
   lastAttemptAt: z.union([z.date(), z.string().datetime()]).nullable(),
   outcome: z.enum(ISSUE_RECOVERY_ACTION_OUTCOMES).nullable(),
   resolutionNote: z.string().nullable(),
@@ -306,13 +337,39 @@ const RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES = [
   "cancelled",
 ] as const;
 
+/**
+ * `sourceIssueStatus` is the status the resolver ASSERTS about the source issue.
+ *
+ * PEN-2756: the enum omits `in_progress` and `backlog`, and those are exactly the
+ * two states beacons most often sit on. No invariant enforces that omission —
+ * `in_progress` is NOT reserved for the execution lock (issues.ts sets it lock-free
+ * on any assigned row, and a deliberate `in_progress` write is explicitly protected
+ * from the checkout-restore sweep). So the exclusion is not load-bearing; it is
+ * simply a vocabulary that never grew a way to say "nothing".
+ *
+ * The fix is to allow asserting NOTHING rather than to widen the enum. Widening it
+ * would make the resolver claim execution state it cannot verify, and would route a
+ * status write through `issues.update` side effects (`startedAt`, checkout-restore
+ * marker clearing) purely to clear an unrelated beacon. Omitting the field asserts
+ * nothing, touches nothing, and leaves a live `in_progress` run or a board-approved
+ * `backlog` park exactly as it was.
+ *
+ * Omission is confined to `restored` on purpose. `blocked` must land the row on
+ * `blocked` (the route additionally requires a real first-class blocker), and the
+ * board-only `false_positive`/`cancelled` outcomes retire the recovery premise
+ * entirely, so they must say where the row lands rather than leave it mid-flight.
+ */
 export const resolveIssueRecoveryActionSchema = z.object({
   actionId: z.string().uuid().optional(),
   outcome: z.enum(RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES),
-  sourceIssueStatus: z.enum(["todo", "done", "in_review", "blocked"]),
+  sourceIssueStatus: z.enum(["todo", "done", "in_review", "blocked"]).optional(),
   resolutionNote: multilineTextSchema.optional().nullable(),
 }).strict().superRefine((value, ctx) => {
   if (value.outcome === "restored") {
+    // Omitted => leave the source issue's status untouched. The route already
+    // guards every status-dependent step on this field being present, so an
+    // absent value resolves the action and writes no status.
+    if (value.sourceIssueStatus === undefined) return;
     if (
       value.sourceIssueStatus !== "todo" &&
       value.sourceIssueStatus !== "done" &&
@@ -320,7 +377,8 @@ export const resolveIssueRecoveryActionSchema = z.object({
     ) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: "Restored recovery actions must move the source issue to todo, done, or in_review",
+        message:
+          "Restored recovery actions must move the source issue to todo, done, or in_review, or omit sourceIssueStatus to leave it unchanged",
         path: ["sourceIssueStatus"],
       });
     }
@@ -592,6 +650,10 @@ const createIssueBaseSchema = z.object({
     agentId: z.string().uuid(),
     instructions: multilineTextSchema.optional().nullable(),
   }).strict().optional().nullable(),
+  prReviewTarget: z.object({
+    repoFullName: z.string().regex(/^[\w.-]+\/[\w.-]+$/),
+    prNumber: z.number().int().positive(),
+  }).strict().optional().nullable(),
 });
 
 const createIssueDuplicateGuardSchema = {
@@ -649,6 +711,7 @@ export const updateIssueSchema = createIssueBaseSchema.omit({
   createdByUserId: true,
   responsibleUserId: true,
   watchdog: true,
+  prReviewTarget: true,
 }).partial().extend({
   requestDepth: issueRequestDepthInputSchema.optional(),
   assigneeAgentId: z.string().trim().min(1).optional().nullable(),

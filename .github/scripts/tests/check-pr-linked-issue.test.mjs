@@ -154,6 +154,26 @@ test('passes when the Paperclip identifier is followed by end-of-sentence punctu
   assert.equal(checkLinkedIssue('Refs BLO-20901,', 'fix: bug').passed, true);
 });
 
+// Left token boundary: the keyword group has no `^`/word-boundary anchor on
+// its left side, so it used to match inside unrelated words that merely end
+// with (or contain) one of fixes/closes/resolves/refs.
+
+test('fails when the keyword is embedded inside another word (Paperclip identifier)', () => {
+  assert.equal(checkLinkedIssue('derefs BLO-20901', 'fix: bug').passed, false);
+  assert.equal(checkLinkedIssue('unresolves BLO-20901', 'fix: bug').passed, false);
+  assert.equal(checkLinkedIssue('prefixes BLO-20901', 'fix: bug').passed, false);
+});
+
+// The #NNN keyword pattern has the same class of left-boundary gap, but a
+// bare `#NNN` (with no keyword at all) is separately accepted as evidence —
+// see "passes with bare #NNN reference" above — so an embedded keyword next
+// to a bare #NNN still passes overall. Use a body with no other qualifying
+// pattern to isolate the keyword-boundary behavior itself.
+
+test('embedded keyword next to #NNN does not smuggle in extra credit, but bare #NNN still passes on its own', () => {
+  assert.equal(checkLinkedIssue('derefs #123', 'fix: bug').passed, true);
+});
+
 // Prefix-aware skip behavior
 
 test('skips check for docs: prefix', () => {

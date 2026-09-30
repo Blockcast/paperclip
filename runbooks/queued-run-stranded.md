@@ -10,7 +10,10 @@ Triggers:
 - `PaperclipQueuedRunStranded` — an agent's oldest queued run is older than
   `queuedRunStrandedAgeSeconds` (1440 seconds by default), and the age
   snapshot refreshed successfully. The five-minute alert hold means it can
-  fire before 30 minutes of real queue wait.
+  fire before 30 minutes of real queue wait. This is the per-agent form this
+  chart renders. Blockcast's live `onprem-k8s` rules replaced it with the
+  fleet-scoped `PaperclipQueuedRunStrandedFleet` (≥5 agents past 1800s, for
+  15m; BLO-29665), which also links here.
 - `PaperclipQueuedRunAgeMetricsRefreshFailed` — the most recent `/metrics`
   database refresh failed, so queued-run ages are stale and intentionally do
   not qualify the stranded-run alert.
@@ -20,19 +23,47 @@ Owner: Platform / SRE (BLO-21116)
 ## Scheduled-retry park horizon is a different signal
 
 `paperclip_scheduled_retry_park_horizon_seconds` measures the booked interval
-from `heartbeat_runs.created_at` to `scheduled_retry_at` for live
-`status='scheduled_retry'` rows. `PaperclipScheduledRetryParkHorizonImplausible`
+from `heartbeat_runs.updated_at` to `scheduled_retry_at` for live
+`status='scheduled_retry'` rows — i.e. how far out the most recent park decision
+booked. `PaperclipScheduledRetryParkHorizonImplausible`
 fires when that future-due horizon exceeds 5,400 seconds, based on the
 observed seven-day population (n=5,253, p99=1,594.8s, maximum 3,567.5s).
 `PaperclipScheduledRetryParkHorizonMetricsRefreshFailed` is the companion
 alert for a failed gauge refresh; while it is firing, the horizon alert is
 gated off and its last snapshot is not trustworthy.
 
+> **Do not measure this from `created_at`** ([BLO-31174](/BLO/issues/BLO-31174)).
+> A park is re-decided in place: each re-check UPDATEs the same row with a new
+> `scheduled_retry_at` and `updated_at`, while `created_at` stays pinned at the
+> first park. Measured from `created_at` the value reports how long the row has
+> been *re-parking*, climbs by one backoff interval per re-check without bound,
+> and crosses the threshold after ~2 re-checks however sane each booking was. On
+> 2026-09-03 that had 9 agents firing simultaneously, every one of them booking a
+> correct ~1h `dependency_blocked` backoff.
+
 The Helm rule is a mirror only: Blockcast production loads the corresponding
 rules from the lockstep `onprem-k8s` Prometheus ConfigMap/CRD pair, not this
 chart's disabled-by-default `PrometheusRule`. A merged chart rule is therefore
 not proof that the production alert is live; verify the authoritative rules and
 the `monitoring-rules` Argo sync before closing an incident.
+
+> **Inside `onprem-k8s`, the ConfigMap is the authoritative half of that pair —
+> not the CRD.** Prometheus loads the `*.rules.yml` keys out of
+> `monitoring/prometheus-rules-*-configmap.yaml`; the `PrometheusRule` CRD
+> (`paperclip/*-prometheusrule.yaml`) is a copy kept in lockstep beside it. So
+> editing only the CRD changes nothing a responder will ever see, even after the
+> PR merges and Argo syncs. Edit **both**, and let
+> `scripts/check-prometheus-rules-lockstep.sh` confirm it — that script names the
+> ConfigMap as authoritative in its own failure text.
+>
+> Two CI gates catch this, and both name the CRD, which is why the failure reads
+> as two unrelated problems instead of one missed file: `CRD vs CM lockstep`
+> diffs the pair, and `promtool check config (parse gate)` extracts its rules
+> **from the ConfigMap shards**, so a unit-test expectation updated alongside the
+> CRD is asserted against the stale ConfigMap text. Fixing the ConfigMap clears
+> both at once. This is not hypothetical: it is exactly how
+> [BLO-31174](/BLO/issues/BLO-31174)'s own mirror PR
+> ([onprem-k8s#3047](https://github.com/Blockcast/onprem-k8s/pull/3047)) went red.
 
 This is not the [BLO-22094](/BLO/issues/BLO-22094) overdue detector:
 
@@ -44,14 +75,21 @@ This is not the [BLO-22094](/BLO/issues/BLO-22094) overdue detector:
 For the horizon alert, query the parked rows directly:
 
 ```sql
-select id, agent_id, created_at, scheduled_retry_at,
-       extract(epoch from scheduled_retry_at - created_at) as park_horizon_seconds,
+select id, agent_id, created_at, updated_at, scheduled_retry_at,
+       scheduled_retry_attempt,
+       extract(epoch from scheduled_retry_at - updated_at) as park_horizon_seconds,
+       extract(epoch from scheduled_retry_at - created_at) as cumulative_reparking_seconds,
        scheduled_retry_reason
 from heartbeat_runs
 where status = 'scheduled_retry'
   and agent_id = '<agent_id from the alert>'
 order by park_horizon_seconds desc;
 ```
+
+A row where `park_horizon_seconds` is sane but `cumulative_reparking_seconds` is
+large is **not** a bad booking — it is a row that has been re-parking for a long
+time, which is a dependency/capacity question, not a scheduler one. Read
+`scheduled_retry_reason` and `scheduled_retry_attempt` to tell which.
 
 ## The invariant
 
@@ -160,15 +198,25 @@ is stale and needs correction before a re-wake is dismissed.
 
 ## When the refresh-failure alert fires
 
-1. Inspect serving Paperclip logs for `failed to refresh queued-run-age
-   metrics before scrape` and the underlying database error.
+1. Inspect serving Paperclip logs for `scrape-metrics collector refresh failed`
+   with `refresh: "queued-run-age"` and the underlying database error. (Before
+   BLO-33243 this refresh ran inline on the scrape and logged `failed to
+   refresh queued-run-age metrics before scrape`; it now runs on a 15 s
+   background interval.)
 2. Check database reachability, connection-pool saturation, and query latency.
-   Do not interpret an exported age of `0` as current data while freshness is
-   `0`.
+   `paperclip_db_pool_waiting_queries` above 0 with
+   `paperclip_db_pool_connections{state="idle"}` at 0 is pool exhaustion on
+   that pod (BLO-33243). Do not interpret an exported age of `0` as current
+   data while freshness is `0`.
 3. Confirm a fresh `/metrics` scrape exposes
    `paperclip_queued_run_age_metrics_refresh_success 1`.
 4. If queued rows are urgent while the metric is stale, run the SQL above
    manually and work from that result.
+
+Freshness now also drops to `0` when the collector *stops ticking altogether*,
+not only when a refresh rejects — a wedged collector would otherwise leave the
+gauge reading last-good over a frozen age, which is the same invisible failure
+the gauge exists to prevent.
 
 ## Silencing
 
@@ -187,7 +235,7 @@ The chart rule in `deploy/helm/paperclip/templates/prometheusrule.yaml` is a
 mirror on Blockcast: `prometheusRule.enabled` is false in
 `values.blockcast.yaml`. The production rule must also be landed in the two
 lockstep `Blockcast/onprem-k8s` alert files: the authoritative
-`monitoring/prometheus-configmap.yaml` key
+`monitoring/prometheus-rules-2-configmap.yaml` key
 `paperclip-runtime-alerts.rules.yml` and the CRD documentation copy. Then
 manually sync the `monitoring-rules` Argo application (BLO-19095). Merging
 this repository alone does not make the alert live. Before treating the
@@ -309,16 +357,18 @@ statement timeout or plan regression can hit one and not the other. A healthy
 `paperclip_queued_run_age_metrics_refresh_success` does **not** vouch for this
 one — check this series by name.
 
-1. Check Paperclip server logs for `failed to refresh
-   overdue-scheduled-retry-age metrics before scrape`; the `err` field carries
-   the database error.
+1. Check Paperclip server logs for `scrape-metrics collector refresh failed`
+   with `refresh: "overdue-scheduled-retry-age"`; the `err` field carries the
+   database error. (Pre-BLO-33243 this logged `failed to refresh
+   overdue-scheduled-retry-age metrics before scrape`.)
 2. Check database connectivity and statement timeouts. If only this refresh is
    failing while the sibling is healthy, suspect the `0224` partial index —
    confirm `heartbeat_runs_overdue_scheduled_retry_idx` is `valid` in
    `pg_index`, since an invalid index left behind by a failed
    `CREATE INDEX CONCURRENTLY` makes the planner fall back to a sequential
    scan over ~219k rows.
-3. Recovery is automatic on the next successful scrape — the gauge returns to
+3. Recovery is automatic on the next successful collector tick (15 s) — the
+   gauge returns to
    `paperclip_overdue_scheduled_retry_age_metrics_refresh_success 1`.
 
 Do not silence this to quiet the page: silencing it while the gate is closed
@@ -358,10 +408,359 @@ deploy on Blockcast (`prometheusRule.enabled: false`) — verify this rule
 against `/api/v1/rules` in the environment that actually pages before relying
 on it, and confirm the `Blockcast/onprem-k8s` copy is in place if it isn't.
 
+## Agent start lock wedged (PEN-3305)
+
+Source: `server/src/services/agent-start-lock.ts` (`withAgentStartLock`,
+`describeHeldAgentStartLocks`), `server/src/services/metrics.ts`
+(`AGENT_START_LOCK_HELD_SECONDS_METRIC`, `setAgentStartLockHeldMetrics`),
+`server/src/services/scrape-metrics-collector.ts`
+(`refreshAgentStartLockMetrics`)
+Trigger: alert `PaperclipAgentStartLockWedged` —
+`count(max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 900) >= 3`
+for 10m once BLO-36522's retune lands. That retune is in `Blockcast/onprem-k8s#3985`,
+**not yet merged**: until it lands, the live rule is still
+`max by (agent_id) (...) > 300` for 5m, and this alert still fires on
+single-agent routine contention.
+The rule is quoted here for readability only and lives in a different repo —
+the source of record is the lockstep pair `paperclip/paperclip-runtime-alerts-prometheusrule.yaml`
+and `monitoring/prometheus-rules-2-configmap.yaml` in `Blockcast/onprem-k8s`.
+Read the numbers there before acting on either one.
+Owner: Platform / SRE (PEN-3305)
+
+### ⚠️ What this alert claims, and what it no longer claims (BLO-36522)
+
+**The name says "wedged". Measured, that word is wrong, and it is retained only
+because it keys this anchor, the promtool cases and the Slack baseline.** Two
+claims this section used to make were falsified on 2026-09-25:
+
+- *"It does not self-heal."* The 7-day maximum hold — 8043s (2h14m), three
+  agents in lockstep — released on its own at 2026-09-24T03:15Z while the
+  **same** `paperclip-0` process, up since 09-21T16:33Z, kept running for a
+  further **7.75 h**. No restart. The routine case behaves the same way: the
+  episode that produced [BLO-35522](https://paperclip.blockcast.net/BLO/issues/BLO-35522)
+  peaked at 658.97s and fell to 98.58s inside
+  70 minutes, within 29 h of unbroken uptime and zero restarts.
+- *"The lock is stuck."* `resets(paperclip_agent_start_lock_held_seconds[6h])`
+  = **175** on the observed agent — it is acquired and released roughly every
+  two minutes. A genuinely wedged lock has **zero** resets. It is slow, not
+  stuck. (The converse does not hold — zero resets does *not* establish a
+  wedge, because the series is absent between holds. See Step 4.)
+
+**There are two regimes, and the old 300s threshold could not tell them apart
+because it sat inside the normal envelope.** Over 7 days, **21 of 23 agents**
+crossed 300s, for **2,730 agent-minutes** (~390/day fleet-wide) — a continuous
+condition, not a page. ⚠️ That agent count is a **sliding 7d window and it
+moves**: re-measured 2026-09-26 it was **22 of 23**, because one of the two
+agents that had been under threshold (peaks of 30.2s and 116.1s on 09-25) rose
+to 572.0s. Cite it with its date, and do not restate it as "all agents" — the
+argument rests on the proportion being overwhelming, not on it being universal.
+Magnitude cannot separate the regimes either: the exceedance
+curve is smooth and knee-free (2,730 agent-min >300s → 1,565 >900s → 963
+>1800s → 492 >3600s), so no single-agent duration has a natural cut.
+
+| | routine contention | common-mode stall |
+|---|---|---|
+| duration | seconds → ~10 min | hours |
+| agents | one at a time | **≥3 simultaneously, in lockstep** |
+| frequency | continuous, nearly every agent | ~1 episode/week |
+| pages? | **no, by design** | yes |
+
+**Simultaneity is the discriminator**, which is why the expression counts
+agents rather than raising the duration bound. Backtested at 179 fleet-minutes
+— one episode, the 2026-09-24T01:00Z event — over all the history Prometheus
+retains.
+
+**Severity stays `critical`, on a new basis.** The old justification was the
+non-self-healing claim above, which is dead. It stays critical because, once
+#3985 lands, it fires only on the fleet-scope episode, and because it must keep the
+out-of-band Slack path precisely *because* the suspected fault is in
+paperclip's own dispatcher — routing it `warning` would put the page behind
+the component it is reporting on. **The action is diagnostic capture, not a
+restart** (Step 4).
+
+⚠️ **The coverage this retune GIVES UP, in Blockcast's live rules: a solo
+indefinite hold now pages on nothing.** Stated here because it is the one cost
+of the change that is not self-evident from the expression. After #3985 lands,
+none of the three alerts that could catch a single agent whose lock is held for
+the life of the process does so in Blockcast's live `onprem-k8s` rules: this
+one needs **≥3** agents, `PaperclipQueuedRunStrandedFleet` needs **≥5**, and
+the per-agent `PaperclipQueuedRunStranded` it superseded is already gone from
+them (BLO-29665). The ≥5 is read from the lockstep pair cited under
+Trigger above, which is also where #3985 puts the ≥3; neither fleet-count form
+exists in this repo. So "the fleet alert already covers user-visible impact"
+is true only in the fleet regime.
+
+That is a deliberate trade, not an oversight, and the evidence supports it:
+the solo hold measured **cycled** (175 resets/6h — acquired and released
+about every 2 minutes), and the founding 2026-09-15/16 incident was five
+agents, so the retuned expression would have caught it. The residual is the
+case never yet observed: one agent, monotonic, indefinite. **On Blockcast's
+live `onprem-k8s` rules, if you are triaging a single stuck agent, no page will
+have brought you here**; reach for
+`max by (agent_id) (paperclip_agent_start_lock_held_seconds)` directly, and
+read the `resets()` caveat in Step 4 before concluding it is stuck.
+
+**This chart copy keeps that coverage.** It still renders the per-agent
+`PaperclipQueuedRunStranded` (`deploy/helm/paperclip/templates/prometheusrule.yaml`,
+`queuedRunStrandedAgeSeconds`, 1440s by default), and its own start-lock rule
+is the unretuned single-agent `> 300` (see KNOWN DIVERGENCE below). An
+installation that enabled the chart still pages on a solo hold, and on its
+stranded consequence.
+
+**What holds the locks for 2h14m is still UNKNOWN.** This retune makes the
+alert describe reality; it does not explain the stall. Recorded lead, untested
+and with no causal claim: 4 of the 5 agents with a firing
+`PaperclipAgentZeroTokenRunStreak` were in the lock-contention set, which is
+what a run that spends its life waiting on the start lock would look like.
+
+### The invariant, and why it is a cause alert rather than a consequence one
+
+`withAgentStartLock` serializes queued-run dispatch per agent. It has **no
+timeout, no TTL and no owner-liveness check**, deliberately: the defect
+BLO-20396 removed was a timeout that let a waiter run *alongside* the holder.
+The lock is released if and only if `fn` settles, so a critical section that
+never settles holds its agent's lock for the life of the process.
+
+⚠️ **"Never settles" is the limiting case, and it is NOT what the observed
+episodes are** (BLO-36522). The mechanism above is real and unchanged — there
+is genuinely no timeout — but every episode measured **since 2026-09-16** has
+settled on its own, including the 2h14m fleet one. Read this paragraph as
+*"nothing external will break the lock"*, not as *"the hold will last until
+you restart it."* Those are different claims and only the first is supported.
+
+⚠️ **The date bound is load-bearing, and the exception is the paragraph
+directly below.** The 2026-09-15/16 episode predates it and is the *only*
+documented fleet-scope episode that ended with a pod replacement. It is not the
+only fleet-scope episode: the 2h14m 2026-09-24 one above was also three agents
+in lockstep, and released on its own. The 09-15/16 episode is **not** a
+counter-example to the self-heal claim, and it is **not** evidence for it
+either: the pod was replaced before the hold was ever observed long enough to
+settle, so that episode tells us nothing about what it would have done. Do not
+read it as precedent in either direction — and in particular, do not read it
+as authorising a restart when the signature in Step 4 is absent.
+
+That agent then dispatches nothing, while every status surface reads healthy —
+`status: idle`, `errorReason: null`, `orgChainHealth: healthy`, work piling up
+in `queued`. Measured 2026-09-15/16: five agents across two companies dark for
+6–19 h, ~70 runs stuck, ended only by a pod replacement on an identical image
+digest and StatefulSet revision — **a restart performed under the withdrawn
+instruction, not an observation that the hold required one** (see the
+qualification above).
+
+In this chart copy, `PaperclipQueuedRunStranded` above fires on the
+*consequence* of this and will usually fire too, a while later. In Blockcast's
+live `onprem-k8s` rules that per-agent form is gone (BLO-29665), and its
+successor `PaperclipQueuedRunStrandedFleet` fires on the consequence only once
+≥5 agents strand at once (see the coverage note above). Neither can tell you
+the cause: a queued run strands identically under slot starvation, a
+scheduler-tick gap or a dropped dispatch. This alert names the mechanism
+directly, and fires sooner.
+
+### What to do when paged
+
+#### Step 1 — confirm the hold, and read its age from two independent places
+
+```
+max by (agent_id) (paperclip_agent_start_lock_held_seconds)
+```
+
+An **absent** series means no lock is held — the gauge is emitted only for
+locks held at scrape time (reset-then-set, no zero-fill), so unlike the two
+age gauges above a healthy agent renders *nothing*, not `0`. "No data" here is
+the healthy reading.
+
+Cross-check against the log, which carries the same `agentId` and `heldMs`:
+
+```
+kubectl logs -n paperclip paperclip-0 | grep "agent start lock held"
+```
+
+`agent start lock held longer than expected` (warn, every 30s) is a section
+that is slow. `agent start lock held far past its budget; queued-run dispatch
+for this agent has stopped` (error, first at 5m then every 5m) is driven by
+`LOCK_HELD_ERROR_MS` (300s) in `agent-start-lock.ts`.
+
+⚠️ **Once #3985 lands, the log line and this alert deliberately no longer
+share a number.** Until then the live rule is still pinned to the same 300s.
+Before BLO-36522 they were pinned together at 300s so "the log line and the
+page cannot disagree". That pinning was abandoned on purpose: 300s is the
+right boundary for the *log* — it is where the code stops calling a hold slow
+— but as an alert threshold it fires on 2,730 agent-minutes a week of routine
+contention. So the log answers *"is this hold slow?"* and the alert answers
+*"is the fleet stalled at once?"*. The cost is real and accepted: **an
+operator grepping the 300s log line will find entries with no corresponding
+page, and that is correct.** Expect roughly 390 agent-minutes of these per day
+fleet-wide with nothing wrong.
+
+#### Step 2 — do NOT clear the agent as healthy
+
+`paperclipGetAgent` will report `status: idle`, `errorReason: null`,
+`orgChainHealth: healthy` and a normal budget. `paperclipListParkedAgents`
+will not list it. None of those refute the wedge — they are what the wedge
+looks like from outside, and they are why the original incident ran 19 h. The
+discriminator is a **dispatch**: `startedAt` moving on a run for that agent.
+Queue depth falling is not one either; runs can be cancelled.
+
+#### Step 3 — decide whether it is the lock or the pool, and mind the trap
+
+The known-plausible wedge is a second pool connection taken while holding
+`lockIssueOwnership`, against `POSTGRES_POOL_MAX = 10` with no acquire timeout
+(`issue-recovery-actions.test.ts` still allowlists five such call sites under
+BLO-34207). Check the pool gauges for the **worker** pod, which is the only
+tier that dispatches:
+
+```
+paperclip_db_pool_connections{pod="paperclip-0"}
+```
+
+⚠️ **Two inferences that look sound and are not.**
+
+- *"Saturation explains it."* In the 2026-09-15/16 incident the pod was
+  already `idle=0 / active=10 / waiting=385` **4.5 h before the first onset**,
+  and the pod serving the fleet healthily afterwards was saturated harder.
+  Saturation is not the discriminator. For the last five hours of that outage
+  the pod read `idle=6–8 / active=2–4 / waiting=0` and still dispatched
+  nothing: the database was not the constraint and the process was not asking.
+- *"A pod restart cleared it, so it is not Postgres."* `lockIssueOwnership` is
+  `pg_advisory_xact_lock` — transaction-scoped, so it dies with the connection
+  and hence with the process, exactly as an in-memory lock does.
+  Restart-clears-it does not discriminate between the two.
+
+The signature that *did* discriminate was a permanently `active` connection
+count with nothing queued — a stuck transaction — alongside zero dispatches.
+
+#### Step 4 — recovery: capture, then wait. Do NOT restart the pod.
+
+**This step used to read "the section must settle or the process must be
+replaced" and prescribe `kubectl delete pod`. That prescription is withdrawn
+(BLO-36522).** It rested on the non-self-healing claim falsified above: the
+worst episode on record cleared itself with the same process still running,
+and kept running 7.75 h afterwards. Replacing the worker pod is a
+shared-infrastructure mutation affecting **every** agent in the fleet, and the
+evidence says it buys nothing the wait would not have given you.
+
+**So the page's action is evidence capture inside a window that closes by
+itself.** While it is still firing:
+
+```
+max by (agent_id) (paperclip_agent_start_lock_held_seconds)      # who, and how long
+resets(paperclip_agent_start_lock_held_seconds[6h])              # see the caveat below before reading this
+count_over_time(paperclip_agent_start_lock_held_seconds[6h])     # MANDATORY companion to resets()
+paperclip_db_pool_connections{pod="paperclip-0"}                 # idle/active/waiting split
+kubectl logs -n paperclip paperclip-0 | grep "agent start lock held"
+```
+
+⚠️ **`resets() == 0` does NOT mean "stuck" on its own, and reading it that way
+fails toward the restart this step exists to withdraw.** The server publishes
+`paperclip_agent_start_lock_held_seconds` **only for locks held at scrape
+time** (`deploy/helm/paperclip/values.yaml`), so between holds the series is
+*absent*, not zero. `resets()` counts decreases between samples that exist, so
+it returns `0` both for a genuinely monotonic hold **and** for an agent with
+barely any samples in the window — including a hold that simply began part-way
+into the range with no earlier cycling to decrease from. That second shape is
+exactly what the 2h14m episode looks like, i.e. the episode used above as the
+argument *against* restarting.
+
+**So always read the two together, and judge on sample count first:**
+
+| `count_over_time[6h]` | `resets[6h]` | reading |
+|---|---|---|
+| high (series present throughout) | `0` | monotonic hold — **genuinely stuck**, the real signature |
+| high | `>0` | cycling — routine contention, not stuck |
+| low / sparse | `0` | **inconclusive, NOT stuck** — too few samples to decrease from. Do not restart on this. |
+| low / sparse | `>0` | cycling — **not stuck**. A decrease was observed, so the lock released at least once however few the samples. |
+
+A `6h` range is also wider than most holds; scoping the range nearer the hold's
+own age makes the comparison sharper for diagnosis. The restart gate below
+deliberately keeps the `[6h]` range.
+
+Record the agent ids, **both** the `resets` and `count_over_time` values, and
+the pool split **on the issue**. Those together are what nobody has captured
+yet, and they are destroyed both by the self-heal and by a restart — which is
+exactly why the old restart-first instruction kept the cause unknown for as
+long as it did.
+
+**The one case that still justifies replacing the pod** is a genuinely stuck
+lock, and it has a distinct signature you can now check rather than assume:
+the **top row** of the table above — `count_over_time(...[6h])` showing the
+series present and climbing throughout **and** `resets(...[6h]) == 0` — for
+the affected agents, **and** a permanently `active` connection count with
+nothing queued (a stuck transaction), **and** zero dispatches (`startedAt` not
+moving). All four, not `resets == 0` alone. Absent that, wait. If you do
+restart, capture the block above first.
+
+That gate cannot be met until the hold is roughly six hours old. The series
+does not exist before acquisition, so a younger hold cannot be present
+throughout a `[6h]` window and lands in the inconclusive third row. This is
+deliberate: in practice the gate means "wait about 6h", and the one long hold
+observed end to end (2h14m) released on its own well inside that.
+
+The real fix — making the critical section's awaits abortable so `fn` rejects
+and releases the lock through the existing `finally` — is out of scope of the
+observability change that added this alert, and is recorded in the module
+header. Abandoning a still-pending `fn` on a timer is **not** that fix: it
+reintroduces the BLO-20396 defect of two sections running at once.
+
+### Verifying the signal is live
+
+```
+paperclip_agent_start_lock_held_seconds
+```
+
+Unlike the two age gauges above there is **no** companion
+`..._refresh_success` series and no freshness gate on the alert expression.
+That is deliberate, not an omission: this gauge is a synchronous in-memory map
+walk performed on the `/metrics` request path itself (see
+`refreshAgentStartLockMetrics`), so a value being present already means the
+scrape succeeded — there is no separate refresh that can fail and leave a
+stale value behind. Publishing on the scrape path is itself load-bearing: the
+section being reported is typically wedged on a database await, which is
+exactly when a DB-backed background collector would be stuck behind the thing
+it is meant to report. Do not "restore" an `and on(instance) (... == 1)` join
+here; it would reference a series that does not exist and make the alert
+permanently unevaluable.
+
+To prove the signal end-to-end, hold a lock deliberately in a scratch process:
+`withAgentStartLock(agentId, () => new Promise(() => {}), opts)` — the series
+appears on the next scrape and its value climbs.
+
+Same onprem-k8s lockstep caveat as the two sections above: the chart copy at
+`deploy/helm/paperclip/templates/prometheusrule.yaml` does not deploy on
+Blockcast (`prometheusRule.enabled: false`), so merging this repository alone
+does **not** make the page live. The rule must also land in the two lockstep
+`Blockcast/onprem-k8s` alert files and the `monitoring-rules` Argo application
+must be synced (BLO-19095). Verify at `/api/v1/rules` before relying on it.
+
+⚠️ **KNOWN DIVERGENCE, accepted and recorded rather than fixed (BLO-36522).**
+The BLO-36522 retune is prepared for the two `Blockcast/onprem-k8s` copies (the
+only ones that fire at Blockcast) in `Blockcast/onprem-k8s#3985`, which is
+**not yet merged**: until it lands, the live rule is still `> 300` for 5m and
+this alert still fires on single-agent routine contention. It is
+**deliberately not** in the chart copy above, which still carries `max by (agent_id) (...) > 300` for 5m wired to
+`prometheusRule.agentStartLockHeldSeconds` / `LOCK_HELD_ERROR_MS`. It renders
+nothing here, so this costs Blockcast nothing today. It is a landmine for
+anyone who enables that chart elsewhere: they would get the pre-retune
+behaviour, i.e. a critical page on every single-agent hold past 300s, roughly
+390 agent-minutes a day. **Before setting `prometheusRule.enabled: true` in
+any installation, port this retune to the chart first.**
+
+The divergence is not only the number. The *rationale prose* beside it —
+`deploy/helm/paperclip/values.yaml` (`agentStartLockHeldSeconds`) and
+`deploy/helm/paperclip/tests/prometheus-rule.test.mjs` — still argues for
+pinning the alert to `LOCK_HELD_ERROR_MS` "so the log line and the page cannot
+disagree", which is the exact policy this retune abandoned, and the test
+comment's premise that "any positive threshold is silent in steady state" is
+measurably false. Both now carry a `BLO-36522` cross-reference pointing here,
+so neither reads as live policy; the chart test's `300` assertion deliberately
+still stands, because it guards the number this chart actually renders.
+
 ## References
 
 - `runbooks/README.md` — index
 - BLO-21116 — JSON-parse recovery classification and queued-run observability
 - BLO-22094 — the `PaperclipOverdueScheduledRetry` alert above
+- PEN-3305 — the `PaperclipAgentStartLockWedged` alert above
+- [BLO-36522](https://paperclip.blockcast.net/BLO/issues/BLO-36522) — the retune of that alert to the common-mode signature, and the measurements that withdrew the "does not self-heal" / "replace the process" claims
+- [BLO-35522](https://paperclip.blockcast.net/BLO/issues/BLO-35522) — the routine-contention page that triggered the retune
 - `runbooks/agent-wakeup-terminal-failed.md` — the sibling alert
 - BLO-19095 — the manual Argo sync gate between merge and deployment

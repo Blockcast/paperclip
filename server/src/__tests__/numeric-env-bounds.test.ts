@@ -27,6 +27,15 @@ const SETTINGS = {
   prReconcilerWindowDays: "PAPERCLIP_PR_RECONCILER_WINDOW_DAYS",
   strandedBlockedIssueReconcilerIntervalMinutes:
     "PAPERCLIP_STRANDED_BLOCKED_ISSUE_RECONCILER_INTERVAL_MINUTES",
+  // BLO-19123. Not a timer period but a per-tick work ceiling, so the overflow
+  // block below correctly ignores it. It still belongs here: an operator who
+  // sets this to `Infinity` while tuning the drain rate would restore exactly
+  // the unbounded bulk return the setting exists to prevent, and the clamp is
+  // the only thing standing between that typo and the whole backlog moving in
+  // one tick.
+  strandedRecoveryHandBackMaxPerPass: "PAPERCLIP_STRANDED_RECOVERY_HAND_BACK_MAX_PER_PASS",
+  strandedRecoveryHandBackIntervalMinutes:
+    "PAPERCLIP_STRANDED_RECOVERY_HAND_BACK_INTERVAL_MINUTES",
   humanGatedDigestIntervalMinutes: "PAPERCLIP_HUMAN_GATED_DIGEST_INTERVAL_MINUTES",
   humanGatedDigestPeriodDays: "PAPERCLIP_HUMAN_GATED_DIGEST_PERIOD_DAYS",
   // Added by the ratchet below, not by the original survey: this site landed on
@@ -34,9 +43,38 @@ const SETTINGS = {
   // branch through a rebase. The `config.ts` offender list going red is what
   // surfaced it — the first live proof the guard bites on a real regression.
   approvalGateReconcilerIntervalMinutes: "PAPERCLIP_APPROVAL_GATE_RECONCILER_INTERVAL_MINUTES",
+  // Second live catch by the same ratchet (BLO-24631): this site was written as
+  // `Math.max(1, Number(env) || 60)` and the offender list went red on the PR
+  // that introduced it, before it ever reached master. The `Math.max` floor is
+  // what made it look safe — it bounds the setting from below and does nothing
+  // at all about `Infinity`, which is the direction that matters.
+  approvalEnforcementReconcilerIntervalMinutes:
+    "PAPERCLIP_APPROVAL_ENFORCEMENT_RECONCILER_INTERVAL_MINUTES",
+  terminalGateReconcilerIntervalMinutes: "PAPERCLIP_TERMINAL_GATE_RECONCILER_INTERVAL_MINUTES",
   heartbeatSchedulerIntervalMs: "HEARTBEAT_SCHEDULER_INTERVAL_MS",
   recoveryActionMaxAttempts: "RECOVERY_ACTION_MAX_ATTEMPTS",
   recoveryActionTimeoutMs: "RECOVERY_ACTION_TIMEOUT_MS",
+  // PEN-3352. Registered so the hostile-input table actually drives this env var
+  // rather than merely declaring that it exists.
+  //
+  // ⚠️ Note while you are here: this map is a STRICT SUBSET of
+  // `NUMERIC_SETTING_BOUNDS`, and the gap is much wider than it looks. Measured at this
+  // commit: 15 keys here against 22 there, so SEVEN settings get no hostile-input
+  // coverage at all —
+  //   isolationWorkspaceReaperIntervalMinutes, isolationWorkspaceReaperMaxAgeDays,
+  //   isolationWorkspaceReaperMaxDeletesPerTick, prReviewStateReconcilerIntervalMinutes,
+  //   prReviewStateMaxPullRequestsPerRepo, lapsedMonitorGraceMs,
+  //   openPullRequestAttendanceGraceMs.
+  // Do not trust that list to be current; recompute the set difference
+  // (`keyof NUMERIC_SETTING_BOUNDS` minus `keyof SETTINGS`) before acting on it.
+  //
+  // The `satisfies Record<keyof typeof NUMERIC_SETTING_BOUNDS, string>` clause below
+  // looks like it would make that impossible and does not: `server/tsconfig.json`
+  // excludes `src/__tests__`, so nothing typechecks this file, and vitest transpiles
+  // without checking. Left as-is deliberately — closing it means registering seven
+  // settings this PR does not otherwise touch, and doing it here would hide that the
+  // enforcement mechanism itself is the thing that needs fixing.
+  pendingBoardApprovalAttendanceGraceMs: "PENDING_BOARD_APPROVAL_ATTENDANCE_GRACE_MS",
 } as const satisfies Record<keyof typeof NUMERIC_SETTING_BOUNDS, string>;
 
 type SettingKey = keyof typeof SETTINGS;

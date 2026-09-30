@@ -12,15 +12,28 @@ export const RECOVER_AGGREGATE_FIRING_ROUTE = "recover-aggregate-firing";
 
 type AggregateFiringFenceRow = {
   aggregate_key: string;
+  phase: string;
   firing_token: string;
   updated_at: string;
+  owner_instance_id: string | null;
+  owner_slot: string | null;
 };
 
 export type AggregateFiringFence = {
   aggregateKey: string;
+  phase: string;
   firingToken: string;
   updatedAt: string;
+  ownerInstanceId: string | null;
+  ownerSlot: string | null;
 };
+
+/**
+ * What a non-board caller sees. `firingToken` is *absent*, not nulled: it is
+ * bearer-equivalent and is the whole capability the `recover` route accepts, so
+ * omitting it keeps an agent read strictly non-authorizing (BLO-35053).
+ */
+export type AggregateFiringFenceDiagnostic = Omit<AggregateFiringFence, "firingToken">;
 
 function nonEmptyString(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
@@ -40,30 +53,50 @@ function isBoardUser(input: PluginApiRequestInput): boolean {
 }
 
 /**
- * List only currently-held firing fences for the already host-authorized
- * company. The token is intentionally present here: it is the capability an
- * operator needs to identify the interrupted owner, and this route is
- * declared `auth: board` so the host applies normal board/company access
- * checks before the worker sees it. Callers must treat this response as
- * sensitive and non-cacheable.
+ * List only currently-held fences for the already host-authorized company. Both
+ * phases that block a new firing claim are listed: `firing` (an interrupted
+ * firing delivery) and `cancelling` (an interrupted terminal transition). A
+ * `cancelling` fence was previously omitted, which left it both unlistable and
+ * unrecoverable — the operator could not discover the token needed to release
+ * it, so the aggregate stayed wedged permanently.
+ *
+ * The token is present in this function's result because a board operator needs
+ * it to identify the interrupted owner. It is NOT present in every response:
+ * the route is declared `auth: board-or-agent`, and `handleRecoveryApiRequest`
+ * strips the token for any non-board actor (BLO-35053). Callers must treat a
+ * token-bearing response as sensitive and non-cacheable.
+ *
+ * `owner_instance_id` / `owner_slot` are selected because they are the fields
+ * that distinguish the two documented failure models — a displaced holder vs an
+ * abandoned one — and neither reaches Prometheus.
  */
 export async function listAggregateFiringFences(
   ctx: PluginContext,
   companyId: string,
 ): Promise<AggregateFiringFence[]> {
   const rows = await ctx.db.query<AggregateFiringFenceRow>(
-    `SELECT aggregate_key, firing_token, updated_at
+    `SELECT aggregate_key,
+            phase,
+            COALESCE(firing_token, resolution_token) AS firing_token,
+            updated_at,
+            owner_instance_id,
+            owner_slot
        FROM ${ctx.db.namespace}.alertmanager_aggregate_lifecycle_fences
       WHERE company_id = $1
-        AND phase = 'firing'
-        AND firing_token IS NOT NULL
+        AND (
+          (phase = 'firing' AND firing_token IS NOT NULL)
+          OR (phase = 'cancelling' AND resolution_token IS NOT NULL)
+        )
       ORDER BY updated_at ASC`,
     [companyId],
   );
   return rows.map((row) => ({
     aggregateKey: row.aggregate_key,
+    phase: row.phase,
     firingToken: row.firing_token,
     updatedAt: row.updated_at,
+    ownerInstanceId: row.owner_instance_id ?? null,
+    ownerSlot: row.owner_slot ?? null,
   }));
 }
 
@@ -101,33 +134,51 @@ async function recoverAndAudit(
 }
 
 /**
- * Worker implementation for the manifest-declared operator API. The host
- * enforces `auth: board` and company membership; the worker repeats the user
- * check as defense in depth because the firing token is bearer-equivalent.
+ * Worker implementation for the manifest-declared operator API.
+ *
+ * The listing is `auth: board-or-agent`; the host has already enforced actor
+ * type and company membership before the worker sees the request. The token is
+ * stripped for anything that is not a board user, so the branch **fails
+ * closed**: an unexpected actor type gets the diagnostic view, never the token.
+ *
+ * `recover` is `auth: board` at the host and repeats the user check here as
+ * defense in depth, because the firing token is bearer-equivalent.
  */
 export async function handleRecoveryApiRequest(
   ctx: PluginContext,
   input: PluginApiRequestInput,
 ): Promise<PluginApiResponse> {
-  if (!isBoardUser(input)) {
-    return recoveryFailureResponse(403);
-  }
-
   if (input.routeKey === LIST_AGGREGATE_FIRING_FENCES_ROUTE) {
     try {
       const requestedCompanyId = nonEmptyString(input.query.companyId);
       if (requestedCompanyId !== input.companyId) {
         return recoveryFailureResponse();
       }
+      const fences = await listAggregateFiringFences(ctx, input.companyId);
+      // `recover` audits through the activity log; this read does not, because
+      // an activity row per diagnostic poll is noise. A debug line still makes
+      // the read attributable the next time fence behaviour is investigated.
+      // Never log the fence rows themselves — they carry the firing token.
+      ctx.logger.debug(
+        `Alertmanager aggregate fence listing read by ${input.actor.actorType} ${input.actor.actorId} for company ${input.companyId}: ${fences.length} fence(s)`,
+      );
       return {
         headers: { "cache-control": "no-store" },
         body: {
-          fences: await listAggregateFiringFences(ctx, input.companyId),
+          fences: isBoardUser(input)
+            ? fences
+            : fences.map(
+              ({ firingToken: _omitted, ...rest }): AggregateFiringFenceDiagnostic => rest,
+            ),
         },
       };
     } catch {
       throw new Error("Alertmanager aggregate fence listing failed");
     }
+  }
+
+  if (!isBoardUser(input)) {
+    return recoveryFailureResponse(403);
   }
 
   if (input.routeKey === RECOVER_AGGREGATE_FIRING_ROUTE) {
