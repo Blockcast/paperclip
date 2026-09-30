@@ -815,7 +815,27 @@ What follows from that:
   left on a shared volume indefinitely is not.
 - **Age is read from the filename stamp, not mtime.** Retrieval means copying
   these off the volume and copy tooling rewrites mtimes; keying on mtime would
-  let any reader extend the window just by touching the file.
+  let any reader extend the window just by touching the file. This holds for
+  unfinished `.partial` files as well as completed ones — see below.
+- **⚠️ An unfinished `.partial` is just as dangerous, and `ls *.heapsnapshot`
+  will not show it.** `writeHeapSnapshot` serialises incrementally, so a
+  `<stamp>.heapsnapshot.partial` holds the same plaintext secrets as a completed
+  snapshot. One is left behind whenever a capture does not return — and an OOM
+  *during* the write is this feature's own most likely failure mode, since it
+  runs on a worker whose failure mode is heap exhaustion.
+
+  So when checking that the snapshot directory is clear, **match both suffixes**:
+
+  ```sh
+  ls -la "$PAPERCLIP_HEAP_SNAPSHOT_DIR"/*.heapsnapshot*
+  ```
+
+  A glob ending at `.heapsnapshot` reports an empty directory while a
+  multi-gigabyte credential-bearing partial sits in it. The startup warning
+  counts both and lists them separately; the periodic sweep deletes a partial
+  once it is past its abandonment window (10 minutes from its filename stamp),
+  which is also why a freshly stranded one keeps the poll armed rather than
+  arming nothing.
 - **Treat each capture as a credential-exposure event.** Decide on rotation of
   the App private key and the agent JWT secret the same way you would for any
   other disclosure, rather than filing it as a diagnostic. Delete the snapshot as

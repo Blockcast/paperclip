@@ -11,6 +11,7 @@ import {
   ensureHeapSnapshotDir,
   heapSnapshotSweepKeep,
   listHeapSnapshots,
+  listResidualHeapSnapshots,
   planHeapSnapshotStartup,
   pruneHeapSnapshots,
   reclaimableHeapSnapshotBytes,
@@ -129,6 +130,45 @@ describe("pruneHeapSnapshots", () => {
 
     expect(pruneHeapSnapshots(dir, 10, NEVER_EXPIRES)).toEqual([]);
     expect(readdirSync(dir)).toEqual([inflight]);
+  });
+
+  it("judges an abandoned .partial by its filename stamp, so touching one cannot keep it alive", () => {
+    // Ally Suggestion 1, promoted to a condition of acceptance on PEN-3631. A
+    // partial holds the same plaintext secrets as a completed snapshot, and
+    // unlike one it has no `keep` bound behind it — the age check was the only
+    // thing retiring it. Judged by mtime, ordinary retrieval tooling (which
+    // rewrites mtimes) could extend that exposure indefinitely.
+    const nowMs = Date.parse("2026-09-29T23:00:00.000Z");
+    const stale = `2026-09-29T20-00-00-000Z-pid1${HEAP_SNAPSHOT_EXTENSION}.partial`;
+    // Stamped three hours ago, but touched one minute ago.
+    writeSnapshotFile(stale, (nowMs - MINUTE_MS) / 1000);
+
+    expect(pruneHeapSnapshots(dir, 10, NEVER_EXPIRES, nowMs)).toEqual([stale]);
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  it("still spares an in-flight .partial whose stamp is recent, even with an ancient mtime", () => {
+    // The only-when-it-should half. The abandonment window exists so a peer
+    // replica's in-flight write survives this pod's prune, and the fix above
+    // must not degenerate into deleting every partial: this one flips the other
+    // way, since mtime says 1970 and the stamp says four minutes ago.
+    const nowMs = Date.parse("2026-09-29T23:00:00.000Z");
+    const inflight = `2026-09-29T22-56-00-000Z-pid1${HEAP_SNAPSHOT_EXTENSION}.partial`;
+    writeSnapshotFile(inflight, 1000);
+
+    expect(pruneHeapSnapshots(dir, 10, NEVER_EXPIRES, nowMs)).toEqual([]);
+    expect(readdirSync(dir)).toEqual([inflight]);
+  });
+
+  it("falls back to mtime for a partial this module did not name", () => {
+    // A stampless name has nothing else to go on, so the prior behaviour stands
+    // rather than the file becoming immortal.
+    const nowMs = Date.parse("2026-09-29T23:00:00.000Z");
+    writeSnapshotFile(`foreign${HEAP_SNAPSHOT_EXTENSION}.partial`, 1000);
+
+    expect(pruneHeapSnapshots(dir, 10, NEVER_EXPIRES, nowMs)).toEqual([
+      `foreign${HEAP_SNAPSHOT_EXTENSION}.partial`,
+    ]);
   });
 
   it("leaves unrelated files alone", () => {
@@ -275,6 +315,78 @@ describe("listHeapSnapshots", () => {
 
   it("is empty for a directory that does not exist", () => {
     expect(listHeapSnapshots(path.join(dir, "absent"))).toEqual([]);
+  });
+});
+
+describe("listResidualHeapSnapshots", () => {
+  // Backs the startup report of leftovers while capture is disabled — the state
+  // in which an operator believes the exposure is over. A `.partial` holds the
+  // same plaintext secrets as a completed file, and sizing the residual check
+  // off completed files alone made the likeliest way to strand one (an OOM
+  // during the write) the one case that reported nothing. (Ally Important 1.)
+  it("reports a lone .partial, which listHeapSnapshots is blind to by construction", () => {
+    const partial = `2026-09-29T22-00-00-000Z-pid1${HEAP_SNAPSHOT_EXTENSION}.partial`;
+    writeSnapshotFile(partial, 3000);
+
+    // The control that makes this a real finding rather than a restatement:
+    // the pre-existing listing genuinely sees nothing here.
+    expect(listHeapSnapshots(dir)).toEqual([]);
+
+    const residual = listResidualHeapSnapshots(dir);
+    expect(residual.completed).toEqual([]);
+    expect(residual.partial).toEqual([partial]);
+    expect(residual.completed.length + residual.partial.length).toBe(1);
+  });
+
+  it("separates completed from partial and orders each newest first", () => {
+    writeSnapshotFile(`2026-09-28T22-00-00-000Z-pid1${HEAP_SNAPSHOT_EXTENSION}`, 1000);
+    writeSnapshotFile(`2026-09-29T22-00-00-000Z-pid1${HEAP_SNAPSHOT_EXTENSION}`, 2000);
+    writeSnapshotFile(`2026-09-27T22-00-00-000Z-pid1${HEAP_SNAPSHOT_EXTENSION}.partial`, 3000);
+    writeSnapshotFile(`2026-09-29T23-00-00-000Z-pid1${HEAP_SNAPSHOT_EXTENSION}.partial`, 4000);
+    writeFileSync(path.join(dir, HEAP_SNAPSHOT_SENTINEL_BASENAME), "");
+    writeFileSync(path.join(dir, "README.md"), "not a snapshot");
+
+    expect(listResidualHeapSnapshots(dir)).toEqual({
+      completed: [
+        `2026-09-29T22-00-00-000Z-pid1${HEAP_SNAPSHOT_EXTENSION}`,
+        `2026-09-28T22-00-00-000Z-pid1${HEAP_SNAPSHOT_EXTENSION}`,
+      ],
+      partial: [
+        `2026-09-29T23-00-00-000Z-pid1${HEAP_SNAPSHOT_EXTENSION}.partial`,
+        `2026-09-27T22-00-00-000Z-pid1${HEAP_SNAPSHOT_EXTENSION}.partial`,
+      ],
+    });
+  });
+
+  it("drives poll and the operator warning on a partial alone", () => {
+    // The end-to-end shape of the finding: capture OFF, nothing completed left,
+    // one partial. Both flags must come back true, or nothing sweeps it again
+    // this process lifetime and the operator is told nothing.
+    writeSnapshotFile(`2026-09-29T22-00-00-000Z-pid1${HEAP_SNAPSHOT_EXTENSION}.partial`, 3000);
+
+    const residual = listResidualHeapSnapshots(dir);
+    expect(
+      planHeapSnapshotStartup({
+        captureEnabled: false,
+        residualSnapshotCount: residual.completed.length + residual.partial.length,
+      }),
+    ).toEqual({ capture: false, poll: true, warnResidualSnapshots: true });
+
+    // And the pre-fix input, for contrast: counting completed files alone armed
+    // nothing at all against the very same directory.
+    expect(
+      planHeapSnapshotStartup({
+        captureEnabled: false,
+        residualSnapshotCount: listHeapSnapshots(dir).length,
+      }),
+    ).toEqual({ capture: false, poll: false, warnResidualSnapshots: false });
+  });
+
+  it("is empty for a directory that does not exist", () => {
+    expect(listResidualHeapSnapshots(path.join(dir, "absent"))).toEqual({
+      completed: [],
+      partial: [],
+    });
   });
 });
 

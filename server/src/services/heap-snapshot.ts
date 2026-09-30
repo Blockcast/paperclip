@@ -73,14 +73,27 @@ const PARTIAL_SUFFIX = ".partial";
 const SIZE_ESTIMATE_MULTIPLIER = 2;
 
 /**
- * Leave a `.partial` alone until it has been untouched for this long.
+ * Leave a `.partial` alone until this long after the capture that created it
+ * started.
  *
  * Within one process a partial is unambiguously garbage, but the tier gate
  * (`paperclipNodeRole !== "api"`) admits both `worker` and the default `all`, so
  * a second replica against the shared directory would otherwise delete a peer's
- * in-flight write and break that peer's `renameSync`. V8 extends the file
- * continuously while writing, so an in-flight partial's mtime is always recent
- * and an abandoned one's is frozen at the abort.
+ * in-flight write and break that peer's `renameSync`.
+ *
+ * Measured from the filename stamp, not mtime, for the same reason `maxAgeMs`
+ * is (see `snapshotStampMs`) — and here the consequence is worse. A partial
+ * holds the same plaintext secrets as a completed snapshot, because
+ * `writeHeapSnapshot` serialises incrementally; mtime is rewritten by ordinary
+ * retrieval tooling; and unlike a completed snapshot a partial has no `keep`
+ * bound behind it, so mtime was the *only* thing retiring it. That made the
+ * exposure indefinitely extensible by a reader. The stamp is not mutable that
+ * way. (Ally review Suggestion 1, promoted to a condition of acceptance by the
+ * CEO on PEN-3631.)
+ *
+ * The liveness this gives up is a write that runs longer than this window being
+ * swept mid-flight. That is bounded by a wide margin: the pause is single-digit
+ * seconds on a ~1 GB heap, against a window of ten minutes.
  */
 const PARTIAL_ABANDONED_AFTER_MS = 10 * 60 * 1000;
 
@@ -235,7 +248,10 @@ function collectPrunable(
     if (!isPartialSnapshot(name)) continue;
     try {
       const stats = statSync(path.join(dir, name));
-      if (nowMs - stats.mtimeMs < PARTIAL_ABANDONED_AFTER_MS) continue;
+      // Filename stamp first; mtime only for a file this module did not name,
+      // where there is nothing else to go on. See PARTIAL_ABANDONED_AFTER_MS.
+      const startedAtMs = snapshotStampMs(name) ?? stats.mtimeMs;
+      if (nowMs - startedAtMs < PARTIAL_ABANDONED_AFTER_MS) continue;
       prunable.push({ name, sizeBytes: stats.size });
     } catch {
       // Vanished under us, or unreadable; nothing to reclaim either way.
@@ -318,14 +334,46 @@ export function pruneHeapSnapshots(
 /**
  * Completed snapshots currently on the volume, newest first.
  *
- * Exported so startup can report leftovers while capture is *disabled* — that
- * is precisely the state in which an operator believes the exposure is over.
+ * Counts only finished files. For the startup residual check use
+ * `listResidualHeapSnapshots`, which also sees `.partial` leftovers — they carry
+ * the same secrets and this function is blind to them by construction.
  */
 export function listHeapSnapshots(dir: string): string[] {
   if (!existsSync(dir)) return [];
   return readdirSync(dir)
     .filter(isCompletedSnapshot)
     .sort((a, b) => (snapshotStampMs(b) ?? 0) - (snapshotStampMs(a) ?? 0));
+}
+
+/**
+ * Every secret-bearing snapshot file on the volume, finished or not, newest first.
+ *
+ * Exported so startup can report leftovers while capture is *disabled* — that
+ * is precisely the state in which an operator believes the exposure is over.
+ *
+ * Partials are included, and that inclusion is the whole point. `writeHeapSnapshot`
+ * serialises incrementally, so a `<stamp>.heapsnapshot.partial` holds the same
+ * plaintext heap strings as a completed one — and this feature's own documented
+ * failure mode, an OOM *during* the write, is exactly what leaves one behind. The
+ * natural operator response to that is to disable the flag and restart, so sizing
+ * the residual check off completed files alone meant the one case most likely to
+ * produce an orphaned partial was the one case that reported nothing: `poll` and
+ * `warnResidualSnapshots` both came back false, nothing swept it again for the
+ * life of the process, and the operator was told nothing. (Ally review Important
+ * 1; upheld as a condition of acceptance by the CEO on PEN-3631.)
+ */
+export function listResidualHeapSnapshots(dir: string): {
+  completed: string[];
+  partial: string[];
+} {
+  if (!existsSync(dir)) return { completed: [], partial: [] };
+  const byNewest = (a: string, b: string): number =>
+    (snapshotStampMs(b) ?? 0) - (snapshotStampMs(a) ?? 0);
+  const entries = readdirSync(dir);
+  return {
+    completed: entries.filter(isCompletedSnapshot).sort(byNewest),
+    partial: entries.filter(isPartialSnapshot).sort(byNewest),
+  };
 }
 
 /**
@@ -479,9 +527,12 @@ export interface HeapSnapshotStartupPlan {
  *
  * Capture off with nothing on disk arms nothing at all: there is no exposure to
  * sweep, so a deployment that never enabled this keeps precisely the footprint
- * it had. Capture off *with* something on disk keeps polling, because with
- * `heapSnapshotSweepKeep` returning 0 anything that survived the startup sweep
- * survived an unlink, and the retry is the only thing that will clear it.
+ * it had. Capture off *with* something on disk keeps polling, for either of two
+ * reasons: a completed snapshot that survived the startup sweep survived an
+ * unlink, and the retry is the only thing that will clear it; or a `.partial`
+ * was spared deliberately because it is still inside its abandonment window, and
+ * the poll is what collects it once it ages out. Both are residual exposure, so
+ * `residualSnapshotCount` must count both — see `listResidualHeapSnapshots`.
  */
 export function planHeapSnapshotStartup(input: {
   captureEnabled: boolean;
