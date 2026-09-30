@@ -8,6 +8,7 @@ import {
   type HeapSnapshotConfig,
   type HeapSnapshotRuntime,
   decideHeapSnapshot,
+  describeSentinelOutcome,
   ensureHeapSnapshotDir,
   heapSnapshotSweepKeep,
   listHeapSnapshots,
@@ -641,7 +642,7 @@ describe("decideHeapSnapshot", () => {
 
     const decision = decideHeapSnapshot(config(), state(), runtime());
 
-    expect(decision).toEqual({ trigger: "sentinel", sentinelConsumed: true });
+    expect(decision).toEqual({ trigger: "sentinel", sentinel: "claimed" });
     // Consumed before the snapshot is attempted: a request is honoured exactly
     // once, so a persistently failing snapshot cannot retry on every poll.
     expect(existsSync(path.join(dir, HEAP_SNAPSHOT_SENTINEL_BASENAME))).toBe(false);
@@ -654,7 +655,7 @@ describe("decideHeapSnapshot", () => {
       runtime({ heapUsedBytes: () => 100 * GB }),
     );
 
-    expect(decision).toEqual({ trigger: null, sentinelConsumed: false });
+    expect(decision).toEqual({ trigger: null, sentinel: "absent" });
   });
 
   it("fires the automatic trigger only at or above the threshold", () => {
@@ -707,7 +708,7 @@ describe("decideHeapSnapshot", () => {
     expect(decision.trigger).toBeNull();
     // Consumed anyway: honoured-exactly-once has to hold whether or not the
     // request produced a snapshot, or a backlog would drain one per poll.
-    expect(decision.sentinelConsumed).toBe(true);
+    expect(decision.sentinel).toBe("rate-limited");
     expect(existsSync(path.join(dir, HEAP_SNAPSHOT_SENTINEL_BASENAME))).toBe(false);
   });
 
@@ -719,5 +720,77 @@ describe("decideHeapSnapshot", () => {
     const decision = decideHeapSnapshot(cfg, state({ lastSentinelSnapshotAtMs: nowMs - 6 * 60 * 1000 }), runtime());
 
     expect(decision.trigger).toBe("sentinel");
+  });
+
+  it("reports a sentinel it could not claim as distinct from no sentinel at all", () => {
+    // A directory at the sentinel path exists but cannot be unlinked, which is
+    // the same shape as losing the race to another replica or hitting a
+    // permission fault — without a distinct verdict the caller cannot tell this
+    // (file still present, unhonoured) from "absent" (nothing was requested).
+    mkdirSync(path.join(dir, HEAP_SNAPSHOT_SENTINEL_BASENAME), { recursive: true });
+
+    const decision = decideHeapSnapshot(config(), state(), runtime());
+
+    expect(decision).toEqual({ trigger: null, sentinel: "claim-failed" });
+    expect(existsSync(path.join(dir, HEAP_SNAPSHOT_SENTINEL_BASENAME))).toBe(true);
+  });
+});
+
+describe("describeSentinelOutcome", () => {
+  const nowMs = new Date("2026-09-29T23:00:00.000Z").getTime();
+
+  it("speaks up when a request was claimed and then declined", () => {
+    // The regression this pins is *silence*. A declined request has already
+    // deleted the request file — the only feedback this interface has — so
+    // logging nothing leaves the operator unable to tell a refusal from a
+    // snapshot that is still being written.
+    const cfg = config({ sentinelMinIntervalMs: 5 * MINUTE_MS });
+    writeFileSync(path.join(dir, HEAP_SNAPSHOT_SENTINEL_BASENAME), "");
+    const st = state({ lastSentinelSnapshotAtMs: nowMs - MINUTE_MS });
+
+    const decision = decideHeapSnapshot(cfg, st, runtime());
+    const log = describeSentinelOutcome(decision, cfg, st);
+
+    expect(decision.trigger).toBeNull();
+    expect(log).not.toBeNull();
+    expect(log?.level).toBe("info");
+    expect(log?.data).toMatchObject({
+      sentinelPath: path.join(dir, HEAP_SNAPSHOT_SENTINEL_BASENAME),
+      sentinelMinIntervalMs: 5 * MINUTE_MS,
+      lastSentinelSnapshotAtMs: nowMs - MINUTE_MS,
+    });
+    // Says the file is gone and no snapshot is coming, which is the part the
+    // operator cannot otherwise observe.
+    expect(log?.message).toContain("deleted anyway");
+    expect(log?.message).toContain("none will appear");
+  });
+
+  it("warns, and differently, when the sentinel could not be claimed", () => {
+    // Deliberately a different level and a different remedy: the rate limit is
+    // by design and self-clears, an unclaimable file is not and may not.
+    mkdirSync(path.join(dir, HEAP_SNAPSHOT_SENTINEL_BASENAME), { recursive: true });
+    const cfg = config();
+
+    const log = describeSentinelOutcome(decideHeapSnapshot(cfg, state(), runtime()), cfg, state());
+
+    expect(log?.level).toBe("warn");
+    expect(log?.message).toContain("still present");
+  });
+
+  it("stays silent when the sentinel was honoured or never existed", () => {
+    const cfg = config();
+
+    // Honoured: the snapshot carries its own credential-exposure warning, so a
+    // second line here would be noise on the one path that already logs.
+    writeFileSync(path.join(dir, HEAP_SNAPSHOT_SENTINEL_BASENAME), "");
+    const claimed = decideHeapSnapshot(cfg, state(), runtime());
+    expect(claimed.sentinel).toBe("claimed");
+    expect(describeSentinelOutcome(claimed, cfg, state())).toBeNull();
+
+    // Absent: every idle poll takes this path, so logging here would be a line
+    // per poll forever.
+    const absent = decideHeapSnapshot(cfg, state(), runtime());
+    expect(absent.sentinel).toBe("absent");
+    expect(describeSentinelOutcome(absent, cfg, state())).toBeNull();
   });
 });

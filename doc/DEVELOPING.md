@@ -745,6 +745,17 @@ file in a loop cannot pause the process that drives every heartbeat, dispatch an
 recovery pass once per poll. The sentinel is consumed either way, so a burst of
 touches does not queue up.
 
+**So the file disappearing does not mean a snapshot was taken.** Deletion is how
+the request is claimed, not how it is honoured, and a declined request deletes it
+just the same. Read the worker log rather than the directory to tell them apart:
+
+| worker log | what happened | what to do |
+| --- | --- | --- |
+| `Heap snapshot written` (warn) | honoured | retrieve it; it holds secrets in plaintext |
+| `Heap snapshot request declined` (info) | claimed, rate-limited | wait out `SENTINEL_MIN_INTERVAL_MINUTES`, touch again |
+| `Heap snapshot request seen but not claimed` (warn) | delete failed, **file still there** | if it repeats, the worker cannot delete the file — remove it by hand |
+| `Heap snapshot skipped` (error) | honoured, then refused | read `skipped` (e.g. `insufficient-free-space`) |
+
 Environment overrides:
 
 Every numeric override below is resolved through `resolveNumericSetting()` against

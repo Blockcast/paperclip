@@ -74,6 +74,7 @@ import { createApiTierPluginWorkerManagerStub } from "./services/plugin-worker-m
 import {
   HEAP_SNAPSHOT_SENTINEL_BASENAME,
   decideHeapSnapshot,
+  describeSentinelOutcome,
   ensureHeapSnapshotDir,
   heapSnapshotSweepKeep,
   listResidualHeapSnapshots,
@@ -2409,6 +2410,21 @@ export async function startServer(): Promise<StartedServer> {
         if (!heapSnapshotPlan.capture) return;
         try {
           const decision = decideHeapSnapshot(heapSnapshotConfig, heapSnapshotState);
+
+          // Emit before the early return below. A sentinel that was claimed and
+          // then declined has already *deleted* the request file, and that file
+          // is the only feedback this interface has — so without this the
+          // operator sees their request vanish with no snapshot and no log, and
+          // cannot tell it apart from one that was honoured.
+          const sentinelLog = describeSentinelOutcome(
+            decision,
+            heapSnapshotConfig,
+            heapSnapshotState,
+          );
+          if (sentinelLog !== null) {
+            logger[sentinelLog.level](sentinelLog.data, sentinelLog.message);
+          }
+
           if (decision.trigger === null) return;
 
           // Stamp the trigger before attempting, not after, for the same reason
