@@ -1635,10 +1635,13 @@ describe("agent issue mutation checkout ownership", () => {
   // mechanism that would have silenced the false incident. These tests pin the 403 -> 2xx
   // transition for the one narrow shape, and the 403 everywhere around it.
   describe("deliberate-park disposition PATCH (BLO-27912)", () => {
+    // Relative to now: the validator rejects a lapsed `until`, so a literal date turns every
+    // "accepts a park" case into a 400 the day it passes (it did, on 2026-09-30).
+    const futureUntil = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
     const parkedBody = {
       parkedDisposition: {
         reason: "Gated on upstream fMP4 contract scheduling; no timer owns the event.",
-        until: "2026-09-30T00:00:00.000Z",
+        until: futureUntil,
       },
     };
     // Grants `issue:comment` (the action the creator / manager-chain allow-paths are
@@ -1789,7 +1792,7 @@ describe("agent issue mutation checkout ownership", () => {
 
       const res = await request(await createApp(ownerActor()))
         .patch(`/api/issues/${issueId}`)
-        .send({ parkedDisposition: { until: "2026-09-30T00:00:00.000Z" } });
+        .send({ parkedDisposition: { until: futureUntil } });
 
       expect(res.status).toBe(400);
       expect(mockIssueService.update).not.toHaveBeenCalled();
