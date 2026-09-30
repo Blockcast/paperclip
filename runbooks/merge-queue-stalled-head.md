@@ -7,7 +7,9 @@ stretches over 21h).
 **Trigger** (both conditions, measured with the instruments below):
 `master` has merged nothing in >90 minutes **by `merged_at` on closed PRs**,
 **and** the `merge_group` Actions run at the position-1 entry's `headCommit.oid`
-is `queued` with no job started, or `in_progress` with no job advancing.
+is `queued` with no job started, or `in_progress` with no job advancing, or
+does not exist at all **when queried with the full 40-hex SHA** (a dispatch
+gap; step 2 below says how to clock it).
 
 Owner: Platform/SRE (staffed by CTO timebox — see
 [BLO-518](/BLO/issues/BLO-518#document-plan)). Detection is **manual** by
@@ -33,8 +35,11 @@ one of these:
    multi-day gap out of a queue that merged all day. **Use `merged_at` on
    closed PRs**, which is the only field that means what it says:
    ```
-   gh api graphql -f query='{ search(query:"repo:Blockcast/paperclip is:pr is:merged merged:>=<ISO>", type:ISSUE, first:100){ issueCount nodes{ ... on PullRequest { number mergedAt } } } }'
+   gh api graphql -f query='{ search(query:"repo:Blockcast/paperclip is:pr is:merged merged:<START>..<END>", type:ISSUE, first:100){ issueCount nodes{ ... on PullRequest { number mergedAt } } } }'
    ```
+   `<START>..<END>` is the claimed stall window, both ends ISO-8601. Keep it
+   bounded: an open-ended `merged:>=<START>` also counts every merge *after*
+   the window, so it refutes a genuine stall.
 3. **`state: AWAITING_CHECKS` at position 1 is the HEALTHY steady state.** It is
    what the head entry reads for the entire ~35 min it is building. Under a
    1-wide serial builder it is true nearly whenever the queue is non-empty and
@@ -76,10 +81,12 @@ This is the "how long before it is dequeued" answer AC4 asked for. It is an
 **active SRE threshold below GitHub's own passive 6h timeout**, not a
 replacement for it:
 
-1. **Baseline**: if `master`'s tip has not advanced and the merge queue is
+1. **Baseline**: if `master` has not merged anything **by `merged_at` on
+   closed PRs** and the merge queue is
    non-empty, that alone is not actionable — queues drain in bursts and a
    healthy run can legitimately take up to ~40 minutes.
-2. **90 minutes since the last merge, queue non-empty, position-1 unchanged**:
+2. **90 minutes since the last merge by `merged_at`, queue non-empty,
+   position-1 unchanged**:
    resolve the position-1 entry's exact identity first — do not trust the
    newest repo-wide `merge_group` run, since concurrent re-staging can make
    that a different PR's run entirely. Query the queue for the entry's PR
@@ -96,11 +103,17 @@ replacement for it:
    on it. Record the PR node ID and the run's `databaseId`. If the run is
    `in_progress` and its per-job timestamps are still advancing, keep
    monitoring — this is a slow but live run, not a stall.
+   If no run is returned for that full 40-hex `oid`, that is the dispatch-gap
+   arm of the trigger: record the PR node ID and the time of this check. That
+   time stands in for the run's `createdAt` in step 3 (absence began no later
+   than it), and "no run" stands in for its `databaseId` in every identity
+   check below.
 3. **150 minutes since the run identified in step 2 was created** (the run's
    own `createdAt`, never wall-clock time since the last merge — a freshly
    promoted position-1 entry has not been stalled just because its
    predecessor was) **with that same run still `queued` (never started) or
-   `in_progress` with no job having progressed since the step-2 check**:
+   `in_progress` with no job having progressed since the step-2 check, or
+   still no run at all at that `oid`**:
    this is a stall. Re-run the step-2 resolution and require the PR node ID
    and run `databaseId` to be identical to what you recorded — if either has
    changed, a different entry was promoted to position 1 and the elapsed-time
