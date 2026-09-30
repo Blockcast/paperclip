@@ -19,11 +19,33 @@ import { writeHeapSnapshot } from "node:v8";
  * file — the *trigger* channel, which is why this is a filesystem poll and not a
  * new authenticated admin route on the worker.
  *
- * Everything here is inert unless `PAPERCLIP_HEAP_SNAPSHOT_ENABLED=true`.
+ * Capture is inert unless `PAPERCLIP_HEAP_SNAPSHOT_ENABLED=true`. *Retention is
+ * not* — see below.
  *
  * Snapshots are large (roughly 1.5-2x the used heap) and the shared volume is
  * also every agent's home directory, so both a retention cap and a free-space
  * precondition are load-bearing rather than tidiness.
+ *
+ * ## A snapshot is a secret, and its lifetime is the only control we have
+ *
+ * `writeHeapSnapshot` serialises every reachable string, and `loadConfig()`
+ * reads this process's secrets out of the environment into exactly such strings
+ * (`githubAppPrivateKey` is a required field). Measured, not assumed: a value
+ * read from the environment onto a live object is present verbatim in the
+ * resulting file, while one left undereferenced is not.
+ *
+ * The obvious mitigation does not exist here. On the deployed cluster the
+ * worker and every agent pod run as the *same uid* against the same RWX claim,
+ * so no file mode separates them — 0600 owned by 1000 is readable by uid 1000
+ * in another pod. The retrieval property this feature is built on ("readable
+ * from any agent seat with no privilege change") is the identical mechanism.
+ *
+ * What is left is *how long* the file exists, which is why `maxAgeMs` is a
+ * security bound rather than a disk-tidiness setting, and why the caller must
+ * keep pruning even when capture is disabled. Gating the prune on the feature
+ * flag — as this first shipped — meant switching capture off stopped the sweep
+ * too, so the moment an operator believes the exposure ended is the moment it
+ * becomes permanent. (CTO review, PEN-3631.)
  */
 
 export const HEAP_SNAPSHOT_EXTENSION = ".heapsnapshot";
@@ -108,6 +130,26 @@ export interface HeapSnapshotConfig {
    * indefinitely. Retention caps the disk cost; only this caps the pause rate.
    */
   sentinelMinIntervalMs: number;
+  /**
+   * Hard ceiling on how long a completed snapshot may remain on the volume,
+   * measured from the capture stamp embedded in its own filename.
+   *
+   * This is the exposure window (see the file header): the file contains this
+   * process's secrets in plaintext and no file mode separates the readers, so
+   * age is the only bound left. It applies *in addition to* `keep` and
+   * overrides it — a snapshot past `maxAgeMs` is pruned even when it is one of
+   * the `keep` newest, because "there are only two of them" is not a security
+   * property.
+   *
+   * Measured from the filename stamp rather than mtime on purpose. Retrieval is
+   * documented as copying these off the shared volume, and copy tooling rewrites
+   * mtimes — so an mtime-based bound would let a reader *extend* the window by
+   * touching the file. The embedded stamp is not mutable that way.
+   *
+   * Must exceed `autoMinIntervalMs`, or the older half of a diff pair can expire
+   * before the newer half is taken; the caller warns when it does not.
+   */
+  maxAgeMs: number;
 }
 
 export type HeapSnapshotTrigger = "sentinel" | "threshold";
@@ -169,17 +211,25 @@ interface PrunableEntry {
 }
 
 /**
- * The entries `pruneHeapSnapshots(dir, keep)` would delete, newest retained.
+ * The entries `pruneHeapSnapshots(dir, keep, maxAgeMs)` would delete.
  *
  * Split out from the deletion so the free-space precondition can price a prune
  * without committing to it.
+ *
+ * Two independent reasons an entry is prunable: it falls outside the `keep`
+ * newest, or it is older than `maxAgeMs`. The second overrides the first — the
+ * age bound is an exposure window, not a disk cap (see the file header).
  */
-function collectPrunable(dir: string, keep: number): PrunableEntry[] {
+function collectPrunable(
+  dir: string,
+  keep: number,
+  maxAgeMs: number,
+  nowMs: number,
+): PrunableEntry[] {
   if (!existsSync(dir)) return [];
   const retain = Math.max(0, keep);
   const entries = readdirSync(dir);
   const prunable: PrunableEntry[] = [];
-  const nowMs = Date.now();
 
   for (const name of entries) {
     if (!isPartialSnapshot(name)) continue;
@@ -205,25 +255,33 @@ function collectPrunable(dir: string, keep: number): PrunableEntry[] {
     .filter((entry): entry is { name: string; sizeBytes: number; sortKey: number } => entry !== null)
     .sort((a, b) => b.sortKey - a.sortKey);
 
-  for (const entry of completed.slice(retain)) {
-    prunable.push({ name: entry.name, sizeBytes: entry.sizeBytes });
-  }
+  completed.forEach((entry, index) => {
+    const beyondKeep = index >= retain;
+    const expired = maxAgeMs > 0 && nowMs - entry.sortKey >= maxAgeMs;
+    if (beyondKeep || expired) prunable.push({ name: entry.name, sizeBytes: entry.sizeBytes });
+  });
 
   return prunable;
 }
 
 /**
- * Bytes a `pruneHeapSnapshots(dir, keep)` would release right now.
+ * Bytes a `pruneHeapSnapshots(dir, keep, maxAgeMs)` would release right now.
  *
  * Exported for the free-space precondition in `takeHeapSnapshot`, which must do
  * this arithmetic *before* deleting anything.
  */
-export function reclaimableHeapSnapshotBytes(dir: string, keep: number): number {
-  return collectPrunable(dir, keep).reduce((sum, entry) => sum + entry.sizeBytes, 0);
+export function reclaimableHeapSnapshotBytes(
+  dir: string,
+  keep: number,
+  maxAgeMs: number,
+  nowMs: number = Date.now(),
+): number {
+  return collectPrunable(dir, keep, maxAgeMs, nowMs).reduce((sum, entry) => sum + entry.sizeBytes, 0);
 }
 
 /**
- * Retain the `keep` newest completed snapshots and delete every older one.
+ * Retain the `keep` newest completed snapshots, and delete every older one plus
+ * every one past `maxAgeMs` regardless of the cap.
  *
  * Also deletes abandoned `.partial` files regardless of the cap. A partial only
  * exists because a previous snapshot did not return — and this worker's failure
@@ -232,12 +290,19 @@ export function reclaimableHeapSnapshotBytes(dir: string, keep: number): number 
  * never renamed in after the fact, so there is nothing to preserve. See
  * `PARTIAL_ABANDONED_AFTER_MS` for why "abandoned" is timed rather than assumed.
  *
+ * Callers must keep invoking this when capture is disabled; see the file header.
+ *
  * Returns the basenames removed.
  */
-export function pruneHeapSnapshots(dir: string, keep: number): string[] {
+export function pruneHeapSnapshots(
+  dir: string,
+  keep: number,
+  maxAgeMs: number,
+  nowMs: number = Date.now(),
+): string[] {
   const removed: string[] = [];
 
-  for (const entry of collectPrunable(dir, keep)) {
+  for (const entry of collectPrunable(dir, keep, maxAgeMs, nowMs)) {
     try {
       unlinkSync(path.join(dir, entry.name));
       removed.push(entry.name);
@@ -248,6 +313,19 @@ export function pruneHeapSnapshots(dir: string, keep: number): string[] {
   }
 
   return removed;
+}
+
+/**
+ * Completed snapshots currently on the volume, newest first.
+ *
+ * Exported so startup can report leftovers while capture is *disabled* — that
+ * is precisely the state in which an operator believes the exposure is over.
+ */
+export function listHeapSnapshots(dir: string): string[] {
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir)
+    .filter(isCompletedSnapshot)
+    .sort((a, b) => (snapshotStampMs(b) ?? 0) - (snapshotStampMs(a) ?? 0));
 }
 
 /**
@@ -279,6 +357,18 @@ function snapshotBasename(now: Date): string {
  * PEN-3314 is a pair hours apart that a single refusal would reduce to one with
  * no diff. Refusing without pruning costs nothing: the test already credits the
  * prune's bytes, so if it refuses, deleting them would not have been enough.
+ *
+ * For the same reason the pre-prune is *skipped entirely* when there is already
+ * room. On the ample-space path it buys nothing and still destroys the older
+ * half of the pair before a write that may not return — and the write not
+ * returning is not hypothetical here. This runs on a worker whose failure mode
+ * is heap exhaustion, `writeHeapSnapshot` on a bloated heap is itself a
+ * plausible OOM trigger, and an OOMKill is SIGKILL: the `catch` below cannot
+ * run, so nothing restores what the prune deleted. That put maximum kill risk
+ * exactly where the baseline had just been removed. Deferring to the post-write
+ * prune costs only the seconds of the write, and the age bound is unaffected —
+ * an expired snapshot is still swept by the pass below, and by the caller's
+ * periodic sweep. (Ally review, Important 1; upheld on PEN-3631.)
  */
 export function takeHeapSnapshot(
   config: HeapSnapshotConfig,
@@ -287,18 +377,31 @@ export function takeHeapSnapshot(
 ): HeapSnapshotResult | HeapSnapshotSkipped {
   mkdirSync(config.dir, { recursive: true });
 
+  const now = runtime.now();
+  const nowMs = now.getTime();
   const pruneToBeforeWrite = Math.max(0, config.keep - 1);
   const heapUsedBytes = runtime.heapUsedBytes();
   const requiredBytes = config.minFreeBytes + heapUsedBytes * SIZE_ESTIMATE_MULTIPLIER;
   const freeBytes = runtime.freeBytes(config.dir);
-  const reclaimableBytes = reclaimableHeapSnapshotBytes(config.dir, pruneToBeforeWrite);
+  const reclaimableBytes = reclaimableHeapSnapshotBytes(
+    config.dir,
+    pruneToBeforeWrite,
+    config.maxAgeMs,
+    nowMs,
+  );
   if (freeBytes + reclaimableBytes < requiredBytes) {
     return { skipped: "insufficient-free-space", freeBytes, requiredBytes, reclaimableBytes };
   }
 
-  const prunedBefore = pruneHeapSnapshots(config.dir, pruneToBeforeWrite);
+  // Only spend the prune when the write actually needs the room. See the doc
+  // comment: on the ample-space path this would delete the older half of the
+  // diff pair to no purpose, immediately before the operation most likely to
+  // take the process down with it.
+  const prunedBefore =
+    freeBytes < requiredBytes
+      ? pruneHeapSnapshots(config.dir, pruneToBeforeWrite, config.maxAgeMs, nowMs)
+      : [];
 
-  const now = runtime.now();
   const finalPath = path.join(config.dir, snapshotBasename(now));
   const partialPath = `${finalPath}${PARTIAL_SUFFIX}`;
 
@@ -323,7 +426,7 @@ export function takeHeapSnapshot(
     // The snapshot is written; not being able to size it is not a failure.
   }
 
-  const prunedAfter = pruneHeapSnapshots(config.dir, config.keep);
+  const prunedAfter = pruneHeapSnapshots(config.dir, config.keep, config.maxAgeMs, nowMs);
   return {
     filePath: finalPath,
     sizeBytes,
@@ -332,6 +435,63 @@ export function takeHeapSnapshot(
     trigger,
     prunedCount: prunedBefore.length + prunedAfter.length,
   };
+}
+
+/**
+ * How many completed snapshots the periodic sweep may retain.
+ *
+ * `keep` while capture is on; **zero** once it is off. Disabling the flag is an
+ * operator declaring the capture window closed, and a snapshot's lifetime is the
+ * only control there is over what it discloses (see the file header) — so the
+ * files go at that point rather than lingering until `maxAgeMs` retires them.
+ * The two bounds cover different halves of the window: `maxAgeMs` while it is
+ * open, this once it shuts.
+ *
+ * The cost is real and is documented rather than mitigated: flipping the flag
+ * off deletes the pair, including one that has not been retrieved yet. That is
+ * why `doc/DEVELOPING.md` states the ordering — copy the snapshots off the
+ * volume *before* disabling capture — and why that line is load-bearing rather
+ * than documentation polish. (CTO review, PEN-3631.)
+ */
+export function heapSnapshotSweepKeep(captureEnabled: boolean, keep: number): number {
+  return captureEnabled ? Math.max(0, keep) : 0;
+}
+
+export interface HeapSnapshotStartupPlan {
+  /** Create the snapshot directory and honour triggers. */
+  capture: boolean;
+  /** Run the periodic retention sweep. */
+  poll: boolean;
+  /** Warn that secret-bearing files are on disk while capture is off. */
+  warnResidualSnapshots: boolean;
+}
+
+/**
+ * Decide what the worker tier should arm at startup.
+ *
+ * Extracted from `index.ts` so the one property that matters here is a tested
+ * unit rather than inline gating: **`poll` is not implied by `capture`.** Every
+ * prune once lived inside the capture flag, so setting it to `false` stopped the
+ * sweep along with the capture and whatever was already on the shared volume
+ * stayed there forever — the moment an operator believes the exposure ended was
+ * the moment it became permanent. That was an untested inline condition, which
+ * is exactly why this one is not. (CTO review, PEN-3631.)
+ *
+ * Capture off with nothing on disk arms nothing at all: there is no exposure to
+ * sweep, so a deployment that never enabled this keeps precisely the footprint
+ * it had. Capture off *with* something on disk keeps polling, because with
+ * `heapSnapshotSweepKeep` returning 0 anything that survived the startup sweep
+ * survived an unlink, and the retry is the only thing that will clear it.
+ */
+export function planHeapSnapshotStartup(input: {
+  captureEnabled: boolean;
+  residualSnapshotCount: number;
+}): HeapSnapshotStartupPlan {
+  if (input.captureEnabled) {
+    return { capture: true, poll: true, warnResidualSnapshots: false };
+  }
+  const hasResidual = input.residualSnapshotCount > 0;
+  return { capture: false, poll: hasResidual, warnResidualSnapshots: hasResidual };
 }
 
 export interface HeapSnapshotDecision {

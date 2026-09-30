@@ -82,6 +82,10 @@ import {
   HEAP_SNAPSHOT_SENTINEL_BASENAME,
   decideHeapSnapshot,
   ensureHeapSnapshotDir,
+  heapSnapshotSweepKeep,
+  listHeapSnapshots,
+  planHeapSnapshotStartup,
+  pruneHeapSnapshots,
   takeHeapSnapshot,
 } from "./services/heap-snapshot.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
@@ -2457,7 +2461,17 @@ export async function startServer(): Promise<StartedServer> {
   // The trigger is a sentinel file rather than an HTTP route because the volume
   // this writes to is already shared read-write with every agent pod, so it
   // works as the control channel too — no new listener, no new auth surface.
-  if (config.heapSnapshotEnabled && config.paperclipNodeRole !== "api") {
+  //
+  // NOTE the gate: the tier check is the outer condition and
+  // `heapSnapshotEnabled` only guards *capture*. Retention runs either way.
+  // A snapshot serialises every reachable string, including the secrets
+  // loadConfig() reads out of the environment, and the worker shares both the
+  // volume and its uid with every agent pod — so no file mode separates the
+  // readers and the file's lifetime is the only control left. When the prune
+  // lived inside the feature flag (as this first shipped), switching capture
+  // off stopped the sweep with it: the moment an operator believes the exposure
+  // ended was the moment it became permanent. (CTO review, PEN-3631.)
+  if (config.paperclipNodeRole !== "api") {
     const heapSnapshotConfig = {
       dir: config.heapSnapshotDir,
       keep: config.heapSnapshotKeep,
@@ -2465,67 +2479,152 @@ export async function startServer(): Promise<StartedServer> {
       autoThresholdBytes: config.heapSnapshotAutoThresholdBytes,
       autoMinIntervalMs: config.heapSnapshotAutoMinIntervalMs,
       sentinelMinIntervalMs: config.heapSnapshotSentinelMinIntervalMs,
+      maxAgeMs: config.heapSnapshotMaxAgeMs,
     };
     const heapSnapshotState: {
       lastAutoSnapshotAtMs: number | null;
       lastSentinelSnapshotAtMs: number | null;
     } = { lastAutoSnapshotAtMs: null, lastSentinelSnapshotAtMs: null };
 
-    // Create the directory now so the sentinel has somewhere to land; otherwise
-    // there would be no way to request the first snapshot.
-    ensureHeapSnapshotDir(heapSnapshotConfig.dir);
-
-    logger.warn(
-      {
-        snapshotDir: heapSnapshotConfig.dir,
-        sentinel: path.join(heapSnapshotConfig.dir, HEAP_SNAPSHOT_SENTINEL_BASENAME),
-        keep: heapSnapshotConfig.keep,
-        autoThresholdBytes: heapSnapshotConfig.autoThresholdBytes,
-        sentinelMinIntervalMs: heapSnapshotConfig.sentinelMinIntervalMs,
-        pollIntervalMs: config.heapSnapshotPollIntervalMs,
-      },
-      "Heap snapshot diagnostics ENABLED — each trigger pauses this process for seconds and writes a multi-gigabyte file",
-    );
-
-    setInterval(() => {
-      // Deliberately synchronous. writeHeapSnapshot is stop-the-world anyway, so
-      // there is nothing to yield to, and keeping it on one tick means a poll can
-      // never overlap its own predecessor.
+    const sweepHeapSnapshots = (): void => {
+      // Capture off ⇒ retain nothing. Ageing out via maxAgeMs bounds the window
+      // while it is open; disabling the flag is the operator closing it, and the
+      // snapshots go then. DEVELOPING.md carries the ordering this imposes:
+      // retrieve the pair BEFORE flipping the flag off.
+      const keep = heapSnapshotSweepKeep(config.heapSnapshotEnabled, heapSnapshotConfig.keep);
       try {
-        const decision = decideHeapSnapshot(heapSnapshotConfig, heapSnapshotState);
-        if (decision.trigger === null) return;
-
-        // Stamp the trigger before attempting, not after, for the same reason
-        // the sentinel is consumed before attempting: a snapshot that fails for
-        // a persistent reason (a full volume, a dying heap) would otherwise be
-        // retried on every single poll.
-        if (decision.trigger === "threshold") {
-          heapSnapshotState.lastAutoSnapshotAtMs = Date.now();
-        } else {
-          heapSnapshotState.lastSentinelSnapshotAtMs = Date.now();
+        const removed = pruneHeapSnapshots(
+          heapSnapshotConfig.dir,
+          keep,
+          heapSnapshotConfig.maxAgeMs,
+        );
+        if (removed.length > 0) {
+          logger.warn(
+            {
+              snapshotDir: heapSnapshotConfig.dir,
+              removed,
+              keep,
+              maxAgeMs: heapSnapshotConfig.maxAgeMs,
+              captureEnabled: config.heapSnapshotEnabled,
+            },
+            "Pruned heap snapshots",
+          );
         }
+      } catch (err) {
+        logger.error({ err, snapshotDir: heapSnapshotConfig.dir }, "Heap snapshot prune failed");
+      }
+    };
 
-        const result = takeHeapSnapshot(heapSnapshotConfig, decision.trigger);
+    if (config.heapSnapshotEnabled) {
+      // Create the directory now so the sentinel has somewhere to land; otherwise
+      // there would be no way to request the first snapshot. Only when capture is
+      // on — a disabled feature should not materialise a directory, and the sweep
+      // below treats a missing one as nothing to do.
+      ensureHeapSnapshotDir(heapSnapshotConfig.dir);
 
-        if ("skipped" in result) {
-          logger.error({ ...result, trigger: decision.trigger }, "Heap snapshot skipped");
-          return;
-        }
+      logger.warn(
+        {
+          snapshotDir: heapSnapshotConfig.dir,
+          sentinel: path.join(heapSnapshotConfig.dir, HEAP_SNAPSHOT_SENTINEL_BASENAME),
+          keep: heapSnapshotConfig.keep,
+          maxAgeMs: heapSnapshotConfig.maxAgeMs,
+          autoThresholdBytes: heapSnapshotConfig.autoThresholdBytes,
+          sentinelMinIntervalMs: heapSnapshotConfig.sentinelMinIntervalMs,
+          pollIntervalMs: config.heapSnapshotPollIntervalMs,
+        },
+        "Heap snapshot diagnostics ENABLED — each trigger pauses this process for seconds and writes a multi-gigabyte file " +
+          "containing EVERY STRING ON THIS PROCESS'S HEAP IN PLAINTEXT, including the secrets read from the environment " +
+          "(GitHub App private key, agent JWT signing secret, database URL, webhook and provider tokens). Anyone who can read " +
+          "the snapshot directory can recover them, and where that directory is a shared volume no file mode prevents it. " +
+          "Treat every capture as a credential-exposure event with a rotation decision attached.",
+      );
+
+      if (heapSnapshotConfig.maxAgeMs <= heapSnapshotConfig.autoMinIntervalMs) {
         logger.warn(
           {
-            snapshotFile: result.filePath,
-            sizeBytes: result.sizeBytes,
-            heapUsedBytes: result.heapUsedBytes,
-            durationMs: result.durationMs,
-            prunedCount: result.prunedCount,
-            trigger: result.trigger,
+            maxAgeMs: heapSnapshotConfig.maxAgeMs,
+            autoMinIntervalMs: heapSnapshotConfig.autoMinIntervalMs,
           },
-          "Heap snapshot written",
+          "PAPERCLIP_HEAP_SNAPSHOT_MAX_AGE_MINUTES is not greater than the automatic snapshot interval — the older half of a " +
+            "diff pair can expire before the newer half is taken, leaving nothing to diff",
         );
-      } catch (err) {
-        logger.error({ err, snapshotDir: heapSnapshotConfig.dir }, "Heap snapshot failed");
       }
-    }, config.heapSnapshotPollIntervalMs);
+    }
+
+    // Sweep once at startup, whether or not capture is enabled, then on every
+    // poll. This is what makes "flag off" end the exposure rather than freeze it.
+    sweepHeapSnapshots();
+
+    // Measured after the sweep, so the count reported and the decision to keep
+    // polling both reflect what actually survived it.
+    const residualSnapshots = config.heapSnapshotEnabled
+      ? []
+      : listHeapSnapshots(heapSnapshotConfig.dir);
+    const heapSnapshotPlan = planHeapSnapshotStartup({
+      captureEnabled: config.heapSnapshotEnabled,
+      residualSnapshotCount: residualSnapshots.length,
+    });
+
+    if (heapSnapshotPlan.warnResidualSnapshots) {
+      logger.warn(
+        {
+          snapshotDir: heapSnapshotConfig.dir,
+          count: residualSnapshots.length,
+          oldest: residualSnapshots[residualSnapshots.length - 1],
+        },
+        "Heap snapshot capture is DISABLED and the startup sweep FAILED TO DELETE snapshots that remain on disk — these " +
+          "contain this process's secrets in plaintext. With capture off the sweep retains none, so anything still here " +
+          "survived an unlink; the poll below will keep retrying, but remove them by hand if this warning persists.",
+      );
+    }
+
+    if (heapSnapshotPlan.poll) {
+      setInterval(() => {
+        // Deliberately synchronous. writeHeapSnapshot is stop-the-world anyway, so
+        // there is nothing to yield to, and keeping it on one tick means a poll can
+        // never overlap its own predecessor.
+        //
+        // Retention first and unconditionally: when capture is off this poll is
+        // running *only* to retry a deletion the startup sweep could not make.
+        sweepHeapSnapshots();
+        if (!heapSnapshotPlan.capture) return;
+        try {
+          const decision = decideHeapSnapshot(heapSnapshotConfig, heapSnapshotState);
+          if (decision.trigger === null) return;
+
+          // Stamp the trigger before attempting, not after, for the same reason
+          // the sentinel is consumed before attempting: a snapshot that fails for
+          // a persistent reason (a full volume, a dying heap) would otherwise be
+          // retried on every single poll.
+          if (decision.trigger === "threshold") {
+            heapSnapshotState.lastAutoSnapshotAtMs = Date.now();
+          } else {
+            heapSnapshotState.lastSentinelSnapshotAtMs = Date.now();
+          }
+
+          const result = takeHeapSnapshot(heapSnapshotConfig, decision.trigger);
+
+          if ("skipped" in result) {
+            logger.error({ ...result, trigger: decision.trigger }, "Heap snapshot skipped");
+            return;
+          }
+          logger.warn(
+            {
+              snapshotFile: result.filePath,
+              sizeBytes: result.sizeBytes,
+              heapUsedBytes: result.heapUsedBytes,
+              durationMs: result.durationMs,
+              prunedCount: result.prunedCount,
+              trigger: result.trigger,
+              expiresAtMs: Date.now() + heapSnapshotConfig.maxAgeMs,
+            },
+            "Heap snapshot written — contains this process's secrets in plaintext; retrieve, then treat as a credential exposure",
+          );
+        } catch (err) {
+          logger.error({ err, snapshotDir: heapSnapshotConfig.dir }, "Heap snapshot failed");
+        }
+      }, config.heapSnapshotPollIntervalMs);
+    }
   }
   
   // Wait for external adapters to finish loading before accepting requests.
