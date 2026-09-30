@@ -1261,10 +1261,11 @@ async function waitForPod(
     // state is collateral — a sidecar stuck waiting still blocks startup, so the
     // waiting branches below apply to it as they do to any init container.
     // No cast: @kubernetes/client-node declares V1Container.restartPolicy
-    // (1.4.0, V1Container.d.ts:70), so tsc checks this field name.  A cast to a
-    // bare structural type would make a rename or a downgrade inside the
-    // declared ^1.0.0 range evaluate to undefined silently — sidecarNames goes
-    // empty and the DinD mislabel below returns with no compile error.
+    // (1.0.0 V1Container.d.ts:69 through the resolved 1.4.0:70, so every
+    // version in the declared ^1.0.0 range has it), so tsc checks this field
+    // name.  A cast to a bare structural type would make an upstream *rename*
+    // evaluate to undefined silently — sidecarNames goes empty and the DinD
+    // mislabel below returns with no compile error and no test failure.
     const sidecarNames = new Set(
       (pod.spec?.initContainers ?? [])
         .filter((c) => c.restartPolicy === "Always")
