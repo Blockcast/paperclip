@@ -419,6 +419,10 @@ function mountPrefix(mount: string): string {
  *    image layer, not from the shared volume. Rewriting those would relocate a
  *    correct link onto the data volume, where nothing exists — turning the one
  *    set of links that works today into the broken set.
+ *    It is NOT the only shape that reaches this return: a catalog-backed source
+ *    whose PAPERCLIP_HOME is not under the server mount does too, and for that
+ *    one the link dangles. Not derivable here, so `prepareClaudePromptBundle`
+ *    reports it (`claude_k8s.prompt_bundle_skill_off_volume`).
  *
  * With `podMount === serverMount` (every deployment today) the arithmetic is the
  * identity, so every emitted target is byte-identical to the pre-BLO-37961 value.
@@ -502,6 +506,30 @@ export async function prepareClaudePromptBundle(input: {
       // link's CONTENT is resolved by the pod, so it must be a POD path.
       // `entry.source` arrives as a SERVER address — see `toPodAddress`.
       const desired = toPodAddress(entry.source, podDataMountPath, serverDataMountPath);
+      // `toPodAddress`'s "not under the server mount" return is correct for an
+      // IMAGE path only. A catalog-backed source is a PAPERCLIP_HOME path, and
+      // the server mount is `SELF_POD_DATA_MOUNT_PATH`: two variables that
+      // coincide today, not one. Where they diverge the source passes through
+      // untranslated and the pod gets a dangling link, so report it. Keyed on
+      // the pod mount alone, as `prompt_bundle_off_volume` above is; the
+      // catalog discriminator is what keeps the image-path set silent.
+      if (
+        podDataMountPath &&
+        (input.catalogBackedSkillKeys?.has(entry.key) ?? true) &&
+        !desired.startsWith(mountPrefix(podDataMountPath))
+      ) {
+        console.warn(
+          JSON.stringify({
+            level: "warn",
+            event: "claude_k8s.prompt_bundle_skill_off_volume",
+            msg: "catalog-backed skill link target is outside the pod's data mount; the pod cannot follow it, so this skill will not load",
+            skillKey: entry.key,
+            linkTarget: desired,
+            podDataMountPath,
+            serverDataMountPath: serverDataMountPath ?? "",
+          }),
+        );
+      }
       // `ensurePaperclipSkillSymlink` keeps an existing link whose target still
       // stat()s — but it stats HERE, in server space, so a stale pre-fix link
       // carrying the old SERVER address resolves and is kept, leaving the pod
