@@ -4526,13 +4526,21 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
   // same shape as a mention. It is excluded anyway because the harm differs: a
   // mention has no other wake path, whereas a recovery action carries its own
   // `attemptCount`/`maxAttempts` budget and the stranded sweep re-upserts it,
-  // re-arming the owner without this retry.
+  // re-arming the owner without this retry — until that budget escalates, at
+  // which point the sweep reuses instead and the action fires
+  // `issue.escalation.needs_human_decision`, so it fails visibly.
   //
   // Note this leaves the GATE stricter than `claimQueuedRun`, which exempts
   // recovery-owner wakes unconditionally (`isRecoveryOwnerWake`). Safe in that
-  // direction only: the retry is never armed, so the claim exemption is
-  // unreachable rather than contradicted. If this ever flips to `scheduled`,
-  // the two screens have started disagreeing and the claim leg needs a mirror.
+  // direction only, and by this mechanism: the retry IS armed — `scheduled`
+  // below is today's expected outcome, not a defect — and PROMOTION cancels it
+  // `issue_not_assigned_to_agent`. A cancelled retry never becomes a queued
+  // run, so the claim screen is never reached and its exemption is unreachable
+  // rather than contradicted.
+  //
+  // TRIPWIRE: watch `promoted: 0`, NOT the `scheduled` outcome. If promotion
+  // ever returns 1, the retry reaches `claimQueuedRun`, `isRecoveryOwnerWake`
+  // lets it through, and the two screens have started disagreeing.
   it("keeps a source_scoped_recovery_action retry suppressed as issue_not_assigned_to_agent", async () => {
     const companyId = randomUUID();
     const recoveryOwnerAgentId = randomUUID();
@@ -4619,6 +4627,11 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, scheduled.run.id))
       .then((rows) => rows[0] ?? null);
+    // The pair below is the asymmetry itself, not just the gate leg: the gate
+    // cancels this wake, while `claimQueuedRun`'s `isRecoveryOwnerWake` term
+    // would have exempted the very same shape. `issue_not_assigned_to_agent`
+    // is what makes that visible — a plain `cancelled` would not distinguish
+    // this from the assignee-reassignment case the gate was written for.
     expect(retry).toEqual({
       status: "cancelled",
       errorCode: "issue_not_assigned_to_agent",
