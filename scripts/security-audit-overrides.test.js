@@ -123,7 +123,7 @@ async function main() {
     assertIncludes(uiViteConfig, "optimizeDeps", "ui vite config");
     assert.match(
       lockfile,
-      /@connectrpc\/connect-node@1\.7\.0[\s\S]*?undici: 6\.29\.0/,
+      /^  '@connectrpc\/connect-node@1\.7\.0(?:\([^\n]*\))?':\n(?: {4,}[^\n]*\n)*?      undici: 6\.29\.0$/m,
       "@connectrpc/connect-node must resolve undici 6.29.0",
     );
     assert.match(

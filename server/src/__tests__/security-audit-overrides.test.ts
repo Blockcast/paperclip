@@ -88,6 +88,12 @@ describe("PEN-1198 audit dependency remediation", () => {
         "GHSA-4cwx-7wf7-3272",
         "GHSA-vmh5-mc38-953g",
         "GHSA-hm92-r4w5-c3mj",
+        // BLO-38291: GHSA-rfgv-xxqx-mfg5 has three arms, and the
+        // `>=7.0.0 <7.29.1` one covered this path too — not just the 6.x arm
+        // recorded under connect-node. No range change: the floor was already
+        // >=7.29.1 for GHSA-w293-vg96-wgc3, which is exactly the 7.x arm's
+        // first patched version, so this path was never vulnerable to it.
+        "GHSA-rfgv-xxqx-mfg5",
       ]),
     });
     expect(remediations.multer).toMatchObject({
