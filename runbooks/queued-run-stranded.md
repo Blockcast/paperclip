@@ -698,7 +698,31 @@ paperclip_db_pool_connections{pod="paperclip-0"}
 The signature that *did* discriminate was a permanently `active` connection
 count with nothing queued — a stuck transaction — alongside zero dispatches.
 
-#### Step 4 — recovery: capture, then wait. Do NOT restart the pod.
+#### Step 4 — recovery: capture, then wait. Restart only on the gate below.
+
+**Which arm paged decides what the wait is for** (BLO-36522 split):
+
+- **`PaperclipAgentStartLockFleetStall` alone: capture, then wait.** This is
+  the regime the self-heal evidence above covers (every measured hold up to
+  2h14m released on its own), and the rationale in the next paragraph is
+  about it and nothing else.
+- **`PaperclipAgentStartLockWedged`: capture, then re-check the restart gate
+  below as the hold ages. The gate is the decision point, not the wait.** No
+  hold past 4h has been observed to settle, so the self-heal rationale does
+  not license waiting this one out. But the gate cannot return its top row
+  until the hold is about 6h old (see the gate), and `Wedged` pages at
+  `14400`s + `for: 5m`, about **4h05m**. So on this arm the gate reads
+  *inconclusive* for roughly the first **1h55m after the page by
+  construction**, not because the lock is healthy. Capture now, put the agent
+  id on the issue, and re-run the gate queries once the hold passes 6h; from
+  then on, a top-row reading plus the other three signals is the restart
+  case below.
+- **Both firing: `Wedged` governs** for every agent past 4h, and `FleetStall`'s
+  capture-and-wait covers only the agents below it. The two arms are not
+  mutually exclusive: the founding 2026-09-15/16 incident (five agents at
+  6-19 h) trips both, because each of those agents is past `14400`s. Do not
+  let the `FleetStall` self-clear evidence overrule it -- that evidence stops
+  at 2h14m.
 
 **This step used to read "the section must settle or the process must be
 replaced" and prescribe `kubectl delete pod`. That prescription is withdrawn
@@ -706,10 +730,12 @@ replaced" and prescribe `kubectl delete pod`. That prescription is withdrawn
 worst episode on record cleared itself with the same process still running,
 and kept running 7.75 h afterwards. Replacing the worker pod is a
 shared-infrastructure mutation affecting **every** agent in the fleet, and the
-evidence says it buys nothing the wait would not have given you.
+evidence says it buys nothing the wait would not have given you -- in the
+regime that evidence covers, i.e. `FleetStall`; see the per-arm list above.
 
-**So the page's action is evidence capture inside a window that closes by
-itself.** While it is still firing:
+**So the page's action is evidence capture, on either arm** -- inside a window
+that, on `FleetStall`, has closed by itself every time it was measured, and
+on `Wedged` feeds the gate below. While it is still firing:
 
 ```
 max by (agent_id) (paperclip_agent_start_lock_held_seconds)      # who, and how long
@@ -762,7 +788,9 @@ That gate cannot be met until the hold is roughly six hours old. The series
 does not exist before acquisition, so a younger hold cannot be present
 throughout a `[6h]` window and lands in the inconclusive third row. This is
 deliberate: in practice the gate means "wait about 6h", and the one long hold
-observed end to end (2h14m) released on its own well inside that.
+observed end to end (2h14m) released on its own well inside that. On a
+`Wedged` page, which fires at about 4h05m, that floor lands roughly 1h55m
+after the page (per-arm list at the top of this step).
 
 The real fix — making the critical section's awaits abortable so `fn` rejects
 and releases the lock through the existing `finally` — is out of scope of the
