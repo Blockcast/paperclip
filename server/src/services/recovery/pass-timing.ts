@@ -3,11 +3,22 @@
  *
  * WHY THIS EXISTS, AND WHY NO EXISTING SIGNAL SUBSTITUTES FOR IT
  *
- * Measured over 88 consecutive production passes (Loki, `{pod="paperclip-0"}`,
- * 2026-09-28..30), and re-measured over 84 passes joined to Prometheus
- * (2026-09-30), pass 1 of the recovery chain ran 5.5-86.3 min -- a 15.7x
- * spread -- while `candidatesScanned` moved only +/-9% (2095..2284) and
- * `suppressed` only +/-12% (941..1050). Correlations against that wall clock:
+ * Two measurement runs feed this comment. They are tagged separately because
+ * their figures are NOT interchangeable, and a reader re-checking one should
+ * know which query to re-run:
+ *
+ *   (A) 88 consecutive production passes, Loki only (`{pod="paperclip-0"}`,
+ *       2026-09-28..30). Source of: pass 1 ran 5.5-86.3 min, while
+ *       `candidatesScanned` moved only +/-9% (2095..2284) and `suppressed`
+ *       only +/-12% (941..1050).
+ *   (B) 84 pass-1 windows, Loki joined to Prometheus at 30 s step
+ *       (2026-09-30). Independently reproduces the dispersion -- 146.9..2305.6
+ *       ms per candidate, a 15.7x spread -- and is the SOLE source of every
+ *       correlation below. n = 84 throughout.
+ *
+ * From (B). These are against ms-per-candidate rather than the raw pass wall
+ * clock; by 1. below the two are the same variable here, so the ranking is
+ * identical either way:
  *
  *   r(ms-per-candidate, candidatesScanned)  = -0.029  (workload: nothing)
  *   r(ms-per-candidate, concurrent runs)    = +0.368  (direct gauge)
@@ -22,18 +33,35 @@
  *    is not a coefficient of this code and cannot be compared across dates to
  *    establish a regression. `r(pass duration, ms-per-candidate)` is 1.000 --
  *    with the candidate count near-constant, those are the same variable.
- * 2. No externally observable driver explains the spread. An earlier revision of
- *    this comment claimed the advisory-lock hypothesis's "scales with fleet
- *    concurrency" form was DISCARDED, on r = -0.059 against namespace log-line
- *    rate. That was overstated: log-line rate is a weak proxy for DB
- *    contention, and the direct gauge reads +0.368 --
+ * 2. No SINGLE externally observable driver explains MOST of the spread (best
+ *    R^2 ~ 0.20), and the leading suspect is not externally observable at all.
+ *    Read that precisely: the drivers above are real, and the `⚠` corollary
+ *    below tells you to go and read one of them. What no external signal
+ *    supplies is a DOMINANT explanation -- so external attribution is
+ *    exhausted, not useless.
+ *
+ *    An earlier revision of this comment claimed the advisory-lock hypothesis's
+ *    "scales with fleet concurrency" form was DISCARDED, on r = -0.059 against
+ *    namespace log-line rate. That was overstated: log-line rate is a weak
+ *    proxy for DB contention, and the direct gauge reads +0.368 --
  *    `paperclip_external_lifecycle_running_runs`, which nobody had enumerated.
- *    The form is WEAKENED, not refuted -- though it
- *    saturates rather than scaling (terciles: 27 runs -> 507 ms, 37 -> 744 ms,
- *    44 -> 736 ms). Controlling each candidate driver for the others leaves all
- *    of them in +0.27..+0.43 with none dominant, against a positive control of
- *    +0.733 on the same windows -- so that band is a finding, not measurement
- *    noise. Lock wait scoped to one hot issue or company appears in NO external
+ *    The form is WEAKENED, not refuted -- though it saturates rather than
+ *    scaling (terciles: 27 runs -> 507 ms, 37 -> 744 ms, 44 -> 736 ms).
+ *
+ *    Controlling each candidate driver for the others leaves all of them in
+ *    +0.27..+0.43 with none dominant. Two independent reasons to read that band
+ *    as a finding rather than measurement noise, doing different jobs: the join
+ *    and windowing CAN resolve a strong relationship when one exists (positive
+ *    control, same 84 windows: `r(pool wait, pool active)` = +0.733), and at
+ *    n = 84 the band is significant on its own terms (r = 0.27 -> p = 0.013,
+ *    falling below p = 0.001 by r = 0.35). A positive control establishes the
+ *    instrument works; it does NOT bound a false-positive rate, which is what
+ *    the p-values are for. Note the floor is marginal: four drivers were
+ *    tested, so Bonferroni at alpha = 0.05 wants p < 0.0125 and r = 0.27 just
+ *    misses it. The body of the band clears that comfortably; its bottom edge
+ *    does not.
+ *
+ *    Lock wait scoped to one hot issue or company appears in NO external
  *    signal, which is why the two lock acquisitions below are timed SEPARATELY
  *    rather than folded into one "transaction" bucket -- separating them is the
  *    whole point.
