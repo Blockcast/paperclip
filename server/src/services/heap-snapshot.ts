@@ -50,6 +50,18 @@ const PARTIAL_SUFFIX = ".partial";
  */
 const SIZE_ESTIMATE_MULTIPLIER = 2;
 
+/**
+ * Leave a `.partial` alone until it has been untouched for this long.
+ *
+ * Within one process a partial is unambiguously garbage, but the tier gate
+ * (`paperclipNodeRole !== "api"`) admits both `worker` and the default `all`, so
+ * a second replica against the shared directory would otherwise delete a peer's
+ * in-flight write and break that peer's `renameSync`. V8 extends the file
+ * continuously while writing, so an in-flight partial's mtime is always recent
+ * and an abandoned one's is frozen at the abort.
+ */
+const PARTIAL_ABANDONED_AFTER_MS = 10 * 60 * 1000;
+
 export interface HeapSnapshotRuntime {
   now: () => Date;
   heapUsedBytes: () => number;
@@ -84,6 +96,18 @@ export interface HeapSnapshotConfig {
    * from snapshotting on every poll.
    */
   autoMinIntervalMs: number;
+  /**
+   * Minimum gap between *sentinel* snapshots.
+   *
+   * Deliberately much shorter than `autoMinIntervalMs` — a sentinel is a human
+   * asking, and the automatic gap exists to space a *pair* of snapshots for a
+   * diff, which is not what a request means. But it cannot be absent: the
+   * sentinel is writable from every pod mounting the shared claim, so an
+   * unthrottled path lets a loop touching the file force a stop-the-world pause
+   * plus a multi-gigabyte write on the singleton worker once per poll,
+   * indefinitely. Retention caps the disk cost; only this caps the pause rate.
+   */
+  sentinelMinIntervalMs: number;
 }
 
 export type HeapSnapshotTrigger = "sentinel" | "threshold";
@@ -103,6 +127,12 @@ export interface HeapSnapshotSkipped {
   skipped: HeapSnapshotSkipReason;
   freeBytes: number;
   requiredBytes: number;
+  /**
+   * Bytes the retention prune would have released had it run. Reported because
+   * the refusal *declines* to spend it: a reader seeing `freeBytes` alone below
+   * `requiredBytes` would reasonably assume pruning was simply not tried.
+   */
+  reclaimableBytes: number;
 }
 
 function isCompletedSnapshot(name: string): boolean {
@@ -113,52 +143,107 @@ function isPartialSnapshot(name: string): boolean {
   return name.endsWith(`${HEAP_SNAPSHOT_EXTENSION}${PARTIAL_SUFFIX}`);
 }
 
+/** Matches `snapshotBasename`: an ISO stamp with `:` and `.` flattened to `-`. */
+const SNAPSHOT_NAME_PATTERN = /^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z-pid\d+/;
+
 /**
- * Retain the `keep` newest completed snapshots and delete every older one.
+ * Recover the capture time from the filename, or null if it was not written by
+ * `snapshotBasename`.
  *
- * Also deletes *every* `.partial` file unconditionally. A partial only exists
- * because a previous snapshot did not return — and this worker's failure mode is
- * an abrupt SIGABRT on heap exhaustion, so an abandoned multi-gigabyte partial is
- * the expected leftover rather than a hypothetical one. They are never renamed in
- * after the fact, so there is nothing to preserve.
- *
- * Returns the basenames removed.
+ * Preferred over `mtime` for retention ordering because retrieval is documented
+ * as copying these off the shared volume, and copy tooling rewrites mtimes —
+ * which would make the ordering input mutable by the consumer, and could retire
+ * the *newer* snapshot of a pair. The embedded stamp is not mutable that way.
  */
-export function pruneHeapSnapshots(dir: string, keep: number): string[] {
+function snapshotStampMs(name: string): number | null {
+  const match = SNAPSHOT_NAME_PATTERN.exec(name);
+  if (match === null) return null;
+  const [, date, hh, mm, ss, ms] = match;
+  const parsed = Date.parse(`${date}T${hh}:${mm}:${ss}.${ms}Z`);
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+interface PrunableEntry {
+  name: string;
+  sizeBytes: number;
+}
+
+/**
+ * The entries `pruneHeapSnapshots(dir, keep)` would delete, newest retained.
+ *
+ * Split out from the deletion so the free-space precondition can price a prune
+ * without committing to it.
+ */
+function collectPrunable(dir: string, keep: number): PrunableEntry[] {
   if (!existsSync(dir)) return [];
   const retain = Math.max(0, keep);
   const entries = readdirSync(dir);
-  const removed: string[] = [];
+  const prunable: PrunableEntry[] = [];
+  const nowMs = Date.now();
 
   for (const name of entries) {
     if (!isPartialSnapshot(name)) continue;
     try {
-      unlinkSync(path.join(dir, name));
-      removed.push(name);
+      const stats = statSync(path.join(dir, name));
+      if (nowMs - stats.mtimeMs < PARTIAL_ABANDONED_AFTER_MS) continue;
+      prunable.push({ name, sizeBytes: stats.size });
     } catch {
-      // A concurrent prune or an in-flight write owns it; leave it.
+      // Vanished under us, or unreadable; nothing to reclaim either way.
     }
   }
 
   const completed = entries
     .filter(isCompletedSnapshot)
     .map((name) => {
-      const filePath = path.join(dir, name);
       try {
-        return { name, mtimeMs: statSync(filePath).mtimeMs };
+        const stats = statSync(path.join(dir, name));
+        return { name, sizeBytes: stats.size, sortKey: snapshotStampMs(name) ?? stats.mtimeMs };
       } catch {
         return null;
       }
     })
-    .filter((entry): entry is { name: string; mtimeMs: number } => entry !== null)
-    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+    .filter((entry): entry is { name: string; sizeBytes: number; sortKey: number } => entry !== null)
+    .sort((a, b) => b.sortKey - a.sortKey);
 
   for (const entry of completed.slice(retain)) {
+    prunable.push({ name: entry.name, sizeBytes: entry.sizeBytes });
+  }
+
+  return prunable;
+}
+
+/**
+ * Bytes a `pruneHeapSnapshots(dir, keep)` would release right now.
+ *
+ * Exported for the free-space precondition in `takeHeapSnapshot`, which must do
+ * this arithmetic *before* deleting anything.
+ */
+export function reclaimableHeapSnapshotBytes(dir: string, keep: number): number {
+  return collectPrunable(dir, keep).reduce((sum, entry) => sum + entry.sizeBytes, 0);
+}
+
+/**
+ * Retain the `keep` newest completed snapshots and delete every older one.
+ *
+ * Also deletes abandoned `.partial` files regardless of the cap. A partial only
+ * exists because a previous snapshot did not return — and this worker's failure
+ * mode is an abrupt SIGABRT on heap exhaustion, so an abandoned multi-gigabyte
+ * partial is the expected leftover rather than a hypothetical one. They are
+ * never renamed in after the fact, so there is nothing to preserve. See
+ * `PARTIAL_ABANDONED_AFTER_MS` for why "abandoned" is timed rather than assumed.
+ *
+ * Returns the basenames removed.
+ */
+export function pruneHeapSnapshots(dir: string, keep: number): string[] {
+  const removed: string[] = [];
+
+  for (const entry of collectPrunable(dir, keep)) {
     try {
       unlinkSync(path.join(dir, entry.name));
       removed.push(entry.name);
     } catch {
-      // Best effort: a failed prune must never block the snapshot itself.
+      // Best effort: a concurrent prune owns it, or a failed unlink must never
+      // block the snapshot itself.
     }
   }
 
@@ -187,7 +272,13 @@ function snapshotBasename(now: Date): string {
  * Write one heap snapshot, pruning before and after.
  *
  * Pruning *before* is what makes the retention cap useful under pressure: the
- * space the previous snapshot occupies is exactly the space this one needs.
+ * space the previous snapshot occupies is exactly the space this one needs. But
+ * the prune is priced before it is spent, because the free-space refusal below
+ * is unrecoverable in a way an ordinary failure is not — a snapshot names a
+ * *past* heap state, so a deleted one cannot be retaken, and the deliverable on
+ * PEN-3314 is a pair hours apart that a single refusal would reduce to one with
+ * no diff. Refusing without pruning costs nothing: the test already credits the
+ * prune's bytes, so if it refuses, deleting them would not have been enough.
  */
 export function takeHeapSnapshot(
   config: HeapSnapshotConfig,
@@ -196,15 +287,16 @@ export function takeHeapSnapshot(
 ): HeapSnapshotResult | HeapSnapshotSkipped {
   mkdirSync(config.dir, { recursive: true });
 
-  // Prune first so the outgoing generation's bytes count as available headroom.
-  const prunedBefore = pruneHeapSnapshots(config.dir, Math.max(0, config.keep - 1));
-
+  const pruneToBeforeWrite = Math.max(0, config.keep - 1);
   const heapUsedBytes = runtime.heapUsedBytes();
   const requiredBytes = config.minFreeBytes + heapUsedBytes * SIZE_ESTIMATE_MULTIPLIER;
   const freeBytes = runtime.freeBytes(config.dir);
-  if (freeBytes < requiredBytes) {
-    return { skipped: "insufficient-free-space", freeBytes, requiredBytes };
+  const reclaimableBytes = reclaimableHeapSnapshotBytes(config.dir, pruneToBeforeWrite);
+  if (freeBytes + reclaimableBytes < requiredBytes) {
+    return { skipped: "insufficient-free-space", freeBytes, requiredBytes, reclaimableBytes };
   }
+
+  const prunedBefore = pruneHeapSnapshots(config.dir, pruneToBeforeWrite);
 
   const now = runtime.now();
   const finalPath = path.join(config.dir, snapshotBasename(now));
@@ -255,11 +347,13 @@ export interface HeapSnapshotDecision {
  * request is honoured exactly once. Deleting afterwards would retry a failing
  * snapshot on every poll for as long as the condition persisted — and the
  * conditions that make a snapshot fail (a full volume, a dying heap) are exactly
- * the ones that persist.
+ * the ones that persist. A sentinel declined by the rate limit is consumed for
+ * the same reason: honoured-exactly-once has to hold whether or not the request
+ * produced a snapshot, or a backlog of touches would drain one per poll.
  */
 export function decideHeapSnapshot(
   config: HeapSnapshotConfig,
-  state: { lastAutoSnapshotAtMs: number | null },
+  state: { lastAutoSnapshotAtMs: number | null; lastSentinelSnapshotAtMs: number | null },
   runtime: HeapSnapshotRuntime = defaultHeapSnapshotRuntime,
 ): HeapSnapshotDecision {
   const sentinelPath = path.join(config.dir, HEAP_SNAPSHOT_SENTINEL_BASENAME);
@@ -270,6 +364,15 @@ export function decideHeapSnapshot(
       // Another replica consumed it, or it is unwritable. Either way, do not
       // snapshot on a sentinel we could not claim.
       return { trigger: null, sentinelConsumed: false };
+    }
+    const lastSentinelAt = state.lastSentinelSnapshotAtMs;
+    if (
+      lastSentinelAt !== null &&
+      runtime.now().getTime() - lastSentinelAt < config.sentinelMinIntervalMs
+    ) {
+      // Claimed but declined: the pause this would cost is the thing being
+      // rationed, and the sentinel is writable from every pod on the claim.
+      return { trigger: null, sentinelConsumed: true };
     }
     return { trigger: "sentinel", sentinelConsumed: true };
   }
