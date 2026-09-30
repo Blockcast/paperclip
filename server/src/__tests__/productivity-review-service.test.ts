@@ -2966,6 +2966,39 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("Primary trigger: `high_churn`");
   });
 
+  // BLO-37265. Pins the `status = 'cancelled'` arm of `notPreDispatchCancelledSql`,
+  // which the comment beside it calls load-bearing. Neither control above kills a
+  // mutation that deletes it: both seed `errorCode: null`, so the `isNull(errorCode)`
+  // arm carries them either way. This cell is the only one where that arm cannot —
+  // a live `scheduled_retry` row carrying a pre-dispatch `errorCode`, which is
+  // exactly what `enqueueWakeup` (heartbeat.ts) writes when the provider-capacity
+  // gate parks a wake, except that its `rate_limit_exhausted` is not yet in
+  // PRE_DISPATCH_CANCELLED_RUN_ERROR_CODES. Drop `ne(status, "cancelled")` and these
+  // 15 parked-but-live runs stop counting, the window falls to 15 against a bar of
+  // 30, and `high_churn` silently stops firing.
+  it("still generates a high-churn review when half the window is parked scheduled_retry runs carrying a pre-dispatch errorCode (BLO-37265)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await churnExecutedRuns(seeded, now);
+    await churnSecondHalf(seeded, now, {
+      status: "scheduled_retry",
+      errorCode: "issue_dependencies_blocked",
+      startedAt: null,
+      finishedAt: null,
+      livenessState: null,
+      usageJson: null,
+      logStore: null,
+      logBytes: 0,
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `high_churn`");
+  });
+
   // BLO-22887 AC2: the two cells above are the "still warranted on other
   // grounds" case — BLO-22436 suppresses a dependency-blocked source whose
   // fired set is entirely closable, so *every* blocked source that reaches the
