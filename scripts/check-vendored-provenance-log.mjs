@@ -28,6 +28,21 @@ import { fileURLToPath } from "node:url";
 export const VENDOR_DIR = "vendor/paperclip-adapter-claude-k8s";
 export const LOG = `${VENDOR_DIR}/PROVENANCE-CHANGES.md`;
 
+// BLO-34872 round 2. `merge=union` on LOG fixes a *local* `git rebase` and does
+// nothing on GitHub: GitHub's server-side merge ignores .gitattributes merge
+// drivers, and it is what computes both `mergeable` and the merge-queue rebase.
+// Measured 2026-09-30 against master `0bb33a1a7` -- #2070 and #1459 were both
+// ejected from the queue with `merge_conflict` within 3 minutes of #1898
+// landing, the conflict in LOG and nothing else, while `git merge-tree` with
+// the repo's own attributes resolved both cleanly. The attribute was worse than
+// inert: it drew rows into the one file that conflicts.
+//
+// So the unit of record is now one file per change. Two distinct new files
+// never conflict under any merge implementation, GitHub's included -- no driver
+// required. LOG is frozen, not migrated: rewriting it would itself conflict
+// with every in-flight PR that has already appended to it.
+export const LOG_DIR = `${VENDOR_DIR}/PROVENANCE-CHANGES.d`;
+
 // Blockcast additions, not vendored source. Changing one of these alone is not a
 // vendored change and needs no log row.
 //
@@ -37,8 +52,13 @@ export const LOG = `${VENDOR_DIR}/PROVENANCE-CHANGES.md`;
 // a guard's clothes. Measured: removing it leaves the suite green.
 export const NOT_SOURCE = [`${VENDOR_DIR}/LICENSE`, `${VENDOR_DIR}/PROVENANCE.md`];
 
+/** An entry file under LOG_DIR. README.md documents the directory, it is not an entry. */
+export function isEntryPath(path) {
+  return path.startsWith(`${LOG_DIR}/`) && path.endsWith(".md") && !path.endsWith("/README.md");
+}
+
 /**
- * @returns {{ok: true} | {ok: false, reason: string, detail: string[]}}
+ * @returns {{ok: true, warning?: string} | {ok: false, reason: string, detail: string[]}}
  */
 export function checkVendoredProvenanceLog({ base, head = "HEAD", cwd }) {
   const git = (...args) => execFileSync("git", args, { encoding: "utf8", cwd });
@@ -86,9 +106,18 @@ export function checkVendoredProvenanceLog({ base, head = "HEAD", cwd }) {
   const changed = git("diff", "--name-only", range, "--", VENDOR_DIR)
     .split("\n")
     .filter(Boolean)
-    .filter((p) => !NOT_SOURCE.includes(p));
+    .filter((p) => !NOT_SOURCE.includes(p) && !p.startsWith(`${LOG_DIR}/`));
 
   if (changed.length === 0) return { ok: true };
+
+  // The current unit of record: a file this change ADDS under LOG_DIR. Added,
+  // not modified, because that is the property that makes it conflict-free --
+  // two PRs adding distinct paths merge cleanly everywhere, two PRs editing one
+  // path do not. It also keeps README.md and any earlier entry from satisfying
+  // the guard for a later change.
+  const addedEntries = git("diff", "--name-only", "--diff-filter=A", range, "--", LOG_DIR)
+    .split("\n")
+    .filter(isEntryPath);
 
   // Count added *rows*, not added lines: a bare `added > 0` is satisfied by a
   // blank line, so the cheapest way to silence the guard would be to add
@@ -99,15 +128,30 @@ export function checkVendoredProvenanceLog({ base, head = "HEAD", cwd }) {
     .split("\n")
     .filter((line) => /^\+\s*\|/.test(line));
 
-  if (addedRows.length < 1) {
+  if (addedEntries.length < 1 && addedRows.length < 1) {
     return {
       ok: false,
-      reason: `Vendored source changed but ${LOG} gained no row.`,
+      reason: `Vendored source changed but ${LOG_DIR}/ gained no entry.`,
       detail: [
-        "Append one row describing the change, so the recorded provenance does",
-        "not silently drift from what is actually in the tree. Changed files:",
+        `Add one file, '${LOG_DIR}/<issue-or-pr>.md', describing the change, so`,
+        "the recorded provenance does not silently drift from what is actually",
+        `in the tree. See ${LOG_DIR}/README.md. Changed files:`,
         ...changed.map((p) => `  ${p}`),
       ],
+    };
+  }
+
+  // A legacy row still satisfies the guard so that PRs already in the queue do
+  // not all have to be rewritten -- but say so, because appending there is what
+  // reproduces the conflict this directory exists to remove.
+  //
+  // Not when the log is the only thing that changed: there is no vendored
+  // source being recorded, so there is nothing to redirect.
+  const logOnly = changed.length === 1 && changed[0] === LOG;
+  if (addedEntries.length < 1 && !logOnly) {
+    return {
+      ok: true,
+      warning: `${LOG} is frozen: this change appends a row to it instead of adding ${LOG_DIR}/<issue-or-pr>.md. Accepted, but concurrent appends to that one file conflict on GitHub and get ejected from the merge queue.`,
     };
   }
 
@@ -135,5 +179,6 @@ if (isMainModule()) {
     for (const line of result.detail) console.error(line);
     process.exit(1);
   }
-  console.log(`${LOG}: ok`);
+  if (result.warning) console.log(`::warning::${result.warning}`);
+  console.log(`${LOG_DIR}: ok`);
 }

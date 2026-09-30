@@ -1,20 +1,23 @@
-# BLO-34872: the vendored adapter's per-patch log is append-only, so every PR
-# touching that tree used to conflict with every other one on it — 4 rebases on
-# PR #1873 alone, PROVENANCE.md the only conflicting file each time. Union merge
-# keeps both sides' appended rows instead.
+# BLO-34872. The vendored adapter's per-patch log used to be one append-only
+# table, so every PR touching that tree conflicted with every other one on it.
+# The fix that works is one file per change in
+# `vendor/paperclip-adapter-claude-k8s/PROVENANCE-CHANGES.d/` — two distinct new
+# files never conflict under any merge implementation, no driver required.
 #
-# Scoped to this one file deliberately, and it must stay scoped. A union merge
-# is only safe on an append-only list of independent rows: it resolves by
-# keeping both sides' added lines, so it cannot reconcile an interior edit and
-# cannot choose between two values of a field that has only one. PROVENANCE.md
-# is prose and single-valued tables, so union-merging it would interleave both
-# sides' text rather than merge it.
+# ⚠ The `merge=union` line below was the FIRST attempt and it does not fix the
+# real failure. GitHub's server-side merge ignores .gitattributes merge drivers,
+# and that is what computes a PR's `mergeable` state and the merge-queue rebase.
+# Measured 2026-09-30 against master `0bb33a1a7`: #2070 and #1459 were ejected
+# with `merge_conflict` minutes after #1898 landed a row, while `git merge-tree`
+# with these attributes resolved both cleanly. #1699 was ejected three times on
+# it after its author had moved its row here *because* of this attribute.
 #
-# That is also why nothing single-valued may move *into* this file. BLO-35109
-# deleted the 64-hex integrity hash that used to live in PROVENANCE.md for
-# exactly this reason: under a union both candidates survive, and CI's
-# `grep … | head -1` would then resolve the provenance verdict by sort order
-# rather than by the tree. `provenance-union-merge.test.mjs` asserts both
-# halves -- that this file is union-merged, that PROVENANCE.md is not, and that
-# neither carries a 64-hex line.
+# It is kept, not removed: PROVENANCE-CHANGES.md is frozen but still carries
+# rows from in-flight PRs, and union still makes a *local* `git rebase` of those
+# resolve cleanly. Do not read it as protection. Do not move anything else here:
+# a union keeps both sides' added lines, so it cannot reconcile an interior edit
+# and cannot choose between two values of a single-valued field — which is why
+# BLO-35109 deleted the 64-hex integrity hash rather than relocating it.
+# `provenance-union-merge.test.mjs` pins all of this, including a
+# driver-disabled merge that reproduces GitHub's behaviour.
 vendor/paperclip-adapter-claude-k8s/PROVENANCE-CHANGES.md merge=union
