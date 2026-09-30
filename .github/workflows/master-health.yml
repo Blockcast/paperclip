@@ -208,6 +208,16 @@ jobs:
     # Honouring it here would skip every scheduled run and report green -- the
     # exact false green (run 36648202266) that let BLO-38228 sit undetected for
     # 63h. This is the load-bearing half of that fix, not a detail.
+    #
+    # ⚠ DELETING THE `schedule` CLAUSE BELOW IS INVISIBLE AT RUNTIME. The
+    # scheduled run still fires, `gate` still sets pretested=1, this matrix is
+    # SKIPPED -- and a skipped job still concludes `success`, so the liveness
+    # guard sees a fresh completed `schedule` run and reports ok forever. The
+    # cron half of this fix fails loudly (no completion -> red in 48h); this half
+    # fails silently. It is held instead by a source-text invariant in
+    # `scripts/check-scheduled-guard-liveness.test.mjs` ("keeps the schedule
+    # bypass on every pretested gate in a watched guard"), which carries its own
+    # vacuity control. Deleting the clause fails that test.
     if: ${{ !cancelled() && (needs.gate.outputs.pretested != '1' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
     runs-on: arc-paperclip-general
     timeout-minutes: 90

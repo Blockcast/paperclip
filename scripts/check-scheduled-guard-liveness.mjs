@@ -650,10 +650,17 @@ export function completedRunsPath(repo, workflow, event) {
   return event ? `${base}&event=${encodeURIComponent(event)}` : base;
 }
 
-function observeWorkflow(repo, workflow, event) {
+/**
+ * `read` is injectable for exactly one reason: without it this function reaches
+ * `gh` directly, so the `event` argument had no observable effect and dropping
+ * it from the adapter in `makeGuardReaders` was a mutation no test could see.
+ * `crossCheckCompletions` already took `read` and its `event` leg was guarded;
+ * this leg was not, which is the asymmetry rather than a style difference.
+ */
+export function observeWorkflow(repo, workflow, read = gh, event = undefined) {
   let meta;
   try {
-    meta = JSON.parse(gh(["api", `repos/${repo}/actions/workflows/${workflow}`]));
+    meta = JSON.parse(read(["api", `repos/${repo}/actions/workflows/${workflow}`]));
   } catch {
     return { error: "unreadable" };
   }
@@ -700,7 +707,7 @@ function observeWorkflow(repo, workflow, event) {
     // see, disagree with itself on every poll, and suppress the alarm forever.
     // An always-muted guard is the failure mode both of these mechanisms exist
     // to prevent.
-    const raw = gh(["api", completedRunsPath(repo, workflow, event)]);
+    const raw = read(["api", completedRunsPath(repo, workflow, event)]);
     const run = JSON.parse(raw).workflow_runs?.[0];
     if (!run) return { state: meta.state, name: meta.name, newest: null };
 
@@ -822,8 +829,9 @@ export function crossCheckCompletions(repo, workflow, read = gh, event = undefin
  * `graceUntil` handed to `observeWorkflow()`, `classifyGuard()` and the
  * cross-check — and while it lived inline in `main()` it was the last unguarded
  * link in the chain: dropping any of those fields left the whole suite green,
- * because `main()` is never invoked by a test and `observeWorkflow` is not
- * exported (BLO-38228).
+ * because `main()` is never invoked by a test and `observeWorkflow` was not
+ * exported (BLO-38228). `observeWorkflow` now takes an injectable `read` and is
+ * exported, so its own `event` leg is held directly too.
  *
  * `observe` and `crossCheck` are injected for exactly that reason: the join is
  * then testable without a network call, so every field is held by a behavioural
@@ -874,14 +882,18 @@ export function classifyWatched(watched, observe, crossCheck, { now, overrideHou
  * behaviourally right up to the line that assembles it. Here it is one exported
  * call away from a test.
  *
- * `read` is threaded to `crossCheckCompletions` so the cross-check's real URL
- * is observable without a network call. `observeWorkflow` stays unexported and
- * so stays unobservable this way; its `event` leg is held by `classifyWatched`'s
- * injected-observer test instead.
+ * `read` is threaded to BOTH legs so each one's real URL is observable without
+ * a network call. It used to reach only `crossCheckCompletions`; `observeWorkflow`
+ * called `gh` directly, so dropping `event` from the observe closure below was a
+ * mutation the suite could not see. The docstring here previously claimed that
+ * leg was "held by `classifyWatched`'s injected-observer test instead" — that was
+ * wrong and measured wrong: that test injects a FAKE observer, so it pins
+ * `classifyWatched`'s call, never the adapter that forwards into the real
+ * `observeWorkflow`. Both legs now have a failing mutation.
  */
 export function makeGuardReaders(repo, read = gh) {
   return {
-    observe: (workflow, event) => observeWorkflow(repo, workflow, event),
+    observe: (workflow, event) => observeWorkflow(repo, workflow, read, event),
     crossCheck: (workflow, event) => crossCheckCompletions(repo, workflow, read, event),
   };
 }
