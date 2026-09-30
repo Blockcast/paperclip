@@ -85,9 +85,32 @@ rules:
   # patch would leave stale keys from the prior attempt and drop that guard.
   # Granting `update` beside the `create`+`delete` already held is not a
   # privilege increase — the same end state is reachable by delete-then-create.
+  #
+  # `list` (BLO-21857) — required by the orphan-Secret sweep in
+  # vendor/paperclip-adapter-claude-k8s/src/server/secret-sweep.ts, whose first
+  # call is listNamespacedSecret with a label selector. Unlike `update`, this IS
+  # a real widening — but a narrower one than an earlier revision of this
+  # comment claimed. It said the SA could now read every Secret's values
+  # "rather than only those it can name for a `get`", implying `get` was
+  # name-restricted. It is not: this file carries ZERO `resourceNames` clauses,
+  # so the SA could already read any Secret in this namespace whose name it
+  # could produce. What `list` adds is ENUMERATION of names it could not have
+  # guessed, plus bulk retrieval of `data` in one call instead of N. Still a
+  # genuine widening; just a smaller delta, and the precision matters because
+  # an auditor lands on this comment first and can check `get` in one grep.
+  # The sweep reads nothing but `metadata` — the verb does not know that, and
+  # the grant is what gets audited, not the caller. Approved as written in
+  # BLO-36688: `list` on secrets, namespaced Role only. NOT `watch`, NOT
+  # `deletecollection`, and NOT the ClusterRole — each of those is a fresh ask.
+  #
+  # Without it the sweep 403s on its first call, createSweepGate swallows that
+  # as non-fatal, and the feature is inert in a way no dashboard can show: a
+  # sweep that 403s and a sweep that finds zero orphans look identical. Same
+  # class as the pods:delete case recorded above, which 403'd in prod until the
+  # grant landed.
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["create", "delete", "get", "patch", "update"]
+    verbs: ["create", "delete", "get", "list", "patch", "update"]
   # PVCs — adapter looks up the shared PVC claim name (paperclip-data) to mount
   # at /paperclip in agent Job pods. opencode-k8s additionally creates/deletes
   # per-agent PVCs by default — `agentDbMode` defaults to `dedicated_pvc`
