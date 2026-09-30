@@ -8776,6 +8776,16 @@ export function recoveryService(
       // dominates, and those two numbers separate those cases. `slowest` then names
       // the tail's issue ids. Check `completed` before comparing across passes.
       //
+      // `completed` is the boolean; `candidatesScanned - candidates.count` is the
+      // sharper form of the same signal. Every candidate enters a `candidate()`
+      // span unconditionally and that span pushes its duration from a `finally`,
+      // so a candidate that THROWS is still counted — on a pass that ran the loop
+      // to the end the two are necessarily EQUAL. A non-zero difference is
+      // therefore an exact count of candidates the pass never reached, not an
+      // accounting discrepancy to go chasing. Note the one case where they differ
+      // without truncation: `candidatesScanned` is `null` when the pass died in
+      // `candidateQuery`, before it had a population at all.
+      //
       // Wrapped in its own try/catch because a `finally` that throws during unwind
       // REPLACES the pass's real error. Diagnostics must never mask the fault they
       // exist to explain. The catch is deliberately BARE: the summary is plain numbers

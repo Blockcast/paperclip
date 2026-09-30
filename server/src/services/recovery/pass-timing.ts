@@ -129,6 +129,20 @@ export type PassTimingSummary = {
    * exceed `elapsedMs`. Read a phase as "how much of the pass was spent inside
    * this call", never as a slice of a pie — the most-expensive-first ordering
    * otherwise invites exactly that misreading.
+   *
+   * ⚠ That ordering is carried by INSERTION ORDER into a plain object, which JS
+   * guarantees only for non-integer-like keys: an own property whose name is a
+   * canonical array index ("0", "1", "2", ...) is enumerated first, in ascending
+   * numeric order, regardless of when it was inserted. So a phase named `"1"`
+   * would silently sort itself to the front no matter how cheap it was, and the
+   * log line would look exactly like a correct one — the operator reading the
+   * first key would simply be reading the wrong phase. Every name in use is
+   * dotted or alphabetic (`candidateQuery`, `prologue.*`, `escalate.*`,
+   * `orphanBlockerSweep`), so this is latent rather than live. Keep it that way:
+   * PHASE NAMES MUST NOT BE INTEGER-LIKE. The alternative — returning an array
+   * of `{ phase, ...stat }` — is ordering-safe but costs the log line its
+   * addressability (`phases.escalate.lockCompanyIssueGraph.totalMs` stops being
+   * a queryable path), which is the property this instrumentation is read by.
    */
   phases: Record<string, PhaseStat>;
   /**
@@ -241,6 +255,8 @@ export function createPassTimer(opts?: { slowestTracked?: number; now?: () => nu
     const sorted = [...candidateDurations].sort((a, b) => a - b);
     const totalMs = candidateDurations.reduce((acc, ms) => acc + ms, 0);
     const orderedPhases: Record<string, PhaseStat> = {};
+    // Most-expensive-first, and the ordering survives into the emitted object only
+    // because no phase name is integer-like — see `PassTimingSummary.phases`.
     for (const [name, stat] of [...phases.entries()].sort((a, b) => b[1].totalMs - a[1].totalMs)) {
       orderedPhases[name] = {
         totalMs: Math.round(stat.totalMs),
