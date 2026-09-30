@@ -30,11 +30,11 @@ function isVulnerableBraceExpansionVersion(version) {
     isBetweenInclusive(version, [2, 0, 0], [2, 1, 3]) ||
     isBetweenInclusive(version, [3, 0, 0], [3, 0, 5]) ||
     major === 4 ||
-    (major === 5 && minor === 0 && patch <= 8)
+    (major === 5 && minor === 0 && patch <= 9)
   );
 }
 
-test("brace-expansion resolves at the GHSA-rgw5-rvv9-x895 patched floor", async () => {
+test("brace-expansion resolves above the GHSA-rgw5-rvv9-x895 and GHSA-6j4f-fj2g-mc7p patched floors", async () => {
   const tmpRoot = await mkdtemp(join(tmpdir(), "paperclip-brace-expansion-"));
   const fixtureRoot = join(tmpRoot, "repo");
 
@@ -60,20 +60,20 @@ test("brace-expansion resolves at the GHSA-rgw5-rvv9-x895 patched floor", async 
     );
     const lockfile = await readFile(join(fixtureRoot, "pnpm-lock.yaml"), "utf8");
 
-    assert.equal(packageJson.pnpm.overrides["brace-expansion"], "5.0.9");
+    assert.equal(packageJson.pnpm.overrides["brace-expansion"], "5.0.12");
     assert.equal(
-      packageJson.pnpm.patchedDependencies["brace-expansion@5.0.9"],
-      "patches/brace-expansion@5.0.9.patch",
+      packageJson.pnpm.patchedDependencies["brace-expansion@5.0.12"],
+      "patches/brace-expansion@5.0.12.patch",
     );
     assert.match(
       lockfile,
-      /^  brace-expansion@5\.0\.9:\n    resolution: \{integrity: .+\}$/m,
+      /^  brace-expansion@5\.0\.12:\n    resolution: \{integrity: .+\}$/m,
     );
     assert.match(
       lockfile,
-      /^  brace-expansion@5\.0\.9:\n    hash: \S+\n    path: patches\/brace-expansion@5\.0\.9\.patch$/m,
+      /^  brace-expansion@5\.0\.12:\n    hash: \S+\n    path: patches\/brace-expansion@5\.0\.12\.patch$/m,
     );
-    assert.match(lockfile, /^  brace-expansion@5\.0\.9\(patch_hash=[^)]+\):$/m);
+    assert.match(lockfile, /^  brace-expansion@5\.0\.12\(patch_hash=[^)]+\):$/m);
 
     const vulnerableVersions = Array.from(
       lockfile.matchAll(/^  brace-expansion@(\d+)\.(\d+)\.(\d+)(?=[:(])/gm),
