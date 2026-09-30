@@ -94,13 +94,7 @@ export interface AlertmanagerPluginConfig {
    * Per-instance owner map. e.g. `{ team: { platform: "alice@blockcast.net" }}`.
    */
   ownerMap?: OwnerMap;
-  /**
-   * Exact agent name assigned when neither owner resolution nor an issue route
-   * produces an assignee. Required in practice: an instance whose
-   * `fallbackAgentName` is missing, unmatched, or ambiguous fails closed and
-   * creates no issue, because an ownerless alert issue is never actioned and
-   * auto-cancels unattended (BLO-27435 / BLO-27436 / BLO-27438).
-   */
+  /** Exact named agent used when owner and issue-route resolution produce no assignee. */
   fallbackAgentName?: string;
   /**
    * Per-instance issue route map. Matches alert labels and applies project,
@@ -187,6 +181,12 @@ export interface AlertmanagerWebhookPayload {
 export interface AlertStateRecord {
   paperclipIssueId: string;
   paperclipCompanyId: string;
+  /**
+   * Aggregate identity captured when this fingerprint first fired. Routing
+   * annotations are mutable, so resolution must not recompute this from a
+   * later payload and accidentally act on a different aggregate.
+   */
+  aggregateKey?: string;
   assigneeUserId: string | null;
   /**
    * Set when ownerMap routes to an agent via the `agent:<id>` value syntax.
@@ -199,9 +199,31 @@ export interface AlertStateRecord {
   lastFiredAt: string;
   resolvedAt: string | null;
   /**
+   * When the plugin itself last closed this issue — i.e. a resolve delivery's
+   * `status: "cancelled"` patch actually landed (BLO-31736).
+   *
+   * This is the authorship record that `resolvedAt` was previously (and
+   * wrongly) read as. `resolvedAt` says only "the alert cleared", which is
+   * also true when the plugin's terminal guard *declined* to close an issue an
+   * agent had already closed by hand — so keying the re-fire decision on it
+   * resurrected agent-authored `done` rows one cycle later and made
+   * BLO-24234's operator suppression unreachable for any alert that had ever
+   * resolved.
+   *
+   * `null` means the last terminal transition we know about was NOT the
+   * plugin's, so an operator close stands. `undefined` means authorship is
+   * genuinely unknown: the row predates this field, or it is a member of an
+   * aggregate whose close this member deferred to a sibling (only the last
+   * member to resolve lands the shared issue's cancel, and it cannot reach
+   * back to this row). See `closedByPlugin` in webhook-handler.ts for how
+   * that is resolved without muting live alerts.
+   */
+  pluginClosedAt?: string | null;
+  /**
    * When the plugin FIRST saw this fingerprint re-fire against an issue that
-   * an operator (not the plugin) had closed — i.e. terminal status with no
-   * `resolvedAt` (BLO-24234). Anchors the `operatorSuppressionHours` window.
+   * an operator (not the plugin) had closed — i.e. terminal status that
+   * `closedByPlugin` does not attribute to the plugin (BLO-24234, BLO-31736).
+   * Anchors the `operatorSuppressionHours` window.
    *
    * Cleared whenever the issue is observed open again, so a close/re-open
    * cycle restarts the window rather than carrying a stale anchor forward.
@@ -218,6 +240,17 @@ export interface AlertStateRecord {
    * recomputable in the sweep because alert labels are not persisted.
    */
   escalationIntervalMs?: number | null;
+  /**
+   * BLO-29908: set when a resolve arrived while a run held the issue's
+   * execution lock, so the auto-cancel was withheld rather than evicting that
+   * run. Names the holding run; null once a resolve cancels cleanly.
+   *
+   * Diagnostic, not control state — nothing reconciles off it. It exists so
+   * that "this row is open even though its alert cleared" is answerable from
+   * the state row instead of only from the issue thread.
+   */
+  cancelWithheldForRunId?: string | null;
+  cancelWithheldAt?: string | null;
 }
 
 /**

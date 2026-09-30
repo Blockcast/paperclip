@@ -70,7 +70,7 @@ describeEmbeddedPostgres("heartbeat worktree suppression", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("heartbeat-worktree-suppression-");
     db = createDb(tempDb.connectionString);
-  }, 60_000);
+  });
 
   afterEach(async () => {
     const servicesToDrain = [...heartbeatServices];
@@ -86,7 +86,7 @@ describeEmbeddedPostgres("heartbeat worktree suppression", () => {
 
   afterAll(async () => {
     await tempDb?.cleanup();
-  }, 60_000);
+  });
 
   async function insertAgentAndIssue() {
     const companyId = randomUUID();

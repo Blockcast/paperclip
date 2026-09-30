@@ -111,25 +111,124 @@ export function extractReferencedSharedDocPaths(instructionsContents: string): s
   return [...refs].sort((left, right) => left.localeCompare(right));
 }
 
+export function missingSharedDocPlaceholderHeading(relativeDocPath: string): string {
+  return `# Missing Shared Documentation: ${relativeDocPath}`;
+}
+
+/**
+ * Shared docs are commonly curated one or more levels *above* the per-agent instructions
+ * root — e.g. an external bundle at `<company>/agents/<role>/` referencing
+ * `docs/pr-conventions.md`, which lives at `<company>/docs/`. Resolving only against the
+ * instructions root misses every one of them and materializes placeholders instead.
+ *
+ * The upward probe is deliberately not open-ended. Anything it finds is handed to the
+ * agent as instructions, so an unbounded walk from a shallow instructions root would
+ * reach `/tmp/docs` or `/docs` and let a world-writable directory dictate agent
+ * behaviour. Every ancestor probed must therefore stay inside `searchBoundaryPath` — an
+ * admin-controlled root supplied by the caller. With no boundary, only the instructions
+ * root itself is probed, which is exactly the pre-existing behaviour.
+ */
+const SHARED_DOC_ANCESTOR_ROOT_DEPTH = 3;
+
+function isWithin(boundaryPath: string, candidatePath: string): boolean {
+  const relative = path.relative(path.resolve(boundaryPath), path.resolve(candidatePath));
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+export function sharedDocSourceRoots(
+  instructionsRootPath: string,
+  searchBoundaryPath?: string | null,
+): string[] {
+  const roots = [path.resolve(instructionsRootPath)];
+  if (!searchBoundaryPath?.trim()) return roots;
+  // Only walk up from an instructions root that is itself inside the boundary; an
+  // unrelated root (a test temp dir, a hand-configured path elsewhere) gets no ancestors.
+  if (!isWithin(searchBoundaryPath, roots[0]!)) return roots;
+
+  let current = roots[0]!;
+  for (let depth = 0; depth < SHARED_DOC_ANCESTOR_ROOT_DEPTH; depth += 1) {
+    const parent = path.dirname(current);
+    if (parent === current || !isWithin(searchBoundaryPath, parent)) break;
+    roots.push(parent);
+    current = parent;
+  }
+  return roots;
+}
+
+async function resolveSharedDocSourcePath(
+  instructionsRootPath: string,
+  relativeDocPath: string,
+  searchBoundaryPath: string | null | undefined,
+): Promise<string | null> {
+  for (const root of sharedDocSourceRoots(instructionsRootPath, searchBoundaryPath)) {
+    const candidate = resolveSafeRelativePath(root, relativeDocPath);
+    if (candidate && await pathExists(candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
+ * A placeholder we wrote on an earlier run is indistinguishable from a real doc to the
+ * `pathExists` short-circuit below, so without this check a workspace that once missed a
+ * shared doc keeps serving the placeholder forever — even after the source becomes
+ * resolvable. Only our own placeholder heading qualifies; any other existing file is a
+ * workspace doc and is never overwritten.
+ *
+ * The heading is matched as a *complete first line*, not a prefix. The heading embeds the
+ * requested path and carries no terminator of its own, so a prefix test also accepts any
+ * same-line continuation of it — a placeholder for a longer path that shares the prefix
+ * (`…: docs/x.md.bak`), or a genuine doc whose title quotes the heading. Those are
+ * workspace docs, and overwriting one destroys content we never wrote.
+ */
+async function isOwnPlaceholder(targetPath: string, relativeDocPath: string): Promise<boolean> {
+  try {
+    const existing = await fs.readFile(targetPath, "utf8");
+    return existing.split(/\r?\n/, 1)[0] === missingSharedDocPlaceholderHeading(relativeDocPath);
+  } catch {
+    return false;
+  }
+}
+
 export async function ensureReferencedSharedDocsMaterialized(input: {
   cwd: string;
   instructionsRootPath: string;
   instructionsContents: string;
   onLog: AdapterExecutionContext["onLog"];
+  /**
+   * Admin-controlled root the ancestor probe may not leave. Omit to resolve shared docs
+   * against the instructions root only.
+   */
+  sharedDocSearchBoundaryPath?: string | null;
 }) {
   const referencedDocs = extractReferencedSharedDocPaths(input.instructionsContents);
   for (const relativeDocPath of referencedDocs) {
     const targetPath = resolveSafeRelativePath(input.cwd, relativeDocPath);
-    if (!targetPath || await pathExists(targetPath)) continue;
+    if (!targetPath) continue;
 
-    const sourcePath = resolveSafeRelativePath(input.instructionsRootPath, relativeDocPath);
+    const sourcePath = await resolveSharedDocSourcePath(
+      input.instructionsRootPath,
+      relativeDocPath,
+      input.sharedDocSearchBoundaryPath,
+    );
+    if (await pathExists(targetPath)) {
+      // Refresh a stale placeholder only once a real source exists; otherwise leave the
+      // workspace copy — placeholder or genuine doc — exactly as it is.
+      if (!sourcePath || !await isOwnPlaceholder(targetPath, relativeDocPath)) continue;
+      await fs.writeFile(targetPath, await fs.readFile(sourcePath, "utf8"), "utf8");
+      await input.onLog(
+        "stderr",
+        `[paperclip] Replaced stale placeholder for shared doc ${relativeDocPath} with ${sourcePath}\n`,
+      );
+      continue;
+    }
+
     let content: string;
-    if (sourcePath && await pathExists(sourcePath)) {
+    if (sourcePath) {
       content = await fs.readFile(sourcePath, "utf8");
       await input.onLog("stderr", `[paperclip] Materialized shared doc ${relativeDocPath} from ${sourcePath}\n`);
     } else {
       content = [
-        `# Missing Shared Documentation: ${relativeDocPath}`,
+        missingSharedDocPlaceholderHeading(relativeDocPath),
         "",
         "Paperclip materialized this placeholder because AGENTS.md references this shared documentation file, but it was not present in the managed instruction bundle or project workspace.",
         "Continue the run without failing on this missing shared doc, and mention the missing source document in your issue comment if it affects the work.",

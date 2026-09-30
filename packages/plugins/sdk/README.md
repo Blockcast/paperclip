@@ -334,6 +334,7 @@ Declare in `manifest.capabilities`. Grouped by scope:
 | | `issues.checkout` |
 | | `issues.wakeup` |
 | | `issue.comments.create` |
+| | `issue.comments.update` |
 | | `issue.documents.write` |
 | | `issue.relations.write` |
 | | `activity.log.write` |

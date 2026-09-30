@@ -17,7 +17,7 @@
       "id": 1,
       "type": "stat",
       "title": "Unresolved dead-letters",
-      "description": "Restart-safe gauge, recomputed from committed agent_wakeup_requests rows on every wake-dispatch reconcile pass. Non-zero means at least one @ally review request is sitting in the terminal dispatch_failed_exhausted state and will NEVER be retried — the PR has a posted trigger and no review. Steady state is 0. This is the gauge arm of PaperclipGithubReviewRequestDeadLettered.",
+      "description": "Restart-safe gauge, recomputed from committed agent_wakeup_requests rows on every heartbeat scheduler tick, on every replica (BLO-31335 moved it off the wake-dispatch reconcile pass, which only ran on an unsuppressed replica). Replica-invariant, so aggregate with max by (reason) before summing, never a bare sum. Non-zero means at least one @ally review request is sitting in the terminal dispatch_failed_exhausted state and will NEVER be retried — the PR has a posted trigger and no review. Steady state is 0. This is the gauge arm of PaperclipGithubReviewRequestDeadLettered.",
       "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
       "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
       "fieldConfig": {
@@ -47,7 +47,7 @@
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
           "editorMode": "code",
-          "expr": "sum(paperclip_github_review_request_dead_letter_unresolved)",
+          "expr": "sum(max by (reason) (paperclip_github_review_request_dead_letter_unresolved))",
           "legendFormat": "unresolved",
           "range": false,
           "instant": true
@@ -295,6 +295,82 @@
           "editorMode": "code",
           "expr": "sum by (state) (increase(paperclip_github_review_request_delivery_total{service=\"paperclip-workers\"}[$__rate_interval]))",
           "legendFormat": "{{state}}",
+          "range": true,
+          "instant": false
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Reviews actually POSTED by surface — the OUTPUT half (BLO-27608)",
+      "description": "Everything above this row is REQUEST-side and cannot answer 'did a review come out'. During the ~8.6h fleet-wide review blackout on 2026-08-12 (BLO-27123) every panel above read perfectly healthy — received 131 / queued 131 / suppressed 0 — because the runs really were enqueued and dispatched; they died at the model call and produced no artifact. This panel is the signal that was missing. Read it against 'Received (range)': requests arriving with this flat at zero IS the outage, and is what PaperclipGithubReviewOutputDrought pages on. Counts only the configured reviewer identity, so a human review cannot mask an Ally drought. No service selector: this counter comes from the API tier (webhook receiver) while the completion counter beside it comes from the tier that finalizes runs, and the drought question is fleet-wide — unlike the delivery funnel, there is no cross-tier arithmetic here to corrupt.",
+      "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 24 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "auto" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["sum"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+          "editorMode": "code",
+          "expr": "sum by (surface) (increase(paperclip_github_review_posted_total[$__rate_interval]))",
+          "legendFormat": "{{surface}}",
+          "range": true,
+          "instant": false
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Reviewer run verdicts — deliberate skip vs failure (BLO-27608)",
+      "description": "Why the panel to the left is quiet. Publishing nothing is CORRECT for self_review_skipped (Ally declining to review a PR it authored, BLO-9293), already_reviewed, and archived_repo_skipped; a quiet period made of those is healthy. 'missing' is a run that finished and left no review — a real failure. auth_expired is a recoverable fault that is retried. Without this split, intentional-skip volume is indistinguishable from a genuine drought. Note a run that dies at the model call reaches no verdict at all, so a provider outage is silence on BOTH panels — that combination, with requests still arriving, is the outage signature.",
+      "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 24 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "auto" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "missing" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } },
+              { "id": "custom.lineWidth", "value": 3 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "auth_expired" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["sum"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+          "editorMode": "code",
+          "expr": "sum by (status) (increase(paperclip_github_review_completion_total[$__rate_interval]))",
+          "legendFormat": "{{status}}",
           "range": true,
           "instant": false
         }

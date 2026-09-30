@@ -102,6 +102,59 @@ const RUNTIME_CACHE_ENV: Record<string, string> = {
   PLAYWRIGHT_BROWSERS_PATH: `${RUNTIME_CACHE_MOUNT_PATH}/ms-playwright`,
 };
 
+/**
+ * Shared pnpm store for persistent-workspace isolation (BLO-36583).
+ *
+ * Every var in RUNTIME_CACHE_ENV redirects a *cache* directory. pnpm's
+ * content-addressed store is not one: it lives under XDG_DATA_HOME, i.e.
+ * `$HOME/.local/share/pnpm`. So it silently followed `HOME` onto the CephFS PVC
+ * and minted one full store per workspace — measured 2026-09-25 at 259.87 GiB
+ * across 128 stores (96.4% of all per-workspace HOME bytes, against 4.78 GiB of
+ * `.rustup` and 1.75 GiB of `.cargo`). Sampling 8 of those stores found 412,557
+ * objects collapsing to 59,098 unique — 6.98x duplication, with 7 of the 8
+ * holding the same ~58,920 objects — so one shared store serves them all.
+ *
+ * It must stay on the SAME FILESYSTEM as the checkout. pnpm hardlinks store
+ * objects into `node_modules`, and when the configured store is on another
+ * device it silently ignores the configuration and falls back to
+ * `<mount>/.pnpm-store`. Pointing this at the ephemeral runtime-cache while the
+ * workspace lives on the PVC therefore does not work, and would cost the
+ * hardlinks if it did; verified against pnpm 12.6.0 through PNPM_HOME,
+ * XDG_DATA_HOME, npm_config_store_dir, PNPM_STORE_DIR, `.npmrc store-dir` and a
+ * symlink. That fallback is also why a wrong value here degrades safely: the
+ * worst case is a shared store at the mount root, never a per-workspace one.
+ *
+ * Scoped per COMPANY, not fleet-wide. A store is a writable, hardlink-source
+ * directory: an object written by one company's agent gets hardlinked into
+ * another's `node_modules`, so a shared root would erase the tenancy boundary
+ * that `isolationRoot` (`.../k8s-isolation/${companyId}/${agentId}/${key}`)
+ * maintains everywhere else in this file. That is not latent — the isolation
+ * root already holds two live company UUIDs. The dedup cost is ~nil: the 6.98x
+ * duplication measured above is *within* a company, across workspaces
+ * converging on the same dependency set.
+ *
+ * Deliberately NOT derived from the operator-configurable `isolationRoot`. This
+ * must stay on the PVC even when an operator repoints that elsewhere, and the
+ * cross-device fallback below makes the divergence safe rather than broken.
+ *
+ * `PNPM_HOME` is also pnpm's global *bin* directory, so the path is named
+ * `pnpm` (not `pnpm-store`) to match pnpm's own layout: bins land in
+ * `<root>/<companyId>/`, the store in `<root>/<companyId>/store/v11`.
+ *
+ * ponytail: one store shared by all of a company's persistent workspaces.
+ * `pnpm store prune` run from inside one workspace would evict objects the
+ * others still reference (it only sees its own projects); nothing in the fleet
+ * runs it today. If that changes, give each *agent* its own store rather than
+ * each workspace.
+ */
+const SHARED_PNPM_STORE_ROOT = "/paperclip/instances/default/data/k8s-isolation/pnpm";
+
+function sharedPnpmStorePath(rawCompanyId: string): string {
+  const companyId = sanitizeForK8sPath(rawCompanyId);
+  assertSafePathComponent("companyId", companyId);
+  return `${SHARED_PNPM_STORE_ROOT}/${companyId}`;
+}
+
 type IsolationStorage = "ephemeral" | "persistent";
 
 export type JobIsolation = {
@@ -363,6 +416,69 @@ function parseKeyValueConfig(raw: unknown): Record<string, string> {
   return result;
 }
 
+const SUPPORTED_PENSTOCK_PROVIDERS = new Set(["anthropic", "openai"]);
+const PONYTAIL_MODES = new Set(["off", "lite", "full", "ultra"]);
+
+export function validatePenstockProvider(raw: unknown): string {
+  if (typeof raw !== "string") {
+    throw new Error("PENSTOCK_PROVIDER must be anthropic or openai");
+  }
+  const value = raw.trim().toLowerCase();
+  if (!SUPPORTED_PENSTOCK_PROVIDERS.has(value)) {
+    throw new Error("PENSTOCK_PROVIDER must be anthropic or openai");
+  }
+  return value;
+}
+
+/**
+ * Resolve a command that is inserted into the Job shell. The value is an
+ * executable path/name, not a shell fragment: accepting whitespace or shell
+ * syntax here would turn an agent config field into command injection.
+ */
+export function validateAgentCommand(raw: unknown, fallback = "claude"): string {
+  if (raw === undefined || raw === null || raw === "") return fallback;
+  if (typeof raw !== "string") throw new Error("agentCommand must name one executable");
+  const value = raw.trim();
+  if (!value) throw new Error("agentCommand must name one executable");
+  if (!/^[A-Za-z0-9._/-]+$/.test(value)) {
+    throw new Error("agentCommand must name one executable without arguments or shell metacharacters");
+  }
+  return value;
+}
+
+/** Validate a filesystem path used to load a Ponytail plugin. */
+export function validatePonytailPluginPath(raw: unknown): string | null {
+  if (raw === undefined || raw === null || raw === "") return null;
+  if (typeof raw !== "string") throw new Error("ponytailPluginPath must be an absolute path");
+  const value = raw.trim();
+  if (!value || !path.posix.isAbsolute(value) || /[\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error("ponytailPluginPath must be an absolute path without control characters");
+  }
+  return value;
+}
+
+/** Validate the non-secret Ponytail intensity preference. */
+export function validatePonytailDefaultMode(raw: unknown): string | null {
+  if (raw === undefined || raw === null || raw === "") return null;
+  if (typeof raw !== "string") throw new Error("ponytailDefaultMode must be off, lite, full, or ultra");
+  const value = raw.trim().toLowerCase();
+  if (!PONYTAIL_MODES.has(value)) {
+    throw new Error("ponytailDefaultMode must be off, lite, full, or ultra");
+  }
+  return value;
+}
+
+function hasExplicitEnvName(
+  name: string,
+  envConfig: Record<string, unknown>,
+  inheritedEnv: Record<string, string>,
+  inheritedEnvValueFrom: k8s.V1EnvVar[],
+): boolean {
+  return Object.prototype.hasOwnProperty.call(envConfig, name) ||
+    Object.prototype.hasOwnProperty.call(inheritedEnv, name) ||
+    inheritedEnvValueFrom.some((entry) => entry.name === name);
+}
+
 export interface JobBuildInput {
   ctx: AdapterExecutionContext;
   selfPod: SelfPodInfo;
@@ -416,8 +532,323 @@ export interface McpConfigSecret {
  */
 const SENSITIVE_ENV_NAME_RE = /(TOKEN|SECRET|PASSWORD|KEY|CREDENTIAL|AUTH)/i;
 
+export type EnvClassification = "SECRET" | "SAFE_LITERAL";
+
+/** One declared env name (or name family) this file can put on a Job pod. */
+export interface EnvNameClassification {
+  /** Exact env var name, or the family prefix when `prefix` is true. */
+  name: string;
+  /** True when `name` is a prefix covering a family of generated names. */
+  prefix?: boolean;
+  classification: EnvClassification;
+  /**
+   * Why this classification. For SAFE_LITERAL this is the review artifact —
+   * the sentence a future reviewer reads instead of re-deriving whether the
+   * value can carry a credential.
+   */
+  reason: string;
+}
+
+/**
+ * Declarative classification of every env name this adapter's own code can put
+ * on an agent Job pod (BLO-29804, recording the decision on BLO-21858 remedy 2).
+ *
+ * WHY THIS EXISTS. `SENSITIVE_ENV_NAME_RE` is fail-closed against over-matching
+ * but fail-*open* against a credential-carrying variable whose name simply
+ * doesn't match; BLO-21858 is the proof it happens. Pinning names one at a time
+ * only fixes the instances someone notices. This table is the forcing function:
+ * `job-manifest.test.ts` builds manifests across the config permutations and
+ * fails, naming the variable, when an emitted name is absent here. A new env var
+ * therefore reddens CI in the pull request that introduces it, and the author
+ * has to state which class it is rather than inheriting a default.
+ *
+ * The alternative considered and declined was inverting to "everything is
+ * Secret-backed unless declared safe-literal". Measured on live `ac-*` pods
+ * there are 8 secretKeyRef vars against 37-41 non-sensitive literals, so
+ * inversion would move ~40 operationally-load-bearing fields (`HOME`, `TMPDIR`,
+ * `PAPERCLIP_RUN_ID`, the isolation roots) into an opaque Secret and stop
+ * `GET Pod` being a triage tool — a bounded security gain for an unbounded
+ * operability loss. See BLO-29804 for the full reasoning.
+ *
+ * SCOPE — read this before adding an entry. This table covers names *this code*
+ * introduces. Three channels put operator-supplied names on the pod and cannot
+ * be pre-declared, because their names are data rather than code:
+ *
+ *   1. `adapterConfig.env` (layer 4) — arbitrary keys chosen by an operator.
+ *   2. `selfPod.inheritedEnv` — the server Deployment's env, already governed by
+ *      `AGENT_ENV_ALLOWLIST` in `inherit-allowlist.ts`, which is the same
+ *      declare-or-refuse shape applied at that boundary.
+ *   3. `selfPod.inheritedEnvValueFrom` — Deployment `valueFrom` entries, which
+ *      carry no literal value on the pod spec at all.
+ *
+ * The test supplies known values through all three and subtracts exactly those
+ * names, so what remains is code-originated and must appear below.
+ *
+ * NOT a behaviour switch. `isSensitiveEnvName()` keeps its semantics — regex ∪
+ * pinned SECRET names — so which vars are Secret-backed is unchanged by the
+ * table's existence. A `SECRET` entry whose name the regex already matches is a
+ * statement about that name, not a new route.
+ */
+export const ENV_NAME_CLASSIFICATION: readonly EnvNameClassification[] = [
+  // --- SECRET -----------------------------------------------------------
+  {
+    name: "PAPERCLIP_API_KEY",
+    classification: "SECRET",
+    reason: "Run-scoped JWT authenticating agent callbacks to the Paperclip API.",
+  },
+  {
+    name: "ANTHROPIC_CUSTOM_HEADERS",
+    classification: "SECRET",
+    reason:
+      "Arbitrary 'Name: value' lines Claude Code forwards on every Anthropic API call, so it can hold a real Authorization: header; matches none of the regex patterns, hence pinned (BLO-21858).",
+  },
+  {
+    name: "PAPERCLIP_K8S_ISOLATION_KEY",
+    classification: "SECRET",
+    reason:
+      "Not a credential — an isolation-root path segment — but the name contains KEY, so SENSITIVE_ENV_NAME_RE already routes it to a secretKeyRef. Declared SECRET to record today's behaviour truthfully; reclassifying it is a behaviour change and gets its own row (BLO-29804).",
+  },
+
+  // --- SAFE_LITERAL: identity and run context ---------------------------
+  {
+    name: "PAPERCLIP_AGENT_ID",
+    classification: "SAFE_LITERAL",
+    reason: "Opaque agent UUID. Confers nothing without PAPERCLIP_API_KEY, and is already a Job label.",
+  },
+  {
+    name: "PAPERCLIP_COMPANY_ID",
+    classification: "SAFE_LITERAL",
+    reason: "Opaque company UUID; scoping identifier, not an authorization token.",
+  },
+  {
+    name: "PAPERCLIP_API_URL",
+    classification: "SAFE_LITERAL",
+    reason: "In-cluster service URL inherited from the Deployment; an address, not a secret.",
+  },
+  {
+    name: "PAPERCLIP_RUN_ID",
+    classification: "SAFE_LITERAL",
+    reason: "Opaque run UUID. Load-bearing for triage — it is how an SRE ties a wedged pod to its run.",
+  },
+  {
+    name: "PAPERCLIP_TASK_ID",
+    classification: "SAFE_LITERAL",
+    reason: "Issue UUID the run was woken for; readable by anyone who can read the board.",
+  },
+  {
+    name: "PAPERCLIP_LINKED_ISSUE_IDS",
+    classification: "SAFE_LITERAL",
+    reason: "Comma-separated issue UUIDs from the approval wake; board identifiers.",
+  },
+
+  // --- SAFE_LITERAL: wake context ---------------------------------------
+  {
+    name: "PAPERCLIP_WAKE_REASON",
+    classification: "SAFE_LITERAL",
+    reason: "Enum-shaped wake cause (issue_assigned, issue_commented, ...).",
+  },
+  {
+    name: "PAPERCLIP_WAKE_COMMENT_ID",
+    classification: "SAFE_LITERAL",
+    reason: "Opaque comment UUID.",
+  },
+  {
+    name: "PAPERCLIP_WAKE_PAYLOAD_JSON",
+    classification: "SAFE_LITERAL",
+    reason:
+      "Compact issue summary plus the new-comment batch. Board content, not credential material, and already readable by this pod through its own API token — but it is the one SAFE_LITERAL here whose value is free-form text, so a credential pasted into an issue comment would appear on the pod spec. Accepted: the same text is equally readable via the API, so Secret-backing it would not close that path.",
+  },
+  {
+    name: "PAPERCLIP_APPROVAL_ID",
+    classification: "SAFE_LITERAL",
+    reason: "Opaque approval UUID.",
+  },
+  {
+    name: "PAPERCLIP_APPROVAL_STATUS",
+    classification: "SAFE_LITERAL",
+    reason: "Enum-shaped approval outcome.",
+  },
+
+  // --- SAFE_LITERAL: workspace wiring -----------------------------------
+  {
+    name: "PAPERCLIP_WORKSPACE_",
+    prefix: true,
+    classification: "SAFE_LITERAL",
+    reason:
+      "Workspace coordinates — cwd, source, strategy, id, repo URL/ref, branch, worktree path. Filesystem paths and a git remote; the remote is authenticated separately by the gh App token, never embedded here. Prefix because the family is set field-by-field from workspace context.",
+  },
+  {
+    name: "PAPERCLIP_WORKSPACES_JSON",
+    classification: "SAFE_LITERAL",
+    reason: "Serialized list of the same workspace coordinates for multi-workspace projects.",
+  },
+  {
+    name: "AGENT_HOME",
+    classification: "SAFE_LITERAL",
+    reason: "Filesystem path to the agent's home directory on the mounted PVC.",
+  },
+
+  // --- SAFE_LITERAL: runtime services -----------------------------------
+  {
+    name: "PAPERCLIP_RUNTIME_SERVICES_JSON",
+    classification: "SAFE_LITERAL",
+    reason: "Managed preview/dev service descriptors: names, ports, in-cluster URLs.",
+  },
+  {
+    name: "PAPERCLIP_RUNTIME_SERVICE_INTENTS_JSON",
+    classification: "SAFE_LITERAL",
+    reason: "Requested runtime services not yet started; same shape as above.",
+  },
+  {
+    name: "PAPERCLIP_RUNTIME_PRIMARY_URL",
+    classification: "SAFE_LITERAL",
+    reason: "In-cluster URL of the primary runtime service; an address.",
+  },
+
+  // --- SAFE_LITERAL: Penstock/Caveman launcher --------------------------
+  {
+    name: "PENSTOCK_AGENT_COMMAND",
+    classification: "SAFE_LITERAL",
+    reason: "Launcher protocol selector (normally `claude`), not executable command text.",
+  },
+  {
+    name: "PENSTOCK_PROVIDER",
+    classification: "SAFE_LITERAL",
+    reason: "Validated provider selector (`anthropic` or `openai`), not a credential.",
+  },
+  {
+    name: "PONYTAIL_DEFAULT_MODE",
+    classification: "SAFE_LITERAL",
+    reason: "Validated Ponytail mode enum; contains no credential material.",
+  },
+
+  // --- SAFE_LITERAL: isolation and home ---------------------------------
+  {
+    name: "HOME",
+    classification: "SAFE_LITERAL",
+    reason: "Must be readable off the pod spec — it is the first thing checked when session resume misbehaves.",
+  },
+  {
+    name: "CLAUDE_CONFIG_DIR",
+    classification: "SAFE_LITERAL",
+    reason: "Path to the run's Claude config dir under the isolation root.",
+  },
+  {
+    name: "XDG_CONFIG_HOME",
+    classification: "SAFE_LITERAL",
+    reason: "Path to the run's XDG config root.",
+  },
+  {
+    name: "PAPERCLIP_K8S_ISOLATION_MODE",
+    classification: "SAFE_LITERAL",
+    reason: "Enum: shared | run | workspace. Diagnostic for cross-run state bleed.",
+  },
+
+  // --- SAFE_LITERAL: caches and temp ------------------------------------
+  {
+    name: "XDG_CACHE_HOME",
+    classification: "SAFE_LITERAL",
+    reason: "Cache path on the runtime-cache volume.",
+  },
+  {
+    name: "GOCACHE",
+    classification: "SAFE_LITERAL",
+    reason: "Go build cache path.",
+  },
+  {
+    name: "GOMODCACHE",
+    classification: "SAFE_LITERAL",
+    reason: "Go module cache path.",
+  },
+  {
+    name: "npm_config_cache",
+    classification: "SAFE_LITERAL",
+    reason: "npm cache path. Lower-cased by npm convention; matching is case-sensitive so this is exact.",
+  },
+  {
+    name: "BUN_INSTALL_CACHE",
+    classification: "SAFE_LITERAL",
+    reason: "Bun install cache path.",
+  },
+  {
+    name: "PIP_CACHE_DIR",
+    classification: "SAFE_LITERAL",
+    reason: "pip cache path.",
+  },
+  {
+    name: "PLAYWRIGHT_BROWSERS_PATH",
+    classification: "SAFE_LITERAL",
+    reason: "Playwright browser download path.",
+  },
+  {
+    name: "PNPM_HOME",
+    classification: "SAFE_LITERAL",
+    reason:
+      "pnpm store path. Shared across a company's persistent workspaces so the content-addressed store is not duplicated per workspace (BLO-36583).",
+  },
+  {
+    name: "TMPDIR",
+    classification: "SAFE_LITERAL",
+    reason: "Run-scoped temp dir (BLO-16219). Load-bearing for triaging concurrent-run collisions.",
+  },
+  {
+    name: "TMP",
+    classification: "SAFE_LITERAL",
+    reason: "Same path as TMPDIR, for tools that read TMP.",
+  },
+  {
+    name: "TEMP",
+    classification: "SAFE_LITERAL",
+    reason: "Same path as TMPDIR, for tools that read TEMP.",
+  },
+
+  // --- SAFE_LITERAL: container wiring -----------------------------------
+  {
+    name: "DOCKER_HOST",
+    classification: "SAFE_LITERAL",
+    reason: "unix:///var/run/docker.sock — the DinD sidecar socket path. Constant, no credential.",
+  },
+  {
+    name: "DOCKER_TLS_CERTDIR",
+    classification: "SAFE_LITERAL",
+    reason: "Set empty on the DinD sidecar to disable TLS on the shared emptyDir socket. A constant.",
+  },
+  {
+    name: "PROMPT_CONTENT",
+    classification: "SAFE_LITERAL",
+    reason:
+      "Init-container-only. The prompt the agent is about to run; it is written to an emptyDir and read via stdin. Oversized prompts already move to a Secret-backed volume for size reasons, so this path carries only small prompts. Not credential material by construction — the prompt is board-authored text.",
+  },
+];
+
+/**
+ * Names pinned as always-Secret because they carry credential material while
+ * matching none of the patterns above (BLO-21858, from the BLO-21593 review).
+ *
+ * Derived from ENV_NAME_CLASSIFICATION so the table is the single source of
+ * truth: declaring a name SECRET there is what pins it here. Compared
+ * upper-cased so it behaves like the case-insensitive regex.
+ */
+const ALWAYS_SECRET_ENV_NAMES = new Set(
+  ENV_NAME_CLASSIFICATION.filter((e) => e.classification === "SECRET" && !e.prefix).map((e) =>
+    e.name.toUpperCase(),
+  ),
+);
+
 export function isSensitiveEnvName(name: string): boolean {
-  return SENSITIVE_ENV_NAME_RE.test(name);
+  return ALWAYS_SECRET_ENV_NAMES.has(name.toUpperCase()) || SENSITIVE_ENV_NAME_RE.test(name);
+}
+
+/**
+ * Look up an env name in ENV_NAME_CLASSIFICATION. Exact matches win over
+ * prefix matches. Returns null when the name is undeclared — which is what
+ * the classification test in job-manifest.test.ts fails on.
+ */
+export function classifyEnvName(name: string): EnvClassification | null {
+  const exact = ENV_NAME_CLASSIFICATION.find((e) => !e.prefix && e.name === name);
+  if (exact) return exact.classification;
+  const prefixed = ENV_NAME_CLASSIFICATION.find((e) => e.prefix && name.startsWith(e.name));
+  return prefixed ? prefixed.classification : null;
 }
 
 /**
@@ -647,6 +1078,31 @@ function buildEnvVars(
     if (typeof value === "string") merged[key] = value;
   }
 
+  const agentCommand = validateAgentCommand(config.agentCommand, "claude");
+  const usesExternalLauncher = agentCommand !== "claude";
+  if (usesExternalLauncher) {
+    // The launcher owns provider credentials and starts the native Claude
+    // protocol itself. Keep the contract explicit in the pod environment while
+    // leaving any operator-supplied values untouched.
+    if (!hasExplicitEnvName("PENSTOCK_AGENT_COMMAND", envConfig, selfPod.inheritedEnv, selfPod.inheritedEnvValueFrom)) {
+      merged.PENSTOCK_AGENT_COMMAND = "claude";
+    }
+    if (!hasExplicitEnvName("PENSTOCK_PROVIDER", envConfig, selfPod.inheritedEnv, selfPod.inheritedEnvValueFrom)) {
+      merged.PENSTOCK_PROVIDER = "anthropic";
+    } else if (Object.prototype.hasOwnProperty.call(merged, "PENSTOCK_PROVIDER")) {
+      // Validate only literals visible to the adapter. valueFrom-backed
+      // providers stay opaque and are validated by the runtime after resolution.
+      merged.PENSTOCK_PROVIDER = validatePenstockProvider(merged.PENSTOCK_PROVIDER);
+    }
+  }
+  const ponytailMode = validatePonytailDefaultMode(config.ponytailDefaultMode);
+  if (
+    ponytailMode &&
+    !hasExplicitEnvName("PONYTAIL_DEFAULT_MODE", envConfig, selfPod.inheritedEnv, selfPod.inheritedEnvValueFrom)
+  ) {
+    merged.PONYTAIL_DEFAULT_MODE = ponytailMode;
+  }
+
   // Per-agent Penstock session identity (org_penstock #accounts attribution).
   // Every agent Job shares the one org API key, so without a per-agent
   // client-session header the whole fleet melts into a single UNTAGGED bucket
@@ -686,6 +1142,16 @@ function buildEnvVars(
         BUN_INSTALL_CACHE: `${isolation.cacheRoot}/bun`,
         PIP_CACHE_DIR: `${isolation.cacheRoot}/pip`,
         PLAYWRIGHT_BROWSERS_PATH: `${isolation.cacheRoot}/ms-playwright`,
+        // pnpm's store is data, not cache, so none of the vars above reach it
+        // and it followed HOME onto the PVC once per workspace (BLO-36583).
+        // Shared per company when the workspace is persistent — same filesystem
+        // as the checkout, which pnpm requires to hardlink into node_modules;
+        // per-run otherwise, where cacheRoot is already ephemeral. See
+        // SHARED_PNPM_STORE_ROOT.
+        PNPM_HOME:
+          isolation.storage.workspace === "persistent"
+            ? sharedPnpmStorePath(agent.companyId)
+            : `${isolation.cacheRoot}/pnpm`,
         // Run-scoped so concurrent stateless Jobs never share a writable temp
         // directory (BLO-16219) — previously unset here, defaulting to the
         // image's shared /tmp and colliding across concurrent runs.
@@ -831,6 +1297,9 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // K8s Job pods are always unattended — no one to approve permission prompts
   const dangerouslySkipPermissions = asBoolean(config.dangerouslySkipPermissions, true);
   const extraArgs = asStringArray(config.extraArgs);
+  const agentCommand = validateAgentCommand(config.agentCommand, "claude");
+  const usesExternalLauncher = agentCommand !== "claude";
+  const ponytailPluginPath = validatePonytailPluginPath(config.ponytailPluginPath);
   const timeoutSec = asNumber(config.timeoutSec, 0);
   const ttlSeconds = asNumber(config.ttlSecondsAfterFinished, 300);
   const hasConfigKey = (key: string) => Object.prototype.hasOwnProperty.call(config, key);
@@ -961,6 +1430,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     // ns-rw replacing readonly, since the project-scope file would win.
     claudeArgs.push("--mcp-config", "/tmp/prompt/mcp.json", "--strict-mcp-config");
   }
+  if (ponytailPluginPath) claudeArgs.push("--plugin-dir", ponytailPluginPath);
   if (extraArgs.length > 0) claudeArgs.push(...extraArgs);
 
   // Build env vars. envSecretName is computed from jobName (already resolved
@@ -972,10 +1442,19 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
 
   // Resource defaults — UI stores dotted keys (e.g. "resources.requests.cpu")
   // as flat config entries, so read them directly from config with the dotted key.
+  // The memory request is sized from the measured distribution of per-run peak
+  // working set (7d, n=10510 agent runs): mean 439 Mi, p95 1.06 GiB, p99 2.95
+  // GiB, max 7.64 GiB. 1536Mi (= 1.5 GiB) sits just above p95, so ~96% of runs
+  // stay within their request. It is deliberately NOT the mean — the request is
+  // admission control, and the long tail is what the (unchanged) 8Gi limit
+  // absorbs. Written as "1536Mi" rather than "1.5Gi" because Kubernetes
+  // canonicalizes BinarySI quantities on read-back: the two are byte-identical,
+  // but a live pod renders "1536Mi", so the literal here matches what anyone
+  // greps for post-deploy.
   const containerResources: k8s.V1ResourceRequirements = {
     requests: {
       cpu: asString(config["resources.requests.cpu"], "1000m"),
-      memory: asString(config["resources.requests.memory"], "2Gi"),
+      memory: asString(config["resources.requests.memory"], "1536Mi"),
     },
     limits: {
       cpu: asString(config["resources.limits.cpu"], "4000m"),
@@ -1284,9 +1763,11 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       : "no entry in providers.anthropic.accounts is a valid account identifier");
   const accountsArg =
     anthropicAccounts.length > 0 ? ` --accounts ${quoteShellArg(anthropicAccounts.join(","))}` : "";
-  const ccrotateRefresh = accountPoolConfiguredButUnusable
-    ? `echo "[paperclip] ${unusablePoolReason}; skipping ccrotate rather than falling back to global rotation" >&2`
-    : `(command -v ccrotate >/dev/null 2>&1 && ccrotate next --yes --target claude${accountsArg} >/dev/null 2>&1) || true`;
+  const ccrotateRefresh = usesExternalLauncher
+    ? ""
+    : accountPoolConfiguredButUnusable
+      ? `echo "[paperclip] ${unusablePoolReason}; skipping ccrotate rather than falling back to global rotation" >&2`
+      : `(command -v ccrotate >/dev/null 2>&1 && ccrotate next --yes --target claude${accountsArg} >/dev/null 2>&1) || true`;
   // RCA 2026-05-06: terminal rate-limit fail-fast. Before this, a
   // `rate_limit_event` with `overageStatus:"rejected"` +
   // `overageDisabledReason:"out_of_credits"` was not a terminal signal to
@@ -1309,6 +1790,76 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // the pod marks Succeeded even when claude never emits any stream-json
   // — paperclip-server's parser only catches type:error events from
   // inside the JSON stream, not pre-stream crashes.
+  const launcherCommand = agentCommand === "claude" ? "claude" : quoteShellArg(agentCommand);
+  // BLO-31359: `git clone` points the new clone's `origin` at whatever it was
+  // cloned from, so cloning the project base checkout hands every ephemeral run
+  // a remote that writes back into shared, long-lived state on the PVC. Git only
+  // refuses a push to the base's *currently checked out* branch; any other
+  // refname lands, which is how base checkouts accumulate agent-authored
+  // `blo-*` branches. Keep the clone — cloning from local disk with `--shared`
+  // is what makes provisioning cheap — but repoint `origin` at the real
+  // upstream so a push leaves the cluster instead of mutating the base.
+  //
+  // Remove-then-add rather than `set-url`: `git remote remove` drops the whole
+  // `remote.origin` section, so the re-added remote cannot inherit a stale
+  // `pushurl` still aimed at the base.
+  //
+  // `remote remove` also deletes every `refs/remotes/origin/*`, so the clone is
+  // briefly left with no remote-tracking refs and `origin/<branch>` is an
+  // unknown revision. That is deliberate, not collateral: those refs described
+  // the *base's* local branches while being named as though they described
+  // upstream, and a lying ref is worse than a missing one. The best-effort
+  // fetch below repopulates `refs/remotes/origin/<branch>` from the real
+  // upstream, which is the first time `origin/master` in a run workspace has
+  // actually meant upstream.
+  //
+  // `fetch` restores branches but NOT `refs/remotes/origin/HEAD` (a symbolic
+  // ref that a plain clone does carry, and that tooling reads via
+  // `git symbolic-ref refs/remotes/origin/HEAD` to find the default branch),
+  // so the fetch is paired with `remote set-head -a`. Same reasoning as the
+  // branches: the old `origin/HEAD` pointed at the *base's* current branch, so
+  // it too was a lying ref, and this repoints it at upstream's default.
+  //
+  // Guarding rule for this chain: commands that establish the security property
+  // (the base must not be reachable as a remote) stay UNGUARDED so a failure
+  // fails the run closed rather than handing back a base-writable workspace.
+  // Commands that only provide ergonomics or diagnostics are guarded, so a
+  // network blip or a read-only config cannot take down pod startup.
+  const upstreamRepoUrl = asString(workspaceContext.repoUrl, "").trim();
+  const runWorkspaceGit = `git -C ${quoteShellArg(isolation.workspaceRoot)}`;
+  // Both calls below reach the network, so both carry the same bound rather
+  // than only the fetch: `set-head -a` queries the remote for its default
+  // branch even when every remote-tracking ref is already present locally.
+  // Measured against an unreachable https remote with refs/remotes/origin/HEAD
+  // and origin/master intact and `symbolic-ref refs/remotes/origin/HEAD`
+  // already resolving: exit 128, `unable to access ...: Failed to connect`.
+  // Sharing one constant keeps the two from drifting apart.
+  //
+  // Two bounds, because neither one catches the other's failure. Reading
+  // either as covering both is the mistake worth naming here:
+  //   - the low-speed knobs bound the connection once it is ESTABLISHED: if it
+  //     then carries less than 1 KiB/s for 15s, curl aborts. Measured against a
+  //     server that accepts the connection and never speaks: dropped at exactly
+  //     lowSpeedTime, exit 128. They do not bound the connect itself — a SYN
+  //     that is never answered is invisible to them — and both knobs are
+  //     consumed by the curl-based HTTP transport, so an `ssh://` or
+  //     `git@host:` remote ignores them silently. Every configured workspace
+  //     `repoUrl` is https today, so nothing reaches that second path yet.
+  //   - `timeout` bounds WALL CLOCK whatever the transport, so it is the only
+  //     one of the two that covers a connect that hangs, and the only one a
+  //     future SSH remote would inherit rather than silently discard. Measured
+  //     against a blackholed address with lowSpeedTime=3 set: the low-speed
+  //     bound never fired and the call ran 135s before the kernel gave up
+  //     (tcp_syn_retries=6). Over ssh, an established-but-silent connection has
+  //     no equivalent backstop at all.
+  //
+  // 60s therefore tightens the https connect case rather than restating it, and
+  // sits far above a healthy fetch here: the clone is `--shared` off a local
+  // base checkout, so this fetch carries only what upstream has gained since
+  // that base was last updated. Being killed is degradation, not failure — the
+  // chain is guarded and each breadcrumb reports the exit code, so 124 (killed
+  // by the wall-clock bound) stays distinguishable from git's own 128.
+  const boundedRunWorkspaceGit = `timeout 60 ${runWorkspaceGit} -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15`;
   const workspaceSetup = isolation.mode === "run" && workspaceCwd && workspaceCwd !== isolation.workspaceRoot
     ? [
         `if git -C ${quoteShellArg(workspaceCwd)} rev-parse --verify HEAD >/dev/null 2>&1; then`,
@@ -1317,8 +1868,66 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
           `rm -rf ${quoteShellArg(isolation.workspaceRoot)}`,
           // Git objects are immutable/content-addressed and may be shared read-only;
           // the clone still owns its refs, index, worktree, and lock files.
-          `git clone --shared --no-checkout -- ${quoteShellArg(workspaceCwd)} ${quoteShellArg(isolation.workspaceRoot)}`,
-          `git -C ${quoteShellArg(isolation.workspaceRoot)} checkout --detach "$source_head"`,
+          //
+          // `--origin origin` pins the remote name: `git clone` otherwise honors
+          // `clone.defaultRemoteName`, and because the removal below is unguarded,
+          // an image that ever set that config would hard-fail every run-isolated
+          // pod with `error: No such remote: 'origin'`.
+          `git clone --shared --no-checkout --origin origin -- ${quoteShellArg(workspaceCwd)} ${quoteShellArg(isolation.workspaceRoot)}`,
+          `${runWorkspaceGit} checkout --detach "$source_head"`,
+          `${runWorkspaceGit} remote remove origin`,
+          ...(upstreamRepoUrl
+            ? [
+                // `--` because `quoteShellArg` stops shell injection but not git's
+                // own option parsing, and a repoUrl starting with `-` would
+                // otherwise be read as a flag.
+                `${runWorkspaceGit} remote add origin -- ${quoteShellArg(upstreamRepoUrl)}`,
+                // Ergonomics, not security: restore `origin/<branch>` so the
+                // common `git rebase origin/master` / `git log origin/master..HEAD`
+                // phrasings resolve, then `set-head` so `origin/HEAD` resolves
+                // too. Guarded, and leaves a breadcrumb when it cannot run, so
+                // an offline pod degrades to "fetch first" rather than to a
+                // failed run or an unexplained `unknown revision`.
+                //
+                // This runs on every run-isolated pod start, so both network
+                // calls are bounded — see `boundedRunWorkspaceGit` above for
+                // exactly what each of the two bounds does and does not cover.
+                //
+                // Each breadcrumb carries the failed call's exit code, spliced
+                // in by closing the single quotes around `"$?"` rather than
+                // double-quoting the whole message — the messages contain
+                // backticks, which double quotes would turn into command
+                // substitution. `$?` is read at word-expansion time, after the
+                // `||` has already decided to run the breadcrumb, so it is the
+                // status of the call that just failed. Without it the two
+                // bounds are indistinguishable after the fact, and a
+                // breadcrumb that names the wrong cause is worse than none.
+                //
+                // `set-head` is nested inside its own guard so that when the
+                // fetch succeeds but `set-head` fails, the chain does not fall
+                // through and write the misleading `originFetchFailed`
+                // breadcrumb about a fetch that actually worked. It records its
+                // own breadcrumb instead, so both failure paths in this chain
+                // explain themselves on the workspace rather than leaving a
+                // bare `symbolic-ref` failure for an agent to diagnose. (The
+                // sibling `originRemoved` breadcrumb below is not a failure —
+                // it is the no-upstream branch.)
+                `(${boundedRunWorkspaceGit} fetch --no-tags --quiet origin && (${boundedRunWorkspaceGit} remote set-head origin -a >/dev/null 2>&1 || ${runWorkspaceGit} config paperclip.originHeadUnset 'origin/HEAD could not be resolved (exit '"$?"'; 124 means the wall-clock bound killed the call, any other code came from the call itself — a transfer aborted by the low-speed bound reports 128); run \`git remote set-head origin -a\` if you need the default branch (BLO-31359)' || true) || ${runWorkspaceGit} config paperclip.originFetchFailed 'best-effort fetch failed (exit '"$?"'; 124 means the wall-clock bound killed the call, any other code came from the call itself — a transfer aborted by the low-speed bound reports 128); run \`git fetch origin\` before using origin/<branch> (BLO-31359)' || true)`,
+              ]
+            : [
+                // No recorded upstream: leave the clone with no remote at all
+                // rather than one aimed at the base, and say so on the
+                // workspace so the resulting `fatal: 'origin' does not appear
+                // to be a git repository` is self-explaining.
+                //
+                // The reachable case is a `local_path` project workspace.
+                // `validateProjectWorkspace` requires only *one* of `cwd` or
+                // `repoUrl`, so a workspace configured by path satisfies it via
+                // `cwd` and carries `repoUrl: null` by construction. A project
+                // with no git workspace at all never reaches here — it fails the
+                // `rev-parse --verify HEAD` guard above.
+                `(${runWorkspaceGit} config paperclip.originRemoved 'no upstream recorded for this run; origin removed so the clone source (a shared base checkout) is not a push target (BLO-31359)' || true)`,
+              ]),
         ].join(" && ")};`,
         // Stateless PR-review agents may start from the generic per-agent fallback
         // directory, which is intentionally not a repository. Give those runs a
@@ -1328,7 +1937,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       ].join(" ")
     : "";
   const preparePodLog = `mkdir -p ${quoteShellArg(path.posix.dirname(podLogPath))} || exit $?`;
-  const claudeInvocation = `set -o pipefail; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${buildEnvGuardSetupShell()}; ${ccrotateRefresh}; ${preparePodLog}; cat /tmp/prompt/prompt.txt | claude ${claudeArgsEscaped} | tee ${quoteShellArg(podLogPath)} | ${failFastFilter} > /dev/null`;
+  const claudeInvocation = `set -o pipefail; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${buildEnvGuardSetupShell()}; ${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | tee ${quoteShellArg(podLogPath)} | ${failFastFilter} > /dev/null`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket. Mirrors the opencode_k8s adapter.

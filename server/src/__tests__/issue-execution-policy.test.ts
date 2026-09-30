@@ -3,6 +3,9 @@ import {
   DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
   applyIssueExecutionPolicyTransition,
   applyIssueMonitorPolicyTransition,
+  buildIssueMonitorClearedPatch,
+  buildIssueMonitorEligibilityPatch,
+  isMonitorNextCheckAtLive,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "../services/issue-execution-policy.js";
@@ -13,6 +16,85 @@ const qaAgentId = "22222222-2222-4222-8222-222222222222";
 const ctoAgentId = "33333333-3333-4333-8333-333333333333";
 const ctoUserId = "cto-user";
 const boardUserId = "board-user";
+
+describe("buildIssueMonitorEligibilityPatch", () => {
+  it("clears an armed monitor after an agent assignee is removed", () => {
+    const patch = buildIssueMonitorEligibilityPatch({
+      status: "in_progress",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      monitorNextCheckAt: new Date("2026-08-31T17:00:00.000Z"),
+      executionPolicy: {
+        monitor: { nextCheckAt: "2026-08-31T17:00:00.000Z", scheduledBy: "assignee" },
+      },
+    });
+
+    expect(patch).toMatchObject({
+      monitorNextCheckAt: null,
+      monitorWakeRequestedAt: null,
+      monitorNotes: null,
+    });
+    expect((patch.executionState as { monitor?: { status?: string; clearReason?: string } }).monitor)
+      .toMatchObject({ status: "cleared", clearReason: "invalid_assignee" });
+  });
+
+  it("clears an armed monitor after an active issue is demoted", () => {
+    const patch = buildIssueMonitorEligibilityPatch({
+      status: "todo",
+      assigneeAgentId: coderAgentId,
+      assigneeUserId: null,
+      monitorNextCheckAt: new Date("2026-08-31T17:00:00.000Z"),
+      executionPolicy: {
+        monitor: { nextCheckAt: "2026-08-31T17:00:00.000Z", scheduledBy: "assignee" },
+      },
+    });
+
+    expect((patch.executionState as { monitor?: { status?: string; clearReason?: string } }).monitor)
+      .toMatchObject({ status: "cleared", clearReason: "invalid_status" });
+  });
+
+  // BLO-29974: `escalateStrandedAssignedIssue` writes a *computed* status, and it is a
+  // service-layer write, so nothing upstream clears a monitor the new status makes
+  // undeliverable. The caller therefore has to evaluate eligibility against the status
+  // it is about to write, not the one the row currently holds. Passing the unmodified
+  // row is the silent-failure mode this pins: the row still reads `in_progress`, the
+  // patch comes back `{}`, and the monitor survives as a false-live wake path.
+  it("clears when evaluated against a post-write escalation status the row does not hold yet", () => {
+    const armed = {
+      status: "in_progress",
+      assigneeAgentId: coderAgentId,
+      assigneeUserId: null,
+      monitorNextCheckAt: new Date("2026-09-19T10:07:00.000Z"),
+      executionPolicy: {
+        monitor: { nextCheckAt: "2026-09-19T10:07:00.000Z", scheduledBy: "assignee" },
+      },
+    };
+
+    // Evaluated against the row as-is, there is nothing to do — this is the trap.
+    expect(buildIssueMonitorEligibilityPatch(armed)).toEqual({});
+
+    const patch = buildIssueMonitorEligibilityPatch({ ...armed, status: "blocked" });
+    expect(patch.monitorNextCheckAt).toBeNull();
+    expect((patch.executionState as { monitor?: { status?: string; clearReason?: string } }).monitor)
+      .toMatchObject({ status: "cleared", clearReason: "invalid_status" });
+  });
+
+  // BLO-27635 leaves a capacity strand dispatchable rather than writing `blocked`. That
+  // branch must keep its monitor, so the unconditional spread has to stay a no-op there.
+  it("leaves the monitor armed when the escalation status still allows one", () => {
+    expect(
+      buildIssueMonitorEligibilityPatch({
+        status: "in_review",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        monitorNextCheckAt: new Date("2026-09-19T10:07:00.000Z"),
+        executionPolicy: {
+          monitor: { nextCheckAt: "2026-09-19T10:07:00.000Z", scheduledBy: "assignee" },
+        },
+      }),
+    ).toEqual({});
+  });
+});
 
 function makePolicy(
   stages: Array<{ type: "review" | "approval"; participants: Array<{ type: "agent" | "user"; agentId?: string; userId?: string }> }>,
@@ -1465,11 +1547,142 @@ describe("issue execution policy transitions", () => {
 
       expect(result.patch.executionPolicy).toBeNull();
       expect(result.patch.monitorNextCheckAt).toBeNull();
+      expect(result.patch.monitorNotes).toBeNull();
       expect(result.patch.executionState).toMatchObject({
         monitor: {
           status: "cleared",
           clearReason: "done",
         },
+      });
+    });
+
+    // PEN-1995: the notes column describes the ARMED monitor. Every clear path
+    // nulled nextCheckAt/wakeRequestedAt but left the notes, so a retired
+    // monitor's notes survived as live-looking instructions — observed
+    // outliving their monitor by four days and being read as an active gate.
+    it("nulls monitorNotes when the monitor is cleared by removing it from the policy", () => {
+      const armed = normalizeIssueExecutionPolicy({
+        stages: [],
+        monitor: {
+          nextCheckAt: "2026-04-11T12:30:00.000Z",
+          notes: "Read lastHeartbeatAt after the capacity reset",
+          scheduledBy: "assignee",
+        },
+      })!;
+
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: armed,
+          executionState: {
+            status: "idle",
+            currentStageId: null,
+            currentStageIndex: null,
+            currentStageType: null,
+            currentParticipant: null,
+            returnAssignee: null,
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+            monitor: {
+              status: "scheduled",
+              nextCheckAt: "2026-04-11T12:30:00.000Z",
+              lastTriggeredAt: null,
+              attemptCount: 0,
+              notes: "Read lastHeartbeatAt after the capacity reset",
+              scheduledBy: "assignee",
+              clearedAt: null,
+              clearReason: null,
+            },
+          },
+          monitorAttemptCount: 0,
+          monitorNextCheckAt: new Date("2026-04-11T12:30:00.000Z"),
+          monitorLastTriggeredAt: null,
+          monitorNotes: "Read lastHeartbeatAt after the capacity reset",
+          monitorScheduledBy: "assignee",
+        },
+        // Monitor removed from the policy: the manual-clear path.
+        policy: null,
+        previousPolicy: armed,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        monitorExplicitlyUpdated: true,
+      });
+
+      expect(result.patch.monitorNextCheckAt).toBeNull();
+      expect(result.patch.monitorNotes).toBeNull();
+      expect(result.patch.executionState).toMatchObject({
+        monitor: {
+          status: "cleared",
+          clearReason: "manual",
+          // Audit copy is retained on the state, so nulling the column is lossless.
+          notes: "Read lastHeartbeatAt after the capacity reset",
+        },
+      });
+    });
+
+    it("nulls monitorNotes when a monitor is cleared as invalid for the issue state", () => {
+      const armed = normalizeIssueExecutionPolicy({
+        stages: [],
+        monitor: {
+          nextCheckAt: "2026-04-11T12:30:00.000Z",
+          notes: "Poll the deploy",
+          scheduledBy: "assignee",
+        },
+      })!;
+
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: armed,
+          executionState: null,
+          monitorAttemptCount: 0,
+          monitorNextCheckAt: new Date("2026-04-11T12:30:00.000Z"),
+          monitorLastTriggeredAt: null,
+          monitorNotes: "Poll the deploy",
+          monitorScheduledBy: "assignee",
+        },
+        policy: armed,
+        previousPolicy: armed,
+        // A monitor cannot be held on a blocked issue; this is the invalid-state clear.
+        requestedStatus: "blocked",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+      });
+
+      expect(result.patch.monitorNextCheckAt).toBeNull();
+      expect(result.patch.monitorNotes).toBeNull();
+      expect(result.patch.executionState).toMatchObject({
+        monitor: { status: "cleared" },
+      });
+    });
+
+    it("records status suppression when recovery blocks an issue", () => {
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [],
+        monitor: { nextCheckAt: "2099-04-11T12:30:00.000Z", scheduledBy: "assignee" },
+      })!;
+      const result = buildIssueMonitorClearedPatch({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: null,
+          monitorNextCheckAt: new Date("2099-04-11T12:30:00.000Z"),
+        },
+        policy,
+        clearReason: "suppressed_by_status",
+      });
+      expect(result.monitorNextCheckAt).toBeNull();
+      expect(result.executionPolicy).toBeNull();
+      expect(result.executionState).toMatchObject({
+        monitor: { status: "cleared", clearReason: "suppressed_by_status" },
       });
     });
 
@@ -1661,5 +1874,176 @@ describe("issue execution policy transitions", () => {
 
       expect(result.patch.status).not.toBe("in_progress");
     });
+  });
+});
+
+describe("isMonitorNextCheckAtLive", () => {
+  // PEN-2853: one definition of "the monitor is still a live wake path", shared by the
+  // stranded-assigned sweep and the in_review disposition validator. Before this, the
+  // sweep required a future instant and the validator accepted any non-null one, so the
+  // two disagreed about the same column in the direction that admits a row to in_review
+  // while the sweep treats it as unattended.
+  const nowMs = Date.parse("2026-09-01T12:00:00.000Z");
+
+  it("counts an instant strictly in the future", () => {
+    expect(isMonitorNextCheckAtLive(new Date(nowMs + 1), nowMs)).toBe(true);
+    expect(isMonitorNextCheckAtLive("2026-09-01T13:00:00.000Z", nowMs)).toBe(true);
+  });
+
+  it("does not count a lapsed or exactly-now instant", () => {
+    expect(isMonitorNextCheckAtLive(new Date(nowMs - 1), nowMs)).toBe(false);
+    // Exactly `now` is not in the future. `>` matches the sweep's own comparison; a
+    // `>=` here would re-open the divergence by one millisecond.
+    expect(isMonitorNextCheckAtLive(new Date(nowMs), nowMs)).toBe(false);
+    expect(isMonitorNextCheckAtLive("2026-08-25T12:00:00.000Z", nowMs)).toBe(false);
+  });
+
+  it("does not count an absent or unparseable instant", () => {
+    expect(isMonitorNextCheckAtLive(null, nowMs)).toBe(false);
+    expect(isMonitorNextCheckAtLive(undefined, nowMs)).toBe(false);
+    expect(isMonitorNextCheckAtLive("", nowMs)).toBe(false);
+    expect(isMonitorNextCheckAtLive("not a date", nowMs)).toBe(false);
+    expect(isMonitorNextCheckAtLive(new Date("not a date"), nowMs)).toBe(false);
+  });
+});
+
+// BLO-33728: an execution stage must not stay live on a terminal issue. The
+// `done` half was already correct (`buildCompletedState` discharges on
+// approval); the gap was `cancelled` from `changes_requested`, which reached
+// no branch at all and returned an empty patch.
+describe("stage discharge on terminal status", () => {
+  const agentApprovalPolicy = () =>
+    makePolicy([{ type: "approval", participants: [{ type: "agent", agentId: ctoAgentId }] }]);
+
+  /** Drive the real transitions to a genuine `changes_requested` state. */
+  function changesRequestedState(policy: IssueExecutionPolicy) {
+    const pending = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: null,
+      },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      commentBody: "Ready for approval",
+    }).patch.executionState;
+
+    const changesRequested = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: ctoAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: pending,
+      },
+      policy,
+      requestedStatus: "in_progress",
+      requestedAssigneePatch: {},
+      actor: { agentId: ctoAgentId },
+      commentBody: "Needs work",
+    }).patch.executionState;
+
+    return { pending, changesRequested };
+  }
+
+  it("records the approval, not the earlier downgrade, on approve-and-close", () => {
+    const policy = agentApprovalPolicy();
+    const { pending } = changesRequestedState(policy);
+
+    const state = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: ctoAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: pending,
+      },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: ctoAgentId },
+      commentBody: "Approved",
+    }).patch.executionState as IssueExecutionState;
+
+    expect(state.lastDecisionOutcome).toBe("approved");
+    // The negative the AC asks for: never a pre-approval `changes_requested`.
+    expect(state.lastDecisionOutcome).not.toBe("changes_requested");
+    expect(state.currentStageId).toBeNull();
+    expect(state.currentParticipant).toBeNull();
+  });
+
+  it("discharges the stage when a changes_requested issue is cancelled", () => {
+    const policy = agentApprovalPolicy();
+    const { changesRequested } = changesRequestedState(policy);
+    // Guard the fixture: the pre-state really does carry a live stage, so a
+    // passing assertion below cannot be an artifact of an already-empty stage.
+    expect((changesRequested as IssueExecutionState).currentStageId).not.toBeNull();
+
+    const patch = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: changesRequested,
+      },
+      policy,
+      requestedStatus: "cancelled",
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      commentBody: "Abandoning",
+    }).patch;
+
+    // The defect was an empty patch: the cancel reached no branch, so the stage
+    // survived untouched. Name that here rather than dereferencing `undefined`.
+    expect(patch.executionState, "cancel left executionState untouched").toBeDefined();
+    const state = patch.executionState as IssueExecutionState;
+
+    expect(state.currentStageId).toBeNull();
+    expect(state.currentStageType).toBeNull();
+    expect(state.currentParticipant).toBeNull();
+    // A genuine decision is real history and must survive the cancel.
+    expect(state.lastDecisionOutcome).toBe("changes_requested");
+  });
+
+  it("clears the discharged state on reopen so a review path can be rebuilt", () => {
+    const policy = agentApprovalPolicy();
+    const { changesRequested } = changesRequestedState(policy);
+
+    const cancelled = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: changesRequested,
+      },
+      policy,
+      requestedStatus: "cancelled",
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      commentBody: "Abandoning",
+    }).patch.executionState;
+
+    const reopened = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "cancelled",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: cancelled,
+      },
+      policy,
+      requestedStatus: "in_progress",
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      commentBody: "Reopening",
+    }).patch;
+
+    expect(reopened.executionState).toBeNull();
   });
 });

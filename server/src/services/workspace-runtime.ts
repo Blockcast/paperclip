@@ -9,6 +9,7 @@ import type { AdapterRuntimeServiceReport } from "@paperclipai/adapter-utils";
 import type { Db } from "@paperclipai/db";
 import { executionWorkspaces, issueComments, issues, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
 import {
+  collectBranchTemplateProblems,
   listWorkspaceServiceCommandDefinitions,
   type ExecutionWorkspaceRunScope,
   type GitWorktreeBranchAncestryVerdict,
@@ -18,7 +19,7 @@ import {
   type WorkspaceRuntimeDesiredState,
   type WorkspaceRuntimeServiceStateMap,
 } from "@paperclipai/shared";
-import { and, desc, eq, inArray, isNull, ne } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, ne, notInArray } from "drizzle-orm";
 import { asNumber, asString, parseObject, renderTemplate } from "../adapters/utils.js";
 import { resolveHomeAwarePath, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import {
@@ -40,6 +41,10 @@ import {
   pruneOwnStaleGitWorktree,
 } from "./git-worktree-ownership.js";
 import { executionWorkspaceService, readExecutionWorkspaceConfig } from "./execution-workspaces.js";
+import {
+  buildAgentGitIdentityEnv,
+  ensureCheckoutGitIdentity,
+} from "./git-checkout-identity.js";
 import { logActivity } from "./activity-log.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
 
@@ -565,7 +570,16 @@ function sanitizeSlugPart(value: string | null | undefined, fallback: string): s
   return normalized.length > 0 ? normalized : fallback;
 }
 
-function renderWorkspaceTemplate(template: string, input: {
+/**
+ * The data a `workspaceStrategy.branchTemplate` renders against.
+ *
+ * Exported solely so a test can assert its leaf key set is exactly
+ * `EXECUTION_WORKSPACE_BRANCH_TEMPLATE_KEYS` — the list write-time validation
+ * accepts. Keeping the two in lockstep is what stops BLO-31281 recurring in the
+ * other direction: a key added here but not declared there would be rejected at
+ * write time despite rendering fine.
+ */
+export function buildWorkspaceTemplateData(input: {
   issue: ExecutionWorkspaceIssueRef | null;
   agent: ExecutionWorkspaceAgentRef;
   projectId: string | null;
@@ -573,7 +587,7 @@ function renderWorkspaceTemplate(template: string, input: {
 }) {
   const issueIdentifier = input.issue?.identifier ?? input.issue?.id ?? "issue";
   const slug = sanitizeSlugPart(input.issue?.title, sanitizeSlugPart(issueIdentifier, "issue"));
-  return renderTemplate(template, {
+  return {
     issue: {
       id: input.issue?.id ?? "",
       identifier: input.issue?.identifier ?? "",
@@ -590,7 +604,16 @@ function renderWorkspaceTemplate(template: string, input: {
       repoRef: input.repoRef ?? "",
     },
     slug,
-  });
+  };
+}
+
+function renderWorkspaceTemplate(template: string, input: {
+  issue: ExecutionWorkspaceIssueRef | null;
+  agent: ExecutionWorkspaceAgentRef;
+  projectId: string | null;
+  repoRef: string | null;
+}) {
+  return renderTemplate(template, buildWorkspaceTemplateData(input));
 }
 
 function sanitizeBranchName(value: string): string {
@@ -635,6 +658,45 @@ const RUN_SCOPE_TOKEN_LENGTH = 8;
 const BRANCH_NAME_MAX_LENGTH = 120;
 
 /**
+ * BLO-23144 (2): clamp `branchName` into `budget` characters without losing the
+ * issue identifier.
+ *
+ * The clamp truncates from the END, so it only preserves the identifier when the
+ * identifier happens to sit at the FRONT of the rendered name. That is true for
+ * the default branchTemplate and for anything `applyIssueIdentifierToBranchName`
+ * had to prepend, which is why the original code could assert "applied after the
+ * identifier step so the identifier survives" and be right in practice. It is
+ * not true in general: a custom `branchTemplate` that renders the identifier
+ * last (`{{agent.slug}}-{{issue.identifier}}`) puts it exactly where the cut
+ * lands, and losing it breaks the BLO-9117 guarantee that a merged PR ref-links
+ * at merge time — silently, because the branch still looks well-formed.
+ *
+ * When the cut would eat the identifier, re-anchor it at the front, where
+ * end-truncation can never reach it, and spend whatever budget is left on the
+ * original name.
+ */
+function clampBranchBasePreservingIdentifier(
+  branchName: string,
+  issueIdentifier: string | null | undefined,
+  budget: number,
+): string {
+  if (branchName.length <= budget) return branchName;
+  const clamped = branchName.slice(0, budget);
+  const identifier = issueIdentifier ? sanitizeBranchName(issueIdentifier) : "";
+  // Nothing to protect, it already survived the cut, or it was never in the name
+  // to begin with (applyIssueIdentifierToBranchName's job, not this one's).
+  if (!identifier || clamped.includes(identifier) || !branchName.includes(identifier)) {
+    return clamped;
+  }
+  const prefix = `${identifier}-`;
+  // Degenerate budget: an identifier that cannot fit alongside the run token has
+  // nothing to re-anchor into. Prefer the plain clamp over emitting a branch that
+  // is nothing but an identifier.
+  if (prefix.length >= budget) return clamped;
+  return `${prefix}${branchName.slice(0, budget - prefix.length)}`;
+}
+
+/**
  * BLO-19063: derive a run-scoped branch name so that two concurrent runs never
  * share a working tree.
  *
@@ -644,34 +706,41 @@ const BRANCH_NAME_MAX_LENGTH = 120;
  * twice, so a per-run tree genuinely requires a per-run branch, not just a
  * per-run directory.
  *
- * The issue identifier is preserved verbatim in the result, so the BLO-9117
- * ref-linking guarantee (see applyIssueIdentifierToBranchName) still holds — the
- * token is appended, never substituted. Returns `branchName` unchanged for
- * `per_issue` scope or when no run id is available, which is what keeps this
- * opt-in rather than a fleet-wide migration.
+ * The issue identifier is preserved in the result, so the BLO-9117 ref-linking
+ * guarantee (see applyIssueIdentifierToBranchName) still holds — the token is
+ * appended, never substituted, and the clamp re-anchors the identifier rather
+ * than cutting it (see clampBranchBasePreservingIdentifier). Returns
+ * `branchName` unchanged for `per_issue` scope or when no run id is available,
+ * which is what keeps this opt-in rather than a fleet-wide migration.
  */
 export function applyRunScopeToBranchName(
   branchName: string,
   runScope: ExecutionWorkspaceRunScope | null | undefined,
   heartbeatRunId: string | null | undefined,
+  issueIdentifier?: string | null,
 ): string {
   if (runScope !== "per_run") return branchName;
-  // Derive the token from the raw run id rather than via sanitizeBranchName:
-  // that helper substitutes a literal "paperclip-work" for empty input, which
-  // would turn every run *without* a run id into the same token ("papercli")
-  // and silently collapse them back onto one shared tree while still looking
-  // per-run. A missing id must degrade to the issue-scoped name loudly, not to
-  // a colliding one quietly.
-  const token = (heartbeatRunId ?? "")
-    .replace(/[^A-Za-z0-9]+/g, "")
-    .slice(0, RUN_SCOPE_TOKEN_LENGTH)
-    .toLowerCase();
-  // No usable run id (e.g. a non-heartbeat realize path): fall back to the
-  // issue-scoped name rather than inventing a token, which would strand a tree
-  // nothing can find again.
-  if (!token) return branchName;
+  // Decide "is there a usable run id?" on the RAW id, before hashing. A hash maps
+  // every input to a plausible-looking token, including "" and "-----", so
+  // deciding on the digest would resurrect the exact failure the original code
+  // avoided: runs without an id silently colliding on one token while still
+  // looking per-run. A missing id must degrade to the issue-scoped name loudly.
+  if (!/[A-Za-z0-9]/.test(heartbeatRunId ?? "")) return branchName;
+  // BLO-23144 (3): hash the WHOLE run id rather than slicing its first 8
+  // alphanumerics. For a UUID those 8 are just `time_low` — one field, ~32 bits —
+  // so uniqueness rested on a fraction of the id and on the id happening to be a
+  // UUID at all. A digest depends on every character and is stable across calls,
+  // which is what the worktree lookup needs.
+  const token = createHash("sha256")
+    .update(heartbeatRunId ?? "")
+    .digest("hex")
+    .slice(0, RUN_SCOPE_TOKEN_LENGTH);
   const suffix = `-r${token}`;
-  const base = branchName.slice(0, BRANCH_NAME_MAX_LENGTH - suffix.length);
+  const base = clampBranchBasePreservingIdentifier(
+    branchName,
+    issueIdentifier,
+    BRANCH_NAME_MAX_LENGTH - suffix.length,
+  );
   return sanitizeBranchName(`${base}${suffix}`);
 }
 
@@ -1215,6 +1284,7 @@ type DirtyQuarantineRepairResult = {
   rescueCommitSha: string;
   fileCount: number;
   clearedInProgressOperation: GitWorktreeInProgressOperation | null;
+  quarantinedIndexLockPath: string | null;
   sourceAuditCommentId: string | null;
   claimantAuditCommentId: string | null;
 };
@@ -1327,7 +1397,79 @@ async function findGitWorktreeBranchContention(input: {
     worktreePath: input.worktreePath,
     liveBranchName: input.actualBranchName,
     excludingExecutionWorkspaceId: input.executionWorkspaceId,
+    excludingSourceIssueId: input.sourceIssue?.id ?? null,
   });
+}
+
+const EXECUTION_WORKSPACE_CLAIMANT_SAMPLE_LIMIT = 10;
+
+// Outcome of the claimant lookup. `null` used to mean both "nothing to query"
+// and "the query failed", and collapsing those made the failure case read as
+// "not contended" — a refusal that disables itself under exactly the database
+// stress that co-occurs with workspace thrash. Keeping the three states
+// distinct lets eligibility fail closed on `failed` while the fresh-worktree
+// reuse path, which has no execution workspace id yet, keeps passing.
+type ExecutionWorkspaceClaimantLookup =
+  | {
+      status: "ok";
+      claimants: NonNullable<GitWorktreeBranchIncoherenceEvidence["workspaceClaimants"]>;
+      truncated: boolean;
+    }
+  | { status: "not-computable" }
+  | { status: "failed" };
+
+// Non-terminal issues pointing at one execution workspace. A worktree holds a
+// single branch, so two or more claimants make it a shared resource and the
+// recorded branch is shared with them. Restoring it would move the worktree off
+// whichever claimant's branch is currently checked out, so safe repair refuses
+// and leaves the existing workspace-binding recovery path to route it (BLO-32628).
+async function findExecutionWorkspaceIssueClaimants(input: {
+  db: Db | null | undefined;
+  executionWorkspaceId: string | null;
+}): Promise<ExecutionWorkspaceClaimantLookup> {
+  if (!input.db || !input.executionWorkspaceId) return { status: "not-computable" };
+  let rows: { id: string; identifier: string | null; status: string }[];
+  try {
+    // One row past the sample limit, so a saturated result can be reported as
+    // "at least N" rather than rendering the cap as an exact count.
+    rows = await input.db
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        status: issues.status,
+      })
+      .from(issues)
+      .where(and(
+        eq(issues.executionWorkspaceId, input.executionWorkspaceId),
+        notInArray(issues.status, ["done", "cancelled"]),
+        isNull(issues.hiddenAt),
+      ))
+      .orderBy(issues.issueNumber)
+      .limit(EXECUTION_WORKSPACE_CLAIMANT_SAMPLE_LIMIT + 1);
+  } catch {
+    return { status: "failed" };
+  }
+  return {
+    status: "ok",
+    truncated: rows.length > EXECUTION_WORKSPACE_CLAIMANT_SAMPLE_LIMIT,
+    claimants: rows.slice(0, EXECUTION_WORKSPACE_CLAIMANT_SAMPLE_LIMIT).map((row) => ({
+      issueId: row.id,
+      issueIdentifier: row.identifier ?? null,
+      status: row.status,
+    })),
+  };
+}
+
+function formatWorkspaceClaimantRefusal(
+  claimants: NonNullable<GitWorktreeBranchIncoherenceEvidence["workspaceClaimants"]>,
+  truncated: boolean,
+) {
+  const names = claimants
+    .map((claimant) => claimant.issueIdentifier ?? claimant.issueId)
+    .join(", ");
+  const count = truncated ? `at least ${claimants.length}` : `${claimants.length}`;
+  const sample = truncated ? `${names}, …` : names;
+  return `execution workspace is claimed by ${count} non-terminal issues (${sample}); restoring the recorded branch would move the worktree off another issue's branch`;
 }
 
 function executionWorkspaceUsesInheritedProjectRuntimeServices(
@@ -1402,12 +1544,235 @@ async function assertDirtyQuarantineRuntimeServicesStopped(input: {
   throw branchIncoherenceValidationFailure(input.evidence);
 }
 
-async function assertGitIndexIsUnlocked(worktreePath: string) {
-  const indexLockPath = await runGit(["rev-parse", "--git-path", "index.lock"], worktreePath)
-    .catch(() => null);
-  if (indexLockPath && existsSync(indexLockPath)) {
-    throw new Error(`git index lock exists at ${indexLockPath}`);
+// A run killed mid-`git` leaves a 0-byte `index.lock` behind and git will not
+// reap it, because it cannot tell a dead owner from a live one. Neither can the
+// lock file: git creates it `O_CREAT|O_EXCL` at 0 bytes, does every expensive
+// step holding it (blob hashing, tree walk, object writes), and serialises the
+// index into it only in the last moment before the rename. Measured against a
+// live `git add` stalled in a clean filter, size stayed 0 and mtime stayed
+// frozen at creation for the whole run -- so "empty and old" is what a *slow
+// live writer* looks like, not what a dead one leaves behind. Neither size nor
+// mtime is evidence of abandonment, and this guard does not treat them as such.
+//
+// An open descriptor is evidence: git holds the lock open from creation to
+// rename, so `lockHolderPids` below is a positive liveness signal rather than
+// an absence of one. Measured on both commands that plausibly run long here --
+// `git add` (clean filter) and `git checkout` (smudge filter, a separate
+// unpack_trees path) -- each showed a live holding fd while size stayed 0 and
+// mtime stayed frozen.
+//
+// What the scan can see is bounded by the PID namespace it runs in: holders
+// under another uid, on another pod sharing the volume, or in a sandbox Job pod
+// that does not share this namespace are all invisible to it, and nothing here
+// can see them. Which of those applies is a property of the isolation mode in
+// play, and this code does not know the mode -- so the scan is treated as
+// authoritative only for the namespace it can actually read, never as proof
+// that no holder exists anywhere. The age floor is a mitigation for that
+// residue, deliberately not the safety argument. The break is a rename, not a
+// delete, so the residue stays recoverable.
+export const GIT_INDEX_LOCK_STALE_MS = 15 * 60 * 1000;
+
+// Git holds `index.lock` open from creation to rename, so a descriptor naming
+// it is a live owner. `holders: null` is "holder unknown", which must never
+// read as "no holder" -- the caller refuses on it either way. The two ways of
+// not knowing are reported apart because they are not the same fact:
+//
+//   "unsupported" -- this platform has no `/proc` to walk, so the scan cannot
+//     run here and never will. Static; re-running changes nothing. The break is
+//     therefore Linux-only, and on any other host a stale lock still parks the
+//     row exactly as it did before this change (BLO-35981).
+//   "unreadable"  -- `/proc` exists and refused (masked in a hardened
+//     container, or a sandbox policy). Environmental; it can change.
+//
+// Collapsing them loses the one thing an operator reading a parked row needs:
+// whether re-running could ever produce a different answer. Neither falls back
+// to the age floor, because the invariant this guard rests on is that a lock is
+// broken only on a *positive* determination that nothing holds it -- and
+// "I could not look" is not that determination on either branch.
+// `unsupported` carries the platform rather than leaving the caller to read
+// `process.platform`: that is what lets a test state the verdict directly
+// instead of mutating the global, which is only safe while nothing in the file
+// runs concurrently.
+export type LockHolderScan =
+  | { holders: string[] }
+  | { holders: null; failure: "unsupported"; platform: string }
+  | { holders: null; failure: "unreadable" };
+
+let lockHolderScanForTests: ((lockPath: string) => Promise<LockHolderScan>) | null = null;
+
+/**
+ * Test-only seam for the liveness scan, same convention as
+ * `setProcessGroupLivenessProbeForTests`. Without it the scan's verdict is a
+ * property of the host -- the `/proc` walk exists only on Linux -- so every
+ * test of the *gates around* it would assert the platform refusal instead of
+ * what it means to assert, and fail on a developer's macOS on a path they did
+ * not touch. Overriding it makes that verdict a fixture; the real walk is still
+ * exercised by the Linux-only live-holder test. Pass `null` to clear.
+ */
+export function setLockHolderScanForTests(
+  override: ((lockPath: string) => Promise<LockHolderScan>) | null,
+) {
+  lockHolderScanForTests = override;
+}
+
+// ponytail: O(processes x fds) scan, fine on a repair path that runs once per
+// incoherent workspace; switch to a targeted inode match if it ever gets hot.
+async function lockHolderPids(lockPath: string): Promise<LockHolderScan> {
+  if (process.platform !== "linux") {
+    return { holders: null, failure: "unsupported", platform: process.platform };
   }
+  // `/proc/*/fd` readlinks are fully canonical, but `indexLockPath` is built
+  // with `path.resolve`, which does not resolve symlinks. Comparing the two
+  // directly would silently match nothing whenever any component of the
+  // worktree path is a symlink -- a miss that reads as "no holder", which is
+  // the one direction this scan must never fail in.
+  //
+  // The fallback to the uncanonicalised path looks like exactly that miss, and
+  // is safe only because of where this runs: the caller already `stat`ed this
+  // same path successfully two statements earlier, so the one way `realpath`
+  // fails here is the lock being unlinked in between -- i.e. its owner finished
+  // and there is no holder to miss. Such a lock resolves as success at the
+  // pre-rename re-stat below, which returns for a lock already gone -- not at
+  // the rename's `ENOENT` catch, which only backstops the two-syscall gap
+  // after that re-stat.
+  const canonicalLockPath = await fs.realpath(lockPath).catch(() => lockPath);
+  const entries = await fs.readdir("/proc").catch(() => null);
+  if (!entries) return { holders: null, failure: "unreadable" };
+  const holders: string[] = [];
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    // Unreadable (another uid, or exited mid-scan) -- skip rather than fail the
+    // whole scan; the age floor is what covers the holders we cannot read.
+    const fds = await fs.readdir(`/proc/${entry}/fd`).catch(() => null);
+    if (!fds) continue;
+    for (const fd of fds) {
+      const target = await fs.readlink(`/proc/${entry}/fd/${fd}`).catch(() => null);
+      if (target === canonicalLockPath) {
+        holders.push(entry);
+        break;
+      }
+    }
+  }
+  return { holders };
+}
+
+// Returns the path of the lock it broke, or null when there was nothing to
+// break. Every refusal below keeps "index lock" in the message so
+// `formatDirtyQuarantineFailure` still reports it as index contention.
+async function ensureGitIndexIsUnlocked(worktreePath: string): Promise<string | null> {
+  const rawLockPath = await runGit(["rev-parse", "--git-path", "index.lock"], worktreePath)
+    .catch(() => null);
+  if (!rawLockPath) return null;
+  // `--git-path` answers relative to the worktree for a normal repo and absolute
+  // for a linked one. Resolving against `worktreePath` rather than the process
+  // cwd is what makes every `stat` below, and the rename, name the lock that
+  // belongs to *this* worktree -- against the server process cwd a relative
+  // answer would silently address some other repo's lock, or nothing at all.
+  const indexLockPath = path.isAbsolute(rawLockPath) ? rawLockPath : path.resolve(worktreePath, rawLockPath);
+  const lockStat = await fs.stat(indexLockPath).catch((error: unknown) => {
+    // Only "not there" is an unlocked index. EACCES/EIO is a lock we cannot
+    // vet, and an unvettable lock has to refuse rather than read as absent.
+    if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") return null;
+    throw new Error(
+      `git index lock at ${indexLockPath} could not be read: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  });
+  if (!lockStat) return null;
+
+  // Serialised index state, written just before the rename. Never remove it: a
+  // partially-written index is genuinely indistinguishable from a complete one,
+  // so there is no verdict to reach here. This bounds the fix -- a run killed
+  // inside that final serialise window still parks the row permanently, exactly
+  // as before. The window is short relative to the rest of a git write, so this
+  // is the rarer half of the original defect, not the common one, but "stale
+  // index locks self-heal" is not what this guard delivers (BLO-35981).
+  if (lockStat.size > 0) {
+    throw new Error(
+      `git index lock exists at ${indexLockPath} and holds ${lockStat.size} bytes of serialised index state`,
+    );
+  }
+
+  const scan = await (lockHolderScanForTests ?? lockHolderPids)(indexLockPath);
+  if (!scan.holders) {
+    throw new Error(
+      `git index lock exists at ${indexLockPath} and its holder could not be determined because ${
+        scan.failure === "unsupported"
+          ? `the /proc liveness scan is unavailable on ${scan.platform}`
+          : "/proc is unreadable"
+      }`,
+    );
+  }
+  if (scan.holders.length > 0) {
+    throw new Error(
+      `git index lock exists at ${indexLockPath} and is held open by live pid ${scan.holders.join(", ")}`,
+    );
+  }
+
+  // A future mtime yields a negative age and refuses here. That is deliberate,
+  // not incidental: a lock stamped by a clock we do not share is not one to
+  // break on an age argument.
+  const ageMs = Date.now() - lockStat.mtimeMs;
+  if (ageMs < GIT_INDEX_LOCK_STALE_MS) {
+    throw new Error(
+      `git index lock exists at ${indexLockPath} and was created ${Math.round(ageMs / 1000)}s ago, under the ${Math.round(GIT_INDEX_LOCK_STALE_MS / 60000)}m staleness floor`,
+    );
+  }
+
+  // Move it aside rather than delete it. The verdict above is evidential, not
+  // certain -- a holder under another uid or on another pod sharing the volume
+  // is invisible to the scan -- and this is the only irreversible act on the
+  // repair path. A rename releases the mutex exactly as an unlink does, and
+  // costs one inode to keep the evidence if the verdict was wrong.
+  //
+  // Re-stat first, because everything above vetted an *inode* and the rename
+  // names a *path*. The `/proc` walk between them is O(processes x fds), so the
+  // window is measured in the scan's duration, not in syscalls: if the holder
+  // released the lock inside it, a live `git` can take the path afresh with
+  // O_CREAT|O_EXCL and the rename would move that live mutex aside, losing the
+  // victim's index write. The ENOENT branch below does not cover it -- that
+  // handles the lock being *gone*, not *replaced*. Two adjacent syscalls is
+  // still not atomic and nothing portable will be, but it shrinks the window
+  // from the scan's duration to a stat/rename pair and turns the failure from
+  // "break a live lock" into "refuse and retry next dispatch", which is the
+  // direction every other gate here already fails in.
+  const preRenameStat = await fs.stat(indexLockPath).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") return null;
+    throw new Error(
+      `git index lock at ${indexLockPath} could not be re-read before being moved aside: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  });
+  // Released during the scan: its owner finished and the index is unlocked, so
+  // this, not the rename's ENOENT catch below, is the usual way the lock
+  // vanishing mid-repair resolves as success.
+  if (!preRenameStat) return null;
+  if (
+    preRenameStat.ino !== lockStat.ino ||
+    preRenameStat.size !== lockStat.size ||
+    preRenameStat.mtimeMs !== lockStat.mtimeMs
+  ) {
+    throw new Error(
+      `git index lock at ${indexLockPath} was replaced while its holder was being determined, so the scan's verdict does not describe the lock now at that path`,
+    );
+  }
+
+  const quarantinedPath = `${indexLockPath}.paperclip-broken-${formatUtcBranchTimestamp()}`;
+  let broken = true;
+  await fs.rename(indexLockPath, quarantinedPath).catch((error: unknown) => {
+    // Gone between the stat and here: its owner finished normally, or a sibling
+    // repair won the race. Either way the index is unlocked, which is the whole
+    // post-condition -- turning that into a failure would reinstate the
+    // permanent park this guard exists to remove.
+    if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") {
+      broken = false;
+      return;
+    }
+    throw new Error(
+      `git index lock exists at ${indexLockPath} and could not be moved aside: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  });
+  return broken ? quarantinedPath : null;
 }
 
 function fingerprintWorkspaceBranchIncoherence(input: {
@@ -1507,7 +1872,15 @@ async function inspectGitWorktreeBranchIncoherence(input: {
   const actualBranchExists = input.actualBranchName
     ? await localBranchExists(input.repoRoot, input.actualBranchName)
     : null;
-  const registered = await findRegisteredGitWorktreeByPath(input.repoRoot, input.worktreePath);
+  // One `git worktree list` and one realpath walk of the worktree path, shared
+  // by the path lookup here and the recorded-branch lookup below. This runs on
+  // every dispatch, so resolving both out of a single listing keeps the common
+  // `sameHead` repair from paying for a lookup it never reads.
+  const registeredWorktrees = await listRegisteredGitWorktrees(input.repoRoot);
+  const resolvedWorktreePath = await resolvePathForWorktreeComparison(input.worktreePath);
+  const registered = registeredWorktrees
+    ? await findGitWorktreeEntryByResolvedPath(registeredWorktrees, resolvedWorktreePath)
+    : null;
   const actualBranchRef = input.actualBranchName ? `refs/heads/${input.actualBranchName}` : null;
   const registeredBranchRef = registered?.branch ?? null;
   const registeredBranchMatchesHead = Boolean(registered && registeredBranchRef === actualBranchRef);
@@ -1545,14 +1918,72 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     ancestryVerdict === "ancestor" &&
     !sameHead &&
     registeredBranchMatchesHead;
+  const workspaceClaimantLookup = await findExecutionWorkspaceIssueClaimants({
+    db: input.db ?? null,
+    executionWorkspaceId: input.executionWorkspaceId ?? null,
+  });
+  const workspaceClaimants =
+    workspaceClaimantLookup.status === "ok" ? workspaceClaimantLookup.claimants : null;
+  // A failed lookup fails closed. `cleanliness` above resolves to "unknown" when
+  // `git status` fails and then refuses; this has to take the same posture,
+  // because database stress and workspace thrash share causes — a refusal that
+  // evaporates under exactly the load that produces contention is not a refusal.
+  // Only "not-computable" reads as uncontended: there was nothing to query, which
+  // is the fresh-worktree reuse path with no execution workspace id yet.
+  const workspaceIsContended =
+    workspaceClaimantLookup.status === "failed" || (workspaceClaimants?.length ?? 0) > 1;
+  // `git checkout` refuses a branch that is already checked out in another
+  // linked worktree, so eligibility has to know about that before it promises a
+  // repair. Without this the run would report `eligible: true`, attempt the
+  // checkout, and fail with a bare "safe checkout failed" — strictly less
+  // diagnosable than the refusal it replaced.
+  const expectedBranchWorktreePath = expectedBranchExists && registeredWorktrees
+    ? findGitWorktreeEntryByBranch(registeredWorktrees, input.expectedBranchName)
+    : null;
+  const expectedBranchHeldByOtherWorktree = expectedBranchWorktreePath
+    ? await resolvePathForWorktreeComparison(expectedBranchWorktreePath) !== resolvedWorktreePath
+    : false;
+  // Ordinary stacked work — a sibling feature branch cut from the same base —
+  // leaves both branches as named local refs with neither an ancestor of the
+  // other. Ancestry is not load-bearing here: `refs/heads/<actualBranch>` keeps
+  // the checked-out commits reachable by construction, so restoring the recorded
+  // branch cannot orphan work whatever the verdict says. Ancestry stays
+  // load-bearing for the two branches above — the detached-HEAD case, where no
+  // ref preserves those commits, and the forward-adopt case, which rewrites the
+  // recorded branch rather than restoring it. A contended workspace is excluded:
+  // there the checked-out branch belongs to another claimant, so the mismatch is
+  // a workspace-binding defect for the recovery path, not a branch to restore.
+  const canCheckoutRecordedBranchOverDivergedBranch =
+    cleanliness === "clean" &&
+    expectedBranchExists &&
+    actualBranchExists === true &&
+    ancestryVerdict !== "ancestor" &&
+    !sameHead &&
+    registeredBranchMatchesHead &&
+    // `git bisect start` is the one shape that reads clean and still sits on a
+    // branch, so cleanliness does not screen it out; the other operations either
+    // detach (rebase) or stage content (merge, cherry-pick, revert). The checkout
+    // would succeed and lose nothing, but it would leave live bisect state
+    // pointing at a branch the worktree is no longer on, for the next run to
+    // inherit silently. A worktree mid-bisect is an interrupted operation rather
+    // than the ordinary stacked work this branch is for, so excluding it costs no
+    // reach over either observed shape.
+    !inProgressOperation &&
+    !workspaceIsContended &&
+    !expectedBranchHeldByOtherWorktree;
   const eligible =
-    canCheckoutRecordedBranch || canAdoptForwardActualBranch || canAttachRecordedBranchToDetachedHead;
+    canCheckoutRecordedBranch ||
+    canAdoptForwardActualBranch ||
+    canAttachRecordedBranchToDetachedHead ||
+    canCheckoutRecordedBranchOverDivergedBranch;
   const safeRepairReason = eligible
     ? canCheckoutRecordedBranch
       ? "clean worktree and expected branch points at the current HEAD"
       : canAdoptForwardActualBranch
         ? "clean worktree and checked-out branch is forward of the recorded branch"
-        : "clean detached worktree HEAD is forward of the recorded branch"
+        : canAttachRecordedBranchToDetachedHead
+          ? "clean detached worktree HEAD is forward of the recorded branch"
+          : "clean worktree can restore the recorded branch because the checked-out branch keeps its commits reachable"
     : cleanliness !== "clean"
       ? inProgressOperation
         ? `worktree is not clean and a git ${GIT_IN_PROGRESS_OPERATION_LABELS[inProgressOperation]} is in progress`
@@ -1563,9 +1994,22 @@ async function inspectGitWorktreeBranchIncoherence(input: {
         ? "registered worktree branch does not match HEAD"
       : !expectedBranchExists
         ? "expected branch does not exist"
-        : !sameHead
-          ? "expected branch and current HEAD differ"
-          : "safe repair could not be proven";
+        : input.actualBranchName === null
+          ? "detached worktree HEAD is not provably forward of the recorded branch"
+          : inProgressOperation
+            ? `a git ${GIT_IN_PROGRESS_OPERATION_LABELS[inProgressOperation]} is in progress in this worktree`
+          : workspaceClaimantLookup.status === "failed"
+            ? "execution workspace claimant lookup failed, so contention could not be ruled out"
+          : workspaceIsContended && workspaceClaimants
+            ? formatWorkspaceClaimantRefusal(
+              workspaceClaimants,
+              workspaceClaimantLookup.status === "ok" && workspaceClaimantLookup.truncated,
+            )
+            : expectedBranchHeldByOtherWorktree
+              ? `recorded branch is already checked out in another worktree at ${expectedBranchWorktreePath}`
+              : !sameHead
+                ? "expected branch and current HEAD differ"
+                : "safe repair could not be proven";
   const fingerprint = fingerprintWorkspaceBranchIncoherence({
     sourceIssueId: input.sourceIssue?.id ?? null,
     executionWorkspaceId: input.executionWorkspaceId ?? null,
@@ -1599,6 +2043,9 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     statusEntryCount: statusLines?.length ?? null,
     dirtyPathSample,
     contention,
+    workspaceClaimants,
+    workspaceClaimantLookup: workspaceClaimantLookup.status,
+    expectedBranchWorktreePath,
     provenance: {
       expectedBranchRef: `refs/heads/${input.expectedBranchName}`,
       actualBranchRef,
@@ -1884,7 +2331,7 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
   let rescueBranchCreated = false;
   let expectedBranchRestored = false;
   try {
-    await assertGitIndexIsUnlocked(input.worktreePath);
+    const quarantinedIndexLockPath = await ensureGitIndexIsUnlocked(input.worktreePath);
     await recordGitOperation(input.recorder, {
       phase: input.phase ?? "worktree_prepare",
       args: ["checkout", "-b", rescueBranch],
@@ -2019,6 +2466,7 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
       rescueCommitSha,
       fileCount,
       clearedInProgressOperation,
+      quarantinedIndexLockPath,
       ...comments,
     };
   } catch (error) {
@@ -2269,7 +2717,7 @@ export async function ensureGitWorktreeBranchCoherent(input: {
       reconciledForward: false,
       dirtyQuarantineRepair: result,
       warnings: [
-        `Execution workspace dirty worktree state was quarantined on rescue branch "${result.rescueBranch}" (${formatShortSha(result.rescueCommitSha)}; ${result.fileCount} ${result.fileCount === 1 ? "file" : "files"}) before restoring recorded branch "${expectedBranchName}".${result.clearedInProgressOperation ? ` An interrupted git ${GIT_IN_PROGRESS_OPERATION_LABELS[result.clearedInProgressOperation]} was also cleared; its in-flight state is preserved on the rescue branch.` : ""}`,
+        `Execution workspace dirty worktree state was quarantined on rescue branch "${result.rescueBranch}" (${formatShortSha(result.rescueCommitSha)}; ${result.fileCount} ${result.fileCount === 1 ? "file" : "files"}) before restoring recorded branch "${expectedBranchName}".${result.clearedInProgressOperation ? ` An interrupted git ${GIT_IN_PROGRESS_OPERATION_LABELS[result.clearedInProgressOperation]} was also cleared; its in-flight state is preserved on the rescue branch.` : ""}${result.quarantinedIndexLockPath ? ` An abandoned 0-byte git index lock was broken first; no process visible to this pod held it open, and it was preserved at "${result.quarantinedIndexLockPath}".` : ""}`,
       ],
     };
   }
@@ -2469,11 +2917,20 @@ export async function ensureGitWorktreeBranchCoherent(input: {
 
   evidence.safeRepair.succeeded = true;
   evidence.safeRepair.reason = "clean worktree checked out the recorded branch";
+  // A diverged sibling branch is the ordinary stacked-work shape. The checkout
+  // above moved HEAD off it, so name the ref and the commit it still points at:
+  // that is what makes the no-loss guarantee checkable by whoever reads this.
+  const divergedBranchPreserved =
+    currentBranch !== null &&
+    evidence.provenance.actualBranchExists === true &&
+    !evidence.provenance.sameHead;
   return {
     branchName: expectedBranchName,
     reconciledForward: false,
     warnings: [
-      `Execution workspace branch metadata was self-healed by checking out recorded branch "${expectedBranchName}" at ${input.worktreePath}.`,
+      divergedBranchPreserved
+        ? `${warningPrefix} The checked-out branch had diverged from the recorded branch, so Paperclip restored "${expectedBranchName}"; the diverged work is unchanged on "${currentBranch}"${evidence.provenance.actualHeadSha ? ` at ${formatShortSha(evidence.provenance.actualHeadSha)}` : ""} and can be checked out again.`
+        : `Execution workspace branch metadata was self-healed by checking out recorded branch "${expectedBranchName}" at ${input.worktreePath}.`,
     ],
   };
 }
@@ -2644,30 +3101,44 @@ async function resolveGitOwnerRepoRoot(cwd: string): Promise<string> {
   return path.dirname(path.resolve(checkoutRoot, commonDir));
 }
 
-async function findRegisteredGitWorktreeByBranch(repoRoot: string, branchName: string): Promise<string | null> {
+// One `git worktree list` for callers that need to resolve more than one thing
+// out of it. The branch-incoherence inspection runs on every dispatch, so paying
+// the subprocess twice — once by path, once by branch — is pure overhead on the
+// common `sameHead` path that repairs without ever reading the branch lookup.
+async function listRegisteredGitWorktrees(repoRoot: string): Promise<GitWorktreeListEntry[] | null> {
   const raw = await runGit(["worktree", "list", "--porcelain"], repoRoot).catch(() => null);
   if (!raw) return null;
+  return parseGitWorktreeListPorcelain(raw);
+}
 
+function findGitWorktreeEntryByBranch(
+  entries: GitWorktreeListEntry[],
+  branchName: string,
+): string | null {
   const expectedBranchRef = `refs/heads/${branchName}`;
-  for (const entry of parseGitWorktreeListPorcelain(raw)) {
+  for (const entry of entries) {
     if (entry.branch !== expectedBranchRef) continue;
     return path.resolve(entry.worktree);
   }
-
   return null;
 }
 
-async function findRegisteredGitWorktreeByPath(repoRoot: string, worktreePath: string): Promise<GitWorktreeListEntry | null> {
-  const raw = await runGit(["worktree", "list", "--porcelain"], repoRoot).catch(() => null);
-  if (!raw) return null;
-
-  const expectedPath = await resolvePathForWorktreeComparison(worktreePath);
-  for (const entry of parseGitWorktreeListPorcelain(raw)) {
-    if (await resolvePathForWorktreeComparison(entry.worktree) === expectedPath) {
+async function findGitWorktreeEntryByResolvedPath(
+  entries: GitWorktreeListEntry[],
+  resolvedWorktreePath: string,
+): Promise<GitWorktreeListEntry | null> {
+  for (const entry of entries) {
+    if (await resolvePathForWorktreeComparison(entry.worktree) === resolvedWorktreePath) {
       return entry;
     }
   }
   return null;
+}
+
+async function findRegisteredGitWorktreeByBranch(repoRoot: string, branchName: string): Promise<string | null> {
+  const entries = await listRegisteredGitWorktrees(repoRoot);
+  if (!entries) return null;
+  return findGitWorktreeEntryByBranch(entries, branchName);
 }
 
 async function isGitCheckout(cwd: string): Promise<boolean> {
@@ -2711,6 +3182,24 @@ async function validateProjectPrimaryRepoOrigin(input: {
   throw new WorkspaceRepoMismatchError(
     `Execution workspace cwd "${input.cwd}" is checked out from "${actualUrl}" but the issue expects "${input.expectedRepoUrl}". Refusing to start the agent in the wrong repository.`,
   );
+}
+
+async function findVerifiedManagedProjectPrimaryCheckout(input: {
+  companyId: string;
+  projectId: string;
+  expectedRepoUrl: string;
+  currentCwd: string;
+}): Promise<string | null> {
+  const managedCwd = resolveManagedProjectWorkspaceDir({
+    companyId: input.companyId,
+    projectId: input.projectId,
+    repoName: deriveRepoNameFromRepoUrlForRuntime(input.expectedRepoUrl),
+  });
+  if (managedCwd === path.resolve(input.currentCwd) || !await isGitCheckout(managedCwd)) return null;
+
+  const actualUrl = await runGit(["config", "--get", "remote.origin.url"], managedCwd).catch(() => null);
+  if (normalizeRepoIdentity(actualUrl) !== normalizeRepoIdentity(input.expectedRepoUrl)) return null;
+  return managedCwd;
 }
 
 type GitSubmoduleReadinessEntry = {
@@ -3166,25 +3655,53 @@ function deriveRepoNameFromRepoUrlForRuntime(repoUrl: string | null | undefined)
   }
 }
 
-async function resolvePathForWorktreeComparison(value: string): Promise<string> {
+/** Exported for the registry-walk ceiling test; the runtime injects it as `normalizePath`. */
+export async function resolvePathForWorktreeComparison(value: string): Promise<string> {
   const resolved = path.resolve(value);
-  const missingSegments: string[] = [];
-  let current = resolved;
-  while (true) {
-    try {
-      const realPath = await fs.realpath(current);
-      return path.resolve(realPath, ...missingSegments);
-    } catch {
-      const parent = path.dirname(current);
-      if (parent === current) return resolved;
-      missingSegments.unshift(path.basename(current));
-      current = parent;
+  const walk = async (): Promise<string> => {
+    const missingSegments: string[] = [];
+    let current = resolved;
+    while (true) {
+      try {
+        const realPath = await fs.realpath(current);
+        return path.resolve(realPath, ...missingSegments);
+      } catch {
+        const parent = path.dirname(current);
+        if (parent === current) return resolved;
+        missingSegments.unshift(path.basename(current));
+        current = parent;
+      }
     }
-  }
+  };
+  // One deadline for the whole walk, not one per segment. The loop's `catch`
+  // reads any failure as "this segment is missing" and climbs to the parent, so
+  // a per-segment bound on a wedged mount would abandon a thread per segment.
+  //
+  // Skip the walk entirely once this directory already holds a thread. This is
+  // the only fs consumer on the ownership path: `findGitWorktreeRegistration`
+  // calls it once per registration, so without the pre-check a single
+  // collector candidate would abandon one thread per colocated registration —
+  // 128 of them on the population this collector exists to drain. Guarding
+  // here rather than threading a stop signal through the ownership module
+  // covers `listLinkedGitWorktreePaths` and every future caller too.
+  //
+  // Both the pre-check and the expiry fall back to the lexical path, which is
+  // what the comparison already did on every wedge. Note what that costs: the
+  // two sides of `findGitWorktreeRegistration` are compared *after*
+  // normalization, so a fallback on one side only can miss a registration that
+  // a successful walk would have matched. A miss is not a false match — it
+  // authorizes removal with single `--force` rather than double
+  // (`git-worktree-ownership.ts:474`), which is precisely the case git's own
+  // lock is the backstop for, and the collector only reaches here after
+  // `inspectWorktreeReclaimSafety` has proven the tree clean and pushed.
+  if (isReclaimFsWedgedDir(path.dirname(resolved))) return resolved;
+  return withReclaimFsDeadline(walk(), resolved).catch(() => resolved);
 }
 
 async function listLinkedGitWorktreePaths(repoRoot: string): Promise<Set<string>> {
-  const output = await runGit(["worktree", "list", "--porcelain"], repoRoot);
+  const output = await runGit(["worktree", "list", "--porcelain"], repoRoot, {
+    timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS,
+  });
   const paths = new Set<string>();
   for (const line of output.split("\n")) {
     if (!line.startsWith("worktree ")) continue;
@@ -3199,10 +3716,15 @@ async function listLinkedGitWorktreePaths(repoRoot: string): Promise<Set<string>
  * Shared plumbing for the worktree-ownership guards (BLO-19607). The ownership
  * module takes git and path-normalization as parameters so it stays unit
  * testable; this binds it to the runtime's own implementations.
+ *
+ * Every git call here runs in `repoRoot`, which no inspector proves reachable —
+ * `inspectWorktreeReclaimSafety` only ever stats the worktree. So they carry the
+ * same budget the inspector uses: an unbounded await in this path is also an
+ * unbounded await in the collector's shutdown drain.
  */
 function gitWorktreeOwnershipContext(repoRoot: string) {
   return {
-    git: (args: string[], cwd: string) => runGit(args, cwd),
+    git: (args: string[], cwd: string) => runGit(args, cwd, { timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS }),
     repoRoot,
     normalizePath: resolvePathForWorktreeComparison,
   };
@@ -3392,7 +3914,10 @@ function buildWorkspaceCommandEnv(input: {
   agent: ExecutionWorkspaceAgentRef;
   created: boolean;
 }) {
-  const env: NodeJS.ProcessEnv = { ...process.env };
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...buildAgentGitIdentityEnv(input.agent),
+  };
   env.PAPERCLIP_WORKSPACE_CWD = input.worktreePath;
   env.PAPERCLIP_WORKSPACE_PATH = input.worktreePath;
   env.PAPERCLIP_WORKSPACE_WORKTREE_PATH = input.worktreePath;
@@ -3608,6 +4133,47 @@ async function recordWorkspaceCommandOperation(
   );
 }
 
+/**
+ * Stamp the running agent's git author identity onto a checkout that is about to
+ * be handed to a run, and return the warning (if any) as an array ready to merge
+ * into a `RealizedExecutionWorkspace.warnings` list (BLO-23894).
+ *
+ * This exists for the `project_primary` strategy, which does not go through
+ * `provisionExecutionWorktree`: it runs the agent directly in the base checkout
+ * (or, on the persisted path, in a recorded/rebound one). That strategy is the
+ * *default* -- `asString(rawStrategy.type, "project_primary")` -- so leaving it
+ * unstamped would leave the most common configuration exhibiting exactly the
+ * defect this change is meant to close.
+ *
+ * Never throws: `ensureCheckoutGitIdentity` reports failures as a warning, and a
+ * checkout that could not be stamped is still a usable checkout.
+ */
+async function stampCheckoutIdentity(
+  cwd: string | null | undefined,
+  agent: ExecutionWorkspaceAgentRef,
+): Promise<string[]> {
+  const identity = await ensureCheckoutGitIdentity({ cwd, agent });
+  return identity.warning ? [identity.warning] : [];
+}
+
+/**
+ * Final step of every worktree realization path: attempt the compatibility
+ * checkout stamp (BLO-23894), then run the configured provision command if
+ * there is one. Linked worktrees deliberately skip the local-config write
+ * because it would mutate the common repository; the provision command and the
+ * later adapter invocation receive the authoritative per-run GIT_* environment.
+ *
+ * Identity is applied here rather than at the four `git worktree add` call sites
+ * because this function is the one thing all of them funnel through -- the
+ * create, the attach-existing-branch fallback, the reuse-existing-worktree path,
+ * and the persisted-workspace restore. It also must not be applied at the `add`
+ * sites: their cwd is `repoRoot`, so a `git config` scoped off it would land in
+ * the wrong repository.
+ *
+ * Returns warnings rather than throwing them: a checkout that cannot be stamped
+ * is still a usable checkout, and taking the run down over it would be worse
+ * than a misattributed commit.
+ */
 async function provisionExecutionWorktree(input: {
   strategy: Record<string, unknown>;
   base: ExecutionWorkspaceInput;
@@ -3618,9 +4184,15 @@ async function provisionExecutionWorktree(input: {
   agent: ExecutionWorkspaceAgentRef;
   created: boolean;
   recorder?: WorkspaceOperationRecorder | null;
-}) {
+}): Promise<string[]> {
+  const identity = await ensureCheckoutGitIdentity({
+    cwd: input.worktreePath,
+    agent: input.agent,
+  });
+  const warnings = identity.warning ? [identity.warning] : [];
+
   const provisionCommand = asString(input.strategy.provisionCommand, "").trim();
-  if (!provisionCommand) return;
+  if (!provisionCommand) return warnings;
   const resolvedProvisionCommand = resolveRepoManagedWorkspaceCommand(provisionCommand, input.repoRoot);
 
   await recordWorkspaceCommandOperation(input.recorder, {
@@ -3647,6 +4219,7 @@ async function provisionExecutionWorktree(input: {
     },
     successMessage: `Provisioned workspace at ${input.worktreePath}\n`,
   });
+  return warnings;
 }
 
 function buildExecutionWorkspaceCleanupEnv(input: {
@@ -3684,18 +4257,68 @@ async function resolveGitRepoRootForWorkspaceCleanup(
 ): Promise<string | null> {
   if (projectWorkspaceCwd) {
     const resolvedProjectWorkspaceCwd = path.resolve(projectWorkspaceCwd);
-    const gitDir = await runGit(["rev-parse", "--git-common-dir"], resolvedProjectWorkspaceCwd)
-      .catch(() => null);
+    // Bounded: the project checkout can sit on the same wedged mount as the
+    // worktree, and spawn's chdir into it would otherwise never return.
+    const gitDir = await runGit(["rev-parse", "--git-common-dir"], resolvedProjectWorkspaceCwd, {
+      timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS,
+    }).catch(() => null);
     if (gitDir) {
       const resolvedGitDir = path.resolve(resolvedProjectWorkspaceCwd, gitDir);
       return path.dirname(resolvedGitDir);
     }
   }
 
-  const gitDir = await runGit(["rev-parse", "--git-common-dir"], worktreePath).catch(() => null);
+  const gitDir = await runGit(["rev-parse", "--git-common-dir"], worktreePath, {
+    timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS,
+  }).catch(() => null);
   if (!gitDir) return null;
   const resolvedGitDir = path.resolve(worktreePath, gitDir);
   return path.dirname(resolvedGitDir);
+}
+
+// Kept out of realizeExecutionWorkspace's non-worktree branch on purpose: that
+// branch is the identity seam for the default strategy, and
+// git-checkout-identity.test.ts asserts the stampCheckoutIdentity call stays
+// within a fixed window of the branch head. Inlining this logic pushes it out.
+async function rebindProjectPrimaryToManagedCheckout(input: {
+  base: ExecutionWorkspaceInput;
+  agent: ExecutionWorkspaceAgentRef;
+  recorder: WorkspaceOperationRecorder | null;
+}): Promise<RealizedExecutionWorkspace | null> {
+  const expectedRepoUrl = asString(input.base.repoUrl, "").trim();
+  const projectId = asString(input.base.projectId, "").trim();
+  const companyId = asString(input.agent.companyId, "").trim();
+  const managedCwd = expectedRepoUrl && projectId && companyId
+    ? await findVerifiedManagedProjectPrimaryCheckout({
+        companyId,
+        projectId,
+        expectedRepoUrl,
+        currentCwd: input.base.baseCwd,
+      })
+    : null;
+  if (!managedCwd) {
+    await validateProjectPrimaryRepoOrigin({ cwd: input.base.baseCwd, expectedRepoUrl });
+    return null;
+  }
+  const submoduleWarnings = await ensureGitSubmodulesReady({
+    cwd: managedCwd,
+    recorder: input.recorder,
+  });
+  return {
+    ...input.base,
+    baseCwd: managedCwd,
+    cwd: managedCwd,
+    strategy: "project_primary",
+    branchName: null,
+    worktreePath: null,
+    warnings: [
+      `Rebound stale project_primary cwd "${input.base.baseCwd}" to managed checkout "${managedCwd}".`,
+      ...submoduleWarnings,
+      ...(await stampCheckoutIdentity(managedCwd, input.agent)),
+    ],
+    created: false,
+    baseRefSha: null,
+  };
 }
 
 export async function realizeExecutionWorkspace(input: {
@@ -3716,10 +4339,12 @@ export async function realizeExecutionWorkspace(input: {
     const baseIsGitCheckout = await isGitCheckout(input.base.baseCwd);
     let warnings: string[] = [];
     if (input.base.source === "project_primary" && baseIsGitCheckout) {
-      await validateProjectPrimaryRepoOrigin({
-        cwd: input.base.baseCwd,
-        expectedRepoUrl: input.base.repoUrl,
+      const rebound = await rebindProjectPrimaryToManagedCheckout({
+        base: input.base,
+        agent: input.agent,
+        recorder: input.recorder ?? null,
       });
+      if (rebound) return rebound;
     }
     if (baseIsGitCheckout) {
       warnings = await ensureGitSubmodulesReady({
@@ -3727,13 +4352,16 @@ export async function realizeExecutionWorkspace(input: {
         recorder: input.recorder ?? null,
       });
     }
+    // The default strategy runs the agent directly in the base checkout, so this
+    // is the identity seam for it — there is no worktree funnel on this path.
+    const identityWarnings = await stampCheckoutIdentity(input.base.baseCwd, input.agent);
     return {
       ...input.base,
       strategy: "project_primary",
       cwd: input.base.baseCwd,
       branchName: null,
       worktreePath: null,
-      warnings,
+      warnings: [...warnings, ...identityWarnings],
       created: false,
       baseRefSha: null,
     };
@@ -3747,17 +4375,43 @@ export async function realizeExecutionWorkspace(input: {
     projectId: input.base.projectId,
     repoRef: input.base.repoRef,
   });
+  // BLO-31281: write-time validation only guards NEW config. A template
+  // persisted before that validation existed still renders here, and the
+  // failure is invisible — `applyIssueIdentifierToBranchName` prefixes the
+  // issue identifier below, so the branch looks plausible while the template
+  // contributes nothing but a constant literal.
+  //
+  // Warn, do NOT repair. The worktree path is derived from the branch name, so
+  // silently re-rendering it would point this issue at a different directory
+  // and orphan the existing worktree along with any uncommitted work in it.
+  const branchTemplateWarnings = collectBranchTemplateProblems(branchTemplate).map(
+    (problem) =>
+      `Execution workspace ${problem} It rendered to "${renderedBranch}". Existing worktrees are `
+      + `left untouched; correct workspaceStrategy.branchTemplate to change future branch names.`,
+  );
+  // Both git_worktree return shapes below (reuse and create) must surface these.
+  // Composing every warning list through one helper keeps that guarantee in a
+  // single place: this ticket is about a silent no-op, so the mitigation for it
+  // must not itself be droppable by a later refactor that edits one of the two
+  // arrays and not the other.
+  const composeWarnings = (...groups: Array<readonly string[]>): string[] => [
+    ...branchTemplateWarnings,
+    ...groups.flat(),
+  ];
   // Option (A) (BLO-9117): process-enforce the issue identifier into the branch
   // name so a merged PR reliably ref-links at merge time. See
   // applyIssueIdentifierToBranchName.
   //
   // BLO-19063: then, under `runScope: "per_run"`, append a run token so two
   // concurrent runs of this issue land in different trees instead of sharing
-  // one. Applied after the identifier step so the identifier survives.
+  // one. Applied after the identifier step, and handed the identifier so its
+  // length clamp can re-anchor rather than truncate it (BLO-23144) — ordering
+  // alone only protects an identifier that sits at the front.
   let branchName = applyRunScopeToBranchName(
     applyIssueIdentifierToBranchName(renderedBranch, input.issue?.identifier ?? null),
     resolveExecutionWorkspaceRunScope(rawStrategy.runScope),
     input.heartbeatRunId ?? null,
+    input.issue?.identifier ?? null,
   );
   const configuredParentDir = asString(rawStrategy.worktreeParentDir, "");
   const worktreeParentDir = configuredParentDir
@@ -3834,7 +4488,7 @@ export async function realizeExecutionWorkspace(input: {
       cwd: reusablePath,
       recorder: input.recorder ?? null,
     });
-    await provisionExecutionWorktree({
+    const identityWarnings = await provisionExecutionWorktree({
       strategy: rawStrategy,
       base: input.base,
       repoRoot,
@@ -3852,13 +4506,14 @@ export async function realizeExecutionWorkspace(input: {
       cwd: reusablePath,
       branchName: effectiveBranchName,
       worktreePath: reusablePath,
-      warnings: [
-        ...extraWarnings,
-        ...baseRefreshWarnings,
-        ...baseDrift.warnings,
-        ...reuseOwnershipWarnings,
-        ...submoduleWarnings,
-      ],
+      warnings: composeWarnings(
+        extraWarnings,
+        baseRefreshWarnings,
+        baseDrift.warnings,
+        reuseOwnershipWarnings,
+        submoduleWarnings,
+        identityWarnings,
+      ),
       created: false,
       baseRefSha: refresh.baseRefSha ?? baseDrift.branchBaseRefSha ?? baseDrift.currentBaseRefSha,
       pendingForwardBranchReconcile,
@@ -3988,7 +4643,7 @@ export async function realizeExecutionWorkspace(input: {
     cwd: worktreePath,
     recorder: input.recorder ?? null,
   });
-  await provisionExecutionWorktree({
+  const identityWarnings = await provisionExecutionWorktree({
     strategy: rawStrategy,
     base: input.base,
     repoRoot,
@@ -4007,7 +4662,7 @@ export async function realizeExecutionWorkspace(input: {
     cwd: worktreePath,
     branchName,
     worktreePath,
-    warnings: [...baseRefreshWarnings, ...ownershipWarnings, ...submoduleWarnings],
+    warnings: composeWarnings(baseRefreshWarnings, ownershipWarnings, submoduleWarnings, identityWarnings),
     created: true,
     baseRefSha: currentBaseRefSha,
   };
@@ -4064,36 +4719,49 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     const repoUrl = asString(input.workspace.repoUrl ?? input.base.repoUrl, "").trim();
     if (input.workspace.mode === "shared_workspace") {
       const cwdIsGitCheckout = await isGitCheckout(cwd);
-      if (cwdIsGitCheckout) {
-        await validateProjectPrimaryRepoOrigin({
-          cwd,
-          expectedRepoUrl: repoUrl,
-        });
-      } else {
-        const projectId = asString(input.workspace.projectId ?? input.base.projectId, "").trim();
-        const companyId = asString(input.agent.companyId, "").trim();
-        if (repoUrl && projectId && companyId) {
-          const managedCwd = resolveManagedProjectWorkspaceDir({
+      const projectId = asString(input.workspace.projectId ?? input.base.projectId, "").trim();
+      const companyId = asString(input.agent.companyId, "").trim();
+      const managedCwd = repoUrl && projectId && companyId
+        ? await findVerifiedManagedProjectPrimaryCheckout({
             companyId,
             projectId,
-            repoName: deriveRepoNameFromRepoUrlForRuntime(repoUrl),
-          });
-          if (managedCwd !== cwd && (await isGitCheckout(managedCwd))) {
-            return {
-              ...realized,
-              cwd: managedCwd,
-              warnings: [
-                `Rebound stale shared workspace cwd "${cwd}" to managed checkout "${managedCwd}".`,
-              ],
-            };
-          }
-        }
+            expectedRepoUrl: repoUrl,
+            currentCwd: cwd,
+          })
+        : null;
+      if (managedCwd) {
+        const submoduleWarnings = await ensureGitSubmodulesReady({
+          cwd: managedCwd,
+          recorder: input.recorder ?? null,
+        });
+        return {
+          ...realized,
+          cwd: managedCwd,
+          baseCwd: managedCwd,
+          warnings: [
+            `Rebound stale shared workspace cwd "${cwd}" to managed checkout "${managedCwd}".`,
+            ...submoduleWarnings,
+            ...(await stampCheckoutIdentity(managedCwd, input.agent)),
+          ],
+        };
+      }
+      if (cwdIsGitCheckout) {
+        await validateProjectPrimaryRepoOrigin({ cwd, expectedRepoUrl: repoUrl });
+      } else if (repoUrl && projectId && companyId) {
+        throw new WorkspaceRepoMismatchError(
+          `No verified managed checkout exists for expected repository "${repoUrl}"; refusing to start from "${cwd}".`,
+        );
       }
     }
     if (!await directoryExists(cwd)) {
       return null;
     }
-    return realized;
+    // Persisted `project_primary` reuse: the recorded cwd is handed straight to
+    // the run, so this is the last chance to stamp it (BLO-23894).
+    return {
+      ...realized,
+      warnings: [...realized.warnings, ...(await stampCheckoutIdentity(cwd, input.agent))],
+    };
   }
   const repoRoot = await runGit(["rev-parse", "--show-toplevel"], input.base.baseCwd);
   const recordedBaseRefSha = readRecordedBaseRefSha(input.workspace.metadata);
@@ -4166,22 +4834,25 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     });
     realized.warnings = [...repairWarnings, ...baseRefreshWarnings, ...baseDrift.warnings];
     realized.baseRefSha = refresh.baseRefSha ?? recordedBaseRefSha ?? baseDrift.branchBaseRefSha ?? baseDrift.currentBaseRefSha;
-    if (provisionCommand) {
-      await provisionExecutionWorktree({
-        strategy: {
-          type: "git_worktree",
-          provisionCommand,
-        },
-        base: input.base,
-        repoRoot,
-        worktreePath: realized.worktreePath ?? cwd,
-        branchName: realized.branchName ?? "",
-        issue: input.issue,
-        agent: input.agent,
-        created: false,
-        recorder: input.recorder ?? null,
-      });
-    }
+    // Unconditional, unlike the previous `if (provisionCommand)` guard: this is
+    // the reuse path for an *already existing* worktree, which is exactly the
+    // population BLO-23894 found unstamped. `provisionExecutionWorktree` is a
+    // no-op for the command itself when none is configured.
+    const identityWarnings = await provisionExecutionWorktree({
+      strategy: {
+        type: "git_worktree",
+        ...(provisionCommand ? { provisionCommand } : {}),
+      },
+      base: input.base,
+      repoRoot,
+      worktreePath: realized.worktreePath ?? cwd,
+      branchName: realized.branchName ?? "",
+      issue: input.issue,
+      agent: input.agent,
+      created: false,
+      recorder: input.recorder ?? null,
+    });
+    realized.warnings = [...realized.warnings, ...identityWarnings];
     return realized;
   }
 
@@ -4276,7 +4947,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     skipRefresh: true,
   });
 
-  await provisionExecutionWorktree({
+  const identityWarnings = await provisionExecutionWorktree({
     strategy: {
       type: "git_worktree",
       ...(provisionCommand ? { provisionCommand } : {}),
@@ -4300,6 +4971,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       ...restoreRefreshWarnings,
       ...restoreOwnershipWarnings,
       ...baseDrift.warnings,
+      ...identityWarnings,
     ],
     created,
     baseRefSha:
@@ -4307,6 +4979,168 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       ?? (created ? restoreCurrentBaseRefSha : baseDrift.branchBaseRefSha)
       ?? baseDrift.currentBaseRefSha,
   };
+}
+
+export type WorktreeReclaimSafety = {
+  /** True only when reclaiming the disk provably discards no work. */
+  safe: boolean;
+  reason: "missing" | "clean" | "dirty" | "unpushed" | "unverifiable";
+  detail: string | null;
+};
+
+const WORKTREE_RECLAIM_GIT_TIMEOUT_MS = 30_000;
+
+const reclaimFsWedgedRoots = new Map<string, number>();
+
+/**
+ * Directories with an abandoned call still outstanding — threads held right
+ * now, refcounted because a directory can hold more than one.
+ *
+ * Ending the pass bounds a single window, not the process: the next window is
+ * free to abandon one more on the same wedged mount, and four such windows
+ * retire the default pool for every other fs/dns/crypto consumer in the server.
+ * So the hold is on the *directory*, which is what makes it self-clearing and
+ * keeps the collector working on every other mount instead of latching off.
+ *
+ * Refcounted, not a set: the pre-checks below make a second call under a held
+ * directory rare rather than impossible — two callers can both check before
+ * either expires, and the run-teardown and operator-PATCH callers of
+ * `withReclaimFsDeadline` share this map. With a set, whichever syscall
+ * answered first would clear the hold while the other still held its thread,
+ * so the count the backstop reads would understate the pool in use.
+ */
+export function isReclaimFsWedgedDir(dir: string): boolean {
+  return reclaimFsWedgedRoots.has(dir);
+}
+
+/** Threads held by abandoned calls right now, summed across directories. */
+export function reclaimFsOutstandingCount(): number {
+  let outstanding = 0;
+  for (const held of reclaimFsWedgedRoots.values()) outstanding += held;
+  return outstanding;
+}
+
+/**
+ * Backstop for a spread of wedged roots: half the threadpool. A bounded burst,
+ * not a bound — both gates that read it are pre-checks, so a candidate admitted
+ * at `limit - 1` can still hold its inspector stat, its registry walk and its
+ * cleanup-side stat before the next loop-top read sees any of them: `limit + 2`
+ * from the collector alone on the default pool of 4. The run-teardown and
+ * operator-PATCH callers of `withReclaimFsDeadline` never consult it at all.
+ */
+export const RECLAIM_FS_OUTSTANDING_LIMIT = (() => {
+  // `Number.isFinite` rather than `|| 2`, which would also catch the legitimate
+  // 0 that `UV_THREADPOOL_SIZE=1` floors to — the one pool size where the
+  // backstop most needs to be 1.
+  const poolSize = Number(process.env.UV_THREADPOOL_SIZE ?? 4);
+  return Number.isFinite(poolSize) ? Math.max(1, Math.floor(poolSize / 2)) : 2;
+})();
+
+/**
+ * Bounds a filesystem call that can block indefinitely on a wedged mount. The
+ * collector runs as tracked heartbeat-scheduler work, so an unbounded await in
+ * its path is also an unbounded await in the shutdown drain. fs calls cannot be
+ * cancelled: on expiry the call is abandoned and the caller takes its
+ * fail-closed branch, with an ETIMEDOUT error in place of the errno.
+ *
+ * `target` is the path being read; its parent directory is what gets held while
+ * the abandoned call is outstanding, so colocated siblings are not probed too.
+ */
+async function withReclaimFsDeadline<T>(operation: Promise<T>, target: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const wedgedDir = path.dirname(path.resolve(target));
+      reclaimFsWedgedRoots.set(wedgedDir, (reclaimFsWedgedRoots.get(wedgedDir) ?? 0) + 1);
+      // Abandoned, not cancelled: the thread returns to the pool only when the
+      // syscall itself finally answers, so release the hold on settle.
+      const release = () => {
+        const outstanding = (reclaimFsWedgedRoots.get(wedgedDir) ?? 1) - 1;
+        if (outstanding > 0) reclaimFsWedgedRoots.set(wedgedDir, outstanding);
+        else reclaimFsWedgedRoots.delete(wedgedDir);
+      };
+      void operation.then(release, release);
+      reject(Object.assign(new Error(`filesystem call exceeded ${WORKTREE_RECLAIM_GIT_TIMEOUT_MS}ms`), {
+        code: "ETIMEDOUT",
+      }));
+    }, WORKTREE_RECLAIM_GIT_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([operation, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Fail-closed pre-check for reclaiming a worktree's disk (BLO-22984).
+ *
+ * `cleanupExecutionWorkspaceArtifacts` removes with `--force --force`, which is
+ * correct for its existing callers — a persist-rollback tearing down a tree it
+ * created seconds earlier, and an explicit operator PATCH. A background
+ * collector has neither of those warrants, so it asks this first and leaves
+ * anything it cannot *prove* clean alone. Every failure mode returns
+ * `unverifiable`, never `clean`: an unreadable tree is a reason to skip, not a
+ * reason to proceed.
+ */
+export async function inspectWorktreeReclaimSafety(worktreePath: string): Promise<WorktreeReclaimSafety> {
+  // Deliberately not `directoryExists`, which is `stat().catch(() => false)`:
+  // that collapses EACCES/EIO/ESTALE into "missing" and so returns `safe` for a
+  // tree it never read. Only an errno that *proves* nothing is there counts as
+  // missing; every other failure is unverifiable.
+  try {
+    // Same bound as the git probes below: a stat that never returns is an
+    // unreadable tree (ETIMEDOUT lands in the catch as unverifiable).
+    const stats = await withReclaimFsDeadline(fs.stat(worktreePath), worktreePath);
+    if (!stats.isDirectory()) {
+      return { safe: false, reason: "unverifiable", detail: `${worktreePath} exists but is not a directory` };
+    }
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      // Nothing materialized: only a registry entry can remain, and removing
+      // that discards no work.
+      return { safe: true, reason: "missing", detail: null };
+    }
+    return { safe: false, reason: "unverifiable", detail: `stat failed: ${code ?? String(error)}` };
+  }
+
+  const git = async (args: string[]): Promise<{ ok: true; out: string } | { ok: false; error: string }> => {
+    try {
+      return { ok: true, out: await runGit(args, worktreePath, { timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS }) };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  };
+
+  const status = await git(["status", "--porcelain"]);
+  if (!status.ok) return { safe: false, reason: "unverifiable", detail: `git status failed: ${status.error}` };
+  if (status.out.trim()) {
+    const changed = status.out.trim().split("\n");
+    return {
+      safe: false,
+      reason: "dirty",
+      detail: `${changed.length} uncommitted path(s), first: ${changed[0]?.trim() ?? ""}`,
+    };
+  }
+
+  const head = await git(["rev-parse", "HEAD"]);
+  if (!head.ok) return { safe: false, reason: "unverifiable", detail: `git rev-parse HEAD failed: ${head.error}` };
+  const headSha = head.out.trim();
+  if (!headSha) return { safe: false, reason: "unverifiable", detail: "empty HEAD" };
+
+  // Containment in any remote-tracking branch is the cheap proof that HEAD is
+  // published. It deliberately does not care *which* remote branch: a topic
+  // branch pushed for review counts, and that is the common shape here.
+  const remotes = await git(["branch", "-r", "--contains", headSha]);
+  if (!remotes.ok) {
+    return { safe: false, reason: "unverifiable", detail: `git branch -r --contains failed: ${remotes.error}` };
+  }
+  if (!remotes.out.trim()) {
+    return { safe: false, reason: "unpushed", detail: `HEAD ${headSha.slice(0, 9)} is on no remote branch` };
+  }
+
+  return { safe: true, reason: "clean", detail: null };
 }
 
 export async function cleanupExecutionWorkspaceArtifacts(input: {
@@ -4378,8 +5212,15 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
     }
   }
 
+  // A stat that hits its deadline proves nothing either way: skip removal,
+  // and do not stat the same wedged path again for the final check.
+  let worktreeStatExpired = false;
   if (input.workspace.providerType === "git_worktree" && workspacePath) {
-    const worktreeExists = await directoryExists(workspacePath);
+    const worktreeExists = await withReclaimFsDeadline(directoryExists(workspacePath), workspacePath).catch((err) => {
+      worktreeStatExpired = true;
+      warnings.push(`Could not stat "${workspacePath}": ${(err as NodeJS.ErrnoException)?.code ?? String(err)}.`);
+      return false;
+    });
     if (worktreeExists) {
       if (!repoRoot) {
         warnings.push(`Could not resolve git repo root for "${workspacePath}".`);
@@ -4406,6 +5247,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
               phase: "worktree_cleanup",
               args: ["worktree", "remove", ...removeForceArgs, workspacePath],
               cwd: repoRoot,
+              timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS,
               metadata: {
                 workspaceId: input.workspace.id,
                 workspacePath,
@@ -4431,6 +5273,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
             phase: "worktree_cleanup",
             args: ["branch", "-d", input.workspace.branchName],
             cwd: repoRoot,
+            timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS,
             metadata: {
               workspaceId: input.workspace.id,
               workspacePath,
@@ -4480,7 +5323,8 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
 
   const cleaned =
     !workspacePath ||
-    !(await directoryExists(workspacePath));
+    (!worktreeStatExpired &&
+      (await withReclaimFsDeadline(directoryExists(workspacePath), workspacePath).then((exists) => !exists, () => false)));
 
   return {
     cleanedPath: workspacePath,

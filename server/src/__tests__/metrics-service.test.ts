@@ -2,6 +2,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   AGENT_NO_USAGE_STREAK_METRIC,
   AUTH_REQUEST_METRIC,
+  BACKSTOP_CANDIDATES_SKIPPED_METRIC,
+  BACKSTOP_DEFERRED_CANDIDATES_METRIC,
+  BACKSTOP_SKIP_REASONS,
+  BACKSTOP_SOURCES,
+  BACKSTOP_SWEEP_COMPLETED_METRIC,
   CONCURRENT_RUN_BLOCKED_METRIC,
   DEP_BLOCKED_WAKEUP_METRIC,
   ROUTINE_DISPATCH_METRIC,
@@ -25,10 +30,21 @@ import {
   recordConcurrentRunBlocked,
   recordAgentZeroTokenCompletedRunStreak,
   recordAuthRequest,
+  recordBackstopCandidateSkipped,
+  recordBackstopSweepCompleted,
+  recordGbrainRecallOutcome,
+  GBRAIN_RECALL_METRIC,
+  UNKNOWN_GBRAIN_RECALL_STATUS,
+  normalizeGbrainRecallStatus,
   recordHeartbeatRunFailed,
   recordIsolatedRunStarted,
   renderMetrics,
+  setBackstopDeferredCandidates,
   EXTERNAL_LIFECYCLE_RUNNING_RUNS_METRIC,
+  GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC,
+  GITHUB_SUPPRESSION_CAUSE_REVIEWER_LOCK_CONTENDED,
+  UNKNOWN_GITHUB_SUPPRESSION_CAUSE,
+  recordGithubReviewRequestSuppressed,
   GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC,
   KNOWN_PROCESS_LOSS_CLASSIFICATIONS,
   KNOWN_WORKFLOW_RUN_CONCLUSIONS,
@@ -63,6 +79,14 @@ import {
   AGENT_HEARTBEAT_AGE_SECONDS_METRIC,
   AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC,
   AGENT_ERROR_DURATION_SECONDS_METRIC,
+  PLUGIN_ERROR_METRIC,
+  PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC,
+  setPluginErrorStatus,
+  setPluginStatusCollectorLastSuccessSeconds,
+  PR_REVIEW_QUEUE_WAIT_METRIC,
+  PR_REVIEW_QUEUE_WAIT_BUCKETS_SECONDS,
+  computePrReviewQueueWaitSeconds,
+  recordPrReviewQueueWait,
 } from "../services/metrics.js";
 import {
   incrementRoutineDispatchMetric,
@@ -78,6 +102,33 @@ import {
 
 afterEach(() => {
   __resetMetricsForTest();
+});
+
+describe("PR-review queue-wait metrics (BLO-30623)", () => {
+  it("computes only valid pr_review queue waits and ignores other or never-started runs", () => {
+    expect(computePrReviewQueueWaitSeconds(
+      "pr_review:Blockcast/paperclip:123",
+      "2026-08-31T00:00:00.000Z",
+      "2026-08-31T01:05:00.000Z",
+    )).toBe(3900);
+    expect(computePrReviewQueueWaitSeconds("issue_board:123", "2026-08-31T00:00:00Z", "2026-08-31T01:00:00Z")).toBeNull();
+    expect(computePrReviewQueueWaitSeconds("pr_review:repo:123", "2026-08-31T00:00:00Z", null)).toBeNull();
+    expect(computePrReviewQueueWaitSeconds("pr_review:repo:123", "not-a-date", "2026-08-31T01:00:00Z")).toBeNull();
+  });
+
+  it("emits the bounded histogram buckets without unbounded labels", async () => {
+    expect(recordPrReviewQueueWait({
+      taskKey: "pr_review:Blockcast/paperclip:123",
+      createdAt: "2026-08-31T00:00:00.000Z",
+      startedAt: "2026-08-31T01:05:00.000Z",
+    })).toBe(3900);
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${PR_REVIEW_QUEUE_WAIT_METRIC}_bucket{le="3600"} 0`);
+    expect(body).toContain(`${PR_REVIEW_QUEUE_WAIT_METRIC}_bucket{le="7200"} 1`);
+    expect(body).toContain(`${PR_REVIEW_QUEUE_WAIT_METRIC}_count 1`);
+    expect(PR_REVIEW_QUEUE_WAIT_BUCKETS_SECONDS).toEqual([60, 300, 600, 900, 1800, 3600, 7200, 14400, 28800]);
+    expect(body).not.toContain("Blockcast");
+  });
 });
 
 describe("authentication request metrics", () => {
@@ -340,12 +391,16 @@ describe("recordHeartbeatRunFailed + renderMetrics", () => {
     );
   });
 
+  // BLO-17953: every k8s isolation mode is an execution pod, so a pod-schedule
+  // failure must stay attributable in all of them. This previously asserted the
+  // opposite (collapse), which is what made PaperclipExecutionPodFailureLoop
+  // structurally blind to workspace/shared-isolated pods.
   it.each([
     ["workspace", "workspace"],
     ["shared", "shared"],
     ["not-a-mode", UNKNOWN_ISOLATION_MODE],
   ])(
-    "collapses source identifiers for %s pod-schedule failures",
+    "retains source identifiers for %s pod-schedule failures",
     async (isolationMode, expectedIsolationMode) => {
       const labels = recordHeartbeatRunFailed({
         agentId: "agent-a",
@@ -357,8 +412,8 @@ describe("recordHeartbeatRunFailed + renderMetrics", () => {
       });
 
       expect(labels).toEqual({
-        agent_id: UNKNOWN_AGENT_ID,
-        issue_id: "none",
+        agent_id: "agent-a",
+        issue_id: "issue-a",
         adapter: "claude_k8s",
         error_code: "k8s_pod_schedule_failed",
         invocation_source: "github_pr_review_submitted",
@@ -367,10 +422,54 @@ describe("recordHeartbeatRunFailed + renderMetrics", () => {
 
       const { body } = await renderMetrics();
       expect(body).toContain(
-        `${HEARTBEAT_RUN_FAILED_METRIC}{agent_id="${UNKNOWN_AGENT_ID}",issue_id="none",adapter="claude_k8s",error_code="k8s_pod_schedule_failed",invocation_source="github_pr_review_submitted",isolation_mode="${expectedIsolationMode}"} 1`,
+        `${HEARTBEAT_RUN_FAILED_METRIC}{agent_id="agent-a",issue_id="issue-a",adapter="claude_k8s",error_code="k8s_pod_schedule_failed",invocation_source="github_pr_review_submitted",isolation_mode="${expectedIsolationMode}"} 1`,
       );
     },
   );
+
+  it.each([
+    "workspace_repo_mismatch",
+    "workspace_validation_failed",
+    "setup_failed",
+  ])(
+    "collapses issue_id/agent_id for pre-dispatch setup failure %s (BLO-28648)",
+    async (errorCode) => {
+      const labels = recordHeartbeatRunFailed({
+        agentId: "agent-a",
+        issueId: "issue-a",
+        adapter: "claude_k8s",
+        errorCode,
+        invocationSource: "capacity_blocked_retry",
+        isolationMode: "shared",
+      });
+      // Only k8s_pod_schedule_failed keeps the real ids (in every isolation mode,
+      // BLO-17953). Every other code — including every workspace refusal —
+      // collapses them, so a Prometheus selector of the form
+      // `error_code="<workspace code>", issue_id!="none"` can never match.
+      // BLO-28648 shipped exactly that alert; it loaded healthy and could not
+      // fire. Assert the collapse so the impossibility stays documented.
+      expect(labels.issue_id).toBe("none");
+      expect(labels.agent_id).toBe(UNKNOWN_AGENT_ID);
+      expect(labels.error_code).toBe(errorCode);
+    },
+  );
+
+  // The cardinality bound is the error code, not the isolation mode: a
+  // non-pod-schedule failure must still collapse both source identifiers even
+  // in `run` isolation, or every historical issue retains a series.
+  it("still collapses source identifiers for non-pod-schedule failures in run isolation", async () => {
+    const labels = recordHeartbeatRunFailed({
+      agentId: "agent-a",
+      issueId: "issue-a",
+      adapter: "claude_k8s",
+      errorCode: "job_failed",
+      invocationSource: "github_pr_review_submitted",
+      isolationMode: "run",
+    });
+
+    expect(labels.agent_id).toBe(UNKNOWN_AGENT_ID);
+    expect(labels.issue_id).toBe("none");
+  });
 
   it("collapses unknown invocation source to the bounded fallback (cardinality guardrail)", async () => {
     const labels = recordHeartbeatRunFailed({
@@ -460,6 +559,100 @@ describe("recordAgentZeroTokenCompletedRunStreak + renderMetrics", () => {
       `${AGENT_NO_USAGE_STREAK_METRIC}{agent_id="${UNKNOWN_AGENT_ID}",adapter="unknown"} 0`,
     );
     expect(body).not.toContain("ghost");
+  });
+
+  // BLO-21415: `adapter` used to latch. This gauge is written per-agent from
+  // that agent's own heartbeat finalization, so nothing ever retired the child
+  // minted under a previous adapterType -- it stayed frozen at its last value
+  // for the process lifetime and kept firing PaperclipAgentZeroTokenRunStreak
+  // while the agent's live series read healthy.
+  it("retires the previous adapter's series when an agent changes adapter", async () => {
+    const knownAgentIds = new Set(["agent-a"]);
+    recordAgentZeroTokenCompletedRunStreak({
+      agentId: "agent-a",
+      adapter: "opencode_k8s",
+      streak: 10,
+      knownAgentIds,
+    });
+
+    const before = await renderMetrics();
+    expect(before.body).toContain(
+      `${AGENT_NO_USAGE_STREAK_METRIC}{agent_id="agent-a",adapter="opencode_k8s"} 10`,
+    );
+
+    recordAgentZeroTokenCompletedRunStreak({
+      agentId: "agent-a",
+      adapter: "claude_k8s",
+      streak: 0,
+      knownAgentIds,
+    });
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${AGENT_NO_USAGE_STREAK_METRIC}{agent_id="agent-a",adapter="claude_k8s"} 0`,
+    );
+    // The orphaned series is gone entirely, not merely zeroed -- a lingering
+    // `opencode_k8s` child at 10 is exactly what fired the alert forever.
+    expect(body).not.toContain(
+      `${AGENT_NO_USAGE_STREAK_METRIC}{agent_id="agent-a",adapter="opencode_k8s"}`,
+    );
+  });
+
+  it("keeps other agents' series when one agent changes adapter", async () => {
+    const knownAgentIds = new Set(["agent-a", "agent-b"]);
+    recordAgentZeroTokenCompletedRunStreak({
+      agentId: "agent-b",
+      adapter: "opencode_k8s",
+      streak: 7,
+      knownAgentIds,
+    });
+    recordAgentZeroTokenCompletedRunStreak({
+      agentId: "agent-a",
+      adapter: "opencode_k8s",
+      streak: 4,
+      knownAgentIds,
+    });
+    recordAgentZeroTokenCompletedRunStreak({
+      agentId: "agent-a",
+      adapter: "claude_k8s",
+      streak: 1,
+      knownAgentIds,
+    });
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${AGENT_NO_USAGE_STREAK_METRIC}{agent_id="agent-b",adapter="opencode_k8s"} 7`,
+    );
+    expect(body).toContain(
+      `${AGENT_NO_USAGE_STREAK_METRIC}{agent_id="agent-a",adapter="claude_k8s"} 1`,
+    );
+    expect(body).not.toContain(
+      `${AGENT_NO_USAGE_STREAK_METRIC}{agent_id="agent-a",adapter="opencode_k8s"}`,
+    );
+  });
+
+  it("re-recording the same adapter keeps a single series at the newest value", async () => {
+    const knownAgentIds = new Set(["agent-a"]);
+    recordAgentZeroTokenCompletedRunStreak({
+      agentId: "agent-a",
+      adapter: "opencode_k8s",
+      streak: 2,
+      knownAgentIds,
+    });
+    recordAgentZeroTokenCompletedRunStreak({
+      agentId: "agent-a",
+      adapter: "opencode_k8s",
+      streak: 5,
+      knownAgentIds,
+    });
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${AGENT_NO_USAGE_STREAK_METRIC}{agent_id="agent-a",adapter="opencode_k8s"} 5`,
+    );
+    expect(
+      body.split("\n").filter((line) => line.startsWith(`${AGENT_NO_USAGE_STREAK_METRIC}{`)),
+    ).toHaveLength(1);
   });
 });
 
@@ -719,6 +912,7 @@ describe("setAgentLivenessMetrics (BLO-23413 outcome-side agent liveness)", () =
       {
         agentId: "agent-enabled",
         heartbeatEnabled: true,
+        heartbeatExpected: true,
         heartbeatAgeSeconds: 120,
         heartbeatIntervalSeconds: 1800,
         errorDurationSeconds: 0,
@@ -726,6 +920,7 @@ describe("setAgentLivenessMetrics (BLO-23413 outcome-side agent liveness)", () =
       {
         agentId: "agent-disabled",
         heartbeatEnabled: false,
+        heartbeatExpected: true,
         heartbeatAgeSeconds: 99999,
         heartbeatIntervalSeconds: 3600,
         errorDurationSeconds: 45,
@@ -747,15 +942,15 @@ describe("setAgentLivenessMetrics (BLO-23413 outcome-side agent liveness)", () =
 
   it("reset-then-sets so an agent dropped from the next snapshot disappears rather than freezing stale", async () => {
     setAgentLivenessMetrics([
-      { agentId: "agent-a", heartbeatEnabled: true, heartbeatAgeSeconds: 10, heartbeatIntervalSeconds: 1800, errorDurationSeconds: 0 },
-      { agentId: "agent-b", heartbeatEnabled: true, heartbeatAgeSeconds: 20, heartbeatIntervalSeconds: 1800, errorDurationSeconds: 0 },
+      { agentId: "agent-a", heartbeatEnabled: true, heartbeatExpected: true, heartbeatAgeSeconds: 10, heartbeatIntervalSeconds: 1800, errorDurationSeconds: 0 },
+      { agentId: "agent-b", heartbeatEnabled: true, heartbeatExpected: true, heartbeatAgeSeconds: 20, heartbeatIntervalSeconds: 1800, errorDurationSeconds: 0 },
     ]);
     let body = (await renderMetrics()).body;
     expect(body).toContain(`${AGENT_HEARTBEAT_AGE_SECONDS_METRIC}{agent_id="agent-b"} 20`);
 
     // Next publish: agent-b is gone (deleted, or heartbeat disabled).
     setAgentLivenessMetrics([
-      { agentId: "agent-a", heartbeatEnabled: true, heartbeatAgeSeconds: 40, heartbeatIntervalSeconds: 1800, errorDurationSeconds: 0 },
+      { agentId: "agent-a", heartbeatEnabled: true, heartbeatExpected: true, heartbeatAgeSeconds: 40, heartbeatIntervalSeconds: 1800, errorDurationSeconds: 0 },
     ]);
     body = (await renderMetrics()).body;
     expect(body).toContain(`${AGENT_HEARTBEAT_AGE_SECONDS_METRIC}{agent_id="agent-a"} 40`);
@@ -767,6 +962,7 @@ describe("setAgentLivenessMetrics (BLO-23413 outcome-side agent liveness)", () =
       {
         agentId: "agent-c",
         heartbeatEnabled: true,
+        heartbeatExpected: true,
         heartbeatAgeSeconds: Number.NaN,
         heartbeatIntervalSeconds: -5,
         errorDurationSeconds: -10,
@@ -777,6 +973,105 @@ describe("setAgentLivenessMetrics (BLO-23413 outcome-side agent liveness)", () =
     expect(body).not.toContain(`${AGENT_HEARTBEAT_AGE_SECONDS_METRIC}{agent_id="agent-c"}`);
     expect(body).toContain(`${AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC}{agent_id="agent-c"} 0`);
     expect(body).toContain(`${AGENT_ERROR_DURATION_SECONDS_METRIC}{agent_id="agent-c"} 0`);
+  });
+
+  // BLO-28861: `heartbeat.enabled` is not cleared on termination, so config
+  // alone let terminated agents export an age that grows forever and could
+  // never fall back under the alert threshold. `heartbeatExpected` is the
+  // second, independent gate; error duration must survive it untouched.
+  it("suppresses age+interval for a heartbeat-enabled agent that is not expected to heartbeat, while keeping its error duration", async () => {
+    setAgentLivenessMetrics([
+      {
+        agentId: "agent-not-expected",
+        heartbeatEnabled: true,
+        heartbeatExpected: false,
+        heartbeatAgeSeconds: 9_876_543,
+        heartbeatIntervalSeconds: 30,
+        errorDurationSeconds: 77,
+      },
+      {
+        agentId: "agent-expected",
+        heartbeatEnabled: true,
+        heartbeatExpected: true,
+        heartbeatAgeSeconds: 42,
+        heartbeatIntervalSeconds: 1800,
+        errorDurationSeconds: 0,
+      },
+    ]);
+
+    const { body } = await renderMetrics();
+    expect(body).not.toContain(`${AGENT_HEARTBEAT_AGE_SECONDS_METRIC}{agent_id="agent-not-expected"}`);
+    expect(body).not.toContain(`${AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC}{agent_id="agent-not-expected"}`);
+    // The gate is age/interval-only: error duration is a status observation,
+    // not a liveness claim, and BLO-28861 preserves its series set.
+    expect(body).toContain(`${AGENT_ERROR_DURATION_SECONDS_METRIC}{agent_id="agent-not-expected"} 77`);
+    // Control: the gate is not simply suppressing everything.
+    expect(body).toContain(`${AGENT_HEARTBEAT_AGE_SECONDS_METRIC}{agent_id="agent-expected"} 42`);
+    expect(body).toContain(`${AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC}{agent_id="agent-expected"} 1800`);
+  });
+});
+
+describe("setPluginErrorStatus (BLO-21092)", () => {
+  it("registers the gauge and reports 1 for an errored plugin, 0 for a ready one", async () => {
+    setPluginErrorStatus([
+      { id: "11111111-1111-1111-1111-111111111111", pluginKey: "lucitra.plugin-secrets", isError: true },
+      { id: "22222222-2222-2222-2222-222222222222", pluginKey: "example.plugin", isError: false },
+    ]);
+    const { body } = await renderMetrics();
+    expect(body).toContain(`# TYPE ${PLUGIN_ERROR_METRIC} gauge`);
+    expect(body).toContain(
+      `${PLUGIN_ERROR_METRIC}{plugin_id="11111111-1111-1111-1111-111111111111",plugin_key="lucitra.plugin-secrets"} 1`,
+    );
+    expect(body).toContain(
+      `${PLUGIN_ERROR_METRIC}{plugin_id="22222222-2222-2222-2222-222222222222",plugin_key="example.plugin"} 0`,
+    );
+  });
+
+  it("drops a plugin's series once it is no longer in the installed roster (reset-then-set)", async () => {
+    setPluginErrorStatus([
+      { id: "11111111-1111-1111-1111-111111111111", pluginKey: "lucitra.plugin-secrets", isError: true },
+    ]);
+    let body = (await renderMetrics()).body;
+    expect(body).toContain(
+      `${PLUGIN_ERROR_METRIC}{plugin_id="11111111-1111-1111-1111-111111111111",plugin_key="lucitra.plugin-secrets"} 1`,
+    );
+
+    // Plugin uninstalled: next tick's roster no longer includes it.
+    setPluginErrorStatus([]);
+    body = (await renderMetrics()).body;
+    expect(body).not.toContain("plugin_id=\"11111111-1111-1111-1111-111111111111\"");
+  });
+
+  it("flips an existing plugin's series from error to ready without leaving a stale 1", async () => {
+    setPluginErrorStatus([
+      { id: "11111111-1111-1111-1111-111111111111", pluginKey: "lucitra.plugin-secrets", isError: true },
+    ]);
+    setPluginErrorStatus([
+      { id: "11111111-1111-1111-1111-111111111111", pluginKey: "lucitra.plugin-secrets", isError: false },
+    ]);
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${PLUGIN_ERROR_METRIC}{plugin_id="11111111-1111-1111-1111-111111111111",plugin_key="lucitra.plugin-secrets"} 0`,
+    );
+  });
+});
+
+describe("setPluginStatusCollectorLastSuccessSeconds (BLO-21092 review follow-up)", () => {
+  it("registers no series until first set -- unlike a bare gauge, prom-client does not auto-publish a labeled gauge at 0 (Ally review: this is what keeps the API tier, which never calls this setter, from freezing the series at 0 and permanently satisfying a staleness alert)", async () => {
+    const { body } = await renderMetrics();
+    expect(body).toContain(`# TYPE ${PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC} gauge`);
+    expect(body).not.toContain(`${PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC}{`);
+  });
+
+  it("reports the exact unix-seconds value passed in under role=\"worker\", and only advances on an explicit call", async () => {
+    setPluginStatusCollectorLastSuccessSeconds(1_700_000_000);
+    let body = (await renderMetrics()).body;
+    expect(body).toContain(`${PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC}{role="worker"} 1700000000`);
+
+    // A second success tick advances it; nothing else can move it backward or forward.
+    setPluginStatusCollectorLastSuccessSeconds(1_700_000_030);
+    body = (await renderMetrics()).body;
+    expect(body).toContain(`${PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC}{role="worker"} 1700000030`);
   });
 });
 
@@ -1022,5 +1317,157 @@ describe("setQueuedRunOldestAgeMetrics (BLO-21116)", () => {
     const { body } = await renderMetrics();
     expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 9000`);
     expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${UNKNOWN_AGENT_ID}"} 4500`);
+  });
+});
+
+describe("backstop metrics (BLO-29763)", () => {
+  it("pre-seeds the COUNTERS at zero too, not just the gauge, so absence never reads as 'no sweep'", async () => {
+    // Measured live 2026-09-20 on paperclip-0: the gauge was present for both streams
+    // (one at 20, one at 0) while `paperclip_backstop_sweep_completed_total` carried
+    // EXACTLY ONE series -- issue_graph_liveness.backstop was absent entirely, because
+    // that process had not yet completed a sweep. Mechanism and the alert shape this
+    // does and does not fix: see the pre-seed loop in `ensureRegistry` (metrics.ts).
+    // This asserts the healthy-but-untouched state BEFORE anything is recorded.
+    const body = (await renderMetrics()).body;
+
+    for (const source of BACKSTOP_SOURCES) {
+      expect(body).toContain(`${BACKSTOP_DEFERRED_CANDIDATES_METRIC}{source="${source}"} 0`);
+      expect(body).toContain(`${BACKSTOP_SWEEP_COMPLETED_METRIC}{source="${source}"} 0`);
+      for (const reason of BACKSTOP_SKIP_REASONS) {
+        expect(body).toContain(
+          `${BACKSTOP_CANDIDATES_SKIPPED_METRIC}{source="${source}",reason="${reason}"} 0`,
+        );
+      }
+    }
+  });
+
+  it("publishes both bounded streams at zero, then records depth, completion, and skips", async () => {
+    let body = (await renderMetrics()).body;
+    expect(body).toContain(`${BACKSTOP_DEFERRED_CANDIDATES_METRIC}{source="issue_graph_liveness.backstop"} 0`);
+    expect(body).toContain(`${BACKSTOP_DEFERRED_CANDIDATES_METRIC}{source="stranded_recovery_wake_backstop"} 0`);
+
+    setBackstopDeferredCandidates("issue_graph_liveness.backstop", 7);
+    recordBackstopSweepCompleted("stranded_recovery_wake_backstop");
+    recordBackstopCandidateSkipped("issue_graph_liveness.backstop", "not_ready");
+    recordBackstopCandidateSkipped("issue_graph_liveness.backstop", "deferred_or_failed");
+    recordBackstopCandidateSkipped("issue_graph_liveness.backstop", "enqueue_failed");
+    body = (await renderMetrics()).body;
+
+    expect(body).toContain(`${BACKSTOP_DEFERRED_CANDIDATES_METRIC}{source="issue_graph_liveness.backstop"} 7`);
+    expect(body).toContain(`${BACKSTOP_SWEEP_COMPLETED_METRIC}{source="stranded_recovery_wake_backstop"} 1`);
+    expect(body).toContain(
+      `${BACKSTOP_CANDIDATES_SKIPPED_METRIC}{source="issue_graph_liveness.backstop",reason="not_ready"} 1`,
+    );
+    expect(body).toContain(
+      `${BACKSTOP_CANDIDATES_SKIPPED_METRIC}{source="issue_graph_liveness.backstop",reason="deferred_or_failed"} 1`,
+    );
+    expect(body).toContain(
+      `${BACKSTOP_CANDIDATES_SKIPPED_METRIC}{source="issue_graph_liveness.backstop",reason="enqueue_failed"} 1`,
+    );
+
+    setBackstopDeferredCandidates("issue_graph_liveness.backstop", 0);
+    body = (await renderMetrics()).body;
+    expect(body).toContain(`${BACKSTOP_DEFERRED_CANDIDATES_METRIC}{source="issue_graph_liveness.backstop"} 0`);
+  });
+
+  it("keeps every backstop series bounded to source/reason with no per-issue or per-agent label", async () => {
+    // AC5. These three series are recorded once per candidate, so an `issue_id` or
+    // `agent_id` label would make their cardinality track the backlog rather than a fixed
+    // enum. Assert the label set off the rendered exposition rather than the registration
+    // call, so a label added anywhere downstream is caught too.
+    setBackstopDeferredCandidates("issue_graph_liveness.backstop", 3);
+    recordBackstopSweepCompleted("issue_graph_liveness.backstop");
+    recordBackstopCandidateSkipped("issue_graph_liveness.backstop", "live_path");
+    const body = (await renderMetrics()).body;
+
+    const labelSets = body
+      .split("\n")
+      .filter((line) =>
+        [
+          BACKSTOP_DEFERRED_CANDIDATES_METRIC,
+          BACKSTOP_SWEEP_COMPLETED_METRIC,
+          BACKSTOP_CANDIDATES_SKIPPED_METRIC,
+        ].some((metric) => line.startsWith(`${metric}{`)),
+      )
+      .map((line) =>
+        [...(line.match(/\{(.*)\}/)?.[1].matchAll(/([a-zA-Z_][a-zA-Z0-9_]*)=/g) ?? [])]
+          .map((match) => match[1])
+          .sort()
+          .join(","),
+      );
+
+    expect(labelSets.length).toBeGreaterThan(0);
+    expect([...new Set(labelSets)].sort()).toEqual(["reason,source", "source"]);
+  });
+});
+
+describe("github review request suppression causes (BLO-20526 reviewer lock contention)", () => {
+  it("preserves reviewer_lock_contended rather than collapsing it to the unknown bucket", async () => {
+    // `normalizeGithubSuppressionCause` maps any cause absent from
+    // KNOWN_GITHUB_SUPPRESSION_CAUSES to UNKNOWN_GITHUB_SUPPRESSION_CAUSES's
+    // "other" — which the outage alert pages on as an UNTRIAGED cause. So
+    // emitting this cause without registering it would not merely mislabel the
+    // series, it would page on every occurrence of a known, expected drop.
+    __resetMetricsForTest();
+
+    const recorded = recordGithubReviewRequestSuppressed({
+      reason: "github_pr_review_requested",
+      cause: GITHUB_SUPPRESSION_CAUSE_REVIEWER_LOCK_CONTENDED,
+    });
+
+    expect(recorded.cause).toBe("reviewer_lock_contended");
+    expect(recorded.cause).not.toBe(UNKNOWN_GITHUB_SUPPRESSION_CAUSE);
+
+    const body = (await renderMetrics()).body;
+    expect(body).toContain(
+      `${GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC}{cause="reviewer_lock_contended",reason="github_pr_review_requested"} 1`,
+    );
+  });
+
+  it("still collapses an unregistered cause, so the check above is not vacuous", () => {
+    __resetMetricsForTest();
+
+    const recorded = recordGithubReviewRequestSuppressed({
+      reason: "github_pr_review_requested",
+      cause: "reviewer_lock_contended_typo",
+    });
+
+    expect(recorded.cause).toBe(UNKNOWN_GITHUB_SUPPRESSION_CAUSE);
+  });
+
+  it("zero-initializes the contended series so absent is distinguishable from zero", async () => {
+    // The series must exist before the first event or the outage alert cannot
+    // tell "nothing suppressed" from "the scrape is broken".
+    __resetMetricsForTest();
+
+    const body = (await renderMetrics()).body;
+    expect(body).toContain(`${GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC}{cause="reviewer_lock_contended"`);
+  });
+});
+
+describe("recordGbrainRecallOutcome + renderMetrics (BLO-25892)", () => {
+  it("zero-initializes every known status plus 'other' before any event", async () => {
+    const { body } = await renderMetrics();
+    expect(body).toContain(`# TYPE ${GBRAIN_RECALL_METRIC} counter`);
+    for (const status of ["ok", "no-issue-page", "empty", "island", "skipped", "error", "other"]) {
+      expect(body).toContain(`${GBRAIN_RECALL_METRIC}{status="${status}"} 0`);
+    }
+  });
+
+  it("increments the matching status series", async () => {
+    recordGbrainRecallOutcome("error");
+    recordGbrainRecallOutcome("error");
+    recordGbrainRecallOutcome("ok");
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${GBRAIN_RECALL_METRIC}{status="error"} 2`);
+    expect(body).toContain(`${GBRAIN_RECALL_METRIC}{status="ok"} 1`);
+  });
+
+  it("collapses an unrecognized or missing status into 'other' (cardinality guardrail)", async () => {
+    expect(normalizeGbrainRecallStatus("not-a-real-status")).toBe(UNKNOWN_GBRAIN_RECALL_STATUS);
+    expect(normalizeGbrainRecallStatus(undefined)).toBe(UNKNOWN_GBRAIN_RECALL_STATUS);
+    recordGbrainRecallOutcome(undefined);
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${GBRAIN_RECALL_METRIC}{status="other"} 1`);
   });
 });

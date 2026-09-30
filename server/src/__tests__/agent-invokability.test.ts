@@ -55,6 +55,26 @@ describe("agent invokability", () => {
     });
   });
 
+  it("keeps direct pause distinct from a broken reporting chain", () => {
+    const paused = agent({ id: "paused", status: "paused" });
+    expect(evaluateAgentInvokability(paused, [paused])).toMatchObject({
+      invokable: false,
+      reason: "paused",
+      invalidOrgChain: false,
+    });
+
+    const pausedUnderMissingManager = agent({
+      id: "paused-child",
+      status: "paused",
+      reportsTo: "missing",
+    });
+    expect(evaluateAgentInvokability(pausedUnderMissingManager, [pausedUnderMissingManager])).toMatchObject({
+      invokable: false,
+      reason: "paused",
+      invalidOrgChain: false,
+    });
+  });
+
   it("lists non-terminated descendants made invalid by a terminated root", () => {
     const rows = [
       agent({ id: "ceo", status: "terminated" }),

@@ -1,10 +1,13 @@
 export { agentAdapterTypeSchema, optionalAgentAdapterTypeSchema } from "./adapter-type.js";
 export {
+  CREDENTIAL_VALUE_RES,
+  REDACTED_VALUE_SENTINEL,
   SENSITIVE_ENV_KEY_RE,
   isPlausiblySensitiveEnvValue,
   isSensitiveEnv,
   isSensitiveEnvKey,
 } from "./sensitive-env.js";
+export { REDACTED_SENTINEL } from "./secret-sentinel.js";
 export {
   getAgentOrgChainHealth,
   getAgentWorkEligibility,
@@ -207,6 +210,7 @@ export {
   ISSUE_RECOVERY_ACTION_STATUSES,
   ISSUE_RECOVERY_ACTION_OWNER_TYPES,
   ISSUE_RECOVERY_ACTION_OUTCOMES,
+  ISSUE_RECOVERY_ACTION_RETIRING_BOUNDS,
   pluginOperationIssueOriginKind,
   isPluginOperationIssueOriginKind,
   ISSUE_RELATION_TYPES,
@@ -265,6 +269,7 @@ export {
   APPROVAL_TYPES,
   APPROVAL_STATUSES,
   APPROVAL_UNDECIDED_STATUSES,
+  APPROVAL_LINKED_ISSUE_IDS_MAX,
   SECRET_PROVIDERS,
   SECRET_PROVIDER_CONFIG_STATUSES,
   SECRET_PROVIDER_CONFIG_HEALTH_STATUSES,
@@ -398,6 +403,7 @@ export {
   type IssueRecoveryActionStatus,
   type IssueRecoveryActionOwnerType,
   type IssueRecoveryActionOutcome,
+  type IssueRecoveryActionRetiringBound,
   type IssueRelationType,
   type IssueTreeControlMode,
   type IssueTreeHoldReleasePolicyStrategy,
@@ -972,6 +978,8 @@ export type {
   GitWorktreeBranchIncoherenceEvidence,
   GitWorktreeInProgressOperation,
   HeartbeatRun,
+  HeartbeatRunRetrySuccessor,
+  HeartbeatRunRetrySuccessorState,
   HeartbeatRunEvent,
   HeartbeatRunStatusPhase,
   AgentRuntimeState,
@@ -1344,7 +1352,12 @@ export {
   type ResourceMembershipUpdateResult,
 } from "./types/resource-memberships.js";
 
-export { workspaceRuntimeControlTargetSchema } from "./validators/execution-workspace.js";
+export {
+  collectBranchTemplateProblems,
+  EXECUTION_WORKSPACE_BRANCH_TEMPLATE_KEYS,
+  executionWorkspaceStrategySchema,
+  workspaceRuntimeControlTargetSchema,
+} from "./validators/execution-workspace.js";
 export {
   findWorkspaceCommandDefinition,
   listWorkspaceCommandDefinitions,
@@ -1409,6 +1422,7 @@ export type { ServerGitInfo, ServerGitLocalChanges, ServerInfoSnapshot } from ".
 
 export {
   getClosedIsolatedExecutionWorkspaceMessage,
+  isClosedExecutionWorkspace,
   isClosedIsolatedExecutionWorkspace,
 } from "./execution-workspace-guards.js";
 
@@ -1509,6 +1523,7 @@ export {
   skillTestAgentKeyScopeSchema,
   createAgentKeySchema,
   agentMineInboxQuerySchema,
+  agentMeRecoveryActionsQuerySchema,
   wakeAgentSchema,
   resetAgentSessionSchema,
   testAdapterEnvironmentSchema,
@@ -1722,8 +1737,10 @@ export {
 } from "./validators/index.js";
 export type { Milestone, CreateMilestoneInput, UpdateMilestoneInput } from "./types/milestone.js";
 export {
+  approvalGateSchema,
   createApprovalSchema,
   listApprovalsQuerySchema,
+  parseApprovalGate,
   upsertBudgetPolicySchema,
   resolveBudgetIncidentSchema,
   resolveApprovalSchema,
@@ -1731,6 +1748,7 @@ export {
   resubmitApprovalSchema,
   withdrawApprovalSchema,
   addApprovalCommentSchema,
+  type ApprovalGate,
   type CreateApproval,
   type ListApprovalsQuery,
   type UpsertBudgetPolicy,

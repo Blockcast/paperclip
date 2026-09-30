@@ -4,6 +4,7 @@ import {
   addIssueCommentSchema,
   createIssueSchema,
   issueBlockedInboxAttentionSchema,
+  issueExecutionMonitorPolicySchema,
   issueExecutionPolicySchema,
   MISPLACED_ISSUE_MONITOR_INPUT_KEYS,
   misplacedIssueMonitorInputMessage,
@@ -138,6 +139,54 @@ describe("issue validators", () => {
         outcome: "cancelled",
       }).success,
     ).toBe(false);
+  });
+
+  it("lets a restored recovery resolution omit sourceIssueStatus to leave the source issue unchanged", () => {
+    // PEN-2756: the disposal path for a beacon on a row whose status is already
+    // correct — a live `in_progress` run, or a board-approved `backlog` park.
+    // Neither status is in the enum, so before this the only resolutions available
+    // asserted something false and the cheapest correct action was to leave the
+    // beacon active forever.
+    const parsed = resolveIssueRecoveryActionSchema.parse({ outcome: "restored" });
+    expect(parsed.outcome).toBe("restored");
+    expect(parsed.sourceIssueStatus).toBeUndefined();
+
+    expect(
+      resolveIssueRecoveryActionSchema.safeParse({
+        outcome: "restored",
+        resolutionNote: "PR merged 4h11m after the beacon fired; run is still live.",
+      }).success,
+    ).toBe(true);
+  });
+
+  it("confines the leave-unchanged path to restored outcomes", () => {
+    // `blocked` must still land the row on `blocked` (the route additionally
+    // requires a real first-class blocker), and the board-only outcomes must still
+    // say where the row lands rather than retire the premise mid-flight.
+    expect(
+      resolveIssueRecoveryActionSchema.safeParse({ outcome: "blocked" }).success,
+    ).toBe(false);
+    expect(
+      resolveIssueRecoveryActionSchema.safeParse({ outcome: "false_positive" }).success,
+    ).toBe(false);
+    expect(
+      resolveIssueRecoveryActionSchema.safeParse({ outcome: "cancelled" }).success,
+    ).toBe(false);
+  });
+
+  it("still refuses statuses the resolver must never assert", () => {
+    // `in_progress` and `backlog` stay out of the enum. Omission, not widening, is
+    // how a row in either state is disposed — a resolver that wrote `in_progress`
+    // would claim execution state it cannot verify and would route the write
+    // through issue-update side effects purely to clear an unrelated beacon.
+    for (const sourceIssueStatus of ["in_progress", "backlog"]) {
+      expect(
+        resolveIssueRecoveryActionSchema.safeParse({
+          outcome: "restored",
+          sourceIssueStatus,
+        }).success,
+      ).toBe(false);
+    }
   });
 
   it("rejects recovery outcomes that are not supported by the source-scoped resolution endpoint", () => {
@@ -414,6 +463,79 @@ describe("issue validators", () => {
       const text = issueExecutionPolicySchema.shape.monitor.description ?? "";
       expect(text).toContain("attemptCount");
       expect(text).toContain("maxAttempts");
+    });
+
+    // BLO-32419: the `pr:…:review` gate is re-checked by the agent by hand, so this description
+    // IS the implementation for that caller. A single-page fetch reads a reviewed PR as
+    // `reviews=0` — the exact false negative BLO-22574 exists to kill. The clause is +660 chars
+    // on a string paid twice per tool-schema load, so it is a standing candidate for a
+    // size-motivated trim; without this guard such a trim is silent. Assert the invariants, not
+    // the prose, so wording stays free to change.
+    it("requires paginating BOTH review-evidence surfaces and treats a truncated read as unproven", () => {
+      const text = issueExecutionMonitorPolicySchema.shape.gateSignals.description ?? "";
+      // Both surfaces, not the comment surface alone — the helper paginates each of them.
+      expect(text).toMatch(/PAGINATE BOTH surfaces/);
+      expect(text).toContain("per_page=100");
+      // Truncation must fail closed as unproven rather than reading as absence.
+      expect(text).toMatch(/TRUNCATED read is UNPROVEN/i);
+      // Both exhaustion codes, which are outcomes distinct from `{found:false}`.
+      for (const code of ["reviews_pagination_exhausted", "comments_pagination_exhausted"]) {
+        expect(text).toContain(code);
+      }
+      // The hazard that actually bites a hand-rolled fetch is the default page size, not the cap.
+      expect(text).toMatch(/DEFAULT page size is 30/);
+    });
+
+    // BLO-35277: `commit_id` re-anchors FORWARD on APPROVED reviews when the head moves, so
+    // `commit_id == head` fails OPEN — it accepts a review that never saw the head being acted on.
+    // This was the fourth copy of that recipe found and the only one no agent bundle write can
+    // reach. Assert the invariants rather than the prose, so wording stays free to change.
+    it("warns that `commit_id` is mutable and does not prescribe it as the record of the reviewed head", () => {
+      const text = issueExecutionMonitorPolicySchema.shape.gateSignals.description ?? "";
+      // The mechanism and its direction of failure, in those terms.
+      expect(text).toMatch(/commit_id` IS MUTABLE/i);
+      expect(text).toMatch(/RE-ANCHORS it FORWARD/i);
+      expect(text).toMatch(/fails OPEN/i);
+      // The immutable body marker is what records which head was read; commit_id corroborates.
+      expect(text).toMatch(/Reviewed head: <40-hex>` marker in the review BODY/);
+      expect(text).toMatch(/treat `commit_id` as corroboration at most/i);
+      // The CREDITING sentence itself must name the marker as the thing read, and must not reach
+      // `commit_id` before it does — the crediting CONDITION is where the recipe gets reinstated.
+      // SCOPE, stated precisely because the next editor reads this to decide if they are covered:
+      // the lookahead is phrasing-blind only for the region BEFORE the marker phrase. It stops
+      // matching there, so a requirement APPENDED after it ("…corroboration at most. Also require
+      // that its `commit_id` IS the head the PR is currently at.") falls through to the verb-list
+      // guard below — which has known paraphrase gaps ("IS", "currently at") and does not catch
+      // that shape. Measured, not reasoned. Closing it needs the lookahead anchored to the end of
+      // the SURFACE 1 sentence group; `commit_id` appears legitimately four times inside SURFACE 1
+      // (mutability warning, `commit_id == head` fails OPEN, corroboration, COMMENTED anchor), so
+      // a blanket ban on the region is not available and the narrower guard is deliberate.
+      expect(text).toMatch(/Credit an entry only when(?:(?!commit_id)[^])*?Reviewed head: <40-hex>` marker in the review BODY/);
+      // SURFACE 1 must stay labelled a liveness signal, so the empirically safe use survives.
+      expect(text).toMatch(/LIVENESS check/i);
+      // The re-anchoring sample covers COMMENTED and APPROVED only (BLO-27234, n=128). The other
+      // two submitted states must stay labelled unmeasured rather than inheriting COMMENTED's
+      // clean result, which is a stronger instruction, not a weaker one.
+      expect(text).toMatch(/CHANGES_REQUESTED \/ DISMISSED are UNMEASURED, not cleared/i);
+      // The old recipe must not come back as a PARAPHRASE either, not just as a verbatim revert.
+      // The previous exact-string guards passed on "its `commit_id` matches the PR's current
+      // head", which sits perfectly happily beside the mutability warning and reinstates the
+      // prescription anyway.
+      expect(text).not.toMatch(/`commit_id`[^.]{0,60}\b(equals?|matches?|identical to|the same as)\b[^.]{0,40}current head/i);
+      // The staleness comparison must NAME the immutable marker as the thing compared, so
+      // swapping `commit_id` back into that sentence fails here however it is phrased.
+      expect(text).toMatch(/staleness by comparing the attested `Reviewed head:`/i);
+      // The `githubHasReviewerEvidenceForPr` pointer must stay SCOPED. That predicate credits a
+      // formal review on `review.commitId === headSha` alone, in any SUBMITTED state including
+      // APPROVED, with no body-marker check — so an unqualified "mirror it" tells an agent to
+      // re-derive the exact recipe removed above (BLO-35277 review, paperclip#1988).
+      expect(text).toMatch(/do NOT carry (that|its `commit_id` keying) over to `?APPROVED/i);
+      // ...and the pointer must not imply the server is FINE. `APPROVED` is reachable there on any
+      // human-authored PR, so the text has to say the server carries the same latent fail-open —
+      // otherwise a later audit of `github-app-auth.ts` reads this as "already assessed, sound"
+      // and stops. That is the one follow-up that matters (BLO-35545).
+      expect(text).toMatch(/`?APPROVED`? IS a state it runs on/i);
+      expect(text).toMatch(/same latent fail-open and is NOT cleared by this block/i);
     });
   });
 

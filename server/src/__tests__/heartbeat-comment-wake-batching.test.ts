@@ -295,7 +295,7 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
     expect(runs[0]?.id).toBe(runId);
   });
 
-  it("batches deferred comment wakes and forwards the ordered batch to the next run", async () => {
+  it("retains deferred comment identity while forwarding only the newest comment", async () => {
     const gateway = await createControlledGatewayServer();
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -464,6 +464,10 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
       const deferredContext = (deferredWake?.payload as Record<string, unknown> | null)?._paperclipWakeContext as
         | Record<string, unknown>
         | undefined;
+      // The deferred request retains the complete ordered wake identity for
+      // deduplication and auditability, but payload construction deliberately
+      // forwards only the newest live comment. Older comments may already be
+      // stale by the time a running issue is released.
       expect(deferredContext?.wakeCommentIds).toEqual([comment2.id, comment3.id]);
 
       gateway.releaseFirstWait();
@@ -484,11 +488,11 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
       expect(secondPayload.paperclip).toBeUndefined();
       const secondWake = parseWakePayloadFromMessage(secondPayload.message);
       expect(secondWake).toMatchObject({
-        commentIds: [comment2.id, comment3.id],
+        commentIds: [comment3.id],
         latestCommentId: comment3.id,
       });
-      expect(String(secondPayload.message ?? "")).toContain("Second comment");
       expect(String(secondPayload.message ?? "")).toContain("Third comment");
+      expect(String(secondPayload.message ?? "")).not.toContain("Second comment");
       expect(String(secondPayload.message ?? "")).not.toContain("First comment");
     } finally {
       gateway.releaseFirstWait();
@@ -1252,7 +1256,7 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
     }
   }, 120_000);
 
-  it("does not reopen a finished issue when the deferred comment wake is self-authored by the closing run", async () => {
+  it("does not reopen or promote a finished issue when the deferred comment wake is self-authored by the closing run", async () => {
     const gateway = await createControlledGatewayServer();
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -1389,17 +1393,38 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
 
       gateway.releaseFirstWait();
 
-      // The deferred wake still promotes (so the agent gets the message), but
-      // the issue must remain `done` because the only referenced comment is
-      // self-authored by the run that is now ending.
-      await waitFor(() => gateway.getAgentPayloads().length === 2, 90_000);
+      // BLO-23206: this wake is self-authored AND self-directed (the run's own
+      // comment waking the run's own agent) on an issue that is already `done`,
+      // so it is suppressed at the promotion source instead of being promoted.
+      // Only the first run's payload ever reaches the gateway.
+      //
+      // Before BLO-23206 the wake was promoted and the resulting queued run was
+      // dispatched against the closed issue — the comment announcing the closure
+      // was itself what kept the run alive, because carrying a wakeCommentId
+      // exempts a row from the terminal-status prune. The reopen guard this test
+      // was originally written for is unchanged and still asserted below: the
+      // issue must stay `done` with `completedAt` intact.
+      await waitFor(async () => {
+        const deferred = await db
+          .select({ status: agentWakeupRequests.status })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, companyId),
+              eq(agentWakeupRequests.agentId, agentId),
+            ),
+          )
+          .then((rows) => rows.find((row) => row.status === "cancelled") ?? null);
+        return Boolean(deferred);
+      }, 90_000);
       await waitFor(async () => {
         const runs = await db
           .select()
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.agentId, agentId));
-        return runs.length === 2 && runs.every((run) => run.status === "succeeded");
+        return runs.length === 1 && runs.every((run) => run.status === "succeeded");
       }, 90_000);
+      expect(gateway.getAgentPayloads()).toHaveLength(1);
 
       const issueAfterPromotion = await db
         .select({
@@ -1616,7 +1641,9 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
       const secondWake = parseWakePayloadFromMessage(secondPayload.message);
       expect(secondWake).toMatchObject({
         reason: "issue_commented",
-        commentIds: [selfComment.id, humanComment.id],
+        // The self-authored comment remains part of deferred wake identity,
+        // but payload construction forwards the newest live comment only.
+        commentIds: [humanComment.id],
         latestCommentId: humanComment.id,
         issue: {
           id: issueId,

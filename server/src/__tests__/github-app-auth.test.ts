@@ -20,11 +20,19 @@ import {
   getInstallationTokenResult,
   githubFetchPrHeadSha,
   githubGetPullRequestGate,
+  githubGetWorkflowRun,
+  githubHasCommitEvidence,
   githubHasReviewerEvidenceForPr,
+  githubListReviewerSurfacesAtPr,
   githubGetLatestCommitStatusForContext,
+  githubGetPrRequiredStatusContext,
   githubListIssueCommentsWithTimestamps,
+  githubListPrReviewsWithTimestamps,
+  githubListPullRequestCommits,
+  GITHUB_PR_COMMITS_ENDPOINT_LIMIT,
   githubPostCommitStatus,
   githubPostCommitStatusDetailed,
+  githubResolveBranchState,
   githubReviewerAppSlug,
   githubReviewerIdentityMatches,
   normalizeGithubLogin,
@@ -203,6 +211,334 @@ describe("githubGetPullRequestGate", () => {
   });
 });
 
+/**
+ * PEN-3487: whether a status context blocks the merge is per-repository, and a
+ * reader of a red gate cannot derive it. Measured 2026-09-24,
+ * `review/ally-complete` is one of ten required contexts on
+ * Blockcast/penstock-llm-proxy-core, is required on nothing in
+ * Blockcast/paperclip (whose `master` requires exactly `verify`), and
+ * Blockcast/onprem-k8s requires no contexts at all.
+ *
+ * The outcome that carries the most weight here is `unknown`. It must never
+ * degrade to `not_required`: "we could not read branch protection" and "we read
+ * it and this context is absent" are opposite facts, and collapsing them puts a
+ * confident all-clear on an unread gate.
+ *
+ * There are two surfaces that can require a check, and `branches/{b}` reports
+ * only one of them. `Blockcast/hang-mmt-fec` is the worked case (measured
+ * 2026-09-26): empty classic `required_status_checks`, while org ruleset
+ * `19274071` requires `review/ally-complete` on `main`. Absence is therefore
+ * only asserted once BOTH surfaces have been read.
+ */
+describe("githubGetPrRequiredStatusContext", () => {
+  const stubFetch = (input: {
+    pull?: { status?: number; body?: unknown };
+    branch?: { status?: number; body?: unknown };
+    rules?: { status?: number; body?: unknown };
+  }) => {
+    const seen: string[] = [];
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      const href = String(url);
+      seen.push(href);
+      if (href.includes("/access_tokens")) {
+        return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+      }
+      if (href.includes("/pulls/")) {
+        const status = input.pull?.status ?? 200;
+        return jsonResponse(input.pull?.body ?? { base: { ref: "master" } }, status < 400, status);
+      }
+      // Must precede the branch arm: `/rules/branches/{ref}` also contains
+      // `/branches/`, and matching it as the classic read would make every
+      // ruleset assertion below silently test the wrong endpoint.
+      if (href.includes("/rules/branches/")) {
+        const status = input.rules?.status ?? 200;
+        return jsonResponse(input.rules?.body ?? [], status < 400, status);
+      }
+      const status = input.branch?.status ?? 200;
+      return jsonResponse(input.branch?.body ?? {}, status < 400, status);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    return seen;
+  };
+
+  it("reports required when the PR's base branch requires the context", async () => {
+    setCreds();
+    const seen = stubFetch({
+      branch: {
+        body: {
+          protected: true,
+          protection: { enabled: true, required_status_checks: { contexts: ["verify", "review/ally-complete"] } },
+        },
+      },
+    });
+
+    await expect(githubGetPrRequiredStatusContext({
+      repoFullName: "Blockcast/penstock-llm-proxy-core",
+      prNumber: 1867,
+      context: "review/ally-complete",
+    })).resolves.toEqual({
+      outcome: "required",
+      baseRef: "master",
+      requiredContexts: ["review/ally-complete", "verify"],
+      source: "branch_protection",
+    });
+    // Protection is read off the PR's OWN base, not the repo default, so a PR
+    // stacked onto a release branch is answered about the branch it targets.
+    expect(seen.some((url) => url.endsWith("/repos/Blockcast/penstock-llm-proxy-core/branches/master"))).toBe(true);
+    // Presence needs one surface only — a ruleset cannot un-require what classic
+    // protection requires, so the second call is skipped.
+    expect(seen.some((url) => url.includes("/rules/branches/"))).toBe(false);
+  });
+
+  it("reports required from a ruleset that classic branch protection cannot see", async () => {
+    // The Blockcast/hang-mmt-fec shape: classic protection holds nothing, an org
+    // ruleset supplies the context. Reading `branches/{b}` alone answers
+    // `not_required` here — a confident "does not block merge" about a gate that
+    // does, and the empty union is a 200, so no `unknown` guard catches it.
+    setCreds();
+    const seen = stubFetch({
+      branch: {
+        body: {
+          protected: true,
+          protection: {
+            enabled: false,
+            required_status_checks: { checks: [], contexts: [], enforcement_level: "off" },
+          },
+        },
+      },
+      rules: {
+        body: [
+          { type: "pull_request", parameters: { required_approving_review_count: 1 } },
+          {
+            type: "required_status_checks",
+            ruleset_id: 19274071,
+            ruleset_source_type: "Organization",
+            parameters: {
+              required_status_checks: [
+                { context: "review/ally-complete" },
+                { context: "Check" },
+                { context: "Runner policy" },
+              ],
+            },
+          },
+        ],
+      },
+    });
+
+    await expect(githubGetPrRequiredStatusContext({
+      repoFullName: "Blockcast/hang-mmt-fec",
+      prNumber: 593,
+      context: "review/ally-complete",
+    })).resolves.toEqual({
+      outcome: "required",
+      baseRef: "master",
+      requiredContexts: ["Check", "Runner policy", "review/ally-complete"],
+      source: "ruleset",
+    });
+    expect(seen.some((url) => url.endsWith("/repos/Blockcast/hang-mmt-fec/rules/branches/master"))).toBe(true);
+  });
+
+  it("reports not_required and names what IS required there", async () => {
+    setCreds();
+    stubFetch({
+      branch: {
+        body: { protected: true, protection: { enabled: true, required_status_checks: { contexts: ["verify"] } } },
+      },
+    });
+
+    await expect(githubGetPrRequiredStatusContext({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 1867,
+      context: "review/ally-complete",
+    })).resolves.toEqual({
+      outcome: "not_required",
+      baseRef: "master",
+      branchProtected: true,
+      requiredContexts: ["verify"],
+    });
+  });
+
+  it("unions the legacy contexts array with the current checks array", async () => {
+    // A repo configured only through the newer API can come back with an empty
+    // `contexts`. Reading `contexts` alone would report a genuinely required
+    // check as unrequired — the one error direction that matters here.
+    setCreds();
+    stubFetch({
+      branch: {
+        body: {
+          protected: true,
+          protection: {
+            enabled: true,
+            required_status_checks: { contexts: [], checks: [{ context: "review/ally-complete", app_id: 1 }] },
+          },
+        },
+      },
+    });
+
+    await expect(githubGetPrRequiredStatusContext({
+      repoFullName: "Blockcast/penstock-llm-proxy-core",
+      prNumber: 42,
+      context: "review/ally-complete",
+    })).resolves.toMatchObject({ outcome: "required" });
+  });
+
+  it("reports not_required with branchProtected false on an unprotected base", async () => {
+    setCreds();
+    stubFetch({ branch: { body: { protected: false } } });
+
+    await expect(githubGetPrRequiredStatusContext({
+      repoFullName: "Blockcast/onprem-k8s",
+      prNumber: 9,
+      context: "review/ally-complete",
+    })).resolves.toEqual({
+      outcome: "not_required",
+      baseRef: "master",
+      branchProtected: false,
+      requiredContexts: [],
+    });
+  });
+
+  it("unions both surfaces into requiredContexts when neither carries the context", async () => {
+    setCreds();
+    stubFetch({
+      branch: {
+        body: { protected: true, protection: { enabled: true, required_status_checks: { contexts: ["verify"] } } },
+      },
+      rules: {
+        body: [{
+          type: "required_status_checks",
+          parameters: { required_status_checks: [{ context: "Runner policy" }, { context: "verify" }] },
+        }],
+      },
+    });
+
+    await expect(githubGetPrRequiredStatusContext({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 1867,
+      context: "review/ally-complete",
+    })).resolves.toEqual({
+      outcome: "not_required",
+      baseRef: "master",
+      branchProtected: true,
+      requiredContexts: ["Runner policy", "verify"],
+    });
+  });
+
+  it.each([
+    { label: "no credentials", creds: false, stub: {}, reason: "missing_github_app_credentials", baseRef: undefined },
+    {
+      label: "the PR read fails",
+      creds: true,
+      stub: { pull: { status: 503 } },
+      reason: "required_context_pull_request_http_503",
+      baseRef: undefined,
+    },
+    {
+      label: "the PR carries no base ref",
+      creds: true,
+      stub: { pull: { body: {} } },
+      reason: "required_context_base_ref_missing",
+      baseRef: undefined,
+    },
+    {
+      label: "branch protection is unreadable",
+      creds: true,
+      stub: { branch: { status: 404 } },
+      reason: "required_context_branch_http_404",
+      baseRef: "master",
+    },
+    {
+      // Classic said no and the second surface is unreadable, so "absent" is
+      // unproven. This is the case that must not shortcut to `not_required`.
+      label: "classic protection is empty and the ruleset read fails",
+      creds: true,
+      stub: { branch: { body: { protected: true } }, rules: { status: 500 } },
+      reason: "required_context_rules_http_500",
+      baseRef: "master",
+    },
+    {
+      label: "the ruleset read returns a non-array body",
+      creds: true,
+      stub: { branch: { body: { protected: true } }, rules: { body: { message: "nope" } } },
+      reason: "required_context_rules_body_missing",
+      baseRef: "master",
+    },
+  ])("answers unknown, never not_required, when $label", async ({ creds, stub, reason, baseRef }) => {
+    if (creds) setCreds();
+    stubFetch(stub);
+
+    await expect(githubGetPrRequiredStatusContext({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 1867,
+      context: "review/ally-complete",
+    })).resolves.toEqual(baseRef ? { outcome: "unknown", reason, baseRef } : { outcome: "unknown", reason });
+  });
+});
+
+// `not_found` is the single lookup outcome that CLOSES an approval card, and closing
+// is irreversible. GitHub answers 404 both for a deleted run and for a repository the
+// installation cannot see, so the two must be told apart before that outcome is
+// returned — otherwise revoking the App's access to a repo silently cancels every
+// live deploy gate in it.
+describe("githubGetWorkflowRun 404 disambiguation", () => {
+  const stubFetch = (runStatus: number, repoStatus: number, repoBody: unknown = {}) => {
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      const u = String(url);
+      if (u.includes("/access_tokens")) {
+        return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+      }
+      if (u.includes("/actions/runs/")) {
+        return jsonResponse({ message: "Not Found" }, false, runStatus);
+      }
+      return jsonResponse(repoBody, repoStatus >= 200 && repoStatus < 300, repoStatus);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  };
+
+  it("reports not_found only once the repository is confirmed readable", async () => {
+    setCreds();
+    const fetchMock = stubFetch(404, 200, { full_name: "Blockcast/paperclip" });
+
+    await expect(githubGetWorkflowRun({
+      repoFullName: "Blockcast/paperclip",
+      runId: 32372156837,
+    })).resolves.toEqual({ outcome: "not_found" });
+
+    // The repo probe is what makes the run's absence positive evidence.
+    expect(fetchMock.mock.calls.some(([url]) => /\/repos\/Blockcast\/paperclip$/.test(String(url))))
+      .toBe(true);
+  });
+
+  it.each([404, 403, 401])(
+    "defers instead of closing when the repository answers %i",
+    async (repoStatus) => {
+      setCreds();
+      stubFetch(404, repoStatus);
+
+      await expect(githubGetWorkflowRun({
+        repoFullName: "Blockcast/private-repo",
+        runId: 1,
+      })).resolves.toEqual({
+        outcome: "error",
+        retryable: false,
+        reason: `workflow_run_repo_inaccessible_${repoStatus}`,
+      });
+    },
+  );
+
+  it("defers when the repository probe itself fails transiently", async () => {
+    setCreds();
+    stubFetch(404, 503);
+
+    const result = await githubGetWorkflowRun({
+      repoFullName: "Blockcast/paperclip",
+      runId: 1,
+    });
+    expect(result).toMatchObject({ outcome: "error", retryable: true });
+  });
+});
+
 describe("githubFetchPrHeadSha", () => {
   it("uses the installation token to resolve the complete current head", async () => {
     setCreds();
@@ -215,6 +551,110 @@ describe("githubFetchPrHeadSha", () => {
 
     await expect(githubFetchPrHeadSha({ repoFullName: "Blockcast/paperclip", prNumber: 1049 }))
       .resolves.toBe("abcdef1234567890abcdef1234567890abcdef12");
+  });
+});
+
+describe("githubHasCommitEvidence", () => {
+  it("accepts a commit that exists in the configured GitHub installation", async () => {
+    setCreds();
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL) => {
+      if (String(url).includes("/access_tokens")) {
+        return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+      }
+      return jsonResponse({ sha: "abcdef1234567" });
+    }));
+
+    await expect(githubHasCommitEvidence({
+      repoFullName: "Blockcast/paperclip",
+      sha: "abcdef1234567",
+    })).resolves.toEqual({ found: true });
+  });
+
+  it("rejects a commit URL that GitHub cannot resolve", async () => {
+    setCreds();
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL) => {
+      if (String(url).includes("/access_tokens")) {
+        return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+      }
+      return jsonResponse({ message: "No commit found for SHA" }, false, 422);
+    }));
+
+    await expect(githubHasCommitEvidence({
+      repoFullName: "Blockcast/paperclip",
+      sha: "abcdef1234567",
+    })).resolves.toEqual({ found: false });
+  });
+
+  it("keeps transport failures retryable", async () => {
+    setCreds();
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL) => {
+      if (String(url).includes("/access_tokens")) {
+        return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+      }
+      return jsonResponse({ message: "unavailable" }, false, 503);
+    }));
+
+    await expect(githubHasCommitEvidence({
+      repoFullName: "Blockcast/paperclip",
+      sha: "abcdef1234567",
+    })).resolves.toEqual({ error: "commit_http_503" });
+  });
+});
+
+// An empty stacked-child enumeration is only trustworthy while the merged head
+// branch still exists: once GitHub deletes it, it auto-retargets every child
+// away from `?base=` (BLO-29856). `exists` is the one answer that lets the
+// fan-out stay quiet, so no failed read may produce it.
+describe("githubResolveBranchState", () => {
+  const stubBranchResponse = (response: () => Response) => {
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      if (String(url).includes("/access_tokens")) {
+        return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+      }
+      return response();
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  };
+
+  it("reads a readable branch as exists, encoding a slashed branch name", async () => {
+    setCreds();
+    const fetchMock = stubBranchResponse(() => jsonResponse({ name: "se/base" }));
+
+    await expect(githubResolveBranchState({
+      repoFullName: "Blockcast/paperclip",
+      branch: "se/base",
+    })).resolves.toBe("exists");
+    expect(fetchMock.mock.calls.some(([url]) =>
+      String(url).endsWith("/repos/Blockcast/paperclip/branches/se%2Fbase"))).toBe(true);
+  });
+
+  it("reads a 404 as deleted, so an empty enumeration is not taken as no children", async () => {
+    setCreds();
+    stubBranchResponse(() => jsonResponse({ message: "Branch not found" }, false, 404));
+
+    await expect(githubResolveBranchState({
+      repoFullName: "Blockcast/paperclip",
+      branch: "se/base",
+    })).resolves.toBe("deleted");
+  });
+
+  it("returns unknown, never exists, when the branch cannot be read", async () => {
+    setCreds();
+    stubBranchResponse(() => jsonResponse({ message: "unavailable" }, false, 503));
+    await expect(githubResolveBranchState({ repoFullName: "Blockcast/paperclip", branch: "se/base" }))
+      .resolves.toBe("unknown");
+
+    stubBranchResponse(() => {
+      throw new Error("socket hang up");
+    });
+    await expect(githubResolveBranchState({ repoFullName: "Blockcast/paperclip", branch: "se/base" }))
+      .resolves.toBe("unknown");
+
+    clearCreds();
+    _resetInstallationTokenCache();
+    await expect(githubResolveBranchState({ repoFullName: "Blockcast/paperclip", branch: "se/base" }))
+      .resolves.toBe("unknown");
   });
 });
 
@@ -308,6 +748,24 @@ describe("githubHasReviewerEvidenceForPr", () => {
     });
   });
 
+  // BLO-29711 guard. The comment-review gate deliberately SKIPS `DISMISSED`
+  // (a withdrawn verdict must not drive a merge status), and the temptation is
+  // to "make these consistent". Do not: this function asks whether a review run
+  // happened, and a dismissed review still happened. Tightening it here is the
+  // BLO-28920 regression — reviewer runs false-failed `pr_review_output_missing`
+  // and retried in a paid loop (~66 runs / 3h). The asymmetry is the design.
+  it("still accepts an exact-head DISMISSED App review as run-output attestation", async () => {
+    setCreds();
+    stubGithub({
+      reviews: [{ user: { login: "allyblockcast[bot]" }, commit_id: headSha, state: "DISMISSED" }],
+    });
+
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      found: true,
+      via: "review",
+    });
+  });
+
   it("does not let an approved same-slug user-seat review satisfy the App gate", async () => {
     setCreds();
     stubGithub({
@@ -317,6 +775,66 @@ describe("githubHasReviewerEvidenceForPr", () => {
           commit_id: headSha,
           state: "APPROVED",
           body: `## Ally — Consolidated PR Review\n\nReviewed head: ${headSha}\n\nNo findings.`,
+        },
+      ],
+    });
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      found: false,
+    });
+  });
+
+  it("BLO-22574: rejects a forged consolidated comment from a non-reviewer author at the exact head", async () => {
+    setCreds();
+    // The comment surface is matched on a prose heading, so identity is the
+    // only thing standing between it and a forgery. An arbitrary actor who can
+    // comment on the PR reproduces the canonical body and the exact-head
+    // attestation verbatim; it must still not count as review evidence.
+    stubGithub({
+      reviews: [],
+      comments: [
+        {
+          user: { login: "someone-else" },
+          body: `## Ally — Consolidated PR Review\n\nReviewed head: ${headSha}\n\nNo findings.`,
+        },
+      ],
+    });
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      found: false,
+    });
+  });
+
+  it("BLO-22574: rejects a forged consolidated comment from the same-slug user seat", async () => {
+    setCreds();
+    // The user-seat login `allyblockcast` is a DIFFERENT actor from the App
+    // `allyblockcast[bot]`, and `githubReviewerIdentityMatches` accepts only
+    // `<slug>[bot]` / `app/<slug>`. So the seat is credited on NEITHER surface,
+    // whatever the review state: see the sibling case above asserting that even
+    // an APPROVED seat review at the exact head does not satisfy this gate.
+    stubGithub({
+      reviews: [],
+      comments: [
+        {
+          user: { login: "allyblockcast" },
+          body: `## Ally — Consolidated PR Review\n\nReviewed head: ${headSha}\n\nNo findings.`,
+        },
+      ],
+    });
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
+      found: false,
+    });
+  });
+
+  it("BLO-22574: rejects a canonical bot comment whose attestation is a truncated SHA", async () => {
+    setCreds();
+    // A malformed attestation must be distinguishable from a valid one and fail
+    // closed: a short SHA does not prove which tree was reviewed, so crediting
+    // it would satisfy the gate on unproven evidence.
+    stubGithub({
+      reviews: [],
+      comments: [
+        {
+          user: { login: "allyblockcast[bot]" },
+          body: `## Ally — Consolidated PR Review\n\nReviewed head: ${headSha.slice(0, 8)}\n\nNo findings.`,
         },
       ],
     });
@@ -604,6 +1122,64 @@ describe("githubHasReviewerEvidenceForPr", () => {
   });
 });
 
+// BLO-19528, Ally review of #1760. Foreign-commit notification is only as good
+// as the commit listing it reads, and GitHub truncates that listing at 250
+// without saying so -- the page loop sees a short page and concludes it reached
+// the end. A truncated read that reports itself complete turns "I could not
+// check the older commits" into "there are no foreign commits", which is the
+// exact silent-gap failure the notice exists to close.
+describe("githubListPullRequestCommits truncation", () => {
+  const repoFullName = "Blockcast/paperclip";
+  const prNumber = 1760;
+
+  function commitPage(count: number, label: string) {
+    return Array.from({ length: count }, (_, index) => ({
+      sha: `${label}-${index}`,
+      commit: { author: { email: `a${index}@blockcast.net`, name: `A${index}` } },
+      parents: [{ sha: "parent" }],
+    }));
+  }
+
+  /** Serve `total` commits across 100-per-page requests. */
+  function stubPages(total: number) {
+    setCreds();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL) => {
+        const value = String(url);
+        if (value.includes("/access_tokens")) {
+          return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+        }
+        const page = Number(value.match(/[?&]page=(\d+)/)?.[1] ?? "1");
+        const offset = (page - 1) * 100;
+        return jsonResponse(commitPage(Math.max(0, Math.min(100, total - offset)), `p${page}`));
+      }),
+    );
+  }
+
+  it("flags a listing that lands on GitHub's 250-commit ceiling", async () => {
+    // What a >250-commit PR actually returns: 100, 100, 50. The 50 looks like
+    // a natural last page, so nothing but the total gives the truncation away.
+    stubPages(GITHUB_PR_COMMITS_ENDPOINT_LIMIT);
+    const result = await githubListPullRequestCommits({ repoFullName, prNumber });
+    expect("error" in result).toBe(false);
+    if ("error" in result) return;
+    // The commits read are still returned -- a foreign commit among them must
+    // still notify, so truncation is a diagnostic and not an error.
+    expect(result.commits).toHaveLength(GITHUB_PR_COMMITS_ENDPOINT_LIMIT);
+    expect(result.truncated).toBe(true);
+  });
+
+  it("does not flag a listing that ends before the ceiling", async () => {
+    stubPages(150);
+    const result = await githubListPullRequestCommits({ repoFullName, prNumber });
+    expect("error" in result).toBe(false);
+    if ("error" in result) return;
+    expect(result.commits).toHaveLength(150);
+    expect(result.truncated).toBe(false);
+  });
+});
+
 describe("githubGetLatestCommitStatusForContext (BLO-17456)", () => {
   const repoFullName = "Blockcast/hang";
   const sha = "45eb633e348a826f43dc68b0c25fe83a96300cea";
@@ -836,5 +1412,320 @@ describe("githubListIssueCommentsWithTimestamps", () => {
     );
 
     await expect(githubListIssueCommentsWithTimestamps({ repoFullName, prNumber })).resolves.toBeNull();
+  });
+});
+
+// BLO-29711, Ally review of #1464. This function supplies the verdict the
+// comment-review gate is computed from, so a review whose verdict was withdrawn
+// must not reach it. Both directions were live: a dismissed *blocking* review
+// wedged a PR whose only escape hatch is the dismissal being ignored, and a
+// dismissed *clean* review dispositioned findings it no longer vouched for.
+describe("githubListPrReviewsWithTimestamps", () => {
+  const repoFullName = "Blockcast/paperclip";
+  const prNumber = 937;
+  const HEAD = "4f90d2926d2d3b5dcd1f3f4041459d521a86025e";
+
+  function reviewBody(findings: "blocking" | "clean"): string {
+    return findings === "blocking"
+      ? `## Ally — Consolidated PR Review\nReviewed head: ${HEAD}\n### Important Issues (1)\nFix before merge.`
+      : `## Ally — Consolidated PR Review\nReviewed head: ${HEAD}\n### Important Issues (0)`;
+  }
+
+  function stubReviews(reviews: unknown[]) {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL) => {
+        if (String(url).includes("/access_tokens")) {
+          return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+        }
+        return jsonResponse(reviews);
+      }),
+    );
+  }
+
+  it("excludes a DISMISSED blocking review so it cannot wedge the gate", async () => {
+    setCreds();
+    stubReviews([
+      {
+        user: { login: "allyblockcast[bot]" },
+        body: reviewBody("blocking"),
+        state: "DISMISSED",
+        submitted_at: "2026-08-02T13:39:06Z",
+      },
+    ]);
+
+    await expect(githubListPrReviewsWithTimestamps({ repoFullName, prNumber })).resolves.toEqual([]);
+  });
+
+  it("excludes a DISMISSED clean review so it cannot disposition a carried finding", async () => {
+    setCreds();
+    stubReviews([
+      {
+        user: { login: "allyblockcast[bot]" },
+        body: reviewBody("clean"),
+        state: "DISMISSED",
+        submitted_at: "2026-08-02T15:23:07Z",
+      },
+    ]);
+
+    await expect(githubListPrReviewsWithTimestamps({ repoFullName, prNumber })).resolves.toEqual([]);
+  });
+
+  it("excludes PENDING drafts but keeps the COMMENTED review the gate exists to read", async () => {
+    setCreds();
+    stubReviews([
+      {
+        user: { login: "allyblockcast[bot]" },
+        body: reviewBody("blocking"),
+        state: "COMMENTED",
+        submitted_at: "2026-08-02T15:38:57Z",
+      },
+      { user: { login: "allyblockcast[bot]" }, body: "draft", state: "PENDING", submitted_at: null },
+      {
+        user: { login: "allyblockcast[bot]" },
+        body: reviewBody("clean"),
+        state: "DISMISSED",
+        submitted_at: "2026-08-02T15:39:28Z",
+      },
+    ]);
+
+    await expect(githubListPrReviewsWithTimestamps({ repoFullName, prNumber })).resolves.toEqual([
+      { login: "allyblockcast[bot]", body: reviewBody("blocking"), createdAt: "2026-08-02T15:38:57Z" },
+    ]);
+  });
+});
+
+// Task B4 (BLO-32239). `githubHasReviewerEvidenceForPr` no longer carries a
+// private copy of the Ally grammar, and the paging loops both surfaces share are
+// now one helper that the truth probe also consumes.
+describe("githubListReviewerSurfacesAtPr", () => {
+  const repoFullName = "Blockcast/paperclip";
+  const prNumber = 1588;
+  const head = "c".repeat(40);
+
+  function stub(routes: {
+    reviews?: unknown[];
+    comments?: unknown[];
+    reviewsStatus?: number;
+    commentsStatus?: number;
+    throwOn?: "reviews" | "comments";
+  }) {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL) => {
+        const u = String(url);
+        if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+        if (u.includes("/reviews")) {
+          if (routes.throwOn === "reviews") throw new Error("socket hang up");
+          if (routes.reviewsStatus) return jsonResponse([], false, routes.reviewsStatus);
+          return jsonResponse(routes.reviews ?? []);
+        }
+        if (u.includes("/issues/") && u.includes("/comments")) {
+          if (routes.throwOn === "comments") throw new Error("socket hang up");
+          if (routes.commentsStatus) return jsonResponse([], false, routes.commentsStatus);
+          return jsonResponse(routes.comments ?? []);
+        }
+        if (u.includes("/pulls/")) return jsonResponse({ head: { sha: head } });
+        throw new Error(`unexpected url ${u}`);
+      }),
+    );
+  }
+
+  const allyReview = `## Ally — Consolidated PR Review
+**Reviewed head:** \`${head}\`
+### Critical Issues (0)
+### Important Issues (0)`;
+
+  it("returns both surfaces, dropping PENDING drafts and non-App authors", async () => {
+    setCreds();
+    stub({
+      reviews: [
+        {
+          user: { login: "allyblockcast[bot]" },
+          body: allyReview,
+          state: "COMMENTED",
+          commit_id: head,
+          submitted_at: "2026-09-06T00:00:00Z",
+        },
+        { user: { login: "allyblockcast[bot]" }, body: "draft", state: "PENDING", commit_id: head },
+        { user: { login: "kkroo" }, body: "lgtm", state: "APPROVED", commit_id: head },
+      ],
+      comments: [
+        { user: { login: "allyblockcast[bot]" }, body: allyReview, created_at: "2026-09-06T00:01:00Z" },
+        { user: { login: "kkroo" }, body: "thanks", created_at: "2026-09-06T00:02:00Z" },
+      ],
+    });
+
+    const result = await githubListReviewerSurfacesAtPr({ repoFullName, prNumber });
+    expect("error" in result).toBe(false);
+    if ("error" in result) return;
+    expect(result.reviews.map((r) => r.state)).toEqual(["COMMENTED"]);
+    expect(result.reviews[0]).toMatchObject({ commitId: head, submittedAt: "2026-09-06T00:00:00Z" });
+    expect(result.comments).toHaveLength(1);
+    expect(result.comments[0]!.body).toBe(allyReview);
+  });
+
+  // Fails closed as a UNIT, unlike the predicate below: the probe reads these
+  // bodies to decide whether a review was clean, and an unread surface is not
+  // evidence that it carried no finding.
+  it("returns {error} when either surface fails, and never a partial read", async () => {
+    setCreds();
+    stub({ reviewsStatus: 500 });
+    expect(await githubListReviewerSurfacesAtPr({ repoFullName, prNumber })).toEqual({
+      error: expect.stringContaining("reviews"),
+    });
+
+    stub({ reviews: [], commentsStatus: 503 });
+    expect(await githubListReviewerSurfacesAtPr({ repoFullName, prNumber })).toEqual({
+      error: expect.stringContaining("comments"),
+    });
+
+    stub({ throwOn: "reviews" });
+    expect(await githubListReviewerSurfacesAtPr({ repoFullName, prNumber })).toEqual({
+      error: "reviews_fetch_failed",
+    });
+  });
+
+  it("errors without querying GitHub when no reviewer login is configured", async () => {
+    setCreds();
+    h.cfg.prReviewerBotLogin = "";
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await githubListReviewerSurfacesAtPr({ repoFullName, prNumber })).toEqual({ error: "no_bot_login" });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  // A bare user-seat login matches no App row, so without this guard the helper
+  // returns empty surfaces and the caller cannot tell a misconfiguration from a
+  // review that carried no finding.
+  it("errors without querying GitHub when the configured login is the bare user seat", async () => {
+    setCreds();
+    h.cfg.prReviewerBotLogin = "allyblockcast";
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await githubListReviewerSurfacesAtPr({ repoFullName, prNumber })).toEqual({
+      error: "bot_login_not_app_form",
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("githubHasReviewerEvidenceForPr after delegating to the shared grammar", () => {
+  const repoFullName = "Blockcast/paperclip";
+  const prNumber = 1588;
+  const head = "c".repeat(40);
+
+  function stub(routes: { reviews?: unknown[]; comments?: unknown[]; commentsStatus?: number }) {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL) => {
+        const u = String(url);
+        if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+        if (u.includes("/reviews")) return jsonResponse(routes.reviews ?? []);
+        if (u.includes("/issues/") && u.includes("/comments")) {
+          if (routes.commentsStatus) return jsonResponse([], false, routes.commentsStatus);
+          return jsonResponse(routes.comments ?? []);
+        }
+        if (u.includes("/pulls/")) return jsonResponse({ head: { sha: head } });
+        throw new Error(`unexpected url ${u}`);
+      }),
+    );
+  }
+
+  // REGRESSION GUARD. Composing this predicate out of the both-surfaces fetcher
+  // would turn this case into {error}, and its callers fail completion closed on
+  // {error} — a false `pr_review_output_missing` on a PR that WAS reviewed, i.e.
+  // BLO-28920 gated on an unrelated surface's availability. The short-circuit is
+  // load-bearing, not an optimisation.
+  it("returns a review match at head even when the comments surface is failing", async () => {
+    setCreds();
+    stub({
+      reviews: [{ user: { login: "allyblockcast[bot]" }, commit_id: head, state: "COMMENTED" }],
+      commentsStatus: 500,
+    });
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha: head })).resolves.toEqual({
+      found: true,
+      via: "review",
+    });
+  });
+
+  it("does not fetch the comments surface when a review already matched", async () => {
+    setCreds();
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      const u = String(url);
+      if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+      if (u.includes("/reviews")) {
+        return jsonResponse([{ user: { login: "allyblockcast[bot]" }, commit_id: head, state: "COMMENTED" }]);
+      }
+      throw new Error(`unexpected url ${u}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha: head })).resolves.toEqual({
+      found: true,
+      via: "review",
+    });
+    expect(fetchMock.mock.calls.every(([u]) => !String(u).includes("/issues/"))).toBe(true);
+  });
+
+  // The delegation WIDENS the comment surface: the deleted private copy required
+  // a literal `## Ally — Consolidated PR Review` heading and allowed only `_`
+  // around the label, so this real Ally shape attested nothing.
+  it("accepts a bold heading and a bold/backticked attestation", async () => {
+    setCreds();
+    stub({
+      reviews: [],
+      comments: [
+        {
+          user: { login: "allyblockcast[bot]" },
+          body: `**Ally — Consolidated PR Review**\n**Reviewed head:** \`${head}\``,
+          created_at: "2026-09-06T00:00:00Z",
+        },
+      ],
+    });
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha: head })).resolves.toEqual({
+      found: true,
+      via: "comment",
+    });
+  });
+
+  // The delegation also NARROWS one form, deliberately. The deleted copy used
+  // `\s*` around the label and the SHA, which crosses newlines, so an
+  // attestation split over two lines parsed. The shared grammar matches
+  // horizontal whitespace only. No live Ally attestation uses the split form,
+  // and a newline-crossing match would let a bare `Reviewed head:` line bind to
+  // an unrelated 40-hex on the next line. Pinned so the choice is visible if it
+  // ever needs revisiting.
+  it("no longer accepts an attestation split across two lines", async () => {
+    setCreds();
+    stub({
+      reviews: [],
+      comments: [
+        {
+          user: { login: "allyblockcast[bot]" },
+          body: `## Ally — Consolidated PR Review\nReviewed head:\n${head}`,
+          created_at: "2026-09-06T00:00:00Z",
+        },
+      ],
+    });
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha: head })).resolves.toEqual({
+      found: false,
+    });
+  });
+
+  it("still rejects a request comment quoting the heading and a SHA", async () => {
+    setCreds();
+    stub({
+      reviews: [],
+      comments: [
+        {
+          user: { login: "allyblockcast[bot]" },
+          body: `> ## Ally — Consolidated PR Review\n> Reviewed head: ${head}`,
+          created_at: "2026-09-06T00:00:00Z",
+        },
+      ],
+    });
+    await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha: head })).resolves.toEqual({
+      found: false,
+    });
   });
 });

@@ -12,7 +12,11 @@
 import { fileURLToPath } from 'node:url';
 
 const ISSUE_PATTERNS = [
-  /(?:fixes|closes|resolves|refs)\s+#\d+/i,
+  // The leading `(?<![A-Za-z])` is a left token boundary: without it, the
+  // keyword group matches inside unrelated words that happen to end/contain
+  // it — `derefs #123`, `prefixes #123`, `unresolves BLO-1` all satisfied the
+  // gate before this was added.
+  /(?<![A-Za-z])(?:fixes|closes|resolves|refs)\s+#\d+/i,
   /(?:^|[\s(])https:\/\/github\.com\/paperclipai\/paperclip\/issues\/\d+(?=$|[\s),:;!?]|[.](?![\w-]))/i,
   /(?<!\w)#\d+/,
   // Paperclip control-plane issues (e.g. BLO-20901) aren't GitHub issues and
@@ -21,7 +25,7 @@ const ISSUE_PATTERNS = [
   // markdown link (`Refs: [BLO-20901](...)`, `Refs BLO-20901`). The trailing
   // lookahead requires a real token boundary after the digits so
   // `Refs BLO-20901junk` / `Refs BLO-1.evil` don't count as evidence.
-  /(?:fixes|closes|resolves|refs)\s*:?\s*\[?[A-Z][A-Z0-9]{1,9}-\d+(?=$|[\s),\]:;!?]|[.](?![\w-]))/i,
+  /(?<![A-Za-z])(?:fixes|closes|resolves|refs)\s*:?\s*\[?[A-Z][A-Z0-9]{1,9}-\d+(?=$|[\s),\]:;!?]|[.](?![\w-]))/i,
   // ...or the mandated Paperclip issue backlink URL on its own (every
   // Paperclip-tracked PR is required to include this per the paperclip skill).
   /(?:^|[\s(])https:\/\/paperclip\.blockcast\.net\/[A-Za-z0-9]+\/issues\/[A-Za-z0-9]+-\d+(?=$|[\s),:;!?]|[.](?![\w-]))/i,

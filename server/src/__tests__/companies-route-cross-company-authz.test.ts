@@ -23,6 +23,11 @@ const mockAgentService = vi.hoisted(() => ({
 const mockAccessService = vi.hoisted(() => ({
   ensureMembership: vi.fn(),
   ensureRoleDefaultGrants: vi.fn(),
+  // PEN-3252. The export routes resolve a `workspace_runtime:read` decision so the bundle can omit
+  // operator-authored runtime config from a caller that is not entitled to it. Denying here is the
+  // honest default for this file's actor: `assertSameCompanyCeoAgentOrBoard` admits a same-company
+  // CEO agent, and that is not the entitlement that discloses runtime config.
+  decide: vi.fn(async () => ({ allowed: false })),
 }));
 
 const mockBudgetService = vi.hoisted(() => ({
@@ -175,6 +180,7 @@ function resetMockDefaults() {
   mockCompanyPortabilityService.previewExport.mockResolvedValue(exportPreviewResult());
   mockCompanyPortabilityService.previewImport.mockResolvedValue({ ok: true });
   mockCompanyPortabilityService.importBundle.mockResolvedValue(importResult());
+  mockAccessService.decide.mockResolvedValue({ allowed: false });
 }
 
 function assertNoTargetMutationSideEffects() {
@@ -281,6 +287,21 @@ describe.sequential("company route cross-company authorization", () => {
     await request(app).post(`/api/companies/${companyAId}/exports/preview`).send(exportRequest).expect(200);
     await request(app).post(`/api/companies/${companyAId}/imports/preview`).send(importRequest(companyAId)).expect(200);
     await request(app).post(`/api/companies/${companyAId}/imports/apply`).send(importRequest(companyAId)).expect(200);
+
+    // PEN-3252. This actor is exactly the one the finding names: a same-company CEO agent clears
+    // `assertSameCompanyCeoAgentOrBoard` and so reaches the export, which used to carry every issue's
+    // raw `executionWorkspaceSettings` in the bundle. Route access alone must not decide that — the
+    // separate `workspace_runtime:read` decision must, and here it denies.
+    expect(mockCompanyPortabilityService.exportBundle).toHaveBeenCalledWith(
+      companyAId,
+      expect.anything(),
+      expect.objectContaining({ revealWorkspaceRuntime: false }),
+    );
+    expect(mockCompanyPortabilityService.previewExport).toHaveBeenCalledWith(
+      companyAId,
+      expect.anything(),
+      expect.objectContaining({ revealWorkspaceRuntime: false }),
+    );
 
     const archive = await request(app).post(`/api/companies/${companyAId}/archive`).send({});
     expect(archive.status).toBe(403);

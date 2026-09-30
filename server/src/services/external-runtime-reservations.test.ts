@@ -19,6 +19,7 @@ import {
   ExternalRuntimeIsolationConflictError,
   externalRuntimeReservationCanRelease,
   markExternalRuntimeReservationLaunching,
+  getActiveExternalRuntimeReservation,
   rearmExternalRuntimeReservationForRetry,
   recordExpectedExternalRuntimeJobName,
   recordExternalRuntimeJobIdentity,
@@ -968,6 +969,41 @@ describeEmbeddedPostgres("external runtime reservations", () => {
       jobName: "agent-opencode-run-2",
       jobUid: "uid-2",
     });
+  });
+
+  it("serializes the re-arm behind a reaper holding the run row, and yields once the run is terminal (BLO-33019)", async () => {
+    // The lifecycle reaper finalizes a run inside a transaction that locks the
+    // heartbeat_runs row FOR UPDATE, re-reads this reservation, then CASes the
+    // status. The re-arm has to take the same row lock and require the run to
+    // still be running, so the two writes serialize: a re-arm racing a
+    // finalization blocks, then observes `failed` and becomes a no-op instead
+    // of pointing a replacement launch at a run that is already terminal.
+    const [runId] = await seedQueuedRuns(1);
+    const claim = await claimRunWithExternalRuntimeSlot(db, runId, new Date());
+    await markExternalRuntimeReservationLaunching(db, runId);
+    await recordExpectedExternalRuntimeJobName(db, { runId, jobName: "agent-opencode-terminal" });
+    await recordExternalRuntimeJobIdentity(db, { runId, jobName: "agent-opencode-terminal", jobUid: "uid-t" });
+
+    // The re-arm runs on its own pool connection and must stay parked until
+    // the transaction below COMMITS -- so it is awaited after the transaction,
+    // never inside it (awaiting inside would wait on a lock the transaction
+    // itself holds).
+    let pending!: ReturnType<typeof rearmExternalRuntimeReservationForRetry>;
+    await db.transaction(async (tx) => {
+      await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).for("update");
+      pending = rearmExternalRuntimeReservationForRetry(db, { runId, reservationId: claim!.reservation.id });
+      const raced = await Promise.race([
+        pending.then(() => "resolved" as const),
+        new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 400)),
+      ]);
+      expect(raced, "re-arm must wait for the run-row lock held by the finalizer").toBe("blocked");
+      await tx.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+    });
+    const rearmed = await pending;
+
+    expect(rearmed).toBeNull();
+    const reservation = await getActiveExternalRuntimeReservation(db, runId);
+    expect(reservation).toMatchObject({ jobName: "agent-opencode-terminal", jobUid: "uid-t" });
   });
 
   it("re-arms a retry when throttling happens before Job acknowledgment", async () => {

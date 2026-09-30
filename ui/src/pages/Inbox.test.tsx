@@ -683,6 +683,7 @@ describe("FailedRunInboxRow", () => {
       logBytes: null,
       logSha256: null,
       logCompressed: false,
+      firstOutputAt: null,
       lastOutputAt: null,
       lastOutputSeq: 0,
       lastOutputStream: null,

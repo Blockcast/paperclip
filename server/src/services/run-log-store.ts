@@ -21,6 +21,15 @@ export interface RunLogReadOptions {
 export interface RunLogReadResult {
   content: string;
   nextOffset?: number;
+  /**
+   * Total size of the log at the instant it was served, when the backing store
+   * can say. Both backends already compute it to clamp the range; surfacing it
+   * lets a reader seek to the END of a log instead of walking it from byte
+   * zero. `heartbeatRuns.logBytes` cannot serve that purpose: it is only
+   * written back on finalize (PEN-2106), so it is null for exactly the
+   * still-running rows a tail reader cares about.
+   */
+  totalBytes?: number;
 }
 
 export interface RunLogFinalizeSummary {
@@ -50,6 +59,32 @@ function resolveWithin(basePath: string, relativePath: string) {
     throw new Error("Invalid log path");
   }
   return resolved;
+}
+
+/**
+ * True when a read begins at or past the end of the object, so there is
+ * nothing to serve.
+ *
+ * Both backends MUST answer such a read with an empty result instead of
+ * building a range. They floor `end` at `start`, so the range computed for
+ * `offset >= total` is `bytes=total-total` — one byte PAST the last valid
+ * index (`total - 1`). A local file tolerates that and yields zero bytes, but
+ * S3 rejects it with `416 InvalidRange`, and `getObject` only maps
+ * `NoSuchKey`/`NotFound`, so the 416 propagates to a caller that treats any
+ * throw as "no verdict" (PEN-3129).
+ *
+ * The read is legitimate rather than a caller bug: `readRunLogTerminalTail`
+ * re-probes the end of a small log to see whether the pod appended anything
+ * after its size probe. Nothing appended is the STEADY STATE — the reconciler
+ * runs after the pod is terminal — so this is the ordinary path for every
+ * log that fits the tail window, not an edge case.
+ *
+ * Shared so the two backends cannot disagree about EOF again; that divergence
+ * is what let the defect reach only the S3 path, where no local-file test
+ * could see it.
+ */
+function isAtOrPastEnd(offset: number, total: number): boolean {
+  return Math.max(0, Math.min(offset, total)) >= total;
 }
 
 function normalizeKeyPrefix(prefix: string | undefined): string {
@@ -96,9 +131,11 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
   ): Promise<RunLogReadResult | null> {
     const stat = await fs.stat(filePath).catch(() => null);
     if (!stat) return null;
+    // Nothing to serve: answer empty rather than opening a zero-length range.
+    // See `isAtOrPastEnd` — the S3 twin of this read cannot express that range.
+    if (isAtOrPastEnd(offset, stat.size)) return { content: "", totalBytes: stat.size };
     const start = Math.max(0, Math.min(offset, stat.size));
     const end = Math.max(start, Math.min(start + limitBytes - 1, stat.size - 1));
-    if (start > end) return { content: "", nextOffset: start };
 
     const chunks: Buffer[] = [];
     try {
@@ -117,7 +154,7 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
     }
     const content = Buffer.concat(chunks).toString("utf8");
     const nextOffset = end + 1 < stat.size ? end + 1 : undefined;
-    return { content, nextOffset };
+    return { content, nextOffset, totalBytes: stat.size };
   }
 
   async function readS3Range(
@@ -130,9 +167,11 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
     const head = await s3.provider.headObject({ objectKey: key });
     if (!head.exists) throw notFound("Run log not found");
     const total = head.contentLength ?? 0;
+    // Answer an at-or-past-EOF probe WITHOUT a range request: `bytes=total-total`
+    // is unsatisfiable and S3 answers 416. See `isAtOrPastEnd`.
+    if (isAtOrPastEnd(offset, total)) return { content: "", totalBytes: total };
     const start = Math.max(0, Math.min(offset, total));
     const end = Math.max(start, Math.min(start + limitBytes - 1, total - 1));
-    if (start > end || total === 0) return { content: "", nextOffset: start < total ? start : undefined };
 
     const result = await s3.provider.getObject({ objectKey: key, range: { start, end } });
     const chunks: Buffer[] = [];
@@ -143,7 +182,7 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
     });
     const content = Buffer.concat(chunks).toString("utf8");
     const nextOffset = end + 1 < total ? end + 1 : undefined;
-    return { content, nextOffset };
+    return { content, nextOffset, totalBytes: total };
   }
 
   async function sha256File(filePath: string): Promise<string> {

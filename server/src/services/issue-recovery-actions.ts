@@ -1,21 +1,67 @@
-import { and, asc, desc, eq, inArray, isNotNull, lte, sql } from "drizzle-orm";
-import type { Db } from "@paperclipai/db";
-import { issueRecoveryActions } from "@paperclipai/db";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, lte, sql } from "drizzle-orm";
+import type { Db, DbTransaction } from "@paperclipai/db";
+import { issueRecoveryActions, issues } from "@paperclipai/db";
 import type {
   IssueRecoveryAction,
   IssueRecoveryActionKind,
   IssueRecoveryActionOwnerType,
   IssueRecoveryActionOutcome,
   IssueRecoveryActionStatus,
+  IssueRecoveryActionRetiringBound,
 } from "@paperclipai/shared";
 
 export const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
+
+/**
+ * Recovery-action statuses that still hold a live repair path, for the purpose of
+ * suppressing blocked-issue auto-resume.
+ *
+ * Deliberately NARROWER than `ACTIVE_RECOVERY_ACTION_STATUSES`, and the asymmetry is
+ * load-bearing (BLO-21523). `escalated` belongs in the wider set — it holds
+ * `issue_recovery_actions_active_source_uq` so a fresh action cannot be minted with a
+ * new budget (BLO-18996), it keeps the handoff comment grant open, and it keeps the
+ * owner able to check the issue out. What it does NOT do is wake anyone:
+ *
+ *   - Three writers set `escalated`, and each does so only on a bound that
+ *     `strandedRecoveryWakeAttemptsExhausted` already reports as exhausted:
+ *     `escalateExpiredWakeHorizons` on `maxAttempts !== null && timeoutAt !== null &&
+ *     timeoutAt <= now`, and `retireAndReleaseWakeAttempt` / `retireWakeAction` on the
+ *     attempt budget (BLO-19124). (`upsertSourceScoped` never creates one — it only
+ *     preserves, or lifts an `attempt_budget` retirement when the OWNER changes, which
+ *     returns the row to `active` with a fresh budget rather than making a new way in.)
+ *     This bullet read "`escalateExpiredWakeHorizons` is the ONLY writer" until BLO-19124
+ *     added the other two; the premise changed, the conclusion below did not.
+ *   - So every `escalated` action is already wake-exhausted.
+ *     `reconcileStrandedRecoveryWakeBackstop` selects it and then always drops it at
+ *     `exhaustedSkipped`. Should a later re-upsert ever null out `maxAttempts`, the
+ *     conclusion is unchanged: a null budget is reserved for the causes that never wake
+ *     an owner at all.
+ *
+ * The platform says as much verbatim when it escalates: "Paperclip has stopped waking
+ * anyone for it". Suppressing auto-resume on an `escalated` action therefore preserves
+ * no repair path — it only pins the issue `blocked` with zero unresolved blockers, which
+ * is the exact stranded state the reconciler exists to drain, and which no wake, retry or
+ * monitor will ever re-enter. Measured 2026-08-24: 88 of 106 stranded rows were held this
+ * way, 87 of them with no run, no monitor and no scheduled retry, the oldest 6 weeks old.
+ *
+ * Resolving or cancelling the action remains the way to clear the wider set; this constant
+ * only decides whether the row may return to `todo`.
+ */
+export const BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES = ["active"] as const satisfies readonly IssueRecoveryActionStatus[];
+
 const MAX_UPSERT_RETRIES = 3;
 const SOURCE_SCOPED_WAKE_HORIZON_EVIDENCE_KEY = "sourceScopedWakeHorizonAt";
 const RECOVERY_HANDOFF_GRANT_ANCHOR_EVIDENCE_KEY = "recoveryHandoffGrantAnchorAt";
 // Written by `buildStrandedRecoveryActionEvidence` in recovery/service.ts.
 const LATEST_RUN_AGENT_ID_EVIDENCE_KEY = "latestRunAgentId";
 const LATEST_RUN_ID_EVIDENCE_KEY = "latestRunId";
+// Where the source issue stood at the instant the action was resolved. Read by
+// `classifyRecoveryHandoff` (recovery-observability.ts) in place of a live
+// `issues` join, so a resolved action's routing class cannot change when the
+// issue is later reassigned or completed (BLO-33600). Absent on every row
+// resolved before this shipped; those classify as `unknown`, never `handed_back`.
+export const RESOLVED_ASSIGNEE_AGENT_ID_EVIDENCE_KEY = "resolvedAssigneeAgentId";
+export const RESOLVED_ISSUE_STATUS_EVIDENCE_KEY = "resolvedIssueStatus";
 
 // How long after a recovery transfer the previous owner keeps the comment-only
 // handoff channel opened by BLO-18906 / #827.
@@ -36,7 +82,6 @@ const LATEST_RUN_ID_EVIDENCE_KEY = "latestRunId";
 export const RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS = 24 * 60 * 60 * 1000;
 
 type IssueRecoveryActionRow = typeof issueRecoveryActions.$inferSelect;
-type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type DbOrTransaction = Db | DbTransaction;
 
 export type UpsertIssueRecoveryActionInput = {
@@ -252,8 +297,10 @@ function toReadModel(row: IssueRecoveryActionRow): IssueRecoveryAction {
     wakePolicy: row.wakePolicy,
     monitorPolicy: row.monitorPolicy,
     attemptCount: row.attemptCount,
+    nonDeliverySweepCount: row.nonDeliverySweepCount,
     maxAttempts: row.maxAttempts,
     timeoutAt: row.timeoutAt,
+    retiringBound: row.retiringBound as IssueRecoveryActionRetiringBound | null,
     lastAttemptAt: row.lastAttemptAt,
     outcome: row.outcome as IssueRecoveryAction["outcome"],
     resolutionNote: row.resolutionNote,
@@ -384,6 +431,21 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       // Computed in the same UPDATE as the owner write, so no sweep can observe a new owner
       // carrying an old counter.
       const isNewOwnerSequence = (input.ownerAgentId ?? null) !== existing.ownerAgentId;
+      // BLO-19124: an `attempt_budget` retirement belongs to the owner whose budget it was,
+      // so it has to be lifted by the same event that restarts `attemptCount` at 1 below.
+      // Leaving the row `escalated` with that bound hands the replacement owner a budget it
+      // can never spend: `shouldReuseStrandedRecoveryAction` reads `escalated` + an unchanged
+      // owner as a standing escalation and returns BEFORE this upsert on every later sweep,
+      // so the new owner is woken exactly once and then starves. That is the BLO-18996
+      // deadlock reintroduced — the "too broad" half that predicate's own doc warns about.
+      //
+      // Only this bound is lifted. `timeout_horizon` is anchored to creation and owner churn
+      // must not restore it (BLO-24662), and `discharged`/`cancelled` are explicit disposals.
+      // Un-retiring is still bounded: the new owner gets a fresh attempt budget, while the
+      // preserved creation-anchored `timeoutAt` keeps bounding wall-clock and re-retires the
+      // row as `timeout_horizon` the moment that horizon passes.
+      const liftsAttemptBudgetRetirement = isNewOwnerSequence &&
+        existing.retiringBound === "attempt_budget";
       const existingTimeoutAt = toValidDate(existing.timeoutAt);
       const inputMaxAttempts = input.maxAttempts ?? null;
       const existingWakeHorizonAt = readSourceScopedWakeHorizonAt(existing.evidence);
@@ -489,8 +551,12 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
           // action — no owner change restores it (see the `timeoutAt` preservation note
           // below). Re-setting `active` here would silently un-retire an action on the very
           // next sweep and put it straight back into the invisible state the transition
-          // exists to end.
-          status: existing.status === "escalated" ? "escalated" : "active",
+          // exists to end. The one exception is an `attempt_budget` retirement lifted by a
+          // genuine owner change — see `liftsAttemptBudgetRetirement`.
+          status: existing.status === "escalated" && !liftsAttemptBudgetRetirement
+            ? "escalated"
+            : "active",
+          retiringBound: liftsAttemptBudgetRetirement ? null : existing.retiringBound,
           ownerType,
           ownerAgentId: input.ownerAgentId ?? null,
           ownerUserId: input.ownerUserId ?? null,
@@ -526,8 +592,14 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
           // preserving it would exhaust the new owner on its first wake — the deadlock this
           // ticket exists to fix, reintroduced through the back door. So on
           // unbounded -> bounded, adopt the fresh wake horizon; thereafter never rewrite it.
-          // Staying unbounded still preserves, which keeps the quota `retryAt` intact and the
-          // `pr_review_non_convergence` caller (also `maxAttempts: null`) unaffected.
+          // Staying unbounded still preserves, which keeps the quota `retryAt` intact.
+          //
+          // PEN-2756: this used to also name `pr_review_non_convergence` as an unbounded
+          // caller. It is bounded at creation now (it wakes an owner, so the same rule that
+          // bounds every other waking shape applies), which means it reaches the
+          // unbounded -> bounded arm above on its first sweep after rollout, exactly like the
+          // ROLLOUT NOTE describes. Only the ownerless board-escalation variant of that kind
+          // stays unbounded, and that one wakes nobody.
           timeoutAt: inputMaxAttempts !== null
             ? (wakeHorizonAt ?? input.timeoutAt ?? null)
             : (existingTimeoutAt ?? input.timeoutAt ?? null),
@@ -610,21 +682,118 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
   // reports its non-delivery paths (capacity deferral, tree hold, cooldown, disabled wake).
   // So only wakes that actually reached the queue count against the budget. Floors at 0 so a
   // refunded first attempt makes the next sweep's `existing.attemptCount + 1` land back on 1.
-  // Scoped to active statuses and matched on company so it cannot touch a resolved row.
-  async function releaseWakeAttempt(input: { companyId: string; actionId: string }): Promise<void> {
+  // The owner and attempt count are the reservation token captured by the caller. Keep both
+  // in the UPDATE predicate so a refund from an older wake is an atomic no-op after ownership
+  // changes or a newer reservation. Scoped to active statuses and matched on company so it
+  // cannot touch a resolved row.
+  async function releaseWakeAttempt(input: {
+    companyId: string;
+    actionId: string;
+    expectedOwnerAgentId: string;
+    expectedAttemptCount: number;
+  }): Promise<void> {
     await db
       .update(issueRecoveryActions)
       .set({
         attemptCount: sql`greatest(${issueRecoveryActions.attemptCount} - 1, 0)`,
+        nonDeliverySweepCount: sql`${issueRecoveryActions.nonDeliverySweepCount} + 1`,
         updatedAt: new Date(),
       })
       .where(
         and(
           eq(issueRecoveryActions.id, input.actionId),
           eq(issueRecoveryActions.companyId, input.companyId),
+          eq(issueRecoveryActions.ownerAgentId, input.expectedOwnerAgentId),
+          eq(issueRecoveryActions.attemptCount, input.expectedAttemptCount),
           inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
         ),
       );
+  }
+
+  async function retireAndReleaseWakeAttempt(input: {
+    companyId: string;
+    actionId: string;
+    expectedOwnerAgentId: string;
+    expectedAttemptCount: number;
+    retiringBound: IssueRecoveryActionRetiringBound;
+  }): Promise<void> {
+    // Retiring and refunding must share one statement. Splitting them lets a sweep observe a
+    // row whose status advanced without its reserved attempt coming back, which reopens the
+    // exhausted action.
+    //
+    // BLO-19124 (Ally review of #1542): the retirement half is what must be idempotent, NOT
+    // the refund. Gating the whole UPDATE on `status = 'active' AND retiring_bound IS NULL`
+    // made this self-disarming — a successful call sets exactly the opposite on the same row,
+    // so every later call matched zero rows and the refund silently stopped while the reserve
+    // in `upsertSourceScoped` kept incrementing. `shouldReuseStrandedRecoveryAction` hides
+    // that for an unchanged owner by returning before the reserve, but a sweep that changes
+    // the fingerprint without changing the routed owner (two assignees under one manager)
+    // still reaches it, and there the counter climbs +1 per sweep with no ceiling.
+    //
+    // So the predicate keeps only the reservation CAS — owner plus attempt count, scoped to
+    // active statuses — and the retirement writes are made idempotent in SQL instead. A
+    // re-run refunds its own reserve and rewrites neither `status` nor `retiring_bound`.
+    await db
+      .update(issueRecoveryActions)
+      .set({
+        status: sql`case when ${issueRecoveryActions.retiringBound} is null and ${issueRecoveryActions.status} = 'active' then 'escalated' else ${issueRecoveryActions.status} end`,
+        retiringBound: sql`coalesce(${issueRecoveryActions.retiringBound}, ${input.retiringBound})`,
+        attemptCount: sql`greatest(${issueRecoveryActions.attemptCount} - 1, 0)`,
+        nonDeliverySweepCount: sql`${issueRecoveryActions.nonDeliverySweepCount} + 1`,
+        updatedAt: new Date(),
+      })
+      .where(and(
+        eq(issueRecoveryActions.id, input.actionId),
+        eq(issueRecoveryActions.companyId, input.companyId),
+        eq(issueRecoveryActions.ownerAgentId, input.expectedOwnerAgentId),
+        eq(issueRecoveryActions.attemptCount, input.expectedAttemptCount),
+        inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+      ));
+  }
+
+  async function retireWakeAction(input: {
+    companyId: string;
+    actionId: string;
+    retiringBound: IssueRecoveryActionRetiringBound;
+  }) {
+    const [updated] = await db
+      .update(issueRecoveryActions)
+      .set({ status: "escalated", retiringBound: input.retiringBound, updatedAt: new Date() })
+      .where(and(
+        eq(issueRecoveryActions.id, input.actionId),
+        eq(issueRecoveryActions.companyId, input.companyId),
+        // BLO-19124 (Ally review of #1542): `active` alone cannot retire a row that is
+        // already `escalated` with no bound — the legacy shape `0240` backfills. The
+        // backfill closes the known population; this closes the door behind it, so a row
+        // that reaches that shape by any other route can still acquire its bound instead of
+        // staying a backstop candidate forever. `retiring_bound IS NULL` is what keeps the
+        // write idempotent, and it is the predicate that actually carries that job.
+        inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+        isNull(issueRecoveryActions.retiringBound),
+      ))
+      .returning();
+    return updated ? toReadModel(updated) : null;
+  }
+
+  async function recordNonDeliverySweep(input: {
+    companyId: string;
+    actionId: string;
+    expectedOwnerAgentId: string;
+    expectedLastAttemptAt: Date;
+  }): Promise<void> {
+    await db
+      .update(issueRecoveryActions)
+      .set({
+        nonDeliverySweepCount: sql`${issueRecoveryActions.nonDeliverySweepCount} + 1`,
+        updatedAt: new Date(),
+      })
+      .where(and(
+        eq(issueRecoveryActions.id, input.actionId),
+        eq(issueRecoveryActions.companyId, input.companyId),
+        eq(issueRecoveryActions.ownerAgentId, input.expectedOwnerAgentId),
+        eq(issueRecoveryActions.lastAttemptAt, input.expectedLastAttemptAt),
+        inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+      ));
   }
 
   /**
@@ -682,7 +851,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
 
     const updated = await db
       .update(issueRecoveryActions)
-      .set({ status: "escalated", updatedAt: now })
+      .set({ status: "escalated", retiringBound: "timeout_horizon", updatedAt: now })
       .where(and(
         inArray(issueRecoveryActions.id, candidateIds),
         eq(issueRecoveryActions.status, "active"),
@@ -715,14 +884,29 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       predicates.push(eq(issueRecoveryActions.fingerprint, input.fingerprint));
     }
 
+    // Read inside the caller's transaction where there is one, so the snapshot
+    // reflects the same issue mutation that triggered this resolution.
+    const [sourceIssue] = await dbOrTx
+      .select({ assigneeAgentId: issues.assigneeAgentId, status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, input.sourceIssueId))
+      .limit(1);
+
     const [updated] = await dbOrTx
       .update(issueRecoveryActions)
       .set({
         status: input.status,
         outcome: input.outcome,
+        retiringBound: input.status === "cancelled" ? "cancelled" : "discharged",
         resolutionNote: input.resolutionNote ?? null,
         resolvedAt: now,
         updatedAt: now,
+        // Snapshot the source issue as it stands NOW. Merged in SQL rather than
+        // read-modify-written in TS so a concurrent evidence write is not lost.
+        evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({
+          [RESOLVED_ASSIGNEE_AGENT_ID_EVIDENCE_KEY]: sourceIssue?.assigneeAgentId ?? null,
+          [RESOLVED_ISSUE_STATUS_EVIDENCE_KEY]: sourceIssue?.status ?? null,
+        })}::jsonb`,
       })
       .where(and(...predicates))
       .returning();
@@ -737,5 +921,8 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
     escalateExpiredWakeHorizons,
     upsertSourceScoped,
     releaseWakeAttempt,
+    retireAndReleaseWakeAttempt,
+    retireWakeAction,
+    recordNonDeliverySweep,
   };
 }

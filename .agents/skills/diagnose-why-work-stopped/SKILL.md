@@ -87,9 +87,18 @@ State in the forensics: "I reviewed X, Y, Z. The new gap is …"
 
 For every issue in the affected tree that is not `done` / `cancelled` / actively running, decide:
 
-- **Truly needs human or board intervention** — name the owner and the action.
+- **Truly needs human or board intervention** — name the owner and the action, and record it on the issue in the form the liveness sweep actually reads (below).
 - **Agent-actionable but not currently routed** — name the rule that would have routed it, and the agent that should have been waked.
 - **Already covered** — point at the active run, queued wake, recovery issue, or pending interaction.
+
+For the first class, prose is not enough. An issue parked on a human gate is only exempt from the `blocked_without_blockers` dead-end finding when its **description** carries both of these lines, each on its own line:
+
+```
+external owner: <who must act>
+external action: <the concrete action they must take>
+```
+
+Without both lines the sweep reads a deliberately parked issue as one nothing can ever unblock, and mints a recovery escalation against it — so a correctly-diagnosed human gate still generates the noise this skill exists to reduce. Matching is case-insensitive but the `key: value` shape is required, and only `description` is scanned (not comments, not `monitorNotes`). See [Declaring an external wait](../../../doc/execution-semantics.md#declaring-an-external-wait). Do not arm a monitor on a human-only gate instead — polling does not move it.
 
 This is the table the user has asked for repeatedly ([PAP-2335](/PAP/issues/PAP-2335)). Without it the plan is abstract.
 

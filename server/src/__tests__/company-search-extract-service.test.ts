@@ -66,7 +66,7 @@ describeEmbeddedPostgres("companySearchExtractService", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-company-search-extract-");
     db = createDb(tempDb.connectionString);
     svc = companySearchExtractService(db);
-  }, 60_000);
+  });
 
   afterEach(async () => {
     await db.delete(issueDocuments);

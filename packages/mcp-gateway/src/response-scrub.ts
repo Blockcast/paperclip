@@ -1,0 +1,1631 @@
+/**
+ * Response scrubbing: strip secret material out of MCP tool results before
+ * they reach the agent (PEN-2370).
+ *
+ * WHY THIS EXISTS
+ *
+ * `pods_get` and `resources_get` on the Kubernetes MCP servers return the full
+ * resource, including `spec.containers[].env[].value`, in the clear. Any agent
+ * holding the read-only k8s grant can read every other agent's pod, so one
+ * read-only grant yields fleet-wide credentials. The reader cannot avoid it:
+ * these tools have no field selector, so fetching a pod's image or phase — the
+ * legitimate diagnostic use the grant exists for — returns the secrets anyway.
+ * Correct, careful use causes the exposure.
+ *
+ * DESIGN CONSTRAINTS, each of which is load-bearing:
+ *
+ * 1. STRUCTURAL, NOT NAME-MATCHING. We redact *every* value inside an `env`
+ *    block, whatever the variable is called. We deliberately do NOT match
+ *    names against a `/(TOKEN|SECRET|KEY|PASSWORD|...)/i` fragment list: such a
+ *    matcher falls through to the literal value for any name outside the list,
+ *    so it is not default-deny and a credential named `SIGNING_MATERIAL` or
+ *    `DSN` walks straight through. Redact everything; keep the names.
+ *
+ * 2. NAMES ARE PRESERVED. Knowing *which* variables are set is the diagnostic
+ *    value of the grant. We return `value: "<redacted>"`, not a deleted key,
+ *    and `valueFrom:` references (`secretKeyRef`, `configMapKeyRef`) are left
+ *    intact — they name a source, they do not carry the material.
+ *
+ * 3. NO NEW DEPENDENCIES. This package ships `"dependencies": {}` on purpose:
+ *    it is an unauthenticated-reachable proxy, and its supply chain is part of
+ *    its threat model. So we do not pull in a YAML parser. The k8s MCP servers
+ *    serialize resources as YAML text inside a JSON-RPC content block, so we
+ *    walk that text with an indentation-aware scanner instead.
+ *
+ * 4. FAIL CLOSED. Where the scanner cannot confidently tell where a value ends
+ *    (block scalars, wrapped plain/quoted scalars, flow mappings), it removes
+ *    more rather than less — every line indented deeper than a redacted key is
+ *    dropped, since it can only be a continuation of that value. A scrubber
+ *    that guesses in the permissive direction is worse than none: emitting
+ *    `value: "<redacted>"` above the plaintext manufactures false assurance.
+ *
+ *    Note that fail-closed substitution changes YAML *types*: `env:` becomes a
+ *    string where a list was, and a dropped flow entry becomes a string where a
+ *    mapping was. That is deliberate — a client that re-parses the scrubbed
+ *    document may hit a type error rather than find a redaction marker, and a
+ *    type error is the safe direction to fail in.
+ *
+ * 5. `Secret` IS COVERED, NOT JUST `env`. The same read-only grant serves
+ *    `resources_get`/`resources_list` with an arbitrary `apiVersion`/`kind`, and
+ *    a `v1 Secret` carries its material directly in `data` (base64) and
+ *    `stringData` (plaintext). Scrubbing `pods_get` while leaving that path open
+ *    would close the harder route and leave the easier one, so within a document
+ *    whose `kind` is `Secret`/`SecretList` we redact both keys wholesale. Other
+ *    kinds keep their `data` — a ConfigMap read stays fully diagnostic.
+ *
+ * 6. PASS-THROUGH IS BYTE-EXACT. When nothing was redacted we return the
+ *    original Buffer rather than a re-serialized copy. This gateway also proxies
+ *    the GitHub and Paperclip upstreams, where a diff or issue body mentioning
+ *    `env:` is routine; re-stringifying those would silently round integers
+ *    above 2^53 and rewrite `1.0` as `1`. Redaction still re-serializes — that
+ *    cost is accepted only on bodies we actually had to change.
+ *
+ * SCOPE HONESTY: this closes the `env`-value, `Secret`-material and container
+ * `command`/`args` paths on responses that traverse this gateway. It is not a
+ * general secret detector, and it does not by itself establish the fleet-wide
+ * invariant that agent-visible tool output is systematically scrubbed — see
+ * PEN-2370 ask 3.
+ *
+ * `spec.containers[].command` / `args` (PEN-2431, door #5) is redacted, with the
+ * decision and its cost recorded here rather than left implicit:
+ *
+ * - **What.** Inside a container list only, every argv token is redacted. A
+ *   `--flag=value` token keeps its flag name (`--namespace=<redacted>`); a bare
+ *   positional has no name to keep and goes wholesale. There is no
+ *   pass-through arm — a token is redacted one way or the other.
+ * - **Cost, stated plainly.** Flag *values* and bare positionals are gone, and
+ *   that includes subcommands: `kubectl get pods` reads as three redactions.
+ *   Reading what a container is actually doing is materially degraded. This is
+ *   the price of default-deny on a field with no name/value split, and it was
+ *   chosen over PEN-2431's option 2 (redact only high-entropy-looking tokens)
+ *   because that is an allowlist wearing a denylist's clothes — it fails open on
+ *   exactly the credential that does not look like one.
+ * - **Why the container-list gate.** `args:` is not `env:`. This gateway also
+ *   proxies the GitHub and Paperclip upstreams, where `args:` appears in every
+ *   Actions workflow and MCP tool schema. Redacting a bare `args:` would corrupt
+ *   ordinary traffic on a key far more common than `env:`.
+ *
+ * One path through the same tools is knowingly OUT of scope, named so that a
+ * reader does not mistake this module for covering it:
+ *
+ * - `ConfigMap` `data`. Deliberately preserved: a ConfigMap read is a
+ *   legitimate diagnostic — it is how the PEN-2370 evidence was gathered
+ *   without re-probing a pod — and it has no name/value split to exploit
+ *   either. **Residual risk accepted, explicitly: a ConfigMap used to carry a
+ *   credential is still returned in the clear.** Unlike argv, there is no
+ *   structural gate that separates the credential case from the diagnostic one,
+ *   so redacting it would cost the diagnostic outright.
+ *
+ * Both are instances of ask 3's point: the invariant, not the instance. Note
+ * what door #5 cost to close — one redaction rule *and* one pre-filter probe
+ * (`CONTAINERS_KEY_PROBE`), because a rule is only as reachable as the filter
+ * that routes bodies to it. A field-enumeration control keeps producing this.
+ */
+
+export const REDACTED = "<redacted>";
+
+/**
+ * Annotations whose value embeds a serialized copy of the whole resource, and
+ * therefore a second copy of every env value in it.
+ *
+ * `kubectl.kubernetes.io/last-applied-configuration` is the one that matters:
+ * kubectl writes the entire applied manifest into it as a single-line JSON
+ * string. Redacting `env:` in the YAML body while leaving this annotation
+ * intact would leak exactly what we just removed, one field further down the
+ * same response. It is a client-side bookkeeping detail with little diagnostic
+ * value, so we drop the value wholesale rather than try to rewrite JSON
+ * embedded in a YAML scalar.
+ */
+const RESOURCE_ECHO_ANNOTATIONS = [
+  "kubectl.kubernetes.io/last-applied-configuration",
+];
+
+/**
+ * Cheap pre-filter for *decoded* strings.
+ *
+ * Used to decide whether to recurse into a string field that may itself hold a
+ * serialized resource (`content[].text`, an annotation map). It is deliberately
+ * NOT used to gate parsing of a whole response body: on a raw body a nested
+ * JSON resource appears escaped (`\"env\":`), which matches neither an `env:`
+ * nor an `"env"` probe, so gating on the raw bytes made the JSON path
+ * unreachable from the only entry point the proxy uses. `scrubResponseBody`
+ * dispatches on the body's *shape* instead and relies on this filter — which
+ * only ever sees decoded strings — to keep the walk cheap.
+ */
+function mightContainSecrets(text: string): boolean {
+  if (ENV_KEY_PROBE.test(text)) return true;
+  if (SECRET_KIND_PROBE.test(text)) return true;
+  if (CONTAINERS_KEY_PROBE.test(text)) return true;
+  return RESOURCE_ECHO_ANNOTATIONS.some((a) => text.includes(a));
+}
+
+/**
+ * An `env` key in any of the spellings the scanners below accept: bare,
+ * double-quoted, or single-quoted. A plain `includes("env:")` missed `'env':`
+ * entirely, so a single-quoted resource nested in a text field was never even
+ * scanned.
+ *
+ * Case-insensitive for the reason given at `isEnvKey`: Docker/OCI spells the key
+ * `Env`. This probe gates whether a nested string is scanned at all, so leaving
+ * it case-sensitive meant an OCI-shaped resource carried in `content[].text` was
+ * never handed to a scanner — a fail-open one step before any redaction rule.
+ */
+const ENV_KEY_PROBE = /(^|[^A-Za-z0-9_])(["']?)env\2\s*:/i;
+
+/**
+ * A `Secret`/`SecretList` document, in YAML or JSON spelling. Needed because a
+ * Secret body contains no `env` key at all — the pre-filter did not trip on one
+ * before, so `resources_get kind=Secret` was never scanned.
+ *
+ * Case-insensitive for the same reason as `ENV_KEY_PROBE`: this decides whether
+ * a body is scanned at all, so a non-canonical `kind` spelling here skipped
+ * every downstream Secret rule rather than just one of them.
+ */
+const SECRET_KIND_PROBE = /(["']?)kind\1\s*:\s*(["']?)Secret(List)?\2(\s|,|}|$)/i;
+
+/**
+ * A container list, in any of the three spellings Kubernetes uses.
+ *
+ * Needed because a pod whose only secret carrier is `args:` contains no `env`
+ * key and no `kind: Secret`, so neither probe above tripped and the body was
+ * never handed to a scanner at all — the argv rules below then had nothing to
+ * run on. This is the exact fail-open the two docblocks above were each written
+ * for, hit a third time: **a redaction rule is only ever as reachable as this
+ * pre-filter.** Adding a rule downstream without a probe that trips on the
+ * shape carrying it is a silent no-op, and it looks like a fix.
+ *
+ * Gated on the *container list* rather than on `command:`/`args:` so the probe
+ * and the redaction rule agree on scope: argv is only redacted inside a
+ * container list, so a body with no container list has nothing to redact and is
+ * correctly skipped. Matching bare `args:` here would also route every GitHub
+ * Actions workflow and MCP tool schema this gateway proxies into the YAML
+ * scanner for nothing.
+ */
+const CONTAINERS_KEY_PROBE =
+  /(^|[^A-Za-z0-9_])(["']?)(init|ephemeral)?containers\2\s*:/i;
+
+function leadingIndent(line: string): number {
+  let i = 0;
+  while (i < line.length && line[i] === " ") i += 1;
+  return i;
+}
+
+function isBlank(line: string): boolean {
+  return line.trim().length === 0;
+}
+
+/**
+ * True when `line` still belongs to the `env:` block that opened at
+ * `blockIndent`.
+ *
+ * YAML permits a sequence to sit at the same indentation as the key that owns
+ * it, which is exactly how kubectl renders env:
+ *
+ *     env:
+ *     - name: A
+ *       value: B
+ *
+ * so "indent <= blockIndent ends the block" would terminate it immediately, on
+ * the first entry. A line at the block indent continues the block only when it
+ * opens a sequence entry; anything else at that indent or shallower is a
+ * sibling key and ends it.
+ *
+ * Two shapes are held inside the block regardless of their indentation, because
+ * for both of them indentation is not the structural signal it appears to be.
+ * This guard runs *before* the in-block scanner, so a line that ends the block
+ * is never classified by it — which is what made these fail-opens rather than
+ * cosmetic bugs:
+ *
+ * - **A comment line.** YAML comments may sit at any column, including column 0
+ *   in the middle of a nested block. Only a comment at exactly `blockIndent` was
+ *   held in; one at column 0 ended the block from inside it, and every `value:`
+ *   after it missed the in-block default-redact and printed in the clear. The
+ *   comment need not be adjacent to the value, and carries no material itself,
+ *   so keeping it in costs nothing.
+ * - **A tab-indented line.** `leadingIndent` counts spaces, so a tab-indented
+ *   line measures as indent 0 and ended the block from inside it. YAML forbids
+ *   tabs in indentation outright, so such a line is never a legitimate sibling
+ *   key; holding it in hands it to the in-block scanner, which is the fail-closed
+ *   direction. The in-block patterns are `\s`-based and match it, so it is
+ *   classified rather than merely swallowed.
+ *
+ * Both reached `env:` (credential values) and `command:`/`args:` (argv material)
+ * alike, because all three block guards share this predicate.
+ */
+function continuesBlock(line: string, blockIndent: number): boolean {
+  if (isBlank(line)) return true;
+  if (COMMENT_LINE.test(line)) return true;
+  if (hasTabIndent(line)) return true;
+  const indent = leadingIndent(line);
+  if (indent > blockIndent) return true;
+  if (indent < blockIndent) return false;
+  // At exactly the block indent a sequence entry continues the block. Comments
+  // are already held in above, at any column.
+  return line.slice(indent).startsWith("- ");
+}
+
+/**
+ * True when the line's leading whitespace contains a tab.
+ *
+ * Scanned rather than regex-tested so it stops at the first non-whitespace
+ * character: a tab *inside* a value (`image: has\ttab`) is content, not
+ * indentation, and must not be treated as an unmeasurable line.
+ *
+ * A line whose indentation contains a tab has **no measurable depth**, and both
+ * uses of depth in this scanner have to respect that or they invert:
+ *
+ * - As a block-membership test, an unmeasurable line must NOT end the block.
+ *   `leadingIndent` counts spaces, so a tab-indented line measured as indent 0
+ *   and closed the block from *inside* it, and every `value:` after it missed
+ *   the in-block default-redact and printed in the clear.
+ * - As a swallow threshold, an unmeasurable line must NOT set one. That same
+ *   bogus 0 meant "drop every following line indented deeper than 0", which ate
+ *   the rest of the container spec — image, ports, resources, probes — and with
+ *   it the diagnostics the grant exists for.
+ *
+ * Skipping the swallow is safe precisely here: inside an env or argv block the
+ * default is already REDACT, so a continuation line that is no longer swallowed
+ * still reaches the fail-closed arm and is redacted individually rather than
+ * dropped. The swallow is a legibility measure in these blocks, not the
+ * security boundary — which is why every arm that sets a threshold from a line
+ * of unknown shape must set it through `swallowFrom`.
+ */
+function hasTabIndent(line: string): boolean {
+  for (const ch of line) {
+    if (ch === "\t") return true;
+    if (ch !== " ") return false;
+  }
+  return false;
+}
+
+/**
+ * The swallow threshold to set from `line`, or `null` when its indentation is
+ * unmeasurable and no threshold can honestly be computed. See `hasTabIndent`.
+ *
+ * ONLY for arms that redact into a block whose default is REDACT — the `env:`
+ * and `command:`/`args:` bodies. Returning `null` means "swallow nothing", so
+ * the following lines are re-scanned; that is fail-closed exactly where the
+ * re-scan lands on a default-redact arm, and fail-OPEN anywhere else.
+ *
+ * The `containers:` arm is the measured counter-example: it opens a block that
+ * merely gates argv, so dropping its swallow emits the wrapped remainder of a
+ * flow value in the clear. It keeps its raw threshold deliberately. Do not
+ * "make this uniform" — uniformity here is a leak, and the asymmetry is the
+ * rule rather than an oversight.
+ */
+function swallowFrom(line: string, computed: number): number | null {
+  return hasTabIndent(line) ? null : computed;
+}
+
+/**
+ * Matches a `value:` key, optionally as the first key of a sequence entry.
+ *
+ * The key name may be quoted. YAML allows `"value": x` and `'value': x`, and
+ * both reached the plaintext before this was accounted for — the same quoting
+ * allowance `ECHO_ANNOTATION_KEY` already made.
+ */
+const VALUE_KEY = /^(\s*)(-\s+)?(["']?)value\3:(.*)$/;
+/** Matches a sequence entry whose content opens a flow mapping or sequence. */
+const FLOW_SEQUENCE_ENTRY = /^(\s*)(-\s+)[{[]/;
+/**
+ * Matches an `env:` key, whatever follows it.
+ *
+ * This was two patterns — one for a block-opening `env:` and one for an inline
+ * value — and two patterns have to be tested in some order. Both matched
+ * `env: # vars`, the inline one was tested first, and because its suffix was
+ * neither `[` nor `{` the line was emitted *without opening the block*: every
+ * `value:` line below it then missed the in-block guard and printed in the
+ * clear. The same held for `env: &anchor` and `env: !!seq`.
+ *
+ * One pattern that matches every spelling, with the suffix classified after the
+ * match, removes the ordering from the design rather than reordering it.
+ *
+ * Case-insensitive to agree with `isEnvKey`, which the JSON path uses. The two
+ * paths disagreeing about what counts as an env key is itself a fail-open: every
+ * non-lowercase spelling (`Env`, the Docker/OCI one) was redacted on the JSON
+ * path and emitted in the clear on this one, at every entry shape.
+ */
+const ENV_KEY = /^(\s*)(-\s+)?(["']?)env\3:(.*)$/i;
+/**
+ * Leading YAML node properties: an anchor (`&name`) and/or a tag (`!!seq`).
+ * These *label* a node without carrying its content, so an `env:` line whose
+ * suffix is nothing but properties still opens a block below it.
+ */
+const NODE_PROPERTIES = /^(?:[&!]\S*[ \t]*)+/;
+/** A comment-only line. */
+const COMMENT_LINE = /^\s*#/;
+/**
+ * Keys that may pass through an env block untouched: the variable's `name` (the
+ * diagnostic the grant exists for) and `valueFrom`, which names a source
+ * without carrying it.
+ */
+const NAME_KEY = /^(\s*)(-\s+)?(["']?)name\3:(.*)$/;
+const VALUE_FROM_KEY = /^(\s*)(-\s+)?(["']?)valueFrom\3:(.*)$/;
+/**
+ * The keys a `valueFrom` subtree may legally contain — the four `EnvVarSource`
+ * selectors and their scalar leaves. Enumerating them is not the denylist this
+ * module argues against: `EnvVarSource` is closed by the Kubernetes schema, so
+ * this is the same closed-allowlist argument the env block itself rests on, and
+ * `value` is deliberately absent from it.
+ */
+const REF_SUBTREE_KEY = new RegExp(
+  `^(\\s*)(-\\s+)?(["']?)(${[
+    "configMapKeyRef",
+    "fieldRef",
+    "resourceFieldRef",
+    "secretKeyRef",
+    "name",
+    "key",
+    "optional",
+    "apiVersion",
+    "fieldPath",
+    "containerName",
+    "resource",
+    "divisor",
+  ].join("|")})\\3:(.*)$`,
+);
+/** A sequence entry's `- ` introducer, and a dash with nothing after it. */
+const SEQUENCE_DASH = /^\s*(-\s+)/;
+const BARE_SEQUENCE_DASH = /^\s*-\s*$/;
+/**
+ * A shell/OCI environment-variable name. Defined once because both the YAML
+ * sequence-entry rule and the JSON scalar rule must agree on what counts as a
+ * name they may print in the clear — the whole point of preserving a name is
+ * that it is a name and not material.
+ */
+const ENV_VAR_NAME = "[A-Za-z_][A-Za-z0-9_.-]*";
+/**
+ * A `KEY=VALUE` has a VALUE. Asserted as a lookahead after the `=`, and defined
+ * once for the same reason `ENV_VAR_NAME` is: both name-preserving rules must
+ * agree, and a second spelling is a second rule (PEN-2370 ask 3 (b2)).
+ *
+ * Validating the *name* charset is necessary but not sufficient, because
+ * `ENV_VAR_NAME` is also satisfied by base64: `dGhpc2lz…=` is all name
+ * characters followed by an `=`, so a name-only check promotes an entire
+ * base64-encoded credential into the name position and prints it in the clear
+ * beside its own `<redacted>` marker — the false-assurance shape design note 4
+ * warns about, which is how this module's own fix for `[LEAKED]=x` still leaked
+ * a differently-spelled instance of the same defect.
+ *
+ * What distinguishes them is that base64 padding is *terminal*: a real value
+ * follows the `=`, padding does not. So reject when nothing but `=` padding
+ * (and an optional closing quote) remains.
+ *
+ * "Remains" has to mean *to the end of the value*, not to the end of the line.
+ * Its first spelling meant the latter, and an inline YAML comment is line
+ * content that is not value content: `- dGhpc2lz…= # note` put the material
+ * straight back into the name position with a five-character suffix, and the
+ * quoted form did the same past its closing quote. That is this same defect in
+ * its third spelling — twice now the guard has been correct about the property
+ * (padding is terminal) and wrong about where the line ends.
+ *
+ * Whitespace is required before a `#` that ends an *unquoted* value, because
+ * that is precisely when YAML starts a comment: `TOKEN=pa#ss` and `TOKEN=#hash`
+ * are plain scalars whose value contains a `#`, and both keep their name. Past
+ * a closing quote the requirement is dropped, because there nothing but a
+ * comment can follow and `- "dGhpc2lz="# c` is otherwise a fourth spelling of
+ * the same defect — found by sweeping the suffix space after the comment clause
+ * was written, which is the method ask 3 names as the control.
+ *
+ * A legitimate but empty `KEY=` is rejected and redacts whole — over-redacting
+ * a name is the safe direction, and the diagnostic loss is a name whose value
+ * was empty. The comment clause makes that same trade once more on the JSON
+ * path, where `#` has no comment meaning and `TOKEN= #x` is a real value, so it
+ * over-redacts there. One guard that is slightly conservative on one path is
+ * the (b2) trade this constant exists to make: a per-path spelling tuned to
+ * each caller is the drift that produced the defect it is guarding against.
+ */
+const REQUIRE_VALUE_AFTER_EQ = `(?!=*(?:["']\\s*(?:#|$)|\\s*$|\\s+#))`;
+/**
+ * The OCI/Docker `KEY=VALUE` env entry shape. The name is kept and only the
+ * value dropped, matching design note 2 and the JSON path.
+ */
+const ENV_KEY_VALUE_ENTRY = new RegExp(
+  `^(\\s*)(-\\s+)(["']?)(${ENV_VAR_NAME})=${REQUIRE_VALUE_AFTER_EQ}`,
+);
+/**
+ * The same `KEY=VALUE` shape as a bare scalar, with no sequence introducer —
+ * what a string-valued `env` key holds on the JSON path.
+ *
+ * This exists so that "does this scalar have a name worth preserving?" is
+ * answered by matching a name, not by `indexOf("=") !== -1`. The difference is
+ * load-bearing: `[LEAKED]=x` contains an `=`, so slicing at the first one
+ * promotes material into the name position and prints it beside its own
+ * redaction marker. Only a validated name followed by a real value survives.
+ */
+const ENV_KEY_VALUE_SCALAR = new RegExp(
+  `^(${ENV_VAR_NAME})=${REQUIRE_VALUE_AFTER_EQ}`,
+);
+/**
+ * An `env:` scalar that can carry material: a flow collection, an alias (which
+ * may resolve to an anchor we never scrubbed), a block scalar, or the
+ * `KEY=VALUE` encoding. A plain scalar without `=` is prose in some other
+ * body this proxy carries, not a Kubernetes env value.
+ *
+ * Shared by the YAML scanner and the structural JSON walker on purpose. Both
+ * decide the same question — "can this env scalar carry material?" — and when
+ * they answered it with two separate expressions they disagreed on every
+ * indicator-led shape. Keep it one constant; a second spelling is a second
+ * rule.
+ */
+const MATERIAL_BEARING_ENV_SCALAR = /^[[{*|>]|=/;
+/**
+ * Kubernetes spells this key `env`; Docker/OCI spells it `Env` (`Config.Env`).
+ * The scalar-entry handling below exists precisely because `KEY=VALUE` is the
+ * OCI/Docker env encoding, so recognizing that encoding while missing the key
+ * that carries it would leave the shape half-covered.
+ */
+function isEnvKey(key: string): boolean {
+  return key.toLowerCase() === "env";
+}
+/** Matches an annotation key we drop wholesale. */
+const ECHO_ANNOTATION_KEY = new RegExp(
+  `^(\\s*)(-\\s+)?(["']?)(${RESOURCE_ECHO_ANNOTATIONS.map(escapeRegExp).join("|")})\\3:(.*)$`,
+);
+/**
+ * Matches the `data:`/`stringData:` key of a Secret, block or inline. Only
+ * consulted inside a document already identified as a Secret, so a ConfigMap's
+ * `data` is untouched.
+ */
+const SECRET_DATA_KEY = /^(\s*)(-\s+)?(["']?)(data|stringData)\3:(.*)$/i;
+/** A YAML document separator. */
+const DOC_SEPARATOR = /^---(\s|$)/;
+/** A `kind: Secret` / `kind: SecretList` line. */
+const SECRET_KIND_LINE = /^\s*(-\s+)?(["']?)kind\2:\s*(["']?)Secret(List)?\3\s*(#.*)?$/i;
+
+/**
+ * Names whose value is the Secret's material, in the JSON shape.
+ *
+ * Compared case-insensitively, via `isSecretMaterialKey`/`isSecretKind` below,
+ * for the same reason `isEnvKey` is: a case-sensitive literal that gates
+ * *whether material is scanned at all* fails open on every other spelling.
+ * This gate gave up strictly more than the env one did — a Secret's `data` is
+ * pure credential material, where an env block at least keeps its names as the
+ * diagnostic payload. Measured before the change: `Kind: Secret`, `kind: secret`
+ * and `Data:` each emitted the Secret's material verbatim, while the canonical
+ * `kind: Secret` + `data:` redacted, so the mechanism worked and only the
+ * spelling defeated it.
+ */
+const SECRET_MATERIAL_KEYS = new Set(["data", "stringdata"]);
+const SECRET_KINDS = new Set(["secret", "secretlist"]);
+
+/**
+ * A container-list key (PEN-2431, door #5).
+ *
+ * argv redaction is gated on being *inside* one of these, and that gate is the
+ * whole reason the feature is safe to ship here. `env:` is a rare enough key
+ * that failing closed on a bare one costs little; `args:` is not. This same
+ * gateway proxies the GitHub and Paperclip upstreams, where `args:` appears in
+ * every Actions workflow, every MCP tool schema, and — measured, not
+ * hypothesized — in the body of PEN-2431 itself. A bare `args:` trigger would
+ * corrupt ordinary traffic on a key that is orders of magnitude more common
+ * than `env:`, so the structural context is load-bearing, not decoration.
+ */
+const CONTAINERS_KEY =
+  /^(\s*)(-\s+)?(["']?)(containers|initContainers|ephemeralContainers)\3:(.*)$/i;
+/** `command:`/`args:` — only honored inside a container list. */
+const ARGV_KEY = /^(\s*)(-\s+)?(["']?)(command|args)\3:(.*)$/i;
+const CONTAINER_LIST_KEYS = new Set([
+  "containers",
+  "initcontainers",
+  "ephemeralcontainers",
+]);
+const ARGV_KEYS = new Set(["command", "args"]);
+
+function isContainerListKey(key: string): boolean {
+  return CONTAINER_LIST_KEYS.has(key.toLowerCase());
+}
+function isArgvKey(key: string): boolean {
+  return ARGV_KEYS.has(key.toLowerCase());
+}
+
+/**
+ * Redact one argv token, keeping the flag name when there is one.
+ *
+ * PEN-2431 offered four directions and this is deliberately none of them
+ * verbatim; see the SCOPE section above for why options 1 and 2 were rejected.
+ * The rule here has NO pass-through arm: a token is either `--flag=<redacted>`
+ * or `<redacted>` outright. That is what separates it from option 1, which kept
+ * non-matching tokens in the clear and would have printed a redaction marker
+ * beside a plaintext positional — the false-assurance failure design note 4
+ * rejects.
+ *
+ * Keeping the flag name mirrors design note 2: `--namespace=<redacted>` still
+ * tells a reader the container takes a namespace flag. The diagnostic cost is
+ * real and is stated in the SCOPE section: flag *values* and bare positionals
+ * (including subcommands like `get pods`) are gone.
+ */
+function redactArgvToken(token: string): string {
+  const eq = token.indexOf("=");
+  if (token.startsWith("-") && eq > 0) {
+    return `${token.slice(0, eq)}=${REDACTED}`;
+  }
+  return REDACTED;
+}
+
+/** Strip one layer of matching YAML quotes, so the flag name can be read. */
+function unquoteScalar(token: string): string {
+  const t = token.trim();
+  if (t.length >= 2 && (t.startsWith('"') || t.startsWith("'"))) {
+    const q = t[0]!;
+    if (t.endsWith(q)) return t.slice(1, -1);
+  }
+  return t;
+}
+
+function isSecretMaterialKey(key: string): boolean {
+  return SECRET_MATERIAL_KEYS.has(key.toLowerCase());
+}
+
+function isSecretKind(kind: unknown): boolean {
+  return typeof kind === "string" && SECRET_KINDS.has(kind.toLowerCase());
+}
+
+/**
+ * The `kind` key itself, found without assuming its case. `source.kind` is an
+ * exact-property lookup, so a `Kind`-spelled document was never even a
+ * candidate for the Secret branch.
+ */
+function readKind(source: Record<string, unknown>): unknown {
+  for (const [key, value] of Object.entries(source)) {
+    if (key.toLowerCase() === "kind") return value;
+  }
+  return undefined;
+}
+
+const ENV_VAR_SOURCE_REF_KEYS: Record<string, ReadonlySet<string>> = {
+  configMapKeyRef: new Set(["name", "key", "optional"]),
+  fieldRef: new Set(["apiVersion", "fieldPath"]),
+  resourceFieldRef: new Set(["containerName", "resource", "divisor"]),
+  secretKeyRef: new Set(["name", "key", "optional"]),
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasOnlyKeys(source: Record<string, unknown>, allowed: ReadonlySet<string>): boolean {
+  return Object.keys(source).every((key) => allowed.has(key));
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function isValidEnvVarSource(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  const selectors = Object.keys(value);
+  if (selectors.length !== 1) return false;
+
+  const selector = selectors[0]!;
+  const allowedRefKeys = ENV_VAR_SOURCE_REF_KEYS[selector];
+  if (!allowedRefKeys) return false;
+  const ref = value[selector];
+  if (!isRecord(ref) || !hasOnlyKeys(ref, allowedRefKeys)) return false;
+
+  switch (selector) {
+    case "configMapKeyRef":
+    case "secretKeyRef":
+      return (
+        isNonEmptyString(ref.name) &&
+        isNonEmptyString(ref.key) &&
+        (ref.optional === undefined || typeof ref.optional === "boolean")
+      );
+    case "fieldRef":
+      return (
+        isNonEmptyString(ref.fieldPath) &&
+        (ref.apiVersion === undefined || typeof ref.apiVersion === "string")
+      );
+    case "resourceFieldRef":
+      return (
+        isNonEmptyString(ref.resource) &&
+        (ref.containerName === undefined || typeof ref.containerName === "string") &&
+        (ref.divisor === undefined || typeof ref.divisor === "string")
+      );
+    default:
+      return false;
+  }
+}
+
+/**
+ * Scrub one object-shaped EnvVar without passing unknown properties through.
+ * Kubernetes' EnvVar schema is closed: an entry is either `name` + `value` or
+ * `name` + one valid `valueFrom` selector. Anything else is an upstream shape
+ * change, so replacing the whole entry is safer than preserving a partial map.
+ */
+function scrubJsonEnvVarEntry(entry: Record<string, unknown>, ctx: ScrubContext): unknown {
+  const keys = new Set(Object.keys(entry));
+  if (!isNonEmptyString(entry.name)) {
+    ctx.changed = true;
+    return REDACTED;
+  }
+
+  if (keys.size === 2 && keys.has("name") && keys.has("value") && typeof entry.value === "string") {
+    ctx.changed = true;
+    return { name: entry.name, value: REDACTED };
+  }
+
+  if (
+    keys.size === 2 &&
+    keys.has("name") &&
+    keys.has("valueFrom") &&
+    isValidEnvVarSource(entry.valueFrom)
+  ) {
+    return { name: entry.name, valueFrom: entry.valueFrom };
+  }
+
+  ctx.changed = true;
+  return REDACTED;
+}
+
+/** Threaded through the scrubbers so a pure pass-through can be detected. */
+type ScrubContext = { changed: boolean };
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Flag every line belonging to a document whose `kind` is `Secret`.
+ *
+ * This needs a pass of its own because the key order works against a streaming
+ * scanner: Kubernetes serializes fields alphabetically, so `data:` arrives
+ * *before* `kind: Secret`. A single forward pass would have to redact `data`
+ * before it could know the document was a Secret.
+ */
+function markSecretDocuments(lines: string[]): boolean[] {
+  const flags = new Array<boolean>(lines.length).fill(false);
+  let start = 0;
+
+  const finish = (end: number): void => {
+    let isSecret = false;
+    for (let i = start; i < end; i += 1) {
+      if (SECRET_KIND_LINE.test(lines[i]!)) {
+        isSecret = true;
+        break;
+      }
+    }
+    if (isSecret) for (let i = start; i < end; i += 1) flags[i] = true;
+  };
+
+  for (let i = 0; i < lines.length; i += 1) {
+    if (DOC_SEPARATOR.test(lines[i]!)) {
+      finish(i);
+      start = i + 1;
+    }
+  }
+  finish(lines.length);
+  return flags;
+}
+
+/**
+ * Redact env values in a YAML-serialized Kubernetes resource.
+ *
+ * Operates line by line, tracking the indentation of any open `env:` block.
+ * Only `value:` keys *inside* such a block are touched, so the rest of the
+ * spec — images, phases, restart counts, resource limits — survives intact.
+ */
+export function scrubYamlText(text: string): string {
+  return scrubYamlTextTracked(text, { changed: false });
+}
+
+function scrubYamlTextTracked(text: string, ctx: ScrubContext): string {
+  // Split so that each line's own terminator is preserved and re-emitted. A
+  // plain `split("\n")` left a trailing `\r` glued to the line content, and
+  // since `.` does not match `\r` and these patterns are not `/m`-flagged,
+  // `value: SECRET\r` failed to match while `env:\r` still matched (its `\s*`
+  // absorbed the `\r`). The block was entered and every value line inside it
+  // was then emitted verbatim — a silent fail-open on any CRLF upstream. A lone
+  // `\r` is a YAML line break too, so it is split on as well.
+  const parts = text.split(/(\r\n|\n|\r)/);
+  const lines: string[] = [];
+  const seps: string[] = [];
+  for (let i = 0; i < parts.length; i += 2) {
+    lines.push(parts[i]!);
+    seps.push(parts[i + 1] ?? "");
+  }
+
+  const secretDoc = markSecretDocuments(lines);
+  const out: string[] = [];
+
+  // Indentation of the currently open `env:` block, or null when outside one.
+  let envBlockIndent: number | null = null;
+  // Indentation of an open `valueFrom:` key inside that block. Its subtree is
+  // references only, so it passes through the in-block allowlist in full.
+  let refSubtreeIndent: number | null = null;
+  // While set, we are swallowing the continuation lines of a value we already
+  // replaced; every line indented deeper than this belongs to that value.
+  let swallowDeeperThan: number | null = null;
+  // Indentation of an open container-list key, or null when outside one. argv
+  // redaction is gated on this being non-null (PEN-2431).
+  let containersBlockIndent: number | null = null;
+  // Indentation of an open `command:`/`args:` block inside that container list.
+  let argvBlockIndent: number | null = null;
+
+  const emit = (content: string, index: number): void => {
+    out.push(content + seps[index]!);
+  };
+  const redact = (content: string, index: number): void => {
+    ctx.changed = true;
+    emit(content, index);
+  };
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!;
+
+    if (swallowDeeperThan !== null) {
+      if (isBlank(line) || leadingIndent(line) > swallowDeeperThan) {
+        // Part of the block scalar we already replaced. Drop it.
+        continue;
+      }
+      swallowDeeperThan = null;
+    }
+
+    if (envBlockIndent !== null && !continuesBlock(line, envBlockIndent)) {
+      envBlockIndent = null;
+      refSubtreeIndent = null;
+    }
+
+    // Close the argv and container blocks the same way the env block closes.
+    // argv closes first: it is nested inside the container list, so a line that
+    // ends the outer block necessarily ends the inner one too.
+    if (argvBlockIndent !== null && !continuesBlock(line, argvBlockIndent)) {
+      argvBlockIndent = null;
+    }
+    if (
+      containersBlockIndent !== null &&
+      !continuesBlock(line, containersBlockIndent)
+    ) {
+      containersBlockIndent = null;
+      argvBlockIndent = null;
+    }
+
+    // Inside a `command:`/`args:` block, every sequence entry is material until
+    // proven otherwise. There is no allowlist arm here because argv has no
+    // schema-closed key set to allowlist — unlike an env entry, which can only
+    // legally carry `name`/`value`/`valueFrom`.
+    if (argvBlockIndent !== null && !isBlank(line)) {
+      if (COMMENT_LINE.test(line)) {
+        emit(line, index);
+        continue;
+      }
+      const dashMatch = SEQUENCE_DASH.exec(line);
+      if (dashMatch) {
+        const indent = leadingIndent(line);
+        const dash = dashMatch[1]!;
+        const token = unquoteScalar(line.slice(indent + dash.length));
+        redact(
+          `${" ".repeat(indent)}${dash}"${redactArgvToken(token)}"`,
+          index,
+        );
+        // A wrapped or block scalar continues on deeper-indented lines; the
+        // same reasoning as `value:` applies, so drop them.
+        //
+        // The threshold is the entry's OWN indent, not `indent + dash.length`.
+        // A sequence entry's scalar content sits at *exactly* the column after
+        // the dash, never deeper, so `> indent + dash.length` was false on the
+        // very first continuation line and printed the plaintext directly
+        // beneath its own `"<redacted>"` marker — worse than not scrubbing,
+        // because the marker manufactures false assurance. The identical
+        // formula is correct for `value:` below only because a *mapping key's*
+        // content must be strictly deeper than the key; a sequence entry is not
+        // that shape. A sibling entry sits at exactly `indent`, so `> indent`
+        // still lets it through.
+        //
+        // Through `swallowFrom` for the same reason the env arms use it: a
+        // tab-indented entry has no measurable depth and `leadingIndent`
+        // reports 0 for it, so assigning the threshold directly would mean
+        // "drop every following line indented deeper than 0" and eat the rest
+        // of the container spec.
+        swallowDeeperThan = swallowFrom(line, indent);
+        continue;
+      }
+
+      // Unrecognized inside an argv block: fail closed, exactly as the env
+      // block does at its own fall-through. Without this arm a line that was
+      // neither blank, a comment, nor a sequence entry fell out of this `if`
+      // and reached the final `emit(line)` — so a scalar written directly under
+      // `command:` (no dash, hence no swallow ever armed) was emitted verbatim.
+      // argv has no schema-closed key set to allowlist, so there is nothing
+      // here that can legally be passed through.
+      //
+      // The threshold goes through `swallowFrom` for the same reason the env
+      // arms do: an unmeasurable (tab-indented) line must not set one at all.
+      // Skipping it is fail-closed here exactly as it is there — the argv
+      // in-block default is REDACT, and this arm *is* that default, so a
+      // continuation line that is no longer swallowed is redacted individually
+      // rather than dropped along with the spec around it.
+      const indent = leadingIndent(line);
+      redact(`${" ".repeat(indent)}"${REDACTED}"`, index);
+      swallowDeeperThan = swallowFrom(line, indent);
+      continue;
+    }
+
+    // Inside a `valueFrom:` subtree. Its keys are references, but the subtree
+    // is NOT a hole in the in-block default: an unrecognized key here is
+    // redacted exactly as it would be one level up. Passing the whole subtree
+    // through unclassified was measurably worse than the code it replaced —
+    // `valueFrom:` / `value: <secret>` is redacted by the plain in-block
+    // scanner, so a blanket pass-through re-opened a case that was already
+    // closed. Deeper lines are classified, not trusted.
+    if (refSubtreeIndent !== null) {
+      if (!isBlank(line) && leadingIndent(line) > refSubtreeIndent) {
+        if (COMMENT_LINE.test(line) || REF_SUBTREE_KEY.test(line)) {
+          emit(line, index);
+          continue;
+        }
+        const indent = leadingIndent(line);
+        const dash = SEQUENCE_DASH.exec(line)?.[1] ?? "";
+        redact(`${" ".repeat(indent)}${dash}"${REDACTED}"`, index);
+        swallowDeeperThan = indent + dash.length;
+        continue;
+      }
+      refSubtreeIndent = null;
+    }
+
+    // Drop annotations that echo the entire resource (and thus its env values).
+    const echo = ECHO_ANNOTATION_KEY.exec(line);
+    if (echo) {
+      const [, indent, dash = "", quote, key] = echo;
+      redact(`${indent}${dash}${quote}${key}${quote}: "${REDACTED}"`, index);
+      // Same reasoning as `value:` below: any deeper-indented line that follows
+      // is a continuation of this scalar, never a sibling annotation, so drop it
+      // whatever style it was written in.
+      swallowDeeperThan = leadingIndent(line) + (dash?.length ?? 0);
+      continue;
+    }
+
+    // A Secret carries its material in `data`/`stringData` rather than in an
+    // `env` block, so it needs its own key. Redacting the whole subtree rather
+    // than each entry is the fail-closed choice and costs no diagnostics: unlike
+    // env, where the *names* are the diagnostic value, a Secret's keys are
+    // already visible in the pods that mount it.
+    if (secretDoc[index]) {
+      const secretData = SECRET_DATA_KEY.exec(line);
+      if (secretData) {
+        const [, indent, dash = "", quote, key] = secretData;
+        redact(`${indent}${dash}${quote}${key}${quote}: "${REDACTED}"`, index);
+        swallowDeeperThan = indent!.length + dash.length;
+        continue;
+      }
+    }
+
+    // Open a container list. The key itself carries nothing, so it is emitted
+    // as-is; only the flag is set. Not `continue`d past the env branch below,
+    // because a `containers:` line is never also an `env:` line.
+    //
+    // Guarded on `envBlockIndent === null`: this branch is tested BEFORE the env
+    // in-block scanner, so without the guard a `containers:` key *inside* an env
+    // block was exempted from that scanner's default-deny and emitted verbatim —
+    // a measured regression against base `ada8117`, where the same line was
+    // redacted. The env block's argument is that an unrecognized key in there is
+    // an upstream shape change or smuggling; three key spellings must not be
+    // carved out of it.
+    const containersKey =
+      envBlockIndent === null ? CONTAINERS_KEY.exec(line) : null;
+    if (containersKey) {
+      const [, indent, dash = "", quote, key, suffix] = containersKey;
+      const ownIndent = indent!.length + dash.length;
+      // Classify the suffix the way ENV_KEY and ARGV_KEY do. Emitting the line
+      // unconditionally passed a flow-style list through whole —
+      // `containers: [{name: c, args: ["--token=x"]}]` — which is the same shape
+      // this scanner already fails closed on one level down at `args: [...]`.
+      const rest = suffix!.trim().replace(NODE_PROPERTIES, "").trim();
+      if (rest === "" || rest.startsWith("#")) {
+        containersBlockIndent = ownIndent;
+        argvBlockIndent = null;
+        emit(line, index);
+        continue;
+      }
+      // Anything else on the same line sits inside a construct this scanner does
+      // not parse. Fail closed on the whole value, and open the block so that
+      // any content which does follow is guarded rather than emitted.
+      redact(`${indent}${dash}${quote}${key}${quote}: "${REDACTED}"`, index);
+      // NOT through `swallowFrom`, and this is the one arm where that would be
+      // wrong. Skipping the swallow on an unmeasurable line is fail-closed only
+      // where the block being opened defaults to REDACT — true of `env:` and
+      // `command:`/`args:` below, false here. `containersBlockIndent` only gates
+      // whether argv keys are honored; it does not redact its own contents. So
+      // a tab-indented `containers: [{...}` whose flow value wraps onto the next
+      // line would emit that continuation in the clear. Measured: it does —
+      // dropping the swallow here leaks the wrapped remainder. An over-swallow
+      // on a tab-indented `containers:` is the acceptable failure; a leak is not.
+      swallowDeeperThan = ownIndent;
+      containersBlockIndent = ownIndent;
+      argvBlockIndent = null;
+      continue;
+    }
+
+    // `command:`/`args:`, honored ONLY inside a container list. Outside one this
+    // falls through untouched, which is the point: see CONTAINERS_KEY.
+    if (containersBlockIndent !== null) {
+      const argvKey = ARGV_KEY.exec(line);
+      if (argvKey) {
+        const [, indent, dash = "", quote, key, suffix] = argvKey;
+        const ownIndent = indent!.length + dash.length;
+        const rest = suffix!.trim().replace(NODE_PROPERTIES, "").trim();
+        if (rest === "" || rest.startsWith("#")) {
+          // A block sequence follows on the next lines.
+          emit(line, index);
+          argvBlockIndent = ownIndent;
+          continue;
+        }
+        // Anything else on the same line — a flow sequence (`args: [--t=x]`), an
+        // alias, a block scalar — sits inside a construct this scanner does not
+        // parse. Fail closed on the whole value, and open the block too so that
+        // any content which does follow is guarded rather than emitted.
+        redact(`${indent}${dash}${quote}${key}${quote}: "${REDACTED}"`, index);
+        swallowDeeperThan = swallowFrom(line, ownIndent);
+        argvBlockIndent = ownIndent;
+        continue;
+      }
+    }
+
+    // Any `env:` key, in a single branch, tested before the in-block scanner so
+    // that a nested one still opens its own block rather than being treated as
+    // unrecognized content.
+    const envKey = ENV_KEY.exec(line);
+    if (envKey) {
+      const [, indent, dash = "", quote, suffix] = envKey;
+      const ownIndent = indent!.length + dash.length;
+      // Strip anchors and tags before classifying: they label the node that
+      // follows, so `env: &shared` and `env: !!seq` open a block exactly as a
+      // bare `env:` does. Trim first — the suffix keeps the space after the
+      // colon, and an anchored pattern will not match past it.
+      const rest = suffix!.trim().replace(NODE_PROPERTIES, "").trim();
+      if (rest === "" || rest.startsWith("#")) {
+        emit(line, index);
+        envBlockIndent = ownIndent;
+        refSubtreeIndent = null;
+        continue;
+      }
+      // A plain scalar with no `=` in it is not a Kubernetes env value —
+      // `env` is a list there, never a scalar — so it is prose in a body this
+      // proxy happens to carry, and redacting it is a net loss. Not a stylistic
+      // point: redaction sets `ctx.changed`, which re-serializes the *whole*
+      // body, and `JSON.stringify` rounds integers above 2^53 and normalizes
+      // `1.0`. Failing closed here measurably corrupted
+      // `{"nodeId":9007199254740993,"ratio":1.0,"note":"env: none here"}`.
+      // So the fail-closed net is cast at the shapes that can actually carry
+      // material: flow collections, aliases (which may resolve to one), block
+      // scalars, and the `KEY=VALUE` encoding.
+      if (!MATERIAL_BEARING_ENV_SCALAR.test(rest)) {
+        emit(line, index);
+        continue;
+      }
+      // Fail closed on the whole value and swallow any continuation of it — and
+      // open the block as well, so that if content does follow (a shape we did
+      // not anticipate) it is still guarded rather than emitted in the clear.
+      redact(`${indent}${dash}${quote}env${quote}: "${REDACTED}"`, index);
+      swallowDeeperThan = swallowFrom(line, ownIndent);
+      envBlockIndent = ownIndent;
+      refSubtreeIndent = null;
+      continue;
+    }
+
+    if (envBlockIndent !== null) {
+      // Inside an env block the default is to REDACT, not to emit.
+      //
+      // Every fail-open this module has had was a line that reached the final
+      // `emit(line)` because it matched no redact pattern: a CRLF-terminated
+      // `value:`, a quoted key spelling, a `KEY=VALUE` scalar entry. A denylist
+      // has to enumerate every spelling secret material can take, and the
+      // enumeration is never finished. An allowlist only has to enumerate the
+      // three keys a Kubernetes env entry can legally carry, and that list is
+      // closed by the schema. Anything else in here is an upstream shape change
+      // or an attempt to smuggle material past the scanner; both are safer
+      // redacted than emitted.
+      //
+      // Blank lines and comments carry nothing and keep the output readable.
+      if (isBlank(line) || COMMENT_LINE.test(line)) {
+        emit(line, index);
+        continue;
+      }
+
+      // `valueFrom:` names a source — a ConfigMap/Secret key, a field path —
+      // without carrying its content, so the key itself passes through. What
+      // follows it is classified against `REF_SUBTREE_KEY` rather than trusted
+      // wholesale; see the subtree branch above for why.
+      const ref = VALUE_FROM_KEY.exec(line);
+      if (ref) {
+        emit(line, index);
+        refSubtreeIndent = leadingIndent(line) + (ref[2]?.length ?? 0);
+        continue;
+      }
+
+      // The variable's name is the diagnostic value the grant exists for:
+      // knowing *which* variables are set, without their values.
+      if (NAME_KEY.test(line) || BARE_SEQUENCE_DASH.test(line)) {
+        emit(line, index);
+        continue;
+      }
+
+      const value = VALUE_KEY.exec(line);
+      if (value) {
+        const [, indent, dash = "", quote] = value;
+        redact(`${indent}${dash}${quote}value${quote}: "${REDACTED}"`, index);
+        // Swallow every following line indented deeper than this key, whatever
+        // scalar style produced it. `value: |` is the obvious case, but a plain
+        // or quoted scalar wraps across lines too — kubectl's serializer folds
+        // long values at spaces — and a deeper-indented line after `value:` can
+        // only be a continuation of it. A sibling key (`valueFrom:`) sits at the
+        // *same* indent, so it survives.
+        //
+        // Restricting this to `|`/`>` was a real leak: we printed
+        // `value: "<redacted>"` and then the plaintext on the next line, which
+        // is worse than not scrubbing at all because the marker manufactures
+        // false assurance.
+        swallowDeeperThan = swallowFrom(line, indent!.length + dash.length);
+        continue;
+      }
+
+      // A sequence entry that opens a flow mapping (`- {name: A, value: B}`).
+      // The value sits inside a construct we do not parse, so fail closed and
+      // drop the entry rather than pass the literal through. Rare from
+      // kubectl's serializer, which emits block style, but this scanner runs on
+      // whatever the upstream sends, not on what we expect it to send.
+      const flowEntry = FLOW_SEQUENCE_ENTRY.exec(line);
+      if (flowEntry) {
+        const [, indent, dash] = flowEntry;
+        redact(`${indent}${dash}"${REDACTED}"`, index);
+        swallowDeeperThan = swallowFrom(line, indent!.length + dash!.length);
+        continue;
+      }
+
+      // Unrecognized inside an env block: fail closed. `- A=LEAKED` — the
+      // OCI/Docker `KEY=VALUE` shape — lands here, as does any spelling not yet
+      // imagined. Keep the variable name when the entry has the `KEY=` shape.
+      const indent = leadingIndent(line);
+      const dash = SEQUENCE_DASH.exec(line)?.[1] ?? "";
+      const keyValue = ENV_KEY_VALUE_ENTRY.exec(line);
+      const replacement = keyValue
+        ? `${" ".repeat(indent)}${dash}"${keyValue[4]}=${REDACTED}"`
+        : `${" ".repeat(indent)}${dash}"${REDACTED}"`;
+      redact(replacement, index);
+      swallowDeeperThan = swallowFrom(line, indent + dash.length);
+      continue;
+    }
+
+    emit(line, index);
+  }
+
+  return out.join("");
+}
+
+/**
+ * Redact env values in a structurally-parsed JSON resource.
+ *
+ * The k8s MCP servers currently emit YAML, but the format is theirs to change
+ * and other upstreams may return JSON directly. Handling both means a server
+ * upgrade cannot silently turn this scrubber into a no-op.
+ */
+export function scrubJsonValue(node: unknown): unknown {
+  return scrubJsonValueTracked(node, { changed: false }, false, false);
+}
+
+function scrubJsonValueTracked(
+  node: unknown,
+  ctx: ScrubContext,
+  inSecret: boolean,
+  inContainers: boolean,
+): unknown {
+  if (Array.isArray(node))
+    return node.map((n) => scrubJsonValueTracked(n, ctx, inSecret, inContainers));
+  if (!node || typeof node !== "object") return node;
+
+  const source = node as Record<string, unknown>;
+  const result: Record<string, unknown> = {};
+
+  // A `SecretList`'s items usually carry no `kind` of their own, so the flag has
+  // to descend rather than be re-derived at each level.
+  const kind = readKind(source);
+  const nowSecret = inSecret || isSecretKind(kind);
+
+  for (const [key, value] of Object.entries(source)) {
+    if (nowSecret && isSecretMaterialKey(key)) {
+      result[key] = REDACTED;
+      ctx.changed = true;
+      continue;
+    }
+    // `command`/`args` inside a container list (PEN-2431). Gated on
+    // `inContainers` for the same reason the YAML path gates on an open
+    // container block: a bare `args` array is ordinary GitHub/Paperclip traffic.
+    //
+    // Default-deny on the *shape*, not just on the array shape. An earlier
+    // version required `Array.isArray(value)`, which made the two paths
+    // disagree: the YAML scanner fails closed on a scalar `command:` (any
+    // non-empty suffix is redacted wholesale), while a JSON `"command"` holding
+    // a string or a mapping fell through to the generic recursion and was
+    // emitted in the clear. That is the exact failure this path exists to
+    // prevent — an upstream shape change silently turning the scrubber into a
+    // no-op — so every non-empty shape is now material until proven otherwise.
+    if (inContainers && isArgvKey(key)) {
+      if (Array.isArray(value)) {
+        result[key] = value.map((entry) =>
+          typeof entry === "string" ? redactArgvToken(entry) : REDACTED,
+        );
+        if (value.length > 0) ctx.changed = true;
+      } else if (value === null || value === undefined) {
+        // No material to redact, and no name worth inventing.
+        result[key] = value;
+      } else {
+        // A scalar or a mapping. Neither carries a flag name we can preserve
+        // token-by-token, so redact wholesale — matching the YAML path.
+        result[key] = REDACTED;
+        ctx.changed = true;
+      }
+      continue;
+    }
+    if (isEnvKey(key) && Array.isArray(value)) {
+      result[key] = value.map((entry) => {
+        if (entry === null || entry === undefined) return entry;
+        // `KEY=VALUE` is the OCI/Docker env shape, and the generic recursion
+        // returned it untouched: a scalar is not an object, so the `value`
+        // lookup below never ran. This is the same hole the mapping case was
+        // added for — the JSON path exists so an upstream shape change cannot
+        // silently turn the scrubber into a no-op, and a shape it passes through
+        // in the clear defeats that. Keep the name, drop the material.
+        //
+        // The name is validated with the SAME shared constant as the other two
+        // name-preserving rules, not with `indexOf("=")`. That distinction is
+        // the whole point of `ENV_KEY_VALUE_SCALAR`, and this call site is the
+        // third spelling of one predicate: `[LEAKED]=x` and a padded base64 body
+        // are both `=`-bearing and name-shaped, so slicing at the first `=`
+        // promotes the material into the name position and prints it in the
+        // clear beside its own redaction marker — design note 4's false
+        // assurance, which is worse than not scrubbing at all.
+        if (typeof entry === "string") {
+          ctx.changed = true;
+          const named = ENV_KEY_VALUE_SCALAR.exec(entry);
+          return named ? `${named[1]}=${REDACTED}` : REDACTED;
+        }
+        // A nested array (`[["A", "LEAKED"]]`) or any other non-object entry
+        // carries no name we can identify, so there is nothing to preserve.
+        if (typeof entry !== "object" || Array.isArray(entry)) {
+          ctx.changed = true;
+          return REDACTED;
+        }
+        return scrubJsonEnvVarEntry(entry as Record<string, unknown>, ctx);
+      });
+      continue;
+    }
+    // An `env` that is a *mapping* rather than a list. Kubernetes never
+    // serializes env this way, but the JSON path exists precisely so that an
+    // upstream changing its shape cannot silently turn this scrubber into a
+    // no-op, and the generic recursion below carries no "inside an env block"
+    // state — so a mapping fell through it with every value in the clear. Redact
+    // the values and keep the names, matching the list case and design note 2.
+    if (isEnvKey(key) && value && typeof value === "object") {
+      const entries = Object.entries(value as Record<string, unknown>);
+      result[key] = Object.fromEntries(
+        entries.map(([name, inner]) => [
+          name,
+          // A nested object here claims to be a `valueFrom`-shaped reference.
+          // Validate that closed schema instead of trusting generic recursion,
+          // which has no "inside env" state and preserved arbitrary nested
+          // material such as `{ value: "plaintext" }`.
+          isValidEnvVarSource(inner) ? inner : REDACTED,
+        ]),
+      );
+      if (entries.some(([, inner]) => !isValidEnvVarSource(inner))) ctx.changed = true;
+      continue;
+    }
+    if (RESOURCE_ECHO_ANNOTATIONS.includes(key) && typeof value === "string") {
+      result[key] = REDACTED;
+      ctx.changed = true;
+      continue;
+    }
+    // An `env` serialized as a single scalar rather than a list or a mapping.
+    // Gated by `MATERIAL_BEARING_ENV_SCALAR` — the *same constant* the YAML
+    // path uses, not a second spelling of it. This branch previously tested
+    // `value.includes("=")` under a comment claiming it was "the same
+    // discriminator as the YAML path". It was not: the YAML constant also
+    // matches a leading `[`, `{`, `*`, `|` or `>`, so five env-scalar shapes
+    // were redacted on the YAML path and returned verbatim here. Two
+    // independently-maintained spellings of one rule drift silently and the
+    // comment asserting they agree is what stops the next reader checking, so
+    // the constant is now shared rather than restated (PEN-2370 ask 3 (b2):
+    // close the class, not the spelling).
+    if (isEnvKey(key) && typeof value === "string" && MATERIAL_BEARING_ENV_SCALAR.test(value)) {
+      ctx.changed = true;
+      // Keep the variable name ONLY where the scalar really is `KEY=VALUE`.
+      // Testing `indexOf("=") !== -1` is not that test: `[LEAKED]=x` contains
+      // an `=`, so slicing at it promotes `[LEAKED]` into the name position
+      // and emits it in the clear next to a redaction marker. Validate the
+      // prefix against the same name charset the YAML sequence-entry rule
+      // uses; anything else has no name to keep and redacts whole.
+      const named = ENV_KEY_VALUE_SCALAR.exec(value);
+      result[key] = named ? `${named[1]}=${REDACTED}` : REDACTED;
+      continue;
+    }
+    if (typeof value === "string") {
+      // Resource echoes also appear as YAML/JSON text nested in string fields
+      // (annotation maps, `content[].text`). Recurse into the text.
+      result[key] = mightContainSecrets(value) ? scrubTextTracked(value, ctx) : value;
+      continue;
+    }
+    result[key] = scrubJsonValueTracked(
+      value,
+      ctx,
+      nowSecret,
+      inContainers || isContainerListKey(key),
+    );
+  }
+
+  return result;
+}
+
+/**
+ * Scrub a text payload that may be YAML, JSON, or several YAML documents.
+ */
+export function scrubText(text: string): string {
+  return scrubTextTracked(text, { changed: false });
+}
+
+function scrubTextTracked(text: string, ctx: ScrubContext): string {
+  // `stripLeadingBom` before both the sniff and the parse, for the reason that
+  // function documents: `trimStart` counts U+FEFF as whitespace, so this sniff
+  // already accepted a BOM while the `JSON.parse` below still rejected one. A
+  // k8s resource nested in `content[].text` whose text opened on a BOM therefore
+  // classified as JSON, threw, and fell through to the YAML scanner — which does
+  // not match a compact single-line JSON document, so the entry passed through
+  // with its `env` values in the clear.
+  //
+  // That is the *same* fail-open the byte-level sniffs were unified to close,
+  // surviving one layer down because this classifier kept its own idea of where
+  // a document begins. Sharing the definition is what makes the class
+  // unreachable rather than patched at the two spellings someone probed.
+  const source = stripLeadingBom(text);
+  const trimmed = source.trimStart();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      const parsed: unknown = JSON.parse(source);
+      const nested: ScrubContext = { changed: false };
+      const scrubbed = JSON.stringify(scrubJsonValueTracked(parsed, nested, false, false));
+      if (nested.changed) {
+        ctx.changed = true;
+        return scrubbed;
+      }
+      // Nothing to redact in this nested document. Return the original text so a
+      // pass-through stays byte-exact rather than being silently re-serialized.
+      return text;
+    } catch {
+      // Not valid JSON after all — fall through to the YAML scanner, which
+      // degrades gracefully on arbitrary text.
+    }
+  }
+  // The YAML scanner gets the *original* text: it is line-based and tolerates a
+  // leading BOM, and passing it the stripped copy would drop that byte from
+  // every YAML body we pass through unchanged.
+  return scrubYamlTextTracked(text, ctx);
+}
+
+/**
+ * Scrub a full MCP response body.
+ *
+ * Handles both plain JSON-RPC bodies and SSE framing (`event:`/`data:` lines),
+ * which is how the streamable-HTTP MCP transport delivers most tool results.
+ * Anything we cannot parse is returned unchanged: this is a proxy, and a
+ * scrubber that corrupts unrelated traffic is a worse failure than one that
+ * misses a body we did not recognize. The formats we *do* recognize are the
+ * ones that carry k8s resources.
+ *
+ * Dispatch is on the body's *shape*, not on a content probe. Probing the raw
+ * bytes for `env:`/`"env"` skipped any body whose resource arrived as JSON
+ * nested in `content[].text`, because there the key is escaped (`\"env\":`) and
+ * matches neither form — which made the entire JSON path dead code from this
+ * entry point. The per-string filter inside the walk sees decoded strings and is
+ * sound, so that is where the cheap check belongs.
+ */
+export function scrubResponseBody(
+  body: Buffer,
+  contentType?: string | null,
+  options?: ResponseScrubOptions,
+): Buffer {
+  const toolFilter = options?.toolFilter;
+  const transform = toolFilter
+    ? composeDocumentTransforms(toolListFilterTransform(toolFilter), scrubDocument)
+    : scrubDocument;
+  return transformResponseBody(body, contentType, transform);
+}
+
+export interface ResponseScrubOptions {
+  /**
+   * Drop `result.tools[]` entries whose *upstream* tool name this rejects
+   * (PEN-2735). Applied in the same pass as the redaction, on the same parsed
+   * document — see `transformResponseBody`.
+   */
+  toolFilter?: (upstreamToolName: unknown) => boolean;
+}
+
+/**
+ * A rewrite applied to one parsed JSON-RPC document from a response body.
+ *
+ * Set `ctx.changed` when the returned document differs from its input;
+ * `transformResponseBody` uses that flag to decide between re-serializing and
+ * handing back the original bytes.
+ */
+type ResponseDocumentTransform = (document: unknown, ctx: ScrubContext) => unknown;
+
+/** The redaction pass. Not optional at any entry point — see `scrubResponseBody`. */
+const scrubDocument: ResponseDocumentTransform = (document, ctx) =>
+  scrubJsonValueTracked(document, ctx, false, false);
+
+/** Compose transforms into one, applied left to right, over a single parse. */
+function composeDocumentTransforms(...transforms: ResponseDocumentTransform[]): ResponseDocumentTransform {
+  return (document, ctx) => transforms.reduce((node, transform) => transform(node, ctx), document);
+}
+
+/**
+ * Drop the `result.tools[]` entries an upstream is not permitted to expose.
+ *
+ * Filtering by rewriting the parsed document — rather than by intercepting the
+ * one code path that happens to build a tool list — is what makes this reach the
+ * *prefixed* route (`/<prefix>/mcp`), where the reply is the upstream's own and
+ * the gateway never assembles anything. That route is the one the agent seed
+ * actually dials, and a filter written only against the aggregate assembly would
+ * have left it open while reading as done.
+ *
+ * `allow` is asked about the upstream name verbatim; the aggregate endpoint adds
+ * its `prefix__` only after filtering, so both routes ask the same question.
+ */
+function toolListFilterTransform(
+  allow: (upstreamToolName: unknown) => boolean,
+): ResponseDocumentTransform {
+  const filterOne: ResponseDocumentTransform = (document, ctx) => {
+    if (!document || typeof document !== "object" || Array.isArray(document)) return document;
+    const result = (document as { result?: unknown }).result;
+    if (!result || typeof result !== "object" || Array.isArray(result)) return document;
+    const tools = (result as { tools?: unknown }).tools;
+    if (!Array.isArray(tools)) return document;
+
+    const kept = tools.filter((tool) => {
+      // A record with no usable name is not a tool we can authorize, and the
+      // permitted set is an allowlist: drop it rather than pass it through.
+      const name = tool && typeof tool === "object" && !Array.isArray(tool)
+        ? (tool as { name?: unknown }).name
+        : undefined;
+      return allow(name);
+    });
+    if (kept.length === tools.length) return document;
+
+    ctx.changed = true;
+    return { ...(document as object), result: { ...(result as object), tools: kept } };
+  };
+
+  return (document, ctx) => {
+    // A JSON-RPC batch response is an ARRAY of response objects, and the
+    // prefixed route forwards batch requests, so an upstream can answer a
+    // batched `tools/list` this way. Filtering only the single-object shape
+    // left that spelling open while the guard read as done — the same
+    // one-spelling-at-a-time failure this file already records for the BOM and
+    // CR-only bodies, and the exact asymmetry the request side does not have
+    // (it already inspects calls inside a batch). The redaction arm walks
+    // arrays too (`scrubDocument`), so a batch that skipped this transform was
+    // still credential-scrubbed but NOT tool-filtered: the two arms of one
+    // composed transform disagreed about what a document is.
+    if (Array.isArray(document)) return document.map((entry) => filterOne(entry, ctx));
+    return filterOne(document, ctx);
+  };
+}
+
+/**
+ * Apply `transform` to every JSON-RPC document in a response body, whatever
+ * framing carries it.
+ *
+ * PEN-2735: this is deliberately not exported. Adding a *second* kind of
+ * response rewrite must not add a second answer to "where does a document
+ * begin". Every fail-open this file records — the BOM-prefixed JSON body, the
+ * CR-only event stream, the stream opening on `id:` — was a classifier that had
+ * drifted from its peer, and the fix each time was to share the definition
+ * rather than teach both copies. A tool-allowlist filter that re-sniffed the
+ * body would have rebuilt exactly that shape one release after it was closed.
+ * New rewrites belong here as a `ResponseDocumentTransform`, reached through
+ * `scrubResponseBody`, whose redaction arm cannot be opted out of.
+ */
+function transformResponseBody(
+  body: Buffer,
+  contentType: string | null | undefined,
+  transform: ResponseDocumentTransform,
+): Buffer {
+  const isSse = (contentType ?? "").includes("text/event-stream") || startsWithSseField(body);
+  if (!isSse && !startsWithJsonPunctuation(body)) return body;
+
+  const text = body.toString("utf8");
+  const ctx: ScrubContext = { changed: false };
+  const rewritten = isSse
+    ? transformSseFrames(text, ctx, transform)
+    : transformJsonRpcBody(text, ctx, transform);
+
+  // Returning the original Buffer — not a re-serialized equal-looking one — is
+  // what keeps pass-through byte-exact. `JSON.parse`/`JSON.stringify` is lossy
+  // for integers above 2^53 and normalizes `1.0` to `1`, and this gateway also
+  // proxies GitHub and Paperclip bodies that legitimately mention `env:`.
+  if (rewritten === null || !ctx.changed) return body;
+  return Buffer.from(rewritten, "utf8");
+}
+
+/**
+ * Offset of the first byte that decides a body's shape: one optional UTF-8 BOM,
+ * then any leading whitespace.
+ *
+ * Every classifier at this entry point derives its starting offset from here,
+ * and that single definition is the point. Each sniff previously carried its own
+ * idea of where a body begins, and they disagreed: the SSE sniff skipped a BOM
+ * and whitespace, `startsWithJsonPunctuation` skipped whitespace only, and
+ * `JSON.parse` skipped neither. A BOM-prefixed JSON-RPC body therefore matched
+ * no classifier at all and was returned in the clear, with its `env` values
+ * intact — the same fail-open the SSE sniff was widened to close, surviving in
+ * the one direction that widening did not reach.
+ *
+ * Deriving both sniffs from one function is what makes that class unreachable
+ * rather than merely patched: a prefix taught here is understood by every entry
+ * point at once, so the next one cannot silently disagree.
+ */
+function significantByteOffset(body: Buffer): number {
+  let start = body[0] === 0xef && body[1] === 0xbb && body[2] === 0xbf ? 3 : 0;
+  while (start < body.length) {
+    const byte = body[start]!;
+    if (byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0d) start += 1;
+    else break;
+  }
+  return start;
+}
+
+/** First significant byte is `{` or `[`, checked without allocating. */
+function startsWithJsonPunctuation(body: Buffer): boolean {
+  const start = significantByteOffset(body);
+  if (start >= body.length) return false;
+  const byte = body[start]!;
+  return byte === 0x7b /* { */ || byte === 0x5b /* [ */;
+}
+
+/**
+ * Body opens an SSE field line, checked on the Buffer.
+ *
+ * This sniff is the fallback for when the upstream omits `content-type`, so it
+ * has to cover every field an event stream may legally open on — not just the
+ * two we expect. A stream that opened on `id:`, `retry:` or a `:` comment line
+ * was classified as neither SSE nor JSON, and `scrubResponseBody` returns such
+ * bodies unchanged: the whole stream, including its `data:` payloads, passed
+ * through unscrubbed.
+ *
+ * Widening this is safe in the other direction. A non-SSE body that happens to
+ * open on one of these tokens still has no `data:` lines for `transformSseFrames`
+ * to rewrite, so it comes back unchanged and `ctx.changed` stays false — which
+ * returns the original Buffer byte-for-byte.
+ */
+const SSE_FIELD_HEAD = /^(?:event|data|id|retry):|^:/;
+
+/**
+ * The window is 8 bytes: `retry:` already consumes six, and skipping leading
+ * bytes below shifts the field name later in the buffer.
+ *
+ * The leading-byte skip is `significantByteOffset`, shared with the JSON sniff.
+ * It used to be a private copy here — correct, but private, which is precisely
+ * how the JSON sniff was left behind when this one learned about BOMs.
+ */
+function startsWithSseField(body: Buffer): boolean {
+  // The SSE spec requires a client to strip one leading BOM, so a stream that
+  // carries one is well-formed, not malformed. A leading blank line is an empty
+  // event dispatch, equally legal. Neither shifted the field name out of an
+  // anchored 6-byte window before this: the sniff missed, the JSON sniff saw
+  // `e`, and the whole stream — `data:` payloads included — was returned
+  // unscrubbed.
+  const start = significantByteOffset(body);
+  return SSE_FIELD_HEAD.test(body.subarray(start, start + 8).toString("latin1"));
+}
+
+/**
+ * The string-side half of `significantByteOffset`'s BOM rule.
+ *
+ * `significantByteOffset` governs the byte-level sniffs; this governs every
+ * place we hand a decoded string to `JSON.parse`. Two representations need two
+ * functions, but each representation gets exactly *one* — the failure this file
+ * keeps re-learning is a second private copy, not a second representation.
+ *
+ * Exported because the same rule has to hold on the REQUEST side (PEN-2735:
+ * deciding whether an inbound body is a `tools/call` for a denied tool). A
+ * request parser that did not strip the BOM would read a BOM-prefixed body as
+ * unparseable and forward it unexamined — the mirror image, one direction over,
+ * of the response fail-open documented below. Keeping one definition for both
+ * directions is what stops that from being rediscovered as a new door.
+ *
+ * `JSON.parse` tolerates leading whitespace but rejects a leading BOM, while
+ * both of our JSON *detectors* accept one (`significantByteOffset` skips it
+ * explicitly; `String.prototype.trimStart` treats U+FEFF as whitespace per
+ * ECMAScript). Detection and parsing therefore disagree by default, and every
+ * caller that does not strip fails open: the body classifies as JSON, throws on
+ * parse, and the catch hands it back unscrubbed.
+ *
+ * Dropping the BOM is safe only where the return value is a re-serialized
+ * document, which already does not preserve the original byte layout. Callers
+ * that pass a body through unchanged must return their *original* string or
+ * Buffer, not this one, to stay byte-exact.
+ */
+export function stripLeadingBom(text: string): string {
+  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+}
+
+/**
+ * Teaching only the *sniff* about BOMs would have moved this fail-open one step
+ * down rather than closing it — the body would classify as JSON and then fail to
+ * parse, and a `null` return sends it through unscrubbed exactly as before. That
+ * is the same half-fix `transformSseFrames` documents for its own framing regex:
+ * detection and parsing have to agree about where a body begins.
+ *
+ * A body we did not change is returned as the original Buffer by
+ * `scrubResponseBody` and keeps its BOM.
+ */
+function transformJsonRpcBody(
+  text: string,
+  ctx: ScrubContext,
+  transform: ResponseDocumentTransform,
+): string | null {
+  try {
+    return JSON.stringify(transform(JSON.parse(stripLeadingBom(text)), ctx));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Rewrite the JSON payload of each SSE `data:` line, preserving framing.
+ *
+ * SSE payloads may be split across consecutive `data:` lines that concatenate
+ * into one JSON document, so we buffer a run of them and scrub the join. Blank
+ * lines terminate an event and are emitted verbatim to keep the stream valid.
+ *
+ * Note that a buffered run is re-emitted as a *single* `data:` line, joined with
+ * `""`. The SSE spec joins multi-line data with `"\n"`, so this is only
+ * equivalent because the payloads here are JSON, where whitespace between tokens
+ * is insignificant. Do not reuse this helper for a non-JSON `data:` stream.
+ *
+ * Line splitting accepts CRLF, LF *and* a lone CR, because all three terminate a
+ * line in an event stream. Splitting on `"\n"` alone made a CR-only stream a
+ * single unsplit line, so no line ever began with `data:`, nothing was scrubbed,
+ * and the body passed through with its payloads in the clear. This is the same
+ * fail-open class as the CRLF hole in `scrubYamlTextTracked` — fixing that one
+ * scanner's line handling and leaving this one's is how the class survives a
+ * fix. Terminators are normalized to LF, which only ever reaches the client on a
+ * body we actually redacted; an untouched body is returned as the original
+ * Buffer.
+ *
+ * The field match tolerates a leading BOM and indentation for the same reason.
+ * Teaching only the *sniff* to skip those bytes moved the fail-open one step
+ * down rather than closing it: the body was then correctly classified as SSE,
+ * but `"﻿data: …"` does not start with `data:`, so the payload was emitted
+ * in the clear anyway. Detection and framing have to agree about where a line
+ * begins.
+ */
+const SSE_DATA_FIELD = /^[﻿\s]*data:/;
+
+function transformSseFrames(
+  text: string,
+  ctx: ScrubContext,
+  transform: ResponseDocumentTransform,
+): string {
+  const out: string[] = [];
+  let pending: string[] = [];
+
+  const flush = (): void => {
+    if (pending.length === 0) return;
+    const joined = pending.join("");
+    const rewritten = transformJsonRpcBody(joined, ctx, transform);
+    out.push(`data: ${rewritten ?? joined}`);
+    pending = [];
+  };
+
+  for (const line of text.split(/\r\n|\n|\r/)) {
+    const field = SSE_DATA_FIELD.exec(line);
+    if (field) {
+      pending.push(line.slice(field[0].length).trimStart());
+      continue;
+    }
+    flush();
+    out.push(line);
+  }
+  flush();
+
+  return out.join("\n");
+}

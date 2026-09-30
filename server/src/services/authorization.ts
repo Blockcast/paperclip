@@ -76,7 +76,13 @@ export type AuthorizationAction =
   | "project:read"
   | "run:recover_stranded"
   | "runtime:manage"
-  | "secrets:read";
+  | "secrets:read"
+  // PEN-2852: reading the raw `workspaceRuntime` blob off a workspace response.
+  // Deliberately NOT `runtime:manage`: that action is in the standard
+  // same-company agent allow-list below, so gating disclosure on it would
+  // withhold from nothing but restricted principals. See the guard comment on
+  // the agent branch.
+  | "workspace_runtime:read";
 
 export type AuthorizationResource =
   | { type: "company"; companyId: string }
@@ -172,7 +178,8 @@ function permissionForAction(action: AuthorizationAction): PermissionKey | null 
     action === "issue:read" ||
     action === "project:read" ||
     action === "runtime:manage" ||
-    action === "secrets:read"
+    action === "secrets:read" ||
+    action === "workspace_runtime:read"
   ) {
     return null;
   }
@@ -1086,7 +1093,8 @@ export function authorizationService(db: Db) {
       input.action === "skill_config:update" ||
       input.action === "inbox:manage" ||
       input.action === "runtime:manage" ||
-      input.action === "secrets:read"
+      input.action === "secrets:read" ||
+      input.action === "workspace_runtime:read"
     ) {
       return lowTrustDeny(
         `${LOW_TRUST_REVIEW_PRESET} agents cannot use company-wide or privileged ${input.action} APIs by default.`,
@@ -1241,7 +1249,8 @@ export function authorizationService(db: Db) {
       input.action === "agent:wake" ||
       input.action === "project:read" ||
       input.action === "runtime:manage" ||
-      input.action === "secrets:read"
+      input.action === "secrets:read" ||
+      input.action === "workspace_runtime:read"
     ) {
       return denyBridge("Task bridge keys cannot use company-wide, peer-agent, project, runtime, or secret APIs.");
     }
@@ -1308,6 +1317,7 @@ export function authorizationService(db: Db) {
       input.action === "project:read" ||
       input.action === "runtime:manage" ||
       input.action === "secrets:read" ||
+      input.action === "workspace_runtime:read" ||
       input.action === "tasks:assign"
     ) {
       return denySkillTest("Skill-test run tokens cannot use company-wide, peer-agent, project, runtime, secret, or task-create APIs.");
@@ -1945,13 +1955,16 @@ export function authorizationService(db: Db) {
           input.action === "issue:read" ||
           input.action === "project:read" ||
           input.action === "runtime:manage" ||
-          input.action === "secrets:read"
+          input.action === "secrets:read" ||
+          input.action === "workspace_runtime:read"
         ) {
           const membership = await getActiveMembership(companyId, "user", input.actor.userId);
           // Mirroring the tasks:assign carve-out above, viewers keep the
           // read-only visibility actions but not the privileged ones.
           const requiresNonViewer =
-            input.action === "runtime:manage" || input.action === "secrets:read";
+            input.action === "runtime:manage" ||
+            input.action === "secrets:read" ||
+            input.action === "workspace_runtime:read";
           if (membership && (!requiresNonViewer || membership.membershipRole !== "viewer")) {
             return allow({
               action: input.action,
@@ -2186,6 +2199,23 @@ export function authorizationService(db: Db) {
       });
     }
 
+    // PEN-2852: `workspace_runtime:read` is deliberately ABSENT from this list,
+    // and adding it would silently undo the fix it exists for.
+    //
+    // `workspaceRuntime` is an operator-authored `Record<string, unknown>` that
+    // routinely carries service commands and the environment they run with.
+    // The first attempt at that boundary gated disclosure on `runtime:manage`
+    // — which IS in the list below — so every standard same-company agent was
+    // still handed the raw blob and the boundary withheld from nothing but
+    // low-trust and task-bridge principals. The whole point of a separate
+    // action is that it is NOT covered by this blanket allow, so an agent gets
+    // the withheld projection. Note that an `onBehalfOfUserId` JWT does not
+    // re-open it either: the responsible-user intersection can only NARROW an
+    // agent decision, never widen one — pinned by a test in
+    // `authorization-service.test.ts`.
+    //
+    // If an agent workflow genuinely needs the runtime config, give it an
+    // explicit, auditable grant rather than widening this list.
     if (
       input.action === "agent:read" ||
       input.action === "company_scope:read" ||

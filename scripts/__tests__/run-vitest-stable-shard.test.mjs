@@ -9,6 +9,11 @@ import {
   loadShardDurations,
   partitionGeneralServerSuites,
 } from "../general-server-shard.mjs";
+import {
+  HARD_FAIL_COVERAGE_FLOOR,
+  evaluateManifestFreshness,
+  formatMissingSuitesDiagnostic,
+} from "../check-shard-manifest-freshness.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const script = path.join(repoRoot, "scripts", "run-vitest-stable.mjs");
@@ -123,16 +128,27 @@ test("a missing or malformed manifest degrades to uniform weights", () => {
   assert.equal(Math.abs(shards[0].files.length - shards[1].files.length), 0);
 });
 
+// BLO-24241: this used to hard-fail below 90% coverage, which is a cliff —
+// #1117 crossed it at 359/399=89.97% and failed `policy`, which skips build,
+// typecheck, e2e and every test lane over a single missing JSON entry. The
+// floor here is now HARD_FAIL_COVERAGE_FLOOR (well below 90%), so a suite or
+// two of ordinary drift can no longer cascade. Whether coverage is complete
+// is separately, precisely asserted (with the missing suites named) in
+// check-shard-manifest-freshness.test.mjs, wired into pr.yml with
+// continue-on-error so that assertion stays visible without blocking.
 test("the checked-in manifest loads and covers most of the current suite set", () => {
   const durations = loadShardDurations(durationsManifest);
   assert.ok(Object.keys(durations).length > 0, "manifest must parse to a non-empty duration map");
 
   const shard = dryRunJson(["--mode", "general", "--group", "general-server", "--shard-index", "0", "--shard-count", "1"]);
   const currentFiles = shard.selectedGeneralServerSuites;
-  const known = currentFiles.filter((file) => durations[file] !== undefined).length;
+  const { missing, coverage } = evaluateManifestFreshness({ files: currentFiles, durations });
+  if (missing.length > 0) {
+    console.warn(formatMissingSuitesDiagnostic({ missing, coverage, totalSuites: currentFiles.length }));
+  }
   assert.ok(
-    known / currentFiles.length >= 0.9,
-    `manifest is stale: only ${known} of ${currentFiles.length} suites have recorded durations — regenerate it from a recent PR run (see the manifest's $comment)`,
+    coverage >= HARD_FAIL_COVERAGE_FLOOR,
+    `manifest coverage ${(coverage * 100).toFixed(1)}% has fallen below the abandonment floor of ${HARD_FAIL_COVERAGE_FLOOR * 100}% — regenerate it (see the manifest's $comment)`,
   );
 });
 

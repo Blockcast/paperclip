@@ -203,6 +203,62 @@ describeEmbeddedPostgres("parked agents route", () => {
     expect(later.penstockRetryAfterSeconds).toBe(3834);
   });
 
+  it("distinguishes a 429 pool exhaustion from a 503 provider outage, which `reason` alone cannot", async () => {
+    const companyId = await seedCompany();
+    const exhaustedAgent = await seedAgent(companyId, "PlatformSREEngineer");
+    const outageAgent = await seedAgent(companyId, "BackendEngineer");
+    const unlabelledAgent = await seedAgent(companyId, "FrontendEngineer");
+
+    // Both denials book the SAME `scheduledRetryReason` on purpose — the single
+    // value is what preserves BLO-28919's census split-check. So `reason` is
+    // identical across these two rows by design, and `penstockReason` is the
+    // only thing that tells an empty pool from a dead provider (PEN-3323).
+    await seedRun({
+      companyId,
+      agentId: exhaustedAgent,
+      status: "scheduled_retry",
+      scheduledRetryAt: new Date(Date.now() + 5 * 60_000),
+      scheduledRetryReason: "ccrotate_capacity",
+      scheduledRetryAttempt: 1,
+      resultJson: { penstockReason: "penstock.model_capacity_unavailable" },
+    });
+    await seedRun({
+      companyId,
+      agentId: outageAgent,
+      status: "scheduled_retry",
+      scheduledRetryAt: new Date(Date.now() + 10 * 60_000),
+      scheduledRetryReason: "ccrotate_capacity",
+      scheduledRetryAttempt: 1,
+      resultJson: { penstockReason: "penstock.model_temporarily_unavailable" },
+    });
+    // A park written before this key existed, or by a path that set no reason,
+    // must read as null rather than being dropped from the census.
+    await seedRun({
+      companyId,
+      agentId: unlabelledAgent,
+      status: "scheduled_retry",
+      scheduledRetryAt: new Date(Date.now() + 15 * 60_000),
+      scheduledRetryReason: "ccrotate_capacity",
+      scheduledRetryAttempt: 1,
+    });
+
+    const res = await request(createApp(boardActor(companyId)))
+      .get(`/api/companies/${companyId}/parked-agents`)
+      .expect(200);
+
+    const [exhausted, outage, unlabelled] = res.body.agents;
+    expect(res.body.parkedCount).toBe(3);
+
+    // The control: `reason` is the same on all three, so it cannot separate them.
+    expect(
+      res.body.agents.map((entry: { reason: string }) => entry.reason),
+    ).toEqual(["ccrotate_capacity", "ccrotate_capacity", "ccrotate_capacity"]);
+
+    expect(exhausted.penstockReason).toBe("penstock.model_capacity_unavailable");
+    expect(outage.penstockReason).toBe("penstock.model_temporarily_unavailable");
+    expect(unlabelled.penstockReason).toBeNull();
+  });
+
   it("flags a park whose due time has already passed", async () => {
     const companyId = await seedCompany();
     const agentId = await seedAgent(companyId, "PlatformSREEngineer");

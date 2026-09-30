@@ -341,6 +341,14 @@ export const ISSUE_RECOVERY_ACTION_OUTCOMES = [
 ] as const;
 export type IssueRecoveryActionOutcome = (typeof ISSUE_RECOVERY_ACTION_OUTCOMES)[number];
 
+export const ISSUE_RECOVERY_ACTION_RETIRING_BOUNDS = [
+  "timeout_horizon",
+  "attempt_budget",
+  "discharged",
+  "cancelled",
+] as const;
+export type IssueRecoveryActionRetiringBound = (typeof ISSUE_RECOVERY_ACTION_RETIRING_BOUNDS)[number];
+
 export function pluginOperationIssueOriginKind(pluginKey: string): PluginIssueOriginKind {
   return `plugin:${pluginKey}:operation`;
 }
@@ -466,7 +474,7 @@ export type IssueExecutionPolicyMode = (typeof ISSUE_EXECUTION_POLICY_MODES)[num
 export const ISSUE_EXECUTION_STAGE_TYPES = ["review", "approval"] as const;
 export type IssueExecutionStageType = (typeof ISSUE_EXECUTION_STAGE_TYPES)[number];
 
-export const ISSUE_MONITOR_SCHEDULED_BY = ["assignee", "board"] as const;
+export const ISSUE_MONITOR_SCHEDULED_BY = ["assignee", "board", "manager"] as const;
 export type IssueMonitorScheduledBy = (typeof ISSUE_MONITOR_SCHEDULED_BY)[number];
 
 export const ISSUE_EXECUTION_MONITOR_KINDS = ["external_service"] as const;
@@ -495,10 +503,16 @@ export const ISSUE_EXECUTION_MONITOR_CLEAR_REASONS = [
   "cancelled",
   "invalid_status",
   "invalid_assignee",
+  "suppressed_by_status",
   "dispatch_skipped",
   "timeout_exceeded",
   "max_attempts_exhausted",
   "convergence_stalled",
+  // BLO-29606: a monitor that fired and whose woken run never called back, on a
+  // policy that carries no `timeoutAt` to expire against. Distinct from
+  // `timeout_exceeded` on purpose — nothing timed out, the trigger stalled — so
+  // the two stranding shapes stay separable in activity logs and dashboards.
+  "trigger_stalled",
 ] as const;
 export type IssueExecutionMonitorClearReason = (typeof ISSUE_EXECUTION_MONITOR_CLEAR_REASONS)[number];
 
@@ -674,6 +688,15 @@ export type ApprovalStatus = (typeof APPROVAL_STATUSES)[number];
  */
 export const APPROVAL_UNDECIDED_STATUSES = ["pending", "revision_requested"] as const;
 export type ApprovalUndecidedStatus = (typeof APPROVAL_UNDECIDED_STATUSES)[number];
+
+/**
+ * Most issues one approval may link at creation (`issueIds` on approval create,
+ * `sourceIssueIds` on agent hire). Each id is authorized on its own, sequentially,
+ * before anything is written, so an uncapped array let one request queue one issue
+ * read plus an authorization decision per element, bounded only by the JSON body
+ * limit (PR #1271). Matches the issue-id arrays on task-bridge key scopes.
+ */
+export const APPROVAL_LINKED_ISSUE_IDS_MAX = 50;
 
 export const SECRET_PROVIDERS = [
   "local_encrypted",
@@ -1317,6 +1340,7 @@ export const PLUGIN_CAPABILITIES = [
   "issues.checkout",
   "issues.wakeup",
   "issue.comments.create",
+  "issue.comments.update",
   "issue.interactions.create",
   "issue.documents.write",
   "projects.managed",

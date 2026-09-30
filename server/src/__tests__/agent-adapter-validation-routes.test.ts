@@ -47,6 +47,7 @@ const mockBudgetService = vi.hoisted(() => ({
 
 const mockHeartbeatService = vi.hoisted(() => ({
   cancelActiveForAgent: vi.fn(),
+  cancelExternalRuntimeReservationHoldersForAgent: vi.fn(),
 }));
 
 const mockIssueApprovalService = vi.hoisted(() => ({
@@ -609,5 +610,158 @@ describe("agent routes adapter validation", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(422);
     expect(String(res.body.error ?? res.body.message ?? "")).toContain(`Unknown adapter type: ${missingAdapterType}`);
+  });
+  // BLO-28865 (parent BLO-27700). The adapter-type change itself is what
+  // strands the reservation: `recordExpectedExternalRuntimeJobName` matches a
+  // `launched` row by exact `expectedJobName` equality, so once the runtime
+  // starts presenting a differently-prefixed Job name every launch throws and
+  // the unreleased row keeps holding the agent's slot. The route is the only
+  // place that sees both the old and new adapter type, and it must hand the
+  // in-flight run to the cancel cascade -- which is what tears the old-named
+  // Job down while the reservation still carries that name.
+  it("cancels in-flight runs when an external-lifecycle agent's adapter type changes (BLO-28865)", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      name: "Migrating",
+      urlKey: "migrating",
+      role: "engineer",
+      title: null,
+      icon: null,
+      status: "running",
+      reportsTo: null,
+      capabilities: null,
+      adapterType: "opencode_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      budgetMonthlyCents: 0,
+      spentMonthlyCents: 0,
+      pauseReason: null,
+      pausedAt: null,
+      permissions: { canCreateAgents: false },
+      lastHeartbeatAt: null,
+      metadata: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ adapterType: "codex_local" }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockHeartbeatService.cancelExternalRuntimeReservationHoldersForAgent).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      expect.stringContaining("adapter type changed"),
+    );
+    // The reason must name BOTH adapter types: it lands in the run's cancel
+    // event and is the only breadcrumb tying a cancelled run to the migration
+    // that caused it.
+    const [, reason] = mockHeartbeatService.cancelExternalRuntimeReservationHoldersForAgent.mock.calls.at(-1) ?? [];
+    expect(String(reason)).toContain("opencode_k8s");
+    expect(String(reason)).toContain("codex_local");
+  });
+
+  it("does not cancel runs when the PREVIOUS adapter had no external lifecycle (BLO-28865)", async () => {
+    // Default `existing` is codex_local. There is no k8s Job and no runtime
+    // reservation to strand, so cancelling in-flight work here would be pure
+    // collateral damage -- the gate is on the adapter being migrated AWAY
+    // from, not the one being migrated to.
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ adapterType: "opencode_k8s" }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockHeartbeatService.cancelExternalRuntimeReservationHoldersForAgent).not.toHaveBeenCalled();
+  });
+
+  it("does not cancel runs when a PATCH leaves the adapter type unchanged (BLO-28865 AC#6)", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      name: "Steady",
+      urlKey: "steady",
+      role: "engineer",
+      title: null,
+      icon: null,
+      status: "running",
+      reportsTo: null,
+      capabilities: null,
+      adapterType: "opencode_k8s",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true } },
+      budgetMonthlyCents: 0,
+      spentMonthlyCents: 0,
+      pauseReason: null,
+      pausedAt: null,
+      permissions: { canCreateAgents: false },
+      lastHeartbeatAt: null,
+      metadata: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    // The regression this guards is the expensive one: an unrelated PATCH on
+    // an external-lifecycle agent (a title edit, a runtime tweak) must never
+    // kill that agent's in-flight run. The normal reservation lifecycle
+    // reserved -> launching -> launched -> released has to be untouched.
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ title: "Staff Engineer" }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockHeartbeatService.cancelExternalRuntimeReservationHoldersForAgent).not.toHaveBeenCalled();
+  });
+
+  it("still applies the adapter-type change when the cancel cascade throws (BLO-28865)", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      name: "Migrating",
+      urlKey: "migrating",
+      role: "engineer",
+      title: null,
+      icon: null,
+      status: "running",
+      reportsTo: null,
+      capabilities: null,
+      adapterType: "opencode_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      budgetMonthlyCents: 0,
+      spentMonthlyCents: 0,
+      pauseReason: null,
+      pausedAt: null,
+      permissions: { canCreateAgents: false },
+      lastHeartbeatAt: null,
+      metadata: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    mockHeartbeatService.cancelExternalRuntimeReservationHoldersForAgent.mockRejectedValueOnce(new Error("kube unavailable"));
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ adapterType: "codex_local" }),
+    );
+
+    // The agent row is already committed at this point. Returning 500 would
+    // tell the caller the migration failed when it did not, and would invite a
+    // retry against an agent that has ALREADY changed type. Degrading to the
+    // pre-fix behaviour (the reaper clears it at the 45m hard-stale boundary)
+    // is strictly better than lying about the outcome.
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.adapterType).toBe("codex_local");
   });
 });

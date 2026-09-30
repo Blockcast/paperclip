@@ -1,7 +1,7 @@
 import type { Request, Response } from "express";
 import { forbidden, HttpError, unauthorized } from "../errors.js";
 import { logger } from "../middleware/logger.js";
-import { responsibleUserAuthzShadowMode } from "../services/authorization.js";
+import { responsibleUserAuthzShadowMode, type AuthorizationDecision } from "../services/authorization.js";
 
 function throwOrShadowResponsibleUserCompanyAccessDeny(
   req: Request,
@@ -161,6 +161,42 @@ export function hasCompanyAccess(req: Request, companyId: string): boolean {
   if (req.actor.type === "agent") return req.actor.companyId === companyId;
   if (req.actor.source === "local_implicit") return true;
   return (req.actor.companyIds ?? []).includes(companyId);
+}
+
+type AgentConfigReadDecider = {
+  decide: (input: {
+    actor: Request["actor"];
+    action: "agent_config:read";
+    resource: { type: "company"; companyId: string };
+  }) => Promise<AuthorizationDecision>;
+};
+
+/**
+ * Shared "may this actor see agent configuration?" test.
+ *
+ * Mirrors `actorCanReadConfigurationsForCompany` in `routes/agents.ts`: board
+ * (human) members of the company keep the read, agent actors must hold
+ * `agent_config:read` so peers cannot snoop each other's configuration.
+ *
+ * It lives here rather than being re-derived per module because the material is
+ * reachable from more than one subsystem — the agent routes, the approval card
+ * that embeds a hire's config, and the issue→approvals projection. PEN-2777 was
+ * exactly a copy of this gate existing on one path and not its sibling; a
+ * single definition is what keeps the next reader from reopening that.
+ */
+export async function actorCanReadAgentConfig(
+  req: Request,
+  access: AgentConfigReadDecider,
+  companyId: string,
+): Promise<boolean> {
+  if (!hasCompanyAccess(req, companyId)) return false;
+  if (req.actor.type === "board") return true;
+  const decision = await access.decide({
+    actor: req.actor,
+    action: "agent_config:read",
+    resource: { type: "company", companyId },
+  });
+  return decision.allowed;
 }
 
 /**

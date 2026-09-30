@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
 import { and, asc, desc, eq, ilike, inArray, isNull, or, sql } from "drizzle-orm";
-import type { Db } from "@paperclipai/db";
+import type { Db, DbTransaction } from "@paperclipai/db";
 import {
   agents,
   assets,
@@ -33,7 +33,7 @@ import { documentAnnotationService, logActivity } from "../services/index.js";
 import type { StorageService } from "../storage/types.js";
 import { assertCompanyAccess, getActorInfo, hasCompanyAccess } from "./authz.js";
 
-type CaseRouteDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
+type CaseRouteDb = Db | DbTransaction;
 type CaseActor = ReturnType<typeof getActorInfo>;
 
 const CASE_STATUSES = ["draft", "in_progress", "in_review", "approved", "done", "cancelled"] as const;

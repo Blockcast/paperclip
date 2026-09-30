@@ -47,9 +47,16 @@ vi.mock("./k8s-client.js", () => ({
 }));
 
 const mockPrepareBundle = vi.fn();
-vi.mock("./prompt-cache.js", () => ({
-  prepareClaudePromptBundle: mockPrepareBundle,
-}));
+// Partial mock via importOriginal, matching the server-utils mock below: only
+// prepareClaudePromptBundle needs replacing, and a whole-module replacement
+// silently drops every other export the module gains later (BLO-32055 added
+// readCatalogBackedSkillKeys and broke 23 tests here that way).
+vi.mock("./prompt-cache.js", async (importOriginal) => {
+  const original = await importOriginal<typeof import("./prompt-cache.js")>();
+  return Object.assign(Object.create(null), original, {
+    prepareClaudePromptBundle: mockPrepareBundle,
+  });
+});
 
 vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
   const original = await importOriginal<typeof import("@paperclipai/adapter-utils/server-utils")>();

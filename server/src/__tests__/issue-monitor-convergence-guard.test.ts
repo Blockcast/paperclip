@@ -31,7 +31,7 @@ const BLOCKER_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 type MonitorInput = {
   nextCheckAt: string;
   notes?: string | null;
-  scheduledBy?: "assignee" | "board";
+  scheduledBy?: "assignee" | "board" | "manager";
   kind?: "external_service" | null;
   gateSignals?: string[] | null;
 };
@@ -274,6 +274,24 @@ describe("issue monitor convergence guard (BLO-18294)", () => {
         expect(monitorState(issue)).toMatchObject({ gateFingerprint: null, convergenceCount: 0 });
         fire(issue, checkAt(cycle));
       }
+    });
+
+    it("exempts manager-scheduled monitors and preserves their stored attribution", () => {
+      const issue = newIssue();
+      const managerAgentId = "33333333-3333-4333-8333-333333333333";
+      const result = arm(
+        issue,
+        { nextCheckAt: checkAt(1), scheduledBy: "manager" },
+        { blockers: [BLOCKER_A], actor: { agentId: managerAgentId } },
+      );
+
+      expect(result.monitorConvergence).toBeNull();
+      expect(result.patch.monitorScheduledBy).toBe("manager");
+      expect(monitorState(issue)).toMatchObject({
+        scheduledBy: "manager",
+        gateFingerprint: null,
+        convergenceCount: 0,
+      });
     });
 
     it("exempts external-service monitors even when the assignee scheduled them", () => {
@@ -553,6 +571,19 @@ describe("issue monitor convergence guard (BLO-18294)", () => {
         unresolvedBlockerIssueIds: [BLOCKER_A],
       });
       expect(result).toMatchObject({ count: 1, converged: false, source: "gates" });
+    });
+
+    it("exempts manager-scheduled monitors from convergence bookkeeping", () => {
+      const result = evaluateIssueMonitorConvergence({
+        monitor: normalizeIssueExecutionPolicy({
+          stages: [],
+          monitor: { nextCheckAt: checkAt(1), scheduledBy: "manager" },
+        })!.monitor!,
+        previous: null,
+        unresolvedBlockerIssueIds: [BLOCKER_A],
+      });
+
+      expect(result).toBeNull();
     });
   });
 });

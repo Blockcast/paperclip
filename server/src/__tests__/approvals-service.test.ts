@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
-import { agents, approvals, companies, createDb } from "@paperclipai/db";
+import { agents, approvals, budgetIncidents, budgetPolicies, companies, createDb } from "@paperclipai/db";
 import fs from "node:fs";
 import path from "node:path";
 import url from "node:url";
@@ -61,7 +61,18 @@ function createApproval(status: string): ApprovalRecord {
 
 function createDbStub(selectResults: Array<Array<Record<string, unknown>>>, updateResults: ApprovalRecord[]) {
   const pendingSelectResults = [...selectResults];
-  const selectWhere = vi.fn(async () => pendingSelectResults.shift() ?? []);
+  // Drizzle's select builder is a thenable that also carries `.for()`. The stub
+  // needs both: the `hire_agent` decision path locks `budget_policies … for
+  // update` before it touches `agents` (BLO-34422), and that lock's rows are
+  // discarded, so it just drains the queue like any other select.
+  const selectWhere = vi.fn(() => {
+    const rows = pendingSelectResults.shift() ?? [];
+    const builder = Promise.resolve(rows) as Promise<typeof rows> & {
+      for: () => typeof builder;
+    };
+    builder.for = () => builder;
+    return builder;
+  });
   const innerJoin = vi.fn(() => ({ where: selectWhere }));
   const from = vi.fn(() => ({ where: selectWhere, innerJoin }));
   const select = vi.fn(() => ({ from }));
@@ -98,7 +109,7 @@ describe("approvalService resolution idempotency", () => {
     mockAgentService.activatePendingApproval.mockResolvedValue({ agent: { id: "agent-1" }, activated: true });
     mockAgentService.create.mockResolvedValue({ id: "agent-1" });
     mockAgentService.terminate.mockResolvedValue(undefined);
-    mockLogActivity.mockResolvedValue(undefined);
+    mockLogActivity.mockResolvedValue(async () => {});
     mockNotifyHireApproved.mockResolvedValue(undefined);
   });
 
@@ -659,6 +670,117 @@ describe("approvalService createWithIdempotency", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// BLO-24744: one incident, one card. A liveness detector mints an escalation per
+// repair target and picks each one's owner independently, so the runs filing for a
+// single root cause can be different agents. Requester-scoped dedupe is right for a
+// caller-chosen key and wrong for a server-derived incident key: it would mint one
+// card per owner for one human decision. These run against real Postgres because
+// the claim is about which rows a WHERE clause matches.
+// ---------------------------------------------------------------------------
+
+describeEmbeddedPostgres("approvalService createWithIdempotency dedupe scope", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-approval-dedupe-scope-");
+    db = createDb(tempDb.connectionString);
+  }, 120_000);
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seedCompanyWithTwoAgents() {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Dedupe scope company",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+    });
+    const agentIds = [randomUUID(), randomUUID()];
+    for (const [index, id] of agentIds.entries()) {
+      await db.insert(agents).values({
+        id,
+        companyId,
+        name: `Escalation owner ${index + 1}`,
+        role: "engineer",
+        status: "idle",
+      });
+    }
+    return { companyId, agentIds: agentIds as [string, string] };
+  }
+
+  function escalationInput(requestedByAgentId: string, idempotencyKey: string) {
+    return {
+      type: "request_board_approval",
+      payload: { title: "Paused agent is blocking its issues — unpause or re-home" },
+      requestedByAgentId,
+      requestedByUserId: null,
+      status: "pending",
+      idempotencyKey,
+    } as any;
+  }
+
+  it("replays one card across the different owners escalating the same incident", async () => {
+    const { companyId, agentIds } = await seedCompanyWithTwoAgents();
+    const svc = approvalService(db);
+    const key = "harness_liveness_board:company:blocked_by_uninvokable_assignee:paused-agent";
+
+    const first = await svc.createWithIdempotency(companyId, escalationInput(agentIds[0], key), {
+      dedupeScope: "company",
+    });
+    const second = await svc.createWithIdempotency(companyId, escalationInput(agentIds[1], key), {
+      dedupeScope: "company",
+    });
+
+    expect(first.deduplicated).toBe(false);
+    expect(second.deduplicated).toBe(true);
+    expect(second.approval.id).toBe(first.approval.id);
+    // The requester on the surviving card is the agent that actually filed it, not the replayer.
+    expect(second.approval.requestedByAgentId).toBe(agentIds[0]);
+    const rows = await db.select().from(approvals).where(eq(approvals.companyId, companyId));
+    expect(rows).toHaveLength(1);
+  });
+
+  it("still keeps two agents' own keys apart under the default requester scope", async () => {
+    const { companyId, agentIds } = await seedCompanyWithTwoAgents();
+    const svc = approvalService(db);
+    const key = "rotate-creds:BLO-18969";
+
+    const first = await svc.createWithIdempotency(companyId, escalationInput(agentIds[0], key));
+    const second = await svc.createWithIdempotency(companyId, escalationInput(agentIds[1], key));
+
+    expect(first.deduplicated).toBe(false);
+    expect(second.deduplicated).toBe(false);
+    expect(second.approval.id).not.toBe(first.approval.id);
+    const rows = await db.select().from(approvals).where(eq(approvals.companyId, companyId));
+    expect(rows).toHaveLength(2);
+  });
+
+  it("does not replay a decided card, so a re-fired incident can raise a fresh one", async () => {
+    const { companyId, agentIds } = await seedCompanyWithTwoAgents();
+    const svc = approvalService(db);
+    const key = "harness_liveness_board:company:blocked_by_uninvokable_assignee:decided-agent";
+
+    const first = await svc.createWithIdempotency(companyId, escalationInput(agentIds[0], key), {
+      dedupeScope: "company",
+    });
+    await db
+      .update(approvals)
+      .set({ status: "withdrawn", decidedAt: new Date() })
+      .where(eq(approvals.id, first.approval.id));
+
+    const second = await svc.createWithIdempotency(companyId, escalationInput(agentIds[1], key), {
+      dedupeScope: "company",
+    });
+
+    expect(second.deduplicated).toBe(false);
+    expect(second.approval.id).not.toBe(first.approval.id);
+  });
+});
+
 describe("approvalService listSummary", () => {
   it("derives labels from redacted payload snippets instead of raw payload text", async () => {
     const row = {
@@ -739,5 +861,150 @@ describe("approval undecided-status scope stays bound across all three sites", (
     for (const clause of clauses) {
       expect(normalize(clause), `schema clause drifted: ${clause}`).toBe(expected);
     }
+  });
+});
+
+/**
+ * BLO-29085 — a budget card decided through the generic approvals surface used to
+ * mark itself terminal and leave its `budget_incidents` row `open` forever. The
+ * scope stays paused with no live card, and the stranded open row suppresses every
+ * subsequent card for the same (policy, window, threshold), so nothing re-arms it.
+ *
+ * Only `budgetService.resolveIncident` closes the pair, and it writes the approvals
+ * table directly rather than through this service — so these tests pin the refusal
+ * without touching that path. The negative cases are load-bearing: the guard is
+ * keyed on an *open incident*, not on the type, so a budget card that owns no open
+ * lifecycle must still be decidable here.
+ */
+describeEmbeddedPostgres("approvalService refuses to strand an open budget incident (BLO-29085)", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-approval-budget-incident-");
+    db = createDb(tempDb.connectionString);
+  }, 120_000);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockLogActivity.mockResolvedValue(undefined);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seedIncidentCard(incidentStatus: "open" | "resolved" | null) {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Budget incident company",
+      issuePrefix: `B${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+    });
+
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "budget_override_required",
+      status: "pending",
+      // Server-filed, exactly as the budget watcher files it.
+      requestedByAgentId: null,
+      requestedByUserId: null,
+      payload: { title: "Budget hard stop reached" },
+    });
+
+    if (incidentStatus === null) return { companyId, approvalId, incidentId: null };
+
+    const windowStart = new Date("2026-09-01T00:00:00.000Z");
+    const policyId = randomUUID();
+    await db.insert(budgetPolicies).values({
+      id: policyId,
+      companyId,
+      scopeType: "company",
+      scopeId: companyId,
+      metric: "spend",
+      windowKind: "calendar_month_utc",
+      amount: 100_000,
+      hardStopEnabled: true,
+    });
+
+    const incidentId = randomUUID();
+    await db.insert(budgetIncidents).values({
+      id: incidentId,
+      companyId,
+      policyId,
+      scopeType: "company",
+      scopeId: companyId,
+      metric: "spend",
+      windowKind: "calendar_month_utc",
+      windowStart,
+      windowEnd: new Date("2026-10-01T00:00:00.000Z"),
+      thresholdType: "hard",
+      amountLimit: 100_000,
+      amountObserved: 100_001,
+      status: incidentStatus,
+      approvalId,
+    });
+
+    return { companyId, approvalId, incidentId };
+  }
+
+  async function readStatus(approvalId: string) {
+    const [row] = await db.select().from(approvals).where(eq(approvals.id, approvalId));
+    return row.status;
+  }
+
+  for (const verb of ["approve", "reject", "withdraw"] as const) {
+    it(`refuses to ${verb} a budget card whose incident is still open, without mutating it`, async () => {
+      const { approvalId, incidentId } = await seedIncidentCard("open");
+      const svc = approvalService(db);
+
+      const call =
+        verb === "withdraw"
+          ? svc.withdraw(approvalId, "moot", withdrawalActor)
+          : svc[verb](approvalId, "board-user", "decided in the wrong place");
+
+      await expect(call).rejects.toMatchObject({
+        status: 422,
+        details: { code: "budget_incident_open", incidentId },
+      });
+
+      // The whole point: the card stays decidable where the incident lives.
+      expect(await readStatus(approvalId)).toBe("pending");
+      const [incident] = await db
+        .select()
+        .from(budgetIncidents)
+        .where(eq(budgetIncidents.id, incidentId!));
+      expect(incident.status).toBe("open");
+    });
+  }
+
+  it("names the budget route in the refusal so the caller can act on it", async () => {
+    const { companyId, approvalId, incidentId } = await seedIncidentCard("open");
+
+    await expect(
+      approvalService(db).approve(approvalId, "board-user", null),
+    ).rejects.toMatchObject({
+      details: { route: `/api/companies/${companyId}/budget-incidents/${incidentId}/resolve` },
+    });
+  });
+
+  it("still decides a budget card whose incident is already closed", async () => {
+    const { approvalId } = await seedIncidentCard("resolved");
+
+    const result = await approvalService(db).approve(approvalId, "board-user", "cap already raised");
+
+    expect(result.applied).toBe(true);
+    expect(await readStatus(approvalId)).toBe("approved");
+  });
+
+  it("still decides a caller-filed budget card that owns no incident", async () => {
+    const { approvalId } = await seedIncidentCard(null);
+
+    const result = await approvalService(db).reject(approvalId, "board-user", "not needed");
+
+    expect(result.applied).toBe(true);
+    expect(await readStatus(approvalId)).toBe("rejected");
   });
 });

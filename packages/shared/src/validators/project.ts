@@ -1,21 +1,8 @@
 import { z } from "zod";
 import { PROJECT_STATUSES, PROJECT_ICON_NAMES } from "../constants.js";
+import { executionWorkspaceStrategySchema } from "./execution-workspace.js";
 import { envConfigSchema } from "./secret.js";
 import { trustAuthorizationPolicySchema } from "./trust-policy.js";
-
-const executionWorkspaceStrategySchema = z
-  .object({
-    type: z.enum(["project_primary", "git_worktree", "adapter_managed", "cloud_sandbox"]).optional(),
-    baseRef: z.string().optional().nullable(),
-    branchTemplate: z.string().optional().nullable(),
-    worktreeParentDir: z.string().optional().nullable(),
-    provisionCommand: z.string().optional().nullable(),
-    teardownCommand: z.string().optional().nullable(),
-    // BLO-19063: opt into a per-run working tree. Omitted => "per_issue", the
-    // historical behaviour.
-    runScope: z.enum(["per_issue", "per_run"]).optional().nullable(),
-  })
-  .strict();
 
 export const projectExecutionWorkspacePolicySchema = z
   .object({

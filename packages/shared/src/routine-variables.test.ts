@@ -106,6 +106,51 @@ describe("routine variable helpers", () => {
     ]);
   });
 
+  // A scheduled fire must render the window it BELONGS to, not the instant it was
+  // dispatched: catch-up fires run minutes-to-hours late, and one catch-up pass can
+  // dispatch several slots back to back. See BLO-34348.
+  it("renders built-ins as of the supplied slot, not the current time", () => {
+    const slot = new Date("2026-09-14T18:07:00.000Z");
+    const values = getBuiltinRoutineVariableValues(slot);
+    expect(values.scheduled_at).toBe("2026-09-14T18:07:00.000Z");
+    expect(values.date).toBe("2026-09-14");
+    expect(values.timestamp).toContain("September 14, 2026");
+    // Guard against a silent regression to `new Date()`: the slot is in the past, so a
+    // "now"-based implementation cannot produce any of the three values above.
+    expect(values.date).not.toBe(new Date().toISOString().slice(0, 10));
+  });
+
+  it("renders distinct values for distinct slots dispatched by one catch-up pass", () => {
+    const first = getBuiltinRoutineVariableValues(new Date("2026-09-14T12:07:00.000Z"));
+    const second = getBuiltinRoutineVariableValues(new Date("2026-09-14T18:07:00.000Z"));
+    expect(first.scheduled_at).not.toBe(second.scheduled_at);
+    expect(first.timestamp).not.toBe(second.timestamp);
+  });
+
+  it("falls back to the current time when no slot is supplied (manual/api fires)", () => {
+    const values = getBuiltinRoutineVariableValues();
+    expect(values.date).toBe(new Date().toISOString().slice(0, 10));
+    expect(Date.parse(values.scheduled_at)).not.toBeNaN();
+  });
+
+  it("treats scheduled_at as built-in so templates need not declare it", () => {
+    expect(isBuiltinRoutineVariable("scheduled_at")).toBe(true);
+    expect(
+      syncRoutineVariablesWithTemplate("Window {{scheduled_at}} — {{repo}}", []),
+    ).toEqual([
+      { name: "repo", label: null, type: "text", defaultValue: null, required: true, options: [] },
+    ]);
+  });
+
+  it("interpolates scheduled_at into a routine title", () => {
+    expect(
+      interpolateRoutineTemplate(
+        "Agent health & stalled-issue check {{scheduled_at}}",
+        getBuiltinRoutineVariableValues(new Date("2026-09-14T18:07:00.000Z")),
+      ),
+    ).toBe("Agent health & stalled-issue check 2026-09-14T18:07:00.000Z");
+  });
+
   it("extracts snake_case variable names", () => {
     expect(extractRoutineVariableNames("Open {{pr_url}} for review")).toEqual(["pr_url"]);
   });

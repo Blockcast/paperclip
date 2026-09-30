@@ -2,13 +2,15 @@ import { Router, type Request, type Response } from "express";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
-import { REDACTED_EVENT_VALUE, redactAgentConfigPayload, redactEventPayload } from "../redaction.js";
+import { REDACTED_EVENT_VALUE, isPlainObject, maskWorkspaceRuntimeTextForRead, redactAgentConfigPayload, redactEventPayload } from "../redaction.js";
+import { diffAgentAdapterSecretBindings } from "../services/agent-secret-bindings.js";
 import { agentRuntimeState, agents as agentsTable, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
 import { and, asc, desc, eq, gte, inArray, not, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   agentSkillSyncSchema,
   agentMineInboxQuerySchema,
+  agentMeRecoveryActionsQuerySchema,
   ADAPTER_AGNOSTIC_KEYS,
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
   createAgentKeySchema,
@@ -99,6 +101,7 @@ import {
   resolveWorktreeRunExecutionActivationState,
 } from "../services/instance-settings.js";
 import { loadAgentInboxLite } from "../services/agent-inbox-lite.js";
+import { recoveryObservabilityService } from "../services/recovery-observability.js";
 import { logger } from "../middleware/logger.js";
 import { runClaudeLogin } from "@paperclipai/adapter-claude-local/server";
 import { DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX } from "@paperclipai/adapter-codex-local";
@@ -112,9 +115,11 @@ import {
 } from "../services/default-agent-instructions.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
+import { evaluateAgentIssueApprovalLinkAuthorization } from "./issue-approval-link-authorization.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { resolveCoreTrustPreset } from "../services/trust-preset-resolver.js";
 import { readObject } from "../lib/objects.js";
+import { publicWorkspaceOperations, resolveWorkspaceRuntimeViewer } from "./workspace-response.js";
 import { listInvalidOrgChainDescendantIds } from "../services/agent-invokability.js";
 import {
   AGENT_PROFILE_CHANGE_CONSENT_FIELDS,
@@ -148,14 +153,21 @@ export function isRedactedEnvBinding(binding: unknown): boolean {
 const OMIT_REDACTED_ADAPTER_VALUE = Symbol("omit-redacted-adapter-value");
 
 function containsRedactedAdapterValue(value: unknown): boolean {
-  if (value === REDACTED_EVENT_VALUE) return true;
+  if (typeof value === "string") return value.includes(REDACTED_EVENT_VALUE);
   if (Array.isArray(value)) return value.some(containsRedactedAdapterValue);
   if (!value || typeof value !== "object") return false;
   return Object.values(value as Record<string, unknown>).some(containsRedactedAdapterValue);
 }
 
 function restoreRedactedAdapterValue(incoming: unknown, existing: unknown): unknown {
-  if (incoming === REDACTED_EVENT_VALUE) {
+  // PEN-2747: the URI-credential rule masks only the credential *component* of
+  // a URL, so the round-tripped value is `https://user:***REDACTED***@host/mcp`
+  // — a string that merely CONTAINS the sentinel rather than equalling it. An
+  // equality test misses it and persists a broken upstream URL, which is the
+  // BLO-5xxx failure mode described above (a sentinel written back into live
+  // config killed every run) with a different shape. Substring-test instead:
+  // no legitimate configured value contains this sentinel.
+  if (typeof incoming === "string" && incoming.includes(REDACTED_EVENT_VALUE)) {
     return existing === undefined ? OMIT_REDACTED_ADAPTER_VALUE : existing;
   }
   if (
@@ -355,31 +367,65 @@ export function agentRoutes(
   const instanceSettings = instanceSettingsService(db);
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
 
-  async function logRunLogAccessAudit(
+  /**
+   * BLO-34631. Shared by both raw-log surfaces. `/workspace-operations/:id/log` serves the same
+   * class of bytes as `/heartbeat-runs/:runId/log` — stored log content, not a projected row — and
+   * was the only one of the four run/operation log surfaces writing no audit record at all, so
+   * "who read this log" had no answer for it. Both call sites audit allowed AND denied reads.
+   */
+  async function logLogAccessAudit(
     req: Request,
-    run: { id: string; companyId: string; logStore: string | null },
+    entity: {
+      companyId: string;
+      entityType: "heartbeat_run" | "workspace_operation";
+      entityId: string;
+      runId: string | null;
+      logStore: string | null;
+    },
     result: "allowed" | "denied",
-    opts: { offset: number; limitBytes: number },
+    opts: { offset: number; limitBytes: number; withheld?: boolean },
   ) {
     const actor = getRunLogAuditActor(req);
     await logActivity(db, {
-      companyId: run.companyId,
+      companyId: entity.companyId,
       actorType: actor.actorType,
       actorId: actor.actorId,
       agentId: actor.agentId,
-      runId: run.id,
-      action: "heartbeat.run_log_accessed",
-      entityType: "heartbeat_run",
-      entityId: run.id,
+      runId: entity.runId,
+      action: entity.entityType === "heartbeat_run"
+        ? "heartbeat.run_log_accessed"
+        : "workspace_operation.log_accessed",
+      entityType: entity.entityType,
+      entityId: entity.entityId,
       details: {
         result,
         actorSource: actor.actorSource,
         actorRunId: actor.actorRunId,
         offset: opts.offset,
         limitBytes: opts.limitBytes,
-        logStore: run.logStore,
+        logStore: entity.logStore,
+        // BLO-34631 review: a withheld read and a real disclosure are both `result: "allowed"` —
+        // the access check decides reachability, the entitlement decides the bytes. Record which
+        // one happened so "who read this log" is answerable without re-deriving the reader's
+        // grants after the fact. Absent on surfaces that apply no read-time projection.
+        ...(opts.withheld === undefined ? {} : { withheld: opts.withheld }),
       },
     });
+  }
+
+  async function logRunLogAccessAudit(
+    req: Request,
+    run: { id: string; companyId: string; logStore: string | null },
+    result: "allowed" | "denied",
+    opts: { offset: number; limitBytes: number },
+  ) {
+    await logLogAccessAudit(req, {
+      companyId: run.companyId,
+      entityType: "heartbeat_run",
+      entityId: run.id,
+      runId: run.id,
+      logStore: run.logStore,
+    }, result, opts);
   }
 
   async function assertAgentEnvironmentSelection(
@@ -1220,6 +1266,76 @@ export function agentRoutes(
     return Array.from(new Set(values));
   }
 
+  /**
+   * BLO-24699: the third door to a row in `issue_approvals`.
+   *
+   * `POST /companies/:companyId/agent-hires` links its `sourceIssueIds` through the
+   * same `linkManyForApproval` as the other two routes, which validates only that
+   * each id exists in the approval's company — the BLO-23763 hole, a third time.
+   * This route's `agents:create` gate happens to admit only the population the old
+   * `assertCanManageIssueApprovalLinks` gate did (2 of 16 agents on this company's
+   * roster), which bounds the exposure but does not close it: nothing stopped a
+   * hire approval from being attached to an issue its filer has no authority over.
+   *
+   * Evaluated through the shared evaluator so all three doors agree. Ids that do
+   * not resolve, or resolve into another company, are passed through untouched —
+   * `linkManyForApproval` already rejects those, and duplicating that here would
+   * change this route's error semantics for a case that is not an authorization
+   * question. This mirrors `assertIssueLinksAllowed` in `approvals.ts`.
+   *
+   * The evaluator's *status* is preserved, not just its verdict: an issue that is
+   * `in_progress` under another agent's checkout is a **retryable** refusal, and the
+   * other two doors report it as 409. Collapsing that to 403 here would tell a
+   * caller its hire can never succeed when in fact it succeeds once the other
+   * agent's checkout ends. A mixed set takes the stricter reading, 403 — "retry
+   * this" is only true if every refusal clears on its own — with each entry's own
+   * status retained in `details.refusals`.
+   */
+  async function assertHireSourceIssueLinksAllowed(
+    req: Request,
+    companyId: string,
+    sourceIssueIds: string[],
+  ) {
+    if (req.actor.type !== "agent" || sourceIssueIds.length === 0) return;
+    const issuesSvc = issueService(db);
+    const refusals: Array<{ issueId: string; status: 403 | 409 } & Record<string, unknown>> = [];
+    for (const issueId of sourceIssueIds) {
+      const issue = await issuesSvc.getById(issueId);
+      if (!issue || issue.companyId !== companyId) continue;
+      const verdict = await evaluateAgentIssueApprovalLinkAuthorization({ access, db }, req, issue);
+      if (verdict.allowed) continue;
+      refusals.push({
+        issueId,
+        status: verdict.status,
+        reason: verdict.reason,
+        boundary: verdict.boundary,
+        error: verdict.error,
+      });
+    }
+    if (refusals.length === 0) return;
+
+    const everyRefusalIsCheckoutConflict = refusals.every((refusal) => refusal.status === 409);
+    const refusedIssueIds = refusals.map((refusal) => refusal.issueId);
+    const details = {
+      companyId,
+      refusedIssueIds,
+      refusals,
+      securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+    };
+    if (everyRefusalIsCheckoutConflict) {
+      throw conflict(
+        "Hire approval cannot be linked to issues checked out by another agent: " +
+          refusedIssueIds.join(", "),
+        details,
+      );
+    }
+    throw forbidden(
+      "Hire approval cannot be linked to issues this actor is not authorized on: " +
+        refusedIssueIds.join(", "),
+      details,
+    );
+  }
+
   function asRecord(value: unknown): Record<string, unknown> | null {
     if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
     return value as Record<string, unknown>;
@@ -1416,9 +1532,29 @@ export function agentRoutes(
     return entries;
   }
 
-  function assertNoAgentRuntimeConfigAdapterConfigMutation(req: Request, runtimeConfig: unknown) {
+  /**
+   * A model profile's adapterConfig is not synced to `company_secret_bindings`
+   * — only the agent's top-level `adapterConfig` is (`syncAgentSecretBindings`)
+   * — so a binding declared here creates no row and fails closed at runtime on
+   * `binding_missing`. The guard runs anyway as defence in depth against a
+   * future sync, and pairs each profile with its stored counterpart so an
+   * unchanged round-trip is not refused. Removal is deliberately not checked:
+   * there is no row for it to delete.
+   */
+  function assertNoAgentRuntimeConfigAdapterConfigMutation(
+    req: Request,
+    runtimeConfig: unknown,
+    existingRuntimeConfig?: unknown,
+  ) {
+    const existingByProfileKey = new Map(
+      listRuntimeModelProfileAdapterConfigs(existingRuntimeConfig).map((entry) =>
+        [entry.profileKey, entry.adapterConfig] as const,
+      ),
+    );
     for (const entry of listRuntimeModelProfileAdapterConfigs(runtimeConfig)) {
-      assertNoAgentAdapterConfigMutation(req, entry.adapterConfig, entry.path);
+      assertNoAgentAdapterConfigMutation(req, entry.adapterConfig, entry.path, {
+        existingAdapterConfig: existingByProfileKey.get(entry.profileKey) ?? null,
+      });
     }
   }
 
@@ -1427,6 +1563,7 @@ export function agentRoutes(
     adapterType: string | null | undefined;
     adapterConfig: Record<string, unknown>;
     constraintAdapterConfig?: Record<string, unknown>;
+    actor?: { userId?: string | null; agentId?: string | null };
   }): Promise<Record<string, unknown>> {
     const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
       input.companyId,
@@ -1434,6 +1571,7 @@ export function agentRoutes(
       {
         strictMode: strictSecretsMode,
         adapterType: input.adapterType ?? null,
+        actor: input.actor,
       },
     );
     await assertAdapterConfigConstraints(
@@ -1450,6 +1588,7 @@ export function agentRoutes(
     adapterType: string,
     runtimeConfig: Record<string, unknown>,
     baseAdapterConfig: Record<string, unknown>,
+    actor?: { userId?: string | null; agentId?: string | null },
   ): Promise<Record<string, unknown>> {
     const entries = listRuntimeModelProfileAdapterConfigs(runtimeConfig);
     if (entries.length === 0) return runtimeConfig;
@@ -1467,6 +1606,7 @@ export function agentRoutes(
         companyId,
         adapterType,
         adapterConfig: entry.adapterConfig,
+        actor,
         constraintAdapterConfig: {
           ...baseAdapterConfig,
           ...adapterDefaultConfig,
@@ -1733,14 +1873,45 @@ export function agentRoutes(
     );
   }
 
+  /**
+   * An agent must not be able to change its own instructions path or bundle
+   * configuration — that is a rewrite of its own operating instructions.
+   *
+   * This compares each instructions key the write would persist against the
+   * value already stored and refuses only a difference. A presence test is
+   * wrong here for the same reason it was wrong for secret bindings: on
+   * `PATCH /agents/:id` this guard also runs against the *effective* config,
+   * which `resolveRawEffectiveAdapterConfigForPatch` shallow-merges onto the
+   * stored config precisely to preserve these keys. Every bundle-managed agent
+   * therefore carried its whole `KNOWN_INSTRUCTIONS_BUNDLE_KEYS` set into the
+   * guard, so any agent-authored `adapterConfig` write — one naming no
+   * instructions key at all, or a verbatim no-op round-trip — was refused with
+   * a message listing keys the caller never sent (BLO-32332). There was no
+   * request shape that could pass.
+   *
+   * Check the value that is actually persisted, not just the request: on
+   * `PATCH /agents/:id` the persisted config is the output of
+   * `syncInstructionsBundleConfigFromFilePath`, which re-derives the bundle
+   * keys from `instructionsFilePath` and resolves a relative one against
+   * `adapterConfig.cwd` — a key with no agent-actor guard of its own. So that
+   * call site runs this guard a second time on the post-sync result.
+   *
+   * `existingAdapterConfig` is omitted on create and hire, where there is no
+   * prior state and every key present is therefore a change. Removal is not
+   * checked here: a merge cannot drop a key, and the `replaceAdapterConfig`
+   * path that can routes through `assertCanManageInstructionsPath` instead.
+   */
   function assertNoAgentInstructionsConfigMutation(
     req: Request,
     adapterConfig: Record<string, unknown> | null | undefined,
     path = "adapterConfig",
+    existingAdapterConfig?: Record<string, unknown> | null,
   ) {
     if (req.actor.type !== "agent" || !adapterConfig) return;
+    const existing = existingAdapterConfig ?? {};
     const changedSensitiveKeys = KNOWN_INSTRUCTIONS_BUNDLE_KEYS
-      .filter((key) => adapterConfig[key] !== undefined)
+      .filter((key) => adapterConfig[key] !== undefined
+        && JSON.stringify(adapterConfig[key]) !== JSON.stringify(existing[key]))
       .map((key) => `${path}.${key}`);
     if (changedSensitiveKeys.length === 0) return;
     throw forbidden(
@@ -1752,12 +1923,121 @@ export function agentRoutes(
     return KNOWN_INSTRUCTIONS_BUNDLE_KEYS.some((key) => adapterConfig[key] !== undefined);
   }
 
+  /**
+   * An agent must not be able to create, modify, or remove its own secret
+   * bindings (BLO-27991).
+   *
+   * `PATCH /agents/:id` carrying only `adapterConfig` takes the weak
+   * authorization branch (`allow_self`, no change grant), and the sync path it
+   * feeds — `syncAgentAdapterEnvBindings` -> `syncSecretRefsForTarget` — only
+   * checks that the referenced secret is in the same company. Without this
+   * guard any agent can mint a `company_secret_bindings` row pointing at any
+   * company secret and have it projected into its own pod, because the runtime
+   * re-check (`assertBindingContext`) validates against that very row.
+   *
+   * This compares the bindings the write would persist against the bindings
+   * already stored, and refuses only a difference. A blanket refusal of any
+   * request *carrying* a binding is wrong in both directions:
+   *
+   *  - It 403s the honest round-trip. An agent-facing GET masks only the
+   *    top-level `env` map to `***`; a `secret_ref` outside `env`, and every
+   *    binding from `redactAgentConfiguration`, comes back as a readable
+   *    pointer by design (`redaction.ts`). So read-modify-write does echo
+   *    literal bindings, and `stripRedactedEnvBindingsFromAdapterConfig`
+   *    restores sentinels only — never a literal pointer.
+   *  - It misses removal. `syncSecretRefsForTarget` runs `replaceAll: true`,
+   *    so dropping a key deletes its row; the only way past a blanket refusal
+   *    is to drop the key, which is itself an unauthorized mutation.
+   *
+   * `existingAdapterConfig` is omitted on create and hire, where there is no
+   * prior state and every binding is therefore a creation. Board and system
+   * actors are unaffected, as are the service-internal callers (company-package
+   * import, built-in agent reconciler) that bypass this route.
+   */
+  function assertNoAgentSecretBindingMutation(
+    req: Request,
+    adapterConfig: Record<string, unknown> | null | undefined,
+    path = "adapterConfig",
+    existingAdapterConfig?: Record<string, unknown> | null,
+  ) {
+    if (req.actor.type !== "agent") return;
+    const changedPaths = diffAgentAdapterSecretBindings(
+      existingAdapterConfig ?? null,
+      adapterConfig ?? null,
+    );
+    if (changedPaths.length === 0) return;
+    throw forbidden(
+      "Agent-authenticated callers cannot create, modify, or remove secret bindings "
+        + `(${changedPaths.map((bindingPath) => `${path}.${bindingPath}`).join(", ")}). `
+        + "Secret bindings must be configured by a board actor.",
+    );
+  }
+
+  /**
+   * The adapterConfig a `PATCH /agents/:id` would persist, before server-side
+   * normalization: sentinel env values already restored from stored state by
+   * the caller, shallow-merged onto the stored config unless the request asked
+   * to replace it, then adapter-agnostic and instructions-bundle keys carried
+   * over when the adapter type changes.
+   *
+   * Shared by the agent secret-binding guard and the persistence path so the
+   * two cannot drift. A guard that models the merge differently from the writer
+   * either refuses honest requests — every omitted key reads as a removal — or
+   * misses real ones.
+   */
+  function resolveRawEffectiveAdapterConfigForPatch(input: {
+    existingAdapterConfig: Record<string, unknown>;
+    requestedAdapterConfig: Record<string, unknown> | null;
+    replaceAdapterConfig: boolean;
+    changingAdapterType: boolean;
+  }): Record<string, unknown> {
+    const { existingAdapterConfig, requestedAdapterConfig } = input;
+    let effective = requestedAdapterConfig ?? existingAdapterConfig;
+    if (requestedAdapterConfig && !input.changingAdapterType && !input.replaceAdapterConfig) {
+      effective = { ...existingAdapterConfig, ...requestedAdapterConfig };
+    }
+    if (input.changingAdapterType) {
+      // Preserve adapter-agnostic keys (env, cwd, etc.) from the existing config
+      // when the adapter type changes. Without this, a PATCH that includes
+      // adapterConfig but omits these keys would silently drop them.
+      for (const key of ADAPTER_AGNOSTIC_KEYS) {
+        if (KNOWN_INSTRUCTIONS_BUNDLE_KEY_SET.has(key)) continue;
+        if (effective[key] === undefined && existingAdapterConfig[key] !== undefined) {
+          effective = { ...effective, [key]: existingAdapterConfig[key] };
+        }
+      }
+      effective = preserveInstructionsBundleConfig(existingAdapterConfig, effective);
+    }
+    return effective;
+  }
+
   function assertNoAgentAdapterConfigMutation(
     req: Request,
     adapterConfig: Record<string, unknown>,
     path = "adapterConfig",
+    options?: {
+      /** Stored config the binding diff is taken against. Omit on create/hire. */
+      existingAdapterConfig?: Record<string, unknown> | null;
+      /**
+       * Config that will actually be persisted, when it differs from the raw
+       * request body — a PATCH shallow-merges onto the stored config, so the
+       * request alone understates what survives and overstates what is removed.
+       */
+      effectiveAdapterConfig?: Record<string, unknown> | null;
+    },
   ) {
-    assertNoAgentInstructionsConfigMutation(req, adapterConfig, path);
+    assertNoAgentInstructionsConfigMutation(
+      req,
+      adapterConfig,
+      path,
+      options?.existingAdapterConfig ?? null,
+    );
+    assertNoAgentSecretBindingMutation(
+      req,
+      options?.effectiveAdapterConfig ?? adapterConfig,
+      path,
+      options?.existingAdapterConfig ?? null,
+    );
     assertNoAgentHostWorkspaceCommandMutation(
       req,
       collectAgentAdapterWorkspaceCommandPaths(adapterConfig, path),
@@ -1849,12 +2129,68 @@ export function agentRoutes(
     };
   }
 
+  /**
+   * The desired-skill keys an agent already carries in its persisted config.
+   *
+   * An unresolvable key cannot be canonicalized — it matches no library row, so
+   * there is nothing to canonicalize it against. A trimmed exact compare against
+   * the stored keys is therefore both the only comparison available and the
+   * correct one: it answers "did *this* write introduce the key?", which is the
+   * distinction the reject-vs-tolerate rule turns on. `readPaperclipSkillSyncPreference`
+   * already trims, so both sides of the compare are normalized identically.
+   */
+  function storedDesiredSkillKeys(adapterConfig: unknown): Set<string> {
+    const config = asRecord(adapterConfig);
+    if (!config) return new Set<string>();
+    return new Set(readPaperclipSkillSyncPreference(config).desiredSkills);
+  }
+
+  /**
+   * Reject desired-skill keys that this write *introduces* and that resolve to
+   * no company-skill row, while continuing to tolerate keys the agent already
+   * carried (BLO-7991).
+   *
+   * Both halves matter. Tolerating everything is how `garrytan/gstack/design-shotgun`
+   * — a key that named a catalog entry which never existed, because the skill was
+   * published upstream five days after the catalog's pinned import ref — was
+   * accepted in silence and then simply failed to materialize at pod start, with
+   * no error on any surface. Tolerating *nothing* is worse: a key whose library
+   * row was deleted after the fact would 422 every subsequent save, so the agent
+   * could neither run nor have the offending key removed, since removing it takes
+   * a successful write. Splitting on "introduced by this write" keeps stale keys
+   * visible and removable and still fails the never-resolvable case at the point
+   * where the caller is present to fix it.
+   */
+  function assertNoUnresolvableNewDesiredSkills(
+    unresolvedKeys: readonly string[],
+    previouslyDesiredKeys: ReadonlySet<string>,
+  ) {
+    const introduced = unresolvedKeys
+      .filter((key) => !previouslyDesiredKeys.has(key))
+      .sort();
+    if (introduced.length === 0) return;
+    throw unprocessable(
+      `Unknown desired skill${introduced.length > 1 ? "s" : ""}: ${introduced.join(", ")}. `
+      + "No matching skill exists in this company's library — import the skill first "
+      + "(POST /api/companies/:companyId/skills/import), then set it as desired.",
+    );
+  }
+
   async function resolveDesiredSkillAssignment(
     companyId: string,
     adapterType: string,
     adapterConfig: Record<string, unknown>,
     requestedDesiredSkills: AgentDesiredSkillEntry[] | undefined,
-    options: { tolerateUnknownDesiredSkills?: boolean } = {},
+    options: {
+      tolerateUnknownDesiredSkills?: boolean;
+      /**
+       * Keys the agent already carries. When supplied alongside
+       * `tolerateUnknownDesiredSkills`, tolerance narrows to exactly these —
+       * anything else unresolvable is a newly-introduced dangling key and is
+       * rejected instead of silently persisted.
+       */
+      previouslyDesiredKeys?: ReadonlySet<string>;
+    } = {},
   ) {
     if (!requestedDesiredSkills) {
       return {
@@ -1869,6 +2205,12 @@ export function agentRoutes(
       await companySkills.resolveRequestedSkillEntries(companyId, requestedDesiredSkills, {
         tolerateUnknownReferences: options.tolerateUnknownDesiredSkills,
       });
+    if (options.previouslyDesiredKeys) {
+      assertNoUnresolvableNewDesiredSkills(
+        unresolvedDesiredSkillKeys,
+        options.previouslyDesiredKeys,
+      );
+    }
     // Runtime materialization + version selection only ever consider skills that
     // actually resolve to the company library; stale keys can't be materialized.
     const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(companyId, {
@@ -1905,6 +2247,35 @@ export function agentRoutes(
   }
 
   /**
+   * The one admission gate for anything agent-config-shaped on its way out.
+   *
+   * `redactAgentConfigPayload` — and `sanitizeValue` beneath it — sanitize only
+   * `isPlainObject` values and return anything else *by reference*. A caller
+   * that admits on a weaker "is it an object" test, or hands the value straight
+   * in with no gate, therefore has a fail-open the redactor cannot see: it gets
+   * the raw value back and serializes it.
+   *
+   * The obvious repair — swap the caller's predicate to `isPlainObject` — does
+   * not work where the assignment sits inside the gate, as in
+   * `redactAgentSecrets`: a failing gate just leaves the raw value on the
+   * `{ ...agent }` spread, so the same bytes reach the wire by a different
+   * route. Containment has to be *written back*, which is why this returns a
+   * value rather than answering a question.
+   *
+   *   `undefined` — not object-like (`null`, `undefined`, a primitive). No
+   *                 config to contain; each caller keeps its own absence
+   *                 contract for these.
+   *   `{}`        — an object this file cannot sanitize (array or foreign
+   *                 prototype). Withheld rather than emitted uncontained.
+   *   otherwise   — the redacted record.
+   */
+  function containAgentConfig(value: unknown): Record<string, unknown> | undefined {
+    if (typeof value !== "object" || value === null) return undefined;
+    if (!isPlainObject(value)) return {};
+    return redactAgentConfigPayload(value) ?? {};
+  }
+
+  /**
    * Strip credential material out of an agent row before it goes on the wire.
    *
    * `adapterConfig` holds live secrets — `{type:"plain",value}` env bindings and
@@ -1928,10 +2299,15 @@ export function agentRoutes(
    */
   function redactAgentSecrets<T extends { adapterConfig?: unknown; runtimeConfig?: unknown }>(agent: T): T {
     let result = { ...agent };
-    const config = asRecord(agent.adapterConfig);
-    if (config) {
-      const redactedConfig = redactAgentConfigPayload(config) ?? {};
-      const env = asRecord(config.env);
+    // `containAgentConfig`, not the local `asRecord`: `asRecord` admits any
+    // non-array object, and for a foreign-prototype config the redactor handed
+    // the argument straight back, so `result.adapterConfig` was assigned the
+    // raw record. See the helper for why swapping the predicate alone would
+    // have moved the leak rather than closed it.
+    const rawConfig = agent.adapterConfig;
+    const containedConfig = containAgentConfig(rawConfig);
+    if (containedConfig) {
+      const env = isPlainObject(rawConfig) ? asRecord(rawConfig.env) : null;
       if (env) {
         // The top-level env keeps the shorter `***` sentinel the UI and
         // `stripRedactedEnvBindingsFromAdapterConfig` have always round-tripped.
@@ -1939,14 +2315,14 @@ export function agentRoutes(
         for (const key of Object.keys(env)) {
           redactedEnv[key] = REDACTED_ENV_SENTINEL;
         }
-        result.adapterConfig = { ...redactedConfig, env: redactedEnv } as T["adapterConfig"];
+        result.adapterConfig = { ...containedConfig, env: redactedEnv } as T["adapterConfig"];
       } else {
-        result.adapterConfig = redactedConfig as T["adapterConfig"];
+        result.adapterConfig = containedConfig as T["adapterConfig"];
       }
     }
-    const rtConfig = asRecord(agent.runtimeConfig);
-    if (rtConfig) {
-      result.runtimeConfig = redactAgentConfigPayload(rtConfig) as T["runtimeConfig"];
+    const containedRuntime = containAgentConfig(agent.runtimeConfig);
+    if (containedRuntime) {
+      result.runtimeConfig = containedRuntime as T["runtimeConfig"];
     }
     return result;
   }
@@ -1963,32 +2339,85 @@ export function agentRoutes(
       status: agent.status,
       reportsTo: agent.reportsTo,
       adapterType: agent.adapterType,
-      adapterConfig: redactAgentConfigPayload(agent.adapterConfig),
-      runtimeConfig: redactAgentConfigPayload(agent.runtimeConfig),
+      adapterConfig: containAgentConfig(agent.adapterConfig) ?? null,
+      runtimeConfig: containAgentConfig(agent.runtimeConfig) ?? null,
       permissions: agent.permissions,
       updatedAt: agent.updatedAt,
     };
   }
 
+  /**
+   * Contain the WHOLE snapshot, not three named fields.
+   *
+   * This used to spread the stored row and override `adapterConfig`,
+   * `runtimeConfig` and `metadata`. That list is complete for the shape
+   * `buildConfigSnapshot` emits today, so it did not leak — but it fails open
+   * the moment a config-bearing field is added to the snapshot and this line is
+   * not revisited in the same commit. It is the same drift that produced doors
+   * #12 and #13 on PEN-2370, where a projection's withholding list was correct
+   * when written and silently stopped covering what it projected.
+   *
+   * The stakes here are higher than for a live-agent read, because the row this
+   * projects is stored *pre-redaction* by `buildConfigSnapshot`, which uses the
+   * name-based `sanitizeRecord` rather than the structural one — so an
+   * ordinary-keyed value like `env.FOO` is genuinely at rest in the clear and
+   * this projection is the only thing masking it on the way out.
+   *
+   * `redactAgentConfigPayload` recurses, so an `env`/`headers` map or a
+   * `{type:"plain",value}` binding is masked at any depth under any parent key,
+   * including one added after this comment was written. That also closes an
+   * array-shaped hole in the old `metadata` branch: `typeof x === "object"` is
+   * true for an array, and `redactAgentConfigPayload` returns a non-plain-object
+   * argument unchanged, so an array-valued `metadata` was passed through
+   * verbatim. `sanitizeValue` maps arrays element-wise.
+   *
+   * Note the polarity of `redactAgentConfiguration` directly above: it
+   * enumerates its output, so a new agent column cannot ship by accident. Same
+   * material, same file — these two should share a default, and now do.
+   */
   function redactRevisionSnapshot(snapshot: unknown): Record<string, unknown> {
-    if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return {};
-    const record = snapshot as Record<string, unknown>;
+    // Gate on `isPlainObject`, NOT the local `asRecord`. `asRecord` admits any
+    // non-null non-array object, while `redactAgentConfigPayload` sanitizes only
+    // plain objects and otherwise returns its argument *by reference*
+    // (`redaction.ts`). Admitting on the wider test would let a foreign-prototype
+    // snapshot through uncontained: `contained` would BE `record`, the spread
+    // would emit it verbatim, and the three lines below would only be reshaping.
+    // Not reachable from today's callers — both snapshots come from `jsonb` via
+    // `JSON.parse`, which always yields `Object.prototype` objects — but a
+    // containment function resting on an unstated assumption about the shape it
+    // is handed is the exact defect class this function exists to close, so the
+    // admit gate and the sanitize gate share one predicate instead.
+    if (!isPlainObject(snapshot)) return {};
+    // `?? {}` is a type narrowing, not a live branch: `containAgentConfig`
+    // returns `undefined` only for a non-object, which the gate above has
+    // already excluded.
+    const contained = containAgentConfig(snapshot) ?? {};
+    const meta = contained.metadata;
     return {
-      ...record,
-      adapterConfig: redactAgentConfigPayload(
-        typeof record.adapterConfig === "object" && record.adapterConfig !== null
-          ? (record.adapterConfig as Record<string, unknown>)
-          : {},
-      ),
-      runtimeConfig: redactAgentConfigPayload(
-        typeof record.runtimeConfig === "object" && record.runtimeConfig !== null
-          ? (record.runtimeConfig as Record<string, unknown>)
-          : {},
-      ),
+      // Shape contract preserved exactly: absent or non-object config still
+      // normalizes to `{}`, and absent metadata still to `null`. These sub-field
+      // gates are `isPlainObject` for the same reason as above — `sanitizeValue`
+      // also passes a nested non-plain object through unchanged, so the mismatch
+      // recurs one level down.
+      ...contained,
+      adapterConfig: isPlainObject(contained.adapterConfig) ? contained.adapterConfig : {},
+      runtimeConfig: isPlainObject(contained.runtimeConfig) ? contained.runtimeConfig : {},
+      // `metadata` is NOT coerced to a record: an array-valued `metadata` must
+      // survive as the element-wise-sanitized array `sanitizeValue` produced,
+      // not be flattened to `null`. But it must still fail closed the same way
+      // the two lines above do. `metadata` matches no tier and no special case
+      // in `sanitizeRecord`, so it reaches `sanitizeValue`, which returns a
+      // non-plain non-array object BY REFERENCE — a foreign-prototype
+      // `metadata` arrived in `contained` unsanitized and `?? null` emitted it
+      // verbatim. Arrays and plain objects have been sanitized and pass; a
+      // primitive carries no binding for `sanitizeValue` to have missed and any
+      // string has already been through `redactUriCredentialsInValue`;
+      // everything else is withheld.
       metadata:
-        typeof record.metadata === "object" && record.metadata !== null
-          ? redactAgentConfigPayload(record.metadata as Record<string, unknown>)
-          : record.metadata ?? null,
+        meta === null || meta === undefined ? null
+        : typeof meta !== "object" ? meta
+        : isPlainObject(meta) || Array.isArray(meta) ? meta
+        : null,
     };
   }
 
@@ -2214,8 +2643,13 @@ export function agentRoutes(
         requestedSkills,
         // Toggling a resolvable skill must not fail just because the agent
         // already carries stale desired keys (e.g. a skill removed from the
-        // library). Preserve those keys so they remain visible/removable.
-        { tolerateUnknownDesiredSkills: true },
+        // library). Preserve those keys so they remain visible/removable —
+        // but scope that tolerance to the keys already stored, so this write
+        // cannot introduce a brand-new dangling key (BLO-7991).
+        {
+          tolerateUnknownDesiredSkills: true,
+          previouslyDesiredKeys: storedDesiredSkillKeys(agent.adapterConfig),
+        },
       );
       if (!desiredSkills || !desiredSkillEntries || !runtimeSkillEntries) {
         throw unprocessable("Skill sync requires desiredSkills.");
@@ -2476,7 +2910,54 @@ export function agentRoutes(
           "inbox-lite: withheld issue already held by another live run of this agent",
         );
       },
+      onWithheldForeignScheduledRetry: (issue, holder) => {
+        logger.info(
+          {
+            agentId: req.actor.agentId,
+            issueId: issue.id,
+            identifier: issue.identifier,
+            callerRunId,
+            holdingRunId: holder.runId,
+            scheduledRetryAt: holder.scheduledRetryAt,
+            scheduledRetryReason: holder.scheduledRetryReason,
+          },
+          "inbox-lite: withheld issue attended by another run of this agent parked on a scheduled retry",
+        );
+      },
     }));
+  });
+
+  // PEN-2756: a recovery action names an OWNER agent and a `nextAction` addressed
+  // to that owner, so it is a real assigned obligation — but every agent-facing
+  // surface for it is keyed by ISSUE, not by owner. `inbox-lite` does carry
+  // `activeRecoveryAction`, yet only for rows the agent is the ASSIGNEE of, and a
+  // beacon routinely lands on a row assigned to someone else (escalation reassigns
+  // away from the stranded agent). The owner's sweep therefore reads clean while
+  // the obligation is live, and the only way to find it was to scan every issue in
+  // the company.
+  //
+  // The owner-filtered query already existed (`recoveryObservability.listActions`)
+  // but only behind the company-wide dashboard route, which has no self-scoping and
+  // requires the caller to already know its own agent id. This is that same query,
+  // self-scoped from the authenticated actor — deliberately a SIBLING of
+  // `inbox-lite` rather than extra rows inside it, because inbox-lite rows are
+  // offered work that consumers check out, and these rows are someone else's issue.
+  router.get("/agents/me/recovery-actions", async (req, res) => {
+    if (req.actor.type !== "agent" || !req.actor.agentId || !req.actor.companyId) {
+      res.status(401).json({ error: "Agent authentication required" });
+      return;
+    }
+
+    const query = agentMeRecoveryActionsQuerySchema.parse(req.query);
+    const actions = await recoveryObservabilityService(db).listActions(req.actor.companyId, {
+      ownerAgentId: req.actor.agentId,
+      status: query.status,
+      kind: query.kind,
+      limit: query.limit,
+      offset: query.offset,
+      order: query.order,
+    });
+    res.json(actions);
   });
 
   router.get("/agents/me/inbox/mine", async (req, res) => {
@@ -2655,6 +3136,7 @@ export function agentRoutes(
     const companyId = req.params.companyId as string;
     await assertCanCreateAgentsForCompany(req, companyId);
     const sourceIssueIds = parseSourceIssueIds(req.body);
+    const actor = getActorInfo(req);
     const {
       desiredSkills: requestedDesiredSkills,
       instructionsBundle,
@@ -2693,7 +3175,9 @@ export function agentRoutes(
       companyId,
       adapterType: hireInput.adapterType,
       adapterConfig: desiredSkillAssignment.adapterConfig,
+      actor: req.actor,
     });
+    assertNoAgentAdapterConfigMutation(req, normalizedAdapterConfig);
     const requestedRuntimeConfig = normalizeNewAgentRuntimeConfig(hireInput.runtimeConfig, hireInput.adapterType);
     assertExternalLifecycleConcurrencyPolicy(hireInput.adapterType, requestedRuntimeConfig);
     const normalizedRuntimeConfig = await normalizeRuntimeConfigAdapterConfigsForPersistence(
@@ -2701,6 +3185,7 @@ export function agentRoutes(
       hireInput.adapterType,
       requestedRuntimeConfig,
       normalizedAdapterConfig,
+      req.actor,
     );
     const normalizedHireInput = {
       ...hireInput,
@@ -2719,6 +3204,15 @@ export function agentRoutes(
     }
 
     const requiresApproval = company.requireBoardApprovalForNewAgents;
+    // BLO-24699: only the approval-creating path links `sourceIssueIds`, so only it
+    // is authorized. When the company does not require board approval the ids are
+    // discarded and no `issue_approvals` row is ever created — refusing the hire
+    // there would deny a legitimate agent creation over a link that was never going
+    // to happen. Runs after `requiresApproval` is known but before `svc.create`, so
+    // a refusal never leaves a persisted agent behind.
+    if (requiresApproval) {
+      await assertHireSourceIssueLinksAllowed(req, companyId, sourceIssueIds);
+    }
     const status = requiresApproval ? "pending_approval" : "idle";
     const createdAgent = await svc.create(companyId, {
       id: hiredAgentId,
@@ -2730,8 +3224,6 @@ export function agentRoutes(
     const agent = await materializeDefaultInstructionsBundleForNewAgent(createdAgent, instructionsBundle);
 
     let approval: Awaited<ReturnType<typeof approvalsSvc.getById>> | null = null;
-    const actor = getActorInfo(req);
-
     if (requiresApproval) {
       const requestedAdapterType = normalizedHireInput.adapterType ?? agent.adapterType;
       // Deliberately the generic redactor, matching what is already stored:
@@ -2849,7 +3341,7 @@ export function agentRoutes(
     res.status(201).json({
       agent: redactAgentSecrets(agent),
       approval: approval
-        ? { ...approval, payload: redactAgentConfigPayload(asRecord(approval.payload) ?? null) }
+        ? { ...approval, payload: containAgentConfig(approval.payload) ?? null }
         : approval,
     });
   });
@@ -2857,6 +3349,7 @@ export function agentRoutes(
   router.post("/companies/:companyId/agents", validate(createAgentSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     await assertCanCreateAgentsForCompany(req, companyId);
+    const actor = getActorInfo(req);
 
     const company = await db
       .select()
@@ -2909,7 +3402,9 @@ export function agentRoutes(
       companyId,
       adapterType: createInput.adapterType,
       adapterConfig: desiredSkillAssignment.adapterConfig,
+      actor: req.actor,
     });
+    assertNoAgentAdapterConfigMutation(req, normalizedAdapterConfig);
     const requestedRuntimeConfig = normalizeNewAgentRuntimeConfig(createInput.runtimeConfig, createInput.adapterType);
     assertExternalLifecycleConcurrencyPolicy(createInput.adapterType, requestedRuntimeConfig);
     const normalizedRuntimeConfig = await normalizeRuntimeConfigAdapterConfigsForPersistence(
@@ -2917,6 +3412,7 @@ export function agentRoutes(
       createInput.adapterType,
       requestedRuntimeConfig,
       normalizedAdapterConfig,
+      req.actor,
     );
     await assertAgentEnvironmentSelection(companyId, createInput.adapterType, createInput.defaultEnvironmentId);
     await assertAgentDefaultEnvironmentSelection(companyId, createInput.defaultEnvironmentId, {
@@ -2935,7 +3431,6 @@ export function agentRoutes(
     });
     const agent = await materializeDefaultInstructionsBundleForNewAgent(createdAgent, instructionsBundle);
 
-    const actor = getActorInfo(req);
     await logActivity(db, {
       companyId,
       actorType: actor.actorType,
@@ -3277,6 +3772,28 @@ export function agentRoutes(
       return;
     }
 
+    // This route wrote `agents.budget_monthly_cents` — the display mirror — and
+    // never the budget policy that actually enforces the cap
+    // (`pauseScopeForBudget` reads the policy, not the column). It returned 200,
+    // echoed the new value and recorded a config revision, so a cap raise made
+    // here was indistinguishable from one that took effect while binding
+    // nothing. It is also the only agent-reachable budget write, so the failure
+    // absorbed real allocation decisions: two separate raises landed here and
+    // silently did not apply.
+    //
+    // Rejecting rather than writing through on purpose. Write-through would
+    // hand every agent the ability to raise its own enforcing cap, which is the
+    // boundary `assertBoard` on the budgets route exists to hold — the fix has
+    // to narrow what agents can write, never widen it. BLO-27626.
+    if (hasOwn(req.body as object, "budgetMonthlyCents")) {
+      res.status(422).json({
+        error:
+          "Use PATCH /api/agents/:agentId/budgets to change a monthly budget cap. "
+          + "This route writes only the display mirror and would not change enforcement.",
+      });
+      return;
+    }
+
     const patchData = { ...(req.body as Record<string, unknown>) };
     const replaceAdapterConfig = patchData.replaceAdapterConfig === true;
     delete patchData.replaceAdapterConfig;
@@ -3292,7 +3809,28 @@ export function agentRoutes(
         res.status(422).json({ error: "adapterConfig must be an object" });
         return;
       }
-      assertNoAgentAdapterConfigMutation(req, adapterConfig);
+      const existingAdapterConfigForGuard = asRecord(existing.adapterConfig) ?? {};
+      assertNoAgentAdapterConfigMutation(req, adapterConfig, "adapterConfig", {
+        existingAdapterConfig: existingAdapterConfigForGuard,
+        // The binding diff has to be taken against what will actually be
+        // persisted, via the same helper the writer uses below: read from the
+        // request body alone, every key this PATCH merely omits would read as a
+        // binding removal.
+        //
+        // Deliberately pre-normalization: `normalizeAdapterConfigForPersistence`
+        // can itself mint a `secret_ref` from a plain value (mediated secrets),
+        // and that is the server's own write, not the caller's.
+        effectiveAdapterConfig: resolveRawEffectiveAdapterConfigForPatch({
+          existingAdapterConfig: existingAdapterConfigForGuard,
+          requestedAdapterConfig: stripRedactedEnvBindingsFromAdapterConfig(
+            adapterConfig,
+            existingAdapterConfigForGuard,
+          ),
+          replaceAdapterConfig,
+          changingAdapterType:
+            typeof patchData.adapterType === "string" && patchData.adapterType !== existing.adapterType,
+        }),
+      });
       const changingInstructionsConfig = adapterConfigTouchesInstructionsConfig(adapterConfig);
       if (changingInstructionsConfig) {
         await assertCanManageInstructionsPath(req, existing);
@@ -3314,7 +3852,7 @@ export function agentRoutes(
         existing.runtimeConfig,
         runtimeConfig,
       );
-      assertNoAgentRuntimeConfigAdapterConfigMutation(req, requestedRuntimeConfig);
+      assertNoAgentRuntimeConfigAdapterConfigMutation(req, requestedRuntimeConfig, existing.runtimeConfig);
     }
     const touchesAdapterConfiguration =
       hasOwn(patchData, "adapterType") ||
@@ -3338,25 +3876,12 @@ export function agentRoutes(
       ) {
         await assertCanManageInstructionsPath(req, existing);
       }
-      let rawEffectiveAdapterConfig = requestedAdapterConfig ?? existingAdapterConfig;
-      if (requestedAdapterConfig && !changingAdapterType && !replaceAdapterConfig) {
-        rawEffectiveAdapterConfig = { ...existingAdapterConfig, ...requestedAdapterConfig };
-      }
-      if (changingAdapterType) {
-        // Preserve adapter-agnostic keys (env, cwd, etc.) from the existing config
-        // when the adapter type changes. Without this, a PATCH that includes
-        // adapterConfig but omits these keys would silently drop them.
-        for (const key of ADAPTER_AGNOSTIC_KEYS) {
-          if (KNOWN_INSTRUCTIONS_BUNDLE_KEY_SET.has(key)) continue;
-          if (rawEffectiveAdapterConfig[key] === undefined && existingAdapterConfig[key] !== undefined) {
-            rawEffectiveAdapterConfig = { ...rawEffectiveAdapterConfig, [key]: existingAdapterConfig[key] };
-          }
-        }
-        rawEffectiveAdapterConfig = preserveInstructionsBundleConfig(
-          existingAdapterConfig,
-          rawEffectiveAdapterConfig,
-        );
-      }
+      let rawEffectiveAdapterConfig = resolveRawEffectiveAdapterConfigForPatch({
+        existingAdapterConfig,
+        requestedAdapterConfig,
+        replaceAdapterConfig,
+        changingAdapterType,
+      });
       const effectiveAdapterConfig = applyCodexLocalKeyIsolation(
         existing.companyId,
         existing.id,
@@ -3370,8 +3895,69 @@ export function agentRoutes(
         companyId: existing.companyId,
         adapterType: requestedAdapterType,
         adapterConfig: effectiveAdapterConfig,
+        actor: req.actor,
+      });
+      // Normalization can turn a plain schema-secret value into a managed
+      // secret_ref. Check the result as well as the raw request so that a
+      // mediated binding cannot bypass the agent mutation guard.
+      assertNoAgentAdapterConfigMutation(req, normalizedEffectiveAdapterConfig, "adapterConfig", {
+        existingAdapterConfig,
       });
       patchData.adapterConfig = syncInstructionsBundleConfigFromFilePath(existing, normalizedEffectiveAdapterConfig);
+      // The sync above re-derives the bundle keys from `instructionsFilePath`,
+      // resolving a relative one against `adapterConfig.cwd`. `cwd` is not an
+      // instructions key and has no agent-actor guard, so the check before the
+      // sync passes on a body naming only `cwd` — every instructions value is
+      // byte-identical to stored at that point — and the sync then relocates
+      // the bundle. Re-check what is actually written.
+      //
+      // The baseline is the stored config put through the same sync, not the
+      // stored row: for a legacy relative `instructionsFilePath` the sync
+      // rewrites the keys on every write, so diffing against the raw row would
+      // refuse writes that move nothing — the BLO-32332 bug again, one step
+      // later. Comparing sync(stored) with sync(next) asks only whether this
+      // write moved the bundle.
+      //
+      // Gated on the actor here rather than relying on the guard's own
+      // `actor.type !== "agent"` early return: that return is inside the
+      // function body, so argument evaluation precedes it, and this baseline
+      // syncs the *stored* config. A stored legacy relative
+      // `instructionsFilePath` with no absolute `cwd` throws 422 in
+      // `resolveLegacyInstructionsPath` — a shape `svc.create`/hire persist
+      // unvalidated — so evaluating it for every actor would refuse the
+      // human/board write that repairs it by supplying the missing `cwd`.
+      // An agent sending that same write still fails, on the 422 rather than
+      // a 403: the refusal is right (it relocates the bundle), the status
+      // is not.
+      if (req.actor.type === "agent") {
+        assertNoAgentInstructionsConfigMutation(
+          req,
+          asRecord(patchData.adapterConfig),
+          "adapterConfig",
+          syncInstructionsBundleConfigFromFilePath(existing, existingAdapterConfig),
+        );
+      }
+      // PATCH writes `adapterConfig` straight through to the service, so it was
+      // the one skill-writing route with no skill validation at all — hire and
+      // create already resolve strictly, and skills/sync at least resolves. That
+      // gap is the path the BLO-7991 incident actually took: a `desiredSkills`
+      // key naming a skill with no library row persisted with a 200 and then
+      // simply failed to materialize at pod start, silently.
+      //
+      // Only the keys this write introduces are validated; keys already stored
+      // stay tolerated so a since-deleted library row can't wedge the agent.
+      const previouslyDesiredKeys = storedDesiredSkillKeys(existing.adapterConfig);
+      const introducedDesiredSkillKeys = readPaperclipSkillSyncPreference(
+        asRecord(patchData.adapterConfig) ?? {},
+      ).desiredSkills.filter((key) => !previouslyDesiredKeys.has(key));
+      if (introducedDesiredSkillKeys.length > 0) {
+        const { unresolved } = await companySkills.resolveRequestedSkillEntries(
+          existing.companyId,
+          introducedDesiredSkillKeys.map((key) => ({ key, versionId: null })),
+          { tolerateUnknownReferences: true },
+        );
+        assertNoUnresolvableNewDesiredSkills(unresolved, previouslyDesiredKeys);
+      }
     }
     if (requestedRuntimeConfig) {
       const baseAdapterConfig = asRecord(patchData.adapterConfig) ?? asRecord(existing.adapterConfig) ?? {};
@@ -3380,6 +3966,7 @@ export function agentRoutes(
         requestedAdapterType,
         requestedRuntimeConfig,
         baseAdapterConfig,
+        req.actor,
       );
     }
     if (touchesAdapterConfiguration || Object.prototype.hasOwnProperty.call(patchData, "defaultEnvironmentId")) {
@@ -3394,12 +3981,23 @@ export function agentRoutes(
         },
       );
     }
+    // Fail CLOSED on mixing: any patch that *touches* a consent-gated profile
+    // field takes the protected branch, regardless of which other keys ride
+    // along.  The previous `profileOnlyChange` form required *every* key to be
+    // a profile field, so `{role, <any non-profile key>}` fell through to
+    // `assertCanUpdateAgent`, which reaches `allow_self` for a self-PATCH and
+    // let an agent write its own `role`/`name`/`title`/`capabilities` with no
+    // change grant and no consent (BLO-27751).  This mirrors the
+    // coordination-metadata path, which also fails closed on mixing.
     const touchesProfileFields = touchesAgentProfileChangeConsentFields(patchData);
-    const profileOnlyChange = touchesProfileFields && Object.keys(patchData).every((key) =>
-      (AGENT_PROFILE_CHANGE_CONSENT_FIELDS as readonly string[]).includes(key),
-    );
-    if (profileOnlyChange) {
+    if (touchesProfileFields) {
       await assertCanApplyAgentProfileChange(req, existing);
+      const mixesNonProfileKeys = Object.keys(patchData).some((key) =>
+        !(AGENT_PROFILE_CHANGE_CONSENT_FIELDS as readonly string[]).includes(key),
+      );
+      // Consent for the profile diff must not authorize unrelated keys in a
+      // mixed patch; require the ordinary update grant as well.
+      if (mixesNonProfileKeys) await assertCanUpdateAgent(req, existing);
     } else {
       await assertCanUpdateAgent(req, existing);
     }
@@ -3435,6 +4033,63 @@ export function agentRoutes(
           updatedAt: new Date(),
         })
         .where(eq(agentRuntimeState.agentId, agent.id));
+
+      // BLO-28865: the in-flight run's external-runtime reservation is not
+      // portable across adapters either, and unlike the session id it is
+      // load-bearing. `recordExpectedExternalRuntimeJobName` matches a
+      // `launched` reservation by exact `expectedJobName` equality; the new
+      // adapter presents a differently-prefixed Job name, so zero rows match
+      // and every subsequent launch throws. The row stays unreleased, so it
+      // keeps holding the agent's slot
+      // (`external_runtime_reservations_active_slot_idx`) and ALL launches for
+      // that agent stall -- not just the migrated one. Before this, recovery
+      // was incidental: it arrived only when the orphaned Job exited on its
+      // own or was force-killed at EXTERNAL_LIFECYCLE_HARD_STALE_MS (45 min).
+      //
+      // Cancel the in-flight runs instead of touching the reservation. This is
+      // deliberate, and the ordering is the whole point: the reservation still
+      // holds the OLD Job's name/UID, which is the only handle the cancel
+      // cascade's exact-name delete has on it. `cancelRunInternal` finalizes
+      // the run terminal, deletes that exact old-named Job, then promotes the
+      // next queued run. The reaper releases the now-terminal run's
+      // reservation on its next pass.
+      //
+      // Scoped to reservation HOLDERS specifically, not every active run for
+      // the agent (which is what the pause path's `cancelActiveForAgent`
+      // does). A `queued` run has never been dispatched, holds no reservation
+      // and no Job, and would launch perfectly well under the new adapter --
+      // killing it would be collateral damage from a config edit.
+      //
+      // Do NOT "fix" this by re-arming the reservation instead
+      // (`rearmExternalRuntimeReservationForRetry`): it nulls jobName/jobUid,
+      // which unwedges launches while abandoning a live pre-migration Job that
+      // still holds node CPU and can still make model calls.
+      //
+      // Gate on the PREVIOUS adapter type: the stranded reservation and the
+      // orphaned Job both belong to the substrate being migrated away from. A
+      // process -> claude_k8s change has no external-lifecycle run to cancel.
+      if (EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET.has(existing.adapterType)) {
+        try {
+          await heartbeat.cancelExternalRuntimeReservationHoldersForAgent(
+            id,
+            `Cancelled because the agent's adapter type changed from ${existing.adapterType} to ${agent.adapterType}`,
+          );
+        } catch (error) {
+          // Non-fatal, and deliberately so: the adapter-type change itself has
+          // already committed, and refusing to return it would leave the
+          // caller believing the migration failed when it did not. The reaper
+          // and alert still expose the stranded state if teardown fails.
+          logger.warn(
+            {
+              err: error,
+              agentId: id,
+              from: existing.adapterType,
+              to: agent.adapterType,
+            },
+            "adapter-type change: reservation-holder teardown failed",
+          );
+        }
+      }
     }
 
     // Auto-wakeup when heartbeat.enabled flips false → true (BLO-13048).
@@ -4269,6 +4924,18 @@ export function agentRoutes(
         // two can be compared without opening the run.
         penstockProvider: typeof result.penstockProvider === "string" ? result.penstockProvider : null,
         penstockModel: typeof result.penstockModel === "string" ? result.penstockModel : null,
+        // PEN-3323: which *kind* of denial parked this run —
+        // `penstock.model_capacity_unavailable` (429, pool exhausted) or
+        // `penstock.model_temporarily_unavailable` (503, provider down). Both
+        // book `scheduledRetryReason = "ccrotate_capacity"` deliberately, so
+        // this is the only place the two are distinguishable, and without it
+        // this endpoint could not tell an exhausted pool from a dead provider.
+        //
+        // Two limits on reading it, so nothing is built on it that it cannot
+        // carry (see the writer's docblock in `ccrotate-capacity-retry.ts`):
+        // it is present only while the run is *parked*, and it is not a
+        // historical census.
+        penstockReason: typeof result.penstockReason === "string" ? result.penstockReason : null,
         penstockRetryAfterSeconds:
           typeof result.penstockRetryAfterSeconds === "number" ? result.penstockRetryAfterSeconds : null,
         penstockAdvertisedResumeAt:
@@ -4323,6 +4990,7 @@ export function agentRoutes(
       continuationAttempt: heartbeatRuns.continuationAttempt,
       lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
       nextAction: heartbeatRuns.nextAction,
+      firstOutputAt: heartbeatRuns.firstOutputAt,
       lastOutputAt: heartbeatRuns.lastOutputAt,
       lastOutputSeq: heartbeatRuns.lastOutputSeq,
       lastOutputStream: heartbeatRuns.lastOutputStream,
@@ -4381,10 +5049,20 @@ export function agentRoutes(
     const run = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!run) return;
     const retryExhaustedReason = await heartbeat.getRetryExhaustedReason(runId);
+    // BLO-29312: the run's own scheduledRetry* columns describe the park that
+    // PRODUCED it, so they cannot answer "was this run retried?". Resolve the
+    // outbound edge here so that question costs one read of this endpoint
+    // rather than a reverse scan of the company run list.
+    const retrySuccessor = await heartbeat.getRetrySuccessor(run);
     const decoratedRun = heartbeat.decorateActiveRunStatus(run);
     res.json(
       redactCurrentUserValue(
-        { ...decoratedRun, retryExhaustedReason, outputSilence: await heartbeat.buildRunOutputSilence(run) },
+        {
+          ...decoratedRun,
+          retryExhaustedReason,
+          retrySuccessor,
+          outputSilence: await heartbeat.buildRunOutputSilence(run),
+        },
         await getCurrentUserRedactionOptions(),
       ),
     );
@@ -4555,11 +5233,15 @@ export function agentRoutes(
       throw error;
     }
 
-    await logRunLogAccessAudit(req, run, "allowed", { offset: normalizedOffset, limitBytes });
+    // BLO-34738: audit AFTER `readLog` returns. It throws `notFound("Run log not found")` when the
+    // run stored no log (`services/heartbeat.ts`), and a 404 that disclosed nothing is not a read —
+    // auditing first booked `result: "allowed"` against it, so "who read this log" over-reported.
+    // Denied-path audits stay before the response: those record an attempt, which did happen.
     const result = await heartbeat.readLog(run, {
       offset: normalizedOffset,
       limitBytes,
     });
+    await logRunLogAccessAudit(req, run, "allowed", { offset: normalizedOffset, limitBytes });
 
     res.set("Cache-Control", "no-cache, no-store");
     res.json(result);
@@ -4573,23 +5255,86 @@ export function agentRoutes(
     const context = asRecord(run.contextSnapshot);
     const executionWorkspaceId = asNonEmptyString(context?.executionWorkspaceId);
     const operations = await workspaceOperations.listForRun(runId, executionWorkspaceId);
-    res.json(redactCurrentUserValue(operations, await getCurrentUserRedactionOptions()));
+    // Same projection as the execution-workspace route: this endpoint answers with the identical
+    // `WorkspaceOperation` rows carrying the same copied `command`/`cwd`, gated only on company
+    // scope, so withholding on one route and not the other leaves the exit open one URL over.
+    const viewer = await resolveWorkspaceRuntimeViewer(access, req, run.companyId);
+    res.json(redactCurrentUserValue(
+      publicWorkspaceOperations(operations, viewer),
+      await getCurrentUserRedactionOptions(),
+    ));
   });
 
   router.get("/workspace-operations/:operationId/log", async (req, res) => {
     const operationId = req.params.operationId as string;
-    const operation = await getAccessibleResource(req, res, workspaceOperations.getById(operationId), "Workspace operation not found");
-    if (!operation) return;
-
     const offset = Number(req.query.offset ?? 0);
+    const normalizedOffset = Number.isFinite(offset) ? offset : 0;
     const limitBytes = readRunLogLimitBytes(req.query.limitBytes);
+    const operation = await workspaceOperations.getById(operationId);
+    if (!operation) {
+      res.status(404).json({ error: "Workspace operation not found" });
+      return;
+    }
+
+    const audit = (result: "allowed" | "denied", withheld?: boolean) => logLogAccessAudit(req, {
+      companyId: operation.companyId,
+      entityType: "workspace_operation",
+      entityId: operation.id,
+      runId: operation.heartbeatRunId,
+      logStore: operation.logStore,
+    }, result, { offset: normalizedOffset, limitBytes, withheld });
+
+    // Same shape as `/heartbeat-runs/:runId/log` rather than `getAccessibleResource`: keep the
+    // cross-tenant 404 so this route is not an existence oracle, without silently dropping the
+    // denied access event. `getAccessibleResource`'s own doc block names audit-logged denials as
+    // the case that should compose `hasCompanyAccess` directly.
+    if (!hasCompanyAccess(req, operation.companyId)) {
+      await audit("denied");
+      res.status(404).json({ error: "Workspace operation not found" });
+      return;
+    }
+
+    try {
+      assertCompanyAccess(req, operation.companyId);
+    } catch (error) {
+      await audit("denied");
+      throw error;
+    }
+
+    // Viewer first: the audit record has to say whether this read actually disclosed anything, and
+    // only the entitlement knows that. Resolved after the two denial paths, so a caller who never
+    // clears company access costs no entitlement lookup.
+    const viewer = await resolveWorkspaceRuntimeViewer(access, req, operation.companyId);
+    // BLO-34738: then `readLog`, and only then the audit. It throws
+    // `notFound("Workspace operation log not found")` when the operation stored no log
+    // (`services/workspace-operations.ts`), so auditing first booked `result: "allowed",
+    // withheld: true` against a 404 that disclosed nothing — inaccurate on exactly the flag
+    // BLO-34631 added for audit accuracy. Same ordering as `/heartbeat-runs/:runId/log`
+    // deliberately: the two are one URL apart, and a split audit semantic across them is the
+    // failure mode this series exists to close.
     const result = await workspaceOperations.readLog(operationId, {
-      offset: Number.isFinite(offset) ? offset : 0,
+      offset: normalizedOffset,
       limitBytes,
     });
+    await audit("allowed", !viewer.revealRuntimeConfig);
 
     res.set("Cache-Control", "no-cache, no-store");
-    res.json(result);
+    // BLO-34631. `content` is the stored chunk verbatim — the write-time sanitizer is a heuristic
+    // secret matcher, not a withholding boundary, so it lets host paths, repo layout and any
+    // operator command echoed by `set -x` through. That is the same text `publicWorkspaceOperation`
+    // withholds one projection over, so it is withheld on the same entitlement. Masked rather than
+    // emptied, matching `publicRuntimeServices`: a withheld reader can still tell "this operation
+    // logged nothing" from "the log was withheld". `redactCurrentUserValue` still runs for the
+    // entitled reader, because write-time username censoring is not retroactive.
+    res.json(redactCurrentUserValue(
+      {
+        ...result,
+        content: viewer.revealRuntimeConfig
+          ? result.content
+          : maskWorkspaceRuntimeTextForRead(result.content),
+      },
+      await getCurrentUserRedactionOptions(),
+    ));
   });
 
   router.get("/issues/:issueId/live-runs", async (req, res) => {
@@ -4629,6 +5374,7 @@ export function agentRoutes(
         continuationAttempt: heartbeatRuns.continuationAttempt,
         lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
         nextAction: heartbeatRuns.nextAction,
+        firstOutputAt: heartbeatRuns.firstOutputAt,
         lastOutputAt: heartbeatRuns.lastOutputAt,
         lastOutputSeq: heartbeatRuns.lastOutputSeq,
         lastOutputStream: heartbeatRuns.lastOutputStream,

@@ -133,6 +133,20 @@ export interface RunQuotaExhaustedHookInput {
    *  recovery action per adapter without an extra DB lookup. */
   adapterType: string;
   errorCode: string;
+  /** Invoked once recovery succeeds.
+   *
+   *  LOAD-BEARING CONTRACT (BLO-28992): this must be invoked **per caller**, on
+   *  every branch — the in-flight join, the time-debounced return, and the
+   *  branch that actually ran the recovery. Each parked run passes its own
+   *  closure carrying its own task scope, so collapsing this into a single
+   *  shared callback would silently re-deliver one run's scope to all N (or
+   *  none at all), which is exactly the fan-in that made N runs of one agent
+   *  converge on one issue and interleave writes into a shared checkout.
+   *
+   *  The degradation is silent — N scoped wakes quietly become 1 — and the test
+   *  that pins this behaviour lives on the heartbeat side
+   *  (`heartbeat-quota-recovery-wake-scope.test.ts`), so someone refactoring
+   *  this file would not see it. Keep the per-caller invocation. */
   onSuccess?: (() => void | Promise<void>) | null;
 }
 

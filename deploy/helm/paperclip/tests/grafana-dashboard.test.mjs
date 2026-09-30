@@ -237,7 +237,7 @@ test("the dead-letter alert annotation links to this dashboard (BLO-20171 accept
   // An operator paged by PaperclipGithubReviewRequestDeadLettered should not
   // have to go hunting for the panel. NOTE: this chart's PrometheusRule is
   // disabled on Blockcast -- the copy that actually fires lives in
-  // Blockcast/onprem-k8s monitoring/prometheus-configmap.yaml, and this
+  // Blockcast/onprem-k8s monitoring/prometheus-rules-2-configmap.yaml, and this
   // assertion does NOT reach it. See templates/prometheusrule.yaml.
   const rendered = execFileSync(
     "helm",

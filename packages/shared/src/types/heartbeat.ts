@@ -42,6 +42,36 @@ export interface GitWorktreeBranchIncoherenceEvidence {
       issueIdentifier: string | null;
     } | null;
   } | null;
+  /**
+   * Non-terminal issues that reference this execution workspace. More than one
+   * claimant means the worktree is a shared resource, so restoring the recorded
+   * branch would move it off another issue's branch. Safe repair refuses in that
+   * case and routes to the workspace-binding recovery path instead. Optional so
+   * previously persisted evidence payloads stay valid.
+   */
+  workspaceClaimants?: {
+    issueId: string;
+    issueIdentifier: string | null;
+    status: string;
+  }[] | null;
+  /**
+   * Outcome of the claimant lookup, so a `null` `workspaceClaimants` stays
+   * readable. `failed` means the query errored and contention could not be ruled
+   * out, which refuses; `not-computable` means there was nothing to query (no
+   * database handle, or no execution workspace id yet on the fresh-worktree
+   * reuse path) and does not refuse. Optional so previously persisted evidence
+   * payloads stay valid.
+   */
+  workspaceClaimantLookup?: "ok" | "failed" | "not-computable";
+  /**
+   * Worktree that currently holds the recorded branch, when some worktree does.
+   * Recorded unconditionally rather than only when it is the refusing
+   * precondition: eligibility checks several independent facts and only the
+   * first failing one reaches `safeRepair.reason`, so without this the
+   * held-elsewhere path is absent from the payload whenever another refusal
+   * wins. Optional so previously persisted evidence payloads stay valid.
+   */
+  expectedBranchWorktreePath?: string | null;
   provenance: {
     expectedBranchRef: string;
     actualBranchRef: string | null;
@@ -94,16 +124,51 @@ export interface HeartbeatRun {
   processPid: number | null;
   processGroupId?: number | null;
   processStartedAt: Date | null;
+  // First progress-counting output this run emitted, vs `lastOutputAt` which
+  // advances on every flush. NULL means it never emitted progress-counting
+  // output -- NOT that it emitted nothing. Synthetic keepalive/reattach chunks
+  // are excluded here but still land in the log store, so `logBytes > 0` with
+  // this NULL means keepalive-only (a Job reporting itself alive), not silent.
+  // The distinction is the interesting one: it separates a run that went quiet
+  // from one that never spoke. See migration 0245 for why the reaper's silence
+  // floor needs this, and why conflating the two would be unsafe.
+  firstOutputAt: Date | null;
   lastOutputAt: Date | null;
   lastOutputSeq: number;
   lastOutputStream: "stdout" | "stderr" | null;
   lastOutputBytes: number | null;
   retryOfRunId: string | null;
   processLossRetryCount: number;
+  /**
+   * INBOUND, not outbound. `scheduledRetryAt` / `scheduledRetryAttempt` /
+   * `scheduledRetryReason` describe the park that *produced* this run: when the
+   * hold this run was released from was due, which attempt of that chain this
+   * run is, and why the chain started. They do **not** record a park created
+   * because *this* run failed — a park is a separate row carrying
+   * `retryOfRunId`, so nothing about it is written back here.
+   *
+   * Consequently, on a run whose `status` is `failed`:
+   *   - `scheduledRetryAt: null` means "this run was not itself born of a
+   *     park", NOT "the system declined to retry it";
+   *   - a `scheduledRetryAt` in the past is when *this* attempt was released,
+   *     NOT a retry that was promised and never fired.
+   *
+   * Both readings have been made, in production, on this exact field (BLO-28734
+   * and its re-verification). Read `retrySuccessor` for the outbound direction —
+   * that is the field that answers "was this failed run retried?". BLO-29312.
+   */
   scheduledRetryAt?: Date | null;
+  /** Inbound — see the note on {@link HeartbeatRun.scheduledRetryAt}. */
   scheduledRetryAttempt?: number;
+  /** Inbound — see the note on {@link HeartbeatRun.scheduledRetryAt}. */
   scheduledRetryReason?: string | null;
   retryExhaustedReason?: string | null;
+  /**
+   * Outbound retry edge — the park created because this run ended. Decorated
+   * onto the single-run read (`GET /api/heartbeat-runs/:runId`) only; absent on
+   * list endpoints, which do not resolve it. BLO-29312.
+   */
+  retrySuccessor?: HeartbeatRunRetrySuccessor;
   livenessState: RunLivenessState | null;
   livenessReason: string | null;
   continuationAttempt: number;
@@ -160,6 +225,42 @@ export interface HeartbeatRunOutputSilence {
   evaluationIssueId: string | null;
   evaluationIssueIdentifier: string | null;
   evaluationIssueAssigneeAgentId: string | null;
+}
+
+export type HeartbeatRunRetrySuccessorState = "retried" | "not_retried" | "not_applicable";
+
+/**
+ * The OUTBOUND retry edge of a run: the park that was created *because this run
+ * ended*, resolved by looking up the row whose `retryOfRunId` is this run's id.
+ *
+ * Every persisted `scheduledRetry*` column on `heartbeat_runs` points the other
+ * way — see the note on {@link HeartbeatRun.scheduledRetryAt}. Before this
+ * existed, "was this failed run retried?" could only be answered by scanning
+ * the whole run table for a matching `retryOfRunId`, so readers instead guessed
+ * from `scheduledRetryAt` and guessed wrong. `state` is therefore deliberately
+ * an assertion rather than a nullable object: "not retried" is a fact this
+ * endpoint states, not an absence a caller has to interpret. BLO-29312.
+ */
+export interface HeartbeatRunRetrySuccessor {
+  /**
+   * - `retried` — a successor exists; the fields below describe it.
+   * - `not_retried` — this run reached a terminal status and no successor was
+   *   ever created for it.
+   * - `not_applicable` — this run has not reached a terminal status, so there
+   *   is nothing yet for it to have been retried from.
+   */
+  state: HeartbeatRunRetrySuccessorState;
+  runId: string | null;
+  status: HeartbeatRunStatus | null;
+  /**
+   * The successor's own due time — i.e. when this run's retry is scheduled to
+   * fire, or fired. Null once the successor has been promoted out of the park
+   * without one, which is normal for immediate re-queues (`process_lost`).
+   */
+  scheduledRetryAt: Date | string | null;
+  scheduledRetryAttempt: number | null;
+  scheduledRetryReason: string | null;
+  createdAt: Date | string | null;
 }
 
 export interface AgentWakeupSkipped {

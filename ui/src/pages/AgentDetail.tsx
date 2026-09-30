@@ -106,6 +106,7 @@ import {
   type WorkspaceOperation,
   isResponsibleUserDenialCode,
   isSensitiveEnv,
+  REDACTED_VALUE_SENTINEL,
   responsibleUserLabel,
 } from "@paperclipai/shared";
 import { ResponsibleUserDenialNotice } from "../components/ResponsibleUserDenialNotice";
@@ -133,7 +134,9 @@ const runStatusIcons: Record<string, { icon: typeof CheckCircle2; color: string 
 
 const RUN_LOG_PAGE_BYTES = 256_000;
 
-const REDACTED_ENV_VALUE = "***REDACTED***";
+// Shared with the server's `REDACTED_EVENT_VALUE` so the withheld/absent distinction below cannot
+// drift apart from what the API actually writes (BLO-34631).
+const REDACTED_ENV_VALUE = REDACTED_VALUE_SENTINEL;
 const COMMAND_ENV_KEY_RE = /(^command$|^cmd$|command[-_]?line|resolved[-_]?command|PAPERCLIP_RESOLVED_COMMAND)/i;
 const JWT_VALUE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?$/;
 
@@ -553,7 +556,14 @@ function WorkspaceOperationLogViewer({
             </div>
           )}
           {!isLoading && !error && chunks.length === 0 && (
-            <div className="text-xs text-muted-foreground">No persisted log lines.</div>
+            <div className="text-xs text-muted-foreground">
+              {/* BLO-34631: the API masks withheld log content rather than emptying it, so the
+                  viewer has to tell the two apart — `parseStoredLogContent` yields no chunks for
+                  either. */}
+              {logData?.content === REDACTED_ENV_VALUE
+                ? "Log content withheld — requires workspace runtime access."
+                : "No persisted log lines."}
+            </div>
           )}
           {chunks.length > 0 && (
             <div className="max-h-64 overflow-y-auto rounded bg-neutral-100 p-2 font-mono text-xs dark:bg-neutral-950">
@@ -846,7 +856,14 @@ export function AgentDetail() {
       (policy) => policy.scopeType === "agent" && policy.scopeId === (agent?.id ?? routeAgentRef),
     );
     if (matched) return matched;
-    const budgetMonthlyCents = agent?.budgetMonthlyCents ?? 0;
+    // No policy row in the overview — either the agent has no enforcing policy,
+    // or `budgets/overview` is still loading or forbidden for this viewer. Fall
+    // back to the enforcing amount carried on the agent read model, NOT to
+    // `agent.budgetMonthlyCents`: that column is a display mirror and can be
+    // stale, and rendering it here is what let a drifted cap read as the real
+    // one. `null`/absent means no active policy, i.e. uncapped — which is the
+    // safe thing to show when we do not know the cap. BLO-27626.
+    const budgetMonthlyCents = agent?.enforcedBudgetMonthlyCents ?? 0;
     const spentMonthlyCents = agent?.spentMonthlyCents ?? 0;
     return {
       policyId: "",

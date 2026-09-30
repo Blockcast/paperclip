@@ -71,6 +71,7 @@ export { cycles } from "./cycles.js";
 export { issueCycles } from "./issue_cycles.js";
 export { issueApprovals } from "./issue_approvals.js";
 export { issueComments } from "./issue_comments.js";
+export { issueCommentEffects } from "./issue_comment_effects.js";
 export { issueCreateIdempotencyKeys } from "./issue_create_idempotency_keys.js";
 export { issueThreadInteractions } from "./issue_thread_interactions.js";
 export { issueTreeHolds } from "./issue_tree_holds.js";
@@ -157,7 +158,10 @@ export { pluginWebhookDeliveries } from "./plugin_webhooks.js";
 export { pluginLogs } from "./plugin_logs.js";
 export { pluginEventOutbox } from "./plugin_event_outbox.js";
 export { githubCommitStatusDeliveries } from "./github_commit_status_deliveries.js";
+export { githubReviewGateDeliveries } from "./github_review_gate_deliveries.js";
 export { syntheticSshProbeResults } from "./synthetic_ssh_probe_results.js";
 export { linearIssueLinks } from "./linear_issue_links.js";
 
 export { issuePullRequests } from "./issue_pull_requests.js";
+
+export { pullRequestReviewState } from "./pull_request_review_state.js";

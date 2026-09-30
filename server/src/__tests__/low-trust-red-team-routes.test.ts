@@ -36,7 +36,7 @@ import {
   projects,
   workspaceOperations,
 } from "@paperclipai/db";
-import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY, LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
+import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY, LOW_TRUST_REVIEW_PRESET, extractAgentMentionIds } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -794,6 +794,116 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
       .send({ body: "I was not mentioned." });
     expect(unmentionedComment.status, JSON.stringify(unmentionedComment.body)).toBe(403);
     expect(unmentionedComment.body.error).toBe("Issue is outside this actor's authorization boundary (trust-boundary)");
+  });
+
+  // PEN-2394: end-to-end cover for the grant *parser*, over the real HTTP path.
+  // The 403 body used to prescribe "a comment containing agent://<id>"; posting
+  // exactly that, as the assignee it named, left the denial byte-identical to an
+  // issue where nothing had been posted at all — so the remediation read as a
+  // no-op and got retried instead of escalated. What this pins is the mechanism
+  // underneath that: the bare string is inert and the markdown link clears the
+  // very same POST.
+  //
+  // It deliberately does NOT pin the 403 *text*. A low-trust actor outside its
+  // boundary is refused by `lowTrustDeny` with `deny_low_trust_boundary`, and
+  // `issueCommentGrantRemediation` returns null for every reason except
+  // `deny_missing_grant` — so the remediation message is never emitted on this
+  // path and there is nothing here to assert about it. The message itself is
+  // covered by the `deny_missing_grant` test directly below.
+  it("denies a bare agent:// grant string end-to-end and clears the deny once the assignee posts the mention link", async () => {
+    const fixture = await seedLowTrustFixture(db);
+    const [targetIssue] = await db.insert(issues).values({
+      companyId: fixture.company.id,
+      projectId: fixture.projects.outOfScope.id,
+      title: "Bare grant string mention target",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: fixture.agents.standard.id,
+      responsibleUserId: "board-user",
+    }).returning();
+
+    const postReply = () => request(createApp(db, agentActor(fixture)))
+      .post(`/api/issues/${targetIssue!.id}/comments`)
+      .send({ body: "Mention-scoped verification complete." });
+
+    // Arm 1 — the literal remediation, posted by the assignee it names. This is
+    // the novel coverage.
+    await db.insert(issueComments).values({
+      companyId: fixture.company.id,
+      issueId: targetIssue!.id,
+      authorAgentId: fixture.agents.standard.id,
+      authorType: "agent",
+      body: `Granting access: agent://${fixture.agents.lowTrust.id}`,
+    });
+
+    const denied = await postReply();
+    expect(denied.status, JSON.stringify(denied.body)).toBe(403);
+    // Pin the reason, not just the status: a regression that denied for some
+    // unrelated reason would otherwise keep this green while the bare-string
+    // case stopped being tested at all.
+    expect(denied.body.error).toBe("Issue is outside this actor's authorization boundary (trust-boundary)");
+
+    // Arm 2 — same author, same issue, same agent id; only the form changes.
+    // This restates "allows mentioned low-trust agents to comment on out-of-bound
+    // assigned issues" above, and is kept deliberately: it is the control that
+    // makes arm 1 a statement about the *form* rather than about this fixture
+    // being unable to comment at all.
+    await db.insert(issueComments).values({
+      companyId: fixture.company.id,
+      issueId: targetIssue!.id,
+      authorAgentId: fixture.agents.standard.id,
+      authorType: "agent",
+      body: `Granting access: [@Low Trust Reviewer](agent://${fixture.agents.lowTrust.id})`,
+    });
+
+    const allowed = await postReply();
+    expect(allowed.status, JSON.stringify(allowed.body)).toBe(201);
+    expect(allowed.body).toMatchObject({
+      issueId: targetIssue!.id,
+      authorAgentId: fixture.agents.lowTrust.id,
+    });
+  });
+
+  // PEN-2394: the remediation *message*, on the only path that emits it, against
+  // a real database rather than a mocked `decide`. A standard-trust agent that is
+  // neither the assignee nor mentioned falls through to `deny_missing_grant`,
+  // which is the one reason `issueCommentGrantRemediation` answers.
+  //
+  // The load-bearing assertion is the last one. The body names the actor's real
+  // agent id — it has to, or the reader cannot act on it — and the actor reading
+  // it is often the assignee, i.e. exactly the party who *can* grant. So the body
+  // must show the link form with a placeholder id and never a live one: pasting
+  // this error into the issue to ask about it must not silently hand out write.
+  it("names the working mention form on deny_missing_grant without making the error body itself a grant", async () => {
+    const fixture = await seedLowTrustFixture(db);
+    const [targetIssue] = await db.insert(issues).values({
+      companyId: fixture.company.id,
+      projectId: fixture.projects.allowed.id,
+      title: "Standard-trust missing-grant target",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: fixture.agents.standard.id,
+      responsibleUserId: "board-user",
+    }).returning();
+
+    const denied = await request(createApp(db, agentActor(fixture, fixture.agents.collaborator.id)))
+      .post(`/api/issues/${targetIssue!.id}/comments`)
+      .send({ body: "Replying to the FYI that woke me." });
+
+    expect(denied.status, JSON.stringify(denied.body)).toBe(403);
+    const remediation = denied.body.details?.remediation as string | undefined;
+    expect(remediation, JSON.stringify(denied.body)).toBeTruthy();
+
+    // Names the assignee as the grantor, and the actor's own id as the token.
+    expect(remediation).toContain(`agent://${fixture.agents.standard.id}`);
+    expect(remediation).toContain(fixture.agents.collaborator.id);
+    // Shows the form the parser actually accepts...
+    expect(remediation).toContain("[@name](agent://<agent-id>)");
+    // ...and rules out the form that sent PEN-2394 in circles.
+    expect(remediation).toMatch(/bare agent:\/\/[^\s]+ in the comment body is not a mention/i);
+    // The invariant, independent of wording: no substring of this body parses as
+    // a live mention, so quoting it grants nothing.
+    expect(extractAgentMentionIds(remediation!)).toEqual([]);
   });
 
   it("propagates denied low-trust policy conflicts on control-plane guards", async () => {

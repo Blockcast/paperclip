@@ -66,6 +66,127 @@ const FAILURE_LOG_TAIL_MAX_BYTES = Math.max(
   Number(process.env.PAPERCLIP_K8S_FAILURE_LOG_TAIL_MAX_BYTES ?? "16384"),
 );
 
+// BLO-20251 (Ally review) — a malformed override must not silently disarm the
+// liveness probe. `Number("abc")` is NaN, and NaN survives Math.max, so the
+// older `Math.max(1, Number(env))` shape yielded a NaN threshold; every
+// `millicores >= NaN` comparison is then false, every sampled pod classifies as
+// "idle", and the hard-stale reaper kills exactly the live subprocesses this
+// module exists to protect. Fail closed onto the documented default instead,
+// mirroring how parseCpuQuantityToMillicores rejects a non-finite magnitude
+// rather than guessing.
+//
+// Falls back rather than throwing: these are background-reaper tunables read at
+// import time, and a typo in a deployment value should not take the whole API
+// server down. Exported for unit testing, like parseCpuQuantityToMillicores.
+export function numberFromEnv(name: string, fallback: number, minimum: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const parsed = Number(raw.trim());
+  if (!Number.isFinite(parsed) || parsed < minimum) {
+    logger.warn(
+      { env: name, value: redactSensitiveText(raw), fallback },
+      "invalid k8s liveness tunable; falling back to default",
+    );
+    return fallback;
+  }
+  return parsed;
+}
+
+// BLO-20251 — subprocess liveness for the hard-stale reaper.
+//
+// WHY POD CPU, and not the alternatives:
+//
+//   * adapter stdout (`heartbeat_runs.last_output_at`) is what the reaper
+//     already keys on, and it is exactly the signal that fails here. The
+//     claude_k8s Job pipes only the agent CLI's own stdout to the pod log
+//     (`claude ... | tee <podLog>`, see paperclip-adapter-claude-k8s
+//     job-manifest.ts). While the agent sits in a Bash tool call, the CLI emits
+//     the tool_use event, then nothing until the tool_result — so a 20-minute
+//     `pnpm install` is byte-for-byte indistinguishable from a wedged process.
+//
+//   * workspace mtime would catch a dependency install (it writes into
+//     node_modules on the shared PVC) but NOT a docker build, whose writes go
+//     to the DinD sidecar's emptyDir graph rather than the workspace. It also
+//     needs a recursive walk to be reliable, which is far more expensive than
+//     one metrics read.
+//
+//   * a longer grace window only trades a wrong answer for a slower wrong
+//     answer — a genuinely wedged pod would hold its agent's dispatch slot for
+//     the whole extension.
+//
+// Pod CPU covers all three AC cases (install, test suite, image build), is
+// summed across containers so the DinD sidecar's work counts, and costs one
+// namespace-wide metrics read per reaper tick (cached below). It is read ONLY
+// for runs that already crossed the hard-stale threshold, so the steady-state
+// cost is zero.
+//
+// Verified against the live cluster 2026-08-22: PodMetrics objects mirror the
+// pod's labels (so `paperclip.io/run-id` is present and the managed-by
+// labelSelector filters server-side), and agent pods report CPU in BOTH `n` and
+// `u` units in the same listing — hence the unit handling in the parser below.
+//
+// Threshold: from that same listing — agents idling on an LLM round-trip sit at
+// 8-26m, agents running real subprocesses at 148-2979m. 100m sits in that gap.
+// Being wrong in the "busy" direction only DELAYS the kill to the absolute
+// ceiling enforced by the caller, so the conservative choice is the safe one.
+const AGENT_POD_BUSY_CPU_MILLICORES = numberFromEnv(
+  "PAPERCLIP_K8S_AGENT_POD_BUSY_CPU_MILLICORES",
+  100,
+  // A 0m threshold would classify every pod busy forever, so the floor is 1m.
+  1,
+);
+
+// BLO-20251 / BLO-30087: the two silence bounds that gate the busy-pod
+// deferral. They live HERE, in the leaf module that owns probeAgentPodActivity,
+// rather than in heartbeat.ts, because there are now multiple consumers of the
+// "silence == dead" heuristic and they must not be able to drift apart:
+//
+//   * the hard-stale reaper (heartbeat.ts) — KILLS the run
+//   * the stale-lock sweeper (recovery/service.ts) — FREES the issue lock
+//
+// heartbeat.ts imports recovery/service.js, so recovery cannot import heartbeat
+// and the constant could not simply be shared across. This module imports only
+// the k8s client, the logger and the redactor, so both consumers can depend on
+// it without a cycle.
+//
+// BLO-30087 is what happens when they DO drift: the reaper spared a busy pod up
+// to 3h while the sweeper still freed its lock at 2h, producing a run that was
+// alive and actively writing a shared workspace while its issue lock read free —
+// a state that was previously unreachable, because the 45min reaper always won
+// against the 2h sweeper. Two live runs then interleaved writes into one file.
+export const AGENT_POD_HARD_STALE_MS = 45 * 60 * 1000;
+// Absolute ceiling on how long a demonstrably-busy pod may defer. Without it a
+// run wedged in a CPU-burning spin loop would look "busy" forever and hold its
+// agent's dispatch slot indefinitely (the BLO-12996 starvation the force-reap
+// exists to prevent). 4x the floor (3h) is comfortably longer than any real
+// dependency install, test suite or image build we have observed.
+//
+// Parsed defensively via numberFromEnv, which falls back rather than passing a
+// malformed value through: every `silentMs >= NaN` comparison is false, so a NaN
+// here would make the ceiling silently vanish and let a busy-looking zombie hold
+// its slot — and now also its issue lock — forever. That is the one direction
+// this must never fail in.
+export const AGENT_POD_BUSY_MAX_STALE_MS = Math.max(
+  AGENT_POD_HARD_STALE_MS,
+  numberFromEnv(
+    "PAPERCLIP_EXTERNAL_LIFECYCLE_BUSY_POD_MAX_STALE_MS",
+    4 * AGENT_POD_HARD_STALE_MS,
+    1,
+  ),
+);
+
+// One namespace-wide PodMetrics read serves every hard-stale candidate in a
+// reaper tick. The TTL is deliberately shorter than a tick so consecutive ticks
+// re-read, but a tick with 20 stale candidates still makes a single call.
+// metrics-server itself only refreshes every ~15s, so a finer TTL would buy
+// nothing but load.
+const AGENT_POD_METRICS_CACHE_TTL_MS = numberFromEnv(
+  "PAPERCLIP_K8S_AGENT_POD_METRICS_CACHE_TTL_MS",
+  10_000,
+  // 0 is meaningful here: it disables the cache (every probe re-reads).
+  0,
+);
+
 export type AgentJobRunStatus = {
   phase: "active" | "succeeded" | "failed";
   reason?: string | null;
@@ -169,7 +290,33 @@ export function classifyAgentJobFailureErrorCode(
 type ClientState =
   | { kind: "uninitialized" }
   | { kind: "unavailable"; reason: string }
-  | { kind: "ready"; batchApi: k8s.BatchV1Api; coreApi: k8s.CoreV1Api };
+  | {
+      kind: "ready";
+      batchApi: k8s.BatchV1Api;
+      coreApi: k8s.CoreV1Api;
+      // metrics.k8s.io is served by metrics-server, which is an optional
+      // cluster add-on, so every metrics *call* degrades to "unknown" rather
+      // than throwing.
+      //
+      // `null` when even CONSTRUCTING the client failed. An earlier draft of
+      // this change asserted construction "always succeeds" and built it inline
+      // with batchApi/coreApi. But `makeApiClient` throws
+      // `TypeError: apiClientType is not a constructor` whenever the symbol it
+      // is handed is absent (verified against @kubernetes/client-node 1.4.0),
+      // and that throw landed in initClient's shared catch. The whole client
+      // then went `unavailable`, and because hasActiveJobForAgent fails OPEN on
+      // a non-ready client (`return false`), an optional add-on's client
+      // construction could silently switch off the BLO-20801 double-dispatch /
+      // RWO-PVC multi-attach guard.
+      //
+      // `CustomObjectsApi` IS exported at 1.4.0, so this is drift/packaging
+      // risk rather than a live production fault — but it is not theoretical
+      // either: it is precisely how this broke all 13 cases of
+      // k8s-job-liveness-run-scoped.test.ts, whose mock exports no
+      // CustomObjectsApi. The optional dependency is therefore isolated: it may
+      // be null, and a null here costs only pod-CPU liveness.
+      metricsApi: k8s.CustomObjectsApi | null;
+    };
 
 let clientState: ClientState = { kind: "uninitialized" };
 
@@ -210,7 +357,22 @@ function initClient(): ClientState {
     }
     const batchApi = kc.makeApiClient(k8s.BatchV1Api);
     const coreApi = kc.makeApiClient(k8s.CoreV1Api);
-    clientState = { kind: "ready", batchApi, coreApi };
+    // Constructed in its OWN try: this client is optional, and a throw here
+    // must not reach the shared catch below. See the ClientState comment —
+    // letting it escape marks the entire client `unavailable`, and
+    // hasActiveJobForAgent fails OPEN on that, so a missing metrics symbol
+    // would disable the BLO-20801 double-dispatch guard rather than merely
+    // disabling pod-CPU liveness.
+    let metricsApi: k8s.CustomObjectsApi | null = null;
+    try {
+      metricsApi = kc.makeApiClient(k8s.CustomObjectsApi);
+    } catch (error) {
+      logger.warn(
+        { error: error instanceof Error ? error.message : String(error) },
+        "k8s metrics client unavailable; pod-CPU liveness disabled, job-liveness guard unaffected",
+      );
+    }
+    clientState = { kind: "ready", batchApi, coreApi, metricsApi };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     logger.warn({ error: reason }, "k8s job-liveness client init failed; falling back to staleness heuristic");
@@ -379,6 +541,131 @@ export async function listManagedAgentPods(): Promise<ManagedAgentPod[] | null> 
     );
     return null;
   }
+}
+
+/**
+ * Whether an agent pod is demonstrably doing work right now.
+ *
+ * "unknown" is NOT a synonym for "idle" and callers must not treat it as one:
+ * it means we have no evidence either way (no metrics-server, RBAC denied, the
+ * pod not yet scraped). Callers preserve their pre-BLO-20251 behaviour on
+ * "unknown" so a cluster without metrics-server reaps exactly as it did before.
+ */
+export type AgentPodActivity = "busy" | "idle" | "unknown";
+
+type PodMetricsItem = {
+  metadata?: { name?: string; labels?: Record<string, string> };
+  containers?: Array<{ name?: string; usage?: { cpu?: string } }>;
+};
+
+/**
+ * Parse a Kubernetes CPU quantity into millicores.
+ *
+ * metrics-server reports CPU in whichever unit keeps precision, so the same
+ * cluster yields "0", "46m", "2", and "1234567n" across pods. Returns null for
+ * anything unparseable rather than guessing — an unparseable sample must not
+ * read as 0 (that would look idle and license a kill).
+ */
+export function parseCpuQuantityToMillicores(raw: unknown): number | null {
+  if (typeof raw !== "string") return null;
+  const match = /^([0-9]*\.?[0-9]+)([a-zA-Z]*)$/.exec(raw.trim());
+  if (!match) return null;
+  const magnitude = Number(match[1]);
+  if (!Number.isFinite(magnitude)) return null;
+  switch (match[2]) {
+    case "n":
+      return magnitude / 1_000_000;
+    case "u":
+      return magnitude / 1_000;
+    case "m":
+      return magnitude;
+    case "":
+      return magnitude * 1_000;
+    default:
+      return null;
+  }
+}
+
+// `byRunId: null` is a cached FAILURE (metrics unavailable), distinct from a
+// cached empty map (metrics available, no agent pods). Collapsing the two would
+// turn "we cannot tell" into "idle" and reintroduce the very kill this fixes.
+let podMetricsCache: { at: number; byRunId: Map<string, number> | null } | null = null;
+
+async function readAgentPodCpuMillicoresByRunId(): Promise<Map<string, number> | null> {
+  const state = initClient();
+  if (state.kind !== "ready") return null;
+  // No metrics client at all (construction failed) is the same *answer* as a
+  // failed metrics call — "we cannot tell" — so it returns null and the reaper
+  // keeps its pre-existing behavior. Checked before the cache so a null client
+  // can never be mistaken for a cached empty map.
+  if (state.metricsApi === null) return null;
+  const now = Date.now();
+  if (podMetricsCache && now - podMetricsCache.at < AGENT_POD_METRICS_CACHE_TTL_MS) {
+    return podMetricsCache.byRunId;
+  }
+  try {
+    const response = await state.metricsApi.listNamespacedCustomObject(
+      {
+        group: "metrics.k8s.io",
+        version: "v1beta1",
+        namespace: PAPERCLIP_K8S_NAMESPACE,
+        plural: "pods",
+        labelSelector: AGENT_JOB_LABEL_SELECTOR,
+        timeoutSeconds: K8S_JOB_LIVENESS_TIMEOUT_SECONDS,
+      },
+      requestOptionsWithTimeout(),
+    );
+    const items = (response as { items?: PodMetricsItem[] } | null)?.items ?? [];
+    const byRunId = new Map<string, number>();
+    for (const item of items) {
+      const runId = item.metadata?.labels?.[RUN_ID_LABEL];
+      if (!runId) continue;
+      // Sum across containers so a docker build burning CPU in the DinD
+      // sidecar counts as liveness for the run that launched it. If NOT ONE
+      // container sample parses we leave the run out of the map entirely, so it
+      // reports "unknown" rather than a fabricated 0 — a 0 here would read as
+      // idle and license exactly the kill this exists to prevent.
+      let millicores = 0;
+      let parsedAnySample = false;
+      for (const container of item.containers ?? []) {
+        const parsed = parseCpuQuantityToMillicores(container.usage?.cpu);
+        if (parsed === null) continue;
+        millicores += parsed;
+        parsedAnySample = true;
+      }
+      if (!parsedAnySample) continue;
+      byRunId.set(runId, Math.max(byRunId.get(runId) ?? 0, millicores));
+    }
+    podMetricsCache = { at: now, byRunId };
+    return byRunId;
+  } catch (error) {
+    logger.debug(
+      { error: error instanceof Error ? error.message : String(error) },
+      "k8s pod-metrics read failed; hard-stale reaper falls back to output-silence only",
+    );
+    // Negative-cache so a cluster with no metrics-server does not pay one
+    // failed call per stale run per tick.
+    podMetricsCache = { at: now, byRunId: null };
+    return null;
+  }
+}
+
+/**
+ * BLO-20251: is this run's pod burning CPU right now?
+ *
+ * Used only for runs that already crossed EXTERNAL_LIFECYCLE_HARD_STALE_MS, to
+ * distinguish "blocked on a long silent subprocess" from "wedged". A run absent
+ * from the metrics list reports "unknown", not "idle" — metrics-server lags pod
+ * creation by ~15-30s and a missing sample is not evidence of idleness.
+ */
+export async function probeAgentPodActivity(runId: string): Promise<AgentPodActivity> {
+  const trimmed = runId.trim();
+  if (!trimmed) return "unknown";
+  const byRunId = await readAgentPodCpuMillicoresByRunId();
+  if (!byRunId) return "unknown";
+  const millicores = byRunId.get(trimmed);
+  if (millicores === undefined) return "unknown";
+  return millicores >= AGENT_POD_BUSY_CPU_MILLICORES ? "busy" : "idle";
 }
 
 function toIsoOrNull(value: unknown): string | null {
@@ -1095,4 +1382,5 @@ export async function hasActiveJobForAgent(
 /** Test-only hook to force re-init (e.g. after env changes). */
 export function __resetK8sJobLivenessClient() {
   clientState = { kind: "uninitialized" };
+  podMetricsCache = null;
 }

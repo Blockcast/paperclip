@@ -37,7 +37,7 @@ export const help: Record<string, string> = {
   fastMode: "Enable Codex Fast mode. This burns credits/tokens much faster and is supported on GPT-5.6, GPT-5.5, GPT-5.4, and manual Codex model IDs.",
   workspaceStrategy: "How Paperclip should realize an execution workspace for this agent. Keep project_primary for normal cwd execution, or use git_worktree for issue-scoped isolated checkouts.",
   workspaceBaseRef: "Base git ref used when creating a worktree branch. Leave blank to use the resolved workspace ref or HEAD.",
-  workspaceBranchTemplate: "Template for naming derived branches. Supports {{issue.identifier}}, {{issue.title}}, {{agent.name}}, {{project.id}}, {{workspace.repoRef}}, and {{slug}}.",
+  workspaceBranchTemplate: "Template for naming derived branches. Placeholders must be double-braced: {{issue.id}}, {{issue.identifier}}, {{issue.title}}, {{agent.id}}, {{agent.name}}, {{project.id}}, {{workspace.repoRef}}, {{slug}}. Single braces are not substituted and appear literally in the branch name.",
   worktreeParentDir: "Directory where derived worktrees should be created. Absolute, ~-prefixed, and repo-relative paths are supported.",
   runtimeServicesJson: "Optional workspace runtime service definitions. Use this for shared app servers, workers, or other long-lived companion processes attached to the workspace.",
   maxTurnsPerRun: "Maximum number of agentic turns (tool calls) per heartbeat run.",

@@ -22,6 +22,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { heartbeatService } from "../services/heartbeat.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -97,6 +98,9 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
     agentStatus?: "active" | "paused";
     retryStatus?: "scheduled_retry" | "queued" | "running";
     issueStatus?: "in_progress" | "todo" | "done" | "cancelled";
+    // jsonb accepts any JSON value; the Drizzle column narrows to an object.
+    // Widened so a test can seed the non-object shape the writers never emit.
+    retryResultJson?: Record<string, unknown> | unknown[];
   } = {}) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -173,6 +177,9 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       scheduledRetryAt,
       scheduledRetryAttempt: 2,
       scheduledRetryReason: "transient_failure",
+      ...(input.retryResultJson
+        ? { resultJson: input.retryResultJson as Record<string, unknown> }
+        : {}),
       contextSnapshot: {
         issueId,
         wakeReason: "bounded_transient_heartbeat_retry",
@@ -255,6 +262,141 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       .where(and(eq(heartbeatRuns.retryOfRunId, first.body.scheduledRetry.retryOfRunId), eq(heartbeatRuns.companyId, companyId)));
     expect(retryRuns).toHaveLength(1);
     expect(retryRuns[0]).toMatchObject({ id: retryRunId, status: "queued" });
+  });
+
+  it("clears the capacity decision keys when retry-now overrides a capacity park", async () => {
+    // A retry-now books scheduled_retry_at to now. Every penstock* decision key in
+    // result_json then describes a park the row no longer holds, and the overdue
+    // gauge (queued-run-age-metrics.ts) takes greatest(scheduled_retry_at,
+    // penstockAdvertisedResumeAt), so a stale advertised resume 3.5 days out would
+    // keep the forced row invisible to the detector. The chain origin stays, and
+    // so do the retryNotBefore/transientRetryNotBefore floors, on purpose: the
+    // promotion-time capacity re-probe reads them (see the gate test below).
+    // errorFamily is what applyCcrotateCapacityDecision always writes.
+    // Relative to the real clock: the fixture's fixed May-2026 dates are in the
+    // past by the time this runs, and the whole point is a horizon still ahead.
+    const advertisedResumeAt = new Date(Date.now() + 3.5 * 24 * 60 * 60 * 1000).toISOString();
+    const firstDeferredAt = new Date("2026-05-06T12:00:00.000Z").toISOString();
+    const { companyId, issueId, retryRunId } = await seedIssueWithRetry({
+      retryResultJson: {
+        retryNotBefore: advertisedResumeAt,
+        transientRetryNotBefore: advertisedResumeAt,
+        errorFamily: "rate_limit_exhausted",
+        penstockProvider: "anthropic",
+        penstockModel: "claude-opus-4-1",
+        penstockReason: "ccrotate_capacity",
+        penstockRetryAfterSeconds: 302400,
+        penstockAdvertisedResumeAt: advertisedResumeAt,
+        penstockCapacityParkClampedFrom: advertisedResumeAt,
+        penstockCapacityFirstDeferredAt: firstDeferredAt,
+        unrelatedKey: "kept",
+      },
+    });
+    const before = Date.now();
+
+    const res = await request(createApp(boardActor(companyId)))
+      .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toMatchObject({ outcome: "promoted", scheduledRetry: { runId: retryRunId, status: "queued" } });
+
+    const [run] = await db
+      .select({ resultJson: heartbeatRuns.resultJson, scheduledRetryAt: heartbeatRuns.scheduledRetryAt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, retryRunId));
+    expect(run.resultJson).toEqual({
+      retryNotBefore: advertisedResumeAt,
+      transientRetryNotBefore: advertisedResumeAt,
+      errorFamily: "rate_limit_exhausted",
+      penstockCapacityFirstDeferredAt: firstDeferredAt,
+      unrelatedKey: "kept",
+    });
+    expect(run.scheduledRetryAt).not.toBeNull();
+    expect(run.scheduledRetryAt!.getTime()).toBeGreaterThanOrEqual(before - 1000);
+    expect(run.scheduledRetryAt!.getTime()).toBeLessThan(new Date(advertisedResumeAt).getTime());
+  });
+
+  it("still runs the promotion-time capacity gate on a transient_failure capacity park", async () => {
+    // BLO-28919: a capacity denial whose reset arrived as prose parks under
+    // transient_failure, and promoteScheduledRetryRun re-probes it only through
+    // capacityDrivenTransientPark (errorFamily + a retryNotBefore floor). The
+    // retry-now clear must keep that floor, or the row dispatches blind into a
+    // still-empty pool. The route app cannot inject a gate, so call the service.
+    const floor = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    const { issueId, retryRunId } = await seedIssueWithRetry({
+      retryResultJson: {
+        errorFamily: "rate_limit_exhausted",
+        retryNotBefore: floor,
+        transientRetryNotBefore: floor,
+      },
+    });
+    const heartbeat = heartbeatService(db, {
+      penstockAvailabilityGate: {
+        async checkAdapter() {
+          return {
+            allow: false,
+            provider: "anthropic",
+            reason: "penstock.model_capacity_unavailable",
+            model: "claude-test",
+            resumeAt: new Date(Date.now() + 60_000),
+            retryAfterSeconds: null,
+          };
+        },
+        _resetForTesting() {},
+      },
+      skipQueuedRunDispatch: true,
+    });
+
+    const result = await heartbeat.retryScheduledRetryNow({ issueId });
+
+    expect(result.outcome).not.toBe("promoted");
+    const [run] = await db
+      .select({ status: heartbeatRuns.status, scheduledRetryReason: heartbeatRuns.scheduledRetryReason })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, retryRunId));
+    // The relabel happens only when the capacity gate ran and denied.
+    expect(run).toEqual({ status: "scheduled_retry", scheduledRetryReason: "ccrotate_capacity" });
+  });
+
+  it("leaves result_json untouched when retry-now promotes a row that never had one", async () => {
+    const { companyId, issueId, retryRunId } = await seedIssueWithRetry();
+
+    const res = await request(createApp(boardActor(companyId)))
+      .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toMatchObject({ outcome: "promoted" });
+
+    const [run] = await db
+      .select({ resultJson: heartbeatRuns.resultJson })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, retryRunId));
+    expect(run.resultJson).toBeNull();
+  });
+
+  it("leaves a non-object result_json untouched rather than flattening it to {}", async () => {
+    // parseObject() maps a jsonb array/scalar to {}, so clearing through it
+    // would *replace* the column instead of removing keys from it. Retry-now is
+    // the only writer of result_json on this path, so that loss would be
+    // unrecoverable. Treat a non-object exactly as null: skip the write.
+    const { companyId, issueId, retryRunId } = await seedIssueWithRetry({
+      retryResultJson: ["not", "an", "object"],
+    });
+
+    const res = await request(createApp(boardActor(companyId)))
+      .post(`/api/issues/${issueId}/scheduled-retry/retry-now`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toMatchObject({ outcome: "promoted" });
+
+    const [run] = await db
+      .select({ resultJson: heartbeatRuns.resultJson })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, retryRunId));
+    expect(run.resultJson).toEqual(["not", "an", "object"]);
   });
 
   it("returns a clear no-op response when there is no scheduled retry", async () => {

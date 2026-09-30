@@ -1,5 +1,7 @@
 import { applyPendingMigrations, inspectMigrations } from "./client.js";
+import { ensurePendingConcurrentIndexes } from "./concurrent-index-guard.js";
 import { resolveMigrationConnection } from "./migration-runtime.js";
+import { ensureOnlineIndexPrerequisites } from "./precreate-online-indexes.js";
 
 async function main(): Promise<void> {
   const resolved = await resolveMigrationConnection();
@@ -10,17 +12,37 @@ async function main(): Promise<void> {
     const before = await inspectMigrations(resolved.connectionString);
     if (before.status === "upToDate") {
       console.log("No pending migrations");
-      return;
+    } else {
+      const precreated = await ensureOnlineIndexPrerequisites(resolved.connectionString, {
+        log: (message) => console.log(`[precreate-online-indexes] ${message}`),
+      });
+      for (const result of precreated) {
+        console.log(`[precreate-online-indexes] ${result.migration}: ${result.indexName} -> ${result.action}`);
+      }
+
+      console.log(`Applying ${before.pendingMigrations.length} pending migration(s)...`);
+      await applyPendingMigrations(resolved.connectionString, {
+        prepareOnlineIndexes: true,
+        log: (message) => console.log(`[precreate-online-indexes] ${message}`),
+      });
+
+      const after = await inspectMigrations(resolved.connectionString);
+      if (after.status !== "upToDate") {
+        throw new Error(`Migrations incomplete: ${after.pendingMigrations.join(", ")}`);
+      }
+      console.log("Migrations complete");
     }
 
-    console.log(`Applying ${before.pendingMigrations.length} pending migration(s)...`);
-    await applyPendingMigrations(resolved.connectionString);
-
-    const after = await inspectMigrations(resolved.connectionString);
-    if (after.status !== "upToDate") {
-      throw new Error(`Migrations incomplete: ${after.pendingMigrations.join(", ")}`);
+    // Runs every time, not only when migrations were just applied: migration
+    // 0226 can record complete on a populated database without building its
+    // deferred index, so migration state alone is not sufficient evidence.
+    const indexResults = await ensurePendingConcurrentIndexes(resolved.connectionString);
+    for (const result of indexResults) {
+      // Printed unconditionally, including "already-valid" (BLO-21526): a line
+      // only on change makes a verified index indistinguishable from a guard
+      // that never ran, which is the defect this guard exists to close.
+      console.log(`Deferred index ${result.name} on ${result.table}: ${result.action}`);
     }
-    console.log("Migrations complete");
   } finally {
     await resolved.stop();
   }

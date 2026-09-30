@@ -743,6 +743,49 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       }));
     },
 
+    /**
+     * LOCK ORDER — read this before adding a caller.
+     *
+     * A transaction that writes both `budget_policies` and `agents` must take
+     * the `budget_policies` rows FIRST:
+     *
+     *   await txDb.select({ id: budgetPolicies.id }).from(budgetPolicies)
+     *     .where(and(eq(budgetPolicies.scopeType, "agent"),
+     *                eq(budgetPolicies.scopeId, agentId)))
+     *     .for("update");
+     *
+     * This function's own UPDATE takes the policy row, so a caller that writes
+     * the `agents` mirror first has already inverted the order by the time it
+     * gets here. Against a concurrent writer going the other way that is an ABBA
+     * deadlock: Postgres aborts one side with 40P01, which is not an `HttpError`,
+     * so `withRefusalLogged` neither logs nor maps it and the loser gets an
+     * unhandled 500 with no retry.
+     *
+     * The three in-transaction writers that take policies first:
+     * `PATCH /agents/:agentId/budgets` (`routes/costs.ts`),
+     * `applyApprovalEnforcement` (`approval-enforcement-executor.ts`), and the
+     * `hire_agent` decision path (`approvals.ts`, whose
+     * `activatePendingApproval` opens with `agents … for update`).
+     *
+     * The remaining callers and writers are outside the rule and are safe for
+     * reasons that do not generalise — do not copy them:
+     *  - `POST /companies/:companyId/budgets/policies` and
+     *    `PATCH /companies/:companyId/budgets` (`routes/costs.ts`),
+     *    `POST /companies` (`routes/companies.ts`),
+     *    `POST /companies/:companyId/agents` (`routes/agents.ts`), and
+     *    `resolveIncident` (this file, below) run outside any
+     *    transaction, so each statement autocommits and no lock is held across
+     *    the pair in either order. The agent-creation route is safe for that
+     *    reason and not because its row is new — the insert has committed by the
+     *    time it calls this, so a concurrent `PATCH /agents/:agentId/budgets` can
+     *    already name it. `budgets/policies` takes its scope from the request
+     *    body, so it writes agent-scope rows too;
+     *  - the non-pending branch of `approvals.approve` writes `agents` first
+     *    inside the live transaction, but inserts a brand new row whose id no
+     *    concurrent request can name yet — the only caller that reason covers.
+     *
+     * BLO-32796 introduced the order; BLO-34422 brought the last writer into it.
+     */
     upsertPolicy: async (
       companyId: string,
       input: BudgetPolicyUpsertInput,
@@ -781,8 +824,31 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
             hardStopEnabled: input.hardStopEnabled ?? existing.hardStopEnabled,
             notifyEnabled: input.notifyEnabled ?? existing.notifyEnabled,
             isActive: nextIsActive,
-            updatedByUserId: actorUserId,
+            // Only when the actor is a user. An agent-driven write — the apply
+            // route in `approval-enforcement-executor.ts` is the first — passes
+            // null here, and overwriting would discard whichever board user
+            // last set the cap without recording anything in its place. That
+            // write's own attribution lives in the config revision and the
+            // `approval.enforcement_applied` activity row (BLO-32796).
+            //
+            // These two columns are NOT a pair, and nothing should render them
+            // as one: `updatedAt` below is a row-touch stamp bumped by every
+            // writer, so after an agent write it carries that write's time
+            // beside the earlier board user's id. Left that way deliberately —
+            // there is no reader of this column today, and making `updatedAt`
+            // conditional would make a genuinely changed row look untouched,
+            // which is the worse failure. If a "last changed by" surface is
+            // ever built, it needs its own stamp, the way `amountUpdatedAt`
+            // already does it (BLO-34422).
+            ...(actorUserId === null ? {} : { updatedByUserId: actorUserId }),
             updatedAt: now,
+            // Only when the enforced figure actually moved. This is the single
+            // edit path for warn percent, hard stop, notify and active state as
+            // well, and `approval-enforcement-reconciler.ts` reads this column
+            // as "a later decision moved the cap" — so stamping it on a metadata
+            // toggle would let that toggle hide a real enforcement gap
+            // (BLO-32796).
+            ...(amount === existing.amount ? {} : { amountUpdatedAt: now }),
           })
           .where(eq(budgetPolicies.id, existing.id))
           .returning()
@@ -1144,6 +1210,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
             isActive: true,
             updatedByUserId: actorUserId,
             updatedAt: now,
+            ...(nextAmount === policy.amount ? {} : { amountUpdatedAt: now }),
           })
           .where(eq(budgetPolicies.id, policy.id));
 

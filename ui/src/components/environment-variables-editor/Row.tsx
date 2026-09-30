@@ -22,6 +22,7 @@ import { SecretPicker } from "./SecretPicker";
 import { CreateSecretPopover, ConvertToSecretPopover } from "./CreateSecretPopover";
 import { isSensitiveEnv } from "./sensitive";
 import {
+  canStoreValueAsSecret,
   computeRowHealth,
   computeUserSecretRowHealth,
   planSourceSwitch,
@@ -98,7 +99,10 @@ export function EnvironmentVariableRow({
   const boundSecret = row.source === "secret" ? secrets.find((s) => s.id === row.secretId) ?? null : null;
   const userSecretsEnabled = (userSecretDefinitions?.length ?? 0) > 0;
   const sensitive =
-    row.source === "text" && !row.sensitiveDismissed && isSensitiveEnv(row.name, row.textValue);
+    row.source === "text" &&
+    !row.sensitiveDismissed &&
+    !row.masked &&
+    isSensitiveEnv(row.name, row.textValue);
 
   // Consume parent focus requests (append / source-switch flows).
   useEffect(() => {
@@ -177,6 +181,16 @@ export function EnvironmentVariableRow({
   }
 
   function openStoreAsSecret() {
+    // Same guard as the source switch, for the same reason: `textValue` is the withheld sentinel,
+    // not a value this client holds. Both other entry points to this popover route a withheld row
+    // to the picker, so this one does too rather than storing the placeholder.
+    if (!canStoreValueAsSecret(row)) {
+      onPatch({ source: "secret", userSecretKey: "", required: true });
+      window.setTimeout(() => {
+        valueCellRef.current?.querySelector<HTMLElement>("[role=combobox]")?.focus();
+      }, 0);
+      return;
+    }
     const name = secretNameFromKey(row.name) || "secret";
     const { textValue } = row;
     window.setTimeout(() => setSecretPopover({ mode: "store", name, value: textValue }), 0);
@@ -307,7 +321,7 @@ export function EnvironmentVariableRow({
                     spellCheck={false}
                     disabled={disabled}
                     aria-label="Variable value"
-                    onChange={(event) => onPatch({ textValue: event.target.value })}
+                    onChange={(event) => onPatch({ textValue: event.target.value, masked: false })}
                     onKeyDown={(event) => {
                       if (event.key === "Enter" && isLast) {
                         event.preventDefault();

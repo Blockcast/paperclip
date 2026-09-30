@@ -5,6 +5,7 @@ import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CompanySecret, EnvBinding } from "@paperclipai/shared";
+import { REDACTED_SENTINEL } from "@paperclipai/shared";
 import { EnvironmentVariablesEditor } from "./index";
 import { SecretPicker } from "./SecretPicker";
 
@@ -585,6 +586,144 @@ describe("EnvironmentVariablesEditor", () => {
     expect(warning!.parentElement).not.toBe(nameInput.parentElement);
     expect(warning!.className).toContain("col-span-2");
     expect(warning!.className).toContain("@[40rem]/env:row-start-2");
+  });
+
+  it("blocks renaming a withheld row at the name field, without waiting for blur (PEN-3033)", async () => {
+    // The server refuses this PATCH whole — `normalizeEnvConfig` throws on the sentinel under a key
+    // it has nothing stored for — taking every other edit in the same save down with it, and its
+    // message names an internal placeholder rather than a row. This is that refusal moved to where
+    // the row is known.
+    const onChange = vi.fn();
+    render(
+      <EnvironmentVariablesEditor
+        value={{ GH_TOKEN: { type: "plain", value: REDACTED_SENTINEL }, NODE_ENV: { type: "plain", value: "production" } }}
+        secrets={secrets}
+        onChange={onChange}
+        onCreateSecret={async () => secrets[0]}
+      />,
+    );
+
+    const findRenameError = () =>
+      [...container.querySelectorAll<HTMLParagraphElement>("p")].find((node) => node.textContent?.includes("Re-enter the value to rename"));
+
+    expect(findRenameError(), "an untouched withheld row is not an error").toBeFalsy();
+
+    const nameInput = nameInputs()[0]!;
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+    setter.call(nameInput, "GITHUB_TOKEN");
+    nameInput.dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+
+    // No blur: `touchedNames` is seeded with the LOADED names and probed by the CURRENT one, so a
+    // rename is never "touched". Gating on it would hide this error in exactly the case it exists
+    // for — asserted here rather than in the model, which cannot see the gate.
+    const error = findRenameError();
+    expect(error, "rename error should render while the field still has focus").toBeTruthy();
+    expect(error!.textContent, "must name the key to get back to").toContain("GH_TOKEN");
+    expect(nameInput.getAttribute("aria-describedby")).toBe(error!.id);
+    expect(nameInput.getAttribute("aria-invalid")).toBe("true");
+
+    // Typing a value clears `masked`, so the client now holds a real value for the new key and the
+    // rename is legitimate. The block must lift on its own rather than needing a revert.
+    const valueInput = container.querySelectorAll<HTMLInputElement>('input[aria-label="Variable value"]')[0]!;
+    setter.call(valueInput, "a-new-token");
+    valueInput.dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+    expect(findRenameError(), "supplying a value should lift the block").toBeFalsy();
+
+    saveButton().click();
+    await flush();
+    expect(onChange).toHaveBeenLastCalledWith({
+      GITHUB_TOKEN: { type: "plain", value: "a-new-token" },
+      NODE_ENV: { type: "plain", value: "production" },
+    });
+  });
+
+  it("refuses the save while a withheld row is renamed, on both the editor button and an outer submit (PEN-3033)", async () => {
+    // The companion to the rename *message*. Rendering the error is not the fix on its own:
+    // `valueFromRows` still emits `{ type: "plain", value: "***REDACTED***" }` under the new key, so
+    // an editor that only annotates would show the user what is wrong and submit it anyway. The
+    // server then refuses the PATCH whole and the untouched NODE_ENV edit dies with it. Measured
+    // before this guard existed: onChange fired once, carrying exactly that payload.
+    const onChange = vi.fn();
+    const submitted: Array<Record<string, EnvBinding> | undefined> = [];
+
+    function FormHarness() {
+      const [value, setValue] = useState<Record<string, EnvBinding>>({
+        GH_TOKEN: { type: "plain", value: REDACTED_SENTINEL },
+        NODE_ENV: { type: "plain", value: "production" },
+      });
+      return (
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            submitted.push(value);
+          }}
+        >
+          <EnvironmentVariablesEditor
+            value={value}
+            secrets={secrets}
+            onChange={(next) => {
+              onChange(next);
+              setValue(next ?? {});
+            }}
+            onCreateSecret={async () => secrets[0]}
+          />
+          <button type="submit">Outer save</button>
+        </form>
+      );
+    }
+
+    render(<FormHarness />);
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+
+    // Rename the withheld row, and edit a *different* row — the one a 422 would take down with it.
+    const nameInput = nameInputs()[0]!;
+    setter.call(nameInput, "GITHUB_TOKEN");
+    nameInput.dispatchEvent(new Event("input", { bubbles: true }));
+    const otherValue = container.querySelectorAll<HTMLInputElement>('input[aria-label="Variable value"]')[1]!;
+    setter.call(otherValue, "staging");
+    otherValue.dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+
+    // Route 1: the editor's own Save button — disabled, and inert if clicked anyway.
+    const save = saveButton();
+    expect(save.disabled, "the editor Save button must be disabled").toBe(true);
+    save.click();
+    await flush();
+    expect(onChange, "the editor button must not emit a sentinel-bearing payload").not.toHaveBeenCalled();
+
+    // The refusal has to say which row, next to the button it disabled.
+    const banner = [...container.querySelectorAll<HTMLParagraphElement>("p")].find((node) =>
+      node.textContent?.includes("Can't save"),
+    );
+    expect(banner, "the blocked save must explain itself").toBeTruthy();
+    expect(banner!.textContent, "and must name the row").toContain("GH_TOKEN");
+
+    // Route 2: an outer submit reaches `flushPendingDraft` directly, bypassing the button entirely.
+    const outerSave = [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) =>
+      button.textContent?.includes("Outer save"),
+    )!;
+    outerSave.click();
+    await flush();
+    expect(onChange, "an outer submit must not promote the blocked draft either").not.toHaveBeenCalled();
+    expect(submitted.at(-1), "the outer form still sees the last good value").toEqual({
+      GH_TOKEN: { type: "plain", value: REDACTED_SENTINEL },
+      NODE_ENV: { type: "plain", value: "production" },
+    });
+
+    // Re-entering a value makes the rename legitimate; both routes must open back up.
+    const maskedValue = container.querySelectorAll<HTMLInputElement>('input[aria-label="Variable value"]')[0]!;
+    setter.call(maskedValue, "a-new-token");
+    maskedValue.dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+    expect(saveButton().disabled, "the block must lift, not latch").toBe(false);
+    saveButton().click();
+    await flush();
+    expect(onChange).toHaveBeenLastCalledWith({
+      GITHUB_TOKEN: { type: "plain", value: "a-new-token" },
+      NODE_ENV: { type: "plain", value: "staging" },
+    });
   });
 
   it("bulk-imports a dotenv paste into an empty name field", async () => {

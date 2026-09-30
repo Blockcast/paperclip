@@ -496,6 +496,7 @@ describe("CompanyEnvironments — test provider button", () => {
     });
     await flushReact();
 
+    await waitForAssertion(() => expect(testProviderButtons(container)).toHaveLength(2));
     const buttonsBefore = testProviderButtons(container);
     expect(buttonsBefore).toHaveLength(2);
     expect(buttonsBefore.every((button) => button.textContent?.trim() === "Test provider")).toBe(true);
@@ -542,6 +543,7 @@ describe("CompanyEnvironments — test provider button", () => {
     });
     await flushReact();
 
+    await waitForAssertion(() => expect(testProviderButtons(container)).toHaveLength(1));
     await act(async () => {
       testProviderButtons(container)[0].dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
@@ -581,6 +583,7 @@ describe("CompanyEnvironments — test provider button", () => {
     });
     await flushReact();
 
+    await waitForAssertion(() => expect(testProviderButtons(container)).toHaveLength(1));
     await act(async () => {
       testProviderButtons(container)[0].dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
@@ -602,6 +605,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await flushReact();
 
     // Click both rows in quick succession while both probes are still pending.
+    await waitForAssertion(() => expect(testProviderButtons(container)).toHaveLength(2));
     await act(async () => {
       testProviderButtons(container)[0].dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
@@ -658,9 +662,7 @@ describe("CompanyEnvironments — test provider button", () => {
     });
     await flushReact();
 
-    await act(async () => {
-      click(findAction(container, "Edit"));
-    });
+    await openFirstEnvironmentForEditing(container);
 
     await waitForAssertion(() => {
       expect(getEnvironmentFormPage()?.textContent).toContain("Edit environment");
@@ -708,9 +710,7 @@ describe("CompanyEnvironments — test provider button", () => {
     });
     await flushReact();
 
-    await act(async () => {
-      click(findAction(container, "Edit"));
-    });
+    await openFirstEnvironmentForEditing(container);
     await waitForAssertion(() => {
       expect(getEnvironmentFormPage()?.textContent).toContain("Edit environment");
     });
@@ -747,9 +747,7 @@ describe("CompanyEnvironments — test provider button", () => {
     });
     await flushReact();
 
-    await act(async () => {
-      click(findAction(container, "Edit"));
-    });
+    await openFirstEnvironmentForEditing(container);
     await waitForAssertion(() => {
       expect(getEnvironmentFormPage()?.textContent).toContain("Edit environment");
     });

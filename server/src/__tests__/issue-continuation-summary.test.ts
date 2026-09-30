@@ -86,6 +86,30 @@ describe("issue continuation summaries", () => {
     expect(body).toContain("Inspect the failed run, fix the cause");
   });
 
+  it("keeps the causal tail of a long run error", () => {
+    const cause = "error: could not lock config file /workspace/.git/config.lock: File exists";
+    const body = buildContinuationSummaryMarkdown({
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-1579",
+        title: "Add continuation summaries",
+        description: null,
+        status: "in_progress",
+        priority: "medium",
+      },
+      run: {
+        id: "run-3",
+        status: "failed",
+        error: `${"/very/long/workspace/path/".repeat(30)}${cause}`,
+        errorCode: "workspace_git_submodule_unavailable",
+        resultJson: null,
+      },
+      agent: { id: "agent-1", name: "CodexCoder", adapterType: "codex_local" },
+    });
+
+    expect(body).toContain("could not lock config file");
+  });
+
   it("detects continuation summaries that explicitly park executor work for review", () => {
     const body = [
       "# Continuation Summary",

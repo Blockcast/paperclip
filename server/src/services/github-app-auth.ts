@@ -19,7 +19,13 @@
  */
 import { createSign } from "node:crypto";
 
+import { scrubGitHubEgressText } from "@paperclipai/adapter-utils";
+
 import { loadConfig } from "../config.js";
+import {
+  extractAllyReviewedHeadSha,
+  hasAllyConsolidatedReviewHeading,
+} from "./ally-review-detection.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 
 const GITHUB_HOST = "github.com";
@@ -81,6 +87,56 @@ export function githubReviewerIdentityMatches(login: string, configuredLogin: st
   // GitHub usernames cannot contain `[`/`]` or `/`, so a user account cannot
   // register either accepted App representation and collide with this match.
   return candidate === `${appSlug}[bot]` || candidate === `app/${appSlug}`;
+}
+
+/**
+ * Match ANY spelling of the reviewer identity, the bare `<slug>` user seat
+ * included.
+ *
+ * The fail direction is the inverse of `githubReviewerIdentityMatches`, so the
+ * two are not interchangeable. CREDITING a review must exclude the user seat:
+ * it is a distinct principal, and counting it would let a human-shaped account
+ * speak as the reviewer. DETECTING a self-attestation must include it: the seat
+ * and the App are one agent wearing two hats, so a PR opened by the seat and
+ * attested by the App is still nothing independent examining that head.
+ */
+export function githubSharesReviewerIdentity(login: string, configuredLogin: string): boolean {
+  const candidate = exactGithubLogin(login);
+  const appSlug = githubReviewerAppSlug(configuredLogin);
+  if (!candidate || !appSlug) return false;
+  return candidate === appSlug || githubReviewerIdentityMatches(login, configuredLogin);
+}
+
+/**
+ * Are these two logins the same actor, whichever hat each is wearing?
+ *
+ * `githubSharesReviewerIdentity` is directional — it derives an App slug from
+ * its SECOND argument — so it returns false whenever that side is a plain user
+ * login. This helper is symmetric: both orders, plus plain login equality.
+ *
+ * WHAT IT ACTUALLY BUYS AT ITS CALLER, stated honestly because the obvious
+ * justification does not hold (Ally review of #1966). Its only caller is
+ * `evidence-truth.ts`, comparing a review login against the PR author. Every
+ * row on that surface has already passed `githubReviewerIdentityMatches`, so
+ * the review side is ALWAYS the configured App — which collapses this call to
+ * `githubSharesReviewerIdentity(prAuthor, botLogin)`, the one-liner the merge
+ * gate already uses. Two spellings of one human, and a human reviewing their
+ * own PR, are both UNREACHABLE through that caller today.
+ *
+ * So this is kept for the FORWARD-COMPAT direction, not for a live gap: it
+ * reads the login the row actually carries instead of a config constant, so it
+ * stays correct if that surface is ever widened to admit unfiltered reviewers.
+ * The constant-based form would then fail OPEN — crediting a human's review of
+ * their own PR — and this one fails closed. On a self-attestation check that
+ * asymmetry is the whole reason to prefer the symmetric helper; if the surface
+ * filter is ever made unconditional and provably permanent, delete this and
+ * call `githubSharesReviewerIdentity` directly.
+ */
+export function githubSameActorLogin(a: string, b: string): boolean {
+  const left = exactGithubLogin(a);
+  const right = exactGithubLogin(b);
+  if (!left || !right) return false;
+  return left === right || githubSharesReviewerIdentity(a, b) || githubSharesReviewerIdentity(b, a);
 }
 
 /**
@@ -158,7 +214,10 @@ export function githubAppCredentialsConfigured(): boolean {
  * Return a cached or freshly-minted installation access token, or null when
  * creds are absent or the GitHub API call fails.
  */
-export async function getInstallationTokenResult(nowMs: number = Date.now()): Promise<GitHubInstallationTokenResult> {
+export async function getInstallationTokenResult(
+  nowMs: number = Date.now(),
+  options: { signal?: AbortSignal } = {},
+): Promise<GitHubInstallationTokenResult> {
   if (cachedInstallationToken && cachedInstallationToken.expiresAtMs - TOKEN_REFRESH_SKEW_MS > nowMs) {
     return { ok: true, token: cachedInstallationToken.token };
   }
@@ -177,6 +236,7 @@ export async function getInstallationTokenResult(nowMs: number = Date.now()): Pr
     res = await ghFetch(url, {
       method: "POST",
       headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${jwt}` },
+      signal: options.signal,
     });
   } catch {
     return { ok: false, retryable: true, reason: "github_app_token_fetch_failed" };
@@ -210,9 +270,34 @@ export type PullRequestGateResult =
   | { state: "open" | "closed"; merged: boolean }
   | { error: string };
 
+export type GitHubCommitEvidenceResult =
+  | { found: true }
+  | { found: false }
+  | { error: string };
+
+export async function githubHasCommitEvidence(input: {
+  repoFullName: string;
+  sha: string;
+}): Promise<GitHubCommitEvidenceResult> {
+  const tokenResult = await getInstallationTokenResult();
+  if (!tokenResult.ok) return { error: tokenResult.reason };
+  try {
+    const res = await ghFetch(
+      `${gitHubApiBase(GITHUB_HOST)}/repos/${input.repoFullName}/commits/${input.sha}`,
+      { headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` } },
+    );
+    if (res.ok) return { found: true };
+    const classified = await classifyGithubHttpFailure("commit", res);
+    return classified.retryable ? { error: classified.reason } : { found: false };
+  } catch {
+    return { error: "commit_fetch_failed" };
+  }
+}
+
 export async function githubGetPullRequestGate(input: {
   repoFullName: string;
   prNumber: number;
+  signal?: AbortSignal;
 }): Promise<PullRequestGateResult> {
   const tokenResult = await getInstallationTokenResult();
   if (!tokenResult.ok) return { error: tokenResult.reason };
@@ -222,6 +307,7 @@ export async function githubGetPullRequestGate(input: {
   try {
     res = await ghFetch(`${apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}`, {
       headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` },
+      signal: input.signal,
     });
   } catch {
     return { error: "pull_request_fetch_failed" };
@@ -240,6 +326,540 @@ export async function githubGetPullRequestGate(input: {
   return { state: body.state, merged: body.merged === true };
 }
 
+export type OpenPullRequestOnBase = {
+  number: number;
+  title: string | null;
+  url: string | null;
+  headRef: string | null;
+};
+
+export type OpenPullRequestsOnBaseResult =
+  | { pullRequests: OpenPullRequestOnBase[]; truncated: boolean }
+  | { error: string };
+
+const OPEN_PRS_ON_BASE_PAGE_SIZE = 100;
+
+/**
+ * Pure payload parse, split from the fetch so the decision logic is testable
+ * without network or credentials — the same injection-seam reasoning as
+ * `ReadPullRequestGate` in the terminal-gate reconciler.
+ */
+export function parseOpenPullRequestsOnBasePayload(body: unknown): OpenPullRequestsOnBaseResult {
+  // A non-array body is not an empty page. Treating it as one would report a
+  // confident "this branch had no stacked children" for a response we could not
+  // read at all — the same false all-clear `listOpenPullRequests` refuses.
+  if (!Array.isArray(body)) return { error: "open_pull_requests_malformed" };
+
+  const pullRequests: OpenPullRequestOnBase[] = [];
+  for (const entry of body as Array<Record<string, unknown>>) {
+    const number = entry?.number;
+    if (!Number.isInteger(number)) continue;
+    const head = entry?.head as Record<string, unknown> | undefined;
+    pullRequests.push({
+      number: number as number,
+      title: typeof entry?.title === "string" ? entry.title : null,
+      url: typeof entry?.html_url === "string" ? entry.html_url : null,
+      headRef: typeof head?.ref === "string" ? head.ref : null,
+    });
+  }
+  // One page is the whole answer for any real stacked chain. Surface the cap
+  // anyway: a full page means "there may be more", which is a different claim
+  // from "these are all of them", and a silent prefix reads as the latter.
+  return { pullRequests, truncated: body.length >= OPEN_PRS_ON_BASE_PAGE_SIZE };
+}
+
+/**
+ * Open PRs targeting `baseRef` — the stacked children of a branch (BLO-29856).
+ *
+ * Uses GitHub's own `?base=` filter rather than enumerating every open PR and
+ * filtering client-side. A stacked chain is a handful of PRs, so the server-side
+ * filter is one request instead of one per 100 open PRs in the repo.
+ *
+ * Fails closed. An unreadable enumeration is NOT an empty one, and the caller
+ * must be able to tell those apart: coercing a failed read to "no stacked
+ * children" reproduces exactly the silent no-wake this lookup exists to break.
+ */
+export async function githubListOpenPullRequestsByBase(input: {
+  repoFullName: string;
+  baseRef: string;
+  signal?: AbortSignal;
+}): Promise<OpenPullRequestsOnBaseResult> {
+  const tokenResult = await getInstallationTokenResult();
+  if (!tokenResult.ok) return { error: tokenResult.reason };
+
+  const url =
+    `${gitHubApiBase(GITHUB_HOST)}/repos/${input.repoFullName}/pulls` +
+    `?state=open&per_page=${OPEN_PRS_ON_BASE_PAGE_SIZE}&base=${encodeURIComponent(input.baseRef)}`;
+  let res: Response;
+  try {
+    res = await ghFetch(url, {
+      headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` },
+      signal: input.signal,
+    });
+  } catch {
+    return { error: "open_pull_requests_fetch_failed" };
+  }
+  if (!res.ok) {
+    const classified = await classifyGithubHttpFailure("pull_request", res);
+    return { error: classified.reason };
+  }
+  return parseOpenPullRequestsOnBasePayload(await res.json().catch(() => null));
+}
+
+export type BranchState = "exists" | "deleted" | "unknown";
+
+/**
+ * Does `branch` still exist? (BLO-29856)
+ *
+ * Disambiguates an empty stacked-child enumeration. When a merged PR's head
+ * branch is deleted (`delete_branch_on_merge`, or the "Delete branch" button),
+ * GitHub auto-retargets every PR based on it. Those children no longer match
+ * `?base=<merged head>`, so the enumeration returns nothing, and the retarget
+ * is bare with no rebase: the exact state a rewriting merge makes unsafe.
+ *
+ * 404 reads as `deleted`: callers have just read this repository's pulls with
+ * the same token, so the repository itself is visible. Any other unreadable
+ * answer is `unknown`, never `exists`, so a failed read cannot pass for proof
+ * that the empty enumeration was the whole story.
+ */
+export async function githubResolveBranchState(input: {
+  repoFullName: string;
+  branch: string;
+  signal?: AbortSignal;
+}): Promise<BranchState> {
+  const tokenResult = await getInstallationTokenResult();
+  if (!tokenResult.ok) return "unknown";
+  try {
+    const res = await ghFetch(
+      `${gitHubApiBase(GITHUB_HOST)}/repos/${input.repoFullName}/branches/${encodeURIComponent(input.branch)}`,
+      {
+        headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` },
+        signal: input.signal,
+      },
+    );
+    if (res.ok) return "exists";
+    return res.status === 404 ? "deleted" : "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+/**
+ * Did the merge preserve the base PR's commit SHAs, or rewrite them? (BLO-29856)
+ *
+ * This decides what a stacked child must be told to do, and the two answers take
+ * opposite actions:
+ *
+ *  - `merge_commit` — the base's commits are on the target branch under their
+ *    original SHAs, so the child's base SHA is still an ancestor and a bare
+ *    retarget is clean.
+ *  - `rewritten` — rebase-merge and squash-merge both land the base's work under
+ *    NEW SHAs. The child's old base is no longer an ancestor, so retargeting
+ *    alone REPLAYS the base PR's entire diff into the child. It needs a rebase.
+ *
+ * Derived from the merge commit's parent count, the only signal GitHub gives:
+ * `pull_request.closed` carries no `merge_method`, and a repo's enabled merge
+ * methods say what was *allowed*, not what was *used*. Two parents is a true
+ * merge commit; one parent is squash or rebase. Squash and rebase are
+ * deliberately NOT told apart — they have the same consequence for a child.
+ *
+ * `unknown` on any read failure, and the caller must say so rather than guess.
+ * Recommending a bare retarget after a rebase is the specific trap this exists
+ * to stop, so an unverified guess in that direction is worse than no advice.
+ */
+export type MergeHistoryShape = "merge_commit" | "rewritten" | "unknown";
+
+/** Pure half of `githubResolveMergeHistoryShape`, split so it is testable without network. */
+export function parseMergeHistoryShape(body: unknown): MergeHistoryShape {
+  const parents = (body as { parents?: unknown } | null)?.parents;
+  if (!Array.isArray(parents)) return "unknown";
+  return parents.length >= 2 ? "merge_commit" : "rewritten";
+}
+
+export async function githubResolveMergeHistoryShape(input: {
+  repoFullName: string;
+  mergeCommitSha: string;
+  signal?: AbortSignal;
+}): Promise<MergeHistoryShape> {
+  const tokenResult = await getInstallationTokenResult();
+  if (!tokenResult.ok) return "unknown";
+  try {
+    const res = await ghFetch(
+      `${gitHubApiBase(GITHUB_HOST)}/repos/${input.repoFullName}/commits/${input.mergeCommitSha}`,
+      {
+        headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` },
+        signal: input.signal,
+      },
+    );
+    if (!res.ok) return "unknown";
+    return parseMergeHistoryShape(await res.json().catch(() => null));
+  } catch {
+    return "unknown";
+  }
+}
+
+/**
+ * Is a named status context actually **required to merge** on the branch this
+ * PR targets? (PEN-3487)
+ *
+ * The same context name carries opposite consequences across our repos —
+ * measured 2026-09-24, `review/ally-complete` is one of ten required contexts on
+ * `Blockcast/penstock-llm-proxy-core`, is not required at all on
+ * `Blockcast/paperclip` (whose `master` requires exactly `verify`), and
+ * `Blockcast/onprem-k8s` requires none. A reader who sees that context red has
+ * no way to tell which of those they are looking at, and the cost is not
+ * hypothetical: PEN-3487 was filed as a merge-pipeline blocker, escalated, and
+ * absorbed hours of investigation across three agents before anyone read
+ * `branches/master` and found the gate blocks nothing there.
+ *
+ * Three outcomes, kept distinct on purpose. `unknown` must never collapse into
+ * `not_required`: "we could not read branch protection" and "we read it and the
+ * context is absent" are opposite facts, and flattening them would put a
+ * confident all-clear on an unread gate.
+ *
+ * **Two surfaces, and reading only one is how this function tells the exact lie
+ * it exists to remove.** Classic branch protection and repository/organization
+ * rulesets can each require a status check independently, and
+ * `GET /branches/{branch}` reports only the first. `Blockcast/hang-mmt-fec` is
+ * the worked case, measured 2026-09-26: `main` returns
+ * `protected: true` with `required_status_checks: {checks: [], contexts: [],
+ * enforcement_level: "off"}` — an empty classic set — while org ruleset
+ * `19274071` requires `review/ally-complete`, `Check` and `Runner policy` there.
+ * Reading classic alone would answer `not_required` about a gate that genuinely
+ * blocks the merge, and the empty-union case is a `200`, so no `unknown` guard
+ * catches it. `GET /repos/{repo}/rules/branches/{ref}` returns the rules *in
+ * effect* — including org-level rulesets — and is readable by this token.
+ *
+ * Absence is therefore only asserted from BOTH surfaces. If the ruleset read
+ * fails, a context missing from classic protection is `unknown`, never
+ * `not_required`. Presence needs only one: a ruleset cannot un-require what
+ * classic protection requires, so a hit in classic short-circuits and skips the
+ * second call.
+ *
+ * Readability note: this uses `GET /repos/{repo}/branches/{branch}`, whose
+ * `.protection` summary an ordinary installation token CAN read. The narrower
+ * `branches/{branch}/protection` endpoint 403s for a non-admin App, which is the
+ * read that has repeatedly been mistaken for "the required set is unknowable
+ * from an agent seat". `rules/branches/{ref}` is readable from that same seat.
+ */
+export type PrRequiredStatusContextLookup =
+  | {
+    outcome: "required";
+    baseRef: string;
+    requiredContexts: string[];
+    /** Which surface required it — a ruleset is the one readers cannot see. */
+    source: "branch_protection" | "ruleset";
+  }
+  | { outcome: "not_required"; baseRef: string; branchProtected: boolean; requiredContexts: string[] }
+  // `baseRef` is present whenever the base ref resolved and only a later read
+  // failed, so the notice can name the branch it could not read.
+  | { outcome: "unknown"; reason: string; baseRef?: string };
+
+function encodeGitRefPath(ref: string): string {
+  // Branch names legitimately contain `/`, which must stay a path separator;
+  // everything else gets encoded so a ref cannot escape the path.
+  return ref.split("/").map((segment) => encodeURIComponent(segment)).join("/");
+}
+
+type RequiredContextsRead =
+  | { ok: true; contexts: string[]; branchProtected: boolean }
+  | { ok: false; reason: string };
+
+/** Classic branch protection, via the `.protection` summary on `branches/{b}`. */
+async function readClassicRequiredContexts(
+  apiBase: string,
+  repoFullName: string,
+  baseRef: string,
+  headers: Record<string, string>,
+  signal?: AbortSignal,
+): Promise<RequiredContextsRead> {
+  try {
+    const res = await ghFetch(
+      `${apiBase}/repos/${repoFullName}/branches/${encodeGitRefPath(baseRef)}`,
+      { headers, signal },
+    );
+    if (!res.ok) {
+      const classified = await classifyGithubHttpFailure("required_context_branch", res);
+      return { ok: false, reason: classified.reason };
+    }
+    const body = (await res.json().catch(() => null)) as {
+      protected?: boolean;
+      protection?: {
+        enabled?: boolean;
+        required_status_checks?: {
+          contexts?: unknown;
+          checks?: unknown;
+        };
+      };
+    } | null;
+    if (!body) return { ok: false, reason: "required_context_branch_body_missing" };
+
+    const required = body.protection?.required_status_checks;
+    // `contexts` is the legacy shape and `checks[].context` the current one;
+    // GitHub still returns both, but a repo configured only through the newer
+    // API can come back with an empty `contexts`. Union them rather than
+    // trusting either alone — reading only `contexts` would report a genuinely
+    // required check as unrequired, which is the one error direction that
+    // matters here.
+    //
+    // `enforcement_level` is deliberately NOT consulted. Every repo measured
+    // with checks disabled returned `"off"` alongside an empty `contexts`, so
+    // the disagreeing case is unobserved; if it ever occurs, reporting a listed
+    // context as `required` merely tells a reader to look, whereas honouring
+    // `"off"` would print an all-clear over a gate we cannot prove is inert.
+    const fromContexts = Array.isArray(required?.contexts)
+      ? required.contexts.filter((value): value is string => typeof value === "string")
+      : [];
+    const fromChecks = Array.isArray(required?.checks)
+      ? required.checks
+        .map((check) =>
+          check && typeof check === "object" && typeof (check as { context?: unknown }).context === "string"
+            ? (check as { context: string }).context
+            : null
+        )
+        .filter((value): value is string => value !== null)
+      : [];
+    return {
+      ok: true,
+      contexts: [...new Set([...fromContexts, ...fromChecks])],
+      branchProtected: body.protected === true || body.protection?.enabled === true,
+    };
+  } catch {
+    return { ok: false, reason: "required_context_branch_fetch_failed" };
+  }
+}
+
+/**
+ * Repository- and organization-level rulesets in effect for this ref, via
+ * `rules/branches/{ref}`. Invisible to `branches/{b}` — see the type doc.
+ */
+async function readRulesetRequiredContexts(
+  apiBase: string,
+  repoFullName: string,
+  baseRef: string,
+  headers: Record<string, string>,
+  signal?: AbortSignal,
+): Promise<{ ok: true; contexts: string[] } | { ok: false; reason: string }> {
+  try {
+    const res = await ghFetch(
+      `${apiBase}/repos/${repoFullName}/rules/branches/${encodeGitRefPath(baseRef)}`,
+      { headers, signal },
+    );
+    if (!res.ok) {
+      const classified = await classifyGithubHttpFailure("required_context_rules", res);
+      return { ok: false, reason: classified.reason };
+    }
+    const body = await res.json().catch(() => null);
+    // An empty array is the normal answer for a repo with no rulesets, so the
+    // shape check must not treat `[]` as unreadable. A non-array body is.
+    if (!Array.isArray(body)) return { ok: false, reason: "required_context_rules_body_missing" };
+
+    const contexts: string[] = [];
+    for (const rule of body) {
+      if (!rule || typeof rule !== "object") continue;
+      if ((rule as { type?: unknown }).type !== "required_status_checks") continue;
+      const checks = (rule as { parameters?: { required_status_checks?: unknown } })
+        .parameters?.required_status_checks;
+      if (!Array.isArray(checks)) continue;
+      for (const check of checks) {
+        if (check && typeof check === "object" && typeof (check as { context?: unknown }).context === "string") {
+          contexts.push((check as { context: string }).context);
+        }
+      }
+    }
+    return { ok: true, contexts: [...new Set(contexts)] };
+  } catch {
+    return { ok: false, reason: "required_context_rules_fetch_failed" };
+  }
+}
+
+export async function githubGetPrRequiredStatusContext(input: {
+  repoFullName: string;
+  prNumber: number;
+  context: string;
+  signal?: AbortSignal;
+}): Promise<PrRequiredStatusContextLookup> {
+  const context = input.context.trim();
+  if (!context) return { outcome: "unknown", reason: "status_context_empty" };
+
+  const tokenResult = await getInstallationTokenResult();
+  if (!tokenResult.ok) return { outcome: "unknown", reason: tokenResult.reason };
+  const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` };
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+
+  let baseRef: string;
+  try {
+    const res = await ghFetch(`${apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}`, {
+      headers,
+      signal: input.signal,
+    });
+    if (!res.ok) {
+      const classified = await classifyGithubHttpFailure("required_context_pull_request", res);
+      return { outcome: "unknown", reason: classified.reason };
+    }
+    const body = (await res.json().catch(() => null)) as { base?: { ref?: string } } | null;
+    const ref = typeof body?.base?.ref === "string" ? body.base.ref.trim() : "";
+    if (!ref) return { outcome: "unknown", reason: "required_context_base_ref_missing" };
+    baseRef = ref;
+  } catch {
+    return { outcome: "unknown", reason: "required_context_pull_request_fetch_failed" };
+  }
+
+  const classic = await readClassicRequiredContexts(
+    apiBase,
+    input.repoFullName,
+    baseRef,
+    headers,
+    input.signal,
+  );
+  if (!classic.ok) return { outcome: "unknown", reason: classic.reason, baseRef };
+
+  // Presence needs one surface; absence needs both. A hit here is final, so the
+  // ruleset call is skipped.
+  if (classic.contexts.includes(context)) {
+    return {
+      outcome: "required",
+      baseRef,
+      requiredContexts: [...classic.contexts].sort(),
+      source: "branch_protection",
+    };
+  }
+
+  const ruleset = await readRulesetRequiredContexts(
+    apiBase,
+    input.repoFullName,
+    baseRef,
+    headers,
+    input.signal,
+  );
+  // Classic said no and the second surface is unreadable, so "absent" is
+  // unproven. Asserting `not_required` from here is the Blockcast/hang-mmt-fec
+  // failure: a confident "does not block merge" over a gate that does.
+  if (!ruleset.ok) return { outcome: "unknown", reason: ruleset.reason, baseRef };
+
+  const requiredContexts = [...new Set([...classic.contexts, ...ruleset.contexts])].sort();
+  if (ruleset.contexts.includes(context)) {
+    return { outcome: "required", baseRef, requiredContexts, source: "ruleset" };
+  }
+  return {
+    outcome: "not_required",
+    baseRef,
+    branchProtected: classic.branchProtected || ruleset.contexts.length > 0,
+    requiredContexts,
+  };
+}
+
+/**
+ * Terminal-state lookup for a single Actions run, used to decide whether a board
+ * approval card that points at that run is still worth a human's attention.
+ *
+ * The three outcomes are kept distinct on purpose (BLO-29359). A card must only be
+ * closed on positive evidence that its gate is over: `not_found` is that evidence
+ * (the run is gone), `error` explicitly is NOT — a rate-limited or 5xx lookup must
+ * leave the card alone and retry, or a throttled GitHub would silently retire live
+ * gates.
+ *
+ * A raw 404 is *not* by itself that positive evidence: GitHub returns it for an
+ * inaccessible repository as readily as for a deleted run. `not_found` is therefore
+ * only returned once the repository has been confirmed readable — see
+ * `classifyWorkflowRunNotFound`.
+ */
+export type WorkflowRunLookup =
+  | { outcome: "found"; status: string; conclusion: string | null; htmlUrl: string | null }
+  | { outcome: "not_found" }
+  | { outcome: "error"; retryable: boolean; reason: string };
+
+/**
+ * Disambiguate a 404 on a workflow-run lookup.
+ *
+ * GitHub returns 404 both for a run that has genuinely been deleted *and* for a
+ * repository the installation token cannot see — an App that was never installed on
+ * it, had its access revoked, or a private repo outside the installation. Those are
+ * opposite facts with opposite consequences: `not_found` is the single outcome that
+ * closes an approval card, so treating an access failure as a deleted run would
+ * irreversibly cancel every live gate in that repository, which is exactly the bulk
+ * retirement `githubGetWorkflowRun`'s contract forbids.
+ *
+ * So probe the repository itself. A readable repo makes the run's absence positive
+ * evidence; anything else is ambiguous and must defer instead of closing.
+ */
+async function classifyWorkflowRunNotFound(input: {
+  apiBase: string;
+  repoFullName: string;
+  token: string;
+}): Promise<WorkflowRunLookup> {
+  let res: Response;
+  try {
+    res = await ghFetch(`${input.apiBase}/repos/${input.repoFullName}`, {
+      headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${input.token}` },
+    });
+  } catch {
+    return { outcome: "error", retryable: true, reason: "workflow_run_repo_probe_failed" };
+  }
+  // The repo is readable, so the run really is gone.
+  if (res.ok) return { outcome: "not_found" };
+  if (res.status === 404 || res.status === 403 || res.status === 401) {
+    // Not retryable in the sense that waiting will not fix it — it needs an
+    // installation or permission change. Deferring (never closing) is the safe
+    // direction: a stale card costs a queue row, a wrongly-cancelled one costs a
+    // production deploy gate that cannot be un-cancelled.
+    return {
+      outcome: "error",
+      retryable: false,
+      reason: `workflow_run_repo_inaccessible_${res.status}`,
+    };
+  }
+  const classified = await classifyGithubHttpFailure("workflow_run_repo", res);
+  return { outcome: "error", retryable: classified.retryable, reason: classified.reason };
+}
+
+export async function githubGetWorkflowRun(input: {
+  repoFullName: string;
+  runId: number;
+}): Promise<WorkflowRunLookup> {
+  const tokenResult = await getInstallationTokenResult();
+  if (!tokenResult.ok) {
+    return { outcome: "error", retryable: tokenResult.retryable, reason: tokenResult.reason };
+  }
+
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+  let res: Response;
+  try {
+    res = await ghFetch(`${apiBase}/repos/${input.repoFullName}/actions/runs/${input.runId}`, {
+      headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` },
+    });
+  } catch {
+    return { outcome: "error", retryable: true, reason: "workflow_run_fetch_failed" };
+  }
+  if (res.status === 404) {
+    return await classifyWorkflowRunNotFound({
+      apiBase,
+      repoFullName: input.repoFullName,
+      token: tokenResult.token,
+    });
+  }
+  if (!res.ok) {
+    const classified = await classifyGithubHttpFailure("workflow_run", res);
+    return { outcome: "error", retryable: classified.retryable, reason: classified.reason };
+  }
+  const body = (await res.json().catch(() => null)) as {
+    status?: string;
+    conclusion?: string | null;
+    html_url?: string;
+  } | null;
+  if (typeof body?.status !== "string") {
+    // A 200 without a status is not evidence of anything; treat as retryable so a
+    // malformed response cannot retire a live gate.
+    return { outcome: "error", retryable: true, reason: "workflow_run_status_missing" };
+  }
+  return {
+    outcome: "found",
+    status: body.status,
+    conclusion: typeof body.conclusion === "string" ? body.conclusion : null,
+    htmlUrl: typeof body.html_url === "string" ? body.html_url : null,
+  };
+}
+
 /** Extract the leading 7-40 hex chars of a head SHA, or null. */
 function headShaHex(headSha: string | null | undefined): string | null {
   if (!headSha) return null;
@@ -256,9 +876,13 @@ async function fetchPrHeadSha(
   repoFullName: string,
   prNumber: number,
   headers: Record<string, string>,
+  signal?: AbortSignal,
 ): Promise<string | null> {
   try {
-    const res = await ghFetch(`${apiBase}/repos/${repoFullName}/pulls/${prNumber}`, { headers });
+    const res = await ghFetch(`${apiBase}/repos/${repoFullName}/pulls/${prNumber}`, {
+      headers,
+      signal,
+    });
     if (!res.ok) return null;
     const body = (await res.json().catch(() => null)) as { head?: { sha?: string } } | null;
     const sha = body?.head?.sha;
@@ -272,6 +896,7 @@ async function fetchPrHeadSha(
 export async function githubFetchPrHeadSha(input: {
   repoFullName: string;
   prNumber: number;
+  signal?: AbortSignal;
 }): Promise<string | null> {
   const token = await getInstallationToken();
   if (!token) return null;
@@ -280,26 +905,64 @@ export async function githubFetchPrHeadSha(input: {
     input.repoFullName,
     input.prNumber,
     { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` },
+    input.signal,
   );
 }
 
 /**
- * Extract the head SHA a canonical consolidated Ally review attests to reviewing,
- * or null when the body is not that canonical shape. Requires the server-owned
- * heading AND exactly one standalone full-SHA `Reviewed head:` line: a request
- * comment can quote an arbitrary SHA, so a loose substring match is not durable
- * evidence that the review side effect actually happened.
+ * Fetch a pull request's author login, for wake paths that carry the PR target
+ * but not the author.
+ *
+ * `prReviewOutputHasSelfReviewSkip` refuses to honour a self-review skip unless
+ * it can corroborate the claim against a PR author it did not get from the run's
+ * own text (BLO-9293). The webhook supplies that fact; assignment-sourced
+ * reviewer wakes do not, and `mergeCoalescedContextSnapshot` drops it on a
+ * different-PR coalesce. Resolving it from GitHub keeps the corroboration
+ * trustworthy — the author still never comes from the agent's summary.
  */
-function consolidatedReviewHead(body: string): string | null {
-  if (!/(?:^|\n)\s*## Ally — Consolidated PR Review\s*(?=\n|$)/.test(body)) {
+export async function githubFetchPrAuthorLogin(input: {
+  repoFullName: string;
+  prNumber: number;
+  signal?: AbortSignal;
+}): Promise<string | null> {
+  const token = await getInstallationToken();
+  if (!token) return null;
+  try {
+    const res = await ghFetch(
+      `${gitHubApiBase(GITHUB_HOST)}/repos/${input.repoFullName}/pulls/${input.prNumber}`,
+      {
+        headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` },
+        signal: input.signal,
+      },
+    );
+    if (!res.ok) return null;
+    const body = (await res.json().catch(() => null)) as { user?: { login?: string } } | null;
+    const login = body?.user?.login;
+    return typeof login === "string" && login.trim().length > 0 ? login : null;
+  } catch {
     return null;
   }
-  const attestations = Array.from(
-    body.matchAll(/(?:^|\n)\s*_?\s*reviewed head:\s*`?([0-9a-f]{40})`?\s*_?\s*(?=\n|$)/gi),
-    (match) => match[1]!.toLowerCase(),
-  );
-  return attestations.length === 1 ? attestations[0]! : null;
 }
+
+/**
+ * Whether a comment is Ally emitting a consolidated review that attests to this
+ * exact head. Both halves are required: a request comment can quote an arbitrary
+ * SHA, so a loose substring match is not durable evidence the review side effect
+ * happened.
+ *
+ * This delegates to `ally-review-detection.ts` rather than carrying a second
+ * copy of the grammar. That copy accepted `\s*` around the label and the SHA,
+ * which crosses newlines; the shared grammar uses horizontal whitespace only, so
+ * an attestation split across two lines no longer parses. That narrowing is
+ * deliberate and is pinned by a test below: no live Ally attestation uses the
+ * split form (104/104 sampled bare by Ally on PRs 1400-1440/997/1562; 2/2
+ * same-line and 0 split across a 60-PR re-sample), and a newline-crossing match
+ * would let a bare `Reviewed head:` line bind to an unrelated 40-hex on the
+ * following line — setting a required check on a guess, which is the one thing
+ * the exactly-one rule exists to prevent.
+ */
+const commentAttestsHead = (body: string, head: string): boolean =>
+  hasAllyConsolidatedReviewHeading(body) && extractAllyReviewedHeadSha(body) === head;
 
 /**
  * Page cap for BOTH evidence surfaces below. Deliberately far smaller than
@@ -315,6 +978,168 @@ function consolidatedReviewHead(body: string): string | null {
  * long (28 stacked marker requests on one PR), so the cap is reachable.
  */
 const REVIEWER_EVIDENCE_MAX_PAGES = 10;
+
+/** One SUBMITTED review by the configured reviewer App, at whatever head it names. */
+export interface ReviewerReview {
+  login: string;
+  body: string;
+  state: string;
+  commitId: string | null;
+  submittedAt: string | null;
+}
+
+/** One issue comment by the configured reviewer App. */
+export interface ReviewerComment {
+  login: string;
+  body: string;
+  createdAt: string;
+}
+
+/**
+ * Both surfaces Ally reviews on. Each is individually blind to the other, so a
+ * consumer deciding "was this reviewed?" must read both — see the note on
+ * `githubHasReviewerEvidenceForPr`.
+ */
+export interface ReviewerSurfaces {
+  reviews: ReviewerReview[];
+  comments: ReviewerComment[];
+}
+
+/**
+ * Page one reviewer-evidence surface, filtered to the configured App identity.
+ *
+ * Reaching the cap returns an `{error}`, never a silently truncated list. A
+ * truncated negative would be read as "the reviewer never finished" and re-raise
+ * `pr_review_output_missing` — i.e. reproduce BLO-28920, merely gated on thread
+ * length instead of review state. These threads do get long (28 stacked marker
+ * requests on one PR), so the cap is reachable.
+ */
+async function listReviewerSurface<T>(input: {
+  url: (page: number) => string;
+  headers: Record<string, string>;
+  botLogin: string;
+  signal?: AbortSignal;
+  prefix: string;
+  select: (row: { user?: { login?: string } }, login: string) => T | null;
+}): Promise<T[] | { error: string }> {
+  const out: T[] = [];
+  try {
+    for (let page = 1; page <= REVIEWER_EVIDENCE_MAX_PAGES; page += 1) {
+      const res = await ghFetch(input.url(page), { headers: input.headers, signal: input.signal });
+      if (!res.ok) {
+        const classified = await classifyGithubHttpFailure(input.prefix, res);
+        return { error: classified.reason };
+      }
+      const batch = (await res.json()) as Array<{ user?: { login?: string } }>;
+      for (const row of batch) {
+        const login = row.user?.login ?? "";
+        if (!githubReviewerIdentityMatches(login, input.botLogin)) continue;
+        const picked = input.select(row, login);
+        if (picked !== null) out.push(picked);
+      }
+      if (batch.length < 100) break;
+      if (page === REVIEWER_EVIDENCE_MAX_PAGES) return { error: `${input.prefix}_pagination_exhausted` };
+    }
+  } catch {
+    return { error: `${input.prefix}_fetch_failed` };
+  }
+  return out;
+}
+
+function listReviewerReviews(input: {
+  apiBase: string;
+  repoFullName: string;
+  prNumber: number;
+  headers: Record<string, string>;
+  botLogin: string;
+  signal?: AbortSignal;
+}): Promise<ReviewerReview[] | { error: string }> {
+  return listReviewerSurface<ReviewerReview>({
+    ...input,
+    prefix: "reviews",
+    url: (page) =>
+      `${input.apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}/reviews?per_page=100&page=${page}`,
+    // PENDING is an unsubmitted draft, returned by GitHub only to the identity
+    // that created it — which is this App. A run that dies mid-flow leaves
+    // exactly such a draft; keeping it would let that run self-attest.
+    select: (row, login) => {
+      const r = row as {
+        body?: string | null;
+        state?: string | null;
+        commit_id?: string | null;
+        submitted_at?: string | null;
+      };
+      const state = (r.state ?? "").toUpperCase();
+      if (state === "PENDING") return null;
+      return {
+        login,
+        body: r.body ?? "",
+        state,
+        commitId: headShaHex(r.commit_id),
+        submittedAt: r.submitted_at ?? null,
+      };
+    },
+  });
+}
+
+function listReviewerComments(input: {
+  apiBase: string;
+  repoFullName: string;
+  prNumber: number;
+  headers: Record<string, string>;
+  botLogin: string;
+  signal?: AbortSignal;
+}): Promise<ReviewerComment[] | { error: string }> {
+  return listReviewerSurface<ReviewerComment>({
+    ...input,
+    prefix: "comments",
+    url: (page) =>
+      `${input.apiBase}/repos/${input.repoFullName}/issues/${input.prNumber}/comments?per_page=100&page=${page}`,
+    select: (row, login) => {
+      const c = row as { body?: string | null; created_at?: string };
+      return { login, body: c.body ?? "", createdAt: c.created_at ?? "" };
+    },
+  });
+}
+
+/**
+ * Both reviewer surfaces at once, for consumers that must judge the *content* of
+ * a review rather than merely whether one exists — the evidence gate's truth
+ * probe needs the bodies to ask whether the review was clean.
+ *
+ * Fails closed as a unit: either surface erroring returns `{error}`, because a
+ * partial read cannot distinguish "Ally left no finding" from "we did not see
+ * the comment that carries it". `githubHasReviewerEvidenceForPr` deliberately
+ * does NOT use this composition — see the note there.
+ */
+export async function githubListReviewerSurfacesAtPr(input: {
+  repoFullName: string;
+  prNumber: number;
+  signal?: AbortSignal;
+}): Promise<ReviewerSurfaces | { error: string }> {
+  const botLogin = loadConfig().prReviewerBotLogin.trim();
+  if (!botLogin) return { error: "no_bot_login" };
+  // A bare user-seat login (`allyblockcast`) is not the App identity, so
+  // `githubReviewerIdentityMatches` would filter EVERY row out and hand back
+  // empty surfaces — a misconfiguration that reads to the caller as "Ally
+  // reviewed and found nothing". Fail closed, as the predicate below does.
+  if (!githubReviewerAppSlug(botLogin)) return { error: "bot_login_not_app_form" };
+  const token = await getInstallationToken();
+  if (!token) return { error: "no_token" };
+  const args = {
+    apiBase: gitHubApiBase(GITHUB_HOST),
+    repoFullName: input.repoFullName,
+    prNumber: input.prNumber,
+    headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` },
+    botLogin,
+    signal: input.signal,
+  };
+  const reviews = await listReviewerReviews(args);
+  if ("error" in reviews) return { error: reviews.error };
+  const comments = await listReviewerComments(args);
+  if ("error" in comments) return { error: comments.error };
+  return { reviews, comments };
+}
 
 /**
  * Authoritatively check whether the reviewer GitHub App actually REVIEWED this
@@ -367,6 +1192,119 @@ const REVIEWER_EVIDENCE_MAX_PAGES = 10;
  * unresolved required head returns `{found:false}` and never accepts arbitrary
  * review evidence.
  */
+/** One PR commit, reduced to the fields foreign-commit detection decides on (BLO-19528). */
+export type GitHubPullRequestCommit = {
+  sha: string;
+  authorEmail: string | null;
+  authorName: string | null;
+  parentCount: number;
+};
+
+/**
+ * `truncated` means "this listing is not provably complete" -- see
+ * {@link GITHUB_PR_COMMITS_ENDPOINT_LIMIT}. It is NOT an error: the commits
+ * that were read are still usable, and dropping them would notify about
+ * nothing rather than about most things. Callers must surface it, because a
+ * silently short list is indistinguishable from a PR with no foreign commits.
+ */
+export type GitHubPullRequestCommitsResult =
+  | { commits: GitHubPullRequestCommit[]; truncated: boolean }
+  | { error: string };
+
+/** Cap on `/pulls/{n}/commits` pages. GitHub itself truncates this endpoint at 250 commits. */
+export const GITHUB_PR_COMMITS_MAX_PAGES = 3;
+
+/**
+ * GitHub's own ceiling on `/pulls/{n}/commits`: "Lists a maximum of 250
+ * commits for a pull request." It is announced nowhere in the response -- the
+ * endpoint just stops, so a 250-commit page-out looks exactly like a PR that
+ * has 250 commits and no more. This ceiling, not {@link
+ * GITHUB_PR_COMMITS_MAX_PAGES}, is what actually truncates in practice: 250 <
+ * 3 * 100, so the page loop always breaks on a short page first and never
+ * reaches its own cap. Both are still checked -- the page cap is the one that
+ * bites if `per_page` or the cap is ever retuned.
+ */
+export const GITHUB_PR_COMMITS_ENDPOINT_LIMIT = 250;
+
+/**
+ * List a PR's commits with their **git author** identity (BLO-19528).
+ *
+ * Reads `commit.author.email`, not `author.login`: every agent pod pushes with
+ * the same shared App credential, so the login names the App for all of them
+ * alike, while the git author email is provisioned per agent (BLO-23894).
+ *
+ * `parents.length` is carried through so the caller can exclude merge/squash
+ * commits, which the GitHub merge API creates and legitimately App-attributes.
+ *
+ * Returns `truncated: true` when the listing cannot be proven complete. A
+ * truncated read is *unproven*, never absence -- the caller still gets every
+ * commit that was read and must report the gap rather than treat the short
+ * list as the whole PR.
+ */
+export async function githubListPullRequestCommits(input: {
+  repoFullName: string;
+  prNumber: number;
+}): Promise<GitHubPullRequestCommitsResult> {
+  const token = await getInstallationToken();
+  if (!token) return { error: "no_token" };
+
+  const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` };
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+  const commits: GitHubPullRequestCommit[] = [];
+  let truncated = false;
+
+  for (let page = 1; page <= GITHUB_PR_COMMITS_MAX_PAGES; page += 1) {
+    const url =
+      `${apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}/commits`
+      + `?per_page=100&page=${page}`;
+    let res: Response;
+    try {
+      res = await ghFetch(url, { headers });
+    } catch {
+      return { error: "pr_commits_fetch_failed" };
+    }
+    if (!res.ok) {
+      const classified = await classifyGithubHttpFailure("pr_commits", res);
+      return { error: classified.reason };
+    }
+
+    let batch: Array<Record<string, unknown>>;
+    try {
+      batch = (await res.json()) as Array<Record<string, unknown>>;
+    } catch {
+      return { error: "pr_commits_parse_failed" };
+    }
+    if (!Array.isArray(batch)) return { error: "pr_commits_unexpected_shape" };
+
+    for (const entry of batch) {
+      const sha = typeof entry.sha === "string" ? entry.sha : null;
+      if (!sha) continue;
+      const commit = entry.commit as Record<string, unknown> | undefined;
+      const author = commit?.author as Record<string, unknown> | undefined;
+      const parents = Array.isArray(entry.parents) ? entry.parents : [];
+      commits.push({
+        sha,
+        authorEmail: typeof author?.email === "string" ? author.email : null,
+        authorName: typeof author?.name === "string" ? author.name : null,
+        parentCount: parents.length,
+      });
+    }
+
+    if (batch.length < 100) break;
+    // A full last page with no pages left: our own cap cut the listing short.
+    if (page === GITHUB_PR_COMMITS_MAX_PAGES) truncated = true;
+  }
+
+  // GitHub's 250 ceiling reports itself as a short page, so the loop above
+  // exits believing it read to the end. Landing on the ceiling is the only
+  // signal there is, and it is deliberately fail-closed: a PR with exactly
+  // 250 commits is flagged too, because nothing in the response distinguishes
+  // it from one with 400.
+  if (commits.length >= GITHUB_PR_COMMITS_ENDPOINT_LIMIT) truncated = true;
+
+  return { commits, truncated };
+}
+
 export async function githubHasReviewerEvidenceForPr(input: {
   repoFullName: string;
   prNumber: number;
@@ -386,58 +1324,38 @@ export async function githubHasReviewerEvidenceForPr(input: {
     headShaHex(input.headSha) ?? (await fetchPrHeadSha(apiBase, input.repoFullName, input.prNumber, headers));
   if (!headSha) return { found: false };
 
+  const args = { apiBase, repoFullName: input.repoFullName, prNumber: input.prNumber, headers, botLogin };
+
+  // The two surfaces are read in sequence and SHORT-CIRCUIT, rather than via
+  // `githubListReviewerSurfacesAtPr`, even though that would be the tidier
+  // composition. Two reasons, both regressions if you collapse them:
+  //
+  //  - Fetching both unconditionally would turn a review match whose comments
+  //    fetch then failed into `{error}`, where this predicate used to — and must
+  //    — return `{found:true}`. Its callers fail completion closed on `{error}`,
+  //    so that is a false `pr_review_output_missing` on a PR that WAS reviewed:
+  //    BLO-28920 again, gated on an unrelated surface's availability.
+  //  - This runs on every reviewer-run completion, so its request budget is a
+  //    hot path; the common case (a formal review at head) must cost one page,
+  //    not two.
+  //
+  // Failing closed is still correct for the probe, which needs both bodies to
+  // judge cleanliness and cannot treat an unread surface as "no findings".
+
   // 1) Formal reviews — the configured App at this exact head, in any SUBMITTED
   // state. `COMMENTED` counts: see the merge-authorization vs attestation note
-  // above. `PENDING` does not: it is an unsubmitted draft visible only to its
-  // creator, which is this App.
-  try {
-    for (let page = 1; page <= REVIEWER_EVIDENCE_MAX_PAGES; page += 1) {
-      const url = `${apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}/reviews?per_page=100&page=${page}`;
-      const res = await ghFetch(url, { headers });
-      if (!res.ok) {
-        const classified = await classifyGithubHttpFailure("reviews", res);
-        return { error: classified.reason };
-      }
-      const batch = (await res.json()) as Array<{
-        user?: { login?: string };
-        commit_id?: string | null;
-        state?: string | null;
-      }>;
-      for (const review of batch) {
-        const authorLogin = review.user?.login ?? "";
-        const commitId = headShaHex(review.commit_id);
-        if (!githubReviewerIdentityMatches(authorLogin, botLogin)) continue;
-        if ((review.state ?? "").toUpperCase() === "PENDING") continue;
-        if (commitId === headSha) return { found: true, via: "review" };
-      }
-      if (batch.length < 100) break;
-      if (page === REVIEWER_EVIDENCE_MAX_PAGES) return { error: "reviews_pagination_exhausted" };
-    }
-  } catch {
-    return { error: "reviews_fetch_failed" };
-  }
+  // above.
+  const reviews = await listReviewerReviews(args);
+  if ("error" in reviews) return { error: reviews.error };
+  if (reviews.some((review) => review.commitId === headSha)) return { found: true, via: "review" };
 
   // 2) Comment-shaped reviews — the second surface. Ally frequently reviews by
   // posting a consolidated comment and files no review object at all, so a PR it
   // demonstrably reviewed can report zero reviews on surface (1).
-  try {
-    for (let page = 1; page <= REVIEWER_EVIDENCE_MAX_PAGES; page += 1) {
-      const url = `${apiBase}/repos/${input.repoFullName}/issues/${input.prNumber}/comments?per_page=100&page=${page}`;
-      const res = await ghFetch(url, { headers });
-      if (!res.ok) {
-        const classified = await classifyGithubHttpFailure("comments", res);
-        return { error: classified.reason };
-      }
-      const batch = (await res.json()) as Array<{ user?: { login?: string }; body?: string | null }>;
-      for (const comment of batch) {
-        if (!githubReviewerIdentityMatches(comment.user?.login ?? "", botLogin)) continue;
-        if (consolidatedReviewHead(comment.body ?? "") === headSha) return { found: true, via: "comment" };
-      }
-      if (batch.length < 100) break;
-      if (page === REVIEWER_EVIDENCE_MAX_PAGES) return { error: "comments_pagination_exhausted" };
-    }
-  } catch {
-    return { error: "comments_fetch_failed" };
+  const comments = await listReviewerComments(args);
+  if ("error" in comments) return { error: comments.error };
+  if (comments.some((comment) => commentAttestsHead(comment.body, headSha))) {
+    return { found: true, via: "comment" };
   }
 
   return { found: false };
@@ -516,6 +1434,77 @@ export async function githubListIssueCommentsWithTimestamps(input: {
       if (page === GITHUB_COMMENT_PAGINATION_HARD_LIMIT_PAGES) return null;
     }
     return comments;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetch the submitted-review history for the comment-review gate.
+ *
+ * Ally emits its consolidated review as a `pull_request_review` in the
+ * `COMMENTED` state, not as an issue comment (BLO-29711). `COMMENTED` reviews
+ * are invisible to GitHub's `reviewDecision`, which is exactly why the gate
+ * exists — but they live on `/pulls/{n}/reviews`, so a gate reading only
+ * `/issues/{n}/comments` never observes one. `githubHasReviewerEvidenceForPr`
+ * already reads both surfaces for the same reason.
+ *
+ * `PENDING` reviews are skipped: an unsubmitted draft is visible only to its
+ * creator and carries no `submitted_at`.
+ *
+ * `DISMISSED` reviews are skipped too, and the contrast with
+ * `githubHasReviewerEvidenceForPr` — which deliberately *accepts* them — is the
+ * point rather than an inconsistency (BLO-29711). That function asks whether a
+ * review run happened; a dismissed review still happened. This one supplies the
+ * verdict a merge gate is computed from, and dismissal is precisely an
+ * authorized actor withdrawing a verdict from operation, by hand or via branch
+ * protection's `dismiss_stale_reviews`. GitHub keeps the body but stops counting
+ * it toward `reviewDecision`, so reading it here re-animates a retraction, in
+ * both directions: a dismissed *blocking* review wedges a PR whose only escape
+ * hatch is the dismissal being ignored, and a dismissed *clean* review
+ * dispositions findings it no longer vouches for. Not theoretical —
+ * `Blockcast/paperclip#937` carries six DISMISSED head-attested Ally reviews.
+ *
+ * Returns null on any unreadable page so callers leave the prior status
+ * untouched rather than publishing a verdict from partial history.
+ */
+export async function githubListPrReviewsWithTimestamps(input: {
+  repoFullName: string;
+  prNumber: number;
+}): Promise<Array<{ login: string | null; body: string; createdAt: string }> | null> {
+  const token = await getInstallationToken();
+  if (!token) return null;
+  const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` };
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+  const reviews: Array<{ login: string | null; body: string; createdAt: string }> = [];
+
+  try {
+    for (let page = 1; page <= GITHUB_COMMENT_PAGINATION_HARD_LIMIT_PAGES; page += 1) {
+      const url = `${apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}/reviews?per_page=100&page=${page}`;
+      const response = await ghFetch(url, { headers });
+      if (!response.ok) return null;
+      const batch = (await response.json()) as Array<{
+        user?: { login?: string | null } | null;
+        body?: string | null;
+        state?: string | null;
+        submitted_at?: string | null;
+      }>;
+
+      for (const review of batch) {
+        const state = (review.state ?? "").toUpperCase();
+        if (state === "PENDING" || state === "DISMISSED") continue;
+        if (typeof review.submitted_at !== "string") continue;
+        reviews.push({
+          login: review.user?.login ?? null,
+          body: review.body ?? "",
+          createdAt: review.submitted_at,
+        });
+      }
+
+      if (batch.length < 100) return reviews;
+      if (page === GITHUB_COMMENT_PAGINATION_HARD_LIMIT_PAGES) return null;
+    }
+    return reviews;
   } catch {
     return null;
   }
@@ -611,6 +1600,116 @@ export async function githubGetLatestCommitStatusForContext(input: {
 }
 
 /**
+ * Strip credential-shaped material from one free-text field bound for GitHub
+ * (PEN-3157).
+ *
+ * ## Why this sits in the write helpers and not at each call site
+ *
+ * The same gap has now been found twice — PEN-2527 covered the `gh` binary and
+ * missed the MCP server; PEN-3152 covered both wrappers and missed `server/`
+ * entirely. Both times the cause was the same: a scrub applied per-caller, so
+ * closing it required every future caller to remember. These write helpers are
+ * how `paperclip-api` puts authored text on GitHub, so scrubbing here makes the
+ * control a property of the boundary rather than of the caller's diligence. A
+ * new caller of any helper is covered the day it is written.
+ *
+ * Exported for the one writer that cannot use those helpers:
+ * `github-review-gate-authority.ts` builds its own request because it carries a
+ * caller-supplied token and an abort signal that `githubPostCommitStatusDetailed`
+ * does not model. Rather than leave a structural exception, it calls this
+ * directly — so the write set has no member outside the scrub.
+ *
+ * ## Why not at `ghFetch`
+ *
+ * `ghFetch` is the wider boundary but the wrong altitude: it sees an opaque
+ * request body and cannot tell a prose field from protocol. Scrubbing a
+ * serialized payload there risks rewriting GraphQL text or an id, and the
+ * detectors are tuned for prose. Here the free-text fields are named by the
+ * signature, so each one is scrubbed for exactly what it is.
+ *
+ * The scrub returns its input byte-for-byte when nothing matches, so ordinary
+ * gate prose is never reformatted. When something does match we log the
+ * *classes* and never the text — a log line quoting the match would re-publish
+ * the secret into the very transcripts PEN-3139 is narrowing.
+ */
+export function scrubOutboundGitHubText(value: string, field: string): string {
+  const result = scrubGitHubEgressText(value);
+  if (result.redacted) {
+    console.warn(
+      `[github-egress] Redacted credential-shaped material from an outbound GitHub ${field}: ` +
+        `${result.classes.join(", ")}. The write proceeded with redaction markers in place.`,
+    );
+  }
+  return result.text;
+}
+
+/**
+ * Guard an **identity** field bound for GitHub: refuse the write rather than
+ * redact it (PEN-3391).
+ *
+ * ## Why identity fields are not scrubbed like prose
+ *
+ * `scrubOutboundGitHubText` redacts and proceeds. That is right for prose — a
+ * commit-status `description`, a check-run `summary` — where a redacted string
+ * is a degraded but still-serviceable version of the same message.
+ *
+ * It is wrong for a field that is a NAME. A commit status is addressed by
+ * `(repo, sha, context)` and a check-run by `(repo, sha, name)`; those values
+ * are what branch protection matches a required check against, what
+ * `githubGetLatestCommitStatusForContext` filters on, and what the delivery
+ * outbox keys its upsert on. Redacting one does not degrade the identity, it
+ * substitutes a DIFFERENT one. The status would be published under a name
+ * nothing looks up: branch protection would go on waiting for a context that
+ * will never arrive, the outbox would key its row on the unredacted value it
+ * was handed, and the gate would be unable to observe its own status. That is a
+ * silent gate-liveness failure — the control stays green while the thing it
+ * gates is stuck.
+ *
+ * PEN-3157 already reached this conclusion at the enqueue boundary, where it
+ * declined to scrub `context` because doing so "would risk the delivery
+ * identity". The same argument holds at the send boundary; it just bites later.
+ * The code did both things and justified only one, which is what PEN-3391 was
+ * filed to settle.
+ *
+ * ## Why refuse rather than simply exempt the field
+ *
+ * Exempting it (leaving `context` unscrubbed) would restore the leak the scrub
+ * exists to prevent: commit-status contexts are public on a public repo.
+ * Refusing keeps both properties at once —
+ *
+ * - **nothing leaks**, because a credential-bearing identity is never published; and
+ * - **publish and lookup cannot disagree**, because the write proceeds only
+ *   when the scrub is a byte-for-byte no-op. Callers may therefore keep using
+ *   the raw value as a key, and are provably keying on what was published.
+ *
+ * The refusal is deterministic: the same input scrubs the same way every time,
+ * so a retry cannot succeed. That is a property of this function, not a
+ * guarantee that callers stop retrying. The review-gate delivery loop
+ * (`github-review-gate-authority.ts`) re-queues every non-ok result with
+ * backoff and has no terminal failure state, so a refused context there is
+ * retried indefinitely, as `review_gate_persisted_payload_invalid` and
+ * `review_gate_pull_payload_invalid` already are (PEN-3504). It is logged at
+ * `error` rather than `warn` because, unlike a redaction, no write happened.
+ *
+ * A caller reaching this has a configuration bug — every context in this repo
+ * is a fixed operator-set literal — so the refusal is a loud stop, not a
+ * degradation path.
+ *
+ * @returns the detected classes when the write must be refused, or `null` when
+ *          the field is publishable unchanged.
+ */
+export function gitHubIdentityFieldRedaction(value: string, field: string): string[] | null {
+  const result = scrubGitHubEgressText(value);
+  if (!result.redacted) return null;
+  console.error(
+    `[github-egress] REFUSED an outbound GitHub write: the ${field} is an identity field and ` +
+      `credential-shaped material was detected in it (${result.classes.join(", ")}). Nothing was ` +
+      `published — redacting it would address the status to a name no lookup can find.`,
+  );
+  return result.classes;
+}
+
+/**
  * Post a commit status as the GitHub App with a classified result so callers
  * can retry transient failures and surface permanent configuration/permission
  * failures separately.
@@ -631,6 +1730,25 @@ export async function githubPostCommitStatusDetailed(input: {
     "content-type": "application/json",
   };
   const apiBase = gitHubApiBase(GITHUB_HOST);
+  // GitHub truncates a description at 140 chars; trim here so the message we
+  // intend is the message that lands rather than an arbitrary server-side cut.
+  // Scrub BEFORE that trim, never after: trimming first can cut a vendor-key
+  // prefix or a PEM header in half, and half a token matches no detector while
+  // the surviving half is still most of the secret.
+  const description = input.description
+    ? scrubOutboundGitHubText(input.description, "commit-status description").slice(0, 140)
+    : undefined;
+  // `context` is the status's IDENTITY, not prose: branch protection matches a
+  // required check on it and `githubGetLatestCommitStatusForContext` filters on
+  // it. Refuse rather than redact, so publish and lookup cannot disagree — see
+  // `gitHubIdentityFieldRedaction` (PEN-3391).
+  if (gitHubIdentityFieldRedaction(input.context, "commit-status context")) {
+    return { ok: false, retryable: false, reason: "commit_status_context_not_publishable" };
+  }
+  const context = input.context;
+  const targetUrl = input.targetUrl
+    ? scrubOutboundGitHubText(input.targetUrl, "commit-status target_url")
+    : input.targetUrl;
   try {
     const url = `${apiBase}/repos/${input.repoFullName}/statuses/${input.sha}`;
     const res = await ghFetch(url, {
@@ -638,11 +1756,9 @@ export async function githubPostCommitStatusDetailed(input: {
       headers,
       body: JSON.stringify({
         state: input.state,
-        context: input.context,
-        // GitHub truncates at 140 chars; trim here so the message we intend is
-        // the message that lands rather than an arbitrary server-side cut.
-        ...(input.description ? { description: input.description.slice(0, 140) } : {}),
-        ...(input.targetUrl ? { target_url: input.targetUrl } : {}),
+        context,
+        ...(description ? { description } : {}),
+        ...(targetUrl ? { target_url: targetUrl } : {}),
       }),
     });
     if (res.ok) return { ok: true, statusCode: res.status };
@@ -650,6 +1766,84 @@ export async function githubPostCommitStatusDetailed(input: {
     return { ok: false, ...classified, statusCode: res.status };
   } catch {
     return { ok: false, retryable: true, reason: "commit_status_write_fetch_failed" };
+  }
+}
+
+/**
+ * Conclusions a completed check-run may carry. Only the three this codebase
+ * publishes are listed; the rest of GitHub's enum is unused here.
+ *
+ * `neutral` is the reason check-runs exist in this file at all. A legacy commit
+ * status has only success/failure/pending/error, so a verdict that is neither
+ * "reviewed and clean" nor "blocking" has no honest state to occupy: `pending`
+ * and `failure` block merge, and `success` is indistinguishable from a real
+ * pass. `neutral` renders distinctly and does not block (BLO-33657).
+ */
+export type GitHubCheckRunConclusion = "success" | "failure" | "neutral";
+
+/**
+ * Publish a completed check-run as the GitHub App.
+ *
+ * Requires the installation's `checks: write` permission — a commit status is
+ * `statuses: write` and the two are independent, so a deployment that can post
+ * statuses is not thereby able to post check-runs.
+ *
+ * ponytail: creates a new run per call rather than looking up and PATCHing the
+ * existing one for this name+sha. GitHub takes the latest per name, and commit
+ * statuses already append the same way, so repeated evaluations of one head
+ * leave several rows. Switch to find-then-PATCH if that noise ever matters.
+ */
+export async function githubPostCheckRun(input: {
+  repoFullName: string;
+  sha: string;
+  name: string;
+  conclusion: GitHubCheckRunConclusion;
+  title: string;
+  summary: string;
+  detailsUrl?: string | null;
+}): Promise<GitHubCommitStatusPostResult> {
+  const token = await getInstallationTokenResult();
+  if (!token.ok) return asCommitStatusFailure(token);
+  const headers = {
+    ...GITHUB_API_HEADERS,
+    authorization: `Bearer ${token.token}`,
+    "content-type": "application/json",
+  };
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+  // `summary` is the same verdict prose a commit-status description carries,
+  // and a check-run has no 140-char cap — so it publishes MORE of it. Scrubbed
+  // here like every other free-text field this file writes, so the helper's
+  // callers inherit the control rather than each remembering it (PEN-3157).
+  // `name` is the check-run's IDENTITY — it is what a required check is matched
+  // on and what a `check-runs` read selects by — so it is refused, not redacted,
+  // for the same reason as a commit-status `context` (PEN-3391).
+  if (gitHubIdentityFieldRedaction(input.name, "check-run name")) {
+    return { ok: false, retryable: false, reason: "check_run_name_not_publishable" };
+  }
+  const name = input.name;
+  const title = scrubOutboundGitHubText(input.title, "check-run title");
+  const summary = scrubOutboundGitHubText(input.summary, "check-run summary");
+  const detailsUrl = input.detailsUrl
+    ? scrubOutboundGitHubText(input.detailsUrl, "check-run details_url")
+    : input.detailsUrl;
+  try {
+    const res = await ghFetch(`${apiBase}/repos/${input.repoFullName}/check-runs`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        name,
+        head_sha: input.sha,
+        status: "completed",
+        conclusion: input.conclusion,
+        output: { title, summary },
+        ...(detailsUrl ? { details_url: detailsUrl } : {}),
+      }),
+    });
+    if (res.ok) return { ok: true, statusCode: res.status };
+    const classified = await classifyGithubHttpFailure("check_run_write", res);
+    return { ok: false, ...classified, statusCode: res.status };
+  } catch {
+    return { ok: false, retryable: true, reason: "check_run_write_fetch_failed" };
   }
 }
 
@@ -672,6 +1866,13 @@ export async function githubPostCommitStatus(input: {
  * Post an issue/PR comment as the GitHub App. Returns false when creds are
  * absent or the write fails — the caller logs and continues; a back-link post
  * failure must never break the webhook wake path. (BLO-13353)
+ *
+ * `body` is an arbitrary string by signature, which is what makes this the
+ * widest server-side egress surface in the repo. Its only caller today passes a
+ * template over an issue identifier and a URL, so the exposure is latent rather
+ * than live — but "benign by its current caller" is not a property anyone can
+ * rely on, and a PR comment is the highest-visibility thing this service can
+ * publish. Scrubbed here so the next caller inherits the control (PEN-3157).
  */
 export async function githubPostIssueComment(input: {
   repoFullName: string;
@@ -686,12 +1887,13 @@ export async function githubPostIssueComment(input: {
     "content-type": "application/json",
   };
   const apiBase = gitHubApiBase(GITHUB_HOST);
+  const body = scrubOutboundGitHubText(input.body, "issue-comment body");
   try {
     const url = `${apiBase}/repos/${input.repoFullName}/issues/${input.prNumber}/comments`;
     const res = await ghFetch(url, {
       method: "POST",
       headers,
-      body: JSON.stringify({ body: input.body }),
+      body: JSON.stringify({ body }),
     });
     return res.ok;
   } catch {

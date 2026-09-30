@@ -30,6 +30,19 @@ export interface UpstreamConfig {
   routeId?: string;
   relayAuthorization?: string;
   registryRevision?: string;
+  /**
+   * Tool names this upstream is permitted to expose, by exact match on the
+   * *upstream* name (no `prefix__` — the aggregate endpoint adds that after
+   * filtering). `undefined` means unrestricted, which is the behaviour every
+   * upstream had before PEN-2735 and still has until its registry entry opts in.
+   *
+   * An empty array denies every tool. That is deliberate rather than treated as
+   * a config mistake: if someone writes `tools: []` meaning "all", the failure
+   * is that the upstream's tools disappear — visible, and safe. Reading it as
+   * "all" would make the same typo fail open, and rejecting it at parse time
+   * would take the whole gateway down on a one-line registry edit.
+   */
+  tools?: string[];
 }
 
 export type UpstreamMap = Record<string, UpstreamConfig>;
@@ -223,6 +236,7 @@ function parseUpstreamConfig(prefix: string, value: unknown, tenantRelay?: Tenan
       execution,
       routeId,
       relayAuthorization: tenantRelay.authorization,
+      ...toolAllowlistField(prefix, record),
     };
   }
   if (typeof record.url !== "string" || record.url.length === 0) {
@@ -233,7 +247,47 @@ function parseUpstreamConfig(prefix: string, value: unknown, tenantRelay?: Tenan
     url: record.url,
     credentialHeaders: parseCredentialHeaders(record),
     ...(execution ? { execution } : {}),
+    ...toolAllowlistField(prefix, record),
   };
+}
+
+/**
+ * Parse the optional `tools` allowlist, spread-ready so an absent one leaves the
+ * key off entirely rather than setting it to `undefined` — `configuredTools`
+ * distinguishes the two.
+ */
+function toolAllowlistField(prefix: string, record: Record<string, unknown>): { tools?: string[] } {
+  const raw = record.tools;
+  if (raw === undefined || raw === null) return {};
+  if (!Array.isArray(raw)) {
+    throw new Error(`upstreams: prefix "${prefix}" tools must be an array of tool-name strings`);
+  }
+  const tools: string[] = [];
+  for (const item of raw) {
+    if (typeof item !== "string" || item.length === 0) {
+      throw new Error(`upstreams: prefix "${prefix}" tools entries must be non-empty strings`);
+    }
+    tools.push(item);
+  }
+  return { tools };
+}
+
+/**
+ * The single tool-authorization predicate (PEN-2735).
+ *
+ * Every enforcement point — the aggregate `tools/list` assembly, the aggregate
+ * `tools/call` dispatch, the prefixed request guard, and the prefixed response
+ * filter — asks this one function, on the *upstream* tool name. Four call sites
+ * are fine; four spellings of "is this allowed" are how a control ends up
+ * enforced on the path someone probed and open on the one they did not.
+ *
+ * Fails closed: a non-string or empty name is denied whenever an allowlist
+ * exists, so a malformed request cannot be the way past it.
+ */
+export function isToolAllowed(config: UpstreamConfig, toolName: unknown): boolean {
+  if (!Array.isArray(config.tools)) return true;
+  if (typeof toolName !== "string" || toolName.length === 0) return false;
+  return config.tools.includes(toolName);
 }
 
 function tenantRelayContext(

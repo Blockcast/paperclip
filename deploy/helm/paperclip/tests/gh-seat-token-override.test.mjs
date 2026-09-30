@@ -7,9 +7,11 @@ import os from "node:os";
 import { fileURLToPath } from "node:url";
 
 // Covers BLO-22243: the seed init container installs `paperclip-github-token-env`
-// (the wrapper `gh`, `git`, and `github-mcp-server` all route through) and
+// (the `git` and `github-mcp-server` wrappers route through it) and
 // `github-token-credential-helper` (the git credential helper) into the shared
-// PVC. Both must honor a per-call `GH_SEAT_TOKEN_VALUE` override before falling
+// PVC. The generated `gh` wrapper additionally routes through the compiled
+// adapter-utils egress runtime before reaching the image-level gh wrapper.
+// Token wrappers honor a per-call `GH_SEAT_TOKEN_VALUE` override before falling
 // back to the fleet-wide App-installation token file, without ever emitting a
 // malformed or ambient-derived credential.
 
@@ -77,11 +79,77 @@ function writeExecutable(dir, name, body) {
 const rendered = renderStatefulSet();
 const envScriptBody = extractHeredoc(rendered, "paperclip-github-token-env");
 const credHelperBody = extractHeredoc(rendered, "github-token-credential-helper");
+const ghScriptBody = extractHeredoc(rendered, "gh");
 
 test("rendered statefulset still installs both GitHub credential wrapper scripts", () => {
   assert.match(envScriptBody, /^#!\/bin\/sh/);
   assert.match(credHelperBody, /^#!\/bin\/sh/);
 });
+
+test("rendered gh wrapper executes the egress runtime before the image gh wrapper", () => {
+  assert.match(
+    ghScriptBody,
+    /exec \/usr\/local\/bin\/node \/opt\/paperclip-bundled-adapters\/node_modules\/@paperclipai\/adapter-utils\/dist\/github-cli-egress-runtime\.js \/usr\/bin\/gh \"\$@\"/,
+  );
+});
+
+test("rendered gh wrapper exercises the generated runtime command path", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gh-egress-wrapper-"));
+  const runtimePath = path.join(dir, "github-cli-egress-runtime.mjs");
+  const targetPath = path.join(dir, "gh.real");
+  const recordPath = path.join(dir, "invocation.json");
+
+  fs.writeFileSync(
+    runtimePath,
+    [
+      'import { spawnSync } from "node:child_process";',
+      'import { writeFileSync } from "node:fs";',
+      "const target = process.argv[2];",
+      "const argv = process.argv.slice(3);",
+      "writeFileSync(process.env.RECORD_PATH, JSON.stringify({ target, argv }));",
+      "const result = spawnSync(target, argv, { stdio: \"inherit\" });",
+      "process.exit(result.status ?? 1);",
+      "",
+    ].join("\n"),
+  );
+  fs.writeFileSync(
+    targetPath,
+    [
+      "#!/bin/sh",
+      `printf '%s\\n' invoked > ${JSON.stringify(path.join(dir, "target-ran"))}`,
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+
+  const wrapperBody = ghScriptBody
+    .replaceAll(
+      "/usr/local/bin/node",
+      process.execPath,
+    )
+    .replace(
+      "/opt/paperclip-bundled-adapters/node_modules/@paperclipai/adapter-utils/dist/github-cli-egress-runtime.js /usr/bin/gh",
+      `${runtimePath} ${targetPath}`,
+    );
+  const wrapperPath = writeExecutable(dir, "gh", wrapperBody);
+  const args = ["pr", "comment", "123", "--body", "safe body"];
+  const result = spawnSync("sh", [wrapperPath, ...args], {
+    encoding: "utf8",
+    env: { ...process.env, RECORD_PATH: recordPath },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(recordPath, "utf8")), {
+    target: targetPath,
+    argv: args,
+  });
+  assert.equal(fs.readFileSync(path.join(dir, "target-ran"), "utf8"), "invoked\n");
+});
+
+// PEN-2527. The PATH-reachability half of this — that the seed publishes the
+// scrubbing `gh` onto a PATH the agent shell actually searches, and that it wins
+// against the image CLI — lives in agent-egress-path.test.mjs, which renders the
+// chart's default values rather than the Blockcast overlay this file uses.
 
 test("paperclip-github-token-env: GH_SEAT_TOKEN_VALUE overrides the App-installation token file", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gh-seat-token-"));

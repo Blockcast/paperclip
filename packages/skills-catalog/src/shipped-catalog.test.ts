@@ -389,6 +389,27 @@ describe("shipped skills catalog", () => {
     expect(resolveCatalogSkillRef(sample.slug)).toMatchObject({ key: sample.key });
   });
 
+  it("keeps the GitHub PR workflow conditional on repository review gates", () => {
+    const markdown = readFileSync(GITHUB_PR_WORKFLOW_SKILL, "utf8");
+    const normalized = markdown.replace(/\s+/g, " ");
+
+    expect(normalized).toContain("Some repositories enforce `.github/PULL_REQUEST_TEMPLATE.md`");
+    expect(normalized).toContain("If the template contains the Paperclip dedup-search checkbox");
+    expect(normalized).toContain(
+      "If the repository has no PR template, or its template does not contain that checkbox, follow the repository's own PR-body and duplicate/related-change requirements instead; do not invent or wait for a Paperclip-specific section or checkbox.",
+    );
+    expect(normalized).toContain("inspect the repository for its actual");
+    expect(normalized).toContain(".github/workflows/commitperclip-review.yml");
+    expect(normalized).toContain(
+      "If it does not have commitperclip, wait for the repository's actual required quality gates",
+    );
+    expect(normalized).toContain("commitperclip PR Review");
+    expect(normalized).toContain("If the repository template contains the Paperclip dedup-search checkbox");
+    expect(normalized).toContain("follow the repository's own duplicate/related-change requirement");
+    expect(normalized).not.toContain("- Confirm the dedup-search checkbox is present and checked");
+    expect(normalized).not.toContain("Paperclip repositories run `commitperclip PR Review`");
+  });
+
   it("keeps the Ramp wrapper fail-closed on mixed-provenance playbooks", () => {
     const rampSkill = readFileSync(new URL("../catalog/optional/finance/ramp/SKILL.md", import.meta.url), "utf8");
 

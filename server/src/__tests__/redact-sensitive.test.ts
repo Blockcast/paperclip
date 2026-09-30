@@ -80,6 +80,84 @@ describe("redactSensitive", () => {
     expect(() => redactSensitive(cycle)).not.toThrow();
   });
 
+  // Credential-bearing containers (PEN-2370 series, door #11).
+  //
+  // `customProps` in logger.ts logs the whole request body on every 4xx/5xx.
+  // `PATCH /agents/:id` and the `hire_agent` approval path both accept
+  // `adapterConfig.env` in that body, and those values are credential material
+  // by construction. The scalar denylist above cannot cover them: it matches
+  // exact key names, and an agent's variable names (`OPENAI_API_KEY`,
+  // `ANTHROPIC_BASE_URL`, …) are arbitrary and unknowable in advance.
+  //
+  // So these keys are treated as *containers*: every scalar leaf beneath them
+  // is masked regardless of its name, while the names themselves survive so a
+  // 4xx log still says which variables were set.
+  describe("credential-bearing containers", () => {
+    it("masks variable values beneath a config container but keeps their names", () => {
+      const out = redactSensitive({
+        agentId: "a-1",
+        adapterConfig: { image: "harbor/agent:1", env: { OPENAI_API_KEY: "sk-live-abc123" } },
+      }) as Record<string, any>;
+
+      expect(out.agentId).toBe("a-1");
+      // Name preserved (diagnostics), value gone (the leak).
+      expect(Object.keys(out.adapterConfig.env)).toEqual(["OPENAI_API_KEY"]);
+      expect(out.adapterConfig.env.OPENAI_API_KEY).toBe("[REDACTED]");
+      expect(JSON.stringify(out)).not.toContain("sk-live-abc123");
+    });
+
+    it("masks values nested arbitrarily deep inside a container", () => {
+      const out = redactSensitive({
+        runtimeConfig: { modelProfiles: { cheap: { adapterConfig: { env: { TOK: "deep-secret" } } } } },
+      });
+
+      expect(JSON.stringify(out)).not.toContain("deep-secret");
+    });
+
+    it("masks an ARRAY-shaped container instead of recursing past it", () => {
+      // The bypass class Ally caught in #1574: `isPlainObject` excludes arrays,
+      // so a walk that only guards objects recurses *into* an array-shaped
+      // config and blanks nothing while reporting success.
+      const out = redactSensitive({ adapterConfig: [{ env: { K: "array-secret" } }] });
+
+      expect(JSON.stringify(out)).not.toContain("array-secret");
+    });
+
+    it("masks a STRING-shaped container instead of passing it through", () => {
+      // A container arriving as a JSON string is still credential material;
+      // a walk that only handles objects hands the whole thing back verbatim.
+      const out = redactSensitive({
+        adapterConfig: '{"env":{"K":"string-secret"}}',
+      }) as Record<string, unknown>;
+
+      expect(out.adapterConfig).toBe("[REDACTED]");
+      expect(JSON.stringify(out)).not.toContain("string-secret");
+    });
+
+    it("masks credential-bearing mcpServers and header values the scalar rules miss", () => {
+      // Deliberately avoids `url` (already covered by the URL-part stripper)
+      // and `authorization` (already in the scalar denylist), so this asserts
+      // the container rule rather than being carried by an existing control:
+      // a token in a path segment under a non-urlish key, and a bearer under a
+      // vendor-specific header name nobody could have enumerated.
+      const out = redactSensitive({
+        mcpServers: { gbrain: { endpoint: "https://gbrain.example/mcp/url-secret" } },
+        headers: { "X-Gbrain-Token": "header-secret" },
+      });
+
+      const json = JSON.stringify(out);
+      expect(json).not.toContain("url-secret");
+      expect(json).not.toContain("header-secret");
+    });
+
+    it("does not mask look-alike keys outside the container set", () => {
+      // Guard against over-reach: these are not credential containers.
+      const body = { environment: "production", configVersion: 3, envoy: "sidecar" };
+
+      expect(redactSensitive(body)).toEqual(body);
+    });
+  });
+
   it("omits deeply-nested arrays at the depth cap instead of leaking null entries to JSON", () => {
     // Build an object whose array field is reached at MAX_DEPTH. Recursing
     // into the array elements would exceed the cap; without the array-level

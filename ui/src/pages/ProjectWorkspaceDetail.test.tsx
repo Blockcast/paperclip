@@ -112,6 +112,7 @@ function projectWorkspace(overrides: Partial<ProjectWorkspace> = {}): ProjectWor
     remoteWorkspaceRef: null,
     sharedWorkspaceKey: null,
     metadata: null,
+    hasWorkspaceRuntimeConfig: false,
     runtimeConfig: null,
     runtimeServices: [],
     isPrimary: true,

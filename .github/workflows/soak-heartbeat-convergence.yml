@@ -1,0 +1,115 @@
+name: Soak (heartbeat queued-backlog convergence)
+
+# On-demand only. BLO-20885 AC2 needs 20 consecutive green runs of one test
+# file at ONE head; at ~150-270s per iteration that is ~50-90 minutes of
+# self-hosted runner time, so this is deliberately NOT a per-PR gate and must
+# not be added to pr.yml. See BLO-28888 for why the venue moved here at all:
+# an agent pod failed to survive an uninterrupted 50-90 minute process four
+# times across three assignees, while CI runners have no such constraint.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit SHA, branch or tag to soak — AC2 is measured at a single head
+        required: true
+        type: string
+      iterations:
+        description: Number of fresh vitest processes to run (AC2 requires 20)
+        required: false
+        default: "20"
+        type: string
+      load_workers:
+        description: >-
+          Synthetic CPU load held for the whole soak. "auto" targets the
+          load/core ratio the series-1 iter-14 failure appeared at (11 on 48
+          cores); "off" runs the runner as-is; an integer pins the worker count.
+        required: false
+        default: auto
+        type: string
+      load_settle_s:
+        description: >-
+          Seconds to settle before sampling the load baseline, so the install's
+          decaying load is not counted as baseline. 0 takes a single immediate
+          reading — use that for fast smoke dispatches, not for AC2 evidence.
+        required: false
+        default: "90"
+        type: string
+      load_warmup_s:
+        description: >-
+          Seconds to let the synthetic burners reach steady state before
+          iteration 1. 0 starts iterating immediately.
+        required: false
+        default: "240"
+        type: string
+
+permissions:
+  contents: read
+
+# /proc/loadavg is host-wide — Linux does not namespace it by container or
+# cgroup — so two dispatches landing on the same runner would each read the
+# other's synthetic load and both report the regime as reached. That fails in
+# the flattering direction, which is the one that produces a false AC2 green.
+# Serialise instead. cancel-in-progress is false: a soak that has already burned
+# 40 minutes of its 20 iterations must not be discarded by a later dispatch.
+concurrency:
+  group: soak-heartbeat-convergence
+  cancel-in-progress: false
+
+jobs:
+  soak:
+    name: Soak ${{ inputs.iterations }}x @ ${{ inputs.ref }}
+    runs-on: default
+    # 20 iterations at the observed 150-270s each is 50-90 minutes, and the
+    # synthetic-load mode deliberately slows iterations down. Leave real margin
+    # so runner contention is never reported as a soak failure.
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Setup pnpm
+        # The retrying wrapper, not pnpm/action-setup directly: v6 always runs a
+        # `self-update` whose engine-identity check resolves against the npm
+        # registry fail-closed, so a registry blip would kill the soak before a
+        # single iteration ran. Passes no `version:` -- the action reads the
+        # packageManager pin from package.json, hence the checkout above. See
+        # BLO-28813.
+        uses: ./.github/actions/setup-pnpm
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run soak
+        env:
+          ITERATIONS: ${{ inputs.iterations }}
+          LOAD_WORKERS: ${{ inputs.load_workers }}
+          # Both feed `sleep`, and together they are 5.5 minutes of pure waiting
+          # before iteration 1 at the defaults. Plumbed through so a smoke
+          # dispatch can zero them; the script validates both as integers.
+          LOAD_SETTLE_S: ${{ inputs.load_settle_s }}
+          LOAD_WARMUP_S: ${{ inputs.load_warmup_s }}
+        run: bash .github/scripts/soak-heartbeat-convergence.sh
+
+      - name: Upload soak summary and per-iteration logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-summary
+          path: |
+            soak-out/summary.txt
+            soak-out/iter-*.log
+          # Safe to keep as `error`: the script creates soak-out/summary.txt
+          # before it validates anything, and writes the cause into it on every
+          # fatal path — so a genuine early exit still uploads an artifact that
+          # names the real failure, instead of this step failing second with a
+          # "no files found" message that masks it.
+          if-no-files-found: error

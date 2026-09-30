@@ -10,6 +10,7 @@ import {
   updateAgentInstructionsBundleSchema,
   upsertAgentInstructionsFileSchema,
   createAgentKeySchema,
+  agentMeRecoveryActionsQuerySchema,
   builtInAgentEmptyMutationSchema,
   builtInAgentProvisionSchema,
   generateSummarySlotSchema,
@@ -1537,6 +1538,20 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "get",
+  path: "/api/agents/me/recovery-actions",
+  tags: ["agents"],
+  summary: "List recovery actions the current agent OWNS (defaults to active + escalated)",
+  description:
+    "Owner-scoped view of recovery beacons. Distinct from inbox-lite, which carries " +
+    "`activeRecoveryAction` only for issues the agent is the ASSIGNEE of — a beacon " +
+    "routinely names this agent as owner on a row assigned to someone else, and those " +
+    "obligations appear only here.",
+  request: { query: agentMeRecoveryActionsQuerySchema },
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
   method: "post",
   path: "/api/agents/me/connections/{connectionId}/token",
   tags: ["tools"],
@@ -2956,7 +2971,8 @@ registry.registerPath({
   method: "post",
   path: "/api/approvals/{id}/withdraw",
   tags: ["approvals"],
-  summary: "Withdraw an approval request (requesting agent or board)",
+  summary:
+    "Withdraw an undecided approval request (requesting agent or board). Accepts `pending` and `revision_requested`; a decision note already written by the board is preserved and the withdrawal reason is recorded as an approval comment.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(withdrawApprovalSchema),
@@ -2968,6 +2984,23 @@ registry.registerPath({
     403: r.forbidden,
     404: r.notFound,
     409: r.conflict,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/approvals/{id}/apply",
+  tags: ["approvals"],
+  summary:
+    "Apply the values an approved card recorded to the objects that enforce them (requesting agent). Takes no body — every figure comes from the approved payload, so this route cannot express a figure the board did not decide. Refuses when the card is not `approved` (409), the caller is not the requester or the target is the caller's own budget (403), or no assertion resolves to an exact, still-unapplied target (422). Applying is idempotent. Approval authority is unchanged: `approve`/`reject`/`request-revision` remain board-only.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
   },
 });
 
@@ -3192,6 +3225,28 @@ registry.registerPath({
     query: z.object({
       weeks: z.string().optional(),
       threshold: z.string().optional(),
+    }),
+  },
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/recovery-actions",
+  tags: ["dashboard"],
+  summary: "List issue recovery actions",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      ownerAgentId: z.string().uuid().optional(),
+      kind: z.string().optional(),
+      status: z.string().optional(),
+      limit: z.string().optional(),
+      offset: z.string().optional(),
+      // Documented because `asc` is what makes a census of the legacy tail
+      // reachable at all past the 500-row limit; the route has accepted both
+      // since BLO-19124 but neither appeared here.
+      order: z.enum(["asc", "desc"]).optional(),
     }),
   },
   responses: { 200: r.ok(), 401: r.unauthorized },

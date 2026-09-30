@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import postgres, { type Sql } from "postgres";
 import * as schema from "./schema/index.js";
 import { registerTrackedClient } from "./embedded-test-client-registry.js";
+import { ensureConcurrentIndexesForMigration } from "./concurrent-index-guard.js";
 
 const MIGRATIONS_FOLDER = fileURLToPath(new URL("./migrations", import.meta.url));
 const DRIZZLE_MIGRATIONS_TABLE = "__drizzle_migrations";
@@ -46,6 +47,16 @@ export type MigrationState =
       reason: "no-migration-journal-empty-db" | "no-migration-journal-non-empty-db" | "pending-migrations";
     };
 
+export type ApplyPendingMigrationsOptions = {
+  /**
+   * Prepare guarded `CREATE INDEX CONCURRENTLY` prerequisites immediately
+   * before each migration file. This is opt-in so migration tests and callers
+   * that intentionally exercise a migration's raw failure remain unchanged.
+   */
+  readonly prepareOnlineIndexes?: boolean;
+  readonly log?: (message: string) => void;
+};
+
 /**
  * Connection-pool ceiling for the application client.
  *
@@ -60,15 +71,250 @@ export type MigrationState =
  * `max` as `explicit option > URL query param > PGMAX env > default`, so a
  * `?max=` in the connection string can no longer shrink the pool out from
  * under a caller that derived a bound from it.
+ *
+ * ---
+ *
+ * BLO-35946 AC3 asked for this value to be reconciled against its consumers.
+ * It has been measured, and the honest answer is that **10 is inherited, not
+ * deliberate, and it is below steady-state demand.** Recorded here rather than
+ * changed, because sizing it needs the server-side `max_connections` budget
+ * across all replicas and no such budget is documented in either
+ * `Blockcast/paperclip` or `Blockcast/onprem-k8s`. Changing the number without
+ * it would trade a client-side queue for a server-side connection refusal.
+ *
+ * Measured against this constant (2026-09-24, single API/worker process, one
+ * shared pool — note `server/src/index.ts:543` may create a *second* 10-slot
+ * pool for `databaseMigrationUrl`):
+ *
+ * | source                                              | connections |
+ * |-----------------------------------------------------|-------------|
+ * | PR-reviewer wakes: 4 slots x depth 2 (see below)     | 8           |
+ * | scheduler tick: ~11 unlatched concurrent chains      | ~11         |
+ * | `plugin-job-scheduler.ts` `DEFAULT_MAX_CONCURRENT_JOBS` | 10       |
+ * | one `getDeleteConstraints` precheck (`environments.ts:499`) | 8    |
+ * | agent run executions                                 | unbounded  |
+ *
+ * These are not mutually exclusive — they share one pool in one process — so a
+ * conservative floor is ~19 concurrent demands with zero API traffic.
+ *
+ * {@link POSTGRES_POOL_MAX} has exactly one derived consumer,
+ * `derivePrReviewerWakeMaxConcurrency` (`routes/github-webhook.ts:3013`), which
+ * yields 4 and reserves 8 of the 10 on the reasoning that `2 * bound < poolMax`.
+ * That derivation implicitly assumes the PR path is the only thing on the pool,
+ * which the table above contradicts.
+ *
+ * Exactly one live nested acquire remains (`github-webhook.ts:3092` takes a
+ * transaction-scoped advisory lock, then `heartbeat.wakeup()` inside it opens
+ * its own claim transaction at `heartbeat.ts:23786`). Every other nesting path
+ * — recovery, issues, environment leases, both outboxes — was converted to
+ * thread `tx` through rather than take a second pooled connection, which is why
+ * the two prior incidents at this number (`server/src/index.ts:1114`,
+ * `services/issues.ts:5723`) were each fixed by removing a nest rather than by
+ * sizing the pool. That is the pattern this note exists to flag: the number has
+ * now been paid for twice and never re-derived.
  */
 export const POSTGRES_POOL_MAX = 10;
 
+/**
+ * How long a pooled application connection may sit inside an open transaction
+ * with no statement running before Postgres terminates it.
+ *
+ * This is not a new number: it matches `DELIVERY_LOCK_HOLD_TIMEOUT_MS` in
+ * `server/src/services/github-status-delivery-outbox.ts`, which already applies
+ * exactly this bound — for exactly this reason — to one critical section that
+ * performs external I/O while holding a transaction open. This applies the same
+ * bound pool-wide so a section nobody thought to guard cannot pin a connection
+ * forever.
+ *
+ * Why it is safe to set unconditionally, unlike `statement_timeout`: Postgres
+ * resolves GUCs as `postgresql.conf` < `ALTER DATABASE SET` < `ALTER ROLE SET`
+ * < startup-packet parameters < session `SET`, and both settings have context
+ * `user` — so a startup-packet value *overrides* a role-level one rather than
+ * stacking with it, and can therefore loosen an existing bound as easily as
+ * tighten it. That risk is real for `statement_timeout`, where a role-level
+ * bound is plausible and would be silently raised. It does not apply here: no
+ * healthy workload wants an idle-open transaction, so there is no bound worth
+ * preserving. `statement_timeout` is deliberately left unset until
+ * {@link readInheritedTimeoutSettings} has reported what is actually in force.
+ *
+ * A `?idle_in_transaction_session_timeout=` in the connection URL still wins
+ * over this, because postgres.js lets URL query parameters override
+ * `options.connection`. That is the intended escape hatch for an operator.
+ */
+export const POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS = 120_000;
+
+/**
+ * How long a retiring connection waits for an in-flight query before the
+ * driver terminates it instead (BLO-35946, patched into postgres.js as the
+ * `close_timeout` option; see `closeTimedOut()` in `patches/postgres@3.4.9.patch`).
+ *
+ * This bound only ever applies *after* `Connection.end()` has been called —
+ * by {@link POSTGRES_MAX_LIFETIME_MIN_SECONDS} below, or by `sql.end()`. At
+ * that point the connection has already been moved to the pool's terminal
+ * `ended` queue and can never be handed out again, so the choice is not "kill
+ * the query or let it finish": it is "kill the query or leak the slot
+ * permanently". Waiting was the unbounded half of the 2026-09-24 outage.
+ *
+ * 30s matches the driver's sibling `connect_timeout` and the `statement_timeout`
+ * this repo asserts at role level — so any query a healthy environment would
+ * already have cancelled is dead well before this fires. A query that outlives
+ * it is rejected with `CONNECTION_DESTROYED`, which is loud and retriable;
+ * that is the deliberate trade against a silent permanent leak.
+ */
+export const POSTGRES_CLOSE_TIMEOUT_SECONDS = 30;
+
+/**
+ * Bounds on how long a pooled connection lives before the driver retires and
+ * reopens it. Previously left at the postgres.js default, which is the same
+ * 30–60 minute randomised range — this states it so the value is readable
+ * rather than having to be recovered from the library (BLO-35946 AC4).
+ *
+ * The randomisation is load-bearing and is why this is a function rather than
+ * a constant: `timer()` resolves it **once per `Connection`**, so passing a
+ * plain number would give all {@link POSTGRES_POOL_MAX} connections — which
+ * are all opened at process start — the same expiry instant, retiring the
+ * whole pool simultaneously. Spreading them is the point.
+ */
+export const POSTGRES_MAX_LIFETIME_MIN_SECONDS = 30 * 60;
+export const POSTGRES_MAX_LIFETIME_MAX_SECONDS = 60 * 60;
+
+export function postgresMaxLifetimeSeconds(): number {
+  return (
+    POSTGRES_MAX_LIFETIME_MIN_SECONDS +
+    Math.random() * (POSTGRES_MAX_LIFETIME_MAX_SECONDS - POSTGRES_MAX_LIFETIME_MIN_SECONDS)
+  );
+}
+
+/**
+ * Two options are absent or wrong in postgres.js's shipped typings, and both
+ * are real at runtime: `close_timeout` is this repo's patch, and `max_lifetime`
+ * is typed `number | null` even though the library's own default for it is a
+ * function (`src/index.js:515`) that `timer()` calls (`src/connection.js:1043`).
+ *
+ * Declared as a narrow widening rather than casting the whole object, so a
+ * top-level field like `max` keeps its excess-property and type checking —
+ * `BaseOptions` has no index signature, so a typo there is a compile error,
+ * where a blanket cast would let it land silently. Nested `connection` keys are
+ * NOT protected this way: `ConnectionParameters` carries
+ * `[name: string]: string | number | boolean` (`types/index.d.ts:343`) for
+ * arbitrary startup parameters, so a misspelled
+ * `idle_in_transaction_session_timeout` type-checks and fails at first connect
+ * instead, with Postgres `FATAL: unrecognized configuration parameter`. The
+ * final `as unknown as` is unavoidable — TS rejects
+ * the direct conversion (`max_lifetime: () => number` is not comparable to the
+ * shipped `number`) — but it now applies to an already-checked literal rather
+ * than instead of checking it.
+ */
+type PatchedPostgresOptions = Omit<
+  NonNullable<Parameters<typeof postgres>[1]>,
+  "max_lifetime"
+> & {
+  close_timeout?: number;
+  max_lifetime?: number | (() => number) | null;
+};
+
 export function createDb(url: string) {
-  const sql = postgres(url, { max: POSTGRES_POOL_MAX });
+  const sql = postgres(url, ({
+    max: POSTGRES_POOL_MAX,
+    max_lifetime: postgresMaxLifetimeSeconds,
+    close_timeout: POSTGRES_CLOSE_TIMEOUT_SECONDS,
+    // Sent in the startup packet, so it applies to every connection this pool
+    // opens — including ones created later to refill the pool. postgres.js
+    // filters falsy startup parameters out entirely, so a `0` here would ship
+    // no bound at all rather than the "disabled" it reads as; the value must
+    // stay positive for this to mean anything.
+    connection: {
+      idle_in_transaction_session_timeout: POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+    },
+  } satisfies PatchedPostgresOptions) as unknown as Parameters<typeof postgres>[1]);
   // Inert in production; only embedded test databases register their URL so
   // their pools can be closed before the server stops (see registry module).
   registerTrackedClient(url, sql);
   return createDbFromPostgresClient(sql);
+}
+
+/**
+ * The three timeouts that decide whether a query can hang forever, as they are
+ * inherited from the server environment (`postgresql.conf`, `ALTER DATABASE
+ * SET`, `ALTER ROLE SET`) — *before* any client-side override.
+ *
+ * `valueMs` is `null` when the setting is disabled (Postgres reports `0`),
+ * which is the unbounded case and the one worth alerting on.
+ */
+export type InheritedTimeoutSetting = {
+  readonly name: string;
+  readonly valueMs: number | null;
+  readonly source: string;
+};
+
+export type InheritedTimeoutSettings = {
+  readonly statementTimeout: InheritedTimeoutSetting;
+  readonly idleInTransactionSessionTimeout: InheritedTimeoutSetting;
+  readonly lockTimeout: InheritedTimeoutSetting;
+};
+
+const TIMEOUT_SETTING_NAMES = [
+  "statement_timeout",
+  "idle_in_transaction_session_timeout",
+  "lock_timeout",
+] as const;
+
+/**
+ * Read the effective timeout environment on a connection that carries none of
+ * this module's own client-side overrides.
+ *
+ * It deliberately uses {@link createUtilitySql}, not the application pool. The
+ * pool sets `idle_in_transaction_session_timeout` in its startup packet, so
+ * reading these values there would report our own override back to us and
+ * destroy the one piece of evidence this probe exists to collect: whether the
+ * *server* already bounds these. `statement_timeout` and `lock_timeout` are not
+ * set by the pool, so the values reported here are what the pool inherits too.
+ *
+ * The repo asserts a role-level 30s `statement_timeout` in two places
+ * (`routes/plugins.ts`, migration `0098`) and `lib/db-retry.ts` retries `57014`
+ * on that basis, but no `ALTER ROLE` exists in either `Blockcast/paperclip` or
+ * `Blockcast/onprem-k8s` — so the assertion is unverified. This answers it from
+ * whatever database the process is actually pointed at, with no cluster access.
+ */
+export async function readInheritedTimeoutSettings(
+  url: string,
+): Promise<InheritedTimeoutSettings> {
+  const sql = createUtilitySql(url);
+  try {
+    const rows = await sql<{ name: string; setting: string; source: string }[]>`
+      SELECT name, setting, source
+      FROM pg_settings
+      WHERE name IN ${sql(TIMEOUT_SETTING_NAMES)}
+    `;
+    const byName = new Map(rows.map((row) => [row.name, row]));
+    const read = (name: string): InheritedTimeoutSetting => {
+      const row = byName.get(name);
+      // pg_settings reports these three in milliseconds, and 0 means disabled.
+      const parsed = Number(row?.setting ?? Number.NaN);
+      const valueMs = Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+      return { name, valueMs, source: row?.source ?? "unknown" };
+    };
+    return {
+      statementTimeout: read("statement_timeout"),
+      idleInTransactionSessionTimeout: read("idle_in_transaction_session_timeout"),
+      lockTimeout: read("lock_timeout"),
+    };
+  } finally {
+    await sql.end();
+  }
+}
+
+/** One-line, log-friendly rendering of {@link readInheritedTimeoutSettings}. */
+export function formatInheritedTimeoutSettings(settings: InheritedTimeoutSettings): string {
+  return [
+    settings.statementTimeout,
+    settings.idleInTransactionSessionTimeout,
+    settings.lockTimeout,
+  ]
+    .map(({ name, valueMs, source }) =>
+      `${name}=${valueMs === null ? "disabled" : `${valueMs}ms`} (source=${source})`,
+    )
+    .join(", ");
 }
 
 export function createDbFromPostgresClient(sql: Sql) {
@@ -258,6 +504,7 @@ async function recordMigrationHistoryEntry(
 async function applyPendingMigrationsManually(
   url: string,
   pendingMigrations: string[],
+  options: ApplyPendingMigrationsOptions = {},
 ): Promise<void> {
   if (pendingMigrations.length === 0) return;
 
@@ -283,6 +530,12 @@ async function applyPendingMigrationsManually(
         hash,
       );
       if (existingEntry) continue;
+
+      if (options.prepareOnlineIndexes) {
+        await ensureConcurrentIndexesForMigration(url, migrationFile, {
+          log: options.log,
+        });
+      }
 
       await runInTransaction(sql, async () => {
         for (const statement of splitMigrationStatements(migrationContent)) {
@@ -722,7 +975,10 @@ export async function inspectMigrations(url: string): Promise<MigrationState> {
   }
 }
 
-export async function applyPendingMigrations(url: string): Promise<void> {
+export async function applyPendingMigrations(
+  url: string,
+  options: ApplyPendingMigrationsOptions = {},
+): Promise<void> {
   const initialState = await inspectMigrations(url);
   if (initialState.status === "upToDate") return;
 
@@ -743,7 +999,7 @@ export async function applyPendingMigrations(url: string): Promise<void> {
         bootstrappedState = await inspectMigrations(url);
       }
       if (bootstrappedState.status === "needsMigrations" && bootstrappedState.reason === "pending-migrations") {
-        await applyPendingMigrationsManually(url, bootstrappedState.pendingMigrations);
+        await applyPendingMigrationsManually(url, bootstrappedState.pendingMigrations, options);
         bootstrappedState = await inspectMigrations(url);
       }
     }
@@ -776,7 +1032,7 @@ export async function applyPendingMigrations(url: string): Promise<void> {
     throw new Error("Migrations are still pending after migration-history reconciliation; run inspectMigrations for details.");
   }
 
-  await applyPendingMigrationsManually(url, state.pendingMigrations);
+  await applyPendingMigrationsManually(url, state.pendingMigrations, options);
 
   const finalState = await inspectMigrations(url);
   if (finalState.status !== "upToDate") {
@@ -867,3 +1123,11 @@ export async function resetPostgresDatabase(
 }
 
 export type Db = ReturnType<typeof createDb>;
+
+/**
+ * The open transaction handle drizzle hands to a `db.transaction(...)` callback.
+ * Split across two aliases so the one-line nested-`Parameters` incantation this
+ * type replaces appears nowhere in the tree (BLO-34656).
+ */
+type DbTransactionCallback = Parameters<Db["transaction"]>[0];
+export type DbTransaction = Parameters<DbTransactionCallback>[0];

@@ -1,0 +1,39 @@
+-- BLO-30303: rotation watermark for the productivity-review candidate scan.
+--
+-- The scan (`productivity-review.ts` `reconcileProductivityReviews`) reads
+-- fleet-wide with `ORDER BY updated_at ASC, id ASC LIMIT 250`. Nothing in the
+-- review pipeline writes back to the *scanned source* row — every
+-- `update(issues)` in that file targets the review issue — so the same 250
+-- least-recently-updated rows are re-selected on every pass, forever. Once the
+-- eligible population exceeds the cap (measured >=490 in one company against a
+-- fleet-wide cap of 250) the scan can never reach a row outside that window,
+-- and an issue that just went quiet has a *recent* `updated_at`, which is
+-- precisely the wrong end. Emission went to hard zero on 2026-08-19 and stayed
+-- there.
+--
+-- Flipping to `updated_at DESC` mirrors the bug rather than fixing it: a
+-- stalled issue's `updated_at` stops advancing by definition, so under DESC it
+-- sinks out of the window exactly as it becomes interesting. Any static
+-- ordering on a field uncorrelated with eligibility starves at some cap.
+--
+-- This column is the rotation key instead. Every scanned row is stamped, the
+-- scan orders by it NULLS FIRST, and so every eligible row is evaluated within
+-- ceil(N / 250) passes regardless of population size. Starvation becomes
+-- impossible by construction rather than by a cap somebody has to keep
+-- re-tuning.
+--
+-- NULL (the value every existing row gets here) means "never scanned" and
+-- sorts first, so the backlog drains ahead of anything already visited. No
+-- backfill is wanted.
+--
+-- Deliberately no index. The periodic call is fleet-wide (`index.ts` passes no
+-- companyId), so a `(company_id, …)` index cannot serve it, and the ORDER BY
+-- runs over a set already filtered to visible + agent-assigned + todo/
+-- in_progress — hundreds to low thousands of rows. The pre-fix query had the
+-- identical shape (`ORDER BY updated_at` with no usable fleet-wide index) and
+-- has sorted that set on every pass for months, so this adds no cost that was
+-- not already being paid. Add one if the eligible population ever grows enough
+-- to make the sort measurable; on this table an unused index is a write
+-- amplification nobody asked for.
+ALTER TABLE "issues"
+  ADD COLUMN IF NOT EXISTS "productivity_scanned_at" timestamp with time zone;

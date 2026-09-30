@@ -2270,6 +2270,80 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
+  // PEN-2394: the assignee posted the grant string exactly as the 403 body told
+  // them to — a bare `agent://<id>` — and the mentioned agent was still denied.
+  // The SQL prefilter in `agentHasMentionGrantOnIssue` is a LIKE on that raw
+  // substring, so the comment IS fetched; `extractAgentMentionIds` then drops it
+  // because only the markdown link form is a mention. That gap is why the
+  // remediation read as a no-op. Both halves are pinned here: the bare string is
+  // deliberately inert (an assignee quoting a 403 body must not hand out write by
+  // accident), and the link form is the channel the message now names.
+  it("grants only on the markdown mention link, not on a bare agent:// string from the same assignee", async () => {
+    const company = await createCompany(db, "MentionCommentBareString");
+    const allowedProject = await createProject(db, company.id, "MentionBareAllowed");
+    const targetProject = await createProject(db, company.id, "MentionBareTarget");
+    const assigneeAgent = await createAgent(db, company.id, { role: "coach" });
+    const mentionedAgent = await createAgent(db, company.id, {
+      role: "qa",
+      permissions: {
+        trustPreset: LOW_TRUST_REVIEW_PRESET,
+        authorizationPolicy: {
+          trustBoundary: {
+            mode: LOW_TRUST_REVIEW_PRESET,
+            companyId: company.id,
+            projectIds: [allowedProject.id],
+          },
+        },
+      },
+    });
+    const issue = await createIssue(db, company.id, {
+      title: "Bare grant string reply target",
+      projectId: targetProject.id,
+      assigneeAgentId: assigneeAgent.id,
+    });
+
+    const authorization = authorizationService(db);
+    const decideComment = () => authorization.decide({
+      actor: { type: "agent", agentId: mentionedAgent.id, companyId: company.id, source: "agent_key" },
+      action: "issue:comment",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: issue.id,
+        projectId: issue.projectId,
+        assigneeAgentId: assigneeAgent.id,
+        status: issue.status,
+      },
+    });
+
+    // The literal remediation the 403 used to prescribe, posted by the exact
+    // actor it named. Inert.
+    await db.insert(issueComments).values({
+      companyId: company.id,
+      issueId: issue.id,
+      authorAgentId: assigneeAgent.id,
+      authorType: "agent",
+      body: `Granting access: agent://${mentionedAgent.id}`,
+    });
+    await expect(decideComment()).resolves.toMatchObject({
+      allowed: false,
+      reason: "deny_low_trust_boundary",
+    });
+
+    // Same author, same issue, same agent id — only the form changes.
+    await db.insert(issueComments).values({
+      companyId: company.id,
+      issueId: issue.id,
+      authorAgentId: assigneeAgent.id,
+      authorType: "agent",
+      body: `Granting access: [@QA](agent://${mentionedAgent.id})`,
+    });
+    await expect(decideComment()).resolves.toMatchObject({
+      allowed: true,
+      reason: "allow_issue_mention_grant",
+    });
+  });
+
   it("does not grant mention-scoped issue access from self-authored or unauthorized-author comments", async () => {
     const company = await createCompany(db, "MentionCommentDenied");
     const allowedProject = await createProject(db, company.id, "MentionDeniedAllowed");
@@ -3836,5 +3910,103 @@ describeEmbeddedPostgres("authorization service", () => {
       action: "inbox:manage",
       resource: { type: "company", companyId: company.id },
     })).resolves.toMatchObject({ allowed: false, reason: "deny_low_trust_boundary" });
+  });
+  /**
+   * PEN-2852 — the withholding boundary on workspace responses
+   * (`routes/workspace-response.ts`) resolves its viewer with this service. These cases pin the
+   * policy the boundary depends on, against the REAL decision path rather than a mock.
+   *
+   * They exist because the first version of that boundary gated disclosure on `runtime:manage` and
+   * was proven correct only by a route test whose mock returned denied. The mock was free to deny;
+   * the real policy allows `runtime:manage` to every standard same-company agent
+   * (`allow_company_agent`), so the boundary withheld from nothing but restricted principals while
+   * its tests were green. The first case below is the one that would have caught that: it asserts
+   * the two actions differ for exactly that actor. Do not weaken it into a single-action check.
+   */
+  describe("PEN-2852 workspace_runtime:read", () => {
+    it("denies a standard same-company agent, while runtime:manage still allows it", async () => {
+      const company = await createCompany(db, "WorkspaceRuntimeReadAgent");
+      const actorAgent = await createAgent(db, company.id, { role: "engineer" });
+      const authorization = authorizationService(db);
+      const actor = {
+        type: "agent" as const,
+        agentId: actorAgent.id,
+        companyId: company.id,
+        source: "agent_key" as const,
+      };
+      const resource = { type: "company" as const, companyId: company.id };
+
+      // The control: this is the action the boundary used to gate on, and it allows.
+      await expect(authorization.decide({ actor, action: "runtime:manage", resource }))
+        .resolves.toMatchObject({ allowed: true, reason: "allow_company_agent" });
+
+      // The assertion: the read entitlement must NOT follow it into the blanket allow.
+      await expect(authorization.decide({ actor, action: "workspace_runtime:read", resource }))
+        .resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+    });
+
+    it("denies an agent acting on behalf of an active non-viewer responsible user", async () => {
+      // The responsible-user intersection can only NARROW an agent decision, so a human operator
+      // behind an agent JWT does not re-open the disclosure. Pinned because it is the most
+      // plausible accidental re-widening: granting on the user half and forgetting the agent half.
+      const company = await createCompany(db, "WorkspaceRuntimeReadOnBehalf");
+      const actorAgent = await createAgent(db, company.id, { role: "engineer" });
+      const responsibleUserId = `user-${randomUUID()}`;
+      await db.insert(companyMemberships).values({
+        companyId: company.id,
+        principalType: "user",
+        principalId: responsibleUserId,
+        status: "active",
+        membershipRole: "operator",
+      });
+
+      await expect(authorizationService(db).decide({
+        actor: {
+          type: "agent",
+          agentId: actorAgent.id,
+          companyId: company.id,
+          onBehalfOfUserId: responsibleUserId,
+          source: "agent_jwt",
+        },
+        action: "workspace_runtime:read",
+        resource: { type: "company", companyId: company.id },
+      })).resolves.toMatchObject({ allowed: false });
+    });
+
+    it("allows an active non-viewer board member so the runtime editors keep working", async () => {
+      const company = await createCompany(db, "WorkspaceRuntimeReadMember");
+      const userId = `user-${randomUUID()}`;
+      await db.insert(companyMemberships).values({
+        companyId: company.id,
+        principalType: "user",
+        principalId: userId,
+        status: "active",
+        membershipRole: "member",
+      });
+
+      await expect(authorizationService(db).decide({
+        actor: { type: "board", userId, source: "session" },
+        action: "workspace_runtime:read",
+        resource: { type: "company", companyId: company.id },
+      })).resolves.toMatchObject({ allowed: true, reason: "allow_simple_company_member" });
+    });
+
+    it("denies a viewer board member", async () => {
+      const company = await createCompany(db, "WorkspaceRuntimeReadViewer");
+      const userId = `user-${randomUUID()}`;
+      await db.insert(companyMemberships).values({
+        companyId: company.id,
+        principalType: "user",
+        principalId: userId,
+        status: "active",
+        membershipRole: "viewer",
+      });
+
+      await expect(authorizationService(db).decide({
+        actor: { type: "board", userId, source: "session" },
+        action: "workspace_runtime:read",
+        resource: { type: "company", companyId: company.id },
+      })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+    });
   });
 });

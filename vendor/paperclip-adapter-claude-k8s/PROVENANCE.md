@@ -14,7 +14,7 @@ control plane.
 | Repository vendored from | <https://github.com/kkroo/paperclip-adapter-claude-k8s> |
 | Package | `paperclip-adapter-claude-k8s` |
 | Version at vendor time | `0.2.5-kkroo.6` |
-| Current version | `0.2.6-blockcast.1` — see [Versioning](#versioning) |
+| Current version | `0.2.6-blockcast.11` — see [Versioning](#versioning) |
 | Declared license | MIT, in `package.json` only — see the caveat below |
 
 Before this change the image built this package by cloning that repository at a
@@ -92,25 +92,44 @@ applied since.
 
 ### Integrity
 
-A manifest of `sha256(path)` over all 39 in-tree files, sorted by path under
-`LC_ALL=C`, itself hashes to:
+**There is no recorded integrity hash, deliberately — removed under
+[BLO-35109](https://paperclip.blockcast.net/BLO/issues/BLO-35109).** What
+replaced it is the append-only log in
+[PROVENANCE-CHANGES.md](./PROVENANCE-CHANGES.md): CI fails any change that
+touches vendored source without appending a row there
+(`scripts/check-vendored-provenance-log.mjs`, run from the `policy` job).
 
-```
-69286948d2b197e1c8ec25fb3b2820be7ed87232f2215fdb3ebf742f8c7ce030
-```
+A single 64-hex manifest of the tree used to be recorded here and recomputed by
+CI. It was removed for three reasons, in ascending order of importance:
 
-Regenerate with:
+1. **It did not attest what it appeared to.** The hash was recomputed from *our*
+   tree, which has diverged from upstream — so "hash matches" never meant
+   "upstream is unmodified", only "the tree is what the last editor recorded".
+   The section that stood here said as much in its final paragraph.
+2. **It was a false-positive generator, not a conflict detector.** Two PRs
+   editing different lines of the same vendored file merge correctly, and the
+   combined tree's hash matched *neither* recorded value. It failed on every
+   combination of two changes, correct or not, so it could not tell a bad merge
+   from two good ones.
+3. **It was single-valued, so it made concurrent work serial.** Every pair of
+   PRs touching this tree conflicted on that one line. `merge=union`
+   (BLO-34872) cannot reach it: a union keeps both sides' lines, and CI's
+   `grep -oE '^[0-9a-f]{64}$' … | head -1` would then have resolved the
+   provenance verdict by sort order rather than by the tree — failing
+   permissively on one of the two orderings.
 
-```sh
-cd vendor/paperclip-adapter-claude-k8s
-git ls-files | grep -vxE 'LICENSE|PROVENANCE\.md' \
-  | LC_ALL=C sort | xargs sha256sum | sha256sum
-```
+The property the hash existed for — vendored source does not change without the
+change being recorded — survives, as a *transition* invariant checked against
+the merge base instead of a *state* invariant stored in the file. Nothing is
+stored, so nothing can conflict, and the in-diff review surface is now the log
+row itself rather than an opaque hash nobody could verify by reading.
 
-`LICENSE` and `PROVENANCE.md` are excluded because they are Blockcast additions,
-not upstream files — the hash covers only what came from upstream. The listing
-comes from `git ls-files` rather than `find` so that `node_modules/`, `dist/`
-and packed tarballs cannot perturb it.
+`scripts/__tests__/provenance-union-merge.test.mjs` asserts that no 64-hex line
+is reintroduced into either provenance file, so a future revival is caught
+rather than quietly re-creating the conflict.
+
+The listing comes from `git ls-files` rather than `find` so that `node_modules/`,
+`dist/` and packed tarballs cannot perturb it.
 
 CI enforces this: the `vendor_claude_k8s` job recomputes the hash and fails if
 it does not match the value recorded above. Change any vendored file and you
@@ -146,32 +165,20 @@ patches. They are ordinary in-tree changes, reviewed under our own CI — which 
 the point of vendoring — but they mean the tree is **no longer byte-for-byte
 upstream**, so they are enumerated here rather than left implicit.
 
-| commit | files | what |
-|---|---|---|
-| `cd1630512` | `src/server/env-guard.ts`, `src/server/env-guard.test.ts` | Anchored the `SAFE_ENV_INSPECTION_RE` safe-helper exception to a whole-command invocation. It was evaluated before the full-dump detector and matched the helper anywhere in the command, so a `<safe-helper> && <dump>` compound returned `allow` and executed the dump. Addresses an Ally review finding on Blockcast/paperclip#1092. |
-| `cd1630512` | `src/server/k8s-client.ts`, `src/server/k8s-client.test.ts` (new) | Keyed the `getSelfPodInfo()` cache by (kubeconfig path, namespace, hostname). It memoized into one process-global slot while callers pass a per-request kubeconfig, leaking the first execution's image, scheduling, PVC, env and Secret references into later executions against a different cluster. Same review. |
-| `8f4f7262a` | `src/server/env-guard.ts`, `src/server/env-guard.test.ts` | Treated `\r`/`\n` as command separators in both classifier copies. Anchoring the helper exception (above) closed the `&&`/`;`/`\|` compounds but not a literal newline: JS `$` without `m` is end-of-input and the argument tail's `\s` spanned newlines, so `paperclip-safe-env\nenv` was a whole-command match, and the dump detector did not treat `\n` as a boundary either. Follow-up on the same Ally review of Blockcast/paperclip#1092. |
-| `551c461ef` | `src/server/env-guard.ts`, `src/server/env-guard.test.ts` | Two further dump forms in both classifier copies. (a) Flag-only dumps: `env`/`printenv` stop dumping only when given an *operand*, so requiring a boundary immediately after the utility name let `-0`, `--null` and `-u NAME` through; an option run is now consumed, with `-u`/`--unset` matched together with their argument. (b) Command substitution was never a boundary, so `echo "$(env)"`, `X=$(printenv)` and backtick forms were allowed with no flags at all. Third Ally review pass on Blockcast/paperclip#1092. |
-| `551c461ef` | `src/server/job-manifest.ts`, `src/server/job-manifest.test.ts` | Made the init container's `data` mount conditional on a claim (an unconditional mount named an undeclared volume, which Kubernetes rejects for the whole Pod), and validated + shell-quoted `providers.anthropic.accounts` before interpolating it into the main container's `sh -c`. Same review pass. Both were revised again in `3e0244a78` below. |
-| `435219ccf` | `src/server/env-guard.ts` | Comment-only correction. The header claimed behavioural parity with `server/src/agent-shell-guard.ts` "locked by `env-guard.test.ts`". Both halves were false — the test never imports that file and nothing imports it in production; it is dead code, then four fixed bypasses behind. Tracked for removal-or-resync as BLO-22840. |
-| `3e0244a78` | `src/server/env-guard.ts`, `src/server/env-guard.test.ts` | Closed the unquoted-command-wrapper bypass class. `SHELL_WRAPPER_RE` unwraps only a *quoted* `-c` payload and whitespace was not a command boundary, so a dump passed as a bare argument to any wrapper (`sh -c env`, `eval env`, `xargs env`, `nohup env`, `timeout 5 env`, `su -c env`, ...) was allowed — 9 of 9 measured payloads, in the real spawned pod script. Split the boundary class: whitespace joins the *leading* class only, while the trailing terminator stays punctuation-only so operand-bearing forms (`env NAME=value cmd`, `printenv HOME`, `grep env file`) stay allowed. Fourth Ally review pass. |
-| `3e0244a78` | `src/server/job-manifest.ts`, `src/server/job-manifest.test.ts` | Three manifest fixes from the same review. (a) Operator-configured mount paths (`workspaceMountPath`, `homeRoot`) reached the init container's `sh -c` unquoted via `browserHome`; now quoted at every site plus a new `assertSafeAbsolutePath` as an independent second defence. (b) A configured account pool with no valid entry fell back to ccrotate's *global* rotation — fail-open, widening credential scope on a config typo; absent and invalid configuration are now distinguished. (c) The `data` volume is now ALWAYS declared (PVC-backed, else `emptyDir`), because the conditional mount from `551c461ef` merely moved the no-PVC failure from admission to an EACCES `mkdir` as runAsUser:1000. |
-| `b80b69218` | `src/server/env-guard.ts` | Converged shell unwrapping with `server/src/agent-shell-guard.ts`, adopting its `SHELL_COMMAND_PREFIX_RE` + `readShellCommandArgument` (a human closed the same unquoted-wrapper bypass there in `993bf304c`). Belt-and-braces with the boundary widening in `3e0244a78`: unwrapping is more precise for `sh -c`, the boundary rule is the only thing that reaches non-shell wrappers. Also corrected this file's header claim that the sibling copy was merely "four bypasses behind" — the divergence runs both ways. |
-| `e1b28276f` | `src/server/env-guard.ts`, `src/server/env-guard.test.ts` | Replaced the boundary-regex classifier with a shell-aware normalizer, in both copies. Five prior rounds each closed one boundary bypass; the fifth Ally review found three more (`env >&2`, `e''nv`, `env -S '-u PATH'`). Re-measured against the real spawned pod script the class was wider than reported: 10 of 12 probe payloads classified `allow` while `/bin/sh` emitted a marker variable, including `e"n"v`, `\env`, `'env'`, `env>&2`, `env 2>&1` and `env -S '-0'`. The cause is structural, not a missing character class — a regex matches command *text*, but the shell executes the command after quote removal, escape processing, redirection stripping and GNU `env -S` re-splitting, so the matched string is not the token that runs. The command is now lexed as a shell would and the resulting words are classified, so spelling variants collapse to one word. The hand-maintained second case list for the embedded copy — the mechanism by which the two copies drifted — is replaced by a differential that drives the whole corpus through both. Fifth Ally review pass on Blockcast/paperclip#1092. |
-| `e1b28276f` | `src/server/job-manifest.ts`, `src/server/job-manifest.test.ts` | Two fail-closed fixes from the same review. (a) A configured account pool of the wrong *shape* (`accounts: "a@example.test"` rather than a list) was collapsed into the same `null` used for "absent" by `Array.isArray(...) ? ... : null`, so it read as unconfigured and selected unrestricted *global* ccrotate rotation — the same credential-scope widening `3e0244a78` fixed for the all-invalid case, still reachable by the likeliest possible typo. Presence is now tested separately from validity at both `providers.anthropic` and `.accounts` (`parseObject` returns `{}` for any non-object, so both levels shared the defect), an explicitly empty pool counts as configured-but-unusable, and diagnostics report the offending TYPE only — never the value, which sits next to credential material. (b) `workspaceMountPath` could equal a mount this builder already emits (`/tmp/prompt`, `/runtime-cache`, an inherited secret mount); those are shape-valid so `assertSafeAbsolutePath` passed them, and the duplicate mountPath yields a Pod Kubernetes rejects outright. Rejected at construction with a message naming the conflict, plus a per-container invariant assertion that backstops mounts appended later (`/var/run`, `prompt-secret`, `mcp-config-secret`) and the init container's independently-built list. Nested paths stay legal. |
-| [#1368](https://github.com/Blockcast/paperclip/pull/1368) | `src/server/k8s-client.ts`, `src/server/k8s-client.test.ts`, `src/server/job-manifest.ts`, `src/server/job-manifest.test.ts` | Carried the source volume's `items:` key selector through propagation. `getSelfPodInfo()` captured only `secretName`/`mountPath`/`defaultMode`, and the mount site rebuilt the volume without a selector, so a source mount projecting ONE key out of a multi-key Secret was re-expanded into EVERY key of that Secret on the agent Job pod. Measured live: `paperclip-api` projects `gbrain-plugin-service-key` alone out of `authbot-mcp-consumer-service-keys`, while agent pods received all 7 keys — agents held more key material than the container the mount was copied from. `optional: true` stays hardcoded at the mount site by design, so a Secret absent in the agent namespace still cannot hard-fail the Job. Refs [BLO-18927](https://paperclip.blockcast.net/BLO/issues/BLO-18927) AC-3; does **not** close [BLO-22514](https://paperclip.blockcast.net/BLO/issues/BLO-22514), which needs the allowlist. |
-| [#1377](https://github.com/Blockcast/paperclip/pull/1377) | `src/server/inherit-allowlist.ts` (new), `src/server/inherit-allowlist.test.ts` (new), `src/server/k8s-client.ts`, `src/server/k8s-client.test.ts`, `src/server/job-manifest.ts`, `src/server/job-manifest.test.ts`, `src/server/env-guard.ts` | Allowlisted what agent Job pods inherit from the paperclip server pod. `getSelfPodInfo()` snapshotted the server's ENTIRE env — every literal, every `valueFrom` including `secretKeyRef`, every `envFrom` and every mounted secret volume — with no filter, and `job-manifest.ts` replayed all of it onto every agent Job, so each agent container held `PAPERCLIP_AGENT_JWT_SECRET` (mint an API key for ANY agent), `DATABASE_URL` (bypass the API and all of `authorization.ts`) and `GITHUB_APP_PRIVATE_KEY`. Filtered at `getSelfPodInfo()` rather than at the four replay sites, so a future replay site cannot reintroduce the leak by forgetting to filter, plus a fail-closed `findServerOnlyEnvVarsInPodSpec` backstop in `buildJobManifest` because `SelfPodInfo` is a plain object callers can construct unfiltered. Keep-set derived from actual by-name reads plus an agent-pod consumer sweep — not pattern-matched — and both directions unit-tested, since a filter that dropped everything would pass a deny-only suite while breaking every run in the fleet. Measured against the live server env: 54 vars in, 24 inherited, 30 dropped, 0 control-plane credentials remaining. `env-guard.ts` is comment-only: records the BLO-22514 decision to keep that hook fail-OPEN. Closes [BLO-22514](https://paperclip.blockcast.net/BLO/issues/BLO-22514). |
-| [#1411](https://github.com/Blockcast/paperclip/pull/1411) | `src/server/inherit-allowlist.ts`, `src/server/inherit-allowlist.test.ts`, `src/server/k8s-client.test.ts` | Removed `paperclip-github-merge-token` (the `@allyblockcast` USER seat, id 296676656) from `AGENT_SECRET_VOLUME_ALLOWLIST`, so it no longer propagates from the server pod into agent Job pods. That seat's approvals SATISFY required review on repos whose ruleset names the Ally team (onprem-k8s, penstock-llm-proxy-core), so propagating it made "can clear branch protection" a fleet-wide capability — measured live at **108 agent Job pods** mounting it — rather than one service's. It was also unusable from an agent by construction, i.e. exposure with no function: the `gh` wrapper resolves `PAPERCLIP_GITHUB_TOKEN_FILE` (pinned to the App token at `/paperclip/.secrets/github-token/token`, never the seat path), `GH_TOKEN`/`gh auth`/`--with-token` overrides are no-ops because that wrapper re-reads the file per invocation, and shipped skills are forbidden from naming the seat path by `CREDENTIAL_SELECTOR_PATTERNS` in `packages/skills-catalog/src/shipped-catalog.test.ts`. Measured across 240 PRs in onprem-k8s, penstock-llm-proxy-core, paperclip and multicast: the seat authored 0 and pushed 0 (authorship is 100% the App) and merged 11, a path the App already covers. The CONTROL PLANE keeps the mount via `deploy/helm/paperclip/values.blockcast.yaml`, where the dedicated reviewer service that legitimately uses this identity runs — only the agent-Job propagation is removed. Two `k8s-client` tests used the seat as their example of a KEPT volume and were re-pointed at the App token; the base fixture now mounts both, deliberately keeping the seat so the allowlist is exercised against a realistic server pod rather than one curated to contain only inheritable volumes. Companion to the org-side half of [BLO-24056](https://paperclip.blockcast.net/BLO/issues/BLO-24056) (seat dropped to `read` on all 11 in-scope repos). |
-| [BLO-25403](https://paperclip.blockcast.net/BLO/issues/BLO-25403) | `src/server/job-manifest.ts`, `src/server/job-manifest.test.ts`, `src/server/config-schema.ts`, `src/server/execute.ts`, `src/server/execute.test.ts`, `src/server/execute-environment.test.ts` | Ported upstream `94c97d01d408155a5c173c43ab42304f688e7ce3` (merged as [kkroo#32](https://github.com/kkroo/paperclip-adapter-claude-k8s/pull/32) `c5d1389f`) — the BLO-21812 fix, which the 2026-08-06 vendoring **stranded**: it was authored against a branch that was not part of the `3ad3370`+`35f1eb2`+`6ddd4b0` composition, so it never entered the build path and `CLAUDE_K8S_REF` was retired out from under it. A new `resolveServiceAccountName()` resolves per-agent config → `PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME` (fleet default) → **throw**, replacing `asString(config.serviceAccountName, "") \|\| undefined`, which omitted the key and let Kubernetes admission silently assign the namespace's bare `default` SA — an identity with no cluster-scoped read, and a full misdiagnosed incident ([BLO-21499](https://paperclip.blockcast.net/BLO/issues/BLO-21499)). The resolved SA is echoed on `JobBuildResult`, into the run log and into invocation metadata so identity is attributable without a cluster read. Ported by hand rather than cherry-picked: 4 of 6 files applied clean, but `execute.ts` and the `buildJobManifest` return had drifted under `551c461ef`/`3e0244a78`/`e1b28276f` (`envSecret`, `mcpConfigSecret`), so those two hunks were reapplied against current code. No RBAC object is created or modified. Two cases beyond upstream's pin the load-bearing `.trim()` on both resolution branches — `serviceAccountName` is a `type: "text"` field, so a whitespace-only value is reachable from the UI form and a bare `\|\|` would emit it as a Job SA name the API server rejects (Ally review suggestion on [#1409](https://github.com/Blockcast/paperclip/pull/1409)). |
+The per-patch log lives in [PROVENANCE-CHANGES.md](./PROVENANCE-CHANGES.md),
+a separate file so that concurrent PRs appending to it do not conflict
+(BLO-34872).
 
 The two cherry-picked commits in the composition above remain upstream commits
 authored against the fork, not Blockcast-local patches.
 
 Future changes to this directory are ordinary in-tree changes to this
 repository: edit, open a PR, let CI run. There is no longer an external fork to
-push to first, and `CLAUDE_K8S_REF` no longer exists. **Any change here must
-update the integrity hash in the same PR** — CI fails the `vendor_claude_k8s`
-job otherwise, and prints the expected value.
+push to first, and `CLAUDE_K8S_REF` no longer exists. There is no integrity
+hash to update (see [Integrity](#integrity)). What gates a vendored change now
+is a row appended to [PROVENANCE-CHANGES.md](./PROVENANCE-CHANGES.md):
+`scripts/check-vendored-provenance-log.mjs`, run from the `policy` job, fails
+any PR that touches vendored source without one.
 
 ### Versioning
 
@@ -181,7 +188,7 @@ after the first Blockcast change that ships, the version alone could no longer
 tell you which code was running — provenance had to be established by grepping
 `dist/` for a token.
 
-This directory therefore versions itself: **`0.2.6-blockcast.1`**, set in
+This directory therefore versions itself: **`0.2.6-blockcast.11`**, set in
 `package.json` and `package-lock.json`. The `-blockcast.` prerelease channel
 says plainly that this is our tree, not an upstream release.
 
@@ -192,7 +199,22 @@ prerelease identifiers would have decided it — and `blockcast` sorts *below*
 `kkroo` alphabetically, making the release read as a downgrade to anything
 comparing versions.
 
-Bump `-blockcast.N` for subsequent changes to this directory.
+Bump `-blockcast.N` **only when something outside this directory needs to tell
+two builds of it apart** — which, as of
+[BLO-35109](https://paperclip.blockcast.net/BLO/issues/BLO-35109), nothing does.
+Do **not** bump it per-PR.
+
+Measured 2026-09-21: the `-blockcast.N` version string appears in exactly five
+places, all of them inside this directory (`package.json`, `package-lock.json`
+×2, and twice in this file). Nothing outside the vendored tree reads it. The
+image builds this package from source and packs it with a glob —
+`mv paperclip-adapter-claude-k8s-*.tgz` — so the number never reaches the
+Dockerfile, which says so itself: *"claude_k8s — edit
+vendor/paperclip-adapter-claude-k8s/ and open a PR. Nothing to pin or bump."*
+
+Bumping it per-PR was not free. It put a version line in five places into every
+vendored PR's diff, which is three of the four hunks that used to make any two
+concurrent PRs on this tree conflict — for a number no consumer reads.
 
 ### The inert upstream workflow
 

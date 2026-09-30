@@ -28,6 +28,9 @@ function agentComment(body: string) {
   };
 }
 
+/** A clean GitHub review probe, for cases whose subject is a text shape. */
+const ALLY_CLEAN = { "review:ally-clean": true } as const;
+
 describe("evaluateEvidence — landing-artifact (BLO-17560)", () => {
   it("BLOCKS a backend claim with test-output + checklist but no PR/commit link (the BLO-6395 fabrication shape)", () => {
     const result = evaluateEvidence({
@@ -80,6 +83,11 @@ describe("evaluateEvidence — landing-artifact (BLO-17560)", () => {
       ],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      // `review:ally-clean` (BLO-32239) is a GitHub-probed shape no comment
+      // text can produce. This case's subject is `landing-artifact`, so the
+      // probe result is supplied rather than left absent — otherwise the
+      // assertion silently becomes one about the probe.
+      externalDetections: ALLY_CLEAN,
     });
 
     expect(result.verdict).toBe("pass");
@@ -99,6 +107,7 @@ describe("evaluateEvidence — landing-artifact (BLO-17560)", () => {
       ],
       workProducts: [],
       registry: DEFAULT_EVIDENCE_REGISTRY,
+      externalDetections: ALLY_CLEAN,
     });
 
     expect(result.verdict).toBe("pass");

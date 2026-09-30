@@ -179,6 +179,24 @@ it across:
 - **Map the advice below onto the repo's headings rather than dropping it.** The
   section names change; what a reviewer needs to see does not.
 
+Some repositories enforce `.github/PULL_REQUEST_TEMPLATE.md`. When that
+template exists, fill `## Thinking Path`, `## Linked Issues or Issue
+Description`, `## What Changed`, `## Verification`, `## Risks`, `## Model Used`,
+and `## Checklist`; include `Fixes: #123`, `Closes #123`, or `Refs #123` when an
+issue exists, or a real in-PR issue description when it does not. For
+implementation PRs, search GitHub for duplicate or related PRs when that is
+part of the repository's review requirements. If the template contains the
+Paperclip dedup-search checkbox, check this line exactly:
+
+```md
+- [x] I have searched GitHub for duplicate or related PRs and linked them above
+```
+
+If the repository has no PR template, or its template does not contain that
+checkbox, follow the repository's own PR-body and duplicate/related-change
+requirements instead; do not invent or wait for a Paperclip-specific section or
+checkbox.
+
 **Run the gate locally before you push.** A repo that enforces a template almost
 always ships the checker as a script that CI merely invokes, so the same verdict
 is available in a second instead of costing a push, a red check, and a rewrite:
@@ -213,6 +231,25 @@ mangling backticks and newlines on the way through.
 ```
 
 Skip the `Risk and rollback` section only for clearly trivial PRs (typos, docs).
+
+## Repository pre-review gates
+
+Before requesting or re-requesting review, inspect the repository for its actual
+quality-gate workflow or checker. If it has a commitperclip workflow or checker
+(for example `.github/workflows/commitperclip-review.yml`), its required
+template sections and linked issue/issue description must be satisfied before
+asking for review. Satisfy its dedup-search checkbox only when that checker or
+template defines one; otherwise follow the repository's own duplicate/related-
+change requirement. A missing required item wastes a review cycle and blocks
+`commitperclip PR Review`. If it does not have commitperclip, wait for the
+repository's actual required quality gates and checks instead; do not assume a
+Paperclip-specific check exists.
+
+Before requesting or re-requesting review:
+
+- Confirm the PR body still matches `.github/PULL_REQUEST_TEMPLATE.md` if the repo has one.
+- If the repository template contains the Paperclip dedup-search checkbox, confirm it is present and checked after you searched the GitHub PR list; otherwise follow the repository's own duplicate/related-change requirement.
+- For a repository with commitperclip, confirm `commitperclip PR Review` and its related quality gates are passing; for other repositories, confirm their actual required quality gates are passing. If a gate fails, update the PR and wait for it to rerun before pinging Ally or another reviewer.
 
 ## Verification evidence
 
