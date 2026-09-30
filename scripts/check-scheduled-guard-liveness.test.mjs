@@ -1271,15 +1271,50 @@ describe("annotationFor — the per-guard index-fault signal is the claim, so it
       /title=Scheduled guard is stale \(brand-new-reason\)/,
     );
   });
+
+  // The fallback above was asserted while the one mapped title that actually
+  // ships was not: `unparsable-timestamp` is the sole live `unknown` reason
+  // (classifyGuard, :313), so this is the string an operator really reads and
+  // the fallback is the one that should never fire. Asserting only the
+  // fallback is the inverse of the coverage wanted.
+  it("the one unknown reason that actually ships gets its mapped title", () => {
+    assert.match(
+      annotationFor({ status: "unknown", reason: "unparsable-timestamp", detail: "d" }),
+      /title=Unparsable run timestamp::/,
+    );
+  });
+
+  // `annotationFor` is public API as of this PR, so the stop-mode argument is
+  // omissible by a caller that main() never is. It must not render a
+  // plausible-looking `null` into an operator annotation.
+  it("an omitted stop-mode detail leaves no literal null in the annotation", () => {
+    const line = annotationFor({
+      status: "stale",
+      reason: "stopped",
+      detail: "Relay SSL has stopped.",
+      lastRunUrl: null,
+    });
+
+    assert.doesNotMatch(line, /\bnull\b/, "a missing stop-mode must not print the word null");
+    assert.doesNotMatch(line, /\bundefined\b/);
+    assert.match(line, /Relay SSL has stopped\. This guard is not enforcing/, "the clause closes up cleanly");
+  });
 });
 
 // Suggestion 2 of the a9f0999 review: a count cannot tell an 18-day wedge from
 // a three-minute one, and those are different operational facts.
 describe("summarize — the corroborated clause carries severity, not just a count", () => {
   it("reports the worst index lag across corroborated guards", () => {
+    // The fixture is deliberately non-monotonic: the maximum is neither the
+    // first element nor the last, so this assertion can tell `Math.max` apart
+    // from `lags[0]` AND from `lags.at(-1)`. An ascending fixture cannot — it
+    // makes max and last the same value, and a reducer silently swapped for a
+    // sort-then-take would report a three-minute lag while an 18-day wedge is
+    // live, which is stale in the direction that understates the hazard.
     const summary = summarize([
       { status: "ok", reason: "corroborated", indexLagMinutes: 12 },
       { status: "ok", reason: "corroborated", indexLagMinutes: 26066 },
+      { status: "ok", reason: "corroborated", indexLagMinutes: 900 },
     ]);
 
     assert.match(summary.headline, /worst index lag 26066m/, "the worst lag, not the first or the last");

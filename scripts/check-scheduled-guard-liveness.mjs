@@ -810,7 +810,11 @@ export function crossCheckCompletions(repo, workflow, read = gh) {
  * @param {object} result a classifyGuard result
  * @param {string|null} stopModeDetail describeStopMode output; required only
  *   for the `stopped` reason, which is the one line here costing an API call.
- *   Kept a parameter so this function stays pure and network-free.
+ *   Kept a parameter so this function stays pure and network-free. Omitting it
+ *   drops the clause entirely rather than rendering the word `null` into an
+ *   operator annotation — main() always supplies it for the one reason that
+ *   consumes it, but this function is public API and a caller that forgets
+ *   should get a shorter sentence, not a plausible-looking wrong one.
  * @returns {string}
  */
 export function annotationFor(result, stopModeDetail = null) {
@@ -840,7 +844,8 @@ export function annotationFor(result, stopModeDetail = null) {
 
   if (result.reason === "stopped") {
     return (
-      `::error title=Scheduled guard has stopped executing::${result.detail} ${stopModeDetail} This ` +
+      `::error title=Scheduled guard has stopped executing::${result.detail}` +
+      `${stopModeDetail ? ` ${stopModeDetail}` : ""} This ` +
       `guard is not enforcing anything right now, and a stopped guard reds nothing on its own ` +
       `— that silence is why this job exists (PEN-3281). Last run: ${result.lastRunUrl ?? "n/a"}`
     );
