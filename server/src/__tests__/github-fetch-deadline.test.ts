@@ -6,6 +6,7 @@ import {
   GITHUB_FETCH_DEADLINE_MS,
   GITHUB_REQUEST_TIMEOUT_MS,
   ghFetch,
+  ghReadBody,
   _setGhFetchDeadlineMsForTest,
 } from "../services/github-fetch.js";
 
@@ -53,7 +54,12 @@ describe("ghFetch deadline (BLO-38257)", () => {
       vi.stubGlobal("fetch", neverResolvingFetch());
 
       const startedAt = Date.now();
-      await expect(ghFetch(URL_UNDER_TEST)).rejects.toThrow(/Could not connect to api\.github\.com/);
+      // Reported as a timeout, never as the connect failure that would send
+      // on-call to check URL configuration during a GitHub slowdown.
+      await expect(ghFetch(URL_UNDER_TEST)).rejects.toMatchObject({
+        status: 422,
+        message: "GitHub request to api.github.com timed out after 60ms",
+      });
       // Fired at the 60ms deadline, nowhere near the 1.5s late resolve.
       expect(Date.now() - startedAt).toBeLessThan(750);
     },
@@ -70,16 +76,23 @@ describe("ghFetch deadline (BLO-38257)", () => {
       vi.stubGlobal("fetch", neverResolvingFetch());
 
       const controller = new AbortController();
-      setTimeout(() => controller.abort(new Error("caller-deadline")), 60);
+      const callerReason = new Error("caller-deadline");
+      setTimeout(() => controller.abort(callerReason), 60);
 
       const startedAt = Date.now();
-      await expect(ghFetch(URL_UNDER_TEST, { signal: controller.signal })).rejects.toThrow(
-        /Could not connect to api\.github\.com/,
-      );
+      // The caller's own abort comes back as exactly what it aborted with, so
+      // "I cancelled this" stays distinguishable from "GitHub is down".
+      await expect(ghFetch(URL_UNDER_TEST, { signal: controller.signal })).rejects.toBe(callerReason);
       expect(Date.now() - startedAt).toBeLessThan(750);
     },
     10_000,
   );
+
+  it("still reports a genuine connect failure as one", async () => {
+    vi.stubGlobal("fetch", () => Promise.reject(new TypeError("fetch failed")));
+
+    await expect(ghFetch(URL_UNDER_TEST)).rejects.toThrow(/Could not connect to api\.github\.com/);
+  });
 
   it("passes an already-aborted caller signal straight through to fetch", async () => {
     const seen: Array<AbortSignal | null | undefined> = [];
@@ -92,6 +105,55 @@ describe("ghFetch deadline (BLO-38257)", () => {
 
     expect(seen).toHaveLength(1);
     expect(seen[0]?.aborted).toBe(true);
+  });
+});
+
+describe("ghReadBody: the deadline stays armed through the body read (BLO-38257)", () => {
+  it(
+    "reports a deadline that fires mid-body as a timeout, not a raw TimeoutError",
+    async () => {
+      _setGhFetchDeadlineMsForTest(60);
+      // Headers arrive at once; the body only settles when something aborts it,
+      // or at the late resolve that no deadline in force ever lets it reach.
+      vi.stubGlobal("fetch", (_url: string, init?: RequestInit) =>
+        Promise.resolve({
+          ok: true,
+          status: 200,
+          text: () =>
+            new Promise<string>((resolve, reject) => {
+              const late = setTimeout(() => resolve("late body"), 1_500);
+              init?.signal?.addEventListener("abort", () => {
+                clearTimeout(late);
+                reject(init.signal?.reason);
+              });
+            }),
+        } as unknown as Response),
+      );
+
+      const response = await ghFetch(URL_UNDER_TEST);
+      await expect(ghReadBody(URL_UNDER_TEST, () => response.text())).rejects.toMatchObject({
+        status: 422,
+        message: "GitHub request to api.github.com timed out after 60ms",
+      });
+    },
+    10_000,
+  );
+
+  it("leaves a body failure that is not an abort exactly as it was", async () => {
+    const parseError = new SyntaxError("Unexpected token < in JSON");
+
+    await expect(ghReadBody(URL_UNDER_TEST, () => Promise.reject(parseError))).rejects.toBe(parseError);
+  });
+
+  it("every ghFetch body read in the unprocessable-convention helpers goes through ghReadBody", () => {
+    const offenders = ["company-portability.ts", "company-skills.ts", "skills-catalog.ts"].flatMap((file) =>
+      readFileSync(fileURLToPath(new URL(`../services/${file}`, import.meta.url)), "utf8")
+        .split("\n")
+        .filter((line) => /\.(?:text|json|arrayBuffer|blob|bytes)\(\)/.test(line) && !line.includes("ghReadBody("))
+        .map((line) => `${file}: ${line.trim()}`),
+    );
+
+    expect(offenders).toEqual([]);
   });
 });
 

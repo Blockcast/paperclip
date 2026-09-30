@@ -91,7 +91,7 @@ import type {
 import { isUuidLike, normalizeAgentUrlKey, parseFrontmatterMarkdown } from "@paperclipai/shared";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
-import { ghFetch, gitHubApiBase, resolveRawGitHubUrl } from "./github-fetch.js";
+import { ghFetch, ghReadBody, gitHubApiBase, resolveRawGitHubUrl } from "./github-fetch.js";
 import { agentService } from "./agents.js";
 import { issueDocumentSelect, mapIssueDocumentRow } from "./documents.js";
 import { toIssueWorkProduct } from "./work-products.js";
@@ -665,7 +665,7 @@ async function fetchText(url: string) {
   if (!response.ok) {
     throw unprocessable(`Failed to fetch ${url}: ${response.status}`);
   }
-  return response.text();
+  return ghReadBody(url, () => response.text());
 }
 
 async function fetchJson<T>(url: string): Promise<T> {
@@ -677,7 +677,7 @@ async function fetchJson<T>(url: string): Promise<T> {
   if (!response.ok) {
     throw unprocessable(`Failed to fetch ${url}: ${response.status}`);
   }
-  return response.json() as Promise<T>;
+  return ghReadBody(url, () => response.json() as Promise<T>);
 }
 
 
