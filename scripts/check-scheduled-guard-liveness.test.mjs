@@ -14,6 +14,7 @@ import {
   crossCheckCompletions,
   describeStopMode,
   resolveStaleHours,
+  resolveWatched,
   selectNewestCompleted,
   summarize,
 } from "./check-scheduled-guard-liveness.mjs";
@@ -728,6 +729,60 @@ describe("classifyGuard — stop-modes a run-state scan cannot see", () => {
     assert.equal(result.reason, "never-completed");
   });
 
+  // A newly-scheduled workflow has zero completed runs at merge by construction
+  // — schedules fire only from the default branch — so without a grace it reds
+  // the shared hourly job until its first cron. The alarm this guard reports
+  // into is all-or-nothing, so a red-by-design window trains everyone to ignore
+  // a real stall in the other seven guards.
+  it("graces a never-completed guard inside its window, and only that reason", () => {
+    const never = { state: "active", name: "Master Health", newest: null };
+    const graceUntil = new Date(now + HOUR).toISOString();
+
+    const inside = classifyGuard("master-health.yml", never, { now, graceUntil });
+    assert.equal(inside.status, "ok");
+    assert.equal(inside.reason, "awaiting-first-run");
+
+    // Fail-closed: the grace expires into a hard red, never into a silent green.
+    const expired = classifyGuard("master-health.yml", never, {
+      now,
+      graceUntil: new Date(now - HOUR).toISOString(),
+    });
+    assert.equal(expired.status, "stale");
+    assert.equal(expired.reason, "never-completed");
+
+    // The grace covers the bootstrap only. Every reason decided on real
+    // evidence must survive it, or it becomes a blanket mute.
+    const disabled = classifyGuard(
+      "master-health.yml",
+      { state: "disabled_manually", name: "Master Health" },
+      { now, graceUntil },
+    );
+    assert.equal(disabled.status, "stale");
+    assert.equal(disabled.reason, "disabled");
+
+    const stale = classifyGuard(
+      "master-health.yml",
+      { state: "active", name: "Master Health", newest: { updatedAt: new Date(now - 100 * HOUR).toISOString(), conclusion: "success" } },
+      { now, graceUntil, staleHours: 48 },
+    );
+    assert.equal(stale.status, "stale");
+
+    const unreadable = classifyGuard("master-health.yml", { error: "unreadable" }, { now, graceUntil });
+    assert.equal(unreadable.status, "stale");
+    assert.equal(unreadable.reason, "unreadable");
+  });
+
+  // The window must outlive the merge that introduces the schedule, or it buys
+  // nothing; and it must not be open-ended, or the guard never starts enforcing.
+  it("sets the grace window past the first cron after merge, and not far past it", () => {
+    const grace = Date.parse(
+      WATCHED_GUARDS.find((guard) => guard.workflow === "master-health.yml").graceUntil,
+    );
+
+    assert.ok(grace > Date.parse("2026-10-01T00:37:00Z"), "expires before master-health's first cron can fire");
+    assert.ok(grace < Date.parse("2026-10-05T00:00:00Z"), "an open-ended grace is a permanently muted guard");
+  });
+
   // Silently dropping a guard from the watched set is this row's whole defect,
   // so an unreadable workflow must fail loudly rather than skip.
   it("reds an unreadable workflow rather than skipping it", () => {
@@ -894,7 +949,9 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
   it("declares an event filter for every watched guard with an auto-firing non-schedule trigger", () => {
     const missing = WATCHED_GUARDS.filter((guard) => {
       const body = readFileSync(join(workflowDir, guard.workflow), "utf8");
-      const autoTrigger = /^\s*(push|pull_request|workflow_call):/m.test(body);
+      const autoTrigger = /^\s*(push|pull_request|pull_request_target|workflow_call|workflow_run|merge_group|issue_comment|repository_dispatch|release):/m.test(
+        body,
+      );
       return autoTrigger && guard.event !== "schedule";
     }).map((guard) => guard.workflow);
 
@@ -926,11 +983,36 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
   });
 
   // The two assertions above prove the filter is BUILT correctly. Neither proves
-  // main() actually hands it over — dropping `event` from that one destructure
-  // reverts the whole fix while every other test stays green. main() shells out
-  // to `gh`, so no unit test can see it; this asserts against the source, the
-  // same escape the stale-hours YAML-wiring test above takes for the same reason.
-  it("threads each guard's event filter from WATCHED_GUARDS through to the fetch", () => {
+  // main() actually hands it over. This used to assert against the SOURCE TEXT
+  // of main()'s destructure, and that test was worthless in the precise way this
+  // file keeps warning about: the destructure stayed correct while the scoping
+  // branch beside it rebuilt entries from the workflow name alone and dropped
+  // `event` for every guard it scoped to. The regex matched; the fix was
+  // reverted. resolveWatched() exists so this is a behavioural test on the
+  // object main() classifies, not on how it is spelled.
+  it("threads each guard's event filter and grace through the unscoped set", () => {
+    const masterHealth = resolveWatched("").find((guard) => guard.workflow === "master-health.yml");
+
+    assert.equal(masterHealth.event, "schedule");
+    assert.equal(
+      completedRunsPath("o/r", masterHealth.workflow, masterHealth.event),
+      "repos/o/r/actions/workflows/master-health.yml/runs?status=completed&per_page=1&event=schedule",
+    );
+  });
+
+  // The ONE arm of this fix that has no behavioural instrument. main() shells out
+  // to `gh`, so nothing unit-visible distinguishes it passing `event` to the
+  // cross-check from it dropping it — and the consequence of dropping it is the
+  // permanent mute described on the test below, not a visible red.
+  //
+  // So this asserts against the source text, and the comment on the test above
+  // is the standing warning about what that buys: a regex can keep matching
+  // while an adjacent branch reverts the effect. It is kept because the
+  // alternative is NO failing mutation at all on the arm with the worst failure
+  // mode, and a guard with no failing mutation is a comment (BLO-34263). If
+  // `crossCheckCompletions` ever grows a behavioural seam into main(), replace
+  // this with it rather than adding to it.
+  it("passes each guard's event filter to the cross-check, not just to the filtered read", () => {
     const source = readFileSync(
       resolve(dirname(fileURLToPath(import.meta.url)), "check-scheduled-guard-liveness.mjs"),
       "utf8",
@@ -938,18 +1020,8 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
 
     assert.match(
       source,
-      /watched\.map\(\(\{[^}]*\bevent\b[^}]*\}\)/,
-      "main() no longer destructures `event` off the guard entry",
-    );
-    assert.match(
-      source,
-      /observeWorkflow\(repo,\s*workflow,\s*event\)/,
-      "main() no longer passes `event` to observeWorkflow — every filtered guard silently unfilters",
-    );
-    assert.match(
-      source,
       /crossCheckCompletions\(repo,\s*workflow,\s*gh,\s*event\)/,
-      "main() no longer passes `event` to the cross-check — see the mute below",
+      "main() no longer passes `event` to the cross-check — see the mute on the next test",
     );
   });
 
@@ -984,6 +1056,27 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     // The axis it must still DROP: corroboration depends on not going through
     // the suspect server-side index.
     for (const path of paths) assert.ok(!path.includes("status=completed"));
+  });
+
+  // GUARD_LIVENESS_WORKFLOWS is the path a human uses to check this guard works,
+  // so unfiltering there reports "fresh" off a push run to whoever is verifying
+  // — the one reading most likely to be believed.
+  it("keeps a scoped guard's own event filter, threshold and grace", () => {
+    const [scoped] = resolveWatched("master-health.yml");
+
+    assert.equal(scoped.event, "schedule", "scoping dropped the event filter — push runs read as fresh");
+    assert.equal(scoped.staleHours, 48, "scoping silently reset the threshold to the hourly default");
+    assert.ok(scoped.graceUntil, "scoping dropped the grace window");
+  });
+
+  it("still honours the stale-hours override and resolves an undeclared workflow", () => {
+    const [overridden] = resolveWatched("master-health.yml", 1);
+    assert.equal(overridden.staleHours, 1, "an explicit override must beat the declared threshold");
+
+    // The dial may name anything; an unwatched workflow is not an error.
+    const [undeclared] = resolveWatched("not-a-watched-guard.yml");
+    assert.equal(undeclared.staleHours, DEFAULT_STALE_HOURS);
+    assert.equal(undeclared.event, undefined);
   });
 
   it("gives every exemption a stated reason", () => {
