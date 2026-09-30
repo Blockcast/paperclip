@@ -94,9 +94,9 @@ applied since.
 
 **There is no recorded integrity hash, deliberately — removed under
 [BLO-35109](https://paperclip.blockcast.net/BLO/issues/BLO-35109).** What
-replaced it is the append-only log in
-[PROVENANCE-CHANGES.md](./PROVENANCE-CHANGES.md): CI fails any change that
-touches vendored source without appending a row there
+replaced it is the per-change log in
+[PROVENANCE-CHANGES.d/](./PROVENANCE-CHANGES.d/): CI fails any change that
+touches vendored source without adding a file there
 (`scripts/check-vendored-provenance-log.mjs`, run from the `policy` job).
 
 A single 64-hex manifest of the tree used to be recorded here and recomputed by
@@ -165,9 +165,13 @@ patches. They are ordinary in-tree changes, reviewed under our own CI — which 
 the point of vendoring — but they mean the tree is **no longer byte-for-byte
 upstream**, so they are enumerated here rather than left implicit.
 
-The per-patch log lives in [PROVENANCE-CHANGES.md](./PROVENANCE-CHANGES.md),
-a separate file so that concurrent PRs appending to it do not conflict
-(BLO-34872).
+The per-patch log lives in [PROVENANCE-CHANGES.d/](./PROVENANCE-CHANGES.d/),
+one file per change so that concurrent PRs recording their own do not conflict
+(BLO-34872). [PROVENANCE-CHANGES.md](./PROVENANCE-CHANGES.md) is the frozen
+predecessor: a single append-only table marked `merge=union`, which fixed a
+local `git rebase` and not GitHub's server-side merge — see
+[PROVENANCE-CHANGES.d/README.md](./PROVENANCE-CHANGES.d/README.md) for the
+measurement. Do not add rows to it.
 
 The two cherry-picked commits in the composition above remain upstream commits
 authored against the fork, not Blockcast-local patches.
@@ -176,9 +180,9 @@ Future changes to this directory are ordinary in-tree changes to this
 repository: edit, open a PR, let CI run. There is no longer an external fork to
 push to first, and `CLAUDE_K8S_REF` no longer exists. There is no integrity
 hash to update (see [Integrity](#integrity)). What gates a vendored change now
-is a row appended to [PROVENANCE-CHANGES.md](./PROVENANCE-CHANGES.md):
-`scripts/check-vendored-provenance-log.mjs`, run from the `policy` job, fails
-any PR that touches vendored source without one.
+is one new file under [PROVENANCE-CHANGES.d/](./PROVENANCE-CHANGES.d/), named
+after your issue or PR: `scripts/check-vendored-provenance-log.mjs`, run from
+the `policy` job, fails any PR that touches vendored source without one.
 
 ### Versioning
 

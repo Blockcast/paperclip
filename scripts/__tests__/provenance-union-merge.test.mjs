@@ -7,9 +7,11 @@ import { after, test } from "node:test";
 
 import {
   LOG,
+  LOG_DIR,
   NOT_SOURCE,
   VENDOR_DIR,
   checkVendoredProvenanceLog,
+  isEntryPath,
 } from "../check-vendored-provenance-log.mjs";
 
 // BLO-34872 + BLO-35109. Two concurrent PRs touching the vendored adapter used to
@@ -150,6 +152,7 @@ function scratchRepo() {
   write(SECOND_SOURCE, "export const execute = 1;\n");
   write(`${VENDOR_DIR}/PROVENANCE.md`, "# Provenance\n");
   write(LOG, LOG_HEADER);
+  write(`${LOG_DIR}/README.md`, "# Per-change provenance entries\n");
   git("add", "-A");
   git("commit", "--quiet", "-m", "seed");
 
@@ -169,7 +172,7 @@ test("a vendored source change with no log row is rejected", () => {
 
   const result = check();
   assert.equal(result.ok, false);
-  assert.match(result.reason, /gained no row/);
+  assert.match(result.reason, /gained no entry/);
   assert.ok(
     result.detail.some((line) => line.includes(SOURCE)),
     "the failure should name the changed file",
@@ -182,7 +185,8 @@ test("a vendored source change with an appended log row passes", () => {
   write(LOG, `${LOG_HEADER}| \`abc\` | job-manifest.ts | bumped the manifest |\n`);
   commit("touch vendored source and log it");
 
-  assert.deepEqual(check(), { ok: true });
+  // Still accepted -- transitional, see "a legacy row still passes" below.
+  assert.equal(check().ok, true);
 });
 
 test("deleting a line from the append-only log is rejected", () => {
@@ -275,7 +279,7 @@ test("a blank added line does not satisfy the require-a-row guard", () => {
 
   const result = check();
   assert.equal(result.ok, false);
-  assert.match(result.reason, /gained no row/);
+  assert.match(result.reason, /gained no entry/);
 });
 
 test("a change that does not touch the vendored tree at all passes", () => {
@@ -306,10 +310,7 @@ test("commits that landed on the base branch are not attributed to this change",
   assert.notEqual(baseTip, base, "master must have moved for this test to mean anything");
   git("checkout", "--quiet", "feature");
 
-  assert.deepEqual(
-    checkVendoredProvenanceLog({ base: baseTip, head: "HEAD", cwd: dir }),
-    { ok: true },
-  );
+  assert.equal(checkVendoredProvenanceLog({ base: baseTip, head: "HEAD", cwd: dir }).ok, true);
 });
 
 // --------------------------------------------------------------------------
@@ -341,5 +342,194 @@ test("two concurrent realistic vendored changes rebase with no conflict (BLO-351
   assert.ok(!merged.includes("<<<<<<<"), "the rebase left conflict markers");
 
   // And the rebased result still satisfies the guard.
-  assert.deepEqual(checkVendoredProvenanceLog({ base, head: "HEAD", cwd: dir }), { ok: true });
+  assert.equal(checkVendoredProvenanceLog({ base, head: "HEAD", cwd: dir }).ok, true);
+});
+
+// --------------------------------------------------------------------------
+// BLO-34872 round 2: the merge GitHub actually performs
+//
+// Everything above this line exercises a local `git rebase`, which honours the
+// repo's `merge=union` attribute. GitHub does not: its server-side merge
+// ignores .gitattributes merge drivers, and that merge is what computes a PR's
+// `mergeable` state and the merge-queue rebase. So the union-merge tests above
+// were green while #2070, #1459 and #1699 were being ejected from the queue
+// with `merge_conflict` on exactly the file the union was supposed to fix.
+//
+// These reproduce that by forcing `merge=text` in .git/info/attributes, which
+// has higher precedence than the in-tree .gitattributes. The CONTROL is the
+// load-bearing half: it asserts the harness still conflicts on the old
+// single-file layout. Without it a harness that silently stopped merging
+// anything would report the new layout as clean and prove nothing.
+// --------------------------------------------------------------------------
+
+/**
+ * Two branches off one base, merged the way GitHub merges: attribute merge
+ * drivers disabled. Each branch edits a DIFFERENT vendored source file, so any
+ * conflict reported is attributable to how the change was RECORDED and not to
+ * the source edit -- without that the control conflicts on `SOURCE` and proves
+ * nothing about the log at all.
+ *
+ * @param {(ctx: ReturnType<typeof scratchRepo>, branch: {id: string, source: string}) => void} record
+ * @returns {{clean: boolean, output: string}}
+ */
+function mergeWithoutDrivers(record) {
+  const ctx = scratchRepo();
+  const { dir, git, base } = ctx;
+  const branches = [
+    { id: "a", source: SOURCE },
+    { id: "b", source: SECOND_SOURCE },
+  ];
+
+  // $GIT_DIR/info/attributes has the highest precedence, so this overrides the
+  // union line in the tree's own .gitattributes. That is the GitHub equivalence.
+  mkdirSync(join(dir, ".git", "info"), { recursive: true });
+  writeFileSync(join(dir, ".git", "info", "attributes"), `${LOG} merge=text\n`);
+
+  for (const branch of branches) {
+    git("checkout", "--quiet", "-b", `branch-${branch.id}`, base);
+    ctx.write(branch.source, `export const x = "${branch.id}";\n`);
+    record(ctx, branch);
+    ctx.commit(`change ${branch.id}`);
+  }
+
+  try {
+    return { clean: true, output: git("merge-tree", "--write-tree", "branch-a", "branch-b") };
+  } catch (err) {
+    // Non-zero exit == conflict. merge-tree still writes the conflicted paths
+    // to stdout, which is how we check WHICH file conflicted.
+    return { clean: false, output: String(err.stdout ?? "") };
+  }
+}
+
+test("CONTROL: concurrent appends to the single log file conflict without drivers", () => {
+  // The failure as measured on 2026-09-30: master 0bb33a1a7, #2070 ejected at
+  // 17:04:28Z and #1459 at 17:07:02Z, both `merge_conflict`, both in this file
+  // and nothing else, both clean under a local merge with the union attribute.
+  const { clean, output } = mergeWithoutDrivers((ctx, branch) => {
+    ctx.write(LOG, `${LOG_HEADER}| \`${branch.id}\` | ${branch.source} | change ${branch.id} |\n`);
+  });
+  assert.equal(
+    clean,
+    false,
+    "the harness no longer reproduces the single-file conflict, so the test below proves nothing",
+  );
+  assert.ok(
+    output.includes(LOG),
+    `the conflict must be in ${LOG} itself, not in the source edit: ${output}`,
+  );
+});
+
+test("one file per change merges cleanly without drivers (BLO-34872 round 2)", () => {
+  const { clean, output } = mergeWithoutDrivers((ctx, branch) => {
+    ctx.write(`${LOG_DIR}/change-${branch.id}.md`, `Change ${branch.id}: touched ${branch.source}.\n`);
+  });
+  assert.equal(clean, true, `two distinct new entry files must never conflict: ${output}`);
+});
+
+// --------------------------------------------------------------------------
+// The guard accepts a per-change file, and only a per-change file
+// --------------------------------------------------------------------------
+
+test("a vendored source change with a new entry file passes, with no warning", () => {
+  const { write, commit, check } = scratchRepo();
+  write(SOURCE, "export const manifest = 2;\n");
+  write(`${LOG_DIR}/blo-1.md`, "Bumped the manifest.\n");
+  commit("touch vendored source and record it");
+
+  assert.deepEqual(check(), { ok: true });
+});
+
+test("a legacy row still passes, but is warned about", () => {
+  // Transitional on purpose: PRs already in the queue appended to the old file
+  // and must not all be rewritten. The warning is what stops it being the
+  // silent default -- appending there is what reproduces the conflict.
+  const { write, commit, check } = scratchRepo();
+  write(SOURCE, "export const manifest = 2;\n");
+  write(LOG, `${LOG_HEADER}| \`abc\` | job-manifest.ts | bumped the manifest |\n`);
+  commit("touch vendored source, append to the frozen log");
+
+  const result = check();
+  assert.equal(result.ok, true);
+  assert.match(result.warning ?? "", /frozen/);
+});
+
+test("the entry directory's README does not satisfy the guard", () => {
+  // Every PR would otherwise be able to satisfy it by touching the docs.
+  const { write, commit, check } = scratchRepo();
+  write(SOURCE, "export const manifest = 2;\n");
+  write(`${LOG_DIR}/README.md`, "# Per-change provenance entries\n\nedited\n");
+  commit("touch vendored source, edit the directory README");
+
+  const result = check();
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /gained no entry/);
+});
+
+test("modifying an existing entry does not satisfy the guard for a later change", () => {
+  // --diff-filter=A. Re-editing an earlier entry is not conflict-free -- two
+  // PRs editing one path collide exactly like the single-file log did -- so it
+  // must not count as this change's record. The entry has to predate the base
+  // for this to mean anything: within one PR, add-then-edit is still an add.
+  const { dir, git, write, commit, base } = scratchRepo();
+  write(`${LOG_DIR}/blo-1.md`, "First change.\n");
+  commit("an earlier entry, already on the base branch");
+  const entryBase = git("rev-parse", "HEAD").trim();
+  assert.notEqual(entryBase, base, "the entry must predate the range under test");
+
+  write(SOURCE, "export const manifest = 2;\n");
+  write(`${LOG_DIR}/blo-1.md`, "First change, with a later edit.\n");
+  commit("touch vendored source, edit the earlier entry");
+
+  const result = checkVendoredProvenanceLog({ base: entryBase, head: "HEAD", cwd: dir });
+  assert.equal(result.ok, false, "the edit must not count as this change's entry");
+  assert.match(result.reason, /gained no entry/);
+});
+
+test("editing an entry alone is not itself a vendored change needing an entry", () => {
+  // The `!p.startsWith(LOG_DIR)` filter in `changed`. Drop it and a typo fix in
+  // your own earlier entry is rejected as unrecorded vendored source.
+  //
+  // The entry must predate the base, exactly as in the --diff-filter=A case
+  // above: inside one range an add-then-edit is still an add, so the guard is
+  // satisfied by the add and this passes on broken code. Measured -- written
+  // the obvious way, reverting the filter left the whole suite green.
+  const { dir, git, write, commit } = scratchRepo();
+  write(`${LOG_DIR}/blo-1.md`, "First change.\n");
+  commit("an earlier entry, already on the base branch");
+  const entryBase = git("rev-parse", "HEAD").trim();
+
+  write(`${LOG_DIR}/blo-1.md`, "First change, typo fixed.\n");
+  commit("fix a typo in an entry");
+
+  assert.deepEqual(
+    checkVendoredProvenanceLog({ base: entryBase, head: "HEAD", cwd: dir }),
+    { ok: true },
+  );
+});
+
+test("README.md under the entry directory is documentation, not an entry", () => {
+  assert.ok(isEntryPath(`${LOG_DIR}/blo-34872.md`));
+  assert.ok(!isEntryPath(`${LOG_DIR}/README.md`), "the docs must not satisfy the guard");
+  assert.ok(!isEntryPath(`${LOG_DIR}/notes.txt`), "entries are markdown");
+  assert.ok(!isEntryPath(`${VENDOR_DIR}/PROVENANCE.md`), "only files inside the directory count");
+});
+
+test("the real tree has the entry directory, and PROVENANCE.md points at it", () => {
+  // The two halves that rot independently: the directory could be deleted, or
+  // the docs could keep sending contributors to the frozen table.
+  const tracked = execFileSync("git", ["ls-files", LOG_DIR], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  })
+    .split("\n")
+    .filter(Boolean);
+
+  assert.ok(
+    tracked.includes(`${LOG_DIR}/README.md`),
+    `${LOG_DIR}/README.md is not tracked; the guard's error message points contributors at it`,
+  );
+  assert.ok(
+    read(`${VENDOR_DIR}/PROVENANCE.md`).includes("PROVENANCE-CHANGES.d/"),
+    "PROVENANCE.md does not mention the entry directory, so contributors keep appending to the frozen table",
+  );
 });
