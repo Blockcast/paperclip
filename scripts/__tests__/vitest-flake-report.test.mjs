@@ -120,4 +120,15 @@ test("the General tests job exports the report dir and uploads the reports on fa
     /name:\s*vitest-report-\$\{\{ matrix\.group \}\}-\$\{\{ matrix\.shard_count == '' && 'all' \|\| matrix\.shard_index \}\}/,
     "artifact name must be unique per matrix leg and must not collapse shard 0 into 'all'",
   );
+  // Uniqueness across legs is not enough: a re-run of a failed job is a new
+  // ATTEMPT of the same run, so the same leg re-uploads a name that already
+  // exists and upload-artifact@v4 409s. On a ~29%-red lane "Re-run failed
+  // jobs" is the common path, so without this the step turns a retried job
+  // red -- exactly the blameless failure this issue exists to stop.
+  assert.match(
+    step,
+    /continue-on-error:\s*true/,
+    "the upload must be `continue-on-error: true`: a re-run 409s on the existing " +
+      "artifact name, and this step must never be able to fail a job",
+  );
 });
