@@ -431,6 +431,7 @@ import {
   recordHeartbeatTimerTick,
   recordRetryScheduleOutcome,
   recordConcurrentRunBlocked,
+  recordAgentDispatchDeclined,
   recordHeartbeatRunFailed,
   recordOrphanedManagedPodReaped,
   recordProcessLost,
@@ -454,6 +455,7 @@ import {
   setCrashRecoveryCandidateIndexPresent,
   CAVEMAN_PROXY_NOT_READY_ERROR_CODE,
 } from "./metrics.js";
+import type { DispatchDeclineReason } from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
 import { runLifecycleHook } from "./lifecycle-hook.js";
 import { mapAdapterToCcrotateTarget, mapPenstockProviderToCcrotateTarget } from "./ccrotate-target.js";
@@ -29242,6 +29244,53 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     dispatchAdmissionRetryTimersByAgent.set(agentId, timer);
   }
 
+  /**
+   * PEN-3607: a dispatch pass that declines to start a run must say so.
+   *
+   * `startNextQueuedRunForAgent` has fifteen `return []` sites. Before this,
+   * exactly one of them recorded anything an operator could read — the
+   * `availableSlots <= 0` refusal, via `recordConcurrentRunBlocked`. The other
+   * fourteen wrote no metric, no log above `debug`, and nothing to the run row,
+   * so a seat that was being considered and refused on every scheduler tick was
+   * indistinguishable from a seat nothing was looking at. Measured cost of that
+   * gap: agent `bcba1cc7` held four `queued` runs for 73.6 h with no `startedAt`
+   * while `resumeQueuedRuns` reached it every tick, and two separate code-trace
+   * localizations of the bail were both wrong because the only signal available
+   * was a *different* counter that had stopped incrementing.
+   *
+   * That is why this records on every decline rather than only on the ones that
+   * look pathological. A silent path cannot be ruled out by measurement, so
+   * narrowing by elimination is the only tool left, and it is a bad one.
+   *
+   * `knownAgentIds` is resolved lazily and only when a decline actually happens:
+   * the roster read is cached (`getActiveAgentIds`), but the pass should not pay
+   * for it on the hot success path. For the process-wide guards that fire before
+   * the agent row is loaded there is no company to scope, so the label collapses
+   * to the bounded `unknown` — those refusals are facts about the process, and
+   * labelling them per-agent would invite exactly the wrong query.
+   */
+  async function noteDispatchDeclined(
+    agentId: string,
+    reason: DispatchDeclineReason,
+    companyId: string | null,
+  ): Promise<void> {
+    try {
+      const knownAgentIds = companyId
+        ? await getActiveAgentIds(db, companyId)
+        : new Set<string>();
+      recordAgentDispatchDeclined({ agentId, reason, knownAgentIds });
+    } catch (error) {
+      // Instrumentation must never be able to fail dispatch. A rejected roster
+      // read here would otherwise convert an ordinary decline into a thrown
+      // pass, which `resumeQueuedRuns` collects and rethrows — turning a
+      // reporting improvement into a fleet-wide dispatch fault.
+      logger.debug(
+        { agentId, reason, error },
+        "startNextQueuedRunForAgent: failed to record dispatch decline",
+      );
+    }
+  }
+
   async function startNextQueuedRunForAgent(
     agentId: string,
     dispatchPassOptions: {
@@ -29252,7 +29301,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       reason?: string;
     } = {},
   ) {
-    if (options.skipQueuedRunDispatch || dispatchStopped) return [];
+    if (options.skipQueuedRunDispatch || dispatchStopped) {
+      await noteDispatchDeclined(agentId, "dispatch_stopped", null);
+      return [];
+    }
     if (
       dispatchPassOptions.reason !== "resume_critical_lane"
       && !dispatchPassOptions.suppressCriticalLaneHeadRescanDemand
@@ -29286,13 +29338,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         { agentId, role: paperclipNodeRole },
         "startNextQueuedRunForAgent: dispatch fenced off on the API tier (workers tier owns run execution)",
       );
+      await noteDispatchDeclined(agentId, "api_tier_fence", null);
       return [];
     }
-    if ((await getSchedulingSuppression()).suppressed) return [];
+    if ((await getSchedulingSuppression()).suppressed) {
+      await noteDispatchDeclined(agentId, "scheduling_suppressed", null);
+      return [];
+    }
     const cutoff = await getWorktreeExecutionCutoff();
 
     return withAgentStartLock(agentId, async () => {
-      if (dispatchStopped) return [];
+      if (dispatchStopped) {
+        await noteDispatchDeclined(agentId, "dispatch_stopped", null);
+        return [];
+      }
       await options.beforeQueuedDispatchPassForTest?.({
         agentId,
         reason: dispatchPassOptions.reason ?? "direct",
@@ -29301,12 +29360,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
       markAgentStartLockPhase(agentId, "agent_load");
       let agent = await getAgent(agentId);
-      if (!agent) return [];
+      if (!agent) {
+        await noteDispatchDeclined(agentId, "agent_missing", null);
+        return [];
+      }
       const invokability = await getAgentInvokability(agent);
       if (!invokability.invokable) {
         if (shouldCancelRunsForNonInvokableAgent(invokability)) {
           await cancelActiveForAgentInternal(agentId, `Cancelled because the agent is not invokable: ${invokability.reason}`);
         }
+        // `reason` here is the invokability verdict (paused / terminated /
+        // manager_terminated / …), which is what an operator needs and which
+        // nothing else on this path emits. It is deliberately NOT a metric
+        // label: the verdict set is open-ended enough that folding it in would
+        // widen the series, and the bounded decline reason plus this line
+        // together answer the question.
+        logger.warn(
+          {
+            agentId,
+            invokabilityReason: invokability.reason,
+            invalidOrgChain: invokability.invalidOrgChain,
+          },
+          "startNextQueuedRunForAgent: declined because the agent is not invokable",
+        );
+        await noteDispatchDeclined(agentId, "agent_not_invokable", agent.companyId);
         return [];
       }
       const policy = parseHeartbeatPolicy(agent);
@@ -29408,6 +29485,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           { agentId, adapterType: agent.adapterType },
           "startNextQueuedRunForAgent: untracked Kubernetes Job or Pod still holds the agent",
         );
+        await noteDispatchDeclined(agentId, "untracked_external_job", agent.companyId);
         return [];
       }
       const availableSlots = Math.max(0, effectiveMaxConcurrentRuns - runningCount);
@@ -29424,6 +29502,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             knownAgentIds: await getActiveAgentIds(db, agent.companyId),
           });
         }
+        // Recorded here as well as on the adapter-scoped counter above. That
+        // one is external-lifecycle-only and carries an isolation dimension;
+        // this one covers every adapter and sits in the same series as the
+        // other fourteen decline reasons, so "why is this seat not dispatching"
+        // is one query rather than a join across two metrics with different
+        // population rules.
+        await noteDispatchDeclined(agentId, "no_available_slots", agent.companyId);
         return [];
       }
       if (externalLifecycle) {
@@ -29454,7 +29539,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // Image changes are agent-wide. Drain all active slots before applying
         // the bump so a concurrent dispatch cannot launch an older image after
         // the operator requested convergence.
-        if (runningCount > 0 || hasActiveExternalJob) return [];
+        if (runningCount > 0 || hasActiveExternalJob) {
+          await noteDispatchDeclined(agentId, "pending_image_bump", agent.companyId);
+          return [];
+        }
         await processPendingImageBumpForAgent(db, agentId);
         agent = (await getAgent(agentId)) ?? agent;
       }
@@ -29725,6 +29813,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           agentId,
           reason: "resume_critical_lane",
         });
+        await noteDispatchDeclined(agentId, "emergency_lane_continuation", agent.companyId);
         return [];
       }
       dispatchCriticalLaneCursorByAgent.delete(agentId);
@@ -29734,7 +29823,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           agentId,
           reason: "resume_critical_lane",
         });
-        if (!foundReadyCritical) return [];
+        if (!foundReadyCritical) {
+          await noteDispatchDeclined(agentId, "emergency_lane_continuation", agent.companyId);
+          return [];
+        }
       }
 
       // Lane B — recovery-action wakes. Recovery-ness is a property of the RUN,
@@ -29840,6 +29932,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           agentId,
           reason: "resume_recovery_lane",
         });
+        await noteDispatchDeclined(agentId, "emergency_lane_continuation", agent.companyId);
         return [];
       }
       dispatchRecoveryLaneCursorByAgent.delete(agentId);
@@ -29849,7 +29942,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           agentId,
           reason: "resume_recovery_lane",
         });
-        if (!foundReadyRecovery) return [];
+        if (!foundReadyRecovery) {
+          await noteDispatchDeclined(agentId, "emergency_lane_continuation", agent.companyId);
+          return [];
+        }
       }
 
       // Lane C — absolute starvation floor. BLO-21792 (second and third review
@@ -30165,6 +30261,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (!finishPassWithoutClaims() && dispatchDeferredRunIdsByAgent.has(agentId)) {
           scheduleDelayedAdmissionRetry(agentId);
         }
+        await noteDispatchDeclined(agentId, "no_queued_candidates", agent.companyId);
         return [];
       }
 
@@ -30480,6 +30577,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (!finishPassWithoutClaims() && dispatchDeferredRunIdsByAgent.has(agentId)) {
           scheduleDelayedAdmissionRetry(agentId);
         }
+        // The pass had slots, scanned the queue, ranked candidates, and every
+        // one of them refused to claim. This is the shape a wedged seat takes:
+        // reached every tick, refused every tick, previously recording nothing
+        // anywhere. `queuedRunCount` is on the log line rather than the metric
+        // because it is unbounded; the series carries only the bounded reason.
+        logger.warn(
+          { agentId, queuedRunCount: queuedRuns.length, availableSlots },
+          "startNextQueuedRunForAgent: declined — candidates were ranked but none could be claimed",
+        );
+        await noteDispatchDeclined(agentId, "no_claimable_run", agent.companyId);
         return [];
       }
       // Settle continuation bookkeeping for a pass that DID claim. A pass that
