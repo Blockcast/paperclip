@@ -9,7 +9,7 @@ import {
   gitHubIdentityFieldRedaction,
   scrubOutboundGitHubText,
 } from "./github-app-auth.js";
-import { ghFetch, gitHubApiBase } from "./github-fetch.js";
+import { ghFetch, gitHubApiBase, GITHUB_REQUEST_TIMEOUT_MS } from "./github-fetch.js";
 
 const GITHUB_HOST = "github.com";
 const SHA_PATTERN = /^[0-9a-f]{40}$/i;
@@ -17,7 +17,6 @@ const ID_PATTERN = /^\d+$/;
 const POLL_INTERVAL_MS = 5_000;
 const CLAIM_BATCH = 4;
 const STALE_PROCESSING_MS = 60_000;
-const GITHUB_REQUEST_TIMEOUT_MS = 10_000;
 const RETRY_DELAYS_MS = [5_000, 30_000, 2 * 60_000, 10 * 60_000, 30 * 60_000, 2 * 60 * 60_000];
 const PR_ACTIONS = new Set([
   "opened",

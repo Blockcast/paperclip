@@ -206,8 +206,11 @@ export async function getInstallationTokenResult(
   return { ok: true, token: cachedInstallationToken.token };
 }
 
-export async function getInstallationToken(nowMs: number = Date.now()): Promise<string | null> {
-  const result = await getInstallationTokenResult(nowMs);
+export async function getInstallationToken(
+  nowMs: number = Date.now(),
+  options: { signal?: AbortSignal } = {},
+): Promise<string | null> {
+  const result = await getInstallationTokenResult(nowMs, options);
   return result.ok ? result.token : null;
 }
 
@@ -249,7 +252,7 @@ export async function githubGetPullRequestGate(input: {
   prNumber: number;
   signal?: AbortSignal;
 }): Promise<PullRequestGateResult> {
-  const tokenResult = await getInstallationTokenResult();
+  const tokenResult = await getInstallationTokenResult(Date.now(), { signal: input.signal });
   if (!tokenResult.ok) return { error: tokenResult.reason };
 
   const apiBase = gitHubApiBase(GITHUB_HOST);
@@ -334,7 +337,7 @@ export async function githubListOpenPullRequestsByBase(input: {
   baseRef: string;
   signal?: AbortSignal;
 }): Promise<OpenPullRequestsOnBaseResult> {
-  const tokenResult = await getInstallationTokenResult();
+  const tokenResult = await getInstallationTokenResult(Date.now(), { signal: input.signal });
   if (!tokenResult.ok) return { error: tokenResult.reason };
 
   const url =
@@ -377,7 +380,7 @@ export async function githubResolveBranchState(input: {
   branch: string;
   signal?: AbortSignal;
 }): Promise<BranchState> {
-  const tokenResult = await getInstallationTokenResult();
+  const tokenResult = await getInstallationTokenResult(Date.now(), { signal: input.signal });
   if (!tokenResult.ok) return "unknown";
   try {
     const res = await ghFetch(
@@ -431,7 +434,7 @@ export async function githubResolveMergeHistoryShape(input: {
   mergeCommitSha: string;
   signal?: AbortSignal;
 }): Promise<MergeHistoryShape> {
-  const tokenResult = await getInstallationTokenResult();
+  const tokenResult = await getInstallationTokenResult(Date.now(), { signal: input.signal });
   if (!tokenResult.ok) return "unknown";
   try {
     const res = await ghFetch(
@@ -632,7 +635,7 @@ export async function githubGetPrRequiredStatusContext(input: {
   const context = input.context.trim();
   if (!context) return { outcome: "unknown", reason: "status_context_empty" };
 
-  const tokenResult = await getInstallationTokenResult();
+  const tokenResult = await getInstallationTokenResult(Date.now(), { signal: input.signal });
   if (!tokenResult.ok) return { outcome: "unknown", reason: tokenResult.reason };
   const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` };
   const apiBase = gitHubApiBase(GITHUB_HOST);
@@ -848,7 +851,7 @@ export async function githubFetchPrHeadSha(input: {
   prNumber: number;
   signal?: AbortSignal;
 }): Promise<string | null> {
-  const token = await getInstallationToken();
+  const token = await getInstallationToken(Date.now(), { signal: input.signal });
   if (!token) return null;
   return fetchPrHeadSha(
     gitHubApiBase(GITHUB_HOST),
@@ -875,7 +878,7 @@ export async function githubFetchPrAuthorLogin(input: {
   prNumber: number;
   signal?: AbortSignal;
 }): Promise<string | null> {
-  const token = await getInstallationToken();
+  const token = await getInstallationToken(Date.now(), { signal: input.signal });
   if (!token) return null;
   try {
     const res = await ghFetch(
@@ -1074,7 +1077,7 @@ export async function githubListReviewerSurfacesAtPr(input: {
   // empty surfaces — a misconfiguration that reads to the caller as "Ally
   // reviewed and found nothing". Fail closed, as the predicate below does.
   if (!githubReviewerAppSlug(botLogin)) return { error: "bot_login_not_app_form" };
-  const token = await getInstallationToken();
+  const token = await getInstallationToken(Date.now(), { signal: input.signal });
   if (!token) return { error: "no_token" };
   const args = {
     apiBase: gitHubApiBase(GITHUB_HOST),

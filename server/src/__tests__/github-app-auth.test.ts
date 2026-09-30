@@ -195,6 +195,29 @@ describe("githubGetPullRequestGate", () => {
     })).resolves.toEqual(gate);
   });
 
+  it("threads the caller's signal into the installation-token mint, not just the resource fetch (BLO-38257)", async () => {
+    setCreds();
+    // The token mint is the FIRST of two network calls. Stubbing only the
+    // second cannot see that hop, which is why this asserts on call [0]: an
+    // unthreaded mint carries only ghFetch's own default and reads NOT aborted.
+    const signalsByCall: Array<AbortSignal | null | undefined> = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL, init?: RequestInit) => {
+      signalsByCall.push(init?.signal);
+      return String(url).includes("/access_tokens")
+        ? jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO })
+        : jsonResponse({ state: "open", merged: false });
+    }));
+
+    await githubGetPullRequestGate({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 847,
+      signal: AbortSignal.abort(new Error("already-aborted")),
+    });
+
+    expect(signalsByCall.length).toBeGreaterThan(0);
+    expect(signalsByCall[0]?.aborted).toBe(true);
+  });
+
   it("fails open to an explicit error when GitHub is unavailable", async () => {
     setCreds();
     vi.stubGlobal("fetch", vi.fn(async (url: string | URL) => {
