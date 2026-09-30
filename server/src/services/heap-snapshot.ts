@@ -545,10 +545,41 @@ export function planHeapSnapshotStartup(input: {
   return { capture: false, poll: hasResidual, warnResidualSnapshots: hasResidual };
 }
 
+/**
+ * What this poll did about the sentinel.
+ *
+ * `trigger === null` is three situations wearing one face, and the caller cannot
+ * tell them apart from the trigger alone — so this says which. Two of them are
+ * operator-facing and want *different* responses:
+ *
+ * - `"rate-limited"` — the file is **gone** and no snapshot will appear. The
+ *   sentinel's disappearance is the only feedback this interface has, so
+ *   without a distinct verdict here a declined request is indistinguishable
+ *   from an honoured one. Response: wait out the interval and touch it again.
+ * - `"claim-failed"` — the file is **still there** and was not honoured.
+ *   Response: find out who else is consuming it, or why it cannot be deleted.
+ *
+ * A boolean cannot carry this: `"claim-failed"` and `"absent"` both mean "not
+ * consumed" while meaning opposite things to an operator.
+ */
+export type HeapSnapshotSentinelOutcome =
+  /** No sentinel file was present. Any trigger came from the heap threshold. */
+  | "absent"
+  /** Observed, deleted, and honoured — this poll snapshots. */
+  | "claimed"
+  /** Observed and deleted, but declined by `sentinelMinIntervalMs`. */
+  | "rate-limited"
+  /** Observed, but the delete failed, so it was not claimed and not honoured. */
+  | "claim-failed";
+
 export interface HeapSnapshotDecision {
   trigger: HeapSnapshotTrigger | null;
-  /** True when a sentinel was observed, whether or not it produced a snapshot. */
-  sentinelConsumed: boolean;
+  /**
+   * What happened to the sentinel, whether or not it produced a snapshot.
+   * `"claimed"` and `"rate-limited"` both mean the file was deleted —
+   * honoured-exactly-once holds either way.
+   */
+  sentinel: HeapSnapshotSentinelOutcome;
 }
 
 /**
@@ -574,7 +605,7 @@ export function decideHeapSnapshot(
     } catch {
       // Another replica consumed it, or it is unwritable. Either way, do not
       // snapshot on a sentinel we could not claim.
-      return { trigger: null, sentinelConsumed: false };
+      return { trigger: null, sentinel: "claim-failed" };
     }
     const lastSentinelAt = state.lastSentinelSnapshotAtMs;
     if (
@@ -583,18 +614,76 @@ export function decideHeapSnapshot(
     ) {
       // Claimed but declined: the pause this would cost is the thing being
       // rationed, and the sentinel is writable from every pod on the claim.
-      return { trigger: null, sentinelConsumed: true };
+      return { trigger: null, sentinel: "rate-limited" };
     }
-    return { trigger: "sentinel", sentinelConsumed: true };
+    return { trigger: "sentinel", sentinel: "claimed" };
   }
 
-  if (config.autoThresholdBytes <= 0) return { trigger: null, sentinelConsumed: false };
+  if (config.autoThresholdBytes <= 0) return { trigger: null, sentinel: "absent" };
   if (runtime.heapUsedBytes() < config.autoThresholdBytes) {
-    return { trigger: null, sentinelConsumed: false };
+    return { trigger: null, sentinel: "absent" };
   }
   const lastAt = state.lastAutoSnapshotAtMs;
   if (lastAt !== null && runtime.now().getTime() - lastAt < config.autoMinIntervalMs) {
-    return { trigger: null, sentinelConsumed: false };
+    return { trigger: null, sentinel: "absent" };
   }
-  return { trigger: "threshold", sentinelConsumed: false };
+  return { trigger: "threshold", sentinel: "absent" };
+}
+
+/**
+ * The operator-facing log a decision owes, or `null` when it owes none.
+ *
+ * Split out as a pure function rather than inlined at the call site because the
+ * defect it exists to prevent is *silence* — a declined request deleting the
+ * only file the operator can see and logging nothing. Silence is not observable
+ * from the decision alone, so it has to be assertable here.
+ */
+export interface HeapSnapshotSentinelLog {
+  level: "info" | "warn";
+  data: Record<string, unknown>;
+  message: string;
+}
+
+export function describeSentinelOutcome(
+  decision: HeapSnapshotDecision,
+  config: HeapSnapshotConfig,
+  state: { lastSentinelSnapshotAtMs: number | null },
+): HeapSnapshotSentinelLog | null {
+  const sentinelPath = path.join(config.dir, HEAP_SNAPSHOT_SENTINEL_BASENAME);
+  switch (decision.sentinel) {
+    case "rate-limited":
+      return {
+        // info, not warn: this is the rate limit working as designed, on a
+        // request any pod on the shared claim can make. It is not a fault.
+        level: "info",
+        data: {
+          sentinelPath,
+          sentinelMinIntervalMs: config.sentinelMinIntervalMs,
+          lastSentinelSnapshotAtMs: state.lastSentinelSnapshotAtMs,
+        },
+        message:
+          "Heap snapshot request declined — too soon after the last sentinel snapshot. The request file was " +
+          "deleted anyway (a request is honoured exactly once, declined or not), so its disappearance does NOT " +
+          "mean a snapshot was taken and none will appear. Touch it again once sentinelMinIntervalMs has elapsed " +
+          "since lastSentinelSnapshotAtMs.",
+      };
+    case "claim-failed":
+      return {
+        // warn, not info: unlike the rate limit this is nobody's design. The
+        // worker creates snapshots in this same directory, so a delete it
+        // cannot make is either a race with another replica (clears itself on
+        // the next poll) or a permission fault (does not).
+        level: "warn",
+        data: { sentinelPath },
+        message:
+          "Heap snapshot request seen but not claimed — deleting the request file failed, so it was not honoured. " +
+          "The file is still present. If this clears on the next poll another replica claimed it; if it repeats, " +
+          "the worker cannot delete the file and the request path is wedged until it is removed by hand.",
+      };
+    case "claimed":
+    case "absent":
+      // "claimed" needs nothing here: it snapshots, and the snapshot itself is
+      // logged with its own credential-exposure warning.
+      return null;
+  }
 }
