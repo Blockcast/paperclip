@@ -973,6 +973,65 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     );
   });
 
+  // The bypass this PR calls "the load-bearing half of that fix" had NO guard at
+  // any level, and — unlike every other regression in this file — the runtime
+  // guard cannot catch it either. That asymmetry is the whole reason it needs a
+  // source-text assertion:
+  //
+  //   Delete the `schedule:` cron  -> no scheduled run completes -> this guard
+  //                                   reds after 48h. Defence in depth, working.
+  //   Delete the BYPASS            -> the scheduled run still fires, `gate` still
+  //                                   sets pretested=1, the matrix is SKIPPED, and
+  //                                   a skipped matrix still concludes `success`.
+  //                                   The liveness guard sees a fresh completed
+  //                                   `schedule` run and reports ok forever.
+  //
+  // That second row is run 36648202266 reproduced exactly — the specific false
+  // green cited in master-health.yml's own header. So the half that fails loudly
+  // was guarded and the half that fails SILENTLY was not, which inverts the
+  // priority this file is supposed to apply.
+  //
+  // ON THE INSTRUMENT: this file's general doctrine is "hold the behaviour, not
+  // the source text" (a regex on a destructure is what previously passed across
+  // its own reversion). The doctrine does not apply here, because a YAML `if:`
+  // expression has no behavioural surface a node test can drive — there is no
+  // behaviour to hold. A source-text scan is the only available guard, and the
+  // vacuity control below is what makes it trustworthy rather than decorative.
+  it("keeps the schedule bypass on every pretested gate in a watched guard", () => {
+    const gated = WATCHED_GUARDS.map((guard) => ({
+      workflow: guard.workflow,
+      body: readFileSync(join(workflowDir, guard.workflow), "utf8"),
+    })).filter(({ body }) => /needs\.gate\.outputs\.pretested/.test(body));
+
+    const unbypassed = gated
+      .filter(({ body }) =>
+        body
+          .split("\n")
+          .filter((line) => line.includes("needs.gate.outputs.pretested"))
+          .some(
+            (line) => /^\s*if:/.test(line) && !line.includes("github.event_name == 'schedule'"),
+          ),
+      )
+      .map(({ workflow }) => workflow);
+
+    assert.deepEqual(
+      unbypassed,
+      [],
+      "a watched guard gates a job on `needs.gate.outputs.pretested` without " +
+        "`github.event_name == 'schedule'` in the same `if:`. The scheduled run then skips that " +
+        "job, a skipped job still concludes `success`, and THIS liveness check reads that as a " +
+        "healthy guard forever. The cron half of the fix reds in 48h; this half never does.",
+    );
+
+    // Positive control: if no watched guard has a pretested gate at all, the
+    // filter above is empty and the assertion proves nothing. That silent-vacuity
+    // shape is this file's own recurring failure mode.
+    assert.ok(
+      gated.length > 0,
+      "no watched guard carries a pretested gate — the scan above proves nothing",
+    );
+  });
+
   it("puts the event filter into the API path, and omits it when unset", () => {
     assert.equal(
       completedRunsPath("o/r", "master-health.yml", "schedule"),
@@ -1132,7 +1191,6 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
       paths.push(args[1]);
       return JSON.stringify({ workflow_runs: [] });
     });
-
     crossCheck("master-health.yml", "schedule");
     crossCheck("codeowners-guard.yml", undefined);
 
@@ -1149,6 +1207,45 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     // The axis it must still DROP: corroboration depends on not going through
     // the suspect server-side index.
     for (const path of paths) assert.ok(!path.includes("status=completed"));
+  });
+
+  // The OTHER leg of that same binding line, and it stayed unguarded one round
+  // longer than the cross-check did. `observeWorkflow` used to call `gh`
+  // directly, so `event` had no observable effect and dropping it from the
+  // `observe` closure left the suite at 78/0. The docstring claimed the leg was
+  // "held by classifyWatched's injected-observer test instead" — it is not:
+  // that test injects a FAKE observer, so it pins classifyWatched's own call and
+  // never the adapter that forwards into the real read. Threading `read` through
+  // `observeWorkflow` is what makes this assertion possible at all.
+  it("keeps the event filter on the observe leg too, not just the cross-check", () => {
+    const paths = [];
+    const reader = (args) => {
+      paths.push(args[1]);
+      // First call is the workflow-meta read; it must look active or the
+      // function short-circuits before ever building the runs path.
+      return args[1].includes("/runs?")
+        ? JSON.stringify({ workflow_runs: [] })
+        : JSON.stringify({ state: "active", name: "Master health" });
+    };
+
+    const { observe } = makeGuardReaders("o/r", reader);
+    observe("master-health.yml", "schedule");
+    observe("codeowners-guard.yml", undefined);
+
+    const runPaths = paths.filter((path) => path.includes("/runs?"));
+    assert.equal(runPaths.length, 2, "the observe leg did not reach its runs read — this test is vacuous");
+
+    assert.match(
+      runPaths[0],
+      /^repos\/o\/r\/actions\/workflows\/master-health\.yml\/runs\?status=completed&per_page=1&event=schedule$/,
+      "the binding layer dropped the event filter on the OBSERVE leg. A push run then satisfies " +
+        "the liveness read while the cron is dead — the exact false green this guard exists to withhold.",
+    );
+    assert.match(
+      runPaths[1],
+      /^repos\/o\/r\/actions\/workflows\/codeowners-guard\.yml\/runs\?status=completed&per_page=1$/,
+      "an unfiltered guard's observe read must stay unfiltered",
+    );
   });
 
   it("still honours the stale-hours override and resolves an undeclared workflow", () => {
