@@ -1000,7 +1000,9 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
   // Both fail loudly and neither can pass clean, which is why this is a named
   // ceiling and not a fix: closing them needs the real YAML parser the paragraph
   // above rules out. Upgrade to real scalar tracking only if one of these ever
-  // fires on a real reformat.
+  // fires on a real reformat — and when you do, the two ceiling cases in "the
+  // bypass scan itself" will fail, which is how you learn the prose here is now
+  // stale rather than discovering it from a wrong hint during an outage.
   const joinFoldedIfs = (body) => {
     const joined = [];
     let openAt = null;
@@ -1109,6 +1111,14 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
       "    runs-on: arc-paperclip-general",
     ].join("\n");
 
+    // The same gate, correctly bypassed. Shared, because the two ceiling cases
+    // below are reformats OF A GATE THAT PASSES CLEAN — that is what makes them
+    // false reds rather than correct detections.
+    const bypassed = folded.replace(
+      "'workflow_dispatch')",
+      "'workflow_dispatch' || github.event_name == 'schedule')",
+    );
+
     it("sees through a folded `if:` block scalar, so a reformat cannot disarm it", () => {
       // Without the fold normaliser the `if:` token and the `pretested`
       // reference sit on different physical lines, the scan finds zero
@@ -1123,10 +1133,6 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     });
 
     it("accepts a folded `if:` that keeps the bypass", () => {
-      const bypassed = folded.replace(
-        "'workflow_dispatch')",
-        "'workflow_dispatch' || github.event_name == 'schedule')",
-      );
       assert.deepEqual(auditPretestedBypass([{ workflow: "f.yml", body: bypassed }]), {
         unscannable: [],
         unbypassed: [],
@@ -1142,6 +1148,39 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
       assert.deepEqual(auditPretestedBypass([{ workflow: "f.yml", body }]), {
         unscannable: ["f.yml"],
         unbypassed: [],
+      });
+    });
+
+    // The two cases below PIN THE CEILING documented above `joinFoldedIfs`, and
+    // they exist because that comment was wrong once already: it named
+    // `unscannable` for both, when both actually land in `unbypassed`. Prose that
+    // names the wrong arm sends a reader hunting a missing gate that is present.
+    //
+    // Both are `bypassed` — a gate this scan passes CLEAN — reformatted one way
+    // each. So they assert a FALSE RED, not a detection, and they fail the moment
+    // someone teaches `joinFoldedIfs` real scalar tracking. That is the point:
+    // closing a gap should break the test that documents it, not silently leave
+    // a comment describing behaviour the code no longer has.
+    it("reads a blank line inside a folded `if:` as a short gate, not an unreadable one", () => {
+      // The blank closes the scalar early, so line 1 still joins to
+      // `if: >- ${{ … pretested != '1'`: located, carries the token, truncated
+      // before the bypass clause. A located gate read short — hence `unbypassed`.
+      const blankInside = bypassed.replace("\n      || github", "\n\n      || github");
+      assert.deepEqual(auditPretestedBypass([{ workflow: "f.yml", body: blankInside }]), {
+        unscannable: [],
+        unbypassed: ["f.yml"],
+      });
+    });
+
+    it("reports a plain multi-line `if:` as unbypassed, which is a false red", () => {
+      // No `>`/`|`, so nothing joins the continuation the bypass sits on. The
+      // failure message will assert the clause is missing when it is present
+      // three lines below. Recognise that message; do not trust it.
+      const plain = bypassed.replace("    if: >-\n      ${{", "    if: ${{");
+      assert.match(plain, /github\.event_name == 'schedule'/);
+      assert.deepEqual(auditPretestedBypass([{ workflow: "f.yml", body: plain }]), {
+        unscannable: [],
+        unbypassed: ["f.yml"],
       });
     });
   });
