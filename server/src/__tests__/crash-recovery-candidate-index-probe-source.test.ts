@@ -145,4 +145,19 @@ describe("crash-recovery absent-transition warn tags its caller (BLO-36862)", ()
       "gate",
     ]);
   });
+
+  // The premise the case above rests on, which nothing else pinned. The
+  // DB-backed suite covers the presence PROBE being re-run rather than cached
+  // (heartbeat-worker-crash-marking.test.ts); the warn LATCH is separate, and
+  // removing it leaves the case above green — two fresh services would still
+  // emit one line each. Without this, "the winning caller is the whole report"
+  // is documented and unguarded.
+  it("emits exactly one absent warn per episode, however many callers probe", async () => {
+    const heartbeat = heartbeatService(absentDb, { skipQueuedRunDispatch: true });
+
+    await heartbeat.publishCrashRecoveryCandidateIndexGauge();
+    await heartbeat.reconcileWorkerCrashedRuns({ requireCandidateIndex: true });
+
+    expect(probeWarns()).toHaveLength(1);
+  });
 });
