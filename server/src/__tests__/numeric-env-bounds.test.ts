@@ -58,22 +58,27 @@ const SETTINGS = {
   // rather than merely declaring that it exists.
   //
   // ⚠️ Note while you are here: this map is a STRICT SUBSET of
-  // `NUMERIC_SETTING_BOUNDS`, and the gap is much wider than it looks. Measured at this
-  // commit: 22 keys here against 29 there, so SEVEN settings get no hostile-input
-  // coverage at all —
-  //   isolationWorkspaceReaperIntervalMinutes, isolationWorkspaceReaperMaxAgeDays,
-  //   isolationWorkspaceReaperMaxDeletesPerTick, prReviewStateReconcilerIntervalMinutes,
-  //   prReviewStateMaxPullRequestsPerRepo, lapsedMonitorGraceMs,
-  //   openPullRequestAttendanceGraceMs.
-  // Do not trust that list to be current; recompute the set difference
-  // (`keyof NUMERIC_SETTING_BOUNDS` minus `keyof SETTINGS`) before acting on it.
+  // `NUMERIC_SETTING_BOUNDS` — some settings get no hostile-input coverage at all.
+  // The current gap is enumerated in `KNOWN_UNCOVERED_SETTINGS` below, which is
+  // asserted against the recomputed set difference rather than restated here,
+  // because a hand-maintained list in a comment goes stale silently and this one
+  // already had.
   //
-  // The `satisfies Record<keyof typeof NUMERIC_SETTING_BOUNDS, string>` clause below
-  // looks like it would make that impossible and does not: `server/tsconfig.json`
-  // excludes `src/__tests__`, so nothing typechecks this file, and vitest transpiles
-  // without checking. Left as-is deliberately — closing it means registering seven
-  // settings this PR does not otherwise touch, and doing it here would hide that the
-  // enforcement mechanism itself is the thing that needs fixing.
+  // The annotation below deliberately says `Partial<Record<…>>` and not
+  // `Record<…>`. A total `Record` reads like a compile-time ratchet forcing every
+  // bounds key into this table, and it is inert: `server/tsconfig.json` excludes
+  // `src/__tests__`, so nothing typechecks this file and vitest transpiles without
+  // checking. The seven-key gap persisting is the proof it never fired — a strict
+  // subset against a total `Record` is `TS1360`. Two reasons not to leave the
+  // stronger-looking spelling in place: it advertises enforcement this file cannot
+  // provide, and it would break the build confusingly the moment anyone adds
+  // `src/__tests__` to the typecheck project as ordinary hygiene. `Partial` still
+  // enforces the direction that *can* hold here — every key in this table is a real
+  // `NUMERIC_SETTING_BOUNDS` key — which is the same idiom `TIMER_SETTING_MS_FACTOR`
+  // uses in `config.ts` for the same reason.
+  //
+  // The totality direction is enforced instead by "every bounds key is covered or
+  // explicitly exempt" below, which runs.
   pendingBoardApprovalAttendanceGraceMs: "PENDING_BOARD_APPROVAL_ATTENDANCE_GRACE_MS",
   // PEN-3631. Registered here rather than left in the gap described above: these
   // seven landed as `Math.max(FLOOR, Number(env) || DEFAULT)` and the offender
@@ -92,10 +97,74 @@ const SETTINGS = {
   heapSnapshotSentinelMinIntervalMinutes: "PAPERCLIP_HEAP_SNAPSHOT_SENTINEL_MIN_INTERVAL_MINUTES",
   heapSnapshotMaxAgeMinutes: "PAPERCLIP_HEAP_SNAPSHOT_MAX_AGE_MINUTES",
   heapSnapshotPollIntervalSeconds: "PAPERCLIP_HEAP_SNAPSHOT_POLL_SECONDS",
-} as const satisfies Record<keyof typeof NUMERIC_SETTING_BOUNDS, string>;
+} as const satisfies Partial<Record<keyof typeof NUMERIC_SETTING_BOUNDS, string>>;
 
 type SettingKey = keyof typeof SETTINGS;
 const SETTING_KEYS = Object.keys(SETTINGS) as SettingKey[];
+
+/**
+ * Bounds keys that are deliberately NOT driven by the hostile-input table above.
+ *
+ * This is an exemption list, not a target: every name here is a setting whose
+ * clamp is asserted by `NUMERIC_SETTING_BOUNDS` but never actually exercised
+ * against `"Infinity"`, `"40000"` and friends. Shrinking it is good. Growing it
+ * requires saying why in the same commit.
+ */
+const KNOWN_UNCOVERED_SETTINGS = [
+  "isolationWorkspaceReaperIntervalMinutes",
+  "isolationWorkspaceReaperMaxAgeDays",
+  "isolationWorkspaceReaperMaxDeletesPerTick",
+  "lapsedMonitorGraceMs",
+  "openPullRequestAttendanceGraceMs",
+  "prReviewStateMaxPullRequestsPerRepo",
+  "prReviewStateReconcilerIntervalMinutes",
+] as const satisfies readonly (keyof typeof NUMERIC_SETTING_BOUNDS)[];
+
+describe("every bounds key is covered or explicitly exempt (PEN-3631)", () => {
+  /**
+   * The ratchet the `satisfies` clause on SETTINGS only looked like it was.
+   *
+   * That annotation cannot fire — `server/tsconfig.json` excludes `src/__tests__`,
+   * so this file is never part of `tsc --noEmit` and vitest transpiles without
+   * checking — which is why seven settings sat uncovered underneath a type that
+   * claimed totality. This assertion runs, so the same drift now goes red.
+   *
+   * Deliberately asserted as an exact set rather than a subset, in both
+   * directions:
+   *  - a NEW uncovered key (someone adds a bound and forgets the env mapping)
+   *    fails, which is the regression the type was supposed to prevent;
+   *  - a NEWLY COVERED key fails too, so closing part of the gap has to delete
+   *    the name here and cannot leave a stale exemption behind. That is the
+   *    failure mode the enumerated list in the comment above already had.
+   */
+  it("has exactly its known uncovered settings", () => {
+    const covered = new Set<string>(SETTING_KEYS);
+    const uncovered = Object.keys(NUMERIC_SETTING_BOUNDS)
+      .filter((key) => !covered.has(key))
+      .sort();
+
+    expect(
+      uncovered,
+      `NUMERIC_SETTING_BOUNDS has ${Object.keys(NUMERIC_SETTING_BOUNDS).length} keys and the ` +
+        `hostile-input table covers ${SETTING_KEYS.length}. A NEW name here is a setting whose ` +
+        `bounds are declared but never driven against "Infinity"/"1e999"/"40000" — add it to ` +
+        `SETTINGS with its env var rather than to this exemption list, unless you can say why ` +
+        `it should stay uncovered. A MISSING name means you closed part of the gap: delete it ` +
+        `from KNOWN_UNCOVERED_SETTINGS.`,
+    ).toEqual([...KNOWN_UNCOVERED_SETTINGS].sort());
+  });
+
+  /**
+   * The direction `Partial<Record<…>>` does enforce at the type level — asserted
+   * at runtime too, because nothing typechecks this file. A key here that is not
+   * a real bounds key means the env var is mapped to a setting that has no clamp,
+   * so the whole suite would be testing a name that resolves nothing.
+   */
+  it("maps no setting that NUMERIC_SETTING_BOUNDS does not bound", () => {
+    const bounded = new Set(Object.keys(NUMERIC_SETTING_BOUNDS));
+    expect(SETTING_KEYS.filter((key) => !bounded.has(key))).toEqual([]);
+  });
+});
 
 /**
  * Every input an operator could plausibly get wrong.
