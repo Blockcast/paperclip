@@ -110,6 +110,20 @@ describe("buildJobManifest", () => {
     }
   });
 
+  // BLO-38096 / BLO-35486: POD_TEARDOWN_TIMEOUT_MS (execute.ts) is 60s and must
+  // exceed the pod's terminationGracePeriodSeconds, which is what the teardown
+  // wait is actually waiting on. The two values live in different files, so
+  // until now the invariant was prose only. Setting a grace period above 60s
+  // makes *every* teardown hit the timeout and fail closed, retaining Job +
+  // Secrets with no reaper to collect them.
+  //
+  // If you deliberately set one, this test is the place to record it: assert
+  // the value and confirm it stays below POD_TEARDOWN_TIMEOUT_MS.
+  it("leaves terminationGracePeriodSeconds unset, so pods ride the K8s 30s default", () => {
+    const { job } = buildJobManifest({ ctx, selfPod });
+    expect(job.spec!.template.spec!.terminationGracePeriodSeconds).toBeUndefined();
+  });
+
   describe("job naming", () => {
     it("uses ac- prefix", () => {
       const { jobName } = buildJobManifest({ ctx, selfPod });
