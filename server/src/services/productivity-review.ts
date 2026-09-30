@@ -2201,8 +2201,11 @@ function isNeverExecutedRun(
 // run finishes). A filter that quietly matches too much is indistinguishable
 // from a fixed one.
 //
-// The `status = 'cancelled'` guard is load-bearing, not decoration — do not
-// drop it. "`errorCode` is only ever written on a terminal row" is false:
+// The `status = 'cancelled'` guard is load-bearing *by construction* — do not
+// drop it — though no current writer exercises it: every write site of the two
+// codes below also sets `status: "cancelled"`, so deleting the guard changes no
+// behaviour at this head. What it defends against is the next entry in that
+// list. "`errorCode` is only ever written on a terminal row" is false:
 // `enqueueWakeup` (heartbeat.ts) INSERTs a **`scheduled_retry`** row carrying
 // `errorCode: "rate_limit_exhausted"` when the provider-capacity gate parks a
 // wake. That row is live, not terminal, and it is exactly the kind of run the

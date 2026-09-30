@@ -2999,7 +2999,8 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("Primary trigger: `high_churn`");
   });
 
-  // BLO-22887 AC2: the two cells above are the "still warranted on other
+  // BLO-22887 AC2: the two BLO-22436 cells above titled "still generates ...
+  // for a dependency-blocked issue" are the "still warranted on other
   // grounds" case — BLO-22436 suppresses a dependency-blocked source whose
   // fired set is entirely closable, so *every* blocked source that reaches the
   // body builder is one a blocker does not excuse. Until now the body said
