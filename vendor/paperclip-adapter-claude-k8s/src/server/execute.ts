@@ -1486,11 +1486,11 @@ export function describeTruncationCause(
  *                  Returned only when the pod delete was accepted, so they are
  *                  Terminating.
  * - `undeleted`  -- the list still showed pods at the deadline but the pod
- *                  delete was refused (non-404), so they are NOT Terminating
- *                  and can still start a container.  A successful list proves
- *                  nothing about the delete: `list` and `deletecollection` are
- *                  separate verbs, and a read-only Role grants one without the
- *                  other.
+ *                  delete was refused (non-404) on every poll, so they are NOT
+ *                  Terminating and can still start a container.  A successful
+ *                  list proves nothing about the delete: `list` and
+ *                  `deletecollection` are separate verbs, and a read-only Role
+ *                  grants one without the other.
  * - `unobserved` — no list call ever succeeded, so nothing was observed either
  *                  way.  Notably this is also the branch where the pod delete
  *                  itself may never have been issued.
@@ -1529,27 +1529,34 @@ async function deleteJobPodsAndWait(
 ): Promise<PodTeardownOutcome> {
   const coreApi = getCoreApi(kubeconfigPath);
   const labelSelector = `job-name=${jobName}`;
-  // Whether the pods were actually marked for deletion.  The poll below cannot
-  // tell: it only sees that pods exist, not that they are Terminating.
-  let deleteAccepted = true;
-  try {
-    await coreApi.deleteCollectionNamespacedPod({ namespace, labelSelector });
-  } catch (err) {
-    // Non-fatal: the Job delete below still cascades.  Fall through to the
-    // poll, which is what actually decides whether the Secrets are safe.
-    if (!isK8s404(err)) {
-      deleteAccepted = false;
-      const msg = err instanceof Error ? err.message : String(err);
-      await onLog("stderr", `[paperclip] Warning: failed to delete pods for job ${jobName}: ${msg}\n`);
-    }
-  }
   const deadline = Date.now() + POD_TEARDOWN_TIMEOUT_MS;
+  // Whether the pods were actually marked for deletion.  The poll cannot tell:
+  // it only sees that pods exist, not that they are Terminating.  The delete is
+  // re-issued on every poll until accepted, so one transient fault heals into
+  // `alive` and `undeleted` means refused for the whole budget.
+  let deleteAccepted = false;
+  let deleteErrorLogged = false;
   let listErrorLogged = false;
   // Survives across polls: one late list failure after several good reads
   // still leaves us knowing pods were there, which is `alive`, not
   // `unobserved`.  Only a poll that never once succeeded is `unobserved`.
   let lastObserved: number | null = null;
   while (true) {
+    if (!deleteAccepted) {
+      try {
+        await coreApi.deleteCollectionNamespacedPod({ namespace, labelSelector });
+        deleteAccepted = true;
+      } catch (err) {
+        // A 404 means the namespace, and so its pods, are gone.
+        if (isK8s404(err)) {
+          deleteAccepted = true;
+        } else if (!deleteErrorLogged) {
+          deleteErrorLogged = true;
+          const msg = err instanceof Error ? err.message : String(err);
+          await onLog("stderr", `[paperclip] Warning: failed to delete pods for job ${jobName}: ${msg}\n`);
+        }
+      }
+    }
     try {
       const podList = await coreApi.listNamespacedPod({ namespace, labelSelector });
       lastObserved = (podList?.items ?? []).length;
@@ -1665,6 +1672,20 @@ async function deleteJobOnly(
  * on the delete alone) sees the pod and never marks it Terminating; that is
  * `undeleted`, and it fails closed like `unobserved`.
  *
+ * Retaining on `undeleted` has a pod-side cost the Secret-side argument does
+ * not show.  `deleteJobOnly` deletes the Job with `propagationPolicy:
+ * Background`, and that dependent deletion is done by the kube-controller-
+ * manager garbage collector under its own credentials, so it would stop the pod
+ * even though this ServiceAccount cannot.  Retaining gives up that last lever:
+ * the pod is not Terminating and the cancelled agent keeps running, with no
+ * local bound (`activeDeadlineSeconds` is unset when `timeoutSec` is 0, and
+ * `ttlSecondsAfterFinished` only starts once the Job finishes).  It clears only
+ * when a later run's concurrency guard reaps the Job as stale.  The trade taken:
+ * a cancelled pod that keeps running, rather than run Secrets reaped under a pod
+ * that can still start.  Because the delete is retried on every poll, this is
+ * paid only for a delete refused for the whole budget (a persistent RBAC
+ * denial), not for one transient fault.
+ *
  * BLO-38096: it does NOT fail open on `unobserved`.  A non-404
  * `deleteCollection` failure is swallowed above and falls through to the poll,
  * so a fault denying both verbs (RBAC, 5xx) leaves the pod delete never issued
@@ -1672,6 +1693,8 @@ async function deleteJobOnly(
  * their `ownerReference` under a pod that can still start — BLO-35486's exact
  * failure on the cancel path.  So `unobserved` retains the Job and accepts the
  * hang; it needs a total read outage, where the run is already not settling.
+ * That premise is `unobserved`'s alone: on `undeleted` the list path is healthy
+ * and the run was settling normally up to this branch.
  */
 export async function teardownCancelledJob(
   namespace: string,
