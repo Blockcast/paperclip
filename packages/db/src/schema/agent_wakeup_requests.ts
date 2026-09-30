@@ -1,4 +1,5 @@
 import { pgTable, uuid, text, timestamp, jsonb, integer, index } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
 
@@ -36,5 +37,15 @@ export const agentWakeupRequests = pgTable(
       table.requestedAt,
     ),
     agentRequestedIdx: index("agent_wakeup_requests_agent_requested_idx").on(table.agentId, table.requestedAt),
+    // BLO-34578: serves the heartbeat timer's baseline read
+    // (`MAX(requested_at) ... WHERE source = 'timer' GROUP BY agent_id`), which
+    // runs on every scheduler pass. `agentRequestedIdx` above cannot: it has no
+    // `source` column, so Postgres must read each agent's entire history and
+    // filter — and this is the largest table in the schema with no pruning, so
+    // that scan grows without bound. Partial on `source = 'timer'` keeps it O(1)
+    // per agent regardless of table size.
+    timerBaselineIdx: index("agent_wakeup_requests_timer_baseline_idx")
+      .on(table.agentId, table.requestedAt.desc())
+      .where(sql`${table.source} = 'timer'`),
   }),
 );
