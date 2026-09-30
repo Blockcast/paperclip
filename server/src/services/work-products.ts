@@ -173,6 +173,12 @@ export function workProductService(db: Db) {
       // accepting them would make arrival order authoritative and would refresh
       // liveness for stale same-second deliveries.
       //
+      // That strictness is pinned by
+      // `server/src/__tests__/pull-request-work-product-queue-tie.test.ts`:
+      // relaxing the rank comparison below to accept the later arrival reds its
+      // dequeued->enqueued case and no other case in either PR work-product
+      // test file (measured: 1 failed / 19 passed).
+      //
       // `sourceEventTimestampMs` derives from the PR's `updated_at`, which
       // GitHub reports at second granularity, so a reopen and a close inside one
       // second are indistinguishable by time. Action rank cannot resolve that
