@@ -83,7 +83,7 @@ import {
   decideHeapSnapshot,
   ensureHeapSnapshotDir,
   heapSnapshotSweepKeep,
-  listHeapSnapshots,
+  listResidualHeapSnapshots,
   planHeapSnapshotStartup,
   pruneHeapSnapshots,
   takeHeapSnapshot,
@@ -2557,24 +2557,40 @@ export async function startServer(): Promise<StartedServer> {
 
     // Measured after the sweep, so the count reported and the decision to keep
     // polling both reflect what actually survived it.
+    //
+    // Counts `.partial` leftovers as well as completed files. A partial holds
+    // the same plaintext secrets (writeHeapSnapshot serialises incrementally),
+    // and an OOM *during* the write is this feature's own documented failure
+    // mode — so the case most likely to strand one was the case this check used
+    // to be blind to. (Ally review Important 1, PEN-3631.)
     const residualSnapshots = config.heapSnapshotEnabled
-      ? []
-      : listHeapSnapshots(heapSnapshotConfig.dir);
+      ? { completed: [], partial: [] }
+      : listResidualHeapSnapshots(heapSnapshotConfig.dir);
+    const residualSnapshotCount =
+      residualSnapshots.completed.length + residualSnapshots.partial.length;
     const heapSnapshotPlan = planHeapSnapshotStartup({
       captureEnabled: config.heapSnapshotEnabled,
-      residualSnapshotCount: residualSnapshots.length,
+      residualSnapshotCount,
     });
 
     if (heapSnapshotPlan.warnResidualSnapshots) {
       logger.warn(
         {
           snapshotDir: heapSnapshotConfig.dir,
-          count: residualSnapshots.length,
-          oldest: residualSnapshots[residualSnapshots.length - 1],
+          count: residualSnapshotCount,
+          completed: residualSnapshots.completed,
+          partial: residualSnapshots.partial,
+          // Each list is newest-first, so its last entry is its oldest. Reported
+          // per category rather than as one "oldest" across both, which could
+          // only be right by accident — the two are retired by different bounds.
+          oldestCompleted: residualSnapshots.completed[residualSnapshots.completed.length - 1],
+          oldestPartial: residualSnapshots.partial[residualSnapshots.partial.length - 1],
         },
-        "Heap snapshot capture is DISABLED and the startup sweep FAILED TO DELETE snapshots that remain on disk — these " +
-          "contain this process's secrets in plaintext. With capture off the sweep retains none, so anything still here " +
-          "survived an unlink; the poll below will keep retrying, but remove them by hand if this warning persists.",
+        "Heap snapshot capture is DISABLED and snapshot files remain on disk — these contain this process's secrets in " +
+          "plaintext, and an unfinished '.partial' contains them just as a completed one does. With capture off the sweep " +
+          "retains no completed snapshot, so any listed under 'completed' survived an unlink; a '.partial' may instead have " +
+          "been spared because it is still inside its abandonment window, and the poll below will collect it once it ages " +
+          "out. The poll keeps retrying either way, but remove them by hand if this warning persists.",
       );
     }
 
