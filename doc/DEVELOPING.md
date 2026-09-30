@@ -713,6 +713,54 @@ DB backups are not full instance filesystem backups. For full local disaster
 recovery, also back up local storage files and the local encrypted secrets key if
 those providers are enabled.
 
+## Heap Snapshots
+
+For diagnosing a heap leak whose cause no metric names (PEN-3314), the worker tier
+can write V8 heap snapshots to the Paperclip instance directory. **Off by default.**
+
+```sh
+PAPERCLIP_HEAP_SNAPSHOT_ENABLED=true
+```
+
+Snapshots land in `<instance-root>/data/diagnostics/heap/`. On a deployment where
+that directory sits on a shared volume, any pod mounting it can read the result —
+which is the point: retrieving a snapshot needs no `pods/exec` and no new HTTP
+route on the worker.
+
+Request one by dropping a sentinel file into the snapshot directory from anywhere
+that can write it:
+
+```sh
+touch <instance-root>/data/diagnostics/heap/snapshot.request
+```
+
+The worker consumes the sentinel on its next poll and writes a snapshot. Contents
+are ignored; only the file's existence is read.
+
+Environment overrides:
+
+- `PAPERCLIP_HEAP_SNAPSHOT_ENABLED=true|false` (default `false`)
+- `PAPERCLIP_HEAP_SNAPSHOT_DIR=/absolute/or/~/path`
+- `PAPERCLIP_HEAP_SNAPSHOT_KEEP=<count>` (default `2`)
+- `PAPERCLIP_HEAP_SNAPSHOT_MIN_FREE_GB=<gb>` (default `10`)
+- `PAPERCLIP_HEAP_SNAPSHOT_THRESHOLD_MB=<mb>` — take one unprompted at or above
+  this live-heap size. Default `0`, which leaves the sentinel as the only trigger.
+- `PAPERCLIP_HEAP_SNAPSHOT_MIN_INTERVAL_MINUTES=<minutes>` (default `120`) —
+  minimum gap between *automatic* snapshots.
+- `PAPERCLIP_HEAP_SNAPSHOT_POLL_SECONDS=<seconds>` (default `60`)
+
+Two things to know before enabling it:
+
+- A snapshot is **stop-the-world**. Expect a pause of seconds on a multi-gigabyte
+  heap, during which the process answers nothing, health checks included.
+- A snapshot file is roughly 1.5-2x the live heap. The retention cap and the
+  free-space floor are what keep that from filling a shared volume, so do not
+  raise `KEEP` without checking what else lives there.
+
+One snapshot names what is on the heap. It takes **two, hours apart**, to name what
+is *accumulating* — load the pair into Chrome DevTools (Memory → Load) and use the
+"Objects allocated between snapshot 1 and 2" comparison view.
+
 ## Secrets in Dev
 
 Agent env vars now support secret references. By default, secret values are stored with local encryption and only secret refs are persisted in agent config.

@@ -26,6 +26,7 @@ import {
 import {
   resolveDefaultBackupDir,
   resolveDefaultEmbeddedPostgresDir,
+  resolveDefaultHeapSnapshotDir,
   resolveDefaultSecretsKeyFilePath,
   resolveDefaultStorageDir,
   resolveHomeAwarePath,
@@ -143,6 +144,15 @@ export interface Config {
   // without dispatching an assignee run. Worker-tier only.
   terminalGateReconcilerEnabled: boolean;
   terminalGateReconcilerIntervalMinutes: number;
+  // Heap-snapshot diagnostics (PEN-3631). Off unless explicitly enabled; the
+  // worker tier owns them, same as database backups.
+  heapSnapshotEnabled: boolean;
+  heapSnapshotDir: string;
+  heapSnapshotKeep: number;
+  heapSnapshotMinFreeBytes: number;
+  heapSnapshotAutoThresholdBytes: number;
+  heapSnapshotAutoMinIntervalMs: number;
+  heapSnapshotPollIntervalMs: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -1064,6 +1074,27 @@ export function loadConfig(): Config {
     NUMERIC_SETTING_BOUNDS.terminalGateReconcilerIntervalMinutes,
     "terminalGateReconcilerIntervalMinutes",
   );
+  // Heap-snapshot diagnostics (PEN-3631). Default OFF: a snapshot is a
+  // stop-the-world pause and a multi-gigabyte write onto a volume shared with
+  // every agent's home directory, so it is opt-in per deployment.
+  const heapSnapshotEnabled = process.env.PAPERCLIP_HEAP_SNAPSHOT_ENABLED === "true";
+  const heapSnapshotDir = resolveHomeAwarePath(
+    process.env.PAPERCLIP_HEAP_SNAPSHOT_DIR ?? resolveDefaultHeapSnapshotDir(),
+  );
+  // Two snapshots is the working minimum: one names what is on the heap, the
+  // diff between two names what is accumulating.
+  const heapSnapshotKeep = Math.max(1, Number(process.env.PAPERCLIP_HEAP_SNAPSHOT_KEEP) || 2);
+  const heapSnapshotMinFreeBytes =
+    Math.max(1, Number(process.env.PAPERCLIP_HEAP_SNAPSHOT_MIN_FREE_GB) || 10) * 1024 * 1024 * 1024;
+  // 0 disables the automatic trigger, leaving the sentinel file as the only way in.
+  const heapSnapshotAutoThresholdBytes = Math.max(
+    0,
+    Number(process.env.PAPERCLIP_HEAP_SNAPSHOT_THRESHOLD_MB) || 0,
+  ) * 1024 * 1024;
+  const heapSnapshotAutoMinIntervalMs =
+    Math.max(1, Number(process.env.PAPERCLIP_HEAP_SNAPSHOT_MIN_INTERVAL_MINUTES) || 120) * 60 * 1000;
+  const heapSnapshotPollIntervalMs =
+    Math.max(5, Number(process.env.PAPERCLIP_HEAP_SNAPSHOT_POLL_SECONDS) || 60) * 1000;
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -1187,6 +1218,13 @@ export function loadConfig(): Config {
     terminalGateReconcilerIntervalMinutes,
     databaseBackupRetentionDays,
     databaseBackupDir,
+    heapSnapshotEnabled,
+    heapSnapshotDir,
+    heapSnapshotKeep,
+    heapSnapshotMinFreeBytes,
+    heapSnapshotAutoThresholdBytes,
+    heapSnapshotAutoMinIntervalMs,
+    heapSnapshotPollIntervalMs,
     serveUi:
       process.env.SERVE_UI !== undefined
         ? process.env.SERVE_UI === "true"

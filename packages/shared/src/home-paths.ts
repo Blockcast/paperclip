@@ -87,6 +87,19 @@ export function resolveDefaultBackupDir(input: {
   return path.resolve(resolvePaperclipInstanceRoot(input), "data", "backups");
 }
 
+/**
+ * Heap snapshots land under the instance root so that every pod mounting the
+ * Paperclip volume can read them. On the deployed cluster that volume is a
+ * ReadWriteMany claim shared by the worker and every agent pod, which is what
+ * makes a snapshot retrievable without `pods/exec` (PEN-3631).
+ */
+export function resolveDefaultHeapSnapshotDir(input: {
+  homeDir?: string;
+  instanceId?: string;
+} = {}): string {
+  return path.resolve(resolvePaperclipInstanceRoot(input), "data", "diagnostics", "heap");
+}
+
 export function resolveHomeAwarePath(value: string): string {
   return path.resolve(expandHomePrefix(value));
 }

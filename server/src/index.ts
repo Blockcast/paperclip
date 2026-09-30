@@ -78,6 +78,12 @@ import {
   recordHeartbeatRecoveryChainStalled,
 } from "./services/metrics.js";
 import { createApiTierPluginWorkerManagerStub } from "./services/plugin-worker-manager-stub.js";
+import {
+  HEAP_SNAPSHOT_SENTINEL_BASENAME,
+  decideHeapSnapshot,
+  ensureHeapSnapshotDir,
+  takeHeapSnapshot,
+} from "./services/heap-snapshot.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
@@ -2444,6 +2450,77 @@ export async function startServer(): Promise<StartedServer> {
     }
   }
 
+  // Heap-snapshot diagnostics (PEN-3631). Worker tier only, for the same reason
+  // backups are: this writes one large file per trigger, and replicas racing
+  // would multiply both the stop-the-world pause and the disk cost.
+  //
+  // The trigger is a sentinel file rather than an HTTP route because the volume
+  // this writes to is already shared read-write with every agent pod, so it
+  // works as the control channel too — no new listener, no new auth surface.
+  if (config.heapSnapshotEnabled && config.paperclipNodeRole !== "api") {
+    const heapSnapshotConfig = {
+      dir: config.heapSnapshotDir,
+      keep: config.heapSnapshotKeep,
+      minFreeBytes: config.heapSnapshotMinFreeBytes,
+      autoThresholdBytes: config.heapSnapshotAutoThresholdBytes,
+      autoMinIntervalMs: config.heapSnapshotAutoMinIntervalMs,
+    };
+    const heapSnapshotState: { lastAutoSnapshotAtMs: number | null } = { lastAutoSnapshotAtMs: null };
+
+    // Create the directory now so the sentinel has somewhere to land; otherwise
+    // there would be no way to request the first snapshot.
+    ensureHeapSnapshotDir(heapSnapshotConfig.dir);
+
+    logger.warn(
+      {
+        snapshotDir: heapSnapshotConfig.dir,
+        sentinel: path.join(heapSnapshotConfig.dir, HEAP_SNAPSHOT_SENTINEL_BASENAME),
+        keep: heapSnapshotConfig.keep,
+        autoThresholdBytes: heapSnapshotConfig.autoThresholdBytes,
+        pollIntervalMs: config.heapSnapshotPollIntervalMs,
+      },
+      "Heap snapshot diagnostics ENABLED — each trigger pauses this process for seconds and writes a multi-gigabyte file",
+    );
+
+    setInterval(() => {
+      // Deliberately synchronous. writeHeapSnapshot is stop-the-world anyway, so
+      // there is nothing to yield to, and keeping it on one tick means a poll can
+      // never overlap its own predecessor.
+      try {
+        const decision = decideHeapSnapshot(heapSnapshotConfig, heapSnapshotState);
+        if (decision.trigger === null) return;
+
+        // Stamp the automatic trigger before attempting, not after, for the same
+        // reason the sentinel is consumed before attempting: a snapshot that
+        // fails for a persistent reason (a full volume, a dying heap) would
+        // otherwise be retried on every single poll.
+        if (decision.trigger === "threshold") {
+          heapSnapshotState.lastAutoSnapshotAtMs = Date.now();
+        }
+
+        const result = takeHeapSnapshot(heapSnapshotConfig, decision.trigger);
+
+        if ("skipped" in result) {
+          logger.error({ ...result, trigger: decision.trigger }, "Heap snapshot skipped");
+          return;
+        }
+        logger.warn(
+          {
+            snapshotFile: result.filePath,
+            sizeBytes: result.sizeBytes,
+            heapUsedBytes: result.heapUsedBytes,
+            durationMs: result.durationMs,
+            prunedCount: result.prunedCount,
+            trigger: result.trigger,
+          },
+          "Heap snapshot written",
+        );
+      } catch (err) {
+        logger.error({ err, snapshotDir: heapSnapshotConfig.dir }, "Heap snapshot failed");
+      }
+    }, config.heapSnapshotPollIntervalMs);
+  }
+  
   // Wait for external adapters to finish loading before accepting requests.
   // Without this, adapter type validation (assertKnownAdapterType) would
   // reject valid external adapter types during the startup loading window.
