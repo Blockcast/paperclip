@@ -595,11 +595,16 @@ describe("prompt-bundle skill symlinks carry POD addresses (BLO-37961)", () => {
   });
 
   it("leaves an IMAGE path (/app/skills/...) byte-identical — rewriting it would break it", async () => {
-    await withVolume(async ({ podMount, serverMount, podRootDir }) => {
-      // The adapter's own bundled on-disk skills. Same absolute path in both
-      // namespaces because both come from the image layer, not the volume — so
-      // this is the set that works TODAY, and the rewrite must not touch it.
-      const imageSource = "/app/skills/paperclip";
+    await withVolume(async ({ podMount, serverMount, podRootDir, offMountSkillSource }) => {
+      // The adapter's own bundled on-disk skills (`/app/skills/paperclip`). Same
+      // absolute path in both namespaces because both come from the image
+      // layer, not the volume, so this is the set that works TODAY and the
+      // rewrite must not touch it. Stood in for by `offMountSkillSource`, a real
+      // directory outside both mounts that reaches the identical `toPodAddress`
+      // branch: the source is hashed before any link is written, so the literal
+      // `/app/skills/...` would only run on a host that has it. The empty key
+      // set is what `execute.ts` passes for a bundled (non-catalog) entry.
+      const imageSource = offMountSkillSource;
       const bundle = await prepareClaudePromptBundle({
         companyId,
         skills: [skillEntry(imageSource, "paperclip")],
@@ -607,6 +612,7 @@ describe("prompt-bundle skill symlinks carry POD addresses (BLO-37961)", () => {
         rootDir: podRootDir,
         podDataMountPath: podMount,
         serverDataMountPath: serverMount,
+        catalogBackedSkillKeys: new Set<string>(),
         onLog,
       });
 
@@ -692,19 +698,25 @@ describe("prompt-bundle skill symlinks carry POD addresses (BLO-37961)", () => {
     // The live set is MIXED, which is why the defect was not obvious: a bundle
     // whose image-path links all resolve looks healthy. One leg per shape in one
     // call, so a rewrite that is unconditional in either direction fails here.
-    await withVolume(async ({ podMount, serverMount, podRootDir, serverSkillSource, podSkillSource }) => {
+    await withVolume(async ({ podMount, serverMount, podRootDir, serverSkillSource, podSkillSource, offMountSkillSource }) => {
+      // The image entry is `offMountSkillSource` standing in for
+      // `/app/skills/paperclip`, as in the IMAGE-path test above. It gets its
+      // own key so the key set can mark only the catalog entry, as `execute.ts`
+      // does for a mixed bundle.
+      const imageEntry = { ...skillEntry(offMountSkillSource, "paperclip"), key: "paperclipai/paperclip/paperclip" };
       const bundle = await prepareClaudePromptBundle({
         companyId,
-        skills: [skillEntry(serverSkillSource), skillEntry("/app/skills/paperclip", "paperclip")],
+        skills: [skillEntry(serverSkillSource), imageEntry],
         instructionsContents: null,
         rootDir: podRootDir,
         podDataMountPath: podMount,
         serverDataMountPath: serverMount,
+        catalogBackedSkillKeys: new Set([skillEntry(serverSkillSource).key]),
         onLog,
       });
 
       expect(await linkTarget(bundle)).toBe(podSkillSource);
-      expect(await linkTarget(bundle, "paperclip")).toBe("/app/skills/paperclip");
+      expect(await linkTarget(bundle, "paperclip")).toBe(offMountSkillSource);
     });
   });
 
