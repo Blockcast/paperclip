@@ -2523,6 +2523,37 @@ describe("teardownCancelledJob: external-cancel path (BLO-35486)", () => {
       const warning = onLog.mock.calls.map(([, m]: [string, string]) => m).join("");
       expect(warning).toContain("the pod delete was refused");
       expect(warning).toContain("leaving the Job");
+      // The delete is retried every poll but reported once, not once per 2s.
+      expect(mockCoreDeleteCollectionPods.mock.calls.length).toBeGreaterThan(1);
+      expect(warning.split("failed to delete pods for job").length - 1).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Ally review on #2116 at 5b596d19: the delete used to be issued once, outside
+  // the poll, so a single transient fault latched `undeleted` for the whole
+  // teardown and retained the Job over a pod that was never deleted and kept
+  // running. Retrying it each poll lets the transient case heal into `alive`.
+  it("retries a refused pod delete, so one transient fault still fails open", async () => {
+    vi.useFakeTimers();
+    try {
+      mockCoreDeleteCollectionPods
+        .mockRejectedValueOnce(Object.assign(new Error("service unavailable"), { code: 503 }))
+        .mockResolvedValue({});
+      mockCoreListPods.mockResolvedValue({ items: [{ metadata: { name: "pod-wedged" } }] });
+      const onLog = vi.fn().mockResolvedValue(undefined);
+
+      const promise = teardownCancelledJob("paperclip", "ac-job", onLog);
+      await vi.advanceTimersByTimeAsync(90_000);
+      await promise;
+
+      // Retried once, then left alone once accepted.
+      expect(mockCoreDeleteCollectionPods).toHaveBeenCalledTimes(2);
+      expect(mockBatchDeleteJob).toHaveBeenCalled();
+      const warning = onLog.mock.calls.map(([, m]: [string, string]) => m).join("");
+      expect(warning).toContain("deleting the Job anyway");
+      expect(warning).not.toContain("the pod delete was refused");
     } finally {
       vi.useRealTimers();
     }
