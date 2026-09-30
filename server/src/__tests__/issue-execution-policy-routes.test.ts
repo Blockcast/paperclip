@@ -723,7 +723,7 @@ describe("issue execution policy routes", () => {
       .send({
         executionPolicy: {
           monitor: {
-            nextCheckAt: "2026-12-01T12:00:00.000Z",
+            nextCheckAt: SCHEDULED_MONITOR_NEXT_CHECK_AT,
             scheduledBy: "assignee",
             notes: "Resume an internal follow-up.",
           },
