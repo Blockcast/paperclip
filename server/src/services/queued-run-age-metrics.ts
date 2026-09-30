@@ -321,7 +321,7 @@ export const IS_PROVIDER_QUOTA_FAMILY = sql<boolean>`(
  *    jitter, **9,000s**.
  *  - `transient_failure_floor`: an upstream `retryNotBefore` floor, with up
  *    to `TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS` of forward jitter when it is
- *    just under the horizon; an actually horizon-clamped floor carries no
+ *    at or just under the horizon; an actually horizon-clamped floor carries no
  *    forward jitter. The maximum is `MAX_TRANSIENT_RETRY_HORIZON_MS` plus
  *    300s, **86,700s**. `jitterTransientRetry
  *    Floor`'s own docstring puts these floors "routinely 4-5h out while the
