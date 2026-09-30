@@ -460,7 +460,26 @@ async function probeOne(
       newest !== undefined &&
       countAllyDeferredPriorFindings(newest.body) > 0 &&
       !(formalDeferredAttestedHead !== null && formalDeferredAttestedHead !== normalizedHead);
-    if (formalAttestingReview !== undefined) {
+    // `!commentBlocking` because `formalClean` reaches `out.clean` only through
+    // a conjunction that `commentBlocking` has already falsified — so once
+    // Surface 1 is red this read cannot change a verdict, and can only LOSE
+    // one: an unreadable `GET /pulls/{n}` would set `failed`, which
+    // `evidence-gate.ts` reads as "could not ask" and uses to suppress the
+    // `PAPERCLIP_EVIDENCE_UNLABELED_BLOCK` promotion — demoting a fully
+    // justified block to a warn and blaming an unreadable probe for a red this
+    // probe was holding in its hand (Ally review of #1966).
+    //
+    // The route this is REACHABLE on is `blocking_finding`, which stays
+    // author-blind on purpose ("a finding is a finding whoever wrote it",
+    // `pr-comment-review-gate.ts`): Surface 1 never reads the author there, so
+    // this read is a genuine extra call against a deliberately scarce budget.
+    // NOT `carried_finding`, which that review named — it carries
+    // `authorUnknown` forward on purpose, so Surface 1 has already read and
+    // `readPrAuthor`'s memo makes this one free and its `failed` already set.
+    // So do not delete this clause as redundant with Surface 1, and do not
+    // re-justify it from the carried route: reverting it is green on that one.
+    // `evidence-truth.test.ts` pins both directions with a pair.
+    if (formalAttestingReview !== undefined && !commentBlocking) {
       const prAuthorLogin = await readPrAuthor();
       // An unread author leaves this false: it cannot establish independence,
       // and `readPrAuthor` has already set `failed` and reported it.
