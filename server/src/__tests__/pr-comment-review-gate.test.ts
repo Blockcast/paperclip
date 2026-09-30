@@ -313,6 +313,7 @@ describe("evaluateCommentReviewGate", () => {
   it("reports a tracked residual at this head as deferred, not clean", () => {
     const verdict = evaluateCommentReviewGate({
       headSha: CURRENT_HEAD,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
       comments: [
         allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
         allyComment(
@@ -336,6 +337,7 @@ describe("evaluateCommentReviewGate", () => {
     // ledger verb, not by merely having any ledger or any prior head.
     const verdict = evaluateCommentReviewGate({
       headSha: CURRENT_HEAD,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
       comments: [
         allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
         allyComment(dispositioningReview(CURRENT_HEAD, OLD_HEAD, "fixed"), "2026-08-04T21:09:19Z"),
@@ -365,6 +367,7 @@ describe("evaluateCommentReviewGate", () => {
     ]) {
       const verdict = evaluateCommentReviewGate({
         headSha: CURRENT_HEAD,
+        prAuthorLogin: DISTINCT_PR_AUTHOR,
         comments: [
           allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
           allyComment(reviewBody(CURRENT_HEAD, lines), "2026-08-04T21:09:19Z"),
@@ -1680,6 +1683,11 @@ describe("commentReviewGateCheckConclusion", () => {
   });
   const deferred = evaluateCommentReviewGate({
     headSha: CURRENT_HEAD,
+    // Independent author, for the same reason `clean` above needs one: a
+    // deferral is a POSITIVE claim about what a review decided, so it sits
+    // behind the BLO-34316 independence gate. Without this the fixture reads
+    // `not_evaluated` and every assertion below passes for the wrong reason.
+    prAuthorLogin: DISTINCT_PR_AUTHOR,
     comments: [
       allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
       allyComment(dispositioningReview(CURRENT_HEAD, OLD_HEAD, "tracked"), "2026-08-04T21:09:19Z"),
