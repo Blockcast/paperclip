@@ -1257,7 +1257,16 @@ describe("annotationFor — the per-guard index-fault signal is the claim, so it
     );
 
     assert.match(line, /^::error title=Scheduled guard has stopped executing::/);
-    assert.match(line, /Queued but not started\./, "the API-derived stop-mode must reach the annotation");
+    // Spelled through from `detail` to the next sentence, not just
+    // /Queued but not started\./, because the space separating the two lives
+    // INSIDE the ternary at :848 — a bare match for the stop-mode is green
+    // either way and lets `…has stopped.Queued but not started.` ship. Same
+    // shape as the omitted-branch assertion below, so the pair is symmetric.
+    assert.match(
+      line,
+      /Relay SSL has stopped\. Queued but not started\. This guard/,
+      "the API-derived stop-mode must reach the annotation, spaced off the detail",
+    );
     assert.match(line, /Last run: n\/a/, "a missing URL prints n/a, never `undefined`");
   });
 
