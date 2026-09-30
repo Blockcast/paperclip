@@ -74,6 +74,7 @@ import {
   githubPostIssueComment,
   type MergeHistoryShape,
 } from "../services/github-app-auth.js";
+import { GITHUB_REQUEST_TIMEOUT_MS } from "../services/github-fetch.js";
 import {
   buildForeignCommitNoticeBody,
   foreignCommitNoticeIdempotencyKey,
@@ -4005,6 +4006,10 @@ export async function reconcileContendedPrReviewerWakes(
         liveHeadSha = await (config.resolvePrReviewHeadSha ?? githubFetchPrHeadSha)({
           repoFullName: replay.context.repoFullName,
           prNumber: replay.context.prNumber,
+          // Inline, before this handler answers GitHub: bound it well under the
+          // delivery timeout so a slow read degrades to the warn below rather
+          // than holding the delivery open and earning a redelivery (BLO-38257).
+          signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
         });
       } catch (err) {
         logger.warn(
@@ -5260,6 +5265,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         const headSha = await resolveHeadSha({
           repoFullName: context.repoFullName,
           prNumber: context.prNumber,
+          signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
         });
         if (headSha) {
           context = { ...context, headSha };
@@ -6082,6 +6088,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           const headBranchState = await githubResolveBranchState({
             repoFullName: stackedRepoFullName,
             branch: mergedBaseRef,
+            signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
           });
           if (headBranchState !== "exists") {
             logger.warn(
