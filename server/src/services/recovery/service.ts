@@ -7547,9 +7547,33 @@ export function recoveryService(
   // pass's `escalate.*` totals. That is a diagnostic inaccuracy only, and a small one —
   // both call sites are event-driven (one per failed plan-approval resume, one per blocked
   // PR-review-gate promotion), against a sweep that runs the escalate path ~1000 times per
-  // pass. If the `escalate.*` numbers ever need to be exact rather than indicative, those
-  // two sites are where the contamination enters; scope the timer before trusting them to
-  // the last millisecond.
+  // pass.
+  //
+  // ⚠ That last sentence is a DILUTION argument, so it covers `totalMs` (and the mean)
+  // and does NOT cover `maxMs` or `calls`. `record()` in `pass-timing.ts` keeps any
+  // larger sample (`if (ms > prev.maxMs)`) and increments `calls` unconditionally, so
+  // the 1000:1 ratio damps neither: ONE interleaved escalation that waits long on
+  // `paperclip:issue-parent:<companyId>` writes its full wait straight into
+  // `escalate.lockCompanyIssueGraph.maxMs`. That is the field `PhaseStat` documents as
+  // "a phase whose max approaches its total is one slow call, not a slow phase" — i.e.
+  // the discriminator for whether to go hunting a pathological lock holder — so the
+  // failure mode is a phantom outlier in the exact signal this instrumentation exists
+  // to produce, and `calls` is skewed the same way rather than being available to
+  // sanity-check it. An operator reading a suspicious `escalate.*` max should rule out
+  // a concurrent heartbeat escalation before believing it.
+  //
+  // Exposure is exactly the three phases below that read this module-scoped timer
+  // (`escalate.lockIssueOwnership`, `escalate.lockCompanyIssueGraph`,
+  // `escalate.selectIssueForUpdate`). The `prologue.*`, `candidateQuery` and
+  // `orphanBlockerSweep` phases take `passTimer` as a parameter and cannot be reached
+  // this way at all.
+  //
+  // If the `escalate.*` numbers ever need to be exact rather than indicative, those two
+  // heartbeat sites are where the contamination enters; the structural fix is to thread
+  // the timer through this function's existing `input` object so the CALLER selects the
+  // timed arm, which costs 22 call-site edits (the in-sweep direct calls, counted with
+  // the first grep above) and is not worth it for a diagnostic-accuracy gain until the
+  // totals stop being merely indicative.
   let activePassTimer: PassTimer | null = null;
 
   async function escalateStrandedAssignedIssue(input: {
@@ -8692,8 +8716,12 @@ export function recoveryService(
     // `finally` so nothing outside a sweep is ever timed into it. Assigned rather
     // than pushed/popped because this sweep is single-flight — `index.ts` will not
     // start a chain while one is in flight — so there is never a second pass to
-    // nest. If that gate is ever removed, the later pass's assignment wins and the
-    // earlier pass reports a partial total; that is a diagnostic inaccuracy only.
+    // nest. If that gate is ever removed, the CLEAR below is the sharper problem
+    // rather than the assignment: whichever pass finishes FIRST sets
+    // `activePassTimer = null`, so a still-running pass silently loses all its
+    // `escalate.*` timing from that moment on, while the pass that already emitted
+    // carries the other's spans. Both are diagnostic inaccuracy only, but read this
+    // before concluding the gate is safe to remove.
     //
     // Split into an inner function purely so the `finally` cannot be skipped: the
     // sweep body has many early paths, and a bare try/finally wrapped around all of
@@ -8742,7 +8770,12 @@ export function recoveryService(
       //
       // Wrapped in its own try/catch because a `finally` that throws during unwind
       // REPLACES the pass's real error. Diagnostics must never mask the fault they
-      // exist to explain.
+      // exist to explain. The catch is deliberately BARE: the summary is plain numbers
+      // and strings, so the realistic failure here is a transport/write error, which
+      // would affect a `logger.warn` in this catch identically — and that second throw
+      // would unwind out of the `finally` and mask the pass's error, which is the exact
+      // thing this guard exists to prevent. Swallowing is the only branch that actually
+      // delivers the stated guarantee.
       try {
         logger.info(
           {
@@ -8755,8 +8788,8 @@ export function recoveryService(
           },
           "stranded assigned issue sweep phase timing",
         );
-      } catch (err) {
-        logger.warn({ err }, "failed to emit stranded assigned issue sweep phase timing");
+      } catch {
+        // Intentionally empty — see above.
       }
     }
   }

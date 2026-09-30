@@ -112,7 +112,6 @@ describe("recovery sweep pass timing", () => {
   it("keeps the slowest list worst-first and bounded regardless of arrival order", async () => {
     const clock = fakeClock();
     const timer = createPassTimer({ now: clock.now });
-    const timer2 = createPassTimer({ slowestTracked: 2, now: clock.now });
     // Arrival order deliberately puts a slow candidate FIRST, so a list that simply
     // kept the first N entries would still contain it and could look correct.
     await timer.candidate("slow-first", clock.advance(40));
@@ -125,6 +124,12 @@ describe("recovery sweep pass timing", () => {
     expect(slowest[1]).toEqual({ issueId: "slow-first", ms: 40 });
     expect(slowest.map((entry) => entry.ms)).toEqual([...slowest.map((e) => e.ms)].sort((a, b) => b - a));
 
+    // Constructed HERE rather than beside `timer`: both share one fake clock, so
+    // creating it above would start its `elapsedMs` before `timer`'s candidates
+    // advanced that clock. Measured: it reported `elapsedMs` 119 for 3 ms of
+    // observed work, against 3 from this position. Nothing asserts `elapsedMs`
+    // today, so that was a trap for the next reader rather than a live bug.
+    const timer2 = createPassTimer({ slowestTracked: 2, now: clock.now });
     await timer2.candidate("a", clock.advance(1));
     await timer2.candidate("b", clock.advance(1));
     await timer2.candidate("c", clock.advance(1));
