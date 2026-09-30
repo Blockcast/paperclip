@@ -152,6 +152,7 @@ export interface Config {
   heapSnapshotMinFreeBytes: number;
   heapSnapshotAutoThresholdBytes: number;
   heapSnapshotAutoMinIntervalMs: number;
+  heapSnapshotSentinelMinIntervalMs: number;
   heapSnapshotPollIntervalMs: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
@@ -1093,6 +1094,16 @@ export function loadConfig(): Config {
   ) * 1024 * 1024;
   const heapSnapshotAutoMinIntervalMs =
     Math.max(1, Number(process.env.PAPERCLIP_HEAP_SNAPSHOT_MIN_INTERVAL_MINUTES) || 120) * 60 * 1000;
+  // The sentinel is writable from every pod mounting the shared claim, so the
+  // request path needs a floor of its own or a loop touching the file forces a
+  // stop-the-world pause on the singleton worker once per poll. Much shorter
+  // than the automatic gap: that one spaces a *pair* for a diff, this one only
+  // bounds the pause rate. Clamped to >= 1 minute deliberately — this is a DoS
+  // floor on an untrusted-writable path, so a typo must not be able to remove it.
+  const heapSnapshotSentinelMinIntervalMs =
+    Math.max(1, Number(process.env.PAPERCLIP_HEAP_SNAPSHOT_SENTINEL_MIN_INTERVAL_MINUTES) || 5) *
+    60 *
+    1000;
   const heapSnapshotPollIntervalMs =
     Math.max(5, Number(process.env.PAPERCLIP_HEAP_SNAPSHOT_POLL_SECONDS) || 60) * 1000;
   const bindValidationErrors = validateConfiguredBindMode({
@@ -1224,6 +1235,7 @@ export function loadConfig(): Config {
     heapSnapshotMinFreeBytes,
     heapSnapshotAutoThresholdBytes,
     heapSnapshotAutoMinIntervalMs,
+    heapSnapshotSentinelMinIntervalMs,
     heapSnapshotPollIntervalMs,
     serveUi:
       process.env.SERVE_UI !== undefined

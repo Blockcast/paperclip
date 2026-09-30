@@ -737,6 +737,14 @@ touch <instance-root>/data/diagnostics/heap/snapshot.request
 The worker consumes the sentinel on its next poll and writes a snapshot. Contents
 are ignored; only the file's existence is read.
 
+**The sentinel is a trigger for a stop-the-world pause on the singleton worker,
+and every pod mounting the shared claim can write it.** Requests are therefore
+rate-limited (`SENTINEL_MIN_INTERVAL_MINUTES`, default 5): a sentinel arriving
+inside that window is deleted but declines to snapshot, so a script touching the
+file in a loop cannot pause the process that drives every heartbeat, dispatch and
+recovery pass once per poll. The sentinel is consumed either way, so a burst of
+touches does not queue up.
+
 Environment overrides:
 
 - `PAPERCLIP_HEAP_SNAPSHOT_ENABLED=true|false` (default `false`)
@@ -747,6 +755,10 @@ Environment overrides:
   this live-heap size. Default `0`, which leaves the sentinel as the only trigger.
 - `PAPERCLIP_HEAP_SNAPSHOT_MIN_INTERVAL_MINUTES=<minutes>` (default `120`) —
   minimum gap between *automatic* snapshots.
+- `PAPERCLIP_HEAP_SNAPSHOT_SENTINEL_MIN_INTERVAL_MINUTES=<minutes>` (default `5`)
+  — minimum gap between *sentinel* snapshots. Clamped to at least 1 minute: this
+  is a floor on a path anything with write access to the volume can reach, so
+  there is deliberately no way to switch it off.
 - `PAPERCLIP_HEAP_SNAPSHOT_POLL_SECONDS=<seconds>` (default `60`)
 
 Two things to know before enabling it:
@@ -756,6 +768,13 @@ Two things to know before enabling it:
 - A snapshot file is roughly 1.5-2x the live heap. The retention cap and the
   free-space floor are what keep that from filling a shared volume, so do not
   raise `KEEP` without checking what else lives there.
+
+If the volume is too full, the worker logs `Heap snapshot skipped` and writes
+nothing — **and retains the snapshots it would otherwise have pruned.** The
+free-space test already credits the bytes that prune would release
+(`reclaimableBytes` in the log line), so a refusal means deleting them would not
+have been enough. Snapshots of a past heap state cannot be retaken, so they are
+kept rather than spent on a write that cannot happen.
 
 One snapshot names what is on the heap. It takes **two, hours apart**, to name what
 is *accumulating* — load the pair into Chrome DevTools (Memory → Load) and use the
