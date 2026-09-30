@@ -2714,6 +2714,136 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("Primary trigger: `high_churn`");
   });
 
+  // BLO-36927. `countIssueRunsSince` — the whole denominator for `high_churn`'s
+  // two run-count arms — had no status or errorCode filter, and its
+  // `coalesce(startedAt, createdAt)` fallback is exactly what makes a run that
+  // never started countable. So the dispatcher's own pre-dispatch cancellations
+  // (`cancelQueuedRunForDuplicateDispatch`, `cancelQueuedRunForBlockedDependencies`)
+  // landed in the churn numerator, and the bar scaled with a repo's check-run
+  // count rather than with the assignee's conduct.
+  //
+  // All three cells share one fixture shape, 30 runs spaced 10m apart inside
+  // the 6h window (7 in the last hour, under `highChurnHourly` = 10), so the
+  // ONLY arm in play is `runCountLastSixHours` against `highChurnSixHours` = 30.
+  // Comments are attached to the 15 `churnExecutedRuns` runs only: 15 in 6h
+  // stays under the same 30 bar, which keeps the two comment-count arms out of
+  // the result — without that, cell 2 would pass on the comment arm alone and
+  // prove nothing about the run filter. The most recent run always carries a
+  // comment, so `noCommentStreak` breaks at 0 and `high_churn` is unambiguously
+  // the trigger under test.
+  const CHURN_SIX_HOUR_HALF = 15;
+  const CHURN_PAIR_SPACING_MS = 20 * 60 * 1000;
+  const CHURN_INTERLEAVE_MS = 10 * 60 * 1000;
+  const churnExecutedRuns = (seeded: Awaited<ReturnType<typeof seedAssignedIssue>>, now: Date) =>
+    insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: CHURN_SIX_HOUR_HALF,
+      now,
+      spacingMs: CHURN_PAIR_SPACING_MS,
+      withRunComments: true,
+    });
+  // Interleaved 10m behind the executed half so the combined 30 runs are evenly
+  // spread and no 1h sub-window crosses the hourly bar.
+  const churnSecondHalf = (
+    seeded: Awaited<ReturnType<typeof seedAssignedIssue>>,
+    now: Date,
+    overrides: Partial<Parameters<typeof insertRuns>[0]>,
+  ) =>
+    insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: CHURN_SIX_HOUR_HALF,
+      now: new Date(now.getTime() - CHURN_INTERLEAVE_MS),
+      spacingMs: CHURN_PAIR_SPACING_MS,
+      ...overrides,
+    });
+
+  it.each([
+    ["duplicate_dispatch_suppressed" as const],
+    ["issue_dependencies_blocked" as const],
+  ])(
+    "does not generate a high-churn review when half the window is %s cancellations (BLO-36927)",
+    async (errorCode) => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await churnExecutedRuns(seeded, now);
+      // A pre-dispatch cancellation as production writes it: CAS'd straight from
+      // `queued` to `cancelled`, no `startedAt`, no adapter and therefore no run
+      // telemetry at all.
+      await churnSecondHalf(seeded, now, {
+        status: "cancelled",
+        errorCode,
+        startedAt: null,
+        finishedAt: null,
+        livenessState: null,
+        usageJson: null,
+        logStore: null,
+        logBytes: 0,
+      });
+
+      const service = productivityReviewService(db);
+      const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      expect(result.created).toBe(0);
+      expect(await listProductivityReviews(seeded.companyId)).toEqual([]);
+    },
+  );
+
+  // Non-zero control for the cell above. Without it, an exclusion that matched
+  // everything would degrade `high_churn` to "never fires" and still pass —
+  // indistinguishable from fixed.
+  it("still generates a high-churn review when all 30 runs in the window were dispatched (BLO-36927)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await churnExecutedRuns(seeded, now);
+    await churnSecondHalf(seeded, now, {});
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `high_churn`");
+  });
+
+  // In-flight control. `isNeverInvokedRun` — the predicate the sibling triggers
+  // use — reads `usageJson`/`logStore`/`logRef`/`logBytes`, all of which are
+  // null on a `running` run by construction (`usageJson` is the completion
+  // summary). Lifted into `countIssueRunsSince`, which has no status filter at
+  // all, it would silently exclude the live runs the churn bar most wants to
+  // count. This cell fails if the exclusion is not status-aware.
+  it("still generates a high-churn review when every run in the window is still running (BLO-36927)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const running = {
+      status: "running",
+      usageJson: null,
+      logStore: null,
+      logBytes: 0,
+      livenessState: null,
+    } as const;
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: CHURN_SIX_HOUR_HALF,
+      now,
+      spacingMs: CHURN_PAIR_SPACING_MS,
+      ...running,
+    });
+    await churnSecondHalf(seeded, now, running);
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `high_churn`");
+  });
+
   // BLO-22887 AC2: the two cells above are the "still warranted on other
   // grounds" case — BLO-22436 suppresses a dependency-blocked source whose
   // fired set is entirely closable, so *every* blocked source that reaches the
@@ -3097,6 +3227,23 @@ describeEmbeddedPostgres("productivity review service", () => {
       livenessState: "failed",
       usageJson: null,
       errorCode: "job_failed",
+    });
+    // BLO-36927: this cell asserts the evidence line, and used to reach it on
+    // `high_churn` alone — 5 dependency-gate cancellations + 5 infra failures
+    // hitting `highChurnHourly` exactly. Both halves are non-executing by this
+    // file's own definition, so that was the churn bar firing on a window with
+    // no dispatched runs in it at all, which is the defect BLO-36927 removes
+    // (`countIssueRunsSince` now excludes pre-dispatch cancellations). The
+    // even 5/5 split the test exists to exercise is unchanged; these 10 silent
+    // executed runs just restore a trigger that is about assignee conduct.
+    // They are turn-executing, so they join neither `nonExecutingRuns` nor the
+    // never-invoked count and leave the asserted line byte-identical.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now: new Date(now.getTime() - 12 * 60_000),
     });
 
     const service = productivityReviewService(db);

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db, DbTransaction } from "@paperclipai/db";
 import { clampIssueRequestDepth } from "@paperclipai/shared";
 import {
@@ -1879,10 +1879,17 @@ function isSoftStopTrigger(trigger: ProductivityReviewTrigger) {
 // queued runs before dispatch: `no_comment_streak` counts the silence the gate
 // produces, and `long_active_duration` counts elapsed time the assignee cannot
 // spend. Deliberately excluded:
-//   - `high_churn` — a record of runs that did execute and did burn cost. A
-//     blocker added afterwards does not make that untrue, and honouring it here
-//     would let a flagged agent retire its own cost-accountability artifact by
-//     adding a `blockedBy` edge.
+//   - `high_churn` — a record of runs that were actually dispatched and did
+//     burn cost. A blocker added afterwards does not make that untrue, and
+//     honouring it here would let a flagged agent retire its own
+//     cost-accountability artifact by adding a `blockedBy` edge. BLO-36927:
+//     "dispatched", precisely — the run-count arms exclude the two pre-dispatch
+//     cancel gates (`notPreDispatchCancelledSql`, which covers the dependency
+//     gate's own `issue_dependencies_blocked` rows), so the gate can no longer
+//     manufacture the churn it is then refused the right to retire. What is
+//     still counted, and deliberately: dispatched runs that crashed before a
+//     model turn (`isInfraFailureRun`) — those burned a container, they are not
+//     a graph-state fact, and `runtime_failure_streak` adjudicates them.
 //   - `runtime_failure_streak` — genuine infra faults, disjoint from the gate by
 //     construction (`isInfraFailureRun` short-circuits on
 //     `isDependencyBlockedRun`), so a blocker does not explain it.
@@ -2056,6 +2063,48 @@ function isNeverExecutedRun(
 ): boolean {
   return isInfraFailureRun(run) || isDependencyBlockedRun(run);
 }
+
+// BLO-36927: the two gates that cancel a run *before* it is ever dispatched.
+// Both CAS a still-undispatched row (`queued`, or `scheduled_retry` for the
+// dependency gate's park-expiry/attempt-exhaustion branches) straight to
+// `cancelled`, and neither writes `startedAt` — no adapter, no model turn, no
+// cost:
+//   - `duplicate_dispatch_suppressed` — `cancelQueuedRunForDuplicateDispatch`
+//     (heartbeat.ts), the dispatcher's own redundancy dedupe when two wakeup
+//     paths queue the same (agentId, issueId) on one tick.
+//   - `issue_dependencies_blocked` — `cancelQueuedRunForBlockedDependencies`
+//     and the dependency-blocked park expiry/exhaustion writers, already
+//     recognised as never-executed by `isDependencyBlockedRun` above.
+//
+// `countIssueRunsSince` (the `high_churn` run-count denominator) has no status
+// filter, and its `coalesce(startedAt, createdAt)` fallback is exactly what
+// makes a never-started row countable — so without this exclusion the
+// dispatcher's own redundancy cancellations land in the churn numerator. The
+// denominator then scales with a repo's check-run count rather than with the
+// assignee's conduct: 47 of the 57 wakes in the BLO-36842 episode were GitHub
+// CI events on a repo emitting ~43 check-runs per push, 32 of which the
+// dispatcher immediately suppressed, and the 6h bar (30) fired on a window
+// whose net dispatched count was 15.
+//
+// Expressed as SQL rather than reusing `isNeverInvokedRun`, and gated on
+// `status = 'cancelled'` rather than on `errorCode` alone, for the reason
+// BLO-36927 names: this predicate is applied to a population with no status
+// filter at all, so anything keyed on absent run telemetry would also swallow
+// the in-flight `queued`/`running` rows the churn bar most wants to count
+// (`usageJson` is the completion summary and is null by construction until a
+// run finishes). A filter that quietly matches too much is indistinguishable
+// from a fixed one. `errorCode` is only ever written on a terminal row, so the
+// status guard is belt-and-braces — kept because it is one line and it makes
+// the "pre-dispatch, terminal" intent legible at the call site.
+const PRE_DISPATCH_CANCELLED_RUN_ERROR_CODES = [
+  "duplicate_dispatch_suppressed",
+  "issue_dependencies_blocked",
+];
+const notPreDispatchCancelledSql = or(
+  ne(heartbeatRuns.status, "cancelled"),
+  isNull(heartbeatRuns.errorCode),
+  notInArray(heartbeatRuns.errorCode, PRE_DISPATCH_CANCELLED_RUN_ERROR_CODES),
+);
 
 // True when no adapter container was ever created for this run, so nothing
 // capable of writing a comment ever existed (BLO-23096: `preferred_workspace_
@@ -3795,6 +3844,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           eq(heartbeatRuns.agentId, agentId),
           issueRunScopeSql(issueId),
           sql`coalesce(${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) >= ${since.toISOString()}::timestamptz`,
+          notPreDispatchCancelledSql,
         ),
       )
       .then((rows) => rows[0]?.count ?? 0);
