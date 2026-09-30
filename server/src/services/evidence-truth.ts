@@ -392,12 +392,23 @@ async function probeOne(
     // author-blind on purpose ("a finding is a finding whoever wrote it",
     // `pr-comment-review-gate.ts`): Surface 1 never reads the author there, so
     // this read is a genuine extra call against a deliberately scarce budget.
-    // NOT `carried_finding`, which that review named — it carries
-    // `authorUnknown` forward on purpose, so Surface 1 has already read and
-    // `readPrAuthor`'s memo makes this one free and its `failed` already set.
-    // So do not delete this clause as redundant with Surface 1, and do not
-    // re-justify it from the carried route: reverting it is green on that one.
-    // `evidence-truth.test.ts` pins both directions with a pair.
+    // NOT the `authorUnknown`-CARRYING `carried_finding` sub-shape, which that
+    // review named. `authorUnknown` rides that route only through
+    // `withheldPositive`, which is assigned only inside `if (forHead)` — i.e.
+    // only when a comment passing `isAllyConsolidatedReviewComment` attests
+    // this head. There, Surface 1 has already read and `readPrAuthor`'s memo
+    // makes this one free with its `failed` already set, so reverting this
+    // clause is green on that sub-shape and a guard written against it would
+    // measure nothing.
+    //
+    // The OTHER carried sub-shape DOES reach here, so the exclusion above is
+    // not a universal (Ally review of #2143): an at-head body that attests but
+    // fails the `## Ally` grammar leaves `withheldPositive` null, so the carry
+    // returns author-blind exactly like `blocking_finding` while still being
+    // `commentBlocking`. So do not delete this clause as redundant with
+    // Surface 1, and do not re-justify it from the authorUnknown-carrying
+    // route. `evidence-truth.test.ts` pins both reachable routes and keeps the
+    // memoized one as the negative control.
     if (formalAttestingReview !== undefined && !commentBlocking) {
       const prAuthorLogin = await readPrAuthor();
       // An unread author leaves this false: it cannot establish independence,

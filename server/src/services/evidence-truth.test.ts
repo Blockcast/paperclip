@@ -212,6 +212,16 @@ describe("buildGithubTruthProbe", () => {
   // while `probeFailed` stays honest, because a readable distinct author could
   // genuinely have cleared the carry. Nothing else stops a future edit from
   // collapsing this route into the `not_evaluated` one.
+  //
+  // INERT against the `&& !commentBlocking` clause, not a guard for it (Ally
+  // review of #2143): `reviews: []` leaves `formalAttestingReview` undefined, so
+  // that `if` short-circuits on its FIRST conjunct and `!commentBlocking` is
+  // never evaluated. It survives reverting the clause because Surface 2 never
+  // reaches the read — not because the memo makes Surface 2 free. It IS
+  // discriminating against a different mutation: moving the suppression up onto
+  // Surface 1's `authorUnknown` read at :283 flips `probeFailed` to `false` and
+  // turns this red. So do not read it as this clause's guard and delete the
+  // blocking-route case below as redundant with it.
   it("an unreadable author on the CARRIED-finding route keeps the red and still reports", async () => {
     const r = await buildGithubTruthProbe(
       deps({
@@ -427,10 +437,12 @@ describe("buildGithubTruthProbe", () => {
   // The reachable route is `blocking_finding`, which is author-blind by design
   // (`pr-comment-review-gate.ts`, "a finding is a finding whoever wrote it") so
   // Surface 1 never reads the author and Surface 2's read is a REAL extra call.
-  // NOT the `carried_finding` route the review named: that one carries
-  // `authorUnknown` forward on purpose, so Surface 1 has already read and the
-  // memo makes Surface 2 free — the test below this one pins that, and a guard
-  // written against it would survive reverting the fix.
+  // NOT the `authorUnknown`-carrying `carried_finding` sub-shape the review
+  // named: `authorUnknown` rides that route only via `withheldPositive`, which
+  // needs a `## Ally` body attesting this head — so Surface 1 has already read,
+  // the memo makes Surface 2 free, and a guard written against it would survive
+  // reverting the fix. The grammar-failing carried sub-shape DOES reach this
+  // read (Ally review of #2143); it is not excluded, only the memoized one is.
   //
   // Two rows are load-bearing. Surface 2 keys `formalAttestingReview` off the
   // newest at-head REVIEW, so the blocking row has to be an issue COMMENT: one
@@ -455,6 +467,39 @@ describe("buildGithubTruthProbe", () => {
     expect(r.probeFailed).toBe(false);
     expect(r.diagnostics.filter((d) => d.startsWith("github-truth-probe-failed:pr_author:"))).toHaveLength(0);
     // And the red is untouched: suppressing the read must not soften the verdict.
+    expect(r.detections["review:ally-clean"]).toBeUndefined();
+  });
+
+  // The SECOND reachable route, and the one that proves the exclusion in the
+  // call-site comment is not a universal (Ally review of #2143). `carried_finding`
+  // attaches `authorUnknown` only through `withheldPositive`, which needs a body
+  // passing `isAllyConsolidatedReviewComment` at this head — so a body that
+  // attests the head WITHOUT the `## Ally` heading carries no `authorUnknown`,
+  // Surface 1 never reads, and the carry arrives here author-blind exactly like
+  // `blocking_finding`. Measured on revert: `authorCalls` 0 -> 1 and
+  // `probeFailed` false -> true, so this is discriminating and not a duplicate
+  // of the case above — the two differ in WHICH surface supplies the red.
+  it("an author-blind CARRIED finding also suppresses the Surface 2 read", async () => {
+    let authorCalls = 0;
+    const r = await buildGithubTruthProbe(
+      deps({
+        fetchPrAuthorLogin: async () => {
+          authorCalls += 1;
+          return null;
+        },
+        listReviewerSurfaces: async () => ({
+          // Attests this head, so `formalAttestingReview` is defined — but fails
+          // Surface 1's grammar, so it cannot disposition the older finding.
+          reviews: [
+            { login: ALLY, body: attestedNoHeading, state: "COMMENTED", commitId: HEAD, submittedAt: "2026-09-06T01:00:00Z" },
+          ],
+          comments: [{ login: ALLY, body: dirtyAtOld, createdAt: "2026-09-06T00:00:00Z" }],
+        }),
+      }),
+    )({ workProducts: [wp()] });
+    expect(authorCalls).toBe(0);
+    expect(r.probeFailed).toBe(false);
+    expect(r.diagnostics.filter((d) => d.startsWith("github-truth-probe-failed:pr_author:"))).toHaveLength(0);
     expect(r.detections["review:ally-clean"]).toBeUndefined();
   });
 
