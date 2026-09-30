@@ -3670,7 +3670,7 @@ function ensureRegistry(): {
         + "at least 289x (max_turns_continuation 300s, ccrotate_capacity 1080s as a 15min clamp plus "
         + "20% forward jitter, dependency_blocked "
         + "3600s, transient_failure 9000s on the backoff ladder but up to 86700s when an unclamped "
-        + "upstream retryNotBefore floor is just under the 24h horizon and takes up to 5min forward "
+        + "upstream retryNotBefore floor is at or just under the 24h horizon and takes up to 5min forward "
         + "jitter; a floor actually clamped to 24h carries no forward jitter, and it is unbounded for a "
         + "provider_quota floor, which is never clamped), so any single threshold across all of "
         + "them fires on designed backoff in one class while missing a 5x clamp breach in another. "
