@@ -417,6 +417,47 @@ describe("buildGithubTruthProbe", () => {
     expect(r.diagnostics.filter((d) => d.startsWith("github-truth-probe-failed:pr_author:"))).toHaveLength(1);
   });
 
+  // ...but ONLY while the author can still change the answer. Once Surface 1 is
+  // already blocking, `formalClean` cannot reach the `out.clean` conjunction, so
+  // the Surface 2 read buys nothing and an unreadable `GET /pulls/{n}` turns a
+  // probe that HAS a red verdict into `probeFailed` — which `evidence-gate.ts`
+  // reads as "could not ask", suppressing the `PAPERCLIP_EVIDENCE_UNLABELED_BLOCK`
+  // promotion and blaming the wrong cause in the runbook (Ally review of #1966).
+  //
+  // The reachable route is `blocking_finding`, which is author-blind by design
+  // (`pr-comment-review-gate.ts`, "a finding is a finding whoever wrote it") so
+  // Surface 1 never reads the author and Surface 2's read is a REAL extra call.
+  // NOT the `carried_finding` route the review named: that one carries
+  // `authorUnknown` forward on purpose, so Surface 1 has already read and the
+  // memo makes Surface 2 free — the test below this one pins that, and a guard
+  // written against it would survive reverting the fix.
+  //
+  // Two rows are load-bearing. Surface 2 keys `formalAttestingReview` off the
+  // newest at-head REVIEW, so the blocking row has to be an issue COMMENT: one
+  // row cannot be both blocking and attesting-clean.
+  it("an already-blocking comment verdict suppresses the Surface 2 author read entirely", async () => {
+    let authorCalls = 0;
+    const r = await buildGithubTruthProbe(
+      deps({
+        fetchPrAuthorLogin: async () => {
+          authorCalls += 1;
+          return null;
+        },
+        listReviewerSurfaces: async () => ({
+          reviews: [
+            { login: ALLY, body: clean, state: "COMMENTED", commitId: HEAD, submittedAt: "2026-09-06T00:00:00Z" },
+          ],
+          comments: [{ login: ALLY, body: dirty, createdAt: "2026-09-06T01:00:00Z" }],
+        }),
+      }),
+    )({ workProducts: [wp()] });
+    expect(authorCalls).toBe(0);
+    expect(r.probeFailed).toBe(false);
+    expect(r.diagnostics.filter((d) => d.startsWith("github-truth-probe-failed:pr_author:"))).toHaveLength(0);
+    // And the red is untouched: suppressing the read must not soften the verdict.
+    expect(r.detections["review:ally-clean"]).toBeUndefined();
+  });
+
   // Both surfaces now want the author, and the read is memoized so the pinned
   // MAX_SERIAL_CALLS relation to PROBE_DEADLINE_MS still holds. This drives the
   // path where BOTH ask: Surface 1 refuses the self-attestation, Surface 2 then
