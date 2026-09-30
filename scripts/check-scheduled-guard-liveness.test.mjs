@@ -1607,7 +1607,7 @@ describe("the run index is not self-consistent across filters (BLO-38286)", () =
   const COMPLETED_COUNT = 1058;
   const ALL_COUNT = 632;
 
-  function observation({ completedCount, allCount, newest = true }) {
+  function observation({ completedCount, allCount, newest = true, crossCheckNewest = CLAIMED }) {
     return {
       state: "active",
       name: "Relay SSL Multicert Guard",
@@ -1617,7 +1617,7 @@ describe("the run index is not self-consistent across filters (BLO-38286)", () =
         : null,
       // Timestamp-agreeing, exactly as production saw it: the cross-check is
       // readable and is NOT newer, so the PEN-3379 arm has nothing to fire on.
-      crossCheck: { newestCompletedAt: CLAIMED, allCount },
+      crossCheck: { newestCompletedAt: crossCheckNewest, allCount },
     };
   }
 
@@ -1643,14 +1643,43 @@ describe("the run index is not self-consistent across filters (BLO-38286)", () =
   });
 
   // The same distrusted index makes a STRONGER claim on this path, so it is
-  // gated too — `classifyWatched` spends the cross-check on both reasons.
+  // gated too: `classifyWatched` spends the cross-check on both reasons. The
+  // cross-check found no completion either, so without the proof this is the
+  // `never-completed` red (not the cross-check-refuted `stopped` one below).
   it("suppresses 'never completed' on the same proof", () => {
-    const result = classify(
-      observation({ completedCount: COMPLETED_COUNT, allCount: ALL_COUNT, newest: false }),
-    );
+    const obs = { completedCount: COMPLETED_COUNT, allCount: ALL_COUNT, newest: false, crossCheckNewest: null };
+    assert.equal(classify(observation({ ...obs, completedCount: 1 })).reason, "never-completed");
+
+    const result = classify(observation(obs));
 
     assert.equal(result.status, "unknown");
     assert.equal(result.reason, "index-inconsistent");
+  });
+
+  // THE BOUND (Ally review of 3216098b). The proof says the reads are
+  // untrustworthy, not that the guard is alive, so it must not override a red
+  // the cross-check proves on its own: a strictly better completion that is
+  // itself past the bar means the guard is dead by either read. Before this
+  // arm existed both fixtures below red, and it must not mute them.
+  it("does not preempt a red the cross-check's own better timestamp proves", () => {
+    const stoppedAt = "2026-09-20T00:00:00Z"; // newer than CLAIMED, still ~248h old
+    for (const obs of [
+      observation({ completedCount: COMPLETED_COUNT, allCount: ALL_COUNT, crossCheckNewest: stoppedAt }),
+      observation({ completedCount: COMPLETED_COUNT, allCount: ALL_COUNT, newest: false }),
+    ]) {
+      const result = classify(obs);
+      assert.equal(result.status, "stale", `newest=${obs.newest?.updatedAt ?? null}`);
+      assert.equal(result.reason, "stopped");
+      assert.equal(result.ageMinutes, Math.floor((NOW - Date.parse(obs.crossCheck.newestCompletedAt)) / 60000));
+    }
+
+    // Deferring is not an unconditional red: a FRESH better completion is
+    // suppressed by the timestamp arm itself, on evidence the guard is alive.
+    const fresh = classify(
+      observation({ completedCount: COMPLETED_COUNT, allCount: ALL_COUNT, crossCheckNewest: "2026-09-30T08:30:00Z" }),
+    );
+    assert.equal(fresh.status, "unknown");
+    assert.equal(fresh.reason, "cross-check-disagreement");
   });
 
   // Without this, an arm that returned `unknown` unconditionally would pass
