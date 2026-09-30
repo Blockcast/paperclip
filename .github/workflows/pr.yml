@@ -1410,7 +1410,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: vitest-report-${{ matrix.group }}-${{ matrix.shard_count == '' && 'all' || matrix.shard_index }}-${{ github.run_attempt }}
-          path: /tmp/vitest-reports/*.json
+          path: ${{ env.PAPERCLIP_VITEST_REPORT_DIR }}/*.json
           retention-days: 14
           if-no-files-found: ignore
 
