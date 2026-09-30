@@ -701,6 +701,7 @@ describe("prompt-bundle skill symlinks carry POD addresses (BLO-37961)", () => {
       podRootDir: string;
       serverSkillSource: string;
       podSkillSource: string;
+      offMountSkillSource: string;
     }) => Promise<T>,
   ): Promise<T> {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "blo37961-"));
@@ -710,10 +711,13 @@ describe("prompt-bundle skill symlinks carry POD addresses (BLO-37961)", () => {
       const serverMount = path.join(root, "srv-mnt");
       const serverSkillSource = path.posix.join(serverMount, volumeRelativeSkill);
       const podSkillSource = path.posix.join(podMount, volumeRelativeSkill);
+      // `resolveManagedSkillsRoot` under a PAPERCLIP_HOME that is NOT under the
+      // server mount: on no volume at all, so `toPodAddress` cannot translate it.
+      const offMountSkillSource = path.posix.join(root, "home", volumeRelativeSkill);
       // Same bytes, two mount points. Both carry a real SKILL.md because the
       // server hashes the source tree to derive the bundle key, so a source
       // that does not exist server-side never reaches the symlink code at all.
-      for (const dir of [serverSkillSource, podSkillSource]) {
+      for (const dir of [serverSkillSource, podSkillSource, offMountSkillSource]) {
         await fs.mkdir(dir, { recursive: true });
         await fs.writeFile(path.join(dir, "SKILL.md"), "---\nname: probe\n---\n", "utf8");
       }
@@ -723,6 +727,7 @@ describe("prompt-bundle skill symlinks carry POD addresses (BLO-37961)", () => {
         podRootDir: path.posix.join(podMount, "instances/default/data/k8s-isolation/acme-co/agent-1/prompt-cache"),
         serverSkillSource,
         podSkillSource,
+        offMountSkillSource,
       });
     } finally {
       vi.unstubAllEnvs();
@@ -879,6 +884,106 @@ describe("prompt-bundle skill symlinks carry POD addresses (BLO-37961)", () => {
 
       expect(await linkTarget(bundle)).toBe(podSkillSource);
       expect(await linkTarget(bundle, "paperclip")).toBe("/app/skills/paperclip");
+    });
+  });
+
+  // Ally review of #2114 (Important): `toPodAddress`'s "not under the server
+  // mount" return is right for an IMAGE path only. A catalog-backed source is a
+  // PAPERCLIP_HOME path, and the server mount is `SELF_POD_DATA_MOUNT_PATH`; where
+  // those diverge the source passes through untranslated and dangles in the pod.
+  // Keyed on the pod mount alone, as `prompt_bundle_off_volume` is.
+  const catalogKey = skillEntry("").key;
+  async function skillOffVolumeWarnings(run: () => Promise<unknown>): Promise<Array<Record<string, unknown>>> {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await run();
+      return warn.mock.calls
+        .map(([line]) => JSON.parse(String(line)) as Record<string, unknown>)
+        .filter((entry) => entry.event === "claude_k8s.prompt_bundle_skill_off_volume");
+    } finally {
+      warn.mockRestore();
+    }
+  }
+
+  it("reports a catalog-backed source toPodAddress cannot translate, with or without the key set", async () => {
+    await withVolume(async ({ podMount, serverMount, podRootDir, offMountSkillSource }) => {
+      // Omitting the set defaults every entry to catalog-backed, the same
+      // direction `buildClaudePromptBundleKey` takes, so it must report too.
+      for (const catalogBackedSkillKeys of [new Set([catalogKey]), undefined]) {
+        const warnings = await skillOffVolumeWarnings(() =>
+          prepareClaudePromptBundle({
+            companyId,
+            skills: [skillEntry(offMountSkillSource)],
+            instructionsContents: null,
+            rootDir: podRootDir,
+            podDataMountPath: podMount,
+            serverDataMountPath: serverMount,
+            catalogBackedSkillKeys,
+            onLog,
+          }),
+        );
+        expect(warnings).toEqual([
+          expect.objectContaining({
+            skillKey: catalogKey,
+            linkTarget: offMountSkillSource,
+            podDataMountPath: podMount,
+            serverDataMountPath: serverMount,
+          }),
+        ]);
+      }
+    });
+  });
+
+  it("reports it even when the two mounts coincide", async () => {
+    await withVolume(async ({ podMount, podRootDir, offMountSkillSource }) => {
+      // Equal mounts do not put a PAPERCLIP_HOME path on the volume. Guards
+      // against gating on `pod !== server`.
+      const warnings = await skillOffVolumeWarnings(() =>
+        prepareClaudePromptBundle({
+          companyId,
+          skills: [skillEntry(offMountSkillSource)],
+          instructionsContents: null,
+          rootDir: podRootDir,
+          podDataMountPath: podMount,
+          serverDataMountPath: podMount,
+          catalogBackedSkillKeys: new Set([catalogKey]),
+          onLog,
+        }),
+      );
+      expect(warnings).toHaveLength(1);
+    });
+  });
+
+  it("does not report a followable catalog link, a non-catalog entry, or unknown mounts", async () => {
+    await withVolume(async ({ podMount, serverMount, podRootDir, serverSkillSource, offMountSkillSource }) => {
+      const catalog = new Set([catalogKey]);
+      const legs = [
+        // Translated onto the pod mount: followable.
+        { source: serverSkillSource, keys: catalog, pod: podMount, server: serverMount },
+        // Mounts coincide, so `toPodAddress` returns the source UNCHANGED, yet it
+        // is on the mount and followable. "Unchanged" is not the defect.
+        { source: serverSkillSource, keys: catalog, pod: serverMount, server: serverMount },
+        // Same off-mount path, only the discriminator differs: an image entry
+        // is off the volume by design.
+        { source: offMountSkillSource, keys: new Set<string>(), pod: podMount, server: serverMount },
+        // No pod mount, nothing to compare against.
+        { source: offMountSkillSource, keys: catalog, pod: undefined, server: undefined },
+      ];
+      const warnings = await skillOffVolumeWarnings(async () => {
+        for (const leg of legs) {
+          await prepareClaudePromptBundle({
+            companyId,
+            skills: [skillEntry(leg.source)],
+            instructionsContents: null,
+            rootDir: podRootDir,
+            podDataMountPath: leg.pod,
+            serverDataMountPath: leg.server,
+            catalogBackedSkillKeys: leg.keys,
+            onLog,
+          });
+        }
+      });
+      expect(warnings).toEqual([]);
     });
   });
 });
