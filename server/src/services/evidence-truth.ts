@@ -390,18 +390,15 @@ async function probeOne(
     // artifact of record is a formal review, reads `review:ally-clean` for a
     // head with a live accepted residual (BLO-36903).
     //
-    // Hoisted out of `formalClean` because it is also a cross-surface VETO
-    // below, and deliberately NOT keyed on the head attestation the way
-    // `formalClean` is: as a veto its fail direction is inverted, so a body
-    // that accepts a residual without attesting a head should still suppress
-    // the other surface's clean rather than be ignored (BLO-38032 tracks the
-    // asymmetry).
+    // Enforced ONLY as the cross-surface veto on `out.clean` below, not as an
+    // extra condition on `formalClean`. Adding it in both places is redundant:
+    // `formalClean` feeds nothing but that veto, so the second copy changes no
+    // detection and no test can distinguish it (verified by mutation). It also
+    // saves no work — the comment surface reads the PR author on this same path
+    // regardless — so the obvious "short-circuit before the author read"
+    // justification for keeping it is false. Left in one place on purpose.
     const formalDeferred = newest !== undefined && countAllyDeferredPriorFindings(newest.body) > 0;
-    //
-    // Tested before the author read, not after: a deferral settles `formalClean`
-    // as false on its own, so `readPrAuthor` — a network fetch that also sets
-    // `failed` on error — must not run to reach a conclusion already reached.
-    if (formalAttestingReview !== undefined && !formalDeferred) {
+    if (formalAttestingReview !== undefined) {
       const prAuthorLogin = await readPrAuthor();
       // An unread author leaves this false: it cannot establish independence,
       // and `readPrAuthor` has already set `failed` and reported it.
