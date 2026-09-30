@@ -2177,6 +2177,35 @@ describe("teardownCancelledJob: external-cancel path (BLO-35486)", () => {
     }
   });
 
+  // Ally review on #2116: a successful list is not evidence the delete landed.
+  // `list` and `deletecollection` are separate verbs; a Role granting pods
+  // `list` but not `deletecollection` (or a 5xx on the delete alone) sees a pod
+  // that was never marked Terminating. Failing open there reaps the run
+  // Secrets under a pod that can still start, the same defect as above.
+  it("retains the Job when the pod delete is refused even though the list sees the pod", async () => {
+    vi.useFakeTimers();
+    try {
+      mockCoreDeleteCollectionPods.mockRejectedValue(
+        Object.assign(new Error("pods is forbidden"), { code: 403 }),
+      );
+      mockCoreListPods.mockResolvedValue({ items: [{ metadata: { name: "pod-live" } }] });
+      const onLog = vi.fn().mockResolvedValue(undefined);
+
+      const promise = teardownCancelledJob("paperclip", "ac-job", onLog);
+      await vi.advanceTimersByTimeAsync(90_000);
+      await promise;
+
+      // Guard against a vacuous pass: the list must actually have seen the pod.
+      expect(mockCoreListPods).toHaveBeenCalled();
+      expect(mockBatchDeleteJob).not.toHaveBeenCalled();
+      const warning = onLog.mock.calls.map(([, m]: [string, string]) => m).join("");
+      expect(warning).toContain("the pod delete was refused");
+      expect(warning).toContain("leaving the Job");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   // The `unobserved` verdict means *no* list ever succeeded — not "the last one
   // failed". Deciding it per-poll instead would let a single blip at the
   // deadline, after minutes of clean reads showing a Terminating pod, flip a
