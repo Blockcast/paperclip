@@ -30,11 +30,13 @@ function isVulnerableBraceExpansionVersion(version) {
     isBetweenInclusive(version, [2, 0, 0], [2, 1, 3]) ||
     isBetweenInclusive(version, [3, 0, 0], [3, 0, 5]) ||
     major === 4 ||
-    (major === 5 && minor === 0 && patch <= 8)
+    // GHSA-qhr7-859c-m2p7 / CVE-2026-102278 (BLO-38294) widened the v5 range:
+    // >= 4.0.0, < 5.0.11 is vulnerable, so 5.0.9 and 5.0.10 are no longer safe.
+    (major === 5 && minor === 0 && patch <= 10)
   );
 }
 
-test("brace-expansion resolves at the GHSA-rgw5-rvv9-x895 patched floor", async () => {
+test("brace-expansion resolves at the GHSA-qhr7-859c-m2p7 patched floor", async () => {
   const tmpRoot = await mkdtemp(join(tmpdir(), "paperclip-brace-expansion-"));
   const fixtureRoot = join(tmpRoot, "repo");
 
@@ -60,20 +62,20 @@ test("brace-expansion resolves at the GHSA-rgw5-rvv9-x895 patched floor", async 
     );
     const lockfile = await readFile(join(fixtureRoot, "pnpm-lock.yaml"), "utf8");
 
-    assert.equal(packageJson.pnpm.overrides["brace-expansion"], "5.0.9");
+    assert.equal(packageJson.pnpm.overrides["brace-expansion"], "5.0.11");
     assert.equal(
-      packageJson.pnpm.patchedDependencies["brace-expansion@5.0.9"],
-      "patches/brace-expansion@5.0.9.patch",
+      packageJson.pnpm.patchedDependencies["brace-expansion@5.0.11"],
+      "patches/brace-expansion@5.0.11.patch",
     );
     assert.match(
       lockfile,
-      /^  brace-expansion@5\.0\.9:\n    resolution: \{integrity: .+\}$/m,
+      /^  brace-expansion@5\.0\.11:\n    resolution: \{integrity: .+\}$/m,
     );
     assert.match(
       lockfile,
-      /^  brace-expansion@5\.0\.9:\n    hash: \S+\n    path: patches\/brace-expansion@5\.0\.9\.patch$/m,
+      /^  brace-expansion@5\.0\.11:\n    hash: \S+\n    path: patches\/brace-expansion@5\.0\.11\.patch$/m,
     );
-    assert.match(lockfile, /^  brace-expansion@5\.0\.9\(patch_hash=[^)]+\):$/m);
+    assert.match(lockfile, /^  brace-expansion@5\.0\.11\(patch_hash=[^)]+\):$/m);
 
     const vulnerableVersions = Array.from(
       lockfile.matchAll(/^  brace-expansion@(\d+)\.(\d+)\.(\d+)(?=[:(])/gm),
