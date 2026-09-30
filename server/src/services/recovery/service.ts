@@ -7526,17 +7526,30 @@ export function recoveryService(
   // PEN-3636: phase accounting for the open sweep, or `null` when no sweep is running.
   //
   // Threaded the same way, and for the same reason, as the three counters above:
-  // `escalateStrandedAssignedIssue` has no `result` in scope and many call sites, and it
-  // rests on the same stated invariant — every one of those call sites is lexically
-  // inside `reconcileStrandedAssignedIssues`. Enumerate them before relying on that:
-  //   grep -n 'await escalateStrandedAssignedIssue({' server/src/services/recovery/service.ts
-  // (that grep also matches its own prescription line here and at the BLO-8050 comment
-  // above, so subtract those before comparing).
+  // `escalateStrandedAssignedIssue` has no `result` in scope and many call sites.
   //
-  // Unlike the counters, a misattribution here is bounded to a log line: every read
-  // is guarded on `activePassTimer` being non-null, so a caller outside a sweep times
-  // nothing rather than crashing, and a caller during a sweep would add its own
-  // latency to a diagnostic total. Neither affects control flow.
+  // ⚠ It is NOT true that every call site is inside the sweep, and an earlier revision
+  // of this comment claimed it was. The direct-call grep
+  //   grep -n 'await escalateStrandedAssignedIssue({' server/src/services/recovery/service.ts
+  // only covers internal calls; this function is also re-exported on the object
+  // `recoveryService()` returns, so an external consumer calls it as a member and matches
+  // no direct-call grep at all. That half:
+  //   grep -rn '\.escalateStrandedAssignedIssue(' server/src --include='*.ts' | grep -v 'recovery/service.ts'
+  // returns 63 calls in `__tests__/issue-recovery-actions.test.ts` and, crucially, TWO
+  // production calls in `services/heartbeat.ts` (plan-approval resume failure; blocked
+  // PR-review-gate promotion). Both are event-driven and run in this same process, so
+  // they CAN interleave with a sweep.
+  //
+  // What that costs, stated rather than hidden. Control flow: nothing. Every read below
+  // is guarded on `activePassTimer` being non-null, so a caller outside a sweep takes the
+  // untimed arm rather than crashing — and the 63 test calls are that arm's regression
+  // coverage. Accuracy: an interleaved heartbeat escalation adds its own lock waits to the
+  // pass's `escalate.*` totals. That is a diagnostic inaccuracy only, and a small one —
+  // both call sites are event-driven (one per failed plan-approval resume, one per blocked
+  // PR-review-gate promotion), against a sweep that runs the escalate path ~1000 times per
+  // pass. If the `escalate.*` numbers ever need to be exact rather than indicative, those
+  // two sites are where the contamination enters; scope the timer before trusting them to
+  // the last millisecond.
   let activePassTimer: PassTimer | null = null;
 
   async function escalateStrandedAssignedIssue(input: {
@@ -8687,16 +8700,71 @@ export function recoveryService(
     // it would have to be re-indented wholesale.
     const passTimer = createPassTimer();
     activePassTimer = passTimer;
+    // Filled by the inner function once the candidate query resolves. `null` means
+    // the pass died before it had a population — which is itself the reading, and
+    // is why this is not defaulted to 0: a pass that threw in `candidateQuery` and
+    // a pass that genuinely found no candidates are different failures.
+    const scanned: { candidates: number | null } = { candidates: null };
+    let completed = false;
     try {
-      return await runStrandedAssignedIssueSweep(opts, passTimer);
+      const swept = await runStrandedAssignedIssueSweep(opts, passTimer, scanned);
+      completed = true;
+      return swept;
     } finally {
       activePassTimer = null;
+      // PEN-3636: one line per pass, unconditional, emitted HERE in the `finally`
+      // rather than at the tail of the inner function.
+      //
+      // In the `finally` because a pass that THROWS is the one most worth
+      // diagnosing, and emitting from the tail would discard its entire
+      // accumulated timing. The sweep's per-issue error boundary does not cover
+      // this: `candidateQuery`, the `orphanBlockerSweep` and the whole post-loop
+      // tail sit outside it, and the sweep body has no top-level try/catch. So a
+      // pool timeout or a dropped connection part-way through a pass already
+      // measured at up to 86 minutes unwinds straight through here. This is
+      // `pass-timing.ts`'s own argument for recording a throwing PHASE in a
+      // `finally`, applied one level up to the pass.
+      //
+      // Unconditional on purpose, unlike the funnel line in the sweep. That one is
+      // gated on a non-empty suppressed population so a quiet sweep stays quiet;
+      // this one is the record of where a pass's wall clock went, and a FAST pass
+      // is exactly the observation the slow ones have to be compared against.
+      // Gating it would leave only slow passes in the log and make the comparison
+      // impossible.
+      //
+      // Reading it: `phases` is ordered most-expensive-first, and they are NESTED
+      // spans rather than a partition — see `PassTimingSummary.phases`.
+      // `candidates.p99Ms` next to `candidates.p50Ms` is the first thing to check:
+      // production pass duration varied 15.7x on a workload that varied 9%, so the
+      // open question is whether every candidate is uniformly slower or a thin tail
+      // dominates, and those two numbers separate those cases. `slowest` then names
+      // the tail's issue ids. Check `completed` before comparing across passes.
+      //
+      // Wrapped in its own try/catch because a `finally` that throws during unwind
+      // REPLACES the pass's real error. Diagnostics must never mask the fault they
+      // exist to explain.
+      try {
+        logger.info(
+          {
+            ...passTimer.summary(),
+            candidatesScanned: scanned.candidates,
+            // Distinguishes a complete pass from a truncated one. Without it a
+            // partial total reads exactly like a whole one, and every phase total
+            // beside it would be silently understated.
+            completed,
+          },
+          "stranded assigned issue sweep phase timing",
+        );
+      } catch (err) {
+        logger.warn({ err }, "failed to emit stranded assigned issue sweep phase timing");
+      }
     }
   }
 
   async function runStrandedAssignedIssueSweep(
     opts: { issueCreatedAtGte?: Date | null } | undefined,
     passTimer: PassTimer,
+    scanned: { candidates: number | null },
   ) {
     const dependencyWaitEscalationSuppressedAtSweepStart = dependencyWaitEscalationSuppressedTotal;
     const dependencyWaitEscalationSuppressedDependencyReadyAtSweepStart =
@@ -8724,6 +8792,10 @@ export function recoveryService(
         ),
       )
       .orderBy(asc(issues.companyId), asc(issues.assigneeAgentId), asc(issues.createdAt), asc(issues.id)));
+    // PEN-3636: published to the wrapper immediately, so a pass that throws later
+    // still reports the population it was working against. Read only by the
+    // wrapper's `finally`; nothing branches on it.
+    scanned.candidates = candidates.length;
 
     const result = {
       assignmentDispatched: 0,
@@ -10377,23 +10449,9 @@ export function recoveryService(
       );
     }
 
-    // PEN-3636: one line per pass, unconditional.
-    //
-    // Unconditional on purpose, unlike the funnel line above. That line is gated on
-    // a non-empty suppressed population so a quiet sweep stays quiet; this one is
-    // the record of where a pass's wall clock went, and a FAST pass is exactly the
-    // observation the slow ones have to be compared against. Gating it would leave
-    // only slow passes in the log and make the comparison impossible.
-    //
-    // Reading it: `phases` is ordered most-expensive-first. `candidates.p99Ms` next
-    // to `candidates.p50Ms` is the first thing to check — production pass duration
-    // varied 15.7x on a workload that varied 9%, so the open question is whether
-    // every candidate is uniformly slower or a thin tail dominates, and those two
-    // numbers separate those cases. `slowest` then names the tail's issue ids.
-    logger.info(
-      { ...passTimer.summary(), candidatesScanned: candidates.length },
-      "stranded assigned issue sweep phase timing",
-    );
+    // PEN-3636: the phase-timing line is NOT emitted here. It is emitted from the
+    // `finally` in `reconcileStrandedAssignedIssues`, which also covers the passes
+    // that throw before reaching this point — see the note at that emit site.
 
     return result;
   }
