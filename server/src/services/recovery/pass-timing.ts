@@ -12,9 +12,16 @@
  *       `candidatesScanned` moved only +/-9% (2095..2284) and `suppressed`
  *       only +/-12% (941..1050).
  *   (B) 84 pass-1 windows, Loki joined to Prometheus at 30 s step
- *       (2026-09-30). Independently reproduces the dispersion -- 146.9..2305.6
- *       ms per candidate, a 15.7x spread -- and is the SOLE source of every
- *       correlation below. n = 84 throughout.
+ *       (2026-09-30). A SECOND EXTRACTION PIPELINE reaching the same dispersion
+ *       -- 146.9..2305.6 ms per candidate, a 15.7x spread -- and the SOLE source
+ *       of every correlation below. n = 84 throughout.
+ *
+ *       That agreement corroborates the INSTRUMENT, not the sample. By 1. below
+ *       this is the same variable as (A)'s 5.5..86.3 min, over windows that
+ *       overlap, and the two ratios agree to three significant figures (15.69x
+ *       against 15.70x) because one quantity was measured twice. What it buys is
+ *       real but narrower than independence: the spread is not an artifact of
+ *       the first query.
  *
  * From (B). These are against ms-per-candidate rather than the raw pass wall
  * clock; by 1. below the two are the same variable here, so the ranking is
@@ -46,7 +53,7 @@
  *    proxy for DB contention, and the direct gauge reads +0.368 --
  *    `paperclip_external_lifecycle_running_runs`, which nobody had enumerated.
  *    The form is WEAKENED, not refuted -- though it saturates rather than
- *    scaling (terciles: 27 runs -> 507 ms, 37 -> 744 ms, 44 -> 736 ms).
+ *    scaling (terciles, from (B): 27 runs -> 507 ms, 37 -> 744 ms, 44 -> 736 ms).
  *
  *    Controlling each candidate driver for the others leaves all of them in
  *    +0.27..+0.43 with none dominant. Two independent reasons to read that band
@@ -54,12 +61,12 @@
  *    and windowing CAN resolve a strong relationship when one exists (positive
  *    control, same 84 windows: `r(pool wait, pool active)` = +0.733), and at
  *    n = 84 the band is significant on its own terms (r = 0.27 -> p = 0.013,
- *    falling below p = 0.001 by r = 0.35). A positive control establishes the
- *    instrument works; it does NOT bound a false-positive rate, which is what
- *    the p-values are for. Note the floor is marginal: four drivers were
- *    tested, so Bonferroni at alpha = 0.05 wants p < 0.0125 and r = 0.27 just
- *    misses it. The body of the band clears that comfortably; its bottom edge
- *    does not.
+ *    falling below p = 0.001 at r = 0.353 -- r = 0.35 is p = 0.0011, just the
+ *    wrong side). A positive control establishes the instrument works; it does
+ *    NOT bound a false-positive rate, which is what the p-values are for. Note
+ *    the floor is marginal: four drivers were tested, so Bonferroni at
+ *    alpha = 0.05 wants p < 0.0125 and r = 0.27 just misses it. The body of the
+ *    band clears that comfortably; its bottom edge does not.
  *
  *    Lock wait scoped to one hot issue or company appears in NO external
  *    signal, which is why the two lock acquisitions below are timed SEPARATELY
@@ -90,8 +97,9 @@
  * A large `escalate.*` total is equally consistent with lock contention and with
  * pool starvation, and the pool is measurably queued during exactly the passes
  * worth diagnosing: worker pool queue depth rises 1.31 -> 1.89 -> 4.23 from the
- * fastest to the slowest third of passes, and the api pods -- a separate process
- * with its own size-10 pool, which this sweep cannot consume -- queue alongside.
+ * fastest to the slowest third of passes (terciles, from (B)), and the api pods
+ * -- a separate process with its own size-10 pool, which this sweep cannot
+ * consume -- queue alongside.
  * So read these totals against `paperclip_db_pool_waiting_queries`, which is an
  * INDEPENDENT instrument, before attributing them to locks. High phase totals
  * with a flat pool queue is contention; high totals tracking a deep pool queue
