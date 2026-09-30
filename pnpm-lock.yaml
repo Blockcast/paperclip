@@ -30,7 +30,7 @@ overrides:
   js-yaml: '>=4.3.2 <5'
   esbuild: '>=0.28.1 <0.29'
   '@connectrpc/connect-node>undici': '>=6.27.0 <7'
-  jsdom>undici: '>=7.29.0 <8'
+  jsdom>undici: '>=7.29.1 <8'
   multer: '>=2.3.0 <3'
   browserslist: '>=4.28.7 <5'
   react: ^19.2.7
@@ -7166,6 +7166,7 @@ packages:
 
   opencode-ai@1.15.12:
     resolution: {integrity: sha512-Q7iid09tT6hDF9Np+asu+i554lNIaWEavh+Jdii9RNfjGdRwhXwS9mbIJjScp/UGjKkFOgWL7uMpbraHThX3UA==}
+    cpu: [arm64, x64]
     os: [darwin, linux, win32]
     hasBin: true
 
@@ -8159,8 +8160,8 @@ packages:
     resolution: {integrity: sha512-YmfV3YnEDzXRC5lZ2jWtWWHKGUm1zIt8AhesR1tens+HTNv+YZlN/dp6G727LOvMJ8xjP9Be7Y2Sdr96LDm+pg==}
     engines: {node: '>=18.17'}
 
-  undici@7.29.0:
-    resolution: {integrity: sha512-IDxfleLmmbSskfWSUATiN1nfn2rDuvnMOqb5CWR92iIfojA0Ud+ulOAAEQ57LPr9rWmsreUyf5lwyao+7GNNVw==}
+  undici@7.30.0:
+    resolution: {integrity: sha512-dkrQXeHSaoamnItlYbmzG0wFYrM0ZwDxCIg0A7aKjTyyhh9svRzCNFEzV+Vm05/yehjCzjDZ31KXfGEjYSztDQ==}
     engines: {node: '>=20.18.1'}
 
   unidiff@1.0.4:
@@ -14337,7 +14338,7 @@ snapshots:
       saxes: 6.0.0
       symbol-tree: 3.2.4
       tough-cookie: 6.0.1
-      undici: 7.29.0
+      undici: 7.30.0
       w3c-xmlserializer: 5.0.0
       webidl-conversions: 8.0.1
       whatwg-mimetype: 5.0.0
@@ -16524,7 +16525,7 @@ snapshots:
 
   undici@6.27.0: {}
 
-  undici@7.29.0: {}
+  undici@7.30.0: {}
 
   unidiff@1.0.4:
     dependencies:
