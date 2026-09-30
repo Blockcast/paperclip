@@ -111,10 +111,18 @@ test("the General tests job exports the report dir and uploads the reports on fa
     "the upload must be `if: always()` -- a flake ledger is built from the FAILING runs",
   );
   assert.match(step, /uses:\s*actions\/upload-artifact@/, "expected actions/upload-artifact");
+  // The path REFERENCES the job-level env var rather than restating the
+  // literal. Two literals can drift, and this test would only CATCH that
+  // after the fact; one reference cannot drift at all. `env` does resolve in
+  // a step's `with:` -- same action and same key as release-smoke.yml's
+  // "Upload diagnostics" (`path: ${{ env.SMOKE_METADATA_FILE }}`). Worth
+  // pinning because the failure mode here is silent: an unresolved path
+  // matches nothing, and `if-no-files-found: ignore` plus `continue-on-error`
+  // would hide an empty upload behind a green job.
   assert.match(
     step,
-    new RegExp(`path:\\s*${REPORT_DIR}/`),
-    `the upload path must match ${ENV_VAR}`,
+    new RegExp(`path:\\s*\\$\\{\\{ env\\.${ENV_VAR} \\}\\}/`),
+    `the upload path must reference \${{ env.${ENV_VAR} }} so it cannot drift from the job's export`,
   );
   assert.match(
     step,
