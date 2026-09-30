@@ -107,11 +107,10 @@ describe("crash-recovery candidate-index probe tags its caller (BLO-35258)", () 
  * double-warn tag) and delete it with nothing failing.
  *
  * It is not vestigial. Exactly one line is emitted per absent episode, so the
- * caller that won IS the report: `source: "gauge"` means the gauge publisher —
- * registered above both scheduler gates — got there because the gate never ran,
- * i.e. the replica is suppressed and neither recovery path is active.
- * `source: "gate"` means reconciliation is running and skipping ticks. Same
- * message, opposite blast radius.
+ * caller that won IS the report: `source` names which caller observed the
+ * index going absent. It does not say whether the replica is suppressed: the
+ * gauge publisher is issued first in every tick, above both scheduler gates, so
+ * `source: "gauge"` is the usual value on a healthy replica too.
  */
 describe("crash-recovery absent-transition warn tags its caller (BLO-36862)", () => {
   // Non-throwing, unlike the fixture above: an empty catalog result is

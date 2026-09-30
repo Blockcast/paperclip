@@ -18963,13 +18963,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // Which caller probed — and on THIS branch that is the entire
             // report. The latch above emits exactly one line per absence
             // episode, so the caller that won is the only caller the episode
-            // ever names. `source: "gauge"` therefore says the gauge publisher
-            // — registered above both scheduler gates (see this function's doc
-            // comment) — got there because the gate never ran at all, i.e. the
-            // replica is suppressed and NEITHER recovery path is active.
-            // `source: "gate"` says reconciliation is running and skipping
-            // ticks. Same message, opposite blast radius; dropping the field
-            // collapses them.
+            // ever names. That names the caller that observed the transition,
+            // NOT whether the replica is suppressed: both callers share this
+            // one latch in the same scheduler tick, and the gauge publisher is
+            // issued first, above both scheduler gates (see this function's
+            // doc comment), so `source: "gauge"` is the usual value whether or
+            // not the gate ran. `source: "gate"` only says the gate's probe saw
+            // the absence first, e.g. because the gauge's probe failed into the
+            // `catch` path below, which does not set the latch.
             //
             // It is not a double-warn tag here, which is the other reading:
             // the latch read and write above sit in one synchronous block with
