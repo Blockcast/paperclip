@@ -7504,19 +7504,27 @@ export function recoveryService(
   }
 
   // BLO-27463: incremented by the dependency-wait gate inside
-  // `escalateStrandedAssignedIssue`, which has 20 call sites and no `result` in scope.
-  // `reconcileStrandedAssignedIssues` snapshots and diffs it rather than threading an
-  // out-param through every caller. Diagnostic only: two overlapping sweeps would split
+  // `escalateStrandedAssignedIssue`, which has 22 direct call sites and no `result` in
+  // scope. `reconcileStrandedAssignedIssues` snapshots and diffs it rather than threading
+  // an out-param through every caller. Diagnostic only: two overlapping sweeps would split
   // the delta between them, which does not affect any control-flow decision.
   //
-  // Invariant the snapshot/diff accounting depends on: every
+  // ⚠ This accounting was documented as resting on an invariant — "every
   // `escalateStrandedAssignedIssue` call site is lexically inside
-  // `reconcileStrandedAssignedIssues`. If a caller is ever added outside that sweep, its
-  // increments land in whichever sweep happens to be open and the delta silently
-  // misattributes — thread an explicit counter at that point instead of widening this one.
+  // `reconcileStrandedAssignedIssues`" — that does NOT hold, and has not held since before
+  // PEN-3636. The direct-call grep covers only internal calls; the function is also
+  // re-exported on the object `recoveryService()` returns, and
+  //   grep -rn '\.escalateStrandedAssignedIssue(' server/src --include='*.ts' \
+  //     | grep -v 'recovery/service.ts' | grep -v '__tests__'
+  // returns TWO production callers in `services/heartbeat.ts` (:13274, :34750). Their
+  // increments land in whichever sweep happens to be open, so this delta is indicative
+  // rather than exact — the same exposure, entering at the same two sites, that the
+  // PEN-3636 comment below documents for `activePassTimer`. If these counters ever need
+  // to be exact, thread an explicit counter through those callers rather than widening
+  // this one.
   let dependencyWaitEscalationSuppressedTotal = 0;
   // BLO-32668: the two sub-tallies that replace the removed per-issue INFO line. Same
-  // snapshot/diff accounting and the same invariant as the total above.
+  // snapshot/diff accounting, and the same indicative-not-exact caveat, as the total above.
   // `DependencyReady` is the defect shape BLO-27463 cares about (reported
   // `issue_dependencies_blocked` with its blockers already resolved); `Unclassified`
   // is a suppression whose caller had no pre-lock readiness in hand, kept separate so
