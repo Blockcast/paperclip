@@ -3330,6 +3330,17 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     afterEach(() => {
       if (priorGateContext === undefined) delete process.env[GATE_CONTEXT_ENV];
       else process.env[GATE_CONTEXT_ENV] = priorGateContext;
+      // The notice tests below queue a one-shot lookup with
+      // `mockResolvedValueOnce` and consume it in the same test. A test that
+      // fails BETWEEN the queue and the consume leaves the value on the queue,
+      // where the next test consumes it instead of its own -- and because both
+      // values are well-formed lookups, the symptom is the next test asserting
+      // against the wrong merge-impact branch rather than an obvious error.
+      // Nothing else resets this: there is no `resetMocks`/`clearMocks` in the
+      // vitest config. `mockReset()` (vitest >=2) drops the queue and restores
+      // the `test_default` implementation given to `vi.fn()` at the top of this
+      // file, so the unqueued default survives.
+      mockGithubGetPrRequiredStatusContext.mockReset();
     });
 
     async function exhaustPrReviewRun(contextSnapshot: Record<string, unknown>) {
