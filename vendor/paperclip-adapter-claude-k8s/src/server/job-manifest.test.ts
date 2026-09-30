@@ -22,6 +22,7 @@ import {
   parseMemoryQuantityToKiB,
   resolveToolMemoryLimitKb,
   TOOL_MEMORY_LIMIT_CONFIG_KEY,
+  TOOL_MEMORY_LIMIT_FLOOR_KB,
   TOOL_RLIMIT_DIR,
   TOOL_RLIMIT_FILE,
   TOOL_RLIMIT_BASHENV,
@@ -3055,6 +3056,29 @@ describe("tool-child memory cap (BLO-34477)", () => {
       }
     });
 
+    it("raises a derived cap below the node floor to the floor, with a warning", () => {
+      for (const limit of ["128Mi", "512Mi", "1Gi"]) {
+        const warnings: string[] = [];
+        expect(resolveToolMemoryLimitKb({}, limit, (message) => warnings.push(message))).toBe(TOOL_MEMORY_LIMIT_FLOOR_KB);
+        expect(warnings).toHaveLength(1);
+        expect(warnings[0]).toContain(`resources.limits.memory="${limit}"`);
+        expect(warnings[0]).toMatch(/node aborts at startup/);
+        expect(warnings[0]).toMatch(/toolMemoryKb/);
+      }
+      // Exactly at the floor (half of 1536Mi) is not clamped and does not warn.
+      const warnings: string[] = [];
+      expect(resolveToolMemoryLimitKb({}, "1536Mi", (message) => warnings.push(message))).toBe(TOOL_MEMORY_LIMIT_FLOOR_KB);
+      expect(resolveToolMemoryLimitKb({}, "8Gi", (message) => warnings.push(message))).toBe(4 * 1024 * 1024);
+      expect(warnings).toEqual([]);
+    });
+
+    it("never clamps an explicit toolMemoryKb, however small", () => {
+      const warnings: string[] = [];
+      expect(resolveToolMemoryLimitKb({ [TOOL_MEMORY_LIMIT_CONFIG_KEY]: 262144 }, "1Gi", (message) => warnings.push(message))).toBe(262144);
+      expect(resolveToolMemoryLimitKb({ [TOOL_MEMORY_LIMIT_CONFIG_KEY]: 1 }, "128Mi", (message) => warnings.push(message))).toBe(1);
+      expect(warnings).toEqual([]);
+    });
+
     it("degrades an unparseable container memory limit to no cap with a warning instead of aborting the Job", () => {
       const warnings: string[] = [];
       expect(resolveToolMemoryLimitKb({}, "1.5Gi", (message) => warnings.push(message))).toBe(0);
@@ -3287,6 +3311,22 @@ describe("tool-child memory cap (BLO-34477)", () => {
       expect(ulimitD(["zsh", "-c", "printf %s \"$BLO34477_CHAIN\""], env)).toBe("reached");
       // A grandchild inherits it.
       expect(ulimitD(["zsh", "-c", "sh -c 'ulimit -d'"], env)).toBe(String(CAP_KB));
+    });
+
+    // The property operators depend on is that real tool children still run
+    // under the cap, not just that `ulimit -d` reports it. V8 aborts at startup
+    // below ~576 MiB of RLIMIT_DATA, so this pins the floor against V8 growth;
+    // the 256 MiB control proves the probe can fail at all.
+    itOnCapableHost("node starts under the floor cap, and not far below it", () => {
+      const nodeUnder = (limitKb: number): number | null => {
+        const { dir, home } = install(limitKb);
+        return spawnSync("/bin/sh", ["-c", `. '${dir}/rlimit.sh'; exec "$NODE_BIN" -e 1`], {
+          encoding: "utf8",
+          env: { PATH: process.env.PATH ?? "", HOME: home, NODE_BIN: process.execPath },
+        }).status;
+      };
+      expect(nodeUnder(TOOL_MEMORY_LIMIT_FLOOR_KB)).toBe(0);
+      expect(nodeUnder(256 * 1024)).not.toBe(0);
     });
 
     it("a disabled cap leaves every shell at its baseline", () => {
