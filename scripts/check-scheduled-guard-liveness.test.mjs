@@ -290,17 +290,19 @@ describe("classifyGuard — the four PEN-3379 production false positives", () =>
     }
   });
 
-  it("suppresses all four once the unfiltered cross-check contradicts the index", () => {
+  it("clears all four once the unfiltered cross-check contradicts the index", () => {
     for (const fixture of FALSE_POSITIVES) {
       const result = classifyGuard(fixture.workflow, staleIndexObservation(fixture), {
         now: Date.parse(fixture.redAt),
         staleHours: thresholdFor(fixture.workflow),
       });
 
-      assert.equal(result.status, "unknown", `${fixture.workflow} @ ${fixture.redAt} must not red`);
-      assert.equal(result.reason, "cross-check-disagreement");
+      assert.equal(result.status, "ok", `${fixture.workflow} @ ${fixture.redAt} must not red`);
+      assert.equal(result.reason, "corroborated");
       // Re-aged against the completion that really happened: 14-23 min, not ~150h.
       assert.ok(result.ageMinutes < 30, `re-aged to ${result.ageMinutes}m against the real completion`);
+      // The index fault is quantified, not merely noted (PEN-3462).
+      assert.ok(result.indexLagMinutes > 140 * 60, "the index lag is carried on the result");
     }
   });
 
@@ -321,10 +323,13 @@ describe("classifyGuard — the four PEN-3379 production false positives", () =>
 
     assert.equal(summary.staleCount, 0);
     assert.equal(summary.exitCode, 0, "not one of these four may exit non-zero");
-    // Suppressed is not healthy: the headline must not claim they completed.
-    assert.equal(summary.unknownCount, FALSE_POSITIVES.length);
+    // Corroborated IS healthy — the cross-check aged each completion against
+    // the same bar `fresh` uses (PEN-3462). But the index fault that put them
+    // on this path must still be named, or a wedge vanishes into the green.
+    assert.equal(summary.corroboratedCount, FALSE_POSITIVES.length);
+    assert.equal(summary.unknownCount, 0);
     assert.doesNotMatch(summary.headline, /^All \d+ watched/);
-    assert.match(summary.headline, /could not be assessed/);
+    assert.match(summary.headline, /the index is faulty/);
   });
 
   // The other half of the contract. Suppression must be driven by DISAGREEMENT,
@@ -629,12 +634,12 @@ describe("classifyGuard — 'never completed' rests on the same distrusted index
     assert.equal(result.reason, "never-completed");
   });
 
-  it("suppresses when the unfiltered read finds any completion — 'never' is then a fiction", () => {
+  it("clears when the unfiltered read finds any completion inside the bar — 'never' is then a fiction", () => {
     const result = neverCompleted({ newestCompletedAt: "2026-09-18T14:32:34Z" });
 
-    assert.equal(result.status, "unknown");
-    assert.equal(result.reason, "cross-check-disagreement");
-    assert.match(result.detail, /NOT being\s+asserted to have stopped/);
+    assert.equal(result.status, "ok");
+    assert.equal(result.reason, "corroborated");
+    assert.match(result.detail, /confirms this\s+guard is alive/);
   });
 
   // "Never completed" is refuted by ANY completion, however old. But refuting
@@ -653,13 +658,13 @@ describe("classifyGuard — 'never completed' rests on the same distrusted index
     assert.equal(result.lastRunUrl, null);
   });
 
-  // Inside the bar by one minute: 2h44m against a 2h45m threshold still reads
-  // as a disagreement, not a stop.
-  it("still suppresses when the cross-check completion sits just inside the bar", () => {
+  // Inside the bar by one minute: 2h44m against a 2h45m threshold is a live
+  // guard on the corroborating read, not a stop.
+  it("still clears when the cross-check completion sits just inside the bar", () => {
     const result = neverCompleted({ newestCompletedAt: "2026-09-18T12:06:00Z" });
 
-    assert.equal(result.status, "unknown");
-    assert.equal(result.reason, "cross-check-disagreement");
+    assert.equal(result.status, "ok");
+    assert.equal(result.reason, "corroborated");
   });
 
   // The other side of that minute: EXACTLY on the bar (12:05Z, 165m) is past it,
@@ -1007,5 +1012,146 @@ describe("summarize — 'could not read' is a different claim from 'stopped exec
 
     assert.equal(summary.exitCode, 0);
     assert.match(summary.headline, /All 7 watched scheduled guards have completed/);
+  });
+});
+
+// PEN-3462 asked for an escalation bounded at N consecutive suppressions. The
+// measurement says that instrument cannot work, and these tests pin WHY, so
+// the counter is not reintroduced later on the intuition that it should exist.
+//
+// Population: 297 detector runs, 2026-09-18T01:13Z -> 2026-09-30T08:57Z.
+// 72 verdict-bearing reds across 7 guards, and ground truth at read time was
+// that all 7 read state=active with a completion inside the hour. 72/72 false
+// positives; the detector has still never produced a true positive.
+describe("cross-check disagreement is a liveness CONFIRMATION, not a blind spot (PEN-3462)", () => {
+  // Three consecutive detector runs, all real, all 2026-09-30. Each cites the
+  // same pinned index entry (2026-09-12T04:32:39Z, wedged for 18 days) while
+  // the guard had in fact completed minutes earlier.
+  const CONSECUTIVE = [
+    { runAt: "2026-09-30T07:05:45Z", actual: "2026-09-30T06:58:54Z" },
+    { runAt: "2026-09-30T07:57:15Z", actual: "2026-09-30T07:50:43Z" },
+    { runAt: "2026-09-30T08:57:24Z", actual: "2026-09-30T08:44:18Z" },
+  ];
+  const WORKFLOW = "relay-ssl-multicert-guard.yml";
+  const PINNED = "2026-09-12T04:32:39Z";
+
+  const observationAt = (actual) => ({
+    state: "active",
+    name: "Relay SSL Multicert",
+    newest: {
+      updatedAt: PINNED,
+      conclusion: "success",
+      htmlUrl: "https://github.com/Blockcast/paperclip/actions/runs/1",
+    },
+    crossCheck: { newestCompletedAt: actual },
+  });
+
+  const classifyStreak = () =>
+    CONSECUTIVE.map(({ runAt, actual }) =>
+      classifyGuard(WORKFLOW, observationAt(actual), {
+        now: Date.parse(runAt),
+        staleHours: thresholdFor(WORKFLOW),
+      }),
+    );
+
+  // The load-bearing one. A counter would have been incremented three times
+  // here; what it would have been counting is three successful liveness
+  // confirmations, each carrying a completion inside the freshness bar.
+  it("drives three consecutive disagreements for one guard and confirms liveness every time", () => {
+    const results = classifyStreak();
+
+    assert.equal(results.length, 3);
+    for (const [index, result] of results.entries()) {
+      assert.equal(result.status, "ok", `run ${index + 1} must confirm, not withhold`);
+      assert.equal(result.reason, "corroborated");
+      // Inside the 2.75h bar by a wide margin: 6-13 minutes, not 400+ hours.
+      assert.ok(
+        result.ageMinutes < thresholdFor(WORKFLOW) * 60,
+        `run ${index + 1} re-aged to ${result.ageMinutes}m, inside the bar`,
+      );
+    }
+  });
+
+  // An N-consecutive escalation would fire here. It must not: nothing is wrong
+  // with these guards, and paging on this is strictly worse than doing nothing.
+  it("never reds across the streak, because there is no guard fault to red on", () => {
+    for (const result of classifyStreak()) {
+      assert.equal(summarize([result]).exitCode, 0);
+    }
+    assert.equal(summarize(classifyStreak()).exitCode, 0);
+  });
+
+  // ...but the index fault must not vanish into the green either. That is the
+  // half of the original finding that survives measurement.
+  it("names the wedged index on every run of the streak, quantified", () => {
+    const summary = summarize(classifyStreak());
+
+    assert.equal(summary.corroboratedCount, 3);
+    assert.doesNotMatch(summary.headline, /^All \d+ watched/);
+    assert.match(summary.headline, /the index is faulty/);
+    // 2026-09-12T04:32:39Z -> 2026-09-30T06:58:54Z is > 18 days of index lag.
+    for (const result of classifyStreak()) {
+      assert.ok(result.indexLagMinutes > 18 * 24 * 60, "the lag is reported as a number");
+    }
+  });
+
+  // Why no N is derivable. The benign ceiling is not a constant: it was 2 on
+  // the 2026-09-18..23 window this row was filed from, and 3 on 09-23..30,
+  // reached independently by relay-ssl, ally-review-consistency and
+  // review-gate-sweep. A bar set at the old ceiling+1 (N=3) now fires on three
+  // healthy guards. The ceiling tracks the severity of the index wedge, so any
+  // fixed N is chosen against a moving target.
+  it("N=3, the smallest non-firing bar on the filing-window data, now fires on a healthy guard", () => {
+    const results = classifyStreak();
+    const consecutiveDisagreements = results.filter((r) => r.reason === "corroborated").length;
+
+    assert.equal(consecutiveDisagreements, 3, "the measured streak reaches the proposed bar");
+    // Every one of those is a guard the corroborating read proved alive.
+    assert.equal(
+      results.every((r) => r.status === "ok"),
+      true,
+      "so N=3 would escalate on three confirmations of health",
+    );
+  });
+
+  // The equivalence the correction rests on: `corroborated` and `fresh` apply
+  // the SAME freshness test, differing only in which read supplies the
+  // timestamp. If this ever diverges, the correction is no longer justified.
+  it("applies the same freshness predicate as the `fresh` branch, on the other read", () => {
+    const actual = "2026-09-30T08:44:18Z";
+    const now = Date.parse("2026-09-30T08:57:24Z");
+
+    const viaCrossCheck = classifyGuard(WORKFLOW, observationAt(actual), {
+      now,
+      staleHours: thresholdFor(WORKFLOW),
+    });
+    // Same completion, but served by the filtered read instead.
+    const viaFilteredRead = classifyGuard(
+      WORKFLOW,
+      {
+        state: "active",
+        name: "Relay SSL Multicert",
+        newest: { updatedAt: actual, conclusion: "success", htmlUrl: null },
+      },
+      { now, staleHours: thresholdFor(WORKFLOW) },
+    );
+
+    assert.equal(viaFilteredRead.status, "ok");
+    assert.equal(viaFilteredRead.reason, "fresh");
+    assert.equal(viaCrossCheck.status, viaFilteredRead.status);
+    assert.equal(viaCrossCheck.ageMinutes, viaFilteredRead.ageMinutes);
+  });
+
+  // The safety edge is unmoved: past the bar on the cross-check still reds.
+  // The correction clears guards the second read proves ALIVE, and nothing else.
+  it("still reds when the corroborating completion is itself past the bar", () => {
+    const result = classifyGuard(WORKFLOW, observationAt("2026-09-29T00:00:00Z"), {
+      now: Date.parse("2026-09-30T08:57:24Z"),
+      staleHours: thresholdFor(WORKFLOW),
+    });
+
+    assert.equal(result.status, "stale");
+    assert.equal(result.reason, "stopped");
+    assert.equal(summarize([result]).exitCode, 1);
   });
 });

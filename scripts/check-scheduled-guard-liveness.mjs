@@ -175,11 +175,15 @@ export const EXEMPT_SCHEDULED_DEFAULT_WORKFLOWS = [
  * `observation.crossCheck` is optional and only consulted on the path that
  * would otherwise red. It is `{newestCompletedAt}` from the independent
  * unfiltered read, or `{error: true}`. A cross-check that is NEWER than
- * `newest` suppresses the alarm to "unknown" (PEN-3379); an absent or
- * unreadable one leaves the verdict alone.
+ * `newest` and inside `staleHours` clears the alarm to "ok"/"corroborated"
+ * (PEN-3379 suppressed it to "unknown"; PEN-3462 corrected that to a positive
+ * verdict, since the same freshness test the "fresh" branch uses has been
+ * satisfied). Newer but PAST the bar reds, citing the better timestamp. An
+ * absent or unreadable one leaves the verdict alone.
  *
  * @returns {{workflow: string, status: "ok"|"stale"|"unknown", reason: string,
- *            name: string, ageMinutes: number|null, detail: string}}
+ *            name: string, ageMinutes: number|null,
+ *            indexLagMinutes?: number|null, detail: string}}
  */
 export function classifyGuard(workflow, observation, { now, staleHours = DEFAULT_STALE_HOURS } = {}) {
   const name = observation?.name || workflow;
@@ -232,14 +236,20 @@ export function classifyGuard(workflow, observation, { now, staleHours = DEFAULT
     // run in the unfiltered re-read refutes "never", outright and without
     // needing to be recent (PEN-3379).
     //
-    // Refuting "never" does not establish "alive", though. The cross-check
-    // hands back a real timestamp, and that timestamp is aged against the same
-    // staleHours bar the `stopped` branch uses: inside the bar the two reads
-    // merely disagree and the alarm is suppressed; past the bar the guard has
-    // stopped, and the unfiltered completion is strictly better evidence than
-    // the empty page it replaces. Otherwise a dead guard whose filtered index
-    // happens to serve an empty page would go quiet with exit 0, and an empty
-    // page is exactly the index fault this gate was widened for.
+    // Refuting "never" DOES establish alive, and PEN-3462 is the correction of
+    // the opposite claim that used to stand here. The cross-check hands back a
+    // real timestamp, and that timestamp is aged against the same staleHours
+    // bar the `stopped` branch uses. Inside the bar, `crossAge < staleHours` is
+    // the identical predicate the `fresh` branch applies to the filtered read —
+    // same question, same threshold, different read — so the honest verdict is
+    // that the guard completed, not that it could not be assessed. Past the bar
+    // the guard has stopped, and the unfiltered completion is strictly better
+    // evidence than the empty page it replaces. Otherwise a dead guard whose
+    // filtered index happens to serve an empty page would go quiet with exit 0,
+    // and an empty page is exactly the index fault this gate was widened for.
+    //
+    // The index fault itself does not disappear into the `ok`: it is reported
+    // separately, as an index fault, because that is what it is.
     const crossCheckNewest = observation?.crossCheck?.newestCompletedAt;
     const crossEpoch = crossCheckNewest ? Date.parse(crossCheckNewest) : NaN;
     if (!Number.isNaN(crossEpoch)) {
@@ -247,14 +257,17 @@ export function classifyGuard(workflow, observation, { now, staleHours = DEFAULT
       if (crossAgeMinutes < staleHours * 60) {
         return {
           ...base,
-          status: "unknown",
-          reason: "cross-check-disagreement",
+          status: "ok",
+          reason: "corroborated",
+          ageMinutes: crossAgeMinutes,
+          indexLagMinutes: null,
           detail:
             `${name} (${workflow}) returned no completed run at all from the filtered run index, ` +
-            `but an unfiltered re-read of the same history found a completion at ${crossCheckNewest}. ` +
-            `The two reads disagree, so the filtered index is stale and "has never completed" is a ` +
-            `fiction. Suppressing the alarm rather than firing it (PEN-3379); this guard is NOT being ` +
-            `asserted to have stopped.`,
+            `but an unfiltered re-read of the same history found a completion at ${crossCheckNewest} ` +
+            `— ${crossAgeMinutes}m ago, inside the ${staleHours}h liveness threshold. "Has never ` +
+            `completed" is a fiction of the filtered index; the corroborating read confirms this ` +
+            `guard is alive (PEN-3462). The filtered index is serving an empty page and is itself ` +
+            `faulty.`,
         };
       }
 
@@ -320,12 +333,20 @@ export function classifyGuard(workflow, observation, { now, staleHours = DEFAULT
   // filtered index served a ~140-run-old entry as [0] four times, and every red
   // this detector had ever produced was that fault rather than a stopped guard.
   //
-  // DISAGREEMENT SUPPRESSES. A cross-check that found a completion NEWER than
+  // DISAGREEMENT CORROBORATES. A cross-check that found a completion NEWER than
   // the one we just aged proves the filtered read was stale, so the age is
-  // measured off a fiction and the only honest verdict is "unknown". It still
-  // prints as a warning, so a genuinely wedged index stays visible instead of
-  // going quiet — but it does not assert that a guard stopped, and it does not
-  // exit non-zero.
+  // measured off a fiction. PEN-3379 recorded the only honest verdict there as
+  // "unknown"; PEN-3462 corrects that. To reach this branch the cross-check
+  // completion must be inside `staleHours` — the identical test the `fresh`
+  // branch applies to the filtered read — so the guard's liveness has been
+  // positively established by the corroborating read, not left unassessed.
+  // Calling it "unknown" understated what had been measured and reported a
+  // blind spot where none existed; over 297 production runs (2026-09-18 →
+  // 2026-09-30) that mislabelled 72 confirmations as gaps.
+  //
+  // It still prints as a warning, because the INDEX fault is real and must stay
+  // visible, and it still does not exit non-zero. What changed is only which of
+  // the two facts the verdict names: the guard is alive, the index is wedged.
   //
   // Absence of corroboration is NOT agreement: an unreadable cross-check leaves
   // the stale verdict standing, annotated. Suppressing there would mean a
@@ -358,16 +379,18 @@ export function classifyGuard(workflow, observation, { now, staleHours = DEFAULT
     if (!Number.isNaN(crossEpoch) && crossEpoch > completedEpoch) {
       return {
         ...base,
-        status: "unknown",
-        reason: "cross-check-disagreement",
+        status: "ok",
+        reason: "corroborated",
         ageMinutes: crossAgeMinutes,
+        indexLagMinutes: Math.floor((crossEpoch - completedEpoch) / 60000),
         detail:
           `${name} (${workflow}) read as ${Math.floor(ageMinutes / 60)}h stale from the filtered ` +
           `run index (newest completed ${observation.newest.updatedAt}), but an unfiltered re-read ` +
           `of the same history found a completion at ${crossCheck.newestCompletedAt} — ` +
-          `${crossAgeMinutes}m ago. The two reads disagree, so the filtered index is stale and the ` +
-          `age above is measured off a fiction. Suppressing the alarm rather than firing it ` +
-          `(PEN-3379); this guard is NOT being asserted to have stopped.`,
+          `${crossAgeMinutes}m ago, inside the ${staleHours}h liveness threshold. The corroborating ` +
+          `read confirms this guard is alive (PEN-3462); the ${Math.floor(ageMinutes / 60)}h age ` +
+          `above is measured off a fiction. The filtered index is behind by ` +
+          `${Math.floor((crossEpoch - completedEpoch) / 60000)}m and is itself faulty.`,
         lastRunUrl: observation.newest.htmlUrl ?? null,
       };
     }
@@ -446,6 +469,11 @@ export function summarize(results) {
   // so the headline must not assert the stronger thing, that they completed.
   // They do not redden the run: exitCode stays keyed on `stale` alone.
   const unknown = results.filter((r) => r.status === "unknown");
+  // Corroborated guards ARE healthy — the cross-check aged their completion
+  // against the same bar `fresh` uses (PEN-3462). But the index fault that put
+  // them on this path is a separate fact and is reported separately, or a
+  // persistently wedged index would vanish into the green.
+  const corroborated = results.filter((r) => r.status === "ok" && r.reason === "corroborated");
   const checked = results.length;
 
   const clauses = [];
@@ -460,8 +488,15 @@ export function summarize(results) {
   }
   if (unknown.length > 0) {
     clauses.push(
-      `${unknown.length} of ${checked} could not be assessed (the run index disagreed with itself, ` +
-        `or a run timestamp would not parse), so their liveness is unknown, not asserted healthy`,
+      `${unknown.length} of ${checked} could not be assessed (a run timestamp would not parse), ` +
+        `so their liveness is unknown, not asserted healthy`,
+    );
+  }
+  if (corroborated.length > 0) {
+    clauses.push(
+      `${corroborated.length} of ${checked} were confirmed alive only by the unfiltered ` +
+        `cross-check because the filtered run index disagreed with itself — the guards are live, ` +
+        `the index is faulty`,
     );
   }
 
@@ -472,13 +507,14 @@ export function summarize(results) {
     stoppedCount: stopped.length,
     unreadableCount: unreadable.length,
     unknownCount: unknown.length,
+    corroboratedCount: corroborated.length,
     exitCode: stale.length > 0 ? 1 : 0,
     headline:
       stale.length > 0
         ? `${clauses.join("; ")}.`
-        : unknown.length > 0
-          ? `${checked - unknown.length} of ${checked} watched scheduled guards have completed within ` +
-            `their liveness thresholds; ${clauses.join("; ")}.`
+        : unknown.length > 0 || corroborated.length > 0
+          ? `${checked - unknown.length} of ${checked} watched scheduled guards have completed ` +
+            `within their liveness thresholds; ${clauses.join("; ")}.`
           : `All ${checked} watched scheduled guards have completed within their liveness thresholds.`,
   };
 }
@@ -642,12 +678,28 @@ function countQueued(repo, workflow) {
  *
  * What makes it tolerable is the direction it fails in, not confidence that it
  * holds. A mis-ordered page hands back an OLDER completion than the true
- * newest, which reads as "no corroboration" — and this function's corroboration
- * is only ever used to weaken a red. So the failure mode is a red that stands
- * when it might have been suppressed, never a mute. The assumption is load-
- * bearing for precision and NOT for safety; if it breaks, the detector gets
- * noisier, not quieter. That asymmetry is why this is a `find` over an ordering
+ * newest, which reads as "no corroboration" — the red stands, or the guard is
+ * cleared on a completion that really did happen. Either way the error is
+ * conservative, and that is still why this is a `find` over an ordering
  * assumption rather than a `max` over none.
+ *
+ * SCOPE CORRECTED (PEN-3462, from Ally's review of 01a0b7d). This paragraph
+ * used to end "this function's corroboration is only ever used to weaken a red
+ * … never a mute", and that scope no longer matches the code in two places.
+ * The `never-completed` and past-the-bar branches use corroboration to PRODUCE
+ * a red, citing the cross-check timestamp as the evidence; and the corroborated
+ * branch uses it to clear one. So corroboration now moves the verdict in both
+ * directions.
+ *
+ * The consequence to state plainly: the failure mode this paragraph rules out
+ * is a page that fabricates a NEWER completion than truth, and that would now
+ * be a mute. It always would have been — a suppressed verdict already exited 0
+ * before PEN-3462 relabelled it — so the ordering assumption has been
+ * safety-bearing all along, and describing it as load-bearing for precision
+ * only was the part that was wrong. `find` is what blocks that mute: the
+ * `max(updated_at)` alternative rejected above is exactly a fabricated-newer
+ * read, which is why the choice between them is a safety choice and not a
+ * stylistic one.
  */
 export function selectNewestCompleted(runs) {
   const newest = (runs ?? []).find((run) => run?.status === "completed" && run.updated_at);
@@ -733,16 +785,22 @@ function main() {
 
   for (const result of results) {
     if (result.status === "ok") {
+      // A corroborated guard is alive, but it only got there because the
+      // filtered index lied. Warn on the INDEX so a persistent wedge stays
+      // visible instead of disappearing into the green (PEN-3462).
+      if (result.reason === "corroborated") {
+        console.log(
+          `::warning title=Run index disagreed with itself — guard confirmed alive by cross-check::` +
+            result.detail,
+        );
+        continue;
+      }
       console.log(`ok: ${result.detail}`);
       continue;
     }
 
     if (result.status === "unknown") {
-      const title =
-        result.reason === "cross-check-disagreement"
-          ? "Run index disagreed with itself — liveness alarm suppressed"
-          : "Unparsable run timestamp";
-      console.log(`::warning title=${title}::${result.detail}`);
+      console.log(`::warning title=Unparsable run timestamp::${result.detail}`);
       continue;
     }
 
