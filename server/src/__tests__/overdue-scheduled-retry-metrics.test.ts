@@ -801,7 +801,10 @@ describe("scheduled-retry park horizon help text (BLO-31174)", () => {
       ["transient_failure", ladderCeilingS],
     ];
     for (const [reason, seconds] of ceilings) expect(help).toContain(`${reason} ${seconds}s`);
-    expect(help).toContain(`up to ${flooredCeilingS}s when an unclamped upstream retryNotBefore floor`);
+    expect(help).toContain(
+      `up to ${flooredCeilingS}s when an unclamped upstream retryNotBefore floor `
+        + "is at or just under the 24h horizon",
+    );
     expect(help).toContain("unbounded for a provider_quota floor");
 
     const finite = [...ceilings.map(([, seconds]) => seconds), flooredCeilingS];
