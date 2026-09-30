@@ -1119,6 +1119,46 @@ function describeStalePods(stale: readonly k8s.V1Pod[]): string {
 }
 
 /**
+ * Why waitForPod gave up.  Set at the throw site, where the pod's actual state
+ * is known, so the caller never has to re-derive the category by matching prose
+ * (BLO-33503: an init container that ran and exited non-zero used to fall
+ * through a single `includes("pod containers to start")` test and get reported
+ * as "Pod scheduling failed", pointing diagnosis at cluster capacity).
+ *
+ * `image_pull` and `crash_loop` are main-container-only: the init loop records
+ * its image-pull and crash-loop failures as `init_container` so the label names
+ * the phase the reader has to go look at, and the inline message still says
+ * which of the two it was.  So these six do not partition the throw sites 1:1.
+ */
+export type PodFailureKind =
+  | "scheduling"
+  | "startup"
+  | "init_container"
+  | "image_pull"
+  | "crash_loop"
+  | "terminated";
+
+export class PodWaitError extends Error {
+  constructor(readonly kind: PodFailureKind, message: string) {
+    super(message);
+    this.name = "PodWaitError";
+  }
+}
+
+const POD_FAILURE_LABELS: Record<PodFailureKind, string> = {
+  scheduling: "Pod scheduling failed",
+  startup: "Pod startup failed",
+  init_container: "Init container failed",
+  image_pull: "Image pull failed",
+  crash_loop: "Container crash loop",
+  // "before log streaming", not "before startup": describePodTerminatedError
+  // emits `claude exited 1 (Error)` when the main container started and exited,
+  // so "before startup" would contradict the evidence beside it.  waitForPod
+  // returns when logs can be streamed; that is the boundary this label names.
+  terminated: "Pod terminated before log streaming",
+};
+
+/**
  * Wait for the Job's pod to reach a terminal or running state.
  * Returns the pod name once logs can be streamed, or throws on failure.
  *
@@ -1161,7 +1201,7 @@ async function waitForPod(
 
     if (!pod) {
       if (Date.now() >= scheduleDeadline) {
-        throw new Error(`Timed out waiting for pod to be scheduled (${Math.round(scheduleTimeoutMs / 1000)}s)`);
+        throw new PodWaitError("scheduling", `Timed out waiting for pod to be scheduled (${Math.round(scheduleTimeoutMs / 1000)}s)`);
       }
       if (lastStatus !== "no-pod") {
         await onLog("stdout", `[paperclip] Waiting for Job controller to create pod...\n`);
@@ -1207,11 +1247,49 @@ async function waitForPod(
     if (phase === "Running" || phase === "Succeeded") {
       return podName;
     }
+    // Check for init container failures.  This runs BEFORE the phase=Failed
+    // check: restartPolicy is Never (job-manifest.ts), so a failed init
+    // container takes the whole pod to phase=Failed, and the generic
+    // "terminated" branch below would swallow the specific cause (BLO-33503).
+    //
+    // A native sidecar is the exception: an initContainer carrying its own
+    // restartPolicy: "Always" (the DinD sidecar, job-manifest.ts) overrides the
+    // pod-level Never and is *designed* to terminate when the main container
+    // exits.  Its non-zero exit (SIGKILL 137 past the grace period, SIGTERM 143)
+    // is collateral to a main-container failure, not the cause of one, so it
+    // must not outrank describePodTerminatedError below.  Only its *terminated*
+    // state is collateral — a sidecar stuck waiting still blocks startup, so the
+    // waiting branches below apply to it as they do to any init container.
+    // No cast: @kubernetes/client-node declares V1Container.restartPolicy
+    // (1.0.0 V1Container.d.ts:69 through the resolved 1.4.0:70, so every
+    // version in the declared ^1.0.0 range has it), so tsc checks this field
+    // name.  A cast to a bare structural type would make an upstream *rename*
+    // evaluate to undefined silently — sidecarNames goes empty and the DinD
+    // mislabel below returns with no compile error and no test failure.
+    const sidecarNames = new Set(
+      (pod.spec?.initContainers ?? [])
+        .filter((c) => c.restartPolicy === "Always")
+        .map((c) => c.name),
+    );
+    for (const init of initStatuses) {
+      const terminated = init.state?.terminated;
+      if (terminated && (terminated.exitCode ?? 0) !== 0 && !sidecarNames.has(init.name)) {
+        throw new PodWaitError("init_container", `Init container "${init.name}" failed with exit code ${terminated.exitCode}: ${terminated.reason ?? terminated.message ?? "unknown"}`);
+      }
+      const waiting = init.state?.waiting;
+      if (waiting?.reason === "ErrImagePull" || waiting?.reason === "ImagePullBackOff") {
+        throw new PodWaitError("init_container", `Init container "${init.name}" image pull failed: ${waiting.message ?? waiting.reason}`);
+      }
+      if (waiting?.reason === "CrashLoopBackOff") {
+        throw new PodWaitError("init_container", `Init container "${init.name}" crash loop: ${waiting.message ?? waiting.reason}`);
+      }
+    }
+
     // phase=Failed means the pod crashed before we could stream logs.
     // Throwing here routes the caller into the error path with a structured
     // message instead of entering the log-streaming path with a dead pod.
     if (phase === "Failed") {
-      throw new Error(describePodTerminatedError(podName, phase, containerStatuses));
+      throw new PodWaitError("terminated", describePodTerminatedError(podName, phase, containerStatuses));
     }
 
     // Init containers done + main running (phase may still say Pending briefly)
@@ -1223,44 +1301,29 @@ async function waitForPod(
       return podName;
     }
 
-    // Check for init container failures
-    for (const init of initStatuses) {
-      const terminated = init.state?.terminated;
-      if (terminated && (terminated.exitCode ?? 0) !== 0) {
-        throw new Error(`Init container "${init.name}" failed with exit code ${terminated.exitCode}: ${terminated.reason ?? terminated.message ?? "unknown"}`);
-      }
-      const waiting = init.state?.waiting;
-      if (waiting?.reason === "ErrImagePull" || waiting?.reason === "ImagePullBackOff") {
-        throw new Error(`Init container "${init.name}" image pull failed: ${waiting.message ?? waiting.reason}`);
-      }
-      if (waiting?.reason === "CrashLoopBackOff") {
-        throw new Error(`Init container "${init.name}" crash loop: ${waiting.message ?? waiting.reason}`);
-      }
-    }
-
     // Check for unrecoverable scheduling failures
     const unschedulable = conditions.find(
       (c) => c.type === "PodScheduled" && c.status === "False" && c.reason === "Unschedulable",
     );
     if (unschedulable) {
-      throw new Error(`Pod unschedulable: ${unschedulable.message ?? "insufficient resources"}`);
+      throw new PodWaitError("scheduling", `Pod unschedulable: ${unschedulable.message ?? "insufficient resources"}`);
     }
 
     if (!isScheduled && Date.now() >= scheduleDeadline) {
-      throw new Error(`Timed out waiting for pod to be scheduled (${Math.round(scheduleTimeoutMs / 1000)}s)`);
+      throw new PodWaitError("scheduling", `Timed out waiting for pod to be scheduled (${Math.round(scheduleTimeoutMs / 1000)}s)`);
     }
     if (isScheduled && startDeadline > 0 && Date.now() >= startDeadline) {
-      throw new Error(`Timed out waiting for pod containers to start (${Math.round(startTimeoutMs / 1000)}s): ${lastStatusDetails}`);
+      throw new PodWaitError("startup", `Timed out waiting for pod containers to start (${Math.round(startTimeoutMs / 1000)}s): ${lastStatusDetails}`);
     }
 
     // Check for main container image pull errors
     for (const cs of containerStatuses) {
       const waiting = cs.state?.waiting;
       if (waiting?.reason === "ErrImagePull" || waiting?.reason === "ImagePullBackOff") {
-        throw new Error(`Image pull failed for "${cs.name}": ${waiting.message ?? waiting.reason}`);
+        throw new PodWaitError("image_pull", `Image pull failed for "${cs.name}": ${waiting.message ?? waiting.reason}`);
       }
       if (waiting?.reason === "CrashLoopBackOff") {
-        throw new Error(`Container "${cs.name}" crash loop: ${waiting.message ?? waiting.reason}`);
+        throw new PodWaitError("crash_loop", `Container "${cs.name}" crash loop: ${waiting.message ?? waiting.reason}`);
       }
     }
 
@@ -2225,8 +2288,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      const startupFailure = msg.includes("pod containers to start");
-      const failureLabel = startupFailure ? "Pod startup failed" : "Pod scheduling failed";
+      // Label from the kind the throw site recorded, never from the prose.
+      // Anything that is not a PodWaitError (k8s API error, auth, network) is
+      // genuinely unclassified - say so rather than inheriting "scheduling",
+      // which sends the reader to cluster capacity for a non-capacity fault.
+      // errorCode deliberately stays `k8s_pod_schedule_failed` for every kind.
+      // Server-side consumers key on it to mean "cannot prove external work
+      // never began, so do not auto-retry"; splitting the code would silently
+      // drop these failures out of every set below. AT LEAST SIX behavioural
+      // sites as of 2026-09-29 - this enumeration is a floor, not a closed
+      // list: it read "four" when this PR opened and master grew two more
+      // while it was in review. Re-grep before splitting, do not audit off it:
+      //   heartbeat.ts shouldScheduleAutomaticRunRetry
+      //   heartbeat.ts isNonRetryablePrReviewTerminalOutcome
+      //   heartbeat.ts reclassifyK8sReplacementLaunchFailureAfterThrottle
+      //   metrics.ts   retainSourceIds (whether agent_id survives into labels)
+      //   recovery/service.ts  no-continuation-replay set
+      //   recovery/zero-token-startup-failure.ts ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES
+      // `git grep -n k8s_pod_schedule_failed -- server/src` regenerates it.
+      // See BLO-33503.
+      const failureLabel =
+        err instanceof PodWaitError ? POD_FAILURE_LABELS[err.kind] : "Pod failure (unclassified)";
       await onLog("stderr", `[paperclip] ${failureLabel}: ${msg}\n`);
       return {
         exitCode: null,

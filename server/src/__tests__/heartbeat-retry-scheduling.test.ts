@@ -3276,7 +3276,8 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     const annotation = {
       [K8S_REPLACEMENT_LAUNCH_FAILURE_AFTER_THROTTLE_KEY]: {
         errorCode: "k8s_pod_schedule_failed",
-        errorMessage: "Pod scheduling failed: Pod ac-ally-x reached phase=Failed: claude exited 1",
+        errorMessage:
+          "Pod terminated before log streaming: Pod ac-ally-x reached phase=Failed: claude exited 1 (Error)",
         throttleAttempts: 2,
         throttleErrorCode: null,
       },
