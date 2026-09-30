@@ -130,6 +130,7 @@ import {
   withStrandedRecoveryWakeWorkClass,
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
+import { createPassTimer, type PassTimer } from "./pass-timing.js";
 import {
   resolveStrandedEscalationStatus,
   shouldReuseStrandedRecoveryAction,
@@ -7522,6 +7523,21 @@ export function recoveryService(
   // an absent classification can never be read as a resolved-blocker defect.
   let dependencyWaitEscalationSuppressedDependencyReadyTotal = 0;
   let dependencyWaitEscalationSuppressedUnclassifiedTotal = 0;
+  // PEN-3636: phase accounting for the open sweep, or `null` when no sweep is running.
+  //
+  // Threaded the same way, and for the same reason, as the three counters above:
+  // `escalateStrandedAssignedIssue` has no `result` in scope and many call sites, and it
+  // rests on the same stated invariant — every one of those call sites is lexically
+  // inside `reconcileStrandedAssignedIssues`. Enumerate them before relying on that:
+  //   grep -n 'await escalateStrandedAssignedIssue({' server/src/services/recovery/service.ts
+  // (that grep also matches its own prescription line here and at the BLO-8050 comment
+  // above, so subtract those before comparing).
+  //
+  // Unlike the counters, a misattribution here is bounded to a log line: every read
+  // is guarded on `activePassTimer` being non-null, so a caller outside a sweep times
+  // nothing rather than crashing, and a caller during a sweep would add its own
+  // latency to a diagnostic total. Neither affects control flow.
+  let activePassTimer: PassTimer | null = null;
 
   async function escalateStrandedAssignedIssue(input: {
     issue: typeof issues.$inferSelect;
@@ -7579,7 +7595,21 @@ export function recoveryService(
     // commit/return, waiting peers wake up and record their next attempt
     // against the same active source-scoped action.
     const escalation = await db.transaction(async (tx) => {
-      await lockIssueOwnership(tx, input.issue.companyId, input.issue.id);
+      // PEN-3636: the three awaits below are timed separately, not as one
+      // "transaction" bucket. Separating them is the entire diagnostic value —
+      // the leading hypothesis was contention on the PER-ISSUE lock, but this
+      // path also takes a COMPANY-WIDE one (`paperclip:issue-parent:<companyId>`,
+      // contended by every issue-graph writer in the company) and then a row
+      // lock. Those three wait on different things, so a combined total cannot
+      // say which. `pgAdvisoryXactLock` measures wait, not work: both helpers
+      // issue one `pg_advisory_xact_lock(...)` and return, so their latency is
+      // queue time plus one round trip.
+      await (activePassTimer
+        ? activePassTimer.time(
+          "escalate.lockIssueOwnership",
+          () => lockIssueOwnership(tx, input.issue.companyId, input.issue.id),
+        )
+        : lockIssueOwnership(tx, input.issue.companyId, input.issue.id));
 
       // Re-read source issue under the lock so the recovery action records
       // the latest owner/status evidence and repeated sweeps reuse the same
@@ -7595,13 +7625,20 @@ export function recoveryService(
       // company graph lock, then the issue row. Taking the row first here and
       // the graph lock inside `update` would invert against a concurrent
       // blocker/parent mutation (which takes the graph lock before its row).
-      await lockIssueParentMutationCompany(input.issue.companyId, tx);
+      await (activePassTimer
+        ? activePassTimer.time(
+          "escalate.lockCompanyIssueGraph",
+          () => lockIssueParentMutationCompany(input.issue.companyId, tx),
+        )
+        : lockIssueParentMutationCompany(input.issue.companyId, tx));
       const freshQuery = tx
         .select()
         .from(issues)
         .where(eq(issues.id, input.issue.id))
         .limit(1);
-      const [fresh] = await freshQuery.for("update");
+      const [fresh] = await (activePassTimer
+        ? activePassTimer.time("escalate.selectIssueForUpdate", () => freshQuery.for("update"))
+        : freshQuery.for("update"));
       if (!fresh) return null;
       // BLO-18643: mirror the park paths' own re-check (parkReviewWaitingContinuationIssue /
       // parkNoDependencyReviewWaitingIssue both bail if `fresh.status` has moved past the
@@ -8638,12 +8675,35 @@ export function recoveryService(
   }
 
   async function reconcileStrandedAssignedIssues(opts?: { issueCreatedAtGte?: Date | null }) {
+    // PEN-3636: published on the pass's own log line below, then cleared in the
+    // `finally` so nothing outside a sweep is ever timed into it. Assigned rather
+    // than pushed/popped because this sweep is single-flight — `index.ts` will not
+    // start a chain while one is in flight — so there is never a second pass to
+    // nest. If that gate is ever removed, the later pass's assignment wins and the
+    // earlier pass reports a partial total; that is a diagnostic inaccuracy only.
+    //
+    // Split into an inner function purely so the `finally` cannot be skipped: the
+    // sweep body has many early paths, and a bare try/finally wrapped around all of
+    // it would have to be re-indented wholesale.
+    const passTimer = createPassTimer();
+    activePassTimer = passTimer;
+    try {
+      return await runStrandedAssignedIssueSweep(opts, passTimer);
+    } finally {
+      activePassTimer = null;
+    }
+  }
+
+  async function runStrandedAssignedIssueSweep(
+    opts: { issueCreatedAtGte?: Date | null } | undefined,
+    passTimer: PassTimer,
+  ) {
     const dependencyWaitEscalationSuppressedAtSweepStart = dependencyWaitEscalationSuppressedTotal;
     const dependencyWaitEscalationSuppressedDependencyReadyAtSweepStart =
       dependencyWaitEscalationSuppressedDependencyReadyTotal;
     const dependencyWaitEscalationSuppressedUnclassifiedAtSweepStart =
       dependencyWaitEscalationSuppressedUnclassifiedTotal;
-    const candidates = await db
+    const candidates = await passTimer.time("candidateQuery", () => db
       .select()
       .from(issues)
       .where(
@@ -8663,7 +8723,7 @@ export function recoveryService(
           opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
         ),
       )
-      .orderBy(asc(issues.companyId), asc(issues.assigneeAgentId), asc(issues.createdAt), asc(issues.id));
+      .orderBy(asc(issues.companyId), asc(issues.assigneeAgentId), asc(issues.createdAt), asc(issues.id)));
 
     const result = {
       assignmentDispatched: 0,
@@ -8761,26 +8821,35 @@ export function recoveryService(
         return;
       }
 
-      if (await hasActiveExecutionPath(
+      if (await passTimer.time("prologue.hasActiveExecutionPath", () => hasActiveExecutionPath(
         issue.companyId,
         issue.id,
         issue.status === "in_review" ? agentId : null,
+      ))) {
+        result.skipped += 1;
+        return;
+      }
+
+      if (await passTimer.time(
+        "prologue.hasPendingWakeInteraction",
+        () => hasPendingWakeInteraction(issue.companyId, issue.id),
       )) {
         result.skipped += 1;
         return;
       }
 
-      if (await hasPendingWakeInteraction(issue.companyId, issue.id)) {
+      if (await passTimer.time(
+        "prologue.pauseHoldGuard",
+        () => isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc),
+      )) {
         result.skipped += 1;
         return;
       }
 
-      if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)) {
-        result.skipped += 1;
-        return;
-      }
-
-      const newestIssueRun = await getLatestIssueRun(issue.companyId, issue.id);
+      const newestIssueRun = await passTimer.time(
+        "prologue.getLatestIssueRun",
+        () => getLatestIssueRun(issue.companyId, issue.id),
+      );
       // Memoised per candidate: the dependency-blocked arm below and the
       // review-participant block can both need readiness for the same issue on
       // the fall-through path this sweep now has (BLO-29604).
@@ -8844,14 +8913,23 @@ export function recoveryService(
       // Non-null only on the handover path; every recovery mutation below CASes
       // against it so a lost race takes no side effect.
       const adoptionHandoverLockGuard = adoptionHandover?.lockOwnerState ?? null;
-      const agent = await getAgent(agentId);
+      const agent = await passTimer.time("prologue.getAgent", () => getAgent(agentId));
+      // Timed apart from `getAgent` on purpose: this one is not a primary-key read.
+      // `evaluateAgentInvokabilityFromDb` selects EVERY agent row in the company to
+      // evaluate the org chain, and its result depends only on `agent.companyId` —
+      // which is constant across a company's whole candidate block, since candidates
+      // are ordered by `companyId`. If this phase is a large share of the pass, the
+      // fix is a per-pass memo, not an index.
       const agentInvokable = agent && agent.companyId === issue.companyId
-        ? await isAgentInvokable(agent)
+        ? await passTimer.time("prologue.isAgentInvokable", () => isAgentInvokable(agent))
         : false;
       const dependencyBlockedStrand = latestRun?.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE &&
         (issue.status === "in_review" || !agentInvokable);
       if (dependencyBlockedStrand) {
-        dependencyReadiness ??= await issuesSvc.getDependencyReadiness(issue.id);
+        dependencyReadiness ??= await passTimer.time(
+          "prologue.getDependencyReadiness",
+          () => issuesSvc.getDependencyReadiness(issue.id),
+        );
       }
       // BLO-29604: this arm's contract is "keep the owner and let the dependency
       // machinery do the routing", and BOTH of its outputs need a blocker row to
@@ -10220,7 +10298,7 @@ export function recoveryService(
 
     for (const issue of candidates) {
       try {
-        await reconcileStrandedCandidate(issue);
+        await passTimer.candidate(issue.id, () => reconcileStrandedCandidate(issue));
       } catch (err) {
         // BLO-28931: per-issue error boundary. Without it, any throw from the body
         // propagated out of the whole sweep -- and because candidates are ordered
@@ -10249,7 +10327,16 @@ export function recoveryService(
       }
     }
 
-    const orphanBlockerRecovery = await reconcileUnassignedBlockingIssues();
+    // PEN-3636: timed as its own phase because it is a SECOND sequential
+    // per-candidate loop inside this same function, and its population is not
+    // reported anywhere — `candidatesScanned` on the funnel line below counts only
+    // the main loop, while `result.skipped` is shared between the two. So until this
+    // phase had a number, an unknown share of pass 1 was unattributable by
+    // construction.
+    const orphanBlockerRecovery = await passTimer.time(
+      "orphanBlockerSweep",
+      () => reconcileUnassignedBlockingIssues(),
+    );
     result.orphanBlockersAssigned = orphanBlockerRecovery.assigned;
     result.skipped += orphanBlockerRecovery.skipped;
     result.issueIds.push(...orphanBlockerRecovery.issueIds);
@@ -10289,6 +10376,24 @@ export function recoveryService(
         "skipped stranded escalation for dependency-wait terminal runs",
       );
     }
+
+    // PEN-3636: one line per pass, unconditional.
+    //
+    // Unconditional on purpose, unlike the funnel line above. That line is gated on
+    // a non-empty suppressed population so a quiet sweep stays quiet; this one is
+    // the record of where a pass's wall clock went, and a FAST pass is exactly the
+    // observation the slow ones have to be compared against. Gating it would leave
+    // only slow passes in the log and make the comparison impossible.
+    //
+    // Reading it: `phases` is ordered most-expensive-first. `candidates.p99Ms` next
+    // to `candidates.p50Ms` is the first thing to check — production pass duration
+    // varied 15.7x on a workload that varied 9%, so the open question is whether
+    // every candidate is uniformly slower or a thin tail dominates, and those two
+    // numbers separate those cases. `slowest` then names the tail's issue ids.
+    logger.info(
+      { ...passTimer.summary(), candidatesScanned: candidates.length },
+      "stranded assigned issue sweep phase timing",
+    );
 
     return result;
   }
