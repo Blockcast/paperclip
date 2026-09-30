@@ -706,8 +706,8 @@ describe("buildJobManifest", () => {
         }],
         ["no PVC + large prompt", () => {
           selfPod.pvcClaimName = null;
-          // >256 KiB switches prompt delivery to the Secret-volume path, which
-          // adds its own init-container mount.
+          // A prompt well above LARGE_PROMPT_THRESHOLD_BYTES switches delivery to
+          // the Secret-volume path, which adds its own init-container mount.
           ctx.config = { promptTemplate: "x".repeat(300 * 1024) };
           return "prompt-secret";
         }],
@@ -1848,8 +1848,8 @@ describe("buildJobManifest", () => {
       expect(promptSecret).toBeNull();
     });
 
-    it("returns promptSecret for prompts >256 KiB", () => {
-      // Build a prompt >256 KiB via a custom template
+    it("returns promptSecret for prompts well above the threshold", () => {
+      // Build a prompt far above LARGE_PROMPT_THRESHOLD_BYTES via a custom template
       const largePrompt = "x".repeat(300 * 1024);
       ctx.config = { promptTemplate: largePrompt };
       const { promptSecret, job } = buildJobManifest({ ctx, selfPod });
@@ -1868,6 +1868,47 @@ describe("buildJobManifest", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
       const init = job.spec?.template?.spec?.initContainers?.[0];
       expect(init?.env?.[0]?.name).toBe("PROMPT_CONTENT");
+    });
+
+    // Linux caps a SINGLE execve NAME=value string at 32 pages, independently of
+    // the total arg+env budget. `PROMPT_CONTENT` is one such string.
+    const MAX_ARG_STRLEN = 131_072;
+    const promptEnvValue = (job: k8s.V1Job) =>
+      job.spec?.template?.spec?.initContainers?.[0]?.env?.find((e) => e.name === "PROMPT_CONTENT")?.value;
+
+    // BLO-36854: the dead band. At a 256 KiB threshold a prompt in
+    // (MAX_ARG_STRLEN, 256 KiB] took the env-var path, where execve rejects it
+    // E2BIG and the pod dies in the write-prompt init container before any model
+    // turn — so the run cannot report its own breakage. Three routines went dark
+    // this way. Revert LARGE_PROMPT_THRESHOLD_BYTES to 256 * 1024 and this reds.
+    it("routes a prompt above MAX_ARG_STRLEN to the Secret path, not the env var", () => {
+      ctx.config = { promptTemplate: "x".repeat(160 * 1024) };
+      const { promptSecret, job } = buildJobManifest({ ctx, selfPod });
+      // Read whichever path was taken, so the band assertions below stay
+      // meaningful under a regressed threshold instead of failing confusingly.
+      const delivered = promptSecret?.data["prompt.txt"] ?? promptEnvValue(job) ?? "";
+      const bytes = Buffer.byteLength(delivered, "utf-8");
+      // Pin that this case really sits in the old dead band, so the test keeps
+      // testing what it claims if the sections joined around the template grow.
+      expect(bytes).toBeGreaterThan(MAX_ARG_STRLEN);
+      expect(bytes).toBeLessThanOrEqual(256 * 1024);
+      expect(promptSecret).not.toBeNull();
+      expect(job.spec?.template?.spec?.initContainers?.[0]?.env).toBeUndefined();
+    });
+
+    // The invariant behind the number, asserted directly so it cannot drift:
+    // whatever the threshold is, the env path must never carry a string the
+    // kernel would reject. Fails for ANY threshold >= MAX_ARG_STRLEN.
+    it("never puts a PROMPT_CONTENT string over MAX_ARG_STRLEN in the PodSpec", () => {
+      for (const kib of [1, 64, 119, 120, 121, 128, 130, 160, 200, 300]) {
+        ctx.config = { promptTemplate: "x".repeat(kib * 1024) };
+        const value = promptEnvValue(buildJobManifest({ ctx, selfPod }).job);
+        if (value === undefined) continue; // took the Secret path — not exec'd as a string
+        expect(
+          Buffer.byteLength(`PROMPT_CONTENT=${value}`, "utf-8"),
+          `${kib} KiB prompt was delivered as an env var the kernel would reject`,
+        ).toBeLessThan(MAX_ARG_STRLEN);
+      }
     });
   });
 
