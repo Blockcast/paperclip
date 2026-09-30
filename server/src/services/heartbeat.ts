@@ -19648,26 +19648,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logger.warn(
           {
             index: "heartbeat_runs_crash_recovery_pending_idx",
-            // Which caller probed. NOT a double-warn tag on THIS branch: the
-            // latch read and write above sit in one synchronous block with no
-            // `await` between them, and setCrashRecoveryCandidateIndexPresent
-            // is synchronous (metrics.ts), so on a single-threaded event loop
-            // the latch is atomic and the absent TRANSITION emits exactly one
-            // line per episode no matter which caller wins. Where the tag
-            // earns its place is the `catch` path below: that has no latch at
-            // all, so an unreadable catalog genuinely warns once per caller
-            // per tick, and `source` is what stops an operator reading those
-            // two lines as two distinct failures.
+            // Which caller probed — and on THIS branch that is the entire
+            // report. The latch above emits exactly one line per absence
+            // episode, so the caller that won is the only caller the episode
+            // ever names. `source: "gauge"` therefore says the gauge publisher
+            // — registered above both scheduler gates (see this function's doc
+            // comment) — got there because the gate never ran at all, i.e. the
+            // replica is suppressed and NEITHER recovery path is active.
+            // `source: "gate"` says reconciliation is running and skipping
+            // ticks. Same message, opposite blast radius; dropping the field
+            // collapses them.
             //
-            // It is still load-bearing HERE, for a different reason: because
-            // exactly one line is emitted, the caller that won is the only
-            // caller this episode reports. `source: "gauge"` therefore says
-            // the gauge publisher — registered above both scheduler gates
-            // (see this function's doc comment) — got there because the gate
-            // never ran at all, i.e. the replica is suppressed and NEITHER
-            // recovery path is active. `source: "gate"` says reconciliation is
-            // running and skipping ticks. Same message, opposite blast radius;
-            // dropping the field collapses them.
+            // It is not a double-warn tag here, which is the other reading:
+            // the latch read and write above sit in one synchronous block with
+            // no `await` between them, and setCrashRecoveryCandidateIndexPresent
+            // is synchronous (metrics.ts), so on a single-threaded event loop
+            // the latch is atomic and this branch cannot emit twice. That
+            // reading belongs to the `catch` path below, which has no latch at
+            // all: an unreadable catalog genuinely warns once per caller per
+            // tick, and there `source` is what stops an operator reading two
+            // lines as two distinct failures.
             source,
             remediation:
               "CREATE INDEX CONCURRENTLY heartbeat_runs_crash_recovery_pending_idx ON heartbeat_runs USING btree (finished_at, id) WHERE error_code = 'worker_crashed' AND crash_recovery_completed_at IS NULL",
