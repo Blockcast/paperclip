@@ -116,32 +116,83 @@ export type ApplyPendingMigrationsOptions = {
 export const POSTGRES_POOL_MAX = 10;
 
 /**
+ * The `idle_in_transaction_session_timeout` this deployment's Postgres role
+ * already imposes, recorded here so {@link POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS}
+ * can be asserted against it rather than drifting past it unnoticed.
+ *
+ * Applied by hand on 2026-05-13 and documented in `Blockcast/onprem-k8s` at
+ * `memory/paperclip-pg-stuck-transactions.md`:
+ *
+ * ```sql
+ * ALTER ROLE paperclip SET idle_in_transaction_session_timeout = '60000';  -- 60s
+ * ALTER ROLE paperclip SET statement_timeout = '30000';                    -- 30s
+ * ALTER ROLE paperclip SET lock_timeout = '15000';                         -- 15s
+ * ```
+ *
+ * It is a *transcription of prose*, not a reading — no manifest, migration or
+ * IaC re-creates these, and nothing but the startup probe asserts them, so they
+ * would vanish silently on a role rebuild (PEN-3598). Treat it as the bound we
+ * believe is in force and must not quietly exceed, and take
+ * {@link readInheritedTimeoutSettings} as the measurement.
+ */
+export const POSTGRES_ROLE_IDLE_IN_TRANSACTION_TIMEOUT_MS = 60_000;
+
+/**
  * How long a pooled application connection may sit inside an open transaction
  * with no statement running before Postgres terminates it.
  *
- * This is not a new number: it matches `DELIVERY_LOCK_HOLD_TIMEOUT_MS` in
- * `server/src/services/github-status-delivery-outbox.ts`, which already applies
- * exactly this bound — for exactly this reason — to one critical section that
- * performs external I/O while holding a transaction open. This applies the same
- * bound pool-wide so a section nobody thought to guard cannot pin a connection
- * forever.
+ * This matches {@link POSTGRES_ROLE_IDLE_IN_TRANSACTION_TIMEOUT_MS}, so the
+ * pool ships the bound the role already imposes rather than a second opinion
+ * about it. The point of setting it client-side at all is that the role-level
+ * value is hand-applied prose (see above): if the role is ever rebuilt without
+ * it, the pool still carries a bound.
  *
- * Why it is safe to set unconditionally, unlike `statement_timeout`: Postgres
- * resolves GUCs as `postgresql.conf` < `ALTER DATABASE SET` < `ALTER ROLE SET`
- * < startup-packet parameters < session `SET`, and both settings have context
- * `user` — so a startup-packet value *overrides* a role-level one rather than
- * stacking with it, and can therefore loosen an existing bound as easily as
- * tighten it. That risk is real for `statement_timeout`, where a role-level
- * bound is plausible and would be silently raised. It does not apply here: no
- * healthy workload wants an idle-open transaction, so there is no bound worth
- * preserving. `statement_timeout` is deliberately left unset until
- * {@link readInheritedTimeoutSettings} has reported what is actually in force.
+ * ⚠ Setting this *can loosen* an existing bound, and did. Postgres resolves
+ * GUCs as `postgresql.conf` < `ALTER DATABASE SET` < `ALTER ROLE SET` <
+ * startup-packet parameters < session `SET`, and this setting has context
+ * `user`, so a startup-packet value **overrides** the role's rather than
+ * stacking with it. #1921 (`41439c5c`, merged 2026-09-19) introduced this
+ * constant at `120_000`, which raised the role's live 60 s to 120 s fleet-wide
+ * — a change made *for* PEN-3365 that loosened the exact protection PEN-3365
+ * exists to provide, and went unnoticed for seven days. The rationale it
+ * shipped under — *"no healthy workload wants an idle-open transaction, so
+ * there is no bound worth preserving"* — is false: it reasons about whether
+ * the workload is healthy, when the question is whether a bound already
+ * exists. One did.
+ *
+ * The 120 s was borrowed from `DELIVERY_LOCK_HOLD_TIMEOUT_MS`
+ * (`server/src/services/github-status-delivery-outbox.ts:44`) — the one caller
+ * that never needed the pool to supply it. Both long-hold critical sections
+ * set their own value transaction-locally via `set_config(..., true)`, which is
+ * `SET LOCAL` and outranks the startup packet:
+ *
+ * | site | value |
+ * |---|---|
+ * | `github-status-delivery-outbox.ts:66` | 120 s |
+ * | `pr-issue-backlink-lock.ts:82` | 30 s (`BACKLINK_LOCK_HOLD_TIMEOUT_MS`) |
+ *
+ * That precedence is demonstrated by a passing test, not inferred from the
+ * chain above: `server/src/__tests__/pr-issue-backlink-lock.test.ts` reads
+ * `idle: "23456ms"` inside the transaction on a `createDb` pool connection
+ * whose startup packet says otherwise, with a negative control on the pooled
+ * handle. So lowering this cannot shorten either section's hold — the outbox
+ * raises itself to 120 s when it needs to, and did so before #1921 and
+ * independently of it.
+ *
+ * `statement_timeout` is deliberately still left unset, for the same
+ * precedence reason applied in the other direction: the role imposes 30 s, and
+ * any value here would replace it rather than tighten it.
+ *
+ * Spelled as its own literal rather than as an alias of the role constant, so
+ * that `pool-timeout-bounds.test.ts` can assert the `<=` relation between them
+ * and actually fail when someone raises this one. An alias would make that
+ * assertion tautological.
  *
  * A `?idle_in_transaction_session_timeout=` in the connection URL still wins
  * over this, because postgres.js lets URL query parameters override
  * `options.connection`. That is the intended escape hatch for an operator.
  */
-export const POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS = 120_000;
+export const POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS = 60_000;
 
 /**
  * How long a retiring connection waits for an in-flight query before the
@@ -304,9 +355,51 @@ export async function readInheritedTimeoutSettings(
   }
 }
 
-/** One-line, log-friendly rendering of {@link readInheritedTimeoutSettings}. */
+/**
+ * Whether the pool's own `idle_in_transaction_session_timeout` is *looser* than
+ * the one the server would otherwise impose — i.e. whether shipping it makes
+ * the deployment less bounded than leaving it alone would.
+ *
+ * This is the runtime half of the never-loosening guard; the static half is the
+ * `POOL <= ROLE` assertion in `pool-timeout-bounds.test.ts`. The two catch
+ * different things. CI catches someone raising
+ * {@link POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS} past the value this repo
+ * believes the role carries. This catches the case CI provably cannot see: the
+ * role bound being *tightened* below our constant by a hand-applied `ALTER
+ * ROLE` that lives only as prose in another repository (PEN-3598), where the
+ * value in this file is a transcription and the server is the only authority.
+ *
+ * `null` (Postgres' `0`, disabled) is not a loosening — there is no bound to
+ * loosen, and shipping one is strictly an improvement. That is the case the
+ * pool's startup parameter exists for.
+ *
+ * Out of scope: the `?idle_in_transaction_session_timeout=` URL escape hatch
+ * documented on {@link POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS}. This compares
+ * the *constant*, not the pool's effective value, so an operator override in
+ * the connection URL is invisible here — and doubly so, because
+ * {@link readInheritedTimeoutSettings} builds its probe from that same URL and
+ * would report the override back as the inherited value, comparing it against
+ * itself. That hatch is deliberate and operator-initiated; this guard is aimed
+ * at the role bound moving underneath a constant nobody re-read.
+ */
+export function poolIdleInTransactionTimeoutLoosens(
+  settings: InheritedTimeoutSettings,
+): boolean {
+  const inherited = settings.idleInTransactionSessionTimeout.valueMs;
+  return inherited !== null && POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS > inherited;
+}
+
+/**
+ * One-line, log-friendly rendering of {@link readInheritedTimeoutSettings}.
+ *
+ * Appends an explicit marker when {@link poolIdleInTransactionTimeoutLoosens}
+ * holds, rather than leaving the two numbers side by side for a reader to
+ * compare. Both figures were already present at this call site on the day the
+ * loosening shipped, and nobody subtracted them — so printing them is
+ * demonstrably not enough, and the verdict has to be stated.
+ */
 export function formatInheritedTimeoutSettings(settings: InheritedTimeoutSettings): string {
-  return [
+  const rendered = [
     settings.statementTimeout,
     settings.idleInTransactionSessionTimeout,
     settings.lockTimeout,
@@ -315,6 +408,46 @@ export function formatInheritedTimeoutSettings(settings: InheritedTimeoutSetting
       `${name}=${valueMs === null ? "disabled" : `${valueMs}ms`} (source=${source})`,
     )
     .join(", ");
+
+  if (!poolIdleInTransactionTimeoutLoosens(settings)) return rendered;
+
+  return (
+    `${rendered} — LOOSENED: the pool ships ` +
+    `idle_in_transaction_session_timeout=${POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS}ms, which ` +
+    `overrides the tighter ${settings.idleInTransactionSessionTimeout.valueMs}ms this server ` +
+    `imposes (startup-packet parameters outrank ALTER ROLE / ALTER DATABASE). Lower ` +
+    `POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS to at most the inherited value (PEN-3365)`
+  );
+}
+
+/**
+ * The log level {@link formatInheritedTimeoutSettings} should be emitted at.
+ *
+ * Lives here, next to the verdict it reflects, rather than at the call site.
+ * Severity and wording were split across packages for one release, and the
+ * result was that the `LOOSENED:` marker — added precisely because printing the
+ * two numbers had not been enough — was itself emitted at `info`, because the
+ * caller keyed the level solely on `statement_timeout`. A verdict announced at
+ * the same severity as the healthy line is greppable-but-unread, which is the
+ * failure mode the marker exists to close. Keeping both on one function makes
+ * them unable to diverge again.
+ *
+ * Two independent conditions warrant `warn`, and neither implies the other:
+ *
+ * - `statement_timeout` disabled — nothing server-side bounds a blocked query,
+ *   so a recovery pass can hang indefinitely (PEN-3365).
+ * - {@link poolIdleInTransactionTimeoutLoosens} — we are actively *raising* the
+ *   server's own bound. Latent today (pool 60s vs role 60s is equal, not
+ *   looser), and latent on exactly the path the guard exists for: a role
+ *   tightened below our constant, which CI provably cannot see.
+ */
+export function inheritedTimeoutLogLevel(
+  settings: InheritedTimeoutSettings,
+): "warn" | "info" {
+  const statementTimeoutDisabled = settings.statementTimeout.valueMs === null;
+  return statementTimeoutDisabled || poolIdleInTransactionTimeoutLoosens(settings)
+    ? "warn"
+    : "info";
 }
 
 export function createDbFromPostgresClient(sql: Sql) {
