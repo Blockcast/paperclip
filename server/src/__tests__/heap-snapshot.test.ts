@@ -734,6 +734,31 @@ describe("decideHeapSnapshot", () => {
     expect(decision).toEqual({ trigger: null, sentinel: "claim-failed" });
     expect(existsSync(path.join(dir, HEAP_SNAPSHOT_SENTINEL_BASENAME))).toBe(true);
   });
+
+  it("keeps taking threshold snapshots while a sentinel sits unclaimable", () => {
+    // The two triggers are independent, and an unclaimable request file is
+    // permanent by definition: it is still there precisely because the delete
+    // failed, so every later poll observes it again. Returning early on it would
+    // therefore suppress automatic capture for the life of the process — taking
+    // out the unattended hours-apart pair that is this feature's deliverable,
+    // while the operator is told only that the *request* path is wedged.
+    const cfg = config({ autoThresholdBytes: GB / 2, autoMinIntervalMs: 0 });
+    const sentinel = path.join(dir, HEAP_SNAPSHOT_SENTINEL_BASENAME);
+
+    // Control: with no sentinel this config fires, so a null below is the
+    // sentinel suppressing it rather than the threshold simply not being met.
+    expect(decideHeapSnapshot(cfg, state(), runtime()).trigger).toBe("threshold");
+
+    mkdirSync(sentinel, { recursive: true });
+    for (const poll of [1, 2, 3]) {
+      const decision = decideHeapSnapshot(cfg, state(), runtime());
+
+      expect(decision, `poll ${poll}`).toEqual({ trigger: "threshold", sentinel: "claim-failed" });
+      // Still unclaimed, so the warn still fires — the fall-through does not
+      // silence the operator-facing half of this.
+      expect(describeSentinelOutcome(decision, cfg, state())?.level).toBe("warn");
+    }
+  });
 });
 
 describe("describeSentinelOutcome", () => {

@@ -563,7 +563,7 @@ export function planHeapSnapshotStartup(input: {
  * consumed" while meaning opposite things to an operator.
  */
 export type HeapSnapshotSentinelOutcome =
-  /** No sentinel file was present. Any trigger came from the heap threshold. */
+  /** No sentinel file was present. */
   | "absent"
   /** Observed, deleted, and honoured — this poll snapshots. */
   | "claimed"
@@ -578,6 +578,10 @@ export interface HeapSnapshotDecision {
    * What happened to the sentinel, whether or not it produced a snapshot.
    * `"claimed"` and `"rate-limited"` both mean the file was deleted —
    * honoured-exactly-once holds either way.
+   *
+   * Independent of `trigger`, and deliberately so: `"claim-failed"` pairs with
+   * a `"threshold"` trigger whenever the heap floor is over the line, because
+   * an unclaimable request file is not a reason to stop watching the heap.
    */
   sentinel: HeapSnapshotSentinelOutcome;
 }
@@ -592,6 +596,16 @@ export interface HeapSnapshotDecision {
  * the ones that persist. A sentinel declined by the rate limit is consumed for
  * the same reason: honoured-exactly-once has to hold whether or not the request
  * produced a snapshot, or a backlog of touches would drain one per poll.
+ *
+ * A sentinel that could not be *claimed* is the one case that falls through to
+ * the threshold arm rather than returning. The two triggers are independent —
+ * separate config, separate interval, separate state field — and a request file
+ * the worker cannot delete says nothing about the heap. Returning early there
+ * would suppress automatic capture for as long as the file stayed put, which is
+ * the whole life of the process on a real filesystem fault: the file is still
+ * there by definition, so every later poll would take the same branch. That
+ * would silently disable the unattended threshold pair while reporting only a
+ * wedged *request* path.
  */
 export function decideHeapSnapshot(
   config: HeapSnapshotConfig,
@@ -599,35 +613,41 @@ export function decideHeapSnapshot(
   runtime: HeapSnapshotRuntime = defaultHeapSnapshotRuntime,
 ): HeapSnapshotDecision {
   const sentinelPath = path.join(config.dir, HEAP_SNAPSHOT_SENTINEL_BASENAME);
+  let sentinel: HeapSnapshotSentinelOutcome = "absent";
   if (existsSync(sentinelPath)) {
+    let claimed = false;
     try {
       unlinkSync(sentinelPath);
+      claimed = true;
     } catch {
       // Another replica consumed it, or it is unwritable. Either way, do not
-      // snapshot on a sentinel we could not claim.
-      return { trigger: null, sentinel: "claim-failed" };
+      // snapshot on a sentinel we could not claim — but do keep watching the
+      // heap, which is a trigger this file has no bearing on.
+      sentinel = "claim-failed";
     }
-    const lastSentinelAt = state.lastSentinelSnapshotAtMs;
-    if (
-      lastSentinelAt !== null &&
-      runtime.now().getTime() - lastSentinelAt < config.sentinelMinIntervalMs
-    ) {
-      // Claimed but declined: the pause this would cost is the thing being
-      // rationed, and the sentinel is writable from every pod on the claim.
-      return { trigger: null, sentinel: "rate-limited" };
+    if (claimed) {
+      const lastSentinelAt = state.lastSentinelSnapshotAtMs;
+      if (
+        lastSentinelAt !== null &&
+        runtime.now().getTime() - lastSentinelAt < config.sentinelMinIntervalMs
+      ) {
+        // Claimed but declined: the pause this would cost is the thing being
+        // rationed, and the sentinel is writable from every pod on the claim.
+        return { trigger: null, sentinel: "rate-limited" };
+      }
+      return { trigger: "sentinel", sentinel: "claimed" };
     }
-    return { trigger: "sentinel", sentinel: "claimed" };
   }
 
-  if (config.autoThresholdBytes <= 0) return { trigger: null, sentinel: "absent" };
+  if (config.autoThresholdBytes <= 0) return { trigger: null, sentinel };
   if (runtime.heapUsedBytes() < config.autoThresholdBytes) {
-    return { trigger: null, sentinel: "absent" };
+    return { trigger: null, sentinel };
   }
   const lastAt = state.lastAutoSnapshotAtMs;
   if (lastAt !== null && runtime.now().getTime() - lastAt < config.autoMinIntervalMs) {
-    return { trigger: null, sentinel: "absent" };
+    return { trigger: null, sentinel };
   }
-  return { trigger: "threshold", sentinel: "absent" };
+  return { trigger: "threshold", sentinel };
 }
 
 /**
@@ -678,7 +698,8 @@ export function describeSentinelOutcome(
         message:
           "Heap snapshot request seen but not claimed — deleting the request file failed, so it was not honoured. " +
           "The file is still present. If this clears on the next poll another replica claimed it; if it repeats, " +
-          "the worker cannot delete the file and the request path is wedged until it is removed by hand.",
+          "the worker cannot delete the file and the request path is wedged until it is removed by hand. " +
+          "Threshold-triggered capture is unaffected and continues on its own interval.",
       };
     case "claimed":
     case "absent":
