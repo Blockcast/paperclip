@@ -1001,7 +1001,8 @@ describe("github-webhook pure helpers", () => {
     }
   });
 
-  it("resolves a wake reason for pull_request opened", () => {    const ctx = __test_resolveEventContext("pull_request", {
+  it("resolves a wake reason for pull_request opened", () => {
+    const ctx = __test_resolveEventContext("pull_request", {
       action: "opened",
       pull_request: {
         number: 200,

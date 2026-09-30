@@ -51,7 +51,10 @@ export interface PullRequestWorkProductInput {
  *
  * Deliberately a STATE, not a timestamp. GitHub emits exactly two per-PR
  * merge-queue signals — `added_to_merge_queue` and `removed_from_merge_queue`
- * — and NOTHING while a PR advances through the queue. Measured on
+ * on the issue TIMELINE, delivered to this handler as the `pull_request`
+ * webhook ACTIONS `enqueued` and `dequeued` — and NOTHING while a PR advances
+ * through the queue. The two name pairs are the same two signals on different
+ * surfaces; this file keys on the webhook actions throughout. Measured on
  * `Blockcast/paperclip`: #1948 sat 27.4h between the two with no intervening
  * event, #1654 sat 38.9h. So there is no "last queue activity" clock to read;
  * the only honest question is "is it in the queue right now".
