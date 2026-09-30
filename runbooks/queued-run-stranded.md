@@ -421,7 +421,7 @@ form this section was originally written against, was closed superseded):
 
 | alert | expression | `for` | regime |
 |---|---|---|---|
-| `PaperclipAgentStartLockWedged` | `max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 14400` | 5m | one agent, **>4h** — never observed to clear on its own |
+| `PaperclipAgentStartLockWedged` | `max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 14400` | 5m | one agent, **>4h** — no hold past 4h has been observed to settle |
 | `PaperclipAgentStartLockFleetStall` | `count(max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 900) >= 3` | 10m | **≥3 agents** in lockstep — measured to self-clear |
 
 Both are live: verified loaded at `/api/v1/rules` on 2026-09-30, and the
@@ -432,7 +432,7 @@ and `monitoring/prometheus-rules-2-configmap.yaml` in `Blockcast/onprem-k8s`.
 Read the numbers there before acting on either one.
 Owner: Platform / SRE (PEN-3305)
 
-### ⚠️ What this alert claims, and what it no longer claims (BLO-36522)
+### ⚠️ What these alerts claim, and what they no longer claim (BLO-36522)
 
 **The name says "wedged". For the regime the old 300s rule actually fired on,
 that word was wrong.** The split in `#4036` fixed this by moving the name:
@@ -440,8 +440,9 @@ that word was wrong.** The split in `#4036` fixed this by moving the name:
 clear, and the routine/fleet regime pages as `FleetStall` instead.
 
 ⚠️ **Everything in this subsection falsifies claims about the ≤2h14m regime —
-i.e. about `FleetStall`, not about `Wedged`.** Do not carry the "it self-heals"
-wording onto a `PaperclipAgentStartLockWedged` page: no hold past 4h has ever
+i.e. about the `FleetStall` regime and the now-unpaged 15m–4h solo band, not
+about `Wedged`.** Do not carry the "it self-heals" wording onto a
+`PaperclipAgentStartLockWedged` page: no hold past 4h has ever
 been observed to settle, and the one time that regime occurred it ended only
 by pod replacement. They are different regimes and the evidence below does not
 reach the second one.
@@ -511,9 +512,11 @@ the solo hold measured **cycled** (175 resets/6h — acquired and released
 about every 2 minutes), and the founding 2026-09-15/16 incident was five
 agents, so `FleetStall` would have caught it. A solo hold that really does run
 away is still covered — `Wedged` pages at 4h, above the 2h14m self-clearing
-maximum ever observed. The residual is only the 15m–4h band. **On Blockcast's
-live `onprem-k8s` rules, if you are triaging a single stuck agent inside that
-band, no page will have brought you here**; reach for
+maximum in the 7d window measured 2026-09-25 (same sliding window as the agent
+count above — it moves; re-measure before citing it). The residual is only the
+15m–4h band. **On Blockcast's live `onprem-k8s` rules, if you are triaging a
+single stuck agent inside that band, no page will have brought you here**;
+reach for
 `max by (agent_id) (paperclip_agent_start_lock_held_seconds)` directly, and
 read the `resets()` caveat in Step 4 before concluding it is stuck.
 
