@@ -983,10 +983,24 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
   // adding `js-yaml` would change `pnpm-lock.yaml` and the `Block manual
   // lockfile edits` gate rejects that.
   //
-  // ponytail: a blank line inside a block scalar closes it here, where real YAML
-  // would not. No formatter emits that, and the failure direction is safe — the
-  // gate becomes unscannable, which `unscannable` below reports LOUDLY rather
-  // than passing clean. Upgrade to real scalar tracking only if that ever fires.
+  // ponytail: this joins BLOCK scalars (`>`/`|`) only, and treats a blank line as
+  // closing one where real YAML would not. Two known gaps, both MEASURED at this
+  // SHA rather than reasoned about — and note which arm each actually lands in,
+  // because the obvious guess is wrong for both:
+  //
+  //   blank line inside a folded block   -> `unbypassed`, NOT `unscannable`. The
+  //     blank closes the scalar, so line 1 still joins to `if: >- ${{ … pretested
+  //     != '1'` — it matches `/^\s*if:/` and carries the token, it is just
+  //     truncated before the bypass clause. A located gate, read short.
+  //   plain (unquoted) multi-line scalar -> `unbypassed` too, because nothing
+  //     joins it. If the bypass sits on the continuation line this is a FALSE
+  //     RED, and the message will assert the clause is missing when it is
+  //     present. Recognise that message; do not trust it.
+  //
+  // Both fail loudly and neither can pass clean, which is why this is a named
+  // ceiling and not a fix: closing them needs the real YAML parser the paragraph
+  // above rules out. Upgrade to real scalar tracking only if one of these ever
+  // fires on a real reformat.
   const joinFoldedIfs = (body) => {
     const joined = [];
     let openAt = null;
