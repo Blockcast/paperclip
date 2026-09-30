@@ -61,6 +61,10 @@ describe("getConfigSchema", () => {
     expect(field?.type).toBe("number");
     expect(field?.hint).toMatch(/half of Memory Limit/);
     expect(field?.hint).toMatch(/0 disables/);
+    expect(field?.hint).toMatch(/786432/);
+    // The memory hint's examples must not derive a cap under which node cannot start.
+    const memory = schema.fields.find((f: ConfigFieldSchema) => f.key === "resources.limits.memory");
+    expect(memory?.hint).not.toMatch(/\b(128Mi|512Mi|1Gi)\b/);
     expect(keys.indexOf("resources.limits.toolMemoryKb")).toBe(keys.indexOf("resources.limits.memory") + 1);
   });
 
