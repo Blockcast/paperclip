@@ -813,30 +813,41 @@ export function crossCheckCompletions(repo, workflow, read = gh, event = undefin
   }
 }
 
-function main() {
-  const repo = process.env.GUARD_LIVENESS_REPO || process.env.GITHUB_REPOSITORY || "Blockcast/paperclip";
-
-  // An explicit override is a manual debugging dial (workflow_dispatch, or the
-  // live checks in the PR). It deliberately applies to EVERY guard, flattening
-  // the per-guard thresholds, so a dispatch at 1h reds the whole set on purpose.
-  const override = process.env.GUARD_LIVENESS_STALE_HOURS;
-  const overrideHours = override && String(override).trim() !== "" ? resolveStaleHours(override) : null;
-
-  const watched = resolveWatched(process.env.GUARD_LIVENESS_WORKFLOWS, overrideHours);
-
-  const now = Date.now();
-  const results = watched.map(({ workflow, staleHours, event, graceUntil }) => {
+/**
+ * Classifies every resolved guard entry, including the PEN-3379 cross-check
+ * escalation.
+ *
+ * Extracted and exported ONLY so this line has a failing mutation. It is the
+ * JOIN between producer and consumers — `resolveWatched()`'s `event` and
+ * `graceUntil` handed to `observeWorkflow()`, `classifyGuard()` and the
+ * cross-check — and while it lived inline in `main()` it was the last unguarded
+ * link in the chain: dropping any of those fields left the whole suite green,
+ * because `main()` is never invoked by a test and `observeWorkflow` is not
+ * exported (BLO-38228).
+ *
+ * `observe` and `crossCheck` are injected for exactly that reason: the join is
+ * then testable without a network call, so every field is held by a behavioural
+ * guard rather than a source-text regex. A regex would also have caught the
+ * `observe` leg, but a regex on a destructure is what previously passed across
+ * its own reversion — hold the behaviour instead.
+ *
+ * `crossCheck` MUST receive `event`. That leg came back from the PEN-3379 rebase
+ * as the only one a test could not see, and its failure mode is the worst of the
+ * three: an unfiltered cross-check against a filtered read disagrees on every
+ * poll, so the guard lands permanently in `cross-check-disagreement` and the
+ * alarm is muted forever rather than going red. Pulling it in here is what makes
+ * that arm mutation-visible.
+ */
+export function classifyWatched(watched, observe, crossCheck, { now, overrideHours = null } = {}) {
+  return watched.map(({ workflow, staleHours, event, graceUntil }) => {
     const effectiveStaleHours = overrideHours ?? staleHours;
-    const observation = observeWorkflow(repo, workflow, event);
-    const first = classifyGuard(workflow, observation, {
-      now,
-      staleHours: effectiveStaleHours,
-      graceUntil,
-    });
+    const options = { now, staleHours: effectiveStaleHours, graceUntil };
+    const observation = observe(workflow, event);
+    const first = classifyGuard(workflow, observation, options);
 
     // The cross-check is only worth a call once the cheap read has already
     // decided this guard looks stopped — the same "spend it only when it
-    // matters" shape as countQueued below. Re-classifying is a pure call on the
+    // matters" shape as countQueued. Re-classifying is a pure call on the
     // observation we already hold, so corroborating costs exactly one request
     // and only on the path that was about to red (PEN-3379).
     //
@@ -849,12 +860,46 @@ function main() {
       return first;
     }
 
-    return classifyGuard(
-      workflow,
-      { ...observation, crossCheck: crossCheckCompletions(repo, workflow, gh, event) },
-      { now, staleHours: effectiveStaleHours, graceUntil },
-    );
+    return classifyGuard(workflow, { ...observation, crossCheck: crossCheck(workflow, event) }, options);
   });
+}
+
+/**
+ * Binds `repo` to the two reads `classifyWatched` consumes.
+ *
+ * Exported for the same single reason `classifyWatched` is: to leave no
+ * unguarded link. With the closures written inline in `main()`, dropping
+ * `event` from the cross-check closure was the last mutation the suite could
+ * not see — `main()` is never invoked by a test, so the whole chain was held
+ * behaviourally right up to the line that assembles it. Here it is one exported
+ * call away from a test.
+ *
+ * `read` is threaded to `crossCheckCompletions` so the cross-check's real URL
+ * is observable without a network call. `observeWorkflow` stays unexported and
+ * so stays unobservable this way; its `event` leg is held by `classifyWatched`'s
+ * injected-observer test instead.
+ */
+export function makeGuardReaders(repo, read = gh) {
+  return {
+    observe: (workflow, event) => observeWorkflow(repo, workflow, event),
+    crossCheck: (workflow, event) => crossCheckCompletions(repo, workflow, read, event),
+  };
+}
+
+function main() {
+  const repo = process.env.GUARD_LIVENESS_REPO || process.env.GITHUB_REPOSITORY || "Blockcast/paperclip";
+
+  // An explicit override is a manual debugging dial (workflow_dispatch, or the
+  // live checks in the PR). It deliberately applies to EVERY guard, flattening
+  // the per-guard thresholds, so a dispatch at 1h reds the whole set on purpose.
+  const override = process.env.GUARD_LIVENESS_STALE_HOURS;
+  const overrideHours = override && String(override).trim() !== "" ? resolveStaleHours(override) : null;
+
+  const watched = resolveWatched(process.env.GUARD_LIVENESS_WORKFLOWS, overrideHours);
+
+  const now = Date.now();
+  const { observe, crossCheck } = makeGuardReaders(repo);
+  const results = classifyWatched(watched, observe, crossCheck, { now, overrideHours });
 
   for (const result of results) {
     if (result.status === "ok") {
