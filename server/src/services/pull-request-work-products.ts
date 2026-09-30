@@ -36,9 +36,14 @@ export interface PullRequestWorkProductInput {
    * re-deriving ownership from fields the row does not carry (the PR body is
    * never persisted).
    *
-   * `undefined`/`null` means "not recorded" — for rows written before this
-   * field existed — and must not be read as "owns nothing". An empty array IS
-   * authoritative: the PR named no owner in its title, branch, or labeled body.
+   * `undefined`/`null` means "not recorded" and must not be read as "owns
+   * nothing". Three populations reach it: rows written before this field
+   * existed, rows whose caller never resolved ownership, and recordings this
+   * reader cannot parse. Only the first ages out. Agent-registered rows are the
+   * common case (the Paperclip skill tells agents to create one) and pass no
+   * ownership, so this arm is load-bearing indefinitely — not a migration
+   * artifact with an end date. An empty array IS authoritative: the PR named no
+   * owner in its title, branch, or labeled body.
    */
   owningIdentifiers?: readonly string[] | null;
 }
@@ -190,8 +195,9 @@ export function pullRequestWorkProductSourceEventActionOrder(
  * Read `metadata.owningIdentifiers` back off a stored row, preserving the
  * null-vs-empty distinction the writer above encodes.
  *
- * Returns `null` for "not recorded" — the row predates the field, or it holds
- * a non-empty value no entry of which is readable as a string. An array is
+ * Returns `null` for "not recorded" — the row predates the field, its writer
+ * never resolved ownership (the common case; see the field docblock), or it
+ * holds a non-empty value no entry of which is readable as a string. An array is
  * returned otherwise, and an empty one IS authoritative: the guard below means
  * `[]` out implies `[]` in. Consumers differ on what to do with `null`, and
  * deliberately so: productivity-review re-derives
