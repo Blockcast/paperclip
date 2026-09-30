@@ -465,13 +465,18 @@ Source: `server/src/services/agent-start-lock.ts` (`withAgentStartLock`,
 (`AGENT_START_LOCK_HELD_SECONDS_METRIC`, `setAgentStartLockHeldMetrics`),
 `server/src/services/scrape-metrics-collector.ts`
 (`refreshAgentStartLockMetrics`)
-Trigger: alert `PaperclipAgentStartLockWedged` —
-`count(max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 900) >= 3`
-for 10m once BLO-36522's retune lands. That retune is in `Blockcast/onprem-k8s#3985`,
-**not yet merged**: until it lands, the live rule is still
-`max by (agent_id) (...) > 300` for 5m, and this alert still fires on
-single-agent routine contention.
-The rule is quoted here for readability only and lives in a different repo —
+Trigger: **two alerts**, since `Blockcast/onprem-k8s#4036` landed the BLO-36522
+retune as a split rather than a single retuned rule (`#3985`, the single-rule
+form this section was originally written against, was closed superseded):
+
+| alert | expression | `for` | regime |
+|---|---|---|---|
+| `PaperclipAgentStartLockWedged` | `max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 14400` | 5m | one agent, **>4h** — never observed to clear on its own |
+| `PaperclipAgentStartLockFleetStall` | `count(max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 900) >= 3` | 10m | **≥3 agents** in lockstep — measured to self-clear |
+
+Both are live: verified loaded at `/api/v1/rules` on 2026-09-30, and the
+`>300`-for-5m rule this section used to describe is gone.
+The rules are quoted here for readability only and live in a different repo —
 the source of record is the lockstep pair `paperclip/paperclip-runtime-alerts-prometheusrule.yaml`
 and `monitoring/prometheus-rules-2-configmap.yaml` in `Blockcast/onprem-k8s`.
 Read the numbers there before acting on either one.
@@ -479,9 +484,19 @@ Owner: Platform / SRE (PEN-3305)
 
 ### ⚠️ What this alert claims, and what it no longer claims (BLO-36522)
 
-**The name says "wedged". Measured, that word is wrong, and it is retained only
-because it keys this anchor, the promtool cases and the Slack baseline.** Two
-claims this section used to make were falsified on 2026-09-25:
+**The name says "wedged". For the regime the old 300s rule actually fired on,
+that word was wrong.** The split in `#4036` fixed this by moving the name:
+`Wedged` now keys only the >4h regime, where nothing has ever been observed to
+clear, and the routine/fleet regime pages as `FleetStall` instead.
+
+⚠️ **Everything in this subsection falsifies claims about the ≤2h14m regime —
+i.e. about `FleetStall`, not about `Wedged`.** Do not carry the "it self-heals"
+wording onto a `PaperclipAgentStartLockWedged` page: no hold past 4h has ever
+been observed to settle, and the one time that regime occurred it ended only
+by pod replacement. They are different regimes and the evidence below does not
+reach the second one.
+
+Two claims this section used to make were falsified on 2026-09-25:
 
 - *"It does not self-heal."* The 7-day maximum hold — 8043s (2h14m), three
   agents in lockstep — released on its own at 2026-09-24T03:15Z while the
@@ -520,33 +535,35 @@ agents rather than raising the duration bound. Backtested at 179 fleet-minutes
 — one episode, the 2026-09-24T01:00Z event — over all the history Prometheus
 retains.
 
-**Severity stays `critical`, on a new basis.** The old justification was the
-non-self-healing claim above, which is dead. It stays critical because, once
-#3985 lands, it fires only on the fleet-scope episode, and because it must keep the
+**Both arms stay `critical`, on a new basis.** The old justification was the
+non-self-healing claim above, which is dead for the routine regime. They stay
+critical because each now fires only on a regime that is genuinely a page —
+one agent past 4h, or the fleet-scope episode — and because they must keep the
 out-of-band Slack path precisely *because* the suspected fault is in
-paperclip's own dispatcher — routing it `warning` would put the page behind
-the component it is reporting on. **The action is diagnostic capture, not a
-restart** (Step 4).
+paperclip's own dispatcher — routing them `warning` would put the page behind
+the component it is reporting on. **On `FleetStall` the action is diagnostic
+capture, not a restart** (Step 4).
 
-⚠️ **The coverage this retune GIVES UP, in Blockcast's live rules: a solo
-indefinite hold now pages on nothing.** Stated here because it is the one cost
-of the change that is not self-evident from the expression. After #3985 lands,
-none of the three alerts that could catch a single agent whose lock is held for
-the life of the process does so in Blockcast's live `onprem-k8s` rules: this
-one needs **≥3** agents, `PaperclipQueuedRunStrandedFleet` needs **≥5**, and
-the per-agent `PaperclipQueuedRunStranded` it superseded is already gone from
-them (BLO-29665). The ≥5 is read from the lockstep pair cited under
-Trigger above, which is also where #3985 puts the ≥3; neither fleet-count form
-exists in this repo. So "the fleet alert already covers user-visible impact"
-is true only in the fleet regime.
+⚠️ **The coverage the retune GIVES UP, in Blockcast's live rules: a solo hold
+between ~15m and 4h now pages on nothing.** Stated here because it is the one
+cost of the change that is not self-evident from the expressions. In that band
+none of the alerts that could catch a single agent does so in Blockcast's live
+`onprem-k8s` rules: `FleetStall` needs **≥3** agents, `Wedged` needs **>4h**,
+`PaperclipQueuedRunStrandedFleet` needs **≥5**, and the per-agent
+`PaperclipQueuedRunStranded` it superseded is already gone from them
+(BLO-29665). The ≥5 is read from the lockstep pair cited under Trigger above,
+which is also where the ≥3 lives; neither fleet-count form exists in this repo.
+So "the fleet alert already covers user-visible impact" is true only in the
+fleet regime.
 
 That is a deliberate trade, not an oversight, and the evidence supports it:
 the solo hold measured **cycled** (175 resets/6h — acquired and released
 about every 2 minutes), and the founding 2026-09-15/16 incident was five
-agents, so the retuned expression would have caught it. The residual is the
-case never yet observed: one agent, monotonic, indefinite. **On Blockcast's
-live `onprem-k8s` rules, if you are triaging a single stuck agent, no page will
-have brought you here**; reach for
+agents, so `FleetStall` would have caught it. A solo hold that really does run
+away is still covered — `Wedged` pages at 4h, above the 2h14m self-clearing
+maximum ever observed. The residual is only the 15m–4h band. **On Blockcast's
+live `onprem-k8s` rules, if you are triaging a single stuck agent inside that
+band, no page will have brought you here**; reach for
 `max by (agent_id) (paperclip_agent_start_lock_held_seconds)` directly, and
 read the `resets()` caveat in Step 4 before concluding it is stuck.
 
@@ -630,11 +647,11 @@ that is slow. `agent start lock held far past its budget; queued-run dispatch
 for this agent has stopped` (error, first at 5m then every 5m) is driven by
 `LOCK_HELD_ERROR_MS` (300s) in `agent-start-lock.ts`.
 
-⚠️ **Once #3985 lands, the log line and this alert deliberately no longer
-share a number.** Until then the live rule is still pinned to the same 300s.
-Before BLO-36522 they were pinned together at 300s so "the log line and the
-page cannot disagree". That pinning was abandoned on purpose: 300s is the
-right boundary for the *log* — it is where the code stops calling a hold slow
+⚠️ **The log line and these alerts deliberately no longer share a number.**
+Before BLO-36522 the alert was pinned to `LOCK_HELD_ERROR_MS` at 300s so "the
+log line and the page cannot disagree". That pinning was abandoned on purpose:
+300s is the right boundary for the *log* — it is where the code stops calling a
+hold slow
 — but as an alert threshold it fires on 2,730 agent-minutes a week of routine
 contention. So the log answers *"is this hold slow?"* and the alert answers
 *"is the fleet stalled at once?"*. The cost is real and accepted: **an
@@ -784,10 +801,9 @@ does **not** make the page live. The rule must also land in the two lockstep
 must be synced (BLO-19095). Verify at `/api/v1/rules` before relying on it.
 
 ⚠️ **KNOWN DIVERGENCE, accepted and recorded rather than fixed (BLO-36522).**
-The BLO-36522 retune is prepared for the two `Blockcast/onprem-k8s` copies (the
-only ones that fire at Blockcast) in `Blockcast/onprem-k8s#3985`, which is
-**not yet merged**: until it lands, the live rule is still `> 300` for 5m and
-this alert still fires on single-agent routine contention. It is
+The BLO-36522 retune shipped to the two `Blockcast/onprem-k8s` copies (the only
+ones that fire at Blockcast) in `Blockcast/onprem-k8s#4036`, merged
+2026-09-28 and verified loaded at `/api/v1/rules` on 2026-09-30. It is
 **deliberately not** in the chart copy above, which still carries `max by (agent_id) (...) > 300` for 5m wired to
 `prometheusRule.agentStartLockHeldSeconds` / `LOCK_HELD_ERROR_MS`. It renders
 nothing here, so this costs Blockcast nothing today. It is a landmine for
