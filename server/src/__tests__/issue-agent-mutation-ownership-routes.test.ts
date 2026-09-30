@@ -1635,10 +1635,21 @@ describe("agent issue mutation checkout ownership", () => {
   // mechanism that would have silenced the false incident. These tests pin the 403 -> 2xx
   // transition for the one narrow shape, and the 403 everywhere around it.
   describe("deliberate-park disposition PATCH (BLO-27912)", () => {
+    // Derived from the clock, never a literal. `issueParkedDispositionSchema` bounds
+    // `until` to (now, now + PARKED_DISPOSITION_MAX_HORIZON_DAYS], so a hardcoded date
+    // is a time bomb: it passes until the wall clock crosses it, then every happy-path
+    // assertion here flips 200 -> 400 on a day nobody chose. That is not a local test
+    // failure — `.github/workflows/pr.yml` has no `push` trigger, so master's head is
+    // only ever tested by the merge_group build, and the first symptom is every queued
+    // PR being ejected on a diff it does not touch (BLO-27861, and again on 2026-09-30
+    // when the previous literal `2026-09-30T00:00:00.000Z` lapsed at midnight).
+    // 30 days is comfortably inside the 90-day horizon, so this cannot drift into the
+    // "beyond the horizon" rejection either.
+    const parkUntil = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
     const parkedBody = {
       parkedDisposition: {
         reason: "Gated on upstream fMP4 contract scheduling; no timer owns the event.",
-        until: "2026-09-30T00:00:00.000Z",
+        until: parkUntil,
       },
     };
     // Grants `issue:comment` (the action the creator / manager-chain allow-paths are
@@ -1762,7 +1773,7 @@ describe("agent issue mutation checkout ownership", () => {
 
       const res = await request(await createApp(ownerActor()))
         .patch(`/api/issues/${issueId}`)
-        .send({ parkedUntil: "2026-09-30T00:00:00.000Z" });
+        .send({ parkedUntil: parkUntil });
 
       expect(res.status).toBe(400);
       expect(mockIssueService.update).not.toHaveBeenCalled();
@@ -1789,7 +1800,7 @@ describe("agent issue mutation checkout ownership", () => {
 
       const res = await request(await createApp(ownerActor()))
         .patch(`/api/issues/${issueId}`)
-        .send({ parkedDisposition: { until: "2026-09-30T00:00:00.000Z" } });
+        .send({ parkedDisposition: { until: parkUntil } });
 
       expect(res.status).toBe(400);
       expect(mockIssueService.update).not.toHaveBeenCalled();
