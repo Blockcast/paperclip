@@ -316,8 +316,23 @@ export function classifyGuard(
   //
   // Free: both numbers ride on responses this file already fetches. It fires
   // only on the red path, because `classifyWatched` attaches the cross-check
-  // only there, and it only ever WEAKENS a red — the same direction as every
-  // other suppression here, so it cannot mute a guard the index agrees is dead.
+  // only there, and it only ever WEAKENS a red.
+  //
+  // WHAT BOUNDS IT, AND WHAT DOES NOT. Unlike the PEN-3379 arm below, this one
+  // rests on no evidence that the guard is alive: `completedCount > allCount`
+  // proves the reads are untrustworthy, which is just as true of a guard that
+  // has stopped. So it defers whenever there IS timestamp evidence: when the
+  // unfiltered read carries a strictly better completion (newer than the
+  // filtered one, or any at all against an empty filtered page), the PEN-3379
+  // arm below decides on that timestamp, suppressing if it is fresh and redding
+  // if it is itself past staleHours, exactly as it would with consistent counts.
+  // What it still mutes is the shape the production false red actually had:
+  // both reads citing the SAME stale completion. That observation is
+  // field-for-field what a stopped guard with split reads produces, so no pure
+  // function of one poll can separate the two; such a guard warns on every
+  // poll and exits 0 for as long as its counts stay inconsistent. Bounding
+  // that needs state across polls (consecutive `index-inconsistent` verdicts),
+  // which this file does not keep.
   //
   // NOT complete coverage, stated rather than implied: two reads served by the
   // SAME pinned replica are internally consistent and pass straight through
@@ -325,7 +340,15 @@ export function classifyGuard(
   // make the index trustworthy, and AC2's flap watch is what measures the rest.
   const completedCount = observation?.completedCount;
   const allCount = observation?.crossCheck?.allCount;
-  if (typeof completedCount === "number" && typeof allCount === "number" && completedCount > allCount) {
+  const crossCheckIsBetter =
+    Date.parse(observation?.crossCheck?.newestCompletedAt ?? "") >
+    (observation?.newest ? Date.parse(observation.newest.updatedAt) : -Infinity);
+  if (
+    typeof completedCount === "number" &&
+    typeof allCount === "number" &&
+    completedCount > allCount &&
+    !crossCheckIsBetter
+  ) {
     return {
       ...base,
       status: "unknown",
