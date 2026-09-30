@@ -70,6 +70,12 @@ import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-sh
 import { summarizeStrandedRecoveryHandBackPass } from "./services/recovery/service.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
+import {
+  recordHeartbeatRecoveryChainDuration,
+  recordHeartbeatRecoveryChainInflight,
+  recordHeartbeatRecoveryChainSkipped,
+  recordHeartbeatRecoveryChainStalled,
+} from "./services/metrics.js";
 import { createApiTierPluginWorkerManagerStub } from "./services/plugin-worker-manager-stub.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
@@ -1096,6 +1102,10 @@ export async function startServer(): Promise<StartedServer> {
   let heartbeatSchedulerStopped = false;
   let heartbeatStartupRecoveryPending = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
+  // PEN-3314. Separate timer from `heartbeatSchedulerInterval` on purpose — see
+  // the watchdog registration below for why the recovery-chain detector must
+  // not ride the heartbeat tick.
+  let heartbeatRecoveryChainWatchdogInterval: ReturnType<typeof setInterval> | null = null;
   /**
    * BLO-19123. Last time the hand-back drain actually ran, so its cadence is decoupled from
    * the scheduler's.
@@ -1139,6 +1149,23 @@ export async function startServer(): Promise<StartedServer> {
   // overlap the latch exists to remove, so this reports and does not act.
   let heartbeatRecoveryChainInFlight = false;
   let heartbeatRecoveryChainStartedAt = 0;
+  // PEN-3314: latches the stall COUNTER to once per stalled pass. A counter
+  // that ticked with the log would conflate "how many passes stalled" with "how
+  // long one of them has been stalled", and the first is the alertable
+  // quantity. Reset when a new pass starts, not when one ends, so a pass that
+  // never settles cannot re-arm it.
+  let heartbeatRecoveryChainStallCounted = false;
+  // PEN-3314, from Ally's review of 0cbb0915: the stall report re-logs while the
+  // halt is unresolved — an unresolved halt should keep saying so — but at
+  // `error` and one line per watchdog sample that is unbounded, and the watchdog
+  // now samples faster than the scheduler interval (see
+  // HEARTBEAT_RECOVERY_CHAIN_WATCHDOG_INTERVAL_MS), which would have tripled it.
+  // Re-log on its own coarse clock instead: the first crossing logs
+  // immediately, then at most one line per HEARTBEAT_RECOVERY_CHAIN_RELOG_MS.
+  // `0` means "not currently logged as stalled"; reset with the counter latch on
+  // pass start so a later stall reports immediately rather than inheriting the
+  // previous pass's clock.
+  let heartbeatRecoveryChainStallLoggedAt = 0;
   // BLO-22984: the same latch, for the execution-workspace collector. It is
   // its own tracked pass (below), and `setInterval` fires the next callback on
   // schedule whether or not the previous one settled, so without this a slow
@@ -1155,10 +1182,32 @@ export async function startServer(): Promise<StartedServer> {
   // the chain's stamp it reports and does not act.
   let executionWorkspaceCollectorInFlight = false;
   let executionWorkspaceCollectorStartedAt = 0;
-  // 10 ticks. Above the normal case (a sweep routinely outlives one interval —
-  // that is what the latch is for) and far below the hours a wedged chain would
-  // otherwise sit silent.
-  const HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS = 10 * config.heartbeatSchedulerIntervalMs;
+  // 10 scheduler intervals. Above the normal case (a sweep routinely outlives
+  // one interval — that is what the latch is for) and far below the hours a
+  // wedged chain would otherwise sit silent. Deliberately scaled to the
+  // SCHEDULER interval, not the watchdog's sampling period below: it describes
+  // how long a pass may legitimately run, which is a property of the work, not
+  // of how often we look at it. Naming it `…_STALL_MS` rather than
+  // `…_STALL_WARN_MS` keeps it honest now that its two readers log at different
+  // levels — `error` for the recovery chain, `warn` for the execution-workspace
+  // collector.
+  const HEARTBEAT_RECOVERY_CHAIN_STALL_MS = 10 * config.heartbeatSchedulerIntervalMs;
+  // PEN-3314: how often a still-stalled pass re-logs. One line per stall
+  // threshold keeps the "keeps saying so" property bounded at ~288 lines/day per
+  // wedged worker instead of one per watchdog sample.
+  const HEARTBEAT_RECOVERY_CHAIN_RELOG_MS = HEARTBEAT_RECOVERY_CHAIN_STALL_MS;
+  // PEN-3314, from Ally's review of 0cbb0915: sample at a FRACTION of the
+  // scheduler interval, not at the interval itself. The documented alert is
+  // `inflight > heartbeatSchedulerIntervalMs`, so sampling at that same period
+  // lets the gauge lag the actual overlap crossing by up to a full interval —
+  // the one quantity the alert thresholds on. This callback reads two in-memory
+  // variables, awaits nothing and touches no database, so a faster period costs
+  // nothing. Floored so a pathologically small configured interval cannot spin
+  // the timer.
+  const HEARTBEAT_RECOVERY_CHAIN_WATCHDOG_INTERVAL_MS = Math.max(
+    1_000,
+    Math.floor(config.heartbeatSchedulerIntervalMs / 3),
+  );
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
     let tracked: Promise<void>;
@@ -1437,6 +1486,83 @@ export async function startServer(): Promise<StartedServer> {
     if (toolHealthSweep.failed > 0) {
       logger.warn({ ...toolHealthSweep }, "startup tool connection health sweep found failing connections");
     }
+
+    // PEN-3314. Deliberately its OWN timer, not part of the heartbeat tick
+    // below. The tick reaches the recovery-chain latch only after two
+    // `resolveSchedulingSuppression()` round-trips and a suppression branch, so
+    // it is downstream of the very resource whose exhaustion this detector
+    // exists to report: when the pool saturates — `active` pinned at
+    // POSTGRES_POOL_MAX with a long `waiting` queue, the BLO-34207 state — every
+    // tick parks on those awaits and none arrives here. Reporting from there
+    // would therefore go SILENT exactly when the chain is wedged, and worse than
+    // silent: the in-flight gauge would hold the `0` written by the last settle,
+    // so the worker would export a confident "no pass outstanding" throughout
+    // the incident. That is the same fabricated-health failure the tick body's
+    // own comment above says this code exists to remove.
+    //
+    // This callback reads two in-memory variables and writes two metrics. It
+    // touches no database, takes no lock, and awaits nothing, so nothing the
+    // chain can do to the pool can starve it.
+    heartbeatRecoveryChainWatchdogInterval = setInterval(() => {
+      try {
+        if (heartbeatSchedulerStopped) return;
+        if (!heartbeatRecoveryChainInFlight) {
+          // No pass outstanding. Written every tick rather than only on settle
+          // so the series stays live even if a settle path is ever missed.
+          recordHeartbeatRecoveryChainInflight(0);
+          return;
+        }
+        const inFlightMs = Math.max(0, Date.now() - heartbeatRecoveryChainStartedAt);
+        recordHeartbeatRecoveryChainInflight(inFlightMs);
+        if (inFlightMs > HEARTBEAT_RECOVERY_CHAIN_STALL_MS) {
+          if (!heartbeatRecoveryChainStallCounted) {
+            // Latch before the record, matching the log's own ordering: a
+            // throwing recorder must not re-arm a once-per-pass signal.
+            heartbeatRecoveryChainStallCounted = true;
+            recordHeartbeatRecoveryChainStalled();
+          }
+          // A chain in flight across many ticks is not normal. Reported, not
+          // acted on — see the latch declaration for why clearing it would
+          // re-admit the overlap the latch exists to remove.
+          //
+          // `error`, not `warn`, to match what the matching series already
+          // documents ({@link HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC}: "Page
+          // on this. It is rare by design and it does not resolve itself").
+          // Every recovery pass on this worker is halted by the time this
+          // fires, and it lets a log-based alert reach the same conclusion as a
+          // metric-based one.
+          //
+          // Re-logged on its own coarse clock rather than once per sample. The
+          // halt does not resolve itself, so it must keep saying so; but at
+          // `error`, and at a watchdog period deliberately shorter than the
+          // scheduler interval, one line per sample is an unbounded page storm
+          // against a worker that is already down. Nothing is lost by the
+          // suppressed lines: `inFlightMs` is monotonic for the life of the
+          // pass, so each line that does survive already says how far into the
+          // same unresolved stall it is.
+          const now = Date.now();
+          if (
+            heartbeatRecoveryChainStallLoggedAt === 0 ||
+            now - heartbeatRecoveryChainStallLoggedAt >= HEARTBEAT_RECOVERY_CHAIN_RELOG_MS
+          ) {
+            heartbeatRecoveryChainStallLoggedAt = now;
+            logger.error(
+              {
+                inFlightMs,
+                stallAfterMs: HEARTBEAT_RECOVERY_CHAIN_STALL_MS,
+                relogAfterMs: HEARTBEAT_RECOVERY_CHAIN_RELOG_MS,
+              },
+              "periodic heartbeat recovery chain still in flight across many ticks; recovery passes are not running",
+            );
+          }
+        }
+      } catch (err) {
+        // An uncaught throw from a bare timer callback takes the process down,
+        // and this watchdog runs precisely when the worker is already degraded.
+        // Losing a metric sample is survivable; losing the worker is the outage.
+        logger.warn({ err }, "heartbeat recovery chain watchdog tick failed");
+      }
+    }, HEARTBEAT_RECOVERY_CHAIN_WATCHDOG_INTERVAL_MS);
 
     heartbeatSchedulerInterval = setInterval(() => {
       // Async so the suppression checks below can honor the override-aware
@@ -1777,14 +1903,14 @@ export async function startServer(): Promise<StartedServer> {
               }));
           } else if (
             Date.now() - executionWorkspaceCollectorStartedAt >
-            HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS
+            HEARTBEAT_RECOVERY_CHAIN_STALL_MS
           ) {
             // Skipping is normal and silent; a pass in flight for many ticks is
             // not. Reported, not acted on: see the latch declaration.
             logger.warn(
               {
                 inFlightMs: Date.now() - executionWorkspaceCollectorStartedAt,
-                warnAfterMs: HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS,
+                warnAfterMs: HEARTBEAT_RECOVERY_CHAIN_STALL_MS,
               },
               "periodic execution-workspace collector still in flight across many ticks; workspaces are not being collected",
             );
@@ -1885,6 +2011,11 @@ export async function startServer(): Promise<StartedServer> {
           if (!heartbeatRecoveryChainInFlight) {
             heartbeatRecoveryChainInFlight = true;
             heartbeatRecoveryChainStartedAt = Date.now();
+            heartbeatRecoveryChainStallCounted = false;
+            // Same reset scope as the counter latch: a new pass must be able to
+            // report its own stall immediately rather than waiting out the
+            // previous pass's re-log clock.
+            heartbeatRecoveryChainStallLoggedAt = 0;
             trackHeartbeatSchedulerWork(heartbeat
               .reconcileStrandedAssignedIssues()
               .then(async (reconciled) => {
@@ -1974,22 +2105,75 @@ export async function startServer(): Promise<StartedServer> {
                 logger.error({ err }, "periodic heartbeat recovery failed");
               })
               .finally(() => {
+                // Read the duration BEFORE clearing the start stamp. A backwards
+                // clock must not produce a negative value on a gauge that only
+                // ever means "how long did this take". Captured into a local
+                // rather than recorded here, because the latch must be cleared
+                // first — see below.
+                const elapsedMs = Math.max(0, Date.now() - heartbeatRecoveryChainStartedAt);
+                // Clear the latch BEFORE any fallible call. Both recorders route
+                // through `ensureRegistry()` and prom-client validates on `.set()`,
+                // so either can throw; a throw between here and the clear would
+                // leave the latch set and every later tick would take the skip
+                // branch for the life of the process — orphan reaping, retry
+                // promotion, stranded-issue reconciliation and the watchdogs all
+                // halted until restart. The rejection is swallowed by
+                // `trackHeartbeatSchedulerWork`, so that wedge would be silent.
+                // Same reasoning as the watchdog's own `try`/`catch` above:
+                // losing a metric sample is survivable, losing the chain is the
+                // outage.
                 heartbeatRecoveryChainInFlight = false;
                 heartbeatRecoveryChainStartedAt = 0;
+                try {
+                  recordHeartbeatRecoveryChainDuration(elapsedMs);
+                  // No pass is outstanding now. Leaving the previous value behind
+                  // would keep the overlap alert firing against a worker that has
+                  // already recovered.
+                  recordHeartbeatRecoveryChainInflight(0);
+                } catch (err) {
+                  logger.error(
+                    { err },
+                    "failed to record heartbeat recovery chain settle metrics; chain latch already cleared",
+                  );
+                }
               }));
-          } else if (
-            Date.now() - heartbeatRecoveryChainStartedAt >
-            HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS
-          ) {
-            // Skipping is normal and silent; a chain that has been in flight for
-            // many ticks is not. Reported, not acted on — see the latch decl.
-            logger.warn(
-              {
-                inFlightMs: Date.now() - heartbeatRecoveryChainStartedAt,
-                warnAfterMs: HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS,
-              },
-              "periodic heartbeat recovery chain still in flight across many ticks; recovery passes are not running",
-            );
+          } else {
+            // Every skipped tick, not just the stalled ones: a sustained skip
+            // rate is how "the chain is outrunning the interval" becomes
+            // visible, and that is observable hours before the heap ceiling.
+            //
+            // PEN-3314: this is the ONLY recovery-chain signal that belongs on
+            // the tick, because it is the only one whose subject *is* the tick —
+            // "a tick reached the latch and had to skip". The in-flight gauge and
+            // the stall report deliberately live on the watchdog timer instead;
+            // both describe the pass rather than the tick, and both must keep
+            // reporting when no tick gets this far. That split is also what makes
+            // a flat skip counter readable: paired with a climbing in-flight
+            // gauge it now means "ticks are not arriving", which is a distinct
+            // and worse condition than "the chain is keeping up".
+            try {
+              recordHeartbeatRecoveryChainSkipped();
+            } catch (err) {
+              // Same hazard the settle path above guards, at the one call site
+              // that fix did not reach: this recorder routes through the same
+              // `ensureRegistry()` and can throw for the same reasons.
+              //
+              // It matters more here than the line count suggests. This branch
+              // runs ONLY while a pass is already in flight — the degraded
+              // state these metrics exist to make visible — so an unguarded
+              // throw would take the worker down in precisely the window the
+              // instrumentation was added to report on.
+              //
+              // "Takes the worker down" is literal, and it is not Node's
+              // default `ERR_UNHANDLED_REJECTION`. This IIFE is `void`-ed with
+              // no `.catch()`, so the rejection reaches the
+              // `unhandledRejection` handler that `installWorkerCrashGuard()`
+              // arms at the entrypoint — which terminalizes every in-flight run
+              // on this worker and exits 1. Losing a metric sample is
+              // survivable; losing the worker and every run on it is the
+              // outage.
+              logger.error({ err }, "failed to record heartbeat recovery chain skip");
+            }
           }
         }
       })();
@@ -2411,6 +2595,10 @@ export async function startServer(): Promise<StartedServer> {
       if (heartbeatSchedulerInterval) {
         clearInterval(heartbeatSchedulerInterval);
         heartbeatSchedulerInterval = null;
+      }
+      if (heartbeatRecoveryChainWatchdogInterval) {
+        clearInterval(heartbeatRecoveryChainWatchdogInterval);
+        heartbeatRecoveryChainWatchdogInterval = null;
       }
 
       const heartbeatShutdown = await coordinateHeartbeatSchedulerShutdown({
