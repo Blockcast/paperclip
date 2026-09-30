@@ -155,7 +155,7 @@ RUN apt-get update \
 # system site-packages; the console script is symlinked onto PATH. The
 # `graphify --version` self-check fails the build on a bad version/URL (same
 # discipline as the tinygo/java/protoc checks).
-ARG GRAPHIFY_VERSION=0.8.46
+ARG GRAPHIFY_VERSION=0.9.62
 RUN python3 -m venv /opt/graphify \
   && /opt/graphify/bin/pip install --no-cache-dir "graphifyy[mcp]==${GRAPHIFY_VERSION}" \
   && ln -sf /opt/graphify/bin/graphify /usr/local/bin/graphify \
