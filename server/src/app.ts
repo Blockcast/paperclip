@@ -73,6 +73,7 @@ import {
   expireStaleRefreshFreshness,
   refreshAgentStartLockMetrics,
   refreshDbPoolMetrics,
+  refreshFdClassMetrics,
   startScrapeMetricsCollector,
 } from "./services/scrape-metrics-collector.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
@@ -324,12 +325,15 @@ export async function createApp(
   // `refreshDbPoolMetrics` and `refreshAgentStartLockMetrics` are synchronous
   // in-memory reads, not queries — which is load-bearing for the last one
   // (PEN-3305): it reports dispatch sections wedged on the database, so it must
-  // not itself need the database to be reachable.
+  // not itself need the database to be reachable. `refreshFdClassMetrics`
+  // (PEN-3314) joins them on the same terms: procfs is kernel memory, so the
+  // descriptor walk is syscalls without I/O wait.
   app.get("/metrics", async (_req, res, next) => {
     try {
       expireStaleRefreshFreshness();
       refreshDbPoolMetrics(db);
       refreshAgentStartLockMetrics();
+      refreshFdClassMetrics();
       const { contentType, body } = await renderMetrics();
       res.status(200).set("Content-Type", contentType).send(body);
     } catch (err) {
