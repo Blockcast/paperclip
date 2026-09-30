@@ -1372,6 +1372,25 @@ test("the start-lock retune prose does not run ahead of the evidence (BLO-36522)
     "runbook must narrow the 09-15/16 claim to the only fleet-scope episode ended by a pod replacement",
   );
 
+  // Step 4 is the step an operator executes, and the split left it describing
+  // the pre-split single alert: its capture-and-wait rationale is FleetStall
+  // evidence (holds up to 2h14m), while Wedged pages at 14400s + 5m = 4h05m,
+  // about 1h55m before the [6h] restart gate can read anything but
+  // inconclusive. The two arms also fire together (09-15/16 tripped both), so
+  // the step must say which governs.
+  const step4Index = section.indexOf("#### Step 4");
+  assert.notStrictEqual(step4Index, -1, "runbook start-lock section must keep its Step 4");
+  const step4End = section.slice(step4Index + 1).search(/\n#{2,4} /);
+  const step4 = section.slice(step4Index, step4End === -1 ? undefined : step4Index + 1 + step4End);
+  for (const [pattern, message] of [
+    [/`PaperclipAgentStartLockFleetStall` alone: capture, then wait/, "Step 4 must scope capture-and-wait to FleetStall"],
+    [/`PaperclipAgentStartLockWedged`: capture, then re-check the restart gate/, "Step 4 must give Wedged its own action"],
+    [/4h05m[\s\S]*1h55m after the page/, "Step 4 must state that the 6h gate floor lands ~1h55m after a Wedged page (4h05m)"],
+    [/Both firing: `Wedged` governs/, "Step 4 must say Wedged governs when both arms fire"],
+  ]) {
+    assert.match(step4, pattern, message);
+  }
+
   // The coverage note describes Blockcast's live onprem-k8s rules, which this
   // chart does not match: PaperclipQueuedRunStrandedFleet exists only there,
   // and this chart still renders the per-agent PaperclipQueuedRunStranded. At
