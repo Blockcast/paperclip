@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, exists, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, not, notInArray, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, exists, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, max, ne, not, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db, DbTransaction } from "@paperclipai/db";
 
 /**
@@ -35061,7 +35061,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       cooldownSec: policy.cooldownSec,
       lastHeartbeatAt: agent.lastHeartbeatAt,
     });
-    if (cooldown.active) {
+    // BLO-34578 review: the scheduler's own ticks are exempt. `tickTimers` only
+    // gets here once `intervalSec` has elapsed since the agent's last TIMER tick,
+    // and an enabled policy clamps `cooldownSec` to `intervalSec`, so the
+    // cooldown adds nothing for them. What it would add is the old
+    // `lastHeartbeatAt` baseline: every run stamps that column, so an event-busy
+    // agent would have each tick spent here, and this skip row is itself a timer
+    // row, so it advances the baseline and the tick is lost. Timer-sourced wakes
+    // from the API are still throttled.
+    const schedulerTimerTick =
+      opts.requestedByActorType === "system" && opts.requestedByActorId === "heartbeat_scheduler";
+    if (cooldown.active && !schedulerTimerTick) {
       await writeSkippedRequest("heartbeat.cooldown.active");
       logger.debug(
         { agentId, source, cooldownSec: policy.cooldownSec, cooldownRemainingSec: cooldown.remainingSec, preset: policy.preset },
@@ -40039,6 +40049,47 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       };
 
+      // BLO-34578 review: the penstock capacity gate inside `wakeup()` is the one
+      // timer exit that writes no `agentWakeupRequests` row at all, deliberately —
+      // it does not DECLINE the wake, it postpones it behind a committed
+      // `scheduled_retry` run, and BLO-18859 requires `durableSkipReason` to stay
+      // null so the suppression metric does not label a postponement as a refusal.
+      //
+      // That leaves the timer with no record that it ran, so the baseline never
+      // advances and the gate stays open: the scheduler re-enters the same path
+      // every pass (`heartbeatSchedulerIntervalMs` defaults to 30s) and each pass
+      // commits another `scheduled_retry` run, because a bare timer wake carries
+      // no `taskKey` and so cannot coalesce. Pre-fix this self-closed by accident
+      // on a busy agent — any concurrent run bumped `lastHeartbeatAt` — so the
+      // baseline change above newly exposes it for exactly the event-busy agents
+      // this issue is about, which are also the heaviest provider consumers.
+      //
+      // Recorded here rather than in `wakeup()`: the loop already classifies this
+      // outcome (`suppression.providerCapacityDeferred`, read below), and the
+      // timer ledger is the loop's own concern. Writing it here leaves the
+      // capacity gate's contract untouched — `durableSkipReason` stays null, the
+      // wake is still postponed rather than declined — while recording the true
+      // fact that the timer evaluated this agent at `now`. Unlike the two skip
+      // writers above it leaves `lastHeartbeatAt` alone: no run happened, and no
+      // reader on the timer path uses that column any more (the baseline below is
+      // the timer row or `createdAt`, and the cooldown exempts scheduler ticks),
+      // so a bump would only keep the liveness signal fresh for the length of a
+      // capacity outage.
+      const writeTimerProviderCapacityDeferred = async (agent: typeof agents.$inferSelect) => {
+        await db.insert(agentWakeupRequests).values({
+          companyId: agent.companyId,
+          agentId: agent.id,
+          source: "timer",
+          triggerDetail: "system",
+          reason: "provider_capacity_deferred",
+          payload: { heartbeatSkip: { reason: "provider_capacity_deferred" } },
+          status: "skipped",
+          requestedByActorType: "system",
+          requestedByActorId: "heartbeat_scheduler",
+          finishedAt: now,
+        });
+      };
+
       const opencodeK8sAgentIds = allAgents
         .filter((agent) => agent.adapterType === "opencode_k8s")
         .map((agent) => agent.id);
@@ -40056,6 +40107,60 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
         for (const row of assignedLiveWorkRows) {
           if (row.agentId) assignedLiveWorkAgentIds.add(row.agentId);
+        }
+      }
+
+      // BLO-34578: the interval timer used `agents.lastHeartbeatAt` as its
+      // baseline, but that column is stamped by EVERY run's status transition
+      // (`finalizeAgentStatus`), not only by timer ticks. So the gate below was
+      // really asking "has this agent had NO run of ANY KIND for intervalSec?",
+      // and an event-driven agent whose inter-run gap is shorter than its
+      // interval could never satisfy it — its timer never fired at all.
+      //
+      // Measured 2026-09-19 over 9h/1000 runs: Ally took a run every 2-5 min and
+      // logged 0 timer wakes at intervalSec=3600 (expected ~9); same for CTO and
+      // Release Engineer. `max inter-run gap >= intervalSec` predicted the split
+      // 5/5 on the zero side and 6/7 on the other. The timer is the only path
+      // that sweeps an agent's already-assigned `todo` backlog, so the effect ran
+      // backwards: the busier the agent, the less its own queue was ever swept.
+      // Ally's oldest assigned `todo` had aged 12d while it burned ~260 runs/9h.
+      //
+      // Fix is read-side only. Every timer tick — dispatched, skipped by a
+      // circuit breaker, blocked by the daily cap, or deferred by the provider
+      // capacity gate (see `writeTimerProviderCapacityDeferred` above, which
+      // closes the one exit that used to write nothing) — inserts an
+      // `agentWakeupRequests` row with `source: "timer"`, so that table is an
+      // exact, self-healing record of when the timer last ran. Deriving the
+      // baseline from it needs no new column and no new state key. Batched here
+      // rather than queried per-agent in the loop, same as
+      // `assignedLiveWorkAgentIds` above, and served by the partial index
+      // `agent_wakeup_requests_timer_baseline_idx` (migration 0247) — the
+      // pre-existing `(agent_id, requested_at)` index does NOT cover this, since
+      // it carries no `source` column and would make each agent's whole
+      // append-only history the scan bound on the largest table in the schema.
+      //
+      // `lastHeartbeatAt` deliberately keeps its liveness meaning: agent-health
+      // checks, the stale-heartbeat alert and the agent page all read it, and
+      // narrowing its writers to timer ticks would break every one of them.
+      const lastTimerWakeAtByAgentId = new Map<string, Date>();
+      if (allAgents.length > 0) {
+        const lastTimerWakeRows = await db
+          .select({
+            agentId: agentWakeupRequests.agentId,
+            lastRequestedAt: max(agentWakeupRequests.requestedAt),
+          })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              inArray(agentWakeupRequests.agentId, allAgents.map((agent) => agent.id)),
+              eq(agentWakeupRequests.source, "timer"),
+            ),
+          )
+          .groupBy(agentWakeupRequests.agentId);
+        for (const row of lastTimerWakeRows) {
+          if (row.agentId && row.lastRequestedAt) {
+            lastTimerWakeAtByAgentId.set(row.agentId, new Date(row.lastRequestedAt));
+          }
         }
       }
 
@@ -40081,7 +40186,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
 
         checked += 1;
-        const baseline = new Date(agent.lastHeartbeatAt ?? agent.createdAt).getTime();
+        // No timer tick has ever been recorded for this agent: a brand-new agent,
+        // or one created before this baseline shipped. Falling back to
+        // `lastHeartbeatAt` here would reproduce the original bug verbatim and
+        // permanently — an agent that is busy from creation has a perpetually
+        // fresh `lastHeartbeatAt`, so it never passes this gate, so it never
+        // writes a timer row, so the fallback applies forever (BLO-34578 review).
+        // `createdAt` fires once, that tick writes the first timer row, and the
+        // agent self-heals into the timer-row regime. `agent_wakeup_requests` is
+        // append-only (there is no delete against it anywhere in the repo), so
+        // "history was pruned" is not a case this has to preserve behaviour for.
+        const baseline = (lastTimerWakeAtByAgentId.get(agent.id) ?? agent.createdAt).getTime();
         const elapsedMs = now.getTime() - baseline;
         if (elapsedMs < policy.intervalSec * 1000) continue;
 
@@ -40164,6 +40279,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // exclusion metric describe the same outcome for first and later parks.
         if (run && suppression.dependencyBlockedRetryAt === null) enqueued += 1;
         else {
+          // A capacity-deferred tick wrote nothing, so record that the timer ran
+          // before the baseline is read again on the next pass. See the writer.
+          if (suppression.providerCapacityDeferred) await writeTimerProviderCapacityDeferred(agent);
           recordHeartbeatTimerSchedulerExclusion(resolveHeartbeatTimerSchedulerExclusionReason(suppression));
           skipped += 1;
         }
