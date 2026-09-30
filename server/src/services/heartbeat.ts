@@ -2157,6 +2157,13 @@ const STARVATION_RECOVERY_ESCALATION_MS = 10 * 60 * 1000;
 // visible, do not immediately delete that live Job. The adapter process may
 // still be awaiting/synchronizing the Job and should be allowed to finish.
 const EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS = 5 * 60 * 1000;
+// PEN-3640: how long an unreleased external-runtime reservation may sit before
+// the reclaim sweep names the branch that is refusing it. Every skip in
+// `reconcileReleasePendingExternalRuntimeReservations` used to be silent, so a
+// 64.6 h production strand was visible only as a rising gauge with no
+// attributable cause. Well above the legitimate transients (the 5 min grace
+// above, a Job mid-termination) so steady-state churn stays quiet.
+const EXTERNAL_RUNTIME_RESERVATION_STUCK_LOG_AFTER_MS = 30 * 60 * 1000;
 // BLO-12996: hard ceiling after which a live-but-silent external-lifecycle Job
 // is force-killed to unblock agent dispatch. This is deliberately MUCH longer
 // than EXTERNAL_LIFECYCLE_STALE_MS (15 min). The 15-min soft floor is safe for
@@ -24766,9 +24773,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .select({
         reservation: externalRuntimeReservations,
         run: heartbeatRuns,
+        adapterType: agents.adapterType,
       })
       .from(externalRuntimeReservations)
       .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, externalRuntimeReservations.runId))
+      // PEN-3640: left, not inner. `adapterType` only selects which liveness
+      // signal is authoritative below, so it must never change which rows the
+      // reclaim sweep can see. `agent_id` is ON DELETE CASCADE, so a null here
+      // is not reachable today; the join is left purely so that stays true if
+      // that ever changes.
+      .leftJoin(agents, eq(agents.id, heartbeatRuns.agentId))
       .where(
         and(
           isNull(externalRuntimeReservations.releasedAt),
@@ -24815,7 +24829,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ),
         ),
       );
-    for (const { reservation, run } of pending) {
+    // PEN-3640: name the branch that is refusing to release a long-held
+    // reservation. Rate-limited by age, not by pass, so a healthy fleet stays
+    // silent and a genuine strand is attributable from the logs alone.
+    const noteStuckSkip = (
+      reservation: typeof externalRuntimeReservations.$inferSelect,
+      refusedBy: string,
+    ) => {
+      const heldMs = Date.now() - new Date(reservation.reservedAt).getTime();
+      if (heldMs < EXTERNAL_RUNTIME_RESERVATION_STUCK_LOG_AFTER_MS) return;
+      logger.warn(
+        {
+          reservationId: reservation.id,
+          runId: reservation.runId,
+          agentId: reservation.agentId,
+          reservationState: reservation.state,
+          jobName: reservation.jobName ?? reservation.expectedJobName,
+          heldSeconds: Math.round(heldMs / 1000),
+          refusedBy,
+        },
+        "external-runtime reservation still unreleased after reclaim sweep refused it",
+      );
+    };
+
+    for (const { reservation, run, adapterType } of pending) {
       // BLO-21460 (Ally important 1): isolate per-row failures. The release
       // write below can reject on transient pool or serialization errors, and
       // a deterministic single-row failure would otherwise abort the rest of
@@ -24824,8 +24861,43 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // later kube-independent stages of the tick chain. Report partial
       // failure through the freshness gauge instead of unwinding.
       try {
-        if (activeRunExecutions.has(reservation.runId)) continue;
-        if (ambiguousRunIds.has(reservation.runId)) continue;
+        // PEN-3640: for a non-external adapter the in-process await is
+        // authoritative -- `executeRun` is driving the run in this very pod and
+        // the sweep must not race it. For an external-lifecycle adapter the
+        // kube Job is the source of truth, and the in-process await can be hung
+        // forever on a preRun hook timeout, an MCP RPC with no client timeout,
+        // or a Job that vanished without notifying the awaiting code. The run
+        // then sits in `activeRunExecutions` for the life of the worker
+        // process, and an unconditional skip here quarantines its reservation
+        // just as permanently -- `released_at` stays NULL, the partial unique
+        // index `external_runtime_reservations_active_slot_idx (agent_id,
+        // slot_id) WHERE released_at IS NULL` holds that slot, and the agent's
+        // effective concurrency is ratcheted down by one until the worker
+        // restarts. `reapOrphanedRuns` already carries exactly this exemption
+        // (see the `!externalLifecycleRun` guard on the same Set below); this
+        // sweep was left behind, so the reaper would finalize the run while its
+        // reservation stayed `release_pending` forever.
+        //
+        // Measured in production 2026-09-30: the UX Designer seat held a
+        // `release_pending` reservation for 64.6 h and Devops for 36.3 h,
+        // across an unbroken 144.8 h worker uptime (0 restarts), with no
+        // backing k8s Job for either agent and every other refusal branch in
+        // this loop silent in the logs.
+        //
+        // Dropping the skip is safe because it does not release anything: the
+        // Job-identity, `phase === "active"` and exact `readAgentJobRunStatusByName`
+        // checks below still gate every release, so a live Job keeps its slot.
+        if (
+          activeRunExecutions.has(reservation.runId)
+          && !(adapterType && hasExternalLifecycle(adapterType))
+        ) {
+          noteStuckSkip(reservation, "active_run_execution");
+          continue;
+        }
+        if (ambiguousRunIds.has(reservation.runId)) {
+          noteStuckSkip(reservation, "ambiguous_job_identity");
+          continue;
+        }
         const observed = jobRunStatuses?.get(reservation.runId) ?? null;
         const launchedIdentityMatches = Boolean(
           reservation.jobName
@@ -24840,7 +24912,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
           continue;
         }
-        if (observed?.phase === "active") continue;
+        if (observed?.phase === "active") {
+          noteStuckSkip(reservation, "job_active");
+          continue;
+        }
 
         let terminalOrMissing = launchedIdentityMatches;
         const jobName = reservation.jobName ?? reservation.expectedJobName;
@@ -24848,7 +24923,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           !jobName &&
           (reservation.isolationMode === "shared" || reservation.isolationMode === "workspace") &&
           Date.now() - new Date(reservation.updatedAt).getTime() < EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS;
-        if (isolationSetupGraceActive) continue;
+        if (isolationSetupGraceActive) {
+          noteStuckSkip(reservation, "isolation_setup_grace");
+          continue;
+        }
         // Both bundled external adapters await onMeta before createNamespacedJob.
         // onMeta persists expectedJobName, so no name is durable proof that Job
         // creation was never crossed, even if the dispatcher crashed afterward.
@@ -24867,7 +24945,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ),
           );
         }
-        if (!terminalOrMissing) continue;
+        if (!terminalOrMissing) {
+          noteStuckSkip(reservation, jobName ? "job_not_terminal_or_unreadable" : "launch_unfinished");
+          continue;
+        }
 
         const terminalPrelaunchOrphan =
           reservation.state === "reserved" || reservation.state === "launching";
