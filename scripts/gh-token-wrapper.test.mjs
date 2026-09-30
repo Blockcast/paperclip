@@ -238,6 +238,32 @@ test("still falls back to the real binary when PAPERCLIP_GITHUB_TOKEN_FILE is un
   });
 });
 
+test("refuses when PAPERCLIP_GITHUB_TOKEN_FILE is set but EMPTY (Ally review of c9eb188d)", (t) => {
+  // Pins `${VAR+x}` against the `[ -n "${VAR:-}" ]` Ally suggested for the
+  // diagnostic's sake: `-n` is false for a set-but-empty value, so it would
+  // fall straight through to ambient auth — reopening, for exactly the shape a
+  // broken deployment produces, the fail-open this PR exists to close. The
+  // message was reworded instead. Same skip as the fallback test above: with
+  // the var empty the wrapper resolves the compiled-in default, which holds the
+  // live token in an agent pod.
+  if (existsSync(COMPILED_IN_DEFAULT_TOKEN_FILE)) {
+    t.skip(`${COMPILED_IN_DEFAULT_TOKEN_FILE} exists; refusing to read a live credential`);
+    return;
+  }
+  withTempDir((dir) => {
+    const proc = spawnWrapper(dir, {
+      args: ["auth", "status"],
+      setTokenFileVar: false,
+      extraEnv: { PAPERCLIP_GITHUB_TOKEN_FILE: "" },
+    });
+    assert.equal(proc.status, 64);
+    assert.match(proc.stderr, /is absent; refusing to run with ambient auth/);
+    // The message must not claim the variable named this path — it did not.
+    assert.match(proc.stderr, /is set, so a token file is required, but/);
+    assert.equal(proc.stdout, "");
+  });
+});
+
 test("refuses to spawn against the live compiled-in default token file (Ally review of 396e913f)", (t) => {
   // The mirror of the skip above, which protects only itself: any *new* test
   // taking `setTokenFileVar: false` reaches the same live credential, and the

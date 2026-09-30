@@ -202,6 +202,13 @@ if [ "${PAPERCLIP_GITHUB_TOKEN_FILE+x}" = x ]; then
     # thing a human or a probe runs to decide whether the binary works at all,
     # which is exactly when refusing it would mislead. `config` reads and writes
     # only ~/.config/gh, so it belongs to the same rule.
+    #
+    # The rule is narrower than "every local-only invocation", deliberately: the
+    # patterns match on `$1 $2`, so subcommand-level help (`gh api -h`,
+    # `gh repo view -h`) is still refused even though it contacts nothing.
+    # Widening this is the fail-open direction and the stakes are low — `gh help
+    # api` is the exempt equivalent, and the forms a human or the
+    # github-cli-probe reaches for first are already here.
     "--version "* | "version "* | "--help "* | "-h "* | "help "* | "completion "* | "config "* | " ") TOKEN_FILE_REQUIRED=no ;;
     # `auth git-credential` is deliberately NOT exempt: git resolving a remote
     # is a real query, so it gets the stderr diagnostic at the point of failure.
@@ -215,8 +222,15 @@ fi
 # A caller's own GH_TOKEN/GITHUB_TOKEN is refused here too (the file branch
 # never honours them, see the override below), so the message names the
 # override that does work: the value branch above runs before this one.
+#
+# Says "a token file is required" rather than naming the variable as the source
+# of ${TOKEN_FILE}: the guard above tests `${VAR+x}` (set, including set-empty)
+# while :22 resolves `${VAR:-default}`, so for PAPERCLIP_GITHUB_TOKEN_FILE=""
+# the path printed is the compiled-in default and the variable named nothing.
+# Keeping the `+x` guard is the point — `-n` would let a set-but-empty value
+# fall through to ambient auth, which is the fail-open this file exists to kill.
 reject_token_file() {
-  echo "gh-token-wrapper: PAPERCLIP_GITHUB_TOKEN_FILE is set but ${TOKEN_FILE} ${1}; refusing to run with ambient auth. GH_TOKEN/GITHUB_TOKEN are not used as a fallback; to run under a specific token, set GH_SEAT_TOKEN_VALUE" >&2
+  echo "gh-token-wrapper: PAPERCLIP_GITHUB_TOKEN_FILE is set, so a token file is required, but ${TOKEN_FILE} ${1}; refusing to run with ambient auth. GH_TOKEN/GITHUB_TOKEN are not used as a fallback; to run under a specific token, set GH_SEAT_TOKEN_VALUE" >&2
   exit 64
 }
 
