@@ -154,8 +154,56 @@ export const WATCHED_GUARDS = [
   // deleted (unreadable), disabled (state), never completed — with a coarse
   // descheduled backstop on top. Tighten to ~26h once 30+ real gaps exist,
   // by this file's normal method.
-  { workflow: "master-health.yml", staleHours: 48, event: "schedule" },
+  //
+  // `graceUntil` exists because a schedule only fires from the DEFAULT branch,
+  // so at merge this workflow has zero completed `schedule` runs by
+  // construction and classifies `never-completed` — a threshold-INDEPENDENT
+  // branch the 48h above cannot cover. Without the grace it reds the hourly
+  // liveness job for up to ~24h, and an alarm that is red by design is one
+  // everybody learns to ignore, which is the exact failure this guard exists
+  // to prevent.
+  //
+  // This is a fixed literal in the PR that exists BECAUSE a fixed literal
+  // rotted, so state the difference: rotting here is FAIL-CLOSED. When it
+  // lapses the guard gets STRICTER, and the only thing that can go wrong is a
+  // loud red — never a silent green. The date is the first cron after merge
+  // (2026-10-01T00:37Z) plus two full cycles of slack for GitHub's scheduled-
+  // run delay under load. If the merge slips past it, the grace is already
+  // expired and the guard simply reds on day one: honest, not silent.
+  {
+    workflow: "master-health.yml",
+    staleHours: 48,
+    event: "schedule",
+    graceUntil: "2026-10-03T00:00:00.000Z",
+  },
 ];
+
+/**
+ * Resolves the guard entries `main()` will classify.
+ *
+ * Extracted and exported ONLY so the scoping branch is testable. It was
+ * previously inline and rebuilt entries from the workflow name alone, which
+ * silently dropped `event` and `graceUntil` — i.e. scoping to a guard reverted
+ * its own fix and reported ok off a push run. The source-text test could not
+ * see that, because the destructure it asserts on stayed correct.
+ *
+ * `GUARD_LIVENESS_WORKFLOWS` is a debugging dial that may name a workflow not
+ * in WATCHED_GUARDS at all, so an undeclared name still resolves — to the
+ * default threshold and no filter.
+ */
+export function resolveWatched(workflowsEnv, overrideHours = null) {
+  const scoped = (workflowsEnv || "").trim();
+  if (!scoped) return WATCHED_GUARDS;
+
+  return scoped.split(/\s+/).map((workflow) => {
+    const declared = WATCHED_GUARDS.find((guard) => guard.workflow === workflow);
+    return {
+      ...declared,
+      workflow,
+      staleHours: overrideHours ?? declared?.staleHours ?? DEFAULT_STALE_HOURS,
+    };
+  });
+}
 
 /** Back-compat / convenience view: just the workflow filenames. */
 export const WATCHED_WORKFLOWS = WATCHED_GUARDS.map((guard) => guard.workflow);
@@ -202,7 +250,11 @@ export const EXEMPT_SCHEDULED_DEFAULT_WORKFLOWS = [
  * @returns {{workflow: string, status: "ok"|"stale"|"unknown", reason: string,
  *            name: string, ageMinutes: number|null, detail: string}}
  */
-export function classifyGuard(workflow, observation, { now, staleHours = DEFAULT_STALE_HOURS } = {}) {
+export function classifyGuard(
+  workflow,
+  observation,
+  { now, staleHours = DEFAULT_STALE_HOURS, graceUntil = null } = {},
+) {
   const name = observation?.name || workflow;
   const base = { workflow, name, ageMinutes: null };
 
@@ -245,6 +297,30 @@ export function classifyGuard(workflow, observation, { now, staleHours = DEFAULT
   }
 
   if (!observation?.newest) {
+    // Grace is checked BEFORE the cross-check, deliberately. A guard inside its
+    // grace window has no completed run for a known, benign reason, so there is
+    // nothing for a second read to corroborate — and returning `ok` here means
+    // main()'s `first.status !== "stale"` early-out fires and the cross-check
+    // call is never spent. Correct and one request cheaper.
+    //
+    // A guard whose schedule is newer than its own history has no completed run
+    // yet and cannot have one: schedules fire only from the default branch, so
+    // the count is zero at merge by construction. Red-by-design until the first
+    // cron is noise sitting on top of a shared alarm — see graceUntil's comment
+    // in WATCHED_GUARDS. Only this branch is graced; every other stale reason is
+    // decided on real evidence and is not suppressed.
+    if (graceUntil && now < Date.parse(graceUntil)) {
+      return {
+        ...base,
+        status: "ok",
+        reason: "awaiting-first-run",
+        detail:
+          `${name} (${workflow}) has no completed run yet and is inside its grace window until ` +
+          `${graceUntil}. A newly-scheduled workflow cannot have fired before it reached the ` +
+          `default branch. After that instant this reverts to a hard red.`,
+      };
+    }
+
     // This reds on the SAME filtered index the rest of this function now
     // distrusts, and on its strongest possible claim — "never enforced
     // anything". An index that served a 140-run-old entry as [0] is not
@@ -746,17 +822,17 @@ function main() {
   const override = process.env.GUARD_LIVENESS_STALE_HOURS;
   const overrideHours = override && String(override).trim() !== "" ? resolveStaleHours(override) : null;
 
-  const watched = (process.env.GUARD_LIVENESS_WORKFLOWS || "").trim()
-    ? process.env.GUARD_LIVENESS_WORKFLOWS.trim()
-        .split(/\s+/)
-        .map((workflow) => ({ workflow, staleHours: overrideHours ?? DEFAULT_STALE_HOURS }))
-    : WATCHED_GUARDS;
+  const watched = resolveWatched(process.env.GUARD_LIVENESS_WORKFLOWS, overrideHours);
 
   const now = Date.now();
-  const results = watched.map(({ workflow, staleHours, event }) => {
+  const results = watched.map(({ workflow, staleHours, event, graceUntil }) => {
     const effectiveStaleHours = overrideHours ?? staleHours;
     const observation = observeWorkflow(repo, workflow, event);
-    const first = classifyGuard(workflow, observation, { now, staleHours: effectiveStaleHours });
+    const first = classifyGuard(workflow, observation, {
+      now,
+      staleHours: effectiveStaleHours,
+      graceUntil,
+    });
 
     // The cross-check is only worth a call once the cheap read has already
     // decided this guard looks stopped — the same "spend it only when it
@@ -776,7 +852,7 @@ function main() {
     return classifyGuard(
       workflow,
       { ...observation, crossCheck: crossCheckCompletions(repo, workflow, gh, event) },
-      { now, staleHours: effectiveStaleHours },
+      { now, staleHours: effectiveStaleHours, graceUntil },
     );
   });
 
