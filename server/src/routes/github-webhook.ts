@@ -5938,7 +5938,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       "full_name",
     );
     const retargetChildPrNumber =
-      typeof retargetedPr?.number === "number" ? retargetedPr.number : null;
+      Number.isInteger(retargetedPr?.number) ? (retargetedPr?.number as number) : null;
     if (
       eventName === "pull_request" &&
       payload.action === "edited" &&
@@ -6251,7 +6251,6 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         );
       }
     }
-
 
     // PR work-product upsert (BLO-19566 AC4). Liveness/productivity accounting
     // is blind to PR progress unless the issue carries a first-class
