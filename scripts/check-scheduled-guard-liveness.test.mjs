@@ -973,6 +973,53 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     );
   });
 
+  // A YAML block scalar (`if: >-`) carries one logical expression across several
+  // physical lines, so a line-anchored scan sees the `if:` token and the
+  // `pretested` reference as unrelated lines and matches neither — the gate goes
+  // unguarded on a reformat alone. Join the continuations back before scanning.
+  //
+  // Not a YAML parser by choice: `scripts/check-workflows-parse.mjs` records the
+  // standing decision that this validator stays Node-builtins-only, because
+  // adding `js-yaml` would change `pnpm-lock.yaml` and the `Block manual
+  // lockfile edits` gate rejects that.
+  //
+  // ponytail: a blank line inside a block scalar closes it here, where real YAML
+  // would not. No formatter emits that, and the failure direction is safe — the
+  // gate becomes unscannable, which `unscannable` below reports LOUDLY rather
+  // than passing clean. Upgrade to real scalar tracking only if that ever fires.
+  const joinFoldedIfs = (body) => {
+    const joined = [];
+    let openAt = null;
+    for (const line of body.split("\n")) {
+      const indent = line.search(/\S/);
+      if (openAt !== null && indent > openAt) {
+        joined[joined.length - 1] += ` ${line.trim()}`;
+        continue;
+      }
+      openAt = /^\s*if:\s*[>|][-+]?\s*$/.test(line) ? indent : null;
+      joined.push(line);
+    }
+    return joined;
+  };
+
+  // `unbypassed` — a gate the scheduled run would skip. `unscannable` — a body
+  // that mentions the output but whose gate this scan could not locate, which
+  // would otherwise report as zero violations.
+  const auditPretestedBypass = (guards) => {
+    const scanned = guards.map(({ workflow, body }) => ({
+      workflow,
+      ifs: joinFoldedIfs(body).filter(
+        (line) => /^\s*if:/.test(line) && line.includes("needs.gate.outputs.pretested"),
+      ),
+    }));
+    const missingBypass = ({ ifs }) =>
+      ifs.some((line) => !line.includes("github.event_name == 'schedule'"));
+    return {
+      unscannable: scanned.filter(({ ifs }) => ifs.length === 0).map(({ workflow }) => workflow),
+      unbypassed: scanned.filter(missingBypass).map(({ workflow }) => workflow),
+    };
+  };
+
   // The bypass this PR calls "the load-bearing half of that fix" had NO guard at
   // any level, and — unlike every other regression in this file — the runtime
   // guard cannot catch it either. That asymmetry is the whole reason it needs a
@@ -1003,16 +1050,20 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
       body: readFileSync(join(workflowDir, guard.workflow), "utf8"),
     })).filter(({ body }) => /needs\.gate\.outputs\.pretested/.test(body));
 
-    const unbypassed = gated
-      .filter(({ body }) =>
-        body
-          .split("\n")
-          .filter((line) => line.includes("needs.gate.outputs.pretested"))
-          .some(
-            (line) => /^\s*if:/.test(line) && !line.includes("github.event_name == 'schedule'"),
-          ),
-      )
-      .map(({ workflow }) => workflow);
+    const { unscannable, unbypassed } = auditPretestedBypass(gated);
+
+    // Checked BEFORE the bypass assertion, because a scan that located no gate
+    // reports zero violations — the silent green this whole test exists to
+    // prevent, one level down. The body-level `gated` filter cannot see it: the
+    // body still contains the string, so the file still looks audited.
+    assert.deepEqual(
+      unscannable,
+      [],
+      "a watched guard mentions `needs.gate.outputs.pretested` but this scan found no `if:` " +
+        "carrying it, so the bypass assertion below would pass vacuously. Either the gate moved " +
+        "into a form the scan cannot read, or the output was renamed and only the prose kept the " +
+        "old name. Fix the scan — do not delete this control.",
+    );
 
     assert.deepEqual(
       unbypassed,
@@ -1030,6 +1081,55 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
       gated.length > 0,
       "no watched guard carries a pretested gate — the scan above proves nothing",
     );
+  });
+
+  // The scan above is driven by fixtures here as well as by the real file,
+  // because the real file is in exactly one state at a time — so a guard held
+  // only against it has no failing mutation, and is a comment rather than a test.
+  describe("the bypass scan itself", () => {
+    const folded = [
+      "  general_tests:",
+      "    if: >-",
+      "      ${{ !cancelled() && (needs.gate.outputs.pretested != '1'",
+      "      || github.event_name == 'workflow_dispatch') }}",
+      "    runs-on: arc-paperclip-general",
+    ].join("\n");
+
+    it("sees through a folded `if:` block scalar, so a reformat cannot disarm it", () => {
+      // Without the fold normaliser the `if:` token and the `pretested`
+      // reference sit on different physical lines, the scan finds zero
+      // candidates, and a DELETED bypass reports clean. `if: >-` is established
+      // convention in this repo (pr.yml, commitperclip-review.yml,
+      // storybook-visual.yml) and the guarded line is the longest in
+      // master-health.yml — so this is one reformat away, not a hypothetical.
+      assert.deepEqual(auditPretestedBypass([{ workflow: "f.yml", body: folded }]), {
+        unscannable: [],
+        unbypassed: ["f.yml"],
+      });
+    });
+
+    it("accepts a folded `if:` that keeps the bypass", () => {
+      const bypassed = folded.replace(
+        "'workflow_dispatch')",
+        "'workflow_dispatch' || github.event_name == 'schedule')",
+      );
+      assert.deepEqual(auditPretestedBypass([{ workflow: "f.yml", body: bypassed }]), {
+        unscannable: [],
+        unbypassed: [],
+      });
+    });
+
+    it("reports a gate it cannot locate rather than reporting it clean", () => {
+      // The output renamed but the prose left behind: the body still matches, so
+      // the file still looks audited, while no `if:` carries the token.
+      const body = ["  # needs.gate.outputs.pretested is set by `gate`", "    if: ${{ true }}"].join(
+        "\n",
+      );
+      assert.deepEqual(auditPretestedBypass([{ workflow: "f.yml", body }]), {
+        unscannable: ["f.yml"],
+        unbypassed: [],
+      });
+    });
   });
 
   it("puts the event filter into the API path, and omits it when unset", () => {

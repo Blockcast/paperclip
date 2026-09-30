@@ -217,7 +217,10 @@ jobs:
     # fails silently. It is held instead by a source-text invariant in
     # `scripts/check-scheduled-guard-liveness.test.mjs` ("keeps the schedule
     # bypass on every pretested gate in a watched guard"), which carries its own
-    # vacuity control. Deleting the clause fails that test.
+    # vacuity control. Deleting the clause fails that test -- including when the
+    # `if:` below is rewrapped as a folded block scalar, which the scan joins
+    # before reading. A gate the scan cannot locate at all is reported loudly
+    # rather than passing clean, so reformatting this line cannot disarm it.
     if: ${{ !cancelled() && (needs.gate.outputs.pretested != '1' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
     runs-on: arc-paperclip-general
     timeout-minutes: 90
