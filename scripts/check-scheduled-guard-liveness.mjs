@@ -465,9 +465,12 @@ export function summarize(results) {
   const stale = results.filter((r) => r.status === "stale");
   const stopped = stale.filter((r) => STOPPED_REASONS.has(r.reason));
   const unreadable = stale.filter((r) => UNREADABLE_REASONS.has(r.reason));
-  // Suppressed, not healthy. `classifyGuard` declines to assert these stopped,
-  // so the headline must not assert the stronger thing, that they completed.
-  // They do not redden the run: exitCode stays keyed on `stale` alone.
+  // Unaged, not healthy. The sole member is the unparsable-timestamp case:
+  // `classifyGuard` could not age the run at all, so it declines to assert the
+  // guard stopped, and the headline must not assert the stronger thing, that it
+  // completed. Nothing reaches here by cross-check disagreement any more — that
+  // is an affirmative `ok`/`corroborated` (PEN-3462). They do not redden the
+  // run: exitCode stays keyed on `stale` alone.
   const unknown = results.filter((r) => r.status === "unknown");
   // Corroborated guards ARE healthy — the cross-check aged their completion
   // against the same bar `fresh` uses (PEN-3462). But the index fault that put
@@ -611,10 +614,15 @@ function observeWorkflow(repo, workflow) {
     //
     // So the skew is no longer accepted on trust. `crossCheckCompletions` below
     // re-reads the same history UNFILTERED before any stale verdict is allowed
-    // to stand, and disagreement between the two reads SUPPRESSES the alarm
-    // instead of firing it. The false-early/false-quiet trade above still
-    // decides the sort key; what changed is that "false-early" is no longer
-    // assumed to be small.
+    // to stand, and disagreement between the two reads CORROBORATES the guard
+    // rather than suppressing the alarm. THIS CLAUSE USED TO SAY "SUPPRESSES
+    // the alarm instead of firing it"; PEN-3462 falsified that. To disagree at
+    // all, the cross-check completion must sit inside the same staleHours bar
+    // the `fresh` branch applies to this read — so it establishes liveness
+    // positively, and the verdict is `ok`/`corroborated`, not a withheld one.
+    // What still warns is the INDEX fault. The false-early/false-quiet trade
+    // above still decides the sort key; what changed is that "false-early" is
+    // no longer assumed to be small.
     const raw = gh([
       "api",
       `repos/${repo}/actions/workflows/${workflow}/runs?status=completed&per_page=1`,
@@ -800,7 +808,14 @@ function main() {
     }
 
     if (result.status === "unknown") {
-      console.log(`::warning title=Unparsable run timestamp::${result.detail}`);
+      // Keyed on `reason`, matching the stale branch below, so a second
+      // `unknown` reason cannot silently inherit this one's title. The fallback
+      // names the unhandled reason rather than printing `undefined` — a bare
+      // map would trade one silent mistitle for another, and this annotation is
+      // the only place the reason surfaces.
+      const titles = { "unparsable-timestamp": "Unparsable run timestamp" };
+      const title = titles[result.reason] ?? `Guard could not be assessed (${result.reason})`;
+      console.log(`::warning title=${title}::${result.detail}`);
       continue;
     }
 

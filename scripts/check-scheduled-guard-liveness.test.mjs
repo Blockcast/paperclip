@@ -640,6 +640,18 @@ describe("classifyGuard — 'never completed' rests on the same distrusted index
     assert.equal(result.status, "ok");
     assert.equal(result.reason, "corroborated");
     assert.match(result.detail, /confirms this\s+guard is alive/);
+    // Deliberately asymmetric with the stale branch, which carries a numeric
+    // lag. There, the filtered read served a real (wrong) completion, so the
+    // gap between the two timestamps IS the index's lag. Here it served an
+    // empty page: there is no filtered completion to subtract, so no lag is
+    // measurable and `null` is the honest value — not an unset field. A number
+    // here would have to be invented.
+    //
+    // strictEqual, not equal: `assert.equal` compares with `==`, so
+    // `undefined == null` and a deleted `indexLagMinutes: null` would still
+    // pass. That is the exact edit this assertion exists to catch, so the loose
+    // form would pin nothing.
+    assert.strictEqual(result.indexLagMinutes, null);
   });
 
   // "Never completed" is refuted by ANY completion, however old. But refuting
