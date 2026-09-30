@@ -10,9 +10,11 @@ import {
   WATCHED_GUARDS,
   WATCHED_WORKFLOWS,
   classifyGuard,
+  classifyWatched,
   completedRunsPath,
   crossCheckCompletions,
   describeStopMode,
+  makeGuardReaders,
   resolveStaleHours,
   resolveWatched,
   selectNewestCompleted,
@@ -1000,31 +1002,6 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     );
   });
 
-  // The ONE arm of this fix that has no behavioural instrument. main() shells out
-  // to `gh`, so nothing unit-visible distinguishes it passing `event` to the
-  // cross-check from it dropping it — and the consequence of dropping it is the
-  // permanent mute described on the test below, not a visible red.
-  //
-  // So this asserts against the source text, and the comment on the test above
-  // is the standing warning about what that buys: a regex can keep matching
-  // while an adjacent branch reverts the effect. It is kept because the
-  // alternative is NO failing mutation at all on the arm with the worst failure
-  // mode, and a guard with no failing mutation is a comment (BLO-34263). If
-  // `crossCheckCompletions` ever grows a behavioural seam into main(), replace
-  // this with it rather than adding to it.
-  it("passes each guard's event filter to the cross-check, not just to the filtered read", () => {
-    const source = readFileSync(
-      resolve(dirname(fileURLToPath(import.meta.url)), "check-scheduled-guard-liveness.mjs"),
-      "utf8",
-    );
-
-    assert.match(
-      source,
-      /crossCheckCompletions\(repo,\s*workflow,\s*gh,\s*event\)/,
-      "main() no longer passes `event` to the cross-check — see the mute on the next test",
-    );
-  });
-
   // The cross-check must narrow on the SAME trigger axis as the filtered read
   // (BLO-38228). PEN-3379's design is that the two reads differ on exactly one
   // axis, `status=completed`. Let them differ on the trigger axis too and the
@@ -1067,6 +1044,111 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     assert.equal(scoped.event, "schedule", "scoping dropped the event filter — push runs read as fresh");
     assert.equal(scoped.staleHours, 48, "scoping silently reset the threshold to the hourly default");
     assert.ok(scoped.graceUntil, "scoping dropped the grace window");
+  });
+
+  // Both assertions above prove the fields SURVIVE resolveWatched(). Neither
+  // reaches the line that hands them to the two consumers. That line lived
+  // inline in main(), which no test invokes, so dropping `event` or `graceUntil`
+  // from it left the whole suite green (Ally, BLO-38228) — and the first of
+  // those mutations reintroduces the exact false green this guard exists to
+  // withhold: an unfiltered newest-run query is satisfied by a push run while
+  // the cron is dead. classifyWatched() is exported so the join is behavioural.
+  it("hands each guard's event filter and grace window to the observer and the classifier", () => {
+    const now = Date.now();
+    const seen = [];
+    const [result] = classifyWatched(
+      [
+        {
+          workflow: "master-health.yml",
+          staleHours: 48,
+          event: "schedule",
+          // Derived from the clock, not pinned — a fixed literal here would rot
+          // the same way the fixture this PR's issue is about did.
+          graceUntil: new Date(now + 60_000).toISOString(),
+        },
+      ],
+      (workflow, event) => {
+        seen.push({ workflow, event });
+        return { state: "active", name: "Master general tests", newest: null };
+      },
+      () => {
+        assert.fail("a graced guard must not spend a cross-check call");
+      },
+      { now },
+    );
+
+    assert.deepEqual(
+      seen,
+      [{ workflow: "master-health.yml", event: "schedule" }],
+      "the event filter never reached the observer — an unfiltered query reads push runs as fresh",
+    );
+    assert.equal(result.status, "ok", "the grace window never reached the classifier");
+    assert.equal(result.reason, "awaiting-first-run");
+  });
+
+  // The THIRD consumer of `event`, and the one the PEN-3379 rebase very nearly
+  // lost. PEN-3379 added an unfiltered second read that must corroborate a stale
+  // verdict before it may red; it differs from the filtered read on exactly one
+  // axis, `status=completed`. Let it differ on the TRIGGER axis too and it sees
+  // push runs the filtered side cannot: it reports a newer completion on every
+  // poll, the guard lands permanently in `cross-check-disagreement`, and the
+  // alarm is MUTED forever instead of going red.
+  //
+  // Both changes are correct alone; the naive merge is a permanent mute on the
+  // one guard whose entire job is to notice silence. This leg had no failing
+  // mutation until `classifyWatched` took the cross-check as an argument — a
+  // source-text regex was the only instrument available, and this file's own
+  // history is that such a regex passed straight across its own reversion.
+  it("hands the event filter to the cross-check too, so it cannot disagree by construction", () => {
+    const now = Date.parse("2026-09-30T12:00:00Z");
+    const seen = [];
+    const [result] = classifyWatched(
+      [{ workflow: "master-health.yml", staleHours: 48, event: "schedule" }],
+      () => ({ state: "active", name: "Master general tests", newest: null }),
+      (workflow, event) => {
+        seen.push({ workflow, event });
+        return { newestCompletedAt: null };
+      },
+      { now },
+    );
+
+    assert.deepEqual(
+      seen,
+      [{ workflow: "master-health.yml", event: "schedule" }],
+      "the cross-check ran unfiltered against a filtered read — it will disagree on every poll and mute the alarm",
+    );
+    assert.equal(result.status, "stale", "an ungraced never-completed guard must still red");
+    assert.equal(result.reason, "never-completed");
+  });
+
+  // The LAST link: the line that binds `repo` into those two reads. Everything
+  // above is held behaviourally, and with the closures written inline in main()
+  // this one line still was not — main() is never invoked by a test, so dropping
+  // `event` from the cross-check closure specifically left the suite green while
+  // reintroducing the permanent mute. makeGuardReaders() is exported to close it.
+  it("binds repo into both reads without losing the event filter", () => {
+    const paths = [];
+    const { crossCheck } = makeGuardReaders("o/r", (args) => {
+      paths.push(args[1]);
+      return JSON.stringify({ workflow_runs: [] });
+    });
+
+    crossCheck("master-health.yml", "schedule");
+    crossCheck("codeowners-guard.yml", undefined);
+
+    assert.match(
+      paths[0],
+      /^repos\/o\/r\/actions\/workflows\/master-health\.yml\/runs\?per_page=\d+&event=schedule$/,
+      "the binding layer dropped the event filter — the cross-check will disagree on every poll and mute the alarm",
+    );
+    assert.match(
+      paths[1],
+      /^repos\/o\/r\/actions\/workflows\/codeowners-guard\.yml\/runs\?per_page=\d+$/,
+      "an unfiltered guard's cross-check must stay unfiltered",
+    );
+    // The axis it must still DROP: corroboration depends on not going through
+    // the suspect server-side index.
+    for (const path of paths) assert.ok(!path.includes("status=completed"));
   });
 
   it("still honours the stale-hours override and resolves an undeclared workflow", () => {
