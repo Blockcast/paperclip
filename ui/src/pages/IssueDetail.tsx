@@ -1347,7 +1347,6 @@ function IssueDetailActivityTab({
           usage,
           "cacheCreationInputTokens",
           "cache_creation_input_tokens",
-          "rawCacheCreationInputTokens",
         );
       const runOutput = usageNumber(usage, "outputTokens", "output_tokens");
       const runCached = usageNumber(

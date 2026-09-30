@@ -67,11 +67,17 @@ function readTokenCount(
 // Extract input/output token counts from a heartbeat-run `usage_json` blob,
 // tolerating both camelCase and snake_case key spellings.
 //
-// BLO-29842: also reports the two cache classes. `usage_json` carries both the
-// normalized keys and `raw*` twins; when `normalizedUsage` is null but a cost
-// was recorded, only the `raw*` twins are written, hence the last-resort
-// spelling. Normalized is listed first so this keeps agreeing with the
-// input/output resolution above rather than quietly switching basis.
+// BLO-29842: also reports the two cache classes. The `raw*` arms are DEFENSIVE,
+// not reachable from this repo's writer, and mirror the shape the input/output
+// legs already carry rather than making cache the one leg of four that drops
+// them. `usage_json` has exactly one writer (see the comment above its build in
+// heartbeat.ts): it gates the `raw*` twins on `rawUsage`, and `normalizedUsage`
+// is null exactly when `rawUsage` is null, so a blob carrying
+// `rawCacheCreationInputTokens` always also carries `cacheCreationInputTokens`.
+// Normalized is listed first because this reader asks what a single run billed,
+// i.e. the per-run delta — the opposite of `heartbeatRunTokenUsage`, which
+// prefers the `raw*` twins on every leg because it wants the session-cumulative
+// basis. That ordering is the load-bearing difference between the two readers.
 export function runUsageTokenCounts(
   usage: Record<string, unknown> | null | undefined,
 ): {

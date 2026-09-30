@@ -315,7 +315,6 @@ function runMetrics(run: HeartbeatRun) {
       usage,
       "cacheCreationInputTokens",
       "cache_creation_input_tokens",
-      "rawCacheCreationInputTokens",
     );
   const output = usageNumber(usage, "outputTokens", "output_tokens");
   const cached = usageNumber(
