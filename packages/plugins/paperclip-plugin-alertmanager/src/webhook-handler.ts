@@ -698,6 +698,109 @@ const DEFAULT_AGGREGATE_FENCE_WAIT: AggregateFenceWaitPolicy = {
 type AggregateFenceWedgedMemo = Set<string>;
 
 /**
+ * Process-local fair handoff for the aggregate fence (PEN-3013).
+ *
+ * Every refusal this fence produces in production is a delivery in THIS process
+ * losing to a sibling delivery in THIS process — that is a property of the
+ * claim predicate, not an observation that could drift. `beginAggregateFiring`
+ * admits a holder in the same slot with a *different* `owner_instance_id`
+ * (BLO-31036) and a holder past the abandonment backstop, so the only holder it
+ * can still refuse for is one sharing `WORKER_INSTANCE_ID` — i.e. a concurrent
+ * delivery interleaved into the same worker child, which is exactly what the
+ * RPC layer produces. Measured 2026-09-30 over 24h on `paperclip-0`: 902
+ * refusals, all of them phase `firing`, none `cancelling`, single pod.
+ *
+ * So the fence is being used as a mutex between coroutines of one process, and
+ * the waiter had no way to learn that the holder had finished. It polled with
+ * exponential full jitter, which is the right shape against an *unknown* remote
+ * holder but is unfair against a local one: a delivery that has already waited
+ * competes on equal terms with a fresh arrival every round. Measured over the
+ * same window, 36% of refusals reported a holder age *below* the 3s budget the
+ * waiter had already spent — lost races against a briskly rotating fence, not a
+ * stuck one. Raising the budget lengthens that starvation window; it does not
+ * end it.
+ *
+ * This registry closes the loop: a release performed by this process wakes one
+ * waiter directly, so the handoff is FIFO by arrival and the woken waiter
+ * reclaims before any jitter timer fires.
+ *
+ * Two properties keep the worst case at exactly today's behaviour:
+ *   - Waiters keep their jitter timer. The signal only ever *shortens* a wait,
+ *     so a fence held by another process, another slot, or a dead owner behaves
+ *     precisely as before — including the budget arithmetic and the wedged memo.
+ *   - A wake is never required for progress. If the woken waiter exhausts its
+ *     budget before retrying, the wake is dropped rather than forwarded; the
+ *     remaining waiters still retry on their own timers within
+ *     `maxDelayMs`. That bounds a lost wake at one extra poll interval, which
+ *     is why forwarding it is not worth the state it would cost.
+ *
+ * Waking exactly one is deliberate. Waking all would rebuild the thundering
+ * herd this file's jitter exists to break up, and only one of them can win.
+ */
+type LocalFenceWaiter = {
+  /** Re-armed after each wake, because one waiter waits across many attempts. */
+  awaken: () => Promise<void>;
+  wake: () => void;
+};
+
+const aggregateFenceLocalWaiters = new Map<string, LocalFenceWaiter[]>();
+
+/** Fences are company-scoped, so the local queue must be too. */
+function localFenceQueueKey(companyId: string, aggregateKey: string): string {
+  return `${companyId} ${aggregateKey}`;
+}
+
+function createLocalFenceWaiter(): LocalFenceWaiter {
+  let resolve: (() => void) | null = null;
+  let pending: Promise<void> | null = null;
+  return {
+    awaken() {
+      if (!pending) {
+        pending = new Promise<void>((res) => {
+          resolve = res;
+        });
+      }
+      return pending;
+    },
+    wake() {
+      const res = resolve;
+      pending = null;
+      resolve = null;
+      res?.();
+    },
+  };
+}
+
+/**
+ * Hand the fence to the longest-waiting local delivery, if there is one.
+ *
+ * Called only after a release this process actually performed, so it cannot
+ * announce availability that does not exist. A spurious wake would still be
+ * harmless — the woken waiter simply re-attempts the real claim, which is the
+ * only thing that decides ownership — but keeping it truthful is what lets the
+ * wake be read as "the fence was just freed" in a log or a test.
+ */
+function signalLocalFenceRelease(companyId: string, aggregateKey: string): void {
+  const queueKey = localFenceQueueKey(companyId, aggregateKey);
+  const queue = aggregateFenceLocalWaiters.get(queueKey);
+  if (!queue || queue.length === 0) return;
+  const next = queue.shift();
+  if (queue.length === 0) aggregateFenceLocalWaiters.delete(queueKey);
+  next?.wake();
+}
+
+/** Test seam: how many deliveries are queued on a local fence right now. */
+export function localFenceWaiterCount(
+  companyId: string,
+  aggregateKey: string,
+): number {
+  return (
+    aggregateFenceLocalWaiters.get(localFenceQueueKey(companyId, aggregateKey))
+      ?.length ?? 0
+  );
+}
+
+/**
  * `beginAggregateFiring`, but waits out a fence held by a live holder instead of
  * failing the delivery on first refusal (PEN-3013).
  *
@@ -737,25 +840,50 @@ async function claimAggregateFiringWaiting(
   const startedAt = policy.now();
   let attempt = 0;
   let claim = await beginAggregateFiring(ctx, companyId, aggregateKey);
+  if (claim.ok) return claim;
 
-  while (!claim.ok) {
-    const elapsedMs = policy.now() - startedAt;
-    const remainingMs = policy.budgetMs - elapsedMs;
-    if (remainingMs <= 0) {
-      wedgedKeys?.add(aggregateKey);
-      return claim;
+  // Registered only once the first attempt has actually been refused, and for
+  // the whole remaining wait rather than per iteration. Both halves matter: the
+  // uncontended path allocates nothing, and a waiter that kept re-registering
+  // would drop to the back of the queue on every poll, which is the starvation
+  // this is here to remove.
+  const queueKey = localFenceQueueKey(companyId, aggregateKey);
+  const waiter = createLocalFenceWaiter();
+  const queue = aggregateFenceLocalWaiters.get(queueKey) ?? [];
+  queue.push(waiter);
+  aggregateFenceLocalWaiters.set(queueKey, queue);
+
+  try {
+    while (!claim.ok) {
+      const elapsedMs = policy.now() - startedAt;
+      const remainingMs = policy.budgetMs - elapsedMs;
+      if (remainingMs <= 0) {
+        wedgedKeys?.add(aggregateKey);
+        return claim;
+      }
+
+      // Exponential with full jitter, clamped to whatever budget is left so the
+      // total wait cannot overrun even on the final attempt.
+      const ceiling = Math.min(
+        policy.maxDelayMs,
+        policy.initialDelayMs * 2 ** attempt,
+      );
+      const delayMs = Math.min(remainingMs, Math.ceil(policy.random() * ceiling));
+      // Whichever comes first: a local release hands the fence over directly,
+      // the timer is the backstop for every holder this process cannot observe.
+      // `awaken()` is read before the sleep starts so a release that lands
+      // mid-sleep is not missed.
+      await Promise.race([waiter.awaken(), policy.sleep(delayMs)]);
+      attempt += 1;
+      claim = await beginAggregateFiring(ctx, companyId, aggregateKey);
     }
-
-    // Exponential with full jitter, clamped to whatever budget is left so the
-    // total wait cannot overrun even on the final attempt.
-    const ceiling = Math.min(
-      policy.maxDelayMs,
-      policy.initialDelayMs * 2 ** attempt,
-    );
-    const delayMs = Math.min(remainingMs, Math.ceil(policy.random() * ceiling));
-    await policy.sleep(delayMs);
-    attempt += 1;
-    claim = await beginAggregateFiring(ctx, companyId, aggregateKey);
+  } finally {
+    const live = aggregateFenceLocalWaiters.get(queueKey);
+    if (live) {
+      const index = live.indexOf(waiter);
+      if (index >= 0) live.splice(index, 1);
+      if (live.length === 0) aggregateFenceLocalWaiters.delete(queueKey);
+    }
   }
 
   if (attempt > 0) {
@@ -878,6 +1006,9 @@ async function finishAggregateFiring(
       `Alertmanager aggregate firing fence was lost for ${aggregateKey}; retrying delivery`,
     );
   }
+  // The fence is now 'active' and claimable. Hand it to the longest-waiting
+  // local delivery instead of leaving it to find out on its next poll.
+  signalLocalFenceRelease(companyId, aggregateKey);
 }
 
 /**
@@ -917,7 +1048,12 @@ export async function recoverAggregateFiring(
        AND firing_token = $3`,
     [companyId, aggregateKey, token],
   );
-  if (result.rowCount > 0) return true;
+  if (result.rowCount > 0) {
+    // An operator draining a wedged fence should not also have to wait out the
+    // poll interval of whatever is queued behind it.
+    signalLocalFenceRelease(companyId, aggregateKey);
+    return true;
+  }
   // Same compare-and-set discipline on the resolution token: a stale or wrong
   // token releases nothing, so this cannot reopen a fence owned by a newer
   // resolver.
@@ -934,7 +1070,9 @@ export async function recoverAggregateFiring(
        AND resolution_token = $3`,
     [companyId, aggregateKey, token],
   );
-  return cancelling.rowCount > 0;
+  if (cancelling.rowCount === 0) return false;
+  signalLocalFenceRelease(companyId, aggregateKey);
+  return true;
 }
 
 async function tryClaimAggregateFinalization(
@@ -1018,7 +1156,7 @@ async function releaseAggregateFinalization(
   token: string,
 ): Promise<void> {
   const ns = ctx.db.namespace;
-  await ctx.db.execute(
+  const result = await ctx.db.execute(
     `UPDATE ${q(ns, AGGREGATE_LIFECYCLE_FENCES_TABLE)}
      SET phase = 'active',
          resolution_token = NULL,
@@ -1031,6 +1169,13 @@ async function releaseAggregateFinalization(
        AND resolution_token = $3`,
     [companyId, aggregateKey, token],
   );
+  // 'cancelling' refuses a firing claim just as 'firing' does, so a delivery
+  // can be queued locally behind this release too. Production has not observed
+  // that phase blocking (0 of 902 refusals over 24h on 2026-09-30), but the
+  // handoff belongs wherever this process makes the fence claimable again —
+  // leaving it out would make the fast path depend on which phase happened to
+  // hold it.
+  if (result.rowCount > 0) signalLocalFenceRelease(companyId, aggregateKey);
 }
 
 async function resolveAggregateMember(
