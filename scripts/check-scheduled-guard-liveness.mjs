@@ -378,7 +378,19 @@ export function classifyGuard(workflow, observation, { now, staleHours = DEFAULT
         lastRunUrl: observation.newest.htmlUrl ?? null,
       };
     }
-    if (!Number.isNaN(crossEpoch) && crossEpoch > completedEpoch) {
+    // The freshness test is stated here rather than inherited from the branch
+    // above. That branch consumes the past-the-bar case first, so position
+    // alone would make this correct — but the detail string below makes the
+    // positive claim "inside the ${staleHours}h liveness threshold", and the
+    // claim should be guarded where it is made. The sibling clearing branch on
+    // the never-completed path tests freshness explicitly for the same reason;
+    // this removes the asymmetry. Ordering is pinned by tests, the string was
+    // not.
+    if (
+      !Number.isNaN(crossEpoch) &&
+      crossEpoch > completedEpoch &&
+      crossAgeMinutes < staleHours * 60
+    ) {
       // One expression, used twice: the lag on the result and the lag in the
       // annotation are then provably the same number rather than two
       // computations that happen to agree.
@@ -502,10 +514,20 @@ export function summarize(results) {
     );
   }
   if (corroborated.length > 0) {
+    // A count alone cannot tell an 18-day wedge from a three-minute one, and
+    // those are very different operational facts. Every corroborated result
+    // carries `indexLagMinutes` except the empty-page case, which has no
+    // earlier timestamp to subtract, so the worst non-null lag is reported
+    // when one exists and the clause degrades to the bare count when none does.
+    const lags = corroborated
+      .map((r) => r.indexLagMinutes)
+      .filter((lag) => typeof lag === "number" && Number.isFinite(lag));
+    const worstLag = lags.length > 0 ? Math.max(...lags) : null;
     clauses.push(
       `${corroborated.length} of ${checked} were confirmed alive only by the unfiltered ` +
         `cross-check because the filtered run index disagreed with itself — the guards are live, ` +
-        `the index is faulty`,
+        `the index is faulty` +
+        (worstLag === null ? "" : ` (worst index lag ${worstLag}m)`),
     );
   }
 
@@ -764,6 +786,80 @@ export function crossCheckCompletions(repo, workflow, read = gh) {
   }
 }
 
+/**
+ * Renders the single line an operator actually sees for one guard, as a pure
+ * function of the result.
+ *
+ * This is deliberately separate from `main()`. The line below that names a
+ * corroborated guard is now the ONLY place an individually wedged index
+ * surfaces per guard: `summarize` reports a count, not a name. Before PEN-3462
+ * that path was an `unknown`, whose default rendering was already a warning, so
+ * the `unknownCount` assertions fenced it indirectly. It is now an `ok`, whose
+ * default rendering is a silent `ok:` line — so the warning hangs on one
+ * conditional, and nothing that runs in CI could see it disappear. Deleting the
+ * branch outright, or blanking the "is itself faulty" clause it prints, both
+ * left the suite green at 73/73 while removing exactly the signal this PR
+ * exists to preserve.
+ *
+ * `main()` is not importable without executing (that is what `isMainModule`
+ * exists for), so the fix is to move the strings, not to export the shell:
+ * every annotation is now a return value that a test can assert. A veto whose
+ * failure mode is untested is a veto nobody can trust — this file says so at
+ * `selectNewestCompleted`, and the rule binds its own rendering too.
+ *
+ * @param {object} result a classifyGuard result
+ * @param {string|null} stopModeDetail describeStopMode output; required only
+ *   for the `stopped` reason, which is the one line here costing an API call.
+ *   Kept a parameter so this function stays pure and network-free.
+ * @returns {string}
+ */
+export function annotationFor(result, stopModeDetail = null) {
+  if (result.status === "ok") {
+    // A corroborated guard is alive, but it only got there because the
+    // filtered index lied. Warn on the INDEX so a persistent wedge stays
+    // visible instead of disappearing into the green (PEN-3462).
+    if (result.reason === "corroborated") {
+      return (
+        `::warning title=Run index disagreed with itself — guard confirmed alive by cross-check::` +
+        result.detail
+      );
+    }
+    return `ok: ${result.detail}`;
+  }
+
+  if (result.status === "unknown") {
+    // Keyed on `reason`, matching the stale branch below, so a second
+    // `unknown` reason cannot silently inherit this one's title. The fallback
+    // names the unhandled reason rather than printing `undefined` — a bare
+    // map would trade one silent mistitle for another, and this annotation is
+    // the only place the reason surfaces.
+    const titles = { "unparsable-timestamp": "Unparsable run timestamp" };
+    const title = titles[result.reason] ?? `Guard could not be assessed (${result.reason})`;
+    return `::warning title=${title}::${result.detail}`;
+  }
+
+  if (result.reason === "stopped") {
+    return (
+      `::error title=Scheduled guard has stopped executing::${result.detail} ${stopModeDetail} This ` +
+      `guard is not enforcing anything right now, and a stopped guard reds nothing on its own ` +
+      `— that silence is why this job exists (PEN-3281). Last run: ${result.lastRunUrl ?? "n/a"}`
+    );
+  }
+
+  const titles = {
+    unreadable: "Guard workflow unreadable",
+    "runs-unreadable": "Guard run history unreadable",
+    disabled: "Guard workflow disabled",
+    "never-completed": "Guard has never completed",
+  };
+  // Exhaustive over the stale reasons that reach here today ("stopped" is
+  // handled above), but carrying the same fallback as the `unknown` branch:
+  // an unmapped reason must name itself rather than print `title=undefined`,
+  // and that branch's comment claims this symmetry.
+  const title = titles[result.reason] ?? `Scheduled guard is stale (${result.reason})`;
+  return `::error title=${title}::${result.detail}`;
+}
+
 function main() {
   const repo = process.env.GUARD_LIVENESS_REPO || process.env.GITHUB_REPOSITORY || "Blockcast/paperclip";
 
@@ -808,57 +904,16 @@ function main() {
   });
 
   for (const result of results) {
-    if (result.status === "ok") {
-      // A corroborated guard is alive, but it only got there because the
-      // filtered index lied. Warn on the INDEX so a persistent wedge stays
-      // visible instead of disappearing into the green (PEN-3462).
-      if (result.reason === "corroborated") {
-        console.log(
-          `::warning title=Run index disagreed with itself — guard confirmed alive by cross-check::` +
-            result.detail,
-        );
-        continue;
-      }
-      console.log(`ok: ${result.detail}`);
-      continue;
-    }
-
-    if (result.status === "unknown") {
-      // Keyed on `reason`, matching the stale branch below, so a second
-      // `unknown` reason cannot silently inherit this one's title. The fallback
-      // names the unhandled reason rather than printing `undefined` — a bare
-      // map would trade one silent mistitle for another, and this annotation is
-      // the only place the reason surfaces.
-      const titles = { "unparsable-timestamp": "Unparsable run timestamp" };
-      const title = titles[result.reason] ?? `Guard could not be assessed (${result.reason})`;
-      console.log(`::warning title=${title}::${result.detail}`);
-      continue;
-    }
-
-    if (result.reason === "stopped") {
-      // Only now, and only for a guard already known stale, spend a call to
-      // distinguish the stop-modes.
-      const detail = describeStopMode(countQueued(repo, result.workflow));
-      console.log(
-        `::error title=Scheduled guard has stopped executing::${result.detail} ${detail} This ` +
-          `guard is not enforcing anything right now, and a stopped guard reds nothing on its own ` +
-          `— that silence is why this job exists (PEN-3281). Last run: ${result.lastRunUrl ?? "n/a"}`,
-      );
-      continue;
-    }
-
-    const titles = {
-      unreadable: "Guard workflow unreadable",
-      "runs-unreadable": "Guard run history unreadable",
-      disabled: "Guard workflow disabled",
-      "never-completed": "Guard has never completed",
-    };
-    // Exhaustive over the stale reasons that reach here today ("stopped" is
-    // handled above), but carrying the same fallback as the `unknown` branch:
-    // an unmapped reason must name itself rather than print `title=undefined`,
-    // and that branch's comment claims this symmetry.
-    const title = titles[result.reason] ?? `Scheduled guard is stale (${result.reason})`;
-    console.log(`::error title=${title}::${result.detail}`);
+    // The stop-mode scan is the only line in this loop that costs an API call,
+    // so it stays lazy — computed for the one reason that consumes it, and
+    // handed to a pure renderer. Everything about WHAT an operator sees is then
+    // decided in `annotationFor`, where a test can reach it without a network
+    // (PEN-3462).
+    const stopModeDetail =
+      result.status === "stale" && result.reason === "stopped"
+        ? describeStopMode(countQueued(repo, result.workflow))
+        : null;
+    console.log(annotationFor(result, stopModeDetail));
   }
 
   const summary = summarize(results);

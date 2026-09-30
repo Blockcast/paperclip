@@ -9,6 +9,7 @@ import {
   EXEMPT_SCHEDULED_DEFAULT_WORKFLOWS,
   WATCHED_GUARDS,
   WATCHED_WORKFLOWS,
+  annotationFor,
   classifyGuard,
   crossCheckCompletions,
   describeStopMode,
@@ -1177,5 +1178,119 @@ describe("cross-check disagreement is a liveness CONFIRMATION, not a blind spot 
     assert.equal(result.status, "stale");
     assert.equal(result.reason, "stopped");
     assert.equal(summarize([result]).exitCode, 1);
+  });
+});
+
+// The annotation an operator actually reads. `summarize` reports a COUNT; this
+// is the only place an individually wedged guard is NAMED, in the Actions
+// annotation UI. Before PEN-3462 that path was an `unknown`, whose default
+// rendering is already a warning, so the `unknownCount` assertions fenced it
+// indirectly. It is now an `ok`, whose default rendering is a silent `ok:`
+// line — so the warning hangs on one conditional with nothing under it.
+//
+// Both of these were confirmed by mutation, not by inspection: deleting the
+// corroborated branch outright, and blanking the "is itself faulty" clause
+// from the detail, EACH left the suite green at 73/73 before this block
+// existed. A veto whose failure mode is untested is a veto nobody can trust.
+describe("annotationFor — the per-guard index-fault signal is the claim, so it is asserted", () => {
+  const corroborated = {
+    status: "ok",
+    reason: "corroborated",
+    detail: "Relay SSL read as 18h stale ... the filtered index is behind by 26066m and is itself faulty.",
+  };
+
+  it("a corroborated guard warns on the INDEX rather than printing a silent ok: line", () => {
+    const line = annotationFor(corroborated);
+
+    assert.match(line, /^::warning title=/, "an `ok:` line here would hide a wedged index in the green");
+    assert.match(line, /Run index disagreed with itself/);
+    assert.match(line, /guard confirmed alive by cross-check/, "both facts must survive: alive, and faulty");
+    assert.ok(line.endsWith(corroborated.detail), "the detail is carried verbatim, not summarised away");
+  });
+
+  it("names the index as faulty, the clause a count cannot carry", () => {
+    // classifyGuard's real detail, not a hand-written one: the assertion is on
+    // the string that actually ships.
+    const result = classifyGuard(
+      "relay-ssl-multicert-guard.yml",
+      {
+        state: "active",
+        name: "Relay SSL Multicert",
+        newest: { updatedAt: "2026-09-12T04:32:39Z", conclusion: "success", htmlUrl: null },
+        crossCheck: { newestCompletedAt: "2026-09-30T06:58:54Z" },
+      },
+      { now: Date.parse("2026-09-30T07:05:45Z"), staleHours: thresholdFor("relay-ssl-multicert-guard.yml") },
+    );
+
+    assert.equal(result.reason, "corroborated");
+    assert.match(annotationFor(result), /is itself faulty/, "the index fault must be stated, not implied");
+    assert.match(annotationFor(result), /confirms this guard is alive/);
+  });
+
+  it("the empty-page corroboration also names the index as faulty", () => {
+    const result = classifyGuard(
+      "relay-ssl-multicert-guard.yml",
+      {
+        state: "active",
+        name: "Relay SSL Multicert",
+        newest: null,
+        crossCheck: { newestCompletedAt: "2026-09-30T06:58:54Z" },
+      },
+      { now: Date.parse("2026-09-30T07:05:45Z"), staleHours: thresholdFor("relay-ssl-multicert-guard.yml") },
+    );
+
+    assert.equal(result.reason, "corroborated");
+    assert.match(annotationFor(result), /serving an empty page and is itself faulty/);
+  });
+
+  it("a plain healthy guard stays a quiet ok: line, so the warning means something", () => {
+    const line = annotationFor({ status: "ok", reason: "fresh", detail: "Relay SSL last completed 6m ago" });
+
+    assert.equal(line, "ok: Relay SSL last completed 6m ago");
+    assert.doesNotMatch(line, /::warning/, "warning on every ok would make the corroborated warning noise");
+  });
+
+  it("a stopped guard errors and consumes the stop-mode detail it is handed", () => {
+    const line = annotationFor(
+      { status: "stale", reason: "stopped", detail: "Relay SSL has stopped.", lastRunUrl: null },
+      "Queued but not started.",
+    );
+
+    assert.match(line, /^::error title=Scheduled guard has stopped executing::/);
+    assert.match(line, /Queued but not started\./, "the API-derived stop-mode must reach the annotation");
+    assert.match(line, /Last run: n\/a/, "a missing URL prints n/a, never `undefined`");
+  });
+
+  it("an unmapped reason names itself instead of printing title=undefined", () => {
+    assert.match(
+      annotationFor({ status: "unknown", reason: "brand-new-reason", detail: "d" }),
+      /title=Guard could not be assessed \(brand-new-reason\)/,
+    );
+    assert.match(
+      annotationFor({ status: "stale", reason: "brand-new-reason", detail: "d" }),
+      /title=Scheduled guard is stale \(brand-new-reason\)/,
+    );
+  });
+});
+
+// Suggestion 2 of the a9f0999 review: a count cannot tell an 18-day wedge from
+// a three-minute one, and those are different operational facts.
+describe("summarize — the corroborated clause carries severity, not just a count", () => {
+  it("reports the worst index lag across corroborated guards", () => {
+    const summary = summarize([
+      { status: "ok", reason: "corroborated", indexLagMinutes: 12 },
+      { status: "ok", reason: "corroborated", indexLagMinutes: 26066 },
+    ]);
+
+    assert.match(summary.headline, /worst index lag 26066m/, "the worst lag, not the first or the last");
+  });
+
+  it("degrades to the bare count when no lag is derivable", () => {
+    // The empty-page path carries indexLagMinutes: null — there is no earlier
+    // timestamp to subtract, so there is no lag to report.
+    const summary = summarize([{ status: "ok", reason: "corroborated", indexLagMinutes: null }]);
+
+    assert.match(summary.headline, /the index is faulty/);
+    assert.doesNotMatch(summary.headline, /worst index lag/, "null must not render as NaN or -1");
   });
 });
