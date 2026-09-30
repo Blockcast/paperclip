@@ -1387,8 +1387,17 @@ jobs:
       # must never be able to turn an otherwise-green run red. Losing a report
       # costs one row in the ledger; failing the job re-creates the blameless
       # ejection this issue exists to stop.
+      #
+      # `continue-on-error` closes the same hole from the other side, and it is
+      # NOT belt-and-braces. `if-no-files-found` only covers the empty case;
+      # upload-artifact@v4 rejects a name that already exists in the RUN, and a
+      # re-run of a failed job is a new attempt of the SAME run -- so "Re-run
+      # failed jobs", the first thing anyone does on this ~29%-red lane, 409s
+      # this step and turns the retried job red for a reason the diff cannot
+      # reach. Matches the playwright-report upload below.
       - name: Upload vitest JSON reports (flake ledger)
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: vitest-report-${{ matrix.group }}-${{ matrix.shard_count == '' && 'all' || matrix.shard_index }}
