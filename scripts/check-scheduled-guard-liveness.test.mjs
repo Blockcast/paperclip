@@ -328,13 +328,21 @@ describe("classifyGuard — the four PEN-3379 production false positives", () =>
     // on this path must still be named, or a wedge vanishes into the green.
     assert.equal(summary.corroboratedCount, FALSE_POSITIVES.length);
     assert.equal(summary.unknownCount, 0);
-    assert.doesNotMatch(summary.headline, /^All \d+ watched/);
+    // This pins the BRANCH, not the claim: the headline still says these four
+    // "have completed within their liveness thresholds", because they have. What
+    // it may not do is take the unqualified `All N watched …` form, which carries
+    // no clauses and so would drop the index fault entirely. The claim-level
+    // property — that the fault is named — is the assertion below, which is what
+    // actually protects the wedge from vanishing into the green.
+    assert.doesNotMatch(summary.headline, /^All \d+ watched/, "the clause-free all-clear branch must not be taken");
     assert.match(summary.headline, /the index is faulty/);
   });
 
-  // The other half of the contract. Suppression must be driven by DISAGREEMENT,
-  // not by the cross-check existing — otherwise the fix mutes the detector and
-  // reproduces PEN-3281 by a different route.
+  // The other half of the contract. The affirmative clear must be driven by
+  // DISAGREEMENT, not by the cross-check existing — otherwise the fix greens the
+  // detector and reproduces PEN-3281 by a different route. Since PEN-3462 that
+  // failure is worse than a mute: the wrong answer here is `ok`/`corroborated`,
+  // a positive claim that the guard is alive, not a warning anyone might read.
   it("still reds a genuinely stopped guard when both reads agree", () => {
     const now = Date.parse("2026-09-18T14:50:00Z");
     const result = classifyGuard(
@@ -374,7 +382,9 @@ describe("classifyGuard — the four PEN-3379 production false positives", () =>
   });
 
   // Exactly ON the bar is past it (`>=`): 12:05Z -> 14:50Z is 165m against the
-  // 2.75h threshold. `>` in place of `>=` turns this stop into a suppression.
+  // 2.75h threshold. `>` in place of `>=` drops this stop through to the branch
+  // below and returns `ok`/`corroborated` — an affirmative green on a guard that
+  // has stopped, not merely a muted warning (PEN-3462).
   it("still reds a stopped guard whose newer cross-check sits exactly on the bar", () => {
     const now = Date.parse("2026-09-18T14:50:00Z");
     const result = classifyGuard(
@@ -394,7 +404,7 @@ describe("classifyGuard — the four PEN-3379 production false positives", () =>
   });
 
   // Absence of corroboration is not agreement. A permanently failing second
-  // read must not become a mute switch.
+  // read must not become a clear switch.
   it("leaves the red standing, annotated, when the cross-check cannot be read", () => {
     const now = Date.parse("2026-09-18T14:50:00Z");
     const result = classifyGuard(
@@ -413,7 +423,7 @@ describe("classifyGuard — the four PEN-3379 production false positives", () =>
   });
 });
 
-describe("selectNewestCompleted — the cross-check must not become a mute switch", () => {
+describe("selectNewestCompleted — the cross-check must not manufacture a clear", () => {
   /**
    * An unfiltered run page as the API returns it: ordered by `created_at` DESC,
    * mixing queued/in-progress entries in with completed ones.
@@ -432,9 +442,10 @@ describe("selectNewestCompleted — the cross-check must not become a mute switc
   // which bumped that entry's `updated_at` to 09-18 WITHOUT moving its
   // `created_at`, so it stays near the bottom of the page.
   //
-  // `max(updated_at)` reads 09-18, contradicts the filtered read, and suppresses
-  // the alarm: a mute, co-located with the outage it would hide. Taking the
-  // first completed entry in `created_at` order cannot be fooled this way.
+  // `max(updated_at)` reads 09-18, contradicts the filtered read, and clears the
+  // alarm to `ok`/`corroborated` (PEN-3462): an affirmative "this guard is
+  // alive", co-located with the outage it would hide. Taking the first completed
+  // entry in `created_at` order cannot be fooled this way.
   it("takes the newest-CREATED completion, not the largest updated_at", () => {
     const observed = selectNewestCompleted(
       page(
@@ -449,7 +460,7 @@ describe("selectNewestCompleted — the cross-check must not become a mute switc
     assert.notEqual(observed, "2026-09-18T14:00:00.000Z", "a re-run of an old run is not a fresh completion");
   });
 
-  it("drives that page through the classifier without suppressing a real outage", () => {
+  it("drives that page through the classifier without clearing a real outage", () => {
     const result = classifyGuard(
       "relay-ssl-multicert-guard.yml",
       {
@@ -471,11 +482,11 @@ describe("selectNewestCompleted — the cross-check must not become a mute switc
       },
     );
 
-    assert.equal(result.status, "stale", "a re-run must not demote a genuine outage to unknown");
+    assert.equal(result.status, "stale", "a re-run must not clear a genuine outage to ok/corroborated");
     assert.equal(result.reason, "stopped");
   });
 
-  // The other direction: the four real false positives must still be suppressed
+  // The other direction: the four real false positives must still be cleared
   // when the cross-check is derived from a PAGE rather than handed in ready-made.
   it("still recovers the real completion behind each PEN-3379 false positive", () => {
     const observed = selectNewestCompleted(
@@ -532,7 +543,7 @@ describe("crossCheckCompletions — the corroborating read's own failure modes",
 
     assert.equal(calls.length, 1);
     // Workflow-scoped: a repo-wide page is always fresh ordinary CI, which
-    // would mute every guard forever at exit 0.
+    // would clear every guard to `ok`/`corroborated` forever at exit 0.
     assert.match(
       calls[0][1],
       /^repos\/Blockcast\/paperclip\/actions\/workflows\/relay-ssl-multicert-guard\.yml\/runs\?per_page=30$/,
@@ -577,8 +588,8 @@ describe("crossCheckCompletions — the corroborating read's own failure modes",
     });
 
     // THE branch that decides whether a broken second read degrades to "no
-    // corroboration, red stands" or becomes a mute switch. classifyGuard only
-    // suppresses on `!error && newestCompletedAt`, so `{error: true}` must not
+    // corroboration, red stands" or becomes a clear switch. classifyGuard only
+    // clears on `!error && newestCompletedAt`, so `{error: true}` must not
     // be confused with either a null or a timestamp.
     assert.deepEqual(observed, { error: true });
     assert.equal(observed.newestCompletedAt, undefined);
@@ -630,7 +641,7 @@ describe("classifyGuard — 'never completed' rests on the same distrusted index
   it("still reds when the cross-check could not be read — absence is not agreement", () => {
     const result = neverCompleted({ error: true });
 
-    assert.equal(result.status, "stale", "an unreadable second read must not mute the alarm");
+    assert.equal(result.status, "stale", "an unreadable second read must not clear the alarm");
     assert.equal(result.reason, "never-completed");
   });
 
@@ -657,7 +668,7 @@ describe("classifyGuard — 'never completed' rests on the same distrusted index
   // "Never completed" is refuted by ANY completion, however old. But refuting
   // "never" does not establish "alive": the cross-check timestamp is aged
   // against staleHours, and a six-day-old completion is a stopped guard, not a
-  // disagreement to suppress. The empty filtered page must not mute a dead guard.
+  // disagreement that clears. The empty filtered page must not green a dead guard.
   it("reds as stopped, citing the cross-check timestamp, when the only completion is past the bar; refuting 'never' does not establish 'alive'", () => {
     const result = neverCompleted({ newestCompletedAt: "2026-09-12T04:32:39Z" });
 
@@ -680,7 +691,8 @@ describe("classifyGuard — 'never completed' rests on the same distrusted index
   });
 
   // The other side of that minute: EXACTLY on the bar (12:05Z, 165m) is past it,
-  // a stop and not a suppression. `<=` in place of `<` mutes it.
+  // a stop and not a clear. `<=` in place of `<` returns `ok`/`corroborated` here
+  // — an affirmative green on a stopped guard (PEN-3462).
   it("reds as stopped when the cross-check completion sits exactly on the bar", () => {
     const result = neverCompleted({ newestCompletedAt: "2026-09-18T12:05:00Z" });
 

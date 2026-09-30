@@ -139,9 +139,11 @@
 #
 # Absence of corroboration is not agreement: an unreadable cross-check leaves
 # the red standing, annotated, so a persistently failing second read cannot
-# become a mute switch. Nor does a newer completion PAST the bar clear anything
-# — the guard is then dead by either read and the red stands, citing the better
-# timestamp. The extra call is spent only on the path that was about to red.
+# become a clear switch — under the verdict above that would be an affirmative
+# "this guard is alive" resting on a read that could not be made. Nor does a
+# newer completion PAST the bar clear anything — the guard is then dead by
+# either read and the red stands, citing the better timestamp. The extra call
+# is spent only on the path that was about to red.
 #
 # WHY arc-light AND NOT default
 #

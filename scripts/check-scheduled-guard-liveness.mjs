@@ -349,10 +349,12 @@ export function classifyGuard(workflow, observation, { now, staleHours = DEFAULT
   // the two facts the verdict names: the guard is alive, the index is wedged.
   //
   // Absence of corroboration is NOT agreement: an unreadable cross-check leaves
-  // the stale verdict standing, annotated. Suppressing there would mean a
-  // persistently failing second read mutes the alarm entirely, which is the
-  // exact failure mode this detector exists to prevent — the same reasoning
-  // that makes `runs-unreadable` red rather than pass.
+  // the stale verdict standing, annotated. Clearing there would mean a
+  // persistently failing second read greens the alarm entirely — under PEN-3462
+  // that is an affirmative "this guard is alive" resting on a read that could
+  // not be made, which is the exact failure mode this detector exists to
+  // prevent — the same reasoning that makes `runs-unreadable` red rather than
+  // pass.
   //
   // A newer cross-check refutes the AGE, not staleness: it is aged against the
   // same staleHours bar the never-completed branch uses. Past the bar the guard
@@ -377,12 +379,16 @@ export function classifyGuard(workflow, observation, { now, staleHours = DEFAULT
       };
     }
     if (!Number.isNaN(crossEpoch) && crossEpoch > completedEpoch) {
+      // One expression, used twice: the lag on the result and the lag in the
+      // annotation are then provably the same number rather than two
+      // computations that happen to agree.
+      const indexLagMinutes = Math.floor((crossEpoch - completedEpoch) / 60000);
       return {
         ...base,
         status: "ok",
         reason: "corroborated",
         ageMinutes: crossAgeMinutes,
-        indexLagMinutes: Math.floor((crossEpoch - completedEpoch) / 60000),
+        indexLagMinutes,
         detail:
           `${name} (${workflow}) read as ${Math.floor(ageMinutes / 60)}h stale from the filtered ` +
           `run index (newest completed ${observation.newest.updatedAt}), but an unfiltered re-read ` +
@@ -390,7 +396,7 @@ export function classifyGuard(workflow, observation, { now, staleHours = DEFAULT
           `${crossAgeMinutes}m ago, inside the ${staleHours}h liveness threshold. The corroborating ` +
           `read confirms this guard is alive (PEN-3462); the ${Math.floor(ageMinutes / 60)}h age ` +
           `above is measured off a fiction. The filtered index is behind by ` +
-          `${Math.floor((crossEpoch - completedEpoch) / 60000)}m and is itself faulty.`,
+          `${indexLagMinutes}m and is itself faulty.`,
         lastRunUrl: observation.newest.htmlUrl ?? null,
       };
     }
@@ -708,11 +714,13 @@ function countQueued(repo, workflow) {
  * directions.
  *
  * The consequence to state plainly: the failure mode this paragraph rules out
- * is a page that fabricates a NEWER completion than truth, and that would now
- * be a mute. It always would have been — a suppressed verdict already exited 0
- * before PEN-3462 relabelled it — so the ordering assumption has been
+ * is a page that fabricates a NEWER completion than truth, and under PEN-3462
+ * that is an affirmative `ok`/`corroborated` — the detector asserting the guard
+ * is alive on a timestamp that does not describe a real completion. The alarm
+ * was already silenced by it before PEN-3462 relabelled the verdict (a
+ * suppressed verdict also exited 0), so the ordering assumption has been
  * safety-bearing all along, and describing it as load-bearing for precision
- * only was the part that was wrong. `find` is what blocks that mute: the
+ * only was the part that was wrong. `find` is what blocks that false green: the
  * `max(updated_at)` alternative rejected above is exactly a fabricated-newer
  * read, which is why the choice between them is a safety choice and not a
  * stylistic one.
@@ -741,7 +749,7 @@ export function selectNewestCompleted(runs) {
  *
  * `read` is injectable so the failure branch is reachable from a test. It is
  * the branch that matters most: it decides whether a broken second read
- * degrades to "no corroboration, red stands" or to a silent mute, and a
+ * degrades to "no corroboration, red stands" or to a silent clear, and a
  * veto whose failure mode is untested is a veto nobody can trust.
  */
 export function crossCheckCompletions(repo, workflow, read = gh) {
@@ -845,7 +853,12 @@ function main() {
       disabled: "Guard workflow disabled",
       "never-completed": "Guard has never completed",
     };
-    console.log(`::error title=${titles[result.reason]}::${result.detail}`);
+    // Exhaustive over the stale reasons that reach here today ("stopped" is
+    // handled above), but carrying the same fallback as the `unknown` branch:
+    // an unmapped reason must name itself rather than print `title=undefined`,
+    // and that branch's comment claims this symmetry.
+    const title = titles[result.reason] ?? `Scheduled guard is stale (${result.reason})`;
+    console.log(`::error title=${title}::${result.detail}`);
   }
 
   const summary = summarize(results);
