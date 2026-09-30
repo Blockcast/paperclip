@@ -1638,22 +1638,35 @@ export function describeTruncationCause(
  *
  * - `gone`       — the pod list came back empty, or the namespace itself 404s.
  * - `alive`      — the list succeeded and still showed pods at the deadline.
+ *                  Returned only when the pod delete was accepted, so they are
+ *                  Terminating.
+ * - `undeleted`  -- the list still showed pods at the deadline but the pod
+ *                  delete was refused (non-404), so they are NOT Terminating
+ *                  and can still start a container.  A successful list proves
+ *                  nothing about the delete: `list` and `deletecollection` are
+ *                  separate verbs, and a read-only Role grants one without the
+ *                  other.
  * - `unobserved` — no list call ever succeeded, so nothing was observed either
  *                  way.  Notably this is also the branch where the pod delete
  *                  itself may never have been issued.
  */
-type PodTeardownOutcome = "gone" | "alive" | "unobserved";
+type PodTeardownOutcome = "gone" | "alive" | "undeleted" | "unobserved";
 
 /**
  * The clause describing a non-`gone` teardown outcome.  Split because
  * `unobserved` must not claim pods were "still present": nothing was seen —
  * the poll failed to look.
  */
-function podTeardownFailureClause(outcome: "alive" | "unobserved", subject: string): string {
+function podTeardownFailureClause(
+  outcome: Exclude<PodTeardownOutcome, "gone">,
+  subject: string,
+): string {
   const secs = Math.round(POD_TEARDOWN_TIMEOUT_MS / 1000);
-  return outcome === "alive"
-    ? `pod(s) for ${subject} still present after ${secs}s`
-    : `could not confirm pods for ${subject} are gone after ${secs}s (no pod list succeeded)`;
+  if (outcome === "alive") return `pod(s) for ${subject} still present after ${secs}s`;
+  if (outcome === "undeleted") {
+    return `pod(s) for ${subject} still present after ${secs}s and the pod delete was refused`;
+  }
+  return `could not confirm pods for ${subject} are gone after ${secs}s (no pod list succeeded)`;
 }
 
 /**
@@ -1671,12 +1684,16 @@ async function deleteJobPodsAndWait(
 ): Promise<PodTeardownOutcome> {
   const coreApi = getCoreApi(kubeconfigPath);
   const labelSelector = `job-name=${jobName}`;
+  // Whether the pods were actually marked for deletion.  The poll below cannot
+  // tell: it only sees that pods exist, not that they are Terminating.
+  let deleteAccepted = true;
   try {
     await coreApi.deleteCollectionNamespacedPod({ namespace, labelSelector });
   } catch (err) {
     // Non-fatal: the Job delete below still cascades.  Fall through to the
     // poll, which is what actually decides whether the Secrets are safe.
     if (!isK8s404(err)) {
+      deleteAccepted = false;
       const msg = err instanceof Error ? err.message : String(err);
       await onLog("stderr", `[paperclip] Warning: failed to delete pods for job ${jobName}: ${msg}\n`);
     }
@@ -1709,7 +1726,10 @@ async function deleteJobPodsAndWait(
       }
     }
     if (lastObserved === 0) return "gone";
-    if (Date.now() >= deadline) return lastObserved === null ? "unobserved" : "alive";
+    if (Date.now() >= deadline) {
+      if (lastObserved === null) return "unobserved";
+      return deleteAccepted ? "alive" : "undeleted";
+    }
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
   }
 }
@@ -1794,8 +1814,11 @@ async function deleteJobOnly(
  * run only settles once `waitForJobCompletion` sees the Job 404, and
  * `completionTimeoutMs` may be 0 (run indefinitely), so refusing to delete the
  * Job would hang the run forever.  That trade is only sound when the pod delete
- * actually landed — and it is `alive` that evidences it, because the apiserver
- * answered a list for the same Job.
+ * actually landed, which is what `alive` means: `deleteJobPodsAndWait` returns
+ * it only when `deleteCollection` was accepted.  A successful list is not that
+ * evidence: a Role granting pods `list` but not `deletecollection` (or a 5xx
+ * on the delete alone) sees the pod and never marks it Terminating; that is
+ * `undeleted`, and it fails closed like `unobserved`.
  *
  * BLO-38096: it does NOT fail open on `unobserved`.  A non-404
  * `deleteCollection` failure is swallowed above and falls through to the poll,
@@ -1812,11 +1835,13 @@ export async function teardownCancelledJob(
   kubeconfigPath?: string,
 ): Promise<void> {
   const outcome = await deleteJobPodsAndWait(namespace, jobName, onLog, kubeconfigPath);
-  if (outcome === "unobserved") {
+  if (outcome === "unobserved" || outcome === "undeleted") {
+    const deleteStatus =
+      outcome === "unobserved" ? "the pod delete may never have been issued, so " : "";
     await onLog(
       "stderr",
       `[paperclip] Warning: ${podTeardownFailureClause(outcome, `cancelled job ${jobName}`)}; ` +
-        `the pod delete may never have been issued, so leaving the Job rather than letting ` +
+        `${deleteStatus}leaving the Job rather than letting ` +
         `ownerReference GC reap the run Secrets under a pod that can still start\n`,
     ).catch(() => undefined);
     return;
