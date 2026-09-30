@@ -1635,10 +1635,18 @@ describe("agent issue mutation checkout ownership", () => {
   // mechanism that would have silenced the false incident. These tests pin the 403 -> 2xx
   // transition for the one narrow shape, and the 403 everywhere around it.
   describe("deliberate-park disposition PATCH (BLO-27912)", () => {
+    // MUST stay relative to now. `issueParkedDispositionSchema` accepts `until` only in
+    // the open interval (now, now + PARKED_DISPOSITION_MAX_HORIZON_DAYS], so any absolute
+    // literal here is a time bomb with at most a 90-day fuse: once it lapses the schema
+    // rejects it at the edge, and every assertion below shifts to 400 — including the two
+    // that assert 403, because validation runs before the grant check. Not hypothetical: a
+    // literal `2026-09-30T00:00:00.000Z` lapsed at midnight on 2026-09-30 and took the
+    // whole merge queue red (BLO-38229). Do not "simplify" this back to a fixed string.
+    const untilWithinHorizon = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
     const parkedBody = {
       parkedDisposition: {
         reason: "Gated on upstream fMP4 contract scheduling; no timer owns the event.",
-        until: "2026-09-30T00:00:00.000Z",
+        until: untilWithinHorizon,
       },
     };
     // Grants `issue:comment` (the action the creator / manager-chain allow-paths are
@@ -1762,7 +1770,7 @@ describe("agent issue mutation checkout ownership", () => {
 
       const res = await request(await createApp(ownerActor()))
         .patch(`/api/issues/${issueId}`)
-        .send({ parkedUntil: "2026-09-30T00:00:00.000Z" });
+        .send({ parkedUntil: untilWithinHorizon });
 
       expect(res.status).toBe(400);
       expect(mockIssueService.update).not.toHaveBeenCalled();
@@ -1789,7 +1797,7 @@ describe("agent issue mutation checkout ownership", () => {
 
       const res = await request(await createApp(ownerActor()))
         .patch(`/api/issues/${issueId}`)
-        .send({ parkedDisposition: { until: "2026-09-30T00:00:00.000Z" } });
+        .send({ parkedDisposition: { until: untilWithinHorizon } });
 
       expect(res.status).toBe(400);
       expect(mockIssueService.update).not.toHaveBeenCalled();
