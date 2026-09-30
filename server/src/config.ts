@@ -148,13 +148,17 @@ export interface Config {
   // worker tier owns them, same as database backups.
   heapSnapshotEnabled: boolean;
   heapSnapshotDir: string;
+  // Each numeric field below is carried in the unit its env var is written in,
+  // not pre-multiplied into ms/bytes. That is what lets the bounds key match the
+  // field name, which is the contract NUMERIC_SETTING_BOUNDS and the BLO-27641
+  // guard both key off. The conversion happens at the consumer in index.ts.
   heapSnapshotKeep: number;
-  heapSnapshotMinFreeBytes: number;
-  heapSnapshotAutoThresholdBytes: number;
-  heapSnapshotAutoMinIntervalMs: number;
-  heapSnapshotSentinelMinIntervalMs: number;
-  heapSnapshotMaxAgeMs: number;
-  heapSnapshotPollIntervalMs: number;
+  heapSnapshotMinFreeGb: number;
+  heapSnapshotThresholdMb: number;
+  heapSnapshotAutoMinIntervalMinutes: number;
+  heapSnapshotSentinelMinIntervalMinutes: number;
+  heapSnapshotMaxAgeMinutes: number;
+  heapSnapshotPollIntervalSeconds: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -603,6 +607,32 @@ export const NUMERIC_SETTING_BOUNDS = {
     min: 60 * 60_000,
     max: 30 * 24 * 60 * 60_000,
   },
+  // Heap-snapshot diagnostics (PEN-3631). Bounded for the same reason as every
+  // neighbour, and one of these is the sharpest case in the table: the poll
+  // interval is a live `setInterval` delay whose callback takes a
+  // stop-the-world heap snapshot on the singleton worker, so the `Infinity`
+  // coercion would not disable it — it would degrade it to a 1 ms loop pausing
+  // the worker continuously and filling a shared volume.
+  heapSnapshotKeep: { fallback: 2, min: 1, max: 20 },
+  heapSnapshotMinFreeGb: { fallback: 10, min: 1, max: 1_024 },
+  // ⚠ `fallback: 0` and `min: 0` are load-bearing, not a typo. `0` means the
+  // automatic trigger is OFF, leaving the sentinel file as the only way in —
+  // `heap-snapshot.ts` reads `autoThresholdBytes <= 0` as disabled — and off is
+  // the documented default. `resolveNumericSetting` rejects non-positive
+  // candidates, so an explicit `=0` is reported as an ignored override and then
+  // lands on this fallback, which is the same disabled state the operator asked
+  // for. A positive fallback would invert that into "enabled at the default":
+  // the one direction a typo must not be able to send a stop-the-world pause.
+  heapSnapshotThresholdMb: { fallback: 0, min: 0, max: 65_536 },
+  heapSnapshotAutoMinIntervalMinutes: { fallback: 120, min: 1, max: TIMER_PERIOD_MINUTES_MAX },
+  heapSnapshotSentinelMinIntervalMinutes: { fallback: 5, min: 1, max: TIMER_PERIOD_MINUTES_MAX },
+  // An exposure window rather than a delay, so it takes no ms factor. Capped at
+  // 30 days because the file holds every string on the heap — including the
+  // secrets `loadConfig()` reads out of the environment — on a volume shared
+  // with every agent pod, so an unbounded value turns a diagnostic into
+  // indefinite retention of those secrets.
+  heapSnapshotMaxAgeMinutes: { fallback: 1440, min: 1, max: 43_200 },
+  heapSnapshotPollIntervalSeconds: { fallback: 60, min: 5, max: 3_600 },
 } as const satisfies Record<string, NumericSettingBounds>;
 
 /**
@@ -627,6 +657,15 @@ export const TIMER_SETTING_MS_FACTOR = {
   approvalEnforcementReconcilerIntervalMinutes: 60_000,
   terminalGateReconcilerIntervalMinutes: 60_000,
   heartbeatSchedulerIntervalMs: 1,
+  heapSnapshotAutoMinIntervalMinutes: 60_000,
+  heapSnapshotSentinelMinIntervalMinutes: 60_000,
+  // Seconds-denominated, so the `/IntervalM(inutes|s)$/` heuristic that demands
+  // an entry here does not match it and would never ask. Registered anyway, for
+  // the same reason strandedRecoveryHandBackIntervalMinutes is: this one really
+  // is a `setInterval` delay, and being exempt on a spelling technicality is
+  // exactly how the overflow ceiling stops being asserted for the only new
+  // timer in this change.
+  heapSnapshotPollIntervalSeconds: 1_000,
 } as const satisfies Partial<Record<keyof typeof NUMERIC_SETTING_BOUNDS, number>>;
 
 /**
@@ -1085,26 +1124,41 @@ export function loadConfig(): Config {
   );
   // Two snapshots is the working minimum: one names what is on the heap, the
   // diff between two names what is accumulating.
-  const heapSnapshotKeep = Math.max(1, Number(process.env.PAPERCLIP_HEAP_SNAPSHOT_KEEP) || 2);
-  const heapSnapshotMinFreeBytes =
-    Math.max(1, Number(process.env.PAPERCLIP_HEAP_SNAPSHOT_MIN_FREE_GB) || 10) * 1024 * 1024 * 1024;
-  // 0 disables the automatic trigger, leaving the sentinel file as the only way in.
-  const heapSnapshotAutoThresholdBytes = Math.max(
-    0,
-    Number(process.env.PAPERCLIP_HEAP_SNAPSHOT_THRESHOLD_MB) || 0,
-  ) * 1024 * 1024;
-  const heapSnapshotAutoMinIntervalMs =
-    Math.max(1, Number(process.env.PAPERCLIP_HEAP_SNAPSHOT_MIN_INTERVAL_MINUTES) || 120) * 60 * 1000;
+  const heapSnapshotKeep = resolveNumericSetting(
+    [process.env.PAPERCLIP_HEAP_SNAPSHOT_KEEP],
+    NUMERIC_SETTING_BOUNDS.heapSnapshotKeep,
+    "heapSnapshotKeep",
+  );
+  const heapSnapshotMinFreeGb = resolveNumericSetting(
+    [process.env.PAPERCLIP_HEAP_SNAPSHOT_MIN_FREE_GB],
+    NUMERIC_SETTING_BOUNDS.heapSnapshotMinFreeGb,
+    "heapSnapshotMinFreeGb",
+  );
+  // 0 disables the automatic trigger, leaving the sentinel file as the only way
+  // in, and is the default — see the bounds entry for why that is expressed as
+  // `fallback: 0, min: 0` rather than as a floor here.
+  const heapSnapshotThresholdMb = resolveNumericSetting(
+    [process.env.PAPERCLIP_HEAP_SNAPSHOT_THRESHOLD_MB],
+    NUMERIC_SETTING_BOUNDS.heapSnapshotThresholdMb,
+    "heapSnapshotThresholdMb",
+  );
+  const heapSnapshotAutoMinIntervalMinutes = resolveNumericSetting(
+    [process.env.PAPERCLIP_HEAP_SNAPSHOT_MIN_INTERVAL_MINUTES],
+    NUMERIC_SETTING_BOUNDS.heapSnapshotAutoMinIntervalMinutes,
+    "heapSnapshotAutoMinIntervalMinutes",
+  );
   // The sentinel is writable from every pod mounting the shared claim, so the
   // request path needs a floor of its own or a loop touching the file forces a
   // stop-the-world pause on the singleton worker once per poll. Much shorter
   // than the automatic gap: that one spaces a *pair* for a diff, this one only
-  // bounds the pause rate. Clamped to >= 1 minute deliberately — this is a DoS
-  // floor on an untrusted-writable path, so a typo must not be able to remove it.
-  const heapSnapshotSentinelMinIntervalMs =
-    Math.max(1, Number(process.env.PAPERCLIP_HEAP_SNAPSHOT_SENTINEL_MIN_INTERVAL_MINUTES) || 5) *
-    60 *
-    1000;
+  // bounds the pause rate. The floor is the bounds entry's `min`, which unlike
+  // the old `Math.max(1, …)` also holds against `Infinity` — this is a DoS
+  // floor on an untrusted-writable path, so a typo must not be able to lift it.
+  const heapSnapshotSentinelMinIntervalMinutes = resolveNumericSetting(
+    [process.env.PAPERCLIP_HEAP_SNAPSHOT_SENTINEL_MIN_INTERVAL_MINUTES],
+    NUMERIC_SETTING_BOUNDS.heapSnapshotSentinelMinIntervalMinutes,
+    "heapSnapshotSentinelMinIntervalMinutes",
+  );
   // How long a snapshot may remain on the volume, from its capture stamp. This
   // is an exposure window, not a disk cap: the file holds every string on this
   // process's heap, which includes the secrets loadConfig() reads out of the
@@ -1113,13 +1167,20 @@ export function loadConfig(): Config {
   // no file mode separates the readers. Retention therefore runs even when
   // capture is disabled — see the startup block in index.ts.
   //
-  // Clamped to >= 1 minute for the same reason as the sentinel floor: a typo
-  // must not be able to remove a security bound. Default 24h keeps the window
-  // finite while leaving ample room for the hours-apart pair PEN-3314 needs.
-  const heapSnapshotMaxAgeMs =
-    Math.max(1, Number(process.env.PAPERCLIP_HEAP_SNAPSHOT_MAX_AGE_MINUTES) || 1440) * 60 * 1000;
-  const heapSnapshotPollIntervalMs =
-    Math.max(5, Number(process.env.PAPERCLIP_HEAP_SNAPSHOT_POLL_SECONDS) || 60) * 1000;
+  // Bounded above as well as below for the same reason as the sentinel floor: a
+  // typo must not be able to remove a security bound, in either direction.
+  // Default 24h keeps the window finite while leaving ample room for the
+  // hours-apart pair PEN-3314 needs.
+  const heapSnapshotMaxAgeMinutes = resolveNumericSetting(
+    [process.env.PAPERCLIP_HEAP_SNAPSHOT_MAX_AGE_MINUTES],
+    NUMERIC_SETTING_BOUNDS.heapSnapshotMaxAgeMinutes,
+    "heapSnapshotMaxAgeMinutes",
+  );
+  const heapSnapshotPollIntervalSeconds = resolveNumericSetting(
+    [process.env.PAPERCLIP_HEAP_SNAPSHOT_POLL_SECONDS],
+    NUMERIC_SETTING_BOUNDS.heapSnapshotPollIntervalSeconds,
+    "heapSnapshotPollIntervalSeconds",
+  );
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -1246,12 +1307,12 @@ export function loadConfig(): Config {
     heapSnapshotEnabled,
     heapSnapshotDir,
     heapSnapshotKeep,
-    heapSnapshotMinFreeBytes,
-    heapSnapshotAutoThresholdBytes,
-    heapSnapshotAutoMinIntervalMs,
-    heapSnapshotSentinelMinIntervalMs,
-    heapSnapshotMaxAgeMs,
-    heapSnapshotPollIntervalMs,
+    heapSnapshotMinFreeGb,
+    heapSnapshotThresholdMb,
+    heapSnapshotAutoMinIntervalMinutes,
+    heapSnapshotSentinelMinIntervalMinutes,
+    heapSnapshotMaxAgeMinutes,
+    heapSnapshotPollIntervalSeconds,
     serveUi:
       process.env.SERVE_UI !== undefined
         ? process.env.SERVE_UI === "true"
