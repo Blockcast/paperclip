@@ -5536,9 +5536,10 @@ describeEmbeddedPostgres("github-webhook route", () => {
       );
 
       expect(resolved).toMatchObject([{ repoFullName: REPO, prNumber }]);
-      // BLO-38257: this read is inline before the handler answers GitHub, so it
-      // must carry a deadline. Unbounded, it is capped only by undici's ~300s
-      // and holds the delivery open long enough to earn a redelivery storm.
+      // BLO-38257: this read runs on the heartbeat tick at the end of the
+      // latched recovery chain, not inline in a webhook handler. It carries its
+      // own deadline because every second it takes holds that latch, and every
+      // tick skips recovery until it lets go.
       expect(resolved[0]?.signal).toBeInstanceOf(AbortSignal);
       // Against the frozen head this would read `not_attested` and replay,
       // producing the duplicate; against the live head it is superseded.

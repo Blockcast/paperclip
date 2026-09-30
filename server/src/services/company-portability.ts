@@ -59,7 +59,7 @@ import {
 import { requireOpenCodeModelId } from "@paperclipai/adapter-opencode-local/server";
 import { findServerAdapter } from "../adapters/index.js";
 import { forbidden, notFound, unprocessable } from "../errors.js";
-import { ghFetch, gitHubApiBase, resolveRawGitHubUrl } from "./github-fetch.js";
+import { ghFetch, ghReadBody, gitHubApiBase, resolveRawGitHubUrl } from "./github-fetch.js";
 import type { StorageService } from "../storage/types.js";
 import { accessService } from "./access.js";
 import { agentService } from "./agents.js";
@@ -2560,7 +2560,7 @@ async function fetchText(url: string) {
   if (!response.ok) {
     throw unprocessable(`Failed to fetch ${url}: ${response.status}`);
   }
-  return response.text();
+  return ghReadBody(url, () => response.text());
 }
 
 async function fetchOptionalText(url: string) {
@@ -2569,7 +2569,7 @@ async function fetchOptionalText(url: string) {
   if (!response.ok) {
     throw unprocessable(`Failed to fetch ${url}: ${response.status}`);
   }
-  return response.text();
+  return ghReadBody(url, () => response.text());
 }
 
 async function fetchBinary(url: string) {
@@ -2577,7 +2577,7 @@ async function fetchBinary(url: string) {
   if (!response.ok) {
     throw unprocessable(`Failed to fetch ${url}: ${response.status}`);
   }
-  return Buffer.from(await response.arrayBuffer());
+  return Buffer.from(await ghReadBody(url, () => response.arrayBuffer()));
 }
 
 async function fetchJson<T>(url: string): Promise<T> {
@@ -2589,7 +2589,7 @@ async function fetchJson<T>(url: string): Promise<T> {
   if (!response.ok) {
     throw unprocessable(`Failed to fetch ${url}: ${response.status}`);
   }
-  return response.json() as Promise<T>;
+  return ghReadBody(url, () => response.json() as Promise<T>);
 }
 
 function dedupeEnvInputs(values: CompanyPortabilityManifest["envInputs"]) {

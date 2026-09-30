@@ -4006,9 +4006,16 @@ export async function reconcileContendedPrReviewerWakes(
         liveHeadSha = await (config.resolvePrReviewHeadSha ?? githubFetchPrHeadSha)({
           repoFullName: replay.context.repoFullName,
           prNumber: replay.context.prNumber,
-          // Inline, before this handler answers GitHub: bound it well under the
-          // delivery timeout so a slow read degrades to the warn below rather
-          // than holding the delivery open and earning a redelivery (BLO-38257).
+          // Not request-inline: the only production caller is the heartbeat
+          // tick, at the end of the latched recovery chain
+          // (`heartbeatRecoveryChainInFlight` in index.ts), so no GitHub
+          // delivery is held open here. It is bounded because a slow read holds
+          // that latch, and every tick skips recovery until it lets go
+          // (BLO-38257); a timed-out read degrades to the warn below. The bound is
+          // per row, not per pass: a full 50-row batch can still spend 50 x this
+          // timeout here. A pass-level budget was rejected because, once spent,
+          // it would send every later row to the frozen-head fallback, which is
+          // the duplicate-review shape this block exists to stop.
           signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
         });
       } catch (err) {

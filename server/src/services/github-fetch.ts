@@ -45,6 +45,21 @@ export function _setGhFetchDeadlineMsForTest(ms: number = GITHUB_FETCH_DEADLINE_
   deadlineMs = ms;
 }
 
+/**
+ * An abort is not a connect failure, and the two aborts are not each other
+ * (BLO-38257). A caller's own abort is theirs to recognise, so it comes back
+ * untouched; the default deadline firing is reported as a timeout, so a GitHub
+ * slowdown does not send on-call to check URL configuration. Returns null for
+ * anything that is not an abort, which each phase then reports in its own words.
+ */
+function abortFailure(url: string, err: unknown, callerSignal?: AbortSignal | null): unknown {
+  if (callerSignal?.aborted) return err;
+  if ((err as { name?: unknown } | null)?.name === "TimeoutError") {
+    return unprocessable(`GitHub request to ${new URL(url).hostname} timed out after ${deadlineMs}ms`);
+  }
+  return null;
+}
+
 export async function ghFetch(url: string, init?: RequestInit): Promise<Response> {
   // Compose, never replace: a caller-supplied signal must still abort earlier
   // than the default, and the default must still bound a caller that passes none.
@@ -52,7 +67,24 @@ export async function ghFetch(url: string, init?: RequestInit): Promise<Response
   const signal = init?.signal ? AbortSignal.any([init.signal, deadline]) : deadline;
   try {
     return await fetch(url, { ...init, signal });
-  } catch {
+  } catch (err) {
+    const aborted = abortFailure(url, err, init?.signal);
+    if (aborted) throw aborted;
     throw unprocessable(`Could not connect to ${new URL(url).hostname} — ensure the URL points to a GitHub or GitHub Enterprise instance`);
+  }
+}
+
+/**
+ * Read a `ghFetch` response body under the same failure contract. The deadline
+ * stays armed until the body is consumed, so a slow transfer aborts mid-read,
+ * outside `ghFetch`'s own try/catch; unwrapped, that escapes as a raw
+ * `TimeoutError` instead of the structured error the caller throws for every
+ * other failure. For callers that thread no signal of their own.
+ */
+export async function ghReadBody<T>(url: string, read: () => Promise<T>): Promise<T> {
+  try {
+    return await read();
+  } catch (err) {
+    throw abortFailure(url, err) ?? err;
   }
 }
