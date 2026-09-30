@@ -128,6 +128,16 @@ function sumNumber(column: typeof costEvents.costCents | typeof costEvents.input
   return sql<number>`coalesce(sum(${column}), 0)::double precision`;
 }
 
+// BLO-29842: cache writes used to be folded into `input_tokens` and now have
+// their own column. These profile figures report token VOLUME, not rate-card
+// regressors, so they sum both to keep meaning what they meant before the split
+// — summing `input_tokens` alone would silently shrink every per-user total by
+// the whole cache-write volume. The three-way split is exposed on /costs/*,
+// where the rate-card fit actually needs the classes apart.
+function sumPromptTokens() {
+  return sql<number>`coalesce(sum(${costEvents.inputTokens} + ${costEvents.cacheCreationInputTokens}), 0)::double precision`;
+}
+
 async function loadWindowStats(
   db: Db,
   companyId: string,
@@ -179,7 +189,7 @@ async function loadWindowStats(
   const [costStats] = await db
     .select({
       costCents: sumNumber(costEvents.costCents),
-      inputTokens: sumNumber(costEvents.inputTokens),
+      inputTokens: sumPromptTokens(),
       cachedInputTokens: sumNumber(costEvents.cachedInputTokens),
       outputTokens: sumNumber(costEvents.outputTokens),
       costEventCount: sql<number>`count(${costEvents.id})::int`,
@@ -271,7 +281,7 @@ async function loadDailyStats(db: Db, companyId: string, userId: string): Promis
     .select({
       date: costDay,
       costCents: sumNumber(costEvents.costCents),
-      inputTokens: sumNumber(costEvents.inputTokens),
+      inputTokens: sumPromptTokens(),
       cachedInputTokens: sumNumber(costEvents.cachedInputTokens),
       outputTokens: sumNumber(costEvents.outputTokens),
     })
@@ -364,7 +374,7 @@ export function userProfileRoutes(db: Db) {
           agentId: costEvents.agentId,
           agentName: agents.name,
           costCents: sumNumber(costEvents.costCents),
-          inputTokens: sumNumber(costEvents.inputTokens),
+          inputTokens: sumPromptTokens(),
           cachedInputTokens: sumNumber(costEvents.cachedInputTokens),
           outputTokens: sumNumber(costEvents.outputTokens),
         })
@@ -381,7 +391,7 @@ export function userProfileRoutes(db: Db) {
           biller: costEvents.biller,
           model: costEvents.model,
           costCents: sumNumber(costEvents.costCents),
-          inputTokens: sumNumber(costEvents.inputTokens),
+          inputTokens: sumPromptTokens(),
           cachedInputTokens: sumNumber(costEvents.cachedInputTokens),
           outputTokens: sumNumber(costEvents.outputTokens),
         })

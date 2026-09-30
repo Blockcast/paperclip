@@ -104,6 +104,7 @@ import {
   envBindingSchema,
   isSensitiveEnv,
   isEnvironmentDriverSupportedForAdapter,
+  promptTokens,
   type BillingType,
   type CostStatus,
   type EnvironmentLeaseStatus,
@@ -495,7 +496,7 @@ import {
 } from "./recovery/index.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./recovery/pause-hold-guard.js";
 import {
-  runUsageTokenCounts,
+  runUsageHasNoModelTokens,
   SESSION_UNAVAILABLE_RECOVERY_MAX_ATTEMPTS,
   SESSION_UNAVAILABLE_RECOVERY_RETRY_REASON,
   ZERO_TOKEN_SESSION_RESET_RETRY_REASON,
@@ -4719,6 +4720,8 @@ interface WakeupOptions {
 type UsageTotals = {
   inputTokens: number;
   cachedInputTokens: number;
+  /** BLO-29842: cache WRITE, billed 1.25x-2x input. Never part of inputTokens. */
+  cacheCreationInputTokens: number;
   outputTokens: number;
 };
 
@@ -5475,9 +5478,26 @@ function stripAdapterProviderCapacityResetMetadata(
   return sanitized;
 }
 
-function zeroTokenUsage(usage: { inputTokens?: number; outputTokens?: number; cachedInputTokens?: number } | undefined) {
+function zeroTokenUsage(
+  usage:
+    | {
+        inputTokens?: number;
+        outputTokens?: number;
+        cachedInputTokens?: number;
+        cacheCreationInputTokens?: number;
+      }
+    | undefined,
+) {
   if (!usage) return true;
-  return (usage.inputTokens ?? 0) <= 0 && (usage.outputTokens ?? 0) <= 0 && (usage.cachedInputTokens ?? 0) <= 0;
+  // BLO-29842: cache creation is billed model work. Omitting it here would let a
+  // run that only wrote cache read as "zero tokens" and be misclassified as a
+  // throttled/idle run that never reached the model.
+  return (
+    (usage.inputTokens ?? 0) <= 0 &&
+    (usage.outputTokens ?? 0) <= 0 &&
+    (usage.cachedInputTokens ?? 0) <= 0 &&
+    (usage.cacheCreationInputTokens ?? 0) <= 0
+  );
 }
 
 export function isRetryableK8sCcrotateThrottleResult(result: {
@@ -5486,7 +5506,12 @@ export function isRetryableK8sCcrotateThrottleResult(result: {
   errorFamily?: string | null;
   retryNotBefore?: string | null;
   resultJson?: Record<string, unknown> | null;
-  usage?: { inputTokens?: number; outputTokens?: number; cachedInputTokens?: number };
+  usage?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    cachedInputTokens?: number;
+    cacheCreationInputTokens?: number;
+  };
 }) {
   if (!zeroTokenUsage(result.usage)) return false;
   if (result.errorFamily === "rate_limit_exhausted") return true;
@@ -6273,9 +6298,14 @@ export function resolveLedgerCostStatus(input: {
   costUsd: number | null | undefined;
   inputTokens: number;
   cachedInputTokens: number;
+  cacheCreationInputTokens: number;
   outputTokens: number;
 }): CostStatus {
-  const hasTokenUsage = input.inputTokens > 0 || input.cachedInputTokens > 0 || input.outputTokens > 0;
+  const hasTokenUsage =
+    input.inputTokens > 0 ||
+    input.cachedInputTokens > 0 ||
+    input.cacheCreationInputTokens > 0 ||
+    input.outputTokens > 0;
   return input.costUsd == null && hasTokenUsage ? "unpriced" : "reported";
 }
 
@@ -6387,6 +6417,7 @@ function normalizeUsageTotals(usage: UsageSummary | null | undefined): UsageTota
   return {
     inputTokens: Math.max(0, Math.floor(asNumber(usage.inputTokens, 0))),
     cachedInputTokens: Math.max(0, Math.floor(asNumber(usage.cachedInputTokens, 0))),
+    cacheCreationInputTokens: Math.max(0, Math.floor(asNumber(usage.cacheCreationInputTokens, 0))),
     outputTokens: Math.max(0, Math.floor(asNumber(usage.outputTokens, 0))),
   };
 }
@@ -6403,18 +6434,25 @@ function readRawUsageTotals(usageJson: unknown): UsageTotals | null {
     0,
     Math.floor(asNumber(parsed.rawCachedInputTokens, asNumber(parsed.cachedInputTokens, 0))),
   );
+  const cacheCreationInputTokens = Math.max(
+    0,
+    Math.floor(
+      asNumber(parsed.rawCacheCreationInputTokens, asNumber(parsed.cacheCreationInputTokens, 0)),
+    ),
+  );
   const outputTokens = Math.max(
     0,
     Math.floor(asNumber(parsed.rawOutputTokens, asNumber(parsed.outputTokens, 0))),
   );
 
-  if (inputTokens <= 0 && cachedInputTokens <= 0 && outputTokens <= 0) {
+  if (inputTokens <= 0 && cachedInputTokens <= 0 && cacheCreationInputTokens <= 0 && outputTokens <= 0) {
     return null;
   }
 
   return {
     inputTokens,
     cachedInputTokens,
+    cacheCreationInputTokens,
     outputTokens,
   };
 }
@@ -6429,6 +6467,9 @@ function deriveNormalizedUsageDelta(current: UsageTotals | null, previous: Usage
   const cachedInputTokens = current.cachedInputTokens >= previous.cachedInputTokens
     ? current.cachedInputTokens - previous.cachedInputTokens
     : current.cachedInputTokens;
+  const cacheCreationInputTokens = current.cacheCreationInputTokens >= previous.cacheCreationInputTokens
+    ? current.cacheCreationInputTokens - previous.cacheCreationInputTokens
+    : current.cacheCreationInputTokens;
   const outputTokens = current.outputTokens >= previous.outputTokens
     ? current.outputTokens - previous.outputTokens
     : current.outputTokens;
@@ -6436,6 +6477,7 @@ function deriveNormalizedUsageDelta(current: UsageTotals | null, previous: Usage
   return {
     inputTokens: Math.max(0, inputTokens),
     cachedInputTokens: Math.max(0, cachedInputTokens),
+    cacheCreationInputTokens: Math.max(0, cacheCreationInputTokens),
     outputTokens: Math.max(0, outputTokens),
   };
 }
@@ -6449,17 +6491,33 @@ export function parseSessionCompactionPolicy(agent: typeof agents.$inferSelect):
   return resolveSessionCompactionPolicy(agent.adapterType, agent.runtimeConfig).policy;
 }
 
+// BLO-29842: the rotation trigger's input basis, as one named unit so it can be
+// pinned. Cache creation used to be summed into `inputTokens` upstream; reading
+// `inputTokens` alone here would quietly shrink the trigger by the whole
+// cache-write volume — most of the prompt on this fleet — and rotate far later
+// than the policy asks. The threshold is unchanged; only what feeds it is.
+// Deliberately the shared `promptTokens` rather than a heartbeat-local twin:
+// two names for one concept is how a third spelling arrives. Kept exported and
+// separate from evaluateSessionCompaction (which needs a DB harness) so that
+// reverting this to `.inputTokens` fails a test instead of passing silently.
+export function sessionRotationInputTokens(usageJson: unknown): number | null {
+  const usage = readRawUsageTotals(usageJson);
+  return usage ? promptTokens(usage) : null;
+}
+
 // Pure rotation-trigger decision, factored out of evaluateSessionCompaction so the
 // boundary semantics are unit-testable without a DB harness (BLO-8827). Returns the
 // human-readable rotation reason, or null to keep the current session. Trigger
 // precedence is consecutive-failures → runs → raw-input → age (first match wins);
 // consecutive-failures is checked first because a poisoned session that never does
 // any model work will never trip the other thresholds (BLO-10889 / BLO-10866 WS2).
-// `latestRawInputTokens` is the NON-cached raw input of the latest run
-// (readRawUsageTotals prefers rawInputTokens, which excludes cached reads) — the
-// ceiling gates re-inflation across wakes, not cache hits. The raw-input comparison
-// is inclusive (>=), so a wake that lands exactly on the threshold rotates. A
-// zero/disabled threshold (value <= 0) disables that trigger.
+// `latestRawInputTokens` is the latest run's raw prompt input: fresh input plus
+// cache creation, via the shared `promptTokens`, with cache READS the one input
+// class left out (BLO-29842). readRawUsageTotals supplies both legs from their
+// raw, pre-compaction counts. The ceiling gates re-inflation across wakes, not
+// cache hits. The raw-input comparison is inclusive (>=), so a wake that lands
+// exactly on the threshold rotates. A zero/disabled threshold (value <= 0)
+// disables that trigger.
 export function computeSessionCompactionReason(input: {
   policy: SessionCompactionPolicy;
   runsCount: number;
@@ -6525,8 +6583,7 @@ function isFailedOrZeroTokenResume(run: {
   ) {
     return true;
   }
-  const { inputTokens, outputTokens } = runUsageTokenCounts(run.usageJson);
-  return inputTokens === 0 && outputTokens === 0;
+  return runUsageHasNoModelTokens(run.usageJson);
 }
 
 function heartbeatRunTokenUsage(usageJson: Record<string, unknown> | null): UsageTotals {
@@ -6539,6 +6596,10 @@ function heartbeatRunTokenUsage(usageJson: Record<string, unknown> | null): Usag
     cachedInputTokens: Math.max(
       0,
       Math.floor(asNumber(parsed.rawCachedInputTokens, asNumber(parsed.cachedInputTokens, asNumber(parsed.cached_input_tokens, 0)))),
+    ),
+    cacheCreationInputTokens: Math.max(
+      0,
+      Math.floor(asNumber(parsed.rawCacheCreationInputTokens, asNumber(parsed.cacheCreationInputTokens, asNumber(parsed.cache_creation_input_tokens, 0)))),
     ),
     outputTokens: Math.max(
       0,
@@ -6553,7 +6614,12 @@ function isZeroTokenCompletedRun(run: {
 }): boolean {
   if (!isHeartbeatRunTerminalStatus(run.status)) return false;
   const usage = heartbeatRunTokenUsage(run.usageJson);
-  return usage.inputTokens === 0 && usage.cachedInputTokens === 0 && usage.outputTokens === 0;
+  return (
+    usage.inputTokens === 0 &&
+    usage.cachedInputTokens === 0 &&
+    usage.cacheCreationInputTokens === 0 &&
+    usage.outputTokens === 0
+  );
 }
 
 export function countConsecutiveZeroTokenCompletedRuns(
@@ -15546,7 +15612,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       policy.maxSessionAgeHours > 0
         ? await getOldestRunForSession(agent.id, sessionId)
         : runs[runs.length - 1] ?? latestRun;
-    const latestRawUsage = readRawUsageTotals(latestRun?.usageJson);
     const sessionAgeHours =
       latestRun && oldestRun
         ? Math.max(
@@ -15559,7 +15624,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const reason = computeSessionCompactionReason({
       policy,
       runsCount: runs.length,
-      latestRawInputTokens: latestRawUsage?.inputTokens ?? null,
+      // BLO-29842: fresh input + cache creation. See sessionRotationInputTokens.
+      latestRawInputTokens: sessionRotationInputTokens(latestRun?.usageJson),
       sessionAgeHours,
       consecutiveFailedOrZeroTokenResumes,
     });
@@ -27315,13 +27381,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const inputTokens = usage?.inputTokens ?? 0;
     const outputTokens = usage?.outputTokens ?? 0;
     const cachedInputTokens = usage?.cachedInputTokens ?? 0;
+    const cacheCreationInputTokens = usage?.cacheCreationInputTokens ?? 0;
     const billingType = normalizeLedgerBillingType(result.billingType);
     const additionalCostCents = normalizeBilledCostCents(result.costUsd, billingType);
-    const hasTokenUsage = inputTokens > 0 || outputTokens > 0 || cachedInputTokens > 0;
+    const hasTokenUsage =
+      inputTokens > 0 || outputTokens > 0 || cachedInputTokens > 0 || cacheCreationInputTokens > 0;
     const costStatus = resolveLedgerCostStatus({
       costUsd: result.costUsd,
       inputTokens,
       cachedInputTokens,
+      cacheCreationInputTokens,
       outputTokens,
     });
     const provider = result.provider ?? "unknown";
@@ -27392,6 +27461,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         model: result.model ?? "unknown",
         inputTokens,
         cachedInputTokens,
+        cacheCreationInputTokens,
         outputTokens,
         costCents: additionalCostCents,
         occurredAt: new Date(),
@@ -32621,6 +32691,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ? "timed_out"
               : "failed";
 
+      // BLO-29842: this is the ONLY writer of `usage_json`, so it defines the
+      // spellings a reader can encounter on rows it wrote. For cache creation
+      // there are exactly two, both camelCase: `cacheCreationInputTokens` (via
+      // the `normalizedUsage` spread) and `rawCacheCreationInputTokens` below.
+      // Snake_case — `cache_creation_input_tokens` — is the *Anthropic API*
+      // field name; adapters normalize it away at the boundary, so this writer
+      // never emits it. The snake_case arms at the read sites are therefore
+      // DEFENSIVE, not reachable-from-here: the input/cached/output legs have
+      // carried them since before this change, and cache creation matches that
+      // shape rather than being the one leg of four that drops them. Extend
+      // this list when the emitted shape changes, rather than widening a read
+      // site to a guess.
       const usageJson =
         normalizedUsage || adapterResult.costUsd != null
           ? ({
@@ -32628,6 +32710,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ...(rawUsage ? {
                 rawInputTokens: rawUsage.inputTokens,
                 rawCachedInputTokens: rawUsage.cachedInputTokens,
+                rawCacheCreationInputTokens: rawUsage.cacheCreationInputTokens,
                 rawOutputTokens: rawUsage.outputTokens,
               } : {}),
               ...(sessionUsageResolution.derivedFromSessionTotals
@@ -32656,6 +32739,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 costUsd: adapterResult.costUsd,
                 inputTokens: normalizedUsage?.inputTokens ?? 0,
                 cachedInputTokens: normalizedUsage?.cachedInputTokens ?? 0,
+                cacheCreationInputTokens: normalizedUsage?.cacheCreationInputTokens ?? 0,
                 outputTokens: normalizedUsage?.outputTokens ?? 0,
               }),
               billingType: normalizeLedgerBillingType(adapterResult.billingType),
