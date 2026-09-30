@@ -40,6 +40,7 @@ import {
   resetRoutineDispatchMetrics,
   snapshotRoutineDispatchMetrics,
 } from "./routine-dispatch-metrics.js";
+import type { FdClassSnapshot } from "./fd-class-metrics.js";
 
 export const CONCURRENT_RUN_BLOCKED_METRIC = "claude_k8s_concurrent_run_blocked_total";
 /**
@@ -1205,6 +1206,13 @@ export const DB_POOL_WAITING_QUERIES_METRIC = "paperclip_db_pool_waiting_queries
  * can never block startup), which is distinguishable from any reading.
  */
 export const DB_INHERITED_TIMEOUT_METRIC = "paperclip_db_inherited_timeout_seconds";
+/**
+ * Open file descriptors split by what they point at (PEN-3314). Companion to
+ * prom-client's own unlabelled `process_open_fds`, which says the count is
+ * rising but not what is rising — see `services/fd-class-metrics.ts` for the
+ * measurement that motivated it and for the cardinality bounds.
+ */
+export const PROCESS_OPEN_FDS_BY_CLASS_METRIC = "paperclip_process_open_fds_by_class";
 /** Queue wait observed when a sanctioned GitHub PR-review run starts. */
 export const PR_REVIEW_QUEUE_WAIT_METRIC = "paperclip_pr_review_queue_wait_seconds";
 export const PR_REVIEW_QUEUE_WAIT_BUCKETS_SECONDS = [60, 300, 600, 900, 1800, 3600, 7200, 14400, 28800];
@@ -3187,6 +3195,7 @@ let scheduledRetryParkHorizonRefreshSuccess: Gauge | null = null;
 let dbPoolConnections: Gauge<"state"> | null = null;
 let dbPoolWaitingQueries: Gauge | null = null;
 let dbInheritedTimeout: Gauge<"setting" | "source"> | null = null;
+let processOpenFdsByClass: Gauge<"fd_class"> | null = null;
 let pluginError: Gauge<"plugin_id" | "plugin_key"> | null = null;
 let crashRecoveryCandidateIndexPresent: Gauge<"index"> | null = null;
 let pluginMetric: Counter<
@@ -3335,6 +3344,7 @@ function ensureRegistry(): {
   dbPoolConnectionsGauge: Gauge<"state">;
   dbPoolWaitingQueriesGauge: Gauge;
   dbInheritedTimeoutGauge: Gauge<"setting" | "source">;
+  processOpenFdsByClassGauge: Gauge<"fd_class">;
   pluginErrorGauge: Gauge<"plugin_id" | "plugin_key">;
   crashRecoveryCandidateIndexPresentGauge: Gauge<"index">;
   pluginMetricCounter: Counter<
@@ -3434,6 +3444,7 @@ function ensureRegistry(): {
     || !dbPoolConnections
     || !dbPoolWaitingQueries
     || !dbInheritedTimeout
+    || !processOpenFdsByClass
     || !pluginError
     || !crashRecoveryCandidateIndexPresent
     || !pluginMetric
@@ -3723,6 +3734,23 @@ function ensureRegistry(): {
         + "not set pool-side, so for those inherited is effective. Do not read "
         + "postgres_exporter's pg_settings_* for this -- that reports the exporter's own session.",
       labelNames: ["setting", "source"],
+      registers: [registry],
+    });
+    processOpenFdsByClass = new Gauge({
+      name: PROCESS_OPEN_FDS_BY_CLASS_METRIC,
+      help:
+        "Open file descriptors split by readlink('/proc/self/fd/N') target class (PEN-3314). "
+        + "prom-client's process_open_fds says the count is climbing; this says what is climbing. "
+        + "Classes: socket, pipe, memfd, anon_inode:<subtype>, file:<bounded dir>, "
+        + "deleted:<bounded dir> (fd held on an unlinked file -- the classic leak signature), "
+        + "vanished (readlink lost a race with close; ~1 per scrape is the readdir handle itself), "
+        + "other (fold of everything past the series cap), unclassified-truncated (descriptors "
+        + "beyond the per-scrape inspection cap). Counts sum to the true descriptor total. "
+        + "Directory labels are depth-bounded, so this names a code site class, not a file. "
+        + "NOT an alert source: max_fds is 524288 against ~240 open, and the heap aborts long "
+        + "before descriptors matter. Absent series means procfs was unreadable (non-Linux), "
+        + "which is deliberately distinct from a zero.",
+      labelNames: ["fd_class"],
       registers: [registry],
     });
     agentStartLockHeldSeconds = new Gauge({
@@ -4827,6 +4855,7 @@ function ensureRegistry(): {
     dbPoolConnectionsGauge: dbPoolConnections,
     dbPoolWaitingQueriesGauge: dbPoolWaitingQueries,
     dbInheritedTimeoutGauge: dbInheritedTimeout,
+    processOpenFdsByClassGauge: processOpenFdsByClass,
     pluginErrorGauge: pluginError,
     crashRecoveryCandidateIndexPresentGauge: crashRecoveryCandidateIndexPresent,
     pluginMetricCounter: pluginMetric,
@@ -5553,6 +5582,29 @@ export function setAgentStartLockHeldMetrics(
     const rawPhaseMs = entry.phaseMs ?? 0;
     const phaseMs = Number.isFinite(rawPhaseMs) ? Math.max(0, rawPhaseMs) : 0;
     phaseGauge.set({ agent_id: entry.agentId, phase }, phaseMs / 1000);
+  }
+}
+
+/**
+ * PEN-3314: publish the descriptor-class histogram.
+ *
+ * Reset-then-set, and the `reset()` is load-bearing rather than hygienic: a
+ * class that stops appearing must stop being published, because the question
+ * this gauge answers is "which class is *currently* accumulating". Without it,
+ * a directory whose descriptors were all closed would keep reporting its final
+ * count forever and read as a leak that had plateaued.
+ *
+ * A `null` snapshot publishes nothing at all, deliberately — see
+ * {@link collectFdClassSnapshot}, which returns `null` only where procfs is
+ * unreadable. "Cannot measure descriptors here" and "has no descriptors" must
+ * not render identically.
+ */
+export function setFdClassMetrics(snapshot: FdClassSnapshot | null): void {
+  const gauge = ensureRegistry().processOpenFdsByClassGauge;
+  gauge.reset();
+  if (!snapshot) return;
+  for (const [fdClass, count] of snapshot.classes) {
+    gauge.set({ fd_class: fdClass }, count);
   }
 }
 
@@ -6837,6 +6889,7 @@ export function __resetMetricsForTest(): void {
   agentStartLockHeldSeconds = null;
   agentStartLockPhaseSeconds = null;
   agentStartLockAbortedTotal = null;
+  processOpenFdsByClass = null;
   processLostTotal = null;
   externalLifecycleRunningRuns = null;
   externalLifecycleRunSilenceGap = null;
