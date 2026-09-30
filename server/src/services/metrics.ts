@@ -674,6 +674,82 @@ export const KNOWN_RETRY_SCHEDULE_REASONS = [
 ] as const;
 export type RetryScheduleReasonLabel = (typeof KNOWN_RETRY_SCHEDULE_REASONS)[number];
 /**
+ * Coerce a raw `scheduled_retry_reason` to the allow-list above. Shared by the
+ * outcome counter and the park-horizon gauge so the two cannot drift apart:
+ * a reason present on one and folded to `other` on the next would make a
+ * per-reason alert bound and its rate series disagree about the same park.
+ */
+export function coerceRetryScheduleReason(reason: string | null | undefined): RetryScheduleReasonLabel {
+  return (KNOWN_RETRY_SCHEDULE_REASONS as readonly string[]).includes(reason ?? "")
+    ? (reason as RetryScheduleReasonLabel)
+    : "other";
+}
+/**
+ * Per-agent zero-floor `reason`, emitted for EVERY known agent, including an
+ * agent that also carries live park series. It does not mean "no live park":
+ * `{reason="none"}` selects the whole fleet, so counting it yields fleet size,
+ * not drained agents. Keeps the BLO-25036 invariant that every known agent
+ * always carries a series, without zero-filling the agent x reason cross
+ * product. Deliberately outside {@link KNOWN_RETRY_SCHEDULE_REASONS}: it is not
+ * a park class, it is always 0, and an alert rule that bounded it would be
+ * bounding nothing.
+ */
+export const NO_SCHEDULED_RETRY_PARK_REASON = "none";
+/**
+ * Park-horizon-only refinements of `transient_failure` (BLO-31174, Ally C1 on
+ * onprem-k8s#4145). The raw column says `transient_failure` for THREE writer
+ * paths whose ceilings differ by more than 9x and one of which has no ceiling
+ * at all, so a single bound on that label is wrong by construction -- which is
+ * the exact defect the per-class bounds were built to remove:
+ *
+ *  - ladder (neither constant below): `BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS`
+ *    final 2h hop plus 25% jitter = **9,000s**. Keeps the bare
+ *    `transient_failure` label.
+ *  - {@link TRANSIENT_FLOOR_PARK_REASON}: an upstream `retryNotBefore` floor
+ *    won. An unclamped floor at or just under the horizon can add up to
+ *    `TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS` (300s), while a floor that
+ *    `clampTransientRetryHorizon` actually clamps carries no forward jitter;
+ *    the maximum is therefore `MAX_TRANSIENT_RETRY_HORIZON_MS` (86,400s) plus
+ *    300s = **86,700s**.
+ *  - {@link TRANSIENT_QUOTA_FLOOR_PARK_REASON}: a `provider_quota` floor.
+ *    `clampTransientHorizon` deliberately excludes this family -- it is a
+ *    contractual session/billing boundary carrying an authoritative reset
+ *    instant, not a capacity estimate -- so the floor is honoured verbatim and
+ *    has **no upper bound**. A multi-day park here is correct behaviour. An
+ *    alert rule must EXCLUDE this label rather than invent a bound for it;
+ *    bounding it would page on the designed path, which is the defect, not the
+ *    fix.
+ *
+ * Deliberately outside {@link KNOWN_RETRY_SCHEDULE_REASONS}: that list is the
+ * vocabulary of the raw column, which never holds either of these, and it is
+ * shared with the outcome counter. Refining it there would mint two counter
+ * series that can never be written.
+ */
+export const TRANSIENT_FLOOR_PARK_REASON = "transient_failure_floor";
+/** See {@link TRANSIENT_FLOOR_PARK_REASON}. Unbounded by design. */
+export const TRANSIENT_QUOTA_FLOOR_PARK_REASON = "transient_failure_quota_floor";
+/**
+ * Refine a coerced park reason using facts already on the parked row. Only
+ * `transient_failure` refines; every other reason passes through untouched, so
+ * this is a no-op for 13 of the 14 known reasons.
+ *
+ * `hasRetryFloor` is floor PRESENCE, not "the floor won" -- recovering the
+ * latter would mean recomputing the ladder value the park did not keep. When a
+ * present floor loses to the ladder the row is labelled floor anyway and is
+ * judged against 86,700s instead of 9,000s. That is a LOOSER bound on a park
+ * that is already provably under the tighter one, i.e. weaker monitoring of a
+ * known-good case, never a false page.
+ */
+export function refineScheduledRetryParkReason(input: {
+  reason: string | null | undefined;
+  hasRetryFloor?: boolean | null;
+  isProviderQuotaFamily?: boolean | null;
+}): string {
+  const reason = coerceRetryScheduleReason(input.reason);
+  if (reason !== "transient_failure" || !input.hasRetryFloor) return reason;
+  return input.isProviderQuotaFamily ? TRANSIENT_QUOTA_FLOOR_PARK_REASON : TRANSIENT_FLOOR_PARK_REASON;
+}
+/**
  * postgres.js connection-pool occupancy, by `state` (BLO-33243).
  *
  * There was no pool instrumentation anywhere in this fleet, which made pool
@@ -2592,7 +2668,7 @@ function ensureRegistry(): {
   queuedRunAgeMetricsRefreshSuccessGauge: Gauge;
   overdueScheduledRetryOldestAgeGauge: Gauge<"agent_id">;
   overdueScheduledRetryAgeMetricsRefreshSuccessGauge: Gauge;
-  scheduledRetryParkHorizonGauge: Gauge<"agent_id">;
+  scheduledRetryParkHorizonGauge: Gauge<"agent_id" | "reason">;
   scheduledRetryParkHorizonRefreshSuccessGauge: Gauge;
   dbPoolConnectionsGauge: Gauge<"state">;
   dbPoolWaitingQueriesGauge: Gauge;
@@ -2867,8 +2943,21 @@ function ensureRegistry(): {
     queuedRunAgeMetricsRefreshSuccess.set(0);
     scheduledRetryParkHorizon = new Gauge({
       name: SCHEDULED_RETRY_PARK_HORIZON_METRIC,
-      help: "Booked scheduled_retry park horizon in seconds, by agent.",
-      labelNames: ["agent_id"],
+      help:
+        "Booked scheduled_retry park horizon in seconds, by agent and park reason (BLO-31174). "
+        + "`reason` is load-bearing, not decoration: legitimate ceilings differ by class and span "
+        + "at least 289x (max_turns_continuation 300s, ccrotate_capacity 1080s as a 15min clamp plus "
+        + "20% forward jitter, dependency_blocked "
+        + "3600s, transient_failure 9000s on the backoff ladder but up to 86700s when an unclamped "
+        + "upstream retryNotBefore floor is at or just under the 24h horizon and takes up to 5min forward "
+        + "jitter; a floor actually clamped to 24h carries no forward jitter, and it is unbounded for a "
+        + "provider_quota floor, which is never clamped), so any single threshold across all of "
+        + "them fires on designed backoff in one class while missing a 5x clamp breach in another. "
+        + "Bound each reason against its own ceiling. reason='none' is a per-agent zero floor emitted for every "
+        + "known agent, including agents with live parks, so it selects the whole fleet and does "
+        + "not mean the agent is drained; it is not a park class, is always 0, and must never "
+        + "carry a bound.",
+      labelNames: ["agent_id", "reason"],
       registers: [registry],
     });
     scheduledRetryParkHorizonRefreshSuccess = new Gauge({
@@ -4010,9 +4099,7 @@ export function recordRetryScheduleOutcome(
     outcome: (KNOWN_RETRY_SCHEDULE_OUTCOMES as readonly string[]).includes(input.outcome ?? "")
       ? (input.outcome as RetryScheduleOutcomeLabel)
       : ("other" as const),
-    retry_reason: (KNOWN_RETRY_SCHEDULE_REASONS as readonly string[]).includes(input.retryReason ?? "")
-      ? (input.retryReason as RetryScheduleReasonLabel)
-      : ("other" as const),
+    retry_reason: coerceRetryScheduleReason(input.retryReason),
   };
   ensureRegistry().retryScheduleOutcomeCounter.inc(labels);
   return labels;
@@ -4296,23 +4383,57 @@ export function setQueuedRunAgeMetricsRefreshSuccess(success: boolean): void {
   ensureRegistry().queuedRunAgeMetricsRefreshSuccessGauge.set(success ? 1 : 0);
 }
 
-/** Publish the maximum booked park horizon for each live scheduled retry. */
+/**
+ * Publish the maximum booked park horizon for each live scheduled retry, keyed
+ * by agent AND park reason (BLO-31174). Aggregating across reasons was the
+ * second defect on this gauge: `max by (agent_id)` over classes whose ceilings
+ * span at least 289x (300s to a floored `transient_failure` park's 86,700s; a
+ * `provider_quota` floor has no ceiling) can only be thresholded at a value
+ * that is simultaneously below one class's designed backoff and above
+ * another's clamp.
+ *
+ * The reason is {@link refineScheduledRetryParkReason}d, not merely coerced:
+ * the raw column's `transient_failure` covers three paths with three different
+ * ceilings, so the bare column value cannot be bounded either. See that
+ * function for the split and for why the quota path carries no bound at all.
+ */
 export function setScheduledRetryParkHorizonMetrics(
-  entries: ReadonlyArray<{ agentId: string | null | undefined; horizonSeconds: number }>,
+  entries: ReadonlyArray<{
+    agentId: string | null | undefined;
+    reason: string | null | undefined;
+    horizonSeconds: number;
+    hasRetryFloor?: boolean | null;
+    isProviderQuotaFamily?: boolean | null;
+  }>,
   knownAgentIds: ReadonlySet<string>,
 ): void {
   const gauge = ensureRegistry().scheduledRetryParkHorizonGauge;
   gauge.reset();
-  const maxByAgentId = new Map<string, number>();
+  // Every known agent carries a zero placeholder, so a drained agent reads 0
+  // rather than vanishing. Emitted unconditionally: `none` is always 0, so it
+  // can never win a `max by (agent_id)` over a real park, which is what keeps
+  // the pre-BLO-31174 fleet-wide rule reading exactly as it did before.
+  for (const agentId of knownAgentIds) {
+    gauge.set({ agent_id: agentId, reason: NO_SCHEDULED_RETRY_PARK_REASON }, 0);
+  }
+  const maxByLabels = new Map<string, { agentId: string; reason: string; horizonSeconds: number }>();
   for (const entry of entries) {
     const agentId = normalizeAgentId(entry.agentId, knownAgentIds);
+    const reason = refineScheduledRetryParkReason(entry);
     const horizonSeconds = Number.isFinite(entry.horizonSeconds) ? Math.max(0, entry.horizonSeconds) : 0;
-    const current = maxByAgentId.get(agentId);
-    if (current === undefined || horizonSeconds > current) maxByAgentId.set(agentId, horizonSeconds);
+    // Distinct reasons can fold to the same `other` label -- and the three
+    // `transient_failure` refinements above split one GROUP BY key into
+    // several while several fold back into one -- so re-max here rather than
+    // trusting the query's GROUP BY to have produced unique keys.
+    const key = `${agentId} ${reason}`;
+    const current = maxByLabels.get(key);
+    if (current === undefined || horizonSeconds > current.horizonSeconds) {
+      maxByLabels.set(key, { agentId, reason, horizonSeconds });
+    }
   }
-  for (const agentId of knownAgentIds) gauge.set({ agent_id: agentId }, maxByAgentId.get(agentId) ?? 0);
-  const unknownHorizon = maxByAgentId.get(UNKNOWN_AGENT_ID);
-  if (unknownHorizon !== undefined) gauge.set({ agent_id: UNKNOWN_AGENT_ID }, unknownHorizon);
+  for (const { agentId, reason, horizonSeconds } of maxByLabels.values()) {
+    gauge.set({ agent_id: agentId, reason }, horizonSeconds);
+  }
 }
 
 export function setScheduledRetryParkHorizonRefreshSuccess(success: boolean): void {
