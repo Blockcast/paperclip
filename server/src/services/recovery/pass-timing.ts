@@ -62,6 +62,12 @@ export type PassTimingSummary = {
   /**
    * Per-phase totals, ordered most-expensive-first so the dominant term is the
    * first key an operator reads rather than something to be hunted for.
+   *
+   * These are NESTED SPANS, not a partition: `escalate.*` is recorded inside a
+   * `candidate()` span, so phase totals overlap one another and their sum can
+   * exceed `elapsedMs`. Read a phase as "how much of the pass was spent inside
+   * this call", never as a slice of a pie — the most-expensive-first ordering
+   * otherwise invites exactly that misreading.
    */
   phases: Record<string, PhaseStat>;
   /**
@@ -114,9 +120,14 @@ function percentile(sorted: number[], fraction: number): number {
   return sorted[Math.max(0, rank)] ?? 0;
 }
 
-export function createPassTimer(opts?: { slowestTracked?: number }): PassTimer {
+export function createPassTimer(opts?: { slowestTracked?: number; now?: () => number }): PassTimer {
   const slowestTracked = opts?.slowestTracked ?? DEFAULT_SLOWEST_TRACKED;
-  const startedAt = performance.now();
+  // Injectable purely so tests can pin ordering and percentile behaviour on fed
+  // values rather than racing a real timer; production never passes it and gets
+  // `performance.now` unchanged. Wrapped in an arrow rather than passed by
+  // reference because `performance.now` is not bound to `performance`.
+  const now = opts?.now ?? (() => performance.now());
+  const startedAt = now();
   const phases = new Map<string, PhaseStat>();
   // One entry per candidate. At the measured ~2250 candidates per pass this is a
   // few tens of KB of numbers held for the pass's lifetime, which is why the
@@ -139,20 +150,20 @@ export function createPassTimer(opts?: { slowestTracked?: number }): PassTimer {
   }
 
   async function time<T>(phase: string, fn: () => PromiseLike<T>): Promise<T> {
-    const t0 = performance.now();
+    const t0 = now();
     try {
       return await fn();
     } finally {
-      record(phase, performance.now() - t0);
+      record(phase, now() - t0);
     }
   }
 
   async function candidate<T>(issueId: string, fn: () => PromiseLike<T>): Promise<T> {
-    const t0 = performance.now();
+    const t0 = now();
     try {
       return await fn();
     } finally {
-      const ms = performance.now() - t0;
+      const ms = now() - t0;
       candidateDurations.push(ms);
       // Insertion into a list capped at `slowestTracked` -- an O(k) insert per
       // candidate with k of about 5, rather than sorting ~2250 entries. Kept
@@ -177,7 +188,7 @@ export function createPassTimer(opts?: { slowestTracked?: number }): PassTimer {
       };
     }
     return {
-      elapsedMs: Math.round(performance.now() - startedAt),
+      elapsedMs: Math.round(now() - startedAt),
       phases: orderedPhases,
       candidates: {
         count: sorted.length,
