@@ -2067,25 +2067,30 @@ function isNeverExecutedRun(
 // BLO-36927: the two gates that cancel a run *before* it is ever dispatched.
 // Neither writes `startedAt` — no adapter, no model turn, no cost. Their write
 // shapes differ, and the difference is not cosmetic:
-// BLO-36927: the two gates that cancel a run *before* it is ever dispatched.
-// Neither writes `startedAt` — no adapter, no model turn, no cost. Their write
-// shapes differ, and the difference is not cosmetic:
 //   - `duplicate_dispatch_suppressed` — `cancelQueuedRunForDuplicateDispatch`
 //     (heartbeat.ts), the dispatcher's own redundancy dedupe when two wakeup
 //     paths queue the same (agentId, issueId) on one tick. CASes on `queued`
 //     (`setRunStatusIfQueued`), so it cannot land on a row another pass has
 //     already claimed.
-//   - `issue_dependencies_blocked` — `cancelQueuedRunForBlockedDependencies`
-//     and the dependency-blocked park expiry/exhaustion writers, already
-//     recognised as never-executed by `isDependencyBlockedRun` above. This one
-//     writes **by id** (`setRunStatus`, whose UPDATE is
-//     `where(eq(heartbeatRuns.id, runId))` — no status predicate), so the write
-//     always succeeds. BLO-20396 moved the duplicate gate off exactly that
-//     shape, because a by-id write could stomp a row a concurrent pass had
-//     already claimed to `running`. The dependency gate is safe today only by
-//     in-process ordering — it runs before the claim write, not because the
-//     write is guarded. That race is pre-existing and out of scope here: this
-//     predicate only has to recognise the rows, not fix the writer.
+//   - `issue_dependencies_blocked` — three writers, all recognised as
+//     never-executed by `isDependencyBlockedRun` above. They do NOT share a
+//     write shape, so do not collapse this bullet back into one claim:
+//       * `cancelQueuedRunForBlockedDependencies` (heartbeat.ts) cancels a
+//         still-`queued` row from the claim path, and writes **by id**
+//         (`setRunStatus`, whose UPDATE is `where(eq(heartbeatRuns.id, runId))`
+//         — no status predicate), so the write always succeeds. BLO-20396 moved
+//         the duplicate gate off exactly that shape, because a by-id write
+//         could stomp a row a concurrent pass had already claimed to `running`.
+//         A `queued` CAS is available to it — the row genuinely is still
+//         `queued` here — but it does not use one: safety comes from in-process
+//         ordering, since the gate runs before the claim write. That race is
+//         pre-existing and out of scope here; this predicate only has to
+//         recognise the rows, not fix the writer.
+//       * the dependency-blocked park-expiry and attempt-exhaustion writers
+//         cancel from **`scheduled_retry`**, not `queued`, and both DO CAS, on
+//         `and(eq(id), eq(status, 'scheduled_retry'), lte(scheduledRetryAt, now))`.
+//         The by-id claim above is false of these two, and a `queued` CAS would
+//         never match them at all.
 //
 // `countIssueRunsSince` (the `high_churn` run-count denominator) has no status
 // filter, and its `coalesce(startedAt, createdAt)` fallback is exactly what
