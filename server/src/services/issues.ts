@@ -959,11 +959,38 @@ type IssueScheduledRetryProjection = {
   scheduledRetryAt: Date | null;
   scheduledRetryReason: string | null;
   scheduledRetryAttempt: number | null;
+  // BLO-29965: WHICH run is parked on this retry. The single-issue read
+  // (`getCurrentScheduledRetryForIssue`) has always returned `runId`; the list
+  // projection dropped it, so a list consumer could see that *a* retry was
+  // armed but not whether it was its own. Self-selection has to tell those
+  // apart: deferring to your own parked retry strands the row.
+  scheduledRetryRunId: string | null;
+  // BLO-29965 review round 3. WHICH AGENT owns that retry. `scheduledRetryRunId`
+  // alone only answers "is this my run?", and a reassigned issue keeps the
+  // previous assignee's retry row alive, so the new assignee read "not my run"
+  // as "a sibling holds it" and hid its own work. Sibling means same agent.
+  scheduledRetryAgentId: string | null;
+  // BLO-29965 review round 4. EVERY run parked on this issue, in the same
+  // tie-break order. The fields above describe one row, the earliest-due, which
+  // is what list/detail parity needs; the self-selection guard needs more. A
+  // reassigned issue keeps the previous assignee's retry alive, and a stale row
+  // is older, so it wins earliest-due by construction and would hide a live
+  // sibling retry due later.
+  scheduledRetryParkedRuns: ReadonlyArray<IssueParkedScheduledRetry>;
+};
+type IssueParkedScheduledRetry = {
+  runId: string;
+  agentId: string;
+  scheduledRetryAt: Date | null;
+  scheduledRetryReason: string | null;
 };
 const EMPTY_SCHEDULED_RETRY_PROJECTION: IssueScheduledRetryProjection = {
   scheduledRetryAt: null,
   scheduledRetryReason: null,
   scheduledRetryAttempt: null,
+  scheduledRetryRunId: null,
+  scheduledRetryAgentId: null,
+  scheduledRetryParkedRuns: [],
 };
 type IssueWithLabelsAndRun = IssueWithLabels
   & { activeRun: IssueActiveRunRow | null }
@@ -2876,6 +2903,7 @@ async function scheduledRetryProjectionMapForIssues(
   issueIds: string[],
 ): Promise<Map<string, IssueScheduledRetryProjection>> {
   const map = new Map<string, IssueScheduledRetryProjection>();
+  const parkedByIssue = new Map<string, IssueParkedScheduledRetry[]>();
   const uniqueIssueIds = [...new Set(issueIds)];
   if (uniqueIssueIds.length === 0) return map;
 
@@ -2886,6 +2914,8 @@ async function scheduledRetryProjectionMapForIssues(
         scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
         scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
         scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+        scheduledRetryRunId: heartbeatRuns.id,
+        scheduledRetryAgentId: heartbeatRuns.agentId,
       })
       .from(heartbeatRuns)
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
@@ -2899,13 +2929,33 @@ async function scheduledRetryProjectionMapForIssues(
       .orderBy(asc(heartbeatRuns.scheduledRetryAt), asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
 
     // Rows arrive in the single-read tie-break order, so first-seen per issue is
-    // the same row `getCurrentScheduledRetryForIssue` would have returned.
-    for (const row of rows as Array<{ issueId: string | null } & IssueScheduledRetryProjection>) {
-      if (!row.issueId || map.has(row.issueId)) continue;
+    // the same row `getCurrentScheduledRetryForIssue` would have returned. Later
+    // rows only join the parked set.
+    for (const row of rows as Array<
+      { issueId: string | null; scheduledRetryRunId: string; scheduledRetryAgentId: string }
+        & Omit<IssueScheduledRetryProjection, "scheduledRetryRunId" | "scheduledRetryAgentId" | "scheduledRetryParkedRuns">
+    >) {
+      if (!row.issueId) continue;
+      const parked: IssueParkedScheduledRetry = {
+        runId: row.scheduledRetryRunId,
+        agentId: row.scheduledRetryAgentId,
+        scheduledRetryAt: row.scheduledRetryAt ?? null,
+        scheduledRetryReason: row.scheduledRetryReason ?? null,
+      };
+      const seen = parkedByIssue.get(row.issueId);
+      if (seen) {
+        seen.push(parked);
+        continue;
+      }
+      const parkedRuns = [parked];
+      parkedByIssue.set(row.issueId, parkedRuns);
       map.set(row.issueId, {
         scheduledRetryAt: row.scheduledRetryAt ?? null,
         scheduledRetryReason: row.scheduledRetryReason ?? null,
         scheduledRetryAttempt: row.scheduledRetryAttempt ?? null,
+        scheduledRetryRunId: row.scheduledRetryRunId ?? null,
+        scheduledRetryAgentId: row.scheduledRetryAgentId ?? null,
+        scheduledRetryParkedRuns: parkedRuns,
       });
     }
   }
@@ -4266,6 +4316,31 @@ export async function listBlockedIssueAutoResumeSuppressions(
       // the blocked-inbox oracle disagree with its own list in BLO-31839 — a park declared
       // past the cutoff parsed as `null`. Here that would silently drain it (BLO-30445).
       description: issues.description,
+      // BLO-27553: the liveness clause is load-bearing, and its absence made this
+      // suppression PERMANENT. `gateSignals` is written into `executionState.monitor`
+      // when a monitor is armed and is NEVER erased when that monitor is cleared or
+      // expires — `clearReason` is set alongside it and the array stays. So the bare
+      // `jsonb_array_length(...) > 0` test answered "did this row ever have a monitor",
+      // not "is a monitor gating it now", and returned true forever for every row that
+      // had ever armed one. Measured 2026-09-26: 19 of 23 estate-wide strands carried
+      // `gateSignals` on a monitor already `cleared` (`trigger_stalled` /
+      // `timeout_exceeded`), while 0 of 14 sampled rows the reconciler DID drain carried
+      // a cleared monitor. The reconciler that exists to drain these rows was skipping
+      // exactly them, and agent instructions mandate declaring `gateSignals` (BLO-29716),
+      // so following the monitor guidance is what made a row undrainable.
+      //
+      // Liveness is `hasValidBlockerMonitor`, applied in the loop below: a future
+      // `nextCheckAt`, an unexpired policy `timeoutAt`, and attempts under `maxAttempts`.
+      // Delegated rather than restated in SQL: a SQL copy of only the `nextCheckAt` half
+      // would keep suppressing a monitor past its `timeoutAt` whose `nextCheckAt` is later,
+      // and a `::timestamptz` cast of a malformed `timeoutAt` would fail this whole query
+      // where the JS reader skips it. A NULL or OVERDUE `nextCheckAt` is a wake that will
+      // not happen. This is a no-op for `stranded_blocked_reconciler`, whose candidate
+      // predicate already excludes every future `nextCheckAt`; it narrows the other three
+      // trigger paths, which do not.
+      monitorNextCheckAt: issues.monitorNextCheckAt,
+      monitorAttemptCount: issues.monitorAttemptCount,
+      executionPolicy: issues.executionPolicy,
       hasGateSignals: sql<boolean>`
         COALESCE(
           CASE
@@ -4292,7 +4367,7 @@ export async function listBlockedIssueAutoResumeSuppressions(
     .from(issues)
     .where(and(eq(issues.companyId, companyId), inArray(issues.id, uniqueIssueIds)));
   for (const row of monitorRows) {
-    if (row.hasGateSignals) {
+    if (row.hasGateSignals && hasValidBlockerMonitor(row)) {
       addSuppression(row.id, "monitor_gate");
     } else if (row.isConvergenceStalled) {
       addSuppression(row.id, "convergence_stalled");

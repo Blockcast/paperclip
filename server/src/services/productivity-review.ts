@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db, DbTransaction } from "@paperclipai/db";
 import { clampIssueRequestDepth } from "@paperclipai/shared";
 import {
@@ -88,6 +88,25 @@ const PRODUCTIVITY_REVIEW_RESERVATION_STALE_MS = 5 * 60 * 1000;
  * block below (BLO-19566 AC4).
  */
 export const PRODUCTIVITY_REVIEW_PR_FRESH_MS = 24 * 60 * 60 * 1000;
+/**
+ * BLO-35779: the same window for a PR that is sitting in a merge queue.
+ *
+ * A queued PR cannot tick the ordinary clock. `sourceEventTimestampMs` comes
+ * from `pull_request` webhooks, and in a REBASE merge queue the PR's head
+ * deliberately does not move while it advances — pushing ejects it — so the one
+ * behaviour that proves progress is the one that cannot refresh the row.
+ * Measured on `Blockcast/paperclip` (91 queue sits across 52 merged PRs,
+ * 2026-09-23): median 15.5h, p90 31.7h, **35% exceed the 24h bar above**, max
+ * 39.4h. So a third of correctly-behaving queued PRs read `stale` on the
+ * ordinary window, which is exactly the population A1's suppression exists for.
+ *
+ * 48h is the measured ceiling (39.4h) plus headroom, NOT a guess, and it is a
+ * hard cap rather than a rolling window: nothing a queue emits can extend it,
+ * because GitHub emits nothing per-PR between enqueue and dequeue. That is what
+ * keeps BLO-35779 AC4 true — a lost `dequeued` delivery costs at most 48h of
+ * suppression, not indefinite suppression.
+ */
+export const PRODUCTIVITY_REVIEW_PR_MERGE_QUEUE_FRESH_MS = 48 * 60 * 60 * 1000;
 /**
  * BLO-27698 A3: window in which an assignee `Next action:` comment counts as a
  * live progress signal, matching the "in the last 6h" wording in the Manager
@@ -324,6 +343,13 @@ type PullRequestEvidence = {
    * verdict on a `critical` row that had been dark for seven days.
    */
   ownsSourceIssue: boolean;
+  /**
+   * BLO-35779: the PR is sitting in a merge queue as of its last queue event.
+   * Widens the freshness window to
+   * `PRODUCTIVITY_REVIEW_PR_MERGE_QUEUE_FRESH_MS` — see that constant for why a
+   * queued PR cannot tick the ordinary clock, and for the measurement.
+   */
+  inMergeQueue: boolean;
 };
 
 const PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUS_VALUES = ["ready_for_review", "draft", "merged"] as const;
@@ -360,6 +386,13 @@ type PullRequestEvidenceRow = {
    * nothing" — see `pullRequestOwnsIssue`.
    */
   owningIdentifiers: unknown;
+  /**
+   * BLO-35779: merge-queue occupancy as last reported by a `pull_request`
+   * webhook. `null` means no queue event has ever touched this row — which for
+   * a repo with no merge queue is every row, so it must read as "not queued"
+   * and never as "queued".
+   */
+  mergeQueueState: string | null;
 };
 
 type ProductivityReviewEvidence = {
@@ -1381,7 +1414,13 @@ function formatDependencyGating(
 }
 
 function isFreshPullRequest(pr: PullRequestEvidence | null): pr is PullRequestEvidence {
-  return pr !== null && pr.ageMs <= PRODUCTIVITY_REVIEW_PR_FRESH_MS;
+  if (pr === null) return false;
+  // BLO-35779: a queued PR gets the wider window, because the clock this reads
+  // cannot tick while it is queued. Still a cap, not an exemption — AC4.
+  const window = pr.inMergeQueue
+    ? PRODUCTIVITY_REVIEW_PR_MERGE_QUEUE_FRESH_MS
+    : PRODUCTIVITY_REVIEW_PR_FRESH_MS;
+  return pr.ageMs <= window;
 }
 
 // Deliberately NOT a type predicate: a false result means "not progress", not
@@ -1451,6 +1490,7 @@ function toPullRequestEvidence(
     updatedAt: eventAt,
     ageMs: Math.max(0, now.getTime() - eventAt.getTime()),
     ownsSourceIssue: pullRequestOwnsIssue(row, sourceIdentifier),
+    inMergeQueue: row.mergeQueueState === "enqueued",
   };
 }
 
@@ -1474,7 +1514,14 @@ function formatPullRequestEvidence(pr: PullRequestEvidence | null) {
   const attribution = pr.ownsSourceIssue
     ? "attributed to this issue"
     : "NOT attributed to this issue";
-  return `${ref} \`${pr.status}\`, last activity ${pr.updatedAt.toISOString()} (${msToHuman(pr.ageMs)} ago, ${freshness}, ${progress}, ${attribution})`;
+  // BLO-35779: name the merge queue explicitly. Without it a queued PR renders
+  // as "36h ago, non-stale", which reads as a bug to the reviewer it is meant
+  // to inform — the wider window is only defensible if the line says why it
+  // applied. "last activity" is also literally true and misleading here: it is
+  // the last event GitHub SENT, and GitHub sends nothing per-PR while a PR
+  // advances through the queue.
+  const queue = pr.inMergeQueue ? ", in merge queue" : "";
+  return `${ref} \`${pr.status}\`, last activity ${pr.updatedAt.toISOString()} (${msToHuman(pr.ageMs)} ago, ${freshness}${queue}, ${progress}, ${attribution})`;
 }
 
 /**
@@ -1832,10 +1879,17 @@ function isSoftStopTrigger(trigger: ProductivityReviewTrigger) {
 // queued runs before dispatch: `no_comment_streak` counts the silence the gate
 // produces, and `long_active_duration` counts elapsed time the assignee cannot
 // spend. Deliberately excluded:
-//   - `high_churn` — a record of runs that did execute and did burn cost. A
-//     blocker added afterwards does not make that untrue, and honouring it here
-//     would let a flagged agent retire its own cost-accountability artifact by
-//     adding a `blockedBy` edge.
+//   - `high_churn` — a record of runs that were actually dispatched and did
+//     burn cost. A blocker added afterwards does not make that untrue, and
+//     honouring it here would let a flagged agent retire its own
+//     cost-accountability artifact by adding a `blockedBy` edge. BLO-36927:
+//     "dispatched", precisely — the run-count arms exclude the two pre-dispatch
+//     cancel gates (`notPreDispatchCancelledSql`, which covers the dependency
+//     gate's own `issue_dependencies_blocked` rows), so the gate can no longer
+//     manufacture the churn it is then refused the right to retire. What is
+//     still counted, and deliberately: dispatched runs that crashed before a
+//     model turn (`isInfraFailureRun`) — those burned a container, they are not
+//     a graph-state fact, and `runtime_failure_streak` adjudicates them.
 //   - `runtime_failure_streak` — genuine infra faults, disjoint from the gate by
 //     construction (`isInfraFailureRun` short-circuits on
 //     `isDependencyBlockedRun`), so a blocker does not explain it.
@@ -2009,6 +2063,48 @@ function isNeverExecutedRun(
 ): boolean {
   return isInfraFailureRun(run) || isDependencyBlockedRun(run);
 }
+
+// BLO-36927: the two gates that cancel a run *before* it is ever dispatched.
+// Both CAS a still-undispatched row (`queued`, or `scheduled_retry` for the
+// dependency gate's park-expiry/attempt-exhaustion branches) straight to
+// `cancelled`, and neither writes `startedAt` — no adapter, no model turn, no
+// cost:
+//   - `duplicate_dispatch_suppressed` — `cancelQueuedRunForDuplicateDispatch`
+//     (heartbeat.ts), the dispatcher's own redundancy dedupe when two wakeup
+//     paths queue the same (agentId, issueId) on one tick.
+//   - `issue_dependencies_blocked` — `cancelQueuedRunForBlockedDependencies`
+//     and the dependency-blocked park expiry/exhaustion writers, already
+//     recognised as never-executed by `isDependencyBlockedRun` above.
+//
+// `countIssueRunsSince` (the `high_churn` run-count denominator) has no status
+// filter, and its `coalesce(startedAt, createdAt)` fallback is exactly what
+// makes a never-started row countable — so without this exclusion the
+// dispatcher's own redundancy cancellations land in the churn numerator. The
+// denominator then scales with a repo's check-run count rather than with the
+// assignee's conduct: 47 of the 57 wakes in the BLO-36842 episode were GitHub
+// CI events on a repo emitting ~43 check-runs per push, 32 of which the
+// dispatcher immediately suppressed, and the 6h bar (30) fired on a window
+// whose net dispatched count was 15.
+//
+// Expressed as SQL rather than reusing `isNeverInvokedRun`, and gated on
+// `status = 'cancelled'` rather than on `errorCode` alone, for the reason
+// BLO-36927 names: this predicate is applied to a population with no status
+// filter at all, so anything keyed on absent run telemetry would also swallow
+// the in-flight `queued`/`running` rows the churn bar most wants to count
+// (`usageJson` is the completion summary and is null by construction until a
+// run finishes). A filter that quietly matches too much is indistinguishable
+// from a fixed one. `errorCode` is only ever written on a terminal row, so the
+// status guard is belt-and-braces — kept because it is one line and it makes
+// the "pre-dispatch, terminal" intent legible at the call site.
+const PRE_DISPATCH_CANCELLED_RUN_ERROR_CODES = [
+  "duplicate_dispatch_suppressed",
+  "issue_dependencies_blocked",
+];
+const notPreDispatchCancelledSql = or(
+  ne(heartbeatRuns.status, "cancelled"),
+  isNull(heartbeatRuns.errorCode),
+  notInArray(heartbeatRuns.errorCode, PRE_DISPATCH_CANCELLED_RUN_ERROR_CODES),
+);
 
 // True when no adapter container was ever created for this run, so nothing
 // capable of writing a comment ever existed (BLO-23096: `preferred_workspace_
@@ -3748,6 +3844,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           eq(heartbeatRuns.agentId, agentId),
           issueRunScopeSql(issueId),
           sql`coalesce(${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) >= ${since.toISOString()}::timestamptz`,
+          notPreDispatchCancelledSql,
         ),
       )
       .then((rows) => rows[0]?.count ?? 0);
@@ -4141,6 +4238,9 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     const nonExecutingAlsoNeverInvokedCount = nonExecutingRuns.filter(isNeverInvokedRun).length;
 
     const pullRequestFreshCutoff = new Date(now.getTime() - PRODUCTIVITY_REVIEW_PR_FRESH_MS);
+    const pullRequestMergeQueueFreshCutoff = new Date(
+      now.getTime() - PRODUCTIVITY_REVIEW_PR_MERGE_QUEUE_FRESH_MS,
+    );
     const pullRequestEvidenceSelect = {
       title: issueWorkProducts.title,
       url: issueWorkProducts.url,
@@ -4154,6 +4254,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       end`,
       branch: sql<string | null>`${issueWorkProducts.metadata}->>'branch'`,
       owningIdentifiers: sql<unknown>`${issueWorkProducts.metadata}->'owningIdentifiers'`,
+      mergeQueueState: sql<string | null>`${issueWorkProducts.metadata}->>'mergeQueueState'`,
     };
     const trustedPullRequestEvidenceWhere = and(
       eq(issueWorkProducts.companyId, sourceIssue.companyId),
@@ -4261,7 +4362,20 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           and(
             trustedPullRequestEvidenceWhere,
             inArray(issueWorkProducts.status, [...PRODUCTIVITY_REVIEW_PROGRESS_PR_STATUS_VALUES]),
-            sql`${pullRequestEffectiveEventAtSql} >= ${pullRequestFreshCutoff.toISOString()}::timestamptz`,
+            // Mirrors `isFreshPullRequest` exactly, including the BLO-35779
+            // merge-queue widening. The two MUST agree: this clause decides
+            // which row becomes `progressPullRequestRow`, and the TS predicate
+            // then re-tests the row it picked. A queued PR excluded here would
+            // fall back to `latestPullRequestRow` and — where another PR on the
+            // same issue is newer — silently report the wrong PR as this row's
+            // progress signal.
+            or(
+              sql`${pullRequestEffectiveEventAtSql} >= ${pullRequestFreshCutoff.toISOString()}::timestamptz`,
+              and(
+                sql`${issueWorkProducts.metadata}->>'mergeQueueState' = 'enqueued'`,
+                sql`${pullRequestEffectiveEventAtSql} >= ${pullRequestMergeQueueFreshCutoff.toISOString()}::timestamptz`,
+              ),
+            ),
           ),
         )
         .orderBy(desc(pullRequestEffectiveEventAtSql))
@@ -4749,11 +4863,15 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // counts as progress.
     //
     // Bounded by construction, per BLO-22331 AC2: progress-eligibility requires
-    // `ageMs <= PRODUCTIVITY_REVIEW_PR_FRESH_MS` (24h), so a PR that stops moving
-    // ages out and the trigger fires again — this cannot suppress indefinitely.
-    // Returns null rather than a recorded suppression for the same reason the
-    // gated-elapsed check below does: `long_active_duration` is last in
-    // `choosePrimaryTrigger`'s ladder, so no other fired trigger is discarded.
+    // `ageMs <= PRODUCTIVITY_REVIEW_PR_FRESH_MS` (24h), or — for a PR sitting in
+    // a merge queue, whose clock GitHub cannot tick (BLO-35779) —
+    // `PRODUCTIVITY_REVIEW_PR_MERGE_QUEUE_FRESH_MS` (48h). Both are hard caps
+    // measured from the last GitHub event, not rolling windows, so a PR that
+    // stops moving ages out and the trigger fires again; this cannot suppress
+    // indefinitely under either. Returns null rather than a recorded suppression
+    // for the same reason the gated-elapsed check below does:
+    // `long_active_duration` is last in `choosePrimaryTrigger`'s ladder, so no
+    // other fired trigger is discarded.
     if (trigger === "long_active_duration" && isProgressPullRequest(latestPullRequest)) {
       return null;
     }

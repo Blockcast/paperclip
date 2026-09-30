@@ -2,9 +2,12 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
+  CHECK_SETTLE_MINUTES,
   MAX_ENQUEUES_PER_FIRE,
   STALE_ENQUEUE_HOURS,
   allyVerdictAtHead,
+  approvalLanes,
+  checkSettlement,
   classifyAll,
   classifyFromListing,
   classifyPr,
@@ -12,6 +15,8 @@ import {
   isFatalGhError,
   isMainModule,
   latestCheckStates,
+  settleMinutesFrom,
+  targetRepos,
   unsatisfiedOwners,
 } from "./land-clean-prs.mjs";
 
@@ -77,6 +82,19 @@ describe("classifyPr rule order", () => {
       assert.equal(row.action, "skip");
       assert.equal(row.reason, `label:${name}`);
     }
+  });
+
+  it("skips a draft, however clean it looks", () => {
+    // Draft is the author's own opt-out and the only machine-readable form a
+    // deliberate sequencing hold reliably takes. trafficcontrol#1726 is the
+    // case: draft, CLEAN, Ally-authored, reviewed clean, body reading "Do not
+    // merge before magma#1936" — a shared proto field-number space that
+    // landing this half alone would break.
+    const row = classify({ isDraft: true, mergeStateStatus: "CLEAN" });
+    assert.equal(row.action, "skip");
+    assert.equal(row.reason, "draft");
+    // And it must be decidable without paying for checks and reviews.
+    assert.equal(classifyFromListing(pr({ isDraft: true }), { now: NOW }).reason, "draft");
   });
 
   it("reports a fresh auto-merge request as already-enqueued", () => {
@@ -221,6 +239,69 @@ describe("per-fire cap", () => {
     });
     assert.equal(rows[1].action, "enqueue");
   });
+
+  it("carries spend across repos, so the cap is per FIRE and not per repo", () => {
+    // `runRepo` calls `classifyAll` once per swept repo. Without `spent` the
+    // counter restarts each call and the real ceiling is `cap x repos` — the
+    // blast radius scaling with the multi-repo knob that makes a classifier
+    // bug reach further in the first place.
+    const clean = () => Array.from({ length: 3 }, (_, i) => pr({ number: 200 + i }));
+    let spent = 0;
+    const perRepo = [];
+    for (const _repo of ["a/one", "a/two", "a/three"]) {
+      const rows = classifyAll(clean(), { now: NOW, maxEnqueues: 4, spent });
+      const armed = rows.filter((r) => r.action === "enqueue").length;
+      spent += armed;
+      perRepo.push(armed);
+    }
+    assert.deepEqual(perRepo, [3, 1, 0], "repo 2 gets the remainder, repo 3 gets nothing");
+    assert.equal(spent, 4, "total armed never exceeds the cap");
+  });
+});
+
+describe("settle floor from the environment", () => {
+  // `Number("15m")` is NaN and `ageMinutes < NaN` is false, so an unparseable
+  // value reported every rollup as settled — the guard disarming itself in the
+  // fail-OPEN direction, silently.
+  it("falls back to the default for values that are not a number of minutes", () => {
+    // No `undefined` here: the parameter has an env default, so passing it
+    // re-reads the ambient environment instead of the fallback this case is
+    // named for — a red under `LAND_CLEAN_PRS_SETTLE_MINUTES=30`, which the
+    // script itself invites operators to set. The env path is pinned below.
+    for (const bad of ["15m", "banana", "", "   ", null, "-5", "NaN"]) {
+      assert.equal(settleMinutesFrom(bad), CHECK_SETTLE_MINUTES, `bad input: ${String(bad)}`);
+    }
+  });
+
+  it("reads the environment when called with no argument", () => {
+    const prior = process.env.LAND_CLEAN_PRS_SETTLE_MINUTES;
+    try {
+      delete process.env.LAND_CLEAN_PRS_SETTLE_MINUTES;
+      assert.equal(settleMinutesFrom(), CHECK_SETTLE_MINUTES, "unset falls back to the default");
+      process.env.LAND_CLEAN_PRS_SETTLE_MINUTES = "25";
+      assert.equal(settleMinutesFrom(), 25, "a good value is honoured");
+      process.env.LAND_CLEAN_PRS_SETTLE_MINUTES = "15m";
+      assert.equal(settleMinutesFrom(), CHECK_SETTLE_MINUTES, "a bad value cannot disarm the floor");
+    } finally {
+      if (prior === undefined) delete process.env.LAND_CLEAN_PRS_SETTLE_MINUTES;
+      else process.env.LAND_CLEAN_PRS_SETTLE_MINUTES = prior;
+    }
+  });
+
+  it("honours a real number, including an explicit 0", () => {
+    assert.equal(settleMinutesFrom("30"), 30);
+    assert.equal(settleMinutesFrom(" 7 "), 7);
+    assert.equal(settleMinutesFrom("0"), 0, "0 is a deliberate opt-out, not a bad value");
+  });
+
+  it("a bad value cannot let an unsettled rollup read as settled", () => {
+    const fresh = [
+      { name: "verify", conclusion: "SUCCESS", completedAt: new Date(NOW - 60_000).toISOString() },
+    ];
+    const settlement = checkSettlement(fresh, { now: NOW, settleMinutes: settleMinutesFrom("15m") });
+    assert.equal(settlement.settled, false);
+    assert.equal(settlement.reason, "settling");
+  });
 });
 
 describe("Ally verdict-mirror statuses are not CI checks", () => {
@@ -237,6 +318,35 @@ describe("Ally verdict-mirror statuses are not CI checks", () => {
     const row = classify({ statusCheckRollup: [{ name: "verify", conclusion: "SUCCESS" }, ...ALLY_RED] });
     assert.equal(row.action, "enqueue", "a red Ally mirror must not block a PR its review says is clean");
     assert.deepEqual(failingChecks(ALLY_RED), []);
+  });
+
+  // The exclusion has to reach BOTH check rules, or they disagree about what a
+  // check is and the settle guard loses. Green mirrors, so nothing here is
+  // about `failingChecks`.
+  const ALLY_GREEN = (iso) => [
+    { __typename: "StatusContext", context: "review/ally-complete", state: "SUCCESS", createdAt: iso },
+    { __typename: "StatusContext", context: "gate/ally-comment-findings", state: "SUCCESS", createdAt: iso },
+  ];
+
+  it("counts a mirror-only rollup as nothing attesting the head, not as settled", () => {
+    // Fail-open: the rows are non-empty, so the `checks:none` stop never fired
+    // and a head with zero CI classified `enqueue`. Asserted through `classify`
+    // rather than `checkSettlement` directly: the filter lives at the call site
+    // that feeds both check rules, so the helper still reports on whatever set
+    // it is handed.
+    assert.equal(classify({ statusCheckRollup: ALLY_GREEN("2026-09-13T09:00:00Z") }).reason, "checks:none");
+  });
+
+  it("does not let a fresh mirror row reset the settle clock on settled CI", () => {
+    // Fail-closed, and this one fired routinely: the normal ordering is
+    // CI -> review -> mirror, so the newest row is almost always a mirror.
+    const row = classify({
+      statusCheckRollup: [
+        { name: "verify", conclusion: "SUCCESS", completedAt: "2026-09-13T09:00:00Z" },
+        ...ALLY_GREEN("2026-09-13T11:58:00Z"),
+      ],
+    });
+    assert.equal(row.action, "enqueue", "CI settled 3h ago; a 2m-old mirror is not a check");
   });
 
   it("still blocks on the review itself, so the verdict is not lost", () => {
@@ -278,6 +388,219 @@ describe("Ally verdict-mirror statuses are not CI checks", () => {
     assert.deepEqual(failingChecks([{ context: "review/ally-complete", state: "FAILURE" }]), [
       "review/ally-complete=FAILURE",
     ]);
+  });
+
+  // The gate publishes the verdict on BOTH surfaces, so every row above has a
+  // check-run twin carrying the identical name. Typing on `StatusContext`
+  // strips one copy and reads the other as CI. Measured on #1957 @68f3f598.
+  const TWINNED = (state, iso) => [
+    { __typename: "StatusContext", context: "gate/ally-comment-findings", state, createdAt: iso },
+    {
+      __typename: "CheckRun",
+      name: "gate/ally-comment-findings",
+      conclusion: state,
+      completedAt: iso,
+    },
+  ];
+
+  it("strips the check-run twin of an Ally status, so a red mirror cannot read as a red check", () => {
+    assert.deepEqual(failingChecks(TWINNED("FAILURE", "2026-09-13T09:00:00Z")), []);
+    assert.equal(
+      classify({
+        statusCheckRollup: [
+          { name: "verify", conclusion: "SUCCESS", completedAt: "2026-09-13T09:00:00Z" },
+          ...TWINNED("FAILURE", "2026-09-13T09:00:00Z"),
+        ],
+      }).action,
+      "enqueue",
+      "a red Ally mirror must not block through its check-run copy either",
+    );
+  });
+
+  it("counts a twinned mirror-only rollup as nothing attesting the head", () => {
+    // The `checks:none` stop, through the other surface: filtering only the
+    // status copy leaves a non-empty rollup, so a head with zero CI reads as
+    // attested. This is the case the two StatusContext fixtures above missed.
+    assert.equal(
+      classify({ statusCheckRollup: TWINNED("SUCCESS", "2026-09-13T09:00:00Z") }).reason,
+      "checks:none",
+    );
+  });
+
+  it("does not let a fresh check-run twin reset the settle clock on settled CI", () => {
+    // #1981: once the status copy is filtered, the twin is the newest datable
+    // row, so it resets the floor on CI that finished hours earlier.
+    assert.equal(
+      classify({
+        statusCheckRollup: [
+          { name: "verify", conclusion: "SUCCESS", completedAt: "2026-09-13T09:00:00Z" },
+          ...TWINNED("SUCCESS", "2026-09-13T11:58:00Z"),
+        ],
+      }).action,
+      "enqueue",
+      "CI settled 3h ago; a 2m-old mirror twin is not a check",
+    );
+  });
+
+  it("only treats a check-run as a mirror while its status twin is beside it", () => {
+    // The twin is what proves it is a duplicate reading. Without one, an
+    // Ally-named check-run is the publishing workflow and a red one is real —
+    // which is why the exclusion is contextual rather than simply untyped.
+    assert.deepEqual(
+      failingChecks([
+        { __typename: "CheckRun", name: "gate/ally-comment-findings", conclusion: "FAILURE" },
+        { __typename: "StatusContext", context: "review/ally-complete", state: "SUCCESS" },
+      ]),
+      ["gate/ally-comment-findings=FAILURE"],
+    );
+  });
+
+  it("reads a passing Ally-named check-run with no status twin as CI (documented over-enqueue direction)", () => {
+    // Pins the split the `withoutAllyVerdictMirrors` comment documents: only a
+    // FAILURE orphan over-holds. A passing orphan is a row attesting the head,
+    // so `checks:none` does not fire and classification falls through to the
+    // review rules. `reviews: []` makes that landing deterministic; the row is
+    // 6h before NOW so `checks:settling` is not in play.
+    for (const conclusion of ["SUCCESS", "NEUTRAL", "SKIPPED"]) {
+      const row = classify({
+        statusCheckRollup: [
+          {
+            __typename: "CheckRun",
+            name: "gate/ally-comment-findings",
+            conclusion,
+            completedAt: "2026-09-13T06:00:00Z",
+          },
+        ],
+        reviews: [],
+      });
+      assert.notEqual(row.reason, "checks:none", `${conclusion} orphan is a row attesting the head`);
+      assert.equal(row.reason, "review:missing");
+    }
+  });
+});
+
+describe("approval rot (BLO-33208)", () => {
+  const HUMAN = { login: "kkroo", id: 169, type: "User" };
+  const BOT = { login: "allyblockcast[bot]", id: 290875700, type: "Bot" };
+  const approval = (user) => ({ state: "APPROVED", user, commit_id: HEAD, submitted_at: "2026-09-09T14:38:50Z" });
+
+  it("splits approvers by identity, not by a `[bot]` login suffix", () => {
+    // A suffix is a naming convention any account may adopt; `type` is the
+    // identity. Conflating them overstated this ticket's own cohort by ~2.7x.
+    const lanes = approvalLanes({
+      reviews: [
+        approval(HUMAN),
+        approval(BOT),
+        approval({ login: "looks-like-a[bot]", type: "User" }),
+        { state: "COMMENTED", user: HUMAN },
+      ],
+    });
+    assert.deepEqual(lanes, { human: ["kkroo", "looks-like-a[bot]"], bot: ["allyblockcast[bot]"] });
+  });
+
+  it("reports a conflicted PR that spent a human approval as its own action", () => {
+    // The priority cohort: finished, reviewed, and unmergeable because master
+    // moved. Its own action so the receipt tally carries the count instead of
+    // burying it among every other skip.
+    const row = classify({ mergeStateStatus: "DIRTY", reviews: [review(), approval(HUMAN)] });
+    assert.equal(row.action, "approval-rotted");
+    assert.equal(row.reason, "mergestate:DIRTY");
+    assert.match(row.detail, /spent human approval: kkroo/);
+  });
+
+  it("names a bot-only approval separately, since no scarce resource was spent", () => {
+    const row = classify({ mergeStateStatus: "DIRTY", reviews: [review(), approval(BOT)] });
+    assert.equal(row.action, "approval-rotted");
+    assert.match(row.detail, /bot-only approval: allyblockcast\[bot\]/);
+  });
+
+  it("leaves an unapproved conflicted PR as a plain skip", () => {
+    const row = classify({ mergeStateStatus: "DIRTY" });
+    assert.equal(row.action, "skip");
+    assert.equal(row.reason, "mergestate:DIRTY");
+  });
+
+  it("reports the conflict, never a check, on a DIRTY PR (BLO-32606)", () => {
+    // GitHub cannot evaluate a `paths:` filter on a PR whose merge commit will
+    // not compute, so path-filtered workflows are silently never dispatched and
+    // the surviving checks mean nothing. Measured on onprem-k8s#3269: 4 runs
+    // dirty, 22 for the identical tree once mergeable.
+    const row = classify({
+      mergeStateStatus: "DIRTY",
+      statusCheckRollup: [{ name: "verify", conclusion: "FAILURE", completedAt: "2026-09-13T05:00:00Z" }],
+      reviews: [review(), approval(HUMAN)],
+    });
+    assert.equal(row.reason, "mergestate:DIRTY", "the conflict is the true and only actionable cause");
+  });
+
+  it("does not spend enqueue cap on a rotted PR, and never enqueues it", () => {
+    const rows = classifyAll(
+      [pr({ mergeStateStatus: "DIRTY", reviews: [review(), approval(HUMAN)] }), pr({ mergeStateStatus: "CLEAN" })],
+      { now: NOW, maxEnqueues: 1 },
+    );
+    assert.deepEqual(rows.map((r) => r.action), ["approval-rotted", "enqueue"]);
+  });
+});
+
+describe("check settling floor (BLO-33208 bucket-B age floor)", () => {
+  const at = (iso) => [{ name: "verify", conclusion: "SUCCESS", completedAt: iso }];
+
+  it("treats a rollup with zero rows as a stop, not a pass", () => {
+    // Nothing reporting means nothing attested this head, which renders
+    // identically to every check passing.
+    assert.deepEqual(checkSettlement([], { now: NOW }), { settled: false, reason: "none" });
+    assert.equal(classify({ statusCheckRollup: [] }).reason, "checks:none");
+  });
+
+  it(`holds an all-green rollup whose newest check is under ${CHECK_SETTLE_MINUTES}m old`, () => {
+    // Green only because the reds have not registered yet.
+    const row = classify({ statusCheckRollup: at("2026-09-13T11:56:00Z") });
+    assert.equal(row.reason, "checks:settling");
+    assert.match(row.detail, /4\.0m ago, floor 15m/);
+  });
+
+  it("enqueues once the newest check has been green past the floor", () => {
+    assert.equal(classify({ statusCheckRollup: at("2026-09-13T11:40:00Z") }).action, "enqueue");
+  });
+
+  it("does not hold forever on rows carrying no parseable timestamp", () => {
+    // A commit status never moves on its own, so holding undatable rows would
+    // be permanent — the immortal-stale-verdict shape. `--auto` re-gates, so
+    // enqueuing early is the bounded direction.
+    assert.deepEqual(checkSettlement([{ name: "verify", conclusion: "SUCCESS" }], { now: NOW }), {
+      settled: true,
+    });
+  });
+});
+
+describe("multi-repo sweep", () => {
+  it("parses a comma-separated repo list and defaults to this repo", () => {
+    // The rot is not repo-local: it has been hand-cleaned four times and
+    // regrown in the same repos, because each sweep only looked at one.
+    assert.deepEqual(targetRepos("Blockcast/trafficcontrol, Blockcast/multicast"), [
+      "Blockcast/trafficcontrol",
+      "Blockcast/multicast",
+    ]);
+    // Same rule as `settleMinutesFrom` above, and for the same reason: no
+    // `undefined` here, because the parameter has an env default and passing it
+    // re-reads the ambient environment instead of the fallback. `""` and `null`
+    // cover the empty path; the env path is pinned below.
+    assert.deepEqual(targetRepos(""), ["Blockcast/paperclip"]);
+    assert.deepEqual(targetRepos(null), ["Blockcast/paperclip"]);
+    assert.deepEqual(targetRepos("Blockcast/paperclip,,  "), ["Blockcast/paperclip"]);
+  });
+
+  it("reads the environment when called with no argument", () => {
+    const prior = process.env.LAND_CLEAN_PRS_REPO;
+    try {
+      delete process.env.LAND_CLEAN_PRS_REPO;
+      assert.deepEqual(targetRepos(), ["Blockcast/paperclip"], "unset falls back to this repo");
+      process.env.LAND_CLEAN_PRS_REPO = "Blockcast/multicast,Blockcast/trafficcontrol";
+      assert.deepEqual(targetRepos(), ["Blockcast/multicast", "Blockcast/trafficcontrol"]);
+    } finally {
+      if (prior === undefined) delete process.env.LAND_CLEAN_PRS_REPO;
+      else process.env.LAND_CLEAN_PRS_REPO = prior;
+    }
   });
 });
 
