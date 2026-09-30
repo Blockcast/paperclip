@@ -1364,6 +1364,16 @@ const DIND_WAIT_PREAMBLE =
 // ---------------------------------------------------------------------------
 
 export const TOOL_MEMORY_LIMIT_CONFIG_KEY = "resources.limits.toolMemoryKb";
+/**
+ * Lowest cap the *derived* default may resolve to. V8 reserves its CodeRange
+ * up front and aborts before running a line (`Failed to reserve virtual memory
+ * for CodeRange`) when RLIMIT_DATA is below ~576 MiB (measured: 544 MiB fails,
+ * 576 MiB starts, in the agent image and on node 24). Half of a 128Mi-1Gi
+ * limit lands under that, so every node/npm/npx/pnpm a tool shell runs would
+ * die while `claude` itself stays healthy. 768 MiB leaves margin. An explicit
+ * `toolMemoryKb` is not clamped: an operator passing a small value said so.
+ */
+export const TOOL_MEMORY_LIMIT_FLOOR_KB = 768 * 1024;
 export const TOOL_RLIMIT_DIR = `${RUNTIME_CACHE_MOUNT_PATH}/tool-rlimit`;
 /** Sourced by zsh via the `ZDOTDIR` stub, and by bash via the `bashenv.sh` stub. */
 export const TOOL_RLIMIT_FILE = `${TOOL_RLIMIT_DIR}/rlimit.sh`;
@@ -1428,7 +1438,8 @@ export function parseMemoryQuantityToKiB(raw: string, field: string): number {
  * Kubernetes quantity such as `1.5Gi`, or a unit outside the parser) is NOT a
  * reason to refuse the Job: that limit was already valid before this cap
  * existed and the cluster still enforces it. It degrades to no cap (`0`) with
- * a warning so the operator can pin `toolMemoryKb` explicitly.
+ * a warning so the operator can pin `toolMemoryKb` explicitly. A derived value
+ * below `TOOL_MEMORY_LIMIT_FLOOR_KB` is raised to the floor, also with a warning.
  */
 export function resolveToolMemoryLimitKb(
   config: Record<string, unknown>,
@@ -1437,8 +1448,9 @@ export function resolveToolMemoryLimitKb(
 ): number {
   const raw = config[TOOL_MEMORY_LIMIT_CONFIG_KEY];
   if (raw === undefined || raw === null || (typeof raw === "string" && raw.trim() === "")) {
+    let derived: number;
     try {
-      return Math.floor(parseMemoryQuantityToKiB(containerMemoryLimit, "resources.limits.memory") / 2);
+      derived = Math.floor(parseMemoryQuantityToKiB(containerMemoryLimit, "resources.limits.memory") / 2);
     } catch (error) {
       warn(
         `resources.limits.memory=${JSON.stringify(containerMemoryLimit)} cannot be halved into a tool RLIMIT_DATA cap ` +
@@ -1447,6 +1459,15 @@ export function resolveToolMemoryLimitKb(
       );
       return 0;
     }
+    if (derived < TOOL_MEMORY_LIMIT_FLOOR_KB) {
+      warn(
+        `half of resources.limits.memory=${JSON.stringify(containerMemoryLimit)} is ${derived} KiB, below the ` +
+          `${TOOL_MEMORY_LIMIT_FLOOR_KB} KiB floor (node aborts at startup below ~576 MiB); raising the tool RLIMIT_DATA cap to ${TOOL_MEMORY_LIMIT_FLOOR_KB} KiB. ` +
+          `Set ${TOOL_MEMORY_LIMIT_CONFIG_KEY} (KiB) explicitly to override.`,
+      );
+      return TOOL_MEMORY_LIMIT_FLOOR_KB;
+    }
+    return derived;
   }
   const value =
     typeof raw === "number"
