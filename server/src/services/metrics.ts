@@ -1116,7 +1116,7 @@ export const NO_SCHEDULED_RETRY_PARK_REASON = "none";
  *    final 2h hop plus 25% jitter = **9,000s**. Keeps the bare
  *    `transient_failure` label.
  *  - {@link TRANSIENT_FLOOR_PARK_REASON}: an upstream `retryNotBefore` floor
- *    won. An unclamped floor just under the horizon can add up to
+ *    won. An unclamped floor at or just under the horizon can add up to
  *    `TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS` (300s), while a floor that
  *    `clampTransientRetryHorizon` actually clamps carries no forward jitter;
  *    the maximum is therefore `MAX_TRANSIENT_RETRY_HORIZON_MS` (86,400s) plus

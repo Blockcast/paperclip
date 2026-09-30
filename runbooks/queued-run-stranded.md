@@ -51,7 +51,7 @@ gated off and its last snapshot is not trustworthy.
 > | `ccrotate_capacity` | 1,080s | `CCROTATE_CAPACITY_MAX_PARK_MS` (15min) x (1 + `CCROTATE_CAPACITY_PARK_JITTER_RATIO` 0.2), jitter added after the clamp |
 > | `dependency_blocked` | 3,600s | `DEP_BLOCKED_MAX_DELAY_MS` |
 > | `transient_failure`, backoff ladder | 9,000s | final 2h hop of `BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS` x (1 + 0.25 jitter) |
-> | `transient_failure`, upstream `retryNotBefore` floor | 86,700s | `MAX_TRANSIENT_RETRY_HORIZON_MS` (24h) + `TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS` (5min forward jitter on a floor just under the clamp) |
+> | `transient_failure`, upstream `retryNotBefore` floor | 86,700s | `MAX_TRANSIENT_RETRY_HORIZON_MS` (24h) + `TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS` (5min forward jitter on a floor at or just under the clamp, which is therefore not clamped) |
 > | `transient_failure`, `provider_quota` floor | none | adopted verbatim, never clamped (`clampTransientHorizon` in `scheduleBoundedRetryForRun`) |
 >
 > `transient_failure` is one label over three mechanisms, and the gauge cannot
