@@ -4,13 +4,15 @@
  * WHY THIS EXISTS, AND WHY NO EXISTING SIGNAL SUBSTITUTES FOR IT
  *
  * Measured over 88 consecutive production passes (Loki, `{pod="paperclip-0"}`,
- * 2026-09-28..30), pass 1 of the recovery chain ran 5.5-86.3 min -- a 15.7x
+ * 2026-09-28..30), and re-measured over 84 passes joined to Prometheus
+ * (2026-09-30), pass 1 of the recovery chain ran 5.5-86.3 min -- a 15.7x
  * spread -- while `candidatesScanned` moved only +/-9% (2095..2284) and
  * `suppressed` only +/-12% (941..1050). Correlations against that wall clock:
  *
- *   r(pass-1 duration, candidatesScanned) = 0.168
- *   r(pass-1 duration, suppressed)        = 0.227
- *   r(ms-per-candidate, fleet log rate)   = -0.059
+ *   r(ms-per-candidate, candidatesScanned)  = -0.029  (workload: nothing)
+ *   r(ms-per-candidate, concurrent runs)    = +0.368  (direct gauge)
+ *   r(ms-per-candidate, worker pool queue)  = +0.444
+ *   r(ms-per-candidate, api-pod pool queue) = +0.388  (a DIFFERENT process)
  *
  * Two things follow, and both are the reason this module is aggregate timing
  * rather than a fix:
@@ -18,12 +20,23 @@
  * 1. The cost is NOT a property of the candidate set. A mean "ms per candidate"
  *    computed from a pass total is a mean over a 15.7x-dispersed quantity, so it
  *    is not a coefficient of this code and cannot be compared across dates to
- *    establish a regression.
- * 2. The cost does NOT track fleet concurrency, which is the form the leading
- *    advisory-lock hypothesis took. That form is discarded. Lock wait scoped to
- *    one hot issue or company would not have shown in that proxy, which is why
- *    the two lock acquisitions below are timed SEPARATELY rather than folded
- *    into one "transaction" bucket -- separating them is the whole point.
+ *    establish a regression. `r(pass duration, ms-per-candidate)` is 1.000 --
+ *    with the candidate count near-constant, those are the same variable.
+ * 2. No externally observable driver explains the spread. An earlier revision of
+ *    this comment claimed the advisory-lock hypothesis's "scales with fleet
+ *    concurrency" form was DISCARDED, on r = -0.059 against namespace log-line
+ *    rate. That was overstated: log-line rate is a weak proxy for DB
+ *    contention, and the direct gauge reads +0.368 --
+ *    `paperclip_external_lifecycle_running_runs`, which nobody had enumerated.
+ *    The form is WEAKENED, not refuted -- though it
+ *    saturates rather than scaling (terciles: 27 runs -> 507 ms, 37 -> 744 ms,
+ *    44 -> 736 ms). Controlling each candidate driver for the others leaves all
+ *    of them in +0.27..+0.43 with none dominant, against a positive control of
+ *    +0.733 on the same windows -- so that band is a finding, not measurement
+ *    noise. Lock wait scoped to one hot issue or company appears in NO external
+ *    signal, which is why the two lock acquisitions below are timed SEPARATELY
+ *    rather than folded into one "transaction" bucket -- separating them is the
+ *    whole point.
  *
  * No log query could have answered this: the sweep emits no phase timing at all,
  * and a query cannot return data the code never emitted.
@@ -44,6 +57,18 @@
  * database execution time -- time queued behind the connection pool, or behind a
  * blocked event loop, is included. That is deliberate: the question is where the
  * pass's wall clock goes, and pool wait is one of the candidate answers.
+ *
+ * ⚠ The corollary is a real limit on what these numbers can settle on their own.
+ * A large `escalate.*` total is equally consistent with lock contention and with
+ * pool starvation, and the pool is measurably queued during exactly the passes
+ * worth diagnosing: worker pool queue depth rises 1.31 -> 1.89 -> 4.23 from the
+ * fastest to the slowest third of passes, and the api pods -- a separate process
+ * with its own size-10 pool, which this sweep cannot consume -- queue alongside.
+ * So read these totals against `paperclip_db_pool_waiting_queries`, which is an
+ * INDEPENDENT instrument, before attributing them to locks. High phase totals
+ * with a flat pool queue is contention; high totals tracking a deep pool queue
+ * is starvation. BLO-32668 and `packages/db/src/client.ts:96` record that the
+ * two also cause each other, so "which one" can be the wrong question.
  */
 
 /** One phase's accumulated cost across every candidate in a pass. */
