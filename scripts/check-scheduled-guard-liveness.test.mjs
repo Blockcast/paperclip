@@ -10,6 +10,7 @@ import {
   WATCHED_GUARDS,
   WATCHED_WORKFLOWS,
   classifyGuard,
+  completedRunsPath,
   crossCheckCompletions,
   describeStopMode,
   resolveStaleHours,
@@ -107,7 +108,22 @@ describe("classifyGuard — reconstruction of the 2026-09-15 outage (PEN-3281)",
     };
   }
 
-  const outage = Object.fromEntries(WATCHED_WORKFLOWS.map((workflow) => [workflow, observed(workflow)]));
+  // The cohort is PINNED to the seven guards watched on 2026-09-15, not read
+  // from WATCHED_WORKFLOWS. This is a reconstruction of one past event: a guard
+  // added later was not in that outage and cannot be reasoned about from it.
+  // Driving it off the live set made the 7/6 counts below drift the moment
+  // BLO-38228 added an eighth, on a lane that was not even starved that day.
+  const PEN_3281_COHORT = [
+    "review-gate-sweep.yml",
+    "ally-review-consistency.yml",
+    "codeowners-guard.yml",
+    "relay-ssl-multicert-guard.yml",
+    "lockfile-drift-monitor.yml",
+    "adapter-pin-drift-monitor.yml",
+    twiceDaily,
+  ];
+
+  const outage = Object.fromEntries(PEN_3281_COHORT.map((workflow) => [workflow, observed(workflow)]));
 
   it("reds the six hourly guards at detection time", () => {
     const results = classifyAll(outage, now);
@@ -767,17 +783,19 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
   // in the PR that introduces it, instead of silently at 03:00.
   const workflowDir = resolve(dirname(fileURLToPath(import.meta.url)), "../.github/workflows");
 
-  /** Every workflow that is BOTH scheduled and on the starvable `default` lane. */
-  function scheduledDefaultWorkflows() {
+  /** Every scheduled workflow in the repo, whatever lane it runs on. */
+  function scheduledWorkflows() {
     return readdirSync(workflowDir)
       .filter((file) => file.endsWith(".yml") || file.endsWith(".yaml"))
-      .filter((file) => {
-        const body = readFileSync(join(workflowDir, file), "utf8");
-        const scheduled = /^\s*schedule:\s*$/m.test(body);
-        const onDefault = /^\s*runs-on:\s*default\s*$/m.test(body);
-        return scheduled && onDefault;
-      })
+      .filter((file) => /^\s*schedule:\s*$/m.test(readFileSync(join(workflowDir, file), "utf8")))
       .sort();
+  }
+
+  /** Every workflow that is BOTH scheduled and on the starvable `default` lane. */
+  function scheduledDefaultWorkflows() {
+    return scheduledWorkflows().filter((file) =>
+      /^\s*runs-on:\s*default\s*$/m.test(readFileSync(join(workflowDir, file), "utf8")),
+    );
   }
 
   it("finds the scheduled default-lane workflows it is supposed to be reasoning about", () => {
@@ -841,16 +859,131 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     );
   });
 
-  it("does not watch a workflow that has stopped being a scheduled default guard", () => {
-    const live = new Set(scheduledDefaultWorkflows());
+  it("does not watch a workflow that has stopped being a scheduled guard", () => {
+    // Scoped to `scheduledWorkflows()`, not the `default`-lane subset. The
+    // COVERAGE invariant above is deliberately lane-scoped — it asks which
+    // guards MUST be watched, and starvation is a `default`-lane property. This
+    // one asks whether a watched entry is still a live scheduled workflow, and
+    // that is lane-independent: BLO-38228 added master-health.yml, which runs on
+    // arc-light/arc-paperclip-general. Keeping the lane filter here would have
+    // red-flagged a perfectly live entry as dangling.
+    const live = new Set(scheduledWorkflows());
     const dangling = WATCHED_WORKFLOWS.filter((file) => !live.has(file));
 
     assert.deepEqual(
       dangling,
       [],
-      "a watched entry no longer resolves to a scheduled `default` workflow. At runtime this reds " +
+      "a watched entry no longer resolves to a scheduled workflow. At runtime this reds " +
         "as 'unreadable', which is correct but late — fix the entry here.",
     );
+  });
+
+  // BLO-38228. A guard reachable by an AUTO-FIRING non-schedule trigger needs
+  // `event: "schedule"`, or its newest-run query is satisfied by those runs
+  // while the cron is dead — reporting ok forever. master-health.yml is the
+  // first such guard: it also runs on every push to master.
+  //
+  // `workflow_dispatch` is deliberately NOT in this list, and that is a stated
+  // exposure rather than an oversight. All seven pre-existing guards carry it,
+  // and a dispatch does bump the newest-run timestamp — so a manual dispatch
+  // can mask a dead cron for one threshold window. It is accepted because a
+  // dispatch is human-initiated and rare, where a push to master is neither;
+  // and because narrowing those seven to `event: "schedule"` would invalidate
+  // the gap distributions their thresholds were measured from, which is a
+  // change to a live security control and not this row's to make.
+  it("declares an event filter for every watched guard with an auto-firing non-schedule trigger", () => {
+    const missing = WATCHED_GUARDS.filter((guard) => {
+      const body = readFileSync(join(workflowDir, guard.workflow), "utf8");
+      const autoTrigger = /^\s*(push|pull_request|workflow_call):/m.test(body);
+      return autoTrigger && guard.event !== "schedule";
+    }).map((guard) => guard.workflow);
+
+    assert.deepEqual(
+      missing,
+      [],
+      "a watched guard has a non-schedule trigger but no `event: \"schedule\"`. Its liveness " +
+        "check would be satisfied by those runs while the cron is dead, which is a muted alarm " +
+        "dressed as a green one. Add the filter in WATCHED_GUARDS.",
+    );
+
+    // Positive control: a silently-empty scan makes the assertion vacuous, which
+    // is this file's own recurring failure mode.
+    assert.ok(
+      WATCHED_GUARDS.some((guard) => guard.event === "schedule"),
+      "no watched guard declares an event filter — the scan above proves nothing",
+    );
+  });
+
+  it("puts the event filter into the API path, and omits it when unset", () => {
+    assert.equal(
+      completedRunsPath("o/r", "master-health.yml", "schedule"),
+      "repos/o/r/actions/workflows/master-health.yml/runs?status=completed&per_page=1&event=schedule",
+    );
+    assert.equal(
+      completedRunsPath("o/r", "codeowners-guard.yml", undefined),
+      "repos/o/r/actions/workflows/codeowners-guard.yml/runs?status=completed&per_page=1",
+    );
+  });
+
+  // The two assertions above prove the filter is BUILT correctly. Neither proves
+  // main() actually hands it over — dropping `event` from that one destructure
+  // reverts the whole fix while every other test stays green. main() shells out
+  // to `gh`, so no unit test can see it; this asserts against the source, the
+  // same escape the stale-hours YAML-wiring test above takes for the same reason.
+  it("threads each guard's event filter from WATCHED_GUARDS through to the fetch", () => {
+    const source = readFileSync(
+      resolve(dirname(fileURLToPath(import.meta.url)), "check-scheduled-guard-liveness.mjs"),
+      "utf8",
+    );
+
+    assert.match(
+      source,
+      /watched\.map\(\(\{[^}]*\bevent\b[^}]*\}\)/,
+      "main() no longer destructures `event` off the guard entry",
+    );
+    assert.match(
+      source,
+      /observeWorkflow\(repo,\s*workflow,\s*event\)/,
+      "main() no longer passes `event` to observeWorkflow — every filtered guard silently unfilters",
+    );
+    assert.match(
+      source,
+      /crossCheckCompletions\(repo,\s*workflow,\s*gh,\s*event\)/,
+      "main() no longer passes `event` to the cross-check — see the mute below",
+    );
+  });
+
+  // The cross-check must narrow on the SAME trigger axis as the filtered read
+  // (BLO-38228). PEN-3379's design is that the two reads differ on exactly one
+  // axis, `status=completed`. Let them differ on the trigger axis too and the
+  // unfiltered side sees push runs the filtered side cannot: it reports a newer
+  // completion on every single poll, `classifyGuard` lands in
+  // `cross-check-disagreement`, and the alarm is suppressed FOREVER. That is a
+  // permanent mute on the guard whose only job is to notice silence — strictly
+  // worse than the false positives the cross-check was added to remove.
+  it("narrows the cross-check on the same trigger axis, so it cannot disagree by construction", () => {
+    const paths = [];
+    const reader = (args) => {
+      paths.push(args[1]);
+      return JSON.stringify({ workflow_runs: [] });
+    };
+
+    crossCheckCompletions("o/r", "master-health.yml", reader, "schedule");
+    crossCheckCompletions("o/r", "codeowners-guard.yml", reader);
+
+    assert.match(
+      paths[0],
+      /^repos\/o\/r\/actions\/workflows\/master-health\.yml\/runs\?per_page=\d+&event=schedule$/,
+      "a filtered guard's cross-check must carry the same event filter",
+    );
+    assert.match(
+      paths[1],
+      /^repos\/o\/r\/actions\/workflows\/codeowners-guard\.yml\/runs\?per_page=\d+$/,
+      "an unfiltered guard's cross-check must stay unfiltered",
+    );
+    // The axis it must still DROP: corroboration depends on not going through
+    // the suspect server-side index.
+    for (const path of paths) assert.ok(!path.includes("status=completed"));
   });
 
   it("gives every exemption a stated reason", () => {
@@ -862,7 +995,7 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     }
   });
 
-  it("carries the six PEN-3281 guards plus the security control the original list missed", () => {
+  it("carries the six PEN-3281 guards, the security control the original list missed, and the clock-rot guard", () => {
     assert.deepEqual(
       [...WATCHED_WORKFLOWS].sort(),
       [
@@ -870,6 +1003,7 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
         "ally-review-consistency.yml",
         "codeowners-guard.yml",
         "lockfile-drift-monitor.yml",
+        "master-health.yml",
         "production-environment-protection-guard.yml",
         "relay-ssl-multicert-guard.yml",
         "review-gate-sweep.yml",
@@ -886,12 +1020,21 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     assert.ok(twiceDaily > 14.6, "would red on ordinary twice-daily jitter");
     assert.ok(twiceDaily < 17.71, "would sail over the 2026-09-15 outage it must catch");
 
+    // BLO-38228: the daily clock-rot guard is on 48h, deliberately loose because
+    // its schedule is new and has no measured gap distribution yet. Asserted
+    // rather than skipped, so a drift into the hourly bar (which would red it
+    // every single day) fails here.
+    const dailyClockRot = byWorkflow.get("master-health.yml");
+    assert.ok(dailyClockRot > 24, "a daily cron must clear one full cycle plus GitHub's delay");
+    assert.ok(dailyClockRot <= 48, "looser than two missed cycles stops being a backstop at all");
+
     // The hourly six share one bar; a shared GLOBAL threshold across cadences is
     // the bug this replaced. Asserted against DEFAULT_STALE_HOURS rather than a
     // literal so moving the bar stays a one-line change with a reason attached
     // (PEN-3379 moved it 4h -> 2.75h).
+    const notHourly = new Set(["production-environment-protection-guard.yml", "master-health.yml"]);
     for (const workflow of WATCHED_WORKFLOWS) {
-      if (workflow === "production-environment-protection-guard.yml") continue;
+      if (notHourly.has(workflow)) continue;
       assert.equal(
         byWorkflow.get(workflow),
         DEFAULT_STALE_HOURS,
@@ -1006,6 +1149,12 @@ describe("summarize — 'could not read' is a different claim from 'stopped exec
     const summary = summarize(results);
 
     assert.equal(summary.exitCode, 0);
-    assert.match(summary.headline, /All 7 watched scheduled guards have completed/);
+    // Derived, not a literal: the count is incidental to what this asserts
+    // (green + silent), and hardcoding it made adding a guard fail here for no
+    // reason anyone could act on.
+    assert.match(
+      summary.headline,
+      new RegExp(`All ${WATCHED_WORKFLOWS.length} watched scheduled guards have completed`),
+    );
   });
 });

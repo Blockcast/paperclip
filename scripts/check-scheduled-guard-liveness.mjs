@@ -134,6 +134,27 @@ export const WATCHED_GUARDS = [
   // this guard — disabled, renamed, never completed — are decided on their own
   // branches and are threshold-independent.
   { workflow: "production-environment-protection-guard.yml", staleHours: 16 },
+
+  // BLO-38228. Daily at 00:37, and the ONLY thing in this repo that observes
+  // time passing — a test fixture can expire on the clock with no commit, which
+  // is how master stayed red 63h with every push-triggered signal green.
+  //
+  // `event: "schedule"` is load-bearing, not tidiness. master-health also runs
+  // on every push to master, so an unfiltered newest-run query is satisfied by
+  // push runs while the cron is dead. Watching it without the filter would
+  // report ok forever and manufacture exactly the confidence this guard exists
+  // to withhold.
+  //
+  // 48h is DELIBERATELY LOOSE and is the one threshold in this file not derived
+  // from a measured gap distribution — there is none, because BLO-38228 is what
+  // introduces the schedule. Rather than invent a number, it is set where it
+  // cannot false-red on GitHub's scheduled-run delay under load: a daily cron
+  // must miss two full cycles to trip it. That is honest about what it buys.
+  // The value here is mostly the threshold-INDEPENDENT branches — renamed or
+  // deleted (unreadable), disabled (state), never completed — with a coarse
+  // descheduled backstop on top. Tighten to ~26h once 30+ real gaps exist,
+  // by this file's normal method.
+  { workflow: "master-health.yml", staleHours: 48, event: "schedule" },
 ];
 
 /** Back-compat / convenience view: just the workflow filenames. */
@@ -537,7 +558,23 @@ function gh(args, { attempts = 3, backoffMs = 1000 } = {}) {
   throw lastError;
 }
 
-function observeWorkflow(repo, workflow) {
+/**
+ * API path for a guard's newest completed run.
+ *
+ * `event` narrows to one trigger, for a guard that is ALSO reachable by a
+ * non-scheduled trigger. Without it the newest run is whatever fired last, so a
+ * workflow with a push trigger reads fresh while its cron is dead.
+ *
+ * Exported only so the colocated test can mutation-check that filter — the same
+ * reason `classifyGuard` is exported: a guard with no failing mutation is a
+ * comment.
+ */
+export function completedRunsPath(repo, workflow, event) {
+  const base = `repos/${repo}/actions/workflows/${workflow}/runs?status=completed&per_page=1`;
+  return event ? `${base}&event=${encodeURIComponent(event)}` : base;
+}
+
+function observeWorkflow(repo, workflow, event) {
   let meta;
   try {
     meta = JSON.parse(gh(["api", `repos/${repo}/actions/workflows/${workflow}`]));
@@ -579,10 +616,15 @@ function observeWorkflow(repo, workflow) {
     // instead of firing it. The false-early/false-quiet trade above still
     // decides the sort key; what changed is that "false-early" is no longer
     // assumed to be small.
-    const raw = gh([
-      "api",
-      `repos/${repo}/actions/workflows/${workflow}/runs?status=completed&per_page=1`,
-    ]);
+    //
+    // ON THE `event` NARROWING (BLO-38228): orthogonal to the axis above, and it
+    // is threaded into `crossCheckCompletions` as well. The cross-check's whole
+    // point is to differ on ONE axis — `status=completed` — so if it differed on
+    // the trigger axis too it would read a push run the filtered side cannot
+    // see, disagree with itself on every poll, and suppress the alarm forever.
+    // An always-muted guard is the failure mode both of these mechanisms exist
+    // to prevent.
+    const raw = gh(["api", completedRunsPath(repo, workflow, event)]);
     const run = JSON.parse(raw).workflow_runs?.[0];
     if (!run) return { state: meta.state, name: meta.name, newest: null };
 
@@ -675,13 +717,20 @@ export function selectNewestCompleted(runs) {
  * the branch that matters most: it decides whether a broken second read
  * degrades to "no corroboration, red stands" or to a silent mute, and a
  * veto whose failure mode is untested is a veto nobody can trust.
+ *
+ * `event` MIRRORS `observeWorkflow`'s narrowing and is deliberately NOT dropped
+ * along with `status=completed` (BLO-38228). "Differs on ONE axis" is the whole
+ * design: for a guard that is also reachable by a non-scheduled trigger, an
+ * unfiltered cross-check would see push runs the filtered side cannot, report a
+ * newer completion on every poll, and land permanently in
+ * `cross-check-disagreement` — i.e. suppress the alarm forever. It comes after
+ * `read` so the existing positional call sites keep working; nothing about the
+ * PEN-3379 corroboration property depends on the trigger axis.
  */
-export function crossCheckCompletions(repo, workflow, read = gh) {
+export function crossCheckCompletions(repo, workflow, read = gh, event = undefined) {
   try {
-    const raw = read([
-      "api",
-      `repos/${repo}/actions/workflows/${workflow}/runs?per_page=${CROSS_CHECK_PAGE_SIZE}`,
-    ]);
+    const base = `repos/${repo}/actions/workflows/${workflow}/runs?per_page=${CROSS_CHECK_PAGE_SIZE}`;
+    const raw = read(["api", event ? `${base}&event=${encodeURIComponent(event)}` : base]);
     return { newestCompletedAt: selectNewestCompleted(JSON.parse(raw).workflow_runs ?? []) };
   } catch {
     return { error: true };
@@ -704,9 +753,9 @@ function main() {
     : WATCHED_GUARDS;
 
   const now = Date.now();
-  const results = watched.map(({ workflow, staleHours }) => {
+  const results = watched.map(({ workflow, staleHours, event }) => {
     const effectiveStaleHours = overrideHours ?? staleHours;
-    const observation = observeWorkflow(repo, workflow);
+    const observation = observeWorkflow(repo, workflow, event);
     const first = classifyGuard(workflow, observation, { now, staleHours: effectiveStaleHours });
 
     // The cross-check is only worth a call once the cheap read has already
@@ -726,7 +775,7 @@ function main() {
 
     return classifyGuard(
       workflow,
-      { ...observation, crossCheck: crossCheckCompletions(repo, workflow) },
+      { ...observation, crossCheck: crossCheckCompletions(repo, workflow, gh, event) },
       { now, staleHours: effectiveStaleHours },
     );
   });

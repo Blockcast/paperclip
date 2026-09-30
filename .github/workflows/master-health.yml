@@ -68,15 +68,29 @@ on:
   # unconditionally, and the SCOPE block above budgets this pool deliberately.
   # One run/day against the ~9.4 already noted is ~11% more load, for a
   # worst-case detection latency of 24h against the unbounded latency that let
-  # BLO-38228 run 63h. Both known instances of this class pinned midnight UTC,
-  # so 00:37 catches the dominant case within ~37 minutes.
+  # BLO-38228 run 63h.
+  #
+  # ON 00:37 SPECIFICALLY, and this is weaker than a first draft of this comment
+  # claimed. n=1, not 2: BLO-38228's literal pinned midnight, but BLO-27861 was
+  # a semantic conflict between two landings, not a clock expiry, so it is not
+  # an instance of this class at all. The other live literal this PR removed
+  # (issue-execution-policy-routes.test.ts:726) pinned NOON. So 00:37 catches a
+  # midnight-pinned fixture in ~37 minutes and a noon-pinned one in ~12.6h, and
+  # the honest promise is the 24h worst case above, not the 37 minutes.
   #
   # Minute :37 is deliberate: scheduled-guard-liveness.yml documents the
   # minutes this repo's recurring guards already occupy (:09 x2, :17, :23, :31,
   # :41, :47). Avoid :00 and :30 -- every cron on the planet lands there.
   #
-  # Upgrade path if a non-midnight literal ever bites: add a second entry near
+  # Upgrade path if a noon-pinned literal ever bites: add a second entry near
   # 12:37, halving worst-case latency for one extra suite run per day.
+  #
+  # THIS CRON'S OWN LIVENESS IS WATCHED, and it has to be -- a guard that
+  # silently stops while its header tells readers the hole is closed is worse
+  # than no guard, which is this file's own argument about the gate bypass one
+  # level up. scripts/check-scheduled-guard-liveness.mjs watches it with
+  # `event: "schedule"`; that filter is load-bearing, because the push trigger
+  # above would otherwise satisfy the freshness check every time master moves.
   schedule:
     - cron: "37 0 * * *"
 
