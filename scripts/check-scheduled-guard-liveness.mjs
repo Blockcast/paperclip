@@ -664,11 +664,19 @@ function countQueued(repo, workflow) {
  * equivalent: it is the unsafe error the sort-key note in `observeWorkflow`
  * rejects, arriving by the back door. Re-running any older run still inside the
  * page bumps its `updated_at` without moving its `created_at`, so `max` reads
- * that as a fresh completion, disagrees with the filtered read, and SUPPRESSES
- * the alarm. On a genuinely stopped guard that is a mute — and re-running a
- * stalled guard is the first thing a human does, which puts the trigger exactly
- * where the outage is. `find` cannot be fooled this way: a re-run entry stays
- * where its `created_at` put it.
+ * that as a fresh completion and disagrees with the filtered read — which now
+ * CONFIRMS the guard alive (`ok`/`corroborated`), on the strength of a re-run
+ * that enforced nothing. On a genuinely stopped guard that is a false
+ * all-clear, and re-running a stalled guard is the first thing a human does,
+ * which puts the trigger exactly where the outage is. `find` cannot be fooled
+ * this way: a re-run entry stays where its `created_at` put it.
+ *
+ * THIS PARAGRAPH USED TO CALL THAT CONSEQUENCE A SUPPRESSION — "SUPPRESSES the
+ * alarm ... on a genuinely stopped guard that is a mute". PEN-3462 makes it
+ * worse than a mute, not better: disagreement is now an affirmative statement
+ * that the guard is alive, so the same mistake would put a stopped guard in the
+ * green rather than in a warning. The argument for `find` over `max` is
+ * unchanged and strictly stronger.
  *
  * Returns the ISO `updated_at` of that run — the same quantity `observeWorkflow`
  * returns, so the two reads are compared like for like — or null when the page
