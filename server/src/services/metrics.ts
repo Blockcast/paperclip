@@ -1116,9 +1116,11 @@ export const NO_SCHEDULED_RETRY_PARK_REASON = "none";
  *    final 2h hop plus 25% jitter = **9,000s**. Keeps the bare
  *    `transient_failure` label.
  *  - {@link TRANSIENT_FLOOR_PARK_REASON}: an upstream `retryNotBefore` floor
- *    won, and `clampTransientRetryHorizon` applies, so
- *    `MAX_TRANSIENT_RETRY_HORIZON_MS` (86,400s) plus
- *    `TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS` (300s) = **86,700s**.
+ *    won. An unclamped floor just under the horizon can add up to
+ *    `TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS` (300s), while a floor that
+ *    `clampTransientRetryHorizon` actually clamps carries no forward jitter;
+ *    the maximum is therefore `MAX_TRANSIENT_RETRY_HORIZON_MS` (86,400s) plus
+ *    300s = **86,700s**.
  *  - {@link TRANSIENT_QUOTA_FLOOR_PARK_REASON}: a `provider_quota` floor.
  *    `clampTransientHorizon` deliberately excludes this family -- it is a
  *    contractual session/billing boundary carrying an authoritative reset
@@ -3667,8 +3669,9 @@ function ensureRegistry(): {
         + "`reason` is load-bearing, not decoration: legitimate ceilings differ by class and span "
         + "at least 289x (max_turns_continuation 300s, ccrotate_capacity 1080s as a 15min clamp plus "
         + "20% forward jitter, dependency_blocked "
-        + "3600s, transient_failure 9000s on the backoff ladder but up to 86700s when it adopts an "
-        + "upstream retryNotBefore floor, 24h clamp plus 5min forward jitter, and unbounded for a "
+        + "3600s, transient_failure 9000s on the backoff ladder but up to 86700s when an unclamped "
+        + "upstream retryNotBefore floor is just under the 24h horizon and takes up to 5min forward "
+        + "jitter; a floor actually clamped to 24h carries no forward jitter, and it is unbounded for a "
         + "provider_quota floor, which is never clamped), so any single threshold across all of "
         + "them fires on designed backoff in one class while missing a 5x clamp breach in another. "
         + "Bound each reason against its own ceiling. reason='none' is a per-agent zero floor emitted for every "
