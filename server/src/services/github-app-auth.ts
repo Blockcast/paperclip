@@ -814,7 +814,14 @@ export type MergedPullRequestForHeadRef =
   | { outcome: "none" }
   | { outcome: "error"; reason: string };
 
-const MERGED_PR_FOR_HEAD_REF_PAGE_SIZE = 30;
+/**
+ * GitHub's per-page maximum, not its default of 30. Because a full page is
+ * treated as unreadable (below), this number IS the frequency of the
+ * permanently-suppressed-wake-plus-warn outcome: 100 costs the same single
+ * request and pushes that branch ~3.3x further out. Exported so the boundary
+ * test cannot drift from the fetcher.
+ */
+export const MERGED_PR_FOR_HEAD_REF_PAGE_SIZE = 100;
 
 /** Pure half of {@link githubResolveMergedPullRequestForHeadRef}, testable without network. */
 export function parseMergedPullRequestForHeadRef(body: unknown): MergedPullRequestForHeadRef {
@@ -822,7 +829,7 @@ export function parseMergedPullRequestForHeadRef(body: unknown): MergedPullReque
 
   // One page is fetched, so a full page is not provably the whole answer: the
   // merge that triggered this retarget can be on page 2 (a recycled branch name
-  // like `dev` reaches 30 closed PRs easily). Scanning the prefix would report
+  // like `dev` reaches a full page eventually). Scanning the prefix would report
   // `none`, or an older merge, for a read we could not complete, and `none`
   // suppresses the wake. So a full page is unreadable, exactly as the invariant
   // on `MergedPullRequestForHeadRef` requires.

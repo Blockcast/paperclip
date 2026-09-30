@@ -19,6 +19,7 @@
  */
 import { describe, expect, it } from "vitest";
 import {
+  MERGED_PR_FOR_HEAD_REF_PAGE_SIZE,
   parseMergedPullRequestForHeadRef,
   parseMergeHistoryShape,
   parseOpenPullRequestsOnBasePayload,
@@ -161,7 +162,12 @@ describe("parseMergedPullRequestForHeadRef", () => {
     // Only one page is fetched, so the merge that triggered the retarget may be
     // on page 2. Neither `none` (suppresses the wake) nor the prefix's newest
     // merge (possibly the wrong base, so the wrong directive) is a safe answer.
-    const closedUnmerged = Array.from({ length: 29 }, (_, i) => ({ number: i + 1, merged_at: null }));
+    // Sized off the exported constant so the guard and the fetcher's `per_page`
+    // cannot drift apart from this assertion.
+    const closedUnmerged = Array.from(
+      { length: MERGED_PR_FOR_HEAD_REF_PAGE_SIZE - 1 },
+      (_, i) => ({ number: i + 1, merged_at: null }),
+    );
     expect(parseMergedPullRequestForHeadRef([...closedUnmerged, { number: 99, merged_at: null }]))
       .toEqual({ outcome: "error", reason: "merged_pull_request_truncated" });
     expect(parseMergedPullRequestForHeadRef([
