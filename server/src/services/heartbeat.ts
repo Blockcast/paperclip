@@ -9111,21 +9111,29 @@ function isAutoCheckoutWakeReason(wakeReason: string | null | undefined) {
  * `attemptCount`/`maxAttempts` budget and the stranded sweep re-upserts it —
  * incrementing that count and re-arming the wake — so its owner is re-driven
  * without this retry. That re-drive is bounded, not unconditional: BLO-30743
- * makes the sweep REUSE rather than re-upsert once the action is `ownerless` or
- * `escalated` (recovery/stranded-escalation-status.ts), and an `escalated`
- * action is dropped at `exhaustedSkipped` so its owner stops being driven at
- * all. It still fails LOUDLY there — `escalated` fires
- * `issue.escalation.needs_human_decision` — which is exactly the contrast with
- * a lost mention, whose failure is silent. Adding it would widen the exemption
- * to a family with no measured loss; that is the whole reason, and one measured
- * loss is enough to change it. This does leave the gate STRICTER than the claim
- * screen here, which is safe in that direction only — but not by the mechanism
- * a source read suggests. The retry IS armed: mint schedules it, and PROMOTION
- * cancels it `issue_not_assigned_to_agent`. A cancelled retry never becomes a
- * queued run, so `claimQueuedRun` is never reached and its exemption is
- * unreachable rather than contradicted. (Measured, not predicted: a reading of
- * the mint block said "rejected at mint" and the test below disproved it.)
- * Pinned by the
+ * makes the sweep REUSE rather than re-upsert, and a reused `escalated` action
+ * is dropped at `exhaustedSkipped` so its owner stops being driven at all. But
+ * reuse is narrower than the status alone — `shouldReuseStrandedRecoveryAction`
+ * (recovery/stranded-escalation-status.ts:185-190) requires an UNCHANGED action
+ * (cause and fingerprint both match), and for the `escalated` shape an
+ * unchanged owner as well. Routing a NEW owner resets the wake budget and
+ * escalates normally, so a re-routed owner is still driven; only a standing
+ * escalation with the same owner strands. It also fails LOUDLY when it does:
+ * `issue.escalation.needs_human_decision` is emitted once at the escalation
+ * TRANSITION and forwarded to Slack, and reuse is precisely what stops that
+ * repeating on every later sweep (BLO-27999 measured 208 emissions in 10.3h
+ * before it). So the operator is told either way — which is exactly the
+ * contrast with a lost mention, whose failure is silent. Adding it would widen
+ * the exemption to a family with no measured loss; that is the whole reason,
+ * and one measured loss is enough to change it.
+ *
+ * This does leave the gate STRICTER than the claim screen here, which is safe
+ * in that direction only — but not by the mechanism a source read suggests. The
+ * retry IS armed: mint schedules it, and PROMOTION cancels it
+ * `issue_not_assigned_to_agent`. A cancelled retry never becomes a queued run,
+ * so `claimQueuedRun` is never reached and its exemption is unreachable rather
+ * than contradicted. (Measured, not predicted: a reading of the mint block said
+ * "rejected at mint" and the test below disproved it.) Pinned by the
  * `source_scoped_recovery_action` gate-leg case in
  * heartbeat-retry-scheduling.test.ts, so this decision survives the next read.
  *

@@ -4526,9 +4526,12 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
   // same shape as a mention. It is excluded anyway because the harm differs: a
   // mention has no other wake path, whereas a recovery action carries its own
   // `attemptCount`/`maxAttempts` budget and the stranded sweep re-upserts it,
-  // re-arming the owner without this retry — until that budget escalates, at
-  // which point the sweep reuses instead and the action fires
-  // `issue.escalation.needs_human_decision`, so it fails visibly.
+  // re-arming the owner without this retry. Reuse (BLO-30743) bounds that, but
+  // only for an UNCHANGED action whose `escalated` owner is also unchanged —
+  // routing a new owner escalates normally and is still driven. And a stranded
+  // one still fails visibly: `issue.escalation.needs_human_decision` fires once
+  // at the escalation TRANSITION, and reuse is what stops it repeating on every
+  // later sweep rather than what causes it.
   //
   // Note this leaves the GATE stricter than `claimQueuedRun`, which exempts
   // recovery-owner wakes unconditionally (`isRecoveryOwnerWake`). Safe in that
