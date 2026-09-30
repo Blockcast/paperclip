@@ -296,6 +296,72 @@ export function classifyGuard(
     };
   }
 
+  // INDEX CONSISTENCY (BLO-38286). Both reads this function weighs are served
+  // by the SAME eventually-consistent run index, and a same-instant second read
+  // of a PINNED replica agrees with the first. The PEN-3379 timestamp
+  // cross-check below suppresses only when the unfiltered read is strictly
+  // NEWER, so it is structurally blind to a window in which both reads are
+  // equally stale — which is the fault actually observed. On run 36692972253
+  // (2026-09-30T08:59Z) the cross-check was read cleanly, agreed, and two
+  // healthy guards went red anyway; `relay-ssl-multicert-guard` was cited at
+  // 436h stale while completing on schedule.
+  //
+  // This arm compares no timestamps. It compares SET SIZES, and it is a proof
+  // rather than a heuristic: completed runs are a subset of all runs over any
+  // one consistent snapshot, so `completedCount` may never exceed `allCount`.
+  // When it does, the two responses came from different index states and
+  // nothing derived from either is worth aging. Measured on codeowners-guard.yml
+  // + event=schedule inside ~4 minutes: 632 unfiltered, then 1058 with
+  // `status=completed` — adding a filter INCREASED the count.
+  //
+  // Free: both numbers ride on responses this file already fetches. It fires
+  // only on the red path, because `classifyWatched` attaches the cross-check
+  // only there, and it only ever WEAKENS a red.
+  //
+  // WHAT BOUNDS IT, AND WHAT DOES NOT. Unlike the PEN-3379 arm below, this one
+  // rests on no evidence that the guard is alive: `completedCount > allCount`
+  // proves the reads are untrustworthy, which is just as true of a guard that
+  // has stopped. So it defers whenever there IS timestamp evidence: when the
+  // unfiltered read carries a strictly better completion (newer than the
+  // filtered one, or any at all against an empty filtered page), the PEN-3379
+  // arm below decides on that timestamp, suppressing if it is fresh and redding
+  // if it is itself past staleHours, exactly as it would with consistent counts.
+  // What it still mutes is the shape the production false red actually had:
+  // both reads citing the SAME stale completion. That observation is
+  // field-for-field what a stopped guard with split reads produces, so no pure
+  // function of one poll can separate the two; such a guard warns on every
+  // poll and exits 0 for as long as its counts stay inconsistent. Bounding
+  // that needs state across polls (consecutive `index-inconsistent` verdicts),
+  // which this file does not keep.
+  //
+  // NOT complete coverage, stated rather than implied: two reads served by the
+  // SAME pinned replica are internally consistent and pass straight through
+  // this check. It catches the differently-pinned case on proof; it does not
+  // make the index trustworthy, and AC2's flap watch is what measures the rest.
+  const completedCount = observation?.completedCount;
+  const allCount = observation?.crossCheck?.allCount;
+  const crossCheckIsBetter =
+    Date.parse(observation?.crossCheck?.newestCompletedAt ?? "") >
+    (observation?.newest ? Date.parse(observation.newest.updatedAt) : -Infinity);
+  if (
+    typeof completedCount === "number" &&
+    typeof allCount === "number" &&
+    completedCount > allCount &&
+    !crossCheckIsBetter
+  ) {
+    return {
+      ...base,
+      status: "unknown",
+      reason: "index-inconsistent",
+      detail:
+        `${name} (${workflow}) could not be assessed: the run index reported ${completedCount} ` +
+        `completed run(s) but only ${allCount} run(s) in total for the same workflow. Completed runs ` +
+        `are a subset of all runs, so both answers cannot be true — these reads were served from ` +
+        `different index states, and every timestamp in them is suspect. Suppressing the alarm rather ` +
+        `than firing it (BLO-38286); this guard is NOT being asserted to have stopped.`,
+    };
+  }
+
   if (!observation?.newest) {
     // Grace is checked BEFORE the cross-check, deliberately. A guard inside its
     // grace window has no completed run for a known, benign reason, so there is
@@ -700,6 +766,27 @@ export function observeWorkflow(repo, workflow, read = gh, event = undefined) {
     // decides the sort key; what changed is that "false-early" is no longer
     // assumed to be small.
     //
+    // THE ENDPOINT IS EVENTUALLY CONSISTENT (BLO-38286). PEN-3379 recorded the
+    // 2026-09-18 fault without naming the property behind it, so the next
+    // reader — me — re-derived the determinism assumption from scratch and
+    // published a false "3 of 8 guards have stopped". Stated here so nobody
+    // does it a third time: this index serves point-in-time-PINNED answers for
+    // windows of minutes to an hour. Measured 2026-09-30, the same URL from the
+    // same pod ~20 minutes apart returned 2026-09-12T04:27:19Z and then
+    // 2026-09-30T08:40:45Z, with seven workflows on seven different cron minutes
+    // all pinned inside one 27-minute window on 09-12 — a replica frozen at an
+    // instant, not seven independent stalls. Two further properties matter for
+    // anyone writing a check against it:
+    //
+    //   - THE STALENESS IS WINDOWED, NOT PER-CALL. Six identical calls 2s apart
+    //     returned byte-identical answers. Retrying in a tight loop detects
+    //     nothing, and neither does a second read taken at the same instant —
+    //     which is precisely why the timestamp cross-check above, live since
+    //     09-27, still let run 36692972253 red two healthy guards on 09-30.
+    //   - IT IS NOT EVEN SELF-CONSISTENT ACROSS FILTERS, which is the one thing
+    //     here that can be checked by proof rather than by inference. See
+    //     INDEX CONSISTENCY in `classifyGuard`.
+    //
     // ON THE `event` NARROWING (BLO-38228): orthogonal to the axis above, and it
     // is threaded into `crossCheckCompletions` as well. The cross-check's whole
     // point is to differ on ONE axis — `status=completed` — so if it differed on
@@ -708,12 +795,21 @@ export function observeWorkflow(repo, workflow, read = gh, event = undefined) {
     // An always-muted guard is the failure mode both of these mechanisms exist
     // to prevent.
     const raw = read(["api", completedRunsPath(repo, workflow, event)]);
-    const run = JSON.parse(raw).workflow_runs?.[0];
-    if (!run) return { state: meta.state, name: meta.name, newest: null };
+    const page = JSON.parse(raw);
+    const run = page.workflow_runs?.[0];
+
+    // Carried for the set-cardinality check in `classifyGuard` (BLO-38286).
+    // Completed runs are a SUBSET of all runs, so this count may never exceed
+    // the cross-check's `allCount`; when it does, the two reads provably came
+    // from different index states. Costs no extra request — the number is
+    // already on this response.
+    const completedCount = typeof page.total_count === "number" ? page.total_count : null;
+    if (!run) return { state: meta.state, name: meta.name, newest: null, completedCount };
 
     return {
       state: meta.state,
       name: meta.name,
+      completedCount,
       newest: { updatedAt: run.updated_at, conclusion: run.conclusion, htmlUrl: run.html_url },
     };
   } catch {
@@ -814,7 +910,14 @@ export function crossCheckCompletions(repo, workflow, read = gh, event = undefin
   try {
     const base = `repos/${repo}/actions/workflows/${workflow}/runs?per_page=${CROSS_CHECK_PAGE_SIZE}`;
     const raw = read(["api", event ? `${base}&event=${encodeURIComponent(event)}` : base]);
-    return { newestCompletedAt: selectNewestCompleted(JSON.parse(raw).workflow_runs ?? []) };
+    const page = JSON.parse(raw);
+    return {
+      newestCompletedAt: selectNewestCompleted(page.workflow_runs ?? []),
+      // The cardinality half of the corroboration (BLO-38286). Unfiltered, so
+      // this is the SUPERSET count that `observeWorkflow`'s `completedCount`
+      // must not exceed.
+      allCount: typeof page.total_count === "number" ? page.total_count : null,
+    };
   } catch {
     return { error: true };
   }
@@ -920,10 +1023,11 @@ function main() {
     }
 
     if (result.status === "unknown") {
-      const title =
-        result.reason === "cross-check-disagreement"
-          ? "Run index disagreed with itself — liveness alarm suppressed"
-          : "Unparsable run timestamp";
+      const unknownTitles = {
+        "cross-check-disagreement": "Run index disagreed with itself — liveness alarm suppressed",
+        "index-inconsistent": "Run index is internally inconsistent — liveness alarm suppressed",
+      };
+      const title = unknownTitles[result.reason] ?? "Unparsable run timestamp";
       console.log(`::warning title=${title}::${result.detail}`);
       continue;
     }
