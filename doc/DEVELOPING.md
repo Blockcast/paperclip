@@ -759,9 +759,75 @@ Environment overrides:
   — minimum gap between *sentinel* snapshots. Clamped to at least 1 minute: this
   is a floor on a path anything with write access to the volume can reach, so
   there is deliberately no way to switch it off.
+- `PAPERCLIP_HEAP_SNAPSHOT_MAX_AGE_MINUTES=<minutes>` (default `1440`, i.e. 24h)
+  — how long a snapshot may remain on disk, measured from the capture stamp in
+  its filename. See the security section below: this is an exposure window, not
+  a disk cap, so it is clamped to at least 1 minute and overrides `KEEP`. Keep it
+  comfortably above `MIN_INTERVAL_MINUTES` or the older half of a diff pair can
+  expire before the newer half exists; the worker warns at startup if it is not.
+  It bounds the exposure only while capture is *on*: setting `ENABLED=false`
+  deletes the snapshots outright rather than waiting for this to elapse.
 - `PAPERCLIP_HEAP_SNAPSHOT_POLL_SECONDS=<seconds>` (default `60`)
 
-Two things to know before enabling it:
+### ⛔ A snapshot is a credential, not a diagnostic
+
+`v8.writeHeapSnapshot()` serialises **every reachable string**, and `loadConfig()`
+reads this process's secrets out of the environment into exactly such strings
+(`githubAppPrivateKey` is a required field). So a snapshot contains, in plaintext:
+the GitHub App private key, the agent JWT signing secret, `DATABASE_URL`, the
+webhook secret, and any provider API tokens on the heap.
+
+This is measured, not inferred. A value read from the environment onto a live
+object appears verbatim in the resulting file; a value left in the environment
+and never dereferenced does not.
+
+**File permissions do not mitigate this on the deployed cluster.** The worker and
+every agent pod run as the *same uid* against the same ReadWriteMany claim, so a
+`0600` file owned by `1000` is fully readable by uid `1000` in another pod. There
+is no mode that separates them. The retrieval property this feature is built on —
+readable from any agent seat with no privilege change — is the identical
+mechanism, so it cannot be kept while dropping the exposure.
+
+What follows from that:
+
+- **The file's lifetime is the only control.** Hence `MAX_AGE_MINUTES`, which
+  overrides `KEEP`: "there are only two of them" is not a security property.
+- **⚠️ Disabling the flag DELETES the snapshots. Retrieve them first.** Retention
+  runs on the worker tier whether or not capture is enabled, and with
+  `ENABLED=false` it retains **nothing** — the sweep runs at startup and on every
+  poll with an effective `KEEP` of `0`. Disabling capture is how an operator
+  declares the window closed, so the files go at that point rather than ageing
+  out over the next `MAX_AGE_MINUTES`.
+
+  **The ordering is therefore load-bearing, not a nicety:**
+
+  1. Copy the snapshot pair **off** the volume (`cp` to somewhere the claim is
+     not shared, or pull it down and delete the copy on the volume).
+  2. Read the diff.
+  3. *Then* set `PAPERCLIP_HEAP_SNAPSHOT_ENABLED=false`.
+
+  Flip the flag first and the pair is gone on the next worker start — including a
+  snapshot you had not retrieved. This is the deliberate trade: the prune used to
+  live *inside* the feature flag, so switching capture off stopped the sweep with
+  it and whatever was on the volume stayed there forever. The moment an operator
+  believed the exposure had ended was the moment it became permanent. Losing an
+  un-retrieved snapshot is recoverable — take another. A credential-bearing file
+  left on a shared volume indefinitely is not.
+- **Age is read from the filename stamp, not mtime.** Retrieval means copying
+  these off the volume and copy tooling rewrites mtimes; keying on mtime would
+  let any reader extend the window just by touching the file.
+- **Treat each capture as a credential-exposure event.** Decide on rotation of
+  the App private key and the agent JWT secret the same way you would for any
+  other disclosure, rather than filing it as a diagnostic. Delete the snapshot as
+  soon as it has been analysed rather than waiting for it to age out, and prefer
+  analysing it somewhere the volume is not shared.
+- Where the trade is acceptable, a `kubectl debug` ephemeral container against
+  `--heapsnapshot-signal` writes to `/proc/<pid>/cwd` (container-local, **not**
+  the shared claim) and is the safer option on this axis. It needs
+  `pods/ephemeralcontainers` and is a one-off manoeuvre rather than something
+  repeatable, which is why it is not the default here — but it is a real trade.
+
+Two more things to know before enabling it:
 
 - A snapshot is **stop-the-world**. Expect a pause of seconds on a multi-gigabyte
   heap, during which the process answers nothing, health checks included.
@@ -778,7 +844,10 @@ kept rather than spent on a write that cannot happen.
 
 One snapshot names what is on the heap. It takes **two, hours apart**, to name what
 is *accumulating* — load the pair into Chrome DevTools (Memory → Load) and use the
-"Objects allocated between snapshot 1 and 2" comparison view.
+"Objects allocated between snapshot 1 and 2" comparison view. Copy the pair off
+the volume before you disable the flag — see the security section above, where
+that ordering and the reason for it are spelled out — and delete both once the
+diff has been read.
 
 ## Secrets in Dev
 

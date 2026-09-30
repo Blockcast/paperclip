@@ -153,6 +153,7 @@ export interface Config {
   heapSnapshotAutoThresholdBytes: number;
   heapSnapshotAutoMinIntervalMs: number;
   heapSnapshotSentinelMinIntervalMs: number;
+  heapSnapshotMaxAgeMs: number;
   heapSnapshotPollIntervalMs: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
@@ -1104,6 +1105,19 @@ export function loadConfig(): Config {
     Math.max(1, Number(process.env.PAPERCLIP_HEAP_SNAPSHOT_SENTINEL_MIN_INTERVAL_MINUTES) || 5) *
     60 *
     1000;
+  // How long a snapshot may remain on the volume, from its capture stamp. This
+  // is an exposure window, not a disk cap: the file holds every string on this
+  // process's heap, which includes the secrets loadConfig() reads out of the
+  // environment (githubAppPrivateKey is a required field), and on the deployed
+  // cluster the worker and every agent pod share one uid on one RWX claim, so
+  // no file mode separates the readers. Retention therefore runs even when
+  // capture is disabled — see the startup block in index.ts.
+  //
+  // Clamped to >= 1 minute for the same reason as the sentinel floor: a typo
+  // must not be able to remove a security bound. Default 24h keeps the window
+  // finite while leaving ample room for the hours-apart pair PEN-3314 needs.
+  const heapSnapshotMaxAgeMs =
+    Math.max(1, Number(process.env.PAPERCLIP_HEAP_SNAPSHOT_MAX_AGE_MINUTES) || 1440) * 60 * 1000;
   const heapSnapshotPollIntervalMs =
     Math.max(5, Number(process.env.PAPERCLIP_HEAP_SNAPSHOT_POLL_SECONDS) || 60) * 1000;
   const bindValidationErrors = validateConfiguredBindMode({
@@ -1236,6 +1250,7 @@ export function loadConfig(): Config {
     heapSnapshotAutoThresholdBytes,
     heapSnapshotAutoMinIntervalMs,
     heapSnapshotSentinelMinIntervalMs,
+    heapSnapshotMaxAgeMs,
     heapSnapshotPollIntervalMs,
     serveUi:
       process.env.SERVE_UI !== undefined
