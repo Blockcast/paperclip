@@ -747,27 +747,46 @@ touches does not queue up.
 
 Environment overrides:
 
+Every numeric override below is resolved through `resolveNumericSetting()` against
+the bounds declared in `NUMERIC_SETTING_BOUNDS` (BLO-27641), so each carries a
+ceiling as well as a floor. A value outside the range is clamped into it and a
+value that is not a finite positive number — `Infinity`, `1e999`, `abc`, a
+negative — is rejected and falls back to the documented default. Both are
+reported on stderr at startup, because the banner prints only the resolved
+number and so cannot otherwise distinguish "the operator asked for this" from
+"the operator asked for something impossible".
+
 - `PAPERCLIP_HEAP_SNAPSHOT_ENABLED=true|false` (default `false`)
 - `PAPERCLIP_HEAP_SNAPSHOT_DIR=/absolute/or/~/path`
-- `PAPERCLIP_HEAP_SNAPSHOT_KEEP=<count>` (default `2`)
-- `PAPERCLIP_HEAP_SNAPSHOT_MIN_FREE_GB=<gb>` (default `10`)
+- `PAPERCLIP_HEAP_SNAPSHOT_KEEP=<count>` (default `2`, range `1`–`20`)
+- `PAPERCLIP_HEAP_SNAPSHOT_MIN_FREE_GB=<gb>` (default `10`, range `1`–`1024`)
 - `PAPERCLIP_HEAP_SNAPSHOT_THRESHOLD_MB=<mb>` — take one unprompted at or above
-  this live-heap size. Default `0`, which leaves the sentinel as the only trigger.
-- `PAPERCLIP_HEAP_SNAPSHOT_MIN_INTERVAL_MINUTES=<minutes>` (default `120`) —
-  minimum gap between *automatic* snapshots.
-- `PAPERCLIP_HEAP_SNAPSHOT_SENTINEL_MIN_INTERVAL_MINUTES=<minutes>` (default `5`)
-  — minimum gap between *sentinel* snapshots. Clamped to at least 1 minute: this
-  is a floor on a path anything with write access to the volume can reach, so
-  there is deliberately no way to switch it off.
-- `PAPERCLIP_HEAP_SNAPSHOT_MAX_AGE_MINUTES=<minutes>` (default `1440`, i.e. 24h)
-  — how long a snapshot may remain on disk, measured from the capture stamp in
-  its filename. See the security section below: this is an exposure window, not
-  a disk cap, so it is clamped to at least 1 minute and overrides `KEEP`. Keep it
-  comfortably above `MIN_INTERVAL_MINUTES` or the older half of a diff pair can
-  expire before the newer half exists; the worker warns at startup if it is not.
+  this live-heap size. Default `0`, which leaves the sentinel as the only trigger;
+  range `0`–`65536`. This is the one setting whose floor is `0`, because `0` is
+  the off switch — an explicit `0`, and anything else the resolver rejects, lands
+  on the default and so stays off. The failure direction that matters is the
+  other one: a typo must never be able to *enable* an unprompted
+  stop-the-world pause.
+- `PAPERCLIP_HEAP_SNAPSHOT_MIN_INTERVAL_MINUTES=<minutes>` (default `120`, range
+  `1`–`10080`) — minimum gap between *automatic* snapshots.
+- `PAPERCLIP_HEAP_SNAPSHOT_SENTINEL_MIN_INTERVAL_MINUTES=<minutes>` (default `5`,
+  range `1`–`10080`) — minimum gap between *sentinel* snapshots. The floor of 1
+  minute is a floor on a path anything with write access to the volume can reach,
+  so there is deliberately no way to switch it off — and unlike the `Math.max(1, …)`
+  this replaced, the floor also holds against `Infinity`, which used to pass
+  straight through it.
+- `PAPERCLIP_HEAP_SNAPSHOT_MAX_AGE_MINUTES=<minutes>` (default `1440`, i.e. 24h;
+  range `1`–`43200`, i.e. 30 days) — how long a snapshot may remain on disk,
+  measured from the capture stamp in its filename. See the security section
+  below: this is an exposure window, not a disk cap, so it is bounded at *both*
+  ends and overrides `KEEP`. The 30-day ceiling is why: the file holds every
+  string on the heap, so an unbounded value turns a diagnostic into indefinite
+  retention of the process's secrets on a shared volume. Keep it comfortably
+  above `MIN_INTERVAL_MINUTES` or the older half of a diff pair can expire
+  before the newer half exists; the worker warns at startup if it is not.
   It bounds the exposure only while capture is *on*: setting `ENABLED=false`
   deletes the snapshots outright rather than waiting for this to elapse.
-- `PAPERCLIP_HEAP_SNAPSHOT_POLL_SECONDS=<seconds>` (default `60`)
+- `PAPERCLIP_HEAP_SNAPSHOT_POLL_SECONDS=<seconds>` (default `60`, range `5`–`3600`)
 
 ### ⛔ A snapshot is a credential, not a diagnostic
 

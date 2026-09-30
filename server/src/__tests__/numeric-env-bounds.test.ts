@@ -59,7 +59,7 @@ const SETTINGS = {
   //
   // ⚠️ Note while you are here: this map is a STRICT SUBSET of
   // `NUMERIC_SETTING_BOUNDS`, and the gap is much wider than it looks. Measured at this
-  // commit: 15 keys here against 22 there, so SEVEN settings get no hostile-input
+  // commit: 22 keys here against 29 there, so SEVEN settings get no hostile-input
   // coverage at all —
   //   isolationWorkspaceReaperIntervalMinutes, isolationWorkspaceReaperMaxAgeDays,
   //   isolationWorkspaceReaperMaxDeletesPerTick, prReviewStateReconcilerIntervalMinutes,
@@ -75,6 +75,23 @@ const SETTINGS = {
   // settings this PR does not otherwise touch, and doing it here would hide that the
   // enforcement mechanism itself is the thing that needs fixing.
   pendingBoardApprovalAttendanceGraceMs: "PENDING_BOARD_APPROVAL_ATTENDANCE_GRACE_MS",
+  // PEN-3631. Registered here rather than left in the gap described above: these
+  // seven landed as `Math.max(FLOOR, Number(env) || DEFAULT)` and the offender
+  // list below went red on the PR that introduced them — the third live catch by
+  // that ratchet. Registering them means the hostile-input table drives them for
+  // real, instead of the bounds table merely asserting that they exist.
+  //
+  // heapSnapshotThresholdMb is the one worth reading twice: its bounds are
+  // `fallback: 0, min: 0`, because 0 is the documented "automatic trigger off"
+  // state and the default. That makes the `"0"` and `"-1"` hostile inputs resolve
+  // to 0 here, which is in range rather than a clamp escape.
+  heapSnapshotKeep: "PAPERCLIP_HEAP_SNAPSHOT_KEEP",
+  heapSnapshotMinFreeGb: "PAPERCLIP_HEAP_SNAPSHOT_MIN_FREE_GB",
+  heapSnapshotThresholdMb: "PAPERCLIP_HEAP_SNAPSHOT_THRESHOLD_MB",
+  heapSnapshotAutoMinIntervalMinutes: "PAPERCLIP_HEAP_SNAPSHOT_MIN_INTERVAL_MINUTES",
+  heapSnapshotSentinelMinIntervalMinutes: "PAPERCLIP_HEAP_SNAPSHOT_SENTINEL_MIN_INTERVAL_MINUTES",
+  heapSnapshotMaxAgeMinutes: "PAPERCLIP_HEAP_SNAPSHOT_MAX_AGE_MINUTES",
+  heapSnapshotPollIntervalSeconds: "PAPERCLIP_HEAP_SNAPSHOT_POLL_SECONDS",
 } as const satisfies Record<keyof typeof NUMERIC_SETTING_BOUNDS, string>;
 
 type SettingKey = keyof typeof SETTINGS;

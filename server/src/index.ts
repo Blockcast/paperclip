@@ -2472,15 +2472,19 @@ export async function startServer(): Promise<StartedServer> {
   // off stopped the sweep with it: the moment an operator believes the exposure
   // ended was the moment it became permanent. (CTO review, PEN-3631.)
   if (config.paperclipNodeRole !== "api") {
+    // Config carries each of these in the unit its env var is written in, so
+    // the bounds key can match the field name (see NUMERIC_SETTING_BOUNDS).
+    // The conversion to the ms/bytes the service works in happens here.
     const heapSnapshotConfig = {
       dir: config.heapSnapshotDir,
       keep: config.heapSnapshotKeep,
-      minFreeBytes: config.heapSnapshotMinFreeBytes,
-      autoThresholdBytes: config.heapSnapshotAutoThresholdBytes,
-      autoMinIntervalMs: config.heapSnapshotAutoMinIntervalMs,
-      sentinelMinIntervalMs: config.heapSnapshotSentinelMinIntervalMs,
-      maxAgeMs: config.heapSnapshotMaxAgeMs,
+      minFreeBytes: config.heapSnapshotMinFreeGb * 1024 * 1024 * 1024,
+      autoThresholdBytes: config.heapSnapshotThresholdMb * 1024 * 1024,
+      autoMinIntervalMs: config.heapSnapshotAutoMinIntervalMinutes * 60 * 1000,
+      sentinelMinIntervalMs: config.heapSnapshotSentinelMinIntervalMinutes * 60 * 1000,
+      maxAgeMs: config.heapSnapshotMaxAgeMinutes * 60 * 1000,
     };
+    const heapSnapshotPollIntervalMs = config.heapSnapshotPollIntervalSeconds * 1000;
     const heapSnapshotState: {
       lastAutoSnapshotAtMs: number | null;
       lastSentinelSnapshotAtMs: number | null;
@@ -2530,7 +2534,7 @@ export async function startServer(): Promise<StartedServer> {
           maxAgeMs: heapSnapshotConfig.maxAgeMs,
           autoThresholdBytes: heapSnapshotConfig.autoThresholdBytes,
           sentinelMinIntervalMs: heapSnapshotConfig.sentinelMinIntervalMs,
-          pollIntervalMs: config.heapSnapshotPollIntervalMs,
+          pollIntervalMs: heapSnapshotPollIntervalMs,
         },
         "Heap snapshot diagnostics ENABLED — each trigger pauses this process for seconds and writes a multi-gigabyte file " +
           "containing EVERY STRING ON THIS PROCESS'S HEAP IN PLAINTEXT, including the secrets read from the environment " +
@@ -2639,7 +2643,7 @@ export async function startServer(): Promise<StartedServer> {
         } catch (err) {
           logger.error({ err, snapshotDir: heapSnapshotConfig.dir }, "Heap snapshot failed");
         }
-      }, config.heapSnapshotPollIntervalMs);
+      }, heapSnapshotPollIntervalMs);
     }
   }
   
