@@ -155,6 +155,11 @@ RUN apt-get update \
 # system site-packages; the console script is symlinked onto PATH. The
 # `graphify --version` self-check fails the build on a bad version/URL (same
 # discipline as the tinygo/java/protoc checks).
+# The committed graphs are produced by onprem-k8s's gbrain-code-sync-image
+# (keep its pin in step with this one) and can lag it: its weekly reindex only
+# rebuilds a repo whose sources changed, and some repos sit outside it. 0.9.62
+# reads 0.8.46 graphs, printing a "pre-#1504 node-ID scheme" note, but
+# `graphify update` rewrites such a graph wholesale (BLO-37348).
 ARG GRAPHIFY_VERSION=0.9.62
 RUN python3 -m venv /opt/graphify \
   && /opt/graphify/bin/pip install --no-cache-dir "graphifyy[mcp]==${GRAPHIFY_VERSION}" \
