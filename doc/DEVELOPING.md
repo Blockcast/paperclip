@@ -857,8 +857,19 @@ What follows from that:
   So when checking that the snapshot directory is clear, **match both suffixes**:
 
   ```sh
-  ls -la "$PAPERCLIP_HEAP_SNAPSHOT_DIR"/*.heapsnapshot*
+  ls -la <instance-root>/data/diagnostics/heap/*.heapsnapshot*
   ```
+
+  Spell the directory out rather than reaching for `$PAPERCLIP_HEAP_SNAPSHOT_DIR`.
+  That variable is an *optional override* (`config.ts` falls back to the path
+  above) and it is set nowhere in `deploy/helm/paperclip/`, so on both the worker
+  and the agent pod you would shell into it is unset — and
+  `ls -la "$PAPERCLIP_HEAP_SNAPSHOT_DIR"/*.heapsnapshot*` expands to
+  `ls -la /*.heapsnapshot*`, which reports `No such file or directory` no matter
+  what is sitting in the real directory. That is this paragraph's own failure
+  mode with the suffix fixed and the path wrong: a false all-clear over a
+  multi-gigabyte credential-bearing partial. If you do set the override, quote it
+  with the fallback inline — `"${PAPERCLIP_HEAP_SNAPSHOT_DIR:-<instance-root>/data/diagnostics/heap}"`.
 
   A glob ending at `.heapsnapshot` reports an empty directory while a
   multi-gigabyte credential-bearing partial sits in it. The startup warning

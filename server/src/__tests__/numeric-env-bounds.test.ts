@@ -285,6 +285,39 @@ describe("timer periods cannot overflow a 32-bit delay (BLO-27641)", () => {
 
   const timerKeys = Object.keys(TIMER_SETTING_MS_FACTOR) as (keyof typeof TIMER_SETTING_MS_FACTOR)[];
 
+  /**
+   * The timer keys this file can actually drive through the environment.
+   *
+   * `timerKeys` is every key carrying a declared ms factor; `SETTINGS` maps only
+   * those with an env var named here, and it is a strict subset. The
+   * hostile-input subtests below index `SETTINGS[key]`, so a timer key absent
+   * from it evaluated `process.env[undefined] = input` — setting an env var
+   * literally named `undefined` and then asserting against a fallback nothing
+   * had touched. Twenty subtests passed identically whatever hostile input was
+   * fed in, under names claiming overflow coverage.
+   *
+   * The ceiling assertion above still covers the dropped keys via the bounds
+   * table; what is lost is only the end-to-end env path, and the test below
+   * states exactly which keys that is rather than leaving it silently green.
+   * (Ally review, PEN-3631.)
+   */
+  const envDrivenTimerKeys = timerKeys.filter((key) => key in SETTINGS);
+
+  it("drives every timer key through env except the explicitly exempt ones", () => {
+    // Pins the omission to the existing exemption list. A new timer setting that
+    // arrives without an env var here fails this, rather than quietly joining
+    // the subtests that cannot fail.
+    const dropped = [...timerKeys].filter((key) => !(key in SETTINGS)).sort();
+    const exemptTimers = [...KNOWN_UNCOVERED_SETTINGS]
+      .filter((key) => Object.hasOwn(TIMER_SETTING_MS_FACTOR, key))
+      .sort();
+
+    expect(dropped).toEqual(exemptTimers);
+    // Guards the inverse failure: a SETTINGS rename emptying the list would
+    // otherwise make every subtest below vanish and the file still read green.
+    expect(envDrivenTimerKeys.length).toBeGreaterThan(0);
+  });
+
   it.each(Object.entries(NUMERIC_SETTING_BOUNDS))(
     "%s declares min <= fallback <= max",
     (_key, bounds) => {
@@ -327,7 +360,7 @@ describe("timer periods cannot overflow a 32-bit delay (BLO-27641)", () => {
     expect(bounds.max * TIMER_SETTING_MS_FACTOR[key]).toBeLessThanOrEqual(MAX_TIMER_DELAY_MS);
   });
 
-  describe.each(timerKeys)("%s", (key) => {
+  describe.each(envDrivenTimerKeys)("%s", (key) => {
     it.each(HOSTILE_INPUTS)("delay stays a real period for %o", (input) => {
       process.env[SETTINGS[key]] = input;
       const delayMs = loadConfig()[key] * TIMER_SETTING_MS_FACTOR[key];
