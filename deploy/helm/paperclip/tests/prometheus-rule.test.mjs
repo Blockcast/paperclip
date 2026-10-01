@@ -1497,19 +1497,18 @@ test("the start-lock runbook routes its two arms on agent count, not on an alert
     routing.includes("count(max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 900)"),
     "the one-agent section must open with the agent-count query as step 0",
   );
-  // Pin the direction, not just the word: naming the wrong arm, or dropping
-  // the `not` from the `>= 3` remedy, each tells a responder to restart
-  // during a fleet stall.
-  assert.match(
-    routing,
-    /\*\*The fleet arm takes precedence\.\*\*/,
-    "routing must say the fleet arm wins when both alerts fire",
-  );
-  assert.match(
-    routing,
-    /\| `>= 3` \|[^|]*\| do \*\*not\*\* replace the process \|/,
-    "the `>= 3` row's remedy must say do not replace the process",
-  );
+  // Pin every remedy sentence's direction, not just its words. Inverting or
+  // deleting any of the fleet-side ones tells a responder to restart during a
+  // fleet stall; inverting the below-3 row withholds the one-agent remedy.
+  for (const [text, pattern, message] of [
+    [routing, /\*\*The fleet arm takes precedence\.\*\*/, "routing must say the fleet arm wins when both alerts fire"],
+    [routing, /\| `>= 3` \|[^|]*\| do \*\*not\*\* replace the process \|/, "the `>= 3` row's remedy must say do not replace the process"],
+    [routing, /\| below 3, or no data \|[^|]*\| this section, which ends with replacing the process \|/, "the below-3 row's remedy must be this section, which ends with replacing the process"],
+    [routing, /While the count reads `>= 3`, do not apply this section's remedy to any agent/, "routing must say not to apply the one-agent remedy while the count reads >= 3"],
+    [fleetIntro, /\*\*Do NOT replace the process\.\*\*/, "the fleet-stall section must say do NOT replace the process"],
+  ]) {
+    assert.match(text, pattern, message);
+  }
 
   // FleetStall landed in onprem-k8s #4036 and is in the deployed rules, but
   // not in this chart. Both texts must name it, say where to verify what is
