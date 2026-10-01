@@ -74,6 +74,7 @@ import {
   githubPostIssueComment,
   type MergeHistoryShape,
 } from "../services/github-app-auth.js";
+import { GITHUB_REQUEST_TIMEOUT_MS } from "../services/github-fetch.js";
 import {
   buildForeignCommitNoticeBody,
   foreignCommitNoticeIdempotencyKey,
@@ -3941,6 +3942,17 @@ export async function reconcileContendedPrReviewerWakes(
         liveHeadSha = await (config.resolvePrReviewHeadSha ?? githubFetchPrHeadSha)({
           repoFullName: replay.context.repoFullName,
           prNumber: replay.context.prNumber,
+          // Not request-inline: the only production caller is the heartbeat
+          // tick, at the end of the latched recovery chain
+          // (`heartbeatRecoveryChainInFlight` in index.ts), so no GitHub
+          // delivery is held open here. It is bounded because a slow read holds
+          // that latch, and every tick skips recovery until it lets go
+          // (BLO-38257); a timed-out read degrades to the warn below. The bound is
+          // per row, not per pass: a full 50-row batch can still spend 50 x this
+          // timeout here. A pass-level budget was rejected because, once spent,
+          // it would send every later row to the frozen-head fallback, which is
+          // the duplicate-review shape this block exists to stop.
+          signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
         });
       } catch (err) {
         logger.warn(
@@ -5196,6 +5208,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         const headSha = await resolveHeadSha({
           repoFullName: context.repoFullName,
           prNumber: context.prNumber,
+          signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
         });
         if (headSha) {
           context = { ...context, headSha };
@@ -6018,6 +6031,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           const headBranchState = await githubResolveBranchState({
             repoFullName: stackedRepoFullName,
             branch: mergedBaseRef,
+            signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
           });
           if (headBranchState !== "exists") {
             logger.warn(

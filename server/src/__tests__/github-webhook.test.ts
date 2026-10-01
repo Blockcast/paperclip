@@ -5424,7 +5424,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
 
       // While deferred: the branch was pushed (head is now `liveHead`) and Ally
       // reviewed THAT head. Nothing attests `frozenHead`.
-      const resolved: Array<{ repoFullName: string; prNumber: number }> = [];
+      const resolved: Array<{ repoFullName: string; prNumber: number; signal?: AbortSignal }> = [];
       const reconciled = await reconcileContendedPrReviewerWakes(
         db,
         {
@@ -5450,7 +5450,12 @@ describeEmbeddedPostgres("github-webhook route", () => {
         new Date(Date.now() + 60_000),
       );
 
-      expect(resolved).toEqual([{ repoFullName: REPO, prNumber }]);
+      expect(resolved).toMatchObject([{ repoFullName: REPO, prNumber }]);
+      // BLO-38257: this read runs on the heartbeat tick at the end of the
+      // latched recovery chain, not inline in a webhook handler. It carries its
+      // own deadline because every second it takes holds that latch, and every
+      // tick skips recovery until it lets go.
+      expect(resolved[0]?.signal).toBeInstanceOf(AbortSignal);
       // Against the frozen head this would read `not_attested` and replay,
       // producing the duplicate; against the live head it is superseded.
       expect(reconciled).toMatchObject({ recovered: 0, superseded: 1, exhausted: 0 });
@@ -7379,7 +7384,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
 
     const fetchedHeadSha = "0123456789abcdef0123456789abcdef01234567";
     const quotedHeadSha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const lookups: Array<{ repoFullName: string; prNumber: number }> = [];
+    const lookups: Array<{ repoFullName: string; prNumber: number; signal?: AbortSignal }> = [];
     const app = buildApp({
       prReviewerAgentId: reviewerAgentId,
       resolvePrReviewHeadSha: async (input) => {
@@ -7415,7 +7420,10 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .send(body);
 
     expect(res.status).toBe(200);
-    expect(lookups).toEqual([{ repoFullName: "Blockcast/paperclip", prNumber: 1435 }]);
+    expect(lookups).toMatchObject([{ repoFullName: "Blockcast/paperclip", prNumber: 1435 }]);
+    // BLO-38257: inline read on the request-blocking webhook path — it must
+    // carry a deadline rather than inherit undici's ~300s default.
+    expect(lookups[0]?.signal).toBeInstanceOf(AbortSignal);
 
     const runs = await db
       .select({ agentId: heartbeatRuns.agentId, contextSnapshot: heartbeatRuns.contextSnapshot })
