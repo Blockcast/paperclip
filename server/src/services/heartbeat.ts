@@ -10566,6 +10566,38 @@ export function derivePaperclipPrReview(contextSnapshot: Record<string, unknown>
     // self-review, so the gate must confirm the PR was genuinely bot-authored
     // before accepting a "skipped as self-review" summary.
     prAuthorLogin: readNonEmptyString(contextSnapshot.githubPrAuthorLogin),
+    // BLO-38816: project the review-feedback classification so the woken run can
+    // tell "the reviewer found nothing" from "the findings were lost" from
+    // INSIDE the run, rather than inferring the no-op from absence. Both halves
+    // are needed and neither is redundant:
+    //
+    //  - `reviewFeedbackActionable` is written (BLO-30420) only as literal
+    //    `true`, so `=== true` is the whole reader. Its absence is ambiguous by
+    //    construction — it means "not actionable" OR "this wake predates the
+    //    writer" — which is exactly why it must NOT be the thing the directive
+    //    keys off.
+    //  - `reviewFeedbackSuppressionReason` is the positive signal: it is only
+    //    ever written when the classifier actually declined the review, so
+    //    keying the directive on its presence cannot mis-fire on a wake that
+    //    simply never ran through the classifier.
+    //
+    // The two signals are mutually exclusive for a single delivery: the webhook
+    // writes the suppression pair only when the classifier declined, and
+    // `githubReviewFeedbackActionable` only when it did not. The renderer below
+    // still checks the decline first, so if they ever did disagree the no-push
+    // arm wins — the fail-safe direction.
+    //
+    // Reader-before-writer is intentional and inert: the suppression keys are
+    // written by BLO-30420 / #1681, which has not merged. Until it does these
+    // two read null on every wake and nothing downstream changes;
+    // `reviewFeedbackActionable` is live today.
+    reviewFeedbackActionable: contextSnapshot.githubReviewFeedbackActionable === true,
+    reviewFeedbackSuppressionReason: readNonEmptyString(
+      contextSnapshot.githubReviewFeedbackSuppressionReason,
+    ),
+    reviewFeedbackSuppressionPredicate: readNonEmptyString(
+      contextSnapshot.githubReviewFeedbackSuppressionPredicate,
+    ),
   };
 }
 
@@ -12148,6 +12180,13 @@ export function buildPaperclipTaskMarkdown(input: {
     // the "YOUR pull request" possessive and the push instruction — see
     // resolveThirdPartyPrAuthor.
     prAuthorLogin?: string | null;
+    // BLO-38816: see derivePaperclipPrReview. `reviewFeedbackSuppressionReason`
+    // is the positive "classifier declined this review" signal and is what the
+    // closing directive keys off; `reviewFeedbackActionable` is informational
+    // because its absence cannot distinguish non-actionable from unclassified.
+    reviewFeedbackActionable?: boolean;
+    reviewFeedbackSuppressionReason?: string | null;
+    reviewFeedbackSuppressionPredicate?: string | null;
   } | null;
   acceptedPlanContinuation?: boolean;
   // PEN-3275: the run's write-containment notice, derived by the caller from the run
@@ -12344,6 +12383,30 @@ export function buildPaperclipTaskMarkdown(input: {
       if (prReview.reviewBody) {
         lines.push("", "Latest review body:", fenceTaskText(prReview.reviewBody));
       }
+      // BLO-38816: the classifier already decided this review carries no
+      // actionable findings and recorded WHY. Say so, so the run does not have
+      // to re-derive the verdict from an empty body — the diagnosability gap
+      // BLO-30420 exists to close, which until now stopped at the
+      // `heartbeat_runs` row and never reached the run itself.
+      const declinedReason = prReview.reviewFeedbackSuppressionReason ?? null;
+      if (declinedReason) {
+        const predicateSuffix = prReview.reviewFeedbackSuppressionPredicate
+          ? `, predicate: ${quoteTaskScalar(prReview.reviewFeedbackSuppressionPredicate)}`
+          : "";
+        lines.push(
+          "",
+          `This review was classified as carrying NO actionable findings (reason: ${quoteTaskScalar(declinedReason)}${predicateSuffix}). That verdict is recorded, not inferred from an empty body.`,
+        );
+      } else if (prReview.reviewFeedbackActionable) {
+        // The positive half of the same signal. Without it the run can only
+        // distinguish "classified actionable" from "never classified" by the
+        // absence of the decline line above, which is the inference-from-
+        // absence this issue exists to remove.
+        lines.push(
+          "",
+          "This review was classified as carrying actionable findings, so there is something concrete to address below.",
+        );
+      }
       // BLO-19067: the closing instruction must agree with the review state.
       // It used to unconditionally say "push a follow-up commit addressing
       // them", so an APPROVED review told the author to make an implementation
@@ -12358,7 +12421,15 @@ export function buildPaperclipTaskMarkdown(input: {
           ? `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here) so you know where it leaves your issue. You are not this PR's author: do NOT commit to its branch. Raise anything that needs changing as a PR comment, or act in your own branch. ${commonClosing}`
           : normalizedReviewState === "approved"
             ? `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here). It APPROVED your PR, so no implementation pass is required: do NOT push a no-op or invented follow-up commit, because any new push invalidates this approval and restarts CI. Act on a note only if it identifies a real defect; otherwise proceed to merge once required checks pass. ${commonClosing}`
-            : `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here). If the findings are correct, push a follow-up commit addressing them. If they are wrong or out of scope, reply on the PR with rationale. ${commonClosing}`,
+            // BLO-38816: same damage shape as the APPROVED arm above — a run
+            // told to "push a follow-up commit addressing them" when there is
+            // nothing to address pushes a no-op, which restarts CI and (on a
+            // queued PR) ejects the entry. Declining to render the directive is
+            // the load-bearing half; the named reason alone would still ship
+            // the contradiction.
+            : declinedReason
+              ? `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here). It records NO actionable findings, so no implementation pass is required: do NOT push a follow-up or invented commit on the strength of it. If you believe that classification is wrong, reply on the PR with rationale instead of pushing. ${commonClosing}`
+              : `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here). If the findings are correct, push a follow-up commit addressing them. If they are wrong or out of scope, reply on the PR with rationale. ${commonClosing}`,
       );
     } else {
       lines.push(
