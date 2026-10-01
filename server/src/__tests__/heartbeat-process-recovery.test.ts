@@ -6702,8 +6702,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // assertions can tell those two placements apart — this assertion is the only
     // one that regresses if the gate ever drifts back inside the transaction.
     //
-    // Measured on production 2026-09-29: this arm suppressed 994 of 2,234
-    // candidates in a pass that acted on 4 rows and took 29m21s, 85% of the chain.
+    // The production measurement that motivated the hoist is on PEN-3636; as with
+    // the gate comment in `service.ts`, it is not restated here, because it dates
+    // a single pass and will not be re-verified against this test.
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "cancelled",
