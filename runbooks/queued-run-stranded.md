@@ -465,22 +465,34 @@ Source: `server/src/services/agent-start-lock.ts` (`withAgentStartLock`,
 (`AGENT_START_LOCK_HELD_SECONDS_METRIC`, `setAgentStartLockHeldMetrics`),
 `server/src/services/scrape-metrics-collector.ts`
 (`refreshAgentStartLockMetrics`)
-Trigger: **two alerts**, since `Blockcast/onprem-k8s#4036` landed the BLO-36522
+Trigger: **two alerts** at Blockcast, plus a third expression in the chart copy.
+
+Blockcast's live rules, since `Blockcast/onprem-k8s#4036` landed the BLO-36522
 retune as a split rather than a single retuned rule (`#3985`, the single-rule
 form this section was originally written against, was closed superseded):
 
 | alert | expression | `for` | regime |
 |---|---|---|---|
-| `PaperclipAgentStartLockWedged` | `max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 14400` | 5m | one agent, **>4h** — no hold past 4h has been observed to settle |
-| `PaperclipAgentStartLockFleetStall` | `count(max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 900) >= 3` | 10m | **≥3 agents** in lockstep — measured to self-clear |
+| `PaperclipAgentStartLockWedged` | `max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 14400` | 5m | one agent, **>4h** -- no hold past 4h has been observed to settle |
+| `PaperclipAgentStartLockFleetStall` | `count(max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 900) >= 3` | 10m | **>=3 agents** in lockstep -- measured to self-clear |
 
 Both are live: verified loaded at `/api/v1/rules` on 2026-09-30, and the
 `>300`-for-5m rule this section used to describe is gone.
-The rules are quoted here for readability only and live in a different repo —
-the source of record is the lockstep pair `paperclip/paperclip-runtime-alerts-prometheusrule.yaml`
-and `monitoring/prometheus-rules-2-configmap.yaml` in `Blockcast/onprem-k8s`.
-Read the numbers there before acting on either one.
-Owner: Platform / SRE (PEN-3305)
+
+The chart copy in this repo renders only the per-agent arm,
+`max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 14400` for 5m,
+wired to `deploy/helm/paperclip/values.yaml`
+`prometheusRule.agentStartLockHeldSeconds` -- which is the source of record for
+it, pinned by the chart test to `LOCK_ABORT_MS` in `agent-start-lock.ts` and
+**not** to the `LOCK_HELD_ERROR_MS` log budget (PEN-3328). Its threshold now
+matches the live wedge arm; it still has **no fleet-stall arm**.
+
+All of these are quoted here for readability only and the live ones live in a
+different repo -- the source of record is the lockstep pair
+`paperclip/paperclip-runtime-alerts-prometheusrule.yaml` and
+`monitoring/prometheus-rules-2-configmap.yaml` in `Blockcast/onprem-k8s`.
+Read the numbers there before acting on any of them.
+Owner: Platform / SRE (PEN-3305, re-fitted in PEN-3328)
 
 ### ⚠️ What these alerts claim, and what they no longer claim (BLO-36522)
 
@@ -585,11 +597,17 @@ what a run that spends its life waiting on the start lock would look like.
 
 ### The invariant, and why it is a cause alert rather than a consequence one
 
-`withAgentStartLock` serializes queued-run dispatch per agent. It has **no
-timeout, no TTL and no owner-liveness check**, deliberately: the defect
-BLO-20396 removed was a timeout that let a waiter run *alongside* the holder.
-The lock is released if and only if `fn` settles, so a critical section that
-never settles holds its agent's lock for the life of the process.
+`withAgentStartLock` serializes queued-run dispatch per agent. It has **no TTL
+and no owner-liveness check**, deliberately: the defect BLO-20396 removed was a
+timeout that let a waiter run *alongside* the holder, so mutual exclusion is
+never downgraded by a clock. PEN-3328 added the only bound that is safe under
+that constraint — the section is **cancellable**. At `LOCK_ABORT_MS` (4h) its
+abort signal fires, `fn` rejects, and the lock releases through the `finally`
+that was always there. One section at a time, always.
+
+That bound is not a cure, which is why this alert still exists. Cancellation
+only reaches awaits that observe the signal, so a section wedged on something
+that ignores it (a socket with no timeout, a promise that never settles) holds its
 
 ⚠️ **"Never settles" is the limiting case, and it is NOT what the observed
 episodes are** (BLO-36522). The mechanism above is real and unchanged — there
@@ -618,13 +636,23 @@ instruction, not an observation that the hold required one** (see the
 qualification above).
 
 In this chart copy, `PaperclipQueuedRunStranded` above fires on the
-*consequence* of this and will usually fire too, a while later. In Blockcast's
-live `onprem-k8s` rules that per-agent form is gone (BLO-29665), and its
-successor `PaperclipQueuedRunStrandedFleet` fires on the consequence only once
-≥5 agents strand at once (see the coverage note above). Neither can tell you
-the cause: a queued run strands identically under slot starvation, a
-scheduler-tick gap or a dropped dispatch. This alert names the mechanism
-directly, and fires sooner.
+*consequence* of this, and since PEN-3328 moved this alert onto the 4h abort
+boundary the consequence now surfaces **sooner** than the cause pages:
+`warning` at ~29m (1440s + `for: 5m`, and gated on
+`paperclip_queued_run_age_metrics_refresh_success == 1`) against this alert's
+`critical` at 4h05m. That ordering is deliberate — the consequence is worth
+surfacing early and cheaply, the cause is worth *paging* on only once the abort
+has been given its chance to land. Note what it means in practice: for the first
+four hours a genuine wedge is a warning nobody is woken for. That is the
+accepted cost of not paging on the settling tail, which cost twenty false
+critical pages at the old 300s threshold. In Blockcast's live `onprem-k8s` rules
+that per-agent form is gone (BLO-29665), and its successor
+`PaperclipQueuedRunStrandedFleet` fires on the consequence only once ≥5 agents
+strand at once (see the coverage note above) — this chart copy still renders the
+per-agent `PaperclipQueuedRunStranded`. Neither can tell you the cause: a queued
+run strands identically under slot starvation, a scheduler-tick gap or a dropped
+dispatch. This alert names the mechanism directly, and it is the one that means
+a human must act.
 
 ### What to do when paged
 
@@ -646,21 +674,35 @@ kubectl logs -n paperclip paperclip-0 | grep "agent start lock held"
 ```
 
 `agent start lock held longer than expected` (warn, every 30s) is a section
-that is slow. `agent start lock held far past its budget; queued-run dispatch
-for this agent has stopped` (error, first at 5m then every 5m) is driven by
-`LOCK_HELD_ERROR_MS` (300s) in `agent-start-lock.ts`.
+that is slow. `agent start lock held far past its warn budget; queued-run
+dispatch for this agent is still running but overdue` (error, first at 5m then
+every 5m) means the section has passed the point where an operator should look
+— **it is not what this alert fires on, and it is usually a section that will
+settle by itself.** The line this alert fires on is `agent start lock held past
+its abort budget and the abort has not landed` (error, from 4h), whose `aborted`
+field reads `true`.
 
 ⚠️ **The log line and these alerts deliberately no longer share a number.**
 Before BLO-36522 the alert was pinned to `LOCK_HELD_ERROR_MS` at 300s so "the
-log line and the page cannot disagree". That pinning was abandoned on purpose:
-300s is the right boundary for the *log* — it is where the code stops calling a
-hold slow
-— but as an alert threshold it fires on 2,730 agent-minutes a week of routine
-contention. So the log answers *"is this hold slow?"* and the alert answers
-*"is the fleet stalled at once?"*. The cost is real and accepted: **an
-operator grepping the 300s log line will find entries with no corresponding
-page, and that is correct.** Expect roughly 390 agent-minutes of these per day
-fleet-wide with nothing wrong.
+log line and the page cannot disagree". That pinning was abandoned on purpose,
+in both the live rules and the chart copy: 300s is the right boundary for the
+*log* -- it is where the code stops calling a hold slow -- but as an alert
+threshold it fires on 2,730 agent-minutes a week of routine contention. So the
+log answers *"is this hold slow?"*, the live fleet arm answers *"is the fleet
+stalled at once?"*, and the per-agent arm (live and in the chart) answers *"has
+this agent passed the 4h abort boundary?"*.
+
+The chart's threshold is `prometheusRule.agentStartLockHeldSeconds`, pinned to
+`LOCK_ABORT_MS` (4h). The two were the same number until PEN-3328 and
+deliberately are not any more: over the 14 days to 2026-09-25, 21 agents held
+past 300s (peak 8073s / 2h14m) and the old 300s alert reached `firing` for 20
+of them, every one of which resolved with no pod recreation and no container
+restart. Escalating a log line early costs a log line; paging early routes a
+responder to Step 4 pod replacement for a section that was going to finish.
+
+The cost is real and accepted: **an operator grepping the 300s log line will
+find entries with no corresponding page, and that is correct.** Expect roughly
+390 agent-minutes of these per day fleet-wide with nothing wrong.
 
 #### Step 2 — do NOT clear the agent as healthy
 
@@ -726,6 +768,16 @@ count with nothing queued — a stuck transaction — alongside zero dispatches.
   6-19 h) trips both, because each of those agents is past `14400`s. Do not
   let the `FleetStall` self-clear evidence overrule it -- that evidence stops
   at 2h14m.
+
+**Since PEN-3328 the usual case self-heals, and you should confirm that before
+reaching for a restart.** The dispatch critical section is cancellable: at
+`LOCK_ABORT_MS` (4h) the section's abort signal fires, its in-flight database
+work is cancelled for real, `fn` rejects, and the lock is released through the
+`finally` that was already there. The agent resumes dispatching and its queued
+runs are not lost. When that happens you will see
+`PaperclipAgentStartLockAborted` rather than this alert — see the section
+below, and prefer chasing *why* a section blocked for four hours over treating
+the recovery as the end of it.
 
 **This step used to read "the section must settle or the process must be
 replaced" and prescribe `kubectl delete pod`. That prescription is withdrawn
@@ -795,11 +847,40 @@ observed end to end (2h14m) released on its own well inside that. On a
 `Wedged` page, which fires at about 4h05m, that floor lands roughly 1h55m
 after the page (per-arm list at the top of this step).
 
-The real fix — making the critical section's awaits abortable so `fn` rejects
-and releases the lock through the existing `finally` — is out of scope of the
-observability change that added this alert, and is recorded in the module
-header. Abandoning a still-pending `fn` on a timer is **not** that fix: it
-reintroduces the BLO-20396 defect of two sections running at once.
+⚠️ Note the gate deliberately sits about two hours beyond the page. This alert
+fires at 4h05m; the `[6h]` window above cannot be satisfied until the hold is
+roughly six hours old. That gap is intentional — it is the difference between
+"wake someone" and "authorise a shared-infrastructure mutation".
+
+Because this alert's threshold **is** that abort boundary, it firing means
+something narrower and more serious than it did before PEN-3328: the abort was
+requested and did **not** land. Cancellation can only reach awaits that observe
+the signal — today, database work — so a section wedged on anything else (an
+unbounded socket, an in-process promise that never settles) still holds its
+lock. The agent row's `dispatchHealth` distinguishes the two directly, reading
+`stalled` for a requested-but-unlanded abort versus `aborted` for one that
+landed; read it **on the worker pod**, since the api tier never holds a lock
+and so always reports `null` there.
+
+⚠️ **A hold shorter than 4h is not this alert and is not grounds for a
+restart.** Holds of minutes to hours are the normal case, not the pathological
+one: over the 14 days to 2026-09-25, 21 agents held past 300s with a peak of
+8073s (2h14m), and every one released on its own with no pod recreation and no
+container restart. Before PEN-3328 this page sat at 300s and fired on 20 of
+them. If you are reading a `held far past its warn budget` log line with
+`aborted: false`, the abort has not been requested yet — the section is
+overdue, not wedged, and the remedy below is the wrong one.
+
+For the genuine residue there is still no in-process remedy: the abort has
+already been tried and did not take, so the section must settle or the process
+must be replaced. Deleting the worker pod clears it (`kubectl delete pod -n
+paperclip paperclip-0`) and the queued runs then dispatch normally. Capture the
+pool gauges and the `agent start lock held` lines **before** restarting; the
+restart destroys the only evidence of which section was stuck.
+
+Abandoning a still-pending `fn` on a timer is **not** an acceptable extension of
+this: it reintroduces the BLO-20396 defect of two sections running at once.
+Cancellation makes `fn` finish; it must never make the lock stop waiting for it.
 
 ### Verifying the signal is live
 
@@ -832,26 +913,95 @@ does **not** make the page live. The rule must also land in the two lockstep
 must be synced (BLO-19095). Verify at `/api/v1/rules` before relying on it.
 
 ⚠️ **KNOWN DIVERGENCE, accepted and recorded rather than fixed (BLO-36522).**
+Three numbers are now in play and they are not interchangeable: the 300s log
+budget (`LOCK_HELD_ERROR_MS`, unchanged), the 14400s per-agent page
+(`LOCK_ABORT_MS`), and the live fleet-stall expression. Both the live rules and
+the chart have abandoned the old "pin the page to the log budget" policy.
+
 The BLO-36522 retune shipped to the two `Blockcast/onprem-k8s` copies (the only
-ones that fire at Blockcast) in `Blockcast/onprem-k8s#4036`, merged
-2026-09-28 and verified loaded at `/api/v1/rules` on 2026-09-30. It is
-**deliberately not** in the chart copy above, which still carries `max by (agent_id) (...) > 300` for 5m wired to
-`prometheusRule.agentStartLockHeldSeconds` / `LOCK_HELD_ERROR_MS`. It renders
-nothing here, so this costs Blockcast nothing today. It is a landmine for
-anyone who enables that chart elsewhere: they would get the pre-retune
-behaviour, i.e. a critical page on every single-agent hold past 300s, roughly
-390 agent-minutes a day. **Before setting `prometheusRule.enabled: true` in
-any installation, port this retune to the chart first.**
+ones that fire at Blockcast) in `Blockcast/onprem-k8s#4036`, merged 2026-09-28
+and verified loaded at `/api/v1/rules` on 2026-09-30. PEN-3328 then re-pinned
+the chart copy above to the abort boundary, so the chart no longer carries the
+pre-retune `> 300` and no longer pages on every single-agent hold past 300s.
+
+The chart renders nothing at Blockcast (`prometheusRule.enabled: false`), so
+this costs Blockcast nothing today. For anyone enabling that chart elsewhere
+the landmine is no longer "you get a 300s page" -- PEN-3328 removed that -- it
+is that **the chart is only half of the live policy**: it renders the per-agent
+wedge arm at the same 14400 the live rule uses, and has no fleet-stall arm at
+all. Port that arm from #4036 before setting `prometheusRule.enabled: true`.
+Do not instead port `> 900` into the existing arm expecting it to mean what
+14400 means here: a fleet-count expression and a per-agent abort boundary
+answer different questions.
 
 The divergence is not only the number. The *rationale prose* beside it —
 `deploy/helm/paperclip/values.yaml` (`agentStartLockHeldSeconds`) and
-`deploy/helm/paperclip/tests/prometheus-rule.test.mjs` — still argues for
-pinning the alert to `LOCK_HELD_ERROR_MS` "so the log line and the page cannot
-disagree", which is the exact policy this retune abandoned, and the test
-comment's premise that "any positive threshold is silent in steady state" is
-measurably false. Both now carry a `BLO-36522` cross-reference pointing here,
-so neither reads as live policy; the chart test's `300` assertion deliberately
-still stands, because it guards the number this chart actually renders.
+`deploy/helm/paperclip/tests/prometheus-rule.test.mjs` — carries a `BLO-36522`
+cross-reference pointing here so that neither reads as live Blockcast policy,
+and the chart test's threshold assertion deliberately still stands, because it
+guards the number this chart actually renders.
+
+## Agent start lock aborted (PEN-3328)
+
+`PaperclipAgentStartLockAborted` — `warning`, not a page.
+
+### What it means
+
+A queued-run dispatch section held its agent's start lock past `LOCK_ABORT_MS`
+(4h), was cancelled, and the lock was released. **Dispatch has already resumed
+and no queued runs were lost.** Nobody needs waking; this is a post-mortem.
+
+### Why it is a separate alert, and not redundant with the wedge alert
+
+The two fire on opposite outcomes of the same fault, and the wedge alert
+structurally cannot cover this one. `paperclip_agent_start_lock_held_seconds`
+is emitted **only for locks held at scrape time** (`reset()` then set). Both
+rules sit on the same 4h boundary, and the wedge alert's `for: 5m` is what
+separates them: a landed abort deletes the series within a scrape, so that
+window never completes and only an *unlanded* abort pages. A successful
+cancellation is therefore invisible to the wedge alert — the incident
+disappears precisely because it was handled.
+`paperclip_agent_start_lock_aborted_total` is a counter, so it survives the
+release and keeps the event answerable afterwards.
+
+### What to do
+
+**Do not close this on the strength of the recovery.** The cancellation bounded
+the damage; it did not fix whatever blocked the section. Holds of minutes to a
+couple of hours do settle on their own — the worst measured was 8073s (2h14m)
+— so a section that reached 4h outran that tail by ~1.8× and is not the
+slow-but-healthy case.
+
+1. Read `dispatchHealth` on the agent row **on the worker pod** — `aborted`
+   carries the post-mortem (`heldMs`, `abortedAt`). Via the API it will read
+   `null`: the api tier never holds a lock, so it cannot answer.
+2. Correlate with the `agent start lock held past its abort budget` error log
+   for the same `agentId`.
+3. Apply Step 3 of the wedged section above — the pool-versus-lock split and
+   its trap — since the candidate causes are identical.
+
+**A repeat for one `agent_id` is the thing to escalate.** Recurring aborts mean
+cancellation is masking a persistent condition rather than clearing a transient
+one; the likely candidates are pool exhaustion (`max: 10`, no acquire timeout)
+and a circular advisory-lock wait in `lockIssueOwnership`.
+
+### Verifying the signal is live
+
+```
+paperclip_agent_start_lock_aborted_total
+```
+
+Counter, labelled by `agent_id`, so it is absent until the first abort — an
+empty result is the expected healthy reading and does **not** indicate a broken
+scrape. To prove it end-to-end, hold a lock on an *abortable* await in a
+scratch process and advance past 300s; the wedge gauge climbs, then vanishes as
+the counter increments by one.
+
+Same onprem-k8s lockstep caveat as every section above: the chart copy does not
+deploy on Blockcast (`prometheusRule.enabled: false`), so merging this
+repository alone does **not** make this alert live. It must also land in the two
+lockstep `Blockcast/onprem-k8s` alert files — tracked as **PEN-3338** alongside
+`PaperclipAgentStartLockWedged`. Verify at `/api/v1/rules` before relying on it.
 
 ## References
 
