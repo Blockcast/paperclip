@@ -242,11 +242,19 @@ function deferred<T = void>() {
  * Nothing this suite asserts may depend on the machine reaching a state within
  * a particular wall-clock span — that dependency is exactly what ejected merge
  * groups (PEN-3654), so the deadline is set far beyond any plausible CI stall.
+ *
+ * It must nonetheless stay strictly BELOW the enclosing test budget, or vitest
+ * kills the case first and the named message below is unreachable — which would
+ * reintroduce the opaque timeout this helper exists to remove. This package sets
+ * `testTimeout: 60_000` (vitest.config.ts, BLO-37114); the single case using
+ * this helper arms two backstops in sequence, so 15s each bounds the diagnostic
+ * path at 30s and leaves the same again for the PGlite work itself. Raising this
+ * past ~25s silently disarms the second one.
  */
 async function waitUntil(
   condition: () => boolean,
   describeFailure: () => string,
-  timeoutMs = 30_000,
+  timeoutMs = 15_000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!condition()) {
