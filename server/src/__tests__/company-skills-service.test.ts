@@ -2142,6 +2142,15 @@ describeEmbeddedPostgres("companySkillService.list", () => {
   it("retires the published tree by rename when a skill is deleted (BLO-32167)", async () => {
     const companyId = randomUUID();
     const { skillId, publishedDir } = await seedRematerializingSkill(companyId, "delete");
+    // The seed attaches the skill to an agent, which is what gets it published
+    // in the first place. `deleteSkill` refuses an attached skill with a 422
+    // *before* it tears anything down, so detach first — otherwise this test
+    // asserts against the pre-BLO-32167 ordering, where the teardown ran ahead
+    // of the guard and destroyed the tree on a call that then threw.
+    await db
+      .update(agents)
+      .set({ adapterConfig: { paperclipSkillSync: { desiredSkills: [] } } })
+      .where(eq(agents.companyId, companyId));
     const rm = recordRmTargets();
 
     try {
@@ -2159,7 +2168,7 @@ describeEmbeddedPostgres("companySkillService.list", () => {
   // re-import — need a local-path source rig to drive, so guard them where the
   // regression would actually be written instead. `fs.rm` on a published
   // runtime path is the defect; the only sanctioned teardown is
-  // `removeDirectoryByRename`. Fails for a fourth site added later, too.
+  // `removeDirectoryByRename`.
   it("never tears down a published runtime skill path with fs.rm (BLO-32167)", async () => {
     const source = await fs.readFile(
       new URL("../services/company-skills.ts", import.meta.url),
@@ -2167,6 +2176,14 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     );
     const teardowns = source.match(/\w+\.rm\(\s*resolveRuntimeSkillMaterializedPath\(/g) ?? [];
     expect(teardowns).toEqual([]);
+    // The scan above only sees the teardown when the resolve call is written
+    // inline as the first argument, so `const dir = resolve…(); fs.rm(dir)`
+    // escapes it. Pin the count of sanctioned teardowns instead: that fails
+    // when a site is refactored *away* from `removeDirectoryByRename` whatever
+    // replaces it, and when a fourth site is added without being read here.
+    const sanctioned =
+      source.match(/removeDirectoryByRename\(\s*resolveRuntimeSkillMaterializedPath\(/g) ?? [];
+    expect(sanctioned).toHaveLength(3); // reconcile, re-import, delete
     // Negative control: the guard can only mean anything if the pattern it
     // scans for is the one these call sites actually use.
     expect(source).toMatch(/removeDirectoryByRename\(resolveRuntimeSkillMaterializedPath\(/);
