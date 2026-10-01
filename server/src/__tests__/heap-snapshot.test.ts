@@ -198,6 +198,52 @@ describe("pruneHeapSnapshots", () => {
     ]);
   });
 
+  it("reaps a future-stamped .partial, which no other bound can ever reach", () => {
+    // The completed path clamps a future stamp in retentionKeyMs; this path did
+    // not, and here it is worse: nowMs - startedAtMs goes NEGATIVE, so the
+    // abandonment comparison is true on every sweep forever. collectPrunable is
+    // the only partial deleter besides takeHeapSnapshot's own failure catch,
+    // and a partial has no `keep` bound behind it, so this window is the only
+    // retirement mechanism it has. Disabling it permanently strands a
+    // multi-gigabyte plaintext-secret file on the shared claim — visible via
+    // listResidualHeapSnapshots, under a startup warning promising the poll
+    // will collect it, and not removed by disabling capture either.
+    //
+    // No adversary is needed: the name comes from the WRITING pod's clock, so a
+    // forward-skewed pod that OOMs mid-write leaves exactly this file relative
+    // to a correctly-clocked sweeper — and OOM mid-write is this feature's own
+    // documented failure mode on the worker it diagnoses.
+    const nowMs = Date.parse("2026-09-29T23:00:00.000Z");
+    const future = `2027-01-01T00-00-00-000Z-pid1${HEAP_SNAPSHOT_EXTENSION}.partial`;
+    // Stamp in 2027, mtime in 1970: stranded by every measure except the stamp.
+    writeSnapshotFile(future, 1000);
+
+    // Control: a `keep` of 10 cannot be what removes it — a partial is never
+    // priced against the retention cap — so the removal below is attributable
+    // to the abandonment window and nothing else.
+    expect(pruneHeapSnapshots(dir, 10, NEVER_EXPIRES, nowMs)).toEqual([future]);
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  it("still spares a future-stamped .partial whose mtime is fresh, so a peer write survives", () => {
+    // The complement, and the reason the clamp falls back to mtime rather than
+    // to nowMs. A genuinely in-flight write from a forward-skewed peer carries
+    // a fresh mtime, and must keep the protection the window exists to give —
+    // otherwise the fix above degenerates into deleting a peer's write on
+    // sight, which is the problem the stamp-first rule was introduced to avoid.
+    //
+    // This case is also what rules out `Math.min(stamped, nowMs)`: that clamp
+    // re-pins startedAtMs to nowMs on every sweep, so elapsed is 0 each time
+    // and BOTH this file and the stranded one above stay permanently "just
+    // started". It would pass this assertion and fail the previous one.
+    const nowMs = Date.parse("2026-09-29T23:00:00.000Z");
+    const inflight = `2027-01-01T00-00-00-000Z-pid1${HEAP_SNAPSHOT_EXTENSION}.partial`;
+    writeSnapshotFile(inflight, (nowMs - MINUTE_MS) / 1000);
+
+    expect(pruneHeapSnapshots(dir, 10, NEVER_EXPIRES, nowMs)).toEqual([]);
+    expect(readdirSync(dir)).toEqual([inflight]);
+  });
+
   it("expires a completed snapshot whose name it did not write, however fresh its mtime", () => {
     // The hole this closes. `maxAgeMs` is the exposure window and is documented
     // as stamp-based precisely so a reader cannot extend it by touching the
@@ -966,24 +1012,73 @@ describe("decideHeapSnapshot", () => {
     }
   });
 
-  it("keeps taking threshold snapshots while the sentinel is rate-limited", () => {
-    // Same independence as the unclaimable case above, and the same damage if
-    // it returns early instead: a declined request says nothing about the heap
-    // either. Anything re-creating the sentinel once per poll — a retry
-    // wrapper, a cron drop, an operator retouching while waiting the interval
-    // out — makes every poll take the rate-limited branch, so a long
-    // sentinelMinIntervalMs becomes a window with no sentinel capture *and* no
-    // threshold evaluation while the heap climbs. Rationing the request path
-    // must not ration the unattended one.
+  it("throttles a rate-limited sentinel at the shipped interval relationship", () => {
+    // What production actually does, asserted at a LEGAL configuration. The
+    // previous version of this case certified the fall-through at
+    // autoMinIntervalMs: 0, which NUMERIC_SETTING_BOUNDS forbids (min: 1
+    // minute) — so it could not catch a regression in the shipped config.
+    //
+    // Reaching the rate-limited branch needs now - lastSentinel <
+    // sentinelMinIntervalMs; the threshold arm then needs
+    // now - max(lastAuto, lastSentinel) >= autoMinIntervalMs. That max is
+    // >= lastSentinel, so the conjunction holds only when
+    // autoMinIntervalMs < sentinelMinIntervalMs. The fallbacks are the inverse
+    // (120 min vs 5 min), so here it throttles — which is correct either way,
+    // because the suppression window the fall-through was written for is now
+    // closed by the threshold arm's own Math.max spacing.
     const cfg = config({
       autoThresholdBytes: GB / 2,
-      autoMinIntervalMs: 0,
+      autoMinIntervalMs: 2 * 60 * 60 * 1000,
       sentinelMinIntervalMs: 5 * MINUTE_MS,
     });
     const nowMs = new Date("2026-09-29T23:00:00.000Z").getTime();
     const sentinelPath = path.join(dir, HEAP_SNAPSHOT_SENTINEL_BASENAME);
     const declined = (): ReturnType<typeof state> =>
       state({ lastSentinelSnapshotAtMs: nowMs - MINUTE_MS });
+
+    // Control: the same config with the last capture beyond BOTH intervals does
+    // fire, so the null below is the spacing rather than the threshold going
+    // unmet or the config being inert.
+    expect(
+      decideHeapSnapshot(
+        cfg,
+        state({ lastSentinelSnapshotAtMs: nowMs - 3 * 60 * 60 * 1000 }),
+        runtime(),
+      ).trigger,
+    ).toBe("threshold");
+
+    writeFileSync(sentinelPath, "");
+    const decision = decideHeapSnapshot(cfg, declined(), runtime());
+
+    expect(decision).toEqual({ trigger: null, sentinel: "rate-limited" });
+    // Consumed and still spoken about: throttling does not quietly turn a
+    // declined request into a silent one.
+    expect(existsSync(sentinelPath)).toBe(false);
+    expect(describeSentinelOutcome(decision, cfg, declined())?.level).toBe("info");
+  });
+
+  it("keeps taking threshold snapshots while the sentinel is rate-limited", () => {
+    // The fall-through is not dead code: autoMinIntervalMs < sentinelMinIntervalMs
+    // is a legal configuration (both bound at min: 1 minute), and under it this
+    // branch is the difference between watching the heap and not. It is simply
+    // not the shipped relationship — the case above pins that one.
+    //
+    // Same independence as the unclaimable case, and the same damage if it
+    // returns early instead: a declined request says nothing about the heap.
+    // Anything re-creating the sentinel once per poll — a retry wrapper, a cron
+    // drop, an operator retouching while waiting the interval out — makes every
+    // poll take this branch, so a long sentinelMinIntervalMs becomes a window
+    // with no sentinel capture *and* no threshold evaluation while the heap
+    // climbs. Rationing the request path must not ration the unattended one.
+    const cfg = config({
+      autoThresholdBytes: GB / 2,
+      autoMinIntervalMs: MINUTE_MS,
+      sentinelMinIntervalMs: 5 * MINUTE_MS,
+    });
+    const nowMs = new Date("2026-09-29T23:00:00.000Z").getTime();
+    const sentinelPath = path.join(dir, HEAP_SNAPSHOT_SENTINEL_BASENAME);
+    const declined = (): ReturnType<typeof state> =>
+      state({ lastSentinelSnapshotAtMs: nowMs - 2 * MINUTE_MS });
 
     // Control: with no sentinel this config fires, so a null below is the
     // sentinel suppressing it rather than the threshold simply not being met.

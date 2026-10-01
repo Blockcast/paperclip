@@ -87,9 +87,17 @@ const SIZE_ESTIMATE_MULTIPLIER = 2;
  * `writeHeapSnapshot` serialises incrementally; mtime is rewritten by ordinary
  * retrieval tooling; and unlike a completed snapshot a partial has no `keep`
  * bound behind it, so mtime was the *only* thing retiring it. That made the
- * exposure indefinitely extensible by a reader. The stamp is not mutable that
- * way. (Ally review Suggestion 1, promoted to a condition of acceptance by the
- * CEO on PEN-3631.)
+ * exposure indefinitely extensible by a reader. (Ally review Suggestion 1,
+ * promoted to a condition of acceptance by the CEO on PEN-3631.)
+ *
+ * "Not mutable that way" is as far as the stamp's immutability goes, and an
+ * earlier version of this comment overstated it. The stamp resists `touch`; it
+ * does not resist `mv`, and it does not resist a forward-skewed writer clock.
+ * Because this window is the ONLY retirement mechanism a partial has, a stamp
+ * ahead of the sweeper's `nowMs` would make it immortal rather than merely
+ * mis-ordered — so `collectPrunable` falls back to mtime for a future stamp
+ * exactly as it does for an unparseable name. The reasoning is at that call
+ * site; it is the reason this constant is still a sound bound.
  *
  * The liveness this gives up is a write that runs longer than this window being
  * swept mid-flight. That is bounded by a wide margin: the pause is single-digit
@@ -428,18 +436,47 @@ function collectPrunable(
     if (!isPartialSnapshot(name)) continue;
     try {
       const stats = statSync(path.join(dir, name));
-      // Filename stamp first; mtime only for a file this module did not name,
-      // where there is nothing else to go on. See PARTIAL_ABANDONED_AFTER_MS.
+      // Filename stamp first; mtime when the stamp is absent OR ahead of now.
+      // See PARTIAL_ABANDONED_AFTER_MS.
       //
       // Deliberately NOT routed through `retentionKeyMs`. The completed path
       // keys an unparsed name at 0 because its only bound is `maxAgeMs`, which
-      // mtime made evadable without limit. Here the bound is a fixed 10-minute
-      // abandonment window, so the exposure is capped either way — and keying
-      // at 0 would delete every stampless partial on sight, including a peer's
-      // genuinely in-flight write. The two paths differ because what they are
-      // protecting against differs. (Ally review noted the shared shape and
-      // that this bound caps it; PEN-3631.)
-      const startedAtMs = snapshotStampMs(name) ?? stats.mtimeMs;
+      // mtime made evadable without limit. Keying at 0 here would delete every
+      // stampless partial on sight, including a peer's genuinely in-flight
+      // write. The two paths differ because what they are protecting against
+      // differs. (Ally review noted the shared shape; PEN-3631.)
+      //
+      // But the FUTURE-stamp clamp `retentionKeyMs` applies is needed here too,
+      // and the earlier version of this comment was wrong to say the fixed
+      // 10-minute window "caps the exposure either way". That holds for a name
+      // this module did not parse; it does not hold for one stamped ahead of
+      // `nowMs`, which makes `nowMs - startedAtMs` NEGATIVE, so the comparison
+      // below is true on every sweep forever. `collectPrunable` is the only
+      // partial deleter besides `takeHeapSnapshot`'s own failure `catch`, and a
+      // partial has no `keep` bound behind it (see the header at the top of
+      // this file), so this window is the ONLY retirement mechanism a partial
+      // has. A negative elapsed value disables it permanently — and the file
+      // stays visible via `listResidualHeapSnapshots`, under a startup warning
+      // promising the poll will collect it once it ages out, which it never
+      // will. Disabling capture does not remove it either.
+      //
+      // The no-adversary route is the one that matters: the name comes from the
+      // WRITING pod's clock (`takeHeapSnapshot` builds it from `runtime.now()`),
+      // so a forward-skewed pod that OOMs mid-write leaves a future-stamped
+      // partial relative to a correctly-clocked sweeper. OOM mid-write is this
+      // feature's own documented failure mode on the worker it diagnoses.
+      //
+      // Clamp forward to MTIME, not to `nowMs`. `Math.min(stamped, nowMs)` reads
+      // as the obvious fix and silently does not work: it re-pins `startedAtMs`
+      // to `nowMs` on every sweep, so elapsed is 0 each time and the file is
+      // permanently "just started" until the wall clock overtakes the stamp.
+      // Falling back to mtime instead puts a future-stamped partial in exactly
+      // the posture this path already accepts for an unparseable name — a
+      // genuinely in-flight peer write is still spared by its fresh mtime,
+      // while a stranded one ages out in ten minutes.
+      // (Ally review of 320def5, Important 1; PEN-3631.)
+      const stamped = snapshotStampMs(name);
+      const startedAtMs = stamped === null || stamped > nowMs ? stats.mtimeMs : stamped;
       if (nowMs - startedAtMs < PARTIAL_ABANDONED_AFTER_MS) continue;
       prunable.push({ name, sizeBytes: stats.size });
     } catch {
@@ -861,16 +898,34 @@ export interface HeapSnapshotDecision {
  * through to the threshold arm. The two triggers are independent — separate
  * config, separate interval, separate state field — and neither a request file
  * the worker cannot delete nor one the rate limit turned away says anything
- * about the heap. Returning early on either would suppress automatic capture
- * for as long as the condition held, which is the whole life of the process for
- * claim-failed (the file is still there by definition, so every later poll takes
- * the same branch) and the whole of a long `sentinelMinIntervalMs` for a
- * rate-limited one that anything re-creates per poll — a retry wrapper, a cron
- * drop, an operator retouching while waiting the interval out. That is a real
- * suppression window, not a reordering: no sentinel capture *and* no threshold
- * evaluation while the heap climbs. Note the separate decision above — a
- * declined sentinel is still *consumed* — is about honoured-exactly-once and
- * is not a reason to skip the threshold arm. (Ally review, PEN-3631.)
+ * about the heap.
+ *
+ * The suppression this prevents is real, but ONLY the claim-failed half of it
+ * is load-bearing at the shipped configuration, and an earlier version of this
+ * comment claimed both. Claim-failed never stamps `lastSentinelSnapshotAtMs`,
+ * so it genuinely leaves the threshold arm's spacing untouched; the file is
+ * still there by definition, so every later poll takes the same branch, and
+ * returning early would suppress automatic capture for the whole life of the
+ * process.
+ *
+ * The rate-limited half cannot reach a capture on the shipped relationship.
+ * Getting there needs `now - lastSentinel < sentinelMinIntervalMs`, while the
+ * threshold arm needs `now - max(lastAuto, lastSentinel) >= autoMinIntervalMs`;
+ * since that max is `>= lastSentinel`, the conjunction is satisfiable only when
+ * `autoMinIntervalMs < sentinelMinIntervalMs`. The fallbacks are the inverse
+ * (120 min vs 5 min, and the sentinel's is called "deliberately much shorter"),
+ * so in production this path throttles — which is the correct outcome either
+ * way. The window the fall-through was originally justified by is in fact
+ * closed by the threshold arm's own `Math.max` spacing, a change made after
+ * that justification was written.
+ *
+ * The branch stays, because `autoMinIntervalMs < sentinelMinIntervalMs` is a
+ * legal configuration (both bound at `min: 1` minute) under which it is the
+ * difference between watching the heap and not. It is simply not the shipped
+ * one, and the tests say so rather than certifying it at an out-of-bounds
+ * interval. Note the separate decision above — a declined sentinel is still
+ * *consumed* — is about honoured-exactly-once and is not a reason to skip the
+ * threshold arm. (Ally review of 9b2fc5f and 320def5; PEN-3631.)
  */
 export function decideHeapSnapshot(
   config: HeapSnapshotConfig,
