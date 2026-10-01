@@ -2103,6 +2103,90 @@ describeEmbeddedPostgres("productivity review service", () => {
     );
   });
 
+  // PEN-3442: the one measured infra-class population BLO-36535's set left
+  // behind. A provider 503/529 mid-turn is the same "the provider refused to
+  // serve" category as `rate_limit_exhausted`, but it was absent from the set,
+  // so these runs stayed in the `no_comment_streak` numerator as conduct.
+  //
+  // The gap was invisible from the zero-token side, which is the whole reason
+  // it survived the BLO-36535 sweep. Re-measured 2026-10-01 over the 400 most
+  // recent runs of agent `29033747`: 2 `claude_transient_upstream` runs, BOTH
+  // billed (61,230 output tokens at the worst, $12.92 across the pair), against
+  // 109 `provider_throttled_no_progress` runs with zero billed. The throttled
+  // code was already caught by `isInfraFailureRun`'s zero-token test whether or
+  // not it was enumerated; this one never was.
+  //
+  // Non-zero `outputTokens` is load-bearing, exactly as in the BLO-32472 replay
+  // above: a zero-token fixture is excluded by `isInfraFailureRun` regardless of
+  // set membership and so passes against the PRE-fix code, proving nothing.
+  //
+  // The two codes are asserted separately rather than mixed into one window so
+  // that deleting either set member reds exactly one case. Mixed, a single
+  // surviving member would bridge the whole window and both cases would stay
+  // green against half the change.
+  for (const errorCode of ["claude_transient_upstream", "codex_transient_upstream"]) {
+    it(`generates no productivity review for a window of billed ${errorCode} runs (PEN-3442)`, async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+        // 2.5h spacing for the same reason as the BLO-32472 replay: 10 runs
+        // inside an hour trip `high_churn`, and "no review" would then pass for
+        // the wrong reason.
+        spacingMs: 2.5 * 60 * 60 * 1000,
+        status: "failed",
+        livenessState: "failed",
+        usageJson: { inputTokens: 402_118, outputTokens: 61_230 },
+        errorCode,
+      });
+
+      const service = productivityReviewService(db);
+      const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      expect(result.created).toBe(0);
+      expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+    });
+  }
+
+  // PEN-3442 negative control, pinning the over-exclusion direction shut in the
+  // place it would most plausibly leak: `provider_transient_upstream` is the
+  // THIRD member of the transient-upstream family in
+  // `TRANSIENT_INFRA_CONTINUATION_ERROR_CODES` and is deliberately NOT added to
+  // the infra-class set, because BLO-18285 documents it as the server-side
+  // classification of a hint-less 503 that should normally have been parked in
+  // `scheduled_retry` before a sweep sees it. Membership here is per code, not
+  // per family — a reader who adds one sibling "for consistency" reds this.
+  it("keeps a billed provider_transient_upstream run in the no-comment streak (PEN-3442 negative control)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      status: "failed",
+      livenessState: "failed",
+      usageJson: { inputTokens: 402_118, outputTokens: 61_230 },
+      errorCode: "provider_transient_upstream",
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
+    expect(reviews[0]?.description).toContain(
+      "Infra-killed runs excluded (terminal, executed a turn then died of an infrastructure fault — `errorCode` in the shared infra-class set, BLO-36535): 0",
+    );
+  });
+
   // BLO-36535 negative control, pinning BLO-26165's false negative shut: an
   // application-class `errorCode` is not in the infra set, so a run that
   // executed and failed on its own merits still counts as silence. The sibling

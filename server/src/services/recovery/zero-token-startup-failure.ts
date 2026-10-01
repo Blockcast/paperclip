@@ -197,6 +197,48 @@ export const ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES = new Set([
   // against those guards, not a side effect of fixing ownership.
   "rate_limit_exhausted",
   "provider_throttled_no_progress",
+  // PEN-3442: the provider's own transient upstream failure (a 503/529 from
+  // Anthropic/OpenAI mid-turn), which is the same "the provider refused to
+  // serve" category as the two codes above and is already paired with
+  // `adapter_failed` — a member of this set since BLO-20933 — in
+  // `TRANSIENT_INFRA_CONTINUATION_ERROR_CODES` and in heartbeat's own retry
+  // classifier. The membership rule this set states is met: the run never got
+  // to succeed or fail on its own merits, and the assignee had no part in it.
+  //
+  // These were the one measured infra-class population the BLO-36535 sweep left
+  // behind, and the gap was invisible from the zero-token side. Re-measured
+  // 2026-10-01 over the 400 most recent runs of agent `29033747` (window
+  // 2026-09-27T21:33Z → 2026-10-01T17:24Z): 2 `claude_transient_upstream` runs,
+  // BOTH billed, 61,230 output tokens at the worst and $12.92 across the pair.
+  // A billed run has a real `usageJson`, so `isInfraFailureRun`'s zero-token
+  // test reads false and — absent this membership — `no_comment_streak` reads
+  // the missing run comment as assignee silence. Compare the same window's
+  // `provider_throttled_no_progress` (109 runs, zero billed), which the
+  // zero-token predicate already caught whether or not it was enumerated here:
+  // that asymmetry is exactly why a code can look covered and not be.
+  //
+  // `codex_transient_upstream` is the identical adapter-side classification for
+  // the other provider (`claude-local-execute` / `codex-local-execute` emit them
+  // from the same branch) and is enumerated with it everywhere else in this
+  // codebase. Splitting the pair here would leave a drift seam for no reason —
+  // it had zero occurrences in the measured window purely because that agent
+  // does not run the codex adapter.
+  //
+  // Scope note, same shape as the one above: this changes ROUTING and the
+  // review's exclusion, not the attempt budget. Both codes are ALREADY in
+  // `TRANSIENT_INFRA_CONTINUATION_ERROR_CODES`, so their bounded-retry
+  // behaviour is untouched by this line; what changes is that a run which
+  // exhausts those retries and strands is re-dispatched to the existing
+  // assignee instead of moving `ownerAgentId` up the manager ladder for a
+  // provider outage.
+  //
+  // The family's third member, `provider_transient_upstream`, is deliberately
+  // NOT added: BLO-18285 documents it as the server-side classification of a
+  // hint-less 503 that the bounded retry should normally park in
+  // `scheduled_retry` before any sweep sees it. Membership here is per code,
+  // not per family.
+  "claude_transient_upstream",
+  "codex_transient_upstream",
 ]);
 
 // True when a run died of an infrastructure fault, REGARDLESS of how much work
