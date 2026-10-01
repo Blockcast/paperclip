@@ -2261,29 +2261,114 @@ describe("PEN-3052: probe-only health listener on a second port", () => {
         skewed.mockRestore();
       }
     });
+
+    // The other direction, on the same fixture (PEN-3052 review). The backwards
+    // test above would still pass with the TTL term deleted outright, because
+    // its 50ms settle already exceeds the 20ms TTL and the re-probe is due on
+    // elapsed time alone. Stepping *forward* inside a TTL that has not lapsed
+    // pins the complementary property: the cache is not keyed on wall-clock at
+    // all, so a forward jump cannot expire a still-valid entry and stampede
+    // connects into the accept queue being measured.
+    it("does not let a forward wall-clock step expire a live cache entry", async () => {
+      let accepted = 0;
+      const listener = net.createServer((socket) => {
+        accepted += 1;
+        socket.destroy();
+      });
+      servers.push(listener as unknown as http.Server);
+      await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
+      const { port } = listener.address() as AddressInfo;
+
+      // TTL far longer than anything this test waits, so the entry stays live
+      // on a monotonic clock and only a wall-clock read could expire it.
+      const probe = createProxyAcceptProbe(port, { ttlMs: 60_000 });
+      expect(await probe()).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(accepted).toBe(1);
+
+      const realNow = Date.now;
+      const skewed = vi.spyOn(Date, "now").mockImplementation(() => realNow() + 3_600_000);
+      try {
+        expect(await probe()).toBe(true);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(accepted).toBe(1);
+      } finally {
+        skewed.mockRestore();
+      }
+    });
   });
 
   // This listener sits OUTSIDE the deny by construction — that is why it
   // exists — so it is reachable by exactly the `host` / `remote-node` entities
   // the deny excludes from the proxy port, with nothing authenticating in
-  // front of it. Node's defaults (unlimited connections, 60s headers, 300s
-  // request) hold a byte-silent socket for a minute each, and the accept probe
-  // needs an fd of its own: left unbounded, socket-holding here becomes a
-  // restart lever on the authenticated proxy via a 503 from the fd-starved
-  // probe. Asserted on the constructed server, not at the `listen` call site,
-  // so a second caller cannot bind it unbounded.
-  it("bounds connections and timeouts, since nothing in front of this port authenticates", () => {
+  // front of it. Node's defaults (60s headers, 300s request, swept every 30s)
+  // hold a byte-silent socket for a minute each. Asserted on the constructed
+  // server, not at the `listen` call site, so a second caller cannot bind it
+  // unbounded.
+  it("bounds connection timeouts, since nothing in front of this port authenticates", () => {
     // Never bound: these are properties of the constructed server, so the test
     // needs no listener and nothing to tear down.
     const health = createHealthServer(() => true);
 
-    expect(health.maxConnections).toBe(64);
-    // Both well under Node's defaults, which are what this pins against.
-    expect(health.headersTimeout).toBeGreaterThan(0);
-    expect(health.headersTimeout).toBeLessThanOrEqual(2_000);
-    expect(health.requestTimeout).toBeGreaterThan(0);
-    expect(health.requestTimeout).toBeLessThanOrEqual(5_000);
+    // Pinned exactly, not as upper bounds (PEN-3052 review). A `<= 2_000`
+    // assertion admits `headersTimeout = 1`, which would cut a real probe off
+    // mid-headers on a loaded node; README.md names these specific numbers as
+    // properties of the port, so the test should fail when they move either
+    // way.
+    expect(health.headersTimeout).toBe(2_000);
+    expect(health.requestTimeout).toBe(5_000);
+
+    // The one that makes the two above mean what they say. Node sweeps for
+    // expired connections on this interval — default 30_000ms — so at the
+    // default a 2s headers timeout is enforced in ~30s. Settable only as a
+    // `createServer` option, which is why this is pinned rather than assumed.
+    expect(health.connectionsCheckingInterval).toBe(1_000);
+
+    // Idle keep-alive sockets reclaimed faster than Node's 5s default.
+    expect(health.keepAliveTimeout).toBe(2_000);
+
+    // Deliberately never assigned. A cap refuses the *incoming* socket once it
+    // is reached, so the sockets already held win and the kubelet's next probe
+    // connection is the one reset — making a liveness restart of the
+    // authenticated proxy reachable at the cap instead of at the process fd
+    // limit. The bound here is how long a socket is held, not how many are.
+    expect(health.maxConnections).toBeUndefined();
   });
+
+  // The property assertions above pin the configuration; this pins the
+  // behaviour they are configured for (PEN-3052 review). At Node's default
+  // 30_000ms sweep interval this same `headersTimeout` is enforced in ~30s, so
+  // a 10s bound here fails if the interval is ever dropped back to the default
+  // — including by a refactor that rebuilds the server without the options
+  // object, which no property assertion would catch.
+  it("actually reaps a byte-silent socket inside the stated headers timeout", async () => {
+    const health = createHealthServer(() => true);
+    servers.push(health);
+    await new Promise<void>((resolve) => health.listen(0, "127.0.0.1", resolve));
+    const { port } = health.address() as AddressInfo;
+
+    const reaped = new Promise<{ ms: number; banner: string }>((resolve) => {
+      const started = Date.now();
+      // Headers opened and never terminated: the request can never complete, so
+      // only the timeout sweep can end it.
+      const socket = net.connect({ port, host: "127.0.0.1" }, () => socket.write("GET /healthz HTTP/1.1\r\nHost: x\r\n"));
+      let banner = "";
+      // Flowing mode is load-bearing, not incidental. With the readable left
+      // paused, Node withholds `close` until the buffered 408 is consumed — so
+      // this test would hang against a server that reaped exactly on time.
+      socket.on("data", (chunk: Buffer) => {
+        banner += chunk.toString("utf8");
+      });
+      socket.on("error", () => {});
+      socket.on("close", () => resolve({ ms: Date.now() - started, banner }));
+    });
+
+    const { ms, banner } = await reaped;
+    // The specific status matters: it is what distinguishes the headers-timeout
+    // sweep from any other reason the socket might have closed.
+    expect(banner.startsWith("HTTP/1.1 408")).toBe(true);
+    expect(ms).toBeLessThan(10_000);
+  }, 15_000);
 
   it("discloses less than /healthz on the proxy port, which no deny covers here", async () => {
     const base = await startHealthServer();

@@ -1331,68 +1331,103 @@ function writeHealthResponse(res: http.ServerResponse, status: number, payload: 
  * see `createProxyAcceptProbe` for why the production one does.
  */
 export function createHealthServer(isServing: () => boolean | Promise<boolean>): http.Server {
-  const health = http.createServer((req, res) => {
-    const pathName = (req.url ?? "/").split("?", 1)[0] ?? "/";
-    if (pathName !== "/" && pathName !== "/healthz") {
-      writeHealthResponse(res, 404, { error: "not found" });
-      return;
-    }
-    if (req.method !== "GET" && req.method !== "HEAD") {
-      writeHealthResponse(res, 405, { error: "method not allowed" });
-      return;
-    }
-    void (async () => {
-      let serving: boolean;
-      try {
-        serving = await isServing();
-      } catch {
-        // A liveness signal that throws must read as unhealthy, never as a
-        // thrown request. Failing closed here is the whole point of the check.
-        serving = false;
-      }
-      try {
-        if (!serving) {
-          writeHealthResponse(res, 503, { ok: false, error: "proxy listener is not accepting connections" });
-          return;
-        }
-        writeHealthResponse(res, 200, { ok: true });
-      } catch {
-        // The probe hung up while the check was in flight. Nothing to report
-        // to and nobody to report it — but this handler is now async, so an
-        // escaping rejection would be an unhandled rejection, which Node 22
-        // turns into a process exit. On the liveness listener that is the one
-        // outcome worth more than a dropped response.
-        res.destroy();
-      }
-    })();
-  });
-
-  // Bounded here rather than at the `listen` call site so a second caller
-  // cannot bind this server unbounded (PEN-3052 review). Node's defaults are
-  // unlimited connections, a 60s headers timeout and a 300s request timeout,
-  // which is a reasonable posture for an authenticated proxy port and a poor
-  // one here: this listener sits OUTSIDE the deny by construction — that is
-  // the entire reason it exists — so it is reachable by exactly the `host` /
+  // Bounded in the constructor rather than as properties at the `listen` call
+  // site, for two reasons: a second caller cannot then bind this server
+  // unbounded, and `connectionsCheckingInterval` is settable ONLY here
+  // (PEN-3052 review).
+  //
+  // Why this listener needs tighter bounds than Node's defaults (60s headers,
+  // 300s request): it sits OUTSIDE the deny by construction — that is the
+  // entire reason it exists — so it is reachable by exactly the `host` /
   // `remote-node` entities the deny excludes from the proxy port, with nothing
   // in front of it authenticating.
   //
-  // What that bounds concretely: `createProxyAcceptProbe` needs an fd, so a
-  // caller holding sockets open here can push the process toward fd pressure,
-  // at which point the probe's `net.connect` fails, /healthz answers 503, and
-  // liveness restarts the container. Socket-holding against a listener added
-  // to *protect* availability should not be a restart lever on the
-  // authenticated proxy. A kubelet probe needs one short-lived connection per
-  // period; nothing legitimate on this port needs 64 concurrent ones.
+  // `connectionsCheckingInterval` is the load-bearing line and is the easy one
+  // to omit. Node arms no per-socket timer for `headersTimeout` /
+  // `requestTimeout`; it sweeps for expired connections from `checkConnections`
+  // on an interval that defaults to 30_000ms, so a byte-silent socket survives
+  // until the first sweep *after* the timeout elapses. Measured on this shape:
+  // 30040ms to enforce a 2s `headersTimeout` at the default interval, against
+  // 2007ms at 1_000ms. Without this line the bound stated below and in
+  // README.md is ~15x looser than written — which is exactly the arithmetic the
+  // cost of holding a socket here is computed from.
+  const health = http.createServer(
+    {
+      connectionsCheckingInterval: 1_000,
+      headersTimeout: 2_000,
+      requestTimeout: 5_000,
+    },
+    (req, res) => {
+      const pathName = (req.url ?? "/").split("?", 1)[0] ?? "/";
+      if (pathName !== "/" && pathName !== "/healthz") {
+        writeHealthResponse(res, 404, { error: "not found" });
+        return;
+      }
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        writeHealthResponse(res, 405, { error: "method not allowed" });
+        return;
+      }
+      void (async () => {
+        let serving: boolean;
+        try {
+          serving = await isServing();
+        } catch {
+          // A liveness signal that throws must read as unhealthy, never as a
+          // thrown request. Failing closed here is the whole point of the check.
+          serving = false;
+        }
+        try {
+          if (!serving) {
+            writeHealthResponse(res, 503, { ok: false, error: "proxy listener is not accepting connections" });
+            return;
+          }
+          writeHealthResponse(res, 200, { ok: true });
+        } catch {
+          // The probe hung up while the check was in flight. Nothing to report
+          // to and nobody to report it — but this handler is now async, so an
+          // escaping rejection would be an unhandled rejection, which Node 22
+          // turns into a process exit. On the liveness listener that is the one
+          // outcome worth more than a dropped response.
+          res.destroy();
+        }
+      })();
+    },
+  );
+
+  // An idle keep-alive socket is reclaimed in 2s rather than Node's 5s. This
+  // bounds drift, not a determined client: `requestTimeout` restarts per
+  // request, so anything willing to send one cheap request per period keeps its
+  // socket indefinitely. Shrinking how long a socket is held is the mitigation
+  // that scales with the holder's cost; see below for why the cliff-shaped one
+  // was removed.
+  health.keepAliveTimeout = 2_000;
+
+  // Deliberately NO `maxConnections` (PEN-3052 review). An earlier revision set
+  // it to 64, reasoning that `createProxyAcceptProbe` needs an fd, so unbounded
+  // socket-holding here could push the process toward fd pressure, fail the
+  // probe, and turn a 503 into a liveness restart of the authenticated proxy.
+  // The cap does not prevent that outcome. It makes it enormously cheaper to
+  // cause — 64 sockets instead of the process fd limit.
   //
-  // Deliberate non-change: an EMFILE that happens anyway still reads as 503,
-  // not as 200. A process out of descriptors genuinely cannot accept proxy
-  // connections, so "not serving" is the accurate answer and a restart is the
-  // correct recovery — the bug would be masking it. The fix belongs on the
-  // reachability of that state, which is what these three lines do, not on the
-  // honesty of the signal.
-  health.maxConnections = 64;
-  health.headersTimeout = 2_000;
-  health.requestTimeout = 5_000;
+  // Node drops the *incoming* socket once `_connections >= maxConnections`
+  // (`net.js` `onconnection` closes the new handle with no response), so the
+  // sockets already held win and the kubelet's next probe connection is the one
+  // refused. Measured against a cap: ECONNRESET with no HTTP status, in 9ms.
+  // Three of those is a liveness failure and a restart of the authenticated
+  // proxy — the exact outcome these bounds exist to put further out of reach.
+  //
+  // A cap has no notion of which connection matters, so it cannot protect the
+  // probe; it only moves the restart threshold down to itself. EMFILE at least
+  // reports something true — a process out of descriptors genuinely is not
+  // accepting — whereas a process holding 64 idle sockets on the *health* port
+  // is serving the proxy perfectly and gets restarted anyway. So the bound here
+  // is the timeouts above, which shrink how long any one socket is held, rather
+  // than a cap on how many may be held at once.
+  //
+  // Unchanged deliberate non-change: an EMFILE that happens anyway still reads
+  // as 503, not 200. A process out of descriptors is accurately described as
+  // "not serving", and a restart is the correct recovery; masking it would be
+  // the bug.
   return health;
 }
 
@@ -1412,6 +1447,12 @@ export function createHealthServer(isServing: () => boolean | Promise<boolean>):
  * originates to itself. `server.listen(port, cb)` is called with no host, so
  * Node binds `::`/`0.0.0.0` and a `127.0.0.1` connect lands either way — this
  * is not the `localhost` → `::1` hazard.
+ *
+ * That address is fixed rather than an option (PEN-3052 review). Loopback is
+ * the only value for which the paragraph above holds; an override would be an
+ * invitation to probe an address the deny does cover, which would report the
+ * deny's verdict rather than this process's. The one caller that passed it was
+ * the connect-timeout test, which now mocks `net.connect` outright.
  *
  * What this does and does not catch, stated precisely so the next reader does
  * not over-trust it:
@@ -1445,17 +1486,13 @@ export function createHealthServer(isServing: () => boolean | Promise<boolean>):
  */
 export function createProxyAcceptProbe(
   port: number,
-  {
-    timeoutMs = 250,
-    ttlMs = 1000,
-    host = "127.0.0.1",
-  }: { timeoutMs?: number; ttlMs?: number; host?: string } = {},
+  { timeoutMs = 250, ttlMs = 1000 }: { timeoutMs?: number; ttlMs?: number } = {},
 ): () => Promise<boolean> {
   let cached: { at: number; result: Promise<boolean>; pending: boolean } | null = null;
 
   const connectOnce = (): Promise<boolean> =>
     new Promise<boolean>((resolve) => {
-      const socket = net.connect({ port, host });
+      const socket = net.connect({ port, host: "127.0.0.1" });
       let settled = false;
       const finish = (ok: boolean): void => {
         if (settled) return;
