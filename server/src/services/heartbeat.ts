@@ -1777,8 +1777,11 @@ export function shouldScheduleAutomaticRunRetry(
   // recovery/zero-token-startup-failure.ts — the last decides owner-vs-manager
   // routing, so missing it sent an assignee's stranded issue up the manager
   // ladder. Both of the sites this file can reach are asserted by comparison
-  // against `adapter_failed` in that test, so a fourth site, or a fourth rename,
-  // fails CI rather than being measured 18 hours later.
+  // against `adapter_failed` in that test, so a fourth RENAME fails CI rather
+  // than being measured 18 hours later. A fourth enrolment SITE will not: those
+  // assertions are keyed on the two literals and cannot see a set they do not
+  // name, so enumerate consumers by hand. Site 1 is not exported from
+  // recovery/service.ts and is unasserted either way.
   if (
     run.errorCode !== "adapter_failed" &&
     run.errorCode !== "process_lost" &&
