@@ -27,6 +27,21 @@ export interface LiveEventSubscriberContext {
    */
   membershipRole?: string | null;
   /**
+   * The actor source the upgrade authenticated this board subscriber with, in
+   * the REST vocabulary. Carried rather than synthesized because
+   * `decideRunTranscriptRead` keys on it — `cloud_tenant` is refused the
+   * operator short-circuit outright — and a hardcoded `"session"` would erase
+   * that distinction before the gate could see it, so the WS gate would answer
+   * a question its REST twin does not (Ally review 5381822720).
+   *
+   * No upgrade path produces `cloud_tenant` today: `authorizeUpgrade` admits a
+   * board only via the `local_trusted` branch or a better-auth session, and the
+   * cloud-tenant actor is built from trusted headers on the REST middleware
+   * only. This field exists so that if such a path is ever added, the gate
+   * narrows with it instead of silently admitting it.
+   */
+  actorSource?: "local_implicit" | "session" | "cloud_tenant";
+  /**
    * True for the `local_trusted` board, which has no membership row to carry.
    * Maps onto the `local_implicit` actor source the REST paths use for exactly
    * the same caller.
@@ -92,7 +107,13 @@ function syntheticRequest(context: LiveEventSubscriberContext): Request {
                   status: "active",
                 },
               ],
-          source: context.trustedLocal ? ("local_implicit" as const) : ("session" as const),
+          // The source the upgrade actually authenticated with, not a
+          // hardcoded one — the operator short-circuit keys on it, so
+          // synthesizing a value here would make the WS gate ask a different
+          // question than the REST twin (see `actorSource`).
+          source: context.trustedLocal
+            ? ("local_implicit" as const)
+            : (context.actorSource ?? ("session" as const)),
         };
   return { actor } as unknown as Request;
 }
@@ -160,6 +181,14 @@ export function createLiveEventTranscriptGate(
         return false;
       });
     cache.set(key, { decidedAt: startedAt, allowed: pending });
+    // Drop entries that can no longer be reused. The map is bounded by the
+    // company's agent count rather than by event volume, so this is small — but
+    // the entries are timestamped now, so evicting is nearly free and keeps a
+    // long-lived socket in a large company from retaining one entry per owning
+    // agent ever seen (Ally review 5381822720).
+    for (const [cachedKey, entry] of cache) {
+      if (cachedKey !== key && startedAt - entry.decidedAt >= ttlMs) cache.delete(cachedKey);
+    }
     return pending;
   };
 
