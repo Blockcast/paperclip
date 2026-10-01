@@ -200,7 +200,9 @@ On `$PORT` (default 8080):
 On `$PAPERCLIP_MCP_HEALTH_PORT`, when set — see [Probe-only health port](#probe-only-health-port):
 
 - `GET /healthz`, `GET /` — `{ ok: true }`, or 503 `{ ok: false }` when the proxy listener is not accepting connections.
-- everything else — 404. No MCP route, no upstream, no discovery document is served here.
+- `HEAD` of either path — same status, no body.
+- any other method on those paths — 405. Any other path — 404. No MCP route, no
+  upstream, no discovery document is served here.
 
 ## Probe-only health port
 
@@ -236,10 +238,32 @@ Two properties this port is required to keep, both pinned in `server.test.ts`:
   names, breaker state and per-prefix session counts. No deny covers this port;
   treat its body as readable by anything that can route to the pod.
 
+### What the 200 actually asserts
+
+`{ ok: true }` means the proxy listener is **bound and accepting**, not merely
+bound. `server.listening` is a bare `!!this._handle` check and stays true for a
+socket whose accept queue is saturated, so the check also opens a short-timeout
+loopback connection to `PORT` (`createProxyAcceptProbe`). That matters only once
+the probes move here: while liveness targets the proxy port directly, a wedged
+accept queue times the probe out and the pod restarts on its own; served from
+this port without the connect, the same state would answer 200 forever and the
+pod would never self-heal.
+
+A pod-local loopback connect is outside the deny — `fromEntities: [host,
+remote-node]` does not match traffic the pod originates to itself — so this
+costs no policy surface. The result is cached for 1s so that an unauthenticated
+flood of health requests cannot amplify into the accept queue it measures.
+
+A blocked event loop is caught separately and for free: the health handler runs
+on that same loop, so it simply stops answering.
+
 The value must be a plain integer in 1–65535 and must differ from `PORT`.
 Anything else fails startup rather than falling back — a port that silently
 resolved elsewhere would leave the probes hitting a closed socket, which
-liveness turns into a restart loop with no stated cause.
+liveness turns into a restart loop with no stated cause. `PORT` is parsed the
+same strict way, for the same reason: `PORT="8O81"` with a letter O used to
+parse to `8`, and the `must differ` guard is only as good as the number it
+compares against.
 
 An exec probe was considered and rejected for this workload: `node -e` costs
 ~90 ms CPU per spawn against a 200m limit (20 ms per CFS period), i.e. ~4.5

@@ -21,6 +21,7 @@
  */
 
 import http from "node:http";
+import net from "node:net";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -93,28 +94,30 @@ function parsePositiveInt(raw: string | undefined, fallback: number): number {
 }
 
 /**
- * Strict parse for the health listener's port. Deliberately not
- * `parsePositiveInt`: falling back on junk is right for a tuning knob and wrong
- * for a port. The Deployment points both kubelet probes at whatever this value
- * says, so a typo that silently resolved to some other port would leave the
- * probes hitting a closed socket — and liveness failure restarts the container.
- * Refusing at startup names the cause; falling back hides it behind a
- * CrashLoop.
+ * Strict parse for a listener port. Deliberately not `parsePositiveInt`:
+ * falling back on junk is right for a tuning knob and wrong for a port. The
+ * Deployment points both kubelet probes at whatever these values say, so a typo
+ * that silently resolved to some other port would leave the probes hitting a
+ * closed socket — and liveness failure restarts the container. Refusing at
+ * startup names the cause; falling back hides it behind a CrashLoop.
  *
  * The regex is load-bearing. `Number.parseInt` accepts "8081abc" (→ 8081),
  * "0x1f9" (→ 0) and " +8081"; a bare `Number()` accepts "Infinity". Rejecting
  * anything that is not pure digits is what makes the 1-65535 bound below mean
  * what it says.
+ *
+ * Applied to `PORT` as well as the health port (PEN-3052 review). `PORT="8O81"`
+ * with a letter O parsed to 8 under the old lenient read, and the
+ * `must differ from PORT` guard below would then have compared the health port
+ * against that wrong value — the guard is only as good as the number it checks.
  */
-function parseHealthPort(raw: string | undefined): number | null {
+function parsePort(raw: string | undefined, varName: string): number | null {
   if (raw === undefined) return null;
   const trimmed = raw.trim();
   if (trimmed === "") return null;
   const port = /^[0-9]+$/.test(trimmed) ? Number.parseInt(trimmed, 10) : Number.NaN;
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error(
-      `PAPERCLIP_MCP_HEALTH_PORT must be an integer in 1-65535, got ${JSON.stringify(raw)}`,
-    );
+    throw new Error(`${varName} must be an integer in 1-65535, got ${JSON.stringify(raw)}`);
   }
   return port;
 }
@@ -125,8 +128,8 @@ export function loadGatewayConfig(env: NodeJS.ProcessEnv = process.env): Gateway
   if ((publicUrl && !authorizationServer) || (!publicUrl && authorizationServer)) {
     throw new Error("PAPERCLIP_MCP_PUBLIC_URL and PAPERCLIP_MCP_AUTHORIZATION_SERVER must be configured together");
   }
-  const port = Number.parseInt(env.PORT ?? String(DEFAULT_PORT), 10);
-  const healthPort = parseHealthPort(env.PAPERCLIP_MCP_HEALTH_PORT);
+  const port = parsePort(env.PORT, "PORT") ?? DEFAULT_PORT;
+  const healthPort = parsePort(env.PAPERCLIP_MCP_HEALTH_PORT, "PAPERCLIP_MCP_HEALTH_PORT");
   // Same port would mean one socket again, which defeats the whole point: the
   // network policy denies the proxy port by number, so the probe has to live
   // somewhere that deny does not reach. EADDRINUSE would catch it eventually,
@@ -1324,9 +1327,10 @@ function writeHealthResponse(res: http.ServerResponse, status: number, payload: 
  *
  * `isServing` keeps the signal honest. A static 200 would report healthy with
  * the proxy listener closed — strictly weaker than the probe it replaces, which
- * at least had to reach the proxy socket to answer.
+ * at least had to reach the proxy socket to answer. It may return a promise;
+ * see `createProxyAcceptProbe` for why the production one does.
  */
-export function createHealthServer(isServing: () => boolean): http.Server {
+export function createHealthServer(isServing: () => boolean | Promise<boolean>): http.Server {
   return http.createServer((req, res) => {
     const pathName = (req.url ?? "/").split("?", 1)[0] ?? "/";
     if (pathName !== "/" && pathName !== "/healthz") {
@@ -1337,12 +1341,101 @@ export function createHealthServer(isServing: () => boolean): http.Server {
       writeHealthResponse(res, 405, { error: "method not allowed" });
       return;
     }
-    if (!isServing()) {
-      writeHealthResponse(res, 503, { ok: false, error: "proxy listener is not accepting connections" });
-      return;
-    }
-    writeHealthResponse(res, 200, { ok: true });
+    void (async () => {
+      let serving: boolean;
+      try {
+        serving = await isServing();
+      } catch {
+        // A liveness signal that throws must read as unhealthy, never as a
+        // thrown request. Failing closed here is the whole point of the check.
+        serving = false;
+      }
+      try {
+        if (!serving) {
+          writeHealthResponse(res, 503, { ok: false, error: "proxy listener is not accepting connections" });
+          return;
+        }
+        writeHealthResponse(res, 200, { ok: true });
+      } catch {
+        // The probe hung up while the check was in flight. Nothing to report
+        // to and nobody to report it — but this handler is now async, so an
+        // escaping rejection would be an unhandled rejection, which Node 22
+        // turns into a process exit. On the liveness listener that is the one
+        // outcome worth more than a dropped response.
+        res.destroy();
+      }
+    })();
   });
+}
+
+/**
+ * Accept-path liveness for the proxy listener (PEN-3052 review).
+ *
+ * `server.listening` is a bare `!!this._handle` check, so it stays true for a
+ * socket that is *bound* but no longer *accepting*. That distinction did not
+ * matter while the kubelet probed the proxy port directly — a wedged accept
+ * queue timed the probe out and liveness restarted the pod. The moment both
+ * probes move to the health port, the same state would answer `200 {ok:true}`
+ * and the pod would never self-heal. Recovering a wedged listener is precisely
+ * what liveness is for, so the check has to actually open a connection.
+ *
+ * A pod-local loopback connect is outside the deny this listener exists to
+ * permit: `fromEntities: [host, remote-node]` does not match traffic the pod
+ * originates to itself. `server.listen(port, cb)` is called with no host, so
+ * Node binds `::`/`0.0.0.0` and a `127.0.0.1` connect lands either way — this
+ * is not the `localhost` → `::1` hazard.
+ *
+ * What this does and does not catch, stated precisely so the next reader does
+ * not over-trust it:
+ *   - **Saturated accept queue** → caught. Linux drops the SYN once the queue
+ *     is full (`tcp_abort_on_overflow=0`), the connect never completes, the
+ *     timeout fires, 503.
+ *   - **Blocked event loop** → caught, but by the health handler sharing that
+ *     loop, not by this probe; the kernel completes the handshake without the
+ *     process, so the connect alone would succeed.
+ *
+ * The result is cached for `ttlMs` because nothing in front of this port
+ * authenticates. Without it, each unauthenticated health request would open a
+ * fresh connection to the proxy listener — a small amplification into the very
+ * accept queue being measured. One connect per TTL bounds that regardless of
+ * request rate, and is still far finer-grained than the 5s/15s probe periods.
+ */
+export function createProxyAcceptProbe(
+  port: number,
+  {
+    timeoutMs = 250,
+    ttlMs = 1000,
+    host = "127.0.0.1",
+  }: { timeoutMs?: number; ttlMs?: number; host?: string } = {},
+): () => Promise<boolean> {
+  let cached: { at: number; result: Promise<boolean> } | null = null;
+
+  const connectOnce = (): Promise<boolean> =>
+    new Promise<boolean>((resolve) => {
+      const socket = net.connect({ port, host });
+      let settled = false;
+      const finish = (ok: boolean): void => {
+        if (settled) return;
+        settled = true;
+        // Torn down immediately rather than lingering: the probe wants its fd
+        // back, and a connection that sent no bytes is a no-op for the http
+        // server on the other end — it registers no `clientError`, which is
+        // raised for parse failures, not for a peer that never spoke.
+        socket.destroy();
+        resolve(ok);
+      };
+      socket.setTimeout(timeoutMs, () => finish(false));
+      socket.once("connect", () => finish(true));
+      socket.once("error", () => finish(false));
+    });
+
+  return () => {
+    const now = Date.now();
+    if (cached && now - cached.at < ttlMs) return cached.result;
+    const result = connectOnce();
+    cached = { at: now, result };
+    return result;
+  };
 }
 
 function safeOnError(e: unknown, req: http.IncomingMessage, res: http.ServerResponse): void {
@@ -1407,18 +1500,40 @@ async function main(): Promise<void> {
     // never be up while the proxy socket is unbound — the one window in which
     // a 200 here would be a lie that `isServing` cannot catch.
     if (config.healthPort === null) return;
-    const health = createHealthServer(() => server.listening);
-    health.on("error", (e: Error) => {
-      // Fail closed and say why. The Deployment points both probes at this
-      // port, so a failed bind kills the container regardless; exiting here
-      // makes the cause legible instead of surfacing as an unexplained
-      // CrashLoopBackOff with a healthy-looking proxy log above it.
+    const acceptProbe = createProxyAcceptProbe(port);
+    // Both conditions, cheapest first: `listening` settles the unbound case
+    // without opening a socket, the probe settles the bound-but-wedged one.
+    const health = createHealthServer(async () => server.listening && (await acceptProbe()));
+
+    // Bind failure only. The Deployment points both probes at this port, so a
+    // port that never comes up kills the container regardless; exiting here
+    // makes the cause legible instead of surfacing as an unexplained
+    // CrashLoopBackOff with a healthy-looking proxy log above it.
+    //
+    // Scoped to the bind window on purpose (PEN-3052 review). Left registered
+    // for the server's lifetime, this would turn any later socket error on the
+    // *non-essential* listener — EMFILE on accept under fd pressure being the
+    // realistic one in a proxy — into an immediate kill that drops in-flight
+    // MCP requests and skips the SIGTERM drain below. Post-bind, log and let
+    // liveness drive a graceful restart; that path is strictly better.
+    const onBindError = (e: Error): void => {
       // eslint-disable-next-line no-console
-      console.error(`[mcp-gateway] health listener on :${config.healthPort} failed: ${e.message}`);
+      console.error(`[mcp-gateway] health listener on :${config.healthPort} failed to bind: ${e.message}`);
       process.exit(1);
-    });
+    };
+    health.once("error", onBindError);
     healthServer = health;
     health.listen(config.healthPort, () => {
+      // Bind succeeded: swap the kill for a log. From here on a socket error is
+      // the probe's problem to report, not a reason to drop live traffic.
+      health.off("error", onBindError);
+      health.on("error", (e: Error) => {
+        // eslint-disable-next-line no-console
+        console.error(
+          `[mcp-gateway] health listener on :${config.healthPort} error after bind: ${e.message} ` +
+            "(left running; liveness will restart the pod if probes stop succeeding)",
+        );
+      });
       // eslint-disable-next-line no-console
       console.log(`[mcp-gateway] health listening on :${config.healthPort} (GET /healthz)`);
     });
