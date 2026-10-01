@@ -462,7 +462,27 @@ export async function prepareClaudePromptBundle(input: {
       // still owns that case.
       const current = await fs.readlink(target).catch(() => null);
       if (current !== null && current !== desired) {
-        await fs.unlink(target).catch(() => {});
+        // Narrow to ENOENT, not a blanket swallow: on any other error the stale
+        // link SURVIVES, `ensurePaperclipSkillSymlink` below stats its old
+        // SERVER address, finds it, and returns `skipped` — the exact pre-fix
+        // outcome. Nothing else would report it either, because in the
+        // migration shape `desired` IS under the pod mount, so the off-volume
+        // warn above does not fire and the enclosing catch sees no throw.
+        await fs.unlink(target).catch((err: unknown) => {
+          if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return;
+          console.warn(
+            JSON.stringify({
+              level: "warn",
+              event: "claude_k8s.prompt_bundle_stale_skill_link_retained",
+              msg: "could not drop a stale skill symlink; the pod keeps a link it cannot follow and this skill will not load",
+              skillKey: entry.key,
+              target,
+              staleLinkTarget: current,
+              desiredLinkTarget: desired,
+              error: err instanceof Error ? err.message : String(err),
+            }),
+          );
+        });
       }
       await ensurePaperclipSkillSymlink(desired, target);
     } catch (err) {
