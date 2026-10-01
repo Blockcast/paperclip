@@ -153,6 +153,13 @@ export const ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES = new Set([
   // materialization race nobody on this side caused, and stamped
   // `infraClassCauseByErrorCode: false` into the recovery audit row.
   //
+  // Membership has a THIRD consequence, in this file: `isInfraClassErrorCodeRun`
+  // below is a `.has()` on this set and nothing else, so adding a code also
+  // reclassifies it for the productivity review. Correct here — the throw is
+  // pre-`buildJobManifest`, so a run that left no comment was killed before it
+  // could write one, which is infrastructure rather than agent silence. Check all
+  // three consumers before adding a code, not the two above.
+  //
   // Raised by Ally as an Important finding on #2159. The pairing is asserted in
   // heartbeat-recoverable-error-family.test.ts so the next rename fails CI.
   "skill_materialization_pending",
