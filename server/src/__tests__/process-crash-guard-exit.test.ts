@@ -17,6 +17,10 @@
  * `exiting 1 after uncaughtException` breadcrumb while the first short line
  * still lands. That asymmetry is why the bug survived two review rounds, and
  * it is the specific thing these assertions pin.
+ *
+ * Run mutations against the whole file, never `-t` filtered: alone, the stalled case
+ * pays a cold `tsx` compile and dies at the startup watchdog having never reached
+ * backpressure, which looks like a mutation kill and is not one.
  */
 
 import { spawn } from "node:child_process";
@@ -24,6 +28,8 @@ import type { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+
+import { MAX_WRITE_WAIT_MS } from "../shutdown-log.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixture = path.join(here, "fixtures", "crash-guard-exit-fixture.ts");
@@ -56,19 +62,51 @@ const FIXTURE_STARTUP_TIMEOUT_MS = 10_000;
 const FIXTURE_RUN_WATCHDOG_MS = FIXTURE_STARTUP_TIMEOUT_MS + 5_000;
 /**
  * The behaviour under test: with stderr stalled, the guard must still exit this fast.
- * This is the contract — tighten or loosen it only when the guard's own deadline moves.
  *
- * Deliberately left at 1_500 by BLO-25854, which fixed the *other* failure signature on
- * this test and stopped short of this one. This bound spends only 30% of the guard's
- * DEFAULT_CRASH_GUARD_TIMEOUT_MS, and has been seen failing at 1547ms on a loaded
- * runner — a 3% overshoot against 70% unused budget. Deriving it from that constant is
- * the obvious repair, but a mutation test (deleting the `timer.unref()` early exit the
- * assertion exists to protect) failed through the startup watchdog rather than through
- * this assertion, so the re-derivation could not be shown to preserve what it catches.
- * Tracked as BLO-22985 (hardcoded wall-clock budgets under CI load) rather than changed
- * here on an unvalidated rationale.
+ * Derived, not literal, and derived from `MAX_WRITE_WAIT_MS` rather than from the
+ * guard's `DEFAULT_CRASH_GUARD_TIMEOUT_MS` — that one budgets `onCrash` bookkeeping,
+ * and this fixture installs the guard with no `onCrash` at all, so the 5_000ms timeout
+ * is never armed here. Describing this bound as "30% of DEFAULT_CRASH_GUARD_TIMEOUT_MS"
+ * (as it was until BLO-37311) measured it against a constant that does not govern it.
+ *
+ * What does govern it: the fatal path awaits two sequential bounded breadcrumb writes,
+ * each capped at MAX_WRITE_WAIT_MS, then exits. Measured on a warm runner, clean tree:
+ * 235ms — the 200ms budget plus ~35ms of process teardown, i.e. elapsed ≈ 2·budget + 35.
+ *
+ * The derivation documents where the number comes from; it is deliberately not what
+ * catches a change to that budget, and the difference is the point of this block.
+ * Because this bound and STALLED_EXIT_WATCHDOG_MS both scale with MAX_WRITE_WAIT_MS,
+ * raising that constant moves the bound clear of the very regression it exists to
+ * catch: measured at a 10x budget the guard takes 2054ms while this bound becomes
+ * 18_000ms, so without the pin below that edit leaves every test in this file
+ * green — a coverage loss against the `1_500` literal this replaced, which failed it
+ * outright ("expected 2054 to be less than 1500"). The pin asserted in "the stalled-exit
+ * deadline is calibrated for the current write budget" below is what restores it, so the
+ * two assertions divide the work:
+ *   - the pin catches any change to the write budget, whatever its size, and fails by
+ *     naming the constant that moved;
+ *   - this deadline catches what the pin cannot see — teardown or exit-path slowdowns
+ *     at an unchanged budget — once they exceed 1_800ms.
+ *
+ * The window is narrow and asymmetric, so do not widen this without re-measuring both
+ * ends:
+ *   - floor — a loaded runner has been seen at 1547ms (BLO-22985), so anything at or
+ *     below the old 1_500 literal flakes; that overshoot is teardown stretching, not
+ *     the timer budget, which fires on schedule. 1_800 clears it by 16.4%, and this is
+ *     the side resting on a single observed sample.
+ *   - ceiling — 1_800 is 11.6% under the ~2_036-2_054ms a 10x budget regression
+ *     produces. The tighter margin is this one, not the floor.
+ * The ceiling is a choice about the smallest slowdown worth catching, not a hard limit.
+ * It is not the watchdog: STALLED_EXIT_WATCHDOG_MS is a multiple of this bound, so a
+ * slow-but-working exit always fails this assertion with a measured elapsed rather than
+ * degrading into a SIGKILL — that needs >9_000ms at today's values, ~45x the budget.
+ *
+ * Mutation-tested for independent value (BLO-37311), because the previous comment
+ * claimed this assertion protects the `timer.unref()` early exit in the guard and that
+ * is false: deleting `timer.unref?.()` leaves every test in this file green, since the
+ * `if (!onCrash) { finish(); return; }` branch returns before that timer is ever created.
  */
-const STALLED_EXIT_DEADLINE_MS = 1_500;
+const STALLED_EXIT_DEADLINE_MS = MAX_WRITE_WAIT_MS * 2 * 9;
 /**
  * Harness backstop, never the thing under test. It must stay well clear of
  * STALLED_EXIT_DEADLINE_MS: a slow-but-working exit has to fail the assertion with a
@@ -331,6 +369,22 @@ describe("process crash guard — real process exit", () => {
       expect(stderr).toContain(`[shutdown] exiting 1 after ${label}`);
     },
   );
+
+  /**
+   * Pins the input STALLED_EXIT_DEADLINE_MS is calibrated against, not the guard.
+   *
+   * Both that deadline and STALLED_EXIT_WATCHDOG_MS are multiples of MAX_WRITE_WAIT_MS,
+   * so without this assertion a change to the write budget widens every bound in the
+   * file and the slowdown it causes goes unnoticed — measured at 1_000 the stalled exit
+   * takes 2054ms while every other test in the file still passes. Failing here instead
+   * names the constant that moved; the assertion message carries the remedy.
+   */
+  it("the stalled-exit deadline is calibrated for the current write budget", () => {
+    expect(
+      MAX_WRITE_WAIT_MS,
+      "write budget changed: re-measure the stalled exit, then move this pin and the 9x multiplier in STALLED_EXIT_DEADLINE_MS together",
+    ).toBe(100);
+  });
 
   it("still exits when stderr is not drained", async () => {
     const { code, elapsedMs } = await runFixtureWithStalledStderr();
