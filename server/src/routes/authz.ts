@@ -1,6 +1,8 @@
 import type { Request, Response } from "express";
+import type { HumanCompanyMembershipRole } from "@paperclipai/shared";
 import { forbidden, HttpError, unauthorized } from "../errors.js";
 import { logger } from "../middleware/logger.js";
+import { normalizeHumanRole } from "../services/company-member-roles.js";
 import { responsibleUserAuthzShadowMode, type AuthorizationDecision } from "../services/authorization.js";
 
 function throwOrShadowResponsibleUserCompanyAccessDeny(
@@ -211,9 +213,9 @@ type RunTranscriptReadDecider = {
  * The human membership roles that read a transcript without holding a grant —
  * the "human operators" of the PEN-3140 decision.
  *
- * `viewer` and `member` are deliberately absent. The codebase already draws
- * this line one notch LOWER, for material that is less sensitive than a
- * transcript: `workspace_runtime:read` is behind `requiresNonViewer` in
+ * `viewer` is deliberately absent. The codebase already draws this line one
+ * notch LOWER, for material that is less sensitive than a transcript:
+ * `workspace_runtime:read` is behind `requiresNonViewer` in
  * `services/authorization.ts` and answers a viewer with `deny_missing_grant`.
  * A run log that has carried vendor credential material across three incidents
  * (PEN-2328 → PEN-2370 → PEN-3139) cannot be looser than operator-authored
@@ -225,12 +227,40 @@ type RunTranscriptReadDecider = {
  * escape hatch the agent side gets, which is why the seed migration can name
  * the agent roles and stay silent about humans — this set is the only place
  * the human operator set is written down (Ally review 5375217878).
+ *
+ * Stated in the NORMALIZED vocabulary (`HumanCompanyMembershipRole`), not in
+ * raw stored strings. `member` is storable (`COMPANY_MEMBERSHIP_ROLES`) and
+ * `normalizeHumanRole` folds it to `operator`, so matching the stored string
+ * would make one membership row an operator for default-grant seeding and a
+ * non-operator here — the same "two places naming the human set differently"
+ * that migration 0248's comment exists to remove (Ally review 5381822720).
+ * Typing the set to the normalized union also makes a future role addition a
+ * compile error here rather than a silent denial.
  */
-const TRANSCRIPT_OPERATOR_MEMBERSHIP_ROLES: ReadonlySet<string> = new Set([
+const TRANSCRIPT_OPERATOR_MEMBERSHIP_ROLES: ReadonlySet<HumanCompanyMembershipRole> = new Set([
   "owner",
   "admin",
   "operator",
 ]);
+
+/**
+ * Normalize a stored membership role for the operator test, failing CLOSED on
+ * anything unrecognized.
+ *
+ * `normalizeHumanRole`'s own default fallback is `operator`, which is right for
+ * its callers (label rendering, default-grant seeding) and wrong here:
+ * `company_memberships.membership_role` is a plain `text` column with no DB
+ * constraint, and the cloud-tenant path can write `support` into it
+ * (`middleware/auth.ts`, `stackMembershipRole`). Taking the default would turn
+ * every unknown or legacy role string into a transcript operator. `viewer` is
+ * the least-privileged member of the union, so an unrecognized role falls
+ * through to the decider and needs an explicit grant — the same place a viewer
+ * lands. `member` still folds to `operator`, which is the agreement with
+ * `normalizeHumanRole` this exists to keep.
+ */
+function normalizedTranscriptRole(value: unknown): HumanCompanyMembershipRole {
+  return normalizeHumanRole(value, "viewer");
+}
 
 /**
  * Whether a board actor holds an operator-grade membership in this company.
@@ -240,15 +270,30 @@ const TRANSCRIPT_OPERATOR_MEMBERSHIP_ROLES: ReadonlySet<string> = new Set([
  * membership row to inspect. Keeping the two in step matters — a divergence
  * here would make the local board's transcript reads depend on which of the two
  * functions a route happened to call.
+ *
+ * `cloud_tenant` is refused outright, ahead of any role test. Those actors are
+ * company-scoped BY CONTRACT and the decider is where that contract lives:
+ * `services/authorization.ts` refuses to elevate them "not even via stale
+ * instance_admin rows" and enumerates exactly four readable actions
+ * (`agent:read`, `company_scope:read`, `issue:read`, `project:read`).
+ * `runs:read_transcript` is not among them and `grantsForHumanRole` seeds it
+ * for no role, so a cloud-tenant owner is `deny_missing_grant` through the
+ * decider. The short-circuit must not answer the opposite — and it would,
+ * because a cloud-tenant user is stamped `membershipRole: "owner"` whenever
+ * their stack role is owner OR admin (`middleware/auth.ts`) and carries
+ * `companyIds: [companyId]`, so they clear `hasCompanyAccess` and then match
+ * the operator set. Falling through costs them nothing a grant cannot restore
+ * (Ally review 5381822720).
  */
 function boardActorIsTranscriptOperator(req: Request, companyId: string): boolean {
+  if (req.actor.source === "cloud_tenant") return false;
   if (req.actor.source === "local_implicit") return true;
   return (req.actor.memberships ?? []).some(
     (membership) =>
       membership.companyId === companyId &&
       (membership.status === undefined || membership.status === "active") &&
       typeof membership.membershipRole === "string" &&
-      TRANSCRIPT_OPERATOR_MEMBERSHIP_ROLES.has(membership.membershipRole),
+      TRANSCRIPT_OPERATOR_MEMBERSHIP_ROLES.has(normalizedTranscriptRole(membership.membershipRole)),
   );
 }
 
@@ -300,7 +345,7 @@ export type RunTranscriptReadOutcome = {
  * difference: the human short-circuit is scoped to operator-grade memberships
  * (see `TRANSCRIPT_OPERATOR_MEMBERSHIP_ROLES`) rather than to every board
  * actor. Agent actors get own-run plus manager chain from the decider; everyone
- * else — peer agents and viewer/member humans alike — needs an explicit
+ * else — peer agents and viewer humans alike — needs an explicit
  * `runs:read_transcript` grant. The run log has carried vendor credential
  * material across several incidents (PEN-2328 → PEN-2370 → PEN-3139) and the
  * scrub protecting it is write-time only, which is why standing company-wide
@@ -319,9 +364,10 @@ export async function decideRunTranscriptRead(
   run: { companyId: string; agentId: string | null },
 ): Promise<RunTranscriptReadOutcome> {
   if (!hasCompanyAccess(req, run.companyId)) return { allowed: false, decision: null };
-  // Operator-grade humans only. A viewer or member falls THROUGH to the decider
-  // rather than being denied here, so an explicitly granted one is still
-  // admitted and the denial still carries the named boundary vocabulary.
+  // Operator-grade humans only. A viewer — or a cloud-tenant actor of any role
+  // — falls THROUGH to the decider rather than being denied here, so an
+  // explicitly granted one is still admitted and the denial still carries the
+  // named boundary vocabulary.
   if (req.actor.type === "board" && boardActorIsTranscriptOperator(req, run.companyId)) {
     return { allowed: true, decision: null };
   }
