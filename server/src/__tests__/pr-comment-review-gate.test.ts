@@ -889,9 +889,46 @@ describe("evaluateCommentReviewGate — self-attestation", () => {
  * open-defect witness below asserts IS eventually carried, so no single
  * implementation could satisfy both and the likelier repair would be deleting
  * the anti-fail-open guard — the direction this block exists to prevent.
- * Placement (2) is meanwhile already fenced without it: the pre-existing
- * retirement test above feeds the same two comments and asserts the strictly
- * stronger `{ state: "success", outcome: "not_evaluated" }`.
+ * Placement (2) is meanwhile PARTLY fenced without it, and the qualifier is
+ * load-bearing: the pre-existing retirement test above feeds the same two
+ * comments and asserts the stronger `{ state: "success", outcome:
+ * "not_evaluated" }`, so it catches an unconditional ledger exclusion — but
+ * it passes no `prAuthorLogin`, so it does NOT catch the author-threaded form
+ * a fix actually reaches for. Only the witness below does; see the per-mutant
+ * counts next.
+ *
+ * WHAT EACH FIXTURE ACTUALLY DETECTS, because "runtime-identical to an
+ * existing test" and "detects nothing new" are NOT the same claim and the
+ * difference decides whether this block may be deleted. Unmutated, both are
+ * indeed identical to tests that already existed, since `prAuthorLogin` is
+ * inert — the anti-fail-open one to "carries an undispositioned finding
+ * forward across a replacement head" (which is strictly stronger, asserting
+ * `carriedFromHeadSha` too), the witness to "lets a later review's ledger
+ * disposition a finding from a head it replaced", down to the same two
+ * comments and timestamps. But a mutant that READS the author is exactly
+ * where they stop being identical, because those pre-existing twins pass no
+ * `prAuthorLogin` at all, so an author-reading exclusion never fires on them.
+ * Measured at this head (113 tests), one mutation per run:
+ *
+ *   placement (1), always-exclude   37 fail — incl. this block's first; the
+ *                                   pre-existing twin catches it too
+ *   placement (2), always-exclude    5 fail — incl. the witness; 4 pre-existing
+ *                                   ledger tests catch it too
+ *   placement (1), author-threaded   3 fail — incl. this block's first; 2
+ *                                   pre-existing self-attestation tests catch it
+ *   placement (2), author-threaded   1 fail — THE WITNESS ALONE
+ *
+ * So the first fixture is redundant for detection and earns its place as a
+ * NAMED ANCHOR: it records at the site which hazard those general-looking
+ * tests guard, so neither can be deleted as redundant without stepping over
+ * the reason. The witness is NOT redundant — it is the only test in the file
+ * that goes red on the deadlocking shape this row exists to prevent, and
+ * deleting it would leave placement (2) unfenced against the author-threaded
+ * form a fix reaches for first.
+ *
+ * Read the witness's red carefully rather than as a verdict: a correct lane
+ * fix turns it red in the SAME direction as the deadlock does. It says an
+ * author-reading ledger exclusion landed, not that the right one did.
  */
 describe("evaluateCommentReviewGate — ledger author exclusion hazards", () => {
   // Placement (1): excluding the author inside `isAllyConsolidatedReviewComment`
