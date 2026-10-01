@@ -324,10 +324,14 @@ export const CCROTATE_CAPACITY_DEFERRED_METRIC = "paperclip_ccrotate_capacity_de
  *   `capacityOutcomeJustifiesFallback` for the capacity one — so a *broken*
  *   probe is indistinguishable from a healthy one on every other signal, and
  *   that set is what an alert wants. `path="capacity"` with
- *   `outcome="auth_fault"` (or `"inconclusive"`) is still **not** fail-open: it
- *   falls through and the fallback decides. Alerting on `outcome="error"` alone
- *   misses every entitlement fail-open; alerting on the fallback path alone now
- *   misses the capacity-transport one.
+ *   `outcome="auth_fault"` (or `"inconclusive"`) is fail-open **only on a
+ *   provider with no fallback**: on `anthropic` it falls through and the
+ *   fallback decides, but `resolvePenstockCheck` sets `messagesUrl` for
+ *   anthropic alone, so on `codex` there is nothing to fall through *to* and
+ *   every verdict-less capacity outcome returns `allow: true` terminally.
+ *   Alerting on `outcome="error"` alone misses every entitlement fail-open;
+ *   alerting on the fallback path alone now misses the capacity-transport one,
+ *   and misses **all** of codex, which has no fallback series at all.
  *
  * Cardinality: `path` and `outcome` are fixed allow-lists (2 x 6), coerced
  * here. `provider` is deliberately **not** coerced: it is bounded by its
@@ -2770,8 +2774,10 @@ function ensureRegistry(): {
         + "path=messages_fallback with outcome=error|auth_fault allows dispatch with no "
         + "verdict, and so does path=capacity with outcome=error, which no longer falls "
         + "through to the fallback (BLO-29900 item 3) - a transport failure says nothing "
-        + "about the model. path=capacity with outcome=auth_fault|inconclusive still does "
-        + "fall through, and there the fallback decides.",
+        + "about the model. path=capacity with outcome=auth_fault|inconclusive is fail-open "
+        + "only where there is no fallback: on anthropic it falls through and the fallback "
+        + "decides, but codex has no messagesUrl, so there every verdict-less capacity "
+        + "outcome is terminal fail-open and no messages_fallback series exists to alert on.",
       labelNames: ["path", "outcome", "provider", "model"],
       registers: [registry],
     });
