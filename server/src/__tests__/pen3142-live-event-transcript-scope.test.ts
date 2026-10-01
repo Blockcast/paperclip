@@ -216,6 +216,7 @@ describe("PEN-3142 live-event transcript gate", () => {
         companyId,
         actorType: "board",
         actorId: boardUserId,
+        actorSource: "session",
         membershipRole: "owner",
       });
 
@@ -249,6 +250,7 @@ describe("PEN-3142 live-event transcript gate", () => {
         companyId,
         actorType: "board",
         actorId: boardUserId,
+        actorSource: "session",
         membershipRole: "viewer",
       });
 
@@ -260,6 +262,54 @@ describe("PEN-3142 live-event transcript gate", () => {
       expect(mockDecide).toHaveBeenCalledWith(expect.objectContaining({
         action: "runs:read_transcript",
       }));
+    });
+
+    /**
+     * Ally review 5381822720 (Important #1), socket half. The context used to
+     * hardcode `source: "session"` for every non-trusted-local board, which
+     * erased the distinction the REST gate decides on — so a cloud-tenant
+     * subscriber would have been modelled as a session actor and matched the
+     * operator set on its `owner` role.
+     *
+     * No upgrade path produces `cloud_tenant` today (`authorizeUpgrade` admits
+     * a board only via `local_trusted` or a better-auth session), so this pins
+     * the PARITY rather than a live hole: the gate's docblock claims the socket
+     * asks the REST twin's question, and this is what makes that true if such a
+     * path is ever added.
+     */
+    it("withholds from a cloud-tenant board subscriber despite an owner role", async () => {
+      const { createLiveEventTranscriptGate } = await import("../realtime/live-event-transcript-gate.js");
+      const project = createLiveEventTranscriptGate({} as never, {
+        companyId,
+        actorType: "board",
+        actorId: boardUserId,
+        actorSource: "cloud_tenant",
+        membershipRole: "owner",
+      });
+
+      const projected = await project(logEvent() as never);
+
+      expect(JSON.stringify(projected)).not.toContain(CANARY);
+      expect(mockDecide).toHaveBeenCalledWith(expect.objectContaining({
+        action: "runs:read_transcript",
+      }));
+    });
+
+    it("delivers transcript content to a member-role board subscriber, which normalizes to operator", async () => {
+      const { createLiveEventTranscriptGate } = await import("../realtime/live-event-transcript-gate.js");
+      const project = createLiveEventTranscriptGate({} as never, {
+        companyId,
+        actorType: "board",
+        actorId: boardUserId,
+        actorSource: "session",
+        membershipRole: "member",
+      });
+
+      // `normalizeHumanRole` folds `member` into `operator` everywhere else in
+      // the codebase; the gate agrees rather than denying one role name that
+      // every other consumer treats as an operator (Ally review 5381822720).
+      expect(JSON.stringify(await project(logEvent() as never))).toContain(CANARY);
+      expect(mockDecide).not.toHaveBeenCalled();
     });
 
     it("decides once per owning agent inside the TTL window", async () => {

@@ -575,8 +575,17 @@ describe("run transcript scoping (PEN-3142)", () => {
      * — two sides of one gate disagreeing about who an operator is. The intent
      * these tests pin is the `requiresNonViewer` precedent the codebase already
      * applies to `workspace_runtime:read`, which guards *less* sensitive
-     * material than a transcript: owner / admin / operator read, viewer and
-     * member do not, and a grant is how you widen it.
+     * material than a transcript: owner / admin / operator read, viewer does
+     * not, and a grant is how you widen it.
+     *
+     * Ally review 5381822720 (Important #2) fixed the vocabulary the gate reads
+     * that set in: `member` is a storable role that `normalizeHumanRole` folds
+     * to `operator`, so matching the raw stored string reintroduced the same
+     * disagreement one layer down — a `member` was an operator for grant
+     * seeding and a non-operator here. It normalizes now, which is why `member`
+     * sits with the allowed roles below and an UNKNOWN role sits with the
+     * denied ones: normalization folds the known alias and fails closed on
+     * everything else.
      */
     describe("human membership roles", () => {
       const humanActor = (membershipRole: string) => ({
@@ -588,7 +597,7 @@ describe("run transcript scoping (PEN-3142)", () => {
         memberships: [{ companyId: "company-1", membershipRole, status: "active" }],
       });
 
-      for (const membershipRole of ["owner", "admin", "operator"]) {
+      for (const membershipRole of ["owner", "admin", "operator", "member"]) {
         it(`keeps the read for a ${membershipRole} without consulting the grant`, async () => {
           const res = await requestApp(
             await createApp(humanActor(membershipRole)),
@@ -600,7 +609,7 @@ describe("run transcript scoping (PEN-3142)", () => {
         });
       }
 
-      for (const membershipRole of ["viewer", "member"]) {
+      for (const membershipRole of ["viewer", "support", "not-a-real-role"]) {
         it(`denies a ${membershipRole} who holds no grant, and says why`, async () => {
           const res = await requestApp(
             await createApp(humanActor(membershipRole)),
@@ -618,6 +627,57 @@ describe("run transcript scoping (PEN-3142)", () => {
           expect(auditCallsFor("heartbeat.run_log_accessed")[0]?.[1]?.details).toMatchObject({
             result: "denied",
           });
+        });
+      }
+
+      /**
+       * `membership_role` is a plain `text` column with no DB constraint, and
+       * the cloud-tenant path writes `support` into it (`middleware/auth.ts`,
+       * `stackMembershipRole`). `normalizeHumanRole`'s own default fallback is
+       * `operator`, which would make every unknown string above an operator —
+       * this gate passes `viewer` instead, so the two cases above are the
+       * fail-closed direction rather than an accident of the role list.
+       */
+      it("does not take normalizeHumanRole's operator fallback for an unknown role", async () => {
+        const res = await requestApp(
+          await createApp(humanActor("support")),
+          (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-1/log"),
+        );
+
+        expect(res.status, JSON.stringify(res.body)).toBe(403);
+        expect(mockDecide).toHaveBeenCalled();
+      });
+
+      /**
+       * Ally review 5381822720 (Important #1). A cloud-tenant user is stamped
+       * `membershipRole: "owner"` whenever their stack role is owner OR admin
+       * (`middleware/auth.ts`) and carries `companyIds: [companyId]`, so they
+       * clear `hasCompanyAccess` and would match the operator set on the role
+       * alone. The decider answers the OPPOSITE for them — it refuses to
+       * elevate cloud tenants and enumerates four readable actions that do not
+       * include `runs:read_transcript` — so the short-circuit has to refuse on
+       * the source, ahead of the role.
+       */
+      for (const membershipRole of ["owner", "admin", "operator"]) {
+        it(`denies a cloud-tenant ${membershipRole}, who would otherwise match the operator set`, async () => {
+          const res = await requestApp(
+            await createApp({
+              type: "board",
+              userId: "user-1",
+              companyIds: ["company-1"],
+              source: "cloud_tenant",
+              isInstanceAdmin: false,
+              memberships: [{ companyId: "company-1", membershipRole, status: "active" }],
+            }),
+            (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-1/log"),
+          );
+
+          expect(res.status, JSON.stringify(res.body)).toBe(403);
+          // Through the decider, not refused inline — same escape hatch as a
+          // viewer, so an explicit grant still admits a cloud-tenant operator.
+          expect(mockDecide).toHaveBeenCalledWith(expect.objectContaining({
+            action: "runs:read_transcript",
+          }));
         });
       }
 
