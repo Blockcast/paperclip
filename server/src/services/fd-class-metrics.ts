@@ -162,6 +162,10 @@ const SEGMENT_TOKEN_SEPARATORS = /([-_.])/;
  *     `013a18368d84`, `adc9`) and numeric ids (`38624`). The length floor is
  *     what keeps genuinely stable short names like `v1`, `s3`, `d0` and the
  *     `x86`/`64` of `x86_64` intact;
+ *   - is ≥4 characters drawn entirely from `[0-9a-f]` — the digit rule alone
+ *     lets an all-letter hex chunk through, and about 1 `randomUUID()` in 2,600
+ *     opens with eight hex letters (`abcdefab-…`). Costs only all-hex-letter
+ *     names (`cafe`, `facade`); this repo creates none;
  *   - exceeds 24 characters, as a backstop for an encoding this does not
  *     anticipate.
  */
@@ -169,6 +173,7 @@ function isStableSegmentToken(token: string): boolean {
   if (token.length === 0 || token.length > 24) return false;
   if (/[A-Z]/.test(token)) return false;
   if (token.length >= 4 && /[0-9]/.test(token)) return false;
+  if (token.length >= 4 && /^[0-9a-f]+$/.test(token)) return false;
   return true;
 }
 
