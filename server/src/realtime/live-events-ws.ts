@@ -9,6 +9,7 @@ import type { DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "../middleware/logger.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
+import { createLiveEventTranscriptGate } from "./live-event-transcript-gate.js";
 
 interface WsSocket {
   readyState: number;
@@ -227,9 +228,28 @@ export function setupLiveEventsWebSocketServer(
       return;
     }
 
+    let sendChain: Promise<void> = Promise.resolve();
+
+    const projectForSubscriber = createLiveEventTranscriptGate(db, context);
+
     const unsubscribe = subscribeCompanyLiveEvents(context.companyId, (event) => {
       if (socket.readyState !== WebSocket.OPEN) return;
-      socket.send(JSON.stringify(event));
+      // The transcript decision is async, so ordering is preserved explicitly:
+      // each event is chained onto the previous one rather than racing it. A
+      // live log stream that arrived out of order would be worse than useless.
+      sendChain = sendChain
+        .then(async () => {
+          const projected = await projectForSubscriber(event);
+          if (socket.readyState !== WebSocket.OPEN) return;
+          socket.send(JSON.stringify(projected));
+        })
+        .catch((err) => {
+          // Fail closed: drop this event rather than fall back to the
+          // unprojected one. The gate itself already fails closed on an
+          // authorization error, so reaching here means send/serialization
+          // failed, and the socket's own error handler will take it from there.
+          logger.warn({ err, companyId: context.companyId }, "failed to deliver live event");
+        });
     });
 
     cleanupByClient.set(socket, unsubscribe);
