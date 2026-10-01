@@ -94,8 +94,9 @@
   "securityAuditRemediations": {
     "PEN-1198": {
       "@connectrpc/connect-node>undici": {
-        "patchedRange": ">=6.27.0 <7",
+        "patchedRange": ">=6.28.1 <7",
         "advisories": [
+          "GHSA-rfgv-xxqx-mfg5",
           "GHSA-vrm6-8vpv-qv8q",
           "GHSA-v9p9-hfj2-hcw8",
           "GHSA-p88m-4jfj-68fv",
@@ -103,13 +104,15 @@
         ]
       },
       "jsdom>undici": {
-        "patchedRange": ">=7.29.0 <8",
+        "patchedRange": ">=7.29.1 <8",
         "advisories": [
+          "GHSA-w293-vg96-wgc3",
           "GHSA-4cwx-7wf7-3272",
           "GHSA-vmh5-mc38-953g",
           "GHSA-hm92-r4w5-c3mj",
           "GHSA-p88m-4jfj-68fv",
-          "GHSA-vxpw-j846-p89q"
+          "GHSA-vxpw-j846-p89q",
+          "GHSA-rfgv-xxqx-mfg5"
         ]
       },
       "multer": {
@@ -174,8 +177,8 @@
       "@babel/core": ">=7.29.7 <8",
       "js-yaml": ">=4.3.2 <5",
       "esbuild": ">=0.28.1 <0.29",
-      "@connectrpc/connect-node>undici": ">=6.27.0 <7",
-      "jsdom>undici": ">=7.29.0 <8",
+      "@connectrpc/connect-node>undici": ">=6.28.1 <7",
+      "jsdom>undici": ">=7.29.1 <8",
       "multer": ">=2.3.0 <3",
       "browserslist": ">=4.28.7 <5",
       "react": "^19.2.7",

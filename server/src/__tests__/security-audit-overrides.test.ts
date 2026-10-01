@@ -57,9 +57,9 @@ describe("PEN-1198 audit dependency remediation", () => {
     const overrides = rootPackageJson.pnpm.overrides;
 
     expect(overrides["@connectrpc/connect-node>undici"]).toBe(
-      ">=6.27.0 <7",
+      ">=6.28.1 <7",
     );
-    expect(overrides["jsdom>undici"]).toBe(">=7.29.0 <8");
+    expect(overrides["jsdom>undici"]).toBe(">=7.29.1 <8");
     expect(overrides["js-yaml"]).toBe(">=4.3.2 <5");
     expect(overrides.multer).toBe(">=2.3.0 <3");
     expect(serverPackageJson.dependencies.multer).toBe("^2.3.0");
@@ -69,18 +69,31 @@ describe("PEN-1198 audit dependency remediation", () => {
     const remediations = rootPackageJson.securityAuditRemediations["PEN-1198"];
 
     expect(remediations["@connectrpc/connect-node>undici"]).toMatchObject({
-      patchedRange: ">=6.27.0 <7",
+      patchedRange: ">=6.28.1 <7",
       advisories: expect.arrayContaining([
+        // BLO-38291: GHSA-rfgv-xxqx-mfg5 (CVE-2026-19534) raised the floor
+        // from 6.27.0 to 6.28.1. The advisories below are still addressed.
+        "GHSA-rfgv-xxqx-mfg5",
         "GHSA-vrm6-8vpv-qv8q",
         "GHSA-vxpw-j846-p89q",
       ]),
     });
     expect(remediations["jsdom>undici"]).toMatchObject({
-      patchedRange: ">=7.29.0 <8",
+      patchedRange: ">=7.29.1 <8",
       advisories: expect.arrayContaining([
+        // BLO-38290: GHSA-w293-vg96-wgc3 (CVE-2026-84961) raised the floor
+        // from 7.29.0 to 7.29.1. The advisories below are still addressed —
+        // their patch versions are lower — so this stays one entry.
+        "GHSA-w293-vg96-wgc3",
         "GHSA-4cwx-7wf7-3272",
         "GHSA-vmh5-mc38-953g",
         "GHSA-hm92-r4w5-c3mj",
+        // BLO-38291: GHSA-rfgv-xxqx-mfg5 has three arms, and the
+        // `>=7.0.0 <7.29.1` one covered this path too — not just the 6.x arm
+        // recorded under connect-node. No range change: the floor was already
+        // >=7.29.1 for GHSA-w293-vg96-wgc3, which is exactly the 7.x arm's
+        // first patched version, so this path was never vulnerable to it.
+        "GHSA-rfgv-xxqx-mfg5",
       ]),
     });
     expect(remediations.multer).toMatchObject({
